@@ -513,3 +513,99 @@ async fn skip_propagates_through_multiple_downstream_levels() {
     // end 透传前驱输出：false 分支的 end_std 拿到条件节点的求值结果（false）
     assert_eq!(state.output, Some(json!({"end_vip": null, "end_std": false})));
 }
+
+#[tokio::test]
+async fn multi_pred_end_collects_output_map() {
+    // 多前驱 end：节点输出是各前驱输出的映射，而不是透传其中一个
+    let h = Harness::new();
+    let run_id = h.run_id();
+    let def = def_from(json!({
+        "nodes": [
+            {"id": "s", "type": "start"},
+            {"id": "a", "type": "script", "params": {"code": "return 1;"}},
+            {"id": "b", "type": "script", "params": {"code": "return 2;"}},
+            {"id": "e", "type": "end"}
+        ],
+        "edges": [
+            {"from": "s", "to": "a"},
+            {"from": "s", "to": "b"},
+            {"from": "a", "to": "e"},
+            {"from": "b", "to": "e"}
+        ]
+    }));
+
+    h.engine
+        .start_run(StartRun {
+            run_id: run_id.clone(),
+            workflow_id: "w1".into(),
+            workflow_version: 1,
+            definition: def,
+            input: json!(null),
+        })
+        .await
+        .unwrap();
+
+    let state = h.wait_terminal(&run_id).await;
+    assert_eq!(state.phase, RunPhase::Succeeded, "{}", describe(&state));
+    // end 自身输出 = 多前驱映射；单 end 时 run 输出透传 end 的输出
+    assert_eq!(state.record("e").output, Some(json!({"a": 1, "b": 2})));
+    assert_eq!(state.output, Some(json!({"a": 1, "b": 2})));
+}
+
+#[tokio::test]
+async fn fatal_failure_lets_independent_branch_finish() {
+    // 钉住 fatal 语义：致命失败只记录，不中断独立分支——
+    // slow 必须跑到 Completed，失败分支的下游必须被跳过，run 结果为 Failed。
+    let h = Harness::new();
+    let run_id = h.run_id();
+    let def = def_from(json!({
+        "nodes": [
+            {"id": "s", "type": "start"},
+            {"id": "bad", "type": "script", "params": {"code": "return nope.x;"}},
+            {"id": "slow", "type": "delay", "params": {"ms": 80}},
+            {"id": "e1", "type": "end"},
+            {"id": "e2", "type": "end"}
+        ],
+        "edges": [
+            {"from": "s", "to": "bad"},
+            {"from": "s", "to": "slow"},
+            {"from": "bad", "to": "e1"},
+            {"from": "slow", "to": "e2"}
+        ]
+    }));
+
+    h.engine
+        .start_run(StartRun {
+            run_id: run_id.clone(),
+            workflow_id: "w1".into(),
+            workflow_version: 1,
+            definition: def,
+            input: json!(null),
+        })
+        .await
+        .unwrap();
+
+    let state = h.wait_terminal(&run_id).await;
+    assert_eq!(state.phase, RunPhase::Failed, "{}", describe(&state));
+    assert!(
+        matches!(state.record("slow").state, flow_engine::NodeState::Completed { .. }),
+        "独立分支必须跑完，实际：{:?}",
+        state.record("slow").state
+    );
+    match state.record("e1").state {
+        flow_engine::NodeState::Skipped { reason } => {
+            assert_eq!(reason, "upstream_failed")
+        }
+        other => panic!("失败分支下游应被跳过，实际：{other:?}"),
+    }
+    assert!(
+        matches!(state.record("e2").state, flow_engine::NodeState::Completed { .. }),
+        "跑完的分支下游必须正常完成，实际：{:?}",
+        state.record("e2").state
+    );
+    assert!(
+        state.fatal_error.as_deref().is_some_and(|e| e.contains("bad")),
+        "fatal 必须记录首个失败节点：{:?}",
+        state.fatal_error
+    );
+}

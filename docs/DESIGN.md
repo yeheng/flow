@@ -112,7 +112,9 @@ Event 流 ──fold──> RunState {
 `Definition::validate()` 在保存与发布时强制（建图即校验，不等到运行）：
 
 1. 节点 id 非空且唯一；类型已知；按类型校验必填参数
-   （script: `code`，condition: `expr`，delay: `ms`，http_call: `url`）；
+   （script: `code`，condition: `expr`，delay: `ms`，http_call: `url`；
+   method 若给出必须属于 `HTTP_METHODS`——该白名单与 `nodetypes.list`
+   共用一份，拼写错误在发布时被拒而不是运行时炸 run）；
 2. 恰好一个 `start`，至少一个 `end`；
 3. start 无入边，end 无出边，其余节点必须有入边（否则永不触发）；
 4. 边端点存在、无自环、无重复边；**condition 出边必须带 `true`/`false` 端口，
@@ -187,12 +189,16 @@ condition 节点输出 = **表达式求值结果本身**（不是 `{result,value
 
 退避计时器计入 inflight（不变量），到点后 `RetryDue` 重新派发，attempt+1。
 
-### 6.6 fatal 语义（已决策，勿改）
+### 6.6 取消与 fatal 的副作用语义
 
-首个致命节点失败只**记录**（`fatal: Option<String>`），不中断其余分支：
-独立分支跑到自然终态再结束 run——避免中途砍掉已发出的副作用；
+**fatal（已决策，勿改）**：首个致命节点失败只**记录**（`fatal: Option<String>`），
+不中断其余分支：独立分支跑到自然终态再结束 run——避免中途砍掉已发出的副作用；
 失败节点的下游经 `upstream_failed` 全部跳过，结果注定 `RunFailed`，
 由 finalize 收尾。代价是注定失败的 run 会等最慢的无关分支跑完。
+
+**cancel**：abort 所有 inflight。对 in-flight 的 `http_call`，请求可能已发出、
+响应永远不读、run 记 `RunCancelled`——与 §7 的人工裁决是同类的副作用歧义，
+取消是用户主动选择，不做裁决。
 
 ### 6.7 外部信号（human_task 与人工裁决）
 
@@ -272,7 +278,7 @@ jsonrpsee WebSocket。引擎不依赖存储，`StoreObserver` 在这一层把
 | `run.events` | 原始事件，`from_seq` 增量拉取 |
 | `run.cancel` | 活着的 run → cancelling；否则 conflict |
 | `run.signal` | human_task 交付 / 副作用节点裁决（§6.7） |
-| `run.subscribe` | 订阅 `run.event` 通知，可按 run_id 过滤 |
+| `run.subscribe` | 订阅 `run.event` 通知，可按 run_id 过滤。订阅者消费慢时收到 Lagged 丢事件，用 `run.events`（from_seq）补齐 |
 
 错误码：`-32010` 参数非法、`-32011` 不存在、`-32012` 冲突、`-32603` 内部错误。
 JSON-RPC 允许整体省略 params（到达 null），解析层统一归一为 `{}`。
@@ -282,14 +288,20 @@ JSON-RPC 允许整体省略 params（到达 null），解析层统一归一为 `
 rquickjs：无 IO、CPU 同步执行（放 `spawn_blocking`，不占死 tokio worker）、
 interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
 
+沙箱边界的证据（升级 rquickjs 时必须重新查证）：`rquickjs-sys` 只编译
+`quickjs.c`，**不含 `quickjs-libc.c`**（`std`/`os` 模块的唯一来源），
+引擎也未注册任何模块加载器——脚本里连 `import` 都不可用。
+
 - `eval_body`：script 节点，函数体带 `return`，可用 `input` 与 `nodes`（前驱输出快照）；
 - `eval_expr`：condition 节点；
 - `expand_templates`：http_call 的 url/headers/body 中 `${expr}` 展开。
+  **限制**：`${...}` 内不能包含 `}`（按第一个 `}` 截断），
+  不支持嵌套对象字面量等复杂表达式。
 
 ## 11. http_call 语义
 
-参数经 `${}` 模板展开后发请求（默认超时 30s）。输出 `{status, headers, body}`
-（body 能解析为 JSON 则解析，否则原样字符串）。失败分类：
+参数经 `${}` 模板展开后发请求（默认超时 30s；method 取自 `HTTP_METHODS` 白名单）。
+输出 `{status, headers, body}`（body 能解析为 JSON 则解析，否则原样字符串）。失败分类：
 
 - 连接失败/超时 → retryable（副作用不明确或未发生，交给重试策略）；
 - 5xx → retryable；4xx → fatal（请求本身的问题）；
@@ -308,7 +320,7 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
 
 ## 13. 测试策略
 
-29 个测试：engine 单元 10（fold 3 + expr 5 + exec 2）、恢复闭环集成 8、
+32 个测试：engine 单元 11（fold 3 + expr 5 + exec 3）、恢复闭环集成 10、
 rpc 契约 1、rpc 端到端 5、store 5。约定：
 
 - RPC 测试用 `env!("CARGO_BIN_EXE_flow-server")` 真起进程，
@@ -326,4 +338,6 @@ rpc 契约 1、rpc 端到端 5、store 5。约定：
 - `sub_workflow` 节点；
 - delay 剩余时间恢复（当前崩溃后整段重放）；
 - fsync 组提交（吞吐优化，不动语义）；
-- 多 end 被跳过时与真 null 输出的显式区分。
+- 多 end 被跳过时与真 null 输出的显式区分；
+- `run.start` 客户端幂等键（当前双击 = 两个 run，服务端 uuid 生成）；
+- `${}` 模板的平衡括号扫描（当前按第一个 `}` 截断，文档化限制）。

@@ -328,3 +328,26 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod singular_or_map_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn passes_single_and_maps_multiple() {
+        assert_eq!(
+            singular_or_map(vec![("e1".into(), json!(7))]),
+            json!(7),
+            "单来源必须透传其值"
+        );
+        assert_eq!(
+            singular_or_map(vec![
+                ("e1".into(), json!(7)),
+                ("e2".into(), Value::Null),
+            ]),
+            json!({"e1": 7, "e2": null}),
+            "多来源必须组成映射，缺失补 null"
+        );
+    }
+}

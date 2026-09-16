@@ -53,6 +53,10 @@ impl NodeType {
     }
 }
 
+/// http_call 允许的方法。validate 与前端能力清单（nodetypes.list）共用这一份，
+/// 校验按大小写不敏感处理（与执行层 to_uppercase 后解析一致）。
+pub const HTTP_METHODS: [&str; 5] = ["GET", "POST", "PUT", "PATCH", "DELETE"];
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Position {
     #[serde(default)]
@@ -321,10 +325,18 @@ fn validate_params(node: &Node, kind: NodeType) -> Result<(), String> {
         NodeType::Condition => need_str("expr"),
         NodeType::HttpCall => {
             need_str("url")?;
-            if let Some(method) = node.param_str("method") {
-                if method.trim().is_empty() {
+            match node.param_str("method") {
+                Some(method) if method.trim().is_empty() => {
                     return Err(format!("节点 {} 的 method 不能为空", node.id));
                 }
+                Some(method) if !HTTP_METHODS.contains(&method.trim().to_uppercase().as_str()) => {
+                    return Err(format!(
+                        "节点 {} 的 method 非法：{method:?}（允许 {}）",
+                        node.id,
+                        HTTP_METHODS.join("/")
+                    ));
+                }
+                _ => {}
             }
             Ok(())
         }

@@ -12,4 +12,4 @@ pub use engine::{
 pub use error::EngineError;
 pub use event::{read_events, Envelope, Event, EventLog};
 pub use fold::{NodeRecord, NodeState, RunPhase, RunState};
-pub use model::{Definition, Edge, Node, NodeType, Position, RetryPolicy};
+pub use model::{Definition, Edge, HTTP_METHODS, Node, NodeType, Position, RetryPolicy};

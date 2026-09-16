@@ -2,8 +2,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use flow_engine::{
-    DbRunStatus, Definition, Engine, EngineError, Envelope, ResumeOutcome, RunObserver, RunPhase,
-    RunState, Signal, StartRun, StatusUpdate,
+    DbRunStatus, Definition, Engine, EngineError, Envelope, HTTP_METHODS, ResumeOutcome,
+    RunObserver, RunPhase, RunState, Signal, StartRun, StatusUpdate,
 };
 use flow_store::{Store, StoreError};
 use futures::future::BoxFuture;
@@ -107,7 +107,14 @@ pub async fn recover_unfinished(state: &AppState) -> Result<Vec<(String, String)
             }
             Ok(ResumeOutcome::AlreadyTerminal(phase)) => {
                 // 崩溃发生在「事件已落盘、DB 未回填」之间：以事件为准修正 DB
-                let snapshot = state.engine.snapshot(&run.id).await.unwrap_or_default();
+                let snapshot = match state.engine.snapshot(&run.id).await {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        // 读不了权威日志就不能编造状态回填
+                        failures.push((run.id.clone(), format!("读取事件日志失败：{err}")));
+                        continue;
+                    }
+                };
                 let status = match phase {
                     RunPhase::Succeeded => DbRunStatus::Succeeded,
                     RunPhase::Failed => DbRunStatus::Failed,
@@ -306,11 +313,13 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
         };
         if let Err(err) = state.engine.start_run(spec).await {
             let message = err.to_string();
-            state
+            if let Err(write_err) = state
                 .store
                 .set_run_status(&run_id, DbRunStatus::Failed.as_str(), None, Some(&message))
                 .await
-                .ok();
+            {
+                tracing::error!(run_id = %run_id, error = %write_err, "回写 run failed 状态失败");
+            }
             return Err(engine_err(err));
         }
         Ok::<_, ErrorObjectOwned>(json!({ "run_id": run_id, "workflow_version": version }))
@@ -577,8 +586,8 @@ fn node_types() -> Value {
             "category": "integration",
             "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
             "params": [
-                {"name": "method", "label": "方法", "kind": "select", "options": ["GET", "POST", "PUT", "PATCH", "DELETE"], "default": "GET"},
-                {"name": "url", "label": "URL", "kind": "text", "required": true, "help": "支持 ${input.x} / ${nodes.n2.y} 模板"},
+                {"name": "method", "label": "方法", "kind": "select", "options": HTTP_METHODS, "default": "GET"},
+                {"name": "url", "label": "URL", "kind": "text", "required": true, "help": "支持 ${input.x} / ${nodes.n2.y} 模板（${} 内不能含 }）"},
                 {"name": "headers", "label": "请求头", "kind": "json", "default": {}},
                 {"name": "body", "label": "请求体", "kind": "json"},
                 {"name": "timeout_ms", "label": "超时（毫秒）", "kind": "number", "default": 30000}
