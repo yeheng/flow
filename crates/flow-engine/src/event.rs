@@ -12,6 +12,9 @@ use crate::error::EngineError;
 ///
 /// 写序协议：执行副作用之前先写 `node_started`，拿到结果后再写终态事件。
 /// 崩溃窗口因此被限定为「有 node_started、无终态」——恢复时据此判定。
+///
+/// 兼容：旧日志的 `node_started` 里可能还有已废弃的 `idempotency_key` /
+/// `params_hash` 字段，反序列化时被忽略。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
@@ -23,8 +26,6 @@ pub enum Event {
     NodeStarted {
         node_id: String,
         attempt: u32,
-        idempotency_key: String,
-        params_hash: String,
     },
     NodeCompleted {
         node_id: String,

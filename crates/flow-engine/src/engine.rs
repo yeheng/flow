@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -248,7 +247,6 @@ impl Engine {
             input: spec.input,
             log,
             state,
-            outputs: Arc::new(HashMap::new()),
             events_tx: self.events_tx.clone(),
             observer: self.observer.clone(),
             cancel,
@@ -306,7 +304,6 @@ struct Driver {
     input: Value,
     log: EventLog,
     state: RunState,
-    outputs: Arc<HashMap<String, Value>>,
     events_tx: broadcast::Sender<Envelope>,
     observer: Arc<dyn RunObserver>,
     cancel: CancellationToken,
@@ -316,6 +313,9 @@ struct Driver {
     human_waiting: HashMap<String, oneshot::Sender<Value>>,
     /// 崩溃遗留的副作用节点：等待人工裁决
     adjudicating: HashSet<String>,
+    /// 首个致命节点失败。置位后不中断其余分支：独立分支跑到自然终态再结束 run
+    /// （避免中途砍掉已发出的副作用）；失败节点的下游经 upstream_failed 全部
+    /// 跳过，结果注定 RunFailed，由 finalize 收尾。
     fatal: Option<String>,
 }
 
@@ -402,15 +402,15 @@ impl Driver {
         result_tx: &mpsc::Sender<DriverMsg>,
     ) -> Result<(), EngineError> {
         for (node_id, attempt, payload) in plan.signal_received {
-            // signal_received 已落盘但终态缺失：补终态，不重复等待
+            // signal_received 已落盘但终态缺失：补终态，不重复等待。
+            // fold 会把 output 记进 state.outputs，无需第二份手工同步。
             self.append(Event::NodeCompleted {
-                node_id: node_id.clone(),
+                node_id,
                 attempt,
-                output: payload.clone(),
+                output: payload,
                 duration_ms: 0,
             })
             .await?;
-            Arc::make_mut(&mut self.outputs).insert(node_id, payload);
         }
 
         for (node_id, attempt) in plan.human_wait {
@@ -463,7 +463,9 @@ impl Driver {
             }
             let incoming = self.definition.incoming(&node.id);
             if incoming.is_empty() {
-                continue; // start 节点在下面的分支里处理
+                // validate 保证唯一无入边的就是 start：直接就绪
+                ready.push(node.id.clone());
+                continue;
             }
 
             let mut all_satisfied = true;
@@ -486,15 +488,6 @@ impl Driver {
             }
         }
 
-        // 无入边的只有 start
-        for node in &self.definition.nodes {
-            if self.definition.incoming(&node.id).is_empty()
-                && matches!(self.state.record(&node.id).state, NodeState::Pending)
-            {
-                ready.push(node.id.clone());
-            }
-        }
-
         (ready, skips)
     }
 
@@ -504,7 +497,7 @@ impl Driver {
             NodeState::Completed { .. } => {
                 let from_kind = self.definition.node_type(from);
                 if from_kind == Some(NodeType::Condition) {
-                    let taken = self.outputs.get(from).map(exec::truthy).unwrap_or(false);
+                    let taken = self.state.outputs.get(from).map(exec::truthy).unwrap_or(false);
                     let taken_port = if taken { "true" } else { "false" };
                     if port == Some(taken_port) {
                         EdgeState::Satisfied
@@ -536,12 +529,9 @@ impl Driver {
             .kind()
             .ok_or_else(|| EngineError::Node(format!("节点类型未知：{}", node.node_type)))?;
 
-        let idempotency_key = format!("{}:{}:{}", self.run_id, node_id, attempt);
         self.append(Event::NodeStarted {
             node_id: node_id.to_string(),
             attempt,
-            idempotency_key,
-            params_hash: params_hash(&node),
         })
         .await?;
 
@@ -559,7 +549,7 @@ impl Driver {
         let ctx = NodeExecContext {
             node,
             input: self.input.clone(),
-            outputs: self.outputs.clone(),
+            outputs: self.state.outputs.clone(),
             preds,
         };
         let cancel = self.cancel.clone();
@@ -632,13 +622,12 @@ impl Driver {
                 match result {
                     Ok(output) => {
                         self.append(Event::NodeCompleted {
-                            node_id: node_id.clone(),
+                            node_id,
                             attempt,
-                            output: output.clone(),
+                            output,
                             duration_ms,
                         })
                         .await?;
-                        Arc::make_mut(&mut self.outputs).insert(node_id, output);
                     }
                     Err(failure) => {
                         let policy = self
@@ -667,8 +656,8 @@ impl Driver {
                             });
                             // 退避计时算作进行中，否则会被误判为「无可推进节点」
                             self.inflight.insert(node_id, handle);
-                        } else if self.fatal.is_none() {
-                            self.fatal = Some(format!("节点 {node_id} 失败：{}", failure.message));
+                        } else {
+                            self.fatal.get_or_insert(format!("节点 {node_id} 失败：{}", failure.message));
                         }
                     }
                 }
@@ -718,13 +707,12 @@ impl Driver {
                 "succeeded" => {
                     let output = signal.payload.get("output").cloned().unwrap_or(Value::Null);
                     self.append(Event::NodeCompleted {
-                        node_id: node_id.clone(),
+                        node_id,
                         attempt,
-                        output: output.clone(),
+                        output,
                         duration_ms: 0,
                     })
                     .await?;
-                    Arc::make_mut(&mut self.outputs).insert(node_id, output);
                 }
                 "failed" => {
                     let error = signal
@@ -788,21 +776,20 @@ impl Driver {
     }
 
     fn collect_output(&self) -> Value {
-        let ends: Vec<&str> = self
+        // 与 end 节点自身的输出同一条规则（exec::singular_or_map）
+        let ends: Vec<(String, Value)> = self
             .definition
             .nodes
             .iter()
             .filter(|n| n.kind() == Some(NodeType::End))
-            .map(|n| n.id.as_str())
+            .map(|n| {
+                (
+                    n.id.clone(),
+                    self.state.outputs.get(&n.id).cloned().unwrap_or(Value::Null),
+                )
+            })
             .collect();
-        if ends.len() == 1 {
-            return self.outputs.get(ends[0]).cloned().unwrap_or(Value::Null);
-        }
-        Value::Object(
-            ends.iter()
-                .map(|id| ((*id).to_string(), self.outputs.get(*id).cloned().unwrap_or(Value::Null)))
-                .collect(),
-        )
+        exec::singular_or_map(ends)
     }
 
     fn abort_inflight(&mut self) {
@@ -818,10 +805,4 @@ enum EdgeState {
     Satisfied,
     Waiting,
     Unsatisfied(String),
-}
-
-fn params_hash(node: &crate::model::Node) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(serde_json::to_vec(&node.params).unwrap_or_default());
-    hex::encode(hasher.finalize())
 }

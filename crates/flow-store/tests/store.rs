@@ -1,4 +1,4 @@
-use flow_store::{Store, RUN_FAILED, RUN_RUNNING, RUN_SUCCEEDED};
+use flow_store::Store;
 use serde_json::json;
 use uuid::Uuid;
 
@@ -71,7 +71,7 @@ async fn workflow_with_runs_cannot_be_deleted() {
     let wf2 = store.create_workflow("流程2").await.unwrap();
     let v2 = store.update_workflow(&wf2, &def("a")).await.unwrap();
     store
-        .insert_run("run-1", &wf2, v2, &json!({"x": 1}), RUN_RUNNING)
+        .insert_run("run-1", &wf2, v2, &json!({"x": 1}), "running")
         .await
         .unwrap();
 
@@ -89,19 +89,19 @@ async fn unfinished_runs_drive_crash_recovery() {
     let v = store.update_workflow(&wf, &def("a")).await.unwrap();
 
     store
-        .insert_run("run-live", &wf, v, &json!({"x": 1}), RUN_RUNNING)
+        .insert_run("run-live", &wf, v, &json!({"x": 1}), "running")
         .await
         .unwrap();
     store
-        .insert_run("run-done", &wf, v, &json!({"x": 2}), RUN_RUNNING)
+        .insert_run("run-done", &wf, v, &json!({"x": 2}), "running")
         .await
         .unwrap();
     store
-        .set_run_status("run-done", RUN_SUCCEEDED, Some(&json!({"ok": true})), None)
+        .set_run_status("run-done", "succeeded", Some(&json!({"ok": true})), None)
         .await
         .unwrap();
     store
-        .set_run_status("run-bad", RUN_FAILED, None, Some("boom"))
+        .set_run_status("run-bad", "failed", None, Some("boom"))
         .await
         .unwrap_err(); // 未插入的 run 报错
 
@@ -110,7 +110,7 @@ async fn unfinished_runs_drive_crash_recovery() {
     assert_eq!(ids, vec!["run-live"]);
 
     let done = store.get_run("run-done").await.unwrap();
-    assert_eq!(done.status, RUN_SUCCEEDED);
+    assert_eq!(done.status, "succeeded");
     assert_eq!(done.output, Some(json!({"ok": true})));
     assert!(done.ended_at.is_some(), "终态必须落结束时间");
 

@@ -105,14 +105,12 @@ async fn craft_partial_log(dir: &Path, run_id: &str, nodes_started: &[&str]) {
     )
     .await
     .unwrap();
-    for (i, node_id) in nodes_started.iter().enumerate() {
+    for node_id in nodes_started {
         log.append(
             run_id,
             Event::NodeStarted {
                 node_id: (*node_id).to_string(),
                 attempt: 1,
-                idempotency_key: format!("{run_id}:{node_id}:1"),
-                params_hash: format!("hash-{i}"),
             },
         )
         .await

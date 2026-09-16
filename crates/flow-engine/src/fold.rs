@@ -257,8 +257,6 @@ mod tests {
                 Event::NodeStarted {
                     node_id: "n1".into(),
                     attempt: 1,
-                    idempotency_key: "r1:n1:1".into(),
-                    params_hash: "h".into(),
                 },
             ),
             env(
@@ -275,8 +273,6 @@ mod tests {
                 Event::NodeStarted {
                     node_id: "n1".into(),
                     attempt: 2,
-                    idempotency_key: "r1:n1:2".into(),
-                    params_hash: "h".into(),
                 },
             ),
             env(
@@ -329,8 +325,6 @@ mod tests {
             Event::NodeStarted {
                 node_id: "n1".into(),
                 attempt: 2,
-                idempotency_key: "k".into(),
-                params_hash: "h".into(),
             },
         ));
         assert!(!state.outputs.contains_key("n1"));

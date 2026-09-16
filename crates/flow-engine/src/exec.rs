@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
@@ -45,7 +45,7 @@ pub struct NodeExecContext {
     pub node: Node,
     pub input: Value,
     /// 前驱节点输出快照（决定论输入）
-    pub outputs: Arc<HashMap<String, Value>>,
+    pub outputs: HashMap<String, Value>,
     pub preds: Vec<String>,
 }
 
@@ -85,15 +85,18 @@ pub async fn execute(ctx: &NodeExecContext, cancel: &CancellationToken) -> Resul
     }
 }
 
-fn collect_end_output(ctx: &NodeExecContext) -> Value {
-    if ctx.preds.len() == 1 {
-        return ctx
-            .outputs
-            .get(&ctx.preds[0])
-            .cloned()
-            .unwrap_or(Value::Null);
+/// 单数透传、复数映射：end 节点输出与 run 最终输出共用同一条规则。
+/// 单个来源直接透传其值；多个来源组成 {id: value} 映射，缺失的补 null。
+pub fn singular_or_map(mut entries: Vec<(String, Value)>) -> Value {
+    if entries.len() == 1 {
+        let (_, value) = entries.pop().unwrap();
+        return value;
     }
-    Value::Object(
+    Value::Object(entries.into_iter().collect())
+}
+
+fn collect_end_output(ctx: &NodeExecContext) -> Value {
+    singular_or_map(
         ctx.preds
             .iter()
             .map(|p| (p.clone(), ctx.outputs.get(p).cloned().unwrap_or(Value::Null)))
@@ -133,6 +136,7 @@ async fn run_condition(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
 }
 
 /// 条件节点的真值判定。引擎用它选出口端口，节点输出保持为求值结果本身。
+/// 语义与 JS Boolean() 一致（"false"、"0" 都是真），因为求值语言就是 JS。
 pub fn truthy(value: &Value) -> bool {
     match value {
         Value::Null => false,
@@ -224,7 +228,16 @@ async fn run_http(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
         .iter()
         .map(|(k, v)| (k.to_string(), Value::String(v.to_str().unwrap_or("").to_string())))
         .collect();
-    let text = response.text().await.unwrap_or_default();
+    let text = match response.text().await {
+        Ok(text) => text,
+        // 连接在读完响应头之后断开：body 不完整。不能带着 200 + 空 body 记成功
+        Err(err) => {
+            return Err(NodeFailure::retryable(format!(
+                "读取 {url} 响应体失败（{}ms）：{err}",
+                started.elapsed().as_millis()
+            )));
+        }
+    };
     let body = serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text));
 
     let output = serde_json::json!({
@@ -251,9 +264,67 @@ async fn run_http(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
 
 fn truncate(value: &Value) -> String {
     let text = value.to_string();
-    if text.len() > 512 {
-        format!("{}…", &text[..512])
-    } else {
-        text
+    if text.len() <= 512 {
+        return text;
+    }
+    // 512 字节可能落在多字节 UTF-8 字符中间，回退到最近的字符边界再切
+    let mut end = 512;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn truncate_cuts_on_utf8_char_boundary() {
+        // 300 个三字节字符：512 字节处落在字符中间，修复前这里直接 panic
+        let value = json!("宁".repeat(300));
+        let cut = truncate(&value);
+        assert!(cut.ends_with('…'), "{cut}");
+    }
+
+    #[tokio::test]
+    async fn http_body_truncated_mid_stream_is_retryable_failure() {
+        // 回归：服务器声明 Content-Length: 100 却只发 10 字节就断开。
+        // 修复前 text() 的 Err 被吞成空字符串，节点带着 200 + 空 body 记成功。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf).await; // 丢弃请求
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+                .await
+                .unwrap();
+            sock.write_all(b"0123456789").await.unwrap();
+            // 不足 Content-Length 就关闭，让响应体确定性地断流
+        });
+
+        let node = crate::model::Node {
+            id: "h".into(),
+            node_type: "http_call".into(),
+            name: String::new(),
+            position: None,
+            params: json!({ "url": format!("http://{addr}/pay"), "method": "POST" }),
+        };
+        let ctx = NodeExecContext {
+            node,
+            input: json!({"amount": 1}),
+            outputs: HashMap::new(),
+            preds: vec![],
+        };
+        let failure = execute(&ctx, &CancellationToken::new()).await.unwrap_err();
+        assert!(
+            failure.retryable,
+            "响应体断流必须判为可重试失败：{}",
+            failure.message
+        );
     }
 }

@@ -5,7 +5,7 @@ use flow_engine::{
     DbRunStatus, Definition, Engine, EngineError, Envelope, ResumeOutcome, RunObserver, RunPhase,
     RunState, Signal, StartRun, StatusUpdate,
 };
-use flow_store::{Store, StoreError, RUN_FAILED, RUN_RUNNING};
+use flow_store::{Store, StoreError};
 use futures::future::BoxFuture;
 use jsonrpsee::core::RegisterMethodError;
 use jsonrpsee::server::{Server, ServerHandle, SubscriptionMessage};
@@ -293,7 +293,7 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
         let run_id = uuid::Uuid::now_v7().to_string();
         state
             .store
-            .insert_run(&run_id, &p.workflow_id, version, &input, RUN_RUNNING)
+            .insert_run(&run_id, &p.workflow_id, version, &input, DbRunStatus::Running.as_str())
             .await
             .map_err(store_err)?;
 
@@ -308,7 +308,7 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
             let message = err.to_string();
             state
                 .store
-                .set_run_status(&run_id, RUN_FAILED, None, Some(&message))
+                .set_run_status(&run_id, DbRunStatus::Failed.as_str(), None, Some(&message))
                 .await
                 .ok();
             return Err(engine_err(err));
@@ -635,5 +635,50 @@ fn engine_err(err: EngineError) -> ErrorObjectOwned {
             invalid(err.to_string())
         }
         other => internal(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 状态词汇表契约：引擎 DbRunStatus 的每个取值都必须被 store 接受；
+    /// 词汇表外的字符串必须在写入时被拒绝——否则 run 会从崩溃恢复扫描里静默消失。
+    #[tokio::test]
+    async fn engine_run_statuses_are_the_only_statuses_store_accepts() {
+        let path = std::env::temp_dir()
+            .join(format!("flow-rpc-status-contract-{}", uuid::Uuid::now_v7()));
+        let store = Store::open(&path).await.unwrap();
+
+        let statuses = [
+            DbRunStatus::Running,
+            DbRunStatus::AwaitingResume,
+            DbRunStatus::Succeeded,
+            DbRunStatus::Failed,
+            DbRunStatus::Cancelled,
+        ];
+        for (i, status) in statuses.iter().enumerate() {
+            let run_id = format!("r-{i}");
+            store
+                .insert_run(&run_id, "wf", 1, &Value::Null, status.as_str())
+                .await
+                .unwrap();
+            store
+                .set_run_status(&run_id, status.as_str(), None, None)
+                .await
+                .unwrap();
+        }
+
+        // 非终态必须进入未完成扫描（这是恢复的输入）
+        assert_eq!(store.unfinished_runs().await.unwrap().len(), 2);
+
+        // 词汇表外的状态在写入时当场报错
+        let err = store
+            .insert_run("r-unknown", "wf", 1, &Value::Null, "paused")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("paused"), "{err}");
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }

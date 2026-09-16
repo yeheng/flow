@@ -24,6 +24,8 @@ pub enum StoreError {
     VersionNotPublished(String, i64),
     #[error("run 不存在：{0}")]
     RunNotFound(String),
+    #[error("非法的 run 状态：{0}")]
+    InvalidStatus(String),
     #[error("json 错误：{0}")]
     Json(#[from] serde_json::Error),
 }
@@ -70,11 +72,24 @@ pub struct RunRecord {
 pub const STATUS_DRAFT: &str = "draft";
 pub const STATUS_PUBLISHED: &str = "published";
 
-pub const RUN_RUNNING: &str = "running";
-pub const RUN_AWAITING_RESUME: &str = "awaiting_resume";
-pub const RUN_SUCCEEDED: &str = "succeeded";
-pub const RUN_FAILED: &str = "failed";
-pub const RUN_CANCELLED: &str = "cancelled";
+// 写入入口统一经 ensure_run_status 校验，两边脱钩时当场报错，
+// 而不是让 run 从 unfinished_runs 的恢复扫描里静默消失。
+const RUN_RUNNING: &str = "running";
+const RUN_AWAITING_RESUME: &str = "awaiting_resume";
+const RUN_SUCCEEDED: &str = "succeeded";
+const RUN_FAILED: &str = "failed";
+const RUN_CANCELLED: &str = "cancelled";
+
+fn ensure_run_status(status: &str) -> Result<(), StoreError> {
+    if matches!(
+        status,
+        RUN_RUNNING | RUN_AWAITING_RESUME | RUN_SUCCEEDED | RUN_FAILED | RUN_CANCELLED
+    ) {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidStatus(status.to_string()))
+    }
+}
 
 /// 定义与 run 元数据的存储。执行状态不在这里——那是 event.jsonl 的事。
 pub struct Store {
@@ -348,6 +363,7 @@ impl Store {
         input: &Value,
         status: &str,
     ) -> Result<(), StoreError> {
+        ensure_run_status(status)?;
         sqlx::query(
             "INSERT INTO runs (id, workflow_id, workflow_version, status, input, started_at)
              VALUES (?, ?, ?, ?, ?, ?)",
@@ -371,6 +387,7 @@ impl Store {
         output: Option<&Value>,
         error: Option<&str>,
     ) -> Result<(), StoreError> {
+        ensure_run_status(status)?;
         let terminal = matches!(status, RUN_SUCCEEDED | RUN_FAILED | RUN_CANCELLED);
         let affected = sqlx::query(
             "UPDATE runs SET status = ?, output = COALESCE(?, output), error = COALESCE(?, error),
