@@ -136,15 +136,14 @@ async fn run_condition(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
 }
 
 /// 条件节点的真值判定。引擎用它选出口端口，节点输出保持为求值结果本身。
-/// 语义与 JS Boolean() 一致（"false"、"0" 都是真），因为求值语言就是 JS。
+/// 对 JSON 值与 JS Boolean() 一致（空数组、空对象、"false"、"0" 都是真）。
 pub fn truthy(value: &Value) -> bool {
     match value {
         Value::Null => false,
         Value::Bool(b) => *b,
         Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
         Value::String(s) => !s.is_empty(),
-        Value::Array(a) => !a.is_empty(),
-        Value::Object(o) => !o.is_empty(),
+        Value::Array(_) | Value::Object(_) => true,
     }
 }
 
@@ -281,6 +280,18 @@ mod tests {
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn json_truthiness_matches_javascript() {
+        for value in [
+            json!(null), json!(false), json!(true), json!(0), json!(-1),
+            json!(""), json!("false"), json!("0"), json!([]), json!({}),
+            json!([0]), json!({"x": false}),
+        ] {
+            let expected = expr::eval_expr("Boolean(input)", &value, &Value::Null, Duration::from_secs(1)).unwrap();
+            assert_eq!(json!(truthy(&value)), expected, "{value}");
+        }
+    }
 
     #[test]
     fn truncate_cuts_on_utf8_char_boundary() {

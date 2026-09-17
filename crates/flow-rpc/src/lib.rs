@@ -132,7 +132,19 @@ pub async fn recover_unfinished(state: &AppState) -> Result<Vec<(String, String)
                     .await?;
                 tracing::info!(run_id = %run.id, "事件日志已终结，回填 DB 状态");
             }
-            Err(err) => failures.push((run.id.clone(), err.to_string())),
+            Err(err) => {
+                let message = err.to_string();
+                if matches!(err, EngineError::RunNotFound(_) | EngineError::LogCorrupted(_)) {
+                    // A missing log is never evidence that replaying side effects is safe.
+                    let status = if run.status == DbRunStatus::Initializing.as_str() {
+                        DbRunStatus::Failed
+                    } else {
+                        DbRunStatus::AwaitingResume
+                    };
+                    state.store.set_run_status(&run.id, status.as_str(), None, Some(&message)).await?;
+                }
+                failures.push((run.id.clone(), message));
+            }
         }
     }
     Ok(failures)
@@ -292,6 +304,9 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
             .get_version(&p.workflow_id, Some(version))
             .await
             .map_err(store_err)?;
+        if !stored.is_published() {
+            return Err(store_err(StoreError::VersionNotPublished(p.workflow_id, version)));
+        }
         let definition: Definition = serde_json::from_value(stored.definition)
             .map_err(|e| invalid(format!("定义结构非法：{e}")))?;
         definition.validate().map_err(invalid)?;
@@ -300,7 +315,7 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
         let run_id = uuid::Uuid::now_v7().to_string();
         state
             .store
-            .insert_run(&run_id, &p.workflow_id, version, &input, DbRunStatus::Running.as_str())
+            .insert_run(&run_id, &p.workflow_id, version, &input, DbRunStatus::Initializing.as_str())
             .await
             .map_err(store_err)?;
 
@@ -655,11 +670,12 @@ mod tests {
     /// 词汇表外的字符串必须在写入时被拒绝——否则 run 会从崩溃恢复扫描里静默消失。
     #[tokio::test]
     async fn engine_run_statuses_are_the_only_statuses_store_accepts() {
-        let path = std::env::temp_dir()
+        let root = std::env::temp_dir()
             .join(format!("flow-rpc-status-contract-{}", uuid::Uuid::now_v7()));
-        let store = Store::open(&path).await.unwrap();
+        let store = Store::open(root.join("flow.db")).await.unwrap();
 
         let statuses = [
+            DbRunStatus::Initializing,
             DbRunStatus::Running,
             DbRunStatus::AwaitingResume,
             DbRunStatus::Succeeded,
@@ -679,7 +695,7 @@ mod tests {
         }
 
         // 非终态必须进入未完成扫描（这是恢复的输入）
-        assert_eq!(store.unfinished_runs().await.unwrap().len(), 2);
+        assert_eq!(store.unfinished_runs().await.unwrap().len(), 3);
 
         // 词汇表外的状态在写入时当场报错
         let err = store
@@ -688,6 +704,7 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("paused"), "{err}");
 
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

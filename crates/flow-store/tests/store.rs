@@ -137,3 +137,51 @@ async fn workflow_summary_reports_latest_and_published_versions() {
 
     std::fs::remove_dir_all(path.parent().unwrap()).ok();
 }
+
+#[tokio::test]
+async fn concurrent_saves_return_their_own_versions_and_deduplicate_identical_definitions() {
+    let (store, path) = store().await;
+    let store = std::sync::Arc::new(store);
+    let workflow = store.create_workflow("concurrent").await.unwrap();
+    for identical in [false, true] {
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(32));
+        let mut workers = Vec::new();
+        for marker in 0..32 {
+            let store = store.clone();
+            let workflow = workflow.clone();
+            let barrier = barrier.clone();
+            workers.push(tokio::spawn(async move {
+                let definition = def(&if identical { "same".to_string() } else { marker.to_string() });
+                barrier.wait().await;
+                let version = store.update_workflow(&workflow, &definition).await.unwrap();
+                let stored = store.get_version(&workflow, Some(version)).await.unwrap();
+                assert_eq!(stored.definition, definition);
+                version
+            }));
+        }
+        let mut versions = std::collections::HashSet::new();
+        for worker in workers {
+            versions.insert(worker.await.unwrap());
+        }
+        assert_eq!(versions.len(), if identical { 1 } else { 32 });
+    }
+    assert_eq!(store.latest_version(&workflow).await.unwrap().unwrap().version, 33);
+    drop(store);
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn status_updates_clear_resolved_errors() {
+    let (store, path) = store().await;
+    store.insert_run("r", "w", 1, &json!(null), "initializing").await.unwrap();
+    assert_eq!(store.unfinished_runs().await.unwrap().len(), 1);
+    store.set_run_status("r", "awaiting_resume", None, Some("needs adjudication")).await.unwrap();
+    store.set_run_status("r", "running", None, None).await.unwrap();
+    assert!(store.get_run("r").await.unwrap().error.is_none());
+    store.set_run_status("r", "succeeded", Some(&json!(7)), None).await.unwrap();
+    let row = store.get_run("r").await.unwrap();
+    assert!(row.error.is_none());
+    assert_eq!(row.output, Some(json!(7)));
+    drop(store);
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}

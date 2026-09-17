@@ -1,259 +1,218 @@
 # flow 调度者 + Executor 模式设计
 
-> 状态：**设计稿，未实现**。`DISTRIBUTED.md` 的姊妹篇——两者共享
-> 租约防双写（其 §5.3）与全部恢复不变量（其 §7），区别只在「谁发起租约」。
-> 对等模式（executor 抢占）与本文的指派模式可以在同一集群**共存**（§7）。
+> 状态：**设计稿，未实现**。依赖 DISTRIBUTED.md 的行锁、lease epoch、持久 inbox 与副作用边界。
+> 本文新增持久容量预留与指派决策，不允许和对等抢占模式在同一集群混跑。
 
-## 1. 先回答：调度者到底「调度」什么
+## 1. 需要解决的决策
 
-中心化调度不是把架构画得更好看，它必须有**对等模式做不了的决策内容**。
-逐条审视，只有这些是真需求：
+只需要 HA 和多个 executor 时使用对等模式。需要以下决策时再引入 scheduler：
 
-| 决策 | 对等模式的困境 | 调度者的解法 |
-|---|---|---|
-| **优先级** | 抢占是 `LIMIT` 先扫到先服务，run 多了以后「先创建先跑」不合理 | 全局视图排序 `priority DESC, started_at ASC` |
-| **工作流级并发上限** | 每个 executor 只知道自己局部的 run 数，无法限制「workflow X 最多同时跑 10 个」 | 指派前 `COUNT` 校验，天然全局 |
-| **配额/公平** | 多租户下一个高频 workflow 打满集群，其他 workflow 饿死 | 按 workflow/租户维度分配容量 |
-| **可运维的调度决策** | 「为什么这个 run 在那台机器上」没有答案，散在 N 个 executor 的日志里 | 决策集中在一处，可审计、可解释 |
+| 决策 | 本模式的规则 |
+|---|---|
+| 优先级 | 对当前可指派 run 按 priority DESC、started_at ASC、id 排序 |
+| 工作流并发上限 | 同一 workflow 的未释放租约预留数不得超过上限 |
+| executor 容量 | 未释放租约预留数不得超过 capacity，包含已指派未认领的 run |
+| 调度可审计 | 记录 run、目标 instance、epoch、决策依据 |
 
-**反面清单**（这些不是上调度者的理由）：
+这些规则可以在数据库中实现，不能声称“存在中心进程就天然满足全局约束”。
+租户配额、加权公平和饥饿避免需要独立业务规则与数据模型，当前不承诺实现。
+持续高优先级流量下低优先级任务可能等待；不得把严格优先级排序描述为公平队列。
 
-- 「抢占有惊群」——那是实现问题，`SELECT ... FOR UPDATE SKIP LOCKED` 就是
-  数据库原生的无惊群抢占，**不需要任何调度进程**；
-- 「负载均衡」——对等抢占本身就是负载均衡（闲的抢得多）；
-- 「看起来更企业级」——空转的调度者是一个把 DB 写放大成「DB + 进程内存」
-  的转发器，多一个故障点，少一分诚实。
+## 2. 数据与所有权
 
-**结论**：需要优先级/配额/工作流级限流 → 本文；只要 HA 和横向扩展 →
-`DISTRIBUTED.md` 的对等模式就够，别给自己加进程。
+保留 DISTRIBUTED.md 的 `lease_owner / lease_epoch / lease_expires_at / last_seq`，
+不改名为另一组同义字段。scheduler 将 lease_owner 设置为 executor 的进程实例 id；
+executor 只续期、追加与释放，不能自行获取无主 run。
 
-## 2. 核心设计：指派 = 租约换个发起方
+**指派即持久容量预留**。容量真值是 runs 表内非空、非终态的租约数量，包含尚未认领的指派。
+已过期的租约在明确持锁回收前仍占名额，不能仅凭时间条件从计数中排除。
+心跳中的 inflight 只能作监控，不参与容量或配额的正确性判断。
 
-整个模式可以压缩成一句话：
-
-> **lease_owner 改名 assigned_to；「获取租约」的动作从 executor 抢占（UPDATE
-> ... WHERE expires < now()）改为 scheduler 指派（UPDATE ... SET assigned_to = $e）；
-> 续期、释放、防双写、接手恢复全部不变。**
-
-三个动作的归属变化：
-
-| 动作 | 对等模式 | 指派模式 |
-|---|---|---|
-| 获取（谁写 assigned_to） | executor 自己抢 | **scheduler 指派** |
-| 续期（谁延期） | executor 心跳（不变） | executor 心跳（不变） |
-| 释放/改派 | executor finalize 后清空；死亡靠 TTL 过期 | 同左；**外加 scheduler 主动改派** |
-
-防双写 SQL 与 `DISTRIBUTED.md` §5.3 **逐字相同**（只换列名）：
-
-```sql
-INSERT INTO run_events (run_id, seq, ts, payload)
-VALUES ($run_id, $seq, now(), $payload)
-WHERE EXISTS (
-    SELECT 1 FROM runs
-    WHERE id = $run_id
-      AND assigned_to = $me
-      AND assigned_expires_at > now()
-);
--- 影响 0 行 → EngineError::LeaseLost → Driver 静默退出（真相由被指派者决定）
-```
-
-改派竞态无需新机制：scheduler 改派的瞬间老 executor 若还在写事件，
-条件里 `assigned_to = $me` 已不成立——写被物理拒绝，老 executor 静默退出。
-这与脑裂防写的语义是同一条不变量：**「写事件必须在有效指派内，校验与写入同事务」**。
+每个 run 的写入/接管仍严格执行 DISTRIBUTED.md §5：同一行锁、持锁后检查时间、epoch fencing。
+普通 EXISTS 条件不是隔离协议。终态事件、元数据和释放必须原子提交。
 
 ## 3. 架构
 
-```
-                     ┌────────────────────┐
-                     │  scheduler（×1 活跃）│←─ standby（advisory lock 选主，§6）
-                     │  无状态：决策循环    │
-                     └─────────┬──────────┘
-                               │ 指派（写 runs.assigned_to）
-                               ▼
-   ┌────────────┐      ┌────────────┐      ┌────────────┐
-   │ executor A │      │ executor B │      │ executor C │   ← 只认领 assigned_to = me
-   │ 认领+驱动+  │      │            │      │            │     的 run；心跳续期
-   │ 心跳续期    │      │            │      │            │
-   └─────┬──────┘      └─────┬──────┘      └─────┬──────┘
-         │    心跳 / 事件写入 / 信号轮询（全部经 DB）    │
-         └────────────────────┼────────────────────┘
-                              ▼
-                        Postgres（唯一协调点）
-                        run_events / runs(+指派列) /
-                        run_signals / executors / workflows(+并发上限)
+```text
+client -> gateway -> Postgres <- scheduler (one active session)
+                         ^
+                         |
+                    executor 1..N
 ```
 
-gateway 角色不变（`DISTRIBUTED.md` §10）：WS 客户端连任意 gateway，
-gateway 照旧写 `runs` + `run_signals`，与 scheduler、executor 均无直接通信。
-**scheduler 与 executor 之间也不直接通信**——指派、心跳、死亡判定全部
-通过数据库行，延续了「DB 是唯一协调点」的边界。
+所有组件通过数据库协调。scheduler 只负责授予租约与预留容量，不参与节点结果和信号投递。
+调度器停止时，持有有效租约的 executor 可以继续续期和运行；新 run 与需要重新指派的 run 等待调度恢复。
+不自动退回对等模式，因为那会绕过优先级和工作流上限。
 
-## 4. 数据模型（相对 DISTRIBUTED.md 的 delta）
+## 4. 数据模型
 
 ```sql
--- 4.1 新表：executor 注册与心跳
-CREATE TABLE executors (
-    id               TEXT PRIMARY KEY,     -- FLOW_NODE_ID
-    capacity         INT  NOT NULL,        -- FLOW_MAX_RUNS（executor 自己声明）
-    inflight         INT  NOT NULL DEFAULT 0, -- executor 心跳上报的真值镜像
-    last_heartbeat_at TIMESTAMPTZ NOT NULL,
-    started_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+CREATE TABLE cluster_settings (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    scheduling_mode TEXT NOT NULL CHECK (scheduling_mode IN ('peer', 'scheduled'))
 );
 
--- 4.2 runs：lease_owner / lease_expires_at 更名为
---     assigned_to / assigned_expires_at（语义：指派即租约，见 §2）
+CREATE TABLE executors (
+    instance_id TEXT PRIMARY KEY,
+    node_name TEXT NOT NULL,
+    capacity INT NOT NULL CHECK (capacity > 0),
+    accepting BOOLEAN NOT NULL DEFAULT TRUE,
+    observed_inflight INT NOT NULL DEFAULT 0 CHECK (observed_inflight >= 0),
+    last_heartbeat_at TIMESTAMPTZ NOT NULL,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
 
--- 4.3 决策输入（调度者存在的理由，§1）
-ALTER TABLE runs ADD COLUMN priority INT NOT NULL DEFAULT 0;
--- run.start 增加 priority 参数（0-9）
-ALTER TABLE workflows ADD COLUMN max_concurrent_runs INT;
--- NULL = 不限；scheduler 指派时校验
+ALTER TABLE runs ADD COLUMN priority INT NOT NULL DEFAULT 0
+    CHECK (priority BETWEEN 0 AND 9);
+ALTER TABLE workflows ADD COLUMN max_concurrent_runs INT
+    CHECK (max_concurrent_runs IS NULL OR max_concurrent_runs > 0);
+CREATE INDEX runs_active_leases ON runs (lease_owner, lease_expires_at)
+    WHERE status IN ('running', 'awaiting_resume');
+CREATE INDEX workflow_active_leases ON runs (workflow_id, lease_expires_at)
+    WHERE status IN ('running', 'awaiting_resume');
 ```
 
-`executors.inflight` 是镜像不是权威——真值在 executor 进程内（registry），
-心跳携带上报。scheduler 基于镜像做指派，最坏情况短暂过载一个 run，
-finalize 时被纠正。**不做反向对账**（YAGNI，等出问题再说）。
+共享表内保存集群模式，不能只靠各进程的环境变量各自决定。启动时配置不匹配必须拒绝服务，
+所有租约获取入口也须校验数据库模式，避免已有旧进程继续使用错误路径。
+同 node_name 重启生成新 instance_id，不能通过 upsert 复活上一进程身份。
 
-## 5. 协议
+## 5. 指派协议
 
 ### 5.1 executor 生命周期
 
-```
-注册   启动时 INSERT INTO executors (id, capacity, ...) ON CONFLICT UPDATE
-心跳   每 TTL/3（TTL 默认 15s，同对等模式）：
-       UPDATE executors SET last_heartbeat_at = now(), inflight = $n WHERE id = $me;
-       同时为每个持有中的 run 续期：
-       UPDATE runs SET assigned_expires_at = now() + $ttl
-       WHERE id = $run_id AND assigned_to = $me;
-       -- 0 行 = 已被改派 → 立即静默退出该 run 的 Driver
-退出   正常关闭：finalize 在跑的 run 或显式移交；DELETE FROM executors
-```
+启动时注册新 instance_id，心跳更新活性与 observed_inflight。
+已有 run 逐个按 DISTRIBUTED.md §5.2 续期，需 owner/epoch 匹配且租约尚未过期；
+不能让过期指派在容量名额已被重新分配后通过迟到心跳恢复有效。
 
-### 5.2 scheduler 决策循环（每 1s，`FLOW_SCHEDULER_INTERVAL_MS`）
+认领扫描只读取 owner=本实例、租约未过期、status 非终态的 run。
+每个 instance 内按 run_id/epoch 防止重复 spawn；恢复期间也计入本地容量。
+已经因 LeaseLost 停止的 epoch 不得在下一次扫描中重新启动。
+executor 应先通过受保护续期确认指派仍有效，再恢复日志；所有后续追加继续校验 epoch。
 
-三个步骤，每步幂等，循环崩溃重启无恢复成本：
+正常 drain 先 accepting=false，继续续期直到已持有 run 结束。
+需要强制移交时依 DISTRIBUTED.md §7 处理在途副作用，再停止本地 Driver、按原 epoch 释放。
+没有未释放租约时才删除 executor 注册信息。心跳超时是活性怀疑，不等于进程死亡。
 
-```
-① 死亡清理
-   UPDATE runs SET assigned_to = NULL, assigned_expires_at = NULL
-   WHERE assigned_to IN (
-       SELECT id FROM executors
-       WHERE last_heartbeat_at < now() - $ttl)
-     AND status IN ('running', 'awaiting_resume');
-   -- 心跳超时 = 死亡。改派后的接手走 resume_run + classify，
-   -- 与对等模式的租约过期接手完全同一条代码路径——
-   -- DISTRIBUTED.md §2 的核心洞察在本模式仍然成立：
-   -- 「指派过期接管 ≡ 进程崩溃重启」。
+### 5.2 每次指派的事务
 
-② 容量计算
-   候选 executor = 心跳新鲜且 inflight < capacity 的集合
+周期扫描只是选择候选；每个指派在同一连接的 READ COMMITTED 事务执行，锁序为：
+**workflow 行 → 目标 executor 行 → run 行**。
 
-③ 指派
-   无主 run（assigned_to IS NULL AND status IN running, awaiting_resume）
-   ORDER BY priority DESC, started_at ASC
-   逐个：校验 workflow 并发上限 → 挑 (capacity - inflight) 最大的 executor →
-   UPDATE runs SET assigned_to = $e, assigned_expires_at = now() + $ttl
-   WHERE id = $run_id AND assigned_to IS NULL
-   -- 0 行 = 被并发指派抢了（多 scheduler 实例时），跳过即可
-```
+1. 确认本连接仍是 scheduler 活跃会话，数据库模式为 scheduled。
+2. 锁 workflow 与 executor 行，之后重新查询该 workflow 和该 instance 的未释放租约数量。
+3. 检查 capacity、max_concurrent_runs、accepting 和心跳活性；容量不足则不指派。
+4. 锁候选 run 行，再检查它属于该 workflow、非终态，且租约为空。过期租约先按 §5.3 回收。
+5. 更新 owner=目标 instance、epoch=epoch+1、expires_at=clock_timestamp()+TTL，提交。
 
-**executor 视角的认领**（与对等模式的扫描几乎相同，只是过滤条件从
-「租约过期可抢」变成「指派给我」）：
+所有指派者、capacity 和 workflow 上限的修改者遵守相同前置锁序。
+不得将“COUNT 后 UPDATE”拆成无锁的两个事务，或者只在内存里减去本轮已经指派的名额。
+COUNT 在拿到控制行锁之后用新的语句执行，以看到之前指派事务已提交的结果。
 
-```
-每 2s：SELECT id FROM runs
-       WHERE assigned_to = $me AND status IN ('running','awaiting_resume')
-         AND id NOT IN (本进程已驱动的 run)
-       → resume_run → RecoveryPlan::classify → 重放/裁决/续等
-```
-
-### 5.3 故障矩阵
-
-| 故障 | 影响 | 恢复 |
-|---|---|---|
-| executor 死亡 | 其 run 无人驱动 | 心跳超时（≤TTL）→ scheduler 清理 → 改派 → classify 接手 |
-| scheduler 死亡（有 standby） | 新 run 停在无主 ≤ 选主超时（≤10s） | advisory lock 过期 → standby 转正 |
-| scheduler 死亡（无 standby） | 新 run 停在无主；**在跑的 run 完全不受影响**（executor 心跳续期不依赖 scheduler） | 拉起 scheduler 即恢复，零状态迁移 |
-| Postgres 死亡 | 全停，零丢失 | DB 恢复即全量续跑（同对等模式） |
-
-第三行是本设计最重要的安全性质：**scheduler 只在「指派时刻」起作用**，
-不参与任何数据面（事件写入、信号、续期）。它的可用性预算与 gateway 同级，
-远低于 executor。
-
-## 6. scheduler 高可用：advisory lock 选主
-
-不引入 Raft/etcd。scheduler 可以部署多个实例，同一时刻只有一个活跃：
+持久预留的计数谓词为：
 
 ```sql
--- 会话级咨询锁：持锁者即主。进程死亡连接断开，锁自动释放。
-SELECT pg_try_advisory_lock(hashtext('flow-scheduler'));
+SELECT count(*) FROM runs
+WHERE workflow_id = $1
+  AND status IN ('running', 'awaiting_resume')
+  AND lease_owner IS NOT NULL;
 ```
 
-- active 实例：持锁，跑 §5.2 循环；
-- standby 实例：每 5s `try_lock` 一次，拿到即转正；
-- 决策幂等性保证切换安全：重复指派被 `WHERE assigned_to IS NULL` 挡住，
-  改派判定基于心跳超时（确定性输入），双主窗口内最坏情况是同一 run
-  被先后指派给两个 executor——第二个 UPDATE 因 assigned_to 非空而失败，
-  且防双写（§2）在事件层物理兜底。
+executor 计数把 workflow_id 条件替换为 lease_owner。相应的 workflow/executor 行锁必须已经持有。
+该锁使所有增加同一受限集合的指派串行化；完成/释放只减少占用，续期不改变预留数。
+不能用 expires_at > now 过滤计数：续期可能在到期前获准、到期后才提交；并发 COUNT 看见
+过期的旧版本会提前释放名额，然后迟到续期提交就会超配。明确回收必须与续期锁同一 run 行。
+目标 run 抢占失败时事务不新增预留，继续尝试其他候选。
 
-选主代码量约 50 行。**要更强的 scheduler HA 之前，先问为什么 gateway 不需要**——
-它们是同级的无状态协调者。
+容量和工作流上限限定的是**未释放预留数**，不是数据库外尚未结束的 HTTP 请求数。
+旧持有者副作用仍可能在途，要求限制远端并发时必须由下游或额外执行隔离保证。
+human_task 和 awaiting_resume 同样占用预留；等待节点休眠并释放配额不是当前设计的一部分。
+降低上限不能撤销已有合法执行：若低于当前预留数，配置修改返回 conflict，需先 drain。
 
-## 7. 与对等模式的共存与选择
+### 5.3 过期指派与选择策略
 
-两种模式共享 §2 的租约列与防双写不变量，差异只在「谁写 assigned_to」：
+扫描同时检查无租约和已过期租约的 run，不能漏掉过期但 owner 非空的行。
+过期回收事务按 workflow → 原 executor → run 的顺序加锁，重新检查 owner/epoch 及
+clock_timestamp 下的过期状态；仍过期则 epoch+1 并清空租约，提交后释放名额。
+若等待 run 锁期间续期已经提交，必须读到新值并放弃回收。回收后再走 §5.2 新指派。
+executor 心跳超时后停止向它指派新 run；现有租约仍以各自的 expires_at 为接管依据，
+不靠批量清空 owner 提前撤销有效租约。
 
-| | 对等模式（DISTRIBUTED.md） | 指派模式（本文） |
-|---|---|---|
-| 谁写 assigned_to | executor 抢占 | scheduler 指派 |
-| 需要新进程 | 否 | 是（scheduler ×1 活跃） |
-| 优先级/配额/工作流级限流 | 无 | 有 |
-| run 等待指派的额外延迟 | 无（直接抢） | ≤ 心跳周期 + 决策周期（~3s） |
-| 复杂度 | 低 | 中（多一个角色 + 一张表 + 选主） |
+按 priority、started_at、id 排序，跳过当前受 workflow 上限阻塞的候选。
+选择具有持久剩余容量的活跃 executor，在指派事务内重新验证容量。
+一次指派即使 executor 尚未轮询到，也已经占用名额；调度器重启后直接从数据库恢复计数。
 
-**共存**：指派模式的 executor 认领条件是 `assigned_to = $me`；
-对等模式的 executor 抢占条件是 `assigned_expires_at IS NULL OR < now()`。
-把抢占条件收紧为「`assigned_to IS NULL` 才可抢」，两种 executor 即可混跑——
-scheduler 存在时它的指派优先落地，scheduler 缺席时对等抢占兜底。
-小集群起步用对等，规模上来加装 scheduler，**不需要迁移任何数据**。
+## 6. scheduler 高可用
 
-## 8. 分阶段实施
+使用专用数据库连接持有会话级 advisory lock：
 
-依赖 `DISTRIBUTED.md` 的 Phase 0（trait 化）与 Phase 1（Postgres + 租约）先行完成。
+```sql
+SELECT pg_try_advisory_lock(74102, 1);
+```
 
-### Phase S1：指派内核
+固定的两个 int 是本服务保留的命名空间和锁号。活跃者仅在这条**相同连接**执行决策事务，
+不能持锁连接独立存活，却用连接池里的其他连接继续指派。连接中断、状态不明或重新连接时，
+立即停止决策；新连接先重新获得锁，才能恢复。
+standby 每隔一段时间尝试获取，成功后读取持久状态继续。
 
-- `runs` 列更名（lease → assigned）+ `executors` 表 + 注册/心跳/认领；
-- scheduler 进程骨架：§5.2 三步循环 + advisory lock 选主；
-- **验收**：双 executor + 单 scheduler，SIGKILL 持有者 → 改派接手语义正确
-  （复用对等模式 Phase 1 的三个集成测试，仅把「抢占」换成「被指派」）；
-  SIGSTOP 双写防护测试结果必须与对等模式逐字一致。
+会话锁**没有 TTL**。正常连接关闭后锁释放，网络分区下需等待 PostgreSQL 检测会话失效。
+必须配置并验证 TCP keepalive、连接检测以及 statement/idle transaction 超时；
+没有这些测量结果时不承诺“10 秒内切换”。不能把 scheduler 与 gateway 的可用性要求混为一谈：
+scheduler 暂停会阻止新指派，gateway 可以多副本独立接请求。
 
-### Phase S2：调度决策（scheduler 存在的理由落地）
+即使部署错误产生并行决策，§5.2 的控制行锁仍保护容量与 workflow 上限，run 行锁和 epoch
+仍保护日志顺序。`owner IS NULL` 本身既不能保护全局配额，也不能替代选主连接规则。
 
-- `priority`、`max_concurrent_runs` + `run.start` 传参；
-- 指派审计：决策写入 tracing 日志（「run X → executor Y，因为 Z」）；
-- **验收**：高优先级 run 插队语义；workflow 并发上限在多 executor
-  集群下全局成立；杀 scheduler，在跑 run 零影响（§5.3 第三行）。
+| 故障 | 行为 |
+|---|---|
+| executor 退出或失联 | 不再给其新指派；租约到期后按容量和副作用约束重新指派 |
+| scheduler 退出，有 standby | 等旧会话锁实际释放后接管；无硬编码切换时间保证 |
+| scheduler 退出，无 standby | 有效持有者继续；新指派和过期接管等待 scheduler 恢复 |
+| PostgreSQL 不可用 | 停止新派发；已有外部请求仍可能完成，恢复后核对持久日志 |
 
-### Phase S3：混跑与运维
+## 7. 模式选择与迁移
 
-- 对者/指派混跑（§7 共存条件）；
-- `scheduler.status` RPC：当前无主 run 数、各 executor 负载、最近决策；
-- **验收**：摘掉 scheduler（standby 也杀），集群退化为对等模式继续服务。
+| 模式 | 谁获取新租约 | 优先级/工作流并发上限 | scheduler 故障 |
+|---|---|---|---|
+| peer | executor | 不提供 | 无此角色 |
+| scheduled | scheduler | 按本文事务协议提供 | 暂停新指派，不自动降级 |
 
-## 9. 风险与开放问题
+不支持同一集群混跑或热切换。数据结构共用，不等于两套授权规则可以同时使用。
+从 peer 切到 scheduled 时停止接收新 run、等待所有 run 终结或按副作用规则完成处置、
+停掉旧 executor，确认没有有效租约后更新 cluster_settings，再启动新角色。
+反向迁移同样要求排空，并明确告知优先级/配额保证将不再提供。
+只摘掉 scheduler 不构成迁移，不允许 executor 自行抢占绕过规则。
 
-1. **决策循环的 DB 扫描成本**：无主 run 多时 ③ 的逐个校验变慢。
-   起步规模（<1k 活跃 run、1s 周期）单轮 <10ms，够用；
-   真正的瓶颈出现时把「workflow 并发 COUNT」缓存进循环内存，
-   而不是给 scheduler 加状态。
-2. **inflight 镜像漂移**：心跳上报间隔内的容量计算偏差 ≤ TTL/3。
-   指派超载一个 run 是可接受的瞬时误差；若观察到持续漂移，
-   检查 executor 是否在 finalize 路径漏报（bug），而不是加对账协议。
-3. **改派的副作用语义**：scheduler 主动改派（非死亡接管）何时合法？
-   默认**不做**主动改派——只有心跳超时才清空指派。运行时迁移（drain、
-   版本升级滚动重启）走「executor 优雅退出 = finalize 或移交」，不依赖 scheduler。
-   这条边界防止「调度器想帮忙结果砍掉正在执行的 http_call」。
-4. **与单机 sqlite 模式无关**：本模式只在 postgres backend 下存在，
-   `FLOW_BACKEND=sqlite` 集群行为不定义（单进程本来就没有调度问题）。
+## 8. 实施与验收
+
+前置：DISTRIBUTED.md 的共享日志、epoch fencing、信号原子消费及副作用约束先完成。
+
+### Phase S1：持久指派
+
+实现 executor 注册、单一集群模式、指派与认领、专用连接选主、固定锁序与持久预留计数。
+所有新任务与故障接管共用这条授权路径；不建立与租约重复的 assigned_* 字段。
+
+验收必须包含：
+
+1. capacity=1，暂停 executor 认领并延迟多个心跳周期，连续调度不能产生两个有效指派。
+2. 指派后立刻重启 scheduler，已指派未认领的 run 仍占容量。
+3. 两个并发指派事务竞争同一 executor/workflow，结果仍满足上限。
+4. 过期心跳不能复活旧 epoch；executor 重启使用新 instance，不能续旧身份的租约。
+5. 续期在到期前获准、到期后延迟提交时，旧预留持续占用；回收等待该事务并重新校验。
+
+### Phase S2：优先级与工作流约束
+
+增加 priority 和 max_concurrent_runs 的管理入口、决策审计及状态查询。
+验证高优先级排序、受限 workflow 不阻塞其他可执行候选、上限修改与指派的并发行为。
+在多个 executor 上验证 workflow 上限，不用单进程计数替代全局断言。
+
+### Phase S3：故障与运维
+
+测试活跃 scheduler 的连接失效、网络隔离、长事务、SIGSTOP 与 SIGKILL；
+同时停止 scheduler 和持有者时任务应保持可恢复，scheduler 恢复后能接管过期非空 owner。
+杀 scheduler 不影响已有有效持有者的续期，peer 入口在 scheduled 模式下始终被拒绝。
+按部署实际测量决策延迟、故障切换时间和数据库负载，再定义运行指标。
+
+## 9. 暂不实施
+
+多租户公平/配额、自动抢占低优先级 run、运行时迁移、混跑自动降级，以及根据上报 inflight
+直接决定容量均不在本版协议内。未来新增策略不能绕开持久预留和所有权事务。

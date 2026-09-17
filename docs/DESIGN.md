@@ -1,17 +1,18 @@
 # flow 工作流引擎设计方案
 
-> 状态：已实现并通过验证（29 测试全绿，clippy 0 警告）。
+> 状态：单机实现；验证命令与覆盖范围见 §13。
 > 本文描述当前代码的实际语义，是后续开发的权威参考。
 
 ## 1. 目标与边界
 
 flow 是一个工作流执行引擎：发布不可变的流程定义（DAG），以 run 为单位执行，
-崩溃后从磁盘日志无损恢复。前端拖拽画布所需的协议已就绪，前端本身未实现。
+进程崩溃后从完整的磁盘日志恢复。日志丢失或损坏时隔离并报告错误，不猜测副作用。
+前端拖拽画布所需的协议已就绪，前端本身未实现。
 
 明确的非目标（v1 范围决策）：
 
-- 单机单进程——不做分布式调度与多写者（多节点部署的设计稿见 `DISTRIBUTED.md`，
-  其承诺是零改动复用本文 §3/§7/§12 的全部资产）；
+- 单机单进程；多节点设计稿见 `DISTRIBUTED.md`。fold 和图语义可复用，
+  租约、信号交付和外部副作用边界需要额外协议，尚未实现；
 - 不做通用 DSL——表达式与脚本统一用 JavaScript。
 
 ## 2. 总体架构
@@ -39,8 +40,10 @@ flow-engine ✗ flow-store   （引擎不依赖存储；状态出口走 RunObser
 这是整个系统最重要的设计决策，其余一切都从它推导。
 
 **磁盘上的 `data_dir/runs/<run_id>/event.jsonl` 是 run 执行状态的唯一权威。**
-SQLite `runs` 表只是查询索引，内存状态只是事件流的折叠缓存。三者的更新顺序无关紧要——
-恢复时以日志为准回填（`recover_unfinished`）。
+SQLite `runs` 表记录初始化结果并提供查询索引，内存执行状态由日志折叠得到。
+初始化必须先插入 `initializing` 元数据，再持久化 `run_started`，才可派发节点；
+Driver 启动后回填 `running`。终态也必须先写事件，再更新索引。
+恢复时以完整日志为准回填（`recover_unfinished`），初始化失败和日志缺失见 §7。
 
 ### 3.1 事件模型
 
@@ -69,8 +72,8 @@ append(node_started)  →  执行副作用  →  append(终态事件)
 ```
 
 每个事件 `write_all` + `sync_all`（fsync 是崩溃安全边界）。
-崩溃窗口因此被限定为**「有 `node_started`、无终态」**——恢复时据这一个谓词分类，
-不需要按节点类型写 if 森林。
+这界定了节点副作用不明的窗口。恢复还必须处理 `node_failed(retryable=true)` 后
+尚未开始下一次 attempt、信号已记录未消费、节点失败后 run 尚未收尾以及初始化未提交。
 
 ### 3.3 日志读写规则
 
@@ -97,10 +100,13 @@ Event 流 ──fold──> RunState {
 ```
 
 节点状态机：`Pending → Running{attempt} → Completed | Failed{retryable} | Skipped{reason}`。
+`Failed{retryable:true}` 是等待重试的**非终态**，时间线标签为 `retrying`；
+保留事件及 NodeState 序列化格式，旧日志无需迁移。
 关键转移：
 
 - `node_started` **清除旧 output**（重试/重放不留脏数据）；
 - `node_completed` 写入 `outputs`；
+- `node_failed(retryable=false)` 在 fold 中记录首个 `fatal_error`，Driver 无独立失败缓存；
 - `signal_received` 只记 `last_signal`（崩溃可能落在它与终态之间，恢复时消费它）；
 - 终态事件携带的 `attempt` 与 `records.attempts` 取 max，重试计数不丢。
 
@@ -157,11 +163,14 @@ loop {
 
 - `Satisfied`：source Completed。condition 节点按真值选 `true`/`false` 端口，
   端口不匹配 → Unsatisfied(`branch_not_taken`)；
-- `Unsatisfied(why)`：source Skipped（`upstream_skipped`）或 Failed（`upstream_failed`）；
-- `Waiting`：source Pending/Running。
+- `Unsatisfied(why)`：source Skipped（`upstream_skipped`）或不可重试 Failed（`upstream_failed`）；
+- `Waiting`：source Pending/Running/Failed{retryable:true}。
 
 **任一入边确定 Unsatisfied → 整节点 Skipped**；全部 Satisfied → 就绪；
 否则等待。跳过的下游沿同样规则继续传播。
+
+因此 if/else 两个互斥分支不能通过普通 AND-join 合流：未选分支会让汇合节点跳过。
+当前定义保持该语义；需要分支合流时须引入显式 join 策略，不能改变旧定义的默认值。
 
 ### 6.3 输出收集：单数透传、复数映射
 
@@ -175,9 +184,10 @@ loop {
 
 ### 6.4 condition 真值判定
 
-condition 节点输出 = **表达式求值结果本身**（不是 `{result,value}` 信封）；
-引擎用 `exec::truthy` 选出口端口。truthy 语义与 JS `Boolean()` 一致
-（`"false"`、`"0"` 都是真）——因为求值语言就是 JS，前端预览与引擎共用同一种语言。
+condition 节点输出为表达式结果经 JSON 序列化后的值；引擎用 `exec::truthy` 选出口。
+对 JSON 值，与 JS `Boolean()` 一致：空数组、空对象、`"false"`、`"0"` 都为真。
+表达式结果契约限定为 JSON 值；非 JSON 结果经过序列化可能改变含义
+（例如 Infinity 变为 null），不能宣称任意 JS 对象的原始真值都被保留。
 
 ### 6.5 重试策略
 
@@ -188,13 +198,16 @@ condition 节点输出 = **表达式求值结果本身**（不是 `{result,value
 - 致命：JS 抛错、参数校验失败、HTTP 4xx（请求本身的问题）。
 
 退避计时器计入 inflight（不变量），到点后 `RetryDue` 重新派发，attempt+1。
+下游在此期间等待。恢复从 `NodeFailed` 的时间戳与固定版本的 backoff_ms
+计算剩余等待时间；已过期则立即调度，墙钟回退最多重新等待整段 backoff。
 
 ### 6.6 取消与 fatal 的副作用语义
 
-**fatal（已决策，勿改）**：首个致命节点失败只**记录**（`fatal: Option<String>`），
+**fatal（已决策，勿改）**：首个致命节点失败由 fold 记录在 `state.fatal_error`，
 不中断其余分支：独立分支跑到自然终态再结束 run——避免中途砍掉已发出的副作用；
 失败节点的下游经 `upstream_failed` 全部跳过，结果注定 `RunFailed`，
 由 finalize 收尾。代价是注定失败的 run 会等最慢的无关分支跑完。
+节点失败后、run 终态前崩溃，恢复也必须保留该失败结论。
 
 **cancel**：abort 所有 inflight。对 in-flight 的 `http_call`，请求可能已发出、
 响应永远不读、run 记 `RunCancelled`——与 §7 的人工裁决是同类的副作用歧义，
@@ -203,25 +216,35 @@ condition 节点输出 = **表达式求值结果本身**（不是 `{result,value
 ### 6.7 外部信号（human_task 与人工裁决）
 
 `Engine::signal` 只对活着的 run 生效（registry 查找，否则明确报错）。
+请求带 oneshot 回执。Driver 先校验节点等待状态和裁决 payload，非法或重复信号返回
+conflict，不改变 run；有效请求写入 `signal_received` 并处理后才确认 `delivered=true`。
+确认丢失后重发可以返回 conflict，调用方应查询时间线核对已提交结果。
 
 - **human_task**：节点执行 = 等待。`node_started` 落盘后挂 oneshot 等待，
   收到 `run.signal` 先 append `signal_received` 再解除等待。
   节点输出 = 信号 payload 本身。
-- **崩溃残留副作用节点裁决**：见 §7。
+- **崩溃残留副作用节点裁决**：同样先记录 `signal_received`；若崩溃发生在信号与
+  `node_completed` / `node_failed` / 下一次 `node_started` 之间，恢复时消费原裁决。
+
+Driver 退出时显式 abort 剩余任务。内部错误若无法写入 `run_failed`，索引保留为
+`awaiting_resume` 并记录诊断，不把未持久化的终态写进 DB。
 
 ## 7. 崩溃恢复
 
 ### 7.1 分类
 
-进程重启时 `recover_unfinished` 取 DB 中 `running`/`awaiting_resume` 的 run，
-读事件日志折叠出状态，对残留 `Running{attempt}`（有 `node_started` 无终态）分类：
+进程重启时 `recover_unfinished` 扫描 `initializing`/`running`/`awaiting_resume`。
+有效日志的 workflow、version、input 必须与元数据匹配。折叠后按持久状态分类：
 
-| 节点类型 | 处置 | 理由 |
+| 节点状态/类型 | 处置 | 理由 |
 |---|---|---|
-| 纯节点（start/end/script/condition/delay） | **重放**：attempt+1 重新执行 | 无外部副作用，重放安全 |
-| `http_call`（`has_side_effect`） | **人工裁决**：`awaiting_resume`，等 `run.signal` | 请求可能已发出：at-most-once 与 at-least-once 都可能错，不猜测 |
-| `human_task` + 已有 `signal_received` | **补终态** `node_completed`（output=信号） | 信号已落盘，消费它 |
-| `human_task`` 无信号 | **继续等待**（不重复写 `node_started`） | 等待是无副作用状态 |
+| Running 纯节点（start/end/script/condition/delay） | **重放**：attempt+1 | 无外部副作用 |
+| Running `http_call`，无裁决信号 | **人工裁决**：`awaiting_resume` | 请求可能已发出，不猜测 |
+| Running `http_call`，已有裁决信号 | **消费裁决**：retry/succeeded/failed | 裁决已经持久化 |
+| Running `human_task`，已有信号 | **补终态**（output=信号） | 信号已经持久化 |
+| Running `human_task`，无信号 | **继续等待**，不重复写 started | 等待无副作用 |
+| Failed{retryable:true} | **重建退避计时器**，下一次 attempt | 内存计时器不是权威 |
+| Failed{retryable:false} | **保留 run 失败结论**，独立分支继续 | fold 已记录 fatal_error |
 
 裁决信号：`run.signal {payload: {action: "retry" | "succeeded" | "failed", output?, error?}}`。
 
@@ -234,6 +257,13 @@ condition 节点输出 = **表达式求值结果本身**（不是 `{result,value
 - 半行残缺日志 → `EventLog::open` 物理截断；
 - seq 不连续 → 硬错误，人工介入。
 
+初始化中断：`initializing` 行配有有效 `run_started` 时按上述分类恢复；日志缺失、
+空文件、首行残缺或损坏时将初始化标为 failed，保留文件与诊断，不执行节点。
+这条失败记录是初始化结果，不伪造执行事件。
+旧 `running`/`awaiting_resume` 的日志缺失、损坏或身份不符，则保留为
+`awaiting_resume`、`live=false` 并报告恢复错误；需恢复原日志后重启，不能靠
+`run.signal` 解除，也不能自动创建新日志重跑。这样兼容旧初始化窗口并避免重复副作用。
+
 **已知限制**：delay 崩溃后重放整段时长（不续算剩余时间）；fsync 每事件一次，
 组提交未做（正确性优先，这是后续优化点）。
 
@@ -243,23 +273,25 @@ SQLite（WAL）。表：
 
 - `workflows`：id, name, created_at；
 - `workflow_versions`：`(workflow_id, version)` 主键，**不可变定义快照** + checksum。
-  版本号用 `INSERT..SELECT COALESCE(MAX(version),0)+1` 原子递增（无 read-modify-write 竞态）；
-  与最新版本 checksum 相同的保存复用版本号（编辑器重复保存不刷版本）。
+  在 `BEGIN IMMEDIATE` 事务内检查最新 checksum 并分配版本；
+  `INSERT ... RETURNING version` 返回本次写入的版本，禁止写后另查 latest。
+  相同定义的并发保存也复用版本号。
   `status`: draft → published；
 - `runs`：run 元数据（id, workflow_id, workflow_version, status, input, output, error, started_at, ended_at）。
 
 约束：
 
-- **只有 published 版本可执行**（`run.start` 不带 version 取 latest published）；
+- **只有 published 版本可执行**；显式 version 同样检查，省略时取 latest published；
 - run 钉死某一版本——定义漂移在架构上不可能发生，无需额外防御；
 - 有 run 记录时拒删 workflow（事件日志不能变孤儿）；
 - `set_run_status` 影响 0 行必须报错（静默成功会掩盖「run 行没插进去」）；
 - **状态词汇表**：`runs.status` 的合法取值
-  （running/awaiting_resume/succeeded/failed/cancelled）由 store 私有常量定义，
+  （initializing/running/awaiting_resume/succeeded/failed/cancelled）由 store 私有常量定义，
   写入口（`insert_run`/`set_run_status`）经 `ensure_run_status` 校验；
   公共词汇表是引擎的 `DbRunStatus`（`as_str()` 生成同样字符串）。
   两边脱钩会在写入时当场报错（跨 crate 契约测试钉住），
   而不是让 run 从恢复扫描里静默消失。
+- 状态更新替换 output/error，传 None 会清空；已解决的裁决诊断不得留在成功结果里。
 
 ## 9. RPC 层（flow-rpc）
 
@@ -272,7 +304,7 @@ jsonrpsee WebSocket。引擎不依赖存储，`StoreObserver` 在这一层把
 |---|---|
 | `workflow.create / update / publish / get / list / delete` | 定义生命周期。update 前强制 validate |
 | `nodetypes.list` | 前端画布能力清单：类型、端口、参数 schema、supports_retry、side_effect |
-| `run.start` | 发布版本 → insert run → 引擎启动。失败时回写 failed |
+| `run.start` | 校验 published → insert initializing → 持久化 run_started → 启动 Driver；初始化错误回写 failed |
 | `run.get / run.list` | 元数据 + live 标记 |
 | `run.timeline` | 只读时间线：定义顺序 + 折叠后的节点状态 |
 | `run.events` | 原始事件，`from_seq` 增量拉取 |
@@ -307,21 +339,27 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
 - 5xx → retryable；4xx → fatal（请求本身的问题）；
 - **响应体读取失败（连接中途断开）→ retryable**——绝不带着 200 + 空 body 记成功。
 
+自动重试不保证外部副作用只发生一次：POST 超时或断流时下游仍可能已提交。
+启用多次重试需要调用方接受重复风险，或在 headers/body 中使用下游支持的稳定幂等键。
+人工裁决只解决崩溃后结果不明，不把任意 HTTP 请求变为恰好一次执行。
+
 ## 12. 不变量清单（改动前必须知道）
 
-1. 事件日志是权威；DB status 与内存 state 都是缓存，可随时由日志重建；
-2. 副作用之前必写 `node_started`；崩溃窗口 = 有 started 无终态；
+1. 执行状态由完整日志重建；初始化结果和日志缺失诊断按 §7 单独处理；
+2. 副作用之前必写 `node_started`；恢复还覆盖等待重试、信号消费与收尾窗口；
 3. `RunState::fold` 是唯一状态转移函数，恢复与时间线共用；
 4. 跳过必须推进到不动点；inflight 每个 handle 恰欠一条 DriverMsg；
 5. `state.outputs` 是唯一输出所有者（无第二份手工同步）；
 6. 端口规则：condition 必须 true/false，其余必须无端口；
 7. end/run 输出共用「单数透传、复数映射」规则（`singular_or_map`）；
 8. 状态词汇表单一来源：`DbRunStatus`，store 写入口校验。
+9. 可重试失败非终态；不可重试失败由 fold 持久推导，恢复不会变为成功。
+10. 信号先校验，再持久化、消费和确认；无效请求不改变 run 终态。
 
 ## 13. 测试策略
 
-32 个测试：engine 单元 11（fold 3 + expr 5 + exec 3）、恢复闭环集成 10、
-rpc 契约 1、rpc 端到端 5、store 5。约定：
+运行 `cargo test --workspace --all-targets --locked` 与
+`cargo clippy --workspace --all-targets --locked -- -D warnings`。覆盖约定：
 
 - RPC 测试用 `env!("CARGO_BIN_EXE_flow-server")` 真起进程，
   `child.kill()`(SIGKILL) + 同 data_dir 重启证明恢复；
@@ -331,6 +369,10 @@ rpc 契约 1、rpc 端到端 5、store 5。约定：
 - 客户端用 `ObjectParams` 具名参数；`subscribe` 三参
   `(subscribe_method, params, unsubscribe_method)`；
 - 契约测试钉住跨 crate 状态词汇表（§8）。
+- `recovery_regressions.rs` 验证失败恢复、重试下游、剩余退避、非法/重复信号和裁决恢复；
+- `contracts.rs` 验证显式 draft 拒绝、初始化中断和旧日志缺失隔离；
+- store 并发测试核对每个返回版本对应的定义及相同定义的版本复用；
+- 测试数据库必须放在独占目录的 `flow.db`，只清理独占目录，禁止删除系统临时目录。
 
 ## 14. 未做
 
@@ -340,4 +382,4 @@ rpc 契约 1、rpc 端到端 5、store 5。约定：
 - fsync 组提交（吞吐优化，不动语义）；
 - 多 end 被跳过时与真 null 输出的显式区分；
 - `run.start` 客户端幂等键（当前双击 = 两个 run，服务端 uuid 生成）；
-- 多节点部署——设计已完成（`DISTRIBUTED.md`），未实施。
+- 多节点部署（`DISTRIBUTED.md` / `SCHEDULER.md` 是待实施设计，尚未通过完整集群验收）。

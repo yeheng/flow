@@ -74,6 +74,7 @@ pub const STATUS_PUBLISHED: &str = "published";
 
 // 写入入口统一经 ensure_run_status 校验，两边脱钩时当场报错，
 // 而不是让 run 从 unfinished_runs 的恢复扫描里静默消失。
+const RUN_INITIALIZING: &str = "initializing";
 const RUN_RUNNING: &str = "running";
 const RUN_AWAITING_RESUME: &str = "awaiting_resume";
 const RUN_SUCCEEDED: &str = "succeeded";
@@ -83,7 +84,7 @@ const RUN_CANCELLED: &str = "cancelled";
 fn ensure_run_status(status: &str) -> Result<(), StoreError> {
     if matches!(
         status,
-        RUN_RUNNING | RUN_AWAITING_RESUME | RUN_SUCCEEDED | RUN_FAILED | RUN_CANCELLED
+        RUN_INITIALIZING | RUN_RUNNING | RUN_AWAITING_RESUME | RUN_SUCCEEDED | RUN_FAILED | RUN_CANCELLED
     ) {
         Ok(())
     } else {
@@ -188,20 +189,35 @@ impl Store {
         workflow_id: &str,
         definition: &Value,
     ) -> Result<i64, StoreError> {
-        self.require_workflow(workflow_id).await?;
         let checksum = definition_checksum(definition)?;
+        let definition_json = serde_json::to_string(definition)?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let exists = sqlx::query("SELECT 1 FROM workflows WHERE id = ?")
+            .bind(workflow_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if exists.is_none() {
+            return Err(StoreError::WorkflowNotFound(workflow_id.to_string()));
+        }
 
-        if let Some(latest) = self.latest_version(workflow_id).await? {
-            if latest.checksum == checksum {
-                return Ok(latest.version);
+        let latest = sqlx::query(
+            "SELECT version, checksum FROM workflow_versions WHERE workflow_id = ? ORDER BY version DESC LIMIT 1",
+        )
+        .bind(workflow_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(latest) = latest {
+            if latest.try_get::<String, _>("checksum")? == checksum {
+                let version = latest.try_get("version")?;
+                tx.commit().await?;
+                return Ok(version);
             }
         }
 
-        let definition_json = serde_json::to_string(definition)?;
-        sqlx::query(
+        let version = sqlx::query_scalar(
             "INSERT INTO workflow_versions (workflow_id, version, definition, checksum, status, created_at)
              SELECT ?, COALESCE(MAX(version), 0) + 1, ?, ?, ?, ?
-             FROM workflow_versions WHERE workflow_id = ?",
+             FROM workflow_versions WHERE workflow_id = ? RETURNING version",
         )
         .bind(workflow_id)
         .bind(&definition_json)
@@ -209,14 +225,10 @@ impl Store {
         .bind(STATUS_DRAFT)
         .bind(Utc::now().to_rfc3339())
         .bind(workflow_id)
-        .execute(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
-
-        let latest = self
-            .latest_version(workflow_id)
-            .await?
-            .ok_or_else(|| StoreError::WorkflowNotFound(workflow_id.to_string()))?;
-        Ok(latest.version)
+        tx.commit().await?;
+        Ok(version)
     }
 
     pub async fn publish(&self, workflow_id: &str, version: i64) -> Result<(), StoreError> {
@@ -332,17 +344,6 @@ impl Store {
         Ok(())
     }
 
-    async fn require_workflow(&self, workflow_id: &str) -> Result<(), StoreError> {
-        let row = sqlx::query("SELECT 1 AS one FROM workflows WHERE id = ?")
-            .bind(workflow_id)
-            .fetch_optional(&self.pool)
-            .await?;
-        if row.is_none() {
-            return Err(StoreError::WorkflowNotFound(workflow_id.to_string()));
-        }
-        Ok(())
-    }
-
     fn version_from_row(row: sqlx::sqlite::SqliteRow) -> Result<WorkflowVersion, StoreError> {
         let definition: String = row.try_get("definition")?;
         Ok(WorkflowVersion {
@@ -390,7 +391,7 @@ impl Store {
         ensure_run_status(status)?;
         let terminal = matches!(status, RUN_SUCCEEDED | RUN_FAILED | RUN_CANCELLED);
         let affected = sqlx::query(
-            "UPDATE runs SET status = ?, output = COALESCE(?, output), error = COALESCE(?, error),
+            "UPDATE runs SET status = ?, output = ?, error = ?,
                     ended_at = CASE WHEN ? THEN ? ELSE ended_at END
              WHERE id = ?",
         )
@@ -445,8 +446,9 @@ impl Store {
     /// 崩溃恢复的输入：进程重启后需要续跑的 run。
     pub async fn unfinished_runs(&self) -> Result<Vec<RunRecord>, StoreError> {
         let rows = sqlx::query(
-            "SELECT * FROM runs WHERE status IN (?, ?) ORDER BY started_at ASC",
+            "SELECT * FROM runs WHERE status IN (?, ?, ?) ORDER BY started_at ASC",
         )
+        .bind(RUN_INITIALIZING)
         .bind(RUN_RUNNING)
         .bind(RUN_AWAITING_RESUME)
         .fetch_all(&self.pool)
@@ -483,4 +485,3 @@ pub fn definition_checksum(definition: &Value) -> Result<String, StoreError> {
     hasher.update(serde_json::to_vec(definition)?);
     Ok(hex::encode(hasher.finalize()))
 }
-

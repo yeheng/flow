@@ -20,10 +20,11 @@ use crate::model::{Definition, NodeType};
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 const SIGNAL_CHANNEL_CAPACITY: usize = 64;
 
-/// 落库用的 run 状态（与 RunPhase 的区别：多一个「等人工裁决」）。
+/// 落库用的 run 状态，包含初始化与人工介入状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DbRunStatus {
+    Initializing,
     Running,
     AwaitingResume,
     Succeeded,
@@ -34,6 +35,7 @@ pub enum DbRunStatus {
 impl DbRunStatus {
     pub fn as_str(self) -> &'static str {
         match self {
+            DbRunStatus::Initializing => "initializing",
             DbRunStatus::Running => "running",
             DbRunStatus::AwaitingResume => "awaiting_resume",
             DbRunStatus::Succeeded => "succeeded",
@@ -85,6 +87,30 @@ pub struct Signal {
     pub payload: Value,
 }
 
+struct SignalRequest {
+    signal: Signal,
+    reply: oneshot::Sender<Result<(), EngineError>>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum Adjudication {
+    Retry,
+    Succeeded {
+        #[serde(default)]
+        output: Value,
+    },
+    Failed {
+        #[serde(default)]
+        error: Option<String>,
+    },
+}
+
+enum SignalAction {
+    Human,
+    Adjudicate(Adjudication),
+}
+
 enum DriverMsg {
     Done {
         node_id: String,
@@ -99,7 +125,7 @@ enum DriverMsg {
 
 struct RunHandle {
     cancel: CancellationToken,
-    signal_tx: mpsc::Sender<Signal>,
+    signal_tx: mpsc::Sender<SignalRequest>,
 }
 
 /// 工作流执行引擎。每次 run 一个 tokio 任务、一个 event.jsonl 单写者。
@@ -192,6 +218,12 @@ impl Engine {
         }
         let events = read_events(&path).await?;
         let mut state = RunState::from_events(&events)?;
+        if state.workflow_id.as_deref() != Some(&spec.workflow_id)
+            || state.workflow_version != Some(spec.workflow_version)
+            || state.input != spec.input
+        {
+            return Err(EngineError::LogCorrupted("run_started 缺失或与 run 元数据不一致".into()));
+        }
         if state.phase.is_terminal() {
             return Ok(ResumeOutcome::AlreadyTerminal(state.phase));
         }
@@ -223,10 +255,12 @@ impl Engine {
             .ok_or_else(|| {
                 EngineError::Node(format!("run {run_id} 当前不在运行中（已结束或未加载）"))
             })?;
+        let (reply, received) = oneshot::channel();
         sender
-            .send(signal)
+            .send(SignalRequest { signal, reply })
             .await
-            .map_err(|_| EngineError::Node(format!("run {run_id} 的引擎任务已退出")))
+            .map_err(|_| EngineError::Node(format!("run {run_id} 的引擎任务已退出")))?;
+        received.await.map_err(|_| EngineError::Node(format!("run {run_id} 未能确认信号处理结果")))?
     }
 
     fn spawn_driver(&self, log: EventLog, spec: StartRun, state: RunState, plan: RecoveryPlan) {
@@ -254,14 +288,13 @@ impl Engine {
             inflight: HashMap::new(),
             human_waiting: HashMap::new(),
             adjudicating: HashSet::new(),
-            fatal: None,
         };
 
         tokio::spawn(driver.run(signal_rx, plan));
     }
 }
 
-/// 恢复期对残留 Running 节点的分类结论。
+/// 恢复期对未完成节点和待重试节点的分类结论。
 #[derive(Default)]
 struct RecoveryPlan {
     /// 纯节点：安全重放
@@ -271,12 +304,18 @@ struct RecoveryPlan {
     human_wait: Vec<(String, u32)>,
     /// 副作用节点：必须人工裁决
     adjudicate: Vec<String>,
+    adjudication_received: Vec<Signal>,
+    retries: Vec<String>,
 }
 
 impl RecoveryPlan {
     fn classify(definition: &Definition, state: &RunState) -> RecoveryPlan {
         let mut plan = RecoveryPlan::default();
         for (node_id, record) in &state.records {
+            if matches!(record.state, NodeState::Failed { retryable: true, .. }) {
+                plan.retries.push(node_id.clone());
+                continue;
+            }
             let NodeState::Running { attempt } = record.state else {
                 continue;
             };
@@ -290,7 +329,15 @@ impl RecoveryPlan {
                         .push((node_id.clone(), attempt, payload.clone())),
                     None => plan.human_wait.push((node_id.clone(), attempt)),
                 },
-                kind if kind.has_side_effect() => plan.adjudicate.push(node_id.clone()),
+                kind if kind.has_side_effect() => {
+                    plan.adjudicate.push(node_id.clone());
+                    if let Some(payload) = &record.last_signal {
+                        plan.adjudication_received.push(Signal {
+                            node_id: node_id.clone(),
+                            payload: payload.clone(),
+                        });
+                    }
+                }
                 _ => plan.replay.push((node_id.clone(), attempt)),
             }
         }
@@ -313,26 +360,27 @@ struct Driver {
     human_waiting: HashMap<String, oneshot::Sender<Value>>,
     /// 崩溃遗留的副作用节点：等待人工裁决
     adjudicating: HashSet<String>,
-    /// 首个致命节点失败。置位后不中断其余分支：独立分支跑到自然终态再结束 run
-    /// （避免中途砍掉已发出的副作用）；失败节点的下游经 upstream_failed 全部
-    /// 跳过，结果注定 RunFailed，由 finalize 收尾。
-    fatal: Option<String>,
 }
 
 impl Driver {
-    async fn run(mut self, signal_rx: mpsc::Receiver<Signal>, plan: RecoveryPlan) {
+    async fn run(mut self, signal_rx: mpsc::Receiver<SignalRequest>, plan: RecoveryPlan) {
         let outcome = self.drive(signal_rx, plan).await;
+        self.abort_inflight();
         match outcome {
             Ok(()) => {}
             Err(err) => {
                 let message = err.to_string();
-                if let Err(append_err) = self.append(Event::RunFailed { error: message.clone() }).await {
-                    tracing::error!(run_id = %self.run_id, error = %append_err, "写入 run_failed 失败");
-                }
+                let status = match self.append(Event::RunFailed { error: message.clone() }).await {
+                    Ok(_) => DbRunStatus::Failed,
+                    Err(append_err) => {
+                        tracing::error!(run_id = %self.run_id, error = %append_err, "写入 run_failed 失败");
+                        DbRunStatus::AwaitingResume
+                    }
+                };
                 self.observer
                     .on_status(StatusUpdate {
                         run_id: &self.run_id,
-                        status: DbRunStatus::Failed,
+                        status,
                         output: None,
                         error: Some(&message),
                     })
@@ -344,11 +392,17 @@ impl Driver {
 
     async fn drive(
         &mut self,
-        mut signal_rx: mpsc::Receiver<Signal>,
+        mut signal_rx: mpsc::Receiver<SignalRequest>,
         plan: RecoveryPlan,
     ) -> Result<(), EngineError> {
         let (result_tx, mut result_rx) = mpsc::channel::<DriverMsg>(256);
 
+        self.observer.on_status(StatusUpdate {
+            run_id: &self.run_id,
+            status: DbRunStatus::Running,
+            output: None,
+            error: None,
+        }).await;
         self.apply_recovery_plan(plan, &result_tx).await?;
 
         loop {
@@ -391,7 +445,23 @@ impl Driver {
                     return Ok(());
                 }
                 Some(msg) = result_rx.recv() => self.handle_result(msg, &result_tx).await?,
-                Some(signal) = signal_rx.recv() => self.handle_signal(signal, &result_tx).await?,
+                Some(request) = signal_rx.recv() => {
+                    let action = match self.signal_action(&request.signal) {
+                        Ok(action) => action,
+                        Err(err) => {
+                            let _ = request.reply.send(Err(err));
+                            continue;
+                        }
+                    };
+                    let outcome = self.handle_signal(request.signal, action, &result_tx).await;
+                    match outcome {
+                        Ok(()) => { let _ = request.reply.send(Ok(())); }
+                        Err(err) => {
+                            let _ = request.reply.send(Err(EngineError::Node(err.to_string())));
+                            return Err(err);
+                        }
+                    }
+                },
             }
         }
     }
@@ -435,6 +505,14 @@ impl Driver {
         for (node_id, attempt) in plan.replay {
             tracing::warn!(run_id = %self.run_id, node_id = %node_id, attempt, "重启残留节点，重新执行");
             self.start_node(&node_id, attempt + 1, result_tx).await?;
+        }
+
+        for node_id in plan.retries {
+            self.schedule_retry(&node_id, result_tx);
+        }
+        for signal in plan.adjudication_received {
+            let action = self.signal_action(&signal)?;
+            self.apply_signal(signal, action, result_tx).await?;
         }
 
         Ok(())
@@ -509,8 +587,9 @@ impl Driver {
                 }
             }
             NodeState::Skipped { .. } => EdgeState::Unsatisfied("upstream_skipped".into()),
-            NodeState::Failed { .. } => EdgeState::Unsatisfied("upstream_failed".into()),
-            NodeState::Pending | NodeState::Running { .. } => EdgeState::Waiting,
+            NodeState::Failed { retryable: false, .. } => EdgeState::Unsatisfied("upstream_failed".into()),
+            NodeState::Pending | NodeState::Running { .. }
+            | NodeState::Failed { retryable: true, .. } => EdgeState::Waiting,
         }
     }
 
@@ -645,19 +724,7 @@ impl Driver {
                         .await?;
 
                         if should_retry {
-                            let backoff = policy.backoff_ms;
-                            let result_tx = result_tx.clone();
-                            let nid = node_id.clone();
-                            let handle = tokio::spawn(async move {
-                                if backoff > 0 {
-                                    tokio::time::sleep(Duration::from_millis(backoff)).await;
-                                }
-                                let _ = result_tx.send(DriverMsg::RetryDue { node_id: nid }).await;
-                            });
-                            // 退避计时算作进行中，否则会被误判为「无可推进节点」
-                            self.inflight.insert(node_id, handle);
-                        } else {
-                            self.fatal.get_or_insert(format!("节点 {node_id} 失败：{}", failure.message));
+                            self.schedule_retry(&node_id, result_tx);
                         }
                     }
                 }
@@ -666,84 +733,87 @@ impl Driver {
         Ok(())
     }
 
+    fn schedule_retry(&mut self, node_id: &str, result_tx: &mpsc::Sender<DriverMsg>) {
+        let backoff = self.definition.node(node_id).map(|node| node.retry().backoff_ms).unwrap_or(0);
+        let elapsed = self.state.record(node_id).ended_at
+            .map(|ended| chrono::Utc::now().signed_duration_since(ended).num_milliseconds().max(0) as u64)
+            .unwrap_or(0);
+        let remaining = backoff.saturating_sub(elapsed);
+        let result_tx = result_tx.clone();
+        let nid = node_id.to_string();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(remaining)).await;
+            let _ = result_tx.send(DriverMsg::RetryDue { node_id: nid }).await;
+        });
+        self.inflight.insert(node_id.to_string(), handle);
+    }
+
+    fn signal_action(&self, signal: &Signal) -> Result<SignalAction, EngineError> {
+        if self.human_waiting.contains_key(&signal.node_id) {
+            return Ok(SignalAction::Human);
+        }
+        if self.adjudicating.contains(&signal.node_id) {
+            return serde_json::from_value(signal.payload.clone())
+                .map(SignalAction::Adjudicate)
+                .map_err(|err| EngineError::Node(format!("节点 {} 的裁决非法：{err}", signal.node_id)));
+        }
+        Err(EngineError::Node(format!("节点 {} 当前不等待信号", signal.node_id)))
+    }
+
     async fn handle_signal(
         &mut self,
         signal: Signal,
+        action: SignalAction,
         result_tx: &mpsc::Sender<DriverMsg>,
     ) -> Result<(), EngineError> {
-        let node_id = signal.node_id.clone();
+        self.append(Event::SignalReceived {
+            node_id: signal.node_id.clone(),
+            payload: signal.payload.clone(),
+        }).await?;
+        self.apply_signal(signal, action, result_tx).await
+    }
 
-        if let Some(tx) = self.human_waiting.remove(&node_id) {
-            self.append(Event::SignalReceived {
-                node_id,
-                payload: signal.payload.clone(),
-            })
-            .await?;
-            let _ = tx.send(signal.payload);
-            return Ok(());
-        }
-
-        if self.adjudicating.remove(&node_id) {
-            let action = signal
-                .payload
-                .get("action")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let attempt = self.state.record(&node_id).attempts;
-            match action.as_str() {
-                "retry" => {
-                    self.observer
-                        .on_status(StatusUpdate {
-                            run_id: &self.run_id,
-                            status: DbRunStatus::Running,
-                            output: None,
-                            error: None,
-                        })
-                        .await;
-                    let next = attempt + 1;
-                    self.start_node(&node_id, next, result_tx).await?;
+    async fn apply_signal(
+        &mut self,
+        signal: Signal,
+        action: SignalAction,
+        result_tx: &mpsc::Sender<DriverMsg>,
+    ) -> Result<(), EngineError> {
+        let node_id = signal.node_id;
+        let attempt = self.state.record(&node_id).attempts;
+        match action {
+            SignalAction::Human => {
+                if let Some(tx) = self.human_waiting.remove(&node_id) {
+                    let _ = tx.send(signal.payload);
                 }
-                "succeeded" => {
-                    let output = signal.payload.get("output").cloned().unwrap_or(Value::Null);
-                    self.append(Event::NodeCompleted {
-                        node_id,
-                        attempt,
-                        output,
-                        duration_ms: 0,
-                    })
-                    .await?;
-                }
-                "failed" => {
-                    let error = signal
-                        .payload
-                        .get("error")
-                        .and_then(Value::as_str)
-                        .unwrap_or("人工判定为失败")
-                        .to_string();
-                    self.append(Event::NodeFailed {
-                        node_id: node_id.clone(),
-                        attempt,
-                        error: error.clone(),
-                        retryable: false,
-                    })
-                    .await?;
-                    self.fatal.get_or_insert(error);
-                }
-                other => {
-                    return Err(EngineError::Node(format!(
-                        "节点 {node_id} 的裁决动作非法：{other:?}（应为 retry/succeeded/failed）"
-                    )))
-                }
+                return Ok(());
             }
-            return Ok(());
+            SignalAction::Adjudicate(Adjudication::Retry) => {
+                self.start_node(&node_id, attempt + 1, result_tx).await?;
+            }
+            SignalAction::Adjudicate(Adjudication::Succeeded { output }) => {
+                self.append(Event::NodeCompleted {
+                    node_id: node_id.clone(), attempt, output, duration_ms: 0,
+                }).await?;
+            }
+            SignalAction::Adjudicate(Adjudication::Failed { error }) => {
+                self.append(Event::NodeFailed {
+                    node_id: node_id.clone(), attempt,
+                    error: error.unwrap_or_else(|| "人工判定为失败".into()), retryable: false,
+                }).await?;
+            }
         }
-
-        Err(EngineError::Node(format!("节点 {node_id} 当前不等待信号")))
+        self.adjudicating.remove(&node_id);
+        if self.adjudicating.is_empty() {
+            self.observer.on_status(StatusUpdate {
+                run_id: &self.run_id, status: DbRunStatus::Running, output: None, error: None,
+            }).await;
+        }
+        Ok(())
     }
 
     async fn finalize(&mut self) -> Result<(), EngineError> {
-        if let Some(error) = self.fatal.clone() {
+        if let Some(error) = self.state.fatal_error.clone() {
             self.append(Event::RunFailed {
                 error: error.clone(),
             })

@@ -31,7 +31,10 @@ pub enum NodeState {
 
 impl NodeState {
     pub fn is_terminal(&self) -> bool {
-        !matches!(self, NodeState::Pending | NodeState::Running { .. })
+        !matches!(
+            self,
+            NodeState::Pending | NodeState::Running { .. } | NodeState::Failed { retryable: true, .. }
+        )
     }
 
     pub fn label(&self) -> &'static str {
@@ -39,7 +42,8 @@ impl NodeState {
             NodeState::Pending => "pending",
             NodeState::Running { .. } => "running",
             NodeState::Completed { .. } => "completed",
-            NodeState::Failed { .. } => "failed",
+            NodeState::Failed { retryable: true, .. } => "retrying",
+            NodeState::Failed { retryable: false, .. } => "failed",
             NodeState::Skipped { .. } => "skipped",
         }
     }
@@ -187,6 +191,9 @@ impl RunState {
                 rec.error = Some(error.clone());
                 rec.last_signal = None;
                 self.outputs.remove(node_id);
+                if !retryable {
+                    self.fatal_error.get_or_insert_with(|| format!("节点 {node_id} 失败：{error}"));
+                }
             }
             Event::NodeSkipped { node_id, reason } => {
                 let rec = self.records.entry(node_id.clone()).or_default();
