@@ -33,7 +33,12 @@ impl NodeState {
     pub fn is_terminal(&self) -> bool {
         !matches!(
             self,
-            NodeState::Pending | NodeState::Running { .. } | NodeState::Failed { retryable: true, .. }
+            NodeState::Pending
+                | NodeState::Running { .. }
+                | NodeState::Failed {
+                    retryable: true,
+                    ..
+                }
         )
     }
 
@@ -42,8 +47,12 @@ impl NodeState {
             NodeState::Pending => "pending",
             NodeState::Running { .. } => "running",
             NodeState::Completed { .. } => "completed",
-            NodeState::Failed { retryable: true, .. } => "retrying",
-            NodeState::Failed { retryable: false, .. } => "failed",
+            NodeState::Failed {
+                retryable: true, ..
+            } => "retrying",
+            NodeState::Failed {
+                retryable: false, ..
+            } => "failed",
             NodeState::Skipped { .. } => "skipped",
         }
     }
@@ -146,7 +155,9 @@ impl RunState {
                 self.started_at = Some(env.ts);
                 self.phase = RunPhase::Running;
             }
-            Event::NodeStarted { node_id, attempt, .. } => {
+            Event::NodeStarted {
+                node_id, attempt, ..
+            } => {
                 let rec = self.records.entry(node_id.clone()).or_default();
                 rec.state = NodeState::Running { attempt: *attempt };
                 rec.attempts = rec.attempts.max(*attempt);
@@ -192,7 +203,8 @@ impl RunState {
                 rec.last_signal = None;
                 self.outputs.remove(node_id);
                 if !retryable {
-                    self.fatal_error.get_or_insert_with(|| format!("节点 {node_id} 失败：{error}"));
+                    self.fatal_error
+                        .get_or_insert_with(|| format!("节点 {node_id} 失败：{error}"));
                 }
             }
             Event::NodeSkipped { node_id, reason } => {
@@ -291,7 +303,12 @@ mod tests {
                     duration_ms: 12,
                 },
             ),
-            env(6, Event::RunCompleted { output: serde_json::json!(7) }),
+            env(
+                6,
+                Event::RunCompleted {
+                    output: serde_json::json!(7),
+                },
+            ),
         ];
 
         let state = RunState::from_events(&events).unwrap();
@@ -307,8 +324,20 @@ mod tests {
     #[test]
     fn from_events_rejects_seq_gap() {
         let events = vec![
-            env(1, Event::RunStarted { workflow_id: "w".into(), workflow_version: 1, input: Value::Null }),
-            env(3, Event::RunCompleted { output: Value::Null }),
+            env(
+                1,
+                Event::RunStarted {
+                    workflow_id: "w".into(),
+                    workflow_version: 1,
+                    input: Value::Null,
+                },
+            ),
+            env(
+                3,
+                Event::RunCompleted {
+                    output: Value::Null,
+                },
+            ),
         ];
         let err = RunState::from_events(&events).unwrap_err();
         assert!(matches!(err, EngineError::LogCorrupted(_)), "{err}");

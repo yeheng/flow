@@ -49,7 +49,11 @@ async fn only_published_versions_are_eligible_for_runs() {
     assert_eq!(store.latest_published(&wf).await.unwrap(), Some(1));
 
     let v2 = store.update_workflow(&wf, &def("b")).await.unwrap();
-    assert_eq!(store.latest_published(&wf).await.unwrap(), Some(1), "draft 不参与");
+    assert_eq!(
+        store.latest_published(&wf).await.unwrap(),
+        Some(1),
+        "draft 不参与"
+    );
     store.publish(&wf, v2).await.unwrap();
     assert_eq!(store.latest_published(&wf).await.unwrap(), Some(2));
 
@@ -151,7 +155,11 @@ async fn concurrent_saves_return_their_own_versions_and_deduplicate_identical_de
             let workflow = workflow.clone();
             let barrier = barrier.clone();
             workers.push(tokio::spawn(async move {
-                let definition = def(&if identical { "same".to_string() } else { marker.to_string() });
+                let definition = def(&if identical {
+                    "same".to_string()
+                } else {
+                    marker.to_string()
+                });
                 barrier.wait().await;
                 let version = store.update_workflow(&workflow, &definition).await.unwrap();
                 let stored = store.get_version(&workflow, Some(version)).await.unwrap();
@@ -165,7 +173,15 @@ async fn concurrent_saves_return_their_own_versions_and_deduplicate_identical_de
         }
         assert_eq!(versions.len(), if identical { 1 } else { 32 });
     }
-    assert_eq!(store.latest_version(&workflow).await.unwrap().unwrap().version, 33);
+    assert_eq!(
+        store
+            .latest_version(&workflow)
+            .await
+            .unwrap()
+            .unwrap()
+            .version,
+        33
+    );
     drop(store);
     std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }
@@ -173,12 +189,24 @@ async fn concurrent_saves_return_their_own_versions_and_deduplicate_identical_de
 #[tokio::test]
 async fn status_updates_clear_resolved_errors() {
     let (store, path) = store().await;
-    store.insert_run("r", "w", 1, &json!(null), "initializing").await.unwrap();
+    store
+        .insert_run("r", "w", 1, &json!(null), "initializing")
+        .await
+        .unwrap();
     assert_eq!(store.unfinished_runs().await.unwrap().len(), 1);
-    store.set_run_status("r", "awaiting_resume", None, Some("needs adjudication")).await.unwrap();
-    store.set_run_status("r", "running", None, None).await.unwrap();
+    store
+        .set_run_status("r", "awaiting_resume", None, Some("needs adjudication"))
+        .await
+        .unwrap();
+    store
+        .set_run_status("r", "running", None, None)
+        .await
+        .unwrap();
     assert!(store.get_run("r").await.unwrap().error.is_none());
-    store.set_run_status("r", "succeeded", Some(&json!(7)), None).await.unwrap();
+    store
+        .set_run_status("r", "succeeded", Some(&json!(7)), None)
+        .await
+        .unwrap();
     let row = store.get_run("r").await.unwrap();
     assert!(row.error.is_none());
     assert_eq!(row.output, Some(json!(7)));

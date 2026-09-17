@@ -118,11 +118,7 @@ impl EventLog {
                 std::io::ErrorKind::AlreadyExists => EngineError::RunExists(run_id.to_string()),
                 _ => EngineError::Io(e),
             })?;
-        Ok(EventLog {
-            path,
-            file,
-            seq: 0,
-        })
+        Ok(EventLog { path, file, seq: 0 })
     }
 
     /// 打开已有日志续写：先修复残缺尾行，再从最后一个有效 seq 接着写。

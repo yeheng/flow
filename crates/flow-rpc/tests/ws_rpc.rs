@@ -291,12 +291,20 @@ async fn workflow_crud_over_websocket() {
         .iter()
         .map(|t| t["type"].as_str().unwrap())
         .collect();
-    assert!(types.contains(&"http_call") && types.contains(&"human_task"), "{types:?}");
+    assert!(
+        types.contains(&"http_call") && types.contains(&"human_task"),
+        "{types:?}"
+    );
 
     // 删除：有 run 之后拒绝
     let run_id = ws.start_run(&workflow_id, json!({"amount": 1})).await;
     ws.wait_run_status(&run_id, "succeeded").await;
-    let err = call_err(client, "workflow.delete", json!({"workflow_id": workflow_id})).await;
+    let err = call_err(
+        client,
+        "workflow.delete",
+        json!({"workflow_id": workflow_id}),
+    )
+    .await;
     assert!(err.contains("拒绝删除"), "{err}");
 }
 
@@ -395,7 +403,11 @@ async fn human_task_is_resolved_by_signal_over_websocket() {
     .await;
 
     let got: Value = call(&ws.client, "run.get", json!({"run_id": run_id})).await;
-    assert_eq!(got["run"]["status"], json!("running"), "等信号期间不能是终态");
+    assert_eq!(
+        got["run"]["status"],
+        json!("running"),
+        "等信号期间不能是终态"
+    );
 
     call::<Value>(
         &ws.client,
@@ -501,5 +513,8 @@ async fn restart_asks_for_human_adjudication_on_side_effect_node() {
     .await;
 
     let run = ws.wait_run_status(&run_id, "succeeded").await;
-    assert_eq!(run["run"]["output"], json!({"status": 200, "body": {"paid": true}}));
+    assert_eq!(
+        run["run"]["output"],
+        json!({"status": 200, "body": {"paid": true}})
+    );
 }

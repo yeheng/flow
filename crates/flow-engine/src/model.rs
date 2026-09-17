@@ -163,7 +163,9 @@ impl Definition {
     }
 
     pub fn start_node(&self) -> Option<&Node> {
-        self.nodes.iter().find(|n| n.kind() == Some(NodeType::Start))
+        self.nodes
+            .iter()
+            .find(|n| n.kind() == Some(NodeType::Start))
     }
 
     pub fn type_map(&self) -> HashMap<String, NodeType> {
@@ -193,7 +195,11 @@ impl Definition {
             validate_params(node, kind)?;
         }
 
-        let starts = self.nodes.iter().filter(|n| n.kind() == Some(NodeType::Start)).count();
+        let starts = self
+            .nodes
+            .iter()
+            .filter(|n| n.kind() == Some(NodeType::Start))
+            .count();
         if starts != 1 {
             return Err(format!("必须且只能有一个 start 节点，当前有 {starts} 个"));
         }
@@ -229,10 +235,7 @@ impl Definition {
                 },
                 _ => {
                     if edge.port.is_some() {
-                        return Err(format!(
-                            "非 condition 节点 {} 的出边不能带端口",
-                            edge.from
-                        ));
+                        return Err(format!("非 condition 节点 {} 的出边不能带端口", edge.from));
                     }
                 }
             }
@@ -308,7 +311,10 @@ impl Definition {
             .filter(|id| !visited.contains(id))
             .collect();
         if !unreachable.is_empty() {
-            return Err(format!("存在从 start 不可达的节点：{}", unreachable.join(", ")));
+            return Err(format!(
+                "存在从 start 不可达的节点：{}",
+                unreachable.join(", ")
+            ));
         }
 
         Ok(())
@@ -318,7 +324,12 @@ impl Definition {
 fn validate_params(node: &Node, kind: NodeType) -> Result<(), String> {
     let need_str = |key: &str| match node.param_str(key) {
         Some(v) if !v.trim().is_empty() => Ok(()),
-        _ => Err(format!("节点 {}（{}）缺少参数 {}", node.id, kind.as_str(), key)),
+        _ => Err(format!(
+            "节点 {}（{}）缺少参数 {}",
+            node.id,
+            kind.as_str(),
+            key
+        )),
     };
     match kind {
         NodeType::Script => need_str("code"),

@@ -1,28 +1,20 @@
 [package]
-name = "flow-rpc"
+name = "flow-pg"
 version.workspace = true
 edition.workspace = true
 
-[[bin]]
-name = "flow-server"
-path = "src/main.rs"
-
 [dependencies]
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
-jsonrpsee = { workspace = true }
+sqlx = { workspace = true, features = ["postgres", "json"] }
+sha2 = { workspace = true }
+hex = { workspace = true }
+parking_lot = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 futures = { workspace = true }
 flow-engine = { path = "../flow-engine" }
-flow-pg = { path = "../flow-pg" }
-flow-store = { path = "../flow-store" }
-
-[dev-dependencies]
-tokio-util = { workspace = true }
-sqlx = { workspace = true, features = ["postgres", "json"] }
-chrono = { workspace = true }

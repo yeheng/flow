@@ -1,9 +1,11 @@
+pub mod pg;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use flow_engine::{
-    DbRunStatus, Definition, Engine, EngineError, Envelope, HTTP_METHODS, ResumeOutcome,
-    RunObserver, RunPhase, RunState, Signal, StartRun, StatusUpdate,
+    DbRunStatus, Definition, Engine, EngineError, Envelope, ResumeOutcome, RunObserver, RunPhase,
+    RunState, Signal, StartRun, StatusUpdate, HTTP_METHODS,
 };
 use flow_store::{Store, StoreError};
 use futures::future::BoxFuture;
@@ -134,14 +136,20 @@ pub async fn recover_unfinished(state: &AppState) -> Result<Vec<(String, String)
             }
             Err(err) => {
                 let message = err.to_string();
-                if matches!(err, EngineError::RunNotFound(_) | EngineError::LogCorrupted(_)) {
+                if matches!(
+                    err,
+                    EngineError::RunNotFound(_) | EngineError::LogCorrupted(_)
+                ) {
                     // A missing log is never evidence that replaying side effects is safe.
                     let status = if run.status == DbRunStatus::Initializing.as_str() {
                         DbRunStatus::Failed
                     } else {
                         DbRunStatus::AwaitingResume
                     };
-                    state.store.set_run_status(&run.id, status.as_str(), None, Some(&message)).await?;
+                    state
+                        .store
+                        .set_run_status(&run.id, status.as_str(), None, Some(&message))
+                        .await?;
                 }
                 failures.push((run.id.clone(), message));
             }
@@ -150,7 +158,10 @@ pub async fn recover_unfinished(state: &AppState) -> Result<Vec<(String, String)
     Ok(failures)
 }
 
-pub async fn serve(state: Arc<AppState>, addr: SocketAddr) -> Result<(ServerHandle, SocketAddr), RpcError> {
+pub async fn serve(
+    state: Arc<AppState>,
+    addr: SocketAddr,
+) -> Result<(ServerHandle, SocketAddr), RpcError> {
     let module = build_module(state)?;
     let server = Server::builder().build(addr).await?;
     let local_addr = server.local_addr()?;
@@ -184,8 +195,8 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
         }
         let p: P = parse(&params)?;
         // 拖拽产出的图在落库前就校验，别等到发布
-        let definition: Definition =
-            serde_json::from_value(p.definition.clone()).map_err(|e| invalid(format!("定义结构非法：{e}")))?;
+        let definition: Definition = serde_json::from_value(p.definition.clone())
+            .map_err(|e| invalid(format!("定义结构非法：{e}")))?;
         definition.validate().map_err(invalid)?;
 
         let version = state
@@ -217,7 +228,9 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
             .publish(&p.workflow_id, p.version)
             .await
             .map_err(store_err)?;
-        Ok::<_, ErrorObjectOwned>(json!({ "workflow_id": p.workflow_id, "version": p.version, "status": "published" }))
+        Ok::<_, ErrorObjectOwned>(
+            json!({ "workflow_id": p.workflow_id, "version": p.version, "status": "published" }),
+        )
     })?;
 
     module.register_async_method("workflow.get", |params, state, _| async move {
@@ -305,7 +318,10 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
             .await
             .map_err(store_err)?;
         if !stored.is_published() {
-            return Err(store_err(StoreError::VersionNotPublished(p.workflow_id, version)));
+            return Err(store_err(StoreError::VersionNotPublished(
+                p.workflow_id,
+                version,
+            )));
         }
         let definition: Definition = serde_json::from_value(stored.definition)
             .map_err(|e| invalid(format!("定义结构非法：{e}")))?;
@@ -315,7 +331,13 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
         let run_id = uuid::Uuid::now_v7().to_string();
         state
             .store
-            .insert_run(&run_id, &p.workflow_id, version, &input, DbRunStatus::Initializing.as_str())
+            .insert_run(
+                &run_id,
+                &p.workflow_id,
+                version,
+                &input,
+                DbRunStatus::Initializing.as_str(),
+            )
             .await
             .map_err(store_err)?;
 
@@ -364,7 +386,10 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
         let p: P = parse(&params)?;
         let runs = state
             .store
-            .list_runs(p.workflow_id.as_deref(), p.limit.unwrap_or(50).clamp(1, 500))
+            .list_runs(
+                p.workflow_id.as_deref(),
+                p.limit.unwrap_or(50).clamp(1, 500),
+            )
             .await
             .map_err(store_err)?;
         Ok::<_, ErrorObjectOwned>(json!({ "runs": runs }))
@@ -391,7 +416,14 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
             .await
             .map_err(|e| internal(format!("读取事件日志失败：{e}")))?;
 
-        Ok::<_, ErrorObjectOwned>(timeline_value(&run, &definition, &snapshot))
+        Ok::<_, ErrorObjectOwned>(timeline_value(
+            &run.id,
+            &run.status,
+            &run.workflow_id,
+            run.workflow_version,
+            &definition,
+            &snapshot,
+        ))
     })?;
 
     module.register_async_method("run.events", |params, state, _| async move {
@@ -503,8 +535,11 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
     Ok(module)
 }
 
-fn timeline_value(
-    run: &flow_store::RunRecord,
+pub(crate) fn timeline_value(
+    run_id: &str,
+    run_status: &str,
+    workflow_id: &str,
+    workflow_version: i64,
     definition: &Definition,
     snapshot: &RunState,
 ) -> Value {
@@ -533,11 +568,11 @@ fn timeline_value(
         .collect();
 
     json!({
-        "run_id": run.id,
-        "status": run.status,
+        "run_id": run_id,
+        "status": run_status,
         "phase": snapshot.phase,
-        "workflow_id": run.workflow_id,
-        "workflow_version": run.workflow_version,
+        "workflow_id": workflow_id,
+        "workflow_version": workflow_version,
         "started_at": snapshot.started_at,
         "ended_at": snapshot.ended_at,
         "output": snapshot.output,
@@ -548,7 +583,7 @@ fn timeline_value(
 }
 
 /// 前端拖拽面板 + 参数表单所需的能力清单。
-fn node_types() -> Value {
+pub(crate) fn node_types() -> Value {
     json!([
         {
             "type": "start",
@@ -621,7 +656,9 @@ fn node_types() -> Value {
 }
 
 /// 具名参数解析。JSON-RPC 允许整个省略 params，此时到达的是 null，等价于空对象。
-fn parse<T: serde::de::DeserializeOwned>(params: &Params<'_>) -> Result<T, ErrorObjectOwned> {
+pub(crate) fn parse<T: serde::de::DeserializeOwned>(
+    params: &Params<'_>,
+) -> Result<T, ErrorObjectOwned> {
     let raw: Value = params
         .parse::<Value>()
         .map_err(|e| invalid(format!("参数非法：{}", e.message())))?;
@@ -629,15 +666,15 @@ fn parse<T: serde::de::DeserializeOwned>(params: &Params<'_>) -> Result<T, Error
     serde_json::from_value(raw).map_err(|e| invalid(format!("参数非法：{e}")))
 }
 
-fn invalid(message: impl Into<String>) -> ErrorObjectOwned {
+pub(crate) fn invalid(message: impl Into<String>) -> ErrorObjectOwned {
     ErrorObject::owned(CODE_INVALID, message.into(), None::<()>)
 }
 
-fn conflict(message: impl Into<String>) -> ErrorObjectOwned {
+pub(crate) fn conflict(message: impl Into<String>) -> ErrorObjectOwned {
     ErrorObject::owned(CODE_CONFLICT, message.into(), None::<()>)
 }
 
-fn internal(message: impl Into<String>) -> ErrorObjectOwned {
+pub(crate) fn internal(message: impl Into<String>) -> ErrorObjectOwned {
     ErrorObject::owned(CODE_INTERNAL, message.into(), None::<()>)
 }
 
@@ -645,7 +682,9 @@ fn store_err(err: StoreError) -> ErrorObjectOwned {
     match err {
         StoreError::WorkflowNotFound(_)
         | StoreError::VersionNotFound(..)
-        | StoreError::RunNotFound(_) => ErrorObject::owned(CODE_NOT_FOUND, err.to_string(), None::<()>),
+        | StoreError::RunNotFound(_) => {
+            ErrorObject::owned(CODE_NOT_FOUND, err.to_string(), None::<()>)
+        }
         StoreError::VersionNotPublished(..) => conflict(err.to_string()),
         other => internal(other.to_string()),
     }
@@ -653,7 +692,9 @@ fn store_err(err: StoreError) -> ErrorObjectOwned {
 
 fn engine_err(err: EngineError) -> ErrorObjectOwned {
     match err {
-        EngineError::RunNotFound(_) => ErrorObject::owned(CODE_NOT_FOUND, err.to_string(), None::<()>),
+        EngineError::RunNotFound(_) => {
+            ErrorObject::owned(CODE_NOT_FOUND, err.to_string(), None::<()>)
+        }
         EngineError::RunExists(_) => conflict(err.to_string()),
         EngineError::InvalidDefinition(_) | EngineError::Node(_) | EngineError::Expr(_) => {
             invalid(err.to_string())
@@ -670,8 +711,8 @@ mod tests {
     /// 词汇表外的字符串必须在写入时被拒绝——否则 run 会从崩溃恢复扫描里静默消失。
     #[tokio::test]
     async fn engine_run_statuses_are_the_only_statuses_store_accepts() {
-        let root = std::env::temp_dir()
-            .join(format!("flow-rpc-status-contract-{}", uuid::Uuid::now_v7()));
+        let root =
+            std::env::temp_dir().join(format!("flow-rpc-status-contract-{}", uuid::Uuid::now_v7()));
         let store = Store::open(root.join("flow.db")).await.unwrap();
 
         let statuses = [

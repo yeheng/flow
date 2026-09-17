@@ -360,16 +360,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "flow-pg"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "flow-engine",
+ "futures",
+ "hex",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "flow-rpc"
 version = "0.1.0"
 dependencies = [
  "chrono",
  "flow-engine",
+ "flow-pg",
  "flow-store",
  "futures",
  "jsonrpsee",
  "serde",
  "serde_json",
+ "sqlx",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",

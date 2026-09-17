@@ -18,7 +18,13 @@ struct JsResult {
 /// 表达式求值统一入口：JS 沙箱，无 IO，带超时中断。
 ///
 /// 走 JS 而不是自造 DSL：前端预览和引擎求值共用同一种语言。
-fn run_js(body: &str, input: &Value, nodes: &Value, tpl: &Value, timeout: Duration) -> Result<Value, EngineError> {
+fn run_js(
+    body: &str,
+    input: &Value,
+    nodes: &Value,
+    tpl: &Value,
+    timeout: Duration,
+) -> Result<Value, EngineError> {
     let runtime = Runtime::new().map_err(|e| EngineError::Expr(e.to_string()))?;
     let deadline = Instant::now() + timeout;
     runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() > deadline)));
@@ -65,18 +71,33 @@ fn run_js(body: &str, input: &Value, nodes: &Value, tpl: &Value, timeout: Durati
 }
 
 /// 脚本节点：body 是一段带 `return` 的函数体，可用 `input` 与 `nodes`。
-pub fn eval_body(body: &str, input: &Value, nodes: &Value, timeout: Duration) -> Result<Value, EngineError> {
+pub fn eval_body(
+    body: &str,
+    input: &Value,
+    nodes: &Value,
+    timeout: Duration,
+) -> Result<Value, EngineError> {
     run_js(body, input, nodes, &Value::Null, timeout)
 }
 
 /// 条件节点：求值单个表达式。
-pub fn eval_expr(expr: &str, input: &Value, nodes: &Value, timeout: Duration) -> Result<Value, EngineError> {
+pub fn eval_expr(
+    expr: &str,
+    input: &Value,
+    nodes: &Value,
+    timeout: Duration,
+) -> Result<Value, EngineError> {
     let body = format!("    return ({expr});");
     run_js(&body, input, nodes, &Value::Null, timeout)
 }
 
 /// 展开字符串中的 `${expr}` 模板（用于 http_call 的 url/headers/body）。
-pub fn expand_templates(tpl: &Value, input: &Value, nodes: &Value, timeout: Duration) -> Result<Value, EngineError> {
+pub fn expand_templates(
+    tpl: &Value,
+    input: &Value,
+    nodes: &Value,
+    timeout: Duration,
+) -> Result<Value, EngineError> {
     let body = r#"    function __expand(v, input, nodes) {
       if (typeof v === 'string') {
         return v.replace(/\$\{([^}]+)\}/g, function (_, e) {
@@ -131,8 +152,13 @@ mod tests {
     #[test]
     fn exceptions_surface_as_errors() {
         let (input, nodes) = ctx();
-        let err = eval_body("return nope.undefined_thing();", &input, &nodes, Duration::from_secs(2))
-            .unwrap_err();
+        let err = eval_body(
+            "return nope.undefined_thing();",
+            &input,
+            &nodes,
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
         assert!(matches!(err, EngineError::Expr(_)), "{err}");
     }
 
@@ -152,7 +178,8 @@ mod tests {
     #[test]
     fn runaway_script_is_interrupted_by_timeout() {
         let (input, nodes) = ctx();
-        let err = eval_body("while (true) {}", &input, &nodes, Duration::from_millis(50)).unwrap_err();
+        let err =
+            eval_body("while (true) {}", &input, &nodes, Duration::from_millis(50)).unwrap_err();
         assert!(matches!(err, EngineError::Expr(_)), "{err}");
     }
 }

@@ -37,7 +37,10 @@ impl Harness {
             if state.phase.is_terminal() {
                 return state;
             }
-            assert!(std::time::Instant::now() < deadline, "run {run_id} 超时未结束");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "run {run_id} 超时未结束"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
@@ -45,7 +48,10 @@ impl Harness {
     async fn wait_not_live(&self, run_id: &str) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while self.engine.is_live(run_id) {
-            assert!(std::time::Instant::now() < deadline, "run {run_id} 引擎任务未退出");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "run {run_id} 引擎任务未退出"
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
@@ -53,7 +59,10 @@ impl Harness {
     async fn wait_live(&self, run_id: &str) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !self.engine.is_live(run_id) {
-            assert!(std::time::Instant::now() < deadline, "run {run_id} 未进入运行态");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "run {run_id} 未进入运行态"
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
@@ -208,7 +217,10 @@ async fn condition_branch_marks_untaken_side_skipped() {
     }
     assert_eq!(state.record("end_no").output, Some(json!("small")));
     // 多 end：run 输出是各 end 输出的映射，被跳过的 end 为 null
-    assert_eq!(state.output, Some(json!({"end_yes": null, "end_no": "small"})));
+    assert_eq!(
+        state.output,
+        Some(json!({"end_yes": null, "end_no": "small"}))
+    );
 }
 
 #[tokio::test]
@@ -248,7 +260,11 @@ async fn restarted_pure_node_is_replayed_with_new_attempt() {
 
     let state = h.wait_terminal(&run_id).await;
     assert_eq!(state.phase, RunPhase::Succeeded, "{}", describe(&state));
-    assert_eq!(state.record("n2").attempts, 2, "残留的纯节点应以 attempt 2 重放");
+    assert_eq!(
+        state.record("n2").attempts,
+        2,
+        "残留的纯节点应以 attempt 2 重放"
+    );
     assert_eq!(state.record("n2").output, Some(json!({"doubled": 42})));
 
     let events = h.engine.read_events(&run_id, None).await.unwrap();
@@ -323,7 +339,10 @@ async fn side_effect_node_after_crash_waits_for_human_adjudication() {
 
     let state = h.wait_terminal(&run_id).await;
     assert_eq!(state.phase, RunPhase::Succeeded);
-    assert_eq!(state.output, Some(json!({"status": 200, "body": {"ok": true}})));
+    assert_eq!(
+        state.output,
+        Some(json!({"status": 200, "body": {"ok": true}}))
+    );
 }
 
 #[tokio::test]
@@ -505,13 +524,19 @@ async fn skip_propagates_through_multiple_downstream_levels() {
     assert_eq!(state.phase, RunPhase::Succeeded, "{}", describe(&state));
     for skipped in ["slow", "approve", "end_vip"] {
         assert!(
-            matches!(state.record(skipped).state, flow_engine::NodeState::Skipped { .. }),
+            matches!(
+                state.record(skipped).state,
+                flow_engine::NodeState::Skipped { .. }
+            ),
             "{skipped} 应被跳过，实际：{:?}",
             state.record(skipped).state
         );
     }
     // end 透传前驱输出：false 分支的 end_std 拿到条件节点的求值结果（false）
-    assert_eq!(state.output, Some(json!({"end_vip": null, "end_std": false})));
+    assert_eq!(
+        state.output,
+        Some(json!({"end_vip": null, "end_std": false}))
+    );
 }
 
 #[tokio::test]
@@ -588,7 +613,10 @@ async fn fatal_failure_lets_independent_branch_finish() {
     let state = h.wait_terminal(&run_id).await;
     assert_eq!(state.phase, RunPhase::Failed, "{}", describe(&state));
     assert!(
-        matches!(state.record("slow").state, flow_engine::NodeState::Completed { .. }),
+        matches!(
+            state.record("slow").state,
+            flow_engine::NodeState::Completed { .. }
+        ),
         "独立分支必须跑完，实际：{:?}",
         state.record("slow").state
     );
@@ -599,12 +627,18 @@ async fn fatal_failure_lets_independent_branch_finish() {
         other => panic!("失败分支下游应被跳过，实际：{other:?}"),
     }
     assert!(
-        matches!(state.record("e2").state, flow_engine::NodeState::Completed { .. }),
+        matches!(
+            state.record("e2").state,
+            flow_engine::NodeState::Completed { .. }
+        ),
         "跑完的分支下游必须正常完成，实际：{:?}",
         state.record("e2").state
     );
     assert!(
-        state.fatal_error.as_deref().is_some_and(|e| e.contains("bad")),
+        state
+            .fatal_error
+            .as_deref()
+            .is_some_and(|e| e.contains("bad")),
         "fatal 必须记录首个失败节点：{:?}",
         state.fatal_error
     );

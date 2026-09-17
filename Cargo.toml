@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/flow-engine",
+    "crates/flow-pg",
     "crates/flow-store",
     "crates/flow-rpc",
 ]

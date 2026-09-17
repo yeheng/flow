@@ -1,6 +1,7 @@
 # flow 工作流引擎设计方案
 
-> 状态：单机实现；验证命令与覆盖范围见 §13。
+> 状态：单机实现 + 对等模式多节点执行（`DISTRIBUTED.md`，Postgres 后端）；
+> 验证命令与覆盖范围见 §13。
 > 本文描述当前代码的实际语义，是后续开发的权威参考。
 
 ## 1. 目标与边界
@@ -11,17 +12,20 @@ flow 是一个工作流执行引擎：发布不可变的流程定义（DAG），
 
 明确的非目标（v1 范围决策）：
 
-- 单机单进程；多节点设计稿见 `DISTRIBUTED.md`。fold 和图语义可复用，
-  租约、信号交付和外部副作用边界需要额外协议，尚未实现；
 - 不做通用 DSL——表达式与脚本统一用 JavaScript。
+- 多节点执行：对等抢占模式（peer）已按 `DISTRIBUTED.md` 实现（Postgres 后端，
+  租约、持久 inbox、副作用边界）；中心指派模式见 `SCHEDULER.md`，仍未实现。
 
 ## 2. 总体架构
 
 ```
 crates/
-  flow-engine   执行引擎。只依赖事件日志文件，不依赖任何存储实现
-  flow-store    SQLite：workflow / workflow_versions / runs 元数据
-  flow-rpc      jsonrpsee WebSocket 服务（bin: flow-server），适配层
+  flow-engine   执行引擎。Driver 只依赖 RunEventSink 后端边界（Phase 0），
+                单机后端走 event.jsonl，不依赖任何存储实现
+  flow-store    SQLite：workflow / workflow_versions / runs 元数据（单机后端）
+  flow-pg       Postgres 后端：共享日志、epoch 租约、持久 inbox、executor
+  flow-rpc      jsonrpsee WebSocket 服务（bin: flow-server），适配层；
+                FLOW_BACKEND=sqlite（默认）| postgres 切换后端
 ```
 
 依赖方向（不可反转）：
@@ -29,11 +33,14 @@ crates/
 ```
 flow-rpc ──> flow-engine
 flow-rpc ──> flow-store
-flow-engine ✗ flow-store   （引擎不依赖存储；状态出口走 RunObserver trait）
+flow-rpc ──> flow-pg ──> flow-engine
+flow-pg ──> flow-store   ✗（两个后端互相独立）
+flow-engine ✗ flow-*     （引擎不依赖存储；状态出口走 RunEventSink trait）
 ```
 
 运行：`cargo run --bin flow-server`。环境变量 `FLOW_ADDR`（默认 `127.0.0.1:9800`）、
-`FLOW_DB`、`FLOW_DATA_DIR`。
+`FLOW_DB`、`FLOW_DATA_DIR`；Postgres 模式另见 `DISTRIBUTED.md` §10
+（`FLOW_BACKEND`、`FLOW_DATABASE_URL`、`FLOW_ROLE`、`FLOW_LEASE_TTL_MS` 等）。
 
 ## 3. 核心数据结构：事件日志是唯一权威
 
@@ -368,17 +375,26 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
   断流用「声明 Content-Length 但发一半即关闭」——确定性，不依赖不可路由地址；
 - 客户端用 `ObjectParams` 具名参数；`subscribe` 三参
   `(subscribe_method, params, unsubscribe_method)`；
-- 契约测试钉住跨 crate 状态词汇表（§8）。
+- 契约测试钉住跨 crate 状态词汇表（§8）；
 - `recovery_regressions.rs` 验证失败恢复、重试下游、剩余退避、非法/重复信号和裁决恢复；
 - `contracts.rs` 验证显式 draft 拒绝、初始化中断和旧日志缺失隔离；
 - store 并发测试核对每个返回版本对应的定义及相同定义的版本复用；
-- 测试数据库必须放在独占目录的 `flow.db`，只清理独占目录，禁止删除系统临时目录。
+- 测试数据库必须放在独占目录的 `flow.db`，只清理独占目录，禁止删除系统临时目录；
+- **Postgres 后端**：租约 fencing、接管窗口、恢复分类与 inbox 幂等由
+  `flow-pg/tests/{protocol,recovery}.rs` 覆盖，集群级 smoke/SIGKILL/订阅由
+  `flow-rpc/tests/ws_pg.rs` 覆盖。每个测试在独立数据库中运行
+  （名称含时间戳，启动时清理残留）；测试库通过 `FLOW_TEST_DATABASE_URL`
+  指定（默认 `postgres://flow:flow@127.0.0.1:54329/flow`），不可达时自动跳过，
+  没有可用 Postgres 时 `cargo test` 仍必须全绿。
 
 ## 14. 未做
 
 - `sub_workflow` 节点；
-- delay 剩余时间恢复（当前崩溃后整段重放）；
+- delay 剩余时间恢复（当前崩溃/接管后整段重放）；
 - fsync 组提交（吞吐优化，不动语义）；
 - 多 end 被跳过时与真 null 输出的显式区分；
 - `run.start` 客户端幂等键（当前双击 = 两个 run，服务端 uuid 生成）；
-- 多节点部署（`DISTRIBUTED.md` / `SCHEDULER.md` 是待实施设计，尚未通过完整集群验收）。
+- 中心指派模式（`SCHEDULER.md` 待实施；对等模式已按 `DISTRIBUTED.md` 实现，
+  未做多节点压测）；
+- 跨进程 SIGSTOP 场景下的真实副作用计数验收（副作用准入已用确定性前缀测试钉住）；
+- Postgres 订阅对未跟踪 run 从头回放（单机 broadcast 只推增量），语义差异已记录。

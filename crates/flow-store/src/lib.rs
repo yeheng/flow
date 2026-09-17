@@ -84,7 +84,12 @@ const RUN_CANCELLED: &str = "cancelled";
 fn ensure_run_status(status: &str) -> Result<(), StoreError> {
     if matches!(
         status,
-        RUN_INITIALIZING | RUN_RUNNING | RUN_AWAITING_RESUME | RUN_SUCCEEDED | RUN_FAILED | RUN_CANCELLED
+        RUN_INITIALIZING
+            | RUN_RUNNING
+            | RUN_AWAITING_RESUME
+            | RUN_SUCCEEDED
+            | RUN_FAILED
+            | RUN_CANCELLED
     ) {
         Ok(())
     } else {
@@ -232,15 +237,20 @@ impl Store {
     }
 
     pub async fn publish(&self, workflow_id: &str, version: i64) -> Result<(), StoreError> {
-        let affected = sqlx::query("UPDATE workflow_versions SET status = ? WHERE workflow_id = ? AND version = ?")
-            .bind(STATUS_PUBLISHED)
-            .bind(workflow_id)
-            .bind(version)
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
+        let affected = sqlx::query(
+            "UPDATE workflow_versions SET status = ? WHERE workflow_id = ? AND version = ?",
+        )
+        .bind(STATUS_PUBLISHED)
+        .bind(workflow_id)
+        .bind(version)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
         if affected == 0 {
-            return Err(StoreError::VersionNotFound(workflow_id.to_string(), version));
+            return Err(StoreError::VersionNotFound(
+                workflow_id.to_string(),
+                version,
+            ));
         }
         Ok(())
     }
@@ -253,13 +263,14 @@ impl Store {
     ) -> Result<WorkflowVersion, StoreError> {
         match version {
             Some(version) => {
-                let row =
-                    sqlx::query("SELECT * FROM workflow_versions WHERE workflow_id = ? AND version = ?")
-                        .bind(workflow_id)
-                        .bind(version)
-                        .fetch_optional(&self.pool)
-                        .await?
-                        .ok_or_else(|| StoreError::VersionNotFound(workflow_id.to_string(), version))?;
+                let row = sqlx::query(
+                    "SELECT * FROM workflow_versions WHERE workflow_id = ? AND version = ?",
+                )
+                .bind(workflow_id)
+                .bind(version)
+                .fetch_optional(&self.pool)
+                .await?
+                .ok_or_else(|| StoreError::VersionNotFound(workflow_id.to_string(), version))?;
                 Self::version_from_row(row)
             }
             None => self
@@ -427,11 +438,13 @@ impl Store {
     ) -> Result<Vec<RunRecord>, StoreError> {
         let rows = match workflow_id {
             Some(id) => {
-                sqlx::query("SELECT * FROM runs WHERE workflow_id = ? ORDER BY started_at DESC LIMIT ?")
-                    .bind(id)
-                    .bind(limit)
-                    .fetch_all(&self.pool)
-                    .await?
+                sqlx::query(
+                    "SELECT * FROM runs WHERE workflow_id = ? ORDER BY started_at DESC LIMIT ?",
+                )
+                .bind(id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
             }
             None => {
                 sqlx::query("SELECT * FROM runs ORDER BY started_at DESC LIMIT ?")
@@ -445,14 +458,13 @@ impl Store {
 
     /// 崩溃恢复的输入：进程重启后需要续跑的 run。
     pub async fn unfinished_runs(&self) -> Result<Vec<RunRecord>, StoreError> {
-        let rows = sqlx::query(
-            "SELECT * FROM runs WHERE status IN (?, ?, ?) ORDER BY started_at ASC",
-        )
-        .bind(RUN_INITIALIZING)
-        .bind(RUN_RUNNING)
-        .bind(RUN_AWAITING_RESUME)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows =
+            sqlx::query("SELECT * FROM runs WHERE status IN (?, ?, ?) ORDER BY started_at ASC")
+                .bind(RUN_INITIALIZING)
+                .bind(RUN_RUNNING)
+                .bind(RUN_AWAITING_RESUME)
+                .fetch_all(&self.pool)
+                .await?;
         rows.into_iter().map(Self::run_from_row).collect()
     }
 
@@ -476,7 +488,12 @@ impl Store {
 
 fn parse_ts(raw: &str) -> Result<DateTime<Utc>, StoreError> {
     Ok(DateTime::parse_from_rfc3339(raw)
-        .map_err(|e| StoreError::Json(serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))))?
+        .map_err(|e| {
+            StoreError::Json(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                e.to_string(),
+            )))
+        })?
         .with_timezone(&Utc))
 }
 

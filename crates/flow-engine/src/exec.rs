@@ -61,12 +61,17 @@ impl NodeExecContext {
 
     fn js_timeout(&self) -> Duration {
         Duration::from_millis(
-            self.node.param_u64("timeout_ms").unwrap_or(DEFAULT_JS_TIMEOUT_MS),
+            self.node
+                .param_u64("timeout_ms")
+                .unwrap_or(DEFAULT_JS_TIMEOUT_MS),
         )
     }
 }
 
-pub async fn execute(ctx: &NodeExecContext, cancel: &CancellationToken) -> Result<Value, NodeFailure> {
+pub async fn execute(
+    ctx: &NodeExecContext,
+    cancel: &CancellationToken,
+) -> Result<Value, NodeFailure> {
     let kind = ctx
         .node
         .kind()
@@ -99,7 +104,12 @@ fn collect_end_output(ctx: &NodeExecContext) -> Value {
     singular_or_map(
         ctx.preds
             .iter()
-            .map(|p| (p.clone(), ctx.outputs.get(p).cloned().unwrap_or(Value::Null)))
+            .map(|p| {
+                (
+                    p.clone(),
+                    ctx.outputs.get(p).cloned().unwrap_or(Value::Null),
+                )
+            })
             .collect(),
     )
 }
@@ -147,7 +157,10 @@ pub fn truthy(value: &Value) -> bool {
     }
 }
 
-async fn run_delay(ctx: &NodeExecContext, cancel: &CancellationToken) -> Result<Value, NodeFailure> {
+async fn run_delay(
+    ctx: &NodeExecContext,
+    cancel: &CancellationToken,
+) -> Result<Value, NodeFailure> {
     let ms = ctx
         .node
         .param_u64("ms")
@@ -225,7 +238,12 @@ async fn run_http(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
     let headers: Map<String, Value> = response
         .headers()
         .iter()
-        .map(|(k, v)| (k.to_string(), Value::String(v.to_str().unwrap_or("").to_string())))
+        .map(|(k, v)| {
+            (
+                k.to_string(),
+                Value::String(v.to_str().unwrap_or("").to_string()),
+            )
+        })
         .collect();
     let text = match response.text().await {
         Ok(text) => text,
@@ -284,11 +302,26 @@ mod tests {
     #[test]
     fn json_truthiness_matches_javascript() {
         for value in [
-            json!(null), json!(false), json!(true), json!(0), json!(-1),
-            json!(""), json!("false"), json!("0"), json!([]), json!({}),
-            json!([0]), json!({"x": false}),
+            json!(null),
+            json!(false),
+            json!(true),
+            json!(0),
+            json!(-1),
+            json!(""),
+            json!("false"),
+            json!("0"),
+            json!([]),
+            json!({}),
+            json!([0]),
+            json!({"x": false}),
         ] {
-            let expected = expr::eval_expr("Boolean(input)", &value, &Value::Null, Duration::from_secs(1)).unwrap();
+            let expected = expr::eval_expr(
+                "Boolean(input)",
+                &value,
+                &Value::Null,
+                Duration::from_secs(1),
+            )
+            .unwrap();
             assert_eq!(json!(truthy(&value)), expected, "{value}");
         }
     }
@@ -353,10 +386,7 @@ mod singular_or_map_tests {
             "单来源必须透传其值"
         );
         assert_eq!(
-            singular_or_map(vec![
-                ("e1".into(), json!(7)),
-                ("e2".into(), Value::Null),
-            ]),
+            singular_or_map(vec![("e1".into(), json!(7)), ("e2".into(), Value::Null),]),
             json!({"e1": 7, "e2": null}),
             "多来源必须组成映射，缺失补 null"
         );
