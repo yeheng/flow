@@ -1,0 +1,138 @@
+// 与 crates/flow-engine/src/model.rs、crates/flow-rpc/src/lib.rs 的 JSON 结构逐字段对齐
+
+export interface Position {
+  x: number;
+  y: number;
+}
+
+export interface DefinitionNode {
+  id: string;
+  type: string;
+  name?: string;
+  position?: Position;
+  params: Record<string, unknown>;
+}
+
+export interface DefinitionEdge {
+  from: string;
+  to: string;
+  /** condition 出边为 "true" | "false"，其余节点出边不得带 */
+  port?: string;
+}
+
+export interface Definition {
+  nodes: DefinitionNode[];
+  edges: DefinitionEdge[];
+}
+
+export interface PortDesc {
+  id: string;
+  label: string;
+}
+
+export type ParamKind = "text" | "number" | "code" | "json" | "select";
+
+export interface ParamSpec {
+  name: string;
+  label: string;
+  kind: ParamKind;
+  required?: boolean;
+  default?: unknown;
+  options?: string[];
+  help?: string;
+}
+
+/** nodetypes.list 返回的画布能力清单条目 */
+export interface NodeTypeDesc {
+  type: string;
+  label: string;
+  category: string;
+  max_instances?: number;
+  ports: PortDesc[];
+  params: ParamSpec[];
+  supports_retry?: boolean;
+  side_effect?: boolean;
+}
+
+export interface WorkflowSummary {
+  workflow_id: string;
+  name: string;
+  latest_version: number;
+  published_version: number | null;
+  created_at: string;
+}
+
+export interface WorkflowDetail {
+  workflow_id: string;
+  version: number;
+  status: string;
+  definition: Definition;
+  published_version: number | null;
+}
+
+export type NodeRunState =
+  | "pending"
+  | "running"
+  | "retrying"
+  | "completed"
+  | "failed"
+  | "skipped";
+
+/** run.timeline 节点条目（crates/flow-rpc/src/lib.rs timeline_value） */
+export interface TimelineNode {
+  id: string;
+  name: string;
+  type: string;
+  state: NodeRunState;
+  attempts: number;
+  started_at: string | null;
+  ended_at: string | null;
+  duration_ms: number | null;
+  output: unknown;
+  error: string | null;
+  reason?: string;
+}
+
+export type RunPhase = "running" | "succeeded" | "failed" | "cancelled";
+
+export interface Timeline {
+  run_id: string;
+  status: string;
+  phase: RunPhase;
+  workflow_id: string;
+  workflow_version: number;
+  started_at: string | null;
+  ended_at: string | null;
+  output: unknown;
+  fatal_error: string | null;
+  last_seq: number;
+  nodes: TimelineNode[];
+}
+
+/**
+ * run.event 通知载荷：crates/flow-engine/src/event.rs 的 Envelope，
+ * event 经 #[serde(flatten)] 扁平展开（type + 各事件字段）。
+ */
+export interface RunEvent {
+  seq: number;
+  ts: string;
+  run_id: string;
+  type:
+    | "run_started"
+    | "node_started"
+    | "node_completed"
+    | "node_failed"
+    | "node_skipped"
+    | "signal_received"
+    | "run_completed"
+    | "run_failed"
+    | "run_cancelled";
+  node_id?: string;
+  attempt?: number;
+  output?: unknown;
+  duration_ms?: number;
+  error?: string;
+  retryable?: boolean;
+  reason?: string;
+  payload?: unknown;
+}
