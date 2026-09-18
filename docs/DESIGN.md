@@ -1,7 +1,7 @@
 # flow 工作流引擎设计方案
 
 > 状态：单机实现 + 对等模式多节点执行（`DISTRIBUTED.md`，Postgres 后端）；
-> 验证命令与覆盖范围见 §13。
+> `cargo test --workspace --all-targets --locked` 73 个测试全绿；验证命令与覆盖范围见 §13。
 > 本文描述当前代码的实际语义，是后续开发的权威参考。
 
 ## 1. 目标与边界
@@ -59,8 +59,8 @@ Driver 启动后回填 `running`。终态也必须先写事件，再更新索引
 
 | 事件 | 载荷 | 语义 |
 |---|---|---|
-| `run_started` | workflow_id, workflow_version, input | run 创建，input 快照 |
-| `node_started` | node_id, attempt | **副作用发生前**写入 |
+| `run_started` | workflow_id, workflow_version, input, depth | run 创建，input 快照；depth 为嵌套深度（根 run 为 0，旧日志缺省 0） |
+| `node_started` | node_id, attempt, child_run_id（可选） | **副作用发生前**写入；child_run_id 仅 sub_workflow 携带 |
 | `node_completed` | node_id, attempt, output, duration_ms | 节点成功 |
 | `node_failed` | node_id, attempt, error, retryable | 节点失败；`retryable` 表示引擎还会重试 |
 | `node_skipped` | node_id, reason | 汇合判定不满足，整节点跳过 |
@@ -98,10 +98,11 @@ append(node_started)  →  执行副作用  →  append(终态事件)
 ```
 Event 流 ──fold──> RunState {
     records: HashMap<node_id, NodeRecord{state, attempts, started_at, ended_at,
-                                          duration_ms, output, error, last_signal}>,
+                                          duration_ms, output, error, last_signal,
+                                          child_run_id}>,
     outputs: HashMap<node_id, Value>,     // 唯一所有者：Driver 直接读它
     phase: Running | Succeeded | Failed | Cancelled,
-    fatal_error, output, workflow_id, workflow_version, input, last_seq,
+    fatal_error, output, workflow_id, workflow_version, input, last_seq, depth,
     started_at, ended_at,
 }
 ```
@@ -120,14 +121,15 @@ Event 流 ──fold──> RunState {
 ## 5. 定义模型与校验
 
 `Definition { nodes, edges }`（前端拖拽产物，整体作为不可变版本入库）。
-节点类型：`start`、`end`、`script`、`condition`、`delay`、`http_call`、`human_task`。
+节点类型：`start`、`end`、`script`、`condition`、`delay`、`http_call`、`human_task`、
+`sub_workflow`。
 
 `Definition::validate()` 在保存与发布时强制（建图即校验，不等到运行）：
 
 1. 节点 id 非空且唯一；类型已知；按类型校验必填参数
-   （script: `code`，condition: `expr`，delay: `ms`，http_call: `url`；
-   method 若给出必须属于 `HTTP_METHODS`——该白名单与 `nodetypes.list`
-   共用一份，拼写错误在发布时被拒而不是运行时炸 run）；
+   （script: `code`，condition: `expr`，delay: `ms`，http_call: `url`，
+   sub_workflow: `workflow_id`；method 若给出必须属于 `HTTP_METHODS`——该白名单
+   与 `nodetypes.list` 共用一份，拼写错误在发布时被拒而不是运行时炸 run）；
 2. 恰好一个 `start`，至少一个 `end`；
 3. start 无入边，end 无出边，其余节点必须有入边（否则永不触发）；
 4. 边端点存在、无自环、无重复边；**condition 出边必须带 `true`/`false` 端口，
@@ -236,6 +238,31 @@ conflict，不改变 run；有效请求写入 `signal_received` 并处理后才�
 Driver 退出时显式 abort 剩余任务。内部错误若无法写入 `run_failed`，索引保留为
 `awaiting_resume` 并记录诊断，不把未持久化的终态写进 DB。
 
+### 6.8 子工作流（sub_workflow）
+
+sub_workflow 节点以目标工作流的**最新已发布版本**启动一个子 run，输入为父 run
+的输入快照，子 run 输出透传为本节点输出。父子 run 是两条完全独立的事件日志，
+各自走自己的恢复与终态协议。Driver 拿不到引擎句柄（DriverSpec 只有
+run_id/definition/input），启动/等待/取消经 `ChildRunLauncher` trait
+（`child_run.rs`）抽象：单机 `LocalChildLauncher` 同进程复用 Engine，
+Postgres `PgChildLauncher` 经 `lease::create_run` 单事务创建子 run、
+轮询共享 runs 投影等终态，取消走持久 inbox（DISTRIBUTED.md §6）。
+
+- **child_run_id 确定性派生**：`{父run_id}:{节点id}:{attempt}`，在 `start_node`
+  中确定并随 `node_started` 落盘——子 run 创建是副作用，其 id 先于副作用
+  持久化，写序协议（§3.2）不破；
+- **重放沿用已落盘 id**：崩溃恢复时 Running 残留记录带有已落盘的 child_run_id，
+  重放复用同一 id 启动，`start` 撞 `RunExists` 即附着既有子 run 等待终态，
+  不重复创建；**重试**（新 attempt，记录已非 Running）派生新 id，每次重试是
+  独立的子 run；
+- **深度上限 8**（`MAX_SUB_WORKFLOW_DEPTH`）：validate 检不了跨 definition 的
+  循环引用，运行时 `depth >= 8` 直接 fatal；depth 经 `run_started` 落盘，
+  恢复时读回；
+- **失败分类**：子 run failed/cancelled → 父节点 fatal；launcher 基础设施错误
+  （启动/等待失败）→ retryable；未配置 launcher 时执行即 fatal；
+- **取消级联 best-effort**：父 run 取消时先对仍在 Running 的 sub_workflow 节点
+  发起子 run 取消，再写 `RunCancelled`；取消失败只记日志，不升级。
+
 ## 7. 崩溃恢复
 
 ### 7.1 分类
@@ -250,6 +277,7 @@ Driver 退出时显式 abort 剩余任务。内部错误若无法写入 `run_fai
 | Running `http_call`，已有裁决信号 | **消费裁决**：retry/succeeded/failed | 裁决已经持久化 |
 | Running `human_task`，已有信号 | **补终态**（output=信号） | 信号已经持久化 |
 | Running `human_task`，无信号 | **继续等待**，不重复写 started | 等待无副作用 |
+| Running `sub_workflow` | **重放**：沿用已落盘 child_run_id，附着既有子 run | id 确定性派生且已随 node_started 落盘，重复 start 撞 RunExists 幂等 |
 | Failed{retryable:true} | **重建退避计时器**，下一次 attempt | 内存计时器不是权威 |
 | Failed{retryable:false} | **保留 run 失败结论**，独立分支继续 | fold 已记录 fatal_error |
 
@@ -310,7 +338,7 @@ jsonrpsee WebSocket。引擎不依赖存储，`StoreObserver` 在这一层把
 | 方法 | 说明 |
 |---|---|
 | `workflow.create / update / publish / get / list / delete` | 定义生命周期。update 前强制 validate |
-| `nodetypes.list` | 前端画布能力清单：类型、端口、参数 schema、supports_retry、side_effect |
+| `nodetypes.list` | 前端画布能力清单：类型、端口、`params_schema`（JSON Schema draft-07 子集 type/required/properties/enum/default，另带 `x-widget`/`x-label`/`x-help` 扩展键，前端据此渲染参数表单；后端校验仍以 `Definition::validate` 为准）、supports_retry、side_effect |
 | `run.start` | 校验 published → insert initializing → 持久化 run_started → 启动 Driver；初始化错误回写 failed |
 | `run.get / run.list` | 元数据 + live 标记 |
 | `run.timeline` | 只读时间线：定义顺序 + 折叠后的节点状态 |
@@ -362,6 +390,10 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
 8. 状态词汇表单一来源：`DbRunStatus`，store 写入口校验。
 9. 可重试失败非终态；不可重试失败由 fold 持久推导，恢复不会变为成功。
 10. 信号先校验，再持久化、消费和确认；无效请求不改变 run 终态。
+11. sub_workflow 的 child_run_id 确定性派生（`{父run}:{节点}:{attempt}`）并随
+    node_started 落盘；重放沿用已落盘 id 附着既有子 run，重试派生新 id。
+12. 父子 run 各有独立事件日志；嵌套深度上限 8，depth 经 run_started 持久化；
+    子 run failed/cancelled 传导为父节点 fatal，取消级联是 best-effort。
 
 ## 13. 测试策略
 
@@ -378,6 +410,8 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
 - 契约测试钉住跨 crate 状态词汇表（§8）；
 - `recovery_regressions.rs` 验证失败恢复、重试下游、剩余退避、非法/重复信号和裁决恢复；
 - `contracts.rs` 验证显式 draft 拒绝、初始化中断和旧日志缺失隔离；
+- `sub_workflow.rs` 验证子 run 输出透传、子失败 fatal、RunExists 附着、深度上限、
+  取消级联，以及崩溃重放沿用同一 child_run_id；
 - store 并发测试核对每个返回版本对应的定义及相同定义的版本复用；
 - 测试数据库必须放在独占目录的 `flow.db`，只清理独占目录，禁止删除系统临时目录；
 - **Postgres 后端**：租约 fencing、接管窗口、恢复分类与 inbox 幂等由
@@ -389,7 +423,6 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
 
 ## 14. 未做
 
-- `sub_workflow` 节点；
 - delay 剩余时间恢复（当前崩溃/接管后整段重放）；
 - fsync 组提交（吞吐优化，不动语义）；
 - 多 end 被跳过时与真 null 输出的显式区分；

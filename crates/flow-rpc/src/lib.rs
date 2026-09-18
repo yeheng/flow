@@ -1,3 +1,4 @@
+pub mod child;
 pub mod pg;
 
 use std::net::SocketAddr;
@@ -101,6 +102,8 @@ pub async fn recover_unfinished(state: &AppState) -> Result<Vec<(String, String)
             workflow_version: run.workflow_version,
             definition,
             input: run.input.clone(),
+            // 恢复路径：深度以日志中的 run_started 为准，这里只是占位
+            depth: 0,
         };
 
         match state.engine.resume_run(spec).await {
@@ -347,6 +350,7 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
             workflow_version: version,
             definition,
             input,
+            depth: 0,
         };
         if let Err(err) = state.engine.start_run(spec).await {
             let message = err.to_string();
@@ -559,6 +563,7 @@ pub(crate) fn timeline_value(
                 "duration_ms": record.duration_ms,
                 "output": record.output,
                 "error": record.error,
+                "child_run_id": record.child_run_id,
             });
             if let flow_engine::NodeState::Skipped { reason } = &record.state {
                 entry["reason"] = json!(reason);
@@ -583,6 +588,10 @@ pub(crate) fn timeline_value(
 }
 
 /// 前端拖拽面板 + 参数表单所需的能力清单。
+///
+/// `params_schema` 是 JSON Schema draft-07 子集（type/required/properties/enum/default），
+/// 另带 `x-widget`（code/json/workflow-picker）、`x-label`、`x-help` 扩展，
+/// 前端据此递归渲染参数表单，后端 validate 仍以 model.rs 为准。
 pub(crate) fn node_types() -> Value {
     json!([
         {
@@ -591,25 +600,29 @@ pub(crate) fn node_types() -> Value {
             "category": "control",
             "max_instances": 1,
             "ports": [{"id": "out", "label": "出"}],
-            "params": []
+            "params_schema": {"type": "object", "properties": {}}
         },
         {
             "type": "end",
             "label": "结束",
             "category": "control",
             "ports": [{"id": "in", "label": "入"}],
-            "params": []
+            "params_schema": {"type": "object", "properties": {}}
         },
         {
             "type": "script",
             "label": "脚本",
             "category": "compute",
             "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
-            "params": [
-                {"name": "code", "label": "JS 函数体", "kind": "code", "required": true,
-                 "help": "可用 input（run 输入）与 nodes（上游节点输出），用 return 返回结果"},
-                {"name": "timeout_ms", "label": "超时（毫秒）", "kind": "number", "default": 2000}
-            ],
+            "params_schema": {
+                "type": "object",
+                "required": ["code"],
+                "properties": {
+                    "code": {"type": "string", "x-widget": "code", "x-label": "JS 函数体",
+                             "x-help": "可用 input（run 输入）与 nodes（上游节点输出），用 return 返回结果"},
+                    "timeout_ms": {"type": "integer", "default": 2000, "x-label": "超时（毫秒）"}
+                }
+            },
             "supports_retry": true
         },
         {
@@ -617,31 +630,46 @@ pub(crate) fn node_types() -> Value {
             "label": "条件分支",
             "category": "control",
             "ports": [{"id": "in", "label": "入"}, {"id": "true", "label": "真"}, {"id": "false", "label": "假"}],
-            "params": [
-                {"name": "expr", "label": "条件表达式", "kind": "code", "required": true,
-                 "help": "表达式结果按真值判定（非空字符串、非 0 数为真），可用 input 与 nodes"},
-                {"name": "timeout_ms", "label": "超时（毫秒）", "kind": "number", "default": 2000}
-            ]
+            "params_schema": {
+                "type": "object",
+                "required": ["expr"],
+                "properties": {
+                    "expr": {"type": "string", "x-widget": "code", "x-label": "条件表达式",
+                             "x-help": "表达式结果按真值判定（非空字符串、非 0 数为真），可用 input 与 nodes"},
+                    "timeout_ms": {"type": "integer", "default": 2000, "x-label": "超时（毫秒）"}
+                }
+            }
         },
         {
             "type": "delay",
             "label": "等待",
             "category": "control",
             "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
-            "params": [{"name": "ms", "label": "时长（毫秒）", "kind": "number", "required": true}]
+            "params_schema": {
+                "type": "object",
+                "required": ["ms"],
+                "properties": {
+                    "ms": {"type": "integer", "x-label": "时长（毫秒）"}
+                }
+            }
         },
         {
             "type": "http_call",
             "label": "HTTP 请求",
             "category": "integration",
             "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
-            "params": [
-                {"name": "method", "label": "方法", "kind": "select", "options": HTTP_METHODS, "default": "GET"},
-                {"name": "url", "label": "URL", "kind": "text", "required": true, "help": "支持 ${input.x} / ${nodes.n2.y} 模板（${} 内不能含 }）"},
-                {"name": "headers", "label": "请求头", "kind": "json", "default": {}},
-                {"name": "body", "label": "请求体", "kind": "json"},
-                {"name": "timeout_ms", "label": "超时（毫秒）", "kind": "number", "default": 30000}
-            ],
+            "params_schema": {
+                "type": "object",
+                "required": ["url"],
+                "properties": {
+                    "method": {"type": "string", "enum": HTTP_METHODS, "default": "GET", "x-label": "方法"},
+                    "url": {"type": "string", "x-label": "URL",
+                            "x-help": "支持 ${input.x} / ${nodes.n2.y} 模板（${} 内不能含 }）"},
+                    "headers": {"x-widget": "json", "default": {}, "x-label": "请求头"},
+                    "body": {"x-widget": "json", "x-label": "请求体"},
+                    "timeout_ms": {"type": "integer", "default": 30000, "x-label": "超时（毫秒）"}
+                }
+            },
             "supports_retry": true,
             "side_effect": true
         },
@@ -650,7 +678,27 @@ pub(crate) fn node_types() -> Value {
             "label": "人工节点",
             "category": "human",
             "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
-            "params": [{"name": "prompt", "label": "提示", "kind": "text"}]
+            "params_schema": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "x-label": "提示"}
+                }
+            }
+        },
+        {
+            "type": "sub_workflow",
+            "label": "子工作流",
+            "category": "control",
+            "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
+            "params_schema": {
+                "type": "object",
+                "required": ["workflow_id"],
+                "properties": {
+                    "workflow_id": {"type": "string", "x-widget": "workflow-picker", "x-label": "目标工作流",
+                                    "x-help": "调用其最新已发布版本作为子 run；输入为父 run 输入，子 run 输出透传为本节点输出"}
+                }
+            },
+            "supports_retry": true
         }
     ])
 }

@@ -16,10 +16,11 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::{CommitOutcome, PendingInput, PendingInputKind, RunEventSink};
+use crate::child_run::ChildRunLauncher;
 use crate::engine::{DbRunStatus, Signal};
 use crate::error::EngineError;
 use crate::event::{Envelope, Event};
-use crate::exec::{self, NodeExecContext, NodeFailure};
+use crate::exec::{self, ChildRunSpec, NodeExecContext, NodeFailure};
 use crate::fold::{NodeState, RunState};
 use crate::model::{Definition, NodeType};
 
@@ -28,6 +29,10 @@ pub struct DriverSpec {
     pub run_id: String,
     pub definition: Arc<Definition>,
     pub input: Value,
+    /// 本 run 的嵌套深度（来自 run_started，恢复时从日志读回）
+    pub depth: u32,
+    /// sub_workflow 节点的子 run 启动器；未配置时 sub_workflow 节点执行即 fatal
+    pub child_launcher: Option<Arc<dyn ChildRunLauncher>>,
 }
 
 /// 文件后端的信号请求：oneshot 回执把校验/落盘结果还给调用方。
@@ -55,6 +60,8 @@ pub fn spawn_driver(
         run_id: spec.run_id,
         definition: spec.definition,
         input: spec.input,
+        depth: spec.depth,
+        child_launcher: spec.child_launcher,
         sink,
         state,
         events_tx,
@@ -165,6 +172,8 @@ struct Driver {
     run_id: String,
     definition: Arc<Definition>,
     input: Value,
+    depth: u32,
+    child_launcher: Option<Arc<dyn ChildRunLauncher>>,
     sink: Box<dyn RunEventSink>,
     state: RunState,
     events_tx: broadcast::Sender<Envelope>,
@@ -273,7 +282,24 @@ impl Driver {
                     return Ok(());
                 }
                 _ = self.cancel.cancelled() => {
+                    // 取消级联：仍在等待的子 run 一并取消（best-effort，失败只记日志）。
+                    // 必须在写 RunCancelled 前发起，子 run 才有最大机会及时停止。
+                    let child_runs: Vec<String> = self
+                        .state
+                        .records
+                        .iter()
+                        .filter(|(id, rec)| {
+                            matches!(rec.state, NodeState::Running { .. })
+                                && self.definition.node_type(id) == Some(NodeType::SubWorkflow)
+                        })
+                        .filter_map(|(_, rec)| rec.child_run_id.clone())
+                        .collect();
                     self.abort_inflight();
+                    if let Some(launcher) = &self.child_launcher {
+                        for child_run_id in child_runs {
+                            launcher.cancel(&child_run_id).await;
+                        }
+                    }
                     self.append_terminal(Event::RunCancelled {}).await?;
                     return Ok(());
                 }
@@ -524,9 +550,23 @@ impl Driver {
             .kind()
             .ok_or_else(|| EngineError::Node(format!("节点类型未知：{}", node.node_type)))?;
 
+        // sub_workflow 的 child_run_id 随 node_started 一起确定并落盘（副作用前写协议）。
+        // 崩溃重放（记录仍是 Running）沿用已落盘的 id 附着原子 run；
+        // 重试（新 attempt）派生新 id，每次重试是独立的子 run。
+        let child_run_id = if kind == NodeType::SubWorkflow {
+            let record = self.state.record(node_id);
+            match (&record.state, &record.child_run_id) {
+                (NodeState::Running { .. }, Some(existing)) => Some(existing.clone()),
+                _ => Some(format!("{}:{}:{}", self.run_id, node_id, attempt)),
+            }
+        } else {
+            None
+        };
+
         self.append(Event::NodeStarted {
             node_id: node_id.to_string(),
             attempt,
+            child_run_id: child_run_id.clone(),
         })
         .await?;
 
@@ -546,6 +586,14 @@ impl Driver {
             input: self.input.clone(),
             outputs: self.state.outputs.clone(),
             preds,
+            depth: self.depth,
+            child: match (child_run_id, &self.child_launcher) {
+                (Some(child_run_id), Some(launcher)) => Some(ChildRunSpec {
+                    child_run_id,
+                    launcher: launcher.clone(),
+                }),
+                _ => None,
+            },
         };
         let cancel = self.cancel.clone();
         let result_tx = result_tx.clone();

@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted } from "vue";
+import { computed, onMounted, onUnmounted } from "vue";
 import { client } from "./rpc/client";
-import { initEditor, ui } from "./state/editor";
+import { initEditor, save, ui } from "./state/editor";
 import WorkflowList from "./components/WorkflowList.vue";
 import NodePalette from "./components/NodePalette.vue";
 import FlowCanvas from "./components/FlowCanvas.vue";
@@ -10,8 +10,20 @@ import RunPanel from "./components/RunPanel.vue";
 
 const connected = computed(() => client.connected.value);
 
+function onKeydown(e: KeyboardEvent): void {
+  if ((e.metaKey || e.ctrlKey) && e.key === "s") {
+    e.preventDefault();
+    void save();
+  }
+}
+
 onMounted(() => {
+  window.addEventListener("keydown", onKeydown);
   void initEditor();
+});
+
+onUnmounted(() => {
+  window.removeEventListener("keydown", onKeydown);
 });
 </script>
 

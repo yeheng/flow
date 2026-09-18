@@ -70,6 +70,9 @@ pub struct NodeRecord {
     pub error: Option<String>,
     /// 已记录但尚未被消费的信号（崩溃在 signal_received 与终态之间）
     pub last_signal: Option<Value>,
+    /// sub_workflow 节点的子 run id（来自 node_started）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +102,9 @@ pub struct RunState {
     pub workflow_version: Option<i64>,
     pub input: Value,
     pub last_seq: u64,
+    /// 嵌套深度（来自 run_started，恢复时读回）
+    #[serde(default)]
+    pub depth: u32,
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
 }
@@ -115,6 +121,7 @@ impl Default for RunState {
             workflow_version: None,
             input: Value::Null,
             last_seq: 0,
+            depth: 0,
             started_at: None,
             ended_at: None,
         }
@@ -148,15 +155,19 @@ impl RunState {
                 workflow_id,
                 workflow_version,
                 input,
+                depth,
             } => {
                 self.workflow_id = Some(workflow_id.clone());
                 self.workflow_version = Some(*workflow_version);
                 self.input = input.clone();
+                self.depth = *depth;
                 self.started_at = Some(env.ts);
                 self.phase = RunPhase::Running;
             }
             Event::NodeStarted {
-                node_id, attempt, ..
+                node_id,
+                attempt,
+                child_run_id,
             } => {
                 let rec = self.records.entry(node_id.clone()).or_default();
                 rec.state = NodeState::Running { attempt: *attempt };
@@ -167,6 +178,7 @@ impl RunState {
                 rec.error = None;
                 rec.output = None;
                 rec.last_signal = None;
+                rec.child_run_id = child_run_id.clone();
                 self.outputs.remove(node_id);
             }
             Event::NodeCompleted {
@@ -269,6 +281,7 @@ mod tests {
                     workflow_id: "w1".into(),
                     workflow_version: 1,
                     input: serde_json::json!({"a": 1}),
+                    depth: 0,
                 },
             ),
             env(
@@ -276,6 +289,7 @@ mod tests {
                 Event::NodeStarted {
                     node_id: "n1".into(),
                     attempt: 1,
+                    child_run_id: None,
                 },
             ),
             env(
@@ -292,6 +306,7 @@ mod tests {
                 Event::NodeStarted {
                     node_id: "n1".into(),
                     attempt: 2,
+                    child_run_id: None,
                 },
             ),
             env(
@@ -330,6 +345,7 @@ mod tests {
                     workflow_id: "w".into(),
                     workflow_version: 1,
                     input: Value::Null,
+                    depth: 0,
                 },
             ),
             env(
@@ -361,6 +377,7 @@ mod tests {
             Event::NodeStarted {
                 node_id: "n1".into(),
                 attempt: 2,
+                child_run_id: None,
             },
         ));
         assert!(!state.outputs.contains_key("n1"));

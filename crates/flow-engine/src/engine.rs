@@ -73,6 +73,9 @@ pub struct StartRun {
     pub workflow_version: i64,
     pub definition: Definition,
     pub input: Value,
+    /// 嵌套深度：根 run 为 0，sub_workflow 的子 run 为父深度 + 1。
+    /// 恢复路径（resume_run）忽略此字段，深度以日志中的 run_started 为准。
+    pub depth: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +211,8 @@ pub struct Engine {
     observer: Arc<dyn RunObserver>,
     events_tx: broadcast::Sender<Envelope>,
     registry: Arc<Mutex<HashMap<String, RunHandle>>>,
+    /// sub_workflow 启动器由 RPC 层在两阶段构造后注入（launcher 依赖 Engine 自身）
+    child_launcher: Mutex<Option<Arc<dyn crate::child_run::ChildRunLauncher>>>,
 }
 
 impl Engine {
@@ -218,7 +223,12 @@ impl Engine {
             observer,
             events_tx,
             registry: Arc::new(Mutex::new(HashMap::new())),
+            child_launcher: Mutex::new(None),
         }
+    }
+
+    pub fn set_child_launcher(&self, launcher: Arc<dyn crate::child_run::ChildRunLauncher>) {
+        *self.child_launcher.lock() = Some(launcher);
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -272,6 +282,7 @@ impl Engine {
                     workflow_id: spec.workflow_id.clone(),
                     workflow_version: spec.workflow_version,
                     input: spec.input.clone(),
+                    depth: spec.depth,
                 },
             )
             .await?;
@@ -370,6 +381,9 @@ impl Engine {
                 run_id: spec.run_id.clone(),
                 definition: Arc::new(spec.definition),
                 input: spec.input,
+                // 深度以日志中的 run_started 为准（恢复路径 spec.depth 不可靠）
+                depth: state.depth,
+                child_launcher: self.child_launcher.lock().clone(),
             },
             state,
             plan,

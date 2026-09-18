@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod child_run;
 pub mod driver;
 pub mod engine;
 pub mod error;
@@ -9,6 +10,7 @@ pub mod fold;
 pub mod model;
 
 pub use backend::{CommitOutcome, PendingInput, PendingInputKind, RunEventSink};
+pub use child_run::{ChildRunLauncher, ChildRunOutcome, MAX_SUB_WORKFLOW_DEPTH};
 pub use driver::{spawn_driver, DriverSpec, RecoveryPlan, SignalRequest};
 pub use engine::{
     DbRunStatus, Engine, NoopObserver, ResumeOutcome, RunObserver, Signal, StartRun, StatusUpdate,

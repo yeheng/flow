@@ -14,6 +14,8 @@ pub enum NodeType {
     Delay,
     HttpCall,
     HumanTask,
+    /// 调用另一个已发布工作流作为子 run，等待其终态并透传输出
+    SubWorkflow,
 }
 
 impl NodeType {
@@ -26,6 +28,7 @@ impl NodeType {
             NodeType::Delay => "delay",
             NodeType::HttpCall => "http_call",
             NodeType::HumanTask => "human_task",
+            NodeType::SubWorkflow => "sub_workflow",
         }
     }
 
@@ -38,6 +41,7 @@ impl NodeType {
             "delay" => NodeType::Delay,
             "http_call" => NodeType::HttpCall,
             "human_task" => NodeType::HumanTask,
+            "sub_workflow" => NodeType::SubWorkflow,
             _ => return None,
         })
     }
@@ -355,6 +359,7 @@ fn validate_params(node: &Node, kind: NodeType) -> Result<(), String> {
             Some(_) => Ok(()),
             None => Err(format!("节点 {}（delay）缺少参数 ms", node.id)),
         },
+        NodeType::SubWorkflow => need_str("workflow_id"),
         NodeType::Start | NodeType::End | NodeType::HumanTask => Ok(()),
     }
 }

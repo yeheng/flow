@@ -222,6 +222,12 @@ async fn take_over(
         run_id: run_id.to_string(),
         definition: Arc::new(definition),
         input: folded.input.clone(),
+        // 深度以共享日志中的 run_started 为准（接管恢复时 spec 无权威来源）
+        depth: folded.depth,
+        child_launcher: Some(Arc::new(crate::child::PgChildLauncher::new(
+            store.pool().clone(),
+            cfg.clone(),
+        ))),
     };
     let handle = spawn_driver(
         Box::new(sink),

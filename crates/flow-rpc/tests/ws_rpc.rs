@@ -518,3 +518,123 @@ async fn restart_asks_for_human_adjudication_on_side_effect_node() {
         json!({"status": 200, "body": {"paid": true}})
     );
 }
+
+#[tokio::test]
+async fn nodetypes_list_exposes_json_schema_and_sub_workflow() {
+    let ws = Workspace::start().await;
+    let node_types: Value = call(&ws.client, "nodetypes.list", json!({})).await;
+    let list = node_types["node_types"].as_array().unwrap();
+
+    // 旧 params 数组已移除，统一为 params_schema
+    for t in list {
+        assert!(t.get("params").is_none(), "{} 仍带旧 params 数组", t["type"]);
+        assert_eq!(t["params_schema"]["type"], json!("object"), "{}", t["type"]);
+    }
+
+    let script = list.iter().find(|t| t["type"] == "script").unwrap();
+    assert_eq!(script["params_schema"]["required"], json!(["code"]));
+    assert_eq!(
+        script["params_schema"]["properties"]["code"]["x-widget"],
+        json!("code")
+    );
+    assert_eq!(
+        script["params_schema"]["properties"]["timeout_ms"]["default"],
+        json!(2000)
+    );
+
+    let http = list.iter().find(|t| t["type"] == "http_call").unwrap();
+    assert_eq!(
+        http["params_schema"]["properties"]["method"]["enum"],
+        json!(flow_engine::HTTP_METHODS)
+    );
+    assert_eq!(
+        http["params_schema"]["properties"]["headers"]["x-widget"],
+        json!("json")
+    );
+
+    let sub = list.iter().find(|t| t["type"] == "sub_workflow").unwrap();
+    assert_eq!(sub["params_schema"]["required"], json!(["workflow_id"]));
+    assert_eq!(
+        sub["params_schema"]["properties"]["workflow_id"]["x-widget"],
+        json!("workflow-picker")
+    );
+}
+
+#[tokio::test]
+async fn sub_workflow_runs_child_and_links_timeline() {
+    let ws = Workspace::start().await;
+
+    // 子工作流：透传输入并包装
+    let (child_id, _) = ws
+        .publish_workflow(
+            "子流程",
+            json!({
+                "nodes": [
+                    {"id": "s", "type": "start"},
+                    {"id": "n", "type": "script", "params": {"code": "return { got: input };"}},
+                    {"id": "e", "type": "end"}
+                ],
+                "edges": [{"from": "s", "to": "n"}, {"from": "n", "to": "e"}]
+            }),
+        )
+        .await;
+
+    // 父工作流：start → sub_workflow → end
+    let (parent_id, _) = ws
+        .publish_workflow(
+            "父流程",
+            json!({
+                "nodes": [
+                    {"id": "s", "type": "start"},
+                    {"id": "sub", "type": "sub_workflow", "params": {"workflow_id": child_id}},
+                    {"id": "e", "type": "end"}
+                ],
+                "edges": [{"from": "s", "to": "sub"}, {"from": "sub", "to": "e"}]
+            }),
+        )
+        .await;
+
+    let run_id = ws.start_run(&parent_id, json!({"amount": 5})).await;
+    let run = ws.wait_run_status(&run_id, "succeeded").await;
+    // 子 run 输入 = 父 run 输入；子 run 输出透传为父 run 输出
+    assert_eq!(run["run"]["output"], json!({"got": {"amount": 5}}));
+
+    // 时间线带上确定性 child_run_id，且子 run 真实存在并已成功
+    let timeline: Value = call(&ws.client, "run.timeline", json!({"run_id": run_id})).await;
+    let sub = timeline["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["id"] == "sub")
+        .unwrap();
+    let child_run_id = sub["child_run_id"].as_str().unwrap();
+    assert_eq!(child_run_id, format!("{run_id}:sub:1"));
+
+    let child = ws.wait_run_status(child_run_id, "succeeded").await;
+    assert_eq!(child["run"]["output"], json!({"got": {"amount": 5}}));
+    assert_eq!(child["run"]["workflow_id"], json!(child_id));
+}
+
+#[tokio::test]
+async fn sub_workflow_missing_workflow_id_is_rejected_at_save() {
+    let ws = Workspace::start().await;
+    let created: Value = call(&ws.client, "workflow.create", json!({"name": "坏流程"})).await;
+    let workflow_id = created["workflow_id"].as_str().unwrap();
+    let err = call_err(
+        &ws.client,
+        "workflow.update",
+        json!({
+            "workflow_id": workflow_id,
+            "definition": {
+                "nodes": [
+                    {"id": "s", "type": "start"},
+                    {"id": "sub", "type": "sub_workflow"},
+                    {"id": "e", "type": "end"}
+                ],
+                "edges": [{"from": "s", "to": "sub"}, {"from": "sub", "to": "e"}]
+            }
+        }),
+    )
+    .await;
+    assert!(err.contains("workflow_id"), "{err}");
+}

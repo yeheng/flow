@@ -6,7 +6,7 @@ import { editor, ui } from "./editor";
 
 export const monitor = reactive({
   runId: null as string | null,
-  /** 记录发起 run 的工作流：画布着色只在仍选中同一工作流时生效 */
+  /** 当前查看的 run 所属工作流：画布着色只在仍选中同一工作流时生效 */
   workflowId: null as string | null,
   inputText: "",
   phase: null as string | null,
@@ -15,6 +15,8 @@ export const monitor = reactive({
   lastSeq: 0,
   /** 定义顺序的节点状态，来自 run.timeline 初始对齐 + run.event 增量 */
   nodes: [] as TimelineNode[],
+  /** 子 run 钻取栈：栈顶是当前 run 的直接父 run */
+  breadcrumb: [] as { runId: string; workflowId: string }[],
   starting: false,
 });
 
@@ -28,6 +30,12 @@ export const waitingHumanTasks = computed(() =>
 export function nodeRunState(nodeId: string): string | null {
   if (!monitor.runId || monitor.workflowId !== editor.workflowId) return null;
   return monitor.nodes.find((n) => n.id === nodeId)?.state ?? null;
+}
+
+/** sub_workflow 节点已启动的子 run（画布节点上的钻取链接用） */
+export function nodeChildRunId(nodeId: string): string | null {
+  if (!monitor.runId || monitor.workflowId !== editor.workflowId) return null;
+  return monitor.nodes.find((n) => n.id === nodeId)?.child_run_id ?? null;
 }
 
 let unsubscribe: (() => Promise<void>) | null = null;
@@ -52,36 +60,65 @@ export async function startRun(): Promise<void> {
   }
   monitor.starting = true;
   try {
-    if (unsubscribe) {
-      await unsubscribe().catch(() => {});
-      unsubscribe = null;
-    }
     const { run_id } = await api.startRun(editor.workflowId, input);
-    monitor.runId = run_id;
+    monitor.breadcrumb = [];
     monitor.workflowId = editor.workflowId;
-    monitor.phase = "running";
-    monitor.output = undefined;
-    monitor.fatalError = null;
-    monitor.lastSeq = 0;
-    monitor.nodes = [];
-    buffer = [];
-    aligned = false;
-    unsubscribe = await api.subscribeRun(run_id, (env) => {
-      if (!aligned) {
-        buffer.push(env);
-        return;
-      }
-      onEvent(env);
-    });
-    await resync();
-    aligned = true;
-    buffer.sort((a, b) => a.seq - b.seq).forEach(onEvent);
-    buffer = [];
+    await attach(run_id);
     ui.error = null;
   } catch (e) {
     ui.error = errText(e);
   } finally {
     monitor.starting = false;
+  }
+}
+
+/** 切换到指定 run：退订旧的、订阅新的、timeline 对齐后补放缓冲事件 */
+async function attach(runId: string): Promise<void> {
+  if (unsubscribe) {
+    await unsubscribe().catch(() => {});
+    unsubscribe = null;
+  }
+  monitor.runId = runId;
+  monitor.phase = "running";
+  monitor.output = undefined;
+  monitor.fatalError = null;
+  monitor.lastSeq = 0;
+  monitor.nodes = [];
+  buffer = [];
+  aligned = false;
+  unsubscribe = await api.subscribeRun(runId, (env) => {
+    if (!aligned) {
+      buffer.push(env);
+      return;
+    }
+    onEvent(env);
+  });
+  await resync();
+  aligned = true;
+  buffer.sort((a, b) => a.seq - b.seq).forEach(onEvent);
+  buffer = [];
+}
+
+/** 钻取 sub_workflow 节点的子 run */
+export async function openChildRun(childRunId: string): Promise<void> {
+  if (!monitor.runId || !monitor.workflowId || childRunId === monitor.runId) return;
+  const parent = { runId: monitor.runId, workflowId: monitor.workflowId };
+  try {
+    await attach(childRunId);
+    monitor.breadcrumb.push(parent);
+  } catch (e) {
+    ui.error = errText(e);
+  }
+}
+
+/** 返回上一级父 run */
+export async function backToParentRun(): Promise<void> {
+  const parent = monitor.breadcrumb.pop();
+  if (!parent) return;
+  try {
+    await attach(parent.runId);
+  } catch (e) {
+    ui.error = errText(e);
   }
 }
 
@@ -123,6 +160,8 @@ async function resync(): Promise<void> {
     monitor.output = tl.output;
     monitor.fatalError = tl.fatal_error;
     monitor.lastSeq = tl.last_seq;
+    // 钻取子 run 后着色守卫按子 run 自己的工作流对齐
+    monitor.workflowId = tl.workflow_id;
   } catch (e) {
     ui.error = errText(e);
   }
@@ -153,6 +192,8 @@ function applyEvent(env: RunEvent): void {
         rec.duration_ms = null;
         rec.output = null;
         rec.error = null;
+        // 重试 = 新 attempt = 新的确定性 child_run_id
+        rec.child_run_id = env.child_run_id;
       }
       break;
     case "node_completed":

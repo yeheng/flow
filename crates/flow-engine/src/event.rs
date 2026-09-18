@@ -22,10 +22,18 @@ pub enum Event {
         workflow_id: String,
         workflow_version: i64,
         input: Value,
+        /// 嵌套深度：sub_workflow 子 run 为父深度 + 1，根 run 为 0。
+        /// 旧日志没有该字段，反序列化默认为 0。
+        #[serde(default)]
+        depth: u32,
     },
     NodeStarted {
         node_id: String,
         attempt: u32,
+        /// sub_workflow 节点确定性派生的子 run id（`{父run}:{节点}:{attempt}`），
+        /// 随 node_started 一起落盘，崩溃重放时据此附着原子 run。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        child_run_id: Option<String>,
     },
     NodeCompleted {
         node_id: String,

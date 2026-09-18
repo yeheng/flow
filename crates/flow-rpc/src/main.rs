@@ -40,6 +40,13 @@ async fn start_sqlite(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>
         Arc::new(StoreObserver::new(store.clone())),
     ));
     let state = Arc::new(AppState { store, engine });
+    // 两阶段注入：launcher 依赖 Engine，Engine 的 Driver 需要 launcher
+    state
+        .engine
+        .set_child_launcher(Arc::new(flow_rpc::child::LocalChildLauncher::new(
+            state.store.clone(),
+            state.engine.clone(),
+        )));
 
     // 崩溃恢复：未结束的 run 从 event.jsonl 折叠回来继续跑
     for (run_id, error) in recover_unfinished(&state).await? {

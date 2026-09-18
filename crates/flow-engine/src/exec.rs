@@ -1,10 +1,11 @@
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
+use crate::child_run::{ChildRunLauncher, ChildRunOutcome, MAX_SUB_WORKFLOW_DEPTH};
 use crate::error::EngineError;
 use crate::expr;
 use crate::model::{Node, NodeType};
@@ -47,6 +48,15 @@ pub struct NodeExecContext {
     /// 前驱节点输出快照（决定论输入）
     pub outputs: HashMap<String, Value>,
     pub preds: Vec<String>,
+    /// 本 run 的嵌套深度（根 run 为 0）；仅 sub_workflow 使用
+    pub depth: u32,
+    /// sub_workflow：已随 node_started 落盘的确定性子 run id 与启动器
+    pub child: Option<ChildRunSpec>,
+}
+
+pub struct ChildRunSpec {
+    pub child_run_id: String,
+    pub launcher: Arc<dyn ChildRunLauncher>,
 }
 
 impl NodeExecContext {
@@ -84,9 +94,66 @@ pub async fn execute(
         NodeType::Condition => run_condition(ctx).await,
         NodeType::Delay => run_delay(ctx, cancel).await,
         NodeType::HttpCall => run_http(ctx).await,
+        NodeType::SubWorkflow => run_sub_workflow(ctx, cancel).await,
         NodeType::HumanTask => Err(NodeFailure::fatal(
             "human_task 由引擎等待信号驱动，不应直接执行",
         )),
+    }
+}
+
+/// sub_workflow：启动子 run（幂等）并等待其终态，输出透传为节点输出。
+/// 写序协议已由 Driver 保证：执行到这里时带 child_run_id 的 node_started 已落盘。
+async fn run_sub_workflow(
+    ctx: &NodeExecContext,
+    cancel: &CancellationToken,
+) -> Result<Value, NodeFailure> {
+    let child = ctx
+        .child
+        .as_ref()
+        .ok_or_else(|| NodeFailure::fatal("sub_workflow 未配置子 run 启动器"))?;
+    let workflow_id = ctx
+        .node
+        .param_str("workflow_id")
+        .ok_or_else(|| NodeFailure::fatal("sub_workflow 节点缺少 workflow_id 参数"))?
+        .to_string();
+    if ctx.depth >= MAX_SUB_WORKFLOW_DEPTH {
+        return Err(NodeFailure::fatal(format!(
+            "子工作流嵌套超过 {MAX_SUB_WORKFLOW_DEPTH} 层（疑似循环引用）"
+        )));
+    }
+    // 子 run 输入 = 父 run 输入快照
+    match child
+        .launcher
+        .start(&child.child_run_id, &workflow_id, ctx.input.clone(), ctx.depth + 1)
+        .await
+    {
+        Ok(()) => {}
+        // 崩溃重放：子 run 已由崩溃前的同一 attempt 创建，附着等待即可
+        Err(EngineError::RunExists(_)) => {}
+        Err(err) => return Err(NodeFailure::retryable(format!("启动子 run 失败：{err}"))),
+    }
+    tokio::select! {
+        _ = cancel.cancelled() => {
+            child.launcher.cancel(&child.child_run_id).await;
+            Err(NodeFailure::fatal("已取消"))
+        }
+        outcome = child.launcher.await_terminal(&child.child_run_id, cancel.clone()) => {
+            match outcome {
+                Ok(ChildRunOutcome::Succeeded(output)) => Ok(output),
+                Ok(ChildRunOutcome::Failed(error)) => Err(NodeFailure::fatal(format!(
+                    "子 run {} 失败：{error}",
+                    child.child_run_id
+                ))),
+                Ok(ChildRunOutcome::Cancelled) => Err(NodeFailure::fatal(format!(
+                    "子 run {} 已取消",
+                    child.child_run_id
+                ))),
+                Err(err) => Err(NodeFailure::retryable(format!(
+                    "等待子 run {} 终态失败：{err}",
+                    child.child_run_id
+                ))),
+            }
+        }
     }
 }
 
@@ -363,6 +430,8 @@ mod tests {
             input: json!({"amount": 1}),
             outputs: HashMap::new(),
             preds: vec![],
+            depth: 0,
+            child: None,
         };
         let failure = execute(&ctx, &CancellationToken::new()).await.unwrap_err();
         assert!(

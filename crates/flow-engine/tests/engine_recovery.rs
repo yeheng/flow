@@ -110,6 +110,7 @@ async fn craft_partial_log(dir: &Path, run_id: &str, nodes_started: &[&str]) {
             workflow_id: "w1".into(),
             workflow_version: 1,
             input: json!({"amount": 21}),
+            depth: 0,
         },
     )
     .await
@@ -120,6 +121,7 @@ async fn craft_partial_log(dir: &Path, run_id: &str, nodes_started: &[&str]) {
             Event::NodeStarted {
                 node_id: (*node_id).to_string(),
                 attempt: 1,
+                child_run_id: None,
             },
         )
         .await
@@ -141,6 +143,7 @@ async fn linear_run_executes_and_records_ordered_events() {
             workflow_version: 1,
             definition: def,
             input: json!({"amount": 21}),
+            depth: 0,
         })
         .await
         .unwrap();
@@ -204,6 +207,7 @@ async fn condition_branch_marks_untaken_side_skipped() {
             workflow_version: 1,
             definition: def,
             input: json!({"amount": 5}),
+            depth: 0,
         })
         .await
         .unwrap();
@@ -253,6 +257,7 @@ async fn restarted_pure_node_is_replayed_with_new_attempt() {
             workflow_version: 1,
             definition: def,
             input: json!({"amount": 21}),
+            depth: 0,
         })
         .await
         .unwrap();
@@ -313,6 +318,7 @@ async fn side_effect_node_after_crash_waits_for_human_adjudication() {
             workflow_version: 1,
             definition: def,
             input: json!({"amount": 21}),
+            depth: 0,
         })
         .await
         .unwrap();
@@ -368,6 +374,7 @@ async fn human_task_holds_run_until_signal_arrives() {
             workflow_version: 1,
             definition: def,
             input: json!({"amount": 21}),
+            depth: 0,
         })
         .await
         .unwrap();
@@ -442,6 +449,7 @@ async fn human_task_signal_recorded_before_crash_is_completed_on_resume() {
             workflow_version: 1,
             definition: def,
             input: json!({"amount": 21}),
+            depth: 0,
         })
         .await
         .unwrap();
@@ -474,6 +482,7 @@ async fn cancelled_run_is_terminal_and_stops_work() {
             workflow_version: 1,
             definition: def,
             input: Value::Null,
+            depth: 0,
         })
         .await
         .unwrap();
@@ -516,6 +525,7 @@ async fn skip_propagates_through_multiple_downstream_levels() {
             workflow_version: 1,
             definition: def,
             input: json!({"amount": 5}),
+            depth: 0,
         })
         .await
         .unwrap();
@@ -566,6 +576,7 @@ async fn multi_pred_end_collects_output_map() {
             workflow_version: 1,
             definition: def,
             input: json!(null),
+            depth: 0,
         })
         .await
         .unwrap();
@@ -606,6 +617,7 @@ async fn fatal_failure_lets_independent_branch_finish() {
             workflow_version: 1,
             definition: def,
             input: json!(null),
+            depth: 0,
         })
         .await
         .unwrap();

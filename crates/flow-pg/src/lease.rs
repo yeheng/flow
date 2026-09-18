@@ -214,6 +214,7 @@ pub async fn create_run(
     workflow_id: &str,
     workflow_version: i64,
     input: &Value,
+    depth: u32,
 ) -> Result<(), PgError> {
     let mut tx = pool.begin().await?;
     // 锁 workflow 行：与 delete_workflow（拒绝已有 run 的 workflow）串行化
@@ -252,6 +253,7 @@ pub async fn create_run(
         workflow_id: workflow_id.to_string(),
         workflow_version,
         input: input.clone(),
+        depth,
     })?;
     sqlx::query(
         "INSERT INTO runs (id, workflow_id, workflow_version, status, input, started_at, last_seq)

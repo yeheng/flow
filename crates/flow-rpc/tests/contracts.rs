@@ -153,6 +153,7 @@ async fn initialized_log_is_resumed_even_when_metadata_still_says_initializing()
             workflow_id: f.workflow.clone(),
             workflow_version: 1,
             input: Value::Null,
+            depth: 0,
         },
     )
     .await

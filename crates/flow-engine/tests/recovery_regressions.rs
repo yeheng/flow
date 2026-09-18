@@ -44,10 +44,12 @@ impl Harness {
                 workflow_id: "w".into(),
                 workflow_version: 1,
                 input: Value::Null,
+                depth: 0,
             },
             Event::NodeStarted {
                 node_id: "s".into(),
                 attempt: 1,
+                child_run_id: None,
             },
             Event::NodeCompleted {
                 node_id: "s".into(),
@@ -58,6 +60,7 @@ impl Harness {
             Event::NodeStarted {
                 node_id: "n".into(),
                 attempt: 1,
+                child_run_id: None,
             },
         ]
         .into_iter()
@@ -105,6 +108,7 @@ fn spec(definition: Definition) -> StartRun {
         workflow_version: 1,
         definition,
         input: Value::Null,
+        depth: 0,
     }
 }
 
@@ -139,6 +143,7 @@ async fn recovered_fatal_failure_remains_failed_and_independent_branch_finishes(
         Event::NodeStarted {
             node_id: "slow".into(),
             attempt: 1,
+            child_run_id: None,
         },
     ])
     .await;

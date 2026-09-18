@@ -1,5 +1,12 @@
 <script setup lang="ts">
-import { createWorkflow, editor, publish, removeWorkflow, save, selectWorkflow } from "../state/editor";
+import {
+  createWorkflow,
+  editor,
+  publish,
+  removeWorkflow,
+  save,
+  switchWorkflow,
+} from "../state/editor";
 import { monitor, startRun } from "../state/monitor";
 
 function onCreate(): void {
@@ -25,7 +32,7 @@ function onDelete(id: string): void {
       :key="w.workflow_id"
       class="wf-item"
       :class="{ active: w.workflow_id === editor.workflowId }"
-      @click="selectWorkflow(w.workflow_id)"
+      @click="switchWorkflow(w.workflow_id)"
     >
       <span class="wf-name">{{ w.name }}</span>
       <span class="wf-meta">

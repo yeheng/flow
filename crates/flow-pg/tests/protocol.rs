@@ -35,6 +35,7 @@ async fn takeover_waits_for_inflight_commit_then_reads_it() {
         .append(flow_engine::Event::NodeStarted {
             node_id: "n1".into(),
             attempt: 2,
+            child_run_id: None,
         })
         .await
         .unwrap();
@@ -122,6 +123,7 @@ async fn after_takeover_old_owner_operations_fail() {
         .append(flow_engine::Event::NodeStarted {
             node_id: "n1".into(),
             attempt: 1,
+            child_run_id: None,
         })
         .await
         .unwrap_err();
@@ -159,6 +161,7 @@ async fn after_takeover_old_owner_operations_fail() {
         .append(flow_engine::Event::NodeStarted {
             node_id: "n1".into(),
             attempt: 1,
+            child_run_id: None,
         })
         .await
         .unwrap();
@@ -173,6 +176,7 @@ async fn after_takeover_old_owner_operations_fail() {
         .append(flow_engine::Event::NodeStarted {
             node_id: "n1".into(),
             attempt: 2,
+            child_run_id: None,
         })
         .await
         .unwrap_err();
@@ -283,6 +287,7 @@ async fn terminal_append_rejects_pending_inputs_and_releases_lease() {
     sink.append(flow_engine::Event::NodeStarted {
         node_id: "n1".into(),
         attempt: 1,
+        child_run_id: None,
     })
     .await
     .unwrap();
@@ -349,6 +354,7 @@ async fn terminal_append_rejects_pending_inputs_and_releases_lease() {
         .append(flow_engine::Event::NodeStarted {
             node_id: "n1".into(),
             attempt: 2,
+            child_run_id: None,
         })
         .await
         .unwrap_err();

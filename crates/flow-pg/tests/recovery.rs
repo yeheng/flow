@@ -35,6 +35,7 @@ async fn takeover_replays_pure_node_with_new_attempt() {
     sink.append(flow_engine::Event::NodeStarted {
         node_id: "n1".into(),
         attempt: 1,
+        child_run_id: None,
     })
     .await
     .unwrap();
@@ -196,6 +197,7 @@ async fn takeover_http_side_effect_requires_adjudication_then_retries_once() {
     sink.append(flow_engine::Event::NodeStarted {
         node_id: "h".into(),
         attempt: 1,
+        child_run_id: None,
     })
     .await
     .unwrap();
@@ -277,6 +279,7 @@ async fn takeover_consumes_recorded_adjudication() {
     sink.append(flow_engine::Event::NodeStarted {
         node_id: "h".into(),
         attempt: 1,
+        child_run_id: None,
     })
     .await
     .unwrap();

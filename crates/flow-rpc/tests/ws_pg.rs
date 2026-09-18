@@ -580,3 +580,57 @@ async fn subscription_streams_events_in_order() {
     server.kill();
     db.close().await;
 }
+
+/// Postgres 模式的 sub_workflow：子 run 经 gateway 单事务创建（确定性 id 幂等），
+/// 父 run 轮询共享投影等待终态（父子可能落在不同 executor）。
+#[tokio::test]
+async fn postgres_sub_workflow_end_to_end() {
+    let Some(db) = test_db().await else { return };
+    let mut server = ServerProc::spawn(&db.url, "all", 5000);
+    let client = server.client().await;
+
+    let (child_wf, _) = publish(&client, "子流程", line_def("return { got: input };")).await;
+    let (parent_wf, _) = publish(
+        &client,
+        "父流程",
+        json!({
+            "nodes": [
+                {"id": "start", "type": "start"},
+                {"id": "sub", "type": "sub_workflow", "params": {"workflow_id": child_wf}},
+                {"id": "end", "type": "end"}
+            ],
+            "edges": [{"from": "start", "to": "sub"}, {"from": "sub", "to": "end"}]
+        }),
+    )
+    .await;
+
+    let started: Value = call(
+        &client,
+        "run.start",
+        json!({"workflow_id": parent_wf, "input": {"amount": 7}}),
+    )
+    .await;
+    let run_id = started["run_id"].as_str().unwrap().to_string();
+
+    let run = wait_status(&client, &run_id, "succeeded", Duration::from_secs(20)).await;
+    assert_eq!(run["run"]["output"], json!({"got": {"amount": 7}}));
+
+    // 父日志的时间线带确定性 child_run_id；子 run 的 run_started 记录深度 1
+    let timeline: Value = call(&client, "run.timeline", json!({"run_id": run_id})).await;
+    let sub = timeline["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["id"] == "sub")
+        .unwrap();
+    let child_run_id = sub["child_run_id"].as_str().unwrap().to_string();
+    assert_eq!(child_run_id, format!("{run_id}:sub:1"));
+
+    let child = wait_status(&client, &child_run_id, "succeeded", Duration::from_secs(10)).await;
+    assert_eq!(child["run"]["output"], json!({"got": {"amount": 7}}));
+    let events: Value = call(&client, "run.events", json!({"run_id": child_run_id})).await;
+    assert_eq!(events["events"][0]["depth"], json!(1));
+
+    server.kill();
+    db.close().await;
+}

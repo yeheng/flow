@@ -1,12 +1,15 @@
 <script setup lang="ts">
 import { reactive } from "vue";
 import {
+  backToParentRun,
   cancelRun,
   deliverSignal,
   monitor,
+  openChildRun,
   runActive,
   waitingHumanTasks,
 } from "../state/monitor";
+import { editor } from "../state/editor";
 
 const phaseLabel: Record<string, string> = {
   running: "运行中",
@@ -32,6 +35,19 @@ function fmtJson(v: unknown): string {
   const s = JSON.stringify(v);
   return s.length > 200 ? s.slice(0, 200) + "…" : s;
 }
+
+function onRowEnter(nodeId: string): void {
+  editor.highlightNodeId = nodeId;
+}
+
+function onRowLeave(): void {
+  editor.highlightNodeId = null;
+}
+
+/** 点击行选中画布节点：仅在画布仍展示该 run 所属工作流时有效 */
+function onRowClick(nodeId: string): void {
+  if (monitor.workflowId === editor.workflowId) editor.selectedNodeId = nodeId;
+}
 </script>
 
 <template>
@@ -50,6 +66,17 @@ function fmtJson(v: unknown): string {
 
     <template v-if="monitor.runId">
       <div class="run-status">
+        <button
+          v-if="monitor.breadcrumb.length"
+          class="run-back"
+          title="返回父 run"
+          @click="backToParentRun()"
+        >
+          ← 父 run
+        </button>
+        <span v-if="monitor.breadcrumb.length" class="run-depth">
+          子 run（第 {{ monitor.breadcrumb.length }} 层）
+        </span>
         <span class="run-id" :title="monitor.runId">run {{ monitor.runId.slice(0, 8) }}…</span>
         <span v-if="monitor.phase" class="run-phase" :class="`run-${monitor.phase}`">
           {{ phaseLabel[monitor.phase] ?? monitor.phase }}
@@ -83,8 +110,25 @@ function fmtJson(v: unknown): string {
           </tr>
         </thead>
         <tbody>
-          <tr v-for="n in monitor.nodes" :key="n.id">
-            <td>{{ n.name || n.id }}</td>
+          <tr
+            v-for="n in monitor.nodes"
+            :key="n.id"
+            :class="{ highlighted: editor.highlightNodeId === n.id }"
+            @mouseenter="onRowEnter(n.id)"
+            @mouseleave="onRowLeave"
+            @click="onRowClick(n.id)"
+          >
+            <td>
+              {{ n.name || n.id }}
+              <button
+                v-if="n.child_run_id"
+                class="child-link"
+                title="查看子 run"
+                @click.stop="openChildRun(n.child_run_id)"
+              >
+                子 run →
+              </button>
+            </td>
             <td>
               <span class="run-state" :class="`run-${n.state}`">
                 {{ stateLabel[n.state] ?? n.state }}

@@ -3,6 +3,7 @@
 //! 依赖方向：flow-pg → flow-engine（事件模型、fold、Driver），
 //! 引擎不依赖本 crate（Phase 0 后端边界：`RunEventSink` trait 在 flow-engine）。
 
+pub mod child;
 pub mod config;
 pub mod error;
 pub mod executor;
@@ -22,6 +23,7 @@ use sqlx::{PgPool, Row};
 use tokio_util::sync::CancellationToken;
 
 pub use config::{PgConfig, Role};
+pub use child::PgChildLauncher;
 pub use error::PgError;
 pub use metadata::{RunRecord, WorkflowSummary, WorkflowVersion};
 pub use sink::PgRunSink;
@@ -145,7 +147,9 @@ impl PgEngine {
             .map_err(|e| PgError::Invalid(format!("工作流定义非法：{e}")))?;
 
         let run_id = uuid::Uuid::now_v7().to_string();
-        lease::create_run(&self.pool, &run_id, &spec.workflow_id, version, &spec.input).await?;
+        // RPC 入口创建的都是根 run（深度 0）；sub_workflow 子 run 走 PgChildLauncher
+        lease::create_run(&self.pool, &run_id, &spec.workflow_id, version, &spec.input, 0)
+            .await?;
         Ok(CreatedRun {
             run_id,
             workflow_version: version,

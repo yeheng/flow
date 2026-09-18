@@ -225,6 +225,12 @@ input.code {
 
 /* ---- 节点面板 ---- */
 
+.palette-cat {
+  color: var(--muted);
+  font-size: 11px;
+  margin: 6px 0 4px;
+}
+
 .palette-item {
   border: 1px solid var(--border);
   border-left-width: 4px;
@@ -233,6 +239,10 @@ input.code {
   margin-bottom: 6px;
   cursor: grab;
   background: var(--panel);
+}
+
+.palette-item:hover {
+  background: #f0f2f5;
 }
 
 .cat-control {
@@ -249,6 +259,10 @@ input.code {
 
 .cat-human {
   border-left-color: #cf222e;
+}
+
+.cat-composition {
+  border-left-color: #1a7f37;
 }
 
 /* ---- 画布与节点 ---- */
@@ -287,16 +301,116 @@ input.code {
   font-weight: 600;
 }
 
+.node-head {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.node-icon {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
 .node-type {
   color: var(--muted);
   font-size: 11px;
 }
 
-.port-labels {
-  display: flex;
-  justify-content: space-around;
+/* start/end 胶囊形 */
+.flow-node.capsule {
+  min-width: 0;
+  border-radius: 999px;
+  border-left-width: 1px;
+  padding: 6px 18px;
+}
+
+/* sub_workflow 卡片 */
+.node-sub-target {
+  margin-top: 4px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: #f0f2f5;
   font-size: 11px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.node-sub-target.missing {
+  color: #cf222e;
+}
+
+.node-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #bf8700;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: help;
+}
+
+.node-drill {
   color: var(--muted);
+  font-size: 12px;
+}
+
+.node-child-link {
+  margin-top: 4px;
+  font-size: 11px;
+  padding: 1px 8px;
+}
+
+/* RunPanel 行 hover/click 联动 */
+.flow-node.highlighted {
+  outline: 2px dashed #8250df;
+}
+
+/* 面包屑 */
+.breadcrumb {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  font-size: 12px;
+}
+
+.crumb {
+  color: #0969da;
+  cursor: pointer;
+}
+
+.crumb:hover {
+  text-decoration: underline;
+}
+
+.crumb-sep {
+  color: var(--muted);
+}
+
+.crumb-current {
+  font-weight: 600;
 }
 
 /* 运行状态着色 */
@@ -465,5 +579,46 @@ fieldset.retry legend {
   color: var(--muted);
   word-break: break-all;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+}
+
+/* schema 递归表单与运行面板新增元素 */
+
+input.checkbox {
+  width: auto;
+}
+
+fieldset.schema-object {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin: 0 0 10px;
+  padding: 8px;
+}
+
+fieldset.schema-object legend {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.run-back {
+  padding: 2px 8px;
+}
+
+.run-depth {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.timeline tr.highlighted td {
+  background: #f3e8ff;
+}
+
+.timeline tbody tr {
+  cursor: default;
+}
+
+.child-link {
+  margin-left: 6px;
+  padding: 0 6px;
   font-size: 11px;
 }

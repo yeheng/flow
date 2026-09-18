@@ -30,16 +30,25 @@ export interface PortDesc {
   label: string;
 }
 
-export type ParamKind = "text" | "number" | "code" | "json" | "select";
-
-export interface ParamSpec {
-  name: string;
-  label: string;
-  kind: ParamKind;
-  required?: boolean;
+/**
+ * nodetypes.list 返回的 params_schema：JSON Schema 子集（draft-07 object），
+ * 属性可带 x-widget / x-label / x-help 扩展键
+ */
+export interface PropertySchema {
+  type?: "string" | "integer" | "number" | "boolean" | "object";
+  enum?: string[];
   default?: unknown;
-  options?: string[];
-  help?: string;
+  required?: string[];
+  properties?: Record<string, PropertySchema>;
+  "x-widget"?: "code" | "json" | "workflow-picker";
+  "x-label"?: string;
+  "x-help"?: string;
+}
+
+export interface ParamsSchema {
+  type: "object";
+  required?: string[];
+  properties?: Record<string, PropertySchema>;
 }
 
 /** nodetypes.list 返回的画布能力清单条目 */
@@ -49,7 +58,7 @@ export interface NodeTypeDesc {
   category: string;
   max_instances?: number;
   ports: PortDesc[];
-  params: ParamSpec[];
+  params_schema: ParamsSchema;
   supports_retry?: boolean;
   side_effect?: boolean;
 }
@@ -91,6 +100,8 @@ export interface TimelineNode {
   output: unknown;
   error: string | null;
   reason?: string;
+  /** sub_workflow 节点启动的子 run；其余节点为空 */
+  child_run_id?: string;
 }
 
 export type RunPhase = "running" | "succeeded" | "failed" | "cancelled";
@@ -129,6 +140,7 @@ export interface RunEvent {
     | "run_cancelled";
   node_id?: string;
   attempt?: number;
+  child_run_id?: string;
   output?: unknown;
   duration_ms?: number;
   error?: string;
