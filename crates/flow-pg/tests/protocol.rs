@@ -89,6 +89,47 @@ async fn takeover_waits_for_inflight_commit_then_reads_it() {
     db.close().await;
 }
 
+/// read_events 的增量语义：from_seq=Some(n) 只取 seq >= n（SQL 下推），
+/// 且只校验相邻连续、不要求首条为 1——订阅轮询的正确性依赖这一点。
+#[tokio::test]
+async fn read_events_incremental_returns_tail_slice_only() {
+    let Some(db) = test_db().await else { return };
+    let engine = engine(&db, flow_pg::Role::Gateway).await;
+    let (wf, v) = publish_definition(&engine, "t1b", def_line("return input.x + 1;")).await;
+    let run_id = start_run(&engine, &wf, v, serde_json::json!({"x": 1})).await;
+    let pool = db.pool.clone();
+
+    let AcquireOutcome::Acquired { epoch } =
+        lease::acquire(&pool, &run_id, "inst-A", Duration::from_secs(30))
+            .await
+            .unwrap()
+    else {
+        panic!("应能获取租约");
+    };
+    let mut sink = PgRunSink::new(pool.clone(), run_id.clone(), "inst-A".into(), epoch, 1);
+    sink.append(flow_engine::Event::NodeStarted {
+        node_id: "n1".into(),
+        attempt: 1,
+        child_run_id: None,
+    })
+    .await
+    .unwrap();
+
+    // 游标在 seq=1：增量读取必须只返回 seq >= 2 起的事件（首条不是 1）
+    let events = PgRunSink::read_events(&pool, &run_id, Some(2))
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1, "增量读取只返回 seq >= 2");
+    assert_eq!(events[0].seq, 2);
+    // 超出末尾的游标：空结果，不是错误
+    let empty = PgRunSink::read_events(&pool, &run_id, Some(9))
+        .await
+        .unwrap();
+    assert!(empty.is_empty());
+
+    db.close().await;
+}
+
 /// §11.2：接管完成后，旧持有者的追加/续期/投影/释放全部 LeaseLost；
 /// 同实例名重新获取也必须被拒（租约被 B 有效持有），不能复用旧权利。
 #[tokio::test]

@@ -2,7 +2,7 @@
 import { computed, watch } from "vue";
 import { MarkerType, VueFlow, useVueFlow } from "@vue-flow/core";
 import type { EdgeChange, NodeChange, NodeMouseEvent } from "@vue-flow/core";
-import { Background } from "@vue-flow/background";
+import { Background, BackgroundVariant } from "@vue-flow/background";
 import { Controls } from "@vue-flow/controls";
 import { MiniMap } from "@vue-flow/minimap";
 import {
@@ -18,7 +18,9 @@ import FlowNode from "./FlowNode.vue";
 
 const { screenToFlowCoordinate } = useVueFlow();
 
-const defaultEdgeOptions = { markerEnd: MarkerType.ArrowClosed };
+const defaultEdgeOptions = {
+  markerEnd: { type: MarkerType.ArrowClosed, color: "#7c6cff" },
+};
 
 function onDrop(event: DragEvent): void {
   const type = event.dataTransfer?.getData("application/flow-node-type");
@@ -83,6 +85,7 @@ watch(
       :max-zoom="2"
       :snap-to-grid="true"
       :snap-grid="[16, 16]"
+      color-mode="dark"
       fit-view-on-init
       @connect="onConnect"
       @node-click="onNodeClick"
@@ -94,7 +97,7 @@ watch(
       <template #node-flow="nodeProps">
         <FlowNode v-bind="nodeProps" />
       </template>
-      <Background :gap="16" />
+      <Background :variant="BackgroundVariant.Dots" :gap="28" :size="1.5" color="rgba(255, 255, 255, 0.06)" />
       <Controls />
       <MiniMap />
     </VueFlow>

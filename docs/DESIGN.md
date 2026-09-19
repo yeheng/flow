@@ -298,6 +298,8 @@ Postgres `PgChildLauncher` 经 `lease::create_run` 单事务创建子 run、
 旧 `running`/`awaiting_resume` 的日志缺失、损坏或身份不符，则保留为
 `awaiting_resume`、`live=false` 并报告恢复错误；需恢复原日志后重启，不能靠
 `run.signal` 解除，也不能自动创建新日志重跑。这样兼容旧初始化窗口并避免重复副作用。
+父 run 等待初始化中断的子 run 时消费 DB 投影（`LocalChildLauncher::await_terminal`
+发现子日志为空时查 runs 行）：这类子 run 永远不会写出终态事件，事件侧等待会挂死。
 
 **已知限制**：delay 崩溃后重放整段时长（不续算剩余时间）；fsync 每事件一次，
 组提交未做（正确性优先，这是后续优化点）。
@@ -384,7 +386,8 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
 2. 副作用之前必写 `node_started`；恢复还覆盖等待重试、信号消费与收尾窗口；
 3. `RunState::fold` 是唯一状态转移函数，恢复与时间线共用；
 4. 跳过必须推进到不动点；inflight 每个 handle 恰欠一条 DriverMsg；
-5. `state.outputs` 是唯一输出所有者（无第二份手工同步）；
+5. `state.outputs` 是唯一输出所有者（无第二份手工同步）；节点执行输入面
+    `nodes` 只暴露直接前驱的输出（重放决定论，见 §10）；
 6. 端口规则：condition 必须 true/false，其余必须无端口；
 7. end/run 输出共用「单数透传、复数映射」规则（`singular_or_map`）；
 8. 状态词汇表单一来源：`DbRunStatus`，store 写入口校验。
@@ -412,6 +415,9 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
 - `contracts.rs` 验证显式 draft 拒绝、初始化中断和旧日志缺失隔离；
 - `sub_workflow.rs` 验证子 run 输出透传、子失败 fatal、RunExists 附着、深度上限、
   取消级联，以及崩溃重放沿用同一 child_run_id；
+- `engine_recovery.rs` 钉住节点输入面语义：`nodes` 只暴露直接前驱输出，
+  非前驱引用深层访问即 fatal（`nodes_scope_*`）；
+- `child_await.rs` 钉住父 run 等待初始化中断子 run 不挂死（空日志 → DB 投影）；
 - store 并发测试核对每个返回版本对应的定义及相同定义的版本复用；
 - 测试数据库必须放在独占目录的 `flow.db`，只清理独占目录，禁止删除系统临时目录；
 - **Postgres 后端**：租约 fencing、接管窗口、恢复分类与 inbox 幂等由

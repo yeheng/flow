@@ -22,8 +22,8 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use tokio_util::sync::CancellationToken;
 
-pub use config::{PgConfig, Role};
 pub use child::PgChildLauncher;
+pub use config::{PgConfig, Role};
 pub use error::PgError;
 pub use metadata::{RunRecord, WorkflowSummary, WorkflowVersion};
 pub use sink::PgRunSink;
@@ -148,8 +148,15 @@ impl PgEngine {
 
         let run_id = uuid::Uuid::now_v7().to_string();
         // RPC 入口创建的都是根 run（深度 0）；sub_workflow 子 run 走 PgChildLauncher
-        lease::create_run(&self.pool, &run_id, &spec.workflow_id, version, &spec.input, 0)
-            .await?;
+        lease::create_run(
+            &self.pool,
+            &run_id,
+            &spec.workflow_id,
+            version,
+            &spec.input,
+            0,
+        )
+        .await?;
         Ok(CreatedRun {
             run_id,
             workflow_version: version,
@@ -277,6 +284,8 @@ impl PgEngine {
 
     /// 订阅轮询的候选 run（§8）：活跃 run + 订阅开始后创建的 run。
     /// 短 run 可能在两次轮询之间走完一生，只有按 started_at 捕获才不漏。
+    /// LIMIT 256 是有界性权衡：活跃 run 超过 256 时按 started_at 取最早的，
+    /// 最新 run 可能延迟若干轮才进入订阅候选（DISTRIBUTED.md §8）。
     /// 返回 (run_id, 是否已终结)。
     pub async fn watch_runs(
         &self,

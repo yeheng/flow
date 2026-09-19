@@ -60,8 +60,9 @@ const nodeClass = computed(() => {
 });
 
 function sourceStyle(index: number, total: number) {
-  // 多个 source handle（condition 的 true/false）在底边均匀分布
-  return { left: `${((index + 1) / (total + 1)) * 100}%` };
+  // 多个 source handle（condition 的 true/false）在右边均匀分布；单出口用默认居中
+  if (total <= 1) return {};
+  return { top: `${((index + 1) / (total + 1)) * 100}%` };
 }
 </script>
 
@@ -72,7 +73,7 @@ function sourceStyle(index: number, total: number) {
       :key="p.id"
       :id="p.id"
       type="target"
-      :position="Position.Top"
+      :position="Position.Left"
     />
     <div class="node-head">
       <svg class="node-icon" viewBox="0 0 16 16" v-html="icon"></svg>
@@ -80,24 +81,26 @@ function sourceStyle(index: number, total: number) {
       <span v-if="subWarning" class="node-badge" :title="subWarning">!</span>
       <span v-else-if="isSubWorkflow" class="node-drill" title="双击钻取子流程">⤢</span>
     </div>
-    <div v-if="!isCapsule" class="node-type">{{ data.nodeType.label }}</div>
-    <div v-if="isSubWorkflow" class="node-sub-target" :class="{ missing: !subTargetWorkflow }">
-      {{ subTargetWorkflow?.name ?? subTarget ?? "未选择目标工作流" }}
+    <div v-if="!isCapsule" class="node-body">
+      <div class="node-type">{{ data.nodeType.label }}</div>
+      <div v-if="isSubWorkflow" class="node-sub-target" :class="{ missing: !subTargetWorkflow }">
+        {{ subTargetWorkflow?.name ?? subTarget ?? "未选择目标工作流" }}
+      </div>
+      <button
+        v-if="childRunId"
+        class="node-child-link"
+        title="查看子 run"
+        @click.stop="openChildRun(childRunId)"
+      >
+        子 run →
+      </button>
     </div>
-    <button
-      v-if="childRunId"
-      class="node-child-link"
-      title="查看子 run"
-      @click.stop="openChildRun(childRunId)"
-    >
-      子 run →
-    </button>
     <Handle
       v-for="(p, i) in sourcePorts"
       :key="p.id"
       :id="p.id"
       type="source"
-      :position="Position.Bottom"
+      :position="Position.Right"
       :style="sourceStyle(i, sourcePorts.length)"
       :title="p.label"
     />

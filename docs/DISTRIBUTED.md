@@ -230,6 +230,10 @@ gateway 不得通过直接清租约或只改 status 实现取消。
 `run.timeline`/`run.events` 从共享日志读取。订阅者按 run_id 维护 last_seq 并轮询增量，
 本地 broadcast 仅作低延迟提示；进程接管不能改变订阅源的正确性。
 from_seq 的 API 语义保留现有闭区间，客户端传 last_seq+1。
+增量读取在 SQL 层下推过滤（`WHERE seq >= from`），只校验相邻 seq 连续；
+全量读取（接管恢复、`from_events`）仍要求首条为 1 + 相邻连续。
+候选查询 `watch_runs` 是 LIMIT 256 的有界查询：活跃 run 超过 256 时
+按 started_at 取最早的，最新 run 可能延迟若干轮询周期才进入订阅候选。
 只在确认已转发后推进游标；重复消息按 seq 去重，发现缺口后通过 run.events 补齐。
 全局订阅必须为各 run 分别跟踪游标，不能将不同 run 的 seq 当成一个全局序列。
 

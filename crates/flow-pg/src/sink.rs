@@ -169,16 +169,26 @@ impl PgRunSink {
         Ok(())
     }
 
-    /// 事件读取（只读，不需要租约）。校验 seq 连续。
+    /// 事件读取（只读，不需要租约）。
+    /// from_seq 为 None 时全量读取并校验「首条=1 + 相邻连续」；
+    /// Some(n) 时 SQL 下推过滤（只取 seq >= n）并校验相邻连续——
+    /// 订阅轮询的增量读取不必（也无法）要求首条为 1。
     pub async fn read_events(
         pool: &PgPool,
         run_id: &str,
         from_seq: Option<u64>,
     ) -> Result<Vec<Envelope>, PgError> {
+        type Validate = fn(&[Envelope]) -> Result<(), flow_engine::EngineError>;
+        let (from, validate): (i64, Validate) = match from_seq {
+            Some(from) => (from as i64, flow_engine::validate_sequence_contiguous),
+            None => (1, flow_engine::validate_sequence),
+        };
         let rows = sqlx::query(
-            "SELECT seq, ts, payload FROM run_events WHERE run_id = $1 ORDER BY seq ASC",
+            "SELECT seq, ts, payload FROM run_events
+             WHERE run_id = $1 AND seq >= $2 ORDER BY seq ASC",
         )
         .bind(run_id)
+        .bind(from)
         .fetch_all(pool)
         .await?;
         let mut events = Vec::with_capacity(rows.len());
@@ -199,10 +209,7 @@ impl PgRunSink {
                 event,
             });
         }
-        flow_engine::validate_sequence(&events)?;
-        if let Some(from) = from_seq {
-            events.retain(|e| e.seq >= from);
-        }
+        validate(&events)?;
         Ok(events)
     }
 }

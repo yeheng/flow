@@ -298,10 +298,11 @@ export function addNode(type: string, position: { x: number; y: number }): boole
   }
   let seq = 1;
   while (editor.nodes.some((n) => n.id === `${type}_${seq}`)) seq++;
-  // 默认值在节点创建时从 schema 落进 params，与后端 default 语义一致
+  // 默认值在节点创建时从 schema 落进 params，与后端 default 语义一致。
+  // default 可能是 reactive Proxy（structuredClone 无法克隆），它来自 JSON-RPC，用 JSON 往返脱壳
   const params: Record<string, unknown> = {};
   for (const [key, prop] of Object.entries(desc.params_schema.properties ?? {})) {
-    if (prop.default !== undefined) params[key] = structuredClone(prop.default);
+    if (prop.default !== undefined) params[key] = JSON.parse(JSON.stringify(prop.default));
   }
   editor.nodes.push({
     id: `${type}_${seq}`,
@@ -325,8 +326,11 @@ export function isValidConnection(conn: Connection): boolean {
   if (!target.data.nodeType.ports.some((p) => p.id === "in")) return false;
   // sourceHandle 必须是源节点真实存在的出端口
   if (!outPorts.some((p) => p.id === (conn.sourceHandle ?? "out"))) return false;
+  // v-model 回写时 Vue Flow 会用已入库的 Edge 再校验一次，去重检查须排除边自身
+  const selfId = "id" in conn ? (conn as { id?: string }).id : undefined;
   return !editor.edges.some(
     (e) =>
+      e.id !== selfId &&
       e.source === conn.source &&
       e.target === conn.target &&
       (e.sourceHandle ?? "out") === (conn.sourceHandle ?? "out"),

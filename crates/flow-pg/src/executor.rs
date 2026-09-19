@@ -211,6 +211,8 @@ async fn take_over(
         epoch,
         folded.last_seq,
     );
+    // PG 模式下这是哑端口：spawn_driver 的接口要求本地广播通道存在，
+    // 但事件不经它分发——订阅走 §8 的 DB 轮询，这里只满足构造参数。
     let (events_tx, _) = broadcast::channel(64);
     // PG 模式：用户取消经持久 inbox 交付；这个 token 不触发
     let cancel = CancellationToken::new();

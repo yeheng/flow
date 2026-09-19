@@ -44,9 +44,7 @@ impl ChildRunLauncher for LocalChildLauncher {
                 .latest_published(workflow_id)
                 .await
                 .map_err(|e| EngineError::Backend(e.to_string()))?
-                .ok_or_else(|| {
-                    EngineError::Node(format!("工作流 {workflow_id} 没有已发布版本"))
-                })?;
+                .ok_or_else(|| EngineError::Node(format!("工作流 {workflow_id} 没有已发布版本")))?;
             let stored = self
                 .store
                 .get_version(workflow_id, Some(version))
@@ -109,7 +107,33 @@ impl ChildRunLauncher for LocalChildLauncher {
                         ))
                     }
                     RunPhase::Cancelled => return Ok(ChildRunOutcome::Cancelled),
-                    RunPhase::Running => {}
+                    RunPhase::Running => {
+                        // 空日志 + DB 终态：子 run 的初始化被中断（崩溃发生在
+                        // run_started 落盘之前，恢复流程已按 DESIGN §7.2 标 failed）。
+                        // 事件日志永远不会出现终态事件，只等日志会挂死，
+                        // 以 DB 投影为权威结束等待。正常启动窗口内 DB 仍是
+                        // initializing/running，不受影响。
+                        if state.last_seq == 0 {
+                            if let Ok(run) = self.store.get_run(child_run_id).await {
+                                match run.status.as_str() {
+                                    "failed" => {
+                                        return Ok(ChildRunOutcome::Failed(
+                                            run.error.unwrap_or_else(|| "子 run 初始化中断".into()),
+                                        ));
+                                    }
+                                    "cancelled" => return Ok(ChildRunOutcome::Cancelled),
+                                    // 空日志不可能对应 RunCompleted 事件：投影矛盾
+                                    // 按失败处理，不把拿不到的输出编造成成功
+                                    "succeeded" => {
+                                        return Ok(ChildRunOutcome::Failed(format!(
+                                            "子 run {child_run_id} 投影为 succeeded 但事件日志为空"
+                                        )));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
                 }
                 tokio::select! {
                     _ = cancel.cancelled() => return Ok(ChildRunOutcome::Cancelled),

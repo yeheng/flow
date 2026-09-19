@@ -50,11 +50,6 @@ impl NodeType {
     pub fn has_side_effect(self) -> bool {
         matches!(self, NodeType::HttpCall)
     }
-
-    /// 纯计算节点：崩溃后重新执行是安全的。
-    pub fn is_pure(self) -> bool {
-        !self.has_side_effect()
-    }
 }
 
 /// http_call 允许的方法。validate 与前端能力清单（nodetypes.list）共用这一份，

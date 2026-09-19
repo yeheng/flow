@@ -197,6 +197,20 @@ pub fn validate_sequence(events: &[Envelope]) -> Result<(), EngineError> {
     Ok(())
 }
 
+/// 增量读取的连续性校验：只要求相邻事件 seq 连续，不要求首条为 1。
+/// PG 订阅轮询等场景从中间 seq 开始读，首条=1 的全量语义不适用。
+pub fn validate_sequence_contiguous(events: &[Envelope]) -> Result<(), EngineError> {
+    for pair in events.windows(2) {
+        if pair[0].seq + 1 != pair[1].seq {
+            return Err(EngineError::LogCorrupted(format!(
+                "事件 seq 不连续：{} 之后是 {}",
+                pair[0].seq, pair[1].seq
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// 逐行解析；允许最后一行是被崩溃截断的半行，返回有效字节长度供调用方截断文件。
 async fn read_events_repairing(path: &Path) -> Result<(Vec<Envelope>, u64), EngineError> {
     let bytes = tokio::fs::read(path).await?;

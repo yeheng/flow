@@ -110,17 +110,11 @@ pub async fn recover_unfinished(state: &AppState) -> Result<Vec<(String, String)
             Ok(ResumeOutcome::Resumed) => {
                 tracing::info!(run_id = %run.id, "恢复未完成的 run");
             }
-            Ok(ResumeOutcome::AlreadyTerminal(phase)) => {
-                // 崩溃发生在「事件已落盘、DB 未回填」之间：以事件为准修正 DB
-                let snapshot = match state.engine.snapshot(&run.id).await {
-                    Ok(snapshot) => snapshot,
-                    Err(err) => {
-                        // 读不了权威日志就不能编造状态回填
-                        failures.push((run.id.clone(), format!("读取事件日志失败：{err}")));
-                        continue;
-                    }
-                };
-                let status = match phase {
+            Ok(ResumeOutcome::AlreadyTerminal(boxed)) => {
+                let terminal = *boxed;
+                // 崩溃发生在「事件已落盘、DB 未回填」之间：以事件为准修正 DB。
+                // 终态与 output/fatal_error 已随 resume_run 折叠返回，不必重读日志。
+                let status = match terminal.phase {
                     RunPhase::Succeeded => DbRunStatus::Succeeded,
                     RunPhase::Failed => DbRunStatus::Failed,
                     RunPhase::Cancelled => DbRunStatus::Cancelled,
@@ -131,8 +125,8 @@ pub async fn recover_unfinished(state: &AppState) -> Result<Vec<(String, String)
                     .set_run_status(
                         &run.id,
                         status.as_str(),
-                        snapshot.output.as_ref(),
-                        snapshot.fatal_error.as_deref(),
+                        terminal.output.as_ref(),
+                        terminal.fatal_error.as_deref(),
                     )
                     .await?;
                 tracing::info!(run_id = %run.id, "事件日志已终结，回填 DB 状态");

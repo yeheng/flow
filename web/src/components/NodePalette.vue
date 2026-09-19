@@ -57,6 +57,7 @@ function onClickAdd(nt: NodeTypeDesc): void {
         @dragstart="onDragStart($event, nt)"
         @click="onClickAdd(nt)"
       >
+        <span class="palette-dot" />
         {{ nt.label }}
       </div>
     </div>

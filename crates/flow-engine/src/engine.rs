@@ -14,7 +14,7 @@ use crate::backend::{CommitOutcome, PendingInput, RunEventSink};
 use crate::driver::{spawn_driver, DriverSpec, RecoveryPlan, SignalRequest};
 use crate::error::EngineError;
 use crate::event::{read_events, run_dir, Envelope, Event, EventLog};
-use crate::fold::{RunPhase, RunState};
+use crate::fold::RunState;
 use crate::model::Definition;
 
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
@@ -78,10 +78,12 @@ pub struct StartRun {
     pub depth: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum ResumeOutcome {
     Resumed,
-    AlreadyTerminal(RunPhase),
+    /// 事件日志已终结：携带折叠出的终态（phase/output/fatal_error），
+    /// 消费方不必为回填 DB 再读一次日志。Box 控制 Resumed 变体的大小差。
+    AlreadyTerminal(Box<RunState>),
 }
 
 #[derive(Debug, Clone)]
@@ -316,7 +318,7 @@ impl Engine {
             ));
         }
         if state.phase.is_terminal() {
-            return Ok(ResumeOutcome::AlreadyTerminal(state.phase));
+            return Ok(ResumeOutcome::AlreadyTerminal(Box::new(state)));
         }
         state.ensure_nodes(&spec.definition);
 

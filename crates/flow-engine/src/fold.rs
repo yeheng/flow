@@ -140,8 +140,20 @@ impl RunState {
         }
     }
 
-    pub fn record(&self, node_id: &str) -> NodeRecord {
-        self.records.get(node_id).cloned().unwrap_or_default()
+    /// 缺失节点的默认视图（Pending）。返回引用，避免热点路径全量克隆。
+    pub fn record(&self, node_id: &str) -> &NodeRecord {
+        const DEFAULT_RECORD: NodeRecord = NodeRecord {
+            state: NodeState::Pending,
+            attempts: 0,
+            started_at: None,
+            ended_at: None,
+            duration_ms: None,
+            output: None,
+            error: None,
+            last_signal: None,
+            child_run_id: None,
+        };
+        self.records.get(node_id).unwrap_or(&DEFAULT_RECORD)
     }
 
     pub fn all_terminal(&self) -> bool {

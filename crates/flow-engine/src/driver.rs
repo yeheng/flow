@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::future::join_all;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -296,9 +297,15 @@ impl Driver {
                         .collect();
                     self.abort_inflight();
                     if let Some(launcher) = &self.child_launcher {
-                        for child_run_id in child_runs {
-                            launcher.cancel(&child_run_id).await;
-                        }
+                        // 并发取消全部子 run（join_all 等全部返回，仍满足
+                        // 「发起于写 RunCancelled 之前」的不变量）；best-effort，
+                        // 失败只记日志。
+                        join_all(
+                            child_runs
+                                .iter()
+                                .map(|child_run_id| launcher.cancel(child_run_id)),
+                        )
+                        .await;
                     }
                     self.append_terminal(Event::RunCancelled {}).await?;
                     return Ok(());
@@ -584,7 +591,12 @@ impl Driver {
         let ctx = NodeExecContext {
             node,
             input: self.input.clone(),
-            outputs: self.state.outputs.clone(),
+            // 决定论输入面（DESIGN §10）：nodes 只暴露直接前驱的输出，
+            // 引用非前驱节点在 JS 里是 undefined，属性访问即抛错进 fatal
+            outputs: preds
+                .iter()
+                .filter_map(|p| self.state.outputs.get(p).cloned().map(|v| (p.clone(), v)))
+                .collect(),
             preds,
             depth: self.depth,
             child: match (child_run_id, &self.child_launcher) {

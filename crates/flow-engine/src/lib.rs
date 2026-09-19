@@ -16,6 +16,8 @@ pub use engine::{
     DbRunStatus, Engine, NoopObserver, ResumeOutcome, RunObserver, Signal, StartRun, StatusUpdate,
 };
 pub use error::EngineError;
-pub use event::{read_events, validate_sequence, Envelope, Event, EventLog};
+pub use event::{
+    read_events, validate_sequence, validate_sequence_contiguous, Envelope, Event, EventLog,
+};
 pub use fold::{NodeRecord, NodeState, RunPhase, RunState};
 pub use model::{Definition, Edge, Node, NodeType, Position, RetryPolicy, HTTP_METHODS};

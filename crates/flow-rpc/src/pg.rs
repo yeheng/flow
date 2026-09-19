@@ -417,6 +417,12 @@ pub fn build_module(state: Arc<PgState>) -> Result<RpcModule<Arc<PgState>>, PgRp
                         // 终结且已追平：丢弃游标
                         cursors.remove(&run_id);
                         drained.insert(run_id.clone());
+                        // 已终结 run 无限累积会撑爆订阅生命周期内的内存；
+                        // 超阈值整体清空只损失一点轮询冗余（终态 run 重查一次即空）
+                        if drained.len() > 4096 {
+                            drained.clear();
+                            tracing::warn!("订阅 drained 集超过 4096，整体清空");
+                        }
                         if filter.is_some() {
                             return; // 指定 run 已终结：订阅自然结束
                         }

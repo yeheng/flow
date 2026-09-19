@@ -215,7 +215,7 @@ async fn condition_branch_marks_untaken_side_skipped() {
     let state = h.wait_terminal(&run_id).await;
     assert_eq!(state.phase, RunPhase::Succeeded, "{}", describe(&state));
     assert_eq!(state.record("no").output, Some(json!("small")));
-    match state.record("yes").state {
+    match &state.record("yes").state {
         flow_engine::NodeState::Skipped { reason } => assert_eq!(reason, "branch_not_taken"),
         other => panic!("未走的分支应被跳过，实际：{other:?}"),
     }
@@ -261,7 +261,7 @@ async fn restarted_pure_node_is_replayed_with_new_attempt() {
         })
         .await
         .unwrap();
-    assert_eq!(outcome, ResumeOutcome::Resumed);
+    assert!(matches!(outcome, ResumeOutcome::Resumed));
 
     let state = h.wait_terminal(&run_id).await;
     assert_eq!(state.phase, RunPhase::Succeeded, "{}", describe(&state));
@@ -589,6 +589,91 @@ async fn multi_pred_end_collects_output_map() {
 }
 
 #[tokio::test]
+async fn nodes_scope_is_direct_predecessors_only() {
+    // 回归（决定论输入面，DESIGN §10）：nodes 只暴露直接前驱的输出。
+    // 菱形图里 c 的前驱是 a、b；引用非前驱节点 s 必须是 undefined，
+    // 深层访问即 TypeError → fatal。旧实现把全部已完成输出都塞进 nodes，
+    // 非前驱引用读到真值，破坏「重放结果与首次执行一致」。
+    let h = Harness::new();
+    let run_id = h.run_id();
+    let def = def_from(json!({
+        "nodes": [
+            {"id": "s", "type": "start"},
+            {"id": "a", "type": "script", "params": {"code": "return 1;"}},
+            {"id": "b", "type": "script", "params": {"code": "return 2;"}},
+            {"id": "c", "type": "script", "params": {"code": "return { v: nodes.s.deep };"}},
+            {"id": "e", "type": "end"}
+        ],
+        "edges": [
+            {"from": "s", "to": "a"},
+            {"from": "s", "to": "b"},
+            {"from": "a", "to": "c"},
+            {"from": "b", "to": "c"},
+            {"from": "c", "to": "e"}
+        ]
+    }));
+
+    h.engine
+        .start_run(StartRun {
+            run_id: run_id.clone(),
+            workflow_id: "w1".into(),
+            workflow_version: 1,
+            definition: def,
+            input: json!({"deep": {"x": 1}}),
+            depth: 0,
+        })
+        .await
+        .unwrap();
+
+    let state = h.wait_terminal(&run_id).await;
+    assert_eq!(state.phase, RunPhase::Failed, "{}", describe(&state));
+    assert!(
+        state.fatal_error.as_deref().unwrap_or("").contains("c"),
+        "fatal 应指向 c 节点，实际：{:?}",
+        state.fatal_error
+    );
+}
+
+#[tokio::test]
+async fn nodes_scope_exposes_predecessor_outputs() {
+    // 正向钉子：直接前驱的输出在 nodes 里可见（a、b 是 c 的前驱）
+    let h = Harness::new();
+    let run_id = h.run_id();
+    let def = def_from(json!({
+        "nodes": [
+            {"id": "s", "type": "start"},
+            {"id": "a", "type": "script", "params": {"code": "return 1;"}},
+            {"id": "b", "type": "script", "params": {"code": "return 2;"}},
+            {"id": "c", "type": "script", "params": {"code": "return { a: nodes.a, b: nodes.b };"}},
+            {"id": "e", "type": "end"}
+        ],
+        "edges": [
+            {"from": "s", "to": "a"},
+            {"from": "s", "to": "b"},
+            {"from": "a", "to": "c"},
+            {"from": "b", "to": "c"},
+            {"from": "c", "to": "e"}
+        ]
+    }));
+
+    h.engine
+        .start_run(StartRun {
+            run_id: run_id.clone(),
+            workflow_id: "w1".into(),
+            workflow_version: 1,
+            definition: def,
+            input: json!(null),
+            depth: 0,
+        })
+        .await
+        .unwrap();
+
+    let state = h.wait_terminal(&run_id).await;
+    assert_eq!(state.phase, RunPhase::Succeeded, "{}", describe(&state));
+    assert_eq!(state.output, Some(json!({"a": 1, "b": 2})));
+}
+
+#[tokio::test]
 async fn fatal_failure_lets_independent_branch_finish() {
     // 钉住 fatal 语义：致命失败只记录，不中断独立分支——
     // slow 必须跑到 Completed，失败分支的下游必须被跳过，run 结果为 Failed。
@@ -632,7 +717,7 @@ async fn fatal_failure_lets_independent_branch_finish() {
         "独立分支必须跑完，实际：{:?}",
         state.record("slow").state
     );
-    match state.record("e1").state {
+    match &state.record("e1").state {
         flow_engine::NodeState::Skipped { reason } => {
             assert_eq!(reason, "upstream_failed")
         }
