@@ -527,7 +527,11 @@ async fn nodetypes_list_exposes_json_schema_and_sub_workflow() {
 
     // 旧 params 数组已移除，统一为 params_schema
     for t in list {
-        assert!(t.get("params").is_none(), "{} 仍带旧 params 数组", t["type"]);
+        assert!(
+            t.get("params").is_none(),
+            "{} 仍带旧 params 数组",
+            t["type"]
+        );
         assert_eq!(t["params_schema"]["type"], json!("object"), "{}", t["type"]);
     }
 

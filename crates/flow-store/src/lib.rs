@@ -1,6 +1,5 @@
 use std::path::Path;
 
-
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
@@ -13,7 +12,7 @@ use chrono::{DateTime, Utc};
 // 领域 DTO 与状态词汇表的单一来源在 flow-dto；本 crate 不再维护第二份拷贝。
 // 写入口经 ensure_run_status 用 DbRunStatus 校验，不复制常量列表。
 pub use flow_dto::{
-    DbRunStatus, RunRecord, STATUS_DRAFT, STATUS_PUBLISHED, WorkflowSummary, WorkflowVersion,
+    DbRunStatus, RunRecord, WorkflowSummary, WorkflowVersion, STATUS_DRAFT, STATUS_PUBLISHED,
 };
 
 fn ensure_run_status(status: &str) -> Result<(), StoreError> {
@@ -405,12 +404,11 @@ impl Store {
 
     /// 崩溃恢复的输入：进程重启后需要续跑的 run。
     pub async fn unfinished_runs(&self) -> Result<Vec<RunRecord>, StoreError> {
-        let rows = sqlx::query(
-            "SELECT * FROM runs WHERE status IN (?, ?, ?) ORDER BY started_at ASC",
-        )
-        .bind(DbRunStatus::Initializing.as_str())
-        .bind(DbRunStatus::Running.as_str())
-        .bind(DbRunStatus::AwaitingResume.as_str())
+        let rows =
+            sqlx::query("SELECT * FROM runs WHERE status IN (?, ?, ?) ORDER BY started_at ASC")
+                .bind(DbRunStatus::Initializing.as_str())
+                .bind(DbRunStatus::Running.as_str())
+                .bind(DbRunStatus::AwaitingResume.as_str())
                 .fetch_all(&self.pool)
                 .await?;
         rows.into_iter().map(Self::run_from_row).collect()

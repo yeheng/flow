@@ -44,12 +44,7 @@ impl DbRunStatus {
     pub fn is_valid_str(status: &str) -> bool {
         matches!(
             status,
-            "initializing"
-                | "running"
-                | "awaiting_resume"
-                | "succeeded"
-                | "failed"
-                | "cancelled"
+            "initializing" | "running" | "awaiting_resume" | "succeeded" | "failed" | "cancelled"
         )
     }
 

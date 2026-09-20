@@ -3,16 +3,13 @@
 //! 有 run 时拒删 workflow、只有 published 版本可执行。
 //! 领域 DTO 的单一来源在 flow-dto，本模块不再维护第二份拷贝。
 
-
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::error::PgError;
-pub use flow_dto::{
-    RunRecord, WorkflowSummary, WorkflowVersion, STATUS_DRAFT, STATUS_PUBLISHED,
-};
+pub use flow_dto::{RunRecord, WorkflowSummary, WorkflowVersion, STATUS_DRAFT, STATUS_PUBLISHED};
 
 /// 定义与 run 元数据的存储。执行事件在 run_events，租约在 runs 行内。
 pub struct PgStore {

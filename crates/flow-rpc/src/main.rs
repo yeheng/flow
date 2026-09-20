@@ -2,14 +2,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use flow_backend::open_from_env;
-use flow_rpc::{AppState, serve};
+use flow_rpc::{serve, AppState};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,flow_engine=debug,flow_rpc=debug,flow_backend=debug".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "info,flow_engine=debug,flow_rpc=debug,flow_backend=debug".into()
+            }),
         )
         .init();
 

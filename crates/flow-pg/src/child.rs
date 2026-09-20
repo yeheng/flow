@@ -41,9 +41,7 @@ impl ChildRunLauncher for PgChildLauncher {
                 .latest_published(workflow_id)
                 .await
                 .map_err(|e| EngineError::Backend(e.to_string()))?
-                .ok_or_else(|| {
-                    EngineError::Node(format!("工作流 {workflow_id} 没有已发布版本"))
-                })?;
+                .ok_or_else(|| EngineError::Node(format!("工作流 {workflow_id} 没有已发布版本")))?;
             let stored = store
                 .get_version(workflow_id, Some(version))
                 .await
@@ -51,10 +49,19 @@ impl ChildRunLauncher for PgChildLauncher {
             let definition: flow_engine::Definition =
                 serde_json::from_value(stored.definition.clone())
                     .map_err(|e| EngineError::InvalidDefinition(format!("定义无法解析：{e}")))?;
-            definition.validate().map_err(EngineError::InvalidDefinition)?;
+            definition
+                .validate()
+                .map_err(EngineError::InvalidDefinition)?;
 
-            match lease::create_run(&self.pool, child_run_id, workflow_id, version, &input, depth)
-                .await
+            match lease::create_run(
+                &self.pool,
+                child_run_id,
+                workflow_id,
+                version,
+                &input,
+                depth,
+            )
+            .await
             {
                 Ok(()) => Ok(()),
                 // 崩溃重放/接管后的重复 start：子 run 已入队，调用方附着等待

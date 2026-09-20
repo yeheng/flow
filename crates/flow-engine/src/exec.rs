@@ -124,7 +124,12 @@ async fn run_sub_workflow(
     // 子 run 输入 = 父 run 输入快照
     match child
         .launcher
-        .start(&child.child_run_id, &workflow_id, ctx.input.clone(), ctx.depth + 1)
+        .start(
+            &child.child_run_id,
+            &workflow_id,
+            ctx.input.clone(),
+            ctx.depth + 1,
+        )
         .await
     {
         Ok(()) => {}

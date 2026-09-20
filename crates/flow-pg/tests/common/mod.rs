@@ -110,9 +110,11 @@ async fn janitor(admin: &PgPool) {
         )))
         .execute(admin)
         .await;
-        let _ = sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {name}")))
-            .execute(admin)
-            .await;
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE IF EXISTS {name}"
+        )))
+        .execute(admin)
+        .await;
     }
 }
 

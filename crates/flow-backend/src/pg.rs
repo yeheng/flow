@@ -20,8 +20,8 @@ use flow_engine::{Envelope, RunState};
 use flow_pg::{CreateRun as PgCreateRun, PgConfig, PgEngine, PgError};
 
 use crate::{
-    BackendError, CreateRun, CreatedRun, RunRecord, SignalAck, SignalRequest, WorkflowSummary,
-    WorkflowVersion, resolve_runnable_definition,
+    resolve_runnable_definition, BackendError, CreateRun, CreatedRun, RunRecord, SignalAck,
+    SignalRequest, WorkflowSummary, WorkflowVersion,
 };
 
 /// Postgres 后端：gateway 入口 + executor 生命周期 + 只读查询。
@@ -32,8 +32,7 @@ pub struct PgBackend {
 
 impl PgBackend {
     pub async fn connect(database_url: &str, cfg: PgConfig) -> Result<PgBackend, BackendError> {
-        let engine =
-            Arc::new(PgEngine::connect(database_url, cfg).await.map_err(pg_err)?);
+        let engine = Arc::new(PgEngine::connect(database_url, cfg).await.map_err(pg_err)?);
         Ok(PgBackend {
             engine,
             executor_task: tokio::sync::Mutex::new(None),
@@ -42,9 +41,8 @@ impl PgBackend {
 
     /// FLOW_DATABASE_URL 必填；其余见 DISTRIBUTED.md §10。
     pub async fn from_env() -> Result<PgBackend, BackendError> {
-        let url = std::env::var("FLOW_DATABASE_URL").map_err(|_| {
-            BackendError::Invalid("Postgres 模式必须设置 FLOW_DATABASE_URL".into())
-        })?;
+        let url = std::env::var("FLOW_DATABASE_URL")
+            .map_err(|_| BackendError::Invalid("Postgres 模式必须设置 FLOW_DATABASE_URL".into()))?;
         Self::connect(&url, PgConfig::from_env()).await
     }
 
@@ -144,11 +142,7 @@ impl PgBackend {
     }
 
     pub async fn list_workflows(&self) -> Result<Vec<WorkflowSummary>, BackendError> {
-        self.engine
-            .store()
-            .list_workflows()
-            .await
-            .map_err(pg_err)
+        self.engine.store().list_workflows().await.map_err(pg_err)
     }
 
     pub async fn delete_workflow(&self, workflow_id: &str) -> Result<(), BackendError> {

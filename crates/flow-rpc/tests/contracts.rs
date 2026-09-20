@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use flow_backend::{AnyBackend, SqliteBackend};
 use flow_engine::{Event, EventLog, RunPhase};
-use flow_rpc::{AppState, build_module};
+use flow_rpc::{build_module, AppState};
 use serde_json::{json, Value};
 
 struct Fixture {
@@ -17,7 +17,11 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Self {
         let root = std::env::temp_dir().join(format!("flow-contracts-{}", uuid::Uuid::now_v7()));
-        let backend = Arc::new(SqliteBackend::open(&root, root.join("flow.db")).await.unwrap());
+        let backend = Arc::new(
+            SqliteBackend::open(&root, root.join("flow.db"))
+                .await
+                .unwrap(),
+        );
         let workflow = backend.store().create_workflow("test").await.unwrap();
         backend
             .store()
@@ -84,7 +88,13 @@ async fn explicit_draft_is_rejected_and_historical_published_version_still_runs(
         .call("run.start", json!({"workflow_id":f.workflow, "version":1}))
         .await;
     assert_eq!(rejected["error"]["code"], -32012);
-    assert!(f.backend.store().list_runs(None, 100).await.unwrap().is_empty());
+    assert!(f
+        .backend
+        .store()
+        .list_runs(None, 100)
+        .await
+        .unwrap()
+        .is_empty());
     f.backend.store().publish(&f.workflow, 1).await.unwrap();
     f.backend
         .store()
@@ -135,7 +145,10 @@ async fn incomplete_initialization_is_failed_without_replaying_missing_logs() {
         assert!(row.error.is_some());
         assert!(!f.backend.engine().is_live(run));
     }
-    assert!(flow_backend::recover_unfinished(&f.backend).await.unwrap().is_empty());
+    assert!(flow_backend::recover_unfinished(&f.backend)
+        .await
+        .unwrap()
+        .is_empty());
     assert!(!f.backend.engine().events_path("missing").exists());
 }
 
@@ -161,7 +174,10 @@ async fn initialized_log_is_resumed_even_when_metadata_still_says_initializing()
     .await
     .unwrap();
     drop(log);
-    assert!(flow_backend::recover_unfinished(&f.backend).await.unwrap().is_empty());
+    assert!(flow_backend::recover_unfinished(&f.backend)
+        .await
+        .unwrap()
+        .is_empty());
     let row = f.wait_finished("r").await;
     assert_eq!(row["status"], "succeeded");
     assert_eq!(row["output"], 7);
@@ -186,7 +202,10 @@ async fn missing_or_empty_logs_of_old_running_tasks_require_manual_recovery() {
     }
     for _ in 0..2 {
         assert_eq!(
-            flow_backend::recover_unfinished(&f.backend).await.unwrap().len(),
+            flow_backend::recover_unfinished(&f.backend)
+                .await
+                .unwrap()
+                .len(),
             2
         );
         for run in ["missing", "empty"] {

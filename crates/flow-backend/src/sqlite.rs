@@ -26,8 +26,8 @@ use flow_store::{Store, StoreError};
 
 use crate::child::LocalChildLauncher;
 use crate::{
-    BackendError, CreateRun, CreatedRun, RunRecord, SignalAck, SignalRequest, WorkflowSummary,
-    WorkflowVersion, resolve_runnable_definition,
+    resolve_runnable_definition, BackendError, CreateRun, CreatedRun, RunRecord, SignalAck,
+    SignalRequest, WorkflowSummary, WorkflowVersion,
 };
 
 /// 把引擎的 run 状态变化落到 runs 表。引擎本身不依赖存储实现，适配在 SQLite
@@ -88,9 +88,12 @@ impl SqliteBackend {
             db_path,
         };
         // 两阶段注入：launcher 依赖 Engine，Engine 的 Driver 需要 launcher
-        backend.engine.set_child_launcher(Arc::new(
-            LocalChildLauncher::new(backend.store.clone(), backend.engine.clone()),
-        ));
+        backend
+            .engine
+            .set_child_launcher(Arc::new(LocalChildLauncher::new(
+                backend.store.clone(),
+                backend.engine.clone(),
+            )));
         Ok(backend)
     }
 
@@ -184,10 +187,7 @@ impl SqliteBackend {
     }
 
     pub async fn list_workflows(&self) -> Result<Vec<WorkflowSummary>, BackendError> {
-        self.store
-            .list_workflows()
-            .await
-            .map_err(sqlite_err)
+        self.store.list_workflows().await.map_err(sqlite_err)
     }
 
     pub async fn delete_workflow(&self, workflow_id: &str) -> Result<(), BackendError> {
@@ -410,8 +410,7 @@ pub async fn recover_unfinished(
                 continue;
             }
         };
-        let definition: flow_engine::Definition =
-            match serde_json::from_value(version.definition) {
+        let definition: flow_engine::Definition = match serde_json::from_value(version.definition) {
             Ok(definition) => definition,
             Err(err) => {
                 failures.push((run.id.clone(), format!("定义无法解析：{err}")));
@@ -532,10 +531,8 @@ mod tests {
     /// 规则断言钉在这里一份，不再分散在各后端。
     #[tokio::test]
     async fn resolve_runnable_definition_enforces_published_and_validates() {
-        let root = std::env::temp_dir().join(format!(
-            "flow-backend-resolve-{}",
-            uuid::Uuid::now_v7()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("flow-backend-resolve-{}", uuid::Uuid::now_v7()));
         let backend = SqliteBackend::open(&root, root.join("flow.db"))
             .await
             .unwrap();
@@ -548,11 +545,17 @@ mod tests {
         assert!(err.to_string().contains("没有已发布版本"), "{err}");
 
         // draft 版本显式指定：拒绝
-        let v1 = backend.update_workflow(&wf, &def_line("return 1;")).await.unwrap();
+        let v1 = backend
+            .update_workflow(&wf, &def_line("return 1;"))
+            .await
+            .unwrap();
         let err = resolve_runnable_definition(&backend, &wf, Some(v1))
             .await
             .unwrap_err();
-        assert!(matches!(err, crate::BackendError::VersionNotPublished(..)), "{err}");
+        assert!(
+            matches!(err, crate::BackendError::VersionNotPublished(..)),
+            "{err}"
+        );
 
         // 发布后：省略版本取 latest published，定义解析校验通过
         backend.publish(&wf, v1).await.unwrap();
@@ -563,7 +566,8 @@ mod tests {
         assert_eq!(definition.nodes.len(), 3);
 
         // 定义非法（start 缺失）：创建前拒绝，不等到运行
-        let v2 = backend.update_workflow(&wf, &json!({"nodes": [], "edges": []}))
+        let v2 = backend
+            .update_workflow(&wf, &json!({"nodes": [], "edges": []}))
             .await
             .unwrap();
         backend.publish(&wf, v2).await.unwrap();

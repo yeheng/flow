@@ -11,9 +11,9 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use futures::StreamExt;
 use flow_backend::{AnyBackend, BackendError, SignalAck};
 use flow_engine::{Definition, RunState, HTTP_METHODS};
+use futures::StreamExt;
 use jsonrpsee::core::RegisterMethodError;
 use jsonrpsee::server::{Server, ServerHandle, SubscriptionMessage};
 use jsonrpsee::types::error::{ErrorObject, ErrorObjectOwned};
@@ -148,11 +148,7 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
 
     module.register_async_method("workflow.list", |params, state, _| async move {
         let _: Value = parse(&params)?;
-        let list = state
-            .backend
-            .list_workflows()
-            .await
-            .map_err(backend_err)?;
+        let list = state.backend.list_workflows().await.map_err(backend_err)?;
         Ok::<_, ErrorObjectOwned>(json!({ "workflows": list }))
     })?;
 
@@ -208,7 +204,11 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
             run_id: String,
         }
         let p: P = parse(&params)?;
-        let run = state.backend.get_run(&p.run_id).await.map_err(backend_err)?;
+        let run = state
+            .backend
+            .get_run(&p.run_id)
+            .await
+            .map_err(backend_err)?;
         Ok::<_, ErrorObjectOwned>(json!({
             "run": run,
             "live": state.backend.is_live(&p.run_id),
@@ -242,7 +242,11 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
             run_id: String,
         }
         let p: P = parse(&params)?;
-        let run = state.backend.get_run(&p.run_id).await.map_err(backend_err)?;
+        let run = state
+            .backend
+            .get_run(&p.run_id)
+            .await
+            .map_err(backend_err)?;
         let stored = state
             .backend
             .get_version(&run.workflow_id, Some(run.workflow_version))

@@ -24,7 +24,11 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Self {
         let root = std::env::temp_dir().join(format!("flow-child-await-{}", Uuid::now_v7()));
-        let backend = Arc::new(SqliteBackend::open(&root, root.join("flow.db")).await.unwrap());
+        let backend = Arc::new(
+            SqliteBackend::open(&root, root.join("flow.db"))
+                .await
+                .unwrap(),
+        );
         let workflow = backend.store().create_workflow("test").await.unwrap();
         // 子工作流：start → end，输出固定值
         backend
@@ -59,8 +63,9 @@ impl Fixture {
                 .unwrap(),
         );
         // 走真实恢复路径：initializing + 空日志 → failed（不写事件）
-        let failures =
-            flow_backend::recover_unfinished(self.backend.as_ref()).await.unwrap();
+        let failures = flow_backend::recover_unfinished(self.backend.as_ref())
+            .await
+            .unwrap();
         assert!(failures.len() == 1, "残留子 run 应恢复失败：{failures:?}");
         let row = self.backend.store().get_run(child_run_id).await.unwrap();
         assert_eq!(row.status, "failed");

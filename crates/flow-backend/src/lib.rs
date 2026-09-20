@@ -51,7 +51,7 @@ mod sqlite;
 
 pub use child::LocalChildLauncher;
 pub use pg::PgBackend;
-pub use sqlite::{SqliteBackend, StoreObserver, recover_unfinished};
+pub use sqlite::{recover_unfinished, SqliteBackend, StoreObserver};
 
 /// 适配层错误：两个后端原生错误的公共超集。
 /// 上层（RPC）据此映射 JSON-RPC 错误码，不再分叉处理具体后端的错误类型。
@@ -321,8 +321,10 @@ pub(crate) trait VersionSource: Send + Sync {
         workflow_id: &str,
         version: Option<i64>,
     ) -> Result<WorkflowVersion, BackendError>;
-    async fn latest_published_version(&self, workflow_id: &str)
-        -> Result<Option<i64>, BackendError>;
+    async fn latest_published_version(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Option<i64>, BackendError>;
 }
 
 /// 解析可执行版本并校验定义——run.start 的完整前置规则，只有这一份实现：
@@ -356,10 +358,8 @@ pub(crate) async fn resolve_runnable_definition(
             version,
         ));
     }
-    let definition: Definition =
-        serde_json::from_value(stored.definition).map_err(|e| {
-            BackendError::Invalid(format!("定义结构非法：{e}"))
-        })?;
+    let definition: Definition = serde_json::from_value(stored.definition)
+        .map_err(|e| BackendError::Invalid(format!("定义结构非法：{e}")))?;
     definition
         .validate()
         .map_err(|e| BackendError::Invalid(e.to_string()))?;
@@ -375,9 +375,9 @@ pub async fn open_from_env() -> Result<AnyBackend, BackendError> {
         "sqlite" => Ok(AnyBackend::Sqlite(Arc::new(
             SqliteBackend::from_env().await?,
         ))),
-        "postgres" | "postgresql" => Ok(AnyBackend::Postgres(Arc::new(
-            PgBackend::from_env().await?,
-        ))),
+        "postgres" | "postgresql" => {
+            Ok(AnyBackend::Postgres(Arc::new(PgBackend::from_env().await?)))
+        }
         other => Err(BackendError::Invalid(format!(
             "未知 FLOW_BACKEND：{other}（支持 sqlite | postgres）"
         ))),

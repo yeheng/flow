@@ -164,7 +164,10 @@ async fn child_success_output_passes_through() {
 
     // child_run_id 确定性派生并随 node_started 落盘；子 run 输入 = 父输入，深度 +1
     let child_run_id = "r:sub:1";
-    assert_eq!(state.record("sub").child_run_id.as_deref(), Some(child_run_id));
+    assert_eq!(
+        state.record("sub").child_run_id.as_deref(),
+        Some(child_run_id)
+    );
     let starts = h.launcher.starts.lock().unwrap().clone();
     assert_eq!(
         starts.as_slice(),
