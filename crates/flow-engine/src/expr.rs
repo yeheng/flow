@@ -182,4 +182,55 @@ mod tests {
             eval_body("while (true) {}", &input, &nodes, Duration::from_millis(50)).unwrap_err();
         assert!(matches!(err, EngineError::Expr(_)), "{err}");
     }
+
+    /// 沙箱边界的**行为**证据（DESIGN.md §10）：无 `std`/`os` 模块、无模块加载器。
+    /// 升级 rquickjs 时这个测试自动重新验证——不靠读 build.rs 考古。
+    /// 若某天升级后 `typeof std` 不再是 "undefined"，这里当场红。
+    #[test]
+    fn sandbox_has_no_std_os_or_module_loader() {
+        let (input, nodes) = ctx();
+
+        // quickjs-libc 的 std/os 模块不存在：typeof 必须是 "undefined"
+        for module in ["std", "os", "quickjs"] {
+            let out = eval_expr(
+                &format!("typeof {module}"),
+                &input,
+                &nodes,
+                Duration::from_secs(2),
+            )
+            .unwrap_or_else(|e| panic!("typeof {module} 不应报错：{e}"));
+            assert_eq!(out, json!("undefined"), "{module} 模块必须不存在于沙箱");
+        }
+
+        // 无模块加载器：静态 import 语法直接被拒（eval/函数体内不允许，
+        // 且无 loader 可供动态 import 解析——动态 import 只会得到永不 settle
+        // 的 Promise，不可能加载到任何模块）
+        let err = eval_body(
+            "import 'whatever'; return 1;",
+            &input,
+            &nodes,
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
+        assert!(matches!(err, EngineError::Expr(_)), "{err}");
+
+        // 全局对象上也没有藏起来的口子：常见的逃逸名字全部 undefined
+        for probe in [
+            "globalThis.std",
+            "globalThis.os",
+            "globalThis.require",
+            "globalThis.process",
+            "globalThis.fetch",
+            "globalThis.XMLHttpRequest",
+        ] {
+            let out = eval_expr(
+                &format!("typeof {probe}"),
+                &input,
+                &nodes,
+                Duration::from_secs(2),
+            )
+            .unwrap();
+            assert_eq!(out, json!("undefined"), "{probe} 必须不可用");
+        }
+    }
 }

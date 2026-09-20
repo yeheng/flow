@@ -42,7 +42,9 @@ pub async fn test_db() -> Option<TestDb> {
         chrono::Utc::now().format("%Y%m%d%H%M%S"),
         Uuid::now_v7().simple()
     );
-    sqlx::query(&format!("CREATE DATABASE {name}"))
+    // CREATE/DROP DATABASE 不支持绑定参数；库名是本函数生成的
+    // flow_test_<时间戳><uuid>，不含用户输入，无注入面。AssertSqlSafe 见 sqlx 0.9。
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
         .execute(&admin)
         .await
         .expect("创建测试数据库失败");
@@ -65,15 +67,18 @@ impl TestDb {
         let Ok(admin) = PgPool::connect(&server_url).await else {
             return;
         };
-        let _ = sqlx::query(&format!(
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{}'",
             self.name
-        ))
+        )))
         .execute(&admin)
         .await;
-        let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS {}", self.name))
-            .execute(&admin)
-            .await;
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE IF EXISTS {}",
+            self.name
+        )))
+        .execute(&admin)
+        .await;
         admin.close().await;
     }
 }
@@ -100,12 +105,12 @@ async fn janitor(admin: &PgPool) {
         if created > cutoff {
             continue;
         }
-        let _ = sqlx::query(&format!(
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{name}'"
-        ))
+        )))
         .execute(admin)
         .await;
-        let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS {name}"))
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {name}")))
             .execute(admin)
             .await;
     }
@@ -171,7 +176,8 @@ pub async fn publish_definition(
     (workflow_id, version)
 }
 
-/// 原子创建 run（gateway 入口），返回 run_id。
+/// 原子创建 run（gateway 入口），返回 run_id。version 必须已发布
+/// （published 解析与校验规则单点在 flow-backend，见 sqlite.rs 测试）。
 pub async fn start_run(
     engine: &PgEngine,
     workflow_id: &str,
@@ -181,7 +187,7 @@ pub async fn start_run(
     let created = engine
         .create_run(flow_pg::CreateRun {
             workflow_id: workflow_id.to_string(),
-            version: Some(version),
+            version,
             input,
         })
         .await

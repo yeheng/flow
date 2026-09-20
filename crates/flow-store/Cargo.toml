@@ -14,3 +14,4 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 sqlx = { workspace = true }
 tracing = { workspace = true }
+flow-dto = { path = "../flow-dto" }

@@ -64,7 +64,7 @@ async fn test_db() -> Option<TestDb> {
         chrono::Utc::now().format("%Y%m%d%H%M%S"),
         Uuid::now_v7().simple()
     );
-    sqlx::query(&format!("CREATE DATABASE {name}"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
         .execute(&admin)
         .await
         .expect("创建测试数据库失败");
@@ -82,15 +82,18 @@ impl TestDb {
         self.pool.close().await;
         let server_url = format!("{}/postgres", &self.url[..self.url.rfind('/').unwrap() + 1]);
         if let Ok(admin) = PgPool::connect(&server_url).await {
-            let _ = sqlx::query(&format!(
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
                 "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{}'",
                 self.name
-            ))
+            )))
             .execute(&admin)
             .await;
-            let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS {}", self.name))
-                .execute(&admin)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP DATABASE IF EXISTS {}",
+                self.name
+            )))
+            .execute(&admin)
+            .await;
             admin.close().await;
         }
     }

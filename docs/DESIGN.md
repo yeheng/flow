@@ -1,8 +1,10 @@
 # flow 工作流引擎设计方案
 
 > 状态：单机实现 + 对等模式多节点执行（`DISTRIBUTED.md`，Postgres 后端）；
-> `cargo test --workspace --all-targets --locked` 73 个测试全绿；验证命令与覆盖范围见 §13。
+> `cargo test --workspace --all-targets --locked` 80 个测试全绿；验证命令与覆盖范围见 §13。
 > 本文描述当前代码的实际语义，是后续开发的权威参考。
+> 架构焊点：**SQLite + events.jsonl 是默认与权威后端**（canonical）；Postgres 是
+> 可替代后端，两者统一在 `flow-backend` 的 `Backend` trait 之后（§2）。
 
 ## 1. 目标与边界
 
@@ -22,21 +24,36 @@ flow 是一个工作流执行引擎：发布不可变的流程定义（DAG），
 crates/
   flow-engine   执行引擎。Driver 只依赖 RunEventSink 后端边界（Phase 0），
                 单机后端走 event.jsonl，不依赖任何存储实现
+  flow-dto      领域 DTO 与状态词汇表的单一来源（零依赖叶子）：
+                WorkflowVersion / WorkflowSummary / RunRecord / DbRunStatus。
+                存储层持久化的本来就是引擎域数据，不维护第二份拷贝
   flow-store    SQLite：workflow / workflow_versions / runs 元数据（单机后端）
-  flow-pg       Postgres 后端：共享日志、epoch 租约、持久 inbox、executor
-  flow-rpc      jsonrpsee WebSocket 服务（bin: flow-server），适配层；
-                FLOW_BACKEND=sqlite（默认）| postgres 切换后端
+  flow-backend  后端适配层：`AnyBackend` 闭集枚举（**不是 dyn trait**）
+                屏蔽两种架构选择。SQLite + event.jsonl 是默认与权威实现
+                （`sqlite.rs`，即本文档描述的全部语义）；Postgres 是可替代实现
+                （`pg.rs`，DISTRIBUTED.md）。公共面只含两个后端都诚实实现的方法；
+                初始化协议、信号落账、订阅推送的差异在边界内吸收；
+                「只有 published 可执行 + 创建前校验」单点在 resolve_runnable_definition
+  flow-pg       Postgres 后端实现：共享日志、epoch 租约、持久 inbox、executor
+  flow-rpc      jsonrpsee WebSocket 服务（bin: flow-server）；**只依赖
+                `AnyBackend` 枚举**，不感知 flow-store / flow-pg，也不读 FLOW_BACKEND
 ```
 
 依赖方向（不可反转）：
 
 ```
-flow-rpc ──> flow-engine
-flow-rpc ──> flow-store
-flow-rpc ──> flow-pg ──> flow-engine
-flow-pg ──> flow-store   ✗（两个后端互相独立）
+flow-rpc ──> flow-backend ──> flow-engine ──> flow-dto
+                         ├──> flow-store ──> flow-dto
+                         └──> flow-pg ────> flow-engine, flow-dto
+flow-pg ──> flow-store   ✗（两个后端互相独立，互不感知）
 flow-engine ✗ flow-*     （引擎不依赖存储；状态出口走 RunEventSink trait）
+flow-rpc ──> flow-store / flow-pg   ✗（上层不感知具体后端）
 ```
+
+后端选择只在进程入口发生一次：`flow_backend::open_from_env()` 按
+`FLOW_BACKEND=sqlite（缺省）| postgres` 构造 `AnyBackend`，之后整条 RPC 链路
+只看枚举。闭集枚举而非 trait 对象：每加一个方法编译器逼着两个臂都写完，
+不存在某个后端静默继承错误默认实现的坑。
 
 运行：`cargo run --bin flow-server`。环境变量 `FLOW_ADDR`（默认 `127.0.0.1:9800`）、
 `FLOW_DB`、`FLOW_DATA_DIR`；Postgres 模式另见 `DISTRIBUTED.md` §10
@@ -323,16 +340,31 @@ SQLite（WAL）。表：
 - 有 run 记录时拒删 workflow（事件日志不能变孤儿）；
 - `set_run_status` 影响 0 行必须报错（静默成功会掩盖「run 行没插进去」）；
 - **状态词汇表**：`runs.status` 的合法取值
-  （initializing/running/awaiting_resume/succeeded/failed/cancelled）由 store 私有常量定义，
-  写入口（`insert_run`/`set_run_status`）经 `ensure_run_status` 校验；
-  公共词汇表是引擎的 `DbRunStatus`（`as_str()` 生成同样字符串）。
-  两边脱钩会在写入时当场报错（跨 crate 契约测试钉住），
-  而不是让 run 从恢复扫描里静默消失。
+  （initializing/running/awaiting_resume/succeeded/failed/cancelled）**单一来源**是
+  flow-dto 的 `DbRunStatus`（`as_str()` 生成这些字符串）；store 写入口
+  （`insert_run`/`set_run_status`）经 `ensure_run_status` 按 `DbRunStatus::is_valid_str`
+  校验，不维护第二份私有常量。契约测试钉住 store 写入口真的在校验，
+  词汇表外的字符串在写入时当场报错，而不是让 run 从恢复扫描里静默消失。
 - 状态更新替换 output/error，传 None 会清空；已解决的裁决诊断不得留在成功结果里。
 
 ## 9. RPC 层（flow-rpc）
 
-jsonrpsee WebSocket。引擎不依赖存储，`StoreObserver` 在这一层把
+jsonrpsee WebSocket。本层只有**一份**方法实现，只依赖 `flow_backend::AnyBackend`
+闭集枚举；后端差异（初始化协议、信号落账、订阅推送）全部在 flow-backend 吸收：
+
+- `run.start`：SQLite 两段式 initializing → run_started；Postgres 单事务原子创建。
+  「只有 published 可执行 + 创建前校验」单点在 flow-backend 的
+  `resolve_runnable_definition`，两个后端 create_run 共用，不存在第二份实现；
+- `run.signal` / `run.cancel`：统一 SignalAck 响应（delivered / pending / rejected）。
+  `signal_id` 在 Postgres 后端必填且重试复用（真实落账的 inbox 主键，可查询）；
+  SQLite 后端可省，响应**只回显客户端提供的 id、从不伪造**（没有持久 inbox，
+  伪造一个查不到的 id 是欺骗客户端）；取消响应统一为 delivered 语义；
+- `run.signal_status`：pg 专属能力，不进 AnyBackend 公共面——在唯一的
+  方法注册点 match 枚举暴露；SQLite 返回明确的 invalid 错误（同步交付无账可查）；
+- `run.subscribe`：SQLite 是进程内 broadcast（零 spawn 的流包装）；
+  Postgres 按 run_id 维护 last_seq 轮询共享日志，指定 run 已终结追平后流自然结束。
+
+引擎不依赖存储，SQLite 后端内部的 `StoreObserver` 在 flow-backend 把
 `RunObserver` 状态出口适配到 runs 表。
 
 方法：
@@ -341,25 +373,46 @@ jsonrpsee WebSocket。引擎不依赖存储，`StoreObserver` 在这一层把
 |---|---|
 | `workflow.create / update / publish / get / list / delete` | 定义生命周期。update 前强制 validate |
 | `nodetypes.list` | 前端画布能力清单：类型、端口、`params_schema`（JSON Schema draft-07 子集 type/required/properties/enum/default，另带 `x-widget`/`x-label`/`x-help` 扩展键，前端据此渲染参数表单；后端校验仍以 `Definition::validate` 为准）、supports_retry、side_effect |
-| `run.start` | 校验 published → insert initializing → 持久化 run_started → 启动 Driver；初始化错误回写 failed |
+| `run.start` | 经 Backend：SQLite 校验 published → insert initializing → 持久化 run_started → 启动 Driver，初始化错误回写 failed；Postgres 单事务原子创建（§9 差异说明） |
 | `run.get / run.list` | 元数据 + live 标记 |
 | `run.timeline` | 只读时间线：定义顺序 + 折叠后的节点状态 |
 | `run.events` | 原始事件，`from_seq` 增量拉取 |
-| `run.cancel` | 活着的 run → cancelling；否则 conflict |
-| `run.signal` | human_task 交付 / 副作用节点裁决（§6.7） |
-| `run.subscribe` | 订阅 `run.event` 通知，可按 run_id 过滤。订阅者消费慢时收到 Lagged 丢事件，用 `run.events`（from_seq）补齐 |
+| `run.cancel` | 统一 SignalAck：活着的 run 交付取消（SQLite 仅本进程生效）；否则 conflict |
+| `run.signal` | human_task 交付 / 副作用节点裁决（§6.7）。signal_id 在 Postgres 必填且重试复用，SQLite 可省（响应只回显客户端提供的，不伪造） |
+| `run.signal_status` | 持久 inbox 落账查询；pg 专属（RPC 边缘 match 暴露），SQLite 返回明确的 invalid |
+| `run.subscribe` | 订阅 `run.event` 通知，可按 run_id 过滤。SQLite 订阅者消费慢时收到 Lagged 丢事件，用 `run.events`（from_seq）补齐；Postgres 按游标轮询共享日志 |
 
 错误码：`-32010` 参数非法、`-32011` 不存在、`-32012` 冲突、`-32603` 内部错误。
 JSON-RPC 允许整体省略 params（到达 null），解析层统一归一为 `{}`。
+
+### 9.1 wire protocol 变更记录（适配层重构）
+
+后端适配层重构（两份 RPC 实现合一）带来的线上协议变更，客户端对齐依据：
+
+- `run.cancel` 响应：`{"cancelling": true}` → `{"delivered": true}`（语义未变：
+  取消已受理。若 Postgres 侧携带 signal_id，则一并返回）；
+- `run.signal` 请求新增可选 `signal_id`（Postgres 必填）；响应新增
+  `signal_id` / `event_seq` 字段（仅在真实存在时返回）；
+- `run.signal_status`：SQLite 后端从「方法不存在」变为「存在但返回 -32010
+  明确错误」；Postgres 语义不变；
+- 自托管 web 前端不读上述响应体，无需变更；外部消费者按本节对齐。
 
 ## 10. JS 沙箱（expr.rs）
 
 rquickjs：无 IO、CPU 同步执行（放 `spawn_blocking`，不占死 tokio worker）、
 interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
 
-沙箱边界的证据（升级 rquickjs 时必须重新查证）：`rquickjs-sys` 只编译
-`quickjs.c`，**不含 `quickjs-libc.c`**（`std`/`os` 模块的唯一来源），
-引擎也未注册任何模块加载器——脚本里连 `import` 都不可用。
+沙箱边界的证据有两条，都不靠人读：
+
+1. **行为测试**（`expr.rs` 的 `sandbox_has_no_std_os_or_module_loader`，随
+   `cargo test` 常驻）：`typeof std/os/quickjs` 必须是 `"undefined"`，
+   `globalThis` 上的 `require/process/fetch/XMLHttpRequest` 全部不可用，
+   静态 `import` 必须被拒。升级 rquickjs 后测试自动重新验证，
+   不需要任何人记得去考古；
+2. **构建证据**（2026-09 对 rquickjs 0.14 重新核对）：`rquickjs-sys` 的 build.rs
+   仅编译 libregexp.c / libunicode.c / quickjs.c / dtoa.c，编译产物不含
+   quickjs-libc.o——`std`/`os` 模块的唯一来源没有被编进引擎。
+   引擎也未注册任何模块加载器：脚本里连 `import` 都不可用。
 
 - `eval_body`：script 节点，函数体带 `return`，可用 `input` 与 `nodes`（前驱输出快照）；
 - `eval_expr`：condition 节点；
@@ -410,7 +463,10 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
   断流用「声明 Content-Length 但发一半即关闭」——确定性，不依赖不可路由地址；
 - 客户端用 `ObjectParams` 具名参数；`subscribe` 三参
   `(subscribe_method, params, unsubscribe_method)`；
-- 契约测试钉住跨 crate 状态词汇表（§8）；
+- 契约测试钉住状态词汇表（§8；位于 flow-backend：store 写入口校验
+  DbRunStatus 单一词汇表）；「只有 published 可执行 + 创建前校验」的规则断言
+  单点钉在 flow-backend 的 `resolve_runnable_definition` 测试；
+- JS 沙箱边界由行为测试钉住（§10），随每次 `cargo test` 重新验证；
 - `recovery_regressions.rs` 验证失败恢复、重试下游、剩余退避、非法/重复信号和裁决恢复；
 - `contracts.rs` 验证显式 draft 拒绝、初始化中断和旧日志缺失隔离；
 - `sub_workflow.rs` 验证子 run 输出透传、子失败 fatal、RunExists 附着、深度上限、

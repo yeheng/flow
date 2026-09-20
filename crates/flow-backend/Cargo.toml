@@ -1,19 +1,21 @@
 [package]
-name = "flow-engine"
+name = "flow-backend"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+tokio-stream = { workspace = true }
+async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
-reqwest = { workspace = true }
-parking_lot = { workspace = true }
-rquickjs = { workspace = true }
 tracing = { workspace = true }
-flow-dto = { path = "../flow-dto" }
 futures = { workspace = true }
+flow-engine = { path = "../flow-engine" }
+flow-dto = { path = "../flow-dto" }
+flow-store = { path = "../flow-store" }
+flow-pg = { path = "../flow-pg" }

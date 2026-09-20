@@ -18,3 +18,4 @@ parking_lot = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 flow-engine = { path = "../flow-engine" }
+flow-dto = { path = "../flow-dto" }

@@ -239,7 +239,7 @@ async fn run_start_is_atomic_and_status_vocabulary_is_enforced() {
     let created = engine
         .create_run(flow_pg::CreateRun {
             workflow_id: wf.clone(),
-            version: Some(v),
+            version: v,
             input: serde_json::json!({"k": 1}),
         })
         .await
@@ -263,32 +263,9 @@ async fn run_start_is_atomic_and_status_vocabulary_is_enforced() {
         .unwrap();
     assert_eq!(events.len(), 1, "创建事务必须同时插入 seq=1 的 RunStarted");
 
-    // draft 版本不可执行
-    let version = engine
-        .store()
-        .update_workflow(&wf, &def_line("return 2;"))
-        .await
-        .unwrap();
-    let err = engine
-        .create_run(flow_pg::CreateRun {
-            workflow_id: wf.clone(),
-            version: Some(version),
-            input: serde_json::json!(null),
-        })
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("尚未发布"), "{err}");
-
-    // 不存在的 workflow
-    let err = engine
-        .create_run(flow_pg::CreateRun {
-            workflow_id: "no-such-wf".into(),
-            version: None,
-            input: serde_json::json!(null),
-        })
-        .await
-        .unwrap_err();
-    assert!(matches!(err, flow_pg::PgError::Invalid(_)), "{err:?}");
+    // 「draft 拒绝 / 无已发布版本报错」的规则断言在 flow-backend 的
+    // resolve_runnable_definition 单点测试里（sqlite.rs tests）；
+    // 这里只钉 pg 侧的原子性与状态词汇表。
 
     // 状态词汇表：Postgres 后端不存在 initializing，CHECK 约束当场拒绝
     let err = sqlx::query(

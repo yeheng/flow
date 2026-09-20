@@ -10,49 +10,40 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use flow_engine::{Engine, RunPhase, StartRun};
-use flow_rpc::child::LocalChildLauncher;
-use flow_rpc::{AppState, StoreObserver};
-use flow_store::Store;
+use flow_backend::SqliteBackend;
+use flow_engine::{RunPhase, StartRun};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 struct Fixture {
     root: PathBuf,
-    state: Arc<AppState>,
+    backend: Arc<SqliteBackend>,
     workflow: String,
 }
 
 impl Fixture {
     async fn new() -> Self {
         let root = std::env::temp_dir().join(format!("flow-child-await-{}", Uuid::now_v7()));
-        let store = Arc::new(Store::open(root.join("flow.db")).await.unwrap());
-        let workflow = store.create_workflow("test").await.unwrap();
+        let backend = Arc::new(SqliteBackend::open(&root, root.join("flow.db")).await.unwrap());
+        let workflow = backend.store().create_workflow("test").await.unwrap();
         // 子工作流：start → end，输出固定值
-        store
+        backend
+            .store()
             .update_workflow(&workflow, &child_definition())
             .await
             .unwrap();
-        store.publish(&workflow, 1).await.unwrap();
-        let engine = Arc::new(Engine::new(
-            &root,
-            Arc::new(StoreObserver::new(store.clone())),
-        ));
-        engine.set_child_launcher(Arc::new(LocalChildLauncher::new(
-            store.clone(),
-            engine.clone(),
-        )));
+        backend.store().publish(&workflow, 1).await.unwrap();
         Self {
             root,
-            state: Arc::new(AppState { store, engine }),
+            backend,
             workflow,
         }
     }
 
     /// 构造崩溃残留：子 run 有 runs 行 + 空 event.jsonl，恢复流程已将其标 failed。
     async fn seed_interrupted_child(&self, child_run_id: &str) {
-        self.state
-            .store
+        self.backend
+            .store()
             .insert_run(
                 child_run_id,
                 &self.workflow,
@@ -68,16 +59,17 @@ impl Fixture {
                 .unwrap(),
         );
         // 走真实恢复路径：initializing + 空日志 → failed（不写事件）
-        let failures = flow_rpc::recover_unfinished(&self.state).await.unwrap();
+        let failures =
+            flow_backend::recover_unfinished(self.backend.as_ref()).await.unwrap();
         assert!(failures.len() == 1, "残留子 run 应恢复失败：{failures:?}");
-        let row = self.state.store.get_run(child_run_id).await.unwrap();
+        let row = self.backend.store().get_run(child_run_id).await.unwrap();
         assert_eq!(row.status, "failed");
     }
 
     async fn wait_terminal(&self, run_id: &str) -> flow_engine::RunState {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let state = self.state.engine.snapshot(run_id).await.unwrap();
+                let state = self.backend.engine().snapshot(run_id).await.unwrap();
                 if state.phase.is_terminal() {
                     return state;
                 }
@@ -130,8 +122,8 @@ async fn parent_terminates_when_child_initialization_was_interrupted() {
 
     let definition: flow_engine::Definition =
         serde_json::from_value(parent_definition(&f.workflow)).unwrap();
-    f.state
-        .engine
+    f.backend
+        .engine()
         .start_run(StartRun {
             run_id: run_id.clone(),
             workflow_id: "parent".into(),
@@ -161,8 +153,8 @@ async fn healthy_child_run_still_succeeds() {
 
     let definition: flow_engine::Definition =
         serde_json::from_value(parent_definition(&f.workflow)).unwrap();
-    f.state
-        .engine
+    f.backend
+        .engine()
         .start_run(StartRun {
             run_id: run_id.clone(),
             workflow_id: "parent".into(),

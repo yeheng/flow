@@ -1,55 +1,18 @@
 //! Postgres 元数据存储：workflows / workflow_versions / runs。
 //! 语义与单机 flow-store 对齐：版本不可变、checksum 去重复用版本号、
 //! 有 run 时拒删 workflow、只有 published 版本可执行。
+//! 领域 DTO 的单一来源在 flow-dto，本模块不再维护第二份拷贝。
 
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::error::PgError;
-use crate::lease::{STATUS_DRAFT, STATUS_PUBLISHED};
-
-/// 定义版本。definition 是不可变快照，run 钉死某一版。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkflowVersion {
-    pub workflow_id: String,
-    pub version: i64,
-    pub definition: Value,
-    pub checksum: String,
-    pub status: String,
-    pub created_at: DateTime<Utc>,
-}
-
-impl WorkflowVersion {
-    pub fn is_published(&self) -> bool {
-        self.status == STATUS_PUBLISHED
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkflowSummary {
-    pub workflow_id: String,
-    pub name: String,
-    pub latest_version: i64,
-    pub published_version: Option<i64>,
-    pub created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunRecord {
-    pub id: String,
-    pub workflow_id: String,
-    pub workflow_version: i64,
-    pub status: String,
-    pub input: Value,
-    pub output: Option<Value>,
-    pub error: Option<String>,
-    pub started_at: DateTime<Utc>,
-    pub ended_at: Option<DateTime<Utc>>,
-}
+pub use flow_dto::{
+    RunRecord, WorkflowSummary, WorkflowVersion, STATUS_DRAFT, STATUS_PUBLISHED,
+};
 
 /// 定义与 run 元数据的存储。执行事件在 run_events，租约在 runs 行内。
 pub struct PgStore {

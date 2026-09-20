@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
@@ -9,6 +9,20 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use chrono::{DateTime, Utc};
+
+// 领域 DTO 与状态词汇表的单一来源在 flow-dto；本 crate 不再维护第二份拷贝。
+// 写入口经 ensure_run_status 用 DbRunStatus 校验，不复制常量列表。
+pub use flow_dto::{
+    DbRunStatus, RunRecord, STATUS_DRAFT, STATUS_PUBLISHED, WorkflowSummary, WorkflowVersion,
+};
+
+fn ensure_run_status(status: &str) -> Result<(), StoreError> {
+    if DbRunStatus::is_valid_str(status) {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidStatus(status.to_string()))
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -28,73 +42,6 @@ pub enum StoreError {
     InvalidStatus(String),
     #[error("json 错误：{0}")]
     Json(#[from] serde_json::Error),
-}
-
-/// 定义版本。definition 是不可变快照，run 钉死某一版。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkflowVersion {
-    pub workflow_id: String,
-    pub version: i64,
-    pub definition: Value,
-    pub checksum: String,
-    pub status: String,
-    pub created_at: DateTime<Utc>,
-}
-
-impl WorkflowVersion {
-    pub fn is_published(&self) -> bool {
-        self.status == STATUS_PUBLISHED
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkflowSummary {
-    pub workflow_id: String,
-    pub name: String,
-    pub latest_version: i64,
-    pub published_version: Option<i64>,
-    pub created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunRecord {
-    pub id: String,
-    pub workflow_id: String,
-    pub workflow_version: i64,
-    pub status: String,
-    pub input: Value,
-    pub output: Option<Value>,
-    pub error: Option<String>,
-    pub started_at: DateTime<Utc>,
-    pub ended_at: Option<DateTime<Utc>>,
-}
-
-pub const STATUS_DRAFT: &str = "draft";
-pub const STATUS_PUBLISHED: &str = "published";
-
-// 写入入口统一经 ensure_run_status 校验，两边脱钩时当场报错，
-// 而不是让 run 从 unfinished_runs 的恢复扫描里静默消失。
-const RUN_INITIALIZING: &str = "initializing";
-const RUN_RUNNING: &str = "running";
-const RUN_AWAITING_RESUME: &str = "awaiting_resume";
-const RUN_SUCCEEDED: &str = "succeeded";
-const RUN_FAILED: &str = "failed";
-const RUN_CANCELLED: &str = "cancelled";
-
-fn ensure_run_status(status: &str) -> Result<(), StoreError> {
-    if matches!(
-        status,
-        RUN_INITIALIZING
-            | RUN_RUNNING
-            | RUN_AWAITING_RESUME
-            | RUN_SUCCEEDED
-            | RUN_FAILED
-            | RUN_CANCELLED
-    ) {
-        Ok(())
-    } else {
-        Err(StoreError::InvalidStatus(status.to_string()))
-    }
 }
 
 /// 定义与 run 元数据的存储。执行状态不在这里——那是 event.jsonl 的事。
@@ -400,7 +347,7 @@ impl Store {
         error: Option<&str>,
     ) -> Result<(), StoreError> {
         ensure_run_status(status)?;
-        let terminal = matches!(status, RUN_SUCCEEDED | RUN_FAILED | RUN_CANCELLED);
+        let terminal = DbRunStatus::is_terminal_str(status);
         let affected = sqlx::query(
             "UPDATE runs SET status = ?, output = ?, error = ?,
                     ended_at = CASE WHEN ? THEN ? ELSE ended_at END
@@ -458,11 +405,12 @@ impl Store {
 
     /// 崩溃恢复的输入：进程重启后需要续跑的 run。
     pub async fn unfinished_runs(&self) -> Result<Vec<RunRecord>, StoreError> {
-        let rows =
-            sqlx::query("SELECT * FROM runs WHERE status IN (?, ?, ?) ORDER BY started_at ASC")
-                .bind(RUN_INITIALIZING)
-                .bind(RUN_RUNNING)
-                .bind(RUN_AWAITING_RESUME)
+        let rows = sqlx::query(
+            "SELECT * FROM runs WHERE status IN (?, ?, ?) ORDER BY started_at ASC",
+        )
+        .bind(DbRunStatus::Initializing.as_str())
+        .bind(DbRunStatus::Running.as_str())
+        .bind(DbRunStatus::AwaitingResume.as_str())
                 .fetch_all(&self.pool)
                 .await?;
         rows.into_iter().map(Self::run_from_row).collect()

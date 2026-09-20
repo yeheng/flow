@@ -1,7 +1,8 @@
 # flow 分布式部署设计（多节点执行）
 
 > 状态：**对等抢占模式（peer）已实现**（Phase 0 后端边界 + Phase 1 共享日志与接管
-> + Phase 2 容量与查询，见 `crates/flow-pg` 与 `flow-rpc` 的 Postgres 模式）；
+> + Phase 2 容量与查询，见 `crates/flow-pg` 与 `flow-backend` 的 Postgres 适配器
+> （`PgBackend`；上层 RPC 经 `Backend` trait 屏蔽后端差异））；
 > SCHEDULER.md 的中心指派模式仍未实现。验收覆盖情况见 §11。
 > 依赖 DESIGN.md 的单机恢复契约。依赖本文定义对等抢占模式；
 > SCHEDULER.md 定义中心指派模式。一个集群只启用一种模式。

@@ -1,4 +1,5 @@
-//! 单机后端的 sub_workflow 启动器：子 run 与父 run 同进程、同引擎。
+//! SQLite 后端的 sub_workflow 启动器：子 run 与父 run 同进程、同引擎。
+//! （原在 flow-rpc，适配层重构后归入 flow-backend 的 sqlite 实现。）
 //!
 //! - start：解析 latest published → insert_run(initializing) → engine.start_run；
 //!   `RunExists`（崩溃重放的重复 start）跳过启动、直接附着等待；

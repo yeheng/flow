@@ -11,18 +11,17 @@ path = "src/main.rs"
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-uuid = { workspace = true }
-chrono = { workspace = true }
 thiserror = { workspace = true }
 jsonrpsee = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 futures = { workspace = true }
-tokio-util = { workspace = true }
 flow-engine = { path = "../flow-engine" }
-flow-pg = { path = "../flow-pg" }
-flow-store = { path = "../flow-store" }
+flow-backend = { path = "../flow-backend" }
 
 [dev-dependencies]
-sqlx = { workspace = true, features = ["postgres", "json"] }
+uuid = { workspace = true }
 chrono = { workspace = true }
+sqlx = { workspace = true, features = ["postgres", "json"] }
+flow-store = { path = "../flow-store" }
+flow-pg = { path = "../flow-pg" }

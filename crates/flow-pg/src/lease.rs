@@ -16,8 +16,8 @@ use sqlx::{PgPool, Row};
 use crate::error::PgError;
 
 pub const MODE_PEER: &str = "peer";
-pub const STATUS_DRAFT: &str = "draft";
-pub const STATUS_PUBLISHED: &str = "published";
+// 版本状态词汇表的单一来源在 flow-dto；此处重导出保持旧导入路径可用。
+pub use flow_dto::{STATUS_DRAFT, STATUS_PUBLISHED};
 const STATUS_ACTIVE: [&str; 2] = ["running", "awaiting_resume"];
 
 /// 持锁后读到的 run 行快照。`expired` 用 SQL 表达式在锁内计算。

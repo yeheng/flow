@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -22,30 +21,9 @@ const SIGNAL_CHANNEL_CAPACITY: usize = 64;
 /// 单机后端没有持久 inbox；这个轮询间隔只是占位（poll_inputs 恒为空）。
 const FILE_INBOX_POLL: Duration = Duration::from_secs(3600);
 
-/// 落库用的 run 状态，包含初始化与人工介入状态。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DbRunStatus {
-    Initializing,
-    Running,
-    AwaitingResume,
-    Succeeded,
-    Failed,
-    Cancelled,
-}
-
-impl DbRunStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            DbRunStatus::Initializing => "initializing",
-            DbRunStatus::Running => "running",
-            DbRunStatus::AwaitingResume => "awaiting_resume",
-            DbRunStatus::Succeeded => "succeeded",
-            DbRunStatus::Failed => "failed",
-            DbRunStatus::Cancelled => "cancelled",
-        }
-    }
-}
+/// 落库用的 run 状态词汇表住在 flow-dto（单一来源），这里重导出保持
+/// `flow_engine::DbRunStatus` 导入路径不变。
+pub use flow_dto::DbRunStatus;
 
 pub struct StatusUpdate<'a> {
     pub run_id: &'a str,

@@ -1,15 +1,19 @@
-pub mod child;
-pub mod pg;
+//! flow-rpc：jsonrpsee WebSocket 服务（bin: flow-server）。
+//!
+//! 适配层重构后的职责边界（DESIGN.md §2）：
+//! - 本 crate **只依赖 flow-backend 的 `Backend` trait**，不感知
+//!   flow-store / flow-pg，也不读取 FLOW_BACKEND——后端选择在 main +
+//!   `flow_backend::open_from_env()` 完成一次，之后对 RPC 层完全透明；
+//! - SQLite + event.jsonl（canonical）与 Postgres（可替代）的语义差异
+//!   （初始化协议、信号落账、订阅推送）由 flow-backend 吸收，这里的每个
+//!   RPC 方法只有一份实现。
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use flow_engine::{
-    DbRunStatus, Definition, Engine, EngineError, Envelope, ResumeOutcome, RunObserver, RunPhase,
-    RunState, Signal, StartRun, StatusUpdate, HTTP_METHODS,
-};
-use flow_store::{Store, StoreError};
-use futures::future::BoxFuture;
+use futures::StreamExt;
+use flow_backend::{AnyBackend, BackendError, SignalAck};
+use flow_engine::{Definition, RunState, HTTP_METHODS};
 use jsonrpsee::core::RegisterMethodError;
 use jsonrpsee::server::{Server, ServerHandle, SubscriptionMessage};
 use jsonrpsee::types::error::{ErrorObject, ErrorObjectOwned};
@@ -30,129 +34,14 @@ pub enum RpcError {
     Register(#[from] RegisterMethodError),
     #[error("监听失败：{0}")]
     Io(#[from] std::io::Error),
-    #[error("存储错误：{0}")]
-    Store(#[from] StoreError),
-    #[error("引擎错误：{0}")]
-    Engine(#[from] EngineError),
+    #[error("后端错误：{0}")]
+    Backend(#[from] BackendError),
 }
 
+/// 唯一的 RPC 层状态：闭集后端枚举。SQLite / Postgres 在这里不可区分，
+/// pg 专属能力在对应方法的注册点单点 match。
 pub struct AppState {
-    pub store: Arc<Store>,
-    pub engine: Arc<Engine>,
-}
-
-/// 把引擎的 run 状态变化落到 runs 表。引擎本身不依赖存储实现，适配在 RPC 层做。
-pub struct StoreObserver {
-    store: Arc<Store>,
-}
-
-impl StoreObserver {
-    pub fn new(store: Arc<Store>) -> StoreObserver {
-        StoreObserver { store }
-    }
-}
-
-impl RunObserver for StoreObserver {
-    fn on_status<'a>(&'a self, update: StatusUpdate<'a>) -> BoxFuture<'a, ()> {
-        Box::pin(async move {
-            if let Err(err) = self
-                .store
-                .set_run_status(
-                    update.run_id,
-                    update.status.as_str(),
-                    update.output,
-                    update.error,
-                )
-                .await
-            {
-                tracing::error!(run_id = %update.run_id, error = %err, "回写 run 状态失败");
-            }
-        })
-    }
-}
-
-/// 启动恢复：把 runs 表里未结束的 run 从 event.jsonl 折叠回来继续跑。
-///
-/// 事件日志是权威：日志已终结但 DB 未回填的情况在这里补齐。
-pub async fn recover_unfinished(state: &AppState) -> Result<Vec<(String, String)>, RpcError> {
-    let mut failures = Vec::new();
-    for run in state.store.unfinished_runs().await? {
-        let version = match state
-            .store
-            .get_version(&run.workflow_id, Some(run.workflow_version))
-            .await
-        {
-            Ok(version) => version,
-            Err(err) => {
-                failures.push((run.id.clone(), err.to_string()));
-                continue;
-            }
-        };
-        let definition: Definition = match serde_json::from_value(version.definition.clone()) {
-            Ok(definition) => definition,
-            Err(err) => {
-                failures.push((run.id.clone(), format!("定义无法解析：{err}")));
-                continue;
-            }
-        };
-
-        let spec = StartRun {
-            run_id: run.id.clone(),
-            workflow_id: run.workflow_id.clone(),
-            workflow_version: run.workflow_version,
-            definition,
-            input: run.input.clone(),
-            // 恢复路径：深度以日志中的 run_started 为准，这里只是占位
-            depth: 0,
-        };
-
-        match state.engine.resume_run(spec).await {
-            Ok(ResumeOutcome::Resumed) => {
-                tracing::info!(run_id = %run.id, "恢复未完成的 run");
-            }
-            Ok(ResumeOutcome::AlreadyTerminal(boxed)) => {
-                let terminal = *boxed;
-                // 崩溃发生在「事件已落盘、DB 未回填」之间：以事件为准修正 DB。
-                // 终态与 output/fatal_error 已随 resume_run 折叠返回，不必重读日志。
-                let status = match terminal.phase {
-                    RunPhase::Succeeded => DbRunStatus::Succeeded,
-                    RunPhase::Failed => DbRunStatus::Failed,
-                    RunPhase::Cancelled => DbRunStatus::Cancelled,
-                    RunPhase::Running => DbRunStatus::Running,
-                };
-                state
-                    .store
-                    .set_run_status(
-                        &run.id,
-                        status.as_str(),
-                        terminal.output.as_ref(),
-                        terminal.fatal_error.as_deref(),
-                    )
-                    .await?;
-                tracing::info!(run_id = %run.id, "事件日志已终结，回填 DB 状态");
-            }
-            Err(err) => {
-                let message = err.to_string();
-                if matches!(
-                    err,
-                    EngineError::RunNotFound(_) | EngineError::LogCorrupted(_)
-                ) {
-                    // A missing log is never evidence that replaying side effects is safe.
-                    let status = if run.status == DbRunStatus::Initializing.as_str() {
-                        DbRunStatus::Failed
-                    } else {
-                        DbRunStatus::AwaitingResume
-                    };
-                    state
-                        .store
-                        .set_run_status(&run.id, status.as_str(), None, Some(&message))
-                        .await?;
-                }
-                failures.push((run.id.clone(), message));
-            }
-        }
-    }
-    Ok(failures)
+    pub backend: AnyBackend,
 }
 
 pub async fn serve(
@@ -177,10 +66,10 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
         }
         let p: P = parse(&params)?;
         let workflow_id = state
-            .store
+            .backend
             .create_workflow(&p.name)
             .await
-            .map_err(store_err)?;
+            .map_err(backend_err)?;
         Ok::<_, ErrorObjectOwned>(json!({ "workflow_id": workflow_id }))
     })?;
 
@@ -197,10 +86,10 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
         definition.validate().map_err(invalid)?;
 
         let version = state
-            .store
+            .backend
             .update_workflow(&p.workflow_id, &p.definition)
             .await
-            .map_err(store_err)?;
+            .map_err(backend_err)?;
         Ok::<_, ErrorObjectOwned>(json!({ "workflow_id": p.workflow_id, "version": version }))
     })?;
 
@@ -212,19 +101,19 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
         }
         let p: P = parse(&params)?;
         let stored = state
-            .store
+            .backend
             .get_version(&p.workflow_id, Some(p.version))
             .await
-            .map_err(store_err)?;
+            .map_err(backend_err)?;
         let definition: Definition = serde_json::from_value(stored.definition)
             .map_err(|e| invalid(format!("定义结构非法：{e}")))?;
         definition.validate().map_err(invalid)?;
 
         state
-            .store
+            .backend
             .publish(&p.workflow_id, p.version)
             .await
-            .map_err(store_err)?;
+            .map_err(backend_err)?;
         Ok::<_, ErrorObjectOwned>(
             json!({ "workflow_id": p.workflow_id, "version": p.version, "status": "published" }),
         )
@@ -239,15 +128,15 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
         }
         let p: P = parse(&params)?;
         let version = state
-            .store
+            .backend
             .get_version(&p.workflow_id, p.version)
             .await
-            .map_err(store_err)?;
+            .map_err(backend_err)?;
         let published_version = state
-            .store
+            .backend
             .latest_published(&p.workflow_id)
             .await
-            .map_err(store_err)?;
+            .map_err(backend_err)?;
         Ok::<_, ErrorObjectOwned>(json!({
             "workflow_id": version.workflow_id,
             "version": version.version,
@@ -259,7 +148,11 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
 
     module.register_async_method("workflow.list", |params, state, _| async move {
         let _: Value = parse(&params)?;
-        let list = state.store.list_workflows().await.map_err(store_err)?;
+        let list = state
+            .backend
+            .list_workflows()
+            .await
+            .map_err(backend_err)?;
         Ok::<_, ErrorObjectOwned>(json!({ "workflows": list }))
     })?;
 
@@ -270,10 +163,10 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
         }
         let p: P = parse(&params)?;
         state
-            .store
+            .backend
             .delete_workflow(&p.workflow_id)
             .await
-            .map_err(store_err)?;
+            .map_err(backend_err)?;
         Ok::<_, ErrorObjectOwned>(json!({ "deleted": true }))
     })?;
 
@@ -294,70 +187,19 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
             input: Option<Value>,
         }
         let p: P = parse(&params)?;
-
-        let version = match p.version {
-            Some(version) => version,
-            None => state
-                .store
-                .latest_published(&p.workflow_id)
-                .await
-                .map_err(store_err)?
-                .ok_or_else(|| {
-                    invalid(format!(
-                        "工作流 {} 没有已发布版本，先 publish 再执行",
-                        p.workflow_id
-                    ))
-                })?,
-        };
-        let stored = state
-            .store
-            .get_version(&p.workflow_id, Some(version))
+        let created = state
+            .backend
+            .create_run(flow_backend::CreateRun {
+                workflow_id: p.workflow_id,
+                version: p.version,
+                input: p.input.unwrap_or(Value::Null),
+            })
             .await
-            .map_err(store_err)?;
-        if !stored.is_published() {
-            return Err(store_err(StoreError::VersionNotPublished(
-                p.workflow_id,
-                version,
-            )));
-        }
-        let definition: Definition = serde_json::from_value(stored.definition)
-            .map_err(|e| invalid(format!("定义结构非法：{e}")))?;
-        definition.validate().map_err(invalid)?;
-
-        let input = p.input.unwrap_or(Value::Null);
-        let run_id = uuid::Uuid::now_v7().to_string();
-        state
-            .store
-            .insert_run(
-                &run_id,
-                &p.workflow_id,
-                version,
-                &input,
-                DbRunStatus::Initializing.as_str(),
-            )
-            .await
-            .map_err(store_err)?;
-
-        let spec = StartRun {
-            run_id: run_id.clone(),
-            workflow_id: p.workflow_id.clone(),
-            workflow_version: version,
-            definition,
-            input,
-            depth: 0,
-        };
-        if let Err(err) = state.engine.start_run(spec).await {
-            let message = err.to_string();
-            if let Err(write_err) = state
-                .store
-                .set_run_status(&run_id, DbRunStatus::Failed.as_str(), None, Some(&message))
-                .await
-            {
-                tracing::error!(run_id = %run_id, error = %write_err, "回写 run failed 状态失败");
-            }
-            return Err(engine_err(err));
-        }
-        Ok::<_, ErrorObjectOwned>(json!({ "run_id": run_id, "workflow_version": version }))
+            .map_err(backend_err)?;
+        Ok::<_, ErrorObjectOwned>(json!({
+            "run_id": created.run_id,
+            "workflow_version": created.workflow_version,
+        }))
     })?;
 
     module.register_async_method("run.get", |params, state, _| async move {
@@ -366,10 +208,10 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
             run_id: String,
         }
         let p: P = parse(&params)?;
-        let run = state.store.get_run(&p.run_id).await.map_err(store_err)?;
+        let run = state.backend.get_run(&p.run_id).await.map_err(backend_err)?;
         Ok::<_, ErrorObjectOwned>(json!({
             "run": run,
-            "live": state.engine.is_live(&p.run_id),
+            "live": state.backend.is_live(&p.run_id),
         }))
     })?;
 
@@ -383,13 +225,13 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
         }
         let p: P = parse(&params)?;
         let runs = state
-            .store
+            .backend
             .list_runs(
                 p.workflow_id.as_deref(),
                 p.limit.unwrap_or(50).clamp(1, 500),
             )
             .await
-            .map_err(store_err)?;
+            .map_err(backend_err)?;
         Ok::<_, ErrorObjectOwned>(json!({ "runs": runs }))
     })?;
 
@@ -400,16 +242,16 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
             run_id: String,
         }
         let p: P = parse(&params)?;
-        let run = state.store.get_run(&p.run_id).await.map_err(store_err)?;
+        let run = state.backend.get_run(&p.run_id).await.map_err(backend_err)?;
         let stored = state
-            .store
+            .backend
             .get_version(&run.workflow_id, Some(run.workflow_version))
             .await
-            .map_err(store_err)?;
+            .map_err(backend_err)?;
         let definition: Definition = serde_json::from_value(stored.definition)
             .map_err(|e| internal(format!("定义结构非法：{e}")))?;
         let snapshot = state
-            .engine
+            .backend
             .snapshot(&p.run_id)
             .await
             .map_err(|e| internal(format!("读取事件日志失败：{e}")))?;
@@ -432,55 +274,90 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
             from_seq: Option<u64>,
         }
         let p: P = parse(&params)?;
-        let events: Vec<Envelope> = state
-            .engine
+        let events = state
+            .backend
             .read_events(&p.run_id, p.from_seq)
             .await
-            .map_err(engine_err)?;
+            .map_err(backend_err)?;
         Ok::<_, ErrorObjectOwned>(json!({ "events": events }))
     })?;
 
+    // 取消：SQLite 仅对活着的 run 生效（conflict）；Postgres 经持久 inbox 消费。
     module.register_async_method("run.cancel", |params, state, _| async move {
         #[derive(Deserialize)]
         struct P {
             run_id: String,
+            #[serde(default)]
+            signal_id: Option<String>,
         }
         let p: P = parse(&params)?;
-        if state.engine.cancel(&p.run_id).await {
-            return Ok::<_, ErrorObjectOwned>(json!({ "cancelling": true }));
-        }
-        let run = state.store.get_run(&p.run_id).await.map_err(store_err)?;
-        Err(conflict(format!(
-            "run {} 当前不在运行中（状态 {}）",
-            p.run_id, run.status
-        )))
+        let ack = state
+            .backend
+            .cancel(&p.run_id, p.signal_id)
+            .await
+            .map_err(backend_err)?;
+        signal_ack_value(ack)
     })?;
 
-    // human_task 交付信号；崩溃残留的副作用节点用 payload.action = retry/succeeded/failed 裁决
+    // human_task 交付信号；崩溃残留的副作用节点用 payload.action = retry/succeeded/failed 裁决。
+    // signal_id 在 Postgres 后端必填且重试复用；SQLite 后端可省略（同步交付）。
     module.register_async_method("run.signal", |params, state, _| async move {
         #[derive(Deserialize)]
         struct P {
             run_id: String,
+            #[serde(default)]
+            signal_id: Option<String>,
             node_id: String,
             #[serde(default)]
             payload: Value,
         }
         let p: P = parse(&params)?;
-        state
-            .engine
-            .signal(
-                &p.run_id,
-                Signal {
-                    node_id: p.node_id,
-                    payload: p.payload,
-                },
-            )
+        let ack = state
+            .backend
+            .signal(flow_backend::SignalRequest {
+                run_id: p.run_id,
+                signal_id: p.signal_id,
+                node_id: p.node_id,
+                payload: p.payload,
+            })
             .await
-            .map_err(|e| conflict(e.to_string()))?;
-        Ok::<_, ErrorObjectOwned>(json!({ "delivered": true }))
+            .map_err(backend_err)?;
+        signal_ack_value(ack)
     })?;
 
-    // 执行进度推送（JSON-RPC 2.0 订阅通知）
+    // 信号落账查询：pg 专属能力，在唯一的注册点 match 暴露。
+    // SQLite 信号是进程内同步交付，没有账可查——不进 AnyBackend 公共面，
+    // 也不会伪造一个查不到的 id。
+    module.register_async_method("run.signal_status", |params, state, _| async move {
+        #[derive(Deserialize)]
+        struct P {
+            run_id: String,
+            signal_id: String,
+        }
+        let p: P = parse(&params)?;
+        let ack = match &state.backend {
+            AnyBackend::Postgres(b) => {
+                b.signal_status(&p.run_id, &p.signal_id)
+                    .await
+                    .map_err(backend_err)?
+            }
+            AnyBackend::Sqlite(_) => {
+                return Err(invalid(
+                    "run.signal_status 仅 Postgres 后端提供；SQLite 后端的信号在进程内同步交付，无持久 inbox 可查",
+                ))
+            }
+        };
+        Ok::<_, ErrorObjectOwned>(json!({
+            "signal_id": ack.signal_id,
+            "status": ack.status,
+            "delivered": ack.delivered,
+            "event_seq": ack.event_seq,
+            "error": ack.error,
+        }))
+    })?;
+
+    // 执行进度推送（JSON-RPC 2.0 订阅通知）。推送机制由后端吸收：
+    // SQLite 是进程内 broadcast；Postgres 按 run_id 维护 last_seq 轮询共享日志。
     module.register_subscription(
         "run.subscribe",
         "run.event",
@@ -498,7 +375,7 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
                     return;
                 }
             };
-            let mut events = state.engine.subscribe();
+            let mut events = state.backend.subscribe(filter);
             let sink = match pending.accept().await {
                 Ok(sink) => sink,
                 Err(_) => return,
@@ -506,14 +383,12 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
             loop {
                 tokio::select! {
                     _ = sink.closed() => break,
-                    received = events.recv() => match received {
-                        Ok(envelope) => {
-                            if let Some(filter) = &filter {
-                                if envelope.run_id != *filter {
-                                    continue;
-                                }
-                            }
-                            match SubscriptionMessage::from_json(&envelope) {
+                    received = events.next() => match received {
+                        Some(envelope) => {
+                            // jsonrpsee 0.26：通知消息需显式携带方法名与订阅 id
+                            match SubscriptionMessage::new("run.event", sink.subscription_id(), &envelope)
+                                .map_err(|e| internal(format!("事件序列化失败：{e}")))
+                            {
                                 Ok(message) => {
                                     if sink.send(message).await.is_err() {
                                         break;
@@ -522,8 +397,8 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
                                 Err(_) => break,
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(_) => break,
+                        // 流结束：指定 run 已终结追平（Postgres），或引擎通道关闭
+                        None => break,
                     },
                 }
             }
@@ -579,6 +454,50 @@ pub(crate) fn timeline_value(
         "last_seq": snapshot.last_seq,
         "nodes": nodes,
     })
+}
+
+/// 信号/取消请求的响应语义（DISTRIBUTED.md §6.1，两种后端共用）：
+/// delivered=true 才是交付；rejected 返回 invalid/conflict 错误体系；
+/// pending 返回明确的 pending 结果和 signal_id，客户端用 run.signal_status 查询。
+fn signal_ack_value(ack: SignalAck) -> Result<Value, ErrorObjectOwned> {
+    if ack.delivered {
+        let mut body = json!({ "delivered": true });
+        // signal_id 只在真有一个可查询的 id 时出现（Postgres inbox 落账）；
+        // SQLite 同步交付只回显客户端提供的 id，不伪造
+        if let Some(id) = ack.signal_id {
+            body["signal_id"] = json!(id);
+        }
+        if let Some(seq) = ack.event_seq {
+            body["event_seq"] = json!(seq);
+        }
+        return Ok(body);
+    }
+    if ack.status == "rejected" {
+        let error = ack.error.clone().unwrap_or_else(|| json!({}));
+        let code = error
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("invalid");
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("信号被拒绝")
+            .to_string();
+        return Err(if code == "conflict" {
+            conflict(message)
+        } else {
+            invalid(message)
+        });
+    }
+    let mut body = json!({
+        "delivered": false,
+        "pending": true,
+        "status": ack.status,
+    });
+    if let Some(id) = ack.signal_id {
+        body["signal_id"] = json!(id);
+    }
+    Ok(body)
 }
 
 /// 前端拖拽面板 + 参数表单所需的能力清单。
@@ -720,74 +639,20 @@ pub(crate) fn internal(message: impl Into<String>) -> ErrorObjectOwned {
     ErrorObject::owned(CODE_INTERNAL, message.into(), None::<()>)
 }
 
-fn store_err(err: StoreError) -> ErrorObjectOwned {
+/// 适配层错误 → JSON-RPC 错误码。唯一映射点：RPC 层不再分叉处理具体后端错误。
+/// 没有 Unsupported 分支——公共面上的方法两个后端都会做；
+/// 后端专属能力在方法注册点 match 时已经处理。
+pub(crate) fn backend_err(err: BackendError) -> ErrorObjectOwned {
     match err {
-        StoreError::WorkflowNotFound(_)
-        | StoreError::VersionNotFound(..)
-        | StoreError::RunNotFound(_) => {
+        BackendError::WorkflowNotFound(_)
+        | BackendError::VersionNotFound(..)
+        | BackendError::RunNotFound(_) => {
             ErrorObject::owned(CODE_NOT_FOUND, err.to_string(), None::<()>)
         }
-        StoreError::VersionNotPublished(..) => conflict(err.to_string()),
-        other => internal(other.to_string()),
-    }
-}
-
-fn engine_err(err: EngineError) -> ErrorObjectOwned {
-    match err {
-        EngineError::RunNotFound(_) => {
-            ErrorObject::owned(CODE_NOT_FOUND, err.to_string(), None::<()>)
+        BackendError::VersionNotPublished(..) | BackendError::Conflict(_) => {
+            conflict(err.to_string())
         }
-        EngineError::RunExists(_) => conflict(err.to_string()),
-        EngineError::InvalidDefinition(_) | EngineError::Node(_) | EngineError::Expr(_) => {
-            invalid(err.to_string())
-        }
-        other => internal(other.to_string()),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 状态词汇表契约：引擎 DbRunStatus 的每个取值都必须被 store 接受；
-    /// 词汇表外的字符串必须在写入时被拒绝——否则 run 会从崩溃恢复扫描里静默消失。
-    #[tokio::test]
-    async fn engine_run_statuses_are_the_only_statuses_store_accepts() {
-        let root =
-            std::env::temp_dir().join(format!("flow-rpc-status-contract-{}", uuid::Uuid::now_v7()));
-        let store = Store::open(root.join("flow.db")).await.unwrap();
-
-        let statuses = [
-            DbRunStatus::Initializing,
-            DbRunStatus::Running,
-            DbRunStatus::AwaitingResume,
-            DbRunStatus::Succeeded,
-            DbRunStatus::Failed,
-            DbRunStatus::Cancelled,
-        ];
-        for (i, status) in statuses.iter().enumerate() {
-            let run_id = format!("r-{i}");
-            store
-                .insert_run(&run_id, "wf", 1, &Value::Null, status.as_str())
-                .await
-                .unwrap();
-            store
-                .set_run_status(&run_id, status.as_str(), None, None)
-                .await
-                .unwrap();
-        }
-
-        // 非终态必须进入未完成扫描（这是恢复的输入）
-        assert_eq!(store.unfinished_runs().await.unwrap().len(), 3);
-
-        // 词汇表外的状态在写入时当场报错
-        let err = store
-            .insert_run("r-unknown", "wf", 1, &Value::Null, "paused")
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("paused"), "{err}");
-
-        drop(store);
-        std::fs::remove_dir_all(root).unwrap();
+        BackendError::Invalid(_) => invalid(err.to_string()),
+        BackendError::Internal(_) => internal(err.to_string()),
     }
 }

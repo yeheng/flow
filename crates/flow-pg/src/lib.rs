@@ -39,10 +39,12 @@ pub struct PgEngine {
     executor: Option<Arc<ExecutorState>>,
 }
 
-/// run.start 的输入。
+/// run.start 的输入。`version` 必须是已解析的 published 版本——
+/// 「只有 published 可执行 + 创建前校验定义」这条规则单点在 flow-backend 的
+/// `resolve_runnable_definition`，本方法不重复实现（DISTRIBUTED.md §3）。
 pub struct CreateRun {
     pub workflow_id: String,
-    pub version: Option<i64>,
+    pub version: i64,
     pub input: Value,
 }
 
@@ -113,53 +115,23 @@ impl PgEngine {
 
     // ---- gateway：run.start ----
 
-    /// 校验 published 版本 → 单事务插入 run + seq=1 RunStarted（§3）。
+    /// 单事务创建 run：校验后的版本号 → insert run + seq=1 RunStarted（§3）。
     /// 提交后 run 已入队（running、lease 为空），由 executor 扫描获得执行容量。
+    /// 版本解析与定义校验在适配层（flow-backend）单点完成。
     pub async fn create_run(&self, spec: CreateRun) -> Result<CreatedRun, PgError> {
-        let version = match spec.version {
-            Some(v) => v,
-            None => self
-                .store
-                .latest_published(&spec.workflow_id)
-                .await?
-                .ok_or_else(|| {
-                    PgError::Invalid(format!(
-                        "工作流 {} 没有已发布版本，先 publish 再执行",
-                        spec.workflow_id
-                    ))
-                })?,
-        };
-        let stored = self
-            .store
-            .get_version(&spec.workflow_id, Some(version))
-            .await?;
-        if !stored.is_published() {
-            return Err(PgError::Conflict(format!(
-                "workflow {} v{version} 尚未发布",
-                spec.workflow_id
-            )));
-        }
-        // 定义结构在创建前校验一次（执行侧 executor 也会再校验）
-        let definition: flow_engine::Definition = serde_json::from_value(stored.definition.clone())
-            .map_err(|e| PgError::Invalid(format!("定义结构非法：{e}")))?;
-        definition
-            .validate()
-            .map_err(|e| PgError::Invalid(format!("工作流定义非法：{e}")))?;
-
         let run_id = uuid::Uuid::now_v7().to_string();
-        // RPC 入口创建的都是根 run（深度 0）；sub_workflow 子 run 走 PgChildLauncher
         lease::create_run(
             &self.pool,
             &run_id,
             &spec.workflow_id,
-            version,
+            spec.version,
             &spec.input,
             0,
         )
         .await?;
         Ok(CreatedRun {
             run_id,
-            workflow_version: version,
+            workflow_version: spec.version,
         })
     }
 
