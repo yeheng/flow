@@ -272,7 +272,26 @@ pub async fn create_run(
     .bind(started)
     .execute(&mut *tx)
     .await?;
+    queue_event_notify(&mut tx, run_id).await?;
     tx.commit().await?;
+    Ok(())
+}
+
+/// 事件提交后唤醒订阅者（DISTRIBUTED.md §8）：与事件插入同一事务，提交时才投递。
+/// 载荷只带 run_id（NOTIFY 载荷上限 8000 字节），事件本体始终由 read_events
+/// 按游标读取；通知只是低延迟提示，丢失由订阅方兜底轮询兜住。
+pub(crate) async fn queue_event_notify(
+    tx: &mut PgConnection,
+    run_id: &str,
+) -> Result<(), sqlx::Error> {
+    // 频道名是编译期常量，无注入面（sqlx 0.9 的 SqlSafeStr 要求）
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT pg_notify('{}', $1)",
+        crate::EVENTS_CHANNEL
+    )))
+    .bind(run_id)
+    .execute(&mut *tx)
+    .await?;
     Ok(())
 }
 

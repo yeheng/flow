@@ -25,11 +25,55 @@ use tokio_util::sync::CancellationToken;
 pub use child::PgChildLauncher;
 pub use config::{PgConfig, Role};
 pub use error::PgError;
+use executor::ExecutorState;
+use flow_engine::{Envelope, RunState};
 pub use metadata::{RunRecord, WorkflowSummary, WorkflowVersion};
 pub use sink::PgRunSink;
 
-use executor::ExecutorState;
-use flow_engine::{Envelope, RunState};
+/// 事件通知频道（§8）：run_events 每次提交后 NOTIFY 一次，载荷为 run_id。
+pub const EVENTS_CHANNEL: &str = "flow_events";
+
+/// 事件通知流（§8 的低延迟提示）：任意 run 提交事件后产出其 run_id。
+/// 返回前已完成 LISTEN，调用方随后产生的事件必然可达；
+/// 连接中断自动退避重连，断开期间的通知由消费方的兜底轮询兜住。
+pub async fn event_notifications(
+    pool: &PgPool,
+) -> Result<tokio::sync::mpsc::Receiver<String>, PgError> {
+    let listener = sqlx::postgres::PgListener::connect_with(pool).await?;
+    let pool = pool.clone();
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(256);
+    tokio::spawn(async move {
+        let mut listener = listener;
+        let mut backoff = Duration::from_millis(200);
+        loop {
+            if let Err(err) = listener.listen(EVENTS_CHANNEL).await {
+                tracing::warn!("pg LISTEN {EVENTS_CHANNEL} 失败：{err}");
+            } else {
+                backoff = Duration::from_millis(200);
+                loop {
+                    match listener.recv().await {
+                        Ok(note) => {
+                            if tx.send(note.payload().to_string()).await.is_err() {
+                                return; // 订阅方已 drop
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!("pg 事件通知接收失败，{backoff:?} 后重连：{err}");
+                            break;
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(5));
+            match sqlx::postgres::PgListener::connect_with(&pool).await {
+                Ok(new) => listener = new,
+                Err(err) => tracing::warn!("pg 事件通知重连失败：{err}"),
+            }
+        }
+    });
+    Ok(rx)
+}
 
 /// Postgres 后端引擎门面：gateway 入口 + executor + 只读查询。
 pub struct PgEngine {
@@ -99,6 +143,13 @@ impl PgEngine {
 
     pub fn config(&self) -> &PgConfig {
         &self.cfg
+    }
+
+    /// 事件通知流（§8 低延迟提示），见 [`event_notifications`]。
+    pub async fn event_notifications(
+        &self,
+    ) -> Result<tokio::sync::mpsc::Receiver<String>, PgError> {
+        event_notifications(&self.pool).await
     }
 
     pub fn instance_id(&self) -> Option<&str> {

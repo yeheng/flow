@@ -81,6 +81,9 @@ impl ChildRunLauncher for PgChildLauncher {
         Box::pin(async move {
             let store = PgStore::new(self.pool.clone());
             let poll = self.cfg.subscribe_poll.max(Duration::from_millis(50));
+            // 终态事件提交时带 NOTIFY（§8）：正常路径毫秒级唤醒；poll 只是通知
+            // 丢失时的兜底（如无事件落库的 reconcile_terminal 修正路径）。
+            let mut notify = crate::event_notifications(&self.pool).await.ok();
             loop {
                 let run = store
                     .get_run(child_run_id)
@@ -100,9 +103,23 @@ impl ChildRunLauncher for PgChildLauncher {
                     "cancelled" => return Ok(ChildRunOutcome::Cancelled),
                     _ => {}
                 }
-                tokio::select! {
-                    _ = cancel.cancelled() => return Ok(ChildRunOutcome::Cancelled),
-                    _ = tokio::time::sleep(poll) => {}
+                let wait = tokio::time::sleep(poll);
+                tokio::pin!(wait);
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Ok(ChildRunOutcome::Cancelled),
+                        _ = &mut wait => break,
+                        note = async { notify.as_mut().unwrap().recv().await }, if notify.is_some() => {
+                            match note {
+                                // 无关 run 的通知：继续等，不重置兜底计时
+                                Some(id) if id != child_run_id => {}
+                                // 本 run 的通知：立刻重查状态
+                                Some(_) => break,
+                                // 监听任务退出：摘掉监听臂，退化为纯兜底轮询
+                                None => notify = None,
+                            }
+                        }
+                    }
                 }
             }
         })

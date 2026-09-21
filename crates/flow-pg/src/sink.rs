@@ -96,6 +96,10 @@ impl PgRunSink {
         .map_err(Self::sql_err)?;
         let seq: i64 = rec.try_get("seq").map_err(Self::sql_err)?;
         let ts: DateTime<Utc> = rec.try_get("ts").map_err(Self::sql_err)?;
+        // 与插入同事务 NOTIFY（§8 低延迟提示），提交时才投递
+        lease::queue_event_notify(tx, &self.run_id)
+            .await
+            .map_err(Self::sql_err)?;
         Ok((seq as u64, ts))
     }
 

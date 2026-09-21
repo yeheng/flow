@@ -228,8 +228,10 @@ gateway 不得通过直接清租约或只改 status 实现取消。
 
 ## 8. 查询与订阅
 
-`run.timeline`/`run.events` 从共享日志读取。订阅者按 run_id 维护 last_seq 并轮询增量，
-本地 broadcast 仅作低延迟提示；进程接管不能改变订阅源的正确性。
+`run.timeline`/`run.events` 从共享日志读取。订阅者按 run_id 维护 last_seq 游标拉取增量，
+LISTEN/NOTIFY（频道 `flow_events`，载荷仅 run_id）仅作低延迟唤醒提示；正确性不依赖
+通知——通知可丢失（断连期间），由 subscribe_poll 兜底轮询兜住；进程接管不能改变
+订阅源的正确性。等待子 run 终态（child.rs）复用同一通知频道加兜底轮询。
 from_seq 的 API 语义保留现有闭区间，客户端传 last_seq+1。
 增量读取在 SQL 层下推过滤（`WHERE seq >= from`），只校验相邻 seq 连续；
 全量读取（接管恢复、`from_events`）仍要求首条为 1 + 相邻连续。
@@ -251,7 +253,8 @@ NodeStarted 丢失可能让已经发生的副作用被再次执行。Postgres �
 ## 10. 部署配置
 
 规划配置：FLOW_BACKEND、FLOW_DATABASE_URL、FLOW_NODE_ID（展示名）、启动时生成的 instance UUID、
-FLOW_LEASE_TTL_MS、FLOW_MAX_RUNS、FLOW_SCAN_INTERVAL_MS、FLOW_SUBSCRIBE_POLL_MS。
+FLOW_LEASE_TTL_MS、FLOW_MAX_RUNS、FLOW_SCAN_INTERVAL_MS、FLOW_SUBSCRIBE_POLL_MS
+（订阅兜底轮询间隔，默认 10s；NOTIFY 是正常路径）。
 TTL/续期/轮询间隔在实施阶段依据数据库延迟实测设定。长事务必须另设锁和语句超时。
 
 可拆分 gateway 与 executor 池。Postgres 模式下 FLOW_DATA_DIR 仅是缓存；备份必须覆盖
@@ -289,5 +292,5 @@ Driver 在单机/Postgres 两种后端上共用同一份调度与恢复语义。
 
 ### Phase 3：有数据支持的优化
 
-再评估批量事件提交、LISTEN/NOTIFY 和 delay 剩余时间恢复。
+再评估批量事件提交和 delay 剩余时间恢复（LISTEN/NOTIFY 唤醒已实现，见 §8）。
 任何优化仍须保持先持久化 NodeStarted 再发副作用，不允许通过放弃已确认事件持久性换吞吐。

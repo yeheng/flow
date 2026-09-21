@@ -28,7 +28,8 @@ pub struct PgConfig {
     pub signal_wait: Duration,
     /// gateway 等待落账的轮询间隔。
     pub signal_poll: Duration,
-    /// 订阅轮询间隔（§8：订阅者按 run_id 维护 last_seq 并轮询增量）。
+    /// 订阅兜底轮询间隔（§8：LISTEN/NOTIFY 唤醒是正常路径，此项只是通知丢失
+    /// 时的安全网；也是 child.rs 等待子 run 终态的兜底间隔）。
     pub subscribe_poll: Duration,
     /// 语句超时（§5.1：锁等待、语句执行和 idle transaction 必须有超时）。
     pub statement_timeout: Duration,
@@ -46,7 +47,7 @@ impl Default for PgConfig {
             max_runs: 8,
             signal_wait: Duration::from_secs(10),
             signal_poll: Duration::from_millis(200),
-            subscribe_poll: Duration::from_millis(500),
+            subscribe_poll: Duration::from_secs(10),
             statement_timeout: Duration::from_secs(10),
             lock_timeout: Duration::from_secs(10),
             idle_tx_timeout: Duration::from_secs(10),
@@ -84,7 +85,7 @@ impl PgConfig {
             max_runs: env_usize("FLOW_MAX_RUNS", 8),
             signal_wait: env_ms("FLOW_SIGNAL_WAIT_MS", 10_000),
             signal_poll: env_ms("FLOW_SIGNAL_POLL_MS", 200),
-            subscribe_poll: env_ms("FLOW_SUBSCRIBE_POLL_MS", 500),
+            subscribe_poll: env_ms("FLOW_SUBSCRIBE_POLL_MS", 10_000),
             statement_timeout: env_ms("FLOW_STATEMENT_TIMEOUT_MS", 10_000),
             lock_timeout: env_ms("FLOW_LOCK_TIMEOUT_MS", 10_000),
             idle_tx_timeout: env_ms("FLOW_IDLE_TX_TIMEOUT_MS", 10_000),

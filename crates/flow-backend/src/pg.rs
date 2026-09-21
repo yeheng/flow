@@ -5,7 +5,8 @@
 //! - run 创建：单事务原子创建（insert run + seq=1 RunStarted），无 initializing 段；
 //!   published 解析与定义校验单点在 `resolve_runnable_definition`；
 //! - 信号/取消：持久 inbox + 等待落账，可能返回 pending；signal_id 必填且稳定复用；
-//! - 订阅：按 run_id 维护 last_seq 轮询共享日志（DISTRIBUTED.md §8）；
+//! - 订阅：按 run_id 维护 last_seq 游标拉取共享日志，LISTEN/NOTIFY 作低延迟唤醒
+//!   （DISTRIBUTED.md §8）；
 //! - 生命周期：start 起 executor 扫描循环（gateway 角色跳过），shutdown 优雅停机。
 
 use std::collections::{HashMap, HashSet};
@@ -250,8 +251,10 @@ impl PgBackend {
             .map_err(pg_err)
     }
 
-    /// 订阅：按 run_id 维护 last_seq 轮询增量（DISTRIBUTED.md §8）。游标只在确认
+    /// 订阅：按 run_id 维护 last_seq 游标拉取增量（DISTRIBUTED.md §8）。游标只在确认
     /// 转发后推进，重复消息按 seq 去重（游标本体），缺口由 run.events 补齐。
+    /// LISTEN/NOTIFY 是低延迟唤醒提示；正确性不依赖通知，通知丢失由
+    /// subscribe_poll 兜底轮询兜住。
     /// 指定 run_id 且该 run 已终结追平后，流自然结束。
     pub fn subscribe(
         &self,
@@ -262,6 +265,15 @@ impl PgBackend {
         tokio::spawn(async move {
             let filter = run_id;
             let poll = engine.config().subscribe_poll;
+            // 先挂监听再扫描，缩小「扫描后、LISTEN 生效前」的通知丢失窗口
+            // （残余窗口仍由兜底轮询兜住）。
+            let mut notify = match engine.event_notifications().await {
+                Ok(rx) => Some(rx),
+                Err(err) => {
+                    tracing::warn!("pg 事件监听不可用，退化为纯兜底轮询：{err}");
+                    None
+                }
+            };
             // 时钟偏差留 5s 余量：捕获订阅开始前后的新 run
             let sub_start = chrono::Utc::now() - chrono::Duration::seconds(5);
             // run_id -> 已确认转发的 last_seq
@@ -324,7 +336,32 @@ impl PgBackend {
                         }
                     }
                 }
-                tokio::time::sleep(poll).await;
+                // 等待下一次扫描：NOTIFY 唤醒（快路径）或兜底轮询到期。
+                // 通知在扫描期间积压在 channel 里，不会丢失唤醒。
+                let wait = tokio::time::sleep(poll);
+                tokio::pin!(wait);
+                loop {
+                    tokio::select! {
+                        _ = tx.closed() => return,
+                        _ = &mut wait => break,
+                        note = async { notify.as_mut().unwrap().recv().await }, if notify.is_some() => {
+                            match note {
+                                // 无关 run 的通知：继续等，不重置兜底计时
+                                Some(id) if filter.as_ref().is_some_and(|f| f != &id) => {}
+                                Some(_) => {
+                                    // 排空积压通知再扫描：突发事件合并成一次扫描，
+                                    // 避免扫描次数随事件数线性增长
+                                    if let Some(rx) = notify.as_mut() {
+                                        while rx.try_recv().is_ok() {}
+                                    }
+                                    break;
+                                }
+                                // 监听任务退出：摘掉监听臂，退化为纯兜底轮询
+                                None => notify = None,
+                            }
+                        }
+                    }
+                }
             }
         });
         ReceiverStream::new(rx).boxed()

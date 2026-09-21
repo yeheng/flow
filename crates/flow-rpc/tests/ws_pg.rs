@@ -107,9 +107,19 @@ struct ServerProc {
 impl ServerProc {
     /// role: all | gateway | executor
     fn spawn(db_url: &str, role: &str, signal_wait_ms: u64) -> ServerProc {
+        Self::spawn_with(db_url, role, signal_wait_ms, &[])
+    }
+
+    /// extra_env 覆盖默认环境变量（如拉长 FLOW_SUBSCRIBE_POLL_MS 证明 NOTIFY 唤醒）。
+    fn spawn_with(
+        db_url: &str,
+        role: &str,
+        signal_wait_ms: u64,
+        extra_env: &[(&str, &str)],
+    ) -> ServerProc {
         let addr = free_port();
-        let child = Command::new(env!("CARGO_BIN_EXE_flow-server"))
-            .env("FLOW_BACKEND", "postgres")
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_flow-server"));
+        cmd.env("FLOW_BACKEND", "postgres")
             .env("FLOW_DATABASE_URL", db_url)
             .env("FLOW_ROLE", role)
             .env("FLOW_ADDR", addr.to_string())
@@ -120,9 +130,11 @@ impl ServerProc {
             .env("FLOW_SIGNAL_WAIT_MS", signal_wait_ms.to_string())
             .env("RUST_LOG", "info,flow_pg=debug")
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("启动 flow-server (postgres) 失败");
+            .stderr(Stdio::inherit());
+        for (key, value) in extra_env {
+            cmd.env(key, value);
+        }
+        let child = cmd.spawn().expect("启动 flow-server (postgres) 失败");
         let proc = ServerProc { child, addr };
         wait_ready(addr);
         proc
@@ -584,8 +596,49 @@ async fn subscription_streams_events_in_order() {
     db.close().await;
 }
 
+/// §8：LISTEN/NOTIFY 是订阅的低延迟唤醒路径。服务端兜底轮询拉长到 30s：
+/// 纯轮询下订阅开始后新 run 的事件必然等 30s，10s 内收到 run_completed
+/// 只能来自 NOTIFY 唤醒。
+#[tokio::test]
+async fn subscription_woken_by_notify_not_poll() {
+    let Some(db) = test_db().await else { return };
+    let mut server =
+        ServerProc::spawn_with(&db.url, "all", 5000, &[("FLOW_SUBSCRIBE_POLL_MS", "30000")]);
+    let client = server.client().await;
+
+    let (wf, _) = publish(&client, "通知唤醒", line_def("return 'hi';")).await;
+
+    let mut sub = client
+        .subscribe::<Value, _>("run.subscribe", named(json!({})), "run.unsubscribe")
+        .await
+        .expect("订阅失败");
+    // 等服务端订阅任务完成 LISTEN（subscribe 流建立是异步的）
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let started: Value = call(&client, "run.start", json!({"workflow_id": wf})).await;
+    let run_id = started["run_id"].as_str().unwrap().to_string();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let msg = tokio::time::timeout_at(deadline, sub.next())
+            .await
+            .expect("10s 内未收到 run_completed：NOTIFY 唤醒失效，只剩 30s 兜底轮询")
+            .expect("订阅流结束");
+        let envelope = match msg {
+            Ok(v) => v,
+            Err(err) => panic!("订阅错误：{err}"),
+        };
+        if envelope["run_id"] == json!(run_id) && envelope["type"] == json!("run_completed") {
+            break;
+        }
+    }
+
+    server.kill();
+    db.close().await;
+}
+
 /// Postgres 模式的 sub_workflow：子 run 经 gateway 单事务创建（确定性 id 幂等），
-/// 父 run 轮询共享投影等待终态（父子可能落在不同 executor）。
+/// 父 run 靠 LISTEN/NOTIFY 唤醒 + 兜底轮询等待终态（父子可能落在不同 executor）。
 #[tokio::test]
 async fn postgres_sub_workflow_end_to_end() {
     let Some(db) = test_db().await else { return };
