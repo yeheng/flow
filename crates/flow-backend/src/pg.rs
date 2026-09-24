@@ -5,17 +5,17 @@
 //! - run 创建：单事务原子创建（insert run + seq=1 RunStarted），无 initializing 段；
 //!   published 解析与定义校验单点在 `resolve_runnable_definition`；
 //! - 信号/取消：持久 inbox + 等待落账，可能返回 pending；signal_id 必填且稳定复用；
-//! - 订阅：按 run_id 维护 last_seq 游标拉取共享日志，LISTEN/NOTIFY 作低延迟唤醒
-//!   （DISTRIBUTED.md §8）；
+//! - 订阅：进程内共享轮询器扇出共享日志增量（扫描次数与订阅者数无关），
+//!   LISTEN/NOTIFY 作低延迟唤醒（DISTRIBUTED.md §8）；
 //! - 生命周期：start 起 executor 扫描循环（gateway 角色跳过），shutdown 优雅停机。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use futures::StreamExt;
 use serde_json::Value;
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
-use tokio_stream::wrappers::ReceiverStream;
 
 use flow_engine::{Envelope, RunState};
 use flow_pg::{CreateRun as PgCreateRun, PgConfig, PgEngine, PgError};
@@ -251,120 +251,115 @@ impl PgBackend {
             .map_err(pg_err)
     }
 
-    /// 订阅：按 run_id 维护 last_seq 游标拉取增量（DISTRIBUTED.md §8）。游标只在确认
-    /// 转发后推进，重复消息按 seq 去重（游标本体），缺口由 run.events 补齐。
-    /// LISTEN/NOTIFY 是低延迟唤醒提示；正确性不依赖通知，通知丢失由
-    /// subscribe_poll 兜底轮询兜住。
-    /// 指定 run_id 且该 run 已终结追平后，流自然结束。
+    /// 订阅：进程内共享轮询器把共享日志的增量扇出给所有订阅者（DISTRIBUTED.md §8），
+    /// 查询次数与订阅者数无关；LISTEN/NOTIFY 是低延迟唤醒提示，正确性不依赖通知，
+    /// 通知丢失由 subscribe_poll 兜底轮询兜住。
+    /// 不指定 run_id：纯实时增量（与 SQLite 后端的 broadcast 语义一致），
+    /// 历史事件用 run.events 补齐；指定 run_id：先回放完整日志再接实时增量
+    ///（按 seq 去重、缺口自动补齐），该 run 已终结追平后流自然结束。
     pub fn subscribe(
         &self,
         run_id: Option<String>,
     ) -> futures::stream::BoxStream<'static, Envelope> {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Envelope>(256);
-        let engine = self.engine.clone();
-        tokio::spawn(async move {
-            let filter = run_id;
-            let poll = engine.config().subscribe_poll;
-            // 先挂监听再扫描，缩小「扫描后、LISTEN 生效前」的通知丢失窗口
-            // （残余窗口仍由兜底轮询兜住）。
-            let mut notify = match engine.event_notifications().await {
-                Ok(rx) => Some(rx),
-                Err(err) => {
-                    tracing::warn!("pg 事件监听不可用，退化为纯兜底轮询：{err}");
-                    None
+        let Some(run_id) = run_id else {
+            return crate::broadcast_tail(self.engine.subscribe_events(), None);
+        };
+        // 先挂共享流再回放历史：回放期间的新事件暂存在广播通道里，
+        // 按 seq 去重后接续，无缝且不重复
+        let rx = self.engine.subscribe_events();
+        let tail = RunTail::new(self.engine.clone(), rx, run_id);
+        futures::stream::unfold(tail, |mut tail| async move {
+            tail.advance().await.map(|env| (env, tail))
+        })
+        .boxed()
+    }
+}
+
+/// 指定 run 的「回放 + 实时追流」状态机：回放从 seq=1 起，
+/// 实时段按 seq 去重（游标本体），缺口用 run.events 补齐，
+/// 终态事件转发后流自然结束。
+struct RunTail {
+    engine: Arc<PgEngine>,
+    rx: broadcast::Receiver<Envelope>,
+    run_id: String,
+    last_seq: u64,
+    backlog: VecDeque<Envelope>,
+    backfilled: bool,
+    done: bool,
+}
+
+impl RunTail {
+    fn new(engine: Arc<PgEngine>, rx: broadcast::Receiver<Envelope>, run_id: String) -> RunTail {
+        RunTail {
+            engine,
+            rx,
+            run_id,
+            last_seq: 0,
+            backlog: VecDeque::new(),
+            backfilled: false,
+            done: false,
+        }
+    }
+
+    async fn advance(&mut self) -> Option<Envelope> {
+        loop {
+            while let Some(envelope) = self.backlog.pop_front() {
+                // 补齐段与实时段重叠产生的重复：按 seq 去重
+                if envelope.seq <= self.last_seq {
+                    continue;
                 }
-            };
-            // 时钟偏差留 5s 余量：捕获订阅开始前后的新 run
-            let sub_start = chrono::Utc::now() - chrono::Duration::seconds(5);
-            // run_id -> 已确认转发的 last_seq
-            let mut cursors: HashMap<String, u64> = HashMap::new();
-            // 已终结且追平、不必再查的 run
-            let mut drained: HashSet<String> = HashSet::new();
-            loop {
-                if tx.is_closed() {
-                    tracing::debug!("pg subscribe: sink closed, exit");
-                    break;
+                self.last_seq = envelope.seq;
+                if envelope.event.is_run_terminal() {
+                    self.done = true;
                 }
-                // 候选：过滤指定的 run，或（活跃 ∪ 订阅后创建）∪ 尚在游标中的 run
-                // 短 run 可能在两次轮询之间走完一生：按 started_at 捕获订阅开始后的新 run。
-                let mut candidates: Vec<(String, bool)> = Vec::new();
-                if let Some(run_id) = &filter {
-                    let terminal = match engine.store().get_run(run_id).await {
-                        Ok(run) => !matches!(run.status.as_str(), "running" | "awaiting_resume"),
-                        Err(_) => true,
-                    };
-                    candidates.push((run_id.clone(), terminal));
-                } else {
-                    let watched = engine.watch_runs(sub_start).await.unwrap_or_default();
-                    for (run_id, terminal) in watched {
-                        candidates.push((run_id, terminal));
+                return Some(envelope);
+            }
+            if self.done {
+                return None;
+            }
+            if !self.backfilled {
+                // 回放完整历史（run 可能已终结：回放含终态事件，流将自然结束）
+                self.backfilled = true;
+                self.fill(1).await;
+                continue;
+            }
+            match self.rx.recv().await {
+                Ok(envelope) if envelope.run_id == self.run_id => {
+                    if envelope.seq > self.last_seq + 1 {
+                        // 缺口（广播 Lagged 或共享轮询跳过）：先补齐再接续
+                        self.fill(self.last_seq + 1).await;
                     }
-                    for run_id in cursors.keys() {
-                        if !candidates.iter().any(|(id, _)| id == run_id) {
-                            candidates.push((run_id.clone(), true));
-                        }
-                    }
+                    self.backlog.push_back(envelope);
                 }
-                for (run_id, terminal) in candidates {
-                    if drained.contains(&run_id) {
-                        continue;
-                    }
-                    let head = cursors.entry(run_id.clone()).or_insert(0);
-                    let events = match engine.read_events(&run_id, Some(*head + 1)).await {
-                        Ok(events) => events,
-                        Err(_) => continue,
-                    };
-                    for envelope in &events {
-                        // 只推进已确认转发的游标；转发失败即订阅者断开
-                        if tx.send(envelope.clone()).await.is_err() {
-                            return;
-                        }
-                        *head = envelope.seq;
-                    }
-                    if terminal && events.is_empty() {
-                        // 终结且已追平：丢弃游标
-                        cursors.remove(&run_id);
-                        drained.insert(run_id.clone());
-                        // 已终结 run 无限累积会撑爆订阅生命周期内的内存；
-                        // 超阈值整体清空只损失一点轮询冗余（终态 run 重查一次即空）
-                        if drained.len() > 4096 {
-                            drained.clear();
-                            tracing::warn!("订阅 drained 集超过 4096，整体清空");
-                        }
-                        if filter.is_some() {
-                            return; // 指定 run 已终结：订阅自然结束
-                        }
-                    }
-                }
-                // 等待下一次扫描：NOTIFY 唤醒（快路径）或兜底轮询到期。
-                // 通知在扫描期间积压在 channel 里，不会丢失唤醒。
-                let wait = tokio::time::sleep(poll);
-                tokio::pin!(wait);
-                loop {
-                    tokio::select! {
-                        _ = tx.closed() => return,
-                        _ = &mut wait => break,
-                        note = async { notify.as_mut().unwrap().recv().await }, if notify.is_some() => {
-                            match note {
-                                // 无关 run 的通知：继续等，不重置兜底计时
-                                Some(id) if filter.as_ref().is_some_and(|f| f != &id) => {}
-                                Some(_) => {
-                                    // 排空积压通知再扫描：突发事件合并成一次扫描，
-                                    // 避免扫描次数随事件数线性增长
-                                    if let Some(rx) = notify.as_mut() {
-                                        while rx.try_recv().is_ok() {}
-                                    }
-                                    break;
-                                }
-                                // 监听任务退出：摘掉监听臂，退化为纯兜底轮询
-                                None => notify = None,
-                            }
-                        }
+                Ok(_) => {}
+                // Lagged：丢事件不致命，整体补齐
+                Err(broadcast::error::RecvError::Lagged(_)) => self.fill(self.last_seq + 1).await,
+                // 共享轮询器已停（进程停机）：补齐剩余后结束
+                Err(broadcast::error::RecvError::Closed) => {
+                    self.fill(self.last_seq + 1).await;
+                    if self.backlog.is_empty() {
+                        return None;
                     }
                 }
             }
-        });
-        ReceiverStream::new(rx).boxed()
+        }
+    }
+
+    /// 从 from_seq 起把缺失段读入 backlog（只收 seq 严格递增的部分）。
+    /// 读失败只记日志：下一次唤醒/轮询会再试，不死等也不谎报终结。
+    async fn fill(&mut self, from_seq: u64) {
+        match self.engine.read_events(&self.run_id, Some(from_seq)).await {
+            Ok(events) => {
+                for envelope in events {
+                    if envelope.seq > self.last_seq {
+                        self.backlog.push_back(envelope);
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::debug!(run_id = %self.run_id, error = %err, "订阅补齐读取失败，稍后重试");
+            }
+        }
     }
 }
 
@@ -389,6 +384,10 @@ impl crate::VersionSource for PgBackend {
 fn pg_err(err: PgError) -> BackendError {
     match err {
         PgError::RunNotFound(id) => BackendError::RunNotFound(id),
+        PgError::WorkflowNotFound(id) => BackendError::WorkflowNotFound(id),
+        PgError::VersionNotFound(id, v) => BackendError::VersionNotFound(id, v),
+        PgError::VersionNotPublished(id, v) => BackendError::VersionNotPublished(id, v),
+        PgError::SignalNotFound(id) => BackendError::SignalNotFound(id),
         PgError::Conflict(msg) => BackendError::Conflict(msg),
         PgError::Invalid(msg) => BackendError::Invalid(msg),
         other => BackendError::internal(other),

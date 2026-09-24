@@ -356,7 +356,6 @@ impl Engine {
             observer: self.observer.clone(),
         });
         let handle = spawn_driver(
-            sink,
             DriverSpec {
                 run_id: spec.run_id.clone(),
                 definition: Arc::new(spec.definition),
@@ -364,14 +363,15 @@ impl Engine {
                 // 深度以日志中的 run_started 为准（恢复路径 spec.depth 不可靠）
                 depth: state.depth,
                 child_launcher: self.child_launcher.lock().clone(),
+                sink,
+                events_tx: Some(self.events_tx.clone()),
+                cancel,
+                ownership_lost: lost,
+                signal_rx: Some(signal_rx),
+                inbox_poll: FILE_INBOX_POLL,
             },
             state,
             plan,
-            self.events_tx.clone(),
-            cancel,
-            lost,
-            signal_rx,
-            FILE_INBOX_POLL,
         );
         // Driver 完全退出（含 LeaseLost 静默退出）后清理本地 registry
         let registry = self.registry.clone();

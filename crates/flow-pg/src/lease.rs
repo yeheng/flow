@@ -224,9 +224,7 @@ pub async fn create_run(
             .fetch_optional(&mut *tx)
             .await?;
     if exists.is_none() {
-        return Err(PgError::RunNotFound(format!(
-            "workflow {workflow_id} 不存在"
-        )));
+        return Err(PgError::WorkflowNotFound(workflow_id.to_string()));
     }
     let status: Option<String> = sqlx::query_scalar(
         "SELECT status FROM workflow_versions WHERE workflow_id = $1 AND version = $2 FOR SHARE",
@@ -237,14 +235,16 @@ pub async fn create_run(
     .await?;
     match status.as_deref() {
         None => {
-            return Err(PgError::Conflict(format!(
-                "workflow {workflow_id} v{workflow_version} 不存在"
-            )))
+            return Err(PgError::VersionNotFound(
+                workflow_id.to_string(),
+                workflow_version,
+            ))
         }
         Some(s) if s != STATUS_PUBLISHED => {
-            return Err(PgError::Conflict(format!(
-                "workflow {workflow_id} v{workflow_version} 尚未发布（{s}）"
-            )));
+            return Err(PgError::VersionNotPublished(
+                workflow_id.to_string(),
+                workflow_version,
+            ));
         }
         _ => {}
     }

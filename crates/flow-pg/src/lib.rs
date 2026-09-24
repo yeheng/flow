@@ -12,6 +12,7 @@ pub mod lease;
 pub mod metadata;
 pub mod schema;
 pub mod sink;
+pub mod subscribe;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,7 +20,7 @@ use std::time::Duration;
 use serde_json::Value;
 use sqlx::postgres::PgConnectOptions;
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
 pub use child::PgChildLauncher;
@@ -81,6 +82,7 @@ pub struct PgEngine {
     store: metadata::PgStore,
     cfg: PgConfig,
     executor: Option<Arc<ExecutorState>>,
+    hub: Arc<subscribe::EventHub>,
 }
 
 /// run.start 的输入。`version` 必须是已解析的 published 版本——
@@ -129,11 +131,13 @@ impl PgEngine {
                 Some(Arc::new(ExecutorState::new(instance_uuid(), cfg.max_runs)))
             }
         };
+        let hub = subscribe::EventHub::start(pool.clone(), cfg.clone());
         Ok(PgEngine {
             pool,
             store,
             cfg,
             executor,
+            hub,
         })
     }
 
@@ -150,6 +154,11 @@ impl PgEngine {
         &self,
     ) -> Result<tokio::sync::mpsc::Receiver<String>, PgError> {
         event_notifications(&self.pool).await
+    }
+
+    /// 共享事件订阅流（§8）：进程内单份轮询的增量扇出，见 [`subscribe::EventHub`]。
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<Envelope> {
+        self.hub.subscribe()
     }
 
     pub fn instance_id(&self) -> Option<&str> {
@@ -293,45 +302,18 @@ impl PgEngine {
         executor::run_scan_loop(executor, &self.store, &self.cfg).await
     }
 
-    /// 停机：停止扫描并等待本地 Driver 退出。
+    /// 停机：停止扫描与共享订阅轮询，等待本地 Driver 退出。
     pub async fn shutdown(&self) {
         if let Some(executor) = self.executor.as_ref() {
             executor.shutdown.cancel();
             executor::shutdown_local(executor).await;
         }
+        // Driver 退出后再停 hub：停机期间写入的终态事件仍会被扇出给订阅者
+        self.hub.stop().await;
     }
 
     pub fn shutdown_token(&self) -> Option<CancellationToken> {
         self.executor.as_ref().map(|e| e.shutdown.clone())
-    }
-
-    /// 订阅轮询的候选 run（§8）：活跃 run + 订阅开始后创建的 run。
-    /// 短 run 可能在两次轮询之间走完一生，只有按 started_at 捕获才不漏。
-    /// LIMIT 256 是有界性权衡：活跃 run 超过 256 时按 started_at 取最早的，
-    /// 最新 run 可能延迟若干轮才进入订阅候选（DISTRIBUTED.md §8）。
-    /// 返回 (run_id, 是否已终结)。
-    pub async fn watch_runs(
-        &self,
-        started_after: chrono::DateTime<chrono::Utc>,
-    ) -> Result<Vec<(String, bool)>, PgError> {
-        let rows = sqlx::query(
-            "SELECT id, status FROM runs
-             WHERE status IN ('running', 'awaiting_resume')
-                OR started_at >= $1
-             ORDER BY started_at ASC
-             LIMIT 256",
-        )
-        .bind(started_after)
-        .fetch_all(&self.pool)
-        .await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let id: String = row.try_get("id")?;
-            let status: String = row.try_get("status")?;
-            let terminal = !matches!(status.as_str(), "running" | "awaiting_resume");
-            out.push((id, terminal));
-        }
-        Ok(out)
     }
 }
 

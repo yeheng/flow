@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
-use futures::StreamExt;
 use serde_json::Value;
 
 use flow_engine::{
@@ -325,29 +324,7 @@ impl SqliteBackend {
         &self,
         run_id: Option<String>,
     ) -> futures::stream::BoxStream<'static, Envelope> {
-        let events = self.engine.subscribe();
-        futures::stream::unfold(events, move |mut events| {
-            // unfold 的闭包是 FnMut：filter 每次克隆进 async 块
-            let filter = run_id.clone();
-            async move {
-                loop {
-                    match events.recv().await {
-                        Ok(envelope) => {
-                            if let Some(filter) = &filter {
-                                if envelope.run_id != *filter {
-                                    continue;
-                                }
-                            }
-                            return Some((envelope, events));
-                        }
-                        // Lagged：丢事件不致命，客户端按 from_seq 补齐
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
-                    }
-                }
-            }
-        })
-        .boxed()
+        crate::broadcast_tail(self.engine.subscribe(), run_id)
     }
 }
 
@@ -375,6 +352,7 @@ fn sqlite_err(err: StoreError) -> BackendError {
         StoreError::VersionNotFound(id, v) => BackendError::VersionNotFound(id, v),
         StoreError::VersionNotPublished(id, v) => BackendError::VersionNotPublished(id, v),
         StoreError::RunNotFound(id) => BackendError::RunNotFound(id),
+        StoreError::Conflict(msg) => BackendError::Conflict(msg),
         StoreError::InvalidStatus(s) => BackendError::Internal(format!("非法的 run 状态：{s}")),
         other => BackendError::internal(other),
     }

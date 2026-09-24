@@ -80,6 +80,9 @@ async fn workflow_with_runs_cannot_be_deleted() {
         .unwrap();
 
     let err = store.delete_workflow(&wf2).await.unwrap_err();
+    // 冲突必须是 Conflict 变体（跨后端错误码一致的契约面），
+    // 不允许穿 NotFound 的皮把 conflict 撒成 not-found
+    assert!(matches!(err, flow_store::StoreError::Conflict(_)), "{err}");
     assert!(err.to_string().contains("拒绝删除"), "{err}");
     let _ = (v, v2);
 

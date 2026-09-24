@@ -39,6 +39,7 @@
 use std::sync::Arc;
 
 use futures::stream::BoxStream;
+use futures::StreamExt;
 use serde_json::Value;
 use thiserror::Error;
 
@@ -51,6 +52,8 @@ mod sqlite;
 
 pub use child::LocalChildLauncher;
 pub use pg::PgBackend;
+// PgBackend::connect 的公共签名暴露了 PgConfig，这里重导出让调用方能命名该类型
+pub use flow_pg::PgConfig;
 pub use sqlite::{recover_unfinished, SqliteBackend, StoreObserver};
 
 /// 适配层错误：两个后端原生错误的公共超集。
@@ -68,6 +71,8 @@ pub enum BackendError {
     VersionNotPublished(String, i64),
     #[error("run 不存在：{0}")]
     RunNotFound(String),
+    #[error("signal 不存在：{0}")]
+    SignalNotFound(String),
     #[error("参数非法：{0}")]
     Invalid(String),
     #[error("冲突：{0}")]
@@ -299,15 +304,47 @@ impl AnyBackend {
         }
     }
 
-    /// 订阅事件流。SQLite：进程内 broadcast（Lagged 丢事件，用 run.events 补齐）；
-    /// Postgres：按 run_id 维护 last_seq 轮询共享日志（DISTRIBUTED.md §8）。
-    /// 指定 run_id 且该 run 已终结追平后，流自然结束。
+    /// 订阅事件流。SQLite：进程内 broadcast；Postgres：共享轮询器扇出共享日志增量
+    ///（DISTRIBUTED.md §8，扫描次数与订阅者数无关）。不指定 run_id 时是纯实时增量
+    ///（Lagged 丢事件，用 run.events 按 from_seq 补齐）；指定 run_id 先回放完整日志
+    /// 再接实时增量，该 run 已终结追平后流自然结束。
     pub fn subscribe(&self, run_id: Option<String>) -> BoxStream<'static, Envelope> {
         match self {
             AnyBackend::Sqlite(b) => b.subscribe(run_id),
             AnyBackend::Postgres(b) => b.subscribe(run_id),
         }
     }
+}
+
+/// broadcast 接收端包装成流：向前转发，Lagged 丢事件不致命
+///（上层用 run.events 按 from_seq 补齐），通道关闭即流结束。
+/// SQLite 的实时推送与 Postgres 的全局订阅共用这一段。
+pub(crate) fn broadcast_tail(
+    events: tokio::sync::broadcast::Receiver<Envelope>,
+    filter: Option<String>,
+) -> BoxStream<'static, Envelope> {
+    futures::stream::unfold(events, move |mut events| {
+        // unfold 的闭包是 FnMut：filter 每次克隆进 async 块
+        let filter = filter.clone();
+        async move {
+            loop {
+                match events.recv().await {
+                    Ok(envelope) => {
+                        if let Some(filter) = &filter {
+                            if envelope.run_id != *filter {
+                                continue;
+                            }
+                        }
+                        return Some((envelope, events));
+                    }
+                    // Lagged：丢事件不致命，客户端按 from_seq 补齐
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        }
+    })
+    .boxed()
 }
 
 // ---- 「可执行版本」规则：单一实现，两个后端共用 ----

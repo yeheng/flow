@@ -16,7 +16,11 @@ pub enum InboxKind {
     Cancel,
 }
 
-impl InboxKind {}
+impl InboxKind {
+    pub fn as_str(self) -> &'static str {
+        kind_str(self)
+    }
+}
 
 /// 入队后的观察结果（轮询所得）。
 #[derive(Debug, Clone)]
@@ -128,7 +132,7 @@ pub async fn status_of(pool: &PgPool, run_id: &str, signal_id: &str) -> Result<S
     .bind(signal_id)
     .fetch_optional(pool)
     .await?
-    .ok_or_else(|| PgError::RunNotFound(format!("signal {signal_id} 不存在")))?;
+    .ok_or_else(|| PgError::SignalNotFound(signal_id.to_string()))?;
     let status: String = row.try_get("status")?;
     let event_seq: Option<i64> = row.try_get("event_seq")?;
     let error: Option<Value> = row.try_get("error")?;

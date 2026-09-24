@@ -248,7 +248,9 @@ static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::n
 async fn run_http(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
     let input = ctx.input.clone();
     let nodes = ctx.nodes_value();
-    let timeout = ctx.js_timeout();
+    // timeout_ms 在 http_call 上只表示 HTTP 超时（见 nodetypes 清单）；
+    // 模板展开的 JS 超时与它无关，固定用默认脚本超时——一个参数不承担两个语义
+    let timeout = Duration::from_millis(DEFAULT_JS_TIMEOUT_MS);
     let params = ctx.node.params.clone();
     let expanded = tokio::task::spawn_blocking(move || {
         expr::expand_templates(&params, &input, &nodes, timeout)

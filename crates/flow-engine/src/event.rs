@@ -89,6 +89,15 @@ impl Event {
             _ => None,
         }
     }
+
+    /// run 终态事件（run_completed / run_failed / run_cancelled）。
+    /// 订阅方据此判定「该 run 的日志已追平、流可结束」。
+    pub fn is_run_terminal(&self) -> bool {
+        matches!(
+            self,
+            Event::RunCompleted { .. } | Event::RunFailed { .. } | Event::RunCancelled {}
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

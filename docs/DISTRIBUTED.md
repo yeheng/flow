@@ -4,6 +4,11 @@
 > + Phase 2 容量与查询，见 `crates/flow-pg` 与 `flow-backend` 的 Postgres 适配器
 > （`PgBackend`；上层 RPC 经 `Backend` trait 屏蔽后端差异））；
 > SCHEDULER.md 的中心指派模式仍未实现。验收覆盖情况见 §11。
+>
+> **⚠️ 安全边界（与 DESIGN.md 同款声明）**：本服务没有任何认证/授权；`http_call`
+> 是任意出站 HTTP（含内网与云元数据端点）。多节点部署把 gateway 暴露到网络时，
+> 必须在外层自备 TLS + 认证与出站访问控制，否则任何能连上 RPC 的人
+> 都能在你的机器上发起任意 HTTP 请求。
 > 依赖 DESIGN.md 的单机恢复契约。依赖本文定义对等抢占模式；
 > SCHEDULER.md 定义中心指派模式。一个集群只启用一种模式。
 > 事件模型、fold 和 DAG 语义已复用；租约、持久信号与副作用边界已按本文协议实现。
@@ -228,17 +233,33 @@ gateway 不得通过直接清租约或只改 status 实现取消。
 
 ## 8. 查询与订阅
 
-`run.timeline`/`run.events` 从共享日志读取。订阅者按 run_id 维护 last_seq 游标拉取增量，
-LISTEN/NOTIFY（频道 `flow_events`，载荷仅 run_id）仅作低延迟唤醒提示；正确性不依赖
-通知——通知可丢失（断连期间），由 subscribe_poll 兜底轮询兜住；进程接管不能改变
-订阅源的正确性。等待子 run 终态（child.rs）复用同一通知频道加兜底轮询。
+`run.timeline`/`run.events` 从共享日志读取。订阅推送由**进程内共享轮询器**
+（`flow-pg::subscribe::EventHub`）统一扇出：一个轮询任务维护全局游标，
+查询次数与本地订阅者数无关，不随订阅者规模放大数据库压力；
+LISTEN/NOTIFY（频道 `flow_events`，载荷仅 run_id）仅作低延迟唤醒提示；
+正确性不依赖通知——通知可丢失（断连期间），由 subscribe_poll 兜底轮询兜住；
+进程接管不能改变订阅源的正确性。等待子 run 终态（child.rs）复用同一通知频道
+加兜底轮询。
+
 from_seq 的 API 语义保留现有闭区间，客户端传 last_seq+1。
 增量读取在 SQL 层下推过滤（`WHERE seq >= from`），只校验相邻 seq 连续；
 全量读取（接管恢复、`from_events`）仍要求首条为 1 + 相邻连续。
-候选查询 `watch_runs` 是 LIMIT 256 的有界查询：活跃 run 超过 256 时
-按 started_at 取最早的，最新 run 可能延迟若干轮询周期才进入订阅候选。
+
+订阅语义（与 SQLite 后端对齐）：
+
+- 不指定 run_id：纯实时增量，历史事件用 run.events 补齐；Lagged 丢事件不致命；
+- 指定 run_id：先回放完整日志（seq 从 1）再接实时增量，按 seq 去重、缺口自动
+  补齐，终态追平后流自然结束（流级契约：wire 层的 JSON-RPC 订阅不推送关闭
+  通知，客户端按事件里的终态或 run.get 判断结束）；
+- 全局订阅为各 run 分别跟踪游标，不把不同 run 的 seq 当成全局序列。
+
+候选查询 `watch_candidates` 是 LIMIT 256 的有界查询：活跃 run + 最近
+ended_at 回看窗口内终结的 run（短 run 可能在两次轮询之间走完一生，只有按
+ended_at 回看才不漏其终态）。活跃 run 超过 256 时按 started_at 取最早的，
+最新 run 可能延迟若干轮询周期才进入候选；已有游标的 run 不受候选裁剪影响。
 只在确认已转发后推进游标；重复消息按 seq 去重，发现缺口后通过 run.events 补齐。
-全局订阅必须为各 run 分别跟踪游标，不能将不同 run 的 seq 当成一个全局序列。
+终态追平的 run 标记 done 不再查询，其游标在退出候选视野（回看窗口过期）后
+随 run 生命周期自清理——不需要单独的去重集合。
 
 ## 9. 时钟与持久性
 
@@ -254,7 +275,8 @@ NodeStarted 丢失可能让已经发生的副作用被再次执行。Postgres �
 
 规划配置：FLOW_BACKEND、FLOW_DATABASE_URL、FLOW_NODE_ID（展示名）、启动时生成的 instance UUID、
 FLOW_LEASE_TTL_MS、FLOW_MAX_RUNS、FLOW_SCAN_INTERVAL_MS、FLOW_SUBSCRIBE_POLL_MS
-（订阅兜底轮询间隔，默认 10s；NOTIFY 是正常路径）。
+（订阅兜底轮询间隔，默认 10s；NOTIFY 是正常路径；同时是已终结 run 候选回看窗口
+的基准，实际窗口 = max(3×间隔, 30s)）。
 TTL/续期/轮询间隔在实施阶段依据数据库延迟实测设定。长事务必须另设锁和语句超时。
 
 可拆分 gateway 与 executor 池。Postgres 模式下 FLOW_DATA_DIR 仅是缓存；备份必须覆盖

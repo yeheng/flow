@@ -537,7 +537,7 @@ pub(crate) fn node_types() -> Value {
                 "properties": {
                     "code": {"type": "string", "x-widget": "code", "x-label": "JS 函数体",
                              "x-help": "可用 input（run 输入）与 nodes（上游节点输出），用 return 返回结果"},
-                    "timeout_ms": {"type": "integer", "default": 2000, "x-label": "超时（毫秒）"}
+                    "timeout_ms": {"type": "integer", "default": 2000, "x-label": "脚本超时（毫秒）"}
                 }
             },
             "supports_retry": true
@@ -553,7 +553,7 @@ pub(crate) fn node_types() -> Value {
                 "properties": {
                     "expr": {"type": "string", "x-widget": "code", "x-label": "条件表达式",
                              "x-help": "表达式结果按真值判定（非空字符串、非 0 数为真），可用 input 与 nodes"},
-                    "timeout_ms": {"type": "integer", "default": 2000, "x-label": "超时（毫秒）"}
+                    "timeout_ms": {"type": "integer", "default": 2000, "x-label": "求值超时（毫秒）"}
                 }
             }
         },
@@ -584,7 +584,7 @@ pub(crate) fn node_types() -> Value {
                             "x-help": "支持 ${input.x} / ${nodes.n2.y} 模板（${} 内不能含 }）"},
                     "headers": {"x-widget": "json", "default": {}, "x-label": "请求头"},
                     "body": {"x-widget": "json", "x-label": "请求体"},
-                    "timeout_ms": {"type": "integer", "default": 30000, "x-label": "超时（毫秒）"}
+                    "timeout_ms": {"type": "integer", "default": 30000, "x-label": "HTTP 超时（毫秒）"}
                 }
             },
             "supports_retry": true,
@@ -650,7 +650,8 @@ pub(crate) fn backend_err(err: BackendError) -> ErrorObjectOwned {
     match err {
         BackendError::WorkflowNotFound(_)
         | BackendError::VersionNotFound(..)
-        | BackendError::RunNotFound(_) => {
+        | BackendError::RunNotFound(_)
+        | BackendError::SignalNotFound(_) => {
             ErrorObject::owned(CODE_NOT_FOUND, err.to_string(), None::<()>)
         }
         BackendError::VersionNotPublished(..) | BackendError::Conflict(_) => {

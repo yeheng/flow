@@ -25,7 +25,7 @@ use crate::exec::{self, ChildRunSpec, NodeExecContext, NodeFailure};
 use crate::fold::{NodeState, RunState};
 use crate::model::{Definition, NodeType};
 
-/// 单次驱动所需的不可变输入。
+/// 单次驱动所需的全部输入。
 pub struct DriverSpec {
     pub run_id: String,
     pub definition: Arc<Definition>,
@@ -34,10 +34,22 @@ pub struct DriverSpec {
     pub depth: u32,
     /// sub_workflow 节点的子 run 启动器；未配置时 sub_workflow 节点执行即 fatal
     pub child_launcher: Option<Arc<dyn ChildRunLauncher>>,
+    /// 事件出口（单机文件日志 / Postgres 受保护追加）
+    pub sink: Box<dyn RunEventSink>,
+    /// 本地事件广播（单机后端）。Postgres 后端的事件订阅走共享日志轮询，传 None。
+    pub events_tx: Option<broadcast::Sender<Envelope>>,
+    /// 用户取消（单机后端）。Postgres 后端的取消经持久 inbox 消费，传未触发的 token。
+    pub cancel: CancellationToken,
+    /// 所有权丢失 / 停机（Postgres 后端）。触发后静默退出，不写任何事件。
+    pub ownership_lost: CancellationToken,
+    /// 信号请求通道（文件后端）；Postgres 后端的信号经持久 inbox，传 None。
+    pub signal_rx: Option<mpsc::Receiver<SignalRequest>>,
+    /// 持久 inbox 轮询间隔（单机后端无 inbox，占位值即可）。
+    pub inbox_poll: Duration,
 }
 
 /// 文件后端的信号请求：oneshot 回执把校验/落盘结果还给调用方。
-/// Postgres 后端不走这条通道（信号经持久 inbox），传入已关闭的接收端即可。
+/// Postgres 后端不走这条通道（信号经持久 inbox），`signal_rx` 传 None 即可。
 pub struct SignalRequest {
     pub signal: Signal,
     pub reply: oneshot::Sender<Result<(), EngineError>>,
@@ -45,31 +57,20 @@ pub struct SignalRequest {
 
 /// 启动 Driver 任务。返回的 JoinHandle 结束即 Driver 完全退出（inflight 已 abort），
 /// 调用方据此释放本地 registry 与容量许可。
-#[allow(clippy::too_many_arguments)]
-pub fn spawn_driver(
-    sink: Box<dyn RunEventSink>,
-    spec: DriverSpec,
-    state: RunState,
-    plan: RecoveryPlan,
-    events_tx: broadcast::Sender<Envelope>,
-    cancel: CancellationToken,
-    ownership_lost: CancellationToken,
-    signal_rx: mpsc::Receiver<SignalRequest>,
-    inbox_poll: Duration,
-) -> JoinHandle<()> {
+pub fn spawn_driver(spec: DriverSpec, state: RunState, plan: RecoveryPlan) -> JoinHandle<()> {
     let driver = Driver {
         run_id: spec.run_id,
         definition: spec.definition,
         input: spec.input,
         depth: spec.depth,
         child_launcher: spec.child_launcher,
-        sink,
+        sink: spec.sink,
         state,
-        events_tx,
-        cancel,
-        lost: ownership_lost,
-        signal_rx: Some(signal_rx),
-        inbox_poll,
+        events_tx: spec.events_tx,
+        cancel: spec.cancel,
+        lost: spec.ownership_lost,
+        signal_rx: spec.signal_rx,
+        inbox_poll: spec.inbox_poll,
         inflight: HashMap::new(),
         human_waiting: HashMap::new(),
         adjudicating: HashSet::new(),
@@ -177,11 +178,13 @@ struct Driver {
     child_launcher: Option<Arc<dyn ChildRunLauncher>>,
     sink: Box<dyn RunEventSink>,
     state: RunState,
-    events_tx: broadcast::Sender<Envelope>,
+    /// 本地事件广播；Postgres 后端为 None（订阅走共享日志轮询）
+    events_tx: Option<broadcast::Sender<Envelope>>,
     /// 用户取消（单机后端）。Postgres 后端的取消经持久 inbox 消费，此 token 不触发。
     cancel: CancellationToken,
     /// 所有权丢失 / 停机（Postgres 后端）。触发后静默退出，不写任何事件。
     lost: CancellationToken,
+    /// 文件后端的信号请求通道；Postgres 后端为 None（信号经持久 inbox）
     signal_rx: Option<mpsc::Receiver<SignalRequest>>,
     inbox_poll: Duration,
     inflight: HashMap<String, JoinHandle<()>>,
@@ -203,6 +206,19 @@ impl Driver {
         }
         match outcome {
             Ok(()) => {}
+            Err(err) if err.is_platform_fault() => {
+                // 平台故障 ≠ 工作流失败：不写 run_failed 终态，
+                // 投影 awaiting_resume 等待恢复/接管（SQLite 重启恢复、
+                // Postgres executor 自动接管），不把基础设施问题伪造成业务终态
+                let message = err.to_string();
+                tracing::error!(run_id = %self.run_id, error = %err, "基础设施故障，run 挂起等待恢复");
+                if let Err(project_err) = self
+                    .project_status(DbRunStatus::AwaitingResume, Some(&message))
+                    .await
+                {
+                    tracing::error!(run_id = %self.run_id, error = %project_err, "投影 awaiting_resume 失败");
+                }
+            }
             Err(err) => {
                 let message = err.to_string();
                 match self
@@ -359,11 +375,18 @@ impl Driver {
 
     // ---- sink 包装：折叠 + 本地广播 + LeaseLost 记账 ----
 
+    /// 本地广播（单机后端）。Postgres 后端无本地订阅者，events_tx 为 None。
+    fn broadcast(&self, envelope: Envelope) {
+        if let Some(tx) = &self.events_tx {
+            let _ = tx.send(envelope);
+        }
+    }
+
     async fn append(&mut self, event: Event) -> Result<Envelope, EngineError> {
         match self.sink.append(event).await {
             Ok(envelope) => {
                 self.state.fold(&envelope);
-                let _ = self.events_tx.send(envelope.clone());
+                self.broadcast(envelope.clone());
                 Ok(envelope)
             }
             Err(err) => Err(self.guard_lease(err)),
@@ -374,7 +397,7 @@ impl Driver {
         match self.sink.append_terminal(event).await {
             Ok(envelope) => {
                 self.state.fold(&envelope);
-                let _ = self.events_tx.send(envelope.clone());
+                self.broadcast(envelope.clone());
                 Ok(envelope)
             }
             Err(err) => Err(self.guard_lease(err)),
@@ -396,7 +419,7 @@ impl Driver {
         match self.sink.consume_cancel(input).await {
             Ok(CommitOutcome::Applied(envelope)) => {
                 self.state.fold(&envelope);
-                let _ = self.events_tx.send(envelope.clone());
+                self.broadcast(envelope);
                 tracing::info!(run_id = %self.run_id, "取消命令已提交，停止本地 Driver");
                 Ok(())
             }
@@ -674,6 +697,20 @@ impl Driver {
                 duration_ms,
             } => {
                 self.inflight.remove(&node_id);
+                // 防御：只有当前 attempt 的结果才生效。中断/裁决重派后旧任务的
+                // 消息可能仍在通道里，迟到结果不得覆盖新 attempt 的状态。
+                if !matches!(
+                    self.state.record(&node_id).state,
+                    NodeState::Running { attempt: current } if current == attempt
+                ) {
+                    tracing::debug!(
+                        run_id = %self.run_id,
+                        node_id = %node_id,
+                        attempt,
+                        "丢弃过期 attempt 的迟到结果"
+                    );
+                    return Ok(());
+                }
                 match result {
                     Ok(output) => {
                         self.append(Event::NodeCompleted {
@@ -799,7 +836,7 @@ impl Driver {
         match self.sink.commit_signal(&input, event).await {
             Ok(CommitOutcome::Applied(envelope)) => {
                 self.state.fold(&envelope);
-                let _ = self.events_tx.send(envelope);
+                self.broadcast(envelope);
             }
             Ok(CommitOutcome::Duplicate) => {
                 tracing::debug!(run_id = %self.run_id, signal_id = %input.signal_id, "重复信号，忽略");

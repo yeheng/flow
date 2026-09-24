@@ -3,6 +3,8 @@
 //! 有 run 时拒删 workflow、只有 published 版本可执行。
 //! 领域 DTO 的单一来源在 flow-dto，本模块不再维护第二份拷贝。
 
+use std::time::Duration;
+
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
@@ -52,9 +54,7 @@ impl PgStore {
                 .fetch_optional(&mut *tx)
                 .await?;
         if exists.is_none() {
-            return Err(PgError::RunNotFound(format!(
-                "workflow {workflow_id} 不存在"
-            )));
+            return Err(PgError::WorkflowNotFound(workflow_id.to_string()));
         }
         let latest: Option<(i64, String)> = sqlx::query_as(
             "SELECT version, checksum FROM workflow_versions
@@ -95,9 +95,10 @@ impl PgStore {
         .await?
         .rows_affected();
         if affected == 0 {
-            return Err(PgError::RunNotFound(format!(
-                "workflow {workflow_id} v{version} 不存在"
-            )));
+            return Err(PgError::VersionNotFound(
+                workflow_id.to_string(),
+                version,
+            ));
         }
         Ok(())
     }
@@ -118,9 +119,7 @@ impl PgStore {
                 .bind(version)
                 .fetch_optional(&self.pool)
                 .await?
-                .ok_or_else(|| {
-                    PgError::RunNotFound(format!("workflow {workflow_id} v{version} 不存在"))
-                })?;
+                .ok_or_else(|| PgError::VersionNotFound(workflow_id.to_string(), version))?;
                 version_from_row(rec)
             }
             None => {
@@ -131,7 +130,7 @@ impl PgStore {
                 .bind(workflow_id)
                 .fetch_optional(&self.pool)
                 .await?
-                .ok_or_else(|| PgError::RunNotFound(format!("workflow {workflow_id} 不存在")))?;
+                .ok_or_else(|| PgError::WorkflowNotFound(workflow_id.to_string()))?;
                 version_from_row(rec)
             }
         }
@@ -185,9 +184,7 @@ impl PgStore {
                 .fetch_optional(&mut *tx)
                 .await?;
         if exists.is_none() {
-            return Err(PgError::RunNotFound(format!(
-                "workflow {workflow_id} 不存在"
-            )));
+            return Err(PgError::WorkflowNotFound(workflow_id.to_string()));
         }
         let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE workflow_id = $1")
             .bind(workflow_id)
@@ -272,6 +269,36 @@ impl PgStore {
             .into_iter()
             .map(|r| r.try_get::<String, _>(0))
             .collect::<Result<_, _>>()?)
+    }
+
+    /// 订阅轮询的候选 run（§8）：活跃 run + 最近 ended_at 窗口内终结的 run。
+    /// 短 run 可能在两次轮询之间走完一生，只有按 ended_at 回看最近窗口才不漏其终态；
+    /// 窗口过后自动退出视野，订阅游标随之回收——不需要单独的去重集合。
+    /// LIMIT 256 是有界性权衡：活跃 run 超过 256 时按 started_at 取最早的，
+    /// 最新 run 可能延迟若干轮才进入订阅候选（DISTRIBUTED.md §8）。
+    /// 返回 (run_id, 是否已终结)。
+    pub async fn watch_candidates(
+        &self,
+        ended_within: Duration,
+    ) -> Result<Vec<(String, bool)>, PgError> {
+        let rows = sqlx::query(
+            "SELECT id, status FROM runs
+             WHERE status IN ('running', 'awaiting_resume')
+                OR ended_at >= clock_timestamp() - make_interval(secs => $1)
+             ORDER BY started_at ASC
+             LIMIT 256",
+        )
+        .bind(ended_within.as_secs_f64())
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.try_get("id")?;
+            let status: String = row.try_get("status")?;
+            let terminal = !matches!(status.as_str(), "running" | "awaiting_resume");
+            out.push((id, terminal));
+        }
+        Ok(out)
     }
 }
 

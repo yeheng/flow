@@ -37,8 +37,12 @@ pub enum StoreError {
     VersionNotPublished(String, i64),
     #[error("run 不存在：{0}")]
     RunNotFound(String),
+    #[error("冲突：{0}")]
+    Conflict(String),
     #[error("非法的 run 状态：{0}")]
     InvalidStatus(String),
+    #[error("时间戳无法解析：{0}")]
+    InvalidTimestamp(String),
     #[error("json 错误：{0}")]
     Json(#[from] serde_json::Error),
 }
@@ -286,8 +290,8 @@ impl Store {
             .await?
             .try_get("c")?;
         if runs > 0 {
-            return Err(StoreError::WorkflowNotFound(format!(
-                "{workflow_id}（已有 {runs} 条 run 记录，拒绝删除）"
+            return Err(StoreError::Conflict(format!(
+                "workflow {workflow_id} 已有 {runs} 条 run 记录，拒绝删除"
             )));
         }
         let affected = sqlx::query("DELETE FROM workflows WHERE id = ?")
@@ -434,12 +438,7 @@ impl Store {
 
 fn parse_ts(raw: &str) -> Result<DateTime<Utc>, StoreError> {
     Ok(DateTime::parse_from_rfc3339(raw)
-        .map_err(|e| {
-            StoreError::Json(serde_json::Error::io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                e.to_string(),
-            )))
-        })?
+        .map_err(|e| StoreError::InvalidTimestamp(format!("{raw}：{e}")))?
         .with_timezone(&Utc))
 }
 

@@ -12,6 +12,14 @@ pub enum PgError {
     Engine(#[from] EngineError),
     #[error("run 不存在：{0}")]
     RunNotFound(String),
+    #[error("workflow 不存在：{0}")]
+    WorkflowNotFound(String),
+    #[error("版本不存在：{0} v{1}")]
+    VersionNotFound(String, i64),
+    #[error("版本尚未发布：{0} v{1}")]
+    VersionNotPublished(String, i64),
+    #[error("signal 不存在：{0}")]
+    SignalNotFound(String),
     #[error("冲突：{0}")]
     Conflict(String),
     #[error("非法参数：{0}")]

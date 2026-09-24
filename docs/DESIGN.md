@@ -1,10 +1,17 @@
 # flow 工作流引擎设计方案
 
 > 状态：单机实现 + 对等模式多节点执行（`DISTRIBUTED.md`，Postgres 后端）；
-> `cargo test --workspace --all-targets --locked` 80 个测试全绿；验证命令与覆盖范围见 §13。
+> `cargo test --workspace --all-targets --locked` 85 个测试全绿；验证命令与覆盖范围见 §13。
 > 本文描述当前代码的实际语义，是后续开发的权威参考。
 > 架构焊点：**SQLite + events.jsonl 是默认与权威后端**（canonical）；Postgres 是
 > 可替代后端，两者统一在 `flow-backend` 的 `Backend` trait 之后（§2）。
+
+> **⚠️ 安全边界（部署前必读）**：本服务**没有任何认证/授权**——JSON-RPC
+> WebSocket 谁连上谁就是管理员。默认只监听 `127.0.0.1:9800`；对外暴露
+> （如多节点部署的 gateway）必须在外层自备 TLS + 认证（反向代理 / 内网 ACL）。
+> `http_call` 节点是**任意出站 HTTP**（可打内网地址与云元数据端点
+> 169.254.169.254），`script`/`condition` 是沙箱内任意 JS——工作流定义事实上是
+> 可执行代码，只允许可信用户创建与发布。出站白名单/沙箱网络隔离未实现。
 
 ## 1. 目标与边界
 
@@ -307,7 +314,10 @@ Postgres `PgChildLauncher` 经 `lease::create_run` 单事务创建子 run、
 - DB 已回填但进程死在最终时刻 → 重启后 `resume_run` 发现 phase 已终态，
   返回 `AlreadyTerminal`，幂等；
 - 半行残缺日志 → `EventLog::open` 物理截断；
-- seq 不连续 → 硬错误，人工介入。
+- seq 不连续 → 硬错误，人工介入；
+- 运行中基础设施故障（磁盘/数据库 IO、序列化、日志损坏）→ **不写 run_failed**，
+  投影 `awaiting_resume` 挂起：平台故障不是工作流失败，SQLite 重启后恢复、
+  Postgres 由 executor 自动接管；只有工作流语义失败才写 run_failed 终态。
 
 初始化中断：`initializing` 行配有有效 `run_started` 时按上述分类恢复；日志缺失、
 空文件、首行残缺或损坏时将初始化标为 failed，保留文件与诊断，不执行节点。
@@ -450,6 +460,9 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
     node_started 落盘；重放沿用已落盘 id 附着既有子 run，重试派生新 id。
 12. 父子 run 各有独立事件日志；嵌套深度上限 8，depth 经 run_started 持久化；
     子 run failed/cancelled 传导为父节点 fatal，取消级联是 best-effort。
+13. 平台故障（IO/Backend/日志损坏）与工作流失败分离：前者投影
+    `awaiting_resume` 等待恢复/人工，只有工作流语义失败才写 run_failed 终态；
+    所有权丢失（LeaseLost）则静默退出，三者互不冒充。
 
 ## 13. 测试策略
 

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use tokio::sync::{broadcast, mpsc, Semaphore};
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use flow_engine::{
@@ -211,14 +211,10 @@ async fn take_over(
         epoch,
         folded.last_seq,
     );
-    // PG 模式下这是哑端口：spawn_driver 的接口要求本地广播通道存在，
-    // 但事件不经它分发——订阅走 §8 的 DB 轮询，这里只满足构造参数。
-    let (events_tx, _) = broadcast::channel(64);
-    // PG 模式：用户取消经持久 inbox 交付；这个 token 不触发
+    // PG 模式：用户取消与信号都经持久 inbox 交付，本地通道不参与；
+    // 事件订阅走共享日志轮询（DISTRIBUTED.md §8），无本地广播。
     let cancel = CancellationToken::new();
     let lost = CancellationToken::new();
-    let (sig_tx, sig_rx) = mpsc::channel(1);
-    drop(sig_tx);
 
     let spec = DriverSpec {
         run_id: run_id.to_string(),
@@ -230,18 +226,14 @@ async fn take_over(
             store.pool().clone(),
             cfg.clone(),
         ))),
-    };
-    let handle = spawn_driver(
-        Box::new(sink),
-        spec,
-        folded,
-        plan,
-        events_tx,
+        sink: Box::new(sink),
+        events_tx: None,
         cancel,
-        lost.clone(),
-        sig_rx,
-        cfg.inbox_poll,
-    );
+        ownership_lost: lost.clone(),
+        signal_rx: None,
+        inbox_poll: cfg.inbox_poll,
+    };
+    let handle = spawn_driver(spec, folded, plan);
 
     // 续期监督：TTL/3 周期续期；LeaseLost 时触发静默退出。
     // 暂时性错误（网络抖动）不立即放弃，下个周期重试。

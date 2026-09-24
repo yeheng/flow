@@ -11,6 +11,7 @@ use std::time::Duration;
 use jsonrpsee::core::client::{ClientT, SubscriptionClientT};
 use jsonrpsee::core::params::ObjectParams;
 use jsonrpsee::ws_client::{WsClient, WsClientBuilder};
+use futures::StreamExt;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -632,6 +633,48 @@ async fn subscription_woken_by_notify_not_poll() {
             break;
         }
     }
+
+    server.kill();
+    db.close().await;
+}
+
+/// 指定 run_id 的订阅（流级契约）：先回放完整历史（seq 从 1 严格递增），
+/// 终态追平后流自然结束。断言打在 `PgBackend::subscribe` 上：wire 层的
+/// JSON-RPC 订阅只承载事件本体，jsonrpsee 的服务端关闭不会通知客户端
+/// （客户端流只在连接断开时结束），「流结束」只在服务端生效。
+#[tokio::test]
+async fn subscribe_specific_run_replays_and_ends() {
+    let Some(db) = test_db().await else { return };
+    let mut server = ServerProc::spawn(&db.url, "all", 5000);
+    let client = server.client().await;
+
+    let (wf, _) = publish(&client, "回放订阅", line_def("return 'hi';")).await;
+    let started: Value = call(&client, "run.start", json!({"workflow_id": wf})).await;
+    let run_id = started["run_id"].as_str().unwrap().to_string();
+    wait_status(&client, &run_id, "succeeded", Duration::from_secs(20)).await;
+
+    // run 已终结才订阅：仍回放完整日志并以「流结束」收尾
+    let backend = flow_backend::PgBackend::connect(&db.url, flow_backend::PgConfig::default())
+        .await
+        .expect("连接后端失败");
+    let mut stream = backend.subscribe(Some(run_id.clone()));
+    let mut kinds = Vec::new();
+    let mut last_seq = 0u64;
+    while let Some(envelope) = tokio::time::timeout(Duration::from_secs(10), stream.next())
+        .await
+        .expect("订阅流未在终态追平后自然结束")
+    {
+        assert_eq!(envelope.run_id, run_id);
+        assert!(
+            envelope.seq > last_seq,
+            "回放必须从头且 seq 严格递增：{} after {last_seq}",
+            envelope.seq
+        );
+        last_seq = envelope.seq;
+        kinds.push(envelope.event.kind().to_string());
+    }
+    assert_eq!(kinds.first().unwrap(), "run_started", "{kinds:?}");
+    assert_eq!(kinds.last().unwrap(), "run_completed", "{kinds:?}");
 
     server.kill();
     db.close().await;
