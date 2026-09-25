@@ -44,10 +44,11 @@ use serde_json::Value;
 use thiserror::Error;
 
 pub use flow_dto::{RunRecord, WorkflowSummary, WorkflowVersion};
-pub use flow_engine::{Definition, Envelope, RunState};
+pub use flow_engine::{Definition, Envelope, NodeState, RunState, HTTP_METHODS};
 
 mod child;
 mod pg;
+mod run_tail;
 mod sqlite;
 
 pub use child::LocalChildLauncher;
@@ -95,11 +96,7 @@ pub struct CreateRun {
     pub input: Value,
 }
 
-#[derive(Debug)]
-pub struct CreatedRun {
-    pub run_id: String,
-    pub workflow_version: i64,
-}
+pub use flow_dto::{CreatedRun, SignalAck};
 
 /// 信号/取消请求。Postgres 后端要求 signal_id 稳定复用（幂等）；
 /// SQLite 后端进程内同步交付，signal_id 仅原样回显、缺省时不伪造。
@@ -109,23 +106,6 @@ pub struct SignalRequest {
     pub signal_id: Option<String>,
     pub node_id: String,
     pub payload: Value,
-}
-
-/// 信号落账结果（DISTRIBUTED.md §6.1）：
-/// - `delivered=true`：已写入事件并生效；
-/// - `status=pending`：已入队尚未处理（仅 Postgres），客户端用
-///   `PgBackend::signal_status` 查询；
-/// - `status=rejected`：非法请求被拒，error 携带原因。
-///
-/// `signal_id` 只在真有一个可查询的 id 时出现（Postgres inbox）。
-/// SQLite 同步交付没有账可查，回显客户端提供的 id 或不带。
-#[derive(Debug, Clone)]
-pub struct SignalAck {
-    pub signal_id: Option<String>,
-    pub status: String,
-    pub delivered: bool,
-    pub event_seq: Option<u64>,
-    pub error: Option<Value>,
 }
 
 /// 后端选择：闭集枚举，不是 trait 对象。
@@ -307,7 +287,8 @@ impl AnyBackend {
     /// 订阅事件流。SQLite：进程内 broadcast；Postgres：共享轮询器扇出共享日志增量
     ///（DISTRIBUTED.md §8，扫描次数与订阅者数无关）。不指定 run_id 时是纯实时增量
     ///（Lagged 丢事件，用 run.events 按 from_seq 补齐）；指定 run_id 先回放完整日志
-    /// 再接实时增量，该 run 已终结追平后流自然结束。
+    /// 再接实时增量，该 run 已终结追平后流自然结束。两臂共用 run_tail 状态机，
+    /// 语义一致（缺口补齐、失败重试、按 seq 去重），契约不分叉。
     pub fn subscribe(&self, run_id: Option<String>) -> BoxStream<'static, Envelope> {
         match self {
             AnyBackend::Sqlite(b) => b.subscribe(run_id),

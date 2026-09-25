@@ -2,7 +2,9 @@ import { computed, reactive } from "vue";
 import * as api from "../api/flow";
 import { client, errText } from "../rpc/client";
 import type { RunEvent, TimelineNode } from "../types";
-import { editor, ui } from "./editor";
+import { editor } from "./editor";
+import { alignProjection, applyEvent, drainBuffer, seqAction } from "./monitor-logic";
+import { toast } from "./toast";
 
 export const monitor = reactive({
   runId: null as string | null,
@@ -10,6 +12,8 @@ export const monitor = reactive({
   workflowId: null as string | null,
   inputText: "",
   phase: null as string | null,
+  /** run 投影状态（run.timeline status）：awaiting_resume 时 fold phase 仍是 running */
+  status: null as string | null,
   output: undefined as unknown,
   fatalError: null as string | null,
   lastSeq: 0,
@@ -39,13 +43,15 @@ export function nodeChildRunId(nodeId: string): string | null {
 }
 
 let unsubscribe: (() => Promise<void>) | null = null;
+/** attach 世代号：并发 attach（快速切换 run）时旧世代的回调/响应一律丢弃 */
+let generation = 0;
 /** 订阅建立与 timeline 对齐之间到达的事件先缓冲，对齐后按 seq 补放 */
 let buffer: RunEvent[] = [];
 let aligned = false;
 
 export async function startRun(): Promise<void> {
   if (!editor.workflowId) {
-    ui.error = "先选择一个工作流";
+    toast.error("先选择一个工作流");
     return;
   }
   let input: unknown;
@@ -54,49 +60,111 @@ export async function startRun(): Promise<void> {
     try {
       input = JSON.parse(raw);
     } catch {
-      ui.error = "运行输入不是合法 JSON";
+      toast.error("运行输入不是合法 JSON");
       return;
     }
   }
   monitor.starting = true;
   try {
     const { run_id } = await api.startRun(editor.workflowId, input);
-    monitor.breadcrumb = [];
-    monitor.workflowId = editor.workflowId;
-    await attach(run_id);
-    ui.error = null;
+    // breadcrumb/workflowId 只在 attach 成功后切换：失败时 attach 已回滚到旧 run，栈要跟着留
+    if (await attach(run_id)) {
+      monitor.breadcrumb = [];
+      monitor.workflowId = editor.workflowId;
+    }
   } catch (e) {
-    ui.error = errText(e);
+    toast.error(errText(e));
   } finally {
     monitor.starting = false;
   }
 }
 
-/** 切换到指定 run：退订旧的、订阅新的、timeline 对齐后补放缓冲事件 */
-async function attach(runId: string): Promise<void> {
+/** 切换到指定 run：退订旧的、订阅新的、timeline 对齐后补放缓冲事件。
+ * 返回 true 表示本次 attach 仍是当前世代且已完成对齐；被并发 attach 取代返回 false；
+ * 订阅失败回滚进入前的 monitor 状态后抛出（调用方只报错） */
+async function attach(runId: string): Promise<boolean> {
+  const gen = ++generation;
   if (unsubscribe) {
     await unsubscribe().catch(() => {});
     unsubscribe = null;
   }
+  // 进入前快照：订阅失败时回滚，不留「运行中」的幻影 run
+  const prev = {
+    runId: monitor.runId,
+    workflowId: monitor.workflowId,
+    phase: monitor.phase,
+    status: monitor.status,
+    output: monitor.output,
+    fatalError: monitor.fatalError,
+    lastSeq: monitor.lastSeq,
+    nodes: monitor.nodes,
+    breadcrumb: monitor.breadcrumb,
+  };
   monitor.runId = runId;
   monitor.phase = "running";
+  monitor.status = null;
   monitor.output = undefined;
   monitor.fatalError = null;
   monitor.lastSeq = 0;
   monitor.nodes = [];
   buffer = [];
   aligned = false;
-  unsubscribe = await api.subscribeRun(runId, (env) => {
-    if (!aligned) {
-      buffer.push(env);
-      return;
+  try {
+    const unsub = await api.subscribeRun(runId, (env) => {
+      // 陈旧订阅的回调可能在退订前到达：只认本世代、本 run 的事件
+      if (!(gen === generation && runId === monitor.runId) || env.run_id !== runId) return;
+      if (!aligned) {
+        buffer.push(env);
+        return;
+      }
+      onEvent(env);
+    });
+    if (!(gen === generation && runId === monitor.runId)) {
+      // 期间已被新的 attach 取代：立即退订，防止回调泄漏/篡改新时间线
+      void unsub().catch(() => {});
+      return false;
     }
-    onEvent(env);
-  });
-  await resync();
-  aligned = true;
-  buffer.sort((a, b) => a.seq - b.seq).forEach(onEvent);
+    unsubscribe = unsub;
+    await resync();
+    if (!(gen === generation && runId === monitor.runId)) return false;
+    aligned = true;
+    drainBuffer(buffer, monitor.lastSeq).forEach(onEvent);
+    buffer = [];
+    return true;
+  } catch (e) {
+    if (!(gen === generation && runId === monitor.runId)) return false; // 已被新的 attach 取代：状态归它收尾
+    Object.assign(monitor, prev);
+    buffer = [];
+    aligned = false;
+    throw e;
+  }
+}
+
+/** 运行详情页入口：attach 到指定 run 并清空钻取栈 */
+export async function attachRun(runId: string): Promise<boolean> {
+  const ok = await attach(runId);
+  if (ok) monitor.breadcrumb = [];
+  return ok;
+}
+
+/** 离开运行详情页：退订并清空 monitor，使进行中的 attach 回调失效 */
+export async function detachRun(): Promise<void> {
+  generation++;
+  if (unsubscribe) {
+    await unsubscribe().catch(() => {});
+    unsubscribe = null;
+  }
+  monitor.runId = null;
+  monitor.workflowId = null;
+  monitor.phase = null;
+  monitor.status = null;
+  monitor.output = undefined;
+  monitor.fatalError = null;
+  monitor.lastSeq = 0;
+  monitor.nodes = [];
+  monitor.breadcrumb = [];
   buffer = [];
+  aligned = false;
 }
 
 /** 钻取 sub_workflow 节点的子 run */
@@ -104,21 +172,21 @@ export async function openChildRun(childRunId: string): Promise<void> {
   if (!monitor.runId || !monitor.workflowId || childRunId === monitor.runId) return;
   const parent = { runId: monitor.runId, workflowId: monitor.workflowId };
   try {
-    await attach(childRunId);
-    monitor.breadcrumb.push(parent);
+    if (await attach(childRunId)) monitor.breadcrumb.push(parent);
   } catch (e) {
-    ui.error = errText(e);
+    toast.error(errText(e));
   }
 }
 
 /** 返回上一级父 run */
 export async function backToParentRun(): Promise<void> {
-  const parent = monitor.breadcrumb.pop();
+  const parent = monitor.breadcrumb[monitor.breadcrumb.length - 1];
   if (!parent) return;
   try {
-    await attach(parent.runId);
+    // 只有 attach 成功才弹栈：失败时 monitor 已回滚到原 run，父级要留在栈里
+    if (await attach(parent.runId)) monitor.breadcrumb.pop();
   } catch (e) {
-    ui.error = errText(e);
+    toast.error(errText(e));
   }
 }
 
@@ -127,7 +195,7 @@ export async function cancelRun(): Promise<void> {
   try {
     await api.runCancel(monitor.runId);
   } catch (e) {
-    ui.error = errText(e);
+    toast.error(errText(e));
   }
 }
 
@@ -146,94 +214,36 @@ export async function deliverSignal(nodeId: string, payloadText: string): Promis
   try {
     await api.runSignal(monitor.runId, nodeId, payload);
   } catch (e) {
-    ui.error = errText(e);
+    toast.error(errText(e));
   }
 }
 
 /** seq 出现缺口（订阅 Lagged 丢事件）时整体重拉 timeline 对齐 */
 async function resync(): Promise<void> {
-  if (!monitor.runId) return;
+  // await 前记录世代与 runId：陈旧响应不得写回已切换的 monitor
+  const gen = generation;
+  const runId = monitor.runId;
+  if (!runId) return;
   try {
-    const tl = await api.runTimeline(monitor.runId);
-    monitor.nodes = tl.nodes;
-    monitor.phase = tl.phase;
-    monitor.output = tl.output;
-    monitor.fatalError = tl.fatal_error;
-    monitor.lastSeq = tl.last_seq;
+    const tl = await api.runTimeline(runId);
+    if (gen !== generation || runId !== monitor.runId) return;
+    alignProjection(monitor, tl);
     // 钻取子 run 后着色守卫按子 run 自己的工作流对齐
     monitor.workflowId = tl.workflow_id;
   } catch (e) {
-    ui.error = errText(e);
+    if (gen === generation && runId === monitor.runId) toast.error(errText(e));
   }
 }
 
 function onEvent(env: RunEvent): void {
-  if (env.seq <= monitor.lastSeq) return;
-  if (env.seq !== monitor.lastSeq + 1) {
-    void resync();
-    return;
-  }
-  applyEvent(env);
-}
-
-function applyEvent(env: RunEvent): void {
-  monitor.lastSeq = env.seq;
-  const rec = env.node_id ? monitor.nodes.find((n) => n.id === env.node_id) : undefined;
-  switch (env.type) {
-    case "run_started":
-      monitor.phase = "running";
-      break;
-    case "node_started":
-      if (rec) {
-        rec.state = "running";
-        rec.attempts = Math.max(rec.attempts, env.attempt ?? 1);
-        rec.started_at = env.ts;
-        rec.ended_at = null;
-        rec.duration_ms = null;
-        rec.output = null;
-        rec.error = null;
-        // 重试 = 新 attempt = 新的确定性 child_run_id
-        rec.child_run_id = env.child_run_id;
-      }
-      break;
-    case "node_completed":
-      if (rec) {
-        rec.state = "completed";
-        rec.attempts = Math.max(rec.attempts, env.attempt ?? 1);
-        rec.ended_at = env.ts;
-        rec.duration_ms = env.duration_ms ?? null;
-        rec.output = env.output ?? null;
-        rec.error = null;
-      }
-      break;
-    case "node_failed":
-      if (rec) {
-        rec.state = env.retryable ? "retrying" : "failed";
-        rec.attempts = Math.max(rec.attempts, env.attempt ?? 1);
-        rec.ended_at = env.ts;
-        rec.error = env.error ?? null;
-      }
-      break;
-    case "node_skipped":
-      if (rec) {
-        rec.state = "skipped";
-        rec.reason = env.reason;
-        rec.ended_at = env.ts;
-      }
-      break;
-    case "signal_received":
-      break; // 信号落盘本身不改变时间线，节点终态由后续事件推进
-    case "run_completed":
-      monitor.phase = "succeeded";
-      monitor.output = env.output;
-      break;
-    case "run_failed":
-      monitor.phase = "failed";
-      monitor.fatalError = env.error ?? null;
-      break;
-    case "run_cancelled":
-      monitor.phase = "cancelled";
-      break;
+  switch (seqAction(monitor.lastSeq, env.seq)) {
+    case "skip":
+      return;
+    case "resync":
+      void resync();
+      return;
+    case "apply":
+      applyEvent(monitor, env);
   }
 }
 

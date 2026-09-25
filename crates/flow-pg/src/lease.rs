@@ -16,9 +16,8 @@ use sqlx::{PgPool, Row};
 use crate::error::PgError;
 
 pub const MODE_PEER: &str = "peer";
-// 版本状态词汇表的单一来源在 flow-dto；此处重导出保持旧导入路径可用。
-pub use flow_dto::{STATUS_DRAFT, STATUS_PUBLISHED};
-const STATUS_ACTIVE: [&str; 2] = ["running", "awaiting_resume"];
+// 状态词汇表的单一来源在 flow-dto；此处重导出保持旧导入路径可用。
+pub use flow_dto::{DbRunStatus, STATUS_ACTIVE, STATUS_DRAFT, STATUS_PUBLISHED};
 
 /// 持锁后读到的 run 行快照。`expired` 用 SQL 表达式在锁内计算。
 #[derive(Debug)]
@@ -163,12 +162,13 @@ pub async fn renew(
         "UPDATE runs SET lease_expires_at = clock_timestamp() + make_interval(secs => $1)
          WHERE id = $2 AND lease_owner = $3 AND lease_epoch = $4
            AND lease_expires_at > clock_timestamp()
-           AND status IN ('running', 'awaiting_resume')",
+           AND status = ANY($5)",
     )
     .bind(ttl.as_secs_f64())
     .bind(run_id)
     .bind(instance_id)
     .bind(epoch)
+    .bind(&STATUS_ACTIVE[..])
     .execute(pool)
     .await
     .map_err(|e| flow_engine::EngineError::Backend(e.to_string()))?
@@ -257,11 +257,12 @@ pub async fn create_run(
     })?;
     sqlx::query(
         "INSERT INTO runs (id, workflow_id, workflow_version, status, input, started_at, last_seq)
-         VALUES ($1, $2, $3, 'running', $4, clock_timestamp(), 1)",
+         VALUES ($1, $2, $3, $4, $5, clock_timestamp(), 1)",
     )
     .bind(run_id)
     .bind(workflow_id)
     .bind(workflow_version)
+    .bind(DbRunStatus::Running.as_str())
     .bind(input)
     .execute(&mut *tx)
     .await?;

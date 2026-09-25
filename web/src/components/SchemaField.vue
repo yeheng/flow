@@ -14,7 +14,8 @@ const emit = defineEmits<{ "update:modelValue": [value: unknown] }>();
 const label = computed(() => props.schema["x-label"] ?? props.name);
 const help = computed(() => props.schema["x-help"]);
 
-type Widget = "text" | "number" | "boolean" | "enum" | "code" | "json" | "workflow-picker" | "object";
+type Widget =
+  "text" | "number" | "boolean" | "enum" | "code" | "json" | "workflow-picker" | "object";
 const widget = computed<Widget>(() => {
   if (props.schema.enum) return "enum";
   const w = props.schema["x-widget"];
@@ -177,3 +178,21 @@ function setChild(key: string, value: unknown): void {
     <div v-if="help" class="field-help">{{ help }}</div>
   </div>
 </template>
+
+<style scoped>
+input.checkbox {
+  width: auto;
+}
+
+fieldset.schema-object {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin: 0 0 10px;
+  padding: 8px;
+}
+
+fieldset.schema-object legend {
+  color: var(--text2);
+  font-size: 12px;
+}
+</style>

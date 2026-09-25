@@ -1,7 +1,7 @@
 //! flow-rpc：jsonrpsee WebSocket 服务（bin: flow-server）。
 //!
 //! 适配层重构后的职责边界（DESIGN.md §2）：
-//! - 本 crate **只依赖 flow-backend 的 `Backend` trait**，不感知
+//! - 本 crate **只依赖 flow-backend 的 `AnyBackend` 闭集枚举**，不感知
 //!   flow-store / flow-pg，也不读取 FLOW_BACKEND——后端选择在 main +
 //!   `flow_backend::open_from_env()` 完成一次，之后对 RPC 层完全透明；
 //! - SQLite + event.jsonl（canonical）与 Postgres（可替代）的语义差异
@@ -11,8 +11,9 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use flow_backend::{AnyBackend, BackendError, SignalAck};
-use flow_engine::{Definition, RunState, HTTP_METHODS};
+use flow_backend::{
+    AnyBackend, BackendError, Definition, NodeState, RunState, SignalAck, HTTP_METHODS,
+};
 use futures::StreamExt;
 use jsonrpsee::core::RegisterMethodError;
 use jsonrpsee::server::{Server, ServerHandle, SubscriptionMessage};
@@ -438,7 +439,7 @@ pub(crate) fn timeline_value(
                 "error": record.error,
                 "child_run_id": record.child_run_id,
             });
-            if let flow_engine::NodeState::Skipped { reason } = &record.state {
+            if let NodeState::Skipped { reason } = &record.state {
                 entry["reason"] = json!(reason);
             }
             entry

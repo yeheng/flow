@@ -79,13 +79,21 @@ export interface WorkflowDetail {
   published_version: number | null;
 }
 
-export type NodeRunState =
-  | "pending"
-  | "running"
-  | "retrying"
-  | "completed"
-  | "failed"
-  | "skipped";
+/** run.list / run.get 返回的运行记录（crates/flow-dto/src/lib.rs RunRecord） */
+export interface RunRecord {
+  id: string;
+  workflow_id: string;
+  workflow_version: number;
+  status: string;
+  input: unknown;
+  /** Option<Value>：未结束时为 null */
+  output: unknown;
+  error: string | null;
+  started_at: string;
+  ended_at: string | null;
+}
+
+export type NodeRunState = "pending" | "running" | "retrying" | "completed" | "failed" | "skipped";
 
 /** run.timeline 节点条目（crates/flow-rpc/src/lib.rs timeline_value） */
 export interface TimelineNode {

@@ -64,3 +64,47 @@ function onClickAdd(nt: NodeTypeDesc): void {
     <p class="palette-hint">拖拽到画布，或点击添加节点</p>
   </div>
 </template>
+
+<style scoped>
+.palette-cat {
+  color: var(--text3);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin: 8px 0 4px;
+}
+
+.palette-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 9px;
+  border-radius: 7px;
+  border: 1px solid transparent;
+  cursor: grab;
+  user-select: none;
+  font-size: 12px;
+  font-weight: 500;
+  transition:
+    background 0.15s,
+    border-color 0.15s;
+}
+
+.palette-item:hover {
+  background: var(--surface2);
+  border-color: var(--border);
+}
+
+.palette-item:active {
+  cursor: grabbing;
+}
+
+.palette-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 3px;
+  flex-shrink: 0;
+  background: var(--cat-color, var(--text3));
+}
+</style>

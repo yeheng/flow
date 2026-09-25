@@ -22,16 +22,9 @@ impl InboxKind {
     }
 }
 
-/// 入队后的观察结果（轮询所得）。
-#[derive(Debug, Clone)]
-pub struct SignalAck {
-    pub signal_id: String,
-    /// applied：已写入事件并生效；rejected：非法请求被拒；pending：尚未处理。
-    pub status: String,
-    pub delivered: bool,
-    pub event_seq: Option<u64>,
-    pub error: Option<Value>,
-}
+/// 入队后的观察结果（轮询所得）。类型单一来源在 flow-dto；
+/// Postgres 的 signal_id 是真实落账的 inbox 主键，构造时始终 Some。
+pub use flow_dto::SignalAck;
 
 /// 入队结果。
 #[derive(Debug)]
@@ -87,7 +80,7 @@ pub async fn enqueue(
         let error: Option<Value> = row.try_get("error")?;
         tx.commit().await?;
         return Ok(EnqueueOutcome::Existing(SignalAck {
-            signal_id: signal_id.to_string(),
+            signal_id: Some(signal_id.to_string()),
             delivered: status == "applied",
             status,
             event_seq: event_seq.map(|s| s as u64),
@@ -95,7 +88,7 @@ pub async fn enqueue(
         }));
     }
 
-    let is_terminal = !matches!(run_status.as_str(), "running" | "awaiting_resume");
+    let is_terminal = !flow_dto::DbRunStatus::is_active_str(&run_status);
     if is_terminal {
         return Err(PgError::Conflict(format!(
             "run {run_id} 已终结（{run_status}），拒绝新的输入"
@@ -137,7 +130,7 @@ pub async fn status_of(pool: &PgPool, run_id: &str, signal_id: &str) -> Result<S
     let event_seq: Option<i64> = row.try_get("event_seq")?;
     let error: Option<Value> = row.try_get("error")?;
     Ok(SignalAck {
-        signal_id: signal_id.to_string(),
+        signal_id: Some(signal_id.to_string()),
         delivered: status == "applied",
         status,
         event_seq: event_seq.map(|s| s as u64),

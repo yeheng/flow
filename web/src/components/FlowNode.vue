@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import { Handle, Position } from "@vue-flow/core";
-import { editor, sourcePortsOf, type FlowNodeData } from "../state/editor";
+import { editor, nodeValidationError, sourcePortsOf, type FlowNodeData } from "../state/editor";
 import { nodeChildRunId, nodeRunState, openChildRun } from "../state/monitor";
 
 const props = defineProps<{
@@ -13,8 +13,14 @@ const props = defineProps<{
 // 协议约定：id 为 "in" 的是入端口（target），其余都是出端口（source）
 const targetPorts = computed(() => props.data.nodeType.ports.filter((p) => p.id === "in"));
 const sourcePorts = computed(() => sourcePortsOf(props.data.nodeType));
-const runState = computed(() => nodeRunState(props.id));
-const childRunId = computed(() => nodeChildRunId(props.id));
+// 只读运行画布（RunCanvas）在 data 里显式注入 runState/childRunId（键存在即生效，可为 null）；
+// 编辑器画布不含这两个键，走 monitor 查询
+const runState = computed(() =>
+  "runState" in props.data ? (props.data.runState as string | null) : nodeRunState(props.id),
+);
+const childRunId = computed(() =>
+  "childRunId" in props.data ? (props.data.childRunId as string | null) : nodeChildRunId(props.id),
+);
 
 const type = computed(() => props.data.nodeType.type);
 const isCapsule = computed(() => type.value === "start" || type.value === "end");
@@ -50,12 +56,16 @@ const subWarning = computed(() => {
   return "";
 });
 
+/** 前端预校验错误（画布标红 + title 提示） */
+const invalidMsg = computed(() => nodeValidationError(props.id));
+
 const nodeClass = computed(() => {
   const cls = [`cat-${props.data.nodeType.category}`];
   if (isCapsule.value) cls.push("capsule");
   if (isSubWorkflow.value) cls.push("sub-workflow");
   if (runState.value) cls.push(`run-${runState.value}`);
   if (editor.highlightNodeId === props.id) cls.push("highlighted");
+  if (invalidMsg.value) cls.push("invalid");
   return cls;
 });
 
@@ -67,11 +77,11 @@ function sourceStyle(index: number, total: number) {
 </script>
 
 <template>
-  <div class="flow-node" :class="nodeClass">
+  <div class="flow-node" :class="nodeClass" :title="invalidMsg ?? undefined">
     <Handle
       v-for="p in targetPorts"
-      :key="p.id"
       :id="p.id"
+      :key="p.id"
       type="target"
       :position="Position.Left"
     />
@@ -97,8 +107,8 @@ function sourceStyle(index: number, total: number) {
     </div>
     <Handle
       v-for="(p, i) in sourcePorts"
-      :key="p.id"
       :id="p.id"
+      :key="p.id"
       type="source"
       :position="Position.Right"
       :style="sourceStyle(i, sourcePorts.length)"
@@ -106,3 +116,165 @@ function sourceStyle(index: number, total: number) {
     />
   </div>
 </template>
+
+<style scoped>
+.flow-node {
+  min-width: 160px;
+  max-width: 220px;
+  background: var(--surface);
+  border: 1px solid var(--border2);
+  border-radius: var(--radius);
+  box-shadow: 0 2px 12px var(--shadow);
+  transition:
+    box-shadow 0.15s,
+    border-color 0.15s;
+}
+
+.flow-node:hover {
+  border-color: var(--hover-border);
+  box-shadow: 0 4px 20px var(--shadow-hover);
+}
+
+/* 选中态：祖先 .vue-flow__node 在组件外，scoped 只给末级选择器加属性，仍可命中 */
+.vue-flow__node.selected .flow-node {
+  border-color: var(--accent);
+  box-shadow:
+    0 0 0 2px rgba(124, 108, 255, 0.35),
+    0 4px 20px var(--shadow-hover);
+}
+
+.node-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+}
+
+.node-icon {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  color: var(--cat-color, var(--text2));
+  stroke: currentColor;
+  stroke-width: 1.5;
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.node-name {
+  flex: 1;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.node-body {
+  padding: 0 12px 10px;
+}
+
+.node-type {
+  color: var(--text3);
+  font-size: 9px;
+  font-weight: 500;
+  font-family: var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+/* start/end 胶囊形 */
+.flow-node.capsule {
+  min-width: 0;
+  border-radius: 999px;
+}
+
+.flow-node.capsule .node-head {
+  padding: 7px 16px;
+}
+
+/* sub_workflow 卡片 */
+.node-sub-target {
+  margin-top: 4px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--surface2);
+  font-size: 11px;
+  color: var(--text2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.node-sub-target.missing {
+  color: var(--danger);
+}
+
+.node-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--warn);
+  color: #0f0f11;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: help;
+  flex: none;
+}
+
+.node-drill {
+  color: var(--text3);
+  font-size: 12px;
+}
+
+.node-child-link {
+  margin-top: 6px;
+  font-size: 11px;
+  padding: 1px 8px;
+}
+
+/* RunPanel 行 hover/click 联动 */
+.flow-node.highlighted {
+  border-color: #a371f7;
+  box-shadow:
+    0 0 0 2px rgba(163, 113, 247, 0.35),
+    0 4px 20px var(--shadow-hover);
+}
+
+/* 运行状态着色 */
+.flow-node.run-running {
+  border-color: var(--run);
+  background: rgba(88, 166, 255, 0.12);
+}
+
+.flow-node.run-retrying {
+  border-color: var(--warn);
+  background: rgba(210, 153, 34, 0.12);
+}
+
+.flow-node.run-completed {
+  border-color: var(--ok);
+  background: rgba(63, 185, 80, 0.12);
+}
+
+.flow-node.run-failed {
+  border-color: var(--danger);
+  background: rgba(248, 81, 73, 0.12);
+}
+
+.flow-node.run-skipped {
+  opacity: 0.5;
+}
+
+/* 前端预校验错误标红 */
+.flow-node.invalid {
+  border-color: var(--danger);
+  box-shadow:
+    0 0 0 2px rgba(248, 81, 73, 0.3),
+    0 2px 12px var(--shadow);
+}
+</style>

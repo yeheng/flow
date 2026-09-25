@@ -17,3 +17,8 @@ flow-engine = { path = "../flow-engine" }
 flow-dto = { path = "../flow-dto" }
 flow-store = { path = "../flow-store" }
 flow-pg = { path = "../flow-pg" }
+
+[dev-dependencies]
+chrono = { workspace = true }
+parking_lot = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

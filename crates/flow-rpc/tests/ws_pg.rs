@@ -8,10 +8,10 @@ use std::net::{SocketAddr, TcpListener};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+use futures::StreamExt;
 use jsonrpsee::core::client::{ClientT, SubscriptionClientT};
 use jsonrpsee::core::params::ObjectParams;
 use jsonrpsee::ws_client::{WsClient, WsClientBuilder};
-use futures::StreamExt;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;

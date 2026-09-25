@@ -16,12 +16,12 @@ jsonrpsee = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 futures = { workspace = true }
-flow-engine = { path = "../flow-engine" }
 flow-backend = { path = "../flow-backend" }
 
 [dev-dependencies]
 uuid = { workspace = true }
 chrono = { workspace = true }
 sqlx = { workspace = true, features = ["postgres", "json"] }
+flow-engine = { path = "../flow-engine" }
 flow-store = { path = "../flow-store" }
 flow-pg = { path = "../flow-pg" }

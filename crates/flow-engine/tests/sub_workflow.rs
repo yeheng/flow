@@ -3,8 +3,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use flow_engine::{
-    ChildRunLauncher, ChildRunOutcome, Definition, Engine, EngineError, Event, EventLog, NodeState,
-    NoopObserver, RunPhase, RunState, StartRun, MAX_SUB_WORKFLOW_DEPTH,
+    ChildRunLauncher, ChildRunOutcome, DbRunStatus, Definition, Engine, EngineError, Event,
+    EventLog, NodeState, NoopObserver, RunObserver, RunPhase, RunState, StartRun, StatusUpdate,
+    MAX_SUB_WORKFLOW_DEPTH,
 };
 use futures::future::BoxFuture;
 use serde_json::{json, Value};
@@ -23,6 +24,8 @@ enum Outcome {
     Fail(String),
     /// 永不终态，直到 cancel（用于取消级联测试）
     Pending,
+    /// 等待子 run 时遭遇基础设施故障（DB 不可用等）：应挂起 run 而非判死
+    PlatformFault,
 }
 
 impl MockLauncher {
@@ -73,6 +76,7 @@ impl ChildRunLauncher for MockLauncher {
             match &self.outcome {
                 Outcome::Succeed(value) => Ok(ChildRunOutcome::Succeeded(value.clone())),
                 Outcome::Fail(error) => Ok(ChildRunOutcome::Failed(error.clone())),
+                Outcome::PlatformFault => Err(EngineError::Backend("db 连接中断".into())),
                 Outcome::Pending => {
                     cancel.cancelled().await;
                     Ok(ChildRunOutcome::Cancelled)
@@ -125,6 +129,90 @@ impl Harness {
 impl Drop for Harness {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// 平台故障分类（DESIGN §7）：等子 run 期间的基础设施故障必须挂起 run
+///（投影 awaiting_resume），绝不写 run_failed 终态——那会把运维故障
+/// 伪造成业务失败，恢复后也无法自动续跑。
+#[tokio::test]
+async fn launcher_platform_fault_suspends_run_instead_of_failing() {
+    let root = std::env::temp_dir().join(format!("flow-subwf-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&root).unwrap();
+    let statuses = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let engine = Engine::new(
+        &root,
+        Arc::new(RecordingObserver {
+            statuses: statuses.clone(),
+        }),
+    );
+    engine.set_child_launcher(Arc::new(MockLauncher::new(Outcome::PlatformFault)));
+
+    let run_id = format!("run-{}", uuid::Uuid::now_v7());
+    engine
+        .start_run(StartRun {
+            run_id: run_id.clone(),
+            workflow_id: "parent-wf".into(),
+            workflow_version: 1,
+            definition: parent_def(),
+            input: json!({"amount": 1}),
+            depth: 0,
+        })
+        .await
+        .unwrap();
+
+    // Driver 挂起后自行退出（不写终态）
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while engine.is_live(&run_id) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("driver 未退出");
+
+    let state = engine.snapshot(&run_id).await.unwrap();
+    assert!(!state.phase.is_terminal(), "平台故障不得写终态：{state:?}");
+    let events = engine.read_events(&run_id, None).await.unwrap();
+    assert!(
+        events.iter().all(|e| !matches!(
+            e.event,
+            Event::RunFailed { .. } | Event::RunCompleted { .. } | Event::RunCancelled { .. }
+        )),
+        "日志里不得出现终态事件：{events:?}"
+    );
+    // 失败节点留 Running，恢复/接管时可附着既有子 run 重试
+    assert!(
+        matches!(state.record("sub").state, NodeState::Running { .. }),
+        "sub_workflow 节点应留 Running：{:?}",
+        state.record("sub")
+    );
+
+    let seen = statuses.lock().clone();
+    assert!(
+        seen.iter().any(|(s, _)| *s == DbRunStatus::AwaitingResume),
+        "必须投影 awaiting_resume：{seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|(s, _)| *s == DbRunStatus::Failed),
+        "不得投影 failed：{seen:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+type StatusLog = Arc<parking_lot::Mutex<Vec<(DbRunStatus, Option<String>)>>>;
+
+#[derive(Clone)]
+struct RecordingObserver {
+    statuses: StatusLog,
+}
+
+impl RunObserver for RecordingObserver {
+    fn on_status<'a>(&'a self, update: StatusUpdate<'a>) -> BoxFuture<'a, ()> {
+        self.statuses
+            .lock()
+            .push((update.status, update.error.map(str::to_string)));
+        Box::pin(async {})
     }
 }
 

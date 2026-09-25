@@ -152,14 +152,14 @@ async fn scan(
         if cursor.done {
             continue;
         }
-        let events = match PgRunSink::read_events(store.pool(), &id, Some(cursor.last_seq + 1)).await
-        {
-            Ok(events) => events,
-            Err(err) => {
-                tracing::debug!(run_id = %id, error = %err, "订阅增量读取失败，下轮重试");
-                continue;
-            }
-        };
+        let events =
+            match PgRunSink::read_events(store.pool(), &id, Some(cursor.last_seq + 1)).await {
+                Ok(events) => events,
+                Err(err) => {
+                    tracing::debug!(run_id = %id, error = %err, "订阅增量读取失败，下轮重试");
+                    continue;
+                }
+            };
         let drained = events.is_empty();
         for envelope in events {
             // 没有本地订阅者时 send 返回 Err，游标照常推进

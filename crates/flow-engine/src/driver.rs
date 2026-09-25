@@ -696,9 +696,11 @@ impl Driver {
                 result,
                 duration_ms,
             } => {
-                self.inflight.remove(&node_id);
                 // 防御：只有当前 attempt 的结果才生效。中断/裁决重派后旧任务的
                 // 消息可能仍在通道里，迟到结果不得覆盖新 attempt 的状态。
+                // 顺序很关键：inflight 不带 attempt 维度，先 remove 会把当前
+                // attempt 的 JoinHandle 误摘掉（违反「每个 handle 恰欠一条
+                // DriverMsg」不变量），必须确认归属后再摘。
                 if !matches!(
                     self.state.record(&node_id).state,
                     NodeState::Running { attempt: current } if current == attempt
@@ -711,6 +713,7 @@ impl Driver {
                     );
                     return Ok(());
                 }
+                self.inflight.remove(&node_id);
                 match result {
                     Ok(output) => {
                         self.append(Event::NodeCompleted {
@@ -722,6 +725,12 @@ impl Driver {
                         .await?;
                     }
                     Err(failure) => {
+                        // 平台故障（IO/Backend/日志损坏）不是工作流失败：
+                        // 不写 NodeFailed，冒泡到 run() 投影 awaiting_resume
+                        // （与 sink 故障同一分类出口），节点留 Running 等恢复。
+                        if failure.platform {
+                            return Err(EngineError::Backend(failure.message));
+                        }
                         let policy = self
                             .definition
                             .node(&node_id)
@@ -781,10 +790,10 @@ impl Driver {
             return serde_json::from_value(signal.payload.clone())
                 .map(SignalAction::Adjudicate)
                 .map_err(|err| {
-                    EngineError::Node(format!("节点 {} 的裁决非法：{err}", signal.node_id))
+                    EngineError::InvalidSignal(format!("节点 {} 的裁决非法：{err}", signal.node_id))
                 });
         }
-        Err(EngineError::Node(format!(
+        Err(EngineError::InvalidSignal(format!(
             "节点 {} 当前不等待信号",
             signal.node_id
         )))

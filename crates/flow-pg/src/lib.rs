@@ -40,36 +40,38 @@ pub const EVENTS_CHANNEL: &str = "flow_events";
 pub async fn event_notifications(
     pool: &PgPool,
 ) -> Result<tokio::sync::mpsc::Receiver<String>, PgError> {
-    let listener = sqlx::postgres::PgListener::connect_with(pool).await?;
+    let mut listener = sqlx::postgres::PgListener::connect_with(pool).await?;
+    // 契约：返回前必须完成首次 LISTEN，调用方随后产生的事件必然可达。
+    listener.listen(EVENTS_CHANNEL).await?;
     let pool = pool.clone();
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(256);
     tokio::spawn(async move {
-        let mut listener = listener;
         let mut backoff = Duration::from_millis(200);
         loop {
-            if let Err(err) = listener.listen(EVENTS_CHANNEL).await {
-                tracing::warn!("pg LISTEN {EVENTS_CHANNEL} 失败：{err}");
-            } else {
-                backoff = Duration::from_millis(200);
-                loop {
-                    match listener.recv().await {
-                        Ok(note) => {
-                            if tx.send(note.payload().to_string()).await.is_err() {
-                                return; // 订阅方已 drop
-                            }
-                        }
-                        Err(err) => {
-                            tracing::warn!("pg 事件通知接收失败，{backoff:?} 后重连：{err}");
-                            break;
-                        }
-                    }
+            // 通知投递直到连接出错（订阅方已 drop 则退出）
+            while let Ok(note) = listener.recv().await {
+                if tx.send(note.payload().to_string()).await.is_err() {
+                    return;
                 }
             }
+            tracing::warn!("pg 事件通知连接中断，{backoff:?} 后重连");
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(Duration::from_secs(5));
-            match sqlx::postgres::PgListener::connect_with(&pool).await {
-                Ok(new) => listener = new,
-                Err(err) => tracing::warn!("pg 事件通知重连失败：{err}"),
+            // 重连成功必须重新 LISTEN，否则静默丢通知
+            loop {
+                match sqlx::postgres::PgListener::connect_with(&pool).await {
+                    Ok(mut new) => match new.listen(EVENTS_CHANNEL).await {
+                        Ok(()) => {
+                            listener = new;
+                            backoff = Duration::from_millis(200);
+                            break;
+                        }
+                        Err(err) => tracing::warn!("pg LISTEN {EVENTS_CHANNEL} 失败：{err}"),
+                    },
+                    Err(err) => tracing::warn!("pg 事件通知重连失败：{err}"),
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(5));
             }
         }
     });
@@ -94,11 +96,8 @@ pub struct CreateRun {
     pub input: Value,
 }
 
-#[derive(Debug)]
-pub struct CreatedRun {
-    pub run_id: String,
-    pub workflow_version: i64,
-}
+/// run 创建结果。类型单一来源在 flow-dto。
+pub use flow_dto::CreatedRun;
 
 impl PgEngine {
     /// 连接并初始化 schema。会话级超时按 §5.1 配置。
@@ -125,13 +124,15 @@ impl PgEngine {
             .await?;
         schema::init(&pool).await?;
         let store = metadata::PgStore::new(pool.clone());
+        let hub = subscribe::EventHub::start(pool.clone(), cfg.clone());
         let executor = match cfg.role {
             Role::Gateway => None,
-            Role::All | Role::Executor => {
-                Some(Arc::new(ExecutorState::new(instance_uuid(), cfg.max_runs)))
-            }
+            Role::All | Role::Executor => Some(Arc::new(ExecutorState::new(
+                instance_uuid(),
+                cfg.max_runs,
+                hub.clone(),
+            ))),
         };
-        let hub = subscribe::EventHub::start(pool.clone(), cfg.clone());
         Ok(PgEngine {
             pool,
             store,

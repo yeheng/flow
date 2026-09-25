@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { editor, selectedNode } from "../state/editor";
+import { selectedNode } from "../state/editor";
+import { commitParams } from "../state/history";
 import SchemaField from "./SchemaField.vue";
 
 const node = selectedNode;
@@ -9,19 +10,20 @@ const desc = computed(() => data.value?.nodeType ?? null);
 const schema = computed(() => desc.value?.params_schema ?? null);
 
 function onName(ev: Event): void {
-  if (!data.value) return;
+  if (!data.value || !node.value) return;
+  // 同字段连续输入合并为一条 undo 历史
+  commitParams(`${node.value.id}:__name__`);
   data.value.name = (ev.target as HTMLInputElement).value;
-  editor.dirty = true;
 }
 
 function setParam(name: string, value: unknown): void {
-  if (!data.value) return;
+  if (!data.value || !node.value) return;
+  commitParams(`${node.value.id}:${name}`);
   if (value === undefined) {
     delete data.value.params[name];
   } else {
     data.value.params[name] = value;
   }
-  editor.dirty = true;
 }
 
 const retry = computed(
@@ -83,3 +85,17 @@ function setRetry(key: "max_attempts" | "backoff_ms", ev: Event): void {
     <p v-else class="params-hint">点击画布中的节点编辑参数</p>
   </div>
 </template>
+
+<style scoped>
+fieldset.retry {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin: 0;
+  padding: 8px;
+}
+
+fieldset.retry legend {
+  color: var(--text2);
+  font-size: 12px;
+}
+</style>

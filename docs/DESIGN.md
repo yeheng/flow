@@ -1,10 +1,10 @@
 # flow 工作流引擎设计方案
 
 > 状态：单机实现 + 对等模式多节点执行（`DISTRIBUTED.md`，Postgres 后端）；
-> `cargo test --workspace --all-targets --locked` 85 个测试全绿；验证命令与覆盖范围见 §13。
+> `cargo test --workspace --all-targets --locked` 94 个测试全绿；验证命令与覆盖范围见 §13。
 > 本文描述当前代码的实际语义，是后续开发的权威参考。
 > 架构焊点：**SQLite + events.jsonl 是默认与权威后端**（canonical）；Postgres 是
-> 可替代后端，两者统一在 `flow-backend` 的 `Backend` trait 之后（§2）。
+> 可替代后端，两者统一在 `flow-backend` 的 `AnyBackend` 闭集枚举之后（§2）。
 
 > **⚠️ 安全边界（部署前必读）**：本服务**没有任何认证/授权**——JSON-RPC
 > WebSocket 谁连上谁就是管理员。默认只监听 `127.0.0.1:9800`；对外暴露
@@ -282,8 +282,9 @@ Postgres `PgChildLauncher` 经 `lease::create_run` 单事务创建子 run、
 - **深度上限 8**（`MAX_SUB_WORKFLOW_DEPTH`）：validate 检不了跨 definition 的
   循环引用，运行时 `depth >= 8` 直接 fatal；depth 经 `run_started` 落盘，
   恢复时读回；
-- **失败分类**：子 run failed/cancelled → 父节点 fatal；launcher 基础设施错误
-  （启动/等待失败）→ retryable；未配置 launcher 时执行即 fatal；
+- **失败分类**：子 run failed/cancelled → 父节点 fatal；launcher 错误按平台
+  故障分类分流——IO/Backend/日志损坏 → 挂起 awaiting_resume（不当作工作流
+  失败，§12.13），其余基础设施错误 → retryable；未配置 launcher 时执行即 fatal；
 - **取消级联 best-effort**：父 run 取消时先对仍在 Running 的 sub_workflow 节点
   发起子 run 取消，再写 `RunCancelled`；取消失败只记日志，不升级。
 
@@ -405,7 +406,9 @@ JSON-RPC 允许整体省略 params（到达 null），解析层统一归一为 `
   `signal_id` / `event_seq` 字段（仅在真实存在时返回）；
 - `run.signal_status`：SQLite 后端从「方法不存在」变为「存在但返回 -32010
   明确错误」；Postgres 语义不变；
-- 自托管 web 前端不读上述响应体，无需变更；外部消费者按本节对齐。
+- 响应面：自托管 web 前端不读上述响应体，无需变更；请求面：`run.signal` 必须
+  携带 `signal_id`（Postgres 必填，前端已在 `web/src/api/flow.ts` 生成）；
+  外部消费者按本节对齐。
 
 ## 10. JS 沙箱（expr.rs）
 
@@ -429,6 +432,10 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
 - `expand_templates`：http_call 的 url/headers/body 中 `${expr}` 展开。
   **限制**：`${...}` 内不能包含 `}`（按第一个 `}` 截断），
   不支持嵌套对象字面量等复杂表达式。
+
+数据契约限制：进出沙箱的数据经 JS Number（f64）——绝对值大于 2^53 的整数
+（雪花 ID、高精度金额）会被静默舍入（9007199254740993 → …0992）并沿节点
+输出向下游传播。大整数必须以字符串传递；重试/重放同样舍入，不影响决定论。
 
 ## 11. http_call 语义
 
@@ -463,6 +470,9 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
 13. 平台故障（IO/Backend/日志损坏）与工作流失败分离：前者投影
     `awaiting_resume` 等待恢复/人工，只有工作流语义失败才写 run_failed 终态；
     所有权丢失（LeaseLost）则静默退出，三者互不冒充。
+14. 一个 run 至多一个活 Driver（engine registry 原子占位 reserve_run）：
+    重复 start/resume 是无操作，绝不允许第二个写者——EventLog 各自计数 seq，
+    双写者必然产生重复 seq 与重复副作用。
 
 ## 13. 测试策略
 
@@ -487,6 +497,10 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
 - `engine_recovery.rs` 钉住节点输入面语义：`nodes` 只暴露直接前驱输出，
   非前驱引用深层访问即 fatal（`nodes_scope_*`）；
 - `child_await.rs` 钉住父 run 等待初始化中断子 run 不挂死（空日志 → DB 投影）；
+- 回归护栏：重复恢复不产生第二个写者（engine_recovery）、平台故障挂起不写
+  run_failed（sub_workflow）、订阅缺口补齐与失败重试（flow-backend run_tail）、
+  子 run 重放沿用钉版本（child_version_pin）、信号错误码与订阅回放契约
+  （contracts）；
 - store 并发测试核对每个返回版本对应的定义及相同定义的版本复用；
 - 测试数据库必须放在独占目录的 `flow.db`，只清理独占目录，禁止删除系统临时目录；
 - **Postgres 后端**：租约 fencing、接管窗口、恢复分类与 inbox 幂等由
@@ -505,4 +519,6 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
 - 中心指派模式（`SCHEDULER.md` 待实施；对等模式已按 `DISTRIBUTED.md` 实现，
   未做多节点压测）；
 - 跨进程 SIGSTOP 场景下的真实副作用计数验收（副作用准入已用确定性前缀测试钉住）；
-- Postgres 订阅对未跟踪 run 从头回放（单机 broadcast 只推增量），语义差异已记录。
+- 不指定 run_id 的全局订阅仍有后端差异：SQLite 只推本进程事件、Postgres 推
+  全集群增量；指定 run_id 的回放 + 追流 + 终态结束语义两后端已统一
+  （flow-backend 的 run_tail 状态机）。

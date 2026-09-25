@@ -9,12 +9,10 @@
 //!   LISTEN/NOTIFY 作低延迟唤醒（DISTRIBUTED.md §8）；
 //! - 生命周期：start 起 executor 扫描循环（gateway 角色跳过），shutdown 优雅停机。
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 
-use futures::StreamExt;
+use futures::future::BoxFuture;
 use serde_json::Value;
-use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 use flow_engine::{Envelope, RunState};
@@ -167,10 +165,6 @@ impl PgBackend {
                 input: spec.input,
             })
             .await
-            .map(|created| CreatedRun {
-                run_id: created.run_id,
-                workflow_version: created.workflow_version,
-            })
             .map_err(pg_err)
     }
 
@@ -220,7 +214,6 @@ impl PgBackend {
         self.engine
             .signal(&req.run_id, &signal_id, &req.node_id, &req.payload)
             .await
-            .map(Into::into)
             .map_err(pg_err)
     }
 
@@ -230,11 +223,7 @@ impl PgBackend {
         run_id: &str,
         signal_id: Option<String>,
     ) -> Result<SignalAck, BackendError> {
-        self.engine
-            .cancel(run_id, signal_id)
-            .await
-            .map(Into::into)
-            .map_err(pg_err)
+        self.engine.cancel(run_id, signal_id).await.map_err(pg_err)
     }
 
     /// pg 专属能力（不在 AnyBackend 公共面上）：查询持久 inbox 的落账状态。
@@ -247,119 +236,40 @@ impl PgBackend {
         self.engine
             .signal_status(run_id, signal_id)
             .await
-            .map(Into::into)
             .map_err(pg_err)
     }
 
     /// 订阅：进程内共享轮询器把共享日志的增量扇出给所有订阅者（DISTRIBUTED.md §8），
     /// 查询次数与订阅者数无关；LISTEN/NOTIFY 是低延迟唤醒提示，正确性不依赖通知，
     /// 通知丢失由 subscribe_poll 兜底轮询兜住。
-    /// 不指定 run_id：纯实时增量（与 SQLite 后端的 broadcast 语义一致），
-    /// 历史事件用 run.events 补齐；指定 run_id：先回放完整日志再接实时增量
-    ///（按 seq 去重、缺口自动补齐），该 run 已终结追平后流自然结束。
+    /// 不指定 run_id：纯实时增量（共享轮询器扇出，扫描次数与订阅者数无关），
+    /// 历史事件用 run.events 补齐；指定 run_id：回放 + 追流、缺口补齐、
+    /// 终态自然结束（与 SQLite 臂共用 run_tail，语义一致）。
     pub fn subscribe(
         &self,
         run_id: Option<String>,
     ) -> futures::stream::BoxStream<'static, Envelope> {
-        let Some(run_id) = run_id else {
-            return crate::broadcast_tail(self.engine.subscribe_events(), None);
-        };
-        // 先挂共享流再回放历史：回放期间的新事件暂存在广播通道里，
-        // 按 seq 去重后接续，无缝且不重复
-        let rx = self.engine.subscribe_events();
-        let tail = RunTail::new(self.engine.clone(), rx, run_id);
-        futures::stream::unfold(tail, |mut tail| async move {
-            tail.advance().await.map(|env| (env, tail))
-        })
-        .boxed()
+        match run_id {
+            None => crate::broadcast_tail(self.engine.subscribe_events(), None),
+            Some(run_id) => crate::run_tail::run_tail(
+                Arc::new(PgReader(self.engine.clone())),
+                self.engine.subscribe_events(),
+                run_id,
+            ),
+        }
     }
 }
 
-/// 指定 run 的「回放 + 实时追流」状态机：回放从 seq=1 起，
-/// 实时段按 seq 去重（游标本体），缺口用 run.events 补齐，
-/// 终态事件转发后流自然结束。
-struct RunTail {
-    engine: Arc<PgEngine>,
-    rx: broadcast::Receiver<Envelope>,
-    run_id: String,
-    last_seq: u64,
-    backlog: VecDeque<Envelope>,
-    backfilled: bool,
-    done: bool,
-}
+/// 共享日志的读取适配（run_tail 的 EventReader 实现）。
+struct PgReader(Arc<PgEngine>);
 
-impl RunTail {
-    fn new(engine: Arc<PgEngine>, rx: broadcast::Receiver<Envelope>, run_id: String) -> RunTail {
-        RunTail {
-            engine,
-            rx,
-            run_id,
-            last_seq: 0,
-            backlog: VecDeque::new(),
-            backfilled: false,
-            done: false,
-        }
-    }
-
-    async fn advance(&mut self) -> Option<Envelope> {
-        loop {
-            while let Some(envelope) = self.backlog.pop_front() {
-                // 补齐段与实时段重叠产生的重复：按 seq 去重
-                if envelope.seq <= self.last_seq {
-                    continue;
-                }
-                self.last_seq = envelope.seq;
-                if envelope.event.is_run_terminal() {
-                    self.done = true;
-                }
-                return Some(envelope);
-            }
-            if self.done {
-                return None;
-            }
-            if !self.backfilled {
-                // 回放完整历史（run 可能已终结：回放含终态事件，流将自然结束）
-                self.backfilled = true;
-                self.fill(1).await;
-                continue;
-            }
-            match self.rx.recv().await {
-                Ok(envelope) if envelope.run_id == self.run_id => {
-                    if envelope.seq > self.last_seq + 1 {
-                        // 缺口（广播 Lagged 或共享轮询跳过）：先补齐再接续
-                        self.fill(self.last_seq + 1).await;
-                    }
-                    self.backlog.push_back(envelope);
-                }
-                Ok(_) => {}
-                // Lagged：丢事件不致命，整体补齐
-                Err(broadcast::error::RecvError::Lagged(_)) => self.fill(self.last_seq + 1).await,
-                // 共享轮询器已停（进程停机）：补齐剩余后结束
-                Err(broadcast::error::RecvError::Closed) => {
-                    self.fill(self.last_seq + 1).await;
-                    if self.backlog.is_empty() {
-                        return None;
-                    }
-                }
-            }
-        }
-    }
-
-    /// 从 from_seq 起把缺失段读入 backlog（只收 seq 严格递增的部分）。
-    /// 读失败只记日志：下一次唤醒/轮询会再试，不死等也不谎报终结。
-    async fn fill(&mut self, from_seq: u64) {
-        match self.engine.read_events(&self.run_id, Some(from_seq)).await {
-            Ok(events) => {
-                for envelope in events {
-                    if envelope.seq > self.last_seq {
-                        self.backlog.push_back(envelope);
-                    }
-                }
-            }
-            Err(err) => {
-                tracing::debug!(run_id = %self.run_id, error = %err, "订阅补齐读取失败，稍后重试");
-            }
-        }
+impl crate::run_tail::EventReader for PgReader {
+    fn read_events<'a>(
+        &'a self,
+        run_id: &'a str,
+        from_seq: Option<u64>,
+    ) -> BoxFuture<'a, Result<Vec<Envelope>, BackendError>> {
+        Box::pin(async move { self.0.read_events(run_id, from_seq).await.map_err(pg_err) })
     }
 }
 
@@ -391,18 +301,5 @@ fn pg_err(err: PgError) -> BackendError {
         PgError::Conflict(msg) => BackendError::Conflict(msg),
         PgError::Invalid(msg) => BackendError::Invalid(msg),
         other => BackendError::internal(other),
-    }
-}
-
-impl From<flow_pg::gateway::SignalAck> for SignalAck {
-    fn from(ack: flow_pg::gateway::SignalAck) -> Self {
-        // Postgres 的 signal_id 是真实落账的 inbox 主键，可查询，始终携带
-        SignalAck {
-            signal_id: Some(ack.signal_id),
-            status: ack.status,
-            delivered: ack.delivered,
-            event_seq: ack.event_seq,
-            error: ack.error,
-        }
     }
 }

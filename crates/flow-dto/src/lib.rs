@@ -17,6 +17,9 @@ use serde_json::Value;
 pub const STATUS_DRAFT: &str = "draft";
 pub const STATUS_PUBLISHED: &str = "published";
 
+/// runs.status 中仍在执行、接受输入与续租的取值（可写权准入判定用）。
+pub const STATUS_ACTIVE: [&str; 2] = ["running", "awaiting_resume"];
+
 /// runs.status 的合法词汇表（DESIGN.md §8：单一来源，写入口校验）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbRunStatus {
@@ -50,6 +53,11 @@ impl DbRunStatus {
 
     pub fn is_terminal_str(status: &str) -> bool {
         matches!(status, "succeeded" | "failed" | "cancelled")
+    }
+
+    /// 仍在执行、接受输入与续租的状态（runs 行可写权的准入判定用）。
+    pub fn is_active_str(status: &str) -> bool {
+        STATUS_ACTIVE.contains(&status)
     }
 }
 
@@ -90,4 +98,28 @@ pub struct RunRecord {
     pub error: Option<String>,
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
+}
+
+/// run.start 的创建结果。
+#[derive(Debug, Clone)]
+pub struct CreatedRun {
+    pub run_id: String,
+    pub workflow_version: i64,
+}
+
+/// 信号/取消请求的落账结果（DISTRIBUTED.md §6.1）：
+/// - `delivered=true`：已写入事件并生效；
+/// - `status="pending"`：已入队尚未处理（仅 Postgres 持久 inbox），
+///   客户端用 run.signal_status 查询；
+/// - `status="rejected"`：非法请求被拒，`error` 携带原因。
+///
+/// `signal_id` 只在真有一个可查询的 id 时出现（Postgres inbox 主键）；
+/// SQLite 同步交付没有账可查，回显客户端提供的 id 或不带——不伪造查不到的 id。
+#[derive(Debug, Clone)]
+pub struct SignalAck {
+    pub signal_id: Option<String>,
+    pub status: String,
+    pub delivered: bool,
+    pub event_seq: Option<u64>,
+    pub error: Option<Value>,
 }

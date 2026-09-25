@@ -238,8 +238,9 @@ gateway 不得通过直接清租约或只改 status 实现取消。
 查询次数与本地订阅者数无关，不随订阅者规模放大数据库压力；
 LISTEN/NOTIFY（频道 `flow_events`，载荷仅 run_id）仅作低延迟唤醒提示；
 正确性不依赖通知——通知可丢失（断连期间），由 subscribe_poll 兜底轮询兜住；
-进程接管不能改变订阅源的正确性。等待子 run 终态（child.rs）复用同一通知频道
-加兜底轮询。
+进程接管不能改变订阅源的正确性。等待子 run 终态（child.rs）复用共享订阅 hub
+的扇出加兜底轮询——不为每次等待新开 LISTEN 连接（每条会占住一个池槽，
+并行子 run 等待曾可耗尽连接池）。
 
 from_seq 的 API 语义保留现有闭区间，客户端传 last_seq+1。
 增量读取在 SQL 层下推过滤（`WHERE seq >= from`），只校验相邻 seq 连续；
@@ -273,10 +274,13 @@ NodeStarted 丢失可能让已经发生的副作用被再次执行。Postgres �
 
 ## 10. 部署配置
 
-规划配置：FLOW_BACKEND、FLOW_DATABASE_URL、FLOW_NODE_ID（展示名）、启动时生成的 instance UUID、
-FLOW_LEASE_TTL_MS、FLOW_MAX_RUNS、FLOW_SCAN_INTERVAL_MS、FLOW_SUBSCRIBE_POLL_MS
-（订阅兜底轮询间隔，默认 10s；NOTIFY 是正常路径；同时是已终结 run 候选回看窗口
-的基准，实际窗口 = max(3×间隔, 30s)）。
+规划配置（与 `flow-pg::config::PgConfig::from_env` 实际读取的变量一致）：
+FLOW_BACKEND、FLOW_DATABASE_URL、FLOW_ROLE（gateway/executor/all，缺省 all）、
+启动时生成的 instance UUID（无对应环境变量）、FLOW_LEASE_TTL_MS、FLOW_MAX_RUNS、
+FLOW_SCAN_INTERVAL_MS、FLOW_SUBSCRIBE_POLL_MS（订阅兜底轮询间隔，默认 10s；
+NOTIFY 是正常路径；同时是已终结 run 候选回看窗口的基准，实际窗口 =
+max(3×间隔, 30s)）、FLOW_INBOX_POLL_MS、FLOW_SIGNAL_WAIT_MS、FLOW_SIGNAL_POLL_MS、
+FLOW_STATEMENT_TIMEOUT_MS、FLOW_LOCK_TIMEOUT_MS、FLOW_IDLE_TX_TIMEOUT_MS。
 TTL/续期/轮询间隔在实施阶段依据数据库延迟实测设定。长事务必须另设锁和语句超时。
 
 可拆分 gateway 与 executor 池。Postgres 模式下 FLOW_DATA_DIR 仅是缓存；备份必须覆盖

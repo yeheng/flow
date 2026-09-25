@@ -1,52 +1,87 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted } from "vue";
+import { computed } from "vue";
 import { client } from "./rpc/client";
-import { initEditor, save, ui } from "./state/editor";
-import WorkflowList from "./components/WorkflowList.vue";
-import NodePalette from "./components/NodePalette.vue";
-import FlowCanvas from "./components/FlowCanvas.vue";
-import ParamsPanel from "./components/ParamsPanel.vue";
-import RunPanel from "./components/RunPanel.vue";
+import AppToasts from "./components/AppToasts.vue";
+import AppModal from "./components/AppModal.vue";
 
 const connected = computed(() => client.connected.value);
-
-function onKeydown(e: KeyboardEvent): void {
-  if ((e.metaKey || e.ctrlKey) && e.key === "s") {
-    e.preventDefault();
-    void save();
-  }
-}
-
-onMounted(() => {
-  window.addEventListener("keydown", onKeydown);
-  void initEditor();
-});
-
-onUnmounted(() => {
-  window.removeEventListener("keydown", onKeydown);
-});
 </script>
 
 <template>
   <header>
-    <span class="logo">flow 流程编辑器</span>
+    <span class="logo">Flow</span>
+    <nav class="nav">
+      <RouterLink to="/workflows">工作流</RouterLink>
+      <RouterLink to="/runs">运行记录</RouterLink>
+    </nav>
     <span class="conn" :class="{ ok: connected }">
       {{ connected ? "已连接" : "未连接" }} {{ client.url }}
     </span>
-    <span v-if="ui.error" class="banner error">{{ ui.error }}</span>
-    <span v-else-if="ui.info" class="banner info">{{ ui.info }}</span>
   </header>
-  <main>
-    <aside class="left">
-      <WorkflowList />
-      <NodePalette />
-    </aside>
-    <section class="center">
-      <FlowCanvas />
-    </section>
-    <aside class="right">
-      <ParamsPanel />
-      <RunPanel />
-    </aside>
-  </main>
+  <RouterView />
+  <AppToasts />
+  <AppModal />
 </template>
+
+<style scoped>
+header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  height: 48px;
+  padding: 0 16px;
+  flex-shrink: 0;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.logo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.logo::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 8px var(--accent);
+}
+
+.nav {
+  display: flex;
+  gap: 14px;
+}
+
+.nav a {
+  color: var(--text2);
+  text-decoration: none;
+  font-weight: 500;
+  padding: 3px 2px;
+  border-bottom: 2px solid transparent;
+}
+
+.nav a:hover {
+  color: var(--text);
+}
+
+.nav a.router-link-active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+.conn {
+  margin-left: auto;
+  color: var(--danger);
+  font-size: 11px;
+  font-family: var(--mono);
+}
+
+.conn.ok {
+  color: var(--ok);
+}
+</style>

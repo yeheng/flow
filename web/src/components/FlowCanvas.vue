@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, watch } from "vue";
 import { MarkerType, VueFlow, useVueFlow } from "@vue-flow/core";
-import type { EdgeChange, NodeChange, NodeMouseEvent } from "@vue-flow/core";
+import type { NodeMouseEvent } from "@vue-flow/core";
 import { Background, BackgroundVariant } from "@vue-flow/background";
 import { Controls } from "@vue-flow/controls";
 import { MiniMap } from "@vue-flow/minimap";
@@ -13,6 +13,7 @@ import {
   onConnect,
   addNode,
 } from "../state/editor";
+import { beginDrag, commit, endDrag } from "../state/history";
 import { monitor } from "../state/monitor";
 import FlowNode from "./FlowNode.vue";
 
@@ -36,24 +37,19 @@ function onNodeDoubleClick(e: NodeMouseEvent): void {
   void drillIntoSubWorkflow(e.node.id);
 }
 
-// 只把结构/位置变化计入 dirty，选中高亮不算改动
-function onNodesChange(changes: NodeChange[]): void {
-  if (changes.some((c) => c.type === "remove" || (c.type === "position" && !c.dragging))) {
-    editor.dirty = true;
-  }
-}
-
-function onEdgesChange(changes: EdgeChange[]): void {
-  if (changes.some((c) => c.type === "remove")) editor.dirty = true;
+// 删除键在 vue-flow 处理前先入 undo 栈（canvas-wrap 在冒泡路径上先于 window 监听器执行）
+function onKeydown(e: KeyboardEvent): void {
+  if (e.key !== "Delete" && e.key !== "Backspace") return;
+  if (e.target instanceof HTMLElement && e.target.closest("input, textarea, [contenteditable]"))
+    return;
+  if (editor.nodes.some((n) => n.selected) || editor.edges.some((edge) => edge.selected)) commit();
 }
 
 // 运行中节点的下游边做流动动画
 const runningNodeIds = computed(() => {
   if (!monitor.runId || monitor.workflowId !== editor.workflowId) return new Set<string>();
   return new Set(
-    monitor.nodes
-      .filter((n) => n.state === "running" || n.state === "retrying")
-      .map((n) => n.id),
+    monitor.nodes.filter((n) => n.state === "running" || n.state === "retrying").map((n) => n.id),
   );
 });
 watch(
@@ -66,7 +62,7 @@ watch(
 </script>
 
 <template>
-  <div class="canvas-wrap" @drop="onDrop" @dragover.prevent>
+  <div class="canvas-wrap" @drop="onDrop" @dragover.prevent @keydown="onKeydown">
     <div v-if="editor.breadcrumb.length" class="breadcrumb">
       <template v-for="(c, i) in editor.breadcrumb" :key="`${i}:${c.workflowId}`">
         <a class="crumb" @click="jumpToBreadcrumb(i)">{{ c.name || c.workflowId }}</a>
@@ -79,6 +75,8 @@ watch(
       v-model:edges="editor.edges"
       :is-valid-connection="isValidConnection"
       :delete-key-code="['Backspace', 'Delete']"
+      :selection-key-code="'Shift'"
+      :multi-selection-key-code="['Meta', 'Control']"
       :default-viewport="{ zoom: 1 }"
       :default-edge-options="defaultEdgeOptions"
       :min-zoom="0.2"
@@ -90,17 +88,57 @@ watch(
       @connect="onConnect"
       @node-click="onNodeClick"
       @node-double-click="onNodeDoubleClick"
+      @node-drag-start="beginDrag()"
+      @node-drag-stop="endDrag()"
       @pane-click="editor.selectedNodeId = null"
-      @nodes-change="onNodesChange"
-      @edges-change="onEdgesChange"
     >
       <template #node-flow="nodeProps">
         <FlowNode v-bind="nodeProps" />
       </template>
-      <Background :variant="BackgroundVariant.Dots" :gap="28" :size="1.5" color="rgba(255, 255, 255, 0.06)" />
+      <Background
+        :variant="BackgroundVariant.Dots"
+        :gap="28"
+        :size="1.5"
+        color="rgba(255, 255, 255, 0.06)"
+      />
       <Controls />
       <MiniMap />
     </VueFlow>
     <div v-if="!editor.workflowId" class="canvas-hint">在左侧新建或选择一个工作流</div>
   </div>
 </template>
+
+<style scoped>
+.breadcrumb {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border2);
+  border-radius: 7px;
+  box-shadow: 0 2px 12px var(--shadow);
+  font-size: 12px;
+}
+
+.crumb {
+  color: var(--accent2);
+  cursor: pointer;
+}
+
+.crumb:hover {
+  text-decoration: underline;
+}
+
+.crumb-sep {
+  color: var(--text3);
+}
+
+.crumb-current {
+  font-weight: 600;
+}
+</style>

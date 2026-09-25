@@ -36,21 +36,28 @@ pub enum TakeOver {
     NotEligible(String),
 }
 
-/// executor 状态：本地 registry + 容量 + 停机信号。
+/// executor 状态：本地 registry + 容量 + 停机信号 + 共享事件 hub。
 pub struct ExecutorState {
     pub instance_id: String,
     local: Mutex<HashMap<String, LocalRun>>,
     permits: Arc<Semaphore>,
     pub shutdown: CancellationToken,
+    /// 进程内唯一的订阅轮询器；子 run 等待复用它的扇出，不再每等待一条 LISTEN 连接。
+    hub: Arc<crate::subscribe::EventHub>,
 }
 
 impl ExecutorState {
-    pub fn new(instance_id: String, max_runs: usize) -> ExecutorState {
+    pub fn new(
+        instance_id: String,
+        max_runs: usize,
+        hub: Arc<crate::subscribe::EventHub>,
+    ) -> ExecutorState {
         ExecutorState {
             instance_id,
             local: Mutex::new(HashMap::new()),
             permits: Arc::new(Semaphore::new(max_runs)),
             shutdown: CancellationToken::new(),
+            hub,
         }
     }
 
@@ -225,6 +232,7 @@ async fn take_over(
         child_launcher: Some(Arc::new(crate::child::PgChildLauncher::new(
             store.pool().clone(),
             cfg.clone(),
+            state.hub.clone(),
         ))),
         sink: Box::new(sink),
         events_tx: None,

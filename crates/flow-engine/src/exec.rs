@@ -13,11 +13,14 @@ use crate::model::{Node, NodeType};
 pub const DEFAULT_JS_TIMEOUT_MS: u64 = 2_000;
 pub const DEFAULT_HTTP_TIMEOUT_MS: u64 = 30_000;
 
-/// 节点执行失败。`retryable` 决定引擎是重试还是把 run 判为失败。
+/// 节点执行失败。`retryable` 决定引擎是重试还是把 run 判为失败；
+/// `platform` 表示基础设施故障（IO/Backend/日志损坏）——不是工作流失败，
+/// 引擎遇此标志挂起 run（awaiting_resume）而不是写 run_failed（DESIGN §7）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodeFailure {
     pub message: String,
     pub retryable: bool,
+    pub platform: bool,
 }
 
 impl NodeFailure {
@@ -25,6 +28,7 @@ impl NodeFailure {
         NodeFailure {
             message: message.into(),
             retryable: true,
+            platform: false,
         }
     }
 
@@ -32,13 +36,27 @@ impl NodeFailure {
         NodeFailure {
             message: message.into(),
             retryable: false,
+            platform: false,
+        }
+    }
+
+    /// 基础设施故障：不重试、不判死 run，交回引擎挂起等待恢复。
+    pub fn platform(message: impl Into<String>) -> NodeFailure {
+        NodeFailure {
+            message: message.into(),
+            retryable: false,
+            platform: true,
         }
     }
 }
 
 impl From<EngineError> for NodeFailure {
     fn from(err: EngineError) -> NodeFailure {
-        NodeFailure::fatal(err.to_string())
+        if err.is_platform_fault() {
+            NodeFailure::platform(err.to_string())
+        } else {
+            NodeFailure::fatal(err.to_string())
+        }
     }
 }
 
@@ -135,6 +153,10 @@ async fn run_sub_workflow(
         Ok(()) => {}
         // 崩溃重放：子 run 已由崩溃前的同一 attempt 创建，附着等待即可
         Err(EngineError::RunExists(_)) => {}
+        Err(err) if err.is_platform_fault() => {
+            // 基础设施故障不当作工作流失败：挂起等恢复，不写 run_failed
+            return Err(NodeFailure::platform(format!("启动子 run 失败：{err}")));
+        }
         Err(err) => return Err(NodeFailure::retryable(format!("启动子 run 失败：{err}"))),
     }
     tokio::select! {
@@ -151,6 +173,10 @@ async fn run_sub_workflow(
                 ))),
                 Ok(ChildRunOutcome::Cancelled) => Err(NodeFailure::fatal(format!(
                     "子 run {} 已取消",
+                    child.child_run_id
+                ))),
+                Err(err) if err.is_platform_fault() => Err(NodeFailure::platform(format!(
+                    "等待子 run {} 终态失败：{err}",
                     child.child_run_id
                 ))),
                 Err(err) => Err(NodeFailure::retryable(format!(
@@ -299,6 +325,10 @@ async fn run_http(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
 
     let response = match request.send().await {
         Ok(response) => response,
+        Err(err) if err.is_builder() => {
+            // URL/请求头非法：请求从未发出，参数错误重试也不会变好（DESIGN §6.5）
+            return Err(NodeFailure::fatal(format!("请求参数非法：{err}")));
+        }
         Err(err) => {
             // 连接失败/超时：副作用不明确或未发生，交给重试策略
             return Err(NodeFailure::retryable(format!(
@@ -339,15 +369,13 @@ async fn run_http(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
 
     if status.is_server_error() || status.is_client_error() {
         // 5xx 可能已被下游处理了一部分，标为可重试；4xx 是请求本身的问题
-        let failure = if status.is_server_error() {
+        let mut failure = if status.is_server_error() {
             NodeFailure::retryable(format!("HTTP {status}"))
         } else {
             NodeFailure::fatal(format!("HTTP {status}"))
         };
-        return Err(NodeFailure {
-            message: format!("{}，响应体：{}", failure.message, truncate(&output)),
-            retryable: failure.retryable,
-        });
+        failure.message = format!("{}，响应体：{}", failure.message, truncate(&output));
+        return Err(failure);
     }
 
     Ok(output)

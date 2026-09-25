@@ -27,6 +27,8 @@ interface Subscription {
   method: string;
   params: Record<string, unknown>;
   onEvent: (event: unknown) => void;
+  /** 本连接上是否已发出过订阅请求：防止「连接未建立时发起订阅」与 onopen 重建叠加成重复订阅 */
+  active: boolean;
 }
 
 /**
@@ -73,7 +75,7 @@ class RpcClient {
     onEvent: (event: unknown) => void,
   ): Promise<() => Promise<void>> {
     const local = this.nextLocalSub++;
-    const sub: Subscription = { method, params, onEvent };
+    const sub: Subscription = { method, params, onEvent, active: false };
     this.subs.set(local, sub);
     try {
       await this.sendSubscribe(local, sub);
@@ -99,12 +101,13 @@ class RpcClient {
 
   private async sendSubscribe(local: number, sub: Subscription): Promise<void> {
     await this.waitOpen();
+    // 同一连接上只发一次：onopen 的重建与 subscribe 自身等待 waitOpen 后的发送在此去重
+    if (sub.active) return;
+    sub.active = true;
     const id = this.nextId++;
     await new Promise<void>((resolve, reject) => {
       this.pending.set(id, { resolve, reject, localSub: local });
-      this.ws!.send(
-        JSON.stringify({ jsonrpc: "2.0", id, method: sub.method, params: sub.params }),
-      );
+      this.ws!.send(JSON.stringify({ jsonrpc: "2.0", id, method: sub.method, params: sub.params }));
     });
   }
 
@@ -119,8 +122,11 @@ class RpcClient {
       const reconnected = this.everConnected;
       this.everConnected = true;
       for (const w of this.openWaiters.splice(0)) w.resolve();
-      // 重连后旧订阅已随连接消失，逐个重建；状态补齐交给 onReconnect 调用方
+      // 重连后旧订阅已随连接消失，逐个重建；状态补齐交给 onReconnect 调用方。
+      // 先复位 active：本连接上尚未发送的订阅（连接未建立时发起的）由重建发送，
+      // 其自身 waitOpen 后的续发会被 sendSubscribe 的 active 检查去重
       this.serverToLocal.clear();
+      for (const sub of this.subs.values()) sub.active = false;
       for (const [local, sub] of this.subs) {
         void this.sendSubscribe(local, sub).catch(() => {});
       }

@@ -278,7 +278,8 @@ impl SqliteBackend {
     /// 进程内同步交付。signal_id 只回显客户端提供的值，缺省时响应不带——
     /// 没有持久 inbox，伪造一个查不到的 id 是欺骗客户端。
     pub async fn signal(&self, req: SignalRequest) -> Result<SignalAck, BackendError> {
-        self.engine
+        let outcome = self
+            .engine
             .signal(
                 &req.run_id,
                 Signal {
@@ -286,8 +287,17 @@ impl SqliteBackend {
                     payload: req.payload,
                 },
             )
-            .await
-            .map_err(engine_err)?;
+            .await;
+        if let Err(EngineError::NotLive(_)) = &outcome {
+            // registry 无此 run：区分「不存在」与「存在但不在跑」，
+            // 与 Postgres 落账语义对齐（RunNotFound / Conflict）
+            let run = self.store.get_run(&req.run_id).await.map_err(sqlite_err)?;
+            return Err(BackendError::Conflict(format!(
+                "run {} 当前不在运行中（状态 {}）",
+                run.id, run.status
+            )));
+        }
+        outcome.map_err(engine_err)?;
         Ok(SignalAck {
             signal_id: req.signal_id,
             status: "applied".into(),
@@ -318,13 +328,38 @@ impl SqliteBackend {
         )))
     }
 
-    /// 进程内 broadcast 直接包装成流：零 spawn、零 channel。
-    /// Lagged 丢事件时上层用 run.events（from_seq）补齐。
+    /// 不指定 run_id：纯实时增量（Lagged 丢事件时上层用 run.events 补齐）；
+    /// 指定 run_id：回放 + 追流、缺口补齐、终态自然结束（与 PG 臂共用 run_tail）。
     pub fn subscribe(
         &self,
         run_id: Option<String>,
     ) -> futures::stream::BoxStream<'static, Envelope> {
-        crate::broadcast_tail(self.engine.subscribe(), run_id)
+        match run_id {
+            None => crate::broadcast_tail(self.engine.subscribe(), None),
+            Some(run_id) => crate::run_tail::run_tail(
+                Arc::new(EngineReader(self.engine.clone())),
+                self.engine.subscribe(),
+                run_id,
+            ),
+        }
+    }
+}
+
+/// 引擎文件日志的读取适配（run_tail 的 EventReader 实现）。
+struct EngineReader(Arc<Engine>);
+
+impl crate::run_tail::EventReader for EngineReader {
+    fn read_events<'a>(
+        &'a self,
+        run_id: &'a str,
+        from_seq: Option<u64>,
+    ) -> BoxFuture<'a, Result<Vec<Envelope>, BackendError>> {
+        Box::pin(async move {
+            self.0
+                .read_events(run_id, from_seq)
+                .await
+                .map_err(engine_err)
+        })
     }
 }
 
@@ -362,6 +397,8 @@ fn engine_err(err: EngineError) -> BackendError {
     match err {
         EngineError::RunNotFound(id) => BackendError::RunNotFound(id),
         EngineError::RunExists(id) => BackendError::Conflict(format!("run {id} 已存在")),
+        EngineError::NotLive(msg) => BackendError::Conflict(msg),
+        EngineError::InvalidSignal(msg) => BackendError::Invalid(msg),
         EngineError::InvalidDefinition(msg) => BackendError::Invalid(msg),
         other => BackendError::internal(other),
     }

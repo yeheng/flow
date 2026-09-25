@@ -3,6 +3,7 @@ import type {
   Definition,
   NodeTypeDesc,
   RunEvent,
+  RunRecord,
   Timeline,
   WorkflowDetail,
   WorkflowSummary,
@@ -23,10 +24,7 @@ export async function createWorkflow(name: string): Promise<string> {
   return r.workflow_id;
 }
 
-export async function updateWorkflow(
-  workflowId: string,
-  definition: Definition,
-): Promise<number> {
+export async function updateWorkflow(workflowId: string, definition: Definition): Promise<number> {
   const r = await client.call<{ workflow_id: string; version: number }>("workflow.update", {
     workflow_id: workflowId,
     definition: definition as unknown as Record<string, unknown>,
@@ -38,8 +36,10 @@ export async function publishWorkflow(workflowId: string, version: number): Prom
   await client.call("workflow.publish", { workflow_id: workflowId, version });
 }
 
-export async function getWorkflow(workflowId: string): Promise<WorkflowDetail> {
-  return client.call<WorkflowDetail>("workflow.get", { workflow_id: workflowId });
+export async function getWorkflow(workflowId: string, version?: number): Promise<WorkflowDetail> {
+  const params: Record<string, unknown> = { workflow_id: workflowId };
+  if (version !== undefined) params.version = version;
+  return client.call<WorkflowDetail>("workflow.get", params);
 }
 
 export async function deleteWorkflow(workflowId: string): Promise<void> {
@@ -53,6 +53,18 @@ export async function startRun(
   const params: Record<string, unknown> = { workflow_id: workflowId };
   if (input !== undefined) params.input = input;
   return client.call("run.start", params);
+}
+
+export async function listRuns(workflowId?: string, limit?: number): Promise<RunRecord[]> {
+  const params: Record<string, unknown> = {};
+  if (workflowId !== undefined) params.workflow_id = workflowId;
+  if (limit !== undefined) params.limit = limit;
+  const r = await client.call<{ runs: RunRecord[] }>("run.list", params);
+  return r.runs;
+}
+
+export async function getRun(runId: string): Promise<{ run: RunRecord; live: boolean }> {
+  return client.call("run.get", { run_id: runId });
 }
 
 export async function runTimeline(runId: string): Promise<Timeline> {
@@ -71,7 +83,14 @@ export async function runCancel(runId: string): Promise<void> {
 }
 
 export async function runSignal(runId: string, nodeId: string, payload: unknown): Promise<void> {
-  await client.call("run.signal", { run_id: runId, node_id: nodeId, payload });
+  // Postgres 后端的信号经持久 inbox 落账，signal_id 必填（1-128 字符）；
+  // UI 无自动重试，一次点击 = 一个逻辑交付，本地生成唯一 id 即可
+  await client.call("run.signal", {
+    run_id: runId,
+    signal_id: crypto.randomUUID(),
+    node_id: nodeId,
+    payload,
+  });
 }
 
 export function subscribeRun(

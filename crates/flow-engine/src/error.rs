@@ -12,6 +12,10 @@ pub enum EngineError {
     RunNotFound(String),
     #[error("run 已存在：{0}")]
     RunExists(String),
+    #[error("run 当前不接受输入：{0}")]
+    NotLive(String),
+    #[error("非法信号：{0}")]
+    InvalidSignal(String),
     #[error("表达式求值失败：{0}")]
     Expr(String),
     #[error("节点错误：{0}")]

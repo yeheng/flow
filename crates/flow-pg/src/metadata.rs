@@ -95,10 +95,7 @@ impl PgStore {
         .await?
         .rows_affected();
         if affected == 0 {
-            return Err(PgError::VersionNotFound(
-                workflow_id.to_string(),
-                version,
-            ));
+            return Err(PgError::VersionNotFound(workflow_id.to_string(), version));
         }
         Ok(())
     }
@@ -295,7 +292,7 @@ impl PgStore {
         for row in rows {
             let id: String = row.try_get("id")?;
             let status: String = row.try_get("status")?;
-            let terminal = !matches!(status.as_str(), "running" | "awaiting_resume");
+            let terminal = !flow_dto::DbRunStatus::is_active_str(&status);
             out.push((id, terminal));
         }
         Ok(out)

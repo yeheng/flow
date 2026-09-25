@@ -40,12 +40,26 @@ impl ChildRunLauncher for LocalChildLauncher {
         depth: u32,
     ) -> BoxFuture<'a, Result<(), EngineError>> {
         Box::pin(async move {
-            let version = self
-                .store
-                .latest_published(workflow_id)
-                .await
-                .map_err(|e| EngineError::Backend(e.to_string()))?
-                .ok_or_else(|| EngineError::Node(format!("工作流 {workflow_id} 没有已发布版本")))?;
+            // 崩溃重放时 runs 行已存在：沿用行内已钉的版本与输入（定义是不可变
+            // 快照，run 钉死某一版）。绝不在重放路径重新解析 latest published——
+            // 重启前发布的新版会让事件日志与元数据分叉，之后 resume_run 的身份
+            // 校验判 LogCorrupted，run 永久不可恢复。
+            let existing = self.store.get_run(child_run_id).await.ok();
+            let version = match &existing {
+                Some(run) => run.workflow_version,
+                None => self
+                    .store
+                    .latest_published(workflow_id)
+                    .await
+                    .map_err(|e| EngineError::Backend(e.to_string()))?
+                    .ok_or_else(|| {
+                        EngineError::Node(format!("工作流 {workflow_id} 没有已发布版本"))
+                    })?,
+            };
+            let input = match &existing {
+                Some(run) => run.input.clone(),
+                None => input,
+            };
             let stored = self
                 .store
                 .get_version(workflow_id, Some(version))
@@ -54,9 +68,7 @@ impl ChildRunLauncher for LocalChildLauncher {
             let definition: Definition = serde_json::from_value(stored.definition)
                 .map_err(|e| EngineError::InvalidDefinition(format!("定义无法解析：{e}")))?;
 
-            // 崩溃重放时 runs 行已存在：跳过插入，start_run 撞 RunExists 后附着等待
-            let exists = self.store.get_run(child_run_id).await.is_ok();
-            if !exists {
+            if existing.is_none() {
                 self.store
                     .insert_run(
                         child_run_id,
@@ -117,15 +129,17 @@ impl ChildRunLauncher for LocalChildLauncher {
                         if state.last_seq == 0 {
                             if let Ok(run) = self.store.get_run(child_run_id).await {
                                 match run.status.as_str() {
-                                    "failed" => {
+                                    s if s == DbRunStatus::Failed.as_str() => {
                                         return Ok(ChildRunOutcome::Failed(
                                             run.error.unwrap_or_else(|| "子 run 初始化中断".into()),
                                         ));
                                     }
-                                    "cancelled" => return Ok(ChildRunOutcome::Cancelled),
+                                    s if s == DbRunStatus::Cancelled.as_str() => {
+                                        return Ok(ChildRunOutcome::Cancelled)
+                                    }
                                     // 空日志不可能对应 RunCompleted 事件：投影矛盾
                                     // 按失败处理，不把拿不到的输出编造成成功
-                                    "succeeded" => {
+                                    s if s == DbRunStatus::Succeeded.as_str() => {
                                         return Ok(ChildRunOutcome::Failed(format!(
                                             "子 run {child_run_id} 投影为 succeeded 但事件日志为空"
                                         )));

@@ -223,3 +223,141 @@ async fn missing_or_empty_logs_of_old_running_tasks_require_manual_recovery() {
         0
     );
 }
+
+fn human_def() -> Value {
+    json!({
+        "nodes": [
+            {"id": "s", "type": "start"},
+            {"id": "h", "type": "human_task"},
+            {"id": "e", "type": "end"}
+        ],
+        "edges": [{"from": "s", "to": "h"}, {"from": "h", "to": "e"}]
+    })
+}
+
+async fn wait_human_waiting(f: &Fixture, run: &str) -> u64 {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let state = f.backend.engine().snapshot(run).await.unwrap();
+            if matches!(
+                state.record("h").state,
+                flow_engine::NodeState::Running { .. }
+            ) {
+                return state.last_seq;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("human_task 未进入等待")
+}
+
+/// 信号错误码契约（两后端同一组码；PG 侧在 ws_pg.rs 钉住落账语义）：
+/// run 不存在 → -32011，run 已终结 → -32012，节点不等待信号 → -32010。
+#[tokio::test]
+async fn run_signal_error_codes_follow_the_shared_contract() {
+    let f = Fixture::new().await;
+    f.backend.store().publish(&f.workflow, 1).await.unwrap();
+
+    let response = f
+        .call(
+            "run.signal",
+            json!({"run_id": "nope", "node_id": "h", "payload": {}}),
+        )
+        .await;
+    assert_eq!(response["error"]["code"], -32011, "{response}");
+
+    let response = f
+        .call("run.start", json!({"workflow_id": f.workflow}))
+        .await;
+    let run = response["result"]["run_id"].as_str().unwrap().to_string();
+    f.wait_finished(&run).await;
+    let response = f
+        .call(
+            "run.signal",
+            json!({"run_id": run, "node_id": "h", "payload": {}}),
+        )
+        .await;
+    assert_eq!(response["error"]["code"], -32012, "{response}");
+
+    let wf = f.backend.store().create_workflow("human").await.unwrap();
+    f.backend
+        .store()
+        .update_workflow(&wf, &human_def())
+        .await
+        .unwrap();
+    f.backend.store().publish(&wf, 1).await.unwrap();
+    let response = f.call("run.start", json!({"workflow_id": wf})).await;
+    let run = response["result"]["run_id"].as_str().unwrap().to_string();
+    wait_human_waiting(&f, &run).await;
+    let response = f
+        .call(
+            "run.signal",
+            json!({"run_id": run, "node_id": "bogus", "payload": {}}),
+        )
+        .await;
+    assert_eq!(response["error"]["code"], -32010, "{response}");
+}
+
+/// 指定 run_id 的订阅契约（两后端共享 run_tail）：先回放完整日志、
+/// 追实时增量、seq 从 1 严格连续，run 终态追平后流自然结束。
+#[tokio::test]
+async fn subscribe_with_run_id_replays_follows_and_naturally_ends() {
+    use futures::StreamExt;
+
+    let f = Fixture::new().await;
+    let wf = f.backend.store().create_workflow("human").await.unwrap();
+    f.backend
+        .store()
+        .update_workflow(&wf, &human_def())
+        .await
+        .unwrap();
+    f.backend.store().publish(&wf, 1).await.unwrap();
+    let response = f.call("run.start", json!({"workflow_id": wf})).await;
+    let run = response["result"]["run_id"].as_str().unwrap().to_string();
+    let until = wait_human_waiting(&f, &run).await;
+
+    let stream = f.backend.subscribe(Some(run.clone()));
+    futures::pin_mut!(stream);
+
+    // 回放段：必须覆盖到等待点之前的全部事件
+    let mut seqs: Vec<u64> = Vec::new();
+    while (seqs.len() as u64) < until {
+        let envelope = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("回放停滞")
+            .expect("回放提前结束");
+        assert_eq!(envelope.run_id, run);
+        seqs.push(envelope.seq);
+    }
+
+    // 交付信号推进 run 到终态：流必须吐完增量并自然结束
+    let response = f
+        .call(
+            "run.signal",
+            json!({"run_id": run, "node_id": "h", "payload": {"ok": true}}),
+        )
+        .await;
+    assert_eq!(response["result"]["delivered"], true, "{response}");
+
+    while let Some(envelope) = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("订阅流未在终态后结束")
+    {
+        assert_eq!(envelope.run_id, run);
+        seqs.push(envelope.seq);
+    }
+
+    assert_eq!(
+        seqs,
+        (1..=seqs.len() as u64).collect::<Vec<u64>>(),
+        "订阅事件必须从 1 起严格连续"
+    );
+    let events = f.backend.read_events(&run, None).await.unwrap();
+    let last = events.last().unwrap();
+    assert_eq!(last.seq, *seqs.last().unwrap());
+    assert!(matches!(
+        last.event,
+        flow_engine::Event::RunCompleted { .. }
+    ));
+}

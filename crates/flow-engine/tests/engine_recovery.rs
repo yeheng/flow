@@ -130,6 +130,60 @@ async fn craft_partial_log(dir: &Path, run_id: &str, nodes_started: &[&str]) {
     drop(log);
 }
 
+/// 双写者守卫：run 仍在被驱动时重复恢复必须是无操作。
+/// 两个 Driver 各持独立 seq 计数器写同一 event.jsonl，必然产生重复 seq
+/// 与重复副作用（同一节点执行两次）。见 engine.rs reserve_run。
+#[tokio::test]
+async fn resume_while_live_is_a_no_op_single_writer_invariant() {
+    let h = Harness::new();
+    let run_id = h.run_id();
+    // 1.5s delay 拉开恢复窗口：resume 时节点必在途（Running 或即将派发）
+    let def = def_from(json!({
+        "nodes": [
+            {"id": "n1", "type": "start"},
+            {"id": "wait", "type": "delay", "params": {"ms": 1500}},
+            {"id": "n4", "type": "end"}
+        ],
+        "edges": [
+            {"from": "n1", "to": "wait"},
+            {"from": "wait", "to": "n4"}
+        ]
+    }));
+    let make_spec = || StartRun {
+        run_id: run_id.clone(),
+        workflow_id: "w1".into(),
+        workflow_version: 1,
+        definition: def.clone(),
+        input: json!({}),
+        depth: 0,
+    };
+
+    h.engine.start_run(make_spec()).await.unwrap();
+    h.wait_live(&run_id).await;
+
+    // 重复恢复：run 仍在被驱动，必须直接返回 Resumed 且不写任何事件
+    let outcome = h.engine.resume_run(make_spec()).await.unwrap();
+    assert!(matches!(outcome, ResumeOutcome::Resumed));
+
+    let state = h.wait_terminal(&run_id).await;
+    assert_eq!(state.phase, RunPhase::Succeeded, "{}", describe(&state));
+    h.wait_not_live(&run_id).await;
+
+    let events = h.engine.read_events(&run_id, None).await.unwrap();
+    // seq 严格连续（双写者必然交错出重复/跳号）
+    RunState::from_events(&events).unwrap();
+    let wait_started = events
+        .iter()
+        .filter(|e| matches!(&e.event, Event::NodeStarted { node_id, .. } if node_id == "wait"))
+        .count();
+    assert_eq!(wait_started, 1, "delay 节点被执行了多次：{events:?}");
+    let completed = events
+        .iter()
+        .filter(|e| matches!(e.event, Event::RunCompleted { .. }))
+        .count();
+    assert_eq!(completed, 1, "finalize 被执行了多次：{events:?}");
+}
+
 #[tokio::test]
 async fn linear_run_executes_and_records_ordered_events() {
     let h = Harness::new();

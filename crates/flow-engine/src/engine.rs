@@ -77,6 +77,30 @@ struct RunHandle {
     signal_tx: mpsc::Sender<SignalRequest>,
 }
 
+/// reserve_run 的占位。Drop 时自动释放注册位（失败路径零样板），
+/// 成功派发时由 spawn_driver disarm，把注册位的清理责任移交给 Driver 退出任务。
+struct RunReservation<'a> {
+    engine: &'a Engine,
+    run_id: String,
+    cancel: CancellationToken,
+    signal_rx: Option<mpsc::Receiver<SignalRequest>>,
+    armed: bool,
+}
+
+impl RunReservation<'_> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RunReservation<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.engine.registry.lock().remove(&self.run_id);
+        }
+    }
+}
+
 /// 单机后端的事件出口：文件日志（每事件 fsync）+ RunObserver 状态投影。
 /// 终态事件与状态投影这里不保证原子——单进程单写者下，观察者只是索引。
 struct FileSink {
@@ -254,6 +278,10 @@ impl Engine {
             .validate()
             .map_err(EngineError::InvalidDefinition)?;
 
+        // 原子占位：同一 run_id 至多一个本地 Driver（event.jsonl 单写者不变量）。
+        // 已被驱动时返回 RunExists，调用方按附着语义处理。
+        let reservation = self.reserve_run(&spec.run_id)?;
+
         let mut log = EventLog::create(&self.data_dir, &spec.run_id).await?;
         let first = log
             .append(
@@ -271,7 +299,7 @@ impl Engine {
         state.ensure_nodes(&spec.definition);
         state.fold(&first);
 
-        self.spawn_driver(log, spec, state, RecoveryPlan::default());
+        self.spawn_driver(log, spec, state, RecoveryPlan::default(), reservation);
         Ok(())
     }
 
@@ -280,6 +308,14 @@ impl Engine {
         spec.definition
             .validate()
             .map_err(EngineError::InvalidDefinition)?;
+
+        // 原子占位：已在驱动中的 run 重复恢复是无操作，绝不允许第二个写者
+        //（EventLog 各自计数 seq，双写者必然产生重复 seq 与重复副作用）。
+        let reservation = match self.reserve_run(&spec.run_id) {
+            Ok(reservation) => reservation,
+            Err(EngineError::RunExists(_)) => return Ok(ResumeOutcome::Resumed),
+            Err(err) => return Err(err),
+        };
 
         let path = self.events_path(&spec.run_id);
         if !path.exists() {
@@ -302,7 +338,7 @@ impl Engine {
 
         let log = EventLog::open(&self.data_dir, &spec.run_id).await?;
         let plan = RecoveryPlan::classify(&spec.definition, &state);
-        self.spawn_driver(log, spec, state, plan);
+        self.spawn_driver(log, spec, state, plan, reservation);
         Ok(ResumeOutcome::Resumed)
     }
 
@@ -324,7 +360,7 @@ impl Engine {
             .get(run_id)
             .map(|h| h.signal_tx.clone())
             .ok_or_else(|| {
-                EngineError::Node(format!("run {run_id} 当前不在运行中（已结束或未加载）"))
+                EngineError::NotLive(format!("run {run_id} 当前不在运行中（已结束或未加载）"))
             })?;
         let (reply, received) = oneshot::channel();
         sender
@@ -336,19 +372,41 @@ impl Engine {
             .map_err(|_| EngineError::Node(format!("run {run_id} 未能确认信号处理结果")))?
     }
 
-    fn spawn_driver(&self, log: EventLog, spec: StartRun, state: RunState, plan: RecoveryPlan) {
+    /// 原子占位 run_id：同一 run 至多一个本地 Driver。
+    /// 占位后要么交给 spawn_driver（移交清理责任），要么随 RunReservation drop 自动释放。
+    fn reserve_run(&self, run_id: &str) -> Result<RunReservation<'_>, EngineError> {
+        let mut registry = self.registry.lock();
+        if registry.contains_key(run_id) {
+            return Err(EngineError::RunExists(run_id.to_string()));
+        }
         let (signal_tx, signal_rx) = mpsc::channel(SIGNAL_CHANNEL_CAPACITY);
         let cancel = CancellationToken::new();
-        // 单机后端没有所有权转移；这个 token 不会触发
-        let lost = CancellationToken::new();
-
-        self.registry.lock().insert(
-            spec.run_id.clone(),
+        registry.insert(
+            run_id.to_string(),
             RunHandle {
                 cancel: cancel.clone(),
                 signal_tx,
             },
         );
+        Ok(RunReservation {
+            engine: self,
+            run_id: run_id.to_string(),
+            cancel,
+            signal_rx: Some(signal_rx),
+            armed: true,
+        })
+    }
+
+    fn spawn_driver(
+        &self,
+        log: EventLog,
+        spec: StartRun,
+        state: RunState,
+        plan: RecoveryPlan,
+        mut reservation: RunReservation<'_>,
+    ) {
+        // 单机后端没有所有权转移；这个 token 不会触发
+        let lost = CancellationToken::new();
 
         let sink: Box<dyn RunEventSink> = Box::new(FileSink {
             run_id: spec.run_id.clone(),
@@ -365,15 +423,16 @@ impl Engine {
                 child_launcher: self.child_launcher.lock().clone(),
                 sink,
                 events_tx: Some(self.events_tx.clone()),
-                cancel,
+                cancel: reservation.cancel.clone(),
                 ownership_lost: lost,
-                signal_rx: Some(signal_rx),
+                signal_rx: reservation.signal_rx.take(),
                 inbox_poll: FILE_INBOX_POLL,
             },
             state,
             plan,
         );
-        // Driver 完全退出（含 LeaseLost 静默退出）后清理本地 registry
+        // 注册位移交：Driver 完全退出（含 LeaseLost 静默退出）后由退出任务清理
+        reservation.disarm();
         let registry = self.registry.clone();
         let run_id = spec.run_id.clone();
         tokio::spawn(async move {

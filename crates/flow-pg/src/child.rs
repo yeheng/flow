@@ -2,12 +2,14 @@
 //! 父子 run 可能在不同实例上执行，不能依赖内存通道——
 //! start 走 gateway 的单事务创建，await 轮询共享 runs 投影，cancel 经持久 inbox。
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use flow_engine::{ChildRunLauncher, ChildRunOutcome, EngineError};
+use flow_engine::{ChildRunLauncher, ChildRunOutcome, DbRunStatus, EngineError};
 use futures::future::BoxFuture;
 use serde_json::Value;
 use sqlx::PgPool;
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::PgConfig;
@@ -19,11 +21,18 @@ use crate::metadata::PgStore;
 pub struct PgChildLauncher {
     pool: PgPool,
     cfg: PgConfig,
+    /// 共享订阅 hub：等待子 run 终态用它的扇出做快路径唤醒，
+    /// 不为每次等待新开 LISTEN 连接（每条会占住一个池槽直到释放）。
+    hub: Arc<crate::subscribe::EventHub>,
 }
 
 impl PgChildLauncher {
-    pub fn new(pool: PgPool, cfg: PgConfig) -> PgChildLauncher {
-        PgChildLauncher { pool, cfg }
+    pub fn new(
+        pool: PgPool,
+        cfg: PgConfig,
+        hub: Arc<crate::subscribe::EventHub>,
+    ) -> PgChildLauncher {
+        PgChildLauncher { pool, cfg, hub }
     }
 }
 
@@ -81,26 +90,29 @@ impl ChildRunLauncher for PgChildLauncher {
         Box::pin(async move {
             let store = PgStore::new(self.pool.clone());
             let poll = self.cfg.subscribe_poll.max(Duration::from_millis(50));
-            // 终态事件提交时带 NOTIFY（§8）：正常路径毫秒级唤醒；poll 只是通知
-            // 丢失时的兜底（如无事件落库的 reconcile_terminal 修正路径）。
-            let mut notify = crate::event_notifications(&self.pool).await.ok();
+            // 子 run 的事件由共享订阅 hub 扇出（§8）：正常路径毫秒级唤醒，
+            // 不新开 LISTEN 连接；poll 是通知丢失/游标限流时的兜底
+            //（如无事件落库的 reconcile_terminal 修正路径）。
+            let mut events = Some(self.hub.subscribe());
             loop {
                 let run = store
                     .get_run(child_run_id)
                     .await
                     .map_err(|e| EngineError::Backend(e.to_string()))?;
                 match run.status.as_str() {
-                    "succeeded" => {
+                    s if s == DbRunStatus::Succeeded.as_str() => {
                         return Ok(ChildRunOutcome::Succeeded(
                             run.output.unwrap_or(Value::Null),
                         ))
                     }
-                    "failed" => {
+                    s if s == DbRunStatus::Failed.as_str() => {
                         return Ok(ChildRunOutcome::Failed(
                             run.error.unwrap_or_else(|| "未知错误".into()),
                         ))
                     }
-                    "cancelled" => return Ok(ChildRunOutcome::Cancelled),
+                    s if s == DbRunStatus::Cancelled.as_str() => {
+                        return Ok(ChildRunOutcome::Cancelled)
+                    }
                     _ => {}
                 }
                 let wait = tokio::time::sleep(poll);
@@ -109,14 +121,21 @@ impl ChildRunLauncher for PgChildLauncher {
                     tokio::select! {
                         _ = cancel.cancelled() => return Ok(ChildRunOutcome::Cancelled),
                         _ = &mut wait => break,
-                        note = async { notify.as_mut().unwrap().recv().await }, if notify.is_some() => {
-                            match note {
-                                // 无关 run 的通知：继续等，不重置兜底计时
-                                Some(id) if id != child_run_id => {}
-                                // 本 run 的通知：立刻重查状态
-                                Some(_) => break,
-                                // 监听任务退出：摘掉监听臂，退化为纯兜底轮询
-                                None => notify = None,
+                        received = async {
+                            match events.as_mut() {
+                                Some(rx) => rx.recv().await,
+                                None => std::future::pending().await,
+                            }
+                        }, if events.is_some() => {
+                            match received {
+                                // 无关 run 的事件：继续等，不重置兜底计时
+                                Ok(env) if env.run_id != child_run_id => {}
+                                // 本 run 的事件：立刻重查状态
+                                Ok(_) => break,
+                                // 丢的是唤醒不是数据，poll 兜底
+                                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                                // hub 已停：退化为纯兜底轮询
+                                Err(broadcast::error::RecvError::Closed) => events = None,
                             }
                         }
                     }
