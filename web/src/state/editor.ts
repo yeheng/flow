@@ -195,22 +195,23 @@ function seedCanvas(): boolean {
   return true;
 }
 
-export async function selectWorkflow(id: string): Promise<void> {
+export async function selectWorkflow(id: string, version?: number): Promise<void> {
   // nodeTypes 未就绪时 toFlow/seedCanvas 的类型断言都会落空：先挡住并提示
   if (editor.nodeTypes.length === 0) {
     toast.error("节点类型清单未加载，无法打开工作流；连接恢复后请重试");
     return;
   }
   try {
-    const w = await api.getWorkflow(id);
+    const w = await api.getWorkflow(id, version);
     editor.version = w.version;
     editor.publishedVersion = w.published_version;
     const flow = definitionToFlow(w.definition);
     editor.nodes = flow.nodes;
     editor.edges = flow.edges;
   } catch (e) {
-    // workflow.get 对无版本的工作流报「不存在」（-32011），按空画布处理
-    if (!(e instanceof RpcError && e.code === -32011)) {
+    // workflow.get 对无版本的工作流报「不存在」（-32011）：仅当未指定版本时按空画布 seed；
+    // 指定版本时的 -32011 是「该版本不存在」，如实报错
+    if (!(e instanceof RpcError && e.code === -32011) || version !== undefined) {
       toast.error(errText(e));
       return;
     }
@@ -224,6 +225,13 @@ export async function selectWorkflow(id: string): Promise<void> {
   markSaved();
   resetHistory();
 }
+
+/** 当前工作流的最新版本号（workflows 清单未载时回落当前编辑版本） */
+export const latestVersion = computed(
+  () =>
+    editor.workflows.find((w) => w.workflow_id === editor.workflowId)?.latest_version ??
+    editor.version,
+);
 
 /** 新建并选中；返回新工作流 id，失败返回 null */
 export async function createWorkflow(name: string): Promise<string | null> {

@@ -5,6 +5,7 @@ import type {
   RunEvent,
   RunRecord,
   Timeline,
+  VersionMeta,
   WorkflowDetail,
   WorkflowSummary,
 } from "../types";
@@ -40,6 +41,13 @@ export async function getWorkflow(workflowId: string, version?: number): Promise
   const params: Record<string, unknown> = { workflow_id: workflowId };
   if (version !== undefined) params.version = version;
   return client.call<WorkflowDetail>("workflow.get", params);
+}
+
+export async function listVersions(workflowId: string): Promise<VersionMeta[]> {
+  const r = await client.call<{ versions: VersionMeta[] }>("workflow.versions", {
+    workflow_id: workflowId,
+  });
+  return r.versions;
 }
 
 export async function deleteWorkflow(workflowId: string): Promise<void> {

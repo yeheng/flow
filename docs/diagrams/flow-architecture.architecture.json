@@ -1,0 +1,362 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "flow 工作流引擎架构",
+    "quality_profile": "showcase",
+    "legend": {
+      "mode": "auto",
+      "entries": {
+        "frontend": {
+          "label": "前端"
+        },
+        "backend": {
+          "label": "后端服务"
+        },
+        "database": {
+          "label": "存储"
+        },
+        "security": {
+          "label": "安全边界"
+        },
+        "external": {
+          "label": "外部交互"
+        }
+      }
+    },
+    "views": [
+      {
+        "id": "request-spine",
+        "label": "请求主链",
+        "focus": [
+          "webCanvas",
+          "flowServer",
+          "flowBackend",
+          "flowEngine"
+        ],
+        "note": "前端画布经 JSON-RPC 进入 AnyBackend，再交给单写者 Driver。"
+      },
+      {
+        "id": "event-authority",
+        "label": "事件权威路径",
+        "focus": [
+          "flowEngine",
+          "flowBackend",
+          "eventLog",
+          "runStore"
+        ],
+        "note": "每个事件先追加并 fsync，再投影到 runs 元数据表。"
+      },
+      {
+        "id": "pg-arm",
+        "label": "Postgres 分支",
+        "focus": [
+          "flowBackend",
+          "flowPg",
+          "postgres"
+        ],
+        "note": "对等多节点模式改用共享日志与 epoch 租约。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "webCanvas",
+      "type": "frontend",
+      "label": "Vue 3 画布",
+      "sublabel": "@vue-flow/core",
+      "pos": [
+        30,
+        220
+      ],
+      "size": [
+        150,
+        76
+      ]
+    },
+    {
+      "id": "flowServer",
+      "type": "backend",
+      "label": "flow-server",
+      "sublabel": "JSON-RPC · :9800",
+      "pos": [
+        270,
+        220
+      ],
+      "size": [
+        170,
+        76
+      ]
+    },
+    {
+      "id": "flowBackend",
+      "type": "backend",
+      "label": "flow-backend",
+      "sublabel": "AnyBackend 枚举",
+      "pos": [
+        540,
+        220
+      ],
+      "size": [
+        180,
+        76
+      ]
+    },
+    {
+      "id": "flowEngine",
+      "type": "backend",
+      "label": "flow-engine",
+      "sublabel": "Driver · 单写者",
+      "pos": [
+        830,
+        220
+      ],
+      "size": [
+        180,
+        76
+      ]
+    },
+    {
+      "id": "jsSandbox",
+      "type": "security",
+      "label": "JS 沙箱",
+      "sublabel": "rquickjs · expr",
+      "pos": [
+        1120,
+        220
+      ],
+      "size": [
+        170,
+        76
+      ]
+    },
+    {
+      "id": "flowDto",
+      "type": "backend",
+      "label": "flow-dto",
+      "sublabel": "DTO 与状态词汇表",
+      "pos": [
+        830,
+        70
+      ],
+      "size": [
+        180,
+        76
+      ]
+    },
+    {
+      "id": "humanSignal",
+      "type": "external",
+      "label": "人工信号",
+      "sublabel": "human_task · 裁决",
+      "pos": [
+        30,
+        420
+      ],
+      "size": [
+        150,
+        76
+      ]
+    },
+    {
+      "id": "eventLog",
+      "type": "database",
+      "label": "event.jsonl",
+      "sublabel": "run 事件日志",
+      "pos": [
+        540,
+        420
+      ],
+      "size": [
+        180,
+        76
+      ]
+    },
+    {
+      "id": "runStore",
+      "type": "database",
+      "label": "flow-store",
+      "sublabel": "SQLite 元数据",
+      "pos": [
+        830,
+        420
+      ],
+      "size": [
+        180,
+        76
+      ]
+    },
+    {
+      "id": "flowPg",
+      "type": "backend",
+      "label": "flow-pg",
+      "sublabel": "共享日志 · epoch 租约",
+      "pos": [
+        1120,
+        600
+      ],
+      "size": [
+        180,
+        76
+      ]
+    },
+    {
+      "id": "postgres",
+      "type": "database",
+      "label": "PostgreSQL",
+      "sublabel": "共享日志 + inbox",
+      "pos": [
+        1400,
+        600
+      ],
+      "size": [
+        180,
+        76
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "flow-server 进程",
+      "wraps": [
+        "flowServer",
+        "flowBackend",
+        "flowEngine",
+        "jsSandbox",
+        "flowDto"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "SQLite 单机后端",
+      "wraps": [
+        "eventLog",
+        "runStore"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "Postgres 后端",
+      "wraps": [
+        "flowPg",
+        "postgres"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "canvas-rpc",
+      "from": "webCanvas",
+      "to": "flowServer",
+      "label": "JSON-RPC",
+      "variant": "emphasis"
+    },
+    {
+      "id": "human-signal",
+      "from": "humanSignal",
+      "to": "webCanvas",
+      "label": "run.signal",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "rpc-backend",
+      "from": "flowServer",
+      "to": "flowBackend",
+      "label": "AnyBackend",
+      "variant": "emphasis"
+    },
+    {
+      "id": "backend-engine",
+      "from": "flowBackend",
+      "to": "flowEngine",
+      "label": "启动 Driver",
+      "variant": "emphasis"
+    },
+    {
+      "id": "engine-sandbox",
+      "from": "flowEngine",
+      "to": "jsSandbox",
+      "label": "JS 求值"
+    },
+    {
+      "id": "engine-dto",
+      "from": "flowEngine",
+      "to": "flowDto",
+      "label": "共享 DTO",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "backend-log",
+      "from": "flowBackend",
+      "to": "eventLog",
+      "label": "追加 + fsync",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        462,
+        404
+      ]
+    },
+    {
+      "id": "backend-store",
+      "from": "flowBackend",
+      "to": "runStore",
+      "label": "runs 表",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        900,
+        580
+      ]
+    },
+    {
+      "id": "backend-pg",
+      "from": "flowBackend",
+      "to": "flowPg",
+      "label": "Postgres 臂",
+      "labelAt": [
+        744,
+        516
+      ]
+    },
+    {
+      "id": "pg-postgres",
+      "from": "flowPg",
+      "to": "postgres",
+      "label": "共享日志"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "闭集后端枚举",
+      "items": [
+        "flow-rpc 只依赖 flow_backend::AnyBackend，不感知 flow-store / flow-pg",
+        "闭集枚举而非 trait 对象：新增方法编译器逼着两个臂都写完",
+        "后端选择只在进程入口发生一次（FLOW_BACKEND 环境变量）"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "事件权威",
+      "items": [
+        "event.jsonl 是 run 执行状态的唯一权威，seq 从 1 严格连续",
+        "每个事件 write_all + sync_all，界定了崩溃窗口",
+        "RunState::fold 是唯一状态转移函数，恢复与时间线共用"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "信任边界",
+      "items": [
+        "服务默认无认证，只监听 127.0.0.1:9800",
+        "http_call 是任意出站 HTTP，工作流定义等同可执行代码",
+        "JS 沙箱无 std/os 模块，脚本 import 被拒"
+      ]
+    }
+  ]
+}

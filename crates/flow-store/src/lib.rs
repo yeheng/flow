@@ -214,7 +214,7 @@ impl Store {
         match version {
             Some(version) => {
                 let row = sqlx::query(
-                    "SELECT * FROM workflow_versions WHERE workflow_id = ? AND version = ?",
+                    "SELECT workflow_id, version, definition, checksum, status, created_at FROM workflow_versions WHERE workflow_id = ? AND version = ?",
                 )
                 .bind(workflow_id)
                 .bind(version)
@@ -235,12 +235,33 @@ impl Store {
         workflow_id: &str,
     ) -> Result<Option<WorkflowVersion>, StoreError> {
         let row = sqlx::query(
-            "SELECT * FROM workflow_versions WHERE workflow_id = ? ORDER BY version DESC LIMIT 1",
+            "SELECT workflow_id, version, definition, checksum, status, created_at FROM workflow_versions WHERE workflow_id = ? ORDER BY version DESC LIMIT 1",
         )
         .bind(workflow_id)
         .fetch_optional(&self.pool)
         .await?;
         row.map(Self::version_from_row).transpose()
+    }
+
+    /// 全部版本（按 version 倒序）；workflow 不存在时报 WorkflowNotFound，与 update/get 语义一致。
+    pub async fn list_versions(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Vec<WorkflowVersion>, StoreError> {
+        let exists = sqlx::query("SELECT 1 FROM workflows WHERE id = ?")
+            .bind(workflow_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        if exists.is_none() {
+            return Err(StoreError::WorkflowNotFound(workflow_id.to_string()));
+        }
+        let rows = sqlx::query(
+            "SELECT workflow_id, version, definition, checksum, status, created_at FROM workflow_versions WHERE workflow_id = ? ORDER BY version DESC",
+        )
+        .bind(workflow_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Self::version_from_row).collect()
     }
 
     /// 最新已发布版本：run.start 不带 version 时用它。
@@ -373,7 +394,7 @@ impl Store {
     }
 
     pub async fn get_run(&self, run_id: &str) -> Result<RunRecord, StoreError> {
-        let row = sqlx::query("SELECT * FROM runs WHERE id = ?")
+        let row = sqlx::query("SELECT id, workflow_id, workflow_version, status, input, output, error, started_at, ended_at FROM runs WHERE id = ?")
             .bind(run_id)
             .fetch_optional(&self.pool)
             .await?
@@ -389,7 +410,7 @@ impl Store {
         let rows = match workflow_id {
             Some(id) => {
                 sqlx::query(
-                    "SELECT * FROM runs WHERE workflow_id = ? ORDER BY started_at DESC LIMIT ?",
+                    "SELECT id, workflow_id, workflow_version, status, input, output, error, started_at, ended_at FROM runs WHERE workflow_id = ? ORDER BY started_at DESC LIMIT ?",
                 )
                 .bind(id)
                 .bind(limit)
@@ -397,7 +418,7 @@ impl Store {
                 .await?
             }
             None => {
-                sqlx::query("SELECT * FROM runs ORDER BY started_at DESC LIMIT ?")
+                sqlx::query("SELECT id, workflow_id, workflow_version, status, input, output, error, started_at, ended_at FROM runs ORDER BY started_at DESC LIMIT ?")
                     .bind(limit)
                     .fetch_all(&self.pool)
                     .await?
@@ -409,7 +430,7 @@ impl Store {
     /// 崩溃恢复的输入：进程重启后需要续跑的 run。
     pub async fn unfinished_runs(&self) -> Result<Vec<RunRecord>, StoreError> {
         let rows =
-            sqlx::query("SELECT * FROM runs WHERE status IN (?, ?, ?) ORDER BY started_at ASC")
+            sqlx::query("SELECT id, workflow_id, workflow_version, status, input, output, error, started_at, ended_at FROM runs WHERE status IN (?, ?, ?) ORDER BY started_at ASC")
                 .bind(DbRunStatus::Initializing.as_str())
                 .bind(DbRunStatus::Running.as_str())
                 .bind(DbRunStatus::AwaitingResume.as_str())

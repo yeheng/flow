@@ -167,13 +167,6 @@ impl Definition {
             .find(|n| n.kind() == Some(NodeType::Start))
     }
 
-    pub fn type_map(&self) -> HashMap<String, NodeType> {
-        self.nodes
-            .iter()
-            .filter_map(|n| n.kind().map(|k| (n.id.clone(), k)))
-            .collect()
-    }
-
     /// 建图即校验：拖拽生成的图在发布前必须过这一关。
     pub fn validate(&self) -> Result<(), String> {
         if self.nodes.is_empty() {

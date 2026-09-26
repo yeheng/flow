@@ -111,7 +111,6 @@ pub struct Envelope {
 
 /// 追加写的 run 事件日志，每事件 fsync。
 pub struct EventLog {
-    path: PathBuf,
     file: tokio::fs::File,
     seq: u64,
 }
@@ -135,7 +134,7 @@ impl EventLog {
                 std::io::ErrorKind::AlreadyExists => EngineError::RunExists(run_id.to_string()),
                 _ => EngineError::Io(e),
             })?;
-        Ok(EventLog { path, file, seq: 0 })
+        Ok(EventLog { file, seq: 0 })
     }
 
     /// 打开已有日志续写：先修复残缺尾行，再从最后一个有效 seq 接着写。
@@ -155,15 +154,7 @@ impl EventLog {
         }
         let seq = events.last().map(|e| e.seq).unwrap_or(0);
         let file = OpenOptions::new().append(true).open(&path).await?;
-        Ok(EventLog { path, file, seq })
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub fn last_seq(&self) -> u64 {
-        self.seq
+        Ok(EventLog { file, seq })
     }
 
     /// 追加一条事件并 fsync。这是崩溃安全的写入边界。

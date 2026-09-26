@@ -141,7 +141,15 @@ impl RunTail {
                         }
                     }
                     Err(err) => {
-                        // 不谎报终结、不跳缺口：等重试定时器或下一条事件唤醒
+                        // run 不存在是确定事实，不是抖动：缺口永远补不上，
+                        // 每 10s 重试只会泄漏一个永不退出的 task。
+                        // 结束流而非谎报终结、跳缺口或用调用方无法区分的挂起。
+                        if matches!(err, BackendError::RunNotFound(_)) {
+                            tracing::debug!(run_id = %self.run_id, "订阅的 run 不存在，结束订阅流");
+                            self.done = true;
+                            continue;
+                        }
+                        // 其余失败：不谎报终结、不跳缺口：等重试定时器或下一条事件唤醒
                         tracing::debug!(
                             run_id = %self.run_id,
                             error = %err,
@@ -206,6 +214,8 @@ mod tests {
     struct FakeReader {
         log: parking_lot::Mutex<Vec<Envelope>>,
         failures: parking_lot::Mutex<u32>,
+        /// run 不存在：确定事实，不是抖动
+        missing: bool,
     }
 
     impl FakeReader {
@@ -213,6 +223,15 @@ mod tests {
             Arc::new(FakeReader {
                 log: parking_lot::Mutex::new(log),
                 failures: parking_lot::Mutex::new(failures),
+                missing: false,
+            })
+        }
+
+        fn missing() -> Arc<FakeReader> {
+            Arc::new(FakeReader {
+                log: parking_lot::Mutex::new(Vec::new()),
+                failures: parking_lot::Mutex::new(0),
+                missing: true,
             })
         }
 
@@ -227,6 +246,9 @@ mod tests {
             _run_id: &'a str,
             from_seq: Option<u64>,
         ) -> BoxFuture<'a, Result<Vec<Envelope>, BackendError>> {
+            if self.missing {
+                return Box::pin(async { Err(BackendError::RunNotFound("run-1".into())) });
+            }
             let fail = {
                 let mut failures = self.failures.lock();
                 if *failures > 0 {
@@ -303,6 +325,21 @@ mod tests {
             out.push(envelope.seq);
         }
         out
+    }
+
+    /// 订阅一个不存在的 run：必须结束流。修复前 RunNotFound 被当成「db 抖动」，
+    /// needs_fill 永远为真 → 每 10s 重试一次，task 永不退出（前端打错 run_id
+    /// 就永久泄漏一个订阅 task）。
+    #[tokio::test(start_paused = true)]
+    async fn missing_run_ends_stream_instead_of_retrying_forever() {
+        let reader = FakeReader::missing();
+        let (_tx, rx) = broadcast::channel::<Envelope>(16);
+
+        let stream = run_tail(reader, rx, "run-1".into());
+        let seqs = tokio::time::timeout(Duration::from_secs(60), collect(stream))
+            .await
+            .expect("订阅不存在的 run 必须立刻结束（修复前永久挂起）");
+        assert!(seqs.is_empty(), "不存在的 run 不应吐出任何事件：{seqs:?}");
     }
 
     /// 回放历史、实时段去重、终态后自然结束。

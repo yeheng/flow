@@ -153,6 +153,33 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
         Ok::<_, ErrorObjectOwned>(json!({ "workflows": list }))
     })?;
 
+    // 版本历史（倒序）：只回元数据列，definition 走 workflow.get 按需拉取
+    module.register_async_method("workflow.versions", |params, state, _| async move {
+        #[derive(Deserialize)]
+        struct P {
+            workflow_id: String,
+        }
+        let p: P = parse(&params)?;
+        let versions = state
+            .backend
+            .list_versions(&p.workflow_id)
+            .await
+            .map_err(backend_err)?;
+        let versions: Vec<Value> = versions
+            .into_iter()
+            .map(|v| {
+                json!({
+                    "workflow_id": v.workflow_id,
+                    "version": v.version,
+                    "status": v.status,
+                    "checksum": v.checksum,
+                    "created_at": v.created_at,
+                })
+            })
+            .collect();
+        Ok::<_, ErrorObjectOwned>(json!({ "versions": versions }))
+    })?;
+
     module.register_async_method("workflow.delete", |params, state, _| async move {
         #[derive(Deserialize)]
         struct P {

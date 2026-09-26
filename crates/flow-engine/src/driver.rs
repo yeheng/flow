@@ -755,28 +755,21 @@ impl Driver {
         Ok(())
     }
 
+    /// 重试退避。恢复路径一律等满退避：事件的 `ts` 由**写入者**的时钟决定
+    /// （单机是 append 时的 Utc::now()，PG 是事务里的 clock_timestamp()），
+    /// 而这里的 `Utc::now()` 来自**当前进程**。跨机器恢复时两个时钟不同源，
+    /// NTP 抖动足以把「剩余退避」算成 0 甚至负数（saturating_sub 后同样是 0），
+    /// 退避防护静默失效 → 重试风暴。宁可多重试一次间隔，不做不可靠的减法。
     fn schedule_retry(&mut self, node_id: &str, result_tx: &mpsc::Sender<DriverMsg>) {
         let backoff = self
             .definition
             .node(node_id)
             .map(|node| node.retry().backoff_ms)
             .unwrap_or(0);
-        let elapsed = self
-            .state
-            .record(node_id)
-            .ended_at
-            .map(|ended| {
-                chrono::Utc::now()
-                    .signed_duration_since(ended)
-                    .num_milliseconds()
-                    .max(0) as u64
-            })
-            .unwrap_or(0);
-        let remaining = backoff.saturating_sub(elapsed);
         let result_tx = result_tx.clone();
         let nid = node_id.to_string();
         let handle = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(remaining)).await;
+            tokio::time::sleep(Duration::from_millis(backoff)).await;
             let _ = result_tx.send(DriverMsg::RetryDue { node_id: nid }).await;
         });
         self.inflight.insert(node_id.to_string(), handle);

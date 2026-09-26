@@ -361,3 +361,45 @@ async fn subscribe_with_run_id_replays_follows_and_naturally_ends() {
         flow_engine::Event::RunCompleted { .. }
     ));
 }
+
+#[tokio::test]
+async fn workflow_versions_lists_desc_and_unknown_workflow_is_not_found() {
+    let f = Fixture::new().await;
+    // Fixture 自带 v1 draft（definition(7)）：发布后 v2 是新 draft
+    f.backend.store().publish(&f.workflow, 1).await.unwrap();
+    let v2 = f
+        .backend
+        .store()
+        .update_workflow(&f.workflow, &definition(8))
+        .await
+        .unwrap();
+    assert_eq!(v2, 2);
+
+    let ok = f
+        .call("workflow.versions", json!({"workflow_id": f.workflow}))
+        .await;
+    let versions = ok["result"]["versions"].as_array().unwrap();
+    assert_eq!(versions.len(), 2, "{ok}");
+    // 按 version 倒序：v2 draft 在前，v1 published 在后
+    assert_eq!(versions[0]["version"], 2);
+    assert_eq!(versions[0]["status"], "draft");
+    assert_eq!(versions[1]["version"], 1);
+    assert_eq!(versions[1]["status"], "published");
+    // 元数据列齐全；definition 不在版本列表里（按需走 workflow.get）
+    assert!(versions[0]["checksum"].is_string());
+    assert!(versions[0]["created_at"].is_string());
+    assert!(versions[0].get("definition").is_none());
+
+    // 从未保存过版本的 workflow：空列表，不报错
+    let empty = f.backend.store().create_workflow("empty").await.unwrap();
+    let resp = f
+        .call("workflow.versions", json!({"workflow_id": empty}))
+        .await;
+    assert_eq!(resp["result"]["versions"].as_array().unwrap().len(), 0);
+
+    // workflow 不存在：与 workflow.get 同一语义 -32011
+    let missing = f
+        .call("workflow.versions", json!({"workflow_id": "nope"}))
+        .await;
+    assert_eq!(missing["error"]["code"], -32011);
+}

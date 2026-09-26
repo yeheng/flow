@@ -79,6 +79,15 @@ export interface WorkflowDetail {
   published_version: number | null;
 }
 
+/** workflow.versions 返回的版本元数据（不含 definition，按需走 workflow.get） */
+export interface VersionMeta {
+  workflow_id: string;
+  version: number;
+  status: string;
+  checksum: string;
+  created_at: string;
+}
+
 /** run.list / run.get 返回的运行记录（crates/flow-dto/src/lib.rs RunRecord） */
 export interface RunRecord {
   id: string;

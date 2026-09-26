@@ -5,7 +5,7 @@
 //! - 若原请求已处理，即使 run 已终结也可查询原结果；
 //! - gateway 不得通过直接清租约或只改 status 实现取消。
 
-use serde_json::{json, Value};
+use serde_json::Value;
 use sqlx::{PgPool, Row};
 
 use crate::error::PgError;
@@ -158,9 +158,4 @@ pub async fn wait_applied(
         }
         tokio::time::sleep(poll).await;
     }
-}
-
-/// rejected 落账的错误载荷（校验失败 / conflict）。
-pub fn rejected_error(code: &str, message: &str) -> Value {
-    json!({ "code": code, "message": message })
 }

@@ -8,6 +8,7 @@ import {
   dirty,
   editor,
   ensureNodeTypes,
+  latestVersion,
   pasteClipboard,
   publish,
   refreshWorkflows,
@@ -36,7 +37,8 @@ async function load(id: string): Promise<void> {
     void router.replace("/workflows");
     return;
   }
-  await selectWorkflow(id);
+  // 已在编辑该工作流（含版本页「加载到编辑器」载入的旧版本）时不重载，保留画布与 undo 栈
+  if (editor.workflowId !== id) await selectWorkflow(id);
 }
 
 onMounted(() => load(route.params.id as string));
@@ -105,6 +107,9 @@ function locateError(nodeId?: string): void {
       <span class="editor-title">
         {{ editor.workflowName || editor.workflowId }}
         <span v-if="editor.version" class="muted">v{{ editor.version }}</span>
+        <span v-if="editor.version > 0 && editor.version < latestVersion" class="muted">
+          （基于旧版本，最新 v{{ latestVersion }}）
+        </span>
         <span v-if="dirty" class="wf-dirty">（未保存）</span>
       </span>
       <div class="editor-actions">
@@ -131,6 +136,13 @@ function locateError(nodeId?: string): void {
             </div>
           </div>
         </span>
+        <RouterLink
+          v-if="editor.workflowId"
+          class="link"
+          :to="`/workflows/${editor.workflowId}/versions`"
+        >
+          版本
+        </RouterLink>
         <RouterLink
           v-if="editor.workflowId"
           class="link"

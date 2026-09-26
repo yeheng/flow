@@ -231,8 +231,10 @@ condition 节点输出为表达式结果经 JSON 序列化后的值；引擎用 
 - 致命：JS 抛错、参数校验失败、HTTP 4xx（请求本身的问题）。
 
 退避计时器计入 inflight（不变量），到点后 `RetryDue` 重新派发，attempt+1。
-下游在此期间等待。恢复从 `NodeFailed` 的时间戳与固定版本的 backoff_ms
-计算剩余等待时间；已过期则立即调度，墙钟回退最多重新等待整段 backoff。
+下游在此期间等待。**恢复一律等满 `backoff_ms`**（不续算剩余时间）：事件 `ts`
+由写入者时钟决定（单机 = append 时的 `Utc::now()`，Postgres = 事务内
+`clock_timestamp()`），而调度进程的 `Utc::now()` 与之不同源，跨机器恢复时
+这个减法不可靠——宁可多重试一次间隔，也不做会静默失效的时钟减法。
 
 ### 6.6 取消与 fatal 的副作用语义
 
@@ -303,7 +305,7 @@ Postgres `PgChildLauncher` 经 `lease::create_run` 单事务创建子 run、
 | Running `human_task`，已有信号 | **补终态**（output=信号） | 信号已经持久化 |
 | Running `human_task`，无信号 | **继续等待**，不重复写 started | 等待无副作用 |
 | Running `sub_workflow` | **重放**：沿用已落盘 child_run_id，附着既有子 run | id 确定性派生且已随 node_started 落盘，重复 start 撞 RunExists 幂等 |
-| Failed{retryable:true} | **重建退避计时器**，下一次 attempt | 内存计时器不是权威 |
+| Failed{retryable:true} | **重建退避计时器**，等满整段 backoff 后下一次 attempt | 内存计时器不是权威；剩余时间不可续算（§6.5） |
 | Failed{retryable:false} | **保留 run 失败结论**，独立分支继续 | fold 已记录 fatal_error |
 
 裁决信号：`run.signal {payload: {action: "retry" | "succeeded" | "failed", output?, error?}}`。
@@ -329,7 +331,8 @@ Postgres `PgChildLauncher` 经 `lease::create_run` 单事务创建子 run、
 父 run 等待初始化中断的子 run 时消费 DB 投影（`LocalChildLauncher::await_terminal`
 发现子日志为空时查 runs 行）：这类子 run 永远不会写出终态事件，事件侧等待会挂死。
 
-**已知限制**：delay 崩溃后重放整段时长（不续算剩余时间）；fsync 每事件一次，
+**已知限制**：delay 崩溃后重放整段时长（不续算剩余时间）；重试退避恢复后同样
+等满整段 backoff（不续算剩余时间，理由同 §6.5）；fsync 每事件一次，
 组提交未做（正确性优先，这是后续优化点）。
 
 ## 8. 存储层（flow-store）
@@ -383,6 +386,7 @@ jsonrpsee WebSocket。本层只有**一份**方法实现，只依赖 `flow_backe
 | 方法 | 说明 |
 |---|---|
 | `workflow.create / update / publish / get / list / delete` | 定义生命周期。update 前强制 validate |
+| `workflow.versions` | 版本历史（按 version 倒序，只回 version/status/checksum/created_at 元数据列，definition 走 workflow.get 按需拉取）；workflow 不存在返回 -32011 |
 | `nodetypes.list` | 前端画布能力清单：类型、端口、`params_schema`（JSON Schema draft-07 子集 type/required/properties/enum/default，另带 `x-widget`/`x-label`/`x-help` 扩展键，前端据此渲染参数表单；后端校验仍以 `Definition::validate` 为准）、supports_retry、side_effect |
 | `run.start` | 经 Backend：SQLite 校验 published → insert initializing → 持久化 run_started → 启动 Driver，初始化错误回写 failed；Postgres 单事务原子创建（§9 差异说明） |
 | `run.get / run.list` | 元数据 + live 标记 |
@@ -391,7 +395,7 @@ jsonrpsee WebSocket。本层只有**一份**方法实现，只依赖 `flow_backe
 | `run.cancel` | 统一 SignalAck：活着的 run 交付取消（SQLite 仅本进程生效）；否则 conflict |
 | `run.signal` | human_task 交付 / 副作用节点裁决（§6.7）。signal_id 在 Postgres 必填且重试复用，SQLite 可省（响应只回显客户端提供的，不伪造） |
 | `run.signal_status` | 持久 inbox 落账查询；pg 专属（RPC 边缘 match 暴露），SQLite 返回明确的 invalid |
-| `run.subscribe` | 订阅 `run.event` 通知，可按 run_id 过滤。SQLite 订阅者消费慢时收到 Lagged 丢事件，用 `run.events`（from_seq）补齐；Postgres 按游标轮询共享日志 |
+| `run.subscribe` | 订阅 `run.event` 通知，可按 run_id 过滤。SQLite 订阅者消费慢时收到 Lagged 丢事件，用 `run.events`（from_seq）补齐；Postgres 按游标轮询共享日志。run_id 不存在时流立即结束（不是报错、不是永久重试） |
 
 错误码：`-32010` 参数非法、`-32011` 不存在、`-32012` 冲突、`-32603` 内部错误。
 JSON-RPC 允许整体省略 params（到达 null），解析层统一归一为 `{}`。
@@ -499,8 +503,9 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
 - `child_await.rs` 钉住父 run 等待初始化中断子 run 不挂死（空日志 → DB 投影）；
 - 回归护栏：重复恢复不产生第二个写者（engine_recovery）、平台故障挂起不写
   run_failed（sub_workflow）、订阅缺口补齐与失败重试（flow-backend run_tail）、
-  子 run 重放沿用钉版本（child_version_pin）、信号错误码与订阅回放契约
-  （contracts）；
+  子 run 重放沿用钉版本（flow-backend flow-store 的 child_version_pin + flow-pg 的
+  `replayed_child_run_keeps_pinned_version`，两臂同一条契约）、信号错误码与订阅
+  回放契约（contracts）；
 - store 并发测试核对每个返回版本对应的定义及相同定义的版本复用；
 - 测试数据库必须放在独占目录的 `flow.db`，只清理独占目录，禁止删除系统临时目录；
 - **Postgres 后端**：租约 fencing、接管窗口、恢复分类与 inbox 幂等由

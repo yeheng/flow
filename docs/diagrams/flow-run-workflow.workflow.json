@@ -1,0 +1,241 @@
+{
+  "schema_version": 1,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "flow run 执行流程",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "happy-path",
+        "label": "执行主链",
+        "focus": [
+          "rpcStart",
+          "createRun",
+          "driverLoop",
+          "nodeExec",
+          "eventLog"
+        ],
+        "note": "run 从 run.start 到事件落盘的主链，每步都有明确的持久化边界。"
+      },
+      {
+        "id": "recovery-loop",
+        "label": "崩溃恢复回路",
+        "focus": [
+          "eventLog",
+          "recover",
+          "awaitingResume"
+        ],
+        "note": "recover 只读日志分流重放 / 裁决 / 挂起，绝不冒充 run_failed。"
+      }
+    ]
+  },
+  "lanes": [
+    {
+      "id": "main",
+      "label": "执行主链"
+    },
+    {
+      "id": "exception",
+      "label": "异常与恢复",
+      "variant": "exception"
+    }
+  ],
+  "phases": [
+    {
+      "id": "intake",
+      "label": "初始化",
+      "fromCol": 0,
+      "toCol": 1
+    },
+    {
+      "id": "execute",
+      "label": "调度执行",
+      "fromCol": 2,
+      "toCol": 3,
+      "variant": "emphasis"
+    },
+    {
+      "id": "close",
+      "label": "落盘收尾",
+      "fromCol": 4,
+      "toCol": 5
+    }
+  ],
+  "groups": [
+    {
+      "id": "write-order",
+      "label": "写序协议",
+      "lane": "main",
+      "fromCol": 3,
+      "toCol": 5,
+      "variant": "emphasis"
+    }
+  ],
+  "mainPath": [
+    "rpcStart",
+    "createRun",
+    "driverLoop",
+    "nodeExec",
+    "eventLog"
+  ],
+  "nodes": [
+    {
+      "id": "rpcStart",
+      "lane": "main",
+      "col": 0,
+      "type": "frontend",
+      "label": "run.start",
+      "sublabel": "入口请求",
+      "width": 68
+    },
+    {
+      "id": "createRun",
+      "lane": "main",
+      "col": 1,
+      "type": "backend",
+      "label": "create_run",
+      "sublabel": "initializing",
+      "width": 72
+    },
+    {
+      "id": "driverLoop",
+      "lane": "main",
+      "col": 2,
+      "type": "backend",
+      "label": "Driver",
+      "sublabel": "调度循环",
+      "width": 64
+    },
+    {
+      "id": "nodeExec",
+      "lane": "main",
+      "col": 3,
+      "type": "backend",
+      "label": "节点执行",
+      "sublabel": "JS / HTTP",
+      "width": 64
+    },
+    {
+      "id": "eventLog",
+      "lane": "main",
+      "col": 5,
+      "type": "database",
+      "label": "event.jsonl",
+      "sublabel": "append + fsync",
+      "width": 78
+    },
+    {
+      "id": "recover",
+      "lane": "exception",
+      "col": 3,
+      "type": "security",
+      "label": "recover",
+      "sublabel": "重放 / 裁决",
+      "width": 70
+    },
+    {
+      "id": "awaitingResume",
+      "lane": "exception",
+      "col": 5,
+      "type": "security",
+      "label": "awaiting_resume",
+      "sublabel": "挂起等待",
+      "width": 110
+    }
+  ],
+  "edges": [
+    {
+      "id": "e-start-create",
+      "from": "rpcStart",
+      "to": "createRun",
+      "role": "main"
+    },
+    {
+      "id": "e-create-driver",
+      "from": "createRun",
+      "to": "driverLoop",
+      "role": "main",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "route": "drop"
+    },
+    {
+      "id": "e-driver-exec",
+      "from": "driverLoop",
+      "to": "nodeExec",
+      "label": "就绪派发",
+      "role": "main"
+    },
+    {
+      "id": "e-exec-log",
+      "from": "nodeExec",
+      "to": "eventLog",
+      "role": "main",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "e-log-recover",
+      "from": "eventLog",
+      "to": "recover",
+      "label": "崩溃扫描",
+      "role": "return",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "route": "drop",
+      "labelAt": [
+        527,
+        200
+      ]
+    },
+    {
+      "id": "e-recover-driver",
+      "from": "recover",
+      "to": "driverLoop",
+      "label": "重放后回到调度",
+      "role": "branch",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "top",
+      "route": "drop"
+    },
+    {
+      "id": "e-recover-resume",
+      "from": "recover",
+      "to": "awaitingResume",
+      "label": "平台故障",
+      "role": "error",
+      "variant": "security"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "写序协议",
+      "items": [
+        "node_started 先于副作用",
+        "write_all + sync_all 每事件",
+        "seq 从 1 严格连续"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "单写者调度",
+      "items": [
+        "每 run 一个 tokio 任务",
+        "无共享可变状态",
+        "退避计时器计入 inflight"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "恢复与挂起",
+      "items": [
+        "recover 分流重放 / 裁决",
+        "平台故障挂 awaiting_resume",
+        "绝不冒充 run_failed"
+      ]
+    }
+  ]
+}

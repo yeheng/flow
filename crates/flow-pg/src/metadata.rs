@@ -146,6 +146,25 @@ impl PgStore {
         Ok(version)
     }
 
+    /// 全部版本（按 version 倒序）；workflow 不存在时报 WorkflowNotFound，与 update/get 语义一致。
+    pub async fn list_versions(&self, workflow_id: &str) -> Result<Vec<WorkflowVersion>, PgError> {
+        let exists: Option<String> = sqlx::query_scalar("SELECT id FROM workflows WHERE id = $1")
+            .bind(workflow_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        if exists.is_none() {
+            return Err(PgError::WorkflowNotFound(workflow_id.to_string()));
+        }
+        let rows = sqlx::query(
+            "SELECT workflow_id, version, definition, checksum, status, created_at
+             FROM workflow_versions WHERE workflow_id = $1 ORDER BY version DESC",
+        )
+        .bind(workflow_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(version_from_row).collect()
+    }
+
     pub async fn list_workflows(&self) -> Result<Vec<WorkflowSummary>, PgError> {
         let rows = sqlx::query(
             "SELECT w.id, w.name, w.created_at,

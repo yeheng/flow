@@ -5,13 +5,14 @@ Vue 3 + Vite + TypeScript + vue-router，画布基于 @vue-flow/core。直连 fl
 
 ## 页面结构
 
-| 路由                  | 页面                                                                             |
-| --------------------- | -------------------------------------------------------------------------------- |
-| `/workflows`          | 工作流列表：新建 / 打开编辑器 / 运行记录 / 删除                                  |
-| `/workflows/:id`      | 编辑器：顶部条（保存/发布/运行）+ 左节点面板、中画布、右参数与运行面板           |
-| `/workflows/:id/runs` | 该工作流的运行历史（3s 轮询）                                                    |
-| `/runs`               | 全局运行历史（同上组件，不过滤）                                                 |
-| `/runs/:runId`        | 运行详情：信息头 + 只读 DAG（按 run 钉死的版本渲染、保留运行态着色）+ 实时时间线 |
+| 路由                      | 页面                                                                                  |
+| ------------------------- | ------------------------------------------------------------------------------------- |
+| `/workflows`              | 工作流列表：新建 / 打开编辑器 / 运行记录 / 删除                                       |
+| `/workflows/:id`          | 编辑器：顶部条（保存/发布/运行）+ 左节点面板、中画布、右参数与运行面板                |
+| `/workflows/:id/versions` | 版本历史：版本表格（状态/校验和/时间）+ 加载到编辑器 / 以此版本发布 + 两版结构化 diff |
+| `/workflows/:id/runs`     | 该工作流的运行历史（3s 轮询）                                                         |
+| `/runs`                   | 全局运行历史（同上组件，不过滤）                                                      |
+| `/runs/:runId`            | 运行详情：信息头 + 只读 DAG（按 run 钉死的版本渲染、保留运行态着色）+ 实时时间线      |
 
 全局通知走右上角 Toast，确认/输入走 Modal（替代原生 prompt/confirm）；
 有未保存修改时离开编辑器路由会先确认。
@@ -40,8 +41,35 @@ VITE_FLOW_RPC=ws://127.0.0.1:9801 npm run dev
 npm run build    # vue-tsc --noEmit && vite build
 npm run lint     # ESLint 9 flat config（typescript-eslint + eslint-plugin-vue）
 npm run format   # Prettier
-npm test         # vitest（monitor 事件缓冲/seq 对齐、toast 过期、RPC 客户端匹配）
+npm test         # vitest（monitor 事件流、toast、RPC 客户端、undo/redo、预校验、复制粘贴）
 ```
+
+## 编辑器交互（P1）
+
+- **Undo/Redo**：Cmd/Ctrl+Z 撤销、Cmd/Ctrl+Shift+Z 或 Ctrl+Y 重做；快照式历史栈（上限 100），
+  覆盖增删节点/边、连线、参数编辑（按 node+field 合并连续输入）、节点拖拽（整段合并为一条）、
+  粘贴、自动布局；undo 回到上次保存的快照时「未保存」标记自动消失（脏标记是保存点的派生值）。
+- **多选与复制粘贴**：Shift+左键拖框选、Cmd/Ctrl+点击多选；Cmd/Ctrl+C 复制选中节点及其内部边，
+  Cmd/Ctrl+V 粘贴（重新生成节点 id、位置逐次偏移 32px、内部边重连、外部边不复制、
+  受 max_instances 限制）；Delete/Backspace 删除选中。快捷键在输入框聚焦时不劫持。
+- **前端预校验**：画布实时校验（150ms debounce），规则对齐服务端 Definition::validate
+  （单 start/至少一个 end/DAG/可达性/condition 端口/max_instances/required 参数）；
+  出错节点画布标红，顶部条显示错误计数，点击展开列表、点条目定位节点；
+  保存/发布先过本地校验，有错不打 RPC（服务端校验仍是最终裁决）。
+- **自动布局**：顶部条按钮，对全部节点做拓扑分层布局，可撤销。
+
+## 版本管理（P2）
+
+- **版本历史页** `/workflows/:id/versions`：版本表格（状态、校验和、创建时间），
+  行操作「加载到编辑器」「以此版本发布」；下方两个版本选择器展示结构化 diff
+  （新增/删除/变更节点按字段级 from→to、边增删，位置变化不算变更）。
+- **回滚语义**：后端 publish 只给目标版本行置 published，`latest_published` 恒取
+  MAX(version)，已发布指针无法回拨。因此「以此版本发布」= 复制该版定义 →
+  `workflow.update` 生成新草稿 → 发布新版本（UI 文案如实说明，不是拨回指针）。
+- 「加载到编辑器」把该版本定义载入作为编辑基础，保存时正常生成新版本；
+  顶部条显示「基于旧版本，最新 vN」提示，避免误以为在改最新版。
+- 版本列表数据来自 RPC `workflow.versions`（倒序，只回元数据列，definition 按需走
+  `workflow.get` 带 version 参数拉取）。
 
 ## 使用
 

@@ -196,6 +196,16 @@ impl AnyBackend {
         }
     }
 
+    pub async fn list_versions(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Vec<WorkflowVersion>, BackendError> {
+        match self {
+            AnyBackend::Sqlite(b) => b.list_versions(workflow_id).await,
+            AnyBackend::Postgres(b) => b.list_versions(workflow_id).await,
+        }
+    }
+
     pub async fn list_workflows(&self) -> Result<Vec<WorkflowSummary>, BackendError> {
         match self {
             AnyBackend::Sqlite(b) => b.list_workflows().await,

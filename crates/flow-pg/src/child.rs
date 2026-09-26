@@ -46,11 +46,26 @@ impl ChildRunLauncher for PgChildLauncher {
     ) -> BoxFuture<'a, Result<(), EngineError>> {
         Box::pin(async move {
             let store = PgStore::new(self.pool.clone());
-            let version = store
-                .latest_published(workflow_id)
-                .await
-                .map_err(|e| EngineError::Backend(e.to_string()))?
-                .ok_or_else(|| EngineError::Node(format!("工作流 {workflow_id} 没有已发布版本")))?;
+            // 崩溃重放时 runs 行已存在：沿用行内已钉的版本与输入（定义是不可变
+            // 快照，run 钉死某一版）。绝不在重放路径重新解析 latest published——
+            // 重启前发布的新版会让事件日志与元数据分叉，之后 take_over 的身份
+            // 校验判 IdentityMismatch，run 永久不可恢复。
+            // 与 SQLite 臂 LocalChildLauncher::start 是同一条契约。
+            let existing = store.get_run(child_run_id).await.ok();
+            let version = match &existing {
+                Some(run) => run.workflow_version,
+                None => store
+                    .latest_published(workflow_id)
+                    .await
+                    .map_err(|e| EngineError::Backend(e.to_string()))?
+                    .ok_or_else(|| {
+                        EngineError::Node(format!("工作流 {workflow_id} 没有已发布版本"))
+                    })?,
+            };
+            let input = match &existing {
+                Some(run) => run.input.clone(),
+                None => input,
+            };
             let stored = store
                 .get_version(workflow_id, Some(version))
                 .await
@@ -62,6 +77,10 @@ impl ChildRunLauncher for PgChildLauncher {
                 .validate()
                 .map_err(EngineError::InvalidDefinition)?;
 
+            // 已入队的子 run 不必再走 create_run：它会撞唯一约束。
+            if existing.is_some() {
+                return Ok(());
+            }
             match lease::create_run(
                 &self.pool,
                 child_run_id,

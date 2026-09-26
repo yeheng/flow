@@ -198,9 +198,12 @@ async fn successful_retry_runs_downstream_once_with_and_without_backoff() {
     }
 }
 
+/// 恢复时重建退避计时器。两条路径都等**满**退避：事件 `ts` 是写入者时钟
+/// （SQLite=append 时 Utc::now()，PG=事务内 clock_timestamp()），当前进程的
+/// Utc::now() 与之不同源，跨机器恢复时「剩余退避」的减法不可靠。
 #[tokio::test]
-async fn recovery_restores_retry_and_only_waits_remaining_backoff() {
-    for elapsed_ms in [0, 61_000] {
+async fn recovery_restores_retry_timer_and_waits_full_backoff() {
+    for backoff_ms in [120, 400] {
         let h = Harness::new();
         let (url, server) = http_server(&["200 OK"]).await;
         h.prefix(vec![Event::NodeFailed {
@@ -210,28 +213,18 @@ async fn recovery_restores_retry_and_only_waits_remaining_backoff() {
             retryable: true,
         }])
         .await;
-        if elapsed_ms > 0 {
-            let mut events = h.engine.read_events("r", None).await.unwrap();
-            events.last_mut().unwrap().ts -= chrono::Duration::milliseconds(elapsed_ms);
-            let mut bytes = Vec::new();
-            for event in events {
-                serde_json::to_writer(&mut bytes, &event).unwrap();
-                bytes.push(b'\n');
-            }
-            tokio::fs::write(h.engine.events_path("r"), bytes)
-                .await
-                .unwrap();
-        }
-        let backoff = if elapsed_ms == 0 { 100 } else { 60_000 };
         let def = definition(json!({"id":"n", "type":"http_call", "params":{
-            "url":url, "retry":{"max_attempts":2, "backoff_ms":backoff}
+            "url":url, "retry":{"max_attempts":2, "backoff_ms":backoff_ms}
         }}));
         h.engine.resume_run(spec(def)).await.unwrap();
-        if elapsed_ms == 0 {
-            let state = h.engine.snapshot("r").await.unwrap();
-            assert!(!state.record("n").state.is_terminal());
-            assert_eq!(state.record("n").state.label(), "retrying");
-        }
+        // 退避计时器重建：节点仍在重试窗口内，不得立即重放
+        let state = h.engine.snapshot("r").await.unwrap();
+        assert!(
+            !state.record("n").state.is_terminal(),
+            "恢复后不得立即重放（退避未到）"
+        );
+        assert_eq!(state.record("n").state.label(), "retrying");
+
         let state = h.terminal().await;
         server.await.unwrap();
         assert_eq!(state.phase, RunPhase::Succeeded);

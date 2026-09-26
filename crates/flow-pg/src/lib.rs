@@ -21,7 +21,6 @@ use serde_json::Value;
 use sqlx::postgres::PgConnectOptions;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
-use tokio_util::sync::CancellationToken;
 
 pub use child::PgChildLauncher;
 pub use config::{PgConfig, Role};
@@ -311,10 +310,6 @@ impl PgEngine {
         }
         // Driver 退出后再停 hub：停机期间写入的终态事件仍会被扇出给订阅者
         self.hub.stop().await;
-    }
-
-    pub fn shutdown_token(&self) -> Option<CancellationToken> {
-        self.executor.as_ref().map(|e| e.shutdown.clone())
     }
 }
 

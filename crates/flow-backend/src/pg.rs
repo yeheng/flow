@@ -140,6 +140,17 @@ impl PgBackend {
             .map_err(pg_err)
     }
 
+    pub async fn list_versions(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Vec<WorkflowVersion>, BackendError> {
+        self.engine
+            .store()
+            .list_versions(workflow_id)
+            .await
+            .map_err(pg_err)
+    }
+
     pub async fn list_workflows(&self) -> Result<Vec<WorkflowSummary>, BackendError> {
         self.engine.store().list_workflows().await.map_err(pg_err)
     }

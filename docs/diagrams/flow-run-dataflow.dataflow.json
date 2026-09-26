@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "flow run 数据流",
+    "quality_profile": "showcase",
+    "viewBox": [1560, 760],
+    "views": [
+      { "id": "command-path", "label": "命令入口", "focus": ["webCanvas", "rpc", "flowBackend", "eventLog"], "note": "run.start 与 run.signal 经 RPC 进入 AnyBackend，由 Driver 落事件。" },
+      { "id": "event-authority", "label": "事件权威", "focus": ["flowBackend", "eventLog", "foldTimeline"], "note": "事件先 append + fsync，再折叠为唯一状态转移结果。" },
+      { "id": "subscribe-path", "label": "回放与订阅", "focus": ["eventLog", "runStore", "runTail", "webMonitor"], "note": "订阅按 seq 去重并严格补齐缺口，缺口补齐用 run.events 口径。" }
+    ]
+  },
+  "stages": [
+    { "label": "客户端" },
+    { "label": "入口" },
+    { "label": "后端适配" },
+    { "label": "执行与持久化" },
+    { "label": "派生与回放" }
+  ],
+  "nodes": [
+    { "id": "webCanvas", "type": "frontend", "label": "Vue 3 画布", "sublabel": "run.start · run.signal", "stage": 0, "row": 0 },
+    { "id": "rpc", "type": "backend", "label": "flow-server", "sublabel": "JSON-RPC 方法注册", "stage": 1, "row": 0 },
+    { "id": "flowBackend", "type": "backend", "label": "flow-backend", "sublabel": "AnyBackend 枚举", "stage": 2, "row": 0 },
+    { "id": "eventLog", "type": "database", "label": "event.jsonl", "sublabel": "Driver 单写者 · fsync", "stage": 3, "row": 1 },
+    { "id": "runStore", "type": "database", "label": "runs 投影", "sublabel": "StoreObserver → SQLite", "stage": 3, "row": 3 },
+    { "id": "foldTimeline", "type": "backend", "label": "RunState::fold", "sublabel": "唯一状态转移函数", "stage": 4, "row": 1 },
+    { "id": "runTail", "type": "backend", "label": "run_tail 状态机", "sublabel": "回放 + 按 seq 补齐", "stage": 4, "row": 3 },
+    { "id": "webMonitor", "type": "frontend", "label": "RunMonitor", "sublabel": "时间线订阅视图", "stage": 4, "row": 4 }
+  ],
+  "flows": [
+    { "from": "webCanvas", "to": "rpc", "label": "run.start / run.signal", "classification": "单 run", "variant": "emphasis", "route": "straight", "labelAt": [208, 200] },
+    { "from": "rpc", "to": "flowBackend", "label": "AnyBackend", "classification": "闭集枚举", "variant": "emphasis", "route": "straight" },
+    { "from": "flowBackend", "to": "eventLog", "label": "node_started → 终态", "classification": "write_all + sync_all", "variant": "emphasis", "route": "vertical-channel" },
+    { "from": "eventLog", "to": "runStore", "label": "持久化后投影", "classification": "runs 元数据表", "variant": "default", "route": "vertical-channel" },
+    { "from": "eventLog", "to": "foldTimeline", "label": "seq 严格连续", "classification": "只读折叠", "variant": "emphasis", "route": "straight" },
+    { "from": "foldTimeline", "to": "runTail", "label": "RunState 快照", "classification": "恢复与时间线共用", "variant": "default", "route": "vertical-channel" },
+    { "from": "runTail", "to": "webMonitor", "label": "run.event 通知", "classification": "缺口补齐", "variant": "emphasis", "route": "vertical-channel" },
+    { "from": "runStore", "to": "runTail", "label": "run.events 补齐口径", "classification": "增量拉取", "variant": "dashed", "route": "straight" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "命令入口", "items": ["只有 published 版本可执行，单点 resolve_runnable_definition", "run.start 先插 initializing，再持久化 run_started 才派发节点", "run.signal 先校验再落盘，确认后才回执 delivered"] },
+    { "dot": "emerald", "title": "事件权威", "items": ["event.jsonl 是唯一权威，seq 从 1 严格连续", "node_started 发生在副作用之前，界定崩溃窗口", "RunState::fold 是唯一状态转移函数，恢复与时间线共用"] },
+    { "dot": "orange", "title": "回放与订阅", "items": ["SQLite 进程内 broadcast，Postgres 按游标轮询共享日志", "run_tail 去重并严格补齐缺口，绝不跳过", "投影只做索引与补齐口径，权威永远是事件日志"] }
+  ]
+}

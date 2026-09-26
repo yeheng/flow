@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use common::*;
-use flow_engine::RunEventSink;
+use flow_engine::{ChildRunLauncher, RunEventSink};
 use flow_pg::lease::{self, AcquireOutcome};
 use flow_pg::PgRunSink;
 
@@ -457,4 +457,109 @@ async fn takeover_preserves_fatal_and_independent_branch_finishes() {
     runner_b.abort();
     b.shutdown().await;
     db.close().await;
+}
+
+/// 子 run 重放必须沿用 runs 行钉死的版本与输入（与 SQLite 臂
+/// flow-backend/tests/child_version_pin.rs 同一条契约）。
+///
+/// 崩溃窗口：父 run 的 sub_workflow 已 node_started（child_run_id 落盘），
+/// 子 run 已由 gateway 单事务创建（runs 行 + seq=1 RunStarted）。重放/接管时
+/// 若 PgChildLauncher::start 重新解析 latest published，会用 v2 定义驱动钉在
+/// v1 的子 run —— 事件日志与定义分叉，且 v2 的节点集与 v1 日志不匹配。
+/// 这里的断言：重放后日志仍是 v1 的那一条 run_started，不新增、不换版本。
+#[tokio::test]
+async fn replayed_child_run_keeps_pinned_version() {
+    let Some(db) = test_db().await else { return };
+    let pool = db.pool.clone();
+    let gw = engine(&db, flow_pg::Role::Gateway).await;
+
+    let child_v1 = json!({
+        "nodes": [
+            {"id": "start", "type": "start"},
+            {"id": "end", "type": "end"}
+        ],
+        "edges": [{"from": "start", "to": "end"}]
+    });
+    let (child_wf, v1) = publish_definition(&gw, "child-wf", child_v1).await;
+
+    let child_id = format!("child-{}", uuid::Uuid::now_v7());
+    let input = json!({"amount": 21});
+    // 崩溃前的真实状态：gateway 单事务创建（runs 行 + seq=1 RunStarted 已落盘）
+    lease::create_run(&pool, &child_id, &child_wf, v1, &input, 1)
+        .await
+        .unwrap();
+    let before = PgRunSink::read_events(&pool, &child_id, None)
+        .await
+        .unwrap();
+    assert_eq!(before.len(), 1, "创建后只有 seq=1 的 run_started");
+
+    // 重放窗口内发布的新版：重放路径必须无视它
+    let child_v2 = json!({
+        "nodes": [
+            {"id": "start", "type": "start"},
+            {"id": "extra", "type": "script", "params": {"code": "return 1;"}},
+            {"id": "end", "type": "end"}
+        ],
+        "edges": [
+            {"from": "start", "to": "extra"},
+            {"from": "extra", "to": "end"}
+        ]
+    });
+    let v2 = gw
+        .store()
+        .update_workflow(&child_wf, &child_v2)
+        .await
+        .unwrap();
+    gw.store().publish(&child_wf, v2).await.unwrap();
+    assert_ne!(v1, v2);
+    assert_eq!(
+        gw.store().latest_published(&child_wf).await.unwrap(),
+        Some(v2),
+        "latest published 现在必须是 v2"
+    );
+
+    // 重放：父 Driver 沿用已落盘的 child_run_id 重新 start
+    let hub =
+        flow_pg::subscribe::EventHub::start(pool.clone(), fast_config(flow_pg::Role::Executor));
+    let launcher = flow_pg::PgChildLauncher::new(
+        pool.clone(),
+        fast_config(flow_pg::Role::Executor),
+        hub.clone(),
+    );
+    let start = launcher.start(&child_id, &child_wf, input.clone(), 1).await;
+    start.expect("重放 start 必须附着既有子 run，不重新解析版本");
+
+    // 权威日志：仍是 v1 的那一条 run_started，没有插入第二份、没有换成 v2
+    let after = PgRunSink::read_events(&pool, &child_id, None)
+        .await
+        .unwrap();
+    assert_eq!(after, before, "重放不得改动事件日志（新增事件或改写版本）");
+    let flow_engine::Event::RunStarted {
+        workflow_version,
+        input: logged,
+        ..
+    } = &after[0].event
+    else {
+        panic!("首事件必须是 run_started：{after:?}");
+    };
+    assert_eq!(*workflow_version, v1, "子 run 日志未沿用钉死版本");
+    assert_eq!(logged, &input);
+
+    // runs 行也不得被改写
+    let row: (i64, serde_json::Value) =
+        sqlx::query_as("SELECT workflow_version, input FROM runs WHERE id = $1")
+            .bind(&child_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row.0, v1, "runs 行版本不得被改写");
+    assert_eq!(row.1, input);
+
+    // 先停自建的 hub（poll_loop 每 50ms 向 pool 取连接，不 stop 会拖住关库），
+    // 再停 gw 自带的 hub。关库带超时：PgPool::close 等待服务端回收连接，
+    // 测试里被 pg_terminate_backend 打断时可能慢于用例预算；残留库由
+    // common::test_db 的 janitor 在下一次测试启动时清理。
+    hub.stop().await;
+    gw.shutdown().await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), db.close()).await;
 }

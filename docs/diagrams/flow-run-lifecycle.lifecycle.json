@@ -1,0 +1,283 @@
+{
+  "schema_version": 1,
+  "diagram_type": "lifecycle",
+  "meta": {
+    "title": "flow run 生命周期",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1420,
+      700
+    ],
+    "views": [
+      {
+        "id": "main-rail",
+        "label": "主状态链",
+        "focus": [
+          "created",
+          "running",
+          "succeeded",
+          "failed",
+          "cancelled"
+        ],
+        "note": "run 从 initialize 经调度执行到三个终态出口。"
+      },
+      {
+        "id": "wait-and-retry",
+        "label": "等待与重试",
+        "focus": [
+          "running",
+          "waiting",
+          "retrying"
+        ],
+        "note": "等待不是停机：补信号、重试退避后都回到 running。"
+      }
+    ]
+  },
+  "lanes": [
+    {
+      "id": "main",
+      "label": "主链"
+    },
+    {
+      "id": "waiting",
+      "label": "等待"
+    },
+    {
+      "id": "recovery",
+      "label": "恢复"
+    },
+    {
+      "id": "terminal",
+      "label": "终态"
+    }
+  ],
+  "states": [
+    {
+      "id": "created",
+      "type": "start",
+      "label": "initializing",
+      "sublabel": "两段式创建",
+      "lane": "main",
+      "col": 0,
+      "step": "01",
+      "tag": "published"
+    },
+    {
+      "id": "running",
+      "type": "active",
+      "label": "running",
+      "sublabel": "Driver 单写者",
+      "lane": "main",
+      "col": 1,
+      "step": "02",
+      "tag": "调度执行"
+    },
+    {
+      "id": "succeeded",
+      "type": "success",
+      "label": "succeeded",
+      "sublabel": "run_completed",
+      "lane": "main",
+      "col": 2,
+      "step": "03",
+      "tag": "成功"
+    },
+    {
+      "id": "failed",
+      "type": "failure",
+      "label": "failed",
+      "sublabel": "run_failed",
+      "lane": "main",
+      "col": 3,
+      "step": "04",
+      "tag": "致命"
+    },
+    {
+      "id": "cancelled",
+      "type": "failure",
+      "label": "cancelled",
+      "sublabel": "run_cancelled",
+      "lane": "main",
+      "col": 4,
+      "step": "05",
+      "tag": "取消"
+    },
+    {
+      "id": "waiting",
+      "type": "waiting",
+      "label": "waiting",
+      "sublabel": "human_task",
+      "lane": "waiting",
+      "col": 0,
+      "tag": "等待信号"
+    },
+    {
+      "id": "retrying",
+      "type": "waiting",
+      "label": "retrying",
+      "sublabel": "backoff 计时器",
+      "lane": "waiting",
+      "col": 1,
+      "tag": "非终态"
+    }
+  ],
+  "transitions": [
+    {
+      "id": "t-created-running",
+      "from": "created",
+      "to": "running",
+      "label": "run_started 落盘",
+      "labelAt": [
+        171,
+        122
+      ]
+    },
+    {
+      "id": "t-running-succeeded",
+      "from": "running",
+      "to": "succeeded",
+      "label": "节点全部终态",
+      "labelAt": [
+        325,
+        122
+      ]
+    },
+    {
+      "id": "t-running-failed",
+      "from": "running",
+      "to": "failed",
+      "label": "fatal_error",
+      "variant": "security",
+      "fromSide": "top",
+      "toSide": "top",
+      "via": [
+        [
+          248,
+          90
+        ],
+        [
+          556,
+          90
+        ]
+      ],
+      "labelAt": [
+        402,
+        86
+      ]
+    },
+    {
+      "id": "t-running-cancelled",
+      "from": "running",
+      "to": "cancelled",
+      "label": "cancel 交付",
+      "variant": "security",
+      "fromSide": "top",
+      "toSide": "top",
+      "via": [
+        [
+          248,
+          70
+        ],
+        [
+          710,
+          70
+        ]
+      ],
+      "labelAt": [
+        556,
+        66
+      ]
+    },
+    {
+      "id": "t-running-waiting",
+      "from": "running",
+      "to": "waiting",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "route": "drop"
+    },
+    {
+      "id": "t-waiting-running",
+      "from": "waiting",
+      "to": "running",
+      "label": "signal_received",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "bottom",
+      "via": [
+        [
+          402,
+          360
+        ],
+        [
+          248,
+          360
+        ]
+      ],
+      "labelAt": [
+        325,
+        356
+      ]
+    },
+    {
+      "id": "t-running-retrying",
+      "from": "running",
+      "to": "retrying",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "route": "drop"
+    },
+    {
+      "id": "t-retrying-running",
+      "from": "retrying",
+      "to": "running",
+      "label": "RetryDue",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "bottom",
+      "via": [
+        [
+          556,
+          380
+        ],
+        [
+          248,
+          380
+        ]
+      ],
+      "labelAt": [
+        430,
+        376
+      ]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "主链",
+      "items": [
+        "initialize 先插元数据，run_started 落盘后才派发节点",
+        "节点全部到达终态才 finalize，没有中间快照状态",
+        "succeeded 输出走 singular_or_map 规则"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "可恢复等待",
+      "items": [
+        "waiting 与 retrying 都不是终态，都回到 running",
+        "human_task 等待只挂 oneshot，不消耗调度轮次",
+        "退避计时器计入 inflight，否则终止判定提前触发"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "终态与分级",
+      "items": [
+        "failed 只在首个致命节点失败后由 fold 持久推导",
+        "cancelled 由 cancel 信号触发，副作用歧义不裁决",
+        "重启时 recover_unfinished 分流重放；平台故障只挂起"
+      ]
+    }
+  ]
+}
