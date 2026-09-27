@@ -119,8 +119,27 @@ export interface RunRecord {
   /** Option<Value>：未结束时为 null */
   output: unknown;
   error: string | null;
+  /** 触发来源：manual / schedule / webhook / sub_workflow */
+  source: string;
+  /** 来源细节：schedule id / webhook token；manual 与 sub_workflow 为 null */
+  source_detail: string | null;
   started_at: string;
   ended_at: string | null;
+}
+
+/** run.stats 返回（GROUP BY 精确计数） */
+export interface RunStats {
+  total: number;
+  /** status → count，只含实际出现的状态 */
+  by_status: Record<string, number>;
+  /** 仅在不带 workflow_id 过滤时返回（否则空数组） */
+  by_workflow: WorkflowRunStats[];
+}
+
+export interface WorkflowRunStats {
+  workflow_id: string;
+  total: number;
+  by_status: Record<string, number>;
 }
 
 export type NodeRunState = "pending" | "running" | "retrying" | "completed" | "failed" | "skipped";

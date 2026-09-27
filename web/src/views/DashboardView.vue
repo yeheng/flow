@@ -2,19 +2,24 @@
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import * as api from "../api/flow";
 import { errText } from "../rpc/client";
-import { perWorkflowRates, summarizeRuns, type WorkflowRate } from "../state/dashboard";
+import { activeCount, perWorkflowRates, successRate, type WorkflowRate } from "../state/dashboard";
 import { editor, refreshWorkflows } from "../state/editor";
 import { toast } from "../state/toast";
-import type { RunRecord } from "../types";
+import type { RunRecord, RunStats } from "../types";
 
-/** 仪表盘：全局概览。run 统计基于 run.list 最新 500 条客户端聚合（见 state/dashboard.ts 的局限说明） */
+/** 仪表盘：全局概览。统计来自 run.stats（服务端 GROUP BY 精确计数）；
+ *  最近运行表只是展示窗口，走 run.list(limit 10) */
+const stats = ref<RunStats>({ total: 0, by_status: {}, by_workflow: [] });
 const runs = ref<RunRecord[]>([]);
 let timer: ReturnType<typeof setInterval> | null = null;
 
 const workflowNames = computed(() => new Map(editor.workflows.map((w) => [w.workflow_id, w.name])));
-const summary = computed(() => summarizeRuns(runs.value));
-const rates = computed(() => perWorkflowRates(runs.value));
-const recent = computed(() => runs.value.slice(0, 10));
+const summary = computed(() => ({
+  total: stats.value.total,
+  active: activeCount(stats.value.by_status),
+  successRate: successRate(stats.value.by_status),
+}));
+const rates = computed(() => perWorkflowRates(stats.value.by_workflow));
 
 const statusLabel: Record<string, string> = {
   running: "运行中",
@@ -46,7 +51,7 @@ function workflowName(r: WorkflowRate): string {
 async function refresh(): Promise<void> {
   try {
     if (editor.workflows.length === 0) await refreshWorkflows();
-    runs.value = await api.listRuns({ limit: 500 });
+    [stats.value, runs.value] = await Promise.all([api.runStats(), api.listRuns({ limit: 10 })]);
   } catch (e) {
     toast.error(errText(e));
   }
@@ -75,7 +80,7 @@ onUnmounted(() => {
       </div>
       <div class="card">
         <div class="card-value">{{ summary.total }}</div>
-        <div class="card-label">运行总数（近 500 条内）</div>
+        <div class="card-label">运行总数</div>
       </div>
       <div class="card">
         <div class="card-value ok">{{ fmtRate(summary.successRate) }}</div>
@@ -100,7 +105,7 @@ onUnmounted(() => {
           </tr>
         </thead>
         <tbody>
-          <tr v-for="r in recent" :key="r.id">
+          <tr v-for="r in runs" :key="r.id">
             <td class="mono">{{ r.id.slice(0, 8) }}…</td>
             <td>
               {{ workflowNames.get(r.workflow_id) ?? r.workflow_id }}
@@ -118,7 +123,7 @@ onUnmounted(() => {
           </tr>
         </tbody>
       </table>
-      <p v-if="recent.length === 0" class="wf-empty">暂无运行记录</p>
+      <p v-if="runs.length === 0" class="wf-empty">暂无运行记录</p>
     </section>
 
     <section class="section">

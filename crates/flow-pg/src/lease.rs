@@ -208,6 +208,7 @@ pub async fn release(
 /// gateway 的 run.start（§3）：在一个事务内校验 published 版本、插入 run
 /// 和 seq=1 的 RunStarted。提交后 run.status=running、lease 为空、last_seq=1，
 /// 表示已入队——running 不保证已获得执行容量。
+/// source/source_detail 是触发来源归因（flow-dto DbRunSource 词汇表）。
 pub async fn create_run(
     pool: &PgPool,
     run_id: &str,
@@ -215,7 +216,12 @@ pub async fn create_run(
     workflow_version: i64,
     input: &Value,
     depth: u32,
+    source: &str,
+    source_detail: Option<&str>,
 ) -> Result<(), PgError> {
+    if !flow_dto::DbRunSource::is_valid_str(source) {
+        return Err(PgError::Invalid(format!("非法的 run 来源：{source}")));
+    }
     let mut tx = pool.begin().await?;
     // 锁 workflow 行：与 delete_workflow（拒绝已有 run 的 workflow）串行化
     let exists: Option<String> =
@@ -256,14 +262,16 @@ pub async fn create_run(
         depth,
     })?;
     sqlx::query(
-        "INSERT INTO runs (id, workflow_id, workflow_version, status, input, started_at, last_seq)
-         VALUES ($1, $2, $3, $4, $5, clock_timestamp(), 1)",
+        "INSERT INTO runs (id, workflow_id, workflow_version, status, input, source, source_detail, started_at, last_seq)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, clock_timestamp(), 1)",
     )
     .bind(run_id)
     .bind(workflow_id)
     .bind(workflow_version)
     .bind(DbRunStatus::Running.as_str())
     .bind(input)
+    .bind(source)
+    .bind(source_detail)
     .execute(&mut *tx)
     .await?;
     sqlx::query(

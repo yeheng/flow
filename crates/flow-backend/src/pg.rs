@@ -19,7 +19,7 @@ use flow_engine::{Envelope, RunState};
 use flow_pg::{CreateRun as PgCreateRun, PgConfig, PgEngine, PgError};
 
 use crate::{
-    resolve_runnable_definition, BackendError, CreateRun, CreatedRun, RunRecord, Schedule,
+    resolve_runnable_definition, BackendError, CreateRun, CreatedRun, RunRecord, RunStats, Schedule,
     SignalAck, SignalRequest, Webhook, WorkflowSummary, WorkflowVersion,
 };
 
@@ -278,6 +278,8 @@ impl PgBackend {
                 workflow_id: spec.workflow_id,
                 version,
                 input: spec.input,
+                source: spec.source,
+                source_detail: spec.source_detail,
             })
             .await
             .map_err(pg_err)
@@ -291,12 +293,21 @@ impl PgBackend {
         &self,
         workflow_id: Option<&str>,
         status: Option<&str>,
+        source: Option<&str>,
         before_run_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<RunRecord>, BackendError> {
         self.engine
             .store()
-            .list_runs(workflow_id, status, before_run_id, limit)
+            .list_runs(workflow_id, status, source, before_run_id, limit)
+            .await
+            .map_err(pg_err)
+    }
+
+    pub async fn run_stats(&self, workflow_id: Option<&str>) -> Result<RunStats, BackendError> {
+        self.engine
+            .store()
+            .run_stats(workflow_id)
             .await
             .map_err(pg_err)
     }

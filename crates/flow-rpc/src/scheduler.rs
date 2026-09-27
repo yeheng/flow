@@ -30,7 +30,8 @@ pub async fn run(backend: AnyBackend) -> ! {
 }
 
 /// 单轮扫描：注入 now 以便单测。单个 schedule 失败不影响其余。
-pub(crate) async fn fire_due(backend: &AnyBackend, now: DateTime<Local>) {
+/// pub：归因契约测试（contracts.rs）直接驱动一轮，不等 20s tick。
+pub async fn fire_due(backend: &AnyBackend, now: DateTime<Local>) {
     let schedules = match backend.list_schedules(None).await {
         Ok(schedules) => schedules,
         Err(err) => {
@@ -73,6 +74,8 @@ async fn fire_one(
             workflow_id: schedule.workflow_id.clone(),
             version: None, // 当前 published 版本
             input: schedule.input.clone().unwrap_or(Value::Null),
+            source: flow_backend::DbRunSource::Schedule.as_str().to_string(),
+            source_detail: Some(schedule.id.clone()),
         })
         .await;
     match created {
@@ -147,7 +150,7 @@ mod tests {
 
         async fn run_count(&self, workflow_id: &str) -> usize {
             self.backend
-                .list_runs(Some(workflow_id), None, None, 100)
+                .list_runs(Some(workflow_id), None, None, None, 100)
                 .await
                 .unwrap()
                 .len()

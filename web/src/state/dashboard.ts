@@ -1,42 +1,24 @@
-import type { RunRecord } from "../types";
+import type { WorkflowRunStats } from "../types";
 
 /**
- * 仪表盘聚合：数据源是 run.list(limit 500) 的一页数据在客户端聚合。
- * 已知局限：run 超过 500 条时统计只覆盖最新 500 条，总量与成功率都不准；
- * 要精确统计需要后端加聚合接口（P4 之前不做）。
+ * 仪表盘聚合：数据源是 run.stats（服务端 GROUP BY 精确计数），不再做客户端采样聚合。
+ * 这里的纯函数只负责把 by_status 映射成展示用的派生值。
  */
 
-export interface RunSummary {
-  total: number;
-  /** running / initializing / awaiting_resume：仍在执行 */
-  active: number;
-  succeeded: number;
-  failed: number;
-  cancelled: number;
-  /** 终态 run 中 succeeded 的占比（0-1）；没有终态 run 时为 null */
-  successRate: number | null;
+/** 进行中（非终态）计数：running / initializing / awaiting_resume */
+export function activeCount(byStatus: Record<string, number>): number {
+  return (
+    (byStatus["running"] ?? 0) +
+    (byStatus["initializing"] ?? 0) +
+    (byStatus["awaiting_resume"] ?? 0)
+  );
 }
 
-const TERMINAL = new Set(["succeeded", "failed", "cancelled"]);
-
-export function summarizeRuns(runs: RunRecord[]): RunSummary {
-  const summary: RunSummary = {
-    total: runs.length,
-    active: 0,
-    succeeded: 0,
-    failed: 0,
-    cancelled: 0,
-    successRate: null,
-  };
-  for (const r of runs) {
-    if (r.status === "succeeded") summary.succeeded++;
-    else if (r.status === "failed") summary.failed++;
-    else if (r.status === "cancelled") summary.cancelled++;
-    else summary.active++;
-  }
-  const terminal = summary.succeeded + summary.failed + summary.cancelled;
-  summary.successRate = terminal > 0 ? summary.succeeded / terminal : null;
-  return summary;
+/** 终态 run 中 succeeded 的占比（0-1）；没有终态 run 时为 null（显示 —，不显示 0%） */
+export function successRate(byStatus: Record<string, number>): number | null {
+  const terminal =
+    (byStatus["succeeded"] ?? 0) + (byStatus["failed"] ?? 0) + (byStatus["cancelled"] ?? 0);
+  return terminal > 0 ? (byStatus["succeeded"] ?? 0) / terminal : null;
 }
 
 export interface WorkflowRate {
@@ -47,22 +29,14 @@ export interface WorkflowRate {
   successRate: number | null;
 }
 
-/** 按工作流分组的成功率，按 run 总数倒序 */
-export function perWorkflowRates(runs: RunRecord[]): WorkflowRate[] {
-  const groups = new Map<string, { total: number; succeeded: number; terminal: number }>();
-  for (const r of runs) {
-    const g = groups.get(r.workflow_id) ?? { total: 0, succeeded: 0, terminal: 0 };
-    g.total++;
-    if (TERMINAL.has(r.status)) g.terminal++;
-    if (r.status === "succeeded") g.succeeded++;
-    groups.set(r.workflow_id, g);
-  }
-  return [...groups.entries()]
-    .map(([workflowId, g]) => ({
-      workflowId,
-      total: g.total,
-      succeeded: g.succeeded,
-      successRate: g.terminal > 0 ? g.succeeded / g.terminal : null,
+/** 按工作流成功率表：run.stats 的 by_workflow 分组，按 run 总数倒序 */
+export function perWorkflowRates(byWorkflow: WorkflowRunStats[]): WorkflowRate[] {
+  return byWorkflow
+    .map((w) => ({
+      workflowId: w.workflow_id,
+      total: w.total,
+      succeeded: w.by_status["succeeded"] ?? 0,
+      successRate: successRate(w.by_status),
     }))
     .sort((a, b) => b.total - a.total);
 }

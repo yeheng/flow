@@ -61,6 +61,35 @@ impl DbRunStatus {
     }
 }
 
+/// runs.source 的合法取值（run 触发来源词汇表，单一来源）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbRunSource {
+    /// run.start 手动触发
+    Manual,
+    /// cron 调度器触发（source_detail = schedule id）
+    Schedule,
+    /// webhook HTTP 触发（source_detail = webhook token）
+    Webhook,
+    /// sub_workflow 节点启动的子 run
+    SubWorkflow,
+}
+
+impl DbRunSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DbRunSource::Manual => "manual",
+            DbRunSource::Schedule => "schedule",
+            DbRunSource::Webhook => "webhook",
+            DbRunSource::SubWorkflow => "sub_workflow",
+        }
+    }
+
+    /// 字符串是否属于词汇表（存储写入口与 RPC 过滤参数校验共用）。
+    pub fn is_valid_str(source: &str) -> bool {
+        matches!(source, "manual" | "schedule" | "webhook" | "sub_workflow")
+    }
+}
+
 /// 定义版本。definition 是不可变快照，run 钉死某一版。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowVersion {
@@ -116,8 +145,29 @@ pub struct RunRecord {
     pub input: Value,
     pub output: Option<Value>,
     pub error: Option<String>,
+    /// 触发来源（DbRunSource 词汇表）；存量数据迁移后为 manual
+    pub source: String,
+    /// 来源细节：schedule id / webhook token；manual 与 sub_workflow 为 None
+    pub source_detail: Option<String>,
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
+}
+
+/// run.stats 的返回：按状态分组的精确计数（GROUP BY，不走采样）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunStats {
+    pub total: i64,
+    /// status → count，只含实际出现的状态
+    pub by_status: std::collections::BTreeMap<String, i64>,
+    /// 仅在不带 workflow_id 过滤时返回（否则为空数组）
+    pub by_workflow: Vec<WorkflowRunStats>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowRunStats {
+    pub workflow_id: String,
+    pub total: i64,
+    pub by_status: std::collections::BTreeMap<String, i64>,
 }
 
 /// run.start 的创建结果。

@@ -440,13 +440,17 @@ impl RunEventSink for PgRunSink {
                 _ => {}
             }
             let (seq, ts) = self.allocate_and_insert(&mut tx, &event).await?;
+            // 先把本信号行落 applied：同事务稍后的 reject_pending_inputs 只动
+            // status='pending' 的行，不先标记的话这条取消会被自己误拒
+            // （gateway 的 wait_applied 看到 rejected → run.cancel 返回 -32012，
+            // 而取消其实已生效——契约要求 delivered 语义）
             sqlx::query(
-                "UPDATE runs SET status = 'cancelled', output = NULL, error = NULL,
-                        ended_at = clock_timestamp(),
-                        lease_owner = NULL, lease_expires_at = NULL
-                 WHERE id = $1",
+                "UPDATE run_signals SET status = 'applied', event_seq = $1
+                 WHERE run_id = $2 AND signal_id = $3",
             )
+            .bind(seq as i64)
             .bind(&self.run_id)
+            .bind(&input.signal_id)
             .execute(&mut *tx)
             .await
             .map_err(Self::sql_err)?;

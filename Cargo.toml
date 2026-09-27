@@ -7,6 +7,8 @@ members = [
     "crates/flow-backend",
     "crates/flow-dto",
     "crates/flow-rpc",
+    "crates/backend-e2e",
+    "crates/backend-perf",
 ]
 
 [workspace.package]

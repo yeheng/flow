@@ -47,6 +47,8 @@ async fn replayed_child_run_keeps_pinned_version() {
             v1,
             &input,
             DbRunStatus::Initializing.as_str(),
+            "manual",
+            None,
         )
         .await
         .unwrap();

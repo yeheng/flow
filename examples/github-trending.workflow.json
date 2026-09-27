@@ -1,0 +1,97 @@
+{
+  "name": "github-trending",
+  "description": "拉取 GitHub Trending 日报（全量 + spoken_language_code=zh），输出 中文 / 非中文 两组项目 JSON",
+  "definition": {
+    "nodes": [
+      {
+        "id": "start",
+        "type": "start",
+        "name": "开始",
+        "position": {
+          "x": 40,
+          "y": 200
+        }
+      },
+      {
+        "id": "fetch_all",
+        "type": "http_call",
+        "name": "Trending 全量榜",
+        "position": {
+          "x": 280,
+          "y": 80
+        },
+        "params": {
+          "method": "GET",
+          "url": "https://github.com/trending?since=daily",
+          "headers": {
+            "User-Agent": "flow-github-trending",
+            "Accept": "text/html"
+          },
+          "timeout_ms": 30000
+        }
+      },
+      {
+        "id": "fetch_zh",
+        "type": "http_call",
+        "name": "Trending 中文榜",
+        "position": {
+          "x": 280,
+          "y": 320
+        },
+        "params": {
+          "method": "GET",
+          "url": "https://github.com/trending?since=daily&spoken_language_code=zh",
+          "headers": {
+            "User-Agent": "flow-github-trending",
+            "Accept": "text/html"
+          },
+          "timeout_ms": 30000
+        }
+      },
+      {
+        "id": "parse",
+        "type": "script",
+        "name": "解析并分成中文 / 非中文",
+        "position": {
+          "x": 560,
+          "y": 200
+        },
+        "params": {
+          "code": "// 把 GitHub Trending 的 HTML 解析成结构化数组。\n// 只用正则：script 节点是 rquickjs 沙箱，没有 DOM、没有网络、没有 fs。\nfunction toNum(s) {\n  if (!s) return null;\n  var n = parseInt(String(s).replace(/,/g, \"\"), 10);\n  return isNaN(n) ? null : n;\n}\n\nfunction decode(s) {\n  return s\n    .replace(/<[^>]+>/g, \"\")\n    .replace(/&amp;/g, \"&\")\n    .replace(/&lt;/g, \"<\")\n    .replace(/&gt;/g, \">\")\n    .replace(/&quot;/g, '\"')\n    .replace(/&#39;/g, \"'\")\n    .replace(/&nbsp;/g, \" \")\n    .replace(/\\s+/g, \" \")\n    .trim();\n}\n\nfunction parseTrending(html) {\n  if (typeof html !== \"string\") return [];\n  var blocks = html.match(/<article class=\"Box-row[^\"]*\">[\\s\\S]*?<\\/article>/g) || [];\n  var projects = [];\n  for (var i = 0; i < blocks.length; i++) {\n    var b = blocks[i];\n    var repo = b.match(/<h2 class=\"h3 lh-condensed\">\\s*<a[^>]*href=\"\\/([^\"]+)\"/);\n    if (!repo) continue;\n    var full = repo[1].replace(/^\\//, \"\");\n    var parts = full.split(\"/\");\n    if (parts.length < 2) continue;\n    var desc = b.match(/<p class=\"col-9[^\"]*\"[^>]*>\\s*([\\s\\S]*?)\\s*<\\/p>/);\n    var lang = b.match(/itemprop=\"programmingLanguage\">([^<]+)</);\n    var today = b.match(/([\\d,]+)\\s+stars today/);\n    var stars = b.match(/href=\"\\/[^\"]+\\/stargazers\"[^>]*>\\s*<svg[\\s\\S]*?<\\/svg>\\s*([\\d,]+)/);\n    var forks = b.match(/href=\"\\/[^\"]+\\/forks\"[^>]*>\\s*<svg[\\s\\S]*?<\\/svg>\\s*([\\d,]+)/);\n    projects.push({\n      rank: projects.length + 1,\n      repo: full,\n      owner: parts[0],\n      name: parts.slice(1).join(\"/\"),\n      url: \"https://github.com/\" + full,\n      description: desc ? decode(desc[1]) : \"\",\n      language: lang ? lang[1].trim() : null,\n      stars_total: toNum(stars && stars[1]),\n      stars_today: toNum(today && today[1]),\n      forks: toNum(forks && forks[1])\n    });\n  }\n  return projects;\n}\n\nvar all = parseTrending(nodes.fetch_all && nodes.fetch_all.body);\nvar zh = parseTrending(nodes.fetch_zh && nodes.fetch_zh.body);\n\n// 页面结构变了要炸出来，不要静悄悄地写一份空 JSON\nif (all.length === 0) {\n  throw new Error(\"全量榜解析出 0 个项目：GitHub Trending 页面结构可能已变\");\n}\n\n// 非中文榜 = 全量榜里排除掉「口语=中文」榜已出现的仓库\nvar zhSet = {};\nfor (var k = 0; k < zh.length; k++) zhSet[zh[k].repo.toLowerCase()] = true;\nvar nonZh = [];\nfor (var j = 0; j < all.length; j++) {\n  if (zhSet[all[j].repo.toLowerCase()]) continue;\n  var p = all[j];\n  nonZh.push({\n    rank: nonZh.length + 1,\n    repo: p.repo,\n    owner: p.owner,\n    name: p.name,\n    url: p.url,\n    description: p.description,\n    language: p.language,\n    stars_total: p.stars_total,\n    stars_today: p.stars_today,\n    forks: p.forks\n  });\n}\n\nreturn {\n  generated_at: new Date().toISOString(),\n  since: \"daily\",\n  sources: {\n    all: \"https://github.com/trending?since=daily\",\n    chinese: \"https://github.com/trending?since=daily&spoken_language_code=zh\"\n  },\n  counts: { chinese: zh.length, non_chinese: nonZh.length, all: all.length },\n  chinese: zh,\n  non_chinese: nonZh\n};",
+          "timeout_ms": 10000
+        }
+      },
+      {
+        "id": "done",
+        "type": "end",
+        "name": "结束",
+        "position": {
+          "x": 840,
+          "y": 200
+        }
+      }
+    ],
+    "edges": [
+      {
+        "from": "start",
+        "to": "fetch_all"
+      },
+      {
+        "from": "start",
+        "to": "fetch_zh"
+      },
+      {
+        "from": "fetch_all",
+        "to": "parse"
+      },
+      {
+        "from": "fetch_zh",
+        "to": "parse"
+      },
+      {
+        "from": "parse",
+        "to": "done"
+      }
+    ]
+  }
+}

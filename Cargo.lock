@@ -134,6 +134,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "backend-e2e"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "flow-backend",
+ "flow-pg",
+ "flow-rpc",
+ "futures",
+ "hex",
+ "jsonrpsee",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "backend-perf"
+version = "0.1.0"
+dependencies = [
+ "backend-e2e",
+ "chrono",
+ "flow-rpc",
+ "futures",
+ "jsonrpsee",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -556,6 +595,7 @@ dependencies = [
  "flow-store",
  "futures",
  "jsonrpsee",
+ "reqwest",
  "serde",
  "serde_json",
  "sqlx",

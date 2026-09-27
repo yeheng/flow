@@ -98,6 +98,9 @@ pub struct CreateRun {
     pub workflow_id: String,
     pub version: i64,
     pub input: Value,
+    /// 触发来源归因（flow-dto DbRunSource 词汇表）
+    pub source: String,
+    pub source_detail: Option<String>,
 }
 
 /// run 创建结果。类型单一来源在 flow-dto。
@@ -192,6 +195,8 @@ impl PgEngine {
             spec.version,
             &spec.input,
             0,
+            &spec.source,
+            spec.source_detail.as_deref(),
         )
         .await?;
         Ok(CreatedRun {

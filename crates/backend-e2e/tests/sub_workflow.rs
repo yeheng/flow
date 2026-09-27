@@ -1,0 +1,273 @@
+//! sub_workflow 端到端语义：子 run 输出透传、确定性 child_run_id、失败传导、
+//! 无发布版本、取消级联、嵌套深度上限。
+//!
+//! 契约来源：DESIGN.md §6.8（子工作流）。
+
+use backend_e2e::common::fixtures::{
+    deep_chain_defs, human_def, linear_def, set_sub_wf, sub_def, timeline_node,
+};
+use backend_e2e::common::{
+    call, call_json, named, publish_workflow, start_run, wait_run_status, wait_run_terminal, Ctx,
+    SHORT, TIMEOUT,
+};
+use backend_e2e::e2e_test;
+use serde_json::{json, Value};
+
+e2e_test!(
+    child_output_passes_through_with_deterministic_id,
+    |ctx: &mut Ctx| Box::pin(async move {
+        let client = ctx.client().await;
+        let (child_wf, child_version) =
+            publish_workflow(&client, "子流程", linear_def("return { got: input };")).await;
+        let (parent_wf, _) = publish_workflow(&client, "父流程", sub_def(&child_wf)).await;
+
+        let run_id = start_run(&client, &parent_wf, json!({ "amount": 7 })).await;
+        let run = wait_run_terminal(&client, &run_id, TIMEOUT).await;
+        assert_eq!(run["run"]["status"], json!("succeeded"), "{run}");
+        // 子 run 输出透传为父节点输出，再经 end 透传为 run 输出
+        assert_eq!(run["run"]["output"], json!({ "got": { "amount": 7 } }));
+
+        // child_run_id 确定性派生：{父run}:{节点}:{attempt}，随 node_started 落盘
+        let timeline: Value = call_json(&client, "run.timeline", json!({"run_id": run_id})).await;
+        let child_run_id = timeline_node(&timeline, "sub")["child_run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(child_run_id, format!("{run_id}:sub:1"));
+
+        // 子 run 是独立日志：可查询、钉死子工作流的已发布版本、深度 1
+        let child = call_json(&client, "run.get", json!({"run_id": child_run_id})).await;
+        assert_eq!(child["run"]["status"], json!("succeeded"));
+        assert_eq!(child["run"]["workflow_id"], json!(child_wf));
+        assert_eq!(child["run"]["workflow_version"], json!(child_version));
+        assert_eq!(child["run"]["output"], json!({ "got": { "amount": 7 } }));
+        let child_events: Value =
+            call_json(&client, "run.events", json!({"run_id": child_run_id})).await;
+        assert_eq!(child_events["events"][0]["depth"], json!(1));
+    })
+);
+
+e2e_test!(child_failure_is_fatal_to_parent, |ctx: &mut Ctx| Box::pin(
+    async move {
+        let client = ctx.client().await;
+        let (child_wf, _) = publish_workflow(
+            &client,
+            "会炸的子流程",
+            linear_def("throw new Error('child boom');"),
+        )
+        .await;
+        let (parent_wf, _) = publish_workflow(&client, "父流程", sub_def(&child_wf)).await;
+
+        let run_id = start_run(&client, &parent_wf, json!({})).await;
+        let run = wait_run_terminal(&client, &run_id, TIMEOUT).await;
+        assert_eq!(run["run"]["status"], json!("failed"), "{run}");
+        assert!(
+            run["run"]["error"].as_str().unwrap().contains("child boom"),
+            "子 run 失败必须传导为父节点 fatal：{run}"
+        );
+
+        let timeline: Value = call_json(&client, "run.timeline", json!({"run_id": run_id})).await;
+        assert_eq!(timeline_node(&timeline, "sub")["state"], json!("failed"));
+        assert_eq!(
+            timeline_node(&timeline, "end")["state"],
+            json!("skipped"),
+            "父节点 fatal 后下游跳过"
+        );
+        assert_eq!(
+            timeline_node(&timeline, "end")["reason"],
+            json!("upstream_failed")
+        );
+
+        // 子 run 自身也是 failed
+        let child_run_id = timeline_node(&timeline, "sub")["child_run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let child = call_json(&client, "run.get", json!({"run_id": child_run_id})).await;
+        assert_eq!(child["run"]["status"], json!("failed"));
+    }
+));
+
+e2e_test!(
+    child_without_published_version_fails_node,
+    |ctx: &mut Ctx| Box::pin(async move {
+        let client = ctx.client().await;
+        // 子工作流只有 draft：启动子 run 解析不到 published 版本
+        let created: Value = call(&client, "workflow.create", json!({"name": "草稿子流程"})).await;
+        let child_wf = created["workflow_id"].as_str().unwrap().to_string();
+        call::<Value>(
+            &client,
+            "workflow.update",
+            json!({"workflow_id": child_wf, "definition": linear_def("return 1;")}),
+        )
+        .await;
+        let (parent_wf, _) = publish_workflow(&client, "父流程", sub_def(&child_wf)).await;
+
+        let run_id = start_run(&client, &parent_wf, json!({})).await;
+        let run = wait_run_terminal(&client, &run_id, TIMEOUT).await;
+        assert_eq!(run["run"]["status"], json!("failed"), "{run}");
+        assert!(
+            run["run"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("没有已发布版本"),
+            "错误必须指明原因：{run}"
+        );
+        let timeline: Value = call_json(&client, "run.timeline", json!({"run_id": run_id})).await;
+        assert_eq!(timeline_node(&timeline, "sub")["state"], json!("failed"));
+    })
+);
+
+e2e_test!(parent_cancel_cascades_to_child, |ctx: &mut Ctx| Box::pin(
+    async move {
+        let client = ctx.client().await;
+        // 子流程里放 human_task：子 run 永远等待，父节点一直 Running
+        let (child_wf, _) = publish_workflow(&client, "等待中的子流程", human_def()).await;
+        let (parent_wf, _) = publish_workflow(&client, "父流程", sub_def(&child_wf)).await;
+
+        let run_id = start_run(&client, &parent_wf, json!({})).await;
+        let timeline = wait_node_running(&client, &run_id, "sub", SHORT).await;
+        let child_run_id = timeline_node(&timeline, "sub")["child_run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // 子 run 已创建并进入运行（human_task 等待中）。父节点 node_started 时
+        // child_run_id 已确定，但子 run 行此刻可能还没落库（initializing 窗口）——
+        // 轮询时把「不存在」当未就绪，直到状态离开 initializing
+        let deadline = std::time::Instant::now() + SHORT;
+        loop {
+            // run.get 对尚未落库的子 run 报 -32011：当「未就绪」处理
+            let child = jsonrpsee::core::client::ClientT::request::<Value, _>(
+                &client,
+                "run.get",
+                named(json!({"run_id": child_run_id})),
+            )
+            .await;
+            if let Ok(child) = child {
+                let status = child["run"]["status"].as_str().unwrap_or_default();
+                if status == "running" || status == "awaiting_resume" {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "子 run {child_run_id} 未进入运行"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // 取消父 run：先级联取消子 run（best-effort），再写 RunCancelled（§6.8）
+        let ack: Value = call_json(&client, "run.cancel", json!({"run_id": run_id})).await;
+        assert_eq!(ack["delivered"], json!(true), "{ack}");
+        let parent = wait_run_status(&client, &run_id, "cancelled", TIMEOUT).await;
+        assert_eq!(parent["run"]["status"], json!("cancelled"));
+
+        // 级联是 best-effort：给子 run 一点时间到达终态
+        let deadline = std::time::Instant::now() + SHORT;
+        loop {
+            let child = call_json(&client, "run.get", json!({"run_id": child_run_id})).await;
+            if child["run"]["status"].as_str() == Some("cancelled") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "子 run 未被级联取消：{child}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+));
+
+/// 嵌套深度上限：10 层链（根 depth=0 … 最内层 run depth=9），第 8 层的
+/// sub_workflow 节点触发上限直接 fatal（§6.8 MAX_SUB_WORKFLOW_DEPTH=8）。
+///
+/// 不用 e2e_test!：链上同时存在 DEPTH 个活跃 run，executor 容量（默认 8）
+/// 小于链长会相互等待成环——本用例显式放大 FLOW_MAX_RUNS，测的是深度上限
+/// 本身而不是容量死锁。
+#[tokio::test]
+async fn nested_depth_limit_is_fatal() {
+    const DEPTH: usize = 10;
+    let bin = env!("CARGO_BIN_EXE_flow-server");
+    for kind in [
+        backend_e2e::common::Kind::Sqlite,
+        backend_e2e::common::Kind::Postgres,
+    ] {
+        backend_e2e::common::run_case_with_env(kind, bin, &[("FLOW_MAX_RUNS", "32")], |ctx| {
+            Box::pin(depth_chain_body(ctx, DEPTH))
+        })
+        .await;
+    }
+}
+
+async fn depth_chain_body(ctx: &Ctx, depth: usize) {
+    let client = ctx.client().await;
+    let mut defs = deep_chain_defs(depth);
+    let mut ids = Vec::new();
+    for def in defs.iter_mut() {
+        let created: Value = call(&client, "workflow.create", json!({"name": "链"})).await;
+        let id = created["workflow_id"].as_str().unwrap().to_string();
+        call::<Value>(
+            &client,
+            "workflow.update",
+            json!({"workflow_id": id, "definition": def}),
+        )
+        .await;
+        call::<Value>(
+            &client,
+            "workflow.publish",
+            json!({"workflow_id": id, "version": 1}),
+        )
+        .await;
+        ids.push(id);
+    }
+    // 回填每层的子工作流指向（占位符换成真实 id 后再发一版）
+    for (level, def) in defs.iter_mut().enumerate() {
+        if level + 1 < depth {
+            set_sub_wf(def, &ids[level + 1]);
+            call::<Value>(
+                &client,
+                "workflow.update",
+                json!({"workflow_id": ids[level], "definition": def}),
+            )
+            .await;
+            call::<Value>(
+                &client,
+                "workflow.publish",
+                json!({"workflow_id": ids[level], "version": 2}),
+            )
+            .await;
+        }
+    }
+
+    let run_id = start_run(&client, &ids[0], json!({})).await;
+    let run = wait_run_terminal(&client, &run_id, TIMEOUT).await;
+    assert_eq!(run["run"]["status"], json!("failed"), "{run}");
+    assert!(
+        run["run"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("嵌套超过 8 层"),
+        "depth>=8 必须直接 fatal：{run}"
+    );
+}
+
+/// 轮询直到节点进入 running。
+async fn wait_node_running(
+    client: &backend_e2e::common::Client,
+    run_id: &str,
+    node_id: &str,
+    timeout: std::time::Duration,
+) -> Value {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let timeline: Value = call_json(client, "run.timeline", json!({"run_id": run_id})).await;
+        if timeline_node(&timeline, node_id)["state"] == json!("running") {
+            return timeline;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "等待节点 {node_id} 到 running 超时：{timeline}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}

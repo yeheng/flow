@@ -13,7 +13,8 @@ use std::sync::Arc;
 
 use chrono::Local;
 use flow_backend::{
-    AnyBackend, BackendError, Definition, NodeState, RunState, SignalAck, HTTP_METHODS,
+    open_from_env, AnyBackend, BackendError, Definition, NodeState, RunState, SignalAck,
+    HTTP_METHODS,
 };
 use futures::StreamExt;
 use jsonrpsee::core::RegisterMethodError;
@@ -58,6 +59,78 @@ pub async fn serve(
     let local_addr = server.local_addr()?;
     let handle = server.start(module);
     Ok((handle, local_addr))
+}
+
+/// 进程入口三件套：从环境变量装配后端 → JSON-RPC WebSocket → cron 调度器 →
+/// webhook HTTP，运行到中断信号为止。
+///
+/// `flow-server` 二进制、backend-e2e 的被测进程、backend-perf 的自举服务模式
+/// 共用这一份实现，保证「被测的就是生产进程」。tracing 在这里初始化（进程入口
+/// 只有一个调用点，不会重复 init）。
+pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "info,flow_engine=debug,flow_rpc=debug,flow_backend=debug".into()
+            }),
+        )
+        .init();
+
+    let addr: SocketAddr = std::env::var("FLOW_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:9800".into())
+        .parse()?;
+
+    // 后端选择只发生在这里一次：FLOW_BACKEND=sqlite（缺省，canonical：
+    // SQLite + event.jsonl）| postgres（可替代：共享日志 + 租约 + inbox）。
+    // 之后整条 RPC 链路只看 AnyBackend 枚举。
+    let backend = open_from_env().await?;
+    backend.start().await?;
+
+    let state = Arc::new(AppState {
+        backend: backend.clone(),
+    });
+    let (handle, local_addr) = serve(state.clone(), addr).await?;
+    tracing::info!(
+        %local_addr,
+        backend = backend.name(),
+        detail = backend.describe(),
+        "flow-server 已启动 (JSON-RPC 2.0 over WebSocket)"
+    );
+
+    // cron 调度器：默认开启，FLOW_SCHEDULER=off 禁用
+    let scheduler_task = if std::env::var("FLOW_SCHEDULER").as_deref() == Ok("off") {
+        tracing::info!("FLOW_SCHEDULER=off，cron 调度器未启动");
+        None
+    } else {
+        let backend = backend.clone();
+        Some(tokio::spawn(async move { scheduler::run(backend).await }))
+    };
+
+    // webhook HTTP 入口：FLOW_HTTP_ADDR，默认 127.0.0.1:9801
+    let http_addr: SocketAddr = std::env::var("FLOW_HTTP_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:9801".into())
+        .parse()?;
+    let http_listener = tokio::net::TcpListener::bind(http_addr).await?;
+    tracing::info!(%http_addr, "webhook HTTP 监听已启动 (POST /hook/:token)");
+    let http_task = tokio::spawn(async move {
+        if let Err(err) = axum::serve(http_listener, webhook::router(state)).await {
+            tracing::error!(error = %err, "webhook HTTP 服务退出");
+        }
+    });
+
+    tokio::signal::ctrl_c().await?;
+    tracing::info!("收到中断信号，正在停止");
+    if let Some(task) = scheduler_task {
+        task.abort();
+    }
+    http_task.abort();
+    // 停机错误只能记日志：进程即将退出，没有重试的意义
+    if let Err(err) = backend.shutdown().await {
+        tracing::error!(error = %err, "后端停机失败");
+    }
+    handle.stop()?;
+    handle.stopped().await;
+    Ok(())
 }
 
 pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, RpcError> {
@@ -221,6 +294,8 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
                 workflow_id: p.workflow_id,
                 version: p.version,
                 input: p.input.unwrap_or(Value::Null),
+                source: flow_backend::DbRunSource::Manual.as_str().to_string(),
+                source_detail: None,
             })
             .await
             .map_err(backend_err)?;
@@ -254,6 +329,9 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
             workflow_id: Option<String>,
             #[serde(default)]
             status: Option<String>,
+            /// 触发来源过滤（manual / schedule / webhook / sub_workflow）
+            #[serde(default)]
+            source: Option<String>,
             /// 游标分页：返回该 run 之前更旧的记录
             #[serde(default)]
             before_run_id: Option<String>,
@@ -261,10 +339,15 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
             limit: Option<i64>,
         }
         let p: P = parse(&params)?;
-        // 客户端给的 status 过滤词必须在 run 状态词汇表内（-32010）
+        // 客户端给的 status/source 过滤词必须在对应词汇表内（-32010）
         if let Some(status) = &p.status {
             if !flow_backend::DbRunStatus::is_valid_str(status) {
                 return Err(invalid(format!("非法的 run 状态：{status}")));
+            }
+        }
+        if let Some(source) = &p.source {
+            if !flow_backend::DbRunSource::is_valid_str(source) {
+                return Err(invalid(format!("非法的 run 来源：{source}")));
             }
         }
         let runs = state
@@ -272,12 +355,29 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
             .list_runs(
                 p.workflow_id.as_deref(),
                 p.status.as_deref(),
+                p.source.as_deref(),
                 p.before_run_id.as_deref(),
                 p.limit.unwrap_or(50).clamp(1, 500),
             )
             .await
             .map_err(backend_err)?;
         Ok::<_, ErrorObjectOwned>(json!({ "runs": runs }))
+    })?;
+
+    // 精确统计（GROUP BY）：仪表盘全局与单工作流共用
+    module.register_async_method("run.stats", |params, state, _| async move {
+        #[derive(Deserialize)]
+        struct P {
+            #[serde(default)]
+            workflow_id: Option<String>,
+        }
+        let p: P = parse(&params)?;
+        let stats = state
+            .backend
+            .run_stats(p.workflow_id.as_deref())
+            .await
+            .map_err(backend_err)?;
+        Ok::<_, ErrorObjectOwned>(json!(stats))
     })?;
 
     // 只读时间线：定义顺序 + 折叠后的节点状态，前端直接画列表

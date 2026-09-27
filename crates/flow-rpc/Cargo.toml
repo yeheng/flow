@@ -23,6 +23,7 @@ flow-backend = { path = "../flow-backend" }
 
 [dev-dependencies]
 uuid = { workspace = true }
+reqwest = { workspace = true }
 chrono = { workspace = true }
 sqlx = { workspace = true, features = ["postgres", "json"] }
 flow-engine = { path = "../flow-engine" }

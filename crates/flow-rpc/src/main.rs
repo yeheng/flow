@@ -1,72 +1,10 @@
-use std::net::SocketAddr;
-use std::sync::Arc;
-
-use flow_backend::open_from_env;
-use flow_rpc::{scheduler, serve, webhook, AppState};
+//! flow-server：JSON-RPC WebSocket 服务进程（薄壳）。
+//!
+//! 入口三件套（serve / cron 调度器 / webhook HTTP）实现在
+//! [`flow_rpc::run_from_env`]，与 backend-e2e 的被测进程、backend-perf 的
+//! 自举服务模式共用同一份代码——生产进程与被测进程逐字一致。
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                "info,flow_engine=debug,flow_rpc=debug,flow_backend=debug".into()
-            }),
-        )
-        .init();
-
-    let addr: SocketAddr = std::env::var("FLOW_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:9800".into())
-        .parse()?;
-
-    // 后端选择只发生在这里一次：FLOW_BACKEND=sqlite（缺省，canonical：
-    // SQLite + event.jsonl）| postgres（可替代：共享日志 + 租约 + inbox）。
-    // 之后整条 RPC 链路只看 AnyBackend 枚举。
-    let backend = open_from_env().await?;
-    backend.start().await?;
-
-    let state = Arc::new(AppState {
-        backend: backend.clone(),
-    });
-    let (handle, local_addr) = serve(state.clone(), addr).await?;
-    tracing::info!(
-        %local_addr,
-        backend = backend.name(),
-        detail = backend.describe(),
-        "flow-server 已启动 (JSON-RPC 2.0 over WebSocket)"
-    );
-
-    // cron 调度器：默认开启，FLOW_SCHEDULER=off 禁用
-    let scheduler_task = if std::env::var("FLOW_SCHEDULER").as_deref() == Ok("off") {
-        tracing::info!("FLOW_SCHEDULER=off，cron 调度器未启动");
-        None
-    } else {
-        let backend = backend.clone();
-        Some(tokio::spawn(async move { scheduler::run(backend).await }))
-    };
-
-    // webhook HTTP 入口：FLOW_HTTP_ADDR，默认 127.0.0.1:9801
-    let http_addr: SocketAddr = std::env::var("FLOW_HTTP_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:9801".into())
-        .parse()?;
-    let http_listener = tokio::net::TcpListener::bind(http_addr).await?;
-    tracing::info!(%http_addr, "webhook HTTP 监听已启动 (POST /hook/:token)");
-    let http_task = tokio::spawn(async move {
-        if let Err(err) = axum::serve(http_listener, webhook::router(state)).await {
-            tracing::error!(error = %err, "webhook HTTP 服务退出");
-        }
-    });
-
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("收到中断信号，正在停止");
-    if let Some(task) = scheduler_task {
-        task.abort();
-    }
-    http_task.abort();
-    // 停机错误只能记日志：进程即将退出，没有重试的意义
-    if let Err(err) = backend.shutdown().await {
-        tracing::error!(error = %err, "后端停机失败");
-    }
-    handle.stop()?;
-    handle.stopped().await;
-    Ok(())
+    flow_rpc::run_from_env().await
 }

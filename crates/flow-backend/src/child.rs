@@ -83,6 +83,8 @@ impl ChildRunLauncher for LocalChildLauncher {
                         version,
                         &input,
                         DbRunStatus::Initializing.as_str(),
+                        flow_dto::DbRunSource::SubWorkflow.as_str(),
+                        None,
                     )
                     .await
                     .map_err(|e| EngineError::Backend(e.to_string()))?;

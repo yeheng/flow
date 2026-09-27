@@ -191,6 +191,8 @@ pub async fn start_run(
             workflow_id: workflow_id.to_string(),
             version,
             input,
+            source: "manual".into(),
+            source_detail: None,
         })
         .await
         .unwrap();

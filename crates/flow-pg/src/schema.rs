@@ -47,6 +47,8 @@ pub async fn init(pool: &PgPool) -> Result<(), sqlx::Error> {
             error TEXT,
             started_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
             ended_at TIMESTAMPTZ,
+            source TEXT NOT NULL DEFAULT 'manual',
+            source_detail TEXT,
             lease_owner TEXT,
             lease_epoch BIGINT NOT NULL DEFAULT 0,
             lease_expires_at TIMESTAMPTZ,
@@ -58,6 +60,15 @@ pub async fn init(pool: &PgPool) -> Result<(), sqlx::Error> {
     )
     .execute(pool)
     .await?;
+
+    // 存量库迁移：runs 加触发来源列（ADD COLUMN IF NOT EXISTS，幂等）。
+    // 旧行由 DEFAULT 'manual' 归因——迁移前没有自动触发入口，语义正确。
+    sqlx::query("ALTER TABLE runs ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'manual'")
+        .execute(pool)
+        .await?;
+    sqlx::query("ALTER TABLE runs ADD COLUMN IF NOT EXISTS source_detail TEXT")
+        .execute(pool)
+        .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS run_events (

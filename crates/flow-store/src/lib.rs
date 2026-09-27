@@ -12,8 +12,8 @@ use chrono::{DateTime, Utc};
 // 领域 DTO 与状态词汇表的单一来源在 flow-dto；本 crate 不再维护第二份拷贝。
 // 写入口经 ensure_run_status 用 DbRunStatus 校验，不复制常量列表。
 pub use flow_dto::{
-    DbRunStatus, RunRecord, Schedule, Webhook, WorkflowSummary, WorkflowVersion, STATUS_DRAFT,
-    STATUS_PUBLISHED,
+    DbRunSource, DbRunStatus, RunRecord, RunStats, Schedule, Webhook, WorkflowRunStats,
+    WorkflowSummary, WorkflowVersion, STATUS_DRAFT, STATUS_PUBLISHED,
 };
 
 fn ensure_run_status(status: &str) -> Result<(), StoreError> {
@@ -21,6 +21,14 @@ fn ensure_run_status(status: &str) -> Result<(), StoreError> {
         Ok(())
     } else {
         Err(StoreError::InvalidStatus(status.to_string()))
+    }
+}
+
+fn ensure_run_source(source: &str) -> Result<(), StoreError> {
+    if DbRunSource::is_valid_str(source) {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidSource(source.to_string()))
     }
 }
 
@@ -46,6 +54,8 @@ pub enum StoreError {
     Conflict(String),
     #[error("非法的 run 状态：{0}")]
     InvalidStatus(String),
+    #[error("非法的 run 来源：{0}")]
+    InvalidSource(String),
     #[error("时间戳无法解析：{0}")]
     InvalidTimestamp(String),
     #[error("json 错误：{0}")]
@@ -112,6 +122,8 @@ impl Store {
                 input TEXT NOT NULL,
                 output TEXT,
                 error TEXT,
+                source TEXT NOT NULL DEFAULT 'manual',
+                source_detail TEXT,
                 started_at TEXT NOT NULL,
                 ended_at TEXT
             )",
@@ -128,6 +140,21 @@ impl Store {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status)")
             .execute(&self.pool)
             .await?;
+
+        // 存量库迁移：runs 加触发来源列（PRAGMA 判存在性，幂等）。
+        // 旧行由 DEFAULT 'manual' 归因——迁移前没有自动触发入口，语义正确。
+        let has_source: bool = sqlx::query("SELECT 1 FROM pragma_table_info('runs') WHERE name = 'source'")
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some();
+        if !has_source {
+            sqlx::query("ALTER TABLE runs ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
+                .execute(&self.pool)
+                .await?;
+            sqlx::query("ALTER TABLE runs ADD COLUMN source_detail TEXT")
+                .execute(&self.pool)
+                .await?;
+        }
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS schedules (
@@ -466,7 +493,16 @@ impl Store {
             qb.push("enabled = ").push_bind(enabled);
         }
         if first {
-            return Ok(()); // 没有要更新的字段
+            // 没有要更新的字段：无操作可以，但必须确认 schedule 存在——
+            // 静默返回成功等于把「更新了一个不存在的 id」伪装成已更新
+            let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM schedules WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+            if exists.is_none() {
+                return Err(StoreError::ScheduleNotFound(id.to_string()));
+            }
+            return Ok(());
         }
         let affected = qb
             .push(" WHERE id = ")
@@ -626,6 +662,7 @@ impl Store {
     /// 创建 run 行。BEGIN IMMEDIATE 写锁内先验证版本仍存在：与
     /// delete_workflow 的事务互斥，杜绝「版本已删、run 行照样插入」的竞态
     ///（runs 表无外键，数据库不会替我们拦）。
+    /// source/source_detail 是触发来源归因（DbRunSource 词汇表）。
     pub async fn insert_run(
         &self,
         run_id: &str,
@@ -633,8 +670,11 @@ impl Store {
         workflow_version: i64,
         input: &Value,
         status: &str,
+        source: &str,
+        source_detail: Option<&str>,
     ) -> Result<(), StoreError> {
         ensure_run_status(status)?;
+        ensure_run_source(source)?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let version_exists =
             sqlx::query("SELECT 1 FROM workflow_versions WHERE workflow_id = ? AND version = ?")
@@ -649,14 +689,16 @@ impl Store {
             ));
         }
         sqlx::query(
-            "INSERT INTO runs (id, workflow_id, workflow_version, status, input, started_at)
-             VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO runs (id, workflow_id, workflow_version, status, input, source, source_detail, started_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(run_id)
         .bind(workflow_id)
         .bind(workflow_version)
         .bind(status)
         .bind(serde_json::to_string(input)?)
+        .bind(source)
+        .bind(source_detail)
         .bind(Utc::now().to_rfc3339())
         .execute(&mut *tx)
         .await?;
@@ -698,7 +740,7 @@ impl Store {
     }
 
     pub async fn get_run(&self, run_id: &str) -> Result<RunRecord, StoreError> {
-        let row = sqlx::query("SELECT id, workflow_id, workflow_version, status, input, output, error, started_at, ended_at FROM runs WHERE id = ?")
+        let row = sqlx::query("SELECT id, workflow_id, workflow_version, status, input, output, error, source, source_detail, started_at, ended_at FROM runs WHERE id = ?")
             .bind(run_id)
             .fetch_optional(&self.pool)
             .await?
@@ -710,20 +752,24 @@ impl Store {
         &self,
         workflow_id: Option<&str>,
         status: Option<&str>,
+        source: Option<&str>,
         before_run_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<RunRecord>, StoreError> {
-        // status 词汇表校验在 RPC 边缘（-32010）；这里作为读过滤，未知值自然查空。
+        // status/source 词汇表校验在 RPC 边缘（-32010）；这里作为读过滤，未知值自然查空。
         // before_run_id 游标：返回该 run 之前更旧的记录（started_at 严格更小）；
         // 游标 run 已被删时子查询为 NULL，整页为空——翻页到此为止，语义可接受
         let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
-            "SELECT id, workflow_id, workflow_version, status, input, output, error, started_at, ended_at FROM runs WHERE 1=1",
+            "SELECT id, workflow_id, workflow_version, status, input, output, error, source, source_detail, started_at, ended_at FROM runs WHERE 1=1",
         );
         if let Some(id) = workflow_id {
             qb.push(" AND workflow_id = ").push_bind(id);
         }
         if let Some(status) = status {
             qb.push(" AND status = ").push_bind(status);
+        }
+        if let Some(source) = source {
+            qb.push(" AND source = ").push_bind(source);
         }
         if let Some(before) = before_run_id {
             qb.push(" AND started_at < (SELECT started_at FROM runs WHERE id = ")
@@ -735,10 +781,61 @@ impl Store {
         rows.into_iter().map(Self::run_from_row).collect()
     }
 
+    /// run.stats：GROUP BY 精确计数。workflow_id 为 None 时附带按工作流分组。
+    pub async fn run_stats(&self, workflow_id: Option<&str>) -> Result<RunStats, StoreError> {
+        let by_status = match workflow_id {
+            Some(id) => {
+                sqlx::query("SELECT status, COUNT(*) AS c FROM runs WHERE workflow_id = ? GROUP BY status")
+                    .bind(id)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+            None => {
+                sqlx::query("SELECT status, COUNT(*) AS c FROM runs GROUP BY status")
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+        };
+        let mut stats = RunStats {
+            total: 0,
+            by_status: std::collections::BTreeMap::new(),
+            by_workflow: Vec::new(),
+        };
+        for row in &by_status {
+            let status: String = row.try_get("status")?;
+            let count: i64 = row.try_get("c")?;
+            stats.total += count;
+            stats.by_status.insert(status, count);
+        }
+        if workflow_id.is_none() {
+            let rows = sqlx::query(
+                "SELECT workflow_id, status, COUNT(*) AS c FROM runs GROUP BY workflow_id, status",
+            )
+            .fetch_all(&self.pool)
+            .await?;
+            let mut grouped: std::collections::BTreeMap<String, WorkflowRunStats> =
+                std::collections::BTreeMap::new();
+            for row in rows {
+                let wf: String = row.try_get("workflow_id")?;
+                let status: String = row.try_get("status")?;
+                let count: i64 = row.try_get("c")?;
+                let entry = grouped.entry(wf.clone()).or_insert(WorkflowRunStats {
+                    workflow_id: wf,
+                    total: 0,
+                    by_status: std::collections::BTreeMap::new(),
+                });
+                entry.total += count;
+                entry.by_status.insert(status, count);
+            }
+            stats.by_workflow = grouped.into_values().collect();
+        }
+        Ok(stats)
+    }
+
     /// 崩溃恢复的输入：进程重启后需要续跑的 run。
     pub async fn unfinished_runs(&self) -> Result<Vec<RunRecord>, StoreError> {
         let rows =
-            sqlx::query("SELECT id, workflow_id, workflow_version, status, input, output, error, started_at, ended_at FROM runs WHERE status IN (?, ?, ?) ORDER BY started_at ASC")
+            sqlx::query("SELECT id, workflow_id, workflow_version, status, input, output, error, source, source_detail, started_at, ended_at FROM runs WHERE status IN (?, ?, ?) ORDER BY started_at ASC")
                 .bind(DbRunStatus::Initializing.as_str())
                 .bind(DbRunStatus::Running.as_str())
                 .bind(DbRunStatus::AwaitingResume.as_str())
@@ -759,6 +856,8 @@ impl Store {
             input: serde_json::from_str(&input)?,
             output: output.map(|o| serde_json::from_str(&o)).transpose()?,
             error: row.try_get("error")?,
+            source: row.try_get("source")?,
+            source_detail: row.try_get("source_detail")?,
             started_at: parse_ts(&row.try_get::<String, _>("started_at")?)?,
             ended_at: ended_at.map(|ts| parse_ts(&ts)).transpose()?,
         })

@@ -353,7 +353,12 @@ SQLite（WAL）。表：
   `INSERT ... RETURNING version` 返回本次写入的版本，禁止写后另查 latest。
   相同定义的并发保存也复用版本号。
   `status`: draft → published；
-- `runs`：run 元数据（id, workflow_id, workflow_version, status, input, output, error, started_at, ended_at）。
+- `runs`：run 元数据（id, workflow_id, workflow_version, status, input, output, error,
+  started_at, ended_at）+ 触发来源归因（`source`：manual/schedule/webhook/sub_workflow，
+  词汇表单一来源是 flow-dto 的 `DbRunSource`，写入口校验同 DbRunStatus；
+  `source_detail`：schedule id / webhook token，可空）。存量库由幂等迁移加列
+  （SQLite PRAGMA 判存在性 / Postgres ADD COLUMN IF NOT EXISTS），旧行 DEFAULT
+  'manual'——迁移前没有自动触发入口，归因语义正确；
 - `schedules`：cron 定时调度（id, workflow_id, cron_expr, input, enabled, created_at）。
   cron 合法性校验在 RPC 边缘（-32010），存储层只持久化；
 - `schedule_fires`：触发去重表，`(schedule_id, fire_at)` 主键——插入成功即赢得本次
@@ -405,7 +410,8 @@ jsonrpsee WebSocket。本层只有**一份**方法实现，只依赖 `flow_backe
 | `workflow.versions` | 版本历史（按 version 倒序，只回 version/status/checksum/created_at 元数据列，definition 走 workflow.get 按需拉取）；workflow 不存在返回 -32011 |
 | `nodetypes.list` | 前端画布能力清单：类型、端口、`params_schema`（JSON Schema draft-07 子集 type/required/properties/enum/default，另带 `x-widget`/`x-label`/`x-help` 扩展键，前端据此渲染参数表单；后端校验仍以 `Definition::validate` 为准）、supports_retry、side_effect |
 | `run.start` | 经 Backend：SQLite 校验 published → insert initializing → 持久化 run_started → 启动 Driver，初始化错误回写 failed；Postgres 单事务原子创建（§9 差异说明） |
-| `run.get / run.list` | 元数据 + live 标记 |
+| `run.get / run.list` | 元数据 + live 标记；list 支持 status 过滤与 source（触发来源）过滤，词汇表外 -32010 |
+| `run.stats` | 精确统计（GROUP BY，非采样）：`{workflow_id?}` → `{total, by_status}`，不带过滤时附带 `by_workflow: [{workflow_id, total, by_status}]` |
 | `run.timeline` | 只读时间线：定义顺序 + 折叠后的节点状态 |
 | `run.events` | 原始事件，`from_seq` 增量拉取 |
 | `run.cancel` | 统一 SignalAck：活着的 run 交付取消（SQLite 仅本进程生效）；否则 conflict |
@@ -435,6 +441,10 @@ run_started 未落盘」的初始化中断窗口，恢复已按 DB 投影标终�
   （不区分，避免探测）；body 须为 JSON（空 body 视为 null 输入），作为 input
   启动当前 published 版本 → 200 `{"run_id": "..."}`；无 published 版本 → 409。
   webhook 与 RPC 共用同一个安全边界：无认证，只允许绑定可信地址（见文首警告）。
+
+四个触发入口都在 runs 表写入归因：`run.start` = manual、调度器 = schedule
+（detail 为 schedule id）、webhook = webhook（detail 为 token）、sub_workflow
+子 run = sub_workflow（两臂的 launcher 直插路径各自标注，不经 run.start）。
 
 错误码：`-32010` 参数非法、`-32011` 不存在、`-32012` 冲突、`-32603` 内部错误。
 JSON-RPC 允许整体省略 params（到达 null），解析层统一归一为 `{}`。
@@ -548,7 +558,8 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
   `replayed_child_run_keeps_pinned_version`，两臂同一条契约）、信号错误码与订阅
   回放契约（contracts）、空日志订阅立即结束（run_tail）、PG reader 回放起点报
   RunNotFound（flow-pg protocol）、身份不符隔离且不重扫——以 lease_epoch
-  停止攀升断言（flow-pg recovery）、删除后 insert_run 拒绝孤儿 run（flow-store）；
+  停止攀升断言（flow-pg recovery）、删除后 insert_run 拒绝孤儿 run（flow-store）、
+  run_started 进全局广播两臂一致（flow-engine global_subscribe）；
 - store 并发测试核对每个返回版本对应的定义及相同定义的版本复用；
 - 测试数据库必须放在独占目录的 `flow.db`，只清理独占目录，禁止删除系统临时目录；
 - **Postgres 后端**：租约 fencing、接管窗口、恢复分类与 inbox 幂等由
@@ -556,7 +567,21 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
   `flow-rpc/tests/ws_pg.rs` 覆盖。每个测试在独立数据库中运行
   （名称含时间戳，启动时清理残留）；测试库通过 `FLOW_TEST_DATABASE_URL`
   指定（默认 `postgres://flow:flow@127.0.0.1:54329/flow`），不可达时自动跳过，
-  没有可用 Postgres 时 `cargo test` 仍必须全绿。
+  没有可用 Postgres 时 `cargo test` 仍必须全绿；
+- **backend-e2e（`crates/backend-e2e`）**：后端契约的完整端到端矩阵。每个用例
+  对 SQLite（独占临时目录 `flow.db`）与 Postgres 两个后端各跑一遍，钉死
+  「两臂同契约」；真起 `flow-server` 进程（`CARGO_BIN_EXE_flow-server`，含
+  SIGKILL 崩溃恢复与重启），HTTP stub 全部本地 TcpListener（确定性，不依赖
+  外部网络）。Postgres 由本 crate 用 docker CLI 自管容器
+  （`postgres:16-alpine`，随机端口，label `com.flow.e2e=1`）：进程退出
+  （atexit）与下次启动（按 label 清扫容器、按 `e2e_%` 前缀清扫测试库）双层
+  清理，每个用例独占一个数据库、用完即 DROP，panic 路径也先清理再 unwind。
+  需要 docker；`FLOW_E2E_PG_IMAGE` 可换镜像。覆盖：workflow 生命周期与
+  「只有 published 可执行」、run 执行（script/condition/delay/输出收集/skip
+  传播/重试/JS 沙箱/大整数舍入）、human_task 信号与取消、http_call 分类与
+  模板、sub_workflow（透传/失败传导/取消级联/深度上限）、schedule 真触发与
+  webhook HTTP 全分支、订阅（回放/增量/未知 run 即结束）、SIGKILL 恢复与
+  人工裁决、错误码映射。入口：`cargo test -p backend-e2e`。
 
 ## 14. 未做
 

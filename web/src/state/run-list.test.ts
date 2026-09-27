@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mergeRunPage, nextCursor } from "./run-list";
+import { mergeRunPage, nextCursor, sourceLabel } from "./run-list";
 import type { RunRecord } from "../types";
 
 function run(id: string): RunRecord {
@@ -11,6 +11,8 @@ function run(id: string): RunRecord {
     input: null,
     output: null,
     error: null,
+    source: "manual",
+    source_detail: null,
     started_at: "2026-01-01T00:00:00Z",
     ended_at: null,
   };
@@ -32,5 +34,15 @@ describe("游标分页合并", () => {
   it("nextCursor 取最末一条；空列表返回 null", () => {
     expect(nextCursor([run("a"), run("b")])).toBe("b");
     expect(nextCursor([])).toBeNull();
+  });
+});
+
+describe("run.source 中文映射", () => {
+  it("词汇表内映射为中文；未知值原样显示", () => {
+    expect(sourceLabel("manual")).toBe("手动");
+    expect(sourceLabel("schedule")).toBe("定时调度");
+    expect(sourceLabel("webhook")).toBe("Webhook");
+    expect(sourceLabel("sub_workflow")).toBe("子流程");
+    expect(sourceLabel("something_new")).toBe("something_new");
   });
 });

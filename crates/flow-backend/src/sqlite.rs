@@ -25,7 +25,7 @@ use flow_store::{Store, StoreError};
 
 use crate::child::LocalChildLauncher;
 use crate::{
-    resolve_runnable_definition, BackendError, CreateRun, CreatedRun, RunRecord, Schedule,
+    resolve_runnable_definition, BackendError, CreateRun, CreatedRun, RunRecord, RunStats, Schedule,
     SignalAck, SignalRequest, Webhook, WorkflowSummary, WorkflowVersion,
 };
 
@@ -313,6 +313,8 @@ impl SqliteBackend {
                 version,
                 &spec.input,
                 DbRunStatus::Initializing.as_str(),
+                &spec.source,
+                spec.source_detail.as_deref(),
             )
             .await
             .map_err(sqlite_err)?;
@@ -357,13 +359,18 @@ impl SqliteBackend {
         &self,
         workflow_id: Option<&str>,
         status: Option<&str>,
+        source: Option<&str>,
         before_run_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<RunRecord>, BackendError> {
         self.store
-            .list_runs(workflow_id, status, before_run_id, limit)
+            .list_runs(workflow_id, status, source, before_run_id, limit)
             .await
             .map_err(sqlite_err)
+    }
+
+    pub async fn run_stats(&self, workflow_id: Option<&str>) -> Result<RunStats, BackendError> {
+        self.store.run_stats(workflow_id).await.map_err(sqlite_err)
     }
 
     pub async fn read_events(
@@ -503,6 +510,7 @@ fn sqlite_err(err: StoreError) -> BackendError {
         StoreError::WebhookNotFound(token) => BackendError::WebhookNotFound(token),
         StoreError::Conflict(msg) => BackendError::Conflict(msg),
         StoreError::InvalidStatus(s) => BackendError::Internal(format!("非法的 run 状态：{s}")),
+        StoreError::InvalidSource(s) => BackendError::Internal(format!("非法的 run 来源：{s}")),
         other => BackendError::internal(other),
     }
 }
@@ -646,7 +654,7 @@ mod tests {
         for (i, status) in statuses.iter().enumerate() {
             let run_id = format!("r-{i}");
             store
-                .insert_run(&run_id, &wf, 1, &Value::Null, status.as_str())
+                .insert_run(&run_id, &wf, 1, &Value::Null, status.as_str(), "manual", None)
                 .await
                 .unwrap();
             store
@@ -660,7 +668,7 @@ mod tests {
 
         // 词汇表外的状态在写入时当场报错
         let err = store
-            .insert_run("r-unknown", &wf, 1, &Value::Null, "paused")
+            .insert_run("r-unknown", &wf, 1, &Value::Null, "paused", "manual", None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("paused"), "{err}");

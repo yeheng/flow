@@ -94,6 +94,8 @@ impl ChildRunLauncher for PgChildLauncher {
                 version,
                 &input,
                 depth,
+                flow_dto::DbRunSource::SubWorkflow.as_str(),
+                None,
             )
             .await
             {

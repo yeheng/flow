@@ -12,8 +12,8 @@ use uuid::Uuid;
 
 use crate::error::PgError;
 pub use flow_dto::{
-    RunRecord, Schedule, Webhook, WorkflowSummary, WorkflowVersion, STATUS_ACTIVE, STATUS_DRAFT,
-    STATUS_PUBLISHED,
+    RunRecord, RunStats, Schedule, Webhook, WorkflowRunStats, WorkflowSummary, WorkflowVersion,
+    STATUS_ACTIVE, STATUS_DRAFT, STATUS_PUBLISHED,
 };
 
 /// 定义与 run 元数据的存储。执行事件在 run_events，租约在 runs 行内。
@@ -316,7 +316,16 @@ impl PgStore {
             qb.push("enabled = ").push_bind(enabled);
         }
         if first {
-            return Ok(()); // 没有要更新的字段
+            // 没有要更新的字段：无操作可以，但必须确认 schedule 存在——
+            // 静默返回成功等于把「更新了一个不存在的 id」伪装成已更新
+            let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM schedules WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+            if exists.is_none() {
+                return Err(PgError::ScheduleNotFound(id.to_string()));
+            }
+            return Ok(());
         }
         let affected = qb
             .push(" WHERE id = ")
@@ -447,7 +456,7 @@ impl PgStore {
     pub async fn get_run(&self, run_id: &str) -> Result<RunRecord, PgError> {
         let rec = sqlx::query(
             "SELECT id, workflow_id, workflow_version, status, input, output, error,
-                    started_at, ended_at
+                    source, source_detail, started_at, ended_at
              FROM runs WHERE id = $1",
         )
         .bind(run_id)
@@ -461,14 +470,15 @@ impl PgStore {
         &self,
         workflow_id: Option<&str>,
         status: Option<&str>,
+        source: Option<&str>,
         before_run_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<RunRecord>, PgError> {
-        // 与 sqlite 臂同契约：status 过滤 + before_run_id 游标（更旧的记录）。
-        // status 词汇表校验在 RPC 边缘（-32010）；这里作为读过滤，未知值自然查空
+        // 与 sqlite 臂同契约：status/source 过滤 + before_run_id 游标（更旧的记录）。
+        // status/source 词汇表校验在 RPC 边缘（-32010）；这里作为读过滤，未知值自然查空
         let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
             "SELECT id, workflow_id, workflow_version, status, input, output, error,
-                    started_at, ended_at
+                    source, source_detail, started_at, ended_at
              FROM runs WHERE TRUE",
         );
         if let Some(id) = workflow_id {
@@ -476,6 +486,9 @@ impl PgStore {
         }
         if let Some(status) = status {
             qb.push(" AND status = ").push_bind(status);
+        }
+        if let Some(source) = source {
+            qb.push(" AND source = ").push_bind(source);
         }
         if let Some(before) = before_run_id {
             qb.push(" AND started_at < (SELECT started_at FROM runs WHERE id = ")
@@ -489,6 +502,52 @@ impl PgStore {
             runs.push(run_from_row(row)?);
         }
         Ok(runs)
+    }
+
+    /// run.stats：GROUP BY 精确计数。workflow_id 为 None 时附带按工作流分组。
+    pub async fn run_stats(&self, workflow_id: Option<&str>) -> Result<RunStats, PgError> {
+        let rows: Vec<(String, i64)> = match workflow_id {
+            Some(id) => sqlx::query_as(
+                "SELECT status, COUNT(*) AS c FROM runs WHERE workflow_id = $1 GROUP BY status",
+            )
+            .bind(id)
+            .fetch_all(&self.pool)
+            .await?,
+            None => {
+                sqlx::query_as("SELECT status, COUNT(*) AS c FROM runs GROUP BY status")
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+        };
+        let mut stats = RunStats {
+            total: 0,
+            by_status: std::collections::BTreeMap::new(),
+            by_workflow: Vec::new(),
+        };
+        for (status, count) in rows {
+            stats.total += count;
+            stats.by_status.insert(status, count);
+        }
+        if workflow_id.is_none() {
+            let rows: Vec<(String, String, i64)> = sqlx::query_as(
+                "SELECT workflow_id, status, COUNT(*) AS c FROM runs GROUP BY workflow_id, status",
+            )
+            .fetch_all(&self.pool)
+            .await?;
+            let mut grouped: std::collections::BTreeMap<String, WorkflowRunStats> =
+                std::collections::BTreeMap::new();
+            for (wf, status, count) in rows {
+                let entry = grouped.entry(wf.clone()).or_insert(WorkflowRunStats {
+                    workflow_id: wf,
+                    total: 0,
+                    by_status: std::collections::BTreeMap::new(),
+                });
+                entry.total += count;
+                entry.by_status.insert(status, count);
+            }
+            stats.by_workflow = grouped.into_values().collect();
+        }
+        Ok(stats)
     }
 
     /// executor 扫描（§5.4）：running/awaiting_resume 且无租约或租约过期的 run。
@@ -584,6 +643,8 @@ fn run_from_row(rec: sqlx::postgres::PgRow) -> Result<RunRecord, PgError> {
         input: rec.try_get("input")?,
         output: rec.try_get("output")?,
         error: rec.try_get("error")?,
+        source: rec.try_get("source")?,
+        source_detail: rec.try_get("source_detail")?,
         started_at: rec.try_get("started_at")?,
         ended_at: rec.try_get("ended_at")?,
     })

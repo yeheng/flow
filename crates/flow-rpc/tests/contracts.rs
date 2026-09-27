@@ -91,7 +91,7 @@ async fn explicit_draft_is_rejected_and_historical_published_version_still_runs(
     assert!(f
         .backend
         .store()
-        .list_runs(None, None, None, 100)
+        .list_runs(None, None, None, None, 100)
         .await
         .unwrap()
         .is_empty());
@@ -125,7 +125,7 @@ async fn incomplete_initialization_is_failed_without_replaying_missing_logs() {
     for run in ["missing", "empty", "partial"] {
         f.backend
             .store()
-            .insert_run(run, &f.workflow, 1, &Value::Null, "initializing")
+            .insert_run(run, &f.workflow, 1, &Value::Null, "initializing", "manual", None)
             .await
             .unwrap();
         if run != "missing" {
@@ -158,7 +158,7 @@ async fn initialized_log_is_resumed_even_when_metadata_still_says_initializing()
     f.backend.store().publish(&f.workflow, 1).await.unwrap();
     f.backend
         .store()
-        .insert_run("r", &f.workflow, 1, &Value::Null, "initializing")
+        .insert_run("r", &f.workflow, 1, &Value::Null, "initializing", "manual", None)
         .await
         .unwrap();
     let mut log = EventLog::create(&f.root, "r").await.unwrap();
@@ -193,7 +193,7 @@ async fn missing_or_empty_logs_of_old_running_tasks_require_manual_recovery() {
     for run in ["missing", "empty"] {
         f.backend
             .store()
-            .insert_run(run, &f.workflow, 1, &Value::Null, "running")
+            .insert_run(run, &f.workflow, 1, &Value::Null, "running", "manual", None)
             .await
             .unwrap();
         if run == "empty" {
@@ -562,6 +562,113 @@ async fn webhook_crud() {
         .call("webhook.list", json!({"workflow_id": f.workflow}))
         .await;
     assert_eq!(list["result"]["webhooks"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn run_stats_counts_exactly_and_groups_by_workflow() {
+    let f = Fixture::new().await;
+    f.backend.store().publish(&f.workflow, 1).await.unwrap();
+
+    // 空库：total 0、by_status 空、by_workflow 空
+    let empty = f.call("run.stats", json!({})).await;
+    assert_eq!(empty["result"]["total"], 0, "{empty}");
+    assert_eq!(
+        empty["result"]["by_status"].as_object().unwrap().len(),
+        0
+    );
+    assert_eq!(
+        empty["result"]["by_workflow"].as_array().unwrap().len(),
+        0
+    );
+
+    // 造数据：f.workflow 两个 run（succeeded + running），另一个 workflow 一个 succeeded
+    let r1 = f.call("run.start", json!({"workflow_id": f.workflow})).await;
+    let run1 = r1["result"]["run_id"].as_str().unwrap().to_string();
+    f.wait_finished(&run1).await; // succeeded
+    f.backend
+        .store()
+        .insert_run("r-manual", &f.workflow, 1, &Value::Null, "running", "manual", None)
+        .await
+        .unwrap();
+    let wf2 = f.backend.store().create_workflow("other").await.unwrap();
+    f.backend
+        .store()
+        .update_workflow(&wf2, &definition(9))
+        .await
+        .unwrap();
+    f.backend.store().publish(&wf2, 1).await.unwrap();
+    let r2 = f.call("run.start", json!({"workflow_id": wf2})).await;
+    let run2 = r2["result"]["run_id"].as_str().unwrap().to_string();
+    f.wait_finished(&run2).await;
+
+    // 全局：total/by_status 精确，by_workflow 按 workflow 分组
+    let all = f.call("run.stats", json!({})).await;
+    let total = all["result"]["total"].as_i64().unwrap();
+    assert_eq!(total, 3, "{all}");
+    assert_eq!(all["result"]["by_status"]["succeeded"], 2);
+    assert_eq!(all["result"]["by_status"]["running"], 1);
+    let by_workflow = all["result"]["by_workflow"].as_array().unwrap();
+    assert_eq!(by_workflow.len(), 2, "{all}");
+    let group = |wf: &str| {
+        by_workflow
+            .iter()
+            .find(|g| g["workflow_id"] == wf)
+            .unwrap_or_else(|| panic!("缺少分组 {wf}：{all}"))
+    };
+    assert_eq!(group(&f.workflow)["total"], 2);
+    assert_eq!(group(&f.workflow)["by_status"]["running"], 1);
+    assert_eq!(group(&wf2)["total"], 1);
+    assert_eq!(group(&wf2)["by_status"]["succeeded"], 1);
+
+    // 按 workflow 过滤：只回该 workflow 的计数，by_workflow 为空数组
+    let one = f
+        .call("run.stats", json!({"workflow_id": f.workflow}))
+        .await;
+    assert_eq!(one["result"]["total"], 2, "{one}");
+    assert_eq!(one["result"]["by_status"]["running"], 1);
+    assert_eq!(one["result"]["by_workflow"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn run_source_attribution_and_filter() {
+    let f = Fixture::new().await;
+    f.backend.store().publish(&f.workflow, 1).await.unwrap();
+
+    // run.start → manual
+    let r = f.call("run.start", json!({"workflow_id": f.workflow})).await;
+    let manual_run = r["result"]["run_id"].as_str().unwrap().to_string();
+    f.wait_finished(&manual_run).await;
+    let got = f.call("run.get", json!({"run_id": manual_run})).await;
+    assert_eq!(got["result"]["run"]["source"], "manual", "{got}");
+    assert!(got["result"]["run"]["source_detail"].is_null());
+
+    // 调度器触发 → schedule + schedule id（直接驱动一轮 fire_due，不等 tick）
+    let created = f
+        .call(
+            "schedule.create",
+            json!({"workflow_id": f.workflow, "cron": "* * * * *"}),
+        )
+        .await;
+    let schedule_id = created["result"]["id"].as_str().unwrap().to_string();
+    flow_rpc::scheduler::fire_due(&f.state.backend, chrono::Local::now()).await;
+    let list = f
+        .call(
+            "run.list",
+            json!({"workflow_id": f.workflow, "source": "schedule"}),
+        )
+        .await;
+    let runs = list["result"]["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 1, "{list}");
+    assert_eq!(runs[0]["source"], "schedule");
+    assert_eq!(runs[0]["source_detail"], json!(schedule_id));
+
+    // source 过滤：manual 只剩 run.start 那条；非法 source → -32010
+    let list = f
+        .call("run.list", json!({"workflow_id": f.workflow, "source": "manual"}))
+        .await;
+    assert_eq!(list["result"]["runs"].as_array().unwrap().len(), 1);
+    let bad = f.call("run.list", json!({"source": "cron"})).await;
+    assert_eq!(bad["error"]["code"], -32010, "{bad}");
 }
 
 #[tokio::test]

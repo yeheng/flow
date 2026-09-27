@@ -1,0 +1,26 @@
+# backend-perf：后端性能压测 harness（黑盒，真起被测进程，双后端矩阵）。
+#
+# 与 backend-e2e 的分工：e2e 钉行为契约，这里量性能——run 执行吞吐、
+# RPC 读路径延迟、订阅推送延迟、崩溃恢复耗时。被测进程是本二进制的自举
+# 服务模式（FLOW_PERF_SERVE=1 → flow_rpc::run_from_env），与 flow-server
+# 逐字同一份实现；存储上下文（独占临时目录 / docker 测试库、panic 路径清理）
+# 复用 backend-e2e 的 harness。
+#
+# 运行：cargo run -p backend-perf -- --help
+# 默认规模是「轻量回归」（单次数分钟内），参数可放大做重负载。
+[package]
+name = "backend-perf"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+jsonrpsee = { version = "0.26", features = ["client", "ws-client"] }
+flow-rpc = { path = "../flow-rpc" }
+backend-e2e = { path = "../backend-e2e" }

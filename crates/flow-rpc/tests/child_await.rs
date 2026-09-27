@@ -54,6 +54,8 @@ impl Fixture {
                 1,
                 &json!({"x": 1}),
                 "initializing",
+                "manual",
+                None,
             )
             .await
             .unwrap();

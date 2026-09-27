@@ -9,5 +9,7 @@ export default defineConfig({
   test: {
     environment: "jsdom",
     globals: true,
+    // e2e/ 是 Playwright（test:e2e），不是 vitest 用例
+    exclude: ["e2e/**", "node_modules/**", "dist/**"],
   },
 });

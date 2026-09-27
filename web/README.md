@@ -7,9 +7,11 @@ Vue 3 + Vite + TypeScript + vue-router，画布基于 @vue-flow/core。直连 fl
 
 | 路由                      | 页面                                                                                  |
 | ------------------------- | ------------------------------------------------------------------------------------- |
-| `/workflows`              | 工作流列表：新建 / 打开编辑器 / 运行记录 / 删除                                       |
+| `/`                       | 仪表盘：概览卡片（工作流数 / 运行数 / 成功率 / 进行中）+ 最近运行 + 按工作流成功率    |
+| `/workflows`              | 工作流列表：新建 / 打开编辑器 / 触发器 / 运行记录 / 删除                              |
 | `/workflows/:id`          | 编辑器：顶部条（保存/发布/运行）+ 左节点面板、中画布、右参数与运行面板                |
 | `/workflows/:id/versions` | 版本历史：版本表格（状态/校验和/时间）+ 加载到编辑器 / 以此版本发布 + 两版结构化 diff |
+| `/workflows/:id/triggers` | 触发器：定时调度（cron + 下次触发，10s 轮询）与 webhook（hook URL 复制 / curl 示例）  |
 | `/workflows/:id/runs`     | 该工作流的运行历史（3s 轮询）                                                         |
 | `/runs`                   | 全局运行历史（同上组件，不过滤）                                                      |
 | `/runs/:runId`            | 运行详情：信息头 + 只读 DAG（按 run 钉死的版本渲染、保留运行态着色）+ 实时时间线      |
@@ -32,7 +34,8 @@ npm run dev                          # 默认 http://127.0.0.1:5173
 flow-server 地址可用环境变量覆盖（需在 vite 启动前设置）：
 
 ```bash
-VITE_FLOW_RPC=ws://127.0.0.1:9801 npm run dev
+VITE_FLOW_RPC=ws://127.0.0.1:9800 npm run dev      # JSON-RPC WebSocket
+VITE_FLOW_HTTP=http://127.0.0.1:9801 npm run dev   # webhook HTTP 入口（触发器页展示 hook URL 用）
 ```
 
 ## 工程化
@@ -41,8 +44,17 @@ VITE_FLOW_RPC=ws://127.0.0.1:9801 npm run dev
 npm run build    # vue-tsc --noEmit && vite build
 npm run lint     # ESLint 9 flat config（typescript-eslint + eslint-plugin-vue）
 npm run format   # Prettier
-npm test         # vitest（monitor 事件流、toast、RPC 客户端、undo/redo、预校验、复制粘贴）
+npm test         # vitest（monitor 事件流、toast、RPC 客户端、undo/redo、预校验、复制粘贴、分页合并、仪表盘聚合）
+npm run test:e2e # Playwright e2e（首次需 npx playwright install chromium）
 ```
+
+e2e 基础设施（`playwright.config.ts` + `e2e/`）：global setup 编译并拉起一个**隔离的
+flow-server**（临时目录 sqlite，`FLOW_ADDR=19311` / `FLOW_HTTP_ADDR=19312`，不碰
+`data/flow.db`），vite 由 webServer 托管在 19313 并注入 `VITE_FLOW_RPC/VITE_FLOW_HTTP`；
+teardown 杀进程删目录。种子数据直接走 JSON-RPC WebSocket（`e2e/helpers.ts`，Node 22
+内置 WebSocket），用例间以随机名称隔离、串行执行（仪表盘断言全局 `run.stats`）。
+覆盖：工作流列表新建、编辑器画布/保存、运行链路（含来源归因与详情时间线）、
+触发器页（webhook 复制/POST 触发、非法 cron 报错）、仪表盘与 `run.stats` 对账。
 
 ## 编辑器交互（P1）
 
@@ -70,6 +82,24 @@ npm test         # vitest（monitor 事件流、toast、RPC 客户端、undo/red
   顶部条显示「基于旧版本，最新 vN」提示，避免误以为在改最新版。
 - 版本列表数据来自 RPC `workflow.versions`（倒序，只回元数据列，definition 按需走
   `workflow.get` 带 version 参数拉取）。
+
+## 触发器与仪表盘（P3）
+
+- **触发器页** `/workflows/:id/triggers`：
+  - 定时调度：新建表单（cron 5 字段 + 可选 JSON input）+ 列表（cron 表达式、
+    下次触发时间本地化显示、启停、删除）。`next_fire_at` 由服务端算好
+    （`schedule.create`/`schedule.list` 返回），前端不解析 cron；非法 cron 由后端
+    -32010 经 toast 展示；页面激活期间 10s 轮询；
+  - Webhook：新建按钮 + 列表（完整 hook URL 一键复制、curl 示例展开、启停、删除）。
+    hook URL 基址 = `VITE_FLOW_HTTP`（默认 `http://127.0.0.1:9801`），因为
+    flow-server 的 HTTP 端口前端无法自知。POST body（JSON）即 run 的 input。
+- **仪表盘** `/`：工作流总数、运行总数、成功率、进行中四张卡片 + 最近运行 +
+  按工作流成功率。统计走 `run.stats`（服务端 GROUP BY 精确计数），派生值纯函数
+  在 `src/state/dashboard.ts`（vitest 覆盖）；最近运行表只是展示窗口，走
+  `run.list(limit 10)`。
+- **运行归因**：runs 表带 `source`（手动 / 定时调度 / Webhook / 子流程）与
+  `source_detail`（schedule id / webhook token）。运行记录页有「来源」列与
+  来源筛选下拉；运行详情信息头显示来源，定时调度来源的 run 附「触发器」页链接。
 
 ## 使用
 

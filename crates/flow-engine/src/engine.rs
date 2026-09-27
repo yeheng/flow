@@ -304,7 +304,12 @@ impl Engine {
 
         let mut state = RunState::new();
         state.ensure_nodes(&spec.definition);
-        state.fold(&first);
+        state.fold(&first.clone());
+        // run_started 写于 Driver 存在之前，但全局订阅者必须和其他事件一样看到它：
+        // Postgres 后端经共享日志 + NOTIFY 扇出，单机后端只有在这里显式广播，
+        // 两条订阅面才一致（此前它只进事件文件，全局流从 node_started 才开始）。
+        // 无订阅者时 send 返回 Err，忽略即可。
+        let _ = self.events_tx.send(first);
 
         self.spawn_driver(log, spec, state, RecoveryPlan::default(), reservation);
         Ok(())

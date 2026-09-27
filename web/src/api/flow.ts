@@ -4,6 +4,7 @@ import type {
   NodeTypeDesc,
   RunEvent,
   RunRecord,
+  RunStats,
   Schedule,
   Timeline,
   VersionMeta,
@@ -68,6 +69,8 @@ export async function startRun(
 export interface ListRunsOptions {
   workflowId?: string;
   status?: string;
+  /** 触发来源过滤：manual / schedule / webhook / sub_workflow */
+  source?: string;
   /** 游标分页：返回该 run 之前更旧的记录 */
   beforeRunId?: string;
   limit?: number;
@@ -77,10 +80,18 @@ export async function listRuns(opts: ListRunsOptions = {}): Promise<RunRecord[]>
   const params: Record<string, unknown> = {};
   if (opts.workflowId !== undefined) params.workflow_id = opts.workflowId;
   if (opts.status !== undefined) params.status = opts.status;
+  if (opts.source !== undefined) params.source = opts.source;
   if (opts.beforeRunId !== undefined) params.before_run_id = opts.beforeRunId;
   if (opts.limit !== undefined) params.limit = opts.limit;
   const r = await client.call<{ runs: RunRecord[] }>("run.list", params);
   return r.runs;
+}
+
+/** 精确统计（GROUP BY）：不带 workflowId 时附带 by_workflow 分组 */
+export async function runStats(workflowId?: string): Promise<RunStats> {
+  const params: Record<string, unknown> = {};
+  if (workflowId !== undefined) params.workflow_id = workflowId;
+  return client.call<RunStats>("run.stats", params);
 }
 
 export async function getRun(runId: string): Promise<{ run: RunRecord; live: boolean }> {

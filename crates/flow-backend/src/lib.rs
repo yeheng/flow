@@ -43,7 +43,10 @@ use futures::StreamExt;
 use serde_json::Value;
 use thiserror::Error;
 
-pub use flow_dto::{DbRunStatus, RunRecord, Schedule, Webhook, WorkflowSummary, WorkflowVersion};
+pub use flow_dto::{
+    DbRunSource, DbRunStatus, RunRecord, RunStats, Schedule, Webhook, WorkflowRunStats,
+    WorkflowSummary, WorkflowVersion,
+};
 pub use flow_engine::{Definition, Envelope, NodeState, RunState, HTTP_METHODS};
 
 mod child;
@@ -94,10 +97,14 @@ impl BackendError {
 }
 
 /// run.start 的输入（AnyBackend::create_run）。
+/// source/source_detail 是触发来源归因：RPC 入口填 manual，调度器/webhook
+/// 填各自的来源与 id/token，子 run 在 launcher 内部标注（不走本结构）。
 pub struct CreateRun {
     pub workflow_id: String,
     pub version: Option<i64>,
     pub input: Value,
+    pub source: String,
+    pub source_detail: Option<String>,
 }
 
 pub use flow_dto::{CreatedRun, SignalAck};
@@ -352,12 +359,27 @@ impl AnyBackend {
         &self,
         workflow_id: Option<&str>,
         status: Option<&str>,
+        source: Option<&str>,
         before_run_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<RunRecord>, BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.list_runs(workflow_id, status, before_run_id, limit).await,
-            AnyBackend::Postgres(b) => b.list_runs(workflow_id, status, before_run_id, limit).await,
+            AnyBackend::Sqlite(b) => {
+                b.list_runs(workflow_id, status, source, before_run_id, limit)
+                    .await
+            }
+            AnyBackend::Postgres(b) => {
+                b.list_runs(workflow_id, status, source, before_run_id, limit)
+                    .await
+            }
+        }
+    }
+
+    /// run.stats：GROUP BY 精确计数；workflow_id 为 None 时附带按工作流分组。
+    pub async fn run_stats(&self, workflow_id: Option<&str>) -> Result<RunStats, BackendError> {
+        match self {
+            AnyBackend::Sqlite(b) => b.run_stats(workflow_id).await,
+            AnyBackend::Postgres(b) => b.run_stats(workflow_id).await,
         }
     }
 

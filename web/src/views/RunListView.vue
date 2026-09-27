@@ -4,7 +4,7 @@ import * as api from "../api/flow";
 import { errText } from "../rpc/client";
 import { editor, refreshWorkflows } from "../state/editor";
 import { confirmDialog } from "../state/modal";
-import { mergeRunPage, nextCursor } from "../state/run-list";
+import { mergeRunPage, nextCursor, sourceLabel } from "../state/run-list";
 import { toast } from "../state/toast";
 import type { RunRecord } from "../types";
 
@@ -14,6 +14,7 @@ const props = defineProps<{ workflowId?: string }>();
 const PAGE_SIZE = 50;
 const runs = ref<RunRecord[]>([]);
 const statusFilter = ref("");
+const sourceFilter = ref("");
 const hasMore = ref(false);
 const loadingMore = ref(false);
 let timer: ReturnType<typeof setInterval> | null = null;
@@ -27,6 +28,14 @@ const STATUS_OPTIONS: { value: string; label: string }[] = [
   { value: "failed", label: "失败" },
   { value: "cancelled", label: "已取消" },
   { value: "awaiting_resume", label: "挂起待恢复" },
+];
+
+const SOURCE_OPTIONS: { value: string; label: string }[] = [
+  { value: "", label: "全部来源" },
+  { value: "manual", label: "手动" },
+  { value: "schedule", label: "定时调度" },
+  { value: "webhook", label: "Webhook" },
+  { value: "sub_workflow", label: "子流程" },
 ];
 
 const statusLabel: Record<string, string> = {
@@ -65,6 +74,7 @@ async function refresh(): Promise<void> {
     const page = await api.listRuns({
       workflowId: props.workflowId,
       status: statusFilter.value || undefined,
+      source: sourceFilter.value || undefined,
       limit: PAGE_SIZE,
     });
     runs.value = mergeRunPage(page, runs.value);
@@ -82,6 +92,7 @@ async function loadMore(): Promise<void> {
     const page = await api.listRuns({
       workflowId: props.workflowId,
       status: statusFilter.value || undefined,
+      source: sourceFilter.value || undefined,
       beforeRunId: cursor,
       limit: PAGE_SIZE,
     });
@@ -105,7 +116,7 @@ async function onCancel(r: RunRecord): Promise<void> {
 }
 
 // 过滤条件变化：丢弃已翻页数据，回到第一页
-watch(statusFilter, () => {
+watch([statusFilter, sourceFilter], () => {
   runs.value = [];
   void refresh();
 });
@@ -135,6 +146,11 @@ watch(
     <div class="page-header">
       <h2>运行记录</h2>
       <div class="header-tools">
+        <select v-model="sourceFilter" class="status-filter">
+          <option v-for="o in SOURCE_OPTIONS" :key="o.value" :value="o.value">
+            {{ o.label }}
+          </option>
+        </select>
         <select v-model="statusFilter" class="status-filter">
           <option v-for="o in STATUS_OPTIONS" :key="o.value" :value="o.value">
             {{ o.label }}
@@ -151,6 +167,7 @@ watch(
           <th>Run</th>
           <th v-if="!workflowId">工作流</th>
           <th>状态</th>
+          <th>来源</th>
           <th>开始时间</th>
           <th>耗时</th>
           <th>操作</th>
@@ -168,6 +185,7 @@ watch(
               {{ statusLabel[r.status] ?? r.status }}
             </span>
           </td>
+          <td>{{ sourceLabel(r.source) }}</td>
           <td>{{ fmtTime(r.started_at) }}</td>
           <td>{{ fmtDuration(r) }}</td>
           <td class="actions">

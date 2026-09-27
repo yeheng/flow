@@ -77,6 +77,8 @@ async fn hook(
             workflow_id: webhook.workflow_id,
             version: None,
             input,
+            source: flow_backend::DbRunSource::Webhook.as_str().to_string(),
+            source_detail: Some(token.clone()),
         })
         .await
     {

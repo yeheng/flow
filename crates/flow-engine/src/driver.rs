@@ -299,30 +299,14 @@ impl Driver {
                     return Ok(());
                 }
                 _ = self.cancel.cancelled() => {
-                    // 取消级联：仍在等待的子 run 一并取消（best-effort，失败只记日志）。
-                    // 必须在写 RunCancelled 前发起，子 run 才有最大机会及时停止。
-                    let child_runs: Vec<String> = self
-                        .state
-                        .records
-                        .iter()
-                        .filter(|(id, rec)| {
-                            matches!(rec.state, NodeState::Running { .. })
-                                && self.definition.node_type(id) == Some(NodeType::SubWorkflow)
-                        })
-                        .filter_map(|(_, rec)| rec.child_run_id.clone())
-                        .collect();
+                    // 取消级联必须在写 RunCancelled 前发起，子 run 才有最大机会
+                    // 及时停止（与 inbox 取消路径共用同一入口，§6.8）
+                    Self::cascade_cancel_children(
+                        self.child_launcher.clone(),
+                        self.running_child_runs(),
+                    )
+                    .await;
                     self.abort_inflight();
-                    if let Some(launcher) = &self.child_launcher {
-                        // 并发取消全部子 run（join_all 等全部返回，仍满足
-                        // 「发起于写 RunCancelled 之前」的不变量）；best-effort，
-                        // 失败只记日志。
-                        join_all(
-                            child_runs
-                                .iter()
-                                .map(|child_run_id| launcher.cancel(child_run_id)),
-                        )
-                        .await;
-                    }
                     self.append_terminal(Event::RunCancelled {}).await?;
                     return Ok(());
                 }
@@ -358,6 +342,14 @@ impl Driver {
                     for input in inputs {
                         match input.kind {
                             PendingInputKind::Cancel => {
+                                // 取消级联必须先于终态事务：inbox 取消与本地取消
+                                // 是同一条契约（§6.8 best-effort 级联），不能只有
+                                // 单机路径级联、分布式路径把子 run 漏成永远 running
+                                Self::cascade_cancel_children(
+                                    self.child_launcher.clone(),
+                                    self.running_child_runs(),
+                                )
+                                .await;
                                 self.consume_cancel(&input).await?;
                             }
                             PendingInputKind::Signal => {
@@ -412,6 +404,36 @@ impl Driver {
         match self.sink.project_status(status, error).await {
             Ok(()) => Ok(()),
             Err(err) => Err(self.guard_lease(err)),
+        }
+    }
+
+    /// 仍在 Running 的 sub_workflow 节点的子 run id（同步收集，不跨 await）。
+    fn running_child_runs(&self) -> Vec<String> {
+        self.state
+            .records
+            .iter()
+            .filter(|(id, rec)| {
+                matches!(rec.state, NodeState::Running { .. })
+                    && self.definition.node_type(id) == Some(NodeType::SubWorkflow)
+            })
+            .filter_map(|(_, rec)| rec.child_run_id.clone())
+            .collect()
+    }
+
+    /// 取消级联（§6.8）：best-effort，失败只记日志，不升级。本地取消与 inbox
+    /// 取消共用同一入口——两条路径都必须满足「发起于写 RunCancelled 之前」。
+    /// 关联函数签名（而非 &self）：保证没有对 Driver 的借用跨过 await，
+    /// Driver future 才是 Send。
+    async fn cascade_cancel_children(
+        launcher: Option<Arc<dyn ChildRunLauncher>>,
+        child_runs: Vec<String>,
+    ) {
+        if child_runs.is_empty() {
+            return;
+        }
+        if let Some(launcher) = launcher {
+            // 并发取消全部子 run（join_all 等全部返回，仍满足上述不变量）
+            join_all(child_runs.iter().map(|id| launcher.cancel(id))).await;
         }
     }
 
@@ -808,6 +830,22 @@ impl Driver {
 
     /// 持久 inbox 的信号消费：先校验（内存状态），再原子持久化（applied 与
     /// SignalReceived 同事务），提交后才更新内存并解除等待（§6.2）。
+    /// inbox 信号是否「早到」：目标是 human_task、节点尚未登记等待、且状态还是
+    /// Pending/Running（即将就绪）。Skipped/Failed/Completed 的 human_task 永远不会
+    /// 等待——那类照常走校验拒绝，给客户端明确反馈。
+    fn inbox_signal_is_early(&self, node_id: &str) -> bool {
+        if self.human_waiting.contains_key(node_id) || self.adjudicating.contains(node_id) {
+            return false;
+        }
+        if self.definition.node_type(node_id) != Some(NodeType::HumanTask) {
+            return false;
+        }
+        matches!(
+            self.state.record(node_id).state,
+            NodeState::Pending | NodeState::Running { .. }
+        )
+    }
+
     async fn handle_inbox_signal(
         &mut self,
         input: PendingInput,
@@ -820,6 +858,20 @@ impl Driver {
                 .ok_or_else(|| EngineError::Node("signal 输入缺少 node_id".into()))?,
             payload: input.payload.clone(),
         };
+        // 早到的 inbox 信号（拆分部署：信号先落账、Driver 后接管；或 run.start
+        // 先于节点派发返回）：目标 human_task 还没登记等待（节点尚在 Pending/
+        // Running，下一刻就会就绪）时，拒绝会直接丢掉这条信号——run 随后永远
+        // 等不到它。此时跳过本次消费：行留 pending，下一次 poll 时节点已等待，
+        // 正常走「校验 → 落账 → 交付」。
+        if self.inbox_signal_is_early(&signal.node_id) {
+            tracing::debug!(
+                run_id = %self.run_id,
+                signal_id = %input.signal_id,
+                node_id = %signal.node_id,
+                "inbox 信号早到，目标 human_task 尚未等待，留待下次 poll"
+            );
+            return Ok(());
+        }
         let action = match self.signal_action(&signal) {
             Ok(action) => action,
             Err(err) => {

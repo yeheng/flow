@@ -1,0 +1,48 @@
+# backend-e2e：端到端测试项目（真起 flow-server 进程，双后端全矩阵）。
+#
+# 覆盖策略（DESIGN.md §13 的延伸）：
+# - 每个用例对 SQLite（canonical，独占临时目录）与 Postgres（docker 容器）各跑一遍，
+#   钉死「两个后端同一套契约」；
+# - Postgres 由本 crate 自己用 docker CLI 起容器（label: com.flow.e2e=1），
+#   进程退出（atexit）与下次运行启动时都会清理残余容器；
+# - 每个用例独占一个测试数据库（e2e_<ts>_<uuid>），用例结束即 DROP，
+#   panic 路径也保证清理（run_case 的 catch_unwind）。
+#
+# 运行：cargo test -p backend-e2e
+# 环境变量：
+#   FLOW_E2E_PG_IMAGE   Postgres 镜像（默认 postgres:16-alpine）
+#   RUST_LOG           透传给被测服务进程（默认 info）
+[package]
+name = "backend-e2e"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+tokio = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+jsonrpsee = { version = "0.26", features = ["client", "ws-client"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+sqlx = { version = "0.9", features = ["postgres", "runtime-tokio", "chrono", "json"] }
+libc = "0.2"
+flow-pg = { path = "../flow-pg" }
+flow-backend = { path = "../flow-backend" }
+flow-rpc = { path = "../flow-rpc" }
+axum = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# 被测二进制：与 flow-rpc 的 flow-server 同源（同一份 serve/scheduler/webhook），
+# 这里包一层薄 main，让本 crate 的集成测试能用 env!("CARGO_BIN_EXE_flow-server")
+# 定位到「本 crate 自己构建的」服务进程，不依赖外部 target 目录布局。
+[[bin]]
+name = "flow-server"
+path = "src/bin/flow-server.rs"
+
+[dev-dependencies]
+sha2 = { workspace = true }
+hex = { workspace = true }

@@ -5,6 +5,7 @@ import * as api from "../api/flow";
 import { errText } from "../rpc/client";
 import { editor, ensureNodeTypes, refreshWorkflows } from "../state/editor";
 import { attachRun, detachRun, monitor } from "../state/monitor";
+import { sourceLabel } from "../state/run-list";
 import { toast } from "../state/toast";
 import type { Definition, RunEvent, RunRecord } from "../types";
 import RunCanvas from "../components/RunCanvas.vue";
@@ -142,6 +143,16 @@ onUnmounted(() => {
       <div class="run-header-row run-header-meta">
         <span>开始 {{ fmtTime(record.started_at) }}</span>
         <span>结束 {{ fmtTime(record.ended_at) }}</span>
+        <span>
+          来源 {{ sourceLabel(record.source) }}
+          <RouterLink
+            v-if="record.source === 'schedule'"
+            class="link"
+            :to="`/workflows/${record.workflow_id}/triggers`"
+          >
+            （触发器）
+          </RouterLink>
+        </span>
       </div>
       <div class="run-header-row">
         <span class="muted">输入</span>

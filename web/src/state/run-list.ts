@@ -10,3 +10,19 @@ export function mergeRunPage(existing: RunRecord[], page: RunRecord[]): RunRecor
 export function nextCursor(runs: RunRecord[]): string | null {
   return runs.length > 0 ? runs[runs.length - 1].id : null;
 }
+
+/** run.source 的中文展示映射（词汇表：flow-dto DbRunSource）；未知值原样显示 */
+export function sourceLabel(source: string): string {
+  switch (source) {
+    case "manual":
+      return "手动";
+    case "schedule":
+      return "定时调度";
+    case "webhook":
+      return "Webhook";
+    case "sub_workflow":
+      return "子流程";
+    default:
+      return source;
+  }
+}

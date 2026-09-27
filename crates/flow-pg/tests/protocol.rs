@@ -241,6 +241,8 @@ async fn run_start_is_atomic_and_status_vocabulary_is_enforced() {
             workflow_id: wf.clone(),
             version: v,
             input: serde_json::json!({"k": 1}),
+            source: "manual".into(),
+            source_detail: None,
         })
         .await
         .unwrap();
