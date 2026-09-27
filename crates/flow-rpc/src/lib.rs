@@ -11,6 +11,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use chrono::Local;
 use flow_backend::{
     AnyBackend, BackendError, Definition, NodeState, RunState, SignalAck, HTTP_METHODS,
 };
@@ -23,6 +24,9 @@ use jsonrpsee::RpcModule;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use thiserror::Error;
+
+pub mod scheduler;
+pub mod webhook;
 
 const CODE_INVALID: i32 = -32010;
 const CODE_NOT_FOUND: i32 = -32011;
@@ -249,13 +253,26 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
             #[serde(default)]
             workflow_id: Option<String>,
             #[serde(default)]
+            status: Option<String>,
+            /// 游标分页：返回该 run 之前更旧的记录
+            #[serde(default)]
+            before_run_id: Option<String>,
+            #[serde(default)]
             limit: Option<i64>,
         }
         let p: P = parse(&params)?;
+        // 客户端给的 status 过滤词必须在 run 状态词汇表内（-32010）
+        if let Some(status) = &p.status {
+            if !flow_backend::DbRunStatus::is_valid_str(status) {
+                return Err(invalid(format!("非法的 run 状态：{status}")));
+            }
+        }
         let runs = state
             .backend
             .list_runs(
                 p.workflow_id.as_deref(),
+                p.status.as_deref(),
+                p.before_run_id.as_deref(),
                 p.limit.unwrap_or(50).clamp(1, 500),
             )
             .await
@@ -386,6 +403,147 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
             "event_seq": ack.event_seq,
             "error": ack.error,
         }))
+    })?;
+
+    // ---- 触发器：cron 调度与 webhook ----
+    // cron 合法性在本层校验（-32010）；next_fire_at 服务端算好（本地时间 cron →
+    // RFC3339），前端不解析 cron。
+
+    module.register_async_method("schedule.create", |params, state, _| async move {
+        #[derive(Deserialize)]
+        struct P {
+            workflow_id: String,
+            cron: String,
+            #[serde(default)]
+            input: Option<Value>,
+            #[serde(default)]
+            enabled: Option<bool>,
+        }
+        let p: P = parse(&params)?;
+        validate_cron(&p.cron)?;
+        let schedule = state
+            .backend
+            .create_schedule(
+                &p.workflow_id,
+                &p.cron,
+                p.input.as_ref(),
+                p.enabled.unwrap_or(true),
+            )
+            .await
+            .map_err(backend_err)?;
+        Ok::<_, ErrorObjectOwned>(schedule_value(&schedule))
+    })?;
+
+    module.register_async_method("schedule.list", |params, state, _| async move {
+        #[derive(Deserialize)]
+        struct P {
+            #[serde(default)]
+            workflow_id: Option<String>,
+        }
+        let p: P = parse(&params)?;
+        let schedules = state
+            .backend
+            .list_schedules(p.workflow_id.as_deref())
+            .await
+            .map_err(backend_err)?;
+        let schedules: Vec<Value> = schedules.iter().map(schedule_value).collect();
+        Ok::<_, ErrorObjectOwned>(json!({ "schedules": schedules }))
+    })?;
+
+    // 部分更新：cron/enabled 缺省不动；input 用双 Option——缺省=不改，null=清空。
+    module.register_async_method("schedule.update", |params, state, _| async move {
+        #[derive(Deserialize)]
+        struct P {
+            id: String,
+            #[serde(default)]
+            cron: Option<String>,
+            #[serde(default, deserialize_with = "double_option")]
+            input: Option<Option<Value>>,
+            #[serde(default)]
+            enabled: Option<bool>,
+        }
+        let p: P = parse(&params)?;
+        if let Some(cron) = &p.cron {
+            validate_cron(cron)?;
+        }
+        state
+            .backend
+            .update_schedule(&p.id, p.cron.as_deref(), p.input, p.enabled)
+            .await
+            .map_err(backend_err)?;
+        Ok::<_, ErrorObjectOwned>(json!({ "updated": true }))
+    })?;
+
+    module.register_async_method("schedule.delete", |params, state, _| async move {
+        #[derive(Deserialize)]
+        struct P {
+            id: String,
+        }
+        let p: P = parse(&params)?;
+        state
+            .backend
+            .delete_schedule(&p.id)
+            .await
+            .map_err(backend_err)?;
+        Ok::<_, ErrorObjectOwned>(json!({ "deleted": true }))
+    })?;
+
+    module.register_async_method("webhook.create", |params, state, _| async move {
+        #[derive(Deserialize)]
+        struct P {
+            workflow_id: String,
+        }
+        let p: P = parse(&params)?;
+        let webhook = state
+            .backend
+            .create_webhook(&p.workflow_id)
+            .await
+            .map_err(backend_err)?;
+        Ok::<_, ErrorObjectOwned>(json!(webhook))
+    })?;
+
+    module.register_async_method("webhook.list", |params, state, _| async move {
+        #[derive(Deserialize)]
+        struct P {
+            #[serde(default)]
+            workflow_id: Option<String>,
+        }
+        let p: P = parse(&params)?;
+        let webhooks = state
+            .backend
+            .list_webhooks(p.workflow_id.as_deref())
+            .await
+            .map_err(backend_err)?;
+        Ok::<_, ErrorObjectOwned>(json!({ "webhooks": webhooks }))
+    })?;
+
+    module.register_async_method("webhook.set_enabled", |params, state, _| async move {
+        #[derive(Deserialize)]
+        struct P {
+            token: String,
+            enabled: bool,
+        }
+        let p: P = parse(&params)?;
+        state
+            .backend
+            .set_webhook_enabled(&p.token, p.enabled)
+            .await
+            .map_err(backend_err)?;
+        Ok::<_, ErrorObjectOwned>(json!({ "updated": true }))
+    })?;
+
+    module.register_async_method("webhook.delete", |params, state, _| async move {
+        #[derive(Deserialize)]
+        struct P {
+            token: String,
+        }
+        let p: P = parse(&params)?;
+        state
+            .backend
+            .delete_webhook(&p.token)
+            .await
+            .map_err(backend_err)?;
+        Ok::<_, ErrorObjectOwned>(json!({ "deleted": true }))
     })?;
 
     // 执行进度推送（JSON-RPC 2.0 订阅通知）。推送机制由后端吸收：
@@ -640,7 +798,7 @@ pub(crate) fn node_types() -> Value {
                 "required": ["workflow_id"],
                 "properties": {
                     "workflow_id": {"type": "string", "x-widget": "workflow-picker", "x-label": "目标工作流",
-                                    "x-help": "调用其最新已发布版本作为子 run；输入为父 run 输入，子 run 输出透传为本节点输出"}
+                                    "x-help": "调用其最新已发布版本作为子 run；输入为父 run 输入，子 run 输出透传为本节点输出；子 run 失败传导为本节点 fatal（DESIGN §6.8），重试策略只覆盖启动/等待类错误"}
                 }
             },
             "supports_retry": true
@@ -657,6 +815,36 @@ pub(crate) fn parse<T: serde::de::DeserializeOwned>(
         .map_err(|e| invalid(format!("参数非法：{}", e.message())))?;
     let raw = if raw.is_null() { json!({}) } else { raw };
     serde_json::from_value(raw).map_err(|e| invalid(format!("参数非法：{e}")))
+}
+
+/// schedule.update 的 input 用双 Option 区分「字段缺失=不改」与「显式 null=清空」。
+/// serde 原生会把两者都收成 None，所以需要自定义反序列化把外层 Some 钉上。
+fn double_option<'de, D>(deserializer: D) -> Result<Option<Option<Value>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::<Value>::deserialize(deserializer)?))
+}
+
+/// cron 合法性校验（标准 5 字段，分 时 日 月 周，本地时间）。非法表达式 -32010。
+fn validate_cron(expr: &str) -> Result<(), ErrorObjectOwned> {
+    expr.parse::<cron_parser::Schedule>()
+        .map(|_| ())
+        .map_err(|e| invalid(format!("非法的 cron 表达式：{e}")))
+}
+
+/// schedule 响应：实体字段 + 服务端算好的 next_fire_at（RFC3339，本地时区偏移）。
+/// 存量数据 cron 损坏时 next_fire_at 为 null，不让 list 整个失败。
+fn schedule_value(schedule: &flow_backend::Schedule) -> Value {
+    let next_fire_at = schedule
+        .cron_expr
+        .parse::<cron_parser::Schedule>()
+        .ok()
+        .and_then(|cron| cron.next_after(&Local::now()))
+        .map(|t| t.to_rfc3339());
+    let mut value = json!(schedule);
+    value["next_fire_at"] = json!(next_fire_at);
+    value
 }
 
 pub(crate) fn invalid(message: impl Into<String>) -> ErrorObjectOwned {
@@ -679,7 +867,9 @@ pub(crate) fn backend_err(err: BackendError) -> ErrorObjectOwned {
         BackendError::WorkflowNotFound(_)
         | BackendError::VersionNotFound(..)
         | BackendError::RunNotFound(_)
-        | BackendError::SignalNotFound(_) => {
+        | BackendError::SignalNotFound(_)
+        | BackendError::ScheduleNotFound(_)
+        | BackendError::WebhookNotFound(_) => {
             ErrorObject::owned(CODE_NOT_FOUND, err.to_string(), None::<()>)
         }
         BackendError::VersionNotPublished(..) | BackendError::Conflict(_) => {

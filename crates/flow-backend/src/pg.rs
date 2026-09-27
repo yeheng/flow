@@ -19,8 +19,8 @@ use flow_engine::{Envelope, RunState};
 use flow_pg::{CreateRun as PgCreateRun, PgConfig, PgEngine, PgError};
 
 use crate::{
-    resolve_runnable_definition, BackendError, CreateRun, CreatedRun, RunRecord, SignalAck,
-    SignalRequest, WorkflowSummary, WorkflowVersion,
+    resolve_runnable_definition, BackendError, CreateRun, CreatedRun, RunRecord, Schedule,
+    SignalAck, SignalRequest, Webhook, WorkflowSummary, WorkflowVersion,
 };
 
 /// Postgres 后端：gateway 入口 + executor 生命周期 + 只读查询。
@@ -163,6 +163,110 @@ impl PgBackend {
             .map_err(pg_err)
     }
 
+    // ---- schedules / webhooks ----
+
+    pub async fn create_schedule(
+        &self,
+        workflow_id: &str,
+        cron_expr: &str,
+        input: Option<&Value>,
+        enabled: bool,
+    ) -> Result<Schedule, BackendError> {
+        self.engine
+            .store()
+            .create_schedule(workflow_id, cron_expr, input, enabled)
+            .await
+            .map_err(pg_err)
+    }
+
+    pub async fn list_schedules(
+        &self,
+        workflow_id: Option<&str>,
+    ) -> Result<Vec<Schedule>, BackendError> {
+        self.engine
+            .store()
+            .list_schedules(workflow_id)
+            .await
+            .map_err(pg_err)
+    }
+
+    pub async fn update_schedule(
+        &self,
+        id: &str,
+        cron_expr: Option<&str>,
+        input: Option<Option<Value>>,
+        enabled: Option<bool>,
+    ) -> Result<(), BackendError> {
+        self.engine
+            .store()
+            .update_schedule(id, cron_expr, input, enabled)
+            .await
+            .map_err(pg_err)
+    }
+
+    pub async fn delete_schedule(&self, id: &str) -> Result<(), BackendError> {
+        self.engine
+            .store()
+            .delete_schedule(id)
+            .await
+            .map_err(pg_err)
+    }
+
+    pub async fn try_insert_fire(
+        &self,
+        schedule_id: &str,
+        fire_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, BackendError> {
+        self.engine
+            .store()
+            .try_insert_fire(schedule_id, fire_at)
+            .await
+            .map_err(pg_err)
+    }
+
+    pub async fn create_webhook(&self, workflow_id: &str) -> Result<Webhook, BackendError> {
+        self.engine
+            .store()
+            .create_webhook(workflow_id)
+            .await
+            .map_err(pg_err)
+    }
+
+    pub async fn list_webhooks(
+        &self,
+        workflow_id: Option<&str>,
+    ) -> Result<Vec<Webhook>, BackendError> {
+        self.engine
+            .store()
+            .list_webhooks(workflow_id)
+            .await
+            .map_err(pg_err)
+    }
+
+    pub async fn get_webhook(&self, token: &str) -> Result<Option<Webhook>, BackendError> {
+        self.engine.store().get_webhook(token).await.map_err(pg_err)
+    }
+
+    pub async fn set_webhook_enabled(
+        &self,
+        token: &str,
+        enabled: bool,
+    ) -> Result<(), BackendError> {
+        self.engine
+            .store()
+            .set_webhook_enabled(token, enabled)
+            .await
+            .map_err(pg_err)
+    }
+
+    pub async fn delete_webhook(&self, token: &str) -> Result<(), BackendError> {
+        self.engine
+            .store()
+            .delete_webhook(token)
+            .await
+            .map_err(pg_err)
+    }
+
     /// 单事务原子创建：insert run + seq=1 RunStarted（DISTRIBUTED.md §3）。
     /// published 解析与定义校验单点在 `resolve_runnable_definition`，
     /// 这里拿到的是已解析的版本——底层不再重复实现这条规则。
@@ -186,11 +290,13 @@ impl PgBackend {
     pub async fn list_runs(
         &self,
         workflow_id: Option<&str>,
+        status: Option<&str>,
+        before_run_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<RunRecord>, BackendError> {
         self.engine
             .store()
-            .list_runs(workflow_id, limit)
+            .list_runs(workflow_id, status, before_run_id, limit)
             .await
             .map_err(pg_err)
     }
@@ -309,6 +415,8 @@ fn pg_err(err: PgError) -> BackendError {
         PgError::VersionNotFound(id, v) => BackendError::VersionNotFound(id, v),
         PgError::VersionNotPublished(id, v) => BackendError::VersionNotPublished(id, v),
         PgError::SignalNotFound(id) => BackendError::SignalNotFound(id),
+        PgError::ScheduleNotFound(id) => BackendError::ScheduleNotFound(id),
+        PgError::WebhookNotFound(token) => BackendError::WebhookNotFound(token),
         PgError::Conflict(msg) => BackendError::Conflict(msg),
         PgError::Invalid(msg) => BackendError::Invalid(msg),
         other => BackendError::internal(other),

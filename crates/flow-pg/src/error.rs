@@ -20,6 +20,10 @@ pub enum PgError {
     VersionNotPublished(String, i64),
     #[error("signal 不存在：{0}")]
     SignalNotFound(String),
+    #[error("schedule 不存在：{0}")]
+    ScheduleNotFound(String),
+    #[error("webhook 不存在：{0}")]
+    WebhookNotFound(String),
     #[error("冲突：{0}")]
     Conflict(String),
     #[error("非法参数：{0}")]

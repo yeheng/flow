@@ -124,6 +124,8 @@ impl ServerProc {
             .env("FLOW_DATABASE_URL", db_url)
             .env("FLOW_ROLE", role)
             .env("FLOW_ADDR", addr.to_string())
+            // flow-server 现在还会绑 webhook HTTP 端口；多进程并发测试必须各占一个
+            .env("FLOW_HTTP_ADDR", free_port().to_string())
             .env("FLOW_LEASE_TTL_MS", "1500")
             .env("FLOW_SCAN_INTERVAL_MS", "50")
             .env("FLOW_INBOX_POLL_MS", "50")

@@ -52,6 +52,7 @@ async function onDelete(id: string): Promise<void> {
           <td class="actions">
             <RouterLink class="link" :to="`/workflows/${w.workflow_id}`">打开</RouterLink>
             <RouterLink class="link" :to="`/workflows/${w.workflow_id}/versions`">版本</RouterLink>
+            <RouterLink class="link" :to="`/workflows/${w.workflow_id}/triggers`">触发器</RouterLink>
             <RouterLink class="link" :to="`/workflows/${w.workflow_id}/runs`">运行记录</RouterLink>
             <button class="link danger" @click="onDelete(w.workflow_id)">删除</button>
           </td>

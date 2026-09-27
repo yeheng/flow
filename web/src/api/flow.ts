@@ -4,8 +4,10 @@ import type {
   NodeTypeDesc,
   RunEvent,
   RunRecord,
+  Schedule,
   Timeline,
   VersionMeta,
+  Webhook,
   WorkflowDetail,
   WorkflowSummary,
 } from "../types";
@@ -63,10 +65,20 @@ export async function startRun(
   return client.call("run.start", params);
 }
 
-export async function listRuns(workflowId?: string, limit?: number): Promise<RunRecord[]> {
+export interface ListRunsOptions {
+  workflowId?: string;
+  status?: string;
+  /** 游标分页：返回该 run 之前更旧的记录 */
+  beforeRunId?: string;
+  limit?: number;
+}
+
+export async function listRuns(opts: ListRunsOptions = {}): Promise<RunRecord[]> {
   const params: Record<string, unknown> = {};
-  if (workflowId !== undefined) params.workflow_id = workflowId;
-  if (limit !== undefined) params.limit = limit;
+  if (opts.workflowId !== undefined) params.workflow_id = opts.workflowId;
+  if (opts.status !== undefined) params.status = opts.status;
+  if (opts.beforeRunId !== undefined) params.before_run_id = opts.beforeRunId;
+  if (opts.limit !== undefined) params.limit = opts.limit;
   const r = await client.call<{ runs: RunRecord[] }>("run.list", params);
   return r.runs;
 }
@@ -107,3 +119,64 @@ export function subscribeRun(
 ): Promise<() => Promise<void>> {
   return client.subscribe("run.subscribe", { run_id: runId }, (e) => onEvent(e as RunEvent));
 }
+
+// ---- 触发器：cron 调度与 webhook（schedule.* / webhook.*） ----
+
+export async function createSchedule(
+  workflowId: string,
+  cron: string,
+  input?: unknown,
+): Promise<Schedule> {
+  const params: Record<string, unknown> = { workflow_id: workflowId, cron };
+  if (input !== undefined) params.input = input;
+  return client.call<Schedule>("schedule.create", params);
+}
+
+export async function listSchedules(workflowId?: string): Promise<Schedule[]> {
+  const params: Record<string, unknown> = {};
+  if (workflowId !== undefined) params.workflow_id = workflowId;
+  const r = await client.call<{ schedules: Schedule[] }>("schedule.list", params);
+  return r.schedules;
+}
+
+export interface UpdateScheduleParams {
+  cron?: string;
+  /** 双 Option 语义：undefined=不改；null=清空；其余值=替换 */
+  input?: unknown;
+  enabled?: boolean;
+}
+
+export async function updateSchedule(id: string, p: UpdateScheduleParams): Promise<void> {
+  const params: Record<string, unknown> = { id };
+  if (p.cron !== undefined) params.cron = p.cron;
+  if (p.input !== undefined) params.input = p.input;
+  if (p.enabled !== undefined) params.enabled = p.enabled;
+  await client.call("schedule.update", params);
+}
+
+export async function deleteSchedule(id: string): Promise<void> {
+  await client.call("schedule.delete", { id });
+}
+
+export async function createWebhook(workflowId: string): Promise<Webhook> {
+  return client.call<Webhook>("webhook.create", { workflow_id: workflowId });
+}
+
+export async function listWebhooks(workflowId?: string): Promise<Webhook[]> {
+  const params: Record<string, unknown> = {};
+  if (workflowId !== undefined) params.workflow_id = workflowId;
+  const r = await client.call<{ webhooks: Webhook[] }>("webhook.list", params);
+  return r.webhooks;
+}
+
+export async function setWebhookEnabled(token: string, enabled: boolean): Promise<void> {
+  await client.call("webhook.set_enabled", { token, enabled });
+}
+
+export async function deleteWebhook(token: string): Promise<void> {
+  await client.call("webhook.delete", { token });
+}
+
+/** webhook HTTP 入口基址（POST /hook/<token>）。flow-server 的 HTTP 端口前端不可知，用 VITE_FLOW_HTTP 覆盖 */
+export const WEBHOOK_BASE =
+  (import.meta.env.VITE_FLOW_HTTP as string | undefined) ?? "http://127.0.0.1:9801";

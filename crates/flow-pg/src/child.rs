@@ -51,7 +51,13 @@ impl ChildRunLauncher for PgChildLauncher {
             // 重启前发布的新版会让事件日志与元数据分叉，之后 take_over 的身份
             // 校验判 IdentityMismatch，run 永久不可恢复。
             // 与 SQLite 臂 LocalChildLauncher::start 是同一条契约。
-            let existing = store.get_run(child_run_id).await.ok();
+            // 只有「行不存在」才走 fresh start；瞬时读错误原样暴露，
+            // 避免误入 latest_published 分支（与 SQLite 臂同一条契约）
+            let existing = match store.get_run(child_run_id).await {
+                Ok(run) => Some(run),
+                Err(PgError::RunNotFound(_)) => None,
+                Err(err) => return Err(EngineError::Backend(err.to_string())),
+            };
             let version = match &existing {
                 Some(run) => run.workflow_version,
                 None => store

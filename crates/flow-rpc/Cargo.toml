@@ -16,6 +16,9 @@ jsonrpsee = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 futures = { workspace = true }
+chrono = { workspace = true }
+cron-parser = { workspace = true }
+axum = { workspace = true }
 flow-backend = { path = "../flow-backend" }
 
 [dev-dependencies]

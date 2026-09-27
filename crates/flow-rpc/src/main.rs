@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use flow_backend::open_from_env;
-use flow_rpc::{serve, AppState};
+use flow_rpc::{scheduler, serve, webhook, AppState};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(AppState {
         backend: backend.clone(),
     });
-    let (handle, local_addr) = serve(state, addr).await?;
+    let (handle, local_addr) = serve(state.clone(), addr).await?;
     tracing::info!(
         %local_addr,
         backend = backend.name(),
@@ -35,8 +35,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "flow-server 已启动 (JSON-RPC 2.0 over WebSocket)"
     );
 
+    // cron 调度器：默认开启，FLOW_SCHEDULER=off 禁用
+    let scheduler_task = if std::env::var("FLOW_SCHEDULER").as_deref() == Ok("off") {
+        tracing::info!("FLOW_SCHEDULER=off，cron 调度器未启动");
+        None
+    } else {
+        let backend = backend.clone();
+        Some(tokio::spawn(async move { scheduler::run(backend).await }))
+    };
+
+    // webhook HTTP 入口：FLOW_HTTP_ADDR，默认 127.0.0.1:9801
+    let http_addr: SocketAddr = std::env::var("FLOW_HTTP_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:9801".into())
+        .parse()?;
+    let http_listener = tokio::net::TcpListener::bind(http_addr).await?;
+    tracing::info!(%http_addr, "webhook HTTP 监听已启动 (POST /hook/:token)");
+    let http_task = tokio::spawn(async move {
+        if let Err(err) = axum::serve(http_listener, webhook::router(state)).await {
+            tracing::error!(error = %err, "webhook HTTP 服务退出");
+        }
+    });
+
     tokio::signal::ctrl_c().await?;
     tracing::info!("收到中断信号，正在停止");
+    if let Some(task) = scheduler_task {
+        task.abort();
+    }
+    http_task.abort();
     // 停机错误只能记日志：进程即将退出，没有重试的意义
     if let Err(err) = backend.shutdown().await {
         tracing::error!(error = %err, "后端停机失败");

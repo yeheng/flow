@@ -88,6 +88,27 @@ export interface VersionMeta {
   created_at: string;
 }
 
+/** schedule.create / schedule.list 返回的 cron 调度（crates/flow-dto/src/lib.rs Schedule） */
+export interface Schedule {
+  id: string;
+  workflow_id: string;
+  cron_expr: string;
+  /** Option<Value>：未设置输入时为 null */
+  input: unknown;
+  enabled: boolean;
+  created_at: string;
+  /** 服务端算好的下次触发时间（RFC3339，本地时区偏移）；存量数据 cron 损坏时为 null */
+  next_fire_at: string | null;
+}
+
+/** webhook.create / webhook.list 返回的 webhook 触发器（flow-dto Webhook，token 即 URL 凭证） */
+export interface Webhook {
+  token: string;
+  workflow_id: string;
+  enabled: boolean;
+  created_at: string;
+}
+
 /** run.list / run.get 返回的运行记录（crates/flow-dto/src/lib.rs RunRecord） */
 export interface RunRecord {
   id: string;

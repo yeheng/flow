@@ -11,6 +11,7 @@ const connected = computed(() => client.connected.value);
   <header>
     <span class="logo">Flow</span>
     <nav class="nav">
+      <RouterLink to="/">仪表盘</RouterLink>
       <RouterLink to="/workflows">工作流</RouterLink>
       <RouterLink to="/runs">运行记录</RouterLink>
     </nav>

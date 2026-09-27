@@ -146,6 +146,13 @@ function locateError(nodeId?: string): void {
         <RouterLink
           v-if="editor.workflowId"
           class="link"
+          :to="`/workflows/${editor.workflowId}/triggers`"
+        >
+          触发器
+        </RouterLink>
+        <RouterLink
+          v-if="editor.workflowId"
+          class="link"
           :to="`/workflows/${editor.workflowId}/runs`"
         >
           运行记录

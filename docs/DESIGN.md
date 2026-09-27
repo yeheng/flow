@@ -43,7 +43,8 @@ crates/
                 「只有 published 可执行 + 创建前校验」单点在 resolve_runnable_definition
   flow-pg       Postgres 后端实现：共享日志、epoch 租约、持久 inbox、executor
   flow-rpc      jsonrpsee WebSocket 服务（bin: flow-server）；**只依赖
-                `AnyBackend` 枚举**，不感知 flow-store / flow-pg，也不读 FLOW_BACKEND
+                `AnyBackend` 枚举**，不感知 flow-store / flow-pg，也不读 FLOW_BACKEND；
+                进程内还跑 cron 调度器与 webhook HTTP 入口（§9.2）
 ```
 
 依赖方向（不可反转）：
@@ -63,7 +64,8 @@ flow-rpc ──> flow-store / flow-pg   ✗（上层不感知具体后端）
 不存在某个后端静默继承错误默认实现的坑。
 
 运行：`cargo run --bin flow-server`。环境变量 `FLOW_ADDR`（默认 `127.0.0.1:9800`）、
-`FLOW_DB`、`FLOW_DATA_DIR`；Postgres 模式另见 `DISTRIBUTED.md` §10
+`FLOW_DB`、`FLOW_DATA_DIR`、`FLOW_HTTP_ADDR` 与 `FLOW_SCHEDULER`（§9.2）；
+Postgres 模式另见 `DISTRIBUTED.md` §10
 （`FLOW_BACKEND`、`FLOW_DATABASE_URL`、`FLOW_ROLE`、`FLOW_LEASE_TTL_MS` 等）。
 
 ## 3. 核心数据结构：事件日志是唯一权威
@@ -310,6 +312,12 @@ Postgres `PgChildLauncher` 经 `lease::create_run` 单事务创建子 run、
 
 裁决信号：`run.signal {payload: {action: "retry" | "succeeded" | "failed", output?, error?}}`。
 
+
+恢复循环的失败隔离：单个 run 的回填/隔离投影失败（如瞬时 SQLite 锁）记入
+失败清单继续下一个 run，不中断整个恢复——一条坏行不能阻止其余 run 恢复，
+更不能让服务拒绝启动。日志缺失或身份不符的 run 保留 awaiting_resume 并
+报告错误，需修复数据后重启重试。
+
 ### 7.2 恢复的正确性来源
 
 - 日志已终结但 DB 未回填（崩溃在 append 与 observer 之间）→ `recover_unfinished`
@@ -346,12 +354,20 @@ SQLite（WAL）。表：
   相同定义的并发保存也复用版本号。
   `status`: draft → published；
 - `runs`：run 元数据（id, workflow_id, workflow_version, status, input, output, error, started_at, ended_at）。
+- `schedules`：cron 定时调度（id, workflow_id, cron_expr, input, enabled, created_at）。
+  cron 合法性校验在 RPC 边缘（-32010），存储层只持久化；
+- `schedule_fires`：触发去重表，`(schedule_id, fire_at)` 主键——插入成功即赢得本次
+  触发权，重复 tick 与多节点竞争都靠它去重；
+- `webhooks`：webhook 触发器（token 主键，随机生成不可猜, workflow_id, enabled, created_at）。
 
 约束：
 
 - **只有 published 版本可执行**；显式 version 同样检查，省略时取 latest published；
 - run 钉死某一版本——定义漂移在架构上不可能发生，无需额外防御；
 - 有 run 记录时拒删 workflow（事件日志不能变孤儿）；
+- 拒删与创建 run 互斥：SQLite 臂 delete_workflow 的计数+删除、insert_run 的
+  版本存在性检查各处一个 BEGIN IMMEDIATE 写锁事务；Postgres 臂用
+  FOR UPDATE / FOR SHARE 串行化（同一互斥，两臂同契约）；
 - `set_run_status` 影响 0 行必须报错（静默成功会掩盖「run 行没插进去」）；
 - **状态词汇表**：`runs.status` 的合法取值
   （initializing/running/awaiting_resume/succeeded/failed/cancelled）**单一来源**是
@@ -396,6 +412,29 @@ jsonrpsee WebSocket。本层只有**一份**方法实现，只依赖 `flow_backe
 | `run.signal` | human_task 交付 / 副作用节点裁决（§6.7）。signal_id 在 Postgres 必填且重试复用，SQLite 可省（响应只回显客户端提供的，不伪造） |
 | `run.signal_status` | 持久 inbox 落账查询；pg 专属（RPC 边缘 match 暴露），SQLite 返回明确的 invalid |
 | `run.subscribe` | 订阅 `run.event` 通知，可按 run_id 过滤。SQLite 订阅者消费慢时收到 Lagged 丢事件，用 `run.events`（from_seq）补齐；Postgres 按游标轮询共享日志。run_id 不存在时流立即结束（不是报错、不是永久重试） |
+| `schedule.create / list / update / delete` | cron 定时调度（§9.2）。非法 cron 表达式 -32010（标准 5 字段，本地时间）；list/create 响应带服务端算好的 `next_fire_at`（RFC3339），前端不解析 cron；update 部分更新，`input` 用双 Option 区分「不改」与「清空」（显式 null） |
+| `webhook.create / list / set_enabled / delete` | webhook 触发器（§9.2）。token 即 URL 凭证，随机生成不可猜 |
+
+订阅流结束条件的完整契约（两臂一致）：终态事件转发后自然结束；run 不存在
+（PG reader 回放起点报 RunNotFound）或日志为空（SQLite 臂「文件已建、
+run_started 未落盘」的初始化中断窗口，恢复已按 DB 投影标终态）时立即结束流，
+绝不挂起等待永远不会出现的终态事件。
+
+### 9.2 触发器：cron 调度与 webhook
+
+除 `run.start` 手动触发外，run 还有两个自动入口，都在 flow-server 进程内：
+
+- **cron 调度器**：默认开启，`FLOW_SCHEDULER=off` 禁用。每 20s tick 扫一次
+  全部 enabled schedule，取「最近一次 ≤ now 的整分触发点」（cron 标准 5 字段，
+  本地时间，解析用 cron-parser crate），先 `try_insert_fire`（schedule_fires
+  主键去重，多节点下谁先插入谁触发）再 `create_run`（当前 published 版本，
+  输入取 schedule.input）。每个 tick 每个 schedule 最多补一次火——停机期间
+  错过的触发点不追补；目标 workflow 没有 published 版本时本次跳过；
+- **webhook HTTP 入口**：独立于 WebSocket 端口的 HTTP 服务，`FLOW_HTTP_ADDR`
+  （默认 `127.0.0.1:9801`）。`POST /hook/<token>`：token 未知或已停用 → 404
+  （不区分，避免探测）；body 须为 JSON（空 body 视为 null 输入），作为 input
+  启动当前 published 版本 → 200 `{"run_id": "..."}`；无 published 版本 → 409。
+  webhook 与 RPC 共用同一个安全边界：无认证，只允许绑定可信地址（见文首警告）。
 
 错误码：`-32010` 参数非法、`-32011` 不存在、`-32012` 冲突、`-32603` 内部错误。
 JSON-RPC 允许整体省略 params（到达 null），解析层统一归一为 `{}`。
@@ -405,7 +444,9 @@ JSON-RPC 允许整体省略 params（到达 null），解析层统一归一为 `
 后端适配层重构（两份 RPC 实现合一）带来的线上协议变更，客户端对齐依据：
 
 - `run.cancel` 响应：`{"cancelling": true}` → `{"delivered": true}`（语义未变：
-  取消已受理。若 Postgres 侧携带 signal_id，则一并返回）；
+  取消已受理。Postgres 落账侧携带 signal_id（缺省时服务端生成）；SQLite 同步
+  交付回显客户端提供的 signal_id，缺省时不伪造——两臂对「提供了 id 的调用」
+  回显一致）；
 - `run.signal` 请求新增可选 `signal_id`（Postgres 必填）；响应新增
   `signal_id` / `event_seq` 字段（仅在真实存在时返回）；
 - `run.signal_status`：SQLite 后端从「方法不存在」变为「存在但返回 -32010
@@ -505,7 +546,9 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
   run_failed（sub_workflow）、订阅缺口补齐与失败重试（flow-backend run_tail）、
   子 run 重放沿用钉版本（flow-backend flow-store 的 child_version_pin + flow-pg 的
   `replayed_child_run_keeps_pinned_version`，两臂同一条契约）、信号错误码与订阅
-  回放契约（contracts）；
+  回放契约（contracts）、空日志订阅立即结束（run_tail）、PG reader 回放起点报
+  RunNotFound（flow-pg protocol）、身份不符隔离且不重扫——以 lease_epoch
+  停止攀升断言（flow-pg recovery）、删除后 insert_run 拒绝孤儿 run（flow-store）；
 - store 并发测试核对每个返回版本对应的定义及相同定义的版本复用；
 - 测试数据库必须放在独占目录的 `flow.db`，只清理独占目录，禁止删除系统临时目录；
 - **Postgres 后端**：租约 fencing、接管窗口、恢复分类与 inbox 幂等由

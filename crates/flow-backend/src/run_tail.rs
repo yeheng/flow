@@ -115,6 +115,8 @@ impl RunTail {
                 };
                 match self.reader.read_events(&self.run_id, Some(from)).await {
                     Ok(list) => {
+                        let replay_from_start = from == 1;
+                        let log_is_empty = list.is_empty();
                         let mut added = false;
                         for envelope in list {
                             if self.events.insert(envelope.seq, envelope).is_none() {
@@ -124,7 +126,18 @@ impl RunTail {
                         self.backfilled = true;
                         self.needs_fill = false;
                         self.fill_failed = false;
-                        // 防御：补齐成功却毫无新数据而缺口仍在（日志里根本没有
+                        // 防御 1：seq=1 起的回放一条事件都没有——run 不存在（PG reader
+                        // 报 RunNotFound）或初始化中断的空日志（SQLite 臂崩溃窗口：
+                        // event.jsonl 已建、run_started 未落盘，恢复已按 DB 投影标终态）。
+                        // 终态事件永远不会出现，等下去只会挂死订阅方，结束流。
+                        if replay_from_start && log_is_empty && self.events.is_empty() {
+                            tracing::debug!(
+                                run_id = %self.run_id,
+                                "事件日志为空（run 不存在或初始化中断），结束订阅流"
+                            );
+                            self.done = true;
+                        }
+                        // 防御 2：补齐成功却毫无新数据而缺口仍在（日志里根本没有
                         // 缺口段）——继续只能空转，吐完连续段后结束流。
                         if !added
                             && self
@@ -340,6 +353,21 @@ mod tests {
             .await
             .expect("订阅不存在的 run 必须立刻结束（修复前永久挂起）");
         assert!(seqs.is_empty(), "不存在的 run 不应吐出任何事件：{seqs:?}");
+    }
+
+    /// 空日志（run 存在但零事件——SQLite 臂「event.jsonl 已建、run_started
+    /// 未落盘」的崩溃窗口，恢复流程已按 DB 投影标终态）：必须结束流而不是
+    /// 挂死。终态事件永远不会出现，等下去只会挂死订阅方。
+    #[tokio::test(start_paused = true)]
+    async fn empty_log_ends_stream_instead_of_hanging() {
+        let reader = FakeReader::new(Vec::new(), 0);
+        let (_tx, rx) = broadcast::channel::<Envelope>(16);
+
+        let stream = run_tail(reader, rx, "run-1".into());
+        let seqs = tokio::time::timeout(Duration::from_secs(60), collect(stream))
+            .await
+            .expect("空日志的订阅必须立刻结束（修复前永久挂起）");
+        assert!(seqs.is_empty(), "空日志不应吐出任何事件：{seqs:?}");
     }
 
     /// 回放历史、实时段去重、终态后自然结束。

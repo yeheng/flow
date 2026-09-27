@@ -76,6 +76,66 @@ async fn takeover_replays_pure_node_with_new_attempt() {
     db.close().await;
 }
 
+/// §5.4/S2 回归：身份不符（元数据与日志分叉）的 run 必须隔离为 awaiting_resume
+/// 并释放租约；且本进程拉黑后不得周期性重扫——修复前它以 awaiting_resume +
+/// 无租约的形态留在候选里，每个扫描周期被重新抢租约、读全量日志、重新 fold
+/// 一遍，直到永远（lease_epoch 持续攀升）。
+#[tokio::test]
+async fn identity_mismatch_run_is_isolated_and_not_rescanned() {
+    let Some(db) = test_db().await else { return };
+    let gw = engine(&db, flow_pg::Role::Gateway).await;
+    let (wf, v) = publish_definition(&gw, "iso", def_line("return 1;")).await;
+    let run_id = start_run(&gw, &wf, v, json!(null)).await;
+    let pool = db.pool.clone();
+
+    // 篡改 runs.input：日志与元数据身份分叉（模拟手工改行）
+    sqlx::query("UPDATE runs SET input = '\"tampered\"'::jsonb WHERE id = $1")
+        .bind(&run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let b = engine(&db, flow_pg::Role::All).await;
+    let runner = tokio::spawn({
+        let b = b.clone();
+        async move { b.run_executor().await }
+    });
+    wait_until(
+        "隔离为 awaiting_resume",
+        Duration::from_secs(10),
+        || async { run_status(&pool, &run_id).await == "awaiting_resume" },
+    )
+    .await;
+
+    let read_epoch = || async {
+        sqlx::query_scalar::<_, i64>("SELECT lease_epoch FROM runs WHERE id = $1")
+            .bind(&run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    let lease_owner: Option<String> =
+        sqlx::query_scalar("SELECT lease_owner FROM runs WHERE id = $1")
+            .bind(&run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(lease_owner.is_none(), "隔离必须释放租约");
+    let epoch_at_isolation = read_epoch().await;
+
+    // 覆盖 ≥2 个扫描周期（默认 1s）：quarantine 生效则 epoch 不再攀升
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let epoch_later = read_epoch().await;
+    assert_eq!(
+        epoch_later, epoch_at_isolation,
+        "拉黑后不得重复接管（epoch 不得继续攀升）"
+    );
+
+    runner.abort();
+    b.shutdown().await;
+    db.close().await;
+}
+
 /// §11.3：Failed{retryable:true} → 接管后重建退避计时器，继续重试直到成功。
 #[tokio::test]
 async fn takeover_resumes_retry_backoff() {

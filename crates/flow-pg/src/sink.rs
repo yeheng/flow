@@ -195,6 +195,19 @@ impl PgRunSink {
         .bind(from)
         .fetch_all(pool)
         .await?;
+        // 回放起点的空结果必须区分「run 不存在」与「已追平」：订阅状态机
+        // （run_tail）依赖 RunNotFound 立即结束流。增量读取（from > 1）为空
+        // 是正常的追平信号，不做存在性检查。
+        if rows.is_empty() && from <= 1 {
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM runs WHERE id = $1)")
+                    .bind(run_id)
+                    .fetch_one(pool)
+                    .await?;
+            if !exists {
+                return Err(PgError::RunNotFound(run_id.to_string()));
+            }
+        }
         let mut events = Vec::with_capacity(rows.len());
         for row in rows {
             let seq: i64 = row.try_get("seq")?;
@@ -438,12 +451,13 @@ impl RunEventSink for PgRunSink {
             .await
             .map_err(Self::sql_err)?;
             sqlx::query(
-                "UPDATE run_signals SET status = 'applied', event_seq = $1
-                 WHERE run_id = $2 AND signal_id = $3",
+                "UPDATE runs SET status = $1, output = NULL, error = NULL,
+                        ended_at = clock_timestamp(),
+                        lease_owner = NULL, lease_expires_at = NULL
+                 WHERE id = $2",
             )
-            .bind(seq as i64)
+            .bind(DbRunStatus::Cancelled.as_str())
             .bind(&self.run_id)
-            .bind(&input.signal_id)
             .execute(&mut *tx)
             .await
             .map_err(Self::sql_err)?;

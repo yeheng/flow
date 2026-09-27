@@ -1,6 +1,7 @@
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -75,6 +76,9 @@ pub struct Signal {
 struct RunHandle {
     cancel: CancellationToken,
     signal_tx: mpsc::Sender<SignalRequest>,
+    /// Driver 任务已结束（清理任务随即摘除注册位）。注册位残留的微秒窗口内
+    /// signal/cancel/is_live 据此拒绝误报 live——契约：不在跑必须回 -32012 家族
+    exited: Arc<AtomicBool>,
 }
 
 /// reserve_run 的占位。Drop 时自动释放注册位（失败路径零样板），
@@ -248,7 +252,10 @@ impl Engine {
     }
 
     pub fn is_live(&self, run_id: &str) -> bool {
-        self.registry.lock().contains_key(run_id)
+        self.registry
+            .lock()
+            .get(run_id)
+            .is_some_and(|h| !h.exited.load(Ordering::Acquire))
     }
 
     pub async fn read_events(
@@ -343,9 +350,17 @@ impl Engine {
     }
 
     pub async fn cancel(&self, run_id: &str) -> bool {
-        let handle = self.registry.lock().get(run_id).map(|h| h.cancel.clone());
+        let handle = self
+            .registry
+            .lock()
+            .get(run_id)
+            .map(|h| (h.cancel.clone(), h.exited.clone()));
         match handle {
-            Some(token) => {
+            Some((token, exited)) => {
+                if exited.load(Ordering::Acquire) {
+                    // Driver 已退出、注册位尚未摘除：不谎报「已交付取消」
+                    return false;
+                }
                 token.cancel();
                 true
             }
@@ -354,22 +369,34 @@ impl Engine {
     }
 
     pub async fn signal(&self, run_id: &str, signal: Signal) -> Result<(), EngineError> {
-        let sender = self
+        let handle = self
             .registry
             .lock()
             .get(run_id)
-            .map(|h| h.signal_tx.clone())
+            .map(|h| (h.signal_tx.clone(), h.exited.clone()))
             .ok_or_else(|| {
                 EngineError::NotLive(format!("run {run_id} 当前不在运行中（已结束或未加载）"))
             })?;
+        let (sender, exited) = handle;
+        if exited.load(Ordering::Acquire) {
+            return Err(EngineError::NotLive(format!(
+                "run {run_id} 当前不在运行中（引擎任务已退出）"
+            )));
+        }
         let (reply, received) = oneshot::channel();
+        // Driver 在发送与回执之间退出属于「不在跑」而非内部错误（契约 -32012），
+        // 信号可能已提交但无法确认——由调用方按 NotLive 语义处理
         sender
             .send(SignalRequest { signal, reply })
             .await
-            .map_err(|_| EngineError::Node(format!("run {run_id} 的引擎任务已退出")))?;
-        received
-            .await
-            .map_err(|_| EngineError::Node(format!("run {run_id} 未能确认信号处理结果")))?
+            .map_err(|_| {
+                EngineError::NotLive(format!("run {run_id} 当前不在运行中（引擎任务已退出）"))
+            })?;
+        received.await.map_err(|_| {
+            EngineError::NotLive(format!(
+                "run {run_id} 未能确认信号处理结果（引擎任务已退出）"
+            ))
+        })?
     }
 
     /// 原子占位 run_id：同一 run 至多一个本地 Driver。
@@ -381,11 +408,13 @@ impl Engine {
         }
         let (signal_tx, signal_rx) = mpsc::channel(SIGNAL_CHANNEL_CAPACITY);
         let cancel = CancellationToken::new();
+        let exited = Arc::new(AtomicBool::new(false));
         registry.insert(
             run_id.to_string(),
             RunHandle {
                 cancel: cancel.clone(),
                 signal_tx,
+                exited: exited.clone(),
             },
         );
         Ok(RunReservation {
@@ -435,8 +464,12 @@ impl Engine {
         reservation.disarm();
         let registry = self.registry.clone();
         let run_id = spec.run_id.clone();
+        let exited = registry.lock().get(&run_id).map(|h| h.exited.clone());
         tokio::spawn(async move {
             let _ = handle.await;
+            if let Some(exited) = exited {
+                exited.store(true, Ordering::Release);
+            }
             registry.lock().remove(&run_id);
         });
     }

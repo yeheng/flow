@@ -43,7 +43,7 @@ use futures::StreamExt;
 use serde_json::Value;
 use thiserror::Error;
 
-pub use flow_dto::{RunRecord, WorkflowSummary, WorkflowVersion};
+pub use flow_dto::{DbRunStatus, RunRecord, Schedule, Webhook, WorkflowSummary, WorkflowVersion};
 pub use flow_engine::{Definition, Envelope, NodeState, RunState, HTTP_METHODS};
 
 mod child;
@@ -74,6 +74,10 @@ pub enum BackendError {
     RunNotFound(String),
     #[error("signal 不存在：{0}")]
     SignalNotFound(String),
+    #[error("schedule 不存在：{0}")]
+    ScheduleNotFound(String),
+    #[error("webhook 不存在：{0}")]
+    WebhookNotFound(String),
     #[error("参数非法：{0}")]
     Invalid(String),
     #[error("冲突：{0}")]
@@ -220,6 +224,113 @@ impl AnyBackend {
         }
     }
 
+    // ---- schedules / webhooks（触发器） ----
+
+    /// 创建 cron 调度。cron 合法性校验在 RPC 边缘（-32010），存储层只持久化。
+    pub async fn create_schedule(
+        &self,
+        workflow_id: &str,
+        cron_expr: &str,
+        input: Option<&Value>,
+        enabled: bool,
+    ) -> Result<Schedule, BackendError> {
+        match self {
+            AnyBackend::Sqlite(b) => {
+                b.create_schedule(workflow_id, cron_expr, input, enabled)
+                    .await
+            }
+            AnyBackend::Postgres(b) => {
+                b.create_schedule(workflow_id, cron_expr, input, enabled)
+                    .await
+            }
+        }
+    }
+
+    pub async fn list_schedules(
+        &self,
+        workflow_id: Option<&str>,
+    ) -> Result<Vec<Schedule>, BackendError> {
+        match self {
+            AnyBackend::Sqlite(b) => b.list_schedules(workflow_id).await,
+            AnyBackend::Postgres(b) => b.list_schedules(workflow_id).await,
+        }
+    }
+
+    /// 部分更新：None 字段不动；input 用 Option<Option<Value>> 区分「不改」与「清空」。
+    pub async fn update_schedule(
+        &self,
+        id: &str,
+        cron_expr: Option<&str>,
+        input: Option<Option<Value>>,
+        enabled: Option<bool>,
+    ) -> Result<(), BackendError> {
+        match self {
+            AnyBackend::Sqlite(b) => b.update_schedule(id, cron_expr, input, enabled).await,
+            AnyBackend::Postgres(b) => b.update_schedule(id, cron_expr, input, enabled).await,
+        }
+    }
+
+    pub async fn delete_schedule(&self, id: &str) -> Result<(), BackendError> {
+        match self {
+            AnyBackend::Sqlite(b) => b.delete_schedule(id).await,
+            AnyBackend::Postgres(b) => b.delete_schedule(id).await,
+        }
+    }
+
+    /// 触发去重：同一 (schedule_id, fire_at) 只插入成功一次（多节点天然分布式锁）。
+    pub async fn try_insert_fire(
+        &self,
+        schedule_id: &str,
+        fire_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, BackendError> {
+        match self {
+            AnyBackend::Sqlite(b) => b.try_insert_fire(schedule_id, fire_at).await,
+            AnyBackend::Postgres(b) => b.try_insert_fire(schedule_id, fire_at).await,
+        }
+    }
+
+    pub async fn create_webhook(&self, workflow_id: &str) -> Result<Webhook, BackendError> {
+        match self {
+            AnyBackend::Sqlite(b) => b.create_webhook(workflow_id).await,
+            AnyBackend::Postgres(b) => b.create_webhook(workflow_id).await,
+        }
+    }
+
+    pub async fn list_webhooks(
+        &self,
+        workflow_id: Option<&str>,
+    ) -> Result<Vec<Webhook>, BackendError> {
+        match self {
+            AnyBackend::Sqlite(b) => b.list_webhooks(workflow_id).await,
+            AnyBackend::Postgres(b) => b.list_webhooks(workflow_id).await,
+        }
+    }
+
+    pub async fn get_webhook(&self, token: &str) -> Result<Option<Webhook>, BackendError> {
+        match self {
+            AnyBackend::Sqlite(b) => b.get_webhook(token).await,
+            AnyBackend::Postgres(b) => b.get_webhook(token).await,
+        }
+    }
+
+    pub async fn set_webhook_enabled(
+        &self,
+        token: &str,
+        enabled: bool,
+    ) -> Result<(), BackendError> {
+        match self {
+            AnyBackend::Sqlite(b) => b.set_webhook_enabled(token, enabled).await,
+            AnyBackend::Postgres(b) => b.set_webhook_enabled(token, enabled).await,
+        }
+    }
+
+    pub async fn delete_webhook(&self, token: &str) -> Result<(), BackendError> {
+        match self {
+            AnyBackend::Sqlite(b) => b.delete_webhook(token).await,
+            AnyBackend::Postgres(b) => b.delete_webhook(token).await,
+        }
+    }
+
     /// 创建并启动 run（run.start）。初始化协议由实现吸收：
     /// SQLite 两段式（initializing → run_started），Postgres 单事务原子创建。
     /// published 解析与定义校验单点在 [`resolve_runnable_definition`]。
@@ -240,11 +351,13 @@ impl AnyBackend {
     pub async fn list_runs(
         &self,
         workflow_id: Option<&str>,
+        status: Option<&str>,
+        before_run_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<RunRecord>, BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.list_runs(workflow_id, limit).await,
-            AnyBackend::Postgres(b) => b.list_runs(workflow_id, limit).await,
+            AnyBackend::Sqlite(b) => b.list_runs(workflow_id, status, before_run_id, limit).await,
+            AnyBackend::Postgres(b) => b.list_runs(workflow_id, status, before_run_id, limit).await,
         }
     }
 

@@ -11,7 +11,10 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::error::PgError;
-pub use flow_dto::{RunRecord, WorkflowSummary, WorkflowVersion, STATUS_DRAFT, STATUS_PUBLISHED};
+pub use flow_dto::{
+    RunRecord, Schedule, Webhook, WorkflowSummary, WorkflowVersion, STATUS_ACTIVE, STATUS_DRAFT,
+    STATUS_PUBLISHED,
+};
 
 /// 定义与 run 元数据的存储。执行事件在 run_events，租约在 runs 行内。
 pub struct PgStore {
@@ -219,6 +222,228 @@ impl PgStore {
         Ok(())
     }
 
+    // ---- schedules / webhooks（触发器，P3；与 sqlite 臂同契约） ----
+
+    /// 创建 cron 调度。cron 合法性校验在 RPC 边缘（-32010），这里只做持久化。
+    pub async fn create_schedule(
+        &self,
+        workflow_id: &str,
+        cron_expr: &str,
+        input: Option<&Value>,
+        enabled: bool,
+    ) -> Result<Schedule, PgError> {
+        let exists: Option<String> = sqlx::query_scalar("SELECT id FROM workflows WHERE id = $1")
+            .bind(workflow_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        if exists.is_none() {
+            return Err(PgError::WorkflowNotFound(workflow_id.to_string()));
+        }
+        let id = Uuid::now_v7().to_string();
+        let created_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "INSERT INTO schedules (id, workflow_id, cron_expr, input, enabled)
+             VALUES ($1, $2, $3, $4, $5) RETURNING created_at",
+        )
+        .bind(&id)
+        .bind(workflow_id)
+        .bind(cron_expr)
+        .bind(input)
+        .bind(enabled)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(Schedule {
+            id,
+            workflow_id: workflow_id.to_string(),
+            cron_expr: cron_expr.to_string(),
+            input: input.cloned(),
+            enabled,
+            created_at,
+        })
+    }
+
+    pub async fn list_schedules(
+        &self,
+        workflow_id: Option<&str>,
+    ) -> Result<Vec<Schedule>, PgError> {
+        let rows = match workflow_id {
+            Some(id) => {
+                sqlx::query(
+                    "SELECT id, workflow_id, cron_expr, input, enabled, created_at
+                     FROM schedules WHERE workflow_id = $1 ORDER BY created_at DESC",
+                )
+                .bind(id)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "SELECT id, workflow_id, cron_expr, input, enabled, created_at
+                     FROM schedules ORDER BY created_at DESC",
+                )
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        rows.into_iter().map(schedule_from_row).collect()
+    }
+
+    /// 部分更新：None 字段不动；input 用 Option<Option<Value>> 区分「不改」与「清空」。
+    pub async fn update_schedule(
+        &self,
+        id: &str,
+        cron_expr: Option<&str>,
+        input: Option<Option<Value>>,
+        enabled: Option<bool>,
+    ) -> Result<(), PgError> {
+        let mut qb: sqlx::QueryBuilder<sqlx::Postgres> =
+            sqlx::QueryBuilder::new("UPDATE schedules SET ");
+        let mut first = true;
+        let mut sep = |qb: &mut sqlx::QueryBuilder<sqlx::Postgres>| {
+            if !std::mem::take(&mut first) {
+                qb.push(", ");
+            }
+        };
+        if let Some(cron_expr) = cron_expr {
+            sep(&mut qb);
+            qb.push("cron_expr = ").push_bind(cron_expr);
+        }
+        if let Some(input) = input {
+            sep(&mut qb);
+            qb.push("input = ").push_bind(input);
+        }
+        if let Some(enabled) = enabled {
+            sep(&mut qb);
+            qb.push("enabled = ").push_bind(enabled);
+        }
+        if first {
+            return Ok(()); // 没有要更新的字段
+        }
+        let affected = qb
+            .push(" WHERE id = ")
+            .push_bind(id)
+            .build()
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if affected == 0 {
+            return Err(PgError::ScheduleNotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
+    pub async fn delete_schedule(&self, id: &str) -> Result<(), PgError> {
+        let affected = sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if affected == 0 {
+            return Err(PgError::ScheduleNotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// 触发去重：同一 (schedule_id, fire_at) 只插入成功一次。
+    /// 多节点下谁先插入谁触发，天然分布式锁。
+    pub async fn try_insert_fire(
+        &self,
+        schedule_id: &str,
+        fire_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, PgError> {
+        let affected = sqlx::query(
+            "INSERT INTO schedule_fires (schedule_id, fire_at) VALUES ($1, $2)
+             ON CONFLICT (schedule_id, fire_at) DO NOTHING",
+        )
+        .bind(schedule_id)
+        .bind(fire_at)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(affected == 1)
+    }
+
+    pub async fn create_webhook(&self, workflow_id: &str) -> Result<Webhook, PgError> {
+        let exists: Option<String> = sqlx::query_scalar("SELECT id FROM workflows WHERE id = $1")
+            .bind(workflow_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        if exists.is_none() {
+            return Err(PgError::WorkflowNotFound(workflow_id.to_string()));
+        }
+        let token = Uuid::now_v7().simple().to_string();
+        let created_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "INSERT INTO webhooks (token, workflow_id) VALUES ($1, $2) RETURNING created_at",
+        )
+        .bind(&token)
+        .bind(workflow_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(Webhook {
+            token,
+            workflow_id: workflow_id.to_string(),
+            enabled: true,
+            created_at,
+        })
+    }
+
+    pub async fn list_webhooks(&self, workflow_id: Option<&str>) -> Result<Vec<Webhook>, PgError> {
+        let rows = match workflow_id {
+            Some(id) => {
+                sqlx::query(
+                    "SELECT token, workflow_id, enabled, created_at
+                     FROM webhooks WHERE workflow_id = $1 ORDER BY created_at DESC",
+                )
+                .bind(id)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "SELECT token, workflow_id, enabled, created_at
+                     FROM webhooks ORDER BY created_at DESC",
+                )
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        rows.into_iter().map(webhook_from_row).collect()
+    }
+
+    pub async fn get_webhook(&self, token: &str) -> Result<Option<Webhook>, PgError> {
+        let rec = sqlx::query(
+            "SELECT token, workflow_id, enabled, created_at FROM webhooks WHERE token = $1",
+        )
+        .bind(token)
+        .fetch_optional(&self.pool)
+        .await?;
+        rec.map(webhook_from_row).transpose()
+    }
+
+    pub async fn set_webhook_enabled(&self, token: &str, enabled: bool) -> Result<(), PgError> {
+        let affected = sqlx::query("UPDATE webhooks SET enabled = $1 WHERE token = $2")
+            .bind(enabled)
+            .bind(token)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if affected == 0 {
+            return Err(PgError::WebhookNotFound(token.to_string()));
+        }
+        Ok(())
+    }
+
+    pub async fn delete_webhook(&self, token: &str) -> Result<(), PgError> {
+        let affected = sqlx::query("DELETE FROM webhooks WHERE token = $1")
+            .bind(token)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if affected == 0 {
+            return Err(PgError::WebhookNotFound(token.to_string()));
+        }
+        Ok(())
+    }
+
     pub async fn get_run(&self, run_id: &str) -> Result<RunRecord, PgError> {
         let rec = sqlx::query(
             "SELECT id, workflow_id, workflow_version, status, input, output, error,
@@ -235,31 +460,30 @@ impl PgStore {
     pub async fn list_runs(
         &self,
         workflow_id: Option<&str>,
+        status: Option<&str>,
+        before_run_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<RunRecord>, PgError> {
-        let rows = match workflow_id {
-            Some(id) => {
-                sqlx::query(
-                    "SELECT id, workflow_id, workflow_version, status, input, output, error,
-                            started_at, ended_at
-                     FROM runs WHERE workflow_id = $1 ORDER BY started_at DESC LIMIT $2",
-                )
-                .bind(id)
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await?
-            }
-            None => {
-                sqlx::query(
-                    "SELECT id, workflow_id, workflow_version, status, input, output, error,
-                            started_at, ended_at
-                     FROM runs ORDER BY started_at DESC LIMIT $1",
-                )
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await?
-            }
-        };
+        // 与 sqlite 臂同契约：status 过滤 + before_run_id 游标（更旧的记录）。
+        // status 词汇表校验在 RPC 边缘（-32010）；这里作为读过滤，未知值自然查空
+        let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+            "SELECT id, workflow_id, workflow_version, status, input, output, error,
+                    started_at, ended_at
+             FROM runs WHERE TRUE",
+        );
+        if let Some(id) = workflow_id {
+            qb.push(" AND workflow_id = ").push_bind(id);
+        }
+        if let Some(status) = status {
+            qb.push(" AND status = ").push_bind(status);
+        }
+        if let Some(before) = before_run_id {
+            qb.push(" AND started_at < (SELECT started_at FROM runs WHERE id = ")
+                .push_bind(before)
+                .push(")");
+        }
+        qb.push(" ORDER BY started_at DESC LIMIT ").push_bind(limit);
+        let rows = qb.build().fetch_all(&self.pool).await?;
         let mut runs = Vec::with_capacity(rows.len());
         for row in rows {
             runs.push(run_from_row(row)?);
@@ -272,13 +496,14 @@ impl PgStore {
     pub async fn takeover_candidates(&self, limit: i64) -> Result<Vec<String>, PgError> {
         let rows = sqlx::query(
             "SELECT id FROM runs
-             WHERE status IN ('running', 'awaiting_resume')
+             WHERE status = ANY($2)
                AND (lease_owner IS NULL
                     OR lease_expires_at <= clock_timestamp())
              ORDER BY started_at ASC
              LIMIT $1",
         )
         .bind(limit)
+        .bind(&STATUS_ACTIVE[..])
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -299,12 +524,13 @@ impl PgStore {
     ) -> Result<Vec<(String, bool)>, PgError> {
         let rows = sqlx::query(
             "SELECT id, status FROM runs
-             WHERE status IN ('running', 'awaiting_resume')
+             WHERE status = ANY($2)
                 OR ended_at >= clock_timestamp() - make_interval(secs => $1)
              ORDER BY started_at ASC
              LIMIT 256",
         )
         .bind(ended_within.as_secs_f64())
+        .bind(&STATUS_ACTIVE[..])
         .fetch_all(&self.pool)
         .await?;
         let mut out = Vec::with_capacity(rows.len());
@@ -316,6 +542,26 @@ impl PgStore {
         }
         Ok(out)
     }
+}
+
+fn schedule_from_row(rec: sqlx::postgres::PgRow) -> Result<Schedule, PgError> {
+    Ok(Schedule {
+        id: rec.try_get("id")?,
+        workflow_id: rec.try_get("workflow_id")?,
+        cron_expr: rec.try_get("cron_expr")?,
+        input: rec.try_get("input")?,
+        enabled: rec.try_get("enabled")?,
+        created_at: rec.try_get("created_at")?,
+    })
+}
+
+fn webhook_from_row(rec: sqlx::postgres::PgRow) -> Result<Webhook, PgError> {
+    Ok(Webhook {
+        token: rec.try_get("token")?,
+        workflow_id: rec.try_get("workflow_id")?,
+        enabled: rec.try_get("enabled")?,
+        created_at: rec.try_get("created_at")?,
+    })
 }
 
 fn version_from_row(rec: sqlx::postgres::PgRow) -> Result<WorkflowVersion, PgError> {

@@ -25,8 +25,8 @@ use flow_store::{Store, StoreError};
 
 use crate::child::LocalChildLauncher;
 use crate::{
-    resolve_runnable_definition, BackendError, CreateRun, CreatedRun, RunRecord, SignalAck,
-    SignalRequest, WorkflowSummary, WorkflowVersion,
+    resolve_runnable_definition, BackendError, CreateRun, CreatedRun, RunRecord, Schedule,
+    SignalAck, SignalRequest, Webhook, WorkflowSummary, WorkflowVersion,
 };
 
 /// 把引擎的 run 状态变化落到 runs 表。引擎本身不依赖存储实现，适配在 SQLite
@@ -51,6 +51,7 @@ impl RunObserver for StoreObserver {
                     update.status.as_str(),
                     update.output,
                     update.error,
+                    None,
                 )
                 .await
             {
@@ -206,6 +207,97 @@ impl SqliteBackend {
             .map_err(sqlite_err)
     }
 
+    // ---- schedules / webhooks ----
+
+    pub async fn create_schedule(
+        &self,
+        workflow_id: &str,
+        cron_expr: &str,
+        input: Option<&Value>,
+        enabled: bool,
+    ) -> Result<Schedule, BackendError> {
+        self.store
+            .create_schedule(workflow_id, cron_expr, input, enabled)
+            .await
+            .map_err(sqlite_err)
+    }
+
+    pub async fn list_schedules(
+        &self,
+        workflow_id: Option<&str>,
+    ) -> Result<Vec<Schedule>, BackendError> {
+        self.store
+            .list_schedules(workflow_id)
+            .await
+            .map_err(sqlite_err)
+    }
+
+    pub async fn update_schedule(
+        &self,
+        id: &str,
+        cron_expr: Option<&str>,
+        input: Option<Option<Value>>,
+        enabled: Option<bool>,
+    ) -> Result<(), BackendError> {
+        self.store
+            .update_schedule(id, cron_expr, input, enabled)
+            .await
+            .map_err(sqlite_err)
+    }
+
+    pub async fn delete_schedule(&self, id: &str) -> Result<(), BackendError> {
+        self.store.delete_schedule(id).await.map_err(sqlite_err)
+    }
+
+    /// sqlite 臂的 fire_at 列是 TEXT：统一 RFC3339 秒精度，保证去重键稳定。
+    pub async fn try_insert_fire(
+        &self,
+        schedule_id: &str,
+        fire_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, BackendError> {
+        let key = fire_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.store
+            .try_insert_fire(schedule_id, &key)
+            .await
+            .map_err(sqlite_err)
+    }
+
+    pub async fn create_webhook(&self, workflow_id: &str) -> Result<Webhook, BackendError> {
+        self.store
+            .create_webhook(workflow_id)
+            .await
+            .map_err(sqlite_err)
+    }
+
+    pub async fn list_webhooks(
+        &self,
+        workflow_id: Option<&str>,
+    ) -> Result<Vec<Webhook>, BackendError> {
+        self.store
+            .list_webhooks(workflow_id)
+            .await
+            .map_err(sqlite_err)
+    }
+
+    pub async fn get_webhook(&self, token: &str) -> Result<Option<Webhook>, BackendError> {
+        self.store.get_webhook(token).await.map_err(sqlite_err)
+    }
+
+    pub async fn set_webhook_enabled(
+        &self,
+        token: &str,
+        enabled: bool,
+    ) -> Result<(), BackendError> {
+        self.store
+            .set_webhook_enabled(token, enabled)
+            .await
+            .map_err(sqlite_err)
+    }
+
+    pub async fn delete_webhook(&self, token: &str) -> Result<(), BackendError> {
+        self.store.delete_webhook(token).await.map_err(sqlite_err)
+    }
+
     /// run.start 的单机协议：校验 published → insert initializing →
     /// 持久化 run_started → 启动 Driver；初始化错误回写 failed（DESIGN.md §9）。
     pub async fn create_run(&self, spec: CreateRun) -> Result<CreatedRun, BackendError> {
@@ -238,7 +330,13 @@ impl SqliteBackend {
             let message = err.to_string();
             if let Err(write_err) = self
                 .store
-                .set_run_status(&run_id, DbRunStatus::Failed.as_str(), None, Some(&message))
+                .set_run_status(
+                    &run_id,
+                    DbRunStatus::Failed.as_str(),
+                    None,
+                    Some(&message),
+                    None,
+                )
                 .await
             {
                 tracing::error!(run_id = %run_id, error = %write_err, "回写 run failed 状态失败");
@@ -258,10 +356,12 @@ impl SqliteBackend {
     pub async fn list_runs(
         &self,
         workflow_id: Option<&str>,
+        status: Option<&str>,
+        before_run_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<RunRecord>, BackendError> {
         self.store
-            .list_runs(workflow_id, limit)
+            .list_runs(workflow_id, status, before_run_id, limit)
             .await
             .map_err(sqlite_err)
     }
@@ -320,11 +420,13 @@ impl SqliteBackend {
     pub async fn cancel(
         &self,
         run_id: &str,
-        _signal_id: Option<String>,
+        signal_id: Option<String>,
     ) -> Result<SignalAck, BackendError> {
         if self.engine.cancel(run_id).await {
+            // 回显客户端提供的 signal_id（与 signal()/PG 臂一致）；没有持久
+            // inbox，缺省时不伪造
             return Ok(SignalAck {
-                signal_id: None,
+                signal_id,
                 status: "applied".into(),
                 delivered: true,
                 event_seq: None,
@@ -397,6 +499,8 @@ fn sqlite_err(err: StoreError) -> BackendError {
         StoreError::VersionNotFound(id, v) => BackendError::VersionNotFound(id, v),
         StoreError::VersionNotPublished(id, v) => BackendError::VersionNotPublished(id, v),
         StoreError::RunNotFound(id) => BackendError::RunNotFound(id),
+        StoreError::ScheduleNotFound(id) => BackendError::ScheduleNotFound(id),
+        StoreError::WebhookNotFound(token) => BackendError::WebhookNotFound(token),
         StoreError::Conflict(msg) => BackendError::Conflict(msg),
         StoreError::InvalidStatus(s) => BackendError::Internal(format!("非法的 run 状态：{s}")),
         other => BackendError::internal(other),
@@ -466,16 +570,23 @@ pub async fn recover_unfinished(
                     RunPhase::Cancelled => DbRunStatus::Cancelled,
                     RunPhase::Running => DbRunStatus::Running,
                 };
-                store
+                match store
                     .set_run_status(
                         &run.id,
                         status.as_str(),
                         terminal.output.as_ref(),
                         terminal.fatal_error.as_deref(),
+                        // 结束时刻以事件日志为准，不用重启时刻顶替
+                        terminal.ended_at.as_ref(),
                     )
                     .await
-                    .map_err(sqlite_err)?;
-                tracing::info!(run_id = %run.id, "事件日志已终结，回填 DB 状态");
+                {
+                    Ok(()) => {
+                        tracing::info!(run_id = %run.id, "事件日志已终结，回填 DB 状态")
+                    }
+                    // 单个 run 的回填失败不中断整个恢复循环：其余 run 照常恢复
+                    Err(err) => failures.push((run.id.clone(), format!("回填终态失败：{err}"))),
+                }
             }
             Err(err) => {
                 let message = err.to_string();
@@ -489,10 +600,12 @@ pub async fn recover_unfinished(
                     } else {
                         DbRunStatus::AwaitingResume
                     };
-                    store
-                        .set_run_status(&run.id, status.as_str(), None, Some(&message))
+                    if let Err(err) = store
+                        .set_run_status(&run.id, status.as_str(), None, Some(&message), None)
                         .await
-                        .map_err(sqlite_err)?;
+                    {
+                        failures.push((run.id.clone(), format!("隔离投影失败：{err}")));
+                    }
                 }
                 failures.push((run.id.clone(), message));
             }
@@ -516,6 +629,11 @@ mod tests {
             uuid::Uuid::now_v7()
         ));
         let store = Store::open(root.join("flow.db")).await.unwrap();
+        let wf = store.create_workflow("wf").await.unwrap();
+        store
+            .update_workflow(&wf, &json!({"nodes": []}))
+            .await
+            .unwrap();
 
         let statuses = [
             DbRunStatus::Initializing,
@@ -528,11 +646,11 @@ mod tests {
         for (i, status) in statuses.iter().enumerate() {
             let run_id = format!("r-{i}");
             store
-                .insert_run(&run_id, "wf", 1, &Value::Null, status.as_str())
+                .insert_run(&run_id, &wf, 1, &Value::Null, status.as_str())
                 .await
                 .unwrap();
             store
-                .set_run_status(&run_id, status.as_str(), None, None)
+                .set_run_status(&run_id, status.as_str(), None, None, None)
                 .await
                 .unwrap();
         }
@@ -542,7 +660,7 @@ mod tests {
 
         // 词汇表外的状态在写入时当场报错
         let err = store
-            .insert_run("r-unknown", "wf", 1, &Value::Null, "paused")
+            .insert_run("r-unknown", &wf, 1, &Value::Null, "paused")
             .await
             .unwrap_err();
         assert!(err.to_string().contains("paused"), "{err}");

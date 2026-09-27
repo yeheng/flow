@@ -13,7 +13,7 @@ use flow_engine::{
     ChildRunLauncher, ChildRunOutcome, DbRunStatus, Definition, Engine, EngineError, RunPhase,
     StartRun,
 };
-use flow_store::Store;
+use flow_store::{Store, StoreError};
 use futures::future::BoxFuture;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -44,7 +44,14 @@ impl ChildRunLauncher for LocalChildLauncher {
             // 快照，run 钉死某一版）。绝不在重放路径重新解析 latest published——
             // 重启前发布的新版会让事件日志与元数据分叉，之后 resume_run 的身份
             // 校验判 LogCorrupted，run 永久不可恢复。
-            let existing = self.store.get_run(child_run_id).await.ok();
+            // 只有「行不存在」才走 fresh start；瞬时读错误必须原样暴露。
+            // 否则会误入 latest_published 分支——版本钉死不变量全靠 runs
+            // 主键兜底，错误也被吞成不透明的 Backend 失败
+            let existing = match self.store.get_run(child_run_id).await {
+                Ok(run) => Some(run),
+                Err(StoreError::RunNotFound(_)) => None,
+                Err(err) => return Err(EngineError::Backend(err.to_string())),
+            };
             let version = match &existing {
                 Some(run) => run.workflow_version,
                 None => self
@@ -105,7 +112,7 @@ impl ChildRunLauncher for LocalChildLauncher {
         cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<ChildRunOutcome, EngineError>> {
         Box::pin(async move {
-            let mut events = self.engine.subscribe();
+            let mut events = Some(self.engine.subscribe());
             loop {
                 let state = self.engine.snapshot(child_run_id).await?;
                 match state.phase {
@@ -150,18 +157,33 @@ impl ChildRunLauncher for LocalChildLauncher {
                         }
                     }
                 }
-                tokio::select! {
-                    _ = cancel.cancelled() => return Ok(ChildRunOutcome::Cancelled),
-                    // 兜底轮询：订阅 Lagged 或事件恰好落在订阅建立之前时不死等
-                    _ = tokio::time::sleep(AWAIT_POLL) => {}
-                    received = events.recv() => {
-                        match received {
-                            Ok(env) if env.run_id != child_run_id => continue,
-                            Ok(_) => {}
-                            // Lagged：丢事件没关系，下一轮 snapshot 是权威
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                tokio::time::sleep(AWAIT_POLL).await
+                // 等待窗口内只被「本 run 的事件」或兜底超时唤醒：无关 run 的每条
+                // 事件都触发一次全量 snapshot（整份 event.jsonl 读 + fold），
+                // 等待成本会随进程事件流量无界放大。结构与 PG 臂一致
+                //（flow-pg/src/child.rs）
+                let wait = tokio::time::sleep(AWAIT_POLL);
+                tokio::pin!(wait);
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Ok(ChildRunOutcome::Cancelled),
+                        _ = &mut wait => break,
+                        received = async {
+                            match events.as_mut() {
+                                Some(rx) => rx.recv().await,
+                                None => std::future::pending().await,
+                            }
+                        }, if events.is_some() => {
+                            match received {
+                                // 无关 run 的事件：继续等，不重查、不重置兜底计时
+                                Ok(env) if env.run_id != child_run_id => {}
+                                // 本 run 的事件：立刻重查状态
+                                Ok(_) => break,
+                                // Lagged：丢的是唤醒不是数据，下一轮 snapshot 是权威
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                // 引擎通道关闭：退化为纯兜底轮询
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                    events = None
+                                }
                             }
                         }
                     }

@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 use crate::child_run::{ChildRunLauncher, ChildRunOutcome, MAX_SUB_WORKFLOW_DEPTH};
 use crate::error::EngineError;
 use crate::expr;
-use crate::model::{Node, NodeType};
+use crate::model::{Node, NodeType, HTTP_METHODS};
 
 pub const DEFAULT_JS_TIMEOUT_MS: u64 = 2_000;
 pub const DEFAULT_HTTP_TIMEOUT_MS: u64 = 30_000;
@@ -295,6 +295,11 @@ async fn run_http(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
         .and_then(Value::as_str)
         .ok_or_else(|| NodeFailure::fatal("http_call 节点缺少 url 参数"))?
         .to_string();
+    // 定义层校验的是原始参数，${...} 模板展开后的 method 可能绕过白名单——
+    // 执行层按同一份 HTTP_METHODS 再验一次，两层共用一个词汇表
+    if !HTTP_METHODS.contains(&method_str.as_str()) {
+        return Err(NodeFailure::fatal(format!("非法 HTTP 方法：{method_str}")));
+    }
     let method = reqwest::Method::from_bytes(method_str.as_bytes())
         .map_err(|_| NodeFailure::fatal(format!("非法 HTTP 方法：{method_str}")))?;
 

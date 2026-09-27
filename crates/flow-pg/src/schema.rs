@@ -127,5 +127,40 @@ pub async fn init(pool: &PgPool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS schedules (
+            id TEXT PRIMARY KEY,
+            workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+            cron_expr TEXT NOT NULL,
+            input JSONB,
+            enabled BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // 去重表：同一 (schedule_id, fire_at) 只允许插入一次——多节点下谁先插入谁触发
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS schedule_fires (
+            schedule_id TEXT NOT NULL,
+            fire_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (schedule_id, fire_at)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS webhooks (
+            token TEXT PRIMARY KEY,
+            workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+            enabled BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+        )",
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
 }

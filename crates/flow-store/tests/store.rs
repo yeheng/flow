@@ -104,11 +104,17 @@ async fn unfinished_runs_drive_crash_recovery() {
         .await
         .unwrap();
     store
-        .set_run_status("run-done", "succeeded", Some(&json!({"ok": true})), None)
+        .set_run_status(
+            "run-done",
+            "succeeded",
+            Some(&json!({"ok": true})),
+            None,
+            None,
+        )
         .await
         .unwrap();
     store
-        .set_run_status("run-bad", "failed", None, Some("boom"))
+        .set_run_status("run-bad", "failed", None, Some("boom"), None)
         .await
         .unwrap_err(); // 未插入的 run 报错
 
@@ -192,22 +198,30 @@ async fn concurrent_saves_return_their_own_versions_and_deduplicate_identical_de
 #[tokio::test]
 async fn status_updates_clear_resolved_errors() {
     let (store, path) = store().await;
+    let w = store.create_workflow("w").await.unwrap();
+    store.update_workflow(&w, &def("a")).await.unwrap();
     store
-        .insert_run("r", "w", 1, &json!(null), "initializing")
+        .insert_run("r", &w, 1, &json!(null), "initializing")
         .await
         .unwrap();
     assert_eq!(store.unfinished_runs().await.unwrap().len(), 1);
     store
-        .set_run_status("r", "awaiting_resume", None, Some("needs adjudication"))
+        .set_run_status(
+            "r",
+            "awaiting_resume",
+            None,
+            Some("needs adjudication"),
+            None,
+        )
         .await
         .unwrap();
     store
-        .set_run_status("r", "running", None, None)
+        .set_run_status("r", "running", None, None, None)
         .await
         .unwrap();
     assert!(store.get_run("r").await.unwrap().error.is_none());
     store
-        .set_run_status("r", "succeeded", Some(&json!(7)), None)
+        .set_run_status("r", "succeeded", Some(&json!(7)), None, None)
         .await
         .unwrap();
     let row = store.get_run("r").await.unwrap();
@@ -215,4 +229,29 @@ async fn status_updates_clear_resolved_errors() {
     assert_eq!(row.output, Some(json!(7)));
     drop(store);
     std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+/// 删除工作流后版本随级联消失；insert_run 必须在写锁内验证版本存在——
+/// 否则 delete 的 COUNT 与 DELETE 之间能插进一个 run.start，造出引用已删
+/// 版本的孤儿 run（runs 表无外键，数据库不会拦）。修复前这里插入成功。
+#[tokio::test]
+async fn run_cannot_reference_deleted_workflow_version() {
+    let (store, path) = store().await;
+    let wf = store.create_workflow("孤儿").await.unwrap();
+    store.update_workflow(&wf, &def("a")).await.unwrap();
+    store.delete_workflow(&wf).await.unwrap();
+
+    let err = store
+        .insert_run("r-orphan", &wf, 1, &json!(null), "initializing")
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("版本不存在"),
+        "必须明确报版本缺失而不是插入孤儿：{err}"
+    );
+    // run 行确实没插进去
+    assert!(store.get_run("r-orphan").await.is_err());
+
+    drop(store);
+    std::fs::remove_dir_all(path.parent().unwrap()).ok();
 }

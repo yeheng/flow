@@ -91,7 +91,7 @@ async fn explicit_draft_is_rejected_and_historical_published_version_still_runs(
     assert!(f
         .backend
         .store()
-        .list_runs(None, 100)
+        .list_runs(None, None, None, 100)
         .await
         .unwrap()
         .is_empty());
@@ -402,4 +402,239 @@ async fn workflow_versions_lists_desc_and_unknown_workflow_is_not_found() {
         .call("workflow.versions", json!({"workflow_id": "nope"}))
         .await;
     assert_eq!(missing["error"]["code"], -32011);
+}
+
+// ---- 触发器：schedule / webhook 契约 ----
+
+#[tokio::test]
+async fn schedule_crud_and_next_fire_at() {
+    let f = Fixture::new().await;
+
+    // 非法 cron → -32010，不落库
+    let bad = f
+        .call(
+            "schedule.create",
+            json!({"workflow_id": f.workflow, "cron": "not a cron"}),
+        )
+        .await;
+    assert_eq!(bad["error"]["code"], -32010, "{bad}");
+    let bad = f
+        .call(
+            "schedule.create",
+            json!({"workflow_id": f.workflow, "cron": "* * * *"}),
+        )
+        .await;
+    assert_eq!(bad["error"]["code"], -32010, "{bad}");
+
+    // workflow 不存在 → -32011
+    let missing = f
+        .call(
+            "schedule.create",
+            json!({"workflow_id": "nope", "cron": "* * * * *"}),
+        )
+        .await;
+    assert_eq!(missing["error"]["code"], -32011, "{missing}");
+
+    // 创建：默认 enabled，next_fire_at 必须在 future
+    let ok = f
+        .call(
+            "schedule.create",
+            json!({"workflow_id": f.workflow, "cron": "*/5 * * * *", "input": {"k": 1}}),
+        )
+        .await;
+    let schedule = &ok["result"];
+    let id = schedule["id"].as_str().unwrap().to_string();
+    assert_eq!(schedule["workflow_id"], f.workflow, "{ok}");
+    assert_eq!(schedule["cron_expr"], "*/5 * * * *");
+    assert_eq!(schedule["input"], json!({"k": 1}));
+    assert_eq!(schedule["enabled"], true);
+    let next_fire_at = schedule["next_fire_at"].as_str().expect("next_fire_at");
+    let next = chrono::DateTime::parse_from_rfc3339(next_fire_at).unwrap();
+    assert!(next > chrono::Utc::now(), "next_fire_at 必须在未来：{next}");
+
+    // list：带 workflow_id 过滤 + next_fire_at
+    let list = f
+        .call("schedule.list", json!({"workflow_id": f.workflow}))
+        .await;
+    let schedules = list["result"]["schedules"].as_array().unwrap();
+    assert_eq!(schedules.len(), 1, "{list}");
+    assert!(schedules[0]["next_fire_at"].is_string());
+    let other = f.backend.store().create_workflow("other").await.unwrap();
+    let list = f.call("schedule.list", json!({"workflow_id": other})).await;
+    assert_eq!(list["result"]["schedules"].as_array().unwrap().len(), 0);
+
+    // update：cron 合法校验；input 缺省=不改
+    let bad = f
+        .call("schedule.update", json!({"id": id, "cron": "bogus"}))
+        .await;
+    assert_eq!(bad["error"]["code"], -32010, "{bad}");
+    let ok = f
+        .call(
+            "schedule.update",
+            json!({"id": id, "cron": "0 9 * * *", "enabled": false}),
+        )
+        .await;
+    assert_eq!(ok["result"]["updated"], true, "{ok}");
+    let list = f
+        .call("schedule.list", json!({"workflow_id": f.workflow}))
+        .await;
+    let s = &list["result"]["schedules"][0];
+    assert_eq!(s["cron_expr"], "0 9 * * *", "{list}");
+    assert_eq!(s["enabled"], false);
+    assert_eq!(s["input"], json!({"k": 1}), "input 缺省不动");
+
+    // input 显式 null = 清空
+    let ok = f
+        .call("schedule.update", json!({"id": id, "input": null}))
+        .await;
+    assert_eq!(ok["result"]["updated"], true);
+    let list = f
+        .call("schedule.list", json!({"workflow_id": f.workflow}))
+        .await;
+    assert!(list["result"]["schedules"][0]["input"].is_null(), "{list}");
+
+    // update/delete 不存在的 id → -32011
+    let missing = f
+        .call("schedule.update", json!({"id": "nope", "enabled": true}))
+        .await;
+    assert_eq!(missing["error"]["code"], -32011, "{missing}");
+    let missing = f.call("schedule.delete", json!({"id": "nope"})).await;
+    assert_eq!(missing["error"]["code"], -32011, "{missing}");
+
+    let ok = f.call("schedule.delete", json!({"id": id})).await;
+    assert_eq!(ok["result"]["deleted"], true);
+    let list = f
+        .call("schedule.list", json!({"workflow_id": f.workflow}))
+        .await;
+    assert_eq!(list["result"]["schedules"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn webhook_crud() {
+    let f = Fixture::new().await;
+
+    // workflow 不存在 → -32011
+    let missing = f
+        .call("webhook.create", json!({"workflow_id": "nope"}))
+        .await;
+    assert_eq!(missing["error"]["code"], -32011, "{missing}");
+
+    let ok = f
+        .call("webhook.create", json!({"workflow_id": f.workflow}))
+        .await;
+    let webhook = &ok["result"];
+    let token = webhook["token"].as_str().unwrap().to_string();
+    assert!(!token.is_empty(), "{ok}");
+    assert_eq!(webhook["workflow_id"], f.workflow);
+    assert_eq!(webhook["enabled"], true);
+
+    let list = f
+        .call("webhook.list", json!({"workflow_id": f.workflow}))
+        .await;
+    assert_eq!(list["result"]["webhooks"].as_array().unwrap().len(), 1);
+
+    // set_enabled
+    let ok = f
+        .call(
+            "webhook.set_enabled",
+            json!({"token": token, "enabled": false}),
+        )
+        .await;
+    assert_eq!(ok["result"]["updated"], true, "{ok}");
+    let list = f
+        .call("webhook.list", json!({"workflow_id": f.workflow}))
+        .await;
+    assert_eq!(list["result"]["webhooks"][0]["enabled"], false);
+    let missing = f
+        .call(
+            "webhook.set_enabled",
+            json!({"token": "nope", "enabled": true}),
+        )
+        .await;
+    assert_eq!(missing["error"]["code"], -32011, "{missing}");
+
+    // delete
+    let missing = f.call("webhook.delete", json!({"token": "nope"})).await;
+    assert_eq!(missing["error"]["code"], -32011, "{missing}");
+    let ok = f.call("webhook.delete", json!({"token": token})).await;
+    assert_eq!(ok["result"]["deleted"], true);
+    let list = f
+        .call("webhook.list", json!({"workflow_id": f.workflow}))
+        .await;
+    assert_eq!(list["result"]["webhooks"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn run_list_filters_by_status_and_paginates_by_cursor() {
+    let f = Fixture::new().await;
+    f.backend.store().publish(&f.workflow, 1).await.unwrap();
+
+    // 起 3 个 run 并等到终态（succeeded）
+    let mut runs = Vec::new();
+    for _ in 0..3 {
+        let resp = f
+            .call("run.start", json!({"workflow_id": f.workflow}))
+            .await;
+        let run_id = resp["result"]["run_id"].as_str().unwrap().to_string();
+        f.wait_finished(&run_id).await;
+        runs.push(run_id);
+    }
+
+    // status 过滤：succeeded 有 3 条，failed 为 0
+    let ok = f
+        .call(
+            "run.list",
+            json!({"workflow_id": f.workflow, "status": "succeeded"}),
+        )
+        .await;
+    assert_eq!(ok["result"]["runs"].as_array().unwrap().len(), 3, "{ok}");
+    let none = f
+        .call(
+            "run.list",
+            json!({"workflow_id": f.workflow, "status": "failed"}),
+        )
+        .await;
+    assert_eq!(none["result"]["runs"].as_array().unwrap().len(), 0);
+
+    // 非法 status → -32010
+    let bad = f.call("run.list", json!({"status": "bogus"})).await;
+    assert_eq!(bad["error"]["code"], -32010, "{bad}");
+
+    // 游标分页：limit=1 逐页翻，before_run_id 取上一页末尾
+    let page1 = f
+        .call(
+            "run.list",
+            json!({"workflow_id": f.workflow, "status": "succeeded", "limit": 1}),
+        )
+        .await;
+    let p1 = page1["result"]["runs"].as_array().unwrap();
+    assert_eq!(p1.len(), 1);
+    let cursor = p1[0]["id"].as_str().unwrap();
+    let page2 = f
+        .call(
+            "run.list",
+            json!({"workflow_id": f.workflow, "status": "succeeded", "limit": 1, "before_run_id": cursor}),
+        )
+        .await;
+    let p2 = page2["result"]["runs"].as_array().unwrap();
+    assert_eq!(p2.len(), 1, "{page2}");
+    assert_ne!(p2[0]["id"], cursor, "第二页必须更旧");
+    let page3 = f
+        .call(
+            "run.list",
+            json!({"workflow_id": f.workflow, "status": "succeeded", "limit": 1, "before_run_id": p2[0]["id"]}),
+        )
+        .await;
+    assert_eq!(page3["result"]["runs"].as_array().unwrap().len(), 1);
+    let page4 = f
+        .call(
+            "run.list",
+            json!({"workflow_id": f.workflow, "status": "succeeded", "limit": 1, "before_run_id": page3["result"]["runs"][0]["id"]}),
+        )
+        .await;
+    assert_eq!(
+        page4["result"]["runs"].as_array().unwrap().len(),
+        0,
+        "翻到头应为空"
+    );
 }

@@ -25,6 +25,8 @@ impl ServerProc {
             .env("FLOW_DATA_DIR", &data_dir)
             .env("FLOW_DB", &db)
             .env("FLOW_ADDR", addr.to_string())
+            // flow-server 现在还会绑 webhook HTTP 端口；多进程并发测试必须各占一个
+            .env("FLOW_HTTP_ADDR", free_port().to_string())
             .env("RUST_LOG", "info")
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())

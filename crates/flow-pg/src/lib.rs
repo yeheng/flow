@@ -36,6 +36,11 @@ pub const EVENTS_CHANNEL: &str = "flow_events";
 /// 事件通知流（§8 的低延迟提示）：任意 run 提交事件后产出其 run_id。
 /// 返回前已完成 LISTEN，调用方随后产生的事件必然可达；
 /// 连接中断自动退避重连，断开期间的通知由消费方的兜底轮询兜住。
+///
+/// **注意（sqlx 0.9 实测）**：`PgListener` 终身占用池里 acquired 的一个连接，
+/// drop 返回的 Receiver **不会**归还它——后台任务只在收到下一条通知时退出。
+/// 每个订阅一条监听会耗尽连接池。进程内应复用唯一的共享轮询器
+///（[`subscribe::EventHub`]/`subscribe_events`），不要按订阅开监听。
 pub async fn event_notifications(
     pool: &PgPool,
 ) -> Result<tokio::sync::mpsc::Receiver<String>, PgError> {

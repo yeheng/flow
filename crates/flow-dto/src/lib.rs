@@ -87,6 +87,26 @@ pub struct WorkflowSummary {
     pub created_at: DateTime<Utc>,
 }
 
+/// cron 定时调度（schedules 表）。cron_expr 是标准 5 字段（分 时 日 月 周），本地时间。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Schedule {
+    pub id: String,
+    pub workflow_id: String,
+    pub cron_expr: String,
+    pub input: Option<Value>,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+/// webhook 触发器（webhooks 表，token 即主键，随机生成不可猜）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Webhook {
+    pub token: String,
+    pub workflow_id: String,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRecord {
     pub id: String,
