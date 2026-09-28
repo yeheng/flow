@@ -574,19 +574,32 @@ impl PgStore {
     /// 订阅轮询的候选 run（§8）：活跃 run + 最近 ended_at 窗口内终结的 run。
     /// 短 run 可能在两次轮询之间走完一生，只有按 ended_at 回看最近窗口才不漏其终态；
     /// 窗口过后自动退出视野，订阅游标随之回收——不需要单独的去重集合。
-    /// LIMIT 256 是有界性权衡：活跃 run 超过 256 时按 started_at 取最早的，
-    /// 最新 run 可能延迟若干轮才进入订阅候选（DISTRIBUTED.md §8）。
     /// 返回 (run_id, 是否已终结)。
+    ///
+    /// 两个集合各有自己的 LIMIT 256 配额，互不挤占（backend-perf 的
+    /// subscribe_latency 实测钉住的坑）：若共用一个 `ORDER BY started_at` 的
+    /// 限额，30s 回看窗口里的老 run（刚批量终结的）会把名额占满，**新 run 一个
+    /// 都进不了扫描**——它的事件不被任何游标追平，订阅端要等老 run 退出窗口
+    /// （最多 30s）才恢复推送，p95 从亚秒劣化到 ~25s。所以：活跃集合永远优先
+    /// （还有活跃 run 时终态补漏不得占其名额），ended 集合单独限额且优先最近
+    /// 终结的（最可能漏终态的）。残余风险只剩「同时活跃超过 256 个」：那批最
+    /// 新 run 由下一轮扫描接住，且已有游标的 run 由 scan 的「视野 ∪ 游标」
+    /// 并集兜住，不受本查询限额影响。
     pub async fn watch_candidates(
         &self,
         ended_within: Duration,
     ) -> Result<Vec<(String, bool)>, PgError> {
         let rows = sqlx::query(
-            "SELECT id, status FROM runs
-             WHERE status = ANY($2)
-                OR ended_at >= clock_timestamp() - make_interval(secs => $1)
-             ORDER BY started_at ASC
-             LIMIT 256",
+            "(SELECT id, status FROM runs
+               WHERE status = ANY($2)
+               ORDER BY started_at ASC
+               LIMIT 256)
+             UNION ALL
+             (SELECT id, status FROM runs
+               WHERE NOT (status = ANY($2))
+                 AND ended_at >= clock_timestamp() - make_interval(secs => $1)
+               ORDER BY ended_at DESC
+               LIMIT 256)",
         )
         .bind(ended_within.as_secs_f64())
         .bind(&STATUS_ACTIVE[..])

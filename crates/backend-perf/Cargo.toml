@@ -14,6 +14,12 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
+# 二进制叫 flow-perf：自举服务模式（FLOW_PERF_SERVE=1）下它就是被测进程，
+# 名字与 flow-server 同族，进程表里一眼能认出哪个是被测端。
+[[bin]]
+name = "flow-perf"
+path = "src/main.rs"
+
 [dependencies]
 tokio = { workspace = true }
 futures = { workspace = true }

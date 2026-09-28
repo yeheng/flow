@@ -77,6 +77,12 @@ impl Store {
             .filename(path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
+            // 写锁等待上限：run.start 的 insert_run 走 BEGIN IMMEDIATE，高并发
+            // 下写锁排队会超过 sqlx 默认的 5s，表现为 run.start 报
+            // `database is locked`（SQLITE_BUSY）。显式放大到 30s 的取值逻辑是
+            // 「排队而不是失败」——SQLite 是单写者，等待时间本身就是写入吞吐
+            // 的物理上限；压测实测见 backend-perf 的 submit_errors 计数器。
+            .busy_timeout(std::time::Duration::from_secs(30))
             .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(8)
@@ -663,6 +669,9 @@ impl Store {
     /// delete_workflow 的事务互斥，杜绝「版本已删、run 行照样插入」的竞态
     ///（runs 表无外键，数据库不会替我们拦）。
     /// source/source_detail 是触发来源归因（DbRunSource 词汇表）。
+    // 参数就是 runs 表的一行（七列 + 自增主键），拆 struct 只是把列清单搬家；
+    // 调用点多在测试里逐行铺开，保持位置参数可读性更好。
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_run(
         &self,
         run_id: &str,

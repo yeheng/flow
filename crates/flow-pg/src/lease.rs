@@ -130,21 +130,20 @@ pub async fn acquire(
     if !free {
         return Ok(AcquireOutcome::NotEligible("租约仍被有效持有".into()));
     }
-    sqlx::query(
+    // UPDATE ... RETURNING 一把拿回递增后的 epoch：行锁（lock_run_row）已持
+    // 有至提交，WHERE 命中的就是刚校验过的同一行，无需再补一条 SELECT。
+    let epoch: i64 = sqlx::query_scalar(
         "UPDATE runs
          SET lease_owner = $1, lease_epoch = lease_epoch + 1,
              lease_expires_at = clock_timestamp() + make_interval(secs => $2)
-         WHERE id = $3",
+         WHERE id = $3
+         RETURNING lease_epoch",
     )
     .bind(instance_id)
     .bind(ttl.as_secs_f64())
     .bind(run_id)
-    .execute(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
-    let epoch: i64 = sqlx::query_scalar("SELECT lease_epoch FROM runs WHERE id = $1")
-        .bind(run_id)
-        .fetch_one(&mut *tx)
-        .await?;
     tx.commit().await?;
     Ok(AcquireOutcome::Acquired { epoch })
 }

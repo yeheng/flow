@@ -2,16 +2,18 @@
 //! 把共享日志的增量扇出给所有本地订阅者——查询次数与订阅者数无关。
 //!
 //! 正确性不依赖 LISTEN/NOTIFY：通知只是低延迟唤醒提示，丢失由 subscribe_poll
-//! 兜底轮询兜住。游标的生命周期与候选视野绑定：
+//! 兜底轮询兜住。唤醒分两条路径：NOTIFY 载荷带 run_id，只定向抓取被点名的
+//! run（突发事件按 run 合并成一次读取）；兜底轮询到期才全量扫描候选视野，
+//! 兼顾游标回收与「可能丢失通知的短生命周期 run」。游标的生命周期与候选视野绑定：
 //! - 终态事件已转发（或状态投影已终结且日志追平）的 run 标记 done，不再查询；
 //! - done 游标保留到该 run 退出候选视野（ended_at 回看窗口过期）后随 GC 移除。
 //!
 //! 这既挡住了窗口期内重复查询导致的全量重放，又保证游标集合随 run 生命周期
 //! 自清理——不需要「已处理集合超阈值整体清空」这种补丁。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -94,28 +96,42 @@ async fn poll_loop(
         }
     };
     let mut cursors: HashMap<String, Cursor> = HashMap::new();
+    // 首轮全量扫描建立游标视野；之后 NOTIFY 只定向抓取被点名的 run，
+    // 兜底轮询到期才再做全量扫描（捕捉可能丢失通知的短生命周期 run）。
+    scan_candidates(&store, &tx, &mut cursors, window).await;
+    // 兜底全量扫描的到期点按「距上次全量扫描多久」计算，不被 NOTIFY 唤醒
+    // 重置：持续事件流下每次唤醒都重置定时器，会饿死兜底扫描（游标回收、
+    // done 标记、漏通知追平全靠它）。
+    let mut last_full_scan = Instant::now();
     loop {
         if stop.is_cancelled() {
             break;
         }
-        scan(&store, &tx, &mut cursors, window).await;
-        // 等待下一次扫描：NOTIFY 唤醒（快路径）或兜底轮询到期。
-        // 通知在扫描期间积压在 channel 里，不会丢失唤醒。
-        let wait = tokio::time::sleep(cfg.subscribe_poll);
+        let until_full = cfg.subscribe_poll.saturating_sub(last_full_scan.elapsed());
+        let wait = tokio::time::sleep(until_full);
         tokio::pin!(wait);
+        let mut full_scan_due = false;
         loop {
             tokio::select! {
                 _ = stop.cancelled() => return,
-                _ = &mut wait => break,
+                _ = &mut wait => {
+                    // 兜底全量扫描：通知丢失/未开启时按候选视野追平
+                    full_scan_due = true;
+                    break;
+                }
                 note = async { notify.as_mut().unwrap().recv().await }, if notify.is_some() => {
                     match note {
-                        Some(_) => {
-                            // 排空积压通知再扫描：突发事件合并成一次扫描，
-                            // 避免扫描次数随事件数线性增长
+                        Some(run_id) => {
+                            // 定向抓取：只读 NOTIFY 点名的 run，顺带排空通道积压
+                            // （突发事件同一 run 的多个通知合并成一次读取）
+                            let mut ids = HashSet::new();
+                            ids.insert(run_id);
                             if let Some(rx) = notify.as_mut() {
-                                while rx.try_recv().is_ok() {}
+                                while let Ok(more) = rx.try_recv() {
+                                    ids.insert(more);
+                                }
                             }
-                            break;
+                            scan_targeted(&store, &tx, &mut cursors, &ids).await;
                         }
                         // 监听任务退出：摘掉监听臂，退化为纯兜底轮询
                         None => notify = None,
@@ -123,11 +139,48 @@ async fn poll_loop(
                 }
             }
         }
+        if full_scan_due {
+            scan_candidates(&store, &tx, &mut cursors, window).await;
+            last_full_scan = Instant::now();
+        }
     }
 }
 
-/// 一轮扫描：把候选 run 的日志增量按游标转发出去，然后回收退出视野的游标。
-async fn scan(
+/// 一次定向抓取：只读取通知涉及的 run 的日志增量（NOTIFY 快路径）。
+/// 没有候选视野表可查，不套用「状态投影已终结且追平」的 done 捷径——
+/// 被通知才读，查询次数由事件数决定；done 标记与游标回收留给全量扫描。
+async fn scan_targeted(
+    store: &PgStore,
+    tx: &broadcast::Sender<Envelope>,
+    cursors: &mut HashMap<String, Cursor>,
+    run_ids: &HashSet<String>,
+) {
+    for id in run_ids {
+        let cursor = cursors.entry(id.clone()).or_default();
+        if cursor.done {
+            continue;
+        }
+        let events =
+            match PgRunSink::read_events(store.pool(), id, Some(cursor.last_seq + 1)).await {
+                Ok(events) => events,
+                Err(err) => {
+                    tracing::debug!(run_id = %id, error = %err, "订阅增量读取失败，下轮重试");
+                    continue;
+                }
+            };
+        for envelope in events {
+            // 没有本地订阅者时 send 返回 Err，游标照常推进
+            let _ = tx.send(envelope.clone());
+            cursor.last_seq = envelope.seq;
+            if envelope.event.is_run_terminal() {
+                cursor.done = true;
+            }
+        }
+    }
+}
+
+/// 一轮全量扫描：把候选 run 的日志增量按游标转发出去，然后回收退出视野的游标。
+async fn scan_candidates(
     store: &PgStore,
     tx: &broadcast::Sender<Envelope>,
     cursors: &mut HashMap<String, Cursor>,

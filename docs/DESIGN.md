@@ -582,6 +582,21 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
   模板、sub_workflow（透传/失败传导/取消级联/深度上限）、schedule 真触发与
   webhook HTTP 全分支、订阅（回放/增量/未知 run 即结束）、SIGKILL 恢复与
   人工裁决、错误码映射。入口：`cargo test -p backend-e2e`。
+- **backend-perf（`crates/backend-perf`）**：后端性能压测 harness（黑盒，真起
+  被测进程，双后端矩阵）。与 backend-e2e 分工：e2e 钉行为契约，这里量性能。
+  被测进程是 `flow-perf` 二进制的自举服务模式（`FLOW_PERF_SERVE=1` →
+  `flow_rpc::run_from_env`，与 flow-server 逐字同一份实现）；存储上下文复用
+  backend-e2e 的 harness（独占临时目录 / docker 测试库、SIGKILL、panic 路径
+  清理）。四个场景：run 执行吞吐（chain/fanout 两形态，完成检测走订阅流，
+  测量本身不给读路径加压）、RPC 读路径延迟（run.get/list/stats/timeline/
+  events 轮转交错）、订阅推送延迟（run.start 返回 → 事件到达）、崩溃恢复
+  耗时（空存储重启基线 vs 停驻 N 个 human_task run 的重启，差值即恢复代价，
+  附恢复后推进耗时）。「并发 N」= 同时在飞 N 个 run（提交侧限流，k6 的 VU
+  模型），被测进程的 FLOW_MAX_RUNS 随之放大；提交失败（如 SQLite 高并发
+  `database is locked`）不炸进程，计入 `submit_errors` 计数器。报告为最近秩
+  分位数（p50/p90/p95/p99）文本 + 可选 JSON（`--json`）。默认轻量回归规模
+  （数分钟）；`--runs/--concurrency/--prefill/--iterations` 放大做重负载。
+  入口：`cargo run -p backend-perf -- --help`。
 
 ## 14. 未做
 
