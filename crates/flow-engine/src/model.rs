@@ -50,6 +50,21 @@ impl NodeType {
     pub fn has_side_effect(self) -> bool {
         matches!(self, NodeType::HttpCall)
     }
+
+    /// 该类型 params 中**不可**被 `${}` 模板展开的「代码承载字段」。
+    ///
+    /// `script.code` / `condition.expr` 是用户 JS：其中的 `${}` 是 JS 模板
+    /// 字面量，不是 flow 模板，展开会破坏用户代码。其余参数一律在执行前
+    /// 统一展开（与 http_call 同一份 `expr::expand_templates`，DESIGN §10）。
+    /// 词汇表只有这一处：新增类型时编译器不逼你，但执行层的默认行为
+    /// （全展开）对纯参数类型就是正确的。
+    pub fn opaque_params(self) -> &'static [&'static str] {
+        match self {
+            NodeType::Script => &["code"],
+            NodeType::Condition => &["expr"],
+            _ => &[],
+        }
+    }
 }
 
 /// http_call 允许的方法。validate 与前端能力清单（nodetypes.list）共用这一份，
@@ -332,6 +347,9 @@ fn validate_params(node: &Node, kind: NodeType) -> Result<(), String> {
                 Some(method) if method.trim().is_empty() => {
                     return Err(format!("节点 {} 的 method 不能为空", node.id));
                 }
+                // ${} 模板 method 执行期展开后才能判定，放行；执行层按同一份
+                // HTTP_METHODS 再验一次（exec::run_http），两层共用一个词汇表
+                Some(method) if method.contains("${") => {}
                 Some(method) if !HTTP_METHODS.contains(&method.trim().to_uppercase().as_str()) => {
                     return Err(format!(
                         "节点 {} 的 method 非法：{method:?}（允许 {}）",
@@ -345,9 +363,24 @@ fn validate_params(node: &Node, kind: NodeType) -> Result<(), String> {
         }
         NodeType::Delay => match node.param_u64("ms") {
             Some(_) => Ok(()),
+            // ${} 模板要在执行期展开后才可判定：放行，运行期 parse
+            // （裸数字字符串仍拒绝——一种参数一种形态，不留灰色地带）
+            None if node.param_str("ms").is_some_and(|s| s.contains("${")) => Ok(()),
             None => Err(format!("节点 {}（delay）缺少参数 ms", node.id)),
         },
-        NodeType::SubWorkflow => need_str("workflow_id"),
+        NodeType::SubWorkflow => {
+            need_str("workflow_id")?;
+            // input_mapping 省略 = 沿用旧语义（父 run 输入快照，DESIGN §6.8）
+            match node.params.get("input_mapping") {
+                None | Some(serde_json::Value::Null) => Ok(()),
+                Some(serde_json::Value::Object(_)) => Ok(()),
+                Some(serde_json::Value::String(s)) if !s.trim().is_empty() => Ok(()),
+                Some(_) => Err(format!(
+                    "节点 {}（sub_workflow）的 input_mapping 必须是对象或 ${{}} 模板字符串",
+                    node.id
+                )),
+            }
+        }
         NodeType::Start | NodeType::End | NodeType::HumanTask => Ok(()),
     }
 }
@@ -668,6 +701,57 @@ mod tests {
             );
             assert!(d.validate().is_err(), "{method:?} 应被拒绝");
         }
+    }
+
+    /// `${}` 模板参数在建图期放行、执行期判定（DESIGN §5 规则 1、§10）：
+    /// 模板 ms / 模板 method 通过；裸数字串、标量 mapping 仍被拒绝。
+    #[test]
+    fn template_params_pass_validation_while_ambiguous_forms_are_rejected() {
+        fn check(kind: &str, params: Value) -> Result<(), String> {
+            let d = def(
+                vec![
+                    node("s", "start"),
+                    json!({"id": "n", "type": kind, "params": params}),
+                    node("e", "end"),
+                ],
+                vec![json!({"from":"s","to":"n"}), json!({"from":"n","to":"e"})],
+            );
+            d.validate()
+        }
+
+        assert!(check("delay", json!({"ms": "${input.tick}"})).is_ok());
+        assert!(
+            check("delay", json!({"ms": "5000"})).is_err(),
+            "裸数字串不留灰色地带"
+        );
+        assert!(check("delay", json!({"ms": "soon"})).is_err());
+        assert!(check(
+            "http_call",
+            json!({"url": "http://x", "method": "${input.m}"})
+        )
+        .is_ok());
+
+        // input_mapping：对象 / 非空模板串放行，其余拒绝
+        assert!(check(
+            "sub_workflow",
+            json!({"workflow_id": "c", "input_mapping": {"a": "${input.x}"}})
+        )
+        .is_ok());
+        assert!(check(
+            "sub_workflow",
+            json!({"workflow_id": "c", "input_mapping": "${nodes.n1}"})
+        )
+        .is_ok());
+        assert!(check(
+            "sub_workflow",
+            json!({"workflow_id": "c", "input_mapping": 7})
+        )
+        .is_err());
+        assert!(check(
+            "sub_workflow",
+            json!({"workflow_id": "c", "input_mapping": ""})
+        )
+        .is_err());
     }
 
     #[test]

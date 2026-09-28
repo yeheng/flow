@@ -60,6 +60,7 @@ impl From<EngineError> for NodeFailure {
     }
 }
 
+#[derive(Clone)]
 pub struct NodeExecContext {
     pub node: Node,
     pub input: Value,
@@ -72,19 +73,96 @@ pub struct NodeExecContext {
     pub child: Option<ChildRunSpec>,
 }
 
+#[derive(Clone)]
 pub struct ChildRunSpec {
     pub child_run_id: String,
     pub launcher: Arc<dyn ChildRunLauncher>,
 }
 
+/// 前驱输出 → `nodes` 输入面（决定论快照，DESIGN §6、§10）。
+fn outputs_value(outputs: &HashMap<String, Value>) -> Value {
+    Value::Object(
+        outputs
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<Map<String, Value>>(),
+    )
+}
+
+/// params 里是否存在待展开的 `${`。决定论快速路径：无模板的节点原样
+/// 返回，不为展开付一次 JS 运行时的成本。
+fn contains_template(value: &Value) -> bool {
+    match value {
+        Value::String(s) => s.contains("${"),
+        Value::Array(items) => items.iter().any(contains_template),
+        Value::Object(map) => map.values().any(contains_template),
+        _ => false,
+    }
+}
+
+/// 执行前统一展开节点 params 的 `${}` 模板。返回 `None` 表示无模板、
+/// 调用方直接沿用原 node（零克隆）。
+///
+/// 规则只有一条：除 `NodeType::opaque_params`（script.code / condition.expr
+/// 等用户 JS 字段，其中的 `${}` 是 JS 模板字面量而非 flow 模板）外全部展开，
+/// 与 http_call 历来共用 `expr::expand_templates`。展开的数据面与 script 的
+/// `nodes` 完全一致——只读 run 输入与直接前驱输出快照，不扩大决定论边界。
+async fn expand_params(
+    node: &Node,
+    input: &Value,
+    outputs: &HashMap<String, Value>,
+) -> Result<Option<Node>, NodeFailure> {
+    if !contains_template(&node.params) {
+        return Ok(None);
+    }
+    // 代码字段整体摘出、展开后原样放回：字节级不动
+    let mut params = node.params.clone();
+    let mut opaque: Vec<(String, Value)> = Vec::new();
+    if let Value::Object(ref mut map) = params {
+        for key in node.kind().map(NodeType::opaque_params).unwrap_or(&[]) {
+            if let Some(value) = map.remove(*key) {
+                opaque.push(((*key).to_string(), value));
+            }
+        }
+    }
+    if !contains_template(&params) {
+        // 模板只出现在代码字段里：还原后原样返回
+        if let Value::Object(ref mut map) = params {
+            map.extend(opaque);
+        }
+        return Ok(None);
+    }
+    let nodes = outputs_value(outputs);
+    let expanded = tokio::task::spawn_blocking({
+        let params = params.clone();
+        let input = input.clone();
+        move || {
+            expr::expand_templates(
+                &params,
+                &input,
+                &nodes,
+                // 展开恒用默认脚本超时：timeout_ms 在各类型上只表示该类型
+                // 自己的执行超时（http_call 的 HTTP 超时等），不承担第二语义
+                Duration::from_millis(DEFAULT_JS_TIMEOUT_MS),
+            )
+        }
+    })
+    .await
+    .map_err(|e| NodeFailure::fatal(format!("参数展开任务异常：{e}")))?
+    .map_err(NodeFailure::from)?;
+    let mut expanded = expanded;
+    if let Value::Object(ref mut map) = expanded {
+        map.extend(opaque);
+    }
+    Ok(Some(Node {
+        params: expanded,
+        ..node.clone()
+    }))
+}
+
 impl NodeExecContext {
     fn nodes_value(&self) -> Value {
-        Value::Object(
-            self.outputs
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect::<Map<String, Value>>(),
-        )
+        outputs_value(&self.outputs)
     }
 
     fn js_timeout(&self) -> Duration {
@@ -105,6 +183,26 @@ pub async fn execute(
         .kind()
         .ok_or_else(|| NodeFailure::fatal(format!("未知节点类型：{}", ctx.node.node_type)))?;
 
+    // 统一参数展开（DESIGN §10）：除代码承载字段外，所有节点 params 在
+    // 执行前过同一份 ${} 模板展开。无模板时零成本原路返回（expand_params）。
+    // http_call 只是这条规则的第一个用户，不是特权户。
+    match expand_params(&ctx.node, &ctx.input, &ctx.outputs).await? {
+        Some(node) => {
+            let owned = NodeExecContext {
+                node,
+                ..ctx.clone()
+            };
+            dispatch(kind, &owned, cancel).await
+        }
+        None => dispatch(kind, ctx, cancel).await,
+    }
+}
+
+async fn dispatch(
+    kind: NodeType,
+    ctx: &NodeExecContext,
+    cancel: &CancellationToken,
+) -> Result<Value, NodeFailure> {
     match kind {
         NodeType::Start => Ok(ctx.input.clone()),
         NodeType::End => Ok(collect_end_output(ctx)),
@@ -139,13 +237,20 @@ async fn run_sub_workflow(
             "子工作流嵌套超过 {MAX_SUB_WORKFLOW_DEPTH} 层（疑似循环引用）"
         )));
     }
-    // 子 run 输入 = 父 run 输入快照
+    // 子 run 输入：input_mapping（执行前已展开）优先；缺省时保持旧语义
+    // ——父 run 输入快照（DESIGN §6.8，存量定义零行为变化）。
+    // 映射的结果整体作为子 run 输入，不是与父输入合并。
+    let child_input = match ctx.node.params.get("input_mapping") {
+        Some(mapped) if !mapped.is_null() => mapped.clone(),
+        _ => ctx.input.clone(),
+    };
+    // 子 run 输入 = 父 run 输入快照（或 input_mapping 展开结果）
     match child
         .launcher
         .start(
             &child.child_run_id,
             &workflow_id,
-            ctx.input.clone(),
+            child_input,
             ctx.depth + 1,
         )
         .await
@@ -259,31 +364,34 @@ async fn run_delay(
     ctx: &NodeExecContext,
     cancel: &CancellationToken,
 ) -> Result<Value, NodeFailure> {
-    let ms = ctx
-        .node
-        .param_u64("ms")
-        .ok_or_else(|| NodeFailure::fatal("delay 节点缺少 ms 参数"))?;
+    let ms = parse_ms(&ctx.node)?;
     tokio::select! {
         _ = cancel.cancelled() => Err(NodeFailure::fatal("已取消")),
         _ = tokio::time::sleep(Duration::from_millis(ms)) => Ok(serde_json::json!({ "slept_ms": ms })),
     }
 }
 
+/// delay 的 ms：数字，或 `${}` 模板展开出的数字串（展开是字符串插值语义，
+/// 标量结果被 JSON.stringify 成字符串，DESIGN §10）。裸数字串（无模板）在建图
+/// 校验期已被拒绝，这里只兜展开产物。
+fn parse_ms(node: &Node) -> Result<u64, NodeFailure> {
+    if let Some(ms) = node.param_u64("ms") {
+        return Ok(ms);
+    }
+    match node.param_str("ms") {
+        Some(s) => s
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| NodeFailure::fatal(format!("delay 参数 ms 展开后不是非负整数：{s:?}"))),
+        None => Err(NodeFailure::fatal("delay 节点缺少 ms 参数")),
+    }
+}
+
 static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
 
 async fn run_http(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
-    let input = ctx.input.clone();
-    let nodes = ctx.nodes_value();
-    // timeout_ms 在 http_call 上只表示 HTTP 超时（见 nodetypes 清单）；
-    // 模板展开的 JS 超时与它无关，固定用默认脚本超时——一个参数不承担两个语义
-    let timeout = Duration::from_millis(DEFAULT_JS_TIMEOUT_MS);
-    let params = ctx.node.params.clone();
-    let expanded = tokio::task::spawn_blocking(move || {
-        expr::expand_templates(&params, &input, &nodes, timeout)
-    })
-    .await
-    .map_err(|e| NodeFailure::fatal(format!("参数展开任务异常：{e}")))?
-    .map_err(NodeFailure::from)?;
+    // params 已在 execute 统一展开（DESIGN §10）——此处直接读展开结果
+    let expanded = &ctx.node.params;
 
     let method_str = expanded
         .get("method")
@@ -405,6 +513,130 @@ mod tests {
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_util::sync::CancellationToken;
+
+    fn node(node_type: &str, params: Value) -> Node {
+        Node {
+            id: "n".into(),
+            node_type: node_type.into(),
+            name: String::new(),
+            position: None,
+            params,
+        }
+    }
+
+    fn ctx(node: Node, input: Value, outputs: HashMap<String, Value>) -> NodeExecContext {
+        NodeExecContext {
+            node,
+            input,
+            outputs,
+            preds: vec![],
+            depth: 0,
+            child: None,
+        }
+    }
+
+    /// 统一参数展开（DESIGN §10）：无模板零成本（None）；有模板则按类型展开。
+    #[tokio::test]
+    async fn expand_params_applies_outside_code_fields_only() {
+        // 无模板：None，调用方零克隆沿用原 node
+        let plain = node("delay", json!({"ms": 5}));
+        assert!(expand_params(&plain, &json!({}), &HashMap::new())
+            .await
+            .unwrap()
+            .is_none());
+
+        // delay 的 ms 走模板：整值规则保留数字类型
+        let delay = node("delay", json!({"ms": "${input.amount * 10}"}));
+        let expanded = expand_params(&delay, &json!({"amount": 5}), &HashMap::new())
+            .await
+            .unwrap()
+            .expect("有模板应返回展开后的 node");
+        assert_eq!(expanded.params["ms"], json!(50));
+
+        // script.code 是 opaque：含 JS 模板字面量也不展开（None = 原样）
+        let script = node(
+            "script",
+            json!({"code": "return `${input.amount}`;", "note": "${input.amount}"}),
+        );
+        let expanded = expand_params(&script, &json!({"amount": 5}), &HashMap::new())
+            .await
+            .unwrap()
+            .expect("note 有模板应返回展开后的 node");
+        assert_eq!(
+            expanded.params["code"],
+            json!("return `${input.amount}`;"),
+            "code 必须字节级不动"
+        );
+        // 整值模板保留类型：数字 5 不再是字符串 "5"
+        assert_eq!(expanded.params["note"], json!(5));
+
+        // 只读直接前驱快照：引用非前驱节点 = 属性访问抛错进 fatal
+        // （与 script 节点同一条决定论边界，DESIGN §10）
+        let http = node("http_call", json!({"url": "http://x/${nodes.n1.hit}"}));
+        let err = expand_params(&http, &json!({}), &HashMap::new())
+            .await
+            .unwrap_err();
+        assert!(!err.retryable, "{}", err.message);
+        assert!(err.message.contains("表达式求值失败"), "{}", err.message);
+    }
+
+    /// delay 的 ms 接受模板产物；执行路径端到端（展开 → parse → sleep）。
+    #[tokio::test]
+    async fn delay_ms_template_drives_the_sleep() {
+        let ok = node("delay", json!({"ms": "${input.tick}"}));
+        let out = execute(
+            &ctx(ok, json!({"tick": 40}), HashMap::new()),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, json!({"slept_ms": 40}));
+
+        // 展开产物不是整数：fatal，不猜
+        let bad = node("delay", json!({"ms": "${input.tick}"}));
+        let err = execute(
+            &ctx(bad, json!({"tick": "soon"}), HashMap::new()),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(!err.retryable, "参数错误不可重试：{}", err.message);
+        assert!(err.message.contains("非负整数"), "{}", err.message);
+    }
+
+    /// http_call 的 url 模板经统一入口展开后再发请求（回归：run_http 不再
+    /// 自己展开，双展开必须不改变行为）。
+    #[tokio::test]
+    async fn http_url_template_is_expanded_before_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let n = sock.read(&mut buf).await.unwrap();
+            *seen2.lock().await = String::from_utf8_lossy(&buf[..n]).to_string();
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n{\"ok\":1}")
+                .await
+                .unwrap();
+        });
+
+        let node = node(
+            "http_call",
+            json!({"url": format!("http://{addr}/items/${{input.order_id}}")}),
+        );
+        let out = execute(
+            &ctx(node, json!({"order_id": "o-9"}), HashMap::new()),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["status"], json!(200));
+        assert_eq!(out["body"], json!({"ok": 1}));
+        let request = seen.lock().await.clone();
+        assert!(request.starts_with("GET /items/o-9 "), "{request}");
+    }
 
     #[test]
     fn json_truthiness_matches_javascript() {

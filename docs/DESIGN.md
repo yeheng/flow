@@ -181,6 +181,9 @@ Event 流 ──fold──> RunState {
    （script: `code`，condition: `expr`，delay: `ms`，http_call: `url`，
    sub_workflow: `workflow_id`；method 若给出必须属于 `HTTP_METHODS`——该白名单
    与 `nodetypes.list` 共用一份，拼写错误在发布时被拒而不是运行时炸 run）；
+   `${}` 模板参数（如 `ms: "${input.delay}"`、模板 method）放行到执行期判定，
+   裸数字串等灰色形态仍拒绝；sub_workflow 的 `input_mapping` 若给出必须是
+   对象或非空模板串；
 2. 恰好一个 `start`，至少一个 `end`；
 3. start 无入边，end 无出边，其余节点必须有入边（否则永不触发）；
 4. 边端点存在、无自环、无重复边；**condition 出边必须带 `true`/`false` 端口，
@@ -293,8 +296,11 @@ Driver 退出时显式 abort 剩余任务。内部错误若无法写入 `run_fai
 
 ### 6.8 子工作流（sub_workflow）
 
-sub_workflow 节点以目标工作流的**最新已发布版本**启动一个子 run，输入为父 run
-的输入快照，子 run 输出透传为本节点输出。父子 run 是两条完全独立的事件日志，
+sub_workflow 节点以目标工作流的**最新已发布版本**启动一个子 run，子 run
+输出透传为本节点输出。子 run 输入的缺省语义是父 run 的输入快照；节点 params
+带 `input_mapping`（对象模板，值支持 `${input.x}` / `${nodes.n.y}`）时，其**展开
+结果整体作为**子 run 输入——上游算出来的数据由此进入子流程（无 mapping 的存量
+定义行为零变化）。父子 run 是两条完全独立的事件日志，
 各自走自己的恢复与终态协议。Driver 拿不到引擎句柄（DriverSpec 只有
 run_id/definition/input），启动/等待/取消经 `ChildRunLauncher` trait
 （`child_run.rs`）抽象：单机 `LocalChildLauncher` 同进程复用 Engine，
@@ -551,17 +557,35 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
 
 - `eval_body`：script 节点，函数体带 `return`，可用 `input` 与 `nodes`（前驱输出快照）；
 - `eval_expr`：condition 节点；
-- `expand_templates`：http_call 的 url/headers/body 中 `${expr}` 展开。
-  **限制**：`${...}` 内不能包含 `}`（按第一个 `}` 截断），
-  不支持嵌套对象字面量等复杂表达式。
+- `expand_templates`：**所有节点 params 的统一前置展开**（`exec::expand_params`，
+  唯一例外是 `NodeType::opaque_params`——script 的 `code` / condition 的 `expr`
+  等用户 JS 字段，其中的 `${}` 是 JS 模板字面量，展开即破坏用户代码）。
+  http_call 的 url/headers/body 只是这条规则的头号用户，delay 的 `ms`、
+  sub_workflow 的 `input_mapping` 等同规则生效。展开的数据面与 `nodes` 一致：
+  只读 `input`（run 输入）与直接前驱输出快照。
+  **限制**：`${}` 内不能包含 `}`（按第一个 `}` 截断），不支持嵌套对象
+  字面量等复杂表达式。两条规则按「整个值是否恰为一个模板」分流：
+  **整值模板**（`"${expr}"` 独占整个字符串）按求值结果的**原类型**替换
+  （数字/对象/数组穿透，`undefined` 归一 `null`）——`input_mapping` 的
+  结构化传参依赖这条；**插值模板**（模板嵌在更长文本里）保持字符串语义，
+  非字符串结果 `JSON.stringify` 后拼回原位。整值字符串模板在两条规则下
+  结果相同，存量定义零行为变化。
 
-数据契约限制：进出沙箱的数据经 JS Number（f64）——绝对值大于 2^53 的整数
-（雪花 ID、高精度金额）会被静默舍入（9007199254740993 → …0992）并沿节点
-输出向下游传播。大整数必须以字符串传递；重试/重放同样舍入，不影响决定论。
+数据契约：进出沙箱的整数经 **BigInt 边界**精确无损——|v| > 2^53 的 i64/u64
+（雪花 ID、高精度金额）注入沙箱时转 BigInt，出口按十进制精确还原 i64/u64，
+透传、比较（用 `123n` 字面量）、模板展开均不再静默舍入；插值模板对 BigInt
+用 `toString()` 拿精确数字。代价是响亮失败取代静默错值：BigInt 与 Number
+混算抛 TypeError、`JSON.stringify`（含 BigInt）抛错、超出 i64/u64 的 BigInt
+结果（如 `2n ** 64n`）在出口被拒。注意：脚本里的 Number 字面量仍是
+ECMAScript 语义（`9007199254740993` 字面量本身已舍入为 2^53），需要精确请
+写 n 后缀或从 input 传入；非整数浮点仍走 f64。纯 Rust 路径（start/delay/
+human_task/子 run 透传、事件日志 i64/u64 序列化）本就无损，重试/重放同样
+无损，决定论不变。
 
 ## 11. http_call 语义
 
-参数经 `${}` 模板展开后发请求（默认超时 30s；method 取自 `HTTP_METHODS` 白名单）。
+params 经 `${}` 统一展开后发请求（默认超时 30s；method 取自 `HTTP_METHODS`
+白名单，定义层校验后执行层再验一次）。
 输出 `{status, headers, body}`（body 能解析为 JSON 则解析，否则原样字符串）。失败分类：
 
 - 连接失败/超时 → retryable（副作用不明确或未发生，交给重试策略）；
@@ -598,6 +622,10 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
     强制（`SqliteBackend::open`，LOCK_NB 立即失败）：registry 管不住另一个
     进程的启动恢复，flock 管；同进程二次 open（独立 fd）同样被拒，
     flock 按 open file description 判定。
+15. 节点 params 执行前统一 `${}` 展开（`exec::expand_params`），唯一例外是
+    `NodeType::opaque_params`（用户 JS 字段）；展开数据面 = `input` +
+    直接前驱输出快照，不扩大决定论边界。sub_workflow 的 `input_mapping`
+    展开结果整体作为子 run 输入，缺省保持「父 run 输入」旧语义。
 
 ## 13. 测试策略
 
@@ -700,7 +728,7 @@ volume 上。Docker 只在容器**自己退出**时（`--rm`）回收匿名 volu
   容器/测试库/volume 垃圾（见上面「docker 卫生」与 `tests/docker_hygiene.rs`）。
   需要 docker；`FLOW_E2E_PG_IMAGE` 可换镜像。覆盖：workflow 生命周期与
   「只有 published 可执行」、run 执行（script/condition/delay/输出收集/skip
-  传播/重试/JS 沙箱/大整数舍入）、human_task 信号与取消、http_call 分类与
+  传播/重试/JS 沙箱/大整数 BigInt 边界）、human_task 信号与取消、http_call 分类与
   模板、sub_workflow（透传/失败传导/取消级联/深度上限）、schedule 真触发与
   webhook HTTP 全分支、订阅（回放/增量/未知 run 即结束）、SIGKILL 恢复与
   人工裁决、错误码映射。入口：`cargo test -p backend-e2e`。

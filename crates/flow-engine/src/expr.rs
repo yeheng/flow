@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use rquickjs::{Array, Context, Ctx, Function, Object, Runtime, Value as JsValue};
+use rquickjs::{Array, BigInt, Context, Ctx, Function, Object, Runtime, Value as JsValue};
 use serde_json::Value;
 
 use crate::error::EngineError;
@@ -9,12 +9,20 @@ use crate::error::EngineError;
 /// 「环即抛错」同类——报错退出，不爆 Rust 栈。
 const MAX_JS_DEPTH: usize = 128;
 
+/// 2^53：f64 能精确表示的最大整数（±9007199254740992）。
+const MAX_EXACT_F64_INT: i64 = 9_007_199_254_740_992;
+
 /// serde_json::Value → JS 原生值：输入面直接以 JS 对象/数组/标量注入沙箱，
 /// 不再 JSON.stringify 成字符串再让 JS 端 JSON.parse 倒一手。
 ///
 /// `define` 是预置的 Object.defineProperty 包装：与 JSON.parse 一致地创建
 /// 「自有可枚举数据属性」。Object.set 走 setter 通道，键恰为 "__proto__" 时
 /// 会改原型而不是建属性，与 JSON.parse 的语义分叉。
+///
+/// 大整数走 BigInt：|v| > 2^53 的整数经 JS Number（f64）会静默舍入
+/// （9007199254740993 → …992）并沿节点输出向下游传播，转 BigInt 进出
+/// 沙箱后透传/比较/模板展开精确无损。代价是脚本中 BigInt 与 Number
+/// 混算会抛 TypeError——响亮失败好过静默错值（DESIGN §10）。
 fn json_to_js<'js>(
     ctx: &Ctx<'js>,
     value: &Value,
@@ -23,7 +31,16 @@ fn json_to_js<'js>(
     Ok(match value {
         Value::Null => JsValue::new_null(ctx.clone()),
         Value::Bool(b) => JsValue::new_bool(ctx.clone(), *b),
-        Value::Number(n) => JsValue::new_number(ctx.clone(), n.as_f64().unwrap_or(f64::NAN)),
+        Value::Number(n) => match (n.as_i64(), n.as_u64()) {
+            // 超出 f64 精确整数域的 i64：BigInt 进沙箱，出口精确还原
+            (Some(v), _) if !(-MAX_EXACT_F64_INT..=MAX_EXACT_F64_INT).contains(&v) => {
+                BigInt::from_i64(ctx.clone(), v)?.into_value()
+            }
+            (Some(v), _) => JsValue::new_number(ctx.clone(), v as f64),
+            // serde_json 对超 i64 的正整数存 u64：必然 > 2^53，一律 BigInt
+            (None, Some(v)) => BigInt::from_u64(ctx.clone(), v)?.into_value(),
+            (None, None) => JsValue::new_number(ctx.clone(), n.as_f64().unwrap_or(f64::NAN)),
+        },
         Value::String(s) => rquickjs::String::from_str(ctx.clone(), s)?.into_value(),
         Value::Array(items) => {
             let array = Array::new(ctx.clone())?;
@@ -45,7 +62,9 @@ fn json_to_js<'js>(
 
 /// JS 求值结果读取器：把 JS 原生值转回 serde_json::Value，语义对齐
 /// JSON.stringify（改造前的结果出口），包括但不限于：
-/// - NaN/Infinity → null；BigInt → 报错（stringify 同样抛 TypeError）；
+/// - NaN/Infinity → null；
+/// - BigInt → 按 i64/u64 精确还原（大整数边界，见 `json_to_js`）；超出
+///   JSON 整数域的 BigInt 报错（stringify 同样抛 TypeError）；
 /// - 整数值浮点 → 整数（stringify(2.0) 产出 "2" 而非 "2.0"）；
 /// - Date（含嵌套位）按 toJSON 约定出 ISO 字符串；
 /// - function/symbol/undefined 被丢弃（对象字段缺键、数组成员为 null）；
@@ -54,6 +73,7 @@ fn json_to_js<'js>(
 struct JsReader<'js> {
     date_ctor: Object<'js>,
     date_to_iso: Function<'js>,
+    bigint_to_string: Function<'js>,
 }
 
 impl<'js> JsReader<'js> {
@@ -61,7 +81,26 @@ impl<'js> JsReader<'js> {
         Ok(Self {
             date_ctor: ctx.globals().get::<_, Object>("Date")?,
             date_to_iso: ctx.eval::<Function, _>("(function (d) { return d.toISOString(); })")?,
+            bigint_to_string: ctx.eval::<Function, _>("(function (b) { return b.toString(); })")?,
         })
+    }
+
+    /// BigInt → JSON 整数：经十进制字符串回读后按 i64/u64 精确还原。
+    /// rquickjs 的 `to_i64` 对超范围值按 JS 语义静默回绕，不能用它判界；
+    /// 超出 JSON 整数域（i64/u64）的 BigInt 响亮报错，绝不静默截断。
+    fn bigint_to_json(&self, value: &JsValue<'js>) -> Result<Value, rquickjs::Error> {
+        let digits: String = self.bigint_to_string.call((value.clone(),))?;
+        if let Ok(v) = digits.parse::<i64>() {
+            return Ok(Value::from(v));
+        }
+        if let Ok(v) = digits.parse::<u64>() {
+            return Ok(Value::from(v));
+        }
+        Err(rquickjs::Error::new_from_js_message(
+            "bigint",
+            "JSON 整数",
+            format!("BigInt 超出 i64/u64 范围，拒绝无损序列化：{digits}"),
+        ))
     }
 
     fn to_json(
@@ -101,12 +140,7 @@ impl<'js> JsReader<'js> {
                 }
                 Value::Array(items)
             }
-            rquickjs::Type::BigInt => {
-                return Err(rquickjs::Error::new_from_js(
-                    "bigint",
-                    "BigInt 无法序列化为 JSON",
-                ));
-            }
+            rquickjs::Type::BigInt => self.bigint_to_json(value)?,
             // stringify 丢弃不可序列化值；顶层已由包装器归 null，这里覆盖字段/数组位。
             // 注意 quickjs-ng 的 type_of 把普通函数报成 Constructor（该分支排在
             // Function 之前），构造器与函数一并丢弃。
@@ -220,19 +254,42 @@ pub fn eval_expr(
     run_js(&body, input, nodes, &Value::Null, timeout)
 }
 
-/// 展开字符串中的 `${expr}` 模板（用于 http_call 的 url/headers/body）。
+/// 展开字符串中的 `${expr}` 模板。所有节点 params 的统一前置展开
+/// （`exec::expand_params`；script.code / condition.expr 等 opaque 字段除外）。
+///
+/// 两条规则，按「整个值是否恰为一个模板」分流：
+///
+/// 1. **整值模板**（`"${expr}"` 独占整个字符串）：按求值结果的**原类型**
+///    替换——数字还是数字、对象还是对象。`input_mapping` 之类的结构化
+///    传参依赖这条；`undefined` 归一为 `null`（与 `eval_body` 出口一致）。
+/// 2. **插值模板**（模板嵌在更长文本里）：字符串语义，非字符串结果经
+///    `JSON.stringify` 拼回原位（url/headers 的历史行为，逐字不变）。
+///
+/// 规则 1 只影响「整值 + 非字符串」这一格：整值字符串模板（如
+/// `"${input.token}"`）在两条规则下结果相同，存量定义零行为变化。
 pub fn expand_templates(
     tpl: &Value,
     input: &Value,
     nodes: &Value,
     timeout: Duration,
 ) -> Result<Value, EngineError> {
-    let body = r#"    function __expand(v, input, nodes) {
+    let body = r#"    function __one(e) {
+      var r = eval(e);
+      return r === undefined ? null : r;
+    }
+    function __interp(v, input, nodes) {
+      return v.replace(/\$\{([^}]+)\}/g, function (_, e) {
+        var r = __one(e);
+        // BigInt 走 toString 拿精确十进制（雪花 ID 拼 URL）：JSON.stringify
+        // 对 BigInt 抛错，而 f64 老路径在这里是静默舍入。
+        if (typeof r === 'bigint') { return r.toString(); }
+        return (typeof r === 'string') ? r : JSON.stringify(r);
+      });
+    }
+    function __expand(v, input, nodes) {
       if (typeof v === 'string') {
-        return v.replace(/\$\{([^}]+)\}/g, function (_, e) {
-          var r = eval(e);
-          return (typeof r === 'string') ? r : JSON.stringify(r);
-        });
+        var whole = /^\$\{([^}]+)\}$/.exec(v);
+        return whole ? __one(whole[1]) : __interp(v, input, nodes);
       }
       if (Array.isArray(v)) { return v.map(function (x) { return __expand(x, input, nodes); }); }
       if (v && typeof v === 'object') {

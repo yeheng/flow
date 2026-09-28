@@ -856,7 +856,8 @@ pub(crate) fn node_types() -> Value {
                 "type": "object",
                 "required": ["ms"],
                 "properties": {
-                    "ms": {"type": "integer", "x-label": "时长（毫秒）"}
+                    "ms": {"type": "integer", "x-label": "时长（毫秒）",
+                            "x-help": "数字，或 ${input.x} / ${nodes.n.y} 模板（展开结果须为整数）"}
                 }
             }
         },
@@ -902,7 +903,9 @@ pub(crate) fn node_types() -> Value {
                 "required": ["workflow_id"],
                 "properties": {
                     "workflow_id": {"type": "string", "x-widget": "workflow-picker", "x-label": "目标工作流",
-                                    "x-help": "调用其最新已发布版本作为子 run；输入为父 run 输入，子 run 输出透传为本节点输出；子 run 失败传导为本节点 fatal（DESIGN §6.8），重试策略只覆盖启动/等待类错误"}
+                                    "x-help": "调用其最新已发布版本作为子 run；子 run 输出透传为本节点输出；子 run 失败传导为本节点 fatal（DESIGN §6.8），重试策略只覆盖启动/等待类错误"},
+                    "input_mapping": {"x-widget": "json", "x-label": "子 run 输入映射",
+                                    "x-help": "JSON 对象，值支持 ${input.x} / ${nodes.n.y} 模板；展开结果整体作为子 run 输入。省略 = 沿用父 run 输入"}
                 }
             },
             "supports_retry": true

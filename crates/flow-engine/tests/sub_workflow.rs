@@ -178,6 +178,61 @@ async fn launcher_platform_fault_suspends_run_instead_of_failing() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[tokio::test]
+async fn input_mapping_feeds_computed_data_to_child_run() {
+    // s → compute（script）→ sub（input_mapping）→ e：子 run 输入来自上游
+    // 计算结果而非父 run 输入（DESIGN §6.8）。整值模板保留 JSON 类型。
+    let (h, launcher) = harness(MockLauncher::new(Outcome::Succeed(json!({"ok": true}))));
+    let def: Definition = serde_json::from_value(json!({
+        "nodes": [
+            {"id": "s", "type": "start"},
+            {"id": "compute", "type": "script",
+             "params": {"code": "return { total: input.amount * input.factor };"}},
+            {"id": "sub", "type": "sub_workflow",
+             "params": {
+                 "workflow_id": "child-wf",
+                 "input_mapping": {
+                     "total": "${nodes.compute.total}",
+                     "raw": "${input.amount}",
+                     "job": "${input.order_id}"
+                 }
+             }},
+            {"id": "e", "type": "end"}
+        ],
+        "edges": [
+            {"from": "s", "to": "compute"},
+            {"from": "compute", "to": "sub"},
+            {"from": "sub", "to": "e"}
+        ]
+    }))
+    .unwrap();
+    def.validate().unwrap();
+
+    let run_id = format!("run-{}", uuid::Uuid::now_v7());
+    h.engine
+        .start_run(StartRun {
+            run_id: run_id.clone(),
+            workflow_id: "parent-wf".into(),
+            workflow_version: 1,
+            definition: def,
+            input: json!({"amount": 5, "factor": 3, "order_id": "o-9"}),
+            depth: 0,
+        })
+        .await
+        .unwrap();
+
+    let state = terminal(&h.engine, &run_id).await;
+    assert_eq!(state.phase, RunPhase::Succeeded, "{:?}", state.fatal_error);
+    let starts = launcher.starts.lock().unwrap().clone();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(
+        starts[0].2,
+        json!({"total": 15, "raw": 5, "job": "o-9"}),
+        "input_mapping 展开结果整体作为子 run 输入，数字保留类型"
+    );
+    assert_eq!(starts[0].1, "child-wf");
+}
+
 type StatusLog = Arc<parking_lot::Mutex<Vec<(DbRunStatus, Option<String>)>>>;
 
 #[derive(Clone)]

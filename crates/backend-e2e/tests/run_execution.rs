@@ -443,15 +443,27 @@ e2e_test!(
     })
 );
 
-e2e_test!(big_int_rounding_contract, |ctx: &mut Ctx| Box::pin(
+e2e_test!(big_int_boundary_contract, |ctx: &mut Ctx| Box::pin(
     async move {
         let client = ctx.client().await;
-        // 2^53+1 经过 JS Number（f64）被静默舍入（§10）：大整数必须以字符串传递
-        let (workflow_id, _) =
-            publish_workflow(&client, "大整数", linear_def("return 9007199254740993;")).await;
-        let run_id = start_run(&client, &workflow_id, json!({})).await;
+        // 大整数边界（§10）：input 里的大整数经 BigInt 进出沙箱，透传精确无损；
+        // 脚本里的 Number 字面量仍是 ECMAScript 语义（9007199254740993 字面量
+        // 本身就是 2^53，与沙箱边界无关），需要精确请写 n 后缀或从 input 传入。
+        let (workflow_id, _) = publish_workflow(
+            &client,
+            "大整数",
+            linear_def("return { passthrough: input.id, literal: 9007199254740993 };"),
+        )
+        .await;
+        let run_id = start_run(&client, &workflow_id, json!({"id": 9007199254740993i64})).await;
         let run = wait_run_terminal(&client, &run_id, TIMEOUT).await;
-        assert_eq!(run["run"]["output"], json!(9007199254740992i64));
+        assert_eq!(
+            run["run"]["output"],
+            json!({
+                "passthrough": 9007199254740993i64,
+                "literal": 9007199254740992i64
+            })
+        );
     }
 ));
 
