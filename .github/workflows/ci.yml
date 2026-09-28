@@ -1,19 +1,81 @@
 name: CI
 
+# 每次提交都跑：任意分支的 push + 所有 PR
 on:
   push:
-    branches: [main]
   pull_request:
 
+# 同一分支连续推送时取消上一次在跑的，省 runner 分钟
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
+  # ---- Rust：fmt / clippy / test 三道门禁 ----
+  # 故意放在同一个 job 的三个 step 里，而不是三个 job：clippy 与 test 都要全量
+  # 编译，共用一个 target 目录和 rust-cache，能省掉一次完整构建。
+  # `if: always()` 让 fmt 挂了之后 clippy / test 照样上报，一次 push 拿到全部信号。
   rust:
+    name: fmt / clippy / test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 格式：仓库已 cargo fmt --all 过，这里只做守门
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      # lints 全开，一个 warning 都不放过（DESIGN.md §13 的验证命令）
+      - name: clippy
+        if: always()
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # --all-targets：lib / bins / tests / benches / examples 一起验。
+      # backend-e2e 会用 docker 起自己的 PG 容器（ubuntu-latest 自带 docker，
+      # 无需额外安装）；flow-pg / flow-rpc 的 PG 用例此时自动跳过，见 rust-postgres。
+      - name: test
+        if: always()
+        run: cargo test --workspace --all-targets --locked
+
+  # ---- Postgres 臂：真连 PG 跑 flow-pg / flow-rpc ----
+  # 上面的 job 不设 FLOW_TEST_DATABASE_URL，那些用例会静默跳过、依旧全绿。
+  # 这里用一个 service 容器把 PG 臂真正跑起来（默认端口 54329 与仓库约定一致）。
+  rust-postgres:
+    name: test (postgres arm)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: flow
+          POSTGRES_PASSWORD: flow
+          POSTGRES_DB: flow
+        ports:
+          - 54329:5432
+        options: >-
+          --health-cmd "pg_isready -U flow -d flow"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      FLOW_TEST_DATABASE_URL: postgres://flow:flow@127.0.0.1:54329/flow
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # flow-pg 的测试无 FLOW_TEST_DATABASE_URL 时自动跳过
-      - run: cargo test --workspace
+      - name: test (flow-pg + flow-rpc)
+        run: cargo test -p flow-pg -p flow-rpc --all-targets --locked
 
   web:
     runs-on: ubuntu-latest

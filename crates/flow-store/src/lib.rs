@@ -157,10 +157,11 @@ impl Store {
 
         // 存量库迁移：runs 加触发来源列（PRAGMA 判存在性，幂等）。
         // 旧行由 DEFAULT 'manual' 归因——迁移前没有自动触发入口，语义正确。
-        let has_source: bool = sqlx::query("SELECT 1 FROM pragma_table_info('runs') WHERE name = 'source'")
-            .fetch_optional(&self.pool)
-            .await?
-            .is_some();
+        let has_source: bool =
+            sqlx::query("SELECT 1 FROM pragma_table_info('runs') WHERE name = 'source'")
+                .fetch_optional(&self.pool)
+                .await?
+                .is_some();
         if !has_source {
             sqlx::query("ALTER TABLE runs ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
                 .execute(&self.pool)
@@ -800,19 +801,20 @@ impl Store {
 
     /// run.stats：GROUP BY 精确计数。workflow_id 为 None 时附带按工作流分组。
     pub async fn run_stats(&self, workflow_id: Option<&str>) -> Result<RunStats, StoreError> {
-        let by_status = match workflow_id {
-            Some(id) => {
-                sqlx::query("SELECT status, COUNT(*) AS c FROM runs WHERE workflow_id = ? GROUP BY status")
-                    .bind(id)
-                    .fetch_all(&self.pool)
-                    .await?
-            }
-            None => {
-                sqlx::query("SELECT status, COUNT(*) AS c FROM runs GROUP BY status")
-                    .fetch_all(&self.pool)
-                    .await?
-            }
-        };
+        let by_status =
+            match workflow_id {
+                Some(id) => sqlx::query(
+                    "SELECT status, COUNT(*) AS c FROM runs WHERE workflow_id = ? GROUP BY status",
+                )
+                .bind(id)
+                .fetch_all(&self.pool)
+                .await?,
+                None => {
+                    sqlx::query("SELECT status, COUNT(*) AS c FROM runs GROUP BY status")
+                        .fetch_all(&self.pool)
+                        .await?
+                }
+            };
         let mut stats = RunStats {
             total: 0,
             by_status: std::collections::BTreeMap::new(),

@@ -545,9 +545,18 @@ async fn replayed_child_run_keeps_pinned_version() {
     let child_id = format!("child-{}", uuid::Uuid::now_v7());
     let input = json!({"amount": 21});
     // 崩溃前的真实状态：gateway 单事务创建（runs 行 + seq=1 RunStarted 已落盘）
-    lease::create_run(&pool, &child_id, &child_wf, v1, &input, 1, "sub_workflow", None)
-        .await
-        .unwrap();
+    lease::create_run(
+        &pool,
+        &child_id,
+        &child_wf,
+        v1,
+        &input,
+        1,
+        "sub_workflow",
+        None,
+    )
+    .await
+    .unwrap();
     let before = PgRunSink::read_events(&pool, &child_id, None)
         .await
         .unwrap();

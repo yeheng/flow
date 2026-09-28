@@ -506,19 +506,20 @@ impl PgStore {
 
     /// run.stats：GROUP BY 精确计数。workflow_id 为 None 时附带按工作流分组。
     pub async fn run_stats(&self, workflow_id: Option<&str>) -> Result<RunStats, PgError> {
-        let rows: Vec<(String, i64)> = match workflow_id {
-            Some(id) => sqlx::query_as(
-                "SELECT status, COUNT(*) AS c FROM runs WHERE workflow_id = $1 GROUP BY status",
-            )
-            .bind(id)
-            .fetch_all(&self.pool)
-            .await?,
-            None => {
-                sqlx::query_as("SELECT status, COUNT(*) AS c FROM runs GROUP BY status")
-                    .fetch_all(&self.pool)
-                    .await?
-            }
-        };
+        let rows: Vec<(String, i64)> =
+            match workflow_id {
+                Some(id) => sqlx::query_as(
+                    "SELECT status, COUNT(*) AS c FROM runs WHERE workflow_id = $1 GROUP BY status",
+                )
+                .bind(id)
+                .fetch_all(&self.pool)
+                .await?,
+                None => {
+                    sqlx::query_as("SELECT status, COUNT(*) AS c FROM runs GROUP BY status")
+                        .fetch_all(&self.pool)
+                        .await?
+                }
+            };
         let mut stats = RunStats {
             total: 0,
             by_status: std::collections::BTreeMap::new(),

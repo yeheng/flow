@@ -130,7 +130,9 @@ async fn run_one(scenario: Scenario, kind: Kind, bin: &str, opts: &Opts) -> Vec<
     let outcome = std::panic::AssertUnwindSafe(scenarios::run(scenario, &mut ctx, opts))
         .catch_unwind()
         .await;
-    let cleanup = std::panic::AssertUnwindSafe(ctx.finish()).catch_unwind().await;
+    let cleanup = std::panic::AssertUnwindSafe(ctx.finish())
+        .catch_unwind()
+        .await;
     match outcome {
         Ok(reports) => {
             if let Err(payload) = cleanup {

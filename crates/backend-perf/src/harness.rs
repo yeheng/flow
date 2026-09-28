@@ -18,9 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use backend_e2e::common::fixtures::timeline_node;
-use backend_e2e::common::{
-    call, call_json, named, wait_run_terminal, Client, TIMEOUT,
-};
+use backend_e2e::common::{call, call_json, named, wait_run_terminal, Client, TIMEOUT};
 use futures::StreamExt;
 use jsonrpsee::core::client::{ClientT, Subscription};
 use serde_json::{json, Value};
@@ -208,10 +206,7 @@ impl Marks {
     }
 
     fn record_error(&self, error: String) {
-        self.errors
-            .lock()
-            .expect("错误表锁中毒")
-            .push(error);
+        self.errors.lock().expect("错误表锁中毒").push(error);
         self.pending.fetch_sub(1, Ordering::SeqCst);
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
     }
@@ -278,10 +273,13 @@ pub async fn start_runs_measured(
                             .as_str()
                             .expect("run.start 未回 run_id")
                             .to_string();
-                        marks.lock().insert(run_id, Mark {
-                            call: call_at,
-                            returned,
-                        });
+                        marks.lock().insert(
+                            run_id,
+                            Mark {
+                                call: call_at,
+                                returned,
+                            },
+                        );
                         marks.finish_attempt();
                     }
                     Err(err) => marks.record_error(format!("{err}")),
@@ -373,7 +371,7 @@ pub async fn collect_arrivals(
                 }
             }
             Ok(Some(Err(_))) | Ok(None) => break, // 订阅流出错 / 结束
-            Err(_) => {},                         // 空闲窗口，回去重查追平条件
+            Err(_) => {}                          // 空闲窗口，回去重查追平条件
         }
     }
     arrivals

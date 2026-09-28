@@ -125,7 +125,15 @@ async fn incomplete_initialization_is_failed_without_replaying_missing_logs() {
     for run in ["missing", "empty", "partial"] {
         f.backend
             .store()
-            .insert_run(run, &f.workflow, 1, &Value::Null, "initializing", "manual", None)
+            .insert_run(
+                run,
+                &f.workflow,
+                1,
+                &Value::Null,
+                "initializing",
+                "manual",
+                None,
+            )
             .await
             .unwrap();
         if run != "missing" {
@@ -158,7 +166,15 @@ async fn initialized_log_is_resumed_even_when_metadata_still_says_initializing()
     f.backend.store().publish(&f.workflow, 1).await.unwrap();
     f.backend
         .store()
-        .insert_run("r", &f.workflow, 1, &Value::Null, "initializing", "manual", None)
+        .insert_run(
+            "r",
+            &f.workflow,
+            1,
+            &Value::Null,
+            "initializing",
+            "manual",
+            None,
+        )
         .await
         .unwrap();
     let mut log = EventLog::create(&f.root, "r").await.unwrap();
@@ -572,22 +588,26 @@ async fn run_stats_counts_exactly_and_groups_by_workflow() {
     // 空库：total 0、by_status 空、by_workflow 空
     let empty = f.call("run.stats", json!({})).await;
     assert_eq!(empty["result"]["total"], 0, "{empty}");
-    assert_eq!(
-        empty["result"]["by_status"].as_object().unwrap().len(),
-        0
-    );
-    assert_eq!(
-        empty["result"]["by_workflow"].as_array().unwrap().len(),
-        0
-    );
+    assert_eq!(empty["result"]["by_status"].as_object().unwrap().len(), 0);
+    assert_eq!(empty["result"]["by_workflow"].as_array().unwrap().len(), 0);
 
     // 造数据：f.workflow 两个 run（succeeded + running），另一个 workflow 一个 succeeded
-    let r1 = f.call("run.start", json!({"workflow_id": f.workflow})).await;
+    let r1 = f
+        .call("run.start", json!({"workflow_id": f.workflow}))
+        .await;
     let run1 = r1["result"]["run_id"].as_str().unwrap().to_string();
     f.wait_finished(&run1).await; // succeeded
     f.backend
         .store()
-        .insert_run("r-manual", &f.workflow, 1, &Value::Null, "running", "manual", None)
+        .insert_run(
+            "r-manual",
+            &f.workflow,
+            1,
+            &Value::Null,
+            "running",
+            "manual",
+            None,
+        )
         .await
         .unwrap();
     let wf2 = f.backend.store().create_workflow("other").await.unwrap();
@@ -635,7 +655,9 @@ async fn run_source_attribution_and_filter() {
     f.backend.store().publish(&f.workflow, 1).await.unwrap();
 
     // run.start → manual
-    let r = f.call("run.start", json!({"workflow_id": f.workflow})).await;
+    let r = f
+        .call("run.start", json!({"workflow_id": f.workflow}))
+        .await;
     let manual_run = r["result"]["run_id"].as_str().unwrap().to_string();
     f.wait_finished(&manual_run).await;
     let got = f.call("run.get", json!({"run_id": manual_run})).await;
@@ -664,7 +686,10 @@ async fn run_source_attribution_and_filter() {
 
     // source 过滤：manual 只剩 run.start 那条；非法 source → -32010
     let list = f
-        .call("run.list", json!({"workflow_id": f.workflow, "source": "manual"}))
+        .call(
+            "run.list",
+            json!({"workflow_id": f.workflow, "source": "manual"}),
+        )
         .await;
     assert_eq!(list["result"]["runs"].as_array().unwrap().len(), 1);
     let bad = f.call("run.list", json!({"source": "cron"})).await;

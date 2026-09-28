@@ -78,7 +78,10 @@ pub async fn publish_definition(
 ) -> (String, i64) {
     let store = engine.store();
     let workflow_id = store.create_workflow(name).await.unwrap();
-    let version = store.update_workflow(&workflow_id, &definition).await.unwrap();
+    let version = store
+        .update_workflow(&workflow_id, &definition)
+        .await
+        .unwrap();
     store.publish(&workflow_id, version).await.unwrap();
     (workflow_id, version)
 }
@@ -164,7 +167,8 @@ pub async fn events(pool: &PgPool, run_id: &str) -> Vec<EventRow> {
                 r.get::<String, _>("kind"),
                 r.get::<Option<String>, _>("node_id"),
                 // attempt 在 SQL 里被 `->>` 取出成文本，这里转回数字
-                r.get::<Option<String>, _>("attempt").and_then(|s| s.parse().ok()),
+                r.get::<Option<String>, _>("attempt")
+                    .and_then(|s| s.parse().ok()),
                 r.get::<serde_json::Value, _>("payload"),
             )
         })
@@ -189,7 +193,11 @@ pub async fn lease_of(
             .fetch_one(pool)
             .await
             .unwrap();
-    (rec.get("lease_owner"), rec.get("lease_epoch"), rec.get("lease_expires_at"))
+    (
+        rec.get("lease_owner"),
+        rec.get("lease_epoch"),
+        rec.get("lease_expires_at"),
+    )
 }
 
 /// 直接以 SQL 插入一条 pending inbox 行（绕过 gateway 的终态检查，用于构造竞态窗口）。

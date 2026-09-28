@@ -86,7 +86,11 @@ async fn measure(client: &Client, ctx: &Ctx, opts: &Opts, shape: Shape) -> Repor
             error_digest(&marks)
         );
     }
-    assert!(started > 0, "全部 run.start 都失败了：{}", error_digest(&marks));
+    assert!(
+        started > 0,
+        "全部 run.start 都失败了：{}",
+        error_digest(&marks)
+    );
     arrivals.assert_complete(started, &format!("run_throughput/{}", shape.name()));
 
     let snapshot = marks.snapshot();

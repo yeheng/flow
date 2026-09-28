@@ -50,9 +50,16 @@ pub async fn run(ctx: &mut Ctx, opts: &Opts) -> Vec<Report> {
     let started = marks.len();
     let submit_errors = marks.error_count();
     if submit_errors > 0 {
-        eprintln!("⚠ subscribe_latency：run.start 提交失败（{}）", error_digest(&marks));
+        eprintln!(
+            "⚠ subscribe_latency：run.start 提交失败（{}）",
+            error_digest(&marks)
+        );
     }
-    assert!(started > 0, "全部 run.start 都失败了：{}", error_digest(&marks));
+    assert!(
+        started > 0,
+        "全部 run.start 都失败了：{}",
+        error_digest(&marks)
+    );
     arrivals.assert_complete(started, "subscribe_latency");
 
     let snapshot = marks.snapshot();

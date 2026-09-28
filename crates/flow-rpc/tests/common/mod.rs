@@ -76,7 +76,12 @@ impl ServerProc {
 
     /// 同 [`ServerProc::spawn_pg`]，`extra_env` 覆盖默认环境变量（如拉长
     /// FLOW_SUBSCRIBE_POLL_MS 证明 NOTIFY 唤醒）。
-    pub fn spawn_pg_with(url: &str, role: &str, signal_wait_ms: u64, extra_env: &[(&str, &str)]) -> Self {
+    pub fn spawn_pg_with(
+        url: &str,
+        role: &str,
+        signal_wait_ms: u64,
+        extra_env: &[(&str, &str)],
+    ) -> Self {
         let addr = SocketAddr::from(([127, 0, 0, 1], free_port()));
         let http_addr = SocketAddr::from(([127, 0, 0, 1], free_port()));
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_flow-server"));
@@ -164,7 +169,11 @@ pub fn named(value: Value) -> ObjectParams {
     params
 }
 
-pub async fn call<T: serde::de::DeserializeOwned>(client: &WsClient, method: &str, params: Value) -> T {
+pub async fn call<T: serde::de::DeserializeOwned>(
+    client: &WsClient,
+    method: &str,
+    params: Value,
+) -> T {
     client
         .request(method, named(params))
         .await
@@ -214,13 +223,22 @@ pub async fn publish(client: &WsClient, name: &str, def: Value) -> (String, i64)
 }
 
 pub async fn start_run(client: &WsClient, workflow_id: &str, input: Value) -> String {
-    let started: Value = call(client, "run.start", json!({"workflow_id": workflow_id, "input": input}))
-        .await;
+    let started: Value = call(
+        client,
+        "run.start",
+        json!({"workflow_id": workflow_id, "input": input}),
+    )
+    .await;
     started["run_id"].as_str().unwrap().to_string()
 }
 
 /// 轮询到 run 状态等于 `expected`，返回 run.get 的完整响应。
-pub async fn wait_status(client: &WsClient, run_id: &str, expected: &str, timeout: Duration) -> Value {
+pub async fn wait_status(
+    client: &WsClient,
+    run_id: &str,
+    expected: &str,
+    timeout: Duration,
+) -> Value {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let run: Value = call(client, "run.get", json!({"run_id": run_id})).await;
@@ -251,7 +269,10 @@ where
         {
             return;
         }
-        assert!(tokio::time::Instant::now() < deadline, "等待事件超时：{events}");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "等待事件超时：{events}"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -263,8 +284,7 @@ const DEFAULT_URL: &str = "postgres://flow:flow@127.0.0.1:54329/flow";
 
 /// 连到 PG 测试库；未配置且默认端口不可达时返回 None（测试自动跳过）。
 pub async fn test_db() -> Option<PgTestDb> {
-    let base =
-        std::env::var("FLOW_TEST_DATABASE_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
+    let base = std::env::var("FLOW_TEST_DATABASE_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
     if std::env::var("FLOW_TEST_DATABASE_URL").is_err() && !port_open().await {
         eprintln!("skip: 未设置 FLOW_TEST_DATABASE_URL 且 {DEFAULT_URL} 不可达");
         return None;

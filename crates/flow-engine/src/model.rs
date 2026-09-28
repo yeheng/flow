@@ -385,7 +385,10 @@ mod tests {
     fn linear() -> Definition {
         def(
             vec![node("s", "start"), node("n", "script"), node("e", "end")],
-            vec![json!({"from": "s", "to": "n"}), json!({"from": "n", "to": "e"})],
+            vec![
+                json!({"from": "s", "to": "n"}),
+                json!({"from": "n", "to": "e"}),
+            ],
         )
     }
 
@@ -396,9 +399,15 @@ mod tests {
 
     #[test]
     fn empty_graph_and_start_end_shape() {
-        assert_eq!(def(vec![], vec![]).validate().unwrap_err(), "工作流没有任何节点");
+        assert_eq!(
+            def(vec![], vec![]).validate().unwrap_err(),
+            "工作流没有任何节点"
+        );
         // 没有 start
-        let no_start = def(vec![node("n", "script"), node("e", "end")], vec![json!({"from":"n","to":"e"})]);
+        let no_start = def(
+            vec![node("n", "script"), node("e", "end")],
+            vec![json!({"from":"n","to":"e"})],
+        );
         assert!(no_start.validate().unwrap_err().contains("start 节点"));
         // 两个 start
         let two_starts = def(
@@ -407,7 +416,10 @@ mod tests {
         );
         assert!(two_starts.validate().unwrap_err().contains("start 节点"));
         // 没有 end
-        let no_end = def(vec![node("s", "start"), node("n", "script")], vec![json!({"from":"s","to":"n"})]);
+        let no_end = def(
+            vec![node("s", "start"), node("n", "script")],
+            vec![json!({"from":"s","to":"n"})],
+        );
         assert!(no_end.validate().unwrap_err().contains("end 节点"));
     }
 
@@ -417,10 +429,20 @@ mod tests {
             vec![node("s", "start"), node("n", "script"), node("n", "delay")],
             vec![],
         );
-        assert!(dup.validate().unwrap_err().contains("id 重复"), "{:?}", dup.validate());
-        let blank = def(vec![node(" ", "start"), node("e", "end")], vec![json!({"from":" ","to":"e"})]);
+        assert!(
+            dup.validate().unwrap_err().contains("id 重复"),
+            "{:?}",
+            dup.validate()
+        );
+        let blank = def(
+            vec![node(" ", "start"), node("e", "end")],
+            vec![json!({"from":" ","to":"e"})],
+        );
         assert!(blank.validate().unwrap_err().contains("空的节点 id"));
-        let unknown = def(vec![node("s", "start"), node("x", "wat"), node("e", "end")], vec![]);
+        let unknown = def(
+            vec![node("s", "start"), node("x", "wat"), node("e", "end")],
+            vec![],
+        );
         assert!(unknown.validate().unwrap_err().contains("类型未知"));
     }
 
@@ -434,13 +456,21 @@ mod tests {
 
         let self_loop = def(
             vec![node("s", "start"), node("n", "script"), node("e", "end")],
-            vec![json!({"from":"s","to":"n"}), json!({"from":"n","to":"n"}), json!({"from":"n","to":"e"})],
+            vec![
+                json!({"from":"s","to":"n"}),
+                json!({"from":"n","to":"n"}),
+                json!({"from":"n","to":"e"}),
+            ],
         );
         assert!(self_loop.validate().unwrap_err().contains("自环"));
 
         let dupe = def(
             vec![node("s", "start"), node("n", "script"), node("e", "end")],
-            vec![json!({"from":"s","to":"n"}), json!({"from":"n","to":"e"}), json!({"from":"n","to":"e"})],
+            vec![
+                json!({"from":"s","to":"n"}),
+                json!({"from":"n","to":"e"}),
+                json!({"from":"n","to":"e"}),
+            ],
         );
         assert!(dupe.validate().unwrap_err().contains("重复的边"));
     }
@@ -451,10 +481,18 @@ mod tests {
             vec![node("s", "start"), node("c", "condition")],
             vec![json!({"from":"c","to":"s","port":"true"})],
         );
-        assert!(ok.validate().is_err(), "没有 end 会先失败；换 end 再看端口规则");
+        assert!(
+            ok.validate().is_err(),
+            "没有 end 会先失败；换 end 再看端口规则"
+        );
 
         let with_ends = def(
-            vec![node("s", "start"), node("c", "condition"), node("t", "script"), node("e", "end")],
+            vec![
+                node("s", "start"),
+                node("c", "condition"),
+                node("t", "script"),
+                node("e", "end"),
+            ],
             vec![
                 json!({"from":"s","to":"c"}),
                 json!({"from":"c","to":"t","port":"true"}),
@@ -464,18 +502,29 @@ mod tests {
         assert!(with_ends.validate().is_ok(), "{:?}", with_ends.validate());
 
         let bad_port = def(
-            vec![node("s", "start"), node("c", "condition"), node("t", "script"), node("e", "end")],
+            vec![
+                node("s", "start"),
+                node("c", "condition"),
+                node("t", "script"),
+                node("e", "end"),
+            ],
             vec![
                 json!({"from":"s","to":"c"}),
                 json!({"from":"c","to":"t","port":"maybe"}),
                 json!({"from":"t","to":"e"}),
             ],
         );
-        assert!(bad_port.validate().unwrap_err().contains("端口必须是 true/false"));
+        assert!(bad_port
+            .validate()
+            .unwrap_err()
+            .contains("端口必须是 true/false"));
 
         let stray_port = def(
             vec![node("s", "start"), node("n", "script"), node("e", "end")],
-            vec![json!({"from":"s","to":"n","port":"true"}), json!({"from":"n","to":"e"})],
+            vec![
+                json!({"from":"s","to":"n","port":"true"}),
+                json!({"from":"n","to":"e"}),
+            ],
         );
         assert!(stray_port.validate().unwrap_err().contains("不能带端口"));
     }
@@ -491,7 +540,11 @@ mod tests {
         // end 出边也违规
         let bad_end = def(
             vec![node("s", "start"), node("n", "script"), node("e", "end")],
-            vec![json!({"from":"s","to":"n"}), json!({"from":"n","to":"e"}), json!({"from":"e","to":"n"})],
+            vec![
+                json!({"from":"s","to":"n"}),
+                json!({"from":"n","to":"e"}),
+                json!({"from":"e","to":"n"}),
+            ],
         );
         assert!(bad_end.validate().unwrap_err().contains("end 节点"));
     }
@@ -502,7 +555,7 @@ mod tests {
             vec![node("s", "start"), node("n", "script"), node("e", "end")],
             vec![
                 json!({"from":"s","to":"n"}),
-                json!({"from":"n","to":"n"}),   // 自环：先被自环规则拦下
+                json!({"from":"n","to":"n"}), // 自环：先被自环规则拦下
                 json!({"from":"n","to":"e"}),
             ],
         );
@@ -511,7 +564,10 @@ mod tests {
         // 两节点互成环（nodes_scope 那一类用例的形状）
         let two_loop = def(
             vec![
-                node("s", "start"), node("n", "script"), node("m", "script"), node("e", "end"),
+                node("s", "start"),
+                node("n", "script"),
+                node("m", "script"),
+                node("e", "end"),
             ],
             vec![
                 json!({"from":"s","to":"n"}),
@@ -535,8 +591,10 @@ mod tests {
         // 形状，这里会响。
         let acyclic_island = def(
             vec![
-                node("s", "start"), node("e", "end"),
-                node("a", "script"), node("b", "script"),
+                node("s", "start"),
+                node("e", "end"),
+                node("a", "script"),
+                node("b", "script"),
             ],
             vec![json!({"from":"s","to":"e"}), json!({"from":"a","to":"b"})],
         );
@@ -546,8 +604,10 @@ mod tests {
         );
         let cyclic_island = def(
             vec![
-                node("s", "start"), node("e", "end"),
-                node("a", "script"), node("b", "script"),
+                node("s", "start"),
+                node("e", "end"),
+                node("a", "script"),
+                node("b", "script"),
             ],
             vec![
                 json!({"from":"s","to":"e"}),
@@ -577,7 +637,10 @@ mod tests {
                 ],
                 vec![json!({"from":"s","to":"n"}), json!({"from":"n","to":"e"})],
             );
-            assert!(d.validate().unwrap_err().contains(needle), "{kind} 应缺 {needle}");
+            assert!(
+                d.validate().unwrap_err().contains(needle),
+                "{kind} 应缺 {needle}"
+            );
         }
 
         // http_call：url 必填，method 大小写不敏感且受白名单约束
@@ -612,25 +675,46 @@ mod tests {
         // 无 retry：1 次不重试、0 退避
         assert_eq!(
             RetryPolicy::from_params(&json!({})),
-            RetryPolicy { max_attempts: 1, backoff_ms: 0 }
+            RetryPolicy {
+                max_attempts: 1,
+                backoff_ms: 0
+            }
         );
-        assert_eq!(RetryPolicy::default(), RetryPolicy { max_attempts: 1, backoff_ms: 0 });
+        assert_eq!(
+            RetryPolicy::default(),
+            RetryPolicy {
+                max_attempts: 1,
+                backoff_ms: 0
+            }
+        );
         // 0 被抬到 1：max_attempts 永远至少一次
         assert_eq!(
             RetryPolicy::from_params(&json!({"retry": {"max_attempts": 0, "backoff_ms": 9}})),
-            RetryPolicy { max_attempts: 1, backoff_ms: 9 }
+            RetryPolicy {
+                max_attempts: 1,
+                backoff_ms: 9
+            }
         );
         // 缺 backoff_ms 用 0
         assert_eq!(
             RetryPolicy::from_params(&json!({"retry": {"max_attempts": 5}})),
-            RetryPolicy { max_attempts: 5, backoff_ms: 0 }
+            RetryPolicy {
+                max_attempts: 5,
+                backoff_ms: 0
+            }
         );
     }
 
     #[test]
     fn node_type_vocabulary_round_trips_and_flags_side_effects() {
         for kind in [
-            "start", "end", "script", "condition", "delay", "http_call", "human_task",
+            "start",
+            "end",
+            "script",
+            "condition",
+            "delay",
+            "http_call",
+            "human_task",
             "sub_workflow",
         ] {
             let parsed = NodeType::parse(kind).unwrap_or_else(|| panic!("{kind} 应可解析"));
@@ -641,7 +725,12 @@ mod tests {
 
         // 只有 http_call 有外部副作用（崩溃后不可安全重放）
         assert!(NodeType::HttpCall.has_side_effect());
-        for kind in [NodeType::Start, NodeType::End, NodeType::Script, NodeType::Delay] {
+        for kind in [
+            NodeType::Start,
+            NodeType::End,
+            NodeType::Script,
+            NodeType::Delay,
+        ] {
             assert!(!kind.has_side_effect(), "{kind:?} 不该有副作用");
         }
     }

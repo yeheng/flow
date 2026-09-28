@@ -36,20 +36,30 @@ pub async fn run(ctx: &mut Ctx, opts: &Opts) -> Vec<Report> {
 
     // 停驻 N 个 run：全部走到 human_task 并等待信号。
     let client = ctx.client().await;
-    let (workflow_id, _) = publish_workflow(
+    let (workflow_id, _) =
+        publish_workflow(&client, &unique_name("perf-recovery"), human_def()).await;
+    let marks = Marks::starting(opts.recovery_runs, opts.recovery_runs);
+    start_runs_measured(
         &client,
-        &unique_name("perf-recovery"),
-        human_def(),
+        &workflow_id,
+        &json!({}),
+        &marks,
+        Duration::from_secs(120),
     )
     .await;
-    let marks = Marks::starting(opts.recovery_runs, opts.recovery_runs);
-    start_runs_measured(&client, &workflow_id, &json!({}), &marks, Duration::from_secs(120)).await;
     let parked = marks.len();
     let submit_errors = marks.error_count();
     if submit_errors > 0 {
-        eprintln!("⚠ crash_recovery：run.start 提交失败（{}）", error_digest(&marks));
+        eprintln!(
+            "⚠ crash_recovery：run.start 提交失败（{}）",
+            error_digest(&marks)
+        );
     }
-    assert!(parked > 0, "全部 run.start 都失败了：{}", error_digest(&marks));
+    assert!(
+        parked > 0,
+        "全部 run.start 都失败了：{}",
+        error_digest(&marks)
+    );
     for run_id in marks.run_ids() {
         wait_node_running(&client, &run_id, HUMAN_NODE, TIMEOUT).await;
     }

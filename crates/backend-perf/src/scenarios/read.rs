@@ -49,10 +49,7 @@ pub async fn run(ctx: &mut Ctx, opts: &Opts) -> Vec<Report> {
     let started = marks.len();
     let submit_errors = marks.error_count();
     if submit_errors > 0 {
-        eprintln!(
-            "⚠ rpc_read：预置提交失败（{}）",
-            error_digest(&marks)
-        );
+        eprintln!("⚠ rpc_read：预置提交失败（{}）", error_digest(&marks));
     }
     assert!(started > 0, "预置 run 全部失败：{}", error_digest(&marks));
     arrivals.assert_complete(started, "rpc_read/prefill");

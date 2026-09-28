@@ -203,10 +203,11 @@ impl GroupCommitter {
     /// 把 `handle` 的 fsync 排进组；返回时该文件已 durable（严格语义）。
     pub async fn sync(&self, handle: Arc<LogHandle>) -> Result<(), EngineError> {
         let (reply, mut done) = oneshot::channel();
-        self.state.lock().unwrap().queue.push(PendingSync {
-            handle,
-            reply,
-        });
+        self.state
+            .lock()
+            .unwrap()
+            .queue
+            .push(PendingSync { handle, reply });
         let mut lead_gen = self.lead_gen.subscribe();
         loop {
             // 队列里有活且没人跑批：自己当 leader 排空它
@@ -257,10 +258,7 @@ impl GroupCommitter {
             // 批内按文件去重：一个文件一批只 fsync 一次
             let mut files: Vec<Arc<LogHandle>> = Vec::new();
             for pending in &batch.pendings {
-                if !files
-                    .iter()
-                    .any(|f| Arc::ptr_eq(f, &pending.handle))
-                {
+                if !files.iter().any(|f| Arc::ptr_eq(f, &pending.handle)) {
                     files.push(pending.handle.clone());
                 }
             }
@@ -268,12 +266,11 @@ impl GroupCommitter {
 
             // 同批多文件的 fsync 并发发出：设备把它们合并进同一轮刷盘，
             // 严格语义不打折——每个调用方等的是自己文件的 sync_all
-            let results: Vec<Result<(), String>> =
-                join_all(files.iter().map(|f| f.sync_all()))
-                    .await
-                    .into_iter()
-                    .map(|r| r.map_err(|e| e.to_string()))
-                    .collect();
+            let results: Vec<Result<(), String>> = join_all(files.iter().map(|f| f.sync_all()))
+                .await
+                .into_iter()
+                .map(|r| r.map_err(|e| e.to_string()))
+                .collect();
 
             for pending in batch.pendings.drain(..) {
                 let index = files

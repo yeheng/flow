@@ -46,7 +46,12 @@ fn docker(args: &[&str]) -> Output {
         .args(args)
         .stdin(Stdio::null())
         .output()
-        .unwrap_or_else(|e| panic!("执行 docker {:?} 失败：{e}（需要 docker CLI 在 PATH 中）", args));
+        .unwrap_or_else(|e| {
+            panic!(
+                "执行 docker {:?} 失败：{e}（需要 docker CLI 在 PATH 中）",
+                args
+            )
+        });
     if !output.status.success() {
         panic!(
             "docker {:?} 退出码 {:?}：{}",
@@ -231,8 +236,9 @@ impl PgContainer {
     /// 起容器并等待到可以执行查询。docker CLI 缺失或镜像拉取失败会直接 panic——
     /// e2e 的语义就是「没有可用 Postgres 就是失败」，不像 ws_pg 那样跳过。
     pub async fn start() -> PgContainer {
-        docker_try(&["version"])
-            .unwrap_or_else(|| panic!("docker CLI 不可用：backend-e2e 需要 docker 来运行 Postgres 容器"));
+        docker_try(&["version"]).unwrap_or_else(|| {
+            panic!("docker CLI 不可用：backend-e2e 需要 docker 来运行 Postgres 容器")
+        });
 
         // 顺序有讲究：先删残留容器（它们的 volume 才算 dangling），再回收孤儿 volume。
         remove_stale_containers();
@@ -504,7 +510,9 @@ fn is_stale(name: &str, db_prefix: &str) -> bool {
         return false;
     };
     let age = chrono::Utc::now().naive_utc() - created;
-    age.to_std().map(|age| age >= STALE_DB_AFTER).unwrap_or(false)
+    age.to_std()
+        .map(|age| age >= STALE_DB_AFTER)
+        .unwrap_or(false)
 }
 
 /// 服务器上还挂着哪些给定前缀的测试库（给「没漏库」的回归测试用）。

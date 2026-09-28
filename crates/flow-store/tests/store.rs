@@ -73,7 +73,15 @@ async fn workflow_with_runs_cannot_be_deleted() {
     let wf2 = store.create_workflow("流程2").await.unwrap();
     let v2 = store.update_workflow(&wf2, &def("a")).await.unwrap();
     store
-        .insert_run("run-1", &wf2, v2, &json!({"x": 1}), "running", "manual", None)
+        .insert_run(
+            "run-1",
+            &wf2,
+            v2,
+            &json!({"x": 1}),
+            "running",
+            "manual",
+            None,
+        )
         .await
         .unwrap();
 
@@ -93,11 +101,27 @@ async fn unfinished_runs_drive_crash_recovery() {
     let v = store.update_workflow(&wf, &def("a")).await.unwrap();
 
     store
-        .insert_run("run-live", &wf, v, &json!({"x": 1}), "running", "manual", None)
+        .insert_run(
+            "run-live",
+            &wf,
+            v,
+            &json!({"x": 1}),
+            "running",
+            "manual",
+            None,
+        )
         .await
         .unwrap();
     store
-        .insert_run("run-done", &wf, v, &json!({"x": 2}), "running", "manual", None)
+        .insert_run(
+            "run-done",
+            &wf,
+            v,
+            &json!({"x": 2}),
+            "running",
+            "manual",
+            None,
+        )
         .await
         .unwrap();
     store
@@ -237,7 +261,15 @@ async fn run_cannot_reference_deleted_workflow_version() {
     store.delete_workflow(&wf).await.unwrap();
 
     let err = store
-        .insert_run("r-orphan", &wf, 1, &json!(null), "initializing", "manual", None)
+        .insert_run(
+            "r-orphan",
+            &wf,
+            1,
+            &json!(null),
+            "initializing",
+            "manual",
+            None,
+        )
         .await
         .unwrap_err();
     assert!(

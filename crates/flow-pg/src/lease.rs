@@ -322,13 +322,7 @@ mod tests {
     use flow_engine::EngineError;
 
     /// 一行「run 行快照」：状态、owner、epoch、expired、last_seq。
-    fn row(
-        status: &str,
-        owner: Option<&str>,
-        epoch: i64,
-        expired: bool,
-        last_seq: i64,
-    ) -> RunRow {
+    fn row(status: &str, owner: Option<&str>, epoch: i64, expired: bool, last_seq: i64) -> RunRow {
         RunRow {
             status: status.into(),
             lease_owner: owner.map(str::to_string),
@@ -360,10 +354,7 @@ mod tests {
             Err(EngineError::LeaseLost)
         ));
         // 没人持锁（租约被清空）——同样不许写
-        assert!(matches!(
-            check_writable(&r, "i-1", 3, Some(7)),
-            Ok(())
-        ));
+        assert!(matches!(check_writable(&r, "i-1", 3, Some(7)), Ok(())));
         assert!(matches!(
             check_writable(&row("running", None, 3, false, 7), "i-1", 3, Some(7)),
             Err(EngineError::LeaseLost)
@@ -381,7 +372,10 @@ mod tests {
         for status in ["succeeded", "failed", "cancelled"] {
             let r = row(status, Some("i-1"), 3, false, 7);
             assert!(
-                matches!(check_writable(&r, "i-1", 3, Some(7)), Err(EngineError::LeaseLost)),
+                matches!(
+                    check_writable(&r, "i-1", 3, Some(7)),
+                    Err(EngineError::LeaseLost)
+                ),
                 "{status} 必须已无写权"
             );
         }
@@ -392,11 +386,17 @@ mod tests {
         // 在这里钉住，免得日后「顺手补全」时把它加进去。
         for status in ["running", "awaiting_resume"] {
             let r = row(status, Some("i-1"), 3, false, 7);
-            assert!(check_writable(&r, "i-1", 3, Some(7)).is_ok(), "{status} 应可写");
+            assert!(
+                check_writable(&r, "i-1", 3, Some(7)).is_ok(),
+                "{status} 应可写"
+            );
         }
         let r = row("initializing", Some("i-1"), 3, false, 7);
         assert!(
-            matches!(check_writable(&r, "i-1", 3, Some(7)), Err(EngineError::LeaseLost)),
+            matches!(
+                check_writable(&r, "i-1", 3, Some(7)),
+                Err(EngineError::LeaseLost)
+            ),
             "initializing 无写权（还没有事件日志可写）"
         );
     }
@@ -433,7 +433,13 @@ mod tests {
             assert!(status_is_active(status), "{status} 应为活跃");
         }
         for status in [
-            "succeeded", "failed", "cancelled", "initializing", "initializing ", "paused", "",
+            "succeeded",
+            "failed",
+            "cancelled",
+            "initializing",
+            "initializing ",
+            "paused",
+            "",
         ] {
             assert!(!status_is_active(status), "{status} 不应为活跃");
         }

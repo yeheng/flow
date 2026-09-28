@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use rquickjs::{Array, Ctx, Context, Function, Object, Runtime, Value as JsValue};
+use rquickjs::{Array, Context, Ctx, Function, Object, Runtime, Value as JsValue};
 use serde_json::Value;
 
 use crate::error::EngineError;
@@ -60,12 +60,15 @@ impl<'js> JsReader<'js> {
     fn new(ctx: &Ctx<'js>) -> Result<Self, rquickjs::Error> {
         Ok(Self {
             date_ctor: ctx.globals().get::<_, Object>("Date")?,
-            date_to_iso: ctx
-                .eval::<Function, _>("(function (d) { return d.toISOString(); })")?,
+            date_to_iso: ctx.eval::<Function, _>("(function (d) { return d.toISOString(); })")?,
         })
     }
 
-    fn to_json(&self, value: &JsValue<'js>, depth: usize) -> Result<Option<Value>, rquickjs::Error> {
+    fn to_json(
+        &self,
+        value: &JsValue<'js>,
+        depth: usize,
+    ) -> Result<Option<Value>, rquickjs::Error> {
         if depth > MAX_JS_DEPTH {
             return Err(rquickjs::Error::new_from_js(
                 "object",

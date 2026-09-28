@@ -44,7 +44,8 @@ impl Harness {
 
     /// 轮询到 run 进入终态（Driver 退出后才算：终态 + not live）。
     pub async fn wait_terminal(&self, run_id: &str) -> RunState {
-        self.wait_terminal_within(run_id, Duration::from_secs(5)).await
+        self.wait_terminal_within(run_id, Duration::from_secs(5))
+            .await
     }
 
     pub async fn wait_terminal_within(&self, run_id: &str, timeout: Duration) -> RunState {
@@ -255,7 +256,10 @@ pub async fn wait_node_running(engine: &Arc<Engine>, run_id: &str, node: &str) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let state = engine.snapshot(run_id).await.expect("读取快照失败");
-            if matches!(state.record(node).state, flow_engine::NodeState::Running { .. }) {
+            if matches!(
+                state.record(node).state,
+                flow_engine::NodeState::Running { .. }
+            ) {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;

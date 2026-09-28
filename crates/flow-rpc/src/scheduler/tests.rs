@@ -11,8 +11,7 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
-        let root =
-            std::env::temp_dir().join(format!("flow-scheduler-{}", uuid::Uuid::now_v7()));
+        let root = std::env::temp_dir().join(format!("flow-scheduler-{}", uuid::Uuid::now_v7()));
         let backend = SqliteBackend::open(&root, root.join("flow.db"))
             .await
             .unwrap();

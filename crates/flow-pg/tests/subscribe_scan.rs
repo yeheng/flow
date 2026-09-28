@@ -54,10 +54,28 @@ async fn active_run_is_never_crowded_out_by_recently_ended() {
         // ended_at 必须落在 30s 回看窗口内，否则根本不进终态补漏集合
         let started = base - Duration::from_secs(3600) + Duration::from_millis(i);
         let ended = base - Duration::from_secs(20) + Duration::from_millis(i);
-        insert_run(&pool, &format!("old-{i:03}"), &wf, v, "succeeded", started, Some(ended)).await;
+        insert_run(
+            &pool,
+            &format!("old-{i:03}"),
+            &wf,
+            v,
+            "succeeded",
+            started,
+            Some(ended),
+        )
+        .await;
     }
     // 最新才创建的活跃 run：旧代码按 started_at ASC 取 256 个时它排在最后
-    insert_run(&pool, "active-new", &wf, v, "running", base + Duration::from_secs(60), None).await;
+    insert_run(
+        &pool,
+        "active-new",
+        &wf,
+        v,
+        "running",
+        base + Duration::from_secs(60),
+        None,
+    )
+    .await;
 
     let candidates = engine
         .store()
@@ -66,7 +84,9 @@ async fn active_run_is_never_crowded_out_by_recently_ended() {
         .unwrap();
 
     assert!(
-        candidates.iter().any(|(id, terminal)| id == "active-new" && !terminal),
+        candidates
+            .iter()
+            .any(|(id, terminal)| id == "active-new" && !terminal),
         "活跃 run 必须进订阅扫描候选（被终态补漏挤出 = 事件推送饿死）：{candidates:?}"
     );
     let ended = candidates.iter().filter(|(_, terminal)| *terminal).count();
@@ -88,7 +108,16 @@ async fn ended_quota_is_bounded_and_prefers_recent() {
         // 终结时间严格递增且都在回看窗口内：old-000 最老、old-299 最新
         let started = base - Duration::from_secs(3600) + Duration::from_millis(i);
         let ended = base - Duration::from_secs(20) + Duration::from_millis(i);
-        insert_run(&pool, &format!("old-{i:03}"), &wf, v, "succeeded", started, Some(ended)).await;
+        insert_run(
+            &pool,
+            &format!("old-{i:03}"),
+            &wf,
+            v,
+            "succeeded",
+            started,
+            Some(ended),
+        )
+        .await;
     }
 
     let candidates = engine

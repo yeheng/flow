@@ -104,8 +104,7 @@ fn bigint_result_is_rejected_like_stringify() {
 #[test]
 fn runaway_script_is_interrupted_by_timeout() {
     let (input, nodes) = ctx();
-    let err =
-        eval_body("while (true) {}", &input, &nodes, Duration::from_millis(50)).unwrap_err();
+    let err = eval_body("while (true) {}", &input, &nodes, Duration::from_millis(50)).unwrap_err();
     assert!(matches!(err, EngineError::Expr(_)), "{err}");
 }
 

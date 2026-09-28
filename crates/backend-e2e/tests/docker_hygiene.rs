@@ -170,5 +170,8 @@ fn docker_ok(args: &[&str]) -> bool {
 /// 服务器上不该留着任何给定前缀的测试库（cleanup 删库必须生效）。
 async fn assert_no_test_databases(base_url: &str, prefix: &str) {
     let left = test_databases(base_url, prefix).await;
-    assert!(left.is_empty(), "{prefix}* 测试库应被全部 DROP，残留：{left:?}");
+    assert!(
+        left.is_empty(),
+        "{prefix}* 测试库应被全部 DROP，残留：{left:?}"
+    );
 }

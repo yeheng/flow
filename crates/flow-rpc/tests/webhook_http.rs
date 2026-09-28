@@ -101,7 +101,10 @@ async fn webhook_post_triggers_run_with_source_attribution() {
     // 未知 token 与禁用 token 同为 404（不区分，避免探测）
     let (status, _) = f.post("deadbeef", "{}").await;
     assert_eq!(status, 404);
-    f.backend.set_webhook_enabled(&hook.token, false).await.unwrap();
+    f.backend
+        .set_webhook_enabled(&hook.token, false)
+        .await
+        .unwrap();
     let (status, _) = f.post(&hook.token, "{}").await;
     assert_eq!(status, 404);
 
@@ -112,7 +115,10 @@ async fn webhook_post_triggers_run_with_source_attribution() {
     assert_eq!(status, 409);
 
     // body 非法 JSON → 400（先恢复 hook 为启用）
-    f.backend.set_webhook_enabled(&hook.token, true).await.unwrap();
+    f.backend
+        .set_webhook_enabled(&hook.token, true)
+        .await
+        .unwrap();
     let (status, _) = f.post(&hook.token, "not json").await;
     assert_eq!(status, 400);
 }

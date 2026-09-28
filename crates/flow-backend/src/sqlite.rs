@@ -25,8 +25,8 @@ use flow_store::{Store, StoreError};
 
 use crate::child::LocalChildLauncher;
 use crate::{
-    resolve_runnable_definition, BackendError, CreateRun, CreatedRun, RunRecord, RunStats, Schedule,
-    SignalAck, SignalRequest, Webhook, WorkflowSummary, WorkflowVersion,
+    resolve_runnable_definition, BackendError, CreateRun, CreatedRun, RunRecord, RunStats,
+    Schedule, SignalAck, SignalRequest, Webhook, WorkflowSummary, WorkflowVersion,
 };
 
 /// 把引擎的 run 状态变化落到 runs 表。引擎本身不依赖存储实现，适配在 SQLite
@@ -81,7 +81,8 @@ impl SqliteBackend {
     ) -> Result<SqliteBackend, BackendError> {
         let data_dir = data_dir.into();
         let db_path = db_path.as_ref().to_path_buf();
-        let io_err = |err: std::io::Error| BackendError::internal(format!("data_dir 访问失败：{err}"));
+        let io_err =
+            |err: std::io::Error| BackendError::internal(format!("data_dir 访问失败：{err}"));
         std::fs::create_dir_all(&data_dir).map_err(io_err)?;
         // 排他 flock：把「单进程假设」从文档焊成代码强制（DESIGN §12.14）。
         // LOCK_NB 立即失败——排队等待只会掩盖部署错误（正确的多节点形态是
@@ -672,7 +673,15 @@ mod tests {
         for (i, status) in statuses.iter().enumerate() {
             let run_id = format!("r-{i}");
             store
-                .insert_run(&run_id, &wf, 1, &Value::Null, status.as_str(), "manual", None)
+                .insert_run(
+                    &run_id,
+                    &wf,
+                    1,
+                    &Value::Null,
+                    status.as_str(),
+                    "manual",
+                    None,
+                )
                 .await
                 .unwrap();
             store

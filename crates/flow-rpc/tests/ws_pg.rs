@@ -17,9 +17,7 @@ use futures::StreamExt;
 use jsonrpsee::core::client::SubscriptionClientT;
 use serde_json::{json, Value};
 
-use common::{
-    call, call_err, line_def, named, publish, test_db, wait_status, ServerProc,
-};
+use common::{call, call_err, line_def, named, publish, test_db, wait_status, ServerProc};
 
 /// 集群冒烟：定义生命周期 → run.start 原子创建 → executor 驱动到终态 →
 /// timeline / events / signal_status 可读。
