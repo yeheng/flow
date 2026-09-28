@@ -10,6 +10,7 @@ use crate::error::EngineError;
 use crate::expr;
 use crate::model::{Node, NodeType, HTTP_METHODS};
 use crate::nodelog::NodeLogger;
+use crate::secrets;
 
 pub const DEFAULT_JS_TIMEOUT_MS: u64 = 2_000;
 pub const DEFAULT_HTTP_TIMEOUT_MS: u64 = 30_000;
@@ -190,9 +191,28 @@ pub async fn execute(
         .kind()
         .ok_or_else(|| NodeFailure::fatal(format!("未知节点类型：{}", ctx.node.node_type)))?;
 
-    // params 已由 driver 的 start_node 统一展开（DESIGN §10，展开恰好一次），
-    // 这里直接按类型分发。
-    dispatch(kind, ctx, cancel).await
+    // 统一参数展开（DESIGN §10）：除代码承载字段外，所有节点 params 在
+    // 执行前过同一份 ${} 模板展开。无模板时零成本原路返回（expand_params）。
+    // http_call 只是这条规则的第一个用户，不是特权户。
+    let mut overlay = expand_params(&ctx.node, &ctx.input, &ctx.outputs).await?;
+    // x-secret 参数：展开之后、dispatch 之前由名称解析为真值。真值不参与
+    // 模板展开，也不会进事件——node_started 在 driver 侧早已落盘，这里的
+    // node 只是执行期的内存副本。
+    if let Some(node) = secrets::resolve_node_secrets(overlay.as_ref().unwrap_or(&ctx.node))
+        .map_err(NodeFailure::fatal)?
+    {
+        overlay = Some(node);
+    }
+    match overlay {
+        Some(node) => {
+            let owned = NodeExecContext {
+                node,
+                ..ctx.clone()
+            };
+            dispatch(kind, &owned, cancel).await
+        }
+        None => dispatch(kind, ctx, cancel).await,
+    }
 }
 
 async fn dispatch(
@@ -207,6 +227,8 @@ async fn dispatch(
         NodeType::Condition => run_condition(ctx).await,
         NodeType::Delay => run_delay(ctx, cancel).await,
         NodeType::HttpCall => run_http(ctx).await,
+        NodeType::Llm => run_llm(ctx).await,
+        NodeType::Email => run_email(ctx).await,
         NodeType::SubWorkflow => run_sub_workflow(ctx, cancel).await,
         NodeType::HumanTask => Err(NodeFailure::fatal(
             "human_task 由引擎等待信号驱动，不应直接执行",
@@ -542,6 +564,185 @@ async fn run_http(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
     Ok(output)
 }
 
+/// llm / email 共用的出口：POST JSON + Bearer 认证。错误分类与 http_call
+/// 同一份习惯（连接失败/超时/读体断流/5xx 可重试，builder 与 4xx fatal），
+/// 唯一补充是 429 限流也可重试；超时参数语义与 http_call 一致（timeout_ms）。
+async fn post_json_bearer(
+    url: &str,
+    api_key: &str,
+    body: &Value,
+    timeout_ms: u64,
+) -> Result<(reqwest::StatusCode, Value), NodeFailure> {
+    let started = Instant::now();
+    let response = match HTTP_CLIENT
+        .post(url)
+        .bearer_auth(api_key)
+        .json(body)
+        .timeout(Duration::from_millis(timeout_ms))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(err) if err.is_builder() => {
+            // URL 非法：请求从未发出，参数错误重试也不会变好
+            return Err(NodeFailure::fatal(format!("请求参数非法：{err}")));
+        }
+        Err(err) => {
+            return Err(NodeFailure::retryable(format!(
+                "请求 {url} 失败（{}ms）：{err}",
+                started.elapsed().as_millis()
+            )));
+        }
+    };
+    let status = response.status();
+    let text = match response.text().await {
+        Ok(text) => text,
+        Err(err) => {
+            return Err(NodeFailure::retryable(format!(
+                "读取 {url} 响应体失败（{}ms）：{err}",
+                started.elapsed().as_millis()
+            )));
+        }
+    };
+    let body = serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text));
+    if status.is_server_error()
+        || status.is_client_error()
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+    {
+        // 429/5xx 稍后可能好转；其余 4xx 是请求本身的问题（key 无效、模型名错）
+        let retryable =
+            status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+        let mut failure = if retryable {
+            NodeFailure::retryable(format!("HTTP {status}"))
+        } else {
+            NodeFailure::fatal(format!("HTTP {status}"))
+        };
+        failure.message = format!("{}，响应体：{}", failure.message, truncate(&body));
+        return Err(failure);
+    }
+    Ok((status, body))
+}
+
+/// OpenAI 兼容 chat/completions 的请求构造（纯函数，与网络无关便于测试）。
+fn llm_request(params: &Value) -> Result<(String, Value), NodeFailure> {
+    let need = |key: &str| {
+        params
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| NodeFailure::fatal(format!("llm 节点缺少参数 {key}")))
+    };
+    let base_url = params
+        .get("base_url")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("https://api.openai.com/v1");
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+
+    let mut messages = Vec::new();
+    if let Some(system) = params
+        .get("system")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        messages.push(serde_json::json!({"role": "system", "content": system}));
+    }
+    messages.push(serde_json::json!({"role": "user", "content": need("prompt")?}));
+
+    let mut body = serde_json::json!({"model": need("model")?, "messages": messages});
+    if let Some(temperature) = params.get("temperature").and_then(Value::as_f64) {
+        body["temperature"] = serde_json::json!(temperature);
+    }
+    if let Some(max_tokens) = params.get("max_tokens").and_then(Value::as_u64) {
+        body["max_tokens"] = serde_json::json!(max_tokens);
+    }
+    if params
+        .get("json_mode")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        body["response_format"] = serde_json::json!({"type": "json_object"});
+    }
+    Ok((url, body))
+}
+
+async fn run_llm(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
+    // params 已展开、x-secret 已由 execute 注入真值——api_key 这里是真值，
+    // 只进 Authorization 头，不得写进输出/错误消息
+    let api_key = ctx
+        .node
+        .param_str("api_key")
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| NodeFailure::fatal("llm 节点缺少参数 api_key"))?
+        .to_string();
+    let (url, body) = llm_request(&ctx.node.params)?;
+    let timeout_ms = ctx
+        .node
+        .param_u64("timeout_ms")
+        .unwrap_or(DEFAULT_HTTP_TIMEOUT_MS);
+    let (_status, response) = post_json_bearer(&url, &api_key, &body, timeout_ms).await?;
+
+    let content = response
+        .pointer("/choices/0/message/content")
+        .cloned()
+        .ok_or_else(|| {
+            NodeFailure::fatal(format!(
+                "llm 响应缺少 choices[0].message.content：{}",
+                truncate(&response)
+            ))
+        })?;
+    Ok(serde_json::json!({
+        "content": content,
+        "model": response.get("model").cloned().unwrap_or(Value::Null),
+        "usage": response.get("usage").cloned().unwrap_or(Value::Null),
+    }))
+}
+
+/// Resend 兼容发信接口的请求构造（纯函数）。to 原样透传字符串。
+fn email_request(params: &Value) -> Result<(String, Value), NodeFailure> {
+    let need = |key: &str| {
+        params
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| NodeFailure::fatal(format!("email 节点缺少参数 {key}")))
+    };
+    let endpoint = params
+        .get("endpoint")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("https://api.resend.com/emails")
+        .to_string();
+    let body = serde_json::json!({
+        "from": need("from")?,
+        "to": need("to")?,
+        "subject": need("subject")?,
+        "text": need("body")?,
+    });
+    Ok((endpoint, body))
+}
+
+async fn run_email(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
+    let api_key = ctx
+        .node
+        .param_str("api_key")
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| NodeFailure::fatal("email 节点缺少参数 api_key"))?
+        .to_string();
+    let (endpoint, body) = email_request(&ctx.node.params)?;
+    let timeout_ms = ctx
+        .node
+        .param_u64("timeout_ms")
+        .unwrap_or(DEFAULT_HTTP_TIMEOUT_MS);
+    let (status, response) = post_json_bearer(&endpoint, &api_key, &body, timeout_ms).await?;
+    Ok(serde_json::json!({
+        "status": status.as_u16(),
+        "id": response.get("id").cloned().unwrap_or(Value::Null),
+    }))
+}
+
 fn truncate(value: &Value) -> String {
     let text = value.to_string();
     if text.len() <= 512 {
@@ -775,6 +976,258 @@ mod tests {
             "响应体断流必须判为可重试失败：{}",
             failure.message
         );
+    }
+
+    /// 一次性 mock HTTP 服务器：收下请求原文，回给定状态行与 JSON body。
+    fn mock_server(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<tokio::sync::Mutex<String>>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            // 读满 请求头 + Content-Length 声明的 body（POST body 可能分片到达）
+            loop {
+                let n = sock.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf);
+                if let Some(head_end) = text.find("\r\n\r\n") {
+                    let len = text[..head_end]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= head_end + 4 + len {
+                        break;
+                    }
+                }
+            }
+            *seen2.lock().await = String::from_utf8_lossy(&buf).to_string();
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(response.as_bytes()).await.unwrap();
+        });
+        (addr, seen)
+    }
+
+    /// llm 请求构造：必填、system 插队、可选字段、json_mode、base_url 默认值与尾斜杠。
+    #[test]
+    fn llm_request_builds_openai_chat_body() {
+        let (url, body) = llm_request(&json!({
+            "api_key": "k", "model": "gpt-x", "prompt": "你好"
+        }))
+        .unwrap();
+        assert_eq!(url, "https://api.openai.com/v1/chat/completions");
+        assert_eq!(
+            body,
+            json!({"model": "gpt-x", "messages": [{"role": "user", "content": "你好"}]})
+        );
+
+        let (url, body) = llm_request(&json!({
+            "base_url": "http://127.0.0.1:9/v1/",
+            "model": "m", "prompt": "p", "system": "s",
+            "temperature": 0.5, "max_tokens": 128, "json_mode": true
+        }))
+        .unwrap();
+        assert_eq!(
+            url, "http://127.0.0.1:9/v1/chat/completions",
+            "尾斜杠不双写"
+        );
+        assert_eq!(
+            body["messages"][0],
+            json!({"role": "system", "content": "s"})
+        );
+        assert_eq!(body["messages"][1], json!({"role": "user", "content": "p"}));
+        assert_eq!(body["temperature"], json!(0.5));
+        assert_eq!(body["max_tokens"], json!(128));
+        assert_eq!(body["response_format"], json!({"type": "json_object"}));
+
+        // 缺 prompt：fatal
+        let err = llm_request(&json!({"model": "m"})).unwrap_err();
+        assert!(
+            !err.retryable && err.message.contains("prompt"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// email 请求构造：Resend 格式（body → text），endpoint 默认值。
+    #[test]
+    fn email_request_builds_resend_body() {
+        let (url, body) = email_request(&json!({
+            "api_key": "k", "from": "a@b.c", "to": "d@e.f", "subject": "s", "body": "正文"
+        }))
+        .unwrap();
+        assert_eq!(url, "https://api.resend.com/emails");
+        assert_eq!(
+            body,
+            json!({"from": "a@b.c", "to": "d@e.f", "subject": "s", "text": "正文"})
+        );
+
+        let err = email_request(&json!({"api_key": "k", "from": "a@b.c"})).unwrap_err();
+        assert!(
+            !err.retryable && err.message.contains("to"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// x-secret 注入：api_key 存名称，execute 内经 FLOW_SECRET_<名称> 解析为
+    /// 真值后进 Authorization 头；名称对应环境变量缺失 → fatal 且消息带提示。
+    #[tokio::test]
+    async fn llm_secret_is_injected_from_env_and_missing_is_fatal() {
+        let (addr, seen) = mock_server(
+            "200 OK",
+            r#"{"model":"m","choices":[{"message":{"content":"答"}}],"usage":{"total_tokens":3}}"#,
+        );
+        std::env::set_var("FLOW_SECRET_TEST_LLM_KEY", "sk-live-value");
+        let llm = node(
+            "llm",
+            json!({
+                "base_url": format!("http://{addr}"),
+                "api_key": "TEST_LLM_KEY",
+                "model": "m", "prompt": "p"
+            }),
+        );
+        let out = execute(
+            &ctx(llm, json!({}), HashMap::new()),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out,
+            json!({"content": "答", "model": "m", "usage": {"total_tokens": 3}})
+        );
+        let request = seen.lock().await.clone();
+        assert!(
+            request.contains("authorization: Bearer sk-live-value"),
+            "真值必须进 Authorization 头：{request}"
+        );
+        assert!(!out.to_string().contains("sk-live-value"), "真值不得进输出");
+        std::env::remove_var("FLOW_SECRET_TEST_LLM_KEY");
+
+        // 名称未配置：fatal（参数错误，重试无意义），消息点名环境变量
+        let llm = node(
+            "llm",
+            json!({"api_key": "TEST_LLM_MISSING", "model": "m", "prompt": "p"}),
+        );
+        let err = execute(
+            &ctx(llm, json!({}), HashMap::new()),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(!err.retryable, "{}", err.message);
+        assert!(
+            err.message.contains("FLOW_SECRET_TEST_LLM_MISSING"),
+            "错误消息必须提示环境变量名：{}",
+            err.message
+        );
+    }
+
+    /// llm 的错误分类：429/5xx 可重试，其余 4xx fatal。
+    #[tokio::test]
+    async fn llm_error_classification_matches_http_habits() {
+        // api_key 是密钥名称（x-secret）：字面量也要经 FLOW_SECRET_<名称> 解析
+        std::env::set_var("FLOW_SECRET_TEST_CLS_KEY", "sk-x");
+        for (status_line, retryable) in [
+            ("429 Too Many Requests", true),
+            ("500 Internal Server Error", true),
+            ("400 Bad Request", false),
+            ("401 Unauthorized", false),
+        ] {
+            let (addr, _seen) = mock_server(status_line, r#"{"error":"x"}"#);
+            let llm = node(
+                "llm",
+                json!({
+                    "base_url": format!("http://{addr}"),
+                    "api_key": "TEST_CLS_KEY", "model": "m", "prompt": "p"
+                }),
+            );
+            let err = execute(
+                &ctx(llm, json!({}), HashMap::new()),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.retryable, retryable, "{status_line}: {}", err.message);
+            assert!(err.message.contains(status_line.split(' ').next().unwrap()));
+        }
+        std::env::remove_var("FLOW_SECRET_TEST_CLS_KEY");
+    }
+
+    /// email 端到端（mock）：请求体是 Resend 格式，Bearer 头是注入的真值，
+    /// 输出 {status, id}。
+    #[tokio::test]
+    async fn email_posts_resend_format_and_reports_id() {
+        let (addr, seen) = mock_server("200 OK", r#"{"id":"em_123"}"#);
+        std::env::set_var("FLOW_SECRET_TEST_EMAIL_KEY", "re-live-value");
+        let email = node(
+            "email",
+            json!({
+                "endpoint": format!("http://{addr}/emails"),
+                "api_key": "TEST_EMAIL_KEY",
+                "from": "a@b.c", "to": "d@e.f",
+                "subject": "告警 ${input.what}", "body": "明细 ${input.what}"
+            }),
+        );
+        let out = execute(
+            &ctx(email, json!({"what": "磁盘"}), HashMap::new()),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, json!({"status": 200, "id": "em_123"}));
+        let request = seen.lock().await.clone();
+        assert!(
+            request.contains("authorization: Bearer re-live-value"),
+            "{request}"
+        );
+        assert!(
+            request.contains("\"subject\":\"告警 磁盘\""),
+            "subject 模板应展开：{request}"
+        );
+        assert!(
+            request.contains("\"text\":\"明细 磁盘\""),
+            "body → text：{request}"
+        );
+
+        // 响应没有 id 字段：id 为 null
+        let (addr, _seen) = mock_server("202 Accepted", r#"{"queued":true}"#);
+        let email = node(
+            "email",
+            json!({
+                "endpoint": format!("http://{addr}/emails"),
+                "api_key": "TEST_EMAIL_KEY", "from": "a@b.c", "to": "d@e.f", "subject": "s", "body": "b"
+            }),
+        );
+        let out = execute(
+            &ctx(email, json!({}), HashMap::new()),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, json!({"status": 202, "id": null}));
+        std::env::remove_var("FLOW_SECRET_TEST_EMAIL_KEY");
     }
 }
 

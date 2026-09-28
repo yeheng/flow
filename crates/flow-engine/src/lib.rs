@@ -9,6 +9,7 @@ pub mod expr;
 pub mod fold;
 pub mod model;
 pub mod nodelog;
+pub mod secrets;
 
 pub use backend::{CommitOutcome, PendingInput, PendingInputKind, RunEventSink};
 pub use child_run::{ChildRunLauncher, ChildRunOutcome, MAX_SUB_WORKFLOW_DEPTH};

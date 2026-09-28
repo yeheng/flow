@@ -47,10 +47,7 @@ pub use flow_dto::{
     DbRunSource, DbRunStatus, RunRecord, RunStats, Schedule, Webhook, WorkflowRunStats,
     WorkflowSummary, WorkflowVersion,
 };
-pub use flow_engine::{
-    redact_value, Definition, Envelope, Event, LogLevel, LogStream, NodeState, RunState,
-    HTTP_METHODS,
-};
+pub use flow_engine::{redact_value, Definition, Envelope, Event, LogLevel, LogStream, NodeState, RunState, HTTP_METHODS, secrets, NodeType};
 
 mod child;
 mod pg;

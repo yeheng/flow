@@ -81,6 +81,78 @@ fn definition(output: i64) -> Value {
     })
 }
 
+fn llm_def(api_key: &str) -> Value {
+    json!({
+        "nodes": [
+            {"id":"s", "type":"start"},
+            {"id":"n", "type":"llm", "params":{"api_key": api_key, "model": "m", "prompt": "p"}},
+            {"id":"e", "type":"end"}
+        ],
+        "edges": [{"from":"s", "to":"n"}, {"from":"n", "to":"e"}]
+    })
+}
+
+/// secrets.list：排序后的名称清单，永远不含值。
+#[tokio::test]
+async fn secrets_list_returns_sorted_names_without_values() {
+    let f = Fixture::new().await;
+    std::env::set_var("FLOW_SECRET_TEST_RPC_B", "value-b");
+    std::env::set_var("FLOW_SECRET_TEST_RPC_A", "value-a");
+
+    let resp = f.call("secrets.list", json!({})).await;
+    let names: Vec<&str> = resp["result"]["secrets"]
+        .as_array()
+        .expect("result.secrets 必须是数组")
+        .iter()
+        .map(|n| n.as_str().unwrap())
+        .collect();
+    let pos_a = names.iter().position(|n| *n == "TEST_RPC_A").unwrap();
+    let pos_b = names.iter().position(|n| *n == "TEST_RPC_B").unwrap();
+    assert!(pos_a < pos_b, "必须按名称排序：{names:?}");
+    assert!(!resp.to_string().contains("value-a"), "响应不得含真值");
+
+    std::env::remove_var("FLOW_SECRET_TEST_RPC_A");
+    std::env::remove_var("FLOW_SECRET_TEST_RPC_B");
+}
+
+/// workflow.update 的密钥提前校验：名称未配置 → -32010 并点名环境变量；
+/// 配置后落库的仍是名称，不是真值。
+#[tokio::test]
+async fn workflow_update_validates_secret_names_exist() {
+    let f = Fixture::new().await;
+
+    let bad = f
+        .call(
+            "workflow.update",
+            json!({"workflow_id": f.workflow, "definition": llm_def("TEST_RPC_MISSING")}),
+        )
+        .await;
+    assert_eq!(bad["error"]["code"], -32010, "{bad}");
+    let message = bad["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("TEST_RPC_MISSING") && message.contains("FLOW_SECRET_TEST_RPC_MISSING"),
+        "{message}"
+    );
+
+    std::env::set_var("FLOW_SECRET_TEST_RPC_OK", "real-value");
+    let ok = f
+        .call(
+            "workflow.update",
+            json!({"workflow_id": f.workflow, "definition": llm_def("TEST_RPC_OK")}),
+        )
+        .await;
+    assert!(ok.get("error").is_none(), "{ok}");
+    let got = f
+        .call("workflow.get", json!({"workflow_id": f.workflow}))
+        .await;
+    assert_eq!(
+        got["result"]["definition"]["nodes"][1]["params"]["api_key"],
+        json!("TEST_RPC_OK"),
+        "落库的必须是名称而非真值"
+    );
+    std::env::remove_var("FLOW_SECRET_TEST_RPC_OK");
+}
+
 #[tokio::test]
 async fn explicit_draft_is_rejected_and_historical_published_version_still_runs() {
     let f = Fixture::new().await;
