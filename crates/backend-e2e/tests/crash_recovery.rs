@@ -75,6 +75,26 @@ e2e_test!(
     })
 );
 
+/// 等 run 的 http 请求日志行落盘（run.events 可见）。
+async fn wait_request_log_written(client: &backend_e2e::common::Client, run_id: &str) {
+    let deadline = std::time::Instant::now() + SHORT;
+    loop {
+        let events: Value = call_json(client, "run.events", json!({"run_id": run_id})).await;
+        let written = events["events"].as_array().unwrap().iter().any(|e| {
+            e["type"] == json!("node_log")
+                && e["message"].as_str().unwrap_or("").starts_with("→ POST")
+        });
+        if written {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "http 请求日志未落盘：{events}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 e2e_test!(
     restart_asks_for_adjudication_on_side_effect_node,
     |ctx: &mut Ctx| Box::pin(async move {
@@ -89,6 +109,9 @@ e2e_test!(
         let (workflow_id, _) = publish_workflow(&client, "支付流程", definition).await;
         let run_id = start_run(&client, &workflow_id, json!({ "amount": 99 })).await;
         wait_node_started(&client, &run_id, "call").await;
+        // 日志发射即忘：要断言"已落盘的日志跨 SIGKILL 存活"，必须等它出现在
+        // 事件日志里再杀（发射到落盘之间的微小窗口内丢尾巴属于分层语义）
+        wait_request_log_written(&client, &run_id).await;
 
         // 请求已发出但未收到响应时杀进程：副作用是否发生不可知（§7 分类表）
         ctx.restart().await;
@@ -112,10 +135,7 @@ e2e_test!(
                 .unwrap()
                 .iter()
                 .any(|e| e["type"] == json!("node_log")
-                    && e["message"]
-                        .as_str()
-                        .unwrap_or("")
-                        .starts_with("→ POST ")),
+                    && e["message"].as_str().unwrap_or("").starts_with("→ POST ")),
             "http 请求日志必须在崩溃后仍可读：{events}"
         );
 

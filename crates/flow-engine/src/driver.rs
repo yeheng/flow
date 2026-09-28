@@ -20,11 +20,11 @@ use crate::backend::{CommitOutcome, PendingInput, PendingInputKind, RunEventSink
 use crate::child_run::ChildRunLauncher;
 use crate::engine::{DbRunStatus, Signal};
 use crate::error::EngineError;
-use crate::event::{Envelope, Event, LogStream, LogLevel};
+use crate::event::{Envelope, Event, LogLevel, LogStream};
 use crate::exec::{self, ChildRunSpec, NodeExecContext, NodeFailure};
 use crate::fold::{NodeState, RunState};
 use crate::model::{Definition, NodeType};
-use crate::nodelog::{redact_value, LogBudget, LogLine, NodeLogger};
+use crate::nodelog::{cap_input_snapshot, redact_value, LogBudget, LogLine, NodeLogger};
 
 /// 单次驱动所需的全部输入。
 pub struct DriverSpec {
@@ -420,18 +420,26 @@ impl Driver {
 
     /// 节点日志落盘（进程级持久）：fold 不消费 NodeLog，但 seq 必须推进、
     /// 订阅者必须收到，与 append 同一套包装。
-    async fn write_log_line(&mut self, line: LogLine) -> Result<(), EngineError> {
-        let event = Event::NodeLog {
-            node_id: line.node_id,
-            attempt: line.attempt,
-            level: line.level,
-            stream: line.stream,
-            message: line.message,
-        };
-        match self.sink.append_log(event).await {
-            Ok(envelope) => {
-                self.state.fold(&envelope);
-                self.broadcast(envelope);
+    async fn write_log_batch(&mut self, lines: Vec<LogLine>) -> Result<(), EngineError> {
+        if lines.is_empty() {
+            return Ok(());
+        }
+        let events: Vec<Event> = lines
+            .into_iter()
+            .map(|line| Event::NodeLog {
+                node_id: line.node_id,
+                attempt: line.attempt,
+                level: line.level,
+                stream: line.stream,
+                message: line.message,
+            })
+            .collect();
+        match self.sink.append_log_batch(events).await {
+            Ok(envelopes) => {
+                for envelope in envelopes {
+                    self.state.fold(&envelope);
+                    self.broadcast(envelope);
+                }
                 Ok(())
             }
             Err(err) => Err(self.guard_lease(err)),
@@ -450,9 +458,7 @@ impl Driver {
                 }
             }
         }
-        for line in lines {
-            self.write_log_line(line).await?;
-        }
+        self.write_log_batch(lines).await?;
         self.flush_log_summary().await
     }
 
@@ -462,13 +468,13 @@ impl Driver {
         if dropped == 0 {
             return Ok(());
         }
-        self.write_log_line(LogLine {
+        self.write_log_batch(vec![LogLine {
             node_id: String::new(),
             attempt: 0,
             level: LogLevel::Warn,
             stream: LogStream::Engine,
             message: format!("已丢弃 {dropped} 条 debug/info 日志（达到每 run 日志预算）"),
-        })
+        }])
         .await
     }
 
@@ -481,9 +487,7 @@ impl Driver {
                 lines.push(line);
             }
         }
-        for line in lines {
-            self.write_log_line(line).await?;
-        }
+        self.write_log_batch(lines).await?;
         self.flush_log_summary().await
     }
 
@@ -727,17 +731,18 @@ impl Driver {
         // 先于 node_started 完成以便输入面快照随事件落盘。展开失败走
         // 节点失败路径（写序协议不变：先 node_started 再 node_failed）。
         // human_task 不执行、历史行为也不展开：输入面用原始 params。
+        // 输入面快照：脱敏 → 字节上限（超限占位，见 nodelog::cap_input_snapshot）
         let (node, input_snapshot) = if kind == NodeType::HumanTask {
-            let input = redact_value(&node.params);
+            let input = cap_input_snapshot(&redact_value(&node.params));
             (node, input)
         } else {
             match exec::expand_params(&node, &self.input, &outputs).await {
                 Ok(Some(expanded)) => {
-                    let input = redact_value(&expanded.params);
+                    let input = cap_input_snapshot(&redact_value(&expanded.params));
                     (expanded, input)
                 }
                 Ok(None) => {
-                    let input = redact_value(&node.params);
+                    let input = cap_input_snapshot(&redact_value(&node.params));
                     (node, input)
                 }
                 Err(failure) => {
@@ -751,7 +756,8 @@ impl Driver {
                     if failure.platform {
                         return Err(EngineError::Backend(failure.message));
                     }
-                    self.fail_node(node_id, attempt, &failure, result_tx).await?;
+                    self.fail_node(node_id, attempt, &failure, result_tx)
+                        .await?;
                     return Ok(());
                 }
             }
@@ -796,12 +802,7 @@ impl Driver {
                 }),
                 _ => None,
             },
-            logger: NodeLogger::new(
-                self.log_tx.clone(),
-                self.budget.clone(),
-                node_id,
-                attempt,
-            ),
+            logger: NodeLogger::new(self.log_tx.clone(), self.budget.clone(), node_id, attempt),
         };
         let cancel = self.cancel.clone();
         let result_tx = result_tx.clone();
@@ -914,7 +915,8 @@ impl Driver {
                         if failure.platform {
                             return Err(EngineError::Backend(failure.message));
                         }
-                        self.fail_node(&node_id, attempt, &failure, result_tx).await?;
+                        self.fail_node(&node_id, attempt, &failure, result_tx)
+                            .await?;
                     }
                 }
             }
@@ -961,7 +963,7 @@ impl Driver {
             .node(node_id)
             .map(|node| node.retry().backoff_ms)
             .unwrap_or(0);
-        // 重试叙事进事件流：第几次、退避多久，归属到即将开始的新 attempt
+        // 重试叙事进事件流：第几次尝试/重试分清楚，退避多久，归属到新 attempt
         let next_attempt = self.next_attempt(node_id);
         let _ = self
             .append(Event::NodeLog {
@@ -969,7 +971,12 @@ impl Driver {
                 attempt: next_attempt,
                 level: LogLevel::Warn,
                 stream: LogStream::Engine,
-                message: format!("第 {next_attempt} 次重试（退避 {backoff}ms）"),
+                message: format!(
+                    "即将开始第 {} 次尝试（第 {} 次重试），退避 {}ms",
+                    next_attempt,
+                    next_attempt.saturating_sub(1),
+                    backoff
+                ),
             })
             .await;
         let result_tx = result_tx.clone();

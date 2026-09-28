@@ -191,27 +191,20 @@ pub async fn execute(
         .kind()
         .ok_or_else(|| NodeFailure::fatal(format!("未知节点类型：{}", ctx.node.node_type)))?;
 
-    // 统一参数展开（DESIGN §10）：除代码承载字段外，所有节点 params 在
-    // 执行前过同一份 ${} 模板展开。无模板时零成本原路返回（expand_params）。
-    // http_call 只是这条规则的第一个用户，不是特权户。
-    let mut overlay = expand_params(&ctx.node, &ctx.input, &ctx.outputs).await?;
-    // x-secret 参数：展开之后、dispatch 之前由名称解析为真值。真值不参与
-    // 模板展开，也不会进事件——node_started 在 driver 侧早已落盘，这里的
-    // node 只是执行期的内存副本。
-    if let Some(node) = secrets::resolve_node_secrets(overlay.as_ref().unwrap_or(&ctx.node))
-        .map_err(NodeFailure::fatal)?
-    {
-        overlay = Some(node);
-    }
-    match overlay {
-        Some(node) => {
-            let owned = NodeExecContext {
-                node,
-                ..ctx.clone()
-            };
-            dispatch(kind, &owned, cancel).await
-        }
-        None => dispatch(kind, ctx, cancel).await,
+    // params 已由 driver 的 start_node 统一展开（DESIGN §10，展开恰好一次），
+    // exec 层不再展开：双展开会把数据里合法的 ${ 再 evaluate 一遍（历史回归，
+    // 见 http_url_template_is_expanded_before_request）。
+    // x-secret 参数：dispatch 之前由名称解析为真值。真值不参与模板展开，也
+    // 不进事件——node_started 在 driver 侧早已落盘，这里的 node 只是执行期
+    // 的内存副本。
+    if let Some(node) = secrets::resolve_node_secrets(&ctx.node).map_err(NodeFailure::fatal)? {
+        let owned = NodeExecContext {
+            node,
+            ..ctx.clone()
+        };
+        dispatch(kind, &owned, cancel).await
+    } else {
+        dispatch(kind, ctx, cancel).await
     }
 }
 
@@ -372,12 +365,11 @@ async fn run_condition(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
     let input = ctx.input.clone();
     let nodes = ctx.nodes_value();
     let timeout = ctx.js_timeout();
-    let result = tokio::task::spawn_blocking(move || {
-        expr::eval_expr(&expression, &input, &nodes, timeout)
-    })
-    .await
-    .map_err(|e| NodeFailure::fatal(format!("条件求值任务异常：{e}")))?
-    .map_err(NodeFailure::from);
+    let result =
+        tokio::task::spawn_blocking(move || expr::eval_expr(&expression, &input, &nodes, timeout))
+            .await
+            .map_err(|e| NodeFailure::fatal(format!("条件求值任务异常：{e}")))?
+            .map_err(NodeFailure::from);
     match &result {
         // 分支走向从日志一目了然：求值结果 + 真值判定
         Ok(value) => ctx.logger.debug(format!(
@@ -386,9 +378,11 @@ async fn run_condition(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
             value,
             if truthy(value) { "true" } else { "false" }
         )),
-        Err(err) => ctx
-            .logger
-            .error(format!("条件求值失败：{}（{}）", err.message, ctx.node.param_str("expr").unwrap_or(""))),
+        Err(err) => ctx.logger.error(format!(
+            "条件求值失败：{}（{}）",
+            err.message,
+            ctx.node.param_str("expr").unwrap_or("")
+        )),
     }
     result
 }
@@ -487,8 +481,7 @@ async fn run_http(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
         Ok(response) => response,
         Err(err) if err.is_builder() => {
             // URL/请求头非法：请求从未发出，参数错误重试也不会变好（DESIGN §6.5）
-            ctx.logger
-                .error(format!("请求参数非法：{err}（未发出）"));
+            ctx.logger.error(format!("请求参数非法：{err}（未发出）"));
             return Err(NodeFailure::fatal(format!("请求参数非法：{err}")));
         }
         Err(err) => {
@@ -902,6 +895,45 @@ mod tests {
         assert!(request.starts_with("GET /items/o-9 "), "{request}");
     }
 
+    /// 双展开守卫：用户数据里合法的 `${` 在 driver 展开后被嵌入 params，
+    /// execute 不得再展开一次——否则数据会被当模板 evaluate（数据损坏 +
+    /// 模板注入）。展开恰好一次，见 expand_params 文档。
+    #[tokio::test]
+    async fn execute_does_not_expand_user_data_again() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let n = sock.read(&mut buf).await.unwrap();
+            *seen2.lock().await = String::from_utf8_lossy(&buf[..n]).to_string();
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n{\"ok\":1}")
+                .await
+                .unwrap();
+        });
+
+        // 模拟 driver 的那一次展开：用户数据 order_id 本身是模板样子的字符串
+        let input = json!({"order_id": "${input.evil}", "evil": "PWNED"});
+        let http = node(
+            "http_call",
+            json!({"url": format!("http://{addr}/items/${{input.order_id}}")}),
+        );
+        let http = expand_params(&http, &input, &HashMap::new())
+            .await
+            .unwrap()
+            .unwrap_or(http);
+        execute(&ctx(http, input, HashMap::new()), &CancellationToken::new())
+            .await
+            .unwrap();
+        let request = seen.lock().await.clone();
+        assert!(
+            !request.contains("PWNED"),
+            "用户数据不得被二次展开 evaluate：{request}"
+        );
+    }
+
     #[test]
     fn json_truthiness_matches_javascript() {
         for value in [
@@ -1190,6 +1222,11 @@ mod tests {
                 "subject": "告警 ${input.what}", "body": "明细 ${input.what}"
             }),
         );
+        // 展开已上移到 driver 的 start_node：测试预展开后进 execute
+        let email = expand_params(&email, &json!({"what": "磁盘"}), &HashMap::new())
+            .await
+            .unwrap()
+            .unwrap_or(email);
         let out = execute(
             &ctx(email, json!({"what": "磁盘"}), HashMap::new()),
             &CancellationToken::new(),

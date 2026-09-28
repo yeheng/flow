@@ -130,7 +130,14 @@ fn result_conversion_matches_json_stringify() {
 #[test]
 fn bigint_results_convert_exactly() {
     let (input, nodes) = ctx();
-    let out = eval_body("return 1n + 2n;", &input, &nodes, Duration::from_secs(2), &NodeLogger::disabled()).unwrap();
+    let out = eval_body(
+        "return 1n + 2n;",
+        &input,
+        &nodes,
+        Duration::from_secs(2),
+        &NodeLogger::disabled(),
+    )
+    .unwrap();
     assert_eq!(out, json!(3));
 }
 
@@ -201,7 +208,14 @@ fn big_int_mixing_number_fails_loudly() {
 #[test]
 fn oversized_bigint_result_is_rejected() {
     let (input, nodes) = ctx();
-    let err = eval_body("return 2n ** 64n;", &input, &nodes, Duration::from_secs(2), &NodeLogger::disabled()).unwrap_err();
+    let err = eval_body(
+        "return 2n ** 64n;",
+        &input,
+        &nodes,
+        Duration::from_secs(2),
+        &NodeLogger::disabled(),
+    )
+    .unwrap_err();
     assert!(matches!(err, EngineError::Expr(_)), "{err}");
 }
 
@@ -227,7 +241,14 @@ fn templates_handle_big_integers_exactly() {
 #[test]
 fn runaway_script_is_interrupted_by_timeout() {
     let (input, nodes) = ctx();
-    let err = eval_body("while (true) {}", &input, &nodes, Duration::from_millis(50), &NodeLogger::disabled()).unwrap_err();
+    let err = eval_body(
+        "while (true) {}",
+        &input,
+        &nodes,
+        Duration::from_millis(50),
+        &NodeLogger::disabled(),
+    )
+    .unwrap_err();
     assert!(matches!(err, EngineError::Expr(_)), "{err}");
 }
 

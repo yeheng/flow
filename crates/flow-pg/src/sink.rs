@@ -245,6 +245,32 @@ impl RunEventSink for PgRunSink {
         })
     }
 
+    /// 批量节点日志：**单事务整批**（锁行/租约校验一次、seq 连续分配、一次提交）。
+    /// 逐条 append_log 在 PG 上 = 每行一个受保护事务 + WAL 刷盘——日志的
+    /// "廉价层"语义会被抹平，刷屏 run 会把 driver 循环拖进成串刷盘。
+    fn append_log_batch<'a>(
+        &'a mut self,
+        events: Vec<Event>,
+    ) -> BoxFuture<'a, Result<Vec<Envelope>, EngineError>> {
+        Box::pin(async move {
+            if events.is_empty() {
+                return Ok(Vec::new());
+            }
+            let count = events.len();
+            let mut tx = self.begin().await?;
+            self.lock_and_check(&mut tx, Some(self.last_seq)).await?;
+            let mut envelopes = Vec::with_capacity(count);
+            for event in events {
+                let (seq, ts) = self.allocate_and_insert(&mut tx, &event).await?;
+                envelopes.push(self.envelope(seq, ts, event));
+            }
+            tx.commit().await.map_err(Self::sql_err)?;
+            // 批内 seq 连续（同一 UPDATE 链），末尾即最新
+            self.last_seq += count as u64;
+            Ok(envelopes)
+        })
+    }
+
     /// 终态追加：事件 + 元数据投影 + 清空租约 + 拒绝剩余 pending 输入，同一事务。
     fn append_terminal<'a>(
         &'a mut self,

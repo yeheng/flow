@@ -3,7 +3,7 @@
 //!
 //! 三条边界：
 //! - 名称列表对前端公开（`secrets.list`），真值永远不出进程内存；
-//! - 执行注入发生在 `exec::execute` 的参数模板展开之后、dispatch 之前——
+//! - 执行注入发生在 dispatch 之前（模板展开已由 driver 的 start_node 完成）——
 //!   真值不参与 `${}` 展开，也不会随 node_started 落盘（事件在注入前已写）；
 //! - `workflow.update` 提前校验名称存在，把配置错误挡在发布前。
 

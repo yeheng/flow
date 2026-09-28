@@ -635,7 +635,7 @@ e2e_test!(
     |ctx: &mut Ctx| Box::pin(async move {
         let client = ctx.client().await;
         // 脚本 console 输出 + 模板参数（含敏感键）→ 日志与输入面快照全部可查
-        let code = "console.log('hi from script', input);\nconsole.error('oops');\nreturn { ok: input.n };";
+        let code = "console.log('hi from script', input);\nconsole.error('oops');\nreturn { ok: input.n, token: 'sk-run-level' };";
         let mut def = linear_def(code);
         def["nodes"][1]["params"]["note"] = json!("n=${input.n}");
         def["nodes"][1]["params"]["token"] = json!("sk-should-be-redacted");
@@ -645,15 +645,23 @@ e2e_test!(
         let run = wait_run_terminal(&client, &run_id, TIMEOUT).await;
         assert_eq!(run["run"]["status"], json!("succeeded"));
 
-        // 时间线：输入面快照（展开 + 脱敏）与输出
+        // 时间线：输入面快照（展开 + 脱敏）、节点输出与 run 级输出同一脱敏标准
         let timeline: Value = call_json(&client, "run.timeline", json!({"run_id": run_id})).await;
         let node = timeline_node(&timeline, "n1");
         assert_eq!(node["input"]["note"], json!("n=7"), "模板展开后的输入面");
         assert_eq!(node["input"]["token"], json!("***"), "敏感键展示值脱敏");
-        assert_eq!(node["output"], json!({ "ok": 7 }));
-        // run.get 的 output 是数据面（CLI 语义），不做展示层脱敏——
-        // 这里仅确认它仍是原始输出
-        assert_eq!(run["run"]["output"], json!({ "ok": 7 }));
+        assert_eq!(node["output"]["token"], json!("***"), "节点输出脱敏");
+        assert_eq!(
+            timeline["output"]["token"],
+            json!("***"),
+            "run 级输出与节点输出同一脱敏标准（展示面不能双标）"
+        );
+        // run.get 的 output 是数据面（CLI 语义）：不做展示层脱敏
+        assert_eq!(
+            run["run"]["output"]["token"],
+            json!("sk-run-level"),
+            "run.get 输出是数据面，保持原值"
+        );
 
         // 事件流里有 node_log：console.log→stdout/info，console.error→stderr/error
         let events: Value = call_json(&client, "run.events", json!({"run_id": run_id})).await;
@@ -661,7 +669,10 @@ e2e_test!(
         let stdout_log = events.iter().find(|e| {
             e["type"] == json!("node_log")
                 && e["stream"] == json!("stdout")
-                && e["message"].as_str().unwrap_or("").contains("hi from script")
+                && e["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("hi from script")
         });
         assert!(stdout_log.is_some(), "console.log 必须进事件流：{events:?}");
         let stderr_log = events.iter().find(|e| {
@@ -669,7 +680,10 @@ e2e_test!(
                 && e["stream"] == json!("stderr")
                 && e["level"] == json!("error")
         });
-        assert!(stderr_log.is_some(), "console.error 必须以 error 级进事件流");
+        assert!(
+            stderr_log.is_some(),
+            "console.error 必须以 error 级进事件流"
+        );
         let log = stdout_log.unwrap();
         assert_eq!(log["node_id"], json!("n1"));
         assert_eq!(log["attempt"], json!(1));

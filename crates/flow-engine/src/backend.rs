@@ -54,6 +54,23 @@ pub trait RunEventSink: Send {
         Box::pin(self.append(event))
     }
 
+    /// 批量节点日志追加：默认逐条走 append_log；Postgres 覆写为**单事务整批**
+    /// （锁行/租约校验/seq 分配一次，逐行插入后一次提交）。逐条 = 每行一个
+    /// 受保护事务 + WAL 刷盘，日志的"廉价层"语义会在 PG 上被抹平——刷屏 run
+    /// 的一批 256 条日志就是 256 次刷盘，driver 循环破破受阻。
+    fn append_log_batch<'a>(
+        &'a mut self,
+        events: Vec<Event>,
+    ) -> BoxFuture<'a, Result<Vec<Envelope>, EngineError>> {
+        Box::pin(async move {
+            let mut envelopes = Vec::with_capacity(events.len());
+            for event in events {
+                envelopes.push(self.append_log(event).await?);
+            }
+            Ok(envelopes)
+        })
+    }
+
     /// 终态追加：事件 + 元数据投影 + 释放租约 + 拒绝剩余 pending 输入，同一提交点。
     fn append_terminal<'a>(
         &'a mut self,

@@ -749,11 +749,20 @@ async fn node_logs_and_input_snapshot_land_in_event_stream() {
         .expect("node_started 必带输入面");
     assert_eq!(started["note"], json!(21), "模板展开后的值");
     assert_eq!(started["code"], json!("console.log('hello', {from: 'js'});\nconsole.warn('careful');\nreturn input.amount * 2;"), "代码字段字节级不动");
-    assert!(!started["code"].as_str().unwrap().contains("${input.amount}"), "展开后不得残留模板");
+    assert!(
+        !started["code"]
+            .as_str()
+            .unwrap()
+            .contains("${input.amount}"),
+        "展开后不得残留模板"
+    );
     // 输入面不包含 run input 本身（token 不在节点输入面，脱敏针对 params 键）
     let snapshot_input = state.record("s").input.clone().expect("fold 记录输入面");
     assert_eq!(snapshot_input["note"], json!(21));
 
     // 日志不改变投影：s 的状态由 started/completed 决定
-    assert!(matches!(state.record("s").state, NodeState::Completed { .. }));
+    assert!(matches!(
+        state.record("s").state,
+        NodeState::Completed { .. }
+    ));
 }

@@ -45,8 +45,13 @@ export type SeqAction = "apply" | "skip";
 
 /**
  * 状态事件序号决策：陈旧（回放已覆盖）跳过；否则应用。
- * run_tail 保证单订阅内 seq 严格升序且不重复，断线重建订阅走 re-attach
- * 整体重建投影，所以这里只剩去重过滤。
+ *
+ * 契约的保证人（改 run_tail 前先读这段）：后端 run_tail（flow-backend/src/
+ * run_tail.rs）保证单订阅内 seq **严格连续且不重复**——回放段 1..N 与实时段
+ * 经 BTreeMap 去重合流，广播 Lagged 造成的缺口由它自己重读磁盘补齐后才继续
+ * 投递。因此客户端只需单调去重过滤；本订阅之外的丢失（断线）由重连后的
+ * re-attach 整体重建投影兑底。状态事件之间的 seq 间隔是日志行——严格相邻
+ * 在这里本来就不成立。
  */
 export function seqAction(lastSeq: number, seq: number): SeqAction {
   if (seq <= lastSeq) return "skip";
@@ -57,6 +62,22 @@ export function seqAction(lastSeq: number, seq: number): SeqAction {
  *  （状态事件的去重交给 seqAction，日志交给 lastLogSeq 水位） */
 export function drainBuffer(buffer: RunEvent[]): RunEvent[] {
   return [...buffer].sort((a, b) => a.seq - b.seq);
+}
+
+/**
+ * 日志控制台渲染窗口（纯函数，便于单测）：默认渲染最近 cap 行；
+ * 「加载更早」把窗口向前扩 extra 行，直到覆盖全部。返回
+ * [渲染行数, 省略行数]——状态存全量（预算封顶），DOM 只开窗口。
+ */
+export function logWindow(
+  total: number,
+  cap: number,
+  extra: number,
+): { rendered: number; hidden: number } {
+  if (total <= cap + extra) {
+    return { rendered: total, hidden: 0 };
+  }
+  return { rendered: cap + extra, hidden: total - (cap + extra) };
 }
 
 /** node_log 事件 → 前端日志行，带水位去重；环形上限内追加 */

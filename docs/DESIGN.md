@@ -1,7 +1,7 @@
 # flow 工作流引擎设计方案
 
 > 状态：单机实现 + 对等模式多节点执行（`DISTRIBUTED.md`，Postgres 后端）；
-> `cargo test --workspace --all-targets --locked` 279 个测试全绿（含 backend-e2e 的
+> `cargo test --workspace --all-targets --locked` 全绿（含 backend-e2e 的
 > Postgres 变体，需 docker；缺 Postgres 时对应用例跳过，其余全绿）。验证命令与覆盖范围见 §13。
 > 本文描述当前代码的实际语义，是后续开发的权威参考。
 > 架构焊点：**SQLite + events.jsonl 是默认与权威后端**（canonical）；Postgres 是
@@ -30,6 +30,9 @@ flow 是一个工作流执行引擎：发布不可变的流程定义（DAG），
 - 不做通用 DSL——表达式与脚本统一用 JavaScript。
 - 多节点执行：对等抢占模式（peer）已按 `DISTRIBUTED.md` 实现（Postgres 后端，
   租约、持久 inbox、副作用边界）；中心指派模式见 `SCHEDULER.md`，仍未实现。
+
+节点运行可观察性（node_log 事件流、输入面快照、日志控制台）的完整设计见
+`docs/observability-design.md`；本文只记它与状态机相关的契约（§3.1、§6.1、§10）。
 
 ## 2. 总体架构
 
@@ -107,10 +110,11 @@ Driver 启动后回填 `running`。终态也必须先写事件，再更新索引
 | 事件 | 载荷 | 语义 |
 |---|---|---|
 | `run_started` | workflow_id, workflow_version, input, depth | run 创建，input 快照；depth 为嵌套深度（根 run 为 0，旧日志缺省 0） |
-| `node_started` | node_id, attempt, child_run_id（可选） | **副作用发生前**写入；child_run_id 仅 sub_workflow 携带 |
+| `node_started` | node_id, attempt, child_run_id（可选）, input（可选） | **副作用发生前**写入；child_run_id 仅 sub_workflow 携带；input 是模板展开后的 params 脱敏快照（可观察性数据，fold 不消费） |
 | `node_completed` | node_id, attempt, output, duration_ms | 节点成功 |
 | `node_failed` | node_id, attempt, error, retryable | 节点失败；`retryable` 表示引擎还会重试 |
 | `node_skipped` | node_id, reason | 汇合判定不满足，整节点跳过 |
+| `node_log` | node_id, attempt, level, stream, message | 节点运行日志（可观察性）。level=debug/info/warn/error，stream=engine/stdout/stderr；只记日志，不改状态 |
 | `signal_received` | node_id, payload | 外部信号已落盘（human_task / 裁决） |
 | `run_completed` | output | run 成功 |
 | `run_failed` | error | run 失败 |
@@ -133,6 +137,12 @@ append(node_started)  →  执行副作用  →  append(终态事件)
 这界定了节点副作用不明的窗口。恢复还必须处理 `node_failed(retryable=true)` 后
 尚未开始下一次 attempt、信号已记录未消费、节点失败后 run 尚未收尾以及初始化未提交。
 
+**日志行是这条边界的例外层**：`node_log` 只 `write_all` 不进组提交（进程级持久），
+搭同文件后续严格事件的 fsync 便车——终态事件 append 前 EventLog 强制先 sync 一次
+（终态返回 ⇒ 终态前的日志已在盘上）。批量追加走 sink 的 `append_log_batch`
+（默认逐条，Postgres 覆写为单事务整批——锁行/seq 分配/提交一次，日志的廉价层
+语义不在受保护事务上被抹平）。细节见 `docs/observability-design.md`。
+
 ### 3.3 日志读写规则
 
 - `EventLog::create`：`create_new`，run_id 已存在则报错（run_id 唯一）。
@@ -150,7 +160,7 @@ append(node_started)  →  执行副作用  →  append(终态事件)
 Event 流 ──fold──> RunState {
     records: HashMap<node_id, NodeRecord{state, attempts, started_at, ended_at,
                                           duration_ms, output, error, last_signal,
-                                          child_run_id}>,
+                                          child_run_id, input}>,
     outputs: HashMap<node_id, Value>,     // 唯一所有者：Driver 直接读它
     phase: Running | Succeeded | Failed | Cancelled,
     fatal_error, output, workflow_id, workflow_version, input, last_seq, depth,
@@ -163,7 +173,10 @@ Event 流 ──fold──> RunState {
 保留事件及 NodeState 序列化格式，旧日志无需迁移。
 关键转移：
 
-- `node_started` **清除旧 output**（重试/重放不留脏数据）；
+- `node_started` **清除旧 output**（重试/重放不留脏数据），同时记下最新一次
+  attempt 的输入面快照 input（展示用，终态不清除）；
+- `node_log` 在 fold 中**跳过**（观察数据，不是恢复状态；`last_seq` 仍推进，
+  订阅者照常收到——一条流两个用途，§3.1）；
 - `node_completed` 写入 `outputs`；
 - `node_failed(retryable=false)` 在 fold 中记录首个 `fatal_error`，Driver 无独立失败缓存；
 - `signal_received` 只记 `last_signal`（崩溃可能落在它与终态之间，恢复时消费它）；
@@ -173,14 +186,24 @@ Event 流 ──fold──> RunState {
 
 `Definition { nodes, edges }`（前端拖拽产物，整体作为不可变版本入库）。
 节点类型：`start`、`end`、`script`、`condition`、`delay`、`http_call`、`human_task`、
-`sub_workflow`。
+`sub_workflow`、`llm`（OpenAI 兼容 chat/completions）、`email`（Resend 兼容发信）。
+后两者是有外部副作用的集成节点（崩溃后不自动重放，§7 人工裁决），`has_side_effect`
+与 http_call 同类。
+
+每个类型在 `model.rs` 的 `NodeType::descriptor()` 注册一次：`NodeType::ALL` 的顺序
+即 `nodetypes.list` 响应顺序（= 前端面板顺序），params_schema 之外带
+`label`/`category`/`ports`/`max_instances`/`supports_retry`/`side_effect` 与
+`x-widget`/`x-help`/`x-secret` 扩展键——新增类型只改这一处，快照测试
+（`node_types_snapshot_is_stable`）钉住响应逐字节不变。
 
 `Definition::validate()` 在保存与发布时强制（建图即校验，不等到运行）：
 
 1. 节点 id 非空且唯一；类型已知；按类型校验必填参数
    （script: `code`，condition: `expr`，delay: `ms`，http_call: `url`，
-   sub_workflow: `workflow_id`；method 若给出必须属于 `HTTP_METHODS`——该白名单
-   与 `nodetypes.list` 共用一份，拼写错误在发布时被拒而不是运行时炸 run）；
+   sub_workflow: `workflow_id`，llm: `api_key`/`model`/`prompt`，
+   email: `api_key`/`from`/`to`/`subject`/`body`；
+   method 若给出必须属于 `HTTP_METHODS`——该白名单与 `nodetypes.list`
+   共用一份，拼写错误在发布时被拒而不是运行时炸 run）；
    `${}` 模板参数（如 `ms: "${input.delay}"`、模板 method）放行到执行期判定，
    裸数字串等灰色形态仍拒绝；sub_workflow 的 `input_mapping` 若给出必须是
    对象或非空模板串；
@@ -189,6 +212,12 @@ Event 流 ──fold──> RunState {
 4. 边端点存在、无自环、无重复边；**condition 出边必须带 `true`/`false` 端口，
    其余节点出边不得带端口**；
 5. 拓扑必须是 DAG，且所有节点从 start 可达（防死代码）。
+
+**密钥参数（x-secret）**：params_schema 里标 `x-secret` 的参数（llm / email 的
+`api_key`）在定义里只存**名称**，真值执行前从 `FLOW_SECRET_<名称>` 环境变量注入
+（`secrets.rs`）。`workflow.update` 提前校验每个名称都已配置，配置错误挡在
+落库前（`missing_secrets`）；模板名称要到执行期展开才能确定，缺失时节点 fatal。
+真值不参与模板展开、不随 `node_started` 落盘，`secrets.list` 只回名称列表。
 
 ## 6. 执行引擎（Driver）
 
@@ -202,7 +231,7 @@ loop {
     内层循环推进到不动点：
         plan() → (ready, skips)
         skips 逐个 append(node_skipped)      // 跳过沿下游传播
-        ready 逐个 start_node()               // 写 node_started + 派发执行
+        ready 逐个 start_node()               // 展开 params + 输入快照 → node_started + 派发执行
     if inflight、human_waiting、adjudicating 全空：
         all_terminal → finalize（RunCompleted/RunFailed）
         否则 → 错误「调度停滞」（图正确性由 validate 兜底，此错误意味着语义 bug）
@@ -219,6 +248,25 @@ loop {
 - **inflight 不变量**：inflight 里每个 handle 都还欠一条 `DriverMsg`。
   human_task 的 oneshot 等待任务、重试退避计时器都必须计入，
   否则终止判定提前触发。
+
+**start_node**（节点执行的唯一入口：就绪派发、重试、人工裁决 retry、接管恢复
+重放都经它）在写 `node_started` 之前做三件事，做完才派发执行：
+
+1. **模板展开恰好一次**：`exec::expand_params`（§10）在写事件前完成，展开结果
+   **同时**是执行期 params 与输入面快照；exec 层不再展开（双展开会把用户数据里
+   合法的 `${` 再 evaluate 一遍——历史回归有测试钉住）。human_task 不执行，
+   用原始 params 做快照。展开失败不破写序协议：先 `node_started` 再走节点
+   失败路径（可重试失败照常调度重试）；
+2. **输入快照脱敏后落盘**：`redact_value` 按敏感键列表（authorization/token/
+   api_key…）把快照里的敏感值替换为 `***`——快照是给前端看的，事件里的原始
+   output 才是下游的数据面，两者都不能动；
+3. **密钥注入在执行期**：x-secret 参数的**名称**在快照里，真值在 exec dispatch
+   前才由 `FLOW_SECRET_<名称>` 注入（只进请求头）。
+
+**节点日志**：exec 任务持 `NodeLogger`（unbounded mpsc，发即忘，per-run 预算
+`Arc<LogBudget>` 判定），driver 的 select 循环 biased 优先排空日志（发射端先发
+日志后发 Done），成批转 `node_log` 落盘，单批 256 条封顶防饿死。日志不是恢复
+状态：fold 跳过 `node_log`，重启后历史日志仍可经 `run.events` 读取（§9）。
 
 ### 6.2 汇合语义：AND-join
 
@@ -257,8 +305,10 @@ condition 节点输出为表达式结果经 JSON 序列化后的值；引擎用 
 `params.retry { max_attempts (默认 1), backoff_ms (默认 0) }`。
 `NodeFailure.retryable` 决定引擎重试还是判死 run：
 
-- 可重试：连接失败/超时、HTTP 5xx、**响应体中途断流**；
+- 可重试：连接失败/超时、HTTP 5xx、**响应体中途断流**、429 限流（仅 llm/email）；
 - 致命：JS 抛错、参数校验失败、HTTP 4xx（请求本身的问题）。
+
+这份分类 http_call / llm / email 共用同一套习惯（后者经 `post_json_bearer`）。
 
 退避计时器计入 inflight（不变量），到点后 `RetryDue` 重新派发，attempt+1。
 下游在此期间等待。**恢复一律等满 `backoff_ms`**（不续算剩余时间）：事件 `ts`
@@ -338,6 +388,8 @@ Postgres `PgChildLauncher` 经 `lease::create_run` 单事务创建子 run、
 | Running `human_task`，已有信号 | **补终态**（output=信号） | 信号已经持久化 |
 | Running `human_task`，无信号 | **继续等待**，不重复写 started | 等待无副作用 |
 | Running `sub_workflow` | **重放**：沿用已落盘 child_run_id，附着既有子 run | id 确定性派生且已随 node_started 落盘，重复 start 撞 RunExists 幂等 |
+「副作用节点」= `has_side_effect()` 的类型：`http_call` / `llm` / `email`——
+三者恢复路径完全同构（无裁决信号一律 awaiting_resume，不自动重放）。
 | Failed{retryable:true} | **重建退避计时器**，等满整段 backoff 后下一次 attempt | 内存计时器不是权威；剩余时间不可续算（§6.5） |
 | Failed{retryable:false} | **保留 run 失败结论**，独立分支继续 | fold 已记录 fatal_error |
 
@@ -440,14 +492,15 @@ jsonrpsee WebSocket。本层只有**一份**方法实现，只依赖 `flow_backe
 
 | 方法 | 说明 |
 |---|---|
-| `workflow.create / update / publish / get / list / delete` | 定义生命周期。update 前强制 validate |
+| `workflow.create / update / publish / get / list / delete` | 定义生命周期。update 前强制 validate + x-secret 名称存在性校验（§5） |
 | `workflow.versions` | 版本历史（按 version 倒序，只回 version/status/checksum/created_at 元数据列，definition 走 workflow.get 按需拉取）；workflow 不存在返回 -32011 |
-| `nodetypes.list` | 前端画布能力清单：类型、端口、`params_schema`（JSON Schema draft-07 子集 type/required/properties/enum/default，另带 `x-widget`/`x-label`/`x-help` 扩展键，前端据此渲染参数表单；后端校验仍以 `Definition::validate` 为准）、supports_retry、side_effect |
+| `nodetypes.list` | 前端画布能力清单：类型、端口、`params_schema`（JSON Schema draft-07 子集 type/required/properties/enum/default，另带 `x-widget`/`x-label`/`x-help`/`x-secret` 扩展键，前端据此渲染参数表单；后端校验仍以 `Definition::validate` 为准）、supports_retry、side_effect；单条描述的唯一来源是 `NodeType::descriptor`（§5） |
+| `secrets.list` | 已配置的密钥**名称**列表（`FLOW_SECRET_<名称>` 存在性），永远不含值；前端给 x-secret 参数渲染可选名称 |
 | `run.start` | 经 Backend：SQLite 校验 published → insert initializing → 持久化 run_started → 启动 Driver，初始化错误回写 failed；Postgres 单事务原子创建（§9 差异说明） |
 | `run.get / run.list` | 元数据 + live 标记；list 支持 status 过滤与 source（触发来源）过滤，词汇表外 -32010 |
 | `run.stats` | 精确统计（GROUP BY，非采样）：`{workflow_id?}` → `{total, by_status}`，不带过滤时附带 `by_workflow: [{workflow_id, total, by_status}]` |
-| `run.timeline` | 只读时间线：定义顺序 + 折叠后的节点状态 |
-| `run.events` | 原始事件，`from_seq` 增量拉取 |
+| `run.timeline` | 只读时间线：定义顺序 + 折叠后的节点状态（含 input 输入面快照；output 展示时按同一敏感键列表脱敏，事件里的原始值不动） |
+| `run.events` | 原始事件，`from_seq` 增量拉取。`node_log` 与状态事件同流同 seq（可观察性设计：日志回放/追流不用第二条管道） |
 | `run.cancel` | 统一 SignalAck：活着的 run 交付取消（SQLite 仅本进程生效）；否则 conflict |
 | `run.signal` | human_task 交付 / 副作用节点裁决（§6.7）。signal_id 在 Postgres 必填且重试复用，SQLite 可省（响应只回显客户端提供的，不伪造） |
 | `run.signal_status` | 持久 inbox 落账查询；pg 专属（RPC 边缘 match 暴露），SQLite 返回明确的 invalid |
@@ -561,7 +614,9 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
   唯一例外是 `NodeType::opaque_params`——script 的 `code` / condition 的 `expr`
   等用户 JS 字段，其中的 `${}` 是 JS 模板字面量，展开即破坏用户代码）。
   http_call 的 url/headers/body 只是这条规则的头号用户，delay 的 `ms`、
-  sub_workflow 的 `input_mapping` 等同规则生效。展开的数据面与 `nodes` 一致：
+  sub_workflow 的 `input_mapping`、llm/email 的 prompt/subject/body 等同规则生效。
+  展开由 driver 的 `start_node` 在**写 `node_started` 前**调用一次（展开结果 =
+  输入面快照，§6.1），exec 层不再展开。展开的数据面与 `nodes` 一致：
   只读 `input`（run 输入）与直接前驱输出快照。
   **限制**：`${}` 内不能包含 `}`（按第一个 `}` 截断），不支持嵌套对象
   字面量等复杂表达式。两条规则按「整个值是否恰为一个模板」分流：
@@ -570,6 +625,12 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
   结构化传参依赖这条；**插值模板**（模板嵌在更长文本里）保持字符串语义，
   非字符串结果 `JSON.stringify` 后拼回原位。整值字符串模板在两条规则下
   结果相同，存量定义零行为变化。
+
+脚本 `console.*` 经宿主函数桥接到日志发射器（log/info→stdout，warn/error→
+stderr，格式化在 JS 侧完成）：console 输出就是普通节点日志，走同一 budget/
+通道/`node_log` 落盘路径——condition 求值路径上没有 logger（disabled，输出丢弃）。
+预算：per-run 默认 10000 条 debug/info（`FLOW_RUN_LOG_BUDGET` 可调），超限
+丢弃并写 Warn 摘要行；单行 8KB 截断。
 
 数据契约：进出沙箱的整数经 **BigInt 边界**精确无损——|v| > 2^53 的 i64/u64
 （雪花 ID、高精度金额）注入沙箱时转 BigInt，出口按十进制精确还原 i64/u64，
@@ -582,15 +643,25 @@ ECMAScript 语义（`9007199254740993` 字面量本身已舍入为 2^53），需
 human_task/子 run 透传、事件日志 i64/u64 序列化）本就无损，重试/重放同样
 无损，决定论不变。
 
-## 11. http_call 语义
+## 11. 外部 HTTP 调用语义
 
-params 经 `${}` 统一展开后发请求（默认超时 30s；method 取自 `HTTP_METHODS`
-白名单，定义层校验后执行层再验一次）。
-输出 `{status, headers, body}`（body 能解析为 JSON 则解析，否则原样字符串）。失败分类：
+http_call params 经 `${}` 统一展开后发请求（默认超时 30s；method 取自
+`HTTP_METHODS` 白名单，定义层校验后执行层再验一次）。
+输出 `{status, headers, body}`（body 能解析为 JSON 则解析，否则原样字符串）。
+失败分类（llm / email 经 `post_json_bearer` 共用同一份，唯一补充是 429 限流
+也可重试）：
 
 - 连接失败/超时 → retryable（副作用不明确或未发生，交给重试策略）；
-- 5xx → retryable；4xx → fatal（请求本身的问题）；
+- 5xx → retryable；4xx → fatal（请求本身的问题）；llm/email 另认 429 → retryable；
 - **响应体读取失败（连接中途断开）→ retryable**——绝不带着 200 + 空 body 记成功。
+
+llm 节点（OpenAI 兼容 `{base_url}/chat/completions`，默认 `api.openai.com`）：
+输出 `{content, model, usage}`；`json_mode` 时请求带
+`response_format: {type: json_object}`，`system` 非空时进 messages[0]。
+email 节点（Resend 兼容 `POST {endpoint}`，默认 `api.resend.com/emails`）：
+body 为 `{from, to, subject, text}`（纯文本正文），输出 `{status, id}`。
+两者的 `api_key` 是 x-secret 名称，执行前注入真值，只进 Authorization 头，
+不进输出/错误消息/事件。
 
 自动重试不保证外部副作用只发生一次：POST 超时或断流时下游仍可能已提交。
 启用多次重试需要调用方接受重复风险，或在 headers/body 中使用下游支持的稳定幂等键。
@@ -626,6 +697,14 @@ params 经 `${}` 统一展开后发请求（默认超时 30s；method 取自 `HT
     `NodeType::opaque_params`（用户 JS 字段）；展开数据面 = `input` +
     直接前驱输出快照，不扩大决定论边界。sub_workflow 的 `input_mapping`
     展开结果整体作为子 run 输入，缺省保持「父 run 输入」旧语义。
+16. 展开恰好一次：driver 的 `start_node` 展开，exec 层不再展开——展开结果
+    同时是执行期 params 与输入面快照（脱敏后随 `node_started` 落盘）。
+17. `node_log` 不是恢复状态：fold 跳过它、恢复不重建它；日志是进程级持久
+    （搭同文件严格事件的 fsync，终态事件前强制兜底 sync），订阅与
+    `run.events` 照常送达。per-run 预算超限只丢 debug/info，warn/error 放行。
+18. x-secret 参数在定义里只存名称，真值在 dispatch 前从 `FLOW_SECRET_<名称>`
+    注入：不进模板展开、不进事件（`node_started.input` 写入时已按敏感键
+    列表脱敏）、`secrets.list` 只回名称。真值缺失 = 节点 fatal。
 
 ## 13. 测试策略
 
@@ -689,6 +768,10 @@ volume 上。Docker 只在容器**自己退出**时（`--rm`）回收匿名 volu
   DbRunStatus 单一词汇表）；「只有 published 可执行 + 创建前校验」的规则断言
   单点钉在 flow-backend 的 `resolve_runnable_definition` 测试；
 - JS 沙箱边界由行为测试钉住（§10），随每次 `cargo test` 重新验证；
+- 图校验规则由 `model.rs` 的表驱动单测逐条钉住（端口/环/不可达/参数必填/
+  模板参数放行与灰色形态拒绝），不为了一句「工作流存在环」起进程；
+- `nodetypes.list` 响应由 `node_types_snapshot_is_stable` 快照测试钉住
+  （descriptor 注册表收敛是纯重构，响应必须逐字节不变）；
 - `recovery_regressions.rs` 验证失败恢复、重试下游、剩余退避、非法/重复信号和裁决恢复；
 - `group_commit.rs`（flow-engine）钉严格组提交（§3.2）：append 返回即完整可读、
   seq 连续、并发多日志不串扰，且 fsync 必须真被组批（批数 ≤ 事件数的一半）；

@@ -3,6 +3,7 @@ import {
   alignProjection,
   applyEvent,
   drainBuffer,
+  logWindow,
   seqAction,
   MAX_LOG_LINES,
   type RunProjection,
@@ -235,5 +236,18 @@ describe("node_log：日志与状态同流但水位独立", () => {
     expect(p.logs.map((l) => l.message)).toEqual(["log-a"]);
     expect(p.phase).toBe("succeeded");
     expect(p.nodes[0].state).toBe("completed");
+  });
+});
+
+describe("logWindow：日志控制台渲染窗口", () => {
+  it("总量小于窗口 → 全渲染", () => {
+    expect(logWindow(100, 1500, 0)).toEqual({ rendered: 100, hidden: 0 });
+  });
+  it("超窗 → 渲染最近 cap 行，其余省略", () => {
+    expect(logWindow(3000, 1500, 0)).toEqual({ rendered: 1500, hidden: 1500 });
+  });
+  it("加载更早逐步扩窗，覆盖全部后不再省略", () => {
+    expect(logWindow(3000, 1500, 1500)).toEqual({ rendered: 3000, hidden: 0 });
+    expect(logWindow(2900, 1500, 1000)).toEqual({ rendered: 2500, hidden: 400 });
   });
 });

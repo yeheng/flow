@@ -103,9 +103,11 @@ async function attach(runId: string): Promise<boolean> {
     unsubscribe = null;
   }
 
-  // 局部投影：订阅建立与 timeline 对齐之间到达的事件先入缓冲
+  // 局部投影：订阅建立与 timeline 对齐之间到达的事件先入缓冲。
+  // phase 缺省 "running" 是有语义的乐观默认：timeline 拉取失败时 runActive
+  // 仍为 true（取消按钮可用）、onReconnect 守卫仍会 re-attach。
   const proj: RunProjection = {
-    phase: null as string | null,
+    phase: "running" as string | null,
     status: null as string | null,
     output: undefined as unknown,
     fatalError: null as string | null,

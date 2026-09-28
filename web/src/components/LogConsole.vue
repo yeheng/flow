@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from "vue";
 import { monitor } from "../state/monitor";
+import { logWindow } from "../state/monitor-logic";
 import type { LogLine, LogLevel } from "../types";
 
 /**
@@ -41,12 +42,30 @@ const filtered = computed<LogLine[]>(() => {
   });
 });
 
+// 过滤条件变化后窗口起点重置：新过滤集的"最近 1500 行"语义才成立
+watch([showDebug, nodeFilter, searchText], () => {
+  extraLines.value = 0;
+});
+
 /** DOM 行上限：状态存全量（预算封顶），渲染窗口化避免万行节点卡死 */
 const RENDER_CAP = 1500;
-const rendered = computed(() =>
-  filtered.value.length > RENDER_CAP ? filtered.value.slice(-RENDER_CAP) : filtered.value,
-);
-const hiddenCount = computed(() => filtered.value.length - rendered.value.length);
+/** 「加载更早」每次向前扩开的行数 */
+const EARLIER_STEP = 1500;
+/** 已向前扩开的行数（过滤器变化时重置） */
+const extraLines = ref(0);
+
+const windowed = computed(() => logWindow(filtered.value.length, RENDER_CAP, extraLines.value));
+const rendered = computed(() => filtered.value.slice(-windowed.value.rendered));
+const hiddenCount = computed(() => windowed.value.hidden);
+
+/** 向前展开一段历史，保持视口停在原内容上（补偿 scrollHeight 增量） */
+async function loadEarlier(): Promise<void> {
+  const el = listEl.value;
+  const prevHeight = el?.scrollHeight ?? 0;
+  extraLines.value += EARLIER_STEP;
+  await nextTick();
+  if (el) el.scrollTop += el.scrollHeight - prevHeight;
+}
 
 function fmtTime(ts: string): string {
   const d = new Date(ts);
@@ -111,9 +130,9 @@ function onSelectNode(id: string): void {
     </div>
     <template v-else>
       <div ref="listEl" class="log-list" @scroll="onScroll">
-        <p v-if="hiddenCount > 0" class="log-truncated">
-          已省略较早的 {{ hiddenCount }} 条（滚动窗口 {{ RENDER_CAP }} 行）
-        </p>
+        <button v-if="hiddenCount > 0" class="log-earlier link" @click="loadEarlier">
+          ↑ 加载更早（还有 {{ hiddenCount }} 条）
+        </button>
         <div
           v-for="line in rendered"
           :key="line.seq"
@@ -184,11 +203,20 @@ function onSelectNode(id: string): void {
   padding: 4px 0;
 }
 
-.log-truncated {
+.log-earlier {
+  display: block;
+  width: 100%;
   color: var(--text3);
   font-size: 11px;
   text-align: center;
   padding: 2px 8px;
+  border-bottom: 1px dashed var(--border);
+  margin-bottom: 2px;
+  cursor: pointer;
+}
+
+.log-earlier:hover {
+  color: var(--text);
 }
 
 .log-empty {

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::event::{LogStream, LogLevel};
+use crate::event::{LogLevel, LogStream};
 
 /// 单行日志截断上限（字节）。发射端截断，事件日志里不会出现超限行。
 pub const MAX_LOG_LINE_BYTES: usize = 8 * 1024;
@@ -150,7 +150,28 @@ pub fn truncate_message(message: &str) -> String {
     while !message.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}…[truncated {} bytes]", &message[..end], message.len() - end)
+    format!(
+        "{}…[truncated {} bytes]",
+        &message[..end],
+        message.len() - end
+    )
+}
+
+/// 输入面快照（node_started.input）的序列化字节上限：日志行有 8KB 截断，
+/// 输入面快照同理——预算管住了日志条数，这里管住单条事件的字节面。
+/// 超限整体替换为占位（展示层看得见大小，重放/订阅/前端不吃大载荷）。
+pub const MAX_INPUT_SNAPSHOT_BYTES: usize = 8 * 1024;
+
+/// 超限的输入面快照 → ` {"__truncated": true, "size": N}` 占位。
+/// 先脱敏后截断：脱敏可能缩小体积，以展示值为准。
+pub fn cap_input_snapshot(value: &Value) -> Value {
+    let size = serde_json::to_string(value)
+        .map(|text| text.len())
+        .unwrap_or(0);
+    if size <= MAX_INPUT_SNAPSHOT_BYTES {
+        return value.clone();
+    }
+    serde_json::json!({ "__truncated": true, "size": size })
 }
 
 /// 固定敏感键列表（小写子串匹配）：脱敏三个出口共用——http 日志行的 headers、
@@ -198,7 +219,9 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn logger_with_budget(max: usize) -> (NodeLogger, tokio::sync::mpsc::UnboundedReceiver<LogLine>) {
+    fn logger_with_budget(
+        max: usize,
+    ) -> (NodeLogger, tokio::sync::mpsc::UnboundedReceiver<LogLine>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         (NodeLogger::new(tx, LogBudget::new(max), "n1", 2), rx)
     }
@@ -253,5 +276,18 @@ mod tests {
         let logger = NodeLogger::disabled();
         logger.info("没人听");
         logger.error("也没人听");
+    }
+
+    #[test]
+    fn input_snapshot_capped_at_byte_limit() {
+        // 限内：原样保留
+        let small = json!({"url": "http://x", "n": 1});
+        assert_eq!(cap_input_snapshot(&small), small);
+        // 超限：占位携带原始序列化大小
+        let big = json!({"body": "x".repeat(MAX_INPUT_SNAPSHOT_BYTES)});
+        let capped = cap_input_snapshot(&big);
+        assert_eq!(capped["__truncated"], json!(true));
+        assert!(capped["size"].as_u64().unwrap() > MAX_INPUT_SNAPSHOT_BYTES as u64);
+        assert!(serde_json::to_string(&capped).unwrap().len() < 100);
     }
 }

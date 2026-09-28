@@ -101,3 +101,18 @@ describe("attach 原子换入", () => {
     expect(monitor.output).toEqual({ ok: 1 });
   });
 });
+
+describe("timeline 拉取失败的降级路径", () => {
+  it("phase 保持乐观缺省 running：runActive 仍为 true，重连守卫不失效", async () => {
+    const runId = "run-degraded";
+    vi.mocked(api.runTimeline).mockRejectedValue(
+      new Error("timeline 拉取失败（模拟）"),
+    );
+    const ok = await attachRun(runId);
+    expect(ok).toBe(true);
+    expect(monitor.runId).toBe(runId);
+    // 乐观缺省：runActive 依赖 phase === "running"，不能因 timeline 失败变 null
+    expect(monitor.phase).toBe("running");
+    await detachRun();
+  });
+});

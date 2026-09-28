@@ -440,8 +440,15 @@ impl EventLog {
     /// 追加一条节点日志（进程级持久）：只 write_all，不进组提交队列。
     /// 单文件字节顺序由 LogHandle 互斥保证；后续同文件任何严格事件的 fsync
     /// 会把先于它写入的日志行一并刷盘。
-    pub async fn append_log(&mut self, run_id: &str, event: Event) -> Result<Envelope, EngineError> {
-        debug_assert!(matches!(event, Event::NodeLog { .. }), "append_log 只收 NodeLog");
+    pub async fn append_log(
+        &mut self,
+        run_id: &str,
+        event: Event,
+    ) -> Result<Envelope, EngineError> {
+        debug_assert!(
+            matches!(event, Event::NodeLog { .. }),
+            "append_log 只收 NodeLog"
+        );
         self.write(run_id, event, false).await
     }
 
@@ -723,7 +730,7 @@ mod group_commit_tests {
     }
 
     /// 序列化兼容：NodeLog 往返一致；旧格式 node_started（无 input 字段）
-/// 反序列化默认 None，不炸。
+    /// 反序列化默认 None，不炸。
     #[test]
     fn node_log_roundtrip_and_old_node_started_compat() {
         let envelope = Envelope {
@@ -748,10 +755,7 @@ mod group_commit_tests {
         let envelope: Envelope = serde_json::from_str(old).unwrap();
         assert!(matches!(
             envelope.event,
-            Event::NodeStarted {
-                input: None,
-                ..
-            }
+            Event::NodeStarted { input: None, .. }
         ));
     }
 }

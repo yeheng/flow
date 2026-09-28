@@ -248,9 +248,11 @@ e2e_test!(
             .filter(|e| e["type"] == json!("node_log"))
             .collect();
         assert_eq!(logs.len(), 5, "5 条 console.log 必须全部回放：{logs:?}");
-        assert!(logs.windows(2).all(|w| {
-            w[0]["message"].as_str().unwrap() < w[1]["message"].as_str().unwrap()
-        }), "日志按发射顺序回放");
+        assert!(
+            logs.windows(2)
+                .all(|w| { w[0]["message"].as_str().unwrap() < w[1]["message"].as_str().unwrap() }),
+            "日志按发射顺序回放"
+        );
         assert_eq!(streamed.last().unwrap()["type"], json!("run_completed"));
     })
 );

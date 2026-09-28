@@ -771,7 +771,9 @@ pub(crate) fn timeline_value(
         "workflow_version": workflow_version,
         "started_at": snapshot.started_at,
         "ended_at": snapshot.ended_at,
-        "output": snapshot.output,
+        // run 级输出与节点输出同一脱敏标准：timeline 是展示面，
+        // 不能节点输出是 *** 而十行之下 run 输出就是明文（run.get 是数据面，另论）
+        "output": snapshot.output.as_ref().map(flow_backend::redact_value),
         "fatal_error": snapshot.fatal_error,
         "last_seq": snapshot.last_seq,
         "nodes": nodes,
