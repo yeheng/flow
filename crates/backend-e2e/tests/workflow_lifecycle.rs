@@ -392,7 +392,9 @@ e2e_test!(
                 "delay",
                 "http_call",
                 "human_task",
-                "sub_workflow"
+                "sub_workflow",
+                "llm",
+                "email"
             ],
             "node 类型闭集：{ids:?}"
         );

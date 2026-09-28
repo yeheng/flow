@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use chrono::Local;
 use flow_backend::{
-    open_from_env, AnyBackend, BackendError, Definition, NodeState, RunState, SignalAck,
-    HTTP_METHODS,
+    open_from_env, secrets, AnyBackend, BackendError, Definition, NodeState, NodeType, RunState,
+    SignalAck,
 };
 use futures::StreamExt;
 use jsonrpsee::core::RegisterMethodError;
@@ -167,6 +167,23 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
             .map_err(|e| invalid(format!("定义结构非法：{e}")))?;
         definition.validate().map_err(invalid)?;
 
+        // x-secret 参数只存名称：落库前确认每个名称都有对应的
+        // FLOW_SECRET_<名称> 环境变量，把配置错误挡在发布前
+        let missing = secrets::missing_secrets(&definition);
+        if !missing.is_empty() {
+            let detail = missing
+                .iter()
+                .map(|(node_id, name)| {
+                    format!(
+                        "节点 {node_id} 引用 {name}（请设置环境变量 {}{name}）",
+                        secrets::SECRET_ENV_PREFIX
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("；");
+            return Err(invalid(format!("引用的密钥未配置：{detail}")));
+        }
+
         let version = state
             .backend
             .update_workflow(&p.workflow_id, &p.definition)
@@ -279,6 +296,12 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
     module.register_method("nodetypes.list", |params, _state, _| {
         let _: Value = parse(&params)?;
         Ok::<_, ErrorObjectOwned>(json!({ "node_types": node_types() }))
+    })?;
+
+    // 密钥名称清单（永远不含值）：前端给 x-secret 参数渲染可选名称
+    module.register_method("secrets.list", |params, _state, _| {
+        let _: Value = parse(&params)?;
+        Ok::<_, ErrorObjectOwned>(json!({ "secrets": secrets::list_secret_names() }))
     })?;
 
     // ---- 执行 ----
@@ -796,121 +819,13 @@ fn signal_ack_value(ack: SignalAck) -> Result<Value, ErrorObjectOwned> {
 
 /// 前端拖拽面板 + 参数表单所需的能力清单。
 ///
-/// `params_schema` 是 JSON Schema draft-07 子集（type/required/properties/enum/default），
-/// 另带 `x-widget`（code/json/workflow-picker）、`x-label`、`x-help` 扩展，
-/// 前端据此递归渲染参数表单，后端 validate 仍以 model.rs 为准。
+/// 单条描述的唯一来源是 `flow_engine::NodeType::descriptor`（与引擎共用一份
+/// 定义），这里只负责按序组装；schema 约定见 descriptor 的文档注释。
 pub(crate) fn node_types() -> Value {
-    json!([
-        {
-            "type": "start",
-            "label": "开始",
-            "category": "control",
-            "max_instances": 1,
-            "ports": [{"id": "out", "label": "出"}],
-            "params_schema": {"type": "object", "properties": {}}
-        },
-        {
-            "type": "end",
-            "label": "结束",
-            "category": "control",
-            "ports": [{"id": "in", "label": "入"}],
-            "params_schema": {"type": "object", "properties": {}}
-        },
-        {
-            "type": "script",
-            "label": "脚本",
-            "category": "compute",
-            "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
-            "params_schema": {
-                "type": "object",
-                "required": ["code"],
-                "properties": {
-                    "code": {"type": "string", "x-widget": "code", "x-label": "JS 函数体",
-                             "x-help": "可用 input（run 输入）与 nodes（上游节点输出），用 return 返回结果"},
-                    "timeout_ms": {"type": "integer", "default": 2000, "x-label": "脚本超时（毫秒）"}
-                }
-            },
-            "supports_retry": true
-        },
-        {
-            "type": "condition",
-            "label": "条件分支",
-            "category": "control",
-            "ports": [{"id": "in", "label": "入"}, {"id": "true", "label": "真"}, {"id": "false", "label": "假"}],
-            "params_schema": {
-                "type": "object",
-                "required": ["expr"],
-                "properties": {
-                    "expr": {"type": "string", "x-widget": "code", "x-label": "条件表达式",
-                             "x-help": "表达式结果按真值判定（非空字符串、非 0 数为真），可用 input 与 nodes"},
-                    "timeout_ms": {"type": "integer", "default": 2000, "x-label": "求值超时（毫秒）"}
-                }
-            }
-        },
-        {
-            "type": "delay",
-            "label": "等待",
-            "category": "control",
-            "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
-            "params_schema": {
-                "type": "object",
-                "required": ["ms"],
-                "properties": {
-                    "ms": {"type": "integer", "x-label": "时长（毫秒）",
-                            "x-help": "数字，或 ${input.x} / ${nodes.n.y} 模板（展开结果须为整数）"}
-                }
-            }
-        },
-        {
-            "type": "http_call",
-            "label": "HTTP 请求",
-            "category": "integration",
-            "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
-            "params_schema": {
-                "type": "object",
-                "required": ["url"],
-                "properties": {
-                    "method": {"type": "string", "enum": HTTP_METHODS, "default": "GET", "x-label": "方法"},
-                    "url": {"type": "string", "x-label": "URL",
-                            "x-help": "支持 ${input.x} / ${nodes.n2.y} 模板（${} 内不能含 }）"},
-                    "headers": {"x-widget": "json", "default": {}, "x-label": "请求头"},
-                    "body": {"x-widget": "json", "x-label": "请求体"},
-                    "timeout_ms": {"type": "integer", "default": 30000, "x-label": "HTTP 超时（毫秒）"}
-                }
-            },
-            "supports_retry": true,
-            "side_effect": true
-        },
-        {
-            "type": "human_task",
-            "label": "人工节点",
-            "category": "human",
-            "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
-            "params_schema": {
-                "type": "object",
-                "properties": {
-                    "prompt": {"type": "string", "x-label": "提示"}
-                }
-            }
-        },
-        {
-            "type": "sub_workflow",
-            "label": "子工作流",
-            "category": "control",
-            "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
-            "params_schema": {
-                "type": "object",
-                "required": ["workflow_id"],
-                "properties": {
-                    "workflow_id": {"type": "string", "x-widget": "workflow-picker", "x-label": "目标工作流",
-                                    "x-help": "调用其最新已发布版本作为子 run；子 run 输出透传为本节点输出；子 run 失败传导为本节点 fatal（DESIGN §6.8），重试策略只覆盖启动/等待类错误"},
-                    "input_mapping": {"x-widget": "json", "x-label": "子 run 输入映射",
-                                    "x-help": "JSON 对象，值支持 ${input.x} / ${nodes.n.y} 模板；展开结果整体作为子 run 输入。省略 = 沿用父 run 输入"}
-                }
-            },
-            "supports_retry": true
-        }
-    ])
+    json!(NodeType::ALL
+        .iter()
+        .map(|kind| kind.descriptor())
+        .collect::<Vec<Value>>())
 }
 
 /// 具名参数解析。JSON-RPC 允许整个省略 params，此时到达的是 null，等价于空对象。
@@ -984,5 +899,20 @@ pub(crate) fn backend_err(err: BackendError) -> ErrorObjectOwned {
         }
         BackendError::Invalid(_) => invalid(err.to_string()),
         BackendError::Internal(_) => internal(err.to_string()),
+    }
+}
+
+/// `nodetypes.list` 响应快照：descriptor 注册表收敛（model.rs `NodeType::descriptor`）
+/// 是纯重构，响应必须逐字节不变。新增/修改节点类型时同步更新本快照。
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn node_types_snapshot_is_stable() {
+        const SNAPSHOT: &str = r#"[{"category":"control","label":"开始","max_instances":1,"params_schema":{"properties":{},"type":"object"},"ports":[{"id":"out","label":"出"}],"type":"start"},{"category":"control","label":"结束","params_schema":{"properties":{},"type":"object"},"ports":[{"id":"in","label":"入"}],"type":"end"},{"category":"compute","label":"脚本","params_schema":{"properties":{"code":{"type":"string","x-help":"可用 input（run 输入）与 nodes（上游节点输出），用 return 返回结果","x-label":"JS 函数体","x-widget":"code"},"timeout_ms":{"default":2000,"type":"integer","x-label":"脚本超时（毫秒）"}},"required":["code"],"type":"object"},"ports":[{"id":"in","label":"入"},{"id":"out","label":"出"}],"supports_retry":true,"type":"script"},{"category":"control","label":"条件分支","params_schema":{"properties":{"expr":{"type":"string","x-help":"表达式结果按真值判定（非空字符串、非 0 数为真），可用 input 与 nodes","x-label":"条件表达式","x-widget":"code"},"timeout_ms":{"default":2000,"type":"integer","x-label":"求值超时（毫秒）"}},"required":["expr"],"type":"object"},"ports":[{"id":"in","label":"入"},{"id":"true","label":"真"},{"id":"false","label":"假"}],"type":"condition"},{"category":"control","label":"等待","params_schema":{"properties":{"ms":{"type":"integer","x-help":"数字，或 ${input.x} / ${nodes.n.y} 模板（展开结果须为整数）","x-label":"时长（毫秒）"}},"required":["ms"],"type":"object"},"ports":[{"id":"in","label":"入"},{"id":"out","label":"出"}],"type":"delay"},{"category":"integration","label":"HTTP 请求","params_schema":{"properties":{"body":{"x-label":"请求体","x-widget":"json"},"headers":{"default":{},"x-label":"请求头","x-widget":"json"},"method":{"default":"GET","enum":["GET","POST","PUT","PATCH","DELETE"],"type":"string","x-label":"方法"},"timeout_ms":{"default":30000,"type":"integer","x-label":"HTTP 超时（毫秒）"},"url":{"type":"string","x-help":"支持 ${input.x} / ${nodes.n2.y} 模板（${} 内不能含 }）","x-label":"URL"}},"required":["url"],"type":"object"},"ports":[{"id":"in","label":"入"},{"id":"out","label":"出"}],"side_effect":true,"supports_retry":true,"type":"http_call"},{"category":"human","label":"人工节点","params_schema":{"properties":{"prompt":{"type":"string","x-label":"提示"}},"type":"object"},"ports":[{"id":"in","label":"入"},{"id":"out","label":"出"}],"type":"human_task"},{"category":"control","label":"子工作流","params_schema":{"properties":{"input_mapping":{"x-help":"JSON 对象，值支持 ${input.x} / ${nodes.n.y} 模板；展开结果整体作为子 run 输入。省略 = 沿用父 run 输入","x-label":"子 run 输入映射","x-widget":"json"},"workflow_id":{"type":"string","x-help":"调用其最新已发布版本作为子 run；子 run 输出透传为本节点输出；子 run 失败传导为本节点 fatal（DESIGN §6.8），重试策略只覆盖启动/等待类错误","x-label":"目标工作流","x-widget":"workflow-picker"}},"required":["workflow_id"],"type":"object"},"ports":[{"id":"in","label":"入"},{"id":"out","label":"出"}],"supports_retry":true,"type":"sub_workflow"},{"category":"ai","label":"LLM 调用","params_schema":{"properties":{"api_key":{"type":"string","x-help":"只存密钥名称（如 OPENAI_KEY），真值来自 FLOW_SECRET_<名称> 环境变量；已配置的名称见 secrets.list","x-label":"API 密钥名称","x-secret":true},"base_url":{"default":"https://api.openai.com/v1","type":"string","x-help":"OpenAI 兼容端点，请求发往 {base_url}/chat/completions","x-label":"API 地址"},"json_mode":{"default":false,"type":"boolean","x-help":"开启后请求带 response_format: {\"type\":\"json_object\"}","x-label":"JSON 模式"},"max_tokens":{"type":"integer","x-label":"最大 token 数"},"model":{"type":"string","x-label":"模型"},"prompt":{"type":"string","x-help":"支持 ${input.x} / ${nodes.n.y} 模板","x-label":"提示词","x-widget":"code"},"system":{"type":"string","x-label":"系统提示"},"temperature":{"type":"number","x-label":"温度"}},"required":["api_key","model","prompt"],"type":"object"},"ports":[{"id":"in","label":"入"},{"id":"out","label":"出"}],"side_effect":true,"supports_retry":true,"type":"llm"},{"category":"notify","label":"邮件","params_schema":{"properties":{"api_key":{"type":"string","x-help":"只存密钥名称（如 RESEND_KEY），真值来自 FLOW_SECRET_<名称> 环境变量；已配置的名称见 secrets.list","x-label":"API 密钥名称","x-secret":true},"body":{"type":"string","x-help":"纯文本（作为 text 字段发送），支持 ${input.x} / ${nodes.n.y} 模板","x-label":"正文","x-widget":"code"},"endpoint":{"default":"https://api.resend.com/emails","type":"string","x-help":"Resend 兼容接口：POST {from, to, subject, text}，Bearer 认证","x-label":"API 端点"},"from":{"type":"string","x-label":"发件人"},"subject":{"type":"string","x-help":"支持 ${input.x} / ${nodes.n.y} 模板","x-label":"主题"},"to":{"type":"string","x-label":"收件人"}},"required":["api_key","from","to","subject","body"],"type":"object"},"ports":[{"id":"in","label":"入"},{"id":"out","label":"出"}],"side_effect":true,"supports_retry":true,"type":"email"}]"#;
+        assert_eq!(
+            serde_json::to_string(&crate::node_types()).unwrap(),
+            SNAPSHOT,
+            "nodetypes.list 响应变了：若是有意变更，更新本快照"
+        );
     }
 }

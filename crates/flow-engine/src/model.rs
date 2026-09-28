@@ -16,6 +16,10 @@ pub enum NodeType {
     HumanTask,
     /// 调用另一个已发布工作流作为子 run，等待其终态并透传输出
     SubWorkflow,
+    /// 调 OpenAI 兼容的 chat/completions 接口，输出 content/model/usage
+    Llm,
+    /// 经 HTTP API（Resend 兼容格式）发邮件
+    Email,
 }
 
 impl NodeType {
@@ -29,6 +33,8 @@ impl NodeType {
             NodeType::HttpCall => "http_call",
             NodeType::HumanTask => "human_task",
             NodeType::SubWorkflow => "sub_workflow",
+            NodeType::Llm => "llm",
+            NodeType::Email => "email",
         }
     }
 
@@ -42,13 +48,216 @@ impl NodeType {
             "http_call" => NodeType::HttpCall,
             "human_task" => NodeType::HumanTask,
             "sub_workflow" => NodeType::SubWorkflow,
+            "llm" => NodeType::Llm,
+            "email" => NodeType::Email,
             _ => return None,
         })
     }
 
     /// 崩溃后是否不可安全重放：有外部副作用的节点必须人工裁决。
     pub fn has_side_effect(self) -> bool {
-        matches!(self, NodeType::HttpCall)
+        matches!(self, NodeType::HttpCall | NodeType::Llm | NodeType::Email)
+    }
+
+    /// 全部节点类型。数组顺序 = nodetypes.list 响应顺序 = 前端面板顺序。
+    pub const ALL: [NodeType; 10] = [
+        NodeType::Start,
+        NodeType::End,
+        NodeType::Script,
+        NodeType::Condition,
+        NodeType::Delay,
+        NodeType::HttpCall,
+        NodeType::HumanTask,
+        NodeType::SubWorkflow,
+        NodeType::Llm,
+        NodeType::Email,
+    ];
+
+    /// 前端拖拽面板 + 参数表单所需的能力描述（nodetypes.list 的单条）。
+    ///
+    /// `params_schema` 是 JSON Schema draft-07 子集（type/required/properties/enum/default），
+    /// 另带 `x-widget`（code/json/workflow-picker）、`x-label`、`x-help` 扩展，
+    /// 前端据此递归渲染参数表单，后端 validate 仍以本文件的 validate_params 为准。
+    pub fn descriptor(self) -> Value {
+        match self {
+            NodeType::Start => serde_json::json!({
+                "type": "start",
+                "label": "开始",
+                "category": "control",
+                "max_instances": 1,
+                "ports": [{"id": "out", "label": "出"}],
+                "params_schema": {"type": "object", "properties": {}}
+            }),
+            NodeType::End => serde_json::json!({
+                "type": "end",
+                "label": "结束",
+                "category": "control",
+                "ports": [{"id": "in", "label": "入"}],
+                "params_schema": {"type": "object", "properties": {}}
+            }),
+            NodeType::Script => serde_json::json!({
+                "type": "script",
+                "label": "脚本",
+                "category": "compute",
+                "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
+                "params_schema": {
+                    "type": "object",
+                    "required": ["code"],
+                    "properties": {
+                        "code": {"type": "string", "x-widget": "code", "x-label": "JS 函数体",
+                                 "x-help": "可用 input（run 输入）与 nodes（上游节点输出），用 return 返回结果"},
+                        "timeout_ms": {"type": "integer", "default": 2000, "x-label": "脚本超时（毫秒）"}
+                    }
+                },
+                "supports_retry": true
+            }),
+            NodeType::Condition => serde_json::json!({
+                "type": "condition",
+                "label": "条件分支",
+                "category": "control",
+                "ports": [{"id": "in", "label": "入"}, {"id": "true", "label": "真"}, {"id": "false", "label": "假"}],
+                "params_schema": {
+                    "type": "object",
+                    "required": ["expr"],
+                    "properties": {
+                        "expr": {"type": "string", "x-widget": "code", "x-label": "条件表达式",
+                                 "x-help": "表达式结果按真值判定（非空字符串、非 0 数为真），可用 input 与 nodes"},
+                        "timeout_ms": {"type": "integer", "default": 2000, "x-label": "求值超时（毫秒）"}
+                    }
+                }
+            }),
+            NodeType::Delay => serde_json::json!({
+                "type": "delay",
+                "label": "等待",
+                "category": "control",
+                "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
+                "params_schema": {
+                    "type": "object",
+                    "required": ["ms"],
+                    "properties": {
+                        "ms": {"type": "integer", "x-label": "时长（毫秒）",
+                                "x-help": "数字，或 ${input.x} / ${nodes.n.y} 模板（展开结果须为整数）"}
+                    }
+                }
+            }),
+            NodeType::HttpCall => serde_json::json!({
+                "type": "http_call",
+                "label": "HTTP 请求",
+                "category": "integration",
+                "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
+                "params_schema": {
+                    "type": "object",
+                    "required": ["url"],
+                    "properties": {
+                        "method": {"type": "string", "enum": HTTP_METHODS, "default": "GET", "x-label": "方法"},
+                        "url": {"type": "string", "x-label": "URL",
+                                "x-help": "支持 ${input.x} / ${nodes.n2.y} 模板（${} 内不能含 }）"},
+                        "headers": {"x-widget": "json", "default": {}, "x-label": "请求头"},
+                        "body": {"x-widget": "json", "x-label": "请求体"},
+                        "timeout_ms": {"type": "integer", "default": 30000, "x-label": "HTTP 超时（毫秒）"}
+                    }
+                },
+                "supports_retry": true,
+                "side_effect": true
+            }),
+            NodeType::HumanTask => serde_json::json!({
+                "type": "human_task",
+                "label": "人工节点",
+                "category": "human",
+                "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
+                "params_schema": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": {"type": "string", "x-label": "提示"}
+                    }
+                }
+            }),
+            NodeType::SubWorkflow => serde_json::json!({
+                "type": "sub_workflow",
+                "label": "子工作流",
+                "category": "control",
+                "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
+                "params_schema": {
+                    "type": "object",
+                    "required": ["workflow_id"],
+                    "properties": {
+                        "workflow_id": {"type": "string", "x-widget": "workflow-picker", "x-label": "目标工作流",
+                                        "x-help": "调用其最新已发布版本作为子 run；子 run 输出透传为本节点输出；子 run 失败传导为本节点 fatal（DESIGN §6.8），重试策略只覆盖启动/等待类错误"},
+                        "input_mapping": {"x-widget": "json", "x-label": "子 run 输入映射",
+                                        "x-help": "JSON 对象，值支持 ${input.x} / ${nodes.n.y} 模板；展开结果整体作为子 run 输入。省略 = 沿用父 run 输入"}
+                    }
+                },
+                "supports_retry": true
+            }),
+            NodeType::Llm => serde_json::json!({
+                "type": "llm",
+                "label": "LLM 调用",
+                "category": "ai",
+                "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
+                "params_schema": {
+                    "type": "object",
+                    "required": ["api_key", "model", "prompt"],
+                    "properties": {
+                        "base_url": {"type": "string", "default": "https://api.openai.com/v1", "x-label": "API 地址",
+                                     "x-help": "OpenAI 兼容端点，请求发往 {base_url}/chat/completions"},
+                        "api_key": {"type": "string", "x-secret": true, "x-label": "API 密钥名称",
+                                    "x-help": "只存密钥名称（如 OPENAI_KEY），真值来自 FLOW_SECRET_<名称> 环境变量；已配置的名称见 secrets.list"},
+                        "model": {"type": "string", "x-label": "模型"},
+                        "system": {"type": "string", "x-label": "系统提示"},
+                        "prompt": {"type": "string", "x-widget": "code", "x-label": "提示词",
+                                   "x-help": "支持 ${input.x} / ${nodes.n.y} 模板"},
+                        "temperature": {"type": "number", "x-label": "温度"},
+                        "max_tokens": {"type": "integer", "x-label": "最大 token 数"},
+                        "json_mode": {"type": "boolean", "default": false, "x-label": "JSON 模式",
+                                      "x-help": "开启后请求带 response_format: {\"type\":\"json_object\"}"}
+                    }
+                },
+                "supports_retry": true,
+                "side_effect": true
+            }),
+            NodeType::Email => serde_json::json!({
+                "type": "email",
+                "label": "邮件",
+                "category": "notify",
+                "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
+                "params_schema": {
+                    "type": "object",
+                    "required": ["api_key", "from", "to", "subject", "body"],
+                    "properties": {
+                        "endpoint": {"type": "string", "default": "https://api.resend.com/emails", "x-label": "API 端点",
+                                     "x-help": "Resend 兼容接口：POST {from, to, subject, text}，Bearer 认证"},
+                        "api_key": {"type": "string", "x-secret": true, "x-label": "API 密钥名称",
+                                    "x-help": "只存密钥名称（如 RESEND_KEY），真值来自 FLOW_SECRET_<名称> 环境变量；已配置的名称见 secrets.list"},
+                        "from": {"type": "string", "x-label": "发件人"},
+                        "to": {"type": "string", "x-label": "收件人"},
+                        "subject": {"type": "string", "x-label": "主题",
+                                    "x-help": "支持 ${input.x} / ${nodes.n.y} 模板"},
+                        "body": {"type": "string", "x-widget": "code", "x-label": "正文",
+                                 "x-help": "纯文本（作为 text 字段发送），支持 ${input.x} / ${nodes.n.y} 模板"}
+                    }
+                },
+                "supports_retry": true,
+                "side_effect": true
+            }),
+        }
+    }
+
+    /// params_schema 中标记 `x-secret` 的参数名。definition 里这些参数只存
+    /// 密钥**名称**，真值在执行前按名称从 `FLOW_SECRET_<名称>` 环境变量注入
+    /// （见 secrets.rs）。列表从 descriptor 派生，schema 是唯一事实源。
+    pub fn secret_params(self) -> Vec<String> {
+        let descriptor = self.descriptor();
+        let Some(properties) = descriptor
+            .pointer("/params_schema/properties")
+            .and_then(Value::as_object)
+        else {
+            return Vec::new();
+        };
+        properties
+            .iter()
+            .filter(|(_, schema)| schema.get("x-secret") == Some(&Value::Bool(true)))
+            .map(|(key, _)| key.clone())
+            .collect()
     }
 
     /// 该类型 params 中**不可**被 `${}` 模板展开的「代码承载字段」。
@@ -380,6 +589,18 @@ fn validate_params(node: &Node, kind: NodeType) -> Result<(), String> {
                     node.id
                 )),
             }
+        }
+        NodeType::Llm => {
+            need_str("api_key")?;
+            need_str("model")?;
+            need_str("prompt")
+        }
+        NodeType::Email => {
+            need_str("api_key")?;
+            need_str("from")?;
+            need_str("to")?;
+            need_str("subject")?;
+            need_str("body")
         }
         NodeType::Start | NodeType::End | NodeType::HumanTask => Ok(()),
     }
@@ -800,15 +1021,27 @@ mod tests {
             "http_call",
             "human_task",
             "sub_workflow",
+            "llm",
+            "email",
         ] {
             let parsed = NodeType::parse(kind).unwrap_or_else(|| panic!("{kind} 应可解析"));
             assert_eq!(parsed.as_str(), kind, "{kind} 应原样往返");
         }
+        assert_eq!(NodeType::ALL.len(), 10, "新类型必须登记进 ALL");
+        for kind in NodeType::ALL {
+            assert_eq!(
+                kind.descriptor()["type"],
+                json!(kind.as_str()),
+                "{kind:?} 的 descriptor.type 必须与词汇表一致"
+            );
+        }
         assert!(NodeType::parse("nope").is_none());
         assert!(NodeType::parse("").is_none());
 
-        // 只有 http_call 有外部副作用（崩溃后不可安全重放）
-        assert!(NodeType::HttpCall.has_side_effect());
+        // http_call / llm / email 有外部副作用（崩溃后不可安全重放）
+        for kind in [NodeType::HttpCall, NodeType::Llm, NodeType::Email] {
+            assert!(kind.has_side_effect(), "{kind:?} 应有副作用");
+        }
         for kind in [
             NodeType::Start,
             NodeType::End,
@@ -817,6 +1050,51 @@ mod tests {
         ] {
             assert!(!kind.has_side_effect(), "{kind:?} 不该有副作用");
         }
+    }
+
+    /// x-secret 参数清单从 descriptor 派生：schema 是唯一事实源。
+    #[test]
+    fn secret_params_come_from_descriptor_schema() {
+        assert_eq!(NodeType::Llm.secret_params(), vec!["api_key".to_string()]);
+        assert_eq!(NodeType::Email.secret_params(), vec!["api_key".to_string()]);
+        assert!(NodeType::HttpCall.secret_params().is_empty());
+        assert!(NodeType::Script.secret_params().is_empty());
+    }
+
+    /// llm / email 的必填参数校验。
+    #[test]
+    fn llm_and_email_require_their_params() {
+        let llm = def(
+            vec![
+                node("s", "start"),
+                json!({"id": "n", "type": "llm", "params": {"model": "m"}}),
+                node("e", "end"),
+            ],
+            vec![json!({"from":"s","to":"n"}), json!({"from":"n","to":"e"})],
+        );
+        let err = llm.validate().unwrap_err();
+        assert!(err.contains("api_key"), "{err}");
+
+        let ok = def(
+            vec![
+                node("s", "start"),
+                json!({"id": "n", "type": "llm", "params": {"api_key": "K", "model": "m", "prompt": "p"}}),
+                node("e", "end"),
+            ],
+            vec![json!({"from":"s","to":"n"}), json!({"from":"n","to":"e"})],
+        );
+        assert!(ok.validate().is_ok());
+
+        let email = def(
+            vec![
+                node("s", "start"),
+                json!({"id": "n", "type": "email", "params": {"api_key": "K", "from": "a@b.c"}}),
+                node("e", "end"),
+            ],
+            vec![json!({"from":"s","to":"n"}), json!({"from":"n","to":"e"})],
+        );
+        let err = email.validate().unwrap_err();
+        assert!(err.contains("to"), "{err}");
     }
 
     #[test]
