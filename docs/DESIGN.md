@@ -1,7 +1,8 @@
 # flow 工作流引擎设计方案
 
 > 状态：单机实现 + 对等模式多节点执行（`DISTRIBUTED.md`，Postgres 后端）；
-> `cargo test --workspace --all-targets --locked` 94 个测试全绿；验证命令与覆盖范围见 §13。
+> `cargo test --workspace --all-targets --locked` 253 个测试全绿（含 backend-e2e 的
+> Postgres 变体，需 docker；缺 Postgres 的 SQLite 变体 149 个）。验证命令与覆盖范围见 §13。
 > 本文描述当前代码的实际语义，是后续开发的权威参考。
 > 架构焊点：**SQLite + events.jsonl 是默认与权威后端**（canonical）；Postgres 是
 > 可替代后端，两者统一在 `flow-backend` 的 `AnyBackend` 闭集枚举之后（§2）。
@@ -45,6 +46,9 @@ crates/
   flow-rpc      jsonrpsee WebSocket 服务（bin: flow-server）；**只依赖
                 `AnyBackend` 枚举**，不感知 flow-store / flow-pg，也不读 FLOW_BACKEND；
                 进程内还跑 cron 调度器与 webhook HTTP 入口（§9.2）
+  flow-cli      命令行客户端（bin: flow-cli，§9.3）。**纯 RPC 客户端**：只连
+                flow-server 的 WebSocket，不依赖 flow-backend / store / pg，
+                也不读 FLOW_BACKEND——CRUD 与触发语义唯一来源仍是 RPC 那一份
 ```
 
 依赖方向（不可反转）：
@@ -56,6 +60,9 @@ flow-rpc ──> flow-backend ──> flow-engine ──> flow-dto
 flow-pg ──> flow-store   ✗（两个后端互相独立，互不感知）
 flow-engine ✗ flow-*     （引擎不依赖存储；状态出口走 RunEventSink trait）
 flow-rpc ──> flow-store / flow-pg   ✗（上层不感知具体后端）
+flow-cli ──> flow-server（WebSocket 客户端）──> 上面的整条链路
+flow-cli ──> flow-store / flow-pg ✗   ✗（CLI 不碰存储与事件日志，
+                没有第二条写入路径；SQLite / Postgres 对 CLI 行为一致）
 ```
 
 后端选择只在进程入口发生一次：`flow_backend::open_from_env()` 按
@@ -104,7 +111,11 @@ serde 反序列化时忽略，删除字段不破坏历史日志的可恢复性�
 append(node_started)  →  执行副作用  →  append(终态事件)
 ```
 
-每个事件 `write_all` + `sync_all`（fsync 是崩溃安全边界）。
+每个事件 `write_all` + `sync_all`，**fsync 是崩溃安全边界**——批量 fsync 不松这个
+边界：`append` 返回即 durable（严格组提交），fsync 跨 run 组提交——同时在飞的
+多个 run 的事件共享同一轮刷盘，但每个调用方等的是**自己文件**的 `sync_all` 完成
+（`flow-engine::event::GroupCommitter`，drain 式攒批、无定时器：低负载批=1 零额外
+延迟，高负载批≈并发 append 数）。崩溃语义与「每事件 fsync」逐字一致。
 这界定了节点副作用不明的窗口。恢复还必须处理 `node_failed(retryable=true)` 后
 尚未开始下一次 attempt、信号已记录未消费、节点失败后 run 尚未收尾以及初始化未提交。
 
@@ -340,12 +351,13 @@ Postgres `PgChildLauncher` 经 `lease::create_run` 单事务创建子 run、
 发现子日志为空时查 runs 行）：这类子 run 永远不会写出终态事件，事件侧等待会挂死。
 
 **已知限制**：delay 崩溃后重放整段时长（不续算剩余时间）；重试退避恢复后同样
-等满整段 backoff（不续算剩余时间，理由同 §6.5）；fsync 每事件一次，
-组提交未做（正确性优先，这是后续优化点）。
+等满整段 backoff（不续算剩余时间，理由同 §6.5）。
 
 ## 8. 存储层（flow-store）
 
-SQLite（WAL）。表：
+SQLite（WAL + `synchronous=NORMAL` 组提交：COMMIT 不 fsync、checkpoint 才 fsync。
+SIGKILL 崩溃零丢失——页缓存归内核管；断电/内核崩溃可能丢最后几笔事务，但库
+永不损坏。事件日志才是 run 状态的唯一权威，元数据只是查询索引，见 §3）。表：
 
 - `workflows`：id, name, created_at；
 - `workflow_versions`：`(workflow_id, version)` 主键，**不可变定义快照** + checksum。
@@ -465,6 +477,45 @@ JSON-RPC 允许整体省略 params（到达 null），解析层统一归一为 `
   携带 `signal_id`（Postgres 必填，前端已在 `web/src/api/flow.ts` 生成）；
   外部消费者按本节对齐。
 
+### 9.3 命令行客户端（flow-cli）
+
+`flow-cli`（`crates/flow-cli`）是 §9 方法面的命令行封装：**纯 RPC 客户端**，
+只连 flow-server 的 JSON-RPC WebSocket（`--url` / `FLOW_RPC`，缺省
+`ws://127.0.0.1:9800`），不依赖任何存储 crate、不读 FLOW_BACKEND、不碰
+`data_dir`。因此两个后端对它行为一致，也不存在「绕过 RPC 校验直接操纵
+SQLite / 事件日志」的第二条写入路径。
+
+```bash
+flow-cli workflow list | get | versions | create | update | publish | delete
+flow-cli workflow import <file> [--name N] [--no-publish]
+flow-cli workflow export <id> [-o file] [--version N]
+flow-cli run start <id|name> [--input JSON|@file|-] [--version N] [--detach] [--timeout S]
+flow-cli run list | get | events | timeline | cancel
+```
+
+- **导入导出是客户端编排，不是新 RPC 方法**：`import` = `workflow.list` 按 name
+  反查 → 不存在则 `create` → `update`（新版本）→ `publish`；`export` =
+  `workflow.get`（+ `workflow.list` 反查 name）。信封格式 `{name, definition}`
+  与 `examples/*.workflow.json`、`examples/run-workflow.mjs` 一致，导出的文件可
+  直接再导入或喂给 run-workflow.mjs。服务端语义（不可变版本快照、只有
+  published 可执行、有 run 拒删）一条不变，编排下沉成新方法只会养出第二份
+  「导入」规则。失败不回滚：update/publish 被拒时留下一个 latest 0 的 workflow
+  壳，重新 import 同名会复用它；
+- **手动触发**：`run start` 接受 workflow_id 或 name（本地解析），默认轮询
+  `run.get` 到终态并把 run 输出打到 stdout；`--detach` 只打印 run_id。等待用
+  轮询不用 `run.subscribe`：一次性等待没有推送优化的收益，反而多一条会断开
+  的通道要兜底。`awaiting_resume`（human_task / 待裁决）不是终态，CLI 不提供
+  `run.signal`——信号仍走 web 前端或 RPC，CLI 不引入第二条写入路径；
+- **输出纪律**：文档（definition / run 输出 / run 记录）走 stdout，说明与进度
+  走 stderr，于是 `flow-cli workflow get X > def.json` 拿到的是纯 JSON；
+  `--json` 打印服务端原始结果（供 jq），人类可读表格（CJK 对齐、id 截断
+  12 字符、时间转本地时区）为缺省形态；
+- **退出码契约**（测试钉住）：0 成功；1 本地错误（文件/JSON/连不上/超时/
+  非交互环境缺 `-y`）；2 服务端 RPC 错误（错误码原样透出）；4 触发的 run
+  终态为 failed/cancelled——CI 据此区分「命令打错」与「工作流失败」；
+- **破坏性操作要确认**：`workflow delete` 在非交互 stdin 下必须显式 `-y`
+  （绝不挂起等输入），服务端仍会对有 run 记录的工作流返回 -32012。
+
 ## 10. JS 沙箱（expr.rs）
 
 rquickjs：无 IO、CPU 同步执行（放 `spawn_blocking`，不占死 tokio worker）、
@@ -546,6 +597,9 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
   单点钉在 flow-backend 的 `resolve_runnable_definition` 测试；
 - JS 沙箱边界由行为测试钉住（§10），随每次 `cargo test` 重新验证；
 - `recovery_regressions.rs` 验证失败恢复、重试下游、剩余退避、非法/重复信号和裁决恢复；
+- `group_commit.rs`（flow-engine）钉严格组提交（§3.2）：append 返回即完整可读、
+  seq 连续、并发多日志不串扰，且 fsync 必须真被组批（批数 ≤ 事件数的一半）；
+  fsync 级持久化与写序协议由 backend-e2e 的 SIGKILL 用例钉住；
 - `contracts.rs` 验证显式 draft 拒绝、初始化中断和旧日志缺失隔离；
 - `sub_workflow.rs` 验证子 run 输出透传、子失败 fatal、RunExists 附着、深度上限、
   取消级联，以及崩溃重放沿用同一 child_run_id；
@@ -582,6 +636,17 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
   模板、sub_workflow（透传/失败传导/取消级联/深度上限）、schedule 真触发与
   webhook HTTP 全分支、订阅（回放/增量/未知 run 即结束）、SIGKILL 恢复与
   人工裁决、错误码映射。入口：`cargo test -p backend-e2e`。
+- **flow-cli（`crates/flow-cli`）**：CLI 自己的契约（测试里不直连 JSON-RPC——
+  那测的是服务端）。真起两个进程/实例：`flow-cli` 二进制按
+  `CARGO_BIN_EXE_flow-cli` 作为**子进程**跑，服务端用
+  `flow_rpc::serve` + `SqliteBackend::open`（显式路径、随机端口、不碰环境
+  变量，用例可并行）在进程内监听。钉住：import→list→get/versions→run
+  （等待终态/stdout 输出）→events/timeline→export→roundtrip import 全链路，
+  name 与 workflow_id 等价解析，`--input` 三种形态（内联/@文件/stdin），
+  `--detach` 的 stdout 只剩 run_id，退出码契约（本地 1 / RPC 2 / run 失败 4），
+  未发布即执行与非法定义分别由服务端 -32010 与本地 JSON 错误覆盖，非交互
+  环境 delete 缺 `-y` 必须报错而非挂起，`--url` 覆盖 `FLOW_RPC`，服务不可达
+  的错误文案带起服务提示。入口：`cargo test -p flow-cli`。
 - **backend-perf（`crates/backend-perf`）**：后端性能压测 harness（黑盒，真起
   被测进程，双后端矩阵）。与 backend-e2e 分工：e2e 钉行为契约，这里量性能。
   被测进程是 `flow-perf` 二进制的自举服务模式（`FLOW_PERF_SERVE=1` →
@@ -601,7 +666,6 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
 ## 14. 未做
 
 - delay 剩余时间恢复（当前崩溃/接管后整段重放）；
-- fsync 组提交（吞吐优化，不动语义）；
 - 多 end 被跳过时与真 null 输出的显式区分；
 - `run.start` 客户端幂等键（当前双击 = 两个 run，服务端 uuid 生成）；
 - 中心指派模式（`SCHEDULER.md` 待实施；对等模式已按 `DISTRIBUTED.md` 实现，

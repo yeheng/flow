@@ -1,0 +1,41 @@
+# flow-cli：flow 工作流引擎的命令行客户端（bin: flow-cli）。
+#
+# 定位与边界（与 docs/DESIGN.md §2 一致）：
+# - **纯 RPC 客户端**：只连 flow-server 的 JSON-RPC 2.0 over WebSocket，
+#   不依赖 flow-backend / flow-store / flow-pg，也不读 FLOW_BACKEND——
+#   后端差异在服务端吸收，CLI 对 SQLite / Postgres 后端行为一致；
+# - 不直连 SQLite 或读 data_dir：避免了「绕过 published 校验直接操纵
+#   事件日志」的第二条路径，CRUD 语义唯一来源仍是 RPC 层那一份实现。
+#
+# 覆盖：workflow 的增删改查 + 导入导出（§3），run 的手动触发与查询取消
+# （run.start / run.list / run.get / run.events / run.timeline / run.cancel）。
+#
+# 运行：cargo run --bin flow-cli -- --help
+
+[package]
+name = "flow-cli"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "flow-cli"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+jsonrpsee = { version = "0.26", features = ["client", "ws-client"] }
+chrono = { workspace = true }
+
+[dev-dependencies]
+# 测试自己起服务端：进程内 flow_rpc::serve + SQLite 后端（显式路径，不碰 env），
+# 被测的 flow-cli 仍是真子进程。后端契约本身由 backend-e2e / flow-rpc 覆盖。
+tokio = { workspace = true }
+serde_json = { workspace = true }
+jsonrpsee = { version = "0.26", features = ["server"] }
+flow-rpc = { path = "../flow-rpc" }
+flow-backend = { path = "../flow-backend" }
