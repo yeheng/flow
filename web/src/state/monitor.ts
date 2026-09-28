@@ -43,11 +43,13 @@ export function nodeChildRunId(nodeId: string): string | null {
 }
 
 let unsubscribe: (() => Promise<void>) | null = null;
-/** attach 世代号：并发 attach（快速切换 run）时旧世代的回调/响应一律丢弃 */
-let generation = 0;
-/** 订阅建立与 timeline 对齐之间到达的事件先缓冲，对齐后按 seq 补放 */
-let buffer: RunEvent[] = [];
-let aligned = false;
+/**
+ * attach 令牌：单调递增，每次 attach/detach 抢占一次。
+ * 投影全程在局部变量里构建（订阅缓冲 → timeline 对齐 → 缓冲回放），换入前比对令牌——
+ * 不是最新的就退订走人。monitor 从头到尾要么完全是旧 run、要么完全是新 run，
+ * 没有中间态，也就不需要快照回滚。
+ */
+let attachToken = 0;
 
 export async function startRun(): Promise<void> {
   if (!editor.workflowId) {
@@ -67,7 +69,7 @@ export async function startRun(): Promise<void> {
   monitor.starting = true;
   try {
     const { run_id } = await api.startRun(editor.workflowId, input);
-    // breadcrumb/workflowId 只在 attach 成功后切换：失败时 attach 已回滚到旧 run，栈要跟着留
+    // breadcrumb/workflowId 只在 attach 成功后切换：失败时 monitor 保持旧 run，栈要跟着留
     if (await attach(run_id)) {
       monitor.breadcrumb = [];
       monitor.workflowId = editor.workflowId;
@@ -79,64 +81,89 @@ export async function startRun(): Promise<void> {
   }
 }
 
-/** 切换到指定 run：退订旧的、订阅新的、timeline 对齐后补放缓冲事件。
- * 返回 true 表示本次 attach 仍是当前世代且已完成对齐；被并发 attach 取代返回 false；
- * 订阅失败回滚进入前的 monitor 状态后抛出（调用方只报错） */
+/**
+ * 切换到指定 run：退订旧的、订阅新的，投影在局部构建完成后一次性换入 monitor。
+ * 返回 true 表示本次 attach 完成换入；被更新的 attach/detach 取代返回 false；
+ * 订阅失败抛出（monitor 保持原状，调用方只报错）。
+ */
 async function attach(runId: string): Promise<boolean> {
-  const gen = ++generation;
+  const token = ++attachToken;
   if (unsubscribe) {
     await unsubscribe().catch(() => {});
     unsubscribe = null;
   }
-  // 进入前快照：订阅失败时回滚，不留「运行中」的幻影 run
-  const prev = {
-    runId: monitor.runId,
-    workflowId: monitor.workflowId,
-    phase: monitor.phase,
-    status: monitor.status,
-    output: monitor.output,
-    fatalError: monitor.fatalError,
-    lastSeq: monitor.lastSeq,
-    nodes: monitor.nodes,
-    breadcrumb: monitor.breadcrumb,
+
+  // 局部投影：订阅建立与 timeline 对齐之间到达的事件先入缓冲
+  const proj = {
+    phase: "running" as string | null,
+    status: null as string | null,
+    output: undefined as unknown,
+    fatalError: null as string | null,
+    lastSeq: 0,
+    nodes: [] as TimelineNode[],
   };
-  monitor.runId = runId;
-  monitor.phase = "running";
-  monitor.status = null;
-  monitor.output = undefined;
-  monitor.fatalError = null;
-  monitor.lastSeq = 0;
-  monitor.nodes = [];
-  buffer = [];
-  aligned = false;
-  try {
-    const unsub = await api.subscribeRun(runId, (env) => {
-      // 陈旧订阅的回调可能在退订前到达：只认本世代、本 run 的事件
-      if (!(gen === generation && runId === monitor.runId) || env.run_id !== runId) return;
-      if (!aligned) {
-        buffer.push(env);
-        return;
-      }
-      onEvent(env);
-    });
-    if (!(gen === generation && runId === monitor.runId)) {
-      // 期间已被新的 attach 取代：立即退订，防止回调泄漏/篡改新时间线
-      void unsub().catch(() => {});
-      return false;
+  const buffer: RunEvent[] = [];
+  let aligned = false;
+
+  const onEvent = (env: RunEvent): void => {
+    if (env.run_id !== runId) return;
+    if (!aligned) {
+      buffer.push(env);
+      return;
     }
-    unsubscribe = unsub;
-    await resync();
-    if (!(gen === generation && runId === monitor.runId)) return false;
-    aligned = true;
-    drainBuffer(buffer, monitor.lastSeq).forEach(onEvent);
-    buffer = [];
-    return true;
+    // 换入后又被新的 attach/detach 取代：事件不再属于当前 monitor
+    if (monitor.runId !== runId) return;
+    switch (seqAction(monitor.lastSeq, env.seq)) {
+      case "skip":
+        return;
+      case "resync":
+        void resyncFor(runId);
+        return;
+      case "apply":
+        applyEvent(monitor, env);
+    }
+  };
+
+  const unsub = await api.subscribeRun(runId, onEvent);
+
+  const tl = await api.runTimeline(runId).catch((e: unknown) => {
+    if (token === attachToken) toast.error(errText(e));
+    return null;
+  });
+  if (tl) alignProjection(proj, tl);
+
+  // 构建期间出现了更新的 attach 或 detach：本次作废，monitor 不动
+  if (token !== attachToken) {
+    void unsub().catch(() => {});
+    return false;
+  }
+
+  // 原子换入（同步块，无 await）：monitor 从旧 run 整体切到新 run
+  unsubscribe = unsub;
+  monitor.runId = runId;
+  monitor.phase = proj.phase;
+  monitor.status = proj.status;
+  monitor.output = proj.output;
+  monitor.fatalError = proj.fatalError;
+  monitor.lastSeq = proj.lastSeq;
+  monitor.nodes = proj.nodes;
+  // 钻取子 run 后着色守卫按子 run 自己的工作流对齐；timeline 拉取失败时退化为不着色
+  monitor.workflowId = tl?.workflow_id ?? null;
+  aligned = true;
+  drainBuffer(buffer, monitor.lastSeq).forEach(onEvent);
+  return true;
+}
+
+/** seq 缺口（订阅 Lagged 丢事件）或断线重连后整体重拉 timeline 对齐 */
+async function resyncFor(runId: string): Promise<void> {
+  try {
+    const tl = await api.runTimeline(runId);
+    // 等待期间 monitor 已切走：陈旧响应不得写回
+    if (monitor.runId !== runId) return;
+    alignProjection(monitor, tl);
+    monitor.workflowId = tl.workflow_id;
   } catch (e) {
-    if (!(gen === generation && runId === monitor.runId)) return false; // 已被新的 attach 取代：状态归它收尾
-    Object.assign(monitor, prev);
-    buffer = [];
-    aligned = false;
-    throw e;
+    if (monitor.runId === runId) toast.error(errText(e));
   }
 }
 
@@ -147,9 +174,9 @@ export async function attachRun(runId: string): Promise<boolean> {
   return ok;
 }
 
-/** 离开运行详情页：退订并清空 monitor，使进行中的 attach 回调失效 */
+/** 离开运行详情页：退订并清空 monitor，使进行中的 attach 在换入前自动放弃 */
 export async function detachRun(): Promise<void> {
-  generation++;
+  attachToken++;
   if (unsubscribe) {
     await unsubscribe().catch(() => {});
     unsubscribe = null;
@@ -163,8 +190,6 @@ export async function detachRun(): Promise<void> {
   monitor.lastSeq = 0;
   monitor.nodes = [];
   monitor.breadcrumb = [];
-  buffer = [];
-  aligned = false;
 }
 
 /** 钻取 sub_workflow 节点的子 run */
@@ -183,7 +208,7 @@ export async function backToParentRun(): Promise<void> {
   const parent = monitor.breadcrumb[monitor.breadcrumb.length - 1];
   if (!parent) return;
   try {
-    // 只有 attach 成功才弹栈：失败时 monitor 已回滚到原 run，父级要留在栈里
+    // 只有 attach 成功才弹栈：失败时 monitor 仍是原 run，父级要留在栈里
     if (await attach(parent.runId)) monitor.breadcrumb.pop();
   } catch (e) {
     toast.error(errText(e));
@@ -218,36 +243,7 @@ export async function deliverSignal(nodeId: string, payloadText: string): Promis
   }
 }
 
-/** seq 出现缺口（订阅 Lagged 丢事件）时整体重拉 timeline 对齐 */
-async function resync(): Promise<void> {
-  // await 前记录世代与 runId：陈旧响应不得写回已切换的 monitor
-  const gen = generation;
-  const runId = monitor.runId;
-  if (!runId) return;
-  try {
-    const tl = await api.runTimeline(runId);
-    if (gen !== generation || runId !== monitor.runId) return;
-    alignProjection(monitor, tl);
-    // 钻取子 run 后着色守卫按子 run 自己的工作流对齐
-    monitor.workflowId = tl.workflow_id;
-  } catch (e) {
-    if (gen === generation && runId === monitor.runId) toast.error(errText(e));
-  }
-}
-
-function onEvent(env: RunEvent): void {
-  switch (seqAction(monitor.lastSeq, env.seq)) {
-    case "skip":
-      return;
-    case "resync":
-      void resync();
-      return;
-    case "apply":
-      applyEvent(monitor, env);
-  }
-}
-
 // 断线重连后客户端已自动重建订阅，这里补齐断线期间错过的事件
 client.onReconnect(() => {
-  if (monitor.runId && monitor.phase === "running") void resync();
+  if (monitor.runId && monitor.phase === "running") void resyncFor(monitor.runId!);
 });

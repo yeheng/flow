@@ -1,4 +1,5 @@
 import { client } from "../rpc/client";
+import { httpUrl } from "../config";
 import type {
   Definition,
   NodeTypeDesc,
@@ -188,6 +189,7 @@ export async function deleteWebhook(token: string): Promise<void> {
   await client.call("webhook.delete", { token });
 }
 
-/** webhook HTTP 入口基址（POST /hook/<token>）。flow-server 的 HTTP 端口前端不可知，用 VITE_FLOW_HTTP 覆盖 */
-export const WEBHOOK_BASE =
-  (import.meta.env.VITE_FLOW_HTTP as string | undefined) ?? "http://127.0.0.1:9801";
+/** webhook HTTP 入口基址（POST /hook/<token>）：运行时 config.json 优先，其次 VITE_FLOW_HTTP，最后本地默认 */
+export function webhookBase(): string {
+  return httpUrl();
+}

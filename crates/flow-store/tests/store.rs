@@ -1,11 +1,11 @@
 use flow_store::Store;
+use flow_test_support::io::TempDir;
 use serde_json::json;
-use uuid::Uuid;
 
-async fn store() -> (Store, std::path::PathBuf) {
-    let path = std::env::temp_dir().join(format!("flow-store-test-{}/flow.db", Uuid::now_v7()));
-    let store = Store::open(&path).await.unwrap();
-    (store, path)
+async fn store() -> (Store, TempDir) {
+    let dir = TempDir::new("flow-store-test");
+    let store = Store::open(dir.join("flow.db")).await.unwrap();
+    (store, dir)
 }
 
 fn def(marker: &str) -> serde_json::Value {
@@ -17,7 +17,7 @@ fn def(marker: &str) -> serde_json::Value {
 
 #[tokio::test]
 async fn versions_are_immutable_and_identical_saves_do_not_bump() {
-    let (store, path) = store().await;
+    let (store, _dir) = store().await;
     let wf = store.create_workflow("订单流程").await.unwrap();
 
     let v1 = store.update_workflow(&wf, &def("a")).await.unwrap();
@@ -34,13 +34,12 @@ async fn versions_are_immutable_and_identical_saves_do_not_bump() {
     let old = store.get_version(&wf, Some(1)).await.unwrap();
     assert_eq!(old.definition["edges"][0]["marker"], json!("a"));
     assert_eq!(old.status, "draft");
-
-    std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    // TempDir 的 Drop 负责删目录
 }
 
 #[tokio::test]
 async fn only_published_versions_are_eligible_for_runs() {
-    let (store, path) = store().await;
+    let (store, _dir) = store().await;
     let wf = store.create_workflow("流程").await.unwrap();
     let v1 = store.update_workflow(&wf, &def("a")).await.unwrap();
 
@@ -59,13 +58,12 @@ async fn only_published_versions_are_eligible_for_runs() {
 
     let err = store.publish(&wf, 99).await.unwrap_err();
     assert!(err.to_string().contains("99"), "{err}");
-
-    std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    // TempDir 的 Drop 负责删目录
 }
 
 #[tokio::test]
 async fn workflow_with_runs_cannot_be_deleted() {
-    let (store, path) = store().await;
+    let (store, _dir) = store().await;
     let wf = store.create_workflow("流程").await.unwrap();
     let v = store.update_workflow(&wf, &def("a")).await.unwrap();
 
@@ -85,13 +83,12 @@ async fn workflow_with_runs_cannot_be_deleted() {
     assert!(matches!(err, flow_store::StoreError::Conflict(_)), "{err}");
     assert!(err.to_string().contains("拒绝删除"), "{err}");
     let _ = (v, v2);
-
-    std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    // TempDir 的 Drop 负责删目录
 }
 
 #[tokio::test]
 async fn unfinished_runs_drive_crash_recovery() {
-    let (store, path) = store().await;
+    let (store, _dir) = store().await;
     let wf = store.create_workflow("流程").await.unwrap();
     let v = store.update_workflow(&wf, &def("a")).await.unwrap();
 
@@ -130,13 +127,12 @@ async fn unfinished_runs_drive_crash_recovery() {
     let live = store.get_run("run-live").await.unwrap();
     assert!(live.ended_at.is_none());
     assert_eq!(live.input, json!({"x": 1}));
-
-    std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    // TempDir 的 Drop 负责删目录
 }
 
 #[tokio::test]
 async fn workflow_summary_reports_latest_and_published_versions() {
-    let (store, path) = store().await;
+    let (store, _dir) = store().await;
     let wf = store.create_workflow("流程").await.unwrap();
     let v1 = store.update_workflow(&wf, &def("a")).await.unwrap();
     store.publish(&wf, v1).await.unwrap();
@@ -147,13 +143,12 @@ async fn workflow_summary_reports_latest_and_published_versions() {
     assert_eq!(list[0].latest_version, 2);
     assert_eq!(list[0].published_version, Some(1));
     assert_eq!(list[0].name, "流程");
-
-    std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    // TempDir 的 Drop 负责删目录
 }
 
 #[tokio::test]
 async fn concurrent_saves_return_their_own_versions_and_deduplicate_identical_definitions() {
-    let (store, path) = store().await;
+    let (store, _dir) = store().await;
     let store = std::sync::Arc::new(store);
     let workflow = store.create_workflow("concurrent").await.unwrap();
     for identical in [false, true] {
@@ -192,12 +187,12 @@ async fn concurrent_saves_return_their_own_versions_and_deduplicate_identical_de
         33
     );
     drop(store);
-    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    // TempDir 的 Drop 负责删目录（assert 失败也不会漏垃圾）
 }
 
 #[tokio::test]
 async fn status_updates_clear_resolved_errors() {
-    let (store, path) = store().await;
+    let (store, _dir) = store().await;
     let w = store.create_workflow("w").await.unwrap();
     store.update_workflow(&w, &def("a")).await.unwrap();
     store
@@ -228,7 +223,7 @@ async fn status_updates_clear_resolved_errors() {
     assert!(row.error.is_none());
     assert_eq!(row.output, Some(json!(7)));
     drop(store);
-    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    // TempDir 的 Drop 负责删目录（assert 失败也不会漏垃圾）
 }
 
 /// 删除工作流后版本随级联消失；insert_run 必须在写锁内验证版本存在——
@@ -236,7 +231,7 @@ async fn status_updates_clear_resolved_errors() {
 /// 版本的孤儿 run（runs 表无外键，数据库不会拦）。修复前这里插入成功。
 #[tokio::test]
 async fn run_cannot_reference_deleted_workflow_version() {
-    let (store, path) = store().await;
+    let (store, _dir) = store().await;
     let wf = store.create_workflow("孤儿").await.unwrap();
     store.update_workflow(&wf, &def("a")).await.unwrap();
     store.delete_workflow(&wf).await.unwrap();
@@ -253,5 +248,5 @@ async fn run_cannot_reference_deleted_workflow_version() {
     assert!(store.get_run("r-orphan").await.is_err());
 
     drop(store);
-    std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    // TempDir 的 Drop 负责删目录
 }

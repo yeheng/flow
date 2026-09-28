@@ -1,11 +1,16 @@
 # flow 工作流引擎设计方案
 
 > 状态：单机实现 + 对等模式多节点执行（`DISTRIBUTED.md`，Postgres 后端）；
-> `cargo test --workspace --all-targets --locked` 253 个测试全绿（含 backend-e2e 的
-> Postgres 变体，需 docker；缺 Postgres 的 SQLite 变体 149 个）。验证命令与覆盖范围见 §13。
+> `cargo test --workspace --all-targets --locked` 279 个测试全绿（含 backend-e2e 的
+> Postgres 变体，需 docker；缺 Postgres 时对应用例跳过，其余全绿）。验证命令与覆盖范围见 §13。
 > 本文描述当前代码的实际语义，是后续开发的权威参考。
 > 架构焊点：**SQLite + events.jsonl 是默认与权威后端**（canonical）；Postgres 是
 > 可替代后端，两者统一在 `flow-backend` 的 `AnyBackend` 闭集枚举之后（§2）。
+>
+> **容量定位（部署选型）**：SQLite 定位是**单机并发**——单写者 + fsync 崩溃边界，
+> backend-perf 实测 ~25 runs/s（16 在飞，e2e p95 < 1s）；**并发再高就换 Postgres**
+> （`FLOW_BACKEND=postgres`，同一套 API，实测 ~60-70 runs/s @16 在飞，且可多节点
+> 水平扩展 executor）。两者语义等价（backend-e2e 双后端同契约），选型只看容量。
 
 > **⚠️ 安全边界（部署前必读）**：本服务**没有任何认证/授权**——JSON-RPC
 > WebSocket 谁连上谁就是管理员。默认只监听 `127.0.0.1:9800`；对外暴露
@@ -74,6 +79,15 @@ flow-cli ──> flow-store / flow-pg ✗   ✗（CLI 不碰存储与事件日�
 `FLOW_DB`、`FLOW_DATA_DIR`、`FLOW_HTTP_ADDR` 与 `FLOW_SCHEDULER`（§9.2）；
 Postgres 模式另见 `DISTRIBUTED.md` §10
 （`FLOW_BACKEND`、`FLOW_DATABASE_URL`、`FLOW_ROLE`、`FLOW_LEASE_TTL_MS` 等）。
+
+**SQLite 模式的进程模型（焊死三件套）**：单进程（open 时对 `data_dir` 目录
+fd 持排他 flock，第二个实例立即失败——多节点清用 postgres 后端）·
+单线程（flow-server 跑 current_thread runtime，一个 OS 线程；异步任务仍
+并发，JS 求值/文件 IO 经 spawn_blocking 走独立阻塞线程）·单连接
+（SQLite 连接池 max=1，进程内 DB 访问全串行，SQLITE_BUSY 结构性消失）。
+runtime 形态选择只在二进制薄壳 main 发生（`flow_backend::
+prefer_current_thread_runtime`），lib 内的请求处理路径依旧不感知
+FLOW_BACKEND。
 
 ## 3. 核心数据结构：事件日志是唯一权威
 
@@ -357,7 +371,9 @@ Postgres `PgChildLauncher` 经 `lease::create_run` 单事务创建子 run、
 
 SQLite（WAL + `synchronous=NORMAL` 组提交：COMMIT 不 fsync、checkpoint 才 fsync。
 SIGKILL 崩溃零丢失——页缓存归内核管；断电/内核崩溃可能丢最后几笔事务，但库
-永不损坏。事件日志才是 run 状态的唯一权威，元数据只是查询索引，见 §3）。表：
+永不损坏。事件日志才是 run 状态的唯一权威，元数据只是查询索引，见 §3）。
+连接池 max=1（§2 进程模型：单进程·单线程·单连接；进程内排队在 pool 上
+发生，SQLITE_BUSY 在进程内结构性消失，busy_timeout 只防御进程外访问）。表：
 
 - `workflows`：id, name, created_at；
 - `workflow_versions`：`(workflow_id, version)` 主键，**不可变定义快照** + checksum。
@@ -578,12 +594,61 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
     所有权丢失（LeaseLost）则静默退出，三者互不冒充。
 14. 一个 run 至多一个活 Driver（engine registry 原子占位 reserve_run）：
     重复 start/resume 是无操作，绝不允许第二个写者——EventLog 各自计数 seq，
-    双写者必然产生重复 seq 与重复副作用。
+    双写者必然产生重复 seq 与重复副作用。跨进程维度由 data_dir 排他 flock
+    强制（`SqliteBackend::open`，LOCK_NB 立即失败）：registry 管不住另一个
+    进程的启动恢复，flock 管；同进程二次 open（独立 fd）同样被拒，
+    flock 按 open file description 判定。
 
 ## 13. 测试策略
 
 运行 `cargo test --workspace --all-targets --locked` 与
 `cargo clippy --workspace --all-targets --locked -- -D warnings`。覆盖约定：
+
+### 测试代码怎么摆（Rust 的四层位置约定）
+
+| 层 | 位置 | 规则 |
+|---|---|---|
+| 单测 | `src/<模块>.rs` 末尾 `#[cfg(test)] mod tests;` | 能碰 `super::*` 私有项；模块超过 ~150 行就拆到 `src/<模块>/tests.rs` |
+| 集成测试基建 | `flow-test-support`（`io`：TempDir / free_port；`pg`：docker 容器 + 独占测试库 + 孤儿 volume 回收） | 跨 crate 共享的测试代码只能放这里；只用到 `io` 的 crate 用 `default-features = false` 关掉 `pg` |
+| 集成测试 | `tests/<主题>.rs` + `tests/common/mod.rs` | 只走 public API；共享夹具放 `common`（放子目录，cargo 才不会把它当成独立测试 target） |
+| 端到端 | `backend-e2e/tests/*.rs`（`e2e_test!` 双后端展开） | 真起进程；`common` 里只有 e2e 专属部分 |
+
+三条硬规则：
+
+- **不许为了让 `tests/` 通过而把内部 API `pub` 出去**。曾经为了一份
+  `tests/group_commit.rs` 把 `commit_stats()` / `read_events()` 导出到
+  `flow_engine`——一个测试事实在公开 API 上开了两个洞。这条断言现在住在
+  `src/event.rs` 的 `#[cfg(test)] mod group_commit_tests`。
+- **共享夹具不逐文件复制**。`flow-engine/tests/{engine_recovery,
+  recovery_regressions,sub_workflow}.rs` 曾经各有一份几乎同构的 `Harness`；
+  现在统一在 `tests/common`。同理 `flow-rpc/tests/ws_{rpc,pg}.rs` 的两份
+  `ServerProc`。
+- **docker / PG 测试库的生命周期只在 `flow-test-support::pg` 一处**
+  （历史上有三份各自漂移的实现，其中 flow-pg 那份的残留库清扫因为取错了
+  时间戳长度，从来没删掉过任何库）。
+
+### docker 卫生（backend-e2e / flow-test-support::pg）
+
+PG 镜像声明了 `VOLUME /var/lib/postgresql/data`，不带挂载启动就落到一个**匿名**
+volume 上。Docker 只在容器**自己退出**时（`--rm`）回收匿名 volume；测试清理走
+的是 `docker rm -f`（atexit 与残留清扫都走这条），它只删容器，把 volume 留在
+`/var/lib/docker/volumes` 里变成孤儿——一个 e2e 运行漏一个。三层都堵住：
+
+1. **不创建**：数据目录挂 `--tmpfs`，匿名 volume 根本不出现（临时库的数据
+   本来就没有跨容器的意义，tmpfs 还更快）；
+2. **不留**：删除容器一律 `docker rm -f -v`；
+3. **回收历史遗留**：启动时（删完残留容器之后，否则它们还不算 dangling）
+   清扫 dangling 匿名 volume。只认 64 位十六进制的匿名名——命名 volume
+   是开发者显式建的，绝不动。
+
+`backend-e2e/tests/docker_hygiene.rs` 把这三层各钉一条断言（外加
+「cleanup 必须真的 DROP 测试库」）。每条都验证过：对应的修复被回退，测试就红。
+
+测试库的清理同样有讲究：`DROP DATABASE ... WITH (FORCE)`（PG 13+）原子踢掉
+所有会话再删库，且删库必须排在「关自己的池」之前——用例手里常有第二个池
+（PgEngine / PgBackend / 自建 EventHub），先关池会把删库拖到超时之后。
+
+### 具体覆盖
 
 - RPC 测试用 `env!("CARGO_BIN_EXE_flow-server")` 真起进程，
   `child.kill()`(SIGKILL) + 同 data_dir 重启证明恢复；
@@ -606,7 +671,8 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
 - `engine_recovery.rs` 钉住节点输入面语义：`nodes` 只暴露直接前驱输出，
   非前驱引用深层访问即 fatal（`nodes_scope_*`）；
 - `child_await.rs` 钉住父 run 等待初始化中断子 run 不挂死（空日志 → DB 投影）；
-- 回归护栏：重复恢复不产生第二个写者（engine_recovery）、平台故障挂起不写
+- 回归护栏：重复恢复不产生第二个写者（engine_recovery）、共享 data_dir 的第二个
+  实例被排他 flock 拒绝且锁释放后可重开（flow-backend exclusive_lock）、平台故障挂起不写
   run_failed（sub_workflow）、订阅缺口补齐与失败重试（flow-backend run_tail）、
   子 run 重放沿用钉版本（flow-backend flow-store 的 child_version_pin + flow-pg 的
   `replayed_child_run_keeps_pinned_version`，两臂同一条契约）、信号错误码与订阅
@@ -626,16 +692,23 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
   对 SQLite（独占临时目录 `flow.db`）与 Postgres 两个后端各跑一遍，钉死
   「两臂同契约」；真起 `flow-server` 进程（`CARGO_BIN_EXE_flow-server`，含
   SIGKILL 崩溃恢复与重启），HTTP stub 全部本地 TcpListener（确定性，不依赖
-  外部网络）。Postgres 由本 crate 用 docker CLI 自管容器
+  外部网络）。容器与测试库由 `flow-test-support::pg` 用 docker CLI 自管
   （`postgres:16-alpine`，随机端口，label `com.flow.e2e=1`）：进程退出
   （atexit）与下次启动（按 label 清扫容器、按 `e2e_%` 前缀清扫测试库）双层
-  清理，每个用例独占一个数据库、用完即 DROP，panic 路径也先清理再 unwind。
+  清理，每个用例独占一个数据库、用完即 DROP，panic 路径也先清理再 unwind；
+  数据目录 tmpfs + `rm -f -v` + 启动回收孤儿匿名 volume，磁盘上不留
+  容器/测试库/volume 垃圾（见上面「docker 卫生」与 `tests/docker_hygiene.rs`）。
   需要 docker；`FLOW_E2E_PG_IMAGE` 可换镜像。覆盖：workflow 生命周期与
   「只有 published 可执行」、run 执行（script/condition/delay/输出收集/skip
   传播/重试/JS 沙箱/大整数舍入）、human_task 信号与取消、http_call 分类与
   模板、sub_workflow（透传/失败传导/取消级联/深度上限）、schedule 真触发与
   webhook HTTP 全分支、订阅（回放/增量/未知 run 即结束）、SIGKILL 恢复与
   人工裁决、错误码映射。入口：`cargo test -p backend-e2e`。
+- **flow-test-support（`crates/flow-test-support`）**：测试基建 crate，
+  publish = false、不进产品二进制。`io`：独占临时目录 `TempDir`（Drop 即删，
+  断言失败也不漏）、`free_port`、`wait_ready`；`pg`（特性，默认开）：docker
+  容器、每用例独占测试库、残留清扫、孤儿 volume 回收。flow-pg / flow-rpc 的
+  测试、backend-e2e、backend-perf 都指着这一份。
 - **flow-cli（`crates/flow-cli`）**：CLI 自己的契约（测试里不直连 JSON-RPC——
   那测的是服务端）。真起两个进程/实例：`flow-cli` 二进制按
   `CARGO_BIN_EXE_flow-cli` 作为**子进程**跑，服务端用

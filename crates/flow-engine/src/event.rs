@@ -325,8 +325,13 @@ fn global_committer() -> &'static GroupCommitter {
     GLOBAL.get_or_init(GroupCommitter::default)
 }
 
-/// 进程级组提交统计（测试用：断言组批真的发生）。单调累计，取差值。
-pub fn commit_stats() -> CommitStats {
+/// 进程级组提交统计。**不对外**：它的消费者只有本文件末尾的组提交单测，
+///
+/// 曾为了一份 `tests/group_commit.rs` 把它 `pub` 到 `flow_engine::commit_stats`——
+/// 公开 API 为一个测试事实开了洞。现在这条断言搬回本文件（见末尾
+/// `#[cfg(test)] mod group_commit_tests`），直接读内部计数器，不再需要导出。
+#[cfg(test)]
+fn commit_stats_for_test() -> CommitStats {
     global_committer().stats()
 }
 
@@ -407,7 +412,7 @@ impl EventLog {
 }
 
 /// 读取事件流，并校验 seq 连续（防截断/损坏）。
-pub async fn read_events(path: &Path) -> Result<Vec<Envelope>, EngineError> {
+pub(crate) async fn read_events(path: &Path) -> Result<Vec<Envelope>, EngineError> {
     let (events, _) = read_events_repairing(path).await?;
     validate_sequence(&events)?;
     Ok(events)
@@ -470,4 +475,117 @@ async fn read_events_repairing(path: &Path) -> Result<(Vec<Envelope>, u64), Engi
     }
 
     Ok((events, valid_len))
+}
+
+/// 严格组提交语义（DESIGN §3.2）的内联单测。
+///
+/// 这些断言原来放在 `tests/group_commit.rs`，为此把 `commit_stats()` /
+/// `read_events()` 从 `pub use` 导出到了公开 API——一个测试事实开了两个公开
+/// 符号的洞。搬回本文件后：直接读 `GroupCommitter` 的内部统计，公开 API 收
+/// 回原样，而且断言离被测代码只有几行。
+///
+/// 注意：`stats` 是进程级计数器，本二进制里的用例必须串行取差值，否则并行
+/// 用例的 append 会混进统计。（跨测试二进制是独立进程，本来没这问题。）
+#[cfg(test)]
+mod group_commit_tests {
+    use super::*;
+    use flow_test_support::io::TempDir;
+    use serde_json::json;
+
+    fn test_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(tokio::sync::Mutex::default)
+    }
+
+    fn log_path(root: &Path, run_id: &str) -> PathBuf {
+        run_dir(root, run_id).join("event.jsonl")
+    }
+
+    fn started(index: usize) -> Event {
+        Event::NodeStarted {
+            node_id: format!("n{index}"),
+            attempt: 1,
+            child_run_id: None,
+        }
+    }
+
+    /// 8 个日志 × 5 事件并发追加：每个文件 seq 有序、行完整；fsync 必须被组批
+    /// （批数远小于事件数——攒批是 drain 式的，一攒就是同时在飞的 append）。
+    #[tokio::test]
+    async fn concurrent_appends_group_fsyncs_and_stay_ordered() {
+        let _guard = test_lock().lock().await;
+        let dir = TempDir::new("flow-group-commit");
+        const LOGS: usize = 8;
+        const EVENTS: usize = 5;
+        let before = commit_stats_for_test();
+
+        let mut tasks = Vec::new();
+        for log_index in 0..LOGS {
+            let root = dir.path().to_path_buf();
+            tasks.push(tokio::spawn(async move {
+                let run_id = format!("run-{log_index}");
+                let mut log = EventLog::create(&root, &run_id).await.unwrap();
+                for event_index in 0..EVENTS {
+                    let envelope = log.append(&run_id, started(event_index)).await.unwrap();
+                    assert_eq!(envelope.seq, event_index as u64 + 1);
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        for log_index in 0..LOGS {
+            let run_id = format!("run-{log_index}");
+            let events = read_events(&log_path(dir.path(), &run_id)).await.unwrap();
+            assert_eq!(events.len(), EVENTS, "{run_id} 事件数不符");
+            for (position, envelope) in events.iter().enumerate() {
+                assert_eq!(envelope.seq, position as u64 + 1, "{run_id} seq 不连续");
+                assert_eq!(envelope.run_id, run_id, "{run_id} 行串扰到别的 run");
+            }
+        }
+
+        let after = commit_stats_for_test();
+        let batches = after.batches - before.batches;
+        let file_syncs = after.file_syncs - before.file_syncs;
+        let total = (LOGS * EVENTS) as u64;
+        println!("组批统计：{total} 个 append → {batches} 批 / {file_syncs} 次文件 fsync");
+        assert_eq!(file_syncs, total, "每事件一个文件 fsync（严格语义不打折）");
+        assert!(
+            batches * 2 <= total,
+            "fsync 必须被组批：{total} 个 append 只该跑几批，实际 {batches} 批"
+        );
+    }
+
+    /// append 返回即可被全新读取者完整读到；EventLog::open 续写接在返回的 seq 后。
+    /// 「返回即 durable」的 fsync 面由 SIGKILL 用例覆盖，这里钉读回一致性。
+    #[tokio::test]
+    async fn append_returns_with_line_fully_readable() {
+        let _guard = test_lock().lock().await;
+        let dir = TempDir::new("flow-group-commit");
+
+        let mut log = EventLog::create(dir.path(), "r").await.unwrap();
+        let first = log.append("r", started(1)).await.unwrap();
+        let events = read_events(&log_path(dir.path(), "r")).await.unwrap();
+        assert_eq!(events, vec![first.clone()], "append 返回即须读到完整行");
+
+        // 崩溃恢复路径：open 续写必须接在已返回的 seq 之后，不重不漏
+        let mut reopened = EventLog::open(dir.path(), "r").await.unwrap();
+        let second = reopened
+            .append(
+                "r",
+                Event::NodeCompleted {
+                    node_id: "n1".into(),
+                    attempt: 1,
+                    output: json!(null),
+                    duration_ms: 3,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.seq, first.seq + 1);
+
+        let events = read_events(&log_path(dir.path(), "r")).await.unwrap();
+        assert_eq!(events, vec![first, second]);
+    }
 }

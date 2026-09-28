@@ -10,37 +10,19 @@ import {
   waitingHumanTasks,
 } from "../state/monitor";
 import { editor } from "../state/editor";
+import { nodeStateLabel, runPhaseLabel, runStatusLabel } from "../state/labels";
 
 const props = withDefaults(defineProps<{ childRunNavigate?: boolean }>(), {
   childRunNavigate: false,
 });
 
-const phaseLabel: Record<string, string> = {
-  running: "运行中",
-  succeeded: "成功",
-  failed: "失败",
-  cancelled: "已取消",
-};
+/** run 投影的特殊 status（挂起/初始化）优先展示；其余回落 fold phase */
+const SPECIAL_STATUS = new Set(["initializing", "awaiting_resume"]);
 
-/** run 投影状态（run.timeline status）的特殊展示；其余回落 fold phase */
-const statusLabel: Record<string, string> = {
-  initializing: "初始化中",
-  awaiting_resume: "挂起待恢复",
-};
-
-const runPhaseLabel = computed(() => {
-  if (monitor.status && statusLabel[monitor.status]) return statusLabel[monitor.status];
-  return phaseLabel[monitor.phase ?? ""] ?? monitor.phase ?? "";
+const phaseText = computed(() => {
+  if (monitor.status && SPECIAL_STATUS.has(monitor.status)) return runStatusLabel(monitor.status);
+  return monitor.phase ? runPhaseLabel(monitor.phase) : "";
 });
-
-const stateLabel: Record<string, string> = {
-  pending: "等待",
-  running: "运行中",
-  retrying: "重试中",
-  completed: "完成",
-  failed: "失败",
-  skipped: "跳过",
-};
 
 /** human_task 信号输入框内容，key = node_id */
 const signalTexts = reactive<Record<string, string>>({});
@@ -81,7 +63,7 @@ function onRowClick(nodeId: string): void {
       </span>
       <span class="run-id" :title="monitor.runId ?? ''">run {{ monitor.runId?.slice(0, 8) }}…</span>
       <span v-if="monitor.phase" class="run-phase" :class="`run-${monitor.phase}`">
-        {{ runPhaseLabel }}
+        {{ phaseText }}
       </span>
       <button v-if="runActive" @click="cancelRun()">取消</button>
     </div>
@@ -142,7 +124,7 @@ function onRowClick(nodeId: string): void {
           </td>
           <td>
             <span class="run-state" :class="`run-${n.state}`">
-              {{ stateLabel[n.state] ?? n.state }}
+              {{ nodeStateLabel(n.state) }}
             </span>
             <div v-if="n.error" class="node-error">{{ n.error }}</div>
             <div v-else-if="n.reason" class="node-reason">{{ n.reason }}</div>

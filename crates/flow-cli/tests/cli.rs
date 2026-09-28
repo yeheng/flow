@@ -11,58 +11,30 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Output;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use flow_backend::{AnyBackend, SqliteBackend};
 use flow_rpc::{serve, AppState};
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
+use flow_test_support::io::TempDir;
 use tokio::process::Command;
 
 const CLI_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 一个独占临时目录（`flow-cli-test-<pid>-<序号>`），Drop 时整体删除。
+/// 一个独占临时目录，Drop 时整体删除。
 /// 只删自己建的目录，不碰系统临时目录本身（DESIGN.md §13）。
-struct Scratch {
-    path: PathBuf,
-}
-
-impl Scratch {
-    fn new(tag: &str) -> Scratch {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let unique = format!(
-            "flow-cli-test-{}-{}-{}",
-            std::process::id(),
-            tag,
-            NEXT.fetch_add(1, Ordering::SeqCst)
-        );
-        let path = std::env::temp_dir().join(unique);
-        std::fs::create_dir_all(&path).expect("创建测试目录失败");
-        Scratch { path }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
+///
 /// 进程内的 flow-server（随机端口）。持有 handle 即持有服务实例。
 struct TestServer {
     addr: SocketAddr,
-    _scratch: Scratch,
+    _scratch: TempDir,
     handle: Option<jsonrpsee::server::ServerHandle>,
 }
 
 impl TestServer {
     async fn spawn() -> TestServer {
-        let scratch = Scratch::new("server");
+        let scratch = TempDir::new("flow-cli-test-server");
         let backend = SqliteBackend::open(scratch.path(), scratch.path().join("flow.db"))
             .await
             .expect("打开 SQLite 后端失败");
@@ -153,7 +125,7 @@ fn write_json(dir: &Path, name: &str, value: &Value) -> PathBuf {
 #[tokio::test]
 async fn import_then_run_then_export_roundtrip() {
     let server = TestServer::spawn().await;
-    let scratch = Scratch::new("import-run");
+    let scratch = TempDir::new("import-run");
     let file = write_json(
         scratch.path(),
         "demo.workflow.json",
@@ -247,7 +219,7 @@ async fn import_then_run_then_export_roundtrip() {
 #[tokio::test]
 async fn get_writes_only_json_to_stdout() {
     let server = TestServer::spawn().await;
-    let scratch = Scratch::new("get");
+    let scratch = TempDir::new("get");
     let file = write_json(
         scratch.path(),
         "demo.workflow.json",
@@ -268,7 +240,7 @@ async fn get_writes_only_json_to_stdout() {
 #[tokio::test]
 async fn run_start_by_workflow_id_and_name_resolve_alike() {
     let server = TestServer::spawn().await;
-    let scratch = Scratch::new("resolve");
+    let scratch = TempDir::new("resolve");
     let file = write_json(
         scratch.path(),
         "demo.workflow.json",
@@ -298,7 +270,7 @@ async fn run_start_by_workflow_id_and_name_resolve_alike() {
 #[tokio::test]
 async fn detach_prints_run_id_only() {
     let server = TestServer::spawn().await;
-    let scratch = Scratch::new("detach");
+    let scratch = TempDir::new("detach");
     let file = write_json(
         scratch.path(),
         "demo.workflow.json",
@@ -323,7 +295,7 @@ async fn detach_prints_run_id_only() {
 #[tokio::test]
 async fn failed_run_exits_four_with_server_error() {
     let server = TestServer::spawn().await;
-    let scratch = Scratch::new("failed");
+    let scratch = TempDir::new("failed");
     let file = write_json(
         scratch.path(),
         "boom.workflow.json",
@@ -363,7 +335,7 @@ async fn unknown_workflow_exits_two_with_rpc_code() {
 #[tokio::test]
 async fn malformed_definition_is_rejected_locally() {
     let server = TestServer::spawn().await;
-    let scratch = Scratch::new("bad-json");
+    let scratch = TempDir::new("bad-json");
     let file = scratch.path().join("bad.json");
     std::fs::write(&file, "{ 这不是 JSON").unwrap();
 
@@ -387,7 +359,7 @@ async fn malformed_definition_is_rejected_locally() {
 #[tokio::test]
 async fn invalid_definition_is_rejected_by_server_validation() {
     let server = TestServer::spawn().await;
-    let scratch = Scratch::new("invalid-def");
+    let scratch = TempDir::new("invalid-def");
     let file = write_json(
         scratch.path(),
         "invalid.workflow.json",
@@ -424,7 +396,7 @@ async fn invalid_definition_is_rejected_by_server_validation() {
 #[tokio::test]
 async fn delete_requires_yes_outside_interactive_use() {
     let server = TestServer::spawn().await;
-    let scratch = Scratch::new("delete");
+    let scratch = TempDir::new("delete");
     let file = write_json(
         scratch.path(),
         "demo.workflow.json",
@@ -492,7 +464,7 @@ async fn unreachable_server_is_a_local_error_with_hint() {
 #[tokio::test]
 async fn events_and_timeline_render_a_finished_run() {
     let server = TestServer::spawn().await;
-    let scratch = Scratch::new("events");
+    let scratch = TempDir::new("events");
     let file = write_json(
         scratch.path(),
         "demo.workflow.json",
@@ -532,7 +504,7 @@ async fn events_and_timeline_render_a_finished_run() {
 #[tokio::test]
 async fn input_forms_inline_file_and_stdin_agree() {
     let server = TestServer::spawn().await;
-    let scratch = Scratch::new("input-forms");
+    let scratch = TempDir::new("input-forms");
     let file = write_json(
         scratch.path(),
         "demo.workflow.json",

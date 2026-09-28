@@ -1,0 +1,4 @@
+{
+  "rpcUrl": "wss://flow-server.example.com",
+  "httpUrl": "https://flow-hooks.example.com"
+}

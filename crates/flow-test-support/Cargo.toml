@@ -1,0 +1,29 @@
+[package]
+name = "flow-test-support"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# 测试基建 crate：只被 dev-dependencies 或测试 crate 依赖，不进产品二进制。
+#
+# 为什么不是一个 flow-* 库里的 `#[doc(hidden)] pub mod test_util`：
+# 那会让被测 crate 自己拥有测试基建，下游（flow-pg 的测试）也得跟着 flow-pg
+# 的 feature 开关走。单独一个 crate 让依赖方向保持单向：所有测试都依赖它，
+# 它不依赖任何被测 crate。
+#
+# `pg` 特性拉开 docker CLI + sqlx/postgres + chrono 的重量。只用 TempDir /
+# free_port 的 crate（flow-engine 等）用 `default-features = false` 关掉，
+# 免得跑 core lib 的单测也要编一遍 postgres 客户端。
+
+[features]
+default = ["pg"]
+pg = ["dep:libc", "dep:sqlx", "dep:tokio", "dep:chrono"]
+
+[dependencies]
+libc = { version = "0.2", optional = true }
+sqlx = { workspace = true, features = ["postgres"], optional = true }
+tokio = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+uuid = { workspace = true }
+
+[dev-dependencies]

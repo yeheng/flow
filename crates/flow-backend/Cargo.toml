@@ -13,6 +13,7 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+fs2 = { workspace = true }
 futures = { workspace = true }
 flow-engine = { path = "../flow-engine" }
 flow-dto = { path = "../flow-dto" }
@@ -20,6 +21,7 @@ flow-store = { path = "../flow-store" }
 flow-pg = { path = "../flow-pg" }
 
 [dev-dependencies]
+flow-test-support = { path = "../flow-test-support", default-features = false }
 chrono = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

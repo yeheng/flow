@@ -5,8 +5,8 @@
 
 use backend_e2e::common::fixtures::{delay_def, human_def, linear_def, timeline_node};
 use backend_e2e::common::{
-    call, call_err, call_json, connect, container, publish_workflow, spawn_pg_server, start_run,
-    wait_run_status, wait_run_terminal, Ctx, TestDb, SHORT, TIMEOUT,
+    call, call_err, call_json, connect, publish_workflow, shared, spawn_pg_server, start_run,
+    wait_run_status, wait_run_terminal, Ctx, TestDb, E2E_DB_PREFIX, SHORT, TIMEOUT,
 };
 use backend_e2e::e2e_test;
 use serde_json::{json, Value};
@@ -317,8 +317,8 @@ e2e_test!(
 /// 这个用例自己管进程与测试库（不能用 Ctx——它的 all 角色进程会立刻消费信号）。
 #[tokio::test]
 async fn pg_signal_pending_without_executor_then_delivered() {
-    let pg = container::shared().await;
-    let db = TestDb::create(&pg.url()).await;
+    let pg = shared().await;
+    let db = TestDb::create(&pg.url(), E2E_DB_PREFIX).await;
     let bin = env!("CARGO_BIN_EXE_flow-server");
 
     // gateway：只提供元数据与持久输入入口，没有 Driver 消费 inbox

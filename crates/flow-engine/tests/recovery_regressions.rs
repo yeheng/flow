@@ -1,117 +1,17 @@
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+//! 失败恢复的集成回归（DESIGN.md §7）：fatal 失败保持终态、重试下游只跑一次、
+//! 恢复后继续等满退避、非法/重复信号不判死 run、裁决恢复被消费。
+//!
+//! Harness / 定义构造器在 `common`（历史上一份在这里、一份在
+//! engine_recovery.rs / sub_workflow.rs）。
 
-use flow_engine::{
-    Definition, Engine, Event, EventLog, NodeState, NoopObserver, RunPhase, RunState, Signal,
-    StartRun,
-};
+mod common;
+
+use common::{node_def, spec, terminal, Harness};
+use flow_engine::{Event, NodeState, RunPhase, Signal};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-struct Harness {
-    root: PathBuf,
-    engine: Engine,
-}
-
-impl Harness {
-    fn new() -> Self {
-        let root = std::env::temp_dir().join(format!("flow-regression-{}", uuid::Uuid::now_v7()));
-        Self {
-            engine: Engine::new(&root, Arc::new(NoopObserver)),
-            root,
-        }
-    }
-
-    async fn terminal(&self) -> RunState {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let state = self.engine.snapshot("r").await.unwrap();
-                if state.phase.is_terminal() && !self.engine.is_live("r") {
-                    return state;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("run did not terminate")
-    }
-
-    async fn prefix(&self, events: Vec<Event>) {
-        let mut log = EventLog::create(&self.root, "r").await.unwrap();
-        for event in [
-            Event::RunStarted {
-                workflow_id: "w".into(),
-                workflow_version: 1,
-                input: Value::Null,
-                depth: 0,
-            },
-            Event::NodeStarted {
-                node_id: "s".into(),
-                attempt: 1,
-                child_run_id: None,
-            },
-            Event::NodeCompleted {
-                node_id: "s".into(),
-                attempt: 1,
-                output: Value::Null,
-                duration_ms: 0,
-            },
-            Event::NodeStarted {
-                node_id: "n".into(),
-                attempt: 1,
-                child_run_id: None,
-            },
-        ]
-        .into_iter()
-        .chain(events)
-        {
-            log.append("r", event).await.unwrap();
-        }
-    }
-
-    async fn wait_started(&self, node: &str) {
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if matches!(
-                    self.engine.snapshot("r").await.unwrap().record(node).state,
-                    NodeState::Running { .. }
-                ) {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
-    }
-}
-
-impl Drop for Harness {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
-
-fn definition(node: Value) -> Definition {
-    serde_json::from_value(json!({
-        "nodes": [{"id":"s", "type":"start"}, node, {"id":"e", "type":"end"}],
-        "edges": [{"from":"s", "to":"n"}, {"from":"n", "to":"e"}]
-    }))
-    .unwrap()
-}
-
-fn spec(definition: Definition) -> StartRun {
-    StartRun {
-        run_id: "r".into(),
-        workflow_id: "w".into(),
-        workflow_version: 1,
-        definition,
-        input: Value::Null,
-        depth: 0,
-    }
-}
-
+/// 本地 HTTP 桩：按给定状态行逐个回应（确定性，不依赖外部网络）。
 async fn http_server(statuses: &[&str]) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -119,7 +19,7 @@ async fn http_server(statuses: &[&str]) -> (String, tokio::task::JoinHandle<()>)
     let server = tokio::spawn(async move {
         for status in statuses {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut buffer = [0; 4096];
+            let mut buffer = [0u8; 4096];
             let read = socket.read(&mut buffer).await.unwrap();
             assert!(read > 0);
             let response =
@@ -159,7 +59,7 @@ async fn recovered_fatal_failure_remains_failed_and_independent_branch_finishes(
     }))
     .unwrap();
     h.engine.resume_run(spec(def)).await.unwrap();
-    let state = h.terminal().await;
+    let state = terminal(&h.engine, "r").await;
     assert_eq!(state.phase, RunPhase::Failed);
     assert!(state.fatal_error.as_deref().unwrap().contains("fatal"));
     assert!(matches!(
@@ -178,11 +78,11 @@ async fn successful_retry_runs_downstream_once_with_and_without_backoff() {
     for backoff in [0, 30] {
         let h = Harness::new();
         let (url, server) = http_server(&["503 Service Unavailable", "200 OK"]).await;
-        let def = definition(json!({"id":"n", "type":"http_call", "params":{
+        let def = node_def(json!({"id":"n", "type":"http_call", "params":{
             "url":url, "retry":{"max_attempts":2, "backoff_ms":backoff}
         }}));
         h.engine.start_run(spec(def)).await.unwrap();
-        let state = h.terminal().await;
+        let state = terminal(&h.engine, "r").await;
         server.await.unwrap();
         assert_eq!(state.phase, RunPhase::Succeeded);
         assert_eq!(state.record("n").attempts, 2);
@@ -213,7 +113,7 @@ async fn recovery_restores_retry_timer_and_waits_full_backoff() {
             retryable: true,
         }])
         .await;
-        let def = definition(json!({"id":"n", "type":"http_call", "params":{
+        let def = node_def(json!({"id":"n", "type":"http_call", "params":{
             "url":url, "retry":{"max_attempts":2, "backoff_ms":backoff_ms}
         }}));
         h.engine.resume_run(spec(def)).await.unwrap();
@@ -225,7 +125,7 @@ async fn recovery_restores_retry_timer_and_waits_full_backoff() {
         );
         assert_eq!(state.record("n").state.label(), "retrying");
 
-        let state = h.terminal().await;
+        let state = terminal(&h.engine, "r").await;
         server.await.unwrap();
         assert_eq!(state.phase, RunPhase::Succeeded);
         assert_eq!(state.record("n").attempts, 2);
@@ -237,10 +137,10 @@ async fn recovery_restores_retry_timer_and_waits_full_backoff() {
 async fn invalid_and_duplicate_human_signals_do_not_fail_run() {
     let h = Harness::new();
     h.engine
-        .start_run(spec(definition(json!({"id":"n", "type":"human_task"}))))
+        .start_run(spec(node_def(json!({"id":"n", "type":"human_task"}))))
         .await
         .unwrap();
-    h.wait_started("n").await;
+    h.wait_node_running("n").await;
     let err = h
         .engine
         .signal(
@@ -266,7 +166,7 @@ async fn invalid_and_duplicate_human_signals_do_not_fail_run() {
         .iter()
         .any(|env| matches!(env.event, Event::SignalReceived { .. })));
     assert!(h.engine.signal("r", signal).await.is_err());
-    let state = h.terminal().await;
+    let state = terminal(&h.engine, "r").await;
     assert_eq!(state.phase, RunPhase::Succeeded);
     assert_eq!(state.output, Some(json!({"approved":true})));
     let events = h.engine.read_events("r", None).await.unwrap();
@@ -284,7 +184,7 @@ async fn invalid_adjudication_keeps_node_waiting_for_a_valid_decision() {
     let h = Harness::new();
     h.prefix(vec![]).await;
     let def =
-        definition(json!({"id":"n", "type":"http_call", "params":{"url":"http://127.0.0.1:1"}}));
+        node_def(json!({"id":"n", "type":"http_call", "params":{"url":"http://127.0.0.1:1"}}));
     h.engine.resume_run(spec(def)).await.unwrap();
     for payload in [
         json!({"action":"typo"}),
@@ -316,7 +216,7 @@ async fn invalid_adjudication_keeps_node_waiting_for_a_valid_decision() {
         )
         .await
         .unwrap();
-    let state = h.terminal().await;
+    let state = terminal(&h.engine, "r").await;
     assert_eq!(state.phase, RunPhase::Succeeded);
     assert_eq!(state.output, Some(json!(7)));
 }
@@ -331,9 +231,9 @@ async fn durable_adjudication_is_consumed_on_recovery() {
             payload: json!({"action":action, "output":7, "error":"rejected"}),
         }])
         .await;
-        let def = definition(json!({"id":"n", "type":"http_call", "params":{"url":url}}));
+        let def = node_def(json!({"id":"n", "type":"http_call", "params":{"url":url}}));
         h.engine.resume_run(spec(def)).await.unwrap();
-        let state = h.terminal().await;
+        let state = terminal(&h.engine, "r").await;
         server.await.unwrap();
         assert_eq!(
             state.phase,

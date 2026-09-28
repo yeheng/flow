@@ -88,13 +88,17 @@ export function validateDefinition(
       continue;
     }
     edgeKeys.add(key);
+    // 出边端口必须存在于源节点的出端口元数据（与 isValidConnection 同源，不再硬编码 condition）
     const source = byId.get(e.source);
-    if (source && isType(source, "condition")) {
+    const desc = source?.data?.nodeType;
+    if (desc && typeOf.has(desc.type)) {
       const handle = e.sourceHandle ?? "out";
-      if (handle !== "true" && handle !== "false") {
+      const outPorts = desc.ports.filter((p) => p.id !== "in");
+      if (!outPorts.some((p) => p.id === handle)) {
+        const valid = outPorts.map((p) => p.id).join("/");
         errors.push({
           nodeId: e.source,
-          message: `condition 节点 ${e.source} 的出边端口必须是 true/false`,
+          message: `节点 ${e.source} 的出边端口必须是 ${valid}，当前是 ${handle}`,
         });
       }
     }

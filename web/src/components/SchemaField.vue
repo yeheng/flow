@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 import { editor } from "../state/editor";
 import type { PropertySchema } from "../types";
 
@@ -55,6 +55,18 @@ const jsonText = ref(
   props.modelValue === undefined ? "" : JSON.stringify(props.modelValue, null, 2),
 );
 const jsonError = ref("");
+/** 聚焦期间不做外部同步，避免格式化差异打断输入 */
+const jsonFocused = ref(false);
+
+// undo/redo 或版本加载从外部改了 params：非聚焦时把文本同步回来
+watch(
+  () => props.modelValue,
+  (v) => {
+    if (jsonFocused.value || props.schema["x-widget"] !== "json") return;
+    jsonText.value = v === undefined ? "" : JSON.stringify(v, null, 2);
+    jsonError.value = "";
+  },
+);
 
 function onJson(ev: Event): void {
   const raw = (ev.target as HTMLTextAreaElement).value.trim();
@@ -162,6 +174,8 @@ function setChild(key: string, value: unknown): void {
         rows="4"
         spellcheck="false"
         @input="onJson"
+        @focus="jsonFocused = true"
+        @blur="jsonFocused = false"
       ></textarea>
       <div v-if="jsonError" class="field-error">{{ jsonError }}</div>
     </template>

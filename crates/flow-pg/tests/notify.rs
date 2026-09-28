@@ -45,9 +45,9 @@ async fn event_notifications_cover_create_and_append() {
     );
 
     wait_until("run 完成", Duration::from_secs(15), || async {
-        run_status(&db.pool, &run_id).await == "succeeded"
+        run_status(db.pool(), &run_id).await == "succeeded"
     })
     .await;
 
-    db.close().await;
+    db.cleanup().await;
 }

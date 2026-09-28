@@ -1,27 +1,30 @@
 //! PG 测试基建：每个测试使用独立数据库，彻底隔离扫描与容量状态。
+//!
+//! 容器与测试库生命周期的真身在 `flow-test-support::pg`——与 flow-rpc 的
+//! ws_pg、backend-e2e 同指一份（历史上有三份各自漂移的实现：三个 janitor、
+//! 两套 URL 解析，其中一套的残留清扫从来没生效过）。这里只留 flow-pg 的
+//! 测试自己需要的部分：连接配置、发布/起 run 助手、定义构造器、断言工具。
+//!
 //! 未配置 FLOW_TEST_DATABASE_URL 时返回 None，测试自动跳过。
-
-// common 被多个测试二进制共享，各二进制只用到其中一部分辅助函数。
+//!
+//! common 被多个测试二进制共享，各二进制只用到其中一部分辅助函数。
 #![allow(dead_code)]
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use flow_test_support::pg::TestDb;
 use sqlx::{PgConnection, PgPool, Row};
-use uuid::Uuid;
 
 use flow_pg::{PgConfig, PgEngine};
 
+/// PG 测试库名前缀：残留下一次启动时只扫这个前缀的库。
+pub const DB_PREFIX: &str = "flow_test_";
+
 pub const DEFAULT_URL: &str = "postgres://flow:flow@127.0.0.1:54329/flow";
 
-pub struct TestDb {
-    pub pool: PgPool,
-    pub url: String,
-    pub name: String,
-}
-
-/// 连接到基础服务器，创建独立的测试数据库。
-/// 数据库名带时间戳，启动时顺手清理超过 30 分钟的残留库。
+/// 连到基础服务器，创建独立的测试数据库。
+/// 数据库名带时间戳，启动时顺手清理超过 15 分钟的残留库。
 pub async fn test_db() -> Option<TestDb> {
     let base = std::env::var("FLOW_TEST_DATABASE_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
     if std::env::var("FLOW_TEST_DATABASE_URL").is_err() && !port_open().await {
@@ -29,106 +32,11 @@ pub async fn test_db() -> Option<TestDb> {
         eprintln!("skip: 未设置 FLOW_TEST_DATABASE_URL 且 {DEFAULT_URL} 不可达");
         return None;
     }
-    let Some((server_url, _)) = split_db(&base) else {
-        eprintln!("skip: 无法解析 FLOW_TEST_DATABASE_URL");
-        return None;
-    };
-    let admin = PgPool::connect(&server_url)
-        .await
-        .expect("连接 Postgres 失败");
-    janitor(&admin).await;
-    let name = format!(
-        "flow_test_{}{}",
-        chrono::Utc::now().format("%Y%m%d%H%M%S"),
-        Uuid::now_v7().simple()
-    );
-    // CREATE/DROP DATABASE 不支持绑定参数；库名是本函数生成的
-    // flow_test_<时间戳><uuid>，不含用户输入，无注入面。AssertSqlSafe 见 sqlx 0.9。
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
-        .execute(&admin)
-        .await
-        .expect("创建测试数据库失败");
-    admin.close().await;
-    let url = rebase(&base, &name);
-    let pool = PgPool::connect(&url).await.expect("连接测试数据库失败");
-    flow_pg::schema::init(&pool)
+    let db = TestDb::create(&base, DB_PREFIX).await;
+    flow_pg::schema::init(db.pool())
         .await
         .expect("初始化 schema 失败");
-    Some(TestDb { pool, url, name })
-}
-
-impl TestDb {
-    /// 显式清理：关连接池、断开后端、删库。测试结尾调用；失败留给 janitor。
-    pub async fn close(self) {
-        self.pool.close().await;
-        let Some((server_url, _)) = split_db(&self.url) else {
-            return;
-        };
-        let Ok(admin) = PgPool::connect(&server_url).await else {
-            return;
-        };
-        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{}'",
-            self.name
-        )))
-        .execute(&admin)
-        .await;
-        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP DATABASE IF EXISTS {}",
-            self.name
-        )))
-        .execute(&admin)
-        .await;
-        admin.close().await;
-    }
-}
-
-/// 清理陈旧的测试库（名字形如 flow_test_<YYYYMMDDHHMMSS>_<uuid>）。
-async fn janitor(admin: &PgPool) {
-    use sqlx::Row;
-    let cutoff = chrono::Utc::now() - chrono::Duration::minutes(30);
-    let rows = sqlx::query("SELECT datname FROM pg_database WHERE datname LIKE 'flow_test_%'")
-        .fetch_all(admin)
-        .await
-        .unwrap_or_default();
-    for row in rows {
-        let name: String = match row.try_get(0) {
-            Ok(n) => n,
-            Err(_) => continue,
-        };
-        let ts = name
-            .trim_start_matches("flow_test_")
-            .get(..16)
-            .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y%m%d%H%M%S").ok())
-            .map(|t| t.and_utc());
-        let Some(created) = ts else { continue };
-        if created > cutoff {
-            continue;
-        }
-        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{name}'"
-        )))
-        .execute(admin)
-        .await;
-        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP DATABASE IF EXISTS {name}"
-        )))
-        .execute(admin)
-        .await;
-    }
-}
-
-fn split_db(url: &str) -> Option<(String, String)> {
-    let pos = url.rfind('/')?;
-    Some((
-        url[..pos + 1].to_string() + "postgres",
-        url[pos + 1..].to_string(),
-    ))
-}
-
-fn rebase(url: &str, db: &str) -> String {
-    let pos = url.rfind('/').unwrap();
-    url[..pos + 1].to_string() + db
+    Some(db)
 }
 
 async fn port_open() -> bool {
@@ -170,10 +78,7 @@ pub async fn publish_definition(
 ) -> (String, i64) {
     let store = engine.store();
     let workflow_id = store.create_workflow(name).await.unwrap();
-    let version = store
-        .update_workflow(&workflow_id, &definition)
-        .await
-        .unwrap();
+    let version = store.update_workflow(&workflow_id, &definition).await.unwrap();
     store.publish(&workflow_id, version).await.unwrap();
     (workflow_id, version)
 }
@@ -258,8 +163,8 @@ pub async fn events(pool: &PgPool, run_id: &str) -> Vec<EventRow> {
                 r.get::<i64, _>("seq"),
                 r.get::<String, _>("kind"),
                 r.get::<Option<String>, _>("node_id"),
-                r.get::<Option<String>, _>("attempt")
-                    .and_then(|s| s.parse().ok()),
+                // attempt 在 SQL 里被 `->>` 取出成文本，这里转回数字
+                r.get::<Option<String>, _>("attempt").and_then(|s| s.parse().ok()),
                 r.get::<serde_json::Value, _>("payload"),
             )
         })
@@ -284,11 +189,7 @@ pub async fn lease_of(
             .fetch_one(pool)
             .await
             .unwrap();
-    (
-        rec.get("lease_owner"),
-        rec.get("lease_epoch"),
-        rec.get("lease_expires_at"),
-    )
+    (rec.get("lease_owner"), rec.get("lease_epoch"), rec.get("lease_expires_at"))
 }
 
 /// 直接以 SQL 插入一条 pending inbox 行（绕过 gateway 的终态检查，用于构造竞态窗口）。

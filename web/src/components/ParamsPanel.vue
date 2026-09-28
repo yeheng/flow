@@ -32,7 +32,10 @@ const retry = computed(
 
 function setRetry(key: "max_attempts" | "backoff_ms", ev: Event): void {
   const v = (ev.target as HTMLInputElement).valueAsNumber;
-  setParam("retry", { ...retry.value, [key]: Number.isNaN(v) ? undefined : v });
+  const next: Record<string, unknown> = { ...retry.value, [key]: Number.isNaN(v) ? undefined : v };
+  // 两个字段都为空时整体删除 retry（空值语义在写入侧收敛，序列化器不认识具体参数名）
+  const clean = Object.fromEntries(Object.entries(next).filter(([, x]) => x !== undefined));
+  setParam("retry", Object.keys(clean).length > 0 ? clean : undefined);
 }
 </script>
 

@@ -8,7 +8,6 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-uuid = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 reqwest = { workspace = true }
@@ -17,3 +16,9 @@ rquickjs = { workspace = true }
 tracing = { workspace = true }
 flow-dto = { path = "../flow-dto" }
 futures = { workspace = true }
+
+# tests/ 只用：共用测试基建（TempDir / 端口等待）。`pg` 特性拉着 sqlx/postgres +
+# docker CLI 那一坨——flow-engine 的测试一个 PG 都不用，关掉省一坨编译时间。
+[dev-dependencies]
+flow-test-support = { path = "../flow-test-support", default-features = false }
+uuid = { workspace = true }

@@ -113,6 +113,24 @@ export function nodeTypeDesc(type: string): NodeTypeDesc | undefined {
   return editor.nodeTypes.find((t) => t.type === type);
 }
 
+/**
+ * 未知节点类型的占位描述：服务端升级引入新类型时旧前端必须能渲染、编辑、保存，
+ * 而不是白屏。给一个入/出端口的通用卡片 + 空 schema（参数面板无表单，params 原样透传）；
+ * validation 会报「类型未知」标红提示。
+ */
+export function unknownTypeDesc(type: string): NodeTypeDesc {
+  return {
+    type,
+    label: type,
+    category: "unknown",
+    ports: [
+      { id: "in", label: "入" },
+      { id: "out", label: "出" },
+    ],
+    params_schema: { type: "object", properties: {} },
+  };
+}
+
 /** 出端口（source）；协议约定 id 为 "in" 的是入端口，其余都是出端口 */
 export function sourcePortsOf(desc: NodeTypeDesc): PortDesc[] {
   return desc.ports.filter((p) => p.id !== "in");
@@ -287,7 +305,8 @@ export function definitionToFlow(def: Definition): { nodes: EditorNode[]; edges:
     position: n.position ?? fallback.get(n.id) ?? { x: 80, y: 80 },
     data: {
       name: n.name ?? "",
-      nodeType: nodeTypeDesc(n.type)!,
+      // 未知类型降级为占位描述（前向兼容：旧前端渲染新定义不白屏）
+      nodeType: nodeTypeDesc(n.type) ?? unknownTypeDesc(n.type),
       params: (n.params ?? {}) as Record<string, unknown>,
     },
   }));
@@ -306,14 +325,11 @@ export function definitionToFlow(def: Definition): { nodes: EditorNode[]; edges:
   return { nodes, edges };
 }
 
+/** 通用序列化：只剥离空值，不认识任何具体参数名（retry 等字段的空值语义由写入侧保证） */
 function cleanParams(params: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(params)) {
     if (v === undefined || v === "") continue;
-    if (k === "retry" && typeof v === "object" && v !== null) {
-      const r = v as Record<string, unknown>;
-      if (r.max_attempts === undefined && r.backoff_ms === undefined) continue;
-    }
     out[k] = v;
   }
   return out;
@@ -419,6 +435,17 @@ export async function save(): Promise<boolean> {
     return false;
   }
   try {
+    // 软冲突检测：另一标签页/会话可能在我们加载后保存了新版本。
+    // 版本 append-only 不会丢数据，但为避免静默分叉先确认。（workflow.update 尚无
+    // base_version 强校验，这里有 TOCTOU 窗口，挡住的是最常见的多标签页场景）
+    const latest = await api.getWorkflow(editor.workflowId);
+    if (latest.version > editor.version) {
+      const ok = await confirmDialog(
+        `工作流已有更新的 v${latest.version}（当前画布基于 v${editor.version}）。` +
+          `继续保存将以当前画布内容生成 v${latest.version + 1}。确定继续？`,
+      );
+      if (!ok) return false;
+    }
     editor.version = await api.updateWorkflow(editor.workflowId, flowToDefinition());
     markSaved();
     toast.success(`已保存 v${editor.version}`);
@@ -546,11 +573,8 @@ export function pasteClipboard(): boolean {
   const newNodes: EditorNode[] = [];
   let skipped = 0;
   for (const cn of clipboard.nodes) {
-    const desc = nodeTypeDesc(cn.type);
-    if (!desc) {
-      skipped++;
-      continue;
-    }
+    // 未知类型同样用占位描述粘贴：复制粘贴是内存往返，params 不能丢
+    const desc = nodeTypeDesc(cn.type) ?? unknownTypeDesc(cn.type);
     const max = desc.max_instances ?? 0;
     const count =
       editor.nodes.filter((n) => n.data.nodeType.type === cn.type).length +

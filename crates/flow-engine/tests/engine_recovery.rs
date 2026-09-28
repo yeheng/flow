@@ -1,142 +1,24 @@
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+//! 引擎恢复语义的集成回归（DESIGN.md §3.2、§7）。
+//!
+//! 覆盖：双写者守卫、顺序事件、condition 分支跳过、纯节点重放、
+//! 副作用节点等人工裁决、human_task 跨重启派信号、取消终态、skip 传播、
+//! 多前驱输出收集、`nodes` 只暴露直接前驱、独立分支收尾。
+//!
+//! Harness / 定义构造器在 `common`（历史上一份在这里、一份在
+//! recovery_regressions.rs / sub_workflow.rs，三份几乎同构）。
+
+mod common;
+
 use std::time::Duration;
 
-use flow_engine::{
-    Definition, Engine, Event, EventLog, NoopObserver, ResumeOutcome, RunPhase, RunState, Signal,
-    StartRun,
-};
+use common::{def_from, describe, linear_def, Harness};
+use flow_engine::{Event, EventLog, ResumeOutcome, RunPhase, RunState, Signal, StartRun};
 use serde_json::{json, Value};
-use uuid::Uuid;
 
-struct Harness {
-    dir: PathBuf,
-    engine: Arc<Engine>,
-}
-
-impl Harness {
-    fn new() -> Harness {
-        let dir = std::env::temp_dir().join(format!("flow-engine-test-{}", Uuid::now_v7()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let engine = Arc::new(Engine::new(&dir, Arc::new(NoopObserver)));
-        Harness { dir, engine }
-    }
-
-    fn run_id(&self) -> String {
-        format!("run-{}", Uuid::now_v7())
-    }
-
-    async fn snapshot(&self, run_id: &str) -> RunState {
-        self.engine.snapshot(run_id).await.unwrap()
-    }
-
-    async fn wait_terminal(&self, run_id: &str) -> RunState {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let state = self.snapshot(run_id).await;
-            if state.phase.is_terminal() {
-                return state;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "run {run_id} 超时未结束"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-
-    async fn wait_not_live(&self, run_id: &str) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while self.engine.is_live(run_id) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "run {run_id} 引擎任务未退出"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    }
-
-    async fn wait_live(&self, run_id: &str) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !self.engine.is_live(run_id) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "run {run_id} 未进入运行态"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    }
-}
-
-impl Drop for Harness {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-fn describe(state: &RunState) -> String {
-    format!(
-        "phase={:?} fatal_error={:?} output={:?}",
-        state.phase, state.fatal_error, state.output
-    )
-}
-
-fn def_from(json: Value) -> Definition {
-    serde_json::from_value(json).unwrap()
-}
-
-fn linear_def() -> Definition {
-    def_from(json!({
-        "nodes": [
-            {"id": "n1", "type": "start", "name": "输入"},
-            {"id": "n2", "type": "script", "name": "计算", "params": {"code": "return { doubled: input.amount * 2 };"}},
-            {"id": "n3", "type": "delay", "name": "等待", "params": {"ms": 10}},
-            {"id": "n4", "type": "end", "name": "输出"}
-        ],
-        "edges": [
-            {"from": "n1", "to": "n2"},
-            {"from": "n2", "to": "n3"},
-            {"from": "n3", "to": "n4"}
-        ]
-    }))
-}
-
-/// 手工写出一段「崩溃残留」的事件日志：模拟进程在节点执行中被杀死。
-async fn craft_partial_log(dir: &Path, run_id: &str, nodes_started: &[&str]) {
-    let mut log = EventLog::create(dir, run_id).await.unwrap();
-    log.append(
-        run_id,
-        Event::RunStarted {
-            workflow_id: "w1".into(),
-            workflow_version: 1,
-            input: json!({"amount": 21}),
-            depth: 0,
-        },
-    )
-    .await
-    .unwrap();
-    for node_id in nodes_started {
-        log.append(
-            run_id,
-            Event::NodeStarted {
-                node_id: (*node_id).to_string(),
-                attempt: 1,
-                child_run_id: None,
-            },
-        )
-        .await
-        .unwrap();
-    }
-    drop(log);
-}
-
-/// 双写者守卫：run 仍在被驱动时重复恢复必须是无操作。
-/// 两个 Driver 各持独立 seq 计数器写同一 event.jsonl，必然产生重复 seq
-/// 与重复副作用（同一节点执行两次）。见 engine.rs reserve_run。
 #[tokio::test]
 async fn resume_while_live_is_a_no_op_single_writer_invariant() {
     let h = Harness::new();
-    let run_id = h.run_id();
+    let run_id = Harness::run_id();
     // 1.5s delay 拉开恢复窗口：resume 时节点必在途（Running 或即将派发）
     let def = def_from(json!({
         "nodes": [
@@ -187,7 +69,7 @@ async fn resume_while_live_is_a_no_op_single_writer_invariant() {
 #[tokio::test]
 async fn linear_run_executes_and_records_ordered_events() {
     let h = Harness::new();
-    let run_id = h.run_id();
+    let run_id = Harness::run_id();
     let def = linear_def();
 
     h.engine
@@ -233,7 +115,7 @@ async fn linear_run_executes_and_records_ordered_events() {
 #[tokio::test]
 async fn condition_branch_marks_untaken_side_skipped() {
     let h = Harness::new();
-    let run_id = h.run_id();
+    let run_id = Harness::run_id();
     // 两个分支各自收敛到独立的 end 节点
     let def = def_from(json!({
         "nodes": [
@@ -284,12 +166,12 @@ async fn condition_branch_marks_untaken_side_skipped() {
 #[tokio::test]
 async fn restarted_pure_node_is_replayed_with_new_attempt() {
     let h = Harness::new();
-    let run_id = h.run_id();
+    let run_id = Harness::run_id();
     let def = linear_def();
     // 崩溃现场：start 已完成，script 已 node_started 但没有终态
-    craft_partial_log(&h.dir, &run_id, &["n1", "n2"]).await;
+    h.craft_partial_log(&run_id, &["n1", "n2"]).await;
     // 补上 start 的终态，只留 script 悬空
-    let mut log = EventLog::open(&h.dir, &run_id).await.unwrap();
+    let mut log = EventLog::open(h.dir.path(), &run_id).await.unwrap();
     log.append(
         &run_id,
         Event::NodeCompleted {
@@ -337,7 +219,7 @@ async fn restarted_pure_node_is_replayed_with_new_attempt() {
 #[tokio::test]
 async fn side_effect_node_after_crash_waits_for_human_adjudication() {
     let h = Harness::new();
-    let run_id = h.run_id();
+    let run_id = Harness::run_id();
     let def = def_from(json!({
         "nodes": [
             {"id": "n1", "type": "start"},
@@ -350,8 +232,8 @@ async fn side_effect_node_after_crash_waits_for_human_adjudication() {
         ]
     }));
 
-    craft_partial_log(&h.dir, &run_id, &["n1", "pay"]).await;
-    let mut log = EventLog::open(&h.dir, &run_id).await.unwrap();
+    h.craft_partial_log(&run_id, &["n1", "pay"]).await;
+    let mut log = EventLog::open(h.dir.path(), &run_id).await.unwrap();
     log.append(
         &run_id,
         Event::NodeCompleted {
@@ -379,7 +261,7 @@ async fn side_effect_node_after_crash_waits_for_human_adjudication() {
 
     // 引擎不应自动重放副作用节点，而是挂起等待裁决
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let state = h.snapshot(&run_id).await;
+    let state = h.engine.snapshot(&run_id).await.expect("读取快照失败");
     assert_eq!(state.phase, RunPhase::Running);
     assert!(matches!(
         state.record("pay").state,
@@ -408,7 +290,7 @@ async fn side_effect_node_after_crash_waits_for_human_adjudication() {
 #[tokio::test]
 async fn human_task_holds_run_until_signal_arrives() {
     let h = Harness::new();
-    let run_id = h.run_id();
+    let run_id = Harness::run_id();
     let def = def_from(json!({
         "nodes": [
             {"id": "n1", "type": "start"},
@@ -435,7 +317,7 @@ async fn human_task_holds_run_until_signal_arrives() {
 
     h.wait_live(&run_id).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let state = h.snapshot(&run_id).await;
+    let state = h.engine.snapshot(&run_id).await.expect("读取快照失败");
     assert_eq!(state.phase, RunPhase::Running, "等信号期间 run 不能结束");
     assert!(h.engine.is_live(&run_id));
 
@@ -458,7 +340,7 @@ async fn human_task_holds_run_until_signal_arrives() {
 #[tokio::test]
 async fn human_task_signal_recorded_before_crash_is_completed_on_resume() {
     let h = Harness::new();
-    let run_id = h.run_id();
+    let run_id = Harness::run_id();
     let def = def_from(json!({
         "nodes": [
             {"id": "n1", "type": "start"},
@@ -471,8 +353,8 @@ async fn human_task_signal_recorded_before_crash_is_completed_on_resume() {
         ]
     }));
 
-    craft_partial_log(&h.dir, &run_id, &["n1", "approve"]).await;
-    let mut log = EventLog::open(&h.dir, &run_id).await.unwrap();
+    h.craft_partial_log(&run_id, &["n1", "approve"]).await;
+    let mut log = EventLog::open(h.dir.path(), &run_id).await.unwrap();
     log.append(
         &run_id,
         Event::NodeCompleted {
@@ -516,7 +398,7 @@ async fn human_task_signal_recorded_before_crash_is_completed_on_resume() {
 #[tokio::test]
 async fn cancelled_run_is_terminal_and_stops_work() {
     let h = Harness::new();
-    let run_id = h.run_id();
+    let run_id = Harness::run_id();
     let def = def_from(json!({
         "nodes": [
             {"id": "n1", "type": "start"},
@@ -553,7 +435,7 @@ async fn skip_propagates_through_multiple_downstream_levels() {
     // 回归：未走的分支上串联了多个节点（delay → human_task → end），
     // 跳过必须沿下游传递到底，不能把 run 判成「调度停滞」。
     let h = Harness::new();
-    let run_id = h.run_id();
+    let run_id = Harness::run_id();
     let def = def_from(json!({
         "nodes": [
             {"id": "n1", "type": "start"},
@@ -607,7 +489,7 @@ async fn skip_propagates_through_multiple_downstream_levels() {
 async fn multi_pred_end_collects_output_map() {
     // 多前驱 end：节点输出是各前驱输出的映射，而不是透传其中一个
     let h = Harness::new();
-    let run_id = h.run_id();
+    let run_id = Harness::run_id();
     let def = def_from(json!({
         "nodes": [
             {"id": "s", "type": "start"},
@@ -649,7 +531,7 @@ async fn nodes_scope_is_direct_predecessors_only() {
     // 深层访问即 TypeError → fatal。旧实现把全部已完成输出都塞进 nodes，
     // 非前驱引用读到真值，破坏「重放结果与首次执行一致」。
     let h = Harness::new();
-    let run_id = h.run_id();
+    let run_id = Harness::run_id();
     let def = def_from(json!({
         "nodes": [
             {"id": "s", "type": "start"},
@@ -692,7 +574,7 @@ async fn nodes_scope_is_direct_predecessors_only() {
 async fn nodes_scope_exposes_predecessor_outputs() {
     // 正向钉子：直接前驱的输出在 nodes 里可见（a、b 是 c 的前驱）
     let h = Harness::new();
-    let run_id = h.run_id();
+    let run_id = Harness::run_id();
     let def = def_from(json!({
         "nodes": [
             {"id": "s", "type": "start"},
@@ -732,7 +614,7 @@ async fn fatal_failure_lets_independent_branch_finish() {
     // 钉住 fatal 语义：致命失败只记录，不中断独立分支——
     // slow 必须跑到 Completed，失败分支的下游必须被跳过，run 结果为 Failed。
     let h = Harness::new();
-    let run_id = h.run_id();
+    let run_id = Harness::run_id();
     let def = def_from(json!({
         "nodes": [
             {"id": "s", "type": "start"},

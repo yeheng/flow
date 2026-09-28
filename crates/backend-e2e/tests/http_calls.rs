@@ -151,7 +151,7 @@ e2e_test!(
     http_call_connection_refused_retries_then_fails,
     |ctx: &mut Ctx| Box::pin(async move {
         // 起一个监听器拿到端口后立刻关闭：连接被拒（副作用未发生 → retryable）
-        let port = backend_e2e::common::container::free_port();
+        let port = backend_e2e::common::free_port();
         {
             let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
             drop(listener);

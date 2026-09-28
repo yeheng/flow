@@ -529,6 +529,19 @@ pub(crate) async fn resolve_runnable_definition(
     Ok((version, definition))
 }
 
+/// 进程入口的 runtime 形态提示：SQLite 后端整体跑在单线程 runtime
+/// （current_thread，单 OS 线程；异步任务仍并发，JS 求值/文件 IO 经
+/// spawn_blocking 走独立阻塞线程），Postgres 对等模式保持多线程。
+/// 与排他 flock、单连接池一起构成「单进程·单线程·单写者」三件套。
+/// 只应在 main() 构造 tokio runtime 时调用一次——这是部署形态选择，
+/// 不属于 RPC 请求处理路径对后端的感知（那条禁令针对 lib 内逻辑）。
+pub fn prefer_current_thread_runtime() -> bool {
+    match std::env::var("FLOW_BACKEND") {
+        Ok(v) => !v.eq_ignore_ascii_case("postgres") && !v.eq_ignore_ascii_case("postgresql"),
+        Err(_) => true, // 缺省 sqlite
+    }
+}
+
 /// 工厂：按 FLOW_BACKEND 构造后端。
 /// `sqlite`（缺省，canonical）| `postgres`（可替代，多节点执行）。
 /// 这是整个进程唯一读取 FLOW_BACKEND 的地方。

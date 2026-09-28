@@ -1,4 +1,5 @@
 import { ref } from "vue";
+import { rpcUrl } from "../config";
 
 export class RpcError extends Error {
   constructor(
@@ -36,8 +37,12 @@ interface Subscription {
  * 断线自动重连（指数退避）；重连后自动重建订阅，调用方通过 onReconnect 重新拉取状态。
  */
 class RpcClient {
-  readonly url: string;
   readonly connected = ref(false);
+
+  /** 惰性解析：首次连接时才读运行时配置（main.ts 启动时拉取 config.json） */
+  get url(): string {
+    return rpcUrl();
+  }
 
   private ws: WebSocket | null = null;
   private nextId = 1;
@@ -50,10 +55,6 @@ class RpcClient {
   private everConnected = false;
   private reconnectDelay = 500;
   private reconnectCbs: Array<() => void> = [];
-
-  constructor() {
-    this.url = (import.meta.env.VITE_FLOW_RPC as string | undefined) ?? "ws://127.0.0.1:9800";
-  }
 
   onReconnect(cb: () => void): void {
     this.reconnectCbs.push(cb);

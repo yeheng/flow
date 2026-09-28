@@ -310,3 +310,132 @@ pub(crate) async fn queue_event_notify(
 pub(crate) fn payload_of(event: &flow_engine::Event) -> Result<Value, flow_engine::EngineError> {
     serde_json::to_value(event).map_err(flow_engine::EngineError::Json)
 }
+
+/// 准入规则的表驱动单测（DISTRIBUTED.md §5.1）。
+///
+/// `check_writable` 是 fencing 协议的判官：调用点每写一次事件都要问一遍。
+/// 它过去只有 `tests/recovery.rs` 的黑盒覆盖（要连真 PG、不可达时还跳过），
+/// 而规则本身是**纯函数**——在这里按表驱动逐条钉住，无需数据库。
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flow_engine::EngineError;
+
+    /// 一行「run 行快照」：状态、owner、epoch、expired、last_seq。
+    fn row(
+        status: &str,
+        owner: Option<&str>,
+        epoch: i64,
+        expired: bool,
+        last_seq: i64,
+    ) -> RunRow {
+        RunRow {
+            status: status.into(),
+            lease_owner: owner.map(str::to_string),
+            lease_epoch: epoch,
+            last_seq,
+            expired,
+        }
+    }
+
+    #[test]
+    fn matching_owner_epoch_and_seq_writes() {
+        let r = row("running", Some("i-1"), 3, false, 7);
+        assert!(check_writable(&r, "i-1", 3, Some(7)).is_ok());
+        // 不校验 last_seq（None）只用来判定所有权，不是常态
+        assert!(check_writable(&r, "i-1", 3, None).is_ok());
+    }
+
+    #[test]
+    fn every_mismatch_is_lease_lost() {
+        let r = row("running", Some("i-1"), 3, false, 7);
+        // 其他实例持锁
+        assert!(matches!(
+            check_writable(&r, "i-2", 3, Some(7)),
+            Err(EngineError::LeaseLost)
+        ));
+        // 同实例但旧 epoch（已被接管过一次）
+        assert!(matches!(
+            check_writable(&r, "i-1", 2, Some(7)),
+            Err(EngineError::LeaseLost)
+        ));
+        // 没人持锁（租约被清空）——同样不许写
+        assert!(matches!(
+            check_writable(&r, "i-1", 3, Some(7)),
+            Ok(())
+        ));
+        assert!(matches!(
+            check_writable(&row("running", None, 3, false, 7), "i-1", 3, Some(7)),
+            Err(EngineError::LeaseLost)
+        ));
+        // 租约已过期：迟到的持锁者也不能再写
+        assert!(matches!(
+            check_writable(&row("running", Some("i-1"), 3, true, 7), "i-1", 3, Some(7)),
+            Err(EngineError::LeaseLost)
+        ));
+    }
+
+    #[test]
+    fn terminal_status_drops_write_right_silently() {
+        // run 已终结：写权随终态消失。按 LeaseLost 静默退出，不写 run_failed
+        for status in ["succeeded", "failed", "cancelled"] {
+            let r = row(status, Some("i-1"), 3, false, 7);
+            assert!(
+                matches!(check_writable(&r, "i-1", 3, Some(7)), Err(EngineError::LeaseLost)),
+                "{status} 必须已无写权"
+            );
+        }
+        // 反过来：真正在跑的状态才有写权。
+        // 注意 `initializing` **不在**可写侧（flow-dto 的 STATUS_ACTIVE 只含
+        // running / awaiting_resume）：那条状态下的 run 还没有事件日志、轮不到
+        // 租约持有者写，所以判 LeaseLost 让它静默退出是对的。这条不对称是刻意的，
+        // 在这里钉住，免得日后「顺手补全」时把它加进去。
+        for status in ["running", "awaiting_resume"] {
+            let r = row(status, Some("i-1"), 3, false, 7);
+            assert!(check_writable(&r, "i-1", 3, Some(7)).is_ok(), "{status} 应可写");
+        }
+        let r = row("initializing", Some("i-1"), 3, false, 7);
+        assert!(
+            matches!(check_writable(&r, "i-1", 3, Some(7)), Err(EngineError::LeaseLost)),
+            "initializing 无写权（还没有事件日志可写）"
+        );
+    }
+
+    #[test]
+    fn last_seq_mismatch_is_log_corrupted_not_lease_lost() {
+        // 内存 fold 与已提交日志不一致：接管流程必须以日志为准，报 LogCorrupted
+        let r = row("running", Some("i-1"), 3, false, 7);
+        let err = check_writable(&r, "i-1", 3, Some(8)).expect_err("seq 不符必须拒绝");
+        assert!(
+            matches!(err, EngineError::LogCorrupted(_)),
+            "应为 LogCorrupted，实际 {err:?}"
+        );
+        // 两者都不是：所有权还不匹配时归属问题优先判定
+        assert!(matches!(
+            check_writable(&r, "i-2", 3, Some(8)),
+            Err(EngineError::LeaseLost)
+        ));
+    }
+
+    #[test]
+    fn negative_last_seq_is_log_corrupted() {
+        // last_seq < 0 是数据损坏：宁可 LogCorrupted 也不静默放行
+        let r = row("running", Some("i-1"), 3, false, -1);
+        assert!(matches!(
+            check_writable(&r, "i-1", 3, Some(3)),
+            Err(EngineError::LogCorrupted(_))
+        ));
+    }
+
+    #[test]
+    fn status_active_membership_matches_the_vocabulary() {
+        for status in ["running", "awaiting_resume"] {
+            assert!(status_is_active(status), "{status} 应为活跃");
+        }
+        for status in [
+            "succeeded", "failed", "cancelled", "initializing", "initializing ", "paused", "",
+        ] {
+            assert!(!status_is_active(status), "{status} 不应为活跃");
+        }
+    }
+}

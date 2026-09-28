@@ -8,6 +8,7 @@ members = [
     "crates/flow-dto",
     "crates/flow-rpc",
     "crates/flow-cli",
+    "crates/flow-test-support",
     "crates/backend-e2e",
     "crates/backend-perf",
 ]
@@ -28,6 +29,7 @@ thiserror = "2"
 sha2 = "0.11"
 hex = "0.4"
 parking_lot = "0.12"
+fs2 = "0.4"
 sqlx = { version = "0.9", features = ["sqlite", "runtime-tokio", "chrono"] }
 jsonrpsee = { version = "0.26", features = ["server", "client", "macros"] }
 cron-parser = "0.12"

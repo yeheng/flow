@@ -4,7 +4,7 @@
 //! - `Kind::Postgres`：共享容器上的独占测试库；
 //! - `Ctx::restart` 换新端口重新拉起同一份存储——崩溃恢复用例的「重启」。
 
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -13,8 +13,7 @@ use futures::FutureExt;
 use uuid::Uuid;
 
 use crate::common::client;
-use crate::common::container;
-use crate::common::db::TestDb;
+use crate::common::{free_port, shared, TestDb, E2E_DB_PREFIX};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
@@ -80,8 +79,13 @@ impl Ctx {
                 }
             }
             Kind::Postgres => {
-                let pg = container::shared().await;
-                let db = TestDb::create(&pg.url()).await;
+                let pg = shared().await;
+                // schema 在这里初始化：TestDb 只负责「开出一个空库」
+                let db = TestDb::create(&pg.url(), E2E_DB_PREFIX).await;
+                flow_pg::schema::init(db.pool())
+                    .await
+                    .expect("初始化测试库 schema 失败");
+                db.pool().close().await;
                 let server = ServerProc::spawn(
                     bin,
                     &Storage::Postgres {
@@ -354,11 +358,6 @@ impl Drop for ServerProc {
 /// gateway / executor 拆分场景的辅助入口（持久 inbox pending → delivered）。
 pub async fn spawn_pg_server(bin: &str, url: &str, role: &str, signal_wait_ms: u64) -> ServerProc {
     ServerProc::spawn_postgres(bin, url, role, signal_wait_ms)
-}
-
-pub fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("绑定临时端口失败");
-    listener.local_addr().expect("读取端口失败").port()
 }
 
 fn socket_addr(port: u16) -> SocketAddr {

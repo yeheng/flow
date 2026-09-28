@@ -4,7 +4,8 @@ import * as api from "../api/flow";
 import { errText } from "../rpc/client";
 import { editor, refreshWorkflows } from "../state/editor";
 import { confirmDialog } from "../state/modal";
-import { mergeRunPage, nextCursor, sourceLabel } from "../state/run-list";
+import { mergeRunPage, nextCursor } from "../state/run-list";
+import { runStatusLabel, sourceLabel } from "../state/labels";
 import { toast } from "../state/toast";
 import type { RunRecord } from "../types";
 
@@ -18,6 +19,8 @@ const sourceFilter = ref("");
 const hasMore = ref(false);
 const loadingMore = ref(false);
 let timer: ReturnType<typeof setInterval> | null = null;
+/** 轮询在途守卫：断线重连等慢响应场景下请求不叠加 */
+let refreshing = false;
 
 const workflowNames = computed(() => new Map(editor.workflows.map((w) => [w.workflow_id, w.name])));
 
@@ -37,15 +40,6 @@ const SOURCE_OPTIONS: { value: string; label: string }[] = [
   { value: "webhook", label: "Webhook" },
   { value: "sub_workflow", label: "子流程" },
 ];
-
-const statusLabel: Record<string, string> = {
-  running: "运行中",
-  initializing: "初始化中",
-  awaiting_resume: "挂起待恢复",
-  succeeded: "成功",
-  failed: "失败",
-  cancelled: "已取消",
-};
 
 /** 状态徽章着色沿用画布运行态体系：蓝 running / 绿 succeeded / 红 failed / 黄 awaiting / 灰 cancelled */
 function badgeClass(status: string): string {
@@ -68,19 +62,24 @@ function fmtDuration(r: RunRecord): string {
   return `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s`;
 }
 
-/** 轮询只刷首页（最新的 PAGE_SIZE 条），已翻出的旧页保持不动 */
+/** 轮询只刷首页（最新的 PAGE_SIZE 条），已翻出的旧页保持不动。
+ * 多取一条探测是否还有更旧数据，避免「总数恰好整除页大小」时 hasMore 假阳性 */
 async function refresh(): Promise<void> {
+  if (refreshing) return;
+  refreshing = true;
   try {
-    const page = await api.listRuns({
+    const probe = await api.listRuns({
       workflowId: props.workflowId,
       status: statusFilter.value || undefined,
       source: sourceFilter.value || undefined,
-      limit: PAGE_SIZE,
+      limit: PAGE_SIZE + 1,
     });
-    runs.value = mergeRunPage(page, runs.value);
-    hasMore.value = page.length === PAGE_SIZE;
+    hasMore.value = probe.length > PAGE_SIZE;
+    runs.value = mergeRunPage(probe.slice(0, PAGE_SIZE), runs.value);
   } catch (e) {
     toast.error(errText(e));
+  } finally {
+    refreshing = false;
   }
 }
 
@@ -89,15 +88,15 @@ async function loadMore(): Promise<void> {
   if (!cursor || loadingMore.value) return;
   loadingMore.value = true;
   try {
-    const page = await api.listRuns({
+    const probe = await api.listRuns({
       workflowId: props.workflowId,
       status: statusFilter.value || undefined,
       source: sourceFilter.value || undefined,
       beforeRunId: cursor,
-      limit: PAGE_SIZE,
+      limit: PAGE_SIZE + 1,
     });
-    runs.value = mergeRunPage(runs.value, page);
-    hasMore.value = page.length === PAGE_SIZE;
+    hasMore.value = probe.length > PAGE_SIZE;
+    runs.value = mergeRunPage(runs.value, probe.slice(0, PAGE_SIZE));
   } catch (e) {
     toast.error(errText(e));
   } finally {
@@ -182,7 +181,7 @@ watch(
           </td>
           <td>
             <span class="badge" :class="badgeClass(r.status)">
-              {{ statusLabel[r.status] ?? r.status }}
+              {{ runStatusLabel(r.status) }}
             </span>
           </td>
           <td>{{ sourceLabel(r.source) }}</td>

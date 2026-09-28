@@ -67,6 +67,11 @@ pub struct SqliteBackend {
     engine: Arc<Engine>,
     data_dir: PathBuf,
     db_path: PathBuf,
+    /// data_dir 的排他 flock，随后端存续持有：SQLite 后端是单进程设计，
+    /// 第二个实例（哪怕同机）共享 data_dir 会被启动恢复劫持成双写者
+    /// （重复 seq + 重复副作用，DESIGN §12.14）。锁目录本身的 fd——
+    /// 无锁文件残留，进程死亡（含 SIGKILL）内核自动释放。Drop 即解锁。
+    _dir_lock: std::fs::File,
 }
 
 impl SqliteBackend {
@@ -76,6 +81,21 @@ impl SqliteBackend {
     ) -> Result<SqliteBackend, BackendError> {
         let data_dir = data_dir.into();
         let db_path = db_path.as_ref().to_path_buf();
+        let io_err = |err: std::io::Error| BackendError::internal(format!("data_dir 访问失败：{err}"));
+        std::fs::create_dir_all(&data_dir).map_err(io_err)?;
+        // 排他 flock：把「单进程假设」从文档焊成代码强制（DESIGN §12.14）。
+        // LOCK_NB 立即失败——排队等待只会掩盖部署错误（正确的多节点形态是
+        // postgres 后端，不是多个 sqlite 实例共享磁盘）。同进程二次 open
+        // （独立 fd）同样被拒：flock 按 open file description 判定。
+        let dir_lock = std::fs::File::open(&data_dir).map_err(io_err)?;
+        fs2::FileExt::try_lock_exclusive(&dir_lock).map_err(|err| {
+            BackendError::Conflict(format!(
+                "data_dir {} 已被另一个 flow 实例持有（{}）；\
+                 SQLite 后端是单进程设计，多节点部署请用 postgres 后端",
+                data_dir.display(),
+                err
+            ))
+        })?;
         let store = Arc::new(Store::open(&db_path).await.map_err(sqlite_err)?);
         let engine = Arc::new(Engine::new(
             &data_dir,
@@ -86,6 +106,7 @@ impl SqliteBackend {
             engine,
             data_dir,
             db_path,
+            _dir_lock: dir_lock,
         };
         // 两阶段注入：launcher 依赖 Engine，Engine 的 Driver 需要 launcher
         backend
@@ -632,10 +653,7 @@ mod tests {
     /// （词汇表本身现在单一来源在 flow-dto，此测试钉住 store 写入口真的在校验。）
     #[tokio::test]
     async fn engine_run_statuses_are_the_only_statuses_store_accepts() {
-        let root = std::env::temp_dir().join(format!(
-            "flow-backend-status-contract-{}",
-            uuid::Uuid::now_v7()
-        ));
+        let root = flow_test_support::io::TempDir::new("flow-backend-status-contract");
         let store = Store::open(root.join("flow.db")).await.unwrap();
         let wf = store.create_workflow("wf").await.unwrap();
         store
@@ -674,7 +692,7 @@ mod tests {
         assert!(err.to_string().contains("paused"), "{err}");
 
         drop(store);
-        std::fs::remove_dir_all(root).unwrap();
+        // TempDir 的 Drop 负责删目录——断言失败也不会漏垃圾
     }
 
     /// 「只有 published 可执行 + 创建前校验」规则的唯一真相源测试：
@@ -682,9 +700,8 @@ mod tests {
     /// 规则断言钉在这里一份，不再分散在各后端。
     #[tokio::test]
     async fn resolve_runnable_definition_enforces_published_and_validates() {
-        let root =
-            std::env::temp_dir().join(format!("flow-backend-resolve-{}", uuid::Uuid::now_v7()));
-        let backend = SqliteBackend::open(&root, root.join("flow.db"))
+        let root = flow_test_support::io::TempDir::new("flow-backend-resolve");
+        let backend = SqliteBackend::open(root.path(), root.join("flow.db"))
             .await
             .unwrap();
         let wf = backend.create_workflow("t").await.unwrap();
@@ -728,7 +745,7 @@ mod tests {
         assert!(matches!(err, crate::BackendError::Invalid(_)), "{err}");
 
         drop(backend);
-        std::fs::remove_dir_all(root).unwrap();
+        // TempDir 的 Drop 负责删目录——断言失败也不会漏垃圾
     }
 
     fn def_line(code: &str) -> Value {

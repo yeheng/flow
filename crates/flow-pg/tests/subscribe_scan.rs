@@ -46,7 +46,7 @@ async fn active_run_is_never_crowded_out_by_recently_ended() {
     let Some(db) = test_db().await else { return };
     let engine = engine(&db, flow_pg::Role::Gateway).await;
     let (wf, v) = publish_definition(&engine, "scan-quota", def_line("return 1;")).await;
-    let pool = db.pool.clone();
+    let pool = db.pool().clone();
 
     let base = Utc::now();
     for i in 0..300 {
@@ -72,7 +72,7 @@ async fn active_run_is_never_crowded_out_by_recently_ended() {
     let ended = candidates.iter().filter(|(_, terminal)| *terminal).count();
     assert!(ended <= 256, "ended 配额必须有界，实际 {ended}");
 
-    db.close().await;
+    db.cleanup().await;
 }
 
 /// ended 配额优先最近终结的 run（短 run 最可能漏终态），且总量有界。
@@ -81,7 +81,7 @@ async fn ended_quota_is_bounded_and_prefers_recent() {
     let Some(db) = test_db().await else { return };
     let engine = engine(&db, flow_pg::Role::Gateway).await;
     let (wf, v) = publish_definition(&engine, "scan-quota-ended", def_line("return 1;")).await;
-    let pool = db.pool.clone();
+    let pool = db.pool().clone();
 
     let base = Utc::now();
     for i in 0..300 {
@@ -105,5 +105,5 @@ async fn ended_quota_is_bounded_and_prefers_recent() {
         "配额已满时最老的应被挤出（下一轮/窗口滑动后再补）：{ids:?}"
     );
 
-    db.close().await;
+    db.cleanup().await;
 }

@@ -3,43 +3,27 @@
 //! Postgres 后端经共享日志 + NOTIFY 扇出，单机后端漏广播会让全局流从
 //! node_started 才开始，两条订阅面对同一事件历史给出不同答案。
 
-use std::sync::Arc;
+mod common;
+
 use std::time::Duration;
 
-use flow_engine::{Engine, NoopObserver};
+use common::{line_def, Harness};
 use serde_json::json;
 
-fn linear_definition() -> flow_engine::Definition {
-    serde_json::from_value(json!({
-        "nodes": [
-            {"id": "start", "type": "start"},
-            {"id": "n1", "type": "script", "params": {"code": "return 1;"}},
-            {"id": "end", "type": "end"}
-        ],
-        "edges": [
-            {"from": "start", "to": "n1"},
-            {"from": "n1", "to": "end"}
-        ]
-    }))
-    .unwrap()
-}
-
-/// 在 start_run 之前订阅全局流：收到的第一条必须是 seq=1 的 run_started。
 #[tokio::test]
 async fn global_subscription_sees_run_started() {
-    let dir = std::env::temp_dir().join(format!("flow-engine-sub-{}", uuid::Uuid::now_v7()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let engine = Engine::new(&dir, Arc::new(NoopObserver));
+    let h = Harness::new();
+    let engine = h.engine;
 
     // 订阅先于 run 创建：run_started 落盘与广播都必须可达已注册的接收端
     let mut events = engine.subscribe();
-    let run_id = format!("run-{}", uuid::Uuid::now_v7());
+    let run_id = Harness::run_id();
     engine
         .start_run(flow_engine::StartRun {
             run_id: run_id.clone(),
             workflow_id: "wf".into(),
             workflow_version: 1,
-            definition: linear_definition(),
+            definition: line_def("return 1;"),
             input: json!({ "seed": 1 }),
             depth: 0,
         })
@@ -76,6 +60,4 @@ async fn global_subscription_sees_run_started() {
     // 与事件日志逐条对齐：广播是日志的如实副本
     let logged = engine.read_events(&run_id, None).await.unwrap();
     assert_eq!(logged.len() as u64, last_seq);
-
-    std::fs::remove_dir_all(&dir).ok();
 }

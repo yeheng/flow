@@ -39,3 +39,4 @@ serde_json = { workspace = true }
 jsonrpsee = { version = "0.26", features = ["server"] }
 flow-rpc = { path = "../flow-rpc" }
 flow-backend = { path = "../flow-backend" }
+flow-test-support = { path = "../flow-test-support", default-features = false }

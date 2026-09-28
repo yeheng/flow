@@ -136,6 +136,49 @@ describe("validateDefinition", () => {
     expect(errs.some((e) => e.message.includes("true/false"))).toBe(true);
   });
 
+  it("多出端口校验完全由 ports 元数据驱动：未硬编码的新类型同样生效", () => {
+    // 服务端新加一个三出口 switch 节点，前端零改动即可正确校验
+    const switchType: NodeTypeDesc = {
+      type: "switch",
+      label: "分支",
+      category: "control",
+      ports: [
+        { id: "in", label: "入" },
+        { id: "case1", label: "情况1" },
+        { id: "case2", label: "情况2" },
+        { id: "default", label: "默认" },
+      ],
+      params_schema: { type: "object" },
+    };
+    const allTypes = [...types, switchType];
+    const nodes = [
+      node("start_1", "start"),
+      { ...node("switch_1", "switch"), data: { name: "switch_1", nodeType: switchType, params: {} } },
+      node("end_1", "end"),
+      node("end_2", "end"),
+    ];
+    const ok = validateDefinition(
+      nodes,
+      [
+        edge("start_1", "switch_1"),
+        edge("switch_1", "end_1", "case1"),
+        edge("switch_1", "end_2", "default"),
+      ],
+      allTypes,
+    );
+    expect(ok.filter((e) => e.message.includes("出边端口"))).toEqual([]);
+
+    const bad = validateDefinition(
+      nodes,
+      [
+        edge("start_1", "switch_1"),
+        edge("switch_1", "end_1", "true"), // switch 没有 true 端口
+      ],
+      allTypes,
+    );
+    expect(bad.some((e) => e.message.includes("case1/case2/default"))).toBe(true);
+  });
+
   it("非 start/end 节点无入边报错；start 有入边、end 有出边报错", () => {
     const orphan = validateDefinition(
       [node("start_1", "start"), node("script_1", "script", { code: "1" }), node("end_1", "end")],

@@ -82,15 +82,18 @@ impl Store {
             // 断电/内核崩溃可能丢最后几笔事务，但库永不损坏（WAL 保证）。
             // 事件日志才是 run 状态的唯一权威，元数据只是查询索引（DESIGN §3）。
             .synchronous(SqliteSynchronous::Normal)
-            // 写锁等待上限：run.start 的 insert_run 走 BEGIN IMMEDIATE，高并发
-            // 下写锁排队会超过 sqlx 默认的 5s，表现为 run.start 报
-            // `database is locked`（SQLITE_BUSY）。显式放大到 30s 的取值逻辑是
-            // 「排队而不是失败」——SQLite 是单写者，等待时间本身就是写入吞吐
-            // 的物理上限；压测实测见 backend-perf 的 submit_errors 计数器。
+            // 写锁等待上限：单连接池内进程内已无 SQLITE_BUSY（访问在 pool 上
+            // 串行）；这层防御的是进程外并发访问（如运维用 sqlite3 CLI 巡检
+            // 同一个库）。“排队而不是失败”——SQLite 是单写者，等待时间本身就是
+            // 写入吞吐的物理上限。
             .busy_timeout(std::time::Duration::from_secs(30))
             .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
-            .max_connections(8)
+            // 单连接（DESIGN §8）：进程内 DB 访问全部串行，SQLITE_BUSY 在进程内
+            // 结构性消失——排队发生在 pool 上而不是 SQLite 写锁上。
+            // WAL 本就是单写者模型，多连接从未带来过写并行，只带来锁竞争。
+            // busy_timeout 仍保留：防御进程外读者（知 sqlite3 CLI 巡检）。
+            .max_connections(1)
             .connect_with(options)
             .await?;
         let store = Store { pool };

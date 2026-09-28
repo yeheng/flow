@@ -2,277 +2,31 @@
 //! 拆分、SIGKILL 崩溃恢复、订阅轮询）。
 //!
 //! 需要 FLOW_TEST_DATABASE_URL（默认 127.0.0.1:54329 的本地测试库）；
-//! 不可达时跳过。
+//! 不可达时跳过。进程脚手架与测试库生命周期都在 `common`（历史上一份在这里、
+//! 一份在 ws_rpc，两套 test_db 各自漂移）。
+//!
+//! 测试库的 docker 容器由 flow-test-support::pg 管（backend-e2e 也用同一份）：
+//! 数据目录 tmpfs、删除带 -v、启动回收孤儿 volume。这里默认连的是一个已经
+//! 起着的外部 PG（开发用），所以只做「连库 + 建独立测试库」。
 
-use std::net::{SocketAddr, TcpListener};
-use std::process::{Child, Command, Stdio};
+mod common;
+
 use std::time::Duration;
 
 use futures::StreamExt;
-use jsonrpsee::core::client::{ClientT, SubscriptionClientT};
-use jsonrpsee::core::params::ObjectParams;
-use jsonrpsee::ws_client::{WsClient, WsClientBuilder};
+use jsonrpsee::core::client::SubscriptionClientT;
 use serde_json::{json, Value};
-use sqlx::PgPool;
-use uuid::Uuid;
 
-const DEFAULT_URL: &str = "postgres://flow:flow@127.0.0.1:54329/flow";
-
-fn base_url() -> String {
-    std::env::var("FLOW_TEST_DATABASE_URL").unwrap_or_else(|_| DEFAULT_URL.into())
-}
-
-struct TestDb {
-    url: String,
-    name: String,
-    pool: PgPool,
-}
-
-async fn test_db() -> Option<TestDb> {
-    let base = base_url();
-    if std::env::var("FLOW_TEST_DATABASE_URL").is_err() {
-        let host = base
-            .split("//")
-            .nth(1)
-            .and_then(|s| s.split('/').next())
-            .and_then(|s| {
-                s.split('@')
-                    .nth(1)
-                    .map(|s| s.to_string())
-                    .or(Some(s.to_string()))
-            })
-            .unwrap_or_default();
-        let host_only = host.split(':').next().unwrap_or("");
-        let port = host
-            .split(':')
-            .nth(1)
-            .and_then(|p| p.parse::<u16>().ok())
-            .unwrap_or(5432);
-        if tokio::net::TcpStream::connect((host_only, port))
-            .await
-            .is_err()
-        {
-            eprintln!("skip: {host} 不可达且未设置 FLOW_TEST_DATABASE_URL");
-            return None;
-        }
-    }
-    let server_url = format!("{}/postgres", &base[..base.rfind('/').unwrap() + 1]);
-    let admin = PgPool::connect(&server_url)
-        .await
-        .expect("连接 Postgres 失败");
-    let name = format!(
-        "flow_test_{}{}",
-        chrono::Utc::now().format("%Y%m%d%H%M%S"),
-        Uuid::now_v7().simple()
-    );
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
-        .execute(&admin)
-        .await
-        .expect("创建测试数据库失败");
-    admin.close().await;
-    let url = format!("{}/{}", &base[..base.rfind('/').unwrap() + 1], name);
-    let pool = PgPool::connect(&url).await.expect("连接测试数据库失败");
-    flow_pg::schema::init(&pool)
-        .await
-        .expect("初始化 schema 失败");
-    Some(TestDb { url, name, pool })
-}
-
-impl TestDb {
-    async fn close(self) {
-        self.pool.close().await;
-        let server_url = format!("{}/postgres", &self.url[..self.url.rfind('/').unwrap() + 1]);
-        if let Ok(admin) = PgPool::connect(&server_url).await {
-            let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{}'",
-                self.name
-            )))
-            .execute(&admin)
-            .await;
-            let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
-                "DROP DATABASE IF EXISTS {}",
-                self.name
-            )))
-            .execute(&admin)
-            .await;
-            admin.close().await;
-        }
-    }
-}
-
-struct ServerProc {
-    child: Child,
-    addr: SocketAddr,
-}
-
-impl ServerProc {
-    /// role: all | gateway | executor
-    fn spawn(db_url: &str, role: &str, signal_wait_ms: u64) -> ServerProc {
-        Self::spawn_with(db_url, role, signal_wait_ms, &[])
-    }
-
-    /// extra_env 覆盖默认环境变量（如拉长 FLOW_SUBSCRIBE_POLL_MS 证明 NOTIFY 唤醒）。
-    fn spawn_with(
-        db_url: &str,
-        role: &str,
-        signal_wait_ms: u64,
-        extra_env: &[(&str, &str)],
-    ) -> ServerProc {
-        let addr = free_port();
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_flow-server"));
-        cmd.env("FLOW_BACKEND", "postgres")
-            .env("FLOW_DATABASE_URL", db_url)
-            .env("FLOW_ROLE", role)
-            .env("FLOW_ADDR", addr.to_string())
-            // flow-server 现在还会绑 webhook HTTP 端口；多进程并发测试必须各占一个
-            .env("FLOW_HTTP_ADDR", free_port().to_string())
-            .env("FLOW_LEASE_TTL_MS", "1500")
-            .env("FLOW_SCAN_INTERVAL_MS", "50")
-            .env("FLOW_INBOX_POLL_MS", "50")
-            .env("FLOW_SUBSCRIBE_POLL_MS", "50")
-            .env("FLOW_SIGNAL_WAIT_MS", signal_wait_ms.to_string())
-            .env("RUST_LOG", "info,flow_pg=debug")
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit());
-        for (key, value) in extra_env {
-            cmd.env(key, value);
-        }
-        let child = cmd.spawn().expect("启动 flow-server (postgres) 失败");
-        let proc = ServerProc { child, addr };
-        wait_ready(addr);
-        proc
-    }
-
-    fn kill(&mut self) {
-        self.child.kill().expect("kill 失败");
-        self.child.wait().expect("wait 失败");
-    }
-
-    async fn client(&self) -> WsClient {
-        connect(self.addr).await
-    }
-}
-
-impl Drop for ServerProc {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn free_port() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr
-}
-
-fn wait_ready(addr: SocketAddr) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
-            return;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "flow-server 未在 30s 内就绪"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
-async fn connect(addr: SocketAddr) -> WsClient {
-    WsClientBuilder::default()
-        .connection_timeout(Duration::from_secs(10))
-        .request_timeout(Duration::from_secs(20))
-        .build(format!("ws://{addr}"))
-        .await
-        .expect("连接 WebSocket 失败")
-}
-
-fn named(value: Value) -> ObjectParams {
-    let mut params = ObjectParams::new();
-    match value {
-        Value::Object(map) => {
-            for (key, item) in map {
-                params.insert(&key, item).unwrap();
-            }
-        }
-        Value::Null => {}
-        other => panic!("具名参数必须是对象：{other}"),
-    }
-    params
-}
-
-async fn call<T: serde::de::DeserializeOwned>(client: &WsClient, method: &str, params: Value) -> T {
-    client
-        .request(method, named(params))
-        .await
-        .unwrap_or_else(|e| panic!("调用 {method} 失败：{e}"))
-}
-
-async fn call_err(client: &WsClient, method: &str, params: Value) -> String {
-    match client.request::<Value, _>(method, named(params)).await {
-        Ok(value) => panic!("{method} 本应失败，实际返回 {value}"),
-        Err(err) => err.to_string(),
-    }
-}
-
-fn line_def(code: &str) -> Value {
-    json!({
-        "nodes": [
-            {"id": "start", "type": "start", "name": "开始"},
-            {"id": "n1", "type": "script", "name": "脚本", "params": {"code": code}},
-            {"id": "end", "type": "end", "name": "结束"}
-        ],
-        "edges": [
-            {"from": "start", "to": "n1"},
-            {"from": "n1", "to": "end"}
-        ]
-    })
-}
-
-async fn publish(client: &WsClient, name: &str, def: Value) -> (String, i64) {
-    let created: Value = call(client, "workflow.create", json!({"name": name})).await;
-    let workflow_id = created["workflow_id"].as_str().unwrap().to_string();
-    let updated: Value = call(
-        client,
-        "workflow.update",
-        json!({"workflow_id": workflow_id, "definition": def}),
-    )
-    .await;
-    let version = updated["version"].as_i64().unwrap();
-    call::<Value>(
-        client,
-        "workflow.publish",
-        json!({"workflow_id": workflow_id, "version": version}),
-    )
-    .await;
-    (workflow_id, version)
-}
-
-async fn wait_status(client: &WsClient, run_id: &str, expected: &str, timeout: Duration) -> Value {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let run: Value = call(client, "run.get", json!({"run_id": run_id})).await;
-        if run["run"]["status"] == json!(expected) {
-            return run;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "等待 run {run_id} 到 {expected} 超时，当前 {}",
-            run["run"]["status"]
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
+use common::{
+    call, call_err, line_def, named, publish, test_db, wait_status, ServerProc,
+};
 
 /// 集群冒烟：定义生命周期 → run.start 原子创建 → executor 驱动到终态 →
 /// timeline / events / signal_status 可读。
 #[tokio::test]
 async fn postgres_cluster_smoke() {
     let Some(db) = test_db().await else { return };
-    let mut server = ServerProc::spawn(&db.url, "all", 5000);
+    let mut server = ServerProc::spawn_pg(&db.url, "all");
     let client = server.client().await;
 
     // draft 拒绝执行
@@ -331,14 +85,14 @@ async fn postgres_cluster_smoke() {
     assert!(nt["node_types"].as_array().unwrap().len() >= 6);
 
     server.kill();
-    db.close().await;
+    db.cleanup().await;
 }
 
 /// §6.1：human 信号经持久 inbox 交付；幂等与冲突语义在 RPC 层可见。
 #[tokio::test]
 async fn postgres_human_signal_delivery() {
     let Some(db) = test_db().await else { return };
-    let mut server = ServerProc::spawn(&db.url, "all", 5000);
+    let mut server = ServerProc::spawn_pg(&db.url, "all");
     let client = server.client().await;
 
     let (wf, _) = publish(
@@ -428,7 +182,7 @@ async fn postgres_human_signal_delivery() {
     assert_eq!(st["delivered"], json!(true));
 
     server.kill();
-    db.close().await;
+    db.cleanup().await;
 }
 
 /// gateway/executor 角色拆分：无 executor 时信号 pending（不是 delivered），
@@ -436,7 +190,7 @@ async fn postgres_human_signal_delivery() {
 #[tokio::test]
 async fn signal_pending_without_executor_then_delivered() {
     let Some(db) = test_db().await else { return };
-    let mut gateway = ServerProc::spawn(&db.url, "gateway", 600);
+    let mut gateway = ServerProc::spawn_pg(&db.url, "gateway");
     let client = gateway.client().await;
 
     let (wf, _) = publish(&client, "拆分", line_def("return input.v;")).await;
@@ -468,7 +222,7 @@ async fn signal_pending_without_executor_then_delivered() {
     assert_eq!(st["status"], json!("pending"));
 
     // executor 加入后接管并消费（该信号非法——end 不等待——最终 rejected）
-    let mut executor = ServerProc::spawn(&db.url, "executor", 5000);
+    let mut executor = ServerProc::spawn_pg(&db.url, "executor");
     let _ = &executor;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
@@ -487,16 +241,15 @@ async fn signal_pending_without_executor_then_delivered() {
     }
 
     gateway.kill();
-    executor.child.kill().expect("kill executor 失败");
-    executor.child.wait().expect("wait executor 失败");
-    db.close().await;
+    executor.kill();
+    db.cleanup().await;
 }
 
 /// §11.3：SIGKILL 后同库重启，未完成 run 从共享日志恢复（纯节点重放）。
 #[tokio::test]
 async fn sigkill_recovery_from_shared_log() {
     let Some(db) = test_db().await else { return };
-    let mut server = ServerProc::spawn(&db.url, "all", 5000);
+    let mut server = ServerProc::spawn_pg(&db.url, "all");
     let client = server.client().await;
 
     let def = json!({
@@ -534,7 +287,7 @@ async fn sigkill_recovery_from_shared_log() {
     server.kill();
 
     // 同库重启：run 必须被新进程接管并完成
-    let mut server2 = ServerProc::spawn(&db.url, "all", 5000);
+    let mut server2 = ServerProc::spawn_pg(&db.url, "all");
     let client2 = server2.client().await;
     let run = wait_status(&client2, &run_id, "succeeded", Duration::from_secs(20)).await;
     assert_eq!(run["run"]["output"], json!("done"));
@@ -551,14 +304,14 @@ async fn sigkill_recovery_from_shared_log() {
     );
 
     server2.kill();
-    db.close().await;
+    db.cleanup().await;
 }
 
 /// §8：订阅按 run_id 维护游标轮询增量；seq 严格递增，终态事件可达。
 #[tokio::test]
 async fn subscription_streams_events_in_order() {
     let Some(db) = test_db().await else { return };
-    let mut server = ServerProc::spawn(&db.url, "all", 5000);
+    let mut server = ServerProc::spawn_pg(&db.url, "all");
     let client = server.client().await;
 
     let (wf, _) = publish(&client, "订阅", line_def("return 'hi';")).await;
@@ -596,7 +349,7 @@ async fn subscription_streams_events_in_order() {
     }
 
     server.kill();
-    db.close().await;
+    db.cleanup().await;
 }
 
 /// §8：LISTEN/NOTIFY 是订阅的低延迟唤醒路径。服务端兜底轮询拉长到 30s：
@@ -606,7 +359,7 @@ async fn subscription_streams_events_in_order() {
 async fn subscription_woken_by_notify_not_poll() {
     let Some(db) = test_db().await else { return };
     let mut server =
-        ServerProc::spawn_with(&db.url, "all", 5000, &[("FLOW_SUBSCRIBE_POLL_MS", "30000")]);
+        ServerProc::spawn_pg_with(&db.url, "all", 5000, &[("FLOW_SUBSCRIBE_POLL_MS", "30000")]);
     let client = server.client().await;
 
     let (wf, _) = publish(&client, "通知唤醒", line_def("return 'hi';")).await;
@@ -637,7 +390,7 @@ async fn subscription_woken_by_notify_not_poll() {
     }
 
     server.kill();
-    db.close().await;
+    db.cleanup().await;
 }
 
 /// 指定 run_id 的订阅（流级契约）：先回放完整历史（seq 从 1 严格递增），
@@ -647,7 +400,7 @@ async fn subscription_woken_by_notify_not_poll() {
 #[tokio::test]
 async fn subscribe_specific_run_replays_and_ends() {
     let Some(db) = test_db().await else { return };
-    let mut server = ServerProc::spawn(&db.url, "all", 5000);
+    let mut server = ServerProc::spawn_pg(&db.url, "all");
     let client = server.client().await;
 
     let (wf, _) = publish(&client, "回放订阅", line_def("return 'hi';")).await;
@@ -679,7 +432,7 @@ async fn subscribe_specific_run_replays_and_ends() {
     assert_eq!(kinds.last().unwrap(), "run_completed", "{kinds:?}");
 
     server.kill();
-    db.close().await;
+    db.cleanup().await;
 }
 
 /// Postgres 模式的 sub_workflow：子 run 经 gateway 单事务创建（确定性 id 幂等），
@@ -687,7 +440,7 @@ async fn subscribe_specific_run_replays_and_ends() {
 #[tokio::test]
 async fn postgres_sub_workflow_end_to_end() {
     let Some(db) = test_db().await else { return };
-    let mut server = ServerProc::spawn(&db.url, "all", 5000);
+    let mut server = ServerProc::spawn_pg(&db.url, "all");
     let client = server.client().await;
 
     let (child_wf, _) = publish(&client, "子流程", line_def("return { got: input };")).await;
@@ -733,5 +486,5 @@ async fn postgres_sub_workflow_end_to_end() {
     assert_eq!(events["events"][0]["depth"], json!(1));
 
     server.kill();
-    db.close().await;
+    db.cleanup().await;
 }

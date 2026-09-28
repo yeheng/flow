@@ -21,7 +21,7 @@ async fn takeover_replays_pure_node_with_new_attempt() {
     let gw = engine(&db, flow_pg::Role::Gateway).await;
     let (wf, v) = publish_definition(&gw, "r1", def_line("return input.x + 1;")).await;
     let run_id = start_run(&gw, &wf, v, json!({"x": 41})).await;
-    let pool = db.pool.clone();
+    let pool = db.pool().clone();
 
     // 模拟崩溃窗口：NodeStarted 已提交，节点执行结果未知，执行进程消失
     let AcquireOutcome::Acquired { epoch } =
@@ -73,7 +73,7 @@ async fn takeover_replays_pure_node_with_new_attempt() {
 
     runner.abort();
     b.shutdown().await;
-    db.close().await;
+    db.cleanup().await;
 }
 
 /// §5.4/S2 回归：身份不符（元数据与日志分叉）的 run 必须隔离为 awaiting_resume
@@ -86,7 +86,7 @@ async fn identity_mismatch_run_is_isolated_and_not_rescanned() {
     let gw = engine(&db, flow_pg::Role::Gateway).await;
     let (wf, v) = publish_definition(&gw, "iso", def_line("return 1;")).await;
     let run_id = start_run(&gw, &wf, v, json!(null)).await;
-    let pool = db.pool.clone();
+    let pool = db.pool().clone();
 
     // 篡改 runs.input：日志与元数据身份分叉（模拟手工改行）
     sqlx::query("UPDATE runs SET input = '\"tampered\"'::jsonb WHERE id = $1")
@@ -133,7 +133,7 @@ async fn identity_mismatch_run_is_isolated_and_not_rescanned() {
 
     runner.abort();
     b.shutdown().await;
-    db.close().await;
+    db.cleanup().await;
 }
 
 /// §11.3：Failed{retryable:true} → 接管后重建退避计时器，继续重试直到成功。
@@ -176,7 +176,7 @@ async fn takeover_resumes_retry_backoff() {
     def["nodes"][1]["params"]["retry"] = json!({"max_attempts": 3, "backoff_ms": 300});
     let (wf, v) = publish_definition(&gw, "r2", def).await;
     let run_id = start_run(&gw, &wf, v, json!(null)).await;
-    let pool = db.pool.clone();
+    let pool = db.pool().clone();
 
     let a = engine(&db, flow_pg::Role::All).await;
     let runner_a = tokio::spawn({
@@ -229,7 +229,7 @@ async fn takeover_resumes_retry_backoff() {
 
     runner_b.abort();
     b.shutdown().await;
-    db.close().await;
+    db.cleanup().await;
 }
 
 /// §11.5：NodeStarted 后、发 HTTP 前执行进程消失 → 接管者必须等人工裁决
@@ -243,7 +243,7 @@ async fn takeover_http_side_effect_requires_adjudication_then_retries_once() {
     def["nodes"][1]["params"]["url"] = json!(format!("http://{addr}/pay"));
     let (wf, v) = publish_definition(&gw, "r3", def).await;
     let run_id = start_run(&gw, &wf, v, json!(null)).await;
-    let pool = db.pool.clone();
+    let pool = db.pool().clone();
 
     // NodeStarted 已落盘，HTTP 未发出（SIGSTOP/SIGKILL 窗口）
     let AcquireOutcome::Acquired { epoch } =
@@ -313,7 +313,7 @@ async fn takeover_http_side_effect_requires_adjudication_then_retries_once() {
 
     runner.abort();
     b.shutdown().await;
-    db.close().await;
+    db.cleanup().await;
 }
 
 /// §7：已记录的裁决在接管时被消费——succeeded 不再发请求。
@@ -326,7 +326,7 @@ async fn takeover_consumes_recorded_adjudication() {
     def["nodes"][1]["params"]["url"] = json!(format!("http://{addr}/pay"));
     let (wf, v) = publish_definition(&gw, "r4", def).await;
     let run_id = start_run(&gw, &wf, v, json!(null)).await;
-    let pool = db.pool.clone();
+    let pool = db.pool().clone();
 
     let AcquireOutcome::Acquired { epoch } =
         lease::acquire(&pool, &run_id, "inst-A", Duration::from_millis(300))
@@ -373,7 +373,7 @@ async fn takeover_consumes_recorded_adjudication() {
 
     runner.abort();
     b.shutdown().await;
-    db.close().await;
+    db.cleanup().await;
 }
 
 /// §11.3：human_task 等待中接管 → 继续等待，不重复写 node_started；信号照常交付。
@@ -383,7 +383,7 @@ async fn takeover_continues_human_wait_without_restarting() {
     let gw = engine(&db, flow_pg::Role::Gateway).await;
     let (wf, v) = publish_definition(&gw, "r5", def_human()).await;
     let run_id = start_run(&gw, &wf, v, json!(null)).await;
-    let pool = db.pool.clone();
+    let pool = db.pool().clone();
 
     let a = engine(&db, flow_pg::Role::All).await;
     let runner_a = tokio::spawn({
@@ -433,7 +433,7 @@ async fn takeover_continues_human_wait_without_restarting() {
 
     runner_b.abort();
     b.shutdown().await;
-    db.close().await;
+    db.cleanup().await;
 }
 
 /// §11.3：fatal 失败在接管后保留结论，独立分支跑到自然终态后 run 才判失败。
@@ -457,7 +457,7 @@ async fn takeover_preserves_fatal_and_independent_branch_finishes() {
     });
     let (wf, v) = publish_definition(&gw, "r6", def).await;
     let run_id = start_run(&gw, &wf, v, json!(null)).await;
-    let pool = db.pool.clone();
+    let pool = db.pool().clone();
 
     let a = engine(&db, flow_pg::Role::All).await;
     let runner_a = tokio::spawn({
@@ -516,7 +516,7 @@ async fn takeover_preserves_fatal_and_independent_branch_finishes() {
 
     runner_b.abort();
     b.shutdown().await;
-    db.close().await;
+    db.cleanup().await;
 }
 
 /// 子 run 重放必须沿用 runs 行钉死的版本与输入（与 SQLite 臂
@@ -530,7 +530,7 @@ async fn takeover_preserves_fatal_and_independent_branch_finishes() {
 #[tokio::test]
 async fn replayed_child_run_keeps_pinned_version() {
     let Some(db) = test_db().await else { return };
-    let pool = db.pool.clone();
+    let pool = db.pool().clone();
     let gw = engine(&db, flow_pg::Role::Gateway).await;
 
     let child_v1 = json!({
@@ -621,5 +621,5 @@ async fn replayed_child_run_keeps_pinned_version() {
     // common::test_db 的 janitor 在下一次测试启动时清理。
     hub.stop().await;
     gw.shutdown().await;
-    let _ = tokio::time::timeout(Duration::from_secs(5), db.close()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), db.cleanup()).await;
 }

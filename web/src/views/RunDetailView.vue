@@ -5,7 +5,7 @@ import * as api from "../api/flow";
 import { errText } from "../rpc/client";
 import { editor, ensureNodeTypes, refreshWorkflows } from "../state/editor";
 import { attachRun, detachRun, monitor } from "../state/monitor";
-import { sourceLabel } from "../state/run-list";
+import { runStatusLabel, sourceLabel } from "../state/labels";
 import { toast } from "../state/toast";
 import type { Definition, RunEvent, RunRecord } from "../types";
 import RunCanvas from "../components/RunCanvas.vue";
@@ -27,15 +27,6 @@ const workflowName = computed(() => {
   const wf = record.value?.workflow_id;
   return editor.workflows.find((w) => w.workflow_id === wf)?.name ?? wf ?? "";
 });
-
-const statusLabel: Record<string, string> = {
-  running: "运行中",
-  initializing: "初始化中",
-  awaiting_resume: "挂起待恢复",
-  succeeded: "成功",
-  failed: "失败",
-  cancelled: "已取消",
-};
 
 function fmtTime(iso: string | null): string {
   if (!iso) return "—";
@@ -125,7 +116,7 @@ onUnmounted(() => {
     <div v-if="record" class="run-header">
       <div class="run-header-row">
         <span class="badge" :class="`run-${record.status}`">
-          {{ statusLabel[record.status] ?? record.status }}
+          {{ runStatusLabel(record.status) }}
         </span>
         <span class="mono run-full-id" :title="record.id">{{ record.id }}</span>
         <button class="run-copy" title="复制 run id" @click="copyRunId">复制</button>

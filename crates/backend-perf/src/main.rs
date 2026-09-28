@@ -25,8 +25,32 @@ use serde_json::json;
 use crate::opts::{BackendSel, Opts, Scenario};
 use crate::report::{Report, Suite};
 
-#[tokio::main]
-async fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var_os("FLOW_PERF_SERVE").is_some() {
+        // 与 flow-server 同形态（sqlite 单线程 runtime / postgres 多线程）：
+        // 压测量的就是生产形态，不给 sqlite 模式多线程的开挂值
+        let runtime = if flow_rpc::prefer_current_thread_runtime() {
+            tokio::runtime::Builder::new_current_thread()
+        } else {
+            tokio::runtime::Builder::new_multi_thread()
+        }
+        .enable_all()
+        .build()?;
+        if let Err(err) = runtime.block_on(flow_rpc::run_from_env()) {
+            eprintln!("被测服务进程异常退出：{err}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    // 压测 harness 本体：负载生成需要并行，保持多线程 runtime
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(perf_main());
+    Ok(())
+}
+
+async fn perf_main() {
     if std::env::var_os("FLOW_PERF_SERVE").is_some() {
         if let Err(err) = flow_rpc::run_from_env().await {
             eprintln!("被测服务进程异常退出：{err}");

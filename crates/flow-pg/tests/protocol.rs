@@ -20,7 +20,7 @@ async fn takeover_waits_for_inflight_commit_then_reads_it() {
     let engine = engine(&db, flow_pg::Role::Gateway).await;
     let (wf, v) = publish_definition(&engine, "t1", def_line("return input.x + 1;")).await;
     let run_id = start_run(&engine, &wf, v, serde_json::json!({"x": 1})).await;
-    let pool = db.pool.clone();
+    let pool = db.pool().clone();
 
     // A 获取租约并追加一个 NodeStarted（短 TTL，随后让它过期）
     let AcquireOutcome::Acquired { epoch: a_epoch } =
@@ -86,7 +86,7 @@ async fn takeover_waits_for_inflight_commit_then_reads_it() {
     assert_eq!(events.len(), 3, "B 必须看到 A 提交的 seq=3 事件");
     assert_eq!(events[2].seq, 3);
 
-    db.close().await;
+    db.cleanup().await;
 }
 
 /// read_events 的增量语义：from_seq=Some(n) 只取 seq >= n（SQL 下推），
@@ -97,7 +97,7 @@ async fn read_events_incremental_returns_tail_slice_only() {
     let engine = engine(&db, flow_pg::Role::Gateway).await;
     let (wf, v) = publish_definition(&engine, "t1b", def_line("return input.x + 1;")).await;
     let run_id = start_run(&engine, &wf, v, serde_json::json!({"x": 1})).await;
-    let pool = db.pool.clone();
+    let pool = db.pool().clone();
 
     let AcquireOutcome::Acquired { epoch } =
         lease::acquire(&pool, &run_id, "inst-A", Duration::from_secs(30))
@@ -127,7 +127,7 @@ async fn read_events_incremental_returns_tail_slice_only() {
         .unwrap();
     assert!(empty.is_empty());
 
-    db.close().await;
+    db.cleanup().await;
 }
 
 /// §11.2：接管完成后，旧持有者的追加/续期/投影/释放全部 LeaseLost；
@@ -138,7 +138,7 @@ async fn after_takeover_old_owner_operations_fail() {
     let engine = engine(&db, flow_pg::Role::Gateway).await;
     let (wf, v) = publish_definition(&engine, "t2", def_line("return 1;")).await;
     let run_id = start_run(&engine, &wf, v, serde_json::json!(null)).await;
-    let pool = db.pool.clone();
+    let pool = db.pool().clone();
 
     let AcquireOutcome::Acquired { epoch: a_epoch } =
         lease::acquire(&pool, &run_id, "inst-A", Duration::from_millis(300))
@@ -226,7 +226,7 @@ async fn after_takeover_old_owner_operations_fail() {
         "last_seq 漂移必须报一致性错误：{err}"
     );
 
-    db.close().await;
+    db.cleanup().await;
 }
 
 /// §11.6：run 创建事务原子性 + Postgres 状态词汇表 + 孤立状态拒绝。
@@ -246,7 +246,7 @@ async fn run_start_is_atomic_and_status_vocabulary_is_enforced() {
         })
         .await
         .unwrap();
-    let pool = db.pool.clone();
+    let pool = db.pool().clone();
     let rec = sqlx::query(
         "SELECT status, last_seq, lease_owner, lease_expires_at FROM runs WHERE id = $1",
     )
@@ -284,7 +284,7 @@ async fn run_start_is_atomic_and_status_vocabulary_is_enforced() {
     let err = engine.store().delete_workflow(&wf).await.unwrap_err();
     assert!(err.to_string().contains("拒绝删除"), "{err}");
 
-    db.close().await;
+    db.cleanup().await;
 }
 
 /// §5.3：终态追加在同一事务里写事件、投影、清租约，并把剩余 pending 输入标 rejected。
@@ -294,7 +294,7 @@ async fn terminal_append_rejects_pending_inputs_and_releases_lease() {
     let engine = engine(&db, flow_pg::Role::Gateway).await;
     let (wf, v) = publish_definition(&engine, "t4", def_line("return 1;")).await;
     let run_id = start_run(&engine, &wf, v, serde_json::json!(null)).await;
-    let pool = db.pool.clone();
+    let pool = db.pool().clone();
 
     let AcquireOutcome::Acquired { epoch } =
         lease::acquire(&pool, &run_id, "inst-A", Duration::from_secs(30))
@@ -380,7 +380,7 @@ async fn terminal_append_rejects_pending_inputs_and_releases_lease() {
         .unwrap_err();
     assert!(err.is_lease_lost(), "终态后追加必须 LeaseLost：{err}");
 
-    db.close().await;
+    db.cleanup().await;
 }
 
 /// §6.1：信号入队的幂等与冲突语义。
@@ -390,7 +390,7 @@ async fn signal_enqueue_is_idempotent_and_rejects_mismatch() {
     let engine = engine(&db, flow_pg::Role::Gateway).await;
     let (wf, v) = publish_definition(&engine, "t5", def_human()).await;
     let run_id = start_run(&engine, &wf, v, serde_json::json!(null)).await;
-    let pool = db.pool.clone();
+    let pool = db.pool().clone();
 
     let payload = serde_json::json!({"answer": 42});
     let ack = flow_pg::gateway::enqueue(
@@ -460,7 +460,7 @@ async fn signal_enqueue_is_idempotent_and_rejects_mismatch() {
     .unwrap_err();
     assert!(matches!(err, flow_pg::PgError::RunNotFound(_)));
 
-    db.close().await;
+    db.cleanup().await;
 }
 
 /// B1 回归：回放起点的读取必须区分「run 不存在」（RunNotFound，订阅状态机
@@ -472,7 +472,7 @@ async fn read_events_reports_missing_run_at_replay_origin() {
     let engine = engine(&db, flow_pg::Role::Gateway).await;
     let (wf, v) = publish_definition(&engine, "missing-sub", def_line("return 1;")).await;
     let run_id = start_run(&engine, &wf, v, serde_json::json!(null)).await;
-    let pool = db.pool.clone();
+    let pool = db.pool().clone();
 
     // 存在的 run：增量读取（from > 1）为空 = 已追平，不是错误
     let events = PgRunSink::read_events(&pool, &run_id, Some(2))
@@ -495,5 +495,5 @@ async fn read_events_reports_missing_run_at_replay_origin() {
         .unwrap()
         .is_empty());
 
-    db.close().await;
+    db.cleanup().await;
 }

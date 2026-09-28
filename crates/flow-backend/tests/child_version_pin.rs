@@ -5,16 +5,16 @@
 use std::sync::Arc;
 
 use flow_engine::{ChildRunLauncher, DbRunStatus, Engine, NoopObserver};
+use flow_test_support::io::TempDir;
 use flow_store::Store;
 use serde_json::json;
 use uuid::Uuid;
 
 #[tokio::test]
 async fn replayed_child_run_keeps_pinned_version() {
-    let root = std::env::temp_dir().join(format!("flow-childpin-{}", Uuid::now_v7()));
-    std::fs::create_dir_all(&root).unwrap();
+    let root = TempDir::new("flow-childpin");
     let store = Arc::new(Store::open(root.join("flow.db")).await.unwrap());
-    let engine = Arc::new(Engine::new(&root, Arc::new(NoopObserver)));
+    let engine = Arc::new(Engine::new(root.path(), Arc::new(NoopObserver)));
 
     let wf = store.create_workflow("child-wf").await.unwrap();
     let def_v1 = json!({
@@ -70,5 +70,5 @@ async fn replayed_child_run_keeps_pinned_version() {
     let row = store.get_run(&child_id).await.unwrap();
     assert_eq!(row.workflow_version, v1);
 
-    let _ = std::fs::remove_dir_all(&root);
+    // TempDir 的 Drop 负责删目录
 }

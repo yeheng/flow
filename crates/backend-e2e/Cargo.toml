@@ -28,10 +28,10 @@ chrono = { workspace = true }
 jsonrpsee = { version = "0.26", features = ["client", "ws-client"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 sqlx = { version = "0.9", features = ["postgres", "runtime-tokio", "chrono", "json"] }
-libc = "0.2"
 flow-pg = { path = "../flow-pg" }
 flow-backend = { path = "../flow-backend" }
 flow-rpc = { path = "../flow-rpc" }
+flow-test-support = { path = "../flow-test-support" }
 axum = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -39,6 +39,9 @@ tracing-subscriber = { workspace = true }
 # 被测二进制：与 flow-rpc 的 flow-server 同源（同一份 serve/scheduler/webhook），
 # 这里包一层薄 main，让本 crate 的集成测试能用 env!("CARGO_BIN_EXE_flow-server")
 # 定位到「本 crate 自己构建的」服务进程，不依赖外部 target 目录布局。
+#
+# 测试基建（docker 容器 / 独占测试库 / TempDir / 端口等待）在 flow-test-support：
+# 与 flow-pg、flow-rpc 的测试同指一份，单点维护。publish = false，不进产品二进制。
 [[bin]]
 name = "flow-server"
 path = "src/bin/flow-server.rs"

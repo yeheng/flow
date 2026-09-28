@@ -18,6 +18,10 @@ use flow_backend::{
 };
 use futures::StreamExt;
 use jsonrpsee::core::RegisterMethodError;
+
+/// 进程入口逃逸口：backend-perf 的自举服务模式与 flow-server 二进制共用的
+/// runtime 形态提示（sqlite = current_thread）。见 flow_backend 同名函数。
+pub use flow_backend::prefer_current_thread_runtime;
 use jsonrpsee::server::{Server, ServerHandle, SubscriptionMessage};
 use jsonrpsee::types::error::{ErrorObject, ErrorObjectOwned};
 use jsonrpsee::types::Params;

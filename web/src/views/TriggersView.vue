@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import * as api from "../api/flow";
-import { WEBHOOK_BASE } from "../api/flow";
+import { webhookBase } from "../api/flow";
 import { errText } from "../rpc/client";
 import { editor, refreshWorkflows } from "../state/editor";
 import { confirmDialog } from "../state/modal";
@@ -14,6 +14,8 @@ const props = defineProps<{ workflowId: string }>();
 const schedules = ref<Schedule[]>([]);
 const webhooks = ref<Webhook[]>([]);
 let timer: ReturnType<typeof setInterval> | null = null;
+/** 轮询在途守卫：慢响应时请求不叠加 */
+let refreshing = false;
 
 // 新建调度表单
 const newCron = ref("");
@@ -25,6 +27,8 @@ const workflowName = computed(
 );
 
 async function refresh(): Promise<void> {
+  if (refreshing) return;
+  refreshing = true;
   try {
     [schedules.value, webhooks.value] = await Promise.all([
       api.listSchedules(props.workflowId),
@@ -32,6 +36,8 @@ async function refresh(): Promise<void> {
     ]);
   } catch (e) {
     toast.error(errText(e));
+  } finally {
+    refreshing = false;
   }
 }
 
@@ -95,7 +101,7 @@ async function onDeleteSchedule(s: Schedule): Promise<void> {
 }
 
 function hookUrl(w: Webhook): string {
-  return `${WEBHOOK_BASE}/hook/${w.token}`;
+  return `${webhookBase()}/hook/${w.token}`;
 }
 
 function curlExample(w: Webhook): string {

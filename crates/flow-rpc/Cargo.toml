@@ -29,3 +29,4 @@ sqlx = { workspace = true, features = ["postgres", "json"] }
 flow-engine = { path = "../flow-engine" }
 flow-store = { path = "../flow-store" }
 flow-pg = { path = "../flow-pg" }
+flow-test-support = { path = "../flow-test-support" }

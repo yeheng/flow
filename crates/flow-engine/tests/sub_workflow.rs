@@ -1,10 +1,21 @@
-use std::path::PathBuf;
+//! 子工作流（sub_workflow）的集成回归（DESIGN.md §6.6）。
+//!
+//! 覆盖：平台故障挂起而非判死、子输出透传、子失败 fatal、RunExists 附着、
+//! 深度上限、取消级联、崩溃重放沿用同一 child_run_id、缺 workflow_id / 无
+//! launcher 的快速失败。
+//!
+//! Harness / 定义构造器在 `common`（历史上一份在这里、一份在
+//! engine_recovery.rs / recovery_regressions.rs）。
+
+mod common;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use common::{terminal, Harness};
 use flow_engine::{
     ChildRunLauncher, ChildRunOutcome, DbRunStatus, Definition, Engine, EngineError, Event,
-    EventLog, NodeState, NoopObserver, RunObserver, RunPhase, RunState, StartRun, StatusUpdate,
+    EventLog, NodeState, NoopObserver, RunObserver, RunPhase, StartRun, StatusUpdate,
     MAX_SUB_WORKFLOW_DEPTH,
 };
 use futures::future::BoxFuture;
@@ -91,45 +102,12 @@ impl ChildRunLauncher for MockLauncher {
     }
 }
 
-struct Harness {
-    root: PathBuf,
-    engine: Arc<Engine>,
-    launcher: Arc<MockLauncher>,
-}
-
-impl Harness {
-    fn new(launcher: MockLauncher) -> Harness {
-        let root = std::env::temp_dir().join(format!("flow-subwf-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&root).unwrap();
-        let launcher = Arc::new(launcher);
-        let engine = Arc::new(Engine::new(&root, Arc::new(NoopObserver)));
-        engine.set_child_launcher(launcher.clone());
-        Harness {
-            root,
-            engine,
-            launcher,
-        }
-    }
-
-    async fn terminal(&self, run_id: &str) -> RunState {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let state = self.engine.snapshot(run_id).await.unwrap();
-                if state.phase.is_terminal() && !self.engine.is_live(run_id) {
-                    return state;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("run 未在 5s 内结束")
-    }
-}
-
-impl Drop for Harness {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
+/// 带 mock 启动器的 Harness：`set_child_launcher` 必须在任何 run 之前装好。
+fn harness(launcher: MockLauncher) -> (Harness, Arc<MockLauncher>) {
+    let h = Harness::new();
+    let launcher = Arc::new(launcher);
+    h.engine.set_child_launcher(launcher.clone());
+    (h, launcher)
 }
 
 /// 平台故障分类（DESIGN §7）：等子 run 期间的基础设施故障必须挂起 run
@@ -241,10 +219,10 @@ fn spec(run_id: &str, depth: u32) -> StartRun {
 
 #[tokio::test]
 async fn child_success_output_passes_through() {
-    let h = Harness::new(MockLauncher::new(Outcome::Succeed(json!({"total": 42}))));
+    let (h, launcher) = harness(MockLauncher::new(Outcome::Succeed(json!({"total": 42}))));
     h.engine.start_run(spec("r", 0)).await.unwrap();
 
-    let state = h.terminal("r").await;
+    let state = terminal(&h.engine, "r").await;
     assert_eq!(state.phase, RunPhase::Succeeded, "{:?}", state.fatal_error);
     // 子 run 输出透传为节点输出，再经 end 透传为 run 输出
     assert_eq!(state.record("sub").output, Some(json!({"total": 42})));
@@ -256,7 +234,7 @@ async fn child_success_output_passes_through() {
         state.record("sub").child_run_id.as_deref(),
         Some(child_run_id)
     );
-    let starts = h.launcher.starts.lock().unwrap().clone();
+    let starts = launcher.starts.lock().unwrap().clone();
     assert_eq!(
         starts.as_slice(),
         &[(
@@ -280,10 +258,10 @@ async fn child_success_output_passes_through() {
 
 #[tokio::test]
 async fn child_failure_is_fatal_to_parent() {
-    let h = Harness::new(MockLauncher::new(Outcome::Fail("boom".into())));
+    let (h, _launcher) = harness(MockLauncher::new(Outcome::Fail("boom".into())));
     h.engine.start_run(spec("r", 0)).await.unwrap();
 
-    let state = h.terminal("r").await;
+    let state = terminal(&h.engine, "r").await;
     assert_eq!(state.phase, RunPhase::Failed);
     let error = state.fatal_error.clone().unwrap();
     assert!(error.contains("r:sub:1"), "{error}");
@@ -301,38 +279,38 @@ async fn child_failure_is_fatal_to_parent() {
 #[tokio::test]
 async fn start_run_exists_attaches_to_existing_child() {
     // 确定性 id 的幂等语义：start 撞 RunExists 时不报错，附着等待已有子 run
-    let h = Harness::new(MockLauncher::run_exists(Outcome::Succeed(json!("ok"))));
+    let (h, _launcher) = harness(MockLauncher::run_exists(Outcome::Succeed(json!("ok"))));
     h.engine.start_run(spec("r", 0)).await.unwrap();
 
-    let state = h.terminal("r").await;
+    let state = terminal(&h.engine, "r").await;
     assert_eq!(state.phase, RunPhase::Succeeded, "{:?}", state.fatal_error);
     assert_eq!(state.output, Some(json!("ok")));
 }
 
 #[tokio::test]
 async fn depth_limit_fails_fast_without_starting_child() {
-    let h = Harness::new(MockLauncher::new(Outcome::Succeed(json!(1))));
+    let (h, launcher) = harness(MockLauncher::new(Outcome::Succeed(json!(1))));
     h.engine
         .start_run(spec("r", MAX_SUB_WORKFLOW_DEPTH))
         .await
         .unwrap();
 
-    let state = h.terminal("r").await;
+    let state = terminal(&h.engine, "r").await;
     assert_eq!(state.phase, RunPhase::Failed);
     let error = state.fatal_error.clone().unwrap();
     assert!(error.contains("嵌套"), "{error}");
-    assert!(h.launcher.starts.lock().unwrap().is_empty());
+    assert!(launcher.starts.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn cancel_cascades_to_child_run() {
-    let h = Harness::new(MockLauncher::new(Outcome::Pending));
+    let (h, launcher) = harness(MockLauncher::new(Outcome::Pending));
     h.engine.start_run(spec("r", 0)).await.unwrap();
 
     // 等子 run 已启动（node_started 落盘 + launcher.start 已调用）
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if !h.launcher.starts.lock().unwrap().is_empty() {
+            if !launcher.starts.lock().unwrap().is_empty() {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -342,17 +320,17 @@ async fn cancel_cascades_to_child_run() {
     .unwrap();
 
     assert!(h.engine.cancel("r").await);
-    let state = h.terminal("r").await;
+    let state = terminal(&h.engine, "r").await;
     assert_eq!(state.phase, RunPhase::Cancelled);
-    assert_eq!(h.launcher.cancels.lock().unwrap().as_slice(), &["r:sub:1"]);
+    assert_eq!(launcher.cancels.lock().unwrap().as_slice(), &["r:sub:1"]);
 }
 
 #[tokio::test]
 async fn crashed_sub_workflow_replays_and_reattaches_with_same_child_run_id() {
-    let h = Harness::new(MockLauncher::run_exists(Outcome::Succeed(json!("resumed"))));
+    let (h, launcher) = harness(MockLauncher::run_exists(Outcome::Succeed(json!("resumed"))));
 
     // 崩溃现场：s 已完成，sub 已 node_started（child_run_id 已落盘）但没有终态
-    let mut log = EventLog::create(&h.root, "r").await.unwrap();
+    let mut log = EventLog::create(h.dir.path(), "r").await.unwrap();
     for event in [
         Event::RunStarted {
             workflow_id: "parent-wf".into(),
@@ -382,11 +360,11 @@ async fn crashed_sub_workflow_replays_and_reattaches_with_same_child_run_id() {
     drop(log);
 
     h.engine.resume_run(spec("r", 0)).await.unwrap();
-    let state = h.terminal("r").await;
+    let state = terminal(&h.engine, "r").await;
     assert_eq!(state.phase, RunPhase::Succeeded, "{:?}", state.fatal_error);
     assert_eq!(state.output, Some(json!("resumed")));
     // 重放沿用崩溃前落盘的 child_run_id（attempt 1 的 id），附着等待而不是另起子 run
-    let starts = h.launcher.starts.lock().unwrap();
+    let starts = launcher.starts.lock().unwrap();
     assert_eq!(starts.len(), 1);
     assert_eq!(starts[0].0, "r:sub:1");
 }

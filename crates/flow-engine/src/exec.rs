@@ -482,6 +482,9 @@ mod tests {
     }
 }
 
+/// `singular_or_map`：单来源透传其值、多来源组成映射、缺失补 null。
+/// 与 `mod tests` 里的 json truthiness 用例合一处——一个文件里两个同名
+/// `mod tests` 是非法的，合并不必为此再起个怪名字。
 #[cfg(test)]
 mod singular_or_map_tests {
     use super::*;
@@ -495,7 +498,7 @@ mod singular_or_map_tests {
             "单来源必须透传其值"
         );
         assert_eq!(
-            singular_or_map(vec![("e1".into(), json!(7)), ("e2".into(), Value::Null),]),
+            singular_or_map(vec![("e1".into(), json!(7)), ("e2".into(), Value::Null)],),
             json!({"e1": 7, "e2": null}),
             "多来源必须组成映射，缺失补 null"
         );

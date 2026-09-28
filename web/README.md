@@ -38,6 +38,13 @@ VITE_FLOW_RPC=ws://127.0.0.1:9800 npm run dev      # JSON-RPC WebSocket
 VITE_FLOW_HTTP=http://127.0.0.1:9801 npm run dev   # webhook HTTP 入口（触发器页展示 hook URL 用）
 ```
 
+部署时也可不改构建：在 web 根目录放 `config.json`（见 `public/config.example.json`），
+启动时拉取一次，优先级高于 `VITE_FLOW_*`：
+
+```json
+{ "rpcUrl": "wss://flow-server.example.com", "httpUrl": "https://flow-hooks.example.com" }
+```
+
 ## 工程化
 
 ```bash

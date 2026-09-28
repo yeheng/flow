@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { mergeRunPage, nextCursor, sourceLabel } from "./run-list";
+import { mergeRunPage, nextCursor } from "./run-list";
+import { sourceLabel } from "./labels";
 import type { RunRecord } from "../types";
 
 function run(id: string): RunRecord {

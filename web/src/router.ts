@@ -1,34 +1,32 @@
 import { createRouter, createWebHistory } from "vue-router";
-import DashboardView from "./views/DashboardView.vue";
-import WorkflowListView from "./views/WorkflowListView.vue";
-import EditorView from "./views/EditorView.vue";
-import RunListView from "./views/RunListView.vue";
-import RunDetailView from "./views/RunDetailView.vue";
-import VersionsView from "./views/VersionsView.vue";
-import TriggersView from "./views/TriggersView.vue";
 
+// 路由级代码分割：各视图按需加载，首屏不背编辑器/画布的成本
 export const router = createRouter({
   history: createWebHistory(),
   routes: [
-    { path: "/", component: DashboardView },
-    { path: "/workflows", component: WorkflowListView },
-    { path: "/workflows/:id", component: EditorView },
+    { path: "/", component: () => import("./views/DashboardView.vue") },
+    { path: "/workflows", component: () => import("./views/WorkflowListView.vue") },
+    { path: "/workflows/:id", component: () => import("./views/EditorView.vue") },
     {
       path: "/workflows/:id/versions",
-      component: VersionsView,
+      component: () => import("./views/VersionsView.vue"),
       props: (r) => ({ workflowId: r.params.id as string }),
     },
     {
       path: "/workflows/:id/triggers",
-      component: TriggersView,
+      component: () => import("./views/TriggersView.vue"),
       props: (r) => ({ workflowId: r.params.id as string }),
     },
     {
       path: "/workflows/:id/runs",
-      component: RunListView,
+      component: () => import("./views/RunListView.vue"),
       props: (r) => ({ workflowId: r.params.id as string }),
     },
-    { path: "/runs", component: RunListView },
-    { path: "/runs/:runId", component: RunDetailView, props: true },
+    { path: "/runs", component: () => import("./views/RunListView.vue") },
+    {
+      path: "/runs/:runId",
+      component: () => import("./views/RunDetailView.vue"),
+      props: true,
+    },
   ],
 });
