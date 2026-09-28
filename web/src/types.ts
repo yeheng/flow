@@ -32,7 +32,7 @@ export interface PortDesc {
 
 /**
  * nodetypes.list 返回的 params_schema：JSON Schema 子集（draft-07 object），
- * 属性可带 x-widget / x-label / x-help 扩展键
+ * 属性可带 x-widget / x-secret / x-label / x-help 扩展键
  */
 export interface PropertySchema {
   type?: "string" | "integer" | "number" | "boolean" | "object";
@@ -41,6 +41,8 @@ export interface PropertySchema {
   required?: string[];
   properties?: Record<string, PropertySchema>;
   "x-widget"?: "code" | "json" | "workflow-picker";
+  /** true 表示该字符串字段存的是密钥名称（值在服务端 FLOW_SECRET_*），前端渲染为密钥名称选择器 */
+  "x-secret"?: boolean;
   "x-label"?: string;
   "x-help"?: string;
 }
@@ -154,6 +156,8 @@ export interface TimelineNode {
   started_at: string | null;
   ended_at: string | null;
   duration_ms: number | null;
+  /** 节点输入面快照：模板展开后的 params（写入时已脱敏）；旧 run 为空 */
+  input?: unknown;
   output: unknown;
   error: string | null;
   reason?: string;
@@ -162,6 +166,21 @@ export interface TimelineNode {
 }
 
 export type RunPhase = "running" | "succeeded" | "failed" | "cancelled";
+
+/** 节点日志级别/来源（与 crates/flow-engine/src/event.rs 的词汇表对齐） */
+export type LogLevel = "debug" | "info" | "warn" | "error";
+export type LogStream = "engine" | "stdout" | "stderr";
+
+/** 前端日志行：node_log 事件的前端形态（日志控制台/节点检查器共用） */
+export interface LogLine {
+  seq: number;
+  ts: string;
+  node_id: string;
+  attempt: number;
+  level: LogLevel;
+  stream: LogStream;
+  message: string;
+}
 
 export interface Timeline {
   run_id: string;
@@ -191,6 +210,7 @@ export interface RunEvent {
     | "node_completed"
     | "node_failed"
     | "node_skipped"
+    | "node_log"
     | "signal_received"
     | "run_completed"
     | "run_failed"
@@ -198,10 +218,14 @@ export interface RunEvent {
   node_id?: string;
   attempt?: number;
   child_run_id?: string;
+  input?: unknown;
   output?: unknown;
   duration_ms?: number;
   error?: string;
   retryable?: boolean;
   reason?: string;
+  level?: LogLevel;
+  stream?: LogStream;
+  message?: string;
   payload?: unknown;
 }

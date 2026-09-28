@@ -12,7 +12,10 @@ mod common;
 use std::time::Duration;
 
 use common::{def_from, describe, linear_def, Harness};
-use flow_engine::{Event, EventLog, ResumeOutcome, RunPhase, RunState, Signal, StartRun};
+use flow_engine::{
+    Envelope, Event, EventLog, LogLevel, LogStream, NodeState, ResumeOutcome, RunPhase, RunState,
+    Signal, StartRun,
+};
 use serde_json::{json, Value};
 
 #[tokio::test]
@@ -93,9 +96,14 @@ async fn linear_run_executes_and_records_ordered_events() {
     let events = h.engine.read_events(&run_id, None).await.unwrap();
     let seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
     assert_eq!(seqs, (1..=seqs.len() as u64).collect::<Vec<_>>());
-    let kinds: Vec<&str> = events.iter().map(|e| e.event.kind()).collect();
+    // 节点日志（node_log）是可观察性事件，与状态事件同流；状态事件骨架不变
+    let state_kinds: Vec<&str> = events
+        .iter()
+        .map(|e| e.event.kind())
+        .filter(|k| *k != "node_log")
+        .collect();
     assert_eq!(
-        kinds,
+        state_kinds,
         vec![
             "run_started",
             "node_started",
@@ -675,4 +683,77 @@ async fn fatal_failure_lets_independent_branch_finish() {
         "fatal 必须记录首个失败节点：{:?}",
         state.fatal_error
     );
+}
+
+/// 可观察性（设计 §3/§4）：脚本 console 输出以 node_log 进事件流；
+/// node_started 携带模板展开后的输入面快照（脱敏后）。
+#[tokio::test]
+async fn node_logs_and_input_snapshot_land_in_event_stream() {
+    let h = Harness::new();
+    let run_id = Harness::run_id();
+    let def = serde_json::from_value(json!({
+        "nodes": [
+            {"id": "st", "type": "start", "params": {}},
+            {"id": "s", "type": "script", "params": {
+                "code": "console.log('hello', {from: 'js'});\nconsole.warn('careful');\nreturn input.amount * 2;",
+                "note": "${input.amount}"
+            }},
+            {"id": "e", "type": "end", "params": {}}
+        ],
+        "edges": [{"from": "st", "to": "s"}, {"from": "s", "to": "e"}]
+    }))
+    .unwrap();
+
+    h.engine
+        .start_run(StartRun {
+            run_id: run_id.clone(),
+            workflow_id: "w1".into(),
+            workflow_version: 1,
+            definition: def,
+            input: json!({"amount": 21, "token": "sk-secret"}),
+            depth: 0,
+        })
+        .await
+        .unwrap();
+    let state = h.wait_terminal(&run_id).await;
+    assert_eq!(state.phase, RunPhase::Succeeded, "{}", describe(&state));
+
+    let events = h.engine.read_events(&run_id, None).await.unwrap();
+
+    // console.log → node_log（stdout / info），console.warn → warn
+    let logs: Vec<&Envelope> = events
+        .iter()
+        .filter(|e| matches!(e.event, Event::NodeLog { .. }))
+        .collect();
+    assert!(
+        logs.iter().any(|e| matches!(
+            &e.event,
+            Event::NodeLog { stream: LogStream::Stdout, level: LogLevel::Info, message, .. }
+                if message.contains("hello") && message.contains("{\"from\":\"js\"}")
+        )),
+        "console.log 必须进事件流：{logs:?}"
+    );
+    assert!(logs.iter().any(|e| matches!(
+        &e.event,
+        Event::NodeLog { stream: LogStream::Stderr, level: LogLevel::Warn, message, .. }
+            if message.contains("careful")
+    )));
+
+    // 输入面快照：模板展开 + 敏感键脱敏
+    let started = events
+        .iter()
+        .find_map(|e| match &e.event {
+            Event::NodeStarted { node_id, input, .. } if node_id == "s" => input.clone(),
+            _ => None,
+        })
+        .expect("node_started 必带输入面");
+    assert_eq!(started["note"], json!(21), "模板展开后的值");
+    assert_eq!(started["code"], json!("console.log('hello', {from: 'js'});\nconsole.warn('careful');\nreturn input.amount * 2;"), "代码字段字节级不动");
+    assert!(!started["code"].as_str().unwrap().contains("${input.amount}"), "展开后不得残留模板");
+    // 输入面不包含 run input 本身（token 不在节点输入面，脱敏针对 params 键）
+    let snapshot_input = state.record("s").input.clone().expect("fold 记录输入面");
+    assert_eq!(snapshot_input["note"], json!(21));
+
+    // 日志不改变投影：s 的状态由 started/completed 决定
+    assert!(matches!(state.record("s").state, NodeState::Completed { .. }));
 }

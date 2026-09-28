@@ -8,6 +8,7 @@ import {
   dirty,
   editor,
   ensureNodeTypes,
+  ensureSecrets,
   latestVersion,
   pasteClipboard,
   publish,
@@ -30,6 +31,8 @@ const router = useRouter();
 
 async function load(id: string): Promise<void> {
   if (!(await ensureNodeTypes())) return;
+  // 密钥名称清单不阻断加载：拉不到时 x-secret 字段仍可手输，重连后自动重试
+  void ensureSecrets();
   await refreshWorkflows();
   // refreshWorkflows 失败（连接断开）时名单为空：跳过存在性校验，交给 selectWorkflow 报错
   if (editor.workflows.length > 0 && !editor.workflows.some((w) => w.workflow_id === id)) {

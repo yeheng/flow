@@ -9,6 +9,8 @@ const categoryLabels: Record<string, string> = {
   integration: "集成",
   human: "人工",
   composition: "组合",
+  ai: "AI",
+  notify: "通知",
 };
 
 /** 按 category 分组，保持 nodetypes.list 的出现顺序 */

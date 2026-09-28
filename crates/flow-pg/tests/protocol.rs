@@ -36,6 +36,7 @@ async fn takeover_waits_for_inflight_commit_then_reads_it() {
             node_id: "n1".into(),
             attempt: 2,
             child_run_id: None,
+            input: None,
         })
         .await
         .unwrap();
@@ -111,6 +112,7 @@ async fn read_events_incremental_returns_tail_slice_only() {
         node_id: "n1".into(),
         attempt: 1,
         child_run_id: None,
+        input: None,
     })
     .await
     .unwrap();
@@ -165,6 +167,7 @@ async fn after_takeover_old_owner_operations_fail() {
             node_id: "n1".into(),
             attempt: 1,
             child_run_id: None,
+            input: None,
         })
         .await
         .unwrap_err();
@@ -203,6 +206,7 @@ async fn after_takeover_old_owner_operations_fail() {
             node_id: "n1".into(),
             attempt: 1,
             child_run_id: None,
+            input: None,
         })
         .await
         .unwrap();
@@ -218,6 +222,7 @@ async fn after_takeover_old_owner_operations_fail() {
             node_id: "n1".into(),
             attempt: 2,
             child_run_id: None,
+            input: None,
         })
         .await
         .unwrap_err();
@@ -308,6 +313,7 @@ async fn terminal_append_rejects_pending_inputs_and_releases_lease() {
         node_id: "n1".into(),
         attempt: 1,
         child_run_id: None,
+        input: None,
     })
     .await
     .unwrap();
@@ -375,6 +381,7 @@ async fn terminal_append_rejects_pending_inputs_and_releases_lease() {
             node_id: "n1".into(),
             attempt: 2,
             child_run_id: None,
+            input: None,
         })
         .await
         .unwrap_err();

@@ -20,10 +20,11 @@ use crate::backend::{CommitOutcome, PendingInput, PendingInputKind, RunEventSink
 use crate::child_run::ChildRunLauncher;
 use crate::engine::{DbRunStatus, Signal};
 use crate::error::EngineError;
-use crate::event::{Envelope, Event};
+use crate::event::{Envelope, Event, LogStream, LogLevel};
 use crate::exec::{self, ChildRunSpec, NodeExecContext, NodeFailure};
 use crate::fold::{NodeState, RunState};
 use crate::model::{Definition, NodeType};
+use crate::nodelog::{redact_value, LogBudget, LogLine, NodeLogger};
 
 /// 单次驱动所需的全部输入。
 pub struct DriverSpec {
@@ -58,6 +59,9 @@ pub struct SignalRequest {
 /// 启动 Driver 任务。返回的 JoinHandle 结束即 Driver 完全退出（inflight 已 abort），
 /// 调用方据此释放本地 registry 与容量许可。
 pub fn spawn_driver(spec: DriverSpec, state: RunState, plan: RecoveryPlan) -> JoinHandle<()> {
+    // 日志通道与预算在 driver 内创建：单机 / Postgres 两个后端自动同享，
+    // 无需 DriverSpec 感知。预算与广播容量共用 FLOW_RUN_LOG_BUDGET。
+    let (log_tx, log_rx) = tokio::sync::mpsc::unbounded_channel();
     let driver = Driver {
         run_id: spec.run_id,
         definition: spec.definition,
@@ -75,6 +79,9 @@ pub fn spawn_driver(spec: DriverSpec, state: RunState, plan: RecoveryPlan) -> Jo
         human_waiting: HashMap::new(),
         adjudicating: HashSet::new(),
         lease_lost: false,
+        log_tx,
+        log_rx: Some(log_rx),
+        budget: LogBudget::new(crate::nodelog::budget_from_env()),
     };
     tokio::spawn(driver.run(plan))
 }
@@ -194,6 +201,12 @@ struct Driver {
     adjudicating: HashSet<String>,
     /// 任一受保护操作返回 LeaseLost 后置位；run() 据此静默退出。
     lease_lost: bool,
+    /// 节点日志通道：exec 任务发射端（克隆进 NodeLogger），select 循环排空落盘
+    log_tx: tokio::sync::mpsc::UnboundedSender<LogLine>,
+    /// 接收端由 drive() 取出（避免 select! 分支体与 future 同时借用 self）
+    log_rx: Option<tokio::sync::mpsc::UnboundedReceiver<LogLine>>,
+    /// per-run 日志预算（发射端一处判定）
+    budget: Arc<LogBudget>,
 }
 
 impl Driver {
@@ -247,6 +260,7 @@ impl Driver {
         inbox_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // 取出接收端，避免 select! 的 future 与分支体同时借用 self
         let mut signal_rx = self.signal_rx.take();
+        let mut log_rx = self.log_rx.take();
 
         self.project_status(DbRunStatus::Running, None).await?;
         self.apply_recovery_plan(plan, &result_tx).await?;
@@ -310,6 +324,14 @@ impl Driver {
                     self.append_terminal(Event::RunCancelled {}).await?;
                     return Ok(());
                 }
+                // 日志排在结果之前（biased）：发射端先发日志后发 Done（程序序），
+                // 两通道都就绪时先排空日志，落盘顺序与执行顺序一致。
+                Some(line) = async {
+                    match log_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => self.drain_logs(line).await?,
                 Some(msg) = result_rx.recv() => self.handle_result(msg, &result_tx).await?,
                 Some(request) = async {
                     match signal_rx.as_mut() {
@@ -396,6 +418,75 @@ impl Driver {
         }
     }
 
+    /// 节点日志落盘（进程级持久）：fold 不消费 NodeLog，但 seq 必须推进、
+    /// 订阅者必须收到，与 append 同一套包装。
+    async fn write_log_line(&mut self, line: LogLine) -> Result<(), EngineError> {
+        let event = Event::NodeLog {
+            node_id: line.node_id,
+            attempt: line.attempt,
+            level: line.level,
+            stream: line.stream,
+            message: line.message,
+        };
+        match self.sink.append_log(event).await {
+            Ok(envelope) => {
+                self.state.fold(&envelope);
+                self.broadcast(envelope);
+                Ok(())
+            }
+            Err(err) => Err(self.guard_lease(err)),
+        }
+    }
+
+    /// 排空日志通道：首条已到，再非阻塞收集一批，逐条落盘后补预算摘要。
+    /// 单批上限避免极端刷屏饿死其他 select 分支。
+    async fn drain_logs(&mut self, first: LogLine) -> Result<(), EngineError> {
+        let mut lines = vec![first];
+        if let Some(rx) = self.log_rx.as_mut() {
+            while lines.len() < 256 {
+                match rx.try_recv() {
+                    Ok(line) => lines.push(line),
+                    Err(_) => break,
+                }
+            }
+        }
+        for line in lines {
+            self.write_log_line(line).await?;
+        }
+        self.flush_log_summary().await
+    }
+
+    /// 预算摘要：有丢弃就补一条 engine 级日志留痕（node_id 为空 = run 级）。
+    async fn flush_log_summary(&mut self) -> Result<(), EngineError> {
+        let dropped = self.budget.take_dropped();
+        if dropped == 0 {
+            return Ok(());
+        }
+        self.write_log_line(LogLine {
+            node_id: String::new(),
+            attempt: 0,
+            level: LogLevel::Warn,
+            stream: LogStream::Engine,
+            message: format!("已丢弃 {dropped} 条 debug/info 日志（达到每 run 日志预算）"),
+        })
+        .await
+    }
+
+    /// 终态前排空残余日志：所有节点已终态时 exec 任务的发送端已全部关闭，
+    /// 通道必然可排尽。终态 append 的内建兜底 sync 会把这些行一并刷盘。
+    async fn drain_remaining_logs(&mut self) -> Result<(), EngineError> {
+        let mut lines = Vec::new();
+        if let Some(rx) = self.log_rx.as_mut() {
+            while let Ok(line) = rx.try_recv() {
+                lines.push(line);
+            }
+        }
+        for line in lines {
+            self.write_log_line(line).await?;
+        }
+        self.flush_log_summary().await
+    }
+
     async fn project_status(
         &mut self,
         status: DbRunStatus,
@@ -478,12 +569,21 @@ impl Driver {
         }
 
         for (node_id, attempt) in plan.human_wait {
-            self.register_human_wait(&node_id, attempt, result_tx);
+            self.register_human_wait(&node_id, attempt, result_tx).await;
         }
 
         if !plan.adjudicate.is_empty() {
             for node_id in plan.adjudicate {
-                tracing::warn!(run_id = %self.run_id, node_id = %node_id, "副作用节点状态不明，等待人工裁决");
+                // 运行叙事进事件流（NodeLog），不再是纯运维 tracing
+                let _ = self
+                    .append(Event::NodeLog {
+                        node_id: node_id.clone(),
+                        attempt: self.state.record(&node_id).attempts,
+                        level: LogLevel::Warn,
+                        stream: LogStream::Engine,
+                        message: "副作用节点状态不明（接管/重启），等待人工裁决".into(),
+                    })
+                    .await;
                 self.adjudicating.insert(node_id);
             }
             self.project_status(
@@ -494,12 +594,20 @@ impl Driver {
         }
 
         for (node_id, attempt) in plan.replay {
-            tracing::warn!(run_id = %self.run_id, node_id = %node_id, attempt, "接管/重启残留节点，重新执行");
+            let _ = self
+                .append(Event::NodeLog {
+                    node_id: node_id.clone(),
+                    attempt,
+                    level: LogLevel::Info,
+                    stream: LogStream::Engine,
+                    message: format!("接管/重启残留节点，重新执行（attempt {}）", attempt + 1),
+                })
+                .await;
             self.start_node(&node_id, attempt + 1, result_tx).await?;
         }
 
         for node_id in plan.retries {
-            self.schedule_retry(&node_id, result_tx);
+            self.schedule_retry(&node_id, result_tx).await;
         }
         for signal in plan.adjudication_received {
             let action = self.signal_action(&signal)?;
@@ -602,6 +710,53 @@ impl Driver {
             .kind()
             .ok_or_else(|| EngineError::Node(format!("节点类型未知：{}", node.node_type)))?;
 
+        let preds: Vec<String> = self
+            .definition
+            .incoming(node_id)
+            .iter()
+            .map(|e| e.from.clone())
+            .collect();
+        // 决定论输入面（DESIGN §10）：nodes 只暴露直接前驱的输出，
+        // 引用非前驱节点在 JS 里是 undefined，属性访问即抛错进 fatal
+        let outputs: HashMap<String, Value> = preds
+            .iter()
+            .filter_map(|p| self.state.outputs.get(p).cloned().map(|v| (p.clone(), v)))
+            .collect();
+
+        // 参数展开（恰好一次，见 exec::expand_params）：纯计算，无副作用，
+        // 先于 node_started 完成以便输入面快照随事件落盘。展开失败走
+        // 节点失败路径（写序协议不变：先 node_started 再 node_failed）。
+        // human_task 不执行、历史行为也不展开：输入面用原始 params。
+        let (node, input_snapshot) = if kind == NodeType::HumanTask {
+            let input = redact_value(&node.params);
+            (node, input)
+        } else {
+            match exec::expand_params(&node, &self.input, &outputs).await {
+                Ok(Some(expanded)) => {
+                    let input = redact_value(&expanded.params);
+                    (expanded, input)
+                }
+                Ok(None) => {
+                    let input = redact_value(&node.params);
+                    (node, input)
+                }
+                Err(failure) => {
+                    self.append(Event::NodeStarted {
+                        node_id: node_id.to_string(),
+                        attempt,
+                        child_run_id: None,
+                        input: None,
+                    })
+                    .await?;
+                    if failure.platform {
+                        return Err(EngineError::Backend(failure.message));
+                    }
+                    self.fail_node(node_id, attempt, &failure, result_tx).await?;
+                    return Ok(());
+                }
+            }
+        };
+
         // sub_workflow 的 child_run_id 随 node_started 一起确定并落盘（副作用前写协议）。
         // 崩溃重放（记录仍是 Running）沿用已落盘的 id 附着原子 run；
         // 重试（新 attempt）派生新 id，每次重试是独立的子 run。
@@ -619,29 +774,19 @@ impl Driver {
             node_id: node_id.to_string(),
             attempt,
             child_run_id: child_run_id.clone(),
+            input: Some(input_snapshot),
         })
         .await?;
 
         if kind == NodeType::HumanTask {
-            self.register_human_wait(node_id, attempt, result_tx);
+            self.register_human_wait(node_id, attempt, result_tx).await;
             return Ok(());
         }
 
-        let preds: Vec<String> = self
-            .definition
-            .incoming(node_id)
-            .iter()
-            .map(|e| e.from.clone())
-            .collect();
         let ctx = NodeExecContext {
             node,
             input: self.input.clone(),
-            // 决定论输入面（DESIGN §10）：nodes 只暴露直接前驱的输出，
-            // 引用非前驱节点在 JS 里是 undefined，属性访问即抛错进 fatal
-            outputs: preds
-                .iter()
-                .filter_map(|p| self.state.outputs.get(p).cloned().map(|v| (p.clone(), v)))
-                .collect(),
+            outputs,
             preds,
             depth: self.depth,
             child: match (child_run_id, &self.child_launcher) {
@@ -651,6 +796,12 @@ impl Driver {
                 }),
                 _ => None,
             },
+            logger: NodeLogger::new(
+                self.log_tx.clone(),
+                self.budget.clone(),
+                node_id,
+                attempt,
+            ),
         };
         let cancel = self.cancel.clone();
         let result_tx = result_tx.clone();
@@ -674,12 +825,22 @@ impl Driver {
     }
 
     /// human_task：节点已落 node_started，引擎持 oneshot 等待外部 signal。
-    fn register_human_wait(
+    async fn register_human_wait(
         &mut self,
         node_id: &str,
         attempt: u32,
         result_tx: &mpsc::Sender<DriverMsg>,
     ) {
+        // 等待叙事进事件流：运行详情页一眼看出这个节点在等谁
+        let _ = self
+            .append(Event::NodeLog {
+                node_id: node_id.to_string(),
+                attempt,
+                level: LogLevel::Info,
+                stream: LogStream::Engine,
+                message: "等待人工交付信号（run.signal）".into(),
+            })
+            .await;
         let (tx, rx) = oneshot::channel::<Value>();
         self.human_waiting.insert(node_id.to_string(), tx);
         let result_tx = result_tx.clone();
@@ -753,26 +914,38 @@ impl Driver {
                         if failure.platform {
                             return Err(EngineError::Backend(failure.message));
                         }
-                        let policy = self
-                            .definition
-                            .node(&node_id)
-                            .map(|n| n.retry())
-                            .unwrap_or_default();
-                        let should_retry = failure.retryable && attempt < policy.max_attempts;
-                        self.append(Event::NodeFailed {
-                            node_id: node_id.clone(),
-                            attempt,
-                            error: failure.message.clone(),
-                            retryable: should_retry,
-                        })
-                        .await?;
-
-                        if should_retry {
-                            self.schedule_retry(&node_id, result_tx);
-                        }
+                        self.fail_node(&node_id, attempt, &failure, result_tx).await?;
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// 节点失败统一出口：写 NodeFailed（按策略标可重试）+ 必要时调度重试。
+    /// 执行结果与参数展开失败两条路径共用，避免重试逻辑分叉。
+    async fn fail_node(
+        &mut self,
+        node_id: &str,
+        attempt: u32,
+        failure: &NodeFailure,
+        result_tx: &mpsc::Sender<DriverMsg>,
+    ) -> Result<(), EngineError> {
+        let policy = self
+            .definition
+            .node(node_id)
+            .map(|n| n.retry())
+            .unwrap_or_default();
+        let should_retry = failure.retryable && attempt < policy.max_attempts;
+        self.append(Event::NodeFailed {
+            node_id: node_id.to_string(),
+            attempt,
+            error: failure.message.clone(),
+            retryable: should_retry,
+        })
+        .await?;
+        if should_retry {
+            self.schedule_retry(node_id, result_tx).await;
         }
         Ok(())
     }
@@ -782,12 +955,23 @@ impl Driver {
     /// 而这里的 `Utc::now()` 来自**当前进程**。跨机器恢复时两个时钟不同源，
     /// NTP 抖动足以把「剩余退避」算成 0 甚至负数（saturating_sub 后同样是 0），
     /// 退避防护静默失效 → 重试风暴。宁可多重试一次间隔，不做不可靠的减法。
-    fn schedule_retry(&mut self, node_id: &str, result_tx: &mpsc::Sender<DriverMsg>) {
+    async fn schedule_retry(&mut self, node_id: &str, result_tx: &mpsc::Sender<DriverMsg>) {
         let backoff = self
             .definition
             .node(node_id)
             .map(|node| node.retry().backoff_ms)
             .unwrap_or(0);
+        // 重试叙事进事件流：第几次、退避多久，归属到即将开始的新 attempt
+        let next_attempt = self.next_attempt(node_id);
+        let _ = self
+            .append(Event::NodeLog {
+                node_id: node_id.to_string(),
+                attempt: next_attempt,
+                level: LogLevel::Warn,
+                stream: LogStream::Engine,
+                message: format!("第 {next_attempt} 次重试（退避 {backoff}ms）"),
+            })
+            .await;
         let result_tx = result_tx.clone();
         let nid = node_id.to_string();
         let handle = tokio::spawn(async move {
@@ -946,6 +1130,10 @@ impl Driver {
     }
 
     async fn finalize(&mut self) -> Result<(), EngineError> {
+        // 终态前排空残余日志 + 预算摘要：EventLog::append 对终态事件内建兜底
+        // sync，这些行会一并刷盘（终态返回 ⇒ 终态前日志已在盘上）
+        self.drain_remaining_logs().await?;
+
         if let Some(error) = self.state.fatal_error.clone() {
             self.append_terminal(Event::RunFailed { error }).await?;
             return Ok(());

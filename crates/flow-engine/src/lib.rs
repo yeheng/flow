@@ -8,6 +8,7 @@ pub mod exec;
 pub mod expr;
 pub mod fold;
 pub mod model;
+pub mod nodelog;
 
 pub use backend::{CommitOutcome, PendingInput, PendingInputKind, RunEventSink};
 pub use child_run::{ChildRunLauncher, ChildRunOutcome, MAX_SUB_WORKFLOW_DEPTH};
@@ -16,6 +17,9 @@ pub use engine::{
     DbRunStatus, Engine, NoopObserver, ResumeOutcome, RunObserver, Signal, StartRun, StatusUpdate,
 };
 pub use error::EngineError;
-pub use event::{validate_sequence, validate_sequence_contiguous, Envelope, Event, EventLog};
+pub use event::{
+    validate_sequence, validate_sequence_contiguous, Envelope, Event, EventLog, LogLevel, LogStream,
+};
 pub use fold::{NodeRecord, NodeState, RunPhase, RunState};
 pub use model::{Definition, Edge, Node, NodeType, Position, RetryPolicy, HTTP_METHODS};
+pub use nodelog::{redact_value, LogBudget, LogLine, NodeLogger};

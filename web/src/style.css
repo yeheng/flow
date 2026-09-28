@@ -350,6 +350,14 @@ input.code {
   --cat-color: #3fb950;
 }
 
+.cat-ai {
+  --cat-color: #f778ba;
+}
+
+.cat-notify {
+  --cat-color: #76e3ea;
+}
+
 /* ---- 画布容器（FlowCanvas 与只读 RunCanvas 共用） ---- */
 
 .canvas-wrap {

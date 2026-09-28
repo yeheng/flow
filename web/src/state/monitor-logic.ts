@@ -1,8 +1,15 @@
-import type { RunEvent, Timeline, TimelineNode } from "../types";
+import type { LogLine, RunEvent, Timeline, TimelineNode } from "../types";
 
 /**
  * run 投影：run.timeline 初始对齐 + run.event 增量应用的纯逻辑。
  * 从 state/monitor.ts 抽出以便单测；monitor 的 reactive 状态结构上满足本接口。
+ *
+ * 日志（node_log）与状态事件同流同 seq 空间（可观察性设计 §2）：
+ * - 日志有自己的去重水位 lastLogSeq（run_tail 单订阅内按 seq 升序投递），
+ *   历史/实时日志统一走一条路径，无需第二来源；
+ * - 状态事件的水位 lastSeq 用单调过滤（seq > lastSeq 才应用）——状态事件
+ *   之间隔着日志行的 seq，严格相邻不再成立；缺口修复由 run_tail 内部补齐 +
+ *   断线重连后的整体 re-attach 承担，客户端不再做缺口检测。
  */
 export interface RunProjection {
   phase: string | null;
@@ -11,9 +18,18 @@ export interface RunProjection {
   fatalError: string | null;
   lastSeq: number;
   nodes: TimelineNode[];
+  /** 节点日志（按 seq 升序追加；环形上限见 MAX_LOG_LINES） */
+  logs: LogLine[];
+  /** 日志去重水位：已收到的最大 node_log seq */
+  lastLogSeq: number;
 }
 
-/** 用 run.timeline 快照整体对齐投影 */
+/** 日志环形上限：超过后丢弃最旧的，与后端单 run 预算同量级 */
+export const MAX_LOG_LINES = 10000;
+/** 触发上限后保留的行数：避免逐行 trim 的抖动 */
+const KEEP_LOG_LINES = 8000;
+
+/** 用 run.timeline 快照整体对齐投影（日志不在 timeline 里，由订阅回放补齐） */
 export function alignProjection(p: RunProjection, tl: Timeline): void {
   p.nodes = tl.nodes;
   p.phase = tl.phase;
@@ -21,27 +37,54 @@ export function alignProjection(p: RunProjection, tl: Timeline): void {
   p.output = tl.output;
   p.fatalError = tl.fatal_error;
   p.lastSeq = tl.last_seq;
+  p.logs = [];
+  p.lastLogSeq = 0;
 }
 
-export type SeqAction = "apply" | "skip" | "resync";
+export type SeqAction = "apply" | "skip";
 
 /**
- * 事件序号决策：重复/陈旧事件跳过；恰好下一条则应用；
- * 出现缺口（订阅 Lagged 丢事件）时需要整体 resync。
+ * 状态事件序号决策：陈旧（回放已覆盖）跳过；否则应用。
+ * run_tail 保证单订阅内 seq 严格升序且不重复，断线重建订阅走 re-attach
+ * 整体重建投影，所以这里只剩去重过滤。
  */
 export function seqAction(lastSeq: number, seq: number): SeqAction {
   if (seq <= lastSeq) return "skip";
-  if (seq !== lastSeq + 1) return "resync";
   return "apply";
 }
 
-/** 订阅建立与 timeline 对齐之间缓冲的事件：丢弃已覆盖的、按 seq 排序后补放 */
-export function drainBuffer(buffer: RunEvent[], lastSeq: number): RunEvent[] {
-  return buffer.filter((e) => e.seq > lastSeq).sort((a, b) => a.seq - b.seq);
+/** 订阅建立与 timeline 对齐之间缓冲的事件：按 seq 排序后全部补放
+ *  （状态事件的去重交给 seqAction，日志交给 lastLogSeq 水位） */
+export function drainBuffer(buffer: RunEvent[]): RunEvent[] {
+  return [...buffer].sort((a, b) => a.seq - b.seq);
 }
 
-/** 应用单条 run.event 到投影；调用方保证 seq 连续（见 seqAction） */
+/** node_log 事件 → 前端日志行，带水位去重；环形上限内追加 */
+export function applyLog(p: RunProjection, env: RunEvent): void {
+  const seq = env.seq;
+  if (seq <= p.lastLogSeq) return;
+  p.lastLogSeq = seq;
+  p.logs.push({
+    seq,
+    ts: env.ts,
+    node_id: env.node_id ?? "",
+    attempt: env.attempt ?? 0,
+    level: env.level ?? "info",
+    stream: env.stream ?? "engine",
+    message: env.message ?? "",
+  });
+  if (p.logs.length > MAX_LOG_LINES) {
+    p.logs.splice(0, p.logs.length - KEEP_LOG_LINES);
+  }
+}
+
+/** 应用单条 run.event 到投影；状态事件由调用方保证 seq 单调（见 seqAction） */
 export function applyEvent(p: RunProjection, env: RunEvent): void {
+  // 日志不是状态：不推进 lastSeq（否则会把状态水位拖回去）
+  if (env.type === "node_log") {
+    applyLog(p, env);
+    return;
+  }
   p.lastSeq = env.seq;
   const rec = env.node_id ? p.nodes.find((n) => n.id === env.node_id) : undefined;
   switch (env.type) {
@@ -58,6 +101,8 @@ export function applyEvent(p: RunProjection, env: RunEvent): void {
         rec.duration_ms = null;
         rec.output = null;
         rec.error = null;
+        // 输入面快照随 attempt 刷新（node_started 写入时已脱敏）
+        rec.input = env.input;
         // 重试 = 新 attempt = 新的确定性 child_run_id
         rec.child_run_id = env.child_run_id;
       }

@@ -16,6 +16,7 @@ fn body_can_read_input_and_upstream_outputs() {
         &input,
         &nodes,
         Duration::from_secs(2),
+        &NodeLogger::disabled(),
     )
     .unwrap();
     assert_eq!(out, json!({"id": "o-1", "upstream": 200, "total": 24}));
@@ -36,6 +37,7 @@ fn exceptions_surface_as_errors() {
         &input,
         &nodes,
         Duration::from_secs(2),
+        &NodeLogger::disabled(),
     )
     .unwrap_err();
     assert!(matches!(err, EngineError::Expr(_)), "{err}");
@@ -93,6 +95,7 @@ fn injected_objects_keep_proto_as_plain_data_key() {
         &input,
         &json!({"__proto__": {"polluted": true}}),
         Duration::from_secs(2),
+        &NodeLogger::disabled(),
     )
     .unwrap();
     assert_eq!(out["seen"], json!(true));
@@ -110,6 +113,7 @@ fn result_conversion_matches_json_stringify() {
         &input,
         &nodes,
         Duration::from_secs(2),
+        &NodeLogger::disabled(),
     )
     .unwrap();
     assert_eq!(out["half"], json!(3));
@@ -126,7 +130,7 @@ fn result_conversion_matches_json_stringify() {
 #[test]
 fn bigint_results_convert_exactly() {
     let (input, nodes) = ctx();
-    let out = eval_body("return 1n + 2n;", &input, &nodes, Duration::from_secs(2)).unwrap();
+    let out = eval_body("return 1n + 2n;", &input, &nodes, Duration::from_secs(2), &NodeLogger::disabled()).unwrap();
     assert_eq!(out, json!(3));
 }
 
@@ -149,6 +153,7 @@ fn big_integers_round_trip_exactly() {
         &input,
         &nodes,
         Duration::from_secs(2),
+        &NodeLogger::disabled(),
     )
     .unwrap();
     assert_eq!(out["a"], json!(9007199254740993i64));
@@ -170,6 +175,7 @@ fn big_int_mixing_number_fails_loudly() {
         &input,
         &Value::Null,
         Duration::from_secs(2),
+        &NodeLogger::disabled(),
     )
     .unwrap_err();
     let EngineError::Expr(msg) = &err else {
@@ -195,7 +201,7 @@ fn big_int_mixing_number_fails_loudly() {
 #[test]
 fn oversized_bigint_result_is_rejected() {
     let (input, nodes) = ctx();
-    let err = eval_body("return 2n ** 64n;", &input, &nodes, Duration::from_secs(2)).unwrap_err();
+    let err = eval_body("return 2n ** 64n;", &input, &nodes, Duration::from_secs(2), &NodeLogger::disabled()).unwrap_err();
     assert!(matches!(err, EngineError::Expr(_)), "{err}");
 }
 
@@ -221,7 +227,7 @@ fn templates_handle_big_integers_exactly() {
 #[test]
 fn runaway_script_is_interrupted_by_timeout() {
     let (input, nodes) = ctx();
-    let err = eval_body("while (true) {}", &input, &nodes, Duration::from_millis(50)).unwrap_err();
+    let err = eval_body("while (true) {}", &input, &nodes, Duration::from_millis(50), &NodeLogger::disabled()).unwrap_err();
     assert!(matches!(err, EngineError::Expr(_)), "{err}");
 }
 
@@ -252,6 +258,7 @@ fn sandbox_has_no_std_os_or_module_loader() {
         &input,
         &nodes,
         Duration::from_secs(2),
+        &NodeLogger::disabled(),
     )
     .unwrap_err();
     assert!(matches!(err, EngineError::Expr(_)), "{err}");

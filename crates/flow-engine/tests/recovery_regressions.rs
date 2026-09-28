@@ -44,6 +44,7 @@ async fn recovered_fatal_failure_remains_failed_and_independent_branch_finishes(
             node_id: "slow".into(),
             attempt: 1,
             child_run_id: None,
+            input: None,
         },
     ])
     .await;

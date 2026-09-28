@@ -629,3 +629,53 @@ e2e_test!(
         assert_eq!(err.code(), -32601, "{err}");
     })
 );
+
+e2e_test!(
+    node_logs_and_input_snapshot_visible_in_observability,
+    |ctx: &mut Ctx| Box::pin(async move {
+        let client = ctx.client().await;
+        // 脚本 console 输出 + 模板参数（含敏感键）→ 日志与输入面快照全部可查
+        let code = "console.log('hi from script', input);\nconsole.error('oops');\nreturn { ok: input.n };";
+        let mut def = linear_def(code);
+        def["nodes"][1]["params"]["note"] = json!("n=${input.n}");
+        def["nodes"][1]["params"]["token"] = json!("sk-should-be-redacted");
+        let (workflow_id, _) = publish_workflow(&client, "可观察", def).await;
+        let run_id = start_run(&client, &workflow_id, json!({ "n": 7 })).await;
+
+        let run = wait_run_terminal(&client, &run_id, TIMEOUT).await;
+        assert_eq!(run["run"]["status"], json!("succeeded"));
+
+        // 时间线：输入面快照（展开 + 脱敏）与输出
+        let timeline: Value = call_json(&client, "run.timeline", json!({"run_id": run_id})).await;
+        let node = timeline_node(&timeline, "n1");
+        assert_eq!(node["input"]["note"], json!("n=7"), "模板展开后的输入面");
+        assert_eq!(node["input"]["token"], json!("***"), "敏感键展示值脱敏");
+        assert_eq!(node["output"], json!({ "ok": 7 }));
+        // run.get 的 output 是数据面（CLI 语义），不做展示层脱敏——
+        // 这里仅确认它仍是原始输出
+        assert_eq!(run["run"]["output"], json!({ "ok": 7 }));
+
+        // 事件流里有 node_log：console.log→stdout/info，console.error→stderr/error
+        let events: Value = call_json(&client, "run.events", json!({"run_id": run_id})).await;
+        let events = events["events"].as_array().unwrap();
+        let stdout_log = events.iter().find(|e| {
+            e["type"] == json!("node_log")
+                && e["stream"] == json!("stdout")
+                && e["message"].as_str().unwrap_or("").contains("hi from script")
+        });
+        assert!(stdout_log.is_some(), "console.log 必须进事件流：{events:?}");
+        let stderr_log = events.iter().find(|e| {
+            e["type"] == json!("node_log")
+                && e["stream"] == json!("stderr")
+                && e["level"] == json!("error")
+        });
+        assert!(stderr_log.is_some(), "console.error 必须以 error 级进事件流");
+        let log = stdout_log.unwrap();
+        assert_eq!(log["node_id"], json!("n1"));
+        assert_eq!(log["attempt"], json!(1));
+        // seq 连续性覆盖日志行：全量事件 seq 严格 1..N
+        for (index, event) in events.iter().enumerate() {
+            assert_eq!(event["seq"], json!(index as u64 + 1));
+        }
+    })
+);

@@ -36,6 +36,7 @@ async fn takeover_replays_pure_node_with_new_attempt() {
         node_id: "n1".into(),
         attempt: 1,
         child_run_id: None,
+        input: None,
     })
     .await
     .unwrap();
@@ -258,6 +259,7 @@ async fn takeover_http_side_effect_requires_adjudication_then_retries_once() {
         node_id: "h".into(),
         attempt: 1,
         child_run_id: None,
+        input: None,
     })
     .await
     .unwrap();
@@ -340,6 +342,7 @@ async fn takeover_consumes_recorded_adjudication() {
         node_id: "h".into(),
         attempt: 1,
         child_run_id: None,
+        input: None,
     })
     .await
     .unwrap();

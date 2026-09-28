@@ -107,6 +107,7 @@ impl Harness {
                     node_id: (*node_id).to_string(),
                     attempt: 1,
                     child_run_id: None,
+                    input: None,
                 },
             )
             .await
@@ -134,6 +135,7 @@ impl Harness {
                 node_id: "s".into(),
                 attempt: 1,
                 child_run_id: None,
+                input: None,
             },
             Event::NodeCompleted {
                 node_id: "s".into(),
@@ -145,6 +147,7 @@ impl Harness {
                 node_id: "n".into(),
                 attempt: 1,
                 child_run_id: None,
+                input: None,
             },
         ]
         .into_iter()

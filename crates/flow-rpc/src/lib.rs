@@ -715,6 +715,10 @@ pub(crate) fn timeline_value(
         .iter()
         .map(|node| {
             let record = snapshot.record(&node.id);
+            // output 展示出口脱敏（固定敏感键）：事件日志里的原始 output 是
+            // 下游节点的数据面，不能动；这里只脱时间线的展示值。
+            // input 在 node_started 写入时已脱敏，直接透传。
+            let output = record.output.as_ref().map(flow_backend::redact_value);
             let mut entry = json!({
                 "id": node.id,
                 "name": node.name,
@@ -724,7 +728,8 @@ pub(crate) fn timeline_value(
                 "started_at": record.started_at,
                 "ended_at": record.ended_at,
                 "duration_ms": record.duration_ms,
-                "output": record.output,
+                "input": record.input,
+                "output": output,
                 "error": record.error,
                 "child_run_id": record.child_run_id,
             });

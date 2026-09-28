@@ -9,6 +9,7 @@ use crate::child_run::{ChildRunLauncher, ChildRunOutcome, MAX_SUB_WORKFLOW_DEPTH
 use crate::error::EngineError;
 use crate::expr;
 use crate::model::{Node, NodeType, HTTP_METHODS};
+use crate::nodelog::NodeLogger;
 
 pub const DEFAULT_JS_TIMEOUT_MS: u64 = 2_000;
 pub const DEFAULT_HTTP_TIMEOUT_MS: u64 = 30_000;
@@ -71,6 +72,8 @@ pub struct NodeExecContext {
     pub depth: u32,
     /// sub_workflow：已随 node_started 落盘的确定性子 run id 与启动器
     pub child: Option<ChildRunSpec>,
+    /// 节点日志发射器（发射即忘，不阻塞执行）
+    pub logger: NodeLogger,
 }
 
 #[derive(Clone)]
@@ -107,7 +110,11 @@ fn contains_template(value: &Value) -> bool {
 /// 等用户 JS 字段，其中的 `${}` 是 JS 模板字面量而非 flow 模板）外全部展开，
 /// 与 http_call 历来共用 `expr::expand_templates`。展开的数据面与 script 的
 /// `nodes` 完全一致——只读 run 输入与直接前驱输出快照，不扩大决定论边界。
-async fn expand_params(
+///
+/// 由 driver 的 start_node 在写 node_started 前调用（输入面快照随事件落盘），
+/// 展开**恰好一次**：exec 层不再展开，禁止双展开（数据里合法的 `${` 会被
+/// 二次展开损坏——历史回归，见 `http_url_template_is_expanded_before_request`）。
+pub(crate) async fn expand_params(
     node: &Node,
     input: &Value,
     outputs: &HashMap<String, Value>,
@@ -183,19 +190,9 @@ pub async fn execute(
         .kind()
         .ok_or_else(|| NodeFailure::fatal(format!("未知节点类型：{}", ctx.node.node_type)))?;
 
-    // 统一参数展开（DESIGN §10）：除代码承载字段外，所有节点 params 在
-    // 执行前过同一份 ${} 模板展开。无模板时零成本原路返回（expand_params）。
-    // http_call 只是这条规则的第一个用户，不是特权户。
-    match expand_params(&ctx.node, &ctx.input, &ctx.outputs).await? {
-        Some(node) => {
-            let owned = NodeExecContext {
-                node,
-                ..ctx.clone()
-            };
-            dispatch(kind, &owned, cancel).await
-        }
-        None => dispatch(kind, ctx, cancel).await,
-    }
+    // params 已由 driver 的 start_node 统一展开（DESIGN §10，展开恰好一次），
+    // 这里直接按类型分发。
+    dispatch(kind, ctx, cancel).await
 }
 
 async fn dispatch(
@@ -326,11 +323,22 @@ async fn run_script(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
     let input = ctx.input.clone();
     let nodes = ctx.nodes_value();
     let timeout = ctx.js_timeout();
+    let logger = ctx.logger.clone();
     // rquickjs 是同步 CPU 执行，必须放到阻塞线程池，避免占死 tokio worker
-    let out = tokio::task::spawn_blocking(move || expr::eval_body(&code, &input, &nodes, timeout))
-        .await
-        .map_err(|e| NodeFailure::fatal(format!("脚本任务异常：{e}")))?;
-    out.map_err(NodeFailure::from)
+    let out = tokio::task::spawn_blocking(move || {
+        expr::eval_body(&code, &input, &nodes, timeout, &logger)
+    })
+    .await
+    .map_err(|e| NodeFailure::fatal(format!("脚本任务异常：{e}")));
+    match out {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => {
+            // 事件里只有 NodeFailed 的单行 error；日志里给完整异常细节
+            ctx.logger.error(format!("脚本执行失败：{err}"));
+            Err(NodeFailure::from(err))
+        }
+        Err(err) => Err(err),
+    }
 }
 
 async fn run_condition(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
@@ -342,10 +350,25 @@ async fn run_condition(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
     let input = ctx.input.clone();
     let nodes = ctx.nodes_value();
     let timeout = ctx.js_timeout();
-    tokio::task::spawn_blocking(move || expr::eval_expr(&expression, &input, &nodes, timeout))
-        .await
-        .map_err(|e| NodeFailure::fatal(format!("条件求值任务异常：{e}")))?
-        .map_err(NodeFailure::from)
+    let result = tokio::task::spawn_blocking(move || {
+        expr::eval_expr(&expression, &input, &nodes, timeout)
+    })
+    .await
+    .map_err(|e| NodeFailure::fatal(format!("条件求值任务异常：{e}")))?
+    .map_err(NodeFailure::from);
+    match &result {
+        // 分支走向从日志一目了然：求值结果 + 真值判定
+        Ok(value) => ctx.logger.debug(format!(
+            "条件求值：{} => {}（取 {} 出口）",
+            ctx.node.param_str("expr").unwrap_or(""),
+            value,
+            if truthy(value) { "true" } else { "false" }
+        )),
+        Err(err) => ctx
+            .logger
+            .error(format!("条件求值失败：{}（{}）", err.message, ctx.node.param_str("expr").unwrap_or(""))),
+    }
+    result
 }
 
 /// 条件节点的真值判定。引擎用它选出口端口，节点输出保持为求值结果本身。
@@ -365,6 +388,7 @@ async fn run_delay(
     cancel: &CancellationToken,
 ) -> Result<Value, NodeFailure> {
     let ms = parse_ms(&ctx.node)?;
+    ctx.logger.debug(format!("等待 {ms}ms"));
     tokio::select! {
         _ = cancel.cancelled() => Err(NodeFailure::fatal("已取消")),
         _ = tokio::time::sleep(Duration::from_millis(ms)) => Ok(serde_json::json!({ "slept_ms": ms })),
@@ -436,14 +460,21 @@ async fn run_http(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
         }
     }
 
+    ctx.logger.info(format!("→ {method_str} {url}"));
     let response = match request.send().await {
         Ok(response) => response,
         Err(err) if err.is_builder() => {
             // URL/请求头非法：请求从未发出，参数错误重试也不会变好（DESIGN §6.5）
+            ctx.logger
+                .error(format!("请求参数非法：{err}（未发出）"));
             return Err(NodeFailure::fatal(format!("请求参数非法：{err}")));
         }
         Err(err) => {
             // 连接失败/超时：副作用不明确或未发生，交给重试策略
+            ctx.logger.error(format!(
+                "请求 {url} 失败（{}ms）：{err}",
+                started.elapsed().as_millis()
+            ));
             return Err(NodeFailure::retryable(format!(
                 "请求 {url} 失败（{}ms）：{err}",
                 started.elapsed().as_millis()
@@ -466,19 +497,36 @@ async fn run_http(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
         Ok(text) => text,
         // 连接在读完响应头之后断开：body 不完整。不能带着 200 + 空 body 记成功
         Err(err) => {
+            ctx.logger.error(format!(
+                "读取 {url} 响应体失败（{}ms）：{err}",
+                started.elapsed().as_millis()
+            ));
             return Err(NodeFailure::retryable(format!(
                 "读取 {url} 响应体失败（{}ms）：{err}",
                 started.elapsed().as_millis()
             )));
         }
     };
-    let body = serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text));
+    let body = serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text.clone()));
 
     let output = serde_json::json!({
         "status": status.as_u16(),
         "headers": Value::Object(headers),
         "body": body,
     });
+
+    // 响应元信息一行：状态码、耗时、体量；非 2xx 升级 warn
+    let response_line = format!(
+        "← HTTP {}（{}ms，body {}B）",
+        status.as_u16(),
+        started.elapsed().as_millis(),
+        text.len()
+    );
+    if status.is_success() {
+        ctx.logger.info(response_line);
+    } else {
+        ctx.logger.warn(response_line);
+    }
 
     if status.is_server_error() || status.is_client_error() {
         // 5xx 可能已被下游处理了一部分，标为可重试；4xx 是请求本身的问题
@@ -532,6 +580,7 @@ mod tests {
             preds: vec![],
             depth: 0,
             child: None,
+            logger: NodeLogger::disabled(),
         }
     }
 
@@ -581,9 +630,14 @@ mod tests {
     }
 
     /// delay 的 ms 接受模板产物；执行路径端到端（展开 → parse → sleep）。
+    /// 展开现在由 driver 的 start_node 负责，测试预展开后进 execute。
     #[tokio::test]
     async fn delay_ms_template_drives_the_sleep() {
         let ok = node("delay", json!({"ms": "${input.tick}"}));
+        let ok = expand_params(&ok, &json!({"tick": 40}), &HashMap::new())
+            .await
+            .unwrap()
+            .unwrap_or(ok);
         let out = execute(
             &ctx(ok, json!({"tick": 40}), HashMap::new()),
             &CancellationToken::new(),
@@ -594,6 +648,10 @@ mod tests {
 
         // 展开产物不是整数：fatal，不猜
         let bad = node("delay", json!({"ms": "${input.tick}"}));
+        let bad = expand_params(&bad, &json!({"tick": "soon"}), &HashMap::new())
+            .await
+            .unwrap()
+            .unwrap_or(bad);
         let err = execute(
             &ctx(bad, json!({"tick": "soon"}), HashMap::new()),
             &CancellationToken::new(),
@@ -626,6 +684,11 @@ mod tests {
             "http_call",
             json!({"url": format!("http://{addr}/items/${{input.order_id}}")}),
         );
+        // 展开已上移到 driver 的 start_node：测试预展开后进 execute
+        let node = expand_params(&node, &json!({"order_id": "o-9"}), &HashMap::new())
+            .await
+            .unwrap()
+            .unwrap_or(node);
         let out = execute(
             &ctx(node, json!({"order_id": "o-9"}), HashMap::new()),
             &CancellationToken::new(),
@@ -704,6 +767,7 @@ mod tests {
             preds: vec![],
             depth: 0,
             child: None,
+            logger: NodeLogger::disabled(),
         };
         let failure = execute(&ctx, &CancellationToken::new()).await.unwrap_err();
         assert!(

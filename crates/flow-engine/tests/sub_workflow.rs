@@ -397,6 +397,7 @@ async fn crashed_sub_workflow_replays_and_reattaches_with_same_child_run_id() {
             node_id: "s".into(),
             attempt: 1,
             child_run_id: None,
+            input: None,
         },
         Event::NodeCompleted {
             node_id: "s".into(),
@@ -408,6 +409,7 @@ async fn crashed_sub_workflow_replays_and_reattaches_with_same_child_run_id() {
             node_id: "sub".into(),
             attempt: 1,
             child_run_id: Some("r:sub:1".into()),
+            input: None,
         },
     ] {
         log.append("r", event).await.unwrap();

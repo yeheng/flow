@@ -118,6 +118,12 @@ impl RunEventSink for FileSink {
         Box::pin(async move { self.log.append(&self.run_id, event).await })
     }
 
+    /// 节点日志：只写不 fsync（进程级持久）。同文件后续严格事件的组提交
+    /// 会顺带刷盘；run 终态事件写入前 EventLog 内建兑底 sync。
+    fn append_log<'a>(&'a mut self, event: Event) -> BoxFuture<'a, Result<Envelope, EngineError>> {
+        Box::pin(async move { self.log.append_log(&self.run_id, event).await })
+    }
+
     fn append_terminal<'a>(
         &'a mut self,
         event: Event,
@@ -223,9 +229,16 @@ pub struct Engine {
     child_launcher: Mutex<Option<Arc<dyn crate::child_run::ChildRunLauncher>>>,
 }
 
+/// 广播通道容量：日志事件进同一广播（订阅回放 + 实时追流共用），容量必须
+/// 跟随每 run 日志预算核算，否则刷屏 run 会把所有订阅者打进 Lagged。
+/// 公式见可观察性设计 §4：capacity = max(基础容量, 日志预算)。
+fn event_channel_capacity() -> usize {
+    EVENT_CHANNEL_CAPACITY.max(crate::nodelog::budget_from_env())
+}
+
 impl Engine {
     pub fn new(data_dir: impl Into<PathBuf>, observer: Arc<dyn RunObserver>) -> Engine {
-        let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let (events_tx, _) = broadcast::channel(event_channel_capacity());
         Engine {
             data_dir: data_dir.into(),
             observer,

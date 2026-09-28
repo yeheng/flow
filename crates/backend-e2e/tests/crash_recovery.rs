@@ -104,6 +104,21 @@ e2e_test!(
             "副作用节点接管后保持 Running，等人工裁决"
         );
 
+        // 崩溃前发出的请求日志（进程级持久）在重启后仍可查：日志叙事跨崩溃存活
+        let events: Value = call_json(&client, "run.events", json!({"run_id": run_id})).await;
+        assert!(
+            events["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["type"] == json!("node_log")
+                    && e["message"]
+                        .as_str()
+                        .unwrap_or("")
+                        .starts_with("→ POST ")),
+            "http 请求日志必须在崩溃后仍可读：{events}"
+        );
+
         // 人确认这次副作用成功了：引擎不替用户猜
         let adjudication = json!({
             "action": "succeeded",

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive } from "vue";
+import { computed, reactive, ref } from "vue";
 import {
   backToParentRun,
   cancelRun,
@@ -11,10 +11,13 @@ import {
 } from "../state/monitor";
 import { editor } from "../state/editor";
 import { nodeStateLabel, runPhaseLabel, runStatusLabel } from "../state/labels";
+import LogConsole from "./LogConsole.vue";
 
 const props = withDefaults(defineProps<{ childRunNavigate?: boolean }>(), {
   childRunNavigate: false,
 });
+
+const activeTab = ref<"timeline" | "logs">("timeline");
 
 /** run 投影的特殊 status（挂起/初始化）优先展示；其余回落 fold phase */
 const SPECIAL_STATUS = new Set(["initializing", "awaiting_resume"]);
@@ -84,7 +87,24 @@ function onRowClick(nodeId: string): void {
       </div>
     </div>
 
-    <table class="timeline">
+    <div class="run-tabs">
+      <button
+        class="run-tab"
+        :class="{ active: activeTab === 'timeline' }"
+        @click="activeTab = 'timeline'"
+      >
+        时间线
+      </button>
+      <button
+        class="run-tab"
+        :class="{ active: activeTab === 'logs' }"
+        @click="activeTab = 'logs'"
+      >
+        日志（{{ monitor.logs.length }}）
+      </button>
+    </div>
+    <template v-if="activeTab === 'timeline'">
+      <table class="timeline">
       <thead>
         <tr>
           <th>节点</th>
@@ -137,10 +157,38 @@ function onRowClick(nodeId: string): void {
         </tr>
       </tbody>
     </table>
+    </template>
+    <LogConsole v-else class="monitor-log-console" @select-node="onRowClick" />
   </div>
 </template>
 
 <style scoped>
+.run-tabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--border);
+  margin-top: 6px;
+}
+
+.run-tab {
+  border: none;
+  background: none;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--text2);
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+}
+
+.run-tab.active {
+  color: var(--text);
+  border-bottom-color: var(--run);
+}
+
+.monitor-log-console {
+  min-height: 260px;
+}
+
 .run-status {
   display: flex;
   align-items: center;

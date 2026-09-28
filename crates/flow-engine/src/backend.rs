@@ -48,6 +48,12 @@ pub trait RunEventSink: Send {
     /// 受保护追加（非终态事件）。LeaseLost 表示所有权已转移，调用方必须停止派发。
     fn append<'a>(&'a mut self, event: Event) -> BoxFuture<'a, Result<Envelope, EngineError>>;
 
+    /// 节点日志追加（进程级持久层）。文件后端覆写为只写不 fsync；
+    /// Postgres 后端没有更弱的持久层（事务即落库），默认走 append。
+    fn append_log<'a>(&'a mut self, event: Event) -> BoxFuture<'a, Result<Envelope, EngineError>> {
+        Box::pin(self.append(event))
+    }
+
     /// 终态追加：事件 + 元数据投影 + 释放租约 + 拒绝剩余 pending 输入，同一提交点。
     fn append_terminal<'a>(
         &'a mut self,

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, ref, useId, watch } from "vue";
 import { editor } from "../state/editor";
 import type { PropertySchema } from "../types";
 
@@ -15,9 +15,18 @@ const label = computed(() => props.schema["x-label"] ?? props.name);
 const help = computed(() => props.schema["x-help"]);
 
 type Widget =
-  "text" | "number" | "boolean" | "enum" | "code" | "json" | "workflow-picker" | "object";
+  | "text"
+  | "number"
+  | "boolean"
+  | "enum"
+  | "secret"
+  | "code"
+  | "json"
+  | "workflow-picker"
+  | "object";
 const widget = computed<Widget>(() => {
   if (props.schema.enum) return "enum";
+  if (props.schema["x-secret"]) return "secret";
   const w = props.schema["x-widget"];
   if (w) return w;
   switch (props.schema.type) {
@@ -101,6 +110,9 @@ const workflowWarning = computed(() => {
   return "";
 });
 
+// ---- secret：密钥名称选择器（datalist 既给候选又允许手输，覆盖服务端未配置的空列表场景） ----
+const secretListId = useId();
+
 // ---- object 递归 ----
 const objValue = computed<Record<string, unknown>>(() =>
   typeof props.modelValue === "object" && props.modelValue !== null
@@ -159,6 +171,21 @@ function setChild(key: string, value: unknown): void {
     <select v-else-if="widget === 'enum'" :value="(modelValue as string) ?? ''" @change="onSelect">
       <option v-for="opt in schema.enum" :key="opt" :value="opt">{{ opt }}</option>
     </select>
+    <template v-else-if="widget === 'secret'">
+      <input
+        type="text"
+        :list="secretListId"
+        placeholder="密钥名称"
+        :value="(modelValue as string) ?? ''"
+        @input="onText"
+      />
+      <datalist :id="secretListId">
+        <option v-for="s in editor.secrets" :key="s" :value="s" />
+      </datalist>
+      <div v-if="editor.secrets.length === 0" class="field-help">
+        服务端未配置 FLOW_SECRET_* 环境变量，可手动输入密钥名称
+      </div>
+    </template>
     <textarea
       v-else-if="widget === 'code'"
       class="code"

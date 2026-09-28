@@ -73,6 +73,10 @@ pub struct NodeRecord {
     /// sub_workflow 节点的子 run id（来自 node_started）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child_run_id: Option<String>,
+    /// 节点输入面快照：模板展开后的 params（node_started 带入，写入时已脱敏）。
+    /// 每个 attempt 刷新；重试/终态不清除，展示的是最近一次尝试的输入。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +156,7 @@ impl RunState {
             error: None,
             last_signal: None,
             child_run_id: None,
+            input: None,
         };
         self.records.get(node_id).unwrap_or(&DEFAULT_RECORD)
     }
@@ -180,6 +185,7 @@ impl RunState {
                 node_id,
                 attempt,
                 child_run_id,
+                input,
             } => {
                 let rec = self.records.entry(node_id.clone()).or_default();
                 rec.state = NodeState::Running { attempt: *attempt };
@@ -191,6 +197,7 @@ impl RunState {
                 rec.output = None;
                 rec.last_signal = None;
                 rec.child_run_id = child_run_id.clone();
+                rec.input = input.clone();
                 self.outputs.remove(node_id);
             }
             Event::NodeCompleted {
@@ -239,6 +246,9 @@ impl RunState {
                 rec.ended_at = Some(env.ts);
                 self.outputs.remove(node_id);
             }
+            // 日志是观察数据，不是恢复状态：折叠时显式跳过（契约：对未知/
+            // 非状态事件 no-op，前端同款契约，见 monitor-logic.ts）
+            Event::NodeLog { .. } => {}
             Event::SignalReceived { node_id, payload } => {
                 let rec = self.records.entry(node_id.clone()).or_default();
                 rec.last_signal = Some(payload.clone());
@@ -302,6 +312,7 @@ mod tests {
                     node_id: "n1".into(),
                     attempt: 1,
                     child_run_id: None,
+                    input: None,
                 },
             ),
             env(
@@ -319,6 +330,7 @@ mod tests {
                     node_id: "n1".into(),
                     attempt: 2,
                     child_run_id: None,
+                    input: None,
                 },
             ),
             env(
@@ -390,6 +402,7 @@ mod tests {
                 node_id: "n1".into(),
                 attempt: 2,
                 child_run_id: None,
+                input: None,
             },
         ));
         assert!(!state.outputs.contains_key("n1"));

@@ -10,6 +10,8 @@ import { toast } from "../state/toast";
 import type { Definition, RunEvent, RunRecord } from "../types";
 import RunCanvas from "../components/RunCanvas.vue";
 import RunMonitor from "../components/RunMonitor.vue";
+import LogConsole from "../components/LogConsole.vue";
+import NodeInspector from "../components/NodeInspector.vue";
 
 const props = defineProps<{ runId: string }>();
 
@@ -20,8 +22,40 @@ const live = ref(false);
 const definition = ref<Definition | null>(null);
 const showEvents = ref(false);
 const events = ref<RunEvent[] | null>(null);
+const activeTab = ref<"timeline" | "logs">("timeline");
 /** 快速切换 run（子 run 链接）时旧加载的响应一律丢弃 */
 let generation = 0;
+
+/** 节点检查器：画布/时间线/日志点击节点时打开 */
+const inspectorNodeId = ref<string | null>(null);
+
+watch(
+  () => editor.selectedNodeId,
+  (id) => {
+    if (id && monitor.nodes.some((n) => n.id === id)) inspectorNodeId.value = id;
+  },
+);
+
+watch(
+  () => monitor.runId,
+  () => {
+    inspectorNodeId.value = null;
+  },
+);
+
+function closeInspector(): void {
+  inspectorNodeId.value = null;
+  editor.selectedNodeId = null;
+}
+
+function onSelectNode(nodeId: string): void {
+  inspectorNodeId.value = nodeId;
+  editor.selectedNodeId = nodeId;
+}
+
+function onOpenChild(childRunId: string): void {
+  void router.push(`/runs/${childRunId}`);
+}
 
 const workflowName = computed(() => {
   const wf = record.value?.workflow_id;
@@ -165,9 +199,37 @@ onUnmounted(() => {
         <div v-else class="canvas-hint">工作流定义不可用，仅展示时间线</div>
       </section>
       <aside class="right">
-        <h3>时间线</h3>
-        <RunMonitor v-if="monitor.runId" child-run-navigate />
-        <p v-else class="run-hint">正在加载…</p>
+        <div class="aside-tabs">
+          <button
+            class="aside-tab"
+            :class="{ active: activeTab === 'timeline' }"
+            @click="activeTab = 'timeline'"
+          >
+            时间线
+          </button>
+          <button
+            class="aside-tab"
+            :class="{ active: activeTab === 'logs' }"
+            @click="activeTab = 'logs'"
+          >
+            日志（{{ monitor.logs.length }}）
+          </button>
+        </div>
+
+        <NodeInspector
+          v-if="inspectorNodeId"
+          class="aside-inspector"
+          :node-id="inspectorNodeId"
+          @close="closeInspector"
+          @open-child="onOpenChild"
+        />
+
+        <template v-if="activeTab === 'timeline'">
+          <RunMonitor v-if="monitor.runId" child-run-navigate />
+          <p v-else class="run-hint">正在加载…</p>
+        </template>
+        <LogConsole v-else class="aside-log-console" @select-node="onSelectNode" />
+
         <div class="events-toggle">
           <a class="link" @click="toggleEvents">{{
             showEvents ? "收起原始事件" : "展开原始事件"
@@ -253,6 +315,45 @@ onUnmounted(() => {
   display: grid;
   grid-template-columns: 1fr 380px;
   min-height: 0;
+}
+
+.right {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 12px 12px;
+}
+
+.aside-tabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--border);
+  padding-top: 8px;
+}
+
+.aside-tab {
+  border: none;
+  background: none;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--text2);
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+}
+
+.aside-tab.active {
+  color: var(--text);
+  border-bottom-color: var(--run);
+}
+
+.aside-inspector {
+  flex-shrink: 0;
+}
+
+.aside-log-console {
+  flex: 1;
+  min-height: 260px;
 }
 
 .events-toggle {

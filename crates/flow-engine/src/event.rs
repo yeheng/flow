@@ -11,6 +11,25 @@ use tokio::sync::{oneshot, watch};
 
 use crate::error::EngineError;
 
+/// 节点日志级别（NodeLog.level）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LogLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+/// 节点日志来源：engine=引擎叙事，stdout/stderr=脚本 console 输出。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LogStream {
+    Engine,
+    Stdout,
+    Stderr,
+}
+
 /// 写入 event.jsonl 的事件。
 ///
 /// 写序协议：执行副作用之前先写 `node_started`，拿到结果后再写终态事件。
@@ -37,6 +56,10 @@ pub enum Event {
         /// 随 node_started 一起落盘，崩溃重放时据此附着原子 run。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         child_run_id: Option<String>,
+        /// 节点输入面快照：模板展开后的 params（可观察性数据，fold 不消费）。
+        /// 旧日志没有该字段，反序列化默认为 None。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<Value>,
     },
     NodeCompleted {
         node_id: String,
@@ -53,6 +76,16 @@ pub enum Event {
     NodeSkipped {
         node_id: String,
         reason: String,
+    },
+    /// 节点运行日志（可观察性）。进程级持久：`append_log` 只写不 fsync，
+    /// 搭同文件后续严格事件 fsync 的便车；run 终态事件写入前强制兜底 sync。
+    /// fold 不消费本事件（日志不是恢复状态）。
+    NodeLog {
+        node_id: String,
+        attempt: u32,
+        level: LogLevel,
+        stream: LogStream,
+        message: String,
     },
     SignalReceived {
         node_id: String,
@@ -75,6 +108,7 @@ impl Event {
             Event::NodeCompleted { .. } => "node_completed",
             Event::NodeFailed { .. } => "node_failed",
             Event::NodeSkipped { .. } => "node_skipped",
+            Event::NodeLog { .. } => "node_log",
             Event::SignalReceived { .. } => "signal_received",
             Event::RunCompleted { .. } => "run_completed",
             Event::RunFailed { .. } => "run_failed",
@@ -88,6 +122,7 @@ impl Event {
             | Event::NodeCompleted { node_id, .. }
             | Event::NodeFailed { node_id, .. }
             | Event::NodeSkipped { node_id, .. }
+            | Event::NodeLog { node_id, .. }
             | Event::SignalReceived { node_id, .. } => Some(node_id),
             _ => None,
         }
@@ -391,7 +426,32 @@ impl EventLog {
     /// 严格组提交（§3.2）：write_all 保单文件顺序，fsync 跨 run 组提交——
     /// 同时在飞的多个 run 的事件共享同一轮刷盘，但本 future 只在**自己的文件**
     /// sync_all 完成后才返回。崩溃语义与「每事件 fsync」完全一致。
+    ///
+    /// 耐久性分层（可观察性设计 §3.3）：终态事件写入前，先把同文件上先于它
+    /// 写入的 node_log 行强制刷盘（搭同一次组提交）——终态返回 ⇒ 终态前的
+    /// 日志已在盘上。这条保证内建在数据结构里，不依赖调用方记得。
     pub async fn append(&mut self, run_id: &str, event: Event) -> Result<Envelope, EngineError> {
+        if event.is_run_terminal() {
+            global_committer().sync(self.handle.clone()).await?;
+        }
+        self.write(run_id, event, true).await
+    }
+
+    /// 追加一条节点日志（进程级持久）：只 write_all，不进组提交队列。
+    /// 单文件字节顺序由 LogHandle 互斥保证；后续同文件任何严格事件的 fsync
+    /// 会把先于它写入的日志行一并刷盘。
+    pub async fn append_log(&mut self, run_id: &str, event: Event) -> Result<Envelope, EngineError> {
+        debug_assert!(matches!(event, Event::NodeLog { .. }), "append_log 只收 NodeLog");
+        self.write(run_id, event, false).await
+    }
+
+    /// 两个 append 的共用尾部：分配 seq、组行、可选组提交。
+    async fn write(
+        &mut self,
+        run_id: &str,
+        event: Event,
+        durable: bool,
+    ) -> Result<Envelope, EngineError> {
         let seq = self.seq + 1;
         let envelope = Envelope {
             seq,
@@ -402,7 +462,9 @@ impl EventLog {
         let mut line = serde_json::to_string(&envelope)?;
         line.push('\n');
         self.handle.write_line(&line).await?;
-        global_committer().sync(self.handle.clone()).await?;
+        if durable {
+            global_committer().sync(self.handle.clone()).await?;
+        }
         self.seq = seq;
         Ok(envelope)
     }
@@ -503,6 +565,7 @@ mod group_commit_tests {
             node_id: format!("n{index}"),
             attempt: 1,
             child_run_id: None,
+            input: None,
         }
     }
 
@@ -584,5 +647,111 @@ mod group_commit_tests {
 
         let events = read_events(&log_path(dir.path(), "r")).await.unwrap();
         assert_eq!(events, vec![first, second]);
+    }
+
+    fn node_log(index: usize) -> Event {
+        Event::NodeLog {
+            node_id: format!("n{index}"),
+            attempt: 1,
+            level: LogLevel::Info,
+            stream: LogStream::Stdout,
+            message: format!("log {index}"),
+        }
+    }
+
+    /// NodeLog 与状态事件同流：seq 统一编号、读回顺序一致、连续性校验通过。
+    #[tokio::test]
+    async fn node_log_lines_share_one_seq_space() {
+        let _guard = test_lock().lock().await;
+        let dir = TempDir::new("flow-node-log");
+        let mut log = EventLog::create(dir.path(), "r").await.unwrap();
+
+        log.append("r", started(1)).await.unwrap();
+        log.append_log("r", node_log(1)).await.unwrap();
+        log.append_log("r", node_log(2)).await.unwrap();
+        log.append("r", started(2)).await.unwrap();
+
+        let events = read_events(&log_path(dir.path(), "r")).await.unwrap();
+        let kinds: Vec<_> = events.iter().map(|e| e.event.kind()).collect();
+        assert_eq!(
+            kinds,
+            vec!["node_started", "node_log", "node_log", "node_started"]
+        );
+        for (position, envelope) in events.iter().enumerate() {
+            assert_eq!(envelope.seq, position as u64 + 1);
+        }
+    }
+
+    /// 耐久性分层：日志 append_log 不付 fsync；终态事件写入前强制兑底 sync
+    /// （先刷日志、再写终态、终态自身组提交）——共 2 次 file_sync。
+    #[tokio::test]
+    async fn terminal_append_syncs_pending_log_lines() {
+        let _guard = test_lock().lock().await;
+        let dir = TempDir::new("flow-terminal-sync");
+        let mut log = EventLog::create(dir.path(), "r").await.unwrap();
+        log.append("r", started(1)).await.unwrap();
+
+        let before = commit_stats_for_test();
+        log.append_log("r", node_log(1)).await.unwrap();
+        log.append_log("r", node_log(2)).await.unwrap();
+        let after_logs = commit_stats_for_test();
+        assert_eq!(
+            after_logs.file_syncs - before.file_syncs,
+            0,
+            "日志行不得触发 fsync"
+        );
+
+        log.append(
+            "r",
+            Event::RunCompleted {
+                output: json!(null),
+            },
+        )
+        .await
+        .unwrap();
+        let after_terminal = commit_stats_for_test();
+        assert_eq!(
+            after_terminal.file_syncs - after_logs.file_syncs,
+            2,
+            "终态前兑底刷盘一次 + 终态自身组提交一次"
+        );
+
+        // 读回：日志行与终态事件全部在盘，seq 连续
+        let events = read_events(&log_path(dir.path(), "r")).await.unwrap();
+        assert_eq!(events.len(), 4);
+        assert!(matches!(events[3].event, Event::RunCompleted { .. }));
+    }
+
+    /// 序列化兼容：NodeLog 往返一致；旧格式 node_started（无 input 字段）
+/// 反序列化默认 None，不炸。
+    #[test]
+    fn node_log_roundtrip_and_old_node_started_compat() {
+        let envelope = Envelope {
+            seq: 7,
+            ts: Utc::now(),
+            run_id: "r".into(),
+            event: node_log(1),
+        };
+        let text = serde_json::to_string(&envelope).unwrap();
+        let back: Envelope = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, envelope);
+        assert!(matches!(
+            back.event,
+            Event::NodeLog {
+                level: LogLevel::Info,
+                stream: LogStream::Stdout,
+                ..
+            }
+        ));
+
+        let old = r#"{"seq":1,"ts":"2024-01-01T00:00:00Z","run_id":"r","type":"node_started","node_id":"n1","attempt":1}"#;
+        let envelope: Envelope = serde_json::from_str(old).unwrap();
+        assert!(matches!(
+            envelope.event,
+            Event::NodeStarted {
+                input: None,
+                ..
+            }
+        ));
     }
 }

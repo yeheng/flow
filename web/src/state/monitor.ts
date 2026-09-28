@@ -1,9 +1,15 @@
 import { computed, reactive } from "vue";
 import * as api from "../api/flow";
 import { client, errText } from "../rpc/client";
-import type { RunEvent, TimelineNode } from "../types";
+import type { LogLine, RunEvent, TimelineNode } from "../types";
 import { editor } from "./editor";
-import { alignProjection, applyEvent, drainBuffer, seqAction } from "./monitor-logic";
+import {
+  alignProjection,
+  applyEvent,
+  drainBuffer,
+  seqAction,
+  type RunProjection,
+} from "./monitor-logic";
 import { toast } from "./toast";
 
 export const monitor = reactive({
@@ -19,6 +25,10 @@ export const monitor = reactive({
   lastSeq: 0,
   /** 定义顺序的节点状态，来自 run.timeline 初始对齐 + run.event 增量 */
   nodes: [] as TimelineNode[],
+  /** 节点日志（node_log 事件流，历史段来自订阅回放） */
+  logs: [] as LogLine[],
+  /** 日志去重水位：已收到的最大 node_log seq */
+  lastLogSeq: 0,
   /** 子 run 钻取栈：栈顶是当前 run 的直接父 run */
   breadcrumb: [] as { runId: string; workflowId: string }[],
   starting: false,
@@ -94,13 +104,15 @@ async function attach(runId: string): Promise<boolean> {
   }
 
   // 局部投影：订阅建立与 timeline 对齐之间到达的事件先入缓冲
-  const proj = {
-    phase: "running" as string | null,
+  const proj: RunProjection = {
+    phase: null as string | null,
     status: null as string | null,
     output: undefined as unknown,
     fatalError: null as string | null,
     lastSeq: 0,
     nodes: [] as TimelineNode[],
+    logs: [],
+    lastLogSeq: 0,
   };
   const buffer: RunEvent[] = [];
   let aligned = false;
@@ -113,15 +125,13 @@ async function attach(runId: string): Promise<boolean> {
     }
     // 换入后又被新的 attach/detach 取代：事件不再属于当前 monitor
     if (monitor.runId !== runId) return;
-    switch (seqAction(monitor.lastSeq, env.seq)) {
-      case "skip":
-        return;
-      case "resync":
-        void resyncFor(runId);
-        return;
-      case "apply":
-        applyEvent(monitor, env);
+    // 日志有自己的水位（历史/实时统一路径），不走状态事件过滤
+    if (env.type === "node_log") {
+      applyEvent(monitor, env);
+      return;
     }
+    if (seqAction(monitor.lastSeq, env.seq) === "skip") return;
+    applyEvent(monitor, env);
   };
 
   const unsub = await api.subscribeRun(runId, onEvent);
@@ -147,23 +157,27 @@ async function attach(runId: string): Promise<boolean> {
   monitor.fatalError = proj.fatalError;
   monitor.lastSeq = proj.lastSeq;
   monitor.nodes = proj.nodes;
+  monitor.logs = proj.logs;
+  monitor.lastLogSeq = proj.lastLogSeq;
   // 钻取子 run 后着色守卫按子 run 自己的工作流对齐；timeline 拉取失败时退化为不着色
   monitor.workflowId = tl?.workflow_id ?? null;
   aligned = true;
-  drainBuffer(buffer, monitor.lastSeq).forEach(onEvent);
+  // 回放段含全部历史日志（订阅从 seq=1 回放），排序后统一补放：
+  // 状态事件由 seqAction 去重，日志由 lastLogSeq 水位去重
+  drainBuffer(buffer).forEach(onEvent);
   return true;
 }
 
-/** seq 缺口（订阅 Lagged 丢事件）或断线重连后整体重拉 timeline 对齐 */
-async function resyncFor(runId: string): Promise<void> {
+/**
+ * 投影重建（原 resyncFor）：断线重连 / 流异常后的唯一恢复路径 = re-attach
+ * 同一个 run。attach 从新订阅的回放整体重建投影（状态 + 日志），令牌守卫
+ * 保证与进行中的其他 attach 竞争安全；面包屑不动。
+ */
+async function reattachFor(runId: string): Promise<void> {
   try {
-    const tl = await api.runTimeline(runId);
-    // 等待期间 monitor 已切走：陈旧响应不得写回
-    if (monitor.runId !== runId) return;
-    alignProjection(monitor, tl);
-    monitor.workflowId = tl.workflow_id;
-  } catch (e) {
-    if (monitor.runId === runId) toast.error(errText(e));
+    await attach(runId);
+  } catch {
+    // 连接尚未就绪等瞬时错误：onReconnect 会再次触发，不弹错
   }
 }
 
@@ -189,6 +203,8 @@ export async function detachRun(): Promise<void> {
   monitor.fatalError = null;
   monitor.lastSeq = 0;
   monitor.nodes = [];
+  monitor.logs = [];
+  monitor.lastLogSeq = 0;
   monitor.breadcrumb = [];
 }
 
@@ -243,7 +259,7 @@ export async function deliverSignal(nodeId: string, payloadText: string): Promis
   }
 }
 
-// 断线重连后客户端已自动重建订阅，这里补齐断线期间错过的事件
+// 断线重连后客户端已自动重建订阅，投影整体重建（状态 + 日志从回放重来）
 client.onReconnect(() => {
-  if (monitor.runId && monitor.phase === "running") void resyncFor(monitor.runId!);
+  if (monitor.runId && monitor.phase === "running") void reattachFor(monitor.runId!);
 });

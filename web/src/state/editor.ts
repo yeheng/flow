@@ -60,6 +60,8 @@ interface BreadcrumbEntry {
 
 interface EditorState {
   nodeTypes: NodeTypeDesc[];
+  /** secrets.list 下发的密钥名称列表（x-secret 字段的选择器选项） */
+  secrets: string[];
   workflows: WorkflowSummary[];
   workflowId: string | null;
   workflowName: string;
@@ -76,6 +78,7 @@ interface EditorState {
 
 export const editor = reactive<EditorState>({
   nodeTypes: [],
+  secrets: [],
   workflows: [],
   workflowId: null,
   workflowName: "",
@@ -166,6 +169,27 @@ async function loadNodeTypes(): Promise<boolean> {
 client.onReconnect(() => {
   if (editor.nodeTypes.length > 0) return;
   void loadNodeTypes();
+});
+
+/** 拉取密钥名称清单（幂等）；secrets 缺失只影响 x-secret 字段的候选列表，
+ * 不阻断编辑器——失败不提示（字段仍可手输名称），重连后静默重试 */
+export async function ensureSecrets(): Promise<boolean> {
+  if (editor.secrets.length > 0) return true;
+  return loadSecrets();
+}
+
+async function loadSecrets(): Promise<boolean> {
+  try {
+    editor.secrets = await api.listSecrets();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+client.onReconnect(() => {
+  if (editor.secrets.length > 0) return;
+  void loadSecrets();
 });
 
 export async function refreshWorkflows(): Promise<void> {

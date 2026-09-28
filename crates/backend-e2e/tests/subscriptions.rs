@@ -221,3 +221,36 @@ async fn wait_node_running(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+e2e_test!(
+    subscription_stream_includes_node_logs_with_contiguous_seq,
+    |ctx: &mut Ctx| Box::pin(async move {
+        let client = ctx.client().await;
+        // 脚本刷多条 console：日志事件与状态事件同流，订阅回放 + 追流不变
+        let code = "for (let i = 0; i < 5; i++) { console.log('line', i); }\nreturn 'done';";
+        let (workflow_id, _) = publish_workflow(&client, "订阅日志", linear_def(code)).await;
+        let run_id = start_run(&client, &workflow_id, json!({})).await;
+
+        let mut sub = subscribe(&client, Some(run_id.clone())).await;
+        let streamed = collect_run_events(&mut sub, &run_id, TIMEOUT).await;
+
+        // seq 严格连续（日志行占用 seq，但不能产生缺口）
+        for (index, event) in streamed.iter().enumerate() {
+            assert_eq!(
+                event["seq"],
+                json!((index + 1) as u64),
+                "订阅流 seq 必须从 1 严格连续：{streamed:?}"
+            );
+        }
+        // 回放段覆盖全部日志行：5 条 console.log 必须全部在流里
+        let logs: Vec<&Value> = streamed
+            .iter()
+            .filter(|e| e["type"] == json!("node_log"))
+            .collect();
+        assert_eq!(logs.len(), 5, "5 条 console.log 必须全部回放：{logs:?}");
+        assert!(logs.windows(2).all(|w| {
+            w[0]["message"].as_str().unwrap() < w[1]["message"].as_str().unwrap()
+        }), "日志按发射顺序回放");
+        assert_eq!(streamed.last().unwrap()["type"], json!("run_completed"));
+    })
+);

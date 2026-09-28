@@ -1,9 +1,12 @@
 use std::time::{Duration, Instant};
 
 use rquickjs::{Array, BigInt, Context, Ctx, Function, Object, Runtime, Value as JsValue};
+use rquickjs::function::Func;
 use serde_json::Value;
 
 use crate::error::EngineError;
+use crate::event::{LogStream, LogLevel};
+use crate::nodelog::NodeLogger;
 
 /// JS → Rust 递归转换的最大深度：挡手工构造的深链/环，与 JSON.stringify 的
 /// 「环即抛错」同类——报错退出，不爆 Rust 栈。
@@ -181,12 +184,30 @@ impl<'js> JsReader<'js> {
 /// 不跨求值复用 Runtime 是刻意的：quickjs 的原子表只增不减，而复用后输入
 /// 数据里的任意 JSON 键都会沉淀成原子——长生命周期进程下这是无界增长；
 /// 把整个 Runtime 从「盘古开天」重新实例化，换回来的正是这张表的清零。
+/// console.log → LogLevel 映射（与 Node 约定一致：error/warn 走 stderr）。
+fn console_level(name: &str) -> LogLevel {
+    match name {
+        "debug" => LogLevel::Debug,
+        "warn" => LogLevel::Warn,
+        "error" => LogLevel::Error,
+        _ => LogLevel::Info,
+    }
+}
+
+fn console_stream(name: &str) -> LogStream {
+    match name {
+        "warn" | "error" => LogStream::Stderr,
+        _ => LogStream::Stdout,
+    }
+}
+
 fn run_js(
     body: &str,
     input: &Value,
     nodes: &Value,
     tpl: &Value,
     timeout: Duration,
+    logger: &NodeLogger,
 ) -> Result<Value, EngineError> {
     let runtime = Runtime::new().map_err(|e| EngineError::Expr(e.to_string()))?;
     let deadline = Instant::now() + timeout;
@@ -217,6 +238,39 @@ fn run_js(
         globals.set("nodes", json_to_js(&ctx, nodes, &define)?)?;
         globals.set("tpl", json_to_js(&ctx, tpl, &define)?)?;
 
+        // console 桥接：宿主函数收（级别，已格式化消息），格式化在 JS 侧完成
+        //（多参数拼串、对象 JSON.stringify、循环引用回退 String()）。
+        // 所有人都有 console：条件/模板求值传 disabled logger，引用 console
+        // 不再 ReferenceError，只是没人听。
+        let emit_logger = logger.clone();
+        globals.set(
+            "__flow_console_emit",
+            Func::from(move |level: String, message: String| {
+                emit_logger.log(console_level(&level), console_stream(&level), message);
+            }),
+        )?;
+        let console: JsValue = ctx.eval(
+            r#"(function (emit) {
+  function fmt() {
+    var out = [];
+    for (var i = 0; i < arguments.length; i++) {
+      var v = arguments[i];
+      if (typeof v === 'string') { out.push(v); continue; }
+      try { out.push(JSON.stringify(v)); } catch (e) { out.push(String(v)); }
+    }
+    return out.join(' ');
+  }
+  return {
+    log: function () { emit('info', fmt.apply(null, arguments)); },
+    info: function () { emit('info', fmt.apply(null, arguments)); },
+    debug: function () { emit('debug', fmt.apply(null, arguments)); },
+    warn: function () { emit('warn', fmt.apply(null, arguments)); },
+    error: function () { emit('error', fmt.apply(null, arguments)); }
+  };
+})(__flow_console_emit)"#,
+        )?;
+        globals.set("console", console)?;
+
         let result: JsValue = ctx.eval(program)?;
         let outcome = result.get::<Object>()?;
         let reader = JsReader::new(&ctx)?;
@@ -234,16 +288,18 @@ fn run_js(
 }
 
 /// 脚本节点：body 是一段带 `return` 的函数体，可用 `input` 与 `nodes`。
+/// `logger` 承接脚本内的 console.* 输出（level 透传，log/info→stdout，warn/error→stderr）。
 pub fn eval_body(
     body: &str,
     input: &Value,
     nodes: &Value,
     timeout: Duration,
+    logger: &NodeLogger,
 ) -> Result<Value, EngineError> {
-    run_js(body, input, nodes, &Value::Null, timeout)
+    run_js(body, input, nodes, &Value::Null, timeout, logger)
 }
 
-/// 条件节点：求值单个表达式。
+/// 条件节点：求值单个表达式。console 可用（disabled logger，输出丢弃）。
 pub fn eval_expr(
     expr: &str,
     input: &Value,
@@ -251,7 +307,14 @@ pub fn eval_expr(
     timeout: Duration,
 ) -> Result<Value, EngineError> {
     let body = format!("    return ({expr});");
-    run_js(&body, input, nodes, &Value::Null, timeout)
+    run_js(
+        &body,
+        input,
+        nodes,
+        &Value::Null,
+        timeout,
+        &NodeLogger::disabled(),
+    )
 }
 
 /// 展开字符串中的 `${expr}` 模板。所有节点 params 的统一前置展开
@@ -300,7 +363,14 @@ pub fn expand_templates(
       return v;
     }
     return __expand(tpl, input, nodes);"#;
-    run_js(body, input, nodes, tpl, timeout)
+    run_js(
+        body,
+        input,
+        nodes,
+        tpl,
+        timeout,
+        &NodeLogger::disabled(),
+    )
 }
 
 #[cfg(test)]

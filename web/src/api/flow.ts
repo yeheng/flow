@@ -19,6 +19,12 @@ export async function listNodeTypes(): Promise<NodeTypeDesc[]> {
   return r.node_types;
 }
 
+/** secrets.list 只返回密钥名称列表（值不出服务端） */
+export async function listSecrets(): Promise<string[]> {
+  const r = await client.call<{ secrets: string[] }>("secrets.list", {});
+  return r.secrets;
+}
+
 export async function listWorkflows(): Promise<WorkflowSummary[]> {
   const r = await client.call<{ workflows: WorkflowSummary[] }>("workflow.list", {});
   return r.workflows;
