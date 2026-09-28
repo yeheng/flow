@@ -248,7 +248,7 @@ impl GroupCommitter {
                     return;
                 }
                 state.stats.batches += 1;
-                state.queue.drain(..).collect()
+                std::mem::take(&mut state.queue)
             };
             let mut batch = InflightBatch {
                 committer: self,
