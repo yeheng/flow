@@ -1,10 +1,13 @@
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
+use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::{oneshot, watch};
 
 use crate::error::EngineError;
 
@@ -109,9 +112,227 @@ pub struct Envelope {
     pub event: Event,
 }
 
-/// 追加写的 run 事件日志，每事件 fsync。
+/// run 日志文件的共享句柄：写行（互斥，保单文件字节顺序）与 fsync（组提交）。
+pub struct LogHandle {
+    file: tokio::sync::Mutex<tokio::fs::File>,
+}
+
+impl LogHandle {
+    fn new(file: tokio::fs::File) -> LogHandle {
+        LogHandle {
+            file: tokio::sync::Mutex::new(file),
+        }
+    }
+
+    async fn write_line(&self, line: &str) -> Result<(), EngineError> {
+        let mut file = self.file.lock().await;
+        file.write_all(line.as_bytes()).await?;
+        Ok(())
+    }
+
+    async fn sync_all(&self) -> Result<(), EngineError> {
+        let file = self.file.lock().await;
+        file.sync_all().await?;
+        Ok(())
+    }
+}
+
+/// 组提交统计（测试断言组批真的发生了用）。单调累计，测试取差值。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CommitStats {
+    /// 跑过的批数（一批 = leader 一次排空队列）。
+    pub batches: u64,
+    /// 实际 fsync 的文件次数。
+    pub file_syncs: u64,
+}
+
+struct PendingSync {
+    handle: Arc<LogHandle>,
+    reply: oneshot::Sender<Result<(), String>>,
+}
+
+/// 严格组提交器（DESIGN §3.2）：`append` 返回即 durable，但 fsync 跨 run
+/// 组提交。
+///
+/// 模型：写行由调用方自己完成（保单文件 seq 顺序），fsync 进组；leader
+/// 一次排空队列里全部待 sync 的请求合成一批，批内每个文件只 fsync 一次且
+/// 并发发出——同批多文件的写回合并在同一轮设备刷盘里，首个 fsync 付刷盘
+/// 代价，其余近似免费。
+///
+/// 攒批是 drain 式的：leader 每跑完一批就取走排队中的下一批，无定时器——
+/// 低负载批=1（零额外延迟），高负载批≈同时在飞的 append 数。
+///
+/// 没有后台任务：泵跑在抢到领导权的调用方任务里，跨 tokio runtime 安全
+/// （每个 #[tokio::test] 一个 runtime）。leader 被取消时守卫把未完成的请求
+/// 退回队列并交还领导权，等待者经 watch 领导权世代号接手，不会被锁死。
+pub struct GroupCommitter {
+    state: Mutex<CommitState>,
+    /// 领导权易手世代号：watch 无丢失唤醒，取消路径也不丢接棒通知。
+    lead_gen: watch::Sender<u64>,
+}
+
+struct CommitState {
+    queue: Vec<PendingSync>,
+    pumping: bool,
+    stats: CommitStats,
+}
+
+impl Default for GroupCommitter {
+    fn default() -> Self {
+        let (lead_gen, _) = watch::channel(0u64);
+        GroupCommitter {
+            state: Mutex::new(CommitState {
+                queue: Vec::new(),
+                pumping: false,
+                stats: CommitStats::default(),
+            }),
+            lead_gen,
+        }
+    }
+}
+
+impl GroupCommitter {
+    pub fn new() -> Arc<GroupCommitter> {
+        Arc::new(GroupCommitter::default())
+    }
+
+    pub fn stats(&self) -> CommitStats {
+        self.state.lock().unwrap().stats
+    }
+
+    /// 把 `handle` 的 fsync 排进组；返回时该文件已 durable（严格语义）。
+    pub async fn sync(&self, handle: Arc<LogHandle>) -> Result<(), EngineError> {
+        let (reply, mut done) = oneshot::channel();
+        self.state.lock().unwrap().queue.push(PendingSync {
+            handle,
+            reply,
+        });
+        let mut lead_gen = self.lead_gen.subscribe();
+        loop {
+            // 队列里有活且没人跑批：自己当 leader 排空它
+            if let Some(_leader) = self.try_lead() {
+                self.pump().await;
+            }
+            tokio::select! {
+                biased;
+                result = &mut done => {
+                    return result
+                        .map_err(|_| EngineError::Io(std::io::Error::other("组提交泵意外退出")))
+                        .and_then(|r| {
+                            r.map_err(|message| EngineError::Io(std::io::Error::other(message)))
+                        });
+                }
+                // 领导权易手/有请求被退回：重新看看要不要自己接手
+                _ = lead_gen.changed() => {}
+            }
+        }
+    }
+
+    /// 抢领导权。同一时刻至多一个 leader 在跑泵。
+    fn try_lead(&self) -> Option<LeaderGuard<'_>> {
+        let mut state = self.state.lock().unwrap();
+        if state.pumping || state.queue.is_empty() {
+            return None;
+        }
+        state.pumping = true;
+        Some(LeaderGuard { committer: self })
+    }
+
+    /// 跑批：排空 → 每文件一次 fsync（并发）→ 回复；队列空才放手。
+    async fn pump(&self) {
+        loop {
+            let pendings: Vec<PendingSync> = {
+                let mut state = self.state.lock().unwrap();
+                if state.queue.is_empty() {
+                    return;
+                }
+                state.stats.batches += 1;
+                state.queue.drain(..).collect()
+            };
+            let mut batch = InflightBatch {
+                committer: self,
+                pendings,
+            };
+
+            // 批内按文件去重：一个文件一批只 fsync 一次
+            let mut files: Vec<Arc<LogHandle>> = Vec::new();
+            for pending in &batch.pendings {
+                if !files
+                    .iter()
+                    .any(|f| Arc::ptr_eq(f, &pending.handle))
+                {
+                    files.push(pending.handle.clone());
+                }
+            }
+            self.state.lock().unwrap().stats.file_syncs += files.len() as u64;
+
+            // 同批多文件的 fsync 并发发出：设备把它们合并进同一轮刷盘，
+            // 严格语义不打折——每个调用方等的是自己文件的 sync_all
+            let results: Vec<Result<(), String>> =
+                join_all(files.iter().map(|f| f.sync_all()))
+                    .await
+                    .into_iter()
+                    .map(|r| r.map_err(|e| e.to_string()))
+                    .collect();
+
+            for pending in batch.pendings.drain(..) {
+                let index = files
+                    .iter()
+                    .position(|f| Arc::ptr_eq(f, &pending.handle))
+                    .expect("批内文件表必含该请求");
+                let _ = pending.reply.send(results[index].clone());
+            }
+        }
+    }
+}
+
+/// leader 守卫：正常走完/被取消都会交还领导权并唤醒接棒者。
+struct LeaderGuard<'a> {
+    committer: &'a GroupCommitter,
+}
+
+impl Drop for LeaderGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.committer.state.lock().unwrap();
+        state.pumping = false;
+        drop(state);
+        self.committer.lead_gen.send_modify(|gen| *gen += 1);
+    }
+}
+
+/// 在飞批次守卫：leader 被取消时把没回复的请求退回队列，不丢任何 append。
+struct InflightBatch<'a> {
+    committer: &'a GroupCommitter,
+    pendings: Vec<PendingSync>,
+}
+
+impl Drop for InflightBatch<'_> {
+    fn drop(&mut self) {
+        if !self.pendings.is_empty() {
+            self.committer
+                .state
+                .lock()
+                .unwrap()
+                .queue
+                .append(&mut self.pendings);
+        }
+    }
+}
+
+/// 进程级组提交器：没有后台任务，跨 tokio runtime 安全。
+fn global_committer() -> &'static GroupCommitter {
+    static GLOBAL: OnceLock<GroupCommitter> = OnceLock::new();
+    GLOBAL.get_or_init(GroupCommitter::default)
+}
+
+/// 进程级组提交统计（测试用：断言组批真的发生）。单调累计，取差值。
+pub fn commit_stats() -> CommitStats {
+    global_committer().stats()
+}
+
+/// 追加写的 run 事件日志。`append` 返回即 durable（严格组提交，§3.2）。
 pub struct EventLog {
-    file: tokio::fs::File,
+    handle: Arc<LogHandle>,
     seq: u64,
 }
 
@@ -134,7 +355,10 @@ impl EventLog {
                 std::io::ErrorKind::AlreadyExists => EngineError::RunExists(run_id.to_string()),
                 _ => EngineError::Io(e),
             })?;
-        Ok(EventLog { file, seq: 0 })
+        Ok(EventLog {
+            handle: Arc::new(LogHandle::new(file)),
+            seq: 0,
+        })
     }
 
     /// 打开已有日志续写：先修复残缺尾行，再从最后一个有效 seq 接着写。
@@ -154,10 +378,17 @@ impl EventLog {
         }
         let seq = events.last().map(|e| e.seq).unwrap_or(0);
         let file = OpenOptions::new().append(true).open(&path).await?;
-        Ok(EventLog { file, seq })
+        Ok(EventLog {
+            handle: Arc::new(LogHandle::new(file)),
+            seq,
+        })
     }
 
-    /// 追加一条事件并 fsync。这是崩溃安全的写入边界。
+    /// 追加一条事件，返回时已 durable。
+    ///
+    /// 严格组提交（§3.2）：write_all 保单文件顺序，fsync 跨 run 组提交——
+    /// 同时在飞的多个 run 的事件共享同一轮刷盘，但本 future 只在**自己的文件**
+    /// sync_all 完成后才返回。崩溃语义与「每事件 fsync」完全一致。
     pub async fn append(&mut self, run_id: &str, event: Event) -> Result<Envelope, EngineError> {
         let seq = self.seq + 1;
         let envelope = Envelope {
@@ -168,8 +399,8 @@ impl EventLog {
         };
         let mut line = serde_json::to_string(&envelope)?;
         line.push('\n');
-        self.file.write_all(line.as_bytes()).await?;
-        self.file.sync_all().await?;
+        self.handle.write_line(&line).await?;
+        global_committer().sync(self.handle.clone()).await?;
         self.seq = seq;
         Ok(envelope)
     }

@@ -2,7 +2,7 @@ use std::path::Path;
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, SqlitePool};
 use thiserror::Error;
 use uuid::Uuid;
@@ -77,6 +77,11 @@ impl Store {
             .filename(path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
+            // WAL 组提交（SQLite 官方语义）：COMMIT 不 fsync、checkpoint 才 fsync。
+            // 进程崩溃（SIGKILL，本仓库的崩溃模型）零丢失——页缓存归内核管；
+            // 断电/内核崩溃可能丢最后几笔事务，但库永不损坏（WAL 保证）。
+            // 事件日志才是 run 状态的唯一权威，元数据只是查询索引（DESIGN §3）。
+            .synchronous(SqliteSynchronous::Normal)
             // 写锁等待上限：run.start 的 insert_run 走 BEGIN IMMEDIATE，高并发
             // 下写锁排队会超过 sqlx 默认的 5s，表现为 run.start 报
             // `database is locked`（SQLITE_BUSY）。显式放大到 30s 的取值逻辑是

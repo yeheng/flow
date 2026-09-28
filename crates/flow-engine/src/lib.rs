@@ -17,7 +17,8 @@ pub use engine::{
 };
 pub use error::EngineError;
 pub use event::{
-    read_events, validate_sequence, validate_sequence_contiguous, Envelope, Event, EventLog,
+    commit_stats, read_events, validate_sequence, validate_sequence_contiguous, CommitStats,
+    Envelope, Event, EventLog,
 };
 pub use fold::{NodeRecord, NodeState, RunPhase, RunState};
 pub use model::{Definition, Edge, Node, NodeType, Position, RetryPolicy, HTTP_METHODS};
