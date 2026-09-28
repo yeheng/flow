@@ -12,7 +12,7 @@ mod common;
 
 use std::time::Duration;
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use common::*;
 
 /// 往 runs 表直插一行（本测试只关心扫描候选，不需要真执行）。

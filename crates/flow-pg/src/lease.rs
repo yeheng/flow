@@ -208,6 +208,9 @@ pub async fn release(
 /// 和 seq=1 的 RunStarted。提交后 run.status=running、lease 为空、last_seq=1，
 /// 表示已入队——running 不保证已获得执行容量。
 /// source/source_detail 是触发来源归因（flow-dto DbRunSource 词汇表）。
+// 参数就是 runs 表的一行（自增主键之外的全部列），拆 struct 只是把列清单
+// 搬家；调用点多在测试里逐行铺开，保持位置参数可读性更好。
+#[allow(clippy::too_many_arguments)]
 pub async fn create_run(
     pool: &PgPool,
     run_id: &str,

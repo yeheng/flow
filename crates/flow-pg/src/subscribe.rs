@@ -110,7 +110,8 @@ async fn poll_loop(
         let until_full = cfg.subscribe_poll.saturating_sub(last_full_scan.elapsed());
         let wait = tokio::time::sleep(until_full);
         tokio::pin!(wait);
-        let mut full_scan_due = false;
+        // 只在兜底扫描到期时置位：唯一 break 出口就是到期分支，先赋值再跳出
+        let full_scan_due;
         loop {
             tokio::select! {
                 _ = stop.cancelled() => return,
