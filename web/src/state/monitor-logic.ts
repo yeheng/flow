@@ -19,6 +19,13 @@ export interface RunProjection {
   nodes: TimelineNode[];
   /** 节点日志（按 seq 升序追加；环形上限见 MAX_LOG_LINES） */
   logs: LogLine[];
+  /**
+   * `logs` 按 node_id 的索引：`Map` 的对象版（避免 JSON 序列化开销）。
+   * NodeInspector 与 LogConsole 的节点过滤此前每次都全量扫 `logs`
+   * （8000 行 × 每次追加一行 = O(n²)），现在直读桶。
+   * 与 `logs` 由 applyLog 一处同步维护，别处不要单独改。
+   */
+  logsByNode: Record<string, LogLine[]>;
   /** 日志去重水位：已收到的最大 node_log seq */
   lastLogSeq: number;
 }
@@ -36,6 +43,9 @@ export function alignProjection(p: RunProjection, tl: Timeline): void {
   p.fatalError = tl.fatal_error;
   p.lastSeq = tl.last_seq;
   p.logs = [];
+  // 索引必须与 logs 同步清空：留着一个装着上一条 run 的桶，
+  // NodeInspector 直读它就会显示别的 run 的日志
+  p.logsByNode = {};
   p.lastLogSeq = 0;
 }
 
@@ -86,7 +96,7 @@ export function applyLog(p: RunProjection, env: RunEvent): void {
   const seq = env.seq;
   if (seq <= p.lastLogSeq) return;
   p.lastLogSeq = seq;
-  p.logs.push({
+  const line: LogLine = {
     seq,
     ts: env.ts,
     node_id: env.node_id ?? "",
@@ -94,9 +104,19 @@ export function applyLog(p: RunProjection, env: RunEvent): void {
     level: env.level ?? "info",
     stream: env.stream ?? "engine",
     message: env.message ?? "",
-  });
+  };
+  p.logs.push(line);
+  (p.logsByNode[line.node_id] ??= []).push(line);
   if (p.logs.length > MAX_LOG_LINES) {
-    p.logs.splice(0, p.logs.length - KEEP_LOG_LINES);
+    // 环形裁剪要同时裁索引，否则桶里会攒下已被丢弃的行
+    const dropped = p.logs.splice(0, p.logs.length - KEEP_LOG_LINES);
+    for (const old of dropped) {
+      const bucket = p.logsByNode[old.node_id];
+      if (!bucket) continue;
+      const at = bucket.indexOf(old);
+      if (at >= 0) bucket.splice(at, 1);
+      if (bucket.length === 0) delete p.logsByNode[old.node_id];
+    }
   }
 }
 

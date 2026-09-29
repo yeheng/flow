@@ -32,6 +32,8 @@ export const monitor = reactive({
   nodes: [] as TimelineNode[],
   /** 节点日志（node_log 事件流，历史段来自订阅回放） */
   logs: [] as LogLine[],
+  /** `logs` 按 node_id 的索引（与 logs 同步维护，见 monitor-logic.applyLog） */
+  logsByNode: {} as Record<string, LogLine[]>,
   /** 日志去重水位：已收到的最大 node_log seq */
   lastLogSeq: 0,
   /** 子 run 钻取栈：栈顶是当前 run 的直接父 run */
@@ -129,6 +131,7 @@ async function attach(runId: string): Promise<boolean> {
   // 可用取消按钮），canCancelRun / needReattach 也不依赖它是否为 running。
   const proj: RunProjection = {
     status: null as string | null,
+    logsByNode: {} as Record<string, LogLine[]>,
     output: undefined as unknown,
     fatalError: null as string | null,
     lastSeq: 0,
@@ -179,6 +182,7 @@ async function attach(runId: string): Promise<boolean> {
   monitor.lastSeq = proj.lastSeq;
   monitor.nodes = proj.nodes;
   monitor.logs = proj.logs;
+  monitor.logsByNode = proj.logsByNode;
   monitor.lastLogSeq = proj.lastLogSeq;
   // 钻取子 run 后着色守卫按子 run 自己的工作流对齐；timeline 拉取失败时退化为不着色
   monitor.workflowId = tl?.workflow_id ?? null;
@@ -224,6 +228,7 @@ export async function detachRun(): Promise<void> {
   monitor.lastSeq = 0;
   monitor.nodes = [];
   monitor.logs = [];
+  monitor.logsByNode = {};
   monitor.lastLogSeq = 0;
   monitor.breadcrumb = [];
 }

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from "vue";
+import { computed, nextTick, onUnmounted, ref, watch } from "vue";
 import { monitor } from "../state/monitor";
 import { logWindow } from "../state/monitor-logic";
 import type { LogLine, LogLevel } from "../types";
@@ -31,12 +31,19 @@ const nodeOptions = computed(() => {
   return [...ids];
 });
 
+/** 节流计数：每次 rAF 合并后 +1，强制 filtered 重新求值 */
+const filteredRevision = ref(0);
+
+// 节点过滤走索引；级别/关键词过滤没有索引可走（关键词本质上要全量匹配），
+// 但 appendLog 走 rAF 节流（见下），刷屏节点下不再每行都全量重算
 const filtered = computed<LogLine[]>(() => {
+  // 依赖节流计数：rAF 合并后由它触发重算
+  void filteredRevision.value;
   const min = showDebug.value ? LEVEL_ORDER.debug : LEVEL_ORDER.info;
   const kw = searchText.value.trim().toLowerCase();
-  return monitor.logs.filter((l) => {
+  const source = nodeFilter.value ? (monitor.logsByNode[nodeFilter.value] ?? []) : monitor.logs;
+  return source.filter((l) => {
     if (LEVEL_ORDER[l.level] < min) return false;
-    if (nodeFilter.value && l.node_id !== nodeFilter.value) return false;
     if (kw && !l.message.toLowerCase().includes(kw)) return false;
     return true;
   });
@@ -45,6 +52,41 @@ const filtered = computed<LogLine[]>(() => {
 // 过滤条件或 run 变化后窗口起点重置：新过滤集的"最近 N 行"语义才成立
 watch([showDebug, nodeFilter, searchText, () => monitor.runId], () => {
   extraLines.value = 0;
+  scheduleFilterRecalc();
+});
+
+/**
+ * 刷屏时的节流：`filtered` 依赖整个 `monitor.logs`（reactive），每追加一行
+ * 就重算一次全量过滤 + 分配新数组——8000 行 × 每行一次 = O(n²)。
+ * 过滤条件**没有**变化时结果其实不变，所以攒到下一帧重算一次即可，
+ * 视觉上无差别。
+ */
+let filterRaf: number | null = null;
+let filterDirty = false;
+
+/** 请求过滤重算（同一帧内多次调用只算一次） */
+function scheduleFilterRecalc(): void {
+  filterDirty = true;
+  if (filterRaf !== null) return;
+  filterRaf = requestAnimationFrame(() => {
+    filterRaf = null;
+    if (filterDirty) {
+      filterDirty = false;
+      filteredRevision.value += 1;
+    }
+  });
+}
+
+// 只在日志**增长**时节流重算：环形裁剪会让长度减少，那同样要反映到过滤结果
+watch(
+  () => monitor.logs.length,
+  () => {
+    scheduleFilterRecalc();
+  },
+);
+
+onUnmounted(() => {
+  if (filterRaf !== null) cancelAnimationFrame(filterRaf);
 });
 
 /** 起始窗口：DOM 一次只渲染这么多行（状态存全量，预算封顶） */

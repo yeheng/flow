@@ -18,6 +18,7 @@ function proj(nodes: TimelineNode[] = []): RunProjection {
     lastSeq: 0,
     nodes,
     logs: [],
+    logsByNode: {},
     lastLogSeq: 0,
   };
 }
@@ -223,6 +224,34 @@ describe("node_log：日志与状态同流但水位独立", () => {
     expect(p.logs.length).toBeLessThanOrEqual(MAX_LOG_LINES);
     expect(p.logs[p.logs.length - 1].message).toBe(`m${MAX_LOG_LINES + 2000}`);
     expect(p.logs[0].message).not.toBe("m1");
+  });
+
+  it("按 node_id 的索引与 logs 始终一致（含环形裁剪与 re-align）", () => {
+    const p = proj();
+    const base = p.lastLogSeq;
+    // 两个节点交替产出，撑过环形上限以触发裁剪
+    for (let i = 1; i <= MAX_LOG_LINES + 2000; i++) {
+      applyEvent(
+        p,
+        ev(base + i, "node_log", {
+          node_id: i % 2 === 0 ? "a" : "b",
+          message: `m${i}`,
+        }),
+      );
+    }
+
+    // 索引桶的数量与内容必须与 logs 的过滤结果逐条相等
+    const flat = Object.values(p.logsByNode).flat();
+    expect(flat.length).toBe(p.logs.length);
+    expect(new Set(flat).size).toBe(flat.length); // 同一行不得进两个桶
+    for (const id of ["a", "b"]) {
+      expect(p.logsByNode[id]).toEqual(p.logs.filter((l) => l.node_id === id));
+    }
+
+    // 重新对齐（切 run）后索引必须清空，不能留着上一条 run 的日志
+    alignProjection(p, timeline(1, []));
+    expect(p.logsByNode).toEqual({});
+    expect(Object.values(p.logsByNode).flat()).toHaveLength(0);
   });
 
   it("历史日志（seq ≤ lastSeq）经补放路径进入日志列表", () => {

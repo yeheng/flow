@@ -16,7 +16,8 @@ const node = computed<TimelineNode | null>(
   () => monitor.nodes.find((n) => n.id === props.nodeId) ?? null,
 );
 
-const nodeLogs = computed(() => monitor.logs.filter((l) => l.node_id === props.nodeId));
+// 直读按 node_id 的索引（store 侧与 logs 同步维护），不再每次全量扫 8000 行
+const nodeLogs = computed(() => monitor.logsByNode[props.nodeId] ?? []);
 
 /** 按 attempt 分组：重试的日志不串 */
 const logsByAttempt = computed<Array<[number, LogLine[]]>>(() => {
