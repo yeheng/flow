@@ -27,6 +27,10 @@ use crate::sink::PgRunSink;
 
 const BROADCAST_CAPACITY: usize = 1024;
 
+/// 单次 NOTIFY 唤醒里最多合并多少个 run id。封顶的理由见 `poll_loop`：
+/// 不封顶则持续事件流下排空永不结束，兜底全量扫描被饿死。
+const NOTIFY_DRAIN_MAX: usize = 128;
+
 /// 已终结 run 的回看窗口：至少覆盖数个兜底轮询周期，
 /// 保证「两次扫描之间走完一生」的短 run 的终态事件被游标追平。
 fn recent_window(poll: Duration) -> Duration {
@@ -42,7 +46,15 @@ struct Cursor {
 
 /// 共享订阅 hub：一个轮询任务 + 一个进程内 broadcast 扇出。
 pub struct EventHub {
-    tx: broadcast::Sender<Envelope>,
+    /// `parking_lot::Mutex` 而非 tokio 的：`subscribe()` 是同步函数，全仓库
+    /// 调用点（`PgEngine::subscribe_events`、`PgChildLauncher` 的等待循环）
+    /// 都在同步上下文里，不值得为它把签名改成 async。
+    /// 槽内是 `Option` 而非直接持有 sender：只有 `stop()` 把它 take 掉，
+    /// broadcast 才会因为「最后一个 sender 被销毁」而关闭。否则 `stop()` 之后
+    /// 订阅者永远收不到 `RecvError::Closed`——挂在 `run_tail` /
+    /// `broadcast_tail` 的 select 里不退出，每次订阅在停机时留一个永不
+    /// 退出的 task。
+    tx: parking_lot::Mutex<Option<broadcast::Sender<Envelope>>>,
     stop: CancellationToken,
     task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
 }
@@ -52,29 +64,42 @@ impl EventHub {
     pub fn start(pool: sqlx::PgPool, cfg: PgConfig) -> Arc<EventHub> {
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let stop = CancellationToken::new();
-        let hub = Arc::new(EventHub {
-            tx: tx.clone(),
-            stop: stop.clone(),
-            task: tokio::sync::Mutex::new(None),
-        });
-        let handle = tokio::spawn(poll_loop(pool, cfg, tx, stop));
-        if let Ok(mut slot) = hub.task.try_lock() {
-            *slot = Some(handle);
-        }
-        hub
+        // 任务句柄**构造时**就放进槽位。此前用 `try_lock` 填，锁被争用时会
+        // 静默丢弃 JoinHandle（= detach 该任务），`stop()` 于是报告「已停止」
+        // 而 poll_loop 还在跑，且再也无法取消。
+        let task = tokio::sync::Mutex::new(Some(tokio::spawn(poll_loop(
+            pool,
+            cfg,
+            tx.clone(),
+            stop.clone(),
+        ))));
+        Arc::new(EventHub {
+            tx: parking_lot::Mutex::new(Some(tx)),
+            stop,
+            task,
+        })
     }
 
     /// 订阅增量事件流（实时尾部；历史事件用 run.events 补齐）。
+    ///
+    /// `stop()` 之后拿不到新的接收端（sender 已被 take 掉）；已经存在的接收端
+    /// 会立即收到 `Closed`。
     pub fn subscribe(&self) -> broadcast::Receiver<Envelope> {
-        self.tx.subscribe()
+        self.tx
+            .lock()
+            .as_ref()
+            .expect("EventHub 已 stop：不应再建立新订阅")
+            .subscribe()
     }
 
-    /// 停止轮询并等待任务退出。
+    /// 停止轮询并等待任务退出，随后关闭 broadcast（唤醒所有挂起的订阅者）。
     pub async fn stop(&self) {
         self.stop.cancel();
         if let Some(task) = self.task.lock().await.take() {
             let _ = task.await;
         }
+        // 轮询任务已退出，这里销毁最后一个 sender：订阅流自然结束
+        self.tx.lock().take();
     }
 }
 
@@ -124,12 +149,22 @@ async fn poll_loop(
                     match note {
                         Some(run_id) => {
                             // 定向抓取：只读 NOTIFY 点名的 run，顺带排空通道积压
-                            // （突发事件同一 run 的多个通知合并成一次读取）
+                            // （突发事件同一 run 的多个通知合并成一次读取）。
+                            //
+                            // 排空**必须封顶**：不封顶时持续事件流下通道永不空，
+                            // `scan_targeted` 不返回 → 兜底全量扫描的到期检查永远
+                            // 到不了 → 游标得不到回收（`cursors.retain`）而无界增长，
+                            // 短生命周期 run 也拿不到终态追平。
                             let mut ids = HashSet::new();
                             ids.insert(run_id);
                             if let Some(rx) = notify.as_mut() {
-                                while let Ok(more) = rx.try_recv() {
-                                    ids.insert(more);
+                                while ids.len() < NOTIFY_DRAIN_MAX {
+                                    match rx.try_recv() {
+                                        Ok(more) => {
+                                            ids.insert(more);
+                                        }
+                                        Err(_) => break,
+                                    }
                                 }
                             }
                             scan_targeted(&store, &tx, &mut cursors, &ids).await;
@@ -170,12 +205,14 @@ async fn scan_targeted(
             }
         };
         for envelope in events {
-            // 没有本地订阅者时 send 返回 Err，游标照常推进
-            let _ = tx.send(envelope.clone());
+            // 先取走后面还要用的两个字段，再把 envelope 整个 move 进 send
+            // （否则每事件深拷贝一次 payload，send 完就丢）
             cursor.last_seq = envelope.seq;
             if envelope.event.is_run_terminal() {
                 cursor.done = true;
             }
+            // 没有本地订阅者时 send 返回 Err，游标照常推进
+            let _ = tx.send(envelope);
         }
     }
 }
@@ -216,12 +253,12 @@ async fn scan_candidates(
             };
         let drained = events.is_empty();
         for envelope in events {
-            // 没有本地订阅者时 send 返回 Err，游标照常推进
-            let _ = tx.send(envelope.clone());
             cursor.last_seq = envelope.seq;
             if envelope.event.is_run_terminal() {
                 cursor.done = true;
             }
+            // 没有本地订阅者时 send 返回 Err，游标照常推进
+            let _ = tx.send(envelope);
         }
         // 状态投影已终结且日志追平：不必再查
         if !cursor.done && drained && watched.get(&id) == Some(&true) {

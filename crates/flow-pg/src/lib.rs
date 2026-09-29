@@ -52,17 +52,42 @@ pub async fn event_notifications(
     tokio::spawn(async move {
         let mut backoff = Duration::from_millis(200);
         loop {
-            // 通知投递直到连接出错（订阅方已 drop 则退出）
-            while let Ok(note) = listener.recv().await {
-                if tx.send(note.payload().to_string()).await.is_err() {
-                    return;
+            // 通知投递直到连接出错或**接收端被丢弃**。
+            // 后者不能靠 `tx.send()` 的 is_err 兜住：连接健康时任务阻塞在
+            // `recv()` 上，一条通知都不来就永远等不到 send——而 `PgListener`
+            // 终身持有池里一个连接，于是每次调用本函数漏一个 LISTEN 后端。
+            // `tx.closed()` 在接收端 drop 时立即就绪，是唯一可靠的唤醒源。
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = tx.closed() => return,
+                    received = listener.recv() => {
+                        match received {
+                            Ok(note) => {
+                                if tx.send(note.payload().to_string()).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Err(_) => break, // 连接出错，去重连
+                        }
+                    }
                 }
+            }
+            // 接收端已走人（EventHub::stop → poll_loop 返回 → rx drop）。
+            // 下面这条检查必须在**重连循环里**：连接断着的时候 `tx.send()` 根本
+            // 不会被调用，只靠它退出的话，本循环会每 ≤5s 重连一次、每次
+            // connect_with 再占住一个池连接，直到进程结束。
+            if !should_keep_reconnecting(&tx) {
+                return;
             }
             tracing::warn!("pg 事件通知连接中断，{backoff:?} 后重连");
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(Duration::from_secs(5));
             // 重连成功必须重新 LISTEN，否则静默丢通知
             loop {
+                if !should_keep_reconnecting(&tx) {
+                    return;
+                }
                 match sqlx::postgres::PgListener::connect_with(&pool).await {
                     Ok(mut new) => match new.listen(EVENTS_CHANNEL).await {
                         Ok(()) => {
@@ -323,6 +348,20 @@ impl PgEngine {
     }
 }
 
+/// 通知任务在「连接断了」之后、重连之前要不要继续：接收端已被丢弃就退出。
+///
+/// 这条检查必须存在，且必须在**重连循环内部**：接收端 `rx` 随 `EventHub::stop`
+/// → `poll_loop` 返回而 drop，但连接断着的时候 `tx.send()` 根本不会被调用，
+/// 只靠 send 的 `is_err()` 退出的话，重连循环会每 ≤5s 跑一次、每次
+/// `connect_with` 再占住一个池连接，直到进程结束。PG 不可达期间每次重连都会
+/// 失败并重试——那正是连接池被慢慢吃光的场景。
+///
+/// 抽成函数是为了能单测：这个条件只有「接收端已关闭」一种为假，而它在真实
+/// 进程里难以构造（要求 drop 的瞬间 PG 恰好不可达）。
+fn should_keep_reconnecting(tx: &tokio::sync::mpsc::Sender<String>) -> bool {
+    !tx.is_closed()
+}
+
 fn validate_signal_id(signal_id: &str) -> Result<(), PgError> {
     if signal_id.trim().is_empty() || signal_id.len() > 128 {
         return Err(PgError::Invalid(
@@ -335,4 +374,32 @@ fn validate_signal_id(signal_id: &str) -> Result<(), PgError> {
 /// 每次进程启动新生成的 instance UUID；运维节点名可以重复，实例标识不可复用。
 fn instance_uuid() -> String {
     format!("inst-{}", uuid::Uuid::now_v7())
+}
+
+#[cfg(test)]
+mod notification_reconnect_tests {
+    use super::should_keep_reconnecting;
+
+    /// 接收端还在：重连循环必须继续（否则通知会静默停摆，
+    /// 兜底轮询成了唯一路径）。
+    #[tokio::test]
+    async fn keeps_reconnecting_while_receiver_alive() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(4);
+        assert!(should_keep_reconnecting(&tx));
+        drop(rx);
+    }
+
+    /// 接收端已丢弃：重连循环必须退出。
+    ///
+    /// 这是连接池被吃光的根因：PG 不可达时每次重连都失败并重试，若不检查
+    /// `is_closed()`，这个循环会跑到进程结束，每次尝试都占一个池连接。
+    #[tokio::test]
+    async fn stops_reconnecting_once_receiver_dropped() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(4);
+        drop(rx);
+        assert!(
+            !should_keep_reconnecting(&tx),
+            "接收端已 drop 时必须停止重连，否则泄漏池连接"
+        );
+    }
 }
