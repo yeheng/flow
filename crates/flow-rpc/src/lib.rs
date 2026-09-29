@@ -746,7 +746,7 @@ pub(crate) fn timeline_value(
                 .outputs
                 .get(&node.id)
                 .cloned()
-                .map(flow_backend::redact_value);
+                .map(|v| flow_backend::redact_value(&v));
             let mut entry = json!({
                 "id": node.id,
                 "name": node.name,

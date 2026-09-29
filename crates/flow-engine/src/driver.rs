@@ -90,7 +90,7 @@ async fn build_node_prep(
     input: &Value,
 ) -> NodePrep {
     if node.kind() == Some(NodeType::HumanTask) {
-        let snapshot = cap_input_snapshot(redact_value(node.params.clone()));
+        let snapshot = cap_input_snapshot(&redact_value(&node.params));
         return NodePrep {
             node,
             snapshot,
@@ -102,7 +102,7 @@ async fn build_node_prep(
     match exec::expand_params(&node, input, &outputs).await {
         Ok(expanded) => {
             let node = expanded.unwrap_or(node);
-            let snapshot = cap_input_snapshot(redact_value(node.params.clone()));
+            let snapshot = cap_input_snapshot(&redact_value(&node.params));
             NodePrep {
                 node,
                 snapshot,

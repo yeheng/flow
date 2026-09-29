@@ -38,12 +38,13 @@ impl LogBudget {
     }
 
     /// 本条日志是否放行。放行时内部计数 +1。
+    ///
+    /// `max` 是 **debug/info 合计**的上限，不是总量：warn/error 永远放行
+    /// （错误可观测性不打折，DESIGN §12.17）且**不消耗 debug/info 预算**。
+    /// 共享一个计数器会让一个刷 warn 的节点把整条 run 的 info 日志预算吃光。
     pub fn admit(&self, level: LogLevel) -> bool {
         match level {
-            LogLevel::Warn | LogLevel::Error => {
-                self.emitted.fetch_add(1, Ordering::Relaxed);
-                true
-            }
+            LogLevel::Warn | LogLevel::Error => true,
             LogLevel::Debug | LogLevel::Info => {
                 let emitted = self.emitted.fetch_add(1, Ordering::Relaxed);
                 if emitted < self.max {
@@ -155,11 +156,8 @@ pub fn truncate_message(message: &str) -> String {
     if message.len() <= MAX_LOG_LINE_BYTES {
         return message.to_string();
     }
-    format!(
-        "{}…[truncated {} bytes]",
-        byte_prefix(message, MAX_LOG_LINE_BYTES),
-        message.len() - MAX_LOG_LINE_BYTES
-    )
+    let kept = byte_prefix(message, MAX_LOG_LINE_BYTES);
+    format!("{}…[truncated {} bytes]", kept, message.len() - kept.len())
 }
 
 /// 输入面快照（node_started.input）的序列化字节上限：日志行有 8KB 截断，
@@ -173,34 +171,22 @@ pub const INPUT_SNAPSHOT_PREVIEW_BYTES: usize = 512;
 
 /// 超限的输入面快照 → `{"__truncated": true, "size": N, "preview": "…"}`。
 /// 先脱敏后截断：脱敏可能缩小体积，以展示值为准。
-/// 消费式签名：调用方交出所有权，不为一次展示视图深拷贝整棵树。
-pub fn cap_input_snapshot(value: Value) -> Value {
-    // 只量长度不分配：serde_json::Value 的序列化不会失败
-    let mut counter = CountingWriter(0);
-    let size = serde_json::to_writer(&mut counter, &value)
-        .map(|_| counter.0)
-        .unwrap_or(0);
-    if size <= MAX_INPUT_SNAPSHOT_BYTES {
-        return value;
+///
+/// 借引用签名（而非消费式）：脱敏要改值、执行要原值，调用方**必然**要留一份
+/// `params.clone()`。改成拿走所有权只是把那次克隆藏进 `..line` 语法糖里，
+/// 一个字节都没省下，还让「谁拥有这份 params」变成要读三遍才看得懂的事。
+pub fn cap_input_snapshot(value: &Value) -> Value {
+    // 序列化一次，量长度与取预览复用同一个 String——不为「只量长度不分配」
+    // 引入第二个序列化（省下的一个 String 分配换不回多跑的一趟全量序列化）
+    let text = serde_json::to_string(value).unwrap_or_default();
+    if text.len() <= MAX_INPUT_SNAPSHOT_BYTES {
+        return value.clone();
     }
-    let text = serde_json::to_string(&value).unwrap_or_default();
     serde_json::json!({
         "__truncated": true,
-        "size": size,
+        "size": text.len(),
         "preview": byte_prefix(&text, INPUT_SNAPSHOT_PREVIEW_BYTES),
     })
-}
-
-struct CountingWriter(usize);
-
-impl std::io::Write for CountingWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0 += buf.len();
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
 }
 
 /// 固定敏感键列表（小写子串匹配）：脱敏三个出口共用——http 日志行的 headers、
@@ -223,23 +209,26 @@ pub fn is_sensitive_key(key: &str) -> bool {
 
 const REDACTED: &str = "***";
 
-/// 递归脱敏一个 JSON 值（消费式：不改输入，也不复制输入——调用方交出所有权）。
-/// 对象键命中敏感列表时值替换为 "***"；数组逐位递归。
-pub fn redact_value(value: Value) -> Value {
+/// 递归脱敏一个 JSON 值（返回新值，不改输入）。对象键命中敏感列表时值替换
+/// 为 "***"；数组逐位递归。
+///
+/// 借引用签名：调用方还要拿原值执行（见 `cap_input_snapshot` 的说明），
+/// 消费式签名只会让每个调用点补一个 `.clone()`。
+pub fn redact_value(value: &Value) -> Value {
     match value {
         Value::Object(map) => Value::Object(
-            map.into_iter()
+            map.iter()
                 .map(|(k, v)| {
-                    if is_sensitive_key(&k) {
-                        (k, Value::String(REDACTED.into()))
+                    if is_sensitive_key(k) {
+                        (k.clone(), Value::String(REDACTED.into()))
                     } else {
-                        (k, redact_value(v))
+                        (k.clone(), redact_value(v))
                     }
                 })
                 .collect(),
         ),
-        Value::Array(items) => Value::Array(items.into_iter().map(redact_value).collect()),
-        other => other,
+        Value::Array(items) => Value::Array(items.iter().map(redact_value).collect()),
+        other => other.clone(),
     }
 }
 
@@ -271,6 +260,27 @@ mod tests {
         assert_eq!(messages[0].attempt, 2, "日志归属到具体 attempt");
     }
 
+    /// 预算是 debug/info 的上限，warn/error 不参与消耗（DESIGN §12.17）。
+    /// 修复前 warn 也 `emitted += 1`，于是刷满 max 条 warn 之后整条 run 的
+    /// info 日志全部丢弃——包括重试叙事与 HTTP 请求行这些最该看的。
+    #[test]
+    fn warn_burst_does_not_consume_the_info_budget() {
+        let budget = LogBudget::new(3);
+        for i in 0..50 {
+            assert!(budget.admit(LogLevel::Warn), "warn {i} 必须放行");
+            assert!(budget.admit(LogLevel::Error), "error {i} 必须放行");
+        }
+        for i in 0..3 {
+            assert!(budget.admit(LogLevel::Info), "info {i} 必须在预算内");
+        }
+        assert!(!budget.admit(LogLevel::Info), "第 4 条 info 超限");
+        assert!(!budget.admit(LogLevel::Debug), "debug 与 info 共享上限");
+        // warn 永久放行，且不因预算耗尽而改变
+        assert!(budget.admit(LogLevel::Warn));
+        assert!(budget.admit(LogLevel::Error));
+        assert_eq!(budget.take_dropped(), 2, "只丢 2 条 debug/info");
+    }
+
     #[test]
     fn message_truncated_at_char_boundary_with_marker() {
         let (logger, mut rx) = logger_with_budget(usize::MAX);
@@ -281,6 +291,26 @@ mod tests {
         assert!(line.message.len() < 9000, "截断后必须小于上限");
     }
 
+    /// `[truncated N bytes]` 里的 N 必须是**真实丢掉**的字节数。
+    /// 修复前按 `len() - MAX_LOG_LINE_BYTES` 算，而实际截断点为字符边界回退
+    /// 后的位置（≤ 上限），于是 N 系统性偏小——多字节内容上偏得更多。
+    #[test]
+    fn truncated_marker_reports_actual_dropped_bytes() {
+        // 2730 个「宁」= 8190 字节，再加一个是 8193 > 8192 上限
+        let text = "宁".repeat(5000); // 15000 字节
+        let kept_bytes = MAX_LOG_LINE_BYTES - (MAX_LOG_LINE_BYTES % 3);
+        assert_eq!(kept_bytes, 8190);
+        let cut = truncate_message(&text);
+        assert!(
+            cut.contains(&format!("[truncated {} bytes]", text.len() - kept_bytes)),
+            "标注的截断字节数必须等于真正丢掉的字节数（字符边界回退后为 6810，\
+             修复前错报 6808）：{cut:?}"
+        );
+        // 单字节内容（无回退）时两者恰好相等，钉住 ASCII 路径没被改坏
+        let ascii = "x".repeat(MAX_LOG_LINE_BYTES + 100);
+        assert!(truncate_message(&ascii).contains("[truncated 100 bytes]"));
+    }
+
     #[test]
     fn redact_walks_nested_structures() {
         let value = json!({
@@ -289,7 +319,7 @@ mod tests {
             "headers": {"token": "t", "ok": 1},
             "items": [{"password": "p", "n": 2}]
         });
-        let redacted = redact_value(value.clone());
+        let redacted = redact_value(&value);
         assert_eq!(redacted["Authorization"], json!("***"));
         assert_eq!(redacted["headers"]["token"], json!("***"));
         assert_eq!(redacted["headers"]["ok"], json!(1));
@@ -311,10 +341,10 @@ mod tests {
     fn input_snapshot_capped_at_byte_limit() {
         // 限内：原样保留
         let small = json!({"url": "http://x", "n": 1});
-        assert_eq!(cap_input_snapshot(small.clone()), small);
+        assert_eq!(cap_input_snapshot(&small), small);
         // 超限：占位携带原始序列化大小 + 可读前缀（截断而非丢弃）
         let big = json!({"body": "x".repeat(MAX_INPUT_SNAPSHOT_BYTES)});
-        let capped = cap_input_snapshot(big);
+        let capped = cap_input_snapshot(&big);
         assert_eq!(capped["__truncated"], json!(true));
         assert!(capped["size"].as_u64().unwrap() > MAX_INPUT_SNAPSHOT_BYTES as u64);
         let preview = capped["preview"].as_str().unwrap();
@@ -326,7 +356,7 @@ mod tests {
     fn input_snapshot_preview_stays_on_char_boundary() {
         // 多字节内容：前缀不得切在字符中间
         let big = json!({"body": "宁".repeat(MAX_INPUT_SNAPSHOT_BYTES)});
-        let capped = cap_input_snapshot(big);
+        let capped = cap_input_snapshot(&big);
         let preview = capped["preview"].as_str().unwrap();
         assert!(preview.ends_with("宁") || preview.ends_with('"'));
     }
