@@ -525,10 +525,15 @@ impl Driver {
         }
     }
 
-    /// 引擎叙事日志的**唯一**出口：与 exec 的 console 日志同一条路径
-    /// （同预算、同截断、同批落盘）。driver 不再直接 `append(NodeLog)`——
-    /// 那在 Postgres 上是每条一个受保护事务，与「日志是廉价层」的契约冲突
-    /// （backend.rs §append_log_batch）。
+    /// 引擎叙事日志的**唯一**出口：与 exec 的 console 日志同预算、同截断
+    /// （`NodeLogger::log` 已截过一次，这里再截是幂等的）。
+    /// driver 不再直接 `append(NodeLog)`——那在 Postgres 上是每条一个受保护
+    /// 事务，与「日志是廉价层」的契约冲突（backend.rs §append_log_batch）。
+    ///
+    /// 差别在**批**：exec 的日志从通道攒批（`drain_logs`，单批 256 条）后落盘，
+    /// 而叙事日志是引擎在关键决策点顺手写的，不热、也没经过通道，所以每次
+    /// 单独提交（PG 上是一个小事务）。收敛成一个通道或提高叙事密度都行，
+    /// 但「同批落盘」不是当前语义，别按那个前提改代码。
     async fn write_log_line(&mut self, line: LogLine) -> Result<(), EngineError> {
         if !self.budget.admit(line.level) {
             // 丢弃计数由 flush_log_summary 统一留痕，不在这里递归摘要

@@ -8,6 +8,12 @@
 //!
 //! `DbRunStatus` 的字符串形式是 runs.status 列的唯一合法词汇表：
 //! 各存储写入口用它校验，不维护第二份私有常量。
+//!
+//! **注意（加枚举变体时必读）**：`is_valid_str` 是一份手写 `matches!` 字面量表，
+//! **与 enum 不联动**——加一个 `DbRunStatus::Foo` 变体，编译器不会提醒你去改它，
+//! 于是新状态在写入时被当场拒掉。`flow-pg/src/schema.rs` 里还有第三份硬编码
+//! （`runs.status` 的 `CHECK` 约束列表），需要一起改。
+//! `StatusActive` 决定的准入判定则经 `STATUS_ACTIVE` 常量，与变体同步更新。
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -43,7 +49,11 @@ impl DbRunStatus {
         }
     }
 
-    /// 字符串是否属于词汇表。存储写入口的校验函数用它，不复制常量列表。
+    /// 字符串是否属于词汇表。存储写入口的校验函数用它。
+    ///
+    /// **手写字面量表，与 enum 不联动**（见文件头注释）：新增变体必须同步改
+    /// 这里，否则新状态在写入时被拒。改成从 `ALL` 遍历需要一个 `ALL` 列表，
+    /// 属于单独决策。
     pub fn is_valid_str(status: &str) -> bool {
         matches!(
             status,

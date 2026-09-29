@@ -196,8 +196,18 @@ Event 流 ──fold──> RunState {
 每个类型在 `model.rs` 的 `NodeType::descriptor()` 注册一次：`NodeType::ALL` 的顺序
 即 `nodetypes.list` 响应顺序（= 前端面板顺序），params_schema 之外带
 `label`/`category`/`ports`/`max_instances`/`supports_retry`/`side_effect` 与
-`x-widget`/`x-help`/`x-secret` 扩展键——新增类型只改这一处，快照测试
+`x-widget`/`x-help`/`x-secret` 扩展键，快照测试
 （`node_types_snapshot_is_stable`）钉住响应逐字节不变。
+
+**新增节点类型要改四处**（不是一处，编译器只管其中一处）：`NodeType` enum、
+`ALL` 数组、`as_str` + `parse`（同一个字符串写两遍）、`descriptor()`、
+`validate_params()` 的 match 臂，以及 `exec::dispatch` 的 match 臂
+（**只有这一个会编译报错**）。另外 `opaque_params` 与 `secret_params` 各按需
+增改——两者都是 `&'static [&'static str]` 的 match，形状与 `opaque_params`
+一致。`secret_params` 与 descriptor 里的 `x-secret` 标记**不是代码派生关系**
+（派生要为找两三个 key 构造整棵 schema 树，而 `secret_params` 在每个节点执行
+与每次 `workflow.update` 上都调），一致性由
+`secret_params_agree_with_descriptor` 逐类型比对守住。
 
 `Definition::validate()` 在保存与发布时强制（建图即校验，不等到运行）：
 
@@ -489,8 +499,12 @@ jsonrpsee WebSocket。本层只有**一份**方法实现，只依赖 `flow_backe
 闭集枚举；后端差异（初始化协议、信号落账、订阅推送）全部在 flow-backend 吸收：
 
 - `run.start`：SQLite 两段式 initializing → run_started；Postgres 单事务原子创建。
-  「只有 published 可执行 + 创建前校验」单点在 flow-backend 的
-  `resolve_runnable_definition`，两个后端 create_run 共用，不存在第二份实现；
+  「只有 published 可执行 + 创建前校验」在 flow-backend 的
+  `resolve_runnable_definition`，`AnyBackend::create_run` 两臂共用它。
+  **但它是纵深防御而非唯一副本**：`flow-pg/src/lease.rs` 的 `create_run` 与
+  `flow-pg/src/child.rs` 的子 run 启动各自在事务内独立做了一遍
+  「锁 workflow 行 → 校验 version 已 published → 解析定义」，
+  `child.rs` 还有第三种「没有已发布版本」的错误文案。三处都改才安全。
 - `run.signal` / `run.cancel`：统一 SignalAck 响应（delivered / pending / rejected）。
   `signal_id` 在 Postgres 后端必填且重试复用（真实落账的 inbox 主键，可查询）；
   SQLite 后端可省，响应**只回显客户端提供的 id、从不伪造**（没有持久 inbox，
@@ -645,7 +659,9 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
 stderr，格式化在 JS 侧完成）：console 输出就是普通节点日志，走同一 budget/
 通道/`node_log` 落盘路径——condition 求值路径上没有 logger（disabled，输出丢弃）。
 预算：per-run 默认 10000 条 debug/info（`FLOW_RUN_LOG_BUDGET` 可调），超限
-丢弃并写 Warn 摘要行；单行 8KB 截断。
+丢弃并写 Warn 摘要行；单行 8KB 截断。**上限只管 debug/info 合计**，
+warn/error 永久放行且**不消耗 debug/info 预算**——否则一个刷 warn 的节点
+能把整条 run 的 info 日志预算吃光。
 
 数据契约：进出沙箱的整数经 **BigInt 边界**精确无损——|v| > 2^53 的 i64/u64
 （雪花 ID、高精度金额）注入沙箱时转 BigInt，出口按十进制精确还原 i64/u64，
@@ -688,11 +704,15 @@ body 为 `{from, to, subject, text}`（纯文本正文），输出 `{status, id}
 2. 副作用之前必写 `node_started`；恢复还覆盖等待重试、信号消费与收尾窗口；
 3. `RunState::fold` 是唯一状态转移函数，恢复与时间线共用；
 4. 跳过必须推进到不动点；inflight 每个 handle 恰欠一条 DriverMsg；
-5. `state.outputs` 是唯一输出所有者（无第二份手工同步）；节点执行输入面
+5. `state.outputs` 是节点输出的唯一所有者（`NodeRecord` 不存副本——此前两份
+   副本意味着 `NodeFailed`/`NodeSkipped` 漏清一处，靠「`NodeStarted` 必然先清」
+   侥幸不出错）；节点执行输入面
     `nodes` 只暴露直接前驱的输出（重放决定论，见 §10）；
 6. 端口规则：condition 必须 true/false，其余必须无端口；
 7. end/run 输出共用「单数透传、复数映射」规则（`singular_or_map`）；
-8. 状态词汇表单一来源：`DbRunStatus`，store 写入口校验。
+8. 状态词汇表单一来源：`DbRunStatus`，store 写入口校验——但
+   `is_valid_str` 是与 enum **不联动**的手写字面量表，加枚举变体必须同步改它
+   与 `flow-pg/src/schema.rs` 的 `CHECK` 列表。
 9. 可重试失败非终态；不可重试失败由 fold 持久推导，恢复不会变为成功。
 10. 信号先校验，再持久化、消费和确认；无效请求不改变 run 终态。
 11. sub_workflow 的 child_run_id 确定性派生（`{父run}:{节点}:{attempt}`）并随

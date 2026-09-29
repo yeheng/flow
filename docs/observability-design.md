@@ -125,13 +125,20 @@ EventLog 保持愚蠢）：
 - 每 run 默认预算 10000 条（环境变量 `FLOW_RUN_LOG_BUDGET` 可调）。
 - 超预算后：warn/error 照记，debug/info 丢弃，并写一条摘要日志
   （"已达日志预算，已丢弃 N 条 info/debug"），终态前再摘要一次。
-- 单行截断 8KB，截断时 message 尾部带 `…[truncated]` 标记。
+- 单行截断 8KB，截断时 message 尾部带 `…[truncated N bytes]` 标记，N 是
+  **真正丢掉的字节数**（按字符边界回退后的截断点算，不是 `len - 8KB`——
+  多字节内容上前者偏小）。
 
 预算同时保护三样东西：event.jsonl 体积（重放成本）、PG 后端日志表、前端订阅带宽。
 
-归属契约：预算计数是 **per-run** 共享状态（`Arc<AtomicUsize>`，emitted + dropped 两个
-计数），driver 创建并持有，NodeLogger 克隆 Arc——logger 是 per-node-attempt 的，
+归属契约：预算计数是 **per-run** 共享状态（`LogBudget`，emitted + dropped 两个
+原子计数），driver 创建并持有，NodeLogger 克隆 Arc——logger 是 per-node-attempt 的，
 预算判断必须落在 per-run 一处，EventLog 对预算无感知。
+
+`emitted` 只数 debug/info：warn/error 走 `admit` 的独立分支放行且不碰它。
+上限的语义是「debug/info 合计 10000 条」，不是「日志总量 10000 条」——
+共享一个计数器的话，刷满 warn 的节点会把整条 run 的 info 预算吃光
+（`warn_burst_does_not_consume_the_info_budget` 钉住）。
 
 ## 4. 发射点清单（谁在哪儿写日志）
 
@@ -241,9 +248,11 @@ TimelineNode 加 `input`；LogLine/LogLevel/LogStream 接口。`api/flow.ts` **�
 
 ## 8. 脱敏
 
-- 固定敏感键列表（authorization / cookie / token / password / secret / api_key，
-  不分大小写子串匹配）在三个出口生效：http 日志行里的 headers、node_started.input、
-  node_completed.output——值替换为 `"***"`。
+- 固定敏感键列表（authorization / cookie / token / password / secret / api_key /
+  apikey，**不分大小写子串匹配**）在三个出口生效：http 日志行里的 headers、
+  node_started.input、node_completed.output——值替换为 `"***"`。子串匹配的代价：
+  `password_policy`、`tokenizer` 这类合法字段会被误脱敏（安全侧可接受，
+  展示侧可能困惑）。
 - output 属于用户显式产出的数据，v1 也脱敏固定键（低成本高收益）；参数级 `x-secret`
   标记 → P3。
 

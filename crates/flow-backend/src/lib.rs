@@ -547,7 +547,8 @@ pub fn prefer_current_thread_runtime() -> bool {
 
 /// 工厂：按 FLOW_BACKEND 构造后端。
 /// `sqlite`（缺省，canonical）| `postgres`（可替代，多节点执行）。
-/// 这是整个进程唯一读取 FLOW_BACKEND 的地方。
+/// 这是进程入口选择后端的唯一地方（`prefer_current_thread_runtime` 也读同一个
+/// 变量决定 runtime 形态，它在构造 runtime 之前跑，改这里要同步改那边）。
 pub async fn open_from_env() -> Result<AnyBackend, BackendError> {
     let kind = std::env::var("FLOW_BACKEND").unwrap_or_else(|_| "sqlite".into());
     match kind.as_str() {

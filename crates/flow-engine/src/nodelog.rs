@@ -191,10 +191,13 @@ pub fn cap_input_snapshot(value: &Value) -> Value {
 
 /// 固定敏感键列表（小写子串匹配）：脱敏三个出口共用——http 日志行的 headers、
 /// node_started.input（写入时）、timeline 的 output（展示时）。
-const SENSITIVE_KEYS: [&str; 8] = [
+// 子串匹配。「set-cookie」被「cookie」完全覆盖，是死条目；同理
+// 「password_policy」「tokenizer」「secretary」这类合法字段会被误脱敏成
+// 「***」。改成精确/后缀匹配要考虑 `Authorization` / `x-apiKey` /
+// `my_auth_token` 这些真实形状，属于独立决策，暂按现状。
+const SENSITIVE_KEYS: [&str; 7] = [
     "authorization",
     "cookie",
-    "set-cookie",
     "token",
     "password",
     "secret",
