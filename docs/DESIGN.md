@@ -139,9 +139,12 @@ append(node_started)  →  执行副作用  →  append(终态事件)
 
 **日志行是这条边界的例外层**：`node_log` 只 `write_all` 不进组提交（进程级持久），
 搭同文件后续严格事件的 fsync 便车——终态事件 append 前 EventLog 强制先 sync 一次
-（终态返回 ⇒ 终态前的日志已在盘上）。批量追加走 sink 的 `append_log_batch`
-（默认逐条，Postgres 覆写为单事务整批——锁行/seq 分配/提交一次，日志的廉价层
-语义不在受保护事务上被抹平）。细节见 `docs/observability-design.md`。
+（终态返回 ⇒ 终态前的日志已在盘上）。所有 `node_log`（exec 的 console 输出**与**
+引擎叙事日志：重试/接管重放/等待人工/等待裁决）只走 `RunEventSink::append_log_batch`
+一个出口——Postgres 上那是**两条语句一个事务**（`last_seq += N` 一次 + `jsonb_array_
+elements ... WITH ORDINALITY` 整批插入 + 一次 NOTIFY），逐条则是 N 个受保护事务 +
+3N 往返。`last_seq` 只取 DB 返回的批末值，不本地重算。细节见
+`docs/observability-design.md`。
 
 ### 3.3 日志读写规则
 
@@ -256,17 +259,29 @@ loop {
    **同时**是执行期 params 与输入面快照；exec 层不再展开（双展开会把用户数据里
    合法的 `${` 再 evaluate 一遍——历史回归有测试钉住）。human_task 不执行，
    用原始 params 做快照。展开失败不破写序协议：先 `node_started` 再走节点
-   失败路径（可重试失败照常调度重试）；
+   失败路径（可重试失败照常调度重试）。准备阶段（`build_prep`/`build_node_prep`）
+   是纯计算、不碰 sink，**同批 ready 节点并发展开**——`expand_params` 内部是
+   `spawn_blocking`，在驱动循环里串行 await 会把宽扇出排成一条队，期间取消
+   信号、日志排空、租约失效全部要等它跑完；派发仍逐个有序进行，事件顺序不变；
 2. **输入快照脱敏后落盘**：`redact_value` 按敏感键列表（authorization/token/
    api_key…）把快照里的敏感值替换为 `***`——快照是给前端看的，事件里的原始
-   output 才是下游的数据面，两者都不能动；
+   output 才是下游的数据面，两者都不能动。快照另有 8KB 字节上限
+   （`cap_input_snapshot`），超限降级为 `{"__truncated": true, "size": N,
+   "preview": "…"}`：与日志行截断同一取法（**截断而非丢弃**，标注原始字节数
+   并留下可读开头）——输入面快照存在的意义就是调试"到底传了什么进去"，
+   一刀切成空壳恰好在最需要它的时候什么都不剩；
 3. **密钥注入在执行期**：x-secret 参数的**名称**在快照里，真值在 exec dispatch
    前才由 `FLOW_SECRET_<名称>` 注入（只进请求头）。
 
 **节点日志**：exec 任务持 `NodeLogger`（unbounded mpsc，发即忘，per-run 预算
 `Arc<LogBudget>` 判定），driver 的 select 循环 biased 优先排空日志（发射端先发
-日志后发 Done），成批转 `node_log` 落盘，单批 256 条封顶防饿死。日志不是恢复
-状态：fold 跳过 `node_log`，重启后历史日志仍可经 `run.events` 读取（§9）。
+日志后发 Done），成批转 `node_log` 落盘。攒批有 1ms 窗口、单批 256 条封顶：
+产者是另一个线程（节点 exec / QuickJS console 桥），纯 `try_recv` 排空在刷屏时
+每批只有 1 行——批接口形同虚设，Postgres 上等于每行一个事务。等待按**批**摊销
+不是按行（窗口内到达的行一次写完）。日志接收端只活在 `drive()` 的局部变量里，
+**不挂回 Driver 字段**：从 `self` 再取一次会永远拿到 `None`，攒批静默退化成
+逐行落盘（这正是它一度完全不生效的原因）。日志不是恢复状态：fold 跳过 `node_log`，
+重启后历史日志仍可经 `run.events` 读取（§9）。
 
 ### 6.2 汇合语义：AND-join
 
@@ -499,7 +514,7 @@ jsonrpsee WebSocket。本层只有**一份**方法实现，只依赖 `flow_backe
 | `run.start` | 经 Backend：SQLite 校验 published → insert initializing → 持久化 run_started → 启动 Driver，初始化错误回写 failed；Postgres 单事务原子创建（§9 差异说明） |
 | `run.get / run.list` | 元数据 + live 标记；list 支持 status 过滤与 source（触发来源）过滤，词汇表外 -32010 |
 | `run.stats` | 精确统计（GROUP BY，非采样）：`{workflow_id?}` → `{total, by_status}`，不带过滤时附带 `by_workflow: [{workflow_id, total, by_status}]` |
-| `run.timeline` | 只读时间线：定义顺序 + 折叠后的节点状态（含 input 输入面快照；output 展示时按同一敏感键列表脱敏，事件里的原始值不动） |
+| `run.timeline` | 只读时间线：定义顺序 + 折叠后的节点状态。`nodes[].input` 是 node_started 写入时已脱敏限幅的快照；`nodes[].output` 是**节点级展示值**（按敏感键列表脱敏：节点输出可能是上游 HTTP 响应、会回显凭据）；顶层 `output` 是**数据面**，与 `run.get` / `run_completed` 事件逐字一致——同名字段必须同值，否则客户端从 timeline 重建输出会拿到污染数据 |
 | `run.events` | 原始事件，`from_seq` 增量拉取。`node_log` 与状态事件同流同 seq（可观察性设计：日志回放/追流不用第二条管道） |
 | `run.cancel` | 统一 SignalAck：活着的 run 交付取消（SQLite 仅本进程生效）；否则 conflict |
 | `run.signal` | human_task 交付 / 副作用节点裁决（§6.7）。signal_id 在 Postgres 必填且重试复用，SQLite 可省（响应只回显客户端提供的，不伪造） |

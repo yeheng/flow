@@ -42,16 +42,22 @@ const filtered = computed<LogLine[]>(() => {
   });
 });
 
-// 过滤条件变化后窗口起点重置：新过滤集的"最近 1500 行"语义才成立
-watch([showDebug, nodeFilter, searchText], () => {
+// 过滤条件或 run 变化后窗口起点重置：新过滤集的"最近 N 行"语义才成立
+watch([showDebug, nodeFilter, searchText, () => monitor.runId], () => {
   extraLines.value = 0;
 });
 
-/** DOM 行上限：状态存全量（预算封顶），渲染窗口化避免万行节点卡死 */
+/** 起始窗口：DOM 一次只渲染这么多行（状态存全量，预算封顶） */
 const RENDER_CAP = 1500;
 /** 「加载更早」每次向前扩开的行数 */
 const EARLIER_STEP = 1500;
-/** 已向前扩开的行数（过滤器变化时重置） */
+/**
+ * 已向前扩开的行数上限。**必须有天花板**：没有它，「加载更早」就是把
+ * RENDER_CAP 从安全上限变成累加器——点六次 = 10500 行 DOM，正好是这段代码
+ * 存在的理由（避免万行节点卡死）被自己撤销。留 4 倍余量够翻历史。
+ */
+const MAX_EARLIER = RENDER_CAP * 4;
+/** 已向前扩开的行数（过滤/run 变化时重置） */
 const extraLines = ref(0);
 
 const windowed = computed(() => logWindow(filtered.value.length, RENDER_CAP, extraLines.value));
@@ -60,9 +66,10 @@ const hiddenCount = computed(() => windowed.value.hidden);
 
 /** 向前展开一段历史，保持视口停在原内容上（补偿 scrollHeight 增量） */
 async function loadEarlier(): Promise<void> {
+  if (extraLines.value >= MAX_EARLIER) return;
   const el = listEl.value;
   const prevHeight = el?.scrollHeight ?? 0;
-  extraLines.value += EARLIER_STEP;
+  extraLines.value = Math.min(extraLines.value + EARLIER_STEP, MAX_EARLIER);
   await nextTick();
   if (el) el.scrollTop += el.scrollHeight - prevHeight;
 }

@@ -34,7 +34,27 @@ export const monitor = reactive({
   starting: false,
 });
 
-export const runActive = computed(() => monitor.runId !== null && monitor.phase === "running");
+/**
+ * run 还在跑吗？——`phase` 可能是 `null`（timeline 还没回来/拉失败），
+ * 那是**不知道**，不是「已终结」。
+ */
+const phaseTerminal = (): boolean =>
+  monitor.phase === "succeeded" || monitor.phase === "failed" || monitor.phase === "cancelled";
+
+/**
+ * 取消按钮：不知道终态时照常可点（点了服务端会给 conflict，不算错）。
+ * 判据是「没拿到终态」，不是「确定还在跑」——把 null 当成 running 是撒谎，
+ * 把 null 当成终态是漏报，两者都不如承认不知道。
+ */
+export const canCancelRun = computed(() => monitor.runId !== null && !phaseTerminal());
+
+/**
+ * 断线后要不要整体重建投影。判据同 canCancelRun：run 已确定终结才不重建。
+ * （不拿 phase 是否为 running 当判据：timeline 拉失败时 phase 是 null，
+ * 保守设 null 会让仍在跑的 run 永不重建，乐观设 running 会让早已结束的
+ * run 反复重建。一个 phase 不该同时回答两个问题。）
+ */
+export const needReattach = computed(() => monitor.runId !== null && !phaseTerminal());
 
 /** human_task 等待信号中的节点 */
 export const waitingHumanTasks = computed(() =>
@@ -104,10 +124,10 @@ async function attach(runId: string): Promise<boolean> {
   }
 
   // 局部投影：订阅建立与 timeline 对齐之间到达的事件先入缓冲。
-  // phase 缺省 "running" 是有语义的乐观默认：timeline 拉取失败时 runActive
-  // 仍为 true（取消按钮可用）、onReconnect 守卫仍会 re-attach。
+  // phase 缺省 null = 「还不知道」：不撒谎成 running（会对已终结的 run 显示
+  // 可用取消按钮），canCancelRun / needReattach 也不依赖它是否为 running。
   const proj: RunProjection = {
-    phase: "running" as string | null,
+    phase: null as string | null,
     status: null as string | null,
     output: undefined as unknown,
     fatalError: null as string | null,
@@ -263,5 +283,5 @@ export async function deliverSignal(nodeId: string, payloadText: string): Promis
 
 // 断线重连后客户端已自动重建订阅，投影整体重建（状态 + 日志从回放重来）
 client.onReconnect(() => {
-  if (monitor.runId && monitor.phase === "running") void reattachFor(monitor.runId!);
+  if (needReattach.value) void reattachFor(monitor.runId!);
 });

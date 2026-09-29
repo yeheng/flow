@@ -141,37 +141,66 @@ impl NodeLogger {
     }
 }
 
+/// 取不超过 `max` 字节的 UTF-8 前缀（字符边界安全）。两个截断器共用。
+fn byte_prefix(text: &str, max: usize) -> &str {
+    let mut end = text.len().min(max);
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 /// 超限截断：按 UTF-8 字符边界切，尾部带截断标记（保留原字节数信息）。
 pub fn truncate_message(message: &str) -> String {
     if message.len() <= MAX_LOG_LINE_BYTES {
         return message.to_string();
     }
-    let mut end = MAX_LOG_LINE_BYTES;
-    while !message.is_char_boundary(end) {
-        end -= 1;
-    }
     format!(
         "{}…[truncated {} bytes]",
-        &message[..end],
-        message.len() - end
+        byte_prefix(message, MAX_LOG_LINE_BYTES),
+        message.len() - MAX_LOG_LINE_BYTES
     )
 }
 
 /// 输入面快照（node_started.input）的序列化字节上限：日志行有 8KB 截断，
 /// 输入面快照同理——预算管住了日志条数，这里管住单条事件的字节面。
-/// 超限整体替换为占位（展示层看得见大小，重放/订阅/前端不吃大载荷）。
 pub const MAX_INPUT_SNAPSHOT_BYTES: usize = 8 * 1024;
 
-/// 超限的输入面快照 → ` {"__truncated": true, "size": N}` 占位。
+/// 超限快照保留的前缀字节数。与 `truncate_message` 同一取法：**截断而非丢弃**，
+/// 标注原始字节数并留下可读的开头——输入面快照存在的意义就是调试"到底传了
+/// 什么进去"，一刀切成空壳恰好在最需要它的时候什么都不剩。
+pub const INPUT_SNAPSHOT_PREVIEW_BYTES: usize = 512;
+
+/// 超限的输入面快照 → `{"__truncated": true, "size": N, "preview": "…"}`。
 /// 先脱敏后截断：脱敏可能缩小体积，以展示值为准。
-pub fn cap_input_snapshot(value: &Value) -> Value {
-    let size = serde_json::to_string(value)
-        .map(|text| text.len())
+/// 消费式签名：调用方交出所有权，不为一次展示视图深拷贝整棵树。
+pub fn cap_input_snapshot(value: Value) -> Value {
+    // 只量长度不分配：serde_json::Value 的序列化不会失败
+    let mut counter = CountingWriter(0);
+    let size = serde_json::to_writer(&mut counter, &value)
+        .map(|_| counter.0)
         .unwrap_or(0);
     if size <= MAX_INPUT_SNAPSHOT_BYTES {
-        return value.clone();
+        return value;
     }
-    serde_json::json!({ "__truncated": true, "size": size })
+    let text = serde_json::to_string(&value).unwrap_or_default();
+    serde_json::json!({
+        "__truncated": true,
+        "size": size,
+        "preview": byte_prefix(&text, INPUT_SNAPSHOT_PREVIEW_BYTES),
+    })
+}
+
+struct CountingWriter(usize);
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// 固定敏感键列表（小写子串匹配）：脱敏三个出口共用——http 日志行的 headers、
@@ -194,23 +223,23 @@ pub fn is_sensitive_key(key: &str) -> bool {
 
 const REDACTED: &str = "***";
 
-/// 递归脱敏一个 JSON 值（返回新值，不改输入）。对象键命中敏感列表时值替换
-/// 为 "***"；数组逐位递归。
-pub fn redact_value(value: &Value) -> Value {
+/// 递归脱敏一个 JSON 值（消费式：不改输入，也不复制输入——调用方交出所有权）。
+/// 对象键命中敏感列表时值替换为 "***"；数组逐位递归。
+pub fn redact_value(value: Value) -> Value {
     match value {
         Value::Object(map) => Value::Object(
-            map.iter()
+            map.into_iter()
                 .map(|(k, v)| {
-                    if is_sensitive_key(k) {
-                        (k.clone(), Value::String(REDACTED.into()))
+                    if is_sensitive_key(&k) {
+                        (k, Value::String(REDACTED.into()))
                     } else {
-                        (k.clone(), redact_value(v))
+                        (k, redact_value(v))
                     }
                 })
                 .collect(),
         ),
-        Value::Array(items) => Value::Array(items.iter().map(redact_value).collect()),
-        other => other.clone(),
+        Value::Array(items) => Value::Array(items.into_iter().map(redact_value).collect()),
+        other => other,
     }
 }
 
@@ -260,14 +289,14 @@ mod tests {
             "headers": {"token": "t", "ok": 1},
             "items": [{"password": "p", "n": 2}]
         });
-        let redacted = redact_value(&value);
+        let redacted = redact_value(value.clone());
         assert_eq!(redacted["Authorization"], json!("***"));
         assert_eq!(redacted["headers"]["token"], json!("***"));
         assert_eq!(redacted["headers"]["ok"], json!(1));
         assert_eq!(redacted["items"][0]["password"], json!("***"));
         assert_eq!(redacted["items"][0]["n"], json!(2));
         assert_eq!(redacted["url"], json!("http://x"));
-        // 原值不动
+        // 消费式：调用方的原值不受影响
         assert_eq!(value["Authorization"], json!("Bearer x"));
     }
 
@@ -282,12 +311,23 @@ mod tests {
     fn input_snapshot_capped_at_byte_limit() {
         // 限内：原样保留
         let small = json!({"url": "http://x", "n": 1});
-        assert_eq!(cap_input_snapshot(&small), small);
-        // 超限：占位携带原始序列化大小
+        assert_eq!(cap_input_snapshot(small.clone()), small);
+        // 超限：占位携带原始序列化大小 + 可读前缀（截断而非丢弃）
         let big = json!({"body": "x".repeat(MAX_INPUT_SNAPSHOT_BYTES)});
-        let capped = cap_input_snapshot(&big);
+        let capped = cap_input_snapshot(big);
         assert_eq!(capped["__truncated"], json!(true));
         assert!(capped["size"].as_u64().unwrap() > MAX_INPUT_SNAPSHOT_BYTES as u64);
-        assert!(serde_json::to_string(&capped).unwrap().len() < 100);
+        let preview = capped["preview"].as_str().unwrap();
+        assert!(preview.starts_with("{\"body\":\"xxx"), "{preview}");
+        assert!(preview.len() <= INPUT_SNAPSHOT_PREVIEW_BYTES);
+    }
+
+    #[test]
+    fn input_snapshot_preview_stays_on_char_boundary() {
+        // 多字节内容：前缀不得切在字符中间
+        let big = json!({"body": "宁".repeat(MAX_INPUT_SNAPSHOT_BYTES)});
+        let capped = cap_input_snapshot(big);
+        let preview = capped["preview"].as_str().unwrap();
+        assert!(preview.ends_with("宁") || preview.ends_with('"'));
     }
 }

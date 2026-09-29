@@ -245,9 +245,14 @@ impl RunEventSink for PgRunSink {
         })
     }
 
-    /// 批量节点日志：**单事务整批**（锁行/租约校验一次、seq 连续分配、一次提交）。
-    /// 逐条 append_log 在 PG 上 = 每行一个受保护事务 + WAL 刷盘——日志的
-    /// "廉价层"语义会被抹平，刷屏 run 会把 driver 循环拖进成串刷盘。
+    /// 批量节点日志：**两条语句 + 一个事务**（锁行/租约校验一次、seq 一次
+    /// 分配、整批一次插入、一次 NOTIFY、一次提交）。
+    ///
+    /// 逐条 append_log 在 PG 上 = 每行一个受保护事务 + 3 个往返 + WAL 刷盘，
+    /// 日志的"廉价层"语义会被抹平，刷屏 run 的 driver 循环会成串往返。批内
+    /// 用 `jsonb_array_elements ... WITH ORDINALITY` 一次插完：runs 行在事务里
+    /// 只被 UPDATE 一次（N 次的话是 N 个必然废弃的 MVCC 行版本），`runs` 行锁
+    /// 的持有时间也从 O(N) 往返降到 O(1)——`run.cancel` 不会被日志刷屏堵住。
     fn append_log_batch<'a>(
         &'a mut self,
         events: Vec<Event>,
@@ -256,17 +261,60 @@ impl RunEventSink for PgRunSink {
             if events.is_empty() {
                 return Ok(Vec::new());
             }
-            let count = events.len();
+            let payloads = events
+                .iter()
+                .map(lease::payload_of)
+                .collect::<Result<Vec<_>, _>>()?;
             let mut tx = self.begin().await?;
             self.lock_and_check(&mut tx, Some(self.last_seq)).await?;
-            let mut envelopes = Vec::with_capacity(count);
-            for event in events {
-                let (seq, ts) = self.allocate_and_insert(&mut tx, &event).await?;
+            // 一次加 N。base = 本批**第一条**的 seq（= 旧 last_seq + 1），
+            // 批内 seq = base + (ord - 1)，末条正好是新的 last_seq。
+            let base: i64 = sqlx::query_scalar(
+                "UPDATE runs SET last_seq = last_seq + $2 WHERE id = $1
+                 RETURNING last_seq - $2 + 1",
+            )
+            .bind(&self.run_id)
+            .bind(events.len() as i64)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(Self::sql_err)?;
+            let rows = sqlx::query(
+                "INSERT INTO run_events (run_id, seq, ts, payload)
+                 SELECT $1, $2 + g.ord - 1, clock_timestamp(), g.payload
+                 FROM jsonb_array_elements($3::jsonb) WITH ORDINALITY AS g(payload, ord)
+                 RETURNING seq, ts",
+            )
+            .bind(&self.run_id)
+            .bind(base)
+            .bind(Value::Array(payloads))
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(Self::sql_err)?;
+            // 与插入同事务 NOTIFY（§8 低延迟提示），提交时才投递
+            lease::queue_event_notify(&mut tx, &self.run_id)
+                .await
+                .map_err(Self::sql_err)?;
+            tx.commit().await.map_err(Self::sql_err)?;
+            // RETURNING 不保证行序：按 seq 定位回原事件，包络严格升序。
+            // last_seq 只有一个来源——DB 算出来的批次末值，不本地重算。
+            let mut slots: Vec<Option<(u64, DateTime<Utc>)>> = vec![None; events.len()];
+            for row in rows {
+                let seq: i64 = row.try_get("seq").map_err(Self::sql_err)?;
+                let ts: DateTime<Utc> = row.try_get("ts").map_err(Self::sql_err)?;
+                let offset = (seq - base) as usize;
+                let slot = slots.get_mut(offset).ok_or_else(|| {
+                    EngineError::Backend(format!("run {} 批日志 seq 越界：{seq}", self.run_id))
+                })?;
+                *slot = Some((seq as u64, ts));
+            }
+            let mut envelopes = Vec::with_capacity(events.len());
+            for (event, slot) in events.into_iter().zip(slots) {
+                let (seq, ts) = slot.ok_or_else(|| {
+                    EngineError::Backend(format!("run {} 批日志缺行", self.run_id))
+                })?;
                 envelopes.push(self.envelope(seq, ts, event));
             }
-            tx.commit().await.map_err(Self::sql_err)?;
-            // 批内 seq 连续（同一 UPDATE 链），末尾即最新
-            self.last_seq += count as u64;
+            self.last_seq = envelopes.last().map_or(self.last_seq, |e| e.seq);
             Ok(envelopes)
         })
     }

@@ -23,8 +23,10 @@ use crate::error::EngineError;
 use crate::event::{Envelope, Event, LogLevel, LogStream};
 use crate::exec::{self, ChildRunSpec, NodeExecContext, NodeFailure};
 use crate::fold::{NodeState, RunState};
-use crate::model::{Definition, NodeType};
-use crate::nodelog::{cap_input_snapshot, redact_value, LogBudget, LogLine, NodeLogger};
+use crate::model::{Definition, Node, NodeType};
+use crate::nodelog::{
+    cap_input_snapshot, redact_value, truncate_message, LogBudget, LogLine, NodeLogger,
+};
 
 /// 单次驱动所需的全部输入。
 pub struct DriverSpec {
@@ -49,6 +51,10 @@ pub struct DriverSpec {
     pub inbox_poll: Duration,
 }
 
+/// 单批日志行数上限：攒批窗口内到达的行一次写盘，这个上限防止一次批把
+/// 驱动循环按死（也是后端单事务的语句数上限，见 sink 的 append_log_batch）。
+const LOG_BATCH_MAX: usize = 256;
+
 /// 文件后端的信号请求：oneshot 回执把校验/落盘结果还给调用方。
 /// Postgres 后端不走这条通道（信号经持久 inbox），`signal_rx` 传 None 即可。
 pub struct SignalRequest {
@@ -56,11 +62,72 @@ pub struct SignalRequest {
     pub reply: oneshot::Sender<Result<(), EngineError>>,
 }
 
+/// 派发前的同步准备结果：节点、决定论输入面（直接前驱 id + 它们的输出）。
+type NodeInputs = (Node, Vec<String>, HashMap<String, Value>);
+
+/// 派发前的准备结果（纯计算的产物，不含任何写入）。
+struct NodePrep {
+    /// 展开后的执行期 params（无模板时是原节点）
+    node: Node,
+    /// 脱敏 + 限幅后的输入面快照，随 node_started 落盘
+    snapshot: Value,
+    /// 展开失败时的节点失败；Some 时不派发执行
+    failure: Option<NodeFailure>,
+    preds: Vec<String>,
+    outputs: HashMap<String, Value>,
+}
+
+/// params 展开 + 输入面快照。**自由函数**：只吃入参、不碰 Driver，
+/// 因此同一批 ready 节点可以 `join_all` 并发跑（`drive` 的扇出路径）。
+///
+/// 展开恰好一次（见 `exec::expand_params`）：结果**同时**是执行期 params 与
+/// 输入面快照，exec 层不再展开。human_task 不执行、历史行为也不展开，
+/// 输入面用原始 params。快照先脱敏（写盘前）后限幅。
+async fn build_node_prep(
+    node: Node,
+    preds: Vec<String>,
+    outputs: HashMap<String, Value>,
+    input: &Value,
+) -> NodePrep {
+    if node.kind() == Some(NodeType::HumanTask) {
+        let snapshot = cap_input_snapshot(redact_value(node.params.clone()));
+        return NodePrep {
+            node,
+            snapshot,
+            failure: None,
+            preds,
+            outputs,
+        };
+    }
+    match exec::expand_params(&node, input, &outputs).await {
+        Ok(expanded) => {
+            let node = expanded.unwrap_or(node);
+            let snapshot = cap_input_snapshot(redact_value(node.params.clone()));
+            NodePrep {
+                node,
+                snapshot,
+                failure: None,
+                preds,
+                outputs,
+            }
+        }
+        Err(failure) => NodePrep {
+            node,
+            snapshot: Value::Null,
+            failure: Some(failure),
+            preds,
+            outputs,
+        },
+    }
+}
+
 /// 启动 Driver 任务。返回的 JoinHandle 结束即 Driver 完全退出（inflight 已 abort），
 /// 调用方据此释放本地 registry 与容量许可。
 pub fn spawn_driver(spec: DriverSpec, state: RunState, plan: RecoveryPlan) -> JoinHandle<()> {
     // 日志通道与预算在 driver 内创建：单机 / Postgres 两个后端自动同享，
     // 无需 DriverSpec 感知。预算与广播容量共用 FLOW_RUN_LOG_BUDGET。
+    // 接收端只活在 drive() 里（局部变量）——**不要**挂回 Driver 字段：
+    // 排空函数再从 self 取会永远拿到 None，攒批静默退化成逐行落盘。
     let (log_tx, log_rx) = tokio::sync::mpsc::unbounded_channel();
     let driver = Driver {
         run_id: spec.run_id,
@@ -80,10 +147,9 @@ pub fn spawn_driver(spec: DriverSpec, state: RunState, plan: RecoveryPlan) -> Jo
         adjudicating: HashSet::new(),
         lease_lost: false,
         log_tx,
-        log_rx: Some(log_rx),
         budget: LogBudget::new(crate::nodelog::budget_from_env()),
     };
-    tokio::spawn(driver.run(plan))
+    tokio::spawn(driver.run(plan, log_rx))
 }
 
 /// 恢复期对未完成节点和待重试节点的分类结论。
@@ -203,15 +269,13 @@ struct Driver {
     lease_lost: bool,
     /// 节点日志通道：exec 任务发射端（克隆进 NodeLogger），select 循环排空落盘
     log_tx: tokio::sync::mpsc::UnboundedSender<LogLine>,
-    /// 接收端由 drive() 取出（避免 select! 分支体与 future 同时借用 self）
-    log_rx: Option<tokio::sync::mpsc::UnboundedReceiver<LogLine>>,
     /// per-run 日志预算（发射端一处判定）
     budget: Arc<LogBudget>,
 }
 
 impl Driver {
-    async fn run(mut self, plan: RecoveryPlan) {
-        let outcome = self.drive(plan).await;
+    async fn run(mut self, plan: RecoveryPlan, log_rx: mpsc::UnboundedReceiver<LogLine>) {
+        let outcome = self.drive(plan, log_rx).await;
         self.abort_inflight();
         if self.lease_lost {
             tracing::warn!(run_id = %self.run_id, "失去 run 所有权，静默退出（不写终态）");
@@ -254,13 +318,16 @@ impl Driver {
         }
     }
 
-    async fn drive(&mut self, plan: RecoveryPlan) -> Result<(), EngineError> {
+    async fn drive(
+        &mut self,
+        plan: RecoveryPlan,
+        mut log_rx: mpsc::UnboundedReceiver<LogLine>,
+    ) -> Result<(), EngineError> {
         let (result_tx, mut result_rx) = mpsc::channel::<DriverMsg>(256);
         let mut inbox_tick = tokio::time::interval(self.inbox_poll);
         inbox_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // 取出接收端，避免 select! 的 future 与分支体同时借用 self
         let mut signal_rx = self.signal_rx.take();
-        let mut log_rx = self.log_rx.take();
 
         self.project_status(DbRunStatus::Running, None).await?;
         self.apply_recovery_plan(plan, &result_tx).await?;
@@ -275,9 +342,26 @@ impl Driver {
                 for (node_id, reason) in skips {
                     self.append(Event::NodeSkipped { node_id, reason }).await?;
                 }
-                for node_id in ready {
-                    let attempt = self.next_attempt(&node_id);
-                    self.start_node(&node_id, attempt, &result_tx).await?;
+                // 并发展开：准备是纯计算，同批节点互不依赖（本轮内 outputs
+                // 不会变）。串行 await 会把 N 个 spawn_blocking 排成一条队，
+                // 期间取消信号、日志排空、租约失效全部要等它跑完。
+                let targets: Vec<(String, u32)> = ready
+                    .iter()
+                    .map(|id| Ok((id.clone(), self.next_attempt(id))))
+                    .collect::<Result<_, EngineError>>()?;
+                let raw = targets
+                    .iter()
+                    .map(|(id, _)| self.prepare_inputs(id))
+                    .collect::<Result<Vec<_>, EngineError>>()?;
+                let input = self.input.clone();
+                let preps =
+                    join_all(raw.into_iter().map(|(node, preds, outputs)| {
+                        build_node_prep(node, preds, outputs, &input)
+                    }))
+                    .await;
+                for ((node_id, attempt), prep) in targets.into_iter().zip(preps) {
+                    self.dispatch_prepared(&node_id, attempt, prep, &result_tx)
+                        .await?;
                 }
             }
 
@@ -287,7 +371,7 @@ impl Driver {
                 && self.adjudicating.is_empty()
             {
                 if self.state.all_terminal() {
-                    return self.finalize().await;
+                    return self.finalize(&mut log_rx).await;
                 }
                 return Err(EngineError::Node(
                     "调度停滞：存在既不可就绪也无法跳过的节点".into(),
@@ -326,12 +410,7 @@ impl Driver {
                 }
                 // 日志排在结果之前（biased）：发射端先发日志后发 Done（程序序），
                 // 两通道都就绪时先排空日志，落盘顺序与执行顺序一致。
-                Some(line) = async {
-                    match log_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => self.drain_logs(line).await?,
+                Some(line) = log_rx.recv() => self.drain_logs(&mut log_rx, line).await?,
                 Some(msg) = result_rx.recv() => self.handle_result(msg, &result_tx).await?,
                 Some(request) = async {
                     match signal_rx.as_mut() {
@@ -446,16 +525,45 @@ impl Driver {
         }
     }
 
-    /// 排空日志通道：首条已到，再非阻塞收集一批，逐条落盘后补预算摘要。
-    /// 单批上限避免极端刷屏饿死其他 select 分支。
-    async fn drain_logs(&mut self, first: LogLine) -> Result<(), EngineError> {
+    /// 引擎叙事日志的**唯一**出口：与 exec 的 console 日志同一条路径
+    /// （同预算、同截断、同批落盘）。driver 不再直接 `append(NodeLog)`——
+    /// 那在 Postgres 上是每条一个受保护事务，与「日志是廉价层」的契约冲突
+    /// （backend.rs §append_log_batch）。
+    async fn write_log_line(&mut self, line: LogLine) -> Result<(), EngineError> {
+        if !self.budget.admit(line.level) {
+            // 丢弃计数由 flush_log_summary 统一留痕，不在这里递归摘要
+            return Ok(());
+        }
+        self.write_log_batch(vec![LogLine {
+            message: truncate_message(&line.message),
+            ..line
+        }])
+        .await
+    }
+
+    /// 排空日志通道：首条已到，攒批窗口内继续收集一批，落盘后补预算摘要。
+    ///
+    /// **攒批窗口**：产者是另一个线程（节点 exec / QuickJS console 桥），
+    /// 纯 `try_recv` 的排空在刷屏时每批只有 1 行——批接口形同虚设，Postgres
+    /// 上等于每行一个事务。日志是观察数据、本层没有时延契约，允许为凑批
+    /// 短暂等一会儿。等待按**批**摊销不是按行：窗口内到达的行一次写完，
+    /// 吞吐是 窗口/批大小，不是 1/窗口。
+    async fn drain_logs(
+        &mut self,
+        rx: &mut mpsc::UnboundedReceiver<LogLine>,
+        first: LogLine,
+    ) -> Result<(), EngineError> {
+        const BATCH_WAIT: Duration = Duration::from_millis(1);
         let mut lines = vec![first];
-        if let Some(rx) = self.log_rx.as_mut() {
-            while lines.len() < 256 {
-                match rx.try_recv() {
-                    Ok(line) => lines.push(line),
-                    Err(_) => break,
-                }
+        let deadline = tokio::time::Instant::now() + BATCH_WAIT;
+        while lines.len() < LOG_BATCH_MAX {
+            match rx.try_recv() {
+                Ok(line) => lines.push(line),
+                Err(_) => match tokio::time::timeout_at(deadline, rx.recv()).await {
+                    Ok(Some(line)) => lines.push(line),
+                    // 窗口到点 / 通道关闭：手上这批就是全部
+                    Ok(None) | Err(_) => break,
+                },
             }
         }
         self.write_log_batch(lines).await?;
@@ -480,15 +588,25 @@ impl Driver {
 
     /// 终态前排空残余日志：所有节点已终态时 exec 任务的发送端已全部关闭，
     /// 通道必然可排尽。终态 append 的内建兜底 sync 会把这些行一并刷盘。
-    async fn drain_remaining_logs(&mut self) -> Result<(), EngineError> {
-        let mut lines = Vec::new();
-        if let Some(rx) = self.log_rx.as_mut() {
-            while let Ok(line) = rx.try_recv() {
-                lines.push(line);
+    /// 这里是唯一不走攒批窗口的地方：必须把通道排到底（循环分批，
+    /// 单批仍是 LOG_BATCH_MAX——终态前多丢一条日志都是排查证据的损失）。
+    async fn drain_remaining_logs(
+        &mut self,
+        rx: &mut mpsc::UnboundedReceiver<LogLine>,
+    ) -> Result<(), EngineError> {
+        loop {
+            let mut lines = Vec::new();
+            while lines.len() < LOG_BATCH_MAX {
+                match rx.try_recv() {
+                    Ok(line) => lines.push(line),
+                    Err(_) => break,
+                }
             }
+            if lines.is_empty() {
+                return self.flush_log_summary().await;
+            }
+            self.write_log_batch(lines).await?;
         }
-        self.write_log_batch(lines).await?;
-        self.flush_log_summary().await
     }
 
     async fn project_status(
@@ -580,7 +698,7 @@ impl Driver {
             for node_id in plan.adjudicate {
                 // 运行叙事进事件流（NodeLog），不再是纯运维 tracing
                 let _ = self
-                    .append(Event::NodeLog {
+                    .write_log_line(LogLine {
                         node_id: node_id.clone(),
                         attempt: self.state.record(&node_id).attempts,
                         level: LogLevel::Warn,
@@ -599,7 +717,7 @@ impl Driver {
 
         for (node_id, attempt) in plan.replay {
             let _ = self
-                .append(Event::NodeLog {
+                .write_log_line(LogLine {
                     node_id: node_id.clone(),
                     attempt,
                     level: LogLevel::Info,
@@ -699,21 +817,33 @@ impl Driver {
         }
     }
 
+    /// 节点派发（就绪、重试、人工裁决 retry、接管重放的唯一入口）：
+    /// 先准备（并发的纯计算），再派发（单写者的有序写入）。
     async fn start_node(
         &mut self,
         node_id: &str,
         attempt: u32,
         result_tx: &mpsc::Sender<DriverMsg>,
     ) -> Result<(), EngineError> {
+        let (node, preds, outputs) = self.prepare_inputs(node_id)?;
+        let input = self.input.clone();
+        let prep = build_node_prep(node, preds, outputs, &input).await;
+        self.dispatch_prepared(node_id, attempt, prep, result_tx)
+            .await
+    }
+
+    /// 派发前的同步准备：克隆节点、决定论输入面。不跨 await，因此是 `&self`
+    /// 的普通方法；展开部分在自由函数 `build_node_prep` 里（Driver 内的
+    /// `Box<dyn RunEventSink>` 只 Send 不 Sync，`&self` 跨 await 会让 driver
+    /// future 失去 Send）。
+    fn prepare_inputs(&self, node_id: &str) -> Result<NodeInputs, EngineError> {
         let node = self
             .definition
             .node(node_id)
             .ok_or_else(|| EngineError::Node(format!("节点不存在：{node_id}")))?
             .clone();
-        let kind = node
-            .kind()
+        node.kind()
             .ok_or_else(|| EngineError::Node(format!("节点类型未知：{}", node.node_type)))?;
-
         let preds: Vec<String> = self
             .definition
             .incoming(node_id)
@@ -726,42 +856,40 @@ impl Driver {
             .iter()
             .filter_map(|p| self.state.outputs.get(p).cloned().map(|v| (p.clone(), v)))
             .collect();
+        Ok((node, preds, outputs))
+    }
 
-        // 参数展开（恰好一次，见 exec::expand_params）：纯计算，无副作用，
-        // 先于 node_started 完成以便输入面快照随事件落盘。展开失败走
-        // 节点失败路径（写序协议不变：先 node_started 再 node_failed）。
-        // human_task 不执行、历史行为也不展开：输入面用原始 params。
-        // 输入面快照：脱敏 → 字节上限（超限占位，见 nodelog::cap_input_snapshot）
-        let (node, input_snapshot) = if kind == NodeType::HumanTask {
-            let input = cap_input_snapshot(&redact_value(&node.params));
-            (node, input)
-        } else {
-            match exec::expand_params(&node, &self.input, &outputs).await {
-                Ok(Some(expanded)) => {
-                    let input = cap_input_snapshot(&redact_value(&expanded.params));
-                    (expanded, input)
-                }
-                Ok(None) => {
-                    let input = cap_input_snapshot(&redact_value(&node.params));
-                    (node, input)
-                }
-                Err(failure) => {
-                    self.append(Event::NodeStarted {
-                        node_id: node_id.to_string(),
-                        attempt,
-                        child_run_id: None,
-                        input: None,
-                    })
-                    .await?;
-                    if failure.platform {
-                        return Err(EngineError::Backend(failure.message));
-                    }
-                    self.fail_node(node_id, attempt, &failure, result_tx)
-                        .await?;
-                    return Ok(());
-                }
+    /// 写 `node_started` 并派发执行。展开失败仍先写 node_started（input 为
+    /// null），再走节点失败路径——写序协议在两条分支上完全一致。
+    async fn dispatch_prepared(
+        &mut self,
+        node_id: &str,
+        attempt: u32,
+        prep: NodePrep,
+        result_tx: &mpsc::Sender<DriverMsg>,
+    ) -> Result<(), EngineError> {
+        let NodePrep {
+            node,
+            snapshot,
+            failure,
+            preds,
+            outputs,
+        } = prep;
+        let kind = node.kind().expect("build_prep 已校验节点类型");
+
+        if let Some(failure) = failure {
+            self.append(Event::NodeStarted {
+                node_id: node_id.to_string(),
+                attempt,
+                child_run_id: None,
+                input: None,
+            })
+            .await?;
+            if failure.platform {
+                return Err(EngineError::Backend(failure.message));
             }
-        };
+            return self.fail_node(node_id, attempt, &failure, result_tx).await;
+        }
 
         // sub_workflow 的 child_run_id 随 node_started 一起确定并落盘（副作用前写协议）。
         // 崩溃重放（记录仍是 Running）沿用已落盘的 id 附着原子 run；
@@ -780,7 +908,7 @@ impl Driver {
             node_id: node_id.to_string(),
             attempt,
             child_run_id: child_run_id.clone(),
-            input: Some(input_snapshot),
+            input: Some(snapshot),
         })
         .await?;
 
@@ -834,7 +962,7 @@ impl Driver {
     ) {
         // 等待叙事进事件流：运行详情页一眼看出这个节点在等谁
         let _ = self
-            .append(Event::NodeLog {
+            .write_log_line(LogLine {
                 node_id: node_id.to_string(),
                 attempt,
                 level: LogLevel::Info,
@@ -966,16 +1094,14 @@ impl Driver {
         // 重试叙事进事件流：第几次尝试/重试分清楚，退避多久，归属到新 attempt
         let next_attempt = self.next_attempt(node_id);
         let _ = self
-            .append(Event::NodeLog {
+            .write_log_line(LogLine {
                 node_id: node_id.to_string(),
                 attempt: next_attempt,
                 level: LogLevel::Warn,
                 stream: LogStream::Engine,
                 message: format!(
-                    "即将开始第 {} 次尝试（第 {} 次重试），退避 {}ms",
-                    next_attempt,
-                    next_attempt.saturating_sub(1),
-                    backoff
+                    "即将开始第 {next_attempt} 次尝试（第 {} 次重试），退避 {backoff}ms",
+                    next_attempt - 1
                 ),
             })
             .await;
@@ -1136,10 +1262,13 @@ impl Driver {
         Ok(())
     }
 
-    async fn finalize(&mut self) -> Result<(), EngineError> {
+    async fn finalize(
+        &mut self,
+        log_rx: &mut mpsc::UnboundedReceiver<LogLine>,
+    ) -> Result<(), EngineError> {
         // 终态前排空残余日志 + 预算摘要：EventLog::append 对终态事件内建兜底
         // sync，这些行会一并刷盘（终态返回 ⇒ 终态前日志已在盘上）
-        self.drain_remaining_logs().await?;
+        self.drain_remaining_logs(log_rx).await?;
 
         if let Some(error) = self.state.fatal_error.clone() {
             self.append_terminal(Event::RunFailed { error }).await?;

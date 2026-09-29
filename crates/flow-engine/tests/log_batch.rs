@@ -15,8 +15,10 @@ use tokio_util::sync::CancellationToken;
 struct Shared {
     events: Mutex<Vec<Envelope>>,
     seq: AtomicU64,
-    /// append_log（单条）调用次数：exec 日志路径必须为 0
+    /// append_log（单条）调用次数：node_log 不得出现
     single_log_calls: AtomicU64,
+    /// 受保护 append 承载 node_log 的次数：同样不得出现
+    append_log_events: AtomicU64,
     /// append_log_batch 调用次数与经它的日志事件总数
     batch_calls: AtomicU64,
     batch_log_events: AtomicU64,
@@ -55,7 +57,13 @@ impl RunEventSink for CountingSink {
         &'a mut self,
         event: Event,
     ) -> BoxFuture<'a, Result<Envelope, flow_engine::EngineError>> {
-        Box::pin(async move { Ok(self.commit(event)) })
+        Box::pin(async move {
+            if matches!(event, Event::NodeLog { .. }) {
+                // 违规记账：node_log 走受保护路径 = Postgres 上逐条一个事务
+                self.shared.append_log_events.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(self.commit(event))
+        })
     }
 
     fn append_log<'a>(
@@ -64,6 +72,9 @@ impl RunEventSink for CountingSink {
     ) -> BoxFuture<'a, Result<Envelope, flow_engine::EngineError>> {
         Box::pin(async move {
             self.shared.single_log_calls.fetch_add(1, Ordering::SeqCst);
+            if matches!(event, Event::NodeLog { .. }) {
+                self.shared.append_log_events.fetch_add(1, Ordering::SeqCst);
+            }
             Ok(self.commit(event))
         })
     }
@@ -135,9 +146,9 @@ impl RunEventSink for CountingSink {
 }
 
 /// 脚本刷 300 条 console.log：全部日志经 append_log_batch 落盘，
-/// 单条 append_log 一次都不出现；seq 全程连续。
+/// 单条 append_log 与受保护 append 一次都不承载 node_log；seq 全程连续。
 #[tokio::test]
-async fn driver_writes_exec_logs_only_through_batch_interface() {
+async fn driver_writes_all_node_logs_only_through_batch_interface() {
     let (sink, shared) = CountingSink::new();
     let definition: flow_engine::Definition = serde_json::from_value(json!({
         "nodes": [
@@ -184,7 +195,12 @@ async fn driver_writes_exec_logs_only_through_batch_interface() {
     assert_eq!(
         shared.single_log_calls.load(Ordering::SeqCst),
         0,
-        "exec 日志不得走单条 append_log（PG 上逐条=逐事务）"
+        "node_log 不得走单条 append_log"
+    );
+    assert_eq!(
+        shared.append_log_events.load(Ordering::SeqCst),
+        0,
+        "node_log（含引擎叙事日志）不得走受保护 append——PG 上逐条=逐事务"
     );
     assert_eq!(
         shared.batch_log_events.load(Ordering::SeqCst),
@@ -192,9 +208,10 @@ async fn driver_writes_exec_logs_only_through_batch_interface() {
         "全部日志经批接口"
     );
     let batches = shared.batch_calls.load(Ordering::SeqCst);
+    // 批次数严格少于日志条数 = 真的在批（分几次由调度决定，不钉死）
     assert!(
-        batches >= 1 && batches <= 300,
-        "批次数应在合理范围：{batches}"
+        batches < log_count as u64,
+        "批次数 {batches} 应少于日志条数 {log_count}——逐条落盘等于 PG 上逐事务"
     );
 
     // seq 连续：日志行与状态事件同一编号空间

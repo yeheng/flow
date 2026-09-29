@@ -645,22 +645,19 @@ e2e_test!(
         let run = wait_run_terminal(&client, &run_id, TIMEOUT).await;
         assert_eq!(run["run"]["status"], json!("succeeded"));
 
-        // 时间线：输入面快照（展开 + 脱敏）、节点输出与 run 级输出同一脱敏标准
+        // 时间线：输入面快照（展开 + 脱敏）、节点输出展示脱敏
         let timeline: Value = call_json(&client, "run.timeline", json!({"run_id": run_id})).await;
         let node = timeline_node(&timeline, "n1");
         assert_eq!(node["input"]["note"], json!("n=7"), "模板展开后的输入面");
         assert_eq!(node["input"]["token"], json!("***"), "敏感键展示值脱敏");
-        assert_eq!(node["output"]["token"], json!("***"), "节点输出脱敏");
-        assert_eq!(
-            timeline["output"]["token"],
-            json!("***"),
-            "run 级输出与节点输出同一脱敏标准（展示面不能双标）"
-        );
-        // run.get 的 output 是数据面（CLI 语义）：不做展示层脱敏
+        assert_eq!(node["output"]["token"], json!("***"), "节点输出展示值脱敏");
+        // run 级 output 是数据面：与 run.get / run_completed 逐字一致
+        // （同名不同值 = timeline 在骗客户端）
+        assert_eq!(timeline["output"]["token"], json!("sk-run-level"));
         assert_eq!(
             run["run"]["output"]["token"],
             json!("sk-run-level"),
-            "run.get 输出是数据面，保持原值"
+            "run.get 与 run.timeline 的 output 必须同值"
         );
 
         // 事件流里有 node_log：console.log→stdout/info，console.error→stderr/error

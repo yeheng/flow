@@ -6,7 +6,7 @@ import {
   deliverSignal,
   monitor,
   openChildRun,
-  runActive,
+  canCancelRun,
   waitingHumanTasks,
 } from "../state/monitor";
 import { editor } from "../state/editor";
@@ -68,7 +68,7 @@ function onRowClick(nodeId: string): void {
       <span v-if="monitor.phase" class="run-phase" :class="`run-${monitor.phase}`">
         {{ phaseText }}
       </span>
-      <button v-if="runActive" @click="cancelRun()">取消</button>
+      <button v-if="canCancelRun" @click="cancelRun()">取消</button>
     </div>
     <div v-if="monitor.fatalError" class="run-fatal">{{ monitor.fatalError }}</div>
     <div v-if="monitor.output !== undefined" class="run-output">

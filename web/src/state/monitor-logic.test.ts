@@ -248,6 +248,8 @@ describe("logWindow：日志控制台渲染窗口", () => {
   });
   it("加载更早逐步扩窗，覆盖全部后不再省略", () => {
     expect(logWindow(3000, 1500, 1500)).toEqual({ rendered: 3000, hidden: 0 });
-    expect(logWindow(2900, 1500, 1000)).toEqual({ rendered: 2500, hidden: 400 });
+    // 生产里 extra 恒为 EARLIER_STEP 的倍数（点击 + 天花板都是 1500 的倍数）
+    expect(logWindow(4000, 1500, 1500)).toEqual({ rendered: 3000, hidden: 1000 });
+    expect(logWindow(6000, 1500, 6000)).toEqual({ rendered: 6000, hidden: 0 });
   });
 });

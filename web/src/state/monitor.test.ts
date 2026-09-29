@@ -12,7 +12,7 @@ vi.mock("../api/flow", () => ({
 }));
 
 import * as api from "../api/flow";
-import { attachRun, detachRun, monitor } from "./monitor";
+import { attachRun, canCancelRun, detachRun, monitor, needReattach } from "./monitor";
 
 function timeline(runId: string): Timeline {
   return {
@@ -103,7 +103,7 @@ describe("attach 原子换入", () => {
 });
 
 describe("timeline 拉取失败的降级路径", () => {
-  it("phase 保持乐观缺省 running：runActive 仍为 true，重连守卫不失效", async () => {
+  it("phase 保持 null（不知道≠running）：取消与重连判据都不依赖它是否 running", async () => {
     const runId = "run-degraded";
     vi.mocked(api.runTimeline).mockRejectedValue(
       new Error("timeline 拉取失败（模拟）"),
@@ -111,8 +111,22 @@ describe("timeline 拉取失败的降级路径", () => {
     const ok = await attachRun(runId);
     expect(ok).toBe(true);
     expect(monitor.runId).toBe(runId);
-    // 乐观缺省：runActive 依赖 phase === "running"，不能因 timeline 失败变 null
-    expect(monitor.phase).toBe("running");
+    // 不撒谎成 running：判据是「没拿到终态」而不是「确定还在跑」
+    expect(monitor.phase).toBeNull();
+    expect(canCancelRun.value).toBe(true);
+    expect(needReattach.value).toBe(true);
+    await detachRun();
+  });
+
+  it("终态 run 不显示取消、不触发重连重建", async () => {
+    vi.mocked(api.runTimeline).mockResolvedValue({
+      ...timeline("run-done"),
+      status: "succeeded",
+      phase: "succeeded",
+    });
+    expect(await attachRun("run-done")).toBe(true);
+    expect(canCancelRun.value).toBe(false);
+    expect(needReattach.value).toBe(false);
     await detachRun();
   });
 });

@@ -741,7 +741,7 @@ pub(crate) fn timeline_value(
             // output 展示出口脱敏（固定敏感键）：事件日志里的原始 output 是
             // 下游节点的数据面，不能动；这里只脱时间线的展示值。
             // input 在 node_started 写入时已脱敏，直接透传。
-            let output = record.output.as_ref().map(flow_backend::redact_value);
+            let output = record.output.clone().map(flow_backend::redact_value);
             let mut entry = json!({
                 "id": node.id,
                 "name": node.name,
@@ -771,9 +771,11 @@ pub(crate) fn timeline_value(
         "workflow_version": workflow_version,
         "started_at": snapshot.started_at,
         "ended_at": snapshot.ended_at,
-        // run 级输出与节点输出同一脱敏标准：timeline 是展示面，
-        // 不能节点输出是 *** 而十行之下 run 输出就是明文（run.get 是数据面，另论）
-        "output": snapshot.output.as_ref().map(flow_backend::redact_value),
+        // run 级 output 是**数据面**：与 run.get / run_completed 事件逐字一致。
+        // 脱敏只发生在节点级展示值（上面 nodes[].output）——节点的输出可能是
+        // 上游 HTTP 响应（会回显凭据），而 run 级 output 就是 run.get 那个值。
+        // 同名字段必须同值：否则客户端从 timeline 重建输出会拿到污染数据。
+        "output": snapshot.output,
         "fatal_error": snapshot.fatal_error,
         "last_seq": snapshot.last_seq,
         "nodes": nodes,

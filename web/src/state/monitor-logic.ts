@@ -68,6 +68,9 @@ export function drainBuffer(buffer: RunEvent[]): RunEvent[] {
  * 日志控制台渲染窗口（纯函数，便于单测）：默认渲染最近 cap 行；
  * 「加载更早」把窗口向前扩 extra 行，直到覆盖全部。返回
  * [渲染行数, 省略行数]——状态存全量（预算封顶），DOM 只开窗口。
+ *
+ * extra 的天花板由调用方（LogConsole 的 MAX_EARLIER）保证，这里不做二次限制：
+ * 上限是 UI 的资源预算，不是窗口算术的职责。
  */
 export function logWindow(
   total: number,
