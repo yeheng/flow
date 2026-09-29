@@ -59,6 +59,10 @@ impl NodeState {
 }
 
 /// 时间线视图：折叠事件得到的单节点记录。
+///
+/// 节点输出**不在这里**：唯一所有者是 [`RunState::outputs`]（DESIGN §12.5）。
+/// 需要节点输出的人从 `state.outputs.get(node_id)` 读——存两份就等于多一份
+/// 要手工同步的影子。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct NodeRecord {
     pub state: NodeState,
@@ -66,7 +70,6 @@ pub struct NodeRecord {
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<u64>,
-    pub output: Option<Value>,
     pub error: Option<String>,
     /// 已记录但尚未被消费的信号（崩溃在 signal_received 与终态之间）
     pub last_signal: Option<Value>,
@@ -152,7 +155,6 @@ impl RunState {
             started_at: None,
             ended_at: None,
             duration_ms: None,
-            output: None,
             error: None,
             last_signal: None,
             child_run_id: None,
@@ -194,10 +196,11 @@ impl RunState {
                 rec.ended_at = None;
                 rec.duration_ms = None;
                 rec.error = None;
-                rec.output = None;
                 rec.last_signal = None;
                 rec.child_run_id = child_run_id.clone();
                 rec.input = input.clone();
+                // 旧输出唯一那份在 outputs 里，这里随新 attempt 一并清掉：
+                // 重试/重放不留脏数据
                 self.outputs.remove(node_id);
             }
             Event::NodeCompleted {
@@ -211,7 +214,6 @@ impl RunState {
                 rec.attempts = rec.attempts.max(*attempt);
                 rec.ended_at = Some(env.ts);
                 rec.duration_ms = Some(*duration_ms);
-                rec.output = Some(output.clone());
                 rec.error = None;
                 rec.last_signal = None;
                 self.outputs.insert(node_id.clone(), output.clone());
@@ -354,7 +356,7 @@ mod tests {
         let rec = state.record("n1");
         assert_eq!(rec.state, NodeState::Completed { attempt: 2 });
         assert_eq!(rec.attempts, 2);
-        assert_eq!(rec.output, Some(serde_json::json!(7)));
+        assert_eq!(state.outputs.get("n1"), Some(&serde_json::json!(7)));
         assert_eq!(rec.duration_ms, Some(12));
         assert_eq!(state.phase, RunPhase::Succeeded);
         assert!(state.all_terminal());
@@ -406,5 +408,59 @@ mod tests {
             },
         ));
         assert!(!state.outputs.contains_key("n1"));
+    }
+
+    /// 节点输出只存一份：无论走哪条事件路径，唯一所有者都是
+    /// `RunState::outputs`（DESIGN §12.5）。旧的 `NodeRecord.output` 副本让
+    /// `NodeFailed` / `NodeSkipped` 漏清一处，删掉副本后这个不对称不再可能。
+    #[test]
+    fn node_output_lives_only_in_outputs_across_every_event_path() {
+        let completed = Event::NodeCompleted {
+            node_id: "n1".into(),
+            attempt: 1,
+            output: serde_json::json!("v"),
+            duration_ms: 1,
+        };
+        // (事件, 折叠后 outputs 里是否还有该节点的输出)
+        let cases: Vec<(Event, bool)> = vec![
+            (completed.clone(), true),
+            (
+                Event::NodeStarted {
+                    node_id: "n1".into(),
+                    attempt: 2,
+                    child_run_id: None,
+                    input: None,
+                },
+                false,
+            ),
+            (
+                Event::NodeFailed {
+                    node_id: "n1".into(),
+                    attempt: 2,
+                    error: "boom".into(),
+                    retryable: true,
+                },
+                false,
+            ),
+            (
+                Event::NodeSkipped {
+                    node_id: "n1".into(),
+                    reason: "upstream_skipped".into(),
+                },
+                false,
+            ),
+        ];
+        for (event, expect_present) in cases {
+            // 每例都从「节点已完成」起：事件路径只决定该路径自己怎么处置旧输出
+            let mut state = RunState::new();
+            state.fold(&env(1, completed.clone()));
+            assert!(state.outputs.contains_key("n1"), "前置条件不成立");
+            state.fold(&env(2, event.clone()));
+            assert_eq!(
+                state.outputs.contains_key("n1"),
+                expect_present,
+                "{event:?} 之后 outputs 的存在性判断错了"
+            );
+        }
     }
 }

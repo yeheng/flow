@@ -89,7 +89,7 @@ async fn linear_run_executes_and_records_ordered_events() {
 
     let state = h.wait_terminal(&run_id).await;
     assert_eq!(state.phase, RunPhase::Succeeded, "{}", describe(&state));
-    assert_eq!(state.record("n2").output, Some(json!({"doubled": 42})));
+    assert_eq!(state.outputs.get("n2"), Some(&json!({"doubled": 42})));
     // end 单前驱透传：线性链上 end 的前驱是 delay，所以 run 输出是 delay 的输出
     assert_eq!(state.output, Some(json!({"slept_ms": 10})));
 
@@ -158,12 +158,12 @@ async fn condition_branch_marks_untaken_side_skipped() {
 
     let state = h.wait_terminal(&run_id).await;
     assert_eq!(state.phase, RunPhase::Succeeded, "{}", describe(&state));
-    assert_eq!(state.record("no").output, Some(json!("small")));
+    assert_eq!(state.outputs.get("no"), Some(&json!("small")));
     match &state.record("yes").state {
         flow_engine::NodeState::Skipped { reason } => assert_eq!(reason, "branch_not_taken"),
         other => panic!("未走的分支应被跳过，实际：{other:?}"),
     }
-    assert_eq!(state.record("end_no").output, Some(json!("small")));
+    assert_eq!(state.outputs.get("end_no"), Some(&json!("small")));
     // 多 end：run 输出是各 end 输出的映射，被跳过的 end 为 null
     assert_eq!(
         state.output,
@@ -214,7 +214,7 @@ async fn restarted_pure_node_is_replayed_with_new_attempt() {
         2,
         "残留的纯节点应以 attempt 2 重放"
     );
-    assert_eq!(state.record("n2").output, Some(json!({"doubled": 42})));
+    assert_eq!(state.outputs.get("n2"), Some(&json!({"doubled": 42})));
 
     let events = h.engine.read_events(&run_id, None).await.unwrap();
     let replays = events
@@ -528,7 +528,7 @@ async fn multi_pred_end_collects_output_map() {
     let state = h.wait_terminal(&run_id).await;
     assert_eq!(state.phase, RunPhase::Succeeded, "{}", describe(&state));
     // end 自身输出 = 多前驱映射；单 end 时 run 输出透传 end 的输出
-    assert_eq!(state.record("e").output, Some(json!({"a": 1, "b": 2})));
+    assert_eq!(state.outputs.get("e"), Some(&json!({"a": 1, "b": 2})));
     assert_eq!(state.output, Some(json!({"a": 1, "b": 2})));
 }
 

@@ -280,7 +280,7 @@ async fn child_success_output_passes_through() {
     let state = terminal(&h.engine, "r").await;
     assert_eq!(state.phase, RunPhase::Succeeded, "{:?}", state.fatal_error);
     // 子 run 输出透传为节点输出，再经 end 透传为 run 输出
-    assert_eq!(state.record("sub").output, Some(json!({"total": 42})));
+    assert_eq!(state.outputs.get("sub"), Some(&json!({"total": 42})));
     assert_eq!(state.output, Some(json!({"total": 42})));
 
     // child_run_id 确定性派生并随 node_started 落盘；子 run 输入 = 父输入，深度 +1
