@@ -124,28 +124,18 @@ function onSelectNode(id: string): void {
           {{ nodeName(id) }}
         </option>
       </select>
-      <input
-        v-model="searchText"
-        type="search"
-        class="log-search"
-        placeholder="搜索日志…"
-      />
+      <input v-model="searchText" type="search" class="log-search" placeholder="搜索日志…" />
     </div>
 
     <div v-if="monitor.logs.length === 0" class="log-empty">
-      暂无日志<span v-if="monitor.phase === 'running'">（等待节点输出…）</span>
+      暂无日志<span v-if="monitor.status === 'running'">（等待节点输出…）</span>
     </div>
     <template v-else>
       <div ref="listEl" class="log-list" @scroll="onScroll">
         <button v-if="hiddenCount > 0" class="log-earlier link" @click="loadEarlier">
           ↑ 加载更早（还有 {{ hiddenCount }} 条）
         </button>
-        <div
-          v-for="line in rendered"
-          :key="line.seq"
-          class="log-row"
-          :class="`log-${line.level}`"
-        >
+        <div v-for="line in rendered" :key="line.seq" class="log-row" :class="`log-${line.level}`">
           <span class="log-ts">{{ fmtTime(line.ts) }}</span>
           <span class="log-level">{{ line.level }}</span>
           <button
@@ -154,7 +144,8 @@ function onSelectNode(id: string): void {
             :title="`查看节点 ${nodeName(line.node_id)}`"
             @click="onSelectNode(line.node_id)"
           >
-            {{ nodeName(line.node_id) }}<template v-if="line.attempt > 1">×{{ line.attempt }}</template>
+            {{ nodeName(line.node_id)
+            }}<template v-if="line.attempt > 1">×{{ line.attempt }}</template>
           </button>
           <span v-else class="log-node log-node-engine">⚙</span>
           <span v-if="line.stream !== 'engine'" class="log-stream">{{ line.stream }}</span>

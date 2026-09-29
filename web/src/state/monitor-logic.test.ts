@@ -12,7 +12,6 @@ import type { RunEvent, Timeline, TimelineNode } from "../types";
 
 function proj(nodes: TimelineNode[] = []): RunProjection {
   return {
-    phase: null,
     status: null,
     output: undefined,
     fatalError: null,
@@ -85,11 +84,7 @@ describe("drainBuffer：对齐后补放缓冲事件", () => {
   });
   it("日志行也参与排序：状态与日志交错的单一流", () => {
     const buf = [ev(5, "node_log"), ev(2), ev(3, "node_log")];
-    expect(drainBuffer(buf).map((e) => e.type)).toEqual([
-      "run_started",
-      "node_log",
-      "node_log",
-    ]);
+    expect(drainBuffer(buf).map((e) => e.type)).toEqual(["run_started", "node_log", "node_log"]);
   });
 });
 
@@ -100,7 +95,7 @@ describe("alignProjection：timeline 快照对齐", () => {
     alignProjection(p, timeline(9, nodes));
     expect(p.nodes).toHaveLength(2);
     expect(p.lastSeq).toBe(9);
-    expect(p.phase).toBe("running");
+    expect(p.status).toBe("running");
   });
 });
 
@@ -130,20 +125,20 @@ describe("applyEvent：事件增量应用", () => {
     expect(p.nodes[1].state).toBe("failed");
   });
 
-  it("run_completed / run_failed / run_cancelled 推进 phase 与终态字段", () => {
+  it("run_completed / run_failed / run_cancelled 推进 status 与终态字段", () => {
     const p = proj();
     applyEvent(p, ev(1, "run_completed", { output: 42 }));
-    expect(p.phase).toBe("succeeded");
+    expect(p.status).toBe("succeeded");
     expect(p.output).toBe(42);
 
     const p2 = proj();
     applyEvent(p2, ev(1, "run_failed", { error: "fatal" }));
-    expect(p2.phase).toBe("failed");
+    expect(p2.status).toBe("failed");
     expect(p2.fatalError).toBe("fatal");
 
     const p3 = proj();
     applyEvent(p3, ev(1, "run_cancelled"));
-    expect(p3.phase).toBe("cancelled");
+    expect(p3.status).toBe("cancelled");
   });
 
   it("signal_received 不改变投影", () => {
@@ -172,7 +167,7 @@ describe("缓冲 → 对齐 → 补放：attach 时序", () => {
       applied.push(e.seq);
     }
     expect(applied).toEqual([5, 6]);
-    expect(p.phase).toBe("succeeded");
+    expect(p.status).toBe("succeeded");
     expect(p.nodes[0].state).toBe("completed");
   });
 
@@ -189,9 +184,24 @@ describe("node_log：日志与状态同流但水位独立", () => {
   it("applyEvent(node_log) 追加日志行且不推进状态水位", () => {
     const p = proj([node("a")]);
     applyEvent(p, ev(2, "node_started", { node_id: "a", attempt: 1 }));
-    applyEvent(p, ev(3, "node_log", { node_id: "a", attempt: 1, level: "info", stream: "stdout", message: "hello" }));
+    applyEvent(
+      p,
+      ev(3, "node_log", {
+        node_id: "a",
+        attempt: 1,
+        level: "info",
+        stream: "stdout",
+        message: "hello",
+      }),
+    );
     expect(p.logs).toHaveLength(1);
-    expect(p.logs[0]).toMatchObject({ seq: 3, node_id: "a", level: "info", stream: "stdout", message: "hello" });
+    expect(p.logs[0]).toMatchObject({
+      seq: 3,
+      node_id: "a",
+      level: "info",
+      stream: "stdout",
+      message: "hello",
+    });
     // lastSeq 停在 2（node_started），日志不拖动状态水位
     expect(p.lastSeq).toBe(2);
     expect(p.lastLogSeq).toBe(3);
@@ -234,7 +244,7 @@ describe("node_log：日志与状态同流但水位独立", () => {
       if (seqAction(p.lastSeq, e.seq) === "apply") applyEvent(p, e);
     }
     expect(p.logs.map((l) => l.message)).toEqual(["log-a"]);
-    expect(p.phase).toBe("succeeded");
+    expect(p.status).toBe("succeeded");
     expect(p.nodes[0].state).toBe("completed");
   });
 });

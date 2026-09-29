@@ -4,6 +4,25 @@
  * 新增状态或来源时只改这一处。
  */
 
+/**
+ * runs.status 词汇表（flow-dto DbRunStatus，是服务端写入口校验的那一份）。
+ * 终态/在跑两个集合此前散在 4 处硬编码（dashboard.activeCount、
+ * dashboard.successRate、DashboardView.statusLabel、monitor 的 phaseTerminal），
+ * 新增一个状态要改 4 个地方且编译器不提醒——收敛到这里一处。
+ */
+export const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set([
+  "succeeded",
+  "failed",
+  "cancelled",
+]);
+
+/** 仍在执行、接受输入的状态。awaiting_resume 属于这一类（挂起但可续跑）。 */
+export const ACTIVE_RUN_STATUSES: ReadonlySet<string> = new Set([
+  "initializing",
+  "running",
+  "awaiting_resume",
+]);
+
 /** run 记录状态（run.list / run.get 的 status） */
 export function runStatusLabel(status: string): string {
   switch (status) {
@@ -24,20 +43,9 @@ export function runStatusLabel(status: string): string {
   }
 }
 
-/** run 投影 phase（timeline 的 fold 状态）；特殊 status 由 runStatusLabel 覆盖 */
-export function runPhaseLabel(phase: string): string {
-  switch (phase) {
-    case "running":
-      return "运行中";
-    case "succeeded":
-      return "成功";
-    case "failed":
-      return "失败";
-    case "cancelled":
-      return "已取消";
-    default:
-      return phase;
-  }
+/** 节点「忙」= running 或 retrying（retrying 只在前端存在，服务器不发射） */
+export function isBusyNodeState(state: string): boolean {
+  return state === "running" || state === "retrying";
 }
 
 /** 时间线节点状态（NodeRunState） */

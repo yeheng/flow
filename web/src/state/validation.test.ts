@@ -153,7 +153,10 @@ describe("validateDefinition", () => {
     const allTypes = [...types, switchType];
     const nodes = [
       node("start_1", "start"),
-      { ...node("switch_1", "switch"), data: { name: "switch_1", nodeType: switchType, params: {} } },
+      {
+        ...node("switch_1", "switch"),
+        data: { name: "switch_1", nodeType: switchType, params: {} },
+      },
       node("end_1", "end"),
       node("end_2", "end"),
     ];

@@ -12,7 +12,6 @@ import type { LogLine, RunEvent, Timeline, TimelineNode } from "../types";
  *   断线重连后的整体 re-attach 承担，客户端不再做缺口检测。
  */
 export interface RunProjection {
-  phase: string | null;
   status: string | null;
   output: unknown;
   fatalError: string | null;
@@ -32,7 +31,6 @@ const KEEP_LOG_LINES = 8000;
 /** 用 run.timeline 快照整体对齐投影（日志不在 timeline 里，由订阅回放补齐） */
 export function alignProjection(p: RunProjection, tl: Timeline): void {
   p.nodes = tl.nodes;
-  p.phase = tl.phase;
   p.status = tl.status;
   p.output = tl.output;
   p.fatalError = tl.fatal_error;
@@ -113,7 +111,6 @@ export function applyEvent(p: RunProjection, env: RunEvent): void {
   const rec = env.node_id ? p.nodes.find((n) => n.id === env.node_id) : undefined;
   switch (env.type) {
     case "run_started":
-      p.phase = "running";
       p.status = "running";
       break;
     case "node_started":
@@ -159,17 +156,14 @@ export function applyEvent(p: RunProjection, env: RunEvent): void {
     case "signal_received":
       break; // 信号落盘本身不改变时间线，节点终态由后续事件推进
     case "run_completed":
-      p.phase = "succeeded";
       p.status = "succeeded";
       p.output = env.output;
       break;
     case "run_failed":
-      p.phase = "failed";
       p.status = "failed";
       p.fatalError = env.error ?? null;
       break;
     case "run_cancelled":
-      p.phase = "cancelled";
       p.status = "cancelled";
       break;
   }

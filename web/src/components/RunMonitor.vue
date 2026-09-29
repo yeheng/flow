@@ -10,7 +10,7 @@ import {
   waitingHumanTasks,
 } from "../state/monitor";
 import { editor } from "../state/editor";
-import { nodeStateLabel, runPhaseLabel, runStatusLabel } from "../state/labels";
+import { nodeStateLabel, runStatusLabel } from "../state/labels";
 import LogConsole from "./LogConsole.vue";
 
 const props = withDefaults(defineProps<{ childRunNavigate?: boolean }>(), {
@@ -19,13 +19,8 @@ const props = withDefaults(defineProps<{ childRunNavigate?: boolean }>(), {
 
 const activeTab = ref<"timeline" | "logs">("timeline");
 
-/** run 投影的特殊 status（挂起/初始化）优先展示；其余回落 fold phase */
-const SPECIAL_STATUS = new Set(["initializing", "awaiting_resume"]);
-
-const phaseText = computed(() => {
-  if (monitor.status && SPECIAL_STATUS.has(monitor.status)) return runStatusLabel(monitor.status);
-  return monitor.phase ? runPhaseLabel(monitor.phase) : "";
-});
+/** run 状态文案：单一来源 monitor.status，配色与文案同源（此前分家，见提交说明） */
+const runStateText = computed(() => (monitor.status ? runStatusLabel(monitor.status) : ""));
 
 /** human_task 信号输入框内容，key = node_id */
 const signalTexts = reactive<Record<string, string>>({});
@@ -65,8 +60,8 @@ function onRowClick(nodeId: string): void {
         子 run（第 {{ monitor.breadcrumb.length }} 层）
       </span>
       <span class="run-id" :title="monitor.runId ?? ''">run {{ monitor.runId?.slice(0, 8) }}…</span>
-      <span v-if="monitor.phase" class="run-phase" :class="`run-${monitor.phase}`">
-        {{ phaseText }}
+      <span v-if="monitor.status" class="run-phase" :class="`run-${monitor.status}`">
+        {{ runStateText }}
       </span>
       <button v-if="canCancelRun" @click="cancelRun()">取消</button>
     </div>
@@ -95,68 +90,64 @@ function onRowClick(nodeId: string): void {
       >
         时间线
       </button>
-      <button
-        class="run-tab"
-        :class="{ active: activeTab === 'logs' }"
-        @click="activeTab = 'logs'"
-      >
+      <button class="run-tab" :class="{ active: activeTab === 'logs' }" @click="activeTab = 'logs'">
         日志（{{ monitor.logs.length }}）
       </button>
     </div>
     <template v-if="activeTab === 'timeline'">
       <table class="timeline">
-      <thead>
-        <tr>
-          <th>节点</th>
-          <th>状态</th>
-          <th>次数</th>
-          <th>耗时</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr
-          v-for="n in monitor.nodes"
-          :key="n.id"
-          :class="{ highlighted: editor.highlightNodeId === n.id }"
-          @mouseenter="onRowEnter(n.id)"
-          @mouseleave="onRowLeave"
-          @click="onRowClick(n.id)"
-        >
-          <td>
-            {{ n.name || n.id }}
-            <RouterLink
-              v-if="n.child_run_id && props.childRunNavigate"
-              class="child-link"
-              title="查看子 run"
-              :to="`/runs/${n.child_run_id}`"
-              @click.stop
-            >
-              子 run →
-            </RouterLink>
-            <button
-              v-else-if="n.child_run_id"
-              class="child-link"
-              title="查看子 run"
-              @click.stop="openChildRun(n.child_run_id)"
-            >
-              子 run →
-            </button>
-          </td>
-          <td>
-            <span class="run-state" :class="`run-${n.state}`">
-              {{ nodeStateLabel(n.state) }}
-            </span>
-            <div v-if="n.error" class="node-error">{{ n.error }}</div>
-            <div v-else-if="n.reason" class="node-reason">{{ n.reason }}</div>
-            <div v-else-if="n.output !== null && n.output !== undefined" class="node-output">
-              {{ fmtJson(n.output) }}
-            </div>
-          </td>
-          <td>{{ n.attempts }}</td>
-          <td>{{ n.duration_ms !== null ? `${n.duration_ms}ms` : "" }}</td>
-        </tr>
-      </tbody>
-    </table>
+        <thead>
+          <tr>
+            <th>节点</th>
+            <th>状态</th>
+            <th>次数</th>
+            <th>耗时</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr
+            v-for="n in monitor.nodes"
+            :key="n.id"
+            :class="{ highlighted: editor.highlightNodeId === n.id }"
+            @mouseenter="onRowEnter(n.id)"
+            @mouseleave="onRowLeave"
+            @click="onRowClick(n.id)"
+          >
+            <td>
+              {{ n.name || n.id }}
+              <RouterLink
+                v-if="n.child_run_id && props.childRunNavigate"
+                class="child-link"
+                title="查看子 run"
+                :to="`/runs/${n.child_run_id}`"
+                @click.stop
+              >
+                子 run →
+              </RouterLink>
+              <button
+                v-else-if="n.child_run_id"
+                class="child-link"
+                title="查看子 run"
+                @click.stop="openChildRun(n.child_run_id)"
+              >
+                子 run →
+              </button>
+            </td>
+            <td>
+              <span class="run-state" :class="`run-${n.state}`">
+                {{ nodeStateLabel(n.state) }}
+              </span>
+              <div v-if="n.error" class="node-error">{{ n.error }}</div>
+              <div v-else-if="n.reason" class="node-reason">{{ n.reason }}</div>
+              <div v-else-if="n.output !== null && n.output !== undefined" class="node-output">
+                {{ fmtJson(n.output) }}
+              </div>
+            </td>
+            <td>{{ n.attempts }}</td>
+            <td>{{ n.duration_ms !== null ? `${n.duration_ms}ms` : "" }}</td>
+          </tr>
+        </tbody>
+      </table>
     </template>
     <LogConsole v-else class="monitor-log-console" @select-node="onRowClick" />
   </div>
@@ -202,8 +193,14 @@ function onRowClick(nodeId: string): void {
 }
 
 .run-phase.run-running,
+.run-phase.run-initializing,
 .run-state.run-running {
   color: var(--run);
+}
+
+/* 挂起待恢复：不是终态也不是正常推进，用 warn 与 running 区分开 */
+.run-phase.run-awaiting_resume {
+  color: var(--warn);
 }
 
 .run-phase.run-succeeded,

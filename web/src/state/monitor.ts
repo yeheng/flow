@@ -3,6 +3,7 @@ import * as api from "../api/flow";
 import { client, errText } from "../rpc/client";
 import type { LogLine, RunEvent, TimelineNode } from "../types";
 import { editor } from "./editor";
+import { TERMINAL_RUN_STATUSES } from "./labels";
 import {
   alignProjection,
   applyEvent,
@@ -17,8 +18,12 @@ export const monitor = reactive({
   /** 当前查看的 run 所属工作流：画布着色只在仍选中同一工作流时生效 */
   workflowId: null as string | null,
   inputText: "",
-  phase: null as string | null,
-  /** run 投影状态（run.timeline status）：awaiting_resume 时 fold phase 仍是 running */
+  /**
+   * run 状态，唯一出处（run.timeline 的 status）。此前还有一份 `phase`
+   * （timeline 的 fold 相位），两者对 awaiting_resume 不一致——phase 仍是
+   * running，于是 UI 只能用 SPECIAL_STATUS 特判仲裁，结果挂起的 run 渲染成
+   * 「运行中配色 + 挂起待恢复文案」。status 是投影、是权威，删掉 phase。
+   */
   status: null as string | null,
   output: undefined as unknown,
   fatalError: null as string | null,
@@ -35,26 +40,22 @@ export const monitor = reactive({
 });
 
 /**
- * run 还在跑吗？——`phase` 可能是 `null`（timeline 还没回来/拉失败），
- * 那是**不知道**，不是「已终结」。
+ * run 已确定终结了吗？`status === null` 是**不知道**（timeline 还没回来/
+ * 拉失败），既不是终结也不是在跑——所以 `canCancelRun` / `needReattach`
+ * 都在 true 一侧：不知道的时候宁可多问一次服务端，也不谎报。
  */
-const phaseTerminal = (): boolean =>
-  monitor.phase === "succeeded" || monitor.phase === "failed" || monitor.phase === "cancelled";
+const isTerminal = (): boolean =>
+  monitor.status !== null && TERMINAL_RUN_STATUSES.has(monitor.status);
 
 /**
  * 取消按钮：不知道终态时照常可点（点了服务端会给 conflict，不算错）。
  * 判据是「没拿到终态」，不是「确定还在跑」——把 null 当成 running 是撒谎，
  * 把 null 当成终态是漏报，两者都不如承认不知道。
  */
-export const canCancelRun = computed(() => monitor.runId !== null && !phaseTerminal());
+export const canCancelRun = computed(() => monitor.runId !== null && !isTerminal());
 
-/**
- * 断线后要不要整体重建投影。判据同 canCancelRun：run 已确定终结才不重建。
- * （不拿 phase 是否为 running 当判据：timeline 拉失败时 phase 是 null，
- * 保守设 null 会让仍在跑的 run 永不重建，乐观设 running 会让早已结束的
- * run 反复重建。一个 phase 不该同时回答两个问题。）
- */
-export const needReattach = computed(() => monitor.runId !== null && !phaseTerminal());
+/** 断线后要不要整体重建投影。判据同 canCancelRun：run 已确定终结才不重建。 */
+export const needReattach = computed(() => monitor.runId !== null && !isTerminal());
 
 /** human_task 等待信号中的节点 */
 export const waitingHumanTasks = computed(() =>
@@ -124,10 +125,9 @@ async function attach(runId: string): Promise<boolean> {
   }
 
   // 局部投影：订阅建立与 timeline 对齐之间到达的事件先入缓冲。
-  // phase 缺省 null = 「还不知道」：不撒谎成 running（会对已终结的 run 显示
+  // status 缺省 null = 「还不知道」：不撒谎成 running（会对已终结的 run 显示
   // 可用取消按钮），canCancelRun / needReattach 也不依赖它是否为 running。
   const proj: RunProjection = {
-    phase: null as string | null,
     status: null as string | null,
     output: undefined as unknown,
     fatalError: null as string | null,
@@ -173,7 +173,6 @@ async function attach(runId: string): Promise<boolean> {
   // 原子换入（同步块，无 await）：monitor 从旧 run 整体切到新 run
   unsubscribe = unsub;
   monitor.runId = runId;
-  monitor.phase = proj.phase;
   monitor.status = proj.status;
   monitor.output = proj.output;
   monitor.fatalError = proj.fatalError;
@@ -219,7 +218,6 @@ export async function detachRun(): Promise<void> {
   }
   monitor.runId = null;
   monitor.workflowId = null;
-  monitor.phase = null;
   monitor.status = null;
   monitor.output = undefined;
   monitor.fatalError = null;

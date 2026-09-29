@@ -185,6 +185,12 @@ export interface LogLine {
 export interface Timeline {
   run_id: string;
   status: string;
+  /**
+   * 服务端 timeline 仍带 phase（fold 相位），但前端不再消费：它与 status 对
+   * awaiting_resume 不一致（phase=running / status=awaiting_resume），是前端
+   * 曾经需要 SPECIAL_STATUS 特判才能渲染对配色的根因。字段保留在 wire 上，
+   * 前端只以 status 为准。
+   */
   phase: RunPhase;
   workflow_id: string;
   workflow_version: number;

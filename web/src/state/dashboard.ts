@@ -1,23 +1,22 @@
 import type { WorkflowRunStats } from "../types";
+import { ACTIVE_RUN_STATUSES, TERMINAL_RUN_STATUSES } from "./labels";
 
 /**
  * 仪表盘聚合：数据源是 run.stats（服务端 GROUP BY 精确计数），不再做客户端采样聚合。
  * 这里的纯函数只负责把 by_status 映射成展示用的派生值。
  */
 
-/** 进行中（非终态）计数：running / initializing / awaiting_resume */
+/** 进行中（非终态）计数：ACTIVE_RUN_STATUSES 的求和 */
 export function activeCount(byStatus: Record<string, number>): number {
-  return (
-    (byStatus["running"] ?? 0) +
-    (byStatus["initializing"] ?? 0) +
-    (byStatus["awaiting_resume"] ?? 0)
-  );
+  let total = 0;
+  for (const status of ACTIVE_RUN_STATUSES) total += byStatus[status] ?? 0;
+  return total;
 }
 
 /** 终态 run 中 succeeded 的占比（0-1）；没有终态 run 时为 null（显示 —，不显示 0%） */
 export function successRate(byStatus: Record<string, number>): number | null {
-  const terminal =
-    (byStatus["succeeded"] ?? 0) + (byStatus["failed"] ?? 0) + (byStatus["cancelled"] ?? 0);
+  let terminal = 0;
+  for (const status of TERMINAL_RUN_STATUSES) terminal += byStatus[status] ?? 0;
   return terminal > 0 ? (byStatus["succeeded"] ?? 0) / terminal : null;
 }
 

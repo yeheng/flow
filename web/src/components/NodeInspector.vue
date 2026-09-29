@@ -29,9 +29,7 @@ const logsByAttempt = computed<Array<[number, LogLine[]]>>(() => {
   return [...groups.entries()];
 });
 
-const hasInput = computed(
-  () => node.value?.input !== undefined && node.value?.input !== null,
-);
+const hasInput = computed(() => node.value?.input !== undefined && node.value?.input !== null);
 const hasOutput = computed(
   () =>
     node.value?.output !== null &&

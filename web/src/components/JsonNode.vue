@@ -10,16 +10,12 @@ const props = withDefaults(
   { name: "", depth: 0, comma: false },
 );
 
-const isObject = computed(
-  () => props.value !== null && typeof props.value === "object",
-);
+const isObject = computed(() => props.value !== null && typeof props.value === "object");
 
 const entries = computed<Array<[string, unknown]>>(() => {
   if (!isObject.value) return [];
   const v = props.value as Record<string, unknown> | unknown[];
-  return Array.isArray(v)
-    ? v.map((item, i) => [String(i), item])
-    : Object.entries(v);
+  return Array.isArray(v) ? v.map((item, i) => [String(i), item]) : Object.entries(v);
 });
 
 const kindClass = computed(() => {
@@ -47,9 +43,7 @@ const scalarText = computed(() => {
 
 /** 对象/数组的摘要标签（避免在模板里写嵌套模板字符串） */
 const metaText = computed(() =>
-  Array.isArray(props.value)
-    ? `Array(${entries.value.length})`
-    : `Object(${entries.value.length})`,
+  Array.isArray(props.value) ? `Array(${entries.value.length})` : `Object(${entries.value.length})`,
 );
 </script>
 
