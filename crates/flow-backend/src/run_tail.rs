@@ -43,6 +43,40 @@ pub(crate) fn run_tail(
     .boxed()
 }
 
+/// 状态机的相位。
+///
+/// 这里此前是五个 bool（`backfilled`/`needs_fill`/`fill_failed`/`done`/`closed`），
+/// 32 种组合里约一半非法——而且非法组合是可构造的：旧代码先置 `needs_fill`
+/// 再置 `done`，得到「已结束但仍有缺口」。相位是一个值，不变量由类型保证：
+/// - 缺口**不是**状态，是 `events` 里最小 seq 与 `last_seq` 的关系（`has_gap`）；
+/// - 回放是否完成过由 `Replaying → Streaming` 的迁移表达，不是独立开关；
+/// - 补齐失败 = `Filling`，与「要补齐」是同一个相位，不存在
+///   「有缺口但没在补」或「没缺口却在退避」这两种矛盾组合。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// 首次全量回放（seq=1 起）尚未成功过。
+    Replaying,
+    /// 回放完成，追流中。有缺口时转 `Filling`。
+    Streaming,
+    /// 正在等一个缺口被补齐；`retry_at` 到点后重试补齐。
+    Filling { retry_at: tokio::time::Instant },
+    /// 终态事件已转发，流结束。
+    Done,
+    /// 共享流已关闭（进程停机），尽力补齐剩余后收尾。
+    Closed,
+}
+
+impl Phase {
+    /// 还有机会拿到数据（终态/已关闭之外的一切相位）。
+    fn is_live(self) -> bool {
+        !matches!(self, Phase::Done | Phase::Closed)
+    }
+    /// 是否处于「不能空转、要等唤醒」的相位。
+    fn is_filling(self) -> bool {
+        matches!(self, Phase::Filling { .. })
+    }
+}
+
 struct RunTail {
     reader: Arc<dyn EventReader>,
     rx: broadcast::Receiver<Envelope>,
@@ -51,14 +85,7 @@ struct RunTail {
     last_seq: u64,
     /// 按 seq 去重、有序暂存（补齐段与实时段会重叠）。
     events: BTreeMap<u64, Envelope>,
-    /// 回放（seq=1 起）是否已成功完成过。
-    backfilled: bool,
-    /// 存在待补齐的缺口（含首次回放）。
-    needs_fill: bool,
-    /// 上次补齐失败：等重试定时器或新事件唤醒，不空转。
-    fill_failed: bool,
-    done: bool,
-    closed: bool,
+    phase: Phase,
 }
 
 impl RunTail {
@@ -73,18 +100,40 @@ impl RunTail {
             run_id,
             last_seq: 0,
             events: BTreeMap::new(),
-            backfilled: false,
-            needs_fill: true,
-            fill_failed: false,
-            done: false,
-            closed: false,
+            phase: Phase::Replaying,
         }
+    }
+
+    /// 回放起点：已完成过回放则从 `last_seq+1` 续，否则从 1 全量。
+    fn fill_from(&self) -> u64 {
+        match self.phase {
+            Phase::Replaying => 1,
+            _ => self.last_seq + 1,
+        }
+    }
+
+    /// 暂存区里是否还有 `last_seq` 之后的缺口（连续段之外的事件）。
+    fn has_gap(&self) -> bool {
+        self.events
+            .keys()
+            .next()
+            .is_some_and(|seq| *seq > self.last_seq + 1)
+    }
+
+    /// 进入补齐相位；已在补齐则保留原退避（不重置计时器）。
+    fn ensure_filling(&mut self) {
+        if self.phase.is_filling() {
+            return;
+        }
+        self.phase = Phase::Filling {
+            retry_at: tokio::time::Instant::now() + FILL_RETRY,
+        };
     }
 
     async fn advance(&mut self) -> Option<Envelope> {
         loop {
             // 1) 排水：只吐严格连续的前缀。重复（补齐段与实时段重叠）丢弃；
-            //    缺口绝不跳过——置 needs_fill 去补齐，否则事件被静默吞掉。
+            //    缺口绝不跳过——转 Filling 去补齐，否则事件被静默吞掉。
             match self.events.keys().next().copied() {
                 Some(seq) if seq <= self.last_seq => {
                     self.events.remove(&seq);
@@ -94,25 +143,22 @@ impl RunTail {
                     let envelope = self.events.remove(&seq).unwrap();
                     self.last_seq = seq;
                     if envelope.event.is_run_terminal() {
-                        self.done = true;
+                        self.phase = Phase::Done;
                     }
                     return Some(envelope);
                 }
-                Some(_) => self.needs_fill = true,
+                // 缺口：绝不跳，转 Filling 去补齐（已在 Filling 就不重置退避）
+                Some(_) => self.ensure_filling(),
                 None => {}
             }
-            if self.done || self.closed {
+            if !self.phase.is_live() {
                 return None;
             }
 
-            // 2) 补齐（backfilled 前是回放全量）。失败不重试过热，
-            //    置 fill_failed 后等唤醒——绝不在缺口未补齐时继续吐事件。
-            if self.needs_fill && !self.fill_failed {
-                let from = if self.backfilled {
-                    self.last_seq + 1
-                } else {
-                    1
-                };
+            // 2) 补齐。回放期（Replaying）读全量；追流期读 last_seq+1 起的增量。
+            //    失败不重试过热：转 Filling 等唤醒，绝不在缺口未补齐时继续吐事件。
+            if !self.phase.is_filling() {
+                let from = self.fill_from();
                 match self.reader.read_events(&self.run_id, Some(from)).await {
                     Ok(list) => {
                         let replay_from_start = from == 1;
@@ -123,9 +169,9 @@ impl RunTail {
                                 added = true;
                             }
                         }
-                        self.backfilled = true;
-                        self.needs_fill = false;
-                        self.fill_failed = false;
+                        if self.phase == Phase::Replaying {
+                            self.phase = Phase::Streaming;
+                        }
                         // 防御 1：seq=1 起的回放一条事件都没有——run 不存在（PG reader
                         // 报 RunNotFound）或初始化中断的空日志（SQLite 臂崩溃窗口：
                         // event.jsonl 已建、run_started 未落盘，恢复已按 DB 投影标终态）。
@@ -135,22 +181,16 @@ impl RunTail {
                                 run_id = %self.run_id,
                                 "事件日志为空（run 不存在或初始化中断），结束订阅流"
                             );
-                            self.done = true;
+                            self.phase = Phase::Done;
                         }
                         // 防御 2：补齐成功却毫无新数据而缺口仍在（日志里根本没有
                         // 缺口段）——继续只能空转，吐完连续段后结束流。
-                        if !added
-                            && self
-                                .events
-                                .keys()
-                                .next()
-                                .is_some_and(|seq| *seq > self.last_seq + 1)
-                        {
+                        if !added && self.has_gap() {
                             tracing::warn!(
                                 run_id = %self.run_id,
                                 "订阅游标缺口无法从日志补齐，结束订阅流"
                             );
-                            self.done = true;
+                            self.phase = Phase::Done;
                         }
                     }
                     Err(err) => {
@@ -159,7 +199,7 @@ impl RunTail {
                         // 结束流而非谎报终结、跳缺口或用调用方无法区分的挂起。
                         if matches!(err, BackendError::RunNotFound(_)) {
                             tracing::debug!(run_id = %self.run_id, "订阅的 run 不存在，结束订阅流");
-                            self.done = true;
+                            self.phase = Phase::Done;
                             continue;
                         }
                         // 其余失败：不谎报终结、不跳缺口：等重试定时器或下一条事件唤醒
@@ -168,37 +208,45 @@ impl RunTail {
                             error = %err,
                             "订阅补齐读取失败，稍后重试"
                         );
-                        self.fill_failed = true;
+                        self.ensure_filling();
                     }
                 }
                 continue;
             }
 
             // 3) 等待唤醒：新事件（快路径）/ 补齐重试定时器 / 共享流关闭
+            let retry_at = match self.phase {
+                Phase::Filling { retry_at } => retry_at,
+                _ => tokio::time::Instant::now() + FILL_RETRY,
+            };
+            let sleep = tokio::time::sleep_until(retry_at);
+            tokio::pin!(sleep);
             tokio::select! {
-                _ = tokio::time::sleep(FILL_RETRY), if self.needs_fill => {
-                    self.fill_failed = false;
+                _ = &mut sleep => {
+                    // 重试窗口到了：回到「去补齐」
+                    self.phase = Phase::Streaming;
                 }
                 received = self.rx.recv() => {
                     match received {
                         Ok(envelope) if envelope.run_id == self.run_id => {
                             if envelope.seq > self.last_seq {
                                 if envelope.seq > self.last_seq + 1 {
-                                    self.needs_fill = true;
+                                    self.ensure_filling();
                                 }
                                 self.events.insert(envelope.seq, envelope);
                             }
-                            self.fill_failed = false;
+                            if self.phase.is_filling() {
+                                // 新事件是有效唤醒：立刻重试补齐，不等退避
+                                self.phase = Phase::Streaming;
+                            }
                         }
                         Ok(_) => {}
                         // 广播追赶不上：丢的是唤醒不是数据，整体补齐
                         Err(broadcast::error::RecvError::Lagged(_)) => {
-                            self.needs_fill = true;
-                            self.fill_failed = false;
+                            self.phase = Phase::Streaming;
                         }
                         // 共享流关闭（进程停机）：尽力补齐剩余后收尾
                         Err(broadcast::error::RecvError::Closed) => {
-                            self.closed = true;
                             if let Ok(list) = self
                                 .reader
                                 .read_events(&self.run_id, Some(self.last_seq + 1))
@@ -207,9 +255,8 @@ impl RunTail {
                                 for envelope in list {
                                     self.events.insert(envelope.seq, envelope);
                                 }
-                                self.needs_fill = false;
-                                self.fill_failed = false;
                             }
+                            self.phase = Phase::Closed;
                         }
                     }
                 }
