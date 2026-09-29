@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -373,16 +373,73 @@ pub struct Edge {
 }
 
 /// 工作流图。前端拖拽的产物，整体作为一个不可变版本存入数据库。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Definition {
     pub nodes: Vec<Node>,
     #[serde(default)]
     pub edges: Vec<Edge>,
+    /// 邻接索引，一次构建。**必须 skip**：Definition 是落库的版本快照，
+    /// `flow_store` 还按它的序列化字节算 checksum 决定是否复用版本号
+    /// （store/src/lib.rs）。让索引进入序列化就等于给每个 definition 的
+    /// checksum 掺入缓存内容，版本复用契约当场失效。`skip` 保持字节不变。
+    ///
+    /// 私有字段顺带强制了「只能经 `serde_json::from_value` 构造」——全仓库
+    /// 确实没有任何调用方用结构体字面量构造 `Definition`。
+    #[serde(skip)]
+    adj: OnceLock<DefinitionIndex>,
+}
+
+/// 邻接索引：按 id 预分组入边/出边 + 节点直查。
+///
+/// 存在理由：此前 `node()` 线性扫 `nodes`，`incoming()`/`outgoing()` 全扫
+/// `edges` 并**每次分配一个 Vec**。`check_acyclic_and_reachable` 为了算入度
+/// 给每个节点分配一个 Vec 只为取 `.len()`；`Driver::plan` 与 `prepare_inputs`
+/// 在一个 run 的生命周期里对每个节点各调一次。O(N·E) + 每调用一次分配。
+#[derive(Debug, Clone, Default)]
+struct DefinitionIndex {
+    by_id: HashMap<String, usize>,
+    incoming: HashMap<String, Vec<usize>>,
+    outgoing: HashMap<String, Vec<usize>>,
+}
+
+/// 相等性只看图本身：邻接索引是纯缓存（且被 `serde(skip)` 排除），
+/// 「两个定义相等」= 它们的序列化字节相等——这正是版本复用按 checksum 判定的
+/// 那条契约。
+impl PartialEq for Definition {
+    fn eq(&self, other: &Self) -> bool {
+        self.nodes == other.nodes && self.edges == other.edges
+    }
 }
 
 impl Definition {
+    /// 一次性构建的邻接索引。
+    ///
+    /// **契约：`nodes` / `edges` 在构造后不可变。** 全仓库唯一的构造入口是
+    /// `serde_json::from_value`（`nodes`/`edges` 是 `pub` 但没有任何调用方写过
+    /// 它们），所以这里不做失效判断——那是为不存在的场景写的机制。
+    /// 要改定义，走新的反序列化，拿到的是一个全新 `Definition`。
+    fn index(&self) -> &DefinitionIndex {
+        self.adj.get_or_init(|| {
+            let mut by_id = HashMap::with_capacity(self.nodes.len());
+            for (i, node) in self.nodes.iter().enumerate() {
+                by_id.entry(node.id.clone()).or_insert(i);
+            }
+            let mut incoming: HashMap<String, Vec<usize>> = HashMap::new();
+            let mut outgoing: HashMap<String, Vec<usize>> = HashMap::new();
+            for (i, edge) in self.edges.iter().enumerate() {
+                incoming.entry(edge.to.clone()).or_default().push(i);
+                outgoing.entry(edge.from.clone()).or_default().push(i);
+            }
+            DefinitionIndex {
+                by_id,
+                incoming,
+                outgoing,
+            }
+        })
+    }
+
     pub fn node(&self, id: &str) -> Option<&Node> {
-        self.nodes.iter().find(|n| n.id == id)
+        self.index().by_id.get(id).map(|i| &self.nodes[*i])
     }
 
     pub fn node_type(&self, id: &str) -> Option<NodeType> {
@@ -390,11 +447,26 @@ impl Definition {
     }
 
     pub fn incoming(&self, id: &str) -> Vec<&Edge> {
-        self.edges.iter().filter(|e| e.to == id).collect()
+        match self.index().incoming.get(id) {
+            Some(edges) => edges.iter().map(|i| &self.edges[*i]).collect(),
+            None => Vec::new(),
+        }
     }
 
     pub fn outgoing(&self, id: &str) -> Vec<&Edge> {
-        self.edges.iter().filter(|e| e.from == id).collect()
+        match self.index().outgoing.get(id) {
+            Some(edges) => edges.iter().map(|i| &self.edges[*i]).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// 入边条数：不必物化 `Vec<&Edge>`（校验入度、判定 start/end 走这条）。
+    pub fn incoming_count(&self, id: &str) -> usize {
+        self.index().incoming.get(id).map_or(0, Vec::len)
+    }
+
+    pub fn outgoing_count(&self, id: &str) -> usize {
+        self.index().outgoing.get(id).map_or(0, Vec::len)
     }
 
     pub fn start_node(&self) -> Option<&Node> {
@@ -473,17 +545,17 @@ impl Definition {
             let kind = node.kind().unwrap();
             match kind {
                 NodeType::Start => {
-                    if !self.incoming(&node.id).is_empty() {
+                    if self.incoming_count(&node.id) > 0 {
                         return Err(format!("start 节点 {} 不能有入边", node.id));
                     }
                 }
                 NodeType::End => {
-                    if !self.outgoing(&node.id).is_empty() {
+                    if self.outgoing_count(&node.id) > 0 {
                         return Err(format!("end 节点 {} 不能有出边", node.id));
                     }
                 }
                 _ => {
-                    if self.incoming(&node.id).is_empty() {
+                    if self.incoming_count(&node.id) == 0 {
                         return Err(format!("节点 {} 没有入边，永远无法触发", node.id));
                     }
                 }
@@ -497,7 +569,7 @@ impl Definition {
         let mut indegree: HashMap<&str, usize> = self
             .nodes
             .iter()
-            .map(|n| (n.id.as_str(), self.incoming(&n.id).len()))
+            .map(|n| (n.id.as_str(), self.incoming_count(&n.id)))
             .collect();
 
         let mut queue: VecDeque<&str> = indegree
@@ -1151,5 +1223,111 @@ mod tests {
         assert_eq!(d.outgoing("s").len(), 1);
         assert_eq!(d.incoming("s").len(), 0, "start 没有入边");
         assert_eq!(d.outgoing("e").len(), 0, "end 没有出边");
+    }
+
+    /// 邻接索引是纯缓存：**绝不进入序列化**。
+    ///
+    /// `flow_store::definition_checksum` 按 `serde_json::to_vec(definition)`
+    /// 算 checksum 决定「相同定义复用版本号」。索引一旦进了序列化，每个
+    /// definition 的 checksum 都会掺入缓存内容，版本复用契约当场失效。
+    #[test]
+    fn adjacency_index_never_enters_serialization() {
+        let d = linear();
+        // 先访问一次把索引建出来（有缓存的实例 vs 干净实例）
+        assert_eq!(d.incoming_count("n"), 1);
+        assert_eq!(d.outgoing_count("s"), 1);
+        let after_cache = serde_json::to_string(&d).unwrap();
+
+        let fresh = linear(); // 全新反序列化，索引未建
+        let before_cache = serde_json::to_string(&fresh).unwrap();
+        assert_eq!(
+            before_cache, after_cache,
+            "建索引前后序列化字节必须完全一致"
+        );
+        // 反序列化回来仍然相等（PartialEq 手动实现，不含缓存）
+        assert_eq!(fresh, d);
+    }
+
+    /// 索引访问器与全扫描实现必须给出同一答案（邻接分组最容易写错的形状：
+    /// 入/出边搞反、重复边、指向不存在节点的边）。
+    #[test]
+    fn indexed_accessors_match_linear_scan() {
+        let d = def(
+            vec![
+                node("s", "start"),
+                node("a", "script"),
+                node("b", "script"),
+                node("c", "condition"),
+                node("e", "end"),
+            ],
+            vec![
+                json!({"from": "s", "to": "a"}),
+                json!({"from": "a", "to": "b"}),
+                json!({"from": "b", "to": "c"}),
+                json!({"from": "c", "to": "e", "port": "true"}),
+                json!({"from": "c", "to": "a", "port": "false"}),
+            ],
+        );
+        for id in ["s", "a", "b", "c", "e", "nope"] {
+            let linear_in: Vec<_> = d.edges.iter().filter(|e| e.to == id).collect();
+            let linear_out: Vec<_> = d.edges.iter().filter(|e| e.from == id).collect();
+            assert_eq!(d.incoming(id), linear_in, "incoming({id}) 不一致");
+            assert_eq!(d.outgoing(id), linear_out, "outgoing({id}) 不一致");
+            assert_eq!(d.incoming_count(id), linear_in.len());
+            assert_eq!(d.outgoing_count(id), linear_out.len());
+            assert_eq!(d.node(id).is_some(), d.nodes.iter().any(|n| n.id == id));
+        }
+        // 重复边也要两条都在（去重是 validate 的职责，不是索引的）
+        let dup = def(
+            vec![node("s", "start"), node("a", "script"), node("e", "end")],
+            vec![
+                json!({"from": "s", "to": "a"}),
+                json!({"from": "s", "to": "a"}),
+                json!({"from": "a", "to": "e"}),
+            ],
+        );
+        assert_eq!(dup.incoming_count("a"), 2, "重复边不应被索引悄悄去重");
+    }
+
+    /// 防回退护栏：`validate` 不得退回 O(N·E) 全扫描。1000 节点 / 2000 边
+    /// 的宽图，全扫描版本要跑百万次边比较；带索引的版本是线性的。
+    #[test]
+    fn validate_scales_linearly_on_a_wide_graph() {
+        const N: usize = 2000; // script 节点数，另有 start 与 end
+        let mut nodes: Vec<Value> = vec![json!({"id": "s", "type": "start"})];
+        for i in 0..N {
+            nodes.push(json!({"id": format!("n{i}"), "type": "script",
+                             "params": {"code": "return 1;"}}));
+        }
+        nodes.push(json!({"id": "e", "type": "end"}));
+
+        let mut edges: Vec<Value> = vec![json!({"from": "s", "to": "n0"})];
+        for i in 0..N {
+            if i + 1 < N {
+                // 链式（保证可达）+ 短程扇出（保证入度/出度都非平凡），
+                // 边一律从小 id 指向大 id → 无环
+                edges.push(json!({"from": format!("n{i}"), "to": format!("n{}", i + 1)}));
+                for j in 2..=3 {
+                    if i + j < N {
+                        edges.push(json!({"from": format!("n{i}"), "to": format!("n{}", i + j)}));
+                    }
+                }
+            } else {
+                edges.push(json!({"from": format!("n{i}"), "to": "e"}));
+            }
+        }
+
+        let d = def(nodes, edges);
+        assert!(d.validate().is_ok(), "宽图应当是合法 DAG");
+        let started = std::time::Instant::now();
+        assert!(d.validate().is_ok());
+        let elapsed = started.elapsed();
+        // 阈值取「带索引」与「全扫描」之间的中点：debug 构建下带索引约
+        // 20ms、全扫描约 800ms。护栏必须能真的红——初版写 500ms 时实测
+        // 全扫描也能过，那就不叫护栏。
+        assert!(
+            elapsed.as_millis() < 250,
+            "validate 在 {N} 节点宽图上耗时 {elapsed:?}——邻接索引被绕过了？"
+        );
     }
 }
