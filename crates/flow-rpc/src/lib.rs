@@ -838,7 +838,7 @@ fn signal_ack_value(ack: SignalAck) -> Result<Value, ErrorObjectOwned> {
 pub(crate) fn node_types() -> Value {
     json!(NodeType::ALL
         .iter()
-        .map(|kind| kind.descriptor())
+        .map(|kind| kind.descriptor().clone())
         .collect::<Vec<Value>>())
 }
 

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -78,7 +79,7 @@ impl NodeType {
     /// `params_schema` 是 JSON Schema draft-07 子集（type/required/properties/enum/default），
     /// 另带 `x-widget`（code/json/workflow-picker）、`x-label`、`x-help` 扩展，
     /// 前端据此递归渲染参数表单，后端 validate 仍以本文件的 validate_params 为准。
-    pub fn descriptor(self) -> Value {
+    fn build_descriptor(self) -> Value {
         match self {
             NodeType::Start => serde_json::json!({
                 "type": "start",
@@ -242,22 +243,33 @@ impl NodeType {
         }
     }
 
+    /// 能力描述（`nodetypes.list` 的单条）。内容由 [`NodeType::build_descriptor`]
+    /// 那张表决定，这里只做一次性构建 + 缓存。
+    ///
+    /// 缓存是必要的：`descriptor()` 此前每次调用都重新跑一遍 `json!`，而
+    /// 构造出来的一棵 20 行 schema 树没人改动。返回 `&'static Value` 而非
+    /// clone——调用方（RPC 的 `node_types`）本来就只要拼进响应里。
+    pub fn descriptor(self) -> &'static Value {
+        static DESCRIPTORS: LazyLock<[Value; 10]> =
+            LazyLock::new(|| std::array::from_fn(|i| NodeType::ALL[i].build_descriptor()));
+        &DESCRIPTORS[self as usize]
+    }
+
     /// params_schema 中标记 `x-secret` 的参数名。definition 里这些参数只存
     /// 密钥**名称**，真值在执行前按名称从 `FLOW_SECRET_<名称>` 环境变量注入
-    /// （见 secrets.rs）。列表从 descriptor 派生，schema 是唯一事实源。
-    pub fn secret_params(self) -> Vec<String> {
-        let descriptor = self.descriptor();
-        let Some(properties) = descriptor
-            .pointer("/params_schema/properties")
-            .and_then(Value::as_object)
-        else {
-            return Vec::new();
-        };
-        properties
-            .iter()
-            .filter(|(_, schema)| schema.get("x-secret") == Some(&Value::Bool(true)))
-            .map(|(key, _)| key.clone())
-            .collect()
+    /// （见 secrets.rs）。
+    ///
+    /// 形状与 `opaque_params` 一致（`&'static [&'static str]` 的 match）：不要
+    /// 改成「从 `descriptor()` 派生」——那要求为了找两三个 key 把整个 JSON
+    /// schema 序列化进内存，而 `resolve_node_secrets` 在**每个节点执行**上、
+    /// `missing_secrets` 在**每次 `workflow.update`** 上都调它。
+    /// `descriptor` 里那两处 `"x-secret": true` 是给前端渲染表单用的，两边
+    /// 必须同步——`secret_params_agree_with_descriptor` 钉住这个约定。
+    pub fn secret_params(self) -> &'static [&'static str] {
+        match self {
+            NodeType::Llm | NodeType::Email => &["api_key"],
+            _ => &[],
+        }
     }
 
     /// 该类型 params 中**不可**被 `${}` 模板展开的「代码承载字段」。
@@ -1054,11 +1066,42 @@ mod tests {
 
     /// x-secret 参数清单从 descriptor 派生：schema 是唯一事实源。
     #[test]
-    fn secret_params_come_from_descriptor_schema() {
-        assert_eq!(NodeType::Llm.secret_params(), vec!["api_key".to_string()]);
-        assert_eq!(NodeType::Email.secret_params(), vec!["api_key".to_string()]);
+    fn secret_params_are_the_expected_keys() {
+        assert_eq!(NodeType::Llm.secret_params(), &["api_key"]);
+        assert_eq!(NodeType::Email.secret_params(), &["api_key"]);
         assert!(NodeType::HttpCall.secret_params().is_empty());
         assert!(NodeType::Script.secret_params().is_empty());
+    }
+
+    /// `secret_params()` 与 descriptor 的 `x-secret` 标记必须一致。
+    ///
+    /// 两者现在是各自维护的表（静态表 vs `json!` 里的 `"x-secret": true`），
+    /// 不再是代码派生关系——所以「一致」从类型保证退化成一条约定，这条测试
+    /// 就是那个约定的守卫：任何一边漏改，这里立刻红。
+    /// （不再断言「派生」是因为派生要求为了找两三个 key 构造整棵 schema 树，
+    /// 而 `secret_params` 在每个节点执行与每次 `workflow.update` 上都调。）
+    #[test]
+    fn secret_params_agree_with_descriptor() {
+        for kind in NodeType::ALL {
+            let from_schema: Vec<&str> = kind
+                .descriptor()
+                .pointer("/params_schema/properties")
+                .and_then(Value::as_object)
+                .map(|props| {
+                    props
+                        .iter()
+                        .filter(|(_, s)| s.get("x-secret") == Some(&Value::Bool(true)))
+                        .map(|(k, _)| k.as_str())
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                kind.secret_params(),
+                from_schema.as_slice(),
+                "{} 的 secret_params 与 descriptor 的 x-secret 标记不一致",
+                kind.as_str()
+            );
+        }
     }
 
     /// llm / email 的必填参数校验。

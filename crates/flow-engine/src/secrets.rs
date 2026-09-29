@@ -44,12 +44,12 @@ pub fn resolve_node_secrets(node: &Node) -> Result<Option<Node>, String> {
     let Some(map) = node.params.as_object() else {
         return Ok(None);
     };
-    if !keys.iter().any(|key| map.contains_key(key)) {
+    if !keys.iter().any(|key| map.contains_key(*key)) {
         return Ok(None);
     }
     let mut params = node.params.clone();
     for key in keys {
-        let Some(name) = params.get(&key).and_then(Value::as_str) else {
+        let Some(name) = params.get(key).and_then(Value::as_str) else {
             continue;
         };
         let value = get_secret(name).ok_or_else(|| {
@@ -75,7 +75,7 @@ pub fn missing_secrets(definition: &Definition) -> Vec<(String, String)> {
             continue;
         };
         for key in kind.secret_params() {
-            let Some(name) = node.params.get(&key).and_then(Value::as_str) else {
+            let Some(name) = node.params.get(key).and_then(Value::as_str) else {
                 continue;
             };
             if name.contains("${") {
