@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 type Handler = ((ev: { data: string }) => void) | null;
 
@@ -30,6 +30,14 @@ class MockWebSocket {
   open(): void {
     this.readyState = MockWebSocket.OPEN;
     this.onopen?.();
+  }
+
+  /**
+   * 只置状态、不回调 onclose——模拟「旧 socket 的 onclose 在新 socket 就位
+   * 之后才姗姗来迟」。真实浏览器会这样；同步触发 onclose 的 close() 测不出来。
+   */
+  closeSilently(): void {
+    this.readyState = MockWebSocket.CLOSED;
   }
 
   receive(msg: unknown): void {
@@ -151,5 +159,98 @@ describe("RpcClient：请求/响应匹配与订阅映射", () => {
     // 稍等一拍，确认没有叠加的第二条
     await new Promise((r) => setTimeout(r, 20));
     expect(ws2.sent).toHaveLength(1);
+  });
+});
+
+describe("RpcClient：重连生命周期", () => {
+  beforeEach(() => {
+    MockWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", MockWebSocket);
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  // 说明：旧实现（丢弃 setTimeout 句柄）的这条用例**不**变红——因为
+  // MockWebSocket 的 readyState 变化让 connect() 的早退恰好挡住了多余连接。
+  // 真正的失效场景（定时器各自排链、指数退避被重置）由下面的句柄断言覆盖。
+  it("至多一个 pending 重连定时器：连续断线不会排出多条重连链", async () => {
+    const client = await freshClient();
+    client.call("workflow.list", {}).catch(() => {});
+    const ws = MockWebSocket.instances[0];
+    ws.open();
+    await vi.waitFor(() => expect(ws.sent).toHaveLength(1));
+
+    // 第一次断开 → 排 T1
+    ws.close();
+    expect(MockWebSocket.instances).toHaveLength(1);
+
+    // T1 到期、新连接建立后它立刻再断开：会排 T2
+    await vi.advanceTimersByTimeAsync(2000);
+    const ws2 = MockWebSocket.instances[1];
+    ws2.open();
+    ws2.close();
+    expect(MockWebSocket.instances).toHaveLength(2);
+
+    // T1 若没被清掉，此刻仍在队列里；两个定时器都推进也只应新建**一个**连接
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(MockWebSocket.instances, "重连定时器必须互斥，不能每次断开都新排一条链").toHaveLength(3);
+  });
+
+  it("重连定时器句柄至多一个：旧实现丢弃句柄时 timer 计数会累积", async () => {
+    const client = await freshClient();
+    client.call("workflow.list", {}).catch(() => {});
+    const ws = MockWebSocket.instances[0];
+    ws.open();
+    await vi.waitFor(() => expect(ws.sent).toHaveLength(1));
+
+    // 反复断开：每次 onclose 排一个定时器。互斥实现下，
+    // 待触发的定时器数量恒为 1。
+    for (let i = 0; i < 4; i++) {
+      const live = MockWebSocket.instances[MockWebSocket.instances.length - 1];
+      live.open();
+      live.close();
+    }
+    const pendingTimers = vi.getTimerCount();
+    expect(pendingTimers, `4 次断开后仍有 ${pendingTimers} 个待触发定时器，句柄没被复用`).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(60000);
+  });
+
+  it("旧 socket 的迟到 onclose 不影响新 socket：在飞请求不被误 reject", async () => {
+    const client = await freshClient();
+    const p = client.call("run.get", { run_id: "r1" });
+    const ws1 = MockWebSocket.instances[0];
+    ws1.open();
+    await vi.waitFor(() => expect(ws1.sent).toHaveLength(1));
+
+    // 旧连接真正断开 → 重连
+    ws1.close();
+    await vi.advanceTimersByTimeAsync(1000);
+    const ws2 = MockWebSocket.instances[1];
+    ws2.open();
+
+    // 新连接上发起一个在飞请求
+    const p2 = client.call("run.list", {});
+    await vi.waitFor(() => expect(ws2.sent).toHaveLength(1));
+    const req2 = ws2.lastSent();
+
+    // 旧 socket 的 onclose 姗姗来迟（浏览器里真实存在）
+    ws1.closeSilently();
+    ws1.onclose?.();
+
+    // 新连接的在飞请求必须仍然可完成
+    let settled = false;
+    void p2.then(() => {
+      settled = true;
+    });
+    ws2.receive({ jsonrpc: "2.0", id: req2.id, result: { runs: [] } });
+    await expect(p2).resolves.toEqual({ runs: [] });
+    expect(settled).toBe(true);
+
+    // 旧连接的失败请求照常 reject（它确实死了）
+    await expect(p).rejects.toThrow();
   });
 });

@@ -54,6 +54,8 @@ class RpcClient {
   private serverToLocal = new Map<unknown, number>();
   private everConnected = false;
   private reconnectDelay = 500;
+  /** pending 的重连定时器句柄：至多一个，connect() 开头清理 */
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectCbs: Array<() => void> = [];
 
   onReconnect(cb: () => void): void {
@@ -114,6 +116,12 @@ class RpcClient {
 
   private connect(): void {
     if (this.ws && this.ws.readyState !== WebSocket.CLOSED) return;
+    // 单一 pending 重连定时器：旧实现丢弃 setTimeout 句柄，B 的 onclose 排的
+    // T2 与 A 排的 T1 会同时在飞，指数退避也就失效了
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     const ws = new WebSocket(this.url);
     this.ws = ws;
 
@@ -137,17 +145,31 @@ class RpcClient {
     ws.onmessage = (e: MessageEvent<string>) => this.onMessage(e.data);
 
     ws.onclose = () => {
+      // 归属检查：一个旧 socket 的 onclose 可能在新 socket 已就位之后才触发，
+      // 无条件清 this.ws 会把活连接置空、并在飞的请求全 reject 成「连接断开」。
+      if (this.ws !== ws) return;
       this.connected.value = false;
       this.ws = null;
       const err = new RpcError(-32000, "与 flow-server 的连接已断开");
       for (const p of this.pending.values()) p.reject(err);
       this.pending.clear();
       for (const w of this.openWaiters.splice(0)) w.reject(err);
-      setTimeout(() => this.connect(), this.reconnectDelay);
-      this.reconnectDelay = Math.min(this.reconnectDelay * 2, 10000);
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectTimer = null;
+        this.connect();
+      }, this.reconnectDelay);
+      // 抖动：服务端重启后所有浏览器会同步重连，齐刷刷砸在刚起来的实例上
+      this.reconnectDelay = Math.min(
+        Math.round(this.reconnectDelay * 2 * (0.5 + Math.random())),
+        10000,
+      );
     };
 
-    ws.onerror = () => ws.close();
+    // 错误信息此前被完全吞掉，转成不可区分的「断开」。至少留一条诊断。
+    ws.onerror = (ev) => {
+      console.warn("[flow-rpc] WebSocket 错误，随后将关闭重连", ev);
+      ws.close();
+    };
   }
 
   private waitOpen(): Promise<void> {
