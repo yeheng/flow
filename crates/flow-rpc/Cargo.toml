@@ -20,6 +20,8 @@ chrono = { workspace = true }
 cron-parser = { workspace = true }
 axum = { workspace = true }
 flow-backend = { path = "../flow-backend" }
+flow-journal = { path = "../flow-journal" }
+flow-engine = { path = "../flow-engine" }
 
 [dev-dependencies]
 uuid = { workspace = true }

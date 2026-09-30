@@ -25,68 +25,82 @@ const nodeName = computed(() => {
   return (id: string) => map.get(id) ?? (id ? id : "引擎");
 });
 
-/** 日志中出现过的节点（过滤下拉） */
-const nodeOptions = computed(() => {
-  const ids = new Set(monitor.logs.map((l) => l.node_id).filter(Boolean));
-  return [...ids];
-});
-
-/** 节流计数：每次 rAF 合并后 +1，强制 filtered 重新求值 */
-const filteredRevision = ref(0);
+/**
+ * 一帧的日志快照：过滤结果 + 供空态/下拉用的派生量。
+ *
+ * **模板只读这一个 ref**（及其派生 computed），不直接读 `monitor.logs`。
+ * 这是 rAF 节流能成立的前提：只要渲染依赖里还有 `logs` / `logs.length`，
+ * Vue 3.4+ 就会在每次 push 时把渲染标脏 → 每追加一行重渲染一次 →
+ * `filtered` 每行全量重算一次（1 万行 × 1 万次 = 节流形同虚设，实测
+ * 200 行进 200 次重渲染）。把结果搬进 ref、在 rAF 回调里一次性算完，
+ * 行数推送就只在 `scheduleFrame` 里留一个脏标记，不再触发渲染。
+ */
+interface LogFrame {
+  /** 过滤后的全量行（窗口化之前） */
+  rows: LogLine[];
+  /** 是否收到过任何日志（空态判据；不过滤，与旧实现同义） */
+  hasLogs: boolean;
+  /** 日志里出现过的节点 id（过滤下拉） */
+  nodeIds: string[];
+}
 
 // 节点过滤走索引；级别/关键词过滤没有索引可走（关键词本质上要全量匹配），
-// 但 appendLog 走 rAF 节流（见下），刷屏节点下不再每行都全量重算
-const filtered = computed<LogLine[]>(() => {
-  // 依赖节流计数：rAF 合并后由它触发重算
-  void filteredRevision.value;
+// 但每帧只算一次（见 LogFrame），刷屏节点下不再每行都全量重算
+function computeFrame(): LogFrame {
   const min = showDebug.value ? LEVEL_ORDER.debug : LEVEL_ORDER.info;
   const kw = searchText.value.trim().toLowerCase();
   const source = nodeFilter.value ? (monitor.logsByNode[nodeFilter.value] ?? []) : monitor.logs;
-  return source.filter((l) => {
+  const rows = source.filter((l) => {
     if (LEVEL_ORDER[l.level] < min) return false;
     if (kw && !l.message.toLowerCase().includes(kw)) return false;
     return true;
   });
-});
+  const ids = new Set(monitor.logs.map((l) => l.node_id).filter(Boolean));
+  return { rows, hasLogs: monitor.logs.length > 0, nodeIds: [...ids] };
+}
+
+// 初始值就地算一帧（而非 onMounted 里补）：setup 里的这次求值不进任何
+// effect，不建立订阅，但首帧渲染就拿到已有日志——否则切到日志 tab 的
+// 第一帧会闪一下「暂无日志」
+const frame = ref<LogFrame>(computeFrame());
 
 // 过滤条件或 run 变化后窗口起点重置：新过滤集的"最近 N 行"语义才成立
 watch([showDebug, nodeFilter, searchText, () => monitor.runId], () => {
   extraLines.value = 0;
-  scheduleFilterRecalc();
+  scheduleFrame();
 });
 
 /**
- * 刷屏时的节流：`filtered` 依赖整个 `monitor.logs`（reactive），每追加一行
- * 就重算一次全量过滤 + 分配新数组——8000 行 × 每行一次 = O(n²)。
- * 过滤条件**没有**变化时结果其实不变，所以攒到下一帧重算一次即可，
- * 视觉上无差别。
+ * 刷屏时的节流：一次 rAF 合并一帧的所有日志追加（`scheduleFrame` 只留脏
+ * 标记，不做事）。过滤条件**没有**变化时结果其实不变，所以攒到下一帧算
+ * 一次即可，视觉上无差别。
  */
-let filterRaf: number | null = null;
-let filterDirty = false;
+let frameRaf: number | null = null;
+let frameDirty = false;
 
-/** 请求过滤重算（同一帧内多次调用只算一次） */
-function scheduleFilterRecalc(): void {
-  filterDirty = true;
-  if (filterRaf !== null) return;
-  filterRaf = requestAnimationFrame(() => {
-    filterRaf = null;
-    if (filterDirty) {
-      filterDirty = false;
-      filteredRevision.value += 1;
+/** 请求重算一帧（同一帧内多次调用只算一次） */
+function scheduleFrame(): void {
+  frameDirty = true;
+  if (frameRaf !== null) return;
+  frameRaf = requestAnimationFrame(() => {
+    frameRaf = null;
+    if (frameDirty) {
+      frameDirty = false;
+      frame.value = computeFrame();
     }
   });
 }
 
-// 只在日志**增长**时节流重算：环形裁剪会让长度减少，那同样要反映到过滤结果
+// 日志**增长或缩短**都要重算：环形裁剪会让长度减少，同样要反映到结果
 watch(
   () => monitor.logs.length,
   () => {
-    scheduleFilterRecalc();
+    scheduleFrame();
   },
 );
 
 onUnmounted(() => {
-  if (filterRaf !== null) cancelAnimationFrame(filterRaf);
+  if (frameRaf !== null) cancelAnimationFrame(frameRaf);
 });
 
 /** 起始窗口：DOM 一次只渲染这么多行（状态存全量，预算封顶） */
@@ -102,8 +116,8 @@ const MAX_EARLIER = RENDER_CAP * 4;
 /** 已向前扩开的行数（过滤/run 变化时重置） */
 const extraLines = ref(0);
 
-const windowed = computed(() => logWindow(filtered.value.length, RENDER_CAP, extraLines.value));
-const rendered = computed(() => filtered.value.slice(-windowed.value.rendered));
+const windowed = computed(() => logWindow(frame.value.rows.length, RENDER_CAP, extraLines.value));
+const rendered = computed(() => frame.value.rows.slice(-windowed.value.rendered));
 const hiddenCount = computed(() => windowed.value.hidden);
 
 /** 向前展开一段历史，保持视口停在原内容上（补偿 scrollHeight 增量） */
@@ -162,14 +176,15 @@ function onSelectNode(id: string): void {
       </label>
       <select v-model="nodeFilter" class="log-node-select">
         <option value="">全部节点</option>
-        <option v-for="id in nodeOptions" :key="id" :value="id">
+        <option v-for="id in frame.nodeIds" :key="id" :value="id">
           {{ nodeName(id) }}
         </option>
       </select>
       <input v-model="searchText" type="search" class="log-search" placeholder="搜索日志…" />
     </div>
 
-    <div v-if="monitor.logs.length === 0" class="log-empty">
+    <!-- 空态/列表都只读 frame 快照：不直接摸 monitor.logs，见 LogFrame 注释 -->
+    <div v-if="!frame.hasLogs" class="log-empty">
       暂无日志<span v-if="monitor.status === 'running'">（等待节点输出…）</span>
     </div>
     <template v-else>

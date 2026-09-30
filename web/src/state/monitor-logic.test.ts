@@ -254,6 +254,33 @@ describe("node_log：日志与状态同流但水位独立", () => {
     expect(Object.values(p.logsByNode).flat()).toHaveLength(0);
   });
 
+  /**
+   * 裁剪后每个桶仍是**同一条** seq 升序链的前缀对齐结果：桶的内容必须正好是
+   * logs 过滤出的那些行（同一批对象引用，不能有残缺或串行）。
+   * 这是「按 node_id 计数后一次 shift」取代「逐行 indexOf」的正确性依据：
+   * 两者都只能删掉每个桶的一段前缀。
+   */
+  it("环形裁剪后索引与 logs 引用级一致（不是副本、没有残行）", () => {
+    const p = proj();
+    const base = p.lastLogSeq;
+    for (let i = 1; i <= MAX_LOG_LINES + 500; i++) {
+      // 三个节点的量差别很大：让各桶被裁剪的条数不同
+      const node_id = i % 10 < 7 ? "hot" : i % 10 < 9 ? "warm" : "cold";
+      applyEvent(p, ev(base + i, "node_log", { node_id, message: `m${i}` }));
+    }
+    for (const id of ["hot", "warm", "cold"]) {
+      const bucket = p.logsByNode[id] ?? [];
+      const expected = p.logs.filter((l) => l.node_id === id);
+      expect(bucket).toEqual(expected);
+      // 引用一致：桶里就是 logs 里那几行，不是拷贝
+      for (const line of bucket) expect(p.logs).toContain(line);
+      // 桶内 seq 严格升序（裁剪掉的必须是一段前缀，中间不能掉）
+      for (let i = 1; i < bucket.length; i++) {
+        expect(bucket[i].seq).toBeGreaterThan(bucket[i - 1].seq);
+      }
+    }
+  });
+
   it("历史日志（seq ≤ lastSeq）经补放路径进入日志列表", () => {
     // attach 场景：timeline 对齐到 2，回放段余下事件补放，日志行全部可见
     const p = proj([node("a")]);

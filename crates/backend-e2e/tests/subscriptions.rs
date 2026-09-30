@@ -256,3 +256,60 @@ e2e_test!(
         assert_eq!(streamed.last().unwrap()["type"], json!("run_completed"));
     })
 );
+
+// 订阅通知的展示脱敏：node_completed 的 output 与 timeline 同规则脱敏，
+// 而事件日志（run.events）里仍是原始值（数据面，下游节点要消费）。
+//
+// 回归的是「只脱 timeline 不脱订阅」：前端 applyEvent(node_completed) 会用
+// 事件里的原始值覆盖 timeline 的脱敏值，实时观看的 run 于是把敏感输出原样
+// 显示出来，而同一个 run 事后查看反而是脱敏的。
+e2e_test!(
+    subscription_redacts_node_output_like_timeline,
+    |ctx: &mut Ctx| Box::pin(async move {
+        let client = ctx.client().await;
+        let (workflow_id, _) = publish_workflow(
+            &client,
+            "订阅脱敏",
+            linear_def("return { ok: 1, token: 'sk-secret-value' };"),
+        )
+        .await;
+        let run_id = start_run(&client, &workflow_id, json!({})).await;
+        let _ = wait_run_terminal(&client, &run_id, TIMEOUT).await;
+
+        // 回放段从头拿全量：订阅走的是同一条服务端路径
+        let mut sub = subscribe(&client, Some(run_id.clone())).await;
+        let streamed = collect_run_events(&mut sub, &run_id, TIMEOUT).await;
+        let completed = streamed
+            .iter()
+            .find(|e| e["type"] == json!("node_completed") && e["node_id"] == json!("n1"))
+            .unwrap_or_else(|| panic!("订阅流里没有 n1 的 node_completed：{streamed:?}"));
+
+        assert_eq!(
+            completed["output"]["token"],
+            json!("***"),
+            "订阅通知必须与 timeline 同规则脱敏：{completed:#}"
+        );
+        assert_eq!(completed["output"]["ok"], json!(1), "非敏感字段不动");
+
+        // 数据面不变：事件日志里仍是原始值（下游节点/fold 要消费它）
+        let events: Value = call_json(&client, "run.events", json!({"run_id": run_id})).await;
+        let logged = events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["type"] == json!("node_completed") && e["node_id"] == json!("n1"))
+            .unwrap_or_else(|| panic!("事件日志里没有 n1 的 node_completed"));
+        assert_eq!(
+            logged["output"]["token"],
+            json!("sk-secret-value"),
+            "事件日志是数据面，不该被脱敏污染：{logged:#}"
+        );
+
+        // timeline 原本就对：三个展示/读取面各就各位
+        let timeline: Value = call_json(&client, "run.timeline", json!({"run_id": run_id})).await;
+        assert_eq!(
+            timeline_node(&timeline, "n1")["output"]["token"],
+            json!("***")
+        );
+    })
+);

@@ -493,9 +493,15 @@ pub(crate) async fn read_events(path: &Path) -> Result<Vec<Envelope>, EngineErro
 /// 之后新增的字节。
 ///
 /// **正确性护栏**（任一不满足就整体重读，绝不猜）：
-/// 1. 文件头指纹一致——同一路径被复用（测试 TempDir、文件被重建）时认出来；
-/// 2. 文件只变长——变短（截断/轮转）丢弃缓存；
-/// 3. 新块首条 `seq` 必须紧接已缓存的末尾 `seq`——接不上说明不是同一个追加流。
+/// 1. 文件只变长——变短（截断/轮转）丢弃缓存；
+/// 2. 新块首条 `seq` 必须紧接已缓存的末尾 `seq`——接不上说明不是同一个追加流
+///    （文件被重建、路径被复用、另一个 run 占了同名文件），整体重读。
+///
+/// 护栏 2 顺带取代了早先的「32 字节文件头指纹」：追加式日志只要 seq 接得上
+/// 就是同一条流，接不上时全量重读本来就会给出正确结果或与旧实现一致的
+/// LogCorrupted；头指纹只对「同长度整体替换」这一种 contrived 情形额外敏感，
+/// 代价是每次增量读多两次 syscall（open + read 32 字节）。一条写者的 run
+/// 日志不存在这种替换，删掉。
 ///
 /// 缓存窗口之外（`from_seq` 低于窗口首条，或 `None`）一律全量读并全序列校验，
 /// 与旧实现逐字等价。
@@ -504,11 +510,10 @@ pub(crate) async fn read_events_from(
     from_seq: Option<u64>,
 ) -> Result<Vec<Envelope>, EngineError> {
     let file_len = tokio::fs::metadata(path).await?.len();
-    let head = read_head_bytes(path).await?;
 
     // 快照 / 全量读取：不走增量（它也负责把缓存刷热）
     if from_seq.is_none() {
-        return read_events_uncached(path, &head).await;
+        return read_events_uncached(path).await;
     }
 
     // 取可用缓存；不满足护栏就连缓存一起丢掉
@@ -517,7 +522,7 @@ pub(crate) async fn read_events_from(
         let usable = cache
             .entries
             .get(path)
-            .is_some_and(|entry| entry.byte_len <= file_len && entry.head == head);
+            .is_some_and(|entry| entry.byte_len <= file_len);
         if usable {
             let entry = cache.entries.get(path).unwrap();
             Some((entry.byte_len, entry.last_seq))
@@ -534,7 +539,7 @@ pub(crate) async fn read_events_from(
         if !fresh.is_empty() && fresh[0].seq != last_seq + 1 {
             // 接不上：文件被改写或不是同一个追加流。整体重读（它会给出正确结果，
             // 或给出与旧实现一致的 LogCorrupted），不用缓存拼一个似是而非的答案。
-            return read_events_uncached(path, &head).await;
+            return read_events_uncached(path).await;
         }
         for pair in fresh.windows(2) {
             if pair[0].seq + 1 != pair[1].seq {
@@ -545,9 +550,9 @@ pub(crate) async fn read_events_from(
             }
         }
         let new_last = fresh.last().map(|e| e.seq).unwrap_or(last_seq);
-        cache_store(path, head.clone(), consumed, new_last, &fresh, false);
+        cache_store(path, consumed, new_last, &fresh, false);
     } else {
-        return read_events_uncached(path, &head).await;
+        return read_events_uncached(path).await;
     }
 
     // 窗口够不着（回放从很早的 seq 起）：全量读。命中窗口时才走缓存切片。
@@ -572,29 +577,18 @@ pub(crate) async fn read_events_from(
     };
     match window {
         Some(events) => Ok(events),
-        None => read_events_uncached(path, &head).await,
+        None => read_events_uncached(path).await,
     }
 }
 
 /// 全量读 + 全序列校验，并用结果刷新缓存（`read_events_from` 的慢路径）。
-async fn read_events_uncached(path: &Path, head: &[u8]) -> Result<Vec<Envelope>, EngineError> {
+async fn read_events_uncached(path: &Path) -> Result<Vec<Envelope>, EngineError> {
     let bytes = tokio::fs::read(path).await?;
     let (events, consumed) = parse_complete_lines(&bytes, 0)?;
     validate_sequence(&events)?;
     let last_seq = events.last().map(|e| e.seq).unwrap_or(0);
-    cache_store(path, head.to_vec(), consumed, last_seq, &events, true);
+    cache_store(path, consumed, last_seq, &events, true);
     Ok(events)
-}
-
-/// 文件头指纹：同一路径下的文件被换掉时认出它不是同一个日志。
-async fn read_head_bytes(path: &Path) -> Result<Vec<u8>, EngineError> {
-    use tokio::io::AsyncReadExt;
-    let file = tokio::fs::File::open(path).await?;
-    let mut head = Vec::new();
-    file.take(HEAD_FINGERPRINT as u64)
-        .read_to_end(&mut head)
-        .await?;
-    Ok(head)
 }
 
 /// 只读 [start, EOF)：增量路径不把整份文件搬进内存。
@@ -607,8 +601,6 @@ async fn read_tail_bytes(path: &Path, start: u64) -> Result<Vec<u8>, EngineError
     Ok(bytes)
 }
 
-/// 头指纹长度：足以区分同一路径下的不同日志，又不至于把缓存条目撑大。
-const HEAD_FINGERPRINT: usize = 32;
 /// 每个 run 缓存的事件窗口（条）。窗口之外的 `from_seq` 走全量读。
 const TAIL_CACHE_EVENTS: usize = 512;
 /// 缓存条目上限（个 run）。超出按 FIFO 淘汰，内存有界。
@@ -616,9 +608,7 @@ const TAIL_CACHE_RUNS: usize = 64;
 
 /// 一个 run 的追加式日志缓存窗口。
 struct CachedTail {
-    /// 文件头指纹（护栏 1）
-    head: Vec<u8>,
-    /// 已解析到（已消费）的字节偏移：最后一条完整行的末尾（护栏 2 的基准）
+    /// 已解析到（已消费）的字节偏移：最后一条完整行的末尾（护栏 1 的基准）
     byte_len: u64,
     /// 窗口内最小 seq：`from_seq` 低于它就说明窗口够不着，必须全量读
     first_seq: u64,
@@ -644,7 +634,6 @@ fn tail_cache() -> &'static Mutex<TailCache> {
 /// （增量路径：交上来的只有新解析的那些）。
 fn cache_store(
     path: &Path,
-    head: Vec<u8>,
     byte_len: u64,
     last_seq: u64,
     fresh: &[Envelope],
@@ -662,13 +651,11 @@ fn cache_store(
         cache.order.push_back(key.clone());
     }
     let entry = cache.entries.entry(key).or_insert_with(|| CachedTail {
-        head: Vec::new(),
         byte_len: 0,
         first_seq: 1,
         last_seq: 0,
         events: VecDeque::new(),
     });
-    entry.head = head;
     entry.byte_len = byte_len;
     entry.last_seq = last_seq;
     if replace_window {
@@ -1039,8 +1026,13 @@ mod group_commit_tests {
         assert_eq!(kept.last().unwrap().seq, 3);
     }
 
-    /// 同一路径下的文件被整个换掉（测试 TempDir 复用 / 日志重建）：头指纹必须
-    /// 认出来，绝不能把上一个日志的缓存答案交出去。
+    /// 同一路径下的文件被整个换掉（测试 TempDir 复用 / 日志重建）：缓存答案
+    /// 绝不能被交出去。
+    ///
+    /// 这里换成一个**等长**的新日志：旧的 32 字节头指纹靠「头部字节不同」认出
+    /// 它，指纹删掉后就靠护栏 2——新日志从 seq=1 重新开始，与缓存的末尾 5
+    /// 接不上（`fresh[0].seq != last_seq + 1`）→ 整体重读。等长是为了让
+    /// 「文件只变长」这条护栏失效，单独验证 seq 护栏自己就够。
     #[tokio::test]
     async fn incremental_read_does_not_serve_a_replaced_file_from_cache() {
         let _guard = test_lock().lock().await;
@@ -1052,22 +1044,44 @@ mod group_commit_tests {
             first.append("r", started(i)).await.unwrap();
         }
         drop(first);
-        assert_eq!(read_events_from(&path, Some(1)).await.unwrap().len(), 5);
+        let cached = read_events_from(&path, Some(1)).await.unwrap();
+        assert_eq!(cached.len(), 5);
+        let old_len = tokio::fs::metadata(&path).await.unwrap().len();
 
         std::fs::remove_file(&path).unwrap();
-        // 同一个路径、不同的日志（内容更短且头部不同）
+        // 同路径、内容不同（node_id 换成 "m…"，seq 从 1 重来）。写 8 条而不是
+        // 5 条：保证新文件**更长**，让「文件只变长」这条护栏失效，只剩下 seq
+        // 护栏在干活（否则一次等长/更短的替换会被另一条护栏顺手挡住，测不到
+        // 想测的那条）。
         let mut second = EventLog::create(dir.path(), "r").await.unwrap();
-        for i in 0..2 {
-            second.append("r", started(i)).await.unwrap();
+        for seq in 1..=8u64 {
+            second
+                .write(
+                    "r",
+                    Event::NodeStarted {
+                        node_id: format!("m{seq}"),
+                        attempt: 1,
+                        child_run_id: None,
+                        input: None,
+                    },
+                    false,
+                )
+                .await
+                .unwrap();
         }
         drop(second);
+        assert!(
+            tokio::fs::metadata(&path).await.unwrap().len() >= old_len,
+            "本测试要的是「文件只变长」护栏失效（等长/更长的替换）"
+        );
 
         let got = read_events_from(&path, Some(1)).await.unwrap();
-        assert_eq!(
-            got.len(),
-            2,
-            "换文件后必须读到新日志，不是缓存的旧答案：{:?}",
-            got.iter().map(|e| e.seq).collect::<Vec<_>>()
+        assert_eq!(got.len(), 8, "换文件后必须读到新日志，不是缓存的旧答案");
+        assert_eq!(got[1].seq, 2);
+        assert!(
+            matches!(&got[1].event, Event::NodeStarted { node_id, .. } if node_id == "m2"),
+            "读到的是新日志内容：{:?}",
+            got[1].event
         );
     }
 

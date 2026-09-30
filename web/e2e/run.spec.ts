@@ -100,3 +100,64 @@ test("可观察性：日志页签实时显示 console 输出，节点检查器�
   await page.locator(".log-node-select").selectOption("n");
   await expect(page.locator(".log-list .log-row")).toHaveCount(2);
 });
+
+/**
+ * 实时路径的 output 脱敏（回归「只脱 timeline 不脱订阅」的绕过）。
+ *
+ * 关键在于**attach 时 run 还在跑**：node_completed 事件到达时 seq 大于
+ * timeline 快照的 last_seq，前端会把它应用到投影上。老代码下这个值来自
+ * 原始事件，于是节点检查器显示未脱敏的 output；run 终态后再进来反而
+ * 看到脱敏值（回放段全被 seqAction 跳过，只剩 timeline 的展示值）。
+ */
+test("可观察性：运行中收到的 node_completed 也走展示脱敏", async ({ page }) => {
+  const name = uniq("e2e-实时脱敏");
+  const { workflow_id } = await rpc<{ workflow_id: string }>("workflow.create", { name });
+  const { version } = await rpc<{ version: number }>("workflow.update", {
+    workflow_id,
+    definition: {
+      nodes: [
+        { id: "s", type: "start" },
+        // delay 2s 给页面留出「运行中 attach」的窗口
+        { id: "d", type: "delay", params: { ms: 2000 } },
+        {
+          id: "n",
+          type: "script",
+          params: {
+            code: "console.log('late node done');\nreturn { ok: 1, token: ['sk','live','secret'].join('-') };",
+          },
+        },
+        { id: "e", type: "end" },
+      ],
+      edges: [
+        { from: "s", to: "d" },
+        { from: "d", to: "n" },
+        { from: "n", to: "e" },
+      ],
+    },
+  });
+  await rpc("workflow.publish", { workflow_id, version });
+  const { run_id: runId } = await rpc<{ run_id: string }>("run.start", {
+    workflow_id,
+    input: {},
+  });
+
+  // 立刻进详情页：确认此刻 run 仍在跑（这是本用例的前提——node_completed
+  // 必须是在页面 attach **之后**实时到达的，而不是回放段里被 seqAction 跳过的）
+  await page.goto(`/runs/${runId}`);
+  await expect(page.locator(".run-header .badge").first()).toContainText("运行中");
+  // 等后端到终态（头部徽章是 run.get 的一次性快照，不随订阅更新；等它没用）
+  expect(await waitTerminal(runId)).toBe("succeeded");
+
+  // 从日志行点节点标签打开检查器（这条路径不依赖画布选中的工作流）
+  await page.locator(".aside-tab", { hasText: "日志" }).click();
+  await page
+    .locator(".log-list .log-row", { hasText: "late node done" })
+    .locator(".log-node")
+    .click();
+  const inspector = page.locator(".inspector");
+  await expect(inspector).toBeVisible();
+  await expect(inspector).toContainText("输出");
+  await expect(inspector).toContainText("ok");
+  await expect(inspector).not.toContainText("sk-live-secret");
+  await expect(inspector).toContainText("***");
+});

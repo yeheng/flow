@@ -9,7 +9,7 @@ use crate::child_run::{ChildRunLauncher, ChildRunOutcome, MAX_SUB_WORKFLOW_DEPTH
 use crate::error::EngineError;
 use crate::expr;
 use crate::model::{Node, NodeType, HTTP_METHODS};
-use crate::nodelog::NodeLogger;
+use crate::nodelog::{redact_url, redact_value, NodeLogger};
 use crate::secrets;
 
 pub const DEFAULT_JS_TIMEOUT_MS: u64 = 2_000;
@@ -443,6 +443,9 @@ async fn run_http(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
         .and_then(Value::as_str)
         .ok_or_else(|| NodeFailure::fatal("http_call 节点缺少 url 参数"))?
         .to_string();
+    // 展示面用的 URL（日志行 + 失败消息）：query 里的敏感参数值脱敏，
+    // 发起请求用的永远是原始 `url`。两者分开，别为了脱敏改请求目标。
+    let url_label = redact_url(&url);
     // 定义层校验的是原始参数，${...} 模板展开后的 method 可能绕过白名单——
     // 执行层按同一份 HTTP_METHODS 再验一次，两层共用一个词汇表
     if !HTTP_METHODS.contains(&method_str.as_str()) {
@@ -476,7 +479,7 @@ async fn run_http(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
         }
     }
 
-    ctx.logger.info(format!("→ {method_str} {url}"));
+    ctx.logger.info(format!("→ {method_str} {url_label}"));
     let response = match request.send().await {
         Ok(response) => response,
         Err(err) if err.is_builder() => {
@@ -487,11 +490,11 @@ async fn run_http(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
         Err(err) => {
             // 连接失败/超时：副作用不明确或未发生，交给重试策略
             ctx.logger.error(format!(
-                "请求 {url} 失败（{}ms）：{err}",
+                "请求 {url_label} 失败（{}ms）：{err}",
                 started.elapsed().as_millis()
             ));
             return Err(NodeFailure::retryable(format!(
-                "请求 {url} 失败（{}ms）：{err}",
+                "请求 {url_label} 失败（{}ms）：{err}",
                 started.elapsed().as_millis()
             )));
         }
@@ -513,11 +516,11 @@ async fn run_http(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
         // 连接在读完响应头之后断开：body 不完整。不能带着 200 + 空 body 记成功
         Err(err) => {
             ctx.logger.error(format!(
-                "读取 {url} 响应体失败（{}ms）：{err}",
+                "读取 {url_label} 响应体失败（{}ms）：{err}",
                 started.elapsed().as_millis()
             ));
             return Err(NodeFailure::retryable(format!(
-                "读取 {url} 响应体失败（{}ms）：{err}",
+                "读取 {url_label} 响应体失败（{}ms）：{err}",
                 started.elapsed().as_millis()
             )));
         }
@@ -550,7 +553,7 @@ async fn run_http(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
         } else {
             NodeFailure::fatal(format!("HTTP {status}"))
         };
-        failure.message = format!("{}，响应体：{}", failure.message, truncate(&output));
+        failure.message = format!("{}，响应体：{}", failure.message, truncate(&redact_value(&output)));
         return Err(failure);
     }
 
@@ -567,6 +570,8 @@ async fn post_json_bearer(
     timeout_ms: u64,
 ) -> Result<(reqwest::StatusCode, Value), NodeFailure> {
     let started = Instant::now();
+    // 失败消息里回显的 URL 走脱敏副本：原值只用于发请求
+    let url_label = redact_url(url);
     let response = match HTTP_CLIENT
         .post(url)
         .bearer_auth(api_key)
@@ -582,7 +587,7 @@ async fn post_json_bearer(
         }
         Err(err) => {
             return Err(NodeFailure::retryable(format!(
-                "请求 {url} 失败（{}ms）：{err}",
+                "请求 {url_label} 失败（{}ms）：{err}",
                 started.elapsed().as_millis()
             )));
         }
@@ -592,7 +597,7 @@ async fn post_json_bearer(
         Ok(text) => text,
         Err(err) => {
             return Err(NodeFailure::retryable(format!(
-                "读取 {url} 响应体失败（{}ms）：{err}",
+                "读取 {url_label} 响应体失败（{}ms）：{err}",
                 started.elapsed().as_millis()
             )));
         }
@@ -610,7 +615,7 @@ async fn post_json_bearer(
         } else {
             NodeFailure::fatal(format!("HTTP {status}"))
         };
-        failure.message = format!("{}，响应体：{}", failure.message, truncate(&body));
+        failure.message = format!("{}，响应体：{}", failure.message, truncate(&redact_value(&body)));
         return Err(failure);
     }
     Ok((status, body))
@@ -682,7 +687,7 @@ async fn run_llm(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
         .ok_or_else(|| {
             NodeFailure::fatal(format!(
                 "llm 响应缺少 choices[0].message.content：{}",
-                truncate(&response)
+                truncate(&redact_value(&response))
             ))
         })?;
     Ok(serde_json::json!({

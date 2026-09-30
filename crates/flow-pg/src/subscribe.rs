@@ -25,7 +25,19 @@ use crate::config::PgConfig;
 use crate::metadata::PgStore;
 use crate::sink::PgRunSink;
 
-const BROADCAST_CAPACITY: usize = 1024;
+/// 广播通道的基础容量（条）。
+const BASE_BROADCAST_CAPACITY: usize = 1024;
+
+/// 广播通道容量：与单机后端同一公式（可观察性设计 §4）
+/// `max(基础容量, 每 run 日志预算)`。两个后端必须一致——写死常量的话，
+/// 日志量超过它的 run 会把所有订阅者打进 `Lagged`（= 全量 re-attach 重放），
+/// 而单机臂同一份日志却不会：同一份日志两个后端两种命运。
+///
+/// 预算读数与单机臂共用 `flow_engine::budget_from_env()`（`FLOW_RUN_LOG_BUDGET`
+/// 覆盖默认值），容量公式只有一处实现。
+fn broadcast_capacity() -> usize {
+    BASE_BROADCAST_CAPACITY.max(flow_engine::budget_from_env())
+}
 
 /// 单次 NOTIFY 唤醒里最多合并多少个 run id。封顶的理由见 `poll_loop`：
 /// 不封顶则持续事件流下排空永不结束，兜底全量扫描被饿死。
@@ -62,7 +74,7 @@ pub struct EventHub {
 impl EventHub {
     /// 启动共享轮询任务（随 PgEngine 生命周期运行，`stop` 时退出）。
     pub fn start(pool: sqlx::PgPool, cfg: PgConfig) -> Arc<EventHub> {
-        let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let (tx, _) = broadcast::channel(broadcast_capacity());
         let stop = CancellationToken::new();
         // 任务句柄**构造时**就放进槽位，不能延后到第一次使用时——锁被争用时会
         // 静默丢弃 JoinHandle（= detach 该任务），`stop()` 于是报告「已停止」

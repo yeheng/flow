@@ -128,17 +128,29 @@ EventLog 保持愚蠢）：
 - 单行截断 8KB，截断时 message 尾部带 `…[truncated N bytes]` 标记，N 是
   **真正丢掉的字节数**（按字符边界回退后的截断点算，不是 `len - 8KB`——
   多字节内容上前者偏小）。
+- **总量硬顶 10 万行**（`HARD_LOG_LINE_LIMIT`，所有级别合计，且不小于软
+  预算）。软预算只管 debug/info，warn/error 按「错误可观测性不打折」不参与
+  它——但那个前提是错误量偶发。一个 `while (true) console.error()` 的脚本
+  能把 event.jsonl / PG run_events 写到无界：磁盘比「多几条 error」更值得
+  保护。硬顶取 `max(软预算, 常量)`，所以调大 `FLOW_RUN_LOG_BUDGET` 时它
+  跟着抬高，不会变成 info 的第二道隐性预算（两道取小者会让旋钮失真）。
+  摘要行本身也过预算（`admit(Warn)`）——否则被硬顶按住的 run 每排空一批
+  就补一条摘要，摘要自己成了新的无界增长源。
 
 预算同时保护三样东西：event.jsonl 体积（重放成本）、PG 后端日志表、前端订阅带宽。
 
-归属契约：预算计数是 **per-run** 共享状态（`LogBudget`，emitted + dropped 两个
-原子计数），driver 创建并持有，NodeLogger 克隆 Arc——logger 是 per-node-attempt 的，
-预算判断必须落在 per-run 一处，EventLog 对预算无感知。
+归属契约：预算计数是 **per-run** 共享状态（`LogBudget`，emitted / total /
+dropped 三个原子计数），driver 创建并持有，NodeLogger 克隆 Arc——logger 是
+per-node-attempt 的，预算判断必须落在 per-run 一处，EventLog 对预算无感知。
 
-`emitted` 只数 debug/info：warn/error 走 `admit` 的独立分支放行且不碰它。
-上限的语义是「debug/info 合计 10000 条」，不是「日志总量 10000 条」——
-共享一个计数器的话，刷满 warn 的节点会把整条 run 的 info 预算吃光
-（`warn_burst_does_not_consume_the_info_budget` 钉住）。
+`emitted` 只数 debug/info：warn/error 不碰它。上限的语义是「debug/info 合计
+10000 条」，不是「日志总量 10000 条」——共享一个计数器的话，刷满 warn 的节点
+会把整条 run 的 info 预算吃光（`warn_burst_does_not_consume_the_info_budget`
+钉住）。
+
+`total` 数所有放行的行（含 warn/error），只被硬顶消费（见上）。
+（`hard_cap_stops_even_warn_and_error` / `hard_cap_never_below_the_info_budget`
+钉住硬顶语义。）
 
 ## 4. 发射点清单（谁在哪儿写日志）
 
@@ -249,12 +261,30 @@ TimelineNode 加 `input`；LogLine/LogLevel/LogStream 接口。`api/flow.ts` **�
 ## 8. 脱敏
 
 - 固定敏感键列表（authorization / cookie / token / password / secret / api_key /
-  apikey，**不分大小写子串匹配**）在三个出口生效：http 日志行里的 headers、
-  node_started.input、node_completed.output——值替换为 `"***"`。子串匹配的代价：
-  `password_policy`、`tokenizer` 这类合法字段会被误脱敏（安全侧可接受，
-  展示侧可能困惑）。
-- output 属于用户显式产出的数据，v1 也脱敏固定键（低成本高收益）；参数级 `x-secret`
-  标记 → P3。
+  apikey，**不分大小写子串匹配**）在**节点 output 的所有展示面**生效——值替换
+  为 `"***"`：
+  1. `run.timeline` 的 `nodes[].output`（展示投影）；
+  2. `run.subscribe` 通知里的 `node_completed.output`（实时推送）。
+
+  两处必须同规则：前端 `applyEvent(node_completed)` 会用事件里的值覆盖 timeline
+  的展示值，只脱一处等于没脱（实时观看时显示原文、事后查看反而脱敏——同一个
+  字段两种命运）。`subscription_redacts_node_output_like_timeline` 钉住。
+
+  事件日志（`run.events` / event.jsonl）里存的**仍是原始值**：那是下游节点的
+  数据面，fold 与模板展开要消费它。
+- 写入面：`node_started.input`（模板展开后的 params）在写盘前脱敏
+  （`build_node_prep`）——快照即展示，没有第二个出口。
+- URL 的 query 串：`redact_url` 把命中敏感键的参数值换成 `***`（host/path 保留）。
+  `?api_key=…` 这类把凭据放 query 的接口很常见，而 JSON 脱敏管不到字符串。
+  http_call 的请求行、以及 `node_failed.error` 里回显的 URL 都走它。
+- `node_failed.error` 里回显的上游响应体也过 `redact_value`（http_call /
+  llm / email 的失败消息）——错误消息是展示面，和 output 同规则。
+- run 级 output（`run_completed.output`）**不脱敏**：它就是 `run.get` 那个数据面
+  值，同名字段必须同值。
+- 子串匹配的代价：`password_policy`、`tokenizer` 这类合法字段会被误脱敏（安全侧
+  可接受，展示侧可能困惑）。参数级 `x-secret` 标记 → P3。
+- http 日志行**不含** headers（只记 `→ {method} {url}`），所以不存在"请求头
+  脱敏"这个出口；响应头在 output 里，由 output 的两个展示面覆盖。
 
 ## 9. 风险与对策
 
@@ -262,21 +292,31 @@ TimelineNode 加 `input`；LogLine/LogLevel/LogStream 接口。`api/flow.ts` **�
   与预算挂钩；Lagged 的恢复路径就是 re-attach 重放（§7.2），代价有界，无新增机制。
 - **重放成本**：fold 多跳过日志行；预算 10000 行 × serde 反序列化 ≈ 毫秒级，可忽略。
   P3 优化项：Envelope 两段解析（先头后体，fold 路径跳过日志体）。
-- **event.jsonl 体积**：预算封顶（极端刷屏 × 全 8KB 行的最坏上界写进容量核算，
-  实际均值远小）；顺带在 §13（明确不做）记录"event.jsonl 生命周期/GC"仍是既有欠账，
-  本设计不变更它。
+- **event.jsonl 体积**：双重封顶——debug/info 预算 + 总量硬顶（§3.4）。即使
+  极端刷屏 × 全 8KB 行，总量也有 10 万行的确定上界；顺带在 §13（明确不做）记录
+  "event.jsonl 生命周期/GC"仍是既有欠账，本设计不变更它。
 - **PG 后端**：NodeLog 进既有事件表，订阅查询不变；量级受同一预算约束。
+- **广播容量公式分叉**（已修）：单机臂曾按 §4 公式 `max(1024, 预算)` 核算，PG 臂
+  写死 1024——同一份日志两个后端两种命运（PG 上日志量超 1024 就把订阅者打进
+  Lagged）。现在两臂共用 `flow_engine::budget_from_env()` 这一个读数。
 
 ## 10. 测试策略
 
 - **flow-engine 单测**：NodeLog 序列化/反序列化往返；fold 跳过 NodeLog；seq 连续性
-  含日志行；append_log 搭车 fsync 与终态兜底（读回验证）；预算截断与摘要行；
-  脱敏函数表驱动用例；script console 桥接（log/warn/error/对象参数）。
+  含日志行；append_log 搭车 fsync 与终态兜底（读回验证）；预算截断与摘要行、
+  **硬顶**（`hard_cap_stops_even_warn_and_error`）；脱敏函数表驱动用例（含
+  `redact_url` 的 query 脱敏）；script console 桥接（log/warn/error/对象参数）。
+- **flow-rpc 单测**：订阅通知的展示脱敏与 timeline 同规则
+  （`subscription_notice_redacts_node_output_like_timeline`），run 级 output 不脱敏。
 - **backend-e2e**：subscriptions.rs 扩展——订阅流含 node_log 且 seq 严格连续、回放段
-  含历史日志；crash_recovery.rs 扩展——恢复后日志仍在且不缺 seq、**终态返回后日志
-  已持久可读**（终态兜底 fsync 的钉子）；sub_workflow 子 run 的日志归各自 run。
+  含历史日志；**订阅通知脱敏而 run.events 不脱敏**
+  （`subscription_redacts_node_output_like_timeline`）；crash_recovery.rs 扩展——
+  恢复后日志仍在且不缺 seq、**终态返回后日志已持久可读**（终态兜底 fsync 的钉子）；
+  sub_workflow 子 run 的日志归各自 run。
 - **前端 vitest**：monitor-logic（node_log 追加、drainBuffer 收集历史日志、
-  resync=re-attach 投影整体重建）；LogConsole 过滤/窗口化纯函数。
+  resync=re-attach 投影整体重建、**环形裁剪后索引与 logs 引用级一致**）；
+  LogConsole **帧合并节流**（`逐 tick 推送多行只渲染一次`，旧实现 60 行进 60 次渲染）、
+  首帧不闪空态、级别过滤。
 - **Playwright e2e**：跑含 console.log 的 script 工作流 → 控制台页签可见日志、
   点节点开检查器、输入/输出/日志三块齐全；重试工作流 → attempt 徽标与 warn 日志。
 
@@ -284,11 +324,12 @@ TimelineNode 加 `input`；LogLine/LogLevel/LogStream 接口。`api/flow.ts` **�
 
 1. node_started 先于节点副作用（现状），input 随 node_started 落盘——输入面快照点唯一。
 2. NodeLog 不改变投影状态；fold 与前端对未知事件类型必须 no-op。
-3. 日志发射即忘、有界（预算）；节点执行永不因日志写盘阻塞。
+3. 日志发射即忘、有界（debug/info 预算 + 总量硬顶）；节点执行永不因日志写盘阻塞。
 4. 事件 = 设备级持久；日志 = 进程级持久，run 终态前必须兜底 fsync。
 5. 丢失只允许发生在尾部；seq 连续性是全 consumers 的硬契约。
 6. 不支持降级读事件日志。
 7. 终态返回 ⇒ 终态前的日志已在盘上（唯一终态写点的 sync + 专项测试）。
+8. 节点 output 的**所有展示面**同规则脱敏；事件日志（数据面）保持原始值。
 
 ## 12. 分期
 

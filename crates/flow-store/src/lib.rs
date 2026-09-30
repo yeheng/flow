@@ -1,4 +1,5 @@
 use std::path::Path;
+pub mod projection;
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};

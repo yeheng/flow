@@ -108,14 +108,20 @@ export function applyLog(p: RunProjection, env: RunEvent): void {
   p.logs.push(line);
   (p.logsByNode[line.node_id] ??= []).push(line);
   if (p.logs.length > MAX_LOG_LINES) {
-    // 环形裁剪要同时裁索引，否则桶里会攒下已被丢弃的行
+    // 环形裁剪要同时裁索引，否则桶里会攒下已被丢弃的行。
+    //
+    // `logs` 与每个桶都是 seq 升序追加的，所以 `splice(0, n)` 删掉的 n 条
+    // 正是每个受影响桶的一段**前缀**——按 node_id 计数后一次 shift 掉即可。
+    // 别退回逐行 `indexOf`：那是 O(丢弃条数 × 桶长)，单节点刷屏时一次裁剪
+    // 就是上百万次身份比较，而这个函数每追加一行都会走到。
     const dropped = p.logs.splice(0, p.logs.length - KEEP_LOG_LINES);
-    for (const old of dropped) {
-      const bucket = p.logsByNode[old.node_id];
+    const counts = new Map<string, number>();
+    for (const old of dropped) counts.set(old.node_id, (counts.get(old.node_id) ?? 0) + 1);
+    for (const [id, n] of counts) {
+      const bucket = p.logsByNode[id];
       if (!bucket) continue;
-      const at = bucket.indexOf(old);
-      if (at >= 0) bucket.splice(at, 1);
-      if (bucket.length === 0) delete p.logsByNode[old.node_id];
+      if (n >= bucket.length) delete p.logsByNode[id];
+      else bucket.splice(0, n);
     }
   }
 }

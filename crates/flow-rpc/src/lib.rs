@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use chrono::Local;
 use flow_backend::{
-    open_from_env, secrets, AnyBackend, BackendError, Definition, NodeState, NodeType, RunState,
-    SignalAck,
+    open_from_env, secrets, AnyBackend, BackendError, Definition, Envelope, Event, NodeState,
+    NodeType, RunState, SignalAck,
 };
 use futures::StreamExt;
 use jsonrpsee::core::RegisterMethodError;
@@ -31,6 +31,8 @@ use serde_json::{json, Value};
 use thiserror::Error;
 
 pub mod scheduler;
+pub mod journal_v2;
+pub mod journal_download;
 pub mod webhook;
 
 const CODE_INVALID: i32 = -32010;
@@ -708,6 +710,10 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
                     _ = sink.closed() => break,
                     received = events.next() => match received {
                         Some(envelope) => {
+                            // 展示出口脱敏：与 timeline 同一规则（见 redact_display_envelope）。
+                            // 少了这一步，实时段推送的 node_completed 会带原始 output，
+                            // 前端 applyEvent 用它覆盖 timeline 的脱敏值，脱敏被绕过
+                            let envelope = redact_display_envelope(envelope);
                             // jsonrpsee 0.26：通知消息需显式携带方法名与订阅 id
                             match SubscriptionMessage::new("run.event", sink.subscription_id(), &envelope)
                                 .map_err(|e| internal(format!("事件序列化失败：{e}")))
@@ -731,6 +737,24 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
     Ok(module)
 }
 
+/// 订阅通知的展示脱敏：`node_completed.output` 按与 [`timeline_value`] 同一
+/// 规则脱敏后下发。
+///
+/// **为什么订阅也要脱敏**：事件日志里存的是原始 output（数据面，下游节点要
+/// 消费，不能动），而展示面有两处——timeline 投影与订阅通知。只脱一处时，
+/// 前端 `applyEvent(node_completed)` 会用事件里的原始值**覆盖** timeline 的
+/// 脱敏值（monitor-logic.ts），实时观看的 run 于是把敏感值原样显示出来，
+/// 而同一个 run 事后查看反而是脱敏的——同一个字段两种命运。
+///
+/// 与 timeline 的差异只有一处：run 级 output（`run_completed`）两面都不脱敏
+/// （它就是 run.get 那个数据面值，同名字段必须同值），见 timeline_value 注释。
+fn redact_display_envelope(mut envelope: Envelope) -> Envelope {
+    if let Event::NodeCompleted { output, .. } = &mut envelope.event {
+        *output = flow_backend::redact_value(output);
+    }
+    envelope
+}
+
 pub(crate) fn timeline_value(
     run_id: &str,
     run_status: &str,
@@ -748,6 +772,9 @@ pub(crate) fn timeline_value(
             // 下游节点的数据面，不能动；这里只脱时间线的展示值。
             // input 在 node_started 写入时已脱敏，直接透传。
             // 节点输出的唯一所有者是 NodeRecord.output（见 fold.rs）
+            //
+            // 同一规则在订阅通知上还有一份（`redact_display_envelope`）——
+            // 两个展示面必须同规则，否则前端会用一个覆盖另一个。
             let output = record
                 .output()
                 .cloned()
@@ -927,6 +954,55 @@ pub(crate) fn backend_err(err: BackendError) -> ErrorObjectOwned {
 /// 是纯重构，响应必须逐字节不变。新增/修改节点类型时同步更新本快照。
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    /// 订阅通知的展示脱敏：node_completed 的 output 脱敏，其余事件与字段原样。
+    /// 回归的是「只脱 timeline 不脱订阅 → 前端用事件原始值覆盖脱敏值」。
+    #[test]
+    fn subscription_notice_redacts_node_output_like_timeline() {
+        let envelope = Envelope {
+            seq: 7,
+            ts: Utc::now(),
+            run_id: "r".into(),
+            event: Event::NodeCompleted {
+                node_id: "n".into(),
+                attempt: 1,
+                output: serde_json::json!({
+                    "status": 200,
+                    "headers": {"set-cookie": "sid=secret-value", "content-type": "application/json"},
+                    "body": {"ok": true}
+                }),
+                duration_ms: 12,
+            },
+        };
+        let redacted = redact_display_envelope(envelope);
+        let Event::NodeCompleted { output, .. } = &redacted.event else {
+            panic!("事件类型不该被改写");
+        };
+        assert_eq!(output["headers"]["content-type"], json!("application/json"));
+        assert_eq!(output["headers"]["set-cookie"], json!("***"));
+        assert_eq!(output["body"]["ok"], json!(true));
+    }
+
+    /// run 级 output 是数据面（= run.get 的值），两个展示面都不动它。
+    #[test]
+    fn subscription_notice_keeps_run_level_output_verbatim() {
+        let envelope = Envelope {
+            seq: 9,
+            ts: Utc::now(),
+            run_id: "r".into(),
+            event: Event::RunCompleted {
+                output: serde_json::json!({"api_key": "sk-live"}),
+            },
+        };
+        let redacted = redact_display_envelope(envelope);
+        let Event::RunCompleted { output } = &redacted.event else {
+            panic!("事件类型不该被改写");
+        };
+        assert_eq!(output["api_key"], json!("sk-live"));
+    }
+
     #[test]
     fn node_types_snapshot_is_stable() {
         const SNAPSHOT: &str = r#"[{"category":"control","label":"开始","max_instances":1,"params_schema":{"properties":{},"type":"object"},"ports":[{"id":"out","label":"出"}],"type":"start"},{"category":"control","label":"结束","params_schema":{"properties":{},"type":"object"},"ports":[{"id":"in","label":"入"}],"type":"end"},{"category":"compute","label":"脚本","params_schema":{"properties":{"code":{"type":"string","x-help":"可用 input（run 输入）与 nodes（上游节点输出），用 return 返回结果","x-label":"JS 函数体","x-opaque":true,"x-widget":"code"},"timeout_ms":{"default":2000,"type":"integer","x-label":"脚本超时（毫秒）"}},"required":["code"],"type":"object"},"ports":[{"id":"in","label":"入"},{"id":"out","label":"出"}],"supports_retry":true,"type":"script"},{"category":"control","label":"条件分支","params_schema":{"properties":{"expr":{"type":"string","x-help":"表达式结果按真值判定（非空字符串、非 0 数为真），可用 input 与 nodes","x-label":"条件表达式","x-opaque":true,"x-widget":"code"},"timeout_ms":{"default":2000,"type":"integer","x-label":"求值超时（毫秒）"}},"required":["expr"],"type":"object"},"ports":[{"id":"in","label":"入"},{"id":"true","label":"真"},{"id":"false","label":"假"}],"type":"condition"},{"category":"control","label":"等待","params_schema":{"properties":{"ms":{"type":"integer","x-help":"数字，或 ${input.x} / ${nodes.n.y} 模板（展开结果须为整数）","x-label":"时长（毫秒）"}},"required":["ms"],"type":"object"},"ports":[{"id":"in","label":"入"},{"id":"out","label":"出"}],"type":"delay"},{"category":"integration","label":"HTTP 请求","params_schema":{"properties":{"body":{"x-label":"请求体","x-widget":"json"},"headers":{"default":{},"x-label":"请求头","x-widget":"json"},"method":{"default":"GET","enum":["GET","POST","PUT","PATCH","DELETE"],"type":"string","x-label":"方法"},"timeout_ms":{"default":30000,"type":"integer","x-label":"HTTP 超时（毫秒）"},"url":{"type":"string","x-help":"支持 ${input.x} / ${nodes.n2.y} 模板（${} 内不能含 }）","x-label":"URL"}},"required":["url"],"type":"object"},"ports":[{"id":"in","label":"入"},{"id":"out","label":"出"}],"side_effect":true,"supports_retry":true,"type":"http_call"},{"category":"human","label":"人工节点","params_schema":{"properties":{"prompt":{"type":"string","x-label":"提示"}},"type":"object"},"ports":[{"id":"in","label":"入"},{"id":"out","label":"出"}],"type":"human_task"},{"category":"control","label":"子工作流","params_schema":{"properties":{"input_mapping":{"x-help":"JSON 对象，值支持 ${input.x} / ${nodes.n.y} 模板；展开结果整体作为子 run 输入。省略 = 沿用父 run 输入","x-label":"子 run 输入映射","x-widget":"json"},"workflow_id":{"type":"string","x-help":"调用其最新已发布版本作为子 run；子 run 输出透传为本节点输出；子 run 失败传导为本节点 fatal（DESIGN §6.8），重试策略只覆盖启动/等待类错误","x-label":"目标工作流","x-widget":"workflow-picker"}},"required":["workflow_id"],"type":"object"},"ports":[{"id":"in","label":"入"},{"id":"out","label":"出"}],"supports_retry":true,"type":"sub_workflow"},{"category":"ai","label":"LLM 调用","params_schema":{"properties":{"api_key":{"type":"string","x-help":"只存密钥名称（如 OPENAI_KEY），真值来自 FLOW_SECRET_<名称> 环境变量；已配置的名称见 secrets.list","x-label":"API 密钥名称","x-secret":true},"base_url":{"default":"https://api.openai.com/v1","type":"string","x-help":"OpenAI 兼容端点，请求发往 {base_url}/chat/completions","x-label":"API 地址"},"json_mode":{"default":false,"type":"boolean","x-help":"开启后请求带 response_format: {\"type\":\"json_object\"}","x-label":"JSON 模式"},"max_tokens":{"type":"integer","x-label":"最大 token 数"},"model":{"type":"string","x-label":"模型"},"prompt":{"type":"string","x-help":"支持 ${input.x} / ${nodes.n.y} 模板","x-label":"提示词","x-widget":"code"},"system":{"type":"string","x-label":"系统提示"},"temperature":{"type":"number","x-label":"温度"}},"required":["api_key","model","prompt"],"type":"object"},"ports":[{"id":"in","label":"入"},{"id":"out","label":"出"}],"side_effect":true,"supports_retry":true,"type":"llm"},{"category":"notify","label":"邮件","params_schema":{"properties":{"api_key":{"type":"string","x-help":"只存密钥名称（如 RESEND_KEY），真值来自 FLOW_SECRET_<名称> 环境变量；已配置的名称见 secrets.list","x-label":"API 密钥名称","x-secret":true},"body":{"type":"string","x-help":"纯文本（作为 text 字段发送），支持 ${input.x} / ${nodes.n.y} 模板","x-label":"正文","x-widget":"code"},"endpoint":{"default":"https://api.resend.com/emails","type":"string","x-help":"Resend 兼容接口：POST {from, to, subject, text}，Bearer 认证","x-label":"API 端点"},"from":{"type":"string","x-label":"发件人"},"subject":{"type":"string","x-help":"支持 ${input.x} / ${nodes.n.y} 模板","x-label":"主题"},"to":{"type":"string","x-label":"收件人"}},"required":["api_key","from","to","subject","body"],"type":"object"},"ports":[{"id":"in","label":"入"},{"id":"out","label":"出"}],"side_effect":true,"supports_retry":true,"type":"email"}]"#;

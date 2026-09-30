@@ -7,8 +7,10 @@ pub mod event;
 pub mod exec;
 pub mod expr;
 pub mod fold;
+pub mod journal_state;
 pub mod model;
 pub mod nodelog;
+pub mod observation;
 pub mod secrets;
 
 pub use backend::{CommitOutcome, PendingInput, PendingInputKind, RunEventSink};
@@ -23,4 +25,4 @@ pub use event::{
 };
 pub use fold::{NodeRecord, NodeState, RunPhase, RunState};
 pub use model::{Definition, Edge, Node, NodeType, Position, RetryPolicy, HTTP_METHODS};
-pub use nodelog::{redact_value, LogBudget, LogLine, NodeLogger};
+pub use nodelog::{budget_from_env, redact_url, redact_value, LogBudget, LogLine, NodeLogger};

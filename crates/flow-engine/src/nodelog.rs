@@ -20,50 +20,98 @@ pub const MAX_LOG_LINE_BYTES: usize = 8 * 1024;
 /// 每 run 日志条数默认预算。`FLOW_RUN_LOG_BUDGET` 可覆盖。
 pub const DEFAULT_LOG_BUDGET: usize = 10_000;
 
-/// per-run 日志预算：超限后 debug/info 丢弃，warn/error 永远放行
-///（错误可观测性不打折），丢弃量计数、由调用方写摘要行留痕。
+/// 单 run 日志行数**硬顶**（所有级别合计）。
+///
+/// debug/info 有 `max` 软预算，warn/error 按「错误可观测性不打折」不参与它
+/// （DESIGN §12.17）——但那个前提是「错误量是偶发的」。一个
+/// `while (true) console.error(…)` 的脚本就能把 event.jsonl / PG run_events
+/// 写到无界：软预算管不住 warn/error，前端环形缓存又只保护浏览器。磁盘比
+/// 「多几条 error」更值得保护，所以给 warn/error 也设一道总量硬顶。
+///
+/// 两道顶的关系：`hard_max = max(max, 硬顶常量)`。取 max 是为了
+/// `FLOW_RUN_LOG_BUDGET` 调大时硬顶跟着抬高——否则它会变成 info 的第二道
+/// 隐性预算（两道取小者生效），预算旋钮就失真了。默认值比任何正常 run 的
+/// 日志量大一个量级，碰不到它。
+pub const HARD_LOG_LINE_LIMIT: usize = 100_000;
+
+/// per-run 日志预算：debug/info 超 `max` 丢弃，warn/error 不消耗 `max`
+///（错误可观测性不打折），但所有级别合计受 `hard_max` 硬顶约束；
+/// 丢弃量计数、由调用方写摘要行留痕。
 pub struct LogBudget {
+    /// debug/info 合计软预算。
     max: usize,
+    /// 所有级别（含 warn/error）的合计硬顶。
+    hard_max: usize,
     emitted: AtomicUsize,
+    total: AtomicUsize,
     dropped: AtomicUsize,
 }
 
 impl LogBudget {
     pub fn new(max: usize) -> Arc<LogBudget> {
-        Arc::new(LogBudget {
+        Arc::new(LogBudget::build(max, hard_max_for(max)))
+    }
+
+    /// 测试注入小硬顶用：生产的硬顶是 10 万行级别的常量，循环不出来。
+    #[cfg(test)]
+    pub(crate) fn with_limits(max: usize, hard_max: usize) -> Arc<LogBudget> {
+        Arc::new(LogBudget::build(max, hard_max))
+    }
+
+    fn build(max: usize, hard_max: usize) -> LogBudget {
+        LogBudget {
             max,
+            hard_max,
             emitted: AtomicUsize::new(0),
+            total: AtomicUsize::new(0),
             dropped: AtomicUsize::new(0),
-        })
+        }
     }
 
     /// 本条日志是否放行。放行时内部计数 +1。
     ///
-    /// `max` 是 **debug/info 合计**的上限，不是总量：warn/error 永远放行
-    /// （错误可观测性不打折，DESIGN §12.17）且**不消耗 debug/info 预算**。
-    /// 共享一个计数器会让一个刷 warn 的节点把整条 run 的 info 日志预算吃光。
+    /// `max` 是 **debug/info 合计**的上限，不是总量：warn/error 不消耗它
+    /// （错误可观测性不打折，DESIGN §12.17）。共享一个计数器会让一个刷 warn
+    /// 的节点把整条 run 的 info 日志预算吃光。但 warn/error 也不是无限额
+    /// 度的——它们计入 `hard_max`，见 [`HARD_LOG_LINE_LIMIT`]。
     pub fn admit(&self, level: LogLevel) -> bool {
-        match level {
-            LogLevel::Warn | LogLevel::Error => true,
-            LogLevel::Debug | LogLevel::Info => {
-                let emitted = self.emitted.fetch_add(1, Ordering::Relaxed);
-                if emitted < self.max {
-                    true
-                } else {
-                    self.dropped.fetch_add(1, Ordering::Relaxed);
-                    false
-                }
-            }
+        if matches!(level, LogLevel::Debug | LogLevel::Info)
+            && self.emitted.fetch_add(1, Ordering::Relaxed) >= self.max
+        {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return false;
         }
+        // 硬顶对**所有**放行的行计数。被软预算挡下的 debug/info 不进来：
+        // 它们已经被拒了，再记一次总量只会让硬顶提前误伤 warn/error。
+        if self.total.fetch_add(1, Ordering::Relaxed) >= self.hard_max {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        true
     }
 
-    /// 当前累计丢弃条数（摘要行用；取走后清零）。
+    /// 当前累计丢弃条数（摘要行用；取走后清零）。软预算与硬顶的丢弃合在一起计。
     pub fn take_dropped(&self) -> usize {
         self.dropped.swap(0, Ordering::Relaxed)
     }
+
+    /// (debug/info 软预算, 总量硬顶)——driver 的预算摘要行要把两个数写清楚，
+    /// 用户才知道该调哪个旋钮（`FLOW_RUN_LOG_BUDGET`）。
+    pub fn limits(&self) -> (usize, usize) {
+        (self.max, self.hard_max)
+    }
 }
 
-pub(crate) fn budget_from_env() -> usize {
+/// 硬顶不小于软预算：见 [`HARD_LOG_LINE_LIMIT`] 的「两道顶的关系」。
+fn hard_max_for(max: usize) -> usize {
+    max.max(HARD_LOG_LINE_LIMIT)
+}
+
+/// 每 run 日志预算（debug/info 条数）。`FLOW_RUN_LOG_BUDGET` 可覆盖。
+///
+/// 广播容量也跟着它核算（可观察性设计 §4：`max(基础容量, 预算)`），单机与
+/// Postgres 两个后端共用这一个读数，容量公式不分叉。
+pub fn budget_from_env() -> usize {
     std::env::var("FLOW_RUN_LOG_BUDGET")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -72,7 +120,7 @@ pub(crate) fn budget_from_env() -> usize {
 }
 
 /// 通道载荷：driver 排空后转成 `Event::NodeLog` 落盘。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LogLine {
     pub node_id: String,
     pub attempt: u32,
@@ -85,10 +133,16 @@ pub struct LogLine {
 /// 通道满/接收端已关一律静默（fire-and-forget，日志永远不影响执行）。
 #[derive(Clone)]
 pub struct NodeLogger {
-    tx: UnboundedSender<LogLine>,
+    tx: LogTarget,
     budget: Arc<LogBudget>,
     node_id: String,
     attempt: u32,
+}
+
+#[derive(Clone)]
+enum LogTarget {
+    Legacy(UnboundedSender<LogLine>),
+    Observation(crate::observation::ObservationLogger),
 }
 
 impl NodeLogger {
@@ -99,11 +153,15 @@ impl NodeLogger {
         attempt: u32,
     ) -> NodeLogger {
         NodeLogger {
-            tx,
+            tx: LogTarget::Legacy(tx),
             budget,
             node_id: node_id.into(),
             attempt,
         }
+    }
+
+    pub fn observation(target: crate::observation::ObservationLogger, node_id: String, attempt: u32) -> Self {
+        Self { tx: LogTarget::Observation(target), budget: LogBudget::new(usize::MAX), node_id, attempt }
     }
 
     /// 无接收端的 logger（直接调用 exec 的测试路径用）：发射即丢，预算放行。
@@ -116,13 +174,17 @@ impl NodeLogger {
         if !self.budget.admit(level) {
             return;
         }
-        let _ = self.tx.send(LogLine {
+        let line = LogLine {
             node_id: self.node_id.clone(),
             attempt: self.attempt,
             level,
             stream,
             message: truncate_message(&message.into()),
-        });
+        };
+        match &self.tx {
+            LogTarget::Legacy(tx) => { let _ = tx.send(line); }
+            LogTarget::Observation(target) => target.emit(line),
+        }
     }
 
     pub fn debug(&self, message: impl Into<String>) {
@@ -189,8 +251,15 @@ pub fn cap_input_snapshot(value: &Value) -> Value {
     })
 }
 
-/// 固定敏感键列表（小写子串匹配）：脱敏三个出口共用——http 日志行的 headers、
-/// node_started.input（写入时）、timeline 的 output（展示时）。
+/// 固定敏感键列表（小写子串匹配）。脱敏出口：
+/// - `node_started.input`：写入时（`driver::build_node_prep`）；
+/// - 节点 output 的**所有展示面**：timeline（`flow-rpc::timeline_value`）与
+///   run.subscribe 通知（`flow-rpc::redact_display_envelope`）——两处不同步
+///   就会让前端用事件里的原始值覆盖 timeline 的脱敏值，脱敏被绕过；
+/// - `node_failed.error` 里回显的上游响应（`exec` 的失败消息）。
+///
+/// http 日志行**不**含 headers（`exec` 只记 `→ {method} {url}`），所以没有
+/// 「请求头脱敏」这个出口；但 URL query 里的凭据要走 [`redact_url`]。
 // 子串匹配。「set-cookie」被「cookie」完全覆盖，是死条目；同理
 // 「password_policy」「tokenizer」「secretary」这类合法字段会被误脱敏成
 // 「***」。改成精确/后缀匹配要考虑 `Authorization` / `x-apiKey` /
@@ -233,6 +302,31 @@ pub fn redact_value(value: &Value) -> Value {
         Value::Array(items) => Value::Array(items.iter().map(redact_value).collect()),
         other => other.clone(),
     }
+}
+
+/// URL 的 query 串脱敏：命中敏感键的参数值替换为 `"***"`。
+///
+/// `redact_value` 只认识 JSON 键，URL 是字符串、管不到；而 `?api_key=…`
+/// `?access_token=…` 这类把凭据放 query 的接口很常见，日志行和失败消息都会
+/// 原样带上它。host / path / 非敏感参数**原样保留**——排查时要看的是
+/// 「打了哪个接口」，不是「接口的完整签名」。
+///
+/// 只用于**展示/日志面**：发起请求用的永远是原始 URL（本函数不碰入参的
+/// 所有权语义之外的东西，调用方传 `&str`，自己决定用原值还是脱敏值）。
+pub fn redact_url(url: &str) -> String {
+    let Some((base, query)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    let redacted = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            // 键命中即脱敏值；没有 `=` 的裸参数（`?debug`）没有值可泄，原样
+            Some((key, _)) if is_sensitive_key(key) => format!("{key}={REDACTED}"),
+            _ => pair.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{base}?{redacted}")
 }
 
 #[cfg(test)]
@@ -284,6 +378,51 @@ mod tests {
         assert_eq!(budget.take_dropped(), 2, "只丢 2 条 debug/info");
     }
 
+    /// 硬顶：warn/error 不消耗 debug/info 预算，但**不是无限额度**。
+    /// 一个 `while (true) console.error()` 的脚本能把 event.jsonl 写到无界，
+    /// 软预算管不住它（「错误不打折」的前提是错误量偶发）。
+    #[test]
+    fn hard_cap_stops_even_warn_and_error() {
+        let budget = LogBudget::with_limits(3, 10);
+        // 10 条 warn 全部放行：warn 不碰 info 预算，只计入总量
+        for i in 0..10 {
+            assert!(budget.admit(LogLevel::Warn), "总量内 warn {i} 必须放行");
+        }
+        assert_eq!(budget.limits(), (3, 10));
+        // 总量满：之后 warn/error 一样丢（info 也满，但也走同一条硬顶）
+        for i in 0..2 {
+            assert!(!budget.admit(LogLevel::Error), "硬顶后 error {i} 必须丢弃");
+            assert!(!budget.admit(LogLevel::Info), "硬顶后 info {i} 必须丢弃");
+        }
+        assert!(budget.take_dropped() >= 4, "硬顶丢弃要计数");
+    }
+
+    /// info 预算不受 warn 刷屏影响（硬顶之下）：换一个新的预算，info 仍拿满 3 条。
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn info_budget_survives_warn_burst_below_hard_cap() {
+        let budget = LogBudget::with_limits(3, 100);
+        for i in 0..50 {
+            assert!(budget.admit(LogLevel::Warn), "warn {i} 放行（未到硬顶）");
+        }
+        for _ in 0..3 {
+            assert!(budget.admit(LogLevel::Info), "info 预算未被 warn 吃掉");
+        }
+        assert!(!budget.admit(LogLevel::Info), "第 4 条 info 超软预算");
+    }
+
+    /// 硬顶不小于软预算：`FLOW_RUN_LOG_BUDGET` 调大时硬顶跟着抬高，
+    /// 否则它会变成 info 的第二道隐性预算（两道取小者生效，旋钮失真）。
+    #[test]
+    fn hard_cap_never_below_the_info_budget() {
+        let big = 500_000; // > HARD_LOG_LINE_LIMIT
+        assert_eq!(LogBudget::new(big).limits(), (big, big));
+        let (max, hard) = LogBudget::new(10_000).limits();
+        assert_eq!(max, 10_000);
+        assert!(hard >= max, "硬顶 {hard} 不得小于软预算 {max}");
+        assert_eq!(hard, HARD_LOG_LINE_LIMIT);
+    }
+
     #[test]
     fn message_truncated_at_char_boundary_with_marker() {
         let (logger, mut rx) = logger_with_budget(usize::MAX);
@@ -331,6 +470,41 @@ mod tests {
         assert_eq!(redacted["url"], json!("http://x"));
         // 消费式：调用方的原值不受影响
         assert_eq!(value["Authorization"], json!("Bearer x"));
+    }
+
+    #[test]
+    fn redact_url_masks_only_sensitive_query_values() {
+        // 命中敏感键的 query 值：键保留（排查要看打了哪个接口），值脱敏
+        assert_eq!(
+            redact_url("https://api.example.com/v1/items?api_key=sk-123&page=2"),
+            "https://api.example.com/v1/items?api_key=***&page=2"
+        );
+        // 大小写不敏感（is_sensitive_key 内部 to_ascii_lowercase）
+        assert_eq!(
+            redact_url("https://x.test/a?AccessToken=abc&q=1"),
+            "https://x.test/a?AccessToken=***&q=1"
+        );
+        // 子串命中：authorization / secret / password 都在列表里
+        assert_eq!(
+            redact_url("https://x.test/a?authorization=Bearer+y"),
+            "https://x.test/a?authorization=***"
+        );
+        assert_eq!(
+            redact_url("https://x.test/a?client_secret=z&w=0"),
+            "https://x.test/a?client_secret=***&w=0"
+        );
+        // 没有 query / 裸参数（无值可泄）/ 非敏感参数：原样
+        assert_eq!(redact_url("https://x.test/a"), "https://x.test/a");
+        assert_eq!(redact_url("https://x.test/a?debug"), "https://x.test/a?debug");
+        assert_eq!(
+            redact_url("https://x.test/a?q=token&z=1"),
+            "https://x.test/a?q=token&z=1"
+        );
+        // 多个 & 全都过一遍，不因为第一个命中就短路
+        assert_eq!(
+            redact_url("https://x.test/a?token=1&ok=2&password=3"),
+            "https://x.test/a?token=***&ok=2&password=***"
+        );
     }
 
     #[tokio::test]

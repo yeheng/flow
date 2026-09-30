@@ -4,3 +4,6 @@ node_modules/
 web/dist/
 web/test-results/
 web/playwright-report/
+!crates/*/src/bin/
+!crates/*/src/bin/*.rs
+docs/refactor-evidence/

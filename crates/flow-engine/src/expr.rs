@@ -77,6 +77,8 @@ struct JsReader<'js> {
     date_ctor: Object<'js>,
     date_to_iso: Function<'js>,
     bigint_to_string: Function<'js>,
+    remaining: std::cell::Cell<usize>,
+    max_depth: usize,
 }
 
 impl<'js> JsReader<'js> {
@@ -85,6 +87,8 @@ impl<'js> JsReader<'js> {
             date_ctor: ctx.globals().get::<_, Object>("Date")?,
             date_to_iso: ctx.eval::<Function, _>("(function (d) { return d.toISOString(); })")?,
             bigint_to_string: ctx.eval::<Function, _>("(function (b) { return b.toString(); })")?,
+            remaining: std::cell::Cell::new(usize::MAX),
+            max_depth: MAX_JS_DEPTH,
         })
     }
 
@@ -111,12 +115,13 @@ impl<'js> JsReader<'js> {
         value: &JsValue<'js>,
         depth: usize,
     ) -> Result<Option<Value>, rquickjs::Error> {
-        if depth > MAX_JS_DEPTH {
+        if depth > self.max_depth {
             return Err(rquickjs::Error::new_from_js(
                 "object",
                 "数据结构嵌套超过 128 层（或存在环），拒绝序列化",
             ));
         }
+        self.charge(8)?;
         Ok(Some(match value.type_of() {
             rquickjs::Type::Null | rquickjs::Type::Uninitialized => Value::Null,
             rquickjs::Type::Bool => Value::Bool(value.get::<bool>()?),
@@ -132,9 +137,19 @@ impl<'js> JsReader<'js> {
                     Value::from(f)
                 }
             }
-            rquickjs::Type::String => Value::String(value.get::<String>()?),
+            rquickjs::Type::String => {
+                let s = value.get::<String>()?;
+                self.charge(s.len())?;
+                Value::String(s)
+            }
             rquickjs::Type::Array => {
                 let array = value.get::<Array>()?;
+                if array.len() > self.remaining.get() / 8 {
+                    return Err(rquickjs::Error::new_from_js(
+                        "array",
+                        "output budget exceeded",
+                    ));
+                }
                 let mut items = Vec::with_capacity(array.len());
                 for i in 0..array.len() {
                     // 稀疏数组的洞读出来是 undefined：对应 stringify 的 [null]
@@ -165,6 +180,7 @@ impl<'js> JsReader<'js> {
                 let mut map = serde_json::Map::new();
                 for key in object.keys::<String>() {
                     let key = key?;
+                    self.charge(key.len())?;
                     let item = object.get::<_, JsValue>(&key)?;
                     if let Some(json) = self.to_json(&item, depth + 1)? {
                         map.insert(key, json);
@@ -173,6 +189,18 @@ impl<'js> JsReader<'js> {
                 Value::Object(map)
             }
         }))
+    }
+    fn charge(&self, n: usize) -> Result<(), rquickjs::Error> {
+        if self.remaining.get() == usize::MAX {
+            return Ok(());
+        }
+        let remaining = self
+            .remaining
+            .get()
+            .checked_sub(n)
+            .ok_or_else(|| rquickjs::Error::new_from_js("value", "output budget exceeded"))?;
+        self.remaining.set(remaining);
+        Ok(())
     }
 }
 
@@ -209,7 +237,51 @@ fn run_js(
     timeout: Duration,
     logger: &NodeLogger,
 ) -> Result<Value, EngineError> {
+    run_js_limited(body, input, nodes, tpl, timeout, logger, None)
+}
+
+#[derive(Clone, Copy)]
+pub struct JsLimits {
+    pub input_bytes: usize,
+    pub heap_bytes: usize,
+    pub output_bytes: usize,
+    pub depth: usize,
+}
+impl Default for JsLimits {
+    fn default() -> Self {
+        Self {
+            input_bytes: 8 * 1024 * 1024,
+            heap_bytes: 32 * 1024 * 1024,
+            output_bytes: 8 * 1024 * 1024,
+            depth: 64,
+        }
+    }
+}
+
+fn run_js_limited(
+    body: &str,
+    input: &Value,
+    nodes: &Value,
+    tpl: &Value,
+    timeout: Duration,
+    logger: &NodeLogger,
+    limits: Option<JsLimits>,
+) -> Result<Value, EngineError> {
+    if let Some(limits) = limits {
+        let mut remaining = limits.input_bytes;
+        for value in [input, nodes, tpl] {
+            flow_journal::codec::validate_depth(value, 0)
+                .map_err(|e| EngineError::Expr(e.to_string()))?;
+            let bytes = flow_journal::codec::bounded_json(value, remaining)
+                .map_err(|e| EngineError::Expr(e.to_string()))?;
+            remaining = remaining.saturating_sub(bytes.len());
+        }
+    }
     let runtime = Runtime::new().map_err(|e| EngineError::Expr(e.to_string()))?;
+    if let Some(limits) = limits {
+        runtime.set_memory_limit(limits.heap_bytes);
+        runtime.set_max_stack_size(512 * 1024);
+    }
     let deadline = Instant::now() + timeout;
     runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() > deadline)));
 
@@ -273,7 +345,8 @@ fn run_js(
 
         let result: JsValue = ctx.eval(program)?;
         let outcome = result.get::<Object>()?;
-        let reader = JsReader::new(&ctx)?;
+        let mut reader = JsReader::new(&ctx)?;
+        if let Some(limits)=limits {reader.remaining.set(limits.output_bytes);reader.max_depth=limits.depth;}
         if outcome.get::<_, bool>("ok")? {
             let value = outcome.get::<_, JsValue>("value")?;
             Ok(Ok(reader.to_json(&value, 0)?.unwrap_or(Value::Null)))
@@ -282,7 +355,13 @@ fn run_js(
         }
     });
     match outcome.map_err(|e| EngineError::Expr(e.to_string()))? {
-        Ok(value) => Ok(value),
+        Ok(value) => {
+            if let Some(limits) = limits {
+                flow_journal::codec::bounded_json(&value, limits.output_bytes)
+                    .map_err(|e| EngineError::Expr(e.to_string()))?;
+            }
+            Ok(value)
+        }
         Err(message) => Err(EngineError::Expr(message)),
     }
 }
@@ -297,6 +376,24 @@ pub fn eval_body(
     logger: &NodeLogger,
 ) -> Result<Value, EngineError> {
     run_js(body, input, nodes, &Value::Null, timeout, logger)
+}
+
+pub fn eval_body_bounded(
+    body: &str,
+    input: &Value,
+    nodes: &Value,
+    timeout: Duration,
+    logger: &NodeLogger,
+) -> Result<Value, EngineError> {
+    run_js_limited(
+        body,
+        input,
+        nodes,
+        &Value::Null,
+        timeout,
+        logger,
+        Some(JsLimits::default()),
+    )
 }
 
 /// 条件节点：求值单个表达式。console 可用（disabled logger，输出丢弃）。
@@ -336,6 +433,23 @@ pub fn expand_templates(
     nodes: &Value,
     timeout: Duration,
 ) -> Result<Value, EngineError> {
+    expand_templates_impl(tpl, input, nodes, timeout, None)
+}
+pub fn expand_templates_bounded(
+    tpl: &Value,
+    input: &Value,
+    nodes: &Value,
+    timeout: Duration,
+) -> Result<Value, EngineError> {
+    expand_templates_impl(tpl, input, nodes, timeout, Some(JsLimits::default()))
+}
+fn expand_templates_impl(
+    tpl: &Value,
+    input: &Value,
+    nodes: &Value,
+    timeout: Duration,
+    limits: Option<JsLimits>,
+) -> Result<Value, EngineError> {
     let body = r#"    function __one(e) {
       var r = eval(e);
       return r === undefined ? null : r;
@@ -363,7 +477,15 @@ pub fn expand_templates(
       return v;
     }
     return __expand(tpl, input, nodes);"#;
-    run_js(body, input, nodes, tpl, timeout, &NodeLogger::disabled())
+    run_js_limited(
+        body,
+        input,
+        nodes,
+        tpl,
+        timeout,
+        &NodeLogger::disabled(),
+        limits,
+    )
 }
 
 #[cfg(test)]

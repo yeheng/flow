@@ -680,18 +680,28 @@ impl Driver {
     }
 
     /// 预算摘要：有丢弃就补一条 engine 级日志留痕（node_id 为空 = run 级）。
+    ///
+    /// 走 `write_log_line` 而不是直接 `write_log_batch`：摘要行本身也要过
+    /// 预算（`admit(Warn)`）——它会计入总量硬顶。绕过 admit 的老写法规避了
+    /// 「摘要被自己丢掉」，但那时总量本来就有软预算兜底；现在硬顶只挡
+    /// 「warn/error 无界刷屏」，若摘要仍然绕过，被硬顶按住的 run 每排空一批
+    /// 就补一条摘要，摘要自己就成了新的无界增长源。被硬顶挡下时不补摘要，
+    /// 用户看到的是日志停止增长 + 之前那些摘要，恰好就是硬顶生效的证据。
     async fn flush_log_summary(&mut self) -> Result<(), EngineError> {
         let dropped = self.budget.take_dropped();
         if dropped == 0 {
             return Ok(());
         }
-        self.write_log_batch(vec![LogLine {
+        let (max, hard_max) = self.budget.limits();
+        self.write_log_line(LogLine {
             node_id: String::new(),
             attempt: 0,
             level: LogLevel::Warn,
             stream: LogStream::Engine,
-            message: format!("已丢弃 {dropped} 条 debug/info 日志（达到每 run 日志预算）"),
-        }])
+            message: format!(
+                "已丢弃 {dropped} 条日志（每 run 日志上限：debug/info {max} 条 / 总量 {hard_max} 条）"
+            ),
+        })
         .await
     }
 
