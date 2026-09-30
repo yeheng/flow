@@ -55,7 +55,7 @@ async fn event_notifications_cover_create_and_append() {
 
 /// §8 资源边界：`EventHub::stop()` 之后订阅流必须结束。
 ///
-/// 修复前 `EventHub` 直接持有 `broadcast::Sender`，`stop()` 只取消轮询任务，
+/// 若 `EventHub` 直接持有 `broadcast::Sender`，`stop()` 只取消轮询任务时
 /// 最后一个 sender 始终存活 → 订阅者永远收不到 `RecvError::Closed`，
 /// 挂在 `run_tail` / `broadcast_tail` 的 select 里不退出，停机时每次订阅
 /// 留一个永不退出的 task。

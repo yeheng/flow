@@ -243,11 +243,10 @@ enum DriverMsg {
 
 /// 节点级执行状态机：**一个节点在同一时刻恰好处于一个 NodeSlot**。
 ///
-/// 此前是三个平行集合（`inflight` / `human_waiting` / `adjudicating`），终止判定
-/// 是三者皆空的四元合取。新增一种「等待中」要同时改：插入点、删除点、终止条件、
-/// abort 清理——漏一处不是提前 finalize（丢工作）就是永久挂死。这里用一个
-/// enum-keyed map 把它塌缩掉：终止判定收敛为 `slots.is_empty()` 一个谓词，
-/// 新增状态是一个变体而不是四个改动点。
+/// 用一个 enum-keyed map 承载全部在途工作，而不是几个平行集合 + 终止判定的
+/// 多重合取：那种形状下新增一种「等待中」要同时改插入点、删除点、终止条件、
+/// abort 清理四处，漏一处不是提前 finalize（丢工作）就是永久挂死。塌缩之后
+/// 终止判定是 `slots.is_empty()` 一个谓词，新增状态是一个变体。
 ///
 /// ## 转移表（`∅` = 该节点不在 `slots` 里）
 ///
@@ -279,9 +278,9 @@ enum DriverMsg {
 /// 3. **`Adjudicating` 不持有 handle**：它等的是 `run.signal`，不是本地任务。
 ///    裁决消息从 `signal_rx` / inbox 来，不经 `result_rx`。这是它与前两者
 ///    唯一的结构差异，也是 `abort_inflight` 对它只做 `remove` 的原因。
-/// 4. **一个节点不会同时处于两种 slot。** 旧代码里 human_task 节点同时躺在
-///    `human_waiting` 与 `inflight` 两个集合，靠约定而非构造保证同步；这里由
-///    类型保证。
+/// 4. **一个节点不会同时处于两种 slot。** human_task 的 oneshot 发送端与
+///    等待任务句柄必须同生共死——分放两个集合时只能靠约定保持同步，
+///    分开放就会漏清一处。
 enum NodeSlot {
     /// 节点执行中（含退避计时器）。持有本地任务句柄。
     Running(JoinHandle<()>),
@@ -408,8 +407,8 @@ impl Driver {
                 // 期间取消信号、日志排空、租约失效全部要等它跑完。
                 let targets: Vec<(String, u32)> = ready
                     .iter()
-                    .map(|id| Ok((id.clone(), self.next_attempt(id))))
-                    .collect::<Result<_, EngineError>>()?;
+                    .map(|id| (id.clone(), self.next_attempt(id)))
+                    .collect();
                 let raw = targets
                     .iter()
                     .map(|(id, _)| self.prepare_inputs(id))
@@ -593,7 +592,7 @@ impl Driver {
 
     /// 引擎叙事日志的**唯一**出口：与 exec 的 console 日志同预算、同截断
     /// （`NodeLogger::log` 已截过一次，这里再截是幂等的）。
-    /// driver 不再直接 `append(NodeLog)`——那在 Postgres 上是每条一个受保护
+    /// driver 不直接 `append(NodeLog)`——那在 Postgres 上是每条一个受保护
     /// 事务，与「日志是廉价层」的契约冲突（backend.rs §append_log_batch）。
     ///
     /// 差别在**批**：exec 的日志从通道攒批（`drain_logs`，单批 256 条）后落盘，
@@ -1058,8 +1057,7 @@ impl Driver {
             }
         });
         // 不变量 2：`AwaitSignal` 持有的句柄恰好欠一条 DriverMsg——信号到达后
-        // 等待任务回传 Done。旧代码把 oneshot 发送端与 JoinHandle 分放两个集合，
-        // 靠约定保证同步；这里由变体保证两者同生共死。
+        // 等待任务回传 Done。oneshot 发送端与句柄同处一个变体，两者同生共死。
         self.slots.insert(
             node_id.to_string(),
             NodeSlot::AwaitSignal { reply: tx, handle },
@@ -1426,9 +1424,9 @@ impl Driver {
 
     /// 清空全部在途工作（取消 / 停机 / 失去所有权 / Driver 退出）。
     ///
-    /// 旧实现是 `inflight.drain()` + `human_waiting.clear()` + `adjudicating.clear()`
-    /// 三段——漏一段就留下永不消费的节点。`NodeSlot::handle()` 让「要不要 abort」
-    /// 变成一个 match，新增状态时编译器逼着在这里给出处置。
+    /// 一次 `drain` 覆盖全部在途状态：分集合清理时漏一段就留下永不消费的节点。
+    /// `NodeSlot::handle()` 让「要不要 abort」变成一个 match，新增状态时编译器
+    /// 逼着在这里给出处置。
     fn abort_inflight(&mut self) {
         for (_, slot) in self.slots.drain() {
             if let Some(handle) = slot.handle() {

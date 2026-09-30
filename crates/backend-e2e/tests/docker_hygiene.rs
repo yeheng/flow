@@ -13,8 +13,8 @@
 //! 3. **回收历史遗留**：启动时清扫 dangling 匿名 volume → 早于本文件的老运行漏下
 //!    的孤儿，下一次 e2e 启动就该被回收。
 //!
-//! 「不创建」必须在容器**活着的**时候查（`container_anonymous_volumes`）：等
-//! 到进程退出就晚了——那时 volume 已经变成孤儿，而它是不是被 atexit 收走，
+//! 「不创建」必须在容器**活着的**时候查（`container_anonymous_volumes`）：
+//! 等到进程退出就晚了——那时 volume 已经是孤儿，它是否被 atexit 收走，
 //! 测试已经看不到了。
 //!
 //! 这些用例属于「harness 契约」而非「后端行为契约」，所以不套 `e2e_test!`
@@ -55,8 +55,8 @@ async fn pg_run_creates_no_volume_and_reclaims_every_orphan() {
         .await
         .expect("连接引擎失败");
 
-    // cleanup 的语义是「关池 + DROP 数据库」，不是「关池」。曾经 TestDb 实现了
-    // Deref<Target=PgPool>，调用点的 db.close() 静默解析成 PgPool::close()——
+    // cleanup 的语义是「关池 + DROP 数据库」，不是「关池」。若 TestDb 实现
+    // Deref<Target=PgPool>，调用点的 db.close() 会静默解析成 PgPool::close()——
     // 只关池不删库，一圈测试下来服务器上堆了几十个残留库，且没有任何测试会响。
     db.cleanup().await;
     assert!(
@@ -91,7 +91,7 @@ async fn pg_run_creates_no_volume_and_reclaims_every_orphan() {
     );
 
     // ---- 防线 3：上一轮漏下的孤儿要被启动清扫回收 ----
-    // 复刻修复前的行为：起带 volume 的容器，然后**不带 -v** 地强删
+    // 复刻那条错误路径：起带 volume 的容器，然后**不带 -v** 地强删
     let stale = start_probe_container();
     docker_bare_rm(&stale);
     let orphaned = anonymous_dangling_volumes();
@@ -139,7 +139,7 @@ async fn janitor_never_touches_named_volumes() {
     docker_ok(&["volume", "rm", "-f", "flow-test-support-named-probe"]);
 }
 
-/// 复刻修复前的删除路径：强删但不带 `-v`（会漏下匿名 volume）。
+/// 复刻那条错误删除路径：强删但不带 `-v`（会漏下匿名 volume）。
 fn docker_bare_rm(id: &str) {
     std::process::Command::new("docker")
         .args(["rm", "-f", id])

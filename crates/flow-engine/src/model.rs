@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// 节点类型。前端拖拽面板与引擎共用这一份定义。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeType {
     Start,
@@ -23,44 +23,29 @@ pub enum NodeType {
     Email,
 }
 
+/// 节点类型与其字符串名的对应表：**变体清单的唯一来源**。
+///
+/// `as_str` / `parse` / `ALL` / `descriptor` 的下标 / `has_side_effect` 全部
+/// 由这一张表派生。**新增节点类型只改这张表与 enum**：这些面各自手写时，
+/// 漏改的那几处不会编译报错，只在运行期表现为「类型不认识」或前端面板少一项。
+///
+/// 表用 `(变体, 字符串)` 而不是靠 `as_str` 反推：字符串是 wire 格式与落库内容，
+/// 让它显式出现在表里，改名时编译器与快照测试一起响。
+const NODE_TYPE_TABLE: [(NodeType, &str); 10] = [
+    (NodeType::Start, "start"),
+    (NodeType::End, "end"),
+    (NodeType::Script, "script"),
+    (NodeType::Condition, "condition"),
+    (NodeType::Delay, "delay"),
+    (NodeType::HttpCall, "http_call"),
+    (NodeType::HumanTask, "human_task"),
+    (NodeType::SubWorkflow, "sub_workflow"),
+    (NodeType::Llm, "llm"),
+    (NodeType::Email, "email"),
+];
+
 impl NodeType {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            NodeType::Start => "start",
-            NodeType::End => "end",
-            NodeType::Script => "script",
-            NodeType::Condition => "condition",
-            NodeType::Delay => "delay",
-            NodeType::HttpCall => "http_call",
-            NodeType::HumanTask => "human_task",
-            NodeType::SubWorkflow => "sub_workflow",
-            NodeType::Llm => "llm",
-            NodeType::Email => "email",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<NodeType> {
-        Some(match s {
-            "start" => NodeType::Start,
-            "end" => NodeType::End,
-            "script" => NodeType::Script,
-            "condition" => NodeType::Condition,
-            "delay" => NodeType::Delay,
-            "http_call" => NodeType::HttpCall,
-            "human_task" => NodeType::HumanTask,
-            "sub_workflow" => NodeType::SubWorkflow,
-            "llm" => NodeType::Llm,
-            "email" => NodeType::Email,
-            _ => return None,
-        })
-    }
-
-    /// 崩溃后是否不可安全重放：有外部副作用的节点必须人工裁决。
-    pub fn has_side_effect(self) -> bool {
-        matches!(self, NodeType::HttpCall | NodeType::Llm | NodeType::Email)
-    }
-
-    /// 全部节点类型。数组顺序 = nodetypes.list 响应顺序 = 前端面板顺序。
+    /// 全部节点类型，顺序 = 表的顺序 = `nodetypes.list` 响应顺序 = 前端面板顺序。
     pub const ALL: [NodeType; 10] = [
         NodeType::Start,
         NodeType::End,
@@ -74,15 +59,40 @@ impl NodeType {
         NodeType::Email,
     ];
 
-    /// 前端拖拽面板 + 参数表单所需的能力描述（nodetypes.list 的单条）。
+    pub fn as_str(self) -> &'static str {
+        NODE_TYPE_TABLE
+            .iter()
+            .find(|(kind, _)| *kind == self)
+            .map(|(_, name)| *name)
+            .expect("NodeType 的每个变体都在 NODE_TYPE_TABLE 里（node_type_table_is_exhaustive）")
+    }
+
+    pub fn parse(s: &str) -> Option<NodeType> {
+        NODE_TYPE_TABLE
+            .iter()
+            .find(|(_, name)| *name == s)
+            .map(|(kind, _)| *kind)
+    }
+
+    /// 崩溃后是否不可安全重放：有外部副作用的节点必须人工裁决。
+    pub fn has_side_effect(self) -> bool {
+        matches!(self, NodeType::HttpCall | NodeType::Llm | NodeType::Email)
+    }
+
+    /// 能力描述的**主体**（`nodetypes.list` 单条去掉 `"type"` 字段）。
     ///
-    /// `params_schema` 是 JSON Schema draft-07 子集（type/required/properties/enum/default），
-    /// 另带 `x-widget`（code/json/workflow-picker）、`x-label`、`x-help` 扩展，
-    /// 前端据此递归渲染参数表单，后端 validate 仍以本文件的 validate_params 为准。
-    fn build_descriptor(self) -> Value {
+    /// `"type"` 由 [`Self::descriptor`] 从 [`NODE_TYPE_TABLE`] 注入，不在这里
+    /// 重写一遍：同一个类型名字符串出现在表、`as_str`、`parse`、这里共四处时，
+    /// 改名必漏其中一处。
+    ///
+    /// `params_schema` 是 JSON Schema draft-07 子集
+    /// （type/required/properties/enum/default），另带 `x-widget`
+    /// （code/json/workflow-picker）、`x-label`、`x-help`、`x-secret` 扩展，
+    /// 前端据此递归渲染参数表单；后端校验以 [`validate_params`] 为准，
+    /// 它读的必填清单也来自本函数（见 [`Self::required_params`]）。
+    fn descriptor_body(self) -> Value {
         match self {
             NodeType::Start => serde_json::json!({
-                "type": "start",
                 "label": "开始",
                 "category": "control",
                 "max_instances": 1,
@@ -90,14 +100,12 @@ impl NodeType {
                 "params_schema": {"type": "object", "properties": {}}
             }),
             NodeType::End => serde_json::json!({
-                "type": "end",
                 "label": "结束",
                 "category": "control",
                 "ports": [{"id": "in", "label": "入"}],
                 "params_schema": {"type": "object", "properties": {}}
             }),
             NodeType::Script => serde_json::json!({
-                "type": "script",
                 "label": "脚本",
                 "category": "compute",
                 "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
@@ -105,7 +113,8 @@ impl NodeType {
                     "type": "object",
                     "required": ["code"],
                     "properties": {
-                        "code": {"type": "string", "x-widget": "code", "x-label": "JS 函数体",
+                        "code": {"type": "string", "x-widget": "code", "x-opaque": true,
+                                 "x-label": "JS 函数体",
                                  "x-help": "可用 input（run 输入）与 nodes（上游节点输出），用 return 返回结果"},
                         "timeout_ms": {"type": "integer", "default": 2000, "x-label": "脚本超时（毫秒）"}
                     }
@@ -113,7 +122,6 @@ impl NodeType {
                 "supports_retry": true
             }),
             NodeType::Condition => serde_json::json!({
-                "type": "condition",
                 "label": "条件分支",
                 "category": "control",
                 "ports": [{"id": "in", "label": "入"}, {"id": "true", "label": "真"}, {"id": "false", "label": "假"}],
@@ -121,14 +129,14 @@ impl NodeType {
                     "type": "object",
                     "required": ["expr"],
                     "properties": {
-                        "expr": {"type": "string", "x-widget": "code", "x-label": "条件表达式",
+                        "expr": {"type": "string", "x-widget": "code", "x-opaque": true,
+                                 "x-label": "条件表达式",
                                  "x-help": "表达式结果按真值判定（非空字符串、非 0 数为真），可用 input 与 nodes"},
                         "timeout_ms": {"type": "integer", "default": 2000, "x-label": "求值超时（毫秒）"}
                     }
                 }
             }),
             NodeType::Delay => serde_json::json!({
-                "type": "delay",
                 "label": "等待",
                 "category": "control",
                 "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
@@ -142,7 +150,6 @@ impl NodeType {
                 }
             }),
             NodeType::HttpCall => serde_json::json!({
-                "type": "http_call",
                 "label": "HTTP 请求",
                 "category": "integration",
                 "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
@@ -162,7 +169,6 @@ impl NodeType {
                 "side_effect": true
             }),
             NodeType::HumanTask => serde_json::json!({
-                "type": "human_task",
                 "label": "人工节点",
                 "category": "human",
                 "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
@@ -174,7 +180,6 @@ impl NodeType {
                 }
             }),
             NodeType::SubWorkflow => serde_json::json!({
-                "type": "sub_workflow",
                 "label": "子工作流",
                 "category": "control",
                 "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
@@ -191,7 +196,6 @@ impl NodeType {
                 "supports_retry": true
             }),
             NodeType::Llm => serde_json::json!({
-                "type": "llm",
                 "label": "LLM 调用",
                 "category": "ai",
                 "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
@@ -217,7 +221,6 @@ impl NodeType {
                 "side_effect": true
             }),
             NodeType::Email => serde_json::json!({
-                "type": "email",
                 "label": "邮件",
                 "category": "notify",
                 "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
@@ -243,33 +246,71 @@ impl NodeType {
         }
     }
 
-    /// 能力描述（`nodetypes.list` 的单条）。内容由 [`NodeType::build_descriptor`]
-    /// 那张表决定，这里只做一次性构建 + 缓存。
+    /// 能力描述（`nodetypes.list` 的单条）。内容由 [`Self::descriptor_body`]
+    /// 决定，`"type"` 从 [`NODE_TYPE_TABLE`] 注入。
     ///
     /// 一次性构建 + 缓存：每次调用重跑一遍 `json!` 纯属浪费——构造出来的
     /// 那棵 20 行 schema 树没人改动。返回 `&'static Value` 而非 clone，
     /// 调用方（RPC 的 `node_types`）本来就只要拼进响应里。
+    ///
+    /// 下标用 `self as usize` 依赖「enum 声明序 == `ALL` 序」；两者都由
+    /// [`NODE_TYPE_TABLE`] 的顺序与 enum 声明共同决定，
+    /// `node_type_table_is_exhaustive` 钉住这条。
     pub fn descriptor(self) -> &'static Value {
-        static DESCRIPTORS: LazyLock<[Value; 10]> =
-            LazyLock::new(|| std::array::from_fn(|i| NodeType::ALL[i].build_descriptor()));
+        static DESCRIPTORS: LazyLock<[Value; 10]> = LazyLock::new(|| {
+            std::array::from_fn(|i| {
+                let kind = NodeType::ALL[i];
+                let mut body = kind.descriptor_body();
+                body.as_object_mut()
+                    .expect("descriptor_body 顶层必为对象")
+                    .insert("type".into(), Value::String(kind.as_str().into()));
+                body
+            })
+        });
         &DESCRIPTORS[self as usize]
+    }
+
+    /// `params_schema.required` 里的参数名（建图期必填校验的依据）。
+    ///
+    /// **从 descriptor 派生**，不另写一份清单：`required` 是前端渲染表单与
+    /// 后端校验共用的同一份事实，两处手写时改一处漏另一处的症状是
+    /// 「前端把可选参数渲染成必填框」或反之。
+    ///
+    /// 返回 `Vec<&str>` 而非 `&'static [...]`：descriptor 是 `LazyLock` 里的
+    /// `Value`，借出的引用活不到 `'static`。调用点是建图校验与 `workflow.update`
+    /// （每次保存一次），分配成本无关紧要。
+    pub fn required_params(self) -> Vec<&'static str> {
+        self.descriptor()
+            .pointer("/params_schema/required")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default()
     }
 
     /// params_schema 中标记 `x-secret` 的参数名。definition 里这些参数只存
     /// 密钥**名称**，真值在执行前按名称从 `FLOW_SECRET_<名称>` 环境变量注入
     /// （见 secrets.rs）。
     ///
-    /// 形状与 `opaque_params` 一致（`&'static [&'static str]` 的 match）：不要
-    /// 改成「从 `descriptor()` 派生」——那要求为了找两三个 key 把整个 JSON
-    /// schema 序列化进内存，而 `resolve_node_secrets` 在**每个节点执行**上、
-    /// `missing_secrets` 在**每次 `workflow.update`** 上都调它。
-    /// `descriptor` 里那两处 `"x-secret": true` 是给前端渲染表单用的，两边
-    /// 必须同步——`secret_params_agree_with_descriptor` 钉住这个约定。
-    pub fn secret_params(self) -> &'static [&'static str] {
-        match self {
-            NodeType::Llm | NodeType::Email => &["api_key"],
-            _ => &[],
-        }
+    /// **从 descriptor 派生**（扫 `properties` 找 `x-secret: true`）：x-secret
+    /// 标记是给前端的渲染指令，派生后「标记了但执行期不注入」这种半配置状态
+    /// 不可能存在——分开维护时一个测试代替不了一处真相。
+    ///
+    /// 代价（可接受）：调用点 `resolve_node_secrets` 在每个节点执行上、
+    /// `missing_secrets` 在每次 `workflow.update` 上，各扫一遍 20 行的
+    /// `properties`。descriptor 已缓存为 `&'static`，扫的是内存里的树，
+    /// 不涉及序列化。
+    pub fn secret_params(self) -> Vec<&'static str> {
+        self.descriptor()
+            .pointer("/params_schema/properties")
+            .and_then(Value::as_object)
+            .map(|props| {
+                props
+                    .iter()
+                    .filter(|(_, schema)| schema.get("x-secret") == Some(&Value::Bool(true)))
+                    .map(|(key, _)| key.as_str())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// 该类型 params 中**不可**被 `${}` 模板展开的「代码承载字段」。
@@ -277,14 +318,26 @@ impl NodeType {
     /// `script.code` / `condition.expr` 是用户 JS：其中的 `${}` 是 JS 模板
     /// 字面量，不是 flow 模板，展开会破坏用户代码。其余参数一律在执行前
     /// 统一展开（与 http_call 同一份 `expr::expand_templates`，DESIGN §10）。
-    /// 词汇表只有这一处：新增类型时编译器不逼你，但执行层的默认行为
-    /// （全展开）对纯参数类型就是正确的。
-    pub fn opaque_params(self) -> &'static [&'static str] {
-        match self {
-            NodeType::Script => &["code"],
-            NodeType::Condition => &["expr"],
-            _ => &[],
-        }
+    ///
+    /// **从 descriptor 的 `x-opaque: true` 派生**，不另写一张表。不能用
+    /// `x-widget: "code"` 代替——那只是「前端用代码编辑器渲染」的 UI 提示，
+    /// `llm.prompt` 与 `email.body` 同样是 `x-widget: code`，但它们**要**被展开
+    /// （用户在提示词里写 `${input.x}`）。`x-opaque` 是「这段内容是 flow 自己
+    /// 的语法，不参与展开」的显式声明。
+    ///
+    /// 词汇表的默认行为（全展开）对纯参数类型正确，所以新增类型通常无需声明。
+    pub fn opaque_params(self) -> Vec<&'static str> {
+        self.descriptor()
+            .pointer("/params_schema/properties")
+            .and_then(Value::as_object)
+            .map(|props| {
+                props
+                    .iter()
+                    .filter(|(_, schema)| schema.get("x-opaque") == Some(&Value::Bool(true)))
+                    .map(|(key, _)| key.as_str())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -391,10 +444,15 @@ pub struct Definition {
 
 /// 邻接索引：按 id 预分组入边/出边 + 节点直查。
 ///
-/// 存在理由：此前 `node()` 线性扫 `nodes`，`incoming()`/`outgoing()` 全扫
-/// `edges` 并**每次分配一个 Vec**。`check_acyclic_and_reachable` 为了算入度
-/// 给每个节点分配一个 Vec 只为取 `.len()`；`Driver::plan` 与 `prepare_inputs`
-/// 在一个 run 的生命周期里对每个节点各调一次。O(N·E) + 每调用一次分配。
+/// 存在理由：`incoming()` / `outgoing()` 若每次全扫 `edges` 并**分配一个
+/// Vec**，则 `check_acyclic_and_reachable`（为算入度给每个节点分配 Vec 只为取
+/// `.len()`）、`Driver::plan` 与 `prepare_inputs`（一个 run 的生命周期里对每个
+/// 节点各调一次）都是 O(N·E) + 每调用一次分配。
+///
+/// **收益从约 200 节点起才为正**（release 实测 `validate` 一次，索引 vs 全扫
+/// incoming 的比值）：10 节点 0.1x（索引更慢，要先建表）、50 节点 0.4x、
+/// 200 节点 0.8x、1000 节点 4.9x、2000 节点 6.7x。小图上索引是净开销——
+/// 但小图本身就只花几十微秒，付得起。`examples/` 里最大的定义是 5 节点。
 #[derive(Debug, Clone, Default)]
 struct DefinitionIndex {
     by_id: HashMap<String, usize>,
@@ -415,9 +473,11 @@ impl Definition {
     /// 一次性构建的邻接索引。
     ///
     /// **契约：`nodes` / `edges` 在构造后不可变。** 全仓库唯一的构造入口是
-    /// `serde_json::from_value`（`nodes`/`edges` 是 `pub` 但没有任何调用方写过
-    /// 它们），所以这里不做失效判断——那是为不存在的场景写的机制。
-    /// 要改定义，走新的反序列化，拿到的是一个全新 `Definition`。
+    /// `serde_json::from_value`（`nodes`/`edges` 是 `pub`，但没有任何调用方写过
+    /// 它们——全仓 `\.nodes\s*=` / `\.edges\s*=` 零命中），所以这里不做失效判断：
+    /// 那是为不存在的场景写的机制。要改定义，走新的反序列化，拿到的是全新
+    /// `Definition`。若日后有人开始写这两个字段，`OnceLock` 会静默返回**过期**
+    /// 的索引——那时必须换成每次重建或改字段可见性。
     fn index(&self) -> &DefinitionIndex {
         self.adj.get_or_init(|| {
             let mut by_id = HashMap::with_capacity(self.nodes.len());
@@ -642,48 +702,76 @@ impl Definition {
     }
 }
 
+/// 按类型校验节点参数。
+///
+/// **必填清单从 [`NodeType::required_params`] 读**（即 descriptor 的
+/// `params_schema.required`），不在这里重写一份：前端表单与后端校验共用同一份
+/// 「哪些参数必填」，两处手写时改一处漏另一处的症状是「前端把可选参数渲染成
+/// 必填框」或「后端拒掉前端允许留空的参数」。
+///
+/// 下面 match 只放**无法表达在 `required` 里的规则**：枚举白名单、类型约束、
+/// 「`${}` 模板放行到执行期判定」。纯参数类型（start/end/human_task）没有
+/// 额外规则，`required` 为空即通过——新增这类类型不用碰这个函数。
 fn validate_params(node: &Node, kind: NodeType) -> Result<(), String> {
-    let need_str = |key: &str| match node.param_str(key) {
-        Some(v) if !v.trim().is_empty() => Ok(()),
-        _ => Err(format!(
-            "节点 {}（{}）缺少参数 {}",
-            node.id,
-            kind.as_str(),
-            key
-        )),
-    };
-    match kind {
-        NodeType::Script => need_str("code"),
-        NodeType::Condition => need_str("expr"),
-        NodeType::HttpCall => {
-            need_str("url")?;
-            match node.param_str("method") {
-                Some(method) if method.trim().is_empty() => {
-                    return Err(format!("节点 {} 的 method 不能为空", node.id));
-                }
-                // ${} 模板 method 执行期展开后才能判定，放行；执行层按同一份
-                // HTTP_METHODS 再验一次（exec::run_http），两层共用一个词汇表
-                Some(method) if method.contains("${") => {}
-                Some(method) if !HTTP_METHODS.contains(&method.trim().to_uppercase().as_str()) => {
-                    return Err(format!(
-                        "节点 {} 的 method 非法：{method:?}（允许 {}）",
-                        node.id,
-                        HTTP_METHODS.join("/")
-                    ));
-                }
-                _ => {}
-            }
-            Ok(())
+    for key in kind.required_params() {
+        // `${}` 模板放行到执行期判定（DESIGN §5 规则 1）：展开后才知道是不是
+        // 整数/非空串，建图期一律认它「填了」。先判模板再判类型，顺序反了会把
+        // `ms: "${input.tick}"` 这类合法定义误拒。
+        if node.param_str(key).is_some_and(|v| v.contains("${")) {
+            continue;
         }
+        // 按 schema 声明的类型判「必填」，不能一律当字符串查：`delay.ms` 声明为
+        // integer，值是数字，`param_str` 恒为 None——用字符串判会让所有 delay
+        // 节点在建图期被误拒。
+        let schema_type = kind
+            .descriptor()
+            .pointer(&format!("/params_schema/properties/{key}/type"))
+            .and_then(Value::as_str)
+            .unwrap_or("string");
+        let missing = match schema_type {
+            "integer" | "number" => node.params.get(key).and_then(Value::as_u64).is_none(),
+            "boolean" => node.params.get(key).and_then(Value::as_bool).is_none(),
+            // 字符串必填：空串与纯空白都算「没填」
+            _ => node.param_str(key).is_none_or(|v| v.trim().is_empty()),
+        };
+        if missing {
+            return Err(format!(
+                "节点 {}（{}）缺少参数 {}",
+                node.id,
+                kind.as_str(),
+                key
+            ));
+        }
+    }
+    // `required` 只表达「必须有非空字符串」；下面按类型补其余约束。
+    match kind {
+        NodeType::HttpCall => match node.param_str("method") {
+            Some(method) if method.trim().is_empty() => {
+                Err(format!("节点 {} 的 method 不能为空", node.id))
+            }
+            // ${} 模板 method 执行期展开后才能判定，放行；执行层按同一份
+            // HTTP_METHODS 再验一次（exec::run_http），两层共用一个词汇表
+            Some(method) if method.contains("${") => Ok(()),
+            Some(method) if !HTTP_METHODS.contains(&method.trim().to_uppercase().as_str()) => {
+                Err(format!(
+                    "节点 {} 的 method 非法：{method:?}（允许 {}）",
+                    node.id,
+                    HTTP_METHODS.join("/")
+                ))
+            }
+            _ => Ok(()),
+        },
         NodeType::Delay => match node.param_u64("ms") {
             Some(_) => Ok(()),
             // ${} 模板要在执行期展开后才可判定：放行，运行期 parse
             // （裸数字字符串仍拒绝——一种参数一种形态，不留灰色地带）
             None if node.param_str("ms").is_some_and(|s| s.contains("${")) => Ok(()),
-            None => Err(format!("节点 {}（delay）缺少参数 ms", node.id)),
+            None => Err(format!(
+                "节点 {}（delay）的 ms 必须是整数或 ${{}} 模板",
+                node.id
+            )),
         },
         NodeType::SubWorkflow => {
-            need_str("workflow_id")?;
             // input_mapping 省略 = 沿用旧语义（父 run 输入快照，DESIGN §6.8）
             match node.params.get("input_mapping") {
                 None | Some(serde_json::Value::Null) => Ok(()),
@@ -695,27 +783,14 @@ fn validate_params(node: &Node, kind: NodeType) -> Result<(), String> {
                 )),
             }
         }
-        NodeType::Llm => {
-            need_str("api_key")?;
-            need_str("model")?;
-            need_str("prompt")
-        }
-        NodeType::Email => {
-            need_str("api_key")?;
-            need_str("from")?;
-            need_str("to")?;
-            need_str("subject")?;
-            need_str("body")
-        }
-        NodeType::Start | NodeType::End | NodeType::HumanTask => Ok(()),
+        _ => Ok(()),
     }
 }
 
 /// 图校验 / 重试策略 / 词汇表的表驱动单测。
 ///
-/// `validate` 是「建图即校验」的判官（DESIGN.md §4），过去只有 `ws_rpc.rs` /
-/// `backend-e2e` 的黑盒覆盖——要起进程才知道一句「工作流存在环」。规则本身是
-/// 纯函数，在这按表驱动逐条钉住。
+/// `validate` 是「建图即校验」的判官（DESIGN.md §4）。黑盒覆盖要起进程才知道
+/// 一句「工作流存在环」，而规则本身是纯函数——在这按表驱动逐条钉住。
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1216,44 +1291,119 @@ mod tests {
         }
     }
 
-    /// x-secret 参数清单从 descriptor 派生：schema 是唯一事实源。
+    /// x-secret 参数就是 llm / email 的 `api_key`，且**只在**这两个类型上。
+    ///
+    /// 清单已从 descriptor 派生（`x-secret: true` 扫描），所以这里断言的是
+    /// 「哪些类型该有密钥」这个业务事实，而不是「派生是否一致」——后者已由
+    /// 派生本身保证，再写一遍只是同义反复。
     #[test]
     fn secret_params_are_the_expected_keys() {
-        assert_eq!(NodeType::Llm.secret_params(), &["api_key"]);
-        assert_eq!(NodeType::Email.secret_params(), &["api_key"]);
-        assert!(NodeType::HttpCall.secret_params().is_empty());
-        assert!(NodeType::Script.secret_params().is_empty());
-    }
-
-    /// `secret_params()` 与 descriptor 的 `x-secret` 标记必须一致。
-    ///
-    /// 两者现在是各自维护的表（静态表 vs `json!` 里的 `"x-secret": true`），
-    /// 不再是代码派生关系——所以「一致」从类型保证退化成一条约定，这条测试
-    /// 就是那个约定的守卫：任何一边漏改，这里立刻红。
-    /// （不再断言「派生」是因为派生要求为了找两三个 key 构造整棵 schema 树，
-    /// 而 `secret_params` 在每个节点执行与每次 `workflow.update` 上都调。）
-    #[test]
-    fn secret_params_agree_with_descriptor() {
+        assert_eq!(NodeType::Llm.secret_params(), vec!["api_key"]);
+        assert_eq!(NodeType::Email.secret_params(), vec!["api_key"]);
         for kind in NodeType::ALL {
-            let from_schema: Vec<&str> = kind
-                .descriptor()
-                .pointer("/params_schema/properties")
-                .and_then(Value::as_object)
-                .map(|props| {
-                    props
-                        .iter()
-                        .filter(|(_, s)| s.get("x-secret") == Some(&Value::Bool(true)))
-                        .map(|(k, _)| k.as_str())
-                        .collect()
-                })
-                .unwrap_or_default();
+            let expected = matches!(kind, NodeType::Llm | NodeType::Email);
             assert_eq!(
-                kind.secret_params(),
-                from_schema.as_slice(),
-                "{} 的 secret_params 与 descriptor 的 x-secret 标记不一致",
+                !kind.secret_params().is_empty(),
+                expected,
+                "{} 的密钥参数清单与预期不符",
                 kind.as_str()
             );
         }
+    }
+
+    /// `required` 与 `validate_params` 共用一份：建图期拒掉的参数，必须正好是
+    /// descriptor 声明为 required 且节点没填的那些。
+    ///
+    /// 必填清单已从 descriptor 派生，所以「一致」不需要测；这里测的是**派生之后
+    /// 校验规则仍成立**：逐个把 required 参数挖空，都必须被拒。
+    ///
+    /// 校验在第一个缺失处就返回（不逐条报全），所以断言的是「被拒 + 报错点名了
+    /// 某个 required 参数」，而不是恰好是当前挖空的那个。
+    #[test]
+    fn required_params_are_actually_enforced_by_validate() {
+        for kind in NodeType::ALL {
+            if matches!(kind, NodeType::Start | NodeType::End) {
+                continue;
+            }
+            for key in kind.required_params() {
+                // 只带 start / end 与本节点（params 为空）：所有 required 都缺
+                let bare = def(
+                    vec![
+                        node("s", "start"),
+                        json!({"id":"n","type":kind.as_str(),"params":{}}),
+                        node("e", "end"),
+                    ],
+                    vec![json!({"from":"s","to":"n"}), json!({"from":"n","to":"e"})],
+                );
+                let err = bare
+                    .validate()
+                    .expect_err(&format!("{}({key}) 缺失时必须被拒", kind.as_str()));
+                assert!(
+                    kind.required_params().iter().any(|k| err.contains(k)),
+                    "{}({key}) 缺失时的报错应点名某个 required 参数，实际：{err}",
+                    kind.as_str()
+                );
+            }
+        }
+    }
+
+    /// `opaque_params`（不参与 `${}` 展开的代码字段）只有 script.code 与
+    /// condition.expr 两个——llm.prompt / email.body 虽是 `x-widget: code`，
+    /// 但**要**被展开，所以不能带 `x-opaque`。
+    #[test]
+    fn opaque_params_are_exactly_the_js_bearing_fields() {
+        assert_eq!(NodeType::Script.opaque_params(), vec!["code"]);
+        assert_eq!(NodeType::Condition.opaque_params(), vec!["expr"]);
+        for kind in NodeType::ALL {
+            let is_js_host = matches!(kind, NodeType::Script | NodeType::Condition);
+            assert_eq!(
+                !kind.opaque_params().is_empty(),
+                is_js_host,
+                "{} 的 opaque 字段清单与预期不符：{:?}",
+                kind.as_str(),
+                kind.opaque_params()
+            );
+        }
+        // 带 x-widget: code 但要展开的两个字段，不得被误标为 opaque
+        for (kind, key) in [(NodeType::Llm, "prompt"), (NodeType::Email, "body")] {
+            assert!(
+                !kind.opaque_params().contains(&key),
+                "{kind:?}.{key} 是用户数据（要展开），不能标 x-opaque"
+            );
+        }
+    }
+
+    /// `NODE_TYPE_TABLE` 是变体清单的唯一来源：与 enum 双向覆盖，且字符串唯一。
+    ///
+    /// `ALL` 的长度与 enum 变体数都由类型标注编译期保证；这条守的是**内容**——
+    /// 表里漏一个变体会让 `as_str` 对它 panic，重复会让 `parse` 少认一个类型。
+    #[test]
+    fn node_type_table_is_exhaustive() {
+        // 表 → ALL：每项都在，且顺序一致（descriptor 用下标取值，顺序错了会串）
+        let from_table: Vec<NodeType> = NODE_TYPE_TABLE.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            from_table,
+            NodeType::ALL.to_vec(),
+            "表与 ALL 的内容或顺序不一致"
+        );
+        // 字符串唯一：重复会让 parse 静默丢掉后面的类型
+        let mut names: Vec<&str> = NODE_TYPE_TABLE.iter().map(|(_, n)| *n).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), NODE_TYPE_TABLE.len(), "表里有重复的类型名");
+        // ALL → 表：每个变体都能查到自己的名字（as_str 的 expect 不该触发）
+        for kind in NodeType::ALL {
+            let name = kind.as_str();
+            assert_eq!(NodeType::parse(name), Some(kind), "{kind:?} 的往返断了");
+            // descriptor 的 type 字段由表注入，必须等于 as_str
+            assert_eq!(
+                kind.descriptor()["type"].as_str(),
+                Some(name),
+                "{} 的 descriptor.type 与 as_str 不一致",
+                kind.as_str()
+            );
+        }
+        assert_eq!(NodeType::parse("nope"), None);
     }
 
     /// llm / email 的必填参数校验。
@@ -1402,9 +1552,10 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(d.validate().is_ok());
         let elapsed = started.elapsed();
-        // 阈值取「带索引」与「全扫描」之间的中点：debug 构建下带索引约
-        // 20ms、全扫描约 800ms。护栏必须能真的红——初版写 500ms 时实测
-        // 全扫描也能过，那就不叫护栏。
+        // release 实测：N=2000 时带索引约 2.3ms、全扫 incoming 约 15.3ms；
+        // debug 下两者都慢一个量级。阈值取 250ms：既能真的红（去掉索引后
+        // debug 宽图远超它），又不随机器波动误报。守的是「索引没被绕过」，
+        // 不是绝对性能。
         assert!(
             elapsed.as_millis() < 250,
             "validate 在 {N} 节点宽图上耗时 {elapsed:?}——邻接索引被绕过了？"

@@ -471,8 +471,8 @@ async fn signal_enqueue_is_idempotent_and_rejects_mismatch() {
 }
 
 /// B1 回归：回放起点的读取必须区分「run 不存在」（RunNotFound，订阅状态机
-/// 据此立即结束流）与「已追平」（Ok 空）。修复前不存在 run 也返回 Ok 空，
-/// run_tail 永远等不到事件 → 订阅永久挂死（SQLite 臂则正确结束）。
+/// 据此立即结束流）与「已追平」（Ok 空）。两者都返回 Ok 空时 run_tail 永远等不到
+/// 事件 → 订阅永久挂死（SQLite 臂则正确结束）。
 #[tokio::test]
 async fn read_events_reports_missing_run_at_replay_origin() {
     let Some(db) = test_db().await else { return };

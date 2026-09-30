@@ -447,7 +447,7 @@ mod tests {
 
     /// 节点输出只存一份：无论走哪条事件路径，唯一所有者都是
     /// `RunState::outputs`（DESIGN §12.5）。旧的 `NodeRecord.output` 副本让
-    /// `NodeFailed` / `NodeSkipped` 漏清一处，删掉副本后这个不对称不再可能。
+    /// `NodeFailed` / `NodeSkipped` 漏清一处——删掉副本后这个不对称无从发生。
     #[test]
     fn node_output_lives_only_in_outputs_across_every_event_path() {
         let completed = Event::NodeCompleted {

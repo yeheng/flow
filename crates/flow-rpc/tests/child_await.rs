@@ -4,7 +4,7 @@
 //! 首个事件落盘之前被杀。重启后 recover_unfinished 按 DESIGN §7.2 把
 //! initializing + 空日志的 run 标 failed（不写事件）。父 run 重放 sub_workflow
 //! 时撞 RunExists 附着等待——事件日志为空，snapshot 永远是 Running，
-//! 修复前 await_terminal 死循环。修复后空日志时以 DB 投影为权威结束等待。
+//! 所以 `await_terminal` 必须以 DB 投影为权威结束等待，只看事件日志会死循环。
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -84,7 +84,7 @@ impl Fixture {
             }
         })
         .await
-        .expect("run 在 5s 内到达终态（修复前空日志死循环会超时）")
+        .expect("run 在 5s 内到达终态（只看事件日志会死循环超时）")
     }
 }
 
@@ -142,7 +142,7 @@ async fn parent_terminates_when_child_initialization_was_interrupted() {
         .await
         .unwrap();
 
-    // 修复前：await_terminal 只看事件日志，空日志 → 永远 Running → 挂死超时
+    // await_terminal 若只看事件日志：空日志 → 永远 Running → 挂死超时
     let state = f.wait_terminal(&run_id).await;
     assert_eq!(state.phase, RunPhase::Failed);
     let fatal = state.fatal_error.unwrap_or_default();

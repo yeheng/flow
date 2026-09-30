@@ -78,7 +78,7 @@ async fn takeover_replays_pure_node_with_new_attempt() {
 }
 
 /// §5.4/S2 回归：身份不符（元数据与日志分叉）的 run 必须隔离为 awaiting_resume
-/// 并释放租约；且本进程拉黑后不得周期性重扫——修复前它以 awaiting_resume +
+/// 并释放租约；且本进程拉黑后不得周期性重扫——否则它以 awaiting_resume +
 /// 无租约的形态留在候选里，每个扫描周期被重新抢租约、读全量日志、重新 fold
 /// 一遍，直到永远（lease_epoch 持续攀升）。
 #[tokio::test]

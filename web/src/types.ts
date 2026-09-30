@@ -32,7 +32,8 @@ export interface PortDesc {
 
 /**
  * nodetypes.list 返回的 params_schema：JSON Schema 子集（draft-07 object），
- * 属性可带 x-widget / x-secret / x-label / x-help 扩展键
+ * 属性可带 x-widget / x-secret / x-opaque / x-label / x-help 扩展键。
+ * 未识别的 x-* 键一律忽略，新增扩展键不需要改前端。
  */
 export interface PropertySchema {
   type?: "string" | "integer" | "number" | "boolean" | "object";
@@ -43,6 +44,12 @@ export interface PropertySchema {
   "x-widget"?: "code" | "json" | "workflow-picker";
   /** true 表示该字符串字段存的是密钥名称（值在服务端 FLOW_SECRET_*），前端渲染为密钥名称选择器 */
   "x-secret"?: boolean;
+  /**
+   * true 表示该字段是 flow 自己的语法（JS 代码），不参与 `${}` 模板展开。
+   * 前端无需据此渲染（与 x-widget: code 是两回事：llm.prompt / email.body
+   * 也是 code 组件但要展开），仅作语义标注随 schema 一起透传。
+   */
+  "x-opaque"?: boolean;
   "x-label"?: string;
   "x-help"?: string;
 }

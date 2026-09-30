@@ -543,10 +543,9 @@ async fn read_events_repairing(path: &Path) -> Result<(Vec<Envelope>, u64), Engi
 
 /// 严格组提交语义（DESIGN §3.2）的内联单测。
 ///
-/// 这些断言原来放在 `tests/group_commit.rs`，为此把 `commit_stats()` /
-/// `read_events()` 从 `pub use` 导出到了公开 API——一个测试事实开了两个公开
-/// 符号的洞。搬回本文件后：直接读 `GroupCommitter` 的内部统计，公开 API 收
-/// 回原样，而且断言离被测代码只有几行。
+/// 断言放在本文件内而非 `tests/`，因为放到集成测试就得把 `commit_stats()` /
+/// `read_events()` 从 `pub use` 导到公开 API——不为一个测试事实在公开 API 上
+/// 开洞（DESIGN §13 的硬规则）。放这里直接读内部统计，断言也离被测代码只有几行。
 ///
 /// 注意：`stats` 是进程级计数器，本二进制里的用例必须串行取差值，否则并行
 /// 用例的 append 会混进统计。（跨测试二进制是独立进程，本来没这问题。）

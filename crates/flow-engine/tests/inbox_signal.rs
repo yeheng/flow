@@ -175,7 +175,7 @@ fn spec_with(sink: ObservableSink, definition: flow_engine::Definition) -> flow_
 }
 
 /// 信号在 Driver 启动前就已入 inbox：第一个 inbox poll 时 human_task 尚未
-/// 登记等待。修复前这条信号被当场拒绝、run 永久挂起；修复后跳过本次 poll，
+/// 登记等待。当场拒绝会让 run 永久挂起，所以必须跳过本次 poll，
 /// 下一轮（节点已等待）正常交付，run 成功且 output = 信号 payload。
 #[tokio::test]
 async fn inbox_signal_before_human_wait_is_deferred_then_delivered() {

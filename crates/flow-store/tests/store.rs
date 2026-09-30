@@ -252,7 +252,7 @@ async fn status_updates_clear_resolved_errors() {
 
 /// 删除工作流后版本随级联消失；insert_run 必须在写锁内验证版本存在——
 /// 否则 delete 的 COUNT 与 DELETE 之间能插进一个 run.start，造出引用已删
-/// 版本的孤儿 run（runs 表无外键，数据库不会拦）。修复前这里插入成功。
+/// 版本的孤儿 run（runs 表无外键，数据库不会拦，不加锁则这里插入成功）。
 #[tokio::test]
 async fn run_cannot_reference_deleted_workflow_version() {
     let (store, _dir) = store().await;

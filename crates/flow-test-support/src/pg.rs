@@ -381,19 +381,17 @@ impl TestDb {
 
     /// 关掉连接池并 **DROP 数据库**（幂等：已消失也算干净）。
     ///
-    /// 用例结尾调它；失败留给「下次启动的残留清扫」兜底。调用方过去写的是
-    /// `db.close()`，那时 `TestDb` 有个同名方法；现在统一叫 `cleanup()`——
-    /// **故意不再提供 `close()`**：早期 `Deref<Target=PgPool>` 会让
-    /// `db.close()` 静默解析成 `PgPool::close()`，只关池不删库，几十个测试库
-    /// 就那样留在服务器上了。
+    /// 用例结尾调它；失败留给「下次启动的残留清扫」兜底。
+    /// **故意不提供 `close()`**：若 `TestDb` 实现 `Deref<Target=PgPool>`，
+    /// 调用点的 `db.close()` 会静默解析成 `PgPool::close()`——只关池不删库，
+    /// 几十个测试库就那样留在服务器上。
     pub async fn cleanup(&self) {
         // 注意顺序：**先 DROP，后关池**。
         //
-        // 早先是反的——先 `self.pool.close()` 再删。而用例手里常有第二个池
-        // （PgEngine / PgBackend / 自建的 EventHub），`PgPool::close()` 要等服务
-        // 端把连接收干净；自建 hub 不先 stop 时这一步能拖好几秒，调用方外面套的
-        // `timeout(.., db.cleanup())` 会把整个 future 掐掉，库就漏了。
-        // 把删库提到关池前面，删库就再也不會被关池的耗时挡住。
+        // 用例手里常有第二个池（PgEngine / PgBackend / 自建的 EventHub），
+        // `PgPool::close()` 要等服务端把连接收干净；自建 hub 不先 stop 时这一步
+        // 能拖好几秒，调用方外面套的 `timeout(.., db.cleanup())` 会把整个 future
+        // 掐掉，库就漏了。删库放在关池前面，才不会被关池的耗时挡住。
         let Ok(admin) = PgPool::connect(&self.server_url).await else {
             return;
         };
@@ -498,10 +496,9 @@ pub async fn sweep_stale_databases(base_url: &str, db_prefix: &str) {
 
 /// `{prefix}{时间戳}_...` 里的时间戳是否已经老到可以确定「用例进程已死」。
 fn is_stale(name: &str, db_prefix: &str) -> bool {
-    // 注意：时间戳是定长 14 字符。早先这个函数取的是 `.get(..16)`（多了 2 位
-    // uuid 前缀），`parse_from_str` 对多出的字符直接报错 → `?` 一路 continue
-    // 下去，残留清扫**从来没删掉过任何库**。定长取 + 显式 else 才让这条路径
-    // 真的生效。
+    // 注意：时间戳是定长 14 字符，必须按 TS_LEN 精确截取。范围取宽了
+    // （如 `.get(..16)` 带上 2 位 uuid 前缀）时 `parse_from_str` 会对多出的字符
+    // 直接报错，`?` 一路 continue 下去，残留清扫会静默地一个库都删不掉。
     let Some(stamp) = name.get(db_prefix.len()..db_prefix.len() + TS_LEN) else {
         return false;
     };

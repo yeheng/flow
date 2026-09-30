@@ -118,9 +118,9 @@ async fn collect(stream: BoxStream<'static, Envelope>) -> Vec<u64> {
     out
 }
 
-/// 订阅一个不存在的 run：必须结束流。修复前 RunNotFound 被当成「db 抖动」，
-/// needs_fill 永远为真 → 每 10s 重试一次，task 永不退出（前端打错 run_id
-/// 就永久泄漏一个订阅 task）。
+/// 订阅一个不存在的 run：必须结束流。`RunNotFound` 是确定事实而非抖动，
+/// 若当「db 抖动」处理则退避重试永不退出（前端打错 run_id 就永久泄漏一个
+/// 订阅 task）。
 #[tokio::test(start_paused = true)]
 async fn missing_run_ends_stream_instead_of_retrying_forever() {
     let reader = FakeReader::missing();
@@ -129,7 +129,7 @@ async fn missing_run_ends_stream_instead_of_retrying_forever() {
     let stream = run_tail(reader, rx, "run-1".into());
     let seqs = tokio::time::timeout(Duration::from_secs(60), collect(stream))
         .await
-        .expect("订阅不存在的 run 必须立刻结束（修复前永久挂起）");
+        .expect("订阅不存在的 run 必须立刻结束（当成抖动会永久挂起）");
     assert!(seqs.is_empty(), "不存在的 run 不应吐出任何事件：{seqs:?}");
 }
 
@@ -144,7 +144,7 @@ async fn empty_log_ends_stream_instead_of_hanging() {
     let stream = run_tail(reader, rx, "run-1".into());
     let seqs = tokio::time::timeout(Duration::from_secs(60), collect(stream))
         .await
-        .expect("空日志的订阅必须立刻结束（修复前永久挂起）");
+        .expect("空日志的订阅必须立刻结束（当成抖动会永久挂起）");
     assert!(seqs.is_empty(), "空日志不应吐出任何事件：{seqs:?}");
 }
 

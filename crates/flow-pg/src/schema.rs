@@ -216,9 +216,8 @@ mod tests {
     /// CHECK 列表必须与 flow-dto 的词汇表逐字一致，且**排除 initializing**
     /// （Postgres 的 run.start 是单事务原子创建，不存在 initializing 状态）。
     ///
-    /// 这条测试替代了此前「人手抄一份 CHECK 列表」的做法：列表由 `ALL` 生成，
-    /// 但「生成结果对不对」仍需断言——否则把 `initializing` 误加进 `ALL` 会
-    /// 让 PG 接受一个该后端永远不产生的状态。
+    /// 列表由 `ALL` 生成，但「生成结果对不对」仍需断言：把 `initializing`
+    /// 误加进 `ALL` 会让 PG 接受一个该后端永远不产生的状态。
     #[test]
     fn generated_run_status_check_excludes_initializing() {
         let list = run_status_check();
@@ -242,9 +241,8 @@ mod tests {
         }
     }
 
-    /// 生成的 CHECK 列表与**迁移前手写版逐字一致**（PG 的 e2e 依赖这个约束，
-    /// 存量库里已建表的 CHECK 不会因本次改动而变化）。这条断言是回归护栏：
-    /// 派生逻辑一旦改变列表内容，存量库与新建库就会分叉。
+    /// 生成的 CHECK 列表必须与存量库里已建表的那份逐字一致——派生逻辑一旦改变
+    /// 列表内容，存量库与新建库就会分叉（存量库的 CHECK 不会因代码变化而更新）。
     #[test]
     fn generated_check_list_matches_the_previous_handwritten_one() {
         assert_eq!(

@@ -50,7 +50,8 @@ async fn active_run_is_never_crowded_out_by_recently_ended() {
 
     let base = Utc::now();
     for i in 0..300 {
-        // started_at 严格早于活跃 run（旧代码按 started_at ASC 取名额时它们排前面）；
+        // started_at 严格早于活跃 run（若按 started_at ASC 取名额它们会排前面，
+        // 把最新创建的活跃 run 挤出集合）；
         // ended_at 必须落在 30s 回看窗口内，否则根本不进终态补漏集合
         let started = base - Duration::from_secs(3600) + Duration::from_millis(i);
         let ended = base - Duration::from_secs(20) + Duration::from_millis(i);
@@ -65,7 +66,7 @@ async fn active_run_is_never_crowded_out_by_recently_ended() {
         )
         .await;
     }
-    // 最新才创建的活跃 run：旧代码按 started_at ASC 取 256 个时它排在最后
+    // 最新才创建的活跃 run：按 started_at ASC 取 256 个时它排在最后
     insert_run(
         &pool,
         "active-new",

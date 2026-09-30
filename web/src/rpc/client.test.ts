@@ -222,6 +222,14 @@ describe("RpcClient：重连生命周期", () => {
   it("旧 socket 的迟到 onclose 不影响新 socket：在飞请求不被误 reject", async () => {
     const client = await freshClient();
     const p = client.call("run.get", { run_id: "r1" });
+    // `p` 会在下面 ws1.close() 时立刻 reject。断言要等到用例末尾才做，
+    // 中间这段它处于「已 reject 但无人接」的状态——Node 会记一条 unhandled
+    // rejection 并让 vitest 退出码为 1。断言句柄先挂上（catch 只是把 rejection
+    // 标记为已处理，值仍由末尾的 expects 校验），中途不产生未处理拒绝。
+    const pSettled = p.then(
+      (v) => ({ ok: true as const, v }),
+      (e) => ({ ok: false as const, e }),
+    );
     const ws1 = MockWebSocket.instances[0];
     ws1.open();
     await vi.waitFor(() => expect(ws1.sent).toHaveLength(1));
@@ -252,5 +260,6 @@ describe("RpcClient：重连生命周期", () => {
 
     // 旧连接的失败请求照常 reject（它确实死了）
     await expect(p).rejects.toThrow();
+    expect(await pSettled).toMatchObject({ ok: false });
   });
 });

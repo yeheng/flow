@@ -536,8 +536,8 @@ async fn multi_pred_end_collects_output_map() {
 async fn nodes_scope_is_direct_predecessors_only() {
     // 回归（决定论输入面，DESIGN §10）：nodes 只暴露直接前驱的输出。
     // 菱形图里 c 的前驱是 a、b；引用非前驱节点 s 必须是 undefined，
-    // 深层访问即 TypeError → fatal。旧实现把全部已完成输出都塞进 nodes，
-    // 非前驱引用读到真值，破坏「重放结果与首次执行一致」。
+    // 深层访问即 TypeError → fatal。若把全部已完成输出都塞进 nodes，
+    // 非前驱引用会读到真值，破坏「重放结果与首次执行一致」。
     let h = Harness::new();
     let run_id = Harness::run_id();
     let def = def_from(json!({

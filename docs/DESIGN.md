@@ -213,19 +213,30 @@ Event 流 ──fold──> RunState {
 `x-widget`/`x-help`/`x-secret` 扩展键，快照测试
 （`node_types_snapshot_is_stable`）钉住响应逐字节不变。
 
-**新增节点类型要改四处**（不是一处，编译器只管其中一处）：`NodeType` enum、
-`ALL` 数组、`as_str` + `parse`（同一个字符串写两遍）、`descriptor()`、
-`validate_params()` 的 match 臂，以及 `exec::dispatch` 的 match 臂
-（**只有这一个会编译报错**）。另外 `opaque_params` 与 `secret_params` 各按需
-增改——两者都是 `&'static [&'static str]` 的 match，形状与 `opaque_params`
-一致。`secret_params` 与 descriptor 里的 `x-secret` 标记**不是代码派生关系**
-（派生要为找两三个 key 构造整棵 schema 树，而 `secret_params` 在每个节点执行
-与每次 `workflow.update` 上都调），一致性由
-`secret_params_agree_with_descriptor` 逐类型比对守住。
+**新增节点类型只改两处**：`NodeType` enum 与 `NODE_TYPE_TABLE`
+（`model.rs`，变体 ↔ 字符串名的对应表）。其余全部派生：
+
+- `as_str` / `parse` / `ALL` / `descriptor()` 的下标 ← `NODE_TYPE_TABLE`；
+- `validate_params()` 的必填清单 ← descriptor 的 `params_schema.required`；
+- `secret_params()` ← descriptor 里标 `x-secret: true` 的属性；
+- `opaque_params()` ← descriptor 里标 `x-opaque: true` 的属性。
+
+`validate_params` 里剩下的 match 只放**无法表达在 `required` 里的规则**
+（HTTP 方法白名单、delay 的整数/模板形态、sub_workflow 的 input_mapping 形态）；
+纯参数类型没有额外规则，新类型不用碰它。`exec::dispatch` 的 match 臂仍要加一条
+（编译器会逼你加）。
+
+`x-opaque` 与 `x-widget: "code"` **不是一回事**：后者只是「前端用代码编辑器
+渲染」，`llm.prompt` / `email.body` 同样是 code 组件但**要**参与 `${}` 展开；
+`x-opaque` 才是「这段内容是 flow 自己的 JS 语法，不参与展开」。
+
+`node_type_table_is_exhaustive` 钉住表与 enum 双向覆盖（数组长度由类型标注编译期
+保证，内容对应关系由测试保证）；`required_params_are_actually_enforced_by_validate`
+与 `opaque_params_are_exactly_the_js_bearing_fields` 钉住派生后的规则仍成立。
 
 `Definition::validate()` 在保存与发布时强制（建图即校验，不等到运行）：
 
-1. 节点 id 非空且唯一；类型已知；按类型校验必填参数
+1. 节点 id 非空且唯一；类型已知；按类型校验必填参数（清单来自 descriptor）
    （script: `code`，condition: `expr`，delay: `ms`，http_call: `url`，
    sub_workflow: `workflow_id`，llm: `api_key`/`model`/`prompt`，
    email: `api_key`/`from`/`to`/`subject`/`body`；
@@ -882,6 +893,10 @@ volume 上。Docker 只在容器**自己退出**时（`--rm`）回收匿名 volu
 - 图校验规则由 `model.rs` 的表驱动单测逐条钉住（端口/环/不可达/参数必填/
   模板参数放行与灰色形态拒绝；condition 多端口指同一节点的拒绝见
   `condition_ports_must_target_distinct_nodes`），不为了一句「工作流存在环」起进程；
+- 节点类型注册表（§5）由 `model.rs` 钉住：`node_type_table_is_exhaustive`（表 ↔
+  enum 双向覆盖）、`required_params_are_actually_enforced_by_validate`（派生出的
+  必填清单真的在校验）、`opaque_params_are_exactly_the_js_bearing_fields`
+  （只有 script.code / condition.expr 不参与展开）、`secret_params_are_the_expected_keys`；
 - `nodetypes.list` 响应由 `node_types_snapshot_is_stable` 快照测试钉住
   （descriptor 注册表收敛是纯重构，响应必须逐字节不变）；
 - `recovery_regressions.rs` 验证失败恢复、重试下游、剩余退避、非法/重复信号和裁决恢复；

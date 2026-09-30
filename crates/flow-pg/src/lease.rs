@@ -314,8 +314,8 @@ pub(crate) fn payload_of(event: &flow_engine::Event) -> Result<Value, flow_engin
 /// 准入规则的表驱动单测（`flow-pg/src/lease.rs` 的准入规则表）。
 ///
 /// `check_writable` 是 fencing 协议的判官：调用点每写一次事件都要问一遍。
-/// 它过去只有 `tests/recovery.rs` 的黑盒覆盖（要连真 PG、不可达时还跳过），
-/// 而规则本身是**纯函数**——在这里按表驱动逐条钉住，无需数据库。
+/// 黑盒覆盖要连真 PG、不可达时还跳过，而规则本身是**纯函数**——在这里按表驱动
+/// 逐条钉住，无需数据库。
 #[cfg(test)]
 mod tests {
     use super::*;

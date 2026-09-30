@@ -93,7 +93,7 @@ impl DbRunStatus {
     /// SQL `IN (...)` 的字面量列表：`'running', 'awaiting_resume', ...`。
     ///
     /// 供 schema.rs 生成 `CHECK` / 索引谓词，让数据库约束与 Rust 侧词汇表
-    /// 逐字同源。此前那份是手写列表，加变体要记得改两处而编译器不提醒。
+    /// 逐字同源。手写那份列表时加变体要记得改两处，而编译器不提醒。
     pub fn sql_in_list(self: DbRunStatus) -> String {
         Self::ALL
             .iter()

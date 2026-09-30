@@ -127,9 +127,9 @@ pub(crate) async fn expand_params(
     let mut params = node.params.clone();
     let mut opaque: Vec<(String, Value)> = Vec::new();
     if let Value::Object(ref mut map) = params {
-        for key in node.kind().map(NodeType::opaque_params).unwrap_or(&[]) {
-            if let Some(value) = map.remove(*key) {
-                opaque.push(((*key).to_string(), value));
+        for key in node.kind().map(NodeType::opaque_params).unwrap_or_default() {
+            if let Some(value) = map.remove(key) {
+                opaque.push((key.to_string(), value));
             }
         }
     }
@@ -856,8 +856,8 @@ mod tests {
         assert!(err.message.contains("非负整数"), "{}", err.message);
     }
 
-    /// http_call 的 url 模板经统一入口展开后再发请求（回归：run_http 不再
-    /// 自己展开，双展开必须不改变行为）。
+    /// http_call 的 url 模板经统一入口展开后再发请求（回归：run_http 不自行
+    /// 展开，且双展开不得改变结果）。
     #[tokio::test]
     async fn http_url_template_is_expanded_before_request() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -972,7 +972,7 @@ mod tests {
     #[tokio::test]
     async fn http_body_truncated_mid_stream_is_retryable_failure() {
         // 回归：服务器声明 Content-Length: 100 却只发 10 字节就断开。
-        // 修复前 text() 的 Err 被吞成空字符串，节点带着 200 + 空 body 记成功。
+        // text() 的 Err 若被吞成空字符串，节点会带着 200 + 空 body 记成功。
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
