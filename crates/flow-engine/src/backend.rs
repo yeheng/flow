@@ -1,6 +1,6 @@
 //! Phase 0 后端边界：run 事件出口的最小接口。
 //!
-//! 这不是把文件 append 改名为 trait——接口必须表达（DISTRIBUTED.md §11 Phase 0）：
+//! 这不是把文件 append 改名为 trait——接口必须表达（`flow-engine/src/backend.rs` 模块头（本文件即该边界的实现））：
 //! - **受保护提交**：`append` 在单机后端是逐事件 fsync，在 Postgres 后端是
 //!   「锁 runs 行 → 校验租约代次 → 分配 seq → 插入事件」的同一事务，
 //!   失败时以 `EngineError::LeaseLost` 表示所有权已转移；

@@ -1,4 +1,4 @@
-//! gateway 入口（DISTRIBUTED.md §6）：持久 inbox 的入队、确认与查询。
+//! gateway 入口（`flow-pg/src/gateway.rs`）：持久 inbox 的入队、确认与查询。
 //!
 //! - 入队只代表 accepted，不能返回 delivered=true；
 //! - 相同 signal_id + 相同内容返回原结果（幂等），不同内容返回 conflict；

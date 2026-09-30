@@ -1,9 +1,12 @@
 # flow 工作流引擎设计方案
 
-> 状态：单机实现 + 对等模式多节点执行（`DISTRIBUTED.md`，Postgres 后端）；
+> 状态：单机实现 + 对等模式多节点执行（Postgres 后端；租约 / inbox / 接管的设计
+> 记录在 `flow-pg` 各模块的头注释里）；
 > `cargo test --workspace --all-targets --locked` 全绿（含 backend-e2e 的
 > Postgres 变体，需 docker；缺 Postgres 时对应用例跳过，其余全绿）。验证命令与覆盖范围见 §13。
-> 本文描述当前代码的实际语义，是后续开发的权威参考。
+> 本文描述当前代码的实际语义，是后续开发的权威参考。分布式子系统的设计不再单列
+> 文档（曾有一份 `DISTRIBUTED.md`，删除时已有 40+ 处引用指向不存在的章节）——
+> 逐条落在 `flow-pg` 各模块的头注释里，改代码时顺带就在改设计。
 > 架构焊点：**SQLite + events.jsonl 是默认与权威后端**（canonical）；Postgres 是
 > 可替代后端，两者统一在 `flow-backend` 的 `AnyBackend` 闭集枚举之后（§2）。
 >
@@ -28,8 +31,8 @@ flow 是一个工作流执行引擎：发布不可变的流程定义（DAG），
 明确的非目标（v1 范围决策）：
 
 - 不做通用 DSL——表达式与脚本统一用 JavaScript。
-- 多节点执行：对等抢占模式（peer）已按 `DISTRIBUTED.md` 实现（Postgres 后端，
-  租约、持久 inbox、副作用边界）；中心指派模式见 `SCHEDULER.md`，仍未实现。
+- 多节点执行：对等抢占模式（peer）已在 Postgres 后端实现（租约、持久 inbox、
+  副作用边界；设计记录在 `flow-pg` 各模块的头注释里）；中心指派模式未实现（见 §14）。
 
 节点运行可观察性（node_log 事件流、输入面快照、日志控制台）的完整设计见
 `docs/observability-design.md`；本文只记它与状态机相关的契约（§3.1、§6.1、§10）。
@@ -47,7 +50,8 @@ crates/
   flow-backend  后端适配层：`AnyBackend` 闭集枚举（**不是 dyn trait**）
                 屏蔽两种架构选择。SQLite + event.jsonl 是默认与权威实现
                 （`sqlite.rs`，即本文档描述的全部语义）；Postgres 是可替代实现
-                （`pg.rs`，DISTRIBUTED.md）。公共面只含两个后端都诚实实现的方法；
+                （`pg.rs`；分布式设计记录在 `flow-pg` 各模块的头注释里）。公共面只含两个
+                后端都诚实实现的方法；
                 初始化协议、信号落账、订阅推送的差异在边界内吸收；
                 「只有 published 可执行 + 创建前校验」单点在 resolve_runnable_definition
   flow-pg       Postgres 后端实现：共享日志、epoch 租约、持久 inbox、executor
@@ -80,7 +84,7 @@ flow-cli ──> flow-store / flow-pg ✗   ✗（CLI 不碰存储与事件日�
 
 运行：`cargo run --bin flow-server`。环境变量 `FLOW_ADDR`（默认 `127.0.0.1:9800`）、
 `FLOW_DB`、`FLOW_DATA_DIR`、`FLOW_HTTP_ADDR` 与 `FLOW_SCHEDULER`（§9.2）；
-Postgres 模式另见 `DISTRIBUTED.md` §10
+Postgres 模式另见 `flow-pg/src/config.rs`
 （`FLOW_BACKEND`、`FLOW_DATABASE_URL`、`FLOW_ROLE`、`FLOW_LEASE_TTL_MS` 等）。
 
 **SQLite 模式的进程模型（焊死三件套）**：单进程（open 时对 `data_dir` 目录
@@ -428,7 +432,7 @@ sub_workflow 节点以目标工作流的**最新已发布版本**启动一个子
 run_id/definition/input），启动/等待/取消经 `ChildRunLauncher` trait
 （`child_run.rs`）抽象：单机 `LocalChildLauncher` 同进程复用 Engine，
 Postgres `PgChildLauncher` 经 `lease::create_run` 单事务创建子 run、
-轮询共享 runs 投影等终态，取消走持久 inbox（DISTRIBUTED.md §6）。
+轮询共享 runs 投影等终态，取消走持久 inbox（`flow-pg/src/gateway.rs`）。
 
 - **child_run_id 确定性派生**：`{父run_id}:{节点id}:{attempt}`，在 `start_node`
   中确定并随 `node_started` 落盘——子 run 创建是副作用，其 id 先于副作用
@@ -536,12 +540,15 @@ SIGKILL 崩溃零丢失——页缓存归内核管；断电/内核崩溃可能�
   版本存在性检查各处一个 BEGIN IMMEDIATE 写锁事务；Postgres 臂用
   FOR UPDATE / FOR SHARE 串行化（同一互斥，两臂同契约）；
 - `set_run_status` 影响 0 行必须报错（静默成功会掩盖「run 行没插进去」）；
-- **状态词汇表**：`runs.status` 的合法取值
-  （initializing/running/awaiting_resume/succeeded/failed/cancelled）**单一来源**是
-  flow-dto 的 `DbRunStatus`（`as_str()` 生成这些字符串）；store 写入口
-  （`insert_run`/`set_run_status`）经 `ensure_run_status` 按 `DbRunStatus::is_valid_str`
-  校验，不维护第二份私有常量。契约测试钉住 store 写入口真的在校验，
-  词汇表外的字符串在写入时当场报错，而不是让 run 从恢复扫描里静默消失。
+- **状态词汇表**：`runs.status` 的合法取值**单一来源**是 flow-dto 的
+  `DbRunStatus`——变体清单 `ALL` 是唯一真相，`as_str()` 与之对拍，
+  `is_valid_str` / `is_terminal_str` / `is_active_str` / `sql_in_list` 全部由
+  `ALL` 派生。store 写入口（`insert_run`/`set_run_status`）经 `ensure_run_status`
+  按 `is_valid_str` 校验；`flow-pg` 的 `CHECK` 约束由同一份 `ALL` 生成
+  （排除 `initializing`——PG 的 `run.start` 单事务原子创建，该状态不可达）。
+  **加一个状态变体只需改 `ALL` 与 `as_str` 两处**，其余全部跟随；
+  `all_is_the_single_source_for_status_vocabulary` 钉住两者不脱节
+  （数组长度由类型标注编译期保证，内容对应关系由测试保证）。
 - 状态更新替换 output/error，传 None 会清空；已解决的裁决诊断不得留在成功结果里。
 
 ## 9. RPC 层（flow-rpc）
@@ -771,9 +778,12 @@ body 为 `{from, to, subject, text}`（纯文本正文），输出 `{status, id}
    多个端口不得指向同一节点**（否则 AND-join 会把被选中分支的下游整个跳过，
    §5 规则 4）；
 7. end/run 输出共用「单数透传、复数映射」规则（`singular_or_map`）；
-8. 状态词汇表单一来源：`DbRunStatus`，store 写入口校验——但
-   `is_valid_str` 是与 enum **不联动**的手写字面量表，加枚举变体必须同步改它
-   与 `flow-pg/src/schema.rs` 的 `CHECK` 列表。
+8. **状态词汇表的唯一真相是 `DbRunStatus::ALL`**：`as_str` 与它对拍，
+   `is_valid_str` / `is_terminal_str` / `is_active_str` / `sql_in_list` 全部派生，
+   `flow-pg` 的 `CHECK` 列表也由它生成（排除 PG 不可达的 `initializing`）。
+   此前 `is_valid_str` 是与 enum 不联动的手写 `matches!` 表、`CHECK` 列表是第三份
+   手写拷贝——加变体编译器不提醒，症状是该状态写入时当场被拒、run 从恢复扫描里
+   静默消失。
 9. 可重试失败非终态；不可重试失败由 fold 持久推导，恢复不会变为成功。
 10. 信号先校验，再持久化、消费和确认；无效请求不改变 run 终态。
 11. sub_workflow 的 child_run_id 确定性派生（`{父run}:{节点}:{attempt}`）并随
@@ -862,9 +872,12 @@ volume 上。Docker 只在容器**自己退出**时（`--rm`）回收匿名 volu
   断流用「声明 Content-Length 但发一半即关闭」——确定性，不依赖不可路由地址；
 - 客户端用 `ObjectParams` 具名参数；`subscribe` 三参
   `(subscribe_method, params, unsubscribe_method)`；
-- 契约测试钉住状态词汇表（§8；位于 flow-backend：store 写入口校验
-  DbRunStatus 单一词汇表）；「只有 published 可执行 + 创建前校验」的规则断言
-  单点钉在 flow-backend 的 `resolve_runnable_definition` 测试；
+- 状态词汇表（§8）：`flow-dto` 的 `all_is_the_single_source_for_status_vocabulary`
+  钉住 `ALL` 与 `as_str` 不脱节；`flow-pg` 的 `generated_run_status_check_*` 钉住
+  派生出的 `CHECK` 列表排除 `initializing` 且与迁移前手写版逐字一致；
+  `flow-backend` 的契约测试钉住 store 写入口真的在校验。
+  「只有 published 可执行 + 创建前校验」的规则断言单点钉在 flow-backend 的
+  `resolve_runnable_definition` 测试；
 - JS 沙箱边界由行为测试钉住（§10），随每次 `cargo test` 重新验证；
 - 图校验规则由 `model.rs` 的表驱动单测逐条钉住（端口/环/不可达/参数必填/
   模板参数放行与灰色形态拒绝；condition 多端口指同一节点的拒绝见
@@ -960,7 +973,7 @@ volume 上。Docker 只在容器**自己退出**时（`--rm`）回收匿名 volu
 - delay 剩余时间恢复（当前崩溃/接管后整段重放）；
 - 多 end 被跳过时与真 null 输出的显式区分；
 - `run.start` 客户端幂等键（当前双击 = 两个 run，服务端 uuid 生成）；
-- 中心指派模式（`SCHEDULER.md` 待实施；对等模式已按 `DISTRIBUTED.md` 实现，
+- 中心指派模式（中心指派模式未实施（见 DESIGN §14）；对等模式已实现（设计见 `flow-pg` 各模块头注释），
   未做多节点压测）；
 - 跨进程 SIGSTOP 场景下的真实副作用计数验收（副作用准入已用确定性前缀测试钉住）；
 - 不指定 run_id 的全局订阅仍有后端差异：SQLite 只推本进程事件、Postgres 推

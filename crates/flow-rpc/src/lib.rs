@@ -789,7 +789,7 @@ pub(crate) fn timeline_value(
     })
 }
 
-/// 信号/取消请求的响应语义（DISTRIBUTED.md §6.1，两种后端共用）：
+/// 信号/取消请求的响应语义（`flow-pg/src/gateway.rs`，两种后端共用）：
 /// delivered=true 才是交付；rejected 返回 invalid/conflict 错误体系；
 /// pending 返回明确的 pending 结果和 signal_id，客户端用 run.signal_status 查询。
 fn signal_ack_value(ack: SignalAck) -> Result<Value, ErrorObjectOwned> {

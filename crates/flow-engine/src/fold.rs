@@ -59,9 +59,8 @@ impl NodeState {
 
     /// 已尝试次数（= 当前状态携带的 attempt）。
     ///
-    /// **为什么是派生而非存储**：attempt 号只存在于状态里，此前 `NodeRecord.attempts`
-    /// 是它的影子副本，三个事件分支各写一行 `rec.attempts().max(attempt)` 手工同步。
-    /// `Pending` / `Skipped` 从未启动过，计数为 0。
+    /// **为什么是派生而非存储**：attempt 号只存在于状态里，别处再存一份就得
+    /// 靠事件分支手工同步。`Pending` / `Skipped` 从未启动过，计数为 0。
     ///
     /// 不变量：attempt 从 1 起、每次 +1（`next_attempt`），且 `handle_result` 会
     /// 丢弃非当前 attempt 的迟到结果，所以「状态里的 attempt」与「已尝试次数」
@@ -77,9 +76,8 @@ impl NodeState {
 
     /// 失败原因（仅 `Failed` 携带；其余状态无错）。
     ///
-    /// 派生同 [`Self::attempt`]：此前 `NodeRecord.error` 与
-    /// `NodeState::Failed.error` 各存一份，靠三个分支手工同步——而 `NodeSkipped`
-    /// 分支根本没清它，正是影子字段典型的漏网之处。
+    /// 派生同 [`Self::attempt`]：另存一份就得靠事件分支手工同步，而
+    /// `NodeSkipped` 这类分支最容易漏清。
     pub fn error(&self) -> Option<&str> {
         match self {
             NodeState::Failed { error, .. } => Some(error),

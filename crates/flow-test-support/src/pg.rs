@@ -11,7 +11,7 @@
 //!    数据本来就没有跨容器的意义，tmpfs 还更快）；
 //! 2. **不留**：删除容器一律 [`remove_container`] / `docker rm -f -v`，
 //!    `-v` 把匿名 volume 一并收走；
-//! 3. **回收历史遗留**：启动时清扫上一次运行（以及本文件修复前的老版本）
+//! 3. **回收历史遗留**：启动时清扫上一次运行（以及本文件出现前的旧版本）
 //!    漏下的孤儿 volume。
 //!
 //! 清扫只认**匿名** volume（docker 给它们起的名字是 64 位十六进制）——
@@ -433,7 +433,7 @@ impl TestDb {
 
     /// 这个测试库此刻是否还存在（给「cleanup 真的把库删了」的回归测试用）。
     ///
-    /// 曾经踩过：`TestDb` 实现了 `Deref<Target = PgPool>`，调用点的
+    /// 刻意不做 `Deref<Target = PgPool>`：调用点的
     /// `db.close()` 静默解析成 `PgPool::close()`——只关池、不删库，几十个
     /// 测试库就那样留在服务器上，而且没有任何测试会响。
     pub async fn database_exists(&self) -> bool {

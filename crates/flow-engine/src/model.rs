@@ -246,9 +246,9 @@ impl NodeType {
     /// 能力描述（`nodetypes.list` 的单条）。内容由 [`NodeType::build_descriptor`]
     /// 那张表决定，这里只做一次性构建 + 缓存。
     ///
-    /// 缓存是必要的：`descriptor()` 此前每次调用都重新跑一遍 `json!`，而
-    /// 构造出来的一棵 20 行 schema 树没人改动。返回 `&'static Value` 而非
-    /// clone——调用方（RPC 的 `node_types`）本来就只要拼进响应里。
+    /// 一次性构建 + 缓存：每次调用重跑一遍 `json!` 纯属浪费——构造出来的
+    /// 那棵 20 行 schema 树没人改动。返回 `&'static Value` 而非 clone，
+    /// 调用方（RPC 的 `node_types`）本来就只要拼进响应里。
     pub fn descriptor(self) -> &'static Value {
         static DESCRIPTORS: LazyLock<[Value; 10]> =
             LazyLock::new(|| std::array::from_fn(|i| NodeType::ALL[i].build_descriptor()));

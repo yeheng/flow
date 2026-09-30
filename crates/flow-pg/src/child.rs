@@ -1,4 +1,4 @@
-//! Postgres 后端的 sub_workflow 启动器（DISTRIBUTED.md §3）：
+//! Postgres 后端的 sub_workflow 启动器（`flow-pg/src/lease.rs::create_run`）：
 //! 父子 run 可能在不同实例上执行，不能依赖内存通道——
 //! start 走 gateway 的单事务创建，await 轮询共享 runs 投影，cancel 经持久 inbox。
 

@@ -1,8 +1,7 @@
 //! 失败恢复的集成回归（DESIGN.md §7）：fatal 失败保持终态、重试下游只跑一次、
 //! 恢复后继续等满退避、非法/重复信号不判死 run、裁决恢复被消费。
 //!
-//! Harness / 定义构造器在 `common`（历史上一份在这里、一份在
-//! engine_recovery.rs / sub_workflow.rs）。
+//! Harness / 定义构造器在 `common`（engine_recovery.rs / sub_workflow.rs 同指一份）。
 
 mod common;
 

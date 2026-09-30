@@ -1,14 +1,11 @@
 //! flow-rpc 集成测试基建：真起 `flow-server` 进程（SQLite / Postgres 两种存储）、
 //! JSON-RPC 客户端助手、定义构造器。
 //!
-//! 这份东西曾经在 `ws_rpc.rs` 与 `ws_pg.rs` 里**各写了一遍**：两份 `ServerProc`、
-//! 两份 `free_port` / `wait_ready` / `connect` / `named` / `call` / `call_err`，
-//! 连 `line_def` 这种定义构造器都复制了两份。更糟的是 `ws_pg.rs` 里那份
-//! `test_db()` / `TestDb` 是 `flow-pg/tests/common/mod.rs` 同段逻辑的第二份实现
-//! （连残留扫描都一起复制了，还抄漏了）。
-//!
-//! 现在：进程脚手架统一在这里；PG 测试库交给 `flow-test-support::pg`（flow-pg 的
-//! 测试、backend-e2e 都指着那一份）。
+//! 进程脚手架统一在这里：`ServerProc` / `free_port` / `wait_ready` / `connect` /
+//! `named` / `call` / `call_err` / `line_def` 这些跨用例共用的东西只此一份
+//! （DESIGN §13：共享夹具不逐文件复制——复制品会各自漂移）。
+//! PG 测试库交给 `flow-test-support::pg`，flow-pg 的测试与 backend-e2e 都指着
+//! 那一份。
 //!
 //! 就绪判定用 TCP connect 轮询（DESIGN.md §13 的约定）；`connect` 带重试，
 //! 因为进程刚 bind 上端口时 RPC 路由可能还没装完。

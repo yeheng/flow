@@ -2,8 +2,8 @@
 //! 拆分、SIGKILL 崩溃恢复、订阅轮询）。
 //!
 //! 需要 FLOW_TEST_DATABASE_URL（默认 127.0.0.1:54329 的本地测试库）；
-//! 不可达时跳过。进程脚手架与测试库生命周期都在 `common`（历史上一份在这里、
-//! 一份在 ws_rpc，两套 test_db 各自漂移）。
+//! 不可达时跳过。进程脚手架与测试库生命周期都在 `common`（ws_rpc 同指一份，
+//! 两套 test_db 各自漂移过一次）。
 //!
 //! 测试库的 docker 容器由 flow-test-support::pg 管（backend-e2e 也用同一份）：
 //! 数据目录 tmpfs、删除带 -v、启动回收孤儿 volume。这里默认连的是一个已经

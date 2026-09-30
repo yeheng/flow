@@ -1,10 +1,8 @@
 //! flow-engine 集成测试基建。
 //!
-//! 历史上 `engine_recovery.rs`、`recovery_regressions.rs`、`sub_workflow.rs`
-//! 各自写了一份几乎同构的 `Harness`（临时目录 + `Engine` + Drop 删目录），
-//! `global_subscribe.rs` / `group_commit.rs` 又各写了一个 `temp_root()`——
-//! 一份实现漂一次 GitHub issue。现在统一到这里：单点维护，`Drop` 保证失败
-//! 路径不留垃圾。
+//! `Harness`（临时目录 + `Engine` + Drop 删目录）与 `temp_root()` 等测试基建
+//! 统一到这里：跨用例共用一份，单点维护，`Drop` 保证失败路径不留垃圾
+//! （DESIGN §13：共享夹具不逐文件复制——各写一份必然漂移）。
 //!
 //! 约定（DESIGN.md §13）：每个用例一个独占临时目录，只删自己建的那个，
 //! 绝不碰系统临时目录本身。

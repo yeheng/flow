@@ -1,7 +1,7 @@
 //! 外部信号：human_task 交付、取消、裁决前置校验、pg 持久 inbox 落账语义。
 //!
 //! 契约来源：DESIGN.md §6.7（外部信号）、§9（signal_id 两后端差异）、
-//! DISTRIBUTED.md §6（持久 inbox）。
+//! `flow-pg/src/gateway.rs`（持久 inbox）。
 
 use backend_e2e::common::fixtures::{delay_def, human_def, linear_def, timeline_node};
 use backend_e2e::common::{

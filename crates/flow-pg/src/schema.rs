@@ -1,5 +1,5 @@
 //! Postgres schema。幂等建表；与 DESIGN.md 的 SQLite 是两个独立后端，
-//! 不是迁移关系（DISTRIBUTED.md §4）。
+//! 不是迁移关系。
 //!
 //! 关键不变量：
 //! - `runs.last_seq` 与 run_events 尾部一致，seq 唯一 + 连续由持锁事务共同保证；
@@ -8,8 +8,38 @@
 //! - 状态词汇表不含 initializing——Postgres 后端的 run.start 是单事务原子创建，
 //!   不存在「已插 run 但没有首事件」的合法状态。
 
+use flow_dto::{DbRunStatus, PG_UNREACHABLE_STATUSES};
+use sqlx::AssertSqlSafe;
 use sqlx::PgPool;
 
+/// `runs.status` 的 `CHECK` 列表，由 `DbRunStatus::ALL` 派生并排除本后端
+/// 永不产生的状态。
+///
+/// **不手写**：手写列表与 flow-dto 的 enum 是两份必须同步的拷贝，加变体时
+/// 编译器不提醒，症状是该状态在写入时当场被 DB 拒掉。`DbRunStatus::ALL[0]`
+/// 只是取一个实例来调方法（该方法不依赖具体变体）。
+///
+/// 排除 `initializing` 很重要：PG 的 `run.start` 单事务原子创建，该状态不可达；
+/// 直接用 `ALL` 会让 DB 接受一个不该存在的状态，掩盖「谁写了 initializing」。
+fn run_status_check() -> String {
+    DbRunStatus::ALL[0].sql_in_list_excluding(&PG_UNREACHABLE_STATUSES)
+}
+
+/// `runs.status IN (...)` 的谓词片段（部分索引用），同样由 `ALL` 生成。
+fn run_status_active_in() -> String {
+    DbRunStatus::ALL
+        .iter()
+        .filter(|s| s.is_active())
+        .map(|s| format!("'{}'", s.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// **关于下面两处 `AssertSqlSafe(format!(...))`**：DDL（`CREATE TABLE` /
+/// `CREATE INDEX`）不接受绑定参数，状态列表必须格式化进 SQL 文本。片段内容
+/// 全部来自 `DbRunStatus::ALL` 的 `as_str()`——一组编译期字面量，**不含任何
+/// 外部输入**，故无注入面。这处 `AssertSqlSafe` 是对上述事实的显式背书，不是
+/// 绕过检查：若将来 `sql_in_list` 改去拼接用户输入，它会立刻变成真实注入点。
 pub async fn init(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS workflows (
@@ -35,13 +65,12 @@ pub async fn init(pool: &PgPool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
-    sqlx::query(
+    sqlx::query(AssertSqlSafe(format!(
         "CREATE TABLE IF NOT EXISTS runs (
             id TEXT PRIMARY KEY,
             workflow_id TEXT NOT NULL REFERENCES workflows(id),
             workflow_version BIGINT NOT NULL,
-            status TEXT NOT NULL
-                CHECK (status IN ('running', 'awaiting_resume', 'succeeded', 'failed', 'cancelled')),
+            status TEXT NOT NULL CHECK (status IN ({})),
             input JSONB NOT NULL,
             output JSONB,
             error TEXT,
@@ -57,7 +86,8 @@ pub async fn init(pool: &PgPool) -> Result<(), sqlx::Error> {
             FOREIGN KEY (workflow_id, workflow_version)
                 REFERENCES workflow_versions(workflow_id, version)
         )",
-    )
+        run_status_check()
+    )))
     .execute(pool)
     .await?;
 
@@ -102,8 +132,8 @@ pub async fn init(pool: &PgPool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
-    // 集群模式共享表：一个集群只启用一种模式（DISTRIBUTED.md §1）。
-    // scheduler 模式由 SCHEDULER.md 定义，本版只落 peer。
+    // 集群模式共享表：一个集群只启用一种模式。本版只落 peer 模式
+    // （中心指派模式未实现，见 DESIGN.md §14 未做清单）。
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS cluster_settings (
             singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
@@ -131,10 +161,12 @@ pub async fn init(pool: &PgPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
 
-    sqlx::query(
+    // 活跃租约的部分索引：谓词同样由 DbRunStatus::ALL 派生
+    sqlx::query(AssertSqlSafe(format!(
         "CREATE INDEX IF NOT EXISTS idx_runs_active_lease ON runs (lease_owner, lease_expires_at)
-         WHERE status IN ('running', 'awaiting_resume')",
-    )
+         WHERE status IN ({})",
+        run_status_active_in()
+    )))
     .execute(pool)
     .await?;
 
@@ -174,4 +206,68 @@ pub async fn init(pool: &PgPool) -> Result<(), sqlx::Error> {
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flow_dto::active_statuses;
+
+    /// CHECK 列表必须与 flow-dto 的词汇表逐字一致，且**排除 initializing**
+    /// （Postgres 的 run.start 是单事务原子创建，不存在 initializing 状态）。
+    ///
+    /// 这条测试替代了此前「人手抄一份 CHECK 列表」的做法：列表由 `ALL` 生成，
+    /// 但「生成结果对不对」仍需断言——否则把 `initializing` 误加进 `ALL` 会
+    /// 让 PG 接受一个该后端永远不产生的状态。
+    #[test]
+    fn generated_run_status_check_excludes_initializing() {
+        let list = run_status_check();
+        for status in DbRunStatus::ALL {
+            if PG_UNREACHABLE_STATUSES.contains(&status) {
+                continue;
+            }
+            assert!(
+                list.contains(&format!("'{}'", status.as_str())),
+                "CHECK 列表缺 {}：{list}",
+                status.as_str()
+            );
+        }
+        for excluded in PG_UNREACHABLE_STATUSES {
+            assert!(
+                !list.contains(&format!("'{}'", excluded.as_str())),
+                "{} 必须被排除：PG 后端的 run.start 单事务原子创建，\
+                 不存在「已插 run 但没有首事件」的中间态：{list}",
+                excluded.as_str()
+            );
+        }
+    }
+
+    /// 生成的 CHECK 列表与**迁移前手写版逐字一致**（PG 的 e2e 依赖这个约束，
+    /// 存量库里已建表的 CHECK 不会因本次改动而变化）。这条断言是回归护栏：
+    /// 派生逻辑一旦改变列表内容，存量库与新建库就会分叉。
+    #[test]
+    fn generated_check_list_matches_the_previous_handwritten_one() {
+        assert_eq!(
+            run_status_check(),
+            "'running', 'awaiting_resume', 'succeeded', 'failed', 'cancelled'"
+        );
+    }
+
+    /// 部分索引谓词 = 活跃状态，与 `active_statuses()` 同一份来源。
+    #[test]
+    fn generated_active_index_predicate_matches_active_statuses() {
+        let list = run_status_active_in();
+        let expected: Vec<String> = active_statuses().iter().map(|s| format!("'{s}'")).collect();
+        assert_eq!(list, expected.join(", "));
+        assert!(list.contains("'running'") && list.contains("'awaiting_resume'"));
+        for status in DbRunStatus::ALL {
+            if !status.is_active() {
+                assert!(
+                    !list.contains(&format!("'{}'", status.as_str())),
+                    "{} 非活跃，不该进活跃租约索引：{list}",
+                    status.as_str()
+                );
+            }
+        }
+    }
 }

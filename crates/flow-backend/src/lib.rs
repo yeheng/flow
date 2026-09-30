@@ -1,8 +1,9 @@
 //! flow-backend：后端适配层。
 //!
 //! **架构决策（焊死）**：单机 `SQLite + data_dir/runs/<id>/event.jsonl` 是本系统的
-//! 权威与默认后端（`sqlite.rs`，DESIGN.md）；Postgres 共享日志后端
-//! （DISTRIBUTED.md）是**可替代**的等价实现（`pg.rs`），用于多节点执行。
+//! 权威与默认后端（`sqlite.rs`，DESIGN.md）；Postgres 共享日志后端（`pg.rs`）是
+//! **可替代**的等价实现，用于多节点执行——其设计（租约 / 持久 inbox / 接管）记录在
+//! `flow-pg` 各模块的头注释里。
 //!
 //! ## 接口哲学（闭集，不搞开放扩展）
 //!
@@ -16,7 +17,7 @@
 //! ## 语义差异由各实现吸收（对上层不可见）
 //!
 //! - run 创建：SQLite 走 initializing → run_started 两段协议；
-//!   Postgres 走单事务原子创建（DISTRIBUTED.md §3）；
+//!   Postgres 走单事务原子创建（`flow-pg/src/lease.rs::create_run`）；
 //! - 信号：SQLite 进程内同步交付（响应只回显客户端提供的 signal_id，
 //!   **从不伪造**）；Postgres 走持久 inbox，signal_id 必填且稳定复用，
 //!   可能返回 pending；
@@ -129,7 +130,7 @@ pub struct SignalRequest {
 pub enum AnyBackend {
     /// canonical：SQLite + event.jsonl（DESIGN.md 全部语义）。
     Sqlite(Arc<SqliteBackend>),
-    /// 可替代：Postgres 共享日志 + epoch 租约 + 持久 inbox（DISTRIBUTED.md）。
+    /// 可替代：Postgres 共享日志 + epoch 租约 + 持久 inbox（设计见 `flow-pg` 各模块头注释）。
     Postgres(Arc<PgBackend>),
 }
 
@@ -446,7 +447,7 @@ impl AnyBackend {
     }
 
     /// 订阅事件流。SQLite：进程内 broadcast；Postgres：共享轮询器扇出共享日志增量
-    ///（DISTRIBUTED.md §8，扫描次数与订阅者数无关）。不指定 run_id 时是纯实时增量
+    ///（`flow-pg/src/subscribe.rs`，扫描次数与订阅者数无关）。不指定 run_id 时是纯实时增量
     ///（Lagged 丢事件，用 run.events 按 from_seq 补齐）；指定 run_id 先回放完整日志
     /// 再接实时增量，该 run 已终结追平后流自然结束。两臂共用 run_tail 状态机，
     /// 语义一致（缺口补齐、失败重试、按 seq 去重），契约不分叉。

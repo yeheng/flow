@@ -1,4 +1,4 @@
-//! 所有权协议（DISTRIBUTED.md §5）：行锁、准入检查、租约获取/续期/释放、
+//! 所有权协议（`flow-pg/src/lease.rs`）：行锁、准入检查、租约获取/续期/释放、
 //! 原子 run 创建。
 //!
 //! 约定：
@@ -17,7 +17,7 @@ use crate::error::PgError;
 
 pub const MODE_PEER: &str = "peer";
 // 状态词汇表的单一来源在 flow-dto；此处重导出保持旧导入路径可用。
-pub use flow_dto::{DbRunStatus, STATUS_ACTIVE, STATUS_DRAFT, STATUS_PUBLISHED};
+pub use flow_dto::{active_statuses, DbRunStatus, STATUS_DRAFT, STATUS_PUBLISHED};
 
 /// 持锁后读到的 run 行快照。`expired` 用 SQL 表达式在锁内计算。
 #[derive(Debug)]
@@ -61,7 +61,7 @@ pub(crate) fn check_writable(
     expected_last_seq: Option<u64>,
 ) -> Result<(), flow_engine::EngineError> {
     use flow_engine::EngineError;
-    if !STATUS_ACTIVE.contains(&row.status.as_str()) {
+    if !DbRunStatus::is_active_str(&row.status) {
         // run 已终结：写权已随终态消失，按所有权丢失处理（静默退出）
         return Err(EngineError::LeaseLost);
     }
@@ -84,7 +84,7 @@ pub(crate) fn check_writable(
 }
 
 pub(crate) fn status_is_active(status: &str) -> bool {
-    STATUS_ACTIVE.contains(&status)
+    DbRunStatus::is_active_str(status)
 }
 
 #[derive(Debug)]
@@ -167,7 +167,7 @@ pub async fn renew(
     .bind(run_id)
     .bind(instance_id)
     .bind(epoch)
-    .bind(&STATUS_ACTIVE[..])
+    .bind(active_statuses())
     .execute(pool)
     .await
     .map_err(|e| flow_engine::EngineError::Backend(e.to_string()))?
@@ -288,7 +288,7 @@ pub async fn create_run(
     Ok(())
 }
 
-/// 事件提交后唤醒订阅者（DISTRIBUTED.md §8）：与事件插入同一事务，提交时才投递。
+/// 事件提交后唤醒订阅者（`flow-pg/src/subscribe.rs`）：与事件插入同一事务，提交时才投递。
 /// 载荷只带 run_id（NOTIFY 载荷上限 8000 字节），事件本体始终由 read_events
 /// 按游标读取；通知只是低延迟提示，丢失由订阅方兜底轮询兜住。
 pub(crate) async fn queue_event_notify(
@@ -311,7 +311,7 @@ pub(crate) fn payload_of(event: &flow_engine::Event) -> Result<Value, flow_engin
     serde_json::to_value(event).map_err(flow_engine::EngineError::Json)
 }
 
-/// 准入规则的表驱动单测（DISTRIBUTED.md §5.1）。
+/// 准入规则的表驱动单测（`flow-pg/src/lease.rs` 的准入规则表）。
 ///
 /// `check_writable` 是 fencing 协议的判官：调用点每写一次事件都要问一遍。
 /// 它过去只有 `tests/recovery.rs` 的黑盒覆盖（要连真 PG、不可达时还跳过），
@@ -380,11 +380,12 @@ mod tests {
             );
         }
         // 反过来：真正在跑的状态才有写权。
-        // 注意 `initializing` **不在**可写侧（flow-dto 的 STATUS_ACTIVE 只含
+        // 注意 `initializing` **不在**可写侧（`DbRunStatus::is_active` 只含
         // running / awaiting_resume）：那条状态下的 run 还没有事件日志、轮不到
         // 租约持有者写，所以判 LeaseLost 让它静默退出是对的。这条不对称是刻意的，
         // 在这里钉住，免得日后「顺手补全」时把它加进去。
-        for status in ["running", "awaiting_resume"] {
+        // 状态串由 `active_statuses()` 派生，不手写——手写会在加变体时静默失配。
+        for status in active_statuses() {
             let r = row(status, Some("i-1"), 3, false, 7);
             assert!(
                 check_writable(&r, "i-1", 3, Some(7)).is_ok(),

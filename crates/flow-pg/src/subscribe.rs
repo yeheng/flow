@@ -1,4 +1,4 @@
-//! 共享事件订阅轮询（DISTRIBUTED.md §8）：进程内唯一的轮询任务维护全局游标，
+//! 共享事件订阅轮询（`flow-pg/src/subscribe.rs`）：进程内唯一的轮询任务维护全局游标，
 //! 把共享日志的增量扇出给所有本地订阅者——查询次数与订阅者数无关。
 //!
 //! 正确性不依赖 LISTEN/NOTIFY：通知只是低延迟唤醒提示，丢失由 subscribe_poll
@@ -64,7 +64,7 @@ impl EventHub {
     pub fn start(pool: sqlx::PgPool, cfg: PgConfig) -> Arc<EventHub> {
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let stop = CancellationToken::new();
-        // 任务句柄**构造时**就放进槽位。此前用 `try_lock` 填，锁被争用时会
+        // 任务句柄**构造时**就放进槽位，不能延后到第一次使用时——锁被争用时会
         // 静默丢弃 JoinHandle（= detach 该任务），`stop()` 于是报告「已停止」
         // 而 poll_loop 还在跑，且再也无法取消。
         let task = tokio::sync::Mutex::new(Some(tokio::spawn(poll_loop(

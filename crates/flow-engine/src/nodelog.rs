@@ -264,8 +264,8 @@ mod tests {
     }
 
     /// 预算是 debug/info 的上限，warn/error 不参与消耗（DESIGN §12.17）。
-    /// 修复前 warn 也 `emitted += 1`，于是刷满 max 条 warn 之后整条 run 的
-    /// info 日志全部丢弃——包括重试叙事与 HTTP 请求行这些最该看的。
+    /// 共享一个计数器的话，刷满 max 条 warn 的节点会把整条 run 的 info 日志
+    /// 全部吃掉——包括重试叙事与 HTTP 请求行这些最该看的。
     #[test]
     fn warn_burst_does_not_consume_the_info_budget() {
         let budget = LogBudget::new(3);
@@ -294,9 +294,9 @@ mod tests {
         assert!(line.message.len() < 9000, "截断后必须小于上限");
     }
 
-    /// `[truncated N bytes]` 里的 N 必须是**真实丢掉**的字节数。
-    /// 修复前按 `len() - MAX_LOG_LINE_BYTES` 算，而实际截断点为字符边界回退
-    /// 后的位置（≤ 上限），于是 N 系统性偏小——多字节内容上偏得更多。
+    /// `[truncated N bytes]` 里的 N 必须是**真实丢掉**的字节数，即
+    /// `len() - 实际截断位置`；后者是字符边界回退后的点（≤ 上限），不能拿
+    /// 上限去减——多字节内容上会系统性偏小。
     #[test]
     fn truncated_marker_reports_actual_dropped_bytes() {
         // 2730 个「宁」= 8190 字节，再加一个是 8193 > 8192 上限
@@ -306,8 +306,8 @@ mod tests {
         let cut = truncate_message(&text);
         assert!(
             cut.contains(&format!("[truncated {} bytes]", text.len() - kept_bytes)),
-            "标注的截断字节数必须等于真正丢掉的字节数（字符边界回退后为 6810，\
-             修复前错报 6808）：{cut:?}"
+            "标注的截断字节数必须等于真正丢掉的字节数（字符边界回退后为 6810）：\
+             {cut:?}"
         );
         // 单字节内容（无回退）时两者恰好相等，钉住 ASCII 路径没被改坏
         let ascii = "x".repeat(MAX_LOG_LINE_BYTES + 100);

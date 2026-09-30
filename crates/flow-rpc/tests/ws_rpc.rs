@@ -1,7 +1,7 @@
 //! RPC over WebSocket 的集成测试：真起 flow-server 进程（SQLite 独占临时目录）。
 //!
-//! 进程脚手架、客户端助手、定义构造器都在 `common`（历史上一份在 ws_rpc、
-//! 一份在 ws_pg，各自漂移）。这里只放「崩溃重启」才需要的 Workspace 和用例本身。
+//! 进程脚手架、客户端助手、定义构造器都在 `common`（ws_pg 同指一份——
+//! 两份各自漂移过一次）。这里只放「崩溃重启」才需要的 Workspace 和用例本身。
 
 mod common;
 

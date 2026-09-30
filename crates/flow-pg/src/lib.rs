@@ -1,4 +1,14 @@
-//! flow-pg：Postgres 后端（DISTRIBUTED.md 的共享日志、epoch 租约、持久 inbox）。
+//! flow-pg：Postgres 后端——共享日志、epoch 租约、持久 inbox 的实现。
+//!
+//! **本 crate 的模块头注释即是分布式设计的权威记录。** 曾经有一份
+//! `docs/DISTRIBUTED.md` 专门写这套设计，现已删除：那份文档与代码各改各的、
+//! 互相引用逐渐失真（删除时已有 40+ 处引用指向不存在的章节）。设计逐条落进
+//! 下面这些模块的头注释，改代码时顺带就在改设计：
+//! - `lease.rs` 所有权协议：行锁、准入检查、租约获取/续期/释放、fencing；
+//! - `gateway.rs` 持久 inbox：入队、确认、查询；
+//! - `executor.rs` 对等模式扫描与接管；
+//! - `subscribe.rs` 共享日志轮询与 LISTEN/NOTIFY 唤醒；
+//! - `config.rs` 部署配置与环境变量。
 //!
 //! 依赖方向：flow-pg → flow-engine（事件模型、fold、Driver），
 //! 引擎不依赖本 crate（Phase 0 后端边界：`RunEventSink` trait 在 flow-engine）。
@@ -118,7 +128,7 @@ pub struct PgEngine {
 
 /// run.start 的输入。`version` 必须是已解析的 published 版本——
 /// 「只有 published 可执行 + 创建前校验定义」这条规则单点在 flow-backend 的
-/// `resolve_runnable_definition`，本方法不重复实现（DISTRIBUTED.md §3）。
+/// `resolve_runnable_definition`，本方法不重复实现（`flow-pg/src/lease.rs::create_run`）。
 pub struct CreateRun {
     pub workflow_id: String,
     pub version: i64,

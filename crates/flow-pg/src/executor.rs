@@ -1,4 +1,4 @@
-//! 对等模式的 executor（DISTRIBUTED.md §5.4 / §7）：
+//! 对等模式的 executor（`flow-pg/src/executor.rs` + `driver::RecoveryPlan::classify`）：
 //! 扫描无租约或租约过期的 running/awaiting_resume run 作为候选，
 //! 逐个执行获取事务；提交后读事件、折叠、按 §7 分类恢复并驱动。
 //!
@@ -307,7 +307,7 @@ async fn drive_after_acquire(
         folded.last_seq,
     );
     // PG 模式：用户取消与信号都经持久 inbox 交付，本地通道不参与；
-    // 事件订阅走共享日志轮询（DISTRIBUTED.md §8），无本地广播。
+    // 事件订阅走共享日志轮询（`flow-pg/src/subscribe.rs`），无本地广播。
     let cancel = CancellationToken::new();
     let lost = CancellationToken::new();
 

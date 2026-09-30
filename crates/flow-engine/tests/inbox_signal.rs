@@ -1,4 +1,4 @@
-//! inbox 信号的「早到」回归（DISTRIBUTED.md §6.1 + DESIGN §6.7）：
+//! inbox 信号的「早到」回归（DESIGN §6.7 + `flow-pg/src/gateway.rs`）：
 //! 信号先落账、Driver 后接管（或 run.start 先于节点派发返回）时，
 //! 目标 human_task 还没登记等待——此时拒绝会直接丢掉信号，run 永远等不到它。
 //! Driver 必须跳过本次 poll：行留 pending，下一轮 poll 节点已等待即正常交付。

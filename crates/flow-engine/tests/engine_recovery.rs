@@ -4,8 +4,8 @@
 //! 副作用节点等人工裁决、human_task 跨重启派信号、取消终态、skip 传播、
 //! 多前驱输出收集、`nodes` 只暴露直接前驱、独立分支收尾。
 //!
-//! Harness / 定义构造器在 `common`（历史上一份在这里、一份在
-//! recovery_regressions.rs / sub_workflow.rs，三份几乎同构）。
+//! Harness / 定义构造器在 `common`（recovery_regressions.rs 与 sub_workflow.rs
+//! 同指一份）。
 
 mod common;
 

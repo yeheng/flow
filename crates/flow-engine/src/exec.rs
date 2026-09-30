@@ -113,8 +113,8 @@ fn contains_template(value: &Value) -> bool {
 /// `nodes` 完全一致——只读 run 输入与直接前驱输出快照，不扩大决定论边界。
 ///
 /// 由 driver 的 start_node 在写 node_started 前调用（输入面快照随事件落盘），
-/// 展开**恰好一次**：exec 层不再展开，禁止双展开（数据里合法的 `${` 会被
-/// 二次展开损坏——历史回归，见 `http_url_template_is_expanded_before_request`）。
+/// 展开**恰好一次**：exec 层不再展开。数据里合法的 `${` 经二次展开会被损坏
+/// （回归测试 `http_url_template_is_expanded_before_request`）。
 pub(crate) async fn expand_params(
     node: &Node,
     input: &Value,
@@ -191,9 +191,9 @@ pub async fn execute(
         .kind()
         .ok_or_else(|| NodeFailure::fatal(format!("未知节点类型：{}", ctx.node.node_type)))?;
 
-    // params 已由 driver 的 start_node 统一展开（DESIGN §10，展开恰好一次），
-    // exec 层不再展开：双展开会把数据里合法的 ${ 再 evaluate 一遍（历史回归，
-    // 见 http_url_template_is_expanded_before_request）。
+    // params 已由 driver 的 start_node 统一展开（DESIGN §10，展开恰好一次）：
+    // 双展开会把数据里合法的 ${ 再 evaluate 一遍，见
+    // http_url_template_is_expanded_before_request。
     // x-secret 参数：dispatch 之前由名称解析为真值。真值不参与模板展开，也
     // 不进事件——node_started 在 driver 侧早已落盘，这里的 node 只是执行期
     // 的内存副本。
@@ -963,7 +963,7 @@ mod tests {
 
     #[test]
     fn truncate_cuts_on_utf8_char_boundary() {
-        // 300 个三字节字符：512 字节处落在字符中间，修复前这里直接 panic
+        // 300 个三字节字符：512 字节处落在字符中间，截断必须回退到字符边界
         let value = json!("宁".repeat(300));
         let cut = truncate(&value);
         assert!(cut.ends_with('…'), "{cut}");

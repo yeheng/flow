@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::error::PgError;
 pub use flow_dto::{
     RunRecord, RunStats, Schedule, Webhook, WorkflowRunStats, WorkflowSummary, WorkflowVersion,
-    STATUS_ACTIVE, STATUS_DRAFT, STATUS_PUBLISHED,
+    STATUS_DRAFT, STATUS_PUBLISHED,
 };
 
 /// 定义与 run 元数据的存储。执行事件在 run_events，租约在 runs 行内。
@@ -578,7 +578,7 @@ impl PgStore {
              LIMIT $1",
         )
         .bind(limit)
-        .bind(&STATUS_ACTIVE[..])
+        .bind(flow_dto::active_statuses())
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -618,7 +618,7 @@ impl PgStore {
                LIMIT 256)",
         )
         .bind(ended_within.as_secs_f64())
-        .bind(&STATUS_ACTIVE[..])
+        .bind(flow_dto::active_statuses())
         .fetch_all(&self.pool)
         .await?;
         let mut out = Vec::with_capacity(rows.len());

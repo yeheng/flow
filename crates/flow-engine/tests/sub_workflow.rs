@@ -4,8 +4,7 @@
 //! 深度上限、取消级联、崩溃重放沿用同一 child_run_id、缺 workflow_id / 无
 //! launcher 的快速失败。
 //!
-//! Harness / 定义构造器在 `common`（历史上一份在这里、一份在
-//! engine_recovery.rs / recovery_regressions.rs）。
+//! Harness / 定义构造器在 `common`（engine_recovery.rs / recovery_regressions.rs 同指一份）。
 
 mod common;
 

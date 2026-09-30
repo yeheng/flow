@@ -1,4 +1,4 @@
-//! Postgres 后端适配器（**可替代架构**）：DISTRIBUTED.md 的共享日志 + epoch 租约 +
+//! Postgres 后端适配器（**可替代架构**）：`flow-pg` 的共享日志 + epoch 租约 +
 //! 持久 inbox，封装到 [`AnyBackend`](crate::AnyBackend) 边界之后。
 //!
 //! 吸收的语义差异（对上层不可见）：
@@ -6,7 +6,7 @@
 //!   published 解析与定义校验单点在 `resolve_runnable_definition`；
 //! - 信号/取消：持久 inbox + 等待落账，可能返回 pending；signal_id 必填且稳定复用；
 //! - 订阅：进程内共享轮询器扇出共享日志增量（扫描次数与订阅者数无关），
-//!   LISTEN/NOTIFY 作低延迟唤醒（DISTRIBUTED.md §8）；
+//!   LISTEN/NOTIFY 作低延迟唤醒（`flow-pg/src/subscribe.rs`）；
 //! - 生命周期：start 起 executor 扫描循环（gateway 角色跳过），shutdown 优雅停机。
 
 use std::sync::Arc;
@@ -38,7 +38,7 @@ impl PgBackend {
         })
     }
 
-    /// FLOW_DATABASE_URL 必填；其余见 DISTRIBUTED.md §10。
+    /// FLOW_DATABASE_URL 必填；其余见 `flow-pg/src/config.rs`。
     pub async fn from_env() -> Result<PgBackend, BackendError> {
         let url = std::env::var("FLOW_DATABASE_URL")
             .map_err(|_| BackendError::Invalid("Postgres 模式必须设置 FLOW_DATABASE_URL".into()))?;
@@ -280,7 +280,7 @@ impl PgBackend {
             .map_err(pg_err)
     }
 
-    /// 单事务原子创建：insert run + seq=1 RunStarted（DISTRIBUTED.md §3）。
+    /// 单事务原子创建：insert run + seq=1 RunStarted（`flow-pg/src/lease.rs::create_run`）。
     /// published 解析与定义校验单点在 `resolve_runnable_definition`，
     /// 这里拿到的是已解析的版本——底层不再重复实现这条规则。
     pub async fn create_run(&self, spec: CreateRun) -> Result<CreatedRun, BackendError> {
@@ -344,7 +344,7 @@ impl PgBackend {
         self.engine.is_live(run_id)
     }
 
-    /// 持久 inbox + 等待落账（DISTRIBUTED.md §6.1）。signal_id 必填且稳定复用。
+    /// 持久 inbox + 等待落账（`flow-pg/src/gateway.rs`）。signal_id 必填且稳定复用。
     pub async fn signal(&self, req: SignalRequest) -> Result<SignalAck, BackendError> {
         let Some(signal_id) = req.signal_id else {
             return Err(BackendError::Invalid(
@@ -380,7 +380,7 @@ impl PgBackend {
             .map_err(pg_err)
     }
 
-    /// 订阅：进程内共享轮询器把共享日志的增量扇出给所有订阅者（DISTRIBUTED.md §8），
+    /// 订阅：进程内共享轮询器把共享日志的增量扇出给所有订阅者（`flow-pg/src/subscribe.rs`），
     /// 查询次数与订阅者数无关；LISTEN/NOTIFY 是低延迟唤醒提示，正确性不依赖通知，
     /// 通知丢失由 subscribe_poll 兜底轮询兜住。
     /// 不指定 run_id：纯实时增量（共享轮询器扇出，扫描次数与订阅者数无关），

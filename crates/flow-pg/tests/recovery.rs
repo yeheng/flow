@@ -1,4 +1,4 @@
-//! 接管恢复分类测试（DISTRIBUTED.md §11 Phase 1 验收 3/5 + §7）：
+//! 接管恢复分类测试（接管恢复分类（`driver::RecoveryPlan::classify`））：
 //! 纯节点重放、待重试重建退避、human_task 继续等待、副作用节点人工裁决
 //! （副作用准入检查：接管后不自动重放）、已记录裁决消费、fatal 保留。
 

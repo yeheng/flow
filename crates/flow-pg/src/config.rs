@@ -1,4 +1,4 @@
-//! 部署配置（DISTRIBUTED.md §10）。TTL/续期/轮询间隔的默认值是起点，
+//! 部署配置（`flow-pg/src/config.rs`）。TTL/续期/轮询间隔的默认值是起点，
 //! 正式部署必须依据数据库延迟实测调整。
 
 use std::time::Duration;

@@ -151,7 +151,7 @@ pub fn spawn_driver(spec: DriverSpec, state: RunState, plan: RecoveryPlan) -> Jo
 }
 
 /// 恢复期对未完成节点和待重试节点的分类结论。
-/// 单机与分布式接管共用同一分类（DESIGN.md §7 / DISTRIBUTED.md §7）。
+/// 单机与分布式接管共用同一分类（DESIGN.md §7 / `driver::RecoveryPlan::classify`）。
 #[derive(Default, Debug)]
 pub struct RecoveryPlan {
     /// 纯节点：安全重放

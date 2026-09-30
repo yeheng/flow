@@ -357,11 +357,9 @@ fn global_committer() -> &'static GroupCommitter {
     GLOBAL.get_or_init(GroupCommitter::default)
 }
 
-/// 进程级组提交统计。**不对外**：它的消费者只有本文件末尾的组提交单测，
-///
-/// 曾为了一份 `tests/group_commit.rs` 把它 `pub` 到 `flow_engine::commit_stats`——
-/// 公开 API 为一个测试事实开了洞。现在这条断言搬回本文件（见末尾
-/// `#[cfg(test)] mod group_commit_tests`），直接读内部计数器，不再需要导出。
+/// 进程级组提交统计。**不对外**：消费者只有本文件末尾的组提交单测，
+/// 它们直接读内部计数器（见末尾 `#[cfg(test)] mod group_commit_tests`）——
+/// 不为一个测试事实在公开 API 上开洞（DESIGN §13 的硬规则）。
 #[cfg(test)]
 fn commit_stats_for_test() -> CommitStats {
     global_committer().stats()
