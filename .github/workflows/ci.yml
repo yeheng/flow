@@ -232,24 +232,17 @@ jobs:
           key: cross-${{ matrix.target }}
       - name: cross build（workspace，release）
         run: cross build --workspace --release --locked --target ${{ matrix.target }}
-      # flow-rpc 与 backend-e2e 各有一个同名 bin flow-server（cargo 只 warning，
-      # workspace 构建后 target/<target>/release/flow-server 是二者之一且不确定），
-      # 所以按包分别构建、各自即刻拷出，避免拿到互相覆盖后的那一个。
-      # 第二次之后的 cross 调用命中的是同一份缓存，基本不花时间。
-      - name: 收集 flow-cli / flow-perf / flow-server（flow-rpc）
+      # 四个 bin 一次构建全部就位。backend-e2e 的被测进程叫 flow-server-e2e
+      # （与 flow-rpc 的 flow-server 同一份 run_from_env 实现，只是改名）——
+      # 同名会写同一个产物、cargo 报 output filename collision，谁覆盖谁取决于
+      # 构建顺序，所以两者必须保持不同的名字。
+      - name: 收集 flow-cli / flow-perf / flow-server / flow-server-e2e
         run: |
           set -euo pipefail
-          cross build --release --locked --target ${{ matrix.target }} \
-            -p flow-cli -p flow-rpc -p backend-perf
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/flow-cli" dist/flow-cli
-          cp "target/${{ matrix.target }}/release/flow-perf" dist/flow-perf
-          cp "target/${{ matrix.target }}/release/flow-server" dist/flow-server
-      - name: 收集 flow-server（backend-e2e 的 harness 二进制）
-        run: |
-          set -euo pipefail
-          cross build --release --locked --target ${{ matrix.target }} -p backend-e2e
-          cp "target/${{ matrix.target }}/release/flow-server" dist/flow-server-e2e
+          for bin in flow-cli flow-perf flow-server flow-server-e2e; do
+            cp "target/${{ matrix.target }}/release/$bin" "dist/$bin"
+          done
       - name: 校验产物是目标架构的 ELF
         run: |
           set -euo pipefail

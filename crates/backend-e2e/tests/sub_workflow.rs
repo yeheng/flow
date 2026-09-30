@@ -187,7 +187,7 @@ e2e_test!(parent_cancel_cascades_to_child, |ctx: &mut Ctx| Box::pin(
 #[tokio::test]
 async fn nested_depth_limit_is_fatal() {
     const DEPTH: usize = 10;
-    let bin = env!("CARGO_BIN_EXE_flow-server");
+    let bin = env!("CARGO_BIN_EXE_flow-server-e2e");
     for kind in [
         backend_e2e::common::Kind::Sqlite,
         backend_e2e::common::Kind::Postgres,

@@ -319,7 +319,7 @@ e2e_test!(
 async fn pg_signal_pending_without_executor_then_delivered() {
     let pg = shared().await;
     let db = TestDb::create(&pg.url(), E2E_DB_PREFIX).await;
-    let bin = env!("CARGO_BIN_EXE_flow-server");
+    let bin = env!("CARGO_BIN_EXE_flow-server-e2e");
 
     // gateway：只提供元数据与持久输入入口，没有 Driver 消费 inbox
     let mut gateway = spawn_pg_server(bin, &db.url, "gateway", 600).await;

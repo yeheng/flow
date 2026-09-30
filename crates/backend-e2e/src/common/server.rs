@@ -7,13 +7,13 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
 
 use futures::FutureExt;
 use uuid::Uuid;
 
 use crate::common::client;
 use crate::common::{free_port, shared, TestDb, E2E_DB_PREFIX};
+use flow_test_support::io::{wait_ready_child, Ready, PORT_RETRY_ATTEMPTS};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
@@ -32,7 +32,7 @@ impl Kind {
 
 /// 一个用例的后端上下文：服务进程 + 存储（临时目录或测试库）。
 ///
-/// `bin` 是 `env!("CARGO_BIN_EXE_flow-server")`（测试 crate 编译期常量，
+/// `bin` 是 `env!("CARGO_BIN_EXE_flow-server-e2e")`（测试 crate 编译期常量，
 /// 只能从测试代码传进来——lib 编译时没有这个环境变量）。
 pub struct Ctx {
     pub kind: Kind,
@@ -240,6 +240,27 @@ impl ServerProc {
         signal_wait_ms: u64,
         extra_env: &[(&str, &str)],
     ) -> Self {
+        // 端口是「建议」不是「预留」：free_port 放掉到被测进程 bind 之间会被
+        // 并行用例抢走（TOCTOU，CI 多核上会真发生）。被抢时子进程因 AddrInUse
+        // 立刻退出，换端口重来。
+        let mut last = String::new();
+        for _ in 1..=PORT_RETRY_ATTEMPTS {
+            match Self::spawn_once(bin, storage, role, signal_wait_ms, extra_env) {
+                Ok(proc) => return proc,
+                Err(reason) => last = reason,
+            }
+        }
+        panic!("{last}（已重试 {PORT_RETRY_ATTEMPTS} 次）");
+    }
+
+    /// 起一次并等就绪。`Err` 表示该端口不可用，换一个重试即可。
+    fn spawn_once(
+        bin: &str,
+        storage: &Storage,
+        role: &str,
+        signal_wait_ms: u64,
+        extra_env: &[(&str, &str)],
+    ) -> Result<Self, String> {
         let addr = socket_addr(free_port());
         let http_addr = socket_addr(free_port());
         let mut cmd = Command::new(bin);
@@ -291,16 +312,20 @@ impl ServerProc {
         for (key, value) in extra_env {
             cmd.env(key, value);
         }
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .unwrap_or_else(|e| panic!("启动 flow-server 失败：{e}"));
-        let proc = ServerProc {
-            child,
-            addr,
-            http_addr,
-        };
-        proc.wait_ready();
-        proc
+        match wait_ready_child(addr, &mut child) {
+            Ready::Ready => Ok(ServerProc {
+                child,
+                addr,
+                http_addr,
+            }),
+            Ready::ChildExited(status) => Err(format!(
+                "flow-server 端口 {addr} 上启动即退出（{status}）——端口被并行用例占用"
+            )),
+            Ready::TimedOut => Err(format!("flow-server {addr} 未在就绪超时内起来")),
+        }
     }
 
     pub fn spawn_postgres(bin: &str, url: &str, role: &str, signal_wait_ms: u64) -> Self {
@@ -334,18 +359,6 @@ impl ServerProc {
         // SIGKILL：崩溃恢复必须是「没机会做任何清理」的死法
         let _ = self.child.kill();
         let _ = self.child.wait();
-    }
-
-    fn wait_ready(&self) {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while Instant::now() < deadline {
-            if std::net::TcpStream::connect_timeout(&self.addr, Duration::from_millis(200)).is_ok()
-            {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        panic!("flow-server {} 在 30s 内未就绪", self.addr);
     }
 }
 

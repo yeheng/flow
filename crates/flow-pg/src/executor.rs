@@ -405,20 +405,49 @@ async fn isolate_corrupted(
         folded.workflow_id, folded.workflow_version, run.workflow_id, run.workflow_version
     );
     tracing::error!(run_id = %run_id, error = %message, "接管时发现身份不符，隔离 run");
-    let mut sink = PgRunSink::new(
-        store.pool().clone(),
-        run_id.to_string(),
-        instance.to_string(),
-        epoch,
-        folded.last_seq,
-    );
-    if let Err(err) = sink
-        .project_status(flow_engine::DbRunStatus::AwaitingResume, Some(&message))
-        .await
-    {
-        tracing::error!(run_id = %run_id, error = %err, "隔离投影失败");
+    // 状态投影与租约释放**同一事务**：分两次提交会留下一个可观测的中间态
+    // ——status 已是 awaiting_resume 而 lease_owner 还在。观察者（run.timeline
+    // 的 live 标记、运维巡检、以及 recovery 回归里「隔离必须释放租约」这条断言）
+    // 在这个窗口里读到的就是「已隔离但仍被租约持有」的矛盾状态。
+    let mut tx = store.pool().begin().await?;
+    // 锁行并校验 owner/epoch：与 project_status 走同一套准入检查
+    // （lease.rs 的 check_writable 语义），不依赖「刚 acquire 过所以一定还对」。
+    let row: Option<(String, i64)> =
+        sqlx::query_as("SELECT lease_owner, lease_epoch FROM runs WHERE id = $1 FOR UPDATE")
+            .bind(run_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(PgError::from)?;
+    match row {
+        Some((owner, row_epoch)) if owner == instance && row_epoch == epoch => {}
+        Some((owner, row_epoch)) => {
+            // 租约已易主：不得改他的行，交给新持有者处理
+            tracing::warn!(
+                run_id = %run_id,
+                current_owner = %owner,
+                current_epoch = row_epoch,
+                expected_epoch = epoch,
+                "隔离时租约已易主，放弃投影"
+            );
+            return Ok(TakeOver::NotEligible(message));
+        }
+        None => {
+            tracing::warn!(run_id = %run_id, "隔离时 run 行已消失，放弃投影");
+            return Ok(TakeOver::NotEligible(message));
+        }
     }
-    let _ = lease::release(store.pool(), run_id, instance, epoch).await;
+    sqlx::query(
+        "UPDATE runs SET status = $1, output = NULL, error = $2,
+                lease_owner = NULL, lease_expires_at = NULL
+         WHERE id = $3",
+    )
+    .bind(flow_engine::DbRunStatus::AwaitingResume.as_str())
+    .bind(&message)
+    .bind(run_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(PgError::from)?;
+    tx.commit().await.map_err(PgError::from)?;
     state.quarantine(run_id);
     Ok(TakeOver::NotEligible(message))
 }

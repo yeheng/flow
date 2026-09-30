@@ -115,7 +115,11 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "127.0.0.1:9801".into())
         .parse()?;
     let http_listener = tokio::net::TcpListener::bind(http_addr).await?;
-    tracing::info!(%http_addr, "webhook HTTP 监听已启动 (POST /hook/:token)");
+    // 记**实际绑到的**地址而非请求值：传 `127.0.0.1:0` 让内核分配端口时，
+    // 记请求值会得到一条 `http_addr=127.0.0.1:0` 的假日志（端口 0 意味着
+    // 「由内核选」，没人能从日志里知道实际端口）。测试 harness 靠这行拿端口。
+    let bound_http = http_listener.local_addr()?;
+    tracing::info!(%bound_http, "webhook HTTP 监听已启动 (POST /hook/:token)");
     let http_task = tokio::spawn(async move {
         if let Err(err) = axum::serve(http_listener, webhook::router(state)).await {
             tracing::error!(error = %err, "webhook HTTP 服务退出");

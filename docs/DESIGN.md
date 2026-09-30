@@ -876,7 +876,7 @@ volume 上。Docker 只在容器**自己退出**时（`--rm`）回收匿名 volu
 
 ### 具体覆盖
 
-- RPC 测试用 `env!("CARGO_BIN_EXE_flow-server")` 真起进程，
+- RPC 测试用 `env!("CARGO_BIN_EXE_flow-server")`（flow-rpc 自己的 bin）真起进程，
   `child.kill()`(SIGKILL) + 同 data_dir 重启证明恢复；
   就绪用 TCP connect 轮询，重启换新端口避免 EADDRINUSE；
 - http_call 卡住用「本地 TcpListener 接受连接后持有不响应」；
@@ -937,8 +937,10 @@ volume 上。Docker 只在容器**自己退出**时（`--rm`）回收匿名 volu
   没有可用 Postgres 时 `cargo test` 仍必须全绿；
 - **backend-e2e（`crates/backend-e2e`）**：后端契约的完整端到端矩阵。每个用例
   对 SQLite（独占临时目录 `flow.db`）与 Postgres 两个后端各跑一遍，钉死
-  「两臂同契约」；真起 `flow-server` 进程（`CARGO_BIN_EXE_flow-server`，含
-  SIGKILL 崩溃恢复与重启），HTTP stub 全部本地 TcpListener（确定性，不依赖
+  「两臂同契约」；真起被测服务进程（`CARGO_BIN_EXE_flow-server-e2e`——本 crate
+  自己的 `flow-server-e2e` 薄壳，与 flow-rpc 的 `flow-server` 是同一份
+  `run_from_env` 实现，只是改名以免两个 bin 写同一个 `target/debug/flow-server`；
+  含 SIGKILL 崩溃恢复与重启），HTTP stub 全部本地 TcpListener（确定性，不依赖
   外部网络）。容器与测试库由 `flow-test-support::pg` 用 docker CLI 自管
   （`postgres:16-alpine`，随机端口，label `com.flow.e2e=1`）：进程退出
   （atexit）与下次启动（按 label 清扫容器、按 `e2e_%` 前缀清扫测试库）双层

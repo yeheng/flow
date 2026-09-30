@@ -14,7 +14,7 @@
 //! PG 那套），各二进制只用到其中一部分辅助函数。
 #![allow(dead_code)]
 
-pub use flow_test_support::io::{free_port, wait_ready};
+pub use flow_test_support::io::spawn_reporting_ports;
 
 use std::net::SocketAddr;
 use std::process::{Child, Command, Stdio};
@@ -42,27 +42,28 @@ impl ServerProc {
     /// 目录，所有权留在 proc 身上会把目录在重启前删掉。
     pub fn spawn_sqlite(data_dir: std::path::PathBuf) -> ServerProc {
         let db = data_dir.join("flow.db");
-        let addr = SocketAddr::from(([127, 0, 0, 1], free_port()));
-        // flow-server 还会绑 webhook HTTP 端口；多进程并发测试必须各占一个
-        let http_addr = SocketAddr::from(([127, 0, 0, 1], free_port()));
-        let child = Command::new(env!("CARGO_BIN_EXE_flow-server"))
-            .env("FLOW_DATA_DIR", &data_dir)
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_flow-server"));
+        cmd.env("FLOW_DATA_DIR", &data_dir)
             .env("FLOW_DB", &db)
-            .env("FLOW_ADDR", addr.to_string())
-            .env("FLOW_HTTP_ADDR", http_addr.to_string())
             .env("RUST_LOG", "info")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("启动 flow-server 失败");
-        let proc = ServerProc {
+            .stderr(Stdio::inherit());
+        // 端口由被测进程自己向内核要（FLOW_ADDR/FLOW_HTTP_ADDR=127.0.0.1:0），
+        // 实际端口从它的启动日志读回：父进程「挑端口再让子进程绑」存在 TOCTOU，
+        // 并行用例会抢走端口（CI 多核上会真发生），子进程随即 AddrInUse 退出。
+        let (child, ports) = spawn_reporting_ports(
+            &mut cmd,
+            "FLOW_ADDR",
+            "FLOW_HTTP_ADDR",
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        ServerProc {
             child,
-            addr,
-            http_addr,
-        };
-        wait_ready("flow-server", proc.addr);
-        proc
+            addr: ports.rpc,
+            http_addr: ports.http,
+        }
     }
 
     /// Postgres 后端：`role` 为 all / gateway / executor。时间参数全部压到最快，
@@ -79,14 +80,10 @@ impl ServerProc {
         signal_wait_ms: u64,
         extra_env: &[(&str, &str)],
     ) -> Self {
-        let addr = SocketAddr::from(([127, 0, 0, 1], free_port()));
-        let http_addr = SocketAddr::from(([127, 0, 0, 1], free_port()));
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_flow-server"));
         cmd.env("FLOW_BACKEND", "postgres")
             .env("FLOW_DATABASE_URL", url)
             .env("FLOW_ROLE", role)
-            .env("FLOW_ADDR", addr.to_string())
-            .env("FLOW_HTTP_ADDR", http_addr.to_string())
             .env("FLOW_LEASE_TTL_MS", "1500")
             .env("FLOW_SCAN_INTERVAL_MS", "50")
             .env("FLOW_INBOX_POLL_MS", "50")
@@ -99,14 +96,18 @@ impl ServerProc {
         for (key, value) in extra_env {
             cmd.env(key, value);
         }
-        let child = cmd.spawn().expect("启动 flow-server (postgres) 失败");
-        let proc = ServerProc {
+        let (child, ports) = spawn_reporting_ports(
+            &mut cmd,
+            "FLOW_ADDR",
+            "FLOW_HTTP_ADDR",
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        ServerProc {
             child,
-            addr,
-            http_addr,
-        };
-        wait_ready("flow-server", proc.addr);
-        proc
+            addr: ports.rpc,
+            http_addr: ports.http,
+        }
     }
 
     pub fn addr(&self) -> SocketAddr {

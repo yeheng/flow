@@ -102,9 +102,22 @@ async fn identity_mismatch_run_is_isolated_and_not_rescanned() {
         async move { b.run_executor().await }
     });
     wait_until(
-        "隔离为 awaiting_resume",
+        "隔离为 awaiting_resume 且租约已释放",
         Duration::from_secs(10),
-        || async { run_status(&pool, &run_id).await == "awaiting_resume" },
+        || async {
+            let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = $1")
+                .bind(&run_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            let owner: Option<String> =
+                sqlx::query_scalar("SELECT lease_owner FROM runs WHERE id = $1")
+                    .bind(&run_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            status == "awaiting_resume" && owner.is_none()
+        },
     )
     .await;
 
@@ -115,6 +128,8 @@ async fn identity_mismatch_run_is_isolated_and_not_rescanned() {
             .await
             .unwrap()
     };
+    // 隔离已是单事务提交（status + 清租约一起），这里再读一次是断言不是等待：
+    // 「status 变了但租约还在」这个中间态不该存在，若它存在上面的等待超时。
     let lease_owner: Option<String> =
         sqlx::query_scalar("SELECT lease_owner FROM runs WHERE id = $1")
             .bind(&run_id)

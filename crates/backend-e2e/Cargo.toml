@@ -37,14 +37,18 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 # 被测二进制：与 flow-rpc 的 flow-server 同源（同一份 serve/scheduler/webhook），
-# 这里包一层薄 main，让本 crate 的集成测试能用 env!("CARGO_BIN_EXE_flow-server")
+# 这里包一层薄 main，让本 crate 的集成测试能用 env!("CARGO_BIN_EXE_flow-server-e2e")
 # 定位到「本 crate 自己构建的」服务进程，不依赖外部 target 目录布局。
+#
+# 名字必须与 flow-rpc 的 flow-server 不同：同名会写同一个 target/debug/flow-server，
+# cargo 报 output filename collision，谁覆盖谁取决于构建顺序——e2e 于是可能
+# 静默跑在 flow-rpc 的产物上。
 #
 # 测试基建（docker 容器 / 独占测试库 / TempDir / 端口等待）在 flow-test-support：
 # 与 flow-pg、flow-rpc 的测试同指一份，单点维护。publish = false，不进产品二进制。
 [[bin]]
-name = "flow-server"
-path = "src/bin/flow-server.rs"
+name = "flow-server-e2e"
+path = "src/bin/flow-server-e2e.rs"
 
 [dev-dependencies]
 sha2 = { workspace = true }

@@ -4,8 +4,10 @@
 //! - `common`：公共 harness（被测服务进程、RPC 客户端、fixtures）；
 //! - `docker` / 测试库：来自 [`flow_test_support::pg`]（容器 + 每用例独占库
 //!   + 孤儿 volume 回收），与 flow-pg / flow-rpc 的测试同指一份；
-//! - `src/bin/flow-server.rs`：被测服务进程（与 flow-rpc 的 bin 等价，
-//!   让本 crate 的测试能用 `CARGO_BIN_EXE_flow-server` 定位）；
+//! - `src/bin/flow-server-e2e.rs`：被测服务进程（与 flow-rpc 的 `flow-server`
+//!   是同一份实现，只是包了一层壳并改名，避免与产品 bin 同名撞
+//!   `target/debug/flow-server`），让本 crate 的测试能用
+//!   `CARGO_BIN_EXE_flow-server-e2e` 定位；
 //! - `tests/*.rs`：用例，用 [`e2e_test!`] 生成的用例对 SQLite / Postgres
 //!   两个后端各跑一遍，钉死「两个后端同一套契约」。
 //!
@@ -24,7 +26,7 @@ macro_rules! e2e_test {
             async fn sqlite() {
                 $crate::common::run_case(
                     $crate::common::Kind::Sqlite,
-                    env!("CARGO_BIN_EXE_flow-server"),
+                    env!("CARGO_BIN_EXE_flow-server-e2e"),
                     $body,
                 )
                 .await;
@@ -34,7 +36,7 @@ macro_rules! e2e_test {
             async fn postgres() {
                 $crate::common::run_case(
                     $crate::common::Kind::Postgres,
-                    env!("CARGO_BIN_EXE_flow-server"),
+                    env!("CARGO_BIN_EXE_flow-server-e2e"),
                     $body,
                 )
                 .await;
