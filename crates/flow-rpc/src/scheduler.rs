@@ -89,12 +89,33 @@ async fn fire_one(
             );
             Ok(true)
         }
-        // 配置类失败：本次跳过（火已入账，不重试不追补）
+        // 配置类失败：本次跳过（火已入账，不重试不追补）——重试也不会变好，
+        // 下一分钟的触发点是新行，与本行无关。
         Err(err @ (BackendError::Invalid(_) | BackendError::WorkflowNotFound(_))) => {
             tracing::warn!(schedule_id = %schedule.id, error = %err, "schedule 指向的 workflow 不可执行，本次跳过");
             Ok(false)
         }
-        Err(err) => Err(err),
+        // 瞬时故障（磁盘满 / DB 不可达 / 锁超时）：**撤销去重行**，让下一个
+        // tick 重试同一个触发点。否则这一分钟的火永久丢失——去重键含 fire_at，
+        // 下一轮算的是新一分钟的键，与本行无关，注释里「不追补」的设计决策
+        // 本意是「不追补停机期间错过的点」，不是「静默吞掉一次磁盘错误」。
+        Err(err) => {
+            if let Err(revoke_err) = backend.delete_fire(&schedule.id, fire_at).await {
+                // 撤销也失败：只能等运维介入，记 error 而不是 warn
+                tracing::error!(
+                    schedule_id = %schedule.id,
+                    error = %revoke_err,
+                    "触发失败且撤销去重行失败，本次触发点将丢失"
+                );
+            } else {
+                tracing::warn!(
+                    schedule_id = %schedule.id,
+                    error = %err,
+                    "触发 run 遇瞬时故障，已撤销去重，下个 tick 重试"
+                );
+            }
+            Err(err)
+        }
     }
 }
 

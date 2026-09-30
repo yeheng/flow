@@ -421,9 +421,26 @@ impl Engine {
     /// 占位后要么交给 spawn_driver（移交清理责任），要么随 RunReservation drop 自动释放。
     fn reserve_run(&self, run_id: &str) -> Result<RunReservation<'_>, EngineError> {
         let mut registry = self.registry.lock();
-        if registry.contains_key(run_id) {
+        // 「已占用」= 有注册位**且**它还没退出，与 [`Self::is_live`] 用同一条判据。
+        //
+        // 为什么要一致：清理任务分两步（先置 `exited` 再摘 key），两步之间
+        // `is_live` 已报 false 而 `contains_key` 仍为真。若这里只看 `contains_key`，
+        // `resume_run` 会在该窗口把恢复判成 `RunExists` 并**无声当作已恢复**返回
+        // （`Err(RunExists) => Ok(Resumed)`），run 再无 Driver 驱动。
+        //
+        // 实测（`probe_window`）：driver 任务与其清理任务是背靠背被调度的，该窗口
+        // 窄到单步内闭合，构造不出可观测的假恢复——所以这是**潜在**不一致，不是
+        // 已知在线故障。修它的理由是「两个函数对『活着』不该有不同答案」这条不变量，
+        // 以及 `RunExists => Resumed` 那条静默映射在别处也没有出口。
+        if registry
+            .get(run_id)
+            .is_some_and(|h| !h.exited.load(Ordering::Acquire))
+        {
             return Err(EngineError::RunExists(run_id.to_string()));
         }
+        // 上一任已退出但注册位尚未摘除：就地覆盖。清理任务摘除前会核对
+        // `Arc::ptr_eq(&h.exited, &exited)`，认得出这不是自己的注册位，
+        // 不会误删新 Driver 的活跃凭据。
         let (signal_tx, signal_rx) = mpsc::channel(SIGNAL_CHANNEL_CAPACITY);
         let cancel = CancellationToken::new();
         let exited = Arc::new(AtomicBool::new(false));
@@ -482,13 +499,26 @@ impl Engine {
         reservation.disarm();
         let registry = self.registry.clone();
         let run_id = spec.run_id.clone();
-        let exited = registry.lock().get(&run_id).map(|h| h.exited.clone());
+        // 身份令牌：本次占位的 exited Arc。清理时据此确认「注册位里那个
+        // exited 还是我留下的这个」才摘除——若已被新一轮 reserve_run 覆盖，
+        // 旧任务不得摘掉新 Driver 的注册位（那是另一个 run 的活跃凭据）。
+        let exited = registry
+            .lock()
+            .get(&run_id)
+            .map(|h| h.exited.clone())
+            .expect("reservation.disarm 前注册位必在");
         tokio::spawn(async move {
             let _ = handle.await;
-            if let Some(exited) = exited {
-                exited.store(true, Ordering::Release);
+            // 先置墓碑再摘除：is_live / reserve_run 都以 exited 为准，
+            // 两步之间它们对「活着的 run」给出一致答案。
+            exited.store(true, Ordering::Release);
+            let mut map = registry.lock();
+            if map
+                .get(&run_id)
+                .is_some_and(|h| Arc::ptr_eq(&h.exited, &exited))
+            {
+                map.remove(&run_id);
             }
-            registry.lock().remove(&run_id);
         });
     }
 }

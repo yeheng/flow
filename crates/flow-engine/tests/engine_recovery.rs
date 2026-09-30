@@ -210,7 +210,7 @@ async fn restarted_pure_node_is_replayed_with_new_attempt() {
     let state = h.wait_terminal(&run_id).await;
     assert_eq!(state.phase, RunPhase::Succeeded, "{}", describe(&state));
     assert_eq!(
-        state.record("n2").attempts,
+        state.record("n2").attempts(),
         2,
         "残留的纯节点应以 attempt 2 重放"
     );
@@ -765,4 +765,81 @@ async fn node_logs_and_input_snapshot_land_in_event_stream() {
         state.record("s").state,
         NodeState::Completed { .. }
     ));
+}
+
+/// 契约：日志已终结的 run 恢复时必须回 `AlreadyTerminal`，绝不回 `Resumed`。
+///
+/// `resume_run` 里有一条静默映射 `Err(RunExists) => Ok(Resumed)`（「已有人在驱动」
+/// 的正常情形），它意味着**谎报「正在驱动」不会有任何日志痕迹**。本测试钉住
+/// 正常路径下这个谎报不会发生：run 跑完 → resume → 如实报终态。
+///
+/// 注意：这不是 `reserve_run` 清理窗口的回归测试——该窗口实测窄到不可观测
+/// （见 `Engine::reserve_run` 注释），构造不出失败用例；这里守的是契约本身。
+#[tokio::test]
+async fn resume_after_terminal_run_reports_terminal_not_fake_resumed() {
+    let h = Harness::new();
+    let run_id = Harness::run_id();
+    let def = def_from(json!({
+        "nodes": [
+            {"id": "n1", "type": "start"},
+            {"id": "wait", "type": "delay", "params": {"ms": 20}},
+            {"id": "n4", "type": "end"}
+        ],
+        "edges": [
+            {"from": "n1", "to": "wait"},
+            {"from": "wait", "to": "n4"}
+        ]
+    }));
+    let make_spec = || StartRun {
+        run_id: run_id.clone(),
+        workflow_id: "w1".into(),
+        workflow_version: 1,
+        definition: def.clone(),
+        input: json!({}),
+        depth: 0,
+    };
+
+    h.engine.start_run(make_spec()).await.unwrap();
+    let state = h.wait_terminal(&run_id).await;
+    assert_eq!(state.phase, RunPhase::Succeeded, "{}", describe(&state));
+    h.wait_not_live(&run_id).await;
+
+    // 日志已终结：resume 必须据事件日志回 AlreadyTerminal，绝不谎称 Resumed
+    //（谎称 = 告诉调用方「正在驱动」而实际没有 Driver）。
+    let outcome = h.engine.resume_run(make_spec()).await.unwrap();
+    assert!(
+        matches!(outcome, ResumeOutcome::AlreadyTerminal(_)),
+        "日志已终结的 run 恢复时必须回 AlreadyTerminal，实际：{outcome:?}"
+    );
+}
+
+/// 契约：run 终态且 Driver 退出后，重复恢复是幂等无操作，不报错、不重复执行、
+/// 不产生第二条终态事件。
+#[tokio::test]
+async fn repeated_resume_after_terminal_is_idempotent() {
+    let h = Harness::new();
+    let run_id = Harness::run_id();
+    let def = def_from(json!({
+        "nodes": [
+            {"id": "n1", "type": "start"},
+            {"id": "n4", "type": "end"}
+        ],
+        "edges": [{"from": "n1", "to": "n4"}]
+    }));
+    let spec = || StartRun {
+        run_id: run_id.clone(),
+        workflow_id: "w1".into(),
+        workflow_version: 1,
+        definition: def.clone(),
+        input: json!({}),
+        depth: 0,
+    };
+
+    h.engine.start_run(spec()).await.unwrap();
+    h.wait_terminal(&run_id).await;
+    h.wait_not_live(&run_id).await;
+
+    // 不得因「注册位尚未摘除」而被拒成 RunExists（那会被 resume_run 吞成假 Resumed）。
+    let outcome = h.engine.resume_run(spec()).await.unwrap();
+    assert!(matches!(outcome, ResumeOutcome::AlreadyTerminal(_)));
 }

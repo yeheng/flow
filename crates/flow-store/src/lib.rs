@@ -562,6 +562,21 @@ impl Store {
         Ok(affected == 1)
     }
 
+    /// 撤销一次触发去重：调度器拿到触发权但 `create_run` 遇**瞬时**故障时调用，
+    /// 让下一个 tick 能重试同一触发点（否则该分钟的火永久丢失，见
+    /// flow-rpc::scheduler::fire_one）。
+    ///
+    /// 只删自己刚插入的那一行——去重键含 `fire_at`，别的 tick / 别的节点持有的
+    /// 触发权不受影响。行不存在返回 Ok（幂等：可能已被并发清理）。
+    pub async fn delete_fire(&self, schedule_id: &str, fire_at: &str) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM schedule_fires WHERE schedule_id = ? AND fire_at = ?")
+            .bind(schedule_id)
+            .bind(fire_at)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn create_webhook(&self, workflow_id: &str) -> Result<Webhook, StoreError> {
         let exists = sqlx::query("SELECT 1 FROM workflows WHERE id = ?")
             .bind(workflow_id)

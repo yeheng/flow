@@ -371,6 +371,21 @@ impl PgStore {
         Ok(affected == 1)
     }
 
+    /// 撤销一次触发去重（调度器 `create_run` 遇瞬时故障时调用，让下个 tick 重试）。
+    /// 去重键含 fire_at，只删自己刚插入的那一行；不存在返回 Ok（幂等）。
+    pub async fn delete_fire(
+        &self,
+        schedule_id: &str,
+        fire_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), PgError> {
+        sqlx::query("DELETE FROM schedule_fires WHERE schedule_id = $1 AND fire_at = $2")
+            .bind(schedule_id)
+            .bind(fire_at)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn create_webhook(&self, workflow_id: &str) -> Result<Webhook, PgError> {
         let exists: Option<String> = sqlx::query_scalar("SELECT id FROM workflows WHERE id = $1")
             .bind(workflow_id)

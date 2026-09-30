@@ -105,3 +105,95 @@ async fn workflow_without_published_version_is_skipped() {
     fire_due(&f.backend, Local::now()).await;
     assert_eq!(f.run_count(&wf).await, 0);
 }
+
+/// 撤销去重行后，同一触发点可被重新取得——这是 `create_run` 遇瞬时故障时
+/// 不丢火的机制（`fire_one` 的 Err 分支）。撤销前重复 tick 拿不到触发权，
+/// 撤销后拿得到。
+#[tokio::test]
+async fn revoked_fire_can_be_reclaimed_within_the_same_minute() {
+    let f = Fixture::new().await;
+    let wf = f.workflow(true).await;
+    let schedule = f
+        .backend
+        .create_schedule(&wf, "* * * * *", None, true)
+        .await
+        .unwrap();
+
+    // 与 fire_one 相同的触发点计算：最近一次 <= now 的整分点
+    let now = Local::now();
+    let fire_at = CronSchedule::parse(&schedule.cron_expr)
+        .unwrap()
+        .previous_before(&(now + chrono::Duration::seconds(1)))
+        .unwrap()
+        .with_timezone(&Utc);
+
+    // 首次拿到触发权
+    assert!(f
+        .backend
+        .try_insert_fire(&schedule.id, fire_at)
+        .await
+        .unwrap());
+    // 未撤销时拿不到（这正是重复 tick 被去重挡住的机制）
+    assert!(!f
+        .backend
+        .try_insert_fire(&schedule.id, fire_at)
+        .await
+        .unwrap());
+
+    // 撤销后可再次取得 —— 瞬时故障重试依赖这条
+    f.backend.delete_fire(&schedule.id, fire_at).await.unwrap();
+    assert!(
+        f.backend
+            .try_insert_fire(&schedule.id, fire_at)
+            .await
+            .unwrap(),
+        "撤销去重行后应能重新取得触发权，否则该分钟的火永久丢失"
+    );
+
+    // 幂等：撤销不存在的行不报错
+    f.backend.delete_fire(&schedule.id, fire_at).await.unwrap();
+    f.backend.delete_fire(&schedule.id, fire_at).await.unwrap();
+}
+
+/// 去重行只影响自己那个触发点：撤销 A 不得让 B 的触发权失效。
+#[tokio::test]
+async fn revoking_one_fire_leaves_other_minutes_untouched() {
+    let f = Fixture::new().await;
+    let wf = f.workflow(true).await;
+    let schedule = f
+        .backend
+        .create_schedule(&wf, "* * * * *", None, true)
+        .await
+        .unwrap();
+
+    let base = Utc::now();
+    let first = base;
+    let second = base + chrono::Duration::minutes(1);
+    assert!(f
+        .backend
+        .try_insert_fire(&schedule.id, first)
+        .await
+        .unwrap());
+    assert!(f
+        .backend
+        .try_insert_fire(&schedule.id, second)
+        .await
+        .unwrap());
+
+    f.backend.delete_fire(&schedule.id, first).await.unwrap();
+
+    assert!(
+        f.backend
+            .try_insert_fire(&schedule.id, first)
+            .await
+            .unwrap(),
+        "被撤销的那个应可重取"
+    );
+    assert!(
+        !f.backend
+            .try_insert_fire(&schedule.id, second)
+            .await
+            .unwrap(),
+        "未撤销的那一分钟不得被重取（否则会重复触发）"
+    );
+}

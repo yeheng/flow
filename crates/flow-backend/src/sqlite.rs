@@ -284,6 +284,19 @@ impl SqliteBackend {
             .map_err(sqlite_err)
     }
 
+    /// 撤销一次触发去重（sqlite 臂的 fire_at 列是 TEXT，同一 RFC3339 秒精度键）。
+    pub async fn delete_fire(
+        &self,
+        schedule_id: &str,
+        fire_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), BackendError> {
+        let key = fire_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.store
+            .delete_fire(schedule_id, &key)
+            .await
+            .map_err(sqlite_err)
+    }
+
     pub async fn create_webhook(&self, workflow_id: &str) -> Result<Webhook, BackendError> {
         self.store
             .create_webhook(workflow_id)

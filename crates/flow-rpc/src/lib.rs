@@ -752,13 +752,15 @@ pub(crate) fn timeline_value(
                 "name": node.name,
                 "type": node.node_type,
                 "state": record.state.label(),
-                "attempts": record.attempts,
+                // attempts / error 从 state 派生（NodeRecord 不存副本，见
+                // NodeState::attempt / ::error）——wire 形状逐字不变。
+                "attempts": record.state.attempt(),
                 "started_at": record.started_at,
                 "ended_at": record.ended_at,
                 "duration_ms": record.duration_ms,
                 "input": record.input,
                 "output": output,
-                "error": record.error,
+                "error": record.state.error(),
                 "child_run_id": record.child_run_id,
             });
             if let NodeState::Skipped { reason } = &record.state {

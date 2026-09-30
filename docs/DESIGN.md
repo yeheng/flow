@@ -161,8 +161,8 @@ elements ... WITH ORDINALITY` 整批插入 + 一次 NOTIFY），逐条则是 N �
 
 ```
 Event 流 ──fold──> RunState {
-    records: HashMap<node_id, NodeRecord{state, attempts, started_at, ended_at,
-                                          duration_ms, output, error, last_signal,
+    records: HashMap<node_id, NodeRecord{state, started_at, ended_at,
+                                          duration_ms, last_signal,
                                           child_run_id, input}>,
     outputs: HashMap<node_id, Value>,     // 唯一所有者：Driver 直接读它
     phase: Running | Succeeded | Failed | Cancelled,
@@ -171,9 +171,18 @@ Event 流 ──fold──> RunState {
 }
 ```
 
-节点状态机：`Pending → Running{attempt} → Completed | Failed{retryable} | Skipped{reason}`。
+节点状态机：`Pending → Running{attempt} → Completed | Failed{attempt,error,retryable} | Skipped{reason}`。
 `Failed{retryable:true}` 是等待重试的**非终态**，时间线标签为 `retrying`；
 保留事件及 NodeState 序列化格式，旧日志无需迁移。
+
+**`NodeState` 是节点状态的唯一来源**（§12.5）：已尝试次数与失败原因都**从状态派生**
+（`NodeState::attempt()` / `::error()`），`NodeRecord` 不再存副本。三者——输出
+（`RunState::outputs`）、attempt、error——曾经各有一份影子字段，代价是每个事件
+分支都要手工同步：`output` 副本让 `NodeFailed`/`NodeSkipped` 漏清一处（靠
+「`NodeStarted` 必然先清」侥幸不出错），`error` 副本连 `NodeSkipped` 都没覆盖。
+派生后展示值与状态不可能分叉。`run.timeline` 的 wire 形状（`attempts` / `error`
+字段）逐字不变，只是取值改为从 `state` 取。
+
 关键转移：
 
 - `node_started` **清除旧 output**（重试/重放不留脏数据），同时记下最新一次
@@ -183,7 +192,8 @@ Event 流 ──fold──> RunState {
 - `node_completed` 写入 `outputs`；
 - `node_failed(retryable=false)` 在 fold 中记录首个 `fatal_error`，Driver 无独立失败缓存；
 - `signal_received` 只记 `last_signal`（崩溃可能落在它与终态之间，恢复时消费它）；
-- 终态事件携带的 `attempt` 与 `records.attempts` 取 max，重试计数不丢。
+- attempt 号只存在于状态里：它从 1 起、每次 +1，且 `handle_result` 丢弃非当前
+  attempt 的迟到结果，所以「状态里的 attempt」恒等于「已尝试次数」，无需 max 累积。
 
 ## 5. 定义模型与校验
 
@@ -223,8 +233,16 @@ Event 流 ──fold──> RunState {
 2. 恰好一个 `start`，至少一个 `end`；
 3. start 无入边，end 无出边，其余节点必须有入边（否则永不触发）；
 4. 边端点存在、无自环、无重复边；**condition 出边必须带 `true`/`false` 端口，
-   其余节点出边不得带端口**；
+   其余节点出边不得带端口**；**同一 condition 的多个端口不得指向同一节点**
+   （见下）；
 5. 拓扑必须是 DAG，且所有节点从 start 可达（防死代码）。
+
+**为什么 condition 多端口不能指同一节点**：AND-join 语义（§6.2）下，未被选中的
+那条出边判为 Unsatisfied，会把**整个**目标节点跳过——于是「走 true 分支」反而把
+true 分支的下游跳掉，run 仍记 `succeeded`、输出为 null，全程无任何错误。这是错误
+建模而非分支合流（真要合流应指向不同节点，或引入显式 join 策略），建图期拒掉。
+实测：修复前 `s → c(condition=true) → e` 配 `c(true)→e` + `c(false)→e` 时，
+condition 求值为真而 `e` 被 `branch_not_taken` 跳过。
 
 **密钥参数（x-secret）**：params_schema 里标 `x-secret` 的参数（llm / email 的
 `api_key`）在定义里只存**名称**，真值执行前从 `FLOW_SECRET_<名称>` 环境变量注入
@@ -245,7 +263,7 @@ loop {
         plan() → (ready, skips)
         skips 逐个 append(node_skipped)      // 跳过沿下游传播
         ready 逐个 start_node()               // 展开 params + 输入快照 → node_started + 派发执行
-    if inflight、human_waiting、adjudicating 全空：
+    if slots 为空：
         all_terminal → finalize（RunCompleted/RunFailed）
         否则 → 错误「调度停滞」（图正确性由 validate 兜底，此错误意味着语义 bug）
     select! { cancel → abort_inflight + RunCancelled;
@@ -254,13 +272,43 @@ loop {
 }
 ```
 
+**节点级执行状态机（`NodeSlot`）**：`slots: HashMap<node_id, NodeSlot>` 是 Driver
+唯一的在途工作账本，键集 =「有在途任务或未决外部输入的节点」。三种槽位：
+
+| 槽位 | 含义 | 持句柄 | 由谁推进 |
+|---|---|---|---|
+| `Running` | 节点执行中，或退避计时器在飞 | 是 | `result_rx` 的 `Done` / `RetryDue` |
+| `AwaitSignal` | human_task 已落 `node_started`，挂 oneshot 等 `run.signal` | 是（等 oneshot 的任务） | `run.signal` 交付后回传 `Done` |
+| `Adjudicating` | 崩溃/接管残留的副作用节点，等人工裁决 | **否** | `run.signal` 裁决（不经 `result_rx`） |
+
+转移表（`∅` = 不在 slots 里）：
+
+| 起始 | 事件 | 终止 |
+|---|---|---|
+| `∅` | 派发（就绪 / 重试 / 裁决 retry） | `Running` |
+| `∅` | human_task 就绪 | `AwaitSignal` |
+| `∅` | 接管残留副作用节点 | `Adjudicating` |
+| `Running` | `Done`（attempt 归属校验通过） | `∅` |
+| `Running` | `RetryDue` | `∅` → 随即 `Running` |
+| `AwaitSignal` | `run.signal` 交付 | `Running` |
+| `Adjudicating` | 裁决 `retry` | `Running` |
+| `Adjudicating` | 裁决 `succeeded` / `failed` | `∅` |
+| 任意 | 取消 / 停机 / 失去所有权 / Driver 退出 | `∅`（`abort_inflight` 全部 abort） |
+
 关键不变量（都有回归测试钉住）：
 
 - **跳过必须推进到不动点**：多级下游（delay→human_task→end）单轮只处理一层
   会被误判「调度停滞」。见 `skip_propagates_through_multiple_downstream_levels`。
-- **inflight 不变量**：inflight 里每个 handle 都还欠一条 `DriverMsg`。
-  human_task 的 oneshot 等待任务、重试退避计时器都必须计入，
-  否则终止判定提前触发。
+- **句柄不变量**：`Running` / `AwaitSignal` 各持恰好一个 `JoinHandle`，该 handle
+  恰好欠一条 `DriverMsg`——每个 `spawn` 紧跟一次 `slots.insert`，每条消息的消费
+  紧跟一次 `slots.remove`。human_task 的 oneshot 等待任务与重试退避计时器都必须
+  计入 slots，否则终止判定提前触发。
+- **`AwaitSignal → Running` 不是离开 slots**：交出 oneshot 后等待任务仍在飞、
+  仍欠那条 `Done`，只有消费 `Done` 时才真正转 `∅`。提前摘除会让「信号已交付、
+  结果未回传」的窗口被误判成可收尾。
+- **一个节点同时只占一个槽位**：human_task 节点的 oneshot 发送端与等待任务句柄
+  同处 `AwaitSignal`，由类型保证同步——旧实现把两者分放两个集合，靠约定维持
+  一致，漏清一处即提前收尾或永久挂死。
 
 **start_node**（节点执行的唯一入口：就绪派发、重试、人工裁决 retry、接管恢复
 重放都经它）在写 `node_started` 之前做三件事，做完才派发执行：
@@ -335,7 +383,7 @@ condition 节点输出为表达式结果经 JSON 序列化后的值；引擎用 
 
 这份分类 http_call / llm / email 共用同一套习惯（后者经 `post_json_bearer`）。
 
-退避计时器计入 inflight（不变量），到点后 `RetryDue` 重新派发，attempt+1。
+退避计时器占一个 `Running` 槽位（不变量），到点后 `RetryDue` 重新派发，attempt+1。
 下游在此期间等待。**恢复一律等满 `backoff_ms`**（不续算剩余时间）：事件 `ts`
 由写入者时钟决定（单机 = append 时的 `Utc::now()`，Postgres = 事务内
 `clock_timestamp()`），而调度进程的 `Utc::now()` 与之不同源，跨机器恢复时
@@ -349,7 +397,7 @@ condition 节点输出为表达式结果经 JSON 序列化后的值；引擎用 
 由 finalize 收尾。代价是注定失败的 run 会等最慢的无关分支跑完。
 节点失败后、run 终态前崩溃，恢复也必须保留该失败结论。
 
-**cancel**：abort 所有 inflight。对 in-flight 的 `http_call`，请求可能已发出、
+**cancel**：abort 所有在途槽位。对 in-flight 的 `http_call`，请求可能已发出、
 响应永远不读、run 记 `RunCancelled`——与 §7 的人工裁决是同类的副作用歧义，
 取消是用户主动选择，不做裁决。
 
@@ -436,7 +484,10 @@ Postgres `PgChildLauncher` 经 `lease::create_run` 单事务创建子 run、
 - seq 不连续 → 硬错误，人工介入；
 - 运行中基础设施故障（磁盘/数据库 IO、序列化、日志损坏）→ **不写 run_failed**，
   投影 `awaiting_resume` 挂起：平台故障不是工作流失败，SQLite 重启后恢复、
-  Postgres 由 executor 自动接管；只有工作流语义失败才写 run_failed 终态。
+  Postgres 由 executor 自动接管；只有工作流语义失败才写 run_failed 终态；
+- **引擎不变量被破坏**（`EngineError::Bug`，如调度停滞）→ 与平台故障同一条出口，
+  挂 `awaiting_resume` 而非写 `run_failed`：此时定义合法、引擎却推不动，写业务
+  终态会让运维照着没写错的工作流定义白查。错误信息自带卡住的节点与状态。
 
 初始化中断：`initializing` 行配有有效 `run_started` 时按上述分类恢复；日志缺失、
 空文件、首行残缺或损坏时将初始化标为 failed，保留文件与诊断，不执行节点。
@@ -552,6 +603,10 @@ run_started 未落盘」的初始化中断窗口，恢复已按 DB 投影标终�
   主键去重，多节点下谁先插入谁触发）再 `create_run`（当前 published 版本，
   输入取 schedule.input）。每个 tick 每个 schedule 最多补一次火——停机期间
   错过的触发点不追补；目标 workflow 没有 published 版本时本次跳过；
+  **`create_run` 遇瞬时故障（磁盘满 / DB 不可达）时撤销去重行**（`delete_fire`），
+  让下一个 tick 重试同一触发点——去重键含 `fire_at`，下一轮算的是新一分钟的键，
+  不撤销则这一分钟的火永久丢失。配置类失败（无 published 版本 / workflow 不存在）
+  不撤销：重试也不会变好。「不追补」只针对停机期间错过的点，不是静默吞掉磁盘错误；
 - **webhook HTTP 入口**：独立于 WebSocket 端口的 HTTP 服务，`FLOW_HTTP_ADDR`
   （默认 `127.0.0.1:9801`）。`POST /hook/<token>`：token 未知或已停用 → 404
   （不区分，避免探测）；body 须为 JSON（空 body 视为 null 输入），作为 input
@@ -703,12 +758,18 @@ body 为 `{from, to, subject, text}`（纯文本正文），输出 `{status, id}
 1. 执行状态由完整日志重建；初始化结果和日志缺失诊断按 §7 单独处理；
 2. 副作用之前必写 `node_started`；恢复还覆盖等待重试、信号消费与收尾窗口；
 3. `RunState::fold` 是唯一状态转移函数，恢复与时间线共用；
-4. 跳过必须推进到不动点；inflight 每个 handle 恰欠一条 DriverMsg；
-5. `state.outputs` 是节点输出的唯一所有者（`NodeRecord` 不存副本——此前两份
-   副本意味着 `NodeFailed`/`NodeSkipped` 漏清一处，靠「`NodeStarted` 必然先清」
-   侥幸不出错）；节点执行输入面
-    `nodes` 只暴露直接前驱的输出（重放决定论，见 §10）；
-6. 端口规则：condition 必须 true/false，其余必须无端口；
+4. 跳过必须推进到不动点；每个持句柄的 slot 恰欠一条 DriverMsg；
+   **节点级执行状态机只有一处**——`driver::NodeSlot` + `slots` map，终止判定
+   （`slots.is_empty()`）与 abort 清理（`abort_inflight`）同源；一个节点同时只
+   占一个槽位（§6.1）；
+5. **`NodeState` 是节点状态的唯一来源**（§4）：输出存 `state.outputs`、attempt
+   与 error 从 `state` 派生（`NodeState::attempt` / `::error`），三者都不在
+   `NodeRecord` 里另存副本——此前 `output`/`error`/`attempts` 各有一份影子字段，
+   每个事件分支都要手工同步，`error` 副本连 `NodeSkipped` 都没覆盖；节点执行
+   输入面 `nodes` 只暴露直接前驱的输出（重放决定论，见 §10）；
+6. 端口规则：condition 必须 true/false，其余必须无端口；**同一 condition 的
+   多个端口不得指向同一节点**（否则 AND-join 会把被选中分支的下游整个跳过，
+   §5 规则 4）；
 7. end/run 输出共用「单数透传、复数映射」规则（`singular_or_map`）；
 8. 状态词汇表单一来源：`DbRunStatus`，store 写入口校验——但
    `is_valid_str` 是与 enum **不联动**的手写字面量表，加枚举变体必须同步改它
@@ -719,15 +780,17 @@ body 为 `{from, to, subject, text}`（纯文本正文），输出 `{status, id}
     node_started 落盘；重放沿用已落盘 id 附着既有子 run，重试派生新 id。
 12. 父子 run 各有独立事件日志；嵌套深度上限 8，depth 经 run_started 持久化；
     子 run failed/cancelled 传导为父节点 fatal，取消级联是 best-effort。
-13. 平台故障（IO/Backend/日志损坏）与工作流失败分离：前者投影
+13. 平台故障（IO/Backend/日志损坏/引擎 Bug）与工作流失败分离：前者投影
     `awaiting_resume` 等待恢复/人工，只有工作流语义失败才写 run_failed 终态；
     所有权丢失（LeaseLost）则静默退出，三者互不冒充。
 14. 一个 run 至多一个活 Driver（engine registry 原子占位 reserve_run）：
     重复 start/resume 是无操作，绝不允许第二个写者——EventLog 各自计数 seq，
-    双写者必然产生重复 seq 与重复副作用。跨进程维度由 data_dir 排他 flock
-    强制（`SqliteBackend::open`，LOCK_NB 立即失败）：registry 管不住另一个
-    进程的启动恢复，flock 管；同进程二次 open（独立 fd）同样被拒，
-    flock 按 open file description 判定。
+    双写者必然产生重复 seq 与重复副作用。「活着的判据只有一条」：`reserve_run`
+    与 `is_live` 都以「注册位存在**且**未 exited」为准（清理任务分两步：先置
+    `exited` 再摘 key），两处不得对同一个 run 给出不同答案。跨进程维度由
+    data_dir 排他 flock 强制（`SqliteBackend::open`，LOCK_NB 立即失败）：
+    registry 管不住另一个进程的启动恢复，flock 管；同进程二次 open（独立 fd）
+    同样被拒，flock 按 open file description 判定。
 15. 节点 params 执行前统一 `${}` 展开（`exec::expand_params`），唯一例外是
     `NodeType::opaque_params`（用户 JS 字段）；展开数据面 = `input` +
     直接前驱输出快照，不扩大决定论边界。sub_workflow 的 `input_mapping`
@@ -804,7 +867,8 @@ volume 上。Docker 只在容器**自己退出**时（`--rm`）回收匿名 volu
   单点钉在 flow-backend 的 `resolve_runnable_definition` 测试；
 - JS 沙箱边界由行为测试钉住（§10），随每次 `cargo test` 重新验证；
 - 图校验规则由 `model.rs` 的表驱动单测逐条钉住（端口/环/不可达/参数必填/
-  模板参数放行与灰色形态拒绝），不为了一句「工作流存在环」起进程；
+  模板参数放行与灰色形态拒绝；condition 多端口指同一节点的拒绝见
+  `condition_ports_must_target_distinct_nodes`），不为了一句「工作流存在环」起进程；
 - `nodetypes.list` 响应由 `node_types_snapshot_is_stable` 快照测试钉住
   （descriptor 注册表收敛是纯重构，响应必须逐字节不变）；
 - `recovery_regressions.rs` 验证失败恢复、重试下游、剩余退避、非法/重复信号和裁决恢复；
@@ -815,7 +879,16 @@ volume 上。Docker 只在容器**自己退出**时（`--rm`）回收匿名 volu
 - `sub_workflow.rs` 验证子 run 输出透传、子失败 fatal、RunExists 附着、深度上限、
   取消级联，以及崩溃重放沿用同一 child_run_id；
 - `engine_recovery.rs` 钉住节点输入面语义：`nodes` 只暴露直接前驱输出，
-  非前驱引用深层访问即 fatal（`nodes_scope_*`）；
+  非前驱引用深层访问即 fatal（`nodes_scope_*`）；终态 run 的重复恢复幂等且如实
+  报 `AlreadyTerminal`（`resume_after_terminal_run_reports_terminal_not_fake_resumed`
+  / `repeated_resume_after_terminal_is_idempotent`）；
+- `driver::slot_tests` 钉住节点级执行状态机（§6.1）：三个变体各自都阻止终止、
+  `AwaitSignal → Running` 交付后仍在飞、只有 `Adjudicating` 无句柄、清理幂等；
+- `fold.rs` 的 `attempt_and_error_are_derived_from_state_on_every_path` 钉住
+  「attempt/error 从状态派生、无影子副本」（§12.5）——走一遍全部事件类型，
+  每步断言展示值与状态恒等；
+- 调度器触发去重的撤销语义由 `scheduler::tests` 钉住：撤销后同一分钟可重取
+  触发权、撤销不影响别的分钟、重复撤销幂等；
 - `child_await.rs` 钉住父 run 等待初始化中断子 run 不挂死（空日志 → DB 投影）；
 - 回归护栏：重复恢复不产生第二个写者（engine_recovery）、共享 data_dir 的第二个
   实例被排他 flock 拒绝且锁释放后可重开（flow-backend exclusive_lock）、平台故障挂起不写

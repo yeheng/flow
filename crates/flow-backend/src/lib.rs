@@ -299,6 +299,19 @@ impl AnyBackend {
         }
     }
 
+    /// 撤销一次触发去重：调度器已拿到触发权但 `create_run` 遇**瞬时**故障时调用，
+    /// 让下一个 tick 重试同一触发点。不撤销则该分钟的火永久丢失。
+    pub async fn delete_fire(
+        &self,
+        schedule_id: &str,
+        fire_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), BackendError> {
+        match self {
+            AnyBackend::Sqlite(b) => b.delete_fire(schedule_id, fire_at).await,
+            AnyBackend::Postgres(b) => b.delete_fire(schedule_id, fire_at).await,
+        }
+    }
+
     pub async fn create_webhook(&self, workflow_id: &str) -> Result<Webhook, BackendError> {
         match self {
             AnyBackend::Sqlite(b) => b.create_webhook(workflow_id).await,

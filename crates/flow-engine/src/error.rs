@@ -20,6 +20,12 @@ pub enum EngineError {
     Expr(String),
     #[error("节点错误：{0}")]
     Node(String),
+    /// 引擎自身的不变量被破坏（如调度停滞）。**不是工作流失败**：定义合法、
+    /// 引擎却推进不动，此时写 `run_failed` 会把引擎 bug 伪装成用户的业务终态，
+    /// 运维照着工作流定义查不出任何东西。挂 `awaiting_resume` 等恢复/重启，
+    /// 与平台故障同一条出口（DESIGN §7.2 的分类原则）。
+    #[error("引擎内部错误：{0}")]
+    Bug(String),
     #[error("事件日志损坏：{0}")]
     LogCorrupted(String),
     #[error("run 所有权已丢失（租约被其他实例接管）")]
@@ -37,7 +43,7 @@ impl EngineError {
 
     /// 基础设施故障（磁盘/数据库 IO、序列化、日志损坏）：不是工作流本身的失败，
     /// 不允许写成 run_failed 终态——run 挂起 awaiting_resume 等待恢复或人工介入
-    ///（DESIGN.md §7）。
+    ///（DESIGN §7）。
     pub fn is_platform_fault(&self) -> bool {
         matches!(
             self,
@@ -45,6 +51,7 @@ impl EngineError {
                 | EngineError::Json(_)
                 | EngineError::Backend(_)
                 | EngineError::LogCorrupted(_)
+                | EngineError::Bug(_)
         )
     }
 }
@@ -68,6 +75,8 @@ mod tests {
         // 工作流语义失败保持现有 run_failed 语义
         assert!(!EngineError::Node("调度停滞".into()).is_platform_fault());
         assert!(!EngineError::Expr("boom".into()).is_platform_fault());
+        // 引擎 bug 不是工作流失败：写 run_failed 会让运维误查工作流定义
+        assert!(EngineError::Bug("调度停滞".into()).is_platform_fault());
         // 所有权丢失走静默退出，不进故障分类
         assert!(!EngineError::LeaseLost.is_platform_fault());
     }

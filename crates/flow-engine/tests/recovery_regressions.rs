@@ -86,8 +86,8 @@ async fn successful_retry_runs_downstream_once_with_and_without_backoff() {
         let state = terminal(&h.engine, "r").await;
         server.await.unwrap();
         assert_eq!(state.phase, RunPhase::Succeeded);
-        assert_eq!(state.record("n").attempts, 2);
-        assert_eq!(state.record("e").attempts, 1);
+        assert_eq!(state.record("n").attempts(), 2);
+        assert_eq!(state.record("e").attempts(), 1);
         assert_eq!(state.output.unwrap()["status"], 200);
         assert!(!h
             .engine
@@ -129,7 +129,7 @@ async fn recovery_restores_retry_timer_and_waits_full_backoff() {
         let state = terminal(&h.engine, "r").await;
         server.await.unwrap();
         assert_eq!(state.phase, RunPhase::Succeeded);
-        assert_eq!(state.record("n").attempts, 2);
+        assert_eq!(state.record("n").attempts(), 2);
         assert_eq!(state.output.unwrap()["status"], 200);
     }
 }
@@ -245,7 +245,7 @@ async fn durable_adjudication_is_consumed_on_recovery() {
             }
         );
         assert_eq!(
-            state.record("n").attempts,
+            state.record("n").attempts(),
             if action == "retry" { 2 } else { 1 }
         );
         let events = h.engine.read_events("r", None).await.unwrap();

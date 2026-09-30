@@ -56,21 +56,54 @@ impl NodeState {
             NodeState::Skipped { .. } => "skipped",
         }
     }
+
+    /// 已尝试次数（= 当前状态携带的 attempt）。
+    ///
+    /// **为什么是派生而非存储**：attempt 号只存在于状态里，此前 `NodeRecord.attempts`
+    /// 是它的影子副本，三个事件分支各写一行 `rec.attempts().max(attempt)` 手工同步。
+    /// `Pending` / `Skipped` 从未启动过，计数为 0。
+    ///
+    /// 不变量：attempt 从 1 起、每次 +1（`next_attempt`），且 `handle_result` 会
+    /// 丢弃非当前 attempt 的迟到结果，所以「状态里的 attempt」与「已尝试次数」
+    /// 在所有可达路径上恒等——影子副本没有提供额外保证，只提供了漏同步的机会。
+    pub fn attempt(&self) -> u32 {
+        match self {
+            NodeState::Running { attempt }
+            | NodeState::Completed { attempt }
+            | NodeState::Failed { attempt, .. } => *attempt,
+            NodeState::Pending | NodeState::Skipped { .. } => 0,
+        }
+    }
+
+    /// 失败原因（仅 `Failed` 携带；其余状态无错）。
+    ///
+    /// 派生同 [`Self::attempt`]：此前 `NodeRecord.error` 与
+    /// `NodeState::Failed.error` 各存一份，靠三个分支手工同步——而 `NodeSkipped`
+    /// 分支根本没清它，正是影子字段典型的漏网之处。
+    pub fn error(&self) -> Option<&str> {
+        match self {
+            NodeState::Failed { error, .. } => Some(error),
+            _ => None,
+        }
+    }
 }
 
 /// 时间线视图：折叠事件得到的单节点记录。
 ///
-/// 节点输出**不在这里**：唯一所有者是 [`RunState::outputs`]（DESIGN §12.5）。
-/// 需要节点输出的人从 `state.outputs.get(node_id)` 读——存两份就等于多一份
-/// 要手工同步的影子。
+/// **唯一状态来源是 [`NodeState`]。** attempt / error / 输出都不在这里另存一份：
+/// - 已尝试次数 → [`NodeState::attempt`]（时间线要展示时取，不存副本）；
+/// - 失败原因 → [`NodeState::error`]；
+/// - 节点输出 → [`RunState::outputs`]。
+///
+/// 三者都曾是本结构的字段，代价是每个事件分支都要手工同步副本：`output` 副本
+/// 让 `NodeFailed`/`NodeSkipped` 漏清一处（靠「`NodeStarted` 必然先清」侥幸不出错），
+/// `error` 副本连 `NodeSkipped` 都没覆盖。存两份就等于多一份要维护的影子。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct NodeRecord {
     pub state: NodeState,
-    pub attempts: u32,
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<u64>,
-    pub error: Option<String>,
     /// 已记录但尚未被消费的信号（崩溃在 signal_received 与终态之间）
     pub last_signal: Option<Value>,
     /// sub_workflow 节点的子 run id（来自 node_started）
@@ -80,6 +113,18 @@ pub struct NodeRecord {
     /// 每个 attempt 刷新；重试/终态不清除，展示的是最近一次尝试的输入。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<Value>,
+}
+
+impl NodeRecord {
+    /// 已尝试次数（派生的快捷方式，见 [`NodeState::attempt`]）。
+    pub fn attempts(&self) -> u32 {
+        self.state.attempt()
+    }
+
+    /// 失败原因（派生的快捷方式，见 [`NodeState::error`]）。
+    pub fn error(&self) -> Option<&str> {
+        self.state.error()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,11 +196,9 @@ impl RunState {
     pub fn record(&self, node_id: &str) -> &NodeRecord {
         const DEFAULT_RECORD: NodeRecord = NodeRecord {
             state: NodeState::Pending,
-            attempts: 0,
             started_at: None,
             ended_at: None,
             duration_ms: None,
-            error: None,
             last_signal: None,
             child_run_id: None,
             input: None,
@@ -191,11 +234,9 @@ impl RunState {
             } => {
                 let rec = self.records.entry(node_id.clone()).or_default();
                 rec.state = NodeState::Running { attempt: *attempt };
-                rec.attempts = rec.attempts.max(*attempt);
                 rec.started_at = Some(env.ts);
                 rec.ended_at = None;
                 rec.duration_ms = None;
-                rec.error = None;
                 rec.last_signal = None;
                 rec.child_run_id = child_run_id.clone();
                 rec.input = input.clone();
@@ -211,10 +252,8 @@ impl RunState {
             } => {
                 let rec = self.records.entry(node_id.clone()).or_default();
                 rec.state = NodeState::Completed { attempt: *attempt };
-                rec.attempts = rec.attempts.max(*attempt);
                 rec.ended_at = Some(env.ts);
                 rec.duration_ms = Some(*duration_ms);
-                rec.error = None;
                 rec.last_signal = None;
                 self.outputs.insert(node_id.clone(), output.clone());
             }
@@ -230,9 +269,7 @@ impl RunState {
                     error: error.clone(),
                     retryable: *retryable,
                 };
-                rec.attempts = rec.attempts.max(*attempt);
                 rec.ended_at = Some(env.ts);
-                rec.error = Some(error.clone());
                 rec.last_signal = None;
                 self.outputs.remove(node_id);
                 if !retryable {
@@ -355,7 +392,7 @@ mod tests {
         let state = RunState::from_events(&events).unwrap();
         let rec = state.record("n1");
         assert_eq!(rec.state, NodeState::Completed { attempt: 2 });
-        assert_eq!(rec.attempts, 2);
+        assert_eq!(rec.attempts(), 2);
         assert_eq!(state.outputs.get("n1"), Some(&serde_json::json!(7)));
         assert_eq!(rec.duration_ms, Some(12));
         assert_eq!(state.phase, RunPhase::Succeeded);
@@ -462,5 +499,129 @@ mod tests {
                 "{event:?} 之后 outputs 的存在性判断错了"
             );
         }
+    }
+
+    /// attempt / error 只有一份，且就在 `NodeState` 里。
+    ///
+    /// 这两个字段曾是 `NodeRecord` 的影子副本，靠事件分支手工同步——`error` 副本
+    /// 连 `NodeSkipped` 分支都没清（漏网之处），`attempts` 副本靠三行 `.max()`
+    /// 维持。删掉副本后「展示值」与「状态」不可能分叉：走一遍**全部**事件类型，
+    /// 每步都断言派生的 attempts/error 与状态一致。
+    #[test]
+    fn attempt_and_error_are_derived_from_state_on_every_path() {
+        let started = |attempt| Event::NodeStarted {
+            node_id: "n1".into(),
+            attempt,
+            child_run_id: None,
+            input: None,
+        };
+        let paths: Vec<Vec<Event>> = vec![
+            // 未经启动：Pending
+            vec![],
+            // 启动中
+            vec![started(1)],
+            // 成功
+            vec![
+                started(1),
+                Event::NodeCompleted {
+                    node_id: "n1".into(),
+                    attempt: 1,
+                    output: Value::Null,
+                    duration_ms: 1,
+                },
+            ],
+            // 失败可重试（时间线标签 retrying）
+            vec![
+                started(1),
+                Event::NodeFailed {
+                    node_id: "n1".into(),
+                    attempt: 1,
+                    error: "e1".into(),
+                    retryable: true,
+                },
+            ],
+            // 失败致命
+            vec![
+                started(1),
+                Event::NodeFailed {
+                    node_id: "n1".into(),
+                    attempt: 1,
+                    error: "e2".into(),
+                    retryable: false,
+                },
+            ],
+            // 重试后成功：attempt 必须跟着走到 2
+            vec![
+                started(1),
+                Event::NodeFailed {
+                    node_id: "n1".into(),
+                    attempt: 1,
+                    error: "e1".into(),
+                    retryable: true,
+                },
+                started(2),
+                Event::NodeCompleted {
+                    node_id: "n1".into(),
+                    attempt: 2,
+                    output: Value::Null,
+                    duration_ms: 1,
+                },
+            ],
+            // 跳过
+            vec![Event::NodeSkipped {
+                node_id: "n1".into(),
+                reason: "upstream_skipped".into(),
+            }],
+            // 信号已落盘但未消费
+            vec![
+                started(1),
+                Event::SignalReceived {
+                    node_id: "n1".into(),
+                    payload: Value::Null,
+                },
+            ],
+        ];
+        for path in paths {
+            let mut state = RunState::new();
+            for (i, event) in path.iter().enumerate() {
+                state.fold(&env((i + 1) as u64, event.clone()));
+                let rec = state.record("n1");
+                // 派生的展示值与状态恒等：影子字段已不存在，无从分叉
+                assert_eq!(rec.attempts(), rec.state.attempt());
+                assert_eq!(rec.error(), rec.state.error());
+                // error 只在 Failed 出现，且与状态里的文本逐字一致
+                match &rec.state {
+                    NodeState::Failed { error, .. } => {
+                        assert_eq!(rec.error(), Some(error.as_str()), "{event:?}");
+                    }
+                    _ => assert_eq!(rec.error(), None, "{event:?} 非 Failed 态不该有 error"),
+                }
+            }
+        }
+    }
+
+    /// `NodeState` 是 attempt / error 的唯一来源（DESIGN §12.5）——本测试是
+    /// 「派生而非副本」这条不变量的守卫：任何把字段加回 `NodeRecord` 的改动
+    /// 都会在这里编译失败或断言失败。
+    #[test]
+    fn pending_and_skipped_report_zero_attempts() {
+        for state in [
+            NodeState::Pending,
+            NodeState::Skipped { reason: "r".into() },
+        ] {
+            assert_eq!(state.attempt(), 0, "{state:?} 从未启动，尝试次数应为 0");
+            assert_eq!(state.error(), None);
+        }
+        assert_eq!(NodeState::Running { attempt: 3 }.attempt(), 3);
+        assert_eq!(NodeState::Completed { attempt: 4 }.attempt(), 4);
+        assert_eq!(
+            NodeState::Failed {
+                attempt: 2,
+                error: "x".into(),
+                retryable: true
+            }
+            .error(),
+            Some("x")
+        );
     }
 }

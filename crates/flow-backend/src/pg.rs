@@ -224,6 +224,19 @@ impl PgBackend {
             .map_err(pg_err)
     }
 
+    /// 撤销一次触发去重（让下个 tick 重试同一触发点）。
+    pub async fn delete_fire(
+        &self,
+        schedule_id: &str,
+        fire_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), BackendError> {
+        self.engine
+            .store()
+            .delete_fire(schedule_id, fire_at)
+            .await
+            .map_err(pg_err)
+    }
+
     pub async fn create_webhook(&self, workflow_id: &str) -> Result<Webhook, BackendError> {
         self.engine
             .store()

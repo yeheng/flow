@@ -508,6 +508,8 @@ impl Definition {
         }
 
         let mut edge_keys = HashSet::new();
+        // condition 出边的目标集合：同一目标不得被两个端口同时指向（见下方规则）
+        let mut condition_targets: HashMap<&str, HashSet<&str>> = HashMap::new();
         for edge in &self.edges {
             if self.node(&edge.from).is_none() {
                 return Err(format!("边的起点不存在：{}", edge.from));
@@ -524,15 +526,34 @@ impl Definition {
 
             let from_type = self.node_type(&edge.from).unwrap();
             match from_type {
-                NodeType::Condition => match edge.port.as_deref() {
-                    Some("true") | Some("false") => {}
-                    other => {
-                        return Err(format!(
-                            "condition 节点 {} 的出边端口必须是 true/false，当前为 {:?}",
-                            edge.from, other
-                        ))
+                NodeType::Condition => {
+                    match edge.port.as_deref() {
+                        Some("true") | Some("false") => {}
+                        other => {
+                            return Err(format!(
+                                "condition 节点 {} 的出边端口必须是 true/false，当前为 {:?}",
+                                edge.from, other
+                            ))
+                        }
                     }
-                },
+                    // 同一 condition 的多个端口不得指向同一节点：AND-join 语义
+                    // （§6.2）下，未被选中的那条出边判为 Unsatisfied，会把**整个**
+                    // 目标节点跳过——于是「走 true 分支」反而把 true 分支的下游
+                    // 跳掉，run 仍记成功。这是错误建模，不是分支合流：真要合流
+                    // 应指向不同节点，或引入显式 join 策略。建图期拒掉，别让运行期
+                    // 静默跳过。
+                    if !condition_targets
+                        .entry(edge.from.as_str())
+                        .or_default()
+                        .insert(edge.to.as_str())
+                    {
+                        return Err(format!(
+                            "condition 节点 {} 的多个端口不能指向同一节点 {}\
+                             （未被选中的端口会让该节点被跳过）",
+                            edge.from, edge.to
+                        ));
+                    }
+                }
                 _ => {
                     if edge.port.is_some() {
                         return Err(format!("非 condition 节点 {} 的出边不能带端口", edge.from));
@@ -1057,6 +1078,65 @@ mod tests {
             json!({"workflow_id": "c", "input_mapping": ""})
         )
         .is_err());
+    }
+
+    /// condition 的多个端口不得指向同一节点。
+    ///
+    /// 这个形状曾被 validate 放行，运行期后果是**静默数据丢失**：condition 求值
+    /// 为真、走了 true 分支，但目标节点因 false 那条出边判为 Unsatisfied 而被
+    /// 整个跳过（§6.2 的 AND-join 规则），run 仍记 `succeeded`、输出为 null。
+    /// 建图期拒掉。互斥分支指向**不同**节点后合流是另一回事，见
+    /// `and_join_skips_when_one_branch_skipped`。
+    #[test]
+    fn condition_ports_must_target_distinct_nodes() {
+        let dup = def(
+            vec![node("s", "start"), node("c", "condition"), node("e", "end")],
+            vec![
+                json!({"from":"s","to":"c"}),
+                json!({"from":"c","to":"e","port":"true"}),
+                json!({"from":"c","to":"e","port":"false"}),
+            ],
+        );
+        let err = dup.validate().unwrap_err();
+        assert!(
+            err.contains("多个端口不能指向同一节点"),
+            "condition 两端口指同一节点应在建图期被拒：{err}"
+        );
+
+        // 端口指向不同节点是合法形状（普通 if/else）
+        let distinct = def(
+            vec![
+                node("s", "start"),
+                node("c", "condition"),
+                node("t", "script"),
+                node("f", "script"),
+                node("e", "end"),
+            ],
+            vec![
+                json!({"from":"s","to":"c"}),
+                json!({"from":"c","to":"t","port":"true"}),
+                json!({"from":"c","to":"f","port":"false"}),
+                json!({"from":"t","to":"e"}),
+            ],
+        );
+        assert!(distinct.validate().is_ok(), "{:?}", distinct.validate());
+
+        // 同一对 (from,to) 重复边仍由「重复的边」规则先拦下（port 不同故不算重复）
+        let same_target_same_port = def(
+            vec![node("s", "start"), node("c", "condition"), node("e", "end")],
+            vec![
+                json!({"from":"s","to":"c"}),
+                json!({"from":"c","to":"e","port":"true"}),
+                json!({"from":"c","to":"e","port":"true"}),
+            ],
+        );
+        assert!(
+            same_target_same_port
+                .validate()
+                .unwrap_err()
+                .contains("重复的边"),
+            "同端口重复边仍归「重复的边」规则"
+        );
     }
 
     #[test]
