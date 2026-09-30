@@ -150,25 +150,52 @@ pub fn spawn_driver(spec: DriverSpec, state: RunState, plan: RecoveryPlan) -> Jo
     tokio::spawn(driver.run(plan, log_rx))
 }
 
+/// 恢复期对**单个**未完成节点的分类结论。
+///
+/// 纯节点重放 / 补终态 / 继续等待 / 人工裁决 / 重建退避，五种处置互斥，
+/// 一个节点恰好一条。
+#[derive(Debug)]
+pub enum RecoveryAction {
+    /// 纯节点：安全重放，attempt+1（无外部副作用）。
+    Replay { node_id: String, attempt: u32 },
+    /// human_task：`signal_received` 已落盘但终态缺失 → 补终态，output = 信号。
+    CompleteFromSignal {
+        node_id: String,
+        attempt: u32,
+        payload: Value,
+    },
+    /// human_task：无信号 → 继续等待，不重复写 `node_started`（等待无副作用）。
+    HumanWait { node_id: String, attempt: u32 },
+    /// 副作用节点（`has_side_effect()`）：进入人工裁决，**绝不自动重放**。
+    ///
+    /// `received` 是随日志一并落盘的既有裁决（崩溃落在信号与终态之间）。
+    /// **为什么与「进入裁决」合成一条而不是拆成两个 Vec**：拆开时两者的
+    /// 一致性只能靠 `classify` 里的 push 顺序维持。一旦某条路径只写了其中
+    /// 一半，消费端 `signal_action` 就查不到 `Adjudicating` 槽位 →
+    /// `InvalidSignal` 冒泡出 `drive` → `run()` 判定它不是平台故障 →
+    /// **把引擎内部的记账不一致写成用户的 `run_failed` 业务终态**。合成一条
+    /// 记录后配对由类型保证，这条错误出口从根上不存在。
+    Adjudicate {
+        node_id: String,
+        received: Option<Value>,
+    },
+    /// 失败可重试：重建退避计时器，恢复一律等满整段 backoff。
+    Retry { node_id: String },
+}
+
 /// 恢复期对未完成节点和待重试节点的分类结论。
 /// 单机与分布式接管共用同一分类（DESIGN.md §7 / `driver::RecoveryPlan::classify`）。
+///
+/// **一条记录一个节点**，不做分组平行集合：处置分类与「既有裁决」是同一件事
+/// 的两面（见 [`RecoveryAction::Adjudicate`]）。
 #[derive(Default, Debug)]
 pub struct RecoveryPlan {
-    /// 纯节点：安全重放
-    pub replay: Vec<(String, u32)>,
-    /// human_task：已有信号记录的补终态，没有的继续等待
-    pub signal_received: Vec<(String, u32, Value)>,
-    pub human_wait: Vec<(String, u32)>,
-    /// 副作用节点：必须人工裁决（分布式下这是副作用准入检查的核心：
-    /// 接管后绝不自动重放有外部副作用的节点）
-    pub adjudicate: Vec<String>,
-    pub adjudication_received: Vec<Signal>,
-    pub retries: Vec<String>,
+    pub actions: Vec<RecoveryAction>,
 }
 
 impl RecoveryPlan {
     pub fn classify(definition: &Definition, state: &RunState) -> RecoveryPlan {
-        let mut plan = RecoveryPlan::default();
+        let mut actions = Vec::new();
         for (node_id, record) in &state.records {
             if matches!(
                 record.state,
@@ -177,7 +204,9 @@ impl RecoveryPlan {
                     ..
                 }
             ) {
-                plan.retries.push(node_id.clone());
+                actions.push(RecoveryAction::Retry {
+                    node_id: node_id.clone(),
+                });
                 continue;
             }
             let NodeState::Running { attempt } = record.state else {
@@ -186,27 +215,37 @@ impl RecoveryPlan {
             let Some(kind) = definition.node_type(node_id) else {
                 continue;
             };
-            match kind {
+            actions.push(match kind {
                 NodeType::HumanTask => match &record.last_signal {
-                    Some(payload) => {
-                        plan.signal_received
-                            .push((node_id.clone(), attempt, payload.clone()))
-                    }
-                    None => plan.human_wait.push((node_id.clone(), attempt)),
+                    Some(payload) => RecoveryAction::CompleteFromSignal {
+                        node_id: node_id.clone(),
+                        attempt,
+                        payload: payload.clone(),
+                    },
+                    None => RecoveryAction::HumanWait {
+                        node_id: node_id.clone(),
+                        attempt,
+                    },
                 },
-                kind if kind.has_side_effect() => {
-                    plan.adjudicate.push(node_id.clone());
-                    if let Some(payload) = &record.last_signal {
-                        plan.adjudication_received.push(Signal {
-                            node_id: node_id.clone(),
-                            payload: payload.clone(),
-                        });
-                    }
-                }
-                _ => plan.replay.push((node_id.clone(), attempt)),
-            }
+                kind if kind.has_side_effect() => RecoveryAction::Adjudicate {
+                    node_id: node_id.clone(),
+                    received: record.last_signal.clone(),
+                },
+                _ => RecoveryAction::Replay {
+                    node_id: node_id.clone(),
+                    attempt,
+                },
+            });
         }
-        plan
+        RecoveryPlan { actions }
+    }
+
+    /// 需要人工裁决的节点（诊断用；处置在 `apply_recovery_plan`）。
+    pub fn adjudicating_nodes(&self) -> impl Iterator<Item = &str> {
+        self.actions.iter().filter_map(|action| match action {
+            RecoveryAction::Adjudicate { node_id, .. } => Some(node_id.as_str()),
+            _ => None,
+        })
     }
 }
 
@@ -748,36 +787,73 @@ impl Driver {
         plan: RecoveryPlan,
         result_tx: &mpsc::Sender<DriverMsg>,
     ) -> Result<(), EngineError> {
-        for (node_id, attempt, payload) in plan.signal_received {
-            // signal_received 已落盘但终态缺失：补终态，不重复等待。
-            // fold 会把 output 记进 state.outputs，无需第二份手工同步。
-            self.append(Event::NodeCompleted {
-                node_id,
-                attempt,
-                output: payload,
-                duration_ms: 0,
-            })
-            .await?;
-        }
+        let RecoveryPlan { actions } = plan;
 
-        for (node_id, attempt) in plan.human_wait {
-            self.register_human_wait(&node_id, attempt, result_tx).await;
-        }
-
-        if !plan.adjudicate.is_empty() {
-            for node_id in plan.adjudicate {
-                // 运行叙事进事件流（NodeLog），不再是纯运维 tracing
-                let _ = self
-                    .write_log_line(LogLine {
+        // 第一趟：登记全部 Adjudicating 槽位 + 除「消费既有裁决」外的全部处置。
+        //
+        // **必须整趟做完再消费裁决**：`apply_signal` 消费掉一个裁决后会检查
+        // 「还有没有 Adjudicating 槽位」，没有就投影回 `Running`。登记与消费
+        // 混在一趟里时，先消费掉带裁决的那个节点，另一个**尚未登记**的待裁决
+        // 节点看不见，引擎误判「已无待裁决节点」把 run 投影成 running——而它
+        // 此刻还挂在人工裁决上。`actions` 来自 HashMap 迭代、顺序不确定，所以
+        // 这条顺序只能由这里的显式两趟保证，不能指望 classify 的 push 顺序。
+        // 回归测试：`recovery_regressions::awaiting_adjudication_never_projects_back_to_running`。
+        for action in &actions {
+            match action {
+                RecoveryAction::CompleteFromSignal {
+                    node_id,
+                    attempt,
+                    payload,
+                } => {
+                    // signal_received 已落盘但终态缺失：补终态，不重复等待。
+                    // fold 会把 output 记进节点记录，无需第二份手工同步。
+                    self.append(Event::NodeCompleted {
                         node_id: node_id.clone(),
-                        attempt: self.state.record(&node_id).attempts(),
-                        level: LogLevel::Warn,
-                        stream: LogStream::Engine,
-                        message: "副作用节点状态不明（接管/重启），等待人工裁决".into(),
+                        attempt: *attempt,
+                        output: payload.clone(),
+                        duration_ms: 0,
                     })
-                    .await;
-                self.slots.insert(node_id, NodeSlot::Adjudicating);
+                    .await?;
+                }
+                RecoveryAction::HumanWait { node_id, attempt } => {
+                    self.register_human_wait(node_id, *attempt, result_tx).await;
+                }
+                RecoveryAction::Adjudicate { node_id, .. } => {
+                    // 运行叙事进事件流（NodeLog），不再是纯运维 tracing
+                    let _ = self
+                        .write_log_line(LogLine {
+                            node_id: node_id.clone(),
+                            attempt: self.state.record(node_id).attempts(),
+                            level: LogLevel::Warn,
+                            stream: LogStream::Engine,
+                            message: "副作用节点状态不明（接管/重启），等待人工裁决".into(),
+                        })
+                        .await;
+                    self.slots
+                        .insert(node_id.clone(), NodeSlot::Adjudicating);
+                }
+                RecoveryAction::Replay { node_id, attempt } => {
+                    let _ = self
+                        .write_log_line(LogLine {
+                            node_id: node_id.clone(),
+                            attempt: *attempt,
+                            level: LogLevel::Info,
+                            stream: LogStream::Engine,
+                            message: format!("接管/重启残留节点，重新执行（attempt {}）", attempt + 1),
+                        })
+                        .await;
+                    self.start_node(node_id, attempt + 1, result_tx).await?;
+                }
+                RecoveryAction::Retry { node_id } => {
+                    self.schedule_retry(node_id, result_tx).await;
+                }
             }
+        }
+
+        if actions
+            .iter()
+            .any(|a| matches!(a, RecoveryAction::Adjudicate { .. }))
+        {
             self.project_status(
                 DbRunStatus::AwaitingResume,
                 Some("存在状态不明的副作用节点，等待人工裁决"),
@@ -785,24 +861,30 @@ impl Driver {
             .await?;
         }
 
-        for (node_id, attempt) in plan.replay {
-            let _ = self
-                .write_log_line(LogLine {
-                    node_id: node_id.clone(),
-                    attempt,
-                    level: LogLevel::Info,
-                    stream: LogStream::Engine,
-                    message: format!("接管/重启残留节点，重新执行（attempt {}）", attempt + 1),
-                })
-                .await;
-            self.start_node(&node_id, attempt + 1, result_tx).await?;
-        }
-
-        for node_id in plan.retries {
-            self.schedule_retry(&node_id, result_tx).await;
-        }
-        for signal in plan.adjudication_received {
-            let action = self.signal_action(&signal)?;
+        // 第二趟：消费随日志落盘的既有裁决（崩溃落在信号与下一次 node_started /
+        // 终态之间）。第一趟已登记全部 Adjudicating 槽位，这里逐条认领。
+        for action in &actions {
+            let RecoveryAction::Adjudicate {
+                node_id,
+                received: Some(payload),
+            } = action
+            else {
+                continue;
+            };
+            let signal = Signal {
+                node_id: node_id.clone(),
+                payload: payload.clone(),
+            };
+            // 槽位由第一趟登记，这里必然认领得到；仍走 `signal_action` 复用
+            // 同一份 payload 解析。解析失败是**日志完整性**问题（裁决载荷不是
+            // 合法 adjudication），不是工作流失败——按 LogCorrupted 归平台故障
+            // 挂 awaiting_resume，绝不写成 run_failed 业务终态。回归测试：
+            // `recovery_regressions::corrupt_durable_adjudication_is_a_platform_fault_not_a_run_failure`。
+            let action = self.signal_action(&signal).map_err(|err| {
+                EngineError::LogCorrupted(format!(
+                    "节点 {node_id} 的已落盘裁决载荷非法：{err}"
+                ))
+            })?;
             self.apply_signal(signal, action, result_tx).await?;
         }
 
@@ -859,12 +941,7 @@ impl Driver {
             NodeState::Completed { .. } => {
                 let from_kind = self.definition.node_type(from);
                 if from_kind == Some(NodeType::Condition) {
-                    let taken = self
-                        .state
-                        .outputs
-                        .get(from)
-                        .map(exec::truthy)
-                        .unwrap_or(false);
+                    let taken = record.output().map(exec::truthy).unwrap_or(false);
                     let taken_port = if taken { "true" } else { "false" };
                     if port == Some(taken_port) {
                         EdgeState::Satisfied
@@ -924,7 +1001,7 @@ impl Driver {
         // 引用非前驱节点在 JS 里是 undefined，属性访问即抛错进 fatal
         let outputs: HashMap<String, Value> = preds
             .iter()
-            .filter_map(|p| self.state.outputs.get(p).cloned().map(|v| (p.clone(), v)))
+            .map(|p| (p.clone(), self.state.node_output(p)))
             .collect();
         Ok((node, preds, outputs))
     }
@@ -1408,16 +1485,7 @@ impl Driver {
             .nodes
             .iter()
             .filter(|n| n.kind() == Some(NodeType::End))
-            .map(|n| {
-                (
-                    n.id.clone(),
-                    self.state
-                        .outputs
-                        .get(&n.id)
-                        .cloned()
-                        .unwrap_or(Value::Null),
-                )
-            })
+            .map(|n| (n.id.clone(), self.state.node_output(&n.id)))
             .collect();
         exec::singular_or_map(ends)
     }

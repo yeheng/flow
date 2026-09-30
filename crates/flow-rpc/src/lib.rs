@@ -747,10 +747,9 @@ pub(crate) fn timeline_value(
             // output 展示出口脱敏（固定敏感键）：事件日志里的原始 output 是
             // 下游节点的数据面，不能动；这里只脱时间线的展示值。
             // input 在 node_started 写入时已脱敏，直接透传。
-            // 节点输出的唯一所有者是 snapshot.outputs（NodeRecord 不存副本）
-            let output = snapshot
-                .outputs
-                .get(&node.id)
+            // 节点输出的唯一所有者是 NodeRecord.output（见 fold.rs）
+            let output = record
+                .output()
                 .cloned()
                 .map(|v| flow_backend::redact_value(&v));
             let mut entry = json!({

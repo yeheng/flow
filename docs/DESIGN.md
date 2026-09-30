@@ -165,10 +165,9 @@ elements ... WITH ORDINALITY` 整批插入 + 一次 NOTIFY），逐条则是 N �
 
 ```
 Event 流 ──fold──> RunState {
-    records: HashMap<node_id, NodeRecord{state, started_at, ended_at,
+    records: HashMap<node_id, NodeRecord{state, output, started_at, ended_at,
                                           duration_ms, last_signal,
                                           child_run_id, input}>,
-    outputs: HashMap<node_id, Value>,     // 唯一所有者：Driver 直接读它
     phase: Running | Succeeded | Failed | Cancelled,
     fatal_error, output, workflow_id, workflow_version, input, last_seq, depth,
     started_at, ended_at,
@@ -179,13 +178,16 @@ Event 流 ──fold──> RunState {
 `Failed{retryable:true}` 是等待重试的**非终态**，时间线标签为 `retrying`；
 保留事件及 NodeState 序列化格式，旧日志无需迁移。
 
-**`NodeState` 是节点状态的唯一来源**（§12.5）：已尝试次数与失败原因都**从状态派生**
-（`NodeState::attempt()` / `::error()`），`NodeRecord` 不再存副本。三者——输出
-（`RunState::outputs`）、attempt、error——曾经各有一份影子字段，代价是每个事件
-分支都要手工同步：`output` 副本让 `NodeFailed`/`NodeSkipped` 漏清一处（靠
-「`NodeStarted` 必然先清」侥幸不出错），`error` 副本连 `NodeSkipped` 都没覆盖。
-派生后展示值与状态不可能分叉。`run.timeline` 的 wire 形状（`attempts` / `error`
-字段）逐字不变，只是取值改为从 `state` 取。
+**节点状态与输出只有一份，都在 `NodeRecord` 里**（§12.5）：已尝试次数与失败原因
+**从状态派生**（`NodeState::attempt()` / `::error()`），输出是 `NodeRecord.output`
+字段。驱动器读前驱输出一律经 `RunState::node_output(node_id)`，不另开 map。
+输出曾经是第三种形状——`RunState::outputs` 那把与 `records` 同键的独立 map。挪走
+并没有消除同步义务（四个节点终态分支照样各自要处置旧输出：`NodeStarted`/
+`NodeFailed`/`NodeSkipped` 清、`NodeCompleted` 写），只是把义务搬到另一把 map 上，
+并新增一个「两把 map 的键集可能不一致」的面。留在 `NodeRecord` 里，四处改的是
+**同一个** `rec`，同步点数不变但不可能只改一处。
+`run.timeline` 的 wire 形状（`attempts` / `error` 字段）逐字不变，只是取值改为
+从 `state` 取。
 
 关键转移：
 
@@ -193,9 +195,19 @@ Event 流 ──fold──> RunState {
   attempt 的输入面快照 input（展示用，终态不清除）；
 - `node_log` 在 fold 中**跳过**（观察数据，不是恢复状态；`last_seq` 仍推进，
   订阅者照常收到——一条流两个用途，§3.1）；
-- `node_completed` 写入 `outputs`；
+- `node_completed` 写入 output；
 - `node_failed(retryable=false)` 在 fold 中记录首个 `fatal_error`，Driver 无独立失败缓存；
-- `signal_received` 只记 `last_signal`（崩溃可能落在它与终态之间，恢复时消费它）；
+- `run_cancelled` **清掉 `fatal_error` 与 `output`**：`fatal_error` 的语义是
+  「本 run 终态为 failed 时的原因」，用户主动取消时终态是 Cancelled。漏清的实际
+  后果是恢复回填路径（`recover_unfinished` 用 `terminal.fatal_error` 写 runs 行）
+  把「节点 X 失败」当成 cancelled run 的 error 落库，而正常投影路径对 RunCancelled
+  明确写 error=NULL——同一状态两条路径两个答案，正是 §9「同名字段必须同值」被破掉；
+- `signal_received` 只记 `last_signal`（崩溃可能落在它与终态之间，恢复时消费它）。
+  **不变量 `last_signal.is_some() ⟹ 节点非终态`**：只有非终态节点可能消费它
+  （Running 节点消费，Pending 节点启动时被 `node_started` 清掉），终态节点带着
+  它就是一条永远不会被消费的陈旧待办。四个节点终态分支与 `node_started` 都要清
+  ——`node_skipped` 曾是唯一漏清的分支（当前不可达：信号只对 Running 节点写，
+  而跳过只发生于 Pending 节点）；
 - attempt 号只存在于状态里：它从 1 起、每次 +1，且 `handle_result` 丢弃非当前
   attempt 的迟到结果，所以「状态里的 attempt」恒等于「已尝试次数」，无需 max 累积。
 
@@ -486,8 +498,9 @@ Postgres `PgChildLauncher` 经 `lease::create_run` 单事务创建子 run、
 
 恢复循环的失败隔离：单个 run 的回填/隔离投影失败（如瞬时 SQLite 锁）记入
 失败清单继续下一个 run，不中断整个恢复——一条坏行不能阻止其余 run 恢复，
-更不能让服务拒绝启动。日志缺失或身份不符的 run 保留 awaiting_resume 并
-报告错误，需修复数据后重启重试。
+更不能让服务拒绝启动。日志缺失、身份不符、或**含定义外节点**的 run 保留
+awaiting_resume 并报告错误，需修复数据后重启重试。恢复分类是
+**一条记录一个节点**（`RecoveryAction`，§12.20），不是分组平行集合。
 
 ### 7.2 恢复的正确性来源
 
@@ -780,11 +793,17 @@ body 为 `{from, to, subject, text}`（纯文本正文），输出 `{status, id}
    **节点级执行状态机只有一处**——`driver::NodeSlot` + `slots` map，终止判定
    （`slots.is_empty()`）与 abort 清理（`abort_inflight`）同源；一个节点同时只
    占一个槽位（§6.1）；
-5. **`NodeState` 是节点状态的唯一来源**（§4）：输出存 `state.outputs`、attempt
-   与 error 从 `state` 派生（`NodeState::attempt` / `::error`），三者都不在
-   `NodeRecord` 里另存副本——此前 `output`/`error`/`attempts` 各有一份影子字段，
-   每个事件分支都要手工同步，`error` 副本连 `NodeSkipped` 都没覆盖；节点执行
-   输入面 `nodes` 只暴露直接前驱的输出（重放决定论，见 §10）；
+5. **节点状态与输出只有一份，都在 `NodeRecord` 里**（§4）：输出是
+   `NodeRecord.output` 字段，attempt 与 error 从 `state` 派生
+   （`NodeState::attempt` / `::error`），三者都不另存副本——此前 `error`/
+   `attempts` 各有一份影子字段，每个事件分支都要手工同步，`error` 副本连
+   `NodeSkipped` 都没覆盖；输出曾被挪进 `RunState::outputs` 那把与 `records`
+   同键的独立 map，同步义务并未消失（四个节点终态分支照样各自处置旧输出），
+   只是多出「两把 map 键集可能不一致」的面。四个分支改的是同一个 `rec`，
+   不可能只改一处。**四个节点终态分支的字段处置对称**：`node_completed` /
+   `node_failed` / `node_skipped` 都清 `output` 与待消费的 `last_signal`
+   （`node_skipped` 曾是唯一漏清 `last_signal` 的分支）。节点执行输入面
+   `nodes` 只暴露直接前驱的输出（重放决定论，见 §10），经 `RunState::node_output` 读；
 6. 端口规则：condition 必须 true/false，其余必须无端口；**同一 condition 的
    多个端口不得指向同一节点**（否则 AND-join 会把被选中分支的下游整个跳过，
    §5 规则 4）；
@@ -794,8 +813,12 @@ body 为 `{from, to, subject, text}`（纯文本正文），输出 `{status, id}
    `flow-pg` 的 `CHECK` 列表也由它生成（排除 PG 不可达的 `initializing`）。
    此前 `is_valid_str` 是与 enum 不联动的手写 `matches!` 表、`CHECK` 列表是第三份
    手写拷贝——加变体编译器不提醒，症状是该状态写入时当场被拒、run 从恢复扫描里
-   静默消失。
+   静默消失。**折叠相位到落库状态的映射同样只有一份**：`RunPhase::as_db_status`
+   （`flow-engine`），两个后端的恢复回填（`recover_unfinished` 与
+   `reconcile_terminal`）共用，不各写一遍 match。
 9. 可重试失败非终态；不可重试失败由 fold 持久推导，恢复不会变为成功。
+   **`run_cancelled` 清掉 `fatal_error` 与 `output`**——取消不是失败，漏清会让
+   恢复回填给 cancelled 的 run 行带上节点失败原因（§4）。
 10. 信号先校验，再持久化、消费和确认；无效请求不改变 run 终态。
 11. sub_workflow 的 child_run_id 确定性派生（`{父run}:{节点}:{attempt}`）并随
     node_started 落盘；重放沿用已落盘 id 附着既有子 run，重试派生新 id。
@@ -824,6 +847,24 @@ body 为 `{from, to, subject, text}`（纯文本正文），输出 `{status, id}
 18. x-secret 参数在定义里只存名称，真值在 dispatch 前从 `FLOW_SECRET_<名称>`
     注入：不进模板展开、不进事件（`node_started.input` 写入时已按敏感键
     列表脱敏）、`secrets.list` 只回名称。真值缺失 = 节点 fatal。
+19. **日志里出现定义外 node_id = 日志损坏**，恢复路径（单机 `resume_run` 与
+    PG `drive_after_acquire` 同一处校验）按 `LogCorrupted` 拒，绝不驱动。漏掉
+    的话那条幽灵记录停在非终态时，终止判定读的两个键集不重合（`plan()` 遍历
+    `definition.nodes` 看不见它，`all_terminal()` 遍历 `records` 看得见）→
+    slots 空而 `all_terminal()` 恒假 → 每次恢复都挂 `awaiting_resume`，run
+    永久卡死、只能人工改数据。只读路径（`Engine::snapshot`、订阅回放）不校验，
+    语义仍是「原样呈现磁盘」。
+20. **恢复分类一条记录一个节点**（`RecoveryPlan` 是 `Vec<RecoveryAction>`，不是
+    分组平行集合）：「进入人工裁决」与「既有裁决已落盘」合成 `Adjudicate
+    { received }` 一条。拆成两个 Vec 时两者一致性只靠 `classify` 的 push 顺序
+    维持，一旦只写一半，消费端查不到 `Adjudicating` 槽位 → `InvalidSignal`
+    冒泡 → 被判成工作流失败 → **把引擎内部记账不一致写成用户的 run_failed 终态**。
+    已落盘但载荷非法的裁决按 `LogCorrupted` 归平台故障挂起，同属这条出口。
+    `apply_recovery_plan` 分**显式两趟**（先登记全部 `Adjudicating` 槽位、后消费
+    全部裁决），不依赖 `classify` 的 push 顺序——`actions` 来自 HashMap 迭代，
+    顺序不确定。混成一趟会多投影一次 `Running`：`apply_signal` 消费掉一个裁决后
+    要看「还有没有 `Adjudicating` 槽位」，而另一个待裁决节点此时尚未登记，引擎
+    误判「已无待裁决」把仍挂在人工裁决上的 run 投影成 running。
 
 ## 13. 测试策略
 
@@ -900,10 +941,19 @@ volume 上。Docker 只在容器**自己退出**时（`--rm`）回收匿名 volu
 - `nodetypes.list` 响应由 `node_types_snapshot_is_stable` 快照测试钉住
   （descriptor 注册表收敛是纯重构，响应必须逐字节不变）；
 - `recovery_regressions.rs` 验证失败恢复、重试下游、剩余退避、非法/重复信号和裁决恢复；
+  另钉三条：定义外节点（幽灵记录停在非终态时终止判定永远不成立）在恢复时被判
+  `LogCorrupted` 拒（`node_outside_definition_is_rejected_on_recovery`）；已落盘
+  但载荷非法的裁决归平台故障挂起、**不写 run_failed 业务终态**
+  （`corrupt_durable_adjudication_is_a_platform_fault_not_a_run_failure`）；还有
+  待裁决节点时 run 不得被投影回 `running`
+  （`awaiting_adjudication_never_projects_back_to_running`，用状态投影记录器断言
+  `Running` 只被投影过一次——钉住 §12.20 的两趟顺序）；
 - `group_commit.rs`（flow-engine）钉严格组提交（§3.2）：append 返回即完整可读、
   seq 连续、并发多日志不串扰，且 fsync 必须真被组批（批数 ≤ 事件数的一半）；
   fsync 级持久化与写序协议由 backend-e2e 的 SIGKILL 用例钉住；
-- `contracts.rs` 验证显式 draft 拒绝、初始化中断和旧日志缺失隔离；
+- `contracts.rs` 验证显式 draft 拒绝、初始化中断和旧日志缺失隔离；另钉恢复回填
+  不得给 cancelled 的 run 行带上节点失败原因（正常投影路径写 NULL，回填必须一致，
+  §12.9 `terminal_recovery_backfill_does_not_put_a_node_failure_on_a_cancelled_run`）；
 - `sub_workflow.rs` 验证子 run 输出透传、子失败 fatal、RunExists 附着、深度上限、
   取消级联，以及崩溃重放沿用同一 child_run_id；
 - `engine_recovery.rs` 钉住节点输入面语义：`nodes` 只暴露直接前驱输出，
@@ -914,7 +964,13 @@ volume 上。Docker 只在容器**自己退出**时（`--rm`）回收匿名 volu
   `AwaitSignal → Running` 交付后仍在飞、只有 `Adjudicating` 无句柄、清理幂等；
 - `fold.rs` 的 `attempt_and_error_are_derived_from_state_on_every_path` 钉住
   「attempt/error 从状态派生、无影子副本」（§12.5）——走一遍全部事件类型，
-  每步断言展示值与状态恒等；
+  每步断言展示值与状态恒等；`node_output_is_cleared_on_every_non_completed_path`
+  钉住输出住在 `NodeRecord` 且每个非 completed 分支都清它，
+  `terminal_node_never_carries_a_stale_pending_signal` 钉住「终态节点不携带待消费
+  信号」（`node_skipped` 曾是四个终态分支里唯一漏清 `last_signal` 的）；
+  `run_cancelled_clears_pending_fatal_error` 钉住取消清 `fatal_error`，
+  `node_outside_definition_is_log_corruption` 钉住定义外节点判损坏，
+  `run_phase_maps_to_db_status_on_every_phase` 钉住落库状态映射；
 - 调度器触发去重的撤销语义由 `scheduler::tests` 钉住：撤销后同一分钟可重取
   触发权、撤销不影响别的分钟、重复撤销幂等；
 - `child_await.rs` 钉住父 run 等待初始化中断子 run 不挂死（空日志 → DB 投影）；

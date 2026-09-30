@@ -148,12 +148,10 @@ impl PgRunSink {
 
     /// 接管后发现日志已终结：以事件为准修正 DB（投影 + 释放租约），不插入事件。
     pub async fn reconcile_terminal(&mut self, state: &RunState) -> Result<(), EngineError> {
-        let status = match state.phase {
-            flow_engine::RunPhase::Succeeded => DbRunStatus::Succeeded,
-            flow_engine::RunPhase::Failed => DbRunStatus::Failed,
-            flow_engine::RunPhase::Cancelled => DbRunStatus::Cancelled,
-            flow_engine::RunPhase::Running => return Ok(()),
-        };
+        let status = state.phase.as_db_status();
+        if !status.is_terminal() {
+            return Ok(());
+        }
         let mut tx = self.begin().await?;
         self.lock_and_check(&mut tx, None).await?;
         sqlx::query(

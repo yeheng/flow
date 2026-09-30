@@ -5,10 +5,34 @@
 
 mod common;
 
-use common::{node_def, spec, terminal, Harness};
-use flow_engine::{Event, NodeState, RunPhase, Signal};
+use std::sync::Arc;
+use std::time::Duration;
+
+use common::{def_from, node_def, spec, terminal, Harness};
+use flow_engine::{
+    DbRunStatus, Engine, Event, NodeState, RunObserver, RunPhase, Signal, StatusUpdate,
+};
+use flow_test_support::io::TempDir;
+use futures::future::BoxFuture;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// 状态投影记录器：观察 run 状态被投影成什么、按什么顺序（投影一致性用例用）。
+type StatusLog = Arc<parking_lot::Mutex<Vec<(DbRunStatus, Option<String>)>>>;
+
+#[derive(Clone)]
+struct RecordingObserver {
+    statuses: StatusLog,
+}
+
+impl RunObserver for RecordingObserver {
+    fn on_status<'a>(&'a self, update: StatusUpdate<'a>) -> BoxFuture<'a, ()> {
+        self.statuses
+            .lock()
+            .push((update.status, update.error.map(str::to_string)));
+        Box::pin(async {})
+    }
+}
 
 /// 本地 HTTP 桩：按给定状态行逐个回应（确定性，不依赖外部网络）。
 async fn http_server(statuses: &[&str]) -> (String, tokio::task::JoinHandle<()>) {
@@ -255,5 +279,156 @@ async fn durable_adjudication_is_consumed_on_recovery() {
                 .count(),
             1
         );
+    }
+}
+
+/// 幽灵节点（定义外 node_id）必须被恢复判成日志损坏，而不是被驱动。
+///
+/// 没有这条校验时那条幽灵记录停在 `Running`，而终止判定读的是两个不重合的
+/// 键集：`plan()` 遍历 `definition.nodes`（看不见幽灵，于是不派发也不跳过），
+/// `all_terminal()` 遍历 `records`（看见幽灵，于是恒假）。slots 空 +
+/// `all_terminal()` 假 = 调度停滞，每次恢复都把 run 挂进 `awaiting_resume`，
+/// 永远推不动——只能人工改数据。
+#[tokio::test]
+async fn node_outside_definition_is_rejected_on_recovery() {
+    let h = Harness::new();
+    // 日志里出现定义外的 ghost 节点，且它停在非终态（最容易触发挂死的那一档）
+    h.prefix(vec![Event::NodeStarted {
+        node_id: "ghost".into(),
+        attempt: 1,
+        child_run_id: None,
+        input: None,
+    }])
+    .await;
+    let def =
+        node_def(json!({"id":"n", "type":"http_call", "params":{"url":"http://127.0.0.1:1"}}));
+
+    let err = h.engine.resume_run(spec(def)).await.unwrap_err();
+    assert!(matches!(err, flow_engine::EngineError::LogCorrupted(_)), "{err}");
+    assert!(err.to_string().contains("ghost"), "诊断要指名道姓：{err}");
+
+    // 恢复被拒 → 没有 Driver 被拉起，run 原样停在日志末尾
+    assert!(!h.engine.is_live("r"));
+    let state = h.engine.snapshot("r").await.unwrap();
+    assert_eq!(state.phase, RunPhase::Running);
+    assert_eq!(state.record("ghost").attempts(), 1);
+}
+
+/// 已落盘的裁决载荷非法 = **日志完整性**问题，挂 `awaiting_resume` 等人工，
+/// 绝不写成 `run_failed` 业务终态（与 §7.2 的分类原则同一条出口）。
+#[tokio::test]
+async fn corrupt_durable_adjudication_is_a_platform_fault_not_a_run_failure() {
+    let h = Harness::new();
+    h.prefix(vec![Event::SignalReceived {
+        node_id: "n".into(),
+        payload: json!({"action": "nonexistent"}),
+    }])
+    .await;
+    let def =
+        node_def(json!({"id":"n", "type":"http_call", "params":{"url":"http://127.0.0.1:1"}}));
+
+    // resume_run 本身成功（分类只登记 Adjudicating 槽位），驱动在消费裁决时
+    // 才发现载荷非法 —— 那时 run 已被投影成 awaiting_resume，不得被改写
+    h.engine.resume_run(spec(def)).await.unwrap();
+    h.wait_not_live("r").await;
+
+    let state = h.engine.snapshot("r").await.unwrap();
+    assert_eq!(
+        state.phase,
+        RunPhase::Running,
+        "非法裁决不得写出 run_failed 终态：{state:?}"
+    );
+    let events = h.engine.read_events("r", None).await.unwrap();
+    assert!(
+        events.iter().all(|env| !env.event.is_run_terminal()),
+        "日志里不该出现任何 run 终态事件：{events:?}"
+    );
+}
+
+/// **先登记全部 Adjudicating 槽位、后消费全部裁决**——恢复期唯一的状态投影硬约束。
+///
+/// `apply_recovery_plan` 分两趟而不是一趟：`apply_signal` 消费掉一个裁决后会检查
+/// 「还有没有 Adjudicating 槽位」，没有就投影回 `Running`。若登记与消费混在
+/// 同一趟，先消费掉带裁决的那个节点时**另一个还没登记的待裁决节点**看不见，
+/// 引擎误判「已无待裁决节点」把 run 投影成 `running`——而它此刻明明还挂在人工
+/// 裁决上。观察者（`run.get` 的 status）能读到这段错误窗口。
+///
+/// 用例让 `n`（prefix 固定铺出的那个节点）带已落盘裁决、`n1` 不带：
+/// 两趟实现只投影一次 `Running`（`drive` 开头那次）+ 一次 `AwaitingResume`；
+/// 单趟实现在 HashMap 迭代顺序让 `n` 排在 `n1` 前时（8 轮里约一半）多投影一次
+/// `Running`。断言落在「`Running` 只被投影过一次」，单趟实现 8 轮漏检约 0.4%。
+#[tokio::test]
+async fn awaiting_adjudication_never_projects_back_to_running() {
+    for _ in 0..8 {
+        let statuses: StatusLog = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let dir = TempDir::new("flow-engine-adjudication-projection");
+        let engine = Arc::new(Engine::new(
+            dir.path(),
+            Arc::new(RecordingObserver {
+                statuses: statuses.clone(),
+            }),
+        ));
+        let h = Harness { dir, engine };
+        h.prefix(vec![
+            Event::NodeStarted {
+                node_id: "n1".into(),
+                attempt: 1,
+                child_run_id: None,
+                input: None,
+            },
+            Event::SignalReceived {
+                node_id: "n".into(),
+                payload: json!({"action": "succeeded", "output": 42}),
+            },
+        ])
+        .await;
+        // start → n1、start → n 两条独立副作用分支 → 各自 end
+        let def = def_from(json!({
+            "nodes": [
+                {"id": "s", "type": "start"},
+                {"id": "n1", "type": "http_call", "params": {"url": "http://127.0.0.1:1"}},
+                {"id": "n", "type": "http_call", "params": {"url": "http://127.0.0.1:1"}},
+                {"id": "e1", "type": "end"},
+                {"id": "e2", "type": "end"}
+            ],
+            "edges": [
+                {"from": "s", "to": "n1"}, {"from": "n1", "to": "e1"},
+                {"from": "s", "to": "n"}, {"from": "n", "to": "e2"}
+            ]
+        }));
+        h.engine.resume_run(spec(def)).await.unwrap();
+
+        // 等 n 的已落盘裁决被消费完
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let state = h.engine.snapshot("r").await.unwrap();
+                if matches!(state.record("n").state, NodeState::Completed { .. }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("n 的已落盘裁决未在 5s 内被消费");
+
+        let seen = statuses.lock().clone();
+        let running_count = seen
+            .iter()
+            .filter(|(status, _)| *status == DbRunStatus::Running)
+            .count();
+        assert_eq!(
+            running_count,
+            1,
+            "n1 仍在等人工裁决，run 不得被投影回 running（消费 n 的裁决时，\
+             另一个 Adjudicating 槽位必须已经登记）：{seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|(status, _)| *status == DbRunStatus::AwaitingResume),
+            "存在待裁决节点时必须投影 awaiting_resume：{seen:?}"
+        );
+
+        h.engine.cancel("r").await;
+        h.wait_not_live("r").await;
     }
 }

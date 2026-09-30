@@ -286,10 +286,16 @@ async fn drive_after_acquire(
     let definition: Definition = serde_json::from_value(version.definition)
         .map_err(|e| PgError::Engine(EngineError::LogCorrupted(format!("定义无法解析：{e}"))))?;
 
+    // 定义外节点 = 日志损坏：在补 Pending 与分类之前就拒（与单机臂
+    // `Engine::resume_run` 同一处校验，两臂同契约）。幽灵记录停在非终态时
+    // 终止判定永远不成立，run 会永久卡在 awaiting_resume（fold.rs
+    // `validate_nodes_in_definition` 的完整论证）。
+    folded.validate_nodes_in_definition(&definition)?;
+
     let mut folded = folded;
     folded.ensure_nodes(&definition);
     let plan = RecoveryPlan::classify(&definition, &folded);
-    for node_id in &plan.adjudicate {
+    for node_id in plan.adjudicating_nodes() {
         // 副作用准入检查（§7）：接管后绝不自动重放有外部副作用的节点，
         // 一律进入人工裁决。
         tracing::warn!(

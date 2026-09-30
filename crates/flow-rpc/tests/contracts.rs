@@ -275,6 +275,62 @@ async fn initialized_log_is_resumed_even_when_metadata_still_says_initializing()
     );
 }
 
+/// 崩溃在「`run_cancelled` 已落盘、DB 投影未提交」之间时，恢复回填**不得**
+/// 给 cancelled 的 run 行带上 error。
+///
+/// 回填用的是折叠出的 `fatal_error`，而 `fatal_error` 的语义是「终态为 failed
+/// 时的原因」——取消不是失败。漏清时同一状态两条路径两个答案：正常投影路径
+/// （`FileSink::append_terminal`）对 RunCancelled 明确写 error=NULL，恢复回填
+/// 却把之前某个致命节点的原因写了进去。DESIGN §9「同名字段必须同值」。
+#[tokio::test]
+async fn terminal_recovery_backfill_does_not_put_a_node_failure_on_a_cancelled_run() {
+    let f = Fixture::new().await;
+    f.backend.store().publish(&f.workflow, 1).await.unwrap();
+    f.backend
+        .store()
+        .insert_run("r", &f.workflow, 1, &Value::Null, "running", "manual", None)
+        .await
+        .unwrap();
+    // 崩溃现场：节点致命失败（记下 fatal_error）→ 用户取消 → 日志已终结，
+    // 但 DB 仍是 running（投影那一步没来得及提交）
+    let mut log = EventLog::create(&f.root, "r").await.unwrap();
+    for event in [
+        Event::RunStarted {
+            workflow_id: f.workflow.clone(),
+            workflow_version: 1,
+            input: Value::Null,
+            depth: 0,
+        },
+        Event::NodeStarted {
+            node_id: "s".into(),
+            attempt: 1,
+            child_run_id: None,
+            input: None,
+        },
+        Event::NodeFailed {
+            node_id: "s".into(),
+            attempt: 1,
+            error: "boom".into(),
+            retryable: false,
+        },
+        Event::RunCancelled {},
+    ] {
+        log.append("r", event).await.unwrap();
+    }
+    drop(log);
+
+    assert!(flow_backend::recover_unfinished(&f.backend)
+        .await
+        .unwrap()
+        .is_empty());
+    let row = f.backend.store().get_run("r").await.unwrap();
+    assert_eq!(row.status, "cancelled");
+    assert_eq!(
+        row.error, None,
+        "cancelled 的 run 不得携带节点失败原因（正常路径写 NULL，回填必须一致）"
+    );
+}
+
 #[tokio::test]
 async fn missing_or_empty_logs_of_old_running_tasks_require_manual_recovery() {
     let f = Fixture::new().await;

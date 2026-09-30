@@ -18,7 +18,7 @@ use futures::future::BoxFuture;
 use serde_json::Value;
 
 use flow_engine::{
-    DbRunStatus, Engine, EngineError, Envelope, ResumeOutcome, RunObserver, RunPhase, RunState,
+    DbRunStatus, Engine, EngineError, Envelope, ResumeOutcome, RunObserver, RunState,
     Signal, StartRun, StatusUpdate,
 };
 use flow_store::{Store, StoreError};
@@ -607,12 +607,9 @@ pub async fn recover_unfinished(
             Ok(ResumeOutcome::AlreadyTerminal(boxed)) => {
                 let terminal = *boxed;
                 // 崩溃发生在「事件已落盘、DB 未回填」之间：以事件为准修正 DB。
-                let status = match terminal.phase {
-                    RunPhase::Succeeded => DbRunStatus::Succeeded,
-                    RunPhase::Failed => DbRunStatus::Failed,
-                    RunPhase::Cancelled => DbRunStatus::Cancelled,
-                    RunPhase::Running => DbRunStatus::Running,
-                };
+                // status 映射唯一来源是 RunPhase::as_db_status（PG 臂
+                // reconcile_terminal 共用同一份，不各写一遍 match）。
+                let status = terminal.phase.as_db_status();
                 match store
                     .set_run_status(
                         &run.id,

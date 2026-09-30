@@ -356,6 +356,10 @@ impl Engine {
                 "run_started 缺失或与 run 元数据不一致".into(),
             ));
         }
+        // 定义外节点 = 日志损坏：必须在补 Pending / 分类之前查。幽灵记录停在
+        // 非终态时终止判定永远不成立，run 会永久卡在 awaiting_resume（fold.rs
+        // `validate_nodes_in_definition` 的完整论证）。
+        state.validate_nodes_in_definition(&spec.definition)?;
         if state.phase.is_terminal() {
             return Ok(ResumeOutcome::AlreadyTerminal(Box::new(state)));
         }
