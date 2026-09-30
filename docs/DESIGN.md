@@ -36,6 +36,8 @@ flow 是一个工作流执行引擎：发布不可变的流程定义（DAG），
 
 节点运行可观察性（node_log 事件流、输入面快照、日志控制台）的完整设计见
 `docs/observability-design.md`；本文只记它与状态机相关的契约（§3.1、§6.1、§10）。
+将来接入 OpenTelemetry 的设计见 `docs/opentelemetry-design.md`——**已定未实现**，
+且明确不改事件模型与 `fold`（该文 §2、§12），因此不改变本文任何一条不变量。
 
 ## 2. 总体架构
 

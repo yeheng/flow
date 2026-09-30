@@ -308,3 +308,7 @@ TimelineNode 加 `input`；LogLine/LogLevel/LogStream 接口。`api/flow.ts` **�
 - 不做日志的结构化检索引擎（grep 级前端过滤足够，量被预算封死）。
 - 不做运行时动态调级别（改级别=改环境变量重启；工作流引擎不是常驻服务调参场）。
 - 不改 event.jsonl 的生命周期/GC 策略（既有欠账，另行立项）。
+- **不做 OpenTelemetry 接入**（本文范围之外）。将来接入的设计单独见
+  `docs/opentelemetry-design.md`：OTel 是本事件流的**又一个消费者**，不改事件
+  模型、不动 `fold`；届时本文的预算与脱敏纪律直接复用（脱敏要扩到新的网络出口，
+  见该文 §7）。
