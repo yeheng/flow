@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -482,6 +484,205 @@ pub(crate) async fn read_events(path: &Path) -> Result<Vec<Envelope>, EngineErro
     Ok(events)
 }
 
+/// 读取面（`Engine::read_events`）的实现：全量或增量，由 `from_seq` 与缓存决定。
+///
+/// **为什么要增量**：订阅补齐路径（`run_tail` 的每 10s 兜底、每次缺口/唤醒）与
+/// `run.events(from_seq)` 都会反复读同一个追加式日志。旧实现每次都整份
+/// `fs::read` + 逐行反序列化 + 全序列校验，成本随日志线性增长——一个 1 万事件的
+/// run，每个新事件都要为每个订阅者重解析 1 万行。日志是纯追加的，只需解析上次
+/// 之后新增的字节。
+///
+/// **正确性护栏**（任一不满足就整体重读，绝不猜）：
+/// 1. 文件头指纹一致——同一路径被复用（测试 TempDir、文件被重建）时认出来；
+/// 2. 文件只变长——变短（截断/轮转）丢弃缓存；
+/// 3. 新块首条 `seq` 必须紧接已缓存的末尾 `seq`——接不上说明不是同一个追加流。
+///
+/// 缓存窗口之外（`from_seq` 低于窗口首条，或 `None`）一律全量读并全序列校验，
+/// 与旧实现逐字等价。
+pub(crate) async fn read_events_from(
+    path: &Path,
+    from_seq: Option<u64>,
+) -> Result<Vec<Envelope>, EngineError> {
+    let file_len = tokio::fs::metadata(path).await?.len();
+    let head = read_head_bytes(path).await?;
+
+    // 快照 / 全量读取：不走增量（它也负责把缓存刷热）
+    if from_seq.is_none() {
+        return read_events_uncached(path, &head).await;
+    }
+
+    // 取可用缓存；不满足护栏就连缓存一起丢掉
+    let resume = {
+        let mut cache = tail_cache().lock().unwrap();
+        let usable = cache
+            .entries
+            .get(path)
+            .is_some_and(|entry| entry.byte_len <= file_len && entry.head == head);
+        if usable {
+            let entry = cache.entries.get(path).unwrap();
+            Some((entry.byte_len, entry.last_seq))
+        } else {
+            cache.entries.remove(path);
+            cache.order.retain(|p| p != path);
+            None
+        }
+    };
+
+    if let Some((start, last_seq)) = resume {
+        let bytes = read_tail_bytes(path, start).await?;
+        let (fresh, consumed) = parse_complete_lines(&bytes, start)?;
+        if !fresh.is_empty() && fresh[0].seq != last_seq + 1 {
+            // 接不上：文件被改写或不是同一个追加流。整体重读（它会给出正确结果，
+            // 或给出与旧实现一致的 LogCorrupted），不用缓存拼一个似是而非的答案。
+            return read_events_uncached(path, &head).await;
+        }
+        for pair in fresh.windows(2) {
+            if pair[0].seq + 1 != pair[1].seq {
+                return Err(EngineError::LogCorrupted(format!(
+                    "事件 seq 不连续：{} 之后是 {}",
+                    pair[0].seq, pair[1].seq
+                )));
+            }
+        }
+        let new_last = fresh.last().map(|e| e.seq).unwrap_or(last_seq);
+        cache_store(path, head.clone(), consumed, new_last, &fresh, false);
+    } else {
+        return read_events_uncached(path, &head).await;
+    }
+
+    // 窗口够不着（回放从很早的 seq 起）：全量读。命中窗口时才走缓存切片。
+    //
+    // 锁只在下面这个块里活着，块内就切成 owned Vec 交出来——**绝不**把
+    // MutexGuard 带过任何 await：这个 future 被 `Box<dyn Future + Send>` 装着
+    // （`EventReader::read_events`），带着 std Guard 就直接编译不过。
+    let from = from_seq.unwrap_or(0);
+    let window = {
+        let cache = tail_cache().lock().unwrap();
+        match cache.entries.get(path) {
+            Some(entry) if from > entry.first_seq => Some(
+                entry
+                    .events
+                    .iter()
+                    .filter(|e| e.seq >= from)
+                    .cloned()
+                    .collect::<Vec<Envelope>>(),
+            ),
+            _ => None,
+        }
+    };
+    match window {
+        Some(events) => Ok(events),
+        None => read_events_uncached(path, &head).await,
+    }
+}
+
+/// 全量读 + 全序列校验，并用结果刷新缓存（`read_events_from` 的慢路径）。
+async fn read_events_uncached(path: &Path, head: &[u8]) -> Result<Vec<Envelope>, EngineError> {
+    let bytes = tokio::fs::read(path).await?;
+    let (events, consumed) = parse_complete_lines(&bytes, 0)?;
+    validate_sequence(&events)?;
+    let last_seq = events.last().map(|e| e.seq).unwrap_or(0);
+    cache_store(path, head.to_vec(), consumed, last_seq, &events, true);
+    Ok(events)
+}
+
+/// 文件头指纹：同一路径下的文件被换掉时认出它不是同一个日志。
+async fn read_head_bytes(path: &Path) -> Result<Vec<u8>, EngineError> {
+    use tokio::io::AsyncReadExt;
+    let file = tokio::fs::File::open(path).await?;
+    let mut head = Vec::new();
+    file.take(HEAD_FINGERPRINT as u64)
+        .read_to_end(&mut head)
+        .await?;
+    Ok(head)
+}
+
+/// 只读 [start, EOF)：增量路径不把整份文件搬进内存。
+async fn read_tail_bytes(path: &Path, start: u64) -> Result<Vec<u8>, EngineError> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut file = tokio::fs::File::open(path).await?;
+    file.seek(std::io::SeekFrom::Start(start)).await?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).await?;
+    Ok(bytes)
+}
+
+/// 头指纹长度：足以区分同一路径下的不同日志，又不至于把缓存条目撑大。
+const HEAD_FINGERPRINT: usize = 32;
+/// 每个 run 缓存的事件窗口（条）。窗口之外的 `from_seq` 走全量读。
+const TAIL_CACHE_EVENTS: usize = 512;
+/// 缓存条目上限（个 run）。超出按 FIFO 淘汰，内存有界。
+const TAIL_CACHE_RUNS: usize = 64;
+
+/// 一个 run 的追加式日志缓存窗口。
+struct CachedTail {
+    /// 文件头指纹（护栏 1）
+    head: Vec<u8>,
+    /// 已解析到（已消费）的字节偏移：最后一条完整行的末尾（护栏 2 的基准）
+    byte_len: u64,
+    /// 窗口内最小 seq：`from_seq` 低于它就说明窗口够不着，必须全量读
+    first_seq: u64,
+    /// 窗口内最大 seq（= 已解析的末尾 seq）
+    last_seq: u64,
+    events: VecDeque<Envelope>,
+}
+
+#[derive(Default)]
+struct TailCache {
+    entries: HashMap<PathBuf, CachedTail>,
+    /// 插入顺序，用于 FIFO 淘汰（不用 LRU：读取顺序不改变容量上界）
+    order: VecDeque<PathBuf>,
+}
+
+fn tail_cache() -> &'static Mutex<TailCache> {
+    static CACHE: OnceLock<Mutex<TailCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(TailCache::default()))
+}
+
+/// 维护缓存窗口。`replace_window` 为真时**整体替换**（全量读路径：它交上来的
+/// 就是完整事件表，窗口里已有的都含在里面，再追加一遍会重复），为假时追加
+/// （增量路径：交上来的只有新解析的那些）。
+fn cache_store(
+    path: &Path,
+    head: Vec<u8>,
+    byte_len: u64,
+    last_seq: u64,
+    fresh: &[Envelope],
+    replace_window: bool,
+) {
+    let mut cache = tail_cache().lock().unwrap();
+    let key = path.to_path_buf();
+    let existed = cache.entries.contains_key(&key);
+    if !existed && cache.order.len() >= TAIL_CACHE_RUNS {
+        if let Some(oldest) = cache.order.pop_front() {
+            cache.entries.remove(&oldest);
+        }
+    }
+    if !existed {
+        cache.order.push_back(key.clone());
+    }
+    let entry = cache.entries.entry(key).or_insert_with(|| CachedTail {
+        head: Vec::new(),
+        byte_len: 0,
+        first_seq: 1,
+        last_seq: 0,
+        events: VecDeque::new(),
+    });
+    entry.head = head;
+    entry.byte_len = byte_len;
+    entry.last_seq = last_seq;
+    if replace_window {
+        entry.events.clear();
+    }
+    for envelope in fresh {
+        entry.events.push_back(envelope.clone());
+    }
+    while entry.events.len() > TAIL_CACHE_EVENTS {
+        entry.events.pop_front();
+    }
+    entry.first_seq = entry.events.front().map(|e| e.seq).unwrap_or(last_seq);
+}
+
 pub fn validate_sequence(events: &[Envelope]) -> Result<(), EngineError> {
     for (i, env) in events.iter().enumerate() {
         let expected = i as u64 + 1;
@@ -514,9 +715,15 @@ pub fn validate_sequence_contiguous(events: &[Envelope]) -> Result<(), EngineErr
 /// 逐行解析；允许最后一行是被崩溃截断的半行，返回有效字节长度供调用方截断文件。
 async fn read_events_repairing(path: &Path) -> Result<(Vec<Envelope>, u64), EngineError> {
     let bytes = tokio::fs::read(path).await?;
+    parse_complete_lines(&bytes, 0)
+}
+
+/// 解析一段字节里的**完整行**（末行没有 LF 就是半行，不算——它可能被续写完整，
+/// 留给下一次）。`base` 是该段在文件中的起始偏移，用于错误定位与「已消费字节数」。
+fn parse_complete_lines(bytes: &[u8], base: u64) -> Result<(Vec<Envelope>, u64), EngineError> {
     let mut events = Vec::new();
     let mut offset = 0usize;
-    let mut valid_len = 0u64;
+    let mut consumed = base;
 
     while offset < bytes.len() {
         let rest = &bytes[offset..];
@@ -525,20 +732,21 @@ async fn read_events_repairing(path: &Path) -> Result<(Vec<Envelope>, u64), Engi
         };
         let line = &rest[..nl];
         let text = String::from_utf8_lossy(line);
+        offset += nl + 1;
+        consumed = base + offset as u64;
         if text.trim().is_empty() {
-            offset += nl + 1;
-            valid_len = offset as u64;
             continue;
         }
         let envelope: Envelope = serde_json::from_str(&text).map_err(|e| {
-            EngineError::LogCorrupted(format!("{path:?} 第 {offset} 字节处的事件无法解析：{e}"))
+            EngineError::LogCorrupted(format!(
+                "第 {} 字节处的事件无法解析：{e}",
+                base + offset as u64 - line.len() as u64 - 1
+            ))
         })?;
         events.push(envelope);
-        offset += nl + 1;
-        valid_len = offset as u64;
     }
 
-    Ok((events, valid_len))
+    Ok((events, consumed))
 }
 
 /// 严格组提交语义（DESIGN §3.2）的内联单测。
@@ -724,6 +932,143 @@ mod group_commit_tests {
         let events = read_events(&log_path(dir.path(), "r")).await.unwrap();
         assert_eq!(events.len(), 4);
         assert!(matches!(events[3].event, Event::RunCompleted { .. }));
+    }
+
+    /// 增量读与全量读对每个 `from_seq` 都给同一答案（含越界的 from）。
+    #[tokio::test]
+    async fn incremental_read_matches_full_read_for_every_from_seq() {
+        let _guard = test_lock().lock().await;
+        let dir = TempDir::new("flow-incremental-read");
+        let mut log = EventLog::create(dir.path(), "r").await.unwrap();
+        for i in 0..8 {
+            log.append("r", started(i)).await.unwrap();
+        }
+        let path = log_path(dir.path(), "r");
+        let full = read_events(&path).await.unwrap();
+        assert_eq!(full.len(), 8);
+
+        for from in 1..=10u64 {
+            let got = read_events_from(&path, Some(from)).await.unwrap();
+            let expect: Vec<Envelope> = full.iter().filter(|e| e.seq >= from).cloned().collect();
+            assert_eq!(got, expect, "from_seq={from} 与全量读不一致");
+        }
+        assert_eq!(read_events_from(&path, None).await.unwrap(), full);
+    }
+
+    /// 缓存之后日志继续追加：增量读必须看见新事件，且不许把旧答案再交出去。
+    #[tokio::test]
+    async fn incremental_read_picks_up_appended_events() {
+        let _guard = test_lock().lock().await;
+        let dir = TempDir::new("flow-incremental-append");
+        let mut log = EventLog::create(dir.path(), "r").await.unwrap();
+        for i in 0..4 {
+            log.append("r", started(i)).await.unwrap();
+        }
+        let path = log_path(dir.path(), "r");
+        assert_eq!(read_events_from(&path, Some(1)).await.unwrap().len(), 4);
+
+        let mut reopened = EventLog::open(dir.path(), "r").await.unwrap();
+        for i in 4..8 {
+            reopened.append("r", started(i)).await.unwrap();
+        }
+        let all = read_events_from(&path, Some(1)).await.unwrap();
+        assert_eq!(all.len(), 8, "追加后增量读漏掉了新事件");
+        assert_eq!(all.last().unwrap().seq, 8);
+        // 增量切片：只要窗口内的后缀
+        let tail = read_events_from(&path, Some(6)).await.unwrap();
+        assert_eq!(
+            tail.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![6, 7, 8]
+        );
+    }
+
+    /// 缓存之后日志被改写（ seq 接不上）：必须整体重读并报损坏，
+    /// 不许用缓存拼一个似是而非的连续链。
+    #[tokio::test]
+    async fn incremental_read_rejects_a_gap_it_crosses() {
+        let _guard = test_lock().lock().await;
+        let dir = TempDir::new("flow-incremental-gap");
+        let mut log = EventLog::create(dir.path(), "r").await.unwrap();
+        for i in 0..4 {
+            log.append("r", started(i)).await.unwrap();
+        }
+        let path = log_path(dir.path(), "r");
+        assert_eq!(read_events_from(&path, Some(1)).await.unwrap().len(), 4);
+
+        // 手工接一段 seq=6 起的事件：与已缓存的末尾 4 接不上
+        let mut text = String::new();
+        for seq in 6..=8u64 {
+            let envelope = Envelope {
+                seq,
+                ts: Utc::now(),
+                run_id: "r".into(),
+                event: started(seq as usize),
+            };
+            text.push_str(&serde_json::to_string(&envelope).unwrap());
+            text.push('\n');
+        }
+        let mut file = OpenOptions::new().append(true).open(&path).await.unwrap();
+        file.write_all(text.as_bytes()).await.unwrap();
+        file.sync_all().await.unwrap();
+        drop(file);
+
+        let err = read_events_from(&path, Some(5)).await.unwrap_err();
+        assert!(matches!(err, EngineError::LogCorrupted(_)), "{err}");
+    }
+
+    /// 缓存之后文件被截断：必须丢掉缓存整体重读，而不是从错的偏移继续解析。
+    #[tokio::test]
+    async fn incremental_read_drops_cache_when_file_shrinks() {
+        let _guard = test_lock().lock().await;
+        let dir = TempDir::new("flow-incremental-truncate");
+        let mut log = EventLog::create(dir.path(), "r").await.unwrap();
+        for i in 0..6 {
+            log.append("r", started(i)).await.unwrap();
+        }
+        let path = log_path(dir.path(), "r");
+        assert_eq!(read_events_from(&path, Some(1)).await.unwrap().len(), 6);
+
+        let full_len = tokio::fs::metadata(&path).await.unwrap().len();
+        let truncated = OpenOptions::new().write(true).open(&path).await.unwrap();
+        truncated.set_len(full_len / 2).await.unwrap();
+        truncated.sync_all().await.unwrap();
+        drop(truncated);
+
+        let kept = read_events_from(&path, Some(1)).await.unwrap();
+        assert_eq!(kept.len(), 3, "截断后应只读到剩下的 3 条");
+        assert_eq!(kept.last().unwrap().seq, 3);
+    }
+
+    /// 同一路径下的文件被整个换掉（测试 TempDir 复用 / 日志重建）：头指纹必须
+    /// 认出来，绝不能把上一个日志的缓存答案交出去。
+    #[tokio::test]
+    async fn incremental_read_does_not_serve_a_replaced_file_from_cache() {
+        let _guard = test_lock().lock().await;
+        let dir = TempDir::new("flow-incremental-replace");
+        let path = log_path(dir.path(), "r");
+
+        let mut first = EventLog::create(dir.path(), "r").await.unwrap();
+        for i in 0..5 {
+            first.append("r", started(i)).await.unwrap();
+        }
+        drop(first);
+        assert_eq!(read_events_from(&path, Some(1)).await.unwrap().len(), 5);
+
+        std::fs::remove_file(&path).unwrap();
+        // 同一个路径、不同的日志（内容更短且头部不同）
+        let mut second = EventLog::create(dir.path(), "r").await.unwrap();
+        for i in 0..2 {
+            second.append("r", started(i)).await.unwrap();
+        }
+        drop(second);
+
+        let got = read_events_from(&path, Some(1)).await.unwrap();
+        assert_eq!(
+            got.len(),
+            2,
+            "换文件后必须读到新日志，不是缓存的旧答案：{:?}",
+            got.iter().map(|e| e.seq).collect::<Vec<_>>()
+        );
     }
 
     /// 序列化兼容：NodeLog 往返一致；旧格式 node_started（无 input 字段）

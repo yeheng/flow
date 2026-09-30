@@ -245,10 +245,7 @@ impl RunState {
     ///
     /// 不放进 [`Self::from_events`]：只读路径（`Engine::snapshot` / 订阅回放）
     /// 没有定义，那里的语义是「原样呈现磁盘」，不该要求调用方提供定义。
-    pub fn validate_nodes_in_definition(
-        &self,
-        def: &Definition,
-    ) -> Result<(), EngineError> {
+    pub fn validate_nodes_in_definition(&self, def: &Definition) -> Result<(), EngineError> {
         for node_id in self.records.keys() {
             if def.node(node_id).is_none() {
                 return Err(EngineError::LogCorrupted(format!(
@@ -615,12 +612,12 @@ mod tests {
         }
     }
 
-    /// attempt / error 只有一份，且就在 `NodeState` 里。
+    /// 走一遍**全部**事件类型，每步都断言 `label()` 的展示词与 attempt 的跟随。
     ///
-    /// 这两个字段曾是 `NodeRecord` 的影子副本，靠事件分支手工同步——`error` 副本
-    /// 连 `NodeSkipped` 分支都没清（漏网之处），`attempts` 副本靠三行 `.max()`
-    /// 维持。删掉副本后「展示值」与「状态」不可能分叉：走一遍**全部**事件类型，
-    /// 每步都断言派生的 attempts/error 与状态一致。
+    /// `attempt` / `error` 只有一份且就在 `NodeState` 里（这两个字段曾是
+    /// `NodeRecord` 的影子副本，靠事件分支手工同步——`error` 副本连 `NodeSkipped`
+    /// 分支都没清）。影子字段已不存在，所以这里**不能**再断言「派生值等于状态值」——
+    /// 那是同一个表达式比大小，恒真。要盯的是另一层会分叉的派生：`label()`。
     #[test]
     fn attempt_and_error_are_derived_from_state_on_every_path() {
         let started = |attempt| Event::NodeStarted {
@@ -700,15 +697,45 @@ mod tests {
             for (i, event) in path.iter().enumerate() {
                 state.fold(&env((i + 1) as u64, event.clone()));
                 let rec = state.record("n1");
-                // 派生的展示值与状态恒等：影子字段已不存在，无从分叉
-                assert_eq!(rec.attempts(), rec.state.attempt());
-                assert_eq!(rec.error(), rec.state.error());
-                // error 只在 Failed 出现，且与状态里的文本逐字一致
+                // 这里不断言 `attempts() == state.attempt()`：两者本来就是同一个
+                // 表达式，恒真，不断言任何东西。真正会分叉的是**另一层派生**——
+                // 时间线标签 `label()`（`retrying` 与 `failed` 靠 `retryable` 分流，
+                // 是全文件唯一一处把状态翻译成展示词的分支），以及 attempt 在
+                // 重试后必须跟着走到 2。走遍全部事件路径盯这两件。
                 match &rec.state {
-                    NodeState::Failed { error, .. } => {
+                    NodeState::Pending => assert_eq!(rec.state.label(), "pending", "{event:?}"),
+                    NodeState::Running { attempt } => {
+                        assert_eq!(rec.state.label(), "running", "{event:?}");
+                        assert_eq!(rec.attempts(), *attempt, "{event:?}");
+                    }
+                    NodeState::Completed { attempt } => {
+                        assert_eq!(rec.state.label(), "completed", "{event:?}");
+                        assert_eq!(rec.attempts(), *attempt, "{event:?}");
+                    }
+                    NodeState::Failed {
+                        retryable: true, ..
+                    } => {
+                        assert_eq!(
+                            rec.state.label(),
+                            "retrying",
+                            "{event:?} 可重试失败应是 retrying"
+                        );
+                    }
+                    NodeState::Failed {
+                        retryable: false,
+                        error,
+                        ..
+                    } => {
+                        assert_eq!(rec.state.label(), "failed", "{event:?}");
+                        // error 只在 Failed 出现，且与状态里的文本逐字一致
                         assert_eq!(rec.error(), Some(error.as_str()), "{event:?}");
                     }
-                    _ => assert_eq!(rec.error(), None, "{event:?} 非 Failed 态不该有 error"),
+                    NodeState::Skipped { .. } => {
+                        assert_eq!(rec.state.label(), "skipped", "{event:?}")
+                    }
+                }
+                if !matches!(rec.state, NodeState::Failed { .. }) {
+                    assert_eq!(rec.error(), None, "{event:?} 非 Failed 态不该有 error");
                 }
             }
         }
@@ -868,7 +895,10 @@ mod tests {
                 retryable: false,
             },
         ));
-        assert!(state.fatal_error.is_some(), "前置条件不成立：致命失败应记录原因");
+        assert!(
+            state.fatal_error.is_some(),
+            "前置条件不成立：致命失败应记录原因"
+        );
 
         state.fold(&env(2, Event::RunCancelled {}));
         assert_eq!(state.phase, RunPhase::Cancelled);
@@ -892,9 +922,12 @@ mod tests {
                 retryable: false,
             },
         ));
-        state.fold(&env(2, Event::RunFailed {
-            error: "run boom".into(),
-        }));
+        state.fold(&env(
+            2,
+            Event::RunFailed {
+                error: "run boom".into(),
+            },
+        ));
         assert_eq!(state.fatal_error.as_deref(), Some("run boom"));
     }
 

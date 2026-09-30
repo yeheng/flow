@@ -56,9 +56,14 @@ pub(crate) fn run_tail(
 enum Phase {
     /// 首次全量回放（seq=1 起）尚未成功过。
     Replaying,
-    /// 回放完成，追流中。有缺口时转 `Filling`。
+    /// 回放完成，追流中。已追平（`caught_up`）时不再读，等唤醒。
     Streaming,
     /// 正在等一个缺口被补齐；`retry_at` 到点后重试补齐。
+    ///
+    /// **只有「一次读取毫无所获而缺口仍在」才进这个相位**（`advance` 第 2 步）。
+    /// 缺口本身不是进入理由：相位一旦是 `Filling`，第 2 步的补齐就被整个跳过，
+    /// 于是「缺口由实时段先到造成」时会永远在 退避→醒来→再退避 之间打转——
+    /// 读不发生、缺口不消失、订阅静默停摆（`gap_created_by_live_segment_*` 守护）。
     Filling { retry_at: tokio::time::Instant },
     /// 终态事件已转发，流结束。
     Done,
@@ -86,6 +91,15 @@ struct RunTail {
     /// 按 seq 去重、有序暂存（补齐段与实时段会重叠）。
     events: BTreeMap<u64, Envelope>,
     phase: Phase,
+    /// 已追平：上一次补读取没有任何新数据，且暂存区没有缺口。
+    ///
+    /// **为什么需要它**：没有这个标记时，第 2 步每次 `advance()` 都会重读一次
+    /// 读取面。对活着且暂时没有新事件的 run（订阅一个长跑 run 的**常态**）这就
+    /// 是无限空转——每个在线观众烧满一个核，且每次重读整份日志
+    /// （`live_run_at_tail_*` 守护）。追平后必须落到第 3 步，由新事件或 10s
+    /// 兜底定时器唤醒；`Phase` 装不下这个信息：它不是进度，而是「读取结果为空
+    /// 且无缺口」这个组合的结论。
+    caught_up: bool,
 }
 
 impl RunTail {
@@ -101,6 +115,7 @@ impl RunTail {
             last_seq: 0,
             events: BTreeMap::new(),
             phase: Phase::Replaying,
+            caught_up: false,
         }
     }
 
@@ -121,10 +136,13 @@ impl RunTail {
     }
 
     /// 进入补齐相位；已在补齐则保留原退避（不重置计时器）。
+    ///
+    /// 进入即意味着「这一轮不要读了」：调用点必须已经准备好去第 3 步等唤醒。
     fn ensure_filling(&mut self) {
         if self.phase.is_filling() {
             return;
         }
+        self.caught_up = false;
         self.phase = Phase::Filling {
             retry_at: tokio::time::Instant::now() + FILL_RETRY,
         };
@@ -132,8 +150,10 @@ impl RunTail {
 
     async fn advance(&mut self) -> Option<Envelope> {
         loop {
-            // 1) 排水：只吐严格连续的前缀。重复（补齐段与实时段重叠）丢弃；
-            //    缺口绝不跳过——转 Filling 去补齐，否则事件被静默吞掉。
+            // 1) 排水：只吐严格连续的前缀。重复（补齐段与实时段重叠）丢弃。
+            //    缺口**绝不跳**（下面的臂只放行 last_seq+1，缺口天然挡住后续一切
+            //    事件），但**不在这里转 Filling**——补齐发生在第 2 步，提前转相位
+            //    只会让第 2 步被跳过，缺口永远补不上（见 Phase::Filling 的注释）。
             match self.events.keys().next().copied() {
                 Some(seq) if seq <= self.last_seq => {
                     self.events.remove(&seq);
@@ -147,8 +167,7 @@ impl RunTail {
                     }
                     return Some(envelope);
                 }
-                // 缺口：绝不跳，转 Filling 去补齐（已在 Filling 就不重置退避）
-                Some(_) => self.ensure_filling(),
+                Some(_) => {}
                 None => {}
             }
             if !self.phase.is_live() {
@@ -156,8 +175,12 @@ impl RunTail {
             }
 
             // 2) 补齐。回放期（Replaying）读全量；追流期读 last_seq+1 起的增量。
-            //    失败不重试过热：转 Filling 等唤醒，绝不在缺口未补齐时继续吐事件。
-            if !self.phase.is_filling() {
+            //    追平（`caught_up`）后跳过本步去等唤醒：否则活着且暂时没有新事件的
+            //    run 会被无限重读——每个在线观众烧满一个核，且每次重读整份日志。
+            //    读不到新数据时同样去等：有缺口转 Filling 等退避，无缺口就是追平
+            //    等新事件。两条的共同点是**不再读**，绝不 `continue` 回本步。
+            let mut fresh_data = false;
+            if !self.phase.is_filling() && !self.caught_up {
                 let from = self.fill_from();
                 match self.reader.read_events(&self.run_id, Some(from)).await {
                     Ok(list) => {
@@ -169,6 +192,7 @@ impl RunTail {
                                 added = true;
                             }
                         }
+                        fresh_data = added;
                         if self.phase == Phase::Replaying {
                             self.phase = Phase::Streaming;
                         }
@@ -200,6 +224,7 @@ impl RunTail {
                         if matches!(err, BackendError::RunNotFound(_)) {
                             tracing::debug!(run_id = %self.run_id, "订阅的 run 不存在，结束订阅流");
                             self.phase = Phase::Done;
+                            self.caught_up = false;
                             continue;
                         }
                         // 其余失败：不谎报终结、不跳缺口：等重试定时器或下一条事件唤醒
@@ -211,7 +236,17 @@ impl RunTail {
                         self.ensure_filling();
                     }
                 }
-                continue;
+                // 一次读取毫无所获：去第 3 步等唤醒。有缺口 → Filling（保留原退避，
+                // 由新事件或定时器唤醒）；无缺口 → 追平。两者都不再读。
+                if !fresh_data {
+                    if self.has_gap() {
+                        self.ensure_filling();
+                    }
+                    self.caught_up = self.phase.is_live() && !self.has_gap();
+                }
+                if !self.caught_up {
+                    continue;
+                }
             }
 
             // 3) 等待唤醒：新事件（快路径）/ 补齐重试定时器 / 共享流关闭
@@ -223,27 +258,31 @@ impl RunTail {
             tokio::pin!(sleep);
             tokio::select! {
                 _ = &mut sleep => {
-                    // 重试窗口到了：回到「去补齐」
+                    // 重试窗口到了：回到「去补齐」。**退避不等于追平**——醒来必须
+                    // 真的再读一次，所以 caught_up 与相位一起清掉。
                     self.phase = Phase::Streaming;
+                    self.caught_up = false;
                 }
                 received = self.rx.recv() => {
                     match received {
                         Ok(envelope) if envelope.run_id == self.run_id => {
+                            // 新事件是有效唤醒：清掉追平标记回第 2 步重读。它造成的
+                            // 缺口是否继续退避，由第 2 步的「读不到新数据」分支决定，
+                            // 不在这里提前决定——那正是永久退避的来路。
+                            self.caught_up = false;
                             if envelope.seq > self.last_seq {
                                 if envelope.seq > self.last_seq + 1 {
                                     self.ensure_filling();
                                 }
                                 self.events.insert(envelope.seq, envelope);
                             }
-                            if self.phase.is_filling() {
-                                // 新事件是有效唤醒：立刻重试补齐，不等退避
-                                self.phase = Phase::Streaming;
-                            }
+                            self.phase = Phase::Streaming;
                         }
                         Ok(_) => {}
                         // 广播追赶不上：丢的是唤醒不是数据，整体补齐
                         Err(broadcast::error::RecvError::Lagged(_)) => {
                             self.phase = Phase::Streaming;
+                            self.caught_up = false;
                         }
                         // 共享流关闭（进程停机）：尽力补齐剩余后收尾
                         Err(broadcast::error::RecvError::Closed) => {

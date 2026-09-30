@@ -238,6 +238,7 @@ fn is_unrecoverable(err: &PgError) -> bool {
     matches!(
         err,
         PgError::Engine(EngineError::LogCorrupted(_))
+            | PgError::Engine(EngineError::InvalidDefinition(_))
             | PgError::WorkflowNotFound(_)
             | PgError::VersionNotFound(..)
     )
@@ -285,6 +286,17 @@ async fn drive_after_acquire(
         .await?;
     let definition: Definition = serde_json::from_value(version.definition)
         .map_err(|e| PgError::Engine(EngineError::LogCorrupted(format!("定义无法解析：{e}"))))?;
+
+    // 定义合法性：与单机臂 `Engine::resume_run` 同一处校验（发布期已校验过一次，
+    // 这里是第二道）。**不能不校验**：`RecoveryPlan::classify` 对
+    // `definition.node_type()` 返回 None 的节点是静默 `continue`——不登记任何槽位，
+    // 于是该节点既不被派发也不被跳过，`plan()` 看不见它（只遍历 definition.nodes）、
+    // `all_terminal()` 看得见它（遍历 records），slots 空而非终态 ⇒ `EngineError::Bug`
+    // ⇒ 每次接管都把 run 挂进 awaiting_resume，永远推不动。
+    // InvalidDefinition 归不可恢复（与 LogCorrupted 同一条隔离出口）。
+    definition
+        .validate()
+        .map_err(|e| PgError::Engine(EngineError::InvalidDefinition(e)))?;
 
     // 定义外节点 = 日志损坏：在补 Pending 与分类之前就拒（与单机臂
     // `Engine::resume_run` 同一处校验，两臂同契约）。幽灵记录停在非终态时

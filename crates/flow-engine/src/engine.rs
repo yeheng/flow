@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::backend::{CommitOutcome, PendingInput, RunEventSink};
 use crate::driver::{spawn_driver, DriverSpec, RecoveryPlan, SignalRequest};
 use crate::error::EngineError;
-use crate::event::{read_events, run_dir, Envelope, Event, EventLog};
+use crate::event::{read_events, read_events_from, run_dir, Envelope, Event, EventLog};
 use crate::fold::RunState;
 use crate::model::Definition;
 
@@ -280,11 +280,9 @@ impl Engine {
         if !path.exists() {
             return Err(EngineError::RunNotFound(run_id.to_string()));
         }
-        let events = read_events(&path).await?;
-        Ok(match from_seq {
-            Some(from) => events.into_iter().filter(|e| e.seq >= from).collect(),
-            None => events,
-        })
+        // 增量续读（`read_events_from`）：同一个追加式日志被反复读时只解析新增
+        // 字节；`None` / 窗口够不着时仍是全量读 + 全序列校验，语义不变。
+        read_events_from(&path, from_seq).await
     }
 
     /// 从事件日志折叠出当前状态（磁盘是权威，不依赖内存镜像）。

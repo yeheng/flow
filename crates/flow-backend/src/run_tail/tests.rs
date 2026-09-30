@@ -236,3 +236,95 @@ async fn terminal_run_replay_survives_transient_read_failure() {
         .expect("订阅流未结束（回放失败后挂死）");
     assert_eq!(seqs, vec![1, 2]);
 }
+
+/// 计数 + 让出的一次读取：模拟真实异步 I/O（ Immediately-ready 的假读者
+/// 会让空转的任务永不屈服，超时断言就跑不到）。
+struct CountingReader {
+    log: parking_lot::Mutex<Vec<Envelope>>,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingReader {
+    fn new(log: Vec<Envelope>) -> Arc<CountingReader> {
+        Arc::new(CountingReader {
+            log: parking_lot::Mutex::new(log),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl EventReader for CountingReader {
+    fn read_events<'a>(
+        &'a self,
+        _run_id: &'a str,
+        from_seq: Option<u64>,
+    ) -> BoxFuture<'a, Result<Vec<Envelope>, BackendError>> {
+        Box::pin(async move {
+            tokio::task::yield_now().await;
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let from = from_seq.unwrap_or(0);
+            Ok(self
+                .log
+                .lock()
+                .iter()
+                .filter(|e| e.seq >= from)
+                .cloned()
+                .collect())
+        })
+    }
+}
+
+/// 活着的 run（日志已追平、尚无终态）必须阻塞等唤醒，**不得空转读日志**。
+///
+/// 已有的用例全部以「终态 / run 不存在 / 空日志」收尾，三种都会让
+/// `advance()` 走到 `return None`；「追平但仍活着」这条路径没有任何覆盖，
+/// 而它恰好是订阅一个长跑 run 的**常态**。空转在那里意味着每个在线观众
+/// 无偿占满一个核，并且每次都把整份日志重读一遍。
+#[tokio::test]
+async fn live_run_at_tail_blocks_instead_of_spinning() {
+    let reader = CountingReader::new(vec![started(1), node_done(2)]);
+    let (_tx, rx) = broadcast::channel::<Envelope>(16);
+
+    let stream = run_tail(reader.clone(), rx, "run-1".into());
+    futures::pin_mut!(stream);
+    assert_eq!(stream.next().await.unwrap().seq, 1);
+    assert_eq!(stream.next().await.unwrap().seq, 2);
+
+    let before = reader.reads();
+    let next = tokio::time::timeout(Duration::from_millis(300), stream.next()).await;
+    assert!(
+        next.is_err(),
+        "日志已追平且 run 未终结：必须阻塞等唤醒，不得空转"
+    );
+    let during = reader.reads() - before;
+    assert!(during <= 1, "追平后重读日志 {during} 次——advance 在空转");
+}
+
+/// 缺口由**实时段先到**造成（广播快于读取面）时必须被重试补齐。
+///
+/// 构造方式只能借道「首读失败」：广播只在第 3 步的 `select!` 里被消费，而第 3 步
+/// 只有已经 `Filling` 才会到——先让读取失败一次把相位压过去，此时广播里排队的
+/// 终点事件才被取出，缺口 3 就此由实时段造成。
+///
+/// 失败模式是**永久退避**：`advance()` 每轮先把缺口转回 `Filling`，第 2 步的
+/// 补齐于是被整个跳过，10s 定时器醒来又立刻被转回 `Filling`——读永远不会发生，
+/// 订阅静默停在这个 run 上，连终态都送不出去。已有用例的读取面都即时成功，
+/// 缺口在读取一步就被补掉，广播只是送来的重复，碰不到这条路径。
+#[tokio::test(start_paused = true)]
+async fn gap_created_by_live_segment_is_filled_by_retry() {
+    let log = vec![started(1), node_done(2), node_done(3), terminal(4)];
+    let reader = FakeReader::new(log, 1); // 首读失败：进入 Filling，才会消费广播
+    let (tx, rx) = broadcast::channel::<Envelope>(16);
+    tx.send(terminal(4)).unwrap(); // 实时段先到 4
+
+    let stream = run_tail(reader, rx, "run-1".into());
+    let seqs = tokio::time::timeout(Duration::from_secs(120), collect(stream))
+        .await
+        .expect("缺口必须被重试补齐（永久退避会让订阅静默停摆）");
+    assert_eq!(seqs, vec![1, 2, 3, 4]);
+}

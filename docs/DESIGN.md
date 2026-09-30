@@ -157,6 +157,30 @@ elements ... WITH ORDINALITY` 整批插入 + 一次 NOTIFY），逐条则是 N �
   `open` 时物理截断，保证后续追加不粘连。
 - 逐行解析只容忍**最后一行**残缺；中间行损坏是 `LogCorrupted` 硬错误，
   不静默吞数据。`read_events` 校验 seq 连续（防截断/损坏）。
+- `Engine::read_events(run, from_seq)` 走**增量续读**（`event.rs::read_events_from`）：
+  日志纯追加，因此只需解析上次之后新增的字节。护栏三条，任一不满足就整体重读、
+  绝不猜：文件头指纹一致（同一路径被复用/日志重建时认出来）、文件只变长
+  （截断/轮转丢弃缓存）、新块首条 `seq` 必须紧接已缓存的末尾 `seq`。
+  `from_seq` 低于缓存窗口首条、或 `None`（快照）时仍是全量读 + 全序列校验，
+  与加缓存之前逐字等价。缓存进程级有界（每 run 512 条事件 × 64 个 run，FIFO 淘汰）。
+
+### 3.4 订阅的回放 + 追流状态机（flow-backend run_tail）
+
+`run_tail` 把「从 seq=1 回放」与「追实时增量」合成一个流，`Phase` 是
+`Replaying → Streaming ⇄ Filling → Done | Closed`。**只吐严格连续的前缀**：
+出现缺口先补齐，补齐失败等重试定时器或下一条事件唤醒，绝不跳缺口静默丢事件。
+
+两条不变量（都有回归测试钉住，改动前必须知道）：
+
+- **追平后必须等唤醒，不得重读**。`caught_up` 记录「上次补读取毫无所获且无缺口」；
+  没有这个标记时每次 `advance()` 都会重读一次读取面。对活着且暂时没有新事件的
+  run（订阅一个长跑 run 的**常态**）这就是无限空转——每个在线观众烧满一个核，
+  且每次把整份日志重读一遍。追平后由新事件或 10s 兜底定时器唤醒；
+  `Phase` 装不下这个信息：它不是进度，而是「读取结果为空且无缺口」的结论。
+- **缺口本身不构成退避理由**。`Filling` 只能由「一次读取毫无所获而缺口仍在」
+  进入；缺口一旦在排水步就转成 `Filling`，补齐那一整步就被跳过，10s 定时器醒来
+  又立刻被转回 `Filling`——读永远不发生、缺口永远不消失，订阅静默停摆
+  （连终态都送不出去）。真实后端（PG 查询慢于 NOTIFY）下实时段先到是常态。
 
 ## 4. 折叠器：一个状态机，两个消费者
 
@@ -865,6 +889,12 @@ body 为 `{from, to, subject, text}`（纯文本正文），输出 `{status, id}
     顺序不确定。混成一趟会多投影一次 `Running`：`apply_signal` 消费掉一个裁决后
     要看「还有没有 `Adjudicating` 槽位」，而另一个待裁决节点此时尚未登记，引擎
     误判「已无待裁决」把仍挂在人工裁决上的 run 投影成 running。
+21. **订阅追平后等唤醒、缺口只在读不到新数据时才退避**（run_tail，§3.4）。
+    前者没有标记时会无限重读读取面——订阅一个长跑 run 就把一个核烧满，且每次
+    重读整份日志；后者把「有缺口」直接当成退避理由会让补齐那一整步被跳过，
+    10s 定时器醒来又被转回退避，读永远不发生、订阅静默停摆（终态都送不出去）。
+    两条分别由 `live_run_at_tail_blocks_instead_of_spinning` 与
+    `gap_created_by_live_segment_is_filled_by_retry` 钉住。
 
 ## 13. 测试策略
 
@@ -979,7 +1009,8 @@ volume 上。Docker 只在容器**自己退出**时（`--rm`）回收匿名 volu
   run_failed（sub_workflow）、订阅缺口补齐与失败重试（flow-backend run_tail）、
   子 run 重放沿用钉版本（flow-backend flow-store 的 child_version_pin + flow-pg 的
   `replayed_child_run_keeps_pinned_version`，两臂同一条契约）、信号错误码与订阅
-  回放契约（contracts）、空日志订阅立即结束（run_tail）、PG reader 回放起点报
+  回放契约（contracts）、空日志订阅立即结束（run_tail）、追平后不空转与
+  实时段先到造成的缺口可补齐（run_tail）、PG reader 回放起点报
   RunNotFound（flow-pg protocol）、身份不符隔离且不重扫——以 lease_epoch
   停止攀升断言（flow-pg recovery）、删除后 insert_run 拒绝孤儿 run（flow-store）、
   run_started 进全局广播两臂一致（flow-engine global_subscribe）；
@@ -1051,4 +1082,4 @@ volume 上。Docker 只在容器**自己退出**时（`--rm`）回收匿名 volu
 - 跨进程 SIGSTOP 场景下的真实副作用计数验收（副作用准入已用确定性前缀测试钉住）；
 - 不指定 run_id 的全局订阅仍有后端差异：SQLite 只推本进程事件、Postgres 推
   全集群增量；指定 run_id 的回放 + 追流 + 终态结束语义两后端已统一
-  （flow-backend 的 run_tail 状态机）。
+  （flow-backend 的 run_tail 状态机，见 §3.4）。
