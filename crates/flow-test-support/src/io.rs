@@ -211,9 +211,7 @@ pub fn spawn_reporting_ports(
     cmd.env(rpc_addr_env, "127.0.0.1:0")
         .env(http_addr_env, "127.0.0.1:0")
         .stdout(std::process::Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("启动被测进程失败：{e}"))?;
+    let mut child = cmd.spawn().map_err(|e| format!("启动被测进程失败：{e}"))?;
     let stdout = child
         .stdout
         .take()
@@ -222,8 +220,13 @@ pub fn spawn_reporting_ports(
     let (tx, rx) = std::sync::mpsc::channel::<ReportedPorts>();
     std::thread::spawn(move || {
         use std::io::{BufRead, Write};
-        let mut log = log_path
-            .and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
+        let mut log = log_path.and_then(|p| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .ok()
+        });
         let mut rpc = None;
         let mut http = None;
         for line in std::io::BufReader::new(stdout).lines() {

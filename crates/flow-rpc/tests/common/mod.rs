@@ -52,13 +52,8 @@ impl ServerProc {
         // 端口由被测进程自己向内核要（FLOW_ADDR/FLOW_HTTP_ADDR=127.0.0.1:0），
         // 实际端口从它的启动日志读回：父进程「挑端口再让子进程绑」存在 TOCTOU，
         // 并行用例会抢走端口（CI 多核上会真发生），子进程随即 AddrInUse 退出。
-        let (child, ports) = spawn_reporting_ports(
-            &mut cmd,
-            "FLOW_ADDR",
-            "FLOW_HTTP_ADDR",
-            None,
-        )
-        .unwrap_or_else(|e| panic!("{e}"));
+        let (child, ports) = spawn_reporting_ports(&mut cmd, "FLOW_ADDR", "FLOW_HTTP_ADDR", None)
+            .unwrap_or_else(|e| panic!("{e}"));
         ServerProc {
             child,
             addr: ports.rpc,
@@ -96,13 +91,8 @@ impl ServerProc {
         for (key, value) in extra_env {
             cmd.env(key, value);
         }
-        let (child, ports) = spawn_reporting_ports(
-            &mut cmd,
-            "FLOW_ADDR",
-            "FLOW_HTTP_ADDR",
-            None,
-        )
-        .unwrap_or_else(|e| panic!("{e}"));
+        let (child, ports) = spawn_reporting_ports(&mut cmd, "FLOW_ADDR", "FLOW_HTTP_ADDR", None)
+            .unwrap_or_else(|e| panic!("{e}"));
         ServerProc {
             child,
             addr: ports.rpc,
