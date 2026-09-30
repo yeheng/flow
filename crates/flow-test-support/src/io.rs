@@ -234,6 +234,10 @@ pub fn spawn_reporting_ports(
             if let Some(w) = log.as_mut() {
                 let _ = writeln!(w, "{line}");
             }
+            // tracing 默认给字段名/值上 ANSI 颜色（即使写到管道），转义序列插在
+            // `local_addr` 与 `=` 之间，直接按 "local_addr=" 匹配永远落空——
+            // 先剥掉 CSI 序列再解析。
+            let line = strip_ansi(&line);
             if rpc.is_none() {
                 if let Some(addr) = parse_addr_after(&line, RPC_MARKER) {
                     rpc = Some(addr);
@@ -266,6 +270,31 @@ pub fn spawn_reporting_ports(
     }
 }
 
+/// 剥掉一行日志里的 ANSI CSI 转义序列（ESC `[` … 终止字母）。
+/// tracing-subscriber 的 fmt 层默认开 ANSI 颜色且不探 tty，管道/文件里同样
+/// 带颜色码；颜色只出现在渲染层，剥掉不影响 `key=value` 的语义。
+fn strip_ansi(line: &str) -> std::borrow::Cow<'_, str> {
+    if !line.contains('\u{1b}') {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            // CSI：参数/中间字节之后以 0x40–0x7E 的终止字母收尾
+            for c in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&c) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// 从一行日志里取 `marker` 之后的 `host:port`。
 fn parse_addr_after(line: &str, marker: &str) -> Option<SocketAddr> {
     let rest = line.split(marker).nth(1)?.trim_start();
@@ -273,4 +302,29 @@ fn parse_addr_after(line: &str, marker: &str) -> Option<SocketAddr> {
         .split(|c: char| c.is_whitespace() || c == '"' || c == ',')
         .next()?;
     token.parse().ok()
+}
+
+#[cfg(test)]
+mod port_parse_tests {
+    use super::*;
+
+    /// tracing fmt 的真实输出形态：字段名与 `=` 之间隔着 ANSI 颜色序列，
+    /// 剥掉后必须能解析出地址（这是 spawn_reporting_ports 曾经 30s 超时
+    /// 的根因）。
+    #[test]
+    fn ansi_colored_tracing_line_parses() {
+        let line = "\u{1b}[2m2026-09-30T06:57:58Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m \
+                    \u{1b}[2mflow_rpc\u{1b}[0m\u{1b}[2m:\u{1b}[0m flow-server 已启动 \
+                    \u{1b}[3mlocal_addr\u{1b}[0m\u{1b}[2m=\u{1b}[0m127.0.0.1:54915 \
+                    \u{1b}[3mbackend\u{1b}[0m\u{1b}[2m=\u{1b}[0m\"sqlite\"";
+        let addr = parse_addr_after(&strip_ansi(line), "local_addr=").unwrap();
+        assert_eq!(addr, SocketAddr::from(([127, 0, 0, 1], 54915)));
+    }
+
+    #[test]
+    fn strip_ansi_leaves_plain_text_untouched() {
+        let plain = "http_addr=127.0.0.1:9801 plain";
+        assert!(matches!(strip_ansi(plain), std::borrow::Cow::Borrowed(_)));
+        assert_eq!(strip_ansi(plain), plain);
+    }
 }
