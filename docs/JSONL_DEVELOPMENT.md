@@ -2,6 +2,22 @@
 
 此路径用于开发与独立部署验证；一期非断电验收已通过，真实断电按用户要求排除。不要将旧 SQLite 数据目录直接交给新入口。现有 `flow-server` 的 SQLite/PG 默认行为保持独立，生产未切换。
 
+## 二期 IPC 执行模式（本地子进程）
+
+二期将进程内节点执行替换为受管理的本地执行子进程（模板/script/condition/HTTP 全部在 `flow-executor` 进程内执行；journal 语义与进程内模式逐字节同构）。
+
+```sh
+cargo build -p flow-executor                 # 先构建执行器二进制
+FLOW_EXECUTION_MODE=ipc cargo run -p flow-backend --bin flow-journal-dev -- --data-dir ./target/v2-ipc run --definition ./workflow.json --input ./input.json
+FLOW_EXECUTOR_BIN=/path/to/flow-executor FLOW_EXECUTION_MODE=ipc cargo run -p flow-rpc --bin flow-journal-server
+```
+
+- 默认 `in_process`（一期行为）；`ipc` 模式二进制缺失/版本不兼容直接失败，不静默回退。
+- 执行器定位：`FLOW_EXECUTOR_BIN` 显式路径 → 同目录 → target/{debug,release}。
+- 常量（X_max 默认 4/A_max 16/W 2 MiB/帧上限等）见 `flow_engine::execution_protocol::contract`。
+- 同数据集单写者；一个 run 只绑定一种执行模式；master epoch 随 IPC 启动持久提交。
+- 取消/强杀执行器：缺口与不确定副作用按一期规则保留（uncertain 等待/Integrity 标记），重启不重发已授权操作。
+
 本地运行一个定义：
 
 ```sh

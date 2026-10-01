@@ -632,6 +632,7 @@ dependencies = [
  "fs2",
  "futures",
  "hex",
+ "libc",
  "parking_lot",
  "reqwest",
  "serde",
@@ -643,6 +644,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -682,6 +684,7 @@ dependencies = [
  "flow-journal",
  "flow-test-support",
  "futures",
+ "libc",
  "parking_lot",
  "reqwest",
  "rquickjs",
@@ -691,6 +694,28 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "flow-executor"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "flow-engine",
+ "flow-journal",
+ "futures",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

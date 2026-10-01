@@ -9,6 +9,8 @@ reqwest.workspace = true
 sha2.workspace = true
 hex.workspace = true
 base64 = "0.22"
+libc = { workspace = true }
+tracing-subscriber = { workspace = true }
 clap.workspace = true
 cron-parser.workspace = true
 sqlx.workspace = true
@@ -34,3 +36,5 @@ flow-test-support = { path = "../flow-test-support", default-features = false }
 chrono = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+libc = { workspace = true }
+tracing-subscriber = { workspace = true }

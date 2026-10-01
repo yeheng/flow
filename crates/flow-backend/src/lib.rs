@@ -54,6 +54,7 @@ pub use flow_engine::{
 };
 
 mod child;
+pub mod execution;
 pub mod journal;
 mod journal_commands;
 mod journal_driver;
@@ -580,5 +581,21 @@ pub async fn open_from_env() -> Result<AnyBackend, BackendError> {
         other => Err(BackendError::Invalid(format!(
             "未知 FLOW_BACKEND：{other}（支持 sqlite | postgres）"
         ))),
+    }
+}
+
+
+/// 二期 I09：按环境变量（FLOW_EXECUTION_MODE / FLOW_EXECUTOR_BIN）选择
+/// 执行模式并启动调度。IPC 模式二进制缺失/版本不兼容直接失败，不静默
+/// 落回进程内执行。
+pub async fn start_execution_from_env(
+    backend: &std::sync::Arc<crate::journal::JournalBackend>,
+) -> Result<(), crate::journal::JournalError> {
+    match execution::mode_from_env() {
+        Ok(execution::ExecutionMode::InProcess) => backend.start_execution().await,
+        Ok(mode @ execution::ExecutionMode::Ipc(_)) => backend.start_execution_ipc(mode).await,
+        Err(error) => Err(crate::journal::JournalError::Journal(
+            flow_journal::Error::Invalid(error),
+        )),
     }
 }

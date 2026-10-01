@@ -5,6 +5,7 @@ pub mod engine;
 pub mod error;
 pub mod event;
 pub mod exec;
+pub mod execution_protocol;
 pub mod expr;
 pub mod fold;
 pub mod journal_state;

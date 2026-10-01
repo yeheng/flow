@@ -1,6 +1,6 @@
 # JSONL 重构二期：本地 IPC 与执行子进程
 
-日期：2026-09-30。状态：**设计已拆分，产品实现未开始**。本文件承接 [一期基础](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md)，任务独立见 [I01–I10](JSONL_MASTER_EXECUTOR_PHASE2_TASK_LIST.md)。原远程方案已迁至 [三期](JSONL_MASTER_EXECUTOR_PHASE3_PLAN.md)。
+日期：2026-09-30；更新：2026-10-02。状态：**I01–I10 已实现并通过开发验收（等价性/故障矩阵/打包回归；生产切换与 release 性能矩阵未执行，见各任务证据）。**本文件承接 [一期基础](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md)，任务独立见 [I01–I10](JSONL_MASTER_EXECUTOR_PHASE2_TASK_LIST.md)。原远程方案已迁至 [三期](JSONL_MASTER_EXECUTOR_PHASE3_PLAN.md)。
 
 <a id="phase2-s1"></a>
 ## 1. 二期范围
@@ -314,4 +314,4 @@ I10 同时回归 [一期故障矩阵](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#pla
 <a id="phase2-approval"></a>
 ## 8. 二期实施与交接状态
 
-本轮仅修订设计，I01–I10 尚未执行。后续记录实际用户授权、实现证据、版本兼容和生产切换结果。I10 向三期交付本地进程池、IPC fixtures、稳定业务身份和端到端持久语义；三期在此基础上增加中继，不能提前返回权威 ACK。
+I01–I10 于 2026-10-02 实现完成（开发验收口径）：本地进程池/IPC fixtures/稳定业务身份/端到端持久语义已交付；等价性与二期故障矩阵回归通过。未执行项：生产切换、release 性能复核（本机 sqlx-macros dylib 构建损坏阻塞，与本代码无关）、真实断电（沿用一期排除口径）。三期在此基础上增加中继。I10 向三期交付本地进程池、IPC fixtures、稳定业务身份和端到端持久语义；三期在此基础上增加中继，不能提前返回权威 ACK。

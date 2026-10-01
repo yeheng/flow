@@ -1,0 +1,30 @@
+[package]
+name = "flow-executor"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+flow-engine = { path = "../flow-engine" }
+flow-journal = { path = "../flow-journal" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true }
+base64 = "0.22"
+sha2 = { workspace = true }
+hex = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures = { workspace = true }
+
+[[bin]]
+name = "flow-executor"
+path = "src/main.rs"
+
+[lib]
+name = "flow_executor"
+path = "src/lib.rs"

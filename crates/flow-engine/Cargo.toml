@@ -14,6 +14,7 @@ thiserror = { workspace = true }
 reqwest = { workspace = true }
 parking_lot = { workspace = true }
 rquickjs = { workspace = true }
+libc = { workspace = true }
 tracing = { workspace = true }
 flow-dto = { path = "../flow-dto" }
 futures = { workspace = true }

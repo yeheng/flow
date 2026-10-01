@@ -146,6 +146,11 @@ pub struct State {
     pub commands: BTreeMap<String, CommandRecord>,
     #[serde(default)]
     pub legacy: BTreeMap<String, Value>,
+    /// Writer tenure (JSONL refactor phase 2, §3.2). Bumped durably each time a master
+    /// process takes the exclusive journal write lock and before it dispatches tasks.
+    /// Zero means a journal written before the epoch event existed.
+    #[serde(default, with = "snapshot_decimal")]
+    pub master_epoch: u64,
 }
 
 pub fn command_key(scope: &str, request_id: &str) -> String {
@@ -175,6 +180,20 @@ impl State {
             return Err(invalid("reducer identity/LSN mismatch"));
         }
         for (index, event) in tx.events.iter().enumerate() {
+            if event.kind == EventKind::MasterEpochStarted {
+                if event.run_id.is_some()
+                    || event.dispatch_id.is_some()
+                    || event.node_id.is_some()
+                    || event.run_seq != 0
+                    || event.audit_seq != 0
+                {
+                    return Err(invalid("master epoch event must be dataset-scoped"));
+                }
+                let epoch = number(&event.payload, "epoch")?;
+                if epoch != self.master_epoch + 1 {
+                    return Err(invalid("master epoch must advance by exactly one"));
+                }
+            }
             if event.kind == EventKind::OperationIntent {
                 let next = tx
                     .events
@@ -207,6 +226,7 @@ impl State {
         let mut command_undo = BTreeMap::new();
         let mut value_undo = BTreeMap::new();
         let mut legacy_undo = BTreeMap::new();
+        let mut epoch_undo: Option<u64> = None;
         for event in &tx.events {
             if event.kind == EventKind::LegacyImport {
                 let key = string(&event.payload, "key")?;
@@ -247,6 +267,9 @@ impl State {
                     .entry(id.clone())
                     .or_insert_with(|| self.schedules.get(&id).cloned());
             }
+            if event.kind == EventKind::MasterEpochStarted {
+                epoch_undo.get_or_insert(self.master_epoch);
+            }
             if event.kind == EventKind::WebhookChanged {
                 let id = string(&event.payload, "token")?;
                 webhook_undo
@@ -278,6 +301,9 @@ impl State {
             restore(&mut self.webhooks, webhook_undo);
             restore(&mut self.commands, command_undo);
             restore(&mut self.legacy, legacy_undo);
+            if let Some(epoch) = epoch_undo {
+                self.master_epoch = epoch;
+            }
             for undo in value_undo.into_values() {
                 self.values.restore(undo);
             }
@@ -348,6 +374,10 @@ impl State {
         }
         match event.kind {
             EventKind::SegmentStarted | EventKind::SegmentSealed => return Ok(()),
+            EventKind::MasterEpochStarted => {
+                self.master_epoch = number(p, "epoch")?;
+                return Ok(());
+            }
             EventKind::Command => {
                 let mut command: CommandRecord = serde_json::from_value(p.clone())?;
                 command.lsn = lsn;

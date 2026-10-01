@@ -39,6 +39,7 @@ pub enum EventKind {
     SignalReceived,
     Adjudicated,
     LateAudit,
+    MasterEpochStarted,
     LegacyImport,
 }
 

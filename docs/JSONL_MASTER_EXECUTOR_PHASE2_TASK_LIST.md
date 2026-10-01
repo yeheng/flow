@@ -1,6 +1,6 @@
 # JSONL 重构二期任务清单：本地 IPC 与子进程
 
-日期：2026-09-30。状态：**仅设计与任务已拆分，所有实现任务待执行**。设计依据：[本期方案](JSONL_MASTER_EXECUTOR_PHASE2_PLAN.md)。本轮用户要求仅修订文档，不表示已开始实现或允许生产切换。
+日期：2026-09-30；更新：2026-10-02。状态：**I01–I10 实现完成（开发验收口径；生产切换未执行），证据见 docs/refactor-evidence/I01–I10.md。**设计依据：[本期方案](JSONL_MASTER_EXECUTOR_PHASE2_PLAN.md)。本轮用户要求仅修订文档，不表示已开始实现或允许生产切换。
 
 <a id="agent-entry"></a>
 ## 执行入口与完成定义
@@ -32,7 +32,7 @@
 <a id="task-i01"></a>
 ### I01 冻结本地 IPC 与资源契约
 
-- **状态**：todo；证据：`docs/refactor-evidence/I01.md`。
+- **状态**：done（2026-10-02）；证据：`docs/refactor-evidence/I01.md`。
 - **前置输入**：[F17](JSONL_MASTER_EXECUTOR_TASK_LIST.md#task-f17)。
 - **设计引用**：[二期 §1](JSONL_MASTER_EXECUTOR_PHASE2_PLAN.md#phase2-s1)、[二期 §2](JSONL_MASTER_EXECUTOR_PHASE2_PLAN.md#phase2-s2)、[二期 §3.5](JSONL_MASTER_EXECUTOR_PHASE2_PLAN.md#phase2-s3-5)。
 - **改动范围**：IPC fixtures、能力/会话、窗口与进程预算。
@@ -53,7 +53,7 @@
 <a id="task-i02"></a>
 ### I02 实现双通道帧与会话校验
 
-- **状态**：todo；证据：`docs/refactor-evidence/I02.md`。
+- **状态**：done（2026-10-02）；证据：`docs/refactor-evidence/I02.md`。
 - **前置输入**：[I01](#task-i01)。
 - **设计引用**：[二期 §3.1](JSONL_MASTER_EXECUTOR_PHASE2_PLAN.md#phase2-s3-1)、[二期 §3.2](JSONL_MASTER_EXECUTOR_PHASE2_PLAN.md#phase2-s3-2)、[二期 §3.3](JSONL_MASTER_EXECUTOR_PHASE2_PLAN.md#phase2-s3-3)。
 - **改动范围**：execution_protocol、帧 codec、父端点归属、任期事件接入。
@@ -73,7 +73,7 @@
 <a id="task-i03"></a>
 ### I03 实现子进程池与可靠回收
 
-- **状态**：todo；证据：`docs/refactor-evidence/I03.md`。
+- **状态**：done（2026-10-02）；证据：`docs/refactor-evidence/I03.md`。
 - **前置输入**：[I02](#task-i02)。
 - **设计引用**：[二期 §3.1](JSONL_MASTER_EXECUTOR_PHASE2_PLAN.md#phase2-s3-1)、[二期 §3.7](JSONL_MASTER_EXECUTOR_PHASE2_PLAN.md#phase2-s3-7)、[二期 §3.9](JSONL_MASTER_EXECUTOR_PHASE2_PLAN.md#phase2-s3-9)。
 - **改动范围**：flow-executor 二进制、spawn/FD/进程树与有界槽位。
@@ -93,7 +93,7 @@
 <a id="task-i04"></a>
 ### I04 迁移模板与节点执行到子进程
 
-- **状态**：todo；证据：`docs/refactor-evidence/I04.md`。
+- **状态**：done（2026-10-02）；证据：`docs/refactor-evidence/I04.md`。
 - **前置输入**：[I03](#task-i03)。
 - **设计引用**：[二期 §3.8](JSONL_MASTER_EXECUTOR_PHASE2_PLAN.md#phase2-s3-8)。
 - **改动范围**：exec/expr 子进程适配与每任务 JS 上下文。
@@ -113,7 +113,7 @@
 <a id="task-i05"></a>
 ### I05 实现持久窗口与观测传输
 
-- **状态**：todo；证据：`docs/refactor-evidence/I05.md`。
+- **状态**：done（2026-10-02）；证据：`docs/refactor-evidence/I05.md`。
 - **前置输入**：[I04](#task-i04)。
 - **设计引用**：[二期 §3.4](JSONL_MASTER_EXECUTOR_PHASE2_PLAN.md#phase2-s3-4)、[二期 §3.5](JSONL_MASTER_EXECUTOR_PHASE2_PLAN.md#phase2-s3-5)、[二期 §4](JSONL_MASTER_EXECUTOR_PHASE2_PLAN.md#phase2-s4)。
 - **改动范围**：AuditBatch/Ack、发送/接收预算、ObservabilityBatch。
@@ -134,7 +134,7 @@
 <a id="task-i06"></a>
 ### I06 实现输入传输与输出分块衔接
 
-- **状态**：todo；证据：`docs/refactor-evidence/I06.md`。
+- **状态**：done（2026-10-02）；证据：`docs/refactor-evidence/I06.md`。
 - **前置输入**：[I05](#task-i05)。
 - **设计引用**：[二期 §3.3](JSONL_MASTER_EXECUTOR_PHASE2_PLAN.md#phase2-s3-3)、[二期 §3.6](JSONL_MASTER_EXECUTOR_PHASE2_PLAN.md#phase2-s3-6)、[一期 §6.1](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s6-1)。
 - **改动范围**：TransferChunk/InputReady 与一期 StoredValue 流接口。
@@ -154,7 +154,7 @@
 <a id="task-i07"></a>
 ### I07 接通操作许可、结果屏障与取消排空
 
-- **状态**：todo；证据：`docs/refactor-evidence/I07.md`。
+- **状态**：done（2026-10-02）；证据：`docs/refactor-evidence/I07.md`。
 - **前置输入**：[I06](#task-i06)。
 - **设计引用**：[二期 §3.6](JSONL_MASTER_EXECUTOR_PHASE2_PLAN.md#phase2-s3-6)、[二期 §4.1](JSONL_MASTER_EXECUTOR_PHASE2_PLAN.md#phase2-s4-1)、[一期 §7](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s7)。
 - **改动范围**：主进程 IPC 适配到一期授权/结果门面。
@@ -175,7 +175,7 @@
 <a id="task-i08"></a>
 ### I08 接入 IPC Driver 与持久等待恢复
 
-- **状态**：todo；证据：`docs/refactor-evidence/I08.md`。
+- **状态**：done（2026-10-02）；证据：`docs/refactor-evidence/I08.md`。
 - **前置输入**：[I07](#task-i07)、[I09](#task-i09)。
 - **设计引用**：[二期 §3.8](JSONL_MASTER_EXECUTOR_PHASE2_PLAN.md#phase2-s3-8)、[二期 §5](JSONL_MASTER_EXECUTOR_PHASE2_PLAN.md#phase2-s5)、[一期 §9](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s9)。
 - **改动范围**：执行端口切换、父子/等待/恢复与一期等价回归。
@@ -196,7 +196,7 @@
 <a id="task-i09"></a>
 ### I09 提前交付 IPC 开发打包与升级入口
 
-- **状态**：todo；证据：`docs/refactor-evidence/I09.md`。
+- **状态**：done（2026-10-02）；证据：`docs/refactor-evidence/I09.md`。
 - **前置输入**：[I03](#task-i03)。
 - **设计引用**：[二期 §5](JSONL_MASTER_EXECUTOR_PHASE2_PLAN.md#phase2-s5)。
 - **改动范围**：server/executor 打包、模式配置与测试启动链。
@@ -216,7 +216,7 @@
 <a id="task-i10"></a>
 ### I10 验收本地 IPC 并交接远程阶段
 
-- **状态**：todo；证据：`docs/refactor-evidence/I10.md`。
+- **状态**：done（2026-10-02，开发验收口径；生产切换未执行）；证据：`docs/refactor-evidence/I10.md`。
 - **前置输入**：[I08](#task-i08)、[I09](#task-i09)。
 - **设计引用**：[二期 §6](JSONL_MASTER_EXECUTOR_PHASE2_PLAN.md#phase2-s6)、[二期 §7](JSONL_MASTER_EXECUTOR_PHASE2_PLAN.md#phase2-s7)、[二期状态](JSONL_MASTER_EXECUTOR_PHASE2_PLAN.md#phase2-approval)。
 - **改动范围**：二期故障/e2e/perf 与升级验收报告。

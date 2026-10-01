@@ -1,4 +1,7 @@
-//! V2 in-process coordinator. Persistent waits occupy no active execution task.
+//! V2 coordinator. Persistent waits occupy no active execution task.
+//! IPC mode (phase 2) replaces the in-process node executor with a managed
+//! subprocess pool; journal semantics are byte-identical between modes.
+use crate::execution::{ExecutionMode, IpcDispatcher};
 use crate::journal::{JournalBackend, JournalError};
 use crate::journal_commands::{id, node_event, now};
 use crate::journal_execution::Attempt;
@@ -10,6 +13,13 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// 节点执行端口：一期进程内 / 二期 IPC 子进程。
+#[derive(Clone)]
+pub(crate) enum ExecutionPort {
+    InProcess,
+    Ipc(Arc<IpcDispatcher>),
+}
+
 type Result<T> = std::result::Result<T, JournalError>;
 fn invalid(s: impl Into<String>) -> flow_journal::Error {
     flow_journal::Error::Invalid(s.into())
@@ -17,12 +27,60 @@ fn invalid(s: impl Into<String>) -> flow_journal::Error {
 
 impl JournalBackend {
     pub async fn start_execution(self: &Arc<Self>) -> Result<()> {
-        self.start_execution_with_limit(16).await
+        self.start_execution_with_port(16, ExecutionPort::InProcess).await
     }
     pub async fn start_execution_with_limit(self: &Arc<Self>, limit: usize) -> Result<()> {
         if !(1..=16).contains(&limit) {
             return Err(invalid("A_max must be within 1..=16").into());
         }
+        self.start_execution_with_port(limit, ExecutionPort::InProcess).await
+    }
+    /// 二期 IPC 模式：先持久提交新 master_epoch，再创建进程池与派发器
+    /// （取得独占写权后持久提交新任期，再派发任务；二期 §3.2）。
+    pub async fn start_execution_ipc(
+        self: &Arc<Self>,
+        mode: ExecutionMode,
+    ) -> Result<()> {
+        let crate::execution::ExecutionMode::Ipc(options) = mode else {
+            return self.start_execution().await;
+        };
+        // I09：启用 IPC 时二进制缺失直接失败，不静默回退进程内执行。
+        if !options.executor_bin.is_file() {
+            return Err(invalid(format!(
+                "executor binary missing: {}",
+                options.executor_bin.display()
+            ))
+            .into());
+        }
+        let epoch = self.bump_master_epoch().await?;
+        let pool = crate::execution::ExecutorPool::new(
+            options,
+            self.journal.id().into(),
+            epoch,
+        );
+        let dispatcher = Arc::new(IpcDispatcher::new(pool));
+        self.start_execution_with_port(16, ExecutionPort::Ipc(dispatcher))
+            .await
+    }
+    /// 持久提交新任期并返回新 epoch。
+    pub(crate) async fn bump_master_epoch(self: &Arc<Self>) -> Result<u64> {
+        self.internal(|state| {
+            let epoch = state.master_epoch + 1;
+            Ok((
+                vec![Event::new(
+                    EventKind::MasterEpochStarted,
+                    json!({"epoch": epoch.to_string()}),
+                )],
+                epoch,
+            ))
+        })
+        .await
+    }
+    async fn start_execution_with_port(
+        self: &Arc<Self>,
+        limit: usize,
+        port: ExecutionPort,
+    ) -> Result<()> {
         let mut driver = self.execution.lock().await;
         if driver.is_some() {
             return Ok(());
@@ -31,6 +89,7 @@ impl JournalBackend {
         let weak = Arc::downgrade(self);
         let cancel = self.cancellation();
         let notify = self.execution_notification();
+        let port = port;
         notify.notify_one();
         *driver = Some(tokio::spawn(async move {
             let mut tasks: tokio::task::JoinSet<((String, String), Result<()>)> =
@@ -131,10 +190,17 @@ impl JournalBackend {
                             let attempt=Attempt::begin(backend.clone(),run_id.clone(),node.id.clone()).await?;
                             let key=(run_id.clone(),node.id.clone());active.insert(key.clone());
                             backend.execution_peak.fetch_max(tasks.len()+1,std::sync::atomic::Ordering::Relaxed);
-                            let node=node.clone();let observation=observation.clone();
+                            let node=node.clone();let observation=observation.clone();let port=port.clone();
                             tasks.spawn(async move {
-                                let logger=observation.map(|store|NodeLogger::observation(store.logger(attempt.run_id.clone(),attempt.dispatch_id.clone()),attempt.node_id.clone(),1)).unwrap_or_else(NodeLogger::disabled);
-                                let result=execute(&attempt,&node,predecessors.clone(),logger).await;
+                                let result=match &port{
+                                    ExecutionPort::InProcess=>{
+                                        let logger=observation.map(|store|NodeLogger::observation(store.logger(attempt.run_id.clone(),attempt.dispatch_id.clone()),attempt.node_id.clone(),1)).unwrap_or_else(NodeLogger::disabled);
+                                        execute(&attempt,&node,predecessors.clone(),logger).await
+                                    }
+                                    ExecutionPort::Ipc(dispatcher)=>{
+                                        dispatcher.execute(&attempt,&node,predecessors.clone(),observation).await
+                                    }
+                                };
                                 if let Err(error)=&result {
                                     let snapshot=attempt.snapshot().await;
                                     if let Ok(snapshot)=snapshot {

@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
     });
     let (server, addr) = flow_rpc::journal_v2::serve(backend.clone(), token, addr).await?;
-    backend.start_execution().await?;
+    flow_backend::start_execution_from_env(&backend).await?;
     let scheduler = flow_rpc::journal_triggers::start(backend.clone());
     eprintln!("JSONL development RPC listening on {addr}");
     tokio::signal::ctrl_c().await?;
