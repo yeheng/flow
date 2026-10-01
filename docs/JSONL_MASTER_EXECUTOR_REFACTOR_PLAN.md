@@ -1,8 +1,8 @@
 # JSONL 重构一期：基础存储与进程内执行
 
-日期：2026-09-30。状态：**一期实现进行中；开发 runner/RPC、journal 与进程内执行基础已落地；全量验收未完成；生产未切换**。
+日期：2026-10-01。状态：**一期实现进行中；开发 runner/RPC、journal 与进程内执行基础已落地；全量验收未完成；生产未切换**。
 
-当前证据与剩余项见 [任务清单](JSONL_MASTER_EXECUTOR_TASK_LIST.md) 和 [F17 进展](refactor-evidence/F17.md)。开发入口不能视为现有 web/CLI、cron/webhook、全部集成节点和历史迁移已完成。
+当前证据与剩余项见 [任务清单](JSONL_MASTER_EXECUTOR_TASK_LIST.md) 和 [F17 进展](refactor-evidence/F17.md)。本轮已接入 /journal web、CLI、cron/webhook、LLM/email 与 LegacyImport；已修复的问题和未完成的验收见 [一期复核报告](JSONL_PHASE1_REVIEW.md)。
 
 本文是一期设计，也是三期路线入口。原二期远程方案已移到三期；各期都有独立任务清单，后一期不得成为前一期验收的隐含依赖。现有 `docs/DESIGN.md` 在对应实现验收前不替换。
 

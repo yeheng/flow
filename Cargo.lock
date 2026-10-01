@@ -622,6 +622,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "clap",
+ "cron-parser",
  "flow-dto",
  "flow-engine",
  "flow-journal",
@@ -636,6 +637,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "sqlx",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -654,10 +656,12 @@ dependencies = [
  "flow-rpc",
  "flow-test-support",
  "jsonrpsee",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

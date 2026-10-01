@@ -14,6 +14,37 @@ pub struct ProjectedRow {
 }
 
 impl Projector {
+    /// Startup-only replacement from an already verified complete reducer snapshot.
+    /// Rows and cursor are installed atomically; the caller still owns the journal lock.
+    pub async fn restore_snapshot(
+        &self,
+        journal_id: &str,
+        lsn: u64,
+        rows: Vec<ProjectedRow>,
+    ) -> Result<(), sqlx::Error> {
+        if journal_id != self.journal_id {
+            return Err(sqlx::Error::Protocol("foreign snapshot".into()));
+        }
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM journal_entities")
+            .execute(&mut *tx)
+            .await?;
+        for row in rows {
+            if let Some(value) = row.value {
+                sqlx::query("INSERT INTO journal_entities(kind,key,body) VALUES(?,?,?)")
+                    .bind(row.kind)
+                    .bind(row.key)
+                    .bind(value.to_string())
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+        sqlx::query("UPDATE journal_cursor SET applied_lsn=? WHERE singleton=1")
+            .bind(lsn.to_string())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await
+    }
     pub async fn open(path: &Path, journal_id: &str) -> Result<Self, sqlx::Error> {
         use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
         let pool = SqlitePoolOptions::new()
@@ -109,11 +140,14 @@ impl Projector {
                 .fetch_one(&mut *tx)
                 .await?;
         let body: Option<String> =
-            sqlx::query_scalar("SELECT body FROM journal_entities WHERE kind=? AND key=?")
+            sqlx::query_scalar("SELECT CASE WHEN length(CAST(body AS BLOB))<=8388608 THEN body ELSE 'RESPONSE_TOO_LARGE' END FROM journal_entities WHERE kind=? AND key=?")
                 .bind(kind)
                 .bind(key)
                 .fetch_optional(&mut *tx)
                 .await?;
+        if body.as_deref() == Some("RESPONSE_TOO_LARGE") {
+            return Err(sqlx::Error::Protocol("RESPONSE_TOO_LARGE".into()));
+        }
         let value = body
             .map(|s| serde_json::from_str(&s).map_err(|e| sqlx::Error::Decode(Box::new(e))))
             .transpose()?;
@@ -135,20 +169,32 @@ impl Projector {
                 .fetch_one(&mut *tx)
                 .await?;
         let rows = sqlx::query(
-            "SELECT body FROM journal_entities WHERE kind=? AND key>? ORDER BY key LIMIT ?",
+            "SELECT key,length(CAST(body AS BLOB)) AS bytes FROM journal_entities WHERE kind=? AND key>? ORDER BY key LIMIT ?",
         )
         .bind(kind)
         .bind(after)
         .bind(limit.min(256) as i64)
         .fetch_all(&mut *tx)
         .await?;
-        let values = rows
-            .iter()
-            .map(|r| {
-                serde_json::from_str(r.get::<&str, _>("body"))
-                    .map_err(|e| sqlx::Error::Decode(Box::new(e)))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut values = Vec::new();
+        let mut bytes = 0i64;
+        for row in rows {
+            let n: i64 = row.get("bytes");
+            if bytes + n > 4 * 1024 * 1024 {
+                if values.is_empty() {
+                    return Err(sqlx::Error::Protocol("RESPONSE_TOO_LARGE".into()));
+                }
+                break;
+            }
+            let body: String =
+                sqlx::query_scalar("SELECT body FROM journal_entities WHERE kind=? AND key=?")
+                    .bind(kind)
+                    .bind(row.get::<&str, _>("key"))
+                    .fetch_one(&mut *tx)
+                    .await?;
+            values.push(serde_json::from_str(&body).map_err(|e| sqlx::Error::Decode(Box::new(e)))?);
+            bytes += n;
+        }
         Ok((
             lsn.parse()
                 .map_err(|_| sqlx::Error::Protocol("invalid cursor".into()))?,

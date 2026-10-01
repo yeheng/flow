@@ -25,7 +25,26 @@ pub fn router(
         return Err("download token must contain at least 32 bytes".into());
     }
     Ok(Router::new()
-        .route("/runs/{run_id}/values/{output_id}", get(download))
+        .route(
+            "/runs/{run_id}/values/{output_id}",
+            get(download).options(|| async { StatusCode::NO_CONTENT }),
+        )
+        .layer(axum::middleware::from_fn(
+            |request: axum::extract::Request, next: axum::middleware::Next| async move {
+                let mut response = next.run(request).await;
+                let headers = response.headers_mut();
+                headers.insert("access-control-allow-origin", "*".parse().unwrap());
+                headers.insert(
+                    "access-control-allow-methods",
+                    "GET, OPTIONS".parse().unwrap(),
+                );
+                headers.insert(
+                    "access-control-allow-headers",
+                    "Authorization".parse().unwrap(),
+                );
+                response
+            },
+        ))
         .with_state(Arc::new(DownloadState {
             backend,
             token,
@@ -61,6 +80,41 @@ fn reference(run: &Run, id: &str) -> Option<ValueRef> {
         StoredValue::Ref(r) if r.output_id == id => Some(r.clone()),
         _ => None,
     })
+}
+fn payload_reference(payload: &serde_json::Value, id: &str) -> Option<ValueRef> {
+    if payload.get("output_id").and_then(serde_json::Value::as_str) == Some(id) {
+        if let Ok(value) = serde_json::from_value::<ValueRef>(payload.clone()) {
+            if value.validate().is_ok() {
+                return Some(value);
+            }
+        }
+    }
+    match payload {
+        serde_json::Value::Object(fields) => fields.values().find_map(|v| payload_reference(v, id)),
+        serde_json::Value::Array(values) => values.iter().find_map(|v| payload_reference(v, id)),
+        _ => None,
+    }
+}
+fn historical_reference(
+    root: &std::path::Path,
+    journal: &str,
+    run: &str,
+    id: &str,
+    upper: u64,
+) -> flow_journal::Result<Option<ValueRef>> {
+    let mut tail = flow_journal::tail::TailReader::new(root, journal);
+    while let Some((tx, _)) = tail.next(upper)? {
+        for event in tx.events {
+            if event.run_id.as_deref() == Some(run) {
+                if let Some(value) = payload_reference(&event.payload, id) {
+                    if value.journal_id == journal {
+                        return Ok(Some(value));
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 struct Chunks(tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>);
 impl Write for Chunks {
@@ -111,7 +165,21 @@ async fn download(
     };
     let value = match reference(&run, &output_id) {
         Some(v) if v.journal_id == state.backend.journal.id() => v,
-        _ => return StatusCode::NOT_FOUND.into_response(),
+        _ => {
+            let root = state.backend.journal.root().to_path_buf();
+            let journal = state.backend.journal.id().to_owned();
+            let run = run_id.clone();
+            let output = output_id.clone();
+            match tokio::task::spawn_blocking(move || {
+                historical_reference(&root, &journal, &run, &output, upper)
+            })
+            .await
+            {
+                Ok(Ok(Some(value))) => value,
+                Ok(Ok(None)) => return StatusCode::NOT_FOUND.into_response(),
+                _ => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            }
+        }
     };
     let root = state.backend.journal.root().to_path_buf();
     let (tx, rx) = tokio::sync::mpsc::channel(4);

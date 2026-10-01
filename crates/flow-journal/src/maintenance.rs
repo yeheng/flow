@@ -29,8 +29,11 @@ pub struct Checkpoint {
     pub state_digest: String,
 }
 
-#[derive(Serialize,Deserialize)]
-struct CheckpointFile { data:Checkpoint, digest:String }
+#[derive(Serialize, Deserialize)]
+struct CheckpointFile {
+    data: Checkpoint,
+    digest: String,
+}
 
 #[derive(Serialize)]
 struct IndexEntry<'a> {
@@ -117,10 +120,16 @@ pub fn write_checkpoint(
     let dir = root.join("checkpoints");
     private_dir(&dir)?;
     sync_dir(root)?;
-    let digest=codec::digest(&codec::bounded_json(&checkpoint,CHECKPOINT_BYTES)?);
+    let digest = codec::digest(&codec::bounded_json(&checkpoint, CHECKPOINT_BYTES)?);
     atomic_write(
         &dir.join("latest.json"),
-        &codec::bounded_json(&CheckpointFile{data:checkpoint,digest}, CHECKPOINT_BYTES)?,
+        &codec::bounded_json(
+            &CheckpointFile {
+                data: checkpoint,
+                digest,
+            },
+            CHECKPOINT_BYTES,
+        )?,
     )
 }
 
@@ -150,9 +159,11 @@ pub fn load_checkpoint(root: &Path, reducer_version: u32) -> Result<Option<Check
         if fs::metadata(&path)?.len() > CHECKPOINT_BYTES as u64 {
             return Err(invalid("oversize checkpoint"));
         }
-        let file:CheckpointFile=serde_json::from_reader(File::open(path)?)?;
-        if file.digest!=codec::digest(&codec::bounded_json(&file.data,CHECKPOINT_BYTES)?){return Err(invalid("checkpoint checksum mismatch"))}
-        let cp=file.data;
+        let file: CheckpointFile = serde_json::from_reader(File::open(path)?)?;
+        if file.digest != codec::digest(&codec::bounded_json(&file.data, CHECKPOINT_BYTES)?) {
+            return Err(invalid("checkpoint checksum mismatch"));
+        }
+        let cp = file.data;
         if cp.version != 1
             || cp.reducer_version != reducer_version
             || cp.lsn != cp.boundary.lsn
@@ -186,9 +197,11 @@ pub fn load_checkpoint(root: &Path, reducer_version: u32) -> Result<Option<Check
         if cp.inventory.segments.is_empty() || cp.inventory.fault.is_some() {
             return Err(invalid("invalid checkpoint inventory"));
         }
-        let last=cp.inventory.segments.last().unwrap();
-        if last.number!=cp.boundary.segment || last.last_lsn!=cp.lsn
-            || cp.boundary.offset.checked_add(cp.boundary.bytes)!=Some(last.valid_bytes) {
+        let last = cp.inventory.segments.last().unwrap();
+        if last.number != cp.boundary.segment
+            || last.last_lsn != cp.lsn
+            || cp.boundary.offset.checked_add(cp.boundary.bytes) != Some(last.valid_bytes)
+        {
             return Err(invalid("checkpoint inventory boundary mismatch"));
         }
         Ok(cp)

@@ -18,8 +18,8 @@ use futures::future::BoxFuture;
 use serde_json::Value;
 
 use flow_engine::{
-    DbRunStatus, Engine, EngineError, Envelope, ResumeOutcome, RunObserver, RunState,
-    Signal, StartRun, StatusUpdate,
+    DbRunStatus, Engine, EngineError, Envelope, ResumeOutcome, RunObserver, RunState, Signal,
+    StartRun, StatusUpdate,
 };
 use flow_store::{Store, StoreError};
 

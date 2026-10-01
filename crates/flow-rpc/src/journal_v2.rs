@@ -31,6 +31,26 @@ fn failure(error: JournalError) -> ErrorObjectOwned {
         _ => ErrorObjectOwned::owned(-32603, "journal service unavailable", None::<()>),
     }
 }
+fn projection_failure(error: impl ToString) -> ErrorObjectOwned {
+    if error.to_string().contains("RESPONSE_TOO_LARGE") {
+        ErrorObjectOwned::owned(-32021, "RESPONSE_TOO_LARGE", None::<()>)
+    } else {
+        ErrorObjectOwned::owned(-32603, "projection unavailable", None::<()>)
+    }
+}
+fn decimal_param(p: &Value, key: &str) -> Result<u64, ErrorObjectOwned> {
+    match p.get(key) {
+        None => Ok(0),
+        Some(Value::String(s))
+            if !s.is_empty()
+                && (s == "0" || !s.starts_with('0'))
+                && s.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            s.parse().map_err(invalid)
+        }
+        _ => Err(invalid(format!("{key} must be a decimal string"))),
+    }
+}
 fn text<'a>(params: &'a Value, key: &str) -> Result<&'a str, ErrorObjectOwned> {
     params[key]
         .as_str()
@@ -71,6 +91,11 @@ pub fn module(
         "run.audit.page",
         "schedule.change",
         "webhook.change",
+        "workflow.list",
+        "run.list",
+        "legacy.get",
+        "legacy.list",
+        "run.observations.page",
     ] {
         module.register_async_method(method,move |params,ctx,_|async move {
             let mut p:Value=params.parse()?;
@@ -82,6 +107,15 @@ pub fn module(
             let request=p.get("request_id").map(|v|v.as_str().ok_or_else(||invalid("request_id must be a string"))).transpose()?;
             let b=&ctx.backend;
             let receipt=match method {
+                "run.observations.page"=>{
+                    let run_id=text(&p,"run_id")?.to_owned();
+                    if b.projection.get("run",&run_id).await.map_err(invalid)?.1.is_none(){return Err(ErrorObjectOwned::owned(-32011,"run not found",None::<()>));}
+                    let Some(store)=b.observations.clone() else{return Ok(json!({"records":[],"loss":{"history_incomplete":true},"loss_scope":"store"}));};
+                    let from=decimal_param(&p,"from_seq")?;
+                    let dispatch=p["dispatch_id"].as_str().map(str::to_owned);
+                    let limit=p["limit"].as_u64().unwrap_or(100).min(256) as usize;
+                    return tokio::task::spawn_blocking(move||{let records=store.page(&run_id,dispatch.as_deref(),from,limit).map_err(invalid)?;Ok(json!({"records":records,"loss":store.scoped_loss(&run_id,dispatch.as_deref()),"loss_scope":if dispatch.is_some(){"dispatch"}else{"run"},"store_loss":store.loss()}))}).await.map_err(invalid)?;
+                },
                 "workflow.create"=>b.workflow_create(text(&p,"name")?,request).await,
                 "workflow.update"=>b.workflow_update(text(&p,"workflow_id")?,p["definition"].clone(),request).await,
                 "workflow.publish"=>b.workflow_publish(text(&p,"workflow_id")?,optional_version(&p)?.ok_or_else(||invalid("version required"))?,request).await,
@@ -92,15 +126,20 @@ pub fn module(
                 "run.adjudicate"=>b.run_adjudicate(text(&p,"run_id")?,text(&p,"node_id")?,text(&p,"operation_id")?,text(&p,"reason")?,p["output"].clone(),request.ok_or_else(||invalid("request_id required"))?).await,
                 "schedule.change"|"webhook.change"=>b.config_change(method,if method=="schedule.change"{flow_journal::EventKind::ScheduleChanged}else{flow_journal::EventKind::WebhookChanged},text(&p,"key")?,p["patch"].clone(),request).await,
                 "command.status"=>return serde_json::to_value(b.command_status(text(&p,"scope")?,text(&p,"request_id")?).await.map_err(failure)?).map_err(invalid),
-                "workflow.get"|"run.get"=>{
-                    let kind=if method=="run.get"{"run"}else{"workflow"};
-                    let key=text(&p,if kind=="run"{"run_id"}else{"workflow_id"})?;
-                    let (lsn,value)=b.projection.get(kind,key).await.map_err(|_|invalid("projection unavailable"))?;
+                "workflow.list"|"run.list"|"legacy.list"=>{
+                    let kind=method.split('.').next().unwrap();let after=p["after"].as_str().unwrap_or("");
+                    let (lsn,values)=b.projection.list(kind,after,p["limit"].as_u64().unwrap_or(64).min(256) as usize).await.map_err(projection_failure)?;
+                    return Ok(json!({"snapshot_cursor":{"journal_id":b.journal.id(),"lsn":lsn.to_string()},"values":values}));
+                },
+                "workflow.get"|"run.get"|"legacy.get"=>{
+                    let kind=method.split('.').next().unwrap();
+                    let key=text(&p,match kind {"run"=>"run_id","legacy"=>"key",_=>"workflow_id"})?;
+                    let (lsn,value)=b.projection.get(kind,key).await.map_err(projection_failure)?;
                     return Ok(json!({"snapshot_cursor":{"journal_id":b.journal.id(),"lsn":lsn.to_string()},"value":value}));
                 },
                 "run.events.page"|"run.audit.page"=>{
                     let run_id=text(&p,"run_id")?.to_owned();
-                    let (upper,run)=b.projection.get("run",&run_id).await.map_err(|_|invalid("projection unavailable"))?;
+                    let (upper,run)=b.projection.get("run",&run_id).await.map_err(projection_failure)?;
                     if run.is_none(){return Err(ErrorObjectOwned::owned(-32011,"run not found",None::<()>));}
                     let filter=if method=="run.events.page"{Filter::Events}else{Filter::Audit};
                     let identity=b.journal.id().to_owned();
@@ -115,6 +154,53 @@ pub fn module(
             serde_json::to_value(receipt).map_err(invalid)
         })?;
     }
+    module.register_subscription("run.subscribe","run.event","run.unsubscribe",|params,pending,ctx,_|async move {
+        let p:Value=match params.parse(){Ok(p)=>p,Err(e)=>{pending.reject(e).await;return;}};
+        let supplied=p["_token"].as_str().unwrap_or("");
+        if supplied.len()!=ctx.token.len() || supplied.bytes().zip(ctx.token.bytes()).fold(0u8,|d,(a,b)|d|(a^b))!=0 {
+            pending.reject(ErrorObjectOwned::owned(-32001,"unauthorized",None::<()>)).await;return;
+        }
+        if p["event_format"]!="v2" {pending.reject(invalid("event_format=v2 required")).await;return;}
+        let run_id=match text(&p,"run_id"){Ok(id)=>id.to_owned(),Err(e)=>{pending.reject(e).await;return;}};
+        let from_seq=match decimal_param(&p,"from_seq"){Ok(n)=>n,Err(e)=>{pending.reject(e).await;return;}};
+        let audit=p["mode"]=="audit";
+        if p.get("mode").is_some() && !matches!(p["mode"].as_str(),Some("audit"|"control")){pending.reject(invalid("invalid subscription mode")).await;return;}
+        let from_lsn=match decimal_param(&p,"from_lsn"){Ok(n)=>n,Err(e)=>{pending.reject(e).await;return;}};
+        let sink=match pending.accept().await {Ok(s)=>s,Err(_)=>return};
+        let mut tail=flow_journal::tail::TailReader::new(ctx.backend.journal.root(),ctx.backend.journal.id());
+        let mut scanned=0;
+        loop {
+            let (upper,row)=match ctx.backend.projection.get("run",&run_id).await {Ok(v)=>v,Err(_)=>return};
+            let Some(row)=row else{return};
+            let terminal=matches!(row["status"].as_str(),Some("succeeded"|"failed"|"cancelled"));
+            let id=run_id.clone();
+            let batch=tokio::task::spawn_blocking(move||->flow_journal::Result<_>{
+                let mut records=Vec::new();let mut bytes=0;let mut latest=scanned;
+                while bytes<flow_journal::MAX_LINE_BYTES {
+                    let Some((tx,location))=tail.next(upper)? else{break};latest=tx.lsn;bytes+=location.bytes as usize;
+                    for (index,event) in tx.events.into_iter().enumerate(){
+                        if event.run_id.as_deref()==Some(&id) && (if audit {tx.lsn>from_lsn && (event.audit_seq>0 || event.kind==flow_journal::EventKind::LateAudit)}else{event.run_seq>from_seq}) {
+                            records.push(flow_journal::page::PositionedEvent{lsn:tx.lsn,event_index:index,event});
+                        }
+                    }
+                }
+                Ok((tail,records,latest))
+            }).await;
+            let (reader,records,latest)=match batch {Ok(Ok(v))=>v,_=>return};tail=reader;scanned=latest;
+            for record in records {
+                if flow_journal::codec::bounded_json(&record,flow_journal::MAX_LINE_BYTES-1024).is_err(){
+                    if let Ok(message)=jsonrpsee::server::SubscriptionMessage::new("run.event",sink.subscription_id(),&json!({"type":"stream_error","code":"RESPONSE_TOO_LARGE"})){let _=tokio::time::timeout(std::time::Duration::from_secs(2),sink.send(message)).await;}
+                    return;
+                }
+                let message=match jsonrpsee::server::SubscriptionMessage::new("run.event",sink.subscription_id(),&record){Ok(m)=>m,Err(_)=>return};
+                if !matches!(tokio::time::timeout(std::time::Duration::from_secs(2),sink.send(message)).await,Ok(Ok(()))) {return;}
+            }
+            if scanned>=upper {
+                if terminal && !audit {return;}
+                tokio::select!{_=sink.closed()=>return,_=tokio::time::sleep(std::time::Duration::from_millis(50))=>{}}
+            }
+        }
+    })?;
     Ok(module)
 }
 
@@ -138,4 +224,27 @@ pub async fn serve(
         .await?;
     let addr = server.local_addr()?;
     Ok((server.start(module), addr))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn sequence_parameters_are_lossless_canonical_decimal_strings() {
+        assert_eq!(decimal_param(&json!({}), "from_lsn").unwrap(), 0);
+        assert_eq!(
+            decimal_param(&json!({"from_lsn":"18446744073709551615"}), "from_lsn").unwrap(),
+            u64::MAX
+        );
+        for value in [
+            json!(1),
+            json!(null),
+            json!("+1"),
+            json!("01"),
+            json!("-1"),
+            json!("18446744073709551616"),
+        ] {
+            assert!(decimal_param(&json!({"from_lsn":value}), "from_lsn").is_err());
+        }
+    }
 }

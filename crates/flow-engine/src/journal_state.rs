@@ -11,6 +11,26 @@ fn invalid(s: impl Into<String>) -> flow_journal::Error {
     flow_journal::Error::Invalid(s.into())
 }
 
+// Accept numeric snapshot counters from earlier development logs, emit lossless strings.
+mod snapshot_decimal {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(n: &u64, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(&n.to_string())
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<u64, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Number {
+            Text(String),
+            Number(u64),
+        }
+        match Number::deserialize(d)? {
+            Number::Number(n) => Ok(n),
+            Number::Text(n) => n.parse().map_err(serde::de::Error::custom),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workflow {
     pub workflow_id: String,
@@ -41,6 +61,7 @@ pub struct Run {
     pub status: String,
     pub output: Option<StoredValue>,
     pub error: Option<String>,
+    #[serde(with = "snapshot_decimal")]
     pub last_run_seq: u64,
     pub nodes: BTreeMap<String, Node>,
 }
@@ -67,6 +88,12 @@ pub struct Node {
 pub struct Attempt {
     pub audit_seq: u64,
     pub audit_digests: BTreeMap<u64, String>,
+    #[serde(default)]
+    pub audit_lsns: BTreeMap<u64, u64>,
+    #[serde(default)]
+    pub result: Option<Event>,
+    #[serde(default)]
+    pub result_lsn: Option<u64>,
     pub sealed: bool,
     pub integrity: String,
 }
@@ -105,14 +132,20 @@ pub struct CommandRecord {
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct State {
+    /// Rebuilt by replay before accepting commands; never trusted from serialized snapshots.
+    #[serde(skip)]
+    pub values: flow_journal::value::ValueCatalog,
     pub version: u32,
     pub journal_id: String,
+    #[serde(with = "snapshot_decimal")]
     pub applied_lsn: u64,
     pub workflows: BTreeMap<String, Workflow>,
     pub runs: BTreeMap<String, Run>,
     pub schedules: BTreeMap<String, Value>,
     pub webhooks: BTreeMap<String, Value>,
     pub commands: BTreeMap<String, CommandRecord>,
+    #[serde(default)]
+    pub legacy: BTreeMap<String, Value>,
 }
 
 pub fn command_key(scope: &str, request_id: &str) -> String {
@@ -150,6 +183,7 @@ impl State {
                 if next.kind != EventKind::OperationAuthorized
                     || next.run_id != event.run_id
                     || next.dispatch_id != event.dispatch_id
+                    || next.node_id != event.node_id
                     || next.payload != event.payload
                     || event.audit_seq != 0
                     || next.audit_seq != 0
@@ -171,7 +205,24 @@ impl State {
         let mut schedule_undo = BTreeMap::new();
         let mut webhook_undo = BTreeMap::new();
         let mut command_undo = BTreeMap::new();
+        let mut value_undo = BTreeMap::new();
+        let mut legacy_undo = BTreeMap::new();
         for event in &tx.events {
+            if event.kind == EventKind::LegacyImport {
+                let key = string(&event.payload, "key")?;
+                legacy_undo
+                    .entry(key.clone())
+                    .or_insert_with(|| self.legacy.get(&key).cloned());
+            }
+            if matches!(
+                event.kind,
+                EventKind::ValueChunk | EventKind::ValuePublished
+            ) {
+                let id = string(&event.payload, "output_id")?;
+                value_undo
+                    .entry(id.clone())
+                    .or_insert_with(|| self.values.save(&id));
+            }
             if let Some(id) = event.payload.get("workflow_id").and_then(Value::as_str) {
                 if matches!(
                     event.kind,
@@ -214,6 +265,8 @@ impl State {
         }
         let result = (|| {
             for event in &tx.events {
+                self.values.apply(event, &tx.journal_id)?;
+                self.check_values(event)?;
                 self.apply_event(event, tx.lsn)?;
             }
             Ok(())
@@ -224,6 +277,10 @@ impl State {
             restore(&mut self.schedules, schedule_undo);
             restore(&mut self.webhooks, webhook_undo);
             restore(&mut self.commands, command_undo);
+            restore(&mut self.legacy, legacy_undo);
+            for undo in value_undo.into_values() {
+                self.values.restore(undo);
+            }
         } else {
             self.version = 1;
             self.journal_id = tx.journal_id.clone();
@@ -232,8 +289,63 @@ impl State {
         result
     }
 
+    fn check_values(&self, event: &Event) -> Result<()> {
+        let p = &event.payload;
+        let check = |v: &Value| -> Result<()> {
+            self.values
+                .check(&serde_json::from_value::<StoredValue>(v.clone())?)
+        };
+        match event.kind {
+            EventKind::LegacyImport => check(&p["data"])?,
+            EventKind::WorkflowUpdated => check(&p["version"]["definition"])?,
+            EventKind::RunStarted => {
+                check(&p["input"])?;
+                check(&p["definition"])?;
+            }
+            EventKind::InputPrepared => {
+                let prepared: Prepared = serde_json::from_value(p["prepared"].clone())?;
+                self.values.check(&prepared.input)?;
+                self.values.check(&prepared.params)?;
+                for value in prepared.predecessors.values() {
+                    self.values.check(value)?;
+                }
+            }
+            EventKind::NodeCompleted
+            | EventKind::RunCompleted
+            | EventKind::WaitResolved
+            | EventKind::Adjudicated => check(&p["output"])?,
+            EventKind::SignalReceived => check(&p["payload"])?,
+            EventKind::OperationIntent | EventKind::OperationAuthorized => {
+                check(&p["operation"]["request"])?
+            }
+            EventKind::OperationOutcome => {
+                let outcome: StoredValue = serde_json::from_value(p["outcome"].clone())?;
+                self.values.check(&outcome)?;
+                if let StoredValue::Inline(value) = outcome {
+                    if let Some(raw) = value.get("body_raw") {
+                        self.values
+                            .check(&StoredValue::Ref(serde_json::from_value(raw.clone())?))?;
+                    }
+                }
+            }
+            EventKind::WaitRegistered => {
+                let wait: Wait = serde_json::from_value(p["wait"].clone())?;
+                if let Some(value) = wait.output {
+                    self.values.check(&value)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn apply_event(&mut self, event: &Event, lsn: u64) -> Result<()> {
         let p = &event.payload;
+        if event.kind == EventKind::LateAudit && (event.run_seq != 0 || event.audit_seq == 0) {
+            return Err(invalid(
+                "late evidence requires audit identity and cannot advance run sequence",
+            ));
+        }
         match event.kind {
             EventKind::SegmentStarted | EventKind::SegmentSealed => return Ok(()),
             EventKind::Command => {
@@ -309,7 +421,14 @@ impl State {
             EventKind::ValueChunk | EventKind::ValuePublished if event.run_id.is_none() => {
                 return Ok(())
             }
-            EventKind::LegacyImport => return Err(invalid("legacy import reducer not registered")),
+            EventKind::LegacyImport => {
+                let key = string(p, "key")?;
+                if self.legacy.contains_key(&key) {
+                    return Err(invalid("duplicate legacy baseline key"));
+                }
+                self.legacy.insert(key, p.clone());
+                return Ok(());
+            }
             _ => {}
         }
         let run = self
@@ -396,6 +515,9 @@ impl State {
                 Attempt {
                     audit_seq: 0,
                     audit_digests: BTreeMap::new(),
+                    audit_lsns: BTreeMap::new(),
+                    result: None,
+                    result_lsn: None,
                     sealed: false,
                     integrity: "unknown".into(),
                 },
@@ -459,10 +581,13 @@ impl State {
                 .attempts
                 .get_mut(dispatch)
                 .ok_or_else(|| invalid("unknown audit dispatch"))?;
-            if event.audit_seq != attempt.audit_seq + 1 || attempt.sealed {
+            if event.audit_seq != attempt.audit_seq + 1
+                || (attempt.sealed && event.kind != EventKind::LateAudit)
+            {
                 return Err(invalid("audit gap/duplicate or sealed dispatch"));
             }
             attempt.audit_seq = event.audit_seq;
+            attempt.audit_lsns.insert(event.audit_seq, lsn);
             attempt.audit_digests.insert(
                 event.audit_seq,
                 flow_journal::codec::digest(&flow_journal::codec::bounded_json(
@@ -525,6 +650,8 @@ impl State {
                     return Err(invalid("result audit barrier"));
                 }
                 attempt.sealed = true;
+                attempt.result = Some(event.clone());
+                attempt.result_lsn = Some(lsn);
                 attempt.integrity = p["integrity"].as_str().unwrap_or("complete").into();
                 if terminal {
                     return Ok(());

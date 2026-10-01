@@ -43,12 +43,24 @@ pub struct Observation {
 }
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct Manifest {
+    #[serde(default)]
+    scopes: BTreeMap<String, ObservationLoss>,
     last_seq: u64,
     loss: ObservationLoss,
     segments: BTreeMap<u64, (u64, u64)>,
 }
 
+#[derive(Default)]
+struct ScopeCounters {
+    queue: AtomicU64,
+    storage: AtomicU64,
+}
+type Scopes = Arc<Mutex<BTreeMap<String, Arc<ScopeCounters>>>>;
+fn scope_key(run: &str, dispatch: &str) -> String {
+    serde_json::to_string(&(run, dispatch)).unwrap()
+}
 struct Pending {
+    counters: Option<Arc<ScopeCounters>>,
     run_id: String,
     dispatch_id: String,
     line: LogLine,
@@ -64,6 +76,7 @@ struct Inner {
     tx: mpsc::SyncSender<Message>,
     manifest: Arc<Mutex<Manifest>>,
     dropped: Arc<AtomicU64>,
+    scopes: Scopes,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 impl Drop for Inner {
@@ -81,6 +94,7 @@ pub struct ObservationStore {
 }
 #[derive(Clone)]
 pub struct ObservationLogger {
+    counters: Option<Arc<ScopeCounters>>,
     store: ObservationStore,
     run_id: String,
     dispatch_id: String,
@@ -88,6 +102,7 @@ pub struct ObservationLogger {
 impl ObservationLogger {
     pub fn emit(&self, line: LogLine) {
         let pending = Pending {
+            counters: self.counters.clone(),
             run_id: self.run_id.clone(),
             dispatch_id: self.dispatch_id.clone(),
             line,
@@ -104,6 +119,9 @@ impl ObservationLogger {
             .is_err()
         {
             self.store.inner.dropped.fetch_add(1, Ordering::Relaxed);
+            if let Some(counters) = &self.counters {
+                counters.queue.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -122,10 +140,20 @@ impl ObservationStore {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
         }
-        let mut manifest: Manifest = fs::read(root.join("manifest.json"))
-            .ok()
-            .and_then(|v| serde_json::from_slice(&v).ok())
-            .unwrap_or_default();
+        let manifest_path = root.join("manifest.json");
+        let loaded = File::open(&manifest_path).ok().and_then(|file| {
+            let mut bytes = Vec::new();
+            file.take(1024 * 1024 + 1).read_to_end(&mut bytes).ok()?;
+            if bytes.len() > 1024 * 1024 {
+                return None;
+            }
+            serde_json::from_slice::<Manifest>(&bytes).ok()
+        });
+        let missing_manifest = loaded.is_none();
+        let mut manifest = loaded.unwrap_or_default();
+        if missing_manifest {
+            manifest.loss.history_incomplete = true;
+        }
         // Rebuild small segment inventory from disk rather than trusting a lagging manifest.
         manifest.segments.clear();
         for entry in fs::read_dir(&root)? {
@@ -164,7 +192,26 @@ impl ObservationStore {
                     .insert(number, (entry.metadata()?.len(), lines));
             }
         }
+        if missing_manifest && (!manifest.segments.is_empty() || manifest_path.exists()) {
+            manifest.loss.history_incomplete = true;
+        }
         let dropped = Arc::new(AtomicU64::new(manifest.loss.queue_dropped));
+        let scopes: Scopes = Arc::new(Mutex::new(
+            manifest
+                .scopes
+                .iter()
+                .take(4096)
+                .map(|(key, loss)| {
+                    (
+                        key.clone(),
+                        Arc::new(ScopeCounters {
+                            queue: AtomicU64::new(loss.queue_dropped),
+                            storage: AtomicU64::new(loss.storage_dropped),
+                        }),
+                    )
+                })
+                .collect(),
+        ));
         let shared = Arc::new(Mutex::new(manifest));
         let (tx, rx) = mpsc::sync_channel(QUEUE_RECORDS);
         let inner = Arc::new(Inner {
@@ -172,16 +219,25 @@ impl ObservationStore {
             tx,
             manifest: shared.clone(),
             dropped: dropped.clone(),
+            scopes: scopes.clone(),
             thread: Mutex::new(None),
         });
         let thread = std::thread::Builder::new()
             .name("flow-observation".into())
-            .spawn(move || pump(root, options, shared, dropped, rx))?;
+            .spawn(move || pump(root, options, shared, dropped, scopes, rx))?;
         *inner.thread.lock().unwrap() = Some(thread);
         Ok(Self { inner })
     }
     pub fn logger(&self, run_id: String, dispatch_id: String) -> ObservationLogger {
+        let key = scope_key(&run_id, &dispatch_id);
+        let mut scopes = self.inner.scopes.lock().unwrap();
+        let counters = if scopes.len() < 4096 || scopes.contains_key(&key) {
+            Some(scopes.entry(key).or_default().clone())
+        } else {
+            None
+        };
         ObservationLogger {
+            counters,
             store: self.clone(),
             run_id,
             dispatch_id,
@@ -191,6 +247,29 @@ impl ObservationStore {
         let mut loss = self.inner.manifest.lock().unwrap().loss.clone();
         loss.queue_dropped = self.inner.dropped.load(Ordering::Relaxed);
         loss
+    }
+    /// Exact queue/storage loss for tracked dispatches. Retention/corruption makes
+    /// the historical count unknown; never misrepresent a missing scope as zero.
+    pub fn scoped_loss(&self, run: &str, dispatch: Option<&str>) -> ObservationLoss {
+        let global = self.loss();
+        let scopes = self.inner.scopes.lock().unwrap();
+        let mut result = ObservationLoss {
+            history_incomplete: global.history_incomplete || global.retention_dropped > 0,
+            ..Default::default()
+        };
+        let mut found = false;
+        for (key, counters) in scopes.iter() {
+            let Ok((r, d)) = serde_json::from_str::<(String, String)>(key) else {
+                continue;
+            };
+            if r == run && dispatch.is_none_or(|id| id == d) {
+                found = true;
+                result.queue_dropped += counters.queue.load(Ordering::Relaxed);
+                result.storage_dropped += counters.storage.load(Ordering::Relaxed);
+            }
+        }
+        result.history_incomplete |= !found || scopes.len() >= 4096;
+        result
     }
     pub fn flush(&self) {
         let (tx, rx) = mpsc::channel();
@@ -258,6 +337,7 @@ fn pump(
     options: ObservationOptions,
     shared: Arc<Mutex<Manifest>>,
     dropped: Arc<AtomicU64>,
+    scopes: Scopes,
     rx: mpsc::Receiver<Message>,
 ) {
     let mut segment = shared
@@ -270,12 +350,12 @@ fn pump(
         let pending = match message {
             Message::Line(p) => p,
             Message::Flush(ack) => {
-                persist_manifest(&root, &shared, &dropped);
+                persist_manifest(&root, &shared, &dropped, &scopes);
                 let _ = ack.send(());
                 continue;
             }
             Message::Stop => {
-                persist_manifest(&root, &shared, &dropped);
+                persist_manifest(&root, &shared, &dropped, &scopes);
                 break;
             }
         };
@@ -290,6 +370,9 @@ fn pump(
         };
         let Ok(mut bytes) = serde_json::to_vec(&record) else {
             manifest.loss.storage_dropped += 1;
+            if let Some(c) = &pending.counters {
+                c.storage.fetch_add(1, Ordering::Relaxed);
+            }
             continue;
         };
         bytes.push(b'\n');
@@ -323,6 +406,9 @@ fn pump(
             > options.retained_bytes
         {
             manifest.loss.storage_dropped += 1;
+            if let Some(c) = &pending.counters {
+                c.storage.fetch_add(1, Ordering::Relaxed);
+            }
             continue;
         }
         let mut open = OpenOptions::new();
@@ -343,13 +429,32 @@ fn pump(
             }
             Err(_) => {
                 manifest.loss.storage_dropped += 1;
+                if let Some(c) = &pending.counters {
+                    c.storage.fetch_add(1, Ordering::Relaxed);
+                }
                 manifest.loss.history_incomplete = true;
                 segment += 1;
             }
         }
     }
 }
-fn persist_manifest(root: &Path, shared: &Mutex<Manifest>, dropped: &AtomicU64) {
+fn persist_manifest(root: &Path, shared: &Mutex<Manifest>, dropped: &AtomicU64, scopes: &Scopes) {
+    let snapshot = scopes
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(key, c)| {
+            (
+                key.clone(),
+                ObservationLoss {
+                    queue_dropped: c.queue.load(Ordering::Relaxed),
+                    storage_dropped: c.storage.load(Ordering::Relaxed),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    shared.lock().unwrap().scopes = snapshot;
     shared.lock().unwrap().loss.queue_dropped = dropped.load(Ordering::Relaxed);
     if let Ok(bytes) = serde_json::to_vec(&*shared.lock().unwrap()) {
         let _ = flow_journal::maintenance::atomic_write(&root.join("manifest.json"), &bytes);

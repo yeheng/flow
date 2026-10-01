@@ -13,6 +13,7 @@
 
 mod client;
 mod error;
+mod journal;
 mod output;
 mod run;
 mod workflow;
@@ -51,6 +52,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// JSONL v2 commands, bounded history pages and streaming downloads.
+    Journal {
+        #[command(subcommand)]
+        command: journal::Command,
+    },
     /// 工作流定义：增删改查 + 导入导出
     Workflow {
         #[command(subcommand)]
@@ -186,6 +192,7 @@ async fn main() -> ExitCode {
 async fn dispatch(cli: Cli) -> Result<(), CliError> {
     let client = client::connect(&cli.url).await?;
     match cli.command {
+        Command::Journal { command } => journal::dispatch(&client, command).await,
         Command::Workflow { command } => workflow::dispatch(&client, cli.json, command).await,
         Command::Run { command } => run::dispatch(&client, cli.json, command).await,
     }

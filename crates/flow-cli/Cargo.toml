@@ -23,6 +23,7 @@ name = "flow-cli"
 path = "src/main.rs"
 
 [dependencies]
+uuid = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -30,6 +31,7 @@ thiserror = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 jsonrpsee = { version = "0.26", features = ["client", "ws-client"] }
 chrono = { workspace = true }
+reqwest.workspace = true
 
 [dev-dependencies]
 # 测试自己起服务端：进程内 flow_rpc::serve + SQLite 后端（显式路径，不碰 env），

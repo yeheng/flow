@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -120,6 +121,169 @@ impl ValueRef {
             || self.chunk_count > self.total_bytes
         {
             return Err(invalid("invalid value descriptor"));
+        }
+        Ok(())
+    }
+}
+
+/// Incremental validation state reconstructed from journal facts, never from a client.
+/// Unfinished streams keep only a hash and counters, not their bytes.
+#[derive(Debug, Clone, Default)]
+pub struct ValueCatalog {
+    streams: BTreeMap<String, ValueProgress>,
+    published: BTreeMap<String, ValueRef>,
+}
+#[derive(Debug, Clone, Default)]
+pub struct ValueProgress {
+    hash: Sha256,
+    chunks: u64,
+    bytes: u64,
+}
+pub type ValueUndo = (String, Option<ValueProgress>, Option<ValueRef>);
+impl ValueCatalog {
+    pub fn snapshot(&self) -> Result<Value> {
+        use sha2::digest::common::hazmat::SerializableState;
+        // Bound derived-cache allocations before building the JSON tree.
+        crate::codec::bounded_json(&self.published, 8 * 1024 * 1024)?;
+        if self.streams.len() > 8192 {
+            return Err(crate::Error::Limit("checkpoint stream budget".into()));
+        }
+        let streams=self.streams.iter().map(|(id,s)|serde_json::json!({"id":id,"chunks":s.chunks.to_string(),"bytes":s.bytes.to_string(),"sha256_state":STANDARD.encode(s.hash.serialize())})).collect::<Vec<_>>();
+        Ok(serde_json::json!({"version":1,"streams":streams,"published":self.published}))
+    }
+    pub fn from_snapshot(value: Value) -> Result<Self> {
+        use sha2::digest::common::hazmat::{SerializableState, SerializedState};
+        if value["version"] != 1 {
+            return Err(invalid("unsupported value checkpoint"));
+        }
+        let mut catalog = Self {
+            streams: BTreeMap::new(),
+            published: serde_json::from_value(value["published"].clone())?,
+        };
+        for s in value["streams"]
+            .as_array()
+            .ok_or_else(|| invalid("missing checkpoint streams"))?
+        {
+            let state = STANDARD
+                .decode(
+                    s["sha256_state"]
+                        .as_str()
+                        .ok_or_else(|| invalid("missing hash state"))?,
+                )
+                .map_err(|_| invalid("invalid hash state"))?;
+            let state: SerializedState<Sha256> = state
+                .as_slice()
+                .try_into()
+                .map_err(|_| invalid("invalid hash state length"))?;
+            let hash = <Sha256 as SerializableState>::deserialize(&state)
+                .map_err(|_| invalid("invalid hash checkpoint"))?;
+            let parse = |key: &str| {
+                s[key]
+                    .as_str()
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .ok_or_else(|| invalid("invalid stream counter"))
+            };
+            let id = s["id"]
+                .as_str()
+                .ok_or_else(|| invalid("missing stream id"))?;
+            let bytes = parse("bytes")?;
+            let chunks = parse("chunks")?;
+            if bytes > MAX_VALUE_BYTES || chunks > bytes || catalog.published.contains_key(id) {
+                return Err(invalid("invalid stream checkpoint"));
+            }
+            catalog.streams.insert(
+                id.into(),
+                ValueProgress {
+                    hash,
+                    chunks,
+                    bytes,
+                },
+            );
+        }
+        for value in catalog.published.values() {
+            value.validate()?;
+        }
+        Ok(catalog)
+    }
+    pub fn save(&self, id: &str) -> ValueUndo {
+        (
+            id.into(),
+            self.streams.get(id).cloned(),
+            self.published.get(id).cloned(),
+        )
+    }
+    pub fn restore(&mut self, undo: ValueUndo) {
+        let (id, stream, published) = undo;
+        match stream {
+            Some(v) => {
+                self.streams.insert(id.clone(), v);
+            }
+            None => {
+                self.streams.remove(&id);
+            }
+        }
+        match published {
+            Some(v) => {
+                self.published.insert(id, v);
+            }
+            None => {
+                self.published.remove(&id);
+            }
+        }
+    }
+    pub fn apply(&mut self, event: &Event, journal_id: &str) -> Result<()> {
+        match event.kind {
+            EventKind::ValueChunk => {
+                let chunk: Chunk = serde_json::from_value(event.payload.clone())?;
+                if self.published.contains_key(&chunk.output_id) {
+                    return Err(invalid("chunk after publication"));
+                }
+                let bytes = chunk.decode()?;
+                let stream = self.streams.entry(chunk.output_id).or_default();
+                if stream.chunks != chunk.chunk_index
+                    || stream.bytes + bytes.len() as u64 > MAX_VALUE_BYTES
+                {
+                    return Err(invalid("value chunk gap/duplicate/limit"));
+                }
+                stream.hash.update(&bytes);
+                stream.chunks += 1;
+                stream.bytes += bytes.len() as u64;
+            }
+            EventKind::ValuePublished => {
+                let value: ValueRef = serde_json::from_value(event.payload.clone())?;
+                value.validate()?;
+                let stream = self
+                    .streams
+                    .get(&value.output_id)
+                    .cloned()
+                    .unwrap_or_default();
+                if value.journal_id != journal_id
+                    || self.published.contains_key(&value.output_id)
+                    || value.chunk_count != stream.chunks
+                    || value.total_bytes != stream.bytes
+                    || value.digest != hex::encode(stream.hash.finalize())
+                {
+                    return Err(invalid("publication requires complete matching chunks"));
+                }
+                self.streams.remove(&value.output_id);
+                self.published.insert(value.output_id.clone(), value);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    pub fn check(&self, value: &StoredValue) -> Result<()> {
+        match value {
+            StoredValue::Inline(v) => {
+                bounded_json(v, INLINE_BYTES)?;
+            }
+            StoredValue::Ref(r) => {
+                if self.published.get(&r.output_id) != Some(r) {
+                    return Err(invalid(
+                        "unpublished or mismatched business value reference",
+                    ));
+                }
+            }
         }
         Ok(())
     }

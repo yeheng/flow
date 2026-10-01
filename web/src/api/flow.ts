@@ -1,4 +1,5 @@
 import { client } from "../rpc/client";
+export { JournalClient, EventWindow } from "./journal";
 import { httpUrl } from "../config";
 import type {
   Definition,

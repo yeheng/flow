@@ -30,9 +30,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use thiserror::Error;
 
-pub mod scheduler;
-pub mod journal_v2;
 pub mod journal_download;
+pub mod journal_triggers;
+pub mod journal_v2;
+pub mod scheduler;
 pub mod webhook;
 
 const CODE_INVALID: i32 = -32010;

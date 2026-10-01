@@ -128,6 +128,27 @@ async fn manual_resolution_binds_operation_and_never_fabricates_outcome() {
         .await
         .unwrap();
     backend.append(vec![event(EventKind::WaitRegistered,json!({"wait":{"kind":"uncertain","wake_at":null,"child_run_id":null},"sealed_through":"1","integrity":"unknown"}),5,0)]).await.unwrap();
+    let late = event(
+        EventKind::LateAudit,
+        json!({"reason":"response metadata arrived after sealing","status":200}),
+        0,
+        2,
+    );
+    let original = backend.append(vec![late.clone()]).await.unwrap();
+    assert_eq!(backend.append(vec![late.clone()]).await.unwrap(), original);
+    let mut conflicting = late;
+    conflicting.payload["status"] = json!(500);
+    assert!(backend.append(vec![conflicting]).await.is_err());
+    let snapshot = backend.state().await;
+    assert_eq!(snapshot.runs[run_id].last_run_seq, 5);
+    assert_eq!(
+        snapshot.runs[run_id].nodes["h"].attempts["dispatch"]
+            .result
+            .as_ref()
+            .unwrap()
+            .payload["sealed_through"],
+        "1"
+    );
     assert!(backend
         .run_adjudicate(
             run_id,
@@ -182,6 +203,102 @@ async fn install(b: &JournalBackend, definition: Value) -> String {
     b.workflow_update(&id, definition, None).await.unwrap();
     b.workflow_publish(&id, 1, None).await.unwrap();
     id
+}
+
+#[tokio::test]
+async fn integration_adapters_capture_results_without_persisting_resolved_credentials() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            loop {
+                let n = socket.read(&mut buffer).await.unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&buffer[..n]);
+                if let Some(end) = request.windows(4).position(|v| v == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                    let length = headers
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length: "))
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap();
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request
+                .to_lowercase()
+                .contains("authorization: bearer adapter-private-test-value"));
+            let body=if request.starts_with("POST /chat/completions ") {json!({"choices":[{"message":{"content":"answer"}}],"model":"test","usage":{"total_tokens":3}})}else{assert!(request.starts_with("POST /emails "));json!({"id":"mail-1"})}.to_string();
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+    });
+    std::env::set_var("FLOW_SECRET_V2_ADAPTER_TEST", "adapter-private-test-value");
+    let root = temp();
+    let backend = JournalBackend::open(&root, Default::default())
+        .await
+        .unwrap();
+    backend.start_execution().await.unwrap();
+    for (kind, params, expected) in [
+        (
+            "llm",
+            json!({"api_key":"V2_ADAPTER_TEST","base_url":format!("http://{addr}"),"model":"test","prompt":"hello"}),
+            json!({"content":"answer","model":"test","usage":{"total_tokens":3}}),
+        ),
+        (
+            "email",
+            json!({"api_key":"V2_ADAPTER_TEST","endpoint":format!("http://{addr}/emails"),"from":"a@test","to":"b@test","subject":"test","body":"hello"}),
+            json!({"status":200,"id":"mail-1"}),
+        ),
+    ] {
+        let workflow=install(&backend,json!({"nodes":[{"id":"s","type":"start"},{"id":"a","type":kind,"params":params},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"a"},{"from":"a","to":"e"}]})).await;
+        let receipt = backend
+            .run_start(&workflow, None, json!({}), "manual", None, None)
+            .await
+            .unwrap();
+        let done = until(
+            &backend,
+            receipt.result["run_id"].as_str().unwrap(),
+            Run::terminal,
+        )
+        .await;
+        assert_eq!(done.status, "succeeded", "{:?}", done.error);
+        assert_eq!(done.output, Some(StoredValue::Inline(expected)));
+        assert!(done.nodes["a"]
+            .operation
+            .as_ref()
+            .unwrap()
+            .outcome
+            .is_some());
+    }
+    server.await.unwrap();
+    flow_journal::scan(&root, |tx, _| {
+        assert!(!serde_json::to_string(tx)
+            .unwrap()
+            .contains("adapter-private-test-value"));
+        Ok(())
+    })
+    .unwrap();
+    backend.close().await.unwrap();
+    drop(backend);
+    std::env::remove_var("FLOW_SECRET_V2_ADAPTER_TEST");
+    std::fs::remove_dir_all(root).unwrap();
 }
 async fn until(b: &Arc<JournalBackend>, run_id: &str, predicate: impl Fn(&Run) -> bool) -> Run {
     tokio::time::timeout(Duration::from_secs(15), async {
@@ -273,7 +390,7 @@ async fn child_completion_wakes_parent_and_signal_is_idempotent() {
         .await
         .unwrap();
     let run_id = created.result["run_id"].as_str().unwrap();
-    backend.start_execution().await.unwrap();
+    backend.start_execution_with_limit(1).await.unwrap();
     let waiting = until(&backend, run_id, |r| {
         r.nodes.get("c").is_some_and(|n| n.wait.is_some())
     })
@@ -382,5 +499,59 @@ async fn http_result_is_complete_and_never_resent_after_wait_restart() {
     backend.close().await.unwrap();
     drop(backend);
     server.abort();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn three_generations_complete_with_one_active_slot() {
+    let root = temp();
+    let backend = JournalBackend::open(&root, Default::default())
+        .await
+        .unwrap();
+    let mut workflow = install(&backend,json!({"nodes":[{"id":"s","type":"start"},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"e"}]})).await;
+    for _ in 0..2 {
+        workflow = install(&backend,json!({"nodes":[{"id":"s","type":"start"},{"id":"c","type":"sub_workflow","params":{"workflow_id":workflow}},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"c"},{"from":"c","to":"e"}]})).await;
+    }
+    let receipt = backend
+        .run_start(&workflow, None, json!({"proof":42}), "manual", None, None)
+        .await
+        .unwrap();
+    backend.start_execution_with_limit(1).await.unwrap();
+    let run = until(
+        &backend,
+        receipt.result["run_id"].as_str().unwrap(),
+        Run::terminal,
+    )
+    .await;
+    assert_eq!(run.status, "succeeded", "{:?}", run.error);
+    assert_eq!(backend.state().await.runs.len(), 3);
+    assert!(backend.execution_peak() <= 1);
+    backend.close().await.unwrap();
+    drop(backend);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn malformed_request_fails_before_operation_authorization() {
+    let root = temp();
+    let backend = JournalBackend::open(&root, Default::default())
+        .await
+        .unwrap();
+    let workflow = install(&backend,json!({"nodes":[{"id":"s","type":"start"},{"id":"h","type":"http_call","params":{"url":"http://127.0.0.1:1","headers":{"x-test":"bad\nheader"}}},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"h"},{"from":"h","to":"e"}]})).await;
+    let receipt = backend
+        .run_start(&workflow, None, json!({}), "manual", None, None)
+        .await
+        .unwrap();
+    backend.start_execution().await.unwrap();
+    let run = until(
+        &backend,
+        receipt.result["run_id"].as_str().unwrap(),
+        Run::terminal,
+    )
+    .await;
+    assert_eq!(run.status, "failed");
+    assert!(run.nodes["h"].operation.is_none());
+    backend.close().await.unwrap();
+    drop(backend);
     std::fs::remove_dir_all(root).unwrap();
 }

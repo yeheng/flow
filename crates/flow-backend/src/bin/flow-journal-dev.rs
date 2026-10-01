@@ -27,6 +27,13 @@ enum Command {
     Resume,
     /// Print recovered state without starting any execution.
     Status,
+    /// Preserve a stopped legacy dataset as a read-only baseline in a new JSONL directory.
+    ImportLegacy {
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        database: PathBuf,
+    },
     /// Offline: rebuild into a NEW SQLite file, without executing any workflow.
     RebuildProjection {
         #[arg(long)]
@@ -46,6 +53,11 @@ fn read_json(path: &Path, max: usize) -> Result<serde_json::Value, Box<dyn std::
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    if let Command::ImportLegacy { source, database } = &args.command {
+        let report = flow_backend::journal_import::import(source, database, &args.data_dir).await?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
     if let Command::RebuildProjection { destination } = &args.command {
         let lsn = JournalBackend::rebuild_projection(&args.data_dir, destination).await?;
         println!(

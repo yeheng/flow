@@ -553,7 +553,11 @@ async fn run_http(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
         } else {
             NodeFailure::fatal(format!("HTTP {status}"))
         };
-        failure.message = format!("{}，响应体：{}", failure.message, truncate(&redact_value(&output)));
+        failure.message = format!(
+            "{}，响应体：{}",
+            failure.message,
+            truncate(&redact_value(&output))
+        );
         return Err(failure);
     }
 
@@ -615,14 +619,18 @@ async fn post_json_bearer(
         } else {
             NodeFailure::fatal(format!("HTTP {status}"))
         };
-        failure.message = format!("{}，响应体：{}", failure.message, truncate(&redact_value(&body)));
+        failure.message = format!(
+            "{}，响应体：{}",
+            failure.message,
+            truncate(&redact_value(&body))
+        );
         return Err(failure);
     }
     Ok((status, body))
 }
 
 /// OpenAI 兼容 chat/completions 的请求构造（纯函数，与网络无关便于测试）。
-fn llm_request(params: &Value) -> Result<(String, Value), NodeFailure> {
+pub fn llm_request(params: &Value) -> Result<(String, Value), NodeFailure> {
     let need = |key: &str| {
         params
             .get(key)
@@ -698,7 +706,7 @@ async fn run_llm(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
 }
 
 /// Resend 兼容发信接口的请求构造（纯函数）。to 原样透传字符串。
-fn email_request(params: &Value) -> Result<(String, Value), NodeFailure> {
+pub fn email_request(params: &Value) -> Result<(String, Value), NodeFailure> {
     let need = |key: &str| {
         params
             .get(key)

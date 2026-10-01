@@ -10,6 +10,8 @@ sha2.workspace = true
 hex.workspace = true
 base64 = "0.22"
 clap.workspace = true
+cron-parser.workspace = true
+sqlx.workspace = true
 tempfile = "3"
 tokio = { workspace = true }
 tokio-util = { workspace = true }

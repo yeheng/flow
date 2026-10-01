@@ -2,7 +2,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 use std::time::Duration;
@@ -50,6 +50,7 @@ struct CommittedState {
 pub struct JournalBackend {
     pub journal: Journal,
     pub projection: Arc<Projector>,
+    pub observations: Option<flow_engine::observation::ObservationStore>,
     state: Mutex<CommittedState>,
     projected: Arc<Notify>,
     changed: Arc<Notify>,
@@ -61,6 +62,7 @@ pub struct JournalBackend {
     wait_timeout: Duration,
     pub(crate) execution: Mutex<Option<tokio::task::JoinHandle<()>>>,
     execution_changed: Arc<Notify>,
+    pub(crate) execution_peak: AtomicUsize,
 }
 
 impl JournalBackend {
@@ -117,10 +119,39 @@ impl JournalBackend {
     pub async fn open(root: &Path, options: JournalOptions) -> Result<Arc<Self>> {
         let journal = Journal::open(root, options).await?;
         let mut reader = TailReader::new(root, journal.id());
+        let root_owned = root.to_path_buf();
         let upper = journal.durable_lsn();
         let committed =
             tokio::task::spawn_blocking(move || -> flow_journal::Result<CommittedState> {
                 let mut state = State::default();
+                if let Some(checkpoint) =
+                    flow_journal::maintenance::load_checkpoint(&root_owned, 2)?
+                {
+                    let restored = (|| -> flow_journal::Result<State> {
+                        let mut state: State =
+                            serde_json::from_value(checkpoint.state["state"].clone())?;
+                        state.values = flow_journal::value::ValueCatalog::from_snapshot(
+                            checkpoint.state["values"].clone(),
+                        )?;
+                        if state.journal_id != checkpoint.journal_id
+                            || state.applied_lsn != checkpoint.lsn
+                            || state.applied_lsn > upper
+                        {
+                            return Err(flow_journal::Error::Invalid(
+                                "state checkpoint boundary mismatch".into(),
+                            ));
+                        }
+                        Ok(state)
+                    })();
+                    if let Ok(restored) = restored {
+                        reader = TailReader::after(
+                            &root_owned,
+                            &checkpoint.journal_id,
+                            &checkpoint.boundary,
+                        )?;
+                        state = restored;
+                    }
+                }
                 while let Some((tx, _)) = reader.next(upper)? {
                     state.apply(&tx)?;
                 }
@@ -153,7 +184,53 @@ impl JournalBackend {
                 "projection cursor is ahead of authoritative journal".into(),
             ));
         }
+        if projection
+            .applied_lsn()
+            .await
+            .map_err(|e| JournalError::Projection(e.to_string()))?
+            < upper
+        {
+            let mut rows = Vec::new();
+            for (key, value) in &committed.state.workflows {
+                rows.push(ProjectedRow {
+                    kind: "workflow".into(),
+                    key: key.clone(),
+                    value: Some(serde_json::to_value(value)?),
+                });
+            }
+            for (key, value) in &committed.state.runs {
+                rows.push(ProjectedRow {
+                    kind: "run".into(),
+                    key: key.clone(),
+                    value: Some(serde_json::to_value(value)?),
+                });
+            }
+            for (kind, map) in [
+                ("schedule", &committed.state.schedules),
+                ("webhook", &committed.state.webhooks),
+                ("legacy", &committed.state.legacy),
+            ] {
+                for (key, value) in map {
+                    rows.push(ProjectedRow {
+                        kind: kind.into(),
+                        key: key.clone(),
+                        value: Some(value.clone()),
+                    });
+                }
+            }
+            projection
+                .restore_snapshot(journal.id(), upper, rows)
+                .await
+                .map_err(|e| JournalError::Projection(e.to_string()))?;
+        }
+        let mut tail = committed.reader.fork();
+        let mut state = committed.state.clone();
         let backend = Arc::new(Self {
+            observations: flow_engine::observation::ObservationStore::open(
+                root.join("observations"),
+                Default::default(),
+            )
+            .ok(),
             journal,
             projection,
             state: Mutex::new(committed),
@@ -167,10 +244,9 @@ impl JournalBackend {
             wait_timeout: Duration::from_secs(5),
             execution: Mutex::new(None),
             execution_changed: Arc::new(Notify::new()),
+            execution_peak: AtomicUsize::new(0),
         });
         let weak = Arc::downgrade(&backend);
-        let mut tail = TailReader::new(root, backend.journal.id());
-        let mut state = State::default();
         let task = tokio::spawn(async move {
             loop {
                 let Some(b) = weak.upgrade() else { return };
@@ -244,6 +320,9 @@ impl JournalBackend {
     pub async fn state(&self) -> State {
         self.state.lock().await.state.clone()
     }
+    pub fn execution_peak(&self) -> usize {
+        self.execution_peak.load(Ordering::Relaxed)
+    }
     pub(crate) async fn inspect<T>(&self, read: impl FnOnce(&State) -> T) -> T {
         read(&self.state.lock().await.state)
     }
@@ -313,6 +392,39 @@ impl JournalBackend {
 
     pub async fn append(&self, events: Vec<Event>) -> Result<u64> {
         let mut state = self.state.lock().await;
+        self.refresh_locked(&mut state).await?;
+        if let [event] = events.as_slice() {
+            if event.audit_seq > 0 {
+                if let Some(attempt) = event
+                    .run_id
+                    .as_ref()
+                    .and_then(|id| state.state.runs.get(id))
+                    .and_then(|r| event.node_id.as_ref().and_then(|id| r.nodes.get(id)))
+                    .and_then(|n| event.dispatch_id.as_ref().and_then(|id| n.attempts.get(id)))
+                {
+                    if let Some(digest) = attempt.audit_digests.get(&event.audit_seq) {
+                        let incoming =
+                            flow_journal::codec::digest(&flow_journal::codec::bounded_json(
+                                event,
+                                flow_journal::MAX_LINE_BYTES,
+                            )?);
+                        if *digest != incoming {
+                            return Err(flow_journal::Error::Conflict(
+                                "same audit identity with different content".into(),
+                            )
+                            .into());
+                        }
+                        return attempt
+                            .audit_lsns
+                            .get(&event.audit_seq)
+                            .copied()
+                            .ok_or_else(|| {
+                                JournalError::Projection("missing original audit receipt".into())
+                            });
+                    }
+                }
+            }
+        }
         self.commit_locked(&mut state, events).await
     }
     async fn commit_locked(
@@ -457,8 +569,25 @@ impl JournalBackend {
         if let Some(task) = self.projector.lock().await.take() {
             let _ = task.await;
         }
+        if let Err(error) = self.checkpoint().await {
+            tracing::warn!(%error,"checkpoint unavailable; next startup will replay journal");
+        }
         self.projection.close().await;
         self.journal.close().await?;
+        Ok(())
+    }
+    pub async fn checkpoint(&self) -> Result<()> {
+        let mut committed = self.state.lock().await;
+        self.refresh_locked(&mut committed).await?;
+        let upper = committed.state.applied_lsn;
+        let snapshot = serde_json::json!({"state":committed.state,"values":committed.state.values.snapshot()?});
+        let root = self.journal.root().to_path_buf();
+        drop(committed);
+        tokio::task::spawn_blocking(move || {
+            flow_journal::maintenance::write_checkpoint(&root, upper, 2, snapshot)
+        })
+        .await
+        .map_err(|e| JournalError::Projection(e.to_string()))??;
         Ok(())
     }
     pub(crate) fn cancellation(&self) -> CancellationToken {
@@ -475,6 +604,9 @@ impl JournalBackend {
     pub(crate) async fn defer_run(&self, id: String) {
         self.state.lock().await.dirty_runs.insert(id);
     }
+    pub(crate) async fn defer_runs(&self, ids: Vec<String>) {
+        self.state.lock().await.dirty_runs.extend(ids);
+    }
 }
 
 fn project_rows(state: &State, tx: &Transaction) -> flow_journal::Result<Vec<ProjectedRow>> {
@@ -484,6 +616,12 @@ fn project_rows(state: &State, tx: &Transaction) -> flow_journal::Result<Vec<Pro
             keys.insert(("run", id.clone()));
         }
         match e.kind {
+            EventKind::LegacyImport => {
+                keys.insert((
+                    "legacy",
+                    flow_engine::journal_state::string(&e.payload, "key")?,
+                ));
+            }
             EventKind::WorkflowCreated
             | EventKind::WorkflowUpdated
             | EventKind::WorkflowPublished
@@ -518,6 +656,7 @@ fn project_rows(state: &State, tx: &Transaction) -> flow_journal::Result<Vec<Pro
                     .transpose()?,
                 "schedule" => state.schedules.get(&key).cloned(),
                 "webhook" => state.webhooks.get(&key).cloned(),
+                "legacy" => state.legacy.get(&key).cloned(),
                 _ => None,
             };
             Ok(ProjectedRow {

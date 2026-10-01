@@ -211,6 +211,16 @@ impl Attempt {
                 if node.dispatch_id != self.dispatch_id {
                     return Err(invalid("stale result"));
                 }
+                if let Some(original) = &node.attempts[&self.dispatch_id].result {
+                    let mut previous = original.payload.clone();
+                    previous.as_object_mut().unwrap().remove("sealed_through");
+                    if original.kind == kind && previous == payload {
+                        return Ok((vec![], ()));
+                    }
+                    return Err(flow_journal::Error::Conflict(
+                        "different result for sealed dispatch".into(),
+                    ));
+                }
                 let seq = node.attempts[&self.dispatch_id].audit_seq
                     + u64::from(kind == EventKind::NodeCompleted);
                 payload["sealed_through"] = json!(seq.to_string());
@@ -267,9 +277,29 @@ impl Attempt {
 
     /// Request construction is derived from the committed prepared parameters. Authorization
     /// is durably recorded with intent before reqwest is called, and never reused after restart.
-    pub async fn http(&self, prepared: &Prepared) -> Result<StoredValue> {
+    pub async fn http(&self, prepared: &Prepared, kind: NodeType) -> Result<StoredValue> {
         let mut budget = 8 * 1024 * 1024;
-        let params = self.materialize(&prepared.params, &mut budget).await?;
+        let mut params = self.materialize(&prepared.params, &mut budget).await?;
+        let mut credential = None;
+        if matches!(kind, NodeType::Llm | NodeType::Email) {
+            let name = params["api_key"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| invalid("api_key secret reference required"))?
+                .to_owned();
+            credential = Some(
+                flow_engine::secrets::get_secret(&name)
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| invalid(format!("secret reference {name} not configured")))?,
+            );
+            let (url, body) = if kind == NodeType::Llm {
+                flow_engine::exec::llm_request(&params)
+            } else {
+                flow_engine::exec::email_request(&params)
+            }
+            .map_err(|e| invalid(e.message))?;
+            params = json!({"method":"POST","url":url,"body":body,"timeout_ms":params["timeout_ms"],"credential":{"scheme":"bearer","secret_ref":name}});
+        }
         let method = params["method"].as_str().unwrap_or("GET").to_uppercase();
         if !flow_engine::HTTP_METHODS.contains(&method.as_str()) {
             return Err(invalid("invalid HTTP method").into());
@@ -277,7 +307,37 @@ impl Attempt {
         let url = params["url"]
             .as_str()
             .ok_or_else(|| invalid("HTTP URL missing"))?;
-        let request = json!({"method":method,"url":url,"headers":params.get("headers").cloned().unwrap_or(json!({})),"body":params.get("body").cloned().unwrap_or(Value::Null)});
+        let http_method =
+            reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| invalid(e.to_string()))?;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .build()
+            .map_err(|e| invalid(e.to_string()))?;
+        let mut request = client
+            .request(http_method, url)
+            .timeout(Duration::from_millis(
+                params["timeout_ms"].as_u64().unwrap_or(30_000),
+            ));
+        if let Some(headers) = params["headers"].as_object() {
+            for (key, value) in headers {
+                request = request.header(
+                    key,
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| value.to_string()),
+                );
+            }
+        }
+        if !params["body"].is_null() {
+            request = request.json(&params["body"]);
+        }
+        if let Some(secret) = credential {
+            request = request.bearer_auth(secret);
+        }
+        let outbound = request.build().map_err(|e| invalid(e.to_string()))?;
+        let request = json!({"method":method,"url":url,"headers":params.get("headers").cloned().unwrap_or(json!({})),"body":params.get("body").cloned().unwrap_or(Value::Null),"credential":params.get("credential").cloned().unwrap_or(Value::Null)});
         let fingerprint = flow_journal::codec::digest(&flow_journal::codec::bounded_json(
             &request,
             8 * 1024 * 1024,
@@ -333,30 +393,8 @@ impl Attempt {
         if self.snapshot().await?.terminal() {
             return Err(invalid("cancelled after authorization; outcome uncertain").into());
         }
-        let method =
-            reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| invalid(e.to_string()))?;
-        let mut request =
-            reqwest::Client::new()
-                .request(method, url)
-                .timeout(Duration::from_millis(
-                    params["timeout_ms"].as_u64().unwrap_or(30_000),
-                ));
-        if let Some(headers) = params["headers"].as_object() {
-            for (key, value) in headers {
-                request = request.header(
-                    key,
-                    value
-                        .as_str()
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| value.to_string()),
-                );
-            }
-        }
-        if !params["body"].is_null() {
-            request = request.json(&params["body"]);
-        }
-        let mut response = request
-            .send()
+        let mut response = client
+            .execute(outbound)
             .await
             .map_err(|e| invalid(format!("external outcome uncertain: {e}")))?;
         let status = response.status().as_u16();
@@ -380,9 +418,9 @@ impl Attempt {
             StoredValue::inline(json!({"status":status,"headers":headers,"body_raw":raw}))?;
         self.audit(EventKind::OperationOutcome, json!({"outcome":outcome}))
             .await?;
-        self.http_output(&outcome).await
+        self.http_output(&outcome, kind).await
     }
-    pub async fn http_output(&self, outcome: &StoredValue) -> Result<StoredValue> {
+    pub async fn http_output(&self, outcome: &StoredValue, kind: NodeType) -> Result<StoredValue> {
         use serde::Deserialize;
         use std::io::{Seek, SeekFrom};
         let mut budget = flow_journal::INLINE_BYTES;
@@ -391,6 +429,42 @@ impl Attempt {
             .as_u64()
             .ok_or_else(|| invalid("invalid HTTP outcome"))?;
         let raw: ValueRef = serde_json::from_value(outcome["body_raw"].clone())?;
+        if matches!(kind, NodeType::Llm | NodeType::Email) {
+            if status >= 400 {
+                return Err(invalid(format!("HTTP {status}; outcome retained")).into());
+            }
+            if raw.total_bytes > 8 * 1024 * 1024 {
+                return Err(flow_journal::Error::Limit(
+                    "integration decoding exceeds 8 MiB; raw outcome retained".into(),
+                )
+                .into());
+            }
+            let root = self.backend.journal.root().to_path_buf();
+            let upper = self.backend.journal.durable_lsn();
+            let response: Value = tokio::task::spawn_blocking(move || {
+                let mut bytes = flow_journal::codec::BoundedBuffer {
+                    bytes: Vec::new(),
+                    limit: 8 * 1024 * 1024,
+                };
+                flow_journal::value::read_value(&root, upper, &raw, true, &mut bytes)?;
+                Ok::<_, flow_journal::Error>(serde_json::from_slice(&bytes.bytes)?)
+            })
+            .await
+            .map_err(|e| invalid(e.to_string()))??;
+            let output = if kind == NodeType::Llm {
+                let content = response
+                    .pointer("/choices/0/message/content")
+                    .ok_or_else(|| {
+                        invalid(
+                            "LLM response missing choices[0].message.content; raw outcome retained",
+                        )
+                    })?;
+                json!({"content":content,"model":response["model"],"usage":response["usage"]})
+            } else {
+                json!({"status":status,"id":response["id"]})
+            };
+            return self.json(output).await;
+        }
         // Re-read captured bytes for JSON/text semantics. The temporary spool is bounded by
         // MAX_VALUE_BYTES and contains no unique authority; its reference is never published.
         let root = self.backend.journal.root().to_path_buf();

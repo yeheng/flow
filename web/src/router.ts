@@ -4,6 +4,7 @@ import { createRouter, createWebHistory } from "vue-router";
 export const router = createRouter({
   history: createWebHistory(),
   routes: [
+    { path: "/journal", component: () => import("./views/JournalView.vue") },
     { path: "/", component: () => import("./views/DashboardView.vue") },
     { path: "/workflows", component: () => import("./views/WorkflowListView.vue") },
     { path: "/workflows/:id", component: () => import("./views/EditorView.vue") },

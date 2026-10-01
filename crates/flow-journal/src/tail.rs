@@ -16,6 +16,35 @@ pub struct TailReader {
     reader: Option<BufReader<File>>,
 }
 impl TailReader {
+    pub fn fork(&self) -> Self {
+        Self {
+            root: self.root.clone(),
+            journal_id: self.journal_id.clone(),
+            segment: self.segment,
+            offset: self.offset,
+            next_lsn: self.next_lsn,
+            reader: None,
+        }
+    }
+    pub fn after(root: &Path, journal_id: &str, location: &Location) -> Result<Self> {
+        let tx = codec::decode(&crate::maintenance::read_location(root, location)?)?;
+        if tx.journal_id != journal_id {
+            return Err(invalid("foreign checkpoint boundary"));
+        }
+        let sealed = tx.events[0].kind == EventKind::SegmentSealed;
+        Ok(Self {
+            root: root.into(),
+            journal_id: journal_id.into(),
+            segment: location.segment + u64::from(sealed),
+            offset: if sealed {
+                0
+            } else {
+                location.offset + location.bytes
+            },
+            next_lsn: location.lsn + 1,
+            reader: None,
+        })
+    }
     pub fn new(root: &Path, journal_id: &str) -> Self {
         Self {
             root: root.into(),

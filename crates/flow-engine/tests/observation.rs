@@ -43,3 +43,29 @@ fn bounded_observations_survive_restart_and_record_loss() {
     drop(store);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn scoped_rejections_survive_restart_and_do_not_leak_between_runs() {
+    let root = std::env::temp_dir().join(format!("flow-observation-{}", uuid::Uuid::now_v7()));
+    let store = ObservationStore::open(&root, Default::default()).unwrap();
+    let logger = store.logger("r".into(), "d".into());
+    for _ in 0..3 {
+        logger.emit(LogLine {
+            node_id: "n".into(),
+            attempt: 1,
+            level: LogLevel::Info,
+            stream: LogStream::Stdout,
+            message: "x".repeat(20_000),
+        });
+    }
+    store.logger("other".into(), "d".into());
+    store.flush();
+    assert_eq!(store.scoped_loss("r", Some("d")).queue_dropped, 3);
+    assert_eq!(store.scoped_loss("other", None).queue_dropped, 0);
+    drop(logger);
+    drop(store);
+    let store = ObservationStore::open(&root, Default::default()).unwrap();
+    assert_eq!(store.scoped_loss("r", None).queue_dropped, 3);
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
+}

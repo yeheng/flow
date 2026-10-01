@@ -17,15 +17,17 @@ fn invalid(s: impl Into<String>) -> flow_journal::Error {
 
 impl JournalBackend {
     pub async fn start_execution(self: &Arc<Self>) -> Result<()> {
+        self.start_execution_with_limit(16).await
+    }
+    pub async fn start_execution_with_limit(self: &Arc<Self>, limit: usize) -> Result<()> {
+        if !(1..=16).contains(&limit) {
+            return Err(invalid("A_max must be within 1..=16").into());
+        }
         let mut driver = self.execution.lock().await;
         if driver.is_some() {
             return Ok(());
         }
-        let observation = flow_engine::observation::ObservationStore::open(
-            self.journal.root().join("observations"),
-            Default::default(),
-        )
-        .ok();
+        let observation = self.observations.clone();
         let weak = Arc::downgrade(self);
         let cancel = self.cancellation();
         let notify = self.execution_notification();
@@ -73,8 +75,14 @@ impl JournalBackend {
                         backend.defer_run(run).await;
                     }
                 }
-                let runs = backend.take_dirty_runs().await;
-                for run_id in runs {
+                let mut runs = backend.take_dirty_runs().await.into_iter();
+                while let Some(run_id) = runs.next() {
+                    if tasks.len() >= limit {
+                        backend
+                            .defer_runs(std::iter::once(run_id).chain(runs).collect())
+                            .await;
+                        break;
+                    }
                     let result:Result<()>=async {
                         let run=backend.inspect(|s|s.runs[&run_id].clone()).await;
                         if run.terminal(){return Ok(())}
@@ -119,9 +127,10 @@ impl JournalBackend {
                             }
                             if skip {backend.internal(|s|Ok((vec![node_event(&s.runs[&run_id],&node.id,EventKind::NodeSkipped,json!({}),true)],()))).await?;continue}
                             if !ready{continue}
-                            if tasks.len()>=16{backend.defer_run(run_id.clone()).await;continue}
+                            if tasks.len()>=limit{backend.defer_run(run_id.clone()).await;continue}
                             let attempt=Attempt::begin(backend.clone(),run_id.clone(),node.id.clone()).await?;
                             let key=(run_id.clone(),node.id.clone());active.insert(key.clone());
+                            backend.execution_peak.fetch_max(tasks.len()+1,std::sync::atomic::Ordering::Relaxed);
                             let node=node.clone();let observation=observation.clone();
                             tasks.spawn(async move {
                                 let logger=observation.map(|store|NodeLogger::observation(store.logger(attempt.run_id.clone(),attempt.dispatch_id.clone()),attempt.node_id.clone(),1)).unwrap_or_else(NodeLogger::disabled);
@@ -226,7 +235,7 @@ async fn execute(
             None,
         ),
         NodeType::Script | NodeType::Condition => attempt.compute(node, &prepared, logger).await?,
-        NodeType::HttpCall => {
+        kind @ (NodeType::HttpCall | NodeType::Llm | NodeType::Email) => {
             let run = attempt.snapshot().await?;
             let previous = run.nodes[&attempt.node_id]
                 .operation
@@ -234,9 +243,9 @@ async fn execute(
                 .and_then(|o| o.outcome.clone());
             (
                 if let Some(previous) = previous {
-                    attempt.http_output(&previous).await?
+                    attempt.http_output(&previous, kind).await?
                 } else {
-                    attempt.http(&prepared).await?
+                    attempt.http(&prepared, kind).await?
                 },
                 None,
             )
@@ -276,9 +285,6 @@ async fn execute(
                 .await
         }
         NodeType::SubWorkflow => return start_child(attempt, &prepared).await,
-        NodeType::Llm | NodeType::Email => {
-            return Err(invalid("integration adapter not ready on v2 development path").into())
-        }
     };
     attempt
         .finish(

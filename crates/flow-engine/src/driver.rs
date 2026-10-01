@@ -839,8 +839,7 @@ impl Driver {
                             message: "副作用节点状态不明（接管/重启），等待人工裁决".into(),
                         })
                         .await;
-                    self.slots
-                        .insert(node_id.clone(), NodeSlot::Adjudicating);
+                    self.slots.insert(node_id.clone(), NodeSlot::Adjudicating);
                 }
                 RecoveryAction::Replay { node_id, attempt } => {
                     let _ = self
@@ -849,7 +848,10 @@ impl Driver {
                             attempt: *attempt,
                             level: LogLevel::Info,
                             stream: LogStream::Engine,
-                            message: format!("接管/重启残留节点，重新执行（attempt {}）", attempt + 1),
+                            message: format!(
+                                "接管/重启残留节点，重新执行（attempt {}）",
+                                attempt + 1
+                            ),
                         })
                         .await;
                     self.start_node(node_id, attempt + 1, result_tx).await?;
@@ -891,9 +893,7 @@ impl Driver {
             // 挂 awaiting_resume，绝不写成 run_failed 业务终态。回归测试：
             // `recovery_regressions::corrupt_durable_adjudication_is_a_platform_fault_not_a_run_failure`。
             let action = self.signal_action(&signal).map_err(|err| {
-                EngineError::LogCorrupted(format!(
-                    "节点 {node_id} 的已落盘裁决载荷非法：{err}"
-                ))
+                EngineError::LogCorrupted(format!("节点 {node_id} 的已落盘裁决载荷非法：{err}"))
             })?;
             self.apply_signal(signal, action, result_tx).await?;
         }

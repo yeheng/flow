@@ -14,7 +14,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("development downloads require loopback".into());
     }
     let listener = tokio::net::TcpListener::bind(download_addr).await?;
-    let router = flow_rpc::journal_download::router(backend.clone(), token.clone())?;
+    let router = flow_rpc::journal_download::router(backend.clone(), token.clone())?.merge(
+        flow_rpc::journal_triggers::router(backend.clone(), token.clone()),
+    );
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let mut downloads = tokio::spawn(async move {
         axum::serve(listener, router)
@@ -25,8 +27,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let (server, addr) = flow_rpc::journal_v2::serve(backend.clone(), token, addr).await?;
     backend.start_execution().await?;
+    let scheduler = flow_rpc::journal_triggers::start(backend.clone());
     eprintln!("JSONL development RPC listening on {addr}");
     tokio::signal::ctrl_c().await?;
+    scheduler.abort();
+    let _ = scheduler.await;
     server.stop()?;
     server.stopped().await;
     let _ = stop.send(());

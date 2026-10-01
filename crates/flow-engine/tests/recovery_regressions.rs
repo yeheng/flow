@@ -304,7 +304,10 @@ async fn node_outside_definition_is_rejected_on_recovery() {
         node_def(json!({"id":"n", "type":"http_call", "params":{"url":"http://127.0.0.1:1"}}));
 
     let err = h.engine.resume_run(spec(def)).await.unwrap_err();
-    assert!(matches!(err, flow_engine::EngineError::LogCorrupted(_)), "{err}");
+    assert!(
+        matches!(err, flow_engine::EngineError::LogCorrupted(_)),
+        "{err}"
+    );
     assert!(err.to_string().contains("ghost"), "诊断要指名道姓：{err}");
 
     // 恢复被拒 → 没有 Driver 被拉起，run 原样停在日志末尾
@@ -417,8 +420,7 @@ async fn awaiting_adjudication_never_projects_back_to_running() {
             .filter(|(status, _)| *status == DbRunStatus::Running)
             .count();
         assert_eq!(
-            running_count,
-            1,
+            running_count, 1,
             "n1 仍在等人工裁决，run 不得被投影回 running（消费 n 的裁决时，\
              另一个 Adjudicating 槽位必须已经登记）：{seen:?}"
         );

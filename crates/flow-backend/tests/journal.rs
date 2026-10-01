@@ -25,6 +25,93 @@ fn temp() -> std::path::PathBuf {
 }
 
 #[tokio::test]
+async fn publication_and_business_references_require_a_complete_value_closure() {
+    use flow_journal::value::ValueCodec;
+    use flow_journal::{StoredValue, ValueRef};
+    let root = temp();
+    let backend = JournalBackend::open(&root, Default::default())
+        .await
+        .unwrap();
+    let value = ValueRef {
+        journal_id: backend.journal.id().into(),
+        output_id: "object".into(),
+        codec: ValueCodec::Json,
+        version: 1,
+        chunk_count: 1,
+        total_bytes: 2,
+        digest: flow_journal::codec::digest(b"{}"),
+    };
+    let before = backend.journal.durable_lsn();
+    assert!(backend
+        .append(vec![Event::new(EventKind::ValuePublished, json!(value))])
+        .await
+        .is_err());
+    assert_eq!(backend.journal.durable_lsn(), before);
+    let chunk = Event::new(
+        EventKind::ValueChunk,
+        json!({"output_id":"object","chunk_index":"0","data":"e30="}),
+    );
+    // A later malformed sibling must also roll back the streaming hash/counters.
+    assert!(backend
+        .append(vec![
+            chunk.clone(),
+            Event::new(
+                EventKind::WorkflowPublished,
+                json!({"workflow_id":"missing","version":"1"})
+            )
+        ])
+        .await
+        .is_err());
+    assert_eq!(backend.journal.durable_lsn(), before);
+    backend.append(vec![chunk]).await.unwrap();
+    let mut wrong = value.clone();
+    wrong.digest = "0".repeat(64);
+    assert!(backend
+        .append(vec![Event::new(EventKind::ValuePublished, json!(wrong))])
+        .await
+        .is_err());
+    backend
+        .append(vec![Event::new(EventKind::ValuePublished, json!(value))])
+        .await
+        .unwrap();
+    assert!(backend
+        .state()
+        .await
+        .values
+        .check(&StoredValue::Ref(value.clone()))
+        .is_ok());
+    assert!(backend
+        .state()
+        .await
+        .values
+        .check(&StoredValue::Ref(wrong))
+        .is_err());
+    let before = backend.journal.durable_lsn();
+    assert!(backend
+        .append(vec![Event::new(
+            EventKind::ValueChunk,
+            json!({"output_id":"object","chunk_index":"1","data":"e30="})
+        )])
+        .await
+        .is_err());
+    assert_eq!(backend.journal.durable_lsn(), before);
+    backend.close().await.unwrap();
+    drop(backend);
+    let backend = JournalBackend::open(&root, Default::default())
+        .await
+        .unwrap();
+    assert!(backend
+        .state()
+        .await
+        .values
+        .check(&StoredValue::Ref(value))
+        .is_ok());
+    backend.close().await.unwrap();
+    drop(backend);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn concurrent_same_identity_attaches_and_projection_is_disposable() {
     let root = temp();
     let backend = JournalBackend::open(&root, JournalOptions::default())
@@ -236,6 +323,63 @@ async fn disconnected_command_is_joined_before_retry_decision() {
     assert_eq!(receipt.result["workflow_id"], "original");
     assert!(receipt.visible);
     assert_eq!(backend.journal.stats().transactions, 1);
+    backend.close().await.unwrap();
+    drop(backend);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn checkpoint_resumes_partial_value_and_corrupt_cache_replays() {
+    let root = temp();
+    let backend = JournalBackend::open(&root, Default::default())
+        .await
+        .unwrap();
+    backend
+        .append(vec![Event::new(
+            EventKind::ValueChunk,
+            json!({"output_id":"partial","chunk_index":"0","data":"ew=="}),
+        )])
+        .await
+        .unwrap();
+    let identity = backend.journal.id().to_owned();
+    backend.close().await.unwrap();
+    drop(backend);
+    assert!(root.join("checkpoints/latest.json").exists());
+    let backend = JournalBackend::open(&root, Default::default())
+        .await
+        .unwrap();
+    backend
+        .append(vec![Event::new(
+            EventKind::ValueChunk,
+            json!({"output_id":"partial","chunk_index":"1","data":"fQ=="}),
+        )])
+        .await
+        .unwrap();
+    let value = flow_journal::ValueRef {
+        journal_id: identity,
+        output_id: "partial".into(),
+        codec: flow_journal::value::ValueCodec::Json,
+        version: 1,
+        chunk_count: 2,
+        total_bytes: 2,
+        digest: flow_journal::codec::digest(b"{}"),
+    };
+    backend
+        .append(vec![Event::new(EventKind::ValuePublished, json!(value))])
+        .await
+        .unwrap();
+    backend.close().await.unwrap();
+    drop(backend);
+    std::fs::write(root.join("checkpoints/latest.json"), b"corrupt cache").unwrap();
+    let backend = JournalBackend::open(&root, Default::default())
+        .await
+        .unwrap();
+    backend
+        .state()
+        .await
+        .values
+        .check(&flow_journal::StoredValue::Ref(value))
+        .unwrap();
     backend.close().await.unwrap();
     drop(backend);
     std::fs::remove_dir_all(root).unwrap();

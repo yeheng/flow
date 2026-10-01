@@ -282,3 +282,41 @@ async fn run_cannot_reference_deleted_workflow_version() {
     drop(store);
     // TempDir 的 Drop 负责删目录
 }
+
+#[tokio::test]
+async fn projection_snapshot_failure_restores_both_rows_and_cursor() {
+    use flow_store::projection::{ProjectedRow, Projector};
+    let dir = TempDir::new("projection-snapshot");
+    let projector = Projector::open(&dir.join("projection.db"), "journal")
+        .await
+        .unwrap();
+    let row = |key: &str| ProjectedRow {
+        kind: "run".into(),
+        key: key.into(),
+        value: Some(json!({"key":key})),
+    };
+    projector
+        .restore_snapshot("journal", 1, vec![row("old")])
+        .await
+        .unwrap();
+    // Duplicate primary key fails after DELETE and the first INSERT in the transaction.
+    assert!(projector
+        .restore_snapshot("journal", 2, vec![row("new"), row("new")])
+        .await
+        .is_err());
+    assert_eq!(
+        projector.get("run", "old").await.unwrap(),
+        (1, Some(json!({"key":"old"})))
+    );
+    assert_eq!(projector.get("run", "new").await.unwrap(), (1, None));
+    projector
+        .restore_snapshot("journal", 2, vec![row("new")])
+        .await
+        .unwrap();
+    assert_eq!(projector.get("run", "old").await.unwrap(), (2, None));
+    assert_eq!(
+        projector.get("run", "new").await.unwrap(),
+        (2, Some(json!({"key":"new"})))
+    );
+    projector.close().await;
+}

@@ -160,8 +160,17 @@ impl NodeLogger {
         }
     }
 
-    pub fn observation(target: crate::observation::ObservationLogger, node_id: String, attempt: u32) -> Self {
-        Self { tx: LogTarget::Observation(target), budget: LogBudget::new(usize::MAX), node_id, attempt }
+    pub fn observation(
+        target: crate::observation::ObservationLogger,
+        node_id: String,
+        attempt: u32,
+    ) -> Self {
+        Self {
+            tx: LogTarget::Observation(target),
+            budget: LogBudget::new(usize::MAX),
+            node_id,
+            attempt,
+        }
     }
 
     /// 无接收端的 logger（直接调用 exec 的测试路径用）：发射即丢，预算放行。
@@ -182,7 +191,9 @@ impl NodeLogger {
             message: truncate_message(&message.into()),
         };
         match &self.tx {
-            LogTarget::Legacy(tx) => { let _ = tx.send(line); }
+            LogTarget::Legacy(tx) => {
+                let _ = tx.send(line);
+            }
             LogTarget::Observation(target) => target.emit(line),
         }
     }
@@ -495,7 +506,10 @@ mod tests {
         );
         // 没有 query / 裸参数（无值可泄）/ 非敏感参数：原样
         assert_eq!(redact_url("https://x.test/a"), "https://x.test/a");
-        assert_eq!(redact_url("https://x.test/a?debug"), "https://x.test/a?debug");
+        assert_eq!(
+            redact_url("https://x.test/a?debug"),
+            "https://x.test/a?debug"
+        );
         assert_eq!(
             redact_url("https://x.test/a?q=token&z=1"),
             "https://x.test/a?q=token&z=1"

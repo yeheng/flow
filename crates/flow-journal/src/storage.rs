@@ -90,7 +90,8 @@ pub fn scan_until(
 /// Fast inventory recovery trusts checkpoint-verified sealed bytes, but still checks every
 /// known segment name, identity and length via load_checkpoint. Full verify always uses scan.
 pub fn scan_fast(root: &Path) -> Result<Recovery> {
-    let checkpoint = crate::maintenance::load_checkpoint(root, 1)?;
+    let checkpoint = crate::maintenance::load_checkpoint(root, 2)?
+        .or(crate::maintenance::load_checkpoint(root, 1)?);
     scan_using(
         root,
         u64::MAX,
@@ -265,6 +266,9 @@ pub(crate) fn private_file(path: &Path, create_new: bool) -> Result<File> {
 }
 
 pub(crate) fn private_dir(path: &Path) -> Result<()> {
+    private_dir_recorded(path, &mut SyncLatency::default())
+}
+fn private_dir_recorded(path: &Path, latency: &mut SyncLatency) -> Result<()> {
     if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(invalid("symlink data directory"));
     }
@@ -276,7 +280,7 @@ pub(crate) fn private_dir(path: &Path) -> Result<()> {
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
         if !parent.exists() {
-            private_dir(parent)?;
+            private_dir_recorded(parent, latency)?;
         }
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
@@ -293,7 +297,9 @@ pub(crate) fn private_dir(path: &Path) -> Result<()> {
             }
             Err(e) => return Err(e.into()),
         }
+        let started = std::time::Instant::now();
         sync_dir(parent)?;
+        latency.record(started.elapsed());
     }
     #[cfg(unix)]
     {
@@ -313,6 +319,26 @@ pub struct FaultInjection {
     pub sync_delay_ms: u64,
 }
 
+/// Fixed logarithmic microsecond buckets: bucket i contains durations <= 2^i us,
+/// with the last bucket also collecting longer calls. Includes directory initialization.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct SyncLatency {
+    pub samples: u64,
+    pub total_us: u64,
+    pub max_us: u64,
+    pub buckets: [u64; 24],
+}
+impl SyncLatency {
+    fn record(&mut self, elapsed: std::time::Duration) {
+        let us = elapsed.as_micros().min(u64::MAX as u128) as u64;
+        let bucket = (64 - us.max(1).saturating_sub(1).leading_zeros() as usize).min(23);
+        self.samples += 1;
+        self.total_us = self.total_us.saturating_add(us);
+        self.max_us = self.max_us.max(us);
+        self.buckets[bucket] += 1;
+    }
+}
+
 pub(crate) struct Disk {
     pub file: File,
     pub root: PathBuf,
@@ -324,6 +350,8 @@ pub(crate) struct Disk {
     pub hash: Sha256,
     pub data_syncs: u64,
     pub dir_syncs: u64,
+    pub data_latency: SyncLatency,
+    pub directory_latency: SyncLatency,
     pub written: u64,
     pub faults: FaultInjection,
     pub _lock: File,
@@ -331,7 +359,8 @@ pub(crate) struct Disk {
 
 impl Disk {
     pub fn open(root: &Path, faults: FaultInjection) -> Result<Self> {
-        private_dir(root)?;
+        let mut directory_latency = SyncLatency::default();
+        private_dir_recorded(root, &mut directory_latency)?;
         let lock = File::open(root)?;
         fs2::FileExt::try_lock_exclusive(&lock)
             .map_err(|e| Error::Conflict(format!("data directory is locked: {e}")))?;
@@ -342,8 +371,10 @@ impl Disk {
                     "new journal requires an empty data directory; import legacy data offline",
                 ));
             }
-            private_dir(&root.join("journal"))?;
+            private_dir_recorded(&root.join("journal"), &mut directory_latency)?;
+            let started = std::time::Instant::now();
             sync_dir(root)?;
+            directory_latency.record(started.elapsed());
             let file = private_file(&segment_path(root, 1), true)?;
             let mut disk = Self {
                 file,
@@ -356,6 +387,8 @@ impl Disk {
                 hash: Sha256::new(),
                 data_syncs: 0,
                 dir_syncs: 0,
+                data_latency: SyncLatency::default(),
+                directory_latency,
                 written: 0,
                 faults,
                 _lock: lock,
@@ -411,6 +444,8 @@ impl Disk {
                 hash,
                 data_syncs: 0,
                 dir_syncs: 0,
+                data_latency: SyncLatency::default(),
+                directory_latency,
                 written: 0,
                 faults,
                 _lock: lock,
@@ -474,7 +509,9 @@ impl Disk {
         if self.faults.fail_data_sync == Some(self.data_syncs) {
             return Err(std::io::Error::other("injected fsync failure").into());
         }
+        let started = std::time::Instant::now();
         self.file.sync_all()?;
+        self.data_latency.record(started.elapsed());
         Ok(())
     }
     fn sync_directory(&mut self) -> Result<()> {
@@ -482,7 +519,10 @@ impl Disk {
         if self.faults.fail_dir_sync == Some(self.dir_syncs) {
             return Err(std::io::Error::other("injected directory fsync failure").into());
         }
-        sync_dir(&self.root.join("journal"))
+        let started = std::time::Instant::now();
+        sync_dir(&self.root.join("journal"))?;
+        self.directory_latency.record(started.elapsed());
+        Ok(())
     }
     fn structure(&mut self, kind: EventKind, payload: serde_json::Value) -> Result<()> {
         let tx = Transaction {

@@ -54,6 +54,8 @@ pub struct WriterStats {
     pub batches: u64,
     pub data_syncs: u64,
     pub directory_syncs: u64,
+    pub data_sync_latency: crate::storage::SyncLatency,
+    pub directory_sync_latency: crate::storage::SyncLatency,
     pub max_batch_transactions: usize,
     pub max_batch_bytes: usize,
     pub peak_queued_bytes: usize,
@@ -158,7 +160,9 @@ impl Journal {
                 stats: WriterStats {
                     durable_lsn: disk.last_lsn,
                     data_syncs: disk.data_syncs,
-                    directory_syncs: disk.dir_syncs,
+                    directory_syncs: disk.directory_latency.samples,
+                    data_sync_latency: disk.data_latency.clone(),
+                    directory_sync_latency: disk.directory_latency.clone(),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -348,7 +352,9 @@ fn pump(mut disk: Disk, shared: Arc<Shared>, options: JournalOptions) {
         })();
         let mut queue = shared.queue.lock().unwrap();
         queue.stats.data_syncs = disk.data_syncs;
-        queue.stats.directory_syncs = disk.dir_syncs;
+        queue.stats.directory_syncs = disk.directory_latency.samples;
+        queue.stats.data_sync_latency = disk.data_latency.clone();
+        queue.stats.directory_sync_latency = disk.directory_latency.clone();
         match outcome {
             Ok(()) => {
                 queue.stats.durable_lsn = disk.last_lsn;

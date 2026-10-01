@@ -5,6 +5,7 @@ export class RpcError extends Error {
   constructor(
     public code: number,
     message: string,
+    public data?: unknown,
   ) {
     super(message);
     this.name = "RpcError";
@@ -36,12 +37,29 @@ interface Subscription {
  * JSON-RPC 2.0 over WebSocket 客户端，直连 flow-server（协议见 docs/DESIGN.md §9）。
  * 断线自动重连（指数退避）；重连后自动重建订阅，调用方通过 onReconnect 重新拉取状态。
  */
-class RpcClient {
+export class RpcClient {
+  constructor(private readonly endpoint?: string) {}
   readonly connected = ref(false);
 
   /** 惰性解析：首次连接时才读运行时配置（main.ts 启动时拉取 config.json） */
   get url(): string {
-    return rpcUrl();
+    return this.endpoint ?? rpcUrl();
+  }
+
+  private disposed = false;
+  close(): void {
+    this.disposed = true;
+    if (this.reconnectTimer !== null) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    const socket = this.ws;
+    this.ws = null;
+    this.connected.value = false;
+    const error = new RpcError(-32000, "RPC client closed");
+    for (const pending of this.pending.values()) pending.reject(error);
+    this.pending.clear();
+    for (const waiter of this.openWaiters.splice(0)) waiter.reject(error);
+    this.subs.clear(); this.serverToLocal.clear(); this.reconnectCbs = [];
+    socket?.close();
   }
 
   private ws: WebSocket | null = null;
@@ -58,8 +76,9 @@ class RpcClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectCbs: Array<() => void> = [];
 
-  onReconnect(cb: () => void): void {
+  onReconnect(cb: () => void): () => void {
     this.reconnectCbs.push(cb);
+    return () => { this.reconnectCbs = this.reconnectCbs.filter(item => item !== cb); };
   }
 
   async call<T>(method: string, params: Record<string, unknown> | unknown[]): Promise<T> {
@@ -94,6 +113,7 @@ class RpcClient {
       }
       if (serverId !== undefined) {
         this.serverToLocal.delete(serverId);
+        if (this.disposed || !this.connected.value) return;
         const unsubMethod = method.replace(/subscribe$/, "unsubscribe");
         // jsonrpsee 的退订参数是位置参数 [subscription id]，具名参数会被静默忽略；
         // 退订尽力而为：连接断开时服务端会自行清理
@@ -115,6 +135,7 @@ class RpcClient {
   }
 
   private connect(): void {
+    if (this.disposed) return;
     if (this.ws && this.ws.readyState !== WebSocket.CLOSED) return;
     // 单一 pending 重连定时器：旧实现丢弃 setTimeout 句柄，B 的 onclose 排的
     // T2 与 A 排的 T1 会同时在飞，指数退避也就失效了
@@ -126,6 +147,7 @@ class RpcClient {
     this.ws = ws;
 
     ws.onopen = () => {
+      if (this.disposed || this.ws !== ws) return;
       this.connected.value = true;
       this.reconnectDelay = 500;
       const reconnected = this.everConnected;
@@ -173,6 +195,7 @@ class RpcClient {
   }
 
   private waitOpen(): Promise<void> {
+    if (this.disposed) return Promise.reject(new RpcError(-32000, "RPC client closed"));
     this.connect();
     if (this.ws && this.ws.readyState === WebSocket.OPEN) return Promise.resolve();
     return new Promise((resolve, reject) => this.openWaiters.push({ resolve, reject }));
@@ -184,7 +207,7 @@ class RpcClient {
       method?: string;
       params?: { subscription?: unknown; result?: unknown };
       result?: unknown;
-      error?: { code: number; message: string };
+      error?: { code: number; message: string; data?: unknown };
     };
     try {
       msg = JSON.parse(raw);
@@ -200,7 +223,7 @@ class RpcClient {
     if (!p) return;
     this.pending.delete(msg.id ?? -1);
     if (msg.error) {
-      p.reject(new RpcError(msg.error.code, msg.error.message));
+      p.reject(new RpcError(msg.error.code, msg.error.message, msg.error.data));
       return;
     }
     if (p.localSub !== undefined) {

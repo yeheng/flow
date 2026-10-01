@@ -16,6 +16,81 @@ pub(crate) fn now() -> String {
 }
 
 impl JournalBackend {
+    pub async fn trigger_configs(&self, source: &str) -> Vec<Value> {
+        self.inspect(|s| {
+            if source == "schedule" {
+                s.schedules.values().cloned().collect()
+            } else {
+                s.webhooks.values().cloned().collect()
+            }
+        })
+        .await
+    }
+
+    pub async fn trigger_start(
+        &self,
+        source: &str,
+        key: &str,
+        request_id: &str,
+        input: Value,
+    ) -> Result<CommandReceipt> {
+        if !matches!(source, "schedule" | "webhook") {
+            return Err(invalid("invalid trigger source").into());
+        }
+        // A retry remains attached even if the operator subsequently edits/deletes the trigger.
+        if let Some(receipt) = self
+            .command_status(&format!("run.start:{source}:{key}"), request_id)
+            .await?
+        {
+            let run_id = receipt.result["run_id"]
+                .as_str()
+                .ok_or_else(|| invalid("invalid trigger receipt"))?;
+            let run = self
+                .inspect(|s| s.runs.get(run_id).cloned())
+                .await
+                .ok_or_else(|| invalid("missing committed trigger run"))?;
+            let input = if source == "schedule" {
+                flow_journal::value::materialize(
+                    self.journal.root(),
+                    self.journal.durable_lsn(),
+                    &run.input,
+                    8 * 1024 * 1024,
+                )?
+            } else {
+                input
+            };
+            return self
+                .run_start(
+                    &run.workflow_id,
+                    None,
+                    input,
+                    source,
+                    Some(key),
+                    Some(request_id),
+                )
+                .await;
+        }
+        let config = self
+            .inspect(|s| {
+                if source == "schedule" {
+                    s.schedules.get(key).cloned()
+                } else {
+                    s.webhooks.get(key).cloned()
+                }
+            })
+            .await
+            .ok_or_else(|| invalid("trigger not found"))?;
+        let workflow = config["workflow_id"]
+            .as_str()
+            .ok_or_else(|| invalid("trigger workflow missing"))?;
+        let input = if source == "schedule" {
+            config["input"].clone()
+        } else {
+            input
+        };
+        self.run_start(workflow, None, input, source, Some(key), Some(request_id))
+            .await
+    }
     /// Explicit operator resolution. This records a manual decision, never fabricates an
     /// external OperationOutcome or grants permission to resend the uncertain request.
     pub async fn run_adjudicate(
@@ -202,6 +277,21 @@ impl JournalBackend {
         let stored = flow_journal::value::store_json(&self.journal, input, 8 * 1024 * 1024).await?;
         let scope = format!("run.start:{source}:{}", source_detail.unwrap_or(""));
         self.command(&scope, request_id, &request, |state| {
+            if matches!(source, "schedule" | "webhook") {
+                let key = source_detail.ok_or_else(|| invalid("trigger identity required"))?;
+                let config = if source == "schedule" {
+                    state.schedules.get(key)
+                } else {
+                    state.webhooks.get(key)
+                }
+                .ok_or_else(|| invalid("trigger not found"))?;
+                if config["enabled"] != true
+                    || config["workflow_id"] != workflow_id
+                    || (source == "schedule" && config["input"] != request["input"])
+                {
+                    return Err(invalid("trigger disabled or changed before commit"));
+                }
+            }
             if state.runs.values().filter(|r| !r.terminal()).count() >= 1000 {
                 return Err(flow_journal::Error::Limit("R_max=1000".into()));
             }
@@ -343,6 +433,9 @@ impl JournalBackend {
         if !matches!(kind, EventKind::ScheduleChanged | EventKind::WebhookChanged) {
             return Err(invalid("invalid config kind").into());
         }
+        if key.is_empty() || key.len() > 128 {
+            return Err(invalid("invalid config key").into());
+        }
         self.command(
             scope,
             request_id,
@@ -357,6 +450,11 @@ impl JournalBackend {
                     .get(key)
                     .cloned()
                     .unwrap_or_else(|| json!({"created_at":now()}));
+                if !map.contains_key(key) && map.len() >= 1000 {
+                    return Err(flow_journal::Error::Limit(
+                        "maximum 1000 trigger configurations".into(),
+                    ));
+                }
                 let object = patch
                     .as_object()
                     .ok_or_else(|| invalid("config must be object"))?;
@@ -377,6 +475,13 @@ impl JournalBackend {
                     }
                     if !value["enabled"].is_boolean() {
                         return Err(invalid("enabled flag required"));
+                    }
+                    if kind == EventKind::ScheduleChanged {
+                        let expr = value["cron_expr"]
+                            .as_str()
+                            .ok_or_else(|| invalid("cron_expr required"))?;
+                        expr.parse::<cron_parser::Schedule>()
+                            .map_err(|e| invalid(e.to_string()))?;
                     }
                 }
                 Ok((vec![Event::new(kind, value.clone())], value))

@@ -56,8 +56,9 @@ pub use flow_engine::{
 mod child;
 pub mod journal;
 mod journal_commands;
-mod journal_execution;
 mod journal_driver;
+mod journal_execution;
+pub mod journal_import;
 mod pg;
 mod run_tail;
 mod sqlite;
