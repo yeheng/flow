@@ -419,3 +419,148 @@ async fn slow_disk_and_full_queues_keep_both_classes_progressing() {
     journal.close().await.unwrap();
     assert!(scan(dir.path(), |_, _| Ok(())).unwrap().fault.is_none());
 }
+
+#[tokio::test]
+async fn sync_failure_matrix_never_loses_acknowledged_prefix() {
+    for (data, dir) in (1..=10)
+        .map(|n| (Some(n), None))
+        .chain((1..=4).map(|n| (None, Some(n))))
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let opened = Journal::open(
+            temp.path(),
+            JournalOptions {
+                segment_bytes: 4096,
+                faults: FaultInjection {
+                    fail_data_sync: data,
+                    fail_dir_sync: dir,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await;
+        let Ok(j) = opened else { continue };
+        let mut acknowledged = Vec::new();
+        let mut failed = false;
+        for i in 0..12 {
+            match j
+                .submit(
+                    format!("matrix-{i}"),
+                    vec![Event::new(
+                        EventKind::Command,
+                        json!({"n":i,"pad":"x".repeat(2500)}),
+                    )],
+                    QueueClass::Control,
+                )
+                .await
+            {
+                Ok(receipt) => acknowledged.push(receipt.transaction.tx_id.clone()),
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if failed {
+            let before = j.durable_lsn();
+            assert!(j
+                .submit("after-failure".into(), vec![event()], QueueClass::Control)
+                .await
+                .is_err());
+            assert_eq!(j.durable_lsn(), before);
+        }
+        let _ = j.close().await;
+        drop(j);
+        let mut recovered = Vec::new();
+        flow_journal::scan(temp.path(), |tx, _| {
+            recovered.push(tx.tx_id.clone());
+            Ok(())
+        })
+        .unwrap();
+        for id in acknowledged {
+            assert!(
+                recovered.contains(&id),
+                "lost ack data={data:?} dir={dir:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated 32 MiB FLOW_ENOSPC_VOLUME disk image"]
+async fn real_enospc_freezes_writer_and_preserves_acknowledged_prefix() {
+    use std::io::Write;
+    let volume = std::path::PathBuf::from(
+        std::env::var("FLOW_ENOSPC_VOLUME").expect("isolated volume required"),
+    );
+    assert_eq!(volume, std::path::Path::new("/tmp/flow-acceptance-volume"));
+    let root = volume.join(format!("journal-{}", uuid::Uuid::now_v7()));
+    let j = Journal::open(&root, Default::default()).await.unwrap();
+    let ack = j
+        .submit("before-full".into(), vec![event()], QueueClass::Control)
+        .await
+        .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_ne!(
+            std::fs::metadata(&volume).unwrap().dev(),
+            std::fs::metadata(volume.parent().unwrap()).unwrap().dev(),
+            "requires an isolated mounted filesystem"
+        );
+    }
+    let fill = volume.join("fill.bin");
+    let mut file = std::fs::File::create(&fill).unwrap();
+    let block = vec![0xab; 1024 * 1024];
+    let mut filled = 0;
+    loop {
+        assert!(
+            filled < 40 * 1024 * 1024,
+            "refuse to fill an oversized filesystem"
+        );
+        match file.write_all(&block) {
+            Ok(()) => filled += block.len(),
+            Err(e) => {
+                assert_eq!(e.raw_os_error(), Some(28));
+                break;
+            }
+        }
+    }
+    assert!(filled < 40 * 1024 * 1024, "unexpected backing filesystem");
+    let result = j
+        .submit(
+            "disk-full".into(),
+            vec![Event::new(
+                EventKind::Command,
+                json!({"data":"x".repeat(700_000)}),
+            )],
+            QueueClass::Control,
+        )
+        .await;
+    assert!(result.is_err());
+    assert_eq!(j.durable_lsn(), ack.transaction.lsn);
+    assert!(j
+        .submit("after-full".into(), vec![event()], QueueClass::Control)
+        .await
+        .is_err());
+    let _ = j.close().await;
+    drop(j);
+    drop(file);
+    std::fs::remove_file(fill).unwrap();
+    let mut ids = Vec::new();
+    let report = flow_journal::scan(&root, |tx, _| {
+        ids.push(tx.tx_id.clone());
+        Ok(())
+    })
+    .unwrap();
+    assert!(ids.contains(&"before-full".to_string()));
+    let destination = volume.join("repaired");
+    if report.fault.is_some() {
+        flow_journal::maintenance::repair(&root, &destination, true).unwrap();
+    }
+    println!(
+        "real ENOSPC after {filled} bytes; acknowledged prefix retained; ambiguous_tail={}",
+        report.fault.is_some()
+    );
+}

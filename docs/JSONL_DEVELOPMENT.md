@@ -1,6 +1,6 @@
 # JSONL 一期开发入口
 
-此路径用于开发验证；一期任务尚未全部验收。不要将旧 SQLite 数据目录直接交给新入口。现有 `flow-server` 的 SQLite/PG 默认行为保持独立，生产未切换。
+此路径用于开发与独立部署验证；一期非断电验收已通过，真实断电按用户要求排除。不要将旧 SQLite 数据目录直接交给新入口。现有 `flow-server` 的 SQLite/PG 默认行为保持独立，生产未切换。
 
 本地运行一个定义：
 
@@ -35,7 +35,7 @@ repair 默认仅报告候选前缀并以非零退出码结束；只有显式 `--
 
 流式下载默认监听 `127.0.0.1:9803`（`FLOW_JOURNAL_HTTP_ADDR`），路径为 `/runs/<run_id>/values/<output_id>`，使用 `Authorization: Bearer <FLOW_JOURNAL_TOKEN>`。引用必须出现在指定 run 的当前投影中；采用该投影的 LSN 作为读取上界。最多 8 个下载，每个 4 块有界队列，断连释放读取任务，读取损坏以流错误终止，响应不缓存。历史引用在固定投影上界内流式扫描日志定位；不支持 Range 断点续传。
 
-限制与剩余验收见 [F17](refactor-evidence/F17.md)。本轮已接入 LLM/email、迟到审计、订阅/客户端与 LegacyImport，1000 在飞等待容量已测。1 GiB 大值历史恢复已测；完整混合业务负载与系统级故障矩阵尚未全部验收。
+最新负载、故障矩阵与限制见 [非断电验收报告](JSONL_PHASE1_ACCEPTANCE.md) 和 [F17](refactor-evidence/F17.md)。本轮已接入 LLM/email、迟到审计、订阅/客户端与 LegacyImport，1000 在飞等待容量已测。1 GiB 大值历史恢复已测；指定混合业务负载与非断电故障矩阵已补测通过。
 
 
 浏览器打开 /journal，显式输入 RPC/HTTP 地址与令牌。LLM/email 的 api_key 配置保存凭证名称，对应服务进程的 FLOW_SECRET_<名称>；解析后的 Bearer 值不进入授权事实。webhook 调用 POST /hooks/<key>，携带同一 Bearer 令牌及稳定 Idempotency-Key；body 为 JSON 输入。配置源可通过 schedule.change/webhook.change 写入，cron 使用 cron_expr。

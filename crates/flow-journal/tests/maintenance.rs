@@ -132,3 +132,72 @@ async fn fast_inventory_uses_checkpoint_but_missing_sealed_segments_still_fail()
         .await
         .is_err());
 }
+
+#[tokio::test]
+async fn live_rotation_backup_is_a_fixed_prefix_and_restore_is_writable() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("source");
+    let journal = Journal::open(
+        &root,
+        JournalOptions {
+            segment_bytes: 4096,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    for i in 0..12 {
+        journal
+            .submit(
+                i.to_string(),
+                vec![Event::new(
+                    EventKind::Command,
+                    json!({"n":i,"pad":"x".repeat(2000)}),
+                )],
+                QueueClass::Control,
+            )
+            .await
+            .unwrap();
+    }
+    let upper = journal.durable_lsn();
+    let j = journal.clone();
+    let writes = tokio::spawn(async move {
+        for i in 12..36 {
+            j.submit(
+                i.to_string(),
+                vec![Event::new(
+                    EventKind::Command,
+                    json!({"n":i,"pad":"x".repeat(2000)}),
+                )],
+                QueueClass::Control,
+            )
+            .await
+            .unwrap();
+        }
+    });
+    let target = temp.path().join("backup");
+    let src = root.clone();
+    let dest = target.clone();
+    let copied = tokio::task::spawn_blocking(move || backup(&src, &dest, upper))
+        .await
+        .unwrap()
+        .unwrap();
+    writes.await.unwrap();
+    assert_eq!(copied.last_lsn, upper);
+    journal.close().await.unwrap();
+    drop(journal);
+    assert!(!target.join("projection.sqlite").exists());
+    let restored = Journal::open(&target, Default::default()).await.unwrap();
+    assert_eq!(restored.durable_lsn(), upper);
+    restored
+        .submit(
+            "after-restore".into(),
+            vec![Event::new(EventKind::Command, json!({"restored":true}))],
+            QueueClass::Control,
+        )
+        .await
+        .unwrap();
+    restored.close().await.unwrap();
+    assert!(verify(&target).unwrap().fault.is_none());
+    assert!(backup(&root, &target, upper).is_err()); // no overwrite of the restored dataset
+}

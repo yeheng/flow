@@ -62,6 +62,23 @@ async fn thousand_waiting_runs_release_slots_and_recover_bounded_dispatch() {
     let elapsed = start.elapsed();
     backend.close().await.unwrap();
     drop(backend);
+    let ready = temp.path().join("crash-ready");
+    let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "capacity_crash_child"])
+        .env("FLOW_CAPACITY_CRASH_ROOT", &root)
+        .env("FLOW_CAPACITY_READY", &ready)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !ready.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    child.kill().await.unwrap();
+    assert!(!child.wait().await.unwrap().success());
     let restart = Instant::now();
     let backend = JournalBackend::open(&root, Default::default())
         .await
@@ -160,4 +177,16 @@ async fn gib_history_checkpoint_and_streamed_verify_remain_bounded() {
     assert_eq!(output.0, 128 * 1024 * 1024);
     println!("1 GiB original values; full recovery={full_elapsed:?}; checkpoint recovery={fast_elapsed:?}; streamed 128 MiB verified");
     backend.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "1000-run subprocess crash fixture"]
+async fn capacity_crash_child() {
+    let root = std::path::PathBuf::from(std::env::var("FLOW_CAPACITY_CRASH_ROOT").unwrap());
+    let backend = JournalBackend::open(&root, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(backend.state().await.runs.len(), 1000);
+    std::fs::write(std::env::var("FLOW_CAPACITY_READY").unwrap(), b"loaded").unwrap();
+    std::future::pending::<()>().await;
 }

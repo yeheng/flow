@@ -72,8 +72,32 @@ async fn legacy_import_is_reentrant_preserves_raw_tail_and_reports_missing_input
         state.runs.is_empty(),
         "legacy importing must never schedule an old side effect"
     );
+    // A post-import write must also survive journal-only backup and binary restart.
+    backend
+        .workflow_create("post-import", Some("new-write"))
+        .await
+        .unwrap();
+    let expected = serde_json::to_value(backend.state().await).unwrap();
+    let upper = backend.journal.durable_lsn();
     backend.close().await.unwrap();
     drop(backend);
+    let restored = temp.path().join("journal-only-restore");
+    flow_journal::maintenance::backup(&destination, &restored, upper).unwrap();
+    assert!(!restored.join("projection.sqlite").exists());
+    assert!(!restored.join("legacy-source").exists());
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_flow-journal-dev"))
+        .arg("--data-dir")
+        .arg(&restored)
+        .arg("status")
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        actual, expected,
+        "packaged compatible binary must recover imports and newer writes from JSONL only"
+    );
     std::fs::write(dir.join("event.jsonl"), b"changed").unwrap();
     assert!(journal_import::import(&source, &db, &destination)
         .await

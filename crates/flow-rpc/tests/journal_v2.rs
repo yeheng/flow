@@ -224,3 +224,94 @@ async fn value_download_checks_token_and_run_binding_and_streams_original_bytes(
     drop(backend);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test]
+async fn slow_subscription_can_resume_by_pages_and_terminal_audit_stays_live() {
+    let root = std::env::temp_dir().join(format!("flow-slow-reader-{}", uuid::Uuid::now_v7()));
+    let b = JournalBackend::open(&root, Default::default())
+        .await
+        .unwrap();
+    let w = b.workflow_create("slow", None).await.unwrap();
+    let w = w.result["workflow_id"].as_str().unwrap();
+    b.workflow_update(w,json!({"nodes":[{"id":"s","type":"start"},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"e"}]}),None).await.unwrap();
+    b.workflow_publish(w, 1, None).await.unwrap();
+    let r = b
+        .run_start(w, None, json!({}), "manual", None, None)
+        .await
+        .unwrap();
+    let id = r.result["run_id"].as_str().unwrap();
+    let token = "q".repeat(32);
+    let module = flow_rpc::journal_v2::module(b.clone(), token.clone()).unwrap();
+    let request=json!({"jsonrpc":"2.0","id":1,"method":"run.subscribe","params":{"_token":token,"run_id":id,"event_format":"v2","from_seq":"0"}}).to_string();
+    let (_, mut stream) = module.raw_json_request(&request, 1).await.unwrap();
+    b.start_execution().await.unwrap();
+    // Leave the one-message subscription buffer unread beyond the 2s send deadline.
+    tokio::time::sleep(std::time::Duration::from_millis(2300)).await;
+    let receipt = b.workflow_create("not blocked", None).await.unwrap();
+    assert!(receipt.visible);
+    let mut positions = std::collections::BTreeSet::new();
+    while let Ok(Some(message)) =
+        tokio::time::timeout(std::time::Duration::from_millis(100), stream.recv()).await
+    {
+        let v: Value = serde_json::from_str(message.get()).unwrap();
+        let e = &v["params"]["result"];
+        if let Some(seq) = e["event"]["run_seq"].as_str() {
+            positions.insert(seq.parse::<u64>().unwrap());
+        }
+    }
+    let mut cursor = Value::Null;
+    loop {
+        let v = call(
+            &module,
+            "run.events.page",
+            json!({"_token":token,"run_id":id,"cursor":cursor,"limit":2}),
+        )
+        .await;
+        for e in v["result"]["events"].as_array().unwrap() {
+            positions.insert(
+                e["event"]["run_seq"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap(),
+            );
+        }
+        cursor = v["result"]["next_cursor"].clone();
+        if cursor.is_null() {
+            break;
+        }
+    }
+    let state = b.state().await;
+    let run = &state.runs[id];
+    assert!(run.terminal());
+    assert_eq!(
+        positions.into_iter().collect::<Vec<_>>(),
+        (1..=run.last_run_seq).collect::<Vec<_>>()
+    );
+    let node = &run.nodes["e"];
+    let before = run.last_run_seq;
+    let from = b.journal.durable_lsn();
+    let request=json!({"jsonrpc":"2.0","id":2,"method":"run.subscribe","params":{"_token":token,"run_id":id,"event_format":"v2","mode":"audit","from_lsn":from.to_string()}}).to_string();
+    let (_, mut audit) = module.raw_json_request(&request, 4).await.unwrap();
+    let mut late = flow_journal::Event::new(
+        flow_journal::EventKind::LateAudit,
+        json!({"node_id":"e","evidence":"late"}),
+    );
+    late.run_id = Some(id.into());
+    late.dispatch_id = Some(node.dispatch_id.clone());
+    late.audit_seq = node.attempts[&node.dispatch_id].audit_seq + 1;
+    b.append(vec![late]).await.unwrap();
+    let message = tokio::time::timeout(std::time::Duration::from_secs(5), audit.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let v: Value = serde_json::from_str(message.get()).unwrap();
+    assert_eq!(v["params"]["result"]["event"]["kind"], "late_audit");
+    assert_eq!(b.state().await.runs[id].last_run_seq, before);
+    drop(audit);
+    drop(stream);
+    drop(module);
+    b.close().await.unwrap();
+    drop(b);
+    std::fs::remove_dir_all(root).unwrap();
+}

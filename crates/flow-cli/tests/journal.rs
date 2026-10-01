@@ -94,3 +94,52 @@ async fn v2_binary_calls_pages_and_downloads_without_overwriting() {
     drop(backend);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn long_paginated_history_streams_to_stdout_with_bounded_rss() {
+    use std::process::Stdio;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let count = Arc::new(AtomicUsize::new(0));
+    let mut module = jsonrpsee::RpcModule::new(count.clone());
+    module.register_method("run.events.page",|params,ctx,_|{
+        let p:Value=params.parse().unwrap();assert_eq!(p["_token"],"long-history-token");
+        let page=p["cursor"]["page"].as_u64().unwrap_or(0);
+        let events:Vec<Value>=(0..100).map(|i|json!({"lsn":(page*100+i+1).to_string(),"event_index":0,"event":{"run_seq":(page*100+i+1).to_string(),"kind":"input_prepared","payload":"x".repeat(1024)}})).collect();
+        ctx.fetch_add(1,Ordering::Relaxed);
+        json!({"events":events,"next_cursor":if page<999{json!({"page":page+1})}else{Value::Null},"snapshot_cursor":{"journal_id":"fixed","lsn":"100000"}})
+    }).unwrap();
+    let server = jsonrpsee::server::Server::builder()
+        .build("127.0.0.1:0")
+        .await
+        .unwrap();
+    let url = format!("ws://{}", server.local_addr().unwrap());
+    let handle = server.start(module);
+    let output = Command::new("/usr/bin/time")
+        .args(["-l", env!("CARGO_BIN_EXE_flow-cli")])
+        .args(["--url", &url, "journal", "events", "run"])
+        .env("FLOW_JOURNAL_TOKEN", "long-history-token")
+        .stdout(Stdio::null())
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    assert_eq!(count.load(Ordering::Relaxed), 1000);
+    let stats = String::from_utf8(output.stderr).unwrap();
+    let rss = stats
+        .lines()
+        .find(|line| line.contains("maximum resident set size"))
+        .expect("RSS measurement requires unsandboxed test")
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    println!("CLI 100000 records, 1000 pages, >100 MiB payload; peak_rss={rss} bytes");
+    assert!(rss < 128 * 1024 * 1024, "{stats}");
+    handle.stop().unwrap();
+    handle.stopped().await;
+}

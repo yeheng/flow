@@ -1,8 +1,8 @@
 # JSONL 重构一期任务清单：基础存储与进程内执行
 
-日期：2026-10-01。状态：**用户已授权一期实现；开发路径已落地，整体验收尚未完成**。设计依据：[本期方案](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md)。未进行生产切换。逐项未覆盖工作见 `docs/refactor-evidence/Fxx.md`，不能把开发入口或单项测试通过当作一期完成。
+日期：2026-10-01。状态：**一期非断电验收通过；真实断电按用户要求排除；生产未切换**。设计依据：[本期方案](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md)。逐行矩阵、命令、实测与范围见 [非断电验收报告](JSONL_PHASE1_ACCEPTANCE.md)。
 
-本轮复核、补齐实现与实测见 [复核报告](JSONL_PHASE1_REVIEW.md)。in_progress 区分已实现与尚未满足的验收出口；未测项不勾选。
+历史复核见 [复核报告](JSONL_PHASE1_REVIEW.md)，最新验收以 [非断电验收报告](JSONL_PHASE1_ACCEPTANCE.md) 为准。done 指指定环境、负载与故障夹具的非断电验收，不表示生产已切换或真实断电已测。
 
 <a id="agent-entry"></a>
 ## 执行入口与完成定义
@@ -62,7 +62,7 @@
 <a id="task-f02"></a>
 ### F02 冻结基础数据契约与一期负载
 
-- **状态**：in_progress；证据：`docs/refactor-evidence/F02.md`。
+- **状态**：done（非断电验收）；证据：`docs/refactor-evidence/F02.md`。
 - **前置输入**：[F01](#task-f01)。
 - **设计引用**：[一期 §5](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s5)、[一期 §6](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s6)、[一期 §7](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s7)、[一期 §8](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s8)、[一期 §10](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s10)、[一期 §15](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s15)。
 - **改动范围**：journal/StoredValue/内部提交接口与验收 fixtures；不包含 IPC DTO。
@@ -85,7 +85,7 @@
 <a id="task-f03"></a>
 ### F03 实现单行有界事务格式
 
-- **状态**：in_progress；证据：`docs/refactor-evidence/F03.md`。
+- **状态**：done（非断电验收）；证据：`docs/refactor-evidence/F03.md`。
 - **前置输入**：[F02](#task-f02)。
 - **设计引用**：[一期 §6.2](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s6-2)、[一期 §6.4](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s6-4)。
 - **改动范围**：新增 flow-journal codec/流式读取。
@@ -105,7 +105,7 @@
 <a id="task-f04"></a>
 ### F04 实现唯一 writer 与批量持久提交
 
-- **状态**：in_progress；证据：`docs/refactor-evidence/F04.md`。
+- **状态**：done（非断电验收）；证据：`docs/refactor-evidence/F04.md`。
 - **前置输入**：[F03](#task-f03)。
 - **设计引用**：[一期 §6.2](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s6-2)、[一期 §6.3](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s6-3)、[一期 §8](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s8)。
 - **改动范围**：JournalWriter、有界命令/审计队列、内部持久回执。
@@ -118,15 +118,15 @@
 
 **验收出口**：
 
-- [ ] 任意写入/fsync 故障均不提前成功，回执丢失可恢复原提交。
-- [ ] 满队列和洪泛有界且控制/其他任务不饥饿，低负载及时提交。
+- [x] 任意写入/fsync 故障均不提前成功，回执丢失可恢复原提交。
+- [x] 满队列和洪泛有界且控制/其他任务不饥饿，低负载及时提交。
 
 <!-- END F04 -->
 
 <a id="task-f05"></a>
 ### F05 实现锁、分段与保守恢复
 
-- **状态**：in_progress；证据：`docs/refactor-evidence/F05.md`。
+- **状态**：done（非断电验收）；证据：`docs/refactor-evidence/F05.md`。
 - **前置输入**：[F04](#task-f04)。
 - **设计引用**：[一期 §6.4](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s6-4)、[一期 §11](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s11)。
 - **改动范围**：排他锁、journal_id、段链、轮转与尾部恢复。
@@ -138,15 +138,15 @@
 
 **验收出口**：
 
-- [ ] 双写者争锁、轮转各故障窗口、尾部半行/损坏均有确定结果。
-- [ ] 不自动删歧义尾部，不声称单副本可检测全部历史回退。
+- [x] 双写者争锁、轮转各故障窗口、尾部半行/损坏均有确定结果。
+- [x] 不自动删歧义尾部，不声称单副本可检测全部历史回退。
 
 <!-- END F05 -->
 
 <a id="task-f06"></a>
 ### F06 实现派生索引、检查点与流式值读取
 
-- **状态**：in_progress；证据：`docs/refactor-evidence/F06.md`。
+- **状态**：done（非断电验收）；证据：`docs/refactor-evidence/F06.md`。
 - **前置输入**：[F05](#task-f05)。
 - **设计引用**：[一期 §6.1](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s6-1)、[一期 §11](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s11)。
 - **改动范围**：journal 索引/检查点、verify 核心、按值/提交边界读取。
@@ -166,7 +166,7 @@
 <a id="task-f07"></a>
 ### F07 验收基础提交器容量
 
-- **状态**：in_progress；证据：`docs/refactor-evidence/F07.md`。
+- **状态**：done（非断电验收）；证据：`docs/refactor-evidence/F07.md`。
 - **前置输入**：[F06](#task-f06)。
 - **设计引用**：[一期 §15](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s15)。
 - **改动范围**：真实 journal benchmark 与一期容量证据。
@@ -179,15 +179,15 @@
 
 **验收出口**：
 
-- [ ] 吞吐/p99/内存共同达标；高提交率摊销回归和低负载及时提交分别通过。
-- [ ] 慢盘/满盘不无界积压；微基准不能独立决定通过，未声称已验收业务或 IPC。
+- [x] 吞吐/p99/内存共同达标；高提交率摊销回归和低负载及时提交分别通过。
+- [x] 慢盘/满盘不无界积压；微基准不能独立决定通过，未声称已验收业务或 IPC。
 
 <!-- END F07 -->
 
 <a id="task-f08"></a>
 ### F08 实现 reducer、命令裁决与基础开发入口
 
-- **状态**：in_progress；证据：`docs/refactor-evidence/F08.md`。
+- **状态**：done（非断电验收）；证据：`docs/refactor-evidence/F08.md`。
 - **前置输入**：[F07](#task-f07)。
 - **设计引用**：[一期 §4](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s4)、[一期 §5](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s5)、[一期 §6.3](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s6-3)、[一期 §7](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s7)。
 - **改动范围**：engine/backend 的事实状态与内部命令门面。
@@ -208,7 +208,7 @@
 <a id="task-f09"></a>
 ### F09 实现完整投影与统一公开命令入口
 
-- **状态**：in_progress；证据：`docs/refactor-evidence/F09.md`。
+- **状态**：done（非断电验收）；证据：`docs/refactor-evidence/F09.md`。
 - **前置输入**：[F08](#task-f08)。
 - **设计引用**：[一期 §10](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s10)。
 - **改动范围**：store/backend/RPC 的 Projector、写入口与查询边界。
@@ -221,7 +221,7 @@
 
 **验收出口**：
 
-- [ ] 逐记录退出、批次限制、删除投影与并发查询不产生半笔状态。
+- [x] 逐记录退出、批次限制、删除投影与并发查询不产生半笔状态。
 - [x] 暂停投影不提前成功或假 404，重试不重复写入；没有公开 durable 模式。
 
 <!-- END F09 -->
@@ -229,7 +229,7 @@
 <a id="task-f10"></a>
 ### F10 接通完整值生产、状态与受限消费
 
-- **状态**：in_progress；证据：`docs/refactor-evidence/F10.md`。
+- **状态**：done（非断电验收）；证据：`docs/refactor-evidence/F10.md`。
 - **前置输入**：[F06](#task-f06)、[F08](#task-f08)。
 - **设计引用**：[一期 §6.1](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s6-1)、[一期 §8](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s8)。
 - **改动范围**：exec/expr 与 StoredValue 流接口；先用受控响应流验证。
@@ -243,14 +243,14 @@
 **验收出口**：
 
 - [x] 缺块、异内容重复、长度/摘要/超限不得发布可用结果；没有清单树。
-- [ ] 多前驱合计超限在运行代码前拒绝；流式路径内存不随对象总量增长。
+- [x] 多前驱合计超限在运行代码前拒绝；流式路径内存不随对象总量增长。
 
 <!-- END F10 -->
 
 <a id="task-f11"></a>
 ### F11 实现进程内输入、授权与结果提交
 
-- **状态**：in_progress；证据：`docs/refactor-evidence/F11.md`。
+- **状态**：done（非断电验收）；证据：`docs/refactor-evidence/F11.md`。
 - **前置输入**：[F09](#task-f09)、[F10](#task-f10)。
 - **设计引用**：[一期 §7](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s7)。
 - **改动范围**：内部事实/授权/结果门面与现有节点适配器。
@@ -263,15 +263,15 @@
 
 **验收出口**：
 
-- [ ] 输入提交前后崩溃、同操作异参、授权半写/回执丢失及取消竞争正确处理。
-- [ ] 外部成功无 Outcome 不盲重发，结果缺审计/块不能完成；不实现 IPC 发送窗口。
+- [x] 输入提交前后崩溃、同操作异参、授权半写/回执丢失及取消竞争正确处理。
+- [x] 外部成功无 Outcome 不盲重发，结果缺审计/块不能完成；不实现 IPC 发送窗口。
 
 <!-- END F11 -->
 
 <a id="task-f12"></a>
 ### F12 接通进程内 Driver、持久等待和恢复
 
-- **状态**：in_progress；证据：`docs/refactor-evidence/F12.md`。
+- **状态**：done（非断电验收）；证据：`docs/refactor-evidence/F12.md`。
 - **前置输入**：[F11](#task-f11)。
 - **设计引用**：[一期 §9](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s9)。
 - **改动范围**：driver/engine/child、等待索引、取消树。
@@ -285,14 +285,14 @@
 **验收出口**：
 
 - [x] 父→子→孙在小活跃额度下可完成，不丢唤醒或重启延长 delay。
-- [ ] 已完成 HTTP 不重发，大取消树/1000 在飞可有界恢复；不假设可强杀单个进程内任务。
+- [x] 已完成 HTTP 不重发，大取消树/1000 在飞可有界恢复；不假设可强杀单个进程内任务。
 
 <!-- END F12 -->
 
 <a id="task-f13"></a>
 ### F13 交付独立有界观测存储
 
-- **状态**：in_progress；证据：`docs/refactor-evidence/F13.md`。
+- **状态**：done（非断电验收）；证据：`docs/refactor-evidence/F13.md`。
 - **前置输入**：[F02](#task-f02)。
 - **设计引用**：[一期 §5.0](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s5-0)、[一期 §8](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s8)。
 - **改动范围**：nodelog、独立观测段与有界读取。
@@ -304,15 +304,15 @@
 
 **验收出口**：
 
-- [ ] 损坏/删除/写满观测存储不改变 journal、audit_seq、业务输出或完整性。
-- [ ] 观测洪泛不阻塞 JS/权威提交，展示可识别观测丢弃。
+- [x] 损坏/删除/写满观测存储不改变 journal、audit_seq、业务输出或完整性。
+- [x] 观测洪泛不阻塞 JS/权威提交，展示可识别观测丢弃。
 
 <!-- END F13 -->
 
 <a id="task-f14"></a>
 ### F14 迁移分页、引用与客户端读取
 
-- **状态**：in_progress；证据：`docs/refactor-evidence/F14.md`。
+- **状态**：done（非断电验收）；证据：`docs/refactor-evidence/F14.md`。
 - **前置输入**：[F09](#task-f09)、[F12](#task-f12)、[F13](#task-f13)。
 - **设计引用**：[一期 §10.2](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s10-2)、[一期 §10.3](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s10-3)。
 - **改动范围**：RPC/run_tail、web API/monitor、CLI。
@@ -325,15 +325,15 @@
 
 **验收出口**：
 
-- [ ] 并发写、多页/空页/断点、错游标、慢消费、大值与终态后迟到证据无重复漏项。
-- [ ] 已提交超时不重复写，越权拒绝；服务端、浏览器与 CLI 内存均有界。
+- [x] 并发写、多页/空页/断点、错游标、慢消费、大值与终态后迟到证据无重复漏项。
+- [x] 已提交超时不重复写，越权拒绝；服务端、浏览器与 CLI 内存均有界。
 
 <!-- END F14 -->
 
 <a id="task-f15"></a>
 ### F15 交付 verify、backup、repair 与 rebuild 工具
 
-- **状态**：in_progress；证据：`docs/refactor-evidence/F15.md`。
+- **状态**：done（非断电验收）；证据：`docs/refactor-evidence/F15.md`。
 - **前置输入**：[F06](#task-f06)、[F09](#task-f09)。
 - **设计引用**：[一期 §11](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s11)、[一期 §6.4](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s6-4)。
 - **改动范围**：CLI 与恢复/备份工具。
@@ -346,15 +346,15 @@
 
 **验收出口**：
 
-- [ ] 复制中轮转、缺段/失败、仅 JSONL 备份恢复均可复现。
-- [ ] repair 未确认不写、确认后原证据不变；快恢复与完整 verify 范围分开。
+- [x] 复制中轮转、缺段/失败、仅 JSONL 备份恢复均可复现。
+- [x] repair 未确认不写、确认后原证据不变；快恢复与完整 verify 范围分开。
 
 <!-- END F15 -->
 
 <a id="task-f16"></a>
 ### F16 实现历史迁移与回退规则
 
-- **状态**：in_progress；证据：`docs/refactor-evidence/F16.md`。
+- **状态**：done（非断电验收）；证据：`docs/refactor-evidence/F16.md`。
 - **前置输入**：[F14](#task-f14)、[F15](#task-f15)。
 - **设计引用**：[一期 §12](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s12)。
 - **改动范围**：离线 LegacyImport、差异报告与切换流程。
@@ -375,7 +375,7 @@
 <a id="task-f17"></a>
 ### F17 验收一期基础并交接二期
 
-- **状态**：in_progress；证据：`docs/refactor-evidence/F17.md`。
+- **状态**：done（非断电验收）；证据：`docs/refactor-evidence/F17.md`。
 - **前置输入**：[F16](#task-f16)、[F07](#task-f07)。
 - **设计引用**：[一期 §13](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s13)、[一期 §14](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s14)、[一期 §15](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s15)、[一期 §17](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s17)。
 - **改动范围**：基础端到端/e2e/perf、打包、阶段验收报告。
@@ -388,7 +388,7 @@
 
 **验收出口**：
 
-- [ ] 全部一期任务与故障/容量门槛有证据，不依赖 I/R 任务或 executor 二进制。
+- [x] 全部一期任务与故障/容量门槛有证据，不依赖 I/R 任务或 executor 二进制。
 - [x] 实现、验收、生产切换状态分别记录，未授权切换不执行。
 
 <!-- END F17 -->
