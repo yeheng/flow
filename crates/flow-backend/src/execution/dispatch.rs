@@ -16,9 +16,7 @@ use sha2::Digest as _;
 
 use crate::journal::JournalBackend;
 use crate::journal_execution::Attempt;
-use flow_engine::execution_protocol::contract::{
-    DURABLE_WAIT_TIMEOUT_MS, TRANSFER_CHUNK_BYTES,
-};
+use flow_engine::execution_protocol::contract::{DURABLE_WAIT_TIMEOUT_MS, TRANSFER_CHUNK_BYTES};
 use flow_engine::execution_protocol::message::{Message, ResultOutcome};
 use flow_engine::execution_protocol::record_bytes;
 use flow_engine::journal_state::{Prepared, Run, Wait};
@@ -112,20 +110,14 @@ struct DispatchRunner {
 }
 
 impl DispatchRunner {
-    async fn run(
-        mut self,
-        mut lease: super::pool::SessionLease,
-    ) -> Result<()> {
+    async fn run(mut self, mut lease: super::pool::SessionLease) -> Result<()> {
         let outcome = self.drive(&mut lease).await;
         let healthy = self.session_healthy && outcome.is_ok();
         self.pool.release(lease, healthy).await;
         outcome
     }
 
-    async fn drive(
-        &mut self,
-        lease: &mut super::pool::SessionLease,
-    ) -> Result<()> {
+    async fn drive(&mut self, lease: &mut super::pool::SessionLease) -> Result<()> {
         // 读取当前 run 快照，构造 Execute 任务面。
         let run = self.snapshot().await?;
         let record = run
@@ -136,7 +128,11 @@ impl DispatchRunner {
         if record.dispatch_id != self.attempt.dispatch_id {
             return Err(invalid("stale dispatch"));
         }
-        let prepared = record.prepared.as_ref().map(|p| serde_json::to_value(p)).transpose()?;
+        let prepared = record
+            .prepared
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?;
         let previous_outcome = record
             .operation
             .as_ref()
@@ -255,7 +251,7 @@ impl DispatchRunner {
             .backend
             .inspect(|s| s.runs.get(&self.attempt.run_id).cloned())
             .await
-            .ok_or_else(|| invalid("run missing").into())
+            .ok_or_else(|| invalid("run missing"))
     }
 
     /// 处理一条来自执行器的消息。Ok(Some(())) = 派发完成。
@@ -322,7 +318,11 @@ impl DispatchRunner {
             Message::RequestOperation { .. } => {
                 // 大请求的 data 块可能未齐：未齐时挂起，块到齐后重试。
                 let transfer_id = match &message {
-                    Message::RequestOperation { transfer_id: Some(id), request: None, .. } => id.clone(),
+                    Message::RequestOperation {
+                        transfer_id: Some(id),
+                        request: None,
+                        ..
+                    } => id.clone(),
                     _ => String::new(),
                 };
                 if !transfer_id.is_empty() && !self.op_transfer_complete(&transfer_id) {
@@ -433,10 +433,7 @@ impl DispatchRunner {
     }
 
     /// 挂起的 RequestOperation 在块齐后重试。
-    async fn try_pending_operation(
-        &mut self,
-        lease: &mut super::pool::SessionLease,
-    ) -> Result<()> {
+    async fn try_pending_operation(&mut self, lease: &mut super::pool::SessionLease) -> Result<()> {
         let ready = match &self.pending_operation_request {
             Some(Message::RequestOperation { transfer_id, .. }) => transfer_id
                 .as_ref()
@@ -458,15 +455,21 @@ impl DispatchRunner {
         records: Vec<flow_engine::execution_protocol::AuditRecord>,
         lease: &mut super::pool::SessionLease,
     ) -> Result<()> {
-        tracing::info!(count = records.len(), first = records.first().map(|r| r.audit_seq), "ipc: AuditBatch");
+        tracing::info!(
+            count = records.len(),
+            first = records.first().map(|r| r.audit_seq),
+            "ipc: AuditBatch"
+        );
         let mut new_records = Vec::new();
         for record in records {
-            let digest = hex_sha(&serde_json::to_vec(&wire_record(
-                record.audit_seq,
-                &record.kind,
-                &record.payload,
-            ))
-            .map_err(|e| invalid(e.to_string()))?);
+            let digest = hex_sha(
+                &serde_json::to_vec(&wire_record(
+                    record.audit_seq,
+                    &record.kind,
+                    &record.payload,
+                ))
+                .map_err(|e| invalid(e.to_string()))?,
+            );
             if record.audit_seq <= self.durable_seq {
                 // 幂等重传：同序号同原始内容放行，异内容协议错误。
                 match self.committed.get(&record.audit_seq) {
@@ -490,10 +493,7 @@ impl DispatchRunner {
             self.attempt
                 .backend
                 .internal(move |state| {
-                    let run = state
-                        .runs
-                        .get(&run_id)
-                        .ok_or_else(|| fj("run missing"))?;
+                    let run = state.runs.get(&run_id).ok_or_else(|| fj("run missing"))?;
                     let node = run
                         .nodes
                         .get(&node_id)
@@ -505,8 +505,13 @@ impl DispatchRunner {
                     for (record, _) in &prepared {
                         let kind = event_kind(&record.kind)
                             .ok_or_else(|| fj(format!("unknown audit kind {}", record.kind)))?;
-                        let mut event =
-                            crate::journal_commands::node_event(run, &node_id, kind, record.payload.clone(), false);
+                        let mut event = crate::journal_commands::node_event(
+                            run,
+                            &node_id,
+                            kind,
+                            record.payload.clone(),
+                            false,
+                        );
                         event.dispatch_id = Some(dispatch_id.clone());
                         event.audit_seq = record.audit_seq;
                         events.push(event);
@@ -516,11 +521,7 @@ impl DispatchRunner {
                 .await?;
             for (record, digest) in new_records {
                 self.durable_seq = record.audit_seq;
-                self.durable_bytes += record_bytes(
-                    record.audit_seq,
-                    &record.kind,
-                    &record.payload,
-                );
+                self.durable_bytes += record_bytes(record.audit_seq, &record.kind, &record.payload);
                 self.committed.insert(record.audit_seq, digest);
             }
         }
@@ -589,16 +590,17 @@ impl DispatchRunner {
                     let policy = self.node.retry();
                     if record.prepared.is_some()
                         && record.operation.is_none()
-                        && matches!(self.node.kind(), Some(NodeType::Script | NodeType::Condition))
+                        && matches!(
+                            self.node.kind(),
+                            Some(NodeType::Script | NodeType::Condition)
+                        )
                         && record.attempt < policy.max_attempts.min(100)
                     {
                         let delay = policy.backoff_ms.min(i64::MAX as u64) as i64;
                         payload["retry_wake_at"] =
                             json!(chrono::Utc::now().timestamp_millis().saturating_add(delay));
                     }
-                    self.attempt
-                        .finish(EventKind::NodeFailed, payload)
-                        .await?;
+                    self.attempt.finish(EventKind::NodeFailed, payload).await?;
                 }
             }
             ResultOutcome::Wait { wait } => match wait.kind.as_str() {
@@ -746,7 +748,11 @@ impl DispatchRunner {
             .inspect(|s| {
                 s.runs
                     .values()
-                    .filter(|r| r.parent.as_ref().is_some_and(|p| p.run_id == run_id && p.node_id == node_id))
+                    .filter(|r| {
+                        r.parent
+                            .as_ref()
+                            .is_some_and(|p| p.run_id == run_id && p.node_id == node_id)
+                    })
                     .map(|r| r.run_id.clone())
                     .collect()
             })
@@ -815,8 +821,7 @@ impl DispatchRunner {
         // 请求入库（journal 级值，不占 audit_seq；与一期 store_json 同构）。
         let stored = if request_bytes.len() <= flow_journal::INLINE_BYTES {
             StoredValue::Inline(
-                serde_json::from_slice(&request_bytes)
-                    .map_err(|e| invalid(e.to_string()))?,
+                serde_json::from_slice(&request_bytes).map_err(|e| invalid(e.to_string()))?,
             )
         } else {
             let mut reader = request_bytes.as_slice();
@@ -846,10 +851,7 @@ impl DispatchRunner {
             .attempt
             .backend
             .internal(move |state| {
-                let run = state
-                    .runs
-                    .get(&run_id)
-                    .ok_or_else(|| fj("run missing"))?;
+                let run = state.runs.get(&run_id).ok_or_else(|| fj("run missing"))?;
                 let node = &run.nodes[&node_id];
                 if run.terminal() || node.dispatch_id != dispatch {
                     return Err(fj("operation cancelled/stale"));
@@ -889,7 +891,7 @@ impl DispatchRunner {
                     serde_json::from_slice(&request_bytes).unwrap_or(Value::Null);
                 let credential = request_value["credential"]["secret_ref"]
                     .as_str()
-                    .and_then(|name| flow_engine::secrets::get_secret(name))
+                    .and_then(flow_engine::secrets::get_secret)
                     .filter(|v| !v.is_empty());
                 let _ = lease
                     .to_session
@@ -948,10 +950,7 @@ async fn transfer_inputs(
             .get("body_raw")
             .and_then(|v| serde_json::from_value::<flow_journal::ValueRef>(v.clone()).ok())
         {
-            transfers.push((
-                format!("op-body:{}", raw.output_id),
-                StoredValue::Ref(raw),
-            ));
+            transfers.push((format!("op-body:{}", raw.output_id), StoredValue::Ref(raw)));
         }
     }
     for (transfer_id, value) in transfers {
@@ -964,7 +963,8 @@ async fn transfer_inputs(
         let produce = tokio::task::spawn_blocking(move || {
             use std::io::Write;
             let mut bridge = tokio_util::io::SyncIoBridge::new(writer);
-            let result = flow_journal::value::read_value(&root, upper, &reference, true, &mut bridge);
+            let result =
+                flow_journal::value::read_value(&root, upper, &reference, true, &mut bridge);
             let _ = bridge.flush();
             result
         });

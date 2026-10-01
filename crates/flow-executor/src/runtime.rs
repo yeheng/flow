@@ -57,23 +57,22 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
         }
     };
     let mut transport = FrameTransport::spawn(pair, config.queue_depth);
-    let (identity, limits) =
-        match tokio::time::timeout(
-            Duration::from_millis(STARTUP_TIMEOUT_MS * 2),
-            executor_handshake(&mut transport, EXECUTOR_BUILD, EXECUTOR_CAPABILITIES),
-        )
-        .await
-        {
-            Ok(Ok(ok)) => ok,
-            Ok(Err(error)) => {
-                eprintln!("flow-executor: handshake rejected: {error}");
-                return 72;
-            }
-            Err(_) => {
-                eprintln!("flow-executor: handshake timeout");
-                return 73;
-            }
-        };
+    let (identity, limits) = match tokio::time::timeout(
+        Duration::from_millis(STARTUP_TIMEOUT_MS * 2),
+        executor_handshake(&mut transport, EXECUTOR_BUILD, EXECUTOR_CAPABILITIES),
+    )
+    .await
+    {
+        Ok(Ok(ok)) => ok,
+        Ok(Err(error)) => {
+            eprintln!("flow-executor: handshake rejected: {error}");
+            return 72;
+        }
+        Err(_) => {
+            eprintln!("flow-executor: handshake timeout");
+            return 73;
+        }
+    };
     tracing::info!(
         session = %identity.session_id,
         executor = %identity.executor_id,
@@ -284,11 +283,7 @@ fn handle_message(
 
 fn cancel_acker_removed() {}
 
-async fn heartbeat_loop(
-    outbound: mpsc::Sender<Message>,
-    _session_id: String,
-    interval: Duration,
-) {
+async fn heartbeat_loop(outbound: mpsc::Sender<Message>, _session_id: String, interval: Duration) {
     let mut ticker = tokio::time::interval(interval.max(Duration::from_millis(100)));
     loop {
         ticker.tick().await;

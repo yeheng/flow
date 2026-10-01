@@ -584,7 +584,6 @@ pub async fn open_from_env() -> Result<AnyBackend, BackendError> {
     }
 }
 
-
 /// 二期 I09：按环境变量（FLOW_EXECUTION_MODE / FLOW_EXECUTOR_BIN）选择
 /// 执行模式并启动调度。IPC 模式二进制缺失/版本不兼容直接失败，不静默
 /// 落回进程内执行。

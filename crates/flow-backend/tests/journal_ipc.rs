@@ -43,9 +43,9 @@ async fn ipc_backend(root: &std::path::Path) -> Arc<JournalBackend> {
 }
 
 async fn start_ipc(backend: &Arc<JournalBackend>) {
-    flow_backend::start_execution_from_env(backend).await.unwrap_or_else(|e| {
-        panic!("ipc start failed (is flow-executor built?): {e}")
-    });
+    flow_backend::start_execution_from_env(backend)
+        .await
+        .unwrap_or_else(|e| panic!("ipc start failed (is flow-executor built?): {e}"));
 }
 
 /// 强制 IPC 模式（绕过环境变量，测试内显式指定二进制）。
@@ -53,15 +53,26 @@ async fn ipc_backend_explicit(root: &std::path::Path) -> Arc<JournalBackend> {
     ipc_backend_tagged(root, None).await
 }
 
-async fn ipc_backend_tagged(
+async fn ipc_backend_tagged(root: &std::path::Path, tag: Option<String>) -> Arc<JournalBackend> {
+    ipc_backend_sized(root, tag, 2).await
+}
+
+async fn ipc_backend_sized(
     root: &std::path::Path,
     tag: Option<String>,
+    x_max: usize,
 ) -> Arc<JournalBackend> {
     let backend = JournalBackend::open(root, JournalOptions::default())
         .await
         .unwrap();
     backend
-        .start_execution_ipc(ipc_mode_tagged(tag))
+        .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
+            flow_backend::execution::IpcOptions {
+                executor_bin: executor_bin(),
+                x_max,
+                tag,
+            },
+        ))
         .await
         .unwrap();
     backend
@@ -112,8 +123,7 @@ async fn start_run(backend: &JournalBackend, workflow: &str, input: Value) -> St
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "off".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "off".into()),
         )
         .try_init();
 }
@@ -144,7 +154,12 @@ async fn script_condition_and_templates_execute_in_subprocess() {
         }),
     )
     .await;
-    let run_id = start_run(&backend, &workflow, json!({"n": 41, "name": "flow", "ms": 40})).await;
+    let run_id = start_run(
+        &backend,
+        &workflow,
+        json!({"n": 41, "name": "flow", "ms": 40}),
+    )
+    .await;
     let done = until(&backend, &run_id, Run::terminal).await;
     if done.status != "succeeded" {
         let mut report = String::new();
@@ -185,7 +200,12 @@ async fn materialize(backend: &JournalBackend, run: &Run, node_id: &str) -> Valu
             let root = backend.journal.root().to_path_buf();
             let upper = backend.journal.durable_lsn();
             tokio::task::spawn_blocking(move || {
-                flow_journal::value::materialize(&root, upper, &StoredValue::Ref(reference), 8 * 1024 * 1024)
+                flow_journal::value::materialize(
+                    &root,
+                    upper,
+                    &StoredValue::Ref(reference),
+                    8 * 1024 * 1024,
+                )
             })
             .await
             .unwrap()
@@ -351,7 +371,9 @@ async fn cancel_during_http_marks_uncertain_and_never_resends() {
     tokio::spawn(async move {
         // 接受连接但不响应，制造取消竞争窗口。
         loop {
-            let Ok((socket, _)) = listener.accept().await else { return };
+            let Ok((socket, _)) = listener.accept().await else {
+                return;
+            };
             hits_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             std::mem::forget(socket); // 挂起连接直到测试结束
         }
@@ -368,16 +390,16 @@ async fn cancel_during_http_marks_uncertain_and_never_resends() {
     let run_id = start_run(&backend, &workflow, json!({})).await;
     // 等待授权已提交（请求已发出）再取消。
     let _authorized = until(&backend, &run_id, |r| {
-        r.nodes
-            .get("h")
-            .is_some_and(|n| n.operation.is_some())
+        r.nodes.get("h").is_some_and(|n| n.operation.is_some())
     })
     .await;
     backend.run_cancel(&run_id, None).await.unwrap();
     let cancelled = until(&backend, &run_id, |r| {
         r.status == "cancelled"
             && r.nodes.get("h").is_some_and(|n| {
-                n.attempts.get(n.dispatch_id.as_str()).is_some_and(|a| a.sealed)
+                n.attempts
+                    .get(n.dispatch_id.as_str())
+                    .is_some_and(|a| a.sealed)
             })
     })
     .await;
@@ -388,8 +410,17 @@ async fn cancel_during_http_marks_uncertain_and_never_resends() {
     let attempt = &node.attempts[node.dispatch_id.as_str()];
     assert!(attempt.sealed, "dispatch sealed after cancel");
     let result = attempt.result.as_ref().expect("sealed result event");
-    assert_eq!(result.kind, flow_journal::EventKind::WaitRegistered, "payload: {}", result.payload);
-    assert_eq!(result.payload["wait"]["kind"], "uncertain", "payload: {}", result.payload);
+    assert_eq!(
+        result.kind,
+        flow_journal::EventKind::WaitRegistered,
+        "payload: {}",
+        result.payload
+    );
+    assert_eq!(
+        result.payload["wait"]["kind"], "uncertain",
+        "payload: {}",
+        result.payload
+    );
     let sent_once = hits.load(std::sync::atomic::Ordering::SeqCst);
     assert_eq!(sent_once, 1);
     // 重启不重发：uncertain 保持。
@@ -424,7 +455,9 @@ async fn killing_executor_mid_script_recovers_with_new_process() {
     let run_id = start_run(&backend, &workflow, json!({})).await;
     // 只杀本测试标记的执行器，避免并行测试误伤。
     let victim = wait_for_tagged_executor(&tag).await;
-    unsafe { libc::kill(victim as i32, libc::SIGKILL); }
+    unsafe {
+        libc::kill(victim as i32, libc::SIGKILL);
+    }
     let done = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let run = backend.state().await.runs[&run_id].clone();
@@ -449,7 +482,10 @@ async fn killing_executor_mid_script_recovers_with_new_process() {
                     n.attempt
                 ));
             }
-            panic!("run not terminal after kill: {} {:?}\n{}", run.status, run.error, report);
+            panic!(
+                "run not terminal after kill: {} {:?}\n{}",
+                run.status, run.error, report
+            );
         }
     };
     assert_eq!(done.status, "failed");
@@ -638,61 +674,219 @@ fn tagged_executor_pids(tag: &str) -> Vec<u32> {
         .unwrap_or_default()
 }
 
-/// I10 性能冒烟：IPC 模式 20 个混合 run（script+delay+cancel），验证
-/// projected 提交推进与主进程 RSS 有界（真实负载数字见证据文档）。
+/// I10 性能矩阵：IPC 模式混合业务负载（script/delay/http/cancel 各 1/4），
+/// 采集：吞吐、per-run 完成延迟分位、主进程 RSS、执行器进程数与峰值 RSS。
+/// 运行：scripts/release.sh cargo test --release -p flow-backend --test journal_ipc -- --ignored --nocapture ipc_mixed
 #[tokio::test]
-#[ignore = "perf smoke: cargo test --release -- --ignored"]
-async fn ipc_mixed_load_smoke() {
+#[ignore = "perf: scripts/release.sh cargo test --release -- --ignored --nocapture"]
+async fn ipc_mixed_business_matrix() {
+    use std::sync::atomic::AtomicU64;
     let root = temp();
-    let backend = ipc_backend_explicit(&root).await;
-    let workflow = install(
+    let tag = format!("perf-{}", uuid::Uuid::now_v7().simple());
+    // X_max=4（契约默认）；取消负载的 HTTP 设短超时，让执行器自行封口
+    // （uncertain 结果）而不是依赖 5s Draining 宽限 kill。
+    let backend = ipc_backend_sized(&root, Some(tag.clone()), 4).await;
+    // 挂起 HTTP 服务器（cancel 负载用）。
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hang_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((socket, _)) = listener.accept().await else { return };
+            std::mem::forget(socket);
+        }
+    });
+    // 正常 HTTP 服务器。
+    let ok_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ok_addr = ok_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        loop {
+            let Ok((mut socket, _)) = ok_listener.accept().await else { return };
+            let mut buffer = [0; 4096];
+            let mut seen = Vec::new();
+            loop {
+                let n = match socket.read(&mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                seen.extend_from_slice(&buffer[..n]);
+                if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = "{\"ok\":true}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        }
+    });
+    let script_flow = install(
         &backend,
         json!({"nodes":[
             {"id":"s","type":"start"},
             {"id":"n","type":"script","params":{"code":"return {n: input.n + 1};"}},
-            {"id":"d","type":"delay","params":{"ms": 20}},
+            {"id":"d","type":"delay","params":{"ms": 10}},
             {"id":"e","type":"end"}],
             "edges":[{"from":"s","to":"n"},{"from":"n","to":"d"},{"from":"d","to":"e"}]}),
     )
     .await;
+    let delay_flow = install(
+        &backend,
+        json!({"nodes":[
+            {"id":"s","type":"start"},
+            {"id":"d","type":"delay","params":{"ms": 50}},
+            {"id":"e","type":"end"}],
+            "edges":[{"from":"s","to":"d"},{"from":"d","to":"e"}]}),
+    )
+    .await;
+    let http_flow = install(
+        &backend,
+        json!({"nodes":[
+            {"id":"s","type":"start"},
+            {"id":"h","type":"http_call","params":{"url": format!("http://{ok_addr}/ok")}},
+            {"id":"e","type":"end"}],
+            "edges":[{"from":"s","to":"h"},{"from":"h","to":"e"}]}),
+    )
+    .await;
+    let cancel_flow = install(
+        &backend,
+        json!({"nodes":[
+            {"id":"s","type":"start"},
+            {"id":"h","type":"http_call","params":{"url": format!("http://{hang_addr}/hang"), "timeout_ms": 400}},
+            {"id":"e","type":"end"}],
+            "edges":[{"from":"s","to":"h"},{"from":"h","to":"e"}]}),
+    )
+    .await;
+
+    let runs = 48u64;
+    let batch = runs / 4;
     let started = std::time::Instant::now();
-    let completed = Arc::new(AtomicUsize::new(0));
+    let latencies = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
+    let terminal_count = Arc::new(AtomicU64::new(0));
     let mut handles = Vec::new();
-    for i in 0..20u64 {
+    for i in 0..runs {
+        let (flow, input, cancel) = match i % 4 {
+            0 => (script_flow.clone(), json!({"n": i}), false),
+            1 => (delay_flow.clone(), json!({}), false),
+            2 => (http_flow.clone(), json!({}), false),
+            _ => (cancel_flow.clone(), json!({}), true),
+        };
         let backend = backend.clone();
-        let workflow = workflow.clone();
-        let completed = completed.clone();
+        let latencies = latencies.clone();
+        let terminal_count = terminal_count.clone();
         handles.push(tokio::spawn(async move {
+            let t0 = std::time::Instant::now();
             let created = backend
-                .run_start(&workflow, None, json!({"n": i}), "manual", None, None)
+                .run_start(&flow, None, input, "manual", None, None)
                 .await
                 .unwrap();
             let run_id = created.result["run_id"].as_str().unwrap().to_string();
-            let done = until(&backend, &run_id, Run::terminal).await;
-            assert_eq!(done.status, "succeeded");
-            completed.fetch_add(1, Ordering::Relaxed);
+            if cancel {
+                // 等授权提交后取消（制造真实取消竞争窗口）。
+                loop {
+                    let run = backend.state().await.runs[&run_id].clone();
+                    let authorized = run
+                        .nodes
+                        .get("h")
+                        .is_some_and(|n| n.operation.is_some());
+                    let terminal = run.terminal();
+                    if authorized || terminal {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                let _ = backend.run_cancel(&run_id, None).await;
+            }
+            let done = match tokio::time::timeout(Duration::from_secs(120), async {
+                loop {
+                    let run = backend.state().await.runs[&run_id].clone();
+                    if run.terminal() {
+                        return run;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            {
+                Ok(run) => run,
+                Err(_) => {
+                    let run = backend.state().await.runs[&run_id].clone();
+                    let mut report = format!("stuck run status={}\n", run.status);
+                    for (id, n) in &run.nodes {
+                        report.push_str(&format!(
+                            "  {id}: {} err={:?} wait={:?} attempt={}\n",
+                            n.status,
+                            n.error,
+                            n.wait.as_ref().map(|w| w.kind.clone()),
+                            n.attempt
+                        ));
+                    }
+                    panic!("run {run_id} not terminal in 120s: {report}");
+                }
+            };
+            terminal_count.fetch_add(1, Ordering::Relaxed);
+            assert!(
+                matches!(done.status.as_str(), "succeeded" | "cancelled"),
+                "unexpected status {}",
+                done.status
+            );
+            latencies
+                .lock()
+                .unwrap()
+                .push(t0.elapsed().as_secs_f64() * 1000.0);
         }));
     }
     for handle in handles {
         handle.await.unwrap();
     }
     let elapsed = started.elapsed();
-    assert_eq!(completed.load(Ordering::Relaxed), 20);
-    eprintln!(
-        "ipc mixed smoke: 20 runs in {:.3}s ({:.1} run/s)",
-        elapsed.as_secs_f64(),
-        20.0 / elapsed.as_secs_f64()
-    );
-    // 主进程 RSS（macOS ps；仅冒烟参考，精确口径见证据文档）。
-    let rss = std::process::Command::new("ps")
-        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok());
-    if let Some(rss) = rss {
-        eprintln!("ipc mixed smoke: master RSS {} KiB", rss);
-        assert!(rss < 512 * 1024, "master RSS bounded: {rss} KiB");
+    let mut samples = latencies.lock().unwrap().clone();
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let pct = |p: f64| -> f64 {
+        let idx = ((samples.len() as f64 - 1.0) * p).round() as usize;
+        samples[idx.min(samples.len() - 1)]
+    };
+    let master_rss = rss_kib(std::process::id()).unwrap_or(0);
+    let executor_pids = tagged_executor_pids(&tag);
+    let mut executor_peak = 0u64;
+    for pid in &executor_pids {
+        if let Some(rss) = rss_kib(*pid) {
+            executor_peak = executor_peak.max(rss);
+        }
     }
+    eprintln!("ipc mixed matrix (release):");
+    eprintln!("  runs={} terminal={}", runs, terminal_count.load(Ordering::Relaxed));
+    eprintln!("  wall={:.3}s ({:.1} run/s)", elapsed.as_secs_f64(), runs as f64 / elapsed.as_secs_f64());
+    eprintln!("  latency ms: p50={:.1} p99={:.1} max={:.1}", pct(0.50), pct(0.99), pct(1.0));
+    eprintln!("  master RSS {} KiB; executors alive={} peak_rss {} KiB", master_rss, executor_pids.len(), executor_peak);
+    assert_eq!(terminal_count.load(Ordering::Relaxed), runs);
+    assert!(master_rss < 512 * 1024, "master RSS bounded: {master_rss} KiB");
+    assert!(executor_peak < 256 * 1024, "executor RSS bounded: {executor_peak} KiB");
     backend.close().await.unwrap();
+    // 回收无遗留。
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if tagged_executor_pids(&tag).is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("no orphan executor processes after load");
     std::fs::remove_dir_all(root).unwrap();
+}
+
+fn rss_kib(pid: u32) -> Option<u64> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u64>()
+        .ok()
 }

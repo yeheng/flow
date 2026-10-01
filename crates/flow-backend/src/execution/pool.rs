@@ -171,7 +171,10 @@ impl ExecutorPool {
     }
 
     async fn spawn_session(self: &Arc<Self>) -> Result<RawSession, PoolError> {
-        let executor_id = format!("exec-{}", self.executor_counter.fetch_add(1, Ordering::Relaxed));
+        let executor_id = format!(
+            "exec-{}",
+            self.executor_counter.fetch_add(1, Ordering::Relaxed)
+        );
         let session_id = format!(
             "session-{}",
             self.session_counter.fetch_add(1, Ordering::Relaxed)
@@ -249,7 +252,13 @@ async fn spawn_and_handshake(
     let mut transport = FrameTransport::spawn(parent, 128);
     let hello = tokio::time::timeout(
         Duration::from_millis(STARTUP_TIMEOUT_MS * 2),
-        master_handshake(&mut transport, journal_id, master_epoch, executor_id, session_id),
+        master_handshake(
+            &mut transport,
+            journal_id,
+            master_epoch,
+            executor_id,
+            session_id,
+        ),
     )
     .await
     .map_err(|_| {

@@ -9,7 +9,13 @@ use flow_engine::execution_protocol::message::Message;
 
 use flow_executor::audit::{AuditError, AuditStream};
 
-fn stream(window: u64) -> (AuditStream, mpsc::Receiver<Message>, watch::Sender<(u64, u64)>) {
+fn stream(
+    window: u64,
+) -> (
+    AuditStream,
+    mpsc::Receiver<Message>,
+    watch::Sender<(u64, u64)>,
+) {
     let (outbound, rx) = mpsc::channel(64);
     let (acks, _) = watch::channel((0u64, 0u64));
     (
@@ -28,18 +34,14 @@ async fn window_blocks_until_prefix_acked_then_resumes() {
     // 窗口只容一条记录：第二条必须等第一条的 ACK（B(S)-B(D) ≤ W）。
     let unit = flow_engine::execution_protocol::record_bytes(1, "business_audit", &payload());
     let (mut audit, mut rx, acks) = stream(unit + 16);
-    assert_eq!(
-        audit.push("business_audit", payload()).unwrap(),
-        1
-    );
-    assert_eq!(
-        audit.push("business_audit", payload()).unwrap(),
-        2
-    );
+    assert_eq!(audit.push("business_audit", payload()).unwrap(), 1);
+    assert_eq!(audit.push("business_audit", payload()).unwrap(), 2);
     audit.flush().await.unwrap();
     let first = rx.recv().await.unwrap();
     match &first {
-        Message::AuditBatch { records, first_seq, .. } => {
+        Message::AuditBatch {
+            records, first_seq, ..
+        } => {
             assert_eq!(*first_seq, 1);
             assert_eq!(records.len(), 1);
         }
@@ -65,7 +67,9 @@ async fn window_blocks_until_prefix_acked_then_resumes() {
         .expect("second record flows after ack")
         .unwrap();
     match &second {
-        Message::AuditBatch { records, first_seq, .. } => {
+        Message::AuditBatch {
+            records, first_seq, ..
+        } => {
             assert_eq!(*first_seq, 2);
             assert_eq!(records.len(), 1);
         }
@@ -73,10 +77,7 @@ async fn window_blocks_until_prefix_acked_then_resumes() {
     }
     acks.send((2, unit * 2)).unwrap();
     waiter.await.unwrap();
-    done_rx
-        .await
-        .unwrap()
-        .expect("durable through seq 2");
+    done_rx.await.unwrap().expect("durable through seq 2");
 }
 
 #[tokio::test]
@@ -84,7 +85,10 @@ async fn oversize_record_rejected_at_push() {
     // 单条记录必须能被窗口容纳（二期 §3.5 死锁条款）。
     let (mut audit, _rx, _acks) = stream(1024);
     let error = audit
-        .push("business_audit", serde_json::json!({"padding": "x".repeat(4096)}))
+        .push(
+            "business_audit",
+            serde_json::json!({"padding": "x".repeat(4096)}),
+        )
         .unwrap_err();
     assert!(matches!(error, AuditError::Oversize(_, _)));
 }

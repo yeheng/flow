@@ -94,9 +94,7 @@ pub enum ResultOutcome {
         uncertain_operation: bool,
     },
     /// 持久等待登记请求；主进程确认后释放槽位，等待不占执行进程。
-    Wait {
-        wait: WaitRequest,
-    },
+    Wait { wait: WaitRequest },
 }
 
 /// 等待请求。`wake_at` 为 epoch 毫秒（delay）；child 等待的 child_run_id
@@ -106,7 +104,11 @@ pub enum ResultOutcome {
 pub struct WaitRequest {
     #[serde(rename = "type")]
     pub kind: String,
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "decimal_i64_opt")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "decimal_i64_opt"
+    )]
     pub wake_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<StoredValue>,
@@ -300,9 +302,7 @@ pub enum Message {
         lines: Vec<ObservationLine>,
     },
     /// control，双向。协议错误：明确拒绝后关闭连接。
-    Reject {
-        reason: String,
-    },
+    Reject { reason: String },
 }
 
 /// 观测行（nodelog console/stdout/stderr 叙事）。
@@ -488,19 +488,19 @@ impl Message {
                 command_id,
                 dispatch_id: _,
                 task,
-            } => body_value(&serde_json::json!({
+            } => body_value(serde_json::json!({
                 "command_id": command_id,
                 "task": task,
             })),
             Message::Accepted {
                 command_id,
                 dispatch_id: _,
-            } => body_value(&serde_json::json!({"command_id": command_id})),
+            } => body_value(serde_json::json!({"command_id": command_id})),
             Message::AuditBatch {
                 dispatch_id: _,
                 first_seq,
                 records,
-            } => body_value(&serde_json::json!({
+            } => body_value(serde_json::json!({
                 "first_seq": first_seq.to_string(),
                 "records": records,
             })),
@@ -521,7 +521,7 @@ impl Message {
                 request_fingerprint,
                 request,
                 transfer_id,
-            } => body_value(&serde_json::json!({
+            } => body_value(serde_json::json!({
                 "command_id": command_id,
                 "operation_id": operation_id,
                 "request_fingerprint": request_fingerprint,
@@ -534,7 +534,7 @@ impl Message {
                 permit_id,
                 request_fingerprint,
                 credential,
-            } => body_value(&serde_json::json!({
+            } => body_value(serde_json::json!({
                 "operation_id": operation_id,
                 "permit_id": permit_id,
                 "request_fingerprint": request_fingerprint,
@@ -573,9 +573,9 @@ impl Message {
             Message::ResultCommitted {
                 dispatch_id: _,
                 result_id,
-            } => body_value(&serde_json::json!({"result_id": result_id})),
+            } => body_value(serde_json::json!({"result_id": result_id})),
             Message::Cancel { command_id, .. } => {
-                body_value(&serde_json::json!({"command_id": command_id}))
+                body_value(serde_json::json!({"command_id": command_id}))
             }
             Message::Stopped {
                 dispatch_id: _,
@@ -587,13 +587,15 @@ impl Message {
                 last_audit_seq: *last_audit_seq,
                 pending_operation: pending_operation.clone(),
             }),
-            Message::Heartbeat { dispatch_id: _, phase } => {
-                body_value(&serde_json::json!({"phase": phase}))
-            }
-            Message::ObservabilityBatch { dispatch_id: _, lines } => {
-                body_value(&serde_json::json!({"lines": lines}))
-            }
-            Message::Reject { reason } => body_value(&serde_json::json!({"reason": reason})),
+            Message::Heartbeat {
+                dispatch_id: _,
+                phase,
+            } => body_value(serde_json::json!({"phase": phase})),
+            Message::ObservabilityBatch {
+                dispatch_id: _,
+                lines,
+            } => body_value(serde_json::json!({"lines": lines})),
+            Message::Reject { reason } => body_value(serde_json::json!({"reason": reason})),
         };
         let mut envelope = serde_json::Map::new();
         envelope.insert("v".into(), json!(PROTOCOL_VERSION));

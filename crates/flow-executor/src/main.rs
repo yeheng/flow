@@ -11,8 +11,7 @@ fn main() {
     let _ = std::env::args();
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .try_init();
     let control_fd = std::env::var("FLOW_EXECUTOR_CONTROL_FD")

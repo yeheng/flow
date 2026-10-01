@@ -314,4 +314,4 @@ I10 同时回归 [一期故障矩阵](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#pla
 <a id="phase2-approval"></a>
 ## 8. 二期实施与交接状态
 
-I01–I10 于 2026-10-02 实现完成（开发验收口径）：本地进程池/IPC fixtures/稳定业务身份/端到端持久语义已交付；等价性与二期故障矩阵回归通过。未执行项：生产切换、release 性能复核（本机 sqlx-macros dylib 构建损坏阻塞，与本代码无关）、真实断电（沿用一期排除口径）。三期在此基础上增加中继。I10 向三期交付本地进程池、IPC fixtures、稳定业务身份和端到端持久语义；三期在此基础上增加中继，不能提前返回权威 ACK。
+I01–I10 于 2026-10-02 实现完成（开发验收口径）：本地进程池/IPC fixtures/稳定业务身份/端到端持久语义已交付；等价性与二期故障矩阵回归通过，debug 与 release 口径回归均绿。本机 release 曾被 Xcode 21 ld 的 LINKEDIT 未对齐 bug 阻塞（sqlx-macros dylib 无法 dlopen，机器级问题、与本代码无关），已以 scripts/release.sh（rust-lld + 26.5 SDK）修复并取得 release 混合负载数字（48 run 7.8s、主进程 RSS 40 MiB、执行器峰值 12 MiB，见 I10 证据）。未执行项：生产切换、真实断电（沿用一期排除口径）。三期在此基础上增加中继。I10 向三期交付本地进程池、IPC fixtures、稳定业务身份和端到端持久语义；三期在此基础上增加中继，不能提前返回权威 ACK。

@@ -9,9 +9,7 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
 
-use flow_engine::execution_protocol::contract::{
-    ACK_RETRANSMIT_MS, DATA_MAX_FRAME, W_BYTES,
-};
+use flow_engine::execution_protocol::contract::{ACK_RETRANSMIT_MS, DATA_MAX_FRAME, W_BYTES};
 use flow_engine::execution_protocol::message::{AuditRecord, Message};
 use flow_engine::execution_protocol::record_bytes;
 

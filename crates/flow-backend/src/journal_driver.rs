@@ -27,20 +27,19 @@ fn invalid(s: impl Into<String>) -> flow_journal::Error {
 
 impl JournalBackend {
     pub async fn start_execution(self: &Arc<Self>) -> Result<()> {
-        self.start_execution_with_port(16, ExecutionPort::InProcess).await
+        self.start_execution_with_port(16, ExecutionPort::InProcess)
+            .await
     }
     pub async fn start_execution_with_limit(self: &Arc<Self>, limit: usize) -> Result<()> {
         if !(1..=16).contains(&limit) {
             return Err(invalid("A_max must be within 1..=16").into());
         }
-        self.start_execution_with_port(limit, ExecutionPort::InProcess).await
+        self.start_execution_with_port(limit, ExecutionPort::InProcess)
+            .await
     }
     /// 二期 IPC 模式：先持久提交新 master_epoch，再创建进程池与派发器
     /// （取得独占写权后持久提交新任期，再派发任务；二期 §3.2）。
-    pub async fn start_execution_ipc(
-        self: &Arc<Self>,
-        mode: ExecutionMode,
-    ) -> Result<()> {
+    pub async fn start_execution_ipc(self: &Arc<Self>, mode: ExecutionMode) -> Result<()> {
         let crate::execution::ExecutionMode::Ipc(options) = mode else {
             return self.start_execution().await;
         };
@@ -53,11 +52,7 @@ impl JournalBackend {
             .into());
         }
         let epoch = self.bump_master_epoch().await?;
-        let pool = crate::execution::ExecutorPool::new(
-            options,
-            self.journal.id().into(),
-            epoch,
-        );
+        let pool = crate::execution::ExecutorPool::new(options, self.journal.id().into(), epoch);
         let dispatcher = Arc::new(IpcDispatcher::new(pool));
         self.start_execution_with_port(16, ExecutionPort::Ipc(dispatcher))
             .await

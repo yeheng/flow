@@ -13,6 +13,10 @@ FLOW_EXECUTOR_BIN=/path/to/flow-executor FLOW_EXECUTION_MODE=ipc cargo run -p fl
 ```
 
 - 默认 `in_process`（一期行为）；`ipc` 模式二进制缺失/版本不兼容直接失败，不静默回退。
+- **本机 release 构建**：若遇 `dlopen ... mis-aligned LINKEDIT string pool`（Xcode 21 ld 对部分
+  proc-macro dylib 产生未对齐符号表，机器级 bug），用
+  `scripts/release.sh cargo <command>` 包装（改用 rustc 自带 rust-lld + 26.5
+  SDK）；默认构建不变。
 - 执行器定位：`FLOW_EXECUTOR_BIN` 显式路径 → 同目录 → target/{debug,release}。
 - 常量（X_max 默认 4/A_max 16/W 2 MiB/帧上限等）见 `flow_engine::execution_protocol::contract`。
 - 同数据集单写者；一个 run 只绑定一种执行模式；master epoch 随 IPC 启动持久提交。

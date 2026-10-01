@@ -9,8 +9,9 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
+use flow_engine::event::{LogLevel, LogStream};
 use flow_engine::execution_protocol::contract::OBSERVABILITY_BATCH_LINES;
-use flow_engine::execution_protocol::message::{Message, ObservationLine};use flow_engine::event::{LogLevel, LogStream};
+use flow_engine::execution_protocol::message::{Message, ObservationLine};
 use flow_engine::nodelog::{LogLine, NodeLogger};
 
 /// 观测丢弃计数（进程级，退出前回报诊断用）。
@@ -35,12 +36,7 @@ impl ObservationBridge {
     ) -> (NodeLogger, Arc<ObservationLoss>) {
         let loss = Arc::new(ObservationLoss::default());
         let (tx, mut rx) = mpsc::unbounded_channel::<LogLine>();
-        let logger = NodeLogger::new(
-            tx,
-            flow_engine::nodelog::LogBudget::new(usize::MAX),
-            "",
-            1,
-        );
+        let logger = NodeLogger::new(tx, flow_engine::nodelog::LogBudget::new(usize::MAX), "", 1);
         let forward_loss = loss.clone();
         let forward_dispatch = dispatch_id.clone();
         tokio::spawn(async move {

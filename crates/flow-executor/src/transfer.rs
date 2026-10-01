@@ -116,9 +116,7 @@ impl IncomingTransfers {
         let mut expected = 0u64;
         for (offset, bytes) in &stream.chunks {
             if *offset != expected {
-                return Err(TransferError::Incomplete(format!(
-                    "gap at {expected}"
-                )));
+                return Err(TransferError::Incomplete(format!("gap at {expected}")));
             }
             expected += bytes.len() as u64;
             assembled.extend_from_slice(bytes);
@@ -220,7 +218,10 @@ pub async fn store_bytes(
             chunk_index: index,
             data: STANDARD.encode(chunk),
         };
-        audit.push("value_chunk", serde_json::to_value(&record).expect("chunk json"))?;
+        audit.push(
+            "value_chunk",
+            serde_json::to_value(&record).expect("chunk json"),
+        )?;
         hash.update(chunk);
         total += chunk.len() as u64;
         index += 1;

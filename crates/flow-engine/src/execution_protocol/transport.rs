@@ -133,8 +133,7 @@ impl FrameTransport {
             event_tx.clone(),
             broken.clone(),
         ));
-        let writer_control =
-            tokio::spawn(write_loop(control_write, control_rx, broken.clone()));
+        let writer_control = tokio::spawn(write_loop(control_write, control_rx, broken.clone()));
         let writer_data = tokio::spawn(write_loop(data_write, data_rx, broken.clone()));
         drop(event_tx);
         Self {
@@ -289,12 +288,18 @@ async fn write_loop(
         };
         // 大载荷分多次 write；写不动时天然背压到发送队列。
         if let Err(error) = stream.write_all(&frame).await {
-            eprintln!("flow-transport: frame write failed type={} error={error}", message.type_name());
+            eprintln!(
+                "flow-transport: frame write failed type={} error={error}",
+                message.type_name()
+            );
             broken.store(true, std::sync::atomic::Ordering::SeqCst);
             return;
         }
         if let Err(error) = stream.flush().await {
-            eprintln!("flow-transport: frame flush failed type={} error={error}", message.type_name());
+            eprintln!(
+                "flow-transport: frame flush failed type={} error={error}",
+                message.type_name()
+            );
             broken.store(true, std::sync::atomic::Ordering::SeqCst);
             return;
         }
@@ -524,9 +529,10 @@ mod tests {
     async fn handshake_roundtrip_and_context_identity() {
         let (mut master, mut worker) = pair().await;
         let worker_task = tokio::spawn(async move {
-            let (identity, limits) = executor_handshake(&mut worker, "0.1.0", REQUIRED_CAPABILITIES)
-                .await
-                .expect("executor handshake");
+            let (identity, limits) =
+                executor_handshake(&mut worker, "0.1.0", REQUIRED_CAPABILITIES)
+                    .await
+                    .expect("executor handshake");
             (identity, limits)
         });
         let hello = master_handshake(&mut master, "journal-1", 7, "exec-1", "session-1")
@@ -597,8 +603,7 @@ mod tests {
         // 用 dup 的独立句柄从对端注入非法长度帧。
         use std::os::fd::AsRawFd;
         let dup_fd = unsafe { libc::dup(child.control.as_raw_fd()) };
-        let evil =
-            unsafe { std::os::unix::net::UnixStream::from_raw_fd(dup_fd) };
+        let evil = unsafe { std::os::unix::net::UnixStream::from_raw_fd(dup_fd) };
         let mut a = FrameTransport::spawn(parent, 8);
         let mut _peer = FrameTransport::spawn(child, 8);
         use tokio::io::AsyncWriteExt;

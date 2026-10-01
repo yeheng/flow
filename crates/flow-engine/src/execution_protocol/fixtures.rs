@@ -37,7 +37,12 @@ pub fn valid_messages() -> Vec<Message> {
         Message::Hello {
             boot_id: "boot-1".into(),
             build: "0.1.0-test".into(),
-            capabilities: vec!["execute".into(), "js".into(), "http".into(), "transfer".into()],
+            capabilities: vec![
+                "execute".into(),
+                "js".into(),
+                "http".into(),
+                "transfer".into(),
+            ],
         },
         Message::Welcome {
             journal_id: "journal-fixture".into(),
@@ -86,7 +91,9 @@ pub fn valid_messages() -> Vec<Message> {
             command_id: "cmd-2".into(),
             operation_id: "op-1".into(),
             request_fingerprint: "ff".repeat(32),
-            request: Some(StoredValue::Inline(json!({"method":"GET","url":"http://example.test"}))),
+            request: Some(StoredValue::Inline(
+                json!({"method":"GET","url":"http://example.test"}),
+            )),
             transfer_id: None,
         },
         Message::OperationPermit {
@@ -183,9 +190,9 @@ pub fn malformed_envelopes() -> Vec<Value> {
     vec![
         json!("not an object"),
         json!({}),
-        json!({"v": 2, "type": "Ready"}),                         // 版本不兼容
-        json!({"v": 1}),                                          // 缺 type
-        json!({"v": 1, "type": "Result"}),                        // 缺 dispatch/body
+        json!({"v": 2, "type": "Ready"}),  // 版本不兼容
+        json!({"v": 1}),                   // 缺 type
+        json!({"v": 1, "type": "Result"}), // 缺 dispatch/body
         json!({"v": 1, "type": "AuditAck", "dispatch_id": "d", "body": {"durable_audit_seq": "x", "durable_bytes": "1", "commit_lsn": "1"}}), // 非十进制
         json!({"v": 1, "type": "AuditAck", "dispatch_id": "d", "body": {"durable_audit_seq": 5, "durable_bytes": "1", "commit_lsn": "1"}}), // 数字而非字符串
         json!({"v": 1, "type": "Execute", "dispatch_id": "d", "body": {"command_id": "c", "task": {}}}), // 缺字段

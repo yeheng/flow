@@ -6,10 +6,8 @@
 //! - 版本不兼容（假二进制）在握手处明确失败
 
 use flow_backend::journal::JournalBackend;
-use flow_engine::journal_state::Run;
 use flow_journal::JournalOptions;
 use serde_json::json;
-use std::sync::Arc;
 use std::time::Duration;
 
 fn temp() -> std::path::PathBuf {
@@ -41,7 +39,12 @@ async fn install(b: &JournalBackend, definition: serde_json::Value) -> String {
 #[test]
 fn mode_env_parsing_rejects_invalid_values() {
     // in_process / 空 / 未设置 → 进程内；未知值 → 报错。
-    let cases = [("in_process", true), ("", true), ("ipc", false), ("remote", false)];
+    let cases = [
+        ("in_process", true),
+        ("", true),
+        ("ipc", false),
+        ("remote", false),
+    ];
     for (value, _) in cases {
         // 仅验证解析路径不 panic；真实定位在 async 测试中覆盖。
         let _ = value;
@@ -153,8 +156,7 @@ async fn executor_path_with_spaces_runs() {
 async fn incompatible_executor_binary_fails_handshake_and_node_errors() {
     let root = temp();
     // 假二进制：立即退出（版本不兼容/无法握手）；放在数据目录之外。
-    let fake_dir =
-        std::env::temp_dir().join(format!("flow-fake-{}", uuid::Uuid::now_v7()));
+    let fake_dir = std::env::temp_dir().join(format!("flow-fake-{}", uuid::Uuid::now_v7()));
     std::fs::create_dir_all(&fake_dir).unwrap();
     let fake = fake_dir.join("fake-executor");
     #[cfg(unix)]
@@ -201,7 +203,10 @@ async fn incompatible_executor_binary_fails_handshake_and_node_errors() {
     })
     .await
     .expect("run terminates");
-    assert_eq!(done.status, "failed", "incompatible binary must fail loudly");
+    assert_eq!(
+        done.status, "failed",
+        "incompatible binary must fail loudly"
+    );
     backend.close().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
     std::fs::remove_dir_all(fake_dir).unwrap();

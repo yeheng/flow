@@ -16,9 +16,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use flow_engine::execution_protocol::contract::DURABLE_WAIT_TIMEOUT_MS;
-use flow_engine::execution_protocol::message::{
-    ExecuteTask, Message, ResultOutcome, WaitRequest,
-};
+use flow_engine::execution_protocol::message::{ExecuteTask, Message, ResultOutcome, WaitRequest};
 use flow_engine::journal_state::Prepared;
 use flow_engine::model::Node;
 use flow_engine::{NodeType, HTTP_METHODS};
@@ -93,10 +91,7 @@ impl TaskRunner {
             Ok(()) => TaskEnd::Committed,
             Err(error) => {
                 tracing::warn!(dispatch = %self.dispatch_id, %error, "executor task stopped");
-                eprintln!(
-                    "flow-executor: task {} stopped: {error}",
-                    self.dispatch_id
-                );
+                eprintln!("flow-executor: task {} stopped: {error}", self.dispatch_id);
                 // 尽力通知主进程后进入回收（主进程宽限期后 kill/reap）。
                 let _ = self
                     .outbound
@@ -119,8 +114,7 @@ impl TaskRunner {
             })
             .await
             .map_err(|e| TaskError::Closed(e.to_string()))?;
-        let node: Node =
-            serde_json::from_value(self.task.node.clone()).map_err(TaskError::from)?;
+        let node: Node = serde_json::from_value(self.task.node.clone()).map_err(TaskError::from)?;
         let mut audit = AuditStream::new(
             self.dispatch_id.clone(),
             self.outbound.clone(),
@@ -148,9 +142,7 @@ impl TaskRunner {
                     let prepared_seq = audit.next_seq() - 1;
                     // §3.8：等 InputPrepared 对应 AuditAck 后继续已被 Execute
                     // 授权的纯计算；外部节点另需 OperationPermit。
-                    audit
-                        .await_durable(prepared_seq, &self.cancel)
-                        .await?;
+                    audit.await_durable(prepared_seq, &self.cancel).await?;
                     prepared
                 }
                 Err(TaskError::Business(error)) => {
@@ -272,10 +264,7 @@ impl TaskRunner {
     }
 
     /// 装配 run 输入与前驱输出（inline 即用，Ref 等 transfer）。
-    async fn materialize_inputs(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<TaskInputs, TaskError> {
+    async fn materialize_inputs(&mut self, timeout: Duration) -> Result<TaskInputs, TaskError> {
         let mut budget = INPUT_BUDGET;
         // 收集需要 transfer 的引用：run 输入、前驱输出、已提交准备参数、
         // 恢复路径的历史 Outcome 原始体。
@@ -335,9 +324,7 @@ impl TaskRunner {
                         .ok_or_else(|| TaskError::Invalid(format!("transfer {id} missing")))?;
                     let n = bytes.len();
                     if n > budget {
-                        return Err(TaskError::Invalid(
-                            "aggregate input exceeds 8 MiB".into(),
-                        ));
+                        return Err(TaskError::Invalid("aggregate input exceeds 8 MiB".into()));
                     }
                     budget -= n;
                     match reference.codec {
@@ -372,14 +359,8 @@ impl TaskRunner {
         inputs: &TaskInputs,
         audit: &mut AuditStream,
     ) -> Result<Prepared, TaskError> {
-        let predecessors: BTreeMap<String, StoredValue> = self
-            .task
-            .predecessors
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .collect();
+        let predecessors: BTreeMap<String, StoredValue> =
+            self.task.predecessors.to_vec().into_iter().collect();
         let templates = serde_json::to_string(&node.params)?.contains("${");
         let params = if !templates {
             node.params.clone()
@@ -461,8 +442,7 @@ impl TaskRunner {
                     .await
             }
             kind @ (NodeType::HttpCall | NodeType::Llm | NodeType::Email) => {
-                self.http_node(node, kind, prepared, inputs, audit)
-                    .await
+                self.http_node(node, kind, prepared, inputs, audit).await
             }
             NodeType::Delay => {
                 let params = materialize_prepared_params(self, prepared).await?;
@@ -472,7 +452,10 @@ impl TaskRunner {
                     .ok_or_else(|| TaskError::Business("delay ms required".into()))?;
                 let wake = chrono::Utc::now()
                     .timestamp_millis()
-                    .checked_add(i64::try_from(ms).map_err(|_| TaskError::Business("delay overflow".into()))?)
+                    .checked_add(
+                        i64::try_from(ms)
+                            .map_err(|_| TaskError::Business("delay overflow".into()))?,
+                    )
                     .ok_or_else(|| TaskError::Business("delay overflow".into()))?;
                 Ok(ResultOutcome::Wait {
                     wait: WaitRequest {
@@ -551,9 +534,7 @@ impl TaskRunner {
                             "non-JSON reference in JSON composition".into(),
                         ));
                     }
-                    let bytes = self
-                        .take_transfer(&format!("in:{key}"))
-                        .await?;
+                    let bytes = self.take_transfer(&format!("in:{key}")).await?;
                     composed.extend_from_slice(&bytes);
                 }
             }
@@ -575,7 +556,9 @@ impl TaskRunner {
         // 输入面必须与提交的准备一致：用 prepared 里的原始 StoredValue 重新
         // 物化（Ref 已在装配阶段就位）。
         let mut budget = INPUT_BUDGET;
-        let params_value = self.materialize_stored(&prepared.params, "in:prepared-params", &mut budget).await?;
+        let params_value = self
+            .materialize_stored(&prepared.params, "in:prepared-params", &mut budget)
+            .await?;
         let code = match kind {
             NodeType::Script => params_value["code"].as_str().unwrap_or("").to_owned(),
             NodeType::Condition => format!(
@@ -661,8 +644,7 @@ impl TaskRunner {
                 match reference.codec {
                     ValueCodec::Json => Ok(serde_json::from_slice(&bytes)?),
                     ValueCodec::Utf8 => Ok(Value::String(
-                        String::from_utf8(bytes)
-                            .map_err(|e| TaskError::Invalid(e.to_string()))?,
+                        String::from_utf8(bytes).map_err(|e| TaskError::Invalid(e.to_string()))?,
                     )),
                     ValueCodec::Bytes => {
                         Err(TaskError::Invalid("binary value in JSON input face".into()))
@@ -686,7 +668,10 @@ impl TaskRunner {
             let outcome: StoredValue =
                 serde_json::from_value(outcome_value).map_err(TaskError::from)?;
             let output = self.http_output(&outcome, kind, audit).await?;
-            return Ok(ResultOutcome::Success { output, branch: None });
+            return Ok(ResultOutcome::Success {
+                output,
+                branch: None,
+            });
         }
         let mut budget = INPUT_BUDGET;
         let mut params = self
@@ -731,17 +716,17 @@ impl TaskRunner {
         let fingerprint = flow_journal::codec::digest(&request_bytes);
         let operation_id = uuid::Uuid::now_v7().to_string();
         // 大请求走 data 分块；小请求 inline。
-        let inline = if request_bytes.len()
-            <= flow_engine::execution_protocol::CONTROL_MAX_FRAME / 2
-        {
-            Some(StoredValue::Inline(request.clone()))
-        } else {
-            None
-        };
+        let inline =
+            if request_bytes.len() <= flow_engine::execution_protocol::CONTROL_MAX_FRAME / 2 {
+                Some(StoredValue::Inline(request.clone()))
+            } else {
+                None
+            };
         let transfer_id = if inline.is_none() {
             let id = format!("op:{operation_id}");
             let mut offset = 0u64;
-            for chunk in request_bytes.chunks(flow_engine::execution_protocol::TRANSFER_CHUNK_BYTES) {
+            for chunk in request_bytes.chunks(flow_engine::execution_protocol::TRANSFER_CHUNK_BYTES)
+            {
                 self.outbound
                     .send(Message::TransferChunk {
                         transfer_id: id.clone(),
@@ -847,7 +832,9 @@ impl TaskRunner {
         if let Some(secret) = credential {
             request = request.bearer_auth(secret);
         }
-        let outbound_request = request.build().map_err(|e| TaskError::Invalid(e.to_string()))?;
+        let outbound_request = request
+            .build()
+            .map_err(|e| TaskError::Invalid(e.to_string()))?;
         let mut response = match client.execute(outbound_request).await {
             Ok(response) => response,
             Err(error) => {
@@ -862,7 +849,11 @@ impl TaskRunner {
             .map(|(k, v)| (k.to_string(), json!(v.to_str().unwrap_or(""))))
             .collect();
         let mut raw: Vec<u8> = Vec::new();
-        while let Some(bytes) = response.chunk().await.map_err(|e| TaskError::Uncertain(e.to_string()))? {
+        while let Some(bytes) = response
+            .chunk()
+            .await
+            .map_err(|e| TaskError::Uncertain(e.to_string()))?
+        {
             if raw.len() as u64 + bytes.len() as u64 > flow_journal::MAX_VALUE_BYTES {
                 return Err(TaskError::Http(
                     "captured value size; prefix retained".into(),
@@ -884,14 +875,19 @@ impl TaskRunner {
             self.transfers
                 .insert_ready(format!("op-body:{body_output_id}"), raw);
         }
-        let outcome = StoredValue::inline(json!({"status": status, "headers": headers, "body_raw": body_ref}))?;
+        let outcome = StoredValue::inline(
+            json!({"status": status, "headers": headers, "body_raw": body_ref}),
+        )?;
         let outcome_seq = audit.push(
             "operation_outcome",
             json!({"outcome": serde_json::to_value(&outcome)?}),
         )?;
         audit.await_durable(outcome_seq, &self.cancel).await?;
         let output = self.http_output(&outcome, kind, audit).await?;
-        Ok(ResultOutcome::Success { output, branch: None })
+        Ok(ResultOutcome::Success {
+            output,
+            branch: None,
+        })
     }
 
     /// 一期 `Attempt::http_output` 等价：状态/头/体组合或 llm/email 解析。
@@ -908,18 +904,23 @@ impl TaskRunner {
         let status = outcome_value["status"]
             .as_u64()
             .ok_or_else(|| TaskError::Invalid("invalid HTTP outcome".into()))?;
-        let raw: flow_journal::ValueRef = serde_json::from_value(outcome_value["body_raw"].clone())
-            .map_err(TaskError::from)?;
+        let raw: flow_journal::ValueRef =
+            serde_json::from_value(outcome_value["body_raw"].clone()).map_err(TaskError::from)?;
         if matches!(kind, NodeType::Llm | NodeType::Email) {
             if status >= 400 {
-                return Err(TaskError::Business(format!("HTTP {status}; outcome retained")));
+                return Err(TaskError::Business(format!(
+                    "HTTP {status}; outcome retained"
+                )));
             }
             if raw.total_bytes > 8 * 1024 * 1024 {
                 return Err(TaskError::Business(
                     "integration decoding exceeds 8 MiB; raw outcome retained".into(),
                 ));
             }
-            let bytes = self.take_transfer(&format!("op-body:{}", raw.output_id)).await.ok();
+            let bytes = self
+                .take_transfer(&format!("op-body:{}", raw.output_id))
+                .await
+                .ok();
             // 恢复路径：body 不在本进程时需要主进程送回；v1 由
             // previous_outcome 附带 raw bytes（见下）。
             let bytes = match bytes {
@@ -965,7 +966,9 @@ impl TaskRunner {
         composed.push(b'}');
         let output = store_bytes(audit, &self.journal_id, &composed, ValueCodec::Json).await?;
         if status >= 400 {
-            return Err(TaskError::Business(format!("HTTP {status}; outcome retained")));
+            return Err(TaskError::Business(format!(
+                "HTTP {status}; outcome retained"
+            )));
         }
         Ok(output)
     }
@@ -986,7 +989,10 @@ struct TaskInputs {
     nodes: Value,
 }
 
-async fn materialize_prepared_params(runner: &mut TaskRunner, prepared: &Prepared) -> Result<Value, TaskError> {
+async fn materialize_prepared_params(
+    runner: &mut TaskRunner,
+    prepared: &Prepared,
+) -> Result<Value, TaskError> {
     let mut budget = INPUT_BUDGET;
     runner
         .materialize_stored(&prepared.params, "in:prepared-params", &mut budget)
