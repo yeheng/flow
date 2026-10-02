@@ -113,25 +113,37 @@ async fn connect(
     let hello = Message::AgentHello {
         agent_boot_id: agent_boot_id.to_string(),
         build: crate::AGENT_BUILD.into(),
-        capabilities: crate::AGENT_CAPABILITIES.iter().map(|s| s.to_string()).collect(),
+        capabilities: crate::AGENT_CAPABILITIES
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         slots: config.slots,
     };
     let frame = flow_engine::execution_protocol::frame::encode_frame(&hello)
         .map_err(|e| format!("encode hello: {e}"))?;
-    control.write_all(&frame).await.map_err(|e| format!("send hello: {e}"))?;
+    control
+        .write_all(&frame)
+        .await
+        .map_err(|e| format!("send hello: {e}"))?;
     // 读 Welcome（裸帧）。
     let mut decoder = flow_engine::execution_protocol::frame::FrameDecoder::new(
         flow_engine::execution_protocol::CONTROL_MAX_FRAME,
     );
     let welcome = loop {
         let mut chunk = [0u8; 16 * 1024];
-        let n = control.read(&mut chunk).await.map_err(|e| format!("read welcome: {e}"))?;
+        let n = control
+            .read(&mut chunk)
+            .await
+            .map_err(|e| format!("read welcome: {e}"))?;
         if n == 0 {
             return Err("control closed before welcome".into());
         }
-        decoder.feed(&chunk[..n]).map_err(|e| format!("welcome frame: {e}"))?;
+        decoder
+            .feed(&chunk[..n])
+            .map_err(|e| format!("welcome frame: {e}"))?;
         if let Some(json) = decoder.pop_frame().map_err(|e| e.to_string())? {
-            let value: serde_json::Value = serde_json::from_slice(&json).map_err(|e| e.to_string())?;
+            let value: serde_json::Value =
+                serde_json::from_slice(&json).map_err(|e| e.to_string())?;
             break Message::from_envelope(value).map_err(|e| e.to_string())?;
         }
     };
@@ -160,7 +172,13 @@ async fn connect(
         .map_err(|e| format!("data tls: {e}"))?;
     let mut transport = FrameTransport::spawn_streams(control, data, 128);
     // 会话建立（发 Welcome 已收，data 绑定）。
-    let link = handshake(&mut transport, agent_boot_id, &link_session_id, data_credential).await?;
+    let link = handshake(
+        &mut transport,
+        agent_boot_id,
+        &link_session_id,
+        data_credential,
+    )
+    .await?;
     Ok((transport, link))
 }
 
@@ -181,7 +199,6 @@ pub async fn handshake(
         .map_err(|e| format!("data bind: {e}"))?;
     Ok(link_session_id.to_string())
 }
-
 
 /// 对账：分页上报 Resume 清单并应用裁决（取消项回收本地执行器）。
 pub async fn resume(
@@ -240,12 +257,19 @@ pub async fn resume(
             .await
             .map_err(|e| format!("send resume: {e}"))?;
         let reply = loop {
-            let (_, message) = transport.recv().await.map_err(|e| format!("resume reply: {e}"))?;
+            let (_, message) = transport
+                .recv()
+                .await
+                .map_err(|e| format!("resume reply: {e}"))?;
             if let Message::ResumeReply { .. } = message {
                 break message;
             }
         };
-        if let Message::ResumeReply { decisions, page: reply_page } = reply {
+        if let Message::ResumeReply {
+            decisions,
+            page: reply_page,
+        } = reply
+        {
             debug_assert_eq!(reply_page, page);
             for decision in &decisions {
                 if matches!(
@@ -277,8 +301,8 @@ async fn cancel_all(handles: &Arc<tokio::sync::Mutex<BTreeMap<String, ExecutorHa
 /// Ready 状态转发服务：断线时返回原因（执行器保留等对账）。
 pub async fn serve(
     config: &AgentConfig,
-    agent_boot_id: &str,
-    link_session_id: &str,
+    _agent_boot_id: &str,
+    _link_session_id: &str,
     mut transport: FrameTransport,
     relay: Arc<std::sync::Mutex<Relay>>,
     handles: Arc<tokio::sync::Mutex<BTreeMap<String, ExecutorHandle>>>,
@@ -296,7 +320,10 @@ pub async fn serve(
             let Some(dispatch_id) = message.dispatch_id().map(str::to_owned) else {
                 continue;
             };
-            let wrapped = relay_out.lock().unwrap().wrap_to_master(&dispatch_id, message);
+            let wrapped = relay_out
+                .lock()
+                .unwrap()
+                .wrap_to_master(&dispatch_id, message);
             match wrapped {
                 Ok(frame) => {
                     if uplink_out.send(frame).await.is_err() {
@@ -509,7 +536,10 @@ pub async fn reconnect_session(
         .send(Message::AgentHello {
             agent_boot_id: agent_boot_id.to_string(),
             build: crate::AGENT_BUILD.into(),
-            capabilities: crate::AGENT_CAPABILITIES.iter().map(|s| s.to_string()).collect(),
+            capabilities: crate::AGENT_CAPABILITIES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             slots,
         })
         .await

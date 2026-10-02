@@ -8,10 +8,10 @@
 
 pub mod contract;
 pub mod fixtures;
-pub mod remote;
-pub mod spawn;
 pub mod frame;
 pub mod message;
+pub mod remote;
+pub mod spawn;
 #[cfg(unix)]
 pub mod transport;
 

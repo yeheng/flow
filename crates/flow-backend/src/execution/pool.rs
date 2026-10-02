@@ -18,9 +18,7 @@ use flow_engine::execution_protocol::contract::{
     DRAIN_GRACE_MS, HEARTBEAT_TIMEOUT_MS, STARTUP_TIMEOUT_MS,
 };
 use flow_engine::execution_protocol::message::Message;
-use flow_engine::execution_protocol::transport::{
-    master_handshake, socketpair_channels, FrameTransport,
-};
+use flow_engine::execution_protocol::transport::{master_handshake, FrameTransport};
 
 use super::IpcOptions;
 
@@ -332,4 +330,3 @@ async fn session_driver(
     tracing::debug!(%executor_id, "executor session recycled");
     drop(transport);
 }
-

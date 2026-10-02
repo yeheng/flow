@@ -21,7 +21,11 @@ pub fn client_config_from_files(
     )
 }
 
-pub fn client_config_from_pem(ca: &[u8], cert: &[u8], key: &[u8]) -> std::io::Result<tokio_rustls::TlsConnector> {
+pub fn client_config_from_pem(
+    ca: &[u8],
+    cert: &[u8],
+    key: &[u8],
+) -> std::io::Result<tokio_rustls::TlsConnector> {
     use rustls_pemfile::{certs, private_key};
     let mut roots = rustls::RootCertStore::empty();
     for der in certs(&mut Cursor::new(ca))
@@ -30,12 +34,12 @@ pub fn client_config_from_pem(ca: &[u8], cert: &[u8], key: &[u8]) -> std::io::Re
     {
         let _ = roots.add(rustls::pki_types::CertificateDer::from(der.to_vec()));
     }
-    let client_certs: Vec<rustls::pki_types::CertificateDer<'static>> = certs(&mut Cursor::new(cert))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(bad)?
-        .into_iter()
-        .map(rustls::pki_types::CertificateDer::from)
-        .collect();
+    let client_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        certs(&mut Cursor::new(cert))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(bad)?
+            .into_iter()
+            .collect();
     let client_key = private_key(&mut Cursor::new(key))
         .map_err(bad)?
         .ok_or_else(|| bad("no private key in PEM"))?;

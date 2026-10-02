@@ -13,7 +13,10 @@ use super::transport::{socketpair_channels, ChannelPair};
 
 /// spawn 一个执行器进程并返回 (父端双通道, 子进程句柄)。
 /// `tag` 为可选诊断参数（执行器忽略未知参数）。
-pub fn spawn_executor_process(bin: &Path, tag: Option<&str>) -> std::io::Result<(ChannelPair, Child, ChannelPair)> {
+pub fn spawn_executor_process(
+    bin: &Path,
+    tag: Option<&str>,
+) -> std::io::Result<(ChannelPair, Child, ChannelPair)> {
     let (parent, child_pair) = socketpair_channels()?;
     let child_control = child_pair.control.as_raw_fd();
     let child_data = child_pair.data.as_raw_fd();

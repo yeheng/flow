@@ -74,10 +74,7 @@ impl JournalBackend {
         .await
     }
     /// 三期远程模式：epoch + TLS 监听 + 远程派发器（R1）。
-    pub async fn start_execution_remote(
-        self: &Arc<Self>,
-        options: RemoteOptions,
-    ) -> Result<()> {
+    pub async fn start_execution_remote(self: &Arc<Self>, options: RemoteOptions) -> Result<()> {
         let epoch = self.bump_master_epoch().await?;
         let manager = crate::execution::remote::AgentManager::new(
             self.clone(),

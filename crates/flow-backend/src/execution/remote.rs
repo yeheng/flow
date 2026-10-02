@@ -38,7 +38,7 @@ type BoxedStream = Pin<Box<dyn AsyncReadWrite + Send>>;
 pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Unpin> AsyncReadWrite for T {}
 
-/// 链路死亡标记（dispatch.rs 在 Dead/关闭路径写入 "link-dead: " 前缀）。
+// 链路死亡标记（dispatch.rs 在 Dead/关闭路径写入 "link-dead: " 前缀）。
 pub(crate) fn is_link_dead(error: &crate::journal::JournalError) -> bool {
     matches!(
         error,
@@ -47,7 +47,7 @@ pub(crate) fn is_link_dead(error: &crate::journal::JournalError) -> bool {
     )
 }
 
-/// 远程模式选项。
+// 远程模式选项。
 #[derive(Debug, Clone)]
 pub struct RemoteOptions {
     pub control_addr: String,
@@ -55,7 +55,7 @@ pub struct RemoteOptions {
     pub ca_cert: PathBuf,
     pub server_cert: PathBuf,
     pub server_key: PathBuf,
-    /// 断链后等待 agent 重连对账的总时限（超时按派发失败处理）。
+    // 断链后等待 agent 重连对账的总时限（超时按派发失败处理）。
     pub attach_timeout_ms: u64,
 }
 
@@ -65,20 +65,28 @@ impl RemoteOptions {
     }
 }
 
-/// TLS 服务器配置（mTLS：验证 agent 客户端证书）。
+// TLS 服务器配置（mTLS：验证 agent 客户端证书）。
 pub struct TlsServer {
     pub acceptor: TlsAcceptor,
 }
 
-/// 安装进程级 CryptoProvider（多 crate 启用不同 provider 时必须显式选择；
-/// 幂等，重复安装忽略）。
+// 安装进程级 CryptoProvider（多 crate 启用不同 provider 时必须显式选择；
+// 幂等，重复安装忽略）。
 pub fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 impl TlsServer {
-    pub fn from_files(ca: &std::path::Path, cert: &std::path::Path, key: &std::path::Path) -> std::io::Result<Self> {
-        Self::from_pem(&std::fs::read(ca)?, &std::fs::read(cert)?, &std::fs::read(key)?)
+    pub fn from_files(
+        ca: &std::path::Path,
+        cert: &std::path::Path,
+        key: &std::path::Path,
+    ) -> std::io::Result<Self> {
+        Self::from_pem(
+            &std::fs::read(ca)?,
+            &std::fs::read(cert)?,
+            &std::fs::read(key)?,
+        )
     }
 
     pub fn from_pem(ca: &[u8], cert: &[u8], key: &[u8]) -> std::io::Result<Self> {
@@ -97,12 +105,12 @@ impl TlsServer {
         let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
             .build()
             .map_err(bad_data)?;
-        let server_certs: Vec<rustls::pki_types::CertificateDer<'static>> = certs(&mut Cursor::new(cert))
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(bad_data)?
-            .into_iter()
-            .map(rustls::pki_types::CertificateDer::from)
-            .collect();
+        let server_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+            certs(&mut Cursor::new(cert))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(bad_data)?
+                .into_iter()
+                .collect();
         let server_key = private_key(&mut Cursor::new(key))
             .map_err(bad_data)?
             .ok_or_else(|| bad_data("no private key in PEM"))?;
@@ -120,7 +128,7 @@ fn bad_data<E: std::fmt::Display>(e: E) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
 }
 
-/// 提取证书 CN（TLS 身份映射 agent_id；不信客户端自报字段）。
+// 提取证书 CN（TLS 身份映射 agent_id；不信客户端自报字段）。
 pub fn cert_common_name(der: &[u8]) -> Option<String> {
     use x509_parser::prelude::FromDer;
     let (rest, cert) = x509_parser::certificate::X509Certificate::from_der(der).ok()?;
@@ -136,33 +144,33 @@ pub fn cert_common_name(der: &[u8]) -> Option<String> {
     cn
 }
 
-/// attach 等待的裁决结果。
+// attach 等待的裁决结果。
 pub(crate) enum AttachOutcome {
-    /// agent 会话活跃：给出可驱动链路。
+    // agent 会话活跃：给出可驱动链路。
     Link(DispatchLink),
-    /// 结果已在权威日志（AlreadyCommitted）。
+    // 结果已在权威日志（AlreadyCommitted）。
     Committed,
-    /// 取消/废止（CancelAndDrain）。
+    // 取消/废止（CancelAndDrain）。
     Cancelled(String),
-    /// 执行器丢失/boot 变化/缺数据（ReconcileRequired 或 agent 未上报）。
+    // 执行器丢失/boot 变化/缺数据（ReconcileRequired 或 agent 未上报）。
     Lost(String),
 }
 
-/// 会话侧持有的路由（dispatch → 事件通道）。
+// 会话侧持有的路由（dispatch → 事件通道）。
 struct SessionRouting {
     envelope: RouteEnvelope,
     events: mpsc::Sender<crate::execution::pool::FromSession>,
 }
 
-/// 跨会话存活的派发绑定。
+// 跨会话存活的派发绑定。
 struct BoundDispatch {
     agent_id: String,
-    /// 容量许可（drop 即释放槽位）。
+    // 容量许可（drop 即释放槽位）。
     slot_permit: tokio::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
     executor_boot_id: Mutex<Option<String>>,
     run_id: String,
     node_id: String,
-    /// 活跃链路（等待被 dispatcher 取走驱动）。
+    // 活跃链路（等待被 dispatcher 取走驱动）。
     pending_link: Mutex<Option<DispatchLink>>,
     verdict: Mutex<Option<AttachOutcome>>,
     notify: Notify,
@@ -175,12 +183,12 @@ struct AgentRegistration {
     outbound: mpsc::Sender<ToSession>,
     slots_total: AtomicU64,
     slots_used: AtomicU64,
-    /// 槽位信号量：等待空位而非立即失败（容量准入，三期 §1.6）。
+    // 槽位信号量：等待空位而非立即失败（容量准入，三期 §1.6）。
     slots_sem: Arc<Semaphore>,
     bind_acks: Mutex<BTreeMap<String, oneshot::Sender<Result<String>>>>,
 }
 
-/// Agent 管理器：上联会话注册表 + 全局 A_max 准入 + Resume 裁决。
+// Agent 管理器：上联会话注册表 + 全局 A_max 准入 + Resume 裁决。
 pub struct AgentManager {
     backend: Arc<JournalBackend>,
     journal_id: String,
@@ -195,8 +203,8 @@ pub struct AgentManager {
     shutdown: tokio_util::sync::CancellationToken,
 }
 
-/// 等待 data 流汇入的槽（control 先握手，data 后合并——避免双方互等的
-/// 协议死锁：agent 收到 Welcome 才发起 data 连接）。
+// 等待 data 流汇入的槽（control 先握手，data 后合并——避免双方互等的
+// 协议死锁：agent 收到 Welcome 才发起 data 连接）。
 struct PendingData {
     data: tokio::sync::Mutex<Option<BoxedStream>>,
     notify: Notify,
@@ -226,16 +234,17 @@ impl AgentManager {
         })
     }
 
-    /// 全局活跃派发准入（A_max）。
+    // 全局活跃派发准入（A_max）。
     pub(crate) fn global_slots(&self) -> &Arc<Semaphore> {
         &self.global
     }
 
-    /// TLS 监听入口（真实网络，三期 §1.2）。
+    // TLS 监听入口（真实网络，三期 §1.2）。
     pub async fn listen_tls(self: &Arc<Self>, options: RemoteOptions) -> Result<()> {
         install_crypto_provider();
-        let tls = TlsServer::from_files(&options.ca_cert, &options.server_cert, &options.server_key)
-            .map_err(|e| invalid(format!("agent TLS config: {e}")))?;
+        let tls =
+            TlsServer::from_files(&options.ca_cert, &options.server_cert, &options.server_key)
+                .map_err(|e| invalid(format!("agent TLS config: {e}")))?;
         let control = TcpListener::bind(&options.control_addr)
             .await
             .map_err(|e| invalid(format!("agent control listen: {e}")))?;
@@ -254,11 +263,15 @@ impl AgentManager {
             let manager = self.clone();
             tokio::spawn(async move {
                 loop {
-                    let Ok((socket, _)) = listener.accept().await else { return };
+                    let Ok((socket, _)) = listener.accept().await else {
+                        return;
+                    };
                     let acceptor = acceptor.clone();
                     let manager = manager.clone();
                     tokio::spawn(async move {
-                        let Ok(stream) = acceptor.accept(socket).await else { return };
+                        let Ok(stream) = acceptor.accept(socket).await else {
+                            return;
+                        };
                         let agent_id = stream
                             .get_ref()
                             .1
@@ -269,8 +282,14 @@ impl AgentManager {
                             tracing::warn!("agent TLS connection without client cert");
                             return;
                         };
-                        let side = if is_control { Side::Control } else { Side::Data };
-                        manager.inject_stream(agent_id, side, Box::pin(stream)).await;
+                        let side = if is_control {
+                            Side::Control
+                        } else {
+                            Side::Data
+                        };
+                        manager
+                            .inject_stream(agent_id, side, Box::pin(stream))
+                            .await;
                     });
                 }
             });
@@ -278,7 +297,7 @@ impl AgentManager {
         Ok(())
     }
 
-    /// R0 模拟中继入口：直接注入双流（无 TLS；身份由注入方保证）。
+    // R0 模拟中继入口：直接注入双流（无 TLS；身份由注入方保证）。
     pub async fn attach_inprocess(
         self: &Arc<Self>,
         agent_id: String,
@@ -287,14 +306,15 @@ impl AgentManager {
     ) {
         self.inject_stream(agent_id.clone(), Side::Control, Box::pin(control))
             .await;
-        self.inject_stream(agent_id, Side::Data, Box::pin(data)).await;
+        self.inject_stream(agent_id, Side::Data, Box::pin(data))
+            .await;
     }
 
     async fn inject_stream(self: &Arc<Self>, agent_id: String, side: Side, stream: BoxedStream) {
         match side {
             Side::Control => {
                 // control 到达即启动会话：先裸帧握手（Hello/Welcome），
-                /// 再等 data 流汇入完成 DataBind。
+                // 再等 data 流汇入完成 DataBind。
                 let manager = self.clone();
                 let agent_id = agent_id.clone();
                 tokio::spawn(async move {
@@ -322,8 +342,8 @@ impl AgentManager {
         }
     }
 
-    /// 单个 agent 会话：control 先裸帧握手（Hello/Welcome），随后等 data
-    /// 流汇入并完成 DataBind → 转发。
+    // 单个 agent 会话：control 先裸帧握手（Hello/Welcome），随后等 data
+    // 流汇入并完成 DataBind → 转发。
     async fn run_session(
         self: &Arc<Self>,
         agent_id: String,
@@ -418,17 +438,14 @@ impl AgentManager {
                 })
                 .clone()
         };
-        let data = tokio::time::timeout(
-            Duration::from_millis(STARTUP_TIMEOUT_MS * 4),
-            async {
-                loop {
-                    if let Some(data) = data_slot.data.lock().await.take() {
-                        return Ok::<BoxedStream, ()>(data);
-                    }
-                    data_slot.notify.notified().await;
+        let data = tokio::time::timeout(Duration::from_millis(STARTUP_TIMEOUT_MS * 4), async {
+            loop {
+                if let Some(data) = data_slot.data.lock().await.take() {
+                    return Ok::<BoxedStream, ()>(data);
                 }
-            },
-        )
+                data_slot.notify.notified().await;
+            }
+        })
         .await
         .map_err(|_| "data connection timeout".to_string())?
         .map_err(|_| "data connection cancelled".to_string())?;
@@ -437,35 +454,34 @@ impl AgentManager {
         let data = tokio::io::BufStream::new(data);
         let mut transport = FrameTransport::spawn_streams(control, data, 128);
         // 3) data 首帧 DataBind（防连接串配：同主体、boot、会话、一次性凭据）。
-        let bound = tokio::time::timeout(
-            Duration::from_millis(STARTUP_TIMEOUT_MS * 2),
-            async {
-                loop {
-                    let (channel, message) = transport.recv().await?;
-                    if channel == flow_engine::execution_protocol::Channel::Data {
-                        if let Message::DataBind {
-                            agent_boot_id: bind_boot,
-                            link_session_id: bind_session,
-                            credential,
-                        } = message
+        tokio::time::timeout(Duration::from_millis(STARTUP_TIMEOUT_MS * 2), async {
+            loop {
+                let (channel, message) = transport.recv().await?;
+                if channel == flow_engine::execution_protocol::Channel::Data {
+                    if let Message::DataBind {
+                        agent_boot_id: bind_boot,
+                        link_session_id: bind_session,
+                        credential,
+                    } = message
+                    {
+                        if bind_boot != agent_boot_id
+                            || bind_session != link_session_id
+                            || credential != data_credential
                         {
-                            if bind_boot != agent_boot_id
-                                || bind_session != link_session_id
-                                || credential != data_credential
-                            {
-                                return Err(ProtocolError::Malformed("data bind mismatch".into()));
-                            }
-                            return Ok(());
+                            return Err(ProtocolError::Malformed("data bind mismatch".into()));
                         }
-                        return Err(ProtocolError::Malformed("expected DataBind on data channel".into()));
+                        return Ok(());
                     }
+                    return Err(ProtocolError::Malformed(
+                        "expected DataBind on data channel".into(),
+                    ));
                 }
-            },
-        )
+            }
+        })
         .await
         .map_err(|_| "data bind timeout".to_string())?
         .map_err(|e: ProtocolError| e.to_string())?;
-        let _ = bound;
+        ();
 
         // 3) 注册会话（替换旧会话：旧 outbound 关闭 → 相关 runner link-dead）。
         let (outbound, mut commands) = mpsc::channel::<ToSession>(256);
@@ -486,9 +502,10 @@ impl AgentManager {
             .insert(agent_id.clone(), registration.clone());
         if let Some(previous) = previous {
             // 迁移在飞占用（计数与许可都延续，不重置准入水位）。
-            registration
-                .slots_used
-                .store(previous.slots_used.load(Ordering::Relaxed), Ordering::Relaxed);
+            registration.slots_used.store(
+                previous.slots_used.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
             for _ in 0..previous.slots_used.load(Ordering::Relaxed) {
                 let _ = registration.slots_sem.clone().acquire_owned().await;
             }
@@ -504,7 +521,7 @@ impl AgentManager {
                         match command {
                             ToSession::Send(message) => {
                                 // 业务帧按已确认路由包装；管理帧
-                                /// （BindExecutor/ResumeReply/Drain…）直接发送。
+                                // （BindExecutor/ResumeReply/Drain…）直接发送。
                                 let frame = if
                                     flow_engine::execution_protocol::remote::routable(&message)
                                 {
@@ -561,7 +578,7 @@ impl AgentManager {
                                 }
                                 let Some(routing) = routings.get(&envelope.dispatch_id.clone().unwrap_or_default()) else {
                                     // 未绑定/错路由：明确拒绝（协议错误关闭会话），
-                                    /// 不进入权威日志。
+                                    // 不进入权威日志。
                                     return Err(format!(
                                         "routed frame for unbound dispatch rejected: {agent_id}"
                                     ));
@@ -751,12 +768,8 @@ impl AgentManager {
         }
     }
 
-    /// Resume 裁决（三期 §1.4 表）：以主日志为准，不信 agent 自报游标。
-    async fn adjudicate_resume(
-        &self,
-        agent_id: &str,
-        items: &[ResumeItem],
-    ) -> Vec<ResumeDecision> {
+    // Resume 裁决（三期 §1.4 表）：以主日志为准，不信 agent 自报游标。
+    async fn adjudicate_resume(&self, agent_id: &str, items: &[ResumeItem]) -> Vec<ResumeDecision> {
         let _ = agent_id;
         let state = self.backend.state().await;
         let bindings = self.bindings.lock().await;
@@ -776,13 +789,8 @@ impl AgentManager {
             .collect()
     }
 
-    /// 对绑定写入终局裁决并移除（唤醒等待方）。
-    async fn resolve_binding(
-        &self,
-        dispatch_id: &str,
-        outcome: AttachOutcome,
-        remove: bool,
-    ) {
+    // 对绑定写入终局裁决并移除（唤醒等待方）。
+    async fn resolve_binding(&self, dispatch_id: &str, outcome: AttachOutcome, remove: bool) {
         let binding = if remove {
             self.bindings.lock().await.remove(dispatch_id)
         } else {
@@ -798,7 +806,7 @@ impl AgentManager {
         }
     }
 
-    /// resume 清单未上报的该 agent 绑定 → Lost（执行器已死/失联）。
+    // resume 清单未上报的该 agent 绑定 → Lost（执行器已死/失联）。
     async fn mark_unreported_lost(&self, agent_id: &str, items: &[ResumeItem]) {
         let reported: std::collections::BTreeSet<&str> =
             items.iter().map(|item| item.dispatch_id.as_str()).collect();
@@ -821,7 +829,7 @@ impl AgentManager {
         }
     }
 
-    /// 为 resume 中可继续的项建立新链路并唤醒等待的 dispatcher。
+    // 为 resume 中可继续的项建立新链路并唤醒等待的 dispatcher。
     #[allow(clippy::too_many_arguments)]
     async fn attach_resumed(
         &self,
@@ -836,7 +844,9 @@ impl AgentManager {
             let binding = self.bindings.lock().await.get(&item.dispatch_id).cloned();
             let Some(binding) = binding else { continue };
             let bound_boot = binding.executor_boot_id.lock().await.clone();
-            let Some(executor_boot_id) = bound_boot else { continue };
+            let Some(executor_boot_id) = bound_boot else {
+                continue;
+            };
             let envelope = RouteEnvelope {
                 agent_id: agent_id.to_string(),
                 agent_boot_id: agent_boot_id.to_string(),
@@ -865,7 +875,7 @@ impl AgentManager {
         }
     }
 
-    /// 绑定一个派发到某 agent 的本地执行器（BindExecutor → 确认）。
+    // 绑定一个派发到某 agent 的本地执行器（BindExecutor → 确认）。
     pub(crate) async fn bind_executor(
         self: &Arc<Self>,
         dispatch_id: String,
@@ -873,20 +883,23 @@ impl AgentManager {
         node_id: String,
     ) -> Result<mpsc::Receiver<crate::execution::pool::FromSession>> {
         // 选择：占用最少的已连接 agent；空位等待由槽位信号量承担
-        ///（不立即失败，三期 §1.6）。
+        //（不立即失败，三期 §1.6）。
         let pick = {
             let agents = self.agents.lock().await;
             let mut best: Option<(Arc<AgentRegistration>, u64, u64)> = None;
             for registration in agents.values() {
                 let total = registration.slots_total.load(Ordering::Relaxed);
                 let used = registration.slots_used.load(Ordering::Relaxed);
-                if best.as_ref().is_none_or(|(_, _, used_so_far)| used < *used_so_far) {
+                if best
+                    .as_ref()
+                    .is_none_or(|(_, _, used_so_far)| used < *used_so_far)
+                {
                     best = Some((registration.clone(), total, used));
                 }
             }
             best
         };
-        let Some((registration, _total, used)) = pick else {
+        let Some((registration, _total, _used)) = pick else {
             return Err(invalid("no agent connected"));
         };
         // 等待空位（容量准入不立即失败）。
@@ -896,9 +909,7 @@ impl AgentManager {
             .acquire_owned()
             .await
             .map_err(|_| invalid("agent session closed while waiting for slot"))?;
-        registration
-            .slots_used
-            .fetch_add(1, Ordering::Relaxed);
+        registration.slots_used.fetch_add(1, Ordering::Relaxed);
         let executor_id = format!(
             "exec-{}@{}",
             self.agent_counter.fetch_add(1, Ordering::Relaxed),
@@ -937,7 +948,7 @@ impl AgentManager {
             .await
             .map_err(|_| invalid("agent session closed before bind"))?;
         match tokio::time::timeout(Duration::from_millis(STARTUP_TIMEOUT_MS * 4), ack_rx).await {
-            Ok(Ok(Ok(boot))) => Ok(rx),
+            Ok(Ok(Ok(_boot))) => Ok(rx),
             Ok(Ok(Err(error))) => {
                 self.bindings.lock().await.remove(&dispatch_id);
                 registration.slots_used.fetch_sub(1, Ordering::Relaxed);
@@ -951,7 +962,7 @@ impl AgentManager {
         }
     }
 
-    /// 取走绑定的活跃链路；无则等待重连裁决（Resume）或超时。
+    // 取走绑定的活跃链路；无则等待重连裁决（Resume）或超时。
     pub(crate) async fn wait_attach(
         self: &Arc<Self>,
         dispatch_id: &str,
@@ -979,7 +990,7 @@ impl AgentManager {
         }
     }
 
-    /// 派发结束：解除绑定并通知 agent 取消残留执行（若非正常完成）。
+    // 派发结束：解除绑定并通知 agent 取消残留执行（若非正常完成）。
     pub(crate) async fn unbind(self: &Arc<Self>, dispatch_id: &str, healthy: bool) {
         let binding = self.bindings.lock().await.remove(dispatch_id);
         if let Some(binding) = binding {
@@ -987,11 +998,11 @@ impl AgentManager {
             *binding.slot_permit.lock().await = None;
             if let Some(registration) = self.agents.lock().await.get(&binding.agent_id).cloned() {
                 // 安全递减（会话替换后的计数以当前水位为准，不下溢）。
-                let _ = registration
-                    .slots_used
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                        used.checked_sub(1)
-                    });
+                let _ = registration.slots_used.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |used| used.checked_sub(1),
+                );
                 if !healthy {
                     let _ = registration
                         .outbound
@@ -1002,8 +1013,8 @@ impl AgentManager {
         }
     }
 
-    /// 取绑定 agent 当前会话的 outbound（会话已死时返回死通道：发送立即
-    /// 失败 → runner 走 link-dead → 等待重连裁决）。
+    // 取绑定 agent 当前会话的 outbound（会话已死时返回死通道：发送立即
+    // 失败 → runner 走 link-dead → 等待重连裁决）。
     pub(crate) async fn active_outbound(&self, dispatch_id: &str) -> mpsc::Sender<ToSession> {
         let binding = self.bindings.lock().await.get(dispatch_id).cloned();
         if let Some(binding) = binding {
@@ -1014,8 +1025,8 @@ impl AgentManager {
         dead_to_session()
     }
 
-    /// 发送 drain：agent 停止接新派发、取消在飞、转发最后确认后退出
-    /// （三期 §1.6）。
+    // 发送 drain：agent 停止接新派发、取消在飞、转发最后确认后退出
+    // （三期 §1.6）。
     pub async fn drain(&self, agent_id: &str, grace_ms: u64) -> Result<()> {
         let agents = self.agents.lock().await;
         let registration = agents
@@ -1045,10 +1056,10 @@ enum Side {
     Data,
 }
 
-/// 依主日志裁决单项 resume（三期 §1.4 表）：run 终态/派发被替代 →
-/// CancelAndDrain；结果已提交 → AlreadyCommitted；boot 不符或缺口且无
-/// 封口结果 → ReconcileRequired；否则续跑（UploadOnly/SubmitExistingResult，
-/// 权威游标由重挂后的 ack 流传达）。
+// 依主日志裁决单项 resume（三期 §1.4 表）：run 终态/派发被替代 →
+// CancelAndDrain；结果已提交 → AlreadyCommitted；boot 不符或缺口且无
+// 封口结果 → ReconcileRequired；否则续跑（UploadOnly/SubmitExistingResult，
+// 权威游标由重挂后的 ack 流传达）。
 fn adjudicate_against_journal(
     state: &flow_engine::journal_state::State,
     binding: &BoundDispatch,
@@ -1092,7 +1103,7 @@ fn adjudicate_against_journal(
     }
 }
 
-/// resume 场景的包络（executor_id 以绑定记录为准由 attach_resumed 重建）。
+// resume 场景的包络（executor_id 以绑定记录为准由 attach_resumed 重建）。
 fn resume_envelope(
     agent_id: &str,
     agent_boot_id: &str,
@@ -1109,10 +1120,10 @@ fn resume_envelope(
     }
 }
 
-/// 远程派发器：journal_driver 的第三执行端口（三期 §1.1）。
-///
-/// 断链时派发挂起等待 agent 重连对账（不立即失败、不重新执行）；重挂后
-/// 继续驱动同一 runner（账本/屏障状态保留），结果/审计按既有序列幂等推进。
+// 远程派发器：journal_driver 的第三执行端口（三期 §1.1）。
+//
+// 断链时派发挂起等待 agent 重连对账（不立即失败、不重新执行）；重挂后
+// 继续驱动同一 runner（账本/屏障状态保留），结果/审计按既有序列幂等推进。
 #[derive(Clone)]
 pub struct RemoteDispatcher {
     manager: Arc<AgentManager>,
@@ -1153,12 +1164,8 @@ impl RemoteDispatcher {
             )
             .await
             .map_err(crate::journal::JournalError::from)?;
-        let mut runner = DispatchRunner::runner(
-            attempt.clone(),
-            node.clone(),
-            predecessors,
-            observations,
-        );
+        let mut runner =
+            DispatchRunner::runner(attempt.clone(), node.clone(), predecessors, observations);
         let dispatch_id = attempt.dispatch_id.clone();
         let mut resume = false;
         loop {

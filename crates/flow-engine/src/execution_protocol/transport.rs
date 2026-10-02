@@ -127,7 +127,8 @@ impl FrameTransport {
         // 读写半拆分：读任务与串行写任务各自持有独立句柄。
         let (control_read, control_write) = tokio::io::split(control);
         let (data_read, data_write) = tokio::io::split(data);
-        let control_read: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>> = Box::pin(control_read);
+        let control_read: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>> =
+            Box::pin(control_read);
         let reader_control = tokio::spawn(read_loop(
             control_read,
             Channel::Control,

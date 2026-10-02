@@ -64,7 +64,7 @@ async fn proxy_pair(
     agent_id: &str,
 ) -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
     // (agent 侧流, master 侧代理持有) ×2 —— 简化：agent 侧直连 pair；
-    /// master 侧经代理由我们持柄。
+    // master 侧经代理由我们持柄。
     let (agent_control, master_a) = tokio::io::duplex(256 * 1024);
     let (test_control, master_b) = tokio::io::duplex(256 * 1024);
     tokio::spawn(bidirectional_copy(master_a, master_b));
@@ -77,10 +77,7 @@ async fn proxy_pair(
     (agent_control, agent_data)
 }
 
-async fn bidirectional_copy(
-    a: tokio::io::DuplexStream,
-    b: tokio::io::DuplexStream,
-) {
+async fn bidirectional_copy(a: tokio::io::DuplexStream, b: tokio::io::DuplexStream) {
     let (mut ra, mut wa) = tokio::io::split(a);
     let (mut rb, mut wb) = tokio::io::split(b);
     let _ = tokio::join!(
@@ -89,7 +86,8 @@ async fn bidirectional_copy(
     );
 }
 
-type Handles = Arc<tokio::sync::Mutex<std::collections::BTreeMap<String, flow_agent::pool::ExecutorHandle>>>;
+type Handles =
+    Arc<tokio::sync::Mutex<std::collections::BTreeMap<String, flow_agent::pool::ExecutorHandle>>>;
 
 /// 启动完整 in-process agent 会话（首次连接）。
 async fn start_agent(
@@ -169,8 +167,7 @@ async fn until(b: &Arc<JournalBackend>, run_id: &str, predicate: impl Fn(&Run) -
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "off".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "off".into()),
         )
         .try_init();
 }
@@ -235,9 +232,15 @@ async fn uplink_drop_then_reconnect_resumes_without_double_execution() {
     tokio::spawn(async move {
         let transport = FrameTransport::spawn_streams(control, data, 128);
         let boot = flow_engine::execution_protocol::transport::fresh_boot_id();
-        let (_link, reason) =
-            flow_agent::runtime::reconnect_session(&config, transport, &boot, 4, handles_reconnect, shutdown)
-                .await;
+        let (_link, reason) = flow_agent::runtime::reconnect_session(
+            &config,
+            transport,
+            &boot,
+            4,
+            handles_reconnect,
+            shutdown,
+        )
+        .await;
         let _ = reason;
     });
     let done = until(&backend, &run_id, Run::terminal).await;
@@ -279,7 +282,9 @@ async fn cancel_during_disconnect_drains_after_resume() {
     let hang_addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         loop {
-            let Ok((socket, _)) = listener.accept().await else { return };
+            let Ok((socket, _)) = listener.accept().await else {
+                return;
+            };
             std::mem::forget(socket);
         }
     });
@@ -311,16 +316,24 @@ async fn cancel_during_disconnect_drains_after_resume() {
     tokio::spawn(async move {
         let transport = FrameTransport::spawn_streams(control, data, 128);
         let boot = flow_engine::execution_protocol::transport::fresh_boot_id();
-        let (link, reason) =
-            flow_agent::runtime::reconnect_session(&config, transport, &boot, 4, handles_reconnect, shutdown)
-                .await;
+        let (link, reason) = flow_agent::runtime::reconnect_session(
+            &config,
+            transport,
+            &boot,
+            4,
+            handles_reconnect,
+            shutdown,
+        )
+        .await;
         eprintln!("RECONNECT-DONE link={link} reason={reason}");
     });
     // 等取消 + 封口（重连 resume → CancelAndDrain → 包装器封口）。
     let done = until(&backend, &run_id, |r| {
         r.status == "cancelled"
             && r.nodes.get("h").is_some_and(|n| {
-                n.attempts.get(n.dispatch_id.as_str()).is_some_and(|a| a.sealed)
+                n.attempts
+                    .get(n.dispatch_id.as_str())
+                    .is_some_and(|a| a.sealed)
             })
     })
     .await;

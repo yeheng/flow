@@ -44,7 +44,16 @@ fn agent_bin() -> std::path::PathBuf {
 }
 
 /// 生成测试 PKI：CA + server(flow-server) + agent(CN=agent_id)。
-fn generate_pki(dir: &std::path::Path, agent_cn: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+fn generate_pki(
+    dir: &std::path::Path,
+    agent_cn: &str,
+) -> (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
     use rcgen::{CertificateParams, KeyPair};
     let ca_key = KeyPair::generate().unwrap();
     let mut ca_params = CertificateParams::new(vec![]).unwrap();
@@ -52,8 +61,7 @@ fn generate_pki(dir: &std::path::Path, agent_cn: &str) -> (std::path::PathBuf, s
     let ca_cert = ca_params.self_signed(&ca_key).unwrap();
 
     let server_key = KeyPair::generate().unwrap();
-    let mut server_params =
-        CertificateParams::new(vec!["flow-server".to_string()]).unwrap();
+    let mut server_params = CertificateParams::new(vec!["flow-server".to_string()]).unwrap();
     server_params.distinguished_name.push(
         rcgen::DnType::CommonName,
         rcgen::DnValue::Utf8String("flow-server".into()),
@@ -86,7 +94,11 @@ fn generate_pki(dir: &std::path::Path, agent_cn: &str) -> (std::path::PathBuf, s
     )
 }
 
-fn remote_options(dir: &std::path::Path, control: u16, data: u16) -> flow_backend::execution::remote::RemoteOptions {
+fn remote_options(
+    dir: &std::path::Path,
+    control: u16,
+    data: u16,
+) -> flow_backend::execution::remote::RemoteOptions {
     flow_backend::execution::remote::RemoteOptions {
         control_addr: format!("127.0.0.1:{control}"),
         data_addr: format!("127.0.0.1:{data}"),
@@ -197,8 +209,7 @@ async fn until(b: &Arc<JournalBackend>, run_id: &str, predicate: impl Fn(&Run) -
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "off".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "off".into()),
         )
         .try_init();
 }
@@ -261,7 +272,12 @@ async fn tls_agent_end_to_end_business() {
             let root = backend.journal.root().to_path_buf();
             let upper = backend.journal.durable_lsn();
             let value = tokio::task::spawn_blocking(move || {
-                flow_journal::value::materialize(&root, upper, &StoredValue::Ref(reference), 8 * 1024 * 1024)
+                flow_journal::value::materialize(
+                    &root,
+                    upper,
+                    &StoredValue::Ref(reference),
+                    8 * 1024 * 1024,
+                )
             })
             .await
             .unwrap()
@@ -277,8 +293,8 @@ async fn tls_agent_end_to_end_business() {
 async fn wrong_data_credential_rejected_and_single_cancel_keeps_uplink() {
     // 凭据校验（管理级）：data 绑定凭据错误 → 会话拒绝。
     // 这里用进程内注入验证（无需完整 agent）：错误 DataBind 后会话关闭。
-    use flow_engine::execution_protocol::Message;
     use flow_engine::execution_protocol::transport::FrameTransport;
+    use flow_engine::execution_protocol::Message;
     let dir = temp();
     std::fs::create_dir_all(&dir).unwrap();
     let backend = JournalBackend::open(&dir.join("data"), JournalOptions::default())
@@ -359,7 +375,9 @@ async fn single_task_cancel_keeps_agent_uplink_alive() {
     let hang_addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         loop {
-            let Ok((socket, _)) = listener.accept().await else { return };
+            let Ok((socket, _)) = listener.accept().await else {
+                return;
+            };
             std::mem::forget(socket);
         }
     });
@@ -401,7 +419,10 @@ async fn single_task_cancel_keeps_agent_uplink_alive() {
         .unwrap();
     let ok_run = created.result["run_id"].as_str().unwrap().to_string();
     let done = until(&backend, &ok_run, Run::terminal).await;
-    assert_eq!(done.status, "succeeded", "uplink must survive single cancel");
+    assert_eq!(
+        done.status, "succeeded",
+        "uplink must survive single cancel"
+    );
     drop(agent);
     backend.close().await.unwrap();
     std::fs::remove_dir_all(&dir).unwrap();

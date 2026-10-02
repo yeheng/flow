@@ -5,8 +5,8 @@
 //! 落回进程内执行。
 
 pub mod dispatch;
-pub mod remote;
 pub mod pool;
+pub mod remote;
 
 use std::path::{Path, PathBuf};
 

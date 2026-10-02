@@ -289,7 +289,6 @@ impl TaskRunner {
         }
     }
 
-
     /// 装配 run 输入与前驱输出（inline 即用，Ref 等 transfer）。
     async fn materialize_inputs(&mut self, timeout: Duration) -> Result<TaskInputs, TaskError> {
         let mut budget = INPUT_BUDGET;

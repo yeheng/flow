@@ -6,9 +6,9 @@
 //! 不可包装转发）。
 
 use flow_agent::runtime::AgentConfig;
-use flow_engine::execution_protocol::Message;
 use flow_backend::journal::JournalBackend;
 use flow_engine::execution_protocol::transport::FrameTransport;
+use flow_engine::execution_protocol::Message;
 use flow_engine::journal_state::Run;
 use flow_journal::{JournalOptions, StoredValue};
 use serde_json::{json, Value};
@@ -78,11 +78,7 @@ async fn spawn_simulated_agent(
             .send(flow_engine::execution_protocol::Message::AgentHello {
                 agent_boot_id: boot.clone(),
                 build: "sim".into(),
-                capabilities: vec![
-                    "relay".into(),
-                    "resource_report".into(),
-                    "reconnect".into(),
-                ],
+                capabilities: vec!["relay".into(), "resource_report".into(), "reconnect".into()],
                 slots,
             })
             .await
@@ -116,14 +112,9 @@ async fn spawn_simulated_agent(
             link_session_id,
         )));
         let handles = Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
-        let reason = flow_agent::runtime::serve_for_tests(
-            &config,
-            transport,
-            relay,
-            handles,
-            shutdown,
-        )
-        .await;
+        let reason =
+            flow_agent::runtime::serve_for_tests(&config, transport, relay, handles, shutdown)
+                .await;
         let _ = reason;
     });
 }
@@ -192,8 +183,7 @@ const WORKFLOW: &str = r#"{
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "off".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "off".into()),
         )
         .try_init();
 }

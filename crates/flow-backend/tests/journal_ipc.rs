@@ -691,7 +691,9 @@ async fn ipc_mixed_business_matrix() {
     let hang_addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         loop {
-            let Ok((socket, _)) = listener.accept().await else { return };
+            let Ok((socket, _)) = listener.accept().await else {
+                return;
+            };
             std::mem::forget(socket);
         }
     });
@@ -701,7 +703,9 @@ async fn ipc_mixed_business_matrix() {
     tokio::spawn(async move {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         loop {
-            let Ok((mut socket, _)) = ok_listener.accept().await else { return };
+            let Ok((mut socket, _)) = ok_listener.accept().await else {
+                return;
+            };
             let mut buffer = [0; 4096];
             let mut seen = Vec::new();
             loop {
@@ -788,10 +792,7 @@ async fn ipc_mixed_business_matrix() {
                 // 等授权提交后取消（制造真实取消竞争窗口）。
                 loop {
                     let run = backend.state().await.runs[&run_id].clone();
-                    let authorized = run
-                        .nodes
-                        .get("h")
-                        .is_some_and(|n| n.operation.is_some());
+                    let authorized = run.nodes.get("h").is_some_and(|n| n.operation.is_some());
                     let terminal = run.terminal();
                     if authorized || terminal {
                         break;
@@ -858,13 +859,37 @@ async fn ipc_mixed_business_matrix() {
         }
     }
     eprintln!("ipc mixed matrix (release):");
-    eprintln!("  runs={} terminal={}", runs, terminal_count.load(Ordering::Relaxed));
-    eprintln!("  wall={:.3}s ({:.1} run/s)", elapsed.as_secs_f64(), runs as f64 / elapsed.as_secs_f64());
-    eprintln!("  latency ms: p50={:.1} p99={:.1} max={:.1}", pct(0.50), pct(0.99), pct(1.0));
-    eprintln!("  master RSS {} KiB; executors alive={} peak_rss {} KiB", master_rss, executor_pids.len(), executor_peak);
+    eprintln!(
+        "  runs={} terminal={}",
+        runs,
+        terminal_count.load(Ordering::Relaxed)
+    );
+    eprintln!(
+        "  wall={:.3}s ({:.1} run/s)",
+        elapsed.as_secs_f64(),
+        runs as f64 / elapsed.as_secs_f64()
+    );
+    eprintln!(
+        "  latency ms: p50={:.1} p99={:.1} max={:.1}",
+        pct(0.50),
+        pct(0.99),
+        pct(1.0)
+    );
+    eprintln!(
+        "  master RSS {} KiB; executors alive={} peak_rss {} KiB",
+        master_rss,
+        executor_pids.len(),
+        executor_peak
+    );
     assert_eq!(terminal_count.load(Ordering::Relaxed), runs);
-    assert!(master_rss < 512 * 1024, "master RSS bounded: {master_rss} KiB");
-    assert!(executor_peak < 256 * 1024, "executor RSS bounded: {executor_peak} KiB");
+    assert!(
+        master_rss < 512 * 1024,
+        "master RSS bounded: {master_rss} KiB"
+    );
+    assert!(
+        executor_peak < 256 * 1024,
+        "executor RSS bounded: {executor_peak} KiB"
+    );
     backend.close().await.unwrap();
     // 回收无遗留。
     tokio::time::timeout(Duration::from_secs(10), async {

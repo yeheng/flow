@@ -775,7 +775,9 @@ impl Message {
                 "link_session_id": link_session_id,
                 "credential": credential,
             })),
-            Message::CapacityReport { capacity } => body_value(serde_json::json!({"capacity": capacity})),
+            Message::CapacityReport { capacity } => {
+                body_value(serde_json::json!({"capacity": capacity}))
+            }
             Message::BindExecutor {
                 executor_id,
                 dispatch_id,
@@ -805,7 +807,9 @@ impl Message {
                 "decisions": decisions,
                 "page": page.to_string(),
             })),
-            Message::Drain { grace_ms } => body_value(serde_json::json!({"grace_ms": grace_ms.to_string()})),
+            Message::Drain { grace_ms } => {
+                body_value(serde_json::json!({"grace_ms": grace_ms.to_string()}))
+            }
             Message::DrainComplete { drained } => {
                 body_value(serde_json::json!({"drained": drained.to_string()}))
             }
@@ -1267,7 +1271,9 @@ impl Message {
                     drained: u32,
                 }
                 let wire: Wire = from_body(&body, type_name)?;
-                Message::DrainComplete { drained: wire.drained }
+                Message::DrainComplete {
+                    drained: wire.drained,
+                }
             }
             other => {
                 return Err(ProtocolError::UnknownMessage(other.to_string()));

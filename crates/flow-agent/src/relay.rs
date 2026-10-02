@@ -200,14 +200,36 @@ mod tests {
     fn wrong_route_rejected() {
         let relay = relay_with_binding();
         // 错 agent / 错 boot / 错 link / 错执行器 / 未绑定。
-        assert!(relay.unwrap_from_master(&envelope("agent-2", "boot-1", "link-1", "exec-1", "eboot-1", "d-1")).is_err());
-        assert!(relay.unwrap_from_master(&envelope("agent-1", "boot-2", "link-1", "exec-1", "eboot-1", "d-1")).is_err());
-        assert!(relay.unwrap_from_master(&envelope("agent-1", "boot-1", "link-2", "exec-1", "eboot-1", "d-1")).is_err());
-        assert!(relay.unwrap_from_master(&envelope("agent-1", "boot-1", "link-1", "exec-9", "eboot-1", "d-1")).is_err());
-        assert!(relay.unwrap_from_master(&envelope("agent-1", "boot-1", "link-1", "exec-1", "eboot-1", "d-9")).is_err());
+        assert!(relay
+            .unwrap_from_master(&envelope(
+                "agent-2", "boot-1", "link-1", "exec-1", "eboot-1", "d-1"
+            ))
+            .is_err());
+        assert!(relay
+            .unwrap_from_master(&envelope(
+                "agent-1", "boot-2", "link-1", "exec-1", "eboot-1", "d-1"
+            ))
+            .is_err());
+        assert!(relay
+            .unwrap_from_master(&envelope(
+                "agent-1", "boot-1", "link-2", "exec-1", "eboot-1", "d-1"
+            ))
+            .is_err());
+        assert!(relay
+            .unwrap_from_master(&envelope(
+                "agent-1", "boot-1", "link-1", "exec-9", "eboot-1", "d-1"
+            ))
+            .is_err());
+        assert!(relay
+            .unwrap_from_master(&envelope(
+                "agent-1", "boot-1", "link-1", "exec-1", "eboot-1", "d-9"
+            ))
+            .is_err());
         // 正确包络通过且内层原样。
         let (dispatch, inner) = relay
-            .unwrap_from_master(&envelope("agent-1", "boot-1", "link-1", "exec-1", "eboot-1", "d-1"))
+            .unwrap_from_master(&envelope(
+                "agent-1", "boot-1", "link-1", "exec-1", "eboot-1", "d-1",
+            ))
             .unwrap();
         assert_eq!(dispatch, "d-1");
         assert_eq!(inner.type_name(), "Cancel");
@@ -247,11 +269,12 @@ mod tests {
         let (out_tx, mut out_rx) = mpsc::channel(16);
         tokio::spawn(fair_mux(vec![flood_rx, quiet_rx], out_tx));
         for i in 0..16 {
-            let _ = flood_tx.send(Message::Heartbeat {
-                dispatch_id: Some(format!("flood-{i}")),
-                phase: "f".into(),
-            })
-            .await;
+            let _ = flood_tx
+                .send(Message::Heartbeat {
+                    dispatch_id: Some(format!("flood-{i}")),
+                    phase: "f".into(),
+                })
+                .await;
         }
         let _ = quiet_tx
             .send(Message::Heartbeat {
@@ -263,13 +286,19 @@ mod tests {
         let mut seen_quiet_before_flood_done = false;
         for _ in 0..8 {
             if let Some(Message::Heartbeat { dispatch_id, .. }) = out_rx.recv().await {
-                if dispatch_id.as_deref().is_some_and(|d| d.starts_with("flood")) {
+                if dispatch_id
+                    .as_deref()
+                    .is_some_and(|d| d.starts_with("flood"))
+                {
                     seen_flood += 1;
                 } else {
                     seen_quiet_before_flood_done = true;
                 }
             }
         }
-        assert!(seen_quiet_before_flood_done || seen_flood < 8, "quiet task must not starve");
+        assert!(
+            seen_quiet_before_flood_done || seen_flood < 8,
+            "quiet task must not starve"
+        );
     }
 }

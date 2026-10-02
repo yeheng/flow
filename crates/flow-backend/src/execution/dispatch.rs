@@ -11,9 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use tokio::sync::mpsc;
 use serde_json::{json, Value};
 use sha2::Digest as _;
+use tokio::sync::mpsc;
 
 use crate::journal::JournalBackend;
 use crate::journal_execution::Attempt;
@@ -69,12 +69,8 @@ impl IpcDispatcher {
             .acquire()
             .await
             .map_err(|e| invalid(format!("executor pool: {e}")))?;
-        let mut runner = DispatchRunner::new(
-            attempt.clone(),
-            node.clone(),
-            predecessors,
-            observations,
-        );
+        let mut runner =
+            DispatchRunner::new(attempt.clone(), node.clone(), predecessors, observations);
         let mut link = DispatchLink {
             commands: lease.to_session.clone(),
             events: std::mem::replace(&mut lease.events, mpsc::channel(1).1),
@@ -221,7 +217,7 @@ impl DispatchRunner {
                     let credential = request_value.and_then(|v| {
                         v["credential"]["secret_ref"]
                             .as_str()
-                            .and_then(|name| flow_engine::secrets::get_secret(name))
+                            .and_then(flow_engine::secrets::get_secret)
                             .filter(|s| !s.is_empty())
                     });
                     let _ = link
@@ -331,11 +327,7 @@ impl DispatchRunner {
     }
 
     /// 处理一条来自执行器的消息。Ok(Some(())) = 派发完成。
-    async fn handle(
-        &mut self,
-        message: Message,
-        link: &mut DispatchLink,
-    ) -> Result<Option<()>> {
+    async fn handle(&mut self, message: Message, link: &mut DispatchLink) -> Result<Option<()>> {
         match message {
             Message::Accepted { dispatch_id, .. } => {
                 if dispatch_id != self.attempt.dispatch_id {

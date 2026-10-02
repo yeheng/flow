@@ -42,7 +42,8 @@ fn remote_options() -> flow_backend::execution::remote::RemoteOptions {
     }
 }
 
-type Handles = Arc<tokio::sync::Mutex<std::collections::BTreeMap<String, flow_agent::pool::ExecutorHandle>>>;
+type Handles =
+    Arc<tokio::sync::Mutex<std::collections::BTreeMap<String, flow_agent::pool::ExecutorHandle>>>;
 
 fn agent_config(agent_id: &str, slots: u32) -> AgentConfig {
     AgentConfig {
@@ -79,11 +80,7 @@ async fn spawn_agent(
             .send(Message::AgentHello {
                 agent_boot_id: boot.clone(),
                 build: "sim".into(),
-                capabilities: vec![
-                    "relay".into(),
-                    "resource_report".into(),
-                    "reconnect".into(),
-                ],
+                capabilities: vec!["relay".into(), "resource_report".into(), "reconnect".into()],
                 slots,
             })
             .await
@@ -169,8 +166,7 @@ async fn run_and_finish(backend: &Arc<JournalBackend>, flow: &str, n: i64) -> Ru
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "off".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "off".into()),
         )
         .try_init();
 }
