@@ -5,6 +5,7 @@
 //! 落回进程内执行。
 
 pub mod dispatch;
+pub mod remote;
 pub mod pool;
 
 use std::path::{Path, PathBuf};
@@ -78,6 +79,38 @@ pub fn locate_executor() -> Result<PathBuf, String> {
 pub fn mode_from_env() -> Result<ExecutionMode, String> {
     let value = std::env::var(EXECUTION_MODE_ENV).unwrap_or_default();
     mode_from_env_with(&value)
+}
+
+/// 远程模式环境变量（R1/R3 运维入口）。
+pub struct RemoteEnv {
+    pub control_addr: String,
+    pub data_addr: String,
+    pub ca_cert: PathBuf,
+    pub server_cert: PathBuf,
+    pub server_key: PathBuf,
+    pub attach_timeout_ms: u64,
+}
+
+/// 解析远程模式选项（FLOW_REMOTE_*）；缺失即报错（不静默回退）。
+pub fn remote_options_from_env() -> Result<crate::execution::remote::RemoteOptions, String> {
+    let read = |name: &str| -> Result<PathBuf, String> {
+        std::env::var(name)
+            .map(PathBuf::from)
+            .map_err(|_| format!("{name} not set for remote mode"))
+    };
+    Ok(crate::execution::remote::RemoteOptions {
+        control_addr: std::env::var("FLOW_REMOTE_CONTROL_ADDR")
+            .map_err(|_| "FLOW_REMOTE_CONTROL_ADDR not set".to_string())?,
+        data_addr: std::env::var("FLOW_REMOTE_DATA_ADDR")
+            .map_err(|_| "FLOW_REMOTE_DATA_ADDR not set".to_string())?,
+        ca_cert: read("FLOW_REMOTE_CA")?,
+        server_cert: read("FLOW_REMOTE_CERT")?,
+        server_key: read("FLOW_REMOTE_KEY")?,
+        attach_timeout_ms: std::env::var("FLOW_REMOTE_ATTACH_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120_000),
+    })
 }
 
 /// 按给定环境值解析执行模式。

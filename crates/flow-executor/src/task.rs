@@ -82,6 +82,8 @@ pub struct TaskRunner {
     pub window_bytes: u64,
     /// 本任务全部输入/重传装配（生命周期覆盖整个派发）。
     pub transfers: IncomingTransfers,
+    /// 已发出的唯一 Result 帧（回执丢失时按节奏幂等重发）。
+    pub last_result: Option<Message>,
 }
 
 impl TaskRunner {
@@ -180,15 +182,17 @@ impl TaskRunner {
         audit.flush().await?;
         let last_audit_seq = audit.next_seq().saturating_sub(1);
         let result_id = uuid::Uuid::now_v7().to_string();
+        let result_message = Message::Result {
+            dispatch_id: self.dispatch_id.clone(),
+            result_id: result_id.clone(),
+            last_audit_seq,
+            outcome,
+        };
         self.outbound
-            .send(Message::Result {
-                dispatch_id: self.dispatch_id.clone(),
-                result_id: result_id.clone(),
-                last_audit_seq,
-                outcome,
-            })
+            .send(result_message.clone())
             .await
             .map_err(|e| TaskError::Closed(e.to_string()))?;
+        self.last_result = Some(result_message);
         let deadline = Duration::from_millis(DURABLE_WAIT_TIMEOUT_MS);
         match tokio::time::timeout(deadline, self.wait_committed(&result_id)).await {
             Ok(Ok(())) => Ok(()),
@@ -208,18 +212,20 @@ impl TaskRunner {
         audit.flush().await?;
         let last_audit_seq = audit.next_seq().saturating_sub(1);
         let result_id = uuid::Uuid::now_v7().to_string();
+        let result_message = Message::Result {
+            dispatch_id: self.dispatch_id.clone(),
+            result_id: result_id.clone(),
+            last_audit_seq,
+            outcome: ResultOutcome::Failure {
+                error,
+                uncertain_operation: uncertain,
+            },
+        };
         self.outbound
-            .send(Message::Result {
-                dispatch_id: self.dispatch_id.clone(),
-                result_id: result_id.clone(),
-                last_audit_seq,
-                outcome: ResultOutcome::Failure {
-                    error,
-                    uncertain_operation: uncertain,
-                },
-            })
+            .send(result_message.clone())
             .await
             .map_err(|e| TaskError::Closed(e.to_string()))?;
+        self.last_result = Some(result_message);
         match tokio::time::timeout(
             Duration::from_millis(DURABLE_WAIT_TIMEOUT_MS),
             self.wait_committed(&result_id),
@@ -233,12 +239,32 @@ impl TaskRunner {
     }
 
     async fn wait_committed(&mut self, result_id: &str) -> Result<(), TaskError> {
+        let mut last_send = None::<tokio::time::Instant>;
         loop {
-            let message = self
-                .mail
-                .recv()
-                .await
-                .ok_or_else(|| TaskError::Closed("mailbox closed".into()))?;
+            let message = tokio::select! {
+                message = self.mail.recv() => message,
+                _ = tokio::time::sleep(Duration::from_millis(
+                    flow_engine::execution_protocol::ACK_RETRANSMIT_MS / 2 + 1,
+                )) => {
+                    // 结果回执可能在上联/中继中丢失：周期性重发同一
+                    // result_id 的 Result（主进程幂等返回原提交）。
+                    if last_send.is_none_or(|at| {
+                        at.elapsed()
+                            >= Duration::from_millis(
+                                flow_engine::execution_protocol::ACK_RETRANSMIT_MS,
+                            )
+                    }) {
+                        if let Some(result) = self.last_result.clone() {
+                            let _ = self.outbound.try_send(result);
+                        }
+                        last_send = Some(tokio::time::Instant::now());
+                    }
+                    continue;
+                }
+            };
+            let Some(message) = message else {
+                return Err(TaskError::Closed("mailbox closed".into()));
+            };
             match message {
                 Message::ResultCommitted {
                     dispatch_id,
@@ -262,6 +288,7 @@ impl TaskRunner {
             }
         }
     }
+
 
     /// 装配 run 输入与前驱输出（inline 即用，Ref 等 transfer）。
     async fn materialize_inputs(&mut self, timeout: Duration) -> Result<TaskInputs, TaskError> {

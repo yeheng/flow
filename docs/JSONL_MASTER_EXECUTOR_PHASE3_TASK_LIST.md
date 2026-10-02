@@ -1,6 +1,6 @@
 # JSONL 重构三期任务清单：远程 agent
 
-日期：2026-09-30。状态：**任务已迁入，产品实现未开始**。设计依据：[三期方案](JSONL_MASTER_EXECUTOR_PHASE3_PLAN.md)。本轮只修订文档，三期实施与生产切换状态另行记录。
+日期：2026-09-30；更新：2026-10-02。状态：**R0-01/R1-01/R2-01/R3-01 实现完成（开发验收口径；生产切换未执行），R3-02 按约定 skipped。证据见 docs/refactor-evidence/R0-01–R3-02.md。**
 
 <a id="agent-entry"></a>
 ## 执行入口与完成定义
@@ -28,7 +28,7 @@
 <a id="task-r0-01"></a>
 ### R0-01 通过模拟中继冻结远程复用契约
 
-- **状态**：todo；负责人：待分配；证据：待实施后写入 `docs/refactor-evidence/R0-01.md`。
+- **状态**：done（2026-10-02）；证据：`docs/refactor-evidence/R0-01.md`。
 - **前置输入**：[I10](JSONL_MASTER_EXECUTOR_PHASE2_TASK_LIST.md#task-i10) 的交付证据。
 - **设计引用**：[§1.1](JSONL_MASTER_EXECUTOR_PHASE3_PLAN.md#phase3-s1-1)、[§1.2](JSONL_MASTER_EXECUTOR_PHASE3_PLAN.md#phase3-s1-2)、[§1.7](JSONL_MASTER_EXECUTOR_PHASE3_PLAN.md#phase3-s1-7)。只按需读取这些小节。
 - **目标与原因**：通过模拟中继冻结远程复用契约；解决下述契约对应的正确性或交付问题。
@@ -59,7 +59,7 @@
 <a id="task-r1-01"></a>
 ### R1-01 实现远程 agent 双 TLS 与资源准入
 
-- **状态**：todo；负责人：待分配；证据：待实施后写入 `docs/refactor-evidence/R1-01.md`。
+- **状态**：done（2026-10-02）；证据：`docs/refactor-evidence/R1-01.md`。
 - **前置输入**：[R0-01](#task-r0-01) 的交付证据。
 - **设计引用**：[§1.1](JSONL_MASTER_EXECUTOR_PHASE3_PLAN.md#phase3-s1-1)、[§1.2](JSONL_MASTER_EXECUTOR_PHASE3_PLAN.md#phase3-s1-2)、[§1.3](JSONL_MASTER_EXECUTOR_PHASE3_PLAN.md#phase3-s1-3)、[§1.6](JSONL_MASTER_EXECUTOR_PHASE3_PLAN.md#phase3-s1-6)。只按需读取这些小节。
 - **目标与原因**：实现远程 agent 双 TLS 与资源准入；解决下述契约对应的正确性或交付问题。
@@ -93,7 +93,7 @@
 <a id="task-r2-01"></a>
 ### R2-01 实现断线对账与历史证据补传
 
-- **状态**：todo；负责人：待分配；证据：待实施后写入 `docs/refactor-evidence/R2-01.md`。
+- **状态**：done（2026-10-02）；证据：`docs/refactor-evidence/R2-01.md`。
 - **前置输入**：[R1-01](#task-r1-01) 的交付证据。
 - **设计引用**：[§1.4](JSONL_MASTER_EXECUTOR_PHASE3_PLAN.md#phase3-s1-4)、[§1.3](JSONL_MASTER_EXECUTOR_PHASE3_PLAN.md#phase3-s1-3)、[二期 §3.7](JSONL_MASTER_EXECUTOR_PHASE2_PLAN.md#phase2-s3-7)。只按需读取这些小节。
 - **目标与原因**：实现断线对账与历史证据补传；解决下述契约对应的正确性或交付问题。
@@ -128,7 +128,7 @@
 <a id="task-r3-01"></a>
 ### R3-01 验收远程运维与容量
 
-- **状态**：todo；负责人：待分配；证据：待实施后写入 `docs/refactor-evidence/R3-01.md`。
+- **状态**：done（2026-10-02，开发验收口径）；证据：`docs/refactor-evidence/R3-01.md`。
 - **前置输入**：[R2-01](#task-r2-01) 的交付证据。
 - **设计引用**：[§1.6](JSONL_MASTER_EXECUTOR_PHASE3_PLAN.md#phase3-s1-6)、[§1.7](JSONL_MASTER_EXECUTOR_PHASE3_PLAN.md#phase3-s1-7)、[§1.8](JSONL_MASTER_EXECUTOR_PHASE3_PLAN.md#phase3-s1-8)、[一期 §15](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md#plan-s15)。只按需读取这些小节。
 - **目标与原因**：验收远程运维与容量；解决下述契约对应的正确性或交付问题。
@@ -161,7 +161,7 @@
 <a id="task-r3-02"></a>
 ### R3-02 可选：有界磁盘 spool
 
-- **状态**：todo；负责人：待分配；证据：待实施后写入 `docs/refactor-evidence/R3-02.md`。
+- **状态**：skipped（2026-10-02，无明确需求，按清单约定记录）；证据：`docs/refactor-evidence/R3-02.md`。
 - **前置输入**：[R2-01](#task-r2-01) 的交付证据。
 - **设计引用**：[§1.5](JSONL_MASTER_EXECUTOR_PHASE3_PLAN.md#phase3-s1-5)、[§1.7](JSONL_MASTER_EXECUTOR_PHASE3_PLAN.md#phase3-s1-7)。只按需读取这些小节。
 - **目标与原因**：可选：有界磁盘 spool；解决下述契约对应的正确性或交付问题。

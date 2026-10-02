@@ -1,6 +1,7 @@
 //! V2 coordinator. Persistent waits occupy no active execution task.
 //! IPC mode (phase 2) replaces the in-process node executor with a managed
 //! subprocess pool; journal semantics are byte-identical between modes.
+use crate::execution::remote::{RemoteDispatcher, RemoteOptions};
 use crate::execution::{ExecutionMode, IpcDispatcher};
 use crate::journal::{JournalBackend, JournalError};
 use crate::journal_commands::{id, node_event, now};
@@ -13,11 +14,12 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// 节点执行端口：一期进程内 / 二期 IPC 子进程。
+/// 节点执行端口：一期进程内 / 二期本地 IPC / 三期远程 agent。
 #[derive(Clone)]
 pub(crate) enum ExecutionPort {
     InProcess,
     Ipc(Arc<IpcDispatcher>),
+    Remote(Arc<RemoteDispatcher>),
 }
 
 type Result<T> = std::result::Result<T, JournalError>;
@@ -71,6 +73,34 @@ impl JournalBackend {
         })
         .await
     }
+    /// 三期远程模式：epoch + TLS 监听 + 远程派发器（R1）。
+    pub async fn start_execution_remote(
+        self: &Arc<Self>,
+        options: RemoteOptions,
+    ) -> Result<()> {
+        let epoch = self.bump_master_epoch().await?;
+        let manager = crate::execution::remote::AgentManager::new(
+            self.clone(),
+            self.journal.id().into(),
+            epoch,
+        );
+        manager.listen_tls(options.clone()).await?;
+        let dispatcher = Arc::new(RemoteDispatcher::new(manager, options));
+        self.start_execution_with_port(16, ExecutionPort::Remote(dispatcher))
+            .await
+    }
+
+    /// 三期远程（测试/in-process 入口）：用既有 manager 启动远程端口。
+    pub async fn start_execution_remote_manager(
+        self: &Arc<Self>,
+        manager: Arc<crate::execution::remote::AgentManager>,
+        options: RemoteOptions,
+    ) -> Result<()> {
+        let dispatcher = Arc::new(RemoteDispatcher::new(manager, options));
+        self.start_execution_with_port(16, ExecutionPort::Remote(dispatcher))
+            .await
+    }
+
     async fn start_execution_with_port(
         self: &Arc<Self>,
         limit: usize,
@@ -193,6 +223,9 @@ impl JournalBackend {
                                         execute(&attempt,&node,predecessors.clone(),logger).await
                                     }
                                     ExecutionPort::Ipc(dispatcher)=>{
+                                        dispatcher.execute(&attempt,&node,predecessors.clone(),observation).await
+                                    }
+                                    ExecutionPort::Remote(dispatcher)=>{
                                         dispatcher.execute(&attempt,&node,predecessors.clone(),observation).await
                                     }
                                 };

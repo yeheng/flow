@@ -201,7 +201,8 @@ pub fn malformed_envelopes() -> Vec<Value> {
 }
 
 pub fn unknown_type_envelope() -> Value {
-    json!({"v": 1, "type": "Resume", "body": {}})
+    // 注意：三期已把 Resume/ResumeReply 纳入目录；未知类型用目录外名称。
+    json!({"v": 1, "type": "TeleportRequest", "body": {}})
 }
 
 /// 同 dispatch 同序号异内容样本（必须拒绝）。

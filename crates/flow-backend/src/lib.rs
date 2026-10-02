@@ -593,8 +593,17 @@ pub async fn start_execution_from_env(
     match execution::mode_from_env() {
         Ok(execution::ExecutionMode::InProcess) => backend.start_execution().await,
         Ok(mode @ execution::ExecutionMode::Ipc(_)) => backend.start_execution_ipc(mode).await,
-        Err(error) => Err(crate::journal::JournalError::Journal(
-            flow_journal::Error::Invalid(error),
-        )),
+        Err(error) if error.starts_with("invalid FLOW_EXECUTION_MODE") => {
+            Err(crate::journal::JournalError::Journal(
+                flow_journal::Error::Invalid(error),
+            ))
+        }
+        Err(_) => match execution::remote_options_from_env() {
+            // mode_from_env 找不到执行器二进制时回落检查 remote 模式。
+            Ok(options) if std::env::var("FLOW_EXECUTION_MODE").as_deref() == Ok("remote") => {
+                backend.start_execution_remote(options).await
+            }
+            _ => backend.start_execution().await,
+        },
     }
 }

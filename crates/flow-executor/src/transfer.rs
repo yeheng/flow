@@ -57,14 +57,18 @@ impl IncomingTransfers {
             return Ok(());
         };
         let stream = self.streams.entry(transfer_id.clone()).or_default();
-        if stream.chunks.contains_key(offset) {
-            return Err(TransferError::Duplicate(transfer_id.clone(), *offset));
-        }
         let raw = STANDARD
             .decode(bytes)
             .map_err(|_| TransferError::Digest(*offset))?;
         if hex::encode(Sha256::digest(&raw)) != *digest {
             return Err(TransferError::Digest(*offset));
+        }
+        // 幂等重传：同 offset 同内容跳过；异内容拒绝（三期重连补发）。
+        if let Some(previous) = stream.chunks.get(offset) {
+            if *previous == raw {
+                return Ok(());
+            }
+            return Err(TransferError::Duplicate(transfer_id.clone(), *offset));
         }
         stream.received += raw.len() as u64;
         if stream.received > MAX_VALUE_BYTES {

@@ -109,16 +109,25 @@ struct IoHandle {
 }
 
 impl FrameTransport {
-    /// 在给定端点上启动 I/O 任务。读任务持续运行（不等节点执行返回），
-    /// 每通道一个串行写任务。
+    /// 在给定端点上启动 I/O 任务（Unix socketpair 便捷入口）。
     pub fn spawn(pair: ChannelPair, queue_depth: usize) -> Self {
+        Self::spawn_streams(pair.control, pair.data, queue_depth)
+    }
+
+    /// 在任意双字节流上启动 I/O 任务（三期远程：TLS/TCP 或测试 duplex）。
+    /// 读任务持续运行，每通道一个串行写任务。
+    pub fn spawn_streams<S>(control: S, data: S, queue_depth: usize) -> Self
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         let (event_tx, incoming) = mpsc::channel(queue_depth.max(8));
         let (control_tx, control_rx) = mpsc::channel::<Message>(queue_depth.max(8));
         let (data_tx, data_rx) = mpsc::channel::<Message>(queue_depth.max(8));
         let broken = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         // 读写半拆分：读任务与串行写任务各自持有独立句柄。
-        let (control_read, control_write) = pair.control.into_split();
-        let (data_read, data_write) = pair.data.into_split();
+        let (control_read, control_write) = tokio::io::split(control);
+        let (data_read, data_write) = tokio::io::split(data);
+        let control_read: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>> = Box::pin(control_read);
         let reader_control = tokio::spawn(read_loop(
             control_read,
             Channel::Control,
@@ -126,6 +135,7 @@ impl FrameTransport {
             event_tx.clone(),
             broken.clone(),
         ));
+        let data_read: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>> = Box::pin(data_read);
         let reader_data = tokio::spawn(read_loop(
             data_read,
             Channel::Data,
@@ -134,7 +144,11 @@ impl FrameTransport {
             broken.clone(),
         ));
         let writer_control = tokio::spawn(write_loop(control_write, control_rx, broken.clone()));
-        let writer_data = tokio::spawn(write_loop(data_write, data_rx, broken.clone()));
+        let writer_data = tokio::spawn(write_loop(
+            Box::pin(data_write) as std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>,
+            data_rx,
+            broken.clone(),
+        ));
         drop(event_tx);
         Self {
             incoming,
@@ -180,6 +194,18 @@ impl FrameTransport {
         }
     }
 
+    /// 非阻塞发送（队列满/已关即失败；agent 拒绝路径使用）。
+    pub fn try_send(&self, message: Message) -> Result<(), ProtocolError> {
+        if self.io.broken.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ProtocolError::Closed);
+        }
+        let sender = match message.channel() {
+            Channel::Control => &self.control_out,
+            Channel::Data => &self.data_out,
+        };
+        sender.try_send(message).map_err(|_| ProtocolError::Closed)
+    }
+
     /// 尽力先弹出已缓冲帧；无则 None（非阻塞窥视）。
     pub fn try_recv(&mut self) -> Option<(Channel, Message)> {
         match self.incoming.try_recv() {
@@ -211,7 +237,7 @@ impl FrameTransport {
 impl ChannelPair {}
 
 async fn read_loop(
-    stream: tokio::net::unix::OwnedReadHalf,
+    stream: impl tokio::io::AsyncRead + Unpin + Send,
     channel: Channel,
     limit: usize,
     events: mpsc::Sender<IoEvent>,
@@ -263,7 +289,7 @@ async fn read_loop(
 }
 
 async fn write_loop(
-    stream: tokio::net::unix::OwnedWriteHalf,
+    stream: impl tokio::io::AsyncWrite + Unpin + Send,
     queue: mpsc::Receiver<Message>,
     broken: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {

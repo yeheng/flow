@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::contract::PROTOCOL_VERSION;
+use super::remote::{Capacity, ResumeDecision, ResumeItem, RouteEnvelope};
 
 type Result<T> = std::result::Result<T, ProtocolError>;
 
@@ -143,6 +144,30 @@ pub mod decimal_i64_opt {
     }
 }
 
+/// Option<u64> 的十进制字符串编解码。
+pub mod decimal_u64_opt {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(v: &Option<u64>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(n) => s.serialize_str(&n.to_string()),
+            None => s.serialize_none(),
+        }
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+        let raw: Option<String> = Option::deserialize(d)?;
+        match raw {
+            None => Ok(None),
+            Some(s) => {
+                let n: u64 = s.parse().map_err(serde::de::Error::custom)?;
+                if n.to_string() != s {
+                    return Err(serde::de::Error::custom("noncanonical decimal"));
+                }
+                Ok(Some(n))
+            }
+        }
+    }
+}
+
 /// u32 的十进制字符串编解码（dispatch attempt）。
 pub mod decimal_u32 {
     use serde::{Deserialize, Deserializer, Serializer};
@@ -178,6 +203,18 @@ pub mod kind {
     pub const HEARTBEAT: &str = "Heartbeat";
     pub const OBSERVABILITY_BATCH: &str = "ObservabilityBatch";
     pub const REJECT: &str = "Reject";
+    // 远程层（三期 §1.2）
+    pub const ROUTED: &str = "Routed";
+    pub const AGENT_HELLO: &str = "AgentHello";
+    pub const AGENT_WELCOME: &str = "AgentWelcome";
+    pub const DATA_BIND: &str = "DataBind";
+    pub const CAPACITY_REPORT: &str = "CapacityReport";
+    pub const BIND_EXECUTOR: &str = "BindExecutor";
+    pub const BIND_EXECUTOR_ACK: &str = "BindExecutorAck";
+    pub const RESUME: &str = "Resume";
+    pub const RESUME_REPLY: &str = "ResumeReply";
+    pub const DRAIN: &str = "Drain";
+    pub const DRAIN_COMPLETE: &str = "DrainComplete";
 }
 
 /// 统一消息目录。通道与方向约束见二期 §3.4 表格；transport 层按通道
@@ -303,6 +340,66 @@ pub enum Message {
     },
     /// control，双向。协议错误：明确拒绝后关闭连接。
     Reject { reason: String },
+    /// 远程路由帧（三期 §1.2）：外层包络 + 内层业务消息（审计原始编码
+    /// 原样嵌套）。通道跟随内层。
+    Routed {
+        envelope: RouteEnvelope,
+        inner: Box<Message>,
+    },
+    /// control，agent→主。上联握手：TLS 主体映射 agent_id。
+    AgentHello {
+        agent_boot_id: String,
+        build: String,
+        capabilities: Vec<String>,
+        slots: u32,
+    },
+    /// control，主→agent。选定 link_session、限额与一次性 data 绑定凭据。
+    AgentWelcome {
+        journal_id: String,
+        master_epoch: u64,
+        link_session_id: String,
+        agent_id: String,
+        data_credential: String,
+        heartbeat_ms: u64,
+        /// agent 级转发预算（C_agent，字节）。
+        agent_window_bytes: u64,
+    },
+    /// data，agent→主（data 连接首帧）。绑定到 control 会话；凭据一次性。
+    DataBind {
+        agent_boot_id: String,
+        link_session_id: String,
+        credential: String,
+    },
+    /// control，agent→主。资源报告。
+    CapacityReport { capacity: Capacity },
+    /// control，主→agent。绑定本地执行器到派发；确认后才能 Execute。
+    BindExecutor {
+        executor_id: String,
+        dispatch_id: String,
+    },
+    /// control，agent→主。绑定确认（含本地执行器 boot 身份）。
+    BindExecutorAck {
+        executor_id: String,
+        executor_boot_id: String,
+        dispatch_id: String,
+        ok: bool,
+        error: Option<String>,
+    },
+    /// control，agent→主（新上联会话）。断线对账清单（分页）。
+    Resume {
+        items: Vec<ResumeItem>,
+        page: u32,
+        more: bool,
+    },
+    /// control，主→agent。逐项裁决。
+    ResumeReply {
+        decisions: Vec<ResumeDecision>,
+        page: u32,
+    },
+    /// control，主→agent。drain：停止接新派发，收尾后退出（三期 §1.6）。
+    Drain { grace_ms: u64 },
+    /// control，agent→主。drain 完成：在飞任务终态已转发。
+    DrainComplete { drained: u32 },
 }
 
 /// 观测行（nodelog console/stdout/stderr 叙事）。
@@ -359,6 +456,17 @@ impl Message {
             Message::Heartbeat { .. } => kind::HEARTBEAT,
             Message::ObservabilityBatch { .. } => kind::OBSERVABILITY_BATCH,
             Message::Reject { .. } => kind::REJECT,
+            Message::Routed { .. } => kind::ROUTED,
+            Message::AgentHello { .. } => kind::AGENT_HELLO,
+            Message::AgentWelcome { .. } => kind::AGENT_WELCOME,
+            Message::DataBind { .. } => kind::DATA_BIND,
+            Message::CapacityReport { .. } => kind::CAPACITY_REPORT,
+            Message::BindExecutor { .. } => kind::BIND_EXECUTOR,
+            Message::BindExecutorAck { .. } => kind::BIND_EXECUTOR_ACK,
+            Message::Resume { .. } => kind::RESUME,
+            Message::ResumeReply { .. } => kind::RESUME_REPLY,
+            Message::Drain { .. } => kind::DRAIN,
+            Message::DrainComplete { .. } => kind::DRAIN_COMPLETE,
         }
     }
 
@@ -368,12 +476,16 @@ impl Message {
         match self {
             Message::TransferChunk { .. }
             | Message::ObservabilityBatch { .. }
-            | Message::AuditBatch { .. } => Channel::Data,
+            | Message::AuditBatch { .. }
+            // data 连接绑定帧：必须走 data 通道（三期 §1.2 防连接串配）。
+            | Message::DataBind { .. } => Channel::Data,
+            // 路由帧跟随内层通道（审计/传输走 data，其余 control）。
+            Message::Routed { inner, .. } => inner.channel(),
             _ => Channel::Control,
         }
     }
 
-    fn dispatch_id(&self) -> Option<&str> {
+    pub fn dispatch_id(&self) -> Option<&str> {
         match self {
             Message::Execute { dispatch_id, .. }
             | Message::Accepted { dispatch_id, .. }
@@ -387,6 +499,7 @@ impl Message {
             | Message::Stopped { dispatch_id, .. } => Some(dispatch_id),
             Message::Heartbeat { dispatch_id, .. }
             | Message::ObservabilityBatch { dispatch_id, .. } => dispatch_id.as_deref(),
+            Message::Routed { envelope, .. } => envelope.dispatch_id.as_deref(),
             _ => None,
         }
     }
@@ -596,6 +709,106 @@ impl Message {
                 lines,
             } => body_value(serde_json::json!({"lines": lines})),
             Message::Reject { reason } => body_value(serde_json::json!({"reason": reason})),
+            Message::Routed { envelope, inner } => body_value(serde_json::json!({
+                "envelope": envelope,
+                "inner": inner.to_envelope(),
+            })),
+            Message::AgentHello {
+                agent_boot_id,
+                build,
+                capabilities,
+                slots,
+            } => {
+                #[derive(Serialize)]
+                struct Wire {
+                    agent_boot_id: String,
+                    build: String,
+                    capabilities: Vec<String>,
+                    #[serde(with = "decimal_u32")]
+                    slots: u32,
+                }
+                body_value(&Wire {
+                    agent_boot_id: agent_boot_id.clone(),
+                    build: build.clone(),
+                    capabilities: capabilities.clone(),
+                    slots: *slots,
+                })
+            }
+            Message::AgentWelcome {
+                journal_id,
+                master_epoch,
+                link_session_id,
+                agent_id,
+                data_credential,
+                heartbeat_ms,
+                agent_window_bytes,
+            } => {
+                #[derive(Serialize)]
+                struct Wire {
+                    journal_id: String,
+                    #[serde(with = "flow_journal::decimal")]
+                    master_epoch: u64,
+                    link_session_id: String,
+                    agent_id: String,
+                    data_credential: String,
+                    #[serde(with = "flow_journal::decimal")]
+                    heartbeat_ms: u64,
+                    #[serde(with = "flow_journal::decimal")]
+                    agent_window_bytes: u64,
+                }
+                body_value(&Wire {
+                    journal_id: journal_id.clone(),
+                    master_epoch: *master_epoch,
+                    link_session_id: link_session_id.clone(),
+                    agent_id: agent_id.clone(),
+                    data_credential: data_credential.clone(),
+                    heartbeat_ms: *heartbeat_ms,
+                    agent_window_bytes: *agent_window_bytes,
+                })
+            }
+            Message::DataBind {
+                agent_boot_id,
+                link_session_id,
+                credential,
+            } => body_value(serde_json::json!({
+                "agent_boot_id": agent_boot_id,
+                "link_session_id": link_session_id,
+                "credential": credential,
+            })),
+            Message::CapacityReport { capacity } => body_value(serde_json::json!({"capacity": capacity})),
+            Message::BindExecutor {
+                executor_id,
+                dispatch_id,
+            } => body_value(serde_json::json!({
+                "executor_id": executor_id,
+                "dispatch_id": dispatch_id,
+            })),
+            Message::BindExecutorAck {
+                executor_id,
+                executor_boot_id,
+                dispatch_id,
+                ok,
+                error,
+            } => body_value(serde_json::json!({
+                "executor_id": executor_id,
+                "executor_boot_id": executor_boot_id,
+                "dispatch_id": dispatch_id,
+                "ok": ok,
+                "error": error,
+            })),
+            Message::Resume { items, page, more } => body_value(serde_json::json!({
+                "items": items,
+                "page": page.to_string(),
+                "more": more,
+            })),
+            Message::ResumeReply { decisions, page } => body_value(serde_json::json!({
+                "decisions": decisions,
+                "page": page.to_string(),
+            })),
+            Message::Drain { grace_ms } => body_value(serde_json::json!({"grace_ms": grace_ms.to_string()})),
+            Message::DrainComplete { drained } => {
+                body_value(serde_json::json!({"drained": drained.to_string()}))
+            }
         };
         let mut envelope = serde_json::Map::new();
         envelope.insert("v".into(), json!(PROTOCOL_VERSION));
@@ -890,6 +1103,171 @@ impl Message {
                 Message::Reject {
                     reason: wire.reason,
                 }
+            }
+            kind::ROUTED => {
+                #[derive(Deserialize)]
+                struct Wire {
+                    envelope: RouteEnvelope,
+                    inner: Value,
+                }
+                let wire: Wire = from_body(&body, type_name)?;
+                let inner = Message::from_envelope(wire.inner)
+                    .map_err(|e| ProtocolError::InvalidPayload(format!("Routed inner: {e}")))?;
+                if !super::remote::routable(&inner) {
+                    return Err(ProtocolError::InvalidPayload(
+                        "Routed inner must be a business message".into(),
+                    ));
+                }
+                Message::Routed {
+                    envelope: wire.envelope,
+                    inner: Box::new(inner),
+                }
+            }
+            kind::AGENT_HELLO => {
+                #[derive(Deserialize)]
+                struct Wire {
+                    agent_boot_id: String,
+                    build: String,
+                    capabilities: Vec<String>,
+                    #[serde(with = "decimal_u32")]
+                    slots: u32,
+                }
+                let wire: Wire = from_body(&body, type_name)?;
+                Message::AgentHello {
+                    agent_boot_id: wire.agent_boot_id,
+                    build: wire.build,
+                    capabilities: wire.capabilities,
+                    slots: wire.slots,
+                }
+            }
+            kind::AGENT_WELCOME => {
+                #[derive(Deserialize)]
+                struct Wire {
+                    journal_id: String,
+                    #[serde(with = "flow_journal::decimal")]
+                    master_epoch: u64,
+                    link_session_id: String,
+                    agent_id: String,
+                    data_credential: String,
+                    #[serde(with = "flow_journal::decimal")]
+                    heartbeat_ms: u64,
+                    #[serde(with = "flow_journal::decimal")]
+                    agent_window_bytes: u64,
+                }
+                let wire: Wire = from_body(&body, type_name)?;
+                Message::AgentWelcome {
+                    journal_id: wire.journal_id,
+                    master_epoch: wire.master_epoch,
+                    link_session_id: wire.link_session_id,
+                    agent_id: wire.agent_id,
+                    data_credential: wire.data_credential,
+                    heartbeat_ms: wire.heartbeat_ms,
+                    agent_window_bytes: wire.agent_window_bytes,
+                }
+            }
+            kind::DATA_BIND => {
+                #[derive(Deserialize)]
+                struct Wire {
+                    agent_boot_id: String,
+                    link_session_id: String,
+                    credential: String,
+                }
+                let wire: Wire = from_body(&body, type_name)?;
+                Message::DataBind {
+                    agent_boot_id: wire.agent_boot_id,
+                    link_session_id: wire.link_session_id,
+                    credential: wire.credential,
+                }
+            }
+            kind::CAPACITY_REPORT => {
+                #[derive(Deserialize)]
+                struct Wire {
+                    capacity: Capacity,
+                }
+                let wire: Wire = from_body(&body, type_name)?;
+                Message::CapacityReport {
+                    capacity: wire.capacity,
+                }
+            }
+            kind::BIND_EXECUTOR => {
+                #[derive(Deserialize)]
+                struct Wire {
+                    executor_id: String,
+                    dispatch_id: String,
+                }
+                let wire: Wire = from_body(&body, type_name)?;
+                Message::BindExecutor {
+                    executor_id: wire.executor_id,
+                    dispatch_id: wire.dispatch_id,
+                }
+            }
+            kind::BIND_EXECUTOR_ACK => {
+                #[derive(Deserialize)]
+                struct Wire {
+                    executor_id: String,
+                    executor_boot_id: String,
+                    dispatch_id: String,
+                    #[serde(default)]
+                    ok: bool,
+                    #[serde(default)]
+                    error: Option<String>,
+                }
+                let wire: Wire = from_body(&body, type_name)?;
+                Message::BindExecutorAck {
+                    executor_id: wire.executor_id,
+                    executor_boot_id: wire.executor_boot_id,
+                    dispatch_id: wire.dispatch_id,
+                    ok: wire.ok,
+                    error: wire.error,
+                }
+            }
+            kind::RESUME => {
+                #[derive(Deserialize)]
+                struct Wire {
+                    items: Vec<ResumeItem>,
+                    #[serde(with = "decimal_u32")]
+                    page: u32,
+                    more: bool,
+                }
+                let wire: Wire = from_body(&body, type_name)?;
+                Message::Resume {
+                    items: wire.items,
+                    page: wire.page,
+                    more: wire.more,
+                }
+            }
+            kind::RESUME_REPLY => {
+                #[derive(Deserialize)]
+                struct Wire {
+                    decisions: Vec<ResumeDecision>,
+                    #[serde(with = "decimal_u32")]
+                    page: u32,
+                }
+                let wire: Wire = from_body(&body, type_name)?;
+                Message::ResumeReply {
+                    decisions: wire.decisions,
+                    page: wire.page,
+                }
+            }
+            kind::DRAIN => {
+                #[derive(Deserialize)]
+                struct Wire {
+                    #[serde(with = "flow_journal::decimal")]
+                    grace_ms: u64,
+                }
+                let wire: Wire = from_body(&body, type_name)?;
+                Message::Drain {
+                    grace_ms: wire.grace_ms,
+                }
+            }
+            kind::DRAIN_COMPLETE => {
+                #[derive(Deserialize)]
+                struct Wire {
+                    #[serde(with = "decimal_u32")]
+                    drained: u32,
+                }
+                let wire: Wire = from_body(&body, type_name)?;
+                Message::DrainComplete { drained: wire.drained }
             }
             other => {
                 return Err(ProtocolError::UnknownMessage(other.to_string()));

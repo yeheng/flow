@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use tokio::sync::mpsc;
 use serde_json::{json, Value};
 use sha2::Digest as _;
 
@@ -42,6 +43,13 @@ pub struct IpcDispatcher {
     pool: Arc<ExecutorPool>,
 }
 
+/// 派发链路：命令发送 + 事件流。本地池会话（二期）与远程 agent 路由
+/// （三期）共用同一编排；远程模式链路死亡后可重建继续驱动同一 runner。
+pub(crate) struct DispatchLink {
+    pub commands: mpsc::Sender<ToSession>,
+    pub events: mpsc::Receiver<FromSession>,
+}
+
 impl IpcDispatcher {
     pub fn new(pool: Arc<ExecutorPool>) -> Self {
         Self { pool }
@@ -56,27 +64,26 @@ impl IpcDispatcher {
         predecessors: BTreeMap<String, StoredValue>,
         observations: Option<ObservationStore>,
     ) -> Result<()> {
-        let lease = self
+        let mut lease = self
             .pool
             .acquire()
             .await
             .map_err(|e| invalid(format!("executor pool: {e}")))?;
-        let runner = DispatchRunner {
-            pool: self.pool.clone(),
-            attempt: attempt.clone(),
-            node: node.clone(),
+        let mut runner = DispatchRunner::new(
+            attempt.clone(),
+            node.clone(),
             predecessors,
             observations,
-            durable_seq: 0,
-            durable_bytes: 0,
-            committed: BTreeMap::new(),
-            pending_result: None,
-            op_transfers: BTreeMap::new(),
-            pending_operation_request: None,
-            cancel_sent: false,
-            session_healthy: true,
+        );
+        let mut link = DispatchLink {
+            commands: lease.to_session.clone(),
+            events: std::mem::replace(&mut lease.events, mpsc::channel(1).1),
         };
-        runner.run(lease).await
+        let outcome = runner.drive(&mut link).await;
+        // 归还真实事件流（供空闲会话复用）。
+        lease.events = std::mem::replace(&mut link.events, mpsc::channel(1).1);
+        self.pool.release(lease, outcome.is_ok()).await;
+        outcome
     }
 }
 
@@ -91,8 +98,7 @@ struct PendingResult {
     outcome: ResultOutcome,
 }
 
-struct DispatchRunner {
-    pool: Arc<ExecutorPool>,
+pub(crate) struct DispatchRunner {
     attempt: Attempt,
     node: Node,
     predecessors: BTreeMap<String, StoredValue>,
@@ -110,14 +116,56 @@ struct DispatchRunner {
 }
 
 impl DispatchRunner {
-    async fn run(mut self, mut lease: super::pool::SessionLease) -> Result<()> {
-        let outcome = self.drive(&mut lease).await;
-        let healthy = self.session_healthy && outcome.is_ok();
-        self.pool.release(lease, healthy).await;
-        outcome
+    fn new(
+        attempt: Attempt,
+        node: Node,
+        predecessors: BTreeMap<String, StoredValue>,
+        observations: Option<ObservationStore>,
+    ) -> Self {
+        Self {
+            attempt,
+            node,
+            predecessors,
+            observations,
+            durable_seq: 0,
+            durable_bytes: 0,
+            committed: BTreeMap::new(),
+            pending_result: None,
+            op_transfers: BTreeMap::new(),
+            pending_operation_request: None,
+            cancel_sent: false,
+            session_healthy: true,
+        }
     }
 
-    async fn drive(&mut self, lease: &mut super::pool::SessionLease) -> Result<()> {
+    /// 在给定链路上驱动派发；链路死亡返回 [`LINK_DEAD`] 标记错误，
+    /// 由远程模式重连后继续驱动同一 runner（保留账本/屏障状态）。
+    pub(crate) async fn drive(&mut self, link: &mut DispatchLink) -> Result<()> {
+        self.drive_link(link, false).await
+    }
+
+    /// 远程模式：resume=true 时不重发 Execute（重挂同一执行器继续）。
+    pub(crate) async fn drive_with_resume(
+        &mut self,
+        link: &mut DispatchLink,
+        resume: bool,
+    ) -> Result<()> {
+        self.drive_link(link, resume).await
+    }
+
+    pub(crate) fn runner(
+        attempt: Attempt,
+        node: Node,
+        predecessors: BTreeMap<String, StoredValue>,
+        observations: Option<ObservationStore>,
+    ) -> Self {
+        Self::new(attempt, node, predecessors, observations)
+    }
+
+    /// `resume`：重连后继续驱动同一任务（不重发 Execute；输入传输幂等
+    /// 重传；已授权未 Outcome 的操作重发许可——许可由主进程权威生成，
+    /// 绑定当前会话，非旧会话重放）。
+    async fn drive_link(&mut self, link: &mut DispatchLink, resume: bool) -> Result<()> {
         // 读取当前 run 快照，构造 Execute 任务面。
         let run = self.snapshot().await?;
         let record = run
@@ -152,17 +200,45 @@ impl DispatchRunner {
             observability: self.observations.is_some(),
         };
         let command_id = format!("cmd-{}", uuid::Uuid::now_v7());
-        lease
-            .to_session
-            .send(ToSession::Send(Message::Execute {
-                command_id: command_id.clone(),
-                dispatch_id: self.attempt.dispatch_id.clone(),
-                task,
-            }))
-            .await
-            .map_err(|_| invalid("executor session closed before execute"))?;
+        if !resume {
+            link.commands
+                .send(ToSession::Send(Message::Execute {
+                    command_id: command_id.clone(),
+                    dispatch_id: self.attempt.dispatch_id.clone(),
+                    task,
+                }))
+                .await
+                .map_err(|_| invalid("executor session closed before execute"))?;
+        } else {
+            // 重挂：授权已提交但 Outcome 未到（许可可能在断线中丢失）时
+            // 重发当前会话许可；其余靠执行器审计重传自然恢复。
+            if let Some(operation) = record.operation.clone() {
+                if operation.outcome.is_none() && !self.cancel_sent {
+                    let request_value = match &operation.request {
+                        StoredValue::Inline(value) => Some(value.clone()),
+                        _ => None,
+                    };
+                    let credential = request_value.and_then(|v| {
+                        v["credential"]["secret_ref"]
+                            .as_str()
+                            .and_then(|name| flow_engine::secrets::get_secret(name))
+                            .filter(|s| !s.is_empty())
+                    });
+                    let _ = link
+                        .commands
+                        .send(ToSession::Send(Message::OperationPermit {
+                            dispatch_id: self.attempt.dispatch_id.clone(),
+                            operation_id: operation.operation_id.clone(),
+                            permit_id: operation.permit_id.clone(),
+                            request_fingerprint: operation.fingerprint.clone(),
+                            credential,
+                        }))
+                        .await;
+                }
+            }
+        }
         // 输入传输（独立任务，与审计读取并发；data 通道）。
-        let transfer_session = lease.to_session.clone();
+        let transfer_session = link.commands.clone();
         let transfer_backend = self.attempt.backend.clone();
         let transfer_input = run.input.clone();
         let transfer_preds = self.predecessors.clone();
@@ -186,10 +262,10 @@ impl DispatchRunner {
                 return Err(err);
             }
             tokio::select! {
-                event = lease.events.recv() => {
+                event = link.events.recv() => {
                     match event {
                         Some(FromSession::Incoming(message)) => {
-                            match self.handle(message, lease).await {
+                            match self.handle(message, link).await {
                                 Ok(Some(())) => {
                                     // 任务完成（ResultCommitted 已发）。
                                     let _ = transfer.await;
@@ -212,12 +288,12 @@ impl DispatchRunner {
                                 return Err(invalid(format!("executor stopped after cancel: {reason}")));
                             }
                             self.session_healthy = false;
-                            return Err(invalid(format!("executor session dead: {reason}")));
+                            return Err(invalid(format!("link-dead: executor session dead: {reason}")));
                         }
                         None => {
                             let _ = transfer.await;
                             self.session_healthy = false;
-                            return Err(invalid("executor session closed"));
+                            return Err(invalid("link-dead: executor session closed"));
                         }
                     }
                 }
@@ -229,8 +305,8 @@ impl DispatchRunner {
                                 self.cancel_sent = true;
                                 self.session_healthy = false; // 取消后进程整体回收
                                 let dispatch = self.attempt.dispatch_id.clone();
-                                let _ = lease
-                                    .to_session
+                                let _ = link
+                                    .commands
                                     .send(ToSession::CancelDispatch(dispatch))
                                     .await;
                             }
@@ -258,7 +334,7 @@ impl DispatchRunner {
     async fn handle(
         &mut self,
         message: Message,
-        lease: &mut super::pool::SessionLease,
+        link: &mut DispatchLink,
     ) -> Result<Option<()>> {
         match message {
             Message::Accepted { dispatch_id, .. } => {
@@ -275,11 +351,11 @@ impl DispatchRunner {
                 if dispatch_id != self.attempt.dispatch_id {
                     return Err(invalid("audit for foreign dispatch"));
                 }
-                self.handle_audit(records, lease).await?;
+                self.handle_audit(records, link).await?;
                 // 尝试推进结果屏障。
                 if let Some(pending) = self.pending_result.take() {
                     if self.durable_seq >= pending.last_audit_seq {
-                        self.apply_result(pending, lease).await?;
+                        self.apply_result(pending, link).await?;
                         return Ok(Some(()));
                     }
                     self.pending_result = Some(pending);
@@ -302,7 +378,7 @@ impl DispatchRunner {
                         last_audit_seq,
                         outcome,
                     };
-                    self.apply_result(pending, lease).await?;
+                    self.apply_result(pending, link).await?;
                     return Ok(Some(()));
                 }
                 if self.pending_result.is_some() {
@@ -329,7 +405,7 @@ impl DispatchRunner {
                     self.pending_operation_request = Some(message);
                     return Ok(None);
                 }
-                self.handle_request_operation(message, lease).await?;
+                self.handle_request_operation(message, link).await?;
                 Ok(None)
             }
             Message::TransferChunk {
@@ -352,7 +428,7 @@ impl DispatchRunner {
                 if entry.chunks.insert(offset, raw).is_some() {
                     return Err(invalid("duplicate transfer chunk"));
                 }
-                self.try_pending_operation(lease).await?;
+                self.try_pending_operation(link).await?;
                 Ok(None)
             }
             Message::InputReady {
@@ -365,7 +441,7 @@ impl DispatchRunner {
                     ready: None,
                 });
                 entry.ready = Some((total_bytes, digest));
-                self.try_pending_operation(lease).await?;
+                self.try_pending_operation(link).await?;
                 Ok(None)
             }
             Message::ObservabilityBatch { dispatch_id, lines } => {
@@ -433,7 +509,7 @@ impl DispatchRunner {
     }
 
     /// 挂起的 RequestOperation 在块齐后重试。
-    async fn try_pending_operation(&mut self, lease: &mut super::pool::SessionLease) -> Result<()> {
+    async fn try_pending_operation(&mut self, link: &mut DispatchLink) -> Result<()> {
         let ready = match &self.pending_operation_request {
             Some(Message::RequestOperation { transfer_id, .. }) => transfer_id
                 .as_ref()
@@ -443,7 +519,7 @@ impl DispatchRunner {
         };
         if ready {
             if let Some(message) = self.pending_operation_request.take() {
-                self.handle_request_operation(message, lease).await?;
+                self.handle_request_operation(message, link).await?;
             }
         }
         Ok(())
@@ -453,7 +529,7 @@ impl DispatchRunner {
     async fn handle_audit(
         &mut self,
         records: Vec<flow_engine::execution_protocol::AuditRecord>,
-        lease: &mut super::pool::SessionLease,
+        link: &mut DispatchLink,
     ) -> Result<()> {
         tracing::info!(
             count = records.len(),
@@ -527,8 +603,8 @@ impl DispatchRunner {
         }
         // AuditAck 仅随连续持久前缀前进；commit_lsn 取 durable 位置。
         let commit_lsn = self.attempt.backend.journal.durable_lsn();
-        let _ = lease
-            .to_session
+        let _ = link
+            .commands
             .send(ToSession::Send(Message::AuditAck {
                 dispatch_id: self.attempt.dispatch_id.clone(),
                 durable_audit_seq: self.durable_seq,
@@ -543,7 +619,7 @@ impl DispatchRunner {
     async fn apply_result(
         &mut self,
         pending: PendingResult,
-        lease: &mut super::pool::SessionLease,
+        link: &mut DispatchLink,
     ) -> Result<()> {
         let result_id = pending.result_id.clone();
         match pending.outcome {
@@ -629,8 +705,8 @@ impl DispatchRunner {
             },
         }
         // 结果已提交：回执使执行器释放槽位（重复派发返回原提交）。
-        let _ = lease
-            .to_session
+        let _ = link
+            .commands
             .send(ToSession::Send(Message::ResultCommitted {
                 dispatch_id: self.attempt.dispatch_id.clone(),
                 result_id,
@@ -768,7 +844,7 @@ impl DispatchRunner {
     async fn handle_request_operation(
         &mut self,
         message: Message,
-        lease: &mut super::pool::SessionLease,
+        link: &mut DispatchLink,
     ) -> Result<()> {
         let Message::RequestOperation {
             dispatch_id,
@@ -893,8 +969,8 @@ impl DispatchRunner {
                     .as_str()
                     .and_then(flow_engine::secrets::get_secret)
                     .filter(|v| !v.is_empty());
-                let _ = lease
-                    .to_session
+                let _ = link
+                    .commands
                     .send(ToSession::Send(Message::OperationPermit {
                         dispatch_id: self.attempt.dispatch_id.clone(),
                         operation_id,
@@ -909,8 +985,8 @@ impl DispatchRunner {
                 // 取消先提交或身份无效：不发 Permit，保存证据并取消派发。
                 self.cancel_sent = true;
                 self.session_healthy = false;
-                let _ = lease
-                    .to_session
+                let _ = link
+                    .commands
                     .send(ToSession::CancelDispatch(self.attempt.dispatch_id.clone()))
                     .await;
                 Err(error)

@@ -22,6 +22,16 @@ FLOW_EXECUTOR_BIN=/path/to/flow-executor FLOW_EXECUTION_MODE=ipc cargo run -p fl
 - 同数据集单写者；一个 run 只绑定一种执行模式；master epoch 随 IPC 启动持久提交。
 - 取消/强杀执行器：缺口与不确定副作用按一期规则保留（uncertain 等待/Integrity 标记），重启不重发已授权操作。
 
+## 三期远程执行模式（agent 中继）
+
+主进程增加远程执行端口（`FLOW_EXECUTION_MODE=remote`）：每台执行机运行
+`flow-agent`（mTLS 上联，CN=agent_id），agent 管理本机 `flow-executor` 并
+有界公平中继；审计/确认仍端到端来自主进程 journal（agent 不产生权威
+ACK/Permit）。断线后 agent 保留执行器并退避重连，Resume 清单由主进程按
+日志裁决（AlreadyCommitted/UploadOnly/SubmitExistingResult/CancelAndDrain/
+ReconcileRequired）；drain 用于升级下线。部署/证书/边界见 `docs/AGENT_OPS.md`。
+测试：`cargo test -p flow-backend --test journal_remote --test journal_remote_tls --test journal_remote_reconnect --test journal_remote_ops`。
+
 本地运行一个定义：
 
 ```sh

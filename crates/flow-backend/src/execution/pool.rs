@@ -5,19 +5,17 @@
 //! 关闭父端，兄弟进程不继承连接。任一通道故障 → 会话 Draining → 宽限
 //! 后 kill → wait/reap；已取消/故障任务的进程统一回收重建，不直接复用。
 
-use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use flow_engine::execution_protocol::contract::{
-    DRAIN_GRACE_MS, EXECUTOR_CONTROL_FD_SLOT, EXECUTOR_DATA_FD_SLOT, HEARTBEAT_TIMEOUT_MS,
-    STARTUP_TIMEOUT_MS,
+    DRAIN_GRACE_MS, HEARTBEAT_TIMEOUT_MS, STARTUP_TIMEOUT_MS,
 };
 use flow_engine::execution_protocol::message::Message;
 use flow_engine::execution_protocol::transport::{
@@ -200,52 +198,9 @@ async fn spawn_and_handshake(
     session_id: &str,
     tag: Option<&str>,
 ) -> Result<RawSession, PoolError> {
-    let (parent, child_pair) =
-        socketpair_channels().map_err(|e| PoolError::Spawn(e.to_string()))?;
-    let child_control = child_pair.control.as_raw_fd();
-    let child_data = child_pair.data.as_raw_fd();
-    let mut command = Command::new(bin);
-    if let Some(tag) = tag {
-        command.arg(format!("--tag {tag}"));
-    }
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::inherit())
-        .kill_on_drop(true);
-    // pre_exec 只做允许的低层 FD 操作：dup2/close/getrlimit。禁止分配
-    // 内存、加锁或调用普通异步代码（二期 §3.1）。
-    unsafe {
-        command.pre_exec(move || {
-            // 1) 目标 FD 复制到固定槽位（dup2 产物不带 CLOEXEC）。
-            if libc::dup2(child_control, EXECUTOR_CONTROL_FD_SLOT) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::dup2(child_data, EXECUTOR_DATA_FD_SLOT) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // 2) 关闭原 FD。
-            if child_control != EXECUTOR_CONTROL_FD_SLOT {
-                libc::close(child_control);
-            }
-            if child_data != EXECUTOR_DATA_FD_SLOT {
-                libc::close(child_data);
-            }
-            // 3) 关闭其余继承 FD（父端 + 兄弟进程的 socketpair），防泄漏。
-            let limit = fd_limit();
-            let mut fd: i32 = 3;
-            while fd < limit {
-                if fd != EXECUTOR_CONTROL_FD_SLOT && fd != EXECUTOR_DATA_FD_SLOT {
-                    libc::close(fd);
-                }
-                fd += 1;
-            }
-            Ok(())
-        });
-    }
-    let mut child = command
-        .spawn()
-        .map_err(|e| PoolError::Spawn(format!("{}: {e}", bin.display())))?;
+    let (parent, mut child, child_pair) =
+        flow_engine::execution_protocol::spawn::spawn_executor_process(bin, tag)
+            .map_err(|e| PoolError::Spawn(format!("{}: {e}", bin.display())))?;
     let child_pid = child.id();
     // 父进程关闭子端副本（子进程内已 dup2 到槽位）。
     drop(child_pair);
@@ -378,17 +333,3 @@ async fn session_driver(
     drop(transport);
 }
 
-/// 子进程 FD 上限（getrlimit 是 pre_exec 安全的低层调用）。
-fn fd_limit() -> i32 {
-    unsafe {
-        let mut limit = libc::rlimit {
-            rlim_cur: 4096,
-            rlim_max: 4096,
-        };
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
-            limit.rlim_cur.min(65_536) as i32
-        } else {
-            4096
-        }
-    }
-}

@@ -1,6 +1,6 @@
 # JSONL 重构三期：远程 agent
 
-日期：2026-09-30。状态：**设计已迁入，产品实现未开始**。承接 [二期本地 IPC](JSONL_MASTER_EXECUTOR_PHASE2_PLAN.md)，任务独立见 [R0–R3 清单](JSONL_MASTER_EXECUTOR_PHASE3_TASK_LIST.md)。基础数据契约继续引用 [一期](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md)。
+日期：2026-09-30；更新：2026-10-02。状态：**R0–R3 已实现并通过开发验收（模拟中继等价/双 TLS 端到端/断线对账/运维容量回归；生产切换与真实 WAN 压测未执行）。**承接 [二期本地 IPC](JSONL_MASTER_EXECUTOR_PHASE2_PLAN.md)，任务独立见 [R0–R3 清单](JSONL_MASTER_EXECUTOR_PHASE3_TASK_LIST.md)。基础数据契约继续引用 [一期](JSONL_MASTER_EXECUTOR_REFACTOR_PLAN.md)。
 
 三期从二期 I10 的进程池、IPC 与验收证据出发，增加远程连接/认证、路由、中继、机器资源和断线对账。它不回到一期重新实现存储，也不成为一期/二期上线前置条件。
 
@@ -150,6 +150,6 @@ agent 上报 CPU/内存/可用槽位/待确认字节/本地存储水位；主进
 <a id="phase3-approval"></a>
 ## 3. 三期实施与验收状态
 
-本轮仅迁移设计与任务，R0–R3 尚未执行。后续单独记录实际用户授权、网络/机器负载、协议版本与验收证据。R0-01 的前置交付是 [二期 I10](JSONL_MASTER_EXECUTOR_PHASE2_TASK_LIST.md#task-i10)。
+R0-01/R1-01/R2-01/R3-01 于 2026-10-02 实现完成（开发验收口径），R3-02 按约定 skipped：本地模拟中继与直接路径权威事实一致；flow-agent 双 TLS（mTLS CN 映射身份、data 一次性凭据绑定）真实进程端到端通过；断线对账（Resume/ResumeReply 五裁决、无双重执行、断线期间取消）通过；drain/多机隔离/容量串行通过。未执行项：生产切换、真实 WAN/多日 soak 压测、主进程 HA（按 §1.8 不在本期范围）。R0-01 的前置交付是 [二期 I10](JSONL_MASTER_EXECUTOR_PHASE2_TASK_LIST.md#task-i10)。
 
 R2/R3 覆盖 §1.7 的远程故障矩阵，并回归一期持久业务事实和二期进程/IPC 语义。主进程 HA、日志复制、跨分区事务与 §2 按需扩展都不是默认三期范围。计划、验收和生产切换分别记录。

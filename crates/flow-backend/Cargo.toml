@@ -10,7 +10,13 @@ sha2.workspace = true
 hex.workspace = true
 base64 = "0.22"
 libc = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+x509-parser = { workspace = true }
 tracing-subscriber = { workspace = true }
+flow-agent = { path = "../flow-agent" }
+rcgen = { workspace = true }
 clap.workspace = true
 cron-parser.workspace = true
 sqlx.workspace = true
@@ -37,4 +43,9 @@ chrono = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 libc = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 tracing-subscriber = { workspace = true }
+flow-agent = { path = "../flow-agent" }
+rcgen = { workspace = true }

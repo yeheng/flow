@@ -209,6 +209,7 @@ fn handle_message(
                 journal_id: identity.journal_id.clone(),
                 window_bytes: limits.window_bytes,
                 transfers: IncomingTransfers::default(),
+                last_result: None,
             };
             tokio::spawn(async move {
                 let end = runner.run().await;
