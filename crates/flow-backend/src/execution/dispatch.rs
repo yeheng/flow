@@ -198,11 +198,11 @@ impl DispatchRunner {
         let command_id = format!("cmd-{}", uuid::Uuid::now_v7());
         if !resume {
             link.commands
-                .send(ToSession::Send(Message::Execute {
+                .send(ToSession::Send(Box::new(Message::Execute {
                     command_id: command_id.clone(),
                     dispatch_id: self.attempt.dispatch_id.clone(),
                     task,
-                }))
+                })))
                 .await
                 .map_err(|_| invalid("executor session closed before execute"))?;
         } else {
@@ -222,13 +222,13 @@ impl DispatchRunner {
                     });
                     let _ = link
                         .commands
-                        .send(ToSession::Send(Message::OperationPermit {
+                        .send(ToSession::Send(Box::new(Message::OperationPermit {
                             dispatch_id: self.attempt.dispatch_id.clone(),
                             operation_id: operation.operation_id.clone(),
                             permit_id: operation.permit_id.clone(),
                             request_fingerprint: operation.fingerprint.clone(),
                             credential,
-                        }))
+                        })))
                         .await;
                 }
             }
@@ -262,7 +262,7 @@ impl DispatchRunner {
                 event = link.events.recv() => {
                     match event {
                         Some(FromSession::Incoming(message)) => {
-                            match self.handle(message, link).await {
+                            match self.handle(*message, link).await {
                                 Ok(Some(())) => {
                                     // 任务完成（ResultCommitted 已发）。
                                     let _ = transfer.await;
@@ -601,12 +601,12 @@ impl DispatchRunner {
         let commit_lsn = self.attempt.backend.journal.durable_lsn();
         let _ = link
             .commands
-            .send(ToSession::Send(Message::AuditAck {
+            .send(ToSession::Send(Box::new(Message::AuditAck {
                 dispatch_id: self.attempt.dispatch_id.clone(),
                 durable_audit_seq: self.durable_seq,
                 durable_bytes: self.durable_bytes,
                 commit_lsn,
-            }))
+            })))
             .await;
         Ok(())
     }
@@ -703,10 +703,10 @@ impl DispatchRunner {
         // 结果已提交：回执使执行器释放槽位（重复派发返回原提交）。
         let _ = link
             .commands
-            .send(ToSession::Send(Message::ResultCommitted {
+            .send(ToSession::Send(Box::new(Message::ResultCommitted {
                 dispatch_id: self.attempt.dispatch_id.clone(),
                 result_id,
-            }))
+            })))
             .await;
         Ok(())
     }
@@ -967,13 +967,13 @@ impl DispatchRunner {
                     .filter(|v| !v.is_empty());
                 let _ = link
                     .commands
-                    .send(ToSession::Send(Message::OperationPermit {
+                    .send(ToSession::Send(Box::new(Message::OperationPermit {
                         dispatch_id: self.attempt.dispatch_id.clone(),
                         operation_id,
                         permit_id: operation.permit_id.clone(),
                         request_fingerprint,
                         credential,
-                    }))
+                    })))
                     .await;
                 Ok(())
             }
@@ -1068,24 +1068,24 @@ async fn transfer_one(
         }
         hash.update(&buffer[..n]);
         session
-            .send(ToSession::Send(Message::TransferChunk {
+            .send(ToSession::Send(Box::new(Message::TransferChunk {
                 dispatch_id: dispatch_id.into(),
                 transfer_id: transfer_id.into(),
                 offset,
                 bytes: STANDARD.encode(&buffer[..n]),
                 digest: hex_sha(&buffer[..n]),
-            }))
+            })))
             .await
             .map_err(|_| ())?;
         offset += n as u64;
     }
     session
-        .send(ToSession::Send(Message::InputReady {
+        .send(ToSession::Send(Box::new(Message::InputReady {
             dispatch_id: dispatch_id.into(),
             transfer_id: transfer_id.into(),
             total_bytes: offset,
             digest: hex_sha_result(&hash),
-        }))
+        })))
         .await
         .map_err(|_| ())?;
     Ok(())

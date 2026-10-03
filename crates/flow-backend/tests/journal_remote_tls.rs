@@ -20,7 +20,6 @@ fn executor_bin() -> std::path::PathBuf {
         .and_then(|p| p.parent())
         .expect("workspace root");
     for profile in ["debug", "release"] {
-        let candidate = root.join("profile").join(profile).join("flow-executor");
         let candidate = root.join("target").join(profile).join("flow-executor");
         if candidate.is_file() {
             return candidate;

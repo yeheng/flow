@@ -107,7 +107,7 @@ pub fn module(
             let request=p.get("request_id").map(|v|v.as_str().ok_or_else(||invalid("request_id must be a string"))).transpose()?;
             // 写命令必须带稳定 request_id：无幂等键的客户端重试=双 run/双
             // workflow（服务端无 UUID 透传键可去重）。读面免检。
-            if !matches!(method.as_ref(),"run.observations.page"|"command.status"|"workflow.list"|"run.list"|"legacy.list"|"workflow.get"|"run.get"|"legacy.get"|"run.events.page"|"run.audit.page")
+            if !matches!(method,"run.observations.page"|"command.status"|"workflow.list"|"run.list"|"legacy.list"|"workflow.get"|"run.get"|"legacy.get"|"run.events.page"|"run.audit.page")
                 && request.is_none_or(|id| id.trim().is_empty()) {
                 return Err(invalid("request_id required for write commands"));
             }

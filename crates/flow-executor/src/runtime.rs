@@ -282,8 +282,6 @@ fn handle_message(
     }
 }
 
-fn cancel_acker_removed() {}
-
 async fn heartbeat_loop(outbound: mpsc::Sender<Message>, _session_id: String, interval: Duration) {
     let mut ticker = tokio::time::interval(interval.max(Duration::from_millis(100)));
     loop {

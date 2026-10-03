@@ -6,7 +6,7 @@ use flow_backend::journal::JournalBackend;
 use flow_engine::journal_state::Run;
 use flow_journal::{JournalOptions, StoredValue};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,20 +32,6 @@ fn executor_bin() -> std::path::PathBuf {
         }
     }
     panic!("flow-executor binary not built; run: cargo build -p flow-executor");
-}
-
-async fn ipc_backend(root: &std::path::Path) -> Arc<JournalBackend> {
-    let backend = JournalBackend::open(root, JournalOptions::default())
-        .await
-        .unwrap();
-    start_ipc(&backend).await;
-    backend
-}
-
-async fn start_ipc(backend: &Arc<JournalBackend>) {
-    flow_backend::start_execution_from_env(backend)
-        .await
-        .unwrap_or_else(|e| panic!("ipc start failed (is flow-executor built?): {e}"));
 }
 
 /// 强制 IPC 模式（绕过环境变量，测试内显式指定二进制）。
@@ -76,18 +62,6 @@ async fn ipc_backend_sized(
         .await
         .unwrap();
     backend
-}
-
-fn ipc_mode() -> flow_backend::execution::ExecutionMode {
-    ipc_mode_tagged(None)
-}
-
-fn ipc_mode_tagged(tag: Option<String>) -> flow_backend::execution::ExecutionMode {
-    flow_backend::execution::ExecutionMode::Ipc(flow_backend::execution::IpcOptions {
-        executor_bin: executor_bin(),
-        x_max: 2,
-        tag,
-    })
 }
 
 async fn install(b: &JournalBackend, definition: Value) -> String {
@@ -240,10 +214,10 @@ async fn http_call_requires_permit_and_persists_outcome_via_ipc() {
             }
         }
         let body = json!({"echo": "ok"});
+        let payload = body.to_string();
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.to_string().len(),
-            body.to_string()
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            payload.len(),
         );
         socket.write_all(response.as_bytes()).await.unwrap();
     });
@@ -539,7 +513,6 @@ async fn restart_reuses_committed_preparation_without_reevaluation() {
     })
     .await;
     let prepared = waiting.nodes["n"].prepared.clone();
-    let deadline = waiting.nodes["n"].wait.as_ref().unwrap().wake_at;
     backend.close().await.unwrap();
     drop(backend);
     let backend = ipc_backend_explicit(&root).await;
@@ -766,7 +739,6 @@ async fn ipc_mixed_business_matrix() {
     .await;
 
     let runs = 48u64;
-    let batch = runs / 4;
     let started = std::time::Instant::now();
     let latencies = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
     let terminal_count = Arc::new(AtomicU64::new(0));

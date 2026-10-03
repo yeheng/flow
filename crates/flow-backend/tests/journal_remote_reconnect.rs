@@ -54,11 +54,6 @@ fn agent_config() -> AgentConfig {
     }
 }
 
-/// 双向流代理：drop 测试侧句柄即剪断（模拟网络断开）。
-struct CutLink {
-    _hold: tokio::io::DuplexStream,
-}
-
 async fn proxy_pair(
     manager: &Arc<flow_backend::execution::remote::AgentManager>,
     agent_id: &str,

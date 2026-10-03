@@ -718,7 +718,7 @@ impl State {
                         // retry）期间 run 仍是 running；只有不确定外部结果
                         // （平台故障面）才进入 awaiting_resume——同词同义，
                         // 运维看到 awaiting_resume 即代表需要人工介入。
-                        run.status = if wait_kind_uncertain(&p) {
+                        run.status = if wait_kind_uncertain(p) {
                             "awaiting_resume".into()
                         } else {
                             "running".into()

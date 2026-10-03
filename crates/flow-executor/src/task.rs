@@ -386,7 +386,7 @@ impl TaskRunner {
         audit: &mut AuditStream,
     ) -> Result<Prepared, TaskError> {
         let predecessors: BTreeMap<String, StoredValue> =
-            self.task.predecessors.to_vec().into_iter().collect();
+            self.task.predecessors.iter().cloned().collect();
         let templates = serde_json::to_string(&node.params)?.contains("${");
         let params = if !templates {
             node.params.clone()

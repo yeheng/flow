@@ -1,7 +1,7 @@
 //! 本地执行器绑定池（agent 侧）：BindExecutor → spawn + 本地握手 →
 //! BindExecutorAck；取消/断线回收；Resume 事实（最后确认游标/固定结果）。
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,7 +49,7 @@ pub enum PoolError {
 
 /// 绑定一个派发到新执行器进程并完成本地握手（确认后才转发 Execute）。
 pub async fn bind_executor(
-    bin: &PathBuf,
+    bin: &Path,
     journal_id: &str,
     master_epoch: u64,
     relay: &Arc<parking_lot::Mutex<Relay>>,
@@ -121,6 +121,9 @@ pub async fn bind_executor(
 }
 
 /// 执行器会话循环：本地转发 + 事实旁路记录 + 取消回收（kill/reap）。
+/// 五个旁路事实句柄独立原子量（每执行器一份，取消/回收路径各自置位），
+/// 打包成结构只会把返回值式访问换成 lock；调用点就一处，保持位置参数。
+#[allow(clippy::too_many_arguments)]
 async fn executor_loop(
     dispatch_id: String,
     mut transport: FrameTransport,

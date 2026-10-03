@@ -176,6 +176,9 @@ struct BoundDispatch {
     notify: Notify,
 }
 
+// 字段是会话重构/记账事实：身份三件套在会话替换与 Resume 裁决路径被读，
+// bind_acks 是 bind 握手应答表；cli-side 观察者可另行读取（允许未读告警）。
+#[allow(dead_code)]
 struct AgentRegistration {
     agent_id: String,
     agent_boot_id: String,
@@ -210,6 +213,8 @@ struct PendingData {
     notify: Notify,
 }
 
+// bind 挂起登记：agent_id/executor_id 在超时清理与诊断路径读取。
+#[allow(dead_code)]
 struct PendingBind {
     agent_id: String,
     executor_id: String,
@@ -481,7 +486,6 @@ impl AgentManager {
         .await
         .map_err(|_| "data bind timeout".to_string())?
         .map_err(|e: ProtocolError| e.to_string())?;
-        ();
 
         // 3) 注册会话（替换旧会话：旧 outbound 关闭 → 相关 runner link-dead）。
         let (outbound, mut commands) = mpsc::channel::<ToSession>(256);
@@ -522,21 +526,21 @@ impl AgentManager {
                             ToSession::Send(message) => {
                                 // 业务帧按已确认路由包装；管理帧
                                 // （BindExecutor/ResumeReply/Drain…）直接发送。
-                                let frame = if
-                                    flow_engine::execution_protocol::remote::routable(&message)
-                                {
+                                let frame = if flow_engine::execution_protocol::remote::routable(
+                                    &message,
+                                ) {
                                     match message
                                         .dispatch_id()
                                         .and_then(|id| routings.get(id))
                                     {
                                         Some(routing) => Message::Routed {
                                             envelope: routing.envelope.clone(),
-                                            inner: Box::new(message),
+                                            inner: message,
                                         },
                                         None => continue, // 未绑定：不发送
                                     }
                                 } else {
-                                    message
+                                    *message
                                 };
                                 transport.send(frame).await.map_err(|e| format!("send: {e}"))?;
                             }
@@ -589,7 +593,7 @@ impl AgentManager {
                                 }
                                 let _ = routing
                                     .events
-                                    .send(crate::execution::pool::FromSession::Incoming(*inner))
+                                    .send(crate::execution::pool::FromSession::Incoming(inner))
                                     .await;
                             }
                             Message::BindExecutorAck {
@@ -942,10 +946,10 @@ impl AgentManager {
         );
         registration
             .outbound
-            .send(ToSession::Send(Message::BindExecutor {
+            .send(ToSession::Send(Box::new(Message::BindExecutor {
                 executor_id,
                 dispatch_id: dispatch_id.clone(),
-            }))
+            })))
             .await
             .map_err(|_| invalid("agent session closed before bind"))?;
         match tokio::time::timeout(Duration::from_millis(STARTUP_TIMEOUT_MS * 4), ack_rx).await {
@@ -999,7 +1003,7 @@ impl AgentManager {
             *binding.slot_permit.lock().await = None;
             if let Some(registration) = self.agents.lock().await.get(&binding.agent_id).cloned() {
                 // 安全递减（会话替换后的计数以当前水位为准，不下溢）。
-                let _ = registration.slots_used.fetch_update(
+                let _ = registration.slots_used.try_update(
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                     |used| used.checked_sub(1),
@@ -1035,7 +1039,7 @@ impl AgentManager {
             .ok_or_else(|| invalid(format!("agent {agent_id} not connected")))?;
         registration
             .outbound
-            .send(ToSession::Send(Message::Drain { grace_ms }))
+            .send(ToSession::Send(Box::new(Message::Drain { grace_ms })))
             .await
             .map_err(|_| invalid("agent session closed"))?;
         Ok(())

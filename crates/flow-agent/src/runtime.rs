@@ -311,7 +311,7 @@ pub async fn resume(
 }
 
 async fn cancel_all(handles: &Arc<tokio::sync::Mutex<BTreeMap<String, ExecutorHandle>>>) {
-    for (_, handle) in handles.lock().await.iter() {
+    for handle in handles.lock().await.values() {
         handle.cancel.cancel();
     }
     handles.lock().await.clear();
@@ -322,6 +322,10 @@ async fn cancel_all(handles: &Arc<tokio::sync::Mutex<BTreeMap<String, ExecutorHa
 /// 上联管道（桥 + relay 包装）由调用方常驻持有，`uplink_rx` 跨会话复用；
 /// 本函数只消费当前 transport。`journal_id` / `master_epoch` 来自本会话
 /// Welcome，BindExecutor 时下发给执行器握手（ValueRef 盖章身份）。
+///
+/// `_agent_boot_id` / `_link_session_id` 由调用方在别处消费（relay 槽换新），
+/// 这里保留形状签名避免两套入口分流。
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     config: &AgentConfig,
     _agent_boot_id: &str,
@@ -385,7 +389,7 @@ pub async fn serve(
                             // Drain 会话内不会再有新 Bind（Drain 帧处理后直接
                             // 关闭返回）；这里不做状态检查。
                             let bound = pool::bind_executor(
-                                &config.executor_bin,
+                                config.executor_bin.as_path(),
                                 journal_id,
                                 master_epoch,
                                 &relay,

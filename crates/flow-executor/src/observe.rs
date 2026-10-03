@@ -32,13 +32,9 @@ pub struct ObservationLoss {
     pub dropped_bytes: AtomicU64,
 }
 
-pub struct ObservationBridge {
-    #[allow(dead_code)]
-    dispatch_id: Option<String>,
-    #[allow(dead_code)]
-    outbound: mpsc::Sender<Message>,
-    loss: Arc<ObservationLoss>,
-}
+/// 观测转发的命名空间：`start` 起后台转发，`disabled_logger` 起静默出口；
+/// 无实例状态（所有事实经 `Arc<ObservationLoss>` 返回给调用方）。
+pub struct ObservationBridge;
 
 impl ObservationBridge {
     /// 启动观测转发：NodeLogger 的 unbounded 出口（日志永远不影响执行）

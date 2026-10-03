@@ -84,9 +84,14 @@ pub fn channels_from_raw(control_fd: i32, data_fd: i32) -> std::io::Result<Chann
     })
 }
 
-/// 一条通道的读任务产物。
+/// 一条通道的读任务产物。`Frame` 装箱：`Message` 最大变体携带完整
+/// `ExecuteTask`（数百字节），装箱后事件枚举与队列槽位收缩到指针大小——
+/// I/O 事件量等于消息流量，不装箱等于每帧复制整个 payload。
+/// `Failed`/`Eof` 只经 recv 消费，构造态字段本身不被读；allow 随装箱后
+/// 变体差异收窄仍保留（错误码分支保持不变）。
+#[allow(dead_code)]
 enum IoEvent {
-    Frame(Channel, Message),
+    Frame(Channel, Box<Message>),
     Failed(Channel, ProtocolError),
     Eof(Channel),
 }
@@ -188,7 +193,7 @@ impl FrameTransport {
     /// 协议帧错误（非法长度/未知类型/畸形信封）先返回错误，随后通道关闭。
     pub async fn recv(&mut self) -> Result<(Channel, Message), ProtocolError> {
         match self.incoming.recv().await {
-            Some(IoEvent::Frame(channel, message)) => Ok((channel, message)),
+            Some(IoEvent::Frame(channel, message)) => Ok((channel, *message)),
             Some(IoEvent::Failed(_, error)) => Err(error),
             Some(IoEvent::Eof(_)) => Err(ProtocolError::Closed),
             None => Err(ProtocolError::Closed),
@@ -210,7 +215,7 @@ impl FrameTransport {
     /// 尽力先弹出已缓冲帧；无则 None（非阻塞窥视）。
     pub fn try_recv(&mut self) -> Option<(Channel, Message)> {
         match self.incoming.try_recv() {
-            Ok(IoEvent::Frame(channel, message)) => Some((channel, message)),
+            Ok(IoEvent::Frame(channel, message)) => Some((channel, *message)),
             _ => None,
         }
     }
@@ -273,7 +278,11 @@ async fn read_loop(
                             return;
                         }
                     };
-                    if events.send(IoEvent::Frame(channel, message)).await.is_err() {
+                    if events
+                        .send(IoEvent::Frame(channel, Box::new(message)))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -548,7 +557,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::contract::*;
+    use super::super::contract::{MAX_AUDIT_RECORD_BYTES, REQUIRED_CAPABILITIES, W_BYTES};
     use super::*;
 
     async fn pair() -> (FrameTransport, FrameTransport) {
@@ -608,7 +617,7 @@ mod tests {
 
     #[tokio::test]
     async fn data_channel_carries_transfer_and_control_stays_separate() {
-        let (mut a, mut b) = pair().await;
+        let (a, mut b) = pair().await;
         a.send(Message::TransferChunk {
             dispatch_id: "d".into(),
             transfer_id: "t".into(),
@@ -642,7 +651,6 @@ mod tests {
         let mut a = FrameTransport::spawn(parent, 8);
         let mut _peer = FrameTransport::spawn(child, 8);
         use tokio::io::AsyncWriteExt;
-        let mut evil = evil;
         evil.set_nonblocking(true).unwrap();
         let mut evil = tokio::net::UnixStream::from_std(evil).unwrap();
         evil.write_all(&u32::MAX.to_be_bytes()).await.unwrap();

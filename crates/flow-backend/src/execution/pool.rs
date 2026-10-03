@@ -5,7 +5,7 @@
 //! 关闭父端，兄弟进程不继承连接。任一通道故障 → 会话 Draining → 宽限
 //! 后 kill → wait/reap；已取消/故障任务的进程统一回收重建，不直接复用。
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,18 +32,20 @@ pub enum PoolError {
     Unavailable(String),
 }
 
-/// 主进程 → 会话驱动命令。
+/// 主进程 → 会话驱动命令。`Send` 装箱：`Message` 最大变体携带完整
+/// `ExecuteTask`，装箱使枚举收缩到指针大小，命令队列每个槽位少搬数百字节。
 pub enum ToSession {
-    Send(Message),
+    Send(Box<Message>),
     /// 持久取消已提交：发 Cancel 并等待排空（宽限后 kill）。
     CancelDispatch(String),
     /// 会话整体回收（派发失败/通道故障/关停）。
     Recycle,
 }
 
-/// 会话驱动 → 当前派发的事件。
+/// 会话驱动 → 当前派发的事件。`Incoming` 装箱理由同 `ToSession::Send`：
+/// 消息流经有界队列，槽位大小决定每帧的复制成本。
 pub enum FromSession {
-    Incoming(Message),
+    Incoming(Box<Message>),
     /// 会话死亡（通道 EOF/错误/心跳超时或回收完成）；此后不再有事件。
     Dead(String),
 }
@@ -189,7 +191,7 @@ impl ExecutorPool {
 
 /// spawn 执行器并完成握手；子进程由会话驱动任务持有并负责 kill/reap。
 async fn spawn_and_handshake(
-    bin: &PathBuf,
+    bin: &Path,
     journal_id: &str,
     master_epoch: u64,
     executor_id: &str,
@@ -261,7 +263,7 @@ async fn session_driver(
             command = command_rx.recv() => {
                 match command {
                     Some(ToSession::Send(message)) => {
-                        if transport.send(message).await.is_err() {
+                        if transport.send(*message).await.is_err() {
                             break;
                         }
                     }
@@ -287,7 +289,11 @@ async fn session_driver(
                         if matches!(message, Message::Heartbeat { .. }) {
                             continue;
                         }
-                        if event_tx.send(FromSession::Incoming(message)).await.is_err() {
+                        if event_tx
+                            .send(FromSession::Incoming(Box::new(message)))
+                            .await
+                            .is_err()
+                        {
                             // 派发端已离开：保留会话等待下一个租约或回收。
                         }
                     }
@@ -312,12 +318,13 @@ async fn session_driver(
     // 回收：宽限期收尾（尽力 Stopped/迟到审计）→ kill → wait/reap。
     let grace = Duration::from_millis(DRAIN_GRACE_MS);
     let _ = tokio::time::timeout(grace, async {
-        loop {
-            match transport.recv().await {
-                Ok((_channel, message)) => {
-                    let _ = event_tx.send(FromSession::Incoming(message)).await;
-                }
-                Err(_) => break,
+        while let Ok((_channel, message)) = transport.recv().await {
+            if event_tx
+                .send(FromSession::Incoming(Box::new(message)))
+                .await
+                .is_err()
+            {
+                break;
             }
         }
     })
