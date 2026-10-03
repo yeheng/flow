@@ -315,6 +315,26 @@ pub fn redact_value(value: &Value) -> Value {
     }
 }
 
+/// 输入面快照的完整脱敏：先按敏感键走 [`redact_value`]，字符串叶子再过
+/// [`redact_url`]——`url` 不是敏感键，query 里的 `?token=…` 藏在**值**里，
+/// 键名脱敏管不到。快照即展示（DESIGN §6.1「没有第二个出口」），执行用的
+/// 展开后 params 不经此函数。
+pub fn redact_snapshot(value: &Value) -> Value {
+    fn walk(value: &Value) -> Value {
+        match value {
+            Value::String(text) => Value::String(redact_url(text)),
+            Value::Array(items) => Value::Array(items.iter().map(walk).collect()),
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .map(|(key, item)| (key.clone(), walk(item)))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+    walk(&redact_value(value))
+}
+
 /// URL 的 query 串脱敏：命中敏感键的参数值替换为 `"***"`。
 ///
 /// `redact_value` 只认识 JSON 键，URL 是字符串、管不到；而 `?api_key=…`

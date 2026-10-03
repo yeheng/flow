@@ -145,7 +145,7 @@ pub(crate) async fn expand_params(
         let params = params.clone();
         let input = input.clone();
         move || {
-            expr::expand_templates(
+            expr::expand_templates_bounded(
                 &params,
                 &input,
                 &nodes,
@@ -341,7 +341,7 @@ async fn run_script(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
     let logger = ctx.logger.clone();
     // rquickjs 是同步 CPU 执行，必须放到阻塞线程池，避免占死 tokio worker
     let out = tokio::task::spawn_blocking(move || {
-        expr::eval_body(&code, &input, &nodes, timeout, &logger)
+        expr::eval_body_bounded(&code, &input, &nodes, timeout, &logger)
     })
     .await
     .map_err(|e| NodeFailure::fatal(format!("脚本任务异常：{e}")));
@@ -365,11 +365,12 @@ async fn run_condition(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
     let input = ctx.input.clone();
     let nodes = ctx.nodes_value();
     let timeout = ctx.js_timeout();
-    let result =
-        tokio::task::spawn_blocking(move || expr::eval_expr(&expression, &input, &nodes, timeout))
-            .await
-            .map_err(|e| NodeFailure::fatal(format!("条件求值任务异常：{e}")))?
-            .map_err(NodeFailure::from);
+    let result = tokio::task::spawn_blocking(move || {
+        expr::eval_expr_bounded(&expression, &input, &nodes, timeout)
+    })
+    .await
+    .map_err(|e| NodeFailure::fatal(format!("条件求值任务异常：{e}")))?
+    .map_err(NodeFailure::from);
     match &result {
         // 分支走向从日志一目了然：求值结果 + 真值判定
         Ok(value) => ctx.logger.debug(format!(
@@ -483,12 +484,16 @@ async fn run_http(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
     let response = match request.send().await {
         Ok(response) => response,
         Err(err) if err.is_builder() => {
-            // URL/请求头非法：请求从未发出，参数错误重试也不会变好（DESIGN §6.5）
+            // URL/请求头非法：请求从未发出，参数错误重试也不会变好（DESIGN §6.5）。
+            // reqwest 错误 Display 自带 ` for url (…)` 原样回显查询串，必须剥离；
+            // 脱敏 URL 只走 url_label 这一份。
+            let err = err.without_url();
             ctx.logger.error(format!("请求参数非法：{err}（未发出）"));
             return Err(NodeFailure::fatal(format!("请求参数非法：{err}")));
         }
         Err(err) => {
             // 连接失败/超时：副作用不明确或未发生，交给重试策略
+            let err = err.without_url();
             ctx.logger.error(format!(
                 "请求 {url_label} 失败（{}ms）：{err}",
                 started.elapsed().as_millis()
@@ -515,6 +520,7 @@ async fn run_http(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
         Ok(text) => text,
         // 连接在读完响应头之后断开：body 不完整。不能带着 200 + 空 body 记成功
         Err(err) => {
+            let err = err.without_url();
             ctx.logger.error(format!(
                 "读取 {url_label} 响应体失败（{}ms）：{err}",
                 started.elapsed().as_millis()
@@ -587,12 +593,16 @@ async fn post_json_bearer(
         Ok(response) => response,
         Err(err) if err.is_builder() => {
             // URL 非法：请求从未发出，参数错误重试也不会变好
-            return Err(NodeFailure::fatal(format!("请求参数非法：{err}")));
+            return Err(NodeFailure::fatal(format!(
+                "请求参数非法：{}",
+                err.without_url()
+            )));
         }
         Err(err) => {
             return Err(NodeFailure::retryable(format!(
-                "请求 {url_label} 失败（{}ms）：{err}",
-                started.elapsed().as_millis()
+                "请求 {url_label} 失败（{}ms）：{}",
+                started.elapsed().as_millis(),
+                err.without_url()
             )));
         }
     };
@@ -601,8 +611,9 @@ async fn post_json_bearer(
         Ok(text) => text,
         Err(err) => {
             return Err(NodeFailure::retryable(format!(
-                "读取 {url_label} 响应体失败（{}ms）：{err}",
-                started.elapsed().as_millis()
+                "读取 {url_label} 响应体失败（{}ms）：{}",
+                started.elapsed().as_millis(),
+                err.without_url()
             )));
         }
     };

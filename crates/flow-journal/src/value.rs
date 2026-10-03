@@ -139,17 +139,35 @@ pub struct ValueProgress {
     chunks: u64,
     bytes: u64,
 }
+/// 快照的发布尾部缓冲：live 引用之外的最近发布也保留（在飞窗口）。
+pub const PUBLISHED_TAIL: usize = 8192;
+
 pub type ValueUndo = (String, Option<ValueProgress>, Option<ValueRef>);
 impl ValueCatalog {
-    pub fn snapshot(&self) -> Result<Value> {
+    /// 快照保留 `live` 引用到的已发布值 ∪ **最近 [`PUBLISHED_TAIL`] 条发布**。
+    ///
+    /// 只留 live 不够：audit 事务发布值与引用它的 NodeCompleted/结果事务
+    /// 是**两个事务**，checkpoint 落在中间时，重放后缀的 values.check 会因
+    /// published 缺项而拒绝重放。uuid v7 键序 = 发布时间序，尾部缓冲覆盖
+    /// 一切在飞窗口（在飞发布数 ≤ A_max=16 全局并发，≪ 8192）；终态 run
+    /// 的历史值越过缓冲后照常逐出——checkpoint 不再被无界 published 打死。
+    pub fn snapshot(&self, live: &std::collections::HashSet<String>) -> Result<Value> {
         use sha2::digest::common::hazmat::SerializableState;
+        let tail_start = self.published.len().saturating_sub(PUBLISHED_TAIL);
+        let published: BTreeMap<String, ValueRef> = self
+            .published
+            .iter()
+            .enumerate()
+            .filter(|(index, (id, _))| *index >= tail_start || live.contains(*id))
+            .map(|(_, (id, value))| (id.clone(), value.clone()))
+            .collect();
         // Bound derived-cache allocations before building the JSON tree.
-        crate::codec::bounded_json(&self.published, 8 * 1024 * 1024)?;
+        crate::codec::bounded_json(&published, 8 * 1024 * 1024)?;
         if self.streams.len() > 8192 {
             return Err(crate::Error::Limit("checkpoint stream budget".into()));
         }
         let streams=self.streams.iter().map(|(id,s)|serde_json::json!({"id":id,"chunks":s.chunks.to_string(),"bytes":s.bytes.to_string(),"sha256_state":STANDARD.encode(s.hash.serialize())})).collect::<Vec<_>>();
-        Ok(serde_json::json!({"version":1,"streams":streams,"published":self.published}))
+        Ok(serde_json::json!({"version":1,"streams":streams,"published":published}))
     }
     pub fn from_snapshot(value: Value) -> Result<Self> {
         use sha2::digest::common::hazmat::{SerializableState, SerializedState};

@@ -584,24 +584,38 @@ pub async fn open_from_env() -> Result<AnyBackend, BackendError> {
     }
 }
 
-/// 二期 I09：按环境变量（FLOW_EXECUTION_MODE / FLOW_EXECUTOR_BIN）选择
-/// 执行模式并启动调度。IPC 模式二进制缺失/版本不兼容直接失败，不静默
-/// 落回进程内执行。
+/// 按环境变量（FLOW_EXECUTION_MODE / FLOW_EXECUTOR_BIN / FLOW_REMOTE_*）
+/// 选择执行模式并启动调度。非法值与资源缺失（ipc 无执行器二进制、remote
+/// 缺 FLOW_REMOTE_* 配置）一律直接失败——静默落回进程内执行会把「进程隔离/
+/// 远程执行」的部署承诺变成空气（二期 I09、三期 R1 的共同纪律）。
 pub async fn start_execution_from_env(
     backend: &std::sync::Arc<crate::journal::JournalBackend>,
 ) -> Result<(), crate::journal::JournalError> {
-    match execution::mode_from_env() {
-        Ok(execution::ExecutionMode::InProcess) => backend.start_execution().await,
-        Ok(mode @ execution::ExecutionMode::Ipc(_)) => backend.start_execution_ipc(mode).await,
-        Err(error) if error.starts_with("invalid FLOW_EXECUTION_MODE") => Err(
-            crate::journal::JournalError::Journal(flow_journal::Error::Invalid(error)),
-        ),
-        Err(_) => match execution::remote_options_from_env() {
-            // mode_from_env 找不到执行器二进制时回落检查 remote 模式。
-            Ok(options) if std::env::var("FLOW_EXECUTION_MODE").as_deref() == Ok("remote") => {
-                backend.start_execution_remote(options).await
-            }
-            _ => backend.start_execution().await,
-        },
+    let mode = std::env::var("FLOW_EXECUTION_MODE").unwrap_or_default();
+    let invalid = |message: String| {
+        crate::journal::JournalError::Journal(flow_journal::Error::Invalid(message))
+    };
+    match mode.as_str() {
+        "" | "in_process" => backend.start_execution().await,
+        "ipc" => {
+            let execution::ExecutionMode::Ipc(options) = execution::mode_from_env()
+                .map_err(|error| invalid(format!("FLOW_EXECUTION_MODE=ipc: {error}")))?
+            else {
+                return Err(invalid(
+                    "FLOW_EXECUTION_MODE=ipc: internal parse mismatch".into(),
+                ));
+            };
+            backend
+                .start_execution_ipc(execution::ExecutionMode::Ipc(options))
+                .await
+        }
+        "remote" => {
+            let options = execution::remote_options_from_env()
+                .map_err(|error| invalid(format!("FLOW_EXECUTION_MODE=remote: {error}")))?;
+            backend.start_execution_remote(options).await
+        }
+        other => Err(invalid(format!(
+            "invalid FLOW_EXECUTION_MODE={other:?}; expected in_process|ipc|remote"
+        ))),
     }
 }

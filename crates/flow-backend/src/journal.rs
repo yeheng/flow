@@ -557,6 +557,40 @@ impl JournalBackend {
             >= receipt.commit_cursor.lsn;
         Ok(Some(receipt))
     }
+
+    /// 幂等前置检查（含业务指纹校验）：命中已提交命令返回回执，调用方
+    /// 据此跳过输入值的重复 store；同身份不同参数 → Conflict（与 command()
+    /// 内部去重同一语义，重试路径不得绕过指纹校验）。
+    pub async fn deduped_command(
+        &self,
+        scope: &str,
+        request_id: Option<&str>,
+        request: &Value,
+    ) -> Result<Option<CommandReceipt>> {
+        let Some(id) = request_id.filter(|id| !id.is_empty()) else {
+            return Ok(None);
+        };
+        let fingerprint = flow_journal::codec::fingerprint(request, 9 * 1024 * 1024)?;
+        let mut committed = self.state.lock().await;
+        self.refresh_locked(&mut committed).await?;
+        let Some(original) = committed
+            .state
+            .commands
+            .get(&command_key(scope, id))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        if original.fingerprint != fingerprint {
+            return Err(flow_journal::Error::Conflict(
+                "same request identity with different arguments".into(),
+            )
+            .into());
+        }
+        let receipt = self.receipt(&original);
+        drop(committed);
+        Ok(Some(self.visible(receipt).await?))
+    }
     pub fn pause_projection(&self, paused: bool) {
         self.paused.store(paused, Ordering::Relaxed);
         self.changed.notify_waiters();
@@ -580,7 +614,10 @@ impl JournalBackend {
         let mut committed = self.state.lock().await;
         self.refresh_locked(&mut committed).await?;
         let upper = committed.state.applied_lsn;
-        let snapshot = serde_json::json!({"state":committed.state,"values":committed.state.values.snapshot()?});
+        // 已发布值快照只保留仍被状态引用的 Ref：终态 run 的历史值不进
+        // checkpoint（见 ValueCatalog::snapshot 的安全依据）。
+        let live = live_output_ids(&committed.state);
+        let snapshot = serde_json::json!({"state":committed.state,"values":committed.state.values.snapshot(&live)?});
         let root = self.journal.root().to_path_buf();
         drop(committed);
         tokio::task::spawn_blocking(move || {
@@ -666,4 +703,39 @@ fn project_rows(state: &State, tx: &Transaction) -> flow_journal::Result<Vec<Pro
             })
         })
         .collect()
+}
+
+/// 状态仍引用的已发布值 id 集：把整个状态序列化后递归扫 ValueRef 的
+/// serde 形状（`journal_id`+`output_id`+`digest` 三键同现即命中）。
+/// 任何被 runs/workflows/commands/attempts 持有的 StoredValue::Ref 都
+/// 躲不过这层扫描——按字段枚举引用面则永远怕漏一处。
+fn live_output_ids(state: &State) -> std::collections::HashSet<String> {
+    fn walk(value: &Value, live: &mut std::collections::HashSet<String>) {
+        match value {
+            Value::Object(map) => {
+                if map.contains_key("journal_id")
+                    && map.contains_key("digest")
+                    && map.contains_key("chunk_count")
+                {
+                    if let Some(output_id) = map.get("output_id").and_then(Value::as_str) {
+                        live.insert(output_id.to_string());
+                    }
+                }
+                for child in map.values() {
+                    walk(child, live);
+                }
+            }
+            Value::Array(items) => {
+                for child in items {
+                    walk(child, live);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut live = std::collections::HashSet::new();
+    if let Ok(value) = serde_json::to_value(state) {
+        walk(&value, &mut live);
+    }
+    live
 }

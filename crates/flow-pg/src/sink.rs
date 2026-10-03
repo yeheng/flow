@@ -154,8 +154,12 @@ impl PgRunSink {
         }
         let mut tx = self.begin().await?;
         self.lock_and_check(&mut tx, None).await?;
+        // ended_at 以事件日志为准（与 SQLite 臂 recover_unfinished 同一契约：
+        // 「别把重启/接管时刻伪装成结束时刻」）。折叠态没有结束时间戳时
+        // 才退回 clock_timestamp()。
+        let ended_at = state.ended_at.unwrap_or_else(chrono::Utc::now);
         sqlx::query(
-            "UPDATE runs SET status = $1, output = $2, error = $3, ended_at = clock_timestamp(),
+            "UPDATE runs SET status = $1, output = $2, error = $3, ended_at = $5,
                     lease_owner = NULL, lease_expires_at = NULL
              WHERE id = $4",
         )
@@ -163,6 +167,7 @@ impl PgRunSink {
         .bind(state.output.clone())
         .bind(state.fatal_error.clone())
         .bind(&self.run_id)
+        .bind(ended_at)
         .execute(&mut *tx)
         .await
         .map_err(Self::sql_err)?;

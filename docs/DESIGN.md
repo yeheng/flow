@@ -65,16 +65,23 @@ crates/
                 也不读 FLOW_BACKEND——CRUD 与触发语义唯一来源仍是 RPC 那一份
 ```
 
-依赖方向（不可反转）：
+依赖方向（2026-10-03 与 Cargo.toml 对齐复查后的**现状**；v1 语义权威仍是本文，
+JSONL 世代 crate 的行为契约见各期设计文档）：
 
 ```
 flow-rpc ──> flow-backend ──> flow-engine ──> flow-dto
-                         ├──> flow-store ──> flow-dto
-                         └──> flow-pg ────> flow-engine, flow-dto
+           ├─> flow-journal  （v2 值分页/下载）
+           └─> flow-engine   （nodetypes.list 复用 NodeType::descriptor，单一来源）
+flow-backend ──> flow-store / flow-pg / flow-journal / flow-dto
+             └─> [仅 dev-dependencies] flow-agent（journal_remote* 测试）
+flow-engine ──> flow-dto
+            └─> flow-journal（只共享 StoredValue/ValueRef 词汇与 codec 预算
+                 函数——引擎不依赖任何存储 I/O，状态出口仍走 RunEventSink）
 flow-pg ──> flow-store   ✗（两个后端互相独立，互不感知）
-flow-engine ✗ flow-*     （引擎不依赖存储；状态出口走 RunEventSink trait）
 flow-rpc ──> flow-store / flow-pg   ✗（上层不感知具体后端）
-flow-cli ──> flow-server（WebSocket 客户端）──> 上面的整条链路
+flow-journal ──> 无 flow 依赖（叶子；被 engine/backend/rpc/agent/executor 复用）
+flow-agent / flow-executor ──> flow-engine, flow-journal（JSONL 二/三期执行侧）
+flow-cli ──> flow-server / flow-journal-server（纯 RPC 客户端）──> 上面的链路
 flow-cli ──> flow-store / flow-pg ✗   ✗（CLI 不碰存储与事件日志，
                 没有第二条写入路径；SQLite / Postgres 对 CLI 行为一致）
 ```
@@ -1085,3 +1092,15 @@ volume 上。Docker 只在容器**自己退出**时（`--rm`）回收匿名 volu
 - 不指定 run_id 的全局订阅仍有后端差异：SQLite 只推本进程事件、Postgres 推
   全集群增量；指定 run_id 的回放 + 追流 + 终态结束语义两后端已统一
   （flow-backend 的 run_tail 状态机，见 §3.4）。
+
+### v1/v2 已知语义差异（切换日的行为变更面，parity 安全网见 journal_parity.rs）
+
+- **retry 范围**：v1 对 retryable 的 http/llm/email 失败（5xx/超时/429）自动
+  重试（§6.5）；v2 的重试只覆盖纯计算节点（script/condition），外部操作
+  失败一律进 uncertain 等待人工裁决——**绝不自动重发已授权的外部操作**
+  （JSONL_DEVELOPMENT「不会自动重发未知外部操作」，v2 核心安全立场）。
+- **子 run id 派生**：v1 确定性派生 `{父run}:{节点}:{attempt}`（不变量 11）；
+  v2 用 uuid v7 + 「WaitRegistered 与子 RunStarted 同事务」保证原子性与幂等，
+  不依赖派生式。
+- v2 的 run.start 已要求稳定 `request_id`（写命令幂等键），v1 的
+  `run.start` 客户端幂等键仍未做（见上）。

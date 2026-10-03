@@ -414,6 +414,25 @@ pub fn eval_expr(
     )
 }
 
+/// 有界版 [`eval_expr`]：与 v2 执行端口同一份 `JsLimits` 预算。
+pub fn eval_expr_bounded(
+    expr: &str,
+    input: &Value,
+    nodes: &Value,
+    timeout: Duration,
+) -> Result<Value, EngineError> {
+    let body = format!("    return ({expr});");
+    run_js_limited(
+        &body,
+        input,
+        nodes,
+        &Value::Null,
+        timeout,
+        &NodeLogger::disabled(),
+        Some(JsLimits::default()),
+    )
+}
+
 /// 展开字符串中的 `${expr}` 模板。所有节点 params 的统一前置展开
 /// （`exec::expand_params`；script.code / condition.expr 等 opaque 字段除外）。
 ///

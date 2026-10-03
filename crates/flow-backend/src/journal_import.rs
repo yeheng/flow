@@ -246,6 +246,14 @@ pub async fn import(source: &Path, db: &Path, destination: &Path) -> Result<Valu
     baseline(&backend,"source",json!({"source_id":identity,"database":relative_db,"files":inventory})).await?;
     let backup=destination.join("legacy-source");
     copy_evidence(&source,&backup,&inventory)?;
+    // 源库可能带着崩溃遗留的 -wal（清单允许没有 -shm）：只读打开无法跑
+    // WAL 恢复会直接失败。先以可写打开**副本**（不动源）checkpoint 归并
+    // WAL，再切换只读读取——源证据保持字节原样。
+    {
+        let recover=sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(backup.join(&relative_db))).await?;
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&recover).await?;
+        recover.close().await;
+    }
     let pool=sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(backup.join(&relative_db)).read_only(true)).await?;
     let mut snapshot=pool.begin().await?;
     let mut counts=BTreeMap::new();

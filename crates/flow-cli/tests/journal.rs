@@ -70,7 +70,7 @@ async fn v2_binary_calls_pages_and_downloads_without_overwriting() {
         for _ in 0..2 {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0; 4096];
-            socket.read(&mut request).await.unwrap();
+            let _ = socket.read(&mut request).await;
             socket.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n").await.unwrap();
         }
     });

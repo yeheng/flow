@@ -34,17 +34,51 @@ pub fn spawn_executor_process(
     unsafe {
         command.pre_exec(move || {
             use super::contract::{EXECUTOR_CONTROL_FD_SLOT, EXECUTOR_DATA_FD_SLOT};
-            if libc::dup2(child_control, EXECUTOR_CONTROL_FD_SLOT) < 0 {
+            // 槽位冲突矩阵：socketpair fd 恰好落在 100/101 上时，无脑按序
+            // dup2 会先覆盖还没搬家的另一端（data==100 时 control 的 dup2
+            // 直接抹掉 data；cross 情况两端互占）。经 spare 中转处理。
+            let mut spare = fd_limit() - 1;
+            while spare > EXECUTOR_DATA_FD_SLOT && libc::fcntl(spare, libc::F_GETFD) >= 0 {
+                spare -= 1;
+            }
+            if spare <= EXECUTOR_DATA_FD_SLOT {
                 return Err(std::io::Error::last_os_error());
             }
-            if libc::dup2(child_data, EXECUTOR_DATA_FD_SLOT) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if child_control != EXECUTOR_CONTROL_FD_SLOT {
+            if child_data == EXECUTOR_CONTROL_FD_SLOT && child_control == EXECUTOR_DATA_FD_SLOT {
+                // 交叉：control→spare→101，data→100。
+                if libc::dup2(child_control, spare) < 0
+                    || libc::dup2(child_data, EXECUTOR_CONTROL_FD_SLOT) < 0
+                    || libc::dup2(spare, EXECUTOR_DATA_FD_SLOT) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
                 libc::close(child_control);
-            }
-            if child_data != EXECUTOR_DATA_FD_SLOT {
                 libc::close(child_data);
+                libc::close(spare);
+            } else if child_data == EXECUTOR_CONTROL_FD_SLOT {
+                // data 占了 control 的槽：先搬 data，control 的 dup2 才不会抹掉它。
+                if libc::dup2(child_data, EXECUTOR_DATA_FD_SLOT) < 0
+                    || libc::dup2(child_control, EXECUTOR_CONTROL_FD_SLOT) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                libc::close(child_data);
+                if child_control != EXECUTOR_CONTROL_FD_SLOT {
+                    libc::close(child_control);
+                }
+            } else {
+                if libc::dup2(child_control, EXECUTOR_CONTROL_FD_SLOT) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::dup2(child_data, EXECUTOR_DATA_FD_SLOT) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if child_control != EXECUTOR_CONTROL_FD_SLOT {
+                    libc::close(child_control);
+                }
+                if child_data != EXECUTOR_DATA_FD_SLOT {
+                    libc::close(child_data);
+                }
             }
             // 关闭其余继承 FD（父端 + 兄弟 socketpair），防泄漏/串配。
             let limit = fd_limit();

@@ -31,6 +31,10 @@ mod snapshot_decimal {
     }
 }
 
+/// 幂等回执保留窗口：超过即按 lsn 淘汰最旧一半（远大于 R_max=1000 的
+/// 在飞 run 数，正常重试永远落在窗口内）。
+const COMMAND_WINDOW: usize = 8192;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workflow {
     pub workflow_id: String,
@@ -387,6 +391,21 @@ impl State {
                         return Err(invalid("duplicate committed command identity"));
                     }
                     self.commands.insert(key, command);
+                    // 幂等窗口有界：回ceipt 保留最近 COMMAND_WINDOW 条
+                    //（按 lsn 序淘汰最旧一半），长跑服务内存不随命令数
+                    // 无界增长。重放确定性：阈值与淘汰规则只依赖事件序。
+                    if self.commands.len() > COMMAND_WINDOW {
+                        let mut order: Vec<(u64, String)> = self
+                            .commands
+                            .iter()
+                            .map(|(key, record)| (record.lsn, key.clone()))
+                            .collect();
+                        order.sort_unstable();
+                        let evict = self.commands.len() - COMMAND_WINDOW / 2;
+                        for (_, key) in order.into_iter().take(evict) {
+                            self.commands.remove(&key);
+                        }
+                    }
                 }
                 return Ok(());
             }
@@ -695,7 +714,15 @@ impl State {
                     EventKind::WaitRegistered => {
                         node.status = "waiting".into();
                         node.wait = Some(serde_json::from_value(p["wait"].clone())?);
-                        run.status = "awaiting_resume".into();
+                        // 与 v1 词汇对齐：正常业务等待（delay/human/child/
+                        // retry）期间 run 仍是 running；只有不确定外部结果
+                        // （平台故障面）才进入 awaiting_resume——同词同义，
+                        // 运维看到 awaiting_resume 即代表需要人工介入。
+                        run.status = if wait_kind_uncertain(&p) {
+                            "awaiting_resume".into()
+                        } else {
+                            "running".into()
+                        };
                     }
                     _ => {
                         node.status = "failed".into();
@@ -711,7 +738,7 @@ impl State {
                                 child_run_id: None,
                                 output: None,
                             });
-                            run.status = "awaiting_resume".into();
+                            run.status = "running".into();
                         }
                     }
                 }
@@ -756,6 +783,11 @@ fn restore<T>(map: &mut BTreeMap<String, T>, undo: BTreeMap<String, Option<T>>) 
             }
         }
     }
+}
+
+/// WaitRegistered 载荷的等待是否「不确定外部结果」（uncertain）。
+fn wait_kind_uncertain(payload: &Value) -> bool {
+    payload["wait"]["kind"].as_str() == Some("uncertain")
 }
 fn replace_config(map: &mut BTreeMap<String, Value>, payload: &Value, key: &str) -> Result<()> {
     let id = string(payload, key)?;

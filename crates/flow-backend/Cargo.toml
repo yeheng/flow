@@ -15,7 +15,6 @@ rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 x509-parser = { workspace = true }
 tracing-subscriber = { workspace = true }
-flow-agent = { path = "../flow-agent" }
 rcgen = { workspace = true }
 clap.workspace = true
 cron-parser.workspace = true

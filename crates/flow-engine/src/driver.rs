@@ -25,7 +25,7 @@ use crate::exec::{self, ChildRunSpec, NodeExecContext, NodeFailure};
 use crate::fold::{NodeState, RunState};
 use crate::model::{Definition, Node, NodeType};
 use crate::nodelog::{
-    cap_input_snapshot, redact_value, truncate_message, LogBudget, LogLine, NodeLogger,
+    cap_input_snapshot, redact_snapshot, truncate_message, LogBudget, LogLine, NodeLogger,
 };
 
 /// 单次驱动所需的全部输入。
@@ -90,7 +90,7 @@ async fn build_node_prep(
     input: &Value,
 ) -> NodePrep {
     if node.kind() == Some(NodeType::HumanTask) {
-        let snapshot = cap_input_snapshot(&redact_value(&node.params));
+        let snapshot = cap_input_snapshot(&redact_snapshot(&node.params));
         return NodePrep {
             node,
             snapshot,
@@ -102,7 +102,7 @@ async fn build_node_prep(
     match exec::expand_params(&node, input, &outputs).await {
         Ok(expanded) => {
             let node = expanded.unwrap_or(node);
-            let snapshot = cap_input_snapshot(&redact_value(&node.params));
+            let snapshot = cap_input_snapshot(&redact_snapshot(&node.params));
             NodePrep {
                 node,
                 snapshot,

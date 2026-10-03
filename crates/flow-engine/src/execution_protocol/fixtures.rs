@@ -104,12 +104,14 @@ pub fn valid_messages() -> Vec<Message> {
             credential: Some("token".into()),
         },
         Message::TransferChunk {
+            dispatch_id: "dispatch-09".into(),
             transfer_id: "in-1".into(),
             offset: 0,
             bytes: "aGVsbG8=".into(),
             digest: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".into(),
         },
         Message::InputReady {
+            dispatch_id: "dispatch-09".into(),
             transfer_id: "in-1".into(),
             total_bytes: 5,
             digest: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".into(),

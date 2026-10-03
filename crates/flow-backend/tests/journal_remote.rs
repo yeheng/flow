@@ -90,6 +90,8 @@ async fn spawn_simulated_agent(
             }
         };
         let flow_engine::execution_protocol::Message::AgentWelcome {
+            journal_id,
+            master_epoch,
             link_session_id,
             data_credential,
             ..
@@ -106,15 +108,22 @@ async fn spawn_simulated_agent(
             .await
             .expect("send data bind");
         // serve 内部依赖 relay/绑定/执行器循环；直接复用 run_agent 的 serve。
-        let relay = Arc::new(std::sync::Mutex::new(flow_agent::relay::Relay::new(
+        let relay = Arc::new(parking_lot::Mutex::new(flow_agent::relay::Relay::new(
             agent_id_placeholder(&config),
             boot,
             link_session_id,
         )));
         let handles = Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
-        let reason =
-            flow_agent::runtime::serve_for_tests(&config, transport, relay, handles, shutdown)
-                .await;
+        let reason = flow_agent::runtime::serve_for_tests(
+            &config,
+            &journal_id,
+            master_epoch,
+            transport,
+            relay,
+            handles,
+            shutdown,
+        )
+        .await;
         let _ = reason;
     });
 }
@@ -397,4 +406,109 @@ fn relay_cannot_wrap_authoritative_control_frames() {
         heartbeat_ms: 1,
         agent_window_bytes: 1,
     }));
+}
+
+/// 三期回归（P0）：远程执行器产生的非 inline 值（http_call 的 Bytes 编码
+/// body_raw、>64KiB 的 script 输出）必须携带**主进程 journal_id**——reducer
+/// 会拒绝 journal_id 不符的 ValuePublished（value.rs 的硬校验）。历史上
+/// agent 把自己的 agent_id 当 journal_id 传给执行器握手，导致所有 http/
+/// llm/email 节点与所有大输出在 remote 模式下必然提交失败；当时的验收用例
+/// 只用了小 inline 输出，恰好绕开了这条路径。
+#[tokio::test]
+async fn remote_http_and_large_output_commit_refs() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    init_tracing();
+    // 本地 HTTP stub：响应体 >64KiB（超 INLINE_BYTES，必走 Ref）。
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let response = json!({"data": "x".repeat(70_000)}).to_string();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        response.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+
+    let root = temp();
+    let backend = JournalBackend::open(&root, JournalOptions::default())
+        .await
+        .unwrap();
+    let manager = flow_backend::execution::remote::AgentManager::new(
+        backend.clone(),
+        backend.journal.id().into(),
+        1,
+    );
+    backend
+        .start_execution_remote_manager(manager.clone(), remote_options())
+        .await
+        .unwrap();
+    spawn_simulated_agent(&manager, "agent-ref", 4).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let definition = json!({
+        "nodes": [
+            {"id":"s","type":"start"},
+            {"id":"h","type":"http_call","params":{"url": format!("http://{addr}/v1/data")}},
+            {"id":"big","type":"script","params":{"code": "return { blob: 'y'.repeat(70000) };"}},
+            {"id":"e","type":"end"}
+        ],
+        "edges": [
+            {"from":"s","to":"h"},
+            {"from":"h","to":"big"},
+            {"from":"big","to":"e"}
+        ]
+    });
+    let flow = install(&backend, definition).await;
+    let created = backend
+        .run_start(&flow, None, json!({}), "manual", None, None)
+        .await
+        .unwrap();
+    let run_id = created.result["run_id"].as_str().unwrap().to_string();
+    let done = until(&backend, &run_id, Run::terminal).await;
+    assert_eq!(
+        done.status,
+        "succeeded",
+        "remote 非_inline 值必须能提交：{:?}; nodes: {:?}",
+        done.error,
+        done.nodes
+            .iter()
+            .map(|(id, n)| (id.clone(), n.status.clone(), n.error.clone()))
+            .collect::<Vec<_>>()
+    );
+
+    // http 输出是 Bytes Ref：journal_id 必须是主进程 journal 的 id。
+    let http_output = done.nodes["h"].output.clone().unwrap();
+    let expected_journal = backend.journal.id().to_string();
+    for (node_id, output) in [
+        ("h", http_output.clone()),
+        ("big", done.nodes["big"].output.clone().unwrap()),
+    ] {
+        let StoredValue::Ref(reference) = output else {
+            panic!("{node_id} 输出应为 Ref（非 inline）");
+        };
+        assert_eq!(
+            reference.journal_id, expected_journal,
+            "{node_id} 的 ValueRef 必须盖主进程 journal_id"
+        );
+    }
+    let http_value = materialize(&backend, &done, "h").await;
+    assert_eq!(http_value["body"]["data"].as_str().unwrap().len(), 70_000);
+    let big_value = materialize(&backend, &done, "big").await;
+    assert_eq!(big_value["blob"].as_str().unwrap().len(), 70_000);
+    backend.close().await.unwrap();
+    server.abort();
 }

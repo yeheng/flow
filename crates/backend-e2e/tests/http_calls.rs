@@ -184,6 +184,37 @@ e2e_test!(
 );
 
 e2e_test!(
+    http_call_failure_error_does_not_leak_query_secret,
+    |ctx: &mut Ctx| Box::pin(async move {
+        // reqwest 错误 Display 自带 ` for url (…)` 原样回显查询串；错误消息
+        // 必须剥离成脱敏副本（token=***），密钥值不得进入事件日志。
+        let port = backend_e2e::common::free_port();
+        {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+            drop(listener);
+        }
+        let client = ctx.client().await;
+        let definition = http_def_full(json!({
+            "method": "GET",
+            "url": format!("http://127.0.0.1:{port}/nope?token=hunter2-secret&page=2"),
+            "retry": {"max_attempts": 1, "backoff_ms": 10}
+        }));
+        let (workflow_id, _) = publish_workflow(&client, "泄漏", definition).await;
+        let run_id = start_run(&client, &workflow_id, json!({})).await;
+        let run = wait_run_terminal(&client, &run_id, SHORT).await;
+        assert_eq!(run["run"]["status"], json!("failed"), "{run}");
+
+        let events: Value = call_json(&client, "run.events", json!({"run_id": run_id})).await;
+        let blob = events.to_string();
+        assert!(
+            !blob.contains("hunter2-secret"),
+            "密钥值泄漏进事件日志：{blob}"
+        );
+        assert!(blob.contains("token=***"), "失败消息应回显脱敏 URL：{blob}");
+    })
+);
+
+e2e_test!(
     http_call_hang_then_cancel_marks_run_cancelled,
     |ctx: &mut Ctx| Box::pin(async move {
         // 只接受连接、永不响应：http_call 确定性地挂在请求里（§13 测试约定）

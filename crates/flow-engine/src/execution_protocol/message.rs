@@ -288,7 +288,11 @@ pub enum Message {
         credential: Option<String>,
     },
     /// data，双向。输入分块传输：offset + bytes(base64) + digest。
+    /// `dispatch_id` 是路由键：三期中继按它把帧包进 Routed 信封发往归属
+    /// 执行器（没有它，run_session 查不到路由会静默丢帧——Ref 输入在
+    /// remote 模式下全部黑洞）。
     TransferChunk {
+        dispatch_id: String,
         transfer_id: String,
         offset: u64,
         /// base64 编码后的原始字节；计费包含编码后的体积。
@@ -296,8 +300,9 @@ pub enum Message {
         digest: String,
     },
     /// control，发送方。输入接收器校验并准备完成；不表示新的权威提交，
-    /// 不释放审计持久窗口。
+    /// 不释放审计持久窗口。`dispatch_id` 同 TransferChunk（路由键）。
     InputReady {
+        dispatch_id: String,
         transfer_id: String,
         total_bytes: u64,
         digest: String,
@@ -496,6 +501,8 @@ impl Message {
             | Message::Result { dispatch_id, .. }
             | Message::ResultCommitted { dispatch_id, .. }
             | Message::Cancel { dispatch_id, .. }
+            | Message::TransferChunk { dispatch_id, .. }
+            | Message::InputReady { dispatch_id, .. }
             | Message::Stopped { dispatch_id, .. } => Some(dispatch_id),
             Message::Heartbeat { dispatch_id, .. }
             | Message::ObservabilityBatch { dispatch_id, .. } => dispatch_id.as_deref(),
@@ -654,6 +661,7 @@ impl Message {
                 "credential": credential,
             })),
             Message::TransferChunk {
+                dispatch_id: _,
                 transfer_id,
                 offset,
                 bytes,
@@ -665,6 +673,7 @@ impl Message {
                 digest: digest.clone(),
             }),
             Message::InputReady {
+                dispatch_id: _,
                 transfer_id,
                 total_bytes,
                 digest,
@@ -995,6 +1004,7 @@ impl Message {
                 }
                 let wire: Wire = from_body(&body, type_name)?;
                 Message::TransferChunk {
+                    dispatch_id: dispatch_id(&value)?,
                     transfer_id: wire.transfer_id,
                     offset: wire.offset,
                     bytes: wire.bytes,
@@ -1011,6 +1021,7 @@ impl Message {
                 }
                 let wire: Wire = from_body(&body, type_name)?;
                 Message::InputReady {
+                    dispatch_id: dispatch_id(&value)?,
                     transfer_id: wire.transfer_id,
                     total_bytes: wire.total_bytes,
                     digest: wire.digest,

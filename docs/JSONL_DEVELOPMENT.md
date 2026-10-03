@@ -46,7 +46,7 @@ cargo run -p flow-backend --bin flow-journal-dev -- --data-dir ./target/v2-data 
 
 支持 workflow.create/update/publish/delete、run.start/cancel/signal/adjudicate、command.status、workflow.get、run.get、run.events.page、run.audit.page、schedule.change、webhook.change。cron/webhook 自动触发已接入；另支持 workflow.list/run.list、legacy.get/list、run.observations.page 与 run.subscribe。浏览器使用 /journal 页面，CLI 使用 journal 子命令。
 
-写请求应提供稳定的 `request_id`，重试必须使用相同业务参数。成功结果为包含 `committed`、`commit_cursor`、`request_id`、`result`、`visible` 的回执。错误 `-32020 COMMITTED_NOT_VISIBLE` 的 `data` 是已提交回执：不能当作未提交再次创建，应调用 `command.status` 查询相同 scope/request_id，或用原身份重试。`workflow.create` 的 scope 为 `workflow.create`；手动启动为 `run.start:manual:`；取消/信号/裁决为 `run.cancel:<run_id>`、`run.signal:<run_id>`、`run.adjudicate:<run_id>`。
+写请求**必须**提供稳定的 `request_id`（缺失/空白即拒单）：无幂等键的客户端重试等于双 run/双 workflow。同身份重用不同业务参数返回 Conflict。重试必须使用相同业务参数。成功结果为包含 `committed`、`commit_cursor`、`request_id`、`result`、`visible` 的回执。错误 `-32020 COMMITTED_NOT_VISIBLE` 的 `data` 是已提交回执：不能当作未提交再次创建，应调用 `command.status` 查询相同 scope/request_id，或用原身份重试。`workflow.create` 的 scope 为 `workflow.create`；手动启动为 `run.start:manual:`；取消/信号/裁决为 `run.cancel:<run_id>`、`run.signal:<run_id>`、`run.adjudicate:<run_id>`。命令回执的幂等窗口为最近 8192 条（超窗旧回执按提交序淘汰，超窗重试会生成新命令）。
 
 分页参数含 run_id、可选 cursor、limit（1–256）。后续页使用返回的完整 cursor；空 events 配合非空 next_cursor 表示继续扫描，不代表 run 结束。状态读取返回 StoredValue 与 snapshot_cursor。当前单用户令牌允许读取该数据目录全部 run，不能将此模式当作多租户授权。
 

@@ -242,6 +242,7 @@ impl DispatchRunner {
         let transfer_outcome = previous_outcome.clone();
         let transfer = tokio::spawn(transfer_inputs(
             transfer_session,
+            self.attempt.dispatch_id.clone(),
             transfer_backend,
             transfer_input,
             transfer_preds,
@@ -344,7 +345,6 @@ impl DispatchRunner {
                     return Err(invalid("audit for foreign dispatch"));
                 }
                 self.handle_audit(records, link).await?;
-                // 尝试推进结果屏障。
                 if let Some(pending) = self.pending_result.take() {
                     if self.durable_seq >= pending.last_audit_seq {
                         self.apply_result(pending, link).await?;
@@ -363,7 +363,6 @@ impl DispatchRunner {
                 if dispatch_id != self.attempt.dispatch_id {
                     return Err(invalid("result for foreign dispatch"));
                 }
-                // 屏障未满足时保留有界描述，继续读 data（不阻塞读取）。
                 if self.durable_seq >= last_audit_seq {
                     let pending = PendingResult {
                         result_id,
@@ -401,11 +400,15 @@ impl DispatchRunner {
                 Ok(None)
             }
             Message::TransferChunk {
+                dispatch_id,
                 transfer_id,
                 offset,
                 bytes,
                 digest,
             } => {
+                if dispatch_id != self.attempt.dispatch_id {
+                    return Err(invalid("transfer chunk for foreign dispatch"));
+                }
                 let raw = STANDARD
                     .decode(&bytes)
                     .map_err(|_| invalid("transfer chunk base64"))?;
@@ -424,6 +427,7 @@ impl DispatchRunner {
                 Ok(None)
             }
             Message::InputReady {
+                dispatch_id: _,
                 transfer_id,
                 total_bytes,
                 digest,
@@ -991,6 +995,7 @@ impl DispatchRunner {
 #[allow(clippy::too_many_arguments)]
 async fn transfer_inputs(
     session: tokio::sync::mpsc::Sender<ToSession>,
+    dispatch_id: String,
     backend: Arc<JournalBackend>,
     input: StoredValue,
     predecessors: BTreeMap<String, StoredValue>,
@@ -1037,7 +1042,7 @@ async fn transfer_inputs(
             result
         });
         let mut reader = reader;
-        let send = transfer_one(&session, &transfer_id, &mut reader).await;
+        let send = transfer_one(&session, &dispatch_id, &transfer_id, &mut reader).await;
         let production = produce.await;
         if send.is_err() || production.is_err() {
             return;
@@ -1048,6 +1053,7 @@ async fn transfer_inputs(
 /// 单值分块传输：边读边发（有界管道 → 主进程内存有界）。
 async fn transfer_one(
     session: &tokio::sync::mpsc::Sender<ToSession>,
+    dispatch_id: &str,
     transfer_id: &str,
     reader: &mut (impl tokio::io::AsyncRead + Unpin),
 ) -> std::result::Result<(), ()> {
@@ -1063,6 +1069,7 @@ async fn transfer_one(
         hash.update(&buffer[..n]);
         session
             .send(ToSession::Send(Message::TransferChunk {
+                dispatch_id: dispatch_id.into(),
                 transfer_id: transfer_id.into(),
                 offset,
                 bytes: STANDARD.encode(&buffer[..n]),
@@ -1074,6 +1081,7 @@ async fn transfer_one(
     }
     session
         .send(ToSession::Send(Message::InputReady {
+            dispatch_id: dispatch_id.into(),
             transfer_id: transfer_id.into(),
             total_bytes: offset,
             digest: hex_sha_result(&hash),

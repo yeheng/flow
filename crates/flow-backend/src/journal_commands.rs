@@ -15,6 +15,18 @@ pub(crate) fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+/// 命令幂等前置检查：命中已提交回执直接返回，**不重复 store 输入值**。
+/// store_json 每次都生成新 output_id，重试若先 store 再去重，journal 里
+/// 会累积无主的值垃圾；顺序重试经此检查零垃圾（同键并发的窄窗口仍由
+/// command() 串行去重兜底）。
+async fn deduped(
+    backend: &JournalBackend,
+    scope: &str,
+    request_id: Option<&str>,
+    request: &Value,
+) -> Result<Option<CommandReceipt>> {
+    backend.deduped_command(scope, request_id, request).await
+}
 impl JournalBackend {
     pub async fn trigger_configs(&self, source: &str) -> Vec<Value> {
         self.inspect(|s| {
@@ -108,6 +120,16 @@ impl JournalBackend {
             );
         }
         let request = json!({"run_id":run_id,"node_id":node_id,"operation_id":operation_id,"reason":reason,"output":output});
+        if let Some(receipt) = deduped(
+            self,
+            &format!("run.adjudicate:{run_id}"),
+            Some(request_id),
+            &request,
+        )
+        .await?
+        {
+            return Ok(receipt);
+        }
         let output =
             flow_journal::value::store_json(&self.journal, output, 8 * 1024 * 1024).await?;
         self.command(&format!("run.adjudicate:{run_id}"),Some(request_id),&request,|state|{
@@ -160,6 +182,11 @@ impl JournalBackend {
             &definition,
             flow_journal::MAX_LINE_BYTES,
         )?);
+        if let Some(receipt) =
+            deduped(self, "workflow.update", request_id, &fingerprint_request).await?
+        {
+            return Ok(receipt);
+        }
         let stored = flow_journal::value::store_json(
             &self.journal,
             definition,
@@ -274,8 +301,11 @@ impl JournalBackend {
             return Err(invalid("invalid run source").into());
         }
         let request = json!({"workflow_id":workflow_id,"version":version,"input":input,"source":source,"source_detail":source_detail});
-        let stored = flow_journal::value::store_json(&self.journal, input, 8 * 1024 * 1024).await?;
         let scope = format!("run.start:{source}:{}", source_detail.unwrap_or(""));
+        if let Some(receipt) = deduped(self, &scope, request_id, &request).await? {
+            return Ok(receipt);
+        }
+        let stored = flow_journal::value::store_json(&self.journal, input, 8 * 1024 * 1024).await?;
         self.command(&scope, request_id, &request, |state| {
             if matches!(source, "schedule" | "webhook") {
                 let key = source_detail.ok_or_else(|| invalid("trigger identity required"))?;
@@ -380,6 +410,11 @@ impl JournalBackend {
         request_id: Option<&str>,
     ) -> Result<CommandReceipt> {
         let request = json!({"run_id":run_id,"node_id":node_id,"payload":payload});
+        if let Some(receipt) =
+            deduped(self, &format!("run.signal:{run_id}"), request_id, &request).await?
+        {
+            return Ok(receipt);
+        }
         let output =
             flow_journal::value::store_json(&self.journal, payload, 8 * 1024 * 1024).await?;
         self.command(

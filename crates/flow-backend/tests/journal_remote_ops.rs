@@ -99,6 +99,8 @@ async fn spawn_agent(
             }
         };
         let Message::AgentWelcome {
+            journal_id,
+            master_epoch,
             link_session_id,
             data_credential,
             ..
@@ -117,12 +119,21 @@ async fn spawn_agent(
         {
             return;
         }
-        let relay = Arc::new(std::sync::Mutex::new(flow_agent::relay::Relay::new(
+        let relay = Arc::new(parking_lot::Mutex::new(flow_agent::relay::Relay::new(
             agent_id,
             boot,
             link_session_id,
         )));
-        let _ = serve_for_tests(&config, transport, relay, handles, shutdown).await;
+        let _ = serve_for_tests(
+            &config,
+            &journal_id,
+            master_epoch,
+            transport,
+            relay,
+            handles,
+            shutdown,
+        )
+        .await;
     });
 }
 

@@ -188,7 +188,11 @@ impl JournalBackend {
                                     if wait.kind != "retry" || wait.wake_at.is_none_or(|at|at>chrono::Utc::now().timestamp_millis()) {continue;}
                                 }
                                 if record.status=="succeeded"||record.status=="skipped"{continue}
-                                if record.status=="failed" {finish_run(&backend,&run_id,None,record.error.clone()).await?;break}
+                                // v1 语义（DESIGN §6.6，engine_recovery 钉死）：
+                                // 节点失败不立即终结 run——独立分支继续跑完，失败
+                                // 分支的下游被跳过（reason=upstream_failed），全部
+                                // 节点终态后由收尾判定写 RunFailed。
+                                if record.status=="failed" {continue}
                                 if record.operation.as_ref().is_some_and(|op|op.outcome.is_none()) {
                                     let attempt=Attempt{backend:backend.clone(),run_id:run_id.clone(),node_id:node.id.clone(),dispatch_id:record.dispatch_id.clone()};
                                     attempt.finish(EventKind::WaitRegistered,json!({"wait":Wait{kind:"uncertain".into(),wake_at:None,child_run_id:None,output:None},"integrity":"unknown"})).await?;continue;
@@ -196,17 +200,19 @@ impl JournalBackend {
                             }
                             let incoming=definition.incoming(&node.id);
                             let mut ready=true;let mut skip=false;let mut predecessors=BTreeMap::new();
+                            let mut skip_reason="";
                             for edge in incoming {
                                 match snapshot.nodes.get(&edge.from) {
-                                    Some(n) if n.status=="skipped"=>{skip=true;ready=false;}
-                                    Some(n) if n.status=="succeeded"=>{
+                                    Some(n) if n.status=="skipped"=>{skip=true;ready=false;if skip_reason.is_empty(){skip_reason="upstream_skipped"}}
+                                    Some(n) if n.status=="failed"=>{skip=true;ready=false;if skip_reason.is_empty(){skip_reason="upstream_failed"}}
+                                    Some(n) if n.status=="succeeded"=> {
                                         let accepted=edge.port.as_deref().is_none_or(|port|n.branch==Some(port=="true"));
-                                        if !accepted{skip=true;ready=false;}else if let Some(output)=&n.output{predecessors.insert(edge.from.clone(),output.clone());}
+                                        if !accepted{skip=true;ready=false;if skip_reason.is_empty(){skip_reason="branch_not_taken"}}else if let Some(output)=&n.output{predecessors.insert(edge.from.clone(),output.clone());}
                                     }
                                     _=>ready=false,
                                 }
                             }
-                            if skip {backend.internal(|s|Ok((vec![node_event(&s.runs[&run_id],&node.id,EventKind::NodeSkipped,json!({}),true)],()))).await?;continue}
+                            if skip {backend.internal(|s|Ok((vec![node_event(&s.runs[&run_id],&node.id,EventKind::NodeSkipped,json!({"reason":skip_reason}),true)],()))).await?;continue}
                             if !ready{continue}
                             if tasks.len()>=limit{backend.defer_run(run_id.clone()).await;continue}
                             let attempt=Attempt::begin(backend.clone(),run_id.clone(),node.id.clone()).await?;
@@ -247,9 +253,19 @@ impl JournalBackend {
                             });
                         }
                         let snapshot=backend.inspect(|s|s.runs[&run_id].clone()).await;
-                        if !snapshot.terminal() && definition.nodes.iter().all(|n|snapshot.nodes.get(&n.id).is_some_and(|n|matches!(n.status.as_str(),"succeeded"|"skipped"))) {
-                            let ends=definition.nodes.iter().filter(|n|n.kind()==Some(NodeType::End)).filter_map(|n|snapshot.nodes.get(&n.id).and_then(|r|r.output.clone()).map(|v|(n.id.clone(),v))).collect();
-                            let output=join_values(&backend,ends).await?;finish_run(&backend,&run_id,Some(output),None).await?;
+                        if !snapshot.terminal() && definition.nodes.iter().all(|n|snapshot.nodes.get(&n.id).is_some_and(|n|matches!(n.status.as_str(),"succeeded"|"skipped"|"failed"))) {
+                            // 失败收口（v1 §6.6）：任一节点终态 failed → RunFailed，
+                            // 错误取定义序第一个 failed 节点；否则全部 end 计入
+                            // 输出（无输出/skipped 的 end 记 null，不再丢弃——
+                            // 多 end 时形状恒为 map，与 v1 singular_or_map 一致）。
+                            let failed=definition.nodes.iter().find(|n|snapshot.nodes.get(&n.id).is_some_and(|r|r.status=="failed"));
+                            if let Some(failed_node)=failed {
+                                let error=backend.inspect(|s|s.runs[&run_id].nodes[&failed_node.id].error.clone()).await;
+                                finish_run(&backend,&run_id,None,error).await?;
+                            } else {
+                                let ends=definition.nodes.iter().filter(|n|n.kind()==Some(NodeType::End)).map(|n|(n.id.clone(),snapshot.nodes.get(&n.id).and_then(|r|r.output.clone()).unwrap_or(StoredValue::Inline(Value::Null)))).collect();
+                                let output=join_values(&backend,ends).await?;finish_run(&backend,&run_id,Some(output),None).await?;
+                            }
                         }
                         Ok(())
                     }.await;

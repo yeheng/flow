@@ -192,6 +192,9 @@ impl AuditStream {
                     .map_err(|_| AuditError::Closed)?;
                 self.last_send = Some(tokio::time::Instant::now());
             }
+            // clone 携带的是 self.acks 的旧版本：changed() 在 clone 上恒立即
+            // 就绪 → 等待循环退化成 CPU 热自旋。处理完变更后必须把自身
+            // receiver 的版本同步到最新，下一轮 clone 才会真正等待。
             let mut acks = self.acks.clone();
             tokio::select! {
                 changed = acks.changed() => {
@@ -200,6 +203,7 @@ impl AuditStream {
                     }
                     let (seq_now, bytes_now) = *acks.borrow_and_update();
                     self.ack(seq_now, bytes_now);
+                    let _ = self.acks.borrow_and_update();
                 }
                 _ = cancel.cancelled() => return Err(AuditError::Cancelled),
                 _ = tokio::time::sleep(Duration::from_millis(ACK_RETRANSMIT_MS / 2 + 1)) => {}

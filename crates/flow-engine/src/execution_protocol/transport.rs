@@ -308,9 +308,16 @@ async fn write_loop(
                     "flow-transport: frame encode failed type={} error={error}",
                     message.type_name()
                 );
-                tracing::error!(type_name = message.type_name(), %error, "frame encode failed");
-                broken.store(true, std::sync::atomic::Ordering::SeqCst);
-                return;
+                // 观测是可丢弃数据：编码失败丢帧计数，绝不为它拆除
+                // golden source 会话（审计/结果/传输帧失败仍然断线——
+                // 那是正确性路径，该炸就炸）。
+                if !matches!(message, Message::ObservabilityBatch { .. }) {
+                    tracing::error!(type_name = message.type_name(), %error, "frame encode failed");
+                    broken.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+                tracing::warn!(type_name = message.type_name(), %error, "observability frame dropped");
+                continue;
             }
         };
         // 大载荷分多次 write；写不动时天然背压到发送队列。
@@ -603,6 +610,7 @@ mod tests {
     async fn data_channel_carries_transfer_and_control_stays_separate() {
         let (mut a, mut b) = pair().await;
         a.send(Message::TransferChunk {
+            dispatch_id: "d".into(),
             transfer_id: "t".into(),
             offset: 0,
             bytes: "aGk=".into(),

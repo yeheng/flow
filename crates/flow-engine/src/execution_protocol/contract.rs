@@ -64,6 +64,9 @@ pub const INPUT_TRANSFER_WINDOW_BYTES: u64 = 2 * 1024 * 1024;
 pub const OBSERVABILITY_QUEUE_DEPTH: usize = 256;
 /// 单条 ObservabilityBatch 最多行数。
 pub const OBSERVABILITY_BATCH_LINES: usize = 64;
+/// 单条 ObservabilityBatch 的**转义后**字节预算（保守估计累计）：保证
+/// 编码帧必然落在 DATA_MAX_FRAME 内——观测流量自身永远不能把帧打爆。
+pub const OBSERVABILITY_BATCH_BYTES: usize = DATA_MAX_FRAME / 2;
 /// 观测行消息上限（超出即截断为丢弃计数）。
 pub const OBSERVABILITY_LINE_BYTES: usize = 16 * 1024;
 

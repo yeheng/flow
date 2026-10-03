@@ -2,7 +2,7 @@
 //! BindExecutorAck；取消/断线回收；Resume 事实（最后确认游标/固定结果）。
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,6 +33,12 @@ pub struct ExecutorHandle {
     pub last_acked: Arc<AtomicU64>,
     /// 执行器已生成的固定结果（result_id, last_audit_seq）。
     pub result: Arc<Mutex<Option<(String, u64)>>>,
+    /// Resume 事实：本端主动取消（drain/裁决/停机）杀掉了在飞执行器。
+    pub forced_kill: Arc<AtomicBool>,
+    /// Resume 事实：执行器在无固定结果时失联（未确认审计窗口可能丢失）。
+    pub lost_data: Arc<AtomicBool>,
+    /// executor_loop 走完回收（自然完成或被杀）；drain 宽限等待用。
+    pub done: Arc<AtomicBool>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -46,7 +52,7 @@ pub async fn bind_executor(
     bin: &PathBuf,
     journal_id: &str,
     master_epoch: u64,
-    relay: &Arc<std::sync::Mutex<Relay>>,
+    relay: &Arc<parking_lot::Mutex<Relay>>,
     executor_id: &str,
     dispatch_id: &str,
 ) -> Result<ExecutorHandle, PoolError> {
@@ -77,13 +83,15 @@ pub async fn bind_executor(
     // 登记归属（R0：确认后才允许 Execute 转发）。
     relay
         .lock()
-        .unwrap()
         .bind(dispatch_id, executor_id, &executor_boot_id);
     let (inbox, inbox_rx) = mpsc::channel::<Message>(64);
     let (out_tx, out) = mpsc::channel::<Message>(PER_EXECUTOR_QUEUE);
     let cancel = CancellationToken::new();
     let last_acked = Arc::new(AtomicU64::new(0));
     let result = Arc::new(Mutex::new(None));
+    let forced_kill = Arc::new(AtomicBool::new(false));
+    let lost_data = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
     tokio::spawn(executor_loop(
         dispatch_id.to_string(),
         transport,
@@ -93,6 +101,9 @@ pub async fn bind_executor(
         cancel.clone(),
         last_acked.clone(),
         result.clone(),
+        forced_kill.clone(),
+        lost_data.clone(),
+        done.clone(),
     ));
     Ok(ExecutorHandle {
         dispatch_id: dispatch_id.to_string(),
@@ -103,6 +114,9 @@ pub async fn bind_executor(
         cancel,
         last_acked,
         result,
+        forced_kill,
+        lost_data,
+        done,
     })
 }
 
@@ -116,10 +130,16 @@ async fn executor_loop(
     cancel: CancellationToken,
     last_acked: Arc<AtomicU64>,
     result: Arc<Mutex<Option<(String, u64)>>>,
+    forced_kill: Arc<AtomicBool>,
+    lost_data: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
 ) {
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => break,
+            _ = cancel.cancelled() => {
+                forced_kill.store(true, Ordering::Relaxed);
+                break;
+            }
             inbound = inbox.recv() => {
                 let Some(message) = inbound else { break };
                 if transport.send(message).await.is_err() {
@@ -143,7 +163,13 @@ async fn executor_loop(
                             break;
                         }
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        // 失联且无固定结果：未确认审计窗口视同可能丢失。
+                        if result.lock().await.is_none() {
+                            lost_data.store(true, Ordering::Relaxed);
+                        }
+                        break;
+                    }
                 }
             }
         }
@@ -159,4 +185,5 @@ async fn executor_loop(
     transport.close();
     let _ = child.start_kill();
     let _ = child.wait().await;
+    done.store(true, Ordering::Relaxed);
 }

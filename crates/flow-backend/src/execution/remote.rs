@@ -564,6 +564,7 @@ impl AgentManager {
                         let (channel, message) = received.map_err(|e| format!("recv: {e}"))?;
                         match message {
                             Message::Routed { envelope, inner } => {
+                                eprintln!("[probe-m] routed inner={} dispatch={:?}", inner.type_name(), envelope.dispatch_id);
                                 if channel == flow_engine::execution_protocol::Channel::Control
                                     && matches!(&*inner, Message::DataBind { .. })
                                 {

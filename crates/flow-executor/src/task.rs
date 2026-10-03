@@ -755,6 +755,7 @@ impl TaskRunner {
             {
                 self.outbound
                     .send(Message::TransferChunk {
+                        dispatch_id: self.dispatch_id.clone(),
                         transfer_id: id.clone(),
                         offset,
                         bytes: base64::engine::general_purpose::STANDARD.encode(chunk),
@@ -766,6 +767,7 @@ impl TaskRunner {
             }
             self.outbound
                 .send(Message::InputReady {
+                    dispatch_id: self.dispatch_id.clone(),
                     transfer_id: id.clone(),
                     total_bytes: request_bytes.len() as u64,
                     digest: hex::encode(sha2::Sha256::digest(&request_bytes)),

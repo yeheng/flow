@@ -48,6 +48,8 @@ struct TransferBuffer {
 impl IncomingTransfers {
     pub fn feed(&mut self, chunk: &Message) -> Result<(), TransferError> {
         let Message::TransferChunk {
+            // 路由字段由主进程/中继消费；执行器会话单任务，不校验归属。
+            dispatch_id: _,
             transfer_id,
             offset,
             bytes,
@@ -80,6 +82,7 @@ impl IncomingTransfers {
 
     pub fn input_ready(&mut self, ready: &Message) -> Result<(), TransferError> {
         let Message::InputReady {
+            dispatch_id: _,
             transfer_id,
             total_bytes,
             digest,
@@ -252,6 +255,7 @@ mod tests {
 
     fn chunk(id: &str, offset: u64, data: &[u8]) -> Message {
         Message::TransferChunk {
+            dispatch_id: "d".into(),
             transfer_id: id.into(),
             offset,
             bytes: STANDARD.encode(data),
@@ -269,6 +273,7 @@ mod tests {
         assert!(incoming.take("t1").is_none(), "InputReady 未到不可取");
         incoming
             .input_ready(&Message::InputReady {
+                dispatch_id: "d".into(),
                 transfer_id: "t1".into(),
                 total_bytes: data.len() as u64,
                 digest: hex::encode(Sha256::digest(&data)),
@@ -283,6 +288,7 @@ mod tests {
         incoming.feed(&chunk("t", 10, b"late")).expect("stored");
         incoming
             .input_ready(&Message::InputReady {
+                dispatch_id: "d".into(),
                 transfer_id: "t".into(),
                 total_bytes: 4,
                 digest: hex::encode(Sha256::digest(b"late")),
@@ -291,6 +297,7 @@ mod tests {
         let mut bad = incoming;
         bad.feed(&chunk("u", 0, b"data")).unwrap();
         let error = bad.input_ready(&Message::InputReady {
+            dispatch_id: "d".into(),
             transfer_id: "u".into(),
             total_bytes: 4,
             digest: "00".repeat(32),

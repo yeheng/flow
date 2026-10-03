@@ -341,7 +341,7 @@ async fn cancel_authorized_http_before_response_never_advances_or_resends() {
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut buf = [0; 4096];
-        socket.read(&mut buf).await.unwrap();
+        let _ = socket.read(&mut buf).await;
         let (tx, rx) = tokio::sync::oneshot::channel();
         accepted.send(tx).await.unwrap();
         let _ = rx.await;
@@ -552,7 +552,7 @@ async fn http_without_length_expansion_hits_output_budget_and_retains_outcome() 
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut request = [0; 4096];
-        socket.read(&mut request).await.unwrap();
+        let _ = socket.read(&mut request).await;
         socket
             .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
             .await
@@ -599,7 +599,7 @@ async fn sixteen_active_tasks_and_simultaneous_release_are_bounded() {
         for _ in 0..16 {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut buf = [0; 4096];
-            socket.read(&mut buf).await.unwrap();
+            let _ = socket.read(&mut buf).await;
             sockets.push(socket);
         }
         ready.send(()).unwrap();

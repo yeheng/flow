@@ -118,6 +118,8 @@ async fn start_agent(
             }
         };
         let Message::AgentWelcome {
+            journal_id,
+            master_epoch,
             link_session_id,
             data_credential,
             ..
@@ -133,12 +135,21 @@ async fn start_agent(
             })
             .await
             .expect("data bind");
-        let relay = Arc::new(std::sync::Mutex::new(flow_agent::relay::Relay::new(
+        let relay = Arc::new(parking_lot::Mutex::new(flow_agent::relay::Relay::new(
             "agent-r2".into(),
             boot,
             link_session_id,
         )));
-        let _ = serve_for_tests(&config, transport, relay, handles, shutdown).await;
+        let _ = serve_for_tests(
+            &config,
+            &journal_id,
+            master_epoch,
+            transport,
+            relay,
+            handles,
+            shutdown,
+        )
+        .await;
     });
 }
 
