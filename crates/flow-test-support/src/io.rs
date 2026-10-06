@@ -176,6 +176,34 @@ mod tests {
     }
 }
 
+/// 解析工作区 `target/{debug,release}` 目录里的二进制（先 debug 后 release，
+/// 与各测试既有的手写定位逻辑同一顺序）。
+///
+/// **为什么不用 `CARGO_BIN_EXE_*`**：那个环境变量是 package 级的——只有
+/// 「二进制与测试同属一个 package」时才注入。合并二进制后 `flow` 属于
+/// flow-app，而它的测试分散在 flow-rpc / flow-cli / flow-backend 等包里，
+/// 只能按工作区布局定位（与 flow-backend 既有 executor 定位测试同一约定）。
+pub fn workspace_bin(name: &str) -> PathBuf {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root");
+    for profile in ["debug", "release"] {
+        let candidate = root.join("target").join(profile).join(name);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    panic!(
+        "binary '{name}' not built; run: cargo build -p flow-app (or the owning package)"
+    );
+}
+
+/// 合并二进制 `flow` 的路径（所有测试的被测进程统一走这一个文件）。
+pub fn flow_bin() -> PathBuf {
+    workspace_bin("flow")
+}
+
 /// 被测进程自报端口后的结果。
 #[derive(Debug, Clone, Copy)]
 pub struct ReportedPorts {

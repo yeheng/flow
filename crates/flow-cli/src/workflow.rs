@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 use crate::client::{call, object};
 use crate::error::CliError;
 use crate::output::{local_time, note, parse_json, print_json, read_text, table, truncate_chars};
-use crate::WorkflowCommand;
+use crate::cli::WorkflowCommand;
 
 pub async fn dispatch(
     client: &WsClient,

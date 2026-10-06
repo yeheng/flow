@@ -25,7 +25,8 @@ async fn v2_binary_calls_pages_and_downloads_without_overwriting() {
         json!({"name":"cli","request_id":"stable"}).to_string(),
     )
     .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_flow-cli"))
+    let output = Command::new(flow_test_support::io::flow_bin())
+        .arg("cli")
         .env("FLOW_JOURNAL_TOKEN", &token)
         .args([
             "--url",
@@ -50,7 +51,8 @@ async fn v2_binary_calls_pages_and_downloads_without_overwriting() {
         .await
         .unwrap();
     let run = run.result["run_id"].as_str().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_flow-cli"))
+    let output = Command::new(flow_test_support::io::flow_bin())
+        .arg("cli")
         .env("FLOW_JOURNAL_TOKEN", &token)
         .args(["--url", &url, "journal", "events", run])
         .output()
@@ -76,7 +78,8 @@ async fn v2_binary_calls_pages_and_downloads_without_overwriting() {
     });
     let destination = root.join("download.bin");
     for expected in [true, false] {
-        let output = Command::new(env!("CARGO_BIN_EXE_flow-cli"))
+        let output = Command::new(flow_test_support::io::flow_bin())
+            .arg("cli")
             .env("FLOW_JOURNAL_TOKEN", &token)
             .args(["--url", &url, "journal", "download", run, "value"])
             .arg(&destination)
@@ -119,8 +122,8 @@ async fn long_paginated_history_streams_to_stdout_with_bounded_rss() {
     let url = format!("ws://{}", server.local_addr().unwrap());
     let handle = server.start(module);
     let output = Command::new("/usr/bin/time")
-        .args(["-l", env!("CARGO_BIN_EXE_flow-cli")])
-        .args(["--url", &url, "journal", "events", "run"])
+        .args(["-l", flow_test_support::io::flow_bin().to_str().unwrap()])
+        .args(["cli", "--url", &url, "journal", "events", "run"])
         .env("FLOW_JOURNAL_TOKEN", "long-history-token")
         .stdout(Stdio::null())
         .output()

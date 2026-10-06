@@ -704,6 +704,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "flow-app"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "clap",
+ "flow-agent",
+ "flow-backend",
+ "flow-cli",
+ "flow-engine",
+ "flow-executor",
+ "flow-journal",
+ "flow-rpc",
+ "rustls",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "flow-backend"
 version = "0.1.0"
 dependencies = [

@@ -19,18 +19,11 @@ fn temp() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("flow-journal-r0-{}", uuid::Uuid::now_v7()))
 }
 
-fn executor_bin() -> std::path::PathBuf {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("workspace root");
-    for profile in ["debug", "release"] {
-        let candidate = root.join("target").join(profile).join("flow-executor");
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    panic!("flow-executor binary not built; run: cargo build -p flow-executor");
+/// 合并二进制自召唤形态：同一个 `flow` 文件 + `executor` 子命令前缀。
+fn executor() -> flow_engine::execution_protocol::contract::ExecutorInvocation {
+    flow_engine::execution_protocol::contract::ExecutorInvocation::merged(
+        flow_test_support::io::flow_bin(),
+    )
 }
 
 fn remote_options() -> flow_backend::execution::remote::RemoteOptions {
@@ -63,7 +56,7 @@ async fn spawn_simulated_agent(
         ca_cert: "unused".into(),
         cert: "unused".into(),
         key: "unused".into(),
-        executor_bin: executor_bin(),
+        executor: executor(),
         slots,
     };
     let shutdown = tokio_util::sync::CancellationToken::new();

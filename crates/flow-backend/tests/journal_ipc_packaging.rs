@@ -14,18 +14,8 @@ fn temp() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("flow-journal-ipc9-{}", uuid::Uuid::now_v7()))
 }
 
-fn executor_bin() -> std::path::PathBuf {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("workspace root");
-    for profile in ["debug", "release"] {
-        let candidate = root.join("target").join(profile).join("flow-executor");
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    panic!("flow-executor binary not built; run: cargo build -p flow-executor");
+fn flow_bin() -> std::path::PathBuf {
+    flow_test_support::io::flow_bin()
 }
 
 async fn install(b: &JournalBackend, definition: serde_json::Value) -> String {
@@ -80,7 +70,7 @@ async fn missing_executor_binary_fails_loudly_without_fallback() {
     let result = backend
         .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
             flow_backend::execution::IpcOptions {
-                executor_bin: root.join("does-not-exist"),
+                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(root.join("does-not-exist")),
                 x_max: 1,
                 tag: None,
             },
@@ -102,7 +92,7 @@ async fn executor_path_with_spaces_runs() {
     let spaced = std::env::temp_dir().join(format!("flow spaced {}", uuid::Uuid::now_v7()));
     std::fs::create_dir_all(&spaced).unwrap();
     let copy = spaced.join("flow-executor");
-    std::fs::copy(executor_bin(), &copy).unwrap();
+    std::fs::copy(flow_bin(), &copy).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -114,7 +104,7 @@ async fn executor_path_with_spaces_runs() {
     backend
         .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
             flow_backend::execution::IpcOptions {
-                executor_bin: copy,
+                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::merged(copy),
                 x_max: 1,
                 tag: Some("spaced".into()),
             },
@@ -171,7 +161,7 @@ async fn incompatible_executor_binary_fails_handshake_and_node_errors() {
     backend
         .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
             flow_backend::execution::IpcOptions {
-                executor_bin: fake,
+                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(fake),
                 x_max: 1,
                 tag: None,
             },

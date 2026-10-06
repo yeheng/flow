@@ -21,9 +21,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 futures = { workspace = true }
 
-[[bin]]
-name = "flow-executor"
-path = "src/main.rs"
 
 [lib]
 name = "flow_executor"

@@ -14,24 +14,14 @@ fn temp() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("flow-journal-ipc-{}", uuid::Uuid::now_v7()))
 }
 
-/// 定位真实 flow-executor 二进制（I09 规则的测试版）。
+/// 定位真实执行器（I09 规则的测试版，合并二进制形态）。
 fn executor_bin() -> std::path::PathBuf {
-    if let Ok(path) = std::env::var("FLOW_EXECUTOR_BIN") {
-        let path = std::path::PathBuf::from(path);
-        assert!(path.is_file(), "FLOW_EXECUTOR_BIN invalid: {path:?}");
-        return path;
-    }
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("workspace root");
-    for profile in ["debug", "release"] {
-        let candidate = root.join("target").join(profile).join("flow-executor");
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    panic!("flow-executor binary not built; run: cargo build -p flow-executor");
+    flow_test_support::io::flow_bin()
+}
+
+/// 合并二进制自召唤形态：`flow` 文件 + `executor` 子命令前缀。
+fn executor() -> flow_engine::execution_protocol::contract::ExecutorInvocation {
+    flow_engine::execution_protocol::contract::ExecutorInvocation::merged(executor_bin())
 }
 
 /// 强制 IPC 模式（绕过环境变量，测试内显式指定二进制）。
@@ -54,7 +44,7 @@ async fn ipc_backend_sized(
     backend
         .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
             flow_backend::execution::IpcOptions {
-                executor_bin: executor_bin(),
+                executor: executor(),
                 x_max,
                 tag,
             },
@@ -634,7 +624,7 @@ async fn wait_for_tagged_executor(tag: &str) -> u32 {
 fn tagged_executor_pids(tag: &str) -> Vec<u32> {
     std::process::Command::new("pgrep")
         .arg("-f")
-        .arg(format!("flow-executor.*--tag {tag}"))
+        .arg(format!("flow executor --tag {tag}"))
         .output()
         .ok()
         .map(|o| {

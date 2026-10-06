@@ -84,8 +84,59 @@ pub const ACK_RETRANSMIT_MS: u64 = 2_000;
 /// 槽位；超时按失联处理进入排空。0 表示无限制（由取消驱动）。
 pub const DURABLE_WAIT_TIMEOUT_MS: u64 = 120_000;
 
-/// 执行器二进制名称（打包/定位契约，I09）。
+/// 执行器二进制名称（独立二进制形态的打包/定位契约，I09）。
+/// 合并二进制（`flow`）形态下执行器经 [`ExecutorInvocation`] 的子命令前缀召唤。
 pub const EXECUTOR_BIN_NAME: &str = "flow-executor";
+/// 合并二进制自召唤执行器时的子命令名（`flow executor`）。
+pub const EXECUTOR_SUBCOMMAND: &str = "executor";
+
+/// 执行器进程召唤描述：程序路径 + 前导参数。
+///
+/// - 合并二进制（`flow`）自召唤：`program = current_exe`，`prefix = ["executor"]`；
+/// - 独立 `flow-executor` 二进制（[`EXECUTOR_BIN_ENV`] 显式指定）：`prefix` 为空。
+/// `spawn_executor_process` 按此构造命令行；执行器侧忽略未知参数，因此
+/// `--tag` 等诊断标记始终追加在前导参数之后。
+#[derive(Debug, Clone)]
+pub struct ExecutorInvocation {
+    pub program: std::path::PathBuf,
+    pub prefix: Vec<String>,
+}
+
+impl ExecutorInvocation {
+    /// 显式指定的独立执行器二进制（不做子命令前缀）。
+    pub fn explicit(bin: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            program: bin.into(),
+            prefix: Vec::new(),
+        }
+    }
+
+    /// 合并二进制自召唤：以给定程序 + `executor` 子命令前缀构造。
+    pub fn merged(bin: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            program: bin.into(),
+            prefix: vec![EXECUTOR_SUBCOMMAND.to_string()],
+        }
+    }
+
+    /// 执行器定位（I09）：[`EXECUTOR_BIN_ENV`] 显式路径优先（独立二进制，
+    /// 无前缀）；否则以当前可执行文件自召唤（合并二进制形态）。找不到即
+    /// 报错，不静默回退进程内执行。
+    pub fn locate() -> Result<Self, String> {
+        if let Some(path) = std::env::var_os(EXECUTOR_BIN_ENV) {
+            let path = std::path::PathBuf::from(path);
+            if path.is_file() {
+                return Ok(Self::explicit(path));
+            }
+            return Err(format!(
+                "{EXECUTOR_BIN_ENV}={path:?} does not point to an executable file"
+            ));
+        }
+        let current = std::env::current_exe()
+            .map_err(|_| "cannot locate executor: current_exe unavailable".to_string())?;
+        Ok(Self::merged(current))
+    }
+}
 /// 主进程通过环境变量把固定 FD 槽位告知执行器（pre_exec 中 dup2 的目标）。
 pub const EXECUTOR_CONTROL_FD_SLOT: i32 = 100;
 pub const EXECUTOR_DATA_FD_SLOT: i32 = 101;

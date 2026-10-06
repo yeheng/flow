@@ -46,10 +46,10 @@ impl JournalBackend {
             return self.start_execution().await;
         };
         // I09：启用 IPC 时二进制缺失直接失败，不静默回退进程内执行。
-        if !options.executor_bin.is_file() {
+        if !options.executor.program.is_file() {
             return Err(invalid(format!(
                 "executor binary missing: {}",
-                options.executor_bin.display()
+                options.executor.program.display()
             ))
             .into());
         }

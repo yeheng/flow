@@ -8,10 +8,10 @@ pub mod dispatch;
 pub mod pool;
 pub mod remote;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use flow_engine::execution_protocol::contract::{
-    EXECUTION_MODE_ENV, EXECUTOR_BIN_ENV, EXECUTOR_BIN_NAME, X_MAX_DEFAULT,
+    ExecutorInvocation, EXECUTION_MODE_ENV, X_MAX_DEFAULT,
 };
 
 pub use dispatch::IpcDispatcher;
@@ -27,8 +27,8 @@ pub enum ExecutionMode {
 
 #[derive(Debug, Clone)]
 pub struct IpcOptions {
-    /// 执行器二进制路径。
-    pub executor_bin: PathBuf,
+    /// 执行器召唤方式：合并二进制自召唤（默认）或显式独立二进制。
+    pub executor: ExecutorInvocation,
     /// 执行槽位上限 X_max（1..=16）。
     pub x_max: usize,
     /// 附加到执行器命令行的诊断标记（执行器忽略未知参数）；用于进程
@@ -36,43 +36,11 @@ pub struct IpcOptions {
     pub tag: Option<String>,
 }
 
-/// 执行器二进制定位（I09）：FLOW_EXECUTOR_BIN 显式路径 → 可执行文件
-/// 同目录 → target 目录常规位置。找不到即报错，不回退。
-pub fn locate_executor() -> Result<PathBuf, String> {
-    if let Some(path) = std::env::var_os(EXECUTOR_BIN_ENV) {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Ok(path);
-        }
-        return Err(format!(
-            "{EXECUTOR_BIN_ENV}={path:?} does not point to an executable file"
-        ));
-    }
-    let Ok(current) = std::env::current_exe() else {
-        return Err("cannot locate executor binary: current_exe unavailable".into());
-    };
-    let sibling = current
-        .parent()
-        .map(|dir| dir.join(EXECUTOR_BIN_NAME))
-        .filter(|path| path.is_file());
-    if let Some(path) = sibling {
-        return Ok(path);
-    }
-    // cargo 布局：test/deps 二进制向上两级找 target/{debug,release}。
-    let mut dir = current.parent().map(Path::to_path_buf);
-    for _ in 0..3 {
-        let Some(parent) = dir else { break };
-        for profile in ["debug", "release"] {
-            let candidate = parent.join(profile).join(EXECUTOR_BIN_NAME);
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
-        }
-        dir = parent.parent().map(Path::to_path_buf);
-    }
-    Err(format!(
-        "executor binary '{EXECUTOR_BIN_NAME}' not found; set {EXECUTOR_BIN_ENV}"
-    ))
+/// 执行器定位（I09）：[`ExecutorInvocation::locate`]——FLOW_EXECUTOR_BIN
+/// 显式独立二进制优先，否则当前可执行文件自召唤（`flow executor`）。
+/// 找不到即报错，不回退。
+pub fn locate_executor() -> Result<ExecutorInvocation, String> {
+    ExecutorInvocation::locate()
 }
 
 /// 从环境变量解析执行模式（测试可注入变量值）。
@@ -118,9 +86,9 @@ pub fn mode_from_env_with(value: &str) -> Result<ExecutionMode, String> {
     match value {
         "" | "in_process" => Ok(ExecutionMode::InProcess),
         "ipc" => {
-            let executor_bin = locate_executor()?;
+            let executor = locate_executor()?;
             Ok(ExecutionMode::Ipc(IpcOptions {
-                executor_bin,
+                executor,
                 x_max: X_MAX_DEFAULT,
                 tag: None,
             }))

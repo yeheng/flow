@@ -5,7 +5,6 @@
 //! 关闭父端，兄弟进程不继承连接。任一通道故障 → 会话 Draining → 宽限
 //! 后 kill → wait/reap；已取消/故障任务的进程统一回收重建，不直接复用。
 
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -178,7 +177,7 @@ impl ExecutorPool {
             self.session_counter.fetch_add(1, Ordering::Relaxed)
         );
         spawn_and_handshake(
-            &self.options.executor_bin,
+            &self.options.executor,
             &self.journal_id,
             self.master_epoch,
             &executor_id,
@@ -191,7 +190,7 @@ impl ExecutorPool {
 
 /// spawn 执行器并完成握手；子进程由会话驱动任务持有并负责 kill/reap。
 async fn spawn_and_handshake(
-    bin: &Path,
+    executor: &flow_engine::execution_protocol::contract::ExecutorInvocation,
     journal_id: &str,
     master_epoch: u64,
     executor_id: &str,
@@ -199,8 +198,8 @@ async fn spawn_and_handshake(
     tag: Option<&str>,
 ) -> Result<RawSession, PoolError> {
     let (parent, mut child, child_pair) =
-        flow_engine::execution_protocol::spawn::spawn_executor_process(bin, tag)
-            .map_err(|e| PoolError::Spawn(format!("{}: {e}", bin.display())))?;
+        flow_engine::execution_protocol::spawn::spawn_executor_process(executor, tag)
+            .map_err(|e| PoolError::Spawn(format!("{}: {e}", executor.program.display())))?;
     let child_pid = child.id();
     // 父进程关闭子端副本（子进程内已 dup2 到槽位）。
     drop(child_pair);

@@ -57,7 +57,7 @@ crates/
                 初始化协议、信号落账、订阅推送的差异在边界内吸收；
                 「只有 published 可执行 + 创建前校验」单点在 resolve_runnable_definition
   flow-pg       Postgres 后端实现：共享日志、epoch 租约、持久 inbox、executor
-  flow-rpc      jsonrpsee WebSocket 服务（bin: flow-server）；**只依赖
+  flow-rpc      jsonrpsee WebSocket 服务（入口：`flow server`）；**只依赖
                 `AnyBackend` 枚举**，不感知 flow-store / flow-pg，也不读 FLOW_BACKEND；
                 进程内还跑 cron 调度器与 webhook HTTP 入口（§9.2）
   flow-cli      命令行客户端（bin: flow-cli，§9.3）。**纯 RPC 客户端**：只连
@@ -81,7 +81,7 @@ flow-pg ──> flow-store   ✗（两个后端互相独立，互不感知）
 flow-rpc ──> flow-store / flow-pg   ✗（上层不感知具体后端）
 flow-journal ──> 无 flow 依赖（叶子；被 engine/backend/rpc/agent/executor 复用）
 flow-agent / flow-executor ──> flow-engine, flow-journal（JSONL 二/三期执行侧）
-flow-cli ──> flow-server / flow-journal-server（纯 RPC 客户端）──> 上面的链路
+flow cli ──> flow server / flow journal-server（纯 RPC 客户端）──> 上面的链路
 flow-cli ──> flow-store / flow-pg ✗   ✗（CLI 不碰存储与事件日志，
                 没有第二条写入路径；SQLite / Postgres 对 CLI 行为一致）
 ```
@@ -91,14 +91,14 @@ flow-cli ──> flow-store / flow-pg ✗   ✗（CLI 不碰存储与事件日�
 只看枚举。闭集枚举而非 trait 对象：每加一个方法编译器逼着两个臂都写完，
 不存在某个后端静默继承错误默认实现的坑。
 
-运行：`cargo run --bin flow-server`。环境变量 `FLOW_ADDR`（默认 `127.0.0.1:9800`）、
+运行：`cargo run -p flow-app -- server`（统一二进制 `flow` 的 server 子命令）。环境变量 `FLOW_ADDR`（默认 `127.0.0.1:9800`）、
 `FLOW_DB`、`FLOW_DATA_DIR`、`FLOW_HTTP_ADDR` 与 `FLOW_SCHEDULER`（§9.2）；
 Postgres 模式另见 `flow-pg/src/config.rs`
 （`FLOW_BACKEND`、`FLOW_DATABASE_URL`、`FLOW_ROLE`、`FLOW_LEASE_TTL_MS` 等）。
 
 **SQLite 模式的进程模型（焊死三件套）**：单进程（open 时对 `data_dir` 目录
 fd 持排他 flock，第二个实例立即失败——多节点清用 postgres 后端）·
-单线程（flow-server 跑 current_thread runtime，一个 OS 线程；异步任务仍
+单线程（`flow server` 跑 current_thread runtime，一个 OS 线程；异步任务仍
 并发，JS 求值/文件 IO 经 spawn_blocking 走独立阻塞线程）·单连接
 （SQLite 连接池 max=1，进程内 DB 访问全串行，SQLITE_BUSY 结构性消失）。
 runtime 形态选择只在二进制薄壳 main 发生（`flow_backend::
@@ -659,7 +659,7 @@ run_started 未落盘」的初始化中断窗口，恢复已按 DB 投影标终�
 
 ### 9.2 触发器：cron 调度与 webhook
 
-除 `run.start` 手动触发外，run 还有两个自动入口，都在 flow-server 进程内：
+除 `run.start` 手动触发外，run 还有两个自动入口，都在 `flow server` 进程内：
 
 - **cron 调度器**：默认开启，`FLOW_SCHEDULER=off` 禁用。每 20s tick 扫一次
   全部 enabled schedule，取「最近一次 ≤ now 的整分触发点」（cron 标准 5 字段，

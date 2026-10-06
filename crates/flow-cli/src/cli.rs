@@ -1,40 +1,21 @@
-//! flow-cli：flow 工作流引擎的命令行客户端。
-//!
-//! 形态：`flow-cli [全局选项] <命令组> <子命令> [参数]`。命令面与 flow-server 的
-//! JSON-RPC 方法一一对应（DESIGN.md §9），CLI 是**纯客户端**——不直连 SQLite、
-//! 不读事件日志，SQLite / Postgres 两个后端行为一致。
-//!
-//! 两条使用纪律：
-//! - **文档走 stdout**：`workflow get` / `workflow export` / `run get` /
-//!   `run start`（等待模式）把 JSON 写到 stdout，进度与提示写到 stderr，
-//!   于是 `flow-cli workflow get X > def.json` 拿到的是纯 JSON；
-//! - **退出码分流**：0 成功；1 本地错误；2 服务端 RPC 错误；4 触发的 run
-//!   终态为 failed / cancelled（脚本据此区分「命令打错」与「工作流失败」）。
-
-mod client;
-mod error;
-mod journal;
-mod output;
-mod run;
-mod workflow;
+//! `flow cli` 命令定义与分发（原 flow-cli 二进制入口，合并进 `flow` 后成为子命令）。
 
 use clap::{Parser, Subcommand};
-use std::process::ExitCode;
 
 use crate::error::CliError;
 
 /// flow-cli：flow 工作流引擎命令行客户端（JSON-RPC 2.0 over WebSocket）。
 #[derive(Parser)]
 #[command(
-    name = "flow-cli",
+    name = "flow cli",
     version,
     about = "flow 工作流引擎命令行客户端",
     long_about = "flow 工作流引擎命令行客户端。\n\n\
                   覆盖：workflow 增删改查与导入导出、run 手动触发与查询取消。\n\
-                  服务端需另行运行（cargo run --bin flow-server），地址用 --url 或 FLOW_RPC 指定。",
+                  服务端需另行运行（flow server），地址用 --url 或 FLOW_RPC 指定。",
     arg_required_else_help = true
 )]
-struct Cli {
+pub struct Cli {
     /// flow-server 地址；缺 scheme（如 127.0.0.1:9800）按 ws:// 补全
     #[arg(
         long,
@@ -51,11 +32,11 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
-enum Command {
+pub enum Command {
     /// JSONL v2 commands, bounded history pages and streaming downloads.
     Journal {
         #[command(subcommand)]
-        command: journal::Command,
+        command: crate::journal::Command,
     },
     /// 工作流定义：增删改查 + 导入导出
     Workflow {
@@ -70,7 +51,7 @@ enum Command {
 }
 
 #[derive(Subcommand)]
-enum WorkflowCommand {
+pub enum WorkflowCommand {
     /// 列出全部工作流
     List,
     /// 查看定义（默认最新版本）
@@ -131,7 +112,7 @@ enum WorkflowCommand {
 }
 
 #[derive(Subcommand)]
-enum RunCommand {
+pub enum RunCommand {
     /// 手动触发一次 run（默认等待终态并打印输出）
     Start {
         /// workflow_id 或 workflow name
@@ -176,24 +157,24 @@ enum RunCommand {
     Cancel { run_id: String },
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    let cli = Cli::parse();
+/// 进程入口：解析命令行 → 连服务（连不上是本地错误，exit 1）→ 分发到命令组。
+pub async fn run_from_args(argv: &[String]) -> i32 {
+    // parse_from 的首元素是程序名占位：`flow cli` 是展示名，实际参数从 argv 起。
+    let cli = Cli::parse_from(std::iter::once("flow cli".to_string()).chain(argv.iter().cloned()));
     match dispatch(cli).await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => 0,
         Err(err) => {
             eprintln!("error: {err}");
-            ExitCode::from(err.exit_code() as u8)
+            err.exit_code()
         }
     }
 }
 
-/// 进程入口：先连服务（连不上是本地错误，exit 1），再分发到命令组。
 async fn dispatch(cli: Cli) -> Result<(), CliError> {
-    let client = client::connect(&cli.url).await?;
+    let client = crate::client::connect(&cli.url).await?;
     match cli.command {
-        Command::Journal { command } => journal::dispatch(&client, command).await,
-        Command::Workflow { command } => workflow::dispatch(&client, cli.json, command).await,
-        Command::Run { command } => run::dispatch(&client, cli.json, command).await,
+        Command::Journal { command } => crate::journal::dispatch(&client, command).await,
+        Command::Workflow { command } => crate::workflow::dispatch(&client, cli.json, command).await,
+        Command::Run { command } => crate::run::dispatch(&client, cli.json, command).await,
     }
 }

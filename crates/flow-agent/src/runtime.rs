@@ -15,7 +15,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use flow_engine::execution_protocol::contract::DRAIN_GRACE_MS;
+use flow_engine::execution_protocol::contract::{ExecutorInvocation, DRAIN_GRACE_MS};
 use flow_engine::execution_protocol::message::Message;
 use flow_engine::execution_protocol::remote::{ResumeAction, ResumeItem, RESUME_PAGE_MAX};
 use flow_engine::execution_protocol::transport::FrameTransport;
@@ -31,7 +31,8 @@ pub struct AgentConfig {
     pub ca_cert: PathBuf,
     pub cert: PathBuf,
     pub key: PathBuf,
-    pub executor_bin: PathBuf,
+    /// 执行器召唤方式：合并二进制自召唤（缺省）或显式独立二进制。
+    pub executor: ExecutorInvocation,
     pub slots: u32,
 }
 
@@ -389,7 +390,7 @@ pub async fn serve(
                             // Drain 会话内不会再有新 Bind（Drain 帧处理后直接
                             // 关闭返回）；这里不做状态检查。
                             let bound = pool::bind_executor(
-                                config.executor_bin.as_path(),
+                                &config.executor,
                                 journal_id,
                                 master_epoch,
                                 &relay,

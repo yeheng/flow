@@ -1,15 +1,17 @@
 # JSONL 一期开发入口
 
-此路径用于开发与独立部署验证；一期非断电验收已通过，真实断电按用户要求排除。不要将旧 SQLite 数据目录直接交给新入口。现有 `flow-server` 的 SQLite/PG 默认行为保持独立，生产未切换。
+此路径用于开发与独立部署验证；一期非断电验收已通过，真实断电按用户要求排除。不要将旧 SQLite 数据目录直接交给新入口。现有 `flow server` 的 SQLite/PG 默认行为保持独立，生产未切换。
 
 ## 二期 IPC 执行模式（本地子进程）
 
-二期将进程内节点执行替换为受管理的本地执行子进程（模板/script/condition/HTTP 全部在 `flow-executor` 进程内执行；journal 语义与进程内模式逐字节同构）。
+二期将进程内节点执行替换为受管理的本地执行子进程（模板/script/condition/HTTP 全部在执行器子进程（`flow executor`）内执行；journal 语义与进程内模式逐字节同构）。
 
 ```sh
-cargo build -p flow-executor                 # 先构建执行器二进制
-FLOW_EXECUTION_MODE=ipc cargo run -p flow-backend --bin flow-journal-dev -- --data-dir ./target/v2-ipc run --definition ./workflow.json --input ./input.json
-FLOW_EXECUTOR_BIN=/path/to/flow-executor FLOW_EXECUTION_MODE=ipc cargo run -p flow-rpc --bin flow-journal-server
+cargo build -p flow-app                      # 统一二进制（含 executor 子命令）
+FLOW_EXECUTION_MODE=ipc cargo run -p flow-app -- journal-dev --data-dir ./target/v2-ipc run --definition ./workflow.json --input ./input.json
+# 执行器默认由主进程自召唤（`flow executor`，同一文件）；独立部署时用
+# FLOW_EXECUTOR_BIN=/path/to/flow-executor 覆盖。
+FLOW_EXECUTION_MODE=ipc cargo run -p flow-app -- journal-server
 ```
 
 - 默认 `in_process`（一期行为）；`ipc` 模式二进制缺失/版本不兼容直接失败，不静默回退。
@@ -25,7 +27,7 @@ FLOW_EXECUTOR_BIN=/path/to/flow-executor FLOW_EXECUTION_MODE=ipc cargo run -p fl
 ## 三期远程执行模式（agent 中继）
 
 主进程增加远程执行端口（`FLOW_EXECUTION_MODE=remote`）：每台执行机运行
-`flow-agent`（mTLS 上联，CN=agent_id），agent 管理本机 `flow-executor` 并
+`flow agent`（mTLS 上联，CN=agent_id），agent 管理本机执行器（`flow executor`）并
 有界公平中继；审计/确认仍端到端来自主进程 journal（agent 不产生权威
 ACK/Permit）。断线后 agent 保留执行器并退避重连，Resume 清单由主进程按
 日志裁决（AlreadyCommitted/UploadOnly/SubmitExistingResult/CancelAndDrain/
@@ -35,14 +37,14 @@ ReconcileRequired）；drain 用于升级下线。部署/证书/边界见 `docs/
 本地运行一个定义：
 
 ```sh
-cargo run -p flow-backend --bin flow-journal-dev -- --data-dir ./target/v2-data run --definition ./workflow.json --input ./input.json
-cargo run -p flow-backend --bin flow-journal-dev -- --data-dir ./target/v2-data resume
-cargo run -p flow-backend --bin flow-journal-dev -- --data-dir ./target/v2-data status
+cargo run -p flow-app -- journal-dev --data-dir ./target/v2-data run --definition ./workflow.json --input ./input.json
+cargo run -p flow-app -- journal-dev --data-dir ./target/v2-data resume
+cargo run -p flow-app -- journal-dev --data-dir ./target/v2-data status
 ```
 
 `status` 只归约日志，不运行节点。`resume` 只继续可安全恢复的工作，已授权但缺少 Outcome 的操作进入 uncertain 等待。脚本/条件节点的纯计算重试保留原准备输入和绝对退避时间；不会自动重发未知外部操作。
 
-开发 RPC 使用独立二进制：设置 `FLOW_JOURNAL_DATA_DIR`、至少 32 字节的随机 `FLOW_JOURNAL_TOKEN`，执行 `cargo run -p flow-rpc --bin flow-journal-server`。默认地址 `127.0.0.1:9802`，可通过 `FLOW_JOURNAL_ADDR` 修改为另一本机地址。每个 JSON-RPC 对象参数都必须含 `_token`，不要把该参数或完整请求记录到访问日志。
+开发 RPC 使用独立二进制：设置 `FLOW_JOURNAL_DATA_DIR`、至少 32 字节的随机 `FLOW_JOURNAL_TOKEN`，执行 `cargo run -p flow-app -- journal-server`。默认地址 `127.0.0.1:9802`，可通过 `FLOW_JOURNAL_ADDR` 修改为另一本机地址。每个 JSON-RPC 对象参数都必须含 `_token`，不要把该参数或完整请求记录到访问日志。
 
 支持 workflow.create/update/publish/delete、run.start/cancel/signal/adjudicate、command.status、workflow.get、run.get、run.events.page、run.audit.page、schedule.change、webhook.change。cron/webhook 自动触发已接入；另支持 workflow.list/run.list、legacy.get/list、run.observations.page 与 run.subscribe。浏览器使用 /journal 页面，CLI 使用 journal 子命令。
 
@@ -55,10 +57,10 @@ cargo run -p flow-backend --bin flow-journal-dev -- --data-dir ./target/v2-data 
 离线维护（先关闭持有数据目录锁的服务）：
 
 ```sh
-cargo run -p flow-journal --bin flow-journal-tool -- verify ./target/v2-data
-cargo run -p flow-journal --bin flow-journal-tool -- rebuild-index ./target/v2-data
-cargo run -p flow-journal --bin flow-journal-tool -- backup ./target/v2-data ./target/v2-backup
-cargo run -p flow-backend --bin flow-journal-dev -- --data-dir ./target/v2-data rebuild-projection --destination ./target/rebuilt.sqlite
+cargo run -p flow-app -- journal-tool verify ./target/v2-data
+cargo run -p flow-app -- journal-tool rebuild-index ./target/v2-data
+cargo run -p flow-app -- journal-tool backup ./target/v2-data ./target/v2-backup
+cargo run -p flow-app -- journal-dev --data-dir ./target/v2-data rebuild-projection --destination ./target/rebuilt.sqlite
 ```
 
 repair 默认仅报告候选前缀并以非零退出码结束；只有显式 `--confirm` 才写入新目录，原数据保留。候选后缀可能包含曾被确认的提交，不能将 repair 当作无损清理。新投影目标必须不存在；失败时保留目标用于排查，不将其当作完成的投影。投影重建不执行用户代码或网络请求。
@@ -73,10 +75,10 @@ repair 默认仅报告候选前缀并以非零退出码结束；只有显式 `--
 CLI 示例：
 
 ```sh
-cargo run -p flow-cli -- --url ws://127.0.0.1:9802 journal call workflow.create --params ./request.json
-cargo run -p flow-cli -- --url ws://127.0.0.1:9802 journal events RUN_ID --audit
-cargo run -p flow-cli -- --url ws://127.0.0.1:9802 journal download RUN_ID OUTPUT_ID ./new-value.bin
-cargo run -p flow-backend --bin flow-journal-dev -- --data-dir ./new-v2 import-legacy --source ./old-root --database ./old-root/flow.db
+cargo run -p flow-app -- cli --url ws://127.0.0.1:9802 journal call workflow.create --params ./request.json
+cargo run -p flow-app -- cli --url ws://127.0.0.1:9802 journal events RUN_ID --audit
+cargo run -p flow-app -- cli --url ws://127.0.0.1:9802 journal download RUN_ID OUTPUT_ID ./new-value.bin
+cargo run -p flow-app -- journal-dev --data-dir ./new-v2 import-legacy --source ./old-root --database ./old-root/flow.db
 ```
 
 导入前停止旧服务；导入锁定源目录并校验源清单，目标须为独立目录。legacy.get/list 返回只读历史基线和报告；旧 run 不自动续跑，导入触发器默认禁用。旧日志中不存在的实际输入报告 missing_unrecoverable。导入失败可以用相同源和目标重试；源发生变化则拒绝。备份中未发布的 .flow-copy-* 文件不属于权威记录，可在确认无导入进程后人工清理。

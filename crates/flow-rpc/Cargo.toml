@@ -3,10 +3,6 @@ name = "flow-rpc"
 version.workspace = true
 edition.workspace = true
 
-[[bin]]
-name = "flow-server"
-path = "src/main.rs"
-
 [dependencies]
 tokio = { workspace = true }
 serde = { workspace = true }

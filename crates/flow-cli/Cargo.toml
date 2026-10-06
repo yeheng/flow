@@ -18,9 +18,9 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
-[[bin]]
-name = "flow-cli"
-path = "src/main.rs"
+[lib]
+name = "flow_cli"
+path = "src/lib.rs"
 
 [dependencies]
 uuid = { workspace = true }

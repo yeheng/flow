@@ -7,3 +7,4 @@ web/playwright-report/
 !crates/*/src/bin/
 !crates/*/src/bin/*.rs
 docs/refactor-evidence/
+/dist/

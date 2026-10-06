@@ -23,10 +23,6 @@ rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 clap = { workspace = true, features = ["env", "derive"] }
 
-[[bin]]
-name = "flow-agent"
-path = "src/main.rs"
-
 [lib]
 name = "flow_agent"
 path = "src/lib.rs"

@@ -14,32 +14,8 @@ fn temp() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("flow-journal-r1-{}", uuid::Uuid::now_v7()))
 }
 
-fn executor_bin() -> std::path::PathBuf {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("workspace root");
-    for profile in ["debug", "release"] {
-        let candidate = root.join("target").join(profile).join("flow-executor");
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    panic!("flow-executor binary not built; run: cargo build -p flow-executor");
-}
-
 fn agent_bin() -> std::path::PathBuf {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("workspace root");
-    for profile in ["debug", "release"] {
-        let candidate = root.join("target").join(profile).join("flow-agent");
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    panic!("flow-agent binary not built; run: cargo build -p flow-agent");
+    flow_test_support::io::flow_bin()
 }
 
 /// 生成测试 PKI：CA + server(flow-server) + agent(CN=agent_id)。
@@ -157,6 +133,7 @@ fn spawn_agent(
     slots: u32,
 ) -> AgentProcess {
     let child = std::process::Command::new(agent_bin())
+        .arg("agent")
         .args([
             "--control-addr",
             &format!("127.0.0.1:{control}"),
@@ -171,8 +148,6 @@ fn spawn_agent(
         .arg(dir.join("agent.pem"))
         .arg("--key")
         .arg(dir.join("agent.key"))
-        .arg("--executor-bin")
-        .arg(executor_bin())
         .arg("--slots")
         .arg(slots.to_string())
         .stderr(std::process::Stdio::piped())

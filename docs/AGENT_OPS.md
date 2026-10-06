@@ -2,7 +2,7 @@
 
 ## 部署
 
-- 主进程（flow-journal-server / flow-journal-dev）启用远程模式：
+- 主进程（`flow journal-server` / `flow journal-dev`）启用远程模式：
 
   ```sh
   FLOW_EXECUTION_MODE=remote \
@@ -10,17 +10,20 @@
   FLOW_REMOTE_DATA_ADDR=127.0.0.1:9806 \
   FLOW_REMOTE_CA=/path/ca.pem FLOW_REMOTE_CERT=/path/server.pem \
   FLOW_REMOTE_KEY=/path/server.key \
-  cargo run -p flow-rpc --bin flow-journal-server
+  cargo run -p flow-app -- journal-server
   ```
 
   （环境变量入口经 `flow_backend::execution::remote_mode_from_env`；同数据
   集单写者、同 run 单执行模式约束与一期/二期一致。）
-- 每台执行机部署 `flow-agent` 与 `flow-executor`（同一构建产物）：
+- 每台执行机部署统一二进制 `flow`（`scripts/build-pg.sh` 产物）：
 
   ```sh
-  flow-agent --control-addr HOST:9805 --data-addr HOST:9806 \
+  flow agent --control-addr HOST:9805 --data-addr HOST:9806 \
     --agent-id agent-a --ca-cert ca.pem --cert agent-a.pem \
-    --key agent-a.key --executor-bin ./flow-executor --slots 4
+    --key agent-a.key --slots 4
+
+  （执行器缺省自召唤同一文件的 `executor` 子命令；独立执行器二进制用
+  `--executor-bin` 或 `FLOW_EXECUTOR_BIN` 指定。）
   ```
 
 ## 证书与身份

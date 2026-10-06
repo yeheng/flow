@@ -19,7 +19,7 @@ use crate::error::CliError;
 use crate::output::{
     duration_text, load_json_arg, local_time, note, print_json, short_id, table, truncate_chars,
 };
-use crate::RunCommand;
+use crate::cli::RunCommand;
 
 /// run 终态词汇表（与服务端 `DbRunStatus::is_terminal_str` 同一份含义，
 /// 这里只为轮询判定，不做写入口校验）。
