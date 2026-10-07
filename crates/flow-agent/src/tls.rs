@@ -32,7 +32,12 @@ pub fn client_config_from_pem(
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(bad)?
     {
-        let _ = roots.add(rustls::pki_types::CertificateDer::from(der.to_vec()));
+        roots
+            .add(rustls::pki_types::CertificateDer::from(der.to_vec()))
+            .map_err(bad)?;
+    }
+    if roots.is_empty() {
+        return Err(bad("CA PEM contains no certificates"));
     }
     let client_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
         certs(&mut Cursor::new(cert))

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::future::join_all;
+use futures::{future::join_all, FutureExt};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -1095,7 +1095,11 @@ impl Driver {
 
         let handle = tokio::spawn(async move {
             let started = std::time::Instant::now();
-            let result = exec::execute(&ctx, &cancel).await;
+            // A panicking node must still release its slot through Done.
+            let result = std::panic::AssertUnwindSafe(exec::execute(&ctx, &cancel))
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| Err(NodeFailure::fatal("node execution panicked")));
             let _ = result_tx
                 .send(DriverMsg::Done {
                     node_id: nid,

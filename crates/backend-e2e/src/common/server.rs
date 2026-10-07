@@ -127,6 +127,10 @@ impl Ctx {
     }
 
     /// Postgres 用例的测试库连接串（SQLite 用例为 None；后端专属测试用）。
+    pub fn sqlite_path(&self) -> Option<PathBuf> {
+        self.sqlite_dir.as_ref().map(|root| root.join("flow.db"))
+    }
+
     pub fn pg_url(&self) -> Option<&str> {
         self.db.as_ref().map(|db| db.url.as_str())
     }
@@ -324,7 +328,11 @@ impl ServerProc {
             Ready::ChildExited(status) => Err(format!(
                 "flow-server 端口 {addr} 上启动即退出（{status}）——端口被并行用例占用"
             )),
-            Ready::TimedOut => Err(format!("flow-server {addr} 未在就绪超时内起来")),
+            Ready::TimedOut => {
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(format!("flow-server {addr} 未在就绪超时内起来"))
+            }
         }
     }
 

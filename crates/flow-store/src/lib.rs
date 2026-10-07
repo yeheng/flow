@@ -869,13 +869,17 @@ impl Store {
 
     /// 崩溃恢复的输入：进程重启后需要续跑的 run。
     pub async fn unfinished_runs(&self) -> Result<Vec<RunRecord>, StoreError> {
-        let rows =
-            sqlx::query("SELECT id, workflow_id, workflow_version, status, input, output, error, source, source_detail, started_at, ended_at FROM runs WHERE status IN (?, ?, ?) ORDER BY started_at ASC")
-                .bind(DbRunStatus::Initializing.as_str())
-                .bind(DbRunStatus::Running.as_str())
-                .bind(DbRunStatus::AwaitingResume.as_str())
-                .fetch_all(&self.pool)
-                .await?;
+        // Include initializing as well as active states: it needs crash recovery too.
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new("SELECT id, workflow_id, workflow_version, status, input, output, error, source, source_detail, started_at, ended_at FROM runs WHERE status IN (");
+        let mut statuses = query.separated(", ");
+        for status in DbRunStatus::ALL
+            .iter()
+            .filter(|status| !status.is_terminal())
+        {
+            statuses.push_bind(status.as_str());
+        }
+        statuses.push_unseparated(") ORDER BY started_at ASC");
+        let rows = query.build().fetch_all(&self.pool).await?;
         rows.into_iter().map(Self::run_from_row).collect()
     }
 

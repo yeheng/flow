@@ -236,7 +236,13 @@ async fn tls_agent_end_to_end_business() {
     }
     let output = match done.nodes["e"].output.clone().unwrap() {
         StoredValue::Inline(value) => value,
-        StoredValue::Ref(_) => json!({"slept_ms": 10}),
+        StoredValue::Ref(reference) => flow_journal::value::materialize(
+            backend.journal.root(),
+            backend.journal.durable_lsn(),
+            &StoredValue::Ref(reference),
+            8 * 1024 * 1024,
+        )
+        .unwrap(),
     };
     assert_eq!(output["slept_ms"], 10);
     // script 输出经中继进入权威日志。

@@ -293,17 +293,42 @@ e2e_test!(
                 -32010,
                 "workflow.update 必须拒收「{label}」：{err}"
             );
-            // publish 同样校验（发布即最终校验点）
+            // Seed a real draft, then simulate a legacy/corrupted stored definition.
+            // Publication must reject that definition, not merely a missing version.
+            let draft: Value = call(
+                &client,
+                "workflow.update",
+                json!({"workflow_id":workflow_id,"definition":linear_def("return 1;")}),
+            )
+            .await;
+            let version = draft["version"].as_i64().unwrap();
+            if let Some(url) = ctx.pg_url() {
+                let pool = sqlx::PgPool::connect(url).await.unwrap();
+                sqlx::query("UPDATE workflow_versions SET definition=$1 WHERE workflow_id=$2 AND version=$3")
+                    .bind(&definition).bind(&workflow_id).bind(version).execute(&pool).await.unwrap();
+                pool.close().await;
+            } else {
+                let options =
+                    sqlx::sqlite::SqliteConnectOptions::new().filename(ctx.sqlite_path().unwrap());
+                let pool = sqlx::SqlitePool::connect_with(options).await.unwrap();
+                sqlx::query(
+                    "UPDATE workflow_versions SET definition=? WHERE workflow_id=? AND version=?",
+                )
+                .bind(serde_json::to_string(&definition).unwrap())
+                .bind(&workflow_id)
+                .bind(version)
+                .execute(&pool)
+                .await
+                .unwrap();
+                pool.close().await;
+            }
             let err = call_err(
                 &client,
                 "workflow.publish",
-                json!({"workflow_id": workflow_id, "version": 1}),
+                json!({"workflow_id": workflow_id, "version": version}),
             )
             .await;
-            assert!(
-                err.code() == -32010 || err.code() == -32011,
-                "「{label}」的 publish 结果：{err}"
-            );
+            assert_eq!(err.code(), -32010, "「{label}」的 publish 结果：{err}");
         }
 
         // definition 结构本身不合法（缺 nodes 字段）

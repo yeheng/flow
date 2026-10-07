@@ -14,16 +14,12 @@ use chrono::{DateTime, Utc};
 use jsonrpsee::ws_client::WsClient;
 use serde_json::{json, Value};
 
+use crate::cli::RunCommand;
 use crate::client::{call, object};
 use crate::error::CliError;
 use crate::output::{
     duration_text, load_json_arg, local_time, note, print_json, short_id, table, truncate_chars,
 };
-use crate::cli::RunCommand;
-
-/// run 终态词汇表（与服务端 `DbRunStatus::is_terminal_str` 同一份含义，
-/// 这里只为轮询判定，不做写入口校验）。
-const TERMINAL: [&str; 3] = ["succeeded", "failed", "cancelled"];
 
 pub async fn dispatch(client: &WsClient, json: bool, command: RunCommand) -> Result<(), CliError> {
     match command {
@@ -124,7 +120,7 @@ async fn wait_terminal(
     loop {
         let run = run_record(client, run_id).await?;
         let status = run["status"].as_str().unwrap_or_default();
-        if TERMINAL.contains(&status) {
+        if flow_dto::DbRunStatus::is_terminal_str(status) {
             return Ok(run);
         }
         if Instant::now() >= deadline {

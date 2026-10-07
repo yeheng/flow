@@ -165,7 +165,17 @@ enum JournalDevCommand {
 
 fn main() -> std::process::ExitCode {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let command = Flow::parse().command;
+    let command = match Flow::try_parse() {
+        Ok(args) => args.command,
+        Err(error) => {
+            let success = matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            );
+            let _ = error.print();
+            std::process::exit(if success { 0 } else { 1 });
+        }
+    };
     // 每个子命令自带 runtime 形态：executor/agent 是多线程子进程运行时，
     // server 的形态（current_thread/multi_thread）随 FLOW_BACKEND 切换，
     // 其余工具单线程足够。
@@ -183,7 +193,14 @@ fn main() -> std::process::ExitCode {
             executor_bin,
             slots,
         } => agent_main(
-            control_addr, data_addr, agent_id, ca_cert, cert, key, executor_bin, slots,
+            control_addr,
+            data_addr,
+            agent_id,
+            ca_cert,
+            cert,
+            key,
+            executor_bin,
+            slots,
         ),
         Command::JournalTool { command } => journal_tool_main(command),
         Command::JournalBench { root } => journal_bench_main(root),
@@ -295,7 +312,24 @@ fn agent_main(
         .build()
         .expect("agent tokio runtime");
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let reason = runtime.block_on(flow_agent::runtime::run_agent(config, shutdown));
+    let reason = runtime.block_on(async move {
+        let stop = shutdown.clone();
+        let signal = tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                let mut terminate =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("SIGTERM handler");
+                tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+            }
+            #[cfg(not(unix))]
+            let _ = tokio::signal::ctrl_c().await;
+            stop.cancel();
+        });
+        let reason = flow_agent::runtime::run_agent(config, shutdown).await;
+        signal.abort();
+        reason
+    });
     eprintln!("flow agent exiting: {reason}");
     0
 }
@@ -348,7 +382,10 @@ fn journal_tool_main(command: JournalToolCommand) -> i32 {
                 };
                 return match flow_journal::scan(&data_dir, |_, _| Ok(())) {
                     Ok(report) => {
-                        println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&report).unwrap_or_default()
+                        );
                         eprintln!(
                             "repair requires --confirm; candidate suffix may include previously \
                              acknowledged data; original evidence will be preserved"
@@ -364,7 +401,10 @@ fn journal_tool_main(command: JournalToolCommand) -> i32 {
             }
         }
     };
-    println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).unwrap_or_default()
+    );
     if report.fault.is_some() {
         eprintln!("journal verification found corruption; source is unchanged");
         return 1;
@@ -482,8 +522,7 @@ async fn bench(root: PathBuf) -> Result<i32, Box<dyn std::error::Error>> {
         let pass = p99(&control) <= 100.0
             && p99(&audit) <= 100.0
             && (name != "burst" || elapsed <= 5.0)
-            && (name == "low"
-                || stats.transactions as f64 / (stats.data_syncs - 1) as f64 >= 4.0);
+            && (name == "low" || stats.transactions as f64 / (stats.data_syncs - 1) as f64 >= 4.0);
         println!(
             "{}",
             json!({"load":name,"pass":pass,"seconds":elapsed,"tx_per_second":count as f64/elapsed,
@@ -585,7 +624,10 @@ async fn journal_dev(
     use flow_backend::journal::JournalBackend;
     use flow_journal::JournalOptions;
 
-    fn read_json(path: &std::path::Path, max: usize) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    fn read_json(
+        path: &std::path::Path,
+        max: usize,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
         let mut bytes = Vec::new();
         std::fs::File::open(path)?
             .take(max as u64 + 1)

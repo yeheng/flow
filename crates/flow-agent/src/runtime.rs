@@ -55,10 +55,15 @@ pub async fn run_agent(config: AgentConfig, shutdown: CancellationToken) -> Stri
     let mut backoff = Duration::from_millis(500);
     loop {
         if shutdown.is_cancelled() {
+            cancel_all(&executor_handles).await;
             return "shutdown".into();
         }
         // Reconnecting：建立双 TLS + 握手 + DataBind。
-        match connect(&config, &agent_boot_id).await {
+        let connection = tokio::select! {
+            _ = shutdown.cancelled() => {cancel_all(&executor_handles).await; return "shutdown".into();},
+            result = tokio::time::timeout(Duration::from_secs(15), connect(&config, &agent_boot_id)) => result.unwrap_or_else(|_| Err("agent connect timeout".into())),
+        };
+        match connection {
             Ok((mut transport, link_session_id, journal_id, master_epoch)) => {
                 tracing::info!(%link_session_id, "agent uplink ready");
                 backoff = Duration::from_millis(500);
@@ -87,7 +92,7 @@ pub async fn run_agent(config: AgentConfig, shutdown: CancellationToken) -> Stri
                     transport,
                     relay,
                     executor_handles.clone(),
-                    &mut uplink_rx,
+                    &mut uplink_rx.rx,
                     shutdown.clone(),
                 )
                 .await;
@@ -104,7 +109,7 @@ pub async fn run_agent(config: AgentConfig, shutdown: CancellationToken) -> Stri
                 tracing::warn!(%error, "agent connect failed; retrying with backoff");
             }
         }
-        tokio::time::sleep(backoff).await;
+        tokio::select! { _ = shutdown.cancelled() => {}, _ = tokio::time::sleep(backoff) => {} }
         backoff = (backoff * 2).min(Duration::from_secs(15));
     }
 }
@@ -227,50 +232,50 @@ pub async fn resume(
     relay: &Arc<parking_lot::Mutex<Relay>>,
     handles: &Arc<tokio::sync::Mutex<BTreeMap<String, ExecutorHandle>>>,
 ) -> std::result::Result<(), String> {
+    // Freeze pagination before applying decisions, which may remove handles.
+    let snapshot: Vec<(String, ResumeItem)> = {
+        let handles = handles.lock().await;
+        // 重挂归属：新 link 会话的 relay 重新登记本地绑定（内层执行器
+        // 消息才能按已确认路由包装）。
+        for (dispatch, handle) in handles.iter() {
+            relay
+                .lock()
+                .bind(dispatch, &handle.executor_id, &handle.executor_boot_id);
+        }
+        let mut facts = Vec::new();
+        for (dispatch, handle) in handles.iter() {
+            let result = handle.result.lock().await.clone();
+            facts.push((
+                dispatch.clone(),
+                ResumeItem {
+                    dispatch_id: dispatch.clone(),
+                    executor_boot_id: handle.executor_boot_id.clone(),
+                    state: if result.is_some() {
+                        "result_ready".into()
+                    } else {
+                        "executing".into()
+                    },
+                    durable_audit_seq: handle.last_acked.load(Ordering::Relaxed),
+                    result_id: result.as_ref().map(|(id, _)| id.clone()),
+                    result_last_audit_seq: result.as_ref().map(|(_, seq)| *seq),
+                    lost_data: handle.lost_data.load(Ordering::Relaxed),
+                    forced_kill: handle.forced_kill.load(Ordering::Relaxed),
+                },
+            ));
+        }
+        facts
+    };
     let mut page = 0u32;
     loop {
-        let snapshot: Vec<(String, ResumeItem)> = {
-            let handles = handles.lock().await;
-            // 重挂归属：新 link 会话的 relay 重新登记本地绑定（内层执行器
-            // 消息才能按已确认路由包装）。
-            for (dispatch, handle) in handles.iter() {
-                relay
-                    .lock()
-                    .bind(dispatch, &handle.executor_id, &handle.executor_boot_id);
-            }
-            let mut facts = Vec::new();
-            for (index, (dispatch, handle)) in handles.iter().enumerate() {
-                if index < page as usize * RESUME_PAGE_MAX {
-                    continue;
-                }
-                if facts.len() >= RESUME_PAGE_MAX {
-                    break;
-                }
-                let result = handle.result.lock().await.clone();
-                facts.push((
-                    dispatch.clone(),
-                    ResumeItem {
-                        dispatch_id: dispatch.clone(),
-                        executor_boot_id: handle.executor_boot_id.clone(),
-                        state: if result.is_some() {
-                            "result_ready".into()
-                        } else {
-                            "executing".into()
-                        },
-                        durable_audit_seq: handle.last_acked.load(Ordering::Relaxed),
-                        result_id: result.as_ref().map(|(id, _)| id.clone()),
-                        result_last_audit_seq: result.as_ref().map(|(_, seq)| *seq),
-                        lost_data: handle.lost_data.load(Ordering::Relaxed),
-                        forced_kill: handle.forced_kill.load(Ordering::Relaxed),
-                    },
-                ));
-            }
-            facts
-        };
-        let more = snapshot.len() == RESUME_PAGE_MAX;
+        let start = page as usize * RESUME_PAGE_MAX;
+        let end = (start + RESUME_PAGE_MAX).min(snapshot.len());
+        let more = end < snapshot.len();
         transport
             .send(Message::Resume {
-                items: snapshot.into_iter().map(|(_, item)| item).collect(),
+                items: snapshot[start..end]
+                    .iter()
+                    .map(|(_, item)| item.clone())
+                    .collect(),
                 page,
                 more,
             })
@@ -294,9 +299,14 @@ pub async fn resume(
             for decision in &decisions {
                 if matches!(
                     decision.action,
-                    ResumeAction::CancelAndDrain | ResumeAction::ReconcileRequired
+                    ResumeAction::AlreadyCommitted
+                        | ResumeAction::CancelAndDrain
+                        | ResumeAction::ReconcileRequired
                 ) {
                     if let Some(handle) = handles.lock().await.get(&decision.dispatch_id) {
+                        if decision.action == ResumeAction::AlreadyCommitted {
+                            handle.committed.store(true, Ordering::Release);
+                        }
                         handle.cancel.cancel();
                     }
                     relay.lock().unbind(&decision.dispatch_id);
@@ -339,8 +349,37 @@ pub async fn serve(
     uplink_rx: &mut mpsc::Receiver<Message>,
     shutdown: CancellationToken,
 ) -> String {
+    let mut draining = None;
+    let mut pending: Option<(mpsc::Sender<Message>, Message)> = None;
+    let mut housekeeping = tokio::time::interval(Duration::from_millis(20));
     loop {
         tokio::select! {
+            permit = async { pending.as_ref().unwrap().0.clone().reserve_owned().await }, if pending.is_some() => {
+                let (_, message) = pending.take().unwrap();
+                match permit {
+                    Ok(permit) => { permit.send(message); }
+                    Err(_) => return "executor inbox closed".into(),
+                }
+            }
+            _ = housekeeping.tick() => {
+                let mut guard = handles.lock().await;
+                let finished: Vec<_> = guard.iter().filter(|(_, handle)| handle.done.load(Ordering::Acquire)
+                    && (handle.committed.load(Ordering::Acquire) || handle.forced_kill.load(Ordering::Relaxed)))
+                    .map(|(id, _)| id.clone()).collect();
+                for id in finished {
+                    guard.remove(&id);
+                    relay.lock().unbind(&id);
+                }
+                let all_done = guard.values().all(|handle| handle.done.load(Ordering::Acquire));
+                let count = guard.len() as u32;
+                drop(guard);
+                if draining.is_some_and(|deadline| all_done || tokio::time::Instant::now() >= deadline) {
+                    cancel_all(&handles).await;
+                    let _ = transport.send(Message::DrainComplete { drained: count }).await;
+                    transport.flush_and_close(Duration::from_millis(DRAIN_GRACE_MS)).await;
+                    return "drained".into();
+                }
+            }
             _ = shutdown.cancelled() => {
                 cancel_all(&handles).await;
                 transport.close();
@@ -349,6 +388,11 @@ pub async fn serve(
             outbound = uplink_rx.recv() => {
                 match outbound {
                     Some(message) => {
+                        // Queued frames may have been wrapped before reconnection.
+                        let message = if let Message::Routed { inner, .. } = message {
+                            let Some(id) = inner.dispatch_id().map(str::to_owned) else {continue};
+                            match relay.lock().wrap_to_master(&id, *inner) { Ok(message) => message, Err(RelayError::Unbound(_)) => continue, Err(error) => return error.to_string() }
+                        } else { message };
                         if transport.send(message).await.is_err() {
                             tracing::info!("agent serve exiting: uplink send failed");
                             return "uplink send failed".into();
@@ -360,7 +404,7 @@ pub async fn serve(
                     }
                 }
             }
-            received = transport.recv() => {
+            received = transport.recv(), if pending.is_none() => {
                 match received {
                     Ok((_channel, message)) => match message {
                         Message::Routed { .. } => {
@@ -369,7 +413,10 @@ pub async fn serve(
                                 Ok((dispatch_id, inner)) => {
                                     let handles_guard = handles.lock().await;
                                     if let Some(handle) = handles_guard.get(&dispatch_id) {
-                                        let _ = handle.inbox.try_send(inner);
+                                        if matches!(inner, Message::Cancel { .. }) { handle.cancel.cancel(); }
+                                        else {
+                                            if matches!(inner, Message::ResultCommitted { .. }) {handle.committed.store(true, Ordering::Release);}
+                                            pending = Some((handle.inbox.clone(), inner)); }
                                     }
                                 }
                                 Err(RelayError::Unbound(_)) => {
@@ -387,8 +434,10 @@ pub async fn serve(
                             }
                         }
                         Message::BindExecutor { executor_id, dispatch_id } => {
-                            // Drain 会话内不会再有新 Bind（Drain 帧处理后直接
-                            // 关闭返回）；这里不做状态检查。
+                            if draining.is_some() || handles.lock().await.values().filter(|handle| !handle.done.load(Ordering::Acquire) && !handle.committed.load(Ordering::Acquire)).count() >= config.slots as usize {
+                                if transport.send(Message::BindExecutorAck { executor_id, executor_boot_id: String::new(), dispatch_id, ok: false, error: Some("agent draining or at capacity".into()) }).await.is_err() { return "bind reject send failed".into(); }
+                                continue;
+                            }
                             let bound = pool::bind_executor(
                                 &config.executor,
                                 journal_id,
@@ -402,45 +451,29 @@ pub async fn serve(
                                 Ok(handle) => {
                                     let boot = handle.executor_boot_id.clone();
                                     handles.lock().await.insert(dispatch_id.clone(), handle);
-                                    let _ = transport.try_send(Message::BindExecutorAck {
+                                    let sent = transport.send(Message::BindExecutorAck {
                                         executor_id,
                                         executor_boot_id: boot,
                                         dispatch_id,
                                         ok: true,
                                         error: None,
-                                    });
+                                    }).await;
+                                    if sent.is_err() { return "bind acknowledgement send failed".into(); }
                                 }
                                 Err(error) => {
-                                    let _ = transport.try_send(Message::BindExecutorAck {
+                                    let sent = transport.send(Message::BindExecutorAck {
                                         executor_id,
                                         executor_boot_id: String::new(),
                                         dispatch_id,
                                         ok: false,
                                         error: Some(error.to_string()),
-                                    });
+                                    }).await;
+                                    if sent.is_err() { return "bind acknowledgement send failed".into(); }
                                 }
                             }
                         }
                         Message::Drain { grace_ms } => {
-                            // 宽限内在飞执行器自然收尾，到期强杀（三期 §1.6）。
-                            let deadline = tokio::time::Instant::now()
-                                + Duration::from_millis(grace_ms.min(DRAIN_GRACE_MS));
-                            loop {
-                                let all_done = handles
-                                    .lock()
-                                    .await
-                                    .values()
-                                    .all(|handle| handle.done.load(Ordering::Relaxed));
-                                if all_done || tokio::time::Instant::now() >= deadline {
-                                    break;
-                                }
-                                tokio::time::sleep(Duration::from_millis(50)).await;
-                            }
-                            let drained = handles.lock().await.len() as u32;
-                            cancel_all(&handles).await;
-                            let _ = transport.send(Message::DrainComplete { drained }).await;
-                            transport.close();
-                            return "drained".into();
+                            draining = Some(tokio::time::Instant::now() + Duration::from_millis(grace_ms.min(DRAIN_GRACE_MS)));
                         }
                         Message::ResumeReply { decisions, .. } => {
                             for decision in decisions {
@@ -490,6 +523,10 @@ async fn fair_mux_bridge(
     let mut cursor: Option<String> = None;
     loop {
         let mut served: Option<String> = None;
+        let mut outgoing = None;
+        if mux_in.is_closed() {
+            return;
+        }
         {
             let mut guard = handles.lock().await;
             for pass in 0..2 {
@@ -503,9 +540,7 @@ async fn fair_mux_bridge(
                 };
                 for (dispatch, handle) in guard.range_mut(range) {
                     if let Ok(message) = handle.out.try_recv() {
-                        if mux_in.send(message).await.is_err() {
-                            return;
-                        }
+                        outgoing = Some(message);
                         served = Some(dispatch.clone());
                         break;
                     }
@@ -513,6 +548,11 @@ async fn fair_mux_bridge(
                 if served.is_some() || cursor.is_none() {
                     break;
                 }
+            }
+        }
+        if let Some(message) = outgoing {
+            if mux_in.send(message).await.is_err() {
+                return;
             }
         }
         if served.is_some() {
@@ -526,14 +566,26 @@ async fn fair_mux_bridge(
 /// 上联转发管道：执行器出站 → 轮转桥 → relay 包装 → uplink 队列。
 /// 返回给 serve 会话消费的出站端；桥与包装任务随管道常驻（断线不拆），
 /// relay 槽里的会话身份由调用方在重连时换新。
+struct UplinkPipeline {
+    rx: mpsc::Receiver<Message>,
+    tasks: [tokio::task::JoinHandle<()>; 2],
+}
+impl Drop for UplinkPipeline {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
 fn spawn_uplink_pipeline(
     handles: Arc<tokio::sync::Mutex<BTreeMap<String, ExecutorHandle>>>,
     relay_slot: Arc<parking_lot::Mutex<Arc<parking_lot::Mutex<Relay>>>>,
-) -> mpsc::Receiver<Message> {
+) -> UplinkPipeline {
     let (uplink_out, uplink_rx) = mpsc::channel::<Message>(UPLINK_OUT_QUEUE);
     let (mux_in, mux_in_rx) = mpsc::channel::<Message>(UPLINK_OUT_QUEUE);
-    tokio::spawn(fair_mux_bridge(handles, mux_in));
-    tokio::spawn(async move {
+    let bridge = tokio::spawn(fair_mux_bridge(handles, mux_in));
+    let wrapper = tokio::spawn(async move {
         // mux → 包络 → uplink_out（按 dispatch 包装，relay 取当前会话那份）。
         let mut mux_in_rx = mux_in_rx;
         while let Some(message) = mux_in_rx.recv().await {
@@ -555,7 +607,10 @@ fn spawn_uplink_pipeline(
             }
         }
     });
-    uplink_rx
+    UplinkPipeline {
+        rx: uplink_rx,
+        tasks: [bridge, wrapper],
+    }
 }
 
 /// 测试/进程内入口：跳过 TLS 建流，直接进入服务循环（R0）。
@@ -583,7 +638,7 @@ pub async fn serve_for_tests(
         transport,
         session_relay,
         handles,
-        &mut uplink_rx,
+        &mut uplink_rx.rx,
         shutdown,
     )
     .await
@@ -667,7 +722,7 @@ pub async fn reconnect_session(
         transport,
         relay,
         handles,
-        &mut uplink_rx,
+        &mut uplink_rx.rx,
         shutdown,
     )
     .await;
@@ -697,6 +752,7 @@ mod tests {
                 forced_kill: Arc::new(AtomicBool::new(false)),
                 lost_data: Arc::new(AtomicBool::new(false)),
                 done: Arc::new(AtomicBool::new(false)),
+                committed: Arc::new(AtomicBool::new(false)),
             },
             out_tx,
         )
@@ -752,6 +808,88 @@ mod tests {
                 .expect("single executor starved after cursor wrap")
                 .expect("bridge exited");
         }
+        bridge.abort();
+    }
+    #[tokio::test]
+    async fn resume_pages_survive_removal_and_committed_handles_are_reaped() {
+        let handles = Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+        let mut committed = Vec::new();
+        let mut cancels = Vec::new();
+        for index in 0..RESUME_PAGE_MAX + 3 {
+            let id = format!("d-{index:05}");
+            let (handle, _out) = handle(&id);
+            committed.push(handle.committed.clone());
+            cancels.push(handle.cancel.clone());
+            handles.lock().await.insert(id, handle);
+        }
+        let relay = Arc::new(parking_lot::Mutex::new(Relay::new(
+            "agent".into(),
+            "boot".into(),
+            "session".into(),
+        )));
+        let (ca, cb) = tokio::io::duplex(1024 * 1024);
+        let (da, db) = tokio::io::duplex(1024 * 1024);
+        let mut agent = FrameTransport::spawn_streams(ca, da, 16);
+        let mut master = FrameTransport::spawn_streams(cb, db, 16);
+        let server = tokio::spawn(async move {
+            let mut reported = std::collections::BTreeSet::new();
+            loop {
+                let (_, message) = master.recv().await.unwrap();
+                let Message::Resume { items, page, more } = message else {
+                    panic!("expected resume")
+                };
+                for item in &items {
+                    assert!(reported.insert(item.dispatch_id.clone()));
+                }
+                master
+                    .send(Message::ResumeReply {
+                        page,
+                        decisions: items
+                            .into_iter()
+                            .map(
+                                |item| flow_engine::execution_protocol::remote::ResumeDecision {
+                                    dispatch_id: item.dispatch_id,
+                                    action: ResumeAction::AlreadyCommitted,
+                                },
+                            )
+                            .collect(),
+                    })
+                    .await
+                    .unwrap();
+                if !more {
+                    break;
+                }
+            }
+            reported.len()
+        });
+        tokio::time::timeout(Duration::from_secs(2), resume(&mut agent, &relay, &handles))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(server.await.unwrap(), RESUME_PAGE_MAX + 3);
+        assert!(handles.lock().await.is_empty());
+        assert!(committed.iter().all(|flag| flag.load(Ordering::Acquire)));
+        assert!(cancels.iter().all(CancellationToken::is_cancelled));
+    }
+
+    #[tokio::test]
+    async fn saturated_uplink_does_not_hold_executor_map_lock() {
+        let handles = Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+        let (entry, source) = handle("a");
+        handles.lock().await.insert("a".into(), entry);
+        let (sink, mut received) = mpsc::channel(1);
+        sink.send(Message::Ready).await.unwrap();
+        source.send(Message::Ready).await.unwrap();
+        let bridge = tokio::spawn(fair_mux_bridge(handles.clone(), sink));
+        // Let the bridge consume the frame and encounter outbound backpressure.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let guard = tokio::time::timeout(Duration::from_millis(200), handles.lock())
+            .await
+            .expect("backpressure must not block cancel/drain map access");
+        assert!(guard["a"].out.is_empty());
+        drop(guard);
+        received.recv().await.unwrap();
+        assert!(matches!(received.recv().await, Some(Message::Ready)));
         bridge.abort();
     }
 }

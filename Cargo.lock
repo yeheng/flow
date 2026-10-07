@@ -770,6 +770,7 @@ dependencies = [
  "chrono",
  "clap",
  "flow-backend",
+ "flow-dto",
  "flow-rpc",
  "flow-test-support",
  "jsonrpsee",

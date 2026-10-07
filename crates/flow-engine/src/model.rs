@@ -407,7 +407,7 @@ impl RetryPolicy {
                 .and_then(|r| r.get("max_attempts"))
                 .and_then(Value::as_u64)
                 .unwrap_or(1)
-                .max(1) as u32,
+                .clamp(1, u32::MAX as u64) as u32,
             backoff_ms: retry
                 .and_then(|r| r.get("backoff_ms"))
                 .and_then(Value::as_u64)
@@ -1216,6 +1216,11 @@ mod tests {
 
     #[test]
     fn retry_policy_defaults_and_clamps() {
+        assert_eq!(
+            RetryPolicy::from_params(&json!({"retry":{"max_attempts":1u64 << 40}})).max_attempts,
+            u32::MAX
+        );
+
         // 无 retry：1 次不重试、0 退避
         assert_eq!(
             RetryPolicy::from_params(&json!({})),

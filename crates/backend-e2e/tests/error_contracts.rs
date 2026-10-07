@@ -126,7 +126,9 @@ e2e_test!(run_list_limit_is_clamped_to_bounds, |ctx: &mut Ctx| {
     Box::pin(async move {
         let client = ctx.client().await;
         let (workflow_id, _) = publish_workflow(&client, "夹取", linear_def("return 1;")).await;
-        start_run(&client, &workflow_id, json!({})).await;
+        for _ in 0..501 {
+            start_run(&client, &workflow_id, json!({})).await;
+        }
 
         // 0/负数 → 1；超过 500 → 500（RPC 边缘 clamp）
         let clamped_low: Value = call_json(&client, "run.list", json!({"limit": 0})).await;
@@ -134,11 +136,11 @@ e2e_test!(run_list_limit_is_clamped_to_bounds, |ctx: &mut Ctx| {
         let clamped_negative: Value = call_json(&client, "run.list", json!({"limit": -5})).await;
         assert_eq!(clamped_negative["runs"].as_array().unwrap().len(), 1);
         let clamped_high: Value = call_json(&client, "run.list", json!({"limit": 9999})).await;
-        assert!(clamped_high["runs"].as_array().unwrap().len() <= 500);
+        assert_eq!(clamped_high["runs"].as_array().unwrap().len(), 500);
 
         // 缺省 limit → 50
         let default: Value = call_json(&client, "run.list", json!({})).await;
-        assert!(default["runs"].as_array().unwrap().len() <= 50);
+        assert_eq!(default["runs"].as_array().unwrap().len(), 50);
     })
 });
 

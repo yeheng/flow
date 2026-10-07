@@ -26,9 +26,12 @@ use flow_test_support::pg::{
     remove_container, shared, start_probe_container, test_databases, TestDb,
 };
 
+static HYGIENE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// 三条防线各一条断言。探针容器用完就删，主容器留给 atexit。
 #[tokio::test]
 async fn pg_run_creates_no_volume_and_reclaims_every_orphan() {
+    let _guard = HYGIENE_LOCK.lock().await;
     // ---- 防线 1：容器身上不该有匿名 volume（数据目录挂 tmpfs）----
     let pg = shared().await;
     assert!(
@@ -119,6 +122,7 @@ async fn pg_run_creates_no_volume_and_reclaims_every_orphan() {
 /// 别人的命名 volume（名字再像也不行）。
 #[tokio::test]
 async fn janitor_never_touches_named_volumes() {
+    let _guard = HYGIENE_LOCK.lock().await;
     docker_ok(&[
         "volume",
         "create",

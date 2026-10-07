@@ -9,8 +9,10 @@ use crate::journal_execution::Attempt;
 use flow_engine::journal_state::{Parent, Run, Wait};
 use flow_engine::{Definition, NodeLogger, NodeType};
 use flow_journal::{Event, EventKind, StoredValue};
+use futures::FutureExt;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +20,8 @@ use std::time::Duration;
 #[derive(Clone)]
 pub(crate) enum ExecutionPort {
     InProcess,
+    #[cfg(test)]
+    PanicOnScript,
     Ipc(Arc<IpcDispatcher>),
     Remote(Arc<RemoteDispatcher>),
 }
@@ -104,16 +108,17 @@ impl JournalBackend {
         port: ExecutionPort,
     ) -> Result<()> {
         let mut driver = self.execution.lock().await;
-        if driver.is_some() {
+        if driver.as_ref().is_some_and(|handle| !handle.is_finished()) {
             return Ok(());
         }
         let observation = self.observations.clone();
         let weak = Arc::downgrade(self);
         let cancel = self.cancellation();
         let notify = self.execution_notification();
-        let port = port;
         notify.notify_one();
         *driver = Some(tokio::spawn(async move {
+            loop {
+                let restarted = AssertUnwindSafe(async {
             let mut tasks: tokio::task::JoinSet<((String, String), Result<()>)> =
                 tokio::task::JoinSet::new();
             let mut active = HashSet::new();
@@ -133,7 +138,7 @@ impl JournalBackend {
                     completed=tasks.join_next(),if !tasks.is_empty()=>{
                         match completed {
                             Some(Ok((key,result)))=>{active.remove(&key);finished=Some(key.0);if let Err(error)=result {tracing::error!(%error,"v2 node task stopped; committed evidence retained");}},
-                            Some(Err(error))=>{tracing::error!(%error,"v2 task panic: stopping dispatch, preserving unresolved facts");tasks.abort_all();return},
+                            Some(Err(error))=>{tracing::error!(%error,"v2 task exited unexpectedly; rebuilding coordinator");tasks.abort_all();while tasks.join_next().await.is_some(){}return},
                             None=>{}
                         }
                     },
@@ -164,8 +169,8 @@ impl JournalBackend {
                             .await;
                         break;
                     }
-                    let result:Result<()>=async {
-                        let run=backend.inspect(|s|s.runs[&run_id].clone()).await;
+                    let result:Result<()>=AssertUnwindSafe(async {
+                        let run=backend.inspect(|s|s.runs.get(&run_id).cloned()).await.ok_or_else(||invalid("run missing"))?;
                         if run.terminal(){return Ok(())}
                         // A cancelled parent durably drives bounded one-child cancellation,
                         // so restart resumes propagation without a giant transaction.
@@ -176,11 +181,11 @@ impl JournalBackend {
                         let definition=load_definition(&backend,&run).await?;
                         for node in &definition.nodes {
                             if active.contains(&(run_id.clone(),node.id.clone())){continue}
-                            let snapshot=backend.inspect(|s|s.runs[&run_id].clone()).await;
+                            let snapshot=backend.inspect(|s|s.runs.get(&run_id).cloned()).await.ok_or_else(||invalid("run missing"))?;
                             if snapshot.terminal(){break}
                             if let Some(record)=snapshot.nodes.get(&node.id) {
                                 if record.status=="waiting" {
-                                    let wait=record.wait.as_ref().unwrap();
+                                    let wait=record.wait.as_ref().ok_or_else(||invalid("waiting node missing wait"))?;
                                     if wait.kind=="delay" && wait.wake_at.is_some_and(|at|at<=chrono::Utc::now().timestamp_millis()) {
                                         backend.internal(|s|{let r=&s.runs[&run_id];Ok((vec![node_event(r,&node.id,EventKind::WaitResolved,json!({"output":wait.output.clone().unwrap_or(StoredValue::Inline(Value::Null))}),true)],()))}).await?;
                                     }
@@ -220,7 +225,11 @@ impl JournalBackend {
                             backend.execution_peak.fetch_max(tasks.len()+1,std::sync::atomic::Ordering::Relaxed);
                             let node=node.clone();let observation=observation.clone();let port=port.clone();
                             tasks.spawn(async move {
-                                let result=match &port{
+                                let result=AssertUnwindSafe(async { match &port{
+                                    #[cfg(test)]
+                                    ExecutionPort::PanicOnScript if node.kind() == Some(NodeType::Script) => panic!("injected execution panic"),
+                                    #[cfg(test)]
+                                    ExecutionPort::PanicOnScript => execute(&attempt, &node, predecessors.clone(), NodeLogger::disabled()).await,
                                     ExecutionPort::InProcess=>{
                                         let logger=observation.map(|store|NodeLogger::observation(store.logger(attempt.run_id.clone(),attempt.dispatch_id.clone()),attempt.node_id.clone(),1)).unwrap_or_else(NodeLogger::disabled);
                                         execute(&attempt,&node,predecessors.clone(),logger).await
@@ -231,11 +240,11 @@ impl JournalBackend {
                                     ExecutionPort::Remote(dispatcher)=>{
                                         dispatcher.execute(&attempt,&node,predecessors.clone(),observation).await
                                     }
-                                };
+                                }}).catch_unwind().await.unwrap_or_else(|_| Err(invalid("node execution panicked; committed operation evidence retained").into()));
                                 if let Err(error)=&result {
                                     let snapshot=attempt.snapshot().await;
                                     if let Ok(snapshot)=snapshot {
-                                        let n=&snapshot.nodes[&attempt.node_id];
+                                        let Some(n)=snapshot.nodes.get(&attempt.node_id) else {return (key,Err(invalid("dispatch node missing").into()))};
                                         let uncertain=n.operation.as_ref().is_some_and(|o|o.outcome.is_none());
                                         let mut payload=if uncertain {json!({"wait":Wait{kind:"uncertain".into(),wake_at:None,child_run_id:None,output:None},"integrity":"unknown"})}
                                             else {json!({"error":error.to_string(),"preparation_failed":n.prepared.is_none(),"original_input":snapshot.input,"predecessors":predecessors,"integrity":"incomplete"})};
@@ -252,7 +261,7 @@ impl JournalBackend {
                                 (key,result)
                             });
                         }
-                        let snapshot=backend.inspect(|s|s.runs[&run_id].clone()).await;
+                        let snapshot=backend.inspect(|s|s.runs.get(&run_id).cloned()).await.ok_or_else(||invalid("run missing"))?;
                         if !snapshot.terminal() && definition.nodes.iter().all(|n|snapshot.nodes.get(&n.id).is_some_and(|n|matches!(n.status.as_str(),"succeeded"|"skipped"|"failed"))) {
                             // 失败收口（v1 §6.6）：任一节点终态 failed → RunFailed，
                             // 错误取定义序第一个 failed 节点；否则全部 end 计入
@@ -268,11 +277,42 @@ impl JournalBackend {
                             }
                         }
                         Ok(())
-                    }.await;
+                    }).catch_unwind().await.unwrap_or_else(|_| Err(invalid("coordinator panicked while advancing run").into()));
                     if let Err(error) = result {
-                        tracing::error!(%run_id,%error,"v2 coordinator stopped this run without replaying external work");
+                        tracing::error!(%run_id,%error,"v2 coordinator will retry from committed evidence");
+                        // Retry reads/coordination with a delay; new events may also wake the run.
+                        wakes.entry(chrono::Utc::now().timestamp_millis().saturating_add(1000))
+                            .or_default().insert(run_id);
                     }
                 }
+            }
+            }).catch_unwind().await;
+                if cancel.is_cancelled() {
+                    return;
+                }
+                let Some(backend) = weak.upgrade() else {
+                    return;
+                };
+                tracing::error!(
+                    panicked = restarted.is_err(),
+                    "restarting v2 coordinator from committed state"
+                );
+                let pending = backend
+                    .inspect(|state| {
+                        state
+                            .runs
+                            .values()
+                            .filter(|run| !run.terminal())
+                            .map(|run| run.run_id.clone())
+                            .collect()
+                    })
+                    .await;
+                backend.defer_runs(pending).await;
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
+                notify.notify_one();
             }
         }));
         Ok(())
@@ -455,4 +495,75 @@ async fn finish_run(
         }
         Ok((events,()))
     }).await
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    async fn install(backend: &JournalBackend, code: String) -> String {
+        let created = backend
+            .workflow_create("driver-regression", None)
+            .await
+            .unwrap();
+        let id = created.result["workflow_id"].as_str().unwrap();
+        backend.workflow_update(id, json!({"nodes":[{"id":"s","type":"start"},{"id":"n","type":"script","params":{"code":code}},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"n"},{"from":"n","to":"e"}]}), None).await.unwrap();
+        backend.workflow_publish(id, 1, None).await.unwrap();
+        let started = backend
+            .run_start(id, None, json!(null), "manual", None, None)
+            .await
+            .unwrap();
+        started.result["run_id"].as_str().unwrap().into()
+    }
+    async fn terminal(backend: &JournalBackend, id: &str) -> Run {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let run = backend.state().await.runs[id].clone();
+                if run.terminal() {
+                    return run;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn transient_materialize_error_retries_without_another_command() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = JournalBackend::open(root.path(), Default::default())
+            .await
+            .unwrap();
+        let id = install(&backend, format!("return 1; //{}", "x".repeat(128 * 1024))).await;
+        let path = root.path().join("journal");
+        let hidden = root.path().join("temporarily-unavailable");
+        std::fs::rename(&path, &hidden).unwrap();
+        backend.start_execution().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(backend.state().await.runs[&id].nodes.is_empty());
+        std::fs::rename(&hidden, &path).unwrap();
+        assert_eq!(terminal(&backend, &id).await.status, "succeeded");
+        backend.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn node_panic_seals_failure_and_driver_keeps_serving() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = JournalBackend::open(root.path(), Default::default())
+            .await
+            .unwrap();
+        backend
+            .start_execution_with_port(2, ExecutionPort::PanicOnScript)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let id = install(&backend, "return 1;".into()).await;
+            let run = terminal(&backend, &id).await;
+            assert_eq!(run.status, "failed");
+            assert!(run.nodes["n"].error.as_ref().unwrap().contains("panicked"));
+            assert!(run.nodes["n"]
+                .attempts
+                .values()
+                .all(|attempt| attempt.sealed));
+        }
+        backend.close().await.unwrap();
+    }
 }

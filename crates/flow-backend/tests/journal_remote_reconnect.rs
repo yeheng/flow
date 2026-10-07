@@ -50,19 +50,23 @@ fn agent_config() -> AgentConfig {
 async fn proxy_pair(
     manager: &Arc<flow_backend::execution::remote::AgentManager>,
     agent_id: &str,
-) -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
+) -> (
+    tokio::io::DuplexStream,
+    tokio::io::DuplexStream,
+    Vec<tokio::task::JoinHandle<()>>,
+) {
     // (agent 侧流, master 侧代理持有) ×2 —— 简化：agent 侧直连 pair；
     // master 侧经代理由我们持柄。
     let (agent_control, master_a) = tokio::io::duplex(256 * 1024);
     let (test_control, master_b) = tokio::io::duplex(256 * 1024);
-    tokio::spawn(bidirectional_copy(master_a, master_b));
+    let control_proxy = tokio::spawn(bidirectional_copy(master_a, master_b));
     let (agent_data, master_c) = tokio::io::duplex(256 * 1024);
     let (test_data, master_d) = tokio::io::duplex(256 * 1024);
-    tokio::spawn(bidirectional_copy(master_c, master_d));
+    let data_proxy = tokio::spawn(bidirectional_copy(master_c, master_d));
     manager
         .attach_inprocess(agent_id.to_string(), test_control, test_data)
         .await;
-    (agent_control, agent_data)
+    (agent_control, agent_data, vec![control_proxy, data_proxy])
 }
 
 async fn bidirectional_copy(a: tokio::io::DuplexStream, b: tokio::io::DuplexStream) {
@@ -81,11 +85,14 @@ type Handles =
 async fn start_agent(
     manager: &Arc<flow_backend::execution::remote::AgentManager>,
     handles: Handles,
+) -> (
+    Vec<tokio::task::JoinHandle<()>>,
+    tokio::task::JoinHandle<()>,
 ) {
-    let (control, data) = proxy_pair(manager, "agent-r2").await;
+    let (control, data, proxies) = proxy_pair(manager, "agent-r2").await;
     let config = agent_config();
     let shutdown = tokio_util::sync::CancellationToken::new();
-    tokio::spawn(async move {
+    let session = tokio::spawn(async move {
         // 首连握手（与 R0 相同序列）。
         let mut transport = FrameTransport::spawn_streams(control, data, 128);
         use flow_engine::execution_protocol::Message;
@@ -139,6 +146,21 @@ async fn start_agent(
         )
         .await;
     });
+    (proxies, session)
+}
+
+async fn disconnect(
+    proxies: Vec<tokio::task::JoinHandle<()>>,
+    session: tokio::task::JoinHandle<()>,
+) {
+    for proxy in proxies {
+        proxy.abort();
+        let _ = proxy.await;
+    }
+    tokio::time::timeout(Duration::from_secs(3), session)
+        .await
+        .expect("old session observes actual EOF")
+        .unwrap();
 }
 
 async fn install(b: &JournalBackend, definition: Value) -> String {
@@ -188,7 +210,7 @@ async fn uplink_drop_then_reconnect_resumes_without_double_execution() {
         .await
         .unwrap();
     let handles: Handles = Arc::new(tokio::sync::Mutex::new(Default::default()));
-    start_agent(&manager, handles.clone()).await;
+    let (proxies, session) = start_agent(&manager, handles.clone()).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // 慢脚本：执行中剪断上联。
@@ -211,11 +233,7 @@ async fn uplink_drop_then_reconnect_resumes_without_double_execution() {
         r.nodes.get("n").is_some_and(|n| n.prepared.is_some())
     })
     .await;
-    // 剪断：drop 代理测试侧句柄 → master 会话 EOF → 执行器保留。
-    // （代理句柄在 start_agent 内部 drop 不了——这里改用 manager 侧注入新流
-    // 替换实现断开：直接对同一 agent_id 重新 attach 前先等待 runner 挂起。）
-    // 简化：用第二组流触发「重连替换」（旧会话 outbound 关闭 = 断线效果）。
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    disconnect(proxies, session).await;
     // 断线期间 run 不得终态（主进程挂起等对账，不判死重跑）。
     let snapshot = backend.state().await.runs[&run_id].clone();
     assert!(
@@ -224,7 +242,7 @@ async fn uplink_drop_then_reconnect_resumes_without_double_execution() {
         snapshot.status
     );
     // 重连：新流 + 同一 handles → resume → 裁决续跑。
-    let (control, data) = proxy_pair(&manager, "agent-r2").await;
+    let (control, data, _reconnected_proxies) = proxy_pair(&manager, "agent-r2").await;
     let config = agent_config();
     let shutdown = tokio_util::sync::CancellationToken::new();
     let handles_reconnect = handles.clone();
@@ -253,6 +271,7 @@ async fn uplink_drop_then_reconnect_resumes_without_double_execution() {
         StoredValue::Ref(_) => json!({}),
     };
     assert_eq!(output["n"], 6);
+    manager.shutdown().await;
     backend.close().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -274,18 +293,14 @@ async fn cancel_during_disconnect_drains_after_resume() {
         .await
         .unwrap();
     let handles: Handles = Arc::new(tokio::sync::Mutex::new(Default::default()));
-    start_agent(&manager, handles.clone()).await;
+    let (proxies, session) = start_agent(&manager, handles.clone()).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     // 挂起 HTTP：授权后断线再取消。
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let hang_addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        loop {
-            let Ok((socket, _)) = listener.accept().await else {
-                return;
-            };
-            std::mem::forget(socket);
-        }
+    let server = tokio::spawn(async move {
+        let (_socket, _) = listener.accept().await.unwrap();
+        std::future::pending::<()>().await;
     });
     let workflow = install(
         &backend,
@@ -305,10 +320,10 @@ async fn cancel_during_disconnect_drains_after_resume() {
         r.nodes.get("h").is_some_and(|n| n.operation.is_some()) || r.terminal()
     })
     .await;
-    // 断线（重连替换触发旧会话关闭）+ 取消。
+    disconnect(proxies, session).await;
     backend.run_cancel(&run_id, None).await.unwrap();
     // 重连 → resume → CancelAndDrain → 执行器回收、节点封口。
-    let (control, data) = proxy_pair(&manager, "agent-r2").await;
+    let (control, data, _reconnected_proxies) = proxy_pair(&manager, "agent-r2").await;
     let config = agent_config();
     let shutdown = tokio_util::sync::CancellationToken::new();
     let handles_reconnect = handles.clone();
@@ -350,6 +365,8 @@ async fn cancel_during_disconnect_drains_after_resume() {
     })
     .await
     .expect("local executors recycled");
+    server.abort();
+    manager.shutdown().await;
     backend.close().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }

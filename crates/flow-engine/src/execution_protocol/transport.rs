@@ -99,6 +99,8 @@ enum IoEvent {
 /// 消息级传输端点：业务层唯一的收/发/关闭边界。
 pub struct FrameTransport {
     incoming: mpsc::Receiver<IoEvent>,
+    pending_error: Option<ProtocolError>,
+    ended: bool,
     control_out: mpsc::Sender<Message>,
     data_out: mpsc::Sender<Message>,
     io: IoHandle,
@@ -158,6 +160,8 @@ impl FrameTransport {
         drop(event_tx);
         Self {
             incoming,
+            pending_error: None,
+            ended: false,
             control_out: control_tx,
             data_out: data_tx,
             io: IoHandle {
@@ -192,11 +196,22 @@ impl FrameTransport {
     /// 接收下一条消息。任一通道 EOF/错误时返回 [`ProtocolError::Closed`]；
     /// 协议帧错误（非法长度/未知类型/畸形信封）先返回错误，随后通道关闭。
     pub async fn recv(&mut self) -> Result<(Channel, Message), ProtocolError> {
+        if let Some(error) = self.pending_error.take() {
+            return Err(error);
+        }
+        if self.ended {
+            return Err(ProtocolError::Closed);
+        }
         match self.incoming.recv().await {
             Some(IoEvent::Frame(channel, message)) => Ok((channel, *message)),
-            Some(IoEvent::Failed(_, error)) => Err(error),
-            Some(IoEvent::Eof(_)) => Err(ProtocolError::Closed),
-            None => Err(ProtocolError::Closed),
+            Some(IoEvent::Failed(_, error)) => {
+                self.ended = true;
+                Err(error)
+            }
+            Some(IoEvent::Eof(_)) | None => {
+                self.ended = true;
+                Err(ProtocolError::Closed)
+            }
         }
     }
 
@@ -214,14 +229,44 @@ impl FrameTransport {
 
     /// 尽力先弹出已缓冲帧；无则 None（非阻塞窥视）。
     pub fn try_recv(&mut self) -> Option<(Channel, Message)> {
+        if self.ended {
+            return None;
+        }
         match self.incoming.try_recv() {
             Ok(IoEvent::Frame(channel, message)) => Some((channel, *message)),
-            _ => None,
+            Ok(IoEvent::Failed(_, error)) => {
+                self.ended = true;
+                self.pending_error = Some(error);
+                None
+            }
+            Ok(IoEvent::Eof(_)) | Err(mpsc::error::TryRecvError::Disconnected) => {
+                self.ended = true;
+                self.pending_error = Some(ProtocolError::Closed);
+                None
+            }
+            Err(mpsc::error::TryRecvError::Empty) => None,
         }
+    }
+
+    /// Finish queued frames before closing. The deadline also bounds blocked writers.
+    pub async fn flush_and_close(mut self, timeout: std::time::Duration) {
+        self.control_out = dead_sender();
+        self.data_out = dead_sender();
+        let _ = tokio::time::timeout(timeout, async {
+            let _ = (&mut self.io.writer_control).await;
+            let _ = (&mut self.io.writer_data).await;
+        })
+        .await;
+        self.close();
+        self.io.writer_control.abort();
+        self.io.writer_data.abort();
+        self.io.reader_control.abort();
+        self.io.reader_data.abort();
     }
 
     /// 关闭两条通道并停止 I/O 任务。幂等。
     pub fn close(&mut self) {
+        self.ended = true;
         self.io
             .broken
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -428,7 +473,12 @@ pub async fn master_handshake(
             drain_grace_ms: DRAIN_GRACE_MS,
         })
         .await?;
-    let (_, message) = transport.recv().await?;
+    let (_, message) = tokio::time::timeout(
+        std::time::Duration::from_millis(super::contract::STARTUP_TIMEOUT_MS),
+        transport.recv(),
+    )
+    .await
+    .map_err(|_| ProtocolError::Malformed("Ready timeout".into()))??;
     match message {
         Message::Ready => Ok(ExecutorHello {
             boot_id,
@@ -656,5 +706,56 @@ mod tests {
         evil.write_all(&u32::MAX.to_be_bytes()).await.unwrap();
         let error = a.recv().await.expect_err("illegal length must fail");
         assert!(matches!(error, ProtocolError::FrameTooLarge(_, _)));
+    }
+}
+
+#[cfg(test)]
+mod terminal_event_tests {
+    use super::*;
+    #[tokio::test]
+    async fn graceful_close_writes_queued_control_frame() {
+        use tokio::io::AsyncReadExt;
+        let (ca, mut cb) = tokio::io::duplex(4096);
+        let (da, _db) = tokio::io::duplex(4096);
+        let transport = FrameTransport::spawn_streams(ca, da, 8);
+        let message = Message::DrainComplete { drained: 3 };
+        let expected = encode_frame(&message).unwrap();
+        transport.send(message).await.unwrap();
+        transport
+            .flush_and_close(std::time::Duration::from_secs(1))
+            .await;
+        let mut actual = vec![0; expected.len()];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            cb.read_exact(&mut actual),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn polling_preserves_terminal_errors_and_recv_stays_closed() {
+        for error in [
+            ProtocolError::Closed,
+            ProtocolError::Malformed("bad frame".into()),
+        ] {
+            let (control, _control_peer) = tokio::io::duplex(1024);
+            let (data, _data_peer) = tokio::io::duplex(1024);
+            let mut transport = FrameTransport::spawn_streams(control, data, 4);
+            // Inject the read task event: no scheduling sleep or second EOF can mask the failure.
+            let (events, incoming) = mpsc::channel(4);
+            transport.incoming = incoming;
+            let expected = error.to_string();
+            events
+                .send(IoEvent::Failed(Channel::Control, error))
+                .await
+                .unwrap();
+            assert!(transport.try_recv().is_none());
+            assert!(transport.try_recv().is_none());
+            assert_eq!(transport.recv().await.unwrap_err().to_string(), expected);
+            assert!(matches!(transport.recv().await, Err(ProtocolError::Closed)));
+        }
     }
 }

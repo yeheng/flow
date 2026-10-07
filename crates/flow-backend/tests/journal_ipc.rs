@@ -877,3 +877,68 @@ fn rss_kib(pid: u32) -> Option<u64> {
         .parse::<u64>()
         .ok()
 }
+
+#[tokio::test]
+async fn result_larger_than_audit_window_commits_all_chunks() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = ipc_backend_explicit(root.path()).await;
+    let workflow = install(
+        &backend,
+        json!({"nodes":[
+        {"id":"s","type":"start"},
+        {"id":"n","type":"script","params":{"code":"return 'x'.repeat(3 * 1024 * 1024);"}},
+        {"id":"e","type":"end"}],"edges":[{"from":"s","to":"n"},{"from":"n","to":"e"}]}),
+    )
+    .await;
+    let run_id = start_run(&backend, &workflow, json!(null)).await;
+    let done = until(&backend, &run_id, Run::terminal).await;
+    assert_eq!(done.status, "succeeded", "{:?}", done.error);
+    let output = materialize(&backend, &done, "n").await;
+    assert_eq!(output.as_str().unwrap(), "x".repeat(3 * 1024 * 1024));
+    backend.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn oversized_http_capture_is_uncertain_without_resend() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let root = temp();
+    let backend = ipc_backend_explicit(&root).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        socket.read(&mut request).await.unwrap();
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            flow_journal::MAX_VALUE_BYTES + 1
+        );
+        socket.write_all(head.as_bytes()).await.unwrap();
+        // Keep the body stream open: rejection must follow the declared size,
+        // rather than EOF or the request timeout. Keep the listener to detect retries.
+        (socket, listener)
+    });
+    let flow = install(&backend, json!({"nodes":[{"id":"s","type":"start"},{"id":"h","type":"http_call","params":{"url":format!("http://{addr}"),"timeout_ms":10000}},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"h"},{"from":"h","to":"e"}]})).await;
+    let id = start_run(&backend, &flow, json!({})).await;
+    let (_socket, listener) = server.await.unwrap();
+    let run = tokio::time::timeout(
+        Duration::from_secs(2),
+        until(&backend, &id, |run| {
+            run.nodes
+                .get("h")
+                .and_then(|node| node.wait.as_ref())
+                .is_some_and(|wait| wait.kind == "uncertain")
+        }),
+    )
+    .await
+    .expect("capture limit must be enforced before waiting for the response body");
+    assert!(run.nodes["h"].operation.as_ref().unwrap().outcome.is_none());
+    assert!(run.nodes["h"].output.is_none());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), listener.accept())
+            .await
+            .is_err()
+    );
+    backend.close().await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}

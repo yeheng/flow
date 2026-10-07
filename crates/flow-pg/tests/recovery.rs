@@ -213,6 +213,13 @@ async fn takeover_resumes_retry_backoff() {
     // 模拟执行进程消失：退避计时器被丢弃，租约不再续期
     a.shutdown().await;
     let _ = runner_a.await.unwrap();
+    assert!(
+        !matches!(
+            run_status(&pool, &run_id).await.as_str(),
+            "succeeded" | "failed" | "cancelled"
+        ),
+        "A must stop before completion so B really resumes the run"
+    );
 
     // 新实例接管：从 NodeFailed 时间戳重建退避（已过期 → 立即重试）
     let b = engine(&db, flow_pg::Role::All).await;

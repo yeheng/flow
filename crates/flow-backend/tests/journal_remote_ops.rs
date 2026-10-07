@@ -194,17 +194,67 @@ async fn slots_bound_enforces_serial_dispatch() {
     let handles: Handles = Arc::new(tokio::sync::Mutex::new(Default::default()));
     spawn_agent(&manager, "agent-cap", 1, handles).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let flow = install(&backend, serde_json::from_str(FLOW).unwrap()).await;
-    // 两个 run 并发提交；slots=1：串行完成，均成功（不超配、不死锁）。
-    let b1 = backend.clone();
-    let b2 = backend.clone();
-    let f1 = flow.clone();
-    let f2 = flow.clone();
-    let first = tokio::spawn(async move { run_and_finish(&b1, &f1, 1).await });
-    let second = tokio::spawn(async move { run_and_finish(&b2, &f2, 2).await });
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (entered, mut entries) = tokio::sync::mpsc::channel(4);
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let server_release = release.clone();
+    let server = tokio::spawn(async move {
+        let mut jobs = tokio::task::JoinSet::new();
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let entered = entered.clone();
+            let release = server_release.clone();
+            jobs.spawn(async move {
+                let mut request = [0; 4096];
+                socket.read(&mut request).await.unwrap();
+                entered.send(()).await.unwrap();
+                release.acquire().await.unwrap().forget();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .await
+                    .unwrap();
+            });
+        }
+        while let Some(result) = jobs.join_next().await {
+            result.unwrap();
+        }
+    });
+    let flow = install(&backend, json!({"nodes":[{"id":"s","type":"start"},{"id":"n","type":"http_call","params":{"url":format!("http://{addr}")}},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"n"},{"from":"n","to":"e"}]})).await;
+    let first = {
+        let b = backend.clone();
+        let f = flow.clone();
+        tokio::spawn(async move { run_and_finish(&b, &f, 1).await })
+    };
+    let second = {
+        let b = backend.clone();
+        let f = flow.clone();
+        tokio::spawn(async move { run_and_finish(&b, &f, 2).await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), entries.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), entries.recv())
+            .await
+            .is_err(),
+        "second external operation began before the first released its slot"
+    );
+    release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(10), entries.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    release.add_permits(1);
     let (r1, r2) = (first.await.unwrap(), second.await.unwrap());
     assert_eq!(r1.status, "succeeded", "{:?}", r1.error);
     assert_eq!(r2.status, "succeeded", "{:?}", r2.error);
+    server.await.unwrap();
+    manager.shutdown().await;
     backend.close().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }

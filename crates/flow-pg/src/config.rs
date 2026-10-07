@@ -56,40 +56,61 @@ impl Default for PgConfig {
     }
 }
 
-fn env_ms(key: &str, default_ms: u64) -> Duration {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(Duration::from_millis(default_ms))
+fn env_number<T: std::str::FromStr>(key: &str, default: T) -> Result<T, String> {
+    match std::env::var(key) {
+        Ok(value) => value
+            .parse()
+            .map_err(|_| format!("{key} must be a non-negative integer")),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(_) => Err(format!("{key} must be valid Unicode")),
+    }
 }
-
-fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(default)
+fn env_ms(key: &str, default_ms: u64) -> Result<Duration, String> {
+    env_number(key, default_ms).map(Duration::from_millis)
 }
-
 impl PgConfig {
-    pub fn from_env() -> PgConfig {
+    pub fn from_env() -> Result<PgConfig, String> {
         let role = match std::env::var("FLOW_ROLE").as_deref() {
             Ok("gateway") => Role::Gateway,
             Ok("executor") => Role::Executor,
-            _ => Role::All,
+            Ok("all") | Err(std::env::VarError::NotPresent) => Role::All,
+            _ => return Err("FLOW_ROLE must be all, gateway, or executor".into()),
         };
-        PgConfig {
-            lease_ttl: env_ms("FLOW_LEASE_TTL_MS", 30_000),
-            scan_interval: env_ms("FLOW_SCAN_INTERVAL_MS", 1_000),
-            inbox_poll: env_ms("FLOW_INBOX_POLL_MS", 200),
-            max_runs: env_usize("FLOW_MAX_RUNS", 8),
-            signal_wait: env_ms("FLOW_SIGNAL_WAIT_MS", 10_000),
-            signal_poll: env_ms("FLOW_SIGNAL_POLL_MS", 200),
-            subscribe_poll: env_ms("FLOW_SUBSCRIBE_POLL_MS", 10_000),
-            statement_timeout: env_ms("FLOW_STATEMENT_TIMEOUT_MS", 10_000),
-            lock_timeout: env_ms("FLOW_LOCK_TIMEOUT_MS", 10_000),
-            idle_tx_timeout: env_ms("FLOW_IDLE_TX_TIMEOUT_MS", 10_000),
+        Ok(PgConfig {
+            lease_ttl: env_ms("FLOW_LEASE_TTL_MS", 30_000)?,
+            scan_interval: env_ms("FLOW_SCAN_INTERVAL_MS", 1_000)?,
+            inbox_poll: env_ms("FLOW_INBOX_POLL_MS", 200)?,
+            max_runs: env_number("FLOW_MAX_RUNS", 8)?,
+            signal_wait: env_ms("FLOW_SIGNAL_WAIT_MS", 10_000)?,
+            signal_poll: env_ms("FLOW_SIGNAL_POLL_MS", 200)?,
+            subscribe_poll: env_ms("FLOW_SUBSCRIBE_POLL_MS", 10_000)?,
+            statement_timeout: env_ms("FLOW_STATEMENT_TIMEOUT_MS", 10_000)?,
+            lock_timeout: env_ms("FLOW_LOCK_TIMEOUT_MS", 10_000)?,
+            idle_tx_timeout: env_ms("FLOW_IDLE_TX_TIMEOUT_MS", 10_000)?,
             role,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_explicit_environment_is_rejected() {
+        for (key, value) in [
+            ("FLOW_MAX_RUNS", "many"),
+            ("FLOW_SCAN_INTERVAL_MS", "-1"),
+            ("FLOW_ROLE", "executro"),
+        ] {
+            let before = std::env::var_os(key);
+            std::env::set_var(key, value);
+            let result = PgConfig::from_env();
+            match before {
+                Some(old) => std::env::set_var(key, old),
+                None => std::env::remove_var(key),
+            }
+            assert!(result.unwrap_err().contains(key));
         }
     }
 }

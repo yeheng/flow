@@ -516,21 +516,7 @@ async fn run_http(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
             )
         })
         .collect();
-    let text = match response.text().await {
-        Ok(text) => text,
-        // 连接在读完响应头之后断开：body 不完整。不能带着 200 + 空 body 记成功
-        Err(err) => {
-            let err = err.without_url();
-            ctx.logger.error(format!(
-                "读取 {url_label} 响应体失败（{}ms）：{err}",
-                started.elapsed().as_millis()
-            ));
-            return Err(NodeFailure::retryable(format!(
-                "读取 {url_label} 响应体失败（{}ms）：{err}",
-                started.elapsed().as_millis()
-            )));
-        }
-    };
+    let text = read_response_text(response).await?;
     let body = serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text.clone()));
 
     let output = serde_json::json!({
@@ -554,11 +540,12 @@ async fn run_http(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
 
     if status.is_server_error() || status.is_client_error() {
         // 5xx 可能已被下游处理了一部分，标为可重试；4xx 是请求本身的问题
-        let mut failure = if status.is_server_error() {
-            NodeFailure::retryable(format!("HTTP {status}"))
-        } else {
-            NodeFailure::fatal(format!("HTTP {status}"))
-        };
+        let mut failure =
+            if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                NodeFailure::retryable(format!("HTTP {status}"))
+            } else {
+                NodeFailure::fatal(format!("HTTP {status}"))
+            };
         failure.message = format!(
             "{}，响应体：{}",
             failure.message,
@@ -570,9 +557,28 @@ async fn run_http(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
     Ok(output)
 }
 
-/// llm / email 共用的出口：POST JSON + Bearer 认证。错误分类与 http_call
-/// 同一份习惯（连接失败/超时/读体断流/5xx 可重试，builder 与 4xx fatal），
-/// 唯一补充是 429 限流也可重试；超时参数语义与 http_call 一致（timeout_ms）。
+/// Bound response allocation even when Content-Length is missing or dishonest.
+async fn read_response_text(mut response: reqwest::Response) -> Result<String, NodeFailure> {
+    const LIMIT: usize = 8 * 1024 * 1024;
+    if response
+        .content_length()
+        .is_some_and(|length| length > LIMIT as u64)
+    {
+        return Err(NodeFailure::fatal("HTTP response exceeds 8 MiB"));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        NodeFailure::retryable(format!("读取响应体失败：{}", error.without_url()))
+    })? {
+        if chunk.len() > LIMIT.saturating_sub(body.len()) {
+            return Err(NodeFailure::fatal("HTTP response exceeds 8 MiB"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+/// llm / email 共用 POST JSON；与 http_call 一致，429/5xx 可重试。
 async fn post_json_bearer(
     url: &str,
     api_key: &str,
@@ -607,16 +613,7 @@ async fn post_json_bearer(
         }
     };
     let status = response.status();
-    let text = match response.text().await {
-        Ok(text) => text,
-        Err(err) => {
-            return Err(NodeFailure::retryable(format!(
-                "读取 {url_label} 响应体失败（{}ms）：{}",
-                started.elapsed().as_millis(),
-                err.without_url()
-            )));
-        }
-    };
+    let text = read_response_text(response).await?;
     let body = serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text));
     if status.is_server_error()
         || status.is_client_error()
@@ -1198,6 +1195,57 @@ mod tests {
             "错误消息必须提示环境变量名：{}",
             err.message
         );
+    }
+
+    #[tokio::test]
+    async fn http_rate_limit_is_retryable() {
+        let (addr, _) = mock_server("429 Too Many Requests", "limited");
+        let err = execute(
+            &ctx(
+                node("http_call", json!({"url": format!("http://{addr}")})),
+                json!({}),
+                HashMap::new(),
+            ),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.retryable);
+        assert!(err.message.contains("429"));
+    }
+
+    #[tokio::test]
+    async fn http_declared_oversize_is_rejected_without_reading_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8388609\r\n\r\n")
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            execute(
+                &ctx(
+                    node("http_call", json!({"url": format!("http://{addr}")})),
+                    json!({}),
+                    HashMap::new(),
+                ),
+                &CancellationToken::new(),
+            ),
+        )
+        .await;
+        server.abort();
+        let err = result
+            .expect("must reject before waiting for body")
+            .unwrap_err();
+        assert!(!err.retryable);
+        assert!(err.message.contains("8 MiB"), "{}", err.message);
     }
 
     /// llm 的错误分类：429/5xx 可重试，其余 4xx fatal。

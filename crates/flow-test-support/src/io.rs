@@ -188,15 +188,26 @@ pub fn workspace_bin(name: &str) -> PathBuf {
         .parent()
         .and_then(|p| p.parent())
         .expect("workspace root");
+    // Integration executables live in <target>/<profile>/deps, including custom
+    // --target-dir builds. Prefer the sibling binary from the same build tree.
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(profile) = executable.parent().and_then(|deps| deps.parent()) {
+            let candidate = profile.join(name);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("target"));
     for profile in ["debug", "release"] {
-        let candidate = root.join("target").join(profile).join(name);
+        let candidate = target.join(profile).join(name);
         if candidate.is_file() {
             return candidate;
         }
     }
-    panic!(
-        "binary '{name}' not built; run: cargo build -p flow-app (or the owning package)"
-    );
+    panic!("binary '{name}' not built; run: cargo build -p flow-app (or the owning package)");
 }
 
 /// 合并二进制 `flow` 的路径（所有测试的被测进程统一走这一个文件）。

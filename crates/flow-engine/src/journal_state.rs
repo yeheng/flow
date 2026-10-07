@@ -294,7 +294,7 @@ impl State {
             for event in &tx.events {
                 self.values.apply(event, &tx.journal_id)?;
                 self.check_values(event)?;
-                self.apply_event(event, tx.lsn)?;
+                self.apply_event(event, tx.lsn, &mut command_undo)?;
             }
             Ok(())
         })();
@@ -369,7 +369,12 @@ impl State {
         Ok(())
     }
 
-    fn apply_event(&mut self, event: &Event, lsn: u64) -> Result<()> {
+    fn apply_event(
+        &mut self,
+        event: &Event,
+        lsn: u64,
+        command_undo: &mut BTreeMap<String, Option<CommandRecord>>,
+    ) -> Result<()> {
         let p = &event.payload;
         if event.kind == EventKind::LateAudit && (event.run_seq != 0 || event.audit_seq == 0) {
             return Err(invalid(
@@ -403,7 +408,9 @@ impl State {
                         order.sort_unstable();
                         let evict = self.commands.len() - COMMAND_WINDOW / 2;
                         for (_, key) in order.into_iter().take(evict) {
-                            self.commands.remove(&key);
+                            if let Some(record) = self.commands.remove(&key) {
+                                command_undo.entry(key).or_insert(Some(record));
+                            }
                         }
                     }
                 }
@@ -815,4 +822,65 @@ pub fn validate_definition(value: &Value) -> Result<Definition> {
     let definition: Definition = serde_json::from_value(value.clone())?;
     definition.validate().map_err(|e| invalid(e.to_string()))?;
     Ok(definition)
+}
+
+#[cfg(test)]
+mod command_window_tests {
+    use super::*;
+    fn full_window() -> State {
+        let mut state = State {
+            journal_id: "window".into(),
+            applied_lsn: COMMAND_WINDOW as u64,
+            ..Default::default()
+        };
+        for n in 0..COMMAND_WINDOW {
+            let id = n.to_string();
+            state.commands.insert(
+                command_key("test", &id),
+                CommandRecord {
+                    scope: "test".into(),
+                    request_id: Some(id),
+                    fingerprint: "f".into(),
+                    result: serde_json::json!(n),
+                    lsn: n as u64 + 1,
+                },
+            );
+        }
+        state
+    }
+    fn next() -> Transaction {
+        Transaction {
+            v: 2,
+            journal_id: "window".into(),
+            lsn: COMMAND_WINDOW as u64 + 1,
+            tx_id: "next".into(),
+            events: vec![Event::new(
+                EventKind::Command,
+                serde_json::json!({"scope":"test","request_id":"next","fingerprint":"f","result":null,"lsn":"0"}),
+            )],
+        }
+    }
+    #[test]
+    fn checking_and_rollback_restore_evicted_identities() {
+        let mut state = full_window();
+        let before = serde_json::to_value(&state).unwrap();
+        let tx = next();
+        state.check(&tx).unwrap();
+        assert_eq!(serde_json::to_value(&state).unwrap(), before);
+        let mut invalid = tx.clone();
+        invalid.events.push(Event::new(
+            EventKind::WorkflowDeleted,
+            serde_json::json!({}),
+        ));
+        assert!(state.apply(&invalid).is_err());
+        assert_eq!(serde_json::to_value(&state).unwrap(), before);
+        state.apply(&tx).unwrap();
+        assert_eq!(state.commands.len(), COMMAND_WINDOW / 2);
+        let mut replay = full_window();
+        replay.apply(&tx).unwrap();
+        assert_eq!(
+            serde_json::to_value(&state).unwrap(),
+            serde_json::to_value(&replay).unwrap()
+        );
+    }
 }

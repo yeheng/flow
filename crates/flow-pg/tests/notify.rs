@@ -103,7 +103,7 @@ async fn repeated_notification_streams_do_not_leak_pg_backends() {
             )
             .fetch_one(&pool)
             .await
-            .unwrap_or(0)
+            .expect("query listener count")
         }
     };
 
@@ -112,7 +112,12 @@ async fn repeated_notification_streams_do_not_leak_pg_backends() {
     let baseline = count_listeners(&db).await;
 
     for _ in 0..4 {
-        drop(engine.event_notifications().await.ok());
+        drop(
+            engine
+                .event_notifications()
+                .await
+                .expect("create notification stream"),
+        );
     }
     // 给连接回收留时间（后端退出不是瞬时的）
     tokio::time::sleep(Duration::from_secs(5)).await;

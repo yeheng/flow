@@ -42,7 +42,7 @@ impl PgBackend {
     pub async fn from_env() -> Result<PgBackend, BackendError> {
         let url = std::env::var("FLOW_DATABASE_URL")
             .map_err(|_| BackendError::Invalid("Postgres 模式必须设置 FLOW_DATABASE_URL".into()))?;
-        Self::connect(&url, PgConfig::from_env()).await
+        Self::connect(&url, PgConfig::from_env().map_err(BackendError::Invalid)?).await
     }
 
     /// 测试与诊断入口：底层 PgEngine。

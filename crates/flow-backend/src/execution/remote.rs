@@ -38,13 +38,8 @@ type BoxedStream = Pin<Box<dyn AsyncReadWrite + Send>>;
 pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Unpin> AsyncReadWrite for T {}
 
-// 链路死亡标记（dispatch.rs 在 Dead/关闭路径写入 "link-dead: " 前缀）。
 pub(crate) fn is_link_dead(error: &crate::journal::JournalError) -> bool {
-    matches!(
-        error,
-        crate::journal::JournalError::Journal(flow_journal::Error::Invalid(message))
-            if message.starts_with("link-dead: ")
-    )
+    matches!(error, crate::journal::JournalError::LinkClosed(_))
 }
 
 // 远程模式选项。
@@ -97,7 +92,9 @@ impl TlsServer {
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(bad_data)?
         {
-            let _ = roots.add(rustls::pki_types::CertificateDer::from(der.to_vec()));
+            roots
+                .add(rustls::pki_types::CertificateDer::from(der.to_vec()))
+                .map_err(bad_data)?;
         }
         if roots.is_empty() {
             return Err(bad_data("CA PEM contains no certificates"));
@@ -165,8 +162,9 @@ struct SessionRouting {
 // 跨会话存活的派发绑定。
 struct BoundDispatch {
     agent_id: String,
-    // 容量许可（drop 即释放槽位）。
-    slot_permit: tokio::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
+    // The binding itself reserves one slot, including while disconnected.
+    link_session_id: String,
+    executor_id: String,
     executor_boot_id: Mutex<Option<String>>,
     run_id: String,
     node_id: String,
@@ -185,10 +183,7 @@ struct AgentRegistration {
     link_session_id: String,
     outbound: mpsc::Sender<ToSession>,
     slots_total: AtomicU64,
-    slots_used: AtomicU64,
-    // 槽位信号量：等待空位而非立即失败（容量准入，三期 §1.6）。
-    slots_sem: Arc<Semaphore>,
-    bind_acks: Mutex<BTreeMap<String, oneshot::Sender<Result<String>>>>,
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 // Agent 管理器：上联会话注册表 + 全局 A_max 准入 + Resume 裁决。
@@ -199,6 +194,7 @@ pub struct AgentManager {
     global: Arc<Semaphore>,
     agents: Mutex<BTreeMap<String, Arc<AgentRegistration>>>,
     bindings: Mutex<BTreeMap<String, Arc<BoundDispatch>>>,
+    capacity_changed: Notify,
     pending_data: Mutex<BTreeMap<String, Arc<PendingData>>>,
     pending_binds: Mutex<BTreeMap<String, PendingBind>>,
     session_counter: AtomicU64,
@@ -217,6 +213,7 @@ struct PendingData {
 #[allow(dead_code)]
 struct PendingBind {
     agent_id: String,
+    link_session_id: String,
     executor_id: String,
     events: mpsc::Sender<crate::execution::pool::FromSession>,
     ack: oneshot::Sender<Result<String>>,
@@ -231,6 +228,7 @@ impl AgentManager {
             global: Arc::new(Semaphore::new(A_MAX)),
             agents: Mutex::new(BTreeMap::new()),
             bindings: Mutex::new(BTreeMap::new()),
+            capacity_changed: Notify::new(),
             pending_data: Mutex::new(BTreeMap::new()),
             pending_binds: Mutex::new(BTreeMap::new()),
             session_counter: AtomicU64::new(0),
@@ -495,9 +493,7 @@ impl AgentManager {
             link_session_id: link_session_id.clone(),
             outbound: outbound.clone(),
             slots_total: AtomicU64::new(slots as u64),
-            slots_used: AtomicU64::new(0),
-            slots_sem: Arc::new(Semaphore::new(slots.max(1) as usize)),
-            bind_acks: Mutex::new(BTreeMap::new()),
+            cancel: tokio_util::sync::CancellationToken::new(),
         });
         let previous = self
             .agents
@@ -505,36 +501,43 @@ impl AgentManager {
             .await
             .insert(agent_id.clone(), registration.clone());
         if let Some(previous) = previous {
-            // 迁移在飞占用（计数与许可都延续，不重置准入水位）。
-            registration.slots_used.store(
-                previous.slots_used.load(Ordering::Relaxed),
-                Ordering::Relaxed,
-            );
-            for _ in 0..previous.slots_used.load(Ordering::Relaxed) {
-                let _ = registration.slots_sem.clone().acquire_owned().await;
-            }
+            previous.cancel.cancel();
             tracing::info!(%agent_id, "agent reconnected; old uplink replaced");
         }
+        self.capacity_changed.notify_waiters();
         tracing::info!(%agent_id, slots, "agent session registered");
         let mut routings: BTreeMap<String, SessionRouting> = BTreeMap::new();
+        // Bounded receipts absorb in-flight duplicates after the live route is released.
+        let mut completed: std::collections::VecDeque<(RouteEnvelope, Option<String>)> =
+            Default::default();
+        let mut resume_items = Vec::new();
         let result: std::result::Result<(), String> = async {
             loop {
                 tokio::select! {
+                    _ = registration.cancel.cancelled() => return Ok(()),
+                    _ = self.shutdown.cancelled() => return Ok(()),
                     command = commands.recv() => {
                         let Some(command) = command else { return Ok(()); };
                         match command {
                             ToSession::Send(message) => {
                                 // 业务帧按已确认路由包装；管理帧
                                 // （BindExecutor/ResumeReply/Drain…）直接发送。
+                                if let Message::ResultCommitted { dispatch_id, result_id } = &*message {
+                                    if let Some(route) = routings.remove(dispatch_id) {
+                                        completed.push_back((route.envelope, Some(result_id.clone())));
+                                        if completed.len() > 256 { completed.pop_front(); }
+                                    }
+                                }
                                 let frame = if flow_engine::execution_protocol::remote::routable(
                                     &message,
                                 ) {
                                     match message
                                         .dispatch_id()
-                                        .and_then(|id| routings.get(id))
+                                        .and_then(|id| routings.get(id).map(|route| &route.envelope)
+                                            .or_else(|| completed.iter().rev().find(|(envelope, _)| envelope.dispatch_id.as_deref() == Some(id)).map(|(envelope, _)| envelope)))
                                     {
                                         Some(routing) => Message::Routed {
-                                            envelope: routing.envelope.clone(),
+                                            envelope: routing.clone(),
                                             inner: message,
                                         },
                                         None => continue, // 未绑定：不发送
@@ -556,7 +559,10 @@ impl AgentManager {
                                 })
                                 .await
                                 .map_err(|e| format!("cancel: {e}"))?;
-                                routings.remove(&dispatch_id);
+                                if let Some(route) = routings.remove(&dispatch_id) {
+                                    completed.push_back((route.envelope, None));
+                                    if completed.len() > 256 { completed.pop_front(); }
+                                }
                             }
                             ToSession::Recycle => {
                                 transport.close();
@@ -568,7 +574,7 @@ impl AgentManager {
                         let (channel, message) = received.map_err(|e| format!("recv: {e}"))?;
                         match message {
                             Message::Routed { envelope, inner } => {
-                                eprintln!("[probe-m] routed inner={} dispatch={:?}", inner.type_name(), envelope.dispatch_id);
+                                tracing::trace!(kind = inner.type_name(), dispatch = ?envelope.dispatch_id, "agent routed message");
                                 if channel == flow_engine::execution_protocol::Channel::Control
                                     && matches!(&*inner, Message::DataBind { .. })
                                 {
@@ -582,6 +588,16 @@ impl AgentManager {
                                     return Err(format!("route envelope mismatch from agent {agent_id}"));
                                 }
                                 let Some(routing) = routings.get(&envelope.dispatch_id.clone().unwrap_or_default()) else {
+                                    if let Some((previous, result_id)) = completed.iter().find(|(previous, _)| previous == &envelope) {
+                                        if let (Some(result_id), Message::Result { result_id: id, .. }) = (result_id, &*inner) {
+                                            if id == result_id {
+                                                transport.send(Message::Routed { envelope: previous.clone(), inner: Box::new(Message::ResultCommitted {
+                                                    dispatch_id: envelope.dispatch_id.clone().unwrap(), result_id: result_id.clone(),
+                                                })}).await.map_err(|e| e.to_string())?;
+                                            }
+                                        }
+                                        continue;
+                                    }
                                     // 未绑定/错路由：明确拒绝（协议错误关闭会话），
                                     // 不进入权威日志。
                                     return Err(format!(
@@ -605,6 +621,10 @@ impl AgentManager {
                             } => {
                                 let pending = self.pending_binds.lock().await.remove(&dispatch_id);
                                 if let Some(bind) = pending {
+                                    if bind.agent_id != agent_id || bind.link_session_id != link_session_id || bind.executor_id != executor_id {
+                                        let _ = bind.ack.send(Err(invalid("bind acknowledgement identity mismatch")));
+                                        return Err("bind acknowledgement identity mismatch".into());
+                                    }
                                     if ok {
                                         // 注册路由 + 绑定记录，唤醒 binder。
                                         let envelope = RouteEnvelope {
@@ -619,23 +639,38 @@ impl AgentManager {
                                             envelope,
                                             events: bind.events,
                                         });
-                                        let _ = bind.ack.send(Ok(executor_boot_id.clone()));
-                                        self.note_bound(&dispatch_id, executor_boot_id).await;
+                                        self.note_bound(&dispatch_id, executor_boot_id.clone()).await;
+                                        let _ = bind.ack.send(Ok(executor_boot_id));
                                     } else {
                                         let _ = bind.ack.send(Err(invalid(format!(
                                             "agent bind failed: {}",
                                             error.unwrap_or_else(|| "unknown".into())
                                         ))));
                                     }
+                                } else if ok {
+                                    // The bind timed out or its dispatcher was cancelled while
+                                    // the executor was starting. Reap that late successful bind.
+                                    let envelope = RouteEnvelope {
+                                        agent_id: agent_id.clone(), agent_boot_id: agent_boot_id.clone(),
+                                        link_session_id: link_session_id.clone(), executor_id,
+                                        executor_boot_id, dispatch_id: Some(dispatch_id.clone()),
+                                    };
+                                    completed.push_back((envelope.clone(), None));
+                                    if completed.len() > 256 { completed.pop_front(); }
+                                    transport.send(Message::Routed {
+                                        envelope,
+                                        inner: Box::new(Message::Cancel {
+                                            command_id: format!("late-bind-{dispatch_id}"), dispatch_id,
+                                        }),
+                                    }).await.map_err(|e| format!("cancel late bind: {e}"))?;
                                 }
                             }
                             Message::CapacityReport { capacity } => {
                                 registration
                                     .slots_total
                                     .store(capacity.slots as u64, Ordering::Relaxed);
-                                registration
-                                    .slots_used
-                                    .store(capacity.in_flight as u64, Ordering::Relaxed);
+                                // in_flight is telemetry, not an admission counter.
+                                self.capacity_changed.notify_waiters();
                             }
                             Message::Resume { items, page, more } => {
                                 let decisions = self
@@ -672,7 +707,7 @@ impl AgentManager {
                                                 }
                                             }
                                             routings.remove(&dispatch_id);
-                                            self.resolve_binding(&dispatch_id, AttachOutcome::Committed, true)
+                                            self.resolve_binding(&dispatch_id, AttachOutcome::Committed)
                                                 .await;
                                         }
                                         ResumeAction::CancelAndDrain => {
@@ -694,7 +729,6 @@ impl AgentManager {
                                             self.resolve_binding(
                                                 &dispatch_id,
                                                 AttachOutcome::Cancelled("resume: cancel and drain".into()),
-                                                true,
                                             )
                                             .await;
                                         }
@@ -717,24 +751,25 @@ impl AgentManager {
                                             self.resolve_binding(
                                                 &dispatch_id,
                                                 AttachOutcome::Lost("resume: reconcile required".into()),
-                                                true,
                                             )
                                             .await;
                                         }
                                     }
                                 }
                                 transport
-                                    .send(Message::ResumeReply { decisions, page })
+                                    .send(Message::ResumeReply { decisions: decisions.clone(), page })
                                     .await
                                     .map_err(|e| format!("resume reply: {e}"))?;
-                                if more {
-                                    continue;
-                                }
+                                resume_items.extend(items.iter().cloned());
+                                // Every page establishes routes before the next page arrives.
+                                let continuing: Vec<_> = items.iter().filter(|item| decisions.iter().any(|decision|
+                                    decision.dispatch_id == item.dispatch_id && matches!(decision.action, ResumeAction::UploadOnly { .. } | ResumeAction::SubmitExistingResult))).cloned().collect();
+                                self.attach_resumed(&agent_id, &continuing, &outbound, &mut routings, &link_session_id, &agent_boot_id).await;
+                                if more { continue; }
                                 // 清单末页：未上报的该 agent 绑定判 Lost（执行器已失联）。
-                                self.mark_unreported_lost(&agent_id, &items).await;
-                                // 为继续项建链路并唤醒 waiter。
-                                self.attach_resumed(&agent_id, &items, &outbound, &mut routings, &link_session_id, &agent_boot_id)
-                                    .await;
+                                self.mark_unreported_lost(&agent_id, &link_session_id, &resume_items).await;
+                                resume_items.clear();
+
                             }
                             Message::DrainComplete { drained } => {
                                 tracing::info!(%agent_id, drained, "agent drained");
@@ -764,6 +799,12 @@ impl AgentManager {
             agents.remove(&agent_id);
         }
         drop(agents);
+        registration.cancel.cancel();
+        self.pending_binds
+            .lock()
+            .await
+            .retain(|_, bind| bind.link_session_id != link_session_id);
+        self.capacity_changed.notify_waiters();
         result
     }
 
@@ -775,32 +816,29 @@ impl AgentManager {
 
     // Resume 裁决（三期 §1.4 表）：以主日志为准，不信 agent 自报游标。
     async fn adjudicate_resume(&self, agent_id: &str, items: &[ResumeItem]) -> Vec<ResumeDecision> {
-        let _ = agent_id;
         let state = self.backend.state().await;
-        let bindings = self.bindings.lock().await;
-        items
-            .iter()
-            .map(|item| {
-                let action = match bindings.get(&item.dispatch_id) {
-                    // master 无记录（master 重启/epoch 变化后）：只允许取消回收。
-                    None => ResumeAction::ReconcileRequired,
-                    Some(binding) => adjudicate_against_journal(&state, binding, item),
-                };
-                ResumeDecision {
-                    dispatch_id: item.dispatch_id.clone(),
-                    action,
+        let bindings = self.bindings.lock().await.clone();
+        let mut decisions = Vec::new();
+        for item in items {
+            let action = match bindings.get(&item.dispatch_id) {
+                Some(binding) if binding.agent_id == agent_id => {
+                    let boot = binding.executor_boot_id.lock().await.clone();
+                    adjudicate_against_journal(&state, binding, item, boot.as_deref())
                 }
-            })
-            .collect()
+                _ => ResumeAction::ReconcileRequired,
+            };
+            decisions.push(ResumeDecision {
+                dispatch_id: item.dispatch_id.clone(),
+                action,
+            });
+        }
+        decisions
     }
 
-    // 对绑定写入终局裁决并移除（唤醒等待方）。
-    async fn resolve_binding(&self, dispatch_id: &str, outcome: AttachOutcome, remove: bool) {
-        let binding = if remove {
-            self.bindings.lock().await.remove(dispatch_id)
-        } else {
-            self.bindings.lock().await.get(dispatch_id).cloned()
-        };
+    // 写入终局裁决，保留到 dispatcher 取走并释放绑定。
+    async fn resolve_binding(&self, dispatch_id: &str, outcome: AttachOutcome) {
+        // Keep the verdict reachable until the dispatcher takes it and unbinds.
+        let binding = self.bindings.lock().await.get(dispatch_id).cloned();
         if let Some(binding) = binding {
             let mut verdict = binding.verdict.lock().await;
             if verdict.is_none() {
@@ -812,17 +850,26 @@ impl AgentManager {
     }
 
     // resume 清单未上报的该 agent 绑定 → Lost（执行器已死/失联）。
-    async fn mark_unreported_lost(&self, agent_id: &str, items: &[ResumeItem]) {
+    async fn mark_unreported_lost(
+        &self,
+        agent_id: &str,
+        link_session_id: &str,
+        items: &[ResumeItem],
+    ) {
         let reported: std::collections::BTreeSet<&str> =
             items.iter().map(|item| item.dispatch_id.as_str()).collect();
-        let mut bindings = self.bindings.lock().await;
+        let bindings = self.bindings.lock().await;
         let lost: Vec<_> = bindings
             .iter()
-            .filter(|(id, bound)| bound.agent_id == agent_id && !reported.contains(id.as_str()))
+            .filter(|(id, bound)| {
+                bound.agent_id == agent_id
+                    && bound.link_session_id != link_session_id
+                    && !reported.contains(id.as_str())
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for id in lost {
-            if let Some(bound) = bindings.remove(&id) {
+            if let Some(bound) = bindings.get(&id) {
                 let mut verdict = bound.verdict.lock().await;
                 if verdict.is_none() {
                     *verdict = Some(AttachOutcome::Lost(format!(
@@ -856,7 +903,7 @@ impl AgentManager {
                 agent_id: agent_id.to_string(),
                 agent_boot_id: agent_boot_id.to_string(),
                 link_session_id: link_session_id.to_string(),
-                executor_id: format!("{}:{}", agent_id, executor_boot_id),
+                executor_id: binding.executor_id.clone(),
                 executor_boot_id: executor_boot_id.clone(),
                 dispatch_id: Some(item.dispatch_id.clone()),
             };
@@ -887,84 +934,91 @@ impl AgentManager {
         run_id: String,
         node_id: String,
     ) -> Result<mpsc::Receiver<crate::execution::pool::FromSession>> {
-        // 选择：占用最少的已连接 agent；空位等待由槽位信号量承担
-        //（不立即失败，三期 §1.6）。
-        let pick = {
+        let registration = loop {
+            let changed = self.capacity_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
             let agents = self.agents.lock().await;
-            let mut best: Option<(Arc<AgentRegistration>, u64, u64)> = None;
-            for registration in agents.values() {
-                let total = registration.slots_total.load(Ordering::Relaxed);
-                let used = registration.slots_used.load(Ordering::Relaxed);
-                if best
-                    .as_ref()
-                    .is_none_or(|(_, _, used_so_far)| used < *used_so_far)
-                {
-                    best = Some((registration.clone(), total, used));
-                }
+            if agents.is_empty() {
+                return Err(invalid("no agent connected"));
             }
-            best
+            let mut bindings = self.bindings.lock().await;
+            let pick = agents
+                .values()
+                .filter_map(|agent| {
+                    let used = bindings
+                        .values()
+                        .filter(|bound| bound.agent_id == agent.agent_id)
+                        .count();
+                    (used < agent.slots_total.load(Ordering::Relaxed) as usize)
+                        .then_some((used, agent.clone()))
+                })
+                .min_by_key(|(used, _)| *used);
+            if let Some((_, agent)) = pick {
+                let executor_id = format!(
+                    "exec-{}@{}",
+                    self.agent_counter.fetch_add(1, Ordering::Relaxed),
+                    agent.agent_id
+                );
+                bindings.insert(
+                    dispatch_id.clone(),
+                    Arc::new(BoundDispatch {
+                        agent_id: agent.agent_id.clone(),
+                        link_session_id: agent.link_session_id.clone(),
+                        executor_id,
+                        executor_boot_id: Mutex::new(None),
+                        run_id,
+                        node_id,
+                        pending_link: Mutex::new(None),
+                        verdict: Mutex::new(None),
+                        notify: Notify::new(),
+                    }),
+                );
+                break agent;
+            }
+            drop(bindings);
+            drop(agents);
+            tokio::select! {
+                _ = changed => {},
+                _ = self.shutdown.cancelled() => return Err(invalid("agent manager shut down")),
+            }
         };
-        let Some((registration, _total, _used)) = pick else {
-            return Err(invalid("no agent connected"));
-        };
-        // 等待空位（容量准入不立即失败）。
-        let slot_permit = registration
-            .slots_sem
-            .clone()
-            .acquire_owned()
+        let executor_id = self
+            .bindings
+            .lock()
             .await
-            .map_err(|_| invalid("agent session closed while waiting for slot"))?;
-        registration.slots_used.fetch_add(1, Ordering::Relaxed);
-        let executor_id = format!(
-            "exec-{}@{}",
-            self.agent_counter.fetch_add(1, Ordering::Relaxed),
-            registration.agent_id
-        );
+            .get(&dispatch_id)
+            .unwrap()
+            .executor_id
+            .clone();
         let (events, rx) = mpsc::channel(256);
         let (ack_tx, ack_rx) = oneshot::channel();
         self.pending_binds.lock().await.insert(
             dispatch_id.clone(),
             PendingBind {
                 agent_id: registration.agent_id.clone(),
+                link_session_id: registration.link_session_id.clone(),
                 executor_id: executor_id.clone(),
                 events,
                 ack: ack_tx,
             },
         );
-        self.bindings.lock().await.insert(
-            dispatch_id.clone(),
-            Arc::new(BoundDispatch {
-                agent_id: registration.agent_id.clone(),
-                slot_permit: tokio::sync::Mutex::new(Some(slot_permit)),
-                executor_boot_id: Mutex::new(None),
-                run_id,
-                node_id,
-                pending_link: Mutex::new(None),
-                verdict: Mutex::new(None),
-                notify: Notify::new(),
-            }),
-        );
-        registration
-            .outbound
-            .send(ToSession::Send(Box::new(Message::BindExecutor {
-                executor_id,
-                dispatch_id: dispatch_id.clone(),
-            })))
-            .await
-            .map_err(|_| invalid("agent session closed before bind"))?;
-        match tokio::time::timeout(Duration::from_millis(STARTUP_TIMEOUT_MS * 4), ack_rx).await {
-            Ok(Ok(Ok(_boot))) => Ok(rx),
-            Ok(Ok(Err(error))) => {
-                self.bindings.lock().await.remove(&dispatch_id);
-                registration.slots_used.fetch_sub(1, Ordering::Relaxed);
-                Err(error)
+        let result = async {
+            tokio::select! {
+                result = registration.outbound.send(ToSession::Send(Box::new(Message::BindExecutor { executor_id, dispatch_id: dispatch_id.clone() }))) => {
+                    result.map_err(|_| invalid("agent session closed before bind"))?;
+                }
+                _ = registration.cancel.cancelled() => return Err(invalid("agent session replaced before bind")),
             }
-            Ok(Err(_)) | Err(_) => {
-                self.bindings.lock().await.remove(&dispatch_id);
-                registration.slots_used.fetch_sub(1, Ordering::Relaxed);
-                Err(invalid("agent bind ack lost"))
-            }
+            tokio::time::timeout(Duration::from_millis(STARTUP_TIMEOUT_MS * 4), ack_rx).await
+                .map_err(|_| invalid("agent bind acknowledgement timeout"))?
+                .map_err(|_| invalid("agent bind acknowledgement lost"))??;
+            Ok(rx)
+        }.await;
+        if result.is_err() {
+            self.unbind(&dispatch_id, false).await;
         }
+        result
     }
 
     // 取走绑定的活跃链路；无则等待重连裁决（Resume）或超时。
@@ -997,18 +1051,13 @@ impl AgentManager {
 
     // 派发结束：解除绑定并通知 agent 取消残留执行（若非正常完成）。
     pub(crate) async fn unbind(self: &Arc<Self>, dispatch_id: &str, healthy: bool) {
+        self.pending_binds.lock().await.remove(dispatch_id);
         let binding = self.bindings.lock().await.remove(dispatch_id);
+        self.capacity_changed.notify_waiters();
         if let Some(binding) = binding {
-            // 释放容量许可（drop permit → 槽位归还）。
-            *binding.slot_permit.lock().await = None;
-            if let Some(registration) = self.agents.lock().await.get(&binding.agent_id).cloned() {
-                // 安全递减（会话替换后的计数以当前水位为准，不下溢）。
-                let _ = registration.slots_used.try_update(
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                    |used| used.checked_sub(1),
-                );
-                if !healthy {
+            if !healthy {
+                if let Some(registration) = self.agents.lock().await.get(&binding.agent_id).cloned()
+                {
                     let _ = registration
                         .outbound
                         .send(ToSession::CancelDispatch(dispatch_id.to_string()))
@@ -1069,6 +1118,7 @@ fn adjudicate_against_journal(
     state: &flow_engine::journal_state::State,
     binding: &BoundDispatch,
     item: &ResumeItem,
+    bound_boot: Option<&str>,
 ) -> ResumeAction {
     let Some(run) = state.runs.get(&binding.run_id) else {
         return ResumeAction::CancelAndDrain;
@@ -1088,12 +1138,7 @@ fn adjudicate_against_journal(
     if attempt.result.is_some() {
         return ResumeAction::AlreadyCommitted;
     }
-    let bound_boot = binding
-        .executor_boot_id
-        .try_lock()
-        .ok()
-        .and_then(|guard| guard.clone());
-    if bound_boot.as_deref() != Some(item.executor_boot_id.as_str()) {
+    if bound_boot != Some(item.executor_boot_id.as_str()) {
         return ResumeAction::ReconcileRequired;
     }
     if item.lost_data && item.result_id.is_none() {
@@ -1159,6 +1204,11 @@ impl RemoteDispatcher {
             .await
             .map_err(|_| invalid("remote slots closed"))
             .map_err(crate::journal::JournalError::from)?;
+        // Cancellation/panic must release pending binds as well as established ones.
+        let _binding_guard = BindingGuard {
+            manager: self.manager.clone(),
+            dispatch_id: attempt.dispatch_id.clone(),
+        };
         // 绑定（BindExecutor → agent 本地 spawn+握手 → Ack）。
         let mut events = self
             .manager
@@ -1219,5 +1269,111 @@ impl RemoteDispatcher {
                 }
             }
         }
+    }
+}
+
+struct BindingGuard {
+    manager: Arc<AgentManager>,
+    dispatch_id: String,
+}
+impl Drop for BindingGuard {
+    fn drop(&mut self) {
+        let manager = self.manager.clone();
+        let dispatch_id = self.dispatch_id.clone();
+        tokio::spawn(async move {
+            manager.unbind(&dispatch_id, false).await;
+        });
+    }
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn replacement_session_keeps_outstanding_capacity_reserved() {
+        let root = std::env::temp_dir().join(format!("flow-capacity-{}", uuid::Uuid::now_v7()));
+        let backend = JournalBackend::open(&root, flow_journal::JournalOptions::default())
+            .await
+            .unwrap();
+        let manager = AgentManager::new(backend.clone(), backend.journal.id().into(), 1);
+        let (outbound, mut messages) = mpsc::channel(8);
+        let register = |session: &str| {
+            Arc::new(AgentRegistration {
+                agent_id: "agent".into(),
+                agent_boot_id: "boot".into(),
+                link_session_id: session.into(),
+                outbound: outbound.clone(),
+                slots_total: AtomicU64::new(1),
+                cancel: tokio_util::sync::CancellationToken::new(),
+            })
+        };
+        manager
+            .agents
+            .lock()
+            .await
+            .insert("agent".into(), register("old"));
+        let first = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .bind_executor("first".into(), "run".into(), "node".into())
+                    .await
+            })
+        };
+        assert!(matches!(messages.recv().await, Some(ToSession::Send(_))));
+        manager
+            .pending_binds
+            .lock()
+            .await
+            .remove("first")
+            .unwrap()
+            .ack
+            .send(Ok("boot-first".into()))
+            .unwrap();
+        let _first_events = first.await.unwrap().unwrap();
+        manager
+            .agents
+            .lock()
+            .await
+            .insert("agent".into(), register("new"));
+        manager.capacity_changed.notify_waiters();
+        let second = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .bind_executor("second".into(), "run".into(), "node".into())
+                    .await
+            })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), messages.recv())
+                .await
+                .is_err(),
+            "replacement must not reset used capacity"
+        );
+        assert_eq!(manager.bindings.lock().await.len(), 1);
+        manager.unbind("first", true).await;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), messages.recv())
+                .await
+                .unwrap(),
+            Some(ToSession::Send(_))
+        ));
+        manager
+            .pending_binds
+            .lock()
+            .await
+            .remove("second")
+            .unwrap()
+            .ack
+            .send(Ok("boot-second".into()))
+            .unwrap();
+        let _second_events = second.await.unwrap().unwrap();
+        manager.unbind("second", true).await;
+        assert!(manager.pending_binds.lock().await.is_empty());
+        assert!(manager.bindings.lock().await.is_empty());
+        backend.close().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

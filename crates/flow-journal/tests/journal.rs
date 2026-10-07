@@ -122,7 +122,13 @@ async fn batch_durability_round_robin_lock_and_restart() {
     assert!(journal.stats().max_batch_bytes <= 4 * 1024 * 1024);
     journal.close().await.unwrap();
     let report = scan(dir.path(), |tx, _| {
-        assert!(tx.events.len() == 1 || tx.events.len() == 2);
+        let structural = tx.events.iter().all(|event| {
+            matches!(
+                event.kind,
+                EventKind::SegmentStarted | EventKind::SegmentSealed
+            )
+        });
+        assert_eq!(tx.events.len(), if structural { 1 } else { 2 });
         Ok(())
     })
     .unwrap();
@@ -440,7 +446,20 @@ async fn sync_failure_matrix_never_loses_acknowledged_prefix() {
             },
         )
         .await;
-        let Ok(j) = opened else { continue };
+        let j = match opened {
+            Ok(journal) => journal,
+            Err(error) => {
+                assert!(
+                    error.to_string().contains("injected"),
+                    "unexpected open error: {error}"
+                );
+                assert!(
+                    data == Some(1) || dir.is_some(),
+                    "late data fault cannot fail initial open: {data:?}"
+                );
+                continue;
+            }
+        };
         let mut acknowledged = Vec::new();
         let mut failed = false;
         for i in 0..12 {

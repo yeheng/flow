@@ -38,6 +38,7 @@ pub struct ExecutorHandle {
     pub lost_data: Arc<AtomicBool>,
     /// executor_loop 走完回收（自然完成或被杀）；drain 宽限等待用。
     pub done: Arc<AtomicBool>,
+    pub committed: Arc<AtomicBool>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -55,9 +56,10 @@ pub async fn bind_executor(
     executor_id: &str,
     dispatch_id: &str,
 ) -> Result<ExecutorHandle, PoolError> {
-    let (pair, mut child, _child_side) =
+    let (pair, mut child, child_side) =
         spawn_executor_process(executor, Some(&format!("agent:{executor_id}")))
             .map_err(|e| PoolError::Bind(format!("spawn executor: {e}")))?;
+    drop(child_side);
     let mut transport = FrameTransport::spawn(pair, 64);
     let hello = tokio::time::timeout(
         Duration::from_millis(STARTUP_TIMEOUT_MS * 2),
@@ -91,6 +93,7 @@ pub async fn bind_executor(
     let forced_kill = Arc::new(AtomicBool::new(false));
     let lost_data = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
+    let committed = Arc::new(AtomicBool::new(false));
     tokio::spawn(executor_loop(
         dispatch_id.to_string(),
         transport,
@@ -103,6 +106,7 @@ pub async fn bind_executor(
         forced_kill.clone(),
         lost_data.clone(),
         done.clone(),
+        committed.clone(),
     ));
     Ok(ExecutorHandle {
         dispatch_id: dispatch_id.to_string(),
@@ -116,6 +120,7 @@ pub async fn bind_executor(
         forced_kill,
         lost_data,
         done,
+        committed,
     })
 }
 
@@ -135,6 +140,7 @@ async fn executor_loop(
     forced_kill: Arc<AtomicBool>,
     lost_data: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
+    committed: Arc<AtomicBool>,
 ) {
     loop {
         tokio::select! {
@@ -144,9 +150,12 @@ async fn executor_loop(
             }
             inbound = inbox.recv() => {
                 let Some(message) = inbound else { break };
-                if transport.send(message).await.is_err() {
-                    break;
+                if let Message::AuditAck { durable_audit_seq, .. } = &message {
+                    last_acked.fetch_max(*durable_audit_seq, Ordering::Relaxed);
                 }
+                // The journal has committed the result; this per-dispatch process can be reaped.
+                if matches!(message, Message::ResultCommitted { .. }) { committed.store(true, Ordering::Release); break; }
+                if transport.send(message).await.is_err() { break; }
             }
             received = transport.recv() => {
                 match received {
@@ -161,8 +170,9 @@ async fn executor_loop(
                             _ => {}
                         }
                         // 有界出站：满则停止读取（端到端背压，不提前确认）。
-                        if out.send(message).await.is_err() {
-                            break;
+                        tokio::select! {
+                            _ = cancel.cancelled() => { forced_kill.store(true, Ordering::Relaxed); break; },
+                            sent = out.send(message) => { if sent.is_err() { break; } },
                         }
                     }
                     Err(_) => {
@@ -176,14 +186,34 @@ async fn executor_loop(
             }
         }
     }
-    // 回收：尽力 Cancel → 宽限 → kill → wait/reap。
-    let _ = transport
-        .send(Message::Cancel {
-            command_id: format!("agent-cancel-{dispatch_id}"),
-            dispatch_id: dispatch_id.clone(),
-        })
-        .await;
-    let _ = tokio::time::timeout(Duration::from_millis(DRAIN_GRACE_MS), transport.recv()).await;
+    if !committed.load(Ordering::Acquire) {
+        // 回收：尽力 Cancel → 宽限 → kill → wait/reap。
+        let _ = transport
+            .send(Message::Cancel {
+                command_id: format!("agent-cancel-{dispatch_id}"),
+                dispatch_id: dispatch_id.clone(),
+            })
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(DRAIN_GRACE_MS);
+        while let Ok(Ok((_, message))) = tokio::time::timeout_at(deadline, transport.recv()).await {
+            if let Message::Result {
+                result_id,
+                last_audit_seq,
+                ..
+            } = &message
+            {
+                *result.lock().await = Some((result_id.clone(), *last_audit_seq));
+            }
+            let stopped = matches!(message, Message::Stopped { .. });
+            if !matches!(
+                tokio::time::timeout_at(deadline, out.send(message)).await,
+                Ok(Ok(()))
+            ) || stopped
+            {
+                break;
+            }
+        }
+    }
     transport.close();
     let _ = child.start_kill();
     let _ = child.wait().await;

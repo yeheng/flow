@@ -36,6 +36,7 @@ enum Outcome {
     Pending,
     /// 等待子 run 时遭遇基础设施故障（DB 不可用等）：应挂起 run 而非判死
     PlatformFault,
+    Panic,
 }
 
 impl MockLauncher {
@@ -86,6 +87,7 @@ impl ChildRunLauncher for MockLauncher {
             match &self.outcome {
                 Outcome::Succeed(value) => Ok(ChildRunOutcome::Succeeded(value.clone())),
                 Outcome::Fail(error) => Ok(ChildRunOutcome::Failed(error.clone())),
+                Outcome::Panic => panic!("injected child launcher panic"),
                 Outcome::PlatformFault => Err(EngineError::Backend("db 连接中断".into())),
                 Outcome::Pending => {
                     cancel.cancelled().await;
@@ -464,4 +466,13 @@ async fn sub_workflow_without_launcher_fails_fast() {
     .await
     .unwrap();
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn node_panic_releases_slot_and_fails_run() {
+    let (h, _) = harness(MockLauncher::new(Outcome::Panic));
+    h.engine.start_run(spec("panic", 0)).await.unwrap();
+    let state = terminal(&h.engine, "panic").await;
+    assert_eq!(state.phase, RunPhase::Failed);
+    assert!(state.fatal_error.unwrap().contains("panicked"));
 }

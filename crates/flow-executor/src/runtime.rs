@@ -89,9 +89,14 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
     ));
     let mut current: Option<CurrentTask> = None;
     let mut exit_code = 0;
+    let mut pending: Option<(mpsc::Sender<Message>, Message)> = None;
     loop {
         tokio::select! {
             biased;
+            permit = async { pending.as_ref().unwrap().0.clone().reserve_owned().await }, if pending.is_some() => {
+                let (_, message) = pending.take().unwrap();
+                match permit { Ok(permit) => { permit.send(message); }, Err(_) => {exit_code = 75; break;} }
+            }
             outbound = outbound_rx.recv() => {
                 match outbound {
                     Some(message) => {
@@ -112,6 +117,12 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
                     None => std::future::pending().await,
                 }
             } => {
+                if task_done.is_err() {
+                    // A task panic closes its completion channel; do not spin forever.
+                    if let Some(task) = &current { task.cancel.cancel(); }
+                    exit_code = 75;
+                    break;
+                }
                 if let Ok(end) = task_done {
                     match end {
                         TaskEnd::Committed => {
@@ -127,11 +138,11 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
                     }
                 }
             }
-            received = transport.recv() => {
+            received = transport.recv(), if pending.is_none() => {
                 match received {
                     Ok((channel, message)) => {
                         let _ = channel;
-                        if let Some(code) = handle_message(&mut current, message, &outbound_tx, &identity, limits_ref) {
+                        if let Some(code) = handle_message(&mut current, &mut pending, message, &outbound_tx, &identity, limits_ref) {
                             exit_code = code;
                             break;
                         }
@@ -167,6 +178,7 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
 /// 处理一条入站消息。返回 Some(exit_code) 表示应退出进程。
 fn handle_message(
     current: &mut Option<CurrentTask>,
+    pending: &mut Option<(mpsc::Sender<Message>, Message)>,
     message: Message,
     outbound: &mpsc::Sender<Message>,
     identity: &SessionIdentity,
@@ -255,14 +267,14 @@ fn handle_message(
             };
             if let Some(task) = current {
                 if task.dispatch_id == dispatch_id {
-                    let _ = task.mail.try_send(message);
+                    *pending = Some((task.mail.clone(), message));
                 }
             }
             None
         }
         Message::TransferChunk { .. } | Message::InputReady { .. } => {
             if let Some(task) = current {
-                let _ = task.mail.try_send(message);
+                *pending = Some((task.mail.clone(), message));
             }
             None
         }

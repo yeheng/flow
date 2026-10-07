@@ -178,9 +178,39 @@ impl TaskRunner {
             }
             Err(other) => return Err(other),
         };
-        // 4) 封口并发送唯一 Result，等待 ResultCommitted。
-        audit.flush().await?;
+        self.emit_result(&mut audit, outcome).await
+    }
+
+    async fn emit_failure(
+        &mut self,
+        audit: &mut AuditStream,
+        error: String,
+        uncertain: bool,
+    ) -> Result<(), TaskError> {
+        self.emit_result(
+            audit,
+            ResultOutcome::Failure {
+                error,
+                uncertain_operation: uncertain,
+            },
+        )
+        .await
+    }
+
+    // Result can reference values at the end of the audit stream. A single flush
+    // only fills the window; keep accepting ACKs until the entire prefix is durable.
+    async fn emit_result(
+        &mut self,
+        audit: &mut AuditStream,
+        outcome: ResultOutcome,
+    ) -> Result<(), TaskError> {
         let last_audit_seq = audit.next_seq().saturating_sub(1);
+        tokio::time::timeout(
+            Duration::from_millis(DURABLE_WAIT_TIMEOUT_MS),
+            audit.await_durable(last_audit_seq, &self.cancel),
+        )
+        .await
+        .map_err(|_| TaskError::Closed("final audit acknowledgement timeout".into()))??;
         let result_id = uuid::Uuid::now_v7().to_string();
         let result_message = Message::Result {
             dispatch_id: self.dispatch_id.clone(),
@@ -193,49 +223,12 @@ impl TaskRunner {
             .await
             .map_err(|e| TaskError::Closed(e.to_string()))?;
         self.last_result = Some(result_message);
-        let deadline = Duration::from_millis(DURABLE_WAIT_TIMEOUT_MS);
-        match tokio::time::timeout(deadline, self.wait_committed(&result_id)).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(error),
-            Err(_) => Err(TaskError::Closed("ResultCommitted timeout".into())),
-        }
-    }
-
-    /// 业务失败结果：封口发送 Failure 并等 ResultCommitted（与主进程
-    /// NodeFailed/重试语义对接；uncertain 由主进程依操作状态判定）。
-    async fn emit_failure(
-        &mut self,
-        audit: &mut AuditStream,
-        error: String,
-        uncertain: bool,
-    ) -> Result<(), TaskError> {
-        audit.flush().await?;
-        let last_audit_seq = audit.next_seq().saturating_sub(1);
-        let result_id = uuid::Uuid::now_v7().to_string();
-        let result_message = Message::Result {
-            dispatch_id: self.dispatch_id.clone(),
-            result_id: result_id.clone(),
-            last_audit_seq,
-            outcome: ResultOutcome::Failure {
-                error,
-                uncertain_operation: uncertain,
-            },
-        };
-        self.outbound
-            .send(result_message.clone())
-            .await
-            .map_err(|e| TaskError::Closed(e.to_string()))?;
-        self.last_result = Some(result_message);
-        match tokio::time::timeout(
+        tokio::time::timeout(
             Duration::from_millis(DURABLE_WAIT_TIMEOUT_MS),
             self.wait_committed(&result_id),
         )
         .await
-        {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(error),
-            Err(_) => Err(TaskError::Closed("ResultCommitted timeout".into())),
-        }
+        .map_err(|_| TaskError::Closed("ResultCommitted timeout".into()))?
     }
 
     async fn wait_committed(&mut self, result_id: &str) -> Result<(), TaskError> {
@@ -870,6 +863,14 @@ impl TaskRunner {
                 return Err(TaskError::Uncertain(error.to_string()));
             }
         };
+        if response
+            .content_length()
+            .is_some_and(|length| length > flow_journal::MAX_VALUE_BYTES)
+        {
+            return Err(TaskError::Uncertain(
+                "response exceeds capture limit; no complete outcome retained".into(),
+            ));
+        }
         let status = response.status().as_u16();
         let headers: serde_json::Map<String, Value> = response
             .headers()
@@ -883,8 +884,8 @@ impl TaskRunner {
             .map_err(|e| TaskError::Uncertain(e.to_string()))?
         {
             if raw.len() as u64 + bytes.len() as u64 > flow_journal::MAX_VALUE_BYTES {
-                return Err(TaskError::Http(
-                    "captured value size; prefix retained".into(),
+                return Err(TaskError::Uncertain(
+                    "response exceeds capture limit; no complete outcome retained".into(),
                 ));
             }
             raw.extend_from_slice(&bytes);

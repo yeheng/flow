@@ -1222,7 +1222,6 @@ impl Message {
                     executor_id: String,
                     executor_boot_id: String,
                     dispatch_id: String,
-                    #[serde(default)]
                     ok: bool,
                     #[serde(default)]
                     error: Option<String>,
@@ -1308,4 +1307,20 @@ fn body_value(value: impl Serialize) -> Option<Value> {
 pub enum Channel {
     Control,
     Data,
+}
+
+#[cfg(test)]
+mod strict_bind_ack_tests {
+    use super::*;
+
+    #[test]
+    fn bind_ack_requires_explicit_outcome() {
+        let mut message = serde_json::json!({"v":PROTOCOL_VERSION,"type":"BindExecutorAck","body":{"executor_id":"e","executor_boot_id":"b","dispatch_id":"d"}});
+        assert!(Message::from_envelope(message.clone()).is_err());
+        message["body"]["ok"] = Value::Bool(false);
+        assert!(matches!(
+            Message::from_envelope(message).unwrap(),
+            Message::BindExecutorAck { ok: false, .. }
+        ));
+    }
 }

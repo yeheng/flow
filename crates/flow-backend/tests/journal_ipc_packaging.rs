@@ -28,22 +28,21 @@ async fn install(b: &JournalBackend, definition: serde_json::Value) -> String {
 
 #[test]
 fn mode_env_parsing_rejects_invalid_values() {
-    // in_process / 空 / 未设置 → 进程内；未知值 → 报错。
-    let cases = [
-        ("in_process", true),
-        ("", true),
-        ("ipc", false),
-        ("remote", false),
-    ];
-    for (value, _) in cases {
-        // 仅验证解析路径不 panic；真实定位在 async 测试中覆盖。
-        let _ = value;
+    use flow_backend::execution::{mode_from_env_with, ExecutionMode};
+    for value in ["", "in_process"] {
+        assert!(
+            matches!(mode_from_env_with(value), Ok(ExecutionMode::InProcess)),
+            "{value}"
+        );
     }
-    assert!(flow_backend::execution::mode_from_env_with("bogus").is_err());
     assert!(matches!(
-        flow_backend::execution::mode_from_env_with("in_process"),
-        Ok(flow_backend::execution::ExecutionMode::InProcess)
+        mode_from_env_with("ipc"),
+        Ok(ExecutionMode::Ipc(_))
     ));
+    // Remote startup uses remote_options_from_env, not the local/IPC parser.
+    for value in ["remote", "bogus"] {
+        assert!(mode_from_env_with(value).is_err(), "{value}");
+    }
 }
 
 #[tokio::test]
@@ -70,7 +69,9 @@ async fn missing_executor_binary_fails_loudly_without_fallback() {
     let result = backend
         .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
             flow_backend::execution::IpcOptions {
-                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(root.join("does-not-exist")),
+                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
+                    root.join("does-not-exist"),
+                ),
                 x_max: 1,
                 tag: None,
             },
@@ -104,7 +105,9 @@ async fn executor_path_with_spaces_runs() {
     backend
         .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
             flow_backend::execution::IpcOptions {
-                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::merged(copy),
+                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::merged(
+                    copy,
+                ),
                 x_max: 1,
                 tag: Some("spaced".into()),
             },
@@ -161,7 +164,9 @@ async fn incompatible_executor_binary_fails_handshake_and_node_errors() {
     backend
         .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
             flow_backend::execution::IpcOptions {
-                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(fake),
+                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
+                    fake,
+                ),
                 x_max: 1,
                 tag: None,
             },

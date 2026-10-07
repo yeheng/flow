@@ -6,6 +6,7 @@
 //! ValuePublished/OperationIntent/OperationAuthorized/OperationOutcome/
 //! NodeCompleted/NodeFailed/WaitRegistered 及 sealed_through 屏障语义不变。
 
+use crate::journal::JournalError;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -83,6 +84,9 @@ impl IpcDispatcher {
     }
 }
 
+const OPERATION_TRANSFER_LIMIT: u64 = 8 * 1024 * 1024;
+const OPERATION_TRANSFER_COUNT: usize = 16;
+
 struct OpTransfer {
     chunks: BTreeMap<u64, Vec<u8>>,
     ready: Option<(u64, String)>,
@@ -134,7 +138,7 @@ impl DispatchRunner {
         }
     }
 
-    /// 在给定链路上驱动派发；链路死亡返回 [`LINK_DEAD`] 标记错误，
+    /// 在给定链路上驱动派发；链路死亡返回 `JournalError::LinkClosed`，
     /// 由远程模式重连后继续驱动同一 runner（保留账本/屏障状态）。
     pub(crate) async fn drive(&mut self, link: &mut DispatchLink) -> Result<()> {
         self.drive_link(link, false).await
@@ -285,12 +289,12 @@ impl DispatchRunner {
                                 return Err(invalid(format!("executor stopped after cancel: {reason}")));
                             }
                             self.session_healthy = false;
-                            return Err(invalid(format!("link-dead: executor session dead: {reason}")));
+                            return Err(JournalError::LinkClosed(format!("executor session dead: {reason}")));
                         }
                         None => {
                             let _ = transfer.await;
                             self.session_healthy = false;
-                            return Err(invalid("link-dead: executor session closed"));
+                            return Err(JournalError::LinkClosed("executor session closed".into()));
                         }
                     }
                 }
@@ -416,6 +420,21 @@ impl DispatchRunner {
                 if expected != digest {
                     return Err(invalid("transfer chunk digest mismatch"));
                 }
+                let received: u64 = self
+                    .op_transfers
+                    .values()
+                    .flat_map(|entry| entry.chunks.values())
+                    .map(|chunk| chunk.len() as u64)
+                    .sum();
+                if offset
+                    .checked_add(raw.len() as u64)
+                    .is_none_or(|end| end > OPERATION_TRANSFER_LIMIT)
+                    || received.saturating_add(raw.len() as u64) > OPERATION_TRANSFER_LIMIT
+                    || (!self.op_transfers.contains_key(&transfer_id)
+                        && self.op_transfers.len() >= OPERATION_TRANSFER_COUNT)
+                {
+                    return Err(invalid("operation transfer exceeds input budget"));
+                }
                 let entry = self.op_transfers.entry(transfer_id).or_insert(OpTransfer {
                     chunks: BTreeMap::new(),
                     ready: None,
@@ -427,11 +446,18 @@ impl DispatchRunner {
                 Ok(None)
             }
             Message::InputReady {
-                dispatch_id: _,
+                dispatch_id,
                 transfer_id,
                 total_bytes,
                 digest,
             } => {
+                if dispatch_id != self.attempt.dispatch_id
+                    || total_bytes > OPERATION_TRANSFER_LIMIT
+                    || (!self.op_transfers.contains_key(&transfer_id)
+                        && self.op_transfers.len() >= OPERATION_TRANSFER_COUNT)
+                {
+                    return Err(invalid("invalid operation transfer identity or size"));
+                }
                 let entry = self.op_transfers.entry(transfer_id).or_insert(OpTransfer {
                     chunks: BTreeMap::new(),
                     ready: None,
@@ -492,16 +518,16 @@ impl DispatchRunner {
         if received != *total {
             return false;
         }
-        let mut assembled = Vec::with_capacity(*total as usize);
+        let mut hash = sha2::Sha256::new();
         let mut expected = 0u64;
         for (offset, chunk) in &entry.chunks {
             if *offset != expected {
                 return false;
             }
             expected += chunk.len() as u64;
-            assembled.extend_from_slice(chunk);
+            hash.update(chunk);
         }
-        hex_sha(&assembled) == *digest
+        hex::encode(hash.finalize()) == *digest
     }
 
     /// 挂起的 RequestOperation 在块齐后重试。
@@ -1128,5 +1154,84 @@ fn stream_of(stream: &str) -> flow_engine::event::LogStream {
         "stderr" => flow_engine::event::LogStream::Stderr,
         "engine" => flow_engine::event::LogStream::Engine,
         _ => flow_engine::event::LogStream::Stdout,
+    }
+}
+
+#[cfg(test)]
+mod transfer_budget_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn malformed_transfers_are_bounded_before_retention() {
+        let root =
+            std::env::temp_dir().join(format!("flow-transfer-limit-{}", uuid::Uuid::now_v7()));
+        let backend = JournalBackend::open(&root, flow_journal::JournalOptions::default())
+            .await
+            .unwrap();
+        let attempt = Attempt {
+            backend: backend.clone(),
+            run_id: "r".into(),
+            node_id: "n".into(),
+            dispatch_id: "d".into(),
+        };
+        let node = serde_json::from_value(
+            json!({"id":"n", "type":"http_call", "params":{"url":"http://unused"}}),
+        )
+        .unwrap();
+        let mut runner = DispatchRunner::runner(attempt, node, BTreeMap::new(), None);
+        let (commands, _rx) = mpsc::channel(8);
+        let (_tx, events) = mpsc::channel(8);
+        let mut link = DispatchLink { commands, events };
+        let ready = |dispatch: &str, id: &str, total_bytes| Message::InputReady {
+            dispatch_id: dispatch.into(),
+            transfer_id: id.into(),
+            total_bytes,
+            digest: String::new(),
+        };
+        assert!(runner
+            .handle(ready("foreign", "t", 0), &mut link)
+            .await
+            .is_err());
+        assert!(runner
+            .handle(ready("d", "t", u64::MAX), &mut link)
+            .await
+            .is_err());
+        assert!(runner.op_transfers.is_empty());
+        let chunk = |id: &str, offset, bytes: &[u8]| Message::TransferChunk {
+            dispatch_id: "d".into(),
+            transfer_id: id.into(),
+            offset,
+            bytes: STANDARD.encode(bytes),
+            digest: hex_sha(bytes),
+        };
+        assert!(runner
+            .handle(chunk("t", u64::MAX, b"x"), &mut link)
+            .await
+            .is_err());
+        let half = vec![b'x'; OPERATION_TRANSFER_LIMIT as usize / 2];
+        runner
+            .handle(chunk("a", 0, &half), &mut link)
+            .await
+            .unwrap();
+        runner
+            .handle(chunk("b", 0, &half), &mut link)
+            .await
+            .unwrap();
+        assert!(runner.handle(chunk("c", 0, b"x"), &mut link).await.is_err());
+        assert_eq!(runner.op_transfers.len(), 2);
+        runner.op_transfers.clear();
+        for i in 0..OPERATION_TRANSFER_COUNT {
+            runner
+                .handle(ready("d", &i.to_string(), 0), &mut link)
+                .await
+                .unwrap();
+        }
+        assert!(runner
+            .handle(ready("d", "overflow", 0), &mut link)
+            .await
+            .is_err());
+        assert_eq!(runner.op_transfers.len(), OPERATION_TRANSFER_COUNT);
+        backend.close().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

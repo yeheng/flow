@@ -27,6 +27,8 @@ pub struct CommandReceipt {
 }
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
+    #[error("execution link closed: {0}")]
+    LinkClosed(String),
     #[error("{0}")]
     Journal(#[from] flow_journal::Error),
     #[error("projection: {0}")]
@@ -143,6 +145,9 @@ impl JournalBackend {
                         }
                         Ok(state)
                     })();
+                    if let Err(error) = &restored {
+                        tracing::warn!(%error, "invalid checkpoint; replaying journal");
+                    }
                     if let Ok(restored) = restored {
                         reader = TailReader::after(
                             &root_owned,
@@ -616,8 +621,10 @@ impl JournalBackend {
         let upper = committed.state.applied_lsn;
         // 已发布值快照只保留仍被状态引用的 Ref：终态 run 的历史值不进
         // checkpoint（见 ValueCatalog::snapshot 的安全依据）。
-        let live = live_output_ids(&committed.state);
-        let snapshot = serde_json::json!({"state":committed.state,"values":committed.state.values.snapshot(&live)?});
+        let state = serde_json::to_value(&committed.state)?;
+        let live = live_output_ids(&state);
+        let snapshot =
+            serde_json::json!({"state":state,"values":committed.state.values.snapshot(&live)?});
         let root = self.journal.root().to_path_buf();
         drop(committed);
         tokio::task::spawn_blocking(move || {
@@ -709,7 +716,7 @@ fn project_rows(state: &State, tx: &Transaction) -> flow_journal::Result<Vec<Pro
 /// serde 形状（`journal_id`+`output_id`+`digest` 三键同现即命中）。
 /// 任何被 runs/workflows/commands/attempts 持有的 StoredValue::Ref 都
 /// 躲不过这层扫描——按字段枚举引用面则永远怕漏一处。
-fn live_output_ids(state: &State) -> std::collections::HashSet<String> {
+fn live_output_ids(state: &Value) -> std::collections::HashSet<String> {
     fn walk(value: &Value, live: &mut std::collections::HashSet<String>) {
         match value {
             Value::Object(map) => {
@@ -734,8 +741,6 @@ fn live_output_ids(state: &State) -> std::collections::HashSet<String> {
         }
     }
     let mut live = std::collections::HashSet::new();
-    if let Ok(value) = serde_json::to_value(state) {
-        walk(&value, &mut live);
-    }
+    walk(state, &mut live);
     live
 }

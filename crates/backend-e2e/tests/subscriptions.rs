@@ -152,7 +152,28 @@ e2e_test!(
         // 等订阅处理器完成 broadcast 接收端注册（accept 与注册之间有一个异步
         // 间隙；pg 的 NOTIFY 唤醒会让这个间隙里的事件直接错过——全局流本就是
         // 纯实时增量，间隙里的事件按契约用 run.events 补齐）
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // A canary observed on this exact subscription proves the receiver is registered.
+        let canary_deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            let canary = start_run(&client, &first, json!({})).await;
+            if tokio::time::timeout(Duration::from_millis(200), async {
+                while let Some(Ok(event)) = sub.next().await {
+                    if event["run_id"] == canary {
+                        return;
+                    }
+                }
+                panic!("canary subscription closed");
+            })
+            .await
+            .is_ok()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < canary_deadline,
+                "subscription never became ready"
+            );
+        }
         let run_a = start_run(&client, &first, json!({})).await;
         let run_b = start_run(&client, &second, json!({})).await;
 

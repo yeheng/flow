@@ -23,6 +23,7 @@ name = "flow_cli"
 path = "src/lib.rs"
 
 [dependencies]
+flow-dto = { path = "../flow-dto" }
 uuid = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
