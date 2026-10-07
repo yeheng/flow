@@ -22,10 +22,10 @@ use std::path::Path;
 use jsonrpsee::ws_client::WsClient;
 use serde_json::{json, Value};
 
+use crate::cli::WorkflowCommand;
 use crate::client::{call, object};
 use crate::error::CliError;
 use crate::output::{local_time, note, parse_json, print_json, read_text, table, truncate_chars};
-use crate::cli::WorkflowCommand;
 
 pub async fn dispatch(
     client: &WsClient,

@@ -1,4 +1,6 @@
 import { RpcClient, RpcError } from "../rpc/client";
+import { isDesktop } from "../platform";
+import { invoke } from "@tauri-apps/api/core";
 
 export interface CommitCursor { journal_id: string; lsn: string }
 export interface Receipt { committed: boolean; visible: boolean; request_id: string; commit_cursor: CommitCursor; result: Record<string, unknown> }
@@ -30,7 +32,7 @@ export class EventWindow {
 
 export class JournalClient {
   private rpc: RpcClient;
-  constructor(url: string, private token: string, private http: string) { this.rpc = new RpcClient(url); }
+  constructor(url: string, private token: string, private http: string) { this.rpc = new RpcClient(url, "journal"); }
   close(): void { this.rpc.close(); }
   call<T>(method: string, params: Record<string, unknown> = {}): Promise<T> {
     return this.rpc.call<T>(method, { ...params, _token: this.token });
@@ -104,6 +106,10 @@ export class JournalClient {
     } catch (error) { stopped = true; removeReconnect(); await unsubscribe?.(); throw error; }
   }
   async download(run: string, output: string): Promise<void> {
+    if (isDesktop()) {
+      await invoke("flow_download", { run, output });
+      return;
+    }
     const picker = (window as unknown as {showSaveFilePicker?: (options: unknown) => Promise<{createWritable: () => Promise<WritableStream>}>}).showSaveFilePicker;
     if (!picker) throw new Error("当前浏览器不支持流式保存，请使用 JSONL CLI 下载");
     const file = await picker({suggestedName: `${output}.bin`});

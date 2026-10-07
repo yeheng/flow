@@ -1,8 +1,9 @@
 import { createRouter, createWebHashHistory, createWebHistory } from "vue-router";
+import { isDesktop } from "./platform";
 
 // 路由级代码分割：各视图按需加载，首屏不背编辑器/画布的成本
 export const router = createRouter({
-  history: "__TAURI_INTERNALS__" in window ? createWebHashHistory() : createWebHistory(),
+  history: isDesktop() ? createWebHashHistory() : createWebHistory(),
   routes: [
     { path: "/journal", component: () => import("./views/JournalView.vue") },
     { path: "/", component: () => import("./views/DashboardView.vue") },

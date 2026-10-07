@@ -174,7 +174,9 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
     let client = crate::client::connect(&cli.url).await?;
     match cli.command {
         Command::Journal { command } => crate::journal::dispatch(&client, command).await,
-        Command::Workflow { command } => crate::workflow::dispatch(&client, cli.json, command).await,
+        Command::Workflow { command } => {
+            crate::workflow::dispatch(&client, cli.json, command).await
+        }
         Command::Run { command } => crate::run::dispatch(&client, cli.json, command).await,
     }
 }

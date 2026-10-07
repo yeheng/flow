@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, shallowRef, triggerRef } from "vue";
 import { EventWindow, JournalClient, type JournalPage, type Receipt, type RunSnapshot } from "../api/journal";
+import { isDesktop } from "../platform";
+const desktop = isDesktop();
 const url=ref("ws://127.0.0.1:9802"), http=ref("http://127.0.0.1:9803"), token=ref("");
 const api=shallowRef<JournalClient>();
 const workflows=ref<Array<{workflow_id:string;name:string}>>([]),runs=ref<RunSnapshot[]>([]);
@@ -33,8 +35,11 @@ onBeforeUnmount(()=>{api.value?.close();if(frame!==undefined)cancelAnimationFram
   <main class="journal">
     <h1>JSONL 工作区</h1>
     <form class="bar" @submit.prevent="act(connect)">
-      <label>RPC 地址 <input v-model="url" required /></label><label>下载地址 <input v-model="http" required /></label>
-      <label>访问令牌 <input v-model="token" type="password" autocomplete="off" required /></label><button :disabled="busy">连接</button>
+      <template v-if="!desktop">
+        <label>RPC 地址 <input v-model="url" required /></label><label>下载地址 <input v-model="http" required /></label>
+        <label>访问令牌 <input v-model="token" type="password" autocomplete="off" required /></label>
+      </template>
+      <button :disabled="busy">{{ desktop ? "打开本地工作区" : "连接" }}</button>
     </form>
     <p role="status">{{ message }}</p>
     <template v-if="api">

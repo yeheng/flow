@@ -23,7 +23,7 @@ Vue 3 + Vite + TypeScript + vue-router + Tauri 2，支持浏览器与桌面应�
 
 ```bash
 # 终端 1：后端（仓库根）
-cargo run --bin flow-server          # 默认 ws://127.0.0.1:9800
+cargo run -p flow-app -- server       # 默认 ws://127.0.0.1:9800
 
 # 终端 2：前端
 cd web
@@ -33,7 +33,13 @@ npm run dev                          # 默认 http://127.0.0.1:5173
 
 ### 浏览器 / 桌面双入口
 
-两种模式共用 `src/`，均连接独立的 `flow-server`；桌面应用不内嵌或自动启动后端。
+两种模式共用 `src/` 和服务端方法实现，调用层自动选择：
+
+- **桌面**：应用启动时自动启动内嵌的 flow-server 服务，普通请求经 Tauri `invoke`
+  直接调用 Rust 方法模块，订阅经 Tauri Channel 推送，无需另开后端进程或 RPC 端口。
+- **浏览器**：经原有 JSON-RPC WebSocket API 连接独立的 `flow server`，支持远程部署。
+
+桌面开发与安装包行为一致，执行 `npm run dev:desktop` 或打开 `Flow.app` 即可使用。
 
 | 命令（在 `web/` 下执行） | 用途 |
 | --- | --- |
@@ -45,31 +51,36 @@ npm run dev                          # 默认 http://127.0.0.1:5173
 | `npm run build:desktop -- --bundles app` | macOS 仅生成 `.app`，跳过 DMG |
 
 桌面开发需要 Rust stable 与平台构建依赖：macOS 安装 Xcode Command Line Tools；
-Windows 安装 MSVC C++ Build Tools 和 WebView2；Linux 安装 WebKitGTK 4.1 等
-[Tauri 系统依赖](https://v2.tauri.app/start/prerequisites/)。浏览器模式只需要 Node.js。
+Linux 安装 WebKitGTK 4.1 等 [Tauri 系统依赖](https://v2.tauri.app/start/prerequisites/)。
+当前内嵌后端沿用仓库的 Unix 运行时依赖，已验证 macOS；Windows 还需要后端适配。
+浏览器前端构建只需要 Node.js。
 
 `dev:desktop` 自动启动 Vite，不需要提前运行 `dev`；5173 被占用时会明确报错。
-窗口打开后，也可以在浏览器访问同一开发服务。桌面使用 hash 路由（如
+窗口打开后，也可以在浏览器访问同一开发服务（浏览器仍需独立 API 后端）。桌面使用 hash 路由（如
 `/#/workflows`），浏览器保留 history 路由；浏览器生产部署需将未知页面路径回退到 `index.html`。
 
 原生工程位于 `src-tauri/`，有独立 Cargo workspace / lockfile，避免后端构建引入桌面系统依赖。
 默认桌面产物位于 `src-tauri/target/release/bundle/`（设置 `CARGO_TARGET_DIR` 时随之改变）。
 安装包必须在对应平台构建；对外分发的签名、公证需由发布环境配置。
 
-桌面同样支持下文的 `VITE_FLOW_*`（开发启动前或打包前设置）。如需随安装包携带配置，
-构建前创建 `public/config.json`；它会被打包到应用中。浏览器部署仍可直接替换服务器上的
-`config.json`，已打包桌面的配置文件不会从外部网站自动读取。
+桌面数据默认存放在 Tauri 应用数据目录（macOS 为
+`~/Library/Application Support/com.flow.workflow.desktop/`），普通工作流保存在 `flow/`，
+JSONL 工作区保存在独立的 `journal/`，不会混用两套数据。需要隔离开发数据时，在启动前
+设置 `FLOW_DESKTOP_DATA_DIR=/绝对路径`。桌面不会自动导入原服务器数据目录。
 
-例如连接远程服务：
+应用启动会恢复本地运行并启动定时调度；退出时停止订阅、HTTP 和调度任务，关闭 Journal
+并回收后端运行时。未完成的运行按现有后端恢复规则在下次启动处理，退出不会将它们标为取消。
+同一数据目录的第二个实例会拒绝启动，避免多个进程同时写入。
 
-```bash
-VITE_FLOW_RPC=wss://flow.example.com VITE_FLOW_HTTP=https://hooks.example.com npm run dev:desktop
-```
+webhook 仍需接收 HTTP 请求，桌面仅在 `127.0.0.1` 随机端口开放此入口，触发器页面展示
+实际地址（每次启动可能变化）。JSONL 工作区在桌面直接打开本地数据，无需地址和令牌；
+完整值下载走原生保存对话框和 Rust 流式写入。浏览器下载仍使用 `showSaveFilePicker`，
+不支持该 API 时提示使用 CLI。
 
-Journal 的完整值下载仍依赖 `showSaveFilePicker`；不支持该 API 的 WebView / 浏览器
-会显示原有的 CLI 下载提示。其他 RPC 操作共用现有实现。
+传输适配位于 `src/rpc/`，内嵌服务和 Tauri 命令位于 `src-tauri/src/`。桌面始终使用
+本地服务；以下 `config.json` 和 `VITE_FLOW_*` 地址设置仅作用于浏览器。
 
-flow-server 地址可用环境变量覆盖（需在 vite 启动前设置）：
+浏览器 flow-server 地址可用环境变量覆盖（需在 vite 启动前设置）：
 
 ```bash
 VITE_FLOW_RPC=ws://127.0.0.1:9800 npm run dev      # JSON-RPC WebSocket
@@ -90,6 +101,7 @@ npm run build    # vue-tsc --noEmit && vite build
 npm run lint     # ESLint 9 flat config（typescript-eslint + eslint-plugin-vue）
 npm run format   # Prettier
 npm test         # vitest（monitor 事件流、toast、RPC 客户端、undo/redo、预校验、复制粘贴、分页合并、仪表盘聚合）
+cargo test --manifest-path src-tauri/Cargo.toml # 内嵌运行、订阅、持久化与会话清理
 npm run test:e2e # Playwright e2e（首次需 npx playwright install chromium）
 ```
 

@@ -4,6 +4,9 @@
  * 启动时由 main.ts 拉取一次（无配置文件时静默回落）；解析在首次使用时惰性发生。
  */
 
+import { invoke } from "@tauri-apps/api/core";
+import { isDesktop } from "./platform";
+
 export interface RuntimeConfig {
   rpcUrl?: string;
   httpUrl?: string;
@@ -12,6 +15,10 @@ export interface RuntimeConfig {
 let runtime: RuntimeConfig = {};
 
 export async function loadRuntimeConfig(): Promise<void> {
+  if (isDesktop()) {
+    runtime = await invoke<RuntimeConfig>("flow_info");
+    return;
+  }
   try {
     const r = await fetch("/config.json", { cache: "no-store" });
     if (r.ok) runtime = (await r.json()) as RuntimeConfig;
