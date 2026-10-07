@@ -5,6 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:browser": "vite --open",
+    "dev:desktop": "tauri dev",
+    "build:desktop": "tauri build",
+    "tauri": "tauri",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "lint": "eslint .",
@@ -23,6 +27,7 @@
   "devDependencies": {
     "@eslint/js": "^9.39.5",
     "@playwright/test": "^1.63.0",
+    "@tauri-apps/cli": "^2.12.1",
     "@vitejs/plugin-vue": "^5.2.1",
     "@vue/test-utils": "^2.5.1",
     "eslint": "^9.39.4",

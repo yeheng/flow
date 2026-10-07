@@ -1,6 +1,6 @@
 # flow-web 前端拖拽流程编辑器
 
-Vue 3 + Vite + TypeScript + vue-router，画布基于 @vue-flow/core。直连 flow-server
+Vue 3 + Vite + TypeScript + vue-router + Tauri 2，支持浏览器与桌面应用，画布基于 @vue-flow/core。直连 flow-server
 （JSON-RPC 2.0 over WebSocket），覆盖 编辑 → 保存 → 发布 → 运行 → 实时监控 全流程。
 
 ## 页面结构
@@ -30,6 +30,44 @@ cd web
 npm install
 npm run dev                          # 默认 http://127.0.0.1:5173
 ```
+
+### 浏览器 / 桌面双入口
+
+两种模式共用 `src/`，均连接独立的 `flow-server`；桌面应用不内嵌或自动启动后端。
+
+| 命令（在 `web/` 下执行） | 用途 |
+| --- | --- |
+| `npm run dev:browser` | 启动 Vite 并打开浏览器 |
+| `npm run dev:desktop` | 启动 Vite 并打开 Tauri 桌面窗口 |
+| `npm run build` | 浏览器静态产物 `dist/` |
+| `npm run preview` | 本地预览浏览器构建 |
+| `npm run build:desktop` | 构建当前平台的桌面安装包 |
+| `npm run build:desktop -- --bundles app` | macOS 仅生成 `.app`，跳过 DMG |
+
+桌面开发需要 Rust stable 与平台构建依赖：macOS 安装 Xcode Command Line Tools；
+Windows 安装 MSVC C++ Build Tools 和 WebView2；Linux 安装 WebKitGTK 4.1 等
+[Tauri 系统依赖](https://v2.tauri.app/start/prerequisites/)。浏览器模式只需要 Node.js。
+
+`dev:desktop` 自动启动 Vite，不需要提前运行 `dev`；5173 被占用时会明确报错。
+窗口打开后，也可以在浏览器访问同一开发服务。桌面使用 hash 路由（如
+`/#/workflows`），浏览器保留 history 路由；浏览器生产部署需将未知页面路径回退到 `index.html`。
+
+原生工程位于 `src-tauri/`，有独立 Cargo workspace / lockfile，避免后端构建引入桌面系统依赖。
+默认桌面产物位于 `src-tauri/target/release/bundle/`（设置 `CARGO_TARGET_DIR` 时随之改变）。
+安装包必须在对应平台构建；对外分发的签名、公证需由发布环境配置。
+
+桌面同样支持下文的 `VITE_FLOW_*`（开发启动前或打包前设置）。如需随安装包携带配置，
+构建前创建 `public/config.json`；它会被打包到应用中。浏览器部署仍可直接替换服务器上的
+`config.json`，已打包桌面的配置文件不会从外部网站自动读取。
+
+例如连接远程服务：
+
+```bash
+VITE_FLOW_RPC=wss://flow.example.com VITE_FLOW_HTTP=https://hooks.example.com npm run dev:desktop
+```
+
+Journal 的完整值下载仍依赖 `showSaveFilePicker`；不支持该 API 的 WebView / 浏览器
+会显示原有的 CLI 下载提示。其他 RPC 操作共用现有实现。
 
 flow-server 地址可用环境变量覆盖（需在 vite 启动前设置）：
 

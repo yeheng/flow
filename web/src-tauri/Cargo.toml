@@ -1,0 +1,15 @@
+[package]
+name = "flow-desktop"
+version = "0.1.0"
+description = "Flow desktop workflow editor"
+edition = "2021"
+
+# The desktop shell has its own lockfile and platform dependencies.
+# Backend-only workspace builds must not require a WebView toolchain.
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
