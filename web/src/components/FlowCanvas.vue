@@ -13,6 +13,7 @@ import {
   onConnect,
   addNode,
 } from "../state/editor";
+import { insertTemplate } from "../state/templates";
 import { beginDrag, commit, endDrag } from "../state/history";
 import { monitor } from "../state/monitor";
 import FlowNode from "./FlowNode.vue";
@@ -24,9 +25,16 @@ const defaultEdgeOptions = {
 };
 
 function onDrop(event: DragEvent): void {
+  const point = screenToFlowCoordinate({ x: event.clientX, y: event.clientY });
+  // 模板拖放优先：整段片段按落点插入
+  const templateId = event.dataTransfer?.getData("application/flow-template-id");
+  if (templateId) {
+    void insertTemplate(templateId, point);
+    return;
+  }
   const type = event.dataTransfer?.getData("application/flow-node-type");
   if (!type) return;
-  addNode(type, screenToFlowCoordinate({ x: event.clientX, y: event.clientY }));
+  addNode(type, point);
 }
 
 function onNodeClick(e: NodeMouseEvent): void {

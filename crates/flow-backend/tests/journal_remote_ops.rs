@@ -208,7 +208,7 @@ async fn slots_bound_enforces_serial_dispatch() {
             let release = server_release.clone();
             jobs.spawn(async move {
                 let mut request = [0; 4096];
-                socket.read(&mut request).await.unwrap();
+                let _ = socket.read(&mut request).await.unwrap();
                 entered.send(()).await.unwrap();
                 release.acquire().await.unwrap().forget();
                 socket

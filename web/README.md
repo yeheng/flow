@@ -94,6 +94,26 @@ VITE_FLOW_HTTP=http://127.0.0.1:9801 npm run dev   # webhook HTTP 入口（触�
 { "rpcUrl": "wss://flow-server.example.com", "httpUrl": "https://flow-hooks.example.com" }
 ```
 
+## 设置页与统一配置
+
+「设置」页（`/#/settings`）分两块：
+
+- **统一配置**：读写服务端 `flow.toml`（分层：CLI `--config` > 环境变量 > 配置文件
+  > 内置默认值；示例见仓库根 `flow.config.example.toml`）。修改**重启后生效**，
+  页面会标注哪些分区仍被环境变量覆盖（如 `FLOW_ADDR`）。`database_url` 只写不读
+  （回显为「已设置」），清除需显式清空保存。桌面端隐藏服务器地址类分区（内嵌
+  服务无网络监听），桌面配置文件位于应用数据目录 `flow.toml`；
+- **密钥**：工作流 x-secret 参数引用的密钥可在此增删（AES-GCM 加密落盘于数据
+  目录 `secrets.json` + 主密钥 `secret.key`，值永不出服务端）。执行时优先用这里
+  的密钥，其次回落 `FLOW_SECRET_*` 环境变量；来自环境变量的密钥只能显示、不能删。
+
+## 可复用节点模板
+
+编辑器左侧面板底部是「模板」区：选中若干节点（内部连线一起）→「存为模板」→
+在任意流程中点击或拖拽模板插入（id 重生成、按 max_instances 检查、入 undo 栈）。
+模板持久化在服务端 `node_templates` 表，跨流程、跨设备可用；完整子流程复用仍
+建议用 `sub_workflow` 节点（可钻取、run 溯源）。
+
 ## 工程化
 
 ```bash

@@ -712,7 +712,10 @@ impl Definition {
 /// 下面 match 只放**无法表达在 `required` 里的规则**：枚举白名单、类型约束、
 /// 「`${}` 模板放行到执行期判定」。纯参数类型（start/end/human_task）没有
 /// 额外规则，`required` 为空即通过——新增这类类型不用碰这个函数。
-fn validate_params(node: &Node, kind: NodeType) -> Result<(), String> {
+///
+/// `pub`：整图校验（`validate`）与节点模板的**逐节点**校验共用这一份——
+/// 模板片段不是完整 Definition，不能跑整图规则，但参数规则必须同源。
+pub fn validate_params(node: &Node, kind: NodeType) -> Result<(), String> {
     for key in kind.required_params() {
         // `${}` 模板放行到执行期判定（DESIGN §5 规则 1）：展开后才知道是不是
         // 整数/非空串，建图期一律认它「填了」。先判模板再判类型，顺序反了会把

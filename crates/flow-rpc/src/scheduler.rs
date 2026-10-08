@@ -19,10 +19,11 @@ use flow_backend::{AnyBackend, BackendError, CreateRun, Schedule};
 
 pub const TICK_INTERVAL: Duration = Duration::from_secs(20);
 
-/// main 启动的后台任务（FLOW_SCHEDULER=off 时不调用）。interval 首次立即触发：
-/// 开机先补一轮到期的火。
-pub async fn run(backend: AnyBackend) -> ! {
-    let mut tick = tokio::time::interval(TICK_INTERVAL);
+/// main 启动的后台任务（config.server.scheduler_enabled=false 时不调用）。
+/// tick 可由 `[server].scheduler_tick_secs` 覆盖（缺省 [`TICK_INTERVAL`]）；
+/// interval 首次立即触发：开机先补一轮到期的火。
+pub async fn run(backend: AnyBackend, tick: Duration) -> ! {
+    let mut tick = tokio::time::interval(tick);
     loop {
         tick.tick().await;
         fire_due(&backend, Local::now()).await;

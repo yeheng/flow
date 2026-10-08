@@ -908,7 +908,7 @@ async fn oversized_http_capture_is_uncertain_without_resend() {
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut request = [0; 4096];
-        socket.read(&mut request).await.unwrap();
+        let _ = socket.read(&mut request).await.unwrap();
         let head = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
             flow_journal::MAX_VALUE_BYTES + 1

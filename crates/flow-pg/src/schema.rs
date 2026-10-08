@@ -205,6 +205,21 @@ pub async fn init(pool: &PgPool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // 可复用节点模板：与 SQLite 后端同构（name UNIQUE，nodes/edges JSONB）。
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS node_templates (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            category TEXT,
+            nodes JSONB NOT NULL,
+            edges JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+        )",
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
 }
 

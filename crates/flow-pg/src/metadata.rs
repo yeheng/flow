@@ -12,8 +12,8 @@ use uuid::Uuid;
 
 use crate::error::PgError;
 pub use flow_dto::{
-    RunRecord, RunStats, Schedule, Webhook, WorkflowRunStats, WorkflowSummary, WorkflowVersion,
-    STATUS_DRAFT, STATUS_PUBLISHED,
+    NodeTemplate, NodeTemplateSummary, RunRecord, RunStats, Schedule, Webhook, WorkflowRunStats,
+    WorkflowSummary, WorkflowVersion, STATUS_DRAFT, STATUS_PUBLISHED,
 };
 
 /// 定义与 run 元数据的存储。执行事件在 run_events，租约在 runs 行内。
@@ -468,6 +468,156 @@ impl PgStore {
         Ok(())
     }
 
+    // ---- 可复用节点模板（node_templates 表，与 SQLite 后端同构） ----
+
+    pub async fn create_template(
+        &self,
+        name: &str,
+        category: Option<&str>,
+        nodes: &serde_json::Value,
+        edges: &serde_json::Value,
+    ) -> Result<NodeTemplate, PgError> {
+        let id = Uuid::now_v7().to_string();
+        let row =
+            sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>(
+                "INSERT INTO node_templates (id, name, category, nodes, edges)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING created_at, updated_at",
+            )
+            .bind(&id)
+            .bind(name)
+            .bind(category)
+            .bind(nodes)
+            .bind(edges)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|err| map_template_conflict(err, name))?;
+        Ok(NodeTemplate {
+            id,
+            name: name.to_string(),
+            category: category.map(str::to_string),
+            nodes: nodes.clone(),
+            edges: edges.clone(),
+            created_at: row.0,
+            updated_at: row.1,
+        })
+    }
+
+    pub async fn list_template_summaries(&self) -> Result<Vec<NodeTemplateSummary>, PgError> {
+        let rows = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                Option<String>,
+                i64,
+                chrono::DateTime<chrono::Utc>,
+                chrono::DateTime<chrono::Utc>,
+            ),
+        >(
+            "SELECT id, name, category, jsonb_array_length(nodes) AS node_count,
+                    created_at, updated_at
+             FROM node_templates ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, name, category, node_count, created_at, updated_at)| NodeTemplateSummary {
+                    id,
+                    name,
+                    category,
+                    node_count,
+                    created_at,
+                    updated_at,
+                },
+            )
+            .collect())
+    }
+
+    pub async fn get_template(&self, id: &str) -> Result<NodeTemplate, PgError> {
+        let row = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                Option<String>,
+                serde_json::Value,
+                serde_json::Value,
+                chrono::DateTime<chrono::Utc>,
+                chrono::DateTime<chrono::Utc>,
+            ),
+        >(
+            "SELECT id, name, category, nodes, edges, created_at, updated_at
+             FROM node_templates WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| PgError::TemplateNotFound(id.to_string()))?;
+        Ok(NodeTemplate {
+            id: row.0,
+            name: row.1,
+            category: row.2,
+            nodes: row.3,
+            edges: row.4,
+            created_at: row.5,
+            updated_at: row.6,
+        })
+    }
+
+    pub async fn update_template(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        category: Option<Option<&str>>,
+        nodes: Option<&serde_json::Value>,
+        edges: Option<&serde_json::Value>,
+    ) -> Result<NodeTemplate, PgError> {
+        let existing = self.get_template(id).await?;
+        let name = name.unwrap_or(&existing.name);
+        let category = match category {
+            Some(Some(c)) => Some(c),
+            Some(None) => None,
+            None => existing.category.as_deref(),
+        };
+        let nodes = nodes.unwrap_or(&existing.nodes);
+        let edges = edges.unwrap_or(&existing.edges);
+        let updated_at = sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+            "UPDATE node_templates
+             SET name = $1, category = $2, nodes = $3, edges = $4, updated_at = clock_timestamp()
+             WHERE id = $5
+             RETURNING updated_at",
+        )
+        .bind(name)
+        .bind(category)
+        .bind(nodes)
+        .bind(edges)
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|err| map_template_conflict(err, name))?;
+        Ok(NodeTemplate {
+            id: id.to_string(),
+            name: name.to_string(),
+            category: category.map(str::to_string),
+            nodes: nodes.clone(),
+            edges: edges.clone(),
+            created_at: existing.created_at,
+            updated_at,
+        })
+    }
+
+    pub async fn delete_template(&self, id: &str) -> Result<bool, PgError> {
+        let affected = sqlx::query("DELETE FROM node_templates WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(affected > 0)
+    }
+
     pub async fn get_run(&self, run_id: &str) -> Result<RunRecord, PgError> {
         let rec = sqlx::query(
             "SELECT id, workflow_id, workflow_version, status, input, output, error,
@@ -650,6 +800,18 @@ fn webhook_from_row(rec: sqlx::postgres::PgRow) -> Result<Webhook, PgError> {
         enabled: rec.try_get("enabled")?,
         created_at: rec.try_get("created_at")?,
     })
+}
+
+/// UNIQUE 冲突（模板重名）映射为专用错误，其余原样。
+fn map_template_conflict(err: sqlx::Error, name: &str) -> PgError {
+    if err
+        .as_database_error()
+        .is_some_and(|e| e.is_unique_violation())
+    {
+        PgError::TemplateNameTaken(name.to_string())
+    } else {
+        err.into()
+    }
 }
 
 fn version_from_row(rec: sqlx::postgres::PgRow) -> Result<WorkflowVersion, PgError> {

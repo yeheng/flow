@@ -1,0 +1,81 @@
+# flow 统一配置示例。复制为 flow.toml（搜索顺序：--config / FLOW_CONFIG 显式路径
+# → ./flow.toml → 平台配置目录 flow/flow.toml），或放到 flow-server 工作目录。
+# 分层：CLI 参数 > 环境变量（FLOW_* 全部保留）> 本文件 > 内置默认值。
+# 本文件列出的是**非默认值或常用项**；全部字段见 crates/flow-config/src/lib.rs。
+# Web 设置页（/settings）保存时整文件重写，手工注释不会保留。
+
+[server]
+# JSON-RPC over WebSocket（原 FLOW_ADDR）
+rpc_addr = "127.0.0.1:9800"
+# webhook HTTP（原 FLOW_HTTP_ADDR）
+http_addr = "127.0.0.1:9801"
+# cron 调度器开关（原 FLOW_SCHEDULER=off）
+scheduler_enabled = true
+scheduler_tick_secs = 20
+journal_trigger_tick_secs = 20
+
+[storage]
+# sqlite（缺省，canonical）| postgres（多节点）
+backend = "sqlite"
+# 数据目录（原 FLOW_DATA_DIR；SQLite 模式的事件日志、密钥都在这里）
+data_dir = "data"
+# SQLite 库文件显式路径（原 FLOW_DB）；注释掉 = <data_dir>/flow.db
+# database = "/var/lib/flow/flow.db"
+# backend = "postgres" 时必填（原 FLOW_DATABASE_URL；Web 设置页不回显已设值）
+# database_url = "postgres://user:pass@db:5432/flow"
+
+[execution]
+# in_process（缺省）| ipc（本机执行器子进程）| remote（远程 agent）
+mode = "in_process"
+# 执行器二进制（原 FLOW_EXECUTOR_BIN）；注释掉 = 自召唤 flow executor
+# executor_bin = "/usr/local/bin/flow-executor"
+# IPC 执行槽位（1..=16）
+x_max = 4
+
+# mode = "remote" 时必填（原 FLOW_REMOTE_* 五件套 + 超时）
+# [execution.remote]
+# control_addr = "10.0.0.8:9700"
+# data_addr = "10.0.0.8:9701"
+# ca_cert = "/etc/flow/ca.pem"
+# cert = "/etc/flow/server.pem"
+# key = "/etc/flow/server.key"
+# attach_timeout_ms = 120000
+
+# `flow agent` 的部署参数（原先只能 CLI 参数 / 环境变量；CLI flag 仍可逐项覆盖）
+# [agent]
+# control_addr = "10.0.0.8:9700"
+# data_addr = "10.0.0.8:9701"
+# agent_id = "agent-1"
+# ca_cert = "/etc/flow/ca.pem"
+# cert = "/etc/flow/agent-1.pem"
+# key = "/etc/flow/agent-1.key"
+# executor_bin = "/usr/local/bin/flow-executor"
+# slots = 4
+
+# `flow journal-server`（JSONL v2 开发服务）；token 仍是环境变量 FLOW_JOURNAL_TOKEN（凭据不进配置文件）
+# [journal]
+# addr = "127.0.0.1:9802"
+# http_addr = "127.0.0.1:9803"
+# data_dir = "/var/lib/flow/journal"
+
+# Postgres 后端调优（原 FLOW_ROLE / FLOW_*_MS 等 11 个环境变量；正式部署按数据库延迟实测调整）
+# [pg]
+# role = "all"                # all | gateway | executor
+# lease_ttl_ms = 30000
+# scan_interval_ms = 1000
+# inbox_poll_ms = 200
+# max_runs = 8
+# signal_wait_ms = 10000
+# signal_poll_ms = 200
+# subscribe_poll_ms = 10000
+# statement_timeout_ms = 10000
+# lock_timeout_ms = 10000
+# idle_tx_timeout_ms = 10000
+# max_connections = 16
+
+# 明确**不进配置文件**的配置（保持现状）：
+# - RUST_LOG（tracing env-filter 惯例）
+# - FLOW_SECRET_*（密钥，Web 设置页可管理；执行时 stored 优先、env 兜底）
+# - FLOW_JOURNAL_TOKEN（每工作区凭据，仅环境变量）
+# - 执行协议常量（帧上限/超时族，crates/flow-engine/src/execution_protocol/contract.rs，改即协议变更）
+# - FLOW_RUN_LOG_BUDGET 等 engine 内部预算（读取点在 driver 深处，维持环境变量）

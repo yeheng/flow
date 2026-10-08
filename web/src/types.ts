@@ -151,6 +151,133 @@ export interface WorkflowRunStats {
   by_status: Record<string, number>;
 }
 
+/** 节点片段（模板与剪贴板共用形状）：与 DefinitionNode 相似但 id 必填、position 可选 */
+export interface FragmentNode {
+  id: string;
+  type: string;
+  name: string;
+  position?: Position;
+  params: Record<string, unknown>;
+}
+
+/** 片段内部边（vue-flow 句柄语义：sourceHandle 默认 "out"，targetHandle 默认 "in"） */
+export interface FragmentEdge {
+  source: string;
+  target: string;
+  sourceHandle?: string | null;
+  targetHandle?: string | null;
+}
+
+/** 可复用节点模板（crates/flow-dto/src/lib.rs NodeTemplate） */
+export interface NodeTemplate {
+  id: string;
+  name: string;
+  category: string | null;
+  nodes: FragmentNode[];
+  edges: FragmentEdge[];
+  created_at: string;
+  updated_at: string;
+}
+
+/** template.list 条目：不含片段载荷（按需走 template.get） */
+export interface NodeTemplateSummary {
+  id: string;
+  name: string;
+  category: string | null;
+  node_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** 密钥清单条目：source=stored（界面管理，可删）| env（进程环境变量） */
+export interface SecretInfo {
+  name: string;
+  source: "stored" | "env";
+}
+
+// ---- 统一配置（crates/flow-config/src/lib.rs Config；分区形状对齐） ----
+
+export interface ServerConfig {
+  rpc_addr: string;
+  http_addr: string;
+  scheduler_enabled: boolean;
+  scheduler_tick_secs: number;
+  journal_trigger_tick_secs: number;
+}
+
+export interface StorageConfig {
+  backend: "sqlite" | "postgres";
+  data_dir: string;
+  database: string | null;
+  /** config.get 里已设置为 "<set>"（脱敏）；update 传 "<set>" 表示保持原值 */
+  database_url: string | null;
+}
+
+export interface RemoteExecutionConfig {
+  control_addr: string;
+  data_addr: string;
+  ca_cert: string;
+  cert: string;
+  key: string;
+  attach_timeout_ms: number;
+}
+
+export interface ExecutionConfig {
+  mode: "in_process" | "ipc" | "remote";
+  executor_bin: string | null;
+  x_max: number;
+  remote: RemoteExecutionConfig | null;
+}
+
+export interface AgentConfig {
+  control_addr: string | null;
+  data_addr: string | null;
+  agent_id: string | null;
+  ca_cert: string | null;
+  cert: string | null;
+  key: string | null;
+  executor_bin: string | null;
+  slots: number;
+}
+
+export interface JournalConfig {
+  addr: string;
+  http_addr: string;
+  data_dir: string | null;
+}
+
+export interface PgTuning {
+  role: string;
+  lease_ttl_ms: number;
+  scan_interval_ms: number;
+  inbox_poll_ms: number;
+  max_runs: number;
+  signal_wait_ms: number;
+  signal_poll_ms: number;
+  subscribe_poll_ms: number;
+  statement_timeout_ms: number;
+  lock_timeout_ms: number;
+  idle_tx_timeout_ms: number;
+  max_connections: number;
+}
+
+export interface FlowConfig {
+  server: ServerConfig;
+  storage: StorageConfig;
+  execution: ExecutionConfig;
+  agent: AgentConfig;
+  journal: JournalConfig;
+  pg: PgTuning;
+}
+
+/** config.get / config.update 的响应 */
+export interface ConfigView {
+  config: FlowConfig;
+  config_path: string | null;
+  /** 启动时生效的环境变量覆盖名单（仅名称）；这些项在重启后仍会覆盖文件 */
+  env_overrides: string[];
+}
+
 export type NodeRunState = "pending" | "running" | "retrying" | "completed" | "failed" | "skipped";
 
 /** run.timeline 节点条目（crates/flow-rpc/src/lib.rs timeline_value） */

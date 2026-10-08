@@ -819,7 +819,8 @@ pub fn number(v: &Value, key: &str) -> Result<u64> {
 }
 
 pub fn validate_definition(value: &Value) -> Result<Definition> {
-    let definition: Definition = serde_json::from_value(value.clone())?;
+    let definition: Definition = serde_json::from_value(value.clone())
+        .map_err(|e| invalid(format!("definition 结构不符：{e}")))?;
     definition.validate().map_err(|e| invalid(e.to_string()))?;
     Ok(definition)
 }

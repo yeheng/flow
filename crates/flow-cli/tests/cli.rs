@@ -40,7 +40,7 @@ impl TestServer {
             .expect("打开 SQLite 后端失败");
         let backend = AnyBackend::Sqlite(std::sync::Arc::new(backend));
         backend.start().await.expect("后端启动失败");
-        let state = std::sync::Arc::new(AppState { backend });
+        let state = std::sync::Arc::new(AppState::new(backend));
         let (handle, addr) = serve(state, SocketAddr::from(([127, 0, 0, 1], 0)))
             .await
             .expect("启动 RPC 服务失败");

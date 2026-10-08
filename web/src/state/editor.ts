@@ -180,11 +180,17 @@ export async function ensureSecrets(): Promise<boolean> {
 
 async function loadSecrets(): Promise<boolean> {
   try {
-    editor.secrets = await api.listSecrets();
+    editor.secrets = (await api.listSecrets()).map((s) => s.name);
     return true;
   } catch {
     return false;
   }
+}
+
+/** 密钥增删后调用（设置页）：立刻重拉候选清单并解除幂等缓存 */
+export async function refreshSecrets(): Promise<void> {
+  editor.secrets = [];
+  await loadSecrets();
 }
 
 client.onReconnect(() => {
@@ -542,9 +548,10 @@ export async function jumpToBreadcrumb(index: number): Promise<void> {
   }
 }
 
-// ---- 复制 / 粘贴（内存剪贴板） ----
+// ---- 复制 / 粘贴 / 模板插入（共享同一套片段落地逻辑） ----
 
-interface ClipboardNode {
+/** 片段形状：剪贴板与节点模板（服务端 NodeTemplate 的 nodes/edges）共用 */
+export interface ClipboardNode {
   id: string;
   type: string;
   name: string;
@@ -552,7 +559,7 @@ interface ClipboardNode {
   position: Position;
 }
 
-interface ClipboardEdge {
+export interface ClipboardEdge {
   source: string;
   target: string;
   sourceHandle?: string | null;
@@ -589,15 +596,30 @@ export function copySelection(): boolean {
   return true;
 }
 
-/** 粘贴：重新生成节点 id、位置按粘贴序号偏移 32px、内部边重连到新 id；外部边本就不在剪贴板里 */
-export function pasteClipboard(): boolean {
-  if (!clipboard || clipboard.nodes.length === 0) return false;
-  const offset = 32 * (pasteSerial + 1);
+export interface InsertOptions {
+  /** 落点偏移（px）。缺省用剪贴板的连续粘贴序号偏移。 */
+  offset?: Position;
+  /** 插入后是否选中新节点（默认选中，粘贴/模板插入的行为一致） */
+  selected?: boolean;
+}
+
+/**
+ * 片段落地：重新生成节点 id、按 offset 平移、内部边重连到新 id、尊重
+ * max_instances。粘贴与模板插入共用这一份——差异只在片段来源与偏移。
+ * 返回是否插入了任何节点（全部撞上限时为 false）。
+ */
+export function insertFragment(
+  nodes: ClipboardNode[],
+  edges: ClipboardEdge[],
+  opts: InsertOptions = {},
+): boolean {
+  if (nodes.length === 0) return false;
+  const offset = opts.offset ?? { x: 32 * (pasteSerial + 1), y: 32 * (pasteSerial + 1) };
   const idMap = new Map<string, string>();
   const newNodes: EditorNode[] = [];
   let skipped = 0;
-  for (const cn of clipboard.nodes) {
-    // 未知类型同样用占位描述粘贴：复制粘贴是内存往返，params 不能丢
+  for (const cn of nodes) {
+    // 未知类型同样用占位描述插入：params 不能丢，旧前端渲染新类型不白屏
     const desc = nodeTypeDesc(cn.type) ?? unknownTypeDesc(cn.type);
     const max = desc.max_instances ?? 0;
     const count =
@@ -616,24 +638,27 @@ export function pasteClipboard(): boolean {
     }
     const id = `${cn.type}_${seq}`;
     idMap.set(cn.id, id);
+    const selected = opts.selected ?? true;
     newNodes.push({
       id,
       type: "flow",
-      position: { x: cn.position.x + offset, y: cn.position.y + offset },
+      position: { x: cn.position.x + offset.x, y: cn.position.y + offset.y },
       data: { name: cn.name, nodeType: desc, params: JSON.parse(JSON.stringify(cn.params)) },
-      selected: true,
+      selected,
     });
   }
   if (newNodes.length === 0) {
-    if (skipped > 0) toast.info(`${skipped} 个节点因数量上限未粘贴`);
+    if (skipped > 0) toast.info(`${skipped} 个节点因数量上限未插入`);
     return false;
   }
   commit();
   pasteSerial++;
-  // 选中粘贴结果，取消旧选择
-  for (const n of editor.nodes) n.selected = false;
+  // 选中插入结果，取消旧选择（selected=false 时不动选择态）
+  if ((opts.selected ?? true) === true) {
+    for (const n of editor.nodes) n.selected = false;
+  }
   editor.nodes.push(...newNodes);
-  for (const ce of clipboard.edges) {
+  for (const ce of edges) {
     const source = idMap.get(ce.source);
     const target = idMap.get(ce.target);
     if (!source || !target) continue;
@@ -649,8 +674,14 @@ export function pasteClipboard(): boolean {
       ),
     });
   }
-  if (skipped > 0) toast.info(`${skipped} 个节点因数量上限未粘贴`);
+  if (skipped > 0) toast.info(`${skipped} 个节点因数量上限未插入`);
   return true;
+}
+
+/** 粘贴：偏移按连续粘贴序号递增（同一份片段越粘越远，不叠在一起） */
+export function pasteClipboard(): boolean {
+  if (!clipboard) return false;
+  return insertFragment(clipboard.nodes, clipboard.edges);
 }
 
 // ---- 自动布局 ----

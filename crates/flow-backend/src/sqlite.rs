@@ -25,8 +25,9 @@ use flow_store::{Store, StoreError};
 
 use crate::child::LocalChildLauncher;
 use crate::{
-    resolve_runnable_definition, BackendError, CreateRun, CreatedRun, RunRecord, RunStats,
-    Schedule, SignalAck, SignalRequest, Webhook, WorkflowSummary, WorkflowVersion,
+    resolve_runnable_definition, BackendError, CreateRun, CreatedRun, NodeTemplate,
+    NodeTemplateSummary, RunRecord, RunStats, Schedule, SignalAck, SignalRequest, Webhook,
+    WorkflowSummary, WorkflowVersion,
 };
 
 /// 把引擎的 run 状态变化落到 runs 表。引擎本身不依赖存储实现，适配在 SQLite
@@ -149,6 +150,50 @@ impl SqliteBackend {
 
     pub fn name(&self) -> &'static str {
         "sqlite"
+    }
+
+    // ---- 可复用节点模板（store 直通） ----
+
+    pub async fn template_create(
+        &self,
+        name: &str,
+        category: Option<&str>,
+        nodes: &Value,
+        edges: &Value,
+    ) -> Result<NodeTemplate, BackendError> {
+        self.store
+            .create_template(name, category, nodes, edges)
+            .await
+            .map_err(sqlite_err)
+    }
+
+    pub async fn template_list(&self) -> Result<Vec<NodeTemplateSummary>, BackendError> {
+        self.store
+            .list_template_summaries()
+            .await
+            .map_err(sqlite_err)
+    }
+
+    pub async fn template_get(&self, id: &str) -> Result<NodeTemplate, BackendError> {
+        self.store.get_template(id).await.map_err(sqlite_err)
+    }
+
+    pub async fn template_update(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        category: Option<Option<&str>>,
+        nodes: Option<&Value>,
+        edges: Option<&Value>,
+    ) -> Result<NodeTemplate, BackendError> {
+        self.store
+            .update_template(id, name, category, nodes, edges)
+            .await
+            .map_err(sqlite_err)
+    }
+
+    pub async fn template_delete(&self, id: &str) -> Result<bool, BackendError> {
+        self.store.delete_template(id).await.map_err(sqlite_err)
     }
 
     pub fn describe(&self) -> String {
@@ -543,6 +588,8 @@ fn sqlite_err(err: StoreError) -> BackendError {
         StoreError::RunNotFound(id) => BackendError::RunNotFound(id),
         StoreError::ScheduleNotFound(id) => BackendError::ScheduleNotFound(id),
         StoreError::WebhookNotFound(token) => BackendError::WebhookNotFound(token),
+        StoreError::TemplateNotFound(id) => BackendError::TemplateNotFound(id),
+        StoreError::TemplateNameTaken(name) => BackendError::TemplateNameTaken(name),
         StoreError::Conflict(msg) => BackendError::Conflict(msg),
         StoreError::InvalidStatus(s) => BackendError::Internal(format!("非法的 run 状态：{s}")),
         StoreError::InvalidSource(s) => BackendError::Internal(format!("非法的 run 来源：{s}")),

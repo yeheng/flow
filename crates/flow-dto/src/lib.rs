@@ -278,6 +278,35 @@ pub struct SignalAck {
     pub error: Option<Value>,
 }
 
+/// 可复用节点模板（node_templates 表）：画布片段（节点 + 内部边）+ 命名信封。
+/// 片段**不是完整 Definition**——不走整图校验（`Definition::validate`），只在
+/// 保存/读取时做逐节点参数校验；因此 start/end 节点可含可不含。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeTemplate {
+    pub id: String,
+    /// 人类可读名，唯一（UI 里的键）。
+    pub name: String,
+    /// 面板分组标签（可空；空 = 通用）。
+    pub category: Option<String>,
+    /// 片段节点：[{id, type, name, position, params}]
+    pub nodes: Value,
+    /// 片段内部边：[{source, target, sourceHandle, targetHandle}]
+    pub edges: Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// template.list 的条目：不含节点/边载荷（payload 走 template.get 按需取）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeTemplateSummary {
+    pub id: String,
+    pub name: String,
+    pub category: Option<String>,
+    pub node_count: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -15,6 +15,7 @@ const connected = computed(() => client.connected.value);
       <RouterLink to="/workflows">工作流</RouterLink>
       <RouterLink to="/runs">运行记录</RouterLink>
       <RouterLink to="/journal">JSONL 工作区</RouterLink>
+      <RouterLink to="/settings">设置</RouterLink>
     </nav>
     <span class="conn" :class="{ ok: connected }">
       {{ connected ? "已连接" : "未连接" }} {{ client.url }}

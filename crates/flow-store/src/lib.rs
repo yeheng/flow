@@ -13,8 +13,8 @@ use chrono::{DateTime, Utc};
 // 领域 DTO 与状态词汇表的单一来源在 flow-dto；本 crate 不再维护第二份拷贝。
 // 写入口经 ensure_run_status 用 DbRunStatus 校验，不复制常量列表。
 pub use flow_dto::{
-    DbRunSource, DbRunStatus, RunRecord, RunStats, Schedule, Webhook, WorkflowRunStats,
-    WorkflowSummary, WorkflowVersion, STATUS_DRAFT, STATUS_PUBLISHED,
+    DbRunSource, DbRunStatus, NodeTemplate, NodeTemplateSummary, RunRecord, RunStats, Schedule,
+    Webhook, WorkflowRunStats, WorkflowSummary, WorkflowVersion, STATUS_DRAFT, STATUS_PUBLISHED,
 };
 
 fn ensure_run_status(status: &str) -> Result<(), StoreError> {
@@ -61,6 +61,10 @@ pub enum StoreError {
     InvalidTimestamp(String),
     #[error("json 错误：{0}")]
     Json(#[from] serde_json::Error),
+    #[error("节点模板不存在：{0}")]
+    TemplateNotFound(String),
+    #[error("模板名已存在：{0}")]
+    TemplateNameTaken(String),
 }
 
 /// 定义与 run 元数据的存储。执行状态不在这里——那是 event.jsonl 的事。
@@ -204,6 +208,22 @@ impl Store {
                 enabled INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (workflow_id) REFERENCES workflows(id) ON DELETE CASCADE
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // 可复用节点模板：画布片段（节点 + 内部边 JSON）+ 命名信封。
+        // name UNIQUE——UI 以名为键；冲突即拒绝（不静默改名）。
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS node_templates (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                category TEXT,
+                nodes TEXT NOT NULL,
+                edges TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             )",
         )
         .execute(&self.pool)
@@ -676,6 +696,149 @@ impl Store {
             enabled: row.try_get::<i64, _>("enabled")? != 0,
             created_at: parse_ts(&row.try_get::<String, _>("created_at")?)?,
         })
+    }
+
+    // ---- 可复用节点模板（node_templates 表） ----
+
+    pub async fn create_template(
+        &self,
+        name: &str,
+        category: Option<&str>,
+        nodes: &serde_json::Value,
+        edges: &serde_json::Value,
+    ) -> Result<NodeTemplate, StoreError> {
+        let id = Uuid::now_v7().to_string();
+        let now = Utc::now().to_rfc3339();
+        let nodes_json = serde_json::to_string(nodes)?;
+        let edges_json = serde_json::to_string(edges)?;
+        let result = sqlx::query(
+            "INSERT INTO node_templates (id, name, category, nodes, edges, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(name)
+        .bind(category)
+        .bind(&nodes_json)
+        .bind(&edges_json)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await;
+        Self::map_template_insert(result, name)?;
+        Ok(NodeTemplate {
+            id,
+            name: name.to_string(),
+            category: category.map(str::to_string),
+            nodes: nodes.clone(),
+            edges: edges.clone(),
+            created_at: parse_ts(&now)?,
+            updated_at: parse_ts(&now)?,
+        })
+    }
+
+    pub async fn list_template_summaries(&self) -> Result<Vec<NodeTemplateSummary>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, name, category, json_array_length(nodes) AS node_count, created_at, updated_at
+             FROM node_templates ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(NodeTemplateSummary {
+                    id: row.try_get("id")?,
+                    name: row.try_get("name")?,
+                    category: row.try_get("category")?,
+                    node_count: row.try_get::<i64, _>("node_count")?,
+                    created_at: parse_ts(&row.try_get::<String, _>("created_at")?)?,
+                    updated_at: parse_ts(&row.try_get::<String, _>("updated_at")?)?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn get_template(&self, id: &str) -> Result<NodeTemplate, StoreError> {
+        let row = sqlx::query("SELECT * FROM node_templates WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| StoreError::TemplateNotFound(id.to_string()))?;
+        let nodes: String = row.try_get("nodes")?;
+        let edges: String = row.try_get("edges")?;
+        Ok(NodeTemplate {
+            id: row.try_get("id")?,
+            name: row.try_get("name")?,
+            category: row.try_get("category")?,
+            nodes: serde_json::from_str(&nodes)?,
+            edges: serde_json::from_str(&edges)?,
+            created_at: parse_ts(&row.try_get::<String, _>("created_at")?)?,
+            updated_at: parse_ts(&row.try_get::<String, _>("updated_at")?)?,
+        })
+    }
+
+    /// 部分更新：None 字段保持原值（name/category 的显式清空语义由 RPC 层用
+    /// `""` → NULL 约定表达）。updated_at 总是刷新。
+    pub async fn update_template(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        category: Option<Option<&str>>,
+        nodes: Option<&serde_json::Value>,
+        edges: Option<&serde_json::Value>,
+    ) -> Result<NodeTemplate, StoreError> {
+        // 先确认存在，再逐项拼 SET——字段最多 4 个，不值得动态 SQL 框架
+        let existing = self.get_template(id).await?;
+        let name = name.unwrap_or(&existing.name);
+        let category = match category {
+            Some(Some(c)) => Some(c),
+            Some(None) => None,
+            None => existing.category.as_deref(),
+        };
+        let nodes = nodes.unwrap_or(&existing.nodes);
+        let edges = edges.unwrap_or(&existing.edges);
+        let now = Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE node_templates
+             SET name = ?, category = ?, nodes = ?, edges = ?, updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(name)
+        .bind(category)
+        .bind(serde_json::to_string(nodes)?)
+        .bind(serde_json::to_string(edges)?)
+        .bind(&now)
+        .bind(id)
+        .execute(&self.pool)
+        .await;
+        Self::map_template_insert(result, name)?;
+        self.get_template(id).await
+    }
+
+    pub async fn delete_template(&self, id: &str) -> Result<bool, StoreError> {
+        let affected = sqlx::query("DELETE FROM node_templates WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(affected > 0)
+    }
+
+    /// UNIQUE 冲突（改名撞已有模板）映射为专用错误，其余原样。
+    fn map_template_insert(
+        result: Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>,
+        name: &str,
+    ) -> Result<(), StoreError> {
+        match result {
+            Ok(_) => Ok(()),
+            Err(err)
+                if err
+                    .as_database_error()
+                    .is_some_and(|e| e.is_unique_violation()) =>
+            {
+                Err(StoreError::TemplateNameTaken(name.to_string()))
+            }
+            Err(err) => Err(err.into()),
+        }
     }
 
     fn version_from_row(row: sqlx::sqlite::SqliteRow) -> Result<WorkflowVersion, StoreError> {

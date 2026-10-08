@@ -2,12 +2,19 @@ import { client } from "../rpc/client";
 export { JournalClient, EventWindow } from "./journal";
 import { httpUrl } from "../config";
 import type {
+  ConfigView,
   Definition,
+  FlowConfig,
+  FragmentEdge,
+  FragmentNode,
   NodeTypeDesc,
+  NodeTemplate,
+  NodeTemplateSummary,
   RunEvent,
   RunRecord,
   RunStats,
   Schedule,
+  SecretInfo,
   Timeline,
   VersionMeta,
   Webhook,
@@ -20,10 +27,69 @@ export async function listNodeTypes(): Promise<NodeTypeDesc[]> {
   return r.node_types;
 }
 
-/** secrets.list 只返回密钥名称列表（值不出服务端） */
-export async function listSecrets(): Promise<string[]> {
-  const r = await client.call<{ secrets: string[] }>("secrets.list", {});
+/** secrets.list 返回 {name, source} 清单（值不出服务端；source=stored|env） */
+export async function listSecrets(): Promise<SecretInfo[]> {
+  const r = await client.call<{ secrets: SecretInfo[] }>("secrets.list", {});
   return r.secrets;
+}
+
+/** 写入（或覆盖）一个持久化密钥。真值只进服务端内存与加密落盘。 */
+export async function setSecret(name: string, value: string): Promise<void> {
+  await client.call("secrets.set", { name, value });
+}
+
+/** 删除一个持久化密钥。返回 false 表示该名字来自环境变量（删不了）。 */
+export async function deleteSecret(name: string): Promise<boolean> {
+  const r = await client.call<{ deleted: boolean }>("secrets.delete", { name });
+  return r.deleted;
+}
+
+// ---- 统一配置（重启生效；文件为可编辑真相，env 覆盖单列展示） ----
+
+export async function getConfig(): Promise<ConfigView> {
+  return client.call<ConfigView>("config.get", {});
+}
+
+/** 部分更新：patch 分区可选，给了就整节替换。返回写回后的同一视图。 */
+export async function updateConfig(patch: Partial<FlowConfig>): Promise<ConfigView> {
+  return client.call<ConfigView>("config.update", { patch });
+}
+
+// ---- 可复用节点模板 ----
+
+export async function listTemplates(): Promise<NodeTemplateSummary[]> {
+  const r = await client.call<{ templates: NodeTemplateSummary[] }>("template.list", {});
+  return r.templates;
+}
+
+export async function getTemplate(id: string): Promise<NodeTemplate> {
+  return client.call<NodeTemplate>("template.get", { id });
+}
+
+export async function createTemplate(
+  name: string,
+  nodes: FragmentNode[],
+  edges: FragmentEdge[],
+  category?: string,
+): Promise<NodeTemplate> {
+  const params: Record<string, unknown> = { name, nodes, edges };
+  if (category) params.category = category;
+  return client.call<NodeTemplate>("template.create", params);
+}
+
+/** 双 Option 语义：category === undefined 不改；null 清空分组 */
+export async function updateTemplate(
+  id: string,
+  p: { name?: string; category?: string | null },
+): Promise<void> {
+  const params: Record<string, unknown> = { id };
+  if (p.name !== undefined) params.name = p.name;
+  if (p.category !== undefined) params.category = p.category;
+  await client.call("template.update", params);
+}
+
+export async function deleteTemplate(id: string): Promise<void> {
+  await client.call("template.delete", { id });
 }
 
 export async function listWorkflows(): Promise<WorkflowSummary[]> {

@@ -94,8 +94,8 @@ pub const EXECUTOR_SUBCOMMAND: &str = "executor";
 ///
 /// - 合并二进制（flow）自召唤：program = current_exe，prefix = ["executor"]`；
 /// - 独立 flow-executor 二进制（[`EXECUTOR_BIN_ENV`] 显式指定）：prefix 为空。
-/// spawn_executor_process 按此构造命令行；执行器侧忽略未知参数，因此
-/// --tag` 等诊断标记始终追加在前导参数之后。
+///   spawn_executor_process 按此构造命令行；执行器侧忽略未知参数，因此
+///   `--tag` 等诊断标记始终追加在前导参数之后。
 #[derive(Debug, Clone)]
 pub struct ExecutorInvocation {
     pub program: std::path::PathBuf,

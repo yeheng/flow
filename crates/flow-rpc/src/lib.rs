@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use chrono::Local;
 use flow_backend::{
-    open_from_env, secrets, AnyBackend, BackendError, Definition, Envelope, Event, NodeState,
-    NodeType, RunState, SignalAck,
+    secrets, AnyBackend, BackendError, Definition, Envelope, Event, NodeState, NodeType, RunState,
+    SignalAck,
 };
 use futures::StreamExt;
 use jsonrpsee::core::RegisterMethodError;
@@ -55,6 +55,98 @@ pub enum RpcError {
 /// pg 专属能力在对应方法的注册点单点 match。
 pub struct AppState {
     pub backend: AnyBackend,
+    /// 统一配置面（config.get / config.update 的工作副本）。
+    /// `Some` 时 update 可写回文件；`None`（测试简装）只回默认值。
+    /// 这里的 config 是**文件级**视图（默认值 + 文件，不含 env 覆盖）——
+    /// 文件才是用户可编辑的真相，env 覆盖名单单列展示。
+    pub config: Option<ConfigState>,
+    /// 持久化密钥存储（secrets.set/delete 落这里）；None 时这两个方法报
+    /// 「未启用」。引擎侧取值经 secrets::get_secret（stored 优先，env 兜底）。
+    pub secrets: Option<Arc<flow_engine::secrets_store::SecretFileStore>>,
+}
+
+/// 进程启动时装配的配置工作副本。
+pub struct ConfigState {
+    pub config: std::sync::RwLock<flow_config::Config>,
+    /// 配置文件路径；None 时 update 会落到 `./flow.toml`。
+    pub path: Option<std::path::PathBuf>,
+    /// 启动时生效的 env 覆盖名单（仅名称，值可能含凭据不回传）。
+    pub env_overrides: Vec<String>,
+}
+
+impl AppState {
+    /// 测试与嵌入式简装入口：只有后端，无配置文件与密钥存储。
+    pub fn new(backend: AnyBackend) -> AppState {
+        AppState {
+            backend,
+            config: None,
+            secrets: None,
+        }
+    }
+
+    /// 产品入口：配置 + 密钥存储全量装配。密钥文件在 data_dir 下
+    /// （secret.key + secrets.json）；安装进程级 SecretSource 失败（重复）
+    /// 只告警——先装先得，第二个入口不该发生。
+    pub async fn for_production(
+        backend: AnyBackend,
+        config_state: ConfigState,
+        data_dir: &std::path::Path,
+    ) -> (
+        Arc<AppState>,
+        Option<Arc<flow_engine::secrets_store::SecretFileStore>>,
+    ) {
+        let store = match flow_engine::secrets_store::SecretFileStore::open(data_dir) {
+            Ok(store) => {
+                let store = Arc::new(store);
+                if let Err(err) = flow_engine::secrets::install_secret_source(store.clone()) {
+                    tracing::warn!(%err, "持久化密钥来源安装失败，仅环境变量密钥生效");
+                    None
+                } else {
+                    Some(store)
+                }
+            }
+            Err(err) => {
+                tracing::warn!(%err, "密钥存储初始化失败，secrets.set/delete 不可用");
+                None
+            }
+        };
+        (
+            Arc::new(AppState {
+                backend,
+                config: Some(config_state),
+                secrets: store.clone(),
+            }),
+            store,
+        )
+    }
+}
+
+/// config.get / config.update 的公共响应体。
+/// `config.storage.database_url` 含凭据：一律脱敏为 `"<set>"` / null；
+/// update 侧收到 `"<set>"` 表示保持原值不变。
+fn config_view(state: &AppState) -> Value {
+    let (config, path, env_overrides) = match &state.config {
+        Some(cs) => (
+            Some(cs.config.read().unwrap().clone()),
+            cs.path.clone(),
+            cs.env_overrides.clone(),
+        ),
+        None => (None, None, Vec::new()),
+    };
+    let mut config = config.unwrap_or_default();
+    if config
+        .storage
+        .database_url
+        .as_deref()
+        .is_some_and(|v| !v.is_empty())
+    {
+        config.storage.database_url = Some("<set>".into());
+    }
+    json!({
+        "config": config,
+        "config_path": path,
+        "env_overrides": env_overrides,
+    })
 }
 
 pub async fn serve(
@@ -68,13 +160,14 @@ pub async fn serve(
     Ok((handle, local_addr))
 }
 
-/// 进程入口三件套：从环境变量装配后端 → JSON-RPC WebSocket → cron 调度器 →
-/// webhook HTTP，运行到中断信号为止。
+/// 进程入口三件套（配置文件形态）：统一配置装配后端 → JSON-RPC WebSocket →
+/// cron 调度器 → webhook HTTP，运行到中断信号为止。
 ///
-/// `flow-server` 二进制、backend-e2e 的被测进程、backend-perf 的自举服务模式
+/// `flow server` 二进制、backend-e2e 的被测进程、backend-perf 的自举服务模式
 /// 共用这一份实现，保证「被测的就是生产进程」。tracing 在这里初始化（进程入口
 /// 只有一个调用点，不会重复 init）。
-pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(loaded: flow_config::Loaded) -> Result<(), Box<dyn std::error::Error>> {
+    let config = loaded.config;
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -83,40 +176,59 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let addr: SocketAddr = std::env::var("FLOW_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:9800".into())
-        .parse()?;
+    let addr: SocketAddr = config.server.rpc_addr.parse()?;
 
-    // 后端选择只发生在这里一次：FLOW_BACKEND=sqlite（缺省，canonical：
-    // SQLite + event.jsonl）| postgres（可替代：共享日志 + 租约 + inbox）。
-    // 之后整条 RPC 链路只看 AnyBackend 枚举。
-    let backend = open_from_env().await?;
+    // 后端选择只发生在这里一次（storage.backend）。之后整条 RPC 链路只看
+    // AnyBackend 枚举。
+    let backend = flow_backend::open(&config).await?;
     backend.start().await?;
 
-    let state = Arc::new(AppState {
-        backend: backend.clone(),
-    });
+    // config.get/update 的工作副本：文件级视图（默认 + 文件，env 已在上层
+    // 合并进运行值，不进这份副本）。
+    let file_config = match &loaded.path {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)?;
+            toml_config_from_str(&text)?
+        }
+        None => flow_config::Config::default(),
+    };
+    let data_dir = std::path::PathBuf::from(&config.storage.data_dir);
+    let config_path = loaded
+        .path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<none>".into());
+    let config_state = ConfigState {
+        config: std::sync::RwLock::new(file_config),
+        path: loaded.path,
+        env_overrides: loaded.env_overrides,
+    };
+    let (state, _secrets) =
+        AppState::for_production(backend.clone(), config_state, &data_dir).await;
     let (handle, local_addr) = serve(state.clone(), addr).await?;
     tracing::info!(
         %local_addr,
         backend = backend.name(),
         detail = backend.describe(),
+        config = %config_path,
         "flow-server 已启动 (JSON-RPC 2.0 over WebSocket)"
     );
 
-    // cron 调度器：默认开启，FLOW_SCHEDULER=off 禁用
-    let scheduler_task = if std::env::var("FLOW_SCHEDULER").as_deref() == Ok("off") {
-        tracing::info!("FLOW_SCHEDULER=off，cron 调度器未启动");
-        None
-    } else {
+    // cron 调度器：config.server.scheduler_enabled（env FLOW_SCHEDULER=off 已
+    // 在加载时合并为 false）禁用
+    let scheduler_task = if config.server.scheduler_enabled {
         let backend = backend.clone();
-        Some(tokio::spawn(async move { scheduler::run(backend).await }))
+        let tick = config.scheduler_tick();
+        Some(tokio::spawn(
+            async move { scheduler::run(backend, tick).await },
+        ))
+    } else {
+        tracing::info!("scheduler_enabled=false，cron 调度器未启动");
+        None
     };
 
-    // webhook HTTP 入口：FLOW_HTTP_ADDR，默认 127.0.0.1:9801
-    let http_addr: SocketAddr = std::env::var("FLOW_HTTP_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:9801".into())
-        .parse()?;
+    // webhook HTTP 入口：server.http_addr
+    let http_addr: SocketAddr = config.server.http_addr.parse()?;
     let http_listener = tokio::net::TcpListener::bind(http_addr).await?;
     // 记**实际绑到的**地址而非请求值：传 `127.0.0.1:0` 让内核分配端口时，
     // 记请求值会得到一条 `http_addr=127.0.0.1:0` 的假日志（端口 0 意味着
@@ -144,6 +256,16 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
     handle.stop()?;
     handle.stopped().await;
     Ok(())
+}
+
+/// 环境变量形态的进程入口（backend-e2e / backend-perf 等测试脚手架用）：
+/// 加载默认位置的配置文件（缺省即默认值）+ env 覆盖，然后走同一份 [`run`]。
+pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
+    run(flow_config::Config::load(None)?).await
+}
+
+fn toml_config_from_str(text: &str) -> Result<flow_config::Config, Box<dyn std::error::Error>> {
+    Ok(flow_config::Config::from_toml_str(text)?)
 }
 
 pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, RpcError> {
@@ -307,10 +429,196 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
         Ok::<_, ErrorObjectOwned>(json!({ "node_types": node_types() }))
     })?;
 
-    // 密钥名称清单（永远不含值）：前端给 x-secret 参数渲染可选名称
-    module.register_method("secrets.list", |params, _state, _| {
+    // 密钥清单（永远不含值）：{name, source}，source=stored（界面管理）| env。
+    // 前端给 x-secret 参数渲染可选名称，设置页按来源决定能否删除。
+    module.register_method("secrets.list", |params, state, _| {
         let _: Value = parse(&params)?;
-        Ok::<_, ErrorObjectOwned>(json!({ "secrets": secrets::list_secret_names() }))
+        let secrets: Vec<Value> = secrets::list_secrets()
+            .into_iter()
+            .map(|(name, source)| json!({ "name": name, "source": source }))
+            .collect();
+        let _ = state; // 读取走进程级 SecretSource，与 state.secrets 解耦
+        Ok::<_, ErrorObjectOwned>(json!({ "secrets": secrets }))
+    })?;
+
+    // 写入（或覆盖）一个持久化密钥。真值只进内存与加密落盘，永不回显。
+    module.register_async_method("secrets.set", |params, state, _| async move {
+        #[derive(Deserialize)]
+        struct P {
+            name: String,
+            value: String,
+        }
+        let p: P = parse(&params)?;
+        validate_secret_name(&p.name)?;
+        if p.value.is_empty() {
+            return Err(invalid("密钥值不能为空"));
+        }
+        if p.value.len() > 8192 {
+            return Err(invalid("密钥值过长（上限 8 KiB）"));
+        }
+        let store = state
+            .secrets
+            .as_ref()
+            .ok_or_else(|| invalid("密钥存储未启用（需要 storage.data_dir 可写）"))?;
+        store
+            .set(&p.name, &p.value)
+            .map_err(|e| internal(format!("密钥写入失败：{e}")))?;
+        Ok::<_, ErrorObjectOwned>(json!({ "name": p.name, "source": "stored" }))
+    })?;
+
+    // 删除一个持久化密钥。env 来源的名字删不了（进程环境不可写），
+    // 回 deleted=false 让前端提示。
+    module.register_async_method("secrets.delete", |params, state, _| async move {
+        #[derive(Deserialize)]
+        struct P {
+            name: String,
+        }
+        let p: P = parse(&params)?;
+        validate_secret_name(&p.name)?;
+        let Some(store) = &state.secrets else {
+            return Err(invalid("密钥存储未启用（需要 storage.data_dir 可写）"));
+        };
+        let deleted = store
+            .delete(&p.name)
+            .map_err(|e| internal(format!("密钥删除失败：{e}")))?;
+        Ok::<_, ErrorObjectOwned>(json!({ "name": p.name, "deleted": deleted }))
+    })?;
+
+    // ---- 统一配置（重启生效；文件为可编辑真相，env 覆盖单列） ----
+    module.register_method("config.get", |params, state, _| {
+        let _: Value = parse(&params)?;
+        Ok::<_, ErrorObjectOwned>(config_view(state))
+    })?;
+
+    module.register_async_method("config.update", |params, state, _| async move {
+        #[derive(Deserialize)]
+        struct P {
+            patch: Value,
+        }
+        let p: P = parse(&params)?;
+        let Some(cs) = &state.config else {
+            return Err(invalid("此实例未启用配置文件读写，无法修改配置"));
+        };
+        // 合并基准是**文件级**配置（默认 + 文件），不是运行值——env 覆盖不
+        // 烘焙进文件，重启后 env 仍然优先。
+        let base = cs.config.read().unwrap().clone();
+        // database_url 的 "<set>" 哨兵（config.get 脱敏产物）表示「保持原值」：
+        // 替换回基准值再合并，否则哨兵字面量会落盘。
+        let mut patch = p.patch;
+        if patch.get("storage").and_then(|s| s.get("database_url")) == Some(&json!("<set>")) {
+            if let Some(storage) = patch.get_mut("storage").and_then(|s| s.as_object_mut()) {
+                storage.insert("database_url".into(), json!(base.storage.database_url));
+            }
+        }
+        let merged =
+            flow_config::Config::merge_patch(&base, &patch).map_err(|e| invalid(e.to_string()))?;
+        let write_path = cs
+            .path
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("flow.toml"));
+        merged
+            .save(&write_path)
+            .map_err(|e| invalid(format!("配置写入失败：{e}")))?;
+        *cs.config.write().unwrap() = merged;
+        Ok::<_, ErrorObjectOwned>(config_view(&state))
+    })?;
+
+    // ---- 可复用节点模板（画布片段：节点 + 内部边，非完整 Definition） ----
+    // 校验是**逐节点**的（类型已知 + 参数过 validate_params + 边端点在片段内），
+    // 不跑 Definition::validate——片段本就没有 start/end 约束。
+    module.register_async_method("template.create", |params, state, _| async move {
+        #[derive(Deserialize)]
+        struct P {
+            name: String,
+            #[serde(default)]
+            category: Option<String>,
+            nodes: Value,
+            edges: Value,
+        }
+        let p: P = parse(&params)?;
+        validate_template_name(&p.name)?;
+        let (nodes, edges) = validate_fragment(&p.nodes, &p.edges)?;
+        let template = state
+            .backend
+            .template_create(&p.name, p.category.as_deref(), &nodes, &edges)
+            .await
+            .map_err(backend_err)?;
+        Ok::<_, ErrorObjectOwned>(json!(template))
+    })?;
+
+    module.register_async_method("template.list", |params, state, _| async move {
+        let _: Value = parse(&params)?;
+        let templates = state.backend.template_list().await.map_err(backend_err)?;
+        Ok::<_, ErrorObjectOwned>(json!({ "templates": templates }))
+    })?;
+
+    module.register_async_method("template.get", |params, state, _| async move {
+        #[derive(Deserialize)]
+        struct P {
+            id: String,
+        }
+        let p: P = parse(&params)?;
+        let template = state
+            .backend
+            .template_get(&p.id)
+            .await
+            .map_err(backend_err)?;
+        Ok::<_, ErrorObjectOwned>(json!(template))
+    })?;
+
+    module.register_async_method("template.update", |params, state, _| async move {
+        #[derive(Deserialize)]
+        struct P {
+            id: String,
+            #[serde(default)]
+            name: Option<String>,
+            /// 双 Option：缺失 = 不改；null = 清空分组；字符串 = 设置
+            #[serde(default, deserialize_with = "double_option")]
+            category: Option<Option<String>>,
+            #[serde(default)]
+            nodes: Option<Value>,
+            #[serde(default)]
+            edges: Option<Value>,
+        }
+        let p: P = parse(&params)?;
+        if let Some(name) = &p.name {
+            validate_template_name(name)?;
+        }
+        let (nodes, edges) = match (&p.nodes, &p.edges) {
+            (Some(nodes), Some(edges)) => {
+                let (n, e) = validate_fragment(nodes, edges)?;
+                (Some(n), Some(e))
+            }
+            // 只改信封不改片段：仍要保证存量片段成对一致
+            (None, None) => (None, None),
+            _ => return Err(invalid("nodes 与 edges 必须成对提供或不提供")),
+        };
+        let template = state
+            .backend
+            .template_update(
+                &p.id,
+                p.name.as_deref(),
+                p.category.as_ref().map(|c| c.as_deref()),
+                nodes.as_ref(),
+                edges.as_ref(),
+            )
+            .await
+            .map_err(backend_err)?;
+        Ok::<_, ErrorObjectOwned>(json!(template))
+    })?;
+
+    module.register_async_method("template.delete", |params, state, _| async move {
+        #[derive(Deserialize)]
+        struct P {
+            id: String,
+        }
+        let p: P = parse(&params)?;
+        let deleted = state
+            .backend
+            .template_delete(&p.id)
+            .await
+            .map_err(backend_err)?;
+        Ok::<_, ErrorObjectOwned>(json!({ "id": p.id, "deleted": deleted }))
     })?;
 
     // ---- 执行 ----
@@ -888,13 +1196,15 @@ pub(crate) fn parse<T: serde::de::DeserializeOwned>(
     serde_json::from_value(raw).map_err(|e| invalid(format!("参数非法：{e}")))
 }
 
-/// schedule.update 的 input 用双 Option 区分「字段缺失=不改」与「显式 null=清空」。
-/// serde 原生会把两者都收成 None，所以需要自定义反序列化把外层 Some 钉上。
-fn double_option<'de, D>(deserializer: D) -> Result<Option<Option<Value>>, D::Error>
+/// schedule.update 的 input 与 template.update 的 category 用双 Option 区分
+/// 「字段缺失=不改」与「显式 null=清空」。serde 原生会把两者都收成 None，
+/// 所以需要自定义反序列化把外层 Some 钉上。
+fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
 {
-    Ok(Some(Option::<Value>::deserialize(deserializer)?))
+    Ok(Some(Option::<T>::deserialize(deserializer)?))
 }
 
 /// cron 合法性校验（标准 5 字段，分 时 日 月 周，本地时间）。非法表达式 -32010。
@@ -922,6 +1232,130 @@ pub(crate) fn invalid(message: impl Into<String>) -> ErrorObjectOwned {
     ErrorObject::owned(CODE_INVALID, message.into(), None::<()>)
 }
 
+/// 持久化密钥名称约束：环境变量后缀的合法子集（字母数字下划线），
+/// 1..=64 字符。名称会拼进 FLOW_SECRET_<名称> 展示，不能引入歧义字符。
+fn validate_secret_name(name: &str) -> Result<(), ErrorObjectOwned> {
+    let valid = !name.is_empty()
+        && name.len() <= 64
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    if valid {
+        Ok(())
+    } else {
+        Err(invalid(
+            "密钥名称须为 1..=64 个字母/数字/下划线（如 OPENAI_KEY）",
+        ))
+    }
+}
+
+/// 模板名约束：非空、去首尾空白后 1..=100 字符。
+fn validate_template_name(name: &str) -> Result<(), ErrorObjectOwned> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.len() > 100 {
+        return Err(invalid("模板名须为 1..=100 个字符"));
+    }
+    Ok(())
+}
+
+/// 画布片段校验（template.create / template.update 共用）：
+/// - nodes 非空数组；每项 `{id, type, name, position?, params}`——类型已知，
+///   params 过 [`flow_engine::model::validate_params`]（与整图同源的参数规则）；
+/// - edges 数组（可为空）；端点必须在片段内；带 sourceHandle 的边只允许
+///   condition 节点且端口为 "true"/"false"（与整图规则一致）。
+///
+/// 返回**归一化**后的片段：只保留白名单字段，杜绝面板存进任意 JSON。
+fn validate_fragment(nodes: &Value, edges: &Value) -> Result<(Value, Value), ErrorObjectOwned> {
+    let nodes_arr = nodes
+        .as_array()
+        .ok_or_else(|| invalid("nodes 必须是数组"))?;
+    if nodes_arr.is_empty() {
+        return Err(invalid("片段至少要有一个节点"));
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    let mut normalized_nodes = Vec::with_capacity(nodes_arr.len());
+    for raw in nodes_arr {
+        let id = raw["id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| invalid("片段节点缺少非空 id"))?;
+        if !ids.insert(id.to_string()) {
+            return Err(invalid(format!("片段节点 id 重复：{id}")));
+        }
+        let type_str = raw["type"]
+            .as_str()
+            .ok_or_else(|| invalid(format!("片段节点 {id} 缺少 type")))?;
+        let kind = NodeType::parse(type_str)
+            .ok_or_else(|| invalid(format!("片段节点 {id} 的类型未知：{type_str}")))?;
+        let name = raw["name"].as_str().unwrap_or(id);
+        let params = raw.get("params").cloned().unwrap_or(json!({}));
+        if !params.is_object() {
+            return Err(invalid(format!("片段节点 {id} 的 params 必须是对象")));
+        }
+        let node = flow_engine::Node {
+            id: id.to_string(),
+            node_type: type_str.to_string(),
+            name: name.to_string(),
+            position: None,
+            params,
+        };
+        flow_engine::model::validate_params(&node, kind)
+            .map_err(|e| invalid(format!("片段节点 {id} 参数非法：{e}")))?;
+        let position = raw.get("position").filter(|p| p.is_object()).cloned();
+        let mut normalized = json!({
+            "id": node.id,
+            "type": type_str,
+            "name": node.name,
+            "params": node.params,
+        });
+        if let Some(position) = position {
+            normalized["position"] = position;
+        }
+        normalized_nodes.push(normalized);
+    }
+
+    let edges_arr = edges
+        .as_array()
+        .ok_or_else(|| invalid("edges 必须是数组"))?;
+    let mut normalized_edges = Vec::with_capacity(edges_arr.len());
+    for raw in edges_arr {
+        let source = raw["source"].as_str().unwrap_or_default();
+        let target = raw["target"].as_str().unwrap_or_default();
+        if !ids.contains(source) || !ids.contains(target) {
+            return Err(invalid(format!(
+                "片段边的端点不在片段内：{source} → {target}"
+            )));
+        }
+        if source == target {
+            return Err(invalid(format!("片段不允许自环：{source}")));
+        }
+        let mut normalized = json!({ "source": source, "target": target });
+        if let Some(handle) = raw["sourceHandle"].as_str() {
+            if handle != "out" {
+                let source_kind = NodeType::parse(
+                    normalized_nodes
+                        .iter()
+                        .find(|n| n["id"] == json!(source))
+                        .and_then(|n| n["type"].as_str())
+                        .unwrap_or_default(),
+                );
+                if source_kind != Some(NodeType::Condition) || !matches!(handle, "true" | "false") {
+                    return Err(invalid(format!(
+                        "片段边 {source}→{target} 的 sourceHandle 非法：{handle}（仅 condition 节点可用 true/false）"
+                    )));
+                }
+            }
+            normalized["sourceHandle"] = json!(handle);
+        }
+        if let Some(handle) = raw["targetHandle"].as_str() {
+            normalized["targetHandle"] = json!(handle);
+        }
+        normalized_edges.push(normalized);
+    }
+    Ok((
+        Value::Array(normalized_nodes),
+        Value::Array(normalized_edges),
+    ))
+}
+
 pub(crate) fn conflict(message: impl Into<String>) -> ErrorObjectOwned {
     ErrorObject::owned(CODE_CONFLICT, message.into(), None::<()>)
 }
@@ -940,12 +1374,13 @@ pub(crate) fn backend_err(err: BackendError) -> ErrorObjectOwned {
         | BackendError::RunNotFound(_)
         | BackendError::SignalNotFound(_)
         | BackendError::ScheduleNotFound(_)
-        | BackendError::WebhookNotFound(_) => {
+        | BackendError::WebhookNotFound(_)
+        | BackendError::TemplateNotFound(_) => {
             ErrorObject::owned(CODE_NOT_FOUND, err.to_string(), None::<()>)
         }
-        BackendError::VersionNotPublished(..) | BackendError::Conflict(_) => {
-            conflict(err.to_string())
-        }
+        BackendError::VersionNotPublished(..)
+        | BackendError::Conflict(_)
+        | BackendError::TemplateNameTaken(_) => conflict(err.to_string()),
         BackendError::Invalid(_) => invalid(err.to_string()),
         BackendError::Internal(_) => internal(err.to_string()),
     }

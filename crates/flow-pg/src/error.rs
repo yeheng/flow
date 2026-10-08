@@ -24,6 +24,10 @@ pub enum PgError {
     ScheduleNotFound(String),
     #[error("webhook 不存在：{0}")]
     WebhookNotFound(String),
+    #[error("节点模板不存在：{0}")]
+    TemplateNotFound(String),
+    #[error("模板名已存在：{0}")]
+    TemplateNameTaken(String),
     #[error("冲突：{0}")]
     Conflict(String),
     #[error("非法参数：{0}")]

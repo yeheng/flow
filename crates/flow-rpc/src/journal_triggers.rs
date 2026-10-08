@@ -39,9 +39,13 @@ pub async fn fire_due(backend: &JournalBackend, now: DateTime<Local>) {
         }
     }
 }
-pub fn start(backend: Arc<JournalBackend>) -> tokio::task::JoinHandle<()> {
+/// journal 侧触发器扫描循环；tick 由 `[server].journal_trigger_tick_secs` 配置。
+pub fn start(
+    backend: Arc<JournalBackend>,
+    tick: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(20));
+        let mut tick = tokio::time::interval(tick);
         loop {
             tick.tick().await;
             fire_due(&backend, Local::now()).await;

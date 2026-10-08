@@ -26,6 +26,7 @@ tracing-subscriber.workspace = true
 flow-agent = { path = "../flow-agent" }
 flow-backend = { path = "../flow-backend" }
 flow-cli = { path = "../flow-cli" }
+flow-config = { path = "../flow-config" }
 flow-engine = { path = "../flow-engine" }
 flow-executor = { path = "../flow-executor" }
 flow-journal = { path = "../flow-journal" }

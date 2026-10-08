@@ -40,16 +40,39 @@ pub struct Services {
 
 impl Services {
     async fn open(root: PathBuf) -> Result<Arc<Self>> {
-        let data = root.join("flow");
+        // 统一配置：`<root>/flow.toml` 可选。文件缺省时保持历史桌面布局
+        // （root/flow + root/journal），已有安装数据不受影响；给了文件则
+        // storage.data_dir 相对 root 解析。
+        let config_path = root.join("flow.toml");
+        let has_config_file = config_path.exists();
+        let loaded = flow_config::Config::load_or_default(&config_path)
+            .map_err(|e| e.to_string())?;
+        let config = loaded.config;
+        let data = if has_config_file {
+            root.join(&config.storage.data_dir)
+        } else {
+            root.join("flow")
+        };
+        let db_path = config
+            .storage
+            .database
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data.join("flow.db"));
         let backend = AnyBackend::Sqlite(Arc::new(
-            SqliteBackend::open(&data, data.join("flow.db"))
-                .await
-                .map_err(|e| e.to_string())?,
+            SqliteBackend::open(&data, db_path).await.map_err(|e| e.to_string())?,
         ));
         let journal = JournalBackend::open(&root.join("journal"), Default::default())
             .await
             .map_err(|e| e.to_string())?;
-        let built = Self::assemble(backend.clone(), journal.clone()).await;
+        let built = Self::assemble(
+            backend.clone(),
+            journal.clone(),
+            config,
+            config_path,
+            data,
+        )
+        .await;
         if built.is_err() {
             let _ = journal.close().await;
             let _ = backend.shutdown().await;
@@ -57,11 +80,21 @@ impl Services {
         built
     }
 
-    async fn assemble(backend: AnyBackend, journal: Arc<JournalBackend>) -> Result<Arc<Self>> {
+    async fn assemble(
+        backend: AnyBackend,
+        journal: Arc<JournalBackend>,
+        config: flow_config::Config,
+        config_path: PathBuf,
+        data_dir: PathBuf,
+    ) -> Result<Arc<Self>> {
         let token = uuid::Uuid::new_v4().to_string();
-        let state = Arc::new(flow_rpc::AppState {
-            backend: backend.clone(),
-        });
+        let config_state = flow_rpc::ConfigState {
+            config: std::sync::RwLock::new(config.clone()),
+            path: Some(config_path),
+            env_overrides: Vec::new(),
+        };
+        let (state, _secrets) =
+            flow_rpc::AppState::for_production(backend.clone(), config_state, &data_dir).await;
         let flow = flow_rpc::build_module(state.clone())
             .map_err(|e| e.to_string())?
             .into();
@@ -80,11 +113,18 @@ impl Services {
         );
         backend.start().await.map_err(|e| e.to_string())?;
         journal.start_execution().await.map_err(|e| e.to_string())?;
-        let scheduler_backend = backend.clone();
-        let scheduler = tokio::spawn(async move {
-            flow_rpc::scheduler::run(scheduler_backend).await;
-        });
-        let journal_scheduler = flow_rpc::journal_triggers::start(journal.clone());
+        let scheduler = if config.server.scheduler_enabled {
+            let scheduler_backend = backend.clone();
+            let tick = config.scheduler_tick();
+            tokio::spawn(async move {
+                flow_rpc::scheduler::run(scheduler_backend, tick).await;
+            })
+        } else {
+            // 保持 tasks 通道形状：立即结束的占位任务
+            tokio::spawn(async {})
+        };
+        let journal_scheduler =
+            flow_rpc::journal_triggers::start(journal.clone(), config.journal_trigger_tick());
         let http = tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, flow_rpc::webhook::router(state)).await {
                 eprintln!("desktop webhook server stopped: {error}");

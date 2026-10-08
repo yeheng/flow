@@ -49,6 +49,28 @@ pub fn mode_from_env() -> Result<ExecutionMode, String> {
     mode_from_env_with(&value)
 }
 
+/// 从统一配置解析执行模式（产品入口；env 已由 flow-config 合并进配置值）。
+pub fn mode_from_config(config: &flow_config::ExecutionConfig) -> Result<ExecutionMode, String> {
+    match config.mode {
+        flow_config::ExecutionModeKind::InProcess => Ok(ExecutionMode::InProcess),
+        flow_config::ExecutionModeKind::Ipc => {
+            let executor = match &config.executor_bin {
+                Some(bin) => Ok(ExecutorInvocation::explicit(bin.clone())),
+                None => ExecutorInvocation::locate(),
+            }?;
+            Ok(ExecutionMode::Ipc(IpcOptions {
+                executor,
+                x_max: config.x_max as usize,
+                tag: None,
+            }))
+        }
+        flow_config::ExecutionModeKind::Remote => Err(
+            "execution.mode=remote requires [execution.remote] (use remote_options_from_config)"
+                .into(),
+        ),
+    }
+}
+
 /// 远程模式环境变量（R1/R3 运维入口）。
 pub struct RemoteEnv {
     pub control_addr: String,
@@ -59,25 +81,22 @@ pub struct RemoteEnv {
     pub attach_timeout_ms: u64,
 }
 
-/// 解析远程模式选项（FLOW_REMOTE_*）；缺失即报错（不静默回退）。
-pub fn remote_options_from_env() -> Result<crate::execution::remote::RemoteOptions, String> {
-    let read = |name: &str| -> Result<PathBuf, String> {
-        std::env::var(name)
-            .map(PathBuf::from)
-            .map_err(|_| format!("{name} not set for remote mode"))
-    };
+/// 从统一配置解析远程模式选项（mode=remote 时 [execution.remote] 必填，
+/// validate 已把关，这里是取值转换）。
+pub fn remote_options_from_config(
+    config: &flow_config::ExecutionConfig,
+) -> Result<crate::execution::remote::RemoteOptions, String> {
+    let remote = config
+        .remote
+        .as_ref()
+        .ok_or("execution.mode=remote requires [execution.remote]")?;
     Ok(crate::execution::remote::RemoteOptions {
-        control_addr: std::env::var("FLOW_REMOTE_CONTROL_ADDR")
-            .map_err(|_| "FLOW_REMOTE_CONTROL_ADDR not set".to_string())?,
-        data_addr: std::env::var("FLOW_REMOTE_DATA_ADDR")
-            .map_err(|_| "FLOW_REMOTE_DATA_ADDR not set".to_string())?,
-        ca_cert: read("FLOW_REMOTE_CA")?,
-        server_cert: read("FLOW_REMOTE_CERT")?,
-        server_key: read("FLOW_REMOTE_KEY")?,
-        attach_timeout_ms: std::env::var("FLOW_REMOTE_ATTACH_TIMEOUT_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(120_000),
+        control_addr: remote.control_addr.clone(),
+        data_addr: remote.data_addr.clone(),
+        ca_cert: remote.ca_cert.clone(),
+        server_cert: remote.cert.clone(),
+        server_key: remote.key.clone(),
+        attach_timeout_ms: remote.attach_timeout_ms,
     })
 }
 

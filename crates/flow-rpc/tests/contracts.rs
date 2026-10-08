@@ -28,9 +28,7 @@ impl Fixture {
             .update_workflow(&workflow, &definition(7))
             .await
             .unwrap();
-        let state = Arc::new(AppState {
-            backend: AnyBackend::Sqlite(backend.clone()),
-        });
+        let state = Arc::new(AppState::new(AnyBackend::Sqlite(backend.clone())));
         Self {
             root,
             backend,
@@ -92,7 +90,7 @@ fn llm_def(api_key: &str) -> Value {
     })
 }
 
-/// secrets.list：排序后的名称清单，永远不含值。
+/// secrets.list：排序后的 {name, source} 清单，永远不含值。
 #[tokio::test]
 async fn secrets_list_returns_sorted_names_without_values() {
     let f = Fixture::new().await;
@@ -100,15 +98,30 @@ async fn secrets_list_returns_sorted_names_without_values() {
     std::env::set_var("FLOW_SECRET_TEST_RPC_A", "value-a");
 
     let resp = f.call("secrets.list", json!({})).await;
-    let names: Vec<&str> = resp["result"]["secrets"]
+    let entries: Vec<(&str, &str)> = resp["result"]["secrets"]
         .as_array()
         .expect("result.secrets 必须是数组")
         .iter()
-        .map(|n| n.as_str().unwrap())
+        .map(|s| {
+            (
+                s["name"].as_str().expect("name"),
+                s["source"].as_str().expect("source"),
+            )
+        })
         .collect();
-    let pos_a = names.iter().position(|n| *n == "TEST_RPC_A").unwrap();
-    let pos_b = names.iter().position(|n| *n == "TEST_RPC_B").unwrap();
-    assert!(pos_a < pos_b, "必须按名称排序：{names:?}");
+    let pos_a = entries
+        .iter()
+        .position(|(n, _)| *n == "TEST_RPC_A")
+        .unwrap();
+    let pos_b = entries
+        .iter()
+        .position(|(n, _)| *n == "TEST_RPC_B")
+        .unwrap();
+    assert!(pos_a < pos_b, "必须按名称排序：{entries:?}");
+    assert!(
+        entries.iter().all(|(_, s)| *s == "env"),
+        "无持久化存储时全部归 env：{entries:?}"
+    );
     assert!(!resp.to_string().contains("value-a"), "响应不得含真值");
 
     std::env::remove_var("FLOW_SECRET_TEST_RPC_A");
@@ -897,4 +910,212 @@ async fn run_list_filters_by_status_and_paginates_by_cursor() {
         0,
         "翻到头应为空"
     );
+}
+
+// ---- 可复用节点模板 ----
+
+fn fragment() -> (Value, Value) {
+    (
+        json!([
+            {"id": "h", "type": "http_call", "name": "取数",
+             "params": {"url": "https://example.com", "method": "GET"},
+             "position": {"x": 10, "y": 20}},
+            {"id": "s", "type": "script", "name": "解析",
+             "params": {"code": "return input;"}, "position": {"x": 200, "y": 20}}
+        ]),
+        json!([{"source": "h", "target": "s"}]),
+    )
+}
+
+#[tokio::test]
+async fn template_crud_roundtrip_and_fragment_is_normalized() {
+    let f = Fixture::new().await;
+    let (nodes, edges) = fragment();
+    let created = f
+        .call(
+            "template.create",
+            json!({"name": "HTTP+解析", "category": "集成", "nodes": nodes, "edges": edges}),
+        )
+        .await;
+    let template = &created["result"];
+    assert!(!template["id"].as_str().unwrap().is_empty());
+    assert_eq!(template["name"], "HTTP+解析");
+    assert_eq!(template["nodes"].as_array().unwrap().len(), 2);
+    assert_eq!(template["edges"].as_array().unwrap().len(), 1);
+
+    // list 只回信封不回载荷
+    let list = f.call("template.list", json!({})).await;
+    let entry = &list["result"]["templates"][0];
+    assert_eq!(entry["name"], "HTTP+解析");
+    assert_eq!(entry["node_count"], 2);
+    assert!(entry.get("nodes").is_none(), "list 不回片段载荷");
+
+    // get 回载荷
+    let got = f.call("template.get", json!({"id": template["id"]})).await;
+    assert_eq!(got["result"]["nodes"][0]["id"], "h");
+
+    // 重名冲突 → -32012
+    let conflict = f
+        .call(
+            "template.create",
+            json!({"name": "HTTP+解析", "nodes": nodes, "edges": edges}),
+        )
+        .await;
+    assert_eq!(conflict["error"]["code"], -32012);
+
+    // 改名 + 清空分组
+    let updated = f
+        .call(
+            "template.update",
+            json!({"id": template["id"], "name": "标准取数", "category": null}),
+        )
+        .await;
+    assert_eq!(updated["result"]["name"], "标准取数");
+    assert_eq!(updated["result"]["category"], Value::Null);
+
+    // 删除后 get → -32011
+    let deleted = f
+        .call("template.delete", json!({"id": template["id"]}))
+        .await;
+    assert_eq!(deleted["result"]["deleted"], true);
+    let missing = f.call("template.get", json!({"id": template["id"]})).await;
+    assert_eq!(missing["error"]["code"], -32011);
+}
+
+#[tokio::test]
+async fn template_validation_rejects_bad_fragments() {
+    let f = Fixture::new().await;
+    let (nodes, edges) = fragment();
+
+    // 未知类型
+    let bad_type = f
+        .call(
+            "template.create",
+            json!({"name": "t", "nodes": [{"id": "x", "type": "nope", "name": "x", "params": {}}], "edges": []}),
+        )
+        .await;
+    assert_eq!(bad_type["error"]["code"], -32010);
+
+    // 必填参数缺失（http_call 缺 url）
+    let bad_params = f
+        .call(
+            "template.create",
+            json!({"name": "t", "nodes": [{"id": "x", "type": "http_call", "name": "x", "params": {}}], "edges": []}),
+        )
+        .await;
+    assert_eq!(bad_params["error"]["code"], -32010);
+
+    // 边端点不在片段内
+    let dangling = f
+        .call(
+            "template.create",
+            json!({"name": "t", "nodes": nodes, "edges": [{"source": "ghost", "target": "s"}]}),
+        )
+        .await;
+    assert_eq!(dangling["error"]["code"], -32010);
+
+    // condition 之外的节点不允许 true/false 端口
+    let bad_port = f
+        .call(
+            "template.create",
+            json!({"name": "t", "nodes": nodes, "edges": [{"source": "h", "target": "s", "sourceHandle": "true"}]}),
+        )
+        .await;
+    assert_eq!(bad_port["error"]["code"], -32010);
+
+    // 空模板名
+    let bad_name = f
+        .call(
+            "template.create",
+            json!({"name": "  ", "nodes": nodes, "edges": edges}),
+        )
+        .await;
+    assert_eq!(bad_name["error"]["code"], -32010);
+}
+
+// ---- 统一配置 RPC ----
+
+#[tokio::test]
+async fn config_get_update_roundtrip_writes_file_and_redacts_database_url() {
+    let root = std::env::temp_dir().join(format!("flow-config-rpc-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&root).unwrap();
+    let config_path = root.join("flow.toml");
+    let backend = Arc::new(
+        SqliteBackend::open(&root, root.join("flow.db"))
+            .await
+            .unwrap(),
+    );
+    let state = Arc::new(AppState {
+        backend: AnyBackend::Sqlite(backend.clone()),
+        config: Some(flow_rpc::ConfigState {
+            config: std::sync::RwLock::new(flow_config::Config::default()),
+            path: Some(config_path.clone()),
+            env_overrides: vec!["FLOW_ADDR".to_string()],
+        }),
+        secrets: None,
+    });
+    let f = Fixture {
+        root: root.clone(),
+        backend,
+        state,
+        workflow: String::new(),
+    };
+
+    // get：默认值 + env 覆盖名单 + 路径
+    let resp = f.call("config.get", json!({})).await;
+    assert_eq!(
+        resp["result"]["config"]["server"]["rpc_addr"],
+        "127.0.0.1:9800"
+    );
+    assert_eq!(resp["result"]["env_overrides"].as_array().unwrap().len(), 1);
+
+    // update：改 scheduler tick + database_url 脱敏
+    let resp = f
+        .call(
+            "config.update",
+            json!({"patch": {"server": {"rpc_addr": "127.0.0.1:9800", "http_addr": "127.0.0.1:9801",
+                   "scheduler_enabled": false, "scheduler_tick_secs": 30,
+                   "journal_trigger_tick_secs": 20},
+                   "storage": {"backend": "postgres", "data_dir": "data",
+                               "database": null, "database_url": "postgres://u:p@db/x"}}}),
+        )
+        .await;
+    assert_eq!(
+        resp["result"]["config"]["server"]["scheduler_tick_secs"],
+        30
+    );
+    assert_eq!(
+        resp["result"]["config"]["storage"]["database_url"], "<set>",
+        "连接串必须脱敏"
+    );
+
+    // 文件真的写进去了（持久值，非脱敏形状）
+    let text = std::fs::read_to_string(&config_path).unwrap();
+    assert!(text.contains("postgres://u:p@db/x"));
+    assert!(text.contains("scheduler_tick_secs = 30"));
+
+    // "<set>" 回传表示保持原值：再改一次别的字段，database_url 不丢
+    let resp = f
+        .call(
+            "config.update",
+            json!({"patch": {"storage": {"backend": "postgres", "data_dir": "data2",
+                                "database_url": "<set>"}}}),
+        )
+        .await;
+    // database_url 回 "<set>" 说明仍非空
+    assert_eq!(resp["result"]["config"]["storage"]["database_url"], "<set>");
+    assert_eq!(resp["result"]["config"]["storage"]["data_dir"], "data2");
+    let text = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        text.contains("postgres://u:p@db/x"),
+        "原连接串应保留：{text}"
+    );
+
+    // 非法 patch 被拒且不落盘
+    let bad = f
+        .call("config.update", json!({"patch": {"bogus": {}}}))
+        .await;
+    assert_eq!(bad["error"]["code"], -32010);
+
+    let _ = std::fs::remove_dir_all(&root);
 }

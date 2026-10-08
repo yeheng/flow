@@ -60,6 +60,7 @@ pub fn fast_config(role: flow_pg::Role) -> PgConfig {
         lock_timeout: Duration::from_secs(15),
         idle_tx_timeout: Duration::from_secs(15),
         role,
+        max_connections: 4,
     }
 }
 

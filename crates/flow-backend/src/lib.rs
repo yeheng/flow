@@ -45,8 +45,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 pub use flow_dto::{
-    DbRunSource, DbRunStatus, RunRecord, RunStats, Schedule, Webhook, WorkflowRunStats,
-    WorkflowSummary, WorkflowVersion,
+    DbRunSource, DbRunStatus, NodeTemplate, NodeTemplateSummary, RunRecord, RunStats, Schedule,
+    Webhook, WorkflowRunStats, WorkflowSummary, WorkflowVersion,
 };
 pub use flow_engine::{
     redact_value, secrets, Definition, Envelope, Event, LogLevel, LogStream, NodeState, NodeType,
@@ -91,6 +91,10 @@ pub enum BackendError {
     ScheduleNotFound(String),
     #[error("webhook 不存在：{0}")]
     WebhookNotFound(String),
+    #[error("节点模板不存在：{0}")]
+    TemplateNotFound(String),
+    #[error("模板名已存在：{0}")]
+    TemplateNameTaken(String),
     #[error("参数非法：{0}")]
     Invalid(String),
     #[error("冲突：{0}")]
@@ -361,6 +365,56 @@ impl AnyBackend {
         }
     }
 
+    // ---- 可复用节点模板（node_templates，两个后端同构） ----
+
+    pub async fn template_create(
+        &self,
+        name: &str,
+        category: Option<&str>,
+        nodes: &Value,
+        edges: &Value,
+    ) -> Result<NodeTemplate, BackendError> {
+        match self {
+            AnyBackend::Sqlite(b) => b.template_create(name, category, nodes, edges).await,
+            AnyBackend::Postgres(b) => b.template_create(name, category, nodes, edges).await,
+        }
+    }
+
+    pub async fn template_list(&self) -> Result<Vec<NodeTemplateSummary>, BackendError> {
+        match self {
+            AnyBackend::Sqlite(b) => b.template_list().await,
+            AnyBackend::Postgres(b) => b.template_list().await,
+        }
+    }
+
+    pub async fn template_get(&self, id: &str) -> Result<NodeTemplate, BackendError> {
+        match self {
+            AnyBackend::Sqlite(b) => b.template_get(id).await,
+            AnyBackend::Postgres(b) => b.template_get(id).await,
+        }
+    }
+
+    pub async fn template_update(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        category: Option<Option<&str>>,
+        nodes: Option<&Value>,
+        edges: Option<&Value>,
+    ) -> Result<NodeTemplate, BackendError> {
+        match self {
+            AnyBackend::Sqlite(b) => b.template_update(id, name, category, nodes, edges).await,
+            AnyBackend::Postgres(b) => b.template_update(id, name, category, nodes, edges).await,
+        }
+    }
+
+    pub async fn template_delete(&self, id: &str) -> Result<bool, BackendError> {
+        match self {
+            AnyBackend::Sqlite(b) => b.template_delete(id).await,
+            AnyBackend::Postgres(b) => b.template_delete(id).await,
+        }
+    }
+
     /// 创建并启动 run（run.start）。初始化协议由实现吸收：
     /// SQLite 两段式（initializing → run_started），Postgres 单事务原子创建。
     /// published 解析与定义校验单点在 [`resolve_runnable_definition`]。
@@ -558,64 +612,89 @@ pub(crate) async fn resolve_runnable_definition(
 /// 与排他 flock、单连接池一起构成「单进程·单线程·单写者」三件套。
 /// 只应在 main() 构造 tokio runtime 时调用一次——这是部署形态选择，
 /// 不属于 RPC 请求处理路径对后端的感知（那条禁令针对 lib 内逻辑）。
+pub fn prefer_current_thread_runtime_for(backend: flow_config::StorageBackend) -> bool {
+    backend != flow_config::StorageBackend::Postgres
+}
+
+/// 环境变量形态的同一判定（测试脚手架与未迁移入口用；产品入口走
+/// [`prefer_current_thread_runtime_for`] + flow-config）。
 pub fn prefer_current_thread_runtime() -> bool {
     match std::env::var("FLOW_BACKEND") {
-        Ok(v) => !v.eq_ignore_ascii_case("postgres") && !v.eq_ignore_ascii_case("postgresql"),
+        Ok(v) => {
+            let backend =
+                if v.eq_ignore_ascii_case("postgres") || v.eq_ignore_ascii_case("postgresql") {
+                    flow_config::StorageBackend::Postgres
+                } else {
+                    flow_config::StorageBackend::Sqlite
+                };
+            prefer_current_thread_runtime_for(backend)
+        }
         Err(_) => true, // 缺省 sqlite
     }
 }
 
-/// 工厂：按 FLOW_BACKEND 构造后端。
+/// 工厂：按统一配置构造后端。
 /// `sqlite`（缺省，canonical）| `postgres`（可替代，多节点执行）。
-/// 这是进程入口选择后端的唯一地方（`prefer_current_thread_runtime` 也读同一个
-/// 变量决定 runtime 形态，它在构造 runtime 之前跑，改这里要同步改那边）。
-pub async fn open_from_env() -> Result<AnyBackend, BackendError> {
-    let kind = std::env::var("FLOW_BACKEND").unwrap_or_else(|_| "sqlite".into());
-    match kind.as_str() {
-        "sqlite" => Ok(AnyBackend::Sqlite(Arc::new(
-            SqliteBackend::from_env().await?,
-        ))),
-        "postgres" | "postgresql" => {
-            Ok(AnyBackend::Postgres(Arc::new(PgBackend::from_env().await?)))
+/// 这是进程入口选择后端的唯一地方（runtime 形态判定也读同一个值，
+/// 见 [`prefer_current_thread_runtime_for`]，它在构造 runtime 之前跑）。
+pub async fn open(config: &flow_config::Config) -> Result<AnyBackend, BackendError> {
+    let storage = &config.storage;
+    match storage.backend {
+        flow_config::StorageBackend::Sqlite => {
+            let data_dir = std::path::PathBuf::from(&storage.data_dir);
+            let db_path = storage
+                .database
+                .as_ref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| data_dir.join("flow.db"));
+            Ok(AnyBackend::Sqlite(Arc::new(
+                SqliteBackend::open(data_dir, db_path).await?,
+            )))
         }
-        other => Err(BackendError::Invalid(format!(
-            "未知 FLOW_BACKEND：{other}（支持 sqlite | postgres）"
-        ))),
+        flow_config::StorageBackend::Postgres => {
+            let url = storage.database_url.as_deref().ok_or_else(|| {
+                BackendError::Invalid(
+                    "Postgres 模式必须配置 storage.database_url（或 FLOW_DATABASE_URL）".into(),
+                )
+            })?;
+            let pg_config =
+                flow_pg::PgConfig::from_tuning(&config.pg).map_err(BackendError::Invalid)?;
+            Ok(AnyBackend::Postgres(Arc::new(
+                PgBackend::connect(url, pg_config).await?,
+            )))
+        }
     }
 }
 
-/// 按环境变量（FLOW_EXECUTION_MODE / FLOW_EXECUTOR_BIN / FLOW_REMOTE_*）
-/// 选择执行模式并启动调度。非法值与资源缺失（ipc 无执行器二进制、remote
-/// 缺 FLOW_REMOTE_* 配置）一律直接失败——静默落回进程内执行会把「进程隔离/
-/// 远程执行」的部署承诺变成空气（二期 I09、三期 R1 的共同纪律）。
-pub async fn start_execution_from_env(
+/// 按统一配置选择执行模式并启动调度。非法值与资源缺失（ipc 无执行器二进制、
+/// remote 缺 [execution.remote]）一律直接失败——静默落回进程内执行会把
+/// 「进程隔离/远程执行」的部署承诺变成空气（二期 I09、三期 R1 的共同纪律）。
+pub async fn start_execution(
+    execution: &flow_config::ExecutionConfig,
     backend: &std::sync::Arc<crate::journal::JournalBackend>,
 ) -> Result<(), crate::journal::JournalError> {
-    let mode = std::env::var("FLOW_EXECUTION_MODE").unwrap_or_default();
     let invalid = |message: String| {
         crate::journal::JournalError::Journal(flow_journal::Error::Invalid(message))
     };
-    match mode.as_str() {
-        "" | "in_process" => backend.start_execution().await,
-        "ipc" => {
-            let execution::ExecutionMode::Ipc(options) = execution::mode_from_env()
-                .map_err(|error| invalid(format!("FLOW_EXECUTION_MODE=ipc: {error}")))?
-            else {
-                return Err(invalid(
-                    "FLOW_EXECUTION_MODE=ipc: internal parse mismatch".into(),
-                ));
+    match execution.mode {
+        flow_config::ExecutionModeKind::InProcess => backend.start_execution().await,
+        flow_config::ExecutionModeKind::Ipc => {
+            let options = match execution::mode_from_config(execution) {
+                Ok(execution::ExecutionMode::Ipc(options)) => options,
+                Ok(execution::ExecutionMode::InProcess) => {
+                    return Err(invalid(
+                        "execution.mode=ipc: internal parse mismatch".into(),
+                    ))
+                }
+                Err(error) => return Err(invalid(format!("execution.mode=ipc: {error}"))),
             };
             backend
                 .start_execution_ipc(execution::ExecutionMode::Ipc(options))
                 .await
         }
-        "remote" => {
-            let options = execution::remote_options_from_env()
-                .map_err(|error| invalid(format!("FLOW_EXECUTION_MODE=remote: {error}")))?;
+        flow_config::ExecutionModeKind::Remote => {
+            let options = execution::remote_options_from_config(execution).map_err(invalid)?;
             backend.start_execution_remote(options).await
         }
-        other => Err(invalid(format!(
-            "invalid FLOW_EXECUTION_MODE={other:?}; expected in_process|ipc|remote"
-        ))),
     }
 }

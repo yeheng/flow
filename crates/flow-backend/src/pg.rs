@@ -19,8 +19,9 @@ use flow_engine::{Envelope, RunState};
 use flow_pg::{CreateRun as PgCreateRun, PgConfig, PgEngine, PgError};
 
 use crate::{
-    resolve_runnable_definition, BackendError, CreateRun, CreatedRun, RunRecord, RunStats,
-    Schedule, SignalAck, SignalRequest, Webhook, WorkflowSummary, WorkflowVersion,
+    resolve_runnable_definition, BackendError, CreateRun, CreatedRun, NodeTemplate,
+    NodeTemplateSummary, RunRecord, RunStats, Schedule, SignalAck, SignalRequest, Webhook,
+    WorkflowSummary, WorkflowVersion,
 };
 
 /// Postgres 后端：gateway 入口 + executor 生命周期 + 只读查询。
@@ -280,6 +281,57 @@ impl PgBackend {
             .map_err(pg_err)
     }
 
+    // ---- 可复用节点模板（store 直通） ----
+
+    pub async fn template_create(
+        &self,
+        name: &str,
+        category: Option<&str>,
+        nodes: &Value,
+        edges: &Value,
+    ) -> Result<NodeTemplate, BackendError> {
+        self.engine
+            .store()
+            .create_template(name, category, nodes, edges)
+            .await
+            .map_err(pg_err)
+    }
+
+    pub async fn template_list(&self) -> Result<Vec<NodeTemplateSummary>, BackendError> {
+        self.engine
+            .store()
+            .list_template_summaries()
+            .await
+            .map_err(pg_err)
+    }
+
+    pub async fn template_get(&self, id: &str) -> Result<NodeTemplate, BackendError> {
+        self.engine.store().get_template(id).await.map_err(pg_err)
+    }
+
+    pub async fn template_update(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        category: Option<Option<&str>>,
+        nodes: Option<&Value>,
+        edges: Option<&Value>,
+    ) -> Result<NodeTemplate, BackendError> {
+        self.engine
+            .store()
+            .update_template(id, name, category, nodes, edges)
+            .await
+            .map_err(pg_err)
+    }
+
+    pub async fn template_delete(&self, id: &str) -> Result<bool, BackendError> {
+        self.engine
+            .store()
+            .delete_template(id)
+            .await
+            .map_err(pg_err)
+    }
+
     /// 单事务原子创建：insert run + seq=1 RunStarted（`flow-pg/src/lease.rs::create_run`）。
     /// published 解析与定义校验单点在 `resolve_runnable_definition`，
     /// 这里拿到的是已解析的版本——底层不再重复实现这条规则。
@@ -441,6 +493,8 @@ fn pg_err(err: PgError) -> BackendError {
         PgError::SignalNotFound(id) => BackendError::SignalNotFound(id),
         PgError::ScheduleNotFound(id) => BackendError::ScheduleNotFound(id),
         PgError::WebhookNotFound(token) => BackendError::WebhookNotFound(token),
+        PgError::TemplateNotFound(id) => BackendError::TemplateNotFound(id),
+        PgError::TemplateNameTaken(name) => BackendError::TemplateNameTaken(name),
         PgError::Conflict(msg) => BackendError::Conflict(msg),
         PgError::Invalid(msg) => BackendError::Invalid(msg),
         other => BackendError::internal(other),

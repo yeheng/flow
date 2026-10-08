@@ -35,6 +35,7 @@ flow-engine = { path = "../flow-engine" }
 flow-dto = { path = "../flow-dto" }
 flow-store = { path = "../flow-store" }
 flow-pg = { path = "../flow-pg" }
+flow-config = { path = "../flow-config" }
 
 [dev-dependencies]
 flow-test-support = { path = "../flow-test-support", default-features = false }

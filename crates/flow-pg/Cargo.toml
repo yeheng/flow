@@ -19,6 +19,7 @@ tracing = { workspace = true }
 futures = { workspace = true }
 flow-engine = { path = "../flow-engine" }
 flow-dto = { path = "../flow-dto" }
+flow-config = { path = "../flow-config" }
 
 # tests/ 只用：共用 PG 测试库生命周期（flow-test-support::pg），与 flow-rpc 的
 # ws_pg、backend-e2e 同指一份。`pg` 特性拉起 sqlx/postgres + docker CLI 那套。

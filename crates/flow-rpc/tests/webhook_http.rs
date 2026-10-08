@@ -23,9 +23,7 @@ impl Fixture {
                 .await
                 .unwrap(),
         );
-        let state = Arc::new(AppState {
-            backend: AnyBackend::Sqlite(backend.clone()),
-        });
+        let state = Arc::new(AppState::new(AnyBackend::Sqlite(backend.clone())));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {

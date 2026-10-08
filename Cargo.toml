@@ -10,6 +10,7 @@ members = [
     "crates/flow-store",
     "crates/flow-backend",
     "crates/flow-dto",
+    "crates/flow-config",
     "crates/flow-rpc",
     "crates/flow-cli",
     "crates/flow-test-support",

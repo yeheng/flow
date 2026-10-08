@@ -639,7 +639,10 @@ jsonrpsee WebSocket。本层只有**一份**方法实现，只依赖 `flow_backe
 | `workflow.create / update / publish / get / list / delete` | 定义生命周期。update 前强制 validate + x-secret 名称存在性校验（§5） |
 | `workflow.versions` | 版本历史（按 version 倒序，只回 version/status/checksum/created_at 元数据列，definition 走 workflow.get 按需拉取）；workflow 不存在返回 -32011 |
 | `nodetypes.list` | 前端画布能力清单：类型、端口、`params_schema`（JSON Schema draft-07 子集 type/required/properties/enum/default，另带 `x-widget`/`x-label`/`x-help`/`x-secret` 扩展键，前端据此渲染参数表单；后端校验仍以 `Definition::validate` 为准）、supports_retry、side_effect；单条描述的唯一来源是 `NodeType::descriptor`（§5） |
-| `secrets.list` | 已配置的密钥**名称**列表（`FLOW_SECRET_<名称>` 存在性），永远不含值；前端给 x-secret 参数渲染可选名称 |
+| `secrets.list` | 已配置的密钥清单 `{name, source}`（source=stored（界面管理）\| env（`FLOW_SECRET_<名称>`）），按名称排序，永远不含值；前端给 x-secret 参数渲染可选名称，设置页按来源决定能否删除 |
+| `secrets.set / secrets.delete` | 持久化密钥管理（§9.4）：set 写入（或覆盖）一个 AES-GCM 加密落盘的密钥（真值不出进程）；delete 只删 stored 来源，env 名字回 `deleted=false`。名称限 1..=64 个字母/数字/下划线 |
+| `config.get / config.update` | 统一配置（§9.4）：get 回文件级配置（默认值+文件，**不含 env 覆盖**）+ 生效的 env 覆盖名单 + 文件路径；update 深合并且服务端校验后原子写回文件。`storage.database_url` 一律脱敏为 `"<set>"`，update 侧收到 `"<set>"` 表示保持原值。**重启生效**（进程启动时一次性装配） |
+| `template.create / list / get / update / delete` | 可复用节点模板（§9.5）：画布片段（节点+内部边 JSON）+ 命名信封，`node_templates` 表（两后端同构）。create/update 做逐节点校验（类型已知 + `validate_params` + 边端点在片段内），**不跑** `Definition::validate`——片段不是完整定义；重名 -32012 |
 | `run.start` | 经 Backend：SQLite 校验 published → insert initializing → 持久化 run_started → 启动 Driver，初始化错误回写 failed；Postgres 单事务原子创建（§9 差异说明） |
 | `run.get / run.list` | 元数据 + live 标记；list 支持 status 过滤与 source（触发来源）过滤，词汇表外 -32010 |
 | `run.stats` | 精确统计（GROUP BY，非采样）：`{workflow_id?}` → `{total, by_status}`，不带过滤时附带 `by_workflow: [{workflow_id, total, by_status}]` |
@@ -738,6 +741,53 @@ flow-cli run list | get | events | timeline | cancel
   终态为 failed/cancelled——CI 据此区分「命令打错」与「工作流失败」；
 - **破坏性操作要确认**：`workflow delete` 在非交互 stdin 下必须显式 `-y`
   （绝不挂起等输入），服务端仍会对有 run 记录的工作流返回 -32012。
+
+### 9.4 统一配置（flow-config）与持久化密钥
+
+进程配置曾全部散落在 30+ 个 `FLOW_*` 环境变量 + CLI 参数里。现收敛为一份
+TOML（`flow.toml`，`crates/flow-config`，叶子 crate），分层加载
+（高覆盖低）：**CLI `--config` > 环境变量 > 配置文件 > 内置默认值**。
+搜索顺序：显式路径 → `FLOW_CONFIG` → `./flow.toml` → 平台配置目录。
+分区：`[server]`（监听地址/调度器/tick）、`[storage]`（backend/data_dir/
+database/database_url）、`[execution]`（mode/executor_bin/x_max/[remote]）、
+`[agent]`、`[journal]`、`[pg]`（原 flow-pg 11 个 env）。
+
+- **加载必须发生在构造 tokio runtime 之前**：runtime 形态
+  （current_thread / multi_thread）取决于 `storage.backend`
+  （`prefer_current_thread_runtime_for`）。`flow server` / `flow agent` /
+  `flow journal-server` / `flow journal-dev` 在 main 里同步 `Config::load`；
+- **全部 `FLOW_*` 环境变量保持原语义**（向后兼容：既有部署脚本与测试不改）；
+  env 覆盖按分区手写合并（显式可 grep），生效名单记录在 `Loaded.env_overrides`
+  供设置页展示「这些项重启后仍会被 env 覆盖」；
+- **明确不收敛**：`RUST_LOG`、`FLOW_SECRET_*`（见下）、journal token（每工作区
+  凭据）、执行协议冻结常量（contract.rs，改即协议变更）、executor FD 槽位、
+  `FLOW_RUN_LOG_BUDGET` 等 engine 内部预算（读取点在 driver 深处，维持 env）；
+- **config.get / config.update**：工作副本是**文件级**视图（默认值+文件，env
+  不进副本）——文件才是用户可编辑的真相；update 深合并（分区级替换）→
+  `validate` → 原子写回（tmp+rename），坏配置永远不落盘。全部字段重启生效；
+- **持久化密钥**（`flow-engine/src/secrets_store.rs`）：`secrets.set/delete`
+  写 AES-256-GCM 加密的 `<data_dir>/secrets.json`，主密钥 `<data_dir>/secret.key`
+  （随机 32B，unix 0600）。进程入口把 `SecretFileStore` 安装为进程级
+  `SecretSource`；`get_secret` / `list_secrets` **stored 优先、env 兜底**——
+  dispatch 前注入、真值不落盘不展开的既有边界不变（§5 x-secret）。主密钥
+  丢失（被换/被删）表现为解密失败=未配置，不炸进程。
+
+### 9.5 可复用节点模板
+
+画布片段（若干节点 + 内部边）的命名持久化，跨流程、跨设备复用：
+
+- **存储**：`node_templates` 表（id/name UNIQUE/category/nodes JSON/edges
+  JSON/时间戳），SQLite（flow-store）与 Postgres（flow-pg schema）同构，
+  `CREATE TABLE IF NOT EXISTS` 零迁移；`AnyBackend` 闭集双臂直通 store 层；
+- **校验是逐节点的**：类型已知（`NodeType::parse`）+ `validate_params`
+  （与整图 `Definition::validate` 同源的参数规则，为模板开放为 pub）+ 边端点
+  在片段内 + condition 出边端口合法。**不跑整图校验**——片段没有
+  start/end 约束，这是「模板≠隐藏工作流」的根本原因（绕开 `workflow.update`
+  的整图不变量，而不是破坏它）；
+- **前端只做一份片段落地逻辑**：`editor.ts` 的 `insertFragment`（id 重生成、
+  偏移、内部边重连、max_instances 检查、入 undo 栈）同时服务内存剪贴板
+  （粘贴）与模板插入；模板拖放用独立 MIME（`application/flow-template-id`），
+  面板按名列出、可重命名/删除。未知类型沿用 `unknownTypeDesc` 占位降级。
 
 ## 10. JS 沙箱（expr.rs）
 

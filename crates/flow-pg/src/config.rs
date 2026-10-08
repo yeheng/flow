@@ -36,6 +36,8 @@ pub struct PgConfig {
     pub lock_timeout: Duration,
     pub idle_tx_timeout: Duration,
     pub role: Role,
+    /// 连接池上限。
+    pub max_connections: u32,
 }
 
 impl Default for PgConfig {
@@ -52,6 +54,7 @@ impl Default for PgConfig {
             lock_timeout: Duration::from_secs(10),
             idle_tx_timeout: Duration::from_secs(10),
             role: Role::All,
+            max_connections: 16,
         }
     }
 }
@@ -88,6 +91,39 @@ impl PgConfig {
             lock_timeout: env_ms("FLOW_LOCK_TIMEOUT_MS", 10_000)?,
             idle_tx_timeout: env_ms("FLOW_IDLE_TX_TIMEOUT_MS", 10_000)?,
             role,
+            max_connections: env_number("FLOW_PG_MAX_CONNECTIONS", 16)?,
+        })
+    }
+}
+
+impl PgConfig {
+    /// 统一配置入口：从 flow-config 的 `[pg]` 分区构造。
+    /// role 字符串在这里解析（配置文件反序列化层只保证是三者之一以外的
+    /// 字符串会被 validate 拦下，这里是最后防线）。
+    pub fn from_tuning(tuning: &flow_config::PgTuning) -> Result<PgConfig, String> {
+        let role = match tuning.role.as_str() {
+            "gateway" => Role::Gateway,
+            "executor" => Role::Executor,
+            "all" => Role::All,
+            other => {
+                return Err(format!(
+                    "pg.role 必须是 all, gateway, or executor：{other:?}"
+                ))
+            }
+        };
+        Ok(PgConfig {
+            lease_ttl: Duration::from_millis(tuning.lease_ttl_ms),
+            scan_interval: Duration::from_millis(tuning.scan_interval_ms),
+            inbox_poll: Duration::from_millis(tuning.inbox_poll_ms),
+            max_runs: tuning.max_runs as usize,
+            signal_wait: Duration::from_millis(tuning.signal_wait_ms),
+            signal_poll: Duration::from_millis(tuning.signal_poll_ms),
+            subscribe_poll: Duration::from_millis(tuning.subscribe_poll_ms),
+            statement_timeout: Duration::from_millis(tuning.statement_timeout_ms),
+            lock_timeout: Duration::from_millis(tuning.lock_timeout_ms),
+            idle_tx_timeout: Duration::from_millis(tuning.idle_tx_timeout_ms),
+            role,
+            max_connections: tuning.max_connections,
         })
     }
 }

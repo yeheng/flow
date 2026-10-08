@@ -160,7 +160,7 @@ impl PgEngine {
                 ),
             ]);
         let pool = PgPoolOptions::new()
-            .max_connections(16)
+            .max_connections(cfg.max_connections)
             .acquire_timeout(Duration::from_secs(10))
             .connect_with(opts)
             .await?;

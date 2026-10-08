@@ -27,6 +27,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use flow_config::Config;
 use flow_engine::execution_protocol::contract::ExecutorInvocation;
 
 /// flow：统一二进制入口（server / cli / executor / agent / journal-*）。
@@ -36,11 +37,17 @@ use flow_engine::execution_protocol::contract::ExecutorInvocation;
     version,
     about = "flow 工作流引擎统一入口",
     long_about = "flow 工作流引擎统一入口。\n\n\
-                  后端在启动时用 FLOW_BACKEND 选择（sqlite 缺省 | postgres），\n\
+                  配置分层：CLI 参数 > 环境变量 > 配置文件（--config / FLOW_CONFIG / \
+                  ./flow.toml / 平台配置目录）> 内置默认值。\n\
+                  后端在启动时用 storage.backend 选择（sqlite 缺省 | postgres），\
                   不在构建期区分。执行器与主进程是同一个二进制。",
     arg_required_else_help = true
 )]
 struct Flow {
+    /// 统一配置文件路径（缺省：FLOW_CONFIG → ./flow.toml → 平台配置目录）。
+    /// 只影响读取它的子命令（server / agent / journal-server / journal-dev）。
+    #[arg(long, global = true, env = "FLOW_CONFIG")]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -69,30 +76,31 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// 受信任的远程执行中继（双 TLS 上联 + 本机执行器池）
+    /// 受信任的远程执行中继（双 TLS 上联 + 本机执行器池）。
+    /// 参数缺省时回落配置文件 [agent] 分区（flag > env > 配置文件 > 报错）。
     Agent {
         /// 主进程 control TLS 地址。
         #[arg(long, env = "FLOW_AGENT_CONTROL_ADDR")]
-        control_addr: String,
+        control_addr: Option<String>,
         /// 主进程 data TLS 地址。
         #[arg(long, env = "FLOW_AGENT_DATA_ADDR")]
-        data_addr: String,
+        data_addr: Option<String>,
         /// agent 身份（须与客户端证书 CN 一致）。
         #[arg(long, env = "FLOW_AGENT_ID")]
-        agent_id: String,
+        agent_id: Option<String>,
         #[arg(long, env = "FLOW_AGENT_CA")]
-        ca_cert: String,
+        ca_cert: Option<String>,
         #[arg(long, env = "FLOW_AGENT_CERT")]
-        cert: String,
+        cert: Option<String>,
         #[arg(long, env = "FLOW_AGENT_KEY")]
-        key: String,
+        key: Option<String>,
         /// 本机执行器二进制（独立部署形态）。缺省自召唤本文件的 executor
         /// 子命令；FLOW_EXECUTOR_BIN 环境变量同样生效。
         #[arg(long)]
         executor_bin: Option<String>,
         /// 本机执行槽位。
-        #[arg(long, env = "FLOW_AGENT_SLOTS", default_value = "4")]
-        slots: u32,
+        #[arg(long, env = "FLOW_AGENT_SLOTS")]
+        slots: Option<u32>,
     },
     /// journal 离线维护：verify / rebuild-index / backup / repair
     JournalTool {
@@ -165,8 +173,8 @@ enum JournalDevCommand {
 
 fn main() -> std::process::ExitCode {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let command = match Flow::try_parse() {
-        Ok(args) => args.command,
+    let flow = match Flow::try_parse() {
+        Ok(args) => args,
         Err(error) => {
             let success = matches!(
                 error.kind(),
@@ -176,11 +184,19 @@ fn main() -> std::process::ExitCode {
             std::process::exit(if success { 0 } else { 1 });
         }
     };
-    // 每个子命令自带 runtime 形态：executor/agent 是多线程子进程运行时，
-    // server 的形态（current_thread/multi_thread）随 FLOW_BACKEND 切换，
-    // 其余工具单线程足够。
+    let config = flow.config;
+    let command = flow.command;
+    // 配置文件在构造 runtime 之前同步加载：runtime 形态（current_thread /
+    // multi_thread）取决于 storage.backend。
+    let load_config = || -> Result<flow_config::Loaded, String> {
+        let loaded = Config::load(config.as_deref()).map_err(|e| e.to_string())?;
+        Ok(loaded)
+    };
     let code = match command {
-        Command::Server => server_main(),
+        Command::Server => match load_config() {
+            Ok(loaded) => server_main(loaded),
+            Err(err) => return exit_fail(&err),
+        },
         Command::Cli { args } => cli_main(args),
         Command::Executor { .. } => executor_main(),
         Command::Agent {
@@ -192,20 +208,30 @@ fn main() -> std::process::ExitCode {
             key,
             executor_bin,
             slots,
-        } => agent_main(
-            control_addr,
-            data_addr,
-            agent_id,
-            ca_cert,
-            cert,
-            key,
-            executor_bin,
-            slots,
-        ),
+        } => match load_config() {
+            Ok(loaded) => agent_main(
+                loaded.config,
+                control_addr,
+                data_addr,
+                agent_id,
+                ca_cert,
+                cert,
+                key,
+                executor_bin,
+                slots,
+            ),
+            Err(err) => return exit_fail(&err),
+        },
         Command::JournalTool { command } => journal_tool_main(command),
         Command::JournalBench { root } => journal_bench_main(root),
-        Command::JournalServer => journal_server_main(),
-        Command::JournalDev { data_dir, command } => journal_dev_main(data_dir, command),
+        Command::JournalServer => match load_config() {
+            Ok(loaded) => journal_server_main(loaded.config),
+            Err(err) => return exit_fail(&err),
+        },
+        Command::JournalDev { data_dir, command } => match load_config() {
+            Ok(loaded) => journal_dev_main(loaded.config.execution, data_dir, command),
+            Err(err) => return exit_fail(&err),
+        },
     };
     if code != 0 {
         return std::process::ExitCode::from(code.clamp(0, 255) as u8);
@@ -213,10 +239,17 @@ fn main() -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-/// `flow server`：与原 flow-server 二进制逐字同一份实现（runtime 形态随
-/// FLOW_BACKEND 切换，run_from_env 内部初始化 tracing）。
-fn server_main() -> i32 {
-    let runtime = if flow_rpc::prefer_current_thread_runtime() {
+/// 配置加载失败的统一出口（main 返回 ExitCode）。
+fn exit_fail(err: &dyn std::fmt::Display) -> std::process::ExitCode {
+    eprintln!("error: {err}");
+    std::process::ExitCode::FAILURE
+}
+
+/// `flow server`：配置装配后端（runtime 形态随 storage.backend 切换，
+/// flow_rpc::run 内部初始化 tracing）。
+fn server_main(loaded: flow_config::Loaded) -> i32 {
+    let runtime = if flow_backend::prefer_current_thread_runtime_for(loaded.config.storage.backend)
+    {
         tokio::runtime::Builder::new_current_thread()
     } else {
         tokio::runtime::Builder::new_multi_thread()
@@ -224,7 +257,7 @@ fn server_main() -> i32 {
     .enable_all()
     .build()
     .expect("server tokio runtime");
-    match runtime.block_on(flow_rpc::run_from_env()) {
+    match runtime.block_on(flow_rpc::run(loaded)) {
         Ok(()) => 0,
         Err(err) => {
             eprintln!("flow server 异常退出：{err}");
@@ -271,22 +304,80 @@ fn executor_main() -> i32 {
 }
 
 /// `flow agent`：远程中继入口。executor 缺省自召唤本文件的 executor 子命令。
+/// 参数解析：CLI flag > env（clap env 属性已合并）> 配置文件 [agent] > 报错。
 #[allow(clippy::too_many_arguments)]
 fn agent_main(
-    control_addr: String,
-    data_addr: String,
-    agent_id: String,
-    ca_cert: String,
-    cert: String,
-    key: String,
-    executor_bin: Option<String>,
-    slots: u32,
+    config: Config,
+    flag_control_addr: Option<String>,
+    flag_data_addr: Option<String>,
+    flag_agent_id: Option<String>,
+    flag_ca_cert: Option<String>,
+    flag_cert: Option<String>,
+    flag_key: Option<String>,
+    flag_executor_bin: Option<String>,
+    flag_slots: Option<u32>,
 ) -> i32 {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .try_init();
+    let agent = &config.agent;
+    let required =
+        |flag: Option<String>, configured: Option<String>, name: &str| -> Result<String, String> {
+            flag.or(configured).ok_or_else(|| {
+                format!("缺少 {name}：用 CLI 参数、{name} 对应环境变量或配置文件 [agent] 分区提供")
+            })
+        };
+    let control_addr = match required(
+        flag_control_addr,
+        agent.control_addr.clone(),
+        "control_addr",
+    ) {
+        Ok(v) => v,
+        Err(err) => return fail(&err),
+    };
+    let data_addr = match required(flag_data_addr, agent.data_addr.clone(), "data_addr") {
+        Ok(v) => v,
+        Err(err) => return fail(&err),
+    };
+    let agent_id = match required(flag_agent_id, agent.agent_id.clone(), "agent_id") {
+        Ok(v) => v,
+        Err(err) => return fail(&err),
+    };
+    let ca_cert = match required(
+        flag_ca_cert,
+        agent
+            .ca_cert
+            .clone()
+            .map(|p| p.to_string_lossy().into_owned()),
+        "ca_cert",
+    ) {
+        Ok(v) => v,
+        Err(err) => return fail(&err),
+    };
+    let cert = match required(
+        flag_cert,
+        agent.cert.clone().map(|p| p.to_string_lossy().into_owned()),
+        "cert",
+    ) {
+        Ok(v) => v,
+        Err(err) => return fail(&err),
+    };
+    let key = match required(
+        flag_key,
+        agent.key.clone().map(|p| p.to_string_lossy().into_owned()),
+        "key",
+    ) {
+        Ok(v) => v,
+        Err(err) => return fail(&err),
+    };
+    let slots = flag_slots.unwrap_or(agent.slots);
+    // executor_bin 优先级：CLI flag > [agent].executor_bin > [execution].executor_bin
+    // （FLOW_EXECUTOR_BIN env 已在加载时合并进 execution 侧）
+    let executor_bin = flag_executor_bin
+        .or(agent.executor_bin.clone())
+        .or(config.execution.executor_bin.clone());
     let executor = match executor_bin {
         Some(bin) => ExecutorInvocation::explicit(bin),
         None => match ExecutorInvocation::locate() {
@@ -537,12 +628,12 @@ async fn bench(root: PathBuf) -> Result<i32, Box<dyn std::error::Error>> {
 }
 
 /// `flow journal-server`：JSONL v2 开发服务（原 flow-journal-server bin）。
-fn journal_server_main() -> i32 {
+fn journal_server_main(config: Config) -> i32 {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("journal-server tokio runtime");
-    match runtime.block_on(journal_server()) {
+    match runtime.block_on(journal_server(config)) {
         Ok(()) => 0,
         Err(err) => {
             eprintln!("error: {err}");
@@ -551,18 +642,18 @@ fn journal_server_main() -> i32 {
     }
 }
 
-async fn journal_server() -> Result<(), Box<dyn std::error::Error>> {
+async fn journal_server(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     use flow_backend::journal::JournalBackend;
 
-    let root = PathBuf::from(std::env::var("FLOW_JOURNAL_DATA_DIR")?);
+    let root = std::env::var("FLOW_JOURNAL_DATA_DIR")
+        .ok()
+        .or_else(|| config.journal.data_dir.clone())
+        .map(PathBuf::from)
+        .ok_or("journal 数据目录缺失：配置 [journal].data_dir 或环境变量 FLOW_JOURNAL_DATA_DIR")?;
     let token = std::env::var("FLOW_JOURNAL_TOKEN")?;
-    let addr = std::env::var("FLOW_JOURNAL_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:9802".into())
-        .parse()?;
+    let addr: std::net::SocketAddr = config.journal.addr.parse()?;
     let backend = JournalBackend::open(&root, Default::default()).await?;
-    let download_addr: std::net::SocketAddr = std::env::var("FLOW_JOURNAL_HTTP_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:9803".into())
-        .parse()?;
+    let download_addr: std::net::SocketAddr = config.journal.http_addr.parse()?;
     if !download_addr.ip().is_loopback() {
         return Err("development downloads require loopback".into());
     }
@@ -579,8 +670,9 @@ async fn journal_server() -> Result<(), Box<dyn std::error::Error>> {
             .await
     });
     let (server, addr) = flow_rpc::journal_v2::serve(backend.clone(), token, addr).await?;
-    flow_backend::start_execution_from_env(&backend).await?;
-    let scheduler = flow_rpc::journal_triggers::start(backend.clone());
+    flow_backend::start_execution(&config.execution, &backend).await?;
+    let scheduler =
+        flow_rpc::journal_triggers::start(backend.clone(), config.journal_trigger_tick());
     eprintln!("JSONL development RPC listening on {addr}");
     tokio::signal::ctrl_c().await?;
     scheduler.abort();
@@ -600,12 +692,16 @@ async fn journal_server() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// `flow journal-dev`：JSONL v2 开发运行器（原 flow-journal-dev bin）。
-fn journal_dev_main(data_dir: PathBuf, command: JournalDevCommand) -> i32 {
+fn journal_dev_main(
+    execution: flow_config::ExecutionConfig,
+    data_dir: PathBuf,
+    command: JournalDevCommand,
+) -> i32 {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("journal-dev tokio runtime");
-    match runtime.block_on(journal_dev(data_dir, command)) {
+    match runtime.block_on(journal_dev(execution, data_dir, command)) {
         Ok(()) => 0,
         Err(err) => {
             eprintln!("error: {err}");
@@ -615,6 +711,7 @@ fn journal_dev_main(data_dir: PathBuf, command: JournalDevCommand) -> i32 {
 }
 
 async fn journal_dev(
+    execution: flow_config::ExecutionConfig,
     data_dir: PathBuf,
     command: JournalDevCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -682,7 +779,7 @@ async fn journal_dev(
         .filter(|r| !r.terminal())
         .map(|r| r.run_id.clone())
         .collect::<BTreeSet<_>>();
-    flow_backend::start_execution_from_env(&backend).await?;
+    flow_backend::start_execution(&execution, &backend).await?;
     while !pending.is_empty() {
         tokio::select! {_=tokio::signal::ctrl_c()=>break,_=tokio::time::sleep(std::time::Duration::from_millis(100))=>{}}
         for run in backend.state().await.runs.values().filter(|r| r.terminal()) {

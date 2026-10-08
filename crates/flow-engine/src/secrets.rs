@@ -7,6 +7,8 @@
 //!   真值不参与 `${}` 展开，也不会随 node_started 落盘（事件在注入前已写）；
 //! - `workflow.update` 提前校验名称存在，把配置错误挡在发布前。
 
+use std::sync::{Arc, OnceLock};
+
 use serde_json::Value;
 
 use crate::model::{Definition, Node};
@@ -14,17 +16,69 @@ use crate::model::{Definition, Node};
 /// 密钥环境变量前缀。名称 `OPENAI_KEY` ↔ 环境变量 `FLOW_SECRET_OPENAI_KEY`。
 pub const SECRET_ENV_PREFIX: &str = "FLOW_SECRET_";
 
-/// 按名称取密钥真值。现扫环境变量，不缓存（进程内可随时改，测试友好）。
+/// 追加的密钥来源（web 界面管理的**持久化密钥**，AES-GCM 落盘，见
+/// [`crate::secrets_store::SecretFileStore`]）。进程入口装一次；装上后
+/// `get_secret` 先查它，环境变量兜底——环境变量机制原样保留。
+pub trait SecretSource: Send + Sync {
+    fn get(&self, name: &str) -> Option<String>;
+    fn names(&self) -> Vec<String>;
+}
+
+static STORED: OnceLock<Arc<dyn SecretSource>> = OnceLock::new();
+
+/// 安装持久化密钥来源。重复安装报错（进程入口只调一次；测试各自直连 store）。
+pub fn install_secret_source(source: Arc<dyn SecretSource>) -> Result<(), String> {
+    STORED
+        .set(source)
+        .map_err(|_| "secret source already installed".to_string())
+}
+
+fn stored() -> Option<&'static Arc<dyn SecretSource>> {
+    STORED.get()
+}
+
+/// 密钥来源归因：stored（界面管理）优先于 env。
+pub fn source_of(name: &str) -> &'static str {
+    match stored() {
+        Some(source) if source.get(name).is_some() => "stored",
+        _ => "env",
+    }
+}
+
+/// 密钥清单（排序，去重，永远不含值），附来源归因。
+pub fn list_secrets() -> Vec<(String, &'static str)> {
+    let mut out: Vec<(String, &'static str)> = Vec::new();
+    if let Some(source) = stored() {
+        for name in source.names() {
+            if !name.is_empty() {
+                out.push((name, "stored"));
+            }
+        }
+    }
+    for key in std::env::vars() {
+        if let Some(name) = key.0.strip_prefix(SECRET_ENV_PREFIX) {
+            if !name.is_empty() && !out.iter().any(|(n, _)| n == name) {
+                out.push((name.to_string(), "env"));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out.dedup_by(|a, b| a.0 == b.0);
+    out
+}
+
+/// 按名称取密钥真值：先查持久化来源（若有），回落环境变量。
+/// 不缓存（进程内可随时改，测试友好）。
 pub fn get_secret(name: &str) -> Option<String> {
+    if let Some(value) = stored().and_then(|s| s.get(name)) {
+        return Some(value);
+    }
     std::env::var(format!("{SECRET_ENV_PREFIX}{name}")).ok()
 }
 
 /// 已配置的密钥名称列表（排序，永远不含值）。
 pub fn list_secret_names() -> Vec<String> {
-    let mut names: Vec<String> = std::env::vars()
-        .filter_map(|(key, _)| key.strip_prefix(SECRET_ENV_PREFIX).map(str::to_string))
-        .filter(|name| !name.is_empty())
-        .collect();
+    let mut names: Vec<String> = list_secrets().into_iter().map(|(name, _)| name).collect();
     names.sort();
     names.dedup();
     names

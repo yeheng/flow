@@ -15,6 +15,7 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 flow-backend = { path = "../../crates/flow-backend" }
+flow-config = { path = "../../crates/flow-config" }
 flow-rpc = { path = "../../crates/flow-rpc" }
 jsonrpsee = { version = "0.26", features = ["server"] }
 tokio = { version = "1", features = ["full"] }
