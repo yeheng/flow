@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, watch } from "vue";
+import { onMounted, onUnmounted, ref, watch } from "vue";
 import { onBeforeRouteLeave, onBeforeRouteUpdate, useRoute, useRouter } from "vue-router";
 import {
   autoLayout,
   confirmDiscardIfDirty,
   copySelection,
+  deleteSelection,
   dirty,
   editor,
   ensureNodeTypes,
@@ -28,6 +29,7 @@ import RunPanel from "../components/RunPanel.vue";
 
 const route = useRoute();
 const router = useRouter();
+const paramsPanel = ref<InstanceType<typeof ParamsPanel>>();
 
 async function load(id: string): Promise<void> {
   if (!(await ensureNodeTypes())) return;
@@ -69,6 +71,10 @@ function isEditableTarget(t: EventTarget | null): boolean {
 
 // 快捷键只在编辑器页注册（运行详情等只读页不受影响）；输入框聚焦时不劫持
 function onKeydown(e: KeyboardEvent): void {
+  if ((e.key === "Delete" || e.key === "Backspace") && !isEditableTarget(e.target)) {
+    if (deleteSelection()) e.preventDefault();
+    return;
+  }
   if (!(e.metaKey || e.ctrlKey)) return;
   const key = e.key.toLowerCase();
   if (key === "s") {
@@ -170,10 +176,10 @@ function locateError(nodeId?: string): void {
         <NodePalette />
       </aside>
       <section class="center">
-        <FlowCanvas />
+        <FlowCanvas @edit-node="paramsPanel?.focusName()" />
       </section>
       <aside class="right">
-        <ParamsPanel />
+        <ParamsPanel ref="paramsPanel" />
         <RunPanel />
       </aside>
     </main>

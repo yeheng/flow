@@ -131,7 +131,8 @@ flow-server**（临时目录 sqlite，`FLOW_ADDR=19311` / `FLOW_HTTP_ADDR=19312`
 teardown 杀进程删目录。种子数据直接走 JSON-RPC WebSocket（`e2e/helpers.ts`，Node 22
 内置 WebSocket），用例间以随机名称隔离、串行执行（仪表盘断言全局 `run.stats`）。
 覆盖：工作流列表新建、编辑器画布/保存、运行链路（含来源归因与详情时间线）、
-触发器页（webhook 复制/POST 触发、非法 cron 报错）、仪表盘与 `run.stats` 对账。
+触发器页（webhook 复制/POST 触发、非法 cron 报错）、仪表盘与 `run.stats` 对账、
+编辑器右键交互（菜单增删/粘贴、按住右键拖拽连线与平移画布）。
 
 ## 编辑器交互（P1）
 
@@ -141,6 +142,11 @@ teardown 杀进程删目录。种子数据直接走 JSON-RPC WebSocket（`e2e/he
 - **多选与复制粘贴**：Shift+左键拖框选、Cmd/Ctrl+点击多选；Cmd/Ctrl+C 复制选中节点及其内部边，
   Cmd/Ctrl+V 粘贴（重新生成节点 id、位置逐次偏移 32px、内部边重连、外部边不复制、
   受 max_instances 限制）；Delete/Backspace 删除选中。快捷键在输入框聚焦时不劫持。
+- **右键交互**：原地右键弹自定义菜单——节点上（编辑参数/复制/创建副本/存为模板/删除，
+  sub_workflow 另有钻取）、边上（删除连线）、空白处（添加节点子菜单按类别分组、粘贴到落点、
+  自动布局、适应视图）；按住右键拖动：起点在节点上进入连线模式（多出端口按鼠标就近选择，
+  悬停的合法目标节点绿色高亮，非法落点静默取消），起点在空白处平移画布。位移小于 4px
+  视为点击弹菜单，浏览器原生右键菜单全程抑制。
 - **前端预校验**：画布实时校验（150ms debounce），规则对齐服务端 Definition::validate
   （单 start/至少一个 end/DAG/可达性/condition 端口/max_instances/required 参数）；
   出错节点画布标红，顶部条显示错误计数，点击展开列表、点条目定位节点；
@@ -181,7 +187,7 @@ teardown 杀进程删目录。种子数据直接走 JSON-RPC WebSocket（`e2e/he
 ## 使用
 
 1. `/workflows` 点「新建」，画布自动放入 start → end 最小定义；
-2. 从节点面板拖入或直接点击添加节点（面板按类别分组），拖动手柄连线
+2. 从节点面板拖入节点，或画布空白处右键「添加节点」；手柄拖拽或按住右键从节点拖出连线
    （condition 有 真/假 两个出口，标签标在边上）；
 3. 点击节点在右侧编辑参数——表单由 `nodetypes.list` 返回的 JSON Schema
    （`params_schema`，含 x-widget: code/json/workflow-picker）递归渲染；

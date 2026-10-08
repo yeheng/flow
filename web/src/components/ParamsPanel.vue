@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, nextTick, ref } from "vue";
 import { selectedNode } from "../state/editor";
 import { commitParams } from "../state/history";
 import SchemaField from "./SchemaField.vue";
@@ -8,6 +8,17 @@ const node = selectedNode;
 const data = computed(() => node.value?.data ?? null);
 const desc = computed(() => data.value?.nodeType ?? null);
 const schema = computed(() => desc.value?.params_schema ?? null);
+const nameInput = ref<HTMLInputElement>();
+
+defineExpose({
+  // 调用方（右键菜单「编辑参数」）在 selectedNodeId 刚设置的同一 tick 触发聚焦：
+  // 等面板渲染出输入框再 focus
+  async focusName() {
+    await nextTick();
+    nameInput.value?.focus();
+    nameInput.value?.select();
+  },
+});
 
 function onName(ev: Event): void {
   if (!data.value || !node.value) return;
@@ -48,8 +59,8 @@ function setRetry(key: "max_attempts" | "backoff_ms", ev: Event): void {
         <div class="field-static">{{ node.id }}</div>
       </div>
       <div class="field">
-        <label>名称</label>
-        <input type="text" :value="data.name" @input="onName" />
+        <label for="node-name">名称</label>
+        <input id="node-name" ref="nameInput" type="text" :value="data.name" @input="onName" />
       </div>
       <!-- key 带节点 id：切换节点时强制重建，清掉 json 等字段的本地编辑状态 -->
       <SchemaField

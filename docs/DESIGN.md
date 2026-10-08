@@ -726,7 +726,9 @@ flow-cli run list | get | events | timeline | cancel
   直接再导入或喂给 run-workflow.mjs。服务端语义（不可变版本快照、只有
   published 可执行、有 run 拒删）一条不变，编排下沉成新方法只会养出第二份
   「导入」规则。失败不回滚：update/publish 被拒时留下一个 latest 0 的 workflow
-  壳，重新 import 同名会复用它；
+  壳，重新 import 同名会复用它。web 端工作流列表页的「导入」按钮是同一份
+  编排（`web/src/state/workflow-io.ts`）：信封或裸 definition、name 回落
+  文件名（剥 `.json`/`.workflow`）、同名追加版本、默认发布；
 - **手动触发**：`run start` 接受 workflow_id 或 name（本地解析），默认轮询
   `run.get` 到终态并把 run 输出打到 stdout；`--detach` 只打印 run_id。等待用
   轮询不用 `run.subscribe`：一次性等待没有推送优化的收益，反而多一条会断开

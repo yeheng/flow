@@ -1,4 +1,4 @@
-import { computed, reactive, ref, watch } from "vue";
+import { computed, reactive, ref, shallowRef, watch } from "vue";
 import type { Connection } from "@vue-flow/core";
 import * as api from "../api/flow";
 import { RpcError, client, errText } from "../rpc/client";
@@ -72,6 +72,8 @@ interface EditorState {
   selectedNodeId: string | null;
   /** RunPanel 行 hover/click 联动画布高亮 */
   highlightNodeId: string | null;
+  /** 右键拖拽连线时悬停的合法目标节点（画布高亮用，拖拽结束清空） */
+  linkTargetId: string | null;
   /** sub_workflow 钻取栈：栈顶是当前工作流的直接父级 */
   breadcrumb: BreadcrumbEntry[];
 }
@@ -88,7 +90,37 @@ export const editor = reactive<EditorState>({
   edges: [],
   selectedNodeId: null,
   highlightNodeId: null,
+  linkTargetId: null,
   breadcrumb: [],
+});
+
+/** 节点分类的中文标签（调色板分组与画布右键「添加节点」子菜单共用） */
+export const categoryLabels: Record<string, string> = {
+  control: "控制",
+  compute: "计算",
+  integration: "集成",
+  human: "人工",
+  composition: "组合",
+  ai: "AI",
+  notify: "通知",
+};
+
+/** 按 category 分组，保持 nodetypes.list 的出现顺序 */
+export const nodeTypeGroups = computed(() => {
+  const order: string[] = [];
+  const byCat = new Map<string, NodeTypeDesc[]>();
+  for (const nt of editor.nodeTypes) {
+    if (!byCat.has(nt.category)) {
+      byCat.set(nt.category, []);
+      order.push(nt.category);
+    }
+    byCat.get(nt.category)!.push(nt);
+  }
+  return order.map((cat) => ({
+    cat,
+    label: categoryLabels[cat] ?? cat,
+    items: byCat.get(cat)!,
+  }));
 });
 
 /**
@@ -405,12 +437,30 @@ export function addNode(type: string, position: { x: number; y: number }): boole
     if (prop.default !== undefined) params[key] = JSON.parse(JSON.stringify(prop.default));
   }
   commit();
+  for (const node of editor.nodes) node.selected = false;
+  for (const edge of editor.edges) edge.selected = false;
   editor.nodes.push({
     id: `${type}_${seq}`,
     type: "flow",
     position,
     data: { name: desc.label, nodeType: desc, params },
+    selected: true,
   });
+  editor.selectedNodeId = `${type}_${seq}`;
+  return true;
+}
+
+/** 菜单与快捷键共用删除入口；关联连线随节点一起删除，一次撤销完整恢复。 */
+export function deleteSelection(): boolean {
+  const ids = new Set(editor.nodes.filter((node) => node.selected).map((node) => node.id));
+  if (ids.size === 0 && !editor.edges.some((edge) => edge.selected)) return false;
+  commit();
+  editor.nodes = editor.nodes.filter((node) => !ids.has(node.id));
+  editor.edges = editor.edges.filter(
+    (edge) => !edge.selected && !ids.has(edge.source) && !ids.has(edge.target),
+  );
+  if (editor.selectedNodeId && ids.has(editor.selectedNodeId)) editor.selectedNodeId = null;
+  if (editor.highlightNodeId && ids.has(editor.highlightNodeId)) editor.highlightNodeId = null;
   return true;
 }
 
@@ -566,16 +616,16 @@ export interface ClipboardEdge {
   targetHandle?: string | null;
 }
 
-let clipboard: { nodes: ClipboardNode[]; edges: ClipboardEdge[] } | null = null;
+const clipboard = shallowRef<{ nodes: ClipboardNode[]; edges: ClipboardEdge[] } | null>(null);
+export const canPaste = computed(() => clipboard.value !== null);
 /** 同一份剪贴板连续粘贴的偏移序号；新复制重置 */
 let pasteSerial = 0;
 
-/** 复制选中节点及其内部边（两端都选中的边）；无选中返回 false（调用方不拦截浏览器默认行为） */
-export function copySelection(): boolean {
+function selectionFragment(): { nodes: ClipboardNode[]; edges: ClipboardEdge[] } | null {
   const selected = editor.nodes.filter((n) => n.selected);
-  if (selected.length === 0) return false;
+  if (selected.length === 0) return null;
   const ids = new Set(selected.map((n) => n.id));
-  clipboard = {
+  return {
     nodes: selected.map((n) => ({
       id: n.id,
       type: n.data.nodeType.type,
@@ -592,8 +642,21 @@ export function copySelection(): boolean {
         targetHandle: e.targetHandle,
       })),
   };
+}
+
+/** 复制选中节点及其内部边（两端都选中的边）；无选中返回 false（调用方不拦截浏览器默认行为） */
+export function copySelection(): boolean {
+  const fragment = selectionFragment();
+  if (!fragment) return false;
+  clipboard.value = fragment;
   pasteSerial = 0;
   return true;
+}
+
+/** 创建副本不改写剪贴板；节点参数与内部连线沿用片段插入规则。 */
+export function duplicateSelection(): boolean {
+  const fragment = selectionFragment();
+  return fragment ? insertFragment(fragment.nodes, fragment.edges, { offset: { x: 32, y: 32 } }) : false;
 }
 
 export interface InsertOptions {
@@ -656,6 +719,8 @@ export function insertFragment(
   // 选中插入结果，取消旧选择（selected=false 时不动选择态）
   if ((opts.selected ?? true) === true) {
     for (const n of editor.nodes) n.selected = false;
+    for (const e of editor.edges) e.selected = false;
+    editor.selectedNodeId = newNodes[0].id;
   }
   editor.nodes.push(...newNodes);
   for (const ce of edges) {
@@ -679,9 +744,16 @@ export function insertFragment(
 }
 
 /** 粘贴：偏移按连续粘贴序号递增（同一份片段越粘越远，不叠在一起） */
-export function pasteClipboard(): boolean {
-  if (!clipboard) return false;
-  return insertFragment(clipboard.nodes, clipboard.edges);
+export function pasteClipboard(position?: Position): boolean {
+  const fragment = clipboard.value;
+  if (!fragment) return false;
+  const offset = position
+    ? {
+        x: position.x - Math.min(...fragment.nodes.map((node) => node.position.x)),
+        y: position.y - Math.min(...fragment.nodes.map((node) => node.position.y)),
+      }
+    : undefined;
+  return insertFragment(fragment.nodes, fragment.edges, { offset });
 }
 
 // ---- 自动布局 ----

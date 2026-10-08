@@ -1,8 +1,11 @@
 <script setup lang="ts">
-import { onMounted } from "vue";
+import { onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
 import { createWorkflow, editor, refreshWorkflows, removeWorkflow } from "../state/editor";
+import { importWorkflow, parseImportDocument } from "../state/workflow-io";
+import { errText } from "../rpc/client";
 import { confirmDialog, promptDialog } from "../state/modal";
+import { toast } from "../state/toast";
 
 const router = useRouter();
 
@@ -22,14 +25,69 @@ async function onDelete(id: string): Promise<void> {
     await removeWorkflow(id);
   }
 }
+
+// ---- 导入（flow-cli workflow import 的 web 形态：{name, definition} 信封或裸
+// definition，按 name upsert，默认发布） ----
+const fileInput = ref<HTMLInputElement | null>(null);
+const importing = ref(false);
+
+function onPickFile(): void {
+  fileInput.value?.click();
+}
+
+async function onFileChange(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  // 允许重复选择同一个文件：清空 value，否则 change 不再触发
+  input.value = "";
+  if (!file || importing.value) return;
+  let parsed;
+  try {
+    parsed = parseImportDocument(await file.text(), file.name);
+  } catch (e) {
+    toast.error(e instanceof Error ? e.message : String(e));
+    return;
+  }
+  // 名字可改（预填信封 name 或文件名），确认后导入并发布
+  const name = await promptDialog(
+    `导入「${file.name}」→ 工作流名称（同名将追加新版本，导入后自动发布）`,
+    parsed.name,
+  );
+  if (name === null || !name.trim()) return;
+  importing.value = true;
+  try {
+    const result = await importWorkflow(name.trim(), parsed.definition);
+    toast.success(
+      `已导入 ${result.name} v${result.version}（${result.created ? "新建" : "追加版本"}，已发布）`,
+    );
+    await refreshWorkflows();
+  } catch (e) {
+    toast.error(errText(e));
+  } finally {
+    importing.value = false;
+  }
+}
 </script>
 
 <template>
   <div class="page">
     <div class="page-header">
       <h2>工作流</h2>
-      <button class="primary" @click="onCreate">新建</button>
+      <span class="header-actions">
+        <button :disabled="importing" @click="onPickFile">
+          {{ importing ? "导入中…" : "导入" }}
+        </button>
+        <button class="primary" @click="onCreate">新建</button>
+      </span>
     </div>
+    <!-- 文件选择器藏在按钮后：accept 限定 json；value 清空见 onFileChange -->
+    <input
+      ref="fileInput"
+      type="file"
+      accept=".json,application/json"
+      class="import-input"
+      @change="onFileChange"
+    />
     <table class="data-table">
       <thead>
         <tr>
@@ -64,3 +122,15 @@ async function onDelete(id: string): Promise<void> {
     <p v-if="editor.workflows.length === 0" class="wf-empty">暂无工作流，点击「新建」开始</p>
   </div>
 </template>
+
+<style scoped>
+.header-actions {
+  display: inline-flex;
+  gap: 8px;
+}
+
+/* 文件选择器只作按钮背后的通道，不占布局 */
+.import-input {
+  display: none;
+}
+</style>

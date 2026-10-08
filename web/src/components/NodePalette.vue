@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
-import { addNode, editor } from "../state/editor";
+import { editor, nodeTypeGroups } from "../state/editor";
 import {
   ensureTemplates,
   insertTemplate,
@@ -12,33 +12,7 @@ import {
 import { confirmDialog, promptDialog } from "../state/modal";
 import type { NodeTypeDesc } from "../types";
 
-const categoryLabels: Record<string, string> = {
-  control: "控制",
-  compute: "计算",
-  integration: "集成",
-  human: "人工",
-  composition: "组合",
-  ai: "AI",
-  notify: "通知",
-};
-
-/** 按 category 分组，保持 nodetypes.list 的出现顺序 */
-const groups = computed(() => {
-  const order: string[] = [];
-  const byCat = new Map<string, NodeTypeDesc[]>();
-  for (const nt of editor.nodeTypes) {
-    if (!byCat.has(nt.category)) {
-      byCat.set(nt.category, []);
-      order.push(nt.category);
-    }
-    byCat.get(nt.category)!.push(nt);
-  }
-  return order.map((cat) => ({
-    cat,
-    label: categoryLabels[cat] ?? cat,
-    items: byCat.get(cat)!,
-  }));
-});
+const groups = nodeTypeGroups;
 
 const selectedCount = computed(() => editor.nodes.filter((n) => n.selected).length);
 
@@ -48,20 +22,22 @@ onMounted(() => {
 
 function onDragStart(event: DragEvent, nt: NodeTypeDesc): void {
   if (!event.dataTransfer) return;
+  if (!editor.workflowId || atLimit(nt)) {
+    event.preventDefault();
+    return;
+  }
   event.dataTransfer.setData("application/flow-node-type", nt.type);
-  event.dataTransfer.effectAllowed = "move";
+  event.dataTransfer.effectAllowed = "copy";
+}
+
+function atLimit(nt: NodeTypeDesc): boolean {
+  return !!nt.max_instances && editor.nodes.filter((n) => n.data.nodeType.type === nt.type).length >= nt.max_instances;
 }
 
 function onTemplateDragStart(event: DragEvent, id: string): void {
   if (!event.dataTransfer) return;
   event.dataTransfer.setData("application/flow-template-id", id);
   event.dataTransfer.effectAllowed = "copy";
-}
-
-/** 点击即添加：落在现有节点右下方的错位空档处 */
-function onClickAdd(nt: NodeTypeDesc): void {
-  const n = editor.nodes.length;
-  addNode(nt.type, { x: 160 + (n % 5) * 48, y: 120 + (n % 5) * 48 });
 }
 
 /** 点击模板 = 插入到错位空档；拖拽落点由 FlowCanvas 处理 */
@@ -119,14 +95,16 @@ async function onRenameTemplate(id: string, current: string): Promise<void> {
         v-for="nt in g.items"
         :key="nt.type"
         class="palette-item"
-        :class="`cat-${nt.category}`"
-        draggable="true"
-        :title="`${nt.label}：拖到画布，或点击添加`"
+        :class="[`cat-${nt.category}`, { disabled: !editor.workflowId || atLimit(nt) }]"
+        :draggable="!!editor.workflowId && !atLimit(nt)"
+        :aria-disabled="!editor.workflowId || atLimit(nt)"
+        :data-node-type="nt.type"
+        :title="atLimit(nt) ? `${nt.label}：已达数量上限（${nt.max_instances} 个）` : `${nt.label}：拖到画布添加`"
         @dragstart="onDragStart($event, nt)"
-        @click="onClickAdd(nt)"
       >
         <span class="palette-dot" />
-        {{ nt.label }}
+        <span class="palette-name">{{ nt.label }}</span>
+        <span class="palette-grip" aria-hidden="true">⠿</span>
       </div>
     </div>
 
@@ -152,7 +130,7 @@ async function onRenameTemplate(id: string, current: string): Promise<void> {
         </span>
       </div>
     </div>
-    <p class="palette-hint">拖拽到画布，或点击添加节点</p>
+    <p class="palette-hint">拖动节点到画布添加；右键点节点开菜单，按住右键拖动可连线，空白处拖动平移画布。</p>
   </div>
 </template>
 
@@ -219,6 +197,20 @@ async function onRenameTemplate(id: string, current: string): Promise<void> {
 
 .palette-item:active {
   cursor: grabbing;
+}
+
+.palette-item.disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.palette-name {
+  flex: 1;
+}
+
+.palette-grip {
+  color: var(--text3);
+  font-size: 15px;
 }
 
 .palette-dot {

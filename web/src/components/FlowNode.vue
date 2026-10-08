@@ -67,6 +67,7 @@ const nodeClass = computed(() => {
   if (isSubWorkflow.value) cls.push("sub-workflow");
   if (runState.value) cls.push(`run-${runState.value}`);
   if (editor.highlightNodeId === props.id) cls.push("highlighted");
+  if (editor.linkTargetId === props.id) cls.push("link-target");
   if (invalidMsg.value) cls.push("invalid");
   return cls;
 });
@@ -244,6 +245,14 @@ function sourceStyle(index: number, total: number) {
   border-color: #a371f7;
   box-shadow:
     0 0 0 2px rgba(163, 113, 247, 0.35),
+    0 4px 20px var(--shadow-hover);
+}
+
+/* 右键拖拽连线的合法落点目标 */
+.flow-node.link-target {
+  border-color: var(--ok);
+  box-shadow:
+    0 0 0 2px rgba(63, 185, 80, 0.35),
     0 4px 20px var(--shadow-hover);
 }
 
