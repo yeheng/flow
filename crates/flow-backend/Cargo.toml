@@ -16,7 +16,7 @@ rustls-pemfile = { workspace = true }
 x509-parser = { workspace = true }
 tracing-subscriber = { workspace = true }
 rcgen = { workspace = true }
-clap.workspace = true
+clap = { workspace = true, features = ["env"] }
 cron-parser.workspace = true
 sqlx.workspace = true
 tempfile = "3"

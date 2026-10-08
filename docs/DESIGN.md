@@ -57,13 +57,33 @@ crates/
                 初始化协议、信号落账、订阅推送的差异在边界内吸收；
                 「只有 published 可执行 + 创建前校验」单点在 resolve_runnable_definition
   flow-pg       Postgres 后端实现：共享日志、epoch 租约、持久 inbox、executor
-  flow-rpc      jsonrpsee WebSocket 服务（入口：`flow server`）；**只依赖
-                `AnyBackend` 枚举**，不感知 flow-store / flow-pg，也不读 FLOW_BACKEND；
+  flow-rpc      jsonrpsee WebSocket 服务（bin: flow-server / flow-journal-server）；
+                **只依赖 `AnyBackend` 枚举**，不感知 flow-store / flow-pg，也不读 FLOW_BACKEND；
                 进程内还跑 cron 调度器与 webhook HTTP 入口（§9.2）
   flow-cli      命令行客户端（bin: flow-cli，§9.3）。**纯 RPC 客户端**：只连
                 flow-server 的 WebSocket，不依赖 flow-backend / store / pg，
                 也不读 FLOW_BACKEND——CRUD 与触发语义唯一来源仍是 RPC 那一份
 ```
+
+产品二进制按职责分属各自的 crate（不再做统一多路入口）：
+
+| bin | 所属 crate | 职责 |
+|---|---|---|
+| `flow-server` | flow-rpc | JSON-RPC 2.0 over WebSocket 服务 + cron + webhook |
+| `flow-cli` | flow-cli | 命令行客户端（纯 RPC，后端无关） |
+| `flow-executor` | flow-executor | 受管理执行子进程（FD 槽位由主进程 pre_exec 固定） |
+| `flow-agent` | flow-agent | 受信任远程执行中继（双 TLS 上联 + 本机执行器池） |
+| `flow-journal-tool` | flow-journal | journal 离线维护（verify/index/backup/repair） |
+| `flow-journal-bench` | flow-journal | journal 写入基准 |
+| `flow-journal-server` | flow-rpc | JSONL v2 开发服务（WS RPC + 下载） |
+| `flow-journal-dev` | flow-backend | JSONL v2 开发运行器（run/resume/import-legacy） |
+
+执行器定位契约（I09）：`flow-server` / `flow-agent` 缺省在**自身同目录**召唤
+兄弟 `flow-executor`（部署形态即「全部产品二进制同目录分发」，如
+`scripts/build-sqlite.sh` 的 `dist/*/bin/`）；`FLOW_EXECUTOR_BIN` 显式路径
+优先。找不到即报错，绝不静默回退进程内执行。测试专用脚手架
+（backend-e2e 的 `flow-server-e2e`、backend-perf 的 `flow-perf`）不属于产品
+bin，保持独立。
 
 依赖方向（2026-10-03 与 Cargo.toml 对齐复查后的**现状**；v1 语义权威仍是本文，
 JSONL 世代 crate 的行为契约见各期设计文档）：
@@ -81,7 +101,7 @@ flow-pg ──> flow-store   ✗（两个后端互相独立，互不感知）
 flow-rpc ──> flow-store / flow-pg   ✗（上层不感知具体后端）
 flow-journal ──> 无 flow 依赖（叶子；被 engine/backend/rpc/agent/executor 复用）
 flow-agent / flow-executor ──> flow-engine, flow-journal（JSONL 二/三期执行侧）
-flow cli ──> flow server / flow journal-server（纯 RPC 客户端）──> 上面的链路
+flow-cli ──> flow-server / flow-journal-server（纯 RPC 客户端）──> 上面的链路
 flow-cli ──> flow-store / flow-pg ✗   ✗（CLI 不碰存储与事件日志，
                 没有第二条写入路径；SQLite / Postgres 对 CLI 行为一致）
 ```
@@ -91,14 +111,14 @@ flow-cli ──> flow-store / flow-pg ✗   ✗（CLI 不碰存储与事件日�
 只看枚举。闭集枚举而非 trait 对象：每加一个方法编译器逼着两个臂都写完，
 不存在某个后端静默继承错误默认实现的坑。
 
-运行：`cargo run -p flow-app -- server`（统一二进制 `flow` 的 server 子命令）。环境变量 `FLOW_ADDR`（默认 `127.0.0.1:9800`）、
+运行：`cargo run -p flow-rpc --bin flow-server`。环境变量 `FLOW_ADDR`（默认 `127.0.0.1:9800`）、
 `FLOW_DB`、`FLOW_DATA_DIR`、`FLOW_HTTP_ADDR` 与 `FLOW_SCHEDULER`（§9.2）；
 Postgres 模式另见 `flow-pg/src/config.rs`
 （`FLOW_BACKEND`、`FLOW_DATABASE_URL`、`FLOW_ROLE`、`FLOW_LEASE_TTL_MS` 等）。
 
 **SQLite 模式的进程模型（焊死三件套）**：单进程（open 时对 `data_dir` 目录
 fd 持排他 flock，第二个实例立即失败——多节点清用 postgres 后端）·
-单线程（`flow server` 跑 current_thread runtime，一个 OS 线程；异步任务仍
+单线程（`flow-server` 跑 current_thread runtime，一个 OS 线程；异步任务仍
 并发，JS 求值/文件 IO 经 spawn_blocking 走独立阻塞线程）·单连接
 （SQLite 连接池 max=1，进程内 DB 访问全串行，SQLITE_BUSY 结构性消失）。
 runtime 形态选择只在二进制薄壳 main 发生（`flow_backend::
@@ -662,7 +682,7 @@ run_started 未落盘」的初始化中断窗口，恢复已按 DB 投影标终�
 
 ### 9.2 触发器：cron 调度与 webhook
 
-除 `run.start` 手动触发外，run 还有两个自动入口，都在 `flow server` 进程内：
+除 `run.start` 手动触发外，run 还有两个自动入口，都在 `flow-server` 进程内：
 
 - **cron 调度器**：默认开启，`FLOW_SCHEDULER=off` 禁用。每 20s tick 扫一次
   全部 enabled schedule，取「最近一次 ≤ now 的整分触发点」（cron 标准 5 字段，
@@ -756,8 +776,8 @@ database/database_url）、`[execution]`（mode/executor_bin/x_max/[remote]）�
 
 - **加载必须发生在构造 tokio runtime 之前**：runtime 形态
   （current_thread / multi_thread）取决于 `storage.backend`
-  （`prefer_current_thread_runtime_for`）。`flow server` / `flow agent` /
-  `flow journal-server` / `flow journal-dev` 在 main 里同步 `Config::load`；
+  （`prefer_current_thread_runtime_for`）。`flow-server` / `flow-agent` /
+  `flow-journal-server` / `flow-journal-dev` 在 main 里同步 `Config::load`；
 - **全部 `FLOW_*` 环境变量保持原语义**（向后兼容：既有部署脚本与测试不改）；
   env 覆盖按分区手写合并（显式可 grep），生效名单记录在 `Loaded.env_overrides`
   供设置页展示「这些项重启后仍会被 env 覆盖」；
@@ -1156,3 +1176,6 @@ volume 上。Docker 只在容器**自己退出**时（`--rm`）回收匿名 volu
   不依赖派生式。
 - v2 的 run.start 已要求稳定 `request_id`（写命令幂等键），v1 的
   `run.start` 客户端幂等键仍未做（见上）。
+
+v1（SQLite 权威）→ v2（journal 权威）的打通与废弃路线（RPC parity → 自动
+升级 → 默认切换 → 删除 v1）见 [SQLITE_V1_TO_V2_MIGRATION.md](SQLITE_V1_TO_V2_MIGRATION.md)。

@@ -180,9 +180,9 @@ mod tests {
 /// 与各测试既有的手写定位逻辑同一顺序）。
 ///
 /// **为什么不用 `CARGO_BIN_EXE_*`**：那个环境变量是 package 级的——只有
-/// 「二进制与测试同属一个 package」时才注入。合并二进制后 `flow` 属于
-/// flow-app，而它的测试分散在 flow-rpc / flow-cli / flow-backend 等包里，
-/// 只能按工作区布局定位（与 flow-backend 既有 executor 定位测试同一约定）。
+/// 「二进制与测试同属一个 package」时才注入。产品二进制分散在各自的
+/// package（flow-rpc / flow-cli / flow-agent / …），而使用它们的测试在
+/// 别的 package 里，只能按工作区布局定位。
 pub fn workspace_bin(name: &str) -> PathBuf {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -207,12 +207,41 @@ pub fn workspace_bin(name: &str) -> PathBuf {
             return candidate;
         }
     }
-    panic!("binary '{name}' not built; run: cargo build -p flow-app (or the owning package)");
+    panic!(
+        "binary '{name}' not built; run: cargo build -p <owning package> --bin {name} \
+         (or cargo build --workspace)"
+    );
 }
 
-/// 合并二进制 `flow` 的路径（所有测试的被测进程统一走这一个文件）。
-pub fn flow_bin() -> PathBuf {
-    workspace_bin("flow")
+/// 被测产品二进制定位（每个 bin 属于自己的 package）：
+/// - flow-server / flow-journal-server → flow-rpc
+/// - flow-cli → flow-cli
+/// - flow-agent → flow-agent
+/// - flow-executor → flow-executor
+/// - flow-journal-tool / flow-journal-bench → flow-journal
+/// - flow-journal-dev → flow-backend
+pub fn server_bin() -> PathBuf {
+    workspace_bin("flow-server")
+}
+
+pub fn cli_bin() -> PathBuf {
+    workspace_bin("flow-cli")
+}
+
+pub fn agent_bin() -> PathBuf {
+    workspace_bin("flow-agent")
+}
+
+pub fn executor_bin() -> PathBuf {
+    workspace_bin("flow-executor")
+}
+
+pub fn journal_server_bin() -> PathBuf {
+    workspace_bin("flow-journal-server")
+}
+
+pub fn journal_dev_bin() -> PathBuf {
+    workspace_bin("flow-journal-dev")
 }
 
 /// 被测进程自报端口后的结果。

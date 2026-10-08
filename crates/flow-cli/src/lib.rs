@@ -7,8 +7,8 @@
 //! - 不直连 SQLite 或读 data_dir：避免了「绕过 published 校验直接操纵
 //!   事件日志」的第二条路径，CRUD 语义唯一来源仍是 RPC 层那一份实现。
 //!
-//! 合并二进制形态下本 crate 不再有自己的 bin：命令定义与分发在 [`cli`]，
-//! 由 `flow cli` 召唤（[`run_from_env`] 是进程入口适配）。
+//! 命令定义与分发在 [`cli`]；bin 入口（src/main.rs）只做参数适配与
+//! 退出码传递（[`run_from_args`] 是库形态的进程入口）。
 
 pub mod cli;
 pub mod client;

@@ -17,10 +17,10 @@ fn temp() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("flow-journal-r3-{}", uuid::Uuid::now_v7()))
 }
 
-/// 合并二进制自召唤形态：同一个 `flow` 文件 + `executor` 子命令前缀。
+/// 独立 flow-executor 二进制（agent 本机执行器池召唤它）。
 fn executor() -> flow_engine::execution_protocol::contract::ExecutorInvocation {
-    flow_engine::execution_protocol::contract::ExecutorInvocation::merged(
-        flow_test_support::io::flow_bin(),
+    flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
+        flow_test_support::io::executor_bin(),
     )
 }
 

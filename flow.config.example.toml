@@ -27,7 +27,7 @@ data_dir = "data"
 [execution]
 # in_process（缺省）| ipc（本机执行器子进程）| remote（远程 agent）
 mode = "in_process"
-# 执行器二进制（原 FLOW_EXECUTOR_BIN）；注释掉 = 自召唤 flow executor
+# 执行器二进制（原 FLOW_EXECUTOR_BIN）；注释掉 = 定位同目录兄弟 flow-executor
 # executor_bin = "/usr/local/bin/flow-executor"
 # IPC 执行槽位（1..=16）
 x_max = 4
@@ -41,7 +41,7 @@ x_max = 4
 # key = "/etc/flow/server.key"
 # attach_timeout_ms = 120000
 
-# `flow agent` 的部署参数（原先只能 CLI 参数 / 环境变量；CLI flag 仍可逐项覆盖）
+# `flow-agent` 的部署参数（原先只能 CLI 参数 / 环境变量；CLI flag 仍可逐项覆盖）
 # [agent]
 # control_addr = "10.0.0.8:9700"
 # data_addr = "10.0.0.8:9701"
@@ -52,7 +52,7 @@ x_max = 4
 # executor_bin = "/usr/local/bin/flow-executor"
 # slots = 4
 
-# `flow journal-server`（JSONL v2 开发服务）；token 仍是环境变量 FLOW_JOURNAL_TOKEN（凭据不进配置文件）
+# `flow-journal-server`（JSONL v2 开发服务）；token 仍是环境变量 FLOW_JOURNAL_TOKEN（凭据不进配置文件）
 # [journal]
 # addr = "127.0.0.1:9802"
 # http_addr = "127.0.0.1:9803"

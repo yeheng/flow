@@ -14,14 +14,14 @@ fn temp() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("flow-journal-ipc-{}", uuid::Uuid::now_v7()))
 }
 
-/// 定位真实执行器（I09 规则的测试版，合并二进制形态）。
+/// 定位真实执行器（I09 规则的测试版，独立二进制形态）。
 fn executor_bin() -> std::path::PathBuf {
-    flow_test_support::io::flow_bin()
+    flow_test_support::io::executor_bin()
 }
 
-/// 合并二进制自召唤形态：`flow` 文件 + `executor` 子命令前缀。
+/// 独立 flow-executor 二进制（无子命令前缀）。
 fn executor() -> flow_engine::execution_protocol::contract::ExecutorInvocation {
-    flow_engine::execution_protocol::contract::ExecutorInvocation::merged(executor_bin())
+    flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(executor_bin())
 }
 
 /// 强制 IPC 模式（绕过环境变量，测试内显式指定二进制）。
@@ -624,7 +624,7 @@ async fn wait_for_tagged_executor(tag: &str) -> u32 {
 fn tagged_executor_pids(tag: &str) -> Vec<u32> {
     std::process::Command::new("pgrep")
         .arg("-f")
-        .arg(format!("flow executor --tag {tag}"))
+        .arg(format!("flow-executor --tag {tag}"))
         .output()
         .ok()
         .map(|o| {

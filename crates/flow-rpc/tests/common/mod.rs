@@ -14,7 +14,7 @@
 //! PG 那套），各二进制只用到其中一部分辅助函数。
 #![allow(dead_code)]
 
-pub use flow_test_support::io::{flow_bin, spawn_reporting_ports};
+pub use flow_test_support::io::{server_bin, spawn_reporting_ports};
 
 use std::net::SocketAddr;
 use std::process::{Child, Command, Stdio};
@@ -42,8 +42,7 @@ impl ServerProc {
     /// 目录，所有权留在 proc 身上会把目录在重启前删掉。
     pub fn spawn_sqlite(data_dir: std::path::PathBuf) -> ServerProc {
         let db = data_dir.join("flow.db");
-        let mut cmd = Command::new(flow_bin());
-        cmd.arg("server");
+        let mut cmd = Command::new(server_bin());
         cmd.env("FLOW_DATA_DIR", &data_dir)
             .env("FLOW_DB", &db)
             .env("RUST_LOG", "info")
@@ -76,8 +75,7 @@ impl ServerProc {
         signal_wait_ms: u64,
         extra_env: &[(&str, &str)],
     ) -> Self {
-        let mut cmd = Command::new(flow_bin());
-        cmd.arg("server");
+        let mut cmd = Command::new(server_bin());
         cmd.env("FLOW_BACKEND", "postgres")
             .env("FLOW_DATABASE_URL", url)
             .env("FLOW_ROLE", role)

@@ -7,7 +7,7 @@
 //! [server]   rpc/http 监听地址、调度器开关与 tick
 //! [storage]  backend（sqlite|postgres）、data_dir、database、database_url
 //! [execution] 执行模式（in_process|ipc|remote）、executor_bin、x_max、[remote]
-//! [agent]    flow agent 的上联地址与证书（原先只有 CLI 参数）
+//! [agent]    flow-agent 的上联地址与证书（原先只有 CLI 参数）
 //! [journal]  journal-server 的监听地址与数据目录（token 仍是环境变量——凭据）
 //! [pg]       Postgres 租约/扫描/超时等调优（原 flow-pg 11 个 env）
 //! ```
@@ -152,7 +152,7 @@ impl ExecutionModeKind {
 #[serde(default, deny_unknown_fields)]
 pub struct ExecutionConfig {
     pub mode: ExecutionModeKind,
-    /// 执行器二进制（原 FLOW_EXECUTOR_BIN）；缺省自召唤 `flow executor`。
+    /// 执行器二进制（原 FLOW_EXECUTOR_BIN）；缺省定位同目录兄弟 flow-executor。
     pub executor_bin: Option<String>,
     /// IPC 执行槽位（1..=16；协议常量 X_MAX_DEFAULT 的可配置面）。
     pub x_max: u32,
@@ -195,7 +195,7 @@ impl Default for RemoteExecutionConfig {
     }
 }
 
-/// `flow agent` 的部署参数。CLI 参数仍可逐项覆盖（flag > env > 本节 > 报错）。
+/// `flow-agent` 的部署参数。CLI 参数仍可逐项覆盖（flag > env > 本节 > 报错）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentConfig {

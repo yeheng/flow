@@ -163,7 +163,7 @@ pub async fn serve(
 /// 进程入口三件套（配置文件形态）：统一配置装配后端 → JSON-RPC WebSocket →
 /// cron 调度器 → webhook HTTP，运行到中断信号为止。
 ///
-/// `flow server` 二进制、backend-e2e 的被测进程、backend-perf 的自举服务模式
+/// `flow-server` 二进制、backend-e2e 的被测进程、backend-perf 的自举服务模式
 /// 共用这一份实现，保证「被测的就是生产进程」。tracing 在这里初始化（进程入口
 /// 只有一个调用点，不会重复 init）。
 pub async fn run(loaded: flow_config::Loaded) -> Result<(), Box<dyn std::error::Error>> {

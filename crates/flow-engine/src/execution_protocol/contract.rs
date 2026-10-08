@@ -84,18 +84,15 @@ pub const ACK_RETRANSMIT_MS: u64 = 2_000;
 /// 槽位；超时按失联处理进入排空。0 表示无限制（由取消驱动）。
 pub const DURABLE_WAIT_TIMEOUT_MS: u64 = 120_000;
 
-/// 执行器二进制名称（独立二进制形态的打包/定位契约，I09）。
-/// 合并二进制（`flow`）形态下执行器经 [`ExecutorInvocation`] 的子命令前缀召唤。
+/// 执行器二进制名称（独立二进制的打包/定位契约，I09）。
+/// 主进程（flow-server / flow-agent）缺省在自身同目录定位该名字的兄弟文件。
 pub const EXECUTOR_BIN_NAME: &str = "flow-executor";
-/// 合并二进制自召唤执行器时的子命令名（`flow executor`）。
-pub const EXECUTOR_SUBCOMMAND: &str = "executor";
 
 /// 执行器进程召唤描述：程序路径 + 前导参数。
 ///
-/// - 合并二进制（flow）自召唤：program = current_exe，prefix = ["executor"]`；
-/// - 独立 flow-executor 二进制（[`EXECUTOR_BIN_ENV`] 显式指定）：prefix 为空。
-///   spawn_executor_process 按此构造命令行；执行器侧忽略未知参数，因此
-///   `--tag` 等诊断标记始终追加在前导参数之后。
+/// 执行器是独立二进制，prefix 恒为空（字段保留：spawn_executor_process 的
+/// 命令行构造契约是 program + prefix + 诊断标记；执行器侧忽略未知参数，
+/// `--tag` 等标记始终追加在前导参数之后）。
 #[derive(Debug, Clone)]
 pub struct ExecutorInvocation {
     pub program: std::path::PathBuf,
@@ -103,7 +100,7 @@ pub struct ExecutorInvocation {
 }
 
 impl ExecutorInvocation {
-    /// 显式指定的独立执行器二进制（不做子命令前缀）。
+    /// 显式指定的执行器二进制。
     pub fn explicit(bin: impl Into<std::path::PathBuf>) -> Self {
         Self {
             program: bin.into(),
@@ -111,17 +108,9 @@ impl ExecutorInvocation {
         }
     }
 
-    /// 合并二进制自召唤：以给定程序 + `executor` 子命令前缀构造。
-    pub fn merged(bin: impl Into<std::path::PathBuf>) -> Self {
-        Self {
-            program: bin.into(),
-            prefix: vec![EXECUTOR_SUBCOMMAND.to_string()],
-        }
-    }
-
-    /// 执行器定位（I09）：[`EXECUTOR_BIN_ENV`] 显式路径优先（独立二进制，
-    /// 无前缀）；否则以当前可执行文件自召唤（合并二进制形态）。找不到即
-    /// 报错，不静默回退进程内执行。
+    /// 执行器定位（I09）：[`EXECUTOR_BIN_ENV`] 显式路径优先；否则取当前
+    /// 可执行文件同目录下的兄弟 [`EXECUTOR_BIN_NAME`]（部署形态：全部
+    /// 产品二进制同目录分发）。找不到即报错，不静默回退进程内执行。
     pub fn locate() -> Result<Self, String> {
         if let Some(path) = std::env::var_os(EXECUTOR_BIN_ENV) {
             let path = std::path::PathBuf::from(path);
@@ -134,7 +123,17 @@ impl ExecutorInvocation {
         }
         let current = std::env::current_exe()
             .map_err(|_| "cannot locate executor: current_exe unavailable".to_string())?;
-        Ok(Self::merged(current))
+        let sibling = current
+            .parent()
+            .map(|dir| dir.join(EXECUTOR_BIN_NAME))
+            .ok_or_else(|| "cannot locate executor: current_exe has no parent".to_string())?;
+        if sibling.is_file() {
+            return Ok(Self::explicit(sibling));
+        }
+        Err(format!(
+            "cannot locate {EXECUTOR_BIN_NAME} next to {current:?}: set {EXECUTOR_BIN_ENV} \
+             or deploy {EXECUTOR_BIN_NAME} beside the main binary"
+        ))
     }
 }
 /// 主进程通过环境变量把固定 FD 槽位告知执行器（pre_exec 中 dup2 的目标）。

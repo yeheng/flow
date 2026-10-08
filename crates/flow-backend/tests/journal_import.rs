@@ -85,8 +85,7 @@ async fn legacy_import_is_reentrant_preserves_raw_tail_and_reports_missing_input
     flow_journal::maintenance::backup(&destination, &restored, upper).unwrap();
     assert!(!restored.join("projection.sqlite").exists());
     assert!(!restored.join("legacy-source").exists());
-    let output = tokio::process::Command::new(flow_test_support::io::flow_bin())
-        .arg("journal-dev")
+    let output = tokio::process::Command::new(flow_test_support::io::journal_dev_bin())
         .arg("--data-dir")
         .arg(&restored)
         .arg("status")

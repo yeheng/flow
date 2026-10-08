@@ -27,7 +27,7 @@ pub enum ExecutionMode {
 
 #[derive(Debug, Clone)]
 pub struct IpcOptions {
-    /// 执行器召唤方式：合并二进制自召唤（默认）或显式独立二进制。
+    /// 执行器召唤方式：同目录兄弟 flow-executor（缺省定位）或显式二进制。
     pub executor: ExecutorInvocation,
     /// 执行槽位上限 X_max（1..=16）。
     pub x_max: usize,
@@ -37,7 +37,7 @@ pub struct IpcOptions {
 }
 
 /// 执行器定位（I09）：[`ExecutorInvocation::locate`]——FLOW_EXECUTOR_BIN
-/// 显式独立二进制优先，否则当前可执行文件自召唤（`flow executor`）。
+/// 显式路径优先，否则当前可执行文件同目录的兄弟 `flow-executor`。
 /// 找不到即报错，不回退。
 pub fn locate_executor() -> Result<ExecutorInvocation, String> {
     ExecutorInvocation::locate()

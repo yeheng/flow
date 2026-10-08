@@ -301,7 +301,7 @@ pub struct Host {
 }
 impl Host {
     pub fn start(root: PathBuf) -> Result<Arc<Self>> {
-        // Match `flow server`: dependencies enable both rustls providers.
+        // Match `flow-server`: dependencies enable both rustls providers.
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (ready, started) = std::sync::mpsc::sync_channel(1);
         let (stop, stopped) = oneshot::channel();

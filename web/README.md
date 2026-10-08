@@ -23,7 +23,7 @@ Vue 3 + Vite + TypeScript + vue-router + Tauri 2，支持浏览器与桌面应�
 
 ```bash
 # 终端 1：后端（仓库根）
-cargo run -p flow-app -- server       # 默认 ws://127.0.0.1:9800
+cargo run -p flow-rpc --bin flow-server   # 默认 ws://127.0.0.1:9800
 
 # 终端 2：前端
 cd web
@@ -37,7 +37,7 @@ npm run dev                          # 默认 http://127.0.0.1:5173
 
 - **桌面**：应用启动时自动启动内嵌的 flow-server 服务，普通请求经 Tauri `invoke`
   直接调用 Rust 方法模块，订阅经 Tauri Channel 推送，无需另开后端进程或 RPC 端口。
-- **浏览器**：经原有 JSON-RPC WebSocket API 连接独立的 `flow server`，支持远程部署。
+- **浏览器**：经原有 JSON-RPC WebSocket API 连接独立的 `flow-server`，支持远程部署。
 
 桌面开发与安装包行为一致，执行 `npm run dev:desktop` 或打开 `Flow.app` 即可使用。
 

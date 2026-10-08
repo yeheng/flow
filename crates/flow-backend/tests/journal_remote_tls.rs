@@ -15,7 +15,7 @@ fn temp() -> std::path::PathBuf {
 }
 
 fn agent_bin() -> std::path::PathBuf {
-    flow_test_support::io::flow_bin()
+    flow_test_support::io::agent_bin()
 }
 
 /// 生成测试 PKI：CA + server(flow-server) + agent(CN=agent_id)。
@@ -133,7 +133,6 @@ fn spawn_agent(
     slots: u32,
 ) -> AgentProcess {
     let child = std::process::Command::new(agent_bin())
-        .arg("agent")
         .args([
             "--control-addr",
             &format!("127.0.0.1:{control}"),

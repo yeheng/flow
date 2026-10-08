@@ -1,4 +1,4 @@
-//! `flow cli` 命令定义与分发（原 flow-cli 二进制入口，合并进 `flow` 后成为子命令）。
+//! `flow-cli` 命令定义与分发。
 
 use clap::{Parser, Subcommand};
 
@@ -7,12 +7,12 @@ use crate::error::CliError;
 /// flow-cli：flow 工作流引擎命令行客户端（JSON-RPC 2.0 over WebSocket）。
 #[derive(Parser)]
 #[command(
-    name = "flow cli",
+    name = "flow-cli",
     version,
     about = "flow 工作流引擎命令行客户端",
     long_about = "flow 工作流引擎命令行客户端。\n\n\
                   覆盖：workflow 增删改查与导入导出、run 手动触发与查询取消。\n\
-                  服务端需另行运行（flow server），地址用 --url 或 FLOW_RPC 指定。",
+                  服务端需另行运行（flow-server），地址用 --url 或 FLOW_RPC 指定。",
     arg_required_else_help = true
 )]
 pub struct Cli {
@@ -159,8 +159,8 @@ pub enum RunCommand {
 
 /// 进程入口：解析命令行 → 连服务（连不上是本地错误，exit 1）→ 分发到命令组。
 pub async fn run_from_args(argv: &[String]) -> i32 {
-    // parse_from 的首元素是程序名占位：`flow cli` 是展示名，实际参数从 argv 起。
-    let cli = Cli::parse_from(std::iter::once("flow cli".to_string()).chain(argv.iter().cloned()));
+    // parse_from 的首元素是程序名占位：`flow-cli` 是展示名，实际参数从 argv 起。
+    let cli = Cli::parse_from(std::iter::once("flow-cli".to_string()).chain(argv.iter().cloned()));
     match dispatch(cli).await {
         Ok(()) => 0,
         Err(err) => {
