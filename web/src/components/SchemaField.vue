@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, useId, watch } from "vue";
+import CodeEditor from "./CodeEditor.vue";
 import { editor } from "../state/editor";
 import type { PropertySchema } from "../types";
 
@@ -189,14 +190,13 @@ function setChild(key: string, value: unknown): void {
         服务端未配置 FLOW_SECRET_* 环境变量，可手动输入密钥名称
       </div>
     </template>
-    <textarea
+    <CodeEditor
       v-else-if="widget === 'code'"
-      class="code"
-      rows="5"
-      spellcheck="false"
-      :value="(modelValue as string) ?? ''"
-      @input="onText"
-    ></textarea>
+      language="javascript"
+      height="180px"
+      :model-value="(modelValue as string) ?? ''"
+      @update:model-value="emit('update:modelValue', $event)"
+    />
     <template v-else-if="widget === 'json'">
       <textarea
         v-model="jsonText"

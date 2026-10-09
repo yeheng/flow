@@ -32,7 +32,7 @@ FLOW_EXECUTION_MODE=ipc cargo run -p flow-rpc --bin flow-journal-server
 有界公平中继；审计/确认仍端到端来自主进程 journal（agent 不产生权威
 ACK/Permit）。断线后 agent 保留执行器并退避重连，Resume 清单由主进程按
 日志裁决（AlreadyCommitted/UploadOnly/SubmitExistingResult/CancelAndDrain/
-ReconcileRequired）；drain 用于升级下线。部署/证书/边界见 `docs/AGENT_OPS.md`。
+ReconcileRequired）；drain 用于升级下线。部署/证书/边界见 [OPS.md](OPS.md) §2.3。
 测试：`cargo test -p flow-backend --test journal_remote --test journal_remote_tls --test journal_remote_reconnect --test journal_remote_ops`。
 
 本地运行一个定义：

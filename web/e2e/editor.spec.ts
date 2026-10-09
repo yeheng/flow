@@ -14,11 +14,13 @@ test("编辑器：画布渲染、顶部条、改参数保存无错误", async ({
   await expect(page.locator(".editor-title")).toContainText("v1");
   await expect(page.locator(".editor-actions").getByRole("link", { name: "版本" })).toBeVisible();
 
-  // 点 script 节点（定义顺序第二）→ 参数面板出现代码编辑框
+  // 点 script 节点（定义顺序第二）→ 参数面板出现 Monaco 代码编辑器
   await page.locator(".vue-flow__node").nth(1).click();
-  const codeArea = page.locator("aside.right textarea.code").first();
-  await expect(codeArea).toBeVisible();
-  await codeArea.fill("return 42;");
+  const codeEditor = page.locator("aside.right .code-editor .monaco-editor").first();
+  await expect(codeEditor).toBeVisible();
+  await codeEditor.click();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.type("return 42;");
 
   // 保存：成功 toast，无错误 toast，「未保存」标记消失
   await page.getByRole("button", { name: "保存" }).click();

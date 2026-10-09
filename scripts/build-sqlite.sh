@@ -8,12 +8,12 @@
 #   dist/sqlite/bin/flow-cli           命令行客户端
 #   dist/sqlite/bin/flow-journal-tool  journal 离线维护
 #   dist/sqlite/bin/flow-journal-*     journal 开发工具（server/bench/dev）
-#   dist/sqlite/run-server.sh          预设 FLOW_BACKEND=sqlite 的启动脚本
+#   dist/sqlite/run-server.sh          单机 journal 启动脚本（缺省后端，无 FLOW_BACKEND）
 #
 # 说明：
-# - 后端不在构建期区分：同一份二进制集合，FLOW_BACKEND 在进程入口决定
-#   （sqlite 缺省 | postgres）。本脚本的存在意义是「打包 + 预设环境 +
-#   明确部署形态」，而不是裁剪二进制。
+# - 后端不在构建期区分：同一份二进制集合，storage.backend 在进程入口决定
+#   （journal 缺省 | postgres；v1 sqlite 已删除）。本脚本的存在意义是
+#   「打包 + 预设环境 + 明确部署形态」，而不是裁剪二进制。
 # - 执行器定位契约（I09）：flow-server / flow-agent 在自身同目录召唤
 #   flow-executor（部署形态即本脚本的 bin/ 布局；FLOW_EXECUTOR_BIN 可显式覆盖）。
 # - 经 scripts/release.sh 包装：受 Xcode 21 ld LINKEDIT bug 影响的机器

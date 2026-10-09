@@ -7,20 +7,26 @@
 > 本文描述当前代码的实际语义，是后续开发的权威参考。分布式子系统的设计不再单列
 > 文档（曾有一份 `DISTRIBUTED.md`，删除时已有 40+ 处引用指向不存在的章节）——
 > 逐条落在 `flow-pg` 各模块的头注释里，改代码时顺带就在改设计。
-> 架构焊点：**SQLite + events.jsonl 是默认与权威后端**（canonical）；Postgres 是
-> 可替代后端，两者统一在 `flow-backend` 的 `AnyBackend` 闭集枚举之后（§2）。
+> 架构焊点：**journal（JSONL v2）是默认与权威后端**（canonical；SQLite 只是可
+> 随时重建的投影，v1 SQLite 后端已删除）；Postgres 是可替代后端，两者统一在
+> `flow-backend` 的 `AnyBackend` 闭集枚举之后（§2）。
 >
-> **容量定位（部署选型）**：SQLite 定位是**单机并发**——单写者 + fsync 崩溃边界，
+> **部署 / 运维见 [OPS.md](OPS.md)**（部署形态、执行模式、离线维护、升级、
+> 故障处置、容量预算与安全边界）；本文只描述语义，不重复操作步骤。
+>
+> **容量定位（部署选型）**：journal 定位是**单机并发**——单写者 + fsync 崩溃边界，
 > backend-perf 实测 ~25 runs/s（16 在飞，e2e p95 < 1s）；**并发再高就换 Postgres**
-> （`FLOW_BACKEND=postgres`，同一套 API，实测 ~60-70 runs/s @16 在飞，且可多节点
+> （`storage.backend = "postgres"`，同一套 API，实测 ~60-70 runs/s @16 在飞，且可多节点
 > 水平扩展 executor）。两者语义等价（backend-e2e 双后端同契约），选型只看容量。
-
+>
 > **⚠️ 安全边界（部署前必读）**：本服务**没有任何认证/授权**——JSON-RPC
 > WebSocket 谁连上谁就是管理员。默认只监听 `127.0.0.1:9800`；对外暴露
 > （如多节点部署的 gateway）必须在外层自备 TLS + 认证（反向代理 / 内网 ACL）。
 > `http_call` 节点是**任意出站 HTTP**（可打内网地址与云元数据端点
 > 169.254.169.254），`script`/`condition` 是沙箱内任意 JS——工作流定义事实上是
 > 可执行代码，只允许可信用户创建与发布。出站白名单/沙箱网络隔离未实现。
+> 完整运维边界（journal 内含业务原文、备份介质加密、token 非多租户授权）见
+> [OPS.md](OPS.md) §8。
 
 ## 1. 目标与边界
 
@@ -44,14 +50,14 @@ flow 是一个工作流执行引擎：发布不可变的流程定义（DAG），
 ```
 crates/
   flow-engine   执行引擎。Driver 只依赖 RunEventSink 后端边界（Phase 0），
-                单机后端走 event.jsonl，不依赖任何存储实现
+                不依赖任何存储实现
   flow-dto      领域 DTO 与状态词汇表的单一来源（零依赖叶子）：
                 WorkflowVersion / WorkflowSummary / RunRecord / DbRunStatus。
                 存储层持久化的本来就是引擎域数据，不维护第二份拷贝
-  flow-store    SQLite：workflow / workflow_versions / runs 元数据（单机后端）
+  flow-store    SQLite：journal 的投影层（可随时重建，非权威）
   flow-backend  后端适配层：`AnyBackend` 闭集枚举（**不是 dyn trait**）
-                屏蔽两种架构选择。SQLite + event.jsonl 是默认与权威实现
-                （`sqlite.rs`，即本文档描述的全部语义）；Postgres 是可替代实现
+                屏蔽两种架构选择。journal（`journal.rs`）是默认与权威实现
+                （v2 唯一权威，SQLite 只是可重建投影）；Postgres 是可替代实现
                 （`pg.rs`；分布式设计记录在 `flow-pg` 各模块的头注释里）。公共面只含两个
                 后端都诚实实现的方法；
                 初始化协议、信号落账、订阅推送的差异在边界内吸收；
@@ -107,27 +113,24 @@ flow-cli ──> flow-store / flow-pg ✗   ✗（CLI 不碰存储与事件日�
 ```
 
 后端选择只在进程入口发生一次：`flow_backend::open()` 按
-`storage.backend = journal（缺省）| postgres | sqlite（v1，已弃用）` 构造 `AnyBackend`，之后整条
+`storage.backend = journal（缺省）| postgres` 构造 `AnyBackend`，之后整条
 RPC 链路只看枚举。闭集枚举而非 trait 对象：每加一个方法编译器逼着每个臂都写完，
-不存在某个后端静默继承错误默认实现的坑。**journal 臂**（JSONL v2 权威，SQLite 只是
-可重建投影）已接入全部公共契约（适配层 `flow-backend/src/journal_arm.rs`；历史
+不存在某个后端静默继承错误默认实现的坑。**journal 臂**（JSONL v2 唯一权威，SQLite 只是
+可重建投影）承载全部公共契约（适配层 `flow-backend/src/journal_arm.rs`；历史
 v1 数据不迁移，仅全新数据目录；切换路线见
 [SQLITE_V1_TO_V2_MIGRATION.md](SQLITE_V1_TO_V2_MIGRATION.md)）。
+`FLOW_BACKEND=sqlite`（v1）已删除，显式配置即报错并指向该文档。
 
-运行：`cargo run -p flow-rpc --bin flow-server`。环境变量 `FLOW_ADDR`（默认 `127.0.0.1:9800`）、
-`FLOW_DB`、`FLOW_DATA_DIR`、`FLOW_HTTP_ADDR` 与 `FLOW_SCHEDULER`（§9.2）；
-journal 模式 `FLOW_BACKEND=journal`（`FLOW_DATA_DIR` 即 journal 根）；
+运行：`cargo run -p flow-rpc --bin flow-server`。配置分层 CLI > env > `flow.toml` >
+默认值（§9.4）；常用 env：`FLOW_ADDR`（默认 `127.0.0.1:9800`）、`FLOW_HTTP_ADDR`、
+`FLOW_DATA_DIR`、`FLOW_SCHEDULER`（§9.2）；journal 模式 `FLOW_DATA_DIR` 即 journal 根；
 Postgres 模式另见 `flow-pg/src/config.rs`
-（`FLOW_BACKEND`、`FLOW_DATABASE_URL`、`FLOW_ROLE`、`FLOW_LEASE_TTL_MS` 等）。
+（`FLOW_DATABASE_URL`、`FLOW_ROLE`、`FLOW_LEASE_TTL_MS` 等）。
 
-**SQLite 模式的进程模型（焊死三件套）**：单进程（open 时对 `data_dir` 目录
-fd 持排他 flock，第二个实例立即失败——多节点清用 postgres 后端）·
-单线程（`flow-server` 跑 current_thread runtime，一个 OS 线程；异步任务仍
-并发，JS 求值/文件 IO 经 spawn_blocking 走独立阻塞线程）·单连接
-（SQLite 连接池 max=1，进程内 DB 访问全串行，SQLITE_BUSY 结构性消失）。
-runtime 形态选择只在二进制薄壳 main 发生（`flow_backend::
-prefer_current_thread_runtime`），lib 内的请求处理路径依旧不感知
-FLOW_BACKEND。
+**单写者纪律（journal 臂同款铁律）**：open 时对 `data_dir` 目录 fd 持排他 flock，
+第二个实例立即失败——多节点清用 postgres 后端。journal 用多线程 runtime（投影回放 /
+值读取大量 `spawn_blocking`；v1 SQLite 的 current_thread 单写者形态已随其后端删除）。
+runtime 形态选择只在二进制薄壳 main 发生，lib 内的请求处理路径依旧不感知后端。
 
 ## 3. 核心数据结构：事件日志是唯一权威
 

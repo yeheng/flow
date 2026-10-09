@@ -8,6 +8,9 @@ import {
   type RunSnapshot,
 } from "../api/journal";
 import { isDesktop } from "../platform";
+import CodeEditor from "../components/CodeEditor.vue";
+import JsonNode from "../components/JsonNode.vue";
+import JournalLogList from "../components/JournalLogList.vue";
 import { runBadgeClass, runStatusLabel } from "../state/labels";
 import { confirmDialog } from "../state/modal";
 import { toast } from "../state/toast";
@@ -38,7 +41,24 @@ let frame: number | undefined;
 let stop: (() => Promise<void>) | undefined;
 let timer: ReturnType<typeof setInterval> | undefined;
 
-const detail = computed(() => JSON.stringify(run.value, null, 2));
+/** JSON 字段即时校验：非法时行内报错并禁用对应提交按钮（Monaco 标红之外的显式拦截） */
+function jsonError(text: string): string {
+  try {
+    JSON.parse(text);
+    return "";
+  } catch (e) {
+    return String(e);
+  }
+}
+const definitionError = computed(() => jsonError(definition.value));
+const inputError = computed(() => jsonError(input.value));
+function formatJsonText(text: string): string {
+  try {
+    return JSON.stringify(JSON.parse(text), null, 2);
+  } catch {
+    return text; // 按钮在非法时已禁用，这里是兜底
+  }
+}
 const downloads = computed(() => {
   const refs = new Set<string>();
   const visit = (v: unknown): void => {
@@ -260,36 +280,42 @@ onBeforeUnmount(() => {
           </div>
           <div class="field">
             <label>定义 JSON</label>
-            <textarea
-              v-model="definition"
-              class="code"
-              maxlength="1048576"
-              rows="6"
-              spellcheck="false"
-            />
+            <CodeEditor v-model="definition" language="json" height="220px" />
+            <div v-if="definitionError" class="field-error">{{ definitionError }}</div>
+            <button
+              v-else
+              type="button"
+              class="link journal-format"
+              @click="definition = formatJsonText(definition)"
+            >
+              格式化
+            </button>
           </div>
           <button
             type="button"
             class="primary"
-            :disabled="busy || !workflow"
+            :disabled="busy || !workflow || !!definitionError"
             @click="act(save)"
           >
             保存并发布新版本
           </button>
           <div class="field">
             <label>运行输入 JSON</label>
-            <textarea
-              v-model="input"
-              class="code"
-              maxlength="8388608"
-              rows="3"
-              spellcheck="false"
-            />
+            <CodeEditor v-model="input" language="json" height="110px" />
+            <div v-if="inputError" class="field-error">{{ inputError }}</div>
+            <button
+              v-else
+              type="button"
+              class="link journal-format"
+              @click="input = formatJsonText(input)"
+            >
+              格式化
+            </button>
           </div>
           <button
             type="button"
             class="primary"
-            :disabled="busy || !workflow"
+            :disabled="busy || !workflow || !!inputError"
             @click="act(start)"
           >
             开始运行
@@ -349,7 +375,7 @@ onBeforeUnmount(() => {
         </div>
 
         <h3>快照</h3>
-        <pre class="code-block">{{ detail }}</pre>
+        <div class="code-block journal-json"><JsonNode :value="run" /></div>
 
         <template v-if="downloads.length">
           <h3>完整值下载</h3>
@@ -369,7 +395,7 @@ onBeforeUnmount(() => {
           实时事件
           <span class="muted journal-hint">展示丢弃 {{ windowed.dropped }} 条</span>
         </h3>
-        <pre class="code-block">{{ JSON.stringify(windowed.events, null, 2) }}</pre>
+        <JournalLogList :items="windowed.events" empty-text="暂无实时事件" />
 
         <h3>历史事件与审计</h3>
         <div class="journal-audit">
@@ -381,12 +407,12 @@ onBeforeUnmount(() => {
             下一页
           </button>
         </div>
-        <pre class="code-block">{{ JSON.stringify(page?.events ?? [], null, 2) }}</pre>
+        <JournalLogList :items="page?.events ?? []" empty-text="尚未读取历史事件" />
 
         <h3>观测日志</h3>
         <p class="muted journal-hint">以下丢弃计数属于整个观测存储，不代表业务数据丢失。</p>
         <pre class="code-block">{{ JSON.stringify(observationLoss) }}</pre>
-        <pre class="code-block">{{ JSON.stringify(observations, null, 2) }}</pre>
+        <JournalLogList :items="observations" empty-text="暂无观测日志" />
       </section>
     </div>
   </main>
@@ -527,6 +553,15 @@ onBeforeUnmount(() => {
   padding: 12px;
   font-family: var(--mono);
   font-size: 12px;
+}
+
+/* JsonNode 容器：不用 pre 的 pre-wrap，由折叠树自己换行 */
+.journal-json {
+  white-space: normal;
+}
+
+.journal-format {
+  margin-top: 4px;
 }
 
 .code-block::-webkit-scrollbar {

@@ -104,14 +104,18 @@
 
 ## 4. 运维入口
 
+部署、执行模式、离线维护与故障处置的完整手册见 [OPS.md](OPS.md)；本节只记
+切换日特有的事实：
+
 ```sh
-# journal 后端起服务（全新目录）
-FLOW_BACKEND=journal FLOW_DATA_DIR=/var/lib/flow-v2 cargo run -p flow-rpc --bin flow-server
+# journal 后端起服务（全新目录；FLOW_BACKEND 缺省即 journal）
+FLOW_DATA_DIR=/var/lib/flow-v2 flow-server
 
 # 打包形态（build-sqlite.sh / build-pg.sh 产物 bin/ 布局同样适用）
-FLOW_BACKEND=journal ./bin/flow-server
+./bin/flow-server
 ```
 
-想保全历史 v1 数据的用户：停写后用 `flow-journal-dev import-legacy` 做
-只读保全（[JSONL_DEVELOPMENT.md](JSONL_DEVELOPMENT.md)），但该基线与
-journal 后端的日常服务面互相独立——切换不依赖它。
+- v1 布局目录（有 `flow.db`、无 `journal/`）在 journal 模式下**拒绝启动**。
+- 想保全历史 v1 数据的用户：停写后用 `flow-journal-dev import-legacy` 做
+  只读保全（[JSONL_DEVELOPMENT.md](JSONL_DEVELOPMENT.md)、[OPS.md](OPS.md) §4），
+  但该基线与 journal 后端的日常服务面互相独立——切换不依赖它。
