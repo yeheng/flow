@@ -12,7 +12,8 @@
 #
 # 说明：
 # - 后端不在构建期区分：同一份二进制集合，FLOW_BACKEND 在进程入口决定。
-#   本脚本打包 PG 部署形态并预设 FLOW_BACKEND=postgres；多节点在多台
+#   本脚本打包 PG 部署形态并预设 FLOW_BACKEND=postgres（单机缺省是 journal）；
+#   多节点在多台
 #   机器上各自解包同一份产物即可（对等模式，FLOW_ROLE=all/gateway/executor）。
 # - 执行器定位契约（I09）：flow-server / flow-agent 在自身同目录召唤
 #   flow-executor（部署形态即本脚本的 bin/ 布局；FLOW_EXECUTOR_BIN 可显式覆盖）。

@@ -27,13 +27,18 @@ e2e_test!(
         // 子 run 输出透传为父节点输出，再经 end 透传为 run 输出
         assert_eq!(run["run"]["output"], json!({ "got": { "amount": 7 } }));
 
-        // child_run_id 确定性派生：{父run}:{节点}:{attempt}，随 node_started 落盘
+        // child_run_id：v1 确定性派生 {父run}:{节点}:{attempt}；v2 用 uuid v7 +
+        // parent 关系（差异清单见迁移文档 §3）——共同契约是「可查询、钉版本」
         let timeline: Value = call_json(&client, "run.timeline", json!({"run_id": run_id})).await;
         let child_run_id = timeline_node(&timeline, "sub")["child_run_id"]
             .as_str()
             .unwrap()
             .to_string();
-        assert_eq!(child_run_id, format!("{run_id}:sub:1"));
+        if ctx.is_journal() {
+            assert!(!child_run_id.is_empty() && child_run_id != run_id);
+        } else {
+            assert_eq!(child_run_id, format!("{run_id}:sub:1"));
+        }
 
         // 子 run 是独立日志：可查询、钉死子工作流的已发布版本、深度 1
         let child = call_json(&client, "run.get", json!({"run_id": child_run_id})).await;
@@ -106,11 +111,14 @@ e2e_test!(
         let run_id = start_run(&client, &parent_wf, json!({})).await;
         let run = wait_run_terminal(&client, &run_id, TIMEOUT).await;
         assert_eq!(run["run"]["status"], json!("failed"), "{run}");
+        let expected = if ctx.is_journal() {
+            // v2 的错误词汇（同一语义：子流程无 published 版本不可执行）
+            "published"
+        } else {
+            "没有已发布版本"
+        };
         assert!(
-            run["run"]["error"]
-                .as_str()
-                .unwrap()
-                .contains("没有已发布版本"),
+            run["run"]["error"].as_str().unwrap().contains(expected),
             "错误必须指明原因：{run}"
         );
         let timeline: Value = call_json(&client, "run.timeline", json!({"run_id": run_id})).await;
@@ -189,8 +197,8 @@ async fn nested_depth_limit_is_fatal() {
     const DEPTH: usize = 10;
     let bin = env!("CARGO_BIN_EXE_flow-server-e2e");
     for kind in [
-        backend_e2e::common::Kind::Sqlite,
         backend_e2e::common::Kind::Postgres,
+        backend_e2e::common::Kind::Journal,
     ] {
         backend_e2e::common::run_case_with_env(kind, bin, &[("FLOW_MAX_RUNS", "32")], |ctx| {
             Box::pin(depth_chain_body(ctx, DEPTH))
@@ -242,11 +250,17 @@ async fn depth_chain_body(ctx: &Ctx, depth: usize) {
     let run_id = start_run(&client, &ids[0], json!({})).await;
     let run = wait_run_terminal(&client, &run_id, TIMEOUT).await;
     assert_eq!(run["run"]["status"], json!("failed"), "{run}");
+    let expected_depth = if ctx.kind == backend_e2e::common::Kind::Journal {
+        // v2 的错误词汇（同一语义：深度上限 fatal）
+        "depth exceeded"
+    } else {
+        "嵌套超过 8 层"
+    };
     assert!(
         run["run"]["error"]
             .as_str()
             .unwrap()
-            .contains("嵌套超过 8 层"),
+            .contains(expected_depth),
         "depth>=8 必须直接 fatal：{run}"
     );
 }

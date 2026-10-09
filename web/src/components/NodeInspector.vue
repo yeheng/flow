@@ -37,6 +37,12 @@ const hasOutput = computed(
     node.value?.output !== undefined &&
     node.value?.state !== "pending",
 );
+
+/** 与 LogConsole 一致的时间格式 */
+function fmtTime(ts: string): string {
+  const d = new Date(ts);
+  return Number.isNaN(d.getTime()) ? ts : d.toLocaleTimeString();
+}
 </script>
 
 <template>
@@ -85,13 +91,14 @@ const hasOutput = computed(
       <summary>节点日志（{{ nodeLogs.length }}）</summary>
       <p v-if="nodeLogs.length === 0" class="inspector-empty">该节点没有日志</p>
       <div v-for="[attempt, lines] in logsByAttempt" :key="attempt" class="inspector-attempt">
-        <p class="inspector-attempt-label">attempt {{ attempt }}</p>
+        <p class="inspector-attempt-label">第 {{ attempt }} 次尝试</p>
         <div
           v-for="line in lines"
           :key="line.seq"
           class="inspector-log"
           :class="`log-${line.level}`"
         >
+          <span class="log-ts">{{ fmtTime(line.ts) }}</span>
           <span class="inspector-log-level">{{ line.level }}</span>
           <span class="inspector-log-msg">{{ line.message }}</span>
         </div>
@@ -195,6 +202,11 @@ const hasOutput = computed(
   font-size: 11px;
   font-family: var(--mono);
   padding: 1px 0;
+}
+
+.log-ts {
+  color: var(--text3);
+  flex-shrink: 0;
 }
 
 .inspector-log-level {

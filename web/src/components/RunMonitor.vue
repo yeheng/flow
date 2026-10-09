@@ -11,6 +11,8 @@ import {
 } from "../state/monitor";
 import { editor } from "../state/editor";
 import { nodeStateLabel, runStatusLabel } from "../state/labels";
+import { confirmDialog } from "../state/modal";
+import { toast } from "../state/toast";
 import LogConsole from "./LogConsole.vue";
 
 const props = withDefaults(defineProps<{ childRunNavigate?: boolean }>(), {
@@ -29,6 +31,39 @@ function fmtJson(v: unknown): string {
   if (v === undefined || v === null) return "";
   const s = JSON.stringify(v);
   return s.length > 200 ? s.slice(0, 200) + "…" : s;
+}
+
+/** 未截断的完整 JSON（截断展示的 title 悬浮全文用） */
+function fmtJsonFull(v: unknown): string {
+  if (v === undefined || v === null) return "";
+  return JSON.stringify(v);
+}
+
+async function onCancelRun(): Promise<void> {
+  if (!(await confirmDialog("确定取消该运行？", { danger: true }))) return;
+  await cancelRun();
+}
+
+/** 非空且不是合法 JSON：交付时按字符串处理，提前给用户提示 */
+function signalIsNonJson(text: string | undefined): boolean {
+  const raw = (text ?? "").trim();
+  if (!raw) return false;
+  try {
+    JSON.parse(raw);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+async function copyRunId(): Promise<void> {
+  if (!monitor.runId) return;
+  try {
+    await navigator.clipboard.writeText(monitor.runId);
+    toast.info("已复制 run id");
+  } catch {
+    toast.error("复制失败");
+  }
 }
 
 function onRowEnter(nodeId: string): void {
@@ -60,10 +95,13 @@ function onRowClick(nodeId: string): void {
         子 run（第 {{ monitor.breadcrumb.length }} 层）
       </span>
       <span class="run-id" :title="monitor.runId ?? ''">run {{ monitor.runId?.slice(0, 8) }}…</span>
+      <button v-if="monitor.runId" class="run-copy" title="复制 run id" @click="copyRunId">
+        复制
+      </button>
       <span v-if="monitor.status" class="run-phase" :class="`run-${monitor.status}`">
         {{ runStateText }}
       </span>
-      <button v-if="canCancelRun" @click="cancelRun()">取消</button>
+      <button v-if="canCancelRun" :disabled="monitor.cancelling" @click="onCancelRun">取消</button>
     </div>
     <div v-if="monitor.fatalError" class="run-fatal">{{ monitor.fatalError }}</div>
     <div v-if="monitor.output !== undefined" class="run-output">
@@ -78,7 +116,15 @@ function onRowClick(nodeId: string): void {
           type="text"
           placeholder='信号 payload（JSON），如 {"approved": true}'
         />
-        <button @click="deliverSignal(n.id, signalTexts[n.id] ?? '')">交付</button>
+        <button
+          :disabled="monitor.delivering"
+          @click="deliverSignal(n.id, signalTexts[n.id] ?? '')"
+        >
+          交付
+        </button>
+      </div>
+      <div v-if="signalIsNonJson(signalTexts[n.id])" class="field-help">
+        非 JSON，将作为字符串交付
       </div>
     </div>
 
@@ -100,7 +146,7 @@ function onRowClick(nodeId: string): void {
           <tr>
             <th>节点</th>
             <th>状态</th>
-            <th>次数</th>
+            <th>尝试</th>
             <th>耗时</th>
           </tr>
         </thead>
@@ -139,7 +185,7 @@ function onRowClick(nodeId: string): void {
               </span>
               <div v-if="n.error" class="node-error">{{ n.error }}</div>
               <div v-else-if="n.reason" class="node-reason">{{ n.reason }}</div>
-              <div v-else-if="n.output !== null && n.output !== undefined" class="node-output">
+              <div v-else-if="n.output !== null && n.output !== undefined" class="node-output" :title="fmtJsonFull(n.output)">
                 {{ fmtJson(n.output) }}
               </div>
             </td>
@@ -190,6 +236,11 @@ function onRowClick(nodeId: string): void {
 .run-id {
   font-family: var(--mono);
   color: var(--text2);
+}
+
+.run-copy {
+  padding: 1px 8px;
+  font-size: 11px;
 }
 
 .run-phase.run-running,
@@ -268,11 +319,11 @@ function onRowClick(nodeId: string): void {
 }
 
 .timeline tbody tr {
-  cursor: default;
+  cursor: pointer;
 }
 
 .timeline tr.highlighted td {
-  background: rgba(163, 113, 247, 0.15);
+  background: rgba(124, 108, 255, 0.15);
 }
 
 .node-error {

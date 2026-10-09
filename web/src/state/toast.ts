@@ -18,6 +18,8 @@ export function dismissToast(id: number): void {
 }
 
 export function showToast(kind: ToastKind, text: string): void {
+  // 相同 kind+text 的 toast 已在显示时跳过，避免轮询报错刷屏
+  if (toasts.some((t) => t.kind === kind && t.text === text)) return;
   const id = nextId++;
   toasts.push({ id, kind, text });
   // error 停留更久，便于读完错误信息；三类都可手动关闭

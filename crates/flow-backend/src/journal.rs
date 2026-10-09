@@ -213,6 +213,7 @@ impl JournalBackend {
             for (kind, map) in [
                 ("schedule", &committed.state.schedules),
                 ("webhook", &committed.state.webhooks),
+                ("template", &committed.state.templates),
                 ("legacy", &committed.state.legacy),
             ] {
                 for (key, value) in map {
@@ -686,6 +687,12 @@ fn project_rows(state: &State, tx: &Transaction) -> flow_journal::Result<Vec<Pro
                     flow_engine::journal_state::string(&e.payload, "token")?,
                 ));
             }
+            EventKind::TemplateChanged => {
+                keys.insert((
+                    "template",
+                    flow_engine::journal_state::string(&e.payload, "id")?,
+                ));
+            }
             _ => {}
         }
     }
@@ -700,6 +707,7 @@ fn project_rows(state: &State, tx: &Transaction) -> flow_journal::Result<Vec<Pro
                     .transpose()?,
                 "schedule" => state.schedules.get(&key).cloned(),
                 "webhook" => state.webhooks.get(&key).cloned(),
+                "template" => state.templates.get(&key).cloned(),
                 "legacy" => state.legacy.get(&key).cloned(),
                 _ => None,
             };

@@ -1,19 +1,20 @@
 //! flow-cli 的端到端测试：**真起被测对象**——`flow-cli` 二进制作为子进程跑，
-//! 服务端用 `flow_rpc::serve` + `SqliteBackend::open`（显式路径，不碰环境变量，
+//! 服务端用 `flow_rpc::serve` + journal 后端（显式路径，不碰环境变量，
 //! 测试可以并行）在进程内监听随机端口。
 //!
 //! 为什么不让测试当客户端直连 JSON-RPC：那测的是服务端。这里要钉住的是
 //! CLI 自己的三件事——参数拼装、退出码契约、stdout/stderr 分工（文档走 stdout）。
 //! 崩溃恢复、published 校验等语义由 backend-e2e / flow-rpc 的测试负责。
 //!
-//! 数据落盘遵守仓库约定：每个用例一个独占临时目录里的 `flow.db`，只清理该目录。
+//! 数据落盘遵守仓库约定：每个用例一个独占临时目录（journal 根），只清理该目录。
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::time::Duration;
 
-use flow_backend::{AnyBackend, SqliteBackend};
+use flow_backend::journal::JournalBackend;
+use flow_backend::AnyBackend;
 use flow_rpc::{serve, AppState};
 use flow_test_support::io::TempDir;
 use serde_json::{json, Value};
@@ -35,11 +36,13 @@ struct TestServer {
 impl TestServer {
     async fn spawn() -> TestServer {
         let scratch = TempDir::new("flow-cli-test-server");
-        let backend = SqliteBackend::open(scratch.path(), scratch.path().join("flow.db"))
+        let backend = JournalBackend::open(scratch.path(), Default::default())
             .await
-            .expect("打开 SQLite 后端失败");
-        let backend = AnyBackend::Sqlite(std::sync::Arc::new(backend));
-        backend.start().await.expect("后端启动失败");
+            .expect("打开 journal 后端失败");
+        flow_backend::start_execution(&flow_config::ExecutionConfig::default(), &backend)
+            .await
+            .expect("启动执行驱动失败");
+        let backend = AnyBackend::Journal(backend);
         let state = std::sync::Arc::new(AppState::new(backend));
         let (handle, addr) = serve(state, SocketAddr::from(([127, 0, 0, 1], 0)))
             .await

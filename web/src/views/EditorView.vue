@@ -13,8 +13,10 @@ import {
   latestVersion,
   pasteClipboard,
   publish,
+  publishing,
   refreshWorkflows,
   save,
+  saving,
   selectWorkflow,
   validationErrors,
   validationUi,
@@ -71,6 +73,10 @@ function isEditableTarget(t: EventTarget | null): boolean {
 
 // 快捷键只在编辑器页注册（运行详情等只读页不受影响）；输入框聚焦时不劫持
 function onKeydown(e: KeyboardEvent): void {
+  if (e.key === "Escape" && validationUi.open) {
+    validationUi.open = false;
+    return;
+  }
   if ((e.key === "Delete" || e.key === "Backspace") && !isEditableTarget(e.target)) {
     if (deleteSelection()) e.preventDefault();
     return;
@@ -103,6 +109,18 @@ function onKeydown(e: KeyboardEvent): void {
 onMounted(() => window.addEventListener("keydown", onKeydown));
 onUnmounted(() => window.removeEventListener("keydown", onKeydown));
 
+// 校验错误 popover：点外部或 Esc 关闭（与 CanvasContextMenu 同一模式）
+const validationAnchor = ref<HTMLElement>();
+
+function onPointerDownOutside(e: PointerEvent): void {
+  if (!validationUi.open) return;
+  if (validationAnchor.value?.contains(e.target as Node)) return;
+  validationUi.open = false;
+}
+
+onMounted(() => window.addEventListener("pointerdown", onPointerDownOutside, true));
+onUnmounted(() => window.removeEventListener("pointerdown", onPointerDownOutside, true));
+
 function locateError(nodeId?: string): void {
   if (nodeId) editor.selectedNodeId = nodeId;
   validationUi.open = false;
@@ -113,8 +131,8 @@ function locateError(nodeId?: string): void {
   <div class="editor-page">
     <div class="editor-topbar">
       <RouterLink class="link" to="/workflows">← 工作流列表</RouterLink>
-      <span class="editor-title">
-        {{ editor.workflowName || editor.workflowId }}
+      <span class="editor-title" :title="editor.workflowName || editor.workflowId || undefined">
+        <span class="editor-title-name">{{ editor.workflowName || editor.workflowId }}</span>
         <span v-if="editor.version" class="muted">v{{ editor.version }}</span>
         <span v-if="editor.version > 0 && editor.version < latestVersion" class="muted">
           （基于旧版本，最新 v{{ latestVersion }}）
@@ -125,7 +143,7 @@ function locateError(nodeId?: string): void {
         <button title="撤销 (⌘Z)" :disabled="!history.canUndo" @click="undo()">↶ 撤销</button>
         <button title="重做 (⌘⇧Z)" :disabled="!history.canRedo" @click="redo()">↷ 重做</button>
         <button :disabled="editor.nodes.length === 0" @click="autoLayout()">自动布局</button>
-        <span class="validation-anchor">
+        <span ref="validationAnchor" class="validation-anchor">
           <button
             v-if="validationErrors.length > 0"
             class="validation-badge"
@@ -134,15 +152,16 @@ function locateError(nodeId?: string): void {
             {{ validationErrors.length }} 处错误
           </button>
           <div v-if="validationUi.open && validationErrors.length > 0" class="validation-popover">
-            <div
+            <button
               v-for="(err, i) in validationErrors"
               :key="i"
+              type="button"
               class="validation-item"
               :class="{ clickable: !!err.nodeId }"
               @click="locateError(err.nodeId)"
             >
               {{ err.message }}
-            </div>
+            </button>
           </div>
         </span>
         <RouterLink
@@ -166,8 +185,12 @@ function locateError(nodeId?: string): void {
         >
           运行记录
         </RouterLink>
-        <button @click="save()">保存</button>
-        <button @click="publish()">发布</button>
+        <button title="保存 (⌘S)" :disabled="saving" @click="save()">
+          {{ saving ? "保存中…" : "保存" }}
+        </button>
+        <button :disabled="publishing" @click="publish()">
+          {{ publishing ? "发布中…" : "发布" }}
+        </button>
         <button class="primary" :disabled="monitor.starting" @click="startRun()">运行</button>
       </div>
     </div>
@@ -204,7 +227,9 @@ function locateError(nodeId?: string): void {
 .editor-topbar {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 14px;
+  row-gap: 6px;
   padding: 8px 12px;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
@@ -216,6 +241,10 @@ function locateError(nodeId?: string): void {
   display: flex;
   gap: 8px;
   align-items: baseline;
+  min-width: 0;
+}
+
+.editor-title-name {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -230,7 +259,9 @@ function locateError(nodeId?: string): void {
 .editor-actions {
   margin-left: auto;
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
+  row-gap: 6px;
   align-items: center;
 }
 
@@ -260,10 +291,24 @@ function locateError(nodeId?: string): void {
 }
 
 .validation-item {
+  display: block;
+  width: 100%;
+  text-align: left;
   padding: 6px 8px;
+  border: none;
+  background: none;
   border-radius: 6px;
   font-size: 12px;
+  font-weight: 400;
   color: var(--text2);
+}
+
+.validation-item:not(.clickable) {
+  cursor: default;
+}
+
+.validation-item:not(.clickable):hover {
+  background: none;
 }
 
 .validation-item.clickable {

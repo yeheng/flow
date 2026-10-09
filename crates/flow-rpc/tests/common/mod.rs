@@ -36,31 +36,23 @@ pub struct ServerProc {
 }
 
 impl ServerProc {
+    /// 由已启动的子进程与报出的端口组装（自定义环境形态的 spawn 用）。
+    pub fn from_parts(
+        child: std::process::Child,
+        addr: SocketAddr,
+        http_addr: SocketAddr,
+    ) -> ServerProc {
+        ServerProc {
+            child,
+            addr,
+            http_addr,
+        }
+    }
+
     /// SQLite 后端：独占临时目录里的 `flow.db`（DESIGN.md §13：只清理独占目录）。
     ///
     /// 目录的清理归调用方（[`Workspace`] 持有一个 [`TempDir`]）：重启要复用同一份
     /// 目录，所有权留在 proc 身上会把目录在重启前删掉。
-    pub fn spawn_sqlite(data_dir: std::path::PathBuf) -> ServerProc {
-        let db = data_dir.join("flow.db");
-        let mut cmd = Command::new(server_bin());
-        cmd.env("FLOW_DATA_DIR", &data_dir)
-            .env("FLOW_DB", &db)
-            .env("RUST_LOG", "info")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit());
-        // 端口由被测进程自己向内核要（FLOW_ADDR/FLOW_HTTP_ADDR=127.0.0.1:0），
-        // 实际端口从它的启动日志读回：父进程「挑端口再让子进程绑」存在 TOCTOU，
-        // 并行用例会抢走端口（CI 多核上会真发生），子进程随即 AddrInUse 退出。
-        let (child, ports) = spawn_reporting_ports(&mut cmd, "FLOW_ADDR", "FLOW_HTTP_ADDR", None)
-            .unwrap_or_else(|e| panic!("{e}"));
-        ServerProc {
-            child,
-            addr: ports.rpc,
-            http_addr: ports.http,
-        }
-    }
-
     /// Postgres 后端：`role` 为 all / gateway / executor。时间参数全部压到最快，
     /// 行为测试等不起生产默认值。
     pub fn spawn_pg(url: &str, role: &str) -> ServerProc {
@@ -288,55 +280,4 @@ async fn port_open() -> bool {
     tokio::net::TcpStream::connect("127.0.0.1:54329")
         .await
         .is_ok()
-}
-
-/// 一个 SQLite 存储上的被测服务端 + 已连上的客户端。
-///
-/// `restart` 会 SIGKILL 后用同一份 `data_dir` / `db` 重新拉起——崩溃恢复用例
-/// 的「重启」。Drop 时 ServerProc 连带删掉独占临时目录。
-pub struct Workspace {
-    pub proc: ServerProc,
-    pub client: WsClient,
-    /// 独占临时目录。ServerProc 只管进程，目录的所有权在这里、Drop 时整体删除。
-    _dir: flow_test_support::io::TempDir,
-}
-
-impl Workspace {
-    pub async fn start() -> Workspace {
-        let dir = flow_test_support::io::TempDir::new("flow-rpc-test");
-        let proc = ServerProc::spawn_sqlite(dir.path().to_path_buf());
-        let client = proc.client().await;
-        Workspace {
-            proc,
-            client,
-            _dir: dir,
-        }
-    }
-
-    /// 重启服务端进程，复用同一份 data_dir / db（模拟宕机后重启）。
-    pub async fn restart(&mut self) {
-        self.proc.kill();
-        let dir = self._dir.path().to_path_buf();
-        self.proc = ServerProc::spawn_sqlite(dir);
-        self.client = self.proc.client().await;
-    }
-
-    pub async fn publish_workflow(&self, name: &str, definition: Value) -> (String, i64) {
-        publish(&self.client, name, definition).await
-    }
-
-    pub async fn start_run(&self, workflow_id: &str, input: Value) -> String {
-        start_run(&self.client, workflow_id, input).await
-    }
-
-    pub async fn wait_run_status(&self, run_id: &str, expected: &str) -> Value {
-        wait_status(&self.client, run_id, expected, Duration::from_secs(30)).await
-    }
-
-    pub async fn wait_event<F>(&self, run_id: &str, predicate: F)
-    where
-        F: Fn(&Value) -> bool,
-    {
-        wait_event(&self.client, run_id, predicate, Duration::from_secs(20)).await
-    }
 }

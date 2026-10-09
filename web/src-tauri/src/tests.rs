@@ -103,8 +103,14 @@ async fn journal_uses_separate_authority_and_native_token() {
     )
     .await;
     assert_eq!(reply["result"]["result"], replay["result"]["result"]);
-    let legacy = call(&host, Service::Flow, "workflow.list", json!({})).await;
-    assert_eq!(legacy["result"]["workflows"], json!([]));
+    // M4 后主服务与 journal 工作区同源（v2 唯一权威）：journal 创建的
+    // 工作流对 Flow 服务立即可见
+    let flow_list = call(&host, Service::Flow, "workflow.list", json!({})).await;
+    assert_eq!(
+        flow_list["result"]["workflows"].as_array().unwrap().len(),
+        1,
+        "同一 journal 权威：{flow_list}"
+    );
     host.shutdown().unwrap();
     drop(host);
     let reopened = Host::start(root.path().to_path_buf()).unwrap();

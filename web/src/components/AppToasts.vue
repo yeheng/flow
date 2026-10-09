@@ -3,9 +3,15 @@ import { dismissToast, toasts } from "../state/toast";
 </script>
 
 <template>
-  <div class="toasts">
+  <div class="toasts" aria-live="polite">
     <TransitionGroup name="toast">
-      <div v-for="t in toasts" :key="t.id" class="toast" :class="`toast-${t.kind}`">
+      <div
+        v-for="t in toasts"
+        :key="t.id"
+        class="toast"
+        :class="`toast-${t.kind}`"
+        :role="t.kind === 'error' ? 'alert' : 'status'"
+      >
         <span class="toast-text">{{ t.text }}</span>
         <button class="toast-close" title="关闭" @click="dismissToast(t.id)">×</button>
       </div>
@@ -58,7 +64,8 @@ import { dismissToast, toasts } from "../state/toast";
   border: none;
   background: none;
   color: var(--text3);
-  padding: 0 4px;
+  padding: 4px 8px;
+  margin: -4px -4px 0 0;
 }
 
 .toast-close:hover {

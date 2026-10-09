@@ -2,13 +2,14 @@
 import { computed } from "vue";
 import { Handle, Position } from "@vue-flow/core";
 import { editor, nodeValidationError, sourcePortsOf, type FlowNodeData } from "../state/editor";
-import { nodeChildRunId, nodeRunState, openChildRun } from "../state/monitor";
+import { nodeChildRunId, nodeRunState } from "../state/monitor";
 
 const props = defineProps<{
   id: string;
   data: FlowNodeData;
   selected?: boolean;
 }>();
+const emit = defineEmits<{ "open-child": [childRunId: string] }>();
 
 // 协议约定：id 为 "in" 的是入端口（target），其余都是出端口（source）
 const targetPorts = computed(() => props.data.nodeType.ports.filter((p) => p.id === "in"));
@@ -80,7 +81,7 @@ function sourceStyle(index: number, total: number) {
 </script>
 
 <template>
-  <div class="flow-node" :class="nodeClass" :title="invalidMsg ?? undefined">
+  <div class="flow-node" :class="nodeClass" :title="invalidMsg ?? data.name">
     <Handle
       v-for="p in targetPorts"
       :id="p.id"
@@ -103,7 +104,7 @@ function sourceStyle(index: number, total: number) {
         v-if="childRunId"
         class="node-child-link"
         title="查看子 run"
-        @click.stop="openChildRun(childRunId)"
+        @click.stop="emit('open-child', childRunId)"
       >
         子 run →
       </button>
@@ -179,8 +180,8 @@ function sourceStyle(index: number, total: number) {
 }
 
 .node-type {
-  color: var(--text3);
-  font-size: 9px;
+  color: var(--text2);
+  font-size: 10px;
   font-weight: 500;
   font-family: var(--mono);
   text-transform: uppercase;
@@ -242,7 +243,7 @@ function sourceStyle(index: number, total: number) {
 
 /* RunPanel 行 hover/click 联动 */
 .flow-node.highlighted {
-  border-color: #a371f7;
+  border-color: var(--accent2);
   box-shadow:
     0 0 0 2px rgba(163, 113, 247, 0.35),
     0 4px 20px var(--shadow-hover);

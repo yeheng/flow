@@ -505,8 +505,12 @@ export function onConnect(conn: Connection): void {
 
 // ---- 保存 / 发布 ----
 
+/** 保存/发布进行中的忙碌标记（按钮禁用与文案切换用） */
+export const saving = ref(false);
+export const publishing = ref(false);
+
 export async function save(): Promise<boolean> {
-  if (!editor.workflowId) return false;
+  if (!editor.workflowId || saving.value) return false;
   // 保存前过前端预校验：有错不打 RPC（服务端 validate 仍是最终裁决）
   const errs = validateNow();
   if (errs.length > 0) {
@@ -514,6 +518,7 @@ export async function save(): Promise<boolean> {
     toast.error(`工作流定义有 ${errs.length} 处校验错误，请先修复`);
     return false;
   }
+  saving.value = true;
   try {
     // 软冲突检测：另一标签页/会话可能在我们加载后保存了新版本。
     // 版本 append-only 不会丢数据，但为避免静默分叉先确认。（workflow.update 尚无
@@ -534,20 +539,25 @@ export async function save(): Promise<boolean> {
   } catch (e) {
     toast.error(errText(e));
     return false;
+  } finally {
+    saving.value = false;
   }
 }
 
 export async function publish(): Promise<void> {
   if (!editor.workflowId) return;
-  // 发布前先把画布落库，保证发布的版本就是当前图
-  if (!(await save())) return;
+  publishing.value = true;
   try {
+    // 发布前先把画布落库，保证发布的版本就是当前图
+    if (!(await save())) return;
     await api.publishWorkflow(editor.workflowId, editor.version);
     editor.publishedVersion = editor.version;
     toast.success(`已发布 v${editor.version}`);
     await refreshWorkflows();
   } catch (e) {
     toast.error(errText(e));
+  } finally {
+    publishing.value = false;
   }
 }
 

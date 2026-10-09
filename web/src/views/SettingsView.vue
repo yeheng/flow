@@ -16,6 +16,8 @@ import type { ConfigView, FlowConfig, SecretInfo } from "../types";
 
 const loading = ref(true);
 const saving = ref(false);
+/** 初始 getConfig 失败时展示内联错误块（含重试），而不是一张空表单 */
+const loadError = ref<string | null>(null);
 const configPath = ref<string | null>(null);
 const envOverrides = ref<string[]>([]);
 /** 可编辑副本（深拷贝；database_url 保持 "<set>" 哨兵语义） */
@@ -162,11 +164,19 @@ async function refresh(): Promise<void> {
     configPath.value = view.config_path;
     envOverrides.value = view.env_overrides;
     secrets.value = await api.listSecrets();
+    loadError.value = null;
   } catch (e) {
+    loadError.value = errText(e);
     toast.error(errText(e));
   } finally {
     loading.value = false;
   }
+}
+
+function onRetryLoad(): void {
+  loading.value = true;
+  loadError.value = null;
+  void refresh();
 }
 
 onMounted(() => {
@@ -204,8 +214,9 @@ async function onSave(): Promise<void> {
   }
 }
 
-function onReset(): void {
+async function onReset(): Promise<void> {
   if (!original.value) return;
+  if (!(await confirmDialog("确定放弃所有未保存的修改？"))) return;
   copy.value = JSON.parse(JSON.stringify(original.value)) as FlowConfig;
 }
 
@@ -234,7 +245,9 @@ async function onAddSecret(): Promise<void> {
 }
 
 async function onDeleteSecret(name: string): Promise<void> {
-  const ok = await confirmDialog(`删除密钥「${name}」？引用它的节点将在执行时报缺失。`);
+  const ok = await confirmDialog(`删除密钥「${name}」？引用它的节点将在执行时报缺失。`, {
+    danger: true,
+  });
   if (!ok) return;
   try {
     const deleted = await api.deleteSecret(name);
@@ -267,6 +280,10 @@ async function onDeleteSecret(name: string): Promise<void> {
     </div>
 
     <div v-if="loading" class="empty">加载中…</div>
+    <div v-else-if="loadError" class="empty">
+      加载配置失败：{{ loadError }}
+      <button class="btn" @click="onRetryLoad">重试</button>
+    </div>
     <template v-else>
       <section v-for="s in visibleSections" :key="s.sect" class="card">
         <div class="card-head">
@@ -302,7 +319,7 @@ async function onDeleteSecret(name: string): Promise<void> {
       </section>
     </template>
 
-    <section class="card">
+    <section v-if="!loadError" class="card">
       <div class="card-head">
         <h3>密钥</h3>
         <span class="env-tag">值加密存储，永不出服务端</span>

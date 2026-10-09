@@ -5,8 +5,7 @@
 //! 「被测的就是生产进程」。本入口只做三件事：
 //! - rustls crypto provider 安装（进程级一次）；
 //! - 统一配置加载（`--config` / FLOW_CONFIG / ./flow.toml / 平台目录）；
-//! - runtime 形态选择（sqlite = current_thread 单线程；postgres = 多线程，
-//!   见 `flow_backend::prefer_current_thread_runtime_for`）。
+//! - runtime 构造（多线程；v1 sqlite 的 current_thread 形态已随其后端删除）。
 //!
 //! 运行：cargo run -p flow-rpc --bin flow-server
 
@@ -52,15 +51,11 @@ fn main() -> std::process::ExitCode {
         Ok(loaded) => loaded,
         Err(err) => return exit_fail(&err),
     };
-    let runtime = if flow_backend::prefer_current_thread_runtime_for(loaded.config.storage.backend)
-    {
-        tokio::runtime::Builder::new_current_thread()
-    } else {
-        tokio::runtime::Builder::new_multi_thread()
-    }
-    .enable_all()
-    .build()
-    .expect("server tokio runtime");
+    // v1 sqlite 的 current_thread 单写者形态已随其后端删除；统一多线程
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("server tokio runtime");
     match runtime.block_on(flow_rpc::run(loaded)) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {

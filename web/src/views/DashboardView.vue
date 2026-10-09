@@ -11,6 +11,10 @@ import type { RunRecord, RunStats } from "../types";
  *  最近运行表只是展示窗口，走 run.list(limit 10) */
 const stats = ref<RunStats>({ total: 0, by_status: {}, by_workflow: [] });
 const runs = ref<RunRecord[]>([]);
+/** 首次拉取完成前不展示空态，避免「暂无…」闪烁 */
+const loaded = ref(false);
+/** 轮询失败只在 ok→error 跳变时 toast，避免每 5s 重复弹错 */
+const pollFailed = ref(false);
 let timer: ReturnType<typeof setInterval> | null = null;
 
 const workflowNames = computed(() => new Map(editor.workflows.map((w) => [w.workflow_id, w.name])));
@@ -52,8 +56,21 @@ async function refresh(): Promise<void> {
   try {
     if (editor.workflows.length === 0) await refreshWorkflows();
     [stats.value, runs.value] = await Promise.all([api.runStats(), api.listRuns({ limit: 10 })]);
+    pollFailed.value = false;
   } catch (e) {
-    toast.error(errText(e));
+    if (!pollFailed.value) toast.error(errText(e));
+    pollFailed.value = true;
+  } finally {
+    loaded.value = true;
+  }
+}
+
+async function copyRunId(id: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(id);
+    toast.success("已复制 run id");
+  } catch {
+    toast.error("复制失败，请手动复制");
   }
 }
 
@@ -106,8 +123,10 @@ onUnmounted(() => {
         </thead>
         <tbody>
           <tr v-for="r in runs" :key="r.id">
-            <td class="mono">{{ r.id.slice(0, 8) }}…</td>
-            <td>
+            <td class="mono copyable" :title="r.id" @click="copyRunId(r.id)">
+              {{ r.id.slice(0, 8) }}…
+            </td>
+            <td class="wf-cell">
               {{ workflowNames.get(r.workflow_id) ?? r.workflow_id }}
               <span class="muted">v{{ r.workflow_version }}</span>
             </td>
@@ -116,14 +135,15 @@ onUnmounted(() => {
                 {{ statusLabel[r.status] ?? r.status }}
               </span>
             </td>
-            <td>{{ fmtTime(r.started_at) }}</td>
+            <td :title="r.started_at">{{ fmtTime(r.started_at) }}</td>
             <td class="actions">
               <RouterLink class="link" :to="`/runs/${r.id}`">详情</RouterLink>
             </td>
           </tr>
         </tbody>
       </table>
-      <p v-if="runs.length === 0" class="wf-empty">暂无运行记录</p>
+      <p v-if="!loaded" class="wf-empty">加载中…</p>
+      <p v-else-if="runs.length === 0" class="wf-empty">暂无运行记录</p>
     </section>
 
     <section class="section">
@@ -150,7 +170,8 @@ onUnmounted(() => {
           </tr>
         </tbody>
       </table>
-      <p v-if="rates.length === 0" class="wf-empty">暂无数据</p>
+      <p v-if="!loaded" class="wf-empty">加载中…</p>
+      <p v-else-if="rates.length === 0" class="wf-empty">暂无数据</p>
     </section>
   </div>
 </template>
@@ -192,5 +213,14 @@ onUnmounted(() => {
 
 .section {
   margin-bottom: 24px;
+}
+
+.copyable {
+  cursor: pointer;
+}
+
+/* 名称缺失时回退渲染 36 字符 workflow_id，允许折行避免撑破表格 */
+.wf-cell {
+  word-break: break-all;
 }
 </style>

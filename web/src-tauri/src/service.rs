@@ -9,7 +9,7 @@ use std::{
     },
 };
 
-use flow_backend::{journal::JournalBackend, AnyBackend, SqliteBackend};
+use flow_backend::{journal::JournalBackend, AnyBackend};
 use jsonrpsee::core::server::Methods;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -48,23 +48,18 @@ impl Services {
         let loaded = flow_config::Config::load_or_default(&config_path)
             .map_err(|e| e.to_string())?;
         let config = loaded.config;
+        // 密钥与历史 v1 数据仍住在原 data 目录（密钥是用户资产，不随权威
+        // 切换搬家；v1 数据按「历史舍弃」原则保留只读）。工作流/run 的
+        // 权威是 root/journal（v2 唯一权威，主服务与 /journal 工作区同源）。
         let data = if has_config_file {
             root.join(&config.storage.data_dir)
         } else {
             root.join("flow")
         };
-        let db_path = config
-            .storage
-            .database
-            .as_ref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| data.join("flow.db"));
-        let backend = AnyBackend::Sqlite(Arc::new(
-            SqliteBackend::open(&data, db_path).await.map_err(|e| e.to_string())?,
-        ));
         let journal = JournalBackend::open(&root.join("journal"), Default::default())
             .await
             .map_err(|e| e.to_string())?;
+        let backend = AnyBackend::Journal(journal.clone());
         let built = Self::assemble(
             backend.clone(),
             journal.clone(),
@@ -74,7 +69,6 @@ impl Services {
         )
         .await;
         if built.is_err() {
-            let _ = journal.close().await;
             let _ = backend.shutdown().await;
         }
         built
@@ -113,18 +107,13 @@ impl Services {
         );
         backend.start().await.map_err(|e| e.to_string())?;
         journal.start_execution().await.map_err(|e| e.to_string())?;
-        let scheduler = if config.server.scheduler_enabled {
-            let scheduler_backend = backend.clone();
-            let tick = config.scheduler_tick();
-            tokio::spawn(async move {
-                flow_rpc::scheduler::run(scheduler_backend, tick).await;
-            })
+        // 主后端 = journal：触发器走 journal_triggers（命令身份去重），
+        // 不再跑 v1 调度器（schedule_fires 表语义）
+        let journal_scheduler = if config.server.scheduler_enabled {
+            flow_rpc::journal_triggers::start(journal.clone(), config.journal_trigger_tick())
         } else {
-            // 保持 tasks 通道形状：立即结束的占位任务
             tokio::spawn(async {})
         };
-        let journal_scheduler =
-            flow_rpc::journal_triggers::start(journal.clone(), config.journal_trigger_tick());
         let http = tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, flow_rpc::webhook::router(state)).await {
                 eprintln!("desktop webhook server stopped: {error}");
@@ -138,7 +127,7 @@ impl Services {
             token,
             downloads,
             http_url,
-            tasks: Mutex::new(vec![scheduler, journal_scheduler, http]),
+            tasks: Mutex::new(vec![journal_scheduler, http]),
             closing: AtomicBool::new(false),
             gate: RwLock::new(()),
         }))

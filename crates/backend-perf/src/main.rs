@@ -29,13 +29,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var_os("FLOW_PERF_SERVE").is_some() {
         // 与 flow-server 同形态（sqlite 单线程 runtime / postgres 多线程）：
         // 压测量的就是生产形态，不给 sqlite 模式多线程的开挂值
-        let runtime = if flow_rpc::prefer_current_thread_runtime() {
-            tokio::runtime::Builder::new_current_thread()
-        } else {
-            tokio::runtime::Builder::new_multi_thread()
-        }
-        .enable_all()
-        .build()?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
         if let Err(err) = runtime.block_on(flow_rpc::run_from_env()) {
             eprintln!("被测服务进程异常退出：{err}");
             std::process::exit(1);
@@ -66,9 +62,9 @@ async fn perf_main() {
         .into_owned();
 
     let kinds: Vec<Kind> = match opts.backend {
-        BackendSel::Both => vec![Kind::Sqlite, Kind::Postgres],
-        BackendSel::Sqlite => vec![Kind::Sqlite],
+        BackendSel::Both => vec![Kind::Postgres, Kind::Journal],
         BackendSel::Postgres => vec![Kind::Postgres],
+        BackendSel::Journal => vec![Kind::Journal],
     };
 
     let mut reports = Vec::new();

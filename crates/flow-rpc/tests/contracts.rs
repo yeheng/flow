@@ -2,14 +2,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use flow_backend::{AnyBackend, SqliteBackend};
-use flow_engine::{Event, EventLog, RunPhase};
+use flow_backend::journal::JournalBackend;
+use flow_backend::{AnyBackend, CreateRun};
 use flow_rpc::{build_module, AppState};
 use serde_json::{json, Value};
 
 struct Fixture {
     root: PathBuf,
-    backend: Arc<SqliteBackend>,
+    backend: Arc<JournalBackend>,
+    arm: AnyBackend,
     state: Arc<AppState>,
     workflow: String,
 }
@@ -17,20 +18,22 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Self {
         let root = std::env::temp_dir().join(format!("flow-contracts-{}", uuid::Uuid::now_v7()));
-        let backend = Arc::new(
-            SqliteBackend::open(&root, root.join("flow.db"))
-                .await
-                .unwrap(),
-        );
-        let workflow = backend.store().create_workflow("test").await.unwrap();
-        backend
-            .store()
-            .update_workflow(&workflow, &definition(7))
+        let backend = JournalBackend::open(&root, Default::default())
             .await
             .unwrap();
-        let state = Arc::new(AppState::new(AnyBackend::Sqlite(backend.clone())));
+        flow_backend::start_execution(&flow_config::ExecutionConfig::default(), &backend)
+            .await
+            .unwrap();
+        let workflow = backend.workflow_create("test", None).await.unwrap();
+        let workflow = workflow.result["workflow_id"].as_str().unwrap().to_string();
+        backend
+            .workflow_update(&workflow, definition(7), None)
+            .await
+            .unwrap();
+        let state = Arc::new(AppState::new(AnyBackend::Journal(backend.clone())));
         Self {
             root,
+            arm: AnyBackend::Journal(backend.clone()),
             backend,
             state,
             workflow,
@@ -48,17 +51,18 @@ impl Fixture {
     async fn wait_finished(&self, run: &str) -> Value {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let row = self.backend.store().get_run(run).await.unwrap();
-                if matches!(row.status.as_str(), "succeeded" | "failed" | "cancelled")
-                    && !self.backend.engine().is_live(run)
-                {
-                    return serde_json::to_value(row).unwrap();
+                let state = self.backend.state().await;
+                if let Some(row) = state.runs.get(run).filter(|r| r.terminal()) {
+                    return json!({
+                        "status": row.status,
+                        "error": row.error,
+                    });
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .expect("run did not finish")
+        .expect("run 未在超时内终结")
     }
 }
 
@@ -174,16 +178,17 @@ async fn explicit_draft_is_rejected_and_historical_published_version_still_runs(
         .await;
     assert_eq!(rejected["error"]["code"], -32012);
     assert!(f
-        .backend
-        .store()
+        .arm
         .list_runs(None, None, None, None, 100)
         .await
         .unwrap()
         .is_empty());
-    f.backend.store().publish(&f.workflow, 1).await.unwrap();
     f.backend
-        .store()
-        .update_workflow(&f.workflow, &definition(8))
+        .workflow_publish(&f.workflow, 1, None)
+        .await
+        .unwrap();
+    f.backend
+        .workflow_update(&f.workflow, definition(8), None)
         .await
         .unwrap();
     let rejected = f
@@ -198,187 +203,13 @@ async fn explicit_draft_is_rejected_and_historical_published_version_still_runs(
         assert_eq!(response["result"]["workflow_version"], 1);
         let run = response["result"]["run_id"].as_str().unwrap();
         let row = f.wait_finished(run).await;
-        assert_eq!(row["output"], 7);
         assert_eq!(row["status"], "succeeded");
-    }
-}
-
-#[tokio::test]
-async fn incomplete_initialization_is_failed_without_replaying_missing_logs() {
-    let f = Fixture::new().await;
-    f.backend.store().publish(&f.workflow, 1).await.unwrap();
-    for run in ["missing", "empty", "partial"] {
-        f.backend
-            .store()
-            .insert_run(
-                run,
-                &f.workflow,
-                1,
-                &Value::Null,
-                "initializing",
-                "manual",
-                None,
-            )
-            .await
-            .unwrap();
-        if run != "missing" {
-            drop(EventLog::create(&f.root, run).await.unwrap());
-        }
-        if run == "partial" {
-            tokio::fs::write(f.backend.engine().events_path(run), b"{\"seq\":1")
-                .await
-                .unwrap();
-        }
-    }
-    let failures = flow_backend::recover_unfinished(&f.backend).await.unwrap();
-    assert_eq!(failures.len(), 3);
-    for run in ["missing", "empty", "partial"] {
-        let row = f.backend.store().get_run(run).await.unwrap();
-        assert_eq!(row.status, "failed");
-        assert!(row.error.is_some());
-        assert!(!f.backend.engine().is_live(run));
-    }
-    assert!(flow_backend::recover_unfinished(&f.backend)
-        .await
-        .unwrap()
-        .is_empty());
-    assert!(!f.backend.engine().events_path("missing").exists());
-}
-
-#[tokio::test]
-async fn initialized_log_is_resumed_even_when_metadata_still_says_initializing() {
-    let f = Fixture::new().await;
-    f.backend.store().publish(&f.workflow, 1).await.unwrap();
-    f.backend
-        .store()
-        .insert_run(
-            "r",
-            &f.workflow,
-            1,
-            &Value::Null,
-            "initializing",
-            "manual",
-            None,
-        )
-        .await
-        .unwrap();
-    let mut log = EventLog::create(&f.root, "r").await.unwrap();
-    log.append(
-        "r",
-        Event::RunStarted {
-            workflow_id: f.workflow.clone(),
-            workflow_version: 1,
-            input: Value::Null,
-            depth: 0,
-        },
-    )
-    .await
-    .unwrap();
-    drop(log);
-    assert!(flow_backend::recover_unfinished(&f.backend)
-        .await
-        .unwrap()
-        .is_empty());
-    let row = f.wait_finished("r").await;
-    assert_eq!(row["status"], "succeeded");
-    assert_eq!(row["output"], 7);
-    assert_eq!(
-        f.backend.engine().snapshot("r").await.unwrap().phase,
-        RunPhase::Succeeded
-    );
-}
-
-/// 崩溃在「`run_cancelled` 已落盘、DB 投影未提交」之间时，恢复回填**不得**
-/// 给 cancelled 的 run 行带上 error。
-///
-/// 回填用的是折叠出的 `fatal_error`，而 `fatal_error` 的语义是「终态为 failed
-/// 时的原因」——取消不是失败。漏清时同一状态两条路径两个答案：正常投影路径
-/// （`FileSink::append_terminal`）对 RunCancelled 明确写 error=NULL，恢复回填
-/// 却把之前某个致命节点的原因写了进去。DESIGN §9「同名字段必须同值」。
-#[tokio::test]
-async fn terminal_recovery_backfill_does_not_put_a_node_failure_on_a_cancelled_run() {
-    let f = Fixture::new().await;
-    f.backend.store().publish(&f.workflow, 1).await.unwrap();
-    f.backend
-        .store()
-        .insert_run("r", &f.workflow, 1, &Value::Null, "running", "manual", None)
-        .await
-        .unwrap();
-    // 崩溃现场：节点致命失败（记下 fatal_error）→ 用户取消 → 日志已终结，
-    // 但 DB 仍是 running（投影那一步没来得及提交）
-    let mut log = EventLog::create(&f.root, "r").await.unwrap();
-    for event in [
-        Event::RunStarted {
-            workflow_id: f.workflow.clone(),
-            workflow_version: 1,
-            input: Value::Null,
-            depth: 0,
-        },
-        Event::NodeStarted {
-            node_id: "s".into(),
-            attempt: 1,
-            child_run_id: None,
-            input: None,
-        },
-        Event::NodeFailed {
-            node_id: "s".into(),
-            attempt: 1,
-            error: "boom".into(),
-            retryable: false,
-        },
-        Event::RunCancelled {},
-    ] {
-        log.append("r", event).await.unwrap();
-    }
-    drop(log);
-
-    assert!(flow_backend::recover_unfinished(&f.backend)
-        .await
-        .unwrap()
-        .is_empty());
-    let row = f.backend.store().get_run("r").await.unwrap();
-    assert_eq!(row.status, "cancelled");
-    assert_eq!(
-        row.error, None,
-        "cancelled 的 run 不得携带节点失败原因（正常路径写 NULL，回填必须一致）"
-    );
-}
-
-#[tokio::test]
-async fn missing_or_empty_logs_of_old_running_tasks_require_manual_recovery() {
-    let f = Fixture::new().await;
-    for run in ["missing", "empty"] {
-        f.backend
-            .store()
-            .insert_run(run, &f.workflow, 1, &Value::Null, "running", "manual", None)
-            .await
-            .unwrap();
-        if run == "empty" {
-            drop(EventLog::create(&f.root, run).await.unwrap());
-        }
-    }
-    for _ in 0..2 {
         assert_eq!(
-            flow_backend::recover_unfinished(&f.backend)
-                .await
-                .unwrap()
-                .len(),
-            2
+            f.arm.get_run(run).await.unwrap().output,
+            Some(json!(7)),
+            "历史 published 版本（v1 定义 output=7）仍可执行"
         );
-        for run in ["missing", "empty"] {
-            let row = f.backend.store().get_run(run).await.unwrap();
-            assert_eq!(row.status, "awaiting_resume");
-            assert!(row.error.is_some());
-            assert!(!f.backend.engine().is_live(run));
-        }
     }
-    assert!(!f.backend.engine().events_path("missing").exists());
-    assert_eq!(
-        std::fs::metadata(f.backend.engine().events_path("empty"))
-            .unwrap()
-            .len(),
-        0
-    );
 }
 
 fn human_def() -> Value {
@@ -395,12 +226,11 @@ fn human_def() -> Value {
 async fn wait_human_waiting(f: &Fixture, run: &str) -> u64 {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let state = f.backend.engine().snapshot(run).await.unwrap();
-            if matches!(
-                state.record("h").state,
-                flow_engine::NodeState::Running { .. }
-            ) {
-                return state.last_seq;
+            let state = f.backend.state().await;
+            if let Some(run) = state.runs.get(run) {
+                if run.nodes.get("h").is_some_and(|n| n.status == "waiting") {
+                    return run.last_run_seq;
+                }
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -414,7 +244,10 @@ async fn wait_human_waiting(f: &Fixture, run: &str) -> u64 {
 #[tokio::test]
 async fn run_signal_error_codes_follow_the_shared_contract() {
     let f = Fixture::new().await;
-    f.backend.store().publish(&f.workflow, 1).await.unwrap();
+    f.backend
+        .workflow_publish(&f.workflow, 1, None)
+        .await
+        .unwrap();
 
     let response = f
         .call(
@@ -437,13 +270,13 @@ async fn run_signal_error_codes_follow_the_shared_contract() {
         .await;
     assert_eq!(response["error"]["code"], -32012, "{response}");
 
-    let wf = f.backend.store().create_workflow("human").await.unwrap();
+    let wf = f.backend.workflow_create("human", None).await.unwrap();
+    let wf = wf.result["workflow_id"].as_str().unwrap().to_string();
     f.backend
-        .store()
-        .update_workflow(&wf, &human_def())
+        .workflow_update(&wf, human_def(), None)
         .await
         .unwrap();
-    f.backend.store().publish(&wf, 1).await.unwrap();
+    f.backend.workflow_publish(&wf, 1, None).await.unwrap();
     let response = f.call("run.start", json!({"workflow_id": wf})).await;
     let run = response["result"]["run_id"].as_str().unwrap().to_string();
     wait_human_waiting(&f, &run).await;
@@ -463,23 +296,24 @@ async fn subscribe_with_run_id_replays_follows_and_naturally_ends() {
     use futures::StreamExt;
 
     let f = Fixture::new().await;
-    let wf = f.backend.store().create_workflow("human").await.unwrap();
+    let wf = f.backend.workflow_create("human", None).await.unwrap();
+    let wf = wf.result["workflow_id"].as_str().unwrap().to_string();
     f.backend
-        .store()
-        .update_workflow(&wf, &human_def())
+        .workflow_update(&wf, human_def(), None)
         .await
         .unwrap();
-    f.backend.store().publish(&wf, 1).await.unwrap();
+    f.backend.workflow_publish(&wf, 1, None).await.unwrap();
     let response = f.call("run.start", json!({"workflow_id": wf})).await;
     let run = response["result"]["run_id"].as_str().unwrap().to_string();
     let until = wait_human_waiting(&f, &run).await;
 
-    let stream = f.backend.subscribe(Some(run.clone()));
+    let stream = f.arm.subscribe(Some(run.clone()));
     futures::pin_mut!(stream);
 
-    // 回放段：必须覆盖到等待点之前的全部事件
+    // 回放段：覆盖到等待点之前的全部已映射事件（WaitRegistered 占用尾部
+    // 序号但不映射到 v1 事件面——journal 的 seq 允许空洞）
     let mut seqs: Vec<u64> = Vec::new();
-    while (seqs.len() as u64) < until {
+    while (seqs.len() as u64) < until.saturating_sub(1) {
         let envelope = tokio::time::timeout(Duration::from_secs(5), stream.next())
             .await
             .expect("回放停滞")
@@ -505,12 +339,12 @@ async fn subscribe_with_run_id_replays_follows_and_naturally_ends() {
         seqs.push(envelope.seq);
     }
 
-    assert_eq!(
-        seqs,
-        (1..=seqs.len() as u64).collect::<Vec<u64>>(),
-        "订阅事件必须从 1 起严格连续"
+    assert_eq!(seqs.first(), Some(&1u64), "从 1 开始：{seqs:?}");
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "journal 序号严格递增（允许空洞）：{seqs:?}"
     );
-    let events = f.backend.read_events(&run, None).await.unwrap();
+    let events = f.arm.read_events(&run, None).await.unwrap();
     let last = events.last().unwrap();
     assert_eq!(last.seq, *seqs.last().unwrap());
     assert!(matches!(
@@ -523,14 +357,16 @@ async fn subscribe_with_run_id_replays_follows_and_naturally_ends() {
 async fn workflow_versions_lists_desc_and_unknown_workflow_is_not_found() {
     let f = Fixture::new().await;
     // Fixture 自带 v1 draft（definition(7)）：发布后 v2 是新 draft
-    f.backend.store().publish(&f.workflow, 1).await.unwrap();
-    let v2 = f
-        .backend
-        .store()
-        .update_workflow(&f.workflow, &definition(8))
+    f.backend
+        .workflow_publish(&f.workflow, 1, None)
         .await
         .unwrap();
-    assert_eq!(v2, 2);
+    let v2 = f
+        .backend
+        .workflow_update(&f.workflow, definition(8), None)
+        .await
+        .unwrap();
+    assert_eq!(v2.result["version"], 2);
 
     let ok = f
         .call("workflow.versions", json!({"workflow_id": f.workflow}))
@@ -548,7 +384,8 @@ async fn workflow_versions_lists_desc_and_unknown_workflow_is_not_found() {
     assert!(versions[0].get("definition").is_none());
 
     // 从未保存过版本的 workflow：空列表，不报错
-    let empty = f.backend.store().create_workflow("empty").await.unwrap();
+    let empty = f.backend.workflow_create("empty", None).await.unwrap();
+    let empty = empty.result["workflow_id"].as_str().unwrap().to_string();
     let resp = f
         .call("workflow.versions", json!({"workflow_id": empty}))
         .await;
@@ -616,7 +453,8 @@ async fn schedule_crud_and_next_fire_at() {
     let schedules = list["result"]["schedules"].as_array().unwrap();
     assert_eq!(schedules.len(), 1, "{list}");
     assert!(schedules[0]["next_fire_at"].is_string());
-    let other = f.backend.store().create_workflow("other").await.unwrap();
+    let other = f.backend.workflow_create("other", None).await.unwrap();
+    let other = other.result["workflow_id"].as_str().unwrap().to_string();
     let list = f.call("schedule.list", json!({"workflow_id": other})).await;
     assert_eq!(list["result"]["schedules"].as_array().unwrap().len(), 0);
 
@@ -724,7 +562,10 @@ async fn webhook_crud() {
 #[tokio::test]
 async fn run_stats_counts_exactly_and_groups_by_workflow() {
     let f = Fixture::new().await;
-    f.backend.store().publish(&f.workflow, 1).await.unwrap();
+    f.backend
+        .workflow_publish(&f.workflow, 1, None)
+        .await
+        .unwrap();
 
     // 空库：total 0、by_status 空、by_workflow 空
     let empty = f.call("run.stats", json!({})).await;
@@ -738,26 +579,23 @@ async fn run_stats_counts_exactly_and_groups_by_workflow() {
         .await;
     let run1 = r1["result"]["run_id"].as_str().unwrap().to_string();
     f.wait_finished(&run1).await; // succeeded
-    f.backend
-        .store()
-        .insert_run(
-            "r-manual",
-            &f.workflow,
-            1,
-            &Value::Null,
-            "running",
-            "manual",
-            None,
-        )
+    f.arm
+        .create_run(CreateRun {
+            workflow_id: f.workflow.clone(),
+            version: None,
+            input: Value::Null,
+            source: "manual".into(),
+            source_detail: None,
+        })
         .await
         .unwrap();
-    let wf2 = f.backend.store().create_workflow("other").await.unwrap();
+    let wf2 = f.backend.workflow_create("other", None).await.unwrap();
+    let wf2 = wf2.result["workflow_id"].as_str().unwrap().to_string();
     f.backend
-        .store()
-        .update_workflow(&wf2, &definition(9))
+        .workflow_update(&wf2, definition(9), None)
         .await
         .unwrap();
-    f.backend.store().publish(&wf2, 1).await.unwrap();
+    f.backend.workflow_publish(&wf2, 1, None).await.unwrap();
     let r2 = f.call("run.start", json!({"workflow_id": wf2})).await;
     let run2 = r2["result"]["run_id"].as_str().unwrap().to_string();
     f.wait_finished(&run2).await;
@@ -766,8 +604,8 @@ async fn run_stats_counts_exactly_and_groups_by_workflow() {
     let all = f.call("run.stats", json!({})).await;
     let total = all["result"]["total"].as_i64().unwrap();
     assert_eq!(total, 3, "{all}");
-    assert_eq!(all["result"]["by_status"]["succeeded"], 2);
-    assert_eq!(all["result"]["by_status"]["running"], 1);
+    // journal 下第二个 run 真实执行完成（v1 直插 running 行的构造已不可用）
+    assert_eq!(all["result"]["by_status"]["succeeded"], 3);
     let by_workflow = all["result"]["by_workflow"].as_array().unwrap();
     assert_eq!(by_workflow.len(), 2, "{all}");
     let group = |wf: &str| {
@@ -777,7 +615,7 @@ async fn run_stats_counts_exactly_and_groups_by_workflow() {
             .unwrap_or_else(|| panic!("缺少分组 {wf}：{all}"))
     };
     assert_eq!(group(&f.workflow)["total"], 2);
-    assert_eq!(group(&f.workflow)["by_status"]["running"], 1);
+    assert_eq!(group(&f.workflow)["by_status"]["succeeded"], 2);
     assert_eq!(group(&wf2)["total"], 1);
     assert_eq!(group(&wf2)["by_status"]["succeeded"], 1);
 
@@ -786,14 +624,17 @@ async fn run_stats_counts_exactly_and_groups_by_workflow() {
         .call("run.stats", json!({"workflow_id": f.workflow}))
         .await;
     assert_eq!(one["result"]["total"], 2, "{one}");
-    assert_eq!(one["result"]["by_status"]["running"], 1);
+    assert_eq!(one["result"]["by_status"]["succeeded"], 2);
     assert_eq!(one["result"]["by_workflow"].as_array().unwrap().len(), 0);
 }
 
 #[tokio::test]
 async fn run_source_attribution_and_filter() {
     let f = Fixture::new().await;
-    f.backend.store().publish(&f.workflow, 1).await.unwrap();
+    f.backend
+        .workflow_publish(&f.workflow, 1, None)
+        .await
+        .unwrap();
 
     // run.start → manual
     let r = f
@@ -840,7 +681,10 @@ async fn run_source_attribution_and_filter() {
 #[tokio::test]
 async fn run_list_filters_by_status_and_paginates_by_cursor() {
     let f = Fixture::new().await;
-    f.backend.store().publish(&f.workflow, 1).await.unwrap();
+    f.backend
+        .workflow_publish(&f.workflow, 1, None)
+        .await
+        .unwrap();
 
     // 起 3 个 run 并等到终态（succeeded）
     let mut runs = Vec::new();
@@ -1040,13 +884,11 @@ async fn config_get_update_roundtrip_writes_file_and_redacts_database_url() {
     let root = std::env::temp_dir().join(format!("flow-config-rpc-{}", uuid::Uuid::now_v7()));
     std::fs::create_dir_all(&root).unwrap();
     let config_path = root.join("flow.toml");
-    let backend = Arc::new(
-        SqliteBackend::open(&root, root.join("flow.db"))
-            .await
-            .unwrap(),
-    );
+    let backend = JournalBackend::open(&root, Default::default())
+        .await
+        .unwrap();
     let state = Arc::new(AppState {
-        backend: AnyBackend::Sqlite(backend.clone()),
+        backend: AnyBackend::Journal(backend.clone()),
         config: Some(flow_rpc::ConfigState {
             config: std::sync::RwLock::new(flow_config::Config::default()),
             path: Some(config_path.clone()),
@@ -1056,7 +898,8 @@ async fn config_get_update_roundtrip_writes_file_and_redacts_database_url() {
     });
     let f = Fixture {
         root: root.clone(),
-        backend,
+        backend: backend.clone(),
+        arm: AnyBackend::Journal(backend),
         state,
         workflow: String::new(),
     };

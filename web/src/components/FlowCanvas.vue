@@ -26,7 +26,7 @@ import {
 import { insertTemplate, saveSelectionAsTemplate } from "../state/templates";
 import { promptDialog } from "../state/modal";
 import { beginDrag, commit, endDrag } from "../state/history";
-import { monitor } from "../state/monitor";
+import { monitor, openChildRun } from "../state/monitor";
 import FlowNode from "./FlowNode.vue";
 import CanvasContextMenu, { type MenuEntry } from "./CanvasContextMenu.vue";
 
@@ -407,7 +407,9 @@ onUnmounted(() => {
   >
     <div v-if="editor.breadcrumb.length" class="breadcrumb">
       <template v-for="(c, i) in editor.breadcrumb" :key="`${i}:${c.workflowId}`">
-        <a class="crumb" @click="jumpToBreadcrumb(i)">{{ c.name || c.workflowId }}</a>
+        <button type="button" class="crumb" @click="jumpToBreadcrumb(i)">
+          {{ c.name || c.workflowId }}
+        </button>
         <span class="crumb-sep">/</span>
       </template>
       <span class="crumb-current">{{ editor.workflowName || editor.workflowId }}</span>
@@ -435,7 +437,7 @@ onUnmounted(() => {
       @pane-click="editor.selectedNodeId = null"
     >
       <template #node-flow="nodeProps">
-        <FlowNode v-bind="nodeProps" />
+        <FlowNode v-bind="nodeProps" @open-child="openChildRun" />
       </template>
       <Background
         :variant="BackgroundVariant.Dots"
@@ -491,11 +493,17 @@ onUnmounted(() => {
 }
 
 .crumb {
+  padding: 0;
+  border: none;
+  background: none;
+  font-size: 12px;
+  font-weight: 400;
   color: var(--accent2);
   cursor: pointer;
 }
 
 .crumb:hover {
+  background: none;
   text-decoration: underline;
 }
 

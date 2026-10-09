@@ -4,13 +4,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use flow_backend::{AnyBackend, SqliteBackend};
+use flow_backend::journal::JournalBackend;
+use flow_backend::AnyBackend;
 use flow_rpc::{webhook, AppState};
 use serde_json::{json, Value};
 
 struct Fixture {
     root: PathBuf,
-    backend: Arc<SqliteBackend>,
+    arm: AnyBackend,
     base: String,
     client: reqwest::Client,
 }
@@ -18,12 +19,10 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Self {
         let root = std::env::temp_dir().join(format!("flow-webhook-{}", uuid::Uuid::now_v7()));
-        let backend = Arc::new(
-            SqliteBackend::open(&root, root.join("flow.db"))
-                .await
-                .unwrap(),
-        );
-        let state = Arc::new(AppState::new(AnyBackend::Sqlite(backend.clone())));
+        let backend = JournalBackend::open(&root, Default::default())
+            .await
+            .unwrap();
+        let state = Arc::new(AppState::new(AnyBackend::Journal(backend.clone())));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -31,7 +30,7 @@ impl Fixture {
         });
         Self {
             root,
-            backend,
+            arm: AnyBackend::Journal(backend),
             base: format!("http://{addr}"),
             client: reqwest::Client::new(),
         }
@@ -39,10 +38,10 @@ impl Fixture {
 
     /// 建 workflow；publish=true 时写入并发布最简定义。
     async fn workflow(&self, publish: bool) -> String {
-        let wf = self.backend.create_workflow("t").await.unwrap();
+        let arm = &self.arm;
+        let wf = arm.create_workflow("t").await.unwrap();
         if publish {
-            let v = self
-                .backend
+            let v = arm
                 .update_workflow(
                     &wf,
                     &json!({
@@ -56,7 +55,7 @@ impl Fixture {
                 )
                 .await
                 .unwrap();
-            self.backend.publish(&wf, v).await.unwrap();
+            arm.publish(&wf, v).await.unwrap();
         }
         wf
     }
@@ -84,14 +83,14 @@ impl Drop for Fixture {
 async fn webhook_post_triggers_run_with_source_attribution() {
     let f = Fixture::new().await;
     let wf = f.workflow(true).await;
-    let hook = f.backend.create_webhook(&wf).await.unwrap();
+    let hook = f.arm.create_webhook(&wf).await.unwrap();
 
     let (status, body) = f.post(&hook.token, r#"{"src":"hook"}"#).await;
     assert_eq!(status, 200, "{body}");
     let run_id = body["run_id"].as_str().unwrap();
 
     // run 归因：source=webhook，detail=token；input 透传 body
-    let run = f.backend.get_run(run_id).await.unwrap();
+    let run = f.arm.get_run(run_id).await.unwrap();
     assert_eq!(run.source, "webhook");
     assert_eq!(run.source_detail.as_deref(), Some(hook.token.as_str()));
     assert_eq!(run.input, json!({"src": "hook"}));
@@ -99,24 +98,18 @@ async fn webhook_post_triggers_run_with_source_attribution() {
     // 未知 token 与禁用 token 同为 404（不区分，避免探测）
     let (status, _) = f.post("deadbeef", "{}").await;
     assert_eq!(status, 404);
-    f.backend
-        .set_webhook_enabled(&hook.token, false)
-        .await
-        .unwrap();
+    f.arm.set_webhook_enabled(&hook.token, false).await.unwrap();
     let (status, _) = f.post(&hook.token, "{}").await;
     assert_eq!(status, 404);
 
     // 无 published 版本 → 409
     let wf2 = f.workflow(false).await;
-    let hook2 = f.backend.create_webhook(&wf2).await.unwrap();
+    let hook2 = f.arm.create_webhook(&wf2).await.unwrap();
     let (status, _) = f.post(&hook2.token, "{}").await;
     assert_eq!(status, 409);
 
     // body 非法 JSON → 400（先恢复 hook 为启用）
-    f.backend
-        .set_webhook_enabled(&hook.token, true)
-        .await
-        .unwrap();
+    f.arm.set_webhook_enabled(&hook.token, true).await.unwrap();
     let (status, _) = f.post(&hook.token, "not json").await;
     assert_eq!(status, 400);
 }

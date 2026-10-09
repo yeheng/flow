@@ -293,6 +293,11 @@ e2e_test!(
                 -32010,
                 "workflow.update 必须拒收「{label}」：{err}"
             );
+            // journal：没有可侧改的 SQLite/PG 库（journal 是唯一权威，写入即
+            // 校验，脏定义进不了存储）——侧门损坏场景结构性不存在，跳过。
+            if ctx.is_journal() {
+                continue;
+            }
             // Seed a real draft, then simulate a legacy/corrupted stored definition.
             // Publication must reject that definition, not merely a missing version.
             let draft: Value = call(

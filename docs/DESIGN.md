@@ -106,13 +106,17 @@ flow-cli ──> flow-store / flow-pg ✗   ✗（CLI 不碰存储与事件日�
                 没有第二条写入路径；SQLite / Postgres 对 CLI 行为一致）
 ```
 
-后端选择只在进程入口发生一次：`flow_backend::open_from_env()` 按
-`FLOW_BACKEND=sqlite（缺省）| postgres` 构造 `AnyBackend`，之后整条 RPC 链路
-只看枚举。闭集枚举而非 trait 对象：每加一个方法编译器逼着两个臂都写完，
-不存在某个后端静默继承错误默认实现的坑。
+后端选择只在进程入口发生一次：`flow_backend::open()` 按
+`storage.backend = journal（缺省）| postgres | sqlite（v1，已弃用）` 构造 `AnyBackend`，之后整条
+RPC 链路只看枚举。闭集枚举而非 trait 对象：每加一个方法编译器逼着每个臂都写完，
+不存在某个后端静默继承错误默认实现的坑。**journal 臂**（JSONL v2 权威，SQLite 只是
+可重建投影）已接入全部公共契约（适配层 `flow-backend/src/journal_arm.rs`；历史
+v1 数据不迁移，仅全新数据目录；切换路线见
+[SQLITE_V1_TO_V2_MIGRATION.md](SQLITE_V1_TO_V2_MIGRATION.md)）。
 
 运行：`cargo run -p flow-rpc --bin flow-server`。环境变量 `FLOW_ADDR`（默认 `127.0.0.1:9800`）、
 `FLOW_DB`、`FLOW_DATA_DIR`、`FLOW_HTTP_ADDR` 与 `FLOW_SCHEDULER`（§9.2）；
+journal 模式 `FLOW_BACKEND=journal`（`FLOW_DATA_DIR` 即 journal 根）；
 Postgres 模式另见 `flow-pg/src/config.rs`
 （`FLOW_BACKEND`、`FLOW_DATABASE_URL`、`FLOW_ROLE`、`FLOW_LEASE_TTL_MS` 等）。
 
@@ -128,6 +132,12 @@ FLOW_BACKEND。
 ## 3. 核心数据结构：事件日志是唯一权威
 
 这是整个系统最重要的设计决策，其余一切都从它推导。
+
+> **v1 后端已删除（2026-10-09）**：本节描述的 `data_dir/runs/<id>/event.jsonl`
+> + SQLite 元数据形态是 v1 的权威布局，已随 sqlite 后端移除。单机缺省
+> 后端是 journal（`<data_dir>/journal/` JSONL 段链为唯一权威，SQLite 仅
+> 可重建投影）；Postgres 臂仍共用本文描述的 v1 引擎折叠语义。
+> 见 [SQLITE_V1_TO_V2_MIGRATION.md](SQLITE_V1_TO_V2_MIGRATION.md)。
 
 **磁盘上的 `data_dir/runs/<run_id>/event.jsonl` 是 run 执行状态的唯一权威。**
 SQLite `runs` 表记录初始化结果并提供查询索引，内存执行状态由日志折叠得到。
@@ -1177,5 +1187,6 @@ volume 上。Docker 只在容器**自己退出**时（`--rm`）回收匿名 volu
 - v2 的 run.start 已要求稳定 `request_id`（写命令幂等键），v1 的
   `run.start` 客户端幂等键仍未做（见上）。
 
-v1（SQLite 权威）→ v2（journal 权威）的打通与废弃路线（RPC parity → 自动
-升级 → 默认切换 → 删除 v1）见 [SQLITE_V1_TO_V2_MIGRATION.md](SQLITE_V1_TO_V2_MIGRATION.md)。
+v1（SQLite 权威）→ v2（journal 权威）的切换方案（历史数据舍弃、不迁移；
+journal 臂已接入全量 RPC，剩默认切换与 v1 删除）见
+[SQLITE_V1_TO_V2_MIGRATION.md](SQLITE_V1_TO_V2_MIGRATION.md)。

@@ -129,7 +129,7 @@ pub fn module(
                 "run.start"=>b.run_start(text(&p,"workflow_id")?,optional_version(&p)?,p["input"].clone(),"manual",None,request).await,
                 "run.cancel"=>b.run_cancel(text(&p,"run_id")?,request).await,
                 "run.signal"=>b.run_signal(text(&p,"run_id")?,text(&p,"node_id")?,p["payload"].clone(),request).await,
-                "run.adjudicate"=>b.run_adjudicate(text(&p,"run_id")?,text(&p,"node_id")?,text(&p,"operation_id")?,text(&p,"reason")?,p["output"].clone(),request.ok_or_else(||invalid("request_id required"))?).await,
+                "run.adjudicate"=>b.run_adjudicate(text(&p,"run_id")?,text(&p,"node_id")?,text(&p,"operation_id")?,text(&p,"reason")?,p["output"].clone(),p["decision"].as_str().unwrap_or("accept_output"),request.ok_or_else(||invalid("request_id required"))?).await,
                 "schedule.change"|"webhook.change"=>b.config_change(method,if method=="schedule.change"{flow_journal::EventKind::ScheduleChanged}else{flow_journal::EventKind::WebhookChanged},text(&p,"key")?,p["patch"].clone(),request).await,
                 "command.status"=>return serde_json::to_value(b.command_status(text(&p,"scope")?,text(&p,"request_id")?).await.map_err(failure)?).map_err(invalid),
                 "workflow.list"|"run.list"|"legacy.list"=>{

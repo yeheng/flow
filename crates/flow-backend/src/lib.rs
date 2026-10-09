@@ -1,7 +1,7 @@
 //! flow-backend：后端适配层。
 //!
-//! **架构决策（焊死）**：单机 `SQLite + data_dir/runs/<id>/event.jsonl` 是本系统的
-//! 权威与默认后端（`sqlite.rs`，DESIGN.md）；Postgres 共享日志后端（`pg.rs`）是
+//! **架构决策**：单机默认后端是 JSONL journal（`journal.rs` + `journal_arm.rs`，
+//! SQLite 仅作可重建投影）；Postgres 共享日志后端（`pg.rs`）是
 //! **可替代**的等价实现，用于多节点执行——其设计（租约 / 持久 inbox / 接管）记录在
 //! `flow-pg` 各模块的头注释里。
 //!
@@ -53,22 +53,19 @@ pub use flow_engine::{
     RunState, HTTP_METHODS,
 };
 
-mod child;
 pub mod execution;
 pub mod journal;
+mod journal_arm;
 mod journal_commands;
 mod journal_driver;
 mod journal_execution;
 pub mod journal_import;
 mod pg;
 mod run_tail;
-mod sqlite;
 
-pub use child::LocalChildLauncher;
 pub use pg::PgBackend;
 // PgBackend::connect 的公共签名暴露了 PgConfig，这里重导出让调用方能命名该类型
 pub use flow_pg::PgConfig;
-pub use sqlite::{recover_unfinished, SqliteBackend, StoreObserver};
 
 /// 适配层错误：两个后端原生错误的公共超集。
 /// 上层（RPC）据此映射 JSON-RPC 错误码，不再分叉处理具体后端的错误类型。
@@ -138,50 +135,62 @@ pub struct SignalRequest {
 /// 其余方法静态派发（每方法两个臂，编译器保证谁也不许漏写）。
 #[derive(Clone)]
 pub enum AnyBackend {
-    /// canonical：SQLite + event.jsonl（DESIGN.md 全部语义）。
-    Sqlite(Arc<SqliteBackend>),
     /// 可替代：Postgres 共享日志 + epoch 租约 + 持久 inbox（设计见 `flow-pg` 各模块头注释）。
     Postgres(Arc<PgBackend>),
+    /// JSONL v2 journal 权威（SQLite 只是可重建投影）。公共契约映射在
+    /// `journal_arm`（历史数据不做迁移，全新数据集使用）。
+    Journal(Arc<journal::JournalBackend>),
 }
 
 impl AnyBackend {
     pub fn name(&self) -> &'static str {
         match self {
-            AnyBackend::Sqlite(_) => "sqlite",
             AnyBackend::Postgres(_) => "postgres",
+            AnyBackend::Journal(_) => "journal",
         }
     }
 
     /// 启动日志用的一段描述（db 路径 / 实例与角色，不含敏感信息）。
     pub fn describe(&self) -> String {
         match self {
-            AnyBackend::Sqlite(b) => b.describe(),
             AnyBackend::Postgres(b) => b.describe(),
+            AnyBackend::Journal(b) => {
+                format!(
+                    "journal {} ({})",
+                    b.journal.id(),
+                    b.journal.root().display()
+                )
+            }
         }
     }
 
     /// 进入可服务状态（幂等；调用一次，在 RPC 起服务之前）：
     /// SQLite = 崩溃恢复（recover_unfinished）；
-    /// Postgres = executor 扫描循环（gateway 角色为空操作）。
+    /// Postgres = executor 扫描循环（gateway 角色为空操作）；
+    /// Journal = 空操作（open 已完成重放；执行驱动由进程入口的
+    /// `start_execution` 启动，见 flow_rpc::run 的 journal 臂）。
     pub async fn start(&self) -> Result<(), BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.start().await,
             AnyBackend::Postgres(b) => b.start().await,
+            AnyBackend::Journal(_) => Ok(()),
         }
     }
 
     /// 优雅停机：停止派发、abort inflight、按后端语义释放资源。
     pub async fn shutdown(&self) -> Result<(), BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.shutdown().await,
             AnyBackend::Postgres(b) => b.shutdown().await,
+            AnyBackend::Journal(b) => b
+                .close()
+                .await
+                .map_err(|e| BackendError::Internal(format!("journal close: {e}"))),
         }
     }
 
     pub async fn create_workflow(&self, name: &str) -> Result<String, BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.create_workflow(name).await,
             AnyBackend::Postgres(b) => b.create_workflow(name).await,
+            AnyBackend::Journal(b) => journal_arm::create_workflow(b, name).await,
         }
     }
 
@@ -191,15 +200,17 @@ impl AnyBackend {
         definition: &Value,
     ) -> Result<i64, BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.update_workflow(workflow_id, definition).await,
             AnyBackend::Postgres(b) => b.update_workflow(workflow_id, definition).await,
+            AnyBackend::Journal(b) => {
+                journal_arm::update_workflow(b, workflow_id, definition).await
+            }
         }
     }
 
     pub async fn publish(&self, workflow_id: &str, version: i64) -> Result<(), BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.publish(workflow_id, version).await,
             AnyBackend::Postgres(b) => b.publish(workflow_id, version).await,
+            AnyBackend::Journal(b) => journal_arm::publish(b, workflow_id, version).await,
         }
     }
 
@@ -209,15 +220,15 @@ impl AnyBackend {
         version: Option<i64>,
     ) -> Result<WorkflowVersion, BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.get_version(workflow_id, version).await,
             AnyBackend::Postgres(b) => b.get_version(workflow_id, version).await,
+            AnyBackend::Journal(b) => journal_arm::get_version(b, workflow_id, version).await,
         }
     }
 
     pub async fn latest_published(&self, workflow_id: &str) -> Result<Option<i64>, BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.latest_published(workflow_id).await,
             AnyBackend::Postgres(b) => b.latest_published(workflow_id).await,
+            AnyBackend::Journal(b) => journal_arm::latest_published(b, workflow_id).await,
         }
     }
 
@@ -226,22 +237,22 @@ impl AnyBackend {
         workflow_id: &str,
     ) -> Result<Vec<WorkflowVersion>, BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.list_versions(workflow_id).await,
             AnyBackend::Postgres(b) => b.list_versions(workflow_id).await,
+            AnyBackend::Journal(b) => journal_arm::list_versions(b, workflow_id).await,
         }
     }
 
     pub async fn list_workflows(&self) -> Result<Vec<WorkflowSummary>, BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.list_workflows().await,
             AnyBackend::Postgres(b) => b.list_workflows().await,
+            AnyBackend::Journal(b) => journal_arm::list_workflows(b).await,
         }
     }
 
     pub async fn delete_workflow(&self, workflow_id: &str) -> Result<(), BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.delete_workflow(workflow_id).await,
             AnyBackend::Postgres(b) => b.delete_workflow(workflow_id).await,
+            AnyBackend::Journal(b) => journal_arm::delete_workflow(b, workflow_id).await,
         }
     }
 
@@ -256,13 +267,12 @@ impl AnyBackend {
         enabled: bool,
     ) -> Result<Schedule, BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => {
-                b.create_schedule(workflow_id, cron_expr, input, enabled)
-                    .await
-            }
             AnyBackend::Postgres(b) => {
                 b.create_schedule(workflow_id, cron_expr, input, enabled)
                     .await
+            }
+            AnyBackend::Journal(b) => {
+                journal_arm::create_schedule(b, workflow_id, cron_expr, input, enabled).await
             }
         }
     }
@@ -272,8 +282,8 @@ impl AnyBackend {
         workflow_id: Option<&str>,
     ) -> Result<Vec<Schedule>, BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.list_schedules(workflow_id).await,
             AnyBackend::Postgres(b) => b.list_schedules(workflow_id).await,
+            AnyBackend::Journal(b) => journal_arm::list_schedules(b, workflow_id).await,
         }
     }
 
@@ -286,15 +296,17 @@ impl AnyBackend {
         enabled: Option<bool>,
     ) -> Result<(), BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.update_schedule(id, cron_expr, input, enabled).await,
             AnyBackend::Postgres(b) => b.update_schedule(id, cron_expr, input, enabled).await,
+            AnyBackend::Journal(b) => {
+                journal_arm::update_schedule(b, id, cron_expr, input, enabled).await
+            }
         }
     }
 
     pub async fn delete_schedule(&self, id: &str) -> Result<(), BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.delete_schedule(id).await,
             AnyBackend::Postgres(b) => b.delete_schedule(id).await,
+            AnyBackend::Journal(b) => journal_arm::delete_schedule(b, id).await,
         }
     }
 
@@ -305,8 +317,8 @@ impl AnyBackend {
         fire_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool, BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.try_insert_fire(schedule_id, fire_at).await,
             AnyBackend::Postgres(b) => b.try_insert_fire(schedule_id, fire_at).await,
+            AnyBackend::Journal(b) => journal_arm::try_insert_fire(b, schedule_id, fire_at).await,
         }
     }
 
@@ -318,15 +330,15 @@ impl AnyBackend {
         fire_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.delete_fire(schedule_id, fire_at).await,
             AnyBackend::Postgres(b) => b.delete_fire(schedule_id, fire_at).await,
+            AnyBackend::Journal(b) => journal_arm::delete_fire(b, schedule_id, fire_at).await,
         }
     }
 
     pub async fn create_webhook(&self, workflow_id: &str) -> Result<Webhook, BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.create_webhook(workflow_id).await,
             AnyBackend::Postgres(b) => b.create_webhook(workflow_id).await,
+            AnyBackend::Journal(b) => journal_arm::create_webhook(b, workflow_id).await,
         }
     }
 
@@ -335,15 +347,15 @@ impl AnyBackend {
         workflow_id: Option<&str>,
     ) -> Result<Vec<Webhook>, BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.list_webhooks(workflow_id).await,
             AnyBackend::Postgres(b) => b.list_webhooks(workflow_id).await,
+            AnyBackend::Journal(b) => journal_arm::list_webhooks(b, workflow_id).await,
         }
     }
 
     pub async fn get_webhook(&self, token: &str) -> Result<Option<Webhook>, BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.get_webhook(token).await,
             AnyBackend::Postgres(b) => b.get_webhook(token).await,
+            AnyBackend::Journal(b) => journal_arm::get_webhook(b, token).await,
         }
     }
 
@@ -353,15 +365,15 @@ impl AnyBackend {
         enabled: bool,
     ) -> Result<(), BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.set_webhook_enabled(token, enabled).await,
             AnyBackend::Postgres(b) => b.set_webhook_enabled(token, enabled).await,
+            AnyBackend::Journal(b) => journal_arm::set_webhook_enabled(b, token, enabled).await,
         }
     }
 
     pub async fn delete_webhook(&self, token: &str) -> Result<(), BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.delete_webhook(token).await,
             AnyBackend::Postgres(b) => b.delete_webhook(token).await,
+            AnyBackend::Journal(b) => journal_arm::delete_webhook(b, token).await,
         }
     }
 
@@ -375,22 +387,24 @@ impl AnyBackend {
         edges: &Value,
     ) -> Result<NodeTemplate, BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.template_create(name, category, nodes, edges).await,
             AnyBackend::Postgres(b) => b.template_create(name, category, nodes, edges).await,
+            AnyBackend::Journal(b) => {
+                journal_arm::template_create(b, name, category, nodes, edges).await
+            }
         }
     }
 
     pub async fn template_list(&self) -> Result<Vec<NodeTemplateSummary>, BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.template_list().await,
             AnyBackend::Postgres(b) => b.template_list().await,
+            AnyBackend::Journal(b) => journal_arm::template_list(b).await,
         }
     }
 
     pub async fn template_get(&self, id: &str) -> Result<NodeTemplate, BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.template_get(id).await,
             AnyBackend::Postgres(b) => b.template_get(id).await,
+            AnyBackend::Journal(b) => journal_arm::template_get(b, id).await,
         }
     }
 
@@ -403,15 +417,17 @@ impl AnyBackend {
         edges: Option<&Value>,
     ) -> Result<NodeTemplate, BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.template_update(id, name, category, nodes, edges).await,
             AnyBackend::Postgres(b) => b.template_update(id, name, category, nodes, edges).await,
+            AnyBackend::Journal(b) => {
+                journal_arm::template_update(b, id, name, category, nodes, edges).await
+            }
         }
     }
 
     pub async fn template_delete(&self, id: &str) -> Result<bool, BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.template_delete(id).await,
             AnyBackend::Postgres(b) => b.template_delete(id).await,
+            AnyBackend::Journal(b) => journal_arm::template_delete(b, id).await,
         }
     }
 
@@ -420,15 +436,15 @@ impl AnyBackend {
     /// published 解析与定义校验单点在 [`resolve_runnable_definition`]。
     pub async fn create_run(&self, spec: CreateRun) -> Result<CreatedRun, BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.create_run(spec).await,
             AnyBackend::Postgres(b) => b.create_run(spec).await,
+            AnyBackend::Journal(b) => journal_arm::create_run(b, spec).await,
         }
     }
 
     pub async fn get_run(&self, run_id: &str) -> Result<RunRecord, BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.get_run(run_id).await,
             AnyBackend::Postgres(b) => b.get_run(run_id).await,
+            AnyBackend::Journal(b) => journal_arm::get_run(b, run_id).await,
         }
     }
 
@@ -441,13 +457,12 @@ impl AnyBackend {
         limit: i64,
     ) -> Result<Vec<RunRecord>, BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => {
-                b.list_runs(workflow_id, status, source, before_run_id, limit)
-                    .await
-            }
             AnyBackend::Postgres(b) => {
                 b.list_runs(workflow_id, status, source, before_run_id, limit)
                     .await
+            }
+            AnyBackend::Journal(b) => {
+                journal_arm::list_runs(b, workflow_id, status, source, before_run_id, limit).await
             }
         }
     }
@@ -455,8 +470,8 @@ impl AnyBackend {
     /// run.stats：GROUP BY 精确计数；workflow_id 为 None 时附带按工作流分组。
     pub async fn run_stats(&self, workflow_id: Option<&str>) -> Result<RunStats, BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.run_stats(workflow_id).await,
             AnyBackend::Postgres(b) => b.run_stats(workflow_id).await,
+            AnyBackend::Journal(b) => journal_arm::run_stats(b, workflow_id).await,
         }
     }
 
@@ -466,31 +481,33 @@ impl AnyBackend {
         from_seq: Option<u64>,
     ) -> Result<Vec<Envelope>, BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.read_events(run_id, from_seq).await,
             AnyBackend::Postgres(b) => b.read_events(run_id, from_seq).await,
+            AnyBackend::Journal(b) => journal_arm::read_events(b, run_id, from_seq).await,
         }
     }
 
     pub async fn snapshot(&self, run_id: &str) -> Result<RunState, BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.snapshot(run_id).await,
             AnyBackend::Postgres(b) => b.snapshot(run_id).await,
+            AnyBackend::Journal(b) => journal_arm::snapshot(b, run_id).await,
         }
     }
 
     /// 本进程正在驱动的 run（live 标记）。
-    pub fn is_live(&self, run_id: &str) -> bool {
+    /// 本进程正在驱动的 run（live 标记）。journal 臂：非终态即活（单写者
+    /// 进程，执行循环随服务启动）——需要读已提交 State，故为 async。
+    pub async fn is_live(&self, run_id: &str) -> bool {
         match self {
-            AnyBackend::Sqlite(b) => b.is_live(run_id),
             AnyBackend::Postgres(b) => b.is_live(run_id),
+            AnyBackend::Journal(b) => journal_arm::is_live(b, run_id).await,
         }
     }
 
     /// 交付信号（human_task / 副作用节点裁决）。
     pub async fn signal(&self, req: SignalRequest) -> Result<SignalAck, BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.signal(req).await,
             AnyBackend::Postgres(b) => b.signal(req).await,
+            AnyBackend::Journal(b) => journal_arm::signal(b, req).await,
         }
     }
 
@@ -501,8 +518,8 @@ impl AnyBackend {
         signal_id: Option<String>,
     ) -> Result<SignalAck, BackendError> {
         match self {
-            AnyBackend::Sqlite(b) => b.cancel(run_id, signal_id).await,
             AnyBackend::Postgres(b) => b.cancel(run_id, signal_id).await,
+            AnyBackend::Journal(b) => journal_arm::cancel(b, run_id, signal_id).await,
         }
     }
 
@@ -513,8 +530,8 @@ impl AnyBackend {
     /// 语义一致（缺口补齐、失败重试、按 seq 去重），契约不分叉。
     pub fn subscribe(&self, run_id: Option<String>) -> BoxStream<'static, Envelope> {
         match self {
-            AnyBackend::Sqlite(b) => b.subscribe(run_id),
             AnyBackend::Postgres(b) => b.subscribe(run_id),
+            AnyBackend::Journal(b) => journal_arm::subscribe(b.clone(), run_id),
         }
     }
 }
@@ -606,51 +623,14 @@ pub(crate) async fn resolve_runnable_definition(
     Ok((version, definition))
 }
 
-/// 进程入口的 runtime 形态提示：SQLite 后端整体跑在单线程 runtime
-/// （current_thread，单 OS 线程；异步任务仍并发，JS 求值/文件 IO 经
-/// spawn_blocking 走独立阻塞线程），Postgres 对等模式保持多线程。
-/// 与排他 flock、单连接池一起构成「单进程·单线程·单写者」三件套。
-/// 只应在 main() 构造 tokio runtime 时调用一次——这是部署形态选择，
-/// 不属于 RPC 请求处理路径对后端的感知（那条禁令针对 lib 内逻辑）。
-pub fn prefer_current_thread_runtime_for(backend: flow_config::StorageBackend) -> bool {
-    backend != flow_config::StorageBackend::Postgres
-}
-
-/// 环境变量形态的同一判定（测试脚手架与未迁移入口用；产品入口走
-/// [`prefer_current_thread_runtime_for`] + flow-config）。
-pub fn prefer_current_thread_runtime() -> bool {
-    match std::env::var("FLOW_BACKEND") {
-        Ok(v) => {
-            let backend =
-                if v.eq_ignore_ascii_case("postgres") || v.eq_ignore_ascii_case("postgresql") {
-                    flow_config::StorageBackend::Postgres
-                } else {
-                    flow_config::StorageBackend::Sqlite
-                };
-            prefer_current_thread_runtime_for(backend)
-        }
-        Err(_) => true, // 缺省 sqlite
-    }
-}
-
 /// 工厂：按统一配置构造后端。
-/// `sqlite`（缺省，canonical）| `postgres`（可替代，多节点执行）。
+/// `journal`（缺省，JSONL v2 权威，SQLite 只是可重建投影）|
+/// `postgres`（可替代，多节点执行）。v1 sqlite 后端已删除。
 /// 这是进程入口选择后端的唯一地方（runtime 形态判定也读同一个值，
 /// 见 [`prefer_current_thread_runtime_for`]，它在构造 runtime 之前跑）。
 pub async fn open(config: &flow_config::Config) -> Result<AnyBackend, BackendError> {
     let storage = &config.storage;
     match storage.backend {
-        flow_config::StorageBackend::Sqlite => {
-            let data_dir = std::path::PathBuf::from(&storage.data_dir);
-            let db_path = storage
-                .database
-                .as_ref()
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| data_dir.join("flow.db"));
-            Ok(AnyBackend::Sqlite(Arc::new(
-                SqliteBackend::open(data_dir, db_path).await?,
-            )))
-        }
         flow_config::StorageBackend::Postgres => {
             let url = storage.database_url.as_deref().ok_or_else(|| {
                 BackendError::Invalid(
@@ -662,6 +642,26 @@ pub async fn open(config: &flow_config::Config) -> Result<AnyBackend, BackendErr
             Ok(AnyBackend::Postgres(Arc::new(
                 PgBackend::connect(url, pg_config).await?,
             )))
+        }
+        // journal：data_dir 即 journal 根。历史 v1 数据不做迁移（舍弃）——
+        // 严禁混用：目录呈 v1 布局（有 flow.db、无 journal/ 段目录）时直接
+        // 拒绝启动，防止把 v1 数据目录当 journal 根继续写。
+        flow_config::StorageBackend::Journal => {
+            let root = std::path::PathBuf::from(&storage.data_dir);
+            let v1_layout = root.join("flow.db").is_file() && !root.join("journal").is_dir();
+            if v1_layout {
+                return Err(BackendError::Invalid(
+                    "数据目录是 v1 SQLite 布局（存在 flow.db）：历史数据不迁移，\
+                     journal 后端拒绝复用该目录。请指向全新目录（storage.data_dir / \
+                     FLOW_DATA_DIR），或显式 storage.backend=\"sqlite\" 继续使用 v1\
+                     （已弃用）。见 docs/SQLITE_V1_TO_V2_MIGRATION.md"
+                        .into(),
+                ));
+            }
+            let backend = journal::JournalBackend::open(&root, Default::default())
+                .await
+                .map_err(|e| BackendError::Invalid(format!("journal 打开失败：{e}")))?;
+            Ok(AnyBackend::Journal(backend))
         }
     }
 }

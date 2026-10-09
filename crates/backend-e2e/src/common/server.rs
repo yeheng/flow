@@ -1,6 +1,5 @@
 //! 被测 `flow-server` 进程管理 + 双后端用例上下文。
 //!
-//! - `Kind::Sqlite`：独占临时目录 `flow.db`（DESIGN.md §13：只清理独占目录）；
 //! - `Kind::Postgres`：共享容器上的独占测试库；
 //! - `Ctx::restart` 换新端口重新拉起同一份存储——崩溃恢复用例的「重启」。
 
@@ -17,15 +16,15 @@ use flow_test_support::io::{wait_ready_child, Ready, PORT_RETRY_ATTEMPTS};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
-    Sqlite,
     Postgres,
+    Journal,
 }
 
 impl Kind {
     pub fn name(self) -> &'static str {
         match self {
-            Kind::Sqlite => "sqlite",
             Kind::Postgres => "postgres",
+            Kind::Journal => "journal",
         }
     }
 }
@@ -53,31 +52,6 @@ impl Ctx {
     /// 并发驱动数大于链长，否则 executor 容量许可会相互等待成环）。
     pub async fn start_with(kind: Kind, bin: &str, extra_env: &[(&str, &str)]) -> Ctx {
         match kind {
-            Kind::Sqlite => {
-                let dir = std::env::temp_dir().join(format!("flow-e2e-{}", Uuid::now_v7()));
-                std::fs::create_dir_all(&dir).expect("创建 SQLite 临时目录失败");
-                let server = ServerProc::spawn(
-                    bin,
-                    &Storage::Sqlite {
-                        data_dir: dir.clone(),
-                        db: dir.join("flow.db"),
-                    },
-                    "all",
-                    5_000,
-                    extra_env,
-                );
-                Ctx {
-                    kind,
-                    bin: bin.into(),
-                    server,
-                    db: None,
-                    sqlite_dir: Some(dir),
-                    extra_env: extra_env
-                        .iter()
-                        .map(|(k, v)| (k.to_string(), v.to_string()))
-                        .collect(),
-                }
-            }
             Kind::Postgres => {
                 let pg = shared().await;
                 // schema 在这里初始化：TestDb 只负责「开出一个空库」
@@ -107,6 +81,31 @@ impl Ctx {
                         .collect(),
                 }
             }
+            // journal：独占临时目录即 journal 根（历史数据不迁移，全新数据集）
+            Kind::Journal => {
+                let dir = std::env::temp_dir().join(format!("flow-e2e-j-{}", Uuid::now_v7()));
+                std::fs::create_dir_all(&dir).expect("创建 journal 临时目录失败");
+                let server = ServerProc::spawn(
+                    bin,
+                    &Storage::Journal {
+                        data_dir: dir.clone(),
+                    },
+                    "all",
+                    5_000,
+                    extra_env,
+                );
+                Ctx {
+                    kind,
+                    bin: bin.into(),
+                    server,
+                    db: None,
+                    sqlite_dir: Some(dir),
+                    extra_env: extra_env
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                }
+            }
         }
     }
 
@@ -114,8 +113,8 @@ impl Ctx {
         matches!(self.kind, Kind::Postgres)
     }
 
-    pub fn is_sqlite(&self) -> bool {
-        matches!(self.kind, Kind::Sqlite)
+    pub fn is_journal(&self) -> bool {
+        matches!(self.kind, Kind::Journal)
     }
 
     pub fn addr(&self) -> SocketAddr {
@@ -152,9 +151,8 @@ impl Ctx {
             (Some(db), _) => Storage::Postgres {
                 url: db.url.clone(),
             },
-            (None, Some(dir)) => Storage::Sqlite {
+            (None, Some(dir)) => Storage::Journal {
                 data_dir: dir.clone(),
-                db: dir.join("flow.db"),
             },
             (None, None) => unreachable!("Ctx 必有存储"),
         }
@@ -225,8 +223,8 @@ where
 
 #[derive(Clone)]
 enum Storage {
-    Sqlite { data_dir: PathBuf, db: PathBuf },
     Postgres { url: String },
+    Journal { data_dir: PathBuf },
 }
 
 /// 一个被测 flow-server 进程。Drop 保证 SIGKILL + wait（不漏僵尸）。
@@ -305,12 +303,13 @@ impl ServerProc {
             cmd.stdout(Stdio::null()).stderr(Stdio::inherit());
         }
         match storage {
-            Storage::Sqlite { data_dir, db } => {
-                cmd.env("FLOW_DATA_DIR", data_dir).env("FLOW_DB", db);
-            }
             Storage::Postgres { url } => {
                 cmd.env("FLOW_BACKEND", "postgres")
                     .env("FLOW_DATABASE_URL", url);
+            }
+            Storage::Journal { data_dir } => {
+                cmd.env("FLOW_BACKEND", "journal")
+                    .env("FLOW_DATA_DIR", data_dir);
             }
         }
         for (key, value) in extra_env {

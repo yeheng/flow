@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, ref, shallowRef, triggerRef } from "vue";
 import { EventWindow, JournalClient, type JournalPage, type Receipt, type RunSnapshot } from "../api/journal";
 import { isDesktop } from "../platform";
+import { confirmDialog } from "../state/modal";
 const desktop = isDesktop();
 const url=ref("ws://127.0.0.1:9802"), http=ref("http://127.0.0.1:9803"), token=ref("");
 const api=shallowRef<JournalClient>();
@@ -27,7 +28,7 @@ async function start(){if(!api.value)return;const r=await api.value.command("run
 async function refreshRun(){if(!api.value || !run.value || refreshing)return;refreshing=true;try{const id=run.value.run_id;const current=await api.value.call<{value:RunSnapshot}>("run.get",{run_id:id});if(run.value?.run_id!==id)return;run.value=current.value;const logs=await api.value.call<{records:unknown[];loss:unknown}>("run.observations.page",{run_id:id,limit:100});if(run.value?.run_id!==id)return;observations.value=logs.records;observationLoss.value=logs.loss;}finally{refreshing=false;}}
 async function watchRun(id:string){await stop?.();if(timer)clearInterval(timer);windowed.value=new EventWindow();page.value=undefined;stop=await api.value!.monitor(id,v=>{run.value=v;},e=>{windowed.value.push(e);if(frame===undefined)frame=requestAnimationFrame(()=>{frame=undefined;triggerRef(windowed);});},n=>{if(n)message.value=`实时缓冲丢弃 ${n} 条，已按快照重新对齐；历史可分页读取。`;});timer=setInterval(()=>{void refreshRun().catch(e=>{message.value=String(e);});},2000);await refreshRun();}
 async function nextPage(reset=false){if(!api.value || !run.value)return;page.value=await api.value.page(run.value.run_id,audit.value,reset?undefined:page.value?.next_cursor);}
-async function cancel(){if(!api.value || !run.value)return;receipt(await api.value.command("run.cancel",{run_id:run.value.run_id},`run.cancel:${run.value.run_id}`));await refreshRun();}
+async function cancel(){if(!api.value || !run.value)return;if(!(await confirmDialog(`确定取消 run ${run.value.run_id.slice(0,8)}…？`,{danger:true})))return;receipt(await api.value.command("run.cancel",{run_id:run.value.run_id},`run.cancel:${run.value.run_id}`));await refreshRun();}
 onBeforeUnmount(()=>{api.value?.close();if(frame!==undefined)cancelAnimationFrame(frame);void stop?.();if(timer)clearInterval(timer);});
 </script>
 

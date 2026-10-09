@@ -87,6 +87,9 @@ pub struct Node {
     pub operation: Option<Operation>,
     pub attempts: BTreeMap<String, Attempt>,
     pub error: Option<String>,
+    /// 跳过原因（NodeSkipped 事件携带；时间线展示用，不影响裁决）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Attempt {
@@ -147,6 +150,10 @@ pub struct State {
     pub runs: BTreeMap<String, Run>,
     pub schedules: BTreeMap<String, Value>,
     pub webhooks: BTreeMap<String, Value>,
+    /// 可复用节点模板（画布片段）：UI 资产而非 run 事实，但持久化必须随
+    /// 权威走——journal 是唯一权威，模板以 TemplateChanged 事实落账。
+    #[serde(default)]
+    pub templates: BTreeMap<String, Value>,
     pub commands: BTreeMap<String, CommandRecord>,
     #[serde(default)]
     pub legacy: BTreeMap<String, Value>,
@@ -227,6 +234,7 @@ impl State {
         let mut run_undo = BTreeMap::new();
         let mut schedule_undo = BTreeMap::new();
         let mut webhook_undo = BTreeMap::new();
+        let mut template_undo = BTreeMap::new();
         let mut command_undo = BTreeMap::new();
         let mut value_undo = BTreeMap::new();
         let mut legacy_undo = BTreeMap::new();
@@ -280,6 +288,12 @@ impl State {
                     .entry(id.clone())
                     .or_insert_with(|| self.webhooks.get(&id).cloned());
             }
+            if event.kind == EventKind::TemplateChanged {
+                let id = string(&event.payload, "id")?;
+                template_undo
+                    .entry(id.clone())
+                    .or_insert_with(|| self.templates.get(&id).cloned());
+            }
             if event.kind == EventKind::Command {
                 let c: CommandRecord = serde_json::from_value(event.payload.clone())?;
                 if let Some(id) = c.request_id {
@@ -303,6 +317,7 @@ impl State {
             restore(&mut self.runs, run_undo);
             restore(&mut self.schedules, schedule_undo);
             restore(&mut self.webhooks, webhook_undo);
+            restore(&mut self.templates, template_undo);
             restore(&mut self.commands, command_undo);
             restore(&mut self.legacy, legacy_undo);
             if let Some(epoch) = epoch_undo {
@@ -461,6 +476,10 @@ impl State {
                 replace_config(&mut self.webhooks, p, "token")?;
                 return Ok(());
             }
+            EventKind::TemplateChanged => {
+                replace_config(&mut self.templates, p, "id")?;
+                return Ok(());
+            }
             EventKind::RunStarted => {
                 let mut run: Run = serde_json::from_value(p.clone())?;
                 if event.run_id.as_deref() != Some(run.run_id.as_str())
@@ -554,6 +573,7 @@ impl State {
                 operation: None,
                 attempts: BTreeMap::new(),
                 error: None,
+                skip_reason: None,
             });
             if node.node_execution_id != execution
                 || attempt != node.attempt + 1
@@ -595,6 +615,9 @@ impl State {
                     operation: None,
                     attempts: BTreeMap::new(),
                     error: None,
+                    // 跳过原因只在事件里携带；折影保留一份供时间线展示
+                    //（upstream_failed / upstream_skipped / branch_not_taken …）
+                    skip_reason: p.get("reason").and_then(Value::as_str).map(str::to_owned),
                 },
             );
             return Ok(());
@@ -758,20 +781,45 @@ impl State {
                 }
             }
             EventKind::Adjudicated => {
+                let decision = p["decision"].as_str().unwrap_or_default();
                 if terminal
                     || node.wait.as_ref().is_none_or(|w| w.kind != "uncertain")
                     || node
                         .operation
                         .as_ref()
                         .is_none_or(|o| o.outcome.is_some() || p["operation_id"] != o.operation_id)
-                    || p["decision"] != "accept_output"
                     || p["reason"].as_str().is_none_or(|s| s.trim().is_empty())
+                    || !matches!(decision, "accept_output" | "retry" | "failed")
                 {
                     return Err(invalid("invalid manual resolution"));
                 }
-                node.status = "succeeded".into();
-                node.wait = None;
-                node.output = Some(serde_json::from_value(p["output"].clone())?);
+                match decision {
+                    // 人工显式接受产出（不伪造外部响应被捕获的事实）
+                    "accept_output" => {
+                        node.status = "succeeded".into();
+                        node.wait = None;
+                        node.output = Some(serde_json::from_value(p["output"].clone())?);
+                    }
+                    // 人工显式授权重发：清除未决操作，节点回 pending 等驱动器
+                    // 以 attempt+1 重新派发（绝不自动重发的禁令针对机器，人工
+                    // 裁决就是授权凭据）。审计历史保留在 attempts 里。
+                    "retry" => {
+                        node.status = "pending".into();
+                        node.wait = None;
+                        node.operation = None;
+                        node.error = None;
+                        node.output = None;
+                    }
+                    // 人工判定失败：节点终态 failed，run 由收尾判定写 RunFailed
+                    _ => {
+                        node.status = "failed".into();
+                        node.wait = None;
+                        node.error = Some(string(p, "reason")?);
+                    }
+                }
+                // 裁决即人工介入完成：awaiting_resume 回到 running（终态由
+                // 后续 RunCompleted/RunFailed 事件落定）
+                run.status = "running".into();
             }
             EventKind::ValueChunk | EventKind::ValuePublished | EventKind::LateAudit => {}
             _ => return Err(invalid("unsupported event for node")),

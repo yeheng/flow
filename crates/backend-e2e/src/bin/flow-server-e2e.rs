@@ -11,16 +11,12 @@
 //! collision（将来是硬错误），且谁覆盖谁取决于构建顺序——e2e 有时会静默
 //! 跑在 flow-rpc 的产物上。
 //!
-//! runtime 形态与 flow-server 逐字一致（sqlite = current_thread 单线程 runtime）：
-//! 被测进程必须就是生产形态，否则 e2e 钉的契约与线上跑的不是同一种并发模型。
+//! runtime 形态与 flow-server 逐字一致（多线程）：被测进程必须就是生产形态，
+//! 否则 e2e 钉的契约与线上跑的不是同一种并发模型。
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let runtime = if flow_rpc::prefer_current_thread_runtime() {
-        tokio::runtime::Builder::new_current_thread()
-    } else {
-        tokio::runtime::Builder::new_multi_thread()
-    }
-    .enable_all()
-    .build()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     runtime.block_on(flow_rpc::run_from_env())
 }

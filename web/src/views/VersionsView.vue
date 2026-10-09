@@ -13,6 +13,8 @@ const props = defineProps<{ workflowId: string }>();
 const router = useRouter();
 
 const versions = ref<VersionMeta[]>([]);
+/** 首次拉取完成前不展示空态，避免「暂无…」闪烁 */
+const loaded = ref(false);
 const compareA = ref<number | null>(null);
 const compareB = ref<number | null>(null);
 const publishing = ref(false);
@@ -36,8 +38,10 @@ async function load(): Promise<void> {
     versions.value = await api.listVersions(props.workflowId);
   } catch (e) {
     toast.error(errText(e));
+    loaded.value = true;
     return;
   }
+  loaded.value = true;
   // 默认对比最新两版：A 基线（旧）= 次新，B 对比（新）= 最新
   compareB.value = versions.value[0]?.version ?? null;
   compareA.value = versions.value[1]?.version ?? compareB.value;
@@ -55,8 +59,9 @@ async function recomputeDiff(): Promise<void> {
   const gen = ++diffGen;
   const a = compareA.value;
   const b = compareB.value;
+  // 先清空旧 diff：切换版本期间不展示过期对比结果
+  diff.value = null;
   if (a === null || b === null) {
-    diff.value = null;
     return;
   }
   try {
@@ -127,6 +132,15 @@ function fmtVal(v: unknown): string {
 function fmtEdge(e: { from: string; to: string; port?: string }): string {
   return `${e.from} → ${e.to}${e.port ? `（${e.port}）` : ""}`;
 }
+
+async function copyChecksum(checksum: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(checksum);
+    toast.success("已复制校验和");
+  } catch {
+    toast.error("复制失败，请手动复制");
+  }
+}
 </script>
 
 <template>
@@ -164,8 +178,14 @@ function fmtEdge(e: { from: string; to: string; port?: string }): string {
               {{ v.status === "published" ? "已发布" : "草稿" }}
             </span>
           </td>
-          <td class="mono muted">{{ v.checksum.slice(0, 12) }}</td>
-          <td>{{ fmtTime(v.created_at) }}</td>
+          <td
+            class="mono muted copyable"
+            :title="v.checksum"
+            @click="copyChecksum(v.checksum)"
+          >
+            {{ v.checksum.slice(0, 12) }}
+          </td>
+          <td :title="v.created_at">{{ fmtTime(v.created_at) }}</td>
           <td class="actions">
             <button class="link" @click="loadToEditor(v.version)">加载到编辑器</button>
             <button class="link" :disabled="publishing" @click="publishFromVersion(v.version)">
@@ -175,7 +195,8 @@ function fmtEdge(e: { from: string; to: string; port?: string }): string {
         </tr>
       </tbody>
     </table>
-    <p v-if="versions.length === 0" class="wf-empty">该工作流还没有保存过版本</p>
+    <p v-if="!loaded" class="wf-empty">加载中…</p>
+    <p v-else-if="versions.length === 0" class="wf-empty">该工作流还没有保存过版本</p>
 
     <div v-if="versions.length > 0" class="diff-section">
       <h3>版本对比</h3>
@@ -244,6 +265,7 @@ function fmtEdge(e: { from: string; to: string; port?: string }): string {
           </div>
         </template>
       </template>
+      <p v-else-if="compareA !== null && compareB !== null" class="wf-empty">对比加载中…</p>
     </div>
   </div>
 </template>
@@ -306,5 +328,9 @@ function fmtEdge(e: { from: string; to: string; port?: string }): string {
   padding: 2px 0;
   font-size: 12px;
   word-break: break-all;
+}
+
+.copyable {
+  cursor: pointer;
 }
 </style>

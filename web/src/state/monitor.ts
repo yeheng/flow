@@ -39,6 +39,9 @@ export const monitor = reactive({
   /** 子 run 钻取栈：栈顶是当前 run 的直接父 run */
   breadcrumb: [] as { runId: string; workflowId: string }[],
   starting: false,
+  /** 取消/交付信号进行中（按钮禁用，防重复点击） */
+  cancelling: false,
+  delivering: false,
 });
 
 /**
@@ -257,16 +260,19 @@ export async function backToParentRun(): Promise<void> {
 }
 
 export async function cancelRun(): Promise<void> {
-  if (!monitor.runId) return;
+  if (!monitor.runId || monitor.cancelling) return;
+  monitor.cancelling = true;
   try {
     await api.runCancel(monitor.runId);
   } catch (e) {
     toast.error(errText(e));
+  } finally {
+    monitor.cancelling = false;
   }
 }
 
 export async function deliverSignal(nodeId: string, payloadText: string): Promise<void> {
-  if (!monitor.runId) return;
+  if (!monitor.runId || monitor.delivering) return;
   const raw = payloadText.trim();
   let payload: unknown = null;
   if (raw) {
@@ -277,10 +283,13 @@ export async function deliverSignal(nodeId: string, payloadText: string): Promis
       payload = payloadText;
     }
   }
+  monitor.delivering = true;
   try {
     await api.runSignal(monitor.runId, nodeId, payload);
   } catch (e) {
     toast.error(errText(e));
+  } finally {
+    monitor.delivering = false;
   }
 }
 

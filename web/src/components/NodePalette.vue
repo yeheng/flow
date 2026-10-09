@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
-import { editor, nodeTypeGroups } from "../state/editor";
+import { addNode, editor, nodeTypeGroups } from "../state/editor";
 import {
   ensureTemplates,
   insertTemplate,
@@ -44,6 +44,13 @@ function onTemplateDragStart(event: DragEvent, id: string): void {
 async function onClickInsertTemplate(id: string): Promise<void> {
   const n = editor.nodes.length;
   await insertTemplate(id, { x: 160 + (n % 5) * 48, y: 120 + (n % 5) * 48 });
+}
+
+/** 点击节点类型 = 插入到错位空档（与模板点击同一落点规则）；拖拽落点由 FlowCanvas 处理 */
+function onClickInsertNodeType(nt: NodeTypeDesc): void {
+  if (!editor.workflowId || atLimit(nt)) return;
+  const n = editor.nodes.length;
+  addNode(nt.type, { x: 160 + (n % 5) * 48, y: 120 + (n % 5) * 48 });
 }
 
 const saving = ref(false);
@@ -99,8 +106,11 @@ async function onRenameTemplate(id: string, current: string): Promise<void> {
         :draggable="!!editor.workflowId && !atLimit(nt)"
         :aria-disabled="!editor.workflowId || atLimit(nt)"
         :data-node-type="nt.type"
-        :title="atLimit(nt) ? `${nt.label}：已达数量上限（${nt.max_instances} 个）` : `${nt.label}：拖到画布添加`"
+        tabindex="0"
+        :title="atLimit(nt) ? `${nt.label}：已达数量上限（${nt.max_instances} 个）` : `${nt.label}：拖到画布或点击添加`"
         @dragstart="onDragStart($event, nt)"
+        @click="onClickInsertNodeType(nt)"
+        @keydown.enter="onClickInsertNodeType(nt)"
       >
         <span class="palette-dot" />
         <span class="palette-name">{{ nt.label }}</span>
@@ -190,7 +200,7 @@ async function onRenameTemplate(id: string, current: string): Promise<void> {
     border-color 0.15s;
 }
 
-.palette-item:hover {
+.palette-item:hover:not(.disabled) {
   background: var(--surface2);
   border-color: var(--border);
 }
@@ -261,7 +271,7 @@ async function onRenameTemplate(id: string, current: string): Promise<void> {
 }
 
 .tpl-btn.danger:hover {
-  color: #f7768e;
+  color: var(--danger);
 }
 
 .palette-empty {

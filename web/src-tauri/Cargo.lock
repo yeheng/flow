@@ -1409,6 +1409,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "chrono",
+ "clap",
  "cron-parser",
  "flow-backend",
  "flow-config",
@@ -1416,6 +1417,7 @@ dependencies = [
  "flow-journal",
  "futures",
  "jsonrpsee",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

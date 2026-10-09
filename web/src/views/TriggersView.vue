@@ -13,6 +13,10 @@ const props = defineProps<{ workflowId: string }>();
 
 const schedules = ref<Schedule[]>([]);
 const webhooks = ref<Webhook[]>([]);
+/** 首次拉取完成前不展示空态，避免「暂无…」闪烁 */
+const loaded = ref(false);
+/** 轮询失败只在 ok→error 跳变时 toast，避免每 10s 重复弹错 */
+const pollFailed = ref(false);
 let timer: ReturnType<typeof setInterval> | null = null;
 /** 轮询在途守卫：慢响应时请求不叠加 */
 let refreshing = false;
@@ -21,6 +25,10 @@ let refreshing = false;
 const newCron = ref("");
 const newInput = ref("");
 const creating = ref(false);
+const creatingWebhook = ref(false);
+/** 正在启停的行（schedule.id / webhook.token）：只禁用对应按钮 */
+const togglingScheduleId = ref<string | null>(null);
+const togglingWebhookToken = ref<string | null>(null);
 
 const workflowName = computed(
   () => editor.workflows.find((w) => w.workflow_id === props.workflowId)?.name ?? "",
@@ -34,10 +42,13 @@ async function refresh(): Promise<void> {
       api.listSchedules(props.workflowId),
       api.listWebhooks(props.workflowId),
     ]);
+    pollFailed.value = false;
   } catch (e) {
-    toast.error(errText(e));
+    if (!pollFailed.value) toast.error(errText(e));
+    pollFailed.value = true;
   } finally {
     refreshing = false;
+    loaded.value = true;
   }
 }
 
@@ -82,16 +93,20 @@ async function onCreateSchedule(): Promise<void> {
 }
 
 async function onToggleSchedule(s: Schedule): Promise<void> {
+  if (togglingScheduleId.value) return;
+  togglingScheduleId.value = s.id;
   try {
     await api.updateSchedule(s.id, { enabled: !s.enabled });
     await refresh();
   } catch (e) {
     toast.error(errText(e));
+  } finally {
+    togglingScheduleId.value = null;
   }
 }
 
 async function onDeleteSchedule(s: Schedule): Promise<void> {
-  if (!(await confirmDialog(`确定删除调度 ${s.cron_expr}？`))) return;
+  if (!(await confirmDialog(`确定删除调度 ${s.cron_expr}？`, { danger: true }))) return;
   try {
     await api.deleteSchedule(s.id);
     await refresh();
@@ -118,26 +133,34 @@ async function onCopy(w: Webhook): Promise<void> {
 }
 
 async function onCreateWebhook(): Promise<void> {
+  if (creatingWebhook.value) return;
+  creatingWebhook.value = true;
   try {
     await api.createWebhook(props.workflowId);
     toast.success("webhook 已创建");
     await refresh();
   } catch (e) {
     toast.error(errText(e));
+  } finally {
+    creatingWebhook.value = false;
   }
 }
 
 async function onToggleWebhook(w: Webhook): Promise<void> {
+  if (togglingWebhookToken.value) return;
+  togglingWebhookToken.value = w.token;
   try {
     await api.setWebhookEnabled(w.token, !w.enabled);
     await refresh();
   } catch (e) {
     toast.error(errText(e));
+  } finally {
+    togglingWebhookToken.value = null;
   }
 }
 
 async function onDeleteWebhook(w: Webhook): Promise<void> {
-  if (!(await confirmDialog("确定删除该 webhook？删除后 URL 立即失效。"))) return;
+  if (!(await confirmDialog("确定删除该 webhook？删除后 URL 立即失效。", { danger: true }))) return;
   try {
     await api.deleteWebhook(w.token);
     await refresh();
@@ -202,16 +225,20 @@ onUnmounted(() => {
         <tbody>
           <tr v-for="s in schedules" :key="s.id">
             <td class="mono">{{ s.cron_expr }}</td>
-            <td>{{ fmtTime(s.next_fire_at) }}</td>
-            <td class="mono muted">{{ fmtInput(s.input) }}</td>
+            <td :title="s.next_fire_at ?? undefined">{{ fmtTime(s.next_fire_at) }}</td>
+            <td class="mono muted" :title="JSON.stringify(s.input)">{{ fmtInput(s.input) }}</td>
             <td>
               <span class="badge" :class="s.enabled ? 'run-succeeded' : 'run-cancelled'">
                 {{ s.enabled ? "已启用" : "已停用" }}
               </span>
             </td>
-            <td>{{ fmtTime(s.created_at) }}</td>
+            <td :title="s.created_at">{{ fmtTime(s.created_at) }}</td>
             <td class="actions">
-              <button class="link" @click="onToggleSchedule(s)">
+              <button
+                class="link"
+                :disabled="togglingScheduleId === s.id"
+                @click="onToggleSchedule(s)"
+              >
                 {{ s.enabled ? "停用" : "启用" }}
               </button>
               <button class="link danger" @click="onDeleteSchedule(s)">删除</button>
@@ -219,7 +246,8 @@ onUnmounted(() => {
           </tr>
         </tbody>
       </table>
-      <p v-if="schedules.length === 0" class="wf-empty">
+      <p v-if="!loaded" class="wf-empty">加载中…</p>
+      <p v-else-if="schedules.length === 0" class="wf-empty">
         暂无调度。调度按本地时间触发，每次触发运行当前已发布版本。
       </p>
     </section>
@@ -227,7 +255,9 @@ onUnmounted(() => {
     <section class="section">
       <div class="section-header">
         <h3>Webhook</h3>
-        <button class="primary" @click="onCreateWebhook">新建 webhook</button>
+        <button class="primary" :disabled="creatingWebhook" @click="onCreateWebhook">
+          新建 webhook
+        </button>
       </div>
       <table class="data-table">
         <thead>
@@ -247,10 +277,14 @@ onUnmounted(() => {
                   {{ w.enabled ? "已启用" : "已停用" }}
                 </span>
               </td>
-              <td>{{ fmtTime(w.created_at) }}</td>
+              <td :title="w.created_at">{{ fmtTime(w.created_at) }}</td>
               <td class="actions">
                 <button class="link" @click="onCopy(w)">复制</button>
-                <button class="link" @click="onToggleWebhook(w)">
+                <button
+                  class="link"
+                  :disabled="togglingWebhookToken === w.token"
+                  @click="onToggleWebhook(w)"
+                >
                   {{ w.enabled ? "停用" : "启用" }}
                 </button>
                 <button class="link danger" @click="onDeleteWebhook(w)">删除</button>
@@ -267,7 +301,8 @@ onUnmounted(() => {
           </template>
         </tbody>
       </table>
-      <p v-if="webhooks.length === 0" class="wf-empty">
+      <p v-if="!loaded" class="wf-empty">加载中…</p>
+      <p v-else-if="webhooks.length === 0" class="wf-empty">
         暂无 webhook。POST 请求体（JSON）会作为 run 的 input，触发当前已发布版本。
       </p>
     </section>

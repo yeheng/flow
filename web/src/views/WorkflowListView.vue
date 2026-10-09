@@ -9,20 +9,43 @@ import { toast } from "../state/toast";
 
 const router = useRouter();
 
-onMounted(() => {
-  void refreshWorkflows();
+/** 首次拉取完成前不展示空态，避免「暂无…」闪烁 */
+const loaded = ref(false);
+const creating = ref(false);
+/** 正在删除的工作流 id：只禁用对应行的删除按钮 */
+const deletingId = ref<string | null>(null);
+
+onMounted(async () => {
+  await refreshWorkflows();
+  loaded.value = true;
 });
 
 async function onCreate(): Promise<void> {
+  if (creating.value) return;
   const name = await promptDialog("工作流名称");
   if (!name?.trim()) return;
-  const id = await createWorkflow(name.trim());
-  if (id) void router.push(`/workflows/${id}`);
+  creating.value = true;
+  try {
+    const id = await createWorkflow(name.trim());
+    if (id) void router.push(`/workflows/${id}`);
+  } finally {
+    creating.value = false;
+  }
 }
 
 async function onDelete(id: string): Promise<void> {
-  if (await confirmDialog("确定删除该工作流？已有 run 记录的工作流会被服务端拒绝。")) {
-    await removeWorkflow(id);
+  if (deletingId.value) return;
+  if (
+    await confirmDialog("确定删除该工作流？已有 run 记录的工作流会被服务端拒绝。", {
+      danger: true,
+    })
+  ) {
+    deletingId.value = id;
+    try {
+      await removeWorkflow(id);
+    } finally {
+      deletingId.value = null;
+    }
   }
 }
 
@@ -77,7 +100,7 @@ async function onFileChange(event: Event): Promise<void> {
         <button :disabled="importing" @click="onPickFile">
           {{ importing ? "导入中…" : "导入" }}
         </button>
-        <button class="primary" @click="onCreate">新建</button>
+        <button class="primary" :disabled="creating" @click="onCreate">新建</button>
       </span>
     </div>
     <!-- 文件选择器藏在按钮后：accept 限定 json；value 清空见 onFileChange -->
@@ -114,12 +137,19 @@ async function onFileChange(event: Event): Promise<void> {
               >触发器</RouterLink
             >
             <RouterLink class="link" :to="`/workflows/${w.workflow_id}/runs`">运行记录</RouterLink>
-            <button class="link danger" @click="onDelete(w.workflow_id)">删除</button>
+            <button
+              class="link danger"
+              :disabled="deletingId === w.workflow_id"
+              @click="onDelete(w.workflow_id)"
+            >
+              删除
+            </button>
           </td>
         </tr>
       </tbody>
     </table>
-    <p v-if="editor.workflows.length === 0" class="wf-empty">暂无工作流，点击「新建」开始</p>
+    <p v-if="!loaded" class="wf-empty">加载中…</p>
+    <p v-else-if="editor.workflows.length === 0" class="wf-empty">暂无工作流，点击「新建」开始</p>
   </div>
 </template>
 

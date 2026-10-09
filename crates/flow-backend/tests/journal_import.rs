@@ -7,14 +7,32 @@ async fn legacy_import_is_reentrant_preserves_raw_tail_and_reports_missing_input
     let source = temp.path().join("legacy");
     std::fs::create_dir(&source).unwrap();
     let db = source.join("flow.db");
-    let store = flow_store::Store::open(&db).await.unwrap();
-    let workflow = store.create_workflow("legacy").await.unwrap();
-    store.update_workflow(&workflow,&json!({"nodes":[{"id":"s","type":"start"},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"e"}]})).await.unwrap();
-    drop(store);
+    // v1 Store 已删除：用原始 SQL 构造 v1 布局源库（import-legacy 的输入面）
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&db))
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&db)
+                .create_if_missing(true),
+        )
         .await
         .unwrap();
+    let definition = json!({"nodes":[{"id":"s","type":"start"},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"e"}]}).to_string();
+    let workflow = format!("wf-{}", uuid::Uuid::now_v7());
+    sqlx::query("CREATE TABLE workflows (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL)")
+        .execute(&pool).await.unwrap();
+    sqlx::query("CREATE TABLE workflow_versions (workflow_id TEXT NOT NULL, version INTEGER NOT NULL, definition TEXT NOT NULL, checksum TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (workflow_id, version))")
+        .execute(&pool).await.unwrap();
+    sqlx::query("CREATE TABLE runs (id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, workflow_version INTEGER NOT NULL, status TEXT NOT NULL, input TEXT NOT NULL, output TEXT, error TEXT, source TEXT NOT NULL DEFAULT 'manual', source_detail TEXT, started_at TEXT NOT NULL, ended_at TEXT)")
+        .execute(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO workflows(id,name,created_at) VALUES(?,'legacy','2026-09-30T00:00:00Z')",
+    )
+    .bind(&workflow)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO workflow_versions(workflow_id,version,definition,checksum,status,created_at) VALUES(?,1,?,'deadbeef','published','2026-09-30T00:00:00Z')")
+        .bind(&workflow).bind(&definition).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO runs(id,workflow_id,workflow_version,status,input,source,started_at) VALUES('run-1',?,1,'running','{}','manual','2026-09-30T00:00:00Z')").bind(&workflow).execute(&pool).await.unwrap();
     pool.close().await;
     let dir = source.join("runs/run-1");

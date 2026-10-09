@@ -36,12 +36,12 @@ async function waitReady(url: string, timeoutMs: number): Promise<void> {
 }
 
 export default async function globalSetup(): Promise<void> {
-  // 确保二进制是最新的（缓存命中时毫秒级）。产品 bin 是统一的 `flow`（子命令形态）。
-  execSync("cargo build -p flow-app", { cwd: REPO_ROOT, stdio: "inherit" });
+  // 确保二进制是最新的（缓存命中时毫秒级）。服务端 bin 是 flow-rpc 的 `flow-server`。
+  execSync("cargo build -p flow-rpc --bin flow-server", { cwd: REPO_ROOT, stdio: "inherit" });
 
   const dir = mkdtempSync(path.join(tmpdir(), "flow-e2e-"));
-  const bin = path.join(REPO_ROOT, "target/debug/flow");
-  const child = spawn(bin, ["server"], {
+  const bin = path.join(REPO_ROOT, "target/debug/flow-server");
+  const child = spawn(bin, [], {
     env: {
       ...process.env,
       FLOW_DATA_DIR: dir,

@@ -20,6 +20,8 @@ const router = useRouter();
 const record = ref<RunRecord | null>(null);
 const live = ref(false);
 const definition = ref<Definition | null>(null);
+/** 定义拉取中：区分「加载中」与「加载完成但没有定义」，避免首屏闪「不可用」 */
+const loadingDefinition = ref(false);
 const showEvents = ref(false);
 const events = ref<RunEvent[] | null>(null);
 const activeTab = ref<"timeline" | "logs">("timeline");
@@ -98,6 +100,7 @@ async function load(runId: string): Promise<void> {
   const gen = ++generation;
   record.value = null;
   definition.value = null;
+  loadingDefinition.value = true;
   events.value = null;
   showEvents.value = false;
   try {
@@ -107,6 +110,7 @@ async function load(runId: string): Promise<void> {
     live.value = r.live;
   } catch (e) {
     if (gen !== generation) return;
+    loadingDefinition.value = false;
     toast.error(`加载 run 失败：${errText(e)}`);
     void router.replace("/runs");
     return;
@@ -120,6 +124,7 @@ async function load(runId: string): Promise<void> {
       if (gen === generation) toast.error(`加载工作流定义失败：${errText(e)}`);
     }
   }
+  if (gen === generation) loadingDefinition.value = false;
   try {
     await attachRun(runId);
   } catch (e) {
@@ -195,7 +200,13 @@ onUnmounted(() => {
 
     <div class="run-detail-main">
       <section class="center">
-        <RunCanvas v-if="definition" :definition="definition" />
+        <RunCanvas
+          v-if="definition"
+          :definition="definition"
+          @node-click="onSelectNode"
+          @open-child="onOpenChild"
+        />
+        <div v-else-if="loadingDefinition" class="canvas-hint">加载中…</div>
         <div v-else class="canvas-hint">工作流定义不可用，仅展示时间线</div>
       </section>
       <aside class="right">
@@ -231,9 +242,9 @@ onUnmounted(() => {
         <LogConsole v-else class="aside-log-console" @select-node="onSelectNode" />
 
         <div class="events-toggle">
-          <a class="link" @click="toggleEvents">{{
-            showEvents ? "收起原始事件" : "展开原始事件"
-          }}</a>
+          <button type="button" class="link" @click="toggleEvents">
+            {{ showEvents ? "收起原始事件" : "展开原始事件" }}
+          </button>
         </div>
         <div v-if="showEvents" class="events-list">
           <p v-if="events === null" class="run-hint">加载中…</p>

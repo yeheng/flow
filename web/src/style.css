@@ -133,6 +133,25 @@ button.primary:hover {
   border-color: var(--accent2);
 }
 
+button.danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}
+
+button.danger:hover {
+  background: #ff7b72;
+  border-color: #ff7b72;
+}
+
+/* input/textarea/select 用边框聚焦（见上），按钮与可聚焦元素用 outline */
+button:focus-visible,
+.link:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 input,
 textarea,
 select {
@@ -285,6 +304,14 @@ input.code {
 
 .data-table tbody tr:last-child td {
   border-bottom: none;
+}
+
+.data-table td {
+  transition: background 0.15s;
+}
+
+.data-table tbody tr:hover td {
+  background: var(--surface2);
 }
 
 .data-table .actions {

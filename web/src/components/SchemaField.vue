@@ -56,7 +56,9 @@ function onBoolean(ev: Event): void {
 }
 
 function onSelect(ev: Event): void {
-  emit("update:modelValue", (ev.target as HTMLSelectElement).value);
+  const v = (ev.target as HTMLSelectElement).value;
+  // 非必填枚举的「（不设置）」空选项映射回 undefined（cleanParams 落库时剥掉）
+  emit("update:modelValue", v === "" ? undefined : v);
 }
 
 // ---- json widget：本地持有文本，解析成功才写回（非法输入不污染 params） ----
@@ -169,6 +171,7 @@ function setChild(key: string, value: unknown): void {
       @change="onBoolean"
     />
     <select v-else-if="widget === 'enum'" :value="(modelValue as string) ?? ''" @change="onSelect">
+      <option v-if="!required" value="">（不设置）</option>
       <option v-for="opt in schema.enum" :key="opt" :value="opt">{{ opt }}</option>
     </select>
     <template v-else-if="widget === 'secret'">

@@ -828,6 +828,7 @@ dependencies = [
  "chrono",
  "clap",
  "flow-backend",
+ "flow-config",
  "flow-dto",
  "flow-rpc",
  "flow-test-support",
@@ -980,18 +981,11 @@ dependencies = [
 name = "flow-store"
 version = "0.1.0"
 dependencies = [
- "chrono",
- "flow-dto",
  "flow-test-support",
- "hex",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "sqlx",
- "thiserror 2.0.20",
  "tokio",
- "tracing",
- "uuid",
 ]
 
 [[package]]

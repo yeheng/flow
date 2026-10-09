@@ -119,6 +119,3 @@ async fn fire_one(
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

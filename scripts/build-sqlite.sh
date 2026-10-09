@@ -1,5 +1,5 @@
 #!/bin/sh
-# 构建单体 SQLite 形态的 flow 应用 → dist/sqlite/
+# 构建单机（默认 journal 后端）形态的 flow 应用 → dist/sqlite/
 #
 # 产物：
 #   dist/sqlite/bin/flow-server        JSON-RPC 2.0 over WebSocket 服务
@@ -34,12 +34,11 @@ done
 
 cat > "$DIST/run-server.sh" <<'EOF'
 #!/bin/sh
-# 单体 SQLite 部署启动脚本：单进程·单线程·单写者（canonical 后端）。
+# 单机 journal 部署启动脚本：v2 唯一权威 + 可重建投影。
 # 数据目录即用即建；端口/路径均可用环境变量覆盖。
 DIR="$(cd "$(dirname "$0")" && pwd)"
-export FLOW_BACKEND="${FLOW_BACKEND:-sqlite}"
+# 缺省后端 = journal（v1 sqlite 已删除；如需 Postgres 用 build-pg.sh 形态）
 export FLOW_DATA_DIR="${FLOW_DATA_DIR:-$DIR/data}"
-export FLOW_DB="${FLOW_DB:-$FLOW_DATA_DIR/flow.db}"
 export FLOW_ADDR="${FLOW_ADDR:-127.0.0.1:9800}"
 export FLOW_HTTP_ADDR="${FLOW_HTTP_ADDR:-127.0.0.1:9801}"
 # 可选：FLOW_EXECUTION_MODE=ipc 启用子进程执行（主进程在 bin/ 内召唤
@@ -49,5 +48,5 @@ EOF
 chmod +x "$DIST/run-server.sh"
 
 echo "built: $DIST/bin/  ($BINS)"
-echo "entry: $DIST/run-server.sh  (FLOW_BACKEND=sqlite)"
+echo "entry: $DIST/run-server.sh  (journal, default)"
 echo "cli:   $DIST/bin/flow-cli --url ws://127.0.0.1:9800 --help"

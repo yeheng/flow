@@ -135,6 +135,12 @@ function fmtTime(ts: string): string {
   return Number.isNaN(d.getTime()) ? ts : d.toLocaleTimeString();
 }
 
+/** 完整日期时间（时间列的 title 悬浮提示用） */
+function fmtTimeFull(ts: string): string {
+  const d = new Date(ts);
+  return Number.isNaN(d.getTime()) ? ts : d.toLocaleString();
+}
+
 function onScroll(): void {
   const el = listEl.value;
   if (!el) return;
@@ -193,7 +199,7 @@ function onSelectNode(id: string): void {
           ↑ 加载更早（还有 {{ hiddenCount }} 条）
         </button>
         <div v-for="line in rendered" :key="line.seq" class="log-row" :class="`log-${line.level}`">
-          <span class="log-ts">{{ fmtTime(line.ts) }}</span>
+          <span class="log-ts" :title="fmtTimeFull(line.ts)">{{ fmtTime(line.ts) }}</span>
           <span class="log-level">{{ line.level }}</span>
           <button
             v-if="line.node_id"
@@ -209,7 +215,7 @@ function onSelectNode(id: string): void {
           <span class="log-msg">{{ line.message }}</span>
         </div>
       </div>
-      <button v-if="!follow" class="log-bottom" @click="backToBottom">↓ 回到底部（跟随中）</button>
+      <button v-if="!follow" class="log-bottom" @click="backToBottom">↓ 回到底部并恢复跟随</button>
     </template>
   </div>
 </template>

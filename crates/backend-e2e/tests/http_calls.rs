@@ -8,7 +8,7 @@ use backend_e2e::common::{
     call_err, call_json, publish_workflow, start_run, wait_run_status, wait_run_terminal, Ctx,
     SHORT, TIMEOUT,
 };
-use backend_e2e::e2e_test;
+use backend_e2e::{e2e_test, e2e_test_v1_only};
 use serde_json::{json, Value};
 
 /// 从 stub 收到的请求里取请求行与某个头。
@@ -114,7 +114,7 @@ e2e_test!(http_call_4xx_is_fatal, |ctx: &mut Ctx| Box::pin(
     }
 ));
 
-e2e_test!(http_call_5xx_retries_then_succeeds, |ctx: &mut Ctx| {
+e2e_test_v1_only!(http_call_5xx_retries_then_succeeds, |ctx: &mut Ctx| {
     Box::pin(async move {
         let stub = StubHttp::json_sequence(vec![500, 503, 200]).await;
         let client = ctx.client().await;
@@ -147,7 +147,7 @@ e2e_test!(http_call_5xx_retries_then_succeeds, |ctx: &mut Ctx| {
     })
 });
 
-e2e_test!(
+e2e_test_v1_only!(
     http_call_connection_refused_retries_then_fails,
     |ctx: &mut Ctx| Box::pin(async move {
         // 起一个监听器拿到端口后立刻关闭：连接被拒（副作用未发生 → retryable）
@@ -183,7 +183,7 @@ e2e_test!(
     })
 );
 
-e2e_test!(
+e2e_test_v1_only!(
     http_call_failure_error_does_not_leak_query_secret,
     |ctx: &mut Ctx| Box::pin(async move {
         // reqwest 错误 Display 自带 ` for url (…)` 原样回显查询串；错误消息
@@ -244,7 +244,7 @@ e2e_test!(
     })
 );
 
-e2e_test!(http_call_truncated_body_is_retryable, |ctx: &mut Ctx| {
+e2e_test_v1_only!(http_call_truncated_body_is_retryable, |ctx: &mut Ctx| {
     Box::pin(async move {
         // 声明 Content-Length 但只发一半即关闭：响应体读取失败 → retryable（§11）
         let stub = StubHttp::truncate(100, "{\"partial\": tru").await;

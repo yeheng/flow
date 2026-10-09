@@ -104,7 +104,12 @@ impl JournalBackend {
             .await
     }
     /// Explicit operator resolution. This records a manual decision, never fabricates an
-    /// external OperationOutcome or grants permission to resend the uncertain request.
+    /// external OperationOutcome. `decision`:
+    /// - `accept_output`：人工接受产出（原语义）；
+    /// - `retry`：人工显式授权重发——节点回 pending，驱动器以 attempt+1 重新
+    ///   派发（「绝不自动重发」禁令针对机器；人工裁决就是重发的授权凭据）；
+    /// - `failed`：人工判定失败——节点终态 failed，run 由收尾判定写 RunFailed。
+    #[allow(clippy::too_many_arguments)] // 参数即裁决事实面，拆 struct 只是搬家
     pub async fn run_adjudicate(
         &self,
         run_id: &str,
@@ -112,6 +117,7 @@ impl JournalBackend {
         operation_id: &str,
         reason: &str,
         output: Value,
+        decision: &str,
         request_id: &str,
     ) -> Result<CommandReceipt> {
         if reason.trim().is_empty() || reason.len() > 4096 {
@@ -119,7 +125,10 @@ impl JournalBackend {
                 invalid("manual resolution requires a reason of at most 4096 bytes").into(),
             );
         }
-        let request = json!({"run_id":run_id,"node_id":node_id,"operation_id":operation_id,"reason":reason,"output":output});
+        if !matches!(decision, "accept_output" | "retry" | "failed") {
+            return Err(invalid("decision must be accept_output | retry | failed").into());
+        }
+        let request = json!({"run_id":run_id,"node_id":node_id,"operation_id":operation_id,"reason":reason,"output":output,"decision":decision});
         if let Some(receipt) = deduped(
             self,
             &format!("run.adjudicate:{run_id}"),
@@ -139,8 +148,8 @@ impl JournalBackend {
                 || node.operation.as_ref().is_none_or(|o|o.operation_id!=operation_id || o.outcome.is_some()) {
                 return Err(invalid("manual resolution requires the current uncertain operation"));
             }
-            let event=node_event(run,node_id,EventKind::Adjudicated,json!({"operation_id":operation_id,"reason":reason,"decision":"accept_output","output":output}),true);
-            Ok((vec![event],json!({"resolved":true})))
+            let event=node_event(run,node_id,EventKind::Adjudicated,json!({"operation_id":operation_id,"reason":reason,"decision":decision,"output":output}),true);
+            Ok((vec![event],json!({"resolved":true,"decision":decision})))
         }).await
     }
 
@@ -202,6 +211,13 @@ impl JournalBackend {
                     .workflows
                     .get(workflow_id)
                     .ok_or_else(|| invalid("workflow not found"))?;
+                // v1 §8 语义：与最新版本 checksum 相同的定义复用该版本号
+                //（编辑器重复保存不刷版本；命令回执空事件即幂等）
+                if let Some((_, latest)) = w.versions.last_key_value() {
+                    if latest.checksum == checksum {
+                        return Ok((vec![], json!({"version": latest.version})));
+                    }
+                }
                 let version = w.versions.last_key_value().map_or(1, |(v, _)| v + 1);
                 let value = DefinitionVersion {
                     version,
@@ -520,6 +536,71 @@ impl JournalBackend {
                     }
                 }
                 Ok((vec![Event::new(kind, value.clone())], value))
+            },
+        )
+        .await
+    }
+
+    /// 可复用节点模板的落账命令（TemplateChanged 事实）。patch 合并语义与
+    /// config_change 一致；`deleted=true` 删除。非删除模板要求 name 唯一、
+    /// nodes/edges 为数组（逐节点结构校验在 RPC 边缘，这里只做形状与唯一性）。
+    pub async fn template_change(
+        &self,
+        key: &str,
+        patch: Value,
+        request_id: Option<&str>,
+    ) -> Result<CommandReceipt> {
+        if key.is_empty() || key.len() > 128 {
+            return Err(invalid("invalid template id").into());
+        }
+        self.command(
+            "template.change",
+            request_id,
+            &json!({"key":key,"patch":patch}),
+            |state| {
+                let mut value = state
+                    .templates
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_else(|| json!({"created_at":now()}));
+                if !state.templates.contains_key(key) && state.templates.len() >= 1000 {
+                    return Err(flow_journal::Error::Limit("maximum 1000 templates".into()));
+                }
+                let object = patch
+                    .as_object()
+                    .ok_or_else(|| invalid("template patch must be object"))?;
+                for (k, v) in object {
+                    value[k] = v.clone();
+                }
+                value["id"] = json!(key);
+                if value["deleted"] != true {
+                    let name = value["name"]
+                        .as_str()
+                        .ok_or_else(|| invalid("template name required"))?;
+                    if name.is_empty() || name.len() > 1024 {
+                        return Err(invalid("invalid template name"));
+                    }
+                    // name 唯一（UI 以名为键）：撞别的模板即拒绝，不静默改名。
+                    if state
+                        .templates
+                        .values()
+                        .any(|t| t.get("id") != Some(&json!(key)) && t["name"] == value["name"])
+                    {
+                        return Err(flow_journal::Error::Conflict(
+                            "template name already taken".into(),
+                        ));
+                    }
+                    for field in ["nodes", "edges"] {
+                        if !value[field].is_array() {
+                            return Err(invalid(format!("template {field} must be an array")));
+                        }
+                    }
+                    value["updated_at"] = json!(now());
+                }
+                Ok((
+                    vec![Event::new(EventKind::TemplateChanged, value.clone())],
+                    value,
+                ))
             },
         )
         .await

@@ -18,6 +18,12 @@ const statusFilter = ref("");
 const sourceFilter = ref("");
 const hasMore = ref(false);
 const loadingMore = ref(false);
+/** 首次拉取完成后置 true；过滤条件变化时保持 true，表区直接展示新结果而不闪空态 */
+const loaded = ref(false);
+/** 轮询失败只在 ok→error 跳变时 toast，避免每 3s 重复弹错 */
+const pollFailed = ref(false);
+/** 正在取消的 run id：只禁用对应行的取消按钮 */
+const cancellingId = ref<string | null>(null);
 let timer: ReturnType<typeof setInterval> | null = null;
 /** 轮询在途守卫：断线重连等慢响应场景下请求不叠加 */
 let refreshing = false;
@@ -76,10 +82,13 @@ async function refresh(): Promise<void> {
     });
     hasMore.value = probe.length > PAGE_SIZE;
     runs.value = mergeRunPage(probe.slice(0, PAGE_SIZE), runs.value);
+    pollFailed.value = false;
   } catch (e) {
-    toast.error(errText(e));
+    if (!pollFailed.value) toast.error(errText(e));
+    pollFailed.value = true;
   } finally {
     refreshing = false;
+    loaded.value = true;
   }
 }
 
@@ -105,12 +114,25 @@ async function loadMore(): Promise<void> {
 }
 
 async function onCancel(r: RunRecord): Promise<void> {
-  if (!(await confirmDialog(`确定取消 run ${r.id.slice(0, 8)}…？`))) return;
+  if (cancellingId.value) return;
+  if (!(await confirmDialog(`确定取消 run ${r.id.slice(0, 8)}…？`, { danger: true }))) return;
+  cancellingId.value = r.id;
   try {
     await api.runCancel(r.id);
     await refresh();
   } catch (e) {
     toast.error(errText(e));
+  } finally {
+    cancellingId.value = null;
+  }
+}
+
+async function copyRunId(id: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(id);
+    toast.success("已复制 run id");
+  } catch {
+    toast.error("复制失败，请手动复制");
   }
 }
 
@@ -145,12 +167,12 @@ watch(
     <div class="page-header">
       <h2>运行记录</h2>
       <div class="header-tools">
-        <select v-model="sourceFilter" class="status-filter">
+        <select v-model="sourceFilter" class="status-filter" aria-label="来源筛选">
           <option v-for="o in SOURCE_OPTIONS" :key="o.value" :value="o.value">
             {{ o.label }}
           </option>
         </select>
-        <select v-model="statusFilter" class="status-filter">
+        <select v-model="statusFilter" class="status-filter" aria-label="状态筛选">
           <option v-for="o in STATUS_OPTIONS" :key="o.value" :value="o.value">
             {{ o.label }}
           </option>
@@ -174,8 +196,10 @@ watch(
       </thead>
       <tbody>
         <tr v-for="r in runs" :key="r.id">
-          <td class="mono">{{ r.id.slice(0, 8) }}…</td>
-          <td v-if="!workflowId">
+          <td class="mono copyable" :title="r.id" @click="copyRunId(r.id)">
+            {{ r.id.slice(0, 8) }}…
+          </td>
+          <td v-if="!workflowId" class="wf-cell">
             {{ workflowNames.get(r.workflow_id) ?? r.workflow_id }}
             <span class="muted">v{{ r.workflow_version }}</span>
           </td>
@@ -185,18 +209,24 @@ watch(
             </span>
           </td>
           <td>{{ sourceLabel(r.source) }}</td>
-          <td>{{ fmtTime(r.started_at) }}</td>
+          <td :title="r.started_at">{{ fmtTime(r.started_at) }}</td>
           <td>{{ fmtDuration(r) }}</td>
           <td class="actions">
             <RouterLink class="link" :to="`/runs/${r.id}`">详情</RouterLink>
-            <button v-if="r.status === 'running'" class="link danger" @click="onCancel(r)">
+            <button
+              v-if="r.status === 'running'"
+              class="link danger"
+              :disabled="cancellingId === r.id"
+              @click="onCancel(r)"
+            >
               取消
             </button>
           </td>
         </tr>
       </tbody>
     </table>
-    <p v-if="runs.length === 0" class="wf-empty">暂无运行记录</p>
+    <p v-if="!loaded" class="wf-empty">加载中…</p>
+    <p v-else-if="runs.length === 0" class="wf-empty">暂无运行记录</p>
     <div v-if="hasMore" class="load-more">
       <button :disabled="loadingMore" @click="loadMore">加载更多</button>
     </div>
@@ -218,5 +248,14 @@ watch(
   margin-top: 12px;
   display: flex;
   justify-content: center;
+}
+
+.copyable {
+  cursor: pointer;
+}
+
+/* 名称缺失时回退渲染 36 字符 workflow_id，允许折行避免撑破表格 */
+.wf-cell {
+  word-break: break-all;
 }
 </style>

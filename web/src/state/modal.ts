@@ -4,12 +4,17 @@ export interface ModalRequest {
   kind: "confirm" | "prompt";
   message: string;
   defaultValue: string;
+  danger?: boolean;
+  confirmText?: string;
   resolve: (value: boolean | string | null) => void;
 }
 
 export const modalState = reactive<{ current: ModalRequest | null }>({ current: null });
 
-export function confirmDialog(message: string): Promise<boolean> {
+export function confirmDialog(
+  message: string,
+  opts?: { danger?: boolean; confirmText?: string },
+): Promise<boolean> {
   return new Promise((resolve) => {
     // 已有弹窗时按取消关闭旧的，避免 Promise 悬挂
     modalState.current?.resolve(modalState.current.kind === "confirm" ? false : null);
@@ -17,6 +22,8 @@ export function confirmDialog(message: string): Promise<boolean> {
       kind: "confirm",
       message,
       defaultValue: "",
+      danger: opts?.danger,
+      confirmText: opts?.confirmText,
       resolve: resolve as (v: boolean | string | null) => void,
     };
   });

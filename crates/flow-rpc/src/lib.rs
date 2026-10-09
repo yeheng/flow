@@ -19,9 +19,6 @@ use flow_backend::{
 use futures::StreamExt;
 use jsonrpsee::core::RegisterMethodError;
 
-/// 进程入口逃逸口：backend-perf 的自举服务模式与 flow-server 二进制共用的
-/// runtime 形态提示（sqlite = current_thread）。见 flow_backend 同名函数。
-pub use flow_backend::prefer_current_thread_runtime;
 use jsonrpsee::server::{Server, ServerHandle, SubscriptionMessage};
 use jsonrpsee::types::error::{ErrorObject, ErrorObjectOwned};
 use jsonrpsee::types::Params;
@@ -214,14 +211,29 @@ pub async fn run(loaded: flow_config::Loaded) -> Result<(), Box<dyn std::error::
         "flow-server 已启动 (JSON-RPC 2.0 over WebSocket)"
     );
 
+    // journal 臂：执行驱动（进程内/IPC/远程）是 JournalBackend 的固有启动
+    // 序列——与 journal-server 的 start_execution 同一份实现。
+    if let AnyBackend::Journal(journal) = &backend {
+        flow_backend::start_execution(&config.execution, journal).await?;
+    }
+
     // cron 调度器：config.server.scheduler_enabled（env FLOW_SCHEDULER=off 已
-    // 在加载时合并为 false）禁用
-    let scheduler_task = if config.server.scheduler_enabled {
-        let backend = backend.clone();
-        let tick = config.scheduler_tick();
-        Some(tokio::spawn(
-            async move { scheduler::run(backend, tick).await },
-        ))
+    // 在加载时合并为 false）禁用。journal 臂用 journal_triggers（触发与 run
+    // 创建同事务、命令身份去重），sqlite/pg 用 v1 调度器（schedule_fires 表）。
+    let scheduler_task: Option<tokio::task::JoinHandle<()>> = if config.server.scheduler_enabled {
+        match &backend {
+            AnyBackend::Journal(journal) => {
+                let tick = config.journal_trigger_tick();
+                Some(journal_triggers::start(journal.clone(), tick))
+            }
+            _ => {
+                let backend = backend.clone();
+                let tick = config.scheduler_tick();
+                Some(tokio::spawn(
+                    async move { scheduler::run(backend, tick).await },
+                ))
+            }
+        }
     } else {
         tracing::info!("scheduler_enabled=false，cron 调度器未启动");
         None
@@ -662,7 +674,7 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
             .map_err(backend_err)?;
         Ok::<_, ErrorObjectOwned>(json!({
             "run": run,
-            "live": state.backend.is_live(&p.run_id),
+            "live": state.backend.is_live(&p.run_id).await,
         }))
     })?;
 
@@ -834,9 +846,9 @@ pub fn build_module(state: Arc<AppState>) -> Result<RpcModule<Arc<AppState>>, Rp
                     .await
                     .map_err(backend_err)?
             }
-            AnyBackend::Sqlite(_) => {
+            AnyBackend::Journal(_) => {
                 return Err(invalid(
-                    "run.signal_status 仅 Postgres 后端提供；SQLite 后端的信号在进程内同步交付，无持久 inbox 可查",
+                    "run.signal_status 仅 Postgres 后端提供；journal 后端的信号是同步落账的 journal 命令（run.signal），回执即结果",
                 ))
             }
         };

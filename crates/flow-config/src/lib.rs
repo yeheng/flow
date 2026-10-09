@@ -93,15 +93,17 @@ impl Default for ServerConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageBackend {
-    Sqlite,
     Postgres,
+    /// JSONL v2 journal 权威（`<data_dir>/` 即 journal 根，SQLite 只是
+    /// 可重建投影）。单机目标后端；历史数据不做迁移，全新数据集使用。
+    Journal,
 }
 
 impl StorageBackend {
     pub fn as_str(&self) -> &'static str {
         match self {
-            StorageBackend::Sqlite => "sqlite",
             StorageBackend::Postgres => "postgres",
+            StorageBackend::Journal => "journal",
         }
     }
 }
@@ -122,7 +124,11 @@ pub struct StorageConfig {
 impl Default for StorageConfig {
     fn default() -> Self {
         StorageConfig {
-            backend: StorageBackend::Sqlite,
+            // 默认 = journal（JSONL v2 权威）。sqlite（v1）仍可显式配置，
+            // 但已进入弃用期（deprecation 日志见 flow_rpc::run；删除计划
+            // docs/SQLITE_V1_TO_V2_MIGRATION.md §2）。历史 v1 数据不迁移——
+            // 全新数据目录直接用 journal。
+            backend: StorageBackend::Journal,
             data_dir: "data".into(),
             database: None,
             database_url: None,
@@ -317,7 +323,8 @@ impl Config {
                 .map_err(|e| ConfigError::Parse(format!("{}：{e}", path_display(&path))))?,
             None => Config::default(),
         };
-        let env_overrides = apply_env(&mut config);
+        let env_overrides = apply_env(&mut config)
+            .map_err(|e| ConfigError::Invalid(format!("FLOW_BACKEND：{e}")))?;
         config.validate().map_err(ConfigError::Invalid)?;
         Ok(Loaded {
             config,
@@ -474,7 +481,7 @@ impl Config {
     /// 覆盖该配置的 env 名单（不含值——FLOW_DATABASE_URL 等含凭据）。
     pub fn env_override_names(&self) -> Vec<String> {
         let mut probe = self.clone();
-        apply_env(&mut probe)
+        apply_env(&mut probe).unwrap_or_default()
     }
 }
 
@@ -501,7 +508,7 @@ fn parse_addr(addr: &str, field: &str) -> Result<std::net::SocketAddr, String> {
 ///
 /// 语义与旧读取点逐字对齐（特别是 FLOW_SCHEDULER：仅 `off` 关闭，其他值
 /// 一律开启——旧代码对未知值不报错，这里保持）。
-fn apply_env(config: &mut Config) -> Vec<String> {
+fn apply_env(config: &mut Config) -> Result<Vec<String>, String> {
     let mut applied = Vec::new();
     let env_str =
         |name: &str| -> Option<String> { std::env::var(name).ok().filter(|v| !v.is_empty()) };
@@ -523,12 +530,19 @@ fn apply_env(config: &mut Config) -> Vec<String> {
 
     // ---- [storage] ----
     if let Some(v) = env_str("FLOW_BACKEND") {
-        // 与旧 open_from_env 一致：postgres/postgresql 等价；未知值留给 validate
-        // 报错（旧行为是 open_from_env 报"未知 FLOW_BACKEND"）。
+        // 与旧 open_from_env 一致：postgres/postgresql 等价。
+        // v1 后端已删除（历史数据不迁移，见 docs/SQLITE_V1_TO_V2_MIGRATION.md）。
+        // 不静默回落：非法值（含 "sqlite"）走 Err，与 toml 未知值同语义。
         match v.as_str() {
             "postgres" | "postgresql" => config.storage.backend = StorageBackend::Postgres,
-            "sqlite" => config.storage.backend = StorageBackend::Sqlite,
-            _ => {}
+            "journal" | "jsonl" => config.storage.backend = StorageBackend::Journal,
+            other => {
+                return Err(format!(
+                    "FLOW_BACKEND={other} 不可用（合法：journal | postgres；\
+                     sqlite（v1）已删除，历史数据不迁移，\
+                     见 docs/SQLITE_V1_TO_V2_MIGRATION.md）"
+                ));
+            }
         }
         applied.push("FLOW_BACKEND".into());
     }
@@ -692,7 +706,7 @@ fn apply_env(config: &mut Config) -> Vec<String> {
 
     applied.sort();
     applied.dedup();
-    applied
+    Ok(applied)
 }
 
 impl Config {
@@ -737,7 +751,8 @@ mod tests {
         config.validate().expect("默认值必须合法");
         assert_eq!(config.server.rpc_addr, "127.0.0.1:9800");
         assert_eq!(config.server.http_addr, "127.0.0.1:9801");
-        assert_eq!(config.storage.backend, StorageBackend::Sqlite);
+        // 默认后端 = journal（JSONL v2 权威；sqlite v1 弃用期，显式可用）
+        assert_eq!(config.storage.backend, StorageBackend::Journal);
         assert_eq!(config.storage.data_dir, "data");
         assert_eq!(config.execution.mode, ExecutionModeKind::InProcess);
         assert_eq!(config.execution.x_max, 4);
@@ -823,7 +838,7 @@ max_runs = 4
         std::env::set_var("FLOW_SCHEDULER", "off");
 
         let mut config = Config::default();
-        let applied = apply_env(&mut config);
+        let applied = apply_env(&mut config).unwrap();
         assert_eq!(config.server.rpc_addr, "127.0.0.1:19980");
         assert_eq!(config.storage.backend, StorageBackend::Postgres);
         assert!(!config.server.scheduler_enabled);

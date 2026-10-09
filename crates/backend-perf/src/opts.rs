@@ -41,8 +41,8 @@ impl Scenario {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendSel {
     Both,
-    Sqlite,
     Postgres,
+    Journal,
 }
 
 #[derive(Debug, Clone)]
@@ -102,8 +102,8 @@ impl Opts {
                 "--backend" => {
                     opts.backend = match value("--backend").as_str() {
                         "both" => BackendSel::Both,
-                        "sqlite" => BackendSel::Sqlite,
                         "postgres" => BackendSel::Postgres,
+                        "journal" => BackendSel::Journal,
                         other => die(&format!("--backend 不认识：{other}")),
                     };
                 }
@@ -178,7 +178,7 @@ pub fn usage() -> &'static str {
      \n\
      选项：\n\
        --scenario <列表>      all（缺省）| throughput | read | subscribe | recovery，可逗号组合\n\
-       --backend <后端>       both（缺省）| sqlite | postgres\n\
+       --backend <后端>       both（缺省 postgres+journal）| postgres | journal\n\
        --runs <N>             run_throughput 的总 run 数（缺省 200）\n\
        --concurrency <N>      同时在飞的 run 数（缺省 16，提交侧限流 + 驱动容量基准）\n\
        --prefill <N>          rpc_read 预置的终态 run 数（缺省 100）\n\

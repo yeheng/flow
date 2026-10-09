@@ -156,6 +156,7 @@ async fn manual_resolution_binds_operation_and_never_fabricates_outcome() {
             "other",
             "verified externally",
             json!({"accepted":true}),
+            "accept_output",
             "decision"
         )
         .await
@@ -167,6 +168,7 @@ async fn manual_resolution_binds_operation_and_never_fabricates_outcome() {
             "operation",
             "verified externally",
             json!({"accepted":true}),
+            "accept_output",
             "decision",
         )
         .await
@@ -178,6 +180,7 @@ async fn manual_resolution_binds_operation_and_never_fabricates_outcome() {
             "operation",
             "verified externally",
             json!({"accepted":true}),
+            "accept_output",
             "decision",
         )
         .await

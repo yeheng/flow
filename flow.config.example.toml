@@ -15,8 +15,9 @@ scheduler_tick_secs = 20
 journal_trigger_tick_secs = 20
 
 [storage]
-# sqlite（缺省，canonical）| postgres（多节点）
-backend = "sqlite"
+# journal（缺省，JSONL v2 权威：data_dir 即 journal 根，SQLite 投影可重建）
+# | postgres（多节点）| sqlite（v1，已弃用——显式可用，历史数据不迁移）
+backend = "journal"
 # 数据目录（原 FLOW_DATA_DIR；SQLite 模式的事件日志、密钥都在这里）
 data_dir = "data"
 # SQLite 库文件显式路径（原 FLOW_DB）；注释掉 = <data_dir>/flow.db

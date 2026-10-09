@@ -20,6 +20,7 @@ pub enum EventKind {
     WorkflowDeleted,
     ScheduleChanged,
     WebhookChanged,
+    TemplateChanged,
     RunStarted,
     RunCancelled,
     RunCompleted,
