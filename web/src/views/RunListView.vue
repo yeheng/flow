@@ -5,7 +5,7 @@ import { errText } from "../rpc/client";
 import { editor, refreshWorkflows } from "../state/editor";
 import { confirmDialog } from "../state/modal";
 import { mergeRunPage, nextCursor } from "../state/run-list";
-import { runStatusLabel, sourceLabel } from "../state/labels";
+import { runBadgeClass, runStatusLabel, sourceLabel } from "../state/labels";
 import { toast } from "../state/toast";
 import type { RunRecord } from "../types";
 
@@ -46,12 +46,6 @@ const SOURCE_OPTIONS: { value: string; label: string }[] = [
   { value: "webhook", label: "Webhook" },
   { value: "sub_workflow", label: "子流程" },
 ];
-
-/** 状态徽章着色沿用画布运行态体系：蓝 running / 绿 succeeded / 红 failed / 黄 awaiting / 灰 cancelled */
-function badgeClass(status: string): string {
-  if (status === "awaiting_resume" || status === "initializing") return "run-awaiting";
-  return `run-${status}`;
-}
 
 function fmtTime(iso: string | null): string {
   if (!iso) return "—";
@@ -204,7 +198,7 @@ watch(
             <span class="muted">v{{ r.workflow_version }}</span>
           </td>
           <td>
-            <span class="badge" :class="badgeClass(r.status)">
+            <span class="badge" :class="runBadgeClass(r.status)">
               {{ runStatusLabel(r.status) }}
             </span>
           </td>

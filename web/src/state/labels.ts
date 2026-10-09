@@ -43,6 +43,12 @@ export function runStatusLabel(status: string): string {
   }
 }
 
+/** 状态徽章着色沿用画布运行态体系：蓝 running / 绿 succeeded / 红 failed / 黄 awaiting / 灰 cancelled */
+export function runBadgeClass(status: string): string {
+  if (status === "awaiting_resume" || status === "initializing") return "run-awaiting";
+  return `run-${status}`;
+}
+
 /** 节点「忙」= running 或 retrying（retrying 只在前端存在，服务器不发射） */
 export function isBusyNodeState(state: string): boolean {
   return state === "running" || state === "retrying";
