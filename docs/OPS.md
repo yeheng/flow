@@ -1,7 +1,7 @@
 # flow 运维手册
 
-> 状态：**当前代码实际语义**（2026-10-09）。覆盖单机 journal 部署、三种执行模式、
-> 离线维护、升级、故障处置、容量与安全边界。
+> 状态：**当前代码实际语义**（2026-10-09）。覆盖进程关系、单机/多机部署、三种执行
+> 模式、启动重启终止、离线维护、升级、故障处置、容量与安全边界。
 >
 > 关联文档：
 > - 引擎与协议语义（权威）：[DESIGN.md](DESIGN.md)
@@ -12,36 +12,77 @@
 
 ## 0. 运维速查
 
-| 场景 | 动作 |
-|---|---|
-| 单机起服务 | `flow-server`（缺省 journal 后端，`[storage]` 分区配置） |
-| 多节点起服务 | `storage.backend = "postgres"` + `[pg]`，每个节点一份 `flow-server` |
-| 本机进程隔离 | `[execution] mode = "ipc"`，`flow-executor` 与主进程同目录 |
-| 远程执行扩容 | `[execution] mode = "remote"` + `[execution.remote]`，每台执行机一个 `flow-agent` |
-| 磁盘维护 | 先停服务，再用 `flow-journal-tool verify / rebuild-index / backup / repair` |
-| 重建投影 | `flow-journal-dev --data-dir <dir> rebuild-projection --destination <新文件>` |
-| 升级 | drain（remote 模式）→ 替换二进制 → 重启；journal 只增不删 |
-| 只读保全 v1 历史 | `flow-journal-dev --data-dir <新目录> import-legacy --source <旧根> --database <旧>/flow.db` |
+| 场景 | 动作 | 详见 |
+|---|---|---|
+| 单机起服务 | `flow-server`（缺省 journal 后端） | §1.2 |
+| 单机 + 进程隔离 | `mode = "ipc"`，`flow-executor` 与主进程同目录 | §1.2、§2.2 |
+| 多机执行扩容 | `mode = "remote"`，每台执行机一个 `flow-agent` | §1.1、§2.3 |
+| 多节点对等 | `storage.backend = "postgres"`，每节点一份 `flow-server` | §1.3 |
+| 选哪个 server | 生产 `flow-server`；开发联调 v2 / 值下载 `flow-journal-server` | §3.5 |
+| 优雅停机 | `kill -INT <pid>`（**不是** SIGTERM，见下） | §5.1 |
+| 重启 | `kill -INT` → 等端口/锁释放 → 起新进程 | §5.3 |
+| 下线一台执行机 | `kill -TERM` 该机 `flow-agent` | §5.1、§5.4 |
+| 磁盘维护 | 先停服务，再 `flow-journal-tool verify / rebuild-index / backup / repair` | §4 |
+| 重建投影 | `flow-journal-dev --data-dir <dir> rebuild-projection --destination <新文件>` | §4 |
+| 升级 | 停 agent → 换主进程二进制 → 重启；journal 只增不删 | §5.4、§6 |
+| 只读保全 v1 历史 | `flow-journal-dev --data-dir <新目录> import-legacy --source <旧根> --database <旧>/flow.db` | §4 |
+
+> ⚠️ **`flow-server` 不监听 SIGTERM**：`kill <pid>`（默认 SIGTERM）会跳过 checkpoint
+> 与投影关闭直接终止。优雅停机必须 `kill -INT`。`flow-agent` 两者都监听。
 
 ---
 
 ## 1. 部署形态
 
-### 1.1 产品二进制
+### 1.1 产品二进制与它们的关系
 
-| bin | 职责 | 常驻？ |
+```mermaid
+graph TB
+  subgraph 单机最小形态
+    S["flow-server<br/>（权威 + RPC + 触发器）"]
+    D[("data/<br/>journal JSONL")]
+    S -->|读写| D
+  end
+
+  subgraph ipc 模式追加
+    E1["flow-executor"]
+    S -.同目录召唤.-> E1
+  end
+
+  subgraph remote 模式追加
+    A["flow-agent<br/>（每台执行机一个）"]
+    E2["flow-executor"]
+    S <-->|"双 TLS<br/>control + data"| A
+    A -->|本机池| E2
+  end
+
+  C["flow-cli"] -->|"WS RPC（不碰存储）"| S
+  JS["flow-journal-server"] --> D
+  T["flow-journal-tool"] -.离线排他锁.-> D
+  DEV["flow-journal-dev"] --> D
+```
+
+**谁是权威**：`flow-server`（journal 后端时）是唯一写者与提交者。`flow-executor`
+只做计算、不产生权威 ACK/Permit；`flow-agent` 只做中继与容量扩展。**`flow-cli` 是
+纯 RPC 客户端，不碰任何存储**——CRUD 与触发语义唯一来源是服务端那一份。
+
+| 进程 | 归谁管 | 生命周期 |
 |---|---|---|
-| `flow-server` | JSON-RPC 2.0 over WebSocket 服务 + cron + webhook HTTP | 是 |
-| `flow-cli` | 命令行客户端（纯 RPC，不碰存储） | 否 |
-| `flow-executor` | 受管理执行子进程（`ipc` / `remote` 模式） | 由主进程/agent 召唤 |
-| `flow-agent` | 受信任远程执行中继（双 TLS 上联 + 本机执行器池） | 是 |
-| `flow-journal-tool` | journal 离线维护（verify/index/backup/repair） | 否 |
-| `flow-journal-server` | JSONL v2 开发服务（WS RPC + 下载 HTTP） | 是 |
-| `flow-journal-dev` | JSONL v2 开发运行器（run/resume/status/import-legacy/rebuild-projection） | 否 |
-| `flow-journal-bench` | journal 写入基准（容量测量，非产品路径） | 否 |
+| `flow-server` | 运维 / systemd / 手起 | 常驻主进程 |
+| `flow-agent` | 运维（每台执行机） | 常驻，断线退避重连 |
+| `flow-executor` | **由 `flow-server` 或 `flow-agent` 召唤**，不手起 | 随任务/会话回收 |
+| `flow-cli` | 人手 | 一次性 |
+| `flow-journal-tool` / `flow-journal-dev` | 人手（须停写） | 一次性 |
 
-`backend-e2e` 的 `flow-server-e2e` 与 `backend-perf` 的 `flow-perf` 是测试/压测脚手架，
-不属于产品 bin。
+`flow-executor` **不是独立部署单元**：主进程缺省在**自身同目录**定位兄弟
+`flow-executor`（`FLOW_EXECUTOR_BIN` 可显式覆盖），找不到即报错，绝不静默回退
+进程内执行。所以部署形态永远是「同一目录里放齐需要的二进制」——
+`scripts/build-sqlite.sh` / `build-pg.sh` 的 `dist/*/bin/` 就是这件事。
+
+`flow-journal-server` 与 `flow-server` 的区别：前者是 **journal v2 原生协议的开发
+服务**（v2 方法集 + 有界下载 HTTP + 触发器，token 走 `FLOW_JOURNAL_TOKEN`）；后者是
+**产品服务**（v1 RPC 契约 + cron + webhook）。两者跑的都是同一个 journal 后端，
+差别在协议世代与鉴权，不在新旧。逐项对比见 §3.5。
 
 ### 1.2 单机（journal 后端，缺省）
 
@@ -72,11 +113,40 @@ flow-server --config /etc/flow/flow.toml
 **v1 布局目录（有 `flow.db`、无 `journal/`）在 journal 模式下拒绝启动**——历史数据
 不迁移，防混用护栏。
 
-### 1.3 多节点（Postgres 后端）
+#### 单机进程矩阵
+
+| 执行模式 | 需启动的进程 | 说明 |
+|---|---|---|
+| `in_process`（缺省） | 只 `flow-server` | 无子进程，节点在服务进程内执行 |
+| `ipc` | `flow-server`（同目录备好 `flow-executor`） | `flow-executor` 由主进程按需召唤 |
+| `remote` | `flow-server` + 每台执行机 `flow-agent` | 执行机上也需 `flow-executor` |
+
+单机 `ipc` 的完整形态（生产常用，隔离节点执行但不必跨机）：
 
 ```sh
+# bin/ 目录内：flow-server + flow-executor 同目录
+cat > flow.toml <<'EOF'
+[storage]
+backend = "journal"
+data_dir = "/var/lib/flow"
+
+[execution]
+mode = "ipc"
+x_max = 4
+EOF
+./bin/flow-server --config ./flow.toml
+```
+
+### 1.3 多节点（Postgres 后端）
+
+多节点 = **多个 `flow-server` 共享一个 Postgres**，用 epoch 租约与持久 inbox
+协作（对等抢占模式）。这不是「主从」：每个节点既是 gateway 也是 executor（
+`FLOW_ROLE=all`），也可按角色拆开。
+
+```sh
+# 每个节点同一份配置，只有监听地址可不同
 FLOW_DATABASE_URL=postgres://flow:flow@db:5432/flow \
-FLOW_ROLE=all flow-server          # gateway|executor|all
+FLOW_ROLE=all flow-server
 ```
 
 同一套二进制集合，`storage.backend` 在进程入口决定，不在构建期区分。租约 / 持久
@@ -179,6 +249,47 @@ slots   = 4
 - 凭证：业务密钥以最小引用经 OperationPermit 按任务下发（主进程解析，**不复制主
   进程环境到 agent**；凭证值不进入授权事实，不进 journal）。
 
+#### 多机部署拓扑
+
+```text
+            ┌──────────────────────────────┐
+            │  主进程机器（1 台）           │
+            │  flow-server（mode=remote）   │
+            │  data_dir/journal ← 唯一权威  │
+            └───────────┬──────────────────┘
+                        │ control :9700 + data :9701（mTLS）
+        ┌───────────────┼───────────────┐
+        ▼               ▼               ▼
+  ┌──────────┐    ┌──────────┐    ┌──────────┐
+  │ agent-a  │    │ agent-b  │    │ agent-c  │
+  │ flow-    │    │ flow-    │    │ flow-    │
+  │ agent    │    │ agent    │    │ agent    │
+  │ + exec   │    │ + exec   │    │ + exec   │
+  │ slots=4  │    │ slots=4  │    │ slots=4  │
+  └──────────┘    └──────────┘    └──────────┘
+   执行机 A         执行机 B         执行机 C
+```
+
+部署清单：
+
+| 机器 | 进程 | 数据 | 网络 |
+|---|---|---|---|
+| 主进程 1 台 | `flow-server` | **持有 `data_dir`（journal 权威）** | 出站到各 agent；入站 RPC 9800 / webhook 9801 |
+| 每台执行机 | `flow-agent` + `flow-executor`（同目录） | 无持久数据 | 出站到主进程 9700/9701 |
+
+要点：
+
+- **agent 数与容量**：全局活跃派发上限 `A_max = 16`，每 agent 由 `--slots` 报容量
+  （缺省 4）。主进程按「已绑定占用 < 该 agent slots」准入，报告有延迟也不重复超配。
+- **主进程仍是单点**：agent 只扩算力。主进程重启 = epoch 变化，agent 重连后按
+  Resume 裁决恢复（§7.3）。
+- **一台执行机整体丢失**：其未确认数据可能丢失，主进程保留已确认前缀并标
+  incomplete，不生成成功结果；其他机器任务不受影响。
+- **执行机无需共享 `data_dir`**：业务值经 data 通道传输，agent 不落权威副本。
+- 与 PG 多节点的区别：PG 模式是**多个对等 `flow-server`**（都能提交，靠租约互斥）；
+  remote 模式是**一个 `flow-server` + 多个无状态执行机**。两者可叠加（PG 多节点
+  各自再挂 agent），但没有内置的跨机提交高可用。
+
 ---
 
 ## 3. 日常运行
@@ -226,6 +337,111 @@ journal 后端提供有界流式下载：`GET /runs/<run_id>/values/<output_id>`
   执行协议冻结常量（`contract.rs`）、executor FD 槽位、`FLOW_RUN_LOG_BUDGET` 等
   engine 内部预算。
 
+### 3.5 flow-server vs flow-journal-server
+
+**先纠正一个容易发生的误读**：所谓「v1」指的是 **RPC 协议面**，不是后端。
+v1 SQLite **后端**已在 2026-10-09 删除（`flow-store` 现在只剩 journal 的 SQLite
+投影，见 [SQLITE_V1_TO_V2_MIGRATION.md](SQLITE_V1_TO_V2_MIGRATION.md)）。但
+**v1 RPC 契约一天都没废弃**——`flow-server` 今天就跑在 journal 后端上，v1 的 35 个
+方法由 `flow-backend/src/journal_arm.rs` 逐条映射到 journal 命令（`ws_journal.rs`
+真起服务进程跑全量 v1 面 + SIGKILL 重启恢复）。
+
+所以两个服务的差别是**协议世代**，不是新旧程度：
+
+| 维度 | `flow-server` | `flow-journal-server` |
+|---|---|---|
+| 定位 | **产品服务**（v1 RPC 契约） | **journal v2 开发服务**（v2 原生协议） |
+| 后端 | journal（缺省）/ postgres | **仅 journal** |
+| RPC 方法集 | v1 契约 35 个（见下） | v2 原生 20 个（见下） |
+| 鉴权 | **无**。谁连上谁就是管理员 | 每请求带 `_token`，常量时间比较；不符 `-32001 unauthorized` |
+| 监听限制 | 可绑任意地址（默认 loopback） | **强制 loopback**，非 loopback 拒绝启动 |
+| 配置来源 | `flow.toml` 全部分区 | `[journal]` 分区 + env |
+| 数据目录 | `storage.data_dir` | `[journal].data_dir` / `FLOW_JOURNAL_DATA_DIR` |
+| token | 不需要 | `FLOW_JOURNAL_TOKEN` ≥32 字节，缺失即拒启 |
+| 下载 HTTP | 无 | 有：`GET /runs/<id>/values/<oid>`（§3.3） |
+| webhook | `POST /hook/:token`（v1 面） | `POST /hooks/<id>` + `Idempotency-Key` |
+| 触发器 | journal 后端用 `journal_triggers`（同事务去重）；postgres 后端用 v1 调度器（`schedule_fires` 表） | `journal_triggers`（同事务去重） |
+| cron 配置 | `schedule.*` 五个方法 | `schedule.change` 单方法 |
+| webhook 配置 | `webhook.*` 四个方法 | `webhook.change` 单方法 |
+| 观测读面 | 无 | `run.observations.page` |
+| 幂等 | 无（v1 契约） | 写命令强制 `request_id`，回执窗口 8192 |
+| 适用 | 生产、浏览器/桌面前端 | 开发联调 v2 协议、值下载、观测排查 |
+
+**为什么 v2 有 token 而 v1 没有**：v2 的下载接口能流出业务原文，且面向可能跨机的
+部署形态，所以把「每工作区单口令」做进了协议。v1 面沿用了「无认证，靠网络边界」
+的旧契约——这不是 v2 更安全的证明，只是世代差异；生产暴露 v1 面仍必须自备外层
+TLS + 认证（§9）。
+
+#### flow-server 提供的 interface（v1 RPC 契约）
+
+```text
+工作流定义   workflow.create / update / publish / get / list / versions / delete
+运行         run.start / get / list / stats / timeline / events
+信号与取消   run.cancel / run.signal / run.signal_status
+触发器配置   schedule.create / list / update / delete
+            webhook.create / list / set_enabled / delete
+节点与密钥   nodetypes.list
+            secrets.list / set / delete
+配置与模板   config.get / update
+            template.create / list / get / update / delete
+订阅         run.subscribe → run.event / run.unsubscribe（可按 run_id 过滤）
+HTTP         POST /hook/:token（body 即 run input）
+```
+
+#### flow-journal-server 提供的 interface（v2 原生协议）
+
+```text
+写命令（必须带 request_id）
+            workflow.create / update / publish / delete
+            run.start / cancel / signal / adjudicate
+            schedule.change / webhook.change
+读面        workflow.get / list、run.get / list
+            run.events.page / run.audit.page（游标分页）
+            legacy.get / list（只读历史基线）
+            run.observations.page（可丢失观测）
+            command.status（幂等回执查询）
+订阅        run.subscribe（event_format=v2，from_seq/from_lsn，mode=control|audit）
+            → run.event / run.unsubscribe
+HTTP        GET  /runs/<run_id>/values/<output_id>（Bearer token，§3.3）
+            POST /hooks/<id>（Bearer + Idempotency-Key）
+```
+
+#### v1 RPC 契约独有、v2 没有的 interface
+
+这些方法只存在于 `flow-server`，v2 服务上**没有对应方法**（实测 `-32601 Method
+not found`）：
+
+```text
+nodetypes.list          节点类型目录（前端画布调色板数据源）
+secrets.list/set/delete 持久化密钥管理
+config.get / update     统一配置读写（Web 设置页）
+template.*              可复用节点模板 CRUD
+run.stats               聚合统计（仪表盘）
+run.timeline            只读节点时间线
+workflow.versions       版本历史列表
+run.signal_status       持久 inbox 落账查询（pg 专属）
+schedule.* / webhook.*  触发器 CRUD 的细粒度面（v2 只有 *.change）
+```
+
+**实践含义**：浏览器/桌面前端（编辑、设置页、密钥管理、模板、仪表盘）**必须连
+`flow-server`**；`flow-journal-server` 只服务 journal 原生协议与数据排查。桌面端
+因此同时内嵌两套方法集（`web/src-tauri/src/service.rs` 分别注册 `build_module` 与
+`journal_v2::module`）。
+
+#### 语义差异（同名方法也不同）
+
+| 方法 | flow-server（v1） | flow-journal-server（v2） |
+|---|---|---|
+| `run.start` | 无幂等键，重试 = 双 run | `request_id` 幂等；`COMMITTED_NOT_VISIBLE`(-32020) 时查 `command.status` |
+| `run.signal` | 同步交付，`signal_id` 可省 | `signal_id` 兼作幂等键；裁决走 `payload.action` 映射 |
+| 副作用裁决 | `run.signal` 的 payload | **`run.adjudicate`**，三种 decision（accept_output/retry/failed） |
+| `run.events` | `from_seq` 闭区间 | `run.events.page` 游标分页，limit ≤256 |
+| 外部操作失败 | retryable 自动重试 | **一律 uncertain 等人工裁决**（§7.5） |
+| 节点日志 | `node_log` 走事件流 | 不进事件流，走 ObservationStore（前端日志控制台为空） |
+
+**生产只用 `flow-server`**；`flow-journal-server` 用于开发联调、值下载与观测排查，
+且它强制 loopback——本来也不该对外暴露。
+
 ---
 
 ## 4. 离线维护
@@ -270,18 +486,100 @@ flow-journal-dev --data-dir ./new-v2 import-legacy --source ./old-root --databas
 
 ---
 
-## 5. 升级
+## 5. 进程生命周期：启动、重启、终止
 
-### 5.1 二进制与协议
+### 5.1 各进程的信号处理
+
+| 进程 | SIGINT / SIGTERM 行为 | 收到后的收尾 |
+|---|---|---|
+| `flow-server` | **只处理 Ctrl-C**（`tokio::signal::ctrl_c`） | 停 cron → 停 webhook HTTP → `backend.shutdown()`（写 checkpoint、关投影、关 journal）→ `server.stop()` 等 RPC 排空 |
+| `flow-journal-server` | 同上 | 停触发器 → `server.stop()` → 5s 内等下载任务（超时 abort）→ `backend.close()` |
+| `flow-journal-dev` | Ctrl-C 打断等待循环 | 直接 break 后 `backend.close()`；`run`/`resume` 的等待中 run 保持未终态 |
+| `flow-agent` | **处理 SIGTERM 与 Ctrl-C**（unix 双监听） | `cancel_all`（取消本地执行器）→ 关上联 → 退出，reason 打印为 `shutdown` |
+| `flow-executor` | 无信号处理，随通道 EOF 退出 | 任一通道 EOF → 取消当前任务 → 尽力发 `Stopped` → 退出码 0（主进程不可达 74 / 任务 panic 75，供父进程诊断） |
+
+**关键不对称**：`flow-server` / `flow-journal-server` **不监听 SIGTERM**——用
+`kill <pid>`（默认 SIGTERM）不会触发优雅停机，进程会被默认动作直接终止，
+**跳过 checkpoint 与投影关闭**。所以：
+
+```sh
+# 正确：优雅停机
+kill -INT <pid>          # 或 kill -TERM 对 flow-agent
+
+# 也可以用 supervisor 发 SIGINT
+systemctl stop flow      # 需在 unit 里配 KillSignal=SIGINT
+```
+
+SIGKILL（`kill -9`）跳过全部收尾。**journal 仍然安全**——权威是 append-only
+JSONL，已提交事实不丢；代价是丢一次 checkpoint，下次启动多一次全量重放，以及
+`projection.sqlite` 可能停在落后位置（下次 open 时追平）。
+
+### 5.2 重启前的数据安全边界
+
+journal 后端启动时对 `data_dir` 持**排他 flock**（`Disk::open`）：
+- 第二个实例立即失败（`data directory is locked`），不会双写；
+- 所以「重启」= 旧进程退出并释放锁 → 新进程拿锁。**不要在旧进程还活着时起新进程**；
+- 离线工具（verify/backup/repair）同样要这把锁，**因此跑离线维护必须先停服务**。
+
+进程退出后残留的 `flow-executor` 由 `kill_on_drop` 兜底回收（父进程消失即被杀），
+不会变孤儿继续跑用户代码。
+
+### 5.3 标准重启流程
+
+```sh
+# 0) 可选：先看有没有 awaiting_resume 的 run 待人工裁决
+flow-cli --url ws://127.0.0.1:9800 run list --status awaiting_resume
+
+# 1) 优雅停机（等日志出现「收到中断信号，正在停止」后退出）
+kill -INT "$(pgrep -f 'flow-server')"
+
+# 2) 确认端口与锁已释放
+lsof -nP -iTCP:9800 -sTCP:LISTEN      # 应无输出
+
+# 3) 启动新二进制
+./bin/flow-server --config /etc/flow/flow.toml
+```
+
+重启后自动发生：`Disk::open` 校验段链 → `load_checkpoint` 快路径（仍逐段核对
+存在性/身份/长度/边界）→ 不一致则全量 scan → 投影追平 → 执行驱动重启 →
+**未终态 run 按 §5.5 规则恢复**（uncertain 不自动重发）。
+
+### 5.4 remote 模式的重启顺序
+
+主进程与 agent 的重启互不等价，**顺序有讲究**：
+
+| 场景 | 操作 | 后果 |
+|---|---|---|
+| 重启单台执行机 | `kill -TERM` 该机 agent → 替换二进制 → 重启 agent | 该机在飞任务按 Lost 处理，主进程可重新派发；其他 agent 无感 |
+| 重启主进程（不换二进制） | `kill -INT` flow-server → 重启 | epoch 不变；agent 重连，Resume 按裁决继续 |
+| 主进程升级二进制 | **先 drain 或停 agent** → 换主进程二进制 → 重启 → 再起 agent | agent 以新 `agent_boot_id` 重连；协议/能力不兼容在握手处明确失败 |
+
+**主进程升级时不要留着旧 agent 在线**：新旧协议版本若不兼容，agent 会反复握手失败
+并退避重连，刷屏且无法收敛。先停 agent，主进程就绪后再起。
+
+### 5.5 停机窗口里正在跑的 run 会怎样
+
+| 停机时机 | 行为 |
+|---|---|
+| 授权前（Intent 已写、Permit 未发） | 重启后**安全重新派发**——请求从未发出，无副作用风险 |
+| 授权后、结果未知 | 进 `uncertain` 等待（`awaiting_resume`），**绝不自动重发**；要人工 `run.adjudicate` |
+| 结果已提交 | 重放识别为 `AlreadyCommitted`，直接续跑 |
+| 等待中（delay/human_task/sub_workflow） | 唤醒时间已过的按续跑逻辑处理；未到点的继续等 |
+
+---
+
+## 6. 升级
+
+### 6.1 二进制与协议
 
 - 执行协议 `PROTOCOL_VERSION = 1`：版本不兼容在握手处明确失败（executor 缺能力 /
   帧 `v` 不符），不降级执行。
 - journal 兼容：**只增不删**。新写入只能由能读新 journal 的兼容二进制回退；
   **不能重新启用旧 SQLite 数据库覆盖新事实**。
 - 升级顺序（remote 模式）：drain 目标 agent → 替换二进制 → 重启 agent（新
-  `agent_boot_id`，Resume 对账后按裁决继续/取消）→ 主进程。
+  `agent_boot_id`，Resume 对账后按裁决继续/取消）→ 主进程。停机/启动细节见 §5.4。
 
-### 5.2 drain 语义
+### 6.2 drain 语义
 
 主进程对 agent 发 `Drain { grace_ms }`（上限 `DRAIN_GRACE_MS = 5s`）：agent 停止
 接新派发 → 取消在飞 → 转发最后确认 → `DrainComplete` → 退出上联。之后新派发到该
@@ -289,27 +587,28 @@ agent 明确失败。drain 期间其他 agent 不受影响。
 
 **当前没有 CLI / RPC 的 drain 入口**：`AgentManager::drain(agent_id, grace_ms)` 是
 库 API（测试 `journal_remote_ops.rs` 消费）。要下线一台执行机的现实路径：
-停该机的 `flow-agent` 进程——其在飞任务按 §6 的失联规则处理，已确认事实不受影响。
+`kill -TERM` 该机的 `flow-agent`（§5.1）——其在飞任务按 §7 的失联规则处理，
+已确认事实不受影响。
 
-### 5.3 观测与日志的兼容边界
+### 6.3 观测与日志的兼容边界
 
 新二进制写的 NodeLog / 观测事件旧二进制读会反序列化失败。单二进制部署、升级时
 排空运行中 run 即无此场景；不做兼容层。
 
 ---
 
-## 6. 故障处置
+## 7. 故障处置
 
-### 6.1 agent 失联
+### 7.1 agent 失联
 
 任务挂起等 Resume（`attach_timeout` 后失败封口）。已授权未封口的操作按 uncertain
-规则保留；缺口与 uncertain 按 §6.5 处理。**其他机器任务不受影响。**
+规则保留；缺口与 uncertain 按 §7.5 处理。**其他机器任务不受影响。**
 
-### 6.2 agent 崩溃 / 被杀
+### 7.2 agent 崩溃 / 被杀
 
 执行器随本地通道 EOF 退出；任务按 Lost 失败封口，重试由主进程新派发执行。
 
-### 6.3 主进程重启（epoch 变化）
+### 7.3 主进程重启（epoch 变化）
 
 agent 重连 → Resume 上报本地未决事实 → 主进程**以 journal 为准**裁决（不信 agent
 自报游标）：
@@ -324,17 +623,17 @@ agent 重连 → Resume 上报本地未决事实 → 主进程**以 journal 为�
 
 未上报的该 agent 绑定判 Lost（执行器已失联）。主进程重启本身不丢已提交事实。
 
-### 6.4 journal 尾部损坏 / 满盘
+### 7.4 journal 尾部损坏 / 满盘
 
 - 启动时 `load_checkpoint` 快路径仍校验每个已知段的存在性、身份、长度与检查点边界；
   不一致走全量 scan。完整事务按已提交处理；摘要错误 / 段缺失 / 错序 / 封口段损坏
   **停止自动恢复，不跳过**。
 - 满盘（errno 28）：提交失败后继续提交仍失败，`durable_lsn` 不越过原回执；歧义尾
   保留，可经新目录 repair 读取。备份目标盘满不损坏权威。
-- 初始化中断：`initializing` 行配有有效 `run_started` 时按 §7 分类恢复；日志缺失 /
+- 初始化中断：`initializing` 行配有有效 `run_started` 时按 §5.5 分类恢复；日志缺失 /
   空文件 / 首行残缺 → 初始化标 failed，保留文件与诊断，不执行节点。
 
-### 6.5 uncertain（未知外部结果）
+### 7.5 uncertain（未知外部结果）
 
 授权已发出但结果未知时：节点进 `uncertain` 等待（run 状态 `awaiting_resume`），
 **绝不自动重发已授权的外部操作**。人工用 `run.adjudicate` 决策：
@@ -348,7 +647,7 @@ agent 重连 → Resume 上报本地未决事实 → 主进程**以 journal 为�
 裁决不创建声称外部响应已被捕获的 OperationOutcome，也不清除原尝试的 unknown
 完整性标记。`awaiting_resume` 就是「需要人工介入」的信号。
 
-### 6.6 平台故障 vs 业务失败
+### 7.6 平台故障 vs 业务失败
 
 - 引擎内部错误（`EngineError::Bug`）挂 `awaiting_resume`，**不写 `run_failed`**——
   写业务终态会让运维照着没写错的工作流定义白查。错误信息自带卡住的节点与状态。
@@ -357,7 +656,7 @@ agent 重连 → Resume 上报本地未决事实 → 主进程**以 journal 为�
 
 ---
 
-## 7. 容量与预算（改配置前先看这里）
+## 8. 容量与预算（改配置前先看这里）
 
 | 项 | 值 | 位置 |
 |---|---|---|
@@ -386,7 +685,7 @@ agent 整机丢失时未确认数据可能丢失，主进程保留已确认前�
 
 ---
 
-## 8. 边界（必须向运维明示）
+## 9. 边界（必须向运维明示）
 
 - **主进程是唯一提交者与可用性边界**：agent 只扩展计算容量，不扩展 journal 耐久
   吞吐，不提供主进程高可用。无共享目录 fencing、无日志复制、不宣称 HA。

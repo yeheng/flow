@@ -423,7 +423,7 @@ e2e_test!(
                 "http_call",
                 "human_task",
                 "sub_workflow",
-                "llm",
+                "harness",
                 "email"
             ],
             "node 类型闭集：{ids:?}"

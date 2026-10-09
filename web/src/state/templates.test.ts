@@ -30,7 +30,8 @@ vi.mock("../api/flow", () => ({
   updateTemplate: vi.fn(async () => {}),
 }));
 
-import { insertTemplate } from "./templates";
+import { insertTemplate, saveWorkflowAsNodeTemplate } from "./templates";
+import * as api from "../api/flow";
 
 const types: NodeTypeDesc[] = [
   {
@@ -164,5 +165,48 @@ describe("模板插入（templates store）", () => {
     const ok = await insertTemplate("missing");
     expect(ok).toBe(false);
     expect(editor.nodes).toHaveLength(1);
+  });
+});
+
+describe("saveWorkflowAsNodeTemplate（一键存为常用节点）", () => {
+  it("构造 sub_workflow 单节点片段（预填 workflow_id）并刷新清单", async () => {
+    const createTemplate = vi.mocked(api.createTemplate);
+    const listTemplates = vi.mocked(api.listTemplates);
+    createTemplate.mockClear();
+    listTemplates.mockClear();
+    const created = {
+      id: "t9",
+      name: "我的子流程",
+      category: "子流程",
+      nodes: [
+        {
+          id: "sub_1",
+          type: "sub_workflow",
+          name: "我的子流程",
+          params: { workflow_id: "wf_1" },
+        },
+      ],
+      edges: [],
+      created_at: "",
+      updated_at: "",
+    };
+    createTemplate.mockResolvedValueOnce(created);
+    const r = await saveWorkflowAsNodeTemplate("wf_1", "  我的子流程  ");
+    expect(r).toEqual(created);
+    expect(createTemplate).toHaveBeenCalledWith(
+      "我的子流程",
+      [{ id: "sub_1", type: "sub_workflow", name: "我的子流程", params: { workflow_id: "wf_1" } }],
+      [],
+      "子流程",
+    );
+    expect(listTemplates).toHaveBeenCalled();
+  });
+
+  it("服务端报错（如重名）时返回 null 且不写画布", async () => {
+    const createTemplate = vi.mocked(api.createTemplate);
+    createTemplate.mockRejectedValueOnce(new Error("模板名称已存在"));
+    const r = await saveWorkflowAsNodeTemplate("wf_1", "重名");
+    expect(r).toBeNull();
+    expect(editor.nodes).toHaveLength(0);
   });
 });

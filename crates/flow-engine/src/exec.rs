@@ -14,6 +14,7 @@ use crate::secrets;
 
 pub const DEFAULT_JS_TIMEOUT_MS: u64 = 2_000;
 pub const DEFAULT_HTTP_TIMEOUT_MS: u64 = 30_000;
+pub const DEFAULT_HARNESS_TIMEOUT_MS: u64 = 300_000;
 
 /// 节点执行失败。`retryable` 决定引擎是重试还是把 run 判为失败；
 /// `platform` 表示基础设施故障（IO/Backend/日志损坏）——不是工作流失败，
@@ -220,7 +221,7 @@ async fn dispatch(
         NodeType::Condition => run_condition(ctx).await,
         NodeType::Delay => run_delay(ctx, cancel).await,
         NodeType::HttpCall => run_http(ctx).await,
-        NodeType::Llm => run_llm(ctx).await,
+        NodeType::Harness => run_harness(ctx).await,
         NodeType::Email => run_email(ctx).await,
         NodeType::SubWorkflow => run_sub_workflow(ctx, cancel).await,
         NodeType::HumanTask => Err(NodeFailure::fatal(
@@ -460,8 +461,28 @@ async fn run_http(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
         .param_u64("timeout_ms")
         .unwrap_or(DEFAULT_HTTP_TIMEOUT_MS);
 
+    // proxy 参数存在时按请求建独立 client（共享的 HTTP_CLIENT 不挂代理）；
+    // 代理 URL 非法是配置错误：请求从未发出，重试也不会变好
+    let proxy = expanded
+        .get("proxy")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty());
+    let owned_client = match proxy {
+        Some(proxy) => Some(
+            reqwest::Client::builder()
+                .proxy(
+                    reqwest::Proxy::all(proxy)
+                        .map_err(|e| NodeFailure::fatal(format!("非法代理地址：{e}")))?,
+                )
+                .build()
+                .map_err(|e| NodeFailure::fatal(format!("非法代理配置：{e}")))?,
+        ),
+        None => None,
+    };
+    let client = owned_client.as_ref().unwrap_or(&HTTP_CLIENT);
+
     let started = Instant::now();
-    let mut request = HTTP_CLIENT
+    let mut request = client
         .request(method, &url)
         .timeout(Duration::from_millis(timeout_ms));
 
@@ -578,7 +599,7 @@ async fn read_response_text(mut response: reqwest::Response) -> Result<String, N
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
-/// llm / email 共用 POST JSON；与 http_call 一致，429/5xx 可重试。
+/// email 的 POST JSON；与 http_call 一致，429/5xx 可重试。
 async fn post_json_bearer(
     url: &str,
     api_key: &str,
@@ -637,80 +658,178 @@ async fn post_json_bearer(
     Ok((status, body))
 }
 
-/// OpenAI 兼容 chat/completions 的请求构造（纯函数，与网络无关便于测试）。
-pub fn llm_request(params: &Value) -> Result<(String, Value), NodeFailure> {
+/// harness：外部 agent CLI 的请求构造（纯函数，与进程无关便于测试）。
+/// 返回 `(command, args, workdir, timeout_ms, prompt)`。
+pub fn harness_request(params: &Value) -> Result<(String, Vec<String>, Option<String>, u64, String), NodeFailure> {
     let need = |key: &str| {
         params
             .get(key)
             .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty())
             .map(str::to_string)
-            .ok_or_else(|| NodeFailure::fatal(format!("llm 节点缺少参数 {key}")))
+            .ok_or_else(|| NodeFailure::fatal(format!("harness 节点缺少参数 {key}")))
     };
-    let base_url = params
-        .get("base_url")
+    let command = need("command")?;
+    let prompt = params
+        .get("prompt")
+        .and_then(Value::as_str)
+        .ok_or_else(|| NodeFailure::fatal("harness 节点缺少参数 prompt"))?
+        .to_string();
+    let args = params
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| v.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let workdir = params
+        .get("workdir")
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or("https://api.openai.com/v1");
-    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-
-    let mut messages = Vec::new();
-    if let Some(system) = params
-        .get("system")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-    {
-        messages.push(serde_json::json!({"role": "system", "content": system}));
-    }
-    messages.push(serde_json::json!({"role": "user", "content": need("prompt")?}));
-
-    let mut body = serde_json::json!({"model": need("model")?, "messages": messages});
-    if let Some(temperature) = params.get("temperature").and_then(Value::as_f64) {
-        body["temperature"] = serde_json::json!(temperature);
-    }
-    if let Some(max_tokens) = params.get("max_tokens").and_then(Value::as_u64) {
-        body["max_tokens"] = serde_json::json!(max_tokens);
-    }
-    if params
-        .get("json_mode")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        body["response_format"] = serde_json::json!({"type": "json_object"});
-    }
-    Ok((url, body))
+        .map(str::to_string);
+    let timeout_ms = params
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_HARNESS_TIMEOUT_MS);
+    Ok((command, args, workdir, timeout_ms, prompt))
 }
 
-async fn run_llm(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
-    // params 已展开、x-secret 已由 execute 注入真值——api_key 这里是真值，
-    // 只进 Authorization 头，不得写进输出/错误消息
-    let api_key = ctx
-        .node
-        .param_str("api_key")
-        .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| NodeFailure::fatal("llm 节点缺少参数 api_key"))?
-        .to_string();
-    let (url, body) = llm_request(&ctx.node.params)?;
-    let timeout_ms = ctx
-        .node
-        .param_u64("timeout_ms")
-        .unwrap_or(DEFAULT_HTTP_TIMEOUT_MS);
-    let (_status, response) = post_json_bearer(&url, &api_key, &body, timeout_ms).await?;
-
-    let content = response
-        .pointer("/choices/0/message/content")
-        .cloned()
-        .ok_or_else(|| {
-            NodeFailure::fatal(format!(
-                "llm 响应缺少 choices[0].message.content：{}",
-                truncate(&redact_value(&response))
-            ))
+/// harness 执行：spawn → prompt 写 stdin → 收 stdout/stderr。
+/// 退出码 0 → `{exit_code, stdout, stderr, result?}`（stdout 去空白后能解析为
+/// JSON 对象/数组时带 `result`）；非 0 → fatal 带 stderr 尾部；超时 → 杀进程、
+/// 可重试；spawn 失败（命令不存在等）→ fatal（重试无意义）。
+async fn run_harness(ctx: &NodeExecContext) -> Result<Value, NodeFailure> {
+    let (command, args, workdir, timeout_ms, prompt) = harness_request(&ctx.node.params)?;
+    let mut command_line = command.clone();
+    if !args.is_empty() {
+        command_line = format!("{command_line} {}", args.join(" "));
+    }
+    ctx.logger.info(format!("→ {command_line}"));
+    let started = Instant::now();
+    let output = harness_spawn(&command, &args, workdir.as_deref(), &prompt, timeout_ms)
+        .await
+        .map_err(|err| {
+            ctx.logger.error(format!("harness 失败：{}", err.message));
+            err
         })?;
-    Ok(serde_json::json!({
-        "content": content,
-        "model": response.get("model").cloned().unwrap_or(Value::Null),
-        "usage": response.get("usage").cloned().unwrap_or(Value::Null),
-    }))
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    ctx.logger.info(format!(
+        "← exit {}（{}ms，stdout {}B，stderr {}B）",
+        output.status.code().unwrap_or(-1),
+        started.elapsed().as_millis(),
+        stdout.len(),
+        stderr.len()
+    ));
+    harness_output(output.status.code(), stdout, stderr)
+}
+
+/// 三条执行路径（engine / journal / executor）共用的 harness 输出派生：
+/// 退出码 0 → 输出对象；否则 fatal 错误（消息带 stderr 尾部）。
+pub fn harness_output(
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+) -> Result<Value, NodeFailure> {
+    if exit_code != Some(0) {
+        let code = exit_code.map_or_else(|| "signal".to_string(), |c| c.to_string());
+        return Err(NodeFailure::fatal(format!(
+            "harness 退出码 {code}，stderr 尾部：{}",
+            stderr_tail(&stderr)
+        )));
+    }
+    // stdout 去空白后恰为 JSON 对象/数组时附上解析结果，方便下游直接取数
+    let trimmed = stdout.trim();
+    let result = if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        serde_json::from_str::<Value>(trimmed)
+            .ok()
+            .filter(|v| v.is_object() || v.is_array())
+    } else {
+        None
+    };
+    let mut output = serde_json::json!({
+        "exit_code": 0,
+        "stdout": stdout,
+        "stderr": stderr,
+    });
+    if let Some(result) = result {
+        output["result"] = result;
+    }
+    Ok(output)
+}
+
+/// stderr 尾部（错误消息用）：最多保留末尾 512 字节，按字符边界切。
+pub fn stderr_tail(stderr: &str) -> String {
+    if stderr.len() <= 512 {
+        return stderr.to_string();
+    }
+    let mut start = stderr.len() - 512;
+    while !stderr.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &stderr[start..])
+}
+
+/// harness 子进程命令构造：stdio 全部管道，kill_on_drop 保证超时/取消路径上
+/// 进程被带走（engine / journal / executor 三条执行路径共用）。
+pub fn harness_command(
+    command: &str,
+    args: &[String],
+    workdir: Option<&str>,
+) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(command);
+    cmd.args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(dir) = workdir {
+        cmd.current_dir(dir);
+    }
+    cmd
+}
+
+/// spawn 并等待 harness 子进程。kill_on_drop 保证超时/取消路径上进程被带走。
+async fn harness_spawn(
+    command: &str,
+    args: &[String],
+    workdir: Option<&str>,
+    prompt: &str,
+    timeout_ms: u64,
+) -> Result<std::process::Output, NodeFailure> {
+    use tokio::io::AsyncWriteExt;
+    let mut child = harness_command(command, args, workdir)
+        .spawn()
+        .map_err(|e| NodeFailure::fatal(format!("harness 启动失败（{command}）：{e}")))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| NodeFailure::fatal("harness 子进程 stdin 不可用"))?;
+    // 对端不读 stdin 提前退出时 EPIPE 不算失败——退出码会说明一切
+    match stdin.write_all(prompt.as_bytes()).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => return Err(NodeFailure::retryable(format!("harness 写 stdin 失败：{e}"))),
+    }
+    drop(stdin);
+    match tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait_with_output()).await
+    {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) => Err(NodeFailure::retryable(format!(
+            "harness 等待子进程失败（{command}）：{e}"
+        ))),
+        // 超时：wait_with_output 被 drop，kill_on_drop 杀掉子进程
+        Err(_) => Err(NodeFailure::retryable(format!(
+            "harness 超时（{timeout_ms}ms，已终止）：{command}"
+        ))),
+    }
 }
 
 /// Resend 兼容发信接口的请求构造（纯函数）。to 原样透传字符串。
@@ -1081,45 +1200,117 @@ mod tests {
         (addr, seen)
     }
 
-    /// llm 请求构造：必填、system 插队、可选字段、json_mode、base_url 默认值与尾斜杠。
+    /// harness 请求构造：必填、args 规整、workdir/timeout 默认值。
     #[test]
-    fn llm_request_builds_openai_chat_body() {
-        let (url, body) = llm_request(&json!({
-            "api_key": "k", "model": "gpt-x", "prompt": "你好"
+    fn harness_request_builds_spawn_spec() {
+        let (command, args, workdir, timeout_ms, prompt) = harness_request(&json!({
+            "command": "kimi", "prompt": "你好"
         }))
         .unwrap();
-        assert_eq!(url, "https://api.openai.com/v1/chat/completions");
-        assert_eq!(
-            body,
-            json!({"model": "gpt-x", "messages": [{"role": "user", "content": "你好"}]})
-        );
+        assert_eq!(command, "kimi");
+        assert_eq!(args, Vec::<String>::new());
+        assert_eq!(workdir, None);
+        assert_eq!(timeout_ms, DEFAULT_HARNESS_TIMEOUT_MS);
+        assert_eq!(prompt, "你好");
 
-        let (url, body) = llm_request(&json!({
-            "base_url": "http://127.0.0.1:9/v1/",
-            "model": "m", "prompt": "p", "system": "s",
-            "temperature": 0.5, "max_tokens": 128, "json_mode": true
+        let (command, args, workdir, timeout_ms, _) = harness_request(&json!({
+            "command": "claude", "prompt": "p",
+            "args": ["--model", "m", 42],
+            "workdir": "/tmp", "timeout_ms": 1000
         }))
         .unwrap();
+        assert_eq!(command, "claude");
         assert_eq!(
-            url, "http://127.0.0.1:9/v1/chat/completions",
-            "尾斜杠不双写"
+            args,
+            vec!["--model".to_string(), "m".to_string(), "42".to_string()]
         );
-        assert_eq!(
-            body["messages"][0],
-            json!({"role": "system", "content": "s"})
-        );
-        assert_eq!(body["messages"][1], json!({"role": "user", "content": "p"}));
-        assert_eq!(body["temperature"], json!(0.5));
-        assert_eq!(body["max_tokens"], json!(128));
-        assert_eq!(body["response_format"], json!({"type": "json_object"}));
+        assert_eq!(workdir, Some("/tmp".to_string()));
+        assert_eq!(timeout_ms, 1000);
 
-        // 缺 prompt：fatal
-        let err = llm_request(&json!({"model": "m"})).unwrap_err();
+        // 缺 command / prompt：fatal
+        for params in [json!({"prompt": "p"}), json!({"command": "kimi"})] {
+            let err = harness_request(&params).unwrap_err();
+            assert!(!err.retryable, "{}", err.message);
+        }
+    }
+
+    /// harness 端到端：prompt 经 stdin 进，stdout 出；stdout 是 JSON 时带 result。
+    #[tokio::test]
+    async fn harness_pipes_prompt_and_captures_output() {
+        // cat：stdin 原样回显
+        let cat = node("harness", json!({"command": "cat", "prompt": "提示词正文"}));
+        let out = execute(
+            &ctx(cat, json!({}), HashMap::new()),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out,
+            json!({"exit_code": 0, "stdout": "提示词正文", "stderr": ""}),
+            "stdout 恰为 prompt 时不带 result（非 JSON）"
+        );
+
+        // stdout 是 JSON 对象：附 result
+        let json_out = node(
+            "harness",
+            json!({"command": "printf", "args": ["{\"a\":1}"], "prompt": "p"}),
+        );
+        let out = execute(
+            &ctx(json_out, json!({}), HashMap::new()),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["result"], json!({"a": 1}));
+        assert_eq!(out["stdout"], json!("{\"a\":1}"));
+    }
+
+    /// harness 失败分类：非 0 退出 → fatal 带 stderr 尾部；命令不存在 → fatal；
+    /// 超时 → 可重试。
+    #[tokio::test]
+    async fn harness_failure_classification() {
+        let fail = node(
+            "harness",
+            json!({"command": "sh", "args": ["-c", "echo boom >&2; exit 3"], "prompt": "p"}),
+        );
+        let err = execute(
+            &ctx(fail, json!({}), HashMap::new()),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(!err.retryable, "非 0 退出不可重试：{}", err.message);
         assert!(
-            !err.retryable && err.message.contains("prompt"),
-            "{}",
+            err.message.contains("3") && err.message.contains("boom"),
+            "错误消息带退出码与 stderr 尾部：{}",
             err.message
         );
+
+        let missing = node(
+            "harness",
+            json!({"command": "flow-test-no-such-command", "prompt": "p"}),
+        );
+        let err = execute(
+            &ctx(missing, json!({}), HashMap::new()),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(!err.retryable, "spawn 失败不可重试：{}", err.message);
+
+        let slow = node(
+            "harness",
+            json!({"command": "sleep", "args": ["30"], "prompt": "p", "timeout_ms": 100}),
+        );
+        let err = execute(
+            &ctx(slow, json!({}), HashMap::new()),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.retryable, "超时必须可重试：{}", err.message);
+        assert!(err.message.contains("超时"), "{}", err.message);
     }
 
     /// email 请求构造：Resend 格式（body → text），endpoint 默认值。
@@ -1143,55 +1334,24 @@ mod tests {
         );
     }
 
-    /// x-secret 注入：api_key 存名称，execute 内经 FLOW_SECRET_<名称> 解析为
-    /// 真值后进 Authorization 头；名称对应环境变量缺失 → fatal 且消息带提示。
+    /// x-secret 注入：名称对应环境变量缺失 → fatal 且消息带提示。
+    /// （注入成功的端到端由 email_posts_resend_format_and_reports_id 覆盖。）
     #[tokio::test]
-    async fn llm_secret_is_injected_from_env_and_missing_is_fatal() {
-        let (addr, seen) = mock_server(
-            "200 OK",
-            r#"{"model":"m","choices":[{"message":{"content":"答"}}],"usage":{"total_tokens":3}}"#,
-        );
-        std::env::set_var("FLOW_SECRET_TEST_LLM_KEY", "sk-live-value");
-        let llm = node(
-            "llm",
-            json!({
-                "base_url": format!("http://{addr}"),
-                "api_key": "TEST_LLM_KEY",
-                "model": "m", "prompt": "p"
-            }),
-        );
-        let out = execute(
-            &ctx(llm, json!({}), HashMap::new()),
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            out,
-            json!({"content": "答", "model": "m", "usage": {"total_tokens": 3}})
-        );
-        let request = seen.lock().await.clone();
-        assert!(
-            request.contains("authorization: Bearer sk-live-value"),
-            "真值必须进 Authorization 头：{request}"
-        );
-        assert!(!out.to_string().contains("sk-live-value"), "真值不得进输出");
-        std::env::remove_var("FLOW_SECRET_TEST_LLM_KEY");
-
-        // 名称未配置：fatal（参数错误，重试无意义），消息点名环境变量
-        let llm = node(
-            "llm",
-            json!({"api_key": "TEST_LLM_MISSING", "model": "m", "prompt": "p"}),
+    async fn missing_secret_name_is_fatal_with_env_hint() {
+        let email = node(
+            "email",
+            json!({"api_key": "TEST_EMAIL_MISSING", "from": "a@b.c", "to": "d@e.f",
+                   "subject": "s", "body": "b"}),
         );
         let err = execute(
-            &ctx(llm, json!({}), HashMap::new()),
+            &ctx(email, json!({}), HashMap::new()),
             &CancellationToken::new(),
         )
         .await
         .unwrap_err();
         assert!(!err.retryable, "{}", err.message);
         assert!(
-            err.message.contains("FLOW_SECRET_TEST_LLM_MISSING"),
+            err.message.contains("FLOW_SECRET_TEST_EMAIL_MISSING"),
             "错误消息必须提示环境变量名：{}",
             err.message
         );
@@ -1248,9 +1408,9 @@ mod tests {
         assert!(err.message.contains("8 MiB"), "{}", err.message);
     }
 
-    /// llm 的错误分类：429/5xx 可重试，其余 4xx fatal。
+    /// email（post_json_bearer）的错误分类：429/5xx 可重试，其余 4xx fatal。
     #[tokio::test]
-    async fn llm_error_classification_matches_http_habits() {
+    async fn email_error_classification_matches_http_habits() {
         // api_key 是密钥名称（x-secret）：字面量也要经 FLOW_SECRET_<名称> 解析
         std::env::set_var("FLOW_SECRET_TEST_CLS_KEY", "sk-x");
         for (status_line, retryable) in [
@@ -1260,15 +1420,16 @@ mod tests {
             ("401 Unauthorized", false),
         ] {
             let (addr, _seen) = mock_server(status_line, r#"{"error":"x"}"#);
-            let llm = node(
-                "llm",
+            let email = node(
+                "email",
                 json!({
-                    "base_url": format!("http://{addr}"),
-                    "api_key": "TEST_CLS_KEY", "model": "m", "prompt": "p"
+                    "endpoint": format!("http://{addr}/emails"),
+                    "api_key": "TEST_CLS_KEY",
+                    "from": "a@b.c", "to": "d@e.f", "subject": "s", "body": "b"
                 }),
             );
             let err = execute(
-                &ctx(llm, json!({}), HashMap::new()),
+                &ctx(email, json!({}), HashMap::new()),
                 &CancellationToken::new(),
             )
             .await

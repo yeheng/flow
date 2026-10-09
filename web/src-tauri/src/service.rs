@@ -89,12 +89,15 @@ impl Services {
         };
         let (state, _secrets) =
             flow_rpc::AppState::for_production(backend.clone(), config_state, &data_dir).await;
-        let flow = flow_rpc::build_module(state.clone())
-            .map_err(|e| e.to_string())?
-            .into();
-        let journal_methods = flow_rpc::journal_v2::module(journal.clone(), token.clone())
-            .map_err(|e| e.to_string())?
-            .into();
+        // 主服务与 /journal 工作区同一 v2 模块（产品面全量；v1 RPC 面退役）
+        let journal_methods: Methods = flow_rpc::journal_v2::module_product(
+            journal.clone(),
+            token.clone(),
+            Some(state.clone()),
+        )
+        .map_err(|e| e.to_string())?
+        .into();
+        let flow = journal_methods.clone();
         let downloads = flow_rpc::journal_download::router(journal.clone(), token.clone())
             .map_err(|e| e.to_string())?;
         // Only incoming webhooks need HTTP. RPC and downloads stay inside the process.
@@ -144,13 +147,31 @@ impl Services {
             return Err("local service is stopping".into());
         }
         let module = match service {
-            Service::Flow => &self.flow,
-            Service::Journal => {
+            Service::Flow | Service::Journal => {
                 let object = params
                     .as_object_mut()
-                    .ok_or("journal parameters must be an object")?;
+                    .ok_or("parameters must be an object")?;
                 // Never accept a network token from the desktop renderer.
                 object.insert("_token".into(), json!(self.token));
+                // v2 协议：写命令必须有幂等键。桌面调用方（渲染层）不感知
+                // 协议细节——这里为缺失 request_id 的写命令补一个（一次
+                // 调用一个键 = v1 的一次交付语义）。
+                const WRITE_PREFIXES: &[&str] = &[
+                    "workflow.create", "workflow.update", "workflow.publish", "workflow.delete",
+                    "run.start", "run.cancel", "run.signal", "run.adjudicate", "schedule.",
+                    "webhook.", "template.", "secrets.set", "secrets.delete", "config.update",
+                ];
+                let is_write = WRITE_PREFIXES
+                    .iter()
+                    .any(|p| method == *p || method.starts_with(&format!("{p}.")));
+                if is_write
+                    && !object
+                        .get("request_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.is_empty())
+                {
+                    object.insert("request_id".into(), json!(uuid::Uuid::new_v4().to_string()));
+                }
                 &self.journal_methods
             }
         };

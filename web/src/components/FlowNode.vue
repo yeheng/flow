@@ -37,7 +37,7 @@ const icons: Record<string, string> = {
   http_call:
     '<circle cx="8" cy="8" r="5.5"/><path d="M2.5 8h11M8 2.5c-3.2 3.2-3.2 7.8 0 11M8 2.5c3.2 3.2 3.2 7.8 0 11"/>',
   human_task: '<circle cx="8" cy="5" r="2.2"/><path d="M3.5 13c.6-2.6 2.4-4 4.5-4s3.9 1.4 4.5 4"/>',
-  llm: '<path d="M8 1.8l1.5 4.7L14.2 8l-4.7 1.5L8 14.2 6.5 9.5 1.8 8l4.7-1.5Z"/>',
+  harness: '<path d="M8 1.8l1.5 4.7L14.2 8l-4.7 1.5L8 14.2 6.5 9.5 1.8 8l4.7-1.5Z"/>',
   email: '<rect x="2" y="3.5" width="12" height="9" rx="1.5"/><path d="M2.5 4.5 8 9l5.5-4.5"/>',
   sub_workflow:
     '<rect x="2.5" y="2.5" width="8" height="8" rx="1.5"/><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/>',

@@ -55,7 +55,7 @@ pub use flow_engine::{
 
 pub mod execution;
 pub mod journal;
-mod journal_arm;
+pub mod journal_arm;
 mod journal_commands;
 mod journal_driver;
 mod journal_execution;

@@ -1430,17 +1430,10 @@ dependencies = [
 name = "flow-store"
 version = "0.1.0"
 dependencies = [
- "chrono",
- "flow-dto",
- "hex",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "sqlx",
- "thiserror 2.0.21",
  "tokio",
- "tracing",
- "uuid",
 ]
 
 [[package]]

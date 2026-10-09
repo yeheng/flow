@@ -27,7 +27,7 @@ async fn embedded_flow_runs_streams_and_persists_without_a_rpc_listener() {
         json!({"name":"desktop"}),
     )
     .await;
-    let id = created["result"]["workflow_id"]
+    let id = created["result"]["result"]["workflow_id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -38,7 +38,7 @@ async fn embedded_flow_runs_streams_and_persists_without_a_rpc_listener() {
         json!({"workflow_id":id,"definition":definition()}),
     )
     .await;
-    assert_eq!(updated["result"]["version"], 1);
+    assert_eq!(updated["result"]["result"]["version"], 1);
     assert!(call(
         &host,
         Service::Flow,
@@ -48,17 +48,6 @@ async fn embedded_flow_runs_streams_and_persists_without_a_rpc_listener() {
     .await
     .get("error")
     .is_none());
-    let service = host.services.clone();
-    let (_, mut events) = host
-        .runtime
-        .spawn(async move {
-            service
-                .request(Service::Flow, "run.subscribe".into(), json!({}))
-                .await
-                .unwrap()
-        })
-        .await
-        .unwrap();
     let started = call(
         &host,
         Service::Flow,
@@ -66,8 +55,24 @@ async fn embedded_flow_runs_streams_and_persists_without_a_rpc_listener() {
         json!({"workflow_id":id,"input":{"hello":"desktop"}}),
     )
     .await;
-    assert!(started["result"]["run_id"].is_string(), "{started}");
-    let run = started["result"]["run_id"].clone();
+    assert!(started["result"]["result"]["run_id"].is_string(), "{started}");
+    let run = started["result"]["result"]["run_id"].clone();
+    let service = host.services.clone();
+    let subscribe_run = run.clone();
+    let (_, mut events) = host
+        .runtime
+        .spawn(async move {
+            service
+                .request(
+                    Service::Flow,
+                    "run.subscribe".into(),
+                    json!({"run_id": subscribe_run, "event_format": "envelope"}),
+                )
+                .await
+                .unwrap()
+        })
+        .await
+        .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let event: Value = serde_json::from_str(events.recv().await.unwrap().get()).unwrap();
@@ -79,12 +84,12 @@ async fn embedded_flow_runs_streams_and_persists_without_a_rpc_listener() {
     .await
     .unwrap();
     drop(events);
-    let record = call(&host, Service::Flow, "run.get", json!({"run_id":run})).await;
+    let record = call(&host, Service::Flow, "run.get.full", json!({"run_id":run})).await;
     assert_eq!(record["result"]["run"]["status"], "succeeded");
     host.shutdown().unwrap();
     drop(host);
     let reopened = Host::start(root.path().to_path_buf()).unwrap();
-    let list = call(&reopened, Service::Flow, "workflow.list", json!({})).await;
+    let list = call(&reopened, Service::Flow, "workflow.list.full", json!({})).await;
     assert_eq!(list["result"]["workflows"][0]["workflow_id"], id);
     reopened.shutdown().unwrap();
 }
@@ -105,7 +110,7 @@ async fn journal_uses_separate_authority_and_native_token() {
     assert_eq!(reply["result"]["result"], replay["result"]["result"]);
     // M4 后主服务与 journal 工作区同源（v2 唯一权威）：journal 创建的
     // 工作流对 Flow 服务立即可见
-    let flow_list = call(&host, Service::Flow, "workflow.list", json!({})).await;
+    let flow_list = call(&host, Service::Flow, "workflow.list.full", json!({})).await;
     assert_eq!(
         flow_list["result"]["workflows"].as_array().unwrap().len(),
         1,

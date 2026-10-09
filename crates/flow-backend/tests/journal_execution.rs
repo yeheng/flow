@@ -214,43 +214,42 @@ async fn integration_adapters_capture_results_without_persisting_resolved_creden
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
-        for _ in 0..2 {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0; 4096];
-            loop {
-                let n = socket.read(&mut buffer).await.unwrap();
-                assert!(n > 0);
-                request.extend_from_slice(&buffer[..n]);
-                if let Some(end) = request.windows(4).position(|v| v == b"\r\n\r\n") {
-                    let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
-                    let length = headers
-                        .lines()
-                        .find_map(|l| l.strip_prefix("content-length: "))
-                        .unwrap()
-                        .parse::<usize>()
-                        .unwrap();
-                    if request.len() >= end + 4 + length {
-                        break;
-                    }
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0; 4096];
+        loop {
+            let n = socket.read(&mut buffer).await.unwrap();
+            assert!(n > 0);
+            request.extend_from_slice(&buffer[..n]);
+            if let Some(end) = request.windows(4).position(|v| v == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                let length = headers
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length: "))
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                if request.len() >= end + 4 + length {
+                    break;
                 }
             }
-            let request = String::from_utf8(request).unwrap();
-            assert!(request
-                .to_lowercase()
-                .contains("authorization: bearer adapter-private-test-value"));
-            let body=if request.starts_with("POST /chat/completions ") {json!({"choices":[{"message":{"content":"answer"}}],"model":"test","usage":{"total_tokens":3}})}else{assert!(request.starts_with("POST /emails "));json!({"id":"mail-1"})}.to_string();
-            socket
-                .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    )
-                    .as_bytes(),
-                )
-                .await
-                .unwrap();
         }
+        let request = String::from_utf8(request).unwrap();
+        assert!(request
+            .to_lowercase()
+            .contains("authorization: bearer adapter-private-test-value"));
+        assert!(request.starts_with("POST /emails "));
+        let body=json!({"id":"mail-1"}).to_string();
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
     });
     std::env::set_var("FLOW_SECRET_V2_ADAPTER_TEST", "adapter-private-test-value");
     let root = temp();
@@ -260,14 +259,14 @@ async fn integration_adapters_capture_results_without_persisting_resolved_creden
     backend.start_execution().await.unwrap();
     for (kind, params, expected) in [
         (
-            "llm",
-            json!({"api_key":"V2_ADAPTER_TEST","base_url":format!("http://{addr}"),"model":"test","prompt":"hello"}),
-            json!({"content":"answer","model":"test","usage":{"total_tokens":3}}),
-        ),
-        (
             "email",
             json!({"api_key":"V2_ADAPTER_TEST","endpoint":format!("http://{addr}/emails"),"from":"a@test","to":"b@test","subject":"test","body":"hello"}),
             json!({"status":200,"id":"mail-1"}),
+        ),
+        (
+            "harness",
+            json!({"command":"sh","args":["-c","cat; echo warn >&2"],"prompt":"hello"}),
+            json!({"exit_code":0,"stdout":"hello","stderr":"warn\n"}),
         ),
     ] {
         let workflow=install(&backend,json!({"nodes":[{"id":"s","type":"start"},{"id":"a","type":kind,"params":params},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"a"},{"from":"a","to":"e"}]})).await;

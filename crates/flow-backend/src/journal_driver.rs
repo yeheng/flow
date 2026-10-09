@@ -382,7 +382,7 @@ async fn execute(
             None,
         ),
         NodeType::Script | NodeType::Condition => attempt.compute(node, &prepared, logger).await?,
-        kind @ (NodeType::HttpCall | NodeType::Llm | NodeType::Email) => {
+        kind @ (NodeType::HttpCall | NodeType::Email) => {
             let run = attempt.snapshot().await?;
             let previous = run.nodes[&attempt.node_id]
                 .operation
@@ -393,6 +393,21 @@ async fn execute(
                     attempt.http_output(&previous, kind).await?
                 } else {
                     attempt.http(&prepared, kind).await?
+                },
+                None,
+            )
+        }
+        NodeType::Harness => {
+            let run = attempt.snapshot().await?;
+            let previous = run.nodes[&attempt.node_id]
+                .operation
+                .as_ref()
+                .and_then(|o| o.outcome.clone());
+            (
+                if let Some(previous) = previous {
+                    attempt.harness_output(&previous).await?
+                } else {
+                    attempt.harness(&prepared).await?
                 },
                 None,
             )

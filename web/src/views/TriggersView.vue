@@ -116,11 +116,12 @@ async function onDeleteSchedule(s: Schedule): Promise<void> {
 }
 
 function hookUrl(w: Webhook): string {
-  return `${webhookBase()}/hook/${w.token}`;
+  return `${webhookBase()}/hooks/${w.token}`;
 }
 
 function curlExample(w: Webhook): string {
-  return `curl -X POST ${hookUrl(w)} -H 'Content-Type: application/json' -d '{"key":"value"}'`;
+  // v2 入口：Bearer 认证（token = 部署令牌 FLOW_JOURNAL_TOKEN）
+  return `curl -X POST ${hookUrl(w)} -H 'Authorization: Bearer $FLOW_TOKEN' -H 'Content-Type: application/json' -d '{"key":"value"}'`;
 }
 
 async function onCopy(w: Webhook): Promise<void> {

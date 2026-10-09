@@ -83,11 +83,11 @@ fn definition(output: i64) -> Value {
     })
 }
 
-fn llm_def(api_key: &str) -> Value {
+fn email_def(api_key: &str) -> Value {
     json!({
         "nodes": [
             {"id":"s", "type":"start"},
-            {"id":"n", "type":"llm", "params":{"api_key": api_key, "model": "m", "prompt": "p"}},
+            {"id":"n", "type":"email", "params":{"api_key": api_key, "from": "a@b.c", "to": "d@e.f", "subject": "s", "body": "b"}},
             {"id":"e", "type":"end"}
         ],
         "edges": [{"from":"s", "to":"n"}, {"from":"n", "to":"e"}]
@@ -141,7 +141,7 @@ async fn workflow_update_validates_secret_names_exist() {
     let bad = f
         .call(
             "workflow.update",
-            json!({"workflow_id": f.workflow, "definition": llm_def("TEST_RPC_MISSING")}),
+            json!({"workflow_id": f.workflow, "definition": email_def("TEST_RPC_MISSING")}),
         )
         .await;
     assert_eq!(bad["error"]["code"], -32010, "{bad}");
@@ -155,7 +155,7 @@ async fn workflow_update_validates_secret_names_exist() {
     let ok = f
         .call(
             "workflow.update",
-            json!({"workflow_id": f.workflow, "definition": llm_def("TEST_RPC_OK")}),
+            json!({"workflow_id": f.workflow, "definition": email_def("TEST_RPC_OK")}),
         )
         .await;
     assert!(ok.get("error").is_none(), "{ok}");

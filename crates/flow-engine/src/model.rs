@@ -17,8 +17,8 @@ pub enum NodeType {
     HumanTask,
     /// 调用另一个已发布工作流作为子 run，等待其终态并透传输出
     SubWorkflow,
-    /// 调 OpenAI 兼容的 chat/completions 接口，输出 content/model/usage
-    Llm,
+    /// 外部 agent CLI（kimi / claude / codex 等）：prompt 经 stdin 传入，stdout 作为输出
+    Harness,
     /// 经 HTTP API（Resend 兼容格式）发邮件
     Email,
 }
@@ -40,7 +40,7 @@ const NODE_TYPE_TABLE: [(NodeType, &str); 10] = [
     (NodeType::HttpCall, "http_call"),
     (NodeType::HumanTask, "human_task"),
     (NodeType::SubWorkflow, "sub_workflow"),
-    (NodeType::Llm, "llm"),
+    (NodeType::Harness, "harness"),
     (NodeType::Email, "email"),
 ];
 
@@ -55,7 +55,7 @@ impl NodeType {
         NodeType::HttpCall,
         NodeType::HumanTask,
         NodeType::SubWorkflow,
-        NodeType::Llm,
+        NodeType::Harness,
         NodeType::Email,
     ];
 
@@ -76,7 +76,7 @@ impl NodeType {
 
     /// 崩溃后是否不可安全重放：有外部副作用的节点必须人工裁决。
     pub fn has_side_effect(self) -> bool {
-        matches!(self, NodeType::HttpCall | NodeType::Llm | NodeType::Email)
+        matches!(self, NodeType::HttpCall | NodeType::Harness | NodeType::Email)
     }
 
     /// 能力描述的**主体**（`nodetypes.list` 单条去掉 `"type"` 字段）。
@@ -160,8 +160,10 @@ impl NodeType {
                         "method": {"type": "string", "enum": HTTP_METHODS, "default": "GET", "x-label": "方法"},
                         "url": {"type": "string", "x-label": "URL",
                                 "x-help": "支持 ${input.x} / ${nodes.n2.y} 模板（${} 内不能含 }）"},
-                        "headers": {"x-widget": "json", "default": {}, "x-label": "请求头"},
+                        "headers": {"x-widget": "key-value", "default": {}, "x-label": "请求头"},
                         "body": {"x-widget": "json", "x-label": "请求体"},
+                        "proxy": {"type": "string", "x-label": "代理",
+                                  "x-help": "http(s)://[user:pass@]host:port，留空直连"},
                         "timeout_ms": {"type": "integer", "default": 30000, "x-label": "HTTP 超时（毫秒）"}
                     }
                 },
@@ -195,26 +197,20 @@ impl NodeType {
                 },
                 "supports_retry": true
             }),
-            NodeType::Llm => serde_json::json!({
-                "label": "LLM 调用",
+            NodeType::Harness => serde_json::json!({
+                "label": "Harness 代理",
                 "category": "ai",
                 "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
                 "params_schema": {
                     "type": "object",
-                    "required": ["api_key", "model", "prompt"],
+                    "required": ["command", "prompt"],
                     "properties": {
-                        "base_url": {"type": "string", "default": "https://api.openai.com/v1", "x-label": "API 地址",
-                                     "x-help": "OpenAI 兼容端点，请求发往 {base_url}/chat/completions"},
-                        "api_key": {"type": "string", "x-secret": true, "x-label": "API 密钥名称",
-                                    "x-help": "只存密钥名称（如 OPENAI_KEY），真值来自 FLOW_SECRET_<名称> 环境变量；已配置的名称见 secrets.list"},
-                        "model": {"type": "string", "x-label": "模型"},
-                        "system": {"type": "string", "x-label": "系统提示"},
-                        "prompt": {"type": "string", "x-widget": "code", "x-label": "提示词",
-                                   "x-help": "支持 ${input.x} / ${nodes.n.y} 模板"},
-                        "temperature": {"type": "number", "x-label": "温度"},
-                        "max_tokens": {"type": "integer", "x-label": "最大 token 数"},
-                        "json_mode": {"type": "boolean", "default": false, "x-label": "JSON 模式",
-                                      "x-help": "开启后请求带 response_format: {\"type\":\"json_object\"}"}
+                        "command": {"type": "string", "x-label": "命令",
+                                    "x-help": "要执行的 harness CLI（如 kimi / claude / codex）；prompt 经 stdin 传入，stdout 作为输出"},
+                        "prompt": {"type": "string", "x-widget": "code", "x-label": "提示词"},
+                        "args": {"type": "array", "items": {"type": "string"}, "x-widget": "json", "x-label": "额外参数"},
+                        "workdir": {"type": "string", "x-label": "工作目录"},
+                        "timeout_ms": {"type": "number", "default": 300000, "x-label": "超时 (ms)"}
                     }
                 },
                 "supports_retry": true,
@@ -321,7 +317,7 @@ impl NodeType {
     ///
     /// **从 descriptor 的 `x-opaque: true` 派生**，不另写一张表。不能用
     /// `x-widget: "code"` 代替——那只是「前端用代码编辑器渲染」的 UI 提示，
-    /// `llm.prompt` 与 `email.body` 同样是 `x-widget: code`，但它们**要**被展开
+    /// `harness.prompt` 与 `email.body` 同样是 `x-widget: code`，但它们**要**被展开
     /// （用户在提示词里写 `${input.x}`）。`x-opaque` 是「这段内容是 flow 自己
     /// 的语法，不参与展开」的显式声明。
     ///
@@ -1268,7 +1264,7 @@ mod tests {
             "http_call",
             "human_task",
             "sub_workflow",
-            "llm",
+            "harness",
             "email",
         ] {
             let parsed = NodeType::parse(kind).unwrap_or_else(|| panic!("{kind} 应可解析"));
@@ -1285,8 +1281,8 @@ mod tests {
         assert!(NodeType::parse("nope").is_none());
         assert!(NodeType::parse("").is_none());
 
-        // http_call / llm / email 有外部副作用（崩溃后不可安全重放）
-        for kind in [NodeType::HttpCall, NodeType::Llm, NodeType::Email] {
+        // http_call / harness / email 有外部副作用（崩溃后不可安全重放）
+        for kind in [NodeType::HttpCall, NodeType::Harness, NodeType::Email] {
             assert!(kind.has_side_effect(), "{kind:?} 应有副作用");
         }
         for kind in [
@@ -1299,17 +1295,16 @@ mod tests {
         }
     }
 
-    /// x-secret 参数就是 llm / email 的 `api_key`，且**只在**这两个类型上。
+    /// x-secret 参数就是 email 的 `api_key`，且**只在**这个类型上。
     ///
     /// 清单已从 descriptor 派生（`x-secret: true` 扫描），所以这里断言的是
     /// 「哪些类型该有密钥」这个业务事实，而不是「派生是否一致」——后者已由
     /// 派生本身保证，再写一遍只是同义反复。
     #[test]
     fn secret_params_are_the_expected_keys() {
-        assert_eq!(NodeType::Llm.secret_params(), vec!["api_key"]);
         assert_eq!(NodeType::Email.secret_params(), vec!["api_key"]);
         for kind in NodeType::ALL {
-            let expected = matches!(kind, NodeType::Llm | NodeType::Email);
+            let expected = matches!(kind, NodeType::Email);
             assert_eq!(
                 !kind.secret_params().is_empty(),
                 expected,
@@ -1356,7 +1351,7 @@ mod tests {
     }
 
     /// `opaque_params`（不参与 `${}` 展开的代码字段）只有 script.code 与
-    /// condition.expr 两个——llm.prompt / email.body 虽是 `x-widget: code`，
+    /// condition.expr 两个——harness.prompt / email.body 虽是 `x-widget: code`，
     /// 但**要**被展开，所以不能带 `x-opaque`。
     #[test]
     fn opaque_params_are_exactly_the_js_bearing_fields() {
@@ -1373,7 +1368,7 @@ mod tests {
             );
         }
         // 带 x-widget: code 但要展开的两个字段，不得被误标为 opaque
-        for (kind, key) in [(NodeType::Llm, "prompt"), (NodeType::Email, "body")] {
+        for (kind, key) in [(NodeType::Harness, "prompt"), (NodeType::Email, "body")] {
             assert!(
                 !kind.opaque_params().contains(&key),
                 "{kind:?}.{key} 是用户数据（要展开），不能标 x-opaque"
@@ -1414,24 +1409,24 @@ mod tests {
         assert_eq!(NodeType::parse("nope"), None);
     }
 
-    /// llm / email 的必填参数校验。
+    /// harness / email 的必填参数校验。
     #[test]
-    fn llm_and_email_require_their_params() {
-        let llm = def(
+    fn harness_and_email_require_their_params() {
+        let harness = def(
             vec![
                 node("s", "start"),
-                json!({"id": "n", "type": "llm", "params": {"model": "m"}}),
+                json!({"id": "n", "type": "harness", "params": {"command": "kimi"}}),
                 node("e", "end"),
             ],
             vec![json!({"from":"s","to":"n"}), json!({"from":"n","to":"e"})],
         );
-        let err = llm.validate().unwrap_err();
-        assert!(err.contains("api_key"), "{err}");
+        let err = harness.validate().unwrap_err();
+        assert!(err.contains("prompt"), "{err}");
 
         let ok = def(
             vec![
                 node("s", "start"),
-                json!({"id": "n", "type": "llm", "params": {"api_key": "K", "model": "m", "prompt": "p"}}),
+                json!({"id": "n", "type": "harness", "params": {"command": "kimi", "prompt": "p"}}),
                 node("e", "end"),
             ],
             vec![json!({"from":"s","to":"n"}), json!({"from":"n","to":"e"})],

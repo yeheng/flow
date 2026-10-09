@@ -460,9 +460,10 @@ impl TaskRunner {
                 self.compute(node, kind, prepared, inputs, audit, logger)
                     .await
             }
-            kind @ (NodeType::HttpCall | NodeType::Llm | NodeType::Email) => {
+            kind @ (NodeType::HttpCall | NodeType::Email) => {
                 self.http_node(node, kind, prepared, inputs, audit).await
             }
+            NodeType::Harness => self.harness_node(node, prepared, inputs, audit).await,
             NodeType::Delay => {
                 let params = materialize_prepared_params(self, prepared).await?;
                 let ms = params["ms"]
@@ -673,7 +674,7 @@ impl TaskRunner {
         }
     }
 
-    /// http/llm/email：请求构造→许可→调用→Outcome→输出（I07 执行器侧）。
+    /// http/email：请求构造→许可→调用→Outcome→输出（I07 执行器侧）。
     async fn http_node(
         &mut self,
         _node: &Node,
@@ -696,18 +697,14 @@ impl TaskRunner {
         let mut params = self
             .materialize_stored(&prepared.params, "in:prepared-params", &mut budget)
             .await?;
-        if matches!(kind, NodeType::Llm | NodeType::Email) {
+        if kind == NodeType::Email {
             let name = params["api_key"]
                 .as_str()
                 .filter(|s| !s.trim().is_empty())
                 .ok_or_else(|| TaskError::Business("api_key secret reference required".into()))?
                 .to_owned();
-            let (url, body) = if kind == NodeType::Llm {
-                flow_engine::exec::llm_request(&params)
-            } else {
-                flow_engine::exec::email_request(&params)
-            }
-            .map_err(|e| TaskError::Business(e.message))?;
+            let (url, body) = flow_engine::exec::email_request(&params)
+                .map_err(|e| TaskError::Business(e.message))?;
             params = json!({
                 "method": "POST",
                 "url": url,
@@ -729,103 +726,24 @@ impl TaskRunner {
             "url": url,
             "headers": params.get("headers").cloned().unwrap_or(json!({})),
             "body": params.get("body").cloned().unwrap_or(Value::Null),
+            "proxy": params.get("proxy").cloned().unwrap_or(Value::Null),
             "credential": params.get("credential").cloned().unwrap_or(Value::Null),
         });
-        let request_bytes = flow_journal::codec::bounded_json(&request, INPUT_BUDGET)?;
-        let fingerprint = flow_journal::codec::digest(&request_bytes);
-        let operation_id = uuid::Uuid::now_v7().to_string();
-        // 大请求走 data 分块；小请求 inline。
-        let inline =
-            if request_bytes.len() <= flow_engine::execution_protocol::CONTROL_MAX_FRAME / 2 {
-                Some(StoredValue::Inline(request.clone()))
-            } else {
-                None
-            };
-        let transfer_id = if inline.is_none() {
-            let id = format!("op:{operation_id}");
-            let mut offset = 0u64;
-            for chunk in request_bytes.chunks(flow_engine::execution_protocol::TRANSFER_CHUNK_BYTES)
-            {
-                self.outbound
-                    .send(Message::TransferChunk {
-                        dispatch_id: self.dispatch_id.clone(),
-                        transfer_id: id.clone(),
-                        offset,
-                        bytes: base64::engine::general_purpose::STANDARD.encode(chunk),
-                        digest: hex::encode(sha2::Sha256::digest(chunk)),
-                    })
-                    .await
-                    .map_err(|e| TaskError::Closed(e.to_string()))?;
-                offset += chunk.len() as u64;
-            }
-            self.outbound
-                .send(Message::InputReady {
-                    dispatch_id: self.dispatch_id.clone(),
-                    transfer_id: id.clone(),
-                    total_bytes: request_bytes.len() as u64,
-                    digest: hex::encode(sha2::Sha256::digest(&request_bytes)),
-                })
-                .await
-                .map_err(|e| TaskError::Closed(e.to_string()))?;
-            Some(id)
-        } else {
-            None
-        };
-        self.outbound
-            .send(Message::RequestOperation {
-                dispatch_id: self.dispatch_id.clone(),
-                command_id: format!("op:{operation_id}"),
-                operation_id: operation_id.clone(),
-                request_fingerprint: fingerprint.clone(),
-                request: inline,
-                transfer_id,
-            })
-            .await
-            .map_err(|e| TaskError::Closed(e.to_string()))?;
-        // 等待许可（取消/断线唤醒）。
-        let credential = loop {
-            let message = tokio::time::timeout(
-                Duration::from_millis(DURABLE_WAIT_TIMEOUT_MS),
-                self.mail.recv(),
-            )
-            .await
-            .map_err(|_| TaskError::Closed("permit timeout".into()))?
-            .ok_or_else(|| TaskError::Closed("mailbox closed".into()))?;
-            match message {
-                Message::OperationPermit {
-                    dispatch_id,
-                    operation_id: permitted,
-                    request_fingerprint,
-                    credential,
-                    ..
-                } => {
-                    if dispatch_id != self.dispatch_id
-                        || permitted != operation_id
-                        || request_fingerprint != fingerprint
-                    {
-                        return Err(TaskError::Invalid("permit identity mismatch".into()));
-                    }
-                    break credential;
-                }
-                Message::Cancel { dispatch_id, .. } if dispatch_id == self.dispatch_id => {
-                    return Err(TaskError::Cancelled)
-                }
-                Message::AuditAck {
-                    durable_audit_seq,
-                    durable_bytes,
-                    ..
-                } => {
-                    let _ = self.ack_tx.send((durable_audit_seq, durable_bytes));
-                }
-                _ => continue,
-            }
-        };
+        let credential = self.authorize_operation(request).await?;
         // 执行外部调用（执行器进程内）。
         let http_method = reqwest::Method::from_bytes(method.as_bytes())
             .map_err(|e| TaskError::Invalid(e.to_string()))?;
-        let client = reqwest::Client::builder()
+        // proxy：非法 URL 是配置错误（授权前构建请求时就该失败的最晚一刻）
+        let mut builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
+            .retry(reqwest::retry::never());
+        if let Some(proxy) = params["proxy"].as_str().filter(|s| !s.trim().is_empty()) {
+            builder = builder.proxy(
+                reqwest::Proxy::all(proxy)
+                    .map_err(|e| TaskError::Business(format!("invalid proxy URL: {e}")))?,
+            );
+        }
+        let client = builder
             .build()
             .map_err(|e| TaskError::Invalid(e.to_string()))?;
         let mut request = client
@@ -919,7 +837,241 @@ impl TaskRunner {
         })
     }
 
-    /// 一期 `Attempt::http_output` 等价：状态/头/体组合或 llm/email 解析。
+    /// 外部操作的请求发送与许可等待（http/harness 共用）：RequestOperation →
+    /// OperationPermit（取消/断线唤醒）。返回许可携带的 credential（harness 不用）。
+    async fn authorize_operation(&mut self, request: Value) -> Result<Option<String>, TaskError> {
+        let request_bytes = flow_journal::codec::bounded_json(&request, INPUT_BUDGET)?;
+        let fingerprint = flow_journal::codec::digest(&request_bytes);
+        let operation_id = uuid::Uuid::now_v7().to_string();
+        // 大请求走 data 分块；小请求 inline。
+        let inline =
+            if request_bytes.len() <= flow_engine::execution_protocol::CONTROL_MAX_FRAME / 2 {
+                Some(StoredValue::Inline(request.clone()))
+            } else {
+                None
+            };
+        let transfer_id = if inline.is_none() {
+            let id = format!("op:{operation_id}");
+            let mut offset = 0u64;
+            for chunk in request_bytes.chunks(flow_engine::execution_protocol::TRANSFER_CHUNK_BYTES)
+            {
+                self.outbound
+                    .send(Message::TransferChunk {
+                        dispatch_id: self.dispatch_id.clone(),
+                        transfer_id: id.clone(),
+                        offset,
+                        bytes: base64::engine::general_purpose::STANDARD.encode(chunk),
+                        digest: hex::encode(sha2::Sha256::digest(chunk)),
+                    })
+                    .await
+                    .map_err(|e| TaskError::Closed(e.to_string()))?;
+                offset += chunk.len() as u64;
+            }
+            self.outbound
+                .send(Message::InputReady {
+                    dispatch_id: self.dispatch_id.clone(),
+                    transfer_id: id.clone(),
+                    total_bytes: request_bytes.len() as u64,
+                    digest: hex::encode(sha2::Sha256::digest(&request_bytes)),
+                })
+                .await
+                .map_err(|e| TaskError::Closed(e.to_string()))?;
+            Some(id)
+        } else {
+            None
+        };
+        self.outbound
+            .send(Message::RequestOperation {
+                dispatch_id: self.dispatch_id.clone(),
+                command_id: format!("op:{operation_id}"),
+                operation_id: operation_id.clone(),
+                request_fingerprint: fingerprint.clone(),
+                request: inline,
+                transfer_id,
+            })
+            .await
+            .map_err(|e| TaskError::Closed(e.to_string()))?;
+        // 等待许可（取消/断线唤醒）。
+        let credential = loop {
+            let message = tokio::time::timeout(
+                Duration::from_millis(DURABLE_WAIT_TIMEOUT_MS),
+                self.mail.recv(),
+            )
+            .await
+            .map_err(|_| TaskError::Closed("permit timeout".into()))?
+            .ok_or_else(|| TaskError::Closed("mailbox closed".into()))?;
+            match message {
+                Message::OperationPermit {
+                    dispatch_id,
+                    operation_id: permitted,
+                    request_fingerprint,
+                    credential,
+                    ..
+                } => {
+                    if dispatch_id != self.dispatch_id
+                        || permitted != operation_id
+                        || request_fingerprint != fingerprint
+                    {
+                        return Err(TaskError::Invalid("permit identity mismatch".into()));
+                    }
+                    break credential;
+                }
+                Message::Cancel { dispatch_id, .. } if dispatch_id == self.dispatch_id => {
+                    return Err(TaskError::Cancelled)
+                }
+                Message::AuditAck {
+                    durable_audit_seq,
+                    durable_bytes,
+                    ..
+                } => {
+                    let _ = self.ack_tx.send((durable_audit_seq, durable_bytes));
+                }
+                _ => continue,
+            }
+        };
+        Ok(credential)
+    }
+
+    /// harness：子进程执行（许可→spawn→Outcome→输出），与 http_node 同一条授权路径。
+    /// 退出码非 0 → outcome 留存、节点判死；超时/spawn 后 IO 失败 → Uncertain
+    /// （进程死前副作用未知）；spawn 失败 → 记录 spawn_error outcome 后 Business。
+    async fn harness_node(
+        &mut self,
+        _node: &Node,
+        prepared: &Prepared,
+        _inputs: &TaskInputs,
+        audit: &mut AuditStream,
+    ) -> Result<ResultOutcome, TaskError> {
+        // 恢复路径：已有 Outcome 直接派生输出，不重跑进程。
+        if let Some(outcome_value) = self.task.previous_outcome.clone() {
+            let outcome: StoredValue =
+                serde_json::from_value(outcome_value).map_err(TaskError::from)?;
+            let output = self.harness_output(&outcome, audit).await?;
+            return Ok(ResultOutcome::Success {
+                output,
+                branch: None,
+            });
+        }
+        let mut budget = INPUT_BUDGET;
+        let params = self
+            .materialize_stored(&prepared.params, "in:prepared-params", &mut budget)
+            .await?;
+        let (command, args, workdir, timeout_ms, prompt) =
+            flow_engine::exec::harness_request(&params).map_err(|e| TaskError::Business(e.message))?;
+        let request = json!({
+            "command": command,
+            "args": args,
+            "workdir": workdir,
+            "timeout_ms": timeout_ms,
+            "prompt": prompt,
+        });
+        self.authorize_operation(request).await?;
+        let mut child = match flow_engine::exec::harness_command(&command, &args, workdir.as_deref())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                // 进程从未启动：结果确定。记录 Outcome 后按业务失败收口
+                let outcome = StoredValue::inline(json!({"spawn_error": error.to_string()}))?;
+                let outcome_seq = audit.push(
+                    "operation_outcome",
+                    json!({"outcome": serde_json::to_value(&outcome)?}),
+                )?;
+                audit.await_durable(outcome_seq, &self.cancel).await?;
+                return Err(TaskError::Business(format!("harness spawn failed: {error}")));
+            }
+        };
+        use tokio::io::AsyncWriteExt;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| TaskError::Invalid("harness stdin unavailable".into()))?;
+        // 对端不读 stdin 提前退出时 EPIPE 不算失败——退出码会说明一切
+        match stdin.write_all(prompt.as_bytes()).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => return Err(TaskError::Uncertain(format!("harness stdin: {e}"))),
+        }
+        drop(stdin);
+        let output =
+            match tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait_with_output())
+                .await
+            {
+                Ok(Ok(output)) => output,
+                Ok(Err(e)) => return Err(TaskError::Uncertain(e.to_string())),
+                // 超时：wait_with_output 被 drop，kill_on_drop 杀掉子进程
+                Err(_) => {
+                    return Err(TaskError::Uncertain(format!(
+                        "harness timed out after {timeout_ms}ms (process killed)"
+                    )))
+                }
+            };
+        let raw_stored = store_bytes(audit, &self.journal_id, &output.stdout, ValueCodec::Bytes)
+            .await?;
+        // 捕获的原始字节留在本地装配器，供输出派生阶段复用（不重读 journal）。
+        let body_ref = match &raw_stored {
+            StoredValue::Ref(reference) => serde_json::to_value(reference)?,
+            StoredValue::Inline(value) => value.clone(),
+        };
+        let body_output_id = match &raw_stored {
+            StoredValue::Ref(reference) => reference.output_id.clone(),
+            StoredValue::Inline(_) => String::new(),
+        };
+        if !body_output_id.is_empty() {
+            self.transfers
+                .insert_ready(format!("op-body:{body_output_id}"), output.stdout);
+        }
+        // 字段名沿用 http 的 body_raw：恢复路径按这个名字重传原始字节
+        let outcome = StoredValue::inline(json!({
+            "exit_code": output.status.code(),
+            "body_raw": body_ref,
+            "stderr": flow_engine::exec::stderr_tail(&String::from_utf8_lossy(&output.stderr)),
+        }))?;
+        let outcome_seq = audit.push(
+            "operation_outcome",
+            json!({"outcome": serde_json::to_value(&outcome)?}),
+        )?;
+        audit.await_durable(outcome_seq, &self.cancel).await?;
+        let output = self.harness_output(&outcome, audit).await?;
+        Ok(ResultOutcome::Success {
+            output,
+            branch: None,
+        })
+    }
+
+    /// 一期 `Attempt::harness_output` 等价：Outcome → 节点输出（重跑同一派生）。
+    async fn harness_output(
+        &mut self,
+        outcome: &StoredValue,
+        audit: &mut AuditStream,
+    ) -> Result<StoredValue, TaskError> {
+        let outcome_value = match outcome {
+            StoredValue::Inline(value) => value.clone(),
+            StoredValue::Ref(_) => return Err(TaskError::Invalid("outcome must be inline".into())),
+        };
+        if let Some(error) = outcome_value["spawn_error"].as_str() {
+            return Err(TaskError::Business(format!("harness spawn failed: {error}")));
+        }
+        let exit_code = outcome_value["exit_code"].as_i64().map(|c| c as i32);
+        let stderr = outcome_value["stderr"].as_str().unwrap_or("").to_owned();
+        let raw: flow_journal::ValueRef =
+            serde_json::from_value(outcome_value["body_raw"].clone()).map_err(TaskError::from)?;
+        if raw.total_bytes > 8 * 1024 * 1024 {
+            return Err(TaskError::Business(
+                "integration decoding exceeds 8 MiB; raw outcome retained".into(),
+            ));
+        }
+        let stdout = self.raw_bytes(&raw).await?;
+        let output = flow_engine::exec::harness_output(
+            exit_code,
+            String::from_utf8_lossy(&stdout).into_owned(),
+            stderr,
+        )
+        .map_err(|e| TaskError::Business(format!("{}; outcome retained", e.message)))?;
+        store_value(audit, &self.journal_id, &output, 8 * 1024 * 1024).await
+    }
+
+    /// 一期 `Attempt::http_output` 等价：状态/头/体组合或 email 解析。
     async fn http_output(
         &mut self,
         outcome: &StoredValue,
@@ -935,7 +1087,7 @@ impl TaskRunner {
             .ok_or_else(|| TaskError::Invalid("invalid HTTP outcome".into()))?;
         let raw: flow_journal::ValueRef =
             serde_json::from_value(outcome_value["body_raw"].clone()).map_err(TaskError::from)?;
-        if matches!(kind, NodeType::Llm | NodeType::Email) {
+        if kind == NodeType::Email {
             if status >= 400 {
                 return Err(TaskError::Business(format!(
                     "HTTP {status}; outcome retained"
@@ -957,20 +1109,7 @@ impl TaskRunner {
                 None => return Err(TaskError::Invalid("outcome body bytes unavailable".into())),
             };
             let response: Value = serde_json::from_slice(&bytes)?;
-            let output = if kind == NodeType::Llm {
-                let content = response
-                    .pointer("/choices/0/message/content")
-                    .ok_or_else(|| {
-                        TaskError::Business(
-                            "LLM response missing choices[0].message.content; raw outcome retained"
-                                .into(),
-                        )
-                    })?
-                    .clone();
-                json!({"content": content, "model": response["model"], "usage": response["usage"]})
-            } else {
-                json!({"status": status, "id": response["id"]})
-            };
+            let output = json!({"status": status, "id": response["id"]});
             return store_value(audit, &self.journal_id, &output, 8 * 1024 * 1024).await;
         }
         // HTTP 输出：body 为完整 JSON 时原样嵌入，否则转义为文本。

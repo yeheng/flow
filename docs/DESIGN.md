@@ -281,7 +281,8 @@ Event 流 ──fold──> RunState {
 
 `Definition { nodes, edges }`（前端拖拽产物，整体作为不可变版本入库）。
 节点类型：`start`、`end`、`script`、`condition`、`delay`、`http_call`、`human_task`、
-`sub_workflow`、`llm`（OpenAI 兼容 chat/completions）、`email`（Resend 兼容发信）。
+`sub_workflow`、`harness`（外部 agent CLI，prompt 经 stdin 传入，stdout 作为输出）、
+`email`（Resend 兼容发信）。
 后两者是有外部副作用的集成节点（崩溃后不自动重放，§7 人工裁决），`has_side_effect`
 与 http_call 同类。
 
@@ -305,7 +306,7 @@ Event 流 ──fold──> RunState {
 （编译器会逼你加）。
 
 `x-opaque` 与 `x-widget: "code"` **不是一回事**：后者只是「前端用代码编辑器
-渲染」，`llm.prompt` / `email.body` 同样是 code 组件但**要**参与 `${}` 展开；
+渲染」，`harness.prompt` / `email.body` 同样是 code 组件但**要**参与 `${}` 展开；
 `x-opaque` 才是「这段内容是 flow 自己的 JS 语法，不参与展开」。
 
 `node_type_table_is_exhaustive` 钉住表与 enum 双向覆盖（数组长度由类型标注编译期
@@ -316,7 +317,7 @@ Event 流 ──fold──> RunState {
 
 1. 节点 id 非空且唯一；类型已知；按类型校验必填参数（清单来自 descriptor）
    （script: `code`，condition: `expr`，delay: `ms`，http_call: `url`，
-   sub_workflow: `workflow_id`，llm: `api_key`/`model`/`prompt`，
+   sub_workflow: `workflow_id`，harness: `command`/`prompt`，
    email: `api_key`/`from`/`to`/`subject`/`body`；
    method 若给出必须属于 `HTTP_METHODS`——该白名单与 `nodetypes.list`
    共用一份，拼写错误在发布时被拒而不是运行时炸 run）；
@@ -337,7 +338,7 @@ true 分支的下游跳掉，run 仍记 `succeeded`、输出为 null，全程无
 实测：修复前 `s → c(condition=true) → e` 配 `c(true)→e` + `c(false)→e` 时，
 condition 求值为真而 `e` 被 `branch_not_taken` 跳过。
 
-**密钥参数（x-secret）**：params_schema 里标 `x-secret` 的参数（llm / email 的
+**密钥参数（x-secret）**：params_schema 里标 `x-secret` 的参数（email 的
 `api_key`）在定义里只存**名称**，真值执行前从 `FLOW_SECRET_<名称>` 环境变量注入
 （`secrets.rs`）。`workflow.update` 提前校验每个名称都已配置，配置错误挡在
 落库前（`missing_secrets`）；模板名称要到执行期展开才能确定，缺失时节点 fatal。
@@ -471,10 +472,12 @@ condition 节点输出为表达式结果经 JSON 序列化后的值；引擎用 
 `params.retry { max_attempts (默认 1), backoff_ms (默认 0) }`。
 `NodeFailure.retryable` 决定引擎重试还是判死 run：
 
-- 可重试：连接失败/超时、HTTP 5xx、**响应体中途断流**、429 限流（仅 llm/email）；
-- 致命：JS 抛错、参数校验失败、HTTP 4xx（请求本身的问题）。
+- 可重试：连接失败/超时、HTTP 5xx、**响应体中途断流**、429 限流（仅 email）、
+  harness 超时/等待失败；
+- 致命：JS 抛错、参数校验失败、HTTP 4xx（请求本身的问题）、harness 非 0 退出
+  与 spawn 失败（命令不存在，重试无意义）。
 
-这份分类 http_call / llm / email 共用同一套习惯（后者经 `post_json_bearer`）。
+这份分类 http_call / email 共用同一套习惯（后者经 `post_json_bearer`）。
 
 退避计时器占一个 `Running` 槽位（不变量），到点后 `RetryDue` 重新派发，attempt+1。
 下游在此期间等待。**恢复一律等满 `backoff_ms`**（不续算剩余时间）：事件 `ts`
@@ -554,7 +557,7 @@ Postgres `PgChildLauncher` 经 `lease::create_run` 单事务创建子 run、
 | Running `human_task`，已有信号 | **补终态**（output=信号） | 信号已经持久化 |
 | Running `human_task`，无信号 | **继续等待**，不重复写 started | 等待无副作用 |
 | Running `sub_workflow` | **重放**：沿用已落盘 child_run_id，附着既有子 run | id 确定性派生且已随 node_started 落盘，重复 start 撞 RunExists 幂等 |
-「副作用节点」= `has_side_effect()` 的类型：`http_call` / `llm` / `email`——
+「副作用节点」= `has_side_effect()` 的类型：`http_call` / `harness` / `email`——
 三者恢复路径完全同构（无裁决信号一律 awaiting_resume，不自动重放）。
 | Failed{retryable:true} | **重建退避计时器**，等满整段 backoff 后下一次 attempt | 内存计时器不是权威；剩余时间不可续算（§6.5） |
 | Failed{retryable:false} | **保留 run 失败结论**，独立分支继续 | fold 已记录 fatal_error |
@@ -847,7 +850,7 @@ interrupt handler 超时中断（默认 2000ms，`timeout_ms` 可调）。
   唯一例外是 `NodeType::opaque_params`——script 的 `code` / condition 的 `expr`
   等用户 JS 字段，其中的 `${}` 是 JS 模板字面量，展开即破坏用户代码）。
   http_call 的 url/headers/body 只是这条规则的头号用户，delay 的 `ms`、
-  sub_workflow 的 `input_mapping`、llm/email 的 prompt/subject/body 等同规则生效。
+  sub_workflow 的 `input_mapping`、harness 的 prompt、email 的 subject/body 等同规则生效。
   展开由 driver 的 `start_node` 在**写 `node_started` 前**调用一次（展开结果 =
   输入面快照，§6.1），exec 层不再展开。展开的数据面与 `nodes` 一致：
   只读 `input`（run 输入）与直接前驱输出快照。
@@ -881,21 +884,25 @@ human_task/子 run 透传、事件日志 i64/u64 序列化）本就无损，重�
 ## 11. 外部 HTTP 调用语义
 
 http_call params 经 `${}` 统一展开后发请求（默认超时 30s；method 取自
-`HTTP_METHODS` 白名单，定义层校验后执行层再验一次）。
+`HTTP_METHODS` 白名单，定义层校验后执行层再验一次）。可选 `proxy`
+（`http(s)://[user:pass@]host:port`）按请求建独立 client，缺省用共享 client；
+代理 URL 非法是配置错误（fatal）。
 输出 `{status, headers, body}`（body 能解析为 JSON 则解析，否则原样字符串）。
-失败分类（llm / email 经 `post_json_bearer` 共用同一份，唯一补充是 429 限流
+失败分类（email 经 `post_json_bearer` 共用同一份，唯一补充是 429 限流
 也可重试）：
 
 - 连接失败/超时 → retryable（副作用不明确或未发生，交给重试策略）；
-- 5xx → retryable；4xx → fatal（请求本身的问题）；llm/email 另认 429 → retryable；
+- 5xx → retryable；4xx → fatal（请求本身的问题）；email 另认 429 → retryable；
 - **响应体读取失败（连接中途断开）→ retryable**——绝不带着 200 + 空 body 记成功。
 
-llm 节点（OpenAI 兼容 `{base_url}/chat/completions`，默认 `api.openai.com`）：
-输出 `{content, model, usage}`；`json_mode` 时请求带
-`response_format: {type: json_object}`，`system` 非空时进 messages[0]。
+harness 节点（外部 agent CLI：`command` + `args`，可选 `workdir`/`timeout_ms`
+默认 300s）：prompt 经 stdin 写入，捕获 stdout/stderr。退出码 0 → 输出
+`{exit_code, stdout, stderr, result?}`（stdout 去空白后能解析为 JSON 对象/数组
+时附 `result`）；非 0 → fatal，错误消息带 stderr 尾部；超时 → 杀进程
+（kill_on_drop）、retryable；spawn 失败（命令不存在）→ fatal。
 email 节点（Resend 兼容 `POST {endpoint}`，默认 `api.resend.com/emails`）：
 body 为 `{from, to, subject, text}`（纯文本正文），输出 `{status, id}`。
-两者的 `api_key` 是 x-secret 名称，执行前注入真值，只进 Authorization 头，
+email 的 `api_key` 是 x-secret 名称，执行前注入真值，只进 Authorization 头，
 不进输出/错误消息/事件。
 
 自动重试不保证外部副作用只发生一次：POST 超时或断流时下游仍可能已提交。
@@ -1180,7 +1187,7 @@ volume 上。Docker 只在容器**自己退出**时（`--rm`）回收匿名 volu
 
 ### v1/v2 已知语义差异（切换日的行为变更面，parity 安全网见 journal_parity.rs）
 
-- **retry 范围**：v1 对 retryable 的 http/llm/email 失败（5xx/超时/429）自动
+- **retry 范围**：v1 对 retryable 的 http/harness/email 失败（5xx/超时/429）自动
   重试（§6.5）；v2 的重试只覆盖纯计算节点（script/condition），外部操作
   失败一律进 uncertain 等待人工裁决——**绝不自动重发已授权的外部操作**
   （JSONL_DEVELOPMENT「不会自动重发未知外部操作」，v2 核心安全立场）。

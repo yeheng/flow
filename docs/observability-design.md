@@ -278,7 +278,8 @@ TimelineNode 加 `input`；LogLine/LogLevel/LogStream 接口。`api/flow.ts` **�
   `?api_key=…` 这类把凭据放 query 的接口很常见，而 JSON 脱敏管不到字符串。
   http_call 的请求行、以及 `node_failed.error` 里回显的 URL 都走它。
 - `node_failed.error` 里回显的上游响应体也过 `redact_value`（http_call /
-  llm / email 的失败消息）——错误消息是展示面，和 output 同规则。
+  email 的失败消息）——错误消息是展示面，和 output 同规则。harness 失败消息
+  只带 stderr 尾部（截尾 512 字节），不经 `redact_value`。
 - run 级 output（`run_completed.output`）**不脱敏**：它就是 `run.get` 那个数据面
   值，同名字段必须同值。
 - 子串匹配的代价：`password_policy`、`tokenizer` 这类合法字段会被误脱敏（安全侧

@@ -50,7 +50,7 @@ const PAGE_LIMIT: usize = 256;
 /// 订阅单轮最多连续页数（批间让出，长回放不垄断任务）。
 const POLL_PAGES: usize = 4;
 
-type Result<T> = std::result::Result<T, BackendError>;
+pub type Result<T> = std::result::Result<T, BackendError>;
 /// 订阅单轮扫描的产出（阻塞侧 → 异步侧）与两种轮询载荷。
 type PollOutput<T> = std::result::Result<T, flow_journal::Error>;
 type RunPollBatch = (
@@ -129,7 +129,7 @@ fn materialize(backend: &JournalBackend, stored: &StoredValue, limit: usize) -> 
 
 // ---- workflow ----
 
-pub(crate) async fn create_workflow(backend: &JournalBackend, name: &str) -> Result<String> {
+pub async fn create_workflow(backend: &JournalBackend, name: &str) -> Result<String> {
     let receipt = receipt(backend.workflow_create(name, None).await)?;
     receipt.result["workflow_id"]
         .as_str()
@@ -137,7 +137,7 @@ pub(crate) async fn create_workflow(backend: &JournalBackend, name: &str) -> Res
         .ok_or_else(|| internal("workflow.create receipt missing workflow_id"))
 }
 
-pub(crate) async fn update_workflow(
+pub async fn update_workflow(
     backend: &JournalBackend,
     workflow_id: &str,
     definition: &Value,
@@ -156,7 +156,7 @@ pub(crate) async fn update_workflow(
         .ok_or_else(|| internal("workflow.update receipt missing version"))
 }
 
-pub(crate) async fn publish(
+pub async fn publish(
     backend: &JournalBackend,
     workflow_id: &str,
     version: i64,
@@ -202,7 +202,7 @@ fn workflow_version(
     })
 }
 
-pub(crate) async fn get_version(
+pub async fn get_version(
     backend: &JournalBackend,
     workflow_id: &str,
     version: Option<i64>,
@@ -230,7 +230,7 @@ pub(crate) async fn get_version(
     }
 }
 
-pub(crate) async fn latest_published(
+pub async fn latest_published(
     backend: &JournalBackend,
     workflow_id: &str,
 ) -> Result<Option<i64>> {
@@ -243,7 +243,7 @@ pub(crate) async fn latest_published(
         .map(|(v, _)| *v as i64))
 }
 
-pub(crate) async fn list_versions(
+pub async fn list_versions(
     backend: &JournalBackend,
     workflow_id: &str,
 ) -> Result<Vec<WorkflowVersion>> {
@@ -274,7 +274,7 @@ fn workflow_summary(workflow: &JournalWorkflow) -> Result<WorkflowSummary> {
     })
 }
 
-pub(crate) async fn list_workflows(backend: &JournalBackend) -> Result<Vec<WorkflowSummary>> {
+pub async fn list_workflows(backend: &JournalBackend) -> Result<Vec<WorkflowSummary>> {
     let state = backend.state().await;
     let mut summaries = Vec::new();
     for workflow in state.workflows.values() {
@@ -285,7 +285,7 @@ pub(crate) async fn list_workflows(backend: &JournalBackend) -> Result<Vec<Workf
     Ok(summaries)
 }
 
-pub(crate) async fn delete_workflow(backend: &JournalBackend, workflow_id: &str) -> Result<()> {
+pub async fn delete_workflow(backend: &JournalBackend, workflow_id: &str) -> Result<()> {
     let state = backend.state().await;
     if !state.workflows.contains_key(workflow_id) {
         return Err(BackendError::WorkflowNotFound(workflow_id.to_string()));
@@ -325,7 +325,7 @@ impl VersionSource for JournalVersionSource {
     }
 }
 
-pub(crate) async fn create_run(
+pub async fn create_run(
     backend: &Arc<JournalBackend>,
     spec: CreateRun,
 ) -> Result<CreatedRun> {
@@ -386,7 +386,7 @@ fn run_record(backend: &JournalBackend, run: &JournalRun) -> Result<RunRecord> {
     })
 }
 
-pub(crate) async fn get_run(backend: &JournalBackend, run_id: &str) -> Result<RunRecord> {
+pub async fn get_run(backend: &JournalBackend, run_id: &str) -> Result<RunRecord> {
     let state = backend.state().await;
     let run = state
         .runs
@@ -395,7 +395,7 @@ pub(crate) async fn get_run(backend: &JournalBackend, run_id: &str) -> Result<Ru
     run_record(backend, run)
 }
 
-pub(crate) async fn list_runs(
+pub async fn list_runs(
     backend: &JournalBackend,
     workflow_id: Option<&str>,
     status: Option<&str>,
@@ -426,7 +426,7 @@ pub(crate) async fn list_runs(
         .collect()
 }
 
-pub(crate) async fn run_stats(
+pub async fn run_stats(
     backend: &JournalBackend,
     workflow_id: Option<&str>,
 ) -> Result<RunStats> {
@@ -461,7 +461,7 @@ pub(crate) async fn run_stats(
 }
 
 /// 单写者进程：非终态 run 即本进程正在驱动（执行循环随服务启动）。
-pub(crate) async fn is_live(backend: &JournalBackend, run_id: &str) -> bool {
+pub async fn is_live(backend: &JournalBackend, run_id: &str) -> bool {
     backend
         .state()
         .await
@@ -575,7 +575,7 @@ async fn run_state(backend: &JournalBackend, run: &JournalRun) -> Result<RunStat
     })
 }
 
-pub(crate) async fn snapshot(backend: &JournalBackend, run_id: &str) -> Result<RunState> {
+pub async fn snapshot(backend: &JournalBackend, run_id: &str) -> Result<RunState> {
     let state = backend.state().await;
     let run = state
         .runs
@@ -586,7 +586,7 @@ pub(crate) async fn snapshot(backend: &JournalBackend, run_id: &str) -> Result<R
 
 // ---- 信号 / 取消 ----
 
-pub(crate) async fn signal(backend: &JournalBackend, req: SignalRequest) -> Result<SignalAck> {
+pub async fn signal(backend: &JournalBackend, req: SignalRequest) -> Result<SignalAck> {
     let state = backend.state().await;
     let run = state
         .runs
@@ -687,7 +687,7 @@ pub(crate) async fn signal(backend: &JournalBackend, req: SignalRequest) -> Resu
     })
 }
 
-pub(crate) async fn cancel(
+pub async fn cancel(
     backend: &JournalBackend,
     run_id: &str,
     signal_id: Option<String>,
@@ -765,7 +765,7 @@ fn webhook_from_config(config: &Value) -> Result<Webhook> {
     })
 }
 
-pub(crate) async fn create_schedule(
+pub async fn create_schedule(
     backend: &JournalBackend,
     workflow_id: &str,
     cron_expr: &str,
@@ -798,7 +798,7 @@ pub(crate) async fn create_schedule(
     schedule_from_config(&receipt.result)
 }
 
-pub(crate) async fn list_schedules(
+pub async fn list_schedules(
     backend: &JournalBackend,
     workflow_id: Option<&str>,
 ) -> Result<Vec<Schedule>> {
@@ -813,7 +813,7 @@ pub(crate) async fn list_schedules(
     Ok(schedules)
 }
 
-pub(crate) async fn update_schedule(
+pub async fn update_schedule(
     backend: &JournalBackend,
     id: &str,
     cron_expr: Option<&str>,
@@ -851,7 +851,7 @@ pub(crate) async fn update_schedule(
     Ok(())
 }
 
-pub(crate) async fn delete_schedule(backend: &JournalBackend, id: &str) -> Result<()> {
+pub async fn delete_schedule(backend: &JournalBackend, id: &str) -> Result<()> {
     if !backend.state().await.schedules.contains_key(id) {
         return Err(BackendError::ScheduleNotFound(id.to_string()));
     }
@@ -872,7 +872,7 @@ pub(crate) async fn delete_schedule(backend: &JournalBackend, id: &str) -> Resul
 /// 触发去重：journal 的触发身份就是命令身份（scope = run.start:schedule:<id>，
 /// request_id = fire_at 键）。已提交过该触发点 → false；否则 true。
 /// 与 `trigger_start` 的内部幂等配合，并发双检也只会产生一个 run。
-pub(crate) async fn try_insert_fire(
+pub async fn try_insert_fire(
     backend: &JournalBackend,
     schedule_id: &str,
     fire_at: chrono::DateTime<chrono::Utc>,
@@ -887,7 +887,7 @@ pub(crate) async fn try_insert_fire(
 }
 
 /// journal 不预登记触发权（命令身份即去重），无需撤销。
-pub(crate) async fn delete_fire(
+pub async fn delete_fire(
     _backend: &JournalBackend,
     _schedule_id: &str,
     _fire_at: chrono::DateTime<chrono::Utc>,
@@ -895,7 +895,7 @@ pub(crate) async fn delete_fire(
     Ok(())
 }
 
-pub(crate) async fn create_webhook(backend: &JournalBackend, workflow_id: &str) -> Result<Webhook> {
+pub async fn create_webhook(backend: &JournalBackend, workflow_id: &str) -> Result<Webhook> {
     if !backend.state().await.workflows.contains_key(workflow_id) {
         return Err(BackendError::WorkflowNotFound(workflow_id.to_string()));
     }
@@ -919,7 +919,7 @@ pub(crate) async fn create_webhook(backend: &JournalBackend, workflow_id: &str) 
     webhook_from_config(&receipt.result)
 }
 
-pub(crate) async fn list_webhooks(
+pub async fn list_webhooks(
     backend: &JournalBackend,
     workflow_id: Option<&str>,
 ) -> Result<Vec<Webhook>> {
@@ -934,7 +934,7 @@ pub(crate) async fn list_webhooks(
     Ok(webhooks)
 }
 
-pub(crate) async fn get_webhook(backend: &JournalBackend, token: &str) -> Result<Option<Webhook>> {
+pub async fn get_webhook(backend: &JournalBackend, token: &str) -> Result<Option<Webhook>> {
     let state = backend.state().await;
     match state.webhooks.get(token) {
         Some(config) => Ok(Some(webhook_from_config(config)?)),
@@ -942,7 +942,7 @@ pub(crate) async fn get_webhook(backend: &JournalBackend, token: &str) -> Result
     }
 }
 
-pub(crate) async fn set_webhook_enabled(
+pub async fn set_webhook_enabled(
     backend: &JournalBackend,
     token: &str,
     enabled: bool,
@@ -964,7 +964,7 @@ pub(crate) async fn set_webhook_enabled(
     Ok(())
 }
 
-pub(crate) async fn delete_webhook(backend: &JournalBackend, token: &str) -> Result<()> {
+pub async fn delete_webhook(backend: &JournalBackend, token: &str) -> Result<()> {
     if !backend.state().await.webhooks.contains_key(token) {
         return Err(BackendError::WebhookNotFound(token.to_string()));
     }
@@ -1018,7 +1018,7 @@ fn map_template_error(error: BackendError, name: &str) -> BackendError {
     }
 }
 
-pub(crate) async fn template_create(
+pub async fn template_create(
     backend: &JournalBackend,
     name: &str,
     category: Option<&str>,
@@ -1042,7 +1042,7 @@ pub(crate) async fn template_create(
     template_from_config(&receipt.result)
 }
 
-pub(crate) async fn template_list(backend: &JournalBackend) -> Result<Vec<NodeTemplateSummary>> {
+pub async fn template_list(backend: &JournalBackend) -> Result<Vec<NodeTemplateSummary>> {
     let state = backend.state().await;
     let mut templates: Vec<NodeTemplateSummary> = state
         .templates
@@ -1076,7 +1076,7 @@ pub(crate) async fn template_list(backend: &JournalBackend) -> Result<Vec<NodeTe
     Ok(templates)
 }
 
-pub(crate) async fn template_get(backend: &JournalBackend, id: &str) -> Result<NodeTemplate> {
+pub async fn template_get(backend: &JournalBackend, id: &str) -> Result<NodeTemplate> {
     let state = backend.state().await;
     let config = state
         .templates
@@ -1085,7 +1085,7 @@ pub(crate) async fn template_get(backend: &JournalBackend, id: &str) -> Result<N
     template_from_config(config)
 }
 
-pub(crate) async fn template_update(
+pub async fn template_update(
     backend: &JournalBackend,
     id: &str,
     name: Option<&str>,
@@ -1123,7 +1123,7 @@ pub(crate) async fn template_update(
     template_from_config(&receipt.result)
 }
 
-pub(crate) async fn template_delete(backend: &JournalBackend, id: &str) -> Result<bool> {
+pub async fn template_delete(backend: &JournalBackend, id: &str) -> Result<bool> {
     if !backend.state().await.templates.contains_key(id) {
         return Ok(false);
     }
@@ -1144,7 +1144,7 @@ pub(crate) async fn template_delete(backend: &JournalBackend, id: &str) -> Resul
 /// 单条 journal 事件 → v1 Envelope。attempt 从 DispatchStarted 事件增量追踪
 /// （journal 事件不携带 attempt；终态事件的 attempt = 当前派发序，回放顺序
 /// 保证映射正确）。不属于 v1 事件面的审计事实返回 None。
-pub(crate) fn envelope(
+pub fn envelope(
     event: &JournalEvent,
     root: &std::path::Path,
     upper: u64,
@@ -1284,7 +1284,7 @@ pub(crate) fn envelope(
 }
 
 /// run.events：journal 分页全量读取后映射（阻塞部分走 spawn_blocking）。
-pub(crate) async fn read_events(
+pub async fn read_events(
     backend: &JournalBackend,
     run_id: &str,
     from_seq: Option<u64>,
@@ -1513,7 +1513,7 @@ impl Subscription {
     }
 }
 
-pub(crate) fn subscribe(
+pub fn subscribe(
     backend: Arc<JournalBackend>,
     run_id: Option<String>,
 ) -> futures::stream::BoxStream<'static, Envelope> {

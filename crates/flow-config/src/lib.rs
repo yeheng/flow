@@ -4,8 +4,8 @@
 //! 把**部署/运行形态**收敛为一份 TOML（`flow.toml`）：
 //!
 //! ```toml
-//! [server]   rpc/http 监听地址、调度器开关与 tick
-//! [storage]  backend（sqlite|postgres）、data_dir、database、database_url
+//! [server]   cron 调度器开关与 journal 触发器 tick
+//! [storage]  backend（journal|postgres）、data_dir、database_url
 //! [execution] 执行模式（in_process|ipc|remote）、executor_bin、x_max、[remote]
 //! [agent]    flow-agent 的上联地址与证书（原先只有 CLI 参数）
 //! [journal]  journal-server 的监听地址与数据目录（token 仍是环境变量——凭据）
@@ -14,7 +14,9 @@
 //!
 //! 分层加载（高覆盖低）：**CLI `--config`（显式路径）> 环境变量 > 配置文件 >
 //! 内置默认值**。所有 `FLOW_*` 环境变量保持原语义（向后兼容：既有部署脚本
-//! 与测试不受影响）；配置文件缺省时行为与从前逐字一致。
+//! 与测试不受影响）；配置文件缺省时行为与从前逐字一致。flow-server 退役后
+//! 旧 `[server].rpc_addr / http_addr / scheduler_tick_secs` 与 `FLOW_ADDR /
+//! FLOW_HTTP_ADDR` 不再生效（deny_unknown_fields 会让存量配置显式报错）。
 //!
 //! 明确**不收敛**的配置（保持现状）：`RUST_LOG`（env-filter 惯例）、
 //! `FLOW_SECRET_*`（凭据走密钥机制，见 flow-engine secrets）、journal token
@@ -22,8 +24,7 @@
 //! executor FD 槽位（父进程 pre_exec 契约）、`FLOW_RUN_LOG_BUDGET` 等
 //! engine 内部预算（读取点在 driver 深处，维持 env）。
 //!
-//! 加载必须在**构造 tokio runtime 之前**同步完成：runtime 形态
-//!（current_thread / multi_thread）取决于 `storage.backend`。
+//! 加载必须在**构造 tokio runtime 之前**同步完成。
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -66,14 +67,9 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
-    /// JSON-RPC WebSocket 监听地址（原 FLOW_ADDR）。
-    pub rpc_addr: String,
-    /// webhook HTTP 监听地址（原 FLOW_HTTP_ADDR）。
-    pub http_addr: String,
     /// cron 调度器开关（原 FLOW_SCHEDULER=off 关闭）。
+    /// journal-server 与桌面内嵌服务共用（journal 触发器扫描）。
     pub scheduler_enabled: bool,
-    /// cron 扫描 tick（秒）。
-    pub scheduler_tick_secs: u64,
     /// journal 触发器扫描 tick（秒）。
     pub journal_trigger_tick_secs: u64,
 }
@@ -81,10 +77,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
-            rpc_addr: "127.0.0.1:9800".into(),
-            http_addr: "127.0.0.1:9801".into(),
             scheduler_enabled: true,
-            scheduler_tick_secs: 20,
             journal_trigger_tick_secs: 20,
         }
     }
@@ -112,10 +105,9 @@ impl StorageBackend {
 #[serde(default, deny_unknown_fields)]
 pub struct StorageConfig {
     pub backend: StorageBackend,
-    /// 数据目录（原 FLOW_DATA_DIR，默认 CWD 下 `data`）。
+    /// 数据目录（原 FLOW_DATA_DIR，默认 CWD 下 `data`）：密钥存储与
+    /// 桌面历史数据在这里；journal 权威在 [journal].data_dir。
     pub data_dir: String,
-    /// SQLite 库文件显式路径（原 FLOW_DB）；缺省 `<data_dir>/flow.db`。
-    pub database: Option<String>,
     /// Postgres 连接串（原 FLOW_DATABASE_URL；backend=postgres 时必填）。
     /// 含凭据：config.get 只回 set/unset，不回真值。
     pub database_url: Option<String>,
@@ -124,13 +116,10 @@ pub struct StorageConfig {
 impl Default for StorageConfig {
     fn default() -> Self {
         StorageConfig {
-            // 默认 = journal（JSONL v2 权威）。sqlite（v1）仍可显式配置，
-            // 但已进入弃用期（deprecation 日志见 flow_rpc::run；删除计划
-            // docs/SQLITE_V1_TO_V2_MIGRATION.md §2）。历史 v1 数据不迁移——
-            // 全新数据目录直接用 journal。
+            // 默认 = journal（JSONL v2 权威）。sqlite（v1）已删除；历史数据
+            // 不迁移，见 docs/SQLITE_V1_TO_V2_MIGRATION.md。
             backend: StorageBackend::Journal,
             data_dir: "data".into(),
-            database: None,
             database_url: None,
         }
     }
@@ -233,9 +222,9 @@ impl Default for AgentConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct JournalConfig {
-    /// journal v2 WS RPC 监听地址（原 FLOW_JOURNAL_ADDR；仅 loopback 语义由调用方保证）。
+    /// journal v2 WS RPC 监听地址（原 FLOW_JOURNAL_ADDR）。
     pub addr: String,
-    /// 下载 HTTP 监听地址（原 FLOW_JOURNAL_HTTP_ADDR，强制 loopback）。
+    /// 下载/webhook HTTP 监听地址（原 FLOW_JOURNAL_HTTP_ADDR；Bearer token 认证）。
     pub http_addr: String,
     /// journal 数据目录（原 FLOW_JOURNAL_DATA_DIR；journal-server 用）。
     pub data_dir: Option<String>,
@@ -364,10 +353,8 @@ impl Config {
     /// 写入口统一校验。所有监听地址必须可解析；枚举值在 deserialize 层已把关，
     /// 这里管跨字段约束。
     pub fn validate(&self) -> Result<(), String> {
-        let _ = parse_addr(&self.server.rpc_addr, "server.rpc_addr")?;
-        let _ = parse_addr(&self.server.http_addr, "server.http_addr")?;
-        if self.server.scheduler_tick_secs == 0 || self.server.journal_trigger_tick_secs == 0 {
-            return Err("server.scheduler_tick_secs / journal_trigger_tick_secs 必须 > 0".into());
+        if self.server.journal_trigger_tick_secs == 0 {
+            return Err("server.journal_trigger_tick_secs 必须 > 0".into());
         }
         if self.storage.backend == StorageBackend::Postgres
             && self
@@ -399,10 +386,7 @@ impl Config {
             return Err("agent.slots 必须 > 0".into());
         }
         let _ = parse_addr(&self.journal.addr, "journal.addr")?;
-        let http_addr = parse_addr(&self.journal.http_addr, "journal.http_addr")?;
-        if !http_addr.ip().is_loopback() {
-            return Err("journal.http_addr 必须是 loopback（下载通道的安全边界）".into());
-        }
+        let _ = parse_addr(&self.journal.http_addr, "journal.http_addr")?;
         if self.pg.max_runs == 0 || self.pg.max_connections == 0 {
             return Err("pg.max_runs / pg.max_connections 必须 > 0".into());
         }
@@ -515,14 +499,6 @@ fn apply_env(config: &mut Config) -> Result<Vec<String>, String> {
     let env_u64 = |name: &str| -> Option<u64> { env_str(name).and_then(|v| v.parse().ok()) };
 
     // ---- [server] ----
-    if let Some(v) = env_str("FLOW_ADDR") {
-        config.server.rpc_addr = v;
-        applied.push("FLOW_ADDR".into());
-    }
-    if let Some(v) = env_str("FLOW_HTTP_ADDR") {
-        config.server.http_addr = v;
-        applied.push("FLOW_HTTP_ADDR".into());
-    }
     if let Ok(v) = std::env::var("FLOW_SCHEDULER") {
         config.server.scheduler_enabled = v != "off";
         applied.push("FLOW_SCHEDULER".into());
@@ -549,10 +525,6 @@ fn apply_env(config: &mut Config) -> Result<Vec<String>, String> {
     if let Some(v) = env_str("FLOW_DATA_DIR") {
         config.storage.data_dir = v;
         applied.push("FLOW_DATA_DIR".into());
-    }
-    if let Some(v) = env_str("FLOW_DB") {
-        config.storage.database = Some(v);
-        applied.push("FLOW_DB".into());
     }
     if let Some(v) = env_str("FLOW_DATABASE_URL") {
         config.storage.database_url = Some(v);
@@ -714,11 +686,6 @@ impl Config {
     pub fn journal_trigger_tick(&self) -> Duration {
         Duration::from_secs(self.server.journal_trigger_tick_secs)
     }
-
-    /// cron 调度器扫描间隔（秒 → Duration）。
-    pub fn scheduler_tick(&self) -> Duration {
-        Duration::from_secs(self.server.scheduler_tick_secs)
-    }
 }
 
 #[cfg(test)]
@@ -749,14 +716,13 @@ mod tests {
     fn defaults_match_legacy_env_defaults() {
         let config = Config::default();
         config.validate().expect("默认值必须合法");
-        assert_eq!(config.server.rpc_addr, "127.0.0.1:9800");
-        assert_eq!(config.server.http_addr, "127.0.0.1:9801");
-        // 默认后端 = journal（JSONL v2 权威；sqlite v1 弃用期，显式可用）
+        // 默认后端 = journal（JSONL v2 权威）
         assert_eq!(config.storage.backend, StorageBackend::Journal);
         assert_eq!(config.storage.data_dir, "data");
         assert_eq!(config.execution.mode, ExecutionModeKind::InProcess);
         assert_eq!(config.execution.x_max, 4);
         assert!(config.server.scheduler_enabled);
+        assert_eq!(config.server.journal_trigger_tick_secs, 20);
         assert_eq!(config.pg.max_connections, 16);
     }
 
@@ -764,9 +730,8 @@ mod tests {
     fn parses_full_toml_and_roundtrips() {
         let text = r#"
 [server]
-rpc_addr = "0.0.0.0:9800"
-http_addr = "0.0.0.0:9801"
 scheduler_enabled = false
+journal_trigger_tick_secs = 5
 
 [storage]
 backend = "postgres"
@@ -793,8 +758,8 @@ max_runs = 4
 "#;
         let config: Config = toml::from_str(text).expect("解析失败");
         config.validate().expect("校验失败");
-        assert_eq!(config.server.rpc_addr, "0.0.0.0:9800");
         assert!(!config.server.scheduler_enabled);
+        assert_eq!(config.server.journal_trigger_tick_secs, 5);
         assert_eq!(config.storage.backend, StorageBackend::Postgres);
         assert_eq!(config.execution.mode, ExecutionModeKind::Ipc);
         assert_eq!(config.execution.x_max, 8);
@@ -820,6 +785,10 @@ max_runs = 4
     fn unknown_keys_and_sections_are_rejected() {
         let result = toml::from_str::<Config>("[server]\nnope = 1\n");
         assert!(result.is_err(), "未知键必须被拒绝");
+        // v1 时代的 [server].rpc_addr / http_addr 已随 flow-server 退役：
+        // 存量配置里的旧键必须显式报错（deny_unknown_fields），不能静默忽略。
+        let stale = toml::from_str::<Config>("[server]\nrpc_addr = \"127.0.0.1:9800\"\n");
+        assert!(stale.is_err(), "退役的 [server] 键必须被拒绝");
         let result = Config::merge_patch(&Config::default(), &serde_json::json!({"bogus": {}}));
         assert!(result.is_err());
     }
@@ -827,22 +796,20 @@ max_runs = 4
     #[test]
     fn env_overrides_win_and_are_reported() {
         let saved = clean_env(&[
-            "FLOW_ADDR",
             "FLOW_BACKEND",
             "FLOW_SCHEDULER",
             "FLOW_DATA_DIR",
             "FLOW_DATABASE_URL",
         ]);
-        std::env::set_var("FLOW_ADDR", "127.0.0.1:19980");
         std::env::set_var("FLOW_BACKEND", "postgres");
         std::env::set_var("FLOW_SCHEDULER", "off");
+        std::env::set_var("FLOW_DATA_DIR", "/tmp/flow-env-override");
 
         let mut config = Config::default();
         let applied = apply_env(&mut config).unwrap();
-        assert_eq!(config.server.rpc_addr, "127.0.0.1:19980");
         assert_eq!(config.storage.backend, StorageBackend::Postgres);
+        assert_eq!(config.storage.data_dir, "/tmp/flow-env-override");
         assert!(!config.server.scheduler_enabled);
-        assert!(applied.contains(&"FLOW_ADDR".to_string()));
         assert!(applied.contains(&"FLOW_SCHEDULER".to_string()));
 
         // postgres 而无 url → validate 拒绝；补 url 后通过
@@ -856,12 +823,10 @@ max_runs = 4
     #[test]
     fn merge_patch_replaces_whole_sections_and_validates() {
         let patch = serde_json::json!({
-            "server": {"rpc_addr": "127.0.0.1:19800", "http_addr": "127.0.0.1:19801",
-                       "scheduler_enabled": true, "scheduler_tick_secs": 20,
-                       "journal_trigger_tick_secs": 20}
+            "server": {"scheduler_enabled": true, "journal_trigger_tick_secs": 10}
         });
         let merged = Config::merge_patch(&Config::default(), &patch).expect("合并失败");
-        assert_eq!(merged.server.rpc_addr, "127.0.0.1:19800");
+        assert_eq!(merged.server.journal_trigger_tick_secs, 10);
         // 未给的分区保持 base
         assert_eq!(merged.storage.data_dir, "data");
 

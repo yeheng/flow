@@ -10,6 +10,8 @@ import { isDesktop } from "./platform";
 export interface RuntimeConfig {
   rpcUrl?: string;
   httpUrl?: string;
+  /** v2 API 认证 token（journal-server 部署必配；桌面内嵌服务不需要） */
+  token?: string;
 }
 
 let runtime: RuntimeConfig = {};
@@ -31,6 +33,19 @@ export function rpcUrl(): string {
   return (
     runtime.rpcUrl ?? (import.meta.env.VITE_FLOW_RPC as string | undefined) ?? "ws://127.0.0.1:9800"
   );
+}
+
+/** v2 API token：config.json > VITE_FLOW_TOKEN > localStorage（用户在 UI 输入） */
+export function apiToken(): string {
+  return (
+    runtime.token ??
+    (import.meta.env.VITE_FLOW_TOKEN as string | undefined) ??
+    (typeof localStorage !== "undefined" ? (localStorage.getItem("flow.token") ?? "") : "")
+  );
+}
+
+export function setApiToken(token: string): void {
+  localStorage.setItem("flow.token", token);
 }
 
 export function httpUrl(): string {

@@ -93,7 +93,7 @@ export async function deleteTemplate(id: string): Promise<void> {
 }
 
 export async function listWorkflows(): Promise<WorkflowSummary[]> {
-  const r = await client.call<{ workflows: WorkflowSummary[] }>("workflow.list", {});
+  const r = await client.call<{ workflows: WorkflowSummary[] }>("workflow.list.full", {});
   return r.workflows;
 }
 
@@ -117,7 +117,7 @@ export async function publishWorkflow(workflowId: string, version: number): Prom
 export async function getWorkflow(workflowId: string, version?: number): Promise<WorkflowDetail> {
   const params: Record<string, unknown> = { workflow_id: workflowId };
   if (version !== undefined) params.version = version;
-  return client.call<WorkflowDetail>("workflow.get", params);
+  return client.call<WorkflowDetail>("workflow.get.full", params);
 }
 
 export async function listVersions(workflowId: string): Promise<VersionMeta[]> {
@@ -157,7 +157,7 @@ export async function listRuns(opts: ListRunsOptions = {}): Promise<RunRecord[]>
   if (opts.source !== undefined) params.source = opts.source;
   if (opts.beforeRunId !== undefined) params.before_run_id = opts.beforeRunId;
   if (opts.limit !== undefined) params.limit = opts.limit;
-  const r = await client.call<{ runs: RunRecord[] }>("run.list", params);
+  const r = await client.call<{ runs: RunRecord[] }>("run.list.full", params);
   return r.runs;
 }
 
@@ -179,7 +179,7 @@ export async function runTimeline(runId: string): Promise<Timeline> {
 export async function runEvents(runId: string, fromSeq?: number): Promise<RunEvent[]> {
   const params: Record<string, unknown> = { run_id: runId };
   if (fromSeq !== undefined) params.from_seq = fromSeq;
-  const r = await client.call<{ events: RunEvent[] }>("run.events", params);
+  const r = await client.call<{ events: RunEvent[] }>("run.events.full", params);
   return r.events;
 }
 
@@ -262,7 +262,12 @@ export async function deleteWebhook(token: string): Promise<void> {
   await client.call("webhook.delete", { token });
 }
 
-/** webhook HTTP 入口基址（POST /hook/<token>）：运行时 config.json 优先，其次 VITE_FLOW_HTTP，最后本地默认 */
+/** webhook HTTP 入口基址：v2 形态 POST /hooks/<key>（Bearer token 认证）。
+ * 运行时 config.json 优先，其次 VITE_FLOW_HTTP，最后本地默认。 */
 export function webhookBase(): string {
   return httpUrl();
+}
+/** webhook 调用 URL（v2：Bearer 认证 + Idempotency-Key） */
+export function webhookUrl(key: string): string {
+  return `${httpUrl().replace(/\/$/, "")}/hooks/${key}`;
 }

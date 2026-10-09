@@ -275,69 +275,10 @@ impl Attempt {
             .await
     }
 
-    /// Request construction is derived from the committed prepared parameters. Authorization
-    /// is durably recorded with intent before reqwest is called, and never reused after restart.
-    pub async fn http(&self, prepared: &Prepared, kind: NodeType) -> Result<StoredValue> {
-        let mut budget = 8 * 1024 * 1024;
-        let mut params = self.materialize(&prepared.params, &mut budget).await?;
-        let mut credential = None;
-        if matches!(kind, NodeType::Llm | NodeType::Email) {
-            let name = params["api_key"]
-                .as_str()
-                .filter(|s| !s.trim().is_empty())
-                .ok_or_else(|| invalid("api_key secret reference required"))?
-                .to_owned();
-            credential = Some(
-                flow_engine::secrets::get_secret(&name)
-                    .filter(|v| !v.is_empty())
-                    .ok_or_else(|| invalid(format!("secret reference {name} not configured")))?,
-            );
-            let (url, body) = if kind == NodeType::Llm {
-                flow_engine::exec::llm_request(&params)
-            } else {
-                flow_engine::exec::email_request(&params)
-            }
-            .map_err(|e| invalid(e.message))?;
-            params = json!({"method":"POST","url":url,"body":body,"timeout_ms":params["timeout_ms"],"credential":{"scheme":"bearer","secret_ref":name}});
-        }
-        let method = params["method"].as_str().unwrap_or("GET").to_uppercase();
-        if !flow_engine::HTTP_METHODS.contains(&method.as_str()) {
-            return Err(invalid("invalid HTTP method").into());
-        }
-        let url = params["url"]
-            .as_str()
-            .ok_or_else(|| invalid("HTTP URL missing"))?;
-        let http_method =
-            reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| invalid(e.to_string()))?;
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .build()
-            .map_err(|e| invalid(e.to_string()))?;
-        let mut request = client
-            .request(http_method, url)
-            .timeout(Duration::from_millis(
-                params["timeout_ms"].as_u64().unwrap_or(30_000),
-            ));
-        if let Some(headers) = params["headers"].as_object() {
-            for (key, value) in headers {
-                request = request.header(
-                    key,
-                    value
-                        .as_str()
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| value.to_string()),
-                );
-            }
-        }
-        if !params["body"].is_null() {
-            request = request.json(&params["body"]);
-        }
-        if let Some(secret) = credential {
-            request = request.bearer_auth(secret);
-        }
-        let outbound = request.build().map_err(|e| invalid(e.to_string()))?;
-        let request = json!({"method":method,"url":url,"headers":params.get("headers").cloned().unwrap_or(json!({})),"body":params.get("body").cloned().unwrap_or(Value::Null),"credential":params.get("credential").cloned().unwrap_or(Value::Null)});
+    /// 外部操作的授权落盘：Intent + Authorized 同事务，副作用发生之前必走这里。
+    /// http 与 harness 共用；授权后进程崩溃 → 恢复见「operation 无 outcome」进
+    /// uncertain 等待人工裁决（journal_driver）。
+    async fn authorize(&self, prepared: &Prepared, request: Value) -> Result<()> {
         let fingerprint = flow_journal::codec::digest(&flow_journal::codec::bounded_json(
             &request,
             8 * 1024 * 1024,
@@ -393,6 +334,189 @@ impl Attempt {
         if self.snapshot().await?.terminal() {
             return Err(invalid("cancelled after authorization; outcome uncertain").into());
         }
+        Ok(())
+    }
+
+    /// harness：子进程调用。请求（command/args/workdir/timeout_ms/prompt）先落
+    /// Intent/Authorized 再 spawn——与 http 同一条「不自动重发」路径。
+    /// 退出码非 0 → outcome 留存、节点判死；超时/等待失败 → outcome 未知，
+    /// 进 uncertain 等人工裁决。
+    pub async fn harness(&self, prepared: &Prepared) -> Result<StoredValue> {
+        let mut budget = 8 * 1024 * 1024;
+        let params = self.materialize(&prepared.params, &mut budget).await?;
+        let (command, args, workdir, timeout_ms, prompt) =
+            flow_engine::exec::harness_request(&params).map_err(|e| invalid(e.message))?;
+        let request = json!({"command":command,"args":args,"workdir":workdir,"timeout_ms":timeout_ms,"prompt":prompt});
+        self.authorize(prepared, request).await?;
+        let mut child = match flow_engine::exec::harness_command(&command, &args, workdir.as_deref())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                // spawn 失败 = 进程从未启动，结果确定：记录 Outcome 后按业务失败
+                // 收口（有 outcome，恢复不会进 uncertain）
+                let outcome = StoredValue::inline(json!({"spawn_error": error.to_string()}))?;
+                self.audit(EventKind::OperationOutcome, json!({"outcome":outcome}))
+                    .await?;
+                return Err(invalid(format!("harness spawn failed: {error}")).into());
+            }
+        };
+        use tokio::io::AsyncWriteExt;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| invalid("harness stdin unavailable"))?;
+        // 对端不读 stdin 提前退出时 EPIPE 不算失败——退出码会说明一切
+        match stdin.write_all(prompt.as_bytes()).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => {
+                return Err(invalid(format!(
+                    "external outcome uncertain: harness stdin: {e}"
+                ))
+                .into())
+            }
+        }
+        drop(stdin);
+        let output =
+            match tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait_with_output())
+                .await
+            {
+                Ok(Ok(output)) => output,
+                Ok(Err(e)) => {
+                    return Err(invalid(format!("external outcome uncertain: {e}")).into())
+                }
+                // 超时：wait_with_output 被 drop，kill_on_drop 杀掉子进程；
+                // 进程死前可能已产生副作用 → outcome 未知
+                Err(_) => {
+                    return Err(invalid(format!(
+                        "external outcome uncertain: harness timed out after {timeout_ms}ms (process killed)"
+                    ))
+                    .into())
+                }
+            };
+        let mut capture = Capture::new(self, ValueCodec::Bytes);
+        for chunk in output.stdout.chunks(flow_journal::CHUNK_BYTES) {
+            capture.push(chunk).await?;
+        }
+        let raw = capture.finish().await?;
+        // 字段名沿用 http 的 body_raw：恢复路径（含远程执行器的 transfer 约定
+        // op-body:<output_id>）按这个名字找原始字节
+        let outcome = StoredValue::inline(json!({
+            "exit_code": output.status.code(),
+            "body_raw": raw,
+            "stderr": flow_engine::exec::stderr_tail(
+                &String::from_utf8_lossy(&output.stderr)
+            ),
+        }))?;
+        self.audit(EventKind::OperationOutcome, json!({"outcome":outcome}))
+            .await?;
+        self.harness_output(&outcome).await
+    }
+
+    /// harness 的 Outcome → 节点输出（恢复路径重放同一派生，不重跑进程）。
+    pub async fn harness_output(&self, outcome: &StoredValue) -> Result<StoredValue> {
+        let mut budget = flow_journal::INLINE_BYTES;
+        let outcome = self.materialize(outcome, &mut budget).await?;
+        if let Some(error) = outcome["spawn_error"].as_str() {
+            return Err(invalid(format!("harness spawn failed: {error}")).into());
+        }
+        let exit_code = outcome["exit_code"].as_i64().map(|c| c as i32);
+        let stderr = outcome["stderr"].as_str().unwrap_or("").to_owned();
+        let raw: ValueRef = serde_json::from_value(outcome["body_raw"].clone())?;
+        if raw.total_bytes > 8 * 1024 * 1024 {
+            return Err(flow_journal::Error::Limit(
+                "integration decoding exceeds 8 MiB; raw outcome retained".into(),
+            )
+            .into());
+        }
+        let root = self.backend.journal.root().to_path_buf();
+        let upper = self.backend.journal.durable_lsn();
+        let stdout = tokio::task::spawn_blocking(move || {
+            let mut bytes = flow_journal::codec::BoundedBuffer {
+                bytes: Vec::new(),
+                limit: 8 * 1024 * 1024,
+            };
+            flow_journal::value::read_value(&root, upper, &raw, true, &mut bytes)?;
+            Ok::<_, flow_journal::Error>(bytes.bytes)
+        })
+        .await
+        .map_err(|e| invalid(e.to_string()))??;
+        let output = flow_engine::exec::harness_output(
+            exit_code,
+            String::from_utf8_lossy(&stdout).into_owned(),
+            stderr,
+        )
+        .map_err(|e| invalid(format!("{}; outcome retained", e.message)))?;
+        self.json(output).await
+    }
+
+    /// Request construction is derived from the committed prepared parameters. Authorization
+    /// is durably recorded with intent before reqwest is called, and never reused after restart.
+    pub async fn http(&self, prepared: &Prepared, kind: NodeType) -> Result<StoredValue> {
+        let mut budget = 8 * 1024 * 1024;
+        let mut params = self.materialize(&prepared.params, &mut budget).await?;
+        let mut credential = None;
+        if kind == NodeType::Email {
+            let name = params["api_key"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| invalid("api_key secret reference required"))?
+                .to_owned();
+            credential = Some(
+                flow_engine::secrets::get_secret(&name)
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| invalid(format!("secret reference {name} not configured")))?,
+            );
+            let (url, body) =
+                flow_engine::exec::email_request(&params).map_err(|e| invalid(e.message))?;
+            params = json!({"method":"POST","url":url,"body":body,"timeout_ms":params["timeout_ms"],"credential":{"scheme":"bearer","secret_ref":name}});
+        }
+        let method = params["method"].as_str().unwrap_or("GET").to_uppercase();
+        if !flow_engine::HTTP_METHODS.contains(&method.as_str()) {
+            return Err(invalid("invalid HTTP method").into());
+        }
+        let url = params["url"]
+            .as_str()
+            .ok_or_else(|| invalid("HTTP URL missing"))?;
+        let http_method =
+            reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| invalid(e.to_string()))?;
+        // proxy：非法 URL 在授权前失败——配置错误，不进 operation 直接判死
+        let mut builder = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never());
+        if let Some(proxy) = params["proxy"].as_str().filter(|s| !s.trim().is_empty()) {
+            builder = builder.proxy(
+                reqwest::Proxy::all(proxy)
+                    .map_err(|e| invalid(format!("invalid proxy URL: {e}")))?,
+            );
+        }
+        let client = builder.build().map_err(|e| invalid(e.to_string()))?;
+        let mut request = client
+            .request(http_method, url)
+            .timeout(Duration::from_millis(
+                params["timeout_ms"].as_u64().unwrap_or(30_000),
+            ));
+        if let Some(headers) = params["headers"].as_object() {
+            for (key, value) in headers {
+                request = request.header(
+                    key,
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| value.to_string()),
+                );
+            }
+        }
+        if !params["body"].is_null() {
+            request = request.json(&params["body"]);
+        }
+        if let Some(secret) = credential {
+            request = request.bearer_auth(secret);
+        }
+        let outbound = request.build().map_err(|e| invalid(e.to_string()))?;
+        let request = json!({"method":method,"url":url,"headers":params.get("headers").cloned().unwrap_or(json!({})),"body":params.get("body").cloned().unwrap_or(Value::Null),"proxy":params.get("proxy").cloned().unwrap_or(Value::Null),"credential":params.get("credential").cloned().unwrap_or(Value::Null)});
+        self.authorize(prepared, request).await?;
         let mut response = client
             .execute(outbound)
             .await
@@ -429,7 +553,7 @@ impl Attempt {
             .as_u64()
             .ok_or_else(|| invalid("invalid HTTP outcome"))?;
         let raw: ValueRef = serde_json::from_value(outcome["body_raw"].clone())?;
-        if matches!(kind, NodeType::Llm | NodeType::Email) {
+        if kind == NodeType::Email {
             if status >= 400 {
                 return Err(invalid(format!("HTTP {status}; outcome retained")).into());
             }
@@ -451,18 +575,7 @@ impl Attempt {
             })
             .await
             .map_err(|e| invalid(e.to_string()))??;
-            let output = if kind == NodeType::Llm {
-                let content = response
-                    .pointer("/choices/0/message/content")
-                    .ok_or_else(|| {
-                        invalid(
-                            "LLM response missing choices[0].message.content; raw outcome retained",
-                        )
-                    })?;
-                json!({"content":content,"model":response["model"],"usage":response["usage"]})
-            } else {
-                json!({"status":status,"id":response["id"]})
-            };
+            let output = json!({"status":status,"id":response["id"]});
             return self.json(output).await;
         }
         // Re-read captured bytes for JSON/text semantics. The temporary spool is bounded by

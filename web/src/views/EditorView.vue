@@ -22,7 +22,9 @@ import {
   validationUi,
 } from "../state/editor";
 import { history, redo, undo } from "../state/history";
+import { promptDialog } from "../state/modal";
 import { monitor, startRun } from "../state/monitor";
+import { saveWorkflowAsNodeTemplate } from "../state/templates";
 import { toast } from "../state/toast";
 import NodePalette from "../components/NodePalette.vue";
 import FlowCanvas from "../components/FlowCanvas.vue";
@@ -125,6 +127,18 @@ function locateError(nodeId?: string): void {
   if (nodeId) editor.selectedNodeId = nodeId;
   validationUi.open = false;
 }
+
+/** 一键存为常用节点：把当前工作流打包成 sub_workflow 单节点模板进模板区 */
+async function saveAsNode(): Promise<void> {
+  if (!editor.workflowId) return;
+  const name = await promptDialog(
+    "将当前工作流打包为可复用的子流程节点，存入左侧模板区，之后可在其他工作流中直接插入。注意：该工作流需要有已发布版本，才能作为子流程运行。",
+    editor.workflowName,
+  );
+  if (!name?.trim()) return;
+  const created = await saveWorkflowAsNodeTemplate(editor.workflowId, name);
+  if (created) toast.success("已存为常用节点，可在模板区插入");
+}
 </script>
 
 <template>
@@ -143,6 +157,13 @@ function locateError(nodeId?: string): void {
         <button title="撤销 (⌘Z)" :disabled="!history.canUndo" @click="undo()">↶ 撤销</button>
         <button title="重做 (⌘⇧Z)" :disabled="!history.canRedo" @click="redo()">↷ 重做</button>
         <button :disabled="editor.nodes.length === 0" @click="autoLayout()">自动布局</button>
+        <button
+          title="把当前工作流打包成可复用的子流程节点（存入模板区）"
+          :disabled="!editor.workflowId"
+          @click="saveAsNode()"
+        >
+          存为节点
+        </button>
         <span ref="validationAnchor" class="validation-anchor">
           <button
             v-if="validationErrors.length > 0"

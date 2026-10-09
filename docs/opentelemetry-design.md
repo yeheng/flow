@@ -242,13 +242,13 @@ OTel 最常用的信号是 metrics，而本系统今天一个 counter/histogram 
 | `start` / `end` | `INTERNAL` | — |
 | `script` / `condition` / `delay` | `INTERNAL` | — |
 | `http_call` | `CLIENT` | 请求方法、完整 URL、响应状态码、耗时 |
-| `llm` | `CLIENT` | GenAI 约定：模型名、usage |
+| `harness` | `INTERNAL` | 命令、退出码、耗时（stdout/stderr 体不出 span，见 §7） |
 | `email` | `CLIENT` | 收件方域名（**不含地址**，见 §7） |
 | `sub_workflow` | `INTERNAL` | 子 run 的 trace 亲缘（§8.1） |
 | `human_task` | `INTERNAL` | `flow.awaiting=human_task` |
 
-`llm` 节点的输出已经是 `{content, model, usage}`，**意外贴合** GenAI 语义约定的
-形状——这是既有设计没预期到的红利。
+原 `llm` 节点已删除（由 `harness` 取代）；GenAI 语义约定（模型名、usage 属性）
+随之不再适用——harness 是本地子进程，不是 LLM API 客户端。
 
 **动作**：把 http_call 的请求/响应行从字符串改成结构化属性。字符串行可以保留
 （人读友好，且已落盘），但**机读属性必须另出**。这是 exec 层唯一的改动，

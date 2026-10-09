@@ -405,7 +405,7 @@ fn relay_cannot_wrap_authoritative_control_frames() {
 /// body_raw、>64KiB 的 script 输出）必须携带**主进程 journal_id**——reducer
 /// 会拒绝 journal_id 不符的 ValuePublished（value.rs 的硬校验）。历史上
 /// agent 把自己的 agent_id 当 journal_id 传给执行器握手，导致所有 http/
-/// llm/email 节点与所有大输出在 remote 模式下必然提交失败；当时的验收用例
+/// harness/email 节点与所有大输出在 remote 模式下必然提交失败；当时的验收用例
 /// 只用了小 inline 输出，恰好绕开了这条路径。
 #[tokio::test]
 async fn remote_http_and_large_output_commit_refs() {

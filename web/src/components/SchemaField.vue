@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, useId, watch } from "vue";
+import { computed, markRaw, ref, useId, watch } from "vue";
 import CodeEditor from "./CodeEditor.vue";
 import { editor } from "../state/editor";
 import type { PropertySchema } from "../types";
@@ -24,6 +24,7 @@ type Widget =
   | "code"
   | "json"
   | "workflow-picker"
+  | "key-value"
   | "object";
 const widget = computed<Widget>(() => {
   if (props.schema.enum) return "enum";
@@ -93,6 +94,93 @@ function onJson(ev: Event): void {
   } catch {
     jsonError.value = "JSON 格式错误，未保存此字段";
   }
+}
+
+// ---- key-value widget：动态键值对行编辑（headers 等 object 参数） ----
+// 本地持有行状态，组件按节点 :key 重挂载时从 modelValue 初始化；
+// 行输入聚焦期间不做外部同步（undo/redo 等），避免打断输入。
+// 重复键取舍：不做 last-wins 静默覆盖——重复行标红（kv-dup）且不写入 params，
+// 同名键只保留第一行。
+interface KvRow {
+  id: number;
+  key: string;
+  value: string;
+}
+let kvSeq = 0;
+function kvFromModel(v: unknown): KvRow[] {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return [];
+  return Object.entries(v as Record<string, unknown>).map(([key, val]) => ({
+    id: ++kvSeq,
+    key,
+    value: typeof val === "string" ? val : String(val ?? ""),
+  }));
+}
+const kvRows = ref<KvRow[]>(kvFromModel(props.modelValue));
+/** 聚焦中的行输入数（focus/blur 计数，行间切换不会瞬时清零） */
+let kvFocusCount = 0;
+const kvFocused = ref(false);
+
+function onKvFocus(): void {
+  kvFocusCount += 1;
+  kvFocused.value = true;
+}
+function onKvBlur(): void {
+  kvFocusCount = Math.max(0, kvFocusCount - 1);
+  kvFocused.value = kvFocusCount > 0;
+}
+
+// undo/redo 或版本加载从外部改了 params：非聚焦时把行同步回来。
+// 自己 emit 的值按引用跳过——否则删行后焦点离开输入框，resync 会把
+// 未完成的空键/重复键行（未写入 params）从本地行状态里抹掉。
+let kvSelfEmitted: unknown;
+watch(
+  () => props.modelValue,
+  (v) => {
+    if (v === kvSelfEmitted) return;
+    kvSelfEmitted = undefined;
+    if (kvFocused.value || props.schema["x-widget"] !== "key-value") return;
+    kvRows.value = kvFromModel(v);
+  },
+);
+
+/** 重复的非空键（第二次及以后出现的行不写入 params） */
+const kvDupKeys = computed(() => {
+  const seen = new Set<string>();
+  const dup = new Set<string>();
+  for (const row of kvRows.value) {
+    const k = row.key.trim();
+    if (!k) continue;
+    if (seen.has(k)) dup.add(k);
+    else seen.add(k);
+  }
+  return dup;
+});
+
+function kvIsDup(row: KvRow): boolean {
+  const k = row.key.trim();
+  return k !== "" && kvDupKeys.value.has(k) && kvRows.value.find((r) => r.key.trim() === k) !== row;
+}
+
+function emitKv(): void {
+  const out: Record<string, string> = {};
+  for (const row of kvRows.value) {
+    const k = row.key.trim();
+    if (!k || k in out) continue;
+    out[k] = row.value;
+  }
+  // markRaw：params 存在 reactive 编辑器状态里，读回时保持同一引用，
+  // watch 才能按引用识别出这是自己 emit 的值而跳过 resync
+  kvSelfEmitted = Object.keys(out).length > 0 ? markRaw(out) : undefined;
+  emit("update:modelValue", kvSelfEmitted);
+}
+
+function addKvRow(): void {
+  kvRows.value.push({ id: ++kvSeq, key: "", value: "" });
+}
+
+function removeKvRow(id: number): void {
+  kvRows.value = kvRows.value.filter((r) => r.id !== id);
+  emitKv();
 }
 
 // ---- workflow-picker ----
@@ -209,6 +297,40 @@ function setChild(key: string, value: unknown): void {
       ></textarea>
       <div v-if="jsonError" class="field-error">{{ jsonError }}</div>
     </template>
+    <template v-else-if="widget === 'key-value'">
+      <div v-for="row in kvRows" :key="row.id" class="kv-row" :class="{ 'kv-dup': kvIsDup(row) }">
+        <input
+          v-model="row.key"
+          type="text"
+          class="kv-key"
+          placeholder="键"
+          spellcheck="false"
+          @input="emitKv"
+          @focus="onKvFocus"
+          @blur="onKvBlur"
+        />
+        <input
+          v-model="row.value"
+          type="text"
+          class="kv-value"
+          placeholder="值"
+          spellcheck="false"
+          @input="emitKv"
+          @focus="onKvFocus"
+          @blur="onKvBlur"
+        />
+        <button
+          type="button"
+          class="kv-remove"
+          title="删除此行"
+          @click="removeKvRow(row.id)"
+        >
+          ×
+        </button>
+      </div>
+      <button type="button" class="kv-add" @click="addKvRow">＋ 添加</button>
+      <div v-if="kvDupKeys.size > 0" class="field-error">存在重复的键，重复行未保存</div>
+    </template>
     <template v-else-if="widget === 'workflow-picker'">
       <select :value="(modelValue as string) ?? ''" @change="onPickWorkflow">
         <option value="">（选择工作流）</option>
@@ -237,6 +359,40 @@ fieldset.schema-object {
 
 fieldset.schema-object legend {
   color: var(--text2);
+  font-size: 12px;
+}
+
+/* key-value 行编辑 */
+.kv-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.kv-row .kv-key {
+  flex: 2;
+  min-width: 0;
+}
+
+.kv-row .kv-value {
+  flex: 3;
+  min-width: 0;
+}
+
+.kv-row.kv-dup input {
+  border-color: var(--danger);
+}
+
+.kv-remove {
+  flex: none;
+  padding: 2px 8px;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.kv-add {
+  padding: 2px 10px;
   font-size: 12px;
 }
 </style>

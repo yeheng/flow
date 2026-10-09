@@ -5,7 +5,7 @@
  */
 import { reactive } from "vue";
 import * as api from "../api/flow";
-import type { NodeTemplate, NodeTemplateSummary } from "../types";
+import type { FragmentNode, NodeTemplate, NodeTemplateSummary } from "../types";
 import { errText } from "../rpc/client";
 import { editor, insertFragment } from "./editor";
 import { toast } from "./toast";
@@ -64,6 +64,26 @@ export async function saveSelectionAsTemplate(name: string): Promise<NodeTemplat
         targetHandle: e.targetHandle,
       }));
     const template = await api.createTemplate(name.trim(), nodes, edges);
+    await ensureTemplates(true);
+    return template;
+  } catch (e) {
+    toast.error(errText(e));
+    return null;
+  }
+}
+
+/** 一键存为常用节点：把当前工作流打包成 sub_workflow 单节点模板（预填 workflow_id）。
+ * 注意节点运行时走发布版——工作流没有已发布版本时插入后能保存但运行会失败。 */
+export async function saveWorkflowAsNodeTemplate(
+  workflowId: string,
+  name: string,
+): Promise<NodeTemplate | null> {
+  try {
+    const trimmed = name.trim();
+    const nodes: FragmentNode[] = [
+      { id: "sub_1", type: "sub_workflow", name: trimmed, params: { workflow_id: workflowId } },
+    ];
+    const template = await api.createTemplate(trimmed, nodes, [], "子流程");
     await ensureTemplates(true);
     return template;
   } catch (e) {

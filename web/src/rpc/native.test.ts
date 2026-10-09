@@ -38,12 +38,16 @@ describe("desktop transport", () => {
       data: { committed: true },
     });
     await expect(client.call("workflow.list", {})).rejects.toBeInstanceOf(RpcError);
-    expect(bridge.invoke).toHaveBeenCalledWith("flow_call", {
-      session: "session",
-      service: "flow",
-      method: "workflow.create",
-      params: { name: "x" },
-    });
+    // v2 协议：写命令自动携带 request_id（幂等键）
+    const createCall = bridge.invoke.mock.calls.find(
+      (c: unknown[]) => c[0] === "flow_call" && (c[1] as { method: string }).method === "workflow.create",
+    );
+    expect(createCall).toBeTruthy();
+    const createArgs = (createCall![1] as Record<string, unknown>);
+    expect(createArgs.session).toBe("session");
+    expect(createArgs.service).toBe("flow");
+    expect((createArgs.params as Record<string, unknown>).name).toBe("x");
+    expect(typeof (createArgs.params as Record<string, unknown>).request_id).toBe("string");
     expect(WebSocket).not.toHaveBeenCalled();
     client.close();
   });
