@@ -105,12 +105,12 @@ e2e_test!(http_call_4xx_is_fatal, |ctx: &mut Ctx| Box::pin(
         );
         assert_eq!(stub.requests().len(), 1, "4xx 不得重试");
 
-        let events: Value = call_json(&client, "run.events.full", json!({"run_id": run_id})).await;
+        let events: Value = call_json(&client, "run.events.view", json!({"run_id": run_id})).await;
         let failed = events["events"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|e| e["type"] == json!("node_failed"))
+            .find(|e| e["event"]["kind"] == json!("node_failed"))
             .unwrap();
         assert_eq!(failed["retryable"], json!(false));
     }
@@ -140,9 +140,12 @@ e2e_test!(
         assert_eq!(run["run"]["status"], json!("cancelled"));
 
         // 取消是用户主动选择：不判定外部副作用是否发生（§6.6）
-        let events: Value = call_json(&client, "run.events.full", json!({"run_id": run_id})).await;
+        let events: Value = call_json(&client, "run.events.view", json!({"run_id": run_id})).await;
         let events = events["events"].as_array().unwrap();
-        assert_eq!(events.last().unwrap()["type"], json!("run_cancelled"));
+        assert_eq!(
+            events.last().unwrap()["event"]["kind"],
+            json!("run_cancelled")
+        );
     })
 );
 

@@ -239,7 +239,7 @@ async fn integration_adapters_capture_results_without_persisting_resolved_creden
             .to_lowercase()
             .contains("authorization: bearer adapter-private-test-value"));
         assert!(request.starts_with("POST /emails "));
-        let body=json!({"id":"mail-1"}).to_string();
+        let body = json!({"id":"mail-1"}).to_string();
         socket
             .write_all(
                 format!(

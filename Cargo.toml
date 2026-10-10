@@ -5,7 +5,6 @@ members = [
     "crates/flow-executor",
     "crates/flow-journal",
     "crates/flow-engine",
-    "crates/flow-pg",
     "crates/flow-store",
     "crates/flow-backend",
     "crates/flow-dto",

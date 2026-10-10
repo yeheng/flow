@@ -348,19 +348,18 @@ impl Attempt {
             flow_engine::exec::harness_request(&params).map_err(|e| invalid(e.message))?;
         let request = json!({"command":command,"args":args,"workdir":workdir,"timeout_ms":timeout_ms,"prompt":prompt});
         self.authorize(prepared, request).await?;
-        let mut child = match flow_engine::exec::harness_command(&command, &args, workdir.as_deref())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(error) => {
-                // spawn 失败 = 进程从未启动，结果确定：记录 Outcome 后按业务失败
-                // 收口（有 outcome，恢复不会进 uncertain）
-                let outcome = StoredValue::inline(json!({"spawn_error": error.to_string()}))?;
-                self.audit(EventKind::OperationOutcome, json!({"outcome":outcome}))
-                    .await?;
-                return Err(invalid(format!("harness spawn failed: {error}")).into());
-            }
-        };
+        let mut child =
+            match flow_engine::exec::harness_command(&command, &args, workdir.as_deref()).spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    // spawn 失败 = 进程从未启动，结果确定：记录 Outcome 后按业务失败
+                    // 收口（有 outcome，恢复不会进 uncertain）
+                    let outcome = StoredValue::inline(json!({"spawn_error": error.to_string()}))?;
+                    self.audit(EventKind::OperationOutcome, json!({"outcome":outcome}))
+                        .await?;
+                    return Err(invalid(format!("harness spawn failed: {error}")).into());
+                }
+            };
         use tokio::io::AsyncWriteExt;
         let mut stdin = child
             .stdin
@@ -371,10 +370,9 @@ impl Attempt {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
             Err(e) => {
-                return Err(invalid(format!(
-                    "external outcome uncertain: harness stdin: {e}"
-                ))
-                .into())
+                return Err(
+                    invalid(format!("external outcome uncertain: harness stdin: {e}")).into(),
+                )
             }
         }
         drop(stdin);

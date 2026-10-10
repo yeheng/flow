@@ -44,7 +44,7 @@ describe("V2 client protocol", () => {
       "webhook.list",
       "template.list",
       "template.get",
-      "run.get.full",
+      "run.get.view",
     ]) {
       await client.call(method, {});
       expect(transport.call.mock.calls[transport.call.mock.calls.length - 1]![1]).toEqual({
@@ -114,7 +114,7 @@ describe("V2 client protocol", () => {
     const full = { run: { run_id: "r", workflow_id: "w", workflow_version: 1 }, live: true };
     transport.call.mockResolvedValueOnce(full);
     expect(await getRun("r")).toEqual(full);
-    expect(transport.call).toHaveBeenCalledWith("run.get.full", {
+    expect(transport.call).toHaveBeenCalledWith("run.get.view", {
       run_id: "r",
       _token: "workbench-token",
     });

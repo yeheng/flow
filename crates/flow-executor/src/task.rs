@@ -957,7 +957,8 @@ impl TaskRunner {
             .materialize_stored(&prepared.params, "in:prepared-params", &mut budget)
             .await?;
         let (command, args, workdir, timeout_ms, prompt) =
-            flow_engine::exec::harness_request(&params).map_err(|e| TaskError::Business(e.message))?;
+            flow_engine::exec::harness_request(&params)
+                .map_err(|e| TaskError::Business(e.message))?;
         let request = json!({
             "command": command,
             "args": args,
@@ -966,21 +967,22 @@ impl TaskRunner {
             "prompt": prompt,
         });
         self.authorize_operation(request).await?;
-        let mut child = match flow_engine::exec::harness_command(&command, &args, workdir.as_deref())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(error) => {
-                // 进程从未启动：结果确定。记录 Outcome 后按业务失败收口
-                let outcome = StoredValue::inline(json!({"spawn_error": error.to_string()}))?;
-                let outcome_seq = audit.push(
-                    "operation_outcome",
-                    json!({"outcome": serde_json::to_value(&outcome)?}),
-                )?;
-                audit.await_durable(outcome_seq, &self.cancel).await?;
-                return Err(TaskError::Business(format!("harness spawn failed: {error}")));
-            }
-        };
+        let mut child =
+            match flow_engine::exec::harness_command(&command, &args, workdir.as_deref()).spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    // 进程从未启动：结果确定。记录 Outcome 后按业务失败收口
+                    let outcome = StoredValue::inline(json!({"spawn_error": error.to_string()}))?;
+                    let outcome_seq = audit.push(
+                        "operation_outcome",
+                        json!({"outcome": serde_json::to_value(&outcome)?}),
+                    )?;
+                    audit.await_durable(outcome_seq, &self.cancel).await?;
+                    return Err(TaskError::Business(format!(
+                        "harness spawn failed: {error}"
+                    )));
+                }
+            };
         use tokio::io::AsyncWriteExt;
         let mut stdin = child
             .stdin
@@ -1006,8 +1008,8 @@ impl TaskRunner {
                     )))
                 }
             };
-        let raw_stored = store_bytes(audit, &self.journal_id, &output.stdout, ValueCodec::Bytes)
-            .await?;
+        let raw_stored =
+            store_bytes(audit, &self.journal_id, &output.stdout, ValueCodec::Bytes).await?;
         // 捕获的原始字节留在本地装配器，供输出派生阶段复用（不重读 journal）。
         let body_ref = match &raw_stored {
             StoredValue::Ref(reference) => serde_json::to_value(reference)?,
@@ -1050,7 +1052,9 @@ impl TaskRunner {
             StoredValue::Ref(_) => return Err(TaskError::Invalid("outcome must be inline".into())),
         };
         if let Some(error) = outcome_value["spawn_error"].as_str() {
-            return Err(TaskError::Business(format!("harness spawn failed: {error}")));
+            return Err(TaskError::Business(format!(
+                "harness spawn failed: {error}"
+            )));
         }
         let exit_code = outcome_value["exit_code"].as_i64().map(|c| c as i32);
         let stderr = outcome_value["stderr"].as_str().unwrap_or("").to_owned();

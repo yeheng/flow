@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use flow_backend::journal::JournalBackend;
-use flow_backend::{AnyBackend, CreateRun};
+
 use flow_rpc::AppState;
 const TOKEN: &str = "flow-rpc-contract-test-token-32-bytes";
 use serde_json::{json, Value};
@@ -11,7 +11,6 @@ use serde_json::{json, Value};
 struct Fixture {
     root: PathBuf,
     backend: Arc<JournalBackend>,
-    arm: AnyBackend,
     state: Arc<AppState>,
     workflow: String,
 }
@@ -32,13 +31,12 @@ impl Fixture {
             .await
             .unwrap();
         let state = Arc::new(AppState {
-            backend: AnyBackend::Journal(backend.clone()),
+            backend: backend.clone(),
             config: None,
             secrets: None,
         });
         Self {
             root,
-            arm: AnyBackend::Journal(backend.clone()),
             backend,
             state,
             workflow,
@@ -61,11 +59,11 @@ impl Fixture {
 
     async fn call(&self, method: &str, mut params: Value) -> Value {
         let method = match method {
-            "workflow.get" => "workflow.get.full",
-            "workflow.list" => "workflow.list.full",
-            "run.get" => "run.get.full",
-            "run.list" => "run.list.full",
-            "run.events" => "run.events.full",
+            "workflow.get" => "workflow.get.view",
+            "workflow.list" => "workflow.list.view",
+            "run.get" => "run.get.view",
+            "run.list" => "run.list.view",
+            "run.events" => "run.events.view",
             other => other,
         };
         if flow_rpc::journal_v2::is_write_method(method) && params.get("request_id").is_none() {
@@ -235,7 +233,10 @@ async fn explicit_draft_is_rejected_and_historical_published_version_still_runs(
         let row = f.wait_finished(run).await;
         assert_eq!(row["status"], "succeeded");
         assert_eq!(
-            f.arm.get_run(run).await.unwrap().output,
+            flow_backend::journal_views::get_run(&f.backend, run)
+                .await
+                .unwrap()
+                .output,
             Some(json!(7)),
             "历史 published 版本（v1 定义 output=7）仍可执行"
         );
@@ -319,68 +320,71 @@ async fn run_signal_error_codes_follow_the_shared_contract() {
     assert_eq!(response["error"]["code"], -32602, "{response}");
 }
 
-/// 指定 run_id 的订阅契约（两后端共享 run_tail）：先回放完整日志、
-/// 追实时增量、seq 从 1 严格连续，run 终态追平后流自然结束。
+/// Native subscriptions include every control fact, including waiting and signals.
 #[tokio::test]
 async fn subscribe_with_run_id_replays_follows_and_naturally_ends() {
-    use futures::StreamExt;
-
     let f = Fixture::new().await;
-    let wf = f.backend.workflow_create("human", None).await.unwrap();
-    let wf = wf.result["workflow_id"].as_str().unwrap().to_string();
+    let wf = f
+        .backend
+        .workflow_create("human", None)
+        .await
+        .unwrap()
+        .result["workflow_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     f.backend
         .workflow_update(&wf, human_def(), None)
         .await
         .unwrap();
     f.backend.workflow_publish(&wf, 1, None).await.unwrap();
-    let response = f.call("run.start", json!({"workflow_id": wf})).await;
-    let run = response["result"]["run_id"].as_str().unwrap().to_string();
-    let until = wait_human_waiting(&f, &run).await;
-
-    let stream = f.arm.subscribe(Some(run.clone()));
-    futures::pin_mut!(stream);
-
-    // 回放段：覆盖到等待点之前的全部已映射事件（WaitRegistered 占用尾部
-    // 序号但不映射到 v1 事件面——journal 的 seq 允许空洞）
-    let mut seqs: Vec<u64> = Vec::new();
-    while (seqs.len() as u64) < until.saturating_sub(1) {
-        let envelope = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await
-            .expect("回放停滞")
-            .expect("回放提前结束");
-        assert_eq!(envelope.run_id, run);
-        seqs.push(envelope.seq);
-    }
-
-    // 交付信号推进 run 到终态：流必须吐完增量并自然结束
-    let response = f
-        .call(
-            "run.signal",
-            json!({"run_id": run, "node_id": "h", "payload": {"ok": true}}),
-        )
-        .await;
-    assert_eq!(response["result"]["delivered"], true, "{response}");
-
-    while let Some(envelope) = tokio::time::timeout(Duration::from_secs(5), stream.next())
+    let run = f
+        .backend
+        .run_start(&wf, None, Value::Null, "manual", None, None)
         .await
-        .expect("订阅流未在终态后结束")
-    {
-        assert_eq!(envelope.run_id, run);
-        seqs.push(envelope.seq);
+        .unwrap()
+        .result["run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let until = wait_human_waiting(&f, &run).await;
+    let module = flow_rpc::journal_v2::module(f.backend.clone(), TOKEN.into()).unwrap();
+    let request=json!({"jsonrpc":"2.0","id":1,"method":"run.subscribe","params":{"_token":TOKEN,"run_id":run,"event_format":"v2"}}).to_string();
+    let (_, mut stream) = module.raw_json_request(&request, 64).await.unwrap();
+    let mut seqs = Vec::new();
+    let mut waiting = false;
+    while seqs.len() < until as usize {
+        let raw = tokio::time::timeout(Duration::from_secs(5), stream.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let v: Value = serde_json::from_str(raw.get()).unwrap();
+        let event = &v["params"]["result"]["event"];
+        waiting |= event["kind"] == "wait_registered";
+        seqs.push(event["run_seq"].as_str().unwrap().parse::<u64>().unwrap());
     }
-
-    assert_eq!(seqs.first(), Some(&1u64), "从 1 开始：{seqs:?}");
-    assert!(
-        seqs.windows(2).all(|w| w[0] < w[1]),
-        "journal 序号严格递增（允许空洞）：{seqs:?}"
+    assert!(waiting);
+    f.backend
+        .run_signal(&run, "h", json!({"ok":true}), Some("signal-once"))
+        .await
+        .unwrap();
+    while let Some(raw) = tokio::time::timeout(Duration::from_secs(5), stream.recv())
+        .await
+        .unwrap()
+    {
+        let v: Value = serde_json::from_str(raw.get()).unwrap();
+        seqs.push(
+            v["params"]["result"]["event"]["run_seq"]
+                .as_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        seqs,
+        (1..=f.backend.state().await.runs[&run].last_run_seq).collect::<Vec<_>>()
     );
-    let events = f.arm.read_events(&run, None).await.unwrap();
-    let last = events.last().unwrap();
-    assert_eq!(last.seq, *seqs.last().unwrap());
-    assert!(matches!(
-        last.event,
-        flow_engine::Event::RunCompleted { .. }
-    ));
 }
 
 #[tokio::test]
@@ -609,16 +613,13 @@ async fn run_stats_counts_exactly_and_groups_by_workflow() {
         .await;
     let run1 = r1["result"]["run_id"].as_str().unwrap().to_string();
     f.wait_finished(&run1).await; // succeeded
-    f.arm
-        .create_run(CreateRun {
-            workflow_id: f.workflow.clone(),
-            version: None,
-            input: Value::Null,
-            source: "manual".into(),
-            source_detail: None,
-        })
+    let extra = f
+        .backend
+        .run_start(&f.workflow, None, Value::Null, "manual", None, None)
         .await
         .unwrap();
+    f.wait_finished(extra.result["run_id"].as_str().unwrap())
+        .await;
     let wf2 = f.backend.workflow_create("other", None).await.unwrap();
     let wf2 = wf2.result["workflow_id"].as_str().unwrap().to_string();
     f.backend
@@ -918,7 +919,7 @@ async fn config_get_update_roundtrip_writes_file_and_redacts_database_url() {
         .await
         .unwrap();
     let state = Arc::new(AppState {
-        backend: AnyBackend::Journal(backend.clone()),
+        backend: backend.clone(),
         config: Some(flow_rpc::ConfigState {
             config: std::sync::RwLock::new(flow_config::Config::default()),
             path: Some(config_path.clone()),
@@ -929,7 +930,6 @@ async fn config_get_update_roundtrip_writes_file_and_redacts_database_url() {
     let f = Fixture {
         root: root.clone(),
         backend: backend.clone(),
-        arm: AnyBackend::Journal(backend),
         state,
         workflow: String::new(),
     };

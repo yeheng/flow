@@ -19,11 +19,11 @@ use crate::report::{Latency, Report};
 /// 读路径压的定义：3 层脚本链（每 run 5 个事件左右）。
 const READ_CHAIN_DEPTH: usize = 3;
 const METHODS: [&str; 5] = [
-    "run.get.full",
-    "run.list.full",
+    "run.get.view",
+    "run.list.view",
     "run.stats",
     "run.timeline",
-    "run.events.full",
+    "run.events.view",
 ];
 
 pub async fn run(ctx: &mut Ctx, opts: &Opts) -> Vec<Report> {
@@ -60,7 +60,7 @@ pub async fn run(ctx: &mut Ctx, opts: &Opts) -> Vec<Report> {
         let run_id = &run_ids[index % run_ids.len()];
         for (method, latency) in latencies.iter_mut() {
             let params = match *method {
-                "run.list.full" => json!({ "limit": 50 }),
+                "run.list.view" => json!({ "limit": 50 }),
                 "run.stats" => json!({}),
                 _ => json!({ "run_id": run_id }),
             };

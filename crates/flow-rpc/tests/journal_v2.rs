@@ -343,7 +343,7 @@ async fn delete_workflow_with_runs_is_rejected_by_authoritative_rpc() {
     assert_eq!(rejected["error"]["code"], -32012, "{rejected}");
     assert_eq!(backend.journal.durable_lsn(), before);
     assert!(
-        flow_backend::journal_arm::get_version(&backend, workflow, Some(1))
+        flow_backend::journal_views::get_version(&backend, workflow, Some(1))
             .await
             .is_ok()
     );

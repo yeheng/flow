@@ -20,12 +20,11 @@ use std::time::Duration;
 async fn wait_node_started(client: &Conn, run_id: &str, node_id: &str) {
     let deadline = std::time::Instant::now() + SHORT;
     loop {
-        let events: Value = call_json(client, "run.events.full", json!({"run_id": run_id})).await;
-        let started = events["events"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|e| e["type"] == json!("node_started") && e["node_id"] == json!(node_id));
+        let events: Value = call_json(client, "run.events.view", json!({"run_id": run_id})).await;
+        let started = events["events"].as_array().unwrap().iter().any(|e| {
+            e["event"]["kind"] == json!("dispatch_started")
+                && e["event"]["node_id"] == json!(node_id)
+        });
         if started {
             return;
         }
@@ -224,7 +223,7 @@ e2e_test!(
         assert_eq!(before["run"]["status"], json!("succeeded"));
 
         let events_before: Value =
-            call_json(&client, "run.events.full", json!({"run_id": run_id})).await;
+            call_json(&client, "run.events.view", json!({"run_id": run_id})).await;
         let events_before = events_before["events"].as_array().unwrap().clone();
         assert!(!events_before.is_empty());
 
@@ -232,13 +231,13 @@ e2e_test!(
         let client = ctx.client().await;
 
         // 终态 run 重启后保持终态、事件一字不差（恢复不得产生第二个写者，§12.14）
-        let after: Value = call_json(&client, "run.get.full", json!({"run_id": run_id})).await;
+        let after: Value = call_json(&client, "run.get.view", json!({"run_id": run_id})).await;
         assert_eq!(after["run"]["status"], json!("succeeded"));
         assert_eq!(after["run"]["output"], json!(1));
         assert_eq!(after["live"], json!(false));
 
         let events_after: Value =
-            call_json(&client, "run.events.full", json!({"run_id": run_id})).await;
+            call_json(&client, "run.events.view", json!({"run_id": run_id})).await;
         assert_eq!(
             events_after["events"].as_array().unwrap(),
             &events_before,
@@ -246,7 +245,13 @@ e2e_test!(
         );
         let seqs: Vec<u64> = events_before
             .iter()
-            .map(|e| e["seq"].as_u64().unwrap())
+            .map(|e| {
+                e["event"]["run_seq"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+            })
             .collect();
         assert_eq!(
             seqs,

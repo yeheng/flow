@@ -793,7 +793,6 @@ dependencies = [
  "flow-dto",
  "flow-engine",
  "flow-journal",
- "flow-pg",
  "flow-store",
  "flow-test-support",
  "fs2",
@@ -925,29 +924,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "flow-pg"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "flow-config",
- "flow-dto",
- "flow-engine",
- "flow-test-support",
- "futures",
- "hex",
- "parking_lot",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "sqlx",
- "thiserror 2.0.20",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "flow-rpc"
 version = "0.1.0"
 dependencies = [
@@ -957,9 +933,9 @@ dependencies = [
  "cron-parser",
  "flow-backend",
  "flow-config",
+ "flow-dto",
  "flow-engine",
  "flow-journal",
- "flow-pg",
  "flow-store",
  "flow-test-support",
  "futures",

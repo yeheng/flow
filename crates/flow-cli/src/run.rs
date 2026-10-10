@@ -120,7 +120,7 @@ async fn wait_terminal(
     loop {
         let run = run_record(client, run_id).await?;
         let status = run["status"].as_str().unwrap_or_default();
-        if flow_dto::DbRunStatus::is_terminal_str(status) {
+        if flow_dto::RunStatus::is_terminal_str(status) {
             return Ok(run);
         }
         if Instant::now() >= deadline {
@@ -136,7 +136,7 @@ async fn wait_terminal(
 async fn run_record(client: &WsClient, run_id: &str) -> Result<Value, CliError> {
     Ok(call(
         client,
-        "run.get.full",
+        "run.get.view",
         object(vec![("run_id", json!(run_id))]),
     )
     .await?
@@ -177,7 +177,7 @@ async fn list(
         params.push(("source", json!(source)));
     }
     params.push(("limit", json!(limit)));
-    let result = call(client, "run.list.full", object(params)).await?;
+    let result = call(client, "run.list.view", object(params)).await?;
     if json {
         print_json(&result);
         return Ok(());
@@ -223,7 +223,7 @@ async fn list(
 async fn get(client: &WsClient, json: bool, run_id: &str) -> Result<(), CliError> {
     let result = call(
         client,
-        "run.get.full",
+        "run.get.view",
         object(vec![("run_id", json!(run_id))]),
     )
     .await?;
@@ -247,19 +247,38 @@ async fn get(client: &WsClient, json: bool, run_id: &str) -> Result<(), CliError
 
 /// 原始事件：一行一个 compact JSON（JSONL），可直接 jq / 落盘再分析。
 async fn events(client: &WsClient, run_id: &str, from_seq: Option<u64>) -> Result<(), CliError> {
-    let mut params = vec![("run_id", json!(run_id))];
-    if let Some(from_seq) = from_seq {
-        params.push(("from_seq", json!(from_seq)));
+    let mut cursor = Value::Null;
+    let mut count = 0;
+    loop {
+        let result = call(
+            client,
+            "run.events.page",
+            object(vec![
+                ("run_id", json!(run_id)),
+                ("cursor", cursor),
+                ("limit", json!(256)),
+            ]),
+        )
+        .await?;
+        for event in result["events"]
+            .as_array()
+            .ok_or_else(|| CliError::local("invalid event page"))?
+        {
+            let seq = event["event"]["run_seq"]
+                .as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                .ok_or_else(|| CliError::local("invalid run sequence"))?;
+            if from_seq.is_none_or(|from| seq >= from) {
+                println!("{event}");
+                count += 1;
+            }
+        }
+        cursor = result["next_cursor"].clone();
+        if cursor.is_null() {
+            break;
+        }
     }
-    let result = call(client, "run.events.full", object(params)).await?;
-    let events = result["events"]
-        .as_array()
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    for event in events {
-        println!("{}", serde_json::to_string(event).unwrap_or_default());
-    }
-    note(format!("共 {} 条事件", events.len()));
+    note(format!("共 {count} 条事件"));
     Ok(())
 }
 

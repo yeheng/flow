@@ -1,16 +1,10 @@
 import { computed, reactive } from "vue";
 import * as api from "../api/flow";
 import { client, errText } from "../rpc/client";
-import type { LogLine, RunEvent, TimelineNode } from "../types";
+import type { LogLine, TimelineNode } from "../types";
 import { editor } from "./editor";
 import { TERMINAL_RUN_STATUSES } from "./labels";
-import {
-  alignProjection,
-  applyEvent,
-  drainBuffer,
-  seqAction,
-  type RunProjection,
-} from "./monitor-logic";
+import { appendObservations } from "./monitor-logic";
 import { toast } from "./toast";
 
 export const monitor = reactive({
@@ -35,9 +29,10 @@ export const monitor = reactive({
   /** `logs` 按 node_id 的索引（与 logs 同步维护，见 monitor-logic.applyLog） */
   logsByNode: {} as Record<string, LogLine[]>,
   /** 日志去重水位：已收到的最大 node_log seq */
-  lastLogSeq: 0,
+  lastLogSeq: "0",
   /** 子 run 钻取栈：栈顶是当前 run 的直接父 run */
   breadcrumb: [] as { runId: string; workflowId: string }[],
+  observationLoss: false,
   starting: false,
   /** 取消/交付信号进行中（按钮禁用，防重复点击） */
   cancelling: false,
@@ -64,7 +59,7 @@ export const needReattach = computed(() => monitor.runId !== null && !isTerminal
 
 /** human_task 等待信号中的节点 */
 export const waitingHumanTasks = computed(() =>
-  monitor.nodes.filter((n) => n.type === "human_task" && n.state === "running"),
+  monitor.nodes.filter((n) => n.type === "human_task" && n.wait?.kind === "signal"),
 );
 
 export function nodeRunState(nodeId: string): string | null {
@@ -124,76 +119,54 @@ export async function startRun(): Promise<void> {
  */
 async function attach(runId: string): Promise<boolean> {
   const token = ++attachToken;
-  if (unsubscribe) {
-    await unsubscribe().catch(() => {});
-    unsubscribe = null;
-  }
-
-  // 局部投影：订阅建立与 timeline 对齐之间到达的事件先入缓冲。
-  // status 缺省 null = 「还不知道」：不撒谎成 running（会对已终结的 run 显示
-  // 可用取消按钮），canCancelRun / needReattach 也不依赖它是否为 running。
-  const proj: RunProjection = {
-    status: null as string | null,
-    logsByNode: {} as Record<string, LogLine[]>,
-    output: undefined as unknown,
-    fatalError: null as string | null,
-    lastSeq: 0,
-    nodes: [] as TimelineNode[],
-    logs: [],
-    lastLogSeq: 0,
-  };
-  const buffer: RunEvent[] = [];
-  let aligned = false;
-
-  const onEvent = (env: RunEvent): void => {
-    if (env.run_id !== runId) return;
-    if (!aligned) {
-      buffer.push(env);
-      return;
-    }
-    // 换入后又被新的 attach/detach 取代：事件不再属于当前 monitor
-    if (monitor.runId !== runId) return;
-    // 日志有自己的水位（历史/实时统一路径），不走状态事件过滤
-    if (env.type === "node_log") {
-      applyEvent(monitor, env);
-      return;
-    }
-    if (seqAction(monitor.lastSeq, env.seq) === "skip") return;
-    applyEvent(monitor, env);
-  };
-
-  const unsub = await api.subscribeRun(runId, onEvent);
-
-  const tl = await api.runTimeline(runId).catch((e: unknown) => {
-    if (token === attachToken) toast.error(errText(e));
-    return null;
+  if (unsubscribe) { await unsubscribe().catch(() => {}); unsubscribe = null; }
+  let closed = false, dirty = false, syncing = false;
+  let timer: ReturnType<typeof setInterval> | undefined;
+  const current = () => !closed && token === attachToken;
+  const unsub = await api.subscribeRun(runId, record => {
+    if (!record.event || record.event.run_id === runId) dirty = true;
   });
-  if (tl) alignProjection(proj, tl);
-
-  // 构建期间出现了更新的 attach 或 detach：本次作废，monitor 不动
-  if (token !== attachToken) {
-    void unsub().catch(() => {});
-    return false;
-  }
-
-  // 原子换入（同步块，无 await）：monitor 从旧 run 整体切到新 run
-  unsubscribe = unsub;
+  const dispose = async () => { closed = true; if (timer) clearInterval(timer); await unsub(); };
+  const initial = await api.runTimeline(runId).catch((e: unknown) => {
+    if (current()) toast.error(errText(e)); return null;
+  });
+  if (!current()) { await dispose().catch(() => {}); return false; }
+  unsubscribe = dispose;
   monitor.runId = runId;
-  monitor.status = proj.status;
-  monitor.output = proj.output;
-  monitor.fatalError = proj.fatalError;
-  monitor.lastSeq = proj.lastSeq;
-  monitor.nodes = proj.nodes;
-  monitor.logs = proj.logs;
-  monitor.logsByNode = proj.logsByNode;
-  monitor.lastLogSeq = proj.lastLogSeq;
-  // 钻取子 run 后着色守卫按子 run 自己的工作流对齐；timeline 拉取失败时退化为不着色
-  monitor.workflowId = tl?.workflow_id ?? null;
-  aligned = true;
-  // 回放段含全部历史日志（订阅从 seq=1 回放），排序后统一补放：
-  // 状态事件由 seqAction 去重，日志由 lastLogSeq 水位去重
-  drainBuffer(buffer).forEach(onEvent);
-  return true;
+  monitor.workflowId = initial?.workflow_id ?? null;
+  monitor.status = initial?.status ?? null;
+  monitor.nodes = initial?.nodes ?? [];
+  monitor.output = initial?.output;
+  monitor.fatalError = initial?.fatal_error ?? null;
+  monitor.lastSeq = initial?.last_seq ?? 0;
+  monitor.logs = []; monitor.logsByNode = {}; monitor.lastLogSeq = "0";
+  monitor.observationLoss = false;
+  const refresh = async () => {
+    if (!current() || syncing) return;
+    syncing = true;
+    try {
+      if (dirty || monitor.status === null) {
+        dirty = false;
+        const snapshot = await api.runTimeline(runId);
+        if (!current()) return;
+        monitor.status = snapshot.status; monitor.nodes = snapshot.nodes;
+        monitor.workflowId = snapshot.workflow_id; monitor.lastSeq = snapshot.last_seq;
+        monitor.output = snapshot.output; monitor.fatalError = snapshot.fatal_error;
+      }
+      // The observation store flushes independently of the last control event.
+      for (let page = 0; page < 4 && current(); page++) {
+        const observations = await api.runObservations(runId, monitor.lastLogSeq);
+        if (!current()) return;
+        appendObservations(monitor, observations.records);
+        monitor.observationLoss ||= Object.values(observations.loss).some(Boolean);
+        if (observations.records.length < 256) break;
+      }
+    } catch { dirty = true; }
+    finally { syncing = false; }
+  };
+  timer = setInterval(() => { void refresh(); }, 250);
+  await refresh();
+  return current();
 }
 
 /**
@@ -232,8 +205,9 @@ export async function detachRun(): Promise<void> {
   monitor.nodes = [];
   monitor.logs = [];
   monitor.logsByNode = {};
-  monitor.lastLogSeq = 0;
+  monitor.lastLogSeq = "0";
   monitor.breadcrumb = [];
+  monitor.observationLoss = false;
 }
 
 /** 钻取 sub_workflow 节点的子 run */

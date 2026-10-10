@@ -278,6 +278,8 @@ export type NodeRunState = "pending" | "running" | "retrying" | "completed" | "f
 
 /** run.timeline 节点条目（crates/flow-rpc/src/lib.rs timeline_value） */
 export interface TimelineNode {
+  wait?: { kind: string; child_run_id?: string | null } | null;
+  operation_id?: string | null;
   id: string;
   name: string;
   type: string;
@@ -303,7 +305,7 @@ export type LogStream = "engine" | "stdout" | "stderr";
 
 /** 前端日志行：node_log 事件的前端形态（日志控制台/节点检查器共用） */
 export interface LogLine {
-  seq: number;
+  seq: string;
   ts: string;
   node_id: string;
   attempt: number;
@@ -315,13 +317,6 @@ export interface LogLine {
 export interface Timeline {
   run_id: string;
   status: string;
-  /**
-   * 服务端 timeline 仍带 phase（fold 相位），但前端不再消费：它与 status 对
-   * awaiting_resume 不一致（phase=running / status=awaiting_resume），是前端
-   * 曾经需要 SPECIAL_STATUS 特判才能渲染对配色的根因。字段保留在 wire 上，
-   * 前端只以 status 为准。
-   */
-  phase: RunPhase;
   workflow_id: string;
   workflow_version: number;
   started_at: string | null;
@@ -332,36 +327,16 @@ export interface Timeline {
   nodes: TimelineNode[];
 }
 
-/**
- * run.event 通知载荷：crates/flow-engine/src/event.rs 的 Envelope，
- * event 经 #[serde(flatten)] 扁平展开（type + 各事件字段）。
- */
+/** Native V2 event positions; control/audit sequences are decimal strings. */
 export interface RunEvent {
-  seq: number;
-  ts: string;
+  lsn: string;
+  event_index: number;
+  event: { run_id: string | null; run_seq: string; kind: string; node_id?: string; payload: unknown };
+}
+export interface ObservationRecord {
+  seq: string;
   run_id: string;
-  type:
-    | "run_started"
-    | "node_started"
-    | "node_completed"
-    | "node_failed"
-    | "node_skipped"
-    | "node_log"
-    | "signal_received"
-    | "run_completed"
-    | "run_failed"
-    | "run_cancelled";
-  node_id?: string;
-  attempt?: number;
-  child_run_id?: string;
-  input?: unknown;
-  output?: unknown;
-  duration_ms?: number;
-  error?: string;
-  retryable?: boolean;
-  reason?: string;
-  level?: LogLevel;
-  stream?: LogStream;
-  message?: string;
-  payload?: unknown;
+  dispatch_id: string;
+  ts: string;
+  line: Omit<LogLine, "seq" | "ts">;
 }

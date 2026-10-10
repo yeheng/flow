@@ -23,13 +23,13 @@ e2e_test!(
         wait_run_terminal(&client, &run, TIMEOUT).await;
         let mut sub = subscribe(&client, &run).await;
         let streamed = collect_run_events(&mut sub, &run, TIMEOUT).await;
-        let logged = call_json(&client, "run.events.full", json!({"run_id":run})).await;
+        let logged = call_json(&client, "run.events.view", json!({"run_id":run})).await;
         assert_eq!(streamed.len(), logged["events"].as_array().unwrap().len());
         for (event, logged) in streamed.iter().zip(logged["events"].as_array().unwrap()) {
-            assert_eq!(event["seq"], logged["seq"]);
-            assert_eq!(event["type"], logged["type"]);
+            assert_eq!(event["event"]["run_seq"], logged["event"]["run_seq"]);
+            assert_eq!(event["event"]["kind"], logged["event"]["kind"]);
         }
-        assert_eq!(streamed.last().unwrap()["type"], "run_completed");
+        assert_eq!(streamed.last().unwrap()["event"]["kind"], "run_completed");
     })
 );
 
@@ -47,7 +47,7 @@ e2e_test!(
 
         // journal 的 seq 是 v2 权威序号：等待注册等事实占用序号但不出现在
         // v1 事件面（映射后允许空洞）；timeline.last_seq 是折影水位 ≥ 事件数。
-        let allow_gaps = true;
+        let allow_gaps = false;
         // 中途订阅：先回放完整历史，再接实时增量
         let mut sub = subscribe(&client, &run_id).await;
         let mut seqs: Vec<u64> = Vec::new();
@@ -69,8 +69,14 @@ e2e_test!(
                 .expect("回放停滞")
                 .expect("回放提前结束");
             let envelope = msg.expect("订阅消息错误");
-            assert_eq!(envelope["run_id"], json!(run_id));
-            seqs.push(envelope["seq"].as_u64().unwrap());
+            assert_eq!(envelope["event"]["run_id"], json!(run_id));
+            seqs.push(
+                envelope["event"]["run_seq"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap(),
+            );
         }
         if allow_gaps {
             assert_eq!(
@@ -95,7 +101,13 @@ e2e_test!(
         .await;
         let streamed = collect_run_events(&mut sub, &run_id, SHORT).await;
         for envelope in &streamed {
-            seqs.push(envelope["seq"].as_u64().unwrap());
+            seqs.push(
+                envelope["event"]["run_seq"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap(),
+            );
         }
         if allow_gaps {
             // journal：严格递增、无重复（空洞合法，见回放段注释）
@@ -111,7 +123,10 @@ e2e_test!(
                 "回放 + 增量无缝衔接：{seqs:?}"
             );
         }
-        assert_eq!(streamed.last().unwrap()["type"], json!("run_completed"));
+        assert_eq!(
+            streamed.last().unwrap()["event"]["kind"],
+            json!("run_completed")
+        );
 
         // 终态之后流不再产出（服务端流已结束；wire 上表现为静默）
         let extra = tokio::time::timeout(Duration::from_secs(2), sub.next())
@@ -160,10 +175,10 @@ e2e_test!(subscriptions_isolate_runs, |ctx: &mut Ctx| Box::pin(
             collect_run_events(&mut a, &first, TIMEOUT),
             collect_run_events(&mut b, &second, TIMEOUT)
         );
-        assert!(a.iter().all(|e| e["run_id"] == first));
-        assert!(b.iter().all(|e| e["run_id"] == second));
-        assert_eq!(a.last().unwrap()["type"], "run_completed");
-        assert_eq!(b.last().unwrap()["type"], "run_completed");
+        assert!(a.iter().all(|e| e["event"]["run_id"] == first));
+        assert!(b.iter().all(|e| e["event"]["run_id"] == second));
+        assert_eq!(a.last().unwrap()["event"]["kind"], "run_completed");
+        assert_eq!(b.last().unwrap()["event"]["kind"], "run_completed");
     }
 ));
 
@@ -206,7 +221,11 @@ e2e_test!(
             assert!(
                 index == 0
                     || streamed[index - 1]["seq"].as_u64().unwrap()
-                        < event["seq"].as_u64().unwrap(),
+                        < event["event"]["run_seq"]
+                            .as_str()
+                            .unwrap()
+                            .parse::<u64>()
+                            .unwrap(),
                 "订阅流 seq 严格递增：{streamed:?}"
             );
         }
@@ -217,7 +236,10 @@ e2e_test!(
         for (index, log) in logs.iter().enumerate() {
             assert_eq!(log["line"]["message"], json!(format!("line {index}")));
         }
-        assert_eq!(streamed.last().unwrap()["type"], json!("run_completed"));
+        assert_eq!(
+            streamed.last().unwrap()["event"]["kind"],
+            json!("run_completed")
+        );
     })
 );
 
@@ -245,7 +267,10 @@ e2e_test!(
         let streamed = collect_run_events(&mut sub, &run_id, TIMEOUT).await;
         let completed = streamed
             .iter()
-            .find(|e| e["type"] == json!("node_completed") && e["node_id"] == json!("n1"))
+            .find(|e| {
+                e["event"]["kind"] == json!("node_completed")
+                    && e["event"]["node_id"] == json!("n1")
+            })
             .unwrap_or_else(|| panic!("订阅流里没有 n1 的 node_completed：{streamed:?}"));
 
         assert_eq!(
@@ -256,15 +281,18 @@ e2e_test!(
         assert_eq!(completed["output"]["ok"], json!(1), "非敏感字段不动");
 
         // 数据面不变：事件日志里仍是原始值（下游节点/fold 要消费它）
-        let events: Value = call_json(&client, "run.events.full", json!({"run_id": run_id})).await;
+        let events: Value = call_json(&client, "run.events.view", json!({"run_id": run_id})).await;
         let logged = events["events"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|e| e["type"] == json!("node_completed") && e["node_id"] == json!("n1"))
+            .find(|e| {
+                e["event"]["kind"] == json!("node_completed")
+                    && e["event"]["node_id"] == json!("n1")
+            })
             .unwrap_or_else(|| panic!("事件日志里没有 n1 的 node_completed"));
         assert_eq!(
-            logged["output"]["token"],
+            logged["event"]["payload"]["output"]["value"]["token"],
             json!("sk-secret-value"),
             "事件日志是数据面，不该被脱敏污染：{logged:#}"
         );

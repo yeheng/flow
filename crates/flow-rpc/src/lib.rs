@@ -19,7 +19,8 @@
 
 use std::sync::Arc;
 
-use flow_backend::{AnyBackend, Definition, Envelope, Event, NodeState, NodeType, RunState};
+use flow_backend::journal::JournalBackend;
+use flow_backend::NodeType;
 use jsonrpsee::types::error::{ErrorObject, ErrorObjectOwned};
 use serde_json::{json, Value};
 
@@ -29,7 +30,7 @@ pub mod journal_v2;
 
 /// RPC 层状态：v2 产品装配的工作副本（config.get/update、secrets.set/delete）。
 pub struct AppState {
-    pub backend: AnyBackend,
+    pub backend: Arc<JournalBackend>,
     /// 统一配置面（config.get / config.update 的工作副本）。
     /// `Some` 时 update 可写回文件；`None`（测试简装）只回默认值。
     /// 这里的 config 是**文件级**视图（默认值 + 文件，不含 env 覆盖）——
@@ -54,7 +55,7 @@ impl AppState {
     /// （secret.key + secrets.json）；安装进程级 SecretSource 失败（重复）
     /// 只告警——先装先得，第二个入口不该发生。
     pub async fn for_production(
-        backend: AnyBackend,
+        backend: Arc<JournalBackend>,
         config_state: ConfigState,
         data_dir: &std::path::Path,
     ) -> (
@@ -182,12 +183,8 @@ pub async fn serve_journal_product(
         path: config_path.clone(),
         env_overrides: flow_config::Config::load(config_path.as_deref())?.env_overrides,
     };
-    let (state, _secrets) = AppState::for_production(
-        AnyBackend::Journal(backend.clone()),
-        config_state,
-        &data_dir,
-    )
-    .await;
+    let (state, _secrets) =
+        AppState::for_production(backend.clone(), config_state, &data_dir).await;
     let module = journal_v2::module_product(backend.clone(), token, Some(state))?;
     let (server, addr) = journal_v2::serve_product(module, addr).await?;
     tracing::info!(
@@ -222,90 +219,6 @@ pub async fn serve_journal_product(
     Ok(())
 }
 
-pub fn timeline_value(
-    run_id: &str,
-    run_status: &str,
-    workflow_id: &str,
-    workflow_version: i64,
-    definition: &Definition,
-    snapshot: &RunState,
-) -> Value {
-    let nodes: Vec<Value> = definition
-        .nodes
-        .iter()
-        .map(|node| {
-            let record = snapshot.record(&node.id);
-            // output 展示出口脱敏（固定敏感键）：事件日志里的原始 output 是
-            // 下游节点的数据面，不能动；这里只脱时间线的展示值。
-            // input 在 node_started 写入时已脱敏，直接透传。
-            // 节点输出的唯一所有者是 NodeRecord.output（见 fold.rs）
-            //
-            // 同一规则在订阅通知上还有一份（`redact_display_envelope`）——
-            // 两个展示面必须同规则，否则前端会用一个覆盖另一个。
-            let output = record
-                .output()
-                .cloned()
-                .map(|v| flow_backend::redact_value(&v));
-            let mut entry = json!({
-                "id": node.id,
-                "name": node.name,
-                "type": node.node_type,
-                "state": record.state.label(),
-                // attempts / error 从 state 派生（NodeRecord 不存副本，见
-                // NodeState::attempt / ::error）——wire 形状逐字不变。
-                "attempts": record.state.attempt(),
-                "started_at": record.started_at,
-                "ended_at": record.ended_at,
-                "duration_ms": record.duration_ms,
-                "input": record.input,
-                "output": output,
-                "error": record.state.error(),
-                "child_run_id": record.child_run_id,
-            });
-            if let NodeState::Skipped { reason } = &record.state {
-                entry["reason"] = json!(reason);
-            }
-            entry
-        })
-        .collect();
-
-    json!({
-        "run_id": run_id,
-        "status": run_status,
-        "phase": snapshot.phase,
-        "workflow_id": workflow_id,
-        "workflow_version": workflow_version,
-        "started_at": snapshot.started_at,
-        "ended_at": snapshot.ended_at,
-        // run 级 output 是**数据面**：与 run.get / run_completed 事件逐字一致。
-        // 脱敏只发生在节点级展示值（上面 nodes[].output）——节点的输出可能是
-        // 上游 HTTP 响应（会回显凭据），而 run 级 output 就是 run.get 那个值。
-        // 同名字段必须同值：否则客户端从 timeline 重建输出会拿到污染数据。
-        "output": snapshot.output,
-        "fatal_error": snapshot.fatal_error,
-        "last_seq": snapshot.last_seq,
-        "nodes": nodes,
-    })
-}
-
-/// 订阅通知的展示脱敏：`node_completed.output` 按与 [`timeline_value`] 同一
-/// 规则脱敏后下发。
-///
-/// **为什么订阅也要脱敏**：事件日志里存的是原始 output（数据面，下游节点要
-/// 消费，不能动），而展示面有两处——timeline 投影与订阅通知。只脱一处时，
-/// 前端 `applyEvent(node_completed)` 会用事件里的原始值**覆盖** timeline 的
-/// 脱敏值（monitor-logic.ts），实时观看的 run 于是把敏感值原样显示出来，
-/// 而同一个 run 事后查看反而是脱敏的——同一个字段两种命运。
-///
-/// 与 timeline 的差异只有一处：run 级 output（`run_completed`）两面都不脱敏
-/// （它就是 run.get 那个数据面值，同名字段必须同值），见 timeline_value 注释。
-pub(crate) fn redact_display_envelope(mut envelope: Envelope) -> Envelope {
-    if let Event::NodeCompleted { output, .. } = &mut envelope.event {
-        *output = flow_backend::redact_value(output);
-    }
-    envelope
-}
-
 /// 前端拖拽面板 + 参数表单所需的能力清单。
 ///
 /// 单条描述的唯一来源是 `flow_engine::NodeType::descriptor`（与引擎共用一份
@@ -327,7 +240,7 @@ pub(crate) fn validate_cron(expr: &str) -> Result<(), ErrorObjectOwned> {
 
 /// schedule 响应：实体字段 + 服务端算好的 next_fire_at（RFC3339，本地时区偏移）。
 /// 存量数据 cron 损坏时 next_fire_at 为 null，不让 list 整个失败。
-pub(crate) fn schedule_value(schedule: &flow_backend::Schedule) -> Value {
+pub(crate) fn schedule_value(schedule: &flow_dto::Schedule) -> Value {
     let next_fire_at = schedule
         .cron_expr
         .parse::<cron_parser::Schedule>()

@@ -4,13 +4,13 @@
 use std::path::PathBuf;
 
 use flow_backend::journal::JournalBackend;
-use flow_backend::AnyBackend;
+use std::sync::Arc;
 const TOKEN: &str = "flow-hook-test-token-at-least-32-bytes";
 use serde_json::{json, Value};
 
 struct Fixture {
     root: PathBuf,
-    arm: AnyBackend,
+    backend: Arc<JournalBackend>,
     base: String,
     client: reqwest::Client,
 }
@@ -34,7 +34,7 @@ impl Fixture {
         });
         Self {
             root,
-            arm: AnyBackend::Journal(backend),
+            backend,
             base: format!("http://{addr}"),
             client: reqwest::Client::new(),
         }
@@ -42,28 +42,43 @@ impl Fixture {
 
     /// 建 workflow；publish=true 时写入并发布最简定义。
     async fn workflow(&self, publish: bool) -> String {
-        let arm = &self.arm;
-        let wf = arm.create_workflow("t").await.unwrap();
+        let wf = self
+            .backend
+            .workflow_create("t", None)
+            .await
+            .unwrap()
+            .result["workflow_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         if publish {
-            let v = arm
-                .update_workflow(
-                    &wf,
-                    &json!({
-                        "nodes": [
-                            {"id": "s", "type": "start"},
-                            {"id": "n", "type": "script", "params": {"code": "return 1;"}},
-                            {"id": "e", "type": "end"}
-                        ],
-                        "edges": [{"from": "s", "to": "n"}, {"from": "n", "to": "e"}]
-                    }),
-                )
-                .await
-                .unwrap();
-            arm.publish(&wf, v).await.unwrap();
+            self.backend.workflow_update(&wf,json!({"nodes":[{"id":"s","type":"start"},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"e"}]}),None).await.unwrap();
+            self.backend.workflow_publish(&wf, 1, None).await.unwrap();
         }
         wf
     }
-
+    async fn hook(&self, wf: &str) -> flow_dto::Webhook {
+        let created = self
+            .backend
+            .product_command(
+                "webhook.create",
+                &json!({"workflow_id":wf}),
+                &uuid::Uuid::now_v7().to_string(),
+            )
+            .await
+            .unwrap();
+        serde_json::from_value(created.result).unwrap()
+    }
+    async fn enable(&self, token: &str, enabled: bool) {
+        self.backend
+            .product_command(
+                "webhook.set_enabled",
+                &json!({"token":token,"enabled":enabled}),
+                &uuid::Uuid::now_v7().to_string(),
+            )
+            .await
+            .unwrap();
+    }
     async fn post(&self, token: &str, body: &str) -> (u16, Value) {
         let resp = self
             .client
@@ -98,14 +113,16 @@ impl Drop for Fixture {
 async fn webhook_post_triggers_run_with_source_attribution() {
     let f = Fixture::new().await;
     let wf = f.workflow(true).await;
-    let hook = f.arm.create_webhook(&wf).await.unwrap();
+    let hook = f.hook(&wf).await;
 
     let (status, body) = f.post(&hook.token, r#"{"src":"hook"}"#).await;
     assert_eq!(status, 200, "{body}");
     let run_id = body["run_id"].as_str().unwrap();
 
     // run 归因：source=webhook，detail=token；input 透传 body
-    let run = f.arm.get_run(run_id).await.unwrap();
+    let run = flow_backend::journal_views::get_run(&f.backend, run_id)
+        .await
+        .unwrap();
     assert_eq!(run.source, "webhook");
     assert_eq!(run.source_detail.as_deref(), Some(hook.token.as_str()));
     assert_eq!(run.input, json!({"src": "hook"}));
@@ -113,18 +130,18 @@ async fn webhook_post_triggers_run_with_source_attribution() {
     // 未知 token 与禁用 token 同为 404（不区分，避免探测）
     let (status, _) = f.post("deadbeef", "{}").await;
     assert_eq!(status, 400);
-    f.arm.set_webhook_enabled(&hook.token, false).await.unwrap();
+    f.enable(&hook.token, false).await;
     let (status, _) = f.post(&hook.token, "{}").await;
     assert_eq!(status, 400);
 
     // 无 published 版本 → 409
     let wf2 = f.workflow(false).await;
-    let hook2 = f.arm.create_webhook(&wf2).await.unwrap();
+    let hook2 = f.hook(&wf2).await;
     let (status, _) = f.post(&hook2.token, "{}").await;
     assert_eq!(status, 400);
 
     // body 非法 JSON → 400（先恢复 hook 为启用）
-    f.arm.set_webhook_enabled(&hook.token, true).await.unwrap();
+    f.enable(&hook.token, true).await;
     let (status, _) = f.post(&hook.token, "not json").await;
     assert_eq!(status, 400);
 }

@@ -37,13 +37,13 @@ e2e_test!(
         assert!(!child_run_id.is_empty() && child_run_id != run_id);
 
         // 子 run 是独立日志：可查询、钉死子工作流的已发布版本、深度 1
-        let child = call_json(&client, "run.get.full", json!({"run_id": child_run_id})).await;
+        let child = call_json(&client, "run.get.view", json!({"run_id": child_run_id})).await;
         assert_eq!(child["run"]["status"], json!("succeeded"));
         assert_eq!(child["run"]["workflow_id"], json!(child_wf));
         assert_eq!(child["run"]["workflow_version"], json!(child_version));
         assert_eq!(child["run"]["output"], json!({ "got": { "amount": 7 } }));
         let child_events: Value =
-            call_json(&client, "run.events.full", json!({"run_id": child_run_id})).await;
+            call_json(&client, "run.events.view", json!({"run_id": child_run_id})).await;
         assert_eq!(child_events["events"][0]["depth"], json!(1));
     })
 );
@@ -84,7 +84,7 @@ e2e_test!(child_failure_is_fatal_to_parent, |ctx: &mut Ctx| Box::pin(
             .as_str()
             .unwrap()
             .to_string();
-        let child = call_json(&client, "run.get.full", json!({"run_id": child_run_id})).await;
+        let child = call_json(&client, "run.get.view", json!({"run_id": child_run_id})).await;
         assert_eq!(child["run"]["status"], json!("failed"));
     }
 ));
@@ -136,7 +136,7 @@ e2e_test!(parent_cancel_cascades_to_child, |ctx: &mut Ctx| Box::pin(
         let deadline = std::time::Instant::now() + SHORT;
         loop {
             if let Ok(child) =
-                try_call_json(&client, "run.get.full", json!({"run_id": child_run_id})).await
+                try_call_json(&client, "run.get.view", json!({"run_id": child_run_id})).await
             {
                 let status = child["run"]["status"].as_str().unwrap_or_default();
                 if status == "running" || status == "awaiting_resume" {
@@ -159,7 +159,7 @@ e2e_test!(parent_cancel_cascades_to_child, |ctx: &mut Ctx| Box::pin(
         // 级联是 best-effort：给子 run 一点时间到达终态
         let deadline = std::time::Instant::now() + SHORT;
         loop {
-            let child = call_json(&client, "run.get.full", json!({"run_id": child_run_id})).await;
+            let child = call_json(&client, "run.get.view", json!({"run_id": child_run_id})).await;
             if child["run"]["status"].as_str() == Some("cancelled") {
                 break;
             }

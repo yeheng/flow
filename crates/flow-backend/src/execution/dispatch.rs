@@ -1140,20 +1140,20 @@ fn event_kind(kind: &str) -> Option<EventKind> {
     })
 }
 
-fn level_of(level: &str) -> flow_engine::event::LogLevel {
+fn level_of(level: &str) -> flow_engine::log_types::LogLevel {
     match level {
-        "error" => flow_engine::event::LogLevel::Error,
-        "warn" => flow_engine::event::LogLevel::Warn,
-        "debug" => flow_engine::event::LogLevel::Debug,
-        _ => flow_engine::event::LogLevel::Info,
+        "error" => flow_engine::log_types::LogLevel::Error,
+        "warn" => flow_engine::log_types::LogLevel::Warn,
+        "debug" => flow_engine::log_types::LogLevel::Debug,
+        _ => flow_engine::log_types::LogLevel::Info,
     }
 }
 
-fn stream_of(stream: &str) -> flow_engine::event::LogStream {
+fn stream_of(stream: &str) -> flow_engine::log_types::LogStream {
     match stream {
-        "stderr" => flow_engine::event::LogStream::Stderr,
-        "engine" => flow_engine::event::LogStream::Engine,
-        _ => flow_engine::event::LogStream::Stdout,
+        "stderr" => flow_engine::log_types::LogStream::Stderr,
+        "engine" => flow_engine::log_types::LogStream::Engine,
+        _ => flow_engine::log_types::LogStream::Stdout,
     }
 }
 

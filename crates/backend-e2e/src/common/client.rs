@@ -269,7 +269,7 @@ pub async fn start_run(conn: &Conn, workflow_id: &str, input: Value) -> String {
 }
 
 pub async fn get_run(conn: &Conn, run_id: &str) -> Value {
-    call_json(conn, "run.get.full", json!({ "run_id": run_id })).await
+    call_json(conn, "run.get.view", json!({ "run_id": run_id })).await
 }
 
 /// 轮询 run.get.full 直到状态符合预期（超时即 panic 带最后观测值）。
@@ -319,7 +319,7 @@ pub async fn subscribe(conn: &Conn, run_id: &str) -> jsonrpsee::core::client::Su
             named(json!({
                 "_token": conn.token,
                 "run_id": run_id,
-                "event_format": "envelope",
+                "event_format": "v2",
                 "from_seq": "0",
             })),
             "run.unsubscribe",
@@ -344,9 +344,9 @@ pub async fn collect_run_events(
             panic!("订阅流意外结束（run {run_id} 未终结）");
         };
         let envelope = msg.expect("订阅消息错误");
-        if envelope["run_id"] == json!(run_id) {
+        if envelope["event"]["run_id"] == json!(run_id) {
             let terminal = matches!(
-                envelope["type"].as_str(),
+                envelope["event"]["kind"].as_str(),
                 Some("run_completed") | Some("run_failed") | Some("run_cancelled")
             );
             events.push(envelope);

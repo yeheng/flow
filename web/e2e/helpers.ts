@@ -69,7 +69,7 @@ export async function startRun(workflowId: string): Promise<string> {
 }
 
 export async function runStatus(runId: string): Promise<string> {
-  const r = await rpc<{ run: { status: string } }>("run.get.full", { run_id: runId });
+  const r = await rpc<{ run: { status: string } }>("run.get.view", { run_id: runId });
   return r.run.status;
 }
 

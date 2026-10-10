@@ -9,7 +9,7 @@ use std::{
     },
 };
 
-use flow_backend::{journal::JournalBackend, AnyBackend};
+use flow_backend::journal::JournalBackend;
 use jsonrpsee::core::server::Methods;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -27,7 +27,6 @@ pub enum Service {
 
 pub struct Services {
     journal_methods: Methods,
-    backend: AnyBackend,
     journal: Arc<JournalBackend>,
     token: String,
     pub downloads: axum::Router,
@@ -46,7 +45,8 @@ impl Services {
         let has_config_file = config_path.exists();
         let loaded =
             flow_config::Config::load_or_default(&config_path).map_err(|e| e.to_string())?;
-        let config = loaded.config;
+        let mut config = loaded.config;
+        if !has_config_file { config.storage.data_dir = "flow".into(); }
         // 密钥与历史 v1 数据仍住在原 data 目录（密钥是用户资产，不随权威
         // 切换搬家；v1 数据按「历史舍弃」原则保留只读）。工作流/run 的
         // 权威是 root/journal（v2 唯一权威，主服务与 /journal 工作区同源）。
@@ -58,18 +58,17 @@ impl Services {
         let journal = JournalBackend::open(&root.join("journal"), Default::default())
             .await
             .map_err(|e| e.to_string())?;
-        let backend = AnyBackend::Journal(journal.clone());
+        
         let built =
-            Self::assemble(backend.clone(), journal.clone(), config, config_path, data).await;
+            Self::assemble(journal.clone(), config, config_path, data).await;
         if built.is_err() {
-            let _ = backend.shutdown().await;
+            let _ = journal.close().await;
         }
         built
     }
 
     async fn assemble(
-        backend: AnyBackend,
-        journal: Arc<JournalBackend>,
+            journal: Arc<JournalBackend>,
         config: flow_config::Config,
         config_path: PathBuf,
         data_dir: PathBuf,
@@ -81,7 +80,7 @@ impl Services {
             env_overrides: Vec::new(),
         };
         let (state, _secrets) =
-            flow_rpc::AppState::for_production(backend.clone(), config_state, &data_dir).await;
+            flow_rpc::AppState::for_production(journal.clone(), config_state, &data_dir).await;
         // 主服务与 /journal 工作区同一 v2 模块（产品面全量；v1 RPC 面退役）
         let journal_methods: Methods = flow_rpc::journal_v2::module_product(
             journal.clone(),
@@ -100,7 +99,6 @@ impl Services {
             "http://{}",
             listener.local_addr().map_err(|e| e.to_string())?
         );
-        backend.start().await.map_err(|e| e.to_string())?;
         flow_backend::start_execution(&config.execution, &journal)
             .await
             .map_err(|e| e.to_string())?;
@@ -125,7 +123,6 @@ impl Services {
         });
         Ok(Arc::new(Self {
             journal_methods,
-            backend,
             journal,
             token,
             downloads,
@@ -213,8 +210,7 @@ impl Services {
         // Drain accepted calls before closing the journal/projector.
         let _gate = self.gate.write().await;
         let journal = self.journal.close().await.map_err(|e| e.to_string());
-        let backend = self.backend.shutdown().await.map_err(|e| e.to_string());
-        journal.and(backend)
+        journal
     }
 }
 

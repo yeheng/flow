@@ -19,13 +19,13 @@ e2e_test!(
             ("workflow.create", json!({})),
             ("workflow.create", json!({"name": 42})),
             ("workflow.update", json!({"workflow_id": "x"})),
-            ("workflow.get.full", json!({})),
+            ("workflow.get.view", json!({})),
             (
-                "workflow.get.full",
+                "workflow.get.view",
                 json!({"workflow_id": "x", "version": "one"}),
             ),
             ("run.start", json!({})),
-            ("run.get.full", json!({})),
+            ("run.get.view", json!({})),
             ("run.signal", json!({"run_id": "r", "payload": {}})),
             (
                 "schedule.create",
@@ -42,11 +42,11 @@ e2e_test!(
                 "workflow.publish",
                 json!({"workflow_id": "ghost", "version": 1}),
             ),
-            ("workflow.get.full", json!({"workflow_id": "ghost"})),
+            ("workflow.get.view", json!({"workflow_id": "ghost"})),
             ("workflow.versions", json!({"workflow_id": "ghost"})),
-            ("run.get.full", json!({"run_id": "ghost"})),
+            ("run.get.view", json!({"run_id": "ghost"})),
             ("run.timeline", json!({"run_id": "ghost"})),
-            ("run.events.full", json!({"run_id": "ghost"})),
+            ("run.events.view", json!({"run_id": "ghost"})),
             (
                 "schedule.update",
                 json!({"id": "ghost", "cron": "* * * * *"}),
@@ -109,7 +109,7 @@ e2e_test!(
         let bad =
             backend_e2e::common::connect(ctx.addr(), "wrong-token-0123456789abcdef0123456789")
                 .await;
-        let err = call_err(&bad, "workflow.list.full", json!({})).await;
+        let err = call_err(&bad, "workflow.list.view", json!({})).await;
         assert_eq!(err.code(), -32001, "{err}");
     })
 );
@@ -123,16 +123,16 @@ e2e_test!(run_list_limit_is_clamped_to_bounds, |ctx: &mut Ctx| {
         }
 
         // 0/负数 → 1；超过 500 → 500（RPC 边缘 clamp）
-        let clamped_low: Value = call_json(&client, "run.list.full", json!({"limit": 0})).await;
+        let clamped_low: Value = call_json(&client, "run.list.view", json!({"limit": 0})).await;
         assert_eq!(clamped_low["runs"].as_array().unwrap().len(), 1);
         let clamped_negative: Value =
-            call_json(&client, "run.list.full", json!({"limit": -5})).await;
+            call_json(&client, "run.list.view", json!({"limit": -5})).await;
         assert_eq!(clamped_negative["runs"].as_array().unwrap().len(), 1);
-        let clamped_high: Value = call_json(&client, "run.list.full", json!({"limit": 9999})).await;
+        let clamped_high: Value = call_json(&client, "run.list.view", json!({"limit": 9999})).await;
         assert_eq!(clamped_high["runs"].as_array().unwrap().len(), 500);
 
         // 缺省 limit → 50
-        let default: Value = call_json(&client, "run.list.full", json!({})).await;
+        let default: Value = call_json(&client, "run.list.view", json!({})).await;
         assert_eq!(default["runs"].as_array().unwrap().len(), 50);
     })
 });
@@ -154,14 +154,14 @@ e2e_test!(
         // workflow.get.full 省略 version：取 latest
         let got: Value = call(
             &client,
-            "workflow.get.full",
+            "workflow.get.view",
             json!({"workflow_id": workflow_id}),
         )
         .await;
         assert_eq!(got["version"], json!(1));
 
         // run.events.full 省略 from_seq：从 1 开始全量
-        let events: Value = call_json(&client, "run.events.full", json!({"run_id": run_id})).await;
+        let events: Value = call_json(&client, "run.events.view", json!({"run_id": run_id})).await;
         let events = events["events"].as_array().unwrap();
         assert_eq!(events[0]["seq"], json!(1));
 

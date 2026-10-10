@@ -21,7 +21,7 @@ e2e_test!(
         // 等待中：run 非终态、节点 running、活着的
         let timeline = wait_node_running(&client, &run_id, "h").await;
         assert_eq!(timeline_node(&timeline, "h")["state"], json!("running"));
-        let live = call_json(&client, "run.get.full", json!({"run_id": run_id})).await;
+        let live = call_json(&client, "run.get.view", json!({"run_id": run_id})).await;
         assert_eq!(live["live"], json!(true));
 
         // 交付信号：payload 即节点输出（§6.7）；signal_id 回显 = 命令幂等键
@@ -43,21 +43,21 @@ e2e_test!(
         );
 
         // signal_received 事件已落盘
-        let events: Value = call_json(&client, "run.events.full", json!({"run_id": run_id})).await;
+        let events: Value = call_json(&client, "run.events.view", json!({"run_id": run_id})).await;
         let kinds: Vec<&str> = events["events"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|e| e["type"].as_str().unwrap())
+            .map(|e| e["event"]["kind"].as_str().unwrap())
             .collect();
         assert!(kinds.contains(&"signal_received"), "{kinds:?}");
         let signal_event = events["events"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|e| e["type"] == json!("signal_received"))
+            .find(|e| e["event"]["kind"] == json!("signal_received"))
             .unwrap();
-        assert_eq!(signal_event["node_id"], json!("h"));
+        assert_eq!(signal_event["event"]["node_id"], json!("h"));
         assert_eq!(signal_event["payload"], payload);
     })
 );
@@ -88,7 +88,7 @@ e2e_test!(signal_to_non_waiting_node_is_rejected, |ctx: &mut Ctx| {
         assert_eq!(err.code(), -32602, "{err}");
 
         // run 尚未被信号改变：仍在等 h
-        let run = call_json(&client, "run.get.full", json!({"run_id": run_id})).await;
+        let run = call_json(&client, "run.get.view", json!({"run_id": run_id})).await;
         assert_eq!(run["run"]["status"], json!("running"));
     })
 });
@@ -133,9 +133,12 @@ e2e_test!(
 
         let run = wait_run_status(&client, &run_id, "cancelled", TIMEOUT).await;
         assert_eq!(run["live"], json!(false));
-        let events: Value = call_json(&client, "run.events.full", json!({"run_id": run_id})).await;
+        let events: Value = call_json(&client, "run.events.view", json!({"run_id": run_id})).await;
         let events = events["events"].as_array().unwrap();
-        assert_eq!(events.last().unwrap()["type"], json!("run_cancelled"));
+        assert_eq!(
+            events.last().unwrap()["event"]["kind"],
+            json!("run_cancelled")
+        );
 
         // 终态后 cancel：v2 语义 = 幂等空操作（committed 回执，无新事件）
         let again: Value = call_json(&client, "run.cancel", json!({"run_id": run_id})).await;

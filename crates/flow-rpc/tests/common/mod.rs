@@ -123,11 +123,11 @@ pub async fn call<T: serde::de::DeserializeOwned>(
 
 fn materialized(method: &str) -> &str {
     match method {
-        "workflow.get" => "workflow.get.full",
-        "workflow.list" => "workflow.list.full",
-        "run.get" => "run.get.full",
-        "run.list" => "run.list.full",
-        "run.events" => "run.events.full",
+        "workflow.get" => "workflow.get.view",
+        "workflow.list" => "workflow.list.view",
+        "run.get" => "run.get.view",
+        "run.list" => "run.list.view",
+        "run.events" => "run.events.view",
         other => other,
     }
 }

@@ -81,7 +81,7 @@ pub async fn dispatch(
 /// 但 id 也照常可用。两者都不中时**原样返回**（当 id 用），让服务端的
 /// -32011 做最终裁决——CLI 不预判存在性，避免两套「不存在」语义。
 pub async fn resolve_workflow_id(client: &WsClient, name_or_id: &str) -> Result<String, CliError> {
-    let listed = call(client, "workflow.list.full", object(vec![])).await?;
+    let listed = call(client, "workflow.list.view", object(vec![])).await?;
     let matched = listed["workflows"]
         .as_array()
         .map(Vec::as_slice)
@@ -97,7 +97,7 @@ pub async fn resolve_workflow_id(client: &WsClient, name_or_id: &str) -> Result<
 }
 
 async fn list(client: &WsClient, json: bool) -> Result<(), CliError> {
-    let result = call(client, "workflow.list.full", object(vec![])).await?;
+    let result = call(client, "workflow.list.view", object(vec![])).await?;
     if json {
         print_json(&result);
         return Ok(());
@@ -148,7 +148,7 @@ async fn get(
     if let Some(version) = version {
         params.push(("version", json!(version)));
     }
-    let result = call(client, "workflow.get.full", object(params)).await?;
+    let result = call(client, "workflow.get.view", object(params)).await?;
     if json {
         print_json(&result);
         return Ok(());
@@ -311,7 +311,7 @@ async fn import(
     let (name, definition) = split_document(&document, file, name_override)?;
 
     // 反查同名工作流：存在则追加版本（run 钉死旧版本，不受影响），否则新建
-    let listed = call(client, "workflow.list.full", object(vec![])).await?;
+    let listed = call(client, "workflow.list.view", object(vec![])).await?;
     let existing = listed["workflows"]
         .as_array()
         .map(Vec::as_slice)
@@ -402,11 +402,11 @@ async fn export(
     if let Some(version) = version {
         params.push(("version", json!(version)));
     }
-    let detail = call(client, "workflow.get.full", object(params)).await?;
+    let detail = call(client, "workflow.get.view", object(params)).await?;
 
     // workflow.get 不返回 name；从 list 反查（RPC 面没有 by-id 单查），
     // 查不到（并发删除）时退回用 id 当 name，导出不因此失败。
-    let listed = call(client, "workflow.list.full", object(vec![])).await?;
+    let listed = call(client, "workflow.list.view", object(vec![])).await?;
     let name = listed["workflows"]
         .as_array()
         .map(Vec::as_slice)

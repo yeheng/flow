@@ -155,11 +155,14 @@ impl JournalBackend {
                     .map(|t| t.to_rfc3339());
                 value["next_fire_at"] = json!(next);
                 if creating {
+                    value.as_object_mut().unwrap().remove("input");
                     value
                 } else {
-                    json!({"updated":true,"schedule":value})
+                    json!({"updated":true})
                 }
             } else {
+                value.as_object_mut().unwrap().remove("nodes");
+                value.as_object_mut().unwrap().remove("edges");
                 value
             };
             Ok((events, result))
@@ -474,7 +477,7 @@ impl JournalBackend {
         source_detail: Option<&str>,
         request_id: Option<&str>,
     ) -> Result<CommandReceipt> {
-        if !flow_dto::DbRunSource::is_valid_str(source) {
+        if !flow_dto::RunSource::is_valid_str(source) {
             return Err(invalid("invalid run source").into());
         }
         let request = json!({"workflow_id":workflow_id,"version":version,"input":input,"source":source,"source_detail":source_detail});

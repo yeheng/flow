@@ -76,7 +76,10 @@ impl NodeType {
 
     /// 崩溃后是否不可安全重放：有外部副作用的节点必须人工裁决。
     pub fn has_side_effect(self) -> bool {
-        matches!(self, NodeType::HttpCall | NodeType::Harness | NodeType::Email)
+        matches!(
+            self,
+            NodeType::HttpCall | NodeType::Harness | NodeType::Email
+        )
     }
 
     /// 能力描述的**主体**（`nodetypes.list` 单条去掉 `"type"` 字段）。

@@ -84,12 +84,12 @@ async fn embedded_flow_runs_streams_and_persists_without_a_rpc_listener() {
     .await
     .unwrap();
     drop(events);
-    let record = call(&host, Service::Flow, "run.get.full", json!({"run_id":run})).await;
+    let record = call(&host, Service::Flow, "run.get.view", json!({"run_id":run})).await;
     assert_eq!(record["result"]["run"]["status"], "succeeded");
     host.shutdown().unwrap();
     drop(host);
     let reopened = Host::start(root.path().to_path_buf()).unwrap();
-    let list = call(&reopened, Service::Flow, "workflow.list.full", json!({})).await;
+    let list = call(&reopened, Service::Flow, "workflow.list.view", json!({})).await;
     assert_eq!(list["result"]["workflows"][0]["workflow_id"], id);
     reopened.shutdown().unwrap();
 }
@@ -110,7 +110,7 @@ async fn journal_uses_separate_authority_and_native_token() {
     assert_eq!(reply["result"]["result"], replay["result"]["result"]);
     // M4 后主服务与 journal 工作区同源（v2 唯一权威）：journal 创建的
     // 工作流对 Flow 服务立即可见
-    let flow_list = call(&host, Service::Flow, "workflow.list.full", json!({})).await;
+    let flow_list = call(&host, Service::Flow, "workflow.list.view", json!({})).await;
     assert_eq!(
         flow_list["result"]["workflows"].as_array().unwrap().len(),
         1,

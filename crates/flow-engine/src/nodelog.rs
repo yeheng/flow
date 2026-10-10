@@ -12,7 +12,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::event::{LogLevel, LogStream};
+use crate::log_types::{LogLevel, LogStream};
 
 /// 单行日志截断上限（字节）。发射端截断，事件日志里不会出现超限行。
 pub const MAX_LOG_LINE_BYTES: usize = 8 * 1024;

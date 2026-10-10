@@ -110,7 +110,7 @@ async fn wait_live(client: &Conn, run_id: &str, timeout: Duration) {
     #[allow(unused_assignments)]
     let mut last = serde_json::Value::Null;
     loop {
-        last = call_json(client, "run.get.full", json!({ "run_id": run_id })).await;
+        last = call_json(client, "run.get.view", json!({ "run_id": run_id })).await;
         if last["live"] == json!(true) && last["run"]["status"] == json!("running") {
             return;
         }

@@ -1,6 +1,6 @@
 //! Explicit single-user JSONL RPC endpoint — the one product surface. Every call
 //! authenticates, including pages. Product form (`module_product`) additionally
-//! carries the config/secrets assembly and the v1-shaped product reads
+//! carries the config/secrets assembly and the materialized product reads
 //! (`workflow.*.full` / `run.*.full` / triggers / templates), so the browser
 //! frontend, the embedded desktop service and flow-cli all speak this module.
 use flow_backend::journal::{JournalBackend, JournalError};
@@ -49,31 +49,31 @@ fn failure(error: JournalError) -> ErrorObjectOwned {
     }
 }
 /// v1 公共面错误 → v2 错误码（与 failure() 的 journal 错误同语义分层）。
-fn arm_failure(error: flow_backend::BackendError) -> ErrorObjectOwned {
+fn view_failure(error: flow_backend::ViewError) -> ErrorObjectOwned {
     match error {
-        flow_backend::BackendError::WorkflowNotFound(m) => {
+        flow_backend::ViewError::WorkflowNotFound(m) => {
             ErrorObjectOwned::owned(-32011, format!("工作流不存在：{m}"), None::<()>)
         }
-        flow_backend::BackendError::VersionNotFound(w, v) => {
+        flow_backend::ViewError::VersionNotFound(w, v) => {
             ErrorObjectOwned::owned(-32011, format!("版本不存在：{w} v{v}"), None::<()>)
         }
-        flow_backend::BackendError::RunNotFound(m) => {
+        flow_backend::ViewError::RunNotFound(m) => {
             ErrorObjectOwned::owned(-32011, format!("run 不存在：{m}"), None::<()>)
         }
-        flow_backend::BackendError::ScheduleNotFound(m) => {
+        flow_backend::ViewError::ScheduleNotFound(m) => {
             ErrorObjectOwned::owned(-32011, format!("schedule 不存在：{m}"), None::<()>)
         }
-        flow_backend::BackendError::WebhookNotFound(m) => {
+        flow_backend::ViewError::WebhookNotFound(m) => {
             ErrorObjectOwned::owned(-32011, format!("webhook 不存在：{m}"), None::<()>)
         }
-        flow_backend::BackendError::TemplateNotFound(m) => {
+        flow_backend::ViewError::TemplateNotFound(m) => {
             ErrorObjectOwned::owned(-32011, format!("节点模板不存在：{m}"), None::<()>)
         }
-        flow_backend::BackendError::TemplateNameTaken(m) => {
+        flow_backend::ViewError::TemplateNameTaken(m) => {
             ErrorObjectOwned::owned(-32012, format!("模板名已存在：{m}"), None::<()>)
         }
-        flow_backend::BackendError::Invalid(m) => invalid(m),
-        flow_backend::BackendError::Conflict(m) => ErrorObjectOwned::owned(-32012, m, None::<()>),
+        flow_backend::ViewError::Invalid(m) => invalid(m),
+        flow_backend::ViewError::Conflict(m) => ErrorObjectOwned::owned(-32012, m, None::<()>),
         other => ErrorObjectOwned::owned(-32603, other.to_string(), None::<()>),
     }
 }
@@ -126,14 +126,14 @@ pub const READ_METHODS: &[&str] = &[
     "legacy.get",
     "run.events.page",
     "run.audit.page",
-    "workflow.get.full",
-    "workflow.list.full",
+    "workflow.get.view",
+    "workflow.list.view",
     "workflow.versions",
-    "run.get.full",
-    "run.list.full",
+    "run.get.view",
+    "run.list.view",
     "run.stats",
     "run.timeline",
-    "run.events.full",
+    "run.events.view",
     "schedule.list",
     "webhook.list",
     "template.list",
@@ -230,15 +230,15 @@ pub fn module_product(
         "legacy.get",
         "legacy.list",
         "run.observations.page",
-        // ---- 产品面（v2 协议 + v1 物化数据形状；前端主工作台用） ----
-        "workflow.get.full",
-        "workflow.list.full",
+        // ---- 产品面（v2 协议 + V2 product views；前端主工作台用） ----
+        "workflow.get.view",
+        "workflow.list.view",
         "workflow.versions",
-        "run.get.full",
-        "run.list.full",
+        "run.get.view",
+        "run.list.view",
         "run.stats",
         "run.timeline",
-        "run.events.full",
+        "run.events.view",
         "schedule.create",
         "schedule.update",
         "schedule.delete",
@@ -319,65 +319,66 @@ pub fn module_product(
                     let page=tokio::task::spawn_blocking(move||flow_journal::page::page(&root,&identity,&run_id,filter,cursor,upper,limit)).await.map_err(invalid)?.map_err(|e|failure(e.into()))?;
                     return serde_json::to_value(page).map_err(invalid);
                 },
-                // ---- 产品面：v1 数据形状（journal_arm 物化）----
-                "workflow.list.full"=>{
-                    let workflows=flow_backend::journal_arm::list_workflows(b).await.map_err(arm_failure)?;
+                // ---- 产品面：V2 product views（journal_arm 物化）----
+                "workflow.list.view"=>{
+                    let workflows=flow_backend::journal_views::list_workflows(b).await.map_err(view_failure)?;
                     return Ok(json!({"workflows":workflows}));
                 },
-                "workflow.get.full"=>{
-                    let version=flow_backend::journal_arm::get_version(
+                "workflow.get.view"=>{
+                    let version=flow_backend::journal_views::get_version(
                         b,text(&p,"workflow_id")?,optional_version(&p)?.map(|v|i64::try_from(v).map_err(invalid)).transpose()?,
-                    ).await.map_err(arm_failure)?;
+                    ).await.map_err(view_failure)?;
                     // v1 workflow.get 形状：version 之外还带 published_version
                     // （编辑器用它渲染「已发布 vN」徽标），单独补上。
-                    let published=flow_backend::journal_arm::latest_published(b,text(&p,"workflow_id")?).await.map_err(arm_failure)?;
+                    let published=flow_backend::journal_views::latest_published(b,text(&p,"workflow_id")?).await.map_err(view_failure)?;
                     let mut value=serde_json::to_value(version).map_err(invalid)?;
                     value["published_version"]=json!(published);
                     return Ok(value);
                 },
                 "workflow.versions"=>{
-                    let versions=flow_backend::journal_arm::list_versions(b,text(&p,"workflow_id")?).await.map_err(arm_failure)?;
+                    let versions=flow_backend::journal_views::list_versions(b,text(&p,"workflow_id")?).await.map_err(view_failure)?;
                     let versions:Vec<Value>=versions.into_iter().map(|v|json!({"version":v.version,"status":v.status,"checksum":v.checksum,"created_at":v.created_at})).collect();
                     return Ok(json!({"versions":versions}));
                 },
-                "run.get.full"=>{
+                "run.get.view"=>{
                     let run_id=text(&p,"run_id")?;
-                    let run=flow_backend::journal_arm::get_run(b,run_id).await.map_err(arm_failure)?;
-                    let live=flow_backend::journal_arm::is_live(b,run_id).await;
+                    let run=flow_backend::journal_views::get_run(b,run_id).await.map_err(view_failure)?;
+                    let live=flow_backend::journal_views::is_live(b,run_id).await;
                     return Ok(json!({"run":run,"live":live}));
                 },
-                "run.list.full"=>{
+                "run.list.view"=>{
                     if let Some(status)=p.get("status") {
-                        if !status.as_str().is_some_and(flow_backend::DbRunStatus::is_valid_str) { return Err(invalid("invalid run status")); }
+                        if !status.as_str().is_some_and(flow_backend::RunStatus::is_valid_str) { return Err(invalid("invalid run status")); }
                     }
                     if let Some(source)=p.get("source") {
-                        if !source.as_str().is_some_and(flow_backend::DbRunSource::is_valid_str) { return Err(invalid("invalid run source")); }
+                        if !source.as_str().is_some_and(flow_backend::RunSource::is_valid_str) { return Err(invalid("invalid run source")); }
                     }
-                    let runs=flow_backend::journal_arm::list_runs(
+                    let runs=flow_backend::journal_views::list_runs(
                         b,
                         p["workflow_id"].as_str(),
                         p["status"].as_str(),
                         p["source"].as_str(),
                         p["before_run_id"].as_str(),
                         p["limit"].as_i64().unwrap_or(50).clamp(1,500),
-                    ).await.map_err(arm_failure)?;
+                    ).await.map_err(view_failure)?;
                     return Ok(json!({"runs":runs}));
                 },
                 "run.stats"=>{
-                    let stats=flow_backend::journal_arm::run_stats(b,p["workflow_id"].as_str()).await.map_err(arm_failure)?;
+                    let stats=flow_backend::journal_views::run_stats(b,p["workflow_id"].as_str()).await.map_err(view_failure)?;
                     return serde_json::to_value(stats).map_err(invalid);
                 },
-                "run.timeline"=>{
-                    let run_id=text(&p,"run_id")?;
-                    let run=flow_backend::journal_arm::get_run(b,run_id).await.map_err(arm_failure)?;
-                    let stored=flow_backend::journal_arm::get_version(b,&run.workflow_id,Some(run.workflow_version)).await.map_err(arm_failure)?;
-                    let definition:flow_engine::Definition=serde_json::from_value(stored.definition).map_err(|e|invalid(format!("定义结构非法：{e}")))?;
-                    let snapshot=flow_backend::journal_arm::snapshot(b,run_id).await.map_err(arm_failure)?;
-                    return Ok(crate::timeline_value(run_id,&run.status,&run.workflow_id,run.workflow_version,&definition,&snapshot));
-                },
-                "run.events.full"=>{
-                    let events=flow_backend::journal_arm::read_events(b,text(&p,"run_id")?,p["from_seq"].as_u64()).await.map_err(arm_failure)?;
-                    return Ok(json!({"events":events}));
+                "run.timeline"=>return flow_backend::journal_views::timeline(b,text(&p,"run_id")?).await.map_err(view_failure),
+                "run.events.view"=>{
+                    let run_id=text(&p,"run_id")?.to_owned();
+                    let upper=b.journal.durable_lsn();
+                    if !b.state().await.runs.contains_key(&run_id){return Err(ErrorObjectOwned::owned(-32011,"run not found",None::<()>));}
+                    let from=p["from_seq"].as_u64().unwrap_or(0);
+                    let identity=b.journal.id().to_owned();
+                    let root=b.journal.root().to_path_buf();
+                    let cursor=match p.get("cursor").filter(|v|!v.is_null()){Some(v)=>serde_json::from_value::<Cursor>(v.clone()).map_err(invalid)?,None=>Cursor::first(identity.clone(),run_id.clone(),Filter::Events,upper)};
+                    let mut page=tokio::task::spawn_blocking(move||flow_journal::page::page(&root,&identity,&run_id,Filter::Events,cursor,upper,256)).await.map_err(invalid)?.map_err(|e|failure(e.into()))?;
+                    page.events.retain(|e|e.event.run_seq>=from);
+                    return serde_json::to_value(page).map_err(invalid);
                 },
                 "schedule.create"|"schedule.update"|"schedule.delete"|
                 "webhook.create"|"webhook.set_enabled"|"webhook.delete"|
@@ -397,20 +398,20 @@ pub fn module_product(
                     b.product_command(method,&args,text(&p,"request_id")?).await
                 },
                 "schedule.list"=>{
-                    let schedules=flow_backend::journal_arm::list_schedules(b,p["workflow_id"].as_str()).await.map_err(arm_failure)?;
+                    let schedules=flow_backend::journal_views::list_schedules(b,p["workflow_id"].as_str()).await.map_err(view_failure)?;
                     let list:Vec<Value>=schedules.iter().map(crate::schedule_value).collect();
                     return Ok(json!({"schedules":list}));
                 },
                 "webhook.list"=>{
-                    let webhooks=flow_backend::journal_arm::list_webhooks(b,p["workflow_id"].as_str()).await.map_err(arm_failure)?;
+                    let webhooks=flow_backend::journal_views::list_webhooks(b,p["workflow_id"].as_str()).await.map_err(view_failure)?;
                     return serde_json::to_value(json!({"webhooks":webhooks})).map_err(invalid);
                 },
                 "template.list"=>{
-                    let templates=flow_backend::journal_arm::template_list(b).await.map_err(arm_failure)?;
+                    let templates=flow_backend::journal_views::template_list(b).await.map_err(view_failure)?;
                     return Ok(json!({"templates":templates}));
                 },
                 "template.get"=>{
-                    let template=flow_backend::journal_arm::template_get(b,text(&p,"id")?).await.map_err(arm_failure)?;
+                    let template=flow_backend::journal_views::template_get(b,text(&p,"id")?).await.map_err(view_failure)?;
                     return serde_json::to_value(template).map_err(invalid);
                 },
                 "config.get"=>{
@@ -476,8 +477,8 @@ pub fn module_product(
         }
         // event_format：v2 = journal 事件原形（/journal 工作区）；
         // envelope = v1 Envelope 形状（物化 StoredValue；主工作台 monitor 用）
-        let envelope_format=p["event_format"]=="envelope";
-        if !envelope_format && p["event_format"]!="v2" {pending.reject(invalid("event_format must be v2 or envelope")).await;return;}
+        
+        if p["event_format"]!="v2" {pending.reject(invalid("event_format must be v2")).await;return;}
         let run_id=match text(&p,"run_id"){Ok(id)=>id.to_owned(),Err(e)=>{pending.reject(e).await;return;}};
         let from_seq=match decimal_param(&p,"from_seq"){Ok(n)=>n,Err(e)=>{pending.reject(e).await;return;}};
         let audit=p["mode"]=="audit";
@@ -486,45 +487,26 @@ pub fn module_product(
         let sink=match pending.accept().await {Ok(s)=>s,Err(_)=>return};
         let mut tail=flow_journal::tail::TailReader::new(ctx.backend.journal.root(),ctx.backend.journal.id());
         let mut scanned=0;
-        let root=ctx.backend.journal.root().to_path_buf();
-        // envelope 模式的 attempt 追踪（DispatchStarted 增量维护，跨批保持）
-        let mut attempts=std::collections::HashMap::<String,u32>::new();
         loop {
             let (upper,row)=match ctx.backend.projection.get("run",&run_id).await {Ok(v)=>v,Err(_)=>return};
             let Some(row)=row else{return};
             let terminal=matches!(row["status"].as_str(),Some("succeeded"|"failed"|"cancelled"));
             let id=run_id.clone();
-            let want_envelope=envelope_format;
-            let scan_root=root.clone();
-            let mut attempt_state=std::mem::take(&mut attempts);
             let batch=tokio::task::spawn_blocking(move||->flow_journal::Result<_>{
                 let mut records=Vec::new();let mut bytes=0;let mut latest=scanned;
                 while bytes<flow_journal::MAX_LINE_BYTES {
                     let Some((tx,location))=tail.next(upper)? else{break};latest=tx.lsn;bytes+=location.bytes as usize;
                     for (index,event) in tx.events.into_iter().enumerate(){
                         if event.run_id.as_deref()==Some(&id) && (if audit {tx.lsn>from_lsn && (event.audit_seq>0 || event.kind==flow_journal::EventKind::LateAudit)}else{event.run_seq>from_seq}) {
-                            if want_envelope {
-                                // 物化为 v1 Envelope（StoredValue 解析；Ref 值读文件）
-                                if let Some(envelope)=flow_backend::journal_arm::envelope(&event,&scan_root,upper,&mut attempt_state){
-                                    // 展示出口脱敏：与 timeline 同一规则（node_completed
-                                    // 的 output）。不脱的话前端 applyEvent 会用原始值
-                                    // 覆盖 timeline 的脱敏值——脱敏被订阅绕过。
-                                    records.push((flow_journal::page::PositionedEvent{lsn:tx.lsn,event_index:index,event},Some(crate::redact_display_envelope(envelope))));
-                                }
-                            } else {
-                                records.push((flow_journal::page::PositionedEvent{lsn:tx.lsn,event_index:index,event},None));
-                            }
+                            records.push(flow_journal::page::PositionedEvent{lsn:tx.lsn,event_index:index,event});
                         }
                     }
                 }
-                Ok((tail,records,latest,attempt_state))
+                Ok((tail,records,latest))
             }).await;
-            let (reader,records,latest,state)=match batch {Ok(Ok(v))=>v,_=>return};tail=reader;scanned=latest;attempts=state;
-            for (record,envelope) in records {
-                let payload:Value=match envelope{
-                    Some(e)=>match serde_json::to_value(e){Ok(v)=>v,Err(_)=>return},
-                    None=>match serde_json::to_value(&record){Ok(v)=>v,Err(_)=>return},
-                };
+            let (reader,records,latest)=match batch {Ok(Ok(v))=>v,_=>return};tail=reader;scanned=latest;
+            for record in records {
+                let payload:Value=match serde_json::to_value(&record){Ok(v)=>v,Err(_)=>return};
                 if flow_journal::codec::bounded_json(&payload,flow_journal::MAX_LINE_BYTES-1024).is_err(){
                     if let Ok(message)=jsonrpsee::server::SubscriptionMessage::new("run.event",sink.subscription_id(),&json!({"type":"stream_error","code":"RESPONSE_TOO_LARGE"})){let _=tokio::time::timeout(std::time::Duration::from_secs(2),sink.send(message)).await;}
                     return;

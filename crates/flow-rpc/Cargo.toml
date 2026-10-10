@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+flow-dto = { path = "../flow-dto" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -29,6 +30,5 @@ chrono = { workspace = true }
 sqlx = { workspace = true, features = ["postgres", "json"] }
 flow-engine = { path = "../flow-engine" }
 flow-store = { path = "../flow-store" }
-flow-pg = { path = "../flow-pg" }
 flow-config = { path = "../flow-config" }
 flow-test-support = { path = "../flow-test-support" }

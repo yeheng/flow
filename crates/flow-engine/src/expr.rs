@@ -5,7 +5,7 @@ use rquickjs::{Array, BigInt, Context, Ctx, Function, Object, Runtime, Value as 
 use serde_json::Value;
 
 use crate::error::EngineError;
-use crate::event::{LogLevel, LogStream};
+use crate::log_types::{LogLevel, LogStream};
 use crate::nodelog::NodeLogger;
 
 /// JS → Rust 递归转换的最大深度：挡手工构造的深链/环，与 JSON.stringify 的

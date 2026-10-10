@@ -11,6 +11,7 @@ import type {
   NodeTemplate,
   NodeTemplateSummary,
   RunEvent,
+  ObservationRecord,
   RunRecord,
   RunStats,
   Schedule,
@@ -74,7 +75,8 @@ export async function createTemplate(
 ): Promise<NodeTemplate> {
   const params: Record<string, unknown> = { name, nodes, edges };
   if (category) params.category = category;
-  return client.call<NodeTemplate>("template.create", params);
+  const created = await client.call<{id:string}>("template.create", params);
+  return getTemplate(created.id);
 }
 
 /** 双 Option 语义：category === undefined 不改；null 清空分组 */
@@ -93,7 +95,7 @@ export async function deleteTemplate(id: string): Promise<void> {
 }
 
 export async function listWorkflows(): Promise<WorkflowSummary[]> {
-  const r = await client.call<{ workflows: WorkflowSummary[] }>("workflow.list.full", {});
+  const r = await client.call<{ workflows: WorkflowSummary[] }>("workflow.list.view", {});
   return r.workflows;
 }
 
@@ -117,7 +119,7 @@ export async function publishWorkflow(workflowId: string, version: number): Prom
 export async function getWorkflow(workflowId: string, version?: number): Promise<WorkflowDetail> {
   const params: Record<string, unknown> = { workflow_id: workflowId };
   if (version !== undefined) params.version = version;
-  return client.call<WorkflowDetail>("workflow.get.full", params);
+  return client.call<WorkflowDetail>("workflow.get.view", params);
 }
 
 export async function listVersions(workflowId: string): Promise<VersionMeta[]> {
@@ -157,7 +159,7 @@ export async function listRuns(opts: ListRunsOptions = {}): Promise<RunRecord[]>
   if (opts.source !== undefined) params.source = opts.source;
   if (opts.beforeRunId !== undefined) params.before_run_id = opts.beforeRunId;
   if (opts.limit !== undefined) params.limit = opts.limit;
-  const r = await client.call<{ runs: RunRecord[] }>("run.list.full", params);
+  const r = await client.call<{ runs: RunRecord[] }>("run.list.view", params);
   return r.runs;
 }
 
@@ -169,18 +171,25 @@ export async function runStats(workflowId?: string): Promise<RunStats> {
 }
 
 export async function getRun(runId: string): Promise<{ run: RunRecord; live: boolean }> {
-  return client.call("run.get.full", { run_id: runId });
+  return client.call("run.get.view", { run_id: runId });
 }
 
 export async function runTimeline(runId: string): Promise<Timeline> {
   return client.call<Timeline>("run.timeline", { run_id: runId });
 }
 
-export async function runEvents(runId: string, fromSeq?: number): Promise<RunEvent[]> {
-  const params: Record<string, unknown> = { run_id: runId };
-  if (fromSeq !== undefined) params.from_seq = fromSeq;
-  const r = await client.call<{ events: RunEvent[] }>("run.events.full", params);
-  return r.events;
+export async function runEvents(runId: string): Promise<RunEvent[]> {
+  const events: RunEvent[] = [];
+  let cursor: Record<string, unknown> | null = null;
+  do {
+    const page: { events: RunEvent[]; next_cursor: Record<string, unknown> | null } = await client.call("run.events.page", {run_id:runId,cursor,limit:256});
+    events.push(...page.events); cursor=page.next_cursor;
+  } while (cursor);
+  return events;
+}
+
+export function runObservations(runId: string, fromSeq = "0"): Promise<{ records: ObservationRecord[]; loss: { history_incomplete?: boolean; queue_dropped?: number; retention_dropped?: number; storage_dropped?: number } }> {
+  return client.call("run.observations.page", {run_id:runId,from_seq:fromSeq,limit:256});
 }
 
 export async function runCancel(runId: string): Promise<void> {
@@ -188,11 +197,8 @@ export async function runCancel(runId: string): Promise<void> {
 }
 
 export async function runSignal(runId: string, nodeId: string, payload: unknown): Promise<void> {
-  // Postgres 后端的信号经持久 inbox 落账，signal_id 必填（1-128 字符）；
-  // UI 无自动重试，一次点击 = 一个逻辑交付，本地生成唯一 id 即可
   await client.call("run.signal", {
     run_id: runId,
-    signal_id: crypto.randomUUID(),
     node_id: nodeId,
     payload,
   });
@@ -214,7 +220,10 @@ export async function createSchedule(
 ): Promise<Schedule> {
   const params: Record<string, unknown> = { workflow_id: workflowId, cron };
   if (input !== undefined) params.input = input;
-  return client.call<Schedule>("schedule.create", params);
+  const created = await client.call<{id:string}>("schedule.create", params);
+  const schedule = (await listSchedules(workflowId)).find(s => s.id === created.id);
+  if (!schedule) throw new Error("已提交的调度未出现在读面中");
+  return schedule;
 }
 
 export async function listSchedules(workflowId?: string): Promise<Schedule[]> {

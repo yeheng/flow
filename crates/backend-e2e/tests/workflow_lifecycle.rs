@@ -126,7 +126,7 @@ e2e_test!(create_update_publish_get_list_roundtrip, |ctx: &mut Ctx| {
 
         let got: Value = call(
             &client,
-            "workflow.get.full",
+            "workflow.get.view",
             json!({"workflow_id": workflow_id, "version": 1}),
         )
         .await;
@@ -145,14 +145,14 @@ e2e_test!(create_update_publish_get_list_roundtrip, |ctx: &mut Ctx| {
 
         let got: Value = call(
             &client,
-            "workflow.get.full",
+            "workflow.get.view",
             json!({"workflow_id": workflow_id}),
         )
         .await;
         assert_eq!(got["status"], json!("published"));
         assert_eq!(got["published_version"], json!(1));
 
-        let list: Value = call_json(&client, "workflow.list.full", json!({})).await;
+        let list: Value = call_json(&client, "workflow.list.view", json!({})).await;
         let workflows = list["workflows"].as_array().unwrap();
         let summary = workflows
             .iter()
@@ -166,7 +166,7 @@ e2e_test!(create_update_publish_get_list_roundtrip, |ctx: &mut Ctx| {
         // workflow.get 省略 version 取 latest
         let got: Value = call(
             &client,
-            "workflow.get.full",
+            "workflow.get.view",
             json!({"workflow_id": workflow_id}),
         )
         .await;
@@ -182,7 +182,7 @@ e2e_test!(create_update_publish_get_list_roundtrip, |ctx: &mut Ctx| {
         assert_eq!(deleted["ok"], json!(true));
         let err = call_err(
             &client,
-            "workflow.get.full",
+            "workflow.get.view",
             json!({"workflow_id": workflow_id}),
         )
         .await;
@@ -344,7 +344,7 @@ e2e_test!(publish_unknown_version_is_not_found, |ctx: &mut Ctx| {
         assert_eq!(again["ok"], json!(true));
         let version: Value = call_json(
             &client,
-            "workflow.get.full",
+            "workflow.get.view",
             json!({"workflow_id": workflow_id, "version": version}),
         )
         .await;
@@ -376,7 +376,7 @@ e2e_test!(delete_workflow_with_runs_is_rejected, |ctx: &mut Ctx| {
         let (other, _) = publish_workflow(&client, "没 run 的流", linear_def("return 1;")).await;
         let deleted: Value = call(&client, "workflow.delete", json!({"workflow_id": other})).await;
         assert_eq!(deleted["ok"], json!(true));
-        let list: Value = call_json(&client, "workflow.list.full", json!({})).await;
+        let list: Value = call_json(&client, "workflow.list.view", json!({})).await;
         assert!(list["workflows"]
             .as_array()
             .unwrap()

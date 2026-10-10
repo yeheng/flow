@@ -89,7 +89,11 @@ e2e_test!(schedule_crud_and_next_fire_at, |ctx: &mut Ctx| Box::pin(
             .unwrap()
             .clone();
         assert_eq!(schedule["cron_expr"], json!("0 * * * *"));
-        assert_eq!(schedule["input"], json!({ "job": "sync" }), "缺省字段不动");
+        assert_eq!(
+            schedule["event"]["payload"]["input"]["value"],
+            json!({ "job": "sync" }),
+            "缺省字段不动"
+        );
         assert_eq!(schedule["enabled"], json!(true));
 
         // update 的 input 双 Option：显式 null = 清空
@@ -108,7 +112,7 @@ e2e_test!(schedule_crud_and_next_fire_at, |ctx: &mut Ctx| Box::pin(
             .unwrap()
             .clone();
         assert!(
-            schedule["input"].is_null(),
+            schedule["event"]["payload"]["input"]["value"].is_null(),
             "显式 null 清空 input：{schedule}"
         );
 
@@ -186,7 +190,7 @@ e2e_test!(schedule_fires_run_with_its_input, |ctx: &mut Ctx| Box::pin(
         let run = loop {
             let list: Value = call_json(
                 &client,
-                "run.list.full",
+                "run.list.view",
                 json!({"workflow_id": workflow_id}),
             )
             .await;
@@ -234,7 +238,7 @@ e2e_test!(disabled_schedule_does_not_fire, |ctx: &mut Ctx| Box::pin(
         tokio::time::sleep(Duration::from_secs(26)).await;
         let list: Value = call_json(
             &client,
-            "run.list.full",
+            "run.list.view",
             json!({"workflow_id": workflow_id}),
         )
         .await;

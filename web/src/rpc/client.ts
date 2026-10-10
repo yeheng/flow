@@ -3,6 +3,7 @@ import { apiToken } from "../config";
 import { NativeClient } from "./native";
 import { WebSocketClient } from "./websocket";
 import { WRITE_METHODS } from "./methods";
+import { RpcError } from "./errors";
 export { RpcError, errText } from "./errors";
 export type Service = "flow" | "journal";
 
@@ -50,10 +51,33 @@ export class RpcClient {
       if (enriched["request_id"] === undefined) enriched["request_id"] = crypto.randomUUID();
       requestId = enriched["request_id"] as string;
     }
-    const reply = await this.transport.call<{
+    let reply: {
       committed?: boolean;
       result?: unknown;
-    }>(method, enriched);
+      request_id?: string;
+      visible?: boolean;
+    };
+    try {
+      reply = await this.transport.call(method, enriched);
+    } catch (error) {
+      if (!(error instanceof RpcError) || error.code !== -32020 || !requestId) throw error;
+      const original = error.data as typeof reply;
+      if (!original?.committed || original.request_id !== requestId) throw error;
+      const scope = method === "run.start" ? "run.start:manual:"
+        : ["run.cancel", "run.signal", "run.adjudicate"].includes(method)
+          ? `${method}:${String(enriched.run_id ?? "")}` : method;
+      reply = original;
+      for (let i = 0; i < 20; i++) {
+        // Query only: this write has already committed. Product views read committed state.
+        try {
+          const status = await this.transport.call<typeof reply | null>("command.status", {
+            scope, request_id: requestId, _token: enriched._token,
+          });
+          if (status?.visible) { reply = status; break; }
+        } catch { break; }
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
+    }
     // 主工作台使用物化结果；JournalClient 消费完整回执并处理 -32020。
     if (this.service === "flow" && requestId !== undefined && reply?.committed === true) {
       return reply.result as T;
@@ -77,7 +101,7 @@ export class RpcClient {
       enriched["event_format"] === undefined
     ) {
       // 主工作台订阅：v1 Envelope 事件形状（服务端物化值），monitor 零适配
-      enriched["event_format"] = "envelope";
+      enriched["event_format"] = "v2";
     }
     return this.transport.subscribe(method, enriched, onEvent);
   }
