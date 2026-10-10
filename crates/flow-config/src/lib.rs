@@ -5,11 +5,10 @@
 //!
 //! ```toml
 //! [server]   cron 调度器开关与 journal 触发器 tick
-//! [storage]  backend（journal|postgres）、data_dir、database_url
+//! [storage]  backend（journal）、data_dir
 //! [execution] 执行模式（in_process|ipc|remote）、executor_bin、x_max、[remote]
 //! [agent]    flow-agent 的上联地址与证书（原先只有 CLI 参数）
 //! [journal]  journal-server 的监听地址与数据目录（token 仍是环境变量——凭据）
-//! [pg]       Postgres 租约/扫描/超时等调优（原 flow-pg 11 个 env）
 //! ```
 //!
 //! 分层加载（高覆盖低）：**CLI `--config`（显式路径）> 环境变量 > 配置文件 >
@@ -61,7 +60,6 @@ pub struct Config {
     pub execution: ExecutionConfig,
     pub agent: AgentConfig,
     pub journal: JournalConfig,
-    pub pg: PgTuning,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -86,16 +84,15 @@ impl Default for ServerConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageBackend {
-    Postgres,
     /// JSONL v2 journal 权威（`<data_dir>/` 即 journal 根，SQLite 只是
-    /// 可重建投影）。单机目标后端；历史数据不做迁移，全新数据集使用。
+    /// 可重建投影）。唯一后端；v1 的 sqlite/postgres 已删除，历史数据
+    /// 不做迁移，见 docs/SQLITE_V1_TO_V2_MIGRATION.md。
     Journal,
 }
 
 impl StorageBackend {
     pub fn as_str(&self) -> &'static str {
         match self {
-            StorageBackend::Postgres => "postgres",
             StorageBackend::Journal => "journal",
         }
     }
@@ -108,9 +105,6 @@ pub struct StorageConfig {
     /// 数据目录（原 FLOW_DATA_DIR，默认 CWD 下 `data`）：密钥存储与
     /// 桌面历史数据在这里；journal 权威在 [journal].data_dir。
     pub data_dir: String,
-    /// Postgres 连接串（原 FLOW_DATABASE_URL；backend=postgres 时必填）。
-    /// 含凭据：config.get 只回 set/unset，不回真值。
-    pub database_url: Option<String>,
 }
 
 impl Default for StorageConfig {
@@ -120,7 +114,6 @@ impl Default for StorageConfig {
             // 不迁移，见 docs/SQLITE_V1_TO_V2_MIGRATION.md。
             backend: StorageBackend::Journal,
             data_dir: "data".into(),
-            database_url: None,
         }
     }
 }
@@ -240,46 +233,6 @@ impl Default for JournalConfig {
     }
 }
 
-/// Postgres 后端调优（原 flow-pg 的 11 个 `FLOW_*` 环境变量）。
-/// 默认值是起点，正式部署按数据库延迟实测调整。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct PgTuning {
-    /// all | gateway | executor。
-    pub role: String,
-    pub lease_ttl_ms: u64,
-    pub scan_interval_ms: u64,
-    pub inbox_poll_ms: u64,
-    pub max_runs: u32,
-    pub signal_wait_ms: u64,
-    pub signal_poll_ms: u64,
-    pub subscribe_poll_ms: u64,
-    pub statement_timeout_ms: u64,
-    pub lock_timeout_ms: u64,
-    pub idle_tx_timeout_ms: u64,
-    /// 连接池上限（原硬编码 16）。
-    pub max_connections: u32,
-}
-
-impl Default for PgTuning {
-    fn default() -> Self {
-        PgTuning {
-            role: "all".into(),
-            lease_ttl_ms: 30_000,
-            scan_interval_ms: 1_000,
-            inbox_poll_ms: 200,
-            max_runs: 8,
-            signal_wait_ms: 10_000,
-            signal_poll_ms: 200,
-            subscribe_poll_ms: 10_000,
-            statement_timeout_ms: 10_000,
-            lock_timeout_ms: 10_000,
-            idle_tx_timeout_ms: 10_000,
-            max_connections: 16,
-        }
-    }
-}
-
 impl Config {
     /// 分层加载：显式路径（CLI `--config`）→ `FLOW_CONFIG` → `./flow.toml`
     /// → 平台配置目录。返回配置、实际读取的文件路径与生效的 env 覆盖名单。
@@ -356,15 +309,6 @@ impl Config {
         if self.server.journal_trigger_tick_secs == 0 {
             return Err("server.journal_trigger_tick_secs 必须 > 0".into());
         }
-        if self.storage.backend == StorageBackend::Postgres
-            && self
-                .storage
-                .database_url
-                .as_deref()
-                .is_none_or(str::is_empty)
-        {
-            return Err("storage.backend=postgres 时必须配置 storage.database_url".into());
-        }
         if !(1..=16).contains(&self.execution.x_max) {
             return Err("execution.x_max 必须在 1..=16".into());
         }
@@ -387,12 +331,6 @@ impl Config {
         }
         let _ = parse_addr(&self.journal.addr, "journal.addr")?;
         let _ = parse_addr(&self.journal.http_addr, "journal.http_addr")?;
-        if self.pg.max_runs == 0 || self.pg.max_connections == 0 {
-            return Err("pg.max_runs / pg.max_connections 必须 > 0".into());
-        }
-        if !matches!(self.pg.role.as_str(), "all" | "gateway" | "executor") {
-            return Err("pg.role 必须是 all | gateway | executor".into());
-        }
         Ok(())
     }
 
@@ -450,10 +388,9 @@ impl Config {
                 "execution" => replace_section!(out.execution, "execution", value),
                 "agent" => replace_section!(out.agent, "agent", value),
                 "journal" => replace_section!(out.journal, "journal", value),
-                "pg" => replace_section!(out.pg, "pg", value),
                 other => {
                     return Err(ConfigError::Invalid(format!(
-                        "未知配置分区 {other:?}（合法：server/storage/execution/agent/journal/pg）"
+                        "未知配置分区 {other:?}（合法：server/storage/execution/agent/journal）"
                     )))
                 }
             }
@@ -462,7 +399,7 @@ impl Config {
         Ok(out)
     }
 
-    /// 覆盖该配置的 env 名单（不含值——FLOW_DATABASE_URL 等含凭据）。
+    /// 覆盖该配置的 env 名单（不含值——FLOW_JOURNAL_TOKEN 等凭据不进配置）。
     pub fn env_override_names(&self) -> Vec<String> {
         let mut probe = self.clone();
         apply_env(&mut probe).unwrap_or_default()
@@ -506,16 +443,15 @@ fn apply_env(config: &mut Config) -> Result<Vec<String>, String> {
 
     // ---- [storage] ----
     if let Some(v) = env_str("FLOW_BACKEND") {
-        // 与旧 open_from_env 一致：postgres/postgresql 等价。
-        // v1 后端已删除（历史数据不迁移，见 docs/SQLITE_V1_TO_V2_MIGRATION.md）。
-        // 不静默回落：非法值（含 "sqlite"）走 Err，与 toml 未知值同语义。
+        // v1 后端（sqlite/postgres）已删除（历史数据不迁移，见
+        // docs/SQLITE_V1_TO_V2_MIGRATION.md）。不静默回落：非法值走 Err，
+        // 与 toml 未知值同语义。
         match v.as_str() {
-            "postgres" | "postgresql" => config.storage.backend = StorageBackend::Postgres,
             "journal" | "jsonl" => config.storage.backend = StorageBackend::Journal,
             other => {
                 return Err(format!(
-                    "FLOW_BACKEND={other} 不可用（合法：journal | postgres；\
-                     sqlite（v1）已删除，历史数据不迁移，\
+                    "FLOW_BACKEND={other} 不可用（合法：journal；\
+                     sqlite / postgres（v1）已删除，历史数据不迁移，\
                      见 docs/SQLITE_V1_TO_V2_MIGRATION.md）"
                 ));
             }
@@ -525,10 +461,6 @@ fn apply_env(config: &mut Config) -> Result<Vec<String>, String> {
     if let Some(v) = env_str("FLOW_DATA_DIR") {
         config.storage.data_dir = v;
         applied.push("FLOW_DATA_DIR".into());
-    }
-    if let Some(v) = env_str("FLOW_DATABASE_URL") {
-        config.storage.database_url = Some(v);
-        applied.push("FLOW_DATABASE_URL".into());
     }
 
     // ---- [execution] ----
@@ -640,42 +572,6 @@ fn apply_env(config: &mut Config) -> Result<Vec<String>, String> {
         applied.push("FLOW_JOURNAL_DATA_DIR".into());
     }
 
-    // ---- [pg] ----
-    if let Some(v) = env_str("FLOW_ROLE") {
-        config.pg.role = v;
-        applied.push("FLOW_ROLE".into());
-    }
-    for (name, target) in [
-        ("FLOW_LEASE_TTL_MS", 0),
-        ("FLOW_SCAN_INTERVAL_MS", 1),
-        ("FLOW_INBOX_POLL_MS", 2),
-        ("FLOW_SIGNAL_WAIT_MS", 3),
-        ("FLOW_SIGNAL_POLL_MS", 4),
-        ("FLOW_SUBSCRIBE_POLL_MS", 5),
-        ("FLOW_STATEMENT_TIMEOUT_MS", 6),
-        ("FLOW_LOCK_TIMEOUT_MS", 7),
-        ("FLOW_IDLE_TX_TIMEOUT_MS", 8),
-    ] {
-        if let Some(v) = env_u64(name) {
-            match target {
-                0 => config.pg.lease_ttl_ms = v,
-                1 => config.pg.scan_interval_ms = v,
-                2 => config.pg.inbox_poll_ms = v,
-                3 => config.pg.signal_wait_ms = v,
-                4 => config.pg.signal_poll_ms = v,
-                5 => config.pg.subscribe_poll_ms = v,
-                6 => config.pg.statement_timeout_ms = v,
-                7 => config.pg.lock_timeout_ms = v,
-                _ => config.pg.idle_tx_timeout_ms = v,
-            }
-            applied.push(name.into());
-        }
-    }
-    if let Some(v) = env_u64("FLOW_MAX_RUNS") {
-        config.pg.max_runs = v as u32;
-        applied.push("FLOW_MAX_RUNS".into());
-    }
-
     applied.sort();
     applied.dedup();
     Ok(applied)
@@ -723,7 +619,6 @@ mod tests {
         assert_eq!(config.execution.x_max, 4);
         assert!(config.server.scheduler_enabled);
         assert_eq!(config.server.journal_trigger_tick_secs, 20);
-        assert_eq!(config.pg.max_connections, 16);
     }
 
     #[test]
@@ -734,9 +629,8 @@ scheduler_enabled = false
 journal_trigger_tick_secs = 5
 
 [storage]
-backend = "postgres"
+backend = "journal"
 data_dir = "/var/lib/flow"
-database_url = "postgres://u:p@db/flow"
 
 [execution]
 mode = "ipc"
@@ -751,16 +645,12 @@ slots = 8
 addr = "127.0.0.1:9802"
 http_addr = "127.0.0.1:9803"
 data_dir = "/var/lib/flow/journal"
-
-[pg]
-role = "executor"
-max_runs = 4
 "#;
         let config: Config = toml::from_str(text).expect("解析失败");
         config.validate().expect("校验失败");
         assert!(!config.server.scheduler_enabled);
         assert_eq!(config.server.journal_trigger_tick_secs, 5);
-        assert_eq!(config.storage.backend, StorageBackend::Postgres);
+        assert_eq!(config.storage.backend, StorageBackend::Journal);
         assert_eq!(config.execution.mode, ExecutionModeKind::Ipc);
         assert_eq!(config.execution.x_max, 8);
         assert_eq!(config.agent.slots, 8);
@@ -768,7 +658,6 @@ max_runs = 4
             config.journal.data_dir.as_deref(),
             Some("/var/lib/flow/journal")
         );
-        assert_eq!(config.pg.role, "executor");
 
         let path =
             std::env::temp_dir().join(format!("flow-config-test-{}.toml", std::process::id()));
@@ -795,27 +684,22 @@ max_runs = 4
 
     #[test]
     fn env_overrides_win_and_are_reported() {
-        let saved = clean_env(&[
-            "FLOW_BACKEND",
-            "FLOW_SCHEDULER",
-            "FLOW_DATA_DIR",
-            "FLOW_DATABASE_URL",
-        ]);
-        std::env::set_var("FLOW_BACKEND", "postgres");
+        let saved = clean_env(&["FLOW_BACKEND", "FLOW_SCHEDULER", "FLOW_DATA_DIR"]);
+        std::env::set_var("FLOW_BACKEND", "journal");
         std::env::set_var("FLOW_SCHEDULER", "off");
         std::env::set_var("FLOW_DATA_DIR", "/tmp/flow-env-override");
 
         let mut config = Config::default();
         let applied = apply_env(&mut config).unwrap();
-        assert_eq!(config.storage.backend, StorageBackend::Postgres);
+        assert_eq!(config.storage.backend, StorageBackend::Journal);
         assert_eq!(config.storage.data_dir, "/tmp/flow-env-override");
         assert!(!config.server.scheduler_enabled);
         assert!(applied.contains(&"FLOW_SCHEDULER".to_string()));
 
-        // postgres 而无 url → validate 拒绝；补 url 后通过
-        assert!(config.validate().is_err());
-        config.storage.database_url = Some("postgres://x/y".into());
-        assert!(config.validate().is_ok());
+        // v1 后端值不再可用：postgres 与 sqlite 同样显式报错
+        std::env::set_var("FLOW_BACKEND", "postgres");
+        let mut config = Config::default();
+        assert!(apply_env(&mut config).is_err());
 
         restore_env(saved);
     }
@@ -830,8 +714,11 @@ max_runs = 4
         // 未给的分区保持 base
         assert_eq!(merged.storage.data_dir, "data");
 
-        // 非法合并被 validate 拦下
+        // 非法合并被拦下：v1 的 postgres backend 在 deserialize 层即拒绝
         let bad = serde_json::json!({"storage": {"backend": "postgres", "data_dir": "data"}});
+        assert!(Config::merge_patch(&Config::default(), &bad).is_err());
+        // 跨字段约束由 validate 把关
+        let bad = serde_json::json!({"execution": {"x_max": 0}});
         assert!(Config::merge_patch(&Config::default(), &bad).is_err());
     }
 

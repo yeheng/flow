@@ -36,7 +36,7 @@ e2e_test!(
             assert_eq!(err.code(), -32602, "{method} {params} → {err}");
         }
 
-        // -32011 不存在：实体读面（journal_arm 物化层映射 not-found）
+        // -32011 不存在：实体读面（journal_views 物化层映射 not-found）
         for (method, params) in [
             (
                 "workflow.publish",
@@ -151,7 +151,7 @@ e2e_test!(
         assert_eq!(run["run"]["input"], json!(null));
         assert_eq!(run["run"]["output"], json!({ "seen": null }));
 
-        // workflow.get.full 省略 version：取 latest
+        // workflow.get.view 省略 version：取 latest
         let got: Value = call(
             &client,
             "workflow.get.view",
@@ -160,12 +160,12 @@ e2e_test!(
         .await;
         assert_eq!(got["version"], json!(1));
 
-        // run.events.full 省略 from_seq：从 1 开始全量
+        // run.events.view 省略 cursor：从事件 0 开始全量（v2 事件原形）
         let events: Value = call_json(&client, "run.events.view", json!({"run_id": run_id})).await;
         let events = events["events"].as_array().unwrap();
-        assert_eq!(events[0]["seq"], json!(1));
+        assert_eq!(events[0]["event"]["run_seq"], json!("1"));
 
-        // run.subscribe 省略 from_seq：从 0 起补齐（envelope 格式，v1 事件形状）
+        // run.subscribe 省略 from_seq：从 0 起补齐（journal v2 事件原形）
         let mut sub = backend_e2e::common::subscribe(&client, &run_id).await;
         let collected = backend_e2e::common::collect_run_events(&mut sub, &run_id, TIMEOUT).await;
         assert!(!collected.is_empty());

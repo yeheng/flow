@@ -1,32 +1,30 @@
 # flow 工作流引擎设计方案
 
-> 状态：单机实现 + 对等模式多节点执行（Postgres 后端；租约 / inbox / 接管的设计
-> 记录在 `flow-pg` 各模块的头注释里）；
-> `cargo test --workspace --all-targets --locked` 全绿（含 backend-e2e 的
-> Postgres 变体，需 docker；缺 Postgres 时对应用例跳过，其余全绿）。验证命令与覆盖范围见 §13。
-> 本文描述当前代码的实际语义，是后续开发的权威参考。分布式子系统的设计不再单列
-> 文档（曾有一份 `DISTRIBUTED.md`，删除时已有 40+ 处引用指向不存在的章节）——
-> 逐条落在 `flow-pg` 各模块的头注释里，改代码时顺带就在改设计。
-> 架构焊点：**journal（JSONL v2）是默认与权威后端**（canonical；SQLite 只是可
-> 随时重建的投影，v1 SQLite 后端已删除）；Postgres 是可替代后端，两者统一在
-> `flow-backend` 的 `AnyBackend` 闭集枚举之后（§2）。
+> 状态（2026-10-10 起）：**journal（JSONL v2）是唯一后端**。v1 执行面与双后端
+> 已整体删除——`flow-pg`、`flow-backend` 的 `AnyBackend`/`pg`/`journal_arm`/
+> `run_tail`、`flow-engine` 的 Driver/Engine/fold 事件面、`flow-server` 二进制
+> 均不存在了；执行驱动是 `journal_driver`，产品读面是 `journal_views`。
+> `cargo test --workspace --all-targets --locked` 全绿。验证命令与覆盖见 §13。
+> 本文 §2 / §9.4 / §13 已按现状改写；§3–§8、§12 中描述 Driver / fold /
+> run_tail / Postgres 集群语义的段落**保留为历史设计记录**（V2 语义继承自其中
+> 钉死的不变量，例如 §6.6 的取消与 fatal 副作用边界），阅读时以 §2 的现状
+> 清单为准。
 >
 > **部署 / 运维见 [OPS.md](OPS.md)**（部署形态、执行模式、离线维护、升级、
 > 故障处置、容量预算与安全边界）；本文只描述语义，不重复操作步骤。
 >
 > **容量定位（部署选型）**：journal 定位是**单机并发**——单写者 + fsync 崩溃边界，
-> backend-perf 实测 ~25 runs/s（16 在飞，e2e p95 < 1s）；**并发再高就换 Postgres**
-> （`storage.backend = "postgres"`，同一套 API，实测 ~60-70 runs/s @16 在飞，且可多节点
-> 水平扩展 executor）。两者语义等价（backend-e2e 双后端同契约），选型只看容量。
+> backend-perf 实测 ~25 runs/s（16 在飞，e2e p95 < 1s）。更高并发需求在当前
+> 产品面没有替代后端（v1 的 Postgres 多节点后端已删除，见 §14）。
 >
-> **⚠️ 安全边界（部署前必读）**：本服务**没有任何认证/授权**——JSON-RPC
-> WebSocket 谁连上谁就是管理员。默认只监听 `127.0.0.1:9800`；对外暴露
-> （如多节点部署的 gateway）必须在外层自备 TLS + 认证（反向代理 / 内网 ACL）。
+> **⚠️ 安全边界（部署前必读）**：v2 协议**每个调用都要 token**
+> （`FLOW_JOURNAL_TOKEN`，≥32 字节，含订阅与分页读），但 token 是**单用户
+> 凭据，不是多租户授权**——拿到 token 的任何人都是管理员。默认只监听
+> loopback；对外暴露必须在外层自备 TLS + 认证（反向代理 / 内网 ACL）。
 > `http_call` 节点是**任意出站 HTTP**（可打内网地址与云元数据端点
 > 169.254.169.254），`script`/`condition` 是沙箱内任意 JS——工作流定义事实上是
 > 可执行代码，只允许可信用户创建与发布。出站白名单/沙箱网络隔离未实现。
-> 完整运维边界（journal 内含业务原文、备份介质加密、token 非多租户授权）见
-> [OPS.md](OPS.md) §8。
+> 完整运维边界（journal 内含业务原文、备份介质加密）见 [OPS.md](OPS.md) §8。
 
 ## 1. 目标与边界
 
@@ -37,107 +35,99 @@ flow 是一个工作流执行引擎：发布不可变的流程定义（DAG），
 明确的非目标（v1 范围决策）：
 
 - 不做通用 DSL——表达式与脚本统一用 JavaScript。
-- 多节点执行：对等抢占模式（peer）已在 Postgres 后端实现（租约、持久 inbox、
-  副作用边界；设计记录在 `flow-pg` 各模块的头注释里）；中心指派模式未实现（见 §14）。
+- 多节点对等执行（v1 Postgres 后端的租约/持久 inbox/接管）已随后端删除；
+  远程执行走 `flow-agent`（受信任中继，§2 的执行模式）。
 
 节点运行可观察性（node_log 事件流、输入面快照、日志控制台）的完整设计见
 `docs/observability-design.md`；本文只记它与状态机相关的契约（§3.1、§6.1、§10）。
 将来接入 OpenTelemetry 的设计见 `docs/opentelemetry-design.md`——**已定未实现**，
-且明确不改事件模型与 `fold`（该文 §2、§12），因此不改变本文任何一条不变量。
+且明确不改事件模型（该文 §2、§12），因此不改变本文任何一条不变量。
 
 ## 2. 总体架构
 
 ```
 crates/
-  flow-engine   执行引擎。Driver 只依赖 RunEventSink 后端边界（Phase 0），
-                不依赖任何存储实现
+  flow-engine   执行引擎的共享能力：定义模型与校验、表达式沙箱、节点执行、
+                journal_state（run 状态折叠）、观测日志、密钥、执行协议。
+                （v1 的 Driver/Engine/fold 事件面已删除）
   flow-dto      领域 DTO 与状态词汇表的单一来源（零依赖叶子）：
-                WorkflowVersion / WorkflowSummary / RunRecord / DbRunStatus。
+                WorkflowVersion / WorkflowSummary / RunRecord / RunStatus。
                 存储层持久化的本来就是引擎域数据，不维护第二份拷贝
   flow-store    SQLite：journal 的投影层（可随时重建，非权威）
-  flow-backend  后端适配层：`AnyBackend` 闭集枚举（**不是 dyn trait**）
-                屏蔽两种架构选择。journal（`journal.rs`）是默认与权威实现
-                （v2 唯一权威，SQLite 只是可重建投影）；Postgres 是可替代实现
-                （`pg.rs`；分布式设计记录在 `flow-pg` 各模块的头注释里）。公共面只含两个
-                后端都诚实实现的方法；
-                初始化协议、信号落账、订阅推送的差异在边界内吸收；
-                「只有 published 可执行 + 创建前校验」单点在 resolve_runnable_definition
-  flow-pg       Postgres 后端实现：共享日志、epoch 租约、持久 inbox、executor
-  flow-rpc      jsonrpsee WebSocket 服务（bin: flow-server / flow-journal-server）；
-                **只依赖 `AnyBackend` 枚举**，不感知 flow-store / flow-pg，也不读 FLOW_BACKEND；
-                进程内还跑 cron 调度器与 webhook HTTP 入口（§9.2）
+  flow-backend  journal 唯一权威后端：journal.rs（JournalBackend）+
+                journal_commands（产品 CRUD 命令，request_id 幂等）+
+                journal_views（V2 产品物化视图）+ journal_driver（执行驱动）+
+                journal_execution / journal_triggers / journal_import
+  flow-journal  JSONL journal 库（叶子 crate）：事务日志、分页、codec 预算
+  flow-rpc      jsonrpsee WebSocket 服务（bin: flow-journal-server）：
+                journal_v2 协议（token 认证、写命令幂等键、回执语义）+
+                journal_triggers（cron 扫描 + webhook HTTP）+ journal_download
   flow-cli      命令行客户端（bin: flow-cli，§9.3）。**纯 RPC 客户端**：只连
-                flow-server 的 WebSocket，不依赖 flow-backend / store / pg，
+                flow-journal-server 的 WebSocket，不依赖 flow-backend / store，
                 也不读 FLOW_BACKEND——CRUD 与触发语义唯一来源仍是 RPC 那一份
 ```
 
 产品二进制按职责分属各自的 crate（不再做统一多路入口）：
 
 | bin | 所属 crate | 职责 |
-|---|---|---|
-| `flow-server` | flow-rpc | JSON-RPC 2.0 over WebSocket 服务 + cron + webhook |
-| `flow-cli` | flow-cli | 命令行客户端（纯 RPC，后端无关） |
+| --- | --- | --- |
+| `flow-journal-server` | flow-rpc | JSONL v2 产品服务（WS RPC + cron + webhook + 下载） |
+| `flow-cli` | flow-cli | 命令行客户端（纯 RPC） |
 | `flow-executor` | flow-executor | 受管理执行子进程（FD 槽位由主进程 pre_exec 固定） |
 | `flow-agent` | flow-agent | 受信任远程执行中继（双 TLS 上联 + 本机执行器池） |
 | `flow-journal-tool` | flow-journal | journal 离线维护（verify/index/backup/repair） |
 | `flow-journal-bench` | flow-journal | journal 写入基准 |
-| `flow-journal-server` | flow-rpc | JSONL v2 开发服务（WS RPC + 下载） |
 | `flow-journal-dev` | flow-backend | JSONL v2 开发运行器（run/resume/import-legacy） |
 
-执行器定位契约（I09）：`flow-server` / `flow-agent` 缺省在**自身同目录**召唤
-兄弟 `flow-executor`（部署形态即「全部产品二进制同目录分发」，如
-`scripts/build-sqlite.sh` 的 `dist/*/bin/`）；`FLOW_EXECUTOR_BIN` 显式路径
+执行器定位契约（I09）：`flow-journal-server` / `flow-agent` 缺省在**自身同目录**
+召唤兄弟 `flow-executor`（部署形态即「全部产品二进制同目录分发」，如
+`scripts/build-journal.sh` 的 `dist/*/bin/`）；`FLOW_EXECUTOR_BIN` 显式路径
 优先。找不到即报错，绝不静默回退进程内执行。测试专用脚手架
-（backend-e2e 的 `flow-server-e2e`、backend-perf 的 `flow-perf`）不属于产品
-bin，保持独立。
+（backend-e2e 的 `flow-journal-server-e2e`、backend-perf 的 `flow-perf`）不属于
+产品 bin，保持独立。
 
-依赖方向（2026-10-03 与 Cargo.toml 对齐复查后的**现状**；v1 语义权威仍是本文，
-JSONL 世代 crate 的行为契约见各期设计文档）：
+依赖方向（与 Cargo.toml 对齐的**现状**）：
 
 ```
 flow-rpc ──> flow-backend ──> flow-engine ──> flow-dto
            ├─> flow-journal  （v2 值分页/下载）
            └─> flow-engine   （nodetypes.list 复用 NodeType::descriptor，单一来源）
-flow-backend ──> flow-store / flow-pg / flow-journal / flow-dto
-             └─> [仅 dev-dependencies] flow-agent（journal_remote* 测试）
+flow-backend ──> flow-store / flow-journal / flow-dto
+              └─> [仅 dev-dependencies] flow-agent（journal_remote* 测试）
 flow-engine ──> flow-dto
-            └─> flow-journal（只共享 StoredValue/ValueRef 词汇与 codec 预算
-                 函数——引擎不依赖任何存储 I/O，状态出口仍走 RunEventSink）
-flow-pg ──> flow-store   ✗（两个后端互相独立，互不感知）
-flow-rpc ──> flow-store / flow-pg   ✗（上层不感知具体后端）
+             └─> flow-journal（只共享 StoredValue/ValueRef 词汇与 codec 预算
+                  函数——引擎不依赖任何存储 I/O）
 flow-journal ──> 无 flow 依赖（叶子；被 engine/backend/rpc/agent/executor 复用）
-flow-agent / flow-executor ──> flow-engine, flow-journal（JSONL 二/三期执行侧）
-flow-cli ──> flow-server / flow-journal-server（纯 RPC 客户端）──> 上面的链路
-flow-cli ──> flow-store / flow-pg ✗   ✗（CLI 不碰存储与事件日志，
-                没有第二条写入路径；SQLite / Postgres 对 CLI 行为一致）
+flow-agent / flow-executor ──> flow-engine, flow-journal（执行协议两侧）
+flow-cli ──> flow-journal-server（纯 RPC 客户端）──> 上面的链路
+flow-cli ──> flow-store ✗   ✗（CLI 不碰存储与事件日志，没有第二条写入路径）
 ```
 
-后端选择只在进程入口发生一次：`flow_backend::open()` 按
-`storage.backend = journal（缺省）| postgres` 构造 `AnyBackend`，之后整条
-RPC 链路只看枚举。闭集枚举而非 trait 对象：每加一个方法编译器逼着每个臂都写完，
-不存在某个后端静默继承错误默认实现的坑。**journal 臂**（JSONL v2 唯一权威，SQLite 只是
-可重建投影）承载全部公共契约（适配层 `flow-backend/src/journal_arm.rs`；历史
-v1 数据不迁移，仅全新数据目录；切换路线见
-[SQLITE_V1_TO_V2_MIGRATION.md](SQLITE_V1_TO_V2_MIGRATION.md)）。
-`FLOW_BACKEND=sqlite`（v1）已删除，显式配置即报错并指向该文档。
+后端只有 journal 一种：进程入口直接构造 `JournalBackend`，v1 的
+`AnyBackend` 双后端枚举已删除。产品命令（workflow/run/schedule/webhook/template
+CRUD）落在 `journal_commands`，回执带 `request_id` 幂等；产品读面
+（`workflow.*.view` / `run.*.view` / triggers / templates）由 `journal_views`
+物化。历史 v1 数据不迁移，仅全新数据目录；切换路线见
+[SQLITE_V1_TO_V2_MIGRATION.md](SQLITE_V1_TO_V2_MIGRATION.md)。
+`FLOW_BACKEND=sqlite|postgres`（v1）已删除，显式配置即报错并指向该文档。
 
-运行：`cargo run -p flow-rpc --bin flow-server`。配置分层 CLI > env > `flow.toml` >
-默认值（§9.4）；常用 env：`FLOW_ADDR`（默认 `127.0.0.1:9800`）、`FLOW_HTTP_ADDR`、
-`FLOW_DATA_DIR`、`FLOW_SCHEDULER`（§9.2）；journal 模式 `FLOW_DATA_DIR` 即 journal 根；
-Postgres 模式另见 `flow-pg/src/config.rs`
-（`FLOW_DATABASE_URL`、`FLOW_ROLE`、`FLOW_LEASE_TTL_MS` 等）。
+运行：`cargo run -p flow-rpc --bin flow-journal-server`。配置分层 CLI > env >
+`flow.toml` > 默认值（§9.4）；常用 env：`FLOW_JOURNAL_TOKEN`（必填，≥32 字节）、
+`FLOW_JOURNAL_ADDR` / `FLOW_JOURNAL_HTTP_ADDR` / `FLOW_JOURNAL_DATA_DIR`
+（§9.2）。
 
-**单写者纪律（journal 臂同款铁律）**：open 时对 `data_dir` 目录 fd 持排他 flock，
-第二个实例立即失败——多节点清用 postgres 后端。journal 用多线程 runtime（投影回放 /
-值读取大量 `spawn_blocking`；v1 SQLite 的 current_thread 单写者形态已随其后端删除）。
-runtime 形态选择只在二进制薄壳 main 发生，lib 内的请求处理路径依旧不感知后端。
+**单写者纪律（铁律）**：open 时对 `data_dir` 目录 fd 持排他 flock，
+第二个实例立即失败。journal 用多线程 runtime（投影回放 /
+值读取大量 `spawn_blocking`）。runtime 形态选择只在二进制薄壳 main 发生，
+lib 内的请求处理路径不感知后端。
 
 ## 3. 核心数据结构：事件日志是唯一权威
 
 这是整个系统最重要的设计决策，其余一切都从它推导。
 
 > **v1 后端已删除（2026-10-09）**：本节描述的 `data_dir/runs/<id>/event.jsonl`
-> + SQLite 元数据形态是 v1 的权威布局，已随 sqlite 后端移除。单机缺省
+>
+> - SQLite 元数据形态是 v1 的权威布局，已随 sqlite 后端移除。单机缺省
 > 后端是 journal（`<data_dir>/journal/` JSONL 段链为唯一权威，SQLite 仅
 > 可重建投影）；Postgres 臂仍共用本文描述的 v1 引擎折叠语义。
 > 见 [SQLITE_V1_TO_V2_MIGRATION.md](SQLITE_V1_TO_V2_MIGRATION.md)。
@@ -154,7 +144,7 @@ Driver 启动后回填 `running`。终态也必须先写事件，再更新索引
 事件全集：
 
 | 事件 | 载荷 | 语义 |
-|---|---|---|
+| --- | --- | --- |
 | `run_started` | workflow_id, workflow_version, input, depth | run 创建，input 快照；depth 为嵌套深度（根 run 为 0，旧日志缺省 0） |
 | `node_started` | node_id, attempt, child_run_id（可选）, input（可选） | **副作用发生前**写入；child_run_id 仅 sub_workflow 携带；input 是模板展开后的 params 脱敏快照（可观察性数据，fold 不消费） |
 | `node_completed` | node_id, attempt, output, duration_ms | 节点成功 |
@@ -208,6 +198,9 @@ elements ... WITH ORDINALITY` 整批插入 + 一次 NOTIFY），逐条则是 N �
 
 ### 3.4 订阅的回放 + 追流状态机（flow-backend run_tail）
 
+> 历史记录：`run_tail` 已随 v1 适配层删除；v2 订阅直接 tail journal
+> （`journal_v2.rs` 的 run.subscribe），回放 + 追流 + 终态结束语义继承本节。
+
 `run_tail` 把「从 seq=1 回放」与「追实时增量」合成一个流，`Phase` 是
 `Replaying → Streaming ⇄ Filling → Done | Closed`。**只吐严格连续的前缀**：
 出现缺口先补齐，补齐失败等重试定时器或下一条事件唤醒，绝不跳缺口静默丢事件。
@@ -225,6 +218,9 @@ elements ... WITH ORDINALITY` 整批插入 + 一次 NOTIFY），逐条则是 N �
   （连终态都送不出去）。真实后端（PG 查询慢于 NOTIFY）下实时段先到是常态。
 
 ## 4. 折叠器：一个状态机，两个消费者
+
+> 历史记录：v1 的 `fold.rs` 已删除；v2 的状态折叠在
+> `flow-engine/src/journal_state.rs`，不变量继承本节。
 
 `fold.rs` 的 `RunState::fold(Envelope)` 是**唯一**的状态转移函数。
 恢复（重建驱动状态）与只读时间线（前端渲染）共用它，不存在第二份状态语义。
@@ -346,6 +342,10 @@ condition 求值为真而 `e` 被 `branch_not_taken` 跳过。
 
 ## 6. 执行引擎（Driver）
 
+> 历史记录：v1 的 Driver/Engine 已删除；v2 执行驱动是
+> `flow-backend/src/journal_driver.rs`，副作用边界（§6.6 的授权语义）与
+> 汇合/收集/重试语义继承本节。
+
 每次 run 一个 tokio 任务，持有该 run 事件日志的**单写者**——没有跨 run 共享可变状态，
 没有锁竞争，run 之间完全隔离。
 
@@ -370,7 +370,7 @@ loop {
 唯一的在途工作账本，键集 =「有在途任务或未决外部输入的节点」。三种槽位：
 
 | 槽位 | 含义 | 持句柄 | 由谁推进 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `Running` | 节点执行中，或退避计时器在飞 | 是 | `result_rx` 的 `Done` / `RetryDue` |
 | `AwaitSignal` | human_task 已落 `node_started`，挂 oneshot 等 `run.signal` | 是（等 oneshot 的任务） | `run.signal` 交付后回传 `Done` |
 | `Adjudicating` | 崩溃/接管残留的副作用节点，等人工裁决 | **否** | `run.signal` 裁决（不经 `result_rx`） |
@@ -378,7 +378,7 @@ loop {
 转移表（`∅` = 不在 slots 里）：
 
 | 起始 | 事件 | 终止 |
-|---|---|---|
+| --- | --- | --- |
 | `∅` | 派发（就绪 / 重试 / 裁决 retry） | `Running` |
 | `∅` | human_task 就绪 | `AwaitSignal` |
 | `∅` | 接管残留副作用节点 | `Adjudicating` |
@@ -550,7 +550,7 @@ Postgres `PgChildLauncher` 经 `lease::create_run` 单事务创建子 run、
 有效日志的 workflow、version、input 必须与元数据匹配。折叠后按持久状态分类：
 
 | 节点状态/类型 | 处置 | 理由 |
-|---|---|---|
+| --- | --- | --- |
 | Running 纯节点（start/end/script/condition/delay） | **重放**：attempt+1 | 无外部副作用 |
 | Running `http_call`，无裁决信号 | **人工裁决**：`awaiting_resume` | 请求可能已发出，不猜测 |
 | Running `http_call`，已有裁决信号 | **消费裁决**：retry/succeeded/failed | 裁决已经持久化 |
@@ -563,7 +563,6 @@ Postgres `PgChildLauncher` 经 `lease::create_run` 单事务创建子 run、
 | Failed{retryable:false} | **保留 run 失败结论**，独立分支继续 | fold 已记录 fatal_error |
 
 裁决信号：`run.signal {payload: {action: "retry" | "succeeded" | "failed", output?, error?}}`。
-
 
 恢复循环的失败隔离：单个 run 的回填/隔离投影失败（如瞬时 SQLite 锁）记入
 失败清单继续下一个 run，不中断整个恢复——一条坏行不能阻止其余 run 恢复，
@@ -599,6 +598,10 @@ awaiting_resume 并报告错误，需修复数据后重启重试。恢复分类�
 等满整段 backoff（不续算剩余时间，理由同 §6.5）。
 
 ## 8. 存储层（flow-store）
+
+> 历史记录：v1 的 `Store`（flow.db 元数据权威）已删除；本 crate 只剩
+> journal 的 SQLite 投影（`projection.rs`，可随时重建）。Postgres 后端
+> 整体删除，本节 PG 相关段落为历史设计记录。
 
 SQLite（WAL + `synchronous=NORMAL` 组提交：COMMIT 不 fsync、checkpoint 才 fsync。
 SIGKILL 崩溃零丢失——页缓存归内核管；断电/内核崩溃可能丢最后几笔事务，但库
@@ -671,7 +674,7 @@ jsonrpsee WebSocket。本层只有**一份**方法实现，只依赖 `flow_backe
 方法：
 
 | 方法 | 说明 |
-|---|---|
+| --- | --- |
 | `workflow.create / update / publish / get / list / delete` | 定义生命周期。update 前强制 validate + x-secret 名称存在性校验（§5） |
 | `workflow.versions` | 版本历史（按 version 倒序，只回 version/status/checksum/created_at 元数据列，definition 走 workflow.get 按需拉取）；workflow 不存在返回 -32011 |
 | `nodetypes.list` | 前端画布能力清单：类型、端口、`params_schema`（JSON Schema draft-07 子集 type/required/properties/enum/default，另带 `x-widget`/`x-label`/`x-help`/`x-secret` 扩展键，前端据此渲染参数表单；后端校验仍以 `Definition::validate` 为准）、supports_retry、side_effect；单条描述的唯一来源是 `NodeType::descriptor`（§5） |
@@ -698,32 +701,34 @@ run_started 未落盘」的初始化中断窗口，恢复已按 DB 投影标终�
 
 ### 9.2 触发器：cron 调度与 webhook
 
-除 `run.start` 手动触发外，run 还有两个自动入口，都在 `flow-server` 进程内：
+除 `run.start` 手动触发外，run 还有两个自动入口，都在 `flow-journal-server`
+进程内（`flow-rpc/src/journal_triggers.rs`）：
 
-- **cron 调度器**：默认开启，`FLOW_SCHEDULER=off` 禁用。每 20s tick 扫一次
-  全部 enabled schedule，取「最近一次 ≤ now 的整分触发点」（cron 标准 5 字段，
-  本地时间，解析用 cron-parser crate），先 `try_insert_fire`（schedule_fires
-  主键去重，多节点下谁先插入谁触发）再 `create_run`（当前 published 版本，
-  输入取 schedule.input）。每个 tick 每个 schedule 最多补一次火——停机期间
-  错过的触发点不追补；目标 workflow 没有 published 版本时本次跳过；
-  **`create_run` 遇瞬时故障（磁盘满 / DB 不可达）时撤销去重行**（`delete_fire`），
-  让下一个 tick 重试同一触发点——去重键含 `fire_at`，下一轮算的是新一分钟的键，
-  不撤销则这一分钟的火永久丢失。配置类失败（无 published 版本 / workflow 不存在）
-  不撤销：重试也不会变好。「不追补」只针对停机期间错过的点，不是静默吞掉磁盘错误；
-- **webhook HTTP 入口**：独立于 WebSocket 端口的 HTTP 服务，`FLOW_HTTP_ADDR`
-  （默认 `127.0.0.1:9801`）。`POST /hook/<token>`：token 未知或已停用 → 404
-  （不区分，避免探测）；body 须为 JSON（空 body 视为 null 输入），作为 input
-  启动当前 published 版本 → 200 `{"run_id": "..."}`；无 published 版本 → 409。
-  webhook 与 RPC 共用同一个安全边界：无认证，只允许绑定可信地址（见文首警告）。
+- **cron 调度器**：`[server].scheduler_enabled`（默认开启）+
+  `journal_trigger_tick_secs`（默认 20s）。每 tick 扫描全部 enabled schedule，
+  触发命令带稳定身份（schedule id + 触发点）落 journal 权威——同键重试不产生
+  双 run；停机期间错过的触发点不追补；目标 workflow 没有 published 版本时
+  本次跳过；
+- **webhook HTTP 入口**：独立于 WebSocket 端口的 HTTP 服务
+  （`[journal].http_addr`，默认 `127.0.0.1:9803`，与下载路由同进程）。
+  `POST /hooks/<key>`：**Bearer token（部署 `FLOW_JOURNAL_TOKEN`）+
+  Idempotency-Key 头必填**；key 未知或已停用 → 404（不区分，避免探测）；
+  body 须为 JSON（空 body 视为 null 输入），作为 input 启动当前 published
+  版本 → 200 `{"run_id": "..."}`；无 published 版本 → 409。同一
+  Idempotency-Key 重放不产生第二个 run。
 
-四个触发入口都在 runs 表写入归因：`run.start` = manual、调度器 = schedule
-（detail 为 schedule id）、webhook = webhook（detail 为 token）、sub_workflow
-子 run = sub_workflow（两臂的 launcher 直插路径各自标注，不经 run.start）。
+四个触发入口都在 run 归因里标注：`run.start` = manual、调度器 = schedule
+（detail 为 schedule id）、webhook = webhook（detail 为 key）、sub_workflow
+子 run = sub_workflow。
 
-错误码：`-32010` 参数非法、`-32011` 不存在、`-32012` 冲突、`-32603` 内部错误。
-JSON-RPC 允许整体省略 params（到达 null），解析层统一归一为 `{}`。
+错误码（v2 单一来源）：`-32001` unauthorized、`-32011` 不存在、`-32012` 冲突、
+`-32020` COMMITTED_NOT_VISIBLE、`-32021` 超限、`-32602` 参数非法、`-32603`
+内部错误。JSON-RPC 允许整体省略 params（到达 null），解析层统一归一为 `{}`。
 
 ### 9.1 wire protocol 变更记录（适配层重构）
+
+> 历史记录：本节是 v1 时代两份 RPC 实现合并时的对齐清单，信号/id 语义已被
+> v2 的 `run.signal` 原生命令回执取代，保留作考古依据。
 
 后端适配层重构（两份 RPC 实现合一）带来的线上协议变更，客户端对齐依据：
 
@@ -742,10 +747,10 @@ JSON-RPC 允许整体省略 params（到达 null），解析层统一归一为 `
 ### 9.3 命令行客户端（flow-cli）
 
 `flow-cli`（`crates/flow-cli`）是 §9 方法面的命令行封装：**纯 RPC 客户端**，
-只连 flow-server 的 JSON-RPC WebSocket（`--url` / `FLOW_RPC`，缺省
-`ws://127.0.0.1:9800`），不依赖任何存储 crate、不读 FLOW_BACKEND、不碰
-`data_dir`。因此两个后端对它行为一致，也不存在「绕过 RPC 校验直接操纵
-SQLite / 事件日志」的第二条写入路径。
+只连 flow-journal-server 的 JSON-RPC WebSocket（`--url` / `FLOW_RPC`，缺省
+`ws://127.0.0.1:9802`），认证走部署 token（`FLOW_JOURNAL_TOKEN`），不依赖
+任何存储 crate、不读 FLOW_BACKEND、不碰 `data_dir`。因此不存在「绕过 RPC
+校验直接操纵 SQLite / 事件日志」的第二条写入路径。
 
 ```bash
 flow-cli workflow list | get | versions | create | update | publish | delete
@@ -786,17 +791,18 @@ flow-cli run list | get | events | timeline | cancel
 TOML（`flow.toml`，`crates/flow-config`，叶子 crate），分层加载
 （高覆盖低）：**CLI `--config` > 环境变量 > 配置文件 > 内置默认值**。
 搜索顺序：显式路径 → `FLOW_CONFIG` → `./flow.toml` → 平台配置目录。
-分区：`[server]`（监听地址/调度器/tick）、`[storage]`（backend/data_dir/
-database/database_url）、`[execution]`（mode/executor_bin/x_max/[remote]）、
-`[agent]`、`[journal]`、`[pg]`（原 flow-pg 11 个 env）。
+分区：`[server]`（调度器开关与 journal 触发器 tick）、`[storage]`
+（backend/data_dir；backend 只有 `journal`）、`[execution]`
+（mode/executor_bin/x_max/[remote]）、`[agent]`、`[journal]`。
+v1 的 `[server].rpc_addr/http_addr/scheduler_tick_secs`、`[storage].database/
+database_url` 与整个 `[pg]` 段已删除（deny_unknown_fields：存量旧键显式报错）。
 
-- **加载必须发生在构造 tokio runtime 之前**：runtime 形态
-  （current_thread / multi_thread）取决于 `storage.backend`
-  （`prefer_current_thread_runtime_for`）。`flow-server` / `flow-agent` /
-  `flow-journal-server` / `flow-journal-dev` 在 main 里同步 `Config::load`；
-- **全部 `FLOW_*` 环境变量保持原语义**（向后兼容：既有部署脚本与测试不改）；
-  env 覆盖按分区手写合并（显式可 grep），生效名单记录在 `Loaded.env_overrides`
-  供设置页展示「这些项重启后仍会被 env 覆盖」；
+- **加载必须发生在构造 tokio runtime 之前**。`flow-journal-server` /
+  `flow-agent` / `flow-journal-dev` 在 main 里同步 `Config::load`；
+- **存量 `FLOW_*` 环境变量保持原语义**（v1 的 `FLOW_ADDR` / `FLOW_HTTP_ADDR` /
+  `FLOW_DATABASE_URL` / `FLOW_ROLE` / `FLOW_*_MS` / `FLOW_MAX_RUNS` 已随后端
+  删除）；env 覆盖按分区手写合并（显式可 grep），生效名单记录在
+  `Loaded.env_overrides` 供设置页展示「这些项重启后仍会被 env 覆盖」；
 - **明确不收敛**：`RUST_LOG`、`FLOW_SECRET_*`（见下）、journal token（每工作区
   凭据）、执行协议冻结常量（contract.rs，改即协议变更）、executor FD 槽位、
   `FLOW_RUN_LOG_BUDGET` 等 engine 内部预算（读取点在 driver 深处，维持 env）；
@@ -815,8 +821,8 @@ database/database_url）、`[execution]`（mode/executor_bin/x_max/[remote]）�
 画布片段（若干节点 + 内部边）的命名持久化，跨流程、跨设备复用：
 
 - **存储**：`node_templates` 表（id/name UNIQUE/category/nodes JSON/edges
-  JSON/时间戳），SQLite（flow-store）与 Postgres（flow-pg schema）同构，
-  `CREATE TABLE IF NOT EXISTS` 零迁移；`AnyBackend` 闭集双臂直通 store 层；
+  JSON/时间戳），journal 权威事件 + SQLite 投影，`journal_views::template_*`
+  物化读面；
 - **校验是逐节点的**：类型已知（`NodeType::parse`）+ `validate_params`
   （与整图 `Definition::validate` 同源的参数规则，为模板开放为 pub）+ 边端点
   在片段内 + condition 出边端口合法。**不跑整图校验**——片段没有
@@ -1005,187 +1011,79 @@ email 的 `api_key` 是 x-secret 名称，执行前注入真值，只进 Authori
 ### 测试代码怎么摆（Rust 的四层位置约定）
 
 | 层 | 位置 | 规则 |
-|---|---|---|
+| --- | --- | --- |
 | 单测 | `src/<模块>.rs` 末尾 `#[cfg(test)] mod tests;` | 能碰 `super::*` 私有项；模块超过 ~150 行就拆到 `src/<模块>/tests.rs` |
-| 集成测试基建 | `flow-test-support`（`io`：TempDir / free_port；`pg`：docker 容器 + 独占测试库 + 孤儿 volume 回收） | 跨 crate 共享的测试代码只能放这里；只用到 `io` 的 crate 用 `default-features = false` 关掉 `pg` |
+| 集成测试基建 | `flow-test-support`（`io`：TempDir / free_port） | 跨 crate 共享的测试代码只能放这里（v1 的 `pg` docker 基建已随后端删除） |
 | 集成测试 | `tests/<主题>.rs` + `tests/common/mod.rs` | 只走 public API；共享夹具放 `common`（放子目录，cargo 才不会把它当成独立测试 target） |
-| 端到端 | `backend-e2e/tests/*.rs`（`e2e_test!` 双后端展开） | 真起进程；`common` 里只有 e2e 专属部分 |
+| 端到端 | `backend-e2e/tests/*.rs`（`e2e_test!` 宏） | 真起进程；`common` 里只有 e2e 专属部分 |
 
 三条硬规则：
 
-- **不许为了让 `tests/` 通过而把内部 API `pub` 出去**。曾经为了一份
-  `tests/group_commit.rs` 把 `commit_stats()` / `read_events()` 导出到
-  `flow_engine`——一个测试事实在公开 API 上开了两个洞。这条断言现在住在
-  `src/event.rs` 的 `#[cfg(test)] mod group_commit_tests`。
-- **共享夹具不逐文件复制**。`flow-engine/tests/{engine_recovery,
-  recovery_regressions,sub_workflow}.rs` 曾经各有一份几乎同构的 `Harness`；
-  现在统一在 `tests/common`。同理 `flow-rpc/tests/ws_{rpc,pg}.rs` 的两份
-  `ServerProc`。
-- **docker / PG 测试库的生命周期只在 `flow-test-support::pg` 一处**
-  （历史上有三份各自漂移的实现，其中 flow-pg 那份的残留库清扫因为取错了
-  时间戳长度，从来没删掉过任何库）。
-
-### docker 卫生（backend-e2e / flow-test-support::pg）
-
-PG 镜像声明了 `VOLUME /var/lib/postgresql/data`，不带挂载启动就落到一个**匿名**
-volume 上。Docker 只在容器**自己退出**时（`--rm`）回收匿名 volume；测试清理走
-的是 `docker rm -f`（atexit 与残留清扫都走这条），它只删容器，把 volume 留在
-`/var/lib/docker/volumes` 里变成孤儿——一个 e2e 运行漏一个。三层都堵住：
-
-1. **不创建**：数据目录挂 `--tmpfs`，匿名 volume 根本不出现（临时库的数据
-   本来就没有跨容器的意义，tmpfs 还更快）；
-2. **不留**：删除容器一律 `docker rm -f -v`；
-3. **回收历史遗留**：启动时（删完残留容器之后，否则它们还不算 dangling）
-   清扫 dangling 匿名 volume。只认 64 位十六进制的匿名名——命名 volume
-   是开发者显式建的，绝不动。
-
-`backend-e2e/tests/docker_hygiene.rs` 把这三层各钉一条断言（外加
-「cleanup 必须真的 DROP 测试库」）。每条都验证过：对应的修复被回退，测试就红。
-
-测试库的清理同样有讲究：`DROP DATABASE ... WITH (FORCE)`（PG 13+）原子踢掉
-所有会话再删库，且删库必须排在「关自己的池」之前——用例手里常有第二个池
-（PgEngine / PgBackend / 自建 EventHub），先关池会把删库拖到超时之后。
+- **不许为了让 `tests/` 通过而把内部 API `pub` 出去**——测试事实不能在公开
+  API 上开洞。
+- **共享夹具不逐文件复制**：backend-e2e 的 harness 在 `src/common`，
+  flow-engine 的执行夹具在 `tests/common`。
+- 被测进程与产品进程同一份装配（backend-e2e 的 `flow-journal-server-e2e`
+  与 flow-rpc 的 `flow-journal-server` 同一 `serve_journal_product`）——
+  「被测的就是生产的」。
 
 ### 具体覆盖
 
-- RPC 测试用 `env!("CARGO_BIN_EXE_flow-server")`（flow-rpc 自己的 bin）真起进程，
-  `child.kill()`(SIGKILL) + 同 data_dir 重启证明恢复；
-  就绪用 TCP connect 轮询，重启换新端口避免 EADDRINUSE；
-- http_call 卡住用「本地 TcpListener 接受连接后持有不响应」；
-  断流用「声明 Content-Length 但发一半即关闭」——确定性，不依赖不可路由地址；
-- 客户端用 `ObjectParams` 具名参数；`subscribe` 三参
-  `(subscribe_method, params, unsubscribe_method)`；
-- 状态词汇表（§8）：`flow-dto` 的 `all_is_the_single_source_for_status_vocabulary`
-  钉住 `ALL` 与 `as_str` 不脱节；`flow-pg` 的 `generated_run_status_check_*` 钉住
-  派生出的 `CHECK` 列表排除 `initializing` 且与迁移前手写版逐字一致；
-  `flow-backend` 的契约测试钉住 store 写入口真的在校验。
-  「只有 published 可执行 + 创建前校验」的规则断言单点钉在 flow-backend 的
-  `resolve_runnable_definition` 测试；
-- JS 沙箱边界由行为测试钉住（§10），随每次 `cargo test` 重新验证；
-- 图校验规则由 `model.rs` 的表驱动单测逐条钉住（端口/环/不可达/参数必填/
-  模板参数放行与灰色形态拒绝；condition 多端口指同一节点的拒绝见
-  `condition_ports_must_target_distinct_nodes`），不为了一句「工作流存在环」起进程；
-- 节点类型注册表（§5）由 `model.rs` 钉住：`node_type_table_is_exhaustive`（表 ↔
-  enum 双向覆盖）、`required_params_are_actually_enforced_by_validate`（派生出的
-  必填清单真的在校验）、`opaque_params_are_exactly_the_js_bearing_fields`
-  （只有 script.code / condition.expr 不参与展开）、`secret_params_are_the_expected_keys`；
-- `nodetypes.list` 响应由 `node_types_snapshot_is_stable` 快照测试钉住
-  （descriptor 注册表收敛是纯重构，响应必须逐字节不变）；
-- `recovery_regressions.rs` 验证失败恢复、重试下游、剩余退避、非法/重复信号和裁决恢复；
-  另钉三条：定义外节点（幽灵记录停在非终态时终止判定永远不成立）在恢复时被判
-  `LogCorrupted` 拒（`node_outside_definition_is_rejected_on_recovery`）；已落盘
-  但载荷非法的裁决归平台故障挂起、**不写 run_failed 业务终态**
-  （`corrupt_durable_adjudication_is_a_platform_fault_not_a_run_failure`）；还有
-  待裁决节点时 run 不得被投影回 `running`
-  （`awaiting_adjudication_never_projects_back_to_running`，用状态投影记录器断言
-  `Running` 只被投影过一次——钉住 §12.20 的两趟顺序）；
-- `group_commit.rs`（flow-engine）钉严格组提交（§3.2）：append 返回即完整可读、
-  seq 连续、并发多日志不串扰，且 fsync 必须真被组批（批数 ≤ 事件数的一半）；
-  fsync 级持久化与写序协议由 backend-e2e 的 SIGKILL 用例钉住；
-- `contracts.rs` 验证显式 draft 拒绝、初始化中断和旧日志缺失隔离；另钉恢复回填
-  不得给 cancelled 的 run 行带上节点失败原因（正常投影路径写 NULL，回填必须一致，
-  §12.9 `terminal_recovery_backfill_does_not_put_a_node_failure_on_a_cancelled_run`）；
-- `sub_workflow.rs` 验证子 run 输出透传、子失败 fatal、RunExists 附着、深度上限、
-  取消级联，以及崩溃重放沿用同一 child_run_id；
-- `engine_recovery.rs` 钉住节点输入面语义：`nodes` 只暴露直接前驱输出，
-  非前驱引用深层访问即 fatal（`nodes_scope_*`）；终态 run 的重复恢复幂等且如实
-  报 `AlreadyTerminal`（`resume_after_terminal_run_reports_terminal_not_fake_resumed`
-  / `repeated_resume_after_terminal_is_idempotent`）；
-- `driver::slot_tests` 钉住节点级执行状态机（§6.1）：三个变体各自都阻止终止、
-  `AwaitSignal → Running` 交付后仍在飞、只有 `Adjudicating` 无句柄、清理幂等；
-- `fold.rs` 的 `attempt_and_error_are_derived_from_state_on_every_path` 钉住
-  「attempt/error 从状态派生、无影子副本」（§12.5）——走一遍全部事件类型，
-  每步断言展示值与状态恒等；`node_output_is_cleared_on_every_non_completed_path`
-  钉住输出住在 `NodeRecord` 且每个非 completed 分支都清它，
-  `terminal_node_never_carries_a_stale_pending_signal` 钉住「终态节点不携带待消费
-  信号」（`node_skipped` 曾是四个终态分支里唯一漏清 `last_signal` 的）；
-  `run_cancelled_clears_pending_fatal_error` 钉住取消清 `fatal_error`，
-  `node_outside_definition_is_log_corruption` 钉住定义外节点判损坏，
-  `run_phase_maps_to_db_status_on_every_phase` 钉住落库状态映射；
-- 调度器触发去重的撤销语义由 `scheduler::tests` 钉住：撤销后同一分钟可重取
-  触发权、撤销不影响别的分钟、重复撤销幂等；
-- `child_await.rs` 钉住父 run 等待初始化中断子 run 不挂死（空日志 → DB 投影）；
-- 回归护栏：重复恢复不产生第二个写者（engine_recovery）、共享 data_dir 的第二个
-  实例被排他 flock 拒绝且锁释放后可重开（flow-backend exclusive_lock）、平台故障挂起不写
-  run_failed（sub_workflow）、订阅缺口补齐与失败重试（flow-backend run_tail）、
-  子 run 重放沿用钉版本（flow-backend flow-store 的 child_version_pin + flow-pg 的
-  `replayed_child_run_keeps_pinned_version`，两臂同一条契约）、信号错误码与订阅
-  回放契约（contracts）、空日志订阅立即结束（run_tail）、追平后不空转与
-  实时段先到造成的缺口可补齐（run_tail）、PG reader 回放起点报
-  RunNotFound（flow-pg protocol）、身份不符隔离且不重扫——以 lease_epoch
-  停止攀升断言（flow-pg recovery）、删除后 insert_run 拒绝孤儿 run（flow-store）、
-  run_started 进全局广播两臂一致（flow-engine global_subscribe）；
-- store 并发测试核对每个返回版本对应的定义及相同定义的版本复用；
-- 测试数据库必须放在独占目录的 `flow.db`，只清理独占目录，禁止删除系统临时目录；
-- **Postgres 后端**：租约 fencing、接管窗口、恢复分类与 inbox 幂等由
-  `flow-pg/tests/{protocol,recovery}.rs` 覆盖，集群级 smoke/SIGKILL/订阅由
-  `flow-rpc/tests/ws_pg.rs` 覆盖。每个测试在独立数据库中运行
-  （名称含时间戳，启动时清理残留）；测试库通过 `FLOW_TEST_DATABASE_URL`
-  指定（默认 `postgres://flow:flow@127.0.0.1:54329/flow`），不可达时自动跳过，
-  没有可用 Postgres 时 `cargo test` 仍必须全绿；
-- **backend-e2e（`crates/backend-e2e`）**：后端契约的完整端到端矩阵。每个用例
-  对 SQLite（独占临时目录 `flow.db`）与 Postgres 两个后端各跑一遍，钉死
-  「两臂同契约」；真起被测服务进程（`CARGO_BIN_EXE_flow-server-e2e`——本 crate
-  自己的 `flow-server-e2e` 薄壳，与 flow-rpc 的 `flow-server` 是同一份
-  `run_from_env` 实现，只是改名以免两个 bin 写同一个 `target/debug/flow-server`；
-  含 SIGKILL 崩溃恢复与重启），HTTP stub 全部本地 TcpListener（确定性，不依赖
-  外部网络）。容器与测试库由 `flow-test-support::pg` 用 docker CLI 自管
-  （`postgres:16-alpine`，随机端口，label `com.flow.e2e=1`）：进程退出
-  （atexit）与下次启动（按 label 清扫容器、按 `e2e_%` 前缀清扫测试库）双层
-  清理，每个用例独占一个数据库、用完即 DROP，panic 路径也先清理再 unwind；
-  数据目录 tmpfs + `rm -f -v` + 启动回收孤儿匿名 volume，磁盘上不留
-  容器/测试库/volume 垃圾（见上面「docker 卫生」与 `tests/docker_hygiene.rs`）。
-  需要 docker；`FLOW_E2E_PG_IMAGE` 可换镜像。覆盖：workflow 生命周期与
-  「只有 published 可执行」、run 执行（script/condition/delay/输出收集/skip
-  传播/重试/JS 沙箱/大整数 BigInt 边界）、human_task 信号与取消、http_call 分类与
-  模板、sub_workflow（透传/失败传导/取消级联/深度上限）、schedule 真触发与
-  webhook HTTP 全分支、订阅（回放/增量/未知 run 即结束）、SIGKILL 恢复与
-  人工裁决、错误码映射。入口：`cargo test -p backend-e2e`。
-- **flow-test-support（`crates/flow-test-support`）**：测试基建 crate，
-  publish = false、不进产品二进制。`io`：独占临时目录 `TempDir`（Drop 即删，
-  断言失败也不漏）、`free_port`、`wait_ready`；`pg`（特性，默认开）：docker
-  容器、每用例独占测试库、残留清扫、孤儿 volume 回收。flow-pg / flow-rpc 的
-  测试、backend-e2e、backend-perf 都指着这一份。
-- **flow-cli（`crates/flow-cli`）**：CLI 自己的契约（测试里不直连 JSON-RPC——
-  那测的是服务端）。真起两个进程/实例：`flow-cli` 二进制按
-  `CARGO_BIN_EXE_flow-cli` 作为**子进程**跑，服务端用
-  `flow_rpc::serve` + `SqliteBackend::open`（显式路径、随机端口、不碰环境
-  变量，用例可并行）在进程内监听。钉住：import→list→get/versions→run
-  （等待终态/stdout 输出）→events/timeline→export→roundtrip import 全链路，
-  name 与 workflow_id 等价解析，`--input` 三种形态（内联/@文件/stdin），
-  `--detach` 的 stdout 只剩 run_id，退出码契约（本地 1 / RPC 2 / run 失败 4），
-  未发布即执行与非法定义分别由服务端 -32010 与本地 JSON 错误覆盖，非交互
-  环境 delete 缺 `-y` 必须报错而非挂起，`--url` 覆盖 `FLOW_RPC`，服务不可达
-  的错误文案带起服务提示。入口：`cargo test -p flow-cli`。
-- **backend-perf（`crates/backend-perf`）**：后端性能压测 harness（黑盒，真起
-  被测进程，双后端矩阵）。与 backend-e2e 分工：e2e 钉行为契约，这里量性能。
-  被测进程是 `flow-perf` 二进制的自举服务模式（`FLOW_PERF_SERVE=1` →
-  `flow_rpc::run_from_env`，与 flow-server 逐字同一份实现）；存储上下文复用
-  backend-e2e 的 harness（独占临时目录 / docker 测试库、SIGKILL、panic 路径
-  清理）。四个场景：run 执行吞吐（chain/fanout 两形态，完成检测走订阅流，
-  测量本身不给读路径加压）、RPC 读路径延迟（run.get/list/stats/timeline/
-  events 轮转交错）、订阅推送延迟（run.start 返回 → 事件到达）、崩溃恢复
-  耗时（空存储重启基线 vs 停驻 N 个 human_task run 的重启，差值即恢复代价，
-  附恢复后推进耗时）。「并发 N」= 同时在飞 N 个 run（提交侧限流，k6 的 VU
-  模型），被测进程的 FLOW_MAX_RUNS 随之放大；提交失败（如 SQLite 高并发
-  `database is locked`）不炸进程，计入 `submit_errors` 计数器。报告为最近秩
-  分位数（p50/p90/p95/p99）文本 + 可选 JSON（`--json`）。默认轻量回归规模
-  （数分钟）；`--runs/--concurrency/--prefill/--iterations` 放大做重负载。
-  入口：`cargo run -p backend-perf -- --help`。
+- **backend-e2e（`crates/backend-e2e`）**：v2 产品面的完整端到端矩阵。每个用例
+  独占一个临时 journal 目录（v2 唯一权威），真起被测服务进程
+  （`CARGO_BIN_EXE_flow-journal-server-e2e`——本 crate 自己的薄壳，与
+  flow-rpc 的 `flow-journal-server` 是同一份 `serve_journal_product` 实现，
+  只是改名避免两个 bin 写同一个 `target/debug/flow-journal-server`；含
+  SIGKILL 崩溃恢复与重启），HTTP stub 全部本地 TcpListener（确定性，不依赖
+  外部网络）。覆盖：workflow 生命周期与「只有 published 可执行」、run 执行
+  （script/condition/delay/输出收集/skip 传播/重试/JS 沙箱/harness/email）、
+  human_task 信号与取消、http_call 分类与模板、sub_workflow（透传/失败传导/
+  取消级联/深度上限）、schedule 真触发与 webhook HTTP 全分支、订阅（回放/
+  增量/未知 run 即结束）、SIGKILL 恢复与人工裁决、错误码映射、触发器 CRUD 的
+  幂等与回执恢复。入口：`cargo test -p backend-e2e`（无外部依赖）。
+- **flow-rpc**：`tests/contracts.rs`（进程内 v2 协议契约：token 认证、写命令
+  幂等键、-32020 回执、config.get/update 落盘、secrets、模板与触发器 CRUD、
+  错误码分层）+ `tests/ws_journal.rs`（真起 flow-journal-server 进程的 WS
+  连接/订阅/SIGKILL 恢复）+ `journal_v2.rs` 内联单测。
+- **flow-backend**：`tests/journal*.rs` 覆盖权威命令语义（删除保护、版本复用）、
+  验收用例、容量上限、import-legacy 历史保全、IPC 执行装配与 remote 执行
+  （ops/reconnect/TLS）；`journal_driver.rs` / `journal_commands.rs` /
+  `journal_views.rs` 带内联单测。
+- **flow-engine**：定义模型与校验（`model.rs` 表驱动单测：表 ↔ enum 双向覆盖、
+  必填清单真的在校验、opaque/secret 参数清单）、JS 沙箱边界行为测试
+  （`sandbox_has_no_std_os_or_module_loader`，§10）、表达式 BigInt 边界、
+  journal_state 折叠语义、执行协议帧/传输、密钥存储；`tests/observation.rs`
+  集成验证观测日志。
+- **flow-journal**：`tests/{journal,maintenance,page}.rs` 钉住日志写读、
+  离线维护与值分页契约。
+- **flow-cli（`crates/flow-cli`）**：CLI 自己的契约。`flow-cli` 二进制按
+  `CARGO_BIN_EXE_flow-cli` 作为**子进程**跑，服务端真起
+  `flow-journal-server`（隔离目录、随机端口）。钉住：import→list→get/versions
+  →run（等待终态/stdout 输出）→export→roundtrip 全链路、`--input` 三种形态、
+  `--detach`、退出码契约（本地 1 / RPC 2 / run 失败 4）、非交互环境 delete
+  缺 `-y` 必须报错而非挂起。入口：`cargo test -p flow-cli`。
+- **flow-executor / flow-agent**：执行侧协议契约（audit window、relay、
+  runtime）随 crate 单测。
+- **backend-perf（`crates/backend-perf`）**：性能压测 harness（黑盒，真起被测
+  进程）。被测进程是 `flow-perf` 二进制的自举服务模式（`FLOW_PERF_SERVE=1` →
+  `serve_journal_product`，与 flow-journal-server 同一装配）。场景：run 执行
+  吞吐（chain/fanout）、RPC 读路径延迟、订阅推送延迟、崩溃恢复耗时。报告为
+  最近秩分位数（p50/p90/p95/p99）文本 + 可选 JSON。入口：
+  `cargo run -p backend-perf -- --help`。
+- **前端（`web/`）**：`npm test`（vitest 单测：状态机、labels、journal-log、
+  SchemaField 等）+ `npm run test:e2e`（Playwright：global-setup 自行构建并
+  拉起隔离的 flow-journal-server，跑编辑器/run/触发器/设置页/journal 页）。
 
 ## 14. 未做
 
-- delay 剩余时间恢复（当前崩溃/接管后整段重放）；
+- delay 剩余时间恢复（当前崩溃/恢复后整段重放）；
 - 多 end 被跳过时与真 null 输出的显式区分；
 - `run.start` 客户端幂等键（当前双击 = 两个 run，服务端 uuid 生成）；
-- 中心指派模式（中心指派模式未实施（见 DESIGN §14）；对等模式已实现（设计见 `flow-pg` 各模块头注释），
-  未做多节点压测）；
 - 跨进程 SIGSTOP 场景下的真实副作用计数验收（副作用准入已用确定性前缀测试钉住）；
-- 不指定 run_id 的全局订阅仍有后端差异：SQLite 只推本进程事件、Postgres 推
-  全集群增量；指定 run_id 的回放 + 追流 + 终态结束语义两后端已统一
-  （flow-backend 的 run_tail 状态机，见 §3.4）。
+- ~~多节点对等执行~~：v1 Postgres 后端（租约/inbox/接管）已整体删除；
+  远程执行走 `flow-agent`，多后端能力不再提供（见本文头部状态说明）。
 
-### v1/v2 已知语义差异（切换日的行为变更面，parity 安全网见 journal_parity.rs）
+### v1/v2 已知语义差异（切换日的行为变更面）
 
 - **retry 范围**：v1 对 retryable 的 http/harness/email 失败（5xx/超时/429）自动
   重试（§6.5）；v2 的重试只覆盖纯计算节点（script/condition），外部操作
@@ -1197,6 +1095,6 @@ volume 上。Docker 只在容器**自己退出**时（`--rm`）回收匿名 volu
 - v2 的 run.start 已要求稳定 `request_id`（写命令幂等键），v1 的
   `run.start` 客户端幂等键仍未做（见上）。
 
-v1（SQLite 权威）→ v2（journal 权威）的切换方案（历史数据舍弃、不迁移；
-journal 臂已接入全量 RPC，剩默认切换与 v1 删除）见
+v1（SQLite 权威）→ v2（journal 权威）的切换已完成（2026-10-10 起唯一后端；
+历史数据舍弃、不迁移），全程记录见
 [SQLITE_V1_TO_V2_MIGRATION.md](SQLITE_V1_TO_V2_MIGRATION.md)。

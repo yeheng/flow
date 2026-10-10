@@ -100,7 +100,7 @@ export class RpcClient {
       this.service === "flow" &&
       enriched["event_format"] === undefined
     ) {
-      // 主工作台订阅：v1 Envelope 事件形状（服务端物化值），monitor 零适配
+      // 主工作台订阅：journal v2 事件原形（服务端唯一支持格式）
       enriched["event_format"] = "v2";
     }
     return this.transport.subscribe(method, enriched, onEvent);

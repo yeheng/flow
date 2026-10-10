@@ -50,8 +50,9 @@ e2e_test!(schedule_crud_and_next_fire_at, |ctx: &mut Ctx| Box::pin(
         let schedule_id = created["id"].as_str().unwrap().to_string();
         assert_eq!(created["workflow_id"], json!(workflow_id));
         assert_eq!(created["cron_expr"], json!("*/2 * * * *"));
-        assert_eq!(created["input"], json!({ "job": "sync" }));
         assert_eq!(created["enabled"], json!(true));
+        // create 回执不回显 input（命令回执有界；round-trip 由 list 断言）
+        assert!(created.get("input").is_none() || created["input"].is_null());
 
         // next_fire_at 由服务端算好（RFC3339，本地时区），前端不解析 cron
         let next_fire_at = created["next_fire_at"]
@@ -89,11 +90,7 @@ e2e_test!(schedule_crud_and_next_fire_at, |ctx: &mut Ctx| Box::pin(
             .unwrap()
             .clone();
         assert_eq!(schedule["cron_expr"], json!("0 * * * *"));
-        assert_eq!(
-            schedule["event"]["payload"]["input"]["value"],
-            json!({ "job": "sync" }),
-            "缺省字段不动"
-        );
+        assert_eq!(schedule["input"], json!({ "job": "sync" }), "缺省字段不动");
         assert_eq!(schedule["enabled"], json!(true));
 
         // update 的 input 双 Option：显式 null = 清空
@@ -112,7 +109,7 @@ e2e_test!(schedule_crud_and_next_fire_at, |ctx: &mut Ctx| Box::pin(
             .unwrap()
             .clone();
         assert!(
-            schedule["event"]["payload"]["input"]["value"].is_null(),
+            schedule["input"].is_null(),
             "显式 null 清空 input：{schedule}"
         );
 

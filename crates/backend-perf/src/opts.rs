@@ -120,18 +120,10 @@ impl Opts {
         opts
     }
 
-    /// 透传给被测进程的环境变量。FLOW_MAX_RUNS 是 Journal executor 的容量许可
-    /// （同时驱动的 run 上限）：必须 ≥ 同时在飞的 run 数，否则许可就是个人造瓶颈。
-    /// crash_recovery 里停驻在 human_task 的 run 不释放许可，所以按 recovery_runs
-    /// 放大再留余量。
+    /// 透传给被测进程的环境变量。FLOW_PERF_SERVE=1 让 flow-perf 以
+    /// serve_journal_product 自举为被测服务（与 flow-journal-server 同一装配）。
     pub fn server_env(&self) -> Vec<(String, String)> {
-        vec![
-            ("FLOW_PERF_SERVE".to_string(), "1".to_string()),
-            (
-                "FLOW_MAX_RUNS".to_string(),
-                (self.concurrency.max(self.recovery_runs) + 8).to_string(),
-            ),
-        ]
+        vec![("FLOW_PERF_SERVE".to_string(), "1".to_string())]
     }
 }
 

@@ -37,7 +37,7 @@ flow-store = { path = "../flow-store" }
 flow-config = { path = "../flow-config" }
 
 [dev-dependencies]
-flow-test-support = { path = "../flow-test-support", default-features = false }
+flow-test-support = { path = "../flow-test-support" }
 chrono = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

@@ -1,6 +1,6 @@
 # JSONL 一期开发入口
 
-此路径用于开发与独立部署验证；一期非断电验收已通过，真实断电按用户要求排除。不要将旧 SQLite 数据目录直接交给新入口。v2 已是缺省后端（journal 唯一权威；v1 sqlite 后端已删除）：`flow-server` 直接以 v2 服务全部 v1 RPC 面（映射层 `flow-backend/src/journal_arm.rs`，切换记录见 [SQLITE_V1_TO_V2_MIGRATION.md](SQLITE_V1_TO_V2_MIGRATION.md)）。
+此路径用于开发与独立部署验证；一期非断电验收已通过，真实断电按用户要求排除。不要将旧 SQLite 数据目录直接交给新入口。v2 是唯一后端（journal 唯一权威；v1 的 sqlite/postgres 后端、`flow-server` 与 `journal_arm` 映射层均已删除），产品入口为 `flow-journal-server`（切换记录见 [SQLITE_V1_TO_V2_MIGRATION.md](SQLITE_V1_TO_V2_MIGRATION.md)）。
 
 ## 二期 IPC 执行模式（本地子进程）
 

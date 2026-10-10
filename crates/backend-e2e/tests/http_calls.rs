@@ -112,7 +112,10 @@ e2e_test!(http_call_4xx_is_fatal, |ctx: &mut Ctx| Box::pin(
             .iter()
             .find(|e| e["event"]["kind"] == json!("node_failed"))
             .unwrap();
-        assert_eq!(failed["retryable"], json!(false));
+        // v2 没有显式 retryable：不安排重试 = payload 不带 retry_wake_at
+        // （v2 只对纯计算节点自动重试，外部操作失败一律进等待/裁决语义）
+        assert!(failed["event"]["payload"]["retry_wake_at"].is_null());
+        assert!(failed["event"]["payload"]["error"].is_string());
     }
 ));
 
@@ -139,13 +142,27 @@ e2e_test!(
         let run = wait_run_status(&client, &run_id, "cancelled", TIMEOUT).await;
         assert_eq!(run["run"]["status"], json!("cancelled"));
 
-        // 取消是用户主动选择：不判定外部副作用是否发生（§6.6）
-        let events: Value = call_json(&client, "run.events.view", json!({"run_id": run_id})).await;
-        let events = events["events"].as_array().unwrap();
-        assert_eq!(
-            events.last().unwrap()["event"]["kind"],
-            json!("run_cancelled")
-        );
+        // 取消是用户主动选择：不判定外部副作用是否发生（§6.6）。
+        // run_cancelled 必须落盘，但不要求是末事件——取消后仍在飞的 dispatch
+        // 可能补写滞留事实（如 wait_registered）；事件页以投影 LSN 为上界，
+        // 轮询收敛。
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        loop {
+            let events: Value =
+                call_json(&client, "run.events.view", json!({"run_id": run_id})).await;
+            let events = events["events"].as_array().unwrap().clone();
+            if events
+                .iter()
+                .any(|e| e["event"]["kind"] == json!("run_cancelled"))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "等待 run_cancelled 落盘超时：{events:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     })
 );
 

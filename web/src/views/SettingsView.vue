@@ -28,7 +28,7 @@ const saving = ref(false);
 const loadError = ref<string | null>(null);
 const configPath = ref<string | null>(null);
 const envOverrides = ref<string[]>([]);
-/** 可编辑副本（深拷贝；database_url 保持 "<set>" 哨兵语义） */
+/** 可编辑副本（深拷贝） */
 const copy = ref<FlowConfig | null>(null);
 const original = ref<FlowConfig | null>(null);
 
@@ -165,7 +165,7 @@ function isOverridden(sect: string): boolean {
   // （分区里有任一覆盖就给整区加角标），精确值以 env 为准的语义不变。
   const sectEnv: Record<string, string[]> = {
     server: ["FLOW_SCHEDULER", "FLOW_JOURNAL_TRIGGER_TICK_SECS"],
-    storage: ["FLOW_BACKEND", "FLOW_DATA_DIR", "FLOW_DATABASE_URL"],
+    storage: ["FLOW_BACKEND", "FLOW_DATA_DIR"],
     execution: [
       "FLOW_EXECUTION_MODE",
       "FLOW_EXECUTOR_BIN",
@@ -186,19 +186,6 @@ function isOverridden(sect: string): boolean {
       "FLOW_AGENT_SLOTS",
     ],
     journal: ["FLOW_JOURNAL_ADDR", "FLOW_JOURNAL_HTTP_ADDR", "FLOW_JOURNAL_DATA_DIR"],
-    pg: [
-      "FLOW_ROLE",
-      "FLOW_LEASE_TTL_MS",
-      "FLOW_SCAN_INTERVAL_MS",
-      "FLOW_INBOX_POLL_MS",
-      "FLOW_MAX_RUNS",
-      "FLOW_SIGNAL_WAIT_MS",
-      "FLOW_SIGNAL_POLL_MS",
-      "FLOW_SUBSCRIBE_POLL_MS",
-      "FLOW_STATEMENT_TIMEOUT_MS",
-      "FLOW_LOCK_TIMEOUT_MS",
-      "FLOW_IDLE_TX_TIMEOUT_MS",
-    ],
   };
   return (sectEnv[sect] ?? []).some((name) => envSet.value.has(name));
 }

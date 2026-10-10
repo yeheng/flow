@@ -19,8 +19,8 @@ pub enum RunStatus {
 
 impl RunStatus {
     /// **变体的唯一清单。** 数组顺序 = `as_str` 逐项对拍的顺序；
-    /// 其余谓词（`is_valid_str` / `is_terminal_str` / `is_active_str`）与
-    /// Postgres 的 `CHECK` 约束都由它派生，改这里一处即全链路生效。
+    /// 其余谓词（`is_valid_str` / `is_terminal_str`）由它派生，
+    /// 改这里一处即全链路生效。
     pub const ALL: [RunStatus; 5] = [
         RunStatus::Running,
         RunStatus::AwaitingResume,
@@ -50,40 +50,13 @@ impl RunStatus {
             .any(|s| s.is_terminal() && s.as_str() == status)
     }
 
-    /// 仍在执行、接受输入与续租的状态（runs 行可写权的准入判定用）。
-    pub fn is_active_str(status: &str) -> bool {
-        Self::ALL
-            .iter()
-            .any(|s| s.is_active() && s.as_str() == status)
-    }
-
-    /// 该状态是否已终结（不可再接受信号 / 不再续租）。
+    /// 该状态是否已终结（不可再接受信号）。
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
             RunStatus::Succeeded | RunStatus::Failed | RunStatus::Cancelled
         )
     }
-
-    /// 该状态是否仍在执行（接受输入、续租、参与未完成扫描）。
-    pub fn is_active(self) -> bool {
-        matches!(self, RunStatus::Running | RunStatus::AwaitingResume)
-    }
-}
-
-/// Postgres 后端永不产生的状态（`run.start` 单事务原子创建，无两段式中间态）。
-/// 供 `flow-pg` 生成 `CHECK` 列表时排除，见 [`RunStatus::sql_in_list_excluding`]。
-
-/// 仍在执行、接受输入与续租的状态（runs 行可写权的准入判定用）。
-///
-/// 由 [`RunStatus::ALL`] 派生，不是手写列表。既是成员判定（`is_active_str`）
-/// 也是绑定到 SQL `= ANY($n)` 的数组——两处用法共用这一份，加变体自动跟随。
-pub fn active_statuses() -> Vec<&'static str> {
-    RunStatus::ALL
-        .iter()
-        .filter(|s| s.is_active())
-        .map(|s| s.as_str())
-        .collect()
 }
 
 /// runs.source 的合法取值（run 触发来源词汇表，单一来源）。

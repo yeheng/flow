@@ -205,12 +205,12 @@ async fn explicit_draft_is_rejected_and_historical_published_version_still_runs(
         .call("run.start", json!({"workflow_id":f.workflow, "version":1}))
         .await;
     assert_eq!(rejected["error"]["code"], -32602);
-    assert!(f
-        .arm
-        .list_runs(None, None, None, None, 100)
-        .await
-        .unwrap()
-        .is_empty());
+    let listed = f.call("run.list", json!({})).await;
+    assert_eq!(
+        listed["result"]["runs"].as_array().map(Vec::len),
+        Some(0),
+        "被拒的 run.start 不得产生 run：{listed}"
+    );
     f.backend
         .workflow_publish(&f.workflow, 1, None)
         .await
@@ -474,7 +474,8 @@ async fn schedule_crud_and_next_fire_at() {
     let id = schedule["id"].as_str().unwrap().to_string();
     assert_eq!(schedule["workflow_id"], f.workflow, "{ok}");
     assert_eq!(schedule["cron_expr"], "*/5 * * * *");
-    assert_eq!(schedule["input"], json!({"k": 1}));
+    // create 回执不回显 input（回执有界；list 断言 round-trip）
+    assert!(schedule["input"].is_null());
     assert_eq!(schedule["enabled"], true);
     let next_fire_at = schedule["next_fire_at"].as_str().expect("next_fire_at");
     let next = chrono::DateTime::parse_from_rfc3339(next_fire_at).unwrap();
@@ -815,8 +816,8 @@ async fn template_crud_roundtrip_and_fragment_is_normalized() {
     let template = &created["result"];
     assert!(!template["id"].as_str().unwrap().is_empty());
     assert_eq!(template["name"], "HTTP+解析");
-    assert_eq!(template["nodes"].as_array().unwrap().len(), 2);
-    assert_eq!(template["edges"].as_array().unwrap().len(), 1);
+    // create 回执不回片段载荷（回执有界）；载荷 round-trip 由 template.get 钉住
+    assert!(template["nodes"].is_null() && template["edges"].is_null());
 
     // list 只回信封不回载荷
     let list = f.call("template.list", json!({})).await;
@@ -911,7 +912,7 @@ async fn template_validation_rejects_bad_fragments() {
 // ---- 统一配置 RPC ----
 
 #[tokio::test]
-async fn config_get_update_roundtrip_writes_file_and_redacts_database_url() {
+async fn config_get_update_roundtrip_writes_file() {
     let root = std::env::temp_dir().join(format!("flow-config-rpc-{}", uuid::Uuid::now_v7()));
     std::fs::create_dir_all(&root).unwrap();
     let config_path = root.join("flow.toml");
@@ -923,7 +924,7 @@ async fn config_get_update_roundtrip_writes_file_and_redacts_database_url() {
         config: Some(flow_rpc::ConfigState {
             config: std::sync::RwLock::new(flow_config::Config::default()),
             path: Some(config_path.clone()),
-            env_overrides: vec!["FLOW_ADDR".to_string()],
+            env_overrides: vec!["FLOW_DATA_DIR".to_string()],
         }),
         secrets: None,
     });
@@ -942,45 +943,42 @@ async fn config_get_update_roundtrip_writes_file_and_redacts_database_url() {
     );
     assert_eq!(resp["result"]["env_overrides"].as_array().unwrap().len(), 1);
 
-    // update：改 scheduler tick + database_url 脱敏
+    // update：改 scheduler tick + data_dir，文件真的写进去
     let resp = f
         .call(
             "config.update",
             json!({"patch": {"server": {"scheduler_enabled": false, "journal_trigger_tick_secs": 30},
-                   "storage": {"backend": "postgres", "data_dir": "data",
-                               "database_url": "postgres://u:p@db/x"}}}),
+                   "storage": {"backend": "journal", "data_dir": "data"}}}),
         )
         .await;
     assert_eq!(
         resp["result"]["config"]["server"]["journal_trigger_tick_secs"],
         30
     );
-    assert_eq!(
-        resp["result"]["config"]["storage"]["database_url"], "<set>",
-        "连接串必须脱敏"
-    );
-
-    // 文件真的写进去了（持久值，非脱敏形状）
     let text = std::fs::read_to_string(&config_path).unwrap();
-    assert!(text.contains("postgres://u:p@db/x"));
     assert!(text.contains("journal_trigger_tick_secs = 30"));
 
-    // "<set>" 回传表示保持原值：再改一次别的字段，database_url 不丢
+    // 未给的分区保持原值：再改一次别的字段，前值不丢
     let resp = f
         .call(
             "config.update",
-            json!({"patch": {"storage": {"backend": "postgres", "data_dir": "data2",
-                                "database_url": "<set>"}}}),
+            json!({"patch": {"storage": {"backend": "journal", "data_dir": "data2"}}}),
         )
         .await;
-    // database_url 回 "<set>" 说明仍非空
-    assert_eq!(resp["result"]["config"]["storage"]["database_url"], "<set>");
     assert_eq!(resp["result"]["config"]["storage"]["data_dir"], "data2");
-    let text = std::fs::read_to_string(&config_path).unwrap();
-    assert!(
-        text.contains("postgres://u:p@db/x"),
-        "原连接串应保留：{text}"
+    assert_eq!(
+        resp["result"]["config"]["server"]["journal_trigger_tick_secs"], 30,
+        "未给的分区保持原值"
     );
+
+    // v1 后端值在 update 侧同样显式拒绝
+    let stale = f
+        .call(
+            "config.update",
+            json!({"patch": {"storage": {"backend": "postgres", "data_dir": "data"}}}),
+        )
+        .await;
+    assert_eq!(stale["error"]["code"], -32602);
 
     // 非法 patch 被拒且不落盘
     let bad = f

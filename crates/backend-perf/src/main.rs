@@ -64,8 +64,7 @@ async fn perf_main() {
     for &scenario in &opts.scenarios {
         let started = Instant::now();
         println!(
-            "▶ backend={} · {} 开始（{}）",
-            "journal",
+            "▶ backend=journal · {} 开始（{}）",
             scenario.name(),
             chrono::Local::now().format("%H:%M:%S")
         );

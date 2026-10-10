@@ -1,5 +1,5 @@
 //! v2 产品面的 RPC/HTTP 客户端助手：token 注入、写命令幂等键与回执解包、
-//! COMMITTED_NOT_VISIBLE(-32020) 恢复、订阅 envelope 格式、webhook
+//! COMMITTED_NOT_VISIBLE(-32020) 恢复、订阅 v2 事件格式、webhook
 //! `POST /hooks/<key>`（Bearer + Idempotency-Key）。
 //!
 //! 全部走真实 wire（进程外 flow-journal-server），断言的是 v2 协议与物化
@@ -7,7 +7,7 @@
 //!
 //! [`Conn`] 是 WsClient + 部署 token 的薄包装：`call` 自动补 `_token`；写命令
 //! （`flow_rpc::journal_v2::is_write_method` 集合）自动带 `request_id` 并把
-//! 回执 `{committed, result, ...}` 解包为 `result`（v1 门面形状，用例零感知）。
+//! 回执 `{committed, result, ...}` 解包为 `result`（用例零感知）。
 
 use std::time::{Duration, Instant};
 
@@ -272,7 +272,7 @@ pub async fn get_run(conn: &Conn, run_id: &str) -> Value {
     call_json(conn, "run.get.view", json!({ "run_id": run_id })).await
 }
 
-/// 轮询 run.get.full 直到状态符合预期（超时即 panic 带最后观测值）。
+/// 轮询 run.get.view 直到状态符合预期（超时即 panic 带最后观测值）。
 pub async fn wait_run_status(
     conn: &Conn,
     run_id: &str,
@@ -311,7 +311,7 @@ pub async fn wait_run_terminal(conn: &Conn, run_id: &str, timeout: Duration) -> 
     }
 }
 
-/// 订阅 run.event（v1 Envelope 形状：event_format=envelope + token）。
+/// 订阅 run.event（journal v2 事件原形 + token）。
 pub async fn subscribe(conn: &Conn, run_id: &str) -> jsonrpsee::core::client::Subscription<Value> {
     conn.ws
         .subscribe::<Value, _>(

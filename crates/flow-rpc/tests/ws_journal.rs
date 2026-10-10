@@ -176,8 +176,11 @@ async fn journal_backend_serves_full_rpc_surface() {
     let events: Value = call(client, "run.events", json!({"run_id": run_id})).await;
     let list = events["events"].as_array().unwrap();
     assert!(!list.is_empty());
-    assert_eq!(list[0]["type"], json!("run_started"));
-    assert_eq!(list.last().unwrap()["type"], json!("run_completed"));
+    assert_eq!(list[0]["event"]["kind"], json!("run_started"));
+    assert_eq!(
+        list.last().unwrap()["event"]["kind"],
+        json!("run_completed")
+    );
 
     let stats: Value = call(client, "run.stats", json!({})).await;
     assert_eq!(stats["total"], json!(1));

@@ -203,10 +203,9 @@ export interface ServerConfig {
 }
 
 export interface StorageConfig {
-  backend: "journal" | "postgres";
+  /** journal 是唯一后端；v1 的 sqlite/postgres 已删除 */
+  backend: "journal";
   data_dir: string;
-  /** config.get 里已设置为 "<set>"（脱敏）；update 传 "<set>" 表示保持原值 */
-  database_url: string | null;
 }
 
 export interface RemoteExecutionConfig {
@@ -242,28 +241,12 @@ export interface JournalConfig {
   data_dir: string | null;
 }
 
-export interface PgTuning {
-  role: string;
-  lease_ttl_ms: number;
-  scan_interval_ms: number;
-  inbox_poll_ms: number;
-  max_runs: number;
-  signal_wait_ms: number;
-  signal_poll_ms: number;
-  subscribe_poll_ms: number;
-  statement_timeout_ms: number;
-  lock_timeout_ms: number;
-  idle_tx_timeout_ms: number;
-  max_connections: number;
-}
-
 export interface FlowConfig {
   server: ServerConfig;
   storage: StorageConfig;
   execution: ExecutionConfig;
   agent: AgentConfig;
   journal: JournalConfig;
-  pg: PgTuning;
 }
 
 /** config.get / config.update 的响应 */

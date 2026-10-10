@@ -1,9 +1,9 @@
 //! 被测 `flow-journal-server` 进程管理 + 用例上下文。
 //!
 //! - journal 是唯一后端：每用例独占临时目录即 journal 根（全新数据集，
-//!  历史不迁移）；v2 部署 token 每用例随机生成；
+//!   历史不迁移）；v2 部署 token 每用例随机生成；
 //! - `Ctx::restart` 换新端口重新拉起同一份 journal 目录——崩溃恢复用例的
-//!  「重启」。
+//!   「重启」。
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

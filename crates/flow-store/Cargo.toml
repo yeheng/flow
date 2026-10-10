@@ -11,4 +11,4 @@ sqlx = { workspace = true }
 
 # tests/ 只用：共用测试基建（TempDir / 端口等待）
 [dev-dependencies]
-flow-test-support = { path = "../flow-test-support", default-features = false }
+flow-test-support = { path = "../flow-test-support" }

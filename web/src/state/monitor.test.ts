@@ -1,11 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { RunEvent, Timeline } from "../types";
+import type { Timeline } from "../types";
 
 // monitor 的 attach 竞态语义：局部构建 + 令牌比对 + 原子换入。
 // mock api 层，验证「被取代的 attach 不得写回 monitor、不得泄漏订阅」。
 vi.mock("../api/flow", () => ({
   subscribeRun: vi.fn(),
   runTimeline: vi.fn(),
+  runObservations: vi.fn(),
   startRun: vi.fn(),
   runCancel: vi.fn(),
   runSignal: vi.fn(),
@@ -18,7 +19,6 @@ function timeline(runId: string): Timeline {
   return {
     run_id: runId,
     status: "running",
-    phase: "running",
     workflow_id: "wf1",
     workflow_version: 1,
     started_at: null,
@@ -45,6 +45,7 @@ beforeEach(() => {
     unsubs[runId] = vi.fn(async () => {});
     return unsubs[runId] as unknown as () => Promise<void>;
   });
+  vi.mocked(api.runObservations).mockResolvedValue({ records: [], loss: {} });
   monitor.runId = null;
   monitor.workflowId = null;
   monitor.nodes = [];
@@ -82,20 +83,25 @@ describe("attach 原子换入", () => {
     expect(unsubs["run1"]).toHaveBeenCalled();
   });
 
-  it("订阅建立与 timeline 对齐之间到达的事件按 seq 补放", async () => {
-    let handler: ((e: RunEvent) => void) | null = null;
+  it("订阅建立与 timeline 对齐之间到达的事件置脏，随后刷新拉最新快照收敛", async () => {
+    let handler: ((e: unknown) => void) | null = null;
     vi.mocked(api.subscribeRun).mockImplementation(async (_runId: string, onEvent) => {
-      handler = onEvent;
+      handler = onEvent as (e: unknown) => void;
       return async () => {};
     });
+    let pulls = 0;
     vi.mocked(api.runTimeline).mockImplementation(async (runId: string) => {
-      // 对齐完成前推入两条缓冲事件
-      handler?.({ seq: 1, ts: "", run_id: runId, type: "run_started" });
-      handler?.({ seq: 2, ts: "", run_id: runId, type: "run_completed", output: { ok: 1 } });
-      return timeline(runId);
+      pulls += 1;
+      // 对齐完成前推入两条订阅事件：订阅流只负责置脏，投影一律来自 timeline 快照
+      handler?.({ event: { run_id: runId, kind: "RunStarted", run_seq: 1 } });
+      handler?.({ event: { run_id: runId, kind: "RunCompleted", run_seq: 2 } });
+      if (pulls === 1) return timeline(runId);
+      return { ...timeline(runId), status: "succeeded", output: { ok: 1 }, last_seq: 2 };
     });
 
     expect(await attachRun("run1")).toBe(true);
+    // attach 内的首次 refresh 已按脏标记拉到最新快照：终态不丢
+    expect(pulls).toBeGreaterThanOrEqual(2);
     expect(monitor.lastSeq).toBe(2);
     expect(monitor.status).toBe("succeeded");
     expect(monitor.output).toEqual({ ok: 1 });

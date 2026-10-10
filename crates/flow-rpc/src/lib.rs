@@ -2,9 +2,9 @@
 //!
 //! v1 RPC 面（`flow-server` 的无认证契约，35 个方法直连 `AnyBackend`）已随
 //! flow-server 退役。本 crate 现在只有一个产品面：
-//! - [`journal_v2`]：journal v2 协议（token 认证、写命令幂等键、回执语义）
-//!   + v1 物化数据形状（`flow_backend::journal_arm` 折影）——浏览器前端、
-//!   桌面内嵌服务、flow-cli 全部走这一份方法集；
+//! - [`journal_v2`]：journal v2 协议（token 认证、写命令幂等键、回执语义、
+//!   `journal_views` 物化产品视图）——浏览器前端、桌面内嵌服务、flow-cli
+//!   全部走这一份方法集；
 //! - [`journal_triggers`]：cron 扫描与 `POST /hooks/<key>` HTTP 入口；
 //! - [`journal_download`]：有界值下载 HTTP。
 //!
@@ -89,8 +89,6 @@ impl AppState {
 }
 
 /// config.get / config.update 的公共响应体。
-/// `config.storage.database_url` 含凭据：一律脱敏为 `"<set>"` / null；
-/// update 侧收到 `"<set>"` 表示保持原值不变。
 pub(crate) fn config_view(state: &AppState) -> Value {
     let (config, path, env_overrides) = match &state.config {
         Some(cs) => (
@@ -100,17 +98,8 @@ pub(crate) fn config_view(state: &AppState) -> Value {
         ),
         None => (None, None, Vec::new()),
     };
-    let mut config = config.unwrap_or_default();
-    if config
-        .storage
-        .database_url
-        .as_deref()
-        .is_some_and(|v| !v.is_empty())
-    {
-        config.storage.database_url = Some("<set>".into());
-    }
     json!({
-        "config": config,
+        "config": config.unwrap_or_default(),
         "config_path": path,
         "env_overrides": env_overrides,
     })
@@ -125,7 +114,7 @@ pub fn toml_config_from_str(text: &str) -> Result<flow_config::Config, Box<dyn s
 /// 生产进程」）。
 ///
 /// 组成：下载/webhook HTTP（`[journal].http_addr`，Bearer token）+ WS RPC
-/// （`module_product`：v2 协议 + v1 物化数据形状 + 统一配置/密钥）+ 执行驱动
+/// （`module_product`：v2 协议 + journal_views 物化产品视图 + 统一配置/密钥）+ 执行驱动
 /// + cron 触发器（`[server].scheduler_enabled`）。
 ///
 /// 环境变量（覆盖配置文件）：`FLOW_JOURNAL_DATA_DIR` / `FLOW_JOURNAL_TOKEN`
@@ -387,55 +376,6 @@ pub(crate) fn validate_fragment(
 /// 是纯重构，响应必须逐字节不变。新增/修改节点类型时同步更新本快照。
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use chrono::Utc;
-
-    /// 订阅通知的展示脱敏：node_completed 的 output 脱敏，其余事件与字段原样。
-    /// 回归的是「只脱 timeline 不脱订阅 → 前端用事件原始值覆盖脱敏值」。
-    #[test]
-    fn subscription_notice_redacts_node_output_like_timeline() {
-        let envelope = Envelope {
-            seq: 7,
-            ts: Utc::now(),
-            run_id: "r".into(),
-            event: Event::NodeCompleted {
-                node_id: "n".into(),
-                attempt: 1,
-                output: serde_json::json!({
-                    "status": 200,
-                    "headers": {"set-cookie": "sid=secret-value", "content-type": "application/json"},
-                    "body": {"ok": true}
-                }),
-                duration_ms: 12,
-            },
-        };
-        let redacted = redact_display_envelope(envelope);
-        let Event::NodeCompleted { output, .. } = &redacted.event else {
-            panic!("事件类型不该被改写");
-        };
-        assert_eq!(output["headers"]["content-type"], json!("application/json"));
-        assert_eq!(output["headers"]["set-cookie"], json!("***"));
-        assert_eq!(output["body"]["ok"], json!(true));
-    }
-
-    /// run 级 output 是数据面（= run.get 的值），两个展示面都不动它。
-    #[test]
-    fn subscription_notice_keeps_run_level_output_verbatim() {
-        let envelope = Envelope {
-            seq: 9,
-            ts: Utc::now(),
-            run_id: "r".into(),
-            event: Event::RunCompleted {
-                output: serde_json::json!({"api_key": "sk-live"}),
-            },
-        };
-        let redacted = redact_display_envelope(envelope);
-        let Event::RunCompleted { output } = &redacted.event else {
-            panic!("事件类型不该被改写");
-        };
-        assert_eq!(output["api_key"], json!("sk-live"));
-    }
-
     #[test]
     fn node_types_snapshot_is_stable() {
         const SNAPSHOT: &str = r#"[{"category":"control","label":"开始","max_instances":1,"params_schema":{"properties":{},"type":"object"},"ports":[{"id":"out","label":"出"}],"type":"start"},{"category":"control","label":"结束","params_schema":{"properties":{},"type":"object"},"ports":[{"id":"in","label":"入"}],"type":"end"},{"category":"compute","label":"脚本","params_schema":{"properties":{"code":{"type":"string","x-help":"可用 input（run 输入）与 nodes（上游节点输出），用 return 返回结果","x-label":"JS 函数体","x-opaque":true,"x-widget":"code"},"timeout_ms":{"default":2000,"type":"integer","x-label":"脚本超时（毫秒）"}},"required":["code"],"type":"object"},"ports":[{"id":"in","label":"入"},{"id":"out","label":"出"}],"supports_retry":true,"type":"script"},{"category":"control","label":"条件分支","params_schema":{"properties":{"expr":{"type":"string","x-help":"表达式结果按真值判定（非空字符串、非 0 数为真），可用 input 与 nodes","x-label":"条件表达式","x-opaque":true,"x-widget":"code"},"timeout_ms":{"default":2000,"type":"integer","x-label":"求值超时（毫秒）"}},"required":["expr"],"type":"object"},"ports":[{"id":"in","label":"入"},{"id":"true","label":"真"},{"id":"false","label":"假"}],"type":"condition"},{"category":"control","label":"等待","params_schema":{"properties":{"ms":{"type":"integer","x-help":"数字，或 ${input.x} / ${nodes.n.y} 模板（展开结果须为整数）","x-label":"时长（毫秒）"}},"required":["ms"],"type":"object"},"ports":[{"id":"in","label":"入"},{"id":"out","label":"出"}],"type":"delay"},{"category":"integration","label":"HTTP 请求","params_schema":{"properties":{"body":{"x-label":"请求体","x-widget":"json"},"headers":{"default":{},"x-label":"请求头","x-widget":"key-value"},"method":{"default":"GET","enum":["GET","POST","PUT","PATCH","DELETE"],"type":"string","x-label":"方法"},"proxy":{"type":"string","x-help":"http(s)://[user:pass@]host:port，留空直连","x-label":"代理"},"timeout_ms":{"default":30000,"type":"integer","x-label":"HTTP 超时（毫秒）"},"url":{"type":"string","x-help":"支持 ${input.x} / ${nodes.n2.y} 模板（${} 内不能含 }）","x-label":"URL"}},"required":["url"],"type":"object"},"ports":[{"id":"in","label":"入"},{"id":"out","label":"出"}],"side_effect":true,"supports_retry":true,"type":"http_call"},{"category":"human","label":"人工节点","params_schema":{"properties":{"prompt":{"type":"string","x-label":"提示"}},"type":"object"},"ports":[{"id":"in","label":"入"},{"id":"out","label":"出"}],"type":"human_task"},{"category":"control","label":"子工作流","params_schema":{"properties":{"input_mapping":{"x-help":"JSON 对象，值支持 ${input.x} / ${nodes.n.y} 模板；展开结果整体作为子 run 输入。省略 = 沿用父 run 输入","x-label":"子 run 输入映射","x-widget":"json"},"workflow_id":{"type":"string","x-help":"调用其最新已发布版本作为子 run；子 run 输出透传为本节点输出；子 run 失败传导为本节点 fatal（DESIGN §6.8），重试策略只覆盖启动/等待类错误","x-label":"目标工作流","x-widget":"workflow-picker"}},"required":["workflow_id"],"type":"object"},"ports":[{"id":"in","label":"入"},{"id":"out","label":"出"}],"supports_retry":true,"type":"sub_workflow"},{"category":"ai","label":"Harness 代理","params_schema":{"properties":{"args":{"items":{"type":"string"},"type":"array","x-label":"额外参数","x-widget":"json"},"command":{"type":"string","x-help":"要执行的 harness CLI（如 kimi / claude / codex）；prompt 经 stdin 传入，stdout 作为输出","x-label":"命令"},"prompt":{"type":"string","x-label":"提示词","x-widget":"code"},"timeout_ms":{"default":300000,"type":"number","x-label":"超时 (ms)"},"workdir":{"type":"string","x-label":"工作目录"}},"required":["command","prompt"],"type":"object"},"ports":[{"id":"in","label":"入"},{"id":"out","label":"出"}],"side_effect":true,"supports_retry":true,"type":"harness"},{"category":"notify","label":"邮件","params_schema":{"properties":{"api_key":{"type":"string","x-help":"只存密钥名称（如 RESEND_KEY），真值来自 FLOW_SECRET_<名称> 环境变量；已配置的名称见 secrets.list","x-label":"API 密钥名称","x-secret":true},"body":{"type":"string","x-help":"纯文本（作为 text 字段发送），支持 ${input.x} / ${nodes.n.y} 模板","x-label":"正文","x-widget":"code"},"endpoint":{"default":"https://api.resend.com/emails","type":"string","x-help":"Resend 兼容接口：POST {from, to, subject, text}，Bearer 认证","x-label":"API 端点"},"from":{"type":"string","x-label":"发件人"},"subject":{"type":"string","x-help":"支持 ${input.x} / ${nodes.n.y} 模板","x-label":"主题"},"to":{"type":"string","x-label":"收件人"}},"required":["api_key","from","to","subject","body"],"type":"object"},"ports":[{"id":"in","label":"入"},{"id":"out","label":"出"}],"side_effect":true,"supports_retry":true,"type":"email"}]"#;

@@ -76,7 +76,7 @@ describe("V2 client protocol", () => {
     expect(await client.call("schedule.create", { request_id: "stable" })).toEqual(receipt.result);
     expect(transport.call.mock.calls[0]![1].request_id).toBe("stable");
     await client.subscribe("run.subscribe", { run_id: "r" }, () => {});
-    expect(transport.subscribe.mock.calls[0]![1].event_format).toBe("envelope");
+    expect(transport.subscribe.mock.calls[0]![1].event_format).toBe("v2");
     await client.subscribe(
       "run.subscribe",
       { run_id: "r", event_format: "v2", _token: "explicit" },

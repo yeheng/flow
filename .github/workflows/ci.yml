@@ -19,9 +19,8 @@ env:
 jobs:
   # ================= 多架构总览 =================
   # 公开仓库白用 arm64 标准 runner（ubuntu-24.04-arm，4 vCPU），所以 Rust 的
-  # 编译 / 测试 / PG e2e 全部用**原生双 runner** 铺开：x86_64 与 aarch64 各在
-  # 自己的架构上跑，docker 在各自 runner 上拉到的 postgres 镜像就是对应架构
-  # （linux/amd64 / linux/arm64），全程不靠 qemu 模拟（慢 5-10 倍、偶发挂）。
+  # 编译 / 测试全部用**原生双 runner** 铺开：x86_64 与 aarch64 各在
+  # 自己的架构上跑，全程不靠 qemu 模拟（慢 5-10 倍、偶发挂）。
   # 私有仓库也能用 arm64 标准 runner（计费、2 vCPU）；实在不想要 arm 时，
   # 删掉各矩阵里的 aarch64 项即可退回单架构，其余配置不用动。
   # runner 一律钉 ubuntu-24.04：ubuntu-latest 正在向 26.04 迁移（2026-10 起），
@@ -76,122 +75,9 @@ jobs:
         with:
           key: ${{ matrix.arch.target }}
       # --all-targets：lib / bins / tests / benches / examples 一起验。
-      # backend-e2e 的 PG 臂自己用 docker 起容器（默认 postgres:16-alpine），
-      # runner 自带 docker；本 job 在哪个架构上跑，那遍 PG e2e 就是对应架构的
-      # 原生 e2e——「多架构 PostgreSQL e2e」的主覆盖就在这里（arm64×16 与
-      # amd64×16）。flow-pg / flow-rpc 的 PG 用例此刻仍静默跳过（没有
-      # FLOW_TEST_DATABASE_URL），由下面的 postgres / e2e-postgres 两个矩阵补上。
+      # （v1 的 Postgres 后端与 flow-pg 测试臂已随后端删除，无 PG 依赖。）
       - name: test
         run: cargo test --workspace --all-targets --locked --target ${{ matrix.arch.target }}
-
-  # ---- Postgres 库：flow-pg 真连 PG ----
-  # 主测试 job 不设 FLOW_TEST_DATABASE_URL，这些用例会静默跳过、依旧全绿；
-  # 这里把 PG 臂真正跑起来（端口 54329 与仓库约定一致）。
-  # 矩阵两个维度：runner 架构 × PG 大版本（15/16/17 是依赖的两个 PG 特性的
-  # 共同下界：DROP DATABASE ... WITH (FORCE) 需 PG 13+，LISTEN/NOTIFY 全版本都有）。
-  # PG 不用 services: 而是本 job 自己 docker run，两个原因：
-  # 1. arm runner 上与 x64 行为完全一致，不依赖 service container 在各架构
-  #    runner 上的支持度；
-  # 2. 能显式 --platform 把架构钉死：amd64 runner 上跑 linux/amd64 的 PG，
-  #    arm64 runner 上跑 linux/arm64 的 PG——「多架构 PostgreSQL」是断言出来的，
-  #    不是顺带发生的。
-  postgres:
-    name: test (pg ${{ matrix.pg }}, ${{ matrix.arch.platform }})
-    runs-on: ${{ matrix.arch.runner }}
-    timeout-minutes: 40
-    strategy:
-      fail-fast: false
-      matrix:
-        arch:
-          - runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            platform: linux/amd64
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            platform: linux/arm64
-        pg: ["15", "16", "17"]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.arch.target }}
-      # 同一架构的三个大版本共用一份编译缓存：PG 版本不影响 Rust 产物
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.arch.target }}
-      - name: 起 Postgres 容器（钉平台 ${{ matrix.arch.platform }}）
-        run: |
-          set -euo pipefail
-          docker run -d --rm \
-            --name flow-test-pg \
-            --platform ${{ matrix.arch.platform }} \
-            -e POSTGRES_USER=flow \
-            -e POSTGRES_PASSWORD=flow \
-            -e POSTGRES_DB=flow \
-            -p 127.0.0.1:54329:5432 \
-            postgres:${{ matrix.pg }}-alpine
-          # PG 没就绪就开跑，这些用例不会失败而是静默跳过——那等于绿灯造假。
-          # 所以显式等到 pg_isready 通过，超时就红，并附容器日志。
-          for _ in $(seq 1 90); do
-            if docker exec flow-test-pg pg_isready -U flow -d flow; then
-              echo "Postgres ${{ matrix.pg }} (${{ matrix.arch.platform }}) 就绪"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "::error:: Postgres ${{ matrix.pg }} 90s 未就绪"
-          docker logs flow-test-pg || true
-          exit 1
-      - name: test (flow-pg)
-        env:
-          FLOW_TEST_DATABASE_URL: postgres://flow:flow@127.0.0.1:54329/flow
-        run: cargo test -p flow-pg --all-targets --locked --target ${{ matrix.arch.target }}
-      - name: 清理容器
-        if: always()
-        run: docker rm -f -v flow-test-pg || true
-
-  # PostgreSQL 库的容器和测试库清理契约保留，产品 E2E 由 Journal 矩阵负责。
-  pg-hygiene:
-    name: pg harness hygiene (${{ matrix.pg }})
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        pg: ["15", "17"]
-    env:
-      FLOW_E2E_PG_IMAGE: postgres:${{ matrix.pg }}-alpine
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: PostgreSQL harness cleanup
-        run: cargo test -p flow-pg --test docker_hygiene --locked
-
-  # ---- 断言 postgres 镜像本身是多架构 ----
-  # 原生矩阵只能证明「本 runner 架构上跑通了」；这个 job 直接查镜像 manifest，
-  # 钉住 postgres:{15,16,17}-alpine 同时提供 linux/amd64 与 linux/arm64——
-  # 换镜像、或上游某天砍掉一个架构时，这里先红。
-  pg-image:
-    name: postgres 镜像多架构 manifest
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - name: 校验 manifest 含 linux/amd64 + linux/arm64
-        run: |
-          set -uo pipefail
-          fail=0
-          for pg in 15 16 17; do
-            image="postgres:${pg}-alpine"
-            echo "== $image =="
-            out="$(docker buildx imagetools inspect "$image" 2>&1)" || {
-              echo "$out"; echo "::error:: 读不到 $image 的 manifest"; fail=1; continue; }
-            echo "$out"
-            # 默认输出里每个平台一行 "Platform:  linux/<arch>"
-            echo "$out" | grep -q 'linux/amd64' || { echo "::error::$image 缺 linux/amd64"; fail=1; }
-            echo "$out" | grep -q 'linux/arm64' || { echo "::error::$image 缺 linux/arm64"; fail=1; }
-          done
-          exit "$fail"
 
   # ---- 多架构构建：cross 交叉编译四个 Linux target ----
   # 为什么用 cross 而不是把 aarch64 也放到 arm runner 上原生编：单 runner 铺完

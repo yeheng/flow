@@ -10,10 +10,9 @@
 
 ## 0. 结论
 
-- 产品服务只使用 **Journal**（JSONL v2 唯一权威）。旧 `flow-server` 与
-  V1 RPC 注册层已删除；产品入口统一为 `flow-journal-server`。
-- PostgreSQL 保留为库与测试，不再提供旧 PG 产品服务。backend-e2e 为 Journal
-  单臂；`flow-pg` 继续保留数据库契约及容器清理测试。
+- 产品服务只使用 **Journal**（JSONL v2 唯一权威）。旧 `flow-server`、
+  V1 RPC 注册层、`journal_arm`/`run_tail` 适配层与整个 `flow-pg` crate
+  均已删除；产品入口统一为 `flow-journal-server`。
 - 历史数据不迁移：journal 只接受全新数据目录；v1 布局目录（有 flow.db）
   在 journal 模式下拒绝启动（防混用护栏）。
 
@@ -28,13 +27,14 @@
   `[storage].data_dir` / `FLOW_DATA_DIR`。初次创建的 Journal 根必须为空。
 - WS/HTTP 缺省为 9802/9803，强制 loopback。部署必须设置至少 32 字节的
   `FLOW_JOURNAL_TOKEN`；浏览器工作台在设置页可配置令牌。
-- `journal_arm` 保留物化读面；`flow-store` 的 SQLite 投影可重建，均仍被 V2
-  使用。`flow-engine` 内共享模型与执行能力、PG 库引用的引擎也保留。
+- 物化产品读面由 `flow-backend/src/journal_views.rs` 提供；`flow-store` 的
+  SQLite 投影可重建。`flow-engine` 保留共享模型与执行能力（v1 的
+  Driver/Engine/fold 事件面已删除）。
 
 ### 1.2 RPC 接入约定
 
 | 面 | V2 产品契约 |
-|---|---|
+| --- | --- |
 | workflow 写命令 | `request_id` 幂等与原生回执；相同定义复用版本号；已有 run 原子拒删 |
 | 原生读面 | `workflow.get/list`、`run.get/list`、事件/审计游标分页 |
 | 主工作台与普通 CLI 读面 | `.get.full` / `.list.full`、`run.events.full`、`run.timeline/stats`、`workflow.versions` |
@@ -84,7 +84,7 @@
 ## 3. 已知行为差异（journal 臂 vs v1，切换日变更面）
 
 | 面 | v1 | journal 臂 | 说明 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 事件时间戳 | 真实墙钟 | `ts` = Unix epoch | journal 无墙钟（权威时间是 LSN/run_seq）；前端时间列显示 1970/空 |
 | run ended_at / 节点耗时 | 真实值 | `null` / 0 | 同上；started_at（created_at）保留 |
 | 事件 seq | 严格连续 1..N | 严格递增、允许空洞 | v2 权威序号含不映射到 v1 面的事实（WaitRegistered 等）；前端以 seq 为水位，空洞无害 |
@@ -120,8 +120,8 @@ scripts/build-journal.sh
 ./dist/journal/run-server.sh
 ```
 
-`build-sqlite.sh` 转发到 Journal 打包入口；`build-pg.sh` 明确提示旧 PG 产品已退役。
-
+v1 的 `build-sqlite.sh` / `build-pg.sh` 打包脚本已删除，唯一入口是
+`build-journal.sh`。
 
 - v1 布局目录（有 `flow.db`、无 `journal/`）在 journal 模式下**拒绝启动**。
 - 想保全历史 v1 数据的用户：停写后用 `flow-journal-dev import-legacy` 做

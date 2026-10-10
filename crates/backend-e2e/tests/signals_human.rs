@@ -10,6 +10,7 @@ use backend_e2e::common::{
 };
 use backend_e2e::e2e_test;
 use serde_json::{json, Value};
+use std::time::Instant;
 
 e2e_test!(
     human_task_waits_then_signal_completes_run,
@@ -58,7 +59,10 @@ e2e_test!(
             .find(|e| e["event"]["kind"] == json!("signal_received"))
             .unwrap();
         assert_eq!(signal_event["event"]["node_id"], json!("h"));
-        assert_eq!(signal_event["payload"], payload);
+        assert_eq!(
+            signal_event["event"]["payload"]["payload"]["value"],
+            payload
+        );
     })
 );
 
@@ -97,7 +101,7 @@ e2e_test!(
     signal_error_codes_for_unknown_and_finished_runs,
     |ctx: &mut Ctx| Box::pin(async move {
         let client = ctx.client().await;
-        // run 不存在：journal_arm 映射 not-found（-32011）
+        // run 不存在：journal_views 映射 not-found（-32011）
         let err = call_err(
             &client,
             "run.signal",
@@ -133,12 +137,26 @@ e2e_test!(
 
         let run = wait_run_status(&client, &run_id, "cancelled", TIMEOUT).await;
         assert_eq!(run["live"], json!(false));
-        let events: Value = call_json(&client, "run.events.view", json!({"run_id": run_id})).await;
-        let events = events["events"].as_array().unwrap();
-        assert_eq!(
-            events.last().unwrap()["event"]["kind"],
-            json!("run_cancelled")
-        );
+        // run_cancelled 必须落盘；不要求它是末事件——取消提交后，在飞的
+        // dispatch 仍可能补写 wait_registered 之类滞留事件（驱动竞态窗口，
+        // 状态已定）。事件页以投影 LSN 为上界，状态面可能瞬时超前，轮询收敛。
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let events: Value =
+                call_json(&client, "run.events.view", json!({"run_id": run_id})).await;
+            let events = events["events"].as_array().unwrap().clone();
+            if events
+                .iter()
+                .any(|e| e["event"]["kind"] == json!("run_cancelled"))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "等待 run_cancelled 落盘超时：{events:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
 
         // 终态后 cancel：v2 语义 = 幂等空操作（committed 回执，无新事件）
         let again: Value = call_json(&client, "run.cancel", json!({"run_id": run_id})).await;
@@ -169,7 +187,7 @@ e2e_test!(cancel_aborts_inflight_delay, |ctx: &mut Ctx| Box::pin(
         assert_eq!(run["run"]["status"], json!("cancelled"));
 
         let timeline: Value = call_json(&client, "run.timeline", json!({"run_id": run_id})).await;
-        assert_eq!(timeline["phase"], json!("cancelled"));
+        assert_eq!(timeline["status"], json!("cancelled"));
     }
 ));
 

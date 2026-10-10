@@ -498,7 +498,7 @@ async fn events_and_timeline_render_a_finished_run() {
             .unwrap_or_else(|err| panic!("非 JSONL 行 {line}: {err}"));
     }
     let last: Value = serde_json::from_str(lines.last().unwrap()).unwrap();
-    assert_eq!(last["type"], json!("run_completed"));
+    assert_eq!(last["event"]["kind"], json!("run_completed"));
 
     // timeline：节点行覆盖全部节点
     let (code, stdout, stderr) = cli(&server, &["run", "timeline", &run_id]).await;

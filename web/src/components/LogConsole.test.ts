@@ -27,14 +27,12 @@ vi.mock("../state/editor", () => ({
 import LogConsole from "../components/LogConsole.vue";
 import { monitor } from "../state/monitor";
 import { mount } from "@vue/test-utils";
-import type { RunEvent } from "../types";
+import type { LogLine } from "../types";
 
-function logLine(seq: number, nodeId = "n1", message = `line ${seq}`): RunEvent {
+function logLine(seq: number, nodeId = "n1", message = `line ${seq}`): LogLine {
   return {
-    seq,
+    seq: String(seq),
     ts: "2026-01-01T00:00:00Z",
-    run_id: "r-probe",
-    type: "node_log",
     node_id: nodeId,
     attempt: 1,
     level: "info",
@@ -58,7 +56,7 @@ describe("LogConsole：刷屏时节流", () => {
     monitor.nodes = [];
     monitor.logs = [];
     monitor.logsByNode = {};
-    monitor.lastLogSeq = 0;
+    monitor.lastLogSeq = "0";
   });
 
   it("逐 tick 推送多行只渲染一次（帧合并）", async () => {
@@ -75,7 +73,7 @@ describe("LogConsole：刷屏时节流", () => {
 
     const N = 60;
     for (let i = 1; i <= N; i++) {
-      monitor.logs.push(logLine(i) as never);
+      monitor.logs.push(logLine(i));
       await nextTick();
     }
     // jsdom 的 rAF 在宏任务里：这一轮 push 全部落进同一帧
@@ -84,7 +82,7 @@ describe("LogConsole：刷屏时节流", () => {
   });
 
   it("首帧就展示已有日志（切 tab 不闪空态）", async () => {
-    monitor.logs.push(logLine(1) as never, logLine(2) as never);
+    monitor.logs.push(logLine(1), logLine(2));
     const wrapper = mount(LogConsole, { props: { "on-select-node": () => {} } });
     expect(wrapper.find(".log-empty").exists()).toBe(false);
     expect(wrapper.findAll(".log-row")).toHaveLength(2);
@@ -92,10 +90,7 @@ describe("LogConsole：刷屏时节流", () => {
   });
 
   it("级别过滤生效：默认不渲染 debug 行", async () => {
-    monitor.logs.push(
-      { ...logLine(1), level: "info" } as never,
-      { ...logLine(2), level: "debug" } as never,
-    );
+    monitor.logs.push({ ...logLine(1), level: "info" }, { ...logLine(2), level: "debug" });
     const wrapper = mount(LogConsole, { props: { "on-select-node": () => {} } });
     expect(wrapper.findAll(".log-row")).toHaveLength(1);
     wrapper.unmount();

@@ -249,9 +249,9 @@ onUnmounted(() => {
         <div v-if="showEvents" class="events-list">
           <p v-if="events === null" class="run-hint">加载中…</p>
           <template v-else>
-            <div v-for="e in events" :key="e.seq" class="events-item mono">
-              <span class="muted">#{{ e.seq }}</span> {{ e.type }}
-              <span v-if="e.node_id" class="muted">{{ e.node_id }}</span>
+            <div v-for="e in events" :key="`${e.lsn}:${e.event_index}`" class="events-item mono">
+              <span class="muted">#{{ e.event.run_seq }}</span> {{ e.event.kind }}
+              <span v-if="e.event.node_id" class="muted">{{ e.event.node_id }}</span>
             </div>
             <p v-if="events.length === 0" class="run-hint">无事件</p>
           </template>

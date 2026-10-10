@@ -301,11 +301,11 @@ OTel 的每个信号都挂在一个 `Resource` 上（描述产生遥测的实体
 
 | 属性 | 来源 |
 |---|---|
-| `service.name` | `flow-server`（bin 名） |
+| `service.name` | `flow-journal-server`（bin 名） |
 | `service.version` | 需新增（当前无版本概念） |
-| `service.instance.id` | `flow-pg` 的 `ExecutorState.instance_id`；单机后端需生成 |
+| `service.instance.id` | 需新增（单机后端没有 instance 概念，进程级 UUID 即可） |
 | `deployment.environment` | 需新增（当前无环境概念） |
-| `flow.backend` | `sqlite` / `postgres`（`FLOW_BACKEND`） |
+| `flow.backend` | 固定 `journal`（唯一后端；v1 的 sqlite/postgres 已删除） |
 
 单机后端没有 `instance_id` 概念，需在 `Engine` 构造时生成一个进程级 UUID。
 

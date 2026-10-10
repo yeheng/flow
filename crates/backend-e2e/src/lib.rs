@@ -8,8 +8,7 @@
 //!   壳并改名，避免与产品 bin 同名撞 `target/debug/flow-journal-server`），
 //!   让本 crate 的测试能用 `CARGO_BIN_EXE_flow-journal-server-e2e` 定位；
 //! - `tests/*.rs`：用例，用 [`e2e_test!]` 对 journal v2 产品面跑一遍
-//!   （v1 RPC 面（flow-server）已退役；Postgres 臂随其服务面一并移除，
-//!   flow-pg 保留为库，其自身测试在 crates/flow-pg）。
+//!   （v1 RPC 面（flow-server）与 Postgres 后端均已删除）。
 //!
 //! 运行：`cargo test -p backend-e2e`（无外部依赖；崩溃恢复用 SIGKILL 真杀）。
 

@@ -24,5 +24,5 @@ futures = { workspace = true }
 # tests/ 只用：共用测试基建（TempDir / 端口等待）。`pg` 特性拉着 sqlx/postgres +
 # docker CLI 那一坨——flow-engine 的测试一个 PG 都不用，关掉省一坨编译时间。
 [dev-dependencies]
-flow-test-support = { path = "../flow-test-support", default-features = false }
+flow-test-support = { path = "../flow-test-support" }
 uuid = { workspace = true }

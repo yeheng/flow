@@ -967,10 +967,6 @@ dependencies = [
 name = "flow-test-support"
 version = "0.1.0"
 dependencies = [
- "chrono",
- "libc",
- "sqlx",
- "tokio",
  "uuid",
 ]
 

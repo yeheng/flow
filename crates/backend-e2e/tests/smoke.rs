@@ -24,6 +24,6 @@ e2e_test!(harness_smoke, |ctx: &mut Ctx| Box::pin(async move {
 
     let timeline: serde_json::Value =
         call_json(&client, "run.timeline", json!({ "run_id": run_id })).await;
-    assert_eq!(timeline["phase"], json!("succeeded"));
+    assert_eq!(timeline["status"], json!("succeeded"));
     assert_eq!(timeline["nodes"][1]["state"], json!("completed"));
 }));

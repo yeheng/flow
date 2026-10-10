@@ -1,7 +1,7 @@
 //! Explicit single-user JSONL RPC endpoint — the one product surface. Every call
 //! authenticates, including pages. Product form (`module_product`) additionally
 //! carries the config/secrets assembly and the materialized product reads
-//! (`workflow.*.full` / `run.*.full` / triggers / templates), so the browser
+//! (`workflow.*.view` / `run.*.view` / triggers / templates), so the browser
 //! frontend, the embedded desktop service and flow-cli all speak this module.
 use flow_backend::journal::{JournalBackend, JournalError};
 use flow_journal::page::{Cursor, Filter};
@@ -48,7 +48,7 @@ fn failure(error: JournalError) -> ErrorObjectOwned {
         _ => ErrorObjectOwned::owned(-32603, "journal service unavailable", None::<()>),
     }
 }
-/// v1 公共面错误 → v2 错误码（与 failure() 的 journal 错误同语义分层）。
+/// 产品视图错误 → v2 错误码（与 failure() 的 journal 错误同语义分层）。
 fn view_failure(error: flow_backend::ViewError) -> ErrorObjectOwned {
     match error {
         flow_backend::ViewError::WorkflowNotFound(m) => {
@@ -260,8 +260,7 @@ pub fn module_product(
         "nodetypes.list",
     ] {
         module.register_async_method(method,move |params,ctx,_|async move {
-            // JSON-RPC 允许整体省略 params（到达的是 null）——归一为空对象，
-            // 与 v1 契约的「省略 = {}」同一语义。
+            // JSON-RPC 允许整体省略 params（到达的是 null）——归一为空对象。
             let mut p:Value=match params.parse::<Value>(){Ok(Value::Null)=>json!({}),Ok(v)=>v,Err(e)=>return Err(e)};
             let supplied=p.get("_token").and_then(Value::as_str).unwrap_or("");
             // Full-token comparison without early exit on the first differing byte.
@@ -319,7 +318,7 @@ pub fn module_product(
                     let page=tokio::task::spawn_blocking(move||flow_journal::page::page(&root,&identity,&run_id,filter,cursor,upper,limit)).await.map_err(invalid)?.map_err(|e|failure(e.into()))?;
                     return serde_json::to_value(page).map_err(invalid);
                 },
-                // ---- 产品面：V2 product views（journal_arm 物化）----
+                // ---- 产品面：V2 product views（journal_views 物化）----
                 "workflow.list.view"=>{
                     let workflows=flow_backend::journal_views::list_workflows(b).await.map_err(view_failure)?;
                     return Ok(json!({"workflows":workflows}));
@@ -328,8 +327,8 @@ pub fn module_product(
                     let version=flow_backend::journal_views::get_version(
                         b,text(&p,"workflow_id")?,optional_version(&p)?.map(|v|i64::try_from(v).map_err(invalid)).transpose()?,
                     ).await.map_err(view_failure)?;
-                    // v1 workflow.get 形状：version 之外还带 published_version
-                    // （编辑器用它渲染「已发布 vN」徽标），单独补上。
+                    // 产品形状：version 之外还带 published_version（编辑器
+                    // 用它渲染「已发布 vN」徽标），单独补上。
                     let published=flow_backend::journal_views::latest_published(b,text(&p,"workflow_id")?).await.map_err(view_failure)?;
                     let mut value=serde_json::to_value(version).map_err(invalid)?;
                     value["published_version"]=json!(published);
@@ -423,12 +422,6 @@ pub fn module_product(
                     let patch=p["patch"].clone();
                     let cs=product.config.as_ref().ok_or_else(||invalid("此实例未启用配置文件读写，无法修改配置"))?;
                     let base=cs.config.read().unwrap().clone();
-                    let mut patch=patch;
-                    if patch.get("storage").and_then(|s|s.get("database_url"))==Some(&json!("<set>")){
-                        if let Some(storage)=patch.get_mut("storage").and_then(|s|s.as_object_mut()){
-                            storage.insert("database_url".into(),json!(base.storage.database_url));
-                        }
-                    }
                     let merged=flow_config::Config::merge_patch(&base,&patch).map_err(|e|invalid(e.to_string()))?;
                     let write_path=cs.path.clone().unwrap_or_else(||std::path::PathBuf::from("flow.toml"));
                     merged.save(&write_path).map_err(|e|invalid(format!("配置写入失败：{e}")))?;
@@ -475,9 +468,8 @@ pub fn module_product(
         if supplied.len()!=ctx.token.len() || supplied.bytes().zip(ctx.token.bytes()).fold(0u8,|d,(a,b)|d|(a^b))!=0 {
             pending.reject(ErrorObjectOwned::owned(-32001,"unauthorized",None::<()>)).await;return;
         }
-        // event_format：v2 = journal 事件原形（/journal 工作区）；
-        // envelope = v1 Envelope 形状（物化 StoredValue；主工作台 monitor 用）
-        
+        // 事件只发 journal v2 原形（PositionedEvent）；/journal 工作区与
+        // 主工作台 monitor 都直接消费这一格式。
         if p["event_format"]!="v2" {pending.reject(invalid("event_format must be v2")).await;return;}
         let run_id=match text(&p,"run_id"){Ok(id)=>id.to_owned(),Err(e)=>{pending.reject(e).await;return;}};
         let from_seq=match decimal_param(&p,"from_seq"){Ok(n)=>n,Err(e)=>{pending.reject(e).await;return;}};

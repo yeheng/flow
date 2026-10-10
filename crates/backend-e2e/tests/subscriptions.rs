@@ -220,7 +220,11 @@ e2e_test!(
         for (index, event) in streamed.iter().enumerate() {
             assert!(
                 index == 0
-                    || streamed[index - 1]["seq"].as_u64().unwrap()
+                    || streamed[index - 1]["event"]["run_seq"]
+                        .as_str()
+                        .unwrap()
+                        .parse::<u64>()
+                        .unwrap()
                         < event["event"]["run_seq"]
                             .as_str()
                             .unwrap()
@@ -243,12 +247,10 @@ e2e_test!(
     })
 );
 
-// 订阅通知的展示脱敏：node_completed 的 output 与 timeline 同规则脱敏，
-// 而事件日志（run.events）里仍是原始值（数据面，下游节点要消费）。
-//
-// 回归的是「只脱 timeline 不脱订阅」：前端 applyEvent(node_completed) 会用
-// 事件里的原始值覆盖 timeline 的脱敏值，实时观看的 run 于是把敏感输出原样
-// 显示出来，而同一个 run 事后查看反而是脱敏的。
+// v2 订阅 = journal 事件原形（数据面，StoredValue 包裹、不脱敏）：前端
+// monitor 只把订阅当脏信号，投影一律来自 timeline（脱敏展示面）。此处钉住
+// 「订阅与事件页同源同值」；脱敏契约由 timeline 测试单独覆盖（run_execution
+// 的可观察性用例：node 输出脱敏、事件日志保持原值）。
 e2e_test!(
     subscription_redacts_node_output_like_timeline,
     |ctx: &mut Ctx| Box::pin(async move {
@@ -274,11 +276,14 @@ e2e_test!(
             .unwrap_or_else(|| panic!("订阅流里没有 n1 的 node_completed：{streamed:?}"));
 
         assert_eq!(
-            completed["output"]["token"],
-            json!("***"),
-            "订阅通知必须与 timeline 同规则脱敏：{completed:#}"
+            completed["event"]["payload"]["output"]["value"]["token"],
+            json!("sk-secret-value"),
+            "订阅流是数据面原形，与事件日志同源：{completed:#}"
         );
-        assert_eq!(completed["output"]["ok"], json!(1), "非敏感字段不动");
+        assert_eq!(
+            completed["event"]["payload"]["output"]["value"]["ok"],
+            json!(1)
+        );
 
         // 数据面不变：事件日志里仍是原始值（下游节点/fold 要消费它）
         let events: Value = call_json(&client, "run.events.view", json!({"run_id": run_id})).await;

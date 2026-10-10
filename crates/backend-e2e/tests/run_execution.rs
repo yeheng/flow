@@ -60,11 +60,8 @@ e2e_test!(
 
         // 单 end 单前驱：输出透传（§6.3）
         let timeline: Value = call_json(&client, "run.timeline", json!({"run_id": run_id})).await;
-        assert_eq!(
-            timeline["event"]["payload"]["output"]["value"],
-            json!({ "doubled": 42 })
-        );
-        assert_eq!(timeline["phase"], json!("succeeded"));
+        assert_eq!(timeline["output"], json!({ "doubled": 42 }));
+        assert_eq!(timeline["status"], json!("succeeded"));
     })
 );
 
@@ -368,7 +365,7 @@ e2e_test!(
         );
 
         let timeline: Value = call_json(&client, "run.timeline", json!({"run_id": run_id})).await;
-        assert_eq!(timeline["phase"], json!("failed"));
+        assert_eq!(timeline["status"], json!("failed"));
         assert!(timeline["fatal_error"].as_str().unwrap().contains("boom"));
         assert_eq!(timeline_node(&timeline, "boom")["state"], json!("failed"));
         assert_eq!(
@@ -393,9 +390,11 @@ e2e_test!(
             .iter()
             .find(|e| e["event"]["kind"] == json!("node_failed"))
             .unwrap_or_else(|| panic!("缺少 node_failed：{events}"));
-        assert_eq!(failed["retryable"], json!(false));
+        // v2 没有显式 retryable：无重试策略 = payload 不带 retry_wake_at
+        assert!(failed["event"]["payload"]["retry_wake_at"].is_null());
+        assert!(failed["event"]["payload"]["error"].as_str().is_some());
         let last = events["events"].as_array().unwrap().last().unwrap();
-        assert_eq!(last["type"], json!("run_failed"));
+        assert_eq!(last["event"]["kind"], json!("run_failed"));
     })
 );
 
@@ -558,7 +557,6 @@ e2e_test!(run_list_rejects_invalid_status_filter, |ctx: &mut Ctx| {
         assert_eq!(err.code(), -32602, "status 过滤词必须在状态词汇表内：{err}");
         // 词汇表内的值不被拒
         for status in [
-            "initializing",
             "running",
             "awaiting_resume",
             "succeeded",
@@ -665,27 +663,12 @@ e2e_test!(
         // 时间线：输入面快照（展开 + 脱敏）、节点输出展示脱敏
         let timeline: Value = call_json(&client, "run.timeline", json!({"run_id": run_id})).await;
         let node = timeline_node(&timeline, "n1");
-        assert_eq!(
-            node["event"]["payload"]["input"]["value"]["note"],
-            json!("n=7"),
-            "模板展开后的输入面"
-        );
-        assert_eq!(
-            node["event"]["payload"]["input"]["value"]["token"],
-            json!("***"),
-            "敏感键展示值脱敏"
-        );
-        assert_eq!(
-            node["event"]["payload"]["output"]["value"]["token"],
-            json!("***"),
-            "节点输出展示值脱敏"
-        );
+        assert_eq!(node["input"]["note"], json!("n=7"), "模板展开后的输入面");
+        assert_eq!(node["input"]["token"], json!("***"), "敏感键展示值脱敏");
+        assert_eq!(node["output"]["token"], json!("***"), "节点输出展示值脱敏");
         // run 级 output 是数据面：与 run.get / run_completed 逐字一致
         // （同名不同值 = timeline 在骗客户端）
-        assert_eq!(
-            timeline["event"]["payload"]["output"]["value"]["token"],
-            json!("sk-run-level")
-        );
+        assert_eq!(timeline["output"]["token"], json!("sk-run-level"));
         assert_eq!(
             run["run"]["output"]["token"],
             json!("sk-run-level"),

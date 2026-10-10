@@ -121,12 +121,14 @@ async function attach(runId: string): Promise<boolean> {
   const token = ++attachToken;
   if (unsubscribe) { await unsubscribe().catch(() => {}); unsubscribe = null; }
   let closed = false, dirty = false, syncing = false;
-  let timer: ReturnType<typeof setInterval> | undefined;
+  // 轮询句柄装在持有者里：dispose 闭包先定义（陈旧 attach 路径可能先于
+  // 首个 tick 启动就被调用），句柄在投影原子换入之后才创建。
+  const poll: { timer?: ReturnType<typeof setInterval> } = {};
   const current = () => !closed && token === attachToken;
   const unsub = await api.subscribeRun(runId, record => {
     if (!record.event || record.event.run_id === runId) dirty = true;
   });
-  const dispose = async () => { closed = true; if (timer) clearInterval(timer); await unsub(); };
+  const dispose = async () => { closed = true; if (poll.timer) clearInterval(poll.timer); await unsub(); };
   const initial = await api.runTimeline(runId).catch((e: unknown) => {
     if (current()) toast.error(errText(e)); return null;
   });
@@ -164,7 +166,7 @@ async function attach(runId: string): Promise<boolean> {
     } catch { dirty = true; }
     finally { syncing = false; }
   };
-  timer = setInterval(() => { void refresh(); }, 250);
+  poll.timer = setInterval(() => { void refresh(); }, 250);
   await refresh();
   return current();
 }

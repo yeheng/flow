@@ -36,7 +36,7 @@ pub enum EngineError {
 
 impl EngineError {
     /// 所有权丢失：本实例必须停止派发、丢弃未提交结果并静默退出，
-    /// 不允许再写任何事件或状态投影（`flow-pg/src/lease.rs` 的准入检查）。
+    /// 不允许再写任何事件或状态投影。
     pub fn is_lease_lost(&self) -> bool {
         matches!(self, EngineError::LeaseLost)
     }

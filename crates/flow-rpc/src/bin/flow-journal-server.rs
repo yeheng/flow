@@ -2,6 +2,7 @@
 //!
 //! WS RPC（v2 全量产品面：workflow/run/触发器/模板/统一配置/密钥，v2 协议
 //! + 物化数据形状）+ 下载/webhook HTTP（`[journal].http_addr`）+ journal 触发器。
+//!
 //! token 经 FLOW_JOURNAL_TOKEN 环境变量提供（≥32 字节；凭据不走配置文件）。
 //! 数据目录：FLOW_JOURNAL_DATA_DIR / [journal].data_dir。
 //!

@@ -4,6 +4,7 @@
 > 模式、启动重启终止、离线维护、升级、故障处置、容量与安全边界。
 >
 > 关联文档：
+>
 > - 引擎与协议语义（权威）：[DESIGN.md](DESIGN.md)
 > - journal v2 开发入口与 RPC 契约：[JSONL_DEVELOPMENT.md](JSONL_DEVELOPMENT.md)
 > - v1 SQLite → v2 切换与行为差异：[SQLITE_V1_TO_V2_MIGRATION.md](SQLITE_V1_TO_V2_MIGRATION.md)
@@ -13,7 +14,7 @@
 ## 0. 运维速查
 
 | 场景 | 动作 | 详见 |
-|---|---|---|
+| --- | --- | --- |
 | 单机起服务 | `flow-journal-server`（缺省 journal 后端） | §1.2 |
 | 单机 + 进程隔离 | `mode = "ipc"`，`flow-executor` 与主进程同目录 | §1.2、§2.2 |
 | 多机执行扩容 | `mode = "remote"`，每台执行机一个 `flow-agent` | §1.1、§2.3 |
@@ -66,7 +67,7 @@ graph TB
 纯 RPC 客户端，不碰任何存储**——CRUD 与触发语义唯一来源是服务端那一份。
 
 | 进程 | 归谁管 | 生命周期 |
-|---|---|---|
+| --- | --- | --- |
 | `flow-journal-server` | 运维 / systemd / 手起 | 常驻主进程 |
 | `flow-agent` | 运维（每台执行机） | 常驻，断线退避重连 |
 | `flow-executor` | **由 `flow-journal-server` 或 `flow-agent` 召唤**，不手起 | 随任务/会话回收 |
@@ -115,7 +116,7 @@ flow-journal-server --config /etc/flow/flow.toml
 #### 单机进程矩阵
 
 | 执行模式 | 需启动的进程 | 说明 |
-|---|---|---|
+| --- | --- | --- |
 | `in_process`（缺省） | 只 `flow-journal-server` | 无子进程，节点在服务进程内执行 |
 | `ipc` | `flow-journal-server`（同目录备好 `flow-executor`） | `flow-executor` 由主进程按需召唤 |
 | `remote` | `flow-journal-server` + 每台执行机 `flow-agent` | 执行机上也需 `flow-executor` |
@@ -139,17 +140,16 @@ EOF
 ./bin/flow-journal-server --config ./flow.toml
 ```
 
-### 1.3 PostgreSQL 库的保留范围
+### 1.3 PostgreSQL 后端
 
-`flow-pg` 作为库保留，相关 schema、执行引擎与容器清理测试继续运行。
-V1 PostgreSQL 产品服务及其打包入口已退役；当前产品统一装配 Journal。
-多机计算使用一个 Journal 主进程与多个远程 agent（§2.3）。
+v1 的 PostgreSQL 后端（`flow-pg` crate、`[pg]` 配置段与 PG 测试臂）已整体
+删除；当前产品统一装配 Journal。多机计算使用一个 Journal 主进程与多个
+远程 agent（§2.3）。
 
 ### 1.4 打包
 
 ```sh
-scripts/build-journal.sh    # → dist/journal/
-# build-sqlite.sh 转发到上述入口；build-pg.sh 明确报错提示 PG 产品已退役。
+scripts/build-journal.sh    # → dist/journal/（唯一打包入口）
 ```
 
 产物 `dist/journal/bin/` 内全部二进制同目录。入口 `run-server.sh` 要求
@@ -265,7 +265,7 @@ slots   = 4
 部署清单：
 
 | 机器 | 进程 | 数据 | 网络 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 主进程 1 台 | `flow-journal-server` | **持有 `data_dir`（journal 权威）** | 出站到各 agent；入站 RPC 9802 / webhook 9803 |
 | 每台执行机 | `flow-agent` + `flow-executor`（同目录） | 无持久数据 | 出站到主进程 9700/9701 |
 
@@ -332,7 +332,7 @@ journal 后端提供有界流式下载：`GET /runs/<run_id>/values/<output_id>`
 桌面通过进程内调用 `journal_v2::module_product`，按统一执行配置启动驱动。
 
 | 接入面 | 方法或约定 |
-|---|---|
+| --- | --- |
 | 认证 | RPC 每请求 `_token`；HTTP `Authorization: Bearer ...`；部署 token 通过 `FLOW_JOURNAL_TOKEN` 提供，至少 32 字节 |
 | 写命令 | workflow / run / schedule / webhook / template 写方法必须携带稳定 `request_id`；成功返回完整提交回执 |
 | 回执 | `{committed, visible, request_id, commit_cursor, result}`；`-32020` 表示已提交未可见，按原 scope/身份查询 `command.status` |
@@ -400,7 +400,7 @@ flow-journal-dev --data-dir ./new-v2 import-legacy --source ./old-root --databas
 ### 5.1 各进程的信号处理
 
 | 进程 | SIGINT / SIGTERM 行为 | 收到后的收尾 |
-|---|---|---|
+| --- | --- | --- |
 | `flow-journal-server` | **只处理 Ctrl-C**（`tokio::signal::ctrl_c`） | 停触发器 → `server.stop()` → 5s 内等下载任务（超时 abort）→ `backend.close()` |
 | `flow-journal-dev` | Ctrl-C 打断等待循环 | 直接 break 后 `backend.close()`；`run`/`resume` 的等待中 run 保持未终态 |
 | `flow-agent` | **处理 SIGTERM 与 Ctrl-C**（unix 双监听） | `cancel_all`（取消本地执行器）→ 关上联 → 退出，reason 打印为 `shutdown` |
@@ -425,6 +425,7 @@ JSONL，已提交事实不丢；代价是丢一次 checkpoint，下次启动多�
 ### 5.2 重启前的数据安全边界
 
 journal 后端启动时对 `data_dir` 持**排他 flock**（`Disk::open`）：
+
 - 第二个实例立即失败（`data directory is locked`），不会双写；
 - 所以「重启」= 旧进程退出并释放锁 → 新进程拿锁。**不要在旧进程还活着时起新进程**；
 - 离线工具（verify/backup/repair）同样要这把锁，**因此跑离线维护必须先停服务**。
@@ -457,7 +458,7 @@ lsof -nP -iTCP:9802 -sTCP:LISTEN      # 应无输出
 主进程与 agent 的重启互不等价，**顺序有讲究**：
 
 | 场景 | 操作 | 后果 |
-|---|---|---|
+| --- | --- | --- |
 | 重启单台执行机 | `kill -TERM` 该机 agent → 替换二进制 → 重启 agent | 该机在飞任务按 Lost 处理，主进程可重新派发；其他 agent 无感 |
 | 重启主进程（不换二进制） | `kill -INT` flow-journal-server → 重启 | epoch 不变；agent 重连，Resume 按裁决继续 |
 | 主进程升级二进制 | **先 drain 或停 agent** → 换主进程二进制 → 重启 → 再起 agent | agent 以新 `agent_boot_id` 重连；协议/能力不兼容在握手处明确失败 |
@@ -468,7 +469,7 @@ lsof -nP -iTCP:9802 -sTCP:LISTEN      # 应无输出
 ### 5.5 停机窗口里正在跑的 run 会怎样
 
 | 停机时机 | 行为 |
-|---|---|
+| --- | --- |
 | 授权前（Intent 已写、Permit 未发） | 重启后**安全重新派发**——请求从未发出，无副作用风险 |
 | 授权后、结果未知 | 进 `uncertain` 等待（`awaiting_resume`），**绝不自动重发**；要人工 `run.adjudicate` |
 | 结果已提交 | 重放识别为 `AlreadyCommitted`，直接续跑 |
@@ -522,7 +523,7 @@ agent 重连 → Resume 上报本地未决事实 → 主进程**以 journal 为�
 自报游标）：
 
 | 裁决 | 触发条件 | 处置 |
-|---|---|---|
+| --- | --- | --- |
 | `AlreadyCommitted` | 该 attempt 已有 result | 上传既有结果，不重跑 |
 | `UploadOnly` | boot 一致、无缺口 | 补传审计，权威游标由重挂后的 ack 流传达 |
 | `SubmitExistingResult` | 本地有 result_id | 提交既有结果 |
@@ -547,7 +548,7 @@ agent 重连 → Resume 上报本地未决事实 → 主进程**以 journal 为�
 **绝不自动重发已授权的外部操作**。人工用 `run.adjudicate` 决策：
 
 | decision | 语义 |
-|---|---|
+| --- | --- |
 | `accept_output` | 人工接受产出（不伪造外部响应被捕获） |
 | `retry` | 人工显式授权重发——重放再失败/超时仍回 uncertain |
 | `failed` | 人工判定失败，节点终态 failed |
@@ -567,7 +568,7 @@ agent 重连 → Resume 上报本地未决事实 → 主进程**以 journal 为�
 ## 8. 容量与预算（改配置前先看这里）
 
 | 项 | 值 | 位置 |
-|---|---|---|
+| --- | --- | --- |
 | 执行槽位 X_max | 缺省 4，可配 1..=16 | `[execution] x_max` |
 | 活跃派发 A_max | 16 | `contract.rs` |
 | 在飞 run R_max | 1000 | `contract.rs` |
@@ -577,7 +578,7 @@ agent 重连 → Resume 上报本地未决事实 → 主进程**以 journal 为�
 | 输入传输块 | 256 KiB，窗口 2 MiB | `contract.rs` |
 | 单条 journal 行 | 1 MiB | `flow-journal` |
 | 单值 / 内联 / 分块 | 256 MiB / 64 KiB / 256 KiB | `flow-journal` |
-| run 输入输出值解析 | 8 MiB | `journal_arm.rs` |
+| run 输入输出值解析 | 8 MiB | `journal_commands.rs` |
 | HTTP 响应体 | 8 MiB（超限判不确定/失败） | `exec.rs` |
 | 观测行 / 批 | 16 KiB / 64 行 | `contract.rs` |
 | 观测批字节 | DATA_MAX_FRAME / 2 | `contract.rs` |

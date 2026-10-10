@@ -1,29 +1,23 @@
 # flow 统一配置示例。复制为 flow.toml（搜索顺序：--config / FLOW_CONFIG 显式路径
-# → ./flow.toml → 平台配置目录 flow/flow.toml），或放到 flow-server 工作目录。
+# → ./flow.toml → 平台配置目录 flow/flow.toml），或放到 flow-journal-server 工作目录。
 # 分层：CLI 参数 > 环境变量（FLOW_* 全部保留）> 本文件 > 内置默认值。
 # 本文件列出的是**非默认值或常用项**；全部字段见 crates/flow-config/src/lib.rs。
 # Web 设置页（/settings）保存时整文件重写，手工注释不会保留。
+# 旧 [server].rpc_addr / http_addr / scheduler_tick_secs 与 [pg] 段已随 v1
+# 后端删除（deny_unknown_fields：存量配置里的旧键会显式报错）。
 
 [server]
-# JSON-RPC over WebSocket（原 FLOW_ADDR）
-rpc_addr = "127.0.0.1:9800"
-# webhook HTTP（原 FLOW_HTTP_ADDR）
-http_addr = "127.0.0.1:9801"
 # cron 调度器开关（原 FLOW_SCHEDULER=off）
 scheduler_enabled = true
-scheduler_tick_secs = 20
+# journal 触发器扫描 tick（秒）
 journal_trigger_tick_secs = 20
 
 [storage]
-# journal（缺省，JSONL v2 权威：data_dir 即 journal 根，SQLite 投影可重建）
-# | postgres（多节点）| sqlite（v1，已弃用——显式可用，历史数据不迁移）
+# journal 是唯一后端（JSONL v2 权威；sqlite / postgres（v1）已删除，
+# 历史数据不迁移，见 docs/SQLITE_V1_TO_V2_MIGRATION.md）
 backend = "journal"
-# 数据目录（原 FLOW_DATA_DIR；SQLite 模式的事件日志、密钥都在这里）
+# 数据目录（原 FLOW_DATA_DIR；密钥存储在这里，journal 权威在 [journal].data_dir）
 data_dir = "data"
-# SQLite 库文件显式路径（原 FLOW_DB）；注释掉 = <data_dir>/flow.db
-# database = "/var/lib/flow/flow.db"
-# backend = "postgres" 时必填（原 FLOW_DATABASE_URL；Web 设置页不回显已设值）
-# database_url = "postgres://user:pass@db:5432/flow"
 
 [execution]
 # in_process（缺省）| ipc（本机执行器子进程）| remote（远程 agent）
@@ -53,26 +47,11 @@ x_max = 4
 # executor_bin = "/usr/local/bin/flow-executor"
 # slots = 4
 
-# `flow-journal-server`（JSONL v2 开发服务）；token 仍是环境变量 FLOW_JOURNAL_TOKEN（凭据不进配置文件）
+# `flow-journal-server`（JSONL v2 产品服务）；token 仍是环境变量 FLOW_JOURNAL_TOKEN（凭据不进配置文件）
 # [journal]
 # addr = "127.0.0.1:9802"
 # http_addr = "127.0.0.1:9803"
 # data_dir = "/var/lib/flow/journal"
-
-# Postgres 后端调优（原 FLOW_ROLE / FLOW_*_MS 等 11 个环境变量；正式部署按数据库延迟实测调整）
-# [pg]
-# role = "all"                # all | gateway | executor
-# lease_ttl_ms = 30000
-# scan_interval_ms = 1000
-# inbox_poll_ms = 200
-# max_runs = 8
-# signal_wait_ms = 10000
-# signal_poll_ms = 200
-# subscribe_poll_ms = 10000
-# statement_timeout_ms = 10000
-# lock_timeout_ms = 10000
-# idle_tx_timeout_ms = 10000
-# max_connections = 16
 
 # 明确**不进配置文件**的配置（保持现状）：
 # - RUST_LOG（tracing env-filter 惯例）

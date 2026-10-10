@@ -44,7 +44,10 @@ e2e_test!(
         assert_eq!(child["run"]["output"], json!({ "got": { "amount": 7 } }));
         let child_events: Value =
             call_json(&client, "run.events.view", json!({"run_id": child_run_id})).await;
-        assert_eq!(child_events["events"][0]["depth"], json!(1));
+        assert_eq!(
+            child_events["events"][0]["event"]["payload"]["depth"],
+            json!(1)
+        );
     })
 );
 
@@ -125,11 +128,24 @@ e2e_test!(parent_cancel_cascades_to_child, |ctx: &mut Ctx| Box::pin(
         let (parent_wf, _) = publish_workflow(&client, "父流程", sub_def(&child_wf)).await;
 
         let run_id = start_run(&client, &parent_wf, json!({})).await;
-        let timeline = wait_node_running(&client, &run_id, "sub", SHORT).await;
-        let child_run_id = timeline_node(&timeline, "sub")["child_run_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        wait_node_running(&client, &run_id, "sub", SHORT).await;
+        // timeline 的 child_run_id 由状态扫描派生（父节点的子 run 行），
+        // 节点进入 running 可能早于子 run 建行——轮询到链接出现为止。
+        let child_run_id = {
+            let deadline = std::time::Instant::now() + SHORT;
+            loop {
+                let timeline: Value =
+                    call_json(&client, "run.timeline", json!({"run_id": run_id})).await;
+                if let Some(id) = timeline_node(&timeline, "sub")["child_run_id"].as_str() {
+                    break id.to_string();
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "子 run 链接未出现在 timeline：{timeline}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        };
         // 子 run 已创建并进入运行（human_task 等待中）。父节点 node_started 时
         // child_run_id 已确定，但子 run 行此刻可能还没落库（initializing 窗口）——
         // 轮询时把「不存在」（-32011）当未就绪，直到状态离开 initializing
@@ -172,11 +188,11 @@ e2e_test!(parent_cancel_cascades_to_child, |ctx: &mut Ctx| Box::pin(
     }
 ));
 
-/// 嵌套深度上限：10 层链（根 depth=0 … 最内层 run depth=9），第 8 层的
-/// sub_workflow 节点触发上限直接 fatal（§6.8 MAX_SUB_WORKFLOW_DEPTH=8）。
+/// 嵌套深度上限：18 层链（根 depth=0 … ），第 16 层的 sub_workflow 节点触发
+/// 上限直接 fatal（§6.8 MAX_SUB_WORKFLOW_DEPTH=16；v1 曾是 8）。
 #[tokio::test]
 async fn nested_depth_limit_is_fatal() {
-    const DEPTH: usize = 10;
+    const DEPTH: usize = 18;
     backend_e2e::common::run_case(env!("CARGO_BIN_EXE_flow-journal-server-e2e"), |ctx| {
         Box::pin(depth_chain_body(ctx, DEPTH))
     })

@@ -29,9 +29,6 @@ use uuid::Uuid;
 /// 预热 run 数：少量 run 走完全程（JS 沙箱、日志路径都暖起来），不进统计。
 pub const WARMUP_RUNS: usize = 4;
 
-/// 订阅建立到接收端就位的等待（全局流是纯实时增量，DESIGN §9：订阅注册略晚于
-/// RPC 返回，开跑前先等接收端就位，否则开头的事件不在流里）。
-
 /// Duration → 毫秒（报告里的计数器统一 ms 浮点）。
 pub fn ms(elapsed: Duration) -> f64 {
     elapsed.as_secs_f64() * 1000.0

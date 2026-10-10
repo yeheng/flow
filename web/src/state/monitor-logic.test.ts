@@ -1,273 +1,79 @@
 import { describe, expect, it } from "vitest";
 import {
-  alignProjection,
-  applyEvent,
-  drainBuffer,
+  appendObservations,
   logWindow,
-  seqAction,
   MAX_LOG_LINES,
-  type RunProjection,
+  type LogProjection,
 } from "./monitor-logic";
-import type { RunEvent, Timeline, TimelineNode } from "../types";
+import type { ObservationRecord } from "../types";
 
-function proj(nodes: TimelineNode[] = []): RunProjection {
-  return {
-    status: null,
-    output: undefined,
-    fatalError: null,
-    lastSeq: 0,
-    nodes,
-    logs: [],
-    logsByNode: {},
-    lastLogSeq: 0,
-  };
+function proj(): LogProjection {
+  return { logs: [], logsByNode: {}, lastLogSeq: "0" };
 }
 
-function node(id: string): TimelineNode {
+let seqCounter = 0;
+function rec(nodeId: string, message: string, seq?: string): ObservationRecord {
+  const s = seq ?? String(++seqCounter);
   return {
-    id,
-    name: id,
-    type: "script",
-    state: "pending",
-    attempts: 0,
-    started_at: null,
-    ended_at: null,
-    duration_ms: null,
-    output: null,
-    error: null,
-  };
-}
-
-function ev(
-  seq: number,
-  type: RunEvent["type"] = "run_started",
-  extra: Partial<RunEvent> = {},
-): RunEvent {
-  return { seq, ts: "2026-01-01T00:00:00Z", run_id: "r1", type, ...extra };
-}
-
-function timeline(lastSeq: number, nodes: TimelineNode[]): Timeline {
-  return {
+    seq: s,
     run_id: "r1",
-    status: "running",
-    phase: "running",
-    workflow_id: "w1",
-    workflow_version: 3,
-    started_at: null,
-    ended_at: null,
-    output: undefined,
-    fatal_error: null,
-    last_seq: lastSeq,
-    nodes,
+    dispatch_id: "d1",
+    ts: "2026-01-01T00:00:00Z",
+    line: {
+      node_id: nodeId,
+      attempt: 1,
+      level: "info",
+      stream: "stdout",
+      message,
+    },
   };
 }
 
-describe("seqAction：事件序号决策", () => {
-  it("恰好下一条 → apply", () => {
-    expect(seqAction(3, 4)).toBe("apply");
-  });
-  it("重复/陈旧 → skip", () => {
-    expect(seqAction(3, 3)).toBe("skip");
-    expect(seqAction(3, 1)).toBe("skip");
-  });
-  it("更大的 seq（状态事件之间隔着日志行的 seq）→ apply", () => {
-    // 缺口修复由 run_tail 内部补齐 + 重连后 re-attach 承担，客户端只做单调过滤
-    expect(seqAction(3, 5)).toBe("apply");
-    expect(seqAction(0, 7)).toBe("apply");
-  });
-});
-
-describe("drainBuffer：对齐后补放缓冲事件", () => {
-  it("全量按 seq 排序（含历史日志行；状态事件由 seqAction 去重）", () => {
-    const buf = [ev(5), ev(2), ev(4), ev(3)];
-    const drained = drainBuffer(buf);
-    expect(drained.map((e) => e.seq)).toEqual([2, 3, 4, 5]);
-  });
-  it("日志行也参与排序：状态与日志交错的单一流", () => {
-    const buf = [ev(5, "node_log"), ev(2), ev(3, "node_log")];
-    expect(drainBuffer(buf).map((e) => e.type)).toEqual(["run_started", "node_log", "node_log"]);
-  });
-});
-
-describe("alignProjection：timeline 快照对齐", () => {
-  it("拷贝节点与 run 级字段", () => {
+describe("appendObservations：观测日志增量追加", () => {
+  it("按 seq 追加行并推进游标；行带 seq/ts 覆盖", () => {
     const p = proj();
-    const nodes = [node("a"), node("b")];
-    alignProjection(p, timeline(9, nodes));
-    expect(p.nodes).toHaveLength(2);
-    expect(p.lastSeq).toBe(9);
-    expect(p.status).toBe("running");
-  });
-});
-
-describe("applyEvent：事件增量应用", () => {
-  it("node_started → running，记录 attempt、开始时间与输入面", () => {
-    const p = proj([node("a")]);
-    applyEvent(p, ev(1, "node_started", { node_id: "a", attempt: 2, input: { ms: 5 } }));
-    expect(p.nodes[0].state).toBe("running");
-    expect(p.nodes[0].attempts).toBe(2);
-    expect(p.nodes[0].input).toEqual({ ms: 5 });
-    expect(p.lastSeq).toBe(1);
-  });
-
-  it("node_completed → completed，写入输出与耗时", () => {
-    const p = proj([node("a")]);
-    applyEvent(p, ev(1, "node_completed", { node_id: "a", output: { ok: 1 }, duration_ms: 12 }));
-    expect(p.nodes[0].state).toBe("completed");
-    expect(p.nodes[0].output).toEqual({ ok: 1 });
-    expect(p.nodes[0].duration_ms).toBe(12);
-  });
-
-  it("node_failed：retryable → retrying，否则 failed", () => {
-    const p = proj([node("a"), node("b")]);
-    applyEvent(p, ev(1, "node_failed", { node_id: "a", retryable: true, error: "boom" }));
-    applyEvent(p, ev(2, "node_failed", { node_id: "b", error: "boom" }));
-    expect(p.nodes[0].state).toBe("retrying");
-    expect(p.nodes[1].state).toBe("failed");
-  });
-
-  it("run_completed / run_failed / run_cancelled 推进 status 与终态字段", () => {
-    const p = proj();
-    applyEvent(p, ev(1, "run_completed", { output: 42 }));
-    expect(p.status).toBe("succeeded");
-    expect(p.output).toBe(42);
-
-    const p2 = proj();
-    applyEvent(p2, ev(1, "run_failed", { error: "fatal" }));
-    expect(p2.status).toBe("failed");
-    expect(p2.fatalError).toBe("fatal");
-
-    const p3 = proj();
-    applyEvent(p3, ev(1, "run_cancelled"));
-    expect(p3.status).toBe("cancelled");
-  });
-
-  it("signal_received 不改变投影", () => {
-    const p = proj([node("a")]);
-    applyEvent(p, ev(1, "signal_received", { node_id: "a" }));
-    expect(p.nodes[0].state).toBe("pending");
-    expect(p.lastSeq).toBe(1);
-  });
-});
-
-describe("缓冲 → 对齐 → 补放：attach 时序", () => {
-  it("订阅建立与 timeline 对齐之间到达的事件不丢、不重", () => {
-    const p = proj();
-    // 订阅先建立，事件 5、6 在对齐前到达 → 缓冲
-    const buffer = [
-      ev(6, "run_completed", { output: "done" }),
-      ev(5, "node_completed", { node_id: "a" }),
-    ];
-    // timeline 对齐到 seq 4
-    alignProjection(p, timeline(4, [node("a")]));
-    // 补放：seq 5、6 依次应用
-    const applied: number[] = [];
-    for (const e of drainBuffer(buffer)) {
-      if (seqAction(p.lastSeq, e.seq) !== "apply") continue;
-      applyEvent(p, e);
-      applied.push(e.seq);
-    }
-    expect(applied).toEqual([5, 6]);
-    expect(p.status).toBe("succeeded");
-    expect(p.nodes[0].state).toBe("completed");
-  });
-
-  it("缺口（中间夹着日志行）按单调过滤平滑处理", () => {
-    const p = proj();
-    alignProjection(p, timeline(4, []));
-    const buffer = [ev(7, "run_completed")];
-    const drained = drainBuffer(buffer);
-    expect(seqAction(p.lastSeq, drained[0].seq)).toBe("apply");
-  });
-});
-
-describe("node_log：日志与状态同流但水位独立", () => {
-  it("applyEvent(node_log) 追加日志行且不推进状态水位", () => {
-    const p = proj([node("a")]);
-    applyEvent(p, ev(2, "node_started", { node_id: "a", attempt: 1 }));
-    applyEvent(
-      p,
-      ev(3, "node_log", {
-        node_id: "a",
-        attempt: 1,
-        level: "info",
-        stream: "stdout",
-        message: "hello",
-      }),
-    );
-    expect(p.logs).toHaveLength(1);
+    appendObservations(p, [rec("a", "m1"), rec("a", "m2")]);
+    expect(p.logs.map((l) => l.message)).toEqual(["m1", "m2"]);
     expect(p.logs[0]).toMatchObject({
-      seq: 3,
+      seq: "1",
+      ts: "2026-01-01T00:00:00Z",
       node_id: "a",
       level: "info",
       stream: "stdout",
-      message: "hello",
     });
-    // lastSeq 停在 2（node_started），日志不拖动状态水位
-    expect(p.lastSeq).toBe(2);
-    expect(p.lastLogSeq).toBe(3);
+    expect(p.lastLogSeq).toBe("2");
   });
 
-  it("lastLogSeq 水位去重：陈旧日志重复投递被忽略", () => {
+  it("游标去重：seq ≤ lastLogSeq 的重复投递被忽略（BigInt 语义，非字典序）", () => {
     const p = proj();
-    applyEvent(p, ev(5, "node_log", { node_id: "a", message: "m5" }));
-    applyEvent(p, ev(3, "node_log", { node_id: "a", message: "m3" }));
-    expect(p.logs.map((l) => l.message)).toEqual(["m5"]);
+    appendObservations(p, [rec("a", "m9", "9")]);
+    appendObservations(p, [rec("a", "stale", "8"), rec("a", "dup", "9"), rec("a", "m10", "10")]);
+    expect(p.logs.map((l) => l.message)).toEqual(["m9", "m10"]);
+    expect(p.lastLogSeq).toBe("10");
   });
 
-  it("环形上限：超过 MAX_LOG_LINES 丢弃最旧行", () => {
+  it("控制事件不经过这条路径——观测游标独立推进", () => {
+    // lastLogSeq 只由 ObservationRecord 推进；这里只验证初始投影语义
     const p = proj();
-    const base = p.lastLogSeq;
-    for (let i = 1; i <= MAX_LOG_LINES + 2000; i++) {
-      applyEvent(p, ev(base + i, "node_log", { node_id: "a", message: `m${i}` }));
+    expect(p.lastLogSeq).toBe("0");
+    expect(p.logs).toHaveLength(0);
+    expect(p.logsByNode).toEqual({});
+  });
+
+  it("按 node_id 的索引与 logs 始终一致（环形裁剪后仍引用级一致）", () => {
+    const p = proj();
+    // 三个节点的量差别很大：让各桶被裁剪的条数不同
+    const total = MAX_LOG_LINES + 500;
+    const records: ObservationRecord[] = [];
+    for (let i = 1; i <= total; i++) {
+      const nodeId = i % 10 < 7 ? "hot" : i % 10 < 9 ? "warm" : "cold";
+      records.push(rec(nodeId, `m${i}`, String(i)));
     }
-    expect(p.logs.length).toBeLessThanOrEqual(MAX_LOG_LINES);
-    expect(p.logs[p.logs.length - 1].message).toBe(`m${MAX_LOG_LINES + 2000}`);
-    expect(p.logs[0].message).not.toBe("m1");
-  });
+    appendObservations(p, records);
 
-  it("按 node_id 的索引与 logs 始终一致（含环形裁剪与 re-align）", () => {
-    const p = proj();
-    const base = p.lastLogSeq;
-    // 两个节点交替产出，撑过环形上限以触发裁剪
-    for (let i = 1; i <= MAX_LOG_LINES + 2000; i++) {
-      applyEvent(
-        p,
-        ev(base + i, "node_log", {
-          node_id: i % 2 === 0 ? "a" : "b",
-          message: `m${i}`,
-        }),
-      );
-    }
-
-    // 索引桶的数量与内容必须与 logs 的过滤结果逐条相等
     const flat = Object.values(p.logsByNode).flat();
     expect(flat.length).toBe(p.logs.length);
     expect(new Set(flat).size).toBe(flat.length); // 同一行不得进两个桶
-    for (const id of ["a", "b"]) {
-      expect(p.logsByNode[id]).toEqual(p.logs.filter((l) => l.node_id === id));
-    }
-
-    // 重新对齐（切 run）后索引必须清空，不能留着上一条 run 的日志
-    alignProjection(p, timeline(1, []));
-    expect(p.logsByNode).toEqual({});
-    expect(Object.values(p.logsByNode).flat()).toHaveLength(0);
-  });
-
-  /**
-   * 裁剪后每个桶仍是**同一条** seq 升序链的前缀对齐结果：桶的内容必须正好是
-   * logs 过滤出的那些行（同一批对象引用，不能有残缺或串行）。
-   * 这是「按 node_id 计数后一次 shift」取代「逐行 indexOf」的正确性依据：
-   * 两者都只能删掉每个桶的一段前缀。
-   */
-  it("环形裁剪后索引与 logs 引用级一致（不是副本、没有残行）", () => {
-    const p = proj();
-    const base = p.lastLogSeq;
-    for (let i = 1; i <= MAX_LOG_LINES + 500; i++) {
-      // 三个节点的量差别很大：让各桶被裁剪的条数不同
-      const node_id = i % 10 < 7 ? "hot" : i % 10 < 9 ? "warm" : "cold";
-      applyEvent(p, ev(base + i, "node_log", { node_id, message: `m${i}` }));
-    }
     for (const id of ["hot", "warm", "cold"]) {
       const bucket = p.logsByNode[id] ?? [];
       const expected = p.logs.filter((l) => l.node_id === id);
@@ -276,32 +82,23 @@ describe("node_log：日志与状态同流但水位独立", () => {
       for (const line of bucket) expect(p.logs).toContain(line);
       // 桶内 seq 严格升序（裁剪掉的必须是一段前缀，中间不能掉）
       for (let i = 1; i < bucket.length; i++) {
-        expect(bucket[i].seq).toBeGreaterThan(bucket[i - 1].seq);
+        expect(Number(bucket[i].seq)).toBeGreaterThan(Number(bucket[i - 1].seq));
       }
     }
+    expect(p.logs.length).toBeLessThanOrEqual(MAX_LOG_LINES);
+    expect(p.logs[p.logs.length - 1].message).toBe(`m${total}`);
   });
 
-  it("历史日志（seq ≤ lastSeq）经补放路径进入日志列表", () => {
-    // attach 场景：timeline 对齐到 2，回放段余下事件补放，日志行全部可见
-    const p = proj([node("a")]);
-    alignProjection(p, timeline(2, [node("a")]));
-    const buffer = [
-      ev(1, "run_started"),
-      ev(2, "node_started", { node_id: "a", attempt: 1 }),
-      ev(3, "node_log", { node_id: "a", attempt: 1, message: "log-a" }),
-      ev(4, "node_completed", { node_id: "a" }),
-      ev(6, "run_completed", { output: "x" }),
-    ];
-    for (const e of drainBuffer(buffer)) {
-      if (e.type === "node_log") {
-        applyEvent(p, e);
-        continue;
-      }
-      if (seqAction(p.lastSeq, e.seq) === "apply") applyEvent(p, e);
+  it("整桶裁空后索引键被删除，不留空数组残骸", () => {
+    const p = proj();
+    const records: ObservationRecord[] = [];
+    // cold 只有一条，环形裁剪必然把它整桶裁掉
+    for (let i = 1; i <= MAX_LOG_LINES + 10; i++) {
+      records.push(rec(i === 1 ? "cold" : "hot", `m${i}`, String(i)));
     }
-    expect(p.logs.map((l) => l.message)).toEqual(["log-a"]);
-    expect(p.status).toBe("succeeded");
-    expect(p.nodes[0].state).toBe("completed");
+    appendObservations(p, records);
+    expect(p.logsByNode["cold"]).toBeUndefined();
+    expect(p.logsByNode["hot"]).toEqual(p.logs.filter((l) => l.node_id === "hot"));
   });
 });
 
