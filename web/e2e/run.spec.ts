@@ -17,6 +17,12 @@ test("运行链路：点运行 → RunPanel 终态 → 列表来源=手动 → �
   // 终态：徽章变绿（成功）。运行面板订阅实时事件，poll 等待
   await expect(page.locator(".run-monitor .run-phase")).toHaveText("成功", { timeout: 15_000 });
 
+  // 底部运行抽屉：可手动收起，顶栏「控制台」再展开
+  await page.getByRole("button", { name: "收起 ▾" }).click();
+  await expect(page.locator(".run-drawer")).toHaveCount(0);
+  await page.getByRole("button", { name: "控制台 ▴" }).click();
+  await expect(page.locator(".run-drawer")).toBeVisible();
+
   // 全局运行记录：该 run 出现在列表，来源=手动。
   // 按工作流名定位行（uuid v7 的 run id 前 8 位在同毫秒窗口内会撞）
   await page.goto("/runs");

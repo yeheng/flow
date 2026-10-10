@@ -223,7 +223,8 @@ function onRowClick(nodeId: string): void {
 }
 
 .monitor-log-console {
-  min-height: 260px;
+  /* 底部抽屉形态：给头部/状态行留高度，日志区自身可滚动 */
+  min-height: 140px;
 }
 
 .run-status {
@@ -244,7 +245,6 @@ function onRowClick(nodeId: string): void {
 }
 
 .run-phase.run-running,
-.run-phase.run-initializing,
 .run-state.run-running {
   color: var(--run);
 }

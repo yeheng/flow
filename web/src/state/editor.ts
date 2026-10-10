@@ -70,6 +70,8 @@ interface EditorState {
   nodes: EditorNode[];
   edges: EditorEdge[];
   selectedNodeId: string | null;
+  /** 参数编辑弹窗是否打开（编辑入口：点节点/右键「编辑参数」/校验错误定位） */
+  paramsOpen: boolean;
   /** RunPanel 行 hover/click 联动画布高亮 */
   highlightNodeId: string | null;
   /** 右键拖拽连线时悬停的合法目标节点（画布高亮用，拖拽结束清空） */
@@ -89,6 +91,7 @@ export const editor = reactive<EditorState>({
   nodes: [],
   edges: [],
   selectedNodeId: null,
+  paramsOpen: false,
   highlightNodeId: null,
   linkTargetId: null,
   breadcrumb: [],
@@ -302,6 +305,7 @@ export async function selectWorkflow(id: string, version?: number): Promise<void
   editor.workflowId = id;
   editor.workflowName = editor.workflows.find((w) => w.workflow_id === id)?.name ?? "";
   editor.selectedNodeId = null;
+  editor.paramsOpen = false;
   markSaved();
   resetHistory();
 }
@@ -459,7 +463,10 @@ export function deleteSelection(): boolean {
   editor.edges = editor.edges.filter(
     (edge) => !edge.selected && !ids.has(edge.source) && !ids.has(edge.target),
   );
-  if (editor.selectedNodeId && ids.has(editor.selectedNodeId)) editor.selectedNodeId = null;
+  if (editor.selectedNodeId && ids.has(editor.selectedNodeId)) {
+    editor.selectedNodeId = null;
+    editor.paramsOpen = false;
+  }
   if (editor.highlightNodeId && ids.has(editor.highlightNodeId)) editor.highlightNodeId = null;
   return true;
 }

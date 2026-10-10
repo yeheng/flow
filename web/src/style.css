@@ -75,13 +75,6 @@ aside.left {
   gap: 16px;
 }
 
-aside.right {
-  border-left: 1px solid var(--border);
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
-
 .center {
   position: relative;
   min-width: 0;
@@ -320,7 +313,7 @@ input.code {
   align-items: center;
 }
 
-/* ---- 共享表单字段（ParamsPanel / RunPanel / SchemaField） ---- */
+/* ---- 共享表单字段（ParamsModal / RunPanel / SchemaField） ---- */
 
 .field {
   margin-bottom: 10px;

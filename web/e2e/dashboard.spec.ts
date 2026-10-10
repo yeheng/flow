@@ -44,9 +44,7 @@ test("仪表盘：卡片数字与 run.stats 精确一致，按工作流分组表
   const terminal = succeeded + failed + cancelled;
   const expectRate = terminal > 0 ? `${Math.round((succeeded / terminal) * 100)}%` : "—";
   const active =
-    (stats.by_status["running"] ?? 0) +
-    (stats.by_status["initializing"] ?? 0) +
-    (stats.by_status["awaiting_resume"] ?? 0);
+    (stats.by_status["running"] ?? 0) + (stats.by_status["awaiting_resume"] ?? 0);
 
   await page.goto("/");
   const card = (label: string) => page.locator(".card", { hasText: label }).locator(".card-value");

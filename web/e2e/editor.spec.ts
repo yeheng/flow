@@ -14,13 +14,31 @@ test("编辑器：画布渲染、顶部条、改参数保存无错误", async ({
   await expect(page.locator(".editor-title")).toContainText("v1");
   await expect(page.locator(".editor-actions").getByRole("link", { name: "版本" })).toBeVisible();
 
-  // 点 script 节点（定义顺序第二）→ 参数面板出现 Monaco 代码编辑器
+  // 左侧节点面板可收起/展开（顶栏按钮；⌘B 同效）
+  const palette = page.locator(".palette");
+  await page.locator(".palette-toggle").click();
+  await expect(palette).toBeHidden();
+  await page.locator(".palette-toggle").click();
+  await expect(palette).toBeVisible();
+
+  // 单击 script 节点（定义顺序第二）只选中，不弹参数弹窗；双击才弹
   await page.locator(".vue-flow__node").nth(1).click();
-  const codeEditor = page.locator("aside.right .code-editor .monaco-editor").first();
+  await expect(page.locator(".params-modal")).toHaveCount(0);
+  await page.locator(".vue-flow__node").nth(1).dblclick();
+  const modal = page.locator(".params-modal");
+  await expect(modal).toBeVisible();
+  // 弹窗宽度 = 页面宽度的 65%
+  const viewportWidth = page.viewportSize()!.width;
+  const modalWidth = (await modal.boundingBox())!.width;
+  expect(Math.abs(modalWidth - viewportWidth * 0.65)).toBeLessThan(2);
+  const codeEditor = page.locator(".params-modal .code-editor .monaco-editor").first();
   await expect(codeEditor).toBeVisible();
   await codeEditor.click();
   await page.keyboard.press("ControlOrMeta+a");
   await page.keyboard.type("return 42;");
+  // Esc 关闭弹窗后再保存（弹窗打开时工具栏被遮挡、快捷键不穿透）
+  await page.keyboard.press("Escape");
+  await expect(modal).toHaveCount(0);
 
   // 保存：成功 toast，无错误 toast，「未保存」标记消失
   await page.getByRole("button", { name: "保存" }).click();
@@ -46,7 +64,8 @@ test("可复用节点模板：存为模板 → 另一流程插入 → 刷新仍�
     },
   });
 
-  // 打开源流程：选中 script 节点（模板保存的是选中集 + 内部连线）
+  // 打开源流程：点 script 节点选中（模板保存的是选中集 + 内部连线）；
+  // 单击只选中不弹窗，无需关闭
   await page.goto(`/workflows/${wf.id}`);
   await expect(page.locator(".vue-flow__node")).toHaveCount(3);
   await page.locator(".vue-flow__node").nth(1).click();
@@ -125,9 +144,13 @@ test("右键节点：菜单编辑参数与删除", async ({ page }) => {
   const menu = page.locator(".ctx-menu");
   await expect(menu).toBeVisible();
 
-  // 编辑参数：直达右侧面板并聚焦名称输入框
+  // 编辑参数：弹窗打开并聚焦名称输入框
   await menu.locator(".ctx-item", { hasText: "编辑参数" }).click();
+  const modal = page.locator(".params-modal");
+  await expect(modal).toBeVisible();
   await expect(page.locator("#node-name")).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(modal).toHaveCount(0);
 
   // 再次右键同一节点 → 删除 → 3 节点变 2，菜单关闭
   await page.mouse.down({ button: "right" });
@@ -158,7 +181,7 @@ test("右键空白：添加节点子菜单与粘贴", async ({ page }) => {
   await expect(page.locator(".vue-flow__node")).toHaveCount(4);
   await expect(page.locator(".ctx-menu")).toHaveCount(0);
 
-  // 复制新节点 → 空白处右键粘贴（落点为菜单弹出位置）
+  // 复制新节点（单击选中即可）→ 空白处右键粘贴
   await page.locator(".vue-flow__node").nth(3).click();
   await page.keyboard.press("ControlOrMeta+c");
   const spot2 = await blankSpot(page);

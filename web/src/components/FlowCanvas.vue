@@ -30,10 +30,7 @@ import { monitor, openChildRun } from "../state/monitor";
 import FlowNode from "./FlowNode.vue";
 import CanvasContextMenu, { type MenuEntry } from "./CanvasContextMenu.vue";
 
-const emit = defineEmits<{ "edit-node": [] }>();
-
 const { screenToFlowCoordinate, setViewport, getViewport, fitView } = useVueFlow();
-
 const defaultEdgeOptions = {
   markerEnd: { type: MarkerType.ArrowClosed, color: "#7c6cff" },
 };
@@ -55,8 +52,10 @@ function onNodeClick(e: NodeMouseEvent): void {
   editor.selectedNodeId = e.node.id;
 }
 
+// 双击 = 编辑参数（弹窗）。sub_workflow 的钻取走右键菜单「钻取子流程」
 function onNodeDoubleClick(e: NodeMouseEvent): void {
-  void drillIntoSubWorkflow(e.node.id);
+  editor.selectedNodeId = e.node.id;
+  editor.paramsOpen = true;
 }
 
 // 删除键在 vue-flow 处理前先入 undo 栈（canvas-wrap 在冒泡路径上先于 window 监听器执行）
@@ -272,7 +271,7 @@ function nodeMenu(node: EditorNode): MenuEntry[] {
       label: "编辑参数",
       action: () => {
         selectOnlyNode(node.id);
-        emit("edit-node");
+        editor.paramsOpen = true;
       },
     },
     {

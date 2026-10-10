@@ -66,7 +66,7 @@ async fn embedded_flow_runs_streams_and_persists_without_a_rpc_listener() {
                 .request(
                     Service::Flow,
                     "run.subscribe".into(),
-                    json!({"run_id": subscribe_run, "event_format": "envelope"}),
+                    json!({"run_id": subscribe_run, "event_format": "v2"}),
                 )
                 .await
                 .unwrap()

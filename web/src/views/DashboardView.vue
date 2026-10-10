@@ -27,7 +27,6 @@ const rates = computed(() => perWorkflowRates(stats.value.by_workflow));
 
 const statusLabel: Record<string, string> = {
   running: "运行中",
-  initializing: "初始化中",
   awaiting_resume: "挂起待恢复",
   succeeded: "成功",
   failed: "失败",
@@ -35,7 +34,7 @@ const statusLabel: Record<string, string> = {
 };
 
 function badgeClass(status: string): string {
-  if (status === "awaiting_resume" || status === "initializing") return "run-awaiting";
+  if (status === "awaiting_resume") return "run-awaiting";
   return `run-${status}`;
 }
 

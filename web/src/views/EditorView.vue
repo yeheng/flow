@@ -28,12 +28,28 @@ import { saveWorkflowAsNodeTemplate } from "../state/templates";
 import { toast } from "../state/toast";
 import NodePalette from "../components/NodePalette.vue";
 import FlowCanvas from "../components/FlowCanvas.vue";
-import ParamsPanel from "../components/ParamsPanel.vue";
+import ParamsModal from "../components/ParamsModal.vue";
 import RunPanel from "../components/RunPanel.vue";
 
 const route = useRoute();
 const router = useRouter();
-const paramsPanel = ref<InstanceType<typeof ParamsPanel>>();
+
+// 左侧节点面板收起（⌘B / 顶栏按钮；记忆在 localStorage）
+const PALETTE_KEY = "flow.palette-collapsed";
+const paletteCollapsed = ref(localStorage.getItem(PALETTE_KEY) === "1");
+function togglePalette(): void {
+  paletteCollapsed.value = !paletteCollapsed.value;
+  localStorage.setItem(PALETTE_KEY, paletteCollapsed.value ? "1" : "0");
+}
+
+// 底部运行抽屉：新 run 启动自动展开；手动收起后保持收起到下一次启动
+const runDrawerOpen = ref(!!monitor.runId);
+watch(
+  () => monitor.runId,
+  (id) => {
+    if (id) runDrawerOpen.value = true;
+  },
+);
 
 async function load(id: string): Promise<void> {
   if (!(await ensureNodeTypes())) return;
@@ -75,6 +91,11 @@ function isEditableTarget(t: EventTarget | null): boolean {
 
 // 快捷键只在编辑器页注册（运行详情等只读页不受影响）；输入框聚焦时不劫持
 function onKeydown(e: KeyboardEvent): void {
+  // 参数弹窗打开时：Esc 关闭弹窗，其余快捷键（删除/撤销/保存）不穿透到画布
+  if (editor.paramsOpen) {
+    if (e.key === "Escape") editor.paramsOpen = false;
+    return;
+  }
   if (e.key === "Escape" && validationUi.open) {
     validationUi.open = false;
     return;
@@ -88,6 +109,11 @@ function onKeydown(e: KeyboardEvent): void {
   if (key === "s") {
     e.preventDefault();
     void save();
+    return;
+  }
+  if (key === "b") {
+    e.preventDefault();
+    togglePalette();
     return;
   }
   if (isEditableTarget(e.target)) return;
@@ -124,7 +150,10 @@ onMounted(() => window.addEventListener("pointerdown", onPointerDownOutside, tru
 onUnmounted(() => window.removeEventListener("pointerdown", onPointerDownOutside, true));
 
 function locateError(nodeId?: string): void {
-  if (nodeId) editor.selectedNodeId = nodeId;
+  if (nodeId) {
+    editor.selectedNodeId = nodeId;
+    editor.paramsOpen = true;
+  }
   validationUi.open = false;
 }
 
@@ -144,6 +173,13 @@ async function saveAsNode(): Promise<void> {
 <template>
   <div class="editor-page">
     <div class="editor-topbar">
+      <button
+        class="palette-toggle"
+        :title="paletteCollapsed ? '展开节点面板 (⌘B)' : '收起节点面板 (⌘B)'"
+        @click="togglePalette()"
+      >
+        {{ paletteCollapsed ? "»" : "«" }}
+      </button>
       <RouterLink class="link" to="/workflows">← 工作流列表</RouterLink>
       <span class="editor-title" :title="editor.workflowName || editor.workflowId || undefined">
         <span class="editor-title-name">{{ editor.workflowName || editor.workflowId }}</span>
@@ -213,20 +249,28 @@ async function saveAsNode(): Promise<void> {
           {{ publishing ? "发布中…" : "发布" }}
         </button>
         <button class="primary" :disabled="monitor.starting" @click="startRun()">运行</button>
+        <button
+          :title="runDrawerOpen ? '收起运行控制台' : '展开运行控制台'"
+          @click="runDrawerOpen = !runDrawerOpen"
+        >
+          {{ runDrawerOpen ? "控制台 ▾" : "控制台 ▴" }}
+        </button>
       </div>
     </div>
     <main class="editor-main">
-      <aside class="left">
+      <aside class="left" :class="{ collapsed: paletteCollapsed }">
         <NodePalette />
       </aside>
       <section class="center">
-        <FlowCanvas @edit-node="paramsPanel?.focusName()" />
+        <FlowCanvas />
       </section>
-      <aside class="right">
-        <ParamsPanel ref="paramsPanel" />
-        <RunPanel />
-      </aside>
     </main>
+    <!-- 运行面板：底部抽屉（新 run 启动自动展开），画布占满剩余高度 -->
+    <section v-if="runDrawerOpen" class="run-drawer">
+      <RunPanel @collapse="runDrawerOpen = false" />
+    </section>
+    <!-- 节点参数编辑：弹窗（点节点/右键「编辑参数」/校验错误定位打开） -->
+    <ParamsModal />
   </div>
 </template>
 
@@ -240,9 +284,48 @@ async function saveAsNode(): Promise<void> {
 
 .editor-main {
   flex: 1;
-  display: grid;
-  grid-template-columns: 240px 1fr 320px;
+  display: flex;
   min-height: 0;
+}
+
+/* 左侧节点面板：可收起（宽度动画；收起后不占位、不留滚动条） */
+aside.left {
+  width: 240px;
+  flex-shrink: 0;
+  transition:
+    width 0.18s ease,
+    padding 0.18s ease,
+    border-color 0.18s ease;
+}
+
+aside.left.collapsed {
+  width: 0;
+  padding-left: 0;
+  padding-right: 0;
+  border-right-color: transparent;
+  overflow: hidden;
+}
+
+.palette-toggle {
+  width: 28px;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1.1;
+}
+
+.center {
+  flex: 1;
+}
+
+/* 运行抽屉：固定高度、内容内部滚动 */
+.run-drawer {
+  flex-shrink: 0;
+  height: 340px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
 }
 
 .editor-topbar {

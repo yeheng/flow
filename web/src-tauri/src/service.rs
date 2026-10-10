@@ -152,7 +152,7 @@ impl Services {
                 object.insert("_token".into(), json!(self.token));
                 // v2 协议：写命令必须有幂等键。桌面调用方（渲染层）不感知
                 // 协议细节——这里为缺失 request_id 的写命令补一个（一次
-                // 调用一个键 = v1 的一次交付语义）。
+                // 调用一个键 = 一次交付语义）。
                 let is_write = flow_rpc::journal_v2::is_write_method(&method);
                 if is_write
                     && !object
@@ -323,7 +323,7 @@ impl Host {
                     let _ = stopped.await;
                     service.shutdown().await
                 })
-                // Dropping this dedicated runtime stops the legacy engine's remaining tasks.
+                // Dropping this dedicated runtime stops remaining journal tasks.
             })
             .map_err(|e| e.to_string())?;
         match started.recv().map_err(|e| e.to_string())? {

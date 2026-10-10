@@ -56,7 +56,7 @@ fn main() {
     let code = app.run_return(|_, _| {});
     if let Some(host) = host.get() {
         if let Err(error) = host.shutdown() {
-            eprintln!("flow-server shutdown: {error}");
+            eprintln!("flow-journal shutdown: {error}");
         }
     }
     std::process::exit(code);
