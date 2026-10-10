@@ -1,5 +1,5 @@
 use crate::journal::{CommandReceipt, JournalBackend, JournalError};
-use flow_engine::journal_state::{DefinitionVersion, Run, Workflow};
+use flow_engine::journal_state::{DefinitionVersion, Run, State, Workflow};
 use flow_journal::{Event, EventKind};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -28,6 +28,145 @@ async fn deduped(
     backend.deduped_command(scope, request_id, request).await
 }
 impl JournalBackend {
+    /// Product CRUD uses the caller's identity and arguments for the durable command.
+    /// IDs, timestamps, existence checks and the mutation are decided under the same lock.
+    pub async fn product_command(
+        &self,
+        method: &str,
+        params: &Value,
+        request_id: &str,
+    ) -> Result<CommandReceipt> {
+        self.command(method, Some(request_id), params, |state| {
+            let field = |key: &str| {
+                params[key]
+                    .as_str()
+                    .ok_or_else(|| invalid(format!("missing string {key}")))
+            };
+            let (namespace, action) = method
+                .split_once('.')
+                .ok_or_else(|| invalid("invalid product command"))?;
+            let creating = action == "create";
+            let deleting = action == "delete";
+            let key = if creating {
+                if namespace == "webhook" {
+                    uuid::Uuid::now_v7().simple().to_string()
+                } else {
+                    id()
+                }
+            } else {
+                field(if namespace == "webhook" {
+                    "token"
+                } else {
+                    "id"
+                })?
+                .to_owned()
+            };
+            if key.is_empty() || key.len() > 128 {
+                return Err(invalid("invalid entity key"));
+            }
+            let map = match namespace {
+                "schedule" => &state.schedules,
+                "webhook" => &state.webhooks,
+                "template" => &state.templates,
+                _ => return Err(invalid("invalid product command")),
+            };
+            if !creating && !map.contains_key(&key) {
+                if namespace == "template" && deleting {
+                    return Ok((vec![], json!({"deleted":false})));
+                }
+                return Err(invalid(format!("{namespace} not found")));
+            }
+            let mut patch = serde_json::Map::new();
+            if deleting {
+                patch.insert("deleted".into(), json!(true));
+            } else {
+                match (namespace, action) {
+                    ("schedule", "create" | "update") => {
+                        if creating {
+                            patch.insert("workflow_id".into(), json!(field("workflow_id")?));
+                            patch.insert(
+                                "enabled".into(),
+                                json!(params["enabled"].as_bool().unwrap_or(true)),
+                            );
+                            patch.insert("input".into(), params["input"].clone());
+                            patch.insert("cron_expr".into(), json!(field("cron")?));
+                        } else {
+                            for (source, target) in [
+                                ("cron", "cron_expr"),
+                                ("input", "input"),
+                                ("enabled", "enabled"),
+                            ] {
+                                if let Some(value) = params.get(source) {
+                                    patch.insert(target.into(), value.clone());
+                                }
+                            }
+                        }
+                    }
+                    ("webhook", "create") => {
+                        patch.insert("workflow_id".into(), json!(field("workflow_id")?));
+                        patch.insert("enabled".into(), json!(true));
+                    }
+                    ("webhook", "set_enabled") => {
+                        patch.insert(
+                            "enabled".into(),
+                            params
+                                .get("enabled")
+                                .filter(|v| v.is_boolean())
+                                .cloned()
+                                .ok_or_else(|| invalid("enabled flag required"))?,
+                        );
+                    }
+                    ("template", "create" | "update") => {
+                        for key in ["name", "category", "nodes", "edges"] {
+                            if let Some(value) = params.get(key) {
+                                patch.insert(key.into(), value.clone());
+                            }
+                        }
+                        if creating {
+                            patch.entry("category").or_insert(Value::Null);
+                        }
+                    }
+                    _ => return Err(invalid("invalid product command")),
+                }
+            }
+            let (events, mut value) = if namespace == "template" {
+                template_decision(state, &key, &Value::Object(patch))?
+            } else {
+                trigger_decision(
+                    state,
+                    if namespace == "schedule" {
+                        EventKind::ScheduleChanged
+                    } else {
+                        EventKind::WebhookChanged
+                    },
+                    &key,
+                    &Value::Object(patch),
+                )?
+            };
+            let result = if deleting {
+                json!({"deleted":true})
+            } else if namespace == "webhook" && !creating {
+                json!({"updated":true})
+            } else if namespace == "schedule" {
+                let next = value["cron_expr"]
+                    .as_str()
+                    .and_then(|expr| expr.parse::<cron_parser::Schedule>().ok())
+                    .and_then(|cron| cron.next_after(&chrono::Local::now()))
+                    .map(|t| t.to_rfc3339());
+                value["next_fire_at"] = json!(next);
+                if creating {
+                    value
+                } else {
+                    json!({"updated":true,"schedule":value})
+                }
+            } else {
+                value
+            };
+            Ok((events, result))
+        })
+        .await
+    }
+
     pub async fn trigger_configs(&self, source: &str) -> Vec<Value> {
         self.inspect(|s| {
             if source == "schedule" {
@@ -185,7 +324,7 @@ impl JournalBackend {
         definition: Value,
         request_id: Option<&str>,
     ) -> Result<CommandReceipt> {
-        flow_engine::journal_state::validate_definition(&definition)?;
+        let parsed = flow_engine::journal_state::validate_definition(&definition)?;
         let fingerprint_request = json!({"workflow_id":workflow_id,"definition":definition});
         let checksum = flow_journal::codec::digest(&flow_journal::codec::bounded_json(
             &definition,
@@ -195,6 +334,19 @@ impl JournalBackend {
             deduped(self, "workflow.update", request_id, &fingerprint_request).await?
         {
             return Ok(receipt);
+        }
+        let missing = flow_engine::secrets::missing_secrets(&parsed);
+        if !missing.is_empty() {
+            return Err(invalid(
+                missing
+                    .iter()
+                    .map(|(node, name)| {
+                        format!("node {node}: missing secret {name} (FLOW_SECRET_{name})")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            )
+            .into());
         }
         let stored = flow_journal::value::store_json(
             &self.journal,
@@ -277,6 +429,15 @@ impl JournalBackend {
                 if !state.workflows.contains_key(workflow_id) {
                     return Err(invalid("workflow not found"));
                 }
+                if state
+                    .runs
+                    .values()
+                    .any(|run| run.workflow_id == workflow_id)
+                {
+                    return Err(flow_journal::Error::Conflict(
+                        "workflow has runs; cannot delete".into(),
+                    ));
+                }
                 let mut events = vec![Event::new(
                     EventKind::WorkflowDeleted,
                     json!({"workflow_id":workflow_id}),
@@ -358,8 +519,10 @@ impl JournalBackend {
             let definition = workflow
                 .versions
                 .get(&selected)
-                .filter(|v| v.published)
-                .ok_or_else(|| invalid("version not published"))?;
+                .ok_or_else(|| invalid("workflow version not found"))?;
+            if !definition.published {
+                return Err(invalid("version not published"));
+            }
             let run_id = id();
             let run = Run {
                 run_id: run_id.clone(),
@@ -432,7 +595,14 @@ impl JournalBackend {
             return Ok(receipt);
         }
         let output =
-            flow_journal::value::store_json(&self.journal, payload, 8 * 1024 * 1024).await?;
+            flow_journal::value::store_json(&self.journal, payload.clone(), 8 * 1024 * 1024)
+                .await?;
+        let adjudicated_output = flow_journal::value::store_json(
+            &self.journal,
+            payload.get("output").cloned().unwrap_or(Value::Null),
+            8 * 1024 * 1024,
+        )
+        .await?;
         self.command(
             &format!("run.signal:{run_id}"),
             request_id,
@@ -442,10 +612,30 @@ impl JournalBackend {
                     .runs
                     .get(run_id)
                     .ok_or_else(|| invalid("run not found"))?;
+                if run.terminal() {
+                    return Err(flow_journal::Error::Conflict("run is terminal; cannot deliver signal".into()));
+                }
                 let node = run
                     .nodes
                     .get(node_id)
                     .ok_or_else(|| invalid("node not waiting"))?;
+                if !run.terminal() && node.wait.as_ref().is_some_and(|w| w.kind == "uncertain") {
+                    let operation = node.operation.as_ref()
+                        .filter(|op| op.outcome.is_none())
+                        .ok_or_else(|| invalid("current uncertain operation required"))?;
+                    let (decision, reason) = match payload["action"].as_str().unwrap_or("succeeded") {
+                        "retry" => ("retry", "manual retry via run.signal"),
+                        "failed" => ("failed", payload["error"].as_str().unwrap_or("manual failure via run.signal")),
+                        "succeeded" => ("accept_output", "manual acceptance via run.signal"),
+                        _ => return Err(invalid("action must be succeeded | failed | retry")),
+                    };
+                    if reason.trim().is_empty() || reason.len() > 4096 {
+                        return Err(invalid("manual resolution requires a reason of at most 4096 bytes"));
+                    }
+                    let event = node_event(run, node_id, EventKind::Adjudicated,
+                        json!({"operation_id":operation.operation_id,"reason":reason,"decision":decision,"output":adjudicated_output}), true);
+                    return Ok((vec![event], json!({"delivered":true,"status":"applied","signal_id":request_id})));
+                }
                 if run.terminal() || node.wait.as_ref().is_none_or(|w| w.kind != "signal") {
                     return Err(invalid("node not waiting for signal"));
                 }
@@ -491,52 +681,7 @@ impl JournalBackend {
             scope,
             request_id,
             &json!({"key":key,"patch":patch}),
-            |state| {
-                let map = if kind == EventKind::ScheduleChanged {
-                    &state.schedules
-                } else {
-                    &state.webhooks
-                };
-                let mut value = map
-                    .get(key)
-                    .cloned()
-                    .unwrap_or_else(|| json!({"created_at":now()}));
-                if !map.contains_key(key) && map.len() >= 1000 {
-                    return Err(flow_journal::Error::Limit(
-                        "maximum 1000 trigger configurations".into(),
-                    ));
-                }
-                let object = patch
-                    .as_object()
-                    .ok_or_else(|| invalid("config must be object"))?;
-                for (k, v) in object {
-                    value[k] = v.clone();
-                }
-                value[if kind == EventKind::ScheduleChanged {
-                    "id"
-                } else {
-                    "token"
-                }] = json!(key);
-                if value["deleted"] != true {
-                    let workflow = value["workflow_id"]
-                        .as_str()
-                        .ok_or_else(|| invalid("workflow_id required"))?;
-                    if !state.workflows.contains_key(workflow) {
-                        return Err(invalid("workflow not found"));
-                    }
-                    if !value["enabled"].is_boolean() {
-                        return Err(invalid("enabled flag required"));
-                    }
-                    if kind == EventKind::ScheduleChanged {
-                        let expr = value["cron_expr"]
-                            .as_str()
-                            .ok_or_else(|| invalid("cron_expr required"))?;
-                        expr.parse::<cron_parser::Schedule>()
-                            .map_err(|e| invalid(e.to_string()))?;
-                    }
-                }
-                Ok((vec![Event::new(kind, value.clone())], value))
-            },
+            |state| trigger_decision(state, kind, key, &patch),
         )
         .await
     }
@@ -557,51 +702,7 @@ impl JournalBackend {
             "template.change",
             request_id,
             &json!({"key":key,"patch":patch}),
-            |state| {
-                let mut value = state
-                    .templates
-                    .get(key)
-                    .cloned()
-                    .unwrap_or_else(|| json!({"created_at":now()}));
-                if !state.templates.contains_key(key) && state.templates.len() >= 1000 {
-                    return Err(flow_journal::Error::Limit("maximum 1000 templates".into()));
-                }
-                let object = patch
-                    .as_object()
-                    .ok_or_else(|| invalid("template patch must be object"))?;
-                for (k, v) in object {
-                    value[k] = v.clone();
-                }
-                value["id"] = json!(key);
-                if value["deleted"] != true {
-                    let name = value["name"]
-                        .as_str()
-                        .ok_or_else(|| invalid("template name required"))?;
-                    if name.is_empty() || name.len() > 1024 {
-                        return Err(invalid("invalid template name"));
-                    }
-                    // name 唯一（UI 以名为键）：撞别的模板即拒绝，不静默改名。
-                    if state
-                        .templates
-                        .values()
-                        .any(|t| t.get("id") != Some(&json!(key)) && t["name"] == value["name"])
-                    {
-                        return Err(flow_journal::Error::Conflict(
-                            "template name already taken".into(),
-                        ));
-                    }
-                    for field in ["nodes", "edges"] {
-                        if !value[field].is_array() {
-                            return Err(invalid(format!("template {field} must be an array")));
-                        }
-                    }
-                    value["updated_at"] = json!(now());
-                }
-                Ok((
-                    vec![Event::new(EventKind::TemplateChanged, value.clone())],
-                    value,
-                ))
-            },
+            |state| template_decision(state, key, &patch),
         )
         .await
     }
@@ -626,4 +727,106 @@ pub(crate) fn node_event(
         event.run_seq = run.last_run_seq + 1;
     }
     event
+}
+
+fn trigger_decision(
+    state: &State,
+    kind: EventKind,
+    key: &str,
+    patch: &Value,
+) -> flow_journal::Result<(Vec<Event>, Value)> {
+    let map = if kind == EventKind::ScheduleChanged {
+        &state.schedules
+    } else {
+        &state.webhooks
+    };
+    let mut value = map
+        .get(key)
+        .cloned()
+        .unwrap_or_else(|| json!({"created_at":now()}));
+    if !map.contains_key(key) && map.len() >= 1000 {
+        return Err(flow_journal::Error::Limit(
+            "maximum 1000 trigger configurations".into(),
+        ));
+    }
+    let object = patch
+        .as_object()
+        .ok_or_else(|| invalid("config must be object"))?;
+    for (k, v) in object {
+        value[k] = v.clone();
+    }
+    value[if kind == EventKind::ScheduleChanged {
+        "id"
+    } else {
+        "token"
+    }] = json!(key);
+    if value["deleted"] != true {
+        let workflow = value["workflow_id"]
+            .as_str()
+            .ok_or_else(|| invalid("workflow_id required"))?;
+        if !state.workflows.contains_key(workflow) {
+            return Err(invalid("workflow not found"));
+        }
+        if !value["enabled"].is_boolean() {
+            return Err(invalid("enabled flag required"));
+        }
+        if kind == EventKind::ScheduleChanged {
+            let expr = value["cron_expr"]
+                .as_str()
+                .ok_or_else(|| invalid("cron_expr required"))?;
+            expr.parse::<cron_parser::Schedule>()
+                .map_err(|e| invalid(e.to_string()))?;
+        }
+    }
+    Ok((vec![Event::new(kind, value.clone())], value))
+}
+
+fn template_decision(
+    state: &State,
+    key: &str,
+    patch: &Value,
+) -> flow_journal::Result<(Vec<Event>, Value)> {
+    let mut value = state
+        .templates
+        .get(key)
+        .cloned()
+        .unwrap_or_else(|| json!({"created_at":now()}));
+    if !state.templates.contains_key(key) && state.templates.len() >= 1000 {
+        return Err(flow_journal::Error::Limit("maximum 1000 templates".into()));
+    }
+    let object = patch
+        .as_object()
+        .ok_or_else(|| invalid("template patch must be object"))?;
+    for (k, v) in object {
+        value[k] = v.clone();
+    }
+    value["id"] = json!(key);
+    if value["deleted"] != true {
+        let name = value["name"]
+            .as_str()
+            .ok_or_else(|| invalid("template name required"))?;
+        if name.is_empty() || name.len() > 1024 {
+            return Err(invalid("invalid template name"));
+        }
+        // name 唯一（UI 以名为键）：撞别的模板即拒绝，不静默改名。
+        if state
+            .templates
+            .values()
+            .any(|t| t.get("id") != Some(&json!(key)) && t["name"] == value["name"])
+        {
+            return Err(flow_journal::Error::Conflict(
+                "template name already taken".into(),
+            ));
+        }
+        for field in ["nodes", "edges"] {
+            if !value[field].is_array() {
+                return Err(invalid(format!("template {field} must be an array")));
+            }
+        }
+        value["updated_at"] = json!(now());
+    }
+    Ok((
+        vec![Event::new(EventKind::TemplateChanged, value.clone())],
+        value,
+    ))
 }

@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 
 /// 轮询 run.timeline 直到某节点进入预期状态（用于「运行中等待」这类非终态观测）。
 async fn wait_node_state(
-    client: &backend_e2e::common::Client,
+    client: &backend_e2e::common::Conn,
     run_id: &str,
     node_id: &str,
     state: &str,
@@ -53,12 +53,8 @@ e2e_test!(
         assert_eq!(run["run"]["workflow_version"], json!(version));
         assert_eq!(run["run"]["input"], json!({ "n": 21 }));
         assert!(run["run"]["started_at"].is_string());
-        if ctx.is_journal() {
-            // journal 无墙钟：ended_at 不编造（权威时间是 LSN/run_seq）
-            assert!(run["run"]["ended_at"].is_null());
-        } else {
-            assert!(run["run"]["ended_at"].is_string());
-        }
+        // journal 无墙钟：ended_at 不编造（权威时间是 LSN/run_seq）
+        assert!(run["run"]["ended_at"].is_null());
         assert!(run["run"]["error"].is_null());
         assert_eq!(run["live"], json!(false));
 
@@ -90,23 +86,17 @@ e2e_test!(
         for node in timeline["nodes"].as_array().unwrap() {
             assert_eq!(node["state"], json!("completed"));
             assert_eq!(node["attempts"], json!(1));
-            if ctx.is_journal() {
-                // journal 无墙钟：节点计时三件套不编造
-                assert!(node["started_at"].is_null());
-                assert!(node["ended_at"].is_null());
-                assert!(node["duration_ms"].is_null());
-            } else {
-                assert!(node["started_at"].is_string());
-                assert!(node["ended_at"].is_string());
-                assert!(node["duration_ms"].is_i64());
-            }
+            // journal 无墙钟：节点计时三件套不编造
+            assert!(node["started_at"].is_null());
+            assert!(node["ended_at"].is_null());
+            assert!(node["duration_ms"].is_null());
             assert!(node.get("child_run_id").is_some(), "字段面齐全");
         }
         assert_eq!(timeline_node(&timeline, "n1")["output"], json!("ok"));
         assert_eq!(timeline["workflow_id"], json!(workflow_id));
 
         // last_seq 与事件日志条数一致
-        let events: Value = call_json(&client, "run.events", json!({"run_id": run_id})).await;
+        let events: Value = call_json(&client, "run.events.full", json!({"run_id": run_id})).await;
         let events = events["events"].as_array().unwrap();
         assert_eq!(timeline["last_seq"].as_u64().unwrap(), events.len() as u64);
     })
@@ -119,7 +109,7 @@ e2e_test!(multi_end_output_is_mapped_by_node_id, |ctx: &mut Ctx| {
         let run_id = start_run(&client, &workflow_id, json!({})).await;
         wait_run_terminal(&client, &run_id, TIMEOUT).await;
 
-        let run = call_json(&client, "run.get", json!({"run_id": run_id})).await;
+        let run = call_json(&client, "run.get.full", json!({"run_id": run_id})).await;
         // 多 end：{node_id: output} 映射（§6.3）
         assert_eq!(
             run["run"]["output"],
@@ -141,7 +131,7 @@ e2e_test!(
         let run_id = start_run(&client, &workflow_id, json!({})).await;
         wait_run_terminal(&client, &run_id, TIMEOUT).await;
 
-        let run = call_json(&client, "run.get", json!({"run_id": run_id})).await;
+        let run = call_json(&client, "run.get.full", json!({"run_id": run_id})).await;
         // end 有两个前驱：输出为 {pred_id: output}
         assert_eq!(run["run"]["output"], json!({ "s1": "a", "s2": "b" }));
 
@@ -271,7 +261,7 @@ e2e_test!(
         let (workflow_id, _) = publish_workflow(&client, "深层执行", skip_chain_def("false")).await;
         let run_id = start_run(&client, &workflow_id, json!({ "seed": 2 })).await;
         let timeline = wait_node_state(&client, &run_id, "h", "running", SHORT).await;
-        let waiting = call_json(&client, "run.get", json!({"run_id": run_id})).await;
+        let waiting = call_json(&client, "run.get.full", json!({"run_id": run_id})).await;
         assert_eq!(waiting["run"]["status"], json!("running"), "{waiting}");
         assert_eq!(waiting["live"], json!(true));
         assert_eq!(timeline_node(&timeline, "d")["state"], json!("completed"));
@@ -307,22 +297,21 @@ e2e_test!(delay_node_waits_full_duration, |ctx: &mut Ctx| Box::pin(
     async move {
         let client = ctx.client().await;
         let (workflow_id, _) = publish_workflow(&client, "等待", delay_def(400)).await;
+        let started = std::time::Instant::now();
         let run_id = start_run(&client, &workflow_id, json!({})).await;
         wait_run_terminal(&client, &run_id, SHORT).await;
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(350),
+            "delay 至少等待配置时长"
+        );
 
         let timeline: Value = call_json(&client, "run.timeline", json!({"run_id": run_id})).await;
-        if !ctx.is_journal() {
-            // journal 无墙钟：duration 不编造；等待时长语义由输出 slept_ms 钉住
-            let duration = timeline_node(&timeline, "d")["duration_ms"]
-                .as_i64()
-                .unwrap();
-            assert!(duration >= 350, "delay 至少等满时长，实测 {duration}ms");
-        }
+
         assert_eq!(
             timeline_node(&timeline, "d")["output"],
             json!({ "slept_ms": 400 })
         );
-        let run = call_json(&client, "run.get", json!({"run_id": run_id})).await;
+        let run = call_json(&client, "run.get.full", json!({"run_id": run_id})).await;
         assert_eq!(run["run"]["output"], json!({ "slept_ms": 400 }));
     }
 ));
@@ -394,7 +383,7 @@ e2e_test!(
             json!("upstream_failed")
         );
 
-        let events: Value = call_json(&client, "run.events", json!({"run_id": run_id})).await;
+        let events: Value = call_json(&client, "run.events.full", json!({"run_id": run_id})).await;
         let failed = events["events"]
             .as_array()
             .unwrap()
@@ -428,16 +417,12 @@ e2e_test!(
         let attempts = timeline_node(&timeline, "boom")["attempts"]
             .as_i64()
             .unwrap();
-        if ctx.is_journal() {
-            // v2 语义差异（SQLITE_V1_TO_V2_MIGRATION §3）：纯计算节点的失败
-            // 按策略自动重试（JS 求值是纯计算），重试耗尽才 fatal。
-            assert!(
-                attempts >= 1,
-                "journal 对纯计算失败按策略重试后 fatal，实测 {attempts} 次"
-            );
-        } else {
-            assert_eq!(attempts, 1, "NodeFailure.retryable=false 时引擎不重试");
-        }
+        // v2 语义差异（SQLITE_V1_TO_V2_MIGRATION §3）：纯计算节点的失败
+        // 按策略自动重试（JS 求值是纯计算），重试耗尽才 fatal。
+        assert!(
+            attempts >= 1,
+            "journal 对纯计算失败按策略重试后 fatal，实测 {attempts} 次"
+        );
     })
 );
 
@@ -506,7 +491,7 @@ e2e_test!(run_list_filters_and_cursor_pagination, |ctx: &mut Ctx| {
         wait_run_terminal(&client, &other_run, SHORT).await;
 
         // 全量：新的在前
-        let all: Value = call_json(&client, "run.list", json!({})).await;
+        let all: Value = call_json(&client, "run.list.full", json!({})).await;
         let all = all["runs"].as_array().unwrap();
         assert_eq!(all.len(), 4, "{all:?}");
         assert_eq!(
@@ -518,7 +503,7 @@ e2e_test!(run_list_filters_and_cursor_pagination, |ctx: &mut Ctx| {
         // workflow 过滤
         let filtered: Value = call_json(
             &client,
-            "run.list",
+            "run.list.full",
             json!({"workflow_id": workflow_id, "status": "succeeded"}),
         )
         .await;
@@ -529,7 +514,7 @@ e2e_test!(run_list_filters_and_cursor_pagination, |ctx: &mut Ctx| {
         // 另一个 workflow 的 run 不过滤出来
         let none: Value = call_json(
             &client,
-            "run.list",
+            "run.list.full",
             json!({"workflow_id": workflow_id, "status": "failed"}),
         )
         .await;
@@ -543,7 +528,7 @@ e2e_test!(run_list_filters_and_cursor_pagination, |ctx: &mut Ctx| {
             if let Some(cursor) = &cursor {
                 params["before_run_id"] = json!(cursor);
             }
-            let page: Value = call_json(&client, "run.list", params).await;
+            let page: Value = call_json(&client, "run.list.full", params).await;
             let page = page["runs"].as_array().unwrap().clone();
             if page.is_empty() {
                 break;
@@ -558,7 +543,7 @@ e2e_test!(run_list_filters_and_cursor_pagination, |ctx: &mut Ctx| {
         );
 
         // limit 夹取：0 → 1，999 → 500
-        let clamped: Value = call_json(&client, "run.list", json!({"limit": 0})).await;
+        let clamped: Value = call_json(&client, "run.list.full", json!({"limit": 0})).await;
         assert_eq!(clamped["runs"].as_array().unwrap().len(), 1);
     })
 });
@@ -566,8 +551,8 @@ e2e_test!(run_list_filters_and_cursor_pagination, |ctx: &mut Ctx| {
 e2e_test!(run_list_rejects_invalid_status_filter, |ctx: &mut Ctx| {
     Box::pin(async move {
         let client = ctx.client().await;
-        let err = call_err(&client, "run.list", json!({"status": "bogus"})).await;
-        assert_eq!(err.code(), -32010, "status 过滤词必须在状态词汇表内：{err}");
+        let err = call_err(&client, "run.list.full", json!({"status": "bogus"})).await;
+        assert_eq!(err.code(), -32602, "status 过滤词必须在状态词汇表内：{err}");
         // 词汇表内的值不被拒
         for status in [
             "initializing",
@@ -577,7 +562,7 @@ e2e_test!(run_list_rejects_invalid_status_filter, |ctx: &mut Ctx| {
             "failed",
             "cancelled",
         ] {
-            let _: Value = call(&client, "run.list", json!({"status": status})).await;
+            let _: Value = call(&client, "run.list.full", json!({"status": status})).await;
         }
     })
 });
@@ -590,7 +575,7 @@ e2e_test!(
         let run_id = start_run(&client, &workflow_id, json!({ "tag": "t" })).await;
         wait_run_terminal(&client, &run_id, TIMEOUT).await;
 
-        let events: Value = call_json(&client, "run.events", json!({"run_id": run_id})).await;
+        let events: Value = call_json(&client, "run.events.full", json!({"run_id": run_id})).await;
         let events = events["events"].as_array().unwrap();
         assert!(events.len() >= 5, "至少 5 条事件：{events:?}");
         for (index, envelope) in events.iter().enumerate() {
@@ -611,7 +596,7 @@ e2e_test!(
         // from_seq 增量拉取
         let tail: Value = call_json(
             &client,
-            "run.events",
+            "run.events.full",
             json!({"run_id": run_id, "from_seq": 2}),
         )
         .await;
@@ -626,14 +611,14 @@ e2e_test!(
         // 越过末尾：空列表
         let beyond: Value = call_json(
             &client,
-            "run.events",
+            "run.events.full",
             json!({"run_id": run_id, "from_seq": 9999}),
         )
         .await;
         assert_eq!(beyond["events"].as_array().unwrap().len(), 0);
 
         // run 不存在：-32011
-        let err = call_err(&client, "run.events", json!({"run_id": "nope"})).await;
+        let err = call_err(&client, "run.events.full", json!({"run_id": "nope"})).await;
         assert_eq!(err.code(), -32011, "{err}");
     })
 );
@@ -642,7 +627,7 @@ e2e_test!(
     run_get_unknown_is_not_found_and_timeline_requires_run,
     |ctx: &mut Ctx| Box::pin(async move {
         let client = ctx.client().await;
-        let err = call_err(&client, "run.get", json!({"run_id": "nope"})).await;
+        let err = call_err(&client, "run.get.full", json!({"run_id": "nope"})).await;
         assert_eq!(err.code(), -32011, "{err}");
         let err = call_err(&client, "run.timeline", json!({"run_id": "nope"})).await;
         assert_eq!(err.code(), -32011, "{err}");
@@ -683,34 +668,25 @@ e2e_test!(
             "run.get 与 run.timeline 的 output 必须同值"
         );
 
-        // 事件流里有 node_log：console.log→stdout/info，console.error→stderr/error
-        // （journal 的观测走 ObservationStore，不进事件流——已知差异，跳过）
-        let events: Value = call_json(&client, "run.events", json!({"run_id": run_id})).await;
+        // V2 日志走独立观测面，不占用权威事件序号。
+        let observations =
+            call_json(&client, "run.observations.page", json!({"run_id": run_id})).await;
+        let logs = observations["records"].as_array().unwrap();
+        assert!(logs
+            .iter()
+            .any(|log| log["line"]["stream"] == json!("stdout")
+                && log["line"]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("hi from script")));
+        assert!(logs
+            .iter()
+            .any(|log| log["line"]["stream"] == json!("stderr")
+                && log["line"]["level"] == json!("error")));
+        let events: Value = call_json(&client, "run.events.full", json!({"run_id": run_id})).await;
         let events = events["events"].as_array().unwrap();
-        if !ctx.is_journal() {
-            let stdout_log = events.iter().find(|e| {
-                e["type"] == json!("node_log")
-                    && e["stream"] == json!("stdout")
-                    && e["message"]
-                        .as_str()
-                        .unwrap_or("")
-                        .contains("hi from script")
-            });
-            assert!(stdout_log.is_some(), "console.log 必须进事件流：{events:?}");
-            let stderr_log = events.iter().find(|e| {
-                e["type"] == json!("node_log")
-                    && e["stream"] == json!("stderr")
-                    && e["level"] == json!("error")
-            });
-            assert!(
-                stderr_log.is_some(),
-                "console.error 必须以 error 级进事件流"
-            );
-            let log = stdout_log.unwrap();
-            assert_eq!(log["node_id"], json!("n1"));
-            assert_eq!(log["attempt"], json!(1));
-        }
-        // seq 连续性覆盖日志行：全量事件 seq 严格 1..N
+
+        // 全量物化事件 seq 严格 1..N。
         for (index, event) in events.iter().enumerate() {
             assert_eq!(event["seq"], json!(index as u64 + 1));
         }

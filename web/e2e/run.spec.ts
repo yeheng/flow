@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { rpc, seedWorkflow, uniq, waitTerminal } from "./helpers";
+import { E2E_TOKEN } from "./config";
 
 test("运行链路：点运行 → RunPanel 终态 → 列表来源=手动 → 详情页时间线", async ({ page }) => {
   const name = uniq("e2e-运行");
@@ -37,9 +38,7 @@ test("运行链路：点运行 → RunPanel 终态 → 列表来源=手动 → �
   expect(await waitTerminal(runId)).toBe("succeeded");
 });
 
-test("可观察性：日志页签实时显示 console 输出，节点检查器展示输入面/输出/脱敏", async ({
-  page,
-}) => {
+test("可观察性：Journal 观测日志与节点检查器展示输入面/输出/脱敏", async ({ page }) => {
   const name = uniq("e2e-可观察");
   const { workflow_id } = await rpc<{ workflow_id: string }>("workflow.create", { name });
   const { version } = await rpc<{ version: number }>("workflow.update", {
@@ -70,23 +69,14 @@ test("可观察性：日志页签实时显示 console 输出，节点检查器�
     workflow_id,
     input: { n: 7 },
   });
+  expect(await waitTerminal(runId)).toBe("succeeded");
   await page.goto(`/runs/${runId}`);
   await expect(page.locator(".run-header .badge").first()).toContainText("成功", {
     timeout: 15_000,
   });
 
-  // 日志页签：历史日志来自订阅回放（seq=1 起完整重放），终态 run 也能看到
-  await page.locator(".aside-tab", { hasText: "日志" }).click();
-  await expect(page.locator(".log-list")).toContainText("hello e2e");
-  await expect(page.locator(".log-list")).toContainText("boom e2e");
-  await expect(page.locator(".log-list .log-error")).toHaveCount(1);
-  // stdout/stderr 来源徽章
-  await expect(page.locator(".log-list .log-row", { hasText: "hello e2e" })).toContainText(
-    "stdout",
-  );
-
-  // 节点检查器：点日志行的节点标签 → 输入面（模板展开 + 脱敏）与输出
-  await page.locator(".log-list .log-row", { hasText: "hello e2e" }).locator(".log-node").click();
+  // V2 将 console 输出写入独立观测存储，节点检查器从运行画布打开。
+  await page.locator('.vue-flow__node[data-id="n"]').click();
   const inspector = page.locator(".inspector");
   await expect(inspector).toBeVisible();
   await expect(inspector).toContainText("输入面（模板展开后）");
@@ -96,9 +86,26 @@ test("可观察性：日志页签实时显示 console 输出，节点检查器�
   await expect(inspector).toContainText("输出");
   await expect(inspector).toContainText("ok");
 
-  // 日志的节点过滤：选择节点后只剩该节点的行
-  await page.locator(".log-node-select").selectOption("n");
-  await expect(page.locator(".log-list .log-row")).toHaveCount(2);
+  // 真实 /journal 客户端以原生 V2 格式订阅，并显示独立观测日志。
+  await page.goto("/journal");
+  const inputs = page.locator(".connect-bar input");
+  await inputs.nth(0).fill("ws://127.0.0.1:19311");
+  await inputs.nth(1).fill("http://127.0.0.1:19312");
+  await inputs.nth(2).fill(E2E_TOKEN);
+  await page.getByRole("button", { name: "连接", exact: true }).click();
+  const journalName = uniq("e2e-Journal回执");
+  await page.getByPlaceholder("新工作流名称").fill(journalName);
+  await page.getByRole("button", { name: "新建", exact: true }).click();
+  await expect(page.locator(".journal-status")).toHaveText("已提交并可见");
+  await expect(page.locator(".journal-side select option:checked")).toHaveText(journalName);
+  const runRow = page.locator("tr").filter({ has: page.locator(`td[title="${runId}"]`) });
+  await runRow.getByRole("button", { name: "监控", exact: true }).click();
+  const observations = page.locator(".journal-detail .journal-log").last();
+  await expect(observations).toContainText("hello e2e");
+  await expect(observations).toContainText("boom e2e");
+  await expect(observations.locator(".log-error")).toHaveCount(1);
+  await observations.locator(".log-search").fill("hello e2e");
+  await expect(observations.locator(".log-row")).toHaveCount(1);
 });
 
 /**
@@ -148,12 +155,8 @@ test("可观察性：运行中收到的 node_completed 也走展示脱敏", asyn
   // 等后端到终态（头部徽章是 run.get 的一次性快照，不随订阅更新；等它没用）
   expect(await waitTerminal(runId)).toBe("succeeded");
 
-  // 从日志行点节点标签打开检查器（这条路径不依赖画布选中的工作流）
-  await page.locator(".aside-tab", { hasText: "日志" }).click();
-  await page
-    .locator(".log-list .log-row", { hasText: "late node done" })
-    .locator(".log-node")
-    .click();
+  // 画布节点打开检查器，保留实时 node_completed 的脱敏断言。
+  await page.locator('.vue-flow__node[data-id="n"]').click();
   const inspector = page.locator(".inspector");
   await expect(inspector).toBeVisible();
   await expect(inspector).toContainText("输出");

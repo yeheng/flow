@@ -7,11 +7,11 @@
 
 use std::time::Instant;
 
-use backend_e2e::common::{call_json, publish_workflow, subscribe, Ctx};
+use backend_e2e::common::{call_json, publish_workflow, Ctx};
 use serde_json::{json, Value};
 
 use crate::harness::{
-    chain_def, collect_arrivals, error_digest, start_runs_measured, unique_name, Marks, SETTLE,
+    chain_def, collect_arrivals, error_digest, start_runs_measured, unique_name, Marks,
 };
 use crate::opts::Opts;
 use crate::report::{Latency, Report};
@@ -19,11 +19,11 @@ use crate::report::{Latency, Report};
 /// 读路径压的定义：3 层脚本链（每 run 5 个事件左右）。
 const READ_CHAIN_DEPTH: usize = 3;
 const METHODS: [&str; 5] = [
-    "run.get",
-    "run.list",
+    "run.get.full",
+    "run.list.full",
     "run.stats",
     "run.timeline",
-    "run.events",
+    "run.events.full",
 ];
 
 pub async fn run(ctx: &mut Ctx, opts: &Opts) -> Vec<Report> {
@@ -36,15 +36,12 @@ pub async fn run(ctx: &mut Ctx, opts: &Opts) -> Vec<Report> {
     .await;
 
     // 预置：prefill 个 run 全部走到终态，读路径要压在「有数据」的索引上。
-    let sub_client = ctx.client().await;
-    let mut sub = subscribe(&sub_client, None).await;
-    tokio::time::sleep(SETTLE).await;
     let input = json!({ "x": 1 });
     let timeout = std::time::Duration::from_secs(opts.prefill as u64 / 2 + 60);
     let marks = Marks::starting(opts.prefill, opts.concurrency);
     let (_, arrivals) = tokio::join!(
         start_runs_measured(&client, &workflow_id, &input, &marks, timeout),
-        collect_arrivals(&mut sub, &marks, opts.prefill, timeout),
+        collect_arrivals(&client, &marks, opts.prefill, timeout),
     );
     let started = marks.len();
     let submit_errors = marks.error_count();
@@ -63,7 +60,7 @@ pub async fn run(ctx: &mut Ctx, opts: &Opts) -> Vec<Report> {
         let run_id = &run_ids[index % run_ids.len()];
         for (method, latency) in latencies.iter_mut() {
             let params = match *method {
-                "run.list" => json!({ "limit": 50 }),
+                "run.list.full" => json!({ "limit": 50 }),
                 "run.stats" => json!({}),
                 _ => json!({ "run_id": run_id }),
             };
@@ -78,7 +75,7 @@ pub async fn run(ctx: &mut Ctx, opts: &Opts) -> Vec<Report> {
         .map(|(method, latency)| latency.stats(&metric_name(method)))
         .collect();
     vec![Report::new(
-        ctx.kind.name(),
+        "journal",
         "rpc_read",
         json!({
             "prefill_runs": opts.prefill,

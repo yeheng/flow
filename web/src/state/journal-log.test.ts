@@ -2,6 +2,22 @@ import { describe, expect, it } from "vitest";
 import { summarizeJournalRecord } from "./journal-log";
 
 describe("summarizeJournalRecord", () => {
+  it("原生 Observation 使用 line 内的级别与正文", () => {
+    const row = summarizeJournalRecord(
+      {
+        seq: "9",
+        run_id: "run",
+        dispatch_id: "dispatch",
+        ts: "2026-10-09T02:00:00Z",
+        line: { node_id: "script", attempt: 1, level: "error", stream: "stderr", message: "boom" },
+      },
+      0,
+    );
+    expect(row.label).toBe("error");
+    expect(row.level).toBe("log-error");
+    expect(row.text).toBe("boom");
+    expect(row.meta).toContain("seq 9 · script");
+  });
   it("识别 JournalEvent 结构：kind 作标签、run_seq 作 meta、payload 作摘要", () => {
     const row = summarizeJournalRecord(
       {

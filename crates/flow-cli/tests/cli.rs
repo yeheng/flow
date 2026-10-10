@@ -14,8 +14,7 @@ use std::process::Output;
 use std::time::Duration;
 
 use flow_backend::journal::JournalBackend;
-use flow_backend::AnyBackend;
-use flow_rpc::{serve, AppState};
+const TOKEN: &str = "flow-cli-test-token-at-least-32-bytes";
 use flow_test_support::io::TempDir;
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
@@ -26,7 +25,7 @@ const CLI_TIMEOUT: Duration = Duration::from_secs(30);
 /// 一个独占临时目录，Drop 时整体删除。
 /// 只删自己建的目录，不碰系统临时目录本身（DESIGN.md §13）。
 ///
-/// 进程内的 flow-server（随机端口）。持有 handle 即持有服务实例。
+/// 进程内的 flow-journal-server（随机端口）。持有 handle 即持有服务实例。
 struct TestServer {
     addr: SocketAddr,
     _scratch: TempDir,
@@ -42,11 +41,13 @@ impl TestServer {
         flow_backend::start_execution(&flow_config::ExecutionConfig::default(), &backend)
             .await
             .expect("启动执行驱动失败");
-        let backend = AnyBackend::Journal(backend);
-        let state = std::sync::Arc::new(AppState::new(backend));
-        let (handle, addr) = serve(state, SocketAddr::from(([127, 0, 0, 1], 0)))
-            .await
-            .expect("启动 RPC 服务失败");
+        let (handle, addr) = flow_rpc::journal_v2::serve(
+            backend,
+            TOKEN.to_owned(),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .await
+        .expect("启动 RPC 服务失败");
         TestServer {
             addr,
             _scratch: scratch,
@@ -80,7 +81,8 @@ async fn cli(server: &TestServer, args: &[&str]) -> (i32, String, String) {
 
 async fn run_cli(server: &TestServer, args: &[&str]) -> Output {
     tokio::time::timeout(CLI_TIMEOUT, async {
-        Command::new(flow_test_support::io::cli_bin())
+        Command::new(env!("CARGO_BIN_EXE_flow-cli"))
+            .env("FLOW_JOURNAL_TOKEN", TOKEN)
             .args(args)
             .env("FLOW_RPC", server.url())
             // 隔离父进程环境：--url / FLOW_RPC 的默认值行为由专门用例覆盖
@@ -332,7 +334,7 @@ async fn unknown_workflow_exits_two_with_rpc_code() {
     let server = TestServer::spawn().await;
     let (code, _, stderr) = cli(&server, &["run", "start", "no-such-workflow"]).await;
     assert_eq!(code, 2, "{stderr}");
-    assert!(stderr.contains("服务端错误 code -32010"), "{stderr}");
+    assert!(stderr.contains("服务端错误 code -32011"), "{stderr}");
 }
 
 #[tokio::test]
@@ -381,7 +383,7 @@ async fn invalid_definition_is_rejected_by_server_validation() {
     );
     let (code, _, stderr) = cli(&server, &["workflow", "import", file.to_str().unwrap()]).await;
     assert_eq!(code, 2, "{stderr}");
-    assert!(stderr.contains("code -32010"), "{stderr}");
+    assert!(stderr.contains("code -32602"), "{stderr}");
     // 失败不回滚：create 是已发生的副作用，留下一个没有版本的壳，
     // 且不会被当成可执行工作流（latest 0 / published null）
     let (code, stdout, _) = cli(&server, &["workflow", "list", "--json"]).await;
@@ -434,7 +436,8 @@ async fn url_flag_overrides_env() {
     let server = TestServer::spawn().await;
     // FLOW_RPC 给一个死地址，--url 指活地址：命令行必须赢
     let output = tokio::time::timeout(CLI_TIMEOUT, async {
-        Command::new(flow_test_support::io::cli_bin())
+        Command::new(env!("CARGO_BIN_EXE_flow-cli"))
+            .env("FLOW_JOURNAL_TOKEN", TOKEN)
             .args(["workflow", "list", "--url", &server.url()])
             .env("FLOW_RPC", "ws://127.0.0.1:9")
             .output()
@@ -450,7 +453,8 @@ async fn url_flag_overrides_env() {
 async fn unreachable_server_is_a_local_error_with_hint() {
     // 不起服务：错误必须是 exit 1 + 提示起服务，而不是难懂的传输层堆栈
     let output = tokio::time::timeout(CLI_TIMEOUT, async {
-        Command::new(flow_test_support::io::cli_bin())
+        Command::new(env!("CARGO_BIN_EXE_flow-cli"))
+            .env("FLOW_JOURNAL_TOKEN", TOKEN)
             .args(["workflow", "list", "--url", "ws://127.0.0.1:9"])
             .output()
             .await
@@ -460,8 +464,8 @@ async fn unreachable_server_is_a_local_error_with_hint() {
     .expect("flow-cli 超时");
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("连不上 flow-server"), "{stderr}");
-    assert!(stderr.contains("flow-server"), "{stderr}");
+    assert!(stderr.contains("连不上 flow-journal-server"), "{stderr}");
+    assert!(stderr.contains("flow-journal-server"), "{stderr}");
 }
 
 #[tokio::test]
@@ -534,7 +538,8 @@ async fn input_forms_inline_file_and_stdin_agree() {
 
     // '-' 读标准输入
     let mut child = tokio::time::timeout(CLI_TIMEOUT, async {
-        Command::new(flow_test_support::io::cli_bin())
+        Command::new(env!("CARGO_BIN_EXE_flow-cli"))
+            .env("FLOW_JOURNAL_TOKEN", TOKEN)
             .args(["run", "start", "cli-demo", "--input", "-"])
             .env("FLOW_RPC", server.url())
             .stdin(std::process::Stdio::piped())

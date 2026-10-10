@@ -15,41 +15,21 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 e2e_test!(
-    subscribe_global_stream_delivers_events_in_order,
+    subscribe_replay_matches_event_log,
     |ctx: &mut Ctx| Box::pin(async move {
         let client = ctx.client().await;
-        let (workflow_id, _) = publish_workflow(&client, "订阅", linear_def("return 'hi';")).await;
-
-        // 先订阅（全局，无 run_id 过滤）再启动 run：实时增量路径。
-        // 订阅建立是异步的（服务端 receiver 注册略晚于 RPC 返回），全局流是
-        // 「纯实时增量」——注册前的事件不在流里，客户端按 from_seq 用 run.events
-        // 补齐（§9 订阅契约）。这里等一小会让接收端就位，仍按「日志尾部的
-        // 连续后缀」断言，不假设必然从 seq 1 开始。
-        let mut sub = subscribe(&client, None).await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let run_id = start_run(&client, &workflow_id, json!({})).await;
-
-        let streamed = collect_run_events(&mut sub, &run_id, TIMEOUT).await;
-        assert!(
-            streamed.len() >= 5,
-            "至少收到 node_*/run_completed：{streamed:?}"
-        );
-        assert_eq!(streamed.last().unwrap()["type"], json!("run_completed"));
-
-        // 与事件日志对齐：收到的必须是日志尾部的一段连续后缀（不丢中间、不重）
-        let events: Value = call_json(&client, "run.events", json!({"run_id": run_id})).await;
-        let events = events["events"].as_array().unwrap();
-        let first_seq = streamed.first().unwrap()["seq"].as_u64().unwrap();
-        assert!(
-            first_seq >= 1 && first_seq <= events.len() as u64,
-            "流必须接在日志上：首条 seq {first_seq}，日志 {} 条",
-            events.len()
-        );
-        for (index, streamed_event) in streamed.iter().enumerate() {
-            let logged = &events[first_seq as usize - 1 + index];
-            assert_eq!(streamed_event["seq"], logged["seq"]);
-            assert_eq!(streamed_event["type"], logged["type"]);
+        let (workflow, _) = publish_workflow(&client, "订阅", linear_def("return 'hi';")).await;
+        let run = start_run(&client, &workflow, json!({})).await;
+        wait_run_terminal(&client, &run, TIMEOUT).await;
+        let mut sub = subscribe(&client, &run).await;
+        let streamed = collect_run_events(&mut sub, &run, TIMEOUT).await;
+        let logged = call_json(&client, "run.events.full", json!({"run_id":run})).await;
+        assert_eq!(streamed.len(), logged["events"].as_array().unwrap().len());
+        for (event, logged) in streamed.iter().zip(logged["events"].as_array().unwrap()) {
+            assert_eq!(event["seq"], logged["seq"]);
+            assert_eq!(event["type"], logged["type"]);
         }
+        assert_eq!(streamed.last().unwrap()["type"], "run_completed");
     })
 );
 
@@ -67,9 +47,9 @@ e2e_test!(
 
         // journal 的 seq 是 v2 权威序号：等待注册等事实占用序号但不出现在
         // v1 事件面（映射后允许空洞）；timeline.last_seq 是折影水位 ≥ 事件数。
-        let allow_gaps = ctx.is_journal();
+        let allow_gaps = true;
         // 中途订阅：先回放完整历史，再接实时增量
-        let mut sub = subscribe(&client, Some(run_id.clone())).await;
+        let mut sub = subscribe(&client, &run_id).await;
         let mut seqs: Vec<u64> = Vec::new();
         let deadline = tokio::time::Instant::now() + SHORT;
         // 回放段终点：有空洞时以「水位内的最大已映射序号」为准（WaitRegistered
@@ -149,7 +129,7 @@ e2e_test!(subscribe_unknown_run_ends_immediately, |ctx: &mut Ctx| {
         let client = ctx.client().await;
         // run 不存在：流立即结束（不是报错、不是永久重试）——wire 上可观测为
         // 「订阅建立后没有任何事件，也不报错」
-        let mut sub = subscribe(&client, Some(format!("missing-{}", uuid::Uuid::now_v7()))).await;
+        let mut sub = subscribe(&client, &format!("missing-{}", uuid::Uuid::now_v7())).await;
         let nothing = tokio::time::timeout(Duration::from_secs(3), sub.next()).await;
         assert!(
             nothing.is_err(),
@@ -161,97 +141,35 @@ e2e_test!(subscribe_unknown_run_ends_immediately, |ctx: &mut Ctx| {
         // 不是「订阅整体坏掉」
         let (workflow_id, _) = publish_workflow(&client, "对照", delay_def(30)).await;
         let run_id = start_run(&client, &workflow_id, json!({})).await;
-        let mut sub = subscribe(&client, Some(run_id.clone())).await;
+        let mut sub = subscribe(&client, &run_id).await;
         let streamed = collect_run_events(&mut sub, &run_id, SHORT).await;
         assert!(!streamed.is_empty(), "真实 run 的订阅必须收到事件");
         wait_run_terminal(&client, &run_id, SHORT).await;
     })
 });
 
-e2e_test!(
-    subscribe_global_receives_events_of_all_runs,
-    |ctx: &mut Ctx| Box::pin(async move {
+e2e_test!(subscriptions_isolate_runs, |ctx: &mut Ctx| Box::pin(
+    async move {
         let client = ctx.client().await;
-        let (first, _) = publish_workflow(&client, "流甲", linear_def("return 1;")).await;
-        let (second, _) = publish_workflow(&client, "流乙", linear_def("return 2;")).await;
-
-        let mut sub = subscribe(&client, None).await;
-        // 等订阅处理器完成 broadcast 接收端注册（accept 与注册之间有一个异步
-        // 间隙；pg 的 NOTIFY 唤醒会让这个间隙里的事件直接错过——全局流本就是
-        // 纯实时增量，间隙里的事件按契约用 run.events 补齐）
-        // A canary observed on this exact subscription proves the receiver is registered.
-        let canary_deadline = tokio::time::Instant::now() + TIMEOUT;
-        loop {
-            let canary = start_run(&client, &first, json!({})).await;
-            if tokio::time::timeout(Duration::from_millis(200), async {
-                while let Some(Ok(event)) = sub.next().await {
-                    if event["run_id"] == canary {
-                        return;
-                    }
-                }
-                panic!("canary subscription closed");
-            })
-            .await
-            .is_ok()
-            {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < canary_deadline,
-                "subscription never became ready"
-            );
-        }
-        let run_a = start_run(&client, &first, json!({})).await;
-        let run_b = start_run(&client, &second, json!({})).await;
-
-        // 两个 run 并发跑：必须用同一个收集循环同时等两个终态——分开收会把
-        // 先完成的那个 run 的事件（含终态）从流上消费掉，后收的那个永远等不到
-        let deadline = tokio::time::Instant::now() + TIMEOUT;
-        let mut per_run: std::collections::HashMap<String, Vec<Value>> =
-            std::collections::HashMap::new();
-        while !per_run.get(&run_a).is_some_and(|e| is_terminal(e.last()))
-            || !per_run.get(&run_b).is_some_and(|e| is_terminal(e.last()))
-        {
-            let msg = tokio::time::timeout_at(deadline, sub.next())
-                .await
-                .expect("订阅在超时前没收齐两个 run 的终态")
-                .expect("订阅流结束");
-            let envelope = msg.expect("订阅消息错误");
-            per_run
-                .entry(envelope["run_id"].as_str().unwrap().to_string())
-                .or_default()
-                .push(envelope);
-        }
-        let events_a = &per_run[&run_a];
-        let events_b = &per_run[&run_b];
-        assert!(!events_a.is_empty() && !events_b.is_empty());
-        assert_eq!(events_a.last().unwrap()["type"], json!("run_completed"));
-        assert_eq!(events_b.last().unwrap()["type"], json!("run_completed"));
-        // 每个 run 的流从 seq=1（run_started）起严格连续——两臂一致
-        // （sqlite 的 run_started 由 Engine::start_run 显式广播，pg 经共享日志扇出）
-        for events in [events_a, events_b] {
-            let seqs: Vec<u64> = events.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
-            assert_eq!(
-                seqs,
-                (1..=seqs.len() as u64).collect::<Vec<_>>(),
-                "每个 run 的流从 run_started 起连续：{seqs:?}"
-            );
-        }
-        wait_run_terminal(&client, &run_a, SHORT).await;
-        wait_run_terminal(&client, &run_b, SHORT).await;
-    })
-);
-
-fn is_terminal(event: Option<&Value>) -> bool {
-    matches!(
-        event.and_then(|e| e["type"].as_str()),
-        Some("run_completed") | Some("run_failed") | Some("run_cancelled")
-    )
-}
+        let (workflow, _) = publish_workflow(&client, "流隔离", linear_def("return 1;")).await;
+        let first = start_run(&client, &workflow, json!({})).await;
+        let second = start_run(&client, &workflow, json!({})).await;
+        let mut a = subscribe(&client, &first).await;
+        let mut b = subscribe(&client, &second).await;
+        let (a, b) = tokio::join!(
+            collect_run_events(&mut a, &first, TIMEOUT),
+            collect_run_events(&mut b, &second, TIMEOUT)
+        );
+        assert!(a.iter().all(|e| e["run_id"] == first));
+        assert!(b.iter().all(|e| e["run_id"] == second));
+        assert_eq!(a.last().unwrap()["type"], "run_completed");
+        assert_eq!(b.last().unwrap()["type"], "run_completed");
+    }
+));
 
 /// 轮询直到节点进入 running。
 async fn wait_node_running(
-    client: &backend_e2e::common::Client,
+    client: &backend_e2e::common::Conn,
     run_id: &str,
     node_id: &str,
     timeout: Duration,
@@ -271,49 +189,33 @@ async fn wait_node_running(
 }
 
 e2e_test!(
-    subscription_stream_includes_node_logs_with_contiguous_seq,
+    subscription_is_ordered_and_observations_are_separate,
     |ctx: &mut Ctx| Box::pin(async move {
         let client = ctx.client().await;
-        // 脚本刷多条 console：日志事件与状态事件同流，订阅回放 + 追流不变
+        // 脚本日志走独立观测面，状态订阅仍可回放并追平。
         let code = "for (let i = 0; i < 5; i++) { console.log('line', i); }\nreturn 'done';";
         let (workflow_id, _) = publish_workflow(&client, "订阅日志", linear_def(code)).await;
         let run_id = start_run(&client, &workflow_id, json!({})).await;
 
-        let mut sub = subscribe(&client, Some(run_id.clone())).await;
+        let mut sub = subscribe(&client, &run_id).await;
         let streamed = collect_run_events(&mut sub, &run_id, TIMEOUT).await;
 
         // seq 严格连续（日志行占用 seq，但不能产生缺口）；journal 的 v1 视图
         // 允许空洞（v2 权威序号含不映射的事实），退为严格递增
         for (index, event) in streamed.iter().enumerate() {
-            if ctx.is_journal() {
-                assert!(
-                    index == 0
-                        || streamed[index - 1]["seq"].as_u64().unwrap()
-                            < event["seq"].as_u64().unwrap(),
-                    "订阅流 seq 严格递增：{streamed:?}"
-                );
-            } else {
-                assert_eq!(
-                    event["seq"],
-                    json!((index + 1) as u64),
-                    "订阅流 seq 必须从 1 严格连续：{streamed:?}"
-                );
-            }
-        }
-        // 回放段覆盖全部日志行：5 条 console.log 必须全部在流里
-        // （journal 的观测走 ObservationStore，不进事件流——已知差异）
-        let logs: Vec<&Value> = streamed
-            .iter()
-            .filter(|e| e["type"] == json!("node_log"))
-            .collect();
-        if !ctx.is_journal() {
-            assert_eq!(logs.len(), 5, "5 条 console.log 必须全部回放：{logs:?}");
             assert!(
-                logs.windows(2).all(|w| {
-                    w[0]["message"].as_str().unwrap() < w[1]["message"].as_str().unwrap()
-                }),
-                "日志按发射顺序回放"
+                index == 0
+                    || streamed[index - 1]["seq"].as_u64().unwrap()
+                        < event["seq"].as_u64().unwrap(),
+                "订阅流 seq 严格递增：{streamed:?}"
             );
+        }
+        let observations =
+            call_json(&client, "run.observations.page", json!({"run_id": run_id})).await;
+        let logs = observations["records"].as_array().unwrap();
+        assert_eq!(logs.len(), 5, "全部 console 日志可读取：{observations}");
+        for (index, log) in logs.iter().enumerate() {
+            assert_eq!(log["line"]["message"], json!(format!("line {index}")));
         }
         assert_eq!(streamed.last().unwrap()["type"], json!("run_completed"));
     })
@@ -339,7 +241,7 @@ e2e_test!(
         let _ = wait_run_terminal(&client, &run_id, TIMEOUT).await;
 
         // 回放段从头拿全量：订阅走的是同一条服务端路径
-        let mut sub = subscribe(&client, Some(run_id.clone())).await;
+        let mut sub = subscribe(&client, &run_id).await;
         let streamed = collect_run_events(&mut sub, &run_id, TIMEOUT).await;
         let completed = streamed
             .iter()
@@ -354,7 +256,7 @@ e2e_test!(
         assert_eq!(completed["output"]["ok"], json!(1), "非敏感字段不动");
 
         // 数据面不变：事件日志里仍是原始值（下游节点/fold 要消费它）
-        let events: Value = call_json(&client, "run.events", json!({"run_id": run_id})).await;
+        let events: Value = call_json(&client, "run.events.full", json!({"run_id": run_id})).await;
         let logged = events["events"]
             .as_array()
             .unwrap()

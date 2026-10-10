@@ -31,6 +31,19 @@ fn failure(error: JournalError) -> ErrorObjectOwned {
         JournalError::Journal(flow_journal::Error::Limit(message)) => {
             ErrorObjectOwned::owned(-32021, message, None::<()>)
         }
+        JournalError::Journal(flow_journal::Error::Invalid(message))
+            if matches!(
+                message.as_str(),
+                "run not found"
+                    | "workflow not found"
+                    | "workflow version not found"
+                    | "schedule not found"
+                    | "webhook not found"
+                    | "template not found"
+            ) =>
+        {
+            ErrorObjectOwned::owned(-32011, message, None::<()>)
+        }
         JournalError::Journal(flow_journal::Error::Invalid(message)) => invalid(message),
         _ => ErrorObjectOwned::owned(-32603, "journal service unavailable", None::<()>),
     }
@@ -41,11 +54,9 @@ fn arm_failure(error: flow_backend::BackendError) -> ErrorObjectOwned {
         flow_backend::BackendError::WorkflowNotFound(m) => {
             ErrorObjectOwned::owned(-32011, format!("工作流不存在：{m}"), None::<()>)
         }
-        flow_backend::BackendError::VersionNotFound(w, v) => ErrorObjectOwned::owned(
-            -32011,
-            format!("版本不存在：{w} v{v}"),
-            None::<()>,
-        ),
+        flow_backend::BackendError::VersionNotFound(w, v) => {
+            ErrorObjectOwned::owned(-32011, format!("版本不存在：{w} v{v}"), None::<()>)
+        }
         flow_backend::BackendError::RunNotFound(m) => {
             ErrorObjectOwned::owned(-32011, format!("run 不存在：{m}"), None::<()>)
         }
@@ -62,9 +73,7 @@ fn arm_failure(error: flow_backend::BackendError) -> ErrorObjectOwned {
             ErrorObjectOwned::owned(-32012, format!("模板名已存在：{m}"), None::<()>)
         }
         flow_backend::BackendError::Invalid(m) => invalid(m),
-        flow_backend::BackendError::Conflict(m) => {
-            ErrorObjectOwned::owned(-32012, m, None::<()>)
-        }
+        flow_backend::BackendError::Conflict(m) => ErrorObjectOwned::owned(-32012, m, None::<()>),
         other => ErrorObjectOwned::owned(-32603, other.to_string(), None::<()>),
     }
 }
@@ -101,6 +110,81 @@ fn optional_version(params: &Value) -> Result<Option<u64>, ErrorObjectOwned> {
             .as_u64()
             .map(Some)
             .ok_or_else(|| invalid("invalid version")),
+    }
+}
+
+/// 读方法清单。注册层与客户端
+/// （backend-e2e harness、flow-cli）共用同一份，避免两处各抄一份漂移。
+pub const READ_METHODS: &[&str] = &[
+    "run.observations.page",
+    "command.status",
+    "workflow.list",
+    "run.list",
+    "legacy.list",
+    "workflow.get",
+    "run.get",
+    "legacy.get",
+    "run.events.page",
+    "run.audit.page",
+    "workflow.get.full",
+    "workflow.list.full",
+    "workflow.versions",
+    "run.get.full",
+    "run.list.full",
+    "run.stats",
+    "run.timeline",
+    "run.events.full",
+    "schedule.list",
+    "webhook.list",
+    "template.list",
+    "template.get",
+    "config.get",
+    "secrets.list",
+    "nodetypes.list",
+];
+
+pub const WRITE_METHODS: &[&str] = &[
+    "workflow.create",
+    "workflow.update",
+    "workflow.publish",
+    "workflow.delete",
+    "run.start",
+    "run.cancel",
+    "run.signal",
+    "run.adjudicate",
+    "schedule.change",
+    "schedule.create",
+    "schedule.update",
+    "schedule.delete",
+    "webhook.change",
+    "webhook.create",
+    "webhook.set_enabled",
+    "webhook.delete",
+    "template.create",
+    "template.update",
+    "template.delete",
+    "secrets.set",
+    "secrets.delete",
+    "config.update",
+];
+pub fn is_write_method(method: &str) -> bool {
+    WRITE_METHODS.contains(&method)
+}
+
+/// 方法是否为读面（写命令需要 request_id 幂等键与回执解包）。
+pub fn is_read_method(method: &str) -> bool {
+    READ_METHODS.contains(&method)
+}
+
+/// 写命令的服务端命令 scope（`command.status` 查询键）。run.start 带来源
+/// 归因、run 族按 run_id 分域；其余就是方法名。
+pub fn command_scope(method: &str, params: &Value) -> String {
+    match method {
+        "run.start" => "run.start:manual:".to_string(),
+        "run.cancel" | "run.signal" | "run.adjudicate" => {
+            format!("{method}:{}", params["run_id"].as_str().unwrap_or(""))
+        }
+        other => other.to_string(),
     }
 }
 
@@ -184,11 +268,11 @@ pub fn module_product(
             let mismatch=supplied.len()!=ctx.token.len() || supplied.bytes().zip(ctx.token.bytes()).fold(0u8,|d,(a,b)|d|(a^b))!=0;
             if mismatch {return Err(ErrorObjectOwned::owned(-32001,"unauthorized",None::<()>));}
             p.as_object_mut().ok_or_else(||invalid("object params required"))?.remove("_token");
-            let request=p.get("request_id").map(|v|v.as_str().ok_or_else(||invalid("request_id must be a string"))).transpose()?;
+            let request_id=p.get("request_id").map(|v|v.as_str().map(str::to_owned).ok_or_else(||invalid("request_id must be a string"))).transpose()?;
+            let request=request_id.as_deref();
             // 写命令必须带稳定 request_id：无幂等键的客户端重试=双 run/双
             // workflow（服务端无 UUID 透传键可去重）。读面免检。
-            if !matches!(method,"run.observations.page"|"command.status"|"workflow.list"|"run.list"|"legacy.list"|"workflow.get"|"run.get"|"legacy.get"|"run.events.page"|"run.audit.page"|"workflow.get.full"|"workflow.list.full"|"workflow.versions"|"run.get.full"|"run.list.full"|"run.stats"|"run.timeline"|"run.events.full"|"schedule.list"|"webhook.list"|"template.list"|"template.get"|"config.get"|"secrets.list"|"nodetypes.list")
-                && request.is_none_or(|id| id.trim().is_empty()) {
+            if is_write_method(method) && request.is_none_or(|id| id.trim().is_empty()) {
                 return Err(invalid("request_id required for write commands"));
             }
             let b=&ctx.backend;
@@ -242,7 +326,7 @@ pub fn module_product(
                 },
                 "workflow.get.full"=>{
                     let version=flow_backend::journal_arm::get_version(
-                        b,text(&p,"workflow_id")?,p["version"].as_i64(),
+                        b,text(&p,"workflow_id")?,optional_version(&p)?.map(|v|i64::try_from(v).map_err(invalid)).transpose()?,
                     ).await.map_err(arm_failure)?;
                     // v1 workflow.get 形状：version 之外还带 published_version
                     // （编辑器用它渲染「已发布 vN」徽标），单独补上。
@@ -253,6 +337,7 @@ pub fn module_product(
                 },
                 "workflow.versions"=>{
                     let versions=flow_backend::journal_arm::list_versions(b,text(&p,"workflow_id")?).await.map_err(arm_failure)?;
+                    let versions:Vec<Value>=versions.into_iter().map(|v|json!({"version":v.version,"status":v.status,"checksum":v.checksum,"created_at":v.created_at})).collect();
                     return Ok(json!({"versions":versions}));
                 },
                 "run.get.full"=>{
@@ -262,6 +347,12 @@ pub fn module_product(
                     return Ok(json!({"run":run,"live":live}));
                 },
                 "run.list.full"=>{
+                    if let Some(status)=p.get("status") {
+                        if !status.as_str().is_some_and(flow_backend::DbRunStatus::is_valid_str) { return Err(invalid("invalid run status")); }
+                    }
+                    if let Some(source)=p.get("source") {
+                        if !source.as_str().is_some_and(flow_backend::DbRunSource::is_valid_str) { return Err(invalid("invalid run source")); }
+                    }
                     let runs=flow_backend::journal_arm::list_runs(
                         b,
                         p["workflow_id"].as_str(),
@@ -288,73 +379,31 @@ pub fn module_product(
                     let events=flow_backend::journal_arm::read_events(b,text(&p,"run_id")?,p["from_seq"].as_u64()).await.map_err(arm_failure)?;
                     return Ok(json!({"events":events}));
                 },
-                "schedule.create"=>{
-                    crate::validate_cron(text(&p,"cron")?)?;
-                    let input=p.get("input").filter(|v|!v.is_null());
-                    let schedule=flow_backend::journal_arm::create_schedule(
-                        b,text(&p,"workflow_id")?,text(&p,"cron")?,
-                        input,p["enabled"].as_bool().unwrap_or(true),
-                    ).await.map_err(arm_failure)?;
-                    return Ok(crate::schedule_value(&schedule));
-                },
-                "schedule.update"=>{
-                    let input=match p.get("input"){None=>None,Some(v)=>Some(Some(v.clone()))};
-                    flow_backend::journal_arm::update_schedule(
-                        b,text(&p,"id")?,p["cron"].as_str(),input,p["enabled"].as_bool(),
-                    ).await.map_err(arm_failure)?;
-                    // 回读完整实体（按 v1 形状返回）
-                    let list=flow_backend::journal_arm::list_schedules(b,Some(text(&p,"id")?)).await.map_err(arm_failure)?;
-                    return Ok(json!({"updated":true,"schedule":list.first().map(crate::schedule_value)}));
-                },
-                "schedule.delete"=>{
-                    flow_backend::journal_arm::delete_schedule(b,text(&p,"id")?).await.map_err(arm_failure)?;
-                    return Ok(json!({"deleted":true}));
+                "schedule.create"|"schedule.update"|"schedule.delete"|
+                "webhook.create"|"webhook.set_enabled"|"webhook.delete"|
+                "template.create"|"template.update"|"template.delete"=>{
+                    if method.starts_with("schedule.") {
+                        if let Some(cron)=p.get("cron") { crate::validate_cron(cron.as_str().ok_or_else(||invalid("cron must be a string"))?)?; }
+                    }
+                    if method.starts_with("template.") && method!="template.delete" {
+                        if method=="template.create" || p.get("name").is_some() { crate::validate_template_name(text(&p,"name")?)?; }
+                        if method=="template.create" || p.get("nodes").is_some() || p.get("edges").is_some() {
+                            let (nodes,edges)=crate::validate_fragment(&p["nodes"],&p["edges"])?;
+                            p["nodes"]=nodes; p["edges"]=edges;
+                        }
+                    }
+                    let mut args=p.clone();
+                    args.as_object_mut().unwrap().remove("request_id");
+                    b.product_command(method,&args,text(&p,"request_id")?).await
                 },
                 "schedule.list"=>{
                     let schedules=flow_backend::journal_arm::list_schedules(b,p["workflow_id"].as_str()).await.map_err(arm_failure)?;
                     let list:Vec<Value>=schedules.iter().map(crate::schedule_value).collect();
                     return Ok(json!({"schedules":list}));
                 },
-                "webhook.create"=>{
-                    let webhook=flow_backend::journal_arm::create_webhook(b,text(&p,"workflow_id")?).await.map_err(arm_failure)?;
-                    return serde_json::to_value(webhook).map_err(invalid);
-                },
-                "webhook.set_enabled"=>{
-                    flow_backend::journal_arm::set_webhook_enabled(b,text(&p,"token")?,p["enabled"].as_bool().unwrap_or(false)).await.map_err(arm_failure)?;
-                    return Ok(json!({"updated":true}));
-                },
-                "webhook.delete"=>{
-                    flow_backend::journal_arm::delete_webhook(b,text(&p,"token")?).await.map_err(arm_failure)?;
-                    return Ok(json!({"deleted":true}));
-                },
                 "webhook.list"=>{
                     let webhooks=flow_backend::journal_arm::list_webhooks(b,p["workflow_id"].as_str()).await.map_err(arm_failure)?;
                     return serde_json::to_value(json!({"webhooks":webhooks})).map_err(invalid);
-                },
-                "template.create"=>{
-                    crate::validate_template_name(text(&p,"name")?)?;
-                    let (nodes,edges)=crate::validate_fragment(&p["nodes"],&p["edges"])?;
-                    let template=flow_backend::journal_arm::template_create(b,text(&p,"name")?,p["category"].as_str(),&nodes,&edges).await.map_err(arm_failure)?;
-                    return serde_json::to_value(template).map_err(invalid);
-                },
-                "template.update"=>{
-                    crate::validate_template_name(text(&p,"name").unwrap_or(""))?;
-                    let (nodes,edges)=if p["nodes"].is_null()&&(p["edges"].is_null()){
-                        (Value::Null,Value::Null)
-                    }else{
-                        crate::validate_fragment(&p["nodes"],&p["edges"])?
-                    };
-                    let category=match p.get("category"){None=>None,Some(v)=>Some(v.as_str())};
-                    let template=flow_backend::journal_arm::template_update(
-                        b,text(&p,"id")?,p["name"].as_str(),category,
-                        if nodes.is_null(){None}else{Some(&nodes)},
-                        if edges.is_null(){None}else{Some(&edges)},
-                    ).await.map_err(arm_failure)?;
-                    return serde_json::to_value(template).map_err(invalid);
-                },
-                "template.delete"=>{
-                    let deleted=flow_backend::journal_arm::template_delete(b,text(&p,"id")?).await.map_err(arm_failure)?;
-                    return Ok(json!({"deleted":deleted}));
                 },
                 "template.list"=>{
                     let templates=flow_backend::journal_arm::template_list(b).await.map_err(arm_failure)?;

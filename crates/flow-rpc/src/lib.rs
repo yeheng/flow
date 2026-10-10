@@ -119,6 +119,109 @@ pub fn toml_config_from_str(text: &str) -> Result<flow_config::Config, Box<dyn s
     Ok(flow_config::Config::from_toml_str(text)?)
 }
 
+/// journal v2 产品服务的完整装配与运行（`flow-journal-server` 产品 bin 与
+/// backend-e2e / backend-perf 的被测进程共用同一份实现——「被测的就是
+/// 生产进程」）。
+///
+/// 组成：下载/webhook HTTP（`[journal].http_addr`，Bearer token）+ WS RPC
+/// （`module_product`：v2 协议 + v1 物化数据形状 + 统一配置/密钥）+ 执行驱动
+/// + cron 触发器（`[server].scheduler_enabled`）。
+///
+/// 环境变量（覆盖配置文件）：`FLOW_JOURNAL_DATA_DIR` / `FLOW_JOURNAL_TOKEN`
+/// （≥32 字节，必填）/ `FLOW_JOURNAL_ADDR` / `FLOW_JOURNAL_HTTP_ADDR`。
+///
+/// 日志：`tracing_subscriber` 初始化（RUST_LOG env-filter；已初始化时跳过），
+/// 启动行带 `local_addr=` / `http_addr=` 字段——这是测试 harness 的就绪
+/// 标记（`flow_test_support::io::spawn_reporting_ports`），不能改。
+pub async fn serve_journal_product(
+    config: flow_config::Config,
+    config_path: Option<std::path::PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use flow_backend::journal::JournalBackend;
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "info,flow_engine=debug,flow_rpc=debug,flow_backend=debug".into()
+            }),
+        )
+        .try_init();
+
+    let root = std::env::var("FLOW_JOURNAL_DATA_DIR")
+        .ok()
+        .or_else(|| config.journal.data_dir.clone())
+        .map(std::path::PathBuf::from)
+        .ok_or("journal 数据目录缺失：配置 [journal].data_dir 或环境变量 FLOW_JOURNAL_DATA_DIR")?;
+    let token = std::env::var("FLOW_JOURNAL_TOKEN")?;
+    let addr: std::net::SocketAddr = config.journal.addr.parse()?;
+    let backend = JournalBackend::open(&root, Default::default()).await?;
+    let download_addr: std::net::SocketAddr = config.journal.http_addr.parse()?;
+    let listener = tokio::net::TcpListener::bind(download_addr).await?;
+    let bound_http = listener.local_addr()?;
+    let router = journal_download::router(backend.clone(), token.clone())?
+        .merge(journal_triggers::router(backend.clone(), token.clone()));
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let mut downloads = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    // 产品装配：统一配置面 + 持久化密钥（密钥在 data_dir 下，与桌面同规则）
+    let data_dir = std::path::PathBuf::from(&config.storage.data_dir);
+    let file_config = match &config_path {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)?;
+            toml_config_from_str(&text)?
+        }
+        None => flow_config::Config::default(),
+    };
+    let config_state = ConfigState {
+        config: std::sync::RwLock::new(file_config),
+        path: config_path.clone(),
+        env_overrides: flow_config::Config::load(config_path.as_deref())?.env_overrides,
+    };
+    let (state, _secrets) = AppState::for_production(
+        AnyBackend::Journal(backend.clone()),
+        config_state,
+        &data_dir,
+    )
+    .await;
+    let module = journal_v2::module_product(backend.clone(), token, Some(state))?;
+    let (server, addr) = journal_v2::serve_product(module, addr).await?;
+    tracing::info!(
+        local_addr = %addr,
+        http_addr = %bound_http,
+        data_dir = %root.display(),
+        "flow-journal-server 已启动 (JSONL v2 WS RPC + 下载/触发器 HTTP)"
+    );
+    flow_backend::start_execution(&config.execution, &backend).await?;
+    // cron 触发器：[server].scheduler_enabled=false 时不启动（与桌面同一开关）
+    let scheduler = if config.server.scheduler_enabled {
+        journal_triggers::start(backend.clone(), config.journal_trigger_tick())
+    } else {
+        tracing::info!("scheduler_enabled=false，cron 触发器未启动");
+        tokio::spawn(async {})
+    };
+    tokio::signal::ctrl_c().await?;
+    tracing::info!("收到中断信号，正在停止");
+    scheduler.abort();
+    let _ = scheduler.await;
+    server.stop()?;
+    server.stopped().await;
+    let _ = stop.send(());
+    if tokio::time::timeout(std::time::Duration::from_secs(5), &mut downloads)
+        .await
+        .is_err()
+    {
+        downloads.abort();
+        let _ = downloads.await;
+    }
+    backend.close().await?;
+    Ok(())
+}
+
 pub fn timeline_value(
     run_id: &str,
     run_status: &str,
@@ -271,7 +374,10 @@ pub(crate) fn validate_template_name(name: &str) -> Result<(), ErrorObjectOwned>
 ///   condition 节点且端口为 "true"/"false"（与整图规则一致）。
 ///
 /// 返回**归一化**后的片段：只保留白名单字段，杜绝面板存进任意 JSON。
-pub(crate) fn validate_fragment(nodes: &Value, edges: &Value) -> Result<(Value, Value), ErrorObjectOwned> {
+pub(crate) fn validate_fragment(
+    nodes: &Value,
+    edges: &Value,
+) -> Result<(Value, Value), ErrorObjectOwned> {
     let nodes_arr = nodes
         .as_array()
         .ok_or_else(|| invalid("nodes 必须是数组"))?;

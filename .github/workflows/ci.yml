@@ -84,7 +84,7 @@ jobs:
       - name: test
         run: cargo test --workspace --all-targets --locked --target ${{ matrix.arch.target }}
 
-  # ---- Postgres 臂：flow-pg / flow-rpc 真连 PG ----
+  # ---- Postgres 库：flow-pg 真连 PG ----
   # 主测试 job 不设 FLOW_TEST_DATABASE_URL，这些用例会静默跳过、依旧全绿；
   # 这里把 PG 臂真正跑起来（端口 54329 与仓库约定一致）。
   # 矩阵两个维度：runner 架构 × PG 大版本（15/16/17 是依赖的两个 PG 特性的
@@ -142,23 +142,17 @@ jobs:
           echo "::error:: Postgres ${{ matrix.pg }} 90s 未就绪"
           docker logs flow-test-pg || true
           exit 1
-      - name: test (flow-pg + flow-rpc)
+      - name: test (flow-pg)
         env:
           FLOW_TEST_DATABASE_URL: postgres://flow:flow@127.0.0.1:54329/flow
-        run: cargo test -p flow-pg -p flow-rpc --all-targets --locked --target ${{ matrix.arch.target }}
+        run: cargo test -p flow-pg --all-targets --locked --target ${{ matrix.arch.target }}
       - name: 清理容器
         if: always()
         run: docker rm -f -v flow-test-pg || true
 
-  # ---- 后端 e2e × PG 大版本 ----
-  # backend-e2e 的 PG 臂自己起容器（镜像由 FLOW_E2E_PG_IMAGE 指定，默认
-  # postgres:16-alpine），上面 test 矩阵已把它在 amd64×16 与 arm64×16 上各
-  # 原生跑过一遍。这里在 amd64 上补 15 / 17 两个大版本：版本兼容性与 CPU
-  # 架构无关，arm64 × 每个大版本再复制一遍收益不成比例（需要时把 pg 列表
-  # 补全即可，job 结构不用动）；arm64 的版本兼容由上面的 postgres 矩阵覆盖
-  # （flow-pg / flow-rpc × 15/16/17）。
-  e2e-postgres:
-    name: e2e (backend, pg ${{ matrix.pg }})
+  # PostgreSQL 库的容器和测试库清理契约保留，产品 E2E 由 Journal 矩阵负责。
+  pg-hygiene:
+    name: pg harness hygiene (${{ matrix.pg }})
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
@@ -171,10 +165,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # backend-e2e 自己管容器：label com.flow.e2e=1、数据目录 tmpfs、
-      # rm -f -v + 孤儿匿名 volume 回收（见 DESIGN.md §13「docker 卫生」）
-      - name: e2e (backend, sqlite + postgres ${{ matrix.pg }})
-        run: cargo test -p backend-e2e --all-targets --locked
+      - name: PostgreSQL harness cleanup
+        run: cargo test -p flow-pg --test docker_hygiene --locked
 
   # ---- 断言 postgres 镜像本身是多架构 ----
   # 原生矩阵只能证明「本 runner 架构上跑通了」；这个 job 直接查镜像 manifest，
@@ -232,15 +224,15 @@ jobs:
           key: cross-${{ matrix.target }}
       - name: cross build（workspace，release）
         run: cross build --workspace --release --locked --target ${{ matrix.target }}
-      # 四个 bin 一次构建全部就位。backend-e2e 的被测进程叫 flow-server-e2e
-      # （与 flow-rpc 的 flow-server 同一份 run_from_env 实现，只是改名）——
+      # 四个 bin 一次构建全部就位。backend-e2e 的被测进程叫 flow-journal-server-e2e
+      # （与 flow-rpc 的 flow-journal-server 同一份 serve_journal_product 实现，只是改名）——
       # 同名会写同一个产物、cargo 报 output filename collision，谁覆盖谁取决于
       # 构建顺序，所以两者必须保持不同的名字。
-      - name: 收集 flow-cli / flow-perf / flow-server / flow-server-e2e
+      - name: 收集 flow-cli / flow-perf / flow-journal-server / flow-journal-server-e2e
         run: |
           set -euo pipefail
           mkdir -p dist
-          for bin in flow-cli flow-perf flow-server flow-server-e2e; do
+          for bin in flow-cli flow-perf flow-journal-server flow-journal-server-e2e; do
             cp "target/${{ matrix.target }}/release/$bin" "dist/$bin"
           done
       - name: 校验产物是目标架构的 ELF
@@ -265,7 +257,7 @@ jobs:
 
   # ---- 前端：单架构 ----
   # lint / 单测 / 构建都是 node 侧的事，与 CPU 架构无关；playwright 的 e2e 里
-  # 真二进制 flow-server 的架构覆盖已由上面的 test 矩阵负责（那边是全量 Rust
+  # 真二进制 flow-journal-server 的架构覆盖已由上面的 test 矩阵负责（那边是全量 Rust
   # 测试），这里再铺一遍 arm 属于重复。想扩成双架构时：runs-on 换成
   # matrix.arch.runner、rust-toolchain 加 targets、rust-cache 加 key，
   # 与 test job 同构即可。
@@ -302,5 +294,5 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - run: npm ci
       - run: npx playwright install --with-deps chromium
-      # global-setup 自行 cargo build 并拉起隔离的 flow-server
+      # global-setup 自行 cargo build 并拉起隔离的 flow-journal-server
       - run: npm run test:e2e

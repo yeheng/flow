@@ -11,12 +11,12 @@
 
 use std::time::Duration;
 
-use backend_e2e::common::{publish_workflow, subscribe, Client, Ctx};
+use backend_e2e::common::{publish_workflow, Conn, Ctx};
 use serde_json::{json, Value};
 
 use crate::harness::{
     chain_def, collect_arrivals, error_digest, fanout_def, start_runs_measured, unique_name,
-    warm_up_run, Marks, SETTLE, WARMUP_RUNS,
+    warm_up_run, Marks, WARMUP_RUNS,
 };
 use crate::opts::Opts;
 use crate::report::{Latency, Report};
@@ -55,7 +55,7 @@ pub async fn run(ctx: &mut Ctx, opts: &Opts) -> Vec<Report> {
     reports
 }
 
-async fn measure(client: &Client, ctx: &Ctx, opts: &Opts, shape: Shape) -> Report {
+async fn measure(client: &Conn, _ctx: &Ctx, opts: &Opts, shape: Shape) -> Report {
     let workflow_name = unique_name(&format!("perf-{}", shape.name()));
     let (workflow_id, _) = publish_workflow(client, &workflow_name, shape.definition()).await;
 
@@ -65,17 +65,12 @@ async fn measure(client: &Client, ctx: &Ctx, opts: &Opts, shape: Shape) -> Repor
         warm_up_run(client, &workflow_id).await;
     }
 
-    let sub_client = ctx.client().await;
-    let mut sub = subscribe(&sub_client, None).await;
-    // 全局流是纯实时增量（DESIGN §9）：订阅注册略晚于 RPC 返回，等接收端就位再开跑
-    tokio::time::sleep(SETTLE).await;
-
     let input = json!({ "x": 1 });
     let timeout = Duration::from_secs(opts.runs as u64 / 2 + 60);
     let marks = Marks::starting(opts.runs, opts.concurrency);
     let (_, arrivals) = tokio::join!(
         start_runs_measured(client, &workflow_id, &input, &marks, timeout),
-        collect_arrivals(&mut sub, &marks, opts.runs, timeout),
+        collect_arrivals(client, &marks, opts.runs, timeout),
     );
     let started = marks.len();
     let submit_errors = marks.error_count();
@@ -113,7 +108,7 @@ async fn measure(client: &Client, ctx: &Ctx, opts: &Opts, shape: Shape) -> Repor
     let throughput = started as f64 / wall.as_secs_f64();
 
     Report::new(
-        ctx.kind.name(),
+        "journal",
         "run_throughput",
         json!({
             "shape": shape.name(),

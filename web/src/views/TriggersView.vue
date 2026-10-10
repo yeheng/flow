@@ -121,7 +121,7 @@ function hookUrl(w: Webhook): string {
 
 function curlExample(w: Webhook): string {
   // v2 入口：Bearer 认证（token = 部署令牌 FLOW_JOURNAL_TOKEN）
-  return `curl -X POST ${hookUrl(w)} -H 'Authorization: Bearer $FLOW_TOKEN' -H 'Content-Type: application/json' -d '{"key":"value"}'`;
+  return `curl -X POST ${hookUrl(w)} -H "Authorization: Bearer $FLOW_JOURNAL_TOKEN" -H 'Idempotency-Key: replace-with-a-stable-delivery-id' -H 'Content-Type: application/json' -d '{"key":"value"}'`;
 }
 
 async function onCopy(w: Webhook): Promise<void> {

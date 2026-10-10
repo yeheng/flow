@@ -169,7 +169,7 @@ export async function runStats(workflowId?: string): Promise<RunStats> {
 }
 
 export async function getRun(runId: string): Promise<{ run: RunRecord; live: boolean }> {
-  return client.call("run.get", { run_id: runId });
+  return client.call("run.get.full", { run_id: runId });
 }
 
 export async function runTimeline(runId: string): Promise<Timeline> {

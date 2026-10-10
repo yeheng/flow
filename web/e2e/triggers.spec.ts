@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { seedWorkflow, uniq, waitTerminal } from "./helpers";
+import { E2E_TOKEN } from "./config";
 
 test("触发器页：webhook 创建/复制/POST 触发/归因；非法 cron 报错", async ({
   page,
@@ -13,7 +14,7 @@ test("触发器页：webhook 创建/复制/POST 触发/归因；非法 cron 报�
   // 新建 webhook → 列表出现完整 hook URL
   await page.getByRole("button", { name: "新建 webhook" }).click();
   const urlCell = page.locator(".hook-url").first();
-  await expect(urlCell).toContainText("/hook/");
+  await expect(urlCell).toContainText("/hooks/");
   const hookUrl = (await urlCell.innerText()).trim();
 
   // 复制：授权剪贴板后内容与 URL 一致
@@ -24,16 +25,21 @@ test("触发器页：webhook 创建/复制/POST 触发/归因；非法 cron 报�
   expect(copied).toBe(hookUrl);
 
   // 直接 POST hook URL（绕过页面，验证 HTTP 入口真实可用）→ 200 + run_id
-  const resp = await request.post(hookUrl, { data: { src: "e2e" } });
+  const resp = await request.post(hookUrl, {
+    data: { src: "e2e" },
+    headers: { Authorization: `Bearer ${E2E_TOKEN}`, "Idempotency-Key": crypto.randomUUID() },
+  });
   expect(resp.status()).toBe(200);
-  const { run_id } = (await resp.json()) as { run_id: string };
+  const {
+    result: { run_id },
+  } = (await resp.json()) as { result: { run_id: string } };
   expect(await waitTerminal(run_id)).toBe("succeeded");
 
   // 运行记录出现来源=Webhook 的行
   await page.goto(`/workflows/${wf.id}/runs`);
   await expect(page.locator(".data-table tr", { hasText: "Webhook" })).toBeVisible();
 
-  // 非法 cron：后端 -32010 以错误 toast 呈现
+  // 非法 cron：后端 -32602 以错误 toast 呈现
   await page.goto(`/workflows/${wf.id}/triggers`);
   await page.locator(".cron-input").fill("not a cron");
   await page.getByRole("button", { name: "新建调度" }).click();

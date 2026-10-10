@@ -8,13 +8,12 @@
 //! 参数用 `serde_json::Map` 动态拼装（方法面是开放的字符串表，没有编译期
 //! 类型可用）；jsonrpsee 的 `ToRpcParams` 对 Map 有现成实现。
 
-use jsonrpsee::core::client::ClientT;
 use jsonrpsee::ws_client::WsClient;
 use serde_json::{Map, Value};
 
 use crate::error::CliError;
 
-/// 连接服务。URL 归一化：`127.0.0.1:9800` 之类缺 scheme 的按 `ws://` 补全；
+/// 连接服务。URL 归一化：`127.0.0.1:9802` 之类缺 scheme 的按 `ws://` 补全；
 /// `http(s)://` 原样透传（jsonrpsee 的 ws-client 接受该 scheme 指代 ws）。
 pub async fn connect(url: &str) -> Result<WsClient, CliError> {
     let normalized = if url.contains("://") {
@@ -27,7 +26,7 @@ pub async fn connect(url: &str) -> Result<WsClient, CliError> {
         .await
         .map_err(|err| {
             CliError::local(format!(
-                "连不上 flow-server（{normalized}）：{err}\n提示：先 `cargo run --bin flow-server`，或用 --url / FLOW_RPC 指定地址"
+                "连不上 flow-journal-server（{normalized}）：{err}\n提示：先 `cargo run --bin flow-journal-server`，或用 --url / FLOW_RPC 指定地址"
             ))
         })
 }
@@ -48,17 +47,42 @@ pub async fn call(
     method: &str,
     params: Map<String, Value>,
 ) -> Result<Value, CliError> {
-    client
-        .request::<Value, _>(method, params)
-        .await
-        .map_err(|err| match err {
-            // 服务端回了 JSON-RPC 错误对象：code/message 原样透出，不吞码
-            jsonrpsee::core::ClientError::Call(object) => CliError::Rpc {
-                code: object.code(),
-                message: object.message().to_string(),
-            },
-            other => CliError::local(format!("RPC 调用 {method} 失败：{other}")),
-        })
+    let token = std::env::var("FLOW_JOURNAL_TOKEN")
+        .map_err(|_| CliError::local("FLOW_JOURNAL_TOKEN required"))?;
+    let reply = crate::journal::call(client, &token, method, Value::Object(params)).await?;
+    if is_write_method(method) && reply["committed"] == true {
+        Ok(reply["result"].clone())
+    } else {
+        Ok(reply)
+    }
+}
+
+pub(crate) fn is_write_method(method: &str) -> bool {
+    matches!(
+        method,
+        "workflow.create"
+            | "workflow.update"
+            | "workflow.publish"
+            | "workflow.delete"
+            | "run.start"
+            | "run.cancel"
+            | "run.signal"
+            | "run.adjudicate"
+            | "schedule.change"
+            | "schedule.create"
+            | "schedule.update"
+            | "schedule.delete"
+            | "webhook.change"
+            | "webhook.create"
+            | "webhook.set_enabled"
+            | "webhook.delete"
+            | "template.create"
+            | "template.update"
+            | "template.delete"
+            | "config.update"
+            | "secrets.set"
+            | "secrets.delete"
+    )
 }
 
 #[cfg(test)]

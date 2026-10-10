@@ -30,7 +30,7 @@ pub enum Command {
 fn error(e: impl ToString) -> CliError {
     CliError::local(e.to_string())
 }
-async fn call(
+pub(crate) async fn call(
     client: &WsClient,
     token: &str,
     method: &str,
@@ -40,6 +40,13 @@ async fn call(
         .as_object_mut()
         .ok_or_else(|| error("object parameters required"))?
         .insert("_token".into(), json!(token));
+    if crate::client::is_write_method(method) {
+        params
+            .as_object_mut()
+            .unwrap()
+            .entry("request_id")
+            .or_insert_with(|| Value::String(uuid::Uuid::now_v7().to_string()));
+    }
     match client
         .request::<Value, _>(method, params.as_object().unwrap().clone())
         .await

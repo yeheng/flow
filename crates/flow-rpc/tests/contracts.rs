@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use flow_backend::journal::JournalBackend;
 use flow_backend::{AnyBackend, CreateRun};
-use flow_rpc::{build_module, AppState};
+use flow_rpc::AppState;
+const TOKEN: &str = "flow-rpc-contract-test-token-32-bytes";
 use serde_json::{json, Value};
 
 struct Fixture {
@@ -30,7 +31,11 @@ impl Fixture {
             .workflow_update(&workflow, definition(7), None)
             .await
             .unwrap();
-        let state = Arc::new(AppState::new(AnyBackend::Journal(backend.clone())));
+        let state = Arc::new(AppState {
+            backend: AnyBackend::Journal(backend.clone()),
+            config: None,
+            secrets: None,
+        });
         Self {
             root,
             arm: AnyBackend::Journal(backend.clone()),
@@ -40,12 +45,37 @@ impl Fixture {
         }
     }
 
-    async fn call(&self, method: &str, params: Value) -> Value {
-        let module = build_module(self.state.clone()).unwrap();
+    async fn raw_call(&self, method: &str, mut params: Value) -> Value {
+        let module = flow_rpc::journal_v2::module_product(
+            self.backend.clone(),
+            TOKEN.to_owned(),
+            Some(self.state.clone()),
+        )
+        .unwrap();
+        params["_token"] = json!(TOKEN);
         let request =
             json!({"jsonrpc":"2.0", "id":1, "method":method, "params":params}).to_string();
         let (response, _) = module.raw_json_request(&request, 1).await.unwrap();
         serde_json::from_str(response.get()).unwrap()
+    }
+
+    async fn call(&self, method: &str, mut params: Value) -> Value {
+        let method = match method {
+            "workflow.get" => "workflow.get.full",
+            "workflow.list" => "workflow.list.full",
+            "run.get" => "run.get.full",
+            "run.list" => "run.list.full",
+            "run.events" => "run.events.full",
+            other => other,
+        };
+        if flow_rpc::journal_v2::is_write_method(method) && params.get("request_id").is_none() {
+            params["request_id"] = json!(uuid::Uuid::now_v7().to_string());
+        }
+        let mut response = self.raw_call(method, params).await;
+        if response["result"]["committed"] == true {
+            response["result"] = response["result"]["result"].clone();
+        }
+        response
     }
 
     async fn wait_finished(&self, run: &str) -> Value {
@@ -132,7 +162,7 @@ async fn secrets_list_returns_sorted_names_without_values() {
     std::env::remove_var("FLOW_SECRET_TEST_RPC_B");
 }
 
-/// workflow.update 的密钥提前校验：名称未配置 → -32010 并点名环境变量；
+/// workflow.update 的密钥提前校验：名称未配置 → -32602 并点名环境变量；
 /// 配置后落库的仍是名称，不是真值。
 #[tokio::test]
 async fn workflow_update_validates_secret_names_exist() {
@@ -144,7 +174,7 @@ async fn workflow_update_validates_secret_names_exist() {
             json!({"workflow_id": f.workflow, "definition": email_def("TEST_RPC_MISSING")}),
         )
         .await;
-    assert_eq!(bad["error"]["code"], -32010, "{bad}");
+    assert_eq!(bad["error"]["code"], -32602, "{bad}");
     let message = bad["error"]["message"].as_str().unwrap();
     assert!(
         message.contains("TEST_RPC_MISSING") && message.contains("FLOW_SECRET_TEST_RPC_MISSING"),
@@ -176,7 +206,7 @@ async fn explicit_draft_is_rejected_and_historical_published_version_still_runs(
     let rejected = f
         .call("run.start", json!({"workflow_id":f.workflow, "version":1}))
         .await;
-    assert_eq!(rejected["error"]["code"], -32012);
+    assert_eq!(rejected["error"]["code"], -32602);
     assert!(f
         .arm
         .list_runs(None, None, None, None, 100)
@@ -194,7 +224,7 @@ async fn explicit_draft_is_rejected_and_historical_published_version_still_runs(
     let rejected = f
         .call("run.start", json!({"workflow_id":f.workflow, "version":2}))
         .await;
-    assert_eq!(rejected["error"]["code"], -32012);
+    assert_eq!(rejected["error"]["code"], -32602);
     for params in [
         json!({"workflow_id":f.workflow, "version":1}),
         json!({"workflow_id":f.workflow}),
@@ -240,7 +270,7 @@ async fn wait_human_waiting(f: &Fixture, run: &str) -> u64 {
 }
 
 /// 信号错误码契约（两后端同一组码；PG 侧在 ws_pg.rs 钉住落账语义）：
-/// run 不存在 → -32011，run 已终结 → -32012，节点不等待信号 → -32010。
+/// run 不存在 → -32011，run 已终结 → -32012，节点不等待信号 → -32602。
 #[tokio::test]
 async fn run_signal_error_codes_follow_the_shared_contract() {
     let f = Fixture::new().await;
@@ -286,7 +316,7 @@ async fn run_signal_error_codes_follow_the_shared_contract() {
             json!({"run_id": run, "node_id": "bogus", "payload": {}}),
         )
         .await;
-    assert_eq!(response["error"]["code"], -32010, "{response}");
+    assert_eq!(response["error"]["code"], -32602, "{response}");
 }
 
 /// 指定 run_id 的订阅契约（两后端共享 run_tail）：先回放完整日志、
@@ -404,21 +434,21 @@ async fn workflow_versions_lists_desc_and_unknown_workflow_is_not_found() {
 async fn schedule_crud_and_next_fire_at() {
     let f = Fixture::new().await;
 
-    // 非法 cron → -32010，不落库
+    // 非法 cron → -32602，不落库
     let bad = f
         .call(
             "schedule.create",
             json!({"workflow_id": f.workflow, "cron": "not a cron"}),
         )
         .await;
-    assert_eq!(bad["error"]["code"], -32010, "{bad}");
+    assert_eq!(bad["error"]["code"], -32602, "{bad}");
     let bad = f
         .call(
             "schedule.create",
             json!({"workflow_id": f.workflow, "cron": "* * * *"}),
         )
         .await;
-    assert_eq!(bad["error"]["code"], -32010, "{bad}");
+    assert_eq!(bad["error"]["code"], -32602, "{bad}");
 
     // workflow 不存在 → -32011
     let missing = f
@@ -462,7 +492,7 @@ async fn schedule_crud_and_next_fire_at() {
     let bad = f
         .call("schedule.update", json!({"id": id, "cron": "bogus"}))
         .await;
-    assert_eq!(bad["error"]["code"], -32010, "{bad}");
+    assert_eq!(bad["error"]["code"], -32602, "{bad}");
     let ok = f
         .call(
             "schedule.update",
@@ -654,7 +684,7 @@ async fn run_source_attribution_and_filter() {
         )
         .await;
     let schedule_id = created["result"]["id"].as_str().unwrap().to_string();
-    flow_rpc::scheduler::fire_due(&f.state.backend, chrono::Local::now()).await;
+    flow_rpc::journal_triggers::fire_due(&f.backend, chrono::Local::now()).await;
     let list = f
         .call(
             "run.list",
@@ -666,7 +696,7 @@ async fn run_source_attribution_and_filter() {
     assert_eq!(runs[0]["source"], "schedule");
     assert_eq!(runs[0]["source_detail"], json!(schedule_id));
 
-    // source 过滤：manual 只剩 run.start 那条；非法 source → -32010
+    // source 过滤：manual 只剩 run.start 那条；非法 source → -32602
     let list = f
         .call(
             "run.list",
@@ -675,7 +705,7 @@ async fn run_source_attribution_and_filter() {
         .await;
     assert_eq!(list["result"]["runs"].as_array().unwrap().len(), 1);
     let bad = f.call("run.list", json!({"source": "cron"})).await;
-    assert_eq!(bad["error"]["code"], -32010, "{bad}");
+    assert_eq!(bad["error"]["code"], -32602, "{bad}");
 }
 
 #[tokio::test]
@@ -713,9 +743,9 @@ async fn run_list_filters_by_status_and_paginates_by_cursor() {
         .await;
     assert_eq!(none["result"]["runs"].as_array().unwrap().len(), 0);
 
-    // 非法 status → -32010
+    // 非法 status → -32602
     let bad = f.call("run.list", json!({"status": "bogus"})).await;
-    assert_eq!(bad["error"]["code"], -32010, "{bad}");
+    assert_eq!(bad["error"]["code"], -32602, "{bad}");
 
     // 游标分页：limit=1 逐页翻，before_run_id 取上一页末尾
     let page1 = f
@@ -838,7 +868,7 @@ async fn template_validation_rejects_bad_fragments() {
             json!({"name": "t", "nodes": [{"id": "x", "type": "nope", "name": "x", "params": {}}], "edges": []}),
         )
         .await;
-    assert_eq!(bad_type["error"]["code"], -32010);
+    assert_eq!(bad_type["error"]["code"], -32602);
 
     // 必填参数缺失（http_call 缺 url）
     let bad_params = f
@@ -847,7 +877,7 @@ async fn template_validation_rejects_bad_fragments() {
             json!({"name": "t", "nodes": [{"id": "x", "type": "http_call", "name": "x", "params": {}}], "edges": []}),
         )
         .await;
-    assert_eq!(bad_params["error"]["code"], -32010);
+    assert_eq!(bad_params["error"]["code"], -32602);
 
     // 边端点不在片段内
     let dangling = f
@@ -856,7 +886,7 @@ async fn template_validation_rejects_bad_fragments() {
             json!({"name": "t", "nodes": nodes, "edges": [{"source": "ghost", "target": "s"}]}),
         )
         .await;
-    assert_eq!(dangling["error"]["code"], -32010);
+    assert_eq!(dangling["error"]["code"], -32602);
 
     // condition 之外的节点不允许 true/false 端口
     let bad_port = f
@@ -865,7 +895,7 @@ async fn template_validation_rejects_bad_fragments() {
             json!({"name": "t", "nodes": nodes, "edges": [{"source": "h", "target": "s", "sourceHandle": "true"}]}),
         )
         .await;
-    assert_eq!(bad_port["error"]["code"], -32010);
+    assert_eq!(bad_port["error"]["code"], -32602);
 
     // 空模板名
     let bad_name = f
@@ -874,7 +904,7 @@ async fn template_validation_rejects_bad_fragments() {
             json!({"name": "  ", "nodes": nodes, "edges": edges}),
         )
         .await;
-    assert_eq!(bad_name["error"]["code"], -32010);
+    assert_eq!(bad_name["error"]["code"], -32602);
 }
 
 // ---- 统一配置 RPC ----
@@ -907,8 +937,8 @@ async fn config_get_update_roundtrip_writes_file_and_redacts_database_url() {
     // get：默认值 + env 覆盖名单 + 路径
     let resp = f.call("config.get", json!({})).await;
     assert_eq!(
-        resp["result"]["config"]["server"]["rpc_addr"],
-        "127.0.0.1:9800"
+        resp["result"]["config"]["journal"]["addr"],
+        "127.0.0.1:9802"
     );
     assert_eq!(resp["result"]["env_overrides"].as_array().unwrap().len(), 1);
 
@@ -916,15 +946,13 @@ async fn config_get_update_roundtrip_writes_file_and_redacts_database_url() {
     let resp = f
         .call(
             "config.update",
-            json!({"patch": {"server": {"rpc_addr": "127.0.0.1:9800", "http_addr": "127.0.0.1:9801",
-                   "scheduler_enabled": false, "scheduler_tick_secs": 30,
-                   "journal_trigger_tick_secs": 20},
+            json!({"patch": {"server": {"scheduler_enabled": false, "journal_trigger_tick_secs": 30},
                    "storage": {"backend": "postgres", "data_dir": "data",
-                               "database": null, "database_url": "postgres://u:p@db/x"}}}),
+                               "database_url": "postgres://u:p@db/x"}}}),
         )
         .await;
     assert_eq!(
-        resp["result"]["config"]["server"]["scheduler_tick_secs"],
+        resp["result"]["config"]["server"]["journal_trigger_tick_secs"],
         30
     );
     assert_eq!(
@@ -935,7 +963,7 @@ async fn config_get_update_roundtrip_writes_file_and_redacts_database_url() {
     // 文件真的写进去了（持久值，非脱敏形状）
     let text = std::fs::read_to_string(&config_path).unwrap();
     assert!(text.contains("postgres://u:p@db/x"));
-    assert!(text.contains("scheduler_tick_secs = 30"));
+    assert!(text.contains("journal_trigger_tick_secs = 30"));
 
     // "<set>" 回传表示保持原值：再改一次别的字段，database_url 不丢
     let resp = f
@@ -958,7 +986,7 @@ async fn config_get_update_roundtrip_writes_file_and_redacts_database_url() {
     let bad = f
         .call("config.update", json!({"patch": {"bogus": {}}}))
         .await;
-    assert_eq!(bad["error"]["code"], -32010);
+    assert_eq!(bad["error"]["code"], -32602);
 
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -214,14 +214,14 @@ pub fn workspace_bin(name: &str) -> PathBuf {
 }
 
 /// 被测产品二进制定位（每个 bin 属于自己的 package）：
-/// - flow-server / flow-journal-server → flow-rpc
+/// - flow-journal-server → flow-rpc
 /// - flow-cli → flow-cli
 /// - flow-agent → flow-agent
 /// - flow-executor → flow-executor
 /// - flow-journal-tool / flow-journal-bench → flow-journal
 /// - flow-journal-dev → flow-backend
 pub fn server_bin() -> PathBuf {
-    workspace_bin("flow-server")
+    workspace_bin("flow-journal-server")
 }
 
 pub fn cli_bin() -> PathBuf {

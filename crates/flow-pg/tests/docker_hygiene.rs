@@ -20,7 +20,7 @@
 //! 这些用例属于「harness 契约」而非「后端行为契约」，所以不套 `e2e_test!`
 //! （那个宏按双后端展开），而是普通 `#[tokio::test]`。
 
-use backend_e2e::common::E2E_DB_PREFIX;
+const E2E_DB_PREFIX: &str = "flow_e2e_";
 use flow_test_support::pg::{
     anonymous_dangling_volumes, container_anonymous_volumes, reclaim_orphan_volumes,
     remove_container, shared, start_probe_container, test_databases, TestDb,

@@ -1,23 +1,23 @@
-//! flow-rpc 集成测试基建：真起 `flow-server` 进程（SQLite / Postgres 两种存储）、
+//! flow-rpc 集成测试基建：真起 `flow-journal-server` 进程（隔离 Journal 目录）、
 //! JSON-RPC 客户端助手、定义构造器。
 //!
 //! 进程脚手架统一在这里：`ServerProc` / `free_port` / `wait_ready` / `connect` /
 //! `named` / `call` / `call_err` / `line_def` 这些跨用例共用的东西只此一份
 //! （DESIGN §13：共享夹具不逐文件复制——复制品会各自漂移）。
-//! PG 测试库交给 `flow-test-support::pg`，flow-pg 的测试与 backend-e2e 都指着
-//! 那一份。
-//!
 //! 就绪判定用 TCP connect 轮询（DESIGN.md §13 的约定）；`connect` 带重试，
 //! 因为进程刚 bind 上端口时 RPC 路由可能还没装完。
 //!
-//! common 被多个测试二进制共享（ws_rpc 只要 SQLite 与进程脚手架，ws_pg 还要
-//! PG 那套），各二进制只用到其中一部分辅助函数。
+//! common 被多个 Journal 测试二进制共享，各自使用不同的辅助函数。
 #![allow(dead_code)]
 
-pub use flow_test_support::io::{server_bin, spawn_reporting_ports};
+pub use flow_test_support::io::spawn_reporting_ports;
+pub fn server_bin() -> std::path::PathBuf {
+    env!("CARGO_BIN_EXE_flow-journal-server").into()
+}
+pub const TOKEN: &str = "flow-rpc-process-test-token-32-bytes";
 
 use std::net::SocketAddr;
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
 use std::time::{Duration, Instant};
 
 use jsonrpsee::core::client::ClientT;
@@ -25,10 +25,7 @@ use jsonrpsee::core::params::ObjectParams;
 use jsonrpsee::ws_client::{WsClient, WsClientBuilder};
 use serde_json::{json, Value};
 
-/// Postgres 测试库名前缀（残留下一次启动时只扫这个前缀的库，全局共用一份）。
-pub const DB_PREFIX: &str = "flow_test_";
-
-/// 一个被测 flow-server 进程。Drop 保证 SIGKILL + wait（不漏僵尸）。
+/// 一个被测 flow-journal-server 进程。Drop 保证 SIGKILL + wait（不漏僵尸）。
 pub struct ServerProc {
     child: Child,
     addr: SocketAddr,
@@ -46,49 +43,6 @@ impl ServerProc {
             child,
             addr,
             http_addr,
-        }
-    }
-
-    /// SQLite 后端：独占临时目录里的 `flow.db`（DESIGN.md §13：只清理独占目录）。
-    ///
-    /// 目录的清理归调用方（[`Workspace`] 持有一个 [`TempDir`]）：重启要复用同一份
-    /// 目录，所有权留在 proc 身上会把目录在重启前删掉。
-    /// Postgres 后端：`role` 为 all / gateway / executor。时间参数全部压到最快，
-    /// 行为测试等不起生产默认值。
-    pub fn spawn_pg(url: &str, role: &str) -> ServerProc {
-        Self::spawn_pg_with(url, role, 5_000, &[])
-    }
-
-    /// 同 [`ServerProc::spawn_pg`]，`extra_env` 覆盖默认环境变量（如拉长
-    /// FLOW_SUBSCRIBE_POLL_MS 证明 NOTIFY 唤醒）。
-    pub fn spawn_pg_with(
-        url: &str,
-        role: &str,
-        signal_wait_ms: u64,
-        extra_env: &[(&str, &str)],
-    ) -> Self {
-        let mut cmd = Command::new(server_bin());
-        cmd.env("FLOW_BACKEND", "postgres")
-            .env("FLOW_DATABASE_URL", url)
-            .env("FLOW_ROLE", role)
-            .env("FLOW_LEASE_TTL_MS", "1500")
-            .env("FLOW_SCAN_INTERVAL_MS", "50")
-            .env("FLOW_INBOX_POLL_MS", "50")
-            .env("FLOW_SUBSCRIBE_POLL_MS", "50")
-            .env("FLOW_SIGNAL_WAIT_MS", signal_wait_ms.to_string())
-            .env("RUST_LOG", "info,flow_pg=debug")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit());
-        for (key, value) in extra_env {
-            cmd.env(key, value);
-        }
-        let (child, ports) = spawn_reporting_ports(&mut cmd, "FLOW_ADDR", "FLOW_HTTP_ADDR", None)
-            .unwrap_or_else(|e| panic!("{e}"));
-        ServerProc {
-            child,
-            addr: ports.rpc,
-            http_addr: ports.http,
         }
     }
 
@@ -154,14 +108,42 @@ pub async fn call<T: serde::de::DeserializeOwned>(
     method: &str,
     params: Value,
 ) -> T {
-    client
-        .request(method, named(params))
+    let method = materialized(method);
+    let reply: Value = client
+        .request(method, named(enrich(method, params)))
         .await
-        .unwrap_or_else(|e| panic!("调用 {method} 失败：{e}"))
+        .unwrap_or_else(|e| panic!("调用 {method} 失败：{e}"));
+    let result = if reply["committed"] == true {
+        reply["result"].clone()
+    } else {
+        reply
+    };
+    serde_json::from_value(result).unwrap()
 }
 
+fn materialized(method: &str) -> &str {
+    match method {
+        "workflow.get" => "workflow.get.full",
+        "workflow.list" => "workflow.list.full",
+        "run.get" => "run.get.full",
+        "run.list" => "run.list.full",
+        "run.events" => "run.events.full",
+        other => other,
+    }
+}
+fn enrich(method: &str, mut params: Value) -> Value {
+    params["_token"] = json!(TOKEN);
+    if flow_rpc::journal_v2::is_write_method(method) && params.get("request_id").is_none() {
+        params["request_id"] = json!(uuid::Uuid::now_v7().to_string());
+    }
+    params
+}
 pub async fn call_err(client: &WsClient, method: &str, params: Value) -> String {
-    match client.request::<Value, _>(method, named(params)).await {
+    let method = materialized(method);
+    match client
+        .request::<Value, _>(method, named(enrich(method, params)))
+        .await
+    {
         Ok(value) => panic!("{method} 本应失败，实际返回 {value}"),
         Err(err) => err.to_string(),
     }
@@ -255,29 +237,4 @@ where
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-}
-
-/// PG 测试库（连接串 + 测试自己断言用的连接池）。
-pub type PgTestDb = flow_test_support::pg::TestDb;
-
-const DEFAULT_URL: &str = "postgres://flow:flow@127.0.0.1:54329/flow";
-
-/// 连到 PG 测试库；未配置且默认端口不可达时返回 None（测试自动跳过）。
-pub async fn test_db() -> Option<PgTestDb> {
-    let base = std::env::var("FLOW_TEST_DATABASE_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    if std::env::var("FLOW_TEST_DATABASE_URL").is_err() && !port_open().await {
-        eprintln!("skip: 未设置 FLOW_TEST_DATABASE_URL 且 {DEFAULT_URL} 不可达");
-        return None;
-    }
-    let db = PgTestDb::create(&base, DB_PREFIX).await;
-    flow_pg::schema::init(db.pool())
-        .await
-        .expect("初始化 schema 失败");
-    Some(db)
-}
-
-async fn port_open() -> bool {
-    tokio::net::TcpStream::connect("127.0.0.1:54329")
-        .await
-        .is_ok()
 }

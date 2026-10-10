@@ -1,4 +1,4 @@
-//! flow-server × journal 后端（AnyBackend::Journal）的端到端契约：
+//! flow-journal-server 的端到端契约：
 //! FLOW_BACKEND=journal 起真实服务进程，跑 v1 全量 RPC 面
 //! （workflow / run / 触发器 / 模板 / config），验证「补齐接口后的 v2
 //! 直接接入」——CLI 与 web 前端对 sqlite 后端的行为在这里逐一对齐。
@@ -24,13 +24,20 @@ async fn spawn_journal_opt(dir: std::path::PathBuf, explicit_backend: bool) -> c
     if explicit_backend {
         cmd.env("FLOW_BACKEND", "journal");
     }
-    cmd.env("FLOW_DATA_DIR", &dir)
+    cmd.env("FLOW_DATA_DIR", dir.join("secrets"))
+        .env("FLOW_JOURNAL_DATA_DIR", dir.join("journal"))
+        .env("FLOW_JOURNAL_TOKEN", common::TOKEN)
         .env("RUST_LOG", "info")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
-    let (child, ports) = spawn_reporting_ports(&mut cmd, "FLOW_ADDR", "FLOW_HTTP_ADDR", None)
-        .unwrap_or_else(|e| panic!("{e}"));
+    let (child, ports) = spawn_reporting_ports(
+        &mut cmd,
+        "FLOW_JOURNAL_ADDR",
+        "FLOW_JOURNAL_HTTP_ADDR",
+        None,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
     common::ServerProc::from_parts(child, ports.rpc, ports.http)
 }
 
@@ -317,18 +324,20 @@ async fn default_backend_is_journal_on_fresh_directory() {
     std::fs::write(v1dir.path().join("flow.db"), b"legacy").unwrap();
     use std::process::{Command, Stdio};
     let output = Command::new(common::server_bin())
-        .env("FLOW_DATA_DIR", v1dir.path())
-        .env("FLOW_ADDR", "127.0.0.1:0")
-        .env("FLOW_HTTP_ADDR", "127.0.0.1:0")
+        .env("FLOW_DATA_DIR", v1dir.path().join("secrets"))
+        .env("FLOW_JOURNAL_DATA_DIR", v1dir.path())
+        .env("FLOW_JOURNAL_TOKEN", common::TOKEN)
+        .env("FLOW_JOURNAL_ADDR", "127.0.0.1:0")
+        .env("FLOW_JOURNAL_HTTP_ADDR", "127.0.0.1:0")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()
-        .expect("spawn flow-server on v1 layout");
+        .expect("spawn flow-journal-server on v1 layout");
     assert!(!output.status.success(), "v1 布局必须拒绝启动");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("v1 SQLite"),
+        stderr.contains("empty data directory") && stderr.contains("import legacy data offline"),
         "错误必须指明 v1 布局与迁移指引：{stderr}"
     );
 }

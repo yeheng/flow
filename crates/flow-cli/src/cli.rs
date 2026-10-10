@@ -16,12 +16,12 @@ use crate::error::CliError;
     arg_required_else_help = true
 )]
 pub struct Cli {
-    /// flow-server 地址；缺 scheme（如 127.0.0.1:9800）按 ws:// 补全
+    /// flow-server 地址；缺 scheme（如 127.0.0.1:9802）按 ws:// 补全
     #[arg(
         long,
         global = true,
         env = "FLOW_RPC",
-        default_value = "ws://127.0.0.1:9800"
+        default_value = "ws://127.0.0.1:9802"
     )]
     url: String,
     /// 打印服务端返回的原始 JSON（2 空格缩进），供 jq 等工具消费

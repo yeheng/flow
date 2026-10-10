@@ -3,12 +3,12 @@
 //! 两种模式：
 //! - 正常模式：解析参数 → 对每个「后端 × 场景」起一个被测进程上下文测量 →
 //!   打印文本报告，可选另存 JSON；
-//! - 自举服务模式（`FLOW_PERF_SERVE=1`）：进程被 harness 当作被测 flow-server
-//!   拉起，跑 [`flow_rpc::run_from_env`]——与 flow-server 二进制逐字同一份实现。
+//! - 自举服务模式（`FLOW_PERF_SERVE=1`）：进程被 harness 当作被测 flow-journal-server
+//!   拉起，跑 [`flow_rpc::serve_journal_product`]，复用产品服务装配。
 //!   自举而不是去 target 目录找别人的 bin：跨 package 拿不到 bin，也不该假设
 //!   target 目录布局。
 //!
-//! 存储上下文（SQLite 独占临时目录 / Postgres docker 测试库、SIGKILL、panic
+//! 存储上下文（Journal 独占临时目录、SIGKILL、panic
 //! 路径清理）复用 backend-e2e 的 harness（[`backend_e2e::common`]）。
 
 mod harness;
@@ -18,21 +18,20 @@ mod scenarios;
 
 use std::time::Instant;
 
-use backend_e2e::common::{Ctx, Kind};
+use backend_e2e::common::Ctx;
 use futures::FutureExt;
 use serde_json::json;
 
-use crate::opts::{BackendSel, Opts, Scenario};
+use crate::opts::{Opts, Scenario};
 use crate::report::{Report, Suite};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var_os("FLOW_PERF_SERVE").is_some() {
-        // 与 flow-server 同形态（sqlite 单线程 runtime / postgres 多线程）：
-        // 压测量的就是生产形态，不给 sqlite 模式多线程的开挂值
+        // 与 flow-journal-server 相同的多线程 runtime。
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        if let Err(err) = runtime.block_on(flow_rpc::run_from_env()) {
+        if let Err(err) = runtime.block_on(serve_product()) {
             eprintln!("被测服务进程异常退出：{err}");
             std::process::exit(1);
         }
@@ -48,7 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn perf_main() {
     if std::env::var_os("FLOW_PERF_SERVE").is_some() {
-        if let Err(err) = flow_rpc::run_from_env().await {
+        if let Err(err) = serve_product().await {
             eprintln!("被测服务进程异常退出：{err}");
             std::process::exit(1);
         }
@@ -61,29 +60,21 @@ async fn perf_main() {
         .to_string_lossy()
         .into_owned();
 
-    let kinds: Vec<Kind> = match opts.backend {
-        BackendSel::Both => vec![Kind::Postgres, Kind::Journal],
-        BackendSel::Postgres => vec![Kind::Postgres],
-        BackendSel::Journal => vec![Kind::Journal],
-    };
-
     let mut reports = Vec::new();
-    for kind in kinds {
-        for &scenario in &opts.scenarios {
-            let started = Instant::now();
-            println!(
-                "▶ backend={} · {} 开始（{}）",
-                kind.name(),
-                scenario.name(),
-                chrono::Local::now().format("%H:%M:%S")
-            );
-            let measured = run_one(scenario, kind, &bin, &opts).await;
-            for report in &measured {
-                report.print();
-            }
-            println!("   用时 {:.1}s\n", started.elapsed().as_secs_f64());
-            reports.extend(measured);
+    for &scenario in &opts.scenarios {
+        let started = Instant::now();
+        println!(
+            "▶ backend={} · {} 开始（{}）",
+            "journal",
+            scenario.name(),
+            chrono::Local::now().format("%H:%M:%S")
+        );
+        let measured = run_one(scenario, &bin, &opts).await;
+        for report in &measured {
+            report.print();
         }
+        println!("   用时 {:.1}s\n", started.elapsed().as_secs_f64());
+        reports.extend(measured);
     }
 
     let suite = Suite {
@@ -116,13 +107,13 @@ async fn perf_main() {
 /// 跑一个「后端 × 场景」：起被测进程上下文 → 测量 → 保证清理。panic 也先清理
 /// 再恢复 unwind（与 backend-e2e 的 run_case 同一条纪律）：绝不漏被测进程、
 /// 测试库或临时目录。
-async fn run_one(scenario: Scenario, kind: Kind, bin: &str, opts: &Opts) -> Vec<Report> {
+async fn run_one(scenario: Scenario, bin: &str, opts: &Opts) -> Vec<Report> {
     let env = opts.server_env();
     let env_refs: Vec<(&str, &str)> = env
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect();
-    let mut ctx = Ctx::start_with(kind, bin, &env_refs).await;
+    let mut ctx = Ctx::start_with(bin, &env_refs).await;
     let outcome = std::panic::AssertUnwindSafe(scenarios::run(scenario, &mut ctx, opts))
         .catch_unwind()
         .await;
@@ -143,4 +134,10 @@ async fn run_one(scenario: Scenario, kind: Kind, bin: &str, opts: &Opts) -> Vec<
             std::panic::resume_unwind(payload)
         }
     }
+}
+
+async fn serve_product() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let loaded = flow_config::Config::load(None)?;
+    flow_rpc::serve_journal_product(loaded.config, loaded.path).await
 }

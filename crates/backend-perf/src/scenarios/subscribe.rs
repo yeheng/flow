@@ -1,19 +1,18 @@
 //! 订阅推送延迟：run.start 返回后，事件多久到达订阅端。
 //!
 //! 口径：`push_first_event_ms` / `push_terminal_ms` 都以 run.start 的 RPC 响应
-//! 返回为 0 点（提交已确认，事件必然产生在此后），量的是「落账 → 推送到达」
-//! 在端到端上的净效果；`run_start_ms` 单独报告，便于把提交延迟从推送延迟里剥离。
+//! 返回为 0 点（部分事件可能已发生，随后通过回放追平），量的是「提交响应 → 订阅到达」
+//! 的端到端耗时（含建立单 run 订阅与回放）；`run_start_ms` 单独报告，便于把提交延迟从推送延迟里剥离。
 //! 小并发（≤8）提交，模拟「少量用户盯着 run 看进度」而不是吞吐压力。
 //!
-//! 两后端的推送机制不同（SQLite 进程内广播 / Postgres 按 last_seq 追共享日志 +
-//! LISTEN/NOTIFY），这里的指标就是给这个差异量个数。
+//! V2 按 run 建立订阅，覆盖回放追平和后续实时增量。
 
-use backend_e2e::common::{publish_workflow, subscribe, Ctx};
+use backend_e2e::common::{publish_workflow, Ctx};
 use serde_json::json;
 
 use crate::harness::{
     chain_def, collect_arrivals, error_digest, start_runs_measured, unique_name, warm_up_run,
-    Marks, SETTLE, WARMUP_RUNS,
+    Marks, WARMUP_RUNS,
 };
 use crate::opts::Opts;
 use crate::report::{Latency, Report};
@@ -31,13 +30,10 @@ pub async fn run(ctx: &mut Ctx, opts: &Opts) -> Vec<Report> {
     )
     .await;
 
-    // 预热后建立全局订阅（纯实时增量，DESIGN §9），等接收端就位再开跑。
+    // 预热后开跑；收集器在每个 run.start 返回后建立该 run 的订阅。
     for _ in 0..WARMUP_RUNS {
         warm_up_run(&client, &workflow_id).await;
     }
-    let sub_client = ctx.client().await;
-    let mut sub = subscribe(&sub_client, None).await;
-    tokio::time::sleep(SETTLE).await;
 
     let concurrency = opts.concurrency.min(MAX_SUBSCRIBE_CONCURRENCY);
     let input = json!({});
@@ -45,7 +41,7 @@ pub async fn run(ctx: &mut Ctx, opts: &Opts) -> Vec<Report> {
     let marks = Marks::starting(opts.subscribe_runs, concurrency);
     let (_, arrivals) = tokio::join!(
         start_runs_measured(&client, &workflow_id, &input, &marks, timeout),
-        collect_arrivals(&mut sub, &marks, opts.subscribe_runs, timeout),
+        collect_arrivals(&client, &marks, opts.subscribe_runs, timeout),
     );
     let started = marks.len();
     let submit_errors = marks.error_count();
@@ -83,7 +79,7 @@ pub async fn run(ctx: &mut Ctx, opts: &Opts) -> Vec<Report> {
     }
 
     vec![Report::new(
-        ctx.kind.name(),
+        "journal",
         "subscribe_latency",
         json!({
             "runs": opts.subscribe_runs,

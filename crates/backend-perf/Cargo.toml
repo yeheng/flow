@@ -1,9 +1,9 @@
-# backend-perf：后端性能压测 harness（黑盒，真起被测进程，双后端矩阵）。
+# backend-perf：后端性能压测 harness（黑盒，真起被测进程，Journal 产品后端）。
 #
 # 与 backend-e2e 的分工：e2e 钉行为契约，这里量性能——run 执行吞吐、
 # RPC 读路径延迟、订阅推送延迟、崩溃恢复耗时。被测进程是本二进制的自举
-# 服务模式（FLOW_PERF_SERVE=1 → flow_rpc::run_from_env），与 flow-server
-# 逐字同一份实现；存储上下文（独占临时目录 / docker 测试库、panic 路径清理）
+# 服务模式（FLOW_PERF_SERVE=1 → flow_rpc::serve_journal_product），与 flow-journal-server
+# 相同产品装配；存储上下文（独占临时目录、panic 路径清理）
 # 复用 backend-e2e 的 harness。
 #
 # 运行：cargo run -p backend-perf -- --help
@@ -15,7 +15,7 @@ edition.workspace = true
 publish = false
 
 # 二进制叫 flow-perf：自举服务模式（FLOW_PERF_SERVE=1）下它就是被测进程，
-# 名字与 flow-server 同族，进程表里一眼能认出哪个是被测端。
+# 名字与 flow-journal-server 同族，进程表里一眼能认出哪个是被测端。
 [[bin]]
 name = "flow-perf"
 path = "src/main.rs"
@@ -30,3 +30,6 @@ chrono = { workspace = true }
 jsonrpsee = { version = "0.26", features = ["client", "ws-client"] }
 flow-rpc = { path = "../flow-rpc" }
 backend-e2e = { path = "../backend-e2e" }
+
+flow-config = { path = "../flow-config" }
+rustls = { workspace = true }

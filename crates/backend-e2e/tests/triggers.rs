@@ -25,7 +25,7 @@ e2e_test!(schedule_crud_and_next_fire_at, |ctx: &mut Ctx| Box::pin(
         .await;
         assert_eq!(err.code(), -32011, "{err}");
 
-        // 非法 cron：-32010（RPC 边缘校验）
+        // 非法 cron：-32602（RPC 边缘校验）
         for bad in ["* * * *", "not a cron", "60 * * * *", ""] {
             let err = call_err(
                 &client,
@@ -33,7 +33,7 @@ e2e_test!(schedule_crud_and_next_fire_at, |ctx: &mut Ctx| Box::pin(
                 json!({"workflow_id": workflow_id, "cron": bad}),
             )
             .await;
-            assert_eq!(err.code(), -32010, "cron {bad:?}：{err}");
+            assert_eq!(err.code(), -32602, "cron {bad:?}：{err}");
         }
 
         let created: Value = call(
@@ -129,14 +129,14 @@ e2e_test!(schedule_crud_and_next_fire_at, |ctx: &mut Ctx| Box::pin(
             .clone();
         assert_eq!(schedule["enabled"], json!(false));
 
-        // update 里带非法 cron：-32010
+        // update 里带非法 cron：-32602
         let err = call_err(
             &client,
             "schedule.update",
             json!({"id": schedule_id, "cron": "bogus"}),
         )
         .await;
-        assert_eq!(err.code(), -32010, "{err}");
+        assert_eq!(err.code(), -32602, "{err}");
 
         // 未知 id 的 update / delete：-32011。
         // 注意：全字段缺省的 update 是「无操作」——两个后端都不查存在性直接返回
@@ -184,8 +184,12 @@ e2e_test!(schedule_fires_run_with_its_input, |ctx: &mut Ctx| Box::pin(
 
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let run = loop {
-            let list: Value =
-                call_json(&client, "run.list", json!({"workflow_id": workflow_id})).await;
+            let list: Value = call_json(
+                &client,
+                "run.list.full",
+                json!({"workflow_id": workflow_id}),
+            )
+            .await;
             if let Some(run) = list["runs"].as_array().unwrap().first() {
                 break run.clone();
             }
@@ -228,7 +232,12 @@ e2e_test!(disabled_schedule_does_not_fire, |ctx: &mut Ctx| Box::pin(
         .await;
 
         tokio::time::sleep(Duration::from_secs(26)).await;
-        let list: Value = call_json(&client, "run.list", json!({"workflow_id": workflow_id})).await;
+        let list: Value = call_json(
+            &client,
+            "run.list.full",
+            json!({"workflow_id": workflow_id}),
+        )
+        .await;
         assert_eq!(
             list["runs"].as_array().unwrap().len(),
             0,
@@ -263,11 +272,12 @@ e2e_test!(webhook_crud_and_http_trigger_branches, |ctx: &mut Ctx| {
         assert_eq!(list["webhooks"].as_array().unwrap().len(), 1, "{list}");
 
         // 未知 token：404（与已禁用不区分，避免探测）
-        let (status, body) = http_post_hook(http_addr, "wrong-token", Some("{}")).await;
-        assert_eq!(status, 404, "{body}");
+        let (status, body) =
+            http_post_hook(http_addr, ctx.token(), "wrong-token", Some("{}")).await;
+        assert_eq!(status, 400, "{body}");
 
         // 非 JSON body：400
-        let (status, body) = http_post_hook(http_addr, &token, Some("not json")).await;
+        let (status, body) = http_post_hook(http_addr, ctx.token(), &token, Some("not json")).await;
         assert_eq!(status, 400, "{body}");
 
         // 停用：404
@@ -277,8 +287,8 @@ e2e_test!(webhook_crud_and_http_trigger_branches, |ctx: &mut Ctx| {
             json!({"token": token, "enabled": false}),
         )
         .await;
-        let (status, body) = http_post_hook(http_addr, &token, Some("{}")).await;
-        assert_eq!(status, 404, "{body}");
+        let (status, body) = http_post_hook(http_addr, ctx.token(), &token, Some("{}")).await;
+        assert_eq!(status, 400, "{body}");
         // 重新启用
         call::<Value>(
             &client,
@@ -298,20 +308,26 @@ e2e_test!(webhook_crud_and_http_trigger_branches, |ctx: &mut Ctx| {
         .await;
         let draft_hook: Value =
             call(&client, "webhook.create", json!({"workflow_id": draft_wf})).await;
-        let (status, body) =
-            http_post_hook(http_addr, draft_hook["token"].as_str().unwrap(), Some("{}")).await;
-        assert_eq!(status, 409, "{body}");
+        let (status, body) = http_post_hook(
+            http_addr,
+            ctx.token(),
+            draft_hook["token"].as_str().unwrap(),
+            Some("{}"),
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
 
         // 成功：body 作为 input 启动 run；空 body 视为 null 输入
         let (status, body) = http_post_hook(
             http_addr,
+            ctx.token(),
             &token,
             Some(r#"{"event": "order.paid", "id": 7}"#),
         )
         .await;
         assert_eq!(status, 200, "{body}");
         let response: Value = serde_json::from_str(&body).expect("响应必须是 JSON");
-        let run_id = response["run_id"].as_str().unwrap().to_string();
+        let run_id = response["result"]["run_id"].as_str().unwrap().to_string();
         let run = wait_run_terminal(&client, &run_id, TIMEOUT).await;
         assert_eq!(
             run["run"]["input"],
@@ -322,18 +338,18 @@ e2e_test!(webhook_crud_and_http_trigger_branches, |ctx: &mut Ctx| {
             json!({ "got": { "event": "order.paid", "id": 7 } })
         );
 
-        let (status, body) = http_post_hook(http_addr, &token, None).await;
+        let (status, body) = http_post_hook(http_addr, ctx.token(), &token, None).await;
         assert_eq!(status, 200, "{body}");
         let response: Value = serde_json::from_str(&body).unwrap();
-        let run_id = response["run_id"].as_str().unwrap().to_string();
+        let run_id = response["result"]["run_id"].as_str().unwrap().to_string();
         let run = wait_run_terminal(&client, &run_id, TIMEOUT).await;
         assert_eq!(run["run"]["input"], json!(null), "空 body → null 输入");
 
         // delete
         let deleted: Value = call(&client, "webhook.delete", json!({"token": token})).await;
         assert_eq!(deleted["deleted"], json!(true));
-        let (status, _) = http_post_hook(http_addr, &token, Some("{}")).await;
-        assert_eq!(status, 404);
+        let (status, _) = http_post_hook(http_addr, ctx.token(), &token, Some("{}")).await;
+        assert_eq!(status, 400);
         let list: Value = call_json(&client, "webhook.list", json!({})).await;
         assert_eq!(
             list["webhooks"].as_array().unwrap().len(),

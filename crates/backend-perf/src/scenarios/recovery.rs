@@ -13,12 +13,12 @@
 use std::time::{Duration, Instant};
 
 use backend_e2e::common::fixtures::human_def;
-use backend_e2e::common::{call_json, publish_workflow, subscribe, Client, Ctx, TIMEOUT};
+use backend_e2e::common::{call_json, publish_workflow, Conn, Ctx, TIMEOUT};
 use serde_json::json;
 
 use crate::harness::{
     collect_arrivals, deliver_signal, error_digest, ms, start_runs_measured, unique_name,
-    wait_node_running, Marks, SETTLE,
+    wait_node_running, Marks,
 };
 use crate::opts::Opts;
 use crate::report::{Latency, Report};
@@ -27,8 +27,6 @@ use crate::report::{Latency, Report};
 const HUMAN_NODE: &str = "h";
 
 pub async fn run(ctx: &mut Ctx, opts: &Opts) -> Vec<Report> {
-    let is_pg = ctx.is_pg();
-
     // 基线：空存储重启。SIGKILL + 同一存储拉起 + 就绪，不含任何恢复工作。
     let empty_started = Instant::now();
     ctx.restart().await;
@@ -75,21 +73,18 @@ pub async fn run(ctx: &mut Ctx, opts: &Opts) -> Vec<Report> {
         wait_live(&client, &run_id, TIMEOUT).await;
     }
 
-    // 恢复后推进：逐个交付信号直到全部终态（交付耗时含 pending 追账）。
-    let sub_client = ctx.client().await;
-    let mut sub = subscribe(&sub_client, None).await;
-    tokio::time::sleep(SETTLE).await;
+    // 恢复后推进：逐个交付信号直到全部终态（交付耗时含投影可见屏障）。
     let run_ids = marks.run_ids();
     let resume_started = Instant::now();
     let (signal_latency, arrivals) = tokio::join!(
-        signal_all(&client, is_pg, &run_ids),
-        collect_arrivals(&mut sub, &marks, parked, Duration::from_secs(60)),
+        signal_all(&client, &run_ids),
+        collect_arrivals(&client, &marks, parked, Duration::from_secs(60)),
     );
     let resume_wall = resume_started.elapsed();
     arrivals.assert_complete(parked, "crash_recovery/resume");
 
     vec![Report::new(
-        ctx.kind.name(),
+        "journal",
         "crash_recovery",
         json!({
             "requested_runs": opts.recovery_runs,
@@ -110,12 +105,12 @@ pub async fn run(ctx: &mut Ctx, opts: &Opts) -> Vec<Report> {
 }
 
 /// run.get 等到 run 重新活着且仍在 running（重启后恢复成功的验收）。
-async fn wait_live(client: &Client, run_id: &str, timeout: Duration) {
+async fn wait_live(client: &Conn, run_id: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     #[allow(unused_assignments)]
     let mut last = serde_json::Value::Null;
     loop {
-        last = call_json(client, "run.get", json!({ "run_id": run_id })).await;
+        last = call_json(client, "run.get.full", json!({ "run_id": run_id })).await;
         if last["live"] == json!(true) && last["run"]["status"] == json!("running") {
             return;
         }
@@ -128,17 +123,11 @@ async fn wait_live(client: &Client, run_id: &str, timeout: Duration) {
 }
 
 /// 串行交付 N 个信号，返回每个信号的交付耗时。
-async fn signal_all(client: &Client, is_pg: bool, run_ids: &[String]) -> Latency {
+async fn signal_all(client: &Conn, run_ids: &[String]) -> Latency {
     let mut latency = Latency::default();
     for run_id in run_ids {
-        let spent = deliver_signal(
-            client,
-            is_pg,
-            run_id,
-            HUMAN_NODE,
-            json!({ "approved_by": "perf" }),
-        )
-        .await;
+        let spent =
+            deliver_signal(client, run_id, HUMAN_NODE, json!({ "approved_by": "perf" })).await;
         latency.add(spent);
     }
     latency

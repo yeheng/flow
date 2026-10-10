@@ -315,3 +315,171 @@ async fn slow_subscription_can_resume_by_pages_and_terminal_audit_stays_live() {
     drop(b);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test]
+async fn delete_workflow_with_runs_is_rejected_by_authoritative_rpc() {
+    let root = flow_test_support::io::TempDir::new("v2-delete-guard");
+    let backend = JournalBackend::open(root.path(), Default::default())
+        .await
+        .unwrap();
+    let token = "delete-guard-token-at-least-32-bytes";
+    let module = flow_rpc::journal_v2::module(backend.clone(), token.into()).unwrap();
+    let created = backend.workflow_create("history", None).await.unwrap();
+    let workflow = created.result["workflow_id"].as_str().unwrap();
+    backend.workflow_update(workflow, json!({"nodes":[{"id":"s","type":"start"},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"e"}]}), None).await.unwrap();
+    backend.workflow_publish(workflow, 1, None).await.unwrap();
+    let run = backend
+        .run_start(workflow, None, Value::Null, "manual", None, None)
+        .await
+        .unwrap();
+    let run = run.result["run_id"].as_str().unwrap();
+    let before = backend.journal.durable_lsn();
+    let rejected = call(
+        &module,
+        "workflow.delete",
+        json!({"_token":token,"request_id":"delete","workflow_id":workflow}),
+    )
+    .await;
+    assert_eq!(rejected["error"]["code"], -32012, "{rejected}");
+    assert_eq!(backend.journal.durable_lsn(), before);
+    assert!(
+        flow_backend::journal_arm::get_version(&backend, workflow, Some(1))
+            .await
+            .is_ok()
+    );
+    let timeline = call(
+        &module,
+        "run.timeline",
+        json!({"_token":token,"run_id":run}),
+    )
+    .await;
+    assert!(timeline.get("error").is_none(), "{timeline}");
+    backend.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn product_crud_replays_receipts_and_rejects_changed_arguments() {
+    let root = flow_test_support::io::TempDir::new("v2-product-idempotence");
+    let backend = JournalBackend::open(root.path(), Default::default())
+        .await
+        .unwrap();
+    let token = "product-crud-token-at-least-32-bytes";
+    let module = flow_rpc::journal_v2::module(backend.clone(), token.into()).unwrap();
+    let workflow = backend
+        .workflow_create("triggers", None)
+        .await
+        .unwrap()
+        .result["workflow_id"]
+        .clone();
+    for (namespace, mut args) in [
+        (
+            "schedule",
+            json!({"workflow_id":workflow,"cron":"* * * * *"}),
+        ),
+        ("webhook", json!({"workflow_id":workflow})),
+        (
+            "template",
+            json!({"name":"reusable","nodes":[{"id":"n","type":"script","name":"Script","params":{"code":"return 1;"}}],"edges":[]}),
+        ),
+    ] {
+        args["_token"] = json!(token);
+        args["request_id"] = json!("create");
+        let method = format!("{namespace}.create");
+        let (first, duplicate) = tokio::join!(
+            call(&module, &method, args.clone()),
+            call(&module, &method, args.clone())
+        );
+        assert_eq!(first, duplicate, "concurrent duplicate of {method}");
+        assert_eq!(first["result"]["committed"], true, "{first}");
+        let status = call(
+            &module,
+            "command.status",
+            json!({"_token":token,"scope":method,"request_id":"create"}),
+        )
+        .await;
+        assert_eq!(status["result"], first["result"]);
+        let mut changed = args.clone();
+        if namespace == "template" {
+            changed["name"] = json!("different");
+        } else {
+            changed["workflow_id"] = json!("different");
+        }
+        assert_eq!(
+            call(&module, &method, changed).await["error"]["code"],
+            -32012
+        );
+        let key_field = if namespace == "webhook" {
+            "token"
+        } else {
+            "id"
+        };
+        let key = first["result"]["result"][key_field].clone();
+        assert!(key.is_string(), "{first}");
+        let mut update = json!({"_token":token,"request_id":"update", (key_field):key});
+        let update_method = if namespace == "webhook" {
+            "webhook.set_enabled".to_owned()
+        } else {
+            format!("{namespace}.update")
+        };
+        if namespace == "template" {
+            update["category"] = json!("tools");
+        } else {
+            update["enabled"] = json!(false);
+        }
+        let updated = call(&module, &update_method, update.clone()).await;
+        assert_eq!(updated["result"]["committed"], true, "{updated}");
+        assert_eq!(updated, call(&module, &update_method, update).await);
+        let delete = json!({"_token":token,"request_id":"delete", (key_field):key});
+        let delete_method = format!("{namespace}.delete");
+        let deleted = call(&module, &delete_method, delete.clone()).await;
+        assert_eq!(deleted["result"]["result"]["deleted"], true, "{deleted}");
+        assert_eq!(deleted, call(&module, &delete_method, delete).await);
+        // Replaying a creation must return its original receipt even after deletion.
+        assert_eq!(first, call(&module, &method, args).await);
+    }
+    let state = backend.state().await;
+    assert!(state.schedules.is_empty() && state.webhooks.is_empty() && state.templates.is_empty());
+    backend.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn product_creation_reports_commit_during_projection_delay() {
+    let root = flow_test_support::io::TempDir::new("v2-product-projection-delay");
+    let backend = JournalBackend::open(root.path(), Default::default())
+        .await
+        .unwrap();
+    let token = "product-delay-token-at-least-32-bytes";
+    let module = flow_rpc::journal_v2::module(backend.clone(), token.into()).unwrap();
+    let workflow = backend
+        .workflow_create("delayed", None)
+        .await
+        .unwrap()
+        .result["workflow_id"]
+        .clone();
+    backend.pause_projection(true);
+    let args =
+        json!({"_token":token,"request_id":"stable","workflow_id":workflow,"cron":"* * * * *"});
+    let response = call(&module, "schedule.create", args.clone()).await;
+    assert_eq!(
+        response["error"]["code"],
+        flow_rpc::journal_v2::COMMITTED_NOT_VISIBLE,
+        "{response}"
+    );
+    let original = response["error"]["data"].clone();
+    assert_eq!(original["committed"], true);
+    assert_eq!(original["request_id"], "stable");
+    let status = call(
+        &module,
+        "command.status",
+        json!({"_token":token,"scope":"schedule.create","request_id":"stable"}),
+    )
+    .await;
+    assert_eq!(status["result"], original);
+    backend.pause_projection(false);
+    let retry = call(&module, "schedule.create", args).await;
+    assert_eq!(retry["result"]["commit_cursor"], original["commit_cursor"]);
+    assert_eq!(retry["result"]["result"], original["result"]);
+    assert_eq!(retry["result"]["visible"], true);
+    assert_eq!(backend.state().await.schedules.len(), 1);
+    backend.close().await.unwrap();
+}

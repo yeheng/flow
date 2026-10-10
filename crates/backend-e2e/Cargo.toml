@@ -1,16 +1,13 @@
-# backend-e2e：端到端测试项目（真起 flow-server 进程，双后端全矩阵）。
+# backend-e2e：端到端测试项目（真起 flow-journal-server 进程，journal v2 产品面）。
 #
 # 覆盖策略（DESIGN.md §13 的延伸）：
-# - 每个用例对 SQLite（canonical，独占临时目录）与 Postgres（docker 容器）各跑一遍，
-#   钉死「两个后端同一套契约」；
-# - Postgres 由本 crate 自己用 docker CLI 起容器（label: com.flow.e2e=1），
-#   进程退出（atexit）与下次运行启动时都会清理残余容器；
-# - 每个用例独占一个测试数据库（e2e_<ts>_<uuid>），用例结束即 DROP，
-#   panic 路径也保证清理（run_case 的 catch_unwind）。
+# - 每个用例独占一个临时 journal 目录（v2 唯一权威，全新数据集），经真实
+#   wire（进程外 WS + HTTP）钉 v2 协议与物化数据形状；
+# - Postgres 臂已随 flow-server 退役（v1 RPC 面删除；flow-pg 保留为库，
+#   其自身测试在 crates/flow-pg）。
 #
 # 运行：cargo test -p backend-e2e
 # 环境变量：
-#   FLOW_E2E_PG_IMAGE   Postgres 镜像（默认 postgres:16-alpine）
 #   RUST_LOG           透传给被测服务进程（默认 info）
 [package]
 name = "backend-e2e"
@@ -27,28 +24,26 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 jsonrpsee = { version = "0.26", features = ["client", "ws-client"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
-sqlx = { version = "0.9", features = ["postgres", "runtime-tokio", "chrono", "json"] }
-flow-pg = { path = "../flow-pg" }
 flow-backend = { path = "../flow-backend" }
 flow-rpc = { path = "../flow-rpc" }
+flow-config = { path = "../flow-config" }
 flow-test-support = { path = "../flow-test-support" }
-axum = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+rustls = { workspace = true }
 
-# 被测二进制：与 flow-rpc 的 flow-server 同源（同一份 serve/scheduler/webhook），
-# 这里包一层薄 main，让本 crate 的集成测试能用 env!("CARGO_BIN_EXE_flow-server-e2e")
-# 定位到「本 crate 自己构建的」服务进程，不依赖外部 target 目录布局。
+# 被测二进制：与 flow-rpc 的 flow-journal-server 同源（同一份
+# serve_journal_product），这里包一层薄 main，让本 crate 的集成测试能用
+# env!("CARGO_BIN_EXE_flow-journal-server-e2e") 定位到「本 crate 自己构建的」
+# 服务进程，不依赖外部 target 目录布局。
 #
-# 名字必须与 flow-rpc 的 flow-server 不同：同名会写同一个 target/debug/flow-server，
-# cargo 报 output filename collision，谁覆盖谁取决于构建顺序——e2e 于是可能
-# 静默跑在 flow-rpc 的产物上。
+# 名字必须与 flow-rpc 的 flow-journal-server 不同：同名会写同一个
+# target/debug/flow-journal-server，cargo 报 output filename collision，
+# 谁覆盖谁取决于构建顺序——e2e 于是可能静默跑在 flow-rpc 的产物上。
 #
-# 测试基建（docker 容器 / 独占测试库 / TempDir / 端口等待）在 flow-test-support：
-# 与 flow-pg、flow-rpc 的测试同指一份，单点维护。publish = false，不进产品二进制。
+# 测试基建（TempDir / 端口等待 / 就绪标记解析）在 flow-test-support：
+# 与 flow-rpc 的测试同指一份，单点维护。publish = false，不进产品二进制。
 [[bin]]
-name = "flow-server-e2e"
-path = "src/bin/flow-server-e2e.rs"
+name = "flow-journal-server-e2e"
+path = "src/bin/flow-journal-server-e2e.rs"
 
 [dev-dependencies]
 sha2 = { workspace = true }

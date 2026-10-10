@@ -198,17 +198,13 @@ export interface SecretInfo {
 // ---- 统一配置（crates/flow-config/src/lib.rs Config；分区形状对齐） ----
 
 export interface ServerConfig {
-  rpc_addr: string;
-  http_addr: string;
   scheduler_enabled: boolean;
-  scheduler_tick_secs: number;
   journal_trigger_tick_secs: number;
 }
 
 export interface StorageConfig {
-  backend: "sqlite" | "postgres";
+  backend: "journal" | "postgres";
   data_dir: string;
-  database: string | null;
   /** config.get 里已设置为 "<set>"（脱敏）；update 传 "<set>" 表示保持原值 */
   database_url: string | null;
 }

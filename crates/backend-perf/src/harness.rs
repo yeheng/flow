@@ -18,9 +18,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use backend_e2e::common::fixtures::timeline_node;
-use backend_e2e::common::{call, call_json, named, wait_run_terminal, Client, TIMEOUT};
+use backend_e2e::common::{
+    call, call_json, subscribe, try_call_json, wait_run_terminal, Conn, TIMEOUT,
+};
 use futures::StreamExt;
-use jsonrpsee::core::client::{ClientT, Subscription};
+
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -29,7 +31,6 @@ pub const WARMUP_RUNS: usize = 4;
 
 /// 订阅建立到接收端就位的等待（全局流是纯实时增量，DESIGN §9：订阅注册略晚于
 /// RPC 返回，开跑前先等接收端就位，否则开头的事件不在流里）。
-pub const SETTLE: Duration = Duration::from_millis(300);
 
 /// Duration → 毫秒（报告里的计数器统一 ms 浮点）。
 pub fn ms(elapsed: Duration) -> f64 {
@@ -37,14 +38,14 @@ pub fn ms(elapsed: Duration) -> f64 {
 }
 
 /// 预热一个 run：提交并等终态，返回 run_id。
-pub async fn warm_up_run(client: &Client, workflow_id: &str) -> String {
+pub async fn warm_up_run(client: &Conn, workflow_id: &str) -> String {
     let run_id = start_one(client, workflow_id, &json!({ "x": 1 })).await;
     wait_run_terminal(client, &run_id, TIMEOUT).await;
     run_id
 }
 
 /// 提交一个 run（失败即 panic）：预热、非测量路径用。
-async fn start_one(client: &Client, workflow_id: &str, input: &Value) -> String {
+async fn start_one(client: &Conn, workflow_id: &str, input: &Value) -> String {
     let value: Value = call(
         client,
         "run.start",
@@ -244,7 +245,7 @@ pub fn error_digest(marks: &Marks) -> String {
 /// 测量专用通道；失败不 panic，由场景决定报错还是计入计数器。限流等待以
 /// `timeout` 兜底：收集器停了也只会多提交，不会把提交侧卡死。
 pub async fn start_runs_measured(
-    client: &Client,
+    client: &Conn,
     workflow_id: &str,
     input: &Value,
     marks: &Marks,
@@ -260,16 +261,13 @@ pub async fn start_runs_measured(
                 }
                 marks.begin_attempt();
                 let call_at = Instant::now();
-                let started = client
-                    .request::<Value, _>(
-                        "run.start",
-                        named(json!({ "workflow_id": workflow_id, "input": input.clone() })),
-                    )
-                    .await;
+                let started = try_call_json(client, "run.start", json!({
+                    "workflow_id": workflow_id, "input": input, "request_id": Uuid::now_v7().to_string()
+                })).await;
                 let returned = Instant::now();
                 match started {
                     Ok(value) => {
-                        let run_id = value["run_id"]
+                        let run_id = value["result"]["run_id"]
                             .as_str()
                             .expect("run.start 未回 run_id")
                             .to_string();
@@ -293,7 +291,7 @@ pub async fn start_runs_measured(
 
 // ---- 订阅事件到达 ----
 
-/// 全局订阅流上观测到的事件到达时刻（按 run_id 归并）。
+/// 各 run 订阅上观测到的事件到达时刻（按 run_id 归并）。
 #[derive(Debug, Default)]
 pub struct Arrivals {
     pub first: HashMap<String, Instant>,
@@ -324,17 +322,18 @@ impl Arrivals {
 /// 个终态事件、或 `marks` 里提交成功的 run 全部到终态、或 `timeout` 用尽即
 /// 返回（没收到的缺口由调用方 `assert_complete` 报）。
 ///
-/// 全局流是纯实时增量（DESIGN §9）：调用方必须先订阅、等接收端就位再开跑，
-/// 否则开头的事件不在流里。
+/// run.start 返回后为每个 run 建立订阅，从头回放，再接收实时增量。
 pub async fn collect_arrivals(
-    sub: &mut Subscription<Value>,
+    client: &Conn,
     marks: &Marks,
     expect: usize,
     timeout: Duration,
 ) -> Arrivals {
+    let mut streams = futures::stream::SelectAll::new();
+    let mut subscribed = std::collections::HashSet::new();
     let deadline = tokio::time::Instant::now() + timeout;
     // 空闲窗口：没有新事件时也要定期回来看追平条件（提交可能刚结束）
-    let idle = Duration::from_millis(200);
+    let idle = Duration::from_millis(5);
     let mut arrivals = Arrivals::default();
     loop {
         // 追平：提交全部结束，且收满 expect 或所有提交成功的 run 都到终态
@@ -346,8 +345,17 @@ pub async fn collect_arrivals(
         if tokio::time::Instant::now() >= deadline {
             break; // 超时：缺口交给 assert_complete 报
         }
+        for run in marks.run_ids() {
+            if subscribed.insert(run.clone()) {
+                streams.push(subscribe(client, &run).await);
+            }
+        }
         let window = deadline.min(tokio::time::Instant::now() + idle);
-        match tokio::time::timeout_at(window, sub.next()).await {
+        let received = tokio::select! {
+            item = streams.next(), if !streams.is_empty() => Ok(item),
+            _ = tokio::time::sleep_until(window) => Err(()),
+        };
+        match received {
             Ok(Some(Ok(envelope))) => {
                 let Some(run_id) = envelope["run_id"].as_str() else {
                     continue;
@@ -370,8 +378,9 @@ pub async fn collect_arrivals(
                     _ => {}
                 }
             }
-            Ok(Some(Err(_))) | Ok(None) => break, // 订阅流出错 / 结束
-            Err(_) => {}                          // 空闲窗口，回去重查追平条件
+            Ok(Some(Err(_))) => break,
+            Ok(None) => {} // 订阅流出错 / 结束
+            Err(_) => {}   // 空闲窗口，回去重查追平条件
         }
     }
     arrivals
@@ -381,7 +390,7 @@ pub async fn collect_arrivals(
 
 /// 轮询 run.timeline 等节点进入 `running`（human_task 停驻点），返回时间线。
 pub async fn wait_node_running(
-    client: &Client,
+    client: &Conn,
     run_id: &str,
     node_id: &str,
     timeout: Duration,
@@ -402,49 +411,20 @@ pub async fn wait_node_running(
     }
 }
 
-/// 交付信号直到落账，返回交付耗时（Postgres 的 pending 追账也算进去）。
-///
-/// 两后端差异（DESIGN §9）：SQLite 同步交付直接回 delivered；Postgres 走
-/// 持久 inbox，可能先回 pending，用 run.signal_status 追到 delivered。
+/// 交付 Journal 信号，返回命令提交与投影可见的耗时。
 pub async fn deliver_signal(
-    client: &Client,
-    is_pg: bool,
+    client: &Conn,
     run_id: &str,
     node_id: &str,
     payload: Value,
 ) -> Duration {
-    let signal_id = format!("sig-{}", Uuid::now_v7().simple());
     let started = Instant::now();
     let ack: Value = call(
         client,
         "run.signal",
-        json!({
-            "run_id": run_id,
-            "signal_id": signal_id,
-            "node_id": node_id,
-            "payload": payload,
-        }),
+        json!({ "run_id": run_id, "node_id": node_id, "payload": payload }),
     )
     .await;
-    if ack["delivered"] == json!(true) {
-        return started.elapsed();
-    }
-    assert!(is_pg, "SQLite 信号必须同步交付，实际回执：{ack}");
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
-        let status: Value = call(
-            client,
-            "run.signal_status",
-            json!({ "run_id": run_id, "signal_id": signal_id }),
-        )
-        .await;
-        if status["delivered"] == json!(true) {
-            return started.elapsed();
-        }
-        assert!(
-            Instant::now() < deadline,
-            "信号 {signal_id} 在 {TIMEOUT:?} 内未落账：{status}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    assert_eq!(ack["delivered"], json!(true), "信号提交回执：{ack}");
+    started.elapsed()
 }

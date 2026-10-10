@@ -1,3 +1,5 @@
+import { E2E_TOKEN } from "./config";
+import { WRITE_METHODS } from "../src/rpc/methods";
 // e2e 种子与断言辅助：JSON-RPC over WebSocket（Node 22 内置全局 WebSocket，无需 ws 依赖）。
 // 方法签名对齐 web/src/api/flow.ts。
 
@@ -7,11 +9,14 @@ export async function rpc<T = unknown>(
   method: string,
   params: Record<string, unknown> = {},
 ): Promise<T> {
+  params = { ...params, _token: E2E_TOKEN };
+  if (WRITE_METHODS.has(method) && params.request_id === undefined)
+    params.request_id = crypto.randomUUID();
   const ws = new WebSocket(RPC_URL);
   try {
     await new Promise<void>((resolve, reject) => {
       ws.onopen = () => resolve();
-      ws.onerror = () => reject(new Error("无法连接 e2e flow-server"));
+      ws.onerror = () => reject(new Error("无法连接 e2e flow-journal-server"));
     });
     return await new Promise<T>((resolve, reject) => {
       ws.onmessage = (e) => {
@@ -20,7 +25,10 @@ export async function rpc<T = unknown>(
           error?: { code: number; message: string };
         };
         if (msg.error) reject(new Error(`${msg.error.code}: ${msg.error.message}`));
-        else resolve(msg.result as T);
+        else {
+          const reply = msg.result as { committed?: boolean; result?: unknown };
+          resolve((reply?.committed === true ? reply.result : reply) as T);
+        }
       };
       ws.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }));
     });
@@ -61,7 +69,7 @@ export async function startRun(workflowId: string): Promise<string> {
 }
 
 export async function runStatus(runId: string): Promise<string> {
-  const r = await rpc<{ run: { status: string } }>("run.get", { run_id: runId });
+  const r = await rpc<{ run: { status: string } }>("run.get.full", { run_id: runId });
   return r.run.status;
 }
 

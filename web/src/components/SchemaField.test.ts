@@ -30,7 +30,7 @@ describe("SchemaField key-value widget", () => {
     expect((rows[0].find(".kv-key").element as HTMLInputElement).value).toBe("Accept");
 
     await rows[0].find(".kv-value").setValue("application/json; charset=utf-8");
-    expect(w.emitted("update:modelValue")!.at(-1)![0]).toEqual({
+    expect(w.emitted("update:modelValue")!.slice(-1)[0]![0]).toEqual({
       Accept: "application/json; charset=utf-8",
     });
   });
@@ -44,7 +44,7 @@ describe("SchemaField key-value widget", () => {
     await rows[0].find(".kv-key").setValue("X-Token");
     await rows[0].find(".kv-value").setValue("abc");
     // 第二行键为空：不写入
-    expect(w.emitted("update:modelValue")!.at(-1)![0]).toEqual({ "X-Token": "abc" });
+    expect(w.emitted("update:modelValue")!.slice(-1)[0]![0]).toEqual({ "X-Token": "abc" });
   });
 
   it("重复键：标红且重复行不写入（无静默 last-wins）", async () => {
@@ -54,12 +54,12 @@ describe("SchemaField key-value widget", () => {
     await rows[1].find(".kv-key").setValue("A");
     await rows[1].find(".kv-value").setValue("2");
     expect(w.findAll(".kv-dup")).toHaveLength(1);
-    expect(w.emitted("update:modelValue")!.at(-1)![0]).toEqual({ A: "1" });
+    expect(w.emitted("update:modelValue")!.slice(-1)[0]![0]).toEqual({ A: "1" });
   });
 
   it("删完全部行 → emit undefined（从 params 剔除该键）", async () => {
     const w = mountKv({ A: "1" });
     await w.find(".kv-remove").trigger("click");
-    expect(w.emitted("update:modelValue")!.at(-1)![0]).toBeUndefined();
+    expect(w.emitted("update:modelValue")!.slice(-1)[0]![0]).toBeUndefined();
   });
 });

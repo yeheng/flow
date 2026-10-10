@@ -134,13 +134,15 @@ async fn wait_terminal(
 }
 
 async fn run_record(client: &WsClient, run_id: &str) -> Result<Value, CliError> {
-    Ok(
-        call(client, "run.get", object(vec![("run_id", json!(run_id))]))
-            .await?
-            .get("run")
-            .cloned()
-            .unwrap_or(Value::Null),
+    Ok(call(
+        client,
+        "run.get.full",
+        object(vec![("run_id", json!(run_id))]),
     )
+    .await?
+    .get("run")
+    .cloned()
+    .unwrap_or(Value::Null))
 }
 
 /// run 耗时（秒）。两端都可能缺（未 started_at 或未 ended_at）时返回 None。
@@ -175,7 +177,7 @@ async fn list(
         params.push(("source", json!(source)));
     }
     params.push(("limit", json!(limit)));
-    let result = call(client, "run.list", object(params)).await?;
+    let result = call(client, "run.list.full", object(params)).await?;
     if json {
         print_json(&result);
         return Ok(());
@@ -219,7 +221,12 @@ async fn list(
 }
 
 async fn get(client: &WsClient, json: bool, run_id: &str) -> Result<(), CliError> {
-    let result = call(client, "run.get", object(vec![("run_id", json!(run_id))])).await?;
+    let result = call(
+        client,
+        "run.get.full",
+        object(vec![("run_id", json!(run_id))]),
+    )
+    .await?;
     if json {
         print_json(&result);
         return Ok(());
@@ -244,7 +251,7 @@ async fn events(client: &WsClient, run_id: &str, from_seq: Option<u64>) -> Resul
     if let Some(from_seq) = from_seq {
         params.push(("from_seq", json!(from_seq)));
     }
-    let result = call(client, "run.events", object(params)).await?;
+    let result = call(client, "run.events.full", object(params)).await?;
     let events = result["events"]
         .as_array()
         .map(Vec::as_slice)

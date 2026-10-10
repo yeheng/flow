@@ -1,4 +1,5 @@
 {
   "rpcUrl": "wss://flow-server.example.com",
-  "httpUrl": "https://flow-hooks.example.com"
+  "httpUrl": "https://flow-hooks.example.com",
+  "token": "replace-with-your-FLOW_JOURNAL_TOKEN"
 }

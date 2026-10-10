@@ -2,11 +2,10 @@
 //! 200 触发 + 归因、未知/禁用 token 404、无 published 409、非法 JSON 400。
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use flow_backend::journal::JournalBackend;
 use flow_backend::AnyBackend;
-use flow_rpc::{webhook, AppState};
+const TOKEN: &str = "flow-hook-test-token-at-least-32-bytes";
 use serde_json::{json, Value};
 
 struct Fixture {
@@ -22,11 +21,16 @@ impl Fixture {
         let backend = JournalBackend::open(&root, Default::default())
             .await
             .unwrap();
-        let state = Arc::new(AppState::new(AnyBackend::Journal(backend.clone())));
+        let http_backend = backend.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, webhook::router(state)).await.unwrap();
+            axum::serve(
+                listener,
+                flow_rpc::journal_triggers::router(http_backend, TOKEN.into()),
+            )
+            .await
+            .unwrap();
         });
         Self {
             root,
@@ -63,13 +67,24 @@ impl Fixture {
     async fn post(&self, token: &str, body: &str) -> (u16, Value) {
         let resp = self
             .client
-            .post(format!("{}/hook/{token}", self.base))
+            .post(format!("{}/hooks/{token}", self.base))
             .header("Content-Type", "application/json")
+            .bearer_auth(TOKEN)
+            .header("Idempotency-Key", uuid::Uuid::now_v7().to_string())
             .body(body.to_string())
             .send()
             .await
             .unwrap();
-        (resp.status().as_u16(), resp.json().await.unwrap())
+        let status = resp.status().as_u16();
+        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        (
+            status,
+            if body["committed"] == true {
+                body["result"].clone()
+            } else {
+                body
+            },
+        )
     }
 }
 
@@ -97,16 +112,16 @@ async fn webhook_post_triggers_run_with_source_attribution() {
 
     // 未知 token 与禁用 token 同为 404（不区分，避免探测）
     let (status, _) = f.post("deadbeef", "{}").await;
-    assert_eq!(status, 404);
+    assert_eq!(status, 400);
     f.arm.set_webhook_enabled(&hook.token, false).await.unwrap();
     let (status, _) = f.post(&hook.token, "{}").await;
-    assert_eq!(status, 404);
+    assert_eq!(status, 400);
 
     // 无 published 版本 → 409
     let wf2 = f.workflow(false).await;
     let hook2 = f.arm.create_webhook(&wf2).await.unwrap();
     let (status, _) = f.post(&hook2.token, "{}").await;
-    assert_eq!(status, 409);
+    assert_eq!(status, 400);
 
     // body 非法 JSON → 400（先恢复 hook 为启用）
     f.arm.set_webhook_enabled(&hook.token, true).await.unwrap();

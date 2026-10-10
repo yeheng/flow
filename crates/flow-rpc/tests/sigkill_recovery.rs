@@ -19,13 +19,20 @@ async fn spawn_journal(dir: &std::path::Path) -> common::ServerProc {
 
     let mut cmd = Command::new(common::server_bin());
     cmd.env("FLOW_BACKEND", "journal")
-        .env("FLOW_DATA_DIR", dir)
+        .env("FLOW_DATA_DIR", dir.join("secrets"))
+        .env("FLOW_JOURNAL_DATA_DIR", dir.join("journal"))
+        .env("FLOW_JOURNAL_TOKEN", common::TOKEN)
         .env("RUST_LOG", "info")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(std::process::Stdio::inherit());
-    let (child, ports) = spawn_reporting_ports(&mut cmd, "FLOW_ADDR", "FLOW_HTTP_ADDR", None)
-        .unwrap_or_else(|e| panic!("{e}"));
+    let (child, ports) = spawn_reporting_ports(
+        &mut cmd,
+        "FLOW_JOURNAL_ADDR",
+        "FLOW_JOURNAL_HTTP_ADDR",
+        None,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
     common::ServerProc::from_parts(child, ports.rpc, ports.http)
 }
 

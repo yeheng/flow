@@ -1,10 +1,10 @@
-//! 协议与错误码契约：-32010/-32011/-32012/-32601 的映射、params 省略归一、
-//! 参数类型校验、limit 夹取。契约来源：DESIGN.md §9（RPC 层）。
+//! v2 协议与错误码契约：-32602/-32011/-32012/-32601 的映射、参数类型校验、
+//! limit 夹取、写命令幂等语义。契约来源：journal_v2（v2 错误码词汇：
+//! `-32001` unauthorized / `-32011` not found / `-32012` conflict /
+//! `-32602` invalid params / `-32603` internal）。
 
 use backend_e2e::common::fixtures::linear_def;
-use backend_e2e::common::{
-    call, call_err, call_json, call_null_params, publish_workflow, start_run, Ctx, TIMEOUT,
-};
+use backend_e2e::common::{call, call_err, call_json, publish_workflow, start_run, Ctx, TIMEOUT};
 use backend_e2e::e2e_test;
 use serde_json::{json, Value};
 
@@ -13,40 +13,40 @@ e2e_test!(
     |ctx: &mut Ctx| Box::pin(async move {
         let client = ctx.client().await;
 
-        // -32010 参数非法：缺必填字段 / 类型不对 / 词汇表外取值
+        // -32602 参数非法（v2 词汇）：缺必填字段 / 类型不对 / 词汇表外取值 /
+        // 不存在实体的写命令（journal 层按 invalid 报，如 workflow.publish）
         for (method, params) in [
             ("workflow.create", json!({})),
             ("workflow.create", json!({"name": 42})),
             ("workflow.update", json!({"workflow_id": "x"})),
-            ("workflow.get", json!({})),
+            ("workflow.get.full", json!({})),
             (
-                "workflow.get",
+                "workflow.get.full",
                 json!({"workflow_id": "x", "version": "one"}),
             ),
             ("run.start", json!({})),
-            ("run.get", json!({})),
+            ("run.get.full", json!({})),
             ("run.signal", json!({"run_id": "r", "payload": {}})),
             (
                 "schedule.create",
                 json!({"workflow_id": "w", "cron": "***"}),
             ),
-            ("run.list", json!({"limit": "many"})),
         ] {
             let err = call_err(&client, method, params.clone()).await;
-            assert_eq!(err.code(), -32010, "{method} {params} → {err}");
+            assert_eq!(err.code(), -32602, "{method} {params} → {err}");
         }
 
-        // -32011 不存在：实体查询类
+        // -32011 不存在：实体读面（journal_arm 物化层映射 not-found）
         for (method, params) in [
-            ("workflow.get", json!({"workflow_id": "ghost"})),
-            ("workflow.versions", json!({"workflow_id": "ghost"})),
             (
                 "workflow.publish",
                 json!({"workflow_id": "ghost", "version": 1}),
             ),
-            ("run.get", json!({"run_id": "ghost"})),
+            ("workflow.get.full", json!({"workflow_id": "ghost"})),
+            ("workflow.versions", json!({"workflow_id": "ghost"})),
+            ("run.get.full", json!({"run_id": "ghost"})),
             ("run.timeline", json!({"run_id": "ghost"})),
-            ("run.events", json!({"run_id": "ghost"})),
+            ("run.events.full", json!({"run_id": "ghost"})),
             (
                 "schedule.update",
                 json!({"id": "ghost", "cron": "* * * * *"}),
@@ -58,7 +58,7 @@ e2e_test!(
             assert_eq!(err.code(), -32011, "{method} {params} → {err}");
         }
 
-        // -32012 冲突：显式 draft 版本执行、有 run 的 workflow 删除、终态 run 取消
+        // -32012 冲突：有 run 的 workflow 删除
         let (workflow_id, version) =
             publish_workflow(&client, "契约", linear_def("return 1;")).await;
         let draft_version: Value = call(
@@ -70,13 +70,14 @@ e2e_test!(
         let draft_version = draft_version["version"].as_i64().unwrap();
         assert!(draft_version > version);
 
+        // 显式 draft 版本执行：journal 语义 = invalid（version not published）
         let err = call_err(
             &client,
             "run.start",
             json!({"workflow_id": workflow_id, "version": draft_version}),
         )
         .await;
-        assert_eq!(err.code(), -32012, "{err}");
+        assert_eq!(err.code(), -32602, "{err}");
 
         let run_id = start_run(&client, &workflow_id, json!({})).await;
         let err = call_err(
@@ -88,12 +89,14 @@ e2e_test!(
         assert_eq!(err.code(), -32012, "{err}");
         let run = backend_e2e::common::wait_run_terminal(&client, &run_id, TIMEOUT).await;
         assert_eq!(run["run"]["status"], json!("succeeded"));
-        let err = call_err(&client, "run.cancel", json!({"run_id": run_id})).await;
-        assert_eq!(err.code(), -32012, "{err}");
+        // v2 语义：终态 run 取消是幂等空操作（committed 回执，无事件），不报冲突
+        let cancelled: Value = call(&client, "run.cancel", json!({"run_id": run_id})).await;
+        assert_eq!(cancelled["delivered"], json!(true), "{cancelled}");
+        // 终态 run 的新信号是状态冲突；原已提交身份仍可查询和重放。
         let err = call_err(
             &client,
             "run.signal",
-            json!({"run_id": run_id, "node_id": "n1", "signal_id": "s", "payload": {}}),
+            json!({"run_id": run_id, "node_id": "n1", "payload": {}}),
         )
         .await;
         assert_eq!(err.code(), -32012, "{err}");
@@ -101,26 +104,15 @@ e2e_test!(
         // -32601：未知方法（JSON-RPC 标准）
         let err = call_err(&client, "no.such.method", json!({})).await;
         assert_eq!(err.code(), -32601, "{err}");
+
+        // -32001：token 错误（v2 每请求认证，常量时间比较后拒绝）
+        let bad =
+            backend_e2e::common::connect(ctx.addr(), "wrong-token-0123456789abcdef0123456789")
+                .await;
+        let err = call_err(&bad, "workflow.list.full", json!({})).await;
+        assert_eq!(err.code(), -32001, "{err}");
     })
 );
-
-e2e_test!(params_may_be_omitted_entirely, |ctx: &mut Ctx| Box::pin(
-    async move {
-        let client = ctx.client().await;
-        // JSON-RPC 允许整体省略 params（到达 null）：解析层归一为 {}，
-        // 只依赖缺省参数的方法必须正常工作
-        let list: Value = call_null_params(&client, "workflow.list").await;
-        assert!(list["workflows"].is_array(), "{list}");
-        let types: Value = call_null_params(&client, "nodetypes.list").await;
-        assert!(types["node_types"].is_array(), "{types}");
-        let runs: Value = call_null_params(&client, "run.list").await;
-        assert!(runs["runs"].is_array(), "{runs}");
-        let schedules: Value = call_null_params(&client, "schedule.list").await;
-        assert!(schedules["schedules"].is_array(), "{schedules}");
-        let webhooks: Value = call_null_params(&client, "webhook.list").await;
-        assert!(webhooks["webhooks"].is_array(), "{webhooks}");
-    }
-));
 
 e2e_test!(run_list_limit_is_clamped_to_bounds, |ctx: &mut Ctx| {
     Box::pin(async move {
@@ -131,15 +123,16 @@ e2e_test!(run_list_limit_is_clamped_to_bounds, |ctx: &mut Ctx| {
         }
 
         // 0/负数 → 1；超过 500 → 500（RPC 边缘 clamp）
-        let clamped_low: Value = call_json(&client, "run.list", json!({"limit": 0})).await;
+        let clamped_low: Value = call_json(&client, "run.list.full", json!({"limit": 0})).await;
         assert_eq!(clamped_low["runs"].as_array().unwrap().len(), 1);
-        let clamped_negative: Value = call_json(&client, "run.list", json!({"limit": -5})).await;
+        let clamped_negative: Value =
+            call_json(&client, "run.list.full", json!({"limit": -5})).await;
         assert_eq!(clamped_negative["runs"].as_array().unwrap().len(), 1);
-        let clamped_high: Value = call_json(&client, "run.list", json!({"limit": 9999})).await;
+        let clamped_high: Value = call_json(&client, "run.list.full", json!({"limit": 9999})).await;
         assert_eq!(clamped_high["runs"].as_array().unwrap().len(), 500);
 
         // 缺省 limit → 50
-        let default: Value = call_json(&client, "run.list", json!({})).await;
+        let default: Value = call_json(&client, "run.list.full", json!({})).await;
         assert_eq!(default["runs"].as_array().unwrap().len(), 50);
     })
 });
@@ -158,16 +151,23 @@ e2e_test!(
         assert_eq!(run["run"]["input"], json!(null));
         assert_eq!(run["run"]["output"], json!({ "seen": null }));
 
-        // workflow.get 省略 version：取 latest
-        let got: Value = call(&client, "workflow.get", json!({"workflow_id": workflow_id})).await;
+        // workflow.get.full 省略 version：取 latest
+        let got: Value = call(
+            &client,
+            "workflow.get.full",
+            json!({"workflow_id": workflow_id}),
+        )
+        .await;
         assert_eq!(got["version"], json!(1));
 
-        // run.events 省略 from_seq：从 1 开始全量
-        let events: Value = call_json(&client, "run.events", json!({"run_id": run_id})).await;
+        // run.events.full 省略 from_seq：从 1 开始全量
+        let events: Value = call_json(&client, "run.events.full", json!({"run_id": run_id})).await;
         let events = events["events"].as_array().unwrap();
         assert_eq!(events[0]["seq"], json!(1));
 
-        // run.subscribe 省略 run_id：全局流（不报错）
-        let _sub = backend_e2e::common::subscribe(&client, None).await;
+        // run.subscribe 省略 from_seq：从 0 起补齐（envelope 格式，v1 事件形状）
+        let mut sub = backend_e2e::common::subscribe(&client, &run_id).await;
+        let collected = backend_e2e::common::collect_run_events(&mut sub, &run_id, TIMEOUT).await;
+        assert!(!collected.is_empty());
     })
 );

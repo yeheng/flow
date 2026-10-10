@@ -50,22 +50,24 @@ export function summarizeJournalRecord(item: unknown, index: number): JournalRow
   const rec = asRecord(item);
   // JournalEvent: { lsn, event_index, event: { run_seq, kind, payload } }
   const event = asRecord(rec?.event);
+  // 原生 Observation 将日志字段放在 line 内。
+  const line = asRecord(rec?.line);
   const label = String(
-    event?.kind ?? rec?.kind ?? rec?.level ?? rec?.type ?? "record",
+    event?.kind ?? line?.level ?? rec?.kind ?? rec?.level ?? rec?.type ?? "record",
   );
   const key = rec?.lsn ? `${rec.lsn}:${String(rec.event_index ?? index)}` : `row-${index}`;
 
   const metaParts: string[] = [];
   if (event?.run_seq !== undefined) metaParts.push(`seq ${String(event.run_seq)}`);
+  else if (rec?.seq !== undefined) metaParts.push(`seq ${String(rec.seq)}`);
   else if (rec?.lsn !== undefined) metaParts.push(`lsn ${String(rec.lsn)}`);
+  if (line?.node_id !== undefined) metaParts.push(String(line.node_id));
   const ts = fmtTs(rec?.ts ?? rec?.time ?? rec?.timestamp);
   if (ts) metaParts.push(ts);
 
-  const msg = rec?.message ?? rec?.msg ?? rec?.text;
+  const msg = line?.message ?? rec?.message ?? rec?.msg ?? rec?.text;
   const text =
-    typeof msg === "string"
-      ? truncate(msg)
-      : truncate(JSON.stringify(event?.payload ?? item));
+    typeof msg === "string" ? truncate(msg) : truncate(JSON.stringify(event?.payload ?? item));
 
   return {
     key,

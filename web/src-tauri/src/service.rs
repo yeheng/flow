@@ -1,4 +1,4 @@
-//! Embedded flow-server: same method modules, no WebSocket listener.
+//! Embedded Journal product: same method modules, no WebSocket listener.
 //! A dedicated runtime owns execution, subscriptions, scheduling and shutdown.
 use std::{
     collections::HashMap,
@@ -26,7 +26,6 @@ pub enum Service {
 }
 
 pub struct Services {
-    flow: Methods,
     journal_methods: Methods,
     backend: AnyBackend,
     journal: Arc<JournalBackend>,
@@ -45,8 +44,8 @@ impl Services {
         // storage.data_dir 相对 root 解析。
         let config_path = root.join("flow.toml");
         let has_config_file = config_path.exists();
-        let loaded = flow_config::Config::load_or_default(&config_path)
-            .map_err(|e| e.to_string())?;
+        let loaded =
+            flow_config::Config::load_or_default(&config_path).map_err(|e| e.to_string())?;
         let config = loaded.config;
         // 密钥与历史 v1 数据仍住在原 data 目录（密钥是用户资产，不随权威
         // 切换搬家；v1 数据按「历史舍弃」原则保留只读）。工作流/run 的
@@ -60,14 +59,8 @@ impl Services {
             .await
             .map_err(|e| e.to_string())?;
         let backend = AnyBackend::Journal(journal.clone());
-        let built = Self::assemble(
-            backend.clone(),
-            journal.clone(),
-            config,
-            config_path,
-            data,
-        )
-        .await;
+        let built =
+            Self::assemble(backend.clone(), journal.clone(), config, config_path, data).await;
         if built.is_err() {
             let _ = backend.shutdown().await;
         }
@@ -97,7 +90,6 @@ impl Services {
         )
         .map_err(|e| e.to_string())?
         .into();
-        let flow = journal_methods.clone();
         let downloads = flow_rpc::journal_download::router(journal.clone(), token.clone())
             .map_err(|e| e.to_string())?;
         // Only incoming webhooks need HTTP. RPC and downloads stay inside the process.
@@ -109,7 +101,9 @@ impl Services {
             listener.local_addr().map_err(|e| e.to_string())?
         );
         backend.start().await.map_err(|e| e.to_string())?;
-        journal.start_execution().await.map_err(|e| e.to_string())?;
+        flow_backend::start_execution(&config.execution, &journal)
+            .await
+            .map_err(|e| e.to_string())?;
         // 主后端 = journal：触发器走 journal_triggers（命令身份去重），
         // 不再跑 v1 调度器（schedule_fires 表语义）
         let journal_scheduler = if config.server.scheduler_enabled {
@@ -117,13 +111,19 @@ impl Services {
         } else {
             tokio::spawn(async {})
         };
+        let journal_http = journal.clone();
+        let http_token = token.clone();
         let http = tokio::spawn(async move {
-            if let Err(error) = axum::serve(listener, flow_rpc::webhook::router(state)).await {
+            if let Err(error) = axum::serve(
+                listener,
+                flow_rpc::journal_triggers::router(journal_http, http_token),
+            )
+            .await
+            {
                 eprintln!("desktop webhook server stopped: {error}");
             }
         });
         Ok(Arc::new(Self {
-            flow,
             journal_methods,
             backend,
             journal,
@@ -156,14 +156,7 @@ impl Services {
                 // v2 协议：写命令必须有幂等键。桌面调用方（渲染层）不感知
                 // 协议细节——这里为缺失 request_id 的写命令补一个（一次
                 // 调用一个键 = v1 的一次交付语义）。
-                const WRITE_PREFIXES: &[&str] = &[
-                    "workflow.create", "workflow.update", "workflow.publish", "workflow.delete",
-                    "run.start", "run.cancel", "run.signal", "run.adjudicate", "schedule.",
-                    "webhook.", "template.", "secrets.set", "secrets.delete", "config.update",
-                ];
-                let is_write = WRITE_PREFIXES
-                    .iter()
-                    .any(|p| method == *p || method.starts_with(&format!("{p}.")));
+                let is_write = flow_rpc::journal_v2::is_write_method(&method);
                 if is_write
                     && !object
                         .get("request_id")
@@ -311,12 +304,12 @@ pub struct Host {
 }
 impl Host {
     pub fn start(root: PathBuf) -> Result<Arc<Self>> {
-        // Match `flow-server`: dependencies enable both rustls providers.
+        // Match `flow-journal-server`: dependencies enable both rustls providers.
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (ready, started) = std::sync::mpsc::sync_channel(1);
         let (stop, stopped) = oneshot::channel();
         let thread = std::thread::Builder::new()
-            .name("flow-server".into())
+            .name("flow-journal".into())
             .spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -360,7 +353,7 @@ impl Host {
         if let Some(thread) = self.thread.lock().unwrap().take() {
             return thread
                 .join()
-                .map_err(|_| "flow-server thread panicked".to_string())?;
+                .map_err(|_| "Journal service thread panicked".to_string())?;
         }
         Ok(())
     }

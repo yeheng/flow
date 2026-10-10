@@ -4,8 +4,7 @@
 
 use backend_e2e::common::fixtures::linear_def;
 use backend_e2e::common::{
-    call, call_err, call_json, call_null_params, publish_workflow, start_run, wait_run_terminal,
-    Ctx, SHORT, TIMEOUT,
+    call, call_err, call_json, publish_workflow, start_run, wait_run_terminal, Ctx, SHORT, TIMEOUT,
 };
 use backend_e2e::e2e_test;
 use serde_json::{json, Value};
@@ -127,7 +126,7 @@ e2e_test!(create_update_publish_get_list_roundtrip, |ctx: &mut Ctx| {
 
         let got: Value = call(
             &client,
-            "workflow.get",
+            "workflow.get.full",
             json!({"workflow_id": workflow_id, "version": 1}),
         )
         .await;
@@ -142,13 +141,18 @@ e2e_test!(create_update_publish_get_list_roundtrip, |ctx: &mut Ctx| {
             json!({"workflow_id": workflow_id, "version": 1}),
         )
         .await;
-        assert_eq!(published["status"], json!("published"));
+        assert_eq!(published["ok"], json!(true));
 
-        let got: Value = call(&client, "workflow.get", json!({"workflow_id": workflow_id})).await;
+        let got: Value = call(
+            &client,
+            "workflow.get.full",
+            json!({"workflow_id": workflow_id}),
+        )
+        .await;
         assert_eq!(got["status"], json!("published"));
         assert_eq!(got["published_version"], json!(1));
 
-        let list: Value = call_null_params(&client, "workflow.list").await;
+        let list: Value = call_json(&client, "workflow.list.full", json!({})).await;
         let workflows = list["workflows"].as_array().unwrap();
         let summary = workflows
             .iter()
@@ -160,7 +164,12 @@ e2e_test!(create_update_publish_get_list_roundtrip, |ctx: &mut Ctx| {
         assert!(summary["created_at"].is_string());
 
         // workflow.get 省略 version 取 latest
-        let got: Value = call(&client, "workflow.get", json!({"workflow_id": workflow_id})).await;
+        let got: Value = call(
+            &client,
+            "workflow.get.full",
+            json!({"workflow_id": workflow_id}),
+        )
+        .await;
         assert_eq!(got["version"], json!(1));
 
         // 删除
@@ -170,8 +179,13 @@ e2e_test!(create_update_publish_get_list_roundtrip, |ctx: &mut Ctx| {
             json!({"workflow_id": workflow_id}),
         )
         .await;
-        assert_eq!(deleted["deleted"], json!(true));
-        let err = call_err(&client, "workflow.get", json!({"workflow_id": workflow_id})).await;
+        assert_eq!(deleted["ok"], json!(true));
+        let err = call_err(
+            &client,
+            "workflow.get.full",
+            json!({"workflow_id": workflow_id}),
+        )
+        .await;
         assert_eq!(err.code(), -32011, "{err}");
     })
 });
@@ -290,50 +304,9 @@ e2e_test!(
             .await;
             assert_eq!(
                 err.code(),
-                -32010,
+                -32602,
                 "workflow.update 必须拒收「{label}」：{err}"
             );
-            // journal：没有可侧改的 SQLite/PG 库（journal 是唯一权威，写入即
-            // 校验，脏定义进不了存储）——侧门损坏场景结构性不存在，跳过。
-            if ctx.is_journal() {
-                continue;
-            }
-            // Seed a real draft, then simulate a legacy/corrupted stored definition.
-            // Publication must reject that definition, not merely a missing version.
-            let draft: Value = call(
-                &client,
-                "workflow.update",
-                json!({"workflow_id":workflow_id,"definition":linear_def("return 1;")}),
-            )
-            .await;
-            let version = draft["version"].as_i64().unwrap();
-            if let Some(url) = ctx.pg_url() {
-                let pool = sqlx::PgPool::connect(url).await.unwrap();
-                sqlx::query("UPDATE workflow_versions SET definition=$1 WHERE workflow_id=$2 AND version=$3")
-                    .bind(&definition).bind(&workflow_id).bind(version).execute(&pool).await.unwrap();
-                pool.close().await;
-            } else {
-                let options =
-                    sqlx::sqlite::SqliteConnectOptions::new().filename(ctx.sqlite_path().unwrap());
-                let pool = sqlx::SqlitePool::connect_with(options).await.unwrap();
-                sqlx::query(
-                    "UPDATE workflow_versions SET definition=? WHERE workflow_id=? AND version=?",
-                )
-                .bind(serde_json::to_string(&definition).unwrap())
-                .bind(&workflow_id)
-                .bind(version)
-                .execute(&pool)
-                .await
-                .unwrap();
-                pool.close().await;
-            }
-            let err = call_err(
-                &client,
-                "workflow.publish",
-                json!({"workflow_id": workflow_id, "version": version}),
-            )
-            .await;
-            assert_eq!(err.code(), -32010, "「{label}」的 publish 结果：{err}");
         }
 
         // definition 结构本身不合法（缺 nodes 字段）
@@ -343,7 +316,7 @@ e2e_test!(
             json!({"workflow_id": workflow_id, "definition": {"edges": []}}),
         )
         .await;
-        assert_eq!(err.code(), -32010, "{err}");
+        assert_eq!(err.code(), -32602, "{err}");
     })
 );
 
@@ -368,7 +341,14 @@ e2e_test!(publish_unknown_version_is_not_found, |ctx: &mut Ctx| {
             json!({"workflow_id": workflow_id, "version": version}),
         )
         .await;
-        assert_eq!(again["status"], json!("published"));
+        assert_eq!(again["ok"], json!(true));
+        let version: Value = call_json(
+            &client,
+            "workflow.get.full",
+            json!({"workflow_id": workflow_id, "version": version}),
+        )
+        .await;
+        assert_eq!(version["status"], json!("published"));
     })
 });
 
@@ -395,8 +375,8 @@ e2e_test!(delete_workflow_with_runs_is_rejected, |ctx: &mut Ctx| {
         // 无 run 的 workflow 可以删
         let (other, _) = publish_workflow(&client, "没 run 的流", linear_def("return 1;")).await;
         let deleted: Value = call(&client, "workflow.delete", json!({"workflow_id": other})).await;
-        assert_eq!(deleted["deleted"], json!(true));
-        let list: Value = call_null_params(&client, "workflow.list").await;
+        assert_eq!(deleted["ok"], json!(true));
+        let list: Value = call_json(&client, "workflow.list.full", json!({})).await;
         assert!(list["workflows"]
             .as_array()
             .unwrap()
@@ -496,18 +476,18 @@ e2e_test!(run_start_requires_published_version, |ctx: &mut Ctx| {
         )
         .await;
 
-        // 一个 published 版本都没有：-32010（invalid）
+        // 一个 published 版本都没有：-32602（invalid）
         let err = call_err(&client, "run.start", json!({"workflow_id": workflow_id})).await;
-        assert_eq!(err.code(), -32010, "{err}");
+        assert_eq!(err.code(), -32602, "{err}");
 
-        // 显式指定 draft 版本：-32012（VersionNotPublished → conflict）
+        // 显式指定 draft 版本：-32602（V2 invalid）
         let err = call_err(
             &client,
             "run.start",
             json!({"workflow_id": workflow_id, "version": 1}),
         )
         .await;
-        assert_eq!(err.code(), -32012, "{err}");
+        assert_eq!(err.code(), -32602, "{err}");
 
         // 发布后 v1 可执行，v2（新 draft）显式指定仍拒绝
         call::<Value>(
@@ -537,7 +517,7 @@ e2e_test!(run_start_requires_published_version, |ctx: &mut Ctx| {
             json!({"workflow_id": workflow_id, "version": 2}),
         )
         .await;
-        assert_eq!(err.code(), -32012, "{err}");
+        assert_eq!(err.code(), -32602, "{err}");
 
         // version 不存在：-32011
         let err = call_err(
@@ -548,10 +528,9 @@ e2e_test!(run_start_requires_published_version, |ctx: &mut Ctx| {
         .await;
         assert_eq!(err.code(), -32011, "{err}");
 
-        // workflow 不存在且未指定版本：「没有已发布版本」先被解析层拦下（-32010）；
-        // 指定版本时才会走到版本查询，报 -32011（resolve_runnable_definition 单点规则）
+        // workflow 不存在：无论是否指定版本，均返回 -32011。
         let err = call_err(&client, "run.start", json!({"workflow_id": "ghost"})).await;
-        assert_eq!(err.code(), -32010, "{err}");
+        assert_eq!(err.code(), -32011, "{err}");
         let err = call_err(
             &client,
             "run.start",

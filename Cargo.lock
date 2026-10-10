@@ -261,23 +261,20 @@ dependencies = [
 name = "backend-e2e"
 version = "0.1.0"
 dependencies = [
- "axum",
  "chrono",
  "flow-backend",
- "flow-pg",
+ "flow-config",
  "flow-rpc",
  "flow-test-support",
  "futures",
  "hex",
  "jsonrpsee",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.0",
- "sqlx",
  "tokio",
- "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 
@@ -287,9 +284,11 @@ version = "0.1.0"
 dependencies = [
  "backend-e2e",
  "chrono",
+ "flow-config",
  "flow-rpc",
  "futures",
  "jsonrpsee",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",

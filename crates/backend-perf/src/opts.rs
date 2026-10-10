@@ -1,6 +1,6 @@
 //! 命令行参数：`flow-perf [选项]`。手写解析，不引第三方参数库。
 //!
-//! 默认规模是「轻量回归」：双后端 × 四场景，单次运行数分钟内跑完，适合定期
+//! 默认规模是「轻量回归」：Journal × 四场景，单次运行数分钟内跑完，适合定期
 //! 回归；重负载用 `--runs` / `--concurrency` / `--prefill` / `--iterations`
 //! 放大（见 `usage()` 里的口径说明）。
 
@@ -37,11 +37,9 @@ impl Scenario {
     }
 }
 
-/// 后端选择（双后端矩阵是默认，单后端用于快速迭代）。
+/// 产品后端选择。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendSel {
-    Both,
-    Postgres,
     Journal,
 }
 
@@ -69,7 +67,7 @@ impl Default for Opts {
     fn default() -> Opts {
         Opts {
             scenarios: Scenario::ALL.to_vec(),
-            backend: BackendSel::Both,
+            backend: BackendSel::Journal,
             runs: 200,
             concurrency: 16,
             prefill: 100,
@@ -101,8 +99,6 @@ impl Opts {
                 }
                 "--backend" => {
                     opts.backend = match value("--backend").as_str() {
-                        "both" => BackendSel::Both,
-                        "postgres" => BackendSel::Postgres,
                         "journal" => BackendSel::Journal,
                         other => die(&format!("--backend 不认识：{other}")),
                     };
@@ -124,7 +120,7 @@ impl Opts {
         opts
     }
 
-    /// 透传给被测进程的环境变量。FLOW_MAX_RUNS 是 Postgres executor 的容量许可
+    /// 透传给被测进程的环境变量。FLOW_MAX_RUNS 是 Journal executor 的容量许可
     /// （同时驱动的 run 上限）：必须 ≥ 同时在飞的 run 数，否则许可就是个人造瓶颈。
     /// crash_recovery 里停驻在 human_task 的 run 不释放许可，所以按 recovery_runs
     /// 放大再留余量。
@@ -172,13 +168,13 @@ fn die(message: &str) -> ! {
 }
 
 pub fn usage() -> &'static str {
-    "flow-perf：flow 后端性能压测 harness（黑盒，真起被测进程，双后端矩阵）\n\
+    "flow-perf：flow 后端性能压测 harness（黑盒，真起被测进程，Journal 产品后端）\n\
      \n\
      用法：cargo run -p backend-perf -- [选项]\n\
      \n\
      选项：\n\
        --scenario <列表>      all（缺省）| throughput | read | subscribe | recovery，可逗号组合\n\
-       --backend <后端>       both（缺省 postgres+journal）| postgres | journal\n\
+       --backend <后端>       journal（缺省，v2 唯一产品后端）\n\
        --runs <N>             run_throughput 的总 run 数（缺省 200）\n\
        --concurrency <N>      同时在飞的 run 数（缺省 16，提交侧限流 + 驱动容量基准）\n\
        --prefill <N>          rpc_read 预置的终态 run 数（缺省 100）\n\
@@ -189,10 +185,9 @@ pub fn usage() -> &'static str {
        -h, --help             本帮助\n\
      \n\
      环境变量：\n\
-       FLOW_E2E_PG_IMAGE     Postgres 容器镜像（缺省 postgres:16-alpine，需要 docker）\n\
        RUST_LOG              透传给被测服务进程\n\
      \n\
      默认规模是轻量回归（单次数分钟内）；重负载用 --runs / --concurrency / --prefill\n\
-     放大。每个场景独占一个被测进程上下文（临时目录 / 测试库即建即毁，panic 路径\n\
+     放大。每个场景独占一个被测进程上下文（临时目录即建即毁，panic 路径\n\
      也清理），场景之间数据量互不污染。\n"
 }
