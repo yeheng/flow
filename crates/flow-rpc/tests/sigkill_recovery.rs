@@ -2,8 +2,7 @@
 //!
 //! 1. pre-auth 窗口（DispatchStarted 与授权之间被杀）：未授权 = 请求从未
 //!    发出，重启重新派发是安全语义；重放请求按节点 timeout_ms 计超时后
-//!    进 uncertain（此前误报「挂起」——实为 http 默认 30s 超时 > 测试 20s
-//!    等待窗口）。
+//!    进 uncertain。
 //! 2. 恢复后人工裁决 failed → run 终态 failed（裁决决策面回归）。
 
 mod common;
@@ -104,7 +103,6 @@ async fn sigkill_preauth_window_recovers_via_safe_redispatch() {
     }
 
     // pre-auth 窗口：立即杀（DispatchStarted 与授权之间）
-    // SIGKILL + 重启
     proc.kill();
     let mut proc = spawn_journal(dir.path()).await;
     let client = proc.client().await;

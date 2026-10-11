@@ -17,7 +17,6 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-/// flow-journal-server：JSONL v2 产品服务（WS RPC + 下载/触发 HTTP）。
 #[derive(Parser)]
 #[command(
     name = "flow-journal-server",

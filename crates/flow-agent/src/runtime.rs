@@ -197,7 +197,6 @@ async fn connect(
         .await
         .map_err(|e| format!("data tls: {e}"))?;
     let mut transport = FrameTransport::spawn_streams(control, data, 128);
-    // 会话建立（发 Welcome 已收，data 绑定）。
     let link = handshake(
         &mut transport,
         agent_boot_id,

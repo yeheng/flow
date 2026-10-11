@@ -730,7 +730,6 @@ impl TaskRunner {
             "credential": params.get("credential").cloned().unwrap_or(Value::Null),
         });
         let credential = self.authorize_operation(request).await?;
-        // 执行外部调用（执行器进程内）。
         let http_method = reqwest::Method::from_bytes(method.as_bytes())
             .map_err(|e| TaskError::Invalid(e.to_string()))?;
         // proxy：非法 URL 是配置错误（授权前构建请求时就该失败的最晚一刻）
@@ -843,7 +842,6 @@ impl TaskRunner {
         let request_bytes = flow_journal::codec::bounded_json(&request, INPUT_BUDGET)?;
         let fingerprint = flow_journal::codec::digest(&request_bytes);
         let operation_id = uuid::Uuid::now_v7().to_string();
-        // 大请求走 data 分块；小请求 inline。
         let inline =
             if request_bytes.len() <= flow_engine::execution_protocol::CONTROL_MAX_FRAME / 2 {
                 Some(StoredValue::Inline(request.clone()))
@@ -891,7 +889,6 @@ impl TaskRunner {
             })
             .await
             .map_err(|e| TaskError::Closed(e.to_string()))?;
-        // 等待许可（取消/断线唤醒）。
         let credential = loop {
             let message = tokio::time::timeout(
                 Duration::from_millis(DURABLE_WAIT_TIMEOUT_MS),

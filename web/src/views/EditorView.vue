@@ -34,7 +34,6 @@ import RunPanel from "../components/RunPanel.vue";
 const route = useRoute();
 const router = useRouter();
 
-// 左侧节点面板收起（⌘B / 顶栏按钮；记忆在 localStorage）
 const PALETTE_KEY = "flow.palette-collapsed";
 const paletteCollapsed = ref(localStorage.getItem(PALETTE_KEY) === "1");
 function togglePalette(): void {
@@ -42,7 +41,7 @@ function togglePalette(): void {
   localStorage.setItem(PALETTE_KEY, paletteCollapsed.value ? "1" : "0");
 }
 
-// 底部运行抽屉：新 run 启动自动展开；手动收起后保持收起到下一次启动
+// 抽屉开合不持久化（与节点面板不同）：手动收起后保持收起，直到下一次 run 启动自动展开
 const runDrawerOpen = ref(!!monitor.runId);
 watch(
   () => monitor.runId,
@@ -91,7 +90,7 @@ function isEditableTarget(t: EventTarget | null): boolean {
 
 // 快捷键只在编辑器页注册（运行详情等只读页不受影响）；输入框聚焦时不劫持
 function onKeydown(e: KeyboardEvent): void {
-  // 参数弹窗打开时：Esc 关闭弹窗，其余快捷键（删除/撤销/保存）不穿透到画布
+  // 弹窗打开时吞掉全部快捷键：防删除/撤销/保存穿透到弹窗后面的画布
   if (editor.paramsOpen) {
     if (e.key === "Escape") editor.paramsOpen = false;
     return;
@@ -265,11 +264,9 @@ async function saveAsNode(): Promise<void> {
         <FlowCanvas />
       </section>
     </main>
-    <!-- 运行面板：底部抽屉（新 run 启动自动展开），画布占满剩余高度 -->
     <section v-if="runDrawerOpen" class="run-drawer">
       <RunPanel @collapse="runDrawerOpen = false" />
     </section>
-    <!-- 节点参数编辑：弹窗（点节点/右键「编辑参数」/校验错误定位打开） -->
     <ParamsModal />
   </div>
 </template>

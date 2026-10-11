@@ -12,7 +12,7 @@ const nameInput = ref<HTMLInputElement>();
 
 const open = computed(() => editor.paramsOpen && !!node.value);
 
-// 弹窗打开（或切换到另一节点）时聚焦名称输入框：右键「编辑参数」直达改名
+// 右键「编辑参数」要直达改名：打开弹窗即聚焦名称输入框
 watch(
   [open, () => node.value?.id],
   async ([isOpen], [, prevId], onCleanup) => {
@@ -22,7 +22,7 @@ watch(
     await nextTick();
     if (cancelled) return;
     nameInput.value?.focus();
-    // 换节点重开时全选便于覆盖；同一节点重开保持光标位置语义（全选也无妨）
+    // 换节点重开时全选，便于直接覆盖
     if (prevId !== node.value?.id) nameInput.value?.select();
   },
   { immediate: true },

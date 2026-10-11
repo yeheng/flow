@@ -1,7 +1,6 @@
 //! flow-journal-server 的端到端契约：
-//! FLOW_BACKEND=journal 起真实服务进程，跑 v1 全量 RPC 面
-//! （workflow / run / 触发器 / 模板 / config），验证「补齐接口后的 v2
-//! 直接接入」——CLI 与 web 前端对 sqlite 后端的行为在这里逐一对齐。
+//! FLOW_BACKEND=journal 起真实服务进程，跑全量 RPC 面
+//! （workflow / run / 触发器 / 模板 / config）。
 
 mod common;
 
@@ -253,8 +252,6 @@ async fn journal_backend_serves_full_rpc_surface() {
     call::<Value>(client, "template.delete", json!({"id": template_id})).await;
 
     // ---- 进程级配置面（与后端无关，journal 臂同样可用）----
-    // config.get 是文件级视图（默认 + 文件，env 覆盖不进副本——文档化契约）；
-    // FLOW_BACKEND=journal 的 env 覆盖单列展示。
     let config: Value = call(client, "config.get", json!({})).await;
     assert!(
         config["env_overrides"]

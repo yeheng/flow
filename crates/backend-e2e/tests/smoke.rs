@@ -1,7 +1,6 @@
 //! 冒烟：harness 本身可用（起进程、建流、发 RPC、清理）。
 //!
-//! 用法：`e2e_test!(名字, |ctx: &mut Ctx| async move { ... })` —— 同一个闭包对
-//! SQLite / Postgres 两个后端各跑一遍（断言必须对两边同时成立）。
+//! 用法：`e2e_test!(名字, |ctx: &mut Ctx| async move { ... })`。
 
 use backend_e2e::common::fixtures::linear_def;
 use backend_e2e::common::{

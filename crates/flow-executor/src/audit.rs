@@ -126,7 +126,6 @@ impl AuditStream {
             if unacked + first_bytes > self.window {
                 break;
             }
-            // 组批：窗口许可内的连续记录合并为一个 AuditBatch。
             let mut batch: Vec<AuditRecord> = Vec::new();
             let mut batch_bytes = 0u64;
             while let Some(record) = self.pending.front() {

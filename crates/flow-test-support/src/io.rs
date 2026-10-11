@@ -51,7 +51,7 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        // 只删自己建的子目录；失败意味着它本来就没建成，不值得为它 panic
+        // 失败意味着它本来就没建成，不值得为它 panic
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }

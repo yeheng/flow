@@ -270,7 +270,7 @@ async fn wait_human_waiting(f: &Fixture, run: &str) -> u64 {
     .expect("human_task 未进入等待")
 }
 
-/// 信号错误码契约（两后端同一组码；PG 侧在 ws_pg.rs 钉住落账语义）：
+/// 信号错误码契约：
 /// run 不存在 → -32011，run 已终结 → -32012，节点不等待信号 → -32602。
 #[tokio::test]
 async fn run_signal_error_codes_follow_the_shared_contract() {
@@ -563,7 +563,6 @@ async fn webhook_crud() {
         .await;
     assert_eq!(list["result"]["webhooks"].as_array().unwrap().len(), 1);
 
-    // set_enabled
     let ok = f
         .call(
             "webhook.set_enabled",
@@ -583,7 +582,6 @@ async fn webhook_crud() {
         .await;
     assert_eq!(missing["error"]["code"], -32011, "{missing}");
 
-    // delete
     let missing = f.call("webhook.delete", json!({"token": "nope"})).await;
     assert_eq!(missing["error"]["code"], -32011, "{missing}");
     let ok = f.call("webhook.delete", json!({"token": token})).await;
@@ -608,7 +606,7 @@ async fn run_stats_counts_exactly_and_groups_by_workflow() {
     assert_eq!(empty["result"]["by_status"].as_object().unwrap().len(), 0);
     assert_eq!(empty["result"]["by_workflow"].as_array().unwrap().len(), 0);
 
-    // 造数据：f.workflow 两个 run（succeeded + running），另一个 workflow 一个 succeeded
+    // 造数据：f.workflow 两个 run，另一个 workflow 一个 succeeded
     let r1 = f
         .call("run.start", json!({"workflow_id": f.workflow}))
         .await;
@@ -636,7 +634,6 @@ async fn run_stats_counts_exactly_and_groups_by_workflow() {
     let all = f.call("run.stats", json!({})).await;
     let total = all["result"]["total"].as_i64().unwrap();
     assert_eq!(total, 3, "{all}");
-    // journal 下第二个 run 真实执行完成（v1 直插 running 行的构造已不可用）
     assert_eq!(all["result"]["by_status"]["succeeded"], 3);
     let by_workflow = all["result"]["by_workflow"].as_array().unwrap();
     assert_eq!(by_workflow.len(), 2, "{all}");

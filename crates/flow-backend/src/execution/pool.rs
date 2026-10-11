@@ -224,7 +224,6 @@ async fn spawn_and_handshake(
         PoolError::Handshake(error.to_string())
     })?;
     let boot_id = hello.boot_id.clone();
-    // 会话驱动任务：串行转发 + 心跳超时 + 死亡回收（kill + wait/reap）。
     let (to_session, command_rx) = mpsc::channel::<ToSession>(64);
     let (event_tx, events) = mpsc::channel::<FromSession>(256);
     tokio::spawn(session_driver(

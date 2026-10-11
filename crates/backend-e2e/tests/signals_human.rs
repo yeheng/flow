@@ -191,7 +191,7 @@ e2e_test!(cancel_aborts_inflight_delay, |ctx: &mut Ctx| Box::pin(
     }
 ));
 
-/// 轮询直到节点进入 running（human_task / delay 等运行中状态的观测助手）。
+/// human_task / delay 等运行中状态的观测助手。
 async fn wait_node_running(client: &Conn, run_id: &str, node_id: &str) -> Value {
     let deadline = std::time::Instant::now() + SHORT;
     loop {

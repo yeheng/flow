@@ -20,7 +20,6 @@ use crate::task::{TaskEnd, TaskRunner};
 use crate::transfer::IncomingTransfers;
 use crate::{EXECUTOR_BUILD, EXECUTOR_CAPABILITIES};
 
-/// 运行时配置。
 pub struct ExecutorConfig {
     pub control_fd: i32,
     pub data_fd: i32,

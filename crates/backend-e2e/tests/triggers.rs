@@ -152,7 +152,6 @@ e2e_test!(schedule_crud_and_next_fire_at, |ctx: &mut Ctx| Box::pin(
         let err = call_err(&client, "schedule.delete", json!({"id": "nope"})).await;
         assert_eq!(err.code(), -32011, "{err}");
 
-        // delete
         let deleted: Value = call(&client, "schedule.delete", json!({"id": schedule_id})).await;
         assert_eq!(deleted["deleted"], json!(true));
         let list: Value = call_json(&client, "schedule.list", json!({})).await;
@@ -346,7 +345,6 @@ e2e_test!(webhook_crud_and_http_trigger_branches, |ctx: &mut Ctx| {
         let run = wait_run_terminal(&client, &run_id, TIMEOUT).await;
         assert_eq!(run["run"]["input"], json!(null), "空 body → null 输入");
 
-        // delete
         let deleted: Value = call(&client, "webhook.delete", json!({"token": token})).await;
         assert_eq!(deleted["deleted"], json!(true));
         let (status, _) = http_post_hook(http_addr, ctx.token(), &token, Some("{}")).await;

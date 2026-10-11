@@ -39,7 +39,7 @@ impl Ctx {
 
     /// extra_env 透传给被测进程（如 FLOW_EXECUTION_MODE / FLOW_X_MAX）。
     pub async fn start_with(bin: &str, extra_env: &[(&str, &str)]) -> Ctx {
-        // journal：独占临时目录即 journal 根；v2 部署 token 随机（≥32 字节）
+        // v2 部署 token 随机（≥32 字节）
         let dir = std::env::temp_dir().join(format!("flow-e2e-j-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).expect("创建 journal 临时目录失败");
         let token = uuid::Uuid::now_v7().simple().to_string();

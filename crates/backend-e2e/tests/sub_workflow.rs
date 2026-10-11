@@ -252,7 +252,6 @@ async fn depth_chain_body(ctx: &Ctx, depth: usize) {
     );
 }
 
-/// 轮询直到节点进入 running。
 async fn wait_node_running(
     client: &Conn,
     run_id: &str,

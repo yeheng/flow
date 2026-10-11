@@ -105,8 +105,6 @@ fn exit_fail(err: &dyn std::fmt::Display) -> std::process::ExitCode {
     std::process::ExitCode::FAILURE
 }
 
-/// 中继入口。executor 缺省定位同目录 flow-executor。
-/// 参数解析：CLI flag > env（clap env 属性已合并）> 配置文件 [agent] > 报错。
 #[allow(clippy::too_many_arguments)]
 fn agent_main(
     config: Config,

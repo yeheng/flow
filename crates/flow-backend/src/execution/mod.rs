@@ -100,7 +100,6 @@ pub fn remote_options_from_config(
     })
 }
 
-/// 按给定环境值解析执行模式。
 pub fn mode_from_env_with(value: &str) -> Result<ExecutionMode, String> {
     match value {
         "" | "in_process" => Ok(ExecutionMode::InProcess),

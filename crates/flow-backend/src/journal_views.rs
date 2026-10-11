@@ -125,7 +125,6 @@ pub async fn list_workflows(backend: &JournalBackend) -> Result<Vec<WorkflowSumm
     for workflow in state.workflows.values() {
         summaries.push(workflow_summary(workflow)?);
     }
-    // Newest workflows first.
     summaries.sort_by_key(|s| std::cmp::Reverse(s.created_at));
     Ok(summaries)
 }

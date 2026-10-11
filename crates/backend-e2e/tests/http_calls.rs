@@ -181,7 +181,6 @@ e2e_test!(
     })
 );
 
-/// 轮询直到节点进入预期状态。
 async fn wait_node_state(
     client: &Conn,
     run_id: &str,

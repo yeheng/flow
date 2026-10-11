@@ -4,12 +4,7 @@
  * 新增状态或来源时只改这一处。
  */
 
-/**
- * runs.status 词汇表（flow-dto RunStatus，是服务端写入口校验的那一份）。
- * 终态/在跑两个集合此前散在 4 处硬编码（dashboard.activeCount、
- * dashboard.successRate、DashboardView.statusLabel、monitor 的 phaseTerminal），
- * 新增一个状态要改 4 个地方且编译器不提醒——收敛到这里一处。
- */
+/** runs.status 词汇表（flow-dto RunStatus，服务端写入口校验的那一份）。 */
 export const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set([
   "succeeded",
   "failed",

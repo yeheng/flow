@@ -13,7 +13,7 @@ use backend_e2e::common::{
 use backend_e2e::e2e_test;
 use serde_json::{json, Value};
 
-/// 轮询 run.timeline 直到某节点进入预期状态（用于「运行中等待」这类非终态观测）。
+/// 用于「运行中等待」这类非终态观测。
 async fn wait_node_state(
     client: &backend_e2e::common::Conn,
     run_id: &str,

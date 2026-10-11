@@ -166,7 +166,6 @@ impl DispatchRunner {
     /// 重传；已授权未 Outcome 的操作重发许可——许可由主进程权威生成，
     /// 绑定当前会话，非旧会话重放）。
     async fn drive_link(&mut self, link: &mut DispatchLink, resume: bool) -> Result<()> {
-        // 读取当前 run 快照，构造 Execute 任务面。
         let run = self.snapshot().await?;
         let record = run
             .nodes
@@ -882,7 +881,6 @@ impl DispatchRunner {
         if dispatch_id != self.attempt.dispatch_id {
             return Err(invalid("operation request for foreign dispatch"));
         }
-        // 组装请求字节（inline 或 transfer）。
         let request_bytes: Vec<u8> = match request {
             Some(StoredValue::Inline(value)) => {
                 flow_journal::codec::bounded_json(&value, 8 * 1024 * 1024)?

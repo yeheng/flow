@@ -1,6 +1,6 @@
 //! flow-rpc：jsonrpsee WebSocket 服务（bin: flow-journal-server）。
 //!
-//! v1 RPC 面（`flow-server` 的无认证契约，35 个方法直连 `AnyBackend`）已随
+//! v1 RPC 面（`flow-server` 的无认证契约）已随
 //! flow-server 退役。本 crate 现在只有一个产品面：
 //! - [`journal_v2`]：journal v2 协议（token 认证、写命令幂等键、回执语义、
 //!   `journal_views` 物化产品视图）——浏览器前端、桌面内嵌服务、flow-cli
@@ -158,7 +158,7 @@ pub async fn serve_journal_product(
             })
             .await
     });
-    // 产品装配：统一配置面 + 持久化密钥（密钥在 data_dir 下，与桌面同规则）
+    // 密钥在 data_dir 下，与桌面同规则
     let data_dir = std::path::PathBuf::from(&config.storage.data_dir);
     let file_config = match &config_path {
         Some(path) => {
@@ -372,8 +372,8 @@ pub(crate) fn validate_fragment(
     ))
 }
 
-/// `nodetypes.list` 响应快照：descriptor 注册表收敛（model.rs `NodeType::descriptor`）
-/// 是纯重构，响应必须逐字节不变。新增/修改节点类型时同步更新本快照。
+/// `nodetypes.list` 响应快照：
+/// 响应必须逐字节不变。新增/修改节点类型时同步更新本快照。
 #[cfg(test)]
 mod tests {
     #[test]

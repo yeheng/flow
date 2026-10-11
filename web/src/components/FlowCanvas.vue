@@ -52,7 +52,7 @@ function onNodeClick(e: NodeMouseEvent): void {
   editor.selectedNodeId = e.node.id;
 }
 
-// 双击 = 编辑参数（弹窗）。sub_workflow 的钻取走右键菜单「钻取子流程」
+// sub_workflow 的钻取不走双击，走右键菜单「钻取子流程」
 function onNodeDoubleClick(e: NodeMouseEvent): void {
   editor.selectedNodeId = e.node.id;
   editor.paramsOpen = true;

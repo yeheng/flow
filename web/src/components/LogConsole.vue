@@ -38,7 +38,7 @@ const nodeName = computed(() => {
 interface LogFrame {
   /** 过滤后的全量行（窗口化之前） */
   rows: LogLine[];
-  /** 是否收到过任何日志（空态判据；不过滤，与旧实现同义） */
+  /** 是否收到过任何日志（空态判据；不过滤） */
   hasLogs: boolean;
   /** 日志里出现过的节点 id（过滤下拉） */
   nodeIds: string[];

@@ -172,7 +172,6 @@ e2e_test!(create_update_publish_get_list_roundtrip, |ctx: &mut Ctx| {
         .await;
         assert_eq!(got["version"], json!(1));
 
-        // 删除
         let deleted: Value = call(
             &client,
             "workflow.delete",

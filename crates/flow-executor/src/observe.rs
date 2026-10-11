@@ -197,7 +197,6 @@ mod tests {
         // 让转发任务跑（异步 spawn）。
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // 读出能送达的批，验证每批编码都在帧限内。
         let mut encoded_batches = 0;
         while let Ok(message) = rx.try_recv() {
             let Message::ObservabilityBatch { lines, .. } = message else {

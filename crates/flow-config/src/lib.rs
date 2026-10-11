@@ -7,7 +7,7 @@
 //! [server]   cron 调度器开关与 journal 触发器 tick
 //! [storage]  backend（journal）、data_dir
 //! [execution] 执行模式（in_process|ipc|remote）、executor_bin、x_max、[remote]
-//! [agent]    flow-agent 的上联地址与证书（原先只有 CLI 参数）
+//! [agent]    flow-agent 的上联地址与证书
 //! [journal]  journal-server 的监听地址与数据目录（token 仍是环境变量——凭据）
 //! ```
 //!
@@ -110,8 +110,6 @@ pub struct StorageConfig {
 impl Default for StorageConfig {
     fn default() -> Self {
         StorageConfig {
-            // 默认 = journal（JSONL v2 权威）。sqlite（v1）已删除；历史数据
-            // 不迁移，见 docs/SQLITE_V1_TO_V2_MIGRATION.md。
             backend: StorageBackend::Journal,
             data_dir: "data".into(),
         }
@@ -443,9 +441,7 @@ fn apply_env(config: &mut Config) -> Result<Vec<String>, String> {
 
     // ---- [storage] ----
     if let Some(v) = env_str("FLOW_BACKEND") {
-        // v1 后端（sqlite/postgres）已删除（历史数据不迁移，见
-        // docs/SQLITE_V1_TO_V2_MIGRATION.md）。不静默回落：非法值走 Err，
-        // 与 toml 未知值同语义。
+        // 不静默回落：非法值走 Err，与 toml 未知值同语义。
         match v.as_str() {
             "journal" | "jsonl" => config.storage.backend = StorageBackend::Journal,
             other => {
@@ -612,7 +608,6 @@ mod tests {
     fn defaults_match_legacy_env_defaults() {
         let config = Config::default();
         config.validate().expect("默认值必须合法");
-        // 默认后端 = journal（JSONL v2 权威）
         assert_eq!(config.storage.backend, StorageBackend::Journal);
         assert_eq!(config.storage.data_dir, "data");
         assert_eq!(config.execution.mode, ExecutionModeKind::InProcess);

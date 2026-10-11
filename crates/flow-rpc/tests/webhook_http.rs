@@ -1,5 +1,5 @@
-//! webhook HTTP 入口（POST /hook/:token）的端到端契约：
-//! 200 触发 + 归因、未知/禁用 token 404、无 published 409、非法 JSON 400。
+//! webhook HTTP 入口的端到端契约：
+//! 200 触发 + 归因、非法 JSON 400。
 
 use std::path::PathBuf;
 
@@ -127,14 +127,14 @@ async fn webhook_post_triggers_run_with_source_attribution() {
     assert_eq!(run.source_detail.as_deref(), Some(hook.token.as_str()));
     assert_eq!(run.input, json!({"src": "hook"}));
 
-    // 未知 token 与禁用 token 同为 404（不区分，避免探测）
+    // 未知 token 与禁用 token（不区分，避免探测）
     let (status, _) = f.post("deadbeef", "{}").await;
     assert_eq!(status, 400);
     f.enable(&hook.token, false).await;
     let (status, _) = f.post(&hook.token, "{}").await;
     assert_eq!(status, 400);
 
-    // 无 published 版本 → 409
+    // 无 published 版本
     let wf2 = f.workflow(false).await;
     let hook2 = f.hook(&wf2).await;
     let (status, _) = f.post(&hook2.token, "{}").await;

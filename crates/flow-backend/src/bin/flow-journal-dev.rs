@@ -11,7 +11,6 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-/// flow-journal-dev：JSONL v2 开发运行器。
 #[derive(Parser)]
 #[command(
     name = "flow-journal-dev",
@@ -95,7 +94,6 @@ fn main() -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-/// 配置加载失败的统一出口。
 fn exit_fail(err: &dyn std::fmt::Display) -> std::process::ExitCode {
     eprintln!("error: {err}");
     std::process::ExitCode::FAILURE

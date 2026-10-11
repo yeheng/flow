@@ -42,7 +42,6 @@ pub(crate) fn is_link_dead(error: &crate::journal::JournalError) -> bool {
     matches!(error, crate::journal::JournalError::LinkClosed(_))
 }
 
-// 远程模式选项。
 #[derive(Debug, Clone)]
 pub struct RemoteOptions {
     pub control_addr: String,
@@ -60,7 +59,7 @@ impl RemoteOptions {
     }
 }
 
-// TLS 服务器配置（mTLS：验证 agent 客户端证书）。
+// mTLS：验证 agent 客户端证书。
 pub struct TlsServer {
     pub acceptor: TlsAcceptor,
 }
@@ -316,8 +315,7 @@ impl AgentManager {
     async fn inject_stream(self: &Arc<Self>, agent_id: String, side: Side, stream: BoxedStream) {
         match side {
             Side::Control => {
-                // control 到达即启动会话：先裸帧握手（Hello/Welcome），
-                // 再等 data 流汇入完成 DataBind。
+                // control 到达即启动会话。
                 let manager = self.clone();
                 let agent_id = agent_id.clone();
                 tokio::spawn(async move {
@@ -837,7 +835,6 @@ impl AgentManager {
 
     // 写入终局裁决，保留到 dispatcher 取走并释放绑定。
     async fn resolve_binding(&self, dispatch_id: &str, outcome: AttachOutcome) {
-        // Keep the verdict reachable until the dispatcher takes it and unbinds.
         let binding = self.bindings.lock().await.get(dispatch_id).cloned();
         if let Some(binding) = binding {
             let mut verdict = binding.verdict.lock().await;

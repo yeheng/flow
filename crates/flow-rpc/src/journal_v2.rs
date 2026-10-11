@@ -328,7 +328,7 @@ pub fn module_product(
                         b,text(&p,"workflow_id")?,optional_version(&p)?.map(|v|i64::try_from(v).map_err(invalid)).transpose()?,
                     ).await.map_err(view_failure)?;
                     // 产品形状：version 之外还带 published_version（编辑器
-                    // 用它渲染「已发布 vN」徽标），单独补上。
+                    // 用它渲染「已发布 vN」徽标）。
                     let published=flow_backend::journal_views::latest_published(b,text(&p,"workflow_id")?).await.map_err(view_failure)?;
                     let mut value=serde_json::to_value(version).map_err(invalid)?;
                     value["published_version"]=json!(published);

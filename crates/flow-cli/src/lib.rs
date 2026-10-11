@@ -18,7 +18,7 @@ pub mod output;
 pub mod run;
 pub mod workflow;
 
-/// 进程入口：自带多线程 runtime（与原 `#[tokio::main]` 形态一致），
+/// 进程入口：自带多线程 runtime，
 /// 解析 `flow cli` 之后的参数并分发，返回进程退出码（0/1/2/4 契约）。
 pub fn run_from_args(argv: &[String]) -> i32 {
     let runtime = tokio::runtime::Builder::new_multi_thread()

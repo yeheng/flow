@@ -182,7 +182,6 @@ e2e_test!(subscriptions_isolate_runs, |ctx: &mut Ctx| Box::pin(
     }
 ));
 
-/// 轮询直到节点进入 running。
 async fn wait_node_running(
     client: &backend_e2e::common::Conn,
     run_id: &str,

@@ -21,7 +21,7 @@ const props = withDefaults(defineProps<{ childRunNavigate?: boolean }>(), {
 
 const activeTab = ref<"timeline" | "logs">("timeline");
 
-/** run 状态文案：单一来源 monitor.status，配色与文案同源（此前分家，见提交说明） */
+/** run 状态文案：单一来源 monitor.status，配色与文案同源 */
 const runStateText = computed(() => (monitor.status ? runStatusLabel(monitor.status) : ""));
 
 /** human_task 信号输入框内容，key = node_id */

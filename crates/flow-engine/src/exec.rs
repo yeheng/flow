@@ -112,7 +112,7 @@ pub fn harness_output(
             stderr_tail(&stderr)
         )));
     }
-    // stdout 去空白后恰为 JSON 对象/数组时附上解析结果，方便下游直接取数
+    // 附上解析结果，方便下游直接取数
     let trimmed = stdout.trim();
     let result = if trimmed.starts_with('{') || trimmed.starts_with('[') {
         serde_json::from_str::<Value>(trimmed)

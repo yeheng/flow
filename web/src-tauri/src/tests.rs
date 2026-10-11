@@ -108,7 +108,7 @@ async fn journal_uses_separate_authority_and_native_token() {
     )
     .await;
     assert_eq!(reply["result"]["result"], replay["result"]["result"]);
-    // M4 后主服务与 journal 工作区同源（v2 唯一权威）：journal 创建的
+    // 主服务与 journal 工作区同源（v2 唯一权威）：journal 创建的
     // 工作流对 Flow 服务立即可见
     let flow_list = call(&host, Service::Flow, "workflow.list.view", json!({})).await;
     assert_eq!(
