@@ -55,6 +55,9 @@ impl Services {
         } else {
             root.join("flow")
         };
+        if config.journal.cluster.is_some() {
+            return Err("journal.cluster 当前只支持 flow-journal-server；请使用浏览器工作台连接该服务".into());
+        }
         let journal = JournalBackend::open(&root.join("journal"), Default::default())
             .await
             .map_err(|e| e.to_string())?;

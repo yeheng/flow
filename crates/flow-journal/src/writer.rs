@@ -78,9 +78,45 @@ struct Queue {
     round: VecDeque<String>,
     control_turn: bool,
     closing: bool,
+    in_flight: bool,
     bytes: usize,
     requests: usize,
     stats: WriterStats,
+    admission: Option<Arc<WriteAdmission>>,
+}
+
+/// A conservative local lease deadline. Expiry is permanent for this writer;
+/// delayed renewal must never revive a process that has lost authority.
+pub struct WriteAdmission {
+    deadline: Mutex<Option<Instant>>,
+}
+impl WriteAdmission {
+    pub fn new(deadline: Instant) -> Self {
+        Self {
+            deadline: Mutex::new(Some(deadline)),
+        }
+    }
+    pub fn renew(&self, deadline: Instant) -> bool {
+        let mut current = self.deadline.lock().unwrap();
+        if current.is_some_and(|value| value > Instant::now()) && deadline > Instant::now() {
+            *current = Some(deadline);
+            true
+        } else {
+            *current = None;
+            false
+        }
+    }
+    pub fn revoke(&self) {
+        *self.deadline.lock().unwrap() = None;
+    }
+    fn check(&self) -> Result<()> {
+        let mut deadline = self.deadline.lock().unwrap();
+        if deadline.is_some_and(|value| value > Instant::now()) {
+            return Ok(());
+        }
+        *deadline = None;
+        Err(Error::Unavailable("journal membership lease lost".into()))
+    }
 }
 impl Queue {
     fn pop(&mut self) -> Option<Pending> {
@@ -198,6 +234,16 @@ impl Journal {
         self.stats().durable_lsn
     }
 
+    pub fn set_write_admission(&self, admission: Arc<WriteAdmission>) -> Result<()> {
+        let mut queue = self.inner.shared.queue.lock().unwrap();
+        if queue.admission.is_some() || queue.requests != 0 || queue.in_flight || queue.closing {
+            return Err(invalid("write admission already installed or writer busy"));
+        }
+        admission.check()?;
+        queue.admission = Some(admission);
+        Ok(())
+    }
+
     pub async fn submit(
         &self,
         tx_id: String,
@@ -250,6 +296,9 @@ impl Journal {
             if queue.closing {
                 return Err(Error::Unavailable("writer closed".into()));
             }
+            if let Some(admission) = &queue.admission {
+                admission.check()?;
+            }
             queue.bytes += bytes;
             queue.requests += 1;
             queue.stats.peak_queued_bytes = queue.stats.peak_queued_bytes.max(queue.bytes);
@@ -301,7 +350,7 @@ impl Journal {
 
 fn pump(mut disk: Disk, shared: Arc<Shared>, options: JournalOptions) {
     loop {
-        let batch = {
+        let (batch, admission) = {
             let mut queue = shared.queue.lock().unwrap();
             while queue.requests == 0 && !queue.closing {
                 queue = shared.ready.wait(queue).unwrap();
@@ -324,12 +373,16 @@ fn pump(mut disk: Disk, shared: Arc<Shared>, options: JournalOptions) {
                 bytes += item.bytes;
                 batch.push(item);
             }
-            batch
+            queue.in_flight = true;
+            (batch, queue.admission.clone())
         };
         let mut commits = Vec::with_capacity(batch.len());
         let mut encoded_bytes = 0;
         let outcome: Result<()> = (|| {
             for pending in &batch {
+                if let Some(admission) = &admission {
+                    admission.check()?;
+                }
                 if disk.bytes + pending.bytes as u64 > options.segment_bytes
                     && disk.last_lsn > disk.first_lsn
                 {
@@ -341,6 +394,9 @@ fn pump(mut disk: Disk, shared: Arc<Shared>, options: JournalOptions) {
                     .checked_add(1)
                     .ok_or_else(|| invalid("LSN overflow"))?;
                 let line = codec::encode(&tx)?;
+                if let Some(admission) = &admission {
+                    admission.check()?;
+                }
                 let location = disk.append(&line, tx.lsn)?;
                 encoded_bytes += line.len();
                 commits.push(Commit {
@@ -348,9 +404,14 @@ fn pump(mut disk: Disk, shared: Arc<Shared>, options: JournalOptions) {
                     location,
                 });
             }
-            disk.sync()
+            disk.sync()?;
+            if let Some(admission) = &admission {
+                admission.check()?;
+            }
+            Ok(())
         })();
         let mut queue = shared.queue.lock().unwrap();
+        queue.in_flight = false;
         queue.stats.data_syncs = disk.data_syncs;
         queue.stats.directory_syncs = disk.directory_latency.samples;
         queue.stats.data_sync_latency = disk.data_latency.clone();

@@ -13,6 +13,12 @@
 > **部署 / 运维见 [OPS.md](OPS.md)**（部署形态、执行模式、离线维护、升级、
 > 故障处置、容量预算与安全边界）；本文只描述语义，不重复操作步骤。
 >
+> **多节点注册（2026-10-11）**：可选 `journal-cluster` feature 已实现独立 journal
+> 节点的 PG 注册、租约、归属、进度同步与 `/cluster` 管理页，见
+> [JOURNAL_CLUSTER.md](JOURNAL_CLUSTER.md)。跨节点业务调度和接管仍未实现。审查见
+> [MULTI_NODE_REVIEW.md](MULTI_NODE_REVIEW.md)，PostgreSQL 注册、租约调度、
+> 故障接管设计提案见 [MULTI_NODE_PG_DESIGN.md](MULTI_NODE_PG_DESIGN.md)。
+>
 > **容量定位（部署选型）**：journal 定位是**单机并发**——单写者 + fsync 崩溃边界，
 > backend-perf 实测 ~25 runs/s（16 在飞，e2e p95 < 1s）。更高并发需求在当前
 > 产品面没有替代后端（v1 的 Postgres 多节点后端已删除，见 §14）。

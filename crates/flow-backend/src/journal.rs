@@ -50,6 +50,8 @@ struct CommittedState {
     dirty_runs: BTreeSet<String>,
 }
 pub struct JournalBackend {
+    #[cfg(feature = "journal-cluster")]
+    cluster: std::sync::OnceLock<Arc<crate::journal_cluster::Membership>>,
     pub journal: Journal,
     pub projection: Arc<Projector>,
     pub observations: Option<flow_engine::observation::ObservationStore>,
@@ -232,6 +234,8 @@ impl JournalBackend {
         let mut tail = committed.reader.fork();
         let mut state = committed.state.clone();
         let backend = Arc::new(Self {
+            #[cfg(feature = "journal-cluster")]
+            cluster: std::sync::OnceLock::new(),
             observations: flow_engine::observation::ObservationStore::open(
                 root.join("observations"),
                 Default::default(),
@@ -612,9 +616,27 @@ impl JournalBackend {
         if let Err(error) = self.checkpoint().await {
             tracing::warn!(%error,"checkpoint unavailable; next startup will replay journal");
         }
+        let closed = self.journal.close().await;
+        #[cfg(feature = "journal-cluster")]
+        if let Some(cluster) = self.cluster.get() {
+            let snapshot = self.cluster_snapshot().await.ok();
+            cluster.close(snapshot.as_ref()).await;
+        }
         self.projection.close().await;
-        self.journal.close().await?;
+        closed?;
         Ok(())
+    }
+    #[cfg(feature = "journal-cluster")]
+    pub fn cluster(&self) -> Option<&Arc<crate::journal_cluster::Membership>> {
+        self.cluster.get()
+    }
+    #[cfg(feature = "journal-cluster")]
+    pub fn install_cluster(&self, cluster: Arc<crate::journal_cluster::Membership>) -> bool {
+        self.cluster.set(cluster).is_ok()
+    }
+    #[cfg(feature = "journal-cluster")]
+    pub(crate) async fn projection_failure(&self) -> Option<String> {
+        self.projection_error.lock().await.clone()
     }
     pub async fn checkpoint(&self) -> Result<()> {
         let mut committed = self.state.lock().await;

@@ -5,6 +5,7 @@ import { isDesktop } from "./platform";
 export const router = createRouter({
   history: isDesktop() ? createWebHashHistory() : createWebHistory(),
   routes: [
+    { path: "/cluster", component: () => import("./views/ClusterView.vue") },
     { path: "/journal", component: () => import("./views/JournalView.vue") },
     { path: "/", component: () => import("./views/DashboardView.vue") },
     { path: "/workflows", component: () => import("./views/WorkflowListView.vue") },

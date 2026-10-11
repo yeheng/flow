@@ -15,6 +15,7 @@ const connected = computed(() => client.connected.value);
       <RouterLink to="/workflows">工作流</RouterLink>
       <RouterLink to="/runs">运行记录</RouterLink>
       <RouterLink to="/journal">JSONL 工作区</RouterLink>
+      <RouterLink to="/cluster">节点管理</RouterLink>
       <RouterLink to="/settings">设置</RouterLink>
     </nav>
     <span class="conn" :class="{ ok: connected }">
@@ -44,6 +45,7 @@ header {
   gap: 8px;
   font-weight: 600;
   letter-spacing: 0.04em;
+  flex-shrink: 0;
 }
 
 .logo::before {
@@ -58,6 +60,9 @@ header {
 .nav {
   display: flex;
   gap: 14px;
+  min-width: 0;
+  overflow-x: auto;
+  white-space: nowrap;
 }
 
 .nav a {
@@ -86,5 +91,10 @@ header {
 
 .conn.ok {
   color: var(--ok);
+}
+@media (max-width: 700px) {
+  .conn {
+    display: none;
+  }
 }
 </style>

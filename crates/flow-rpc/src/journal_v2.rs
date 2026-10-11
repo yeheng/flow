@@ -116,6 +116,8 @@ fn optional_version(params: &Value) -> Result<Option<u64>, ErrorObjectOwned> {
 /// 读方法清单。注册层与客户端
 /// （backend-e2e harness、flow-cli）共用同一份，避免两处各抄一份漂移。
 pub const READ_METHODS: &[&str] = &[
+    "journal.cluster.status",
+    "journal.cluster.nodes",
     "run.observations.page",
     "command.status",
     "workflow.list",
@@ -144,6 +146,7 @@ pub const READ_METHODS: &[&str] = &[
 ];
 
 pub const WRITE_METHODS: &[&str] = &[
+    "journal.cluster.remove",
     "workflow.create",
     "workflow.update",
     "workflow.publish",
@@ -210,6 +213,9 @@ pub fn module_product(
         product,
     });
     for method in [
+        "journal.cluster.status",
+        "journal.cluster.nodes",
+        "journal.cluster.remove",
         "workflow.create",
         "workflow.update",
         "workflow.publish",
@@ -275,6 +281,30 @@ pub fn module_product(
                 return Err(invalid("request_id required for write commands"));
             }
             let b=&ctx.backend;
+            if method.starts_with("journal.cluster.") {
+                #[cfg(feature="journal-cluster")]
+                if let Some(cluster) = b.cluster() {
+                    let map = |error: flow_backend::journal_cluster::ClusterError| {
+                        use flow_backend::journal_cluster::ClusterError;
+                        match error {
+                            ClusterError::Conflict(message) => ErrorObjectOwned::owned(-32012,message,None::<()>),
+                            ClusterError::Invalid(message) => invalid(message),
+                            _ => ErrorObjectOwned::owned(-32603,"journal registry unavailable",None::<()>),
+                        }
+                    };
+                    return match method {
+                        "journal.cluster.status" => Ok(json!({"enabled":true,"cluster_id":cluster.cluster_id,"node_id":cluster.lease.node_id})),
+                        "journal.cluster.nodes" => cluster.registry.nodes(p["after"].as_str().unwrap_or(""),p["limit"].as_u64().unwrap_or(64).min(256) as usize).await.map_err(map),
+                        "journal.cluster.remove" => {
+                            if p["expected_epoch"].is_null() { return Err(invalid("expected_epoch required")); }
+                            cluster.registry.remove(text(&p,"node_id")?,decimal_param(&p,"expected_epoch")?,request.unwrap()).await.map_err(map)
+                        },
+                        _ => unreachable!(),
+                    };
+                }
+                if method=="journal.cluster.status" { return Ok(json!({"enabled":false})); }
+                return Err(ErrorObjectOwned::owned(-32012,"journal cluster is not configured",None::<()>));
+            }
             let receipt=match method {
                 "run.observations.page"=>{
                     let run_id=text(&p,"run_id")?.to_owned();
@@ -546,6 +576,14 @@ async fn serve_module(
     module: RpcModule<Context>,
     addr: SocketAddr,
 ) -> Result<(jsonrpsee::server::ServerHandle, SocketAddr), Box<dyn std::error::Error>> {
+    let server = bind_product_server(addr).await?;
+    let addr = server.local_addr()?;
+    Ok((server.start(module), addr))
+}
+
+pub(crate) async fn bind_product_server(
+    addr: SocketAddr,
+) -> Result<jsonrpsee::server::Server, Box<dyn std::error::Error>> {
     let config = jsonrpsee::server::ServerConfig::builder()
         .max_request_body_size(9 * 1024 * 1024)
         .max_response_body_size(9 * 1024 * 1024)
@@ -555,8 +593,7 @@ async fn serve_module(
         .set_config(config)
         .build(addr)
         .await?;
-    let addr = server.local_addr()?;
-    Ok((server.start(module), addr))
+    Ok(server)
 }
 
 #[cfg(test)]

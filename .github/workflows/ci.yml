@@ -75,9 +75,39 @@ jobs:
         with:
           key: ${{ matrix.arch.target }}
       # --all-targets：lib / bins / tests / benches / examples 一起验。
-      # （v1 的 Postgres 后端与 flow-pg 测试臂已随后端删除，无 PG 依赖。）
+      # 默认 journal 构建无需 PG；可选注册 feature 另设真实 PG 测试。
       - name: test
         run: cargo test --workspace --all-targets --locked --target ${{ matrix.arch.target }}
+
+  journal-cluster:
+    name: journal cluster / PostgreSQL
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: flow
+          POSTGRES_PASSWORD: flow-test
+          POSTGRES_DB: flow_cluster_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U flow -d flow_cluster_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      FLOW_CLUSTER_TEST_DATABASE_URL: postgres://flow:flow-test@127.0.0.1:5432/flow_cluster_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: journal-cluster
+      - run: cargo clippy -p flow-rpc -p flow-backend --all-targets --features journal-cluster --locked -- -D warnings
+      - run: cargo test -p flow-backend --features journal-cluster --test journal_cluster --locked -- --ignored
+      - run: cargo test -p flow-rpc --features journal-cluster --test journal_cluster --locked -- --ignored
 
   # ---- 多架构构建：cross 交叉编译四个 Linux target ----
   # 为什么用 cross 而不是把 aarch64 也放到 arm runner 上原生编：单 runner 铺完

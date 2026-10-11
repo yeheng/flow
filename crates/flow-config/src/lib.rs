@@ -219,6 +219,8 @@ pub struct JournalConfig {
     pub http_addr: String,
     /// journal 数据目录（原 FLOW_JOURNAL_DATA_DIR；journal-server 用）。
     pub data_dir: Option<String>,
+    /// Optional PostgreSQL registry for independent journal nodes.
+    pub cluster: Option<JournalClusterConfig>,
 }
 
 impl Default for JournalConfig {
@@ -227,7 +229,76 @@ impl Default for JournalConfig {
             addr: "127.0.0.1:9802".into(),
             http_addr: "127.0.0.1:9803".into(),
             data_dir: None,
+            cluster: None,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct JournalClusterConfig {
+    pub cluster_id: String,
+    pub node_id: String,
+    /// The connection string stays in this environment variable, never config.get.
+    pub database_url_env: String,
+    pub rpc_url: Option<String>,
+    pub http_url: Option<String>,
+    pub heartbeat_ms: u64,
+    pub lease_ms: u64,
+}
+
+impl Default for JournalClusterConfig {
+    fn default() -> Self {
+        Self {
+            cluster_id: String::new(),
+            node_id: String::new(),
+            database_url_env: "FLOW_CLUSTER_DATABASE_URL".into(),
+            rpc_url: None,
+            http_url: None,
+            heartbeat_ms: 5_000,
+            lease_ms: 30_000,
+        }
+    }
+}
+
+impl JournalClusterConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value) in [("cluster_id", &self.cluster_id), ("node_id", &self.node_id)] {
+            if value.is_empty()
+                || value.len() > 128
+                || !value
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+            {
+                return Err(format!("journal.cluster.{name} must contain 1..128 ASCII letters, digits, '.', '_' or '-'"));
+            }
+        }
+        if self.database_url_env.is_empty()
+            || self
+                .database_url_env
+                .as_bytes()
+                .first()
+                .is_none_or(|b| !b.is_ascii_alphabetic() && *b != b'_')
+            || self.database_url_env.len() > 128
+            || !self
+                .database_url_env
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return Err(
+                "journal.cluster.database_url_env must be an environment variable name".into(),
+            );
+        }
+        if self.heartbeat_ms < 100
+            || self.lease_ms > 300_000
+            || self
+                .heartbeat_ms
+                .checked_mul(3)
+                .is_none_or(|minimum| self.lease_ms < minimum)
+        {
+            return Err("journal.cluster requires heartbeat_ms >= 100, lease_ms >= 3 * heartbeat_ms and lease_ms <= 300000".into());
+        }
+        Ok(())
     }
 }
 
@@ -304,6 +375,9 @@ impl Config {
     /// 写入口统一校验。所有监听地址必须可解析；枚举值在 deserialize 层已把关，
     /// 这里管跨字段约束。
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(cluster) = &self.journal.cluster {
+            cluster.validate()?;
+        }
         if self.server.journal_trigger_tick_secs == 0 {
             return Err("server.journal_trigger_tick_secs 必须 > 0".into());
         }
@@ -582,6 +656,28 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn journal_cluster_is_opt_in_and_validates_identity_and_lease() {
+        let config: super::Config =
+            toml::from_str("[journal.cluster]\ncluster_id='production'\nnode_id='journal-a'\n")
+                .unwrap();
+        config.validate().unwrap();
+        let encoded = toml::to_string(&config).unwrap();
+        assert_eq!(toml::from_str::<super::Config>(&encoded).unwrap(), config);
+        assert!(super::Config::default().journal.cluster.is_none());
+        for patch in [
+            serde_json::json!({"cluster_id":"production","node_id":""}),
+            serde_json::json!({"cluster_id":"production","node_id":"a","heartbeat_ms":1}),
+            serde_json::json!({"cluster_id":"production","node_id":"a","lease_ms":5000}),
+            serde_json::json!({"cluster_id":"production","node_id":"a","database_url_env":"1BAD"}),
+        ] {
+            assert!(super::Config::merge_patch(
+                &super::Config::default(),
+                &serde_json::json!({"journal":{"cluster":patch}})
+            )
+            .is_err());
+        }
+    }
     use super::*;
 
     fn clean_env(names: &[&str]) -> Vec<(String, Option<std::ffi::OsString>)> {

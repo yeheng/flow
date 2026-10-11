@@ -50,6 +50,10 @@ impl ServerProc {
         self.addr
     }
 
+    pub fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait().expect("check server process")
+    }
+
     pub async fn client(&self) -> WsClient {
         connect(self.addr).await
     }

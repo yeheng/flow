@@ -3,6 +3,10 @@ name = "flow-rpc"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+journal-cluster = ["flow-backend/journal-cluster"]
+
 [dependencies]
 flow-dto = { path = "../flow-dto" }
 tokio = { workspace = true }

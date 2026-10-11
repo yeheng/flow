@@ -4,6 +4,8 @@ pub use flow_engine::{redact_value, secrets, Definition, NodeType, HTTP_METHODS}
 use thiserror::Error;
 pub mod execution;
 pub mod journal;
+#[cfg(feature = "journal-cluster")]
+pub mod journal_cluster;
 mod journal_commands;
 mod journal_driver;
 mod journal_execution;

@@ -143,13 +143,68 @@ pub async fn serve_journal_product(
         .map(std::path::PathBuf::from)
         .ok_or("journal 数据目录缺失：配置 [journal].data_dir 或环境变量 FLOW_JOURNAL_DATA_DIR")?;
     let token = std::env::var("FLOW_JOURNAL_TOKEN")?;
-    let addr: std::net::SocketAddr = config.journal.addr.parse()?;
+    if token.len() < 32 {
+        return Err("FLOW_JOURNAL_TOKEN must contain at least 32 bytes".into());
+    }
+    config.validate()?;
+    #[cfg(not(feature = "journal-cluster"))]
+    if config.journal.cluster.is_some() {
+        return Err("journal.cluster requires a build with --features journal-cluster".into());
+    }
+    // Finish fallible setup before exposing RPC/HTTP or starting cron. Any failure
+    // after registration closes the backend and releases its PG membership.
+    let data_dir = std::path::PathBuf::from(&config.storage.data_dir);
+    let file_config = match &config_path {
+        Some(path) => toml_config_from_str(&std::fs::read_to_string(path)?)?,
+        None => flow_config::Config::default(),
+    };
+    let config_state = ConfigState {
+        config: std::sync::RwLock::new(file_config),
+        path: config_path.clone(),
+        env_overrides: flow_config::Config::load(config_path.as_deref())?.env_overrides,
+    };
     let backend = JournalBackend::open(&root, Default::default()).await?;
-    let download_addr: std::net::SocketAddr = config.journal.http_addr.parse()?;
-    let listener = tokio::net::TcpListener::bind(download_addr).await?;
-    let bound_http = listener.local_addr()?;
-    let router = journal_download::router(backend.clone(), token.clone())?
-        .merge(journal_triggers::router(backend.clone(), token.clone()));
+    let prepared = async {
+        let listener = tokio::net::TcpListener::bind(&config.journal.http_addr).await?;
+        let bound_http = listener.local_addr()?;
+        let rpc_server = journal_v2::bind_product_server(config.journal.addr.parse()?).await?;
+        let bound_rpc = rpc_server.local_addr()?;
+        let router = journal_download::router(backend.clone(), token.clone())?
+            .merge(journal_triggers::router(backend.clone(), token.clone()));
+        let (state, _secrets) =
+            AppState::for_production(backend.clone(), config_state, &data_dir).await;
+        #[cfg(feature = "journal-cluster")]
+        if let Some(cluster_config) = &config.journal.cluster {
+            let cluster = flow_backend::journal_cluster::Membership::join(
+                &backend,
+                cluster_config,
+                &format!("ws://{bound_rpc}"),
+                &format!("http://{bound_http}"),
+            )
+            .await?;
+            assert!(backend.install_cluster(cluster));
+        }
+        let module = journal_v2::module_product(backend.clone(), token, Some(state))?;
+        flow_backend::start_execution(&config.execution, &backend).await?;
+        #[cfg(feature = "journal-cluster")]
+        if backend
+            .cluster()
+            .is_some_and(|cluster| cluster.lost().is_cancelled())
+        {
+            return Err("journal membership lost during startup".into());
+        }
+        Ok::<_, Box<dyn std::error::Error>>((
+            listener, bound_http, rpc_server, bound_rpc, router, module,
+        ))
+    }
+    .await;
+    let (listener, bound_http, rpc_server, bound_rpc, router, module) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let _ = backend.close().await;
+            return Err(error);
+        }
+    };
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let mut downloads = tokio::spawn(async move {
         axum::serve(listener, router)
@@ -158,31 +213,9 @@ pub async fn serve_journal_product(
             })
             .await
     });
-    // 密钥在 data_dir 下，与桌面同规则
-    let data_dir = std::path::PathBuf::from(&config.storage.data_dir);
-    let file_config = match &config_path {
-        Some(path) => {
-            let text = std::fs::read_to_string(path)?;
-            toml_config_from_str(&text)?
-        }
-        None => flow_config::Config::default(),
-    };
-    let config_state = ConfigState {
-        config: std::sync::RwLock::new(file_config),
-        path: config_path.clone(),
-        env_overrides: flow_config::Config::load(config_path.as_deref())?.env_overrides,
-    };
-    let (state, _secrets) =
-        AppState::for_production(backend.clone(), config_state, &data_dir).await;
-    let module = journal_v2::module_product(backend.clone(), token, Some(state))?;
-    let (server, addr) = journal_v2::serve_product(module, addr).await?;
-    tracing::info!(
-        local_addr = %addr,
-        http_addr = %bound_http,
-        data_dir = %root.display(),
-        "flow-journal-server 已启动 (JSONL v2 WS RPC + 下载/触发器 HTTP)"
-    );
-    flow_backend::start_execution(&config.execution, &backend).await?;
+    let server = rpc_server.start(module);
+    tracing::info!(local_addr=%bound_rpc,http_addr=%bound_http,data_dir=%root.display(),
+        "flow-journal-server 已启动 (JSONL v2 WS RPC + 下载/触发器 HTTP)");
     // cron 触发器：[server].scheduler_enabled=false 时不启动（与桌面同一开关）
     let scheduler = if config.server.scheduler_enabled {
         journal_triggers::start(backend.clone(), config.journal_trigger_tick())
@@ -190,11 +223,22 @@ pub async fn serve_journal_product(
         tracing::info!("scheduler_enabled=false，cron 触发器未启动");
         tokio::spawn(async {})
     };
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("收到中断信号，正在停止");
+    #[cfg(feature = "journal-cluster")]
+    let interrupted = if let Some(cluster) = backend.cluster() {
+        let lost = cluster.lost();
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = lost.cancelled() => { tracing::error!("PG 注册租约失效，停止节点服务"); Ok(()) },
+        }
+    } else {
+        tokio::signal::ctrl_c().await
+    };
+    #[cfg(not(feature = "journal-cluster"))]
+    let interrupted = tokio::signal::ctrl_c().await;
+    tracing::info!("正在停止 journal 节点");
     scheduler.abort();
     let _ = scheduler.await;
-    server.stop()?;
+    let server_stopped = server.stop();
     server.stopped().await;
     let _ = stop.send(());
     if tokio::time::timeout(std::time::Duration::from_secs(5), &mut downloads)
@@ -205,6 +249,8 @@ pub async fn serve_journal_product(
         let _ = downloads.await;
     }
     backend.close().await?;
+    interrupted?;
+    server_stopped?;
     Ok(())
 }
 

@@ -2,6 +2,53 @@ use flow_backend::journal::JournalBackend;
 use jsonrpsee::RpcModule;
 use serde_json::{json, Value};
 
+#[cfg(not(feature = "journal-cluster"))]
+#[test]
+fn configured_cluster_requires_feature_before_opening_the_journal() {
+    let dir = flow_test_support::io::TempDir::new("cluster-requires-feature");
+    let path = dir.path().join("flow.toml");
+    std::fs::write(&path, "[journal.cluster]\ncluster_id='test'\nnode_id='a'\n").unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_flow-journal-server"))
+        .arg("--config")
+        .arg(path)
+        .env(
+            "FLOW_JOURNAL_TOKEN",
+            "cluster-feature-test-token-at-least-32bytes",
+        )
+        .env("FLOW_JOURNAL_DATA_DIR", dir.path().join("journal"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("requires a build with --features journal-cluster"));
+    assert!(!dir.path().join("journal").exists());
+}
+
+#[tokio::test]
+async fn cluster_disabled_mode_is_authenticated_and_does_not_need_postgres() {
+    let dir = flow_test_support::io::TempDir::new("cluster-disabled");
+    let backend = JournalBackend::open(dir.path(), Default::default())
+        .await
+        .unwrap();
+    let token = "cluster-disabled-test-token-32bytes";
+    let module = flow_rpc::journal_v2::module(backend.clone(), token.into()).unwrap();
+    let status = call(&module, "journal.cluster.status", json!({"_token":token})).await;
+    assert_eq!(status["result"], json!({"enabled":false}));
+    assert_eq!(
+        call(&module, "journal.cluster.nodes", json!({"_token":token})).await["error"]["code"],
+        -32012
+    );
+    assert_eq!(
+        call(&module, "journal.cluster.status", json!({})).await["error"]["code"],
+        -32001
+    );
+    assert_eq!(
+        call(&module, "journal.cluster.remove", json!({"_token":token})).await["error"]["code"],
+        -32602
+    );
+    backend.close().await.unwrap();
+}
+
 async fn call(
     module: &RpcModule<flow_rpc::journal_v2::Context>,
     method: &str,

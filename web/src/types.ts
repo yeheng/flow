@@ -239,6 +239,15 @@ export interface JournalConfig {
   addr: string;
   http_addr: string;
   data_dir: string | null;
+  cluster?: {
+    cluster_id: string;
+    node_id: string;
+    database_url_env: string;
+    rpc_url: string | null;
+    http_url: string | null;
+    heartbeat_ms: number;
+    lease_ms: number;
+  } | null;
 }
 
 export interface FlowConfig {
