@@ -16,7 +16,9 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use flow_engine::execution_protocol::contract::DURABLE_WAIT_TIMEOUT_MS;
-use flow_engine::execution_protocol::message::{ExecuteTask, Message, ResultOutcome, WaitRequest};
+use flow_engine::execution_protocol::message::{
+    ExecuteTask, Message, ResultOutcome, TaskValue, WaitRequest,
+};
 use flow_engine::journal_state::Prepared;
 use flow_engine::model::Node;
 use flow_engine::{NodeType, HTTP_METHODS};
@@ -84,6 +86,16 @@ pub struct TaskRunner {
     pub transfers: IncomingTransfers,
     /// 已发出的唯一 Result 帧（回执丢失时按节奏幂等重发）。
     pub last_result: Option<Message>,
+    /// 装配阶段重建的输入面（StoredValue 形态：Ref 保身份供输出回引，
+    /// Local 已物化为 Inline）。resume 重建 Prepared、fresh prepare 都用它。
+    pub face: Option<InputFace>,
+}
+
+/// v2 装配产物：输入面的 StoredValue 重建（值字节全部来自 data 通道）。
+pub struct InputFace {
+    pub input: StoredValue,
+    pub predecessors: BTreeMap<String, StoredValue>,
+    pub prepared_params: Option<StoredValue>,
 }
 
 impl TaskRunner {
@@ -138,7 +150,22 @@ impl TaskRunner {
         // 2) 准备（已有提交 InputPrepared 则跳过求值）；业务失败统一在尾部
         // 转失败 Result，不走 Reject 回收。
         let prepared: Prepared = match &self.task.prepared {
-            Some(value) => serde_json::from_value(value.clone()).map_err(TaskError::from)?,
+            Some(meta) => {
+                let face = self
+                    .face
+                    .as_ref()
+                    .ok_or_else(|| TaskError::Invalid("inputs not materialized".into()))?;
+                Prepared {
+                    input: face.input.clone(),
+                    predecessors: face.predecessors.clone(),
+                    params: face
+                        .prepared_params
+                        .clone()
+                        .ok_or_else(|| TaskError::Invalid("prepared params missing".into()))?,
+                    engine_build: meta.engine_build.clone(),
+                    node_semantics: meta.node_semantics,
+                }
+            }
             None => match self.prepare(&node, &inputs, &mut audit).await {
                 Ok(prepared) => {
                     let prepared_seq = audit.next_seq() - 1;
@@ -282,36 +309,27 @@ impl TaskRunner {
         }
     }
 
-    /// 装配 run 输入与前驱输出（inline 即用，Ref 等 transfer）。
+    /// 装配输入面（v2）：声明的每个值字节都走 data 通道——Ref 保留身份
+    /// 供输出回引，Local 物化为 Inline。重建的 StoredValue 面存入
+    /// [`Self::face`]，resume 重建 Prepared / fresh prepare 复用。
     async fn materialize_inputs(&mut self, timeout: Duration) -> Result<TaskInputs, TaskError> {
         let mut budget = INPUT_BUDGET;
-        // 收集需要 transfer 的引用：run 输入、前驱输出、已提交准备参数、
-        // 恢复路径的历史 Outcome 原始体。
-        let mut refs: Vec<String> = Vec::new();
-        if let StoredValue::Ref(_) = &self.task.input {
-            refs.push("in:run-input".into());
+        let mut ids: Vec<String> = vec!["in:run-input".into()];
+        for (node_id, _) in &self.task.predecessors {
+            ids.push(format!("in:{node_id}"));
         }
-        for (node_id, value) in &self.task.predecessors {
-            if let StoredValue::Ref(_) = value {
-                refs.push(format!("in:{node_id}"));
-            }
-        }
-        if let Some(prepared) = &self.task.prepared {
-            if let Some(params) = prepared.get("params") {
-                if params.get("type").and_then(Value::as_str) == Some("ref") {
-                    refs.push("in:prepared-params".into());
-                }
-            }
+        if self.task.prepared.is_some() {
+            ids.push("in:prepared-params".into());
         }
         if let Some(outcome) = &self.task.previous_outcome {
             if let Some(raw) = outcome.pointer("/value/body_raw") {
                 if let Some(output_id) = raw.get("output_id").and_then(Value::as_str) {
-                    refs.push(format!("op-body:{output_id}"));
+                    ids.push(format!("op-body:{output_id}"));
                 }
             }
         }
         let deadline = tokio::time::Instant::now() + timeout;
-        while refs.iter().any(|id| !self.transfers.is_ready(id)) {
+        while ids.iter().any(|id| !self.transfers.is_ready(id)) {
             let message = tokio::time::timeout_at(deadline, self.mail.recv())
                 .await
                 .map_err(|_| TaskError::Closed("input transfer timeout".into()))?
@@ -332,38 +350,54 @@ impl TaskRunner {
                 _ => continue,
             }
         }
-        // 物化为 JSON（预算内）。Bytes 编码引用不能进 JS 输入面。
-        let mut decode = |stored: &StoredValue, id: &str| -> Result<Value, TaskError> {
-            match stored {
-                StoredValue::Inline(value) => Ok(value.clone()),
-                StoredValue::Ref(reference) => {
-                    let bytes = self
-                        .transfers
-                        .take(id)
-                        .ok_or_else(|| TaskError::Invalid(format!("transfer {id} missing")))?;
-                    let n = bytes.len();
-                    if n > budget {
-                        return Err(TaskError::Invalid("aggregate input exceeds 8 MiB".into()));
-                    }
-                    budget -= n;
-                    match reference.codec {
-                        ValueCodec::Json => Ok(serde_json::from_slice(&bytes)?),
-                        ValueCodec::Utf8 => Ok(Value::String(
+        // 物化（预算内）并重建 StoredValue 面；Bytes 编码引用不能进 JS
+        // 输入面。
+        let mut decode = |tv: &TaskValue, id: &str| -> Result<(StoredValue, Value), TaskError> {
+            let bytes = self
+                .transfers
+                .take(id)
+                .ok_or_else(|| TaskError::Invalid(format!("transfer {id} missing")))?;
+            if bytes.len() > budget {
+                return Err(TaskError::Invalid("aggregate input exceeds 8 MiB".into()));
+            }
+            budget -= bytes.len();
+            match tv {
+                TaskValue::Ref(reference) => {
+                    let value = match reference.codec {
+                        ValueCodec::Json => serde_json::from_slice(&bytes)?,
+                        ValueCodec::Utf8 => Value::String(
                             String::from_utf8(bytes)
                                 .map_err(|e| TaskError::Invalid(e.to_string()))?,
-                        )),
+                        ),
                         ValueCodec::Bytes => {
-                            Err(TaskError::Invalid("binary value in JSON input face".into()))
+                            return Err(TaskError::Invalid("binary value in JSON input face".into()))
                         }
-                    }
+                    };
+                    Ok((StoredValue::Ref(reference.clone()), value))
+                }
+                TaskValue::Local => {
+                    let value: Value = serde_json::from_slice(&bytes)?;
+                    Ok((StoredValue::Inline(value.clone()), value))
                 }
             }
         };
-        let input = decode(&self.task.input, "in:run-input")?;
+        let (input_stored, input) = decode(&self.task.input, "in:run-input")?;
         let mut nodes = serde_json::Map::new();
+        let mut predecessors = BTreeMap::new();
         for (node_id, value) in &self.task.predecessors {
-            nodes.insert(node_id.clone(), decode(value, &format!("in:{node_id}"))?);
+            let (stored, decoded) = decode(value, &format!("in:{node_id}"))?;
+            predecessors.insert(node_id.clone(), stored);
+            nodes.insert(node_id.clone(), decoded);
         }
+        let prepared_params = match &self.task.prepared {
+            Some(meta) => Some(decode(&meta.params, "in:prepared-params")?.0),
+            None => None,
+        };
+        self.face = Some(InputFace {
+            input: input_stored,
+            predecessors,
+            prepared_params,
+        });
         Ok(TaskInputs {
             input,
             nodes: Value::Object(nodes),
@@ -378,8 +412,13 @@ impl TaskRunner {
         inputs: &TaskInputs,
         audit: &mut AuditStream,
     ) -> Result<Prepared, TaskError> {
-        let predecessors: BTreeMap<String, StoredValue> =
-            self.task.predecessors.iter().cloned().collect();
+        let (face_input, predecessors) = {
+            let face = self
+                .face
+                .as_ref()
+                .ok_or_else(|| TaskError::Invalid("inputs not materialized".into()))?;
+            (face.input.clone(), face.predecessors.clone())
+        };
         let templates = serde_json::to_string(&node.params)?.contains("${");
         let params = if !templates {
             node.params.clone()
@@ -419,7 +458,7 @@ impl TaskRunner {
         };
         let params = store_value(audit, &self.journal_id, &params, 8 * 1024 * 1024).await?;
         let prepared = Prepared {
-            input: self.task.input.clone(),
+            input: face_input,
             predecessors,
             params,
             engine_build: crate::EXECUTOR_BUILD.into(),
@@ -842,21 +881,16 @@ impl TaskRunner {
         let request_bytes = flow_journal::codec::bounded_json(&request, INPUT_BUDGET)?;
         let fingerprint = flow_journal::codec::digest(&request_bytes);
         let operation_id = uuid::Uuid::now_v7().to_string();
-        let inline =
-            if request_bytes.len() <= flow_engine::execution_protocol::CONTROL_MAX_FRAME / 2 {
-                Some(StoredValue::Inline(request.clone()))
-            } else {
-                None
-            };
-        let transfer_id = if inline.is_none() {
-            let id = format!("op:{operation_id}");
+        // v2：请求字节一律走 data 通道（再小也走），控制帧只带身份与指纹。
+        let transfer_id = format!("op:{operation_id}");
+        {
             let mut offset = 0u64;
             for chunk in request_bytes.chunks(flow_engine::execution_protocol::TRANSFER_CHUNK_BYTES)
             {
                 self.outbound
                     .send(Message::TransferChunk {
                         dispatch_id: self.dispatch_id.clone(),
-                        transfer_id: id.clone(),
+                        transfer_id: transfer_id.clone(),
                         offset,
                         bytes: base64::engine::general_purpose::STANDARD.encode(chunk),
                         digest: hex::encode(sha2::Sha256::digest(chunk)),
@@ -868,23 +902,19 @@ impl TaskRunner {
             self.outbound
                 .send(Message::InputReady {
                     dispatch_id: self.dispatch_id.clone(),
-                    transfer_id: id.clone(),
+                    transfer_id: transfer_id.clone(),
                     total_bytes: request_bytes.len() as u64,
                     digest: hex::encode(sha2::Sha256::digest(&request_bytes)),
                 })
                 .await
                 .map_err(|e| TaskError::Closed(e.to_string()))?;
-            Some(id)
-        } else {
-            None
-        };
+        }
         self.outbound
             .send(Message::RequestOperation {
                 dispatch_id: self.dispatch_id.clone(),
                 command_id: format!("op:{operation_id}"),
                 operation_id: operation_id.clone(),
                 request_fingerprint: fingerprint.clone(),
-                request: inline,
                 transfer_id,
             })
             .await

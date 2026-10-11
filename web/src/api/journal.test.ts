@@ -11,13 +11,12 @@ describe("JSONL client",()=>{
     const count=window.events.length;window.push(window.events[0]!);expect(window.events).toHaveLength(count);
     expect(()=>window.push({lsn:"100",event_index:0,event:{run_seq:"100",kind:"chunk",payload:"雪".repeat(400_000)}})).toThrow();
   });
-  it("queries the original committed command without submitting another write",async()=>{
+  it("propagates COMMITTED_NOT_VISIBLE without recovery polling",async()=>{
     const receipt={committed:true,visible:false,request_id:"request",commit_cursor:{journal_id:"dataset",lsn:"7"},result:{run_id:"run"}};
-    const call=vi.spyOn(RpcClient.prototype,"call").mockRejectedValueOnce(new RpcError(-32020,"COMMITTED_NOT_VISIBLE",receipt)).mockResolvedValueOnce({...receipt,visible:true});
+    const call=vi.spyOn(RpcClient.prototype,"call").mockRejectedValueOnce(new RpcError(-32020,"COMMITTED_NOT_VISIBLE",receipt));
     const client=new JournalClient("ws://localhost:9802","secret","http://localhost:9803");
-    expect((await client.command("run.start",{workflow_id:"w"},"run.start:manual:","request")).visible).toBe(true);
-    expect(call.mock.calls.map(v=>v[0])).toEqual(["run.start","command.status"]);
-    expect(call.mock.calls[1]![1]).toEqual({scope:"run.start:manual:",request_id:"request",_token:"secret"});
+    await expect(client.command("run.start",{workflow_id:"w"},"run.start:manual:","request")).rejects.toMatchObject({code:-32020});
+    expect(call.mock.calls.map(v=>v[0])).toEqual(["run.start"]);
   });
 });
 

@@ -49,18 +49,30 @@ pub async fn start_execution(
     match execution.mode {
         flow_config::ExecutionModeKind::InProcess => backend.start_execution().await,
         flow_config::ExecutionModeKind::Ipc => {
-            let options = match execution::mode_from_config(execution) {
-                Ok(execution::ExecutionMode::Ipc(options)) => options,
-                Ok(execution::ExecutionMode::InProcess) => {
-                    return Err(invalid(
-                        "execution.mode=ipc: internal parse mismatch".into(),
-                    ))
-                }
-                Err(error) => return Err(invalid(format!("execution.mode=ipc: {error}"))),
-            };
-            backend
-                .start_execution_ipc(execution::ExecutionMode::Ipc(options))
-                .await
+            // IPC 执行层是 unix-only（socketpair + pre_exec FD 槽位）；其余
+            // 平台明确拒绝，不静默落回进程内执行（与二进制缺失同规则）。
+            #[cfg(unix)]
+            {
+                let options = match execution::mode_from_config(execution) {
+                    Ok(execution::ExecutionMode::Ipc(options)) => options,
+                    Ok(execution::ExecutionMode::InProcess) => {
+                        return Err(invalid(
+                            "execution.mode=ipc: internal parse mismatch".into(),
+                        ))
+                    }
+                    Err(error) => return Err(invalid(format!("execution.mode=ipc: {error}"))),
+                };
+                backend
+                    .start_execution_ipc(execution::ExecutionMode::Ipc(options))
+                    .await
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = &execution;
+                Err(invalid(
+                    "execution.mode=ipc requires a unix platform (socketpair transport)".into(),
+                ))
+            }
         }
         flow_config::ExecutionModeKind::Remote => {
             let options = execution::remote_options_from_config(execution).map_err(invalid)?;

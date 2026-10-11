@@ -942,3 +942,42 @@ async fn oversized_http_capture_is_uncertain_without_resend() {
     backend.close().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
+
+/// v2 协议回归：~62KiB 的 inline run 输入（journal 以 Inline 存储，旧协议
+/// 下 Execute 控制帧 = 值 + 节点定义 + envelope 必然超过 64KiB 上限、编码
+/// 失败判死会话）必须照常派发——值字节走 data 通道，控制帧只带声明。
+#[tokio::test]
+async fn inline_sized_run_input_dispatches_via_data_channel() {
+    init_tracing();
+    let root = temp();
+    let backend = ipc_backend_explicit(&root).await;
+    let workflow = install(
+        &backend,
+        json!({
+            "nodes": [
+                {"id":"s","type":"start"},
+                {"id":"a","type":"script","params":{"code":"return {n: input.pad.length};"}},
+                {"id":"e","type":"end"}
+            ],
+            "edges": [
+                {"from":"s","to":"a"},
+                {"from":"a","to":"e"}
+            ]
+        }),
+    )
+    .await;
+    // 62KiB padding：Inline 存储（< 64KiB 阈值），但 v1 控制帧装不下。
+    let pad = "x".repeat(62 * 1024);
+    let run_id = start_run(&backend, &workflow, json!({ "pad": pad })).await;
+    let done = until(&backend, &run_id, Run::terminal).await;
+    assert_eq!(
+        done.status, "succeeded",
+        "run failed: {:?} nodes={:?}",
+        done.error,
+        done.nodes.values().map(|n| (&n.status, &n.error)).collect::<Vec<_>>()
+    );
+    let output = done.nodes.values().find(|n| n.status == "succeeded");
+    let _ = output;
+    backend.close().await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}

@@ -208,6 +208,7 @@ async fn paused_projection_returns_committed_result_and_retry_does_not_duplicate
     let backend = JournalBackend::open(&root, JournalOptions::default())
         .await
         .unwrap();
+    backend.set_projection_wait(100);
     backend.pause_projection(true);
     let result = backend
         .command("create", Some("r"), &json!({}), |_| Ok(creation("w")))
@@ -382,5 +383,41 @@ async fn checkpoint_resumes_partial_value_and_corrupt_cache_replays() {
         .unwrap();
     backend.close().await.unwrap();
     drop(backend);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// 服务端在写响应前等到投影可见：并发写全部拿到 visible=true 回执，
+/// 健康路径不出现 COMMITTED_NOT_VISIBLE（等待器无信号量上限，谓词为
+/// 原子读，不逐唤醒查 SQLite）。
+#[tokio::test]
+async fn concurrent_writes_all_return_visible_without_committed_not_visible() {
+    let root = temp();
+    let backend = Arc::new(
+        JournalBackend::open(&root, Default::default())
+            .await
+            .unwrap(),
+    );
+    let mut tasks = tokio::task::JoinSet::new();
+    for i in 0..500 {
+        let b = backend.clone();
+        tasks.spawn(async move {
+            let scope = format!("workflow.create");
+            let request = format!("concurrent-{i}");
+            let receipt = b
+                .command(&scope, Some(&request), &json!({"n": i}), |state| {
+                    let id = format!("w-concurrent-{i}");
+                    let (events, result) = creation(&id);
+                    let _ = state;
+                    Ok((events, result))
+                })
+                .await
+                .unwrap();
+            assert!(receipt.visible, "receipt not visible: {receipt:?}");
+        });
+    }
+    while let Some(joined) = tasks.join_next().await {
+        joined.unwrap();
+    }
+    backend.close().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }

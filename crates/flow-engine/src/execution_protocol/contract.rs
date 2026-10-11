@@ -14,7 +14,7 @@
 //! `X_MAX` 不得用来论证审计吞吐。
 
 /// IPC 协议版本。v1 = 二期本地 socketpair 版本。
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// control 通道单帧 JSON 上限（不含 4 字节长度头）。握手只可协商到本上限以内。
 pub const CONTROL_MAX_FRAME: usize = 64 * 1024;

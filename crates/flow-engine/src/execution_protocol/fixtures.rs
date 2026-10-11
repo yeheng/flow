@@ -8,7 +8,7 @@ use flow_journal::{StoredValue, ValueRef};
 use serde_json::{json, Value};
 
 use super::message::{
-    AuditRecord, ExecuteTask, Message, ObservationLine, ResultOutcome, WaitRequest,
+    AuditRecord, ExecuteTask, Message, ObservationLine, ResultOutcome, TaskValue, WaitRequest,
 };
 
 pub fn value_ref() -> ValueRef {
@@ -64,8 +64,8 @@ pub fn valid_messages() -> Vec<Message> {
                 node_execution_id: "ne-1".into(),
                 attempt: 2,
                 node: json!({"id":"n1","type":"script","params":{"code":"return 1;"}}),
-                input: StoredValue::Inline(json!({"x": 1})),
-                predecessors: vec![("n0".into(), StoredValue::Ref(value_ref()))],
+                input: TaskValue::Local,
+                predecessors: vec![("n0".into(), TaskValue::Ref(value_ref()))],
                 prepared: None,
                 previous_outcome: None,
                 observability: true,
@@ -91,10 +91,7 @@ pub fn valid_messages() -> Vec<Message> {
             command_id: "cmd-2".into(),
             operation_id: "op-1".into(),
             request_fingerprint: "ff".repeat(32),
-            request: Some(StoredValue::Inline(
-                json!({"method":"GET","url":"http://example.test"}),
-            )),
-            transfer_id: None,
+            transfer_id: "op:op-1".into(),
         },
         Message::OperationPermit {
             dispatch_id: "dispatch-09".into(),
@@ -192,19 +189,19 @@ pub fn malformed_envelopes() -> Vec<Value> {
     vec![
         json!("not an object"),
         json!({}),
-        json!({"v": 2, "type": "Ready"}),  // 版本不兼容
-        json!({"v": 1}),                   // 缺 type
-        json!({"v": 1, "type": "Result"}), // 缺 dispatch/body
-        json!({"v": 1, "type": "AuditAck", "dispatch_id": "d", "body": {"durable_audit_seq": "x", "durable_bytes": "1", "commit_lsn": "1"}}), // 非十进制
-        json!({"v": 1, "type": "AuditAck", "dispatch_id": "d", "body": {"durable_audit_seq": 5, "durable_bytes": "1", "commit_lsn": "1"}}), // 数字而非字符串
-        json!({"v": 1, "type": "Execute", "dispatch_id": "d", "body": {"command_id": "c", "task": {}}}), // 缺字段
-        json!({"v": 1, "type": "AuditBatch", "dispatch_id": "d", "body": {"first_seq": "1", "records": [{"audit_seq": "1", "kind": "k"}]}}), // 记录缺 payload
+        json!({"v": 3, "type": "Ready"}),  // 版本不兼容
+        json!({"v": 2}),                   // 缺 type
+        json!({"v": 2, "type": "Result"}), // 缺 dispatch/body
+        json!({"v": 2, "type": "AuditAck", "dispatch_id": "d", "body": {"durable_audit_seq": "x", "durable_bytes": "1", "commit_lsn": "1"}}), // 非十进制
+        json!({"v": 2, "type": "AuditAck", "dispatch_id": "d", "body": {"durable_audit_seq": 5, "durable_bytes": "1", "commit_lsn": "1"}}), // 数字而非字符串
+        json!({"v": 2, "type": "Execute", "dispatch_id": "d", "body": {"command_id": "c", "task": {}}}), // 缺字段
+        json!({"v": 2, "type": "AuditBatch", "dispatch_id": "d", "body": {"first_seq": "1", "records": [{"audit_seq": "1", "kind": "k"}]}}), // 记录缺 payload
     ]
 }
 
 pub fn unknown_type_envelope() -> Value {
     // 注意：三期已把 Resume/ResumeReply 纳入目录；未知类型用目录外名称。
-    json!({"v": 1, "type": "TeleportRequest", "body": {}})
+    json!({"v": 2, "type": "TeleportRequest", "body": {}})
 }
 
 /// 同 dispatch 同序号异内容样本（必须拒绝）。

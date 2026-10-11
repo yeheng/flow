@@ -13,8 +13,9 @@ use tokio_util::sync::CancellationToken;
 use flow_engine::execution_protocol::contract::STARTUP_TIMEOUT_MS;
 use flow_engine::execution_protocol::message::Message;
 use flow_engine::execution_protocol::transport::{
-    channels_from_raw, executor_handshake, FrameTransport, NegotiatedLimits, SessionIdentity,
+    executor_handshake, FrameTransport, NegotiatedLimits, SessionIdentity,
 };
+use flow_engine::execution_protocol::unix::channels_from_raw;
 
 use crate::task::{TaskEnd, TaskRunner};
 use crate::transfer::IncomingTransfers;
@@ -210,6 +211,7 @@ fn handle_message(
             let cancel = CancellationToken::new();
             let (done_tx, done_rx) = tokio::sync::oneshot::channel();
             let runner = TaskRunner {
+                face: None,
                 command_id,
                 dispatch_id: dispatch_id.clone(),
                 task,

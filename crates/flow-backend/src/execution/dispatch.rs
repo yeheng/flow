@@ -175,26 +175,36 @@ impl DispatchRunner {
         if record.dispatch_id != self.attempt.dispatch_id {
             return Err(invalid("stale dispatch"));
         }
-        let prepared = record
-            .prepared
-            .as_ref()
-            .map(serde_json::to_value)
-            .transpose()?;
         let previous_outcome = record
             .operation
             .as_ref()
             .and_then(|o| o.outcome.clone())
             .map(|v| serde_json::to_value(&v))
             .transpose()?;
+        let node_value = serde_json::to_value(&self.node)?;
+        // node 定义是控制帧唯一允许的变长项：超限在这里拒绝（可读错误），
+        // 而不是等 transport 编码失败把整条会话判死。
+        flow_journal::codec::bounded_json(
+            &node_value,
+            flow_engine::execution_protocol::CONTROL_MAX_FRAME / 2,
+        )?;
         let task = flow_engine::execution_protocol::ExecuteTask {
             run_id: self.attempt.run_id.clone(),
             node_id: self.attempt.node_id.clone(),
             node_execution_id: record.node_execution_id.clone(),
             attempt: record.attempt,
-            node: serde_json::to_value(&self.node)?,
-            input: run.input.clone(),
-            predecessors: self.predecessors.clone().into_iter().collect(),
-            prepared,
+            node: node_value,
+            input: task_value(&run.input),
+            predecessors: self
+                .predecessors
+                .iter()
+                .map(|(id, value)| (id.clone(), task_value(value)))
+                .collect(),
+            prepared: record.prepared.as_ref().map(|committed| flow_engine::execution_protocol::PreparedMeta {
+                engine_build: committed.engine_build.clone(),
+                node_semantics: committed.node_semantics,
+                params: task_value(&committed.params),
+            }),
             previous_outcome: previous_outcome.clone(),
             observability: self.observations.is_some(),
         };
@@ -386,16 +396,14 @@ impl DispatchRunner {
                 Ok(None)
             }
             Message::RequestOperation { .. } => {
-                // 大请求的 data 块可能未齐：未齐时挂起，块到齐后重试。
-                let transfer_id = match &message {
-                    Message::RequestOperation {
-                        transfer_id: Some(id),
-                        request: None,
-                        ..
-                    } => id.clone(),
-                    _ => String::new(),
+                // 请求字节在 data 通道，可能未齐：未齐时挂起，块到齐后重试。
+                let incomplete = match &message {
+                    Message::RequestOperation { transfer_id, .. } => {
+                        !self.op_transfer_complete(transfer_id)
+                    }
+                    _ => unreachable!(),
                 };
-                if !transfer_id.is_empty() && !self.op_transfer_complete(&transfer_id) {
+                if incomplete {
                     self.pending_operation_request = Some(message);
                     return Ok(None);
                 }
@@ -532,10 +540,9 @@ impl DispatchRunner {
     /// 挂起的 RequestOperation 在块齐后重试。
     async fn try_pending_operation(&mut self, link: &mut DispatchLink) -> Result<()> {
         let ready = match &self.pending_operation_request {
-            Some(Message::RequestOperation { transfer_id, .. }) => transfer_id
-                .as_ref()
-                .map(|id| self.op_transfer_complete(id))
-                .unwrap_or(true),
+            Some(Message::RequestOperation { transfer_id, .. }) => {
+                self.op_transfer_complete(transfer_id)
+            }
             _ => false,
         };
         if ready {
@@ -871,7 +878,6 @@ impl DispatchRunner {
             dispatch_id,
             operation_id,
             request_fingerprint,
-            request,
             transfer_id,
             ..
         } = message
@@ -881,34 +887,28 @@ impl DispatchRunner {
         if dispatch_id != self.attempt.dispatch_id {
             return Err(invalid("operation request for foreign dispatch"));
         }
-        let request_bytes: Vec<u8> = match request {
-            Some(StoredValue::Inline(value)) => {
-                flow_journal::codec::bounded_json(&value, 8 * 1024 * 1024)?
-            }
-            _ => {
-                let id = transfer_id.ok_or_else(|| invalid("operation request missing"))?;
-                let entry = self
-                    .op_transfers
-                    .get(&id)
-                    .ok_or_else(|| invalid("operation transfer not started"))?;
-                let (total, digest) = entry
-                    .ready
-                    .clone()
-                    .ok_or_else(|| invalid("operation transfer incomplete"))?;
-                let mut bytes = Vec::with_capacity(total as usize);
-                let mut expected = 0u64;
-                for (offset, chunk) in &entry.chunks {
-                    if *offset != expected {
-                        return Err(invalid("operation transfer gap"));
-                    }
-                    expected += chunk.len() as u64;
-                    bytes.extend_from_slice(chunk);
+        let request_bytes: Vec<u8> = {
+            let entry = self
+                .op_transfers
+                .get(&transfer_id)
+                .ok_or_else(|| invalid("operation transfer not started"))?;
+            let (total, digest) = entry
+                .ready
+                .clone()
+                .ok_or_else(|| invalid("operation transfer incomplete"))?;
+            let mut bytes = Vec::with_capacity(total as usize);
+            let mut expected = 0u64;
+            for (offset, chunk) in &entry.chunks {
+                if *offset != expected {
+                    return Err(invalid("operation transfer gap"));
                 }
-                if bytes.len() as u64 != total || hex_sha(&bytes) != digest {
-                    return Err(invalid("operation transfer digest mismatch"));
-                }
-                bytes
+                expected += chunk.len() as u64;
+                bytes.extend_from_slice(chunk);
             }
+            if bytes.len() as u64 != total || hex_sha(&bytes) != digest {
+                return Err(invalid("operation transfer digest mismatch"));
+            }
+            bytes
         };
         // 完整请求校验：主进程不得只校验未经核实的摘要。
         if flow_journal::codec::digest(&request_bytes) != request_fingerprint {
@@ -1015,7 +1015,31 @@ impl DispatchRunner {
     }
 }
 
-/// 输入传输（master→executor，data 通道）：Ref 值从 journal 流式读出分块。
+/// 输入传输（master→executor，data 通道）：v2 起所有声明的值字节都走
+/// 这里——Ref 从 journal 流式读出，Inline 值序列化后直接分块；再小也走。
+enum ByteSource {
+    Journal(flow_journal::ValueRef),
+    Memory(Vec<u8>),
+}
+
+/// StoredValue → 控制帧声明：Ref 保留 journal 身份（输出回引），
+/// Inline 只声明存在（字节走 data 通道）。
+fn task_value(stored: &StoredValue) -> flow_engine::execution_protocol::TaskValue {
+    match stored {
+        StoredValue::Ref(reference) => {
+            flow_engine::execution_protocol::TaskValue::Ref(reference.clone())
+        }
+        StoredValue::Inline(_) => flow_engine::execution_protocol::TaskValue::Local,
+    }
+}
+
+fn byte_source(stored: &StoredValue) -> std::result::Result<ByteSource, ()> {
+    match stored {
+        StoredValue::Ref(reference) => Ok(ByteSource::Journal(reference.clone())),
+        StoredValue::Inline(value) => serde_json::to_vec(value).map(ByteSource::Memory).map_err(|_| ()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn transfer_inputs(
     session: tokio::sync::mpsc::Sender<ToSession>,
@@ -1028,48 +1052,58 @@ async fn transfer_inputs(
 ) {
     let root = backend.journal.root().to_path_buf();
     let upper = backend.journal.durable_lsn();
-    let mut transfers: Vec<(String, StoredValue)> = Vec::new();
-    if let StoredValue::Ref(_) = &input {
-        transfers.push(("in:run-input".into(), input.clone()));
-    }
+    // 声明与 ExecuteTask.inputs 对齐：run 输入、每个前驱输出、已提交准备
+    // 参数、恢复路径的历史 Outcome 体。
+    let mut transfers: Vec<(String, std::result::Result<ByteSource, ()>)> = Vec::new();
+    transfers.push(("in:run-input".into(), byte_source(&input)));
     for (node_id, value) in &predecessors {
-        if let StoredValue::Ref(_) = value {
-            transfers.push((format!("in:{node_id}"), value.clone()));
-        }
+        transfers.push((format!("in:{node_id}"), byte_source(value)));
     }
     if let Some(prepared) = &prepared {
-        if let StoredValue::Ref(_) = &prepared.params {
-            transfers.push(("in:prepared-params".into(), prepared.params.clone()));
-        }
+        transfers.push(("in:prepared-params".into(), byte_source(&prepared.params)));
     }
     if let Some(outcome) = &previous_outcome {
         if let Some(raw) = outcome
             .get("body_raw")
             .and_then(|v| serde_json::from_value::<flow_journal::ValueRef>(v.clone()).ok())
         {
-            transfers.push((format!("op-body:{}", raw.output_id), StoredValue::Ref(raw)));
+            transfers.push((
+                format!("op-body:{}", raw.output_id),
+                Ok(ByteSource::Journal(raw)),
+            ));
         }
     }
-    for (transfer_id, value) in transfers {
-        let StoredValue::Ref(reference) = value else {
-            continue;
-        };
-        let root = root.clone();
-        let reference = reference.clone();
-        let (reader, writer) = tokio::io::duplex(256 * 1024);
-        let produce = tokio::task::spawn_blocking(move || {
-            use std::io::Write;
-            let mut bridge = tokio_util::io::SyncIoBridge::new(writer);
-            let result =
-                flow_journal::value::read_value(&root, upper, &reference, true, &mut bridge);
-            let _ = bridge.flush();
-            result
-        });
-        let mut reader = reader;
-        let send = transfer_one(&session, &dispatch_id, &transfer_id, &mut reader).await;
-        let production = produce.await;
-        if send.is_err() || production.is_err() {
-            return;
+    for (transfer_id, source) in transfers {
+        let Ok(source) = source else { return };
+        match source {
+            ByteSource::Memory(bytes) => {
+                let mut cursor = std::io::Cursor::new(bytes);
+                if transfer_one(&session, &dispatch_id, &transfer_id, &mut cursor)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            ByteSource::Journal(reference) => {
+                let root = root.clone();
+                let reference = reference.clone();
+                let (reader, writer) = tokio::io::duplex(256 * 1024);
+                let produce = tokio::task::spawn_blocking(move || {
+                    use std::io::Write;
+                    let mut bridge = tokio_util::io::SyncIoBridge::new(writer);
+                    let result =
+                        flow_journal::value::read_value(&root, upper, &reference, true, &mut bridge);
+                    let _ = bridge.flush();
+                    result
+                });
+                let mut reader = reader;
+                let send = transfer_one(&session, &dispatch_id, &transfer_id, &mut reader).await;
+                let production = produce.await;
+                if send.is_err() || production.is_err() {
+                    return;
+                }
+            }
         }
     }
 }

@@ -1,6 +1,5 @@
 //! v2 产品面的 RPC/HTTP 客户端助手：token 注入、写命令幂等键与回执解包、
-//! COMMITTED_NOT_VISIBLE(-32020) 恢复、订阅 v2 事件格式、webhook
-//! `POST /hooks/<key>`（Bearer + Idempotency-Key）。
+//! 订阅 v2 事件格式、webhook `POST /hooks/<key>`（Bearer + Idempotency-Key）。
 //!
 //! 全部走真实 wire（进程外 flow-journal-server），断言的是 v2 协议与物化
 //! 数据形状，不是内部 API。
@@ -8,6 +7,10 @@
 //! [`Conn`] 是 WsClient + 部署 token 的薄包装：`call` 自动补 `_token`；写命令
 //! （`flow_rpc::journal_v2::is_write_method` 集合）自动带 `request_id` 并把
 //! 回执 `{committed, result, ...}` 解包为 `result`（用例零感知）。
+//!
+//! 服务端在写响应前等到投影可见（applied_lsn >= commit_lsn），健康路径不会
+//! 出现 COMMITTED_NOT_VISIBLE(-32020)；若它仍到达，意味着投影病理——这里
+//! 不做任何恢复轮询，直接让测试响亮失败（哨兵）。
 
 use std::time::{Duration, Instant};
 
@@ -21,9 +24,6 @@ use serde_json::{json, Value};
 
 /// 连接超时（服务进程刚 bind 时路由可能还没装完，带重试）。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
-/// -32020 恢复的轮询参数（与 flow-cli journal call 同节奏）。
-const STATUS_POLLS: usize = 20;
-const STATUS_INTERVAL: Duration = Duration::from_millis(250);
 
 /// v2 连接：WebSocket 客户端 + 部署 token。
 pub struct Conn {
@@ -72,20 +72,7 @@ pub fn named(value: Value) -> ObjectParams {
     params
 }
 
-/// 一次原始调用（enrich 后的 params 直发），返回 result 或业务错误。
-async fn raw_call(conn: &Conn, method: &str, params: Value) -> Result<Value, ClientError> {
-    let mut enriched = match params {
-        Value::Object(map) => Value::Object(map),
-        Value::Null => json!({}),
-        other => panic!("params 必须是对象：{other}"),
-    };
-    if let Some(obj) = enriched.as_object_mut() {
-        obj.insert("_token".into(), json!(conn.token));
-    }
-    conn.ws.request::<Value, _>(method, named(enriched)).await
-}
-
-/// v2 语义调用：token 注入 + 写命令 request_id/回执解包 + -32020 恢复。
+/// v2 语义调用：token 注入 + 写命令 request_id/回执解包。
 /// 写命令返回 `receipt.result`（v1 门面形状）。
 pub async fn call<T: DeserializeOwned>(conn: &Conn, method: &str, params: Value) -> T {
     let write = flow_rpc::journal_v2::is_write_method(method);
@@ -111,65 +98,17 @@ pub async fn call<T: DeserializeOwned>(conn: &Conn, method: &str, params: Value)
             obj.entry("request_id").or_insert(json!(id));
         }
     }
-    let reply: Value = match conn
+    let reply: Value = conn
         .ws
-        .request::<Value, _>(method, named(enriched.clone()))
+        .request::<Value, _>(method, named(enriched))
         .await
-    {
-        Ok(reply) => reply,
-        // COMMITTED_NOT_VISIBLE：命令已提交、投影尚未可见。绝不能重发写
-        // 命令——按原 request_id 轮询 command.status 到可见为止。
-        Err(ClientError::Call(err))
-            if err.code() == flow_rpc::journal_v2::COMMITTED_NOT_VISIBLE =>
-        {
-            recover_committed(conn, method, &enriched, &err).await
-        }
-        Err(other) => panic!("调用 {method} 失败：{other}"),
-    };
+        .unwrap_or_else(|other| panic!("调用 {method} 失败：{other}"));
     if write {
         serde_json::from_value(reply["result"].clone())
             .unwrap_or_else(|e| panic!("{method} 回执 result 非法（{e}）：{reply}"))
     } else {
         serde_json::from_value(reply).unwrap_or_else(|e| panic!("{method} 响应非法（{e}）"))
     }
-}
-
-/// -32020 恢复：解析原始回执（error.data），按原 request_id 轮询
-/// command.status 至 visible；超时则回退原始回执（提交事实已成立）。
-async fn recover_committed(
-    conn: &Conn,
-    method: &str,
-    original_params: &Value,
-    err: &ErrorObjectOwned,
-) -> Value {
-    let original: Value = match err.data() {
-        Some(data) => serde_json::from_str(data.get())
-            .unwrap_or_else(|e| panic!("{method} 的 -32020 回执解析失败：{e}")),
-        None => panic!("{method} 返回 -32020 但没有回执数据"),
-    };
-    let request_id = original["request_id"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    assert!(
-        original["committed"] == json!(true) && !request_id.is_empty(),
-        "{method} 的 -32020 回执必须带 committed 与 request_id：{original}"
-    );
-    let scope = flow_rpc::journal_v2::command_scope(method, original_params);
-    for _ in 0..STATUS_POLLS {
-        let status: Value = raw_call(
-            conn,
-            "command.status",
-            json!({"scope": scope, "request_id": request_id}),
-        )
-        .await
-        .unwrap_or_else(|e| panic!("command.status 查询失败：{e}"));
-        if status["visible"] == json!(true) {
-            return status;
-        }
-        tokio::time::sleep(STATUS_INTERVAL).await;
-    }
-    original
 }
 
 pub async fn call_json(conn: &Conn, method: &str, params: Value) -> Value {
@@ -195,17 +134,8 @@ pub async fn try_call_json(
                 .or_insert_with(|| json!(uuid::Uuid::now_v7().to_string()));
         }
     }
-    match conn
-        .ws
-        .request::<Value, _>(method, named(enriched.clone()))
-        .await
-    {
+    match conn.ws.request::<Value, _>(method, named(enriched)).await {
         Ok(value) => Ok(value),
-        Err(ClientError::Call(err))
-            if err.code() == flow_rpc::journal_v2::COMMITTED_NOT_VISIBLE =>
-        {
-            Ok(recover_committed(conn, method, &enriched, &err).await)
-        }
         Err(ClientError::Call(err)) => Err(err),
         Err(other) => panic!("{method} 探测调用失败（传输层）：{other}"),
     }

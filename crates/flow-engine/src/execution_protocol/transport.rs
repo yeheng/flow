@@ -1,16 +1,14 @@
 //! 双通道传输边界与会话校验（二期 §3.1/§3.2）。
 //!
-//! 主进程创建两组 Unix `SOCK_STREAM` socketpair；control 承载握手、派发、
-//! 取消、确认与心跳（禁止大载荷），data 承载输入分块、审计批次、观测
-//! （独立预算类别）。不绑定 `.sock` 路径、不起本地 listener、无服务发现。
+//! 传输层不依赖 Unix：`FrameTransport::spawn_streams` 在任意双字节流上
+//! 工作（本地 socketpair 的构造见 [`super::unix`]，三期远程 TLS/TCP 同走
+//! 此处）。control 承载握手、派发、取消、确认与心跳（禁止大载荷），data
+//! 承载输入分块、审计批次、观测（独立预算类别）。不绑定 `.sock` 路径、
+//! 不起本地 listener、无服务发现。
 //!
 //! 每条连接一个串行帧写入器（单写任务按序写帧，避免并发写导致帧交错），
 //! 读任务独立于节点执行持续运行（主进程不能等节点执行返回才读取审计）。
 
-use std::os::fd::FromRawFd;
-use std::os::unix::net::UnixStream as StdStream;
-
-use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 use super::contract::{
@@ -19,70 +17,6 @@ use super::contract::{
 };
 use super::frame::{encode_frame, FrameDecoder};
 use super::message::{Channel, Message, ProtocolError};
-
-/// 两条 socketpair 的本地端点归属：父端与子端各持其一。
-pub struct ChannelPair {
-    pub control: UnixStream,
-    pub data: UnixStream,
-}
-
-/// 创建一组双通道 socketpair。返回 (父端, 子端)。FD 无 CLOEXEC——子端经
-/// pre_exec dup2 到固定槽位后关闭原 FD（见 pool），父端在 spawn 后关闭
-/// 子端副本，保证除目标子进程外无人继承连接。
-pub fn socketpair_channels() -> std::io::Result<(ChannelPair, ChannelPair)> {
-    let mut control = [0i32; 2];
-    let mut data = [0i32; 2];
-    // SAFETY: 传入的是有效且尺寸正确的输出缓冲。
-    unsafe {
-        if libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, control.as_mut_ptr()) != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        if libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, data.as_mut_ptr()) != 0 {
-            let err = std::io::Error::last_os_error();
-            libc::close(control[0]);
-            libc::close(control[1]);
-            return Err(err);
-        }
-    }
-    let take = |fds: &[i32; 2]| -> (StdStream, StdStream) {
-        // SAFETY: FD 由本函数创建且只移交一次。
-        unsafe {
-            let a = StdStream::from_raw_fd(fds[0]);
-            let b = StdStream::from_raw_fd(fds[1]);
-            (a, b)
-        }
-    };
-    let (control_parent, control_child) = take(&control);
-    let (data_parent, data_child) = take(&data);
-    // tokio 要求非阻塞；socketpair 默认阻塞。
-    control_parent.set_nonblocking(true)?;
-    control_child.set_nonblocking(true)?;
-    data_parent.set_nonblocking(true)?;
-    data_child.set_nonblocking(true)?;
-    Ok((
-        ChannelPair {
-            control: UnixStream::from_std(control_parent)?,
-            data: UnixStream::from_std(data_parent)?,
-        },
-        ChannelPair {
-            control: UnixStream::from_std(control_child)?,
-            data: UnixStream::from_std(data_child)?,
-        },
-    ))
-}
-
-/// 执行器入口：从固定 FD 槽位构建端点（FD 已由 pre_exec dup2 就位）。
-pub fn channels_from_raw(control_fd: i32, data_fd: i32) -> std::io::Result<ChannelPair> {
-    // SAFETY: FD 由父进程 pre_exec 保证有效，且只移交一次。
-    let control = unsafe { StdStream::from_raw_fd(control_fd) };
-    let data = unsafe { StdStream::from_raw_fd(data_fd) };
-    control.set_nonblocking(true)?;
-    data.set_nonblocking(true)?;
-    Ok(ChannelPair {
-        control: UnixStream::from_std(control)?,
-        data: UnixStream::from_std(data)?,
-    })
-}
 
 /// 一条通道的读任务产物。`Frame` 装箱：`Message` 最大变体携带完整
 /// `ExecuteTask`（数百字节），装箱后事件枚举与队列槽位收缩到指针大小——
@@ -116,11 +50,6 @@ struct IoHandle {
 }
 
 impl FrameTransport {
-    /// 在给定端点上启动 I/O 任务（Unix socketpair 便捷入口）。
-    pub fn spawn(pair: ChannelPair, queue_depth: usize) -> Self {
-        Self::spawn_streams(pair.control, pair.data, queue_depth)
-    }
-
     /// 在任意双字节流上启动 I/O 任务（三期远程：TLS/TCP 或测试 duplex）。
     /// 读任务持续运行，每通道一个串行写任务。
     pub fn spawn_streams<S>(control: S, data: S, queue_depth: usize) -> Self
@@ -284,8 +213,6 @@ impl FrameTransport {
         let _ = io.writer_data.await;
     }
 }
-
-impl ChannelPair {}
 
 async fn read_loop(
     stream: impl tokio::io::AsyncRead + Unpin + Send,
@@ -575,6 +502,7 @@ thread_local! {
 /// 组合，仍然保证本进程内唯一。
 pub fn fresh_boot_id() -> String {
     let mut bytes = [0u8; 16];
+    #[cfg(unix)]
     let filled = unsafe {
         // macOS: getentropy; Linux: getrandom。
         #[cfg(target_os = "macos")]
@@ -587,6 +515,8 @@ pub fn fresh_boot_id() -> String {
                 == bytes.len() as isize
         }
     };
+    #[cfg(not(unix))]
+    let filled = false;
     if filled {
         hex_encode(&bytes)
     } else {
@@ -605,10 +535,12 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::super::contract::{MAX_AUDIT_RECORD_BYTES, REQUIRED_CAPABILITIES, W_BYTES};
+    use super::super::unix::socketpair_channels;
     use super::*;
+    use std::os::fd::FromRawFd;
 
     async fn pair() -> (FrameTransport, FrameTransport) {
         let (parent, child) = socketpair_channels().unwrap();

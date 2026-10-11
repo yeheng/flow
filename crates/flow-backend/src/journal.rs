@@ -2,7 +2,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc,
 };
 use std::time::Duration;
@@ -14,7 +14,7 @@ use flow_journal::{Event, EventKind, Journal, JournalOptions, Transaction};
 use flow_store::projection::{ProjectedRow, Projector};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,8 +62,12 @@ pub struct JournalBackend {
     shutdown: CancellationToken,
     projector: Mutex<Option<tokio::task::JoinHandle<()>>>,
     projection_error: Arc<Mutex<Option<String>>>,
-    waiters: Semaphore,
-    wait_timeout: Duration,
+    /// 投影游标的内存镜像：projector 每批 apply 后 fetch_max 更新。等待者
+    /// 用一次原子读判可见，不再按唤醒逐次查 SQLite。
+    projected_lsn: AtomicU64,
+    /// 写命令等到可见的上限（病理阀：健康路径毫秒级追平；超时才发
+    /// -32020，意味着投影坏了而非投影慢）。测试可调小。
+    wait_timeout_ms: AtomicU64,
     pub(crate) execution: Mutex<Option<tokio::task::JoinHandle<()>>>,
     execution_changed: Arc<Notify>,
     pub(crate) execution_peak: AtomicUsize,
@@ -233,6 +237,10 @@ impl JournalBackend {
         }
         let mut tail = committed.reader.fork();
         let mut state = committed.state.clone();
+        let projected_cursor = projection
+            .applied_lsn()
+            .await
+            .map_err(|e| JournalError::Projection(e.to_string()))?;
         let backend = Arc::new(Self {
             #[cfg(feature = "journal-cluster")]
             cluster: std::sync::OnceLock::new(),
@@ -250,8 +258,8 @@ impl JournalBackend {
             shutdown: CancellationToken::new(),
             projector: Mutex::new(None),
             projection_error: Arc::new(Mutex::new(None)),
-            waiters: Semaphore::new(256),
-            wait_timeout: Duration::from_secs(5),
+            projected_lsn: AtomicU64::new(projected_cursor),
+            wait_timeout_ms: AtomicU64::new(30_000),
             execution: Mutex::new(None),
             execution_changed: Arc::new(Notify::new()),
             execution_peak: AtomicUsize::new(0),
@@ -308,6 +316,7 @@ impl JournalBackend {
                         b.projected.notify_waiters();
                         return;
                     }
+                    b.projected_lsn.fetch_max(lsn, Ordering::Release);
                     b.projected.notify_waiters();
                 }
             }
@@ -512,19 +521,10 @@ impl JournalBackend {
         }
     }
     async fn visible(&self, mut receipt: CommandReceipt) -> Result<CommandReceipt> {
-        let Ok(_permit) = self.waiters.try_acquire() else {
-            return Err(JournalError::CommittedNotVisible(receipt));
-        };
         let wait = async {
             loop {
                 let notified = self.projected.notified();
-                if self
-                    .projection
-                    .applied_lsn()
-                    .await
-                    .map_err(|e| JournalError::Projection(e.to_string()))?
-                    >= receipt.commit_cursor.lsn
-                {
+                if self.projected_lsn.load(Ordering::Acquire) >= receipt.commit_cursor.lsn {
                     return Ok::<(), JournalError>(());
                 }
                 if self.projection_error.lock().await.is_some() {
@@ -533,10 +533,9 @@ impl JournalBackend {
                 notified.await;
             }
         };
-        if !matches!(
-            tokio::time::timeout(self.wait_timeout, wait).await,
-            Ok(Ok(()))
-        ) {
+        let timeout =
+            Duration::from_millis(self.wait_timeout_ms.load(Ordering::Relaxed).max(1));
+        if !matches!(tokio::time::timeout(timeout, wait).await, Ok(Ok(()))) {
             return Err(JournalError::CommittedNotVisible(receipt));
         }
         receipt.visible = true;
@@ -604,6 +603,11 @@ impl JournalBackend {
     pub fn pause_projection(&self, paused: bool) {
         self.paused.store(paused, Ordering::Relaxed);
         self.changed.notify_waiters();
+    }
+    /// 调整写命令等到投影可见的上限（毫秒）。测试注入用；产品默认 30s，
+    /// 健康路径下投影在毫秒级追平，超时即投影病理。
+    pub fn set_projection_wait(&self, ms: u64) {
+        self.wait_timeout_ms.store(ms, Ordering::Relaxed);
     }
     pub async fn close(&self) -> Result<()> {
         self.shutdown.cancel();

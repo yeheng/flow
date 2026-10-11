@@ -4,7 +4,9 @@
 //! 绑定一种执行模式。启用 IPC 时二进制缺失/版本不兼容直接失败，不静默
 //! 落回进程内执行。
 
+#[cfg(unix)]
 pub mod dispatch;
+#[cfg(unix)]
 pub mod pool;
 pub mod remote;
 
@@ -14,7 +16,9 @@ use flow_engine::execution_protocol::contract::{
     ExecutorInvocation, EXECUTION_MODE_ENV, X_MAX_DEFAULT,
 };
 
+#[cfg(unix)]
 pub use dispatch::IpcDispatcher;
+#[cfg(unix)]
 pub use pool::ExecutorPool;
 
 #[derive(Debug, Clone)]

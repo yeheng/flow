@@ -11,12 +11,16 @@ pub mod fixtures;
 pub mod frame;
 pub mod message;
 pub mod remote;
-pub mod spawn;
 #[cfg(unix)]
+pub mod spawn;
 pub mod transport;
+#[cfg(unix)]
+pub mod unix;
 
 pub use contract::*;
 pub use message::{
-    record_bytes, AuditRecord, Channel, ExecuteTask, Message, ObservationLine, ProtocolError,
-    ResultOutcome, WaitRequest,
+    record_bytes, AuditRecord, Channel, ExecuteTask, Message, ObservationLine, PreparedMeta,
+    ProtocolError, ResultOutcome, TaskValue, WaitRequest,
 };
+#[cfg(unix)]
+pub use unix::{channels_from_raw, socketpair_channels, ChannelPair};

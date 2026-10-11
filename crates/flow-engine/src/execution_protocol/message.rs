@@ -272,10 +272,9 @@ pub enum Message {
         command_id: String,
         operation_id: String,
         request_fingerprint: String,
-        /// inline 请求（≤ control 帧上限时使用）；大请求走 transfer。
-        request: Option<StoredValue>,
-        /// 大请求的 data 通道 transfer 标识；None 表示 inline。
-        transfer_id: Option<String>,
+        /// 请求字节的 data 通道 transfer 标识（op:<operation_id>）。
+        /// v2 起请求字节一律走 data 通道，无 inline 特例。
+        transfer_id: String,
     },
     /// control，主→子。Intent 与 Authorized 同事务提交成功后发出；
     /// 绑定会话身份；重复 permit_id 不再调用。
@@ -426,18 +425,44 @@ pub struct ExecuteTask {
     pub node_execution_id: String,
     #[serde(with = "decimal_u32")]
     pub attempt: u32,
-    /// 节点定义（含未展开 params）。
+    /// 节点定义（含未展开 params）。控制帧唯一允许的变长项（有界：
+    /// dispatch 侧按 CONTROL_MAX_FRAME/2 预检，超限拒绝派发而非杀会话）。
     pub node: Value,
-    /// run 输入与前驱输出（StoredValue：小值 inline，大值走 transfer）。
-    pub input: StoredValue,
-    pub predecessors: Vec<(String, StoredValue)>,
-    /// 已提交 InputPrepared（重试恢复时携带；执行器跳过求值，
-    /// 不重新求时间/随机模板）。
-    pub prepared: Option<Value>,
-    /// 已提交但缺 Outcome 的操作恢复出的历史 Outcome（重试复用，不重发）。
+    /// run 输入与前驱输出的声明：控制帧只携带身份与 codec，值字节
+    /// 无论大小一律走 data 通道（TransferChunk + InputReady）。
+    pub input: TaskValue,
+    pub predecessors: Vec<(String, TaskValue)>,
+    /// 已提交 InputPrepared 的元数据（重试恢复；执行器跳过求值，不重新
+    /// 求时间/随机模板）。input/predecessors/params 的值经 inputs 声明
+    /// 传输（in:run-input / in:<node_id> / in:prepared-params）。
+    pub prepared: Option<PreparedMeta>,
+    /// 已提交但缺 Outcome 的操作恢复出的历史 Outcome 元数据（重试复用，
+    /// 不重发；体字节走 op-body:<output_id> 传输）。
     pub previous_outcome: Option<Value>,
     /// 观测开/关（主进程未配置观测存储时关闭，避免无谓传输）。
     pub observability: bool,
+}
+
+/// 输入值声明（v2）：控制帧不携带用户值字节。
+/// - `Ref`：journal 引用的身份元数据（start/end 节点输出按引用回传，
+///   需要完整 ValueRef）；字节由主进程从 journal 流式送出。
+/// - `Local`：原 inline 值，只声明存在；字节由主进程分块送出，
+///   接收端按 JSON 解码。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum TaskValue {
+    Ref(flow_journal::ValueRef),
+    Local,
+}
+
+/// 已提交 InputPrepared 的元数据（值字段不入控制帧）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedMeta {
+    pub engine_build: String,
+    #[serde(with = "decimal_u32")]
+    pub node_semantics: u32,
+    /// 已提交准备参数的值声明（字节走 in:prepared-params 传输）。
+    pub params: TaskValue,
 }
 
 impl Message {
@@ -639,13 +664,11 @@ impl Message {
                 command_id,
                 operation_id,
                 request_fingerprint,
-                request,
                 transfer_id,
             } => body_value(serde_json::json!({
                 "command_id": command_id,
                 "operation_id": operation_id,
                 "request_fingerprint": request_fingerprint,
-                "request": request,
                 "transfer_id": transfer_id,
             })),
             Message::OperationPermit {
@@ -963,8 +986,7 @@ impl Message {
                     command_id: String,
                     operation_id: String,
                     request_fingerprint: String,
-                    request: Option<StoredValue>,
-                    transfer_id: Option<String>,
+                    transfer_id: String,
                 }
                 let wire: Wire = from_body(&body, type_name)?;
                 Message::RequestOperation {
@@ -972,7 +994,6 @@ impl Message {
                     command_id: wire.command_id,
                     operation_id: wire.operation_id,
                     request_fingerprint: wire.request_fingerprint,
-                    request: wire.request,
                     transfer_id: wire.transfer_id,
                 }
             }

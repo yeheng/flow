@@ -52,34 +52,6 @@ pub(crate) async fn call(
         .await
     {
         Ok(value) => Ok(value),
-        Err(jsonrpsee::core::ClientError::Call(e)) if e.code() == -32020 => {
-            let original: Value = serde_json::from_str(
-                e.data()
-                    .ok_or_else(|| error("missing committed receipt"))?
-                    .get(),
-            )
-            .map_err(error)?;
-            let scope = match method {
-                "run.start" => "run.start:manual:".to_owned(),
-                "run.cancel" | "run.signal" | "run.adjudicate" => {
-                    format!("{method}:{}", params["run_id"].as_str().unwrap_or(""))
-                }
-                _ => method.to_owned(),
-            };
-            let status = json!({"scope":scope,"request_id":original["request_id"],"_token":token});
-            for _ in 0..20 {
-                let receipt: Value = client
-                    .request("command.status", status.as_object().unwrap().clone())
-                    .await
-                    .map_err(error)?;
-                if receipt["visible"] == true {
-                    return Ok(receipt);
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            }
-            println!("{}", original);
-            Err(CliError::Rpc{code:-32020,message:"COMMITTED_NOT_VISIBLE; original receipt printed; query command.status, do not recreate".into()})
-        }
         Err(jsonrpsee::core::ClientError::Call(e)) => Err(CliError::Rpc {
             code: e.code(),
             message: e.message().into(),

@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -182,6 +182,10 @@ struct AgentRegistration {
     link_session_id: String,
     outbound: mpsc::Sender<ToSession>,
     slots_total: AtomicU64,
+    /// Drain 在 master 侧同步打标：候选选择只看本标志，不依赖 agent 回 ack
+    /// 的时序——否则 drain 中（slots 已回收、used=0）的 agent 反而最优先被
+    /// 选中，bind 被 agent 拒绝后整节点失败。
+    draining: AtomicBool,
     cancel: tokio_util::sync::CancellationToken,
 }
 
@@ -491,6 +495,7 @@ impl AgentManager {
             link_session_id: link_session_id.clone(),
             outbound: outbound.clone(),
             slots_total: AtomicU64::new(slots as u64),
+            draining: AtomicBool::new(false),
             cancel: tokio_util::sync::CancellationToken::new(),
         });
         let previous = self
@@ -943,6 +948,9 @@ impl AgentManager {
             let pick = agents
                 .values()
                 .filter_map(|agent| {
+                    if agent.draining.load(Ordering::Acquire) {
+                        return None;
+                    }
                     let used = bindings
                         .values()
                         .filter(|bound| bound.agent_id == agent.agent_id)
@@ -1083,6 +1091,7 @@ impl AgentManager {
         let registration = agents
             .get(agent_id)
             .ok_or_else(|| invalid(format!("agent {agent_id} not connected")))?;
+        registration.draining.store(true, Ordering::Release);
         registration
             .outbound
             .send(ToSession::Send(Box::new(Message::Drain { grace_ms })))
@@ -1302,6 +1311,7 @@ mod capacity_tests {
                 link_session_id: session.into(),
                 outbound: outbound.clone(),
                 slots_total: AtomicU64::new(1),
+                draining: AtomicBool::new(false),
                 cancel: tokio_util::sync::CancellationToken::new(),
             })
         };

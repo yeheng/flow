@@ -254,6 +254,7 @@ async fn committed_projection_crash_child() {
     let b = JournalBackend::open(&root, Default::default())
         .await
         .unwrap();
+    b.set_projection_wait(100);
     b.pause_projection(true);
     assert!(matches!(
         b.workflow_create("crash", Some("original")).await,

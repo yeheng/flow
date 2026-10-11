@@ -89,25 +89,15 @@ describe("V2 client protocol", () => {
     });
   });
 
-  it("recovers the original journal command when projection is delayed", async () => {
-    transport.call
-      .mockRejectedValueOnce(
-        new RpcError(-32020, "COMMITTED_NOT_VISIBLE", { ...receipt, visible: false }),
-      )
-      .mockResolvedValueOnce(receipt);
-    const client = new JournalClient("ws://other", "other-token", "http://other");
-    expect(await client.command("schedule.create", {}, "schedule.create", "stable")).toEqual(
-      receipt,
+  it("propagates COMMITTED_NOT_VISIBLE as a terminal pathology (no recovery polling)", async () => {
+    transport.call.mockRejectedValueOnce(
+      new RpcError(-32020, "COMMITTED_NOT_VISIBLE", { ...receipt, visible: false }),
     );
-    expect(transport.call.mock.calls.map(([method]) => method)).toEqual([
-      "schedule.create",
-      "command.status",
-    ]);
-    expect(transport.call.mock.calls[1]![1]).toEqual({
-      scope: "schedule.create",
-      request_id: "stable",
-      _token: "other-token",
-    });
+    const client = new JournalClient("ws://other", "other-token", "http://other");
+    await expect(
+      client.command("schedule.create", {}, "schedule.create", "stable"),
+    ).rejects.toMatchObject({ code: -32020 });
+    expect(transport.call.mock.calls.map(([method]) => method)).toEqual(["schedule.create"]);
   });
 
   it("loads the materialized run shape for the run detail view", async () => {

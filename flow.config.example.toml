@@ -21,7 +21,7 @@ data_dir = "data"
 
 [execution]
 # in_process（缺省）| ipc（本机执行器子进程）| remote（远程 agent）
-mode = "in_process"
+mode = "ipc"
 # 执行器二进制（原 FLOW_EXECUTOR_BIN）；注释掉 = 定位同目录兄弟 flow-executor
 # executor_bin = "/usr/local/bin/flow-executor"
 # IPC 执行槽位（1..=16）

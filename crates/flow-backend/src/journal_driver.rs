@@ -2,6 +2,7 @@
 //! IPC mode (phase 2) replaces the in-process node executor with a managed
 //! subprocess pool; journal semantics are byte-identical between modes.
 use crate::execution::remote::{RemoteDispatcher, RemoteOptions};
+#[cfg(unix)]
 use crate::execution::{ExecutionMode, IpcDispatcher};
 use crate::journal::{JournalBackend, JournalError};
 use crate::journal_commands::{id, node_event, now};
@@ -16,12 +17,13 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// 节点执行端口：一期进程内 / 二期本地 IPC / 三期远程 agent。
+/// 节点执行端口：一期进程内 / 二期本地 IPC（unix）/ 三期远程 agent。
 #[derive(Clone)]
 pub(crate) enum ExecutionPort {
     InProcess,
     #[cfg(test)]
     PanicOnScript,
+    #[cfg(unix)]
     Ipc(Arc<IpcDispatcher>),
     Remote(Arc<RemoteDispatcher>),
 }
@@ -45,6 +47,8 @@ impl JournalBackend {
     }
     /// 二期 IPC 模式：先持久提交新 master_epoch，再创建进程池与派发器
     /// （取得独占写权后持久提交新任期，再派发任务；二期 §3.2）。
+    /// Unix only：子进程承载依赖 socketpair + pre_exec FD 槽位。
+    #[cfg(unix)]
     pub async fn start_execution_ipc(self: &Arc<Self>, mode: ExecutionMode) -> Result<()> {
         let crate::execution::ExecutionMode::Ipc(options) = mode else {
             return self.start_execution().await;
@@ -234,6 +238,7 @@ impl JournalBackend {
                                         let logger=observation.map(|store|NodeLogger::observation(store.logger(attempt.run_id.clone(),attempt.dispatch_id.clone()),attempt.node_id.clone(),1)).unwrap_or_else(NodeLogger::disabled);
                                         execute(&attempt,&node,predecessors.clone(),logger).await
                                     }
+                                    #[cfg(unix)]
                                     ExecutionPort::Ipc(dispatcher)=>{
                                         dispatcher.execute(&attempt,&node,predecessors.clone(),observation).await
                                     }

@@ -1,4 +1,4 @@
-import { RpcClient, RpcError } from "../rpc/client";
+import { RpcClient } from "../rpc/client";
 import { isDesktop } from "../platform";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -37,20 +37,10 @@ export class JournalClient {
   call<T>(method: string, params: Record<string, unknown> = {}): Promise<T> {
     return this.rpc.call<T>(method, { ...params, _token: this.token });
   }
-  async command(method: string, params: Record<string, unknown>, scope = method, requestId: string = crypto.randomUUID()): Promise<Receipt> {
-    try { return await this.call<Receipt>(method, { ...params, request_id: requestId }); }
-    catch (error) {
-      if (!(error instanceof RpcError) || error.code !== -32020) throw error;
-      const original = error.data as Receipt;
-      if (!original?.committed || original.request_id !== requestId) throw error;
-      // Never submit another write merely because the projection is behind.
-      for (let i = 0; i < 20; i++) {
-        const receipt = await this.call<Receipt | null>("command.status", { scope, request_id: requestId });
-        if (receipt?.visible) return receipt;
-        await new Promise(resolve => setTimeout(resolve, 250));
-      }
-      return original;
-    }
+  /** 服务端在写响应前等到投影可见（applied_lsn >= commit_lsn）；-32020 到达
+   * 即投影病理，直接上抛，不做恢复轮询。 */
+  command(method: string, params: Record<string, unknown>, _scope = method, requestId: string = crypto.randomUUID()): Promise<Receipt> {
+    return this.call<Receipt>(method, { ...params, request_id: requestId });
   }
   page(run: string, audit = false, cursor?: Record<string, unknown> | null): Promise<JournalPage> {
     return this.call(audit ? "run.audit.page" : "run.events.page", { run_id: run, cursor, limit: 100 });

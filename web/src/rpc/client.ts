@@ -3,7 +3,6 @@ import { apiToken } from "../config";
 import { NativeClient } from "./native";
 import { WebSocketClient } from "./websocket";
 import { WRITE_METHODS } from "./methods";
-import { RpcError } from "./errors";
 export { RpcError, errText } from "./errors";
 export type Service = "flow" | "journal";
 
@@ -57,28 +56,10 @@ export class RpcClient {
       request_id?: string;
       visible?: boolean;
     };
-    try {
-      reply = await this.transport.call(method, enriched);
-    } catch (error) {
-      if (!(error instanceof RpcError) || error.code !== -32020 || !requestId) throw error;
-      const original = error.data as typeof reply;
-      if (!original?.committed || original.request_id !== requestId) throw error;
-      const scope = method === "run.start" ? "run.start:manual:"
-        : ["run.cancel", "run.signal", "run.adjudicate"].includes(method)
-          ? `${method}:${String(enriched.run_id ?? "")}` : method;
-      reply = original;
-      for (let i = 0; i < 20; i++) {
-        // Query only: this write has already committed. Product views read committed state.
-        try {
-          const status = await this.transport.call<typeof reply | null>("command.status", {
-            scope, request_id: requestId, _token: enriched._token,
-          });
-          if (status?.visible) { reply = status; break; }
-        } catch { break; }
-        await new Promise(resolve => setTimeout(resolve, 250));
-      }
-    }
-    // 主工作台使用物化结果；JournalClient 消费完整回执并处理 -32020。
+    reply = await this.transport.call(method, enriched);
+    // 服务端在写响应前等到投影可见（applied_lsn >= commit_lsn），-32020 在
+    // 健康路径不会出现；若到达即投影病理，直接上抛。
+    // 主工作台使用物化结果；JournalClient 消费完整回执。
     if (this.service === "flow" && requestId !== undefined && reply?.committed === true) {
       return reply.result as T;
     }
