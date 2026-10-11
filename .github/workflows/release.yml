@@ -1,0 +1,179 @@
+name: Release
+
+# 只在 v* tag 上发布：校验版本 → 四平台构建 Tauri 桌面端 → 打 zip → 上传 Release。
+# 手动 workflow_dispatch 时也请选 tag 运行，选分支会在 prepare 阶段被拦下。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # tag 与 tauri.conf.json 的 version 必须一致（如 v0.1.0 ↔ 0.1.0），
+      # 否则产物文件名与应用自报版本会对不上，发版前先在这里拦住。
+      - name: 解析并校验版本
+        id: meta
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          case "$TAG" in
+            v*) ;;
+            *) echo "❌ 发布必须从 v* tag 触发（当前：$TAG）"; exit 1 ;;
+          esac
+          CONF_VER=$(python3 -c "import json; print(json.load(open('web/src-tauri/tauri.conf.json'))['version'])")
+          if [ "v${CONF_VER}" != "$TAG" ]; then
+            echo "❌ tag $TAG 与 tauri.conf.json 的 version $CONF_VER 不一致"
+            exit 1
+          fi
+          echo "version=$CONF_VER" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      # 幂等：Release 已存在就只补产物，重跑 workflow 不会因重复创建失败。
+      - name: 创建 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${{ steps.meta.outputs.tag }}" >/dev/null 2>&1 \
+            || gh release create "${{ steps.meta.outputs.tag }}" \
+                 --title "Flow ${{ steps.meta.outputs.tag }}" \
+                 --generate-notes
+
+  build:
+    name: Build (${{ matrix.name }})
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    env:
+      APP_VERSION: ${{ needs.prepare.outputs.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-aarch64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            bundles: app
+          # macos-13 的 Intel runner 已退役，Intel 包在 arm 机器上交叉编译。
+          - name: macos-x86_64
+            runner: macos-latest
+            target: x86_64-apple-darwin
+            bundles: app
+          - name: windows-x86_64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: msi,nsis
+          # 22.04 的 glibc / webkit 版本对 AppImage 分发更友好。
+          - name: linux-x86_64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: appimage,deb
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux 系统依赖（Tauri v2 WebKit 工具链）
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev \
+            libgtk-3-dev libappindicator3-dev librsvg2-dev patchelf \
+            libxdo-dev libssl-dev build-essential curl wget file
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust 缓存
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: web/src-tauri
+          key: ${{ matrix.target }}
+
+      - name: 安装前端依赖
+        working-directory: web
+        run: npm ci
+
+      # tauri build 会先跑 tauri.conf.json 的 beforeBuildCommand（npm run build）。
+      # src-tauri 是独立 workspace（自带 Cargo.lock），产物落在
+      # web/src-tauri/target/<target>/release/bundle/ 下。
+      - name: 构建 Tauri 应用
+        working-directory: web
+        run: npm run build:desktop -- --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
+      - name: 打包 zip（macOS）
+        if: runner.os == 'macOS'
+        run: |
+          NAME="Flow-${APP_VERSION}-${{ matrix.name }}.zip"
+          BUNDLE="web/src-tauri/target/${{ matrix.target }}/release/bundle/macos"
+          mkdir -p staging
+          # .app 必须用 ditto 打包：保留符号链接与权限，普通 zip 会损坏应用结构。
+          ditto -c -k --sequesterRsrc --keepParent "$BUNDLE/Flow.app" "staging/$NAME"
+          (cd staging && shasum -a 256 "$NAME" > "$NAME.sha256")
+
+      - name: 打包 zip（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "Flow-$env:APP_VERSION-${{ matrix.name }}.zip"
+          $bundle = "web/src-tauri/target/${{ matrix.target }}/release/bundle"
+          New-Item -ItemType Directory -Force staging | Out-Null
+          $files = @(Get-ChildItem "$bundle/msi/*.msi") + @(Get-ChildItem "$bundle/nsis/*.exe")
+          if ($files.Count -eq 0) { throw "bundle 目录里没有 msi/nsis 产物" }
+          Compress-Archive -Path $files.FullName -DestinationPath "staging/$name"
+          $hash = (Get-FileHash "staging/$name" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name" | Out-File -Encoding ascii "staging/$name.sha256"
+
+      # 绿色版：免安装，zip 里只有一个改名后的主程序，解压即运行
+      # （仍依赖系统 WebView2 运行时，Win11 与多数 Win10 已预装）。
+      - name: 打包 zip（Windows 绿色版）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "Flow-$env:APP_VERSION-${{ matrix.name }}-portable.zip"
+          $exe = "web/src-tauri/target/${{ matrix.target }}/release/flow-desktop.exe"
+          if (-not (Test-Path $exe)) { throw "找不到便携版可执行文件：$exe" }
+          New-Item -ItemType Directory -Force portable | Out-Null
+          Copy-Item $exe "portable/Flow.exe"
+          Compress-Archive -Path "portable/Flow.exe" -DestinationPath "staging/$name"
+          $hash = (Get-FileHash "staging/$name" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name" | Out-File -Encoding ascii "staging/$name.sha256"
+
+      - name: 打包 zip（Linux）
+        if: runner.os == 'Linux'
+        run: |
+          NAME="Flow-${APP_VERSION}-${{ matrix.name }}.zip"
+          BUNDLE="web/src-tauri/target/${{ matrix.target }}/release/bundle"
+          mkdir -p staging
+          zip -j "staging/$NAME" "$BUNDLE"/appimage/*.AppImage "$BUNDLE"/deb/*.deb
+          (cd staging && sha256sum "$NAME" > "$NAME.sha256")
+
+      - name: 上传到 Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ needs.prepare.outputs.tag }}" staging/* --clobber
