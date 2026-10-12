@@ -6,9 +6,10 @@
 //!   data（帧内 1 字节通道标签，见 [`super::frame`]）。单写任务保证帧按
 //!   提交序串行发出——Execute 先于其 TransferChunk、RequestOperation 晚于
 //!   其请求块，跨通道乱序在物理上不存在，双方无需重组暂存。
-//! - **双流（agent 上联，二期 §3.1 语义不变）**：`spawn_streams` 在两条
-//!   独立流上承载 control（握手、派发、取消、确认、心跳，禁止大载荷）与
-//!   data（输入分块、审计批次、观测，独立预算类别）。
+//! - **双流（二期遗留，已无生产调用方）**：`spawn_streams` 在两条独立流上
+//!   承载 control（握手、派发、取消、确认、心跳，禁止大载荷）与 data（输入
+//!   分块、审计批次、观测，独立预算类别）。v3 起 agent 上联与本地 IPC 都用
+//!   单流 [`FrameTransport::spawn`]，本方法保留供测试与外部兼容。
 //!
 //! 每条连接一个串行帧写入器（单写任务按序写帧，避免并发写导致帧交错），
 //! 读任务独立于节点执行持续运行（主进程不能等节点执行返回才读取审计）。
@@ -89,8 +90,9 @@ impl FrameTransport {
         }
     }
 
-    /// 双流承载（agent 上联，二期格式不变）：control 与 data 各一条流，
-    /// 每通道独立串行写。传输层不依赖 Unix（三期远程 TLS/TCP 或测试 duplex）。
+    /// 双流承载（二期遗留，已无生产调用方）：control 与 data 各一条流，
+    /// 每通道独立串行写。v3 起 agent 上联与本地 IPC 都走单流 [`Self::spawn`]；
+    /// 传输层不依赖 Unix，本方法保留供测试与外部兼容。
     pub fn spawn_streams<S>(control: S, data: S, queue_depth: usize) -> Self
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,

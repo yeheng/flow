@@ -1275,7 +1275,7 @@ fn event_kind(kind: &str) -> Option<EventKind> {
 
 /// 反查派发归属 `(run_id, node_id, attempt)`。
 ///
-/// 观测尾批晚于 Result 到达时（双通道无跨通道顺序），批里的 dispatch_id
+/// 观测尾批晚于 Result 到达时（单流下帧序 = 提交序，但观测与结果分属不同队列），批里的 dispatch_id
 /// 是唯一可靠归属。当前派发命中的是节点的 `dispatch_id` 字段；更旧的
 /// （重试前的）只能命中 attempts 账本，历史尝试号无处可查，用节点当前
 /// 值——归属正确，号偏保守。

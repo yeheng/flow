@@ -4,15 +4,17 @@
 //!
 //! - **单流（执行器本地 IPC，v3）**：`u32 大端长度 + u8 通道标签 + JSON`，
 //!   长度只计标签 + JSON。一条流内的帧序即双方提交序，跨通道乱序不存在。
-//! - **双流（agent 上联，二期格式不变）**：`u32 大端长度 + JSON`，control 与
-//!   data 各占一条物理流，靠流本身区分通道（二期 §3.1 原语义）。
+//! - **双流（二期遗留，已无生产调用方）**：`u32 大端长度 + JSON`，control 与
+//!   data 各占一条物理流，靠流本身区分通道（二期 §3.1 原语义）。v3 起 agent
+//!   上联与本地 IPC 都用单流标签帧。
 //!
 //! 读端处理半帧/粘帧：先校验长度上限再保留缓冲，防止非法长度触发无界分配。
 
 use super::contract::{CONTROL_MAX_FRAME, DATA_MAX_FRAME, FRAME_HEADER_BYTES};
 use super::message::{Channel, Message, ProtocolError};
 
-/// 双流帧上限按 channel 取 control/data；JSON 部分超限即拒绝，
+/// 双流帧上限按 channel 取 control/data（仅二期遗留编码路径使用）；
+/// JSON 部分超限即拒绝，
 /// 不静默截断。
 pub fn encode_frame(message: &Message) -> Result<Vec<u8>, ProtocolError> {
     let json = serde_json::to_vec(&message.to_envelope())

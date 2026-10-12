@@ -58,7 +58,7 @@ pub async fn run_agent(config: AgentConfig, shutdown: CancellationToken) -> Stri
             cancel_all(&executor_handles).await;
             return "shutdown".into();
         }
-        // Reconnecting：建立双 TLS + 握手 + DataBind。
+        // Reconnecting：建立单条 mTLS + 握手。
         let connection = tokio::select! {
             _ = shutdown.cancelled() => {cancel_all(&executor_handles).await; return "shutdown".into();},
             result = tokio::time::timeout(Duration::from_secs(15), connect(&config, &agent_boot_id)) => result.unwrap_or_else(|_| Err("agent connect timeout".into())),
@@ -602,7 +602,7 @@ pub async fn serve_for_tests(
     .await
 }
 
-/// 重连会话（R2 测试/进程内）：AgentHello → Welcome → DataBind →
+/// 重连会话（R2 测试/进程内）：AgentHello → AgentWelcome →
 /// Resume（若有在飞）→ serve。返回 (link_session_id, 退出原因)。
 pub async fn reconnect_session(
     config: &AgentConfig,

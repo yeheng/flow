@@ -20,7 +20,7 @@
 //! 明确**不收敛**的配置（保持现状）：`RUST_LOG`（env-filter 惯例）、
 //! `FLOW_SECRET_*`（凭据走密钥机制，见 flow-engine secrets）、journal token
 //! （每工作区凭据，仅 env）、执行协议冻结常量（帧上限/超时族，改即协议变更）、
-//! executor FD 槽位（父进程 pre_exec 契约）、`FLOW_RUN_LOG_BUDGET` 等
+//! executor 通道 FD 引导（argv `--channel-fd` 契约）、`FLOW_RUN_LOG_BUDGET` 等
 //! engine 内部预算（读取点在 driver 深处，维持 env）。
 //!
 //! 加载必须在**构造 tokio runtime 之前**同步完成。

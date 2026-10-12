@@ -163,8 +163,7 @@ impl IncomingTransfers {
             }
         }
         stream.ready = Some((*total_bytes, digest.clone()));
-        // control 帧可能先于 data 块到达（双通道乱序，二期 §3.6）：标记就绪
-        // 后等块齐再装配，不在此处报错。
+        // 标记就绪后等块齐再装配，不在此处报错（InputReady 与块到达顺序无关）。
         self.try_assemble(transfer_id)
     }
 

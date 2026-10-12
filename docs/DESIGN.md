@@ -79,8 +79,8 @@ crates/
 | --- | --- | --- |
 | `flow-journal-server` | flow-rpc | JSONL v2 产品服务（WS RPC + cron + webhook + 下载） |
 | `flow-cli` | flow-cli | 命令行客户端（纯 RPC） |
-| `flow-executor` | flow-executor | 受管理执行子进程（FD 槽位由主进程 pre_exec 固定） |
-| `flow-agent` | flow-agent | 受信任远程执行中继（双 TLS 上联 + 本机执行器池） |
+| `flow-executor` | flow-executor | 受管理执行子进程（通道 FD 经 argv `--channel-fd` 传递） |
+| `flow-agent` | flow-agent | 受信任远程执行中继（单条 mTLS 上联 + 本机执行器池） |
 | `flow-journal-tool` | flow-journal | journal 离线维护（verify/index/backup/repair） |
 | `flow-journal-bench` | flow-journal | journal 写入基准 |
 | `flow-journal-dev` | flow-backend | JSONL v2 开发运行器（run/resume/import-legacy） |
@@ -101,10 +101,10 @@ crates/
    │  JSON-RPC over WebSocket（产品面，flow-rpc）
    ▼
 journal 服务端（flow-backend，唯一权威）
-   │  远程链路：Routed 信封 over 双 TLS（execution/remote.rs）
+   │  远程链路：Routed 信封 over 单条 mTLS（execution/remote.rs，v3 单流）
    ▼
 flow-agent（中继，自己不碰 journal）
-   │  执行 IPC：帧协议（unix socketpair / 其余平台 loopback 回连）
+   │  执行 IPC：单流标签帧（unix socketpair / 其余平台 loopback 回连）
    ▼
 flow-executor（子进程，节点语义的唯一居所）
 ```
@@ -116,22 +116,23 @@ flow-executor（子进程，节点语义的唯一居所）
 2. 节点执行语义只许存在于 `flow-executor`；master 只做裁决和调度。进程内
    实现已**全平台删除**（`execute()` / `journal_execution` 的计算类函数），
    `journal_execution` 只剩 Attempt 簿记（begin/snapshot/finish）。
-3. 控制通道只走定长身份与元数据；一切变长业务值走 data 通道（协议 v2），
-   再小也走。
+3. 协议 v3 单流：控制与数据复用同一条双向流，帧内 1 字节通道标签区分；
+   控制帧只走定长身份与元数据，变长业务值走 data 标签（再小也走 data）。
 4. 服务端在写 RPC 响应前等到 `applied_lsn >= commit_lsn`；-32020 只作投影
    病理阀，健康路径永不触发，客户端零恢复逻辑。
-5. 本地 IPC 承载按平台选择，对上层透明：unix 用 socketpair + pre_exec
-   FD 槽位（100/101）；Windows 及其余平台用 **TCP loopback 回连**
+5. 本地 IPC 承载按平台选择，对上层透明：unix 用 socketpair，通道 FD 原号
+   经 argv `--channel-fd <N>` 传给执行器（pre_exec 只关闭其余继承 FD，不做
+   dup2 落位）；Windows 及其余平台用 **TCP loopback 回连**
    （父进程 bind `127.0.0.1:0`，执行器按 `FLOW_EXECUTOR_CONNECT_ADDR`
-   回连出 control/data 双通道，`execution_protocol::loopback`）。信任域与
+   回连出单条连接，`execution_protocol::loopback`）。信任域与
    单用户本机工具一致（RPC 端点本就 loopback + token）。
 
 **执行模式矩阵**：
 
 | 模式 | 平台 | 节点执行位置 | 备注 |
 | --- | --- | --- | --- |
-| `ipc` | 全平台（缺省） | `flow-executor` 子进程（unix socketpair + FD 槽位；其余 TCP loopback 回连） | 执行器缺失/协议版本不符直接失败，不静默回退 |
-| `remote` | 全平台 | 经 `flow-agent` 中继的远端执行器 | 双 TLS；`mode=remote` 时 `[execution.remote]` 必填 |
+| `ipc` | 全平台（缺省） | `flow-executor` 子进程（unix socketpair + argv 传通道 FD；其余 TCP loopback 回连） | 执行器缺失/协议版本不符直接失败，不静默回退 |
+| `remote` | 全平台 | 经 `flow-agent` 中继的远端执行器 | 单条 mTLS（v3 单流）；`mode=remote` 时 `[execution.remote]` 必填 |
 | `in_process` | 已删除 | — | 全平台配置即报错；历史模式（T7 删 unix 路径，loopback 传输落地后删 Windows 过渡态） |
 
 执行模式在**配置期与装配期双重把关**：`flow-config` 的 validate 在任何
@@ -857,7 +858,7 @@ database_url` 与整个 `[pg]` 段已删除（deny_unknown_fields：存量旧键
   删除）；env 覆盖按分区手写合并（显式可 grep），生效名单记录在
   `Loaded.env_overrides` 供设置页展示「这些项重启后仍会被 env 覆盖」；
 - **明确不收敛**：`RUST_LOG`、`FLOW_SECRET_*`（见下）、journal token（每工作区
-  凭据）、执行协议冻结常量（contract.rs，改即协议变更）、executor FD 槽位、
+  凭据）、执行协议冻结常量（contract.rs，改即协议变更）、执行器通道 FD 引导、
   `FLOW_RUN_LOG_BUDGET` 等 engine 内部预算（读取点在 driver 深处，维持 env）；
 - **config.get / config.update**：工作副本是**文件级**视图（默认值+文件，env
   不进副本）——文件才是用户可编辑的真相；update 深合并（分区级替换）→

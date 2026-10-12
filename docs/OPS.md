@@ -53,7 +53,7 @@ graph TB
   subgraph remote 模式追加
     A["flow-agent<br/>（每台执行机一个）"]
     E2["flow-executor"]
-    S <-->|"双 TLS<br/>control + data"| A
+    S <-->|"单条 mTLS<br/>（v3 单流）"| A
     A -->|本机池| E2
   end
 
@@ -181,10 +181,11 @@ TCP loopback 回连传输落地后一并删除。任何平台配置该模式都�
 模板 / script / condition / HTTP 全部在 `flow-executor` 子进程内执行；journal 语义
 不变，master 只做裁决与调度。桌面端在无配置文件时默认 `x_max = 8`。
 
-物理承载按平台自动选择，部署形态与运维面完全一致：unix 用 socketpair +
-`pre_exec` FD 槽位；Windows 及其余平台用 **TCP loopback 回连**——主进程
-bind `127.0.0.1` 临时端口，执行器按 `FLOW_EXECUTOR_CONNECT_ADDR` 回连出
-control/data 双通道（`flow_engine::execution_protocol::loopback`）。回连端口
+物理承载按平台自动选择，部署形态与运维面完全一致：unix 用 socketpair，通道 FD
+原号经 argv `--channel-fd` 传递（`pre_exec` 只关闭其余继承 FD，不做 dup2 落位）；
+Windows 及其余平台用 **TCP loopback 回连**——主进程
+bind `127.0.0.1` 临时端口，执行器按 `FLOW_EXECUTOR_CONNECT_ADDR` 回连出单条
+连接（v3 单流，`flow_engine::execution_protocol::loopback`）。回连端口
 只在本机可见，与单用户本机工具的信任域一致；执行器 spawn 仍走
 `env_clear`（仅回填 `RUST_LOG` 与回连地址）。
 
@@ -214,7 +215,6 @@ x_max = 4
 
 [execution.remote]
 control_addr = "10.0.0.8:9700"
-data_addr    = "10.0.0.8:9701"
 ca_cert   = "/etc/flow/ca.pem"
 cert      = "/etc/flow/server.pem"
 key       = "/etc/flow/server.key"
@@ -224,7 +224,7 @@ attach_timeout_ms = 120000    # 断链后等 agent 重连对账的总时限
 每台执行机侧（`flow-agent` + `flow-executor` 同目录）：
 
 ```sh
-flow-agent --control-addr 10.0.0.8:9700 --data-addr 10.0.0.8:9701 \
+flow-agent --control-addr 10.0.0.8:9700 \
   --agent-id agent-a --ca-cert ca.pem --cert agent-a.pem \
   --key agent-a.key --slots 4
 ```
@@ -234,7 +234,6 @@ flow-agent --control-addr 10.0.0.8:9700 --data-addr 10.0.0.8:9701 \
 ```toml
 [agent]
 control_addr = "10.0.0.8:9700"
-data_addr    = "10.0.0.8:9701"
 agent_id     = "agent-a"
 ca_cert = "/etc/flow/ca.pem"
 cert    = "/etc/flow/agent-a.pem"
@@ -247,10 +246,10 @@ slots   = 4
 
 - PKI：内部 CA 签发 server 证书与每台 agent 证书。**证书 CN 即 agent_id**：主进程
   从 TLS 客户端证书取 CN，不信 agent 自报字段。
-- 双连接：control（握手 / 管理帧 / Resume / Drain）+ data（业务帧）。AgentWelcome
-  下发一次性 `data_credential`，DataBind 校验同 TLS 主体 + `agent_boot_id` +
-  `link_session_id`；凭据一次性，连接替换后旧绑定作废。
-- 协议版本：`PROTOCOL_VERSION = 1`，帧信封 `v` 不符即拒。agent 必报能力
+- 单连接（v3 单流）：control（握手 / 管理帧 / Resume / Drain）与 data（业务帧）
+  复用同一条 mTLS 连接，帧内 1 字节通道标签区分；不再有独立 data 端口、
+  `DataBind` 握手或一次性 `data_credential`（相关字段为存量兼容保留并被忽略）。
+- 协议版本：`PROTOCOL_VERSION = 3`，帧信封 `v` 不符即拒。agent 必报能力
   `relay` / `resource_report` / `reconnect`；缺一即拒。
 - 凭证：业务密钥以最小引用经 OperationPermit 按任务下发（主进程解析，**不复制主
   进程环境到 agent**；凭证值不进入授权事实，不进 journal）。
@@ -263,7 +262,7 @@ slots   = 4
             │  flow-journal-server（mode=remote）   │
             │  data_dir/journal ← 唯一权威  │
             └───────────┬──────────────────┘
-                        │ control :9700 + data :9701（mTLS）
+                        │ control :9700（mTLS，v3 单流）
         ┌───────────────┼───────────────┐
         ▼               ▼               ▼
   ┌──────────┐    ┌──────────┐    ┌──────────┐
@@ -281,7 +280,7 @@ slots   = 4
 | 机器 | 进程 | 数据 | 网络 |
 | --- | --- | --- | --- |
 | 主进程 1 台 | `flow-journal-server` | **持有 `data_dir`（journal 权威）** | 出站到各 agent；入站 RPC 9802 / webhook 9803 |
-| 每台执行机 | `flow-agent` + `flow-executor`（同目录） | 无持久数据 | 出站到主进程 9700/9701 |
+| 每台执行机 | `flow-agent` + `flow-executor`（同目录） | 无持久数据 | 出站到主进程 9700 |
 
 要点：
 
@@ -336,7 +335,7 @@ journal 后端提供有界流式下载：`GET /runs/<run_id>/values/<output_id>`
 - journal token：仅环境变量 `FLOW_JOURNAL_TOKEN`（≥32 字节），**不进配置文件**。
 - `FLOW_SECRET_*`：进程级 env 兜底来源。
 - 不在配置文件里的东西：`RUST_LOG`、`FLOW_SECRET_*`、`FLOW_JOURNAL_TOKEN`、
-  执行协议冻结常量（`contract.rs`）、executor FD 槽位、`FLOW_RUN_LOG_BUDGET` 等
+  执行协议冻结常量（`contract.rs`）、执行器通道 FD 引导、`FLOW_RUN_LOG_BUDGET` 等
   engine 内部预算。
 
 ### 3.5 V2 产品服务与客户端契约
@@ -495,7 +494,7 @@ lsof -nP -iTCP:9802 -sTCP:LISTEN      # 应无输出
 
 ### 6.1 二进制与协议
 
-- 执行协议 `PROTOCOL_VERSION = 1`：版本不兼容在握手处明确失败（executor 缺能力 /
+- 执行协议 `PROTOCOL_VERSION = 3`：版本不兼容在握手处明确失败（executor 缺能力 /
   帧 `v` 不符），不降级执行。
 - journal 兼容：**只增不删**。新写入只能由能读新 journal 的兼容二进制回退；
   **不能重新启用旧 SQLite 数据库覆盖新事实**。

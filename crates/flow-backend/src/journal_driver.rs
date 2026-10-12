@@ -69,7 +69,7 @@ fn invalid(s: impl Into<String>) -> flow_journal::Error {
 impl JournalBackend {
     /// 二期 IPC 模式：先持久提交新 master_epoch，再创建进程池与派发器
     /// （取得独占写权后持久提交新任期，再派发任务；二期 §3.2）。
-    /// 全平台：unix 走 socketpair + pre_exec FD 槽位，其余平台走 loopback
+    /// 全平台：unix 走 socketpair + argv 传通道 FD，其余平台走 loopback
     /// 回连（承载差异在 pool 内部收口）。
     pub async fn start_execution_ipc(self: &Arc<Self>, mode: ExecutionMode) -> Result<()> {
         // ExecutionMode 只有 Ipc 一个变体（进程内路径已全平台删除）。

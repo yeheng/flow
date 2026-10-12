@@ -1,11 +1,11 @@
 //! flow-agent：受信任的远程执行中继（bin: flow-agent）。
 //!
-//! 双 TLS 上联（control + data，mTLS，CN 映射 agent_id）+ 本机执行器池。
+//! 单条 mTLS 上联（v3 单流，帧内通道标签，CN 映射 agent_id）+ 本机执行器池。
 //! 参数解析：CLI flag > env（clap env 属性已合并）> 配置文件 [agent] > 报错。
 //! executor 缺省定位：同目录兄弟 `flow-executor`（ExecutorInvocation::locate），
 //! FLOW_EXECUTOR_BIN / [agent].executor_bin / [execution].executor_bin 可覆盖。
 //!
-//! 运行：cargo run -p flow-agent -- --control-addr ... --data-addr ...
+//! 运行：cargo run -p flow-agent -- --control-addr ...
 
 use std::path::PathBuf;
 
@@ -13,14 +13,14 @@ use clap::Parser;
 use flow_config::Config;
 use flow_engine::execution_protocol::contract::ExecutorInvocation;
 
-/// flow-agent：受信任的远程执行中继（双 TLS 上联 + 本机执行器池）。
+/// flow-agent：受信任的远程执行中继（单条 mTLS 上联 + 本机执行器池）。
 #[derive(Parser)]
 #[command(
     name = "flow-agent",
     version,
     about = "flow 受信任远程执行中继",
     long_about = "flow 受信任远程执行中继。\n\n\
-                  双 TLS 上联主进程（control + data，mTLS，证书 CN 须与 agent_id 一致），\
+                  单条 mTLS 上联主进程（v3 单流，证书 CN 须与 agent_id 一致），\
                   本机维护执行器子进程池。参数缺省回落配置文件 [agent] 分区\
                   （flag > env > 配置文件 > 报错）。",
     arg_required_else_help = true
@@ -29,10 +29,10 @@ struct Agent {
     /// 统一配置文件路径（缺省：FLOW_CONFIG → ./flow.toml → 平台配置目录）。
     #[arg(long, global = true, env = "FLOW_CONFIG")]
     config: Option<PathBuf>,
-    /// 主进程 control TLS 地址。
+    /// 主进程 control TLS 地址（v3 起这是唯一的上联地址）。
     #[arg(long, env = "FLOW_AGENT_CONTROL_ADDR")]
     control_addr: Option<String>,
-    /// 主进程 data TLS 地址。
+    /// 已废弃：v3 起上联收敛为单条 TLS 连接，本参数被忽略（兼容保留）。
     #[arg(long, env = "FLOW_AGENT_DATA_ADDR")]
     data_addr: Option<String>,
     /// agent 身份（须与客户端证书 CN 一致）。
