@@ -2,6 +2,22 @@ use crate::service::{Host, Service};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
+/// 测试前置：默认执行模式已切 ipc（unix），测试二进制位于 deps/ 目录，
+/// locate() 找不到同目录兄弟 flow-executor——注入主工作区构建产物。
+/// 编译期拼接路径（env!("CARGO_MANIFEST_DIR") 向上两级 = 主工作区根）。
+fn ensure_executor_bin() {
+    if std::env::var_os("FLOW_EXECUTOR_BIN").is_some() {
+        return;
+    }
+    let candidate = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|root| root.join("target/release/flow-executor"));
+    if let Some(path) = candidate.filter(|p| p.is_file()) {
+        std::env::set_var("FLOW_EXECUTOR_BIN", path);
+    }
+}
+
 async fn call(host: &Arc<Host>, service: Service, method: &str, params: Value) -> Value {
     let services = host.services.clone();
     let method = method.to_string();
@@ -16,6 +32,7 @@ fn definition() -> Value {
 
 #[tokio::test]
 async fn embedded_flow_runs_streams_and_persists_without_a_rpc_listener() {
+    ensure_executor_bin();
     let root = tempfile::tempdir().unwrap();
     let host = Host::start(root.path().to_path_buf()).unwrap();
     let error = call(&host, Service::Flow, "missing.method", json!({})).await;
@@ -96,6 +113,7 @@ async fn embedded_flow_runs_streams_and_persists_without_a_rpc_listener() {
 
 #[tokio::test]
 async fn journal_uses_separate_authority_and_native_token() {
+    ensure_executor_bin();
     let root = tempfile::tempdir().unwrap();
     let host = Host::start(root.path().to_path_buf()).unwrap();
     let reply = call(&host, Service::Journal, "workflow.create", json!({"name":"journal desktop", "request_id":"create-once", "_token":"wrong-browser-token"})).await;
@@ -136,6 +154,7 @@ async fn journal_uses_separate_authority_and_native_token() {
 
 #[tokio::test]
 async fn sessions_cancel_on_close_reload_and_reject_late_subscriptions() {
+    ensure_executor_bin();
     let root = tempfile::tempdir().unwrap();
     let host = Host::start(root.path().to_path_buf()).unwrap();
     let session = host.sessions.open("main".into());

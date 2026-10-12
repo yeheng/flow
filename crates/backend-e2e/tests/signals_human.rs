@@ -19,8 +19,10 @@ e2e_test!(
         let (workflow_id, _) = publish_workflow(&client, "审批", human_def()).await;
         let run_id = start_run(&client, &workflow_id, json!({ "amount": 99 })).await;
 
-        // 等待中：run 非终态、节点 running、活着的
-        let timeline = wait_node_running(&client, &run_id, "h").await;
+        // 等待中：run 非终态、节点 running、活着的。ipc 默认下
+        // dispatching 与 waiting 同显 running：signal 前置是 wait 已登记，
+        // 等 wait 结构非空再发。
+        let timeline = wait_node_waiting(&client, &run_id, "h").await;
         assert_eq!(timeline_node(&timeline, "h")["state"], json!("running"));
         let live = call_json(&client, "run.get.view", json!({"run_id": run_id})).await;
         assert_eq!(live["live"], json!(true));
@@ -130,7 +132,7 @@ e2e_test!(
         let client = ctx.client().await;
         let (workflow_id, _) = publish_workflow(&client, "取消", human_def()).await;
         let run_id = start_run(&client, &workflow_id, json!({})).await;
-        wait_node_running(&client, &run_id, "h").await;
+        wait_node_waiting(&client, &run_id, "h").await;
 
         let ack: Value = call_json(&client, "run.cancel", json!({"run_id": run_id})).await;
         assert_eq!(ack["delivered"], json!(true), "{ack}");
@@ -173,7 +175,7 @@ e2e_test!(cancel_aborts_inflight_delay, |ctx: &mut Ctx| Box::pin(
         let client = ctx.client().await;
         let (workflow_id, _) = publish_workflow(&client, "长等待", delay_def(30_000)).await;
         let run_id = start_run(&client, &workflow_id, json!({})).await;
-        let timeline = wait_node_running(&client, &run_id, "d").await;
+        let timeline = wait_node_waiting(&client, &run_id, "d").await;
         assert_eq!(timeline_node(&timeline, "d")["state"], json!("running"));
 
         let started = std::time::Instant::now();
@@ -202,6 +204,24 @@ async fn wait_node_running(client: &Conn, run_id: &str, node_id: &str) -> Value 
         assert!(
             std::time::Instant::now() < deadline,
             "节点 {node_id} 未进入 running：{timeline}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// 等节点等待登记（wait 结构非空）。signal 的前置是 wait 已提交；
+/// display 态 running 同时覆盖 dispatching 与 waiting，不可区分。
+async fn wait_node_waiting(client: &Conn, run_id: &str, node_id: &str) -> Value {
+    let deadline = std::time::Instant::now() + SHORT;
+    loop {
+        let timeline: Value = call_json(client, "run.timeline", json!({"run_id": run_id})).await;
+        let node = timeline_node(&timeline, node_id);
+        if node["state"] == json!("running") && !node["wait"].is_null() {
+            return timeline;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "节点 {node_id} 未登记等待：{timeline}"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }

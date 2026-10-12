@@ -114,12 +114,14 @@ flow-executor（子进程，节点语义的唯一居所）
 
 **T2 剩余（4b 队列，本版不做）**：`Result Success.output` / `WaitRequest.output` 的 inline 输出通道化（≈63KiB 脚本输出仍有同类杀区），需重做 executor store_value-经审计分块与 resume/lost_data 语义，单独 PR（协议再升 v3）。
 
-### ⏳ T6 · 单机默认切 IPC（依赖 T2 收尾）
+### ✅ T6 · 单机默认切 IPC（完成）
 
-- flow-config 默认 `in_process` → `ipc`（仅 unix；Windows 保持 in_process 并文档标注过渡态）。
-- 桌面打包 flow-executor（Tauri externalBin 带 target triple；macOS 进 Contents/MacOS/ 满足 locate() 同目录契约；Windows 绿色版 zip 附 exe——注意 Windows 桌面本身还是 in_process，此项可随 A 方案再做）。
-- `x_max` 落 config（桌面默认建议 8）；spawn 增加 `env_clear`（executor 只需 argv + 显式回填两个 FD env）。
-- 验收：backend-e2e 全量在 ipc 默认下绿；backend-perf 前后对比留档；RSS 有界用例通过。
+- **flow-config 默认**：`ExecutionConfig::default` 平台条件——unix 上 `mode=ipc`，非 unix 过渡态 `in_process`；`FLOW_EXECUTION_MODE=""` 不再强制 in_process（视为未设置，继承平台默认）；示例配置与 EXECUTION_MODE_ENV 契约注释同步。
+- **环境隔离**：`spawn_executor_process` 增加 `env_clear()`（凭据/路径/代理不泄漏），仅回填 `RUST_LOG`（可观测性）；FD 走 pre_exec 槽位不经 env。x_max 已在 config（u32）；**桌面默认 8** 落在 service.rs 无配置文件分支（交互负载 + executor ≈11MiB/进程）。
+- **e2e 基建**：e2e server spawn 注入 `FLOW_EXECUTOR_BIN`（workspace_bin 定位，尊重显式覆盖）；subscriptions/signals_human 的 signal 前置从「等 display 态 running」改为「等 wait 登记」（timeline 暴露 wait 结构；display running 同时覆盖 dispatching 与 waiting 不可区分，ipc 往返延迟暴露了旧时序假设）。
+- **桌面打包**：tauri.conf.json `externalBin: ["bin/flow-executor"]`；release.yml 在 tauri build 前构建 executor 拷至 `bin/flow-executor-<triple>`（macOS 进 Contents/MacOS/ 满足 locate() 同目录契约）；**Windows 占位文件**过渡（B 方案 in_process 不调用，随 A 方案命名管道换真实产物）；`scripts/build-desktop-executor.sh` 本地开发前置；桌面测试注入 FLOW_EXECUTOR_BIN。
+- **backend-perf 修复（main 预存 bug）**：collect_arrivals 读旧信封格式（顶层 `run_id/type`），订阅协议事件体包在 `envelope["event"]` 层后 perf 未跟上——0 事件断言炸；对齐后恢复可用。
+- **验收**：backend-e2e 全量 **59/59 在 ipc 默认下绿**；桌面测试 3/3（ipc 默认下跑通）；journal_ipc 12/12（单线程/并行）；remote_ops/tls 各 3/3；flow-config 7/7；RSS 有界用例（release）：master 22MiB / executor peak 11MiB、无孤儿进程；perf 对比留档（debug/200 runs）：chain 3.18 vs 3.21 runs/s、fanout 2.57 vs 2.64 runs/s，**ipc 与 in_process 差 ±3% 内**（往返开销被 journal 写延迟掩盖）。
 
 ### ⏳ T7 · 删除进程内执行路径（T6 后沉淀一个版本周期）
 

@@ -15,7 +15,7 @@ FLOW_EXECUTION_MODE=ipc cargo run -p flow-backend --bin flow-journal-dev -- --da
 FLOW_EXECUTION_MODE=ipc cargo run -p flow-rpc --bin flow-journal-server
 ```
 
-- 默认 `in_process`（一期行为）；`ipc` 模式二进制缺失/版本不兼容直接失败，不静默回退。
+- 默认（T6）：unix 上 `ipc`（执行层终态）；非 unix 过渡态 `in_process`（Windows 命名管道 transport 另行交付）。`ipc` 模式二进制缺失/版本不兼容直接失败，不静默回退；`FLOW_EXECUTION_MODE` 显式覆盖。执行器环境隔离：spawn 后 `env_clear`，仅回填 `RUST_LOG`。
 - **本机 release 构建**：若遇 `dlopen ... mis-aligned LINKEDIT string pool`（Xcode 21 ld 对部分
   proc-macro dylib 产生未对齐符号表，机器级 bug），用
   `scripts/release.sh cargo <command>` 包装（改用 rustc 自带 rust-lld + 26.5

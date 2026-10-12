@@ -212,6 +212,15 @@ impl ServerProc {
         } else {
             cmd.stdout(Stdio::null()).stderr(Stdio::inherit());
         }
+        // T6：默认执行模式已切 ipc。被测 server 的二进制位于 deps/ 目录，
+        // locate() 找不到同目录兄弟 flow-executor——注入工作区构建产物路径
+        // （workspace_bin 逻辑：优先同 profile 目录，回退 target/debug）。
+        // 显式 extra_env 的 FLOW_EXECUTOR_BIN 优先，不覆盖。
+        if !extra_env.iter().any(|(key, _)| *key == "FLOW_EXECUTOR_BIN")
+            && std::env::var_os("FLOW_EXECUTOR_BIN").is_none()
+        {
+            cmd.env("FLOW_EXECUTOR_BIN", flow_test_support::io::executor_bin());
+        }
         for (key, value) in extra_env {
             cmd.env(key, value);
         }

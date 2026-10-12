@@ -9,3 +9,4 @@ web/src-tauri/gen/
 !crates/*/src/bin/*.rs
 docs/refactor-evidence/
 /dist/
+web/src-tauri/bin/

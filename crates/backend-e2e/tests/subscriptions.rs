@@ -40,8 +40,11 @@ e2e_test!(
         let (workflow_id, _) = publish_workflow(&client, "回放", human_def()).await;
         let run_id = start_run(&client, &workflow_id, json!({})).await;
 
-        // 等 human_task 进入等待（日志已有若干事件但 run 未终结）
-        let timeline = wait_node_running(&client, &run_id, "h", SHORT).await;
+        // 等 human_task 进入等待（日志已有若干事件但 run 未终结）。
+        // ipc 默认下 running→waiting 有执行器往返延迟：signal 的前置是
+        // wait 已登记（timeline 节点暴露 wait 结构），仅等 display 态
+        // running（dispatching 与 waiting 同显 running）会撞竞态。
+        let timeline = wait_node_waiting(&client, &run_id, "h", SHORT).await;
         let replayed_until = timeline["last_seq"].as_u64().unwrap();
         assert!(replayed_until >= 2, "{timeline}");
 
@@ -197,6 +200,29 @@ async fn wait_node_running(
         assert!(
             std::time::Instant::now() < deadline,
             "等待节点 {node_id} 到 running 超时：{timeline}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// 等节点等待登记（wait 结构非空）。signal/取消的前置是 wait 已提交；
+/// display 态 running 同时覆盖 dispatching 与 waiting，不可区分。
+async fn wait_node_waiting(
+    client: &backend_e2e::common::Conn,
+    run_id: &str,
+    node_id: &str,
+    timeout: Duration,
+) -> Value {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let timeline: Value = call_json(client, "run.timeline", json!({"run_id": run_id})).await;
+        let node = timeline_node(&timeline, node_id);
+        if node["state"] == json!("running") && !node["wait"].is_null() {
+            return timeline;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "等待节点 {node_id} 登记等待超时：{timeline}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

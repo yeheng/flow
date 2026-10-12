@@ -141,7 +141,8 @@ pub const EXECUTOR_CONTROL_FD_SLOT: i32 = 100;
 pub const EXECUTOR_DATA_FD_SLOT: i32 = 101;
 /// 显式指定执行器二进制路径的环境变量（优先级最高，I09）。
 pub const EXECUTOR_BIN_ENV: &str = "FLOW_EXECUTOR_BIN";
-/// 执行模式环境变量：`in_process`（默认，一期行为）或 `ipc`（二期）。
+/// 执行模式环境变量：unix 默认 ipc（T6 终态，非 unix 过渡态默认
+/// in_process）；显式值 `in_process` | `ipc` 覆盖平台默认。
 pub const EXECUTION_MODE_ENV: &str = "FLOW_EXECUTION_MODE";
 
 /// 执行器在 Hello 中声明的能力目录。缺失必需能力的主进程必须明确拒绝，

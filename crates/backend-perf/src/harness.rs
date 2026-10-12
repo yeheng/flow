@@ -354,14 +354,16 @@ pub async fn collect_arrivals(
         };
         match received {
             Ok(Some(Ok(envelope))) => {
-                let Some(run_id) = envelope["run_id"].as_str() else {
+                // 订阅信封：事件体在 envelope["event"] 层（与 e2e 的
+                // collect_run_events 同构；顶层是回执/控制面字段）。
+                let Some(run_id) = envelope["event"]["run_id"].as_str() else {
                     continue;
                 };
                 let run_id = run_id.to_string();
                 let arrived = Instant::now();
                 arrivals.events += 1;
                 arrivals.first.entry(run_id.clone()).or_insert(arrived);
-                match envelope["type"].as_str() {
+                match envelope["event"]["kind"].as_str() {
                     Some("run_completed") => {
                         arrivals.terminal.insert(run_id, arrived);
                         arrivals.completed += 1;

@@ -149,6 +149,11 @@ pub struct ExecutionConfig {
 impl Default for ExecutionConfig {
     fn default() -> Self {
         ExecutionConfig {
+            // T6：unix 上默认 ipc（socketpair 执行层终态）；非 unix 保持
+            // in_process（Windows 过渡态，命名管道 transport 另行交付）。
+            #[cfg(unix)]
+            mode: ExecutionModeKind::Ipc,
+            #[cfg(not(unix))]
             mode: ExecutionModeKind::InProcess,
             executor_bin: None,
             x_max: 4,
@@ -536,7 +541,9 @@ fn apply_env(config: &mut Config) -> Result<Vec<String>, String> {
     // ---- [execution] ----
     if let Some(v) = env_str("FLOW_EXECUTION_MODE") {
         match v.as_str() {
-            "" | "in_process" => config.execution.mode = ExecutionModeKind::InProcess,
+            // 空值视为未设置（不覆盖平台默认）；显式值覆盖。
+            "" => {}
+            "in_process" => config.execution.mode = ExecutionModeKind::InProcess,
             "ipc" => config.execution.mode = ExecutionModeKind::Ipc,
             "remote" => config.execution.mode = ExecutionModeKind::Remote,
             _ => {}
@@ -706,6 +713,10 @@ mod tests {
         config.validate().expect("默认值必须合法");
         assert_eq!(config.storage.backend, StorageBackend::Journal);
         assert_eq!(config.storage.data_dir, "data");
+        // T6：unix 默认 ipc（执行层终态）；非 unix 过渡态保持 in_process。
+        #[cfg(unix)]
+        assert_eq!(config.execution.mode, ExecutionModeKind::Ipc);
+        #[cfg(not(unix))]
         assert_eq!(config.execution.mode, ExecutionModeKind::InProcess);
         assert_eq!(config.execution.x_max, 4);
         assert!(config.server.scheduler_enabled);

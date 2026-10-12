@@ -30,6 +30,13 @@ pub fn spawn_executor_process(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::inherit())
         .kill_on_drop(true);
+    // 环境隔离（T6）：执行器只需要 argv 与 pre_exec 落位的 FD 槽位，
+    // 不继承主进程环境（凭据/路径/代理等一概不泄漏）；仅回填诊断日志
+    // 级别，保持可观测性。
+    command.env_clear();
+    if let Some(log) = std::env::var_os("RUST_LOG") {
+        command.env("RUST_LOG", log);
+    }
     // pre_exec 只做允许的低层 FD 操作：fcntl/dup2/close/getrlimit。禁止
     // 分配内存、加锁或调用普通异步代码（二期 §3.1）。
     unsafe {

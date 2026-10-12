@@ -46,7 +46,12 @@ impl Services {
         let loaded =
             flow_config::Config::load_or_default(&config_path).map_err(|e| e.to_string())?;
         let mut config = loaded.config;
-        if !has_config_file { config.storage.data_dir = "flow".into(); }
+        if !has_config_file {
+            config.storage.data_dir = "flow".into();
+            // 桌面默认执行槽位（T6）：交互负载为主，8 并发节点够用且
+            // 内存可控（executor 常驻 ≈11 MiB/进程）。
+            config.execution.x_max = 8;
+        }
         // 密钥与历史 v1 数据仍住在原 data 目录（密钥是用户资产，不随权威
         // 切换搬家；v1 数据按「历史舍弃」原则保留只读）。工作流/run 的
         // 权威是 root/journal（v2 唯一权威，主服务与 /journal 工作区同源）。
