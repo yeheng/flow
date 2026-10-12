@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { nextTick, ref, watch } from "vue";
 import { modalState, settleModal } from "../state/modal";
+import AppButton from "./AppButton.vue";
 
 const text = ref("");
 const inputEl = ref<HTMLInputElement | null>(null);
-const okEl = ref<HTMLButtonElement | null>(null);
+const okEl = ref<InstanceType<typeof AppButton> | null>(null);
 
 watch(
   () => modalState.current,
@@ -48,14 +49,14 @@ function onKeydown(e: KeyboardEvent): void {
         @keyup.esc="cancel"
       />
       <div class="modal-actions">
-        <button @click="cancel">取消</button>
-        <button
+        <AppButton @click="cancel">取消</AppButton>
+        <AppButton
           ref="okEl"
-          :class="modalState.current.danger ? 'danger' : 'primary'"
+          :variant="modalState.current.danger ? 'danger' : 'primary'"
           @click="ok"
         >
           {{ modalState.current.confirmText ?? "确定" }}
-        </button>
+        </AppButton>
       </div>
     </div>
   </div>

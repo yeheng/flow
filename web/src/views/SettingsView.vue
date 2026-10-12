@@ -8,6 +8,7 @@ import { refreshSecrets } from "../state/editor";
 import { confirmDialog } from "../state/modal";
 import { toast } from "../state/toast";
 import type { ConfigView, FlowConfig, SecretInfo } from "../types";
+import AppButton from "../components/AppButton.vue";
 
 /**
  * 设置页：统一配置（config.get/update，重启生效）+ 密钥管理（secrets.*）。
@@ -261,10 +262,12 @@ async function onDeleteSecret(name: string): Promise<void> {
       <span v-if="configPath" class="config-path" :title="configPath">{{ configPath }}</span>
       <span v-else class="config-path none">未使用配置文件（当前为默认值 + 环境变量）</span>
       <span class="spacer" />
-      <button v-if="dirty" class="btn ghost" :disabled="saving" @click="onReset">放弃修改</button>
-      <button class="btn primary" :disabled="saving || !dirty || loading" @click="onSave">
+      <AppButton v-if="dirty" variant="ghost" :disabled="saving" @click="onReset"
+        >放弃修改</AppButton
+      >
+      <AppButton variant="primary" :disabled="saving || !dirty || loading" @click="onSave">
         {{ saving ? "保存中…" : "保存（重启后生效）" }}
-      </button>
+      </AppButton>
     </div>
 
     <section v-if="!isDesktop()" class="card">
@@ -283,7 +286,7 @@ async function onDeleteSecret(name: string): Promise<void> {
         />
         <div class="help">填写 FLOW_JOURNAL_TOKEN，保存在当前浏览器。</div>
       </div>
-      <button class="btn" @click="saveConnection">保存并连接</button>
+      <AppButton @click="saveConnection">保存并连接</AppButton>
     </section>
 
     <div v-if="envOverrides.length" class="env-banner">
@@ -294,7 +297,7 @@ async function onDeleteSecret(name: string): Promise<void> {
     <div v-if="loading" class="empty">加载中…</div>
     <div v-else-if="loadError" class="empty">
       加载配置失败：{{ loadError }}
-      <button class="btn" @click="onRetryLoad">重试</button>
+      <AppButton @click="onRetryLoad">重试</AppButton>
     </div>
     <template v-else>
       <section v-for="s in visibleSections" :key="s.sect" class="card">
@@ -350,13 +353,13 @@ async function onDeleteSecret(name: string): Promise<void> {
               </span>
             </td>
             <td class="row-actions">
-              <button
+              <AppButton
                 v-if="s.source === 'stored'"
-                class="btn danger"
+                variant="link-danger"
                 @click="onDeleteSecret(s.name)"
               >
                 删除
-              </button>
+              </AppButton>
             </td>
           </tr>
         </tbody>
@@ -370,7 +373,9 @@ async function onDeleteSecret(name: string): Promise<void> {
           autocomplete="new-password"
           spellcheck="false"
         />
-        <button class="btn primary" :disabled="addingSecret" @click="onAddSecret">添加密钥</button>
+        <AppButton variant="primary" :disabled="addingSecret" @click="onAddSecret"
+          >添加密钥</AppButton
+        >
       </div>
       <p class="help">
         执行时优先使用这里的密钥，其次回落环境变量 FLOW_SECRET_&lt;名称&gt;。 workflow.update
@@ -575,33 +580,5 @@ async function onDeleteSecret(name: string): Promise<void> {
   color: var(--text3);
   font-size: 12px;
   padding: 8px 0;
-}
-
-.btn {
-  border: 1px solid var(--border);
-  background: var(--surface2);
-  color: var(--text);
-  border-radius: 7px;
-  padding: 6px 12px;
-  font-size: 12px;
-  cursor: pointer;
-}
-
-.btn.primary {
-  background: var(--accent);
-  border-color: var(--accent);
-}
-
-.btn.primary:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.btn.ghost {
-  background: transparent;
-}
-
-.btn.danger {
-  color: var(--danger);
 }
 </style>

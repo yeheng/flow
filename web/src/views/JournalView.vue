@@ -11,7 +11,10 @@ import { isDesktop } from "../platform";
 import CodeEditor from "../components/CodeEditor.vue";
 import JsonNode from "../components/JsonNode.vue";
 import JournalLogList from "../components/JournalLogList.vue";
+import ResizeHandle from "../components/ResizeHandle.vue";
+import AppButton from "../components/AppButton.vue";
 import { runBadgeClass, runStatusLabel } from "../state/labels";
+import { usePanelResize } from "../state/panel-resize";
 import { confirmDialog } from "../state/modal";
 import { toast } from "../state/toast";
 
@@ -52,6 +55,17 @@ function jsonError(text: string): string {
 }
 const definitionError = computed(() => jsonError(definition.value));
 const inputError = computed(() => jsonError(input.value));
+
+// 左栏（表单区）：拖右边缘改宽度；经 CSS 变量传给 grid,1100px 以下的单列媒体查询不受影响
+const sideEl = ref<HTMLElement | null>(null);
+const sideResize = usePanelResize({
+  target: sideEl,
+  storageKey: "flow.journal-side-w",
+  fallback: 360,
+  min: 280,
+  max: () => Math.min(640, (sideEl.value?.parentElement?.clientWidth ?? 1200) * 0.5),
+  measure: (rect, e) => e.clientX - rect.left,
+});
 function formatJsonText(text: string): string {
   try {
     return JSON.stringify(JSON.parse(text), null, 2);
@@ -210,7 +224,11 @@ async function cancel() {
   if (!(await confirmDialog(`确定取消 run ${run.value.run_id.slice(0, 8)}…？`, { danger: true })))
     return;
   receipt(
-    await api.value.command("run.cancel", { run_id: run.value.run_id }, `run.cancel:${run.value.run_id}`),
+    await api.value.command(
+      "run.cancel",
+      { run_id: run.value.run_id },
+      `run.cancel:${run.value.run_id}`,
+    ),
   );
   await refreshRun();
 }
@@ -254,15 +272,24 @@ onBeforeUnmount(() => {
           <input v-model="token" type="password" autocomplete="off" required />
         </div>
       </template>
-      <button type="submit" class="primary" :disabled="busy">
+      <AppButton type="submit" variant="primary" :disabled="busy">
         {{ desktop ? "打开本地工作区" : "连接" }}
-      </button>
+      </AppButton>
     </form>
 
     <p v-if="message" role="status" class="journal-status">{{ message }}</p>
 
-    <div v-if="api" class="journal-grid">
-      <div class="journal-side">
+    <div
+      v-if="api"
+      class="journal-grid"
+      :style="{ '--journal-side-w': sideResize.size.value + 'px' }"
+    >
+      <div ref="sideEl" class="journal-side">
+        <ResizeHandle
+          orientation="vertical"
+          class="edge-right"
+          @dragstart="sideResize.onDragStart"
+        />
         <section class="panel">
           <h3>工作流</h3>
           <div class="field">
@@ -276,7 +303,7 @@ onBeforeUnmount(() => {
           </div>
           <div class="field journal-new">
             <input v-model="name" placeholder="新工作流名称" />
-            <button type="button" :disabled="busy || !name" @click="act(create)">新建</button>
+            <AppButton type="button" :disabled="busy || !name" @click="act(create)">新建</AppButton>
           </div>
           <div class="field">
             <label>定义 JSON</label>
@@ -291,14 +318,14 @@ onBeforeUnmount(() => {
               格式化
             </button>
           </div>
-          <button
+          <AppButton
             type="button"
-            class="primary"
+            variant="primary"
             :disabled="busy || !workflow || !!definitionError"
             @click="act(save)"
           >
             保存并发布新版本
-          </button>
+          </AppButton>
           <div class="field">
             <label>运行输入 JSON</label>
             <CodeEditor v-model="input" language="json" height="110px" />
@@ -312,20 +339,20 @@ onBeforeUnmount(() => {
               格式化
             </button>
           </div>
-          <button
+          <AppButton
             type="button"
-            class="primary"
+            variant="primary"
             :disabled="busy || !workflow || !!inputError"
             @click="act(start)"
           >
             开始运行
-          </button>
+          </AppButton>
         </section>
 
         <section class="panel">
           <div class="panel-head">
             <h3>运行记录</h3>
-            <button type="button" :disabled="busy" @click="act(load)">刷新</button>
+            <AppButton type="button" :disabled="busy" @click="act(load)">刷新</AppButton>
           </div>
           <p class="muted journal-hint">每次最多展示 64 条。完整历史可通过分页接口读取。</p>
           <table v-if="runs.length" class="data-table">
@@ -347,9 +374,9 @@ onBeforeUnmount(() => {
                   </span>
                 </td>
                 <td>
-                  <button type="button" class="link" @click="act(() => watchRun(r.run_id))">
+                  <AppButton type="button" variant="link" @click="act(() => watchRun(r.run_id))">
                     监控
-                  </button>
+                  </AppButton>
                 </td>
               </tr>
             </tbody>
@@ -361,9 +388,9 @@ onBeforeUnmount(() => {
       <section v-if="run" class="panel journal-detail">
         <div class="panel-head">
           <h3>运行详情</h3>
-          <button type="button" class="danger" :disabled="busy" @click="act(cancel)">
+          <AppButton type="button" variant="danger" :disabled="busy" @click="act(cancel)">
             取消运行
-          </button>
+          </AppButton>
         </div>
         <div class="journal-runhead">
           <span class="mono copyable" :title="run.run_id" @click="copyRunId(run.run_id)">
@@ -380,14 +407,14 @@ onBeforeUnmount(() => {
         <template v-if="downloads.length">
           <h3>完整值下载</h3>
           <div class="journal-downloads">
-            <button
+            <AppButton
               v-for="id in downloads"
               :key="id"
               type="button"
               @click="act(() => api!.download(run!.run_id, id))"
             >
               下载 {{ id }}
-            </button>
+            </AppButton>
           </div>
         </template>
 
@@ -402,10 +429,10 @@ onBeforeUnmount(() => {
           <label class="journal-check">
             <input v-model="audit" type="checkbox" @change="page = undefined" /> 审计记录
           </label>
-          <button type="button" @click="act(() => nextPage(true))">读取新快照</button>
-          <button type="button" :disabled="!page?.next_cursor" @click="act(() => nextPage())">
+          <AppButton type="button" @click="act(() => nextPage(true))">读取新快照</AppButton>
+          <AppButton type="button" :disabled="!page?.next_cursor" @click="act(() => nextPage())">
             下一页
-          </button>
+          </AppButton>
         </div>
         <JournalLogList :items="page?.events ?? []" empty-text="尚未读取历史事件" />
 
@@ -466,7 +493,7 @@ onBeforeUnmount(() => {
 
 .journal-grid {
   display: grid;
-  grid-template-columns: 360px 1fr;
+  grid-template-columns: var(--journal-side-w, 360px) 1fr;
   gap: 16px;
   align-items: start;
 }
@@ -475,13 +502,23 @@ onBeforeUnmount(() => {
   .journal-grid {
     grid-template-columns: 1fr;
   }
+
+  .journal-grid .edge-right {
+    display: none;
+  }
 }
 
 .journal-side {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 16px;
   min-width: 0;
+}
+
+/* 手柄探入 16px 的列间距，扩大可抓区域 */
+.edge-right {
+  right: -8px;
 }
 
 .journal-new {

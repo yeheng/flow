@@ -8,6 +8,7 @@ import { confirmDialog } from "../state/modal";
 import { toast } from "../state/toast";
 import { diffDefinitions, isEmptyDiff, type DefinitionDiff } from "../state/diff";
 import type { Definition, VersionMeta } from "../types";
+import AppButton from "../components/AppButton.vue";
 
 const props = defineProps<{ workflowId: string }>();
 const router = useRouter();
@@ -187,10 +188,10 @@ async function copyChecksum(checksum: string): Promise<void> {
           </td>
           <td :title="v.created_at">{{ fmtTime(v.created_at) }}</td>
           <td class="actions">
-            <button class="link" @click="loadToEditor(v.version)">加载到编辑器</button>
-            <button class="link" :disabled="publishing" @click="publishFromVersion(v.version)">
+            <AppButton variant="link" @click="loadToEditor(v.version)">加载到编辑器</AppButton>
+            <AppButton variant="link" :disabled="publishing" @click="publishFromVersion(v.version)">
               以此版本发布
-            </button>
+            </AppButton>
           </td>
         </tr>
       </tbody>

@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 #[cfg(not(unix))]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 type Result<T> = std::result::Result<T, JournalError>;
 fn invalid(s: impl Into<String>) -> flow_journal::Error {
@@ -362,17 +362,25 @@ impl Attempt {
     /// 退出码非 0 → outcome 留存、节点判死；超时/等待失败 → outcome 未知，
     /// 进 uncertain 等人工裁决。
     #[cfg(not(unix))]
-    pub async fn harness(&self, prepared: &Prepared) -> Result<StoredValue> {
+    pub async fn harness(&self, prepared: &Prepared, logger: &NodeLogger) -> Result<StoredValue> {
         let mut budget = 8 * 1024 * 1024;
         let params = self.materialize(&prepared.params, &mut budget).await?;
         let (command, args, workdir, timeout_ms, prompt) =
             flow_engine::exec::harness_request(&params).map_err(|e| invalid(e.message))?;
         let request = json!({"command":command,"args":args,"workdir":workdir,"timeout_ms":timeout_ms,"prompt":prompt});
         self.authorize(prepared, request).await?;
+        // prompt 可能含敏感内容，不进日志；只记命令行与超时。
+        logger.info(format!(
+            "→ harness {} {}（timeout {timeout_ms}ms）",
+            command,
+            args.join(" ")
+        ));
+        let started = Instant::now();
         let mut child =
             match flow_engine::exec::harness_command(&command, &args, workdir.as_deref()).spawn() {
                 Ok(child) => child,
                 Err(error) => {
+                    logger.error(format!("harness 启动失败：{error}"));
                     // spawn 失败 = 进程从未启动，结果确定：记录 Outcome 后按业务失败
                     // 收口（有 outcome，恢复不会进 uncertain）
                     let outcome = StoredValue::inline(json!({"spawn_error": error.to_string()}))?;
@@ -408,12 +416,26 @@ impl Attempt {
                 // 超时：wait_with_output 被 drop，kill_on_drop 杀掉子进程；
                 // 进程死前可能已产生副作用 → outcome 未知
                 Err(_) => {
+                    logger.error(format!(
+                        "harness 超时（{}ms，进程已杀死）",
+                        started.elapsed().as_millis()
+                    ));
                     return Err(invalid(format!(
                         "external outcome uncertain: harness timed out after {timeout_ms}ms (process killed)"
                     ))
                     .into())
                 }
             };
+        let exit_code = output
+            .status
+            .code()
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "signal".into());
+        logger.info(format!(
+            "← exit {exit_code}（{}ms，stdout {}B）",
+            started.elapsed().as_millis(),
+            output.stdout.len()
+        ));
         let mut capture = Capture::new(self, ValueCodec::Bytes);
         for chunk in output.stdout.chunks(flow_journal::CHUNK_BYTES) {
             capture.push(chunk).await?;
@@ -474,11 +496,25 @@ impl Attempt {
     /// Request construction is derived from the committed prepared parameters. Authorization
     /// is durably recorded with intent before reqwest is called, and never reused after restart.
     #[cfg(not(unix))]
-    pub async fn http(&self, prepared: &Prepared, kind: NodeType) -> Result<StoredValue> {
+    pub async fn http(
+        &self,
+        prepared: &Prepared,
+        kind: NodeType,
+        logger: &NodeLogger,
+    ) -> Result<StoredValue> {
         let mut budget = 8 * 1024 * 1024;
         let mut params = self.materialize(&prepared.params, &mut budget).await?;
         let mut credential = None;
         if kind == NodeType::Email {
+            let recipients = match &params["to"] {
+                Value::Array(list) => list
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                other => other.as_str().unwrap_or("").to_owned(),
+            };
+            logger.info(format!("→ email to {recipients}"));
             let name = params["api_key"]
                 .as_str()
                 .filter(|s| !s.trim().is_empty())
@@ -538,10 +574,21 @@ impl Attempt {
         let outbound = request.build().map_err(|e| invalid(e.to_string()))?;
         let request = json!({"method":method,"url":url,"headers":params.get("headers").cloned().unwrap_or(json!({})),"body":params.get("body").cloned().unwrap_or(Value::Null),"proxy":params.get("proxy").cloned().unwrap_or(Value::Null),"credential":params.get("credential").cloned().unwrap_or(Value::Null)});
         self.authorize(prepared, request).await?;
-        let mut response = client
-            .execute(outbound)
-            .await
-            .map_err(|e| invalid(format!("external outcome uncertain: {e}")))?;
+        // 展示面用的 URL（日志行）：query 里的敏感参数值脱敏，发起请求用的
+        // 永远是原始 `url`。
+        let url_label = flow_engine::redact_url(url);
+        logger.info(format!("→ {method} {url_label}"));
+        let started = Instant::now();
+        let mut response = match client.execute(outbound).await {
+            Ok(response) => response,
+            Err(error) => {
+                logger.error(format!(
+                    "请求 {url_label} 失败（{}ms）：{error}",
+                    started.elapsed().as_millis()
+                ));
+                return Err(invalid(format!("external outcome uncertain: {error}")).into());
+            }
+        };
         let status = response.status().as_u16();
         let headers: serde_json::Map<String, Value> = response
             .headers()
@@ -559,6 +606,17 @@ impl Attempt {
             }
         }
         let raw = capture.finish().await?;
+        // 响应元信息一行：状态码、耗时、体量；非 2xx/3xx 升级 warn
+        let response_line = format!(
+            "← HTTP {status}（{}ms，body {}B）",
+            started.elapsed().as_millis(),
+            raw.total_bytes
+        );
+        if status >= 400 {
+            logger.warn(response_line);
+        } else {
+            logger.info(response_line);
+        }
         let outcome =
             StoredValue::inline(json!({"status":status,"headers":headers,"body_raw":raw}))?;
         self.audit(EventKind::OperationOutcome, json!({"outcome":outcome}))

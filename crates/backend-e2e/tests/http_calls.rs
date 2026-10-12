@@ -167,6 +167,39 @@ e2e_test!(
 );
 
 e2e_test!(
+    http_call_logs_request_and_response_lines,
+    |ctx: &mut Ctx| Box::pin(async move {
+        let stub = StubHttp::fixed(200, json!({ "ok": true })).await;
+        let client = ctx.client().await;
+        let (workflow_id, _) =
+            publish_workflow(&client, "日志", http_def("GET", &stub.url("/ping"))).await;
+        let run_id = start_run(&client, &workflow_id, json!({})).await;
+        let run = wait_run_terminal(&client, &run_id, TIMEOUT).await;
+        assert_eq!(run["run"]["status"], json!("succeeded"), "{run}");
+
+        // http_call 的执行叙事进观测日志流（engine）：请求行 + 响应行
+        let observations =
+            call_json(&client, "run.observations.page", json!({"run_id": run_id})).await;
+        let logs = observations["records"].as_array().unwrap();
+        let engine: Vec<&str> = logs
+            .iter()
+            .filter(|log| log["line"]["stream"] == json!("engine"))
+            .filter_map(|log| log["line"]["message"].as_str())
+            .collect();
+        assert!(
+            engine
+                .iter()
+                .any(|m| m.starts_with("→ GET ") && m.contains("/ping")),
+            "缺少请求行：{engine:?}"
+        );
+        assert!(
+            engine.iter().any(|m| m.starts_with("← HTTP 200")),
+            "缺少响应行：{engine:?}"
+        );
+    })
+);
+
+e2e_test!(
     http_call_invalid_method_rejected_at_save,
     |ctx: &mut Ctx| Box::pin(async move {
         let client = ctx.client().await;

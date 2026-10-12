@@ -137,6 +137,10 @@ button.danger:hover {
   border-color: #ff7b72;
 }
 
+button.ghost {
+  background: transparent;
+}
+
 /* input/textarea/select 用边框聚焦（见上），按钮与可聚焦元素用 outline */
 button:focus-visible,
 .link:focus-visible,
@@ -192,8 +196,12 @@ input.code {
   text-decoration: underline;
 }
 
-.link.danger {
+/* 文字链接形态的 danger：必须压过 button.danger（含 hover）的实心红底 */
+.link.danger,
+.link.danger:hover {
   color: var(--danger);
+  background: none;
+  border-color: transparent;
 }
 
 .muted {

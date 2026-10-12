@@ -6,6 +6,7 @@ import { importWorkflow, parseImportDocument } from "../state/workflow-io";
 import { errText } from "../rpc/client";
 import { confirmDialog, promptDialog } from "../state/modal";
 import { toast } from "../state/toast";
+import AppButton from "../components/AppButton.vue";
 
 const router = useRouter();
 
@@ -97,10 +98,10 @@ async function onFileChange(event: Event): Promise<void> {
     <div class="page-header">
       <h2>工作流</h2>
       <span class="header-actions">
-        <button :disabled="importing" @click="onPickFile">
+        <AppButton :disabled="importing" @click="onPickFile">
           {{ importing ? "导入中…" : "导入" }}
-        </button>
-        <button class="primary" :disabled="creating" @click="onCreate">新建</button>
+        </AppButton>
+        <AppButton variant="primary" :disabled="creating" @click="onCreate">新建</AppButton>
       </span>
     </div>
     <!-- 文件选择器藏在按钮后：accept 限定 json；value 清空见 onFileChange -->
@@ -137,13 +138,13 @@ async function onFileChange(event: Event): Promise<void> {
               >触发器</RouterLink
             >
             <RouterLink class="link" :to="`/workflows/${w.workflow_id}/runs`">运行记录</RouterLink>
-            <button
-              class="link danger"
+            <AppButton
+              variant="link-danger"
               :disabled="deletingId === w.workflow_id"
               @click="onDelete(w.workflow_id)"
             >
               删除
-            </button>
+            </AppButton>
           </td>
         </tr>
       </tbody>

@@ -12,6 +12,9 @@ import RunCanvas from "../components/RunCanvas.vue";
 import RunMonitor from "../components/RunMonitor.vue";
 import LogConsole from "../components/LogConsole.vue";
 import NodeInspector from "../components/NodeInspector.vue";
+import ResizeHandle from "../components/ResizeHandle.vue";
+import AppButton from "../components/AppButton.vue";
+import { usePanelResize } from "../state/panel-resize";
 
 const props = defineProps<{ runId: string }>();
 
@@ -30,6 +33,17 @@ let generation = 0;
 
 /** 节点检查器：画布/时间线/日志点击节点时打开 */
 const inspectorNodeId = ref<string | null>(null);
+
+// 右侧栏：拖左边缘改宽度
+const asideEl = ref<HTMLElement | null>(null);
+const asideResize = usePanelResize({
+  target: asideEl,
+  storageKey: "flow.rundetail-w",
+  fallback: 380,
+  min: 280,
+  max: () => (asideEl.value?.parentElement?.clientWidth ?? 1200) * 0.7,
+  measure: (rect, e) => rect.right - e.clientX,
+});
 
 watch(
   () => editor.selectedNodeId,
@@ -209,7 +223,12 @@ onUnmounted(() => {
         <div v-else-if="loadingDefinition" class="canvas-hint">加载中…</div>
         <div v-else class="canvas-hint">工作流定义不可用，仅展示时间线</div>
       </section>
-      <aside class="right">
+      <aside ref="asideEl" class="right" :style="{ width: asideResize.size.value + 'px' }">
+        <ResizeHandle
+          orientation="vertical"
+          class="edge-left"
+          @dragstart="asideResize.onDragStart"
+        />
         <div class="aside-tabs">
           <button
             class="aside-tab"
@@ -242,9 +261,9 @@ onUnmounted(() => {
         <LogConsole v-else class="aside-log-console" @select-node="onSelectNode" />
 
         <div class="events-toggle">
-          <button type="button" class="link" @click="toggleEvents">
+          <AppButton type="button" variant="link" @click="toggleEvents">
             {{ showEvents ? "收起原始事件" : "展开原始事件" }}
-          </button>
+          </AppButton>
         </div>
         <div v-if="showEvents" class="events-list">
           <p v-if="events === null" class="run-hint">加载中…</p>
@@ -323,17 +342,29 @@ onUnmounted(() => {
 
 .run-detail-main {
   flex: 1;
-  display: grid;
-  grid-template-columns: 1fr 380px;
+  display: flex;
   min-height: 0;
 }
 
+.run-detail-main .center {
+  flex: 1;
+  min-width: 0;
+}
+
 .right {
+  position: relative;
+  flex-shrink: 0;
   display: flex;
   flex-direction: column;
   min-height: 0;
   overflow-y: auto;
   padding: 0 12px 12px;
+  border-left: 1px solid var(--border);
+}
+
+/* 面板有 overflow-y: auto，手柄放内侧避免挤出横向滚动条 */
+.edge-left {
+  left: 0;
 }
 
 .aside-tabs {

@@ -7,6 +7,7 @@ import { editor, refreshWorkflows } from "../state/editor";
 import { confirmDialog } from "../state/modal";
 import { toast } from "../state/toast";
 import type { Schedule, Webhook } from "../types";
+import AppButton from "../components/AppButton.vue";
 
 /** 触发器页：定时调度（schedule.*）+ webhook（webhook.*），作用于单个工作流 */
 const props = defineProps<{ workflowId: string }>();
@@ -208,9 +209,9 @@ onUnmounted(() => {
           placeholder='输入 JSON（可选），每次触发作为 run 的 input，如 {"src":"cron"}'
           rows="2"
         />
-        <button class="primary" type="submit" :disabled="creating || !newCron.trim()">
+        <AppButton variant="primary" type="submit" :disabled="creating || !newCron.trim()">
           新建调度
-        </button>
+        </AppButton>
       </form>
       <table class="data-table">
         <thead>
@@ -235,14 +236,14 @@ onUnmounted(() => {
             </td>
             <td :title="s.created_at">{{ fmtTime(s.created_at) }}</td>
             <td class="actions">
-              <button
-                class="link"
+              <AppButton
+                variant="link"
                 :disabled="togglingScheduleId === s.id"
                 @click="onToggleSchedule(s)"
               >
                 {{ s.enabled ? "停用" : "启用" }}
-              </button>
-              <button class="link danger" @click="onDeleteSchedule(s)">删除</button>
+              </AppButton>
+              <AppButton variant="link-danger" @click="onDeleteSchedule(s)">删除</AppButton>
             </td>
           </tr>
         </tbody>
@@ -256,9 +257,9 @@ onUnmounted(() => {
     <section class="section">
       <div class="section-header">
         <h3>Webhook</h3>
-        <button class="primary" :disabled="creatingWebhook" @click="onCreateWebhook">
+        <AppButton variant="primary" :disabled="creatingWebhook" @click="onCreateWebhook">
           新建 webhook
-        </button>
+        </AppButton>
       </div>
       <table class="data-table">
         <thead>
@@ -280,15 +281,15 @@ onUnmounted(() => {
               </td>
               <td :title="w.created_at">{{ fmtTime(w.created_at) }}</td>
               <td class="actions">
-                <button class="link" @click="onCopy(w)">复制</button>
-                <button
-                  class="link"
+                <AppButton variant="link" @click="onCopy(w)">复制</AppButton>
+                <AppButton
+                  variant="link"
                   :disabled="togglingWebhookToken === w.token"
                   @click="onToggleWebhook(w)"
                 >
                   {{ w.enabled ? "停用" : "启用" }}
-                </button>
-                <button class="link danger" @click="onDeleteWebhook(w)">删除</button>
+                </AppButton>
+                <AppButton variant="link-danger" @click="onDeleteWebhook(w)">删除</AppButton>
               </td>
             </tr>
             <tr class="curl-row">

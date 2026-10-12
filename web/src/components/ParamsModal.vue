@@ -3,6 +3,7 @@ import { computed, nextTick, ref, watch } from "vue";
 import { editor, selectedNode } from "../state/editor";
 import { commitParams } from "../state/history";
 import SchemaField from "./SchemaField.vue";
+import AppButton from "./AppButton.vue";
 
 const node = selectedNode;
 const data = computed(() => node.value?.data ?? null);
@@ -119,7 +120,7 @@ function setRetry(key: "max_attempts" | "backoff_ms", ev: Event): void {
       </div>
       <footer class="params-footer">
         <span class="muted params-hint">修改即时生效，⌘Z 可撤销</span>
-        <button class="primary" @click="close">完成</button>
+        <AppButton variant="primary" @click="close">完成</AppButton>
       </footer>
     </div>
   </div>

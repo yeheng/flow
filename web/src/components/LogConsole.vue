@@ -192,6 +192,7 @@ function onSelectNode(id: string): void {
     <!-- 空态/列表都只读 frame 快照：不直接摸 monitor.logs，见 LogFrame 注释 -->
     <div v-if="!frame.hasLogs" class="log-empty">
       暂无日志<span v-if="monitor.status === 'running'">（等待节点输出…）</span>
+      <div class="log-empty-hint">仅脚本节点的 console.* 会写入日志，HTTP 等节点不产生观测日志</div>
     </div>
     <template v-else>
       <div ref="listEl" class="log-list" @scroll="onScroll">
@@ -287,6 +288,11 @@ function onSelectNode(id: string): void {
   border-radius: 6px;
   padding: 16px;
   text-align: center;
+}
+
+.log-empty-hint {
+  margin-top: 6px;
+  font-size: 11px;
 }
 
 .log-row {

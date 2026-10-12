@@ -12,6 +12,7 @@ import {
 import { errText, RpcError } from "../rpc/client";
 import { confirmDialog } from "../state/modal";
 import { toast } from "../state/toast";
+import AppButton from "../components/AppButton.vue";
 
 const status = ref<ClusterStatus>();
 const page = ref<ClusterPage>();
@@ -92,7 +93,7 @@ onBeforeUnmount(() => {
         <h1>Journal 节点管理</h1>
         <p>各节点独立保存 journal，PG 管理注册、归属、租约和同步进度。</p>
       </div>
-      <button :disabled="busy" @click="refresh()">{{ busy ? "刷新中…" : "刷新" }}</button>
+      <AppButton :disabled="busy" @click="refresh()">{{ busy ? "刷新中…" : "刷新" }}</AppButton>
     </header>
     <p v-if="error" role="alert" class="error">
       {{ error }}<span v-if="page"> · 当前显示上一次成功查询的数据</span>
@@ -132,13 +133,13 @@ onBeforeUnmount(() => {
             ><span v-if="node.node_id === status.node_id" class="current">当前连接</span>
           </div>
           <span class="badge" :class="node.status">{{ labels[node.status] }}</span>
-          <button
-            class="danger"
+          <AppButton
+            variant="danger"
             :disabled="node.status === 'removed' || !!removing"
             @click="remove(node)"
           >
             {{ removing === node.node_id ? "剔除中…" : "剔除" }}
-          </button>
+          </AppButton>
         </div>
         <dl>
           <div>
@@ -185,9 +186,9 @@ onBeforeUnmount(() => {
         </p>
       </section>
       <footer>
-        <button :disabled="!after || busy" @click="refresh('')">首页</button
-        ><button :disabled="!page.next_after || busy" @click="refresh(page.next_after ?? '')">
-          下一页</button
+        <AppButton :disabled="!after || busy" @click="refresh('')">首页</AppButton
+        ><AppButton :disabled="!page.next_after || busy" @click="refresh(page.next_after ?? '')">
+          下一页</AppButton
         ><span>每 5 秒刷新当前页</span>
       </footer>
     </template>

@@ -425,9 +425,10 @@ async fn execute(
                 .and_then(|o| o.outcome.clone());
             (
                 if let Some(previous) = previous {
+                    logger.info("已有捕获的 operation outcome，不重复发起请求（恢复）");
                     attempt.http_output(&previous, kind).await?
                 } else {
-                    attempt.http(&prepared, kind).await?
+                    attempt.http(&prepared, kind, &logger).await?
                 },
                 None,
             )
@@ -440,9 +441,10 @@ async fn execute(
                 .and_then(|o| o.outcome.clone());
             (
                 if let Some(previous) = previous {
+                    logger.info("已有捕获的 operation outcome，不重复启动进程（恢复）");
                     attempt.harness_output(&previous).await?
                 } else {
-                    attempt.harness(&prepared).await?
+                    attempt.harness(&prepared, &logger).await?
                 },
                 None,
             )
@@ -462,6 +464,14 @@ async fn execute(
                 .timestamp_millis()
                 .checked_add(i64::try_from(ms).map_err(|_| invalid("delay overflow"))?)
                 .ok_or_else(|| invalid("delay overflow"))?;
+            let wake_at = chrono::DateTime::from_timestamp_millis(wake)
+                .map(|at| {
+                    at.with_timezone(&chrono::Local)
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string()
+                })
+                .unwrap_or_else(|| wake.to_string());
+            logger.info(format!("delay {ms}ms，等待至 {wake_at}"));
             return attempt
                 .wait(Wait {
                     kind: "delay".into(),
@@ -472,6 +482,7 @@ async fn execute(
                 .await;
         }
         NodeType::HumanTask => {
+            logger.info("等待人工信号（run.signal）");
             return attempt
                 .wait(Wait {
                     kind: "signal".into(),
@@ -479,9 +490,9 @@ async fn execute(
                     child_run_id: None,
                     output: None,
                 })
-                .await
+                .await;
         }
-        NodeType::SubWorkflow => return start_child(attempt, &prepared).await,
+        NodeType::SubWorkflow => return start_child(attempt, &prepared, &logger).await,
     };
     attempt
         .finish(
@@ -495,6 +506,7 @@ async fn execute(
 async fn start_child(
     attempt: &Attempt,
     prepared: &flow_engine::journal_state::Prepared,
+    logger: &NodeLogger,
 ) -> Result<()> {
     let params = flow_journal::value::materialize(
         attempt.backend.journal.root(),
@@ -505,6 +517,7 @@ async fn start_child(
     let workflow_id = params["workflow_id"]
         .as_str()
         .ok_or_else(|| invalid("child workflow required"))?;
+    logger.info(format!("启动子工作流 {workflow_id}"));
     let input = if let Some(mapping) = params.get("input_mapping") {
         flow_journal::value::store_json(&attempt.backend.journal, mapping.clone(), 8 * 1024 * 1024)
             .await?

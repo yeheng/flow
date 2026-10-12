@@ -14,10 +14,12 @@ import { nodeStateLabel, runStatusLabel } from "../state/labels";
 import { confirmDialog } from "../state/modal";
 import { toast } from "../state/toast";
 import LogConsole from "./LogConsole.vue";
+import AppButton from "./AppButton.vue";
 
-const props = withDefaults(defineProps<{ childRunNavigate?: boolean }>(), {
-  childRunNavigate: false,
-});
+const props = withDefaults(
+  defineProps<{ childRunNavigate?: boolean; layout?: "footer" | "sidebar" }>(),
+  { childRunNavigate: false, layout: "sidebar" },
+);
 
 const activeTab = ref<"timeline" | "logs">("timeline");
 
@@ -81,125 +83,192 @@ function onRowClick(nodeId: string): void {
 </script>
 
 <template>
-  <div class="run-monitor">
-    <div class="run-status">
-      <button
-        v-if="monitor.breadcrumb.length"
-        class="run-back"
-        title="返回父 run"
-        @click="backToParentRun()"
-      >
-        ← 父 run
-      </button>
-      <span v-if="monitor.breadcrumb.length" class="run-depth">
-        子 run（第 {{ monitor.breadcrumb.length }} 层）
-      </span>
-      <span class="run-id" :title="monitor.runId ?? ''">run {{ monitor.runId?.slice(0, 8) }}…</span>
-      <button v-if="monitor.runId" class="run-copy" title="复制 run id" @click="copyRunId">
-        复制
-      </button>
-      <span v-if="monitor.status" class="run-phase" :class="`run-${monitor.status}`">
-        {{ runStateText }}
-      </span>
-      <button v-if="canCancelRun" :disabled="monitor.cancelling" @click="onCancelRun">取消</button>
-    </div>
-    <div v-if="monitor.fatalError" class="run-fatal">{{ monitor.fatalError }}</div>
-    <div v-if="monitor.output !== undefined" class="run-output">
-      输出：<code>{{ fmtJson(monitor.output) }}</code>
+  <div class="run-monitor" :class="layout">
+    <div class="monitor-main">
+      <div class="run-status">
+        <button
+          v-if="monitor.breadcrumb.length"
+          class="run-back"
+          title="返回父 run"
+          @click="backToParentRun()"
+        >
+          ← 父 run
+        </button>
+        <span v-if="monitor.breadcrumb.length" class="run-depth">
+          子 run（第 {{ monitor.breadcrumb.length }} 层）
+        </span>
+        <span class="run-id" :title="monitor.runId ?? ''"
+          >run {{ monitor.runId?.slice(0, 8) }}…</span
+        >
+        <button v-if="monitor.runId" class="run-copy" title="复制 run id" @click="copyRunId">
+          复制
+        </button>
+        <span v-if="monitor.status" class="run-phase" :class="`run-${monitor.status}`">
+          {{ runStateText }}
+        </span>
+        <AppButton v-if="canCancelRun" :disabled="monitor.cancelling" @click="onCancelRun"
+          >取消</AppButton
+        >
+      </div>
+      <div v-if="monitor.fatalError" class="run-fatal">{{ monitor.fatalError }}</div>
+      <div v-if="monitor.output !== undefined" class="run-output">
+        输出：<code>{{ fmtJson(monitor.output) }}</code>
+      </div>
+
+      <div v-for="n in waitingHumanTasks" :key="n.id" class="signal-box">
+        <div>「{{ n.name || n.id }}」等待人工交付</div>
+        <div class="signal-row">
+          <input
+            v-model="signalTexts[n.id]"
+            type="text"
+            placeholder='信号 payload（JSON），如 {"approved": true}'
+          />
+          <AppButton
+            :disabled="monitor.delivering"
+            @click="deliverSignal(n.id, signalTexts[n.id] ?? '')"
+          >
+            交付
+          </AppButton>
+        </div>
+        <div v-if="signalIsNonJson(signalTexts[n.id])" class="field-help">
+          非 JSON，将作为字符串交付
+        </div>
+      </div>
     </div>
 
-    <div v-for="n in waitingHumanTasks" :key="n.id" class="signal-box">
-      <div>「{{ n.name || n.id }}」等待人工交付</div>
-      <div class="signal-row">
-        <input
-          v-model="signalTexts[n.id]"
-          type="text"
-          placeholder='信号 payload（JSON），如 {"approved": true}'
-        />
+    <div class="monitor-detail">
+      <div class="run-tabs">
         <button
-          :disabled="monitor.delivering"
-          @click="deliverSignal(n.id, signalTexts[n.id] ?? '')"
+          class="run-tab"
+          :class="{ active: activeTab === 'timeline' }"
+          @click="activeTab = 'timeline'"
         >
-          交付
+          时间线
+        </button>
+        <button
+          class="run-tab"
+          :class="{ active: activeTab === 'logs' }"
+          @click="activeTab = 'logs'"
+        >
+          日志（{{ monitor.logs.length }}）
         </button>
       </div>
-      <div v-if="signalIsNonJson(signalTexts[n.id])" class="field-help">
-        非 JSON，将作为字符串交付
+      <div v-if="activeTab === 'timeline'" class="timeline-wrap">
+        <table class="timeline">
+          <thead>
+            <tr>
+              <th>节点</th>
+              <th>状态</th>
+              <th>尝试</th>
+              <th>耗时</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr
+              v-for="n in monitor.nodes"
+              :key="n.id"
+              :class="{ highlighted: editor.highlightNodeId === n.id }"
+              @mouseenter="onRowEnter(n.id)"
+              @mouseleave="onRowLeave"
+              @click="onRowClick(n.id)"
+            >
+              <td>
+                {{ n.name || n.id }}
+                <RouterLink
+                  v-if="n.child_run_id && props.childRunNavigate"
+                  class="child-link"
+                  title="查看子 run"
+                  :to="`/runs/${n.child_run_id}`"
+                  @click.stop
+                >
+                  子 run →
+                </RouterLink>
+                <button
+                  v-else-if="n.child_run_id"
+                  class="child-link"
+                  title="查看子 run"
+                  @click.stop="openChildRun(n.child_run_id)"
+                >
+                  子 run →
+                </button>
+              </td>
+              <td>
+                <span class="run-state" :class="`run-${n.state}`">
+                  {{ nodeStateLabel(n.state) }}
+                </span>
+                <div v-if="n.error" class="node-error">{{ n.error }}</div>
+                <div v-else-if="n.reason" class="node-reason">{{ n.reason }}</div>
+                <div
+                  v-else-if="n.output !== null && n.output !== undefined"
+                  class="node-output"
+                  :title="fmtJsonFull(n.output)"
+                >
+                  {{ fmtJson(n.output) }}
+                </div>
+              </td>
+              <td>{{ n.attempts }}</td>
+              <td>{{ n.duration_ms !== null ? `${n.duration_ms}ms` : "" }}</td>
+            </tr>
+          </tbody>
+        </table>
       </div>
+      <LogConsole v-else class="monitor-log-console" @select-node="onRowClick" />
     </div>
-
-    <div class="run-tabs">
-      <button
-        class="run-tab"
-        :class="{ active: activeTab === 'timeline' }"
-        @click="activeTab = 'timeline'"
-      >
-        时间线
-      </button>
-      <button class="run-tab" :class="{ active: activeTab === 'logs' }" @click="activeTab = 'logs'">
-        日志（{{ monitor.logs.length }}）
-      </button>
-    </div>
-    <template v-if="activeTab === 'timeline'">
-      <table class="timeline">
-        <thead>
-          <tr>
-            <th>节点</th>
-            <th>状态</th>
-            <th>尝试</th>
-            <th>耗时</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr
-            v-for="n in monitor.nodes"
-            :key="n.id"
-            :class="{ highlighted: editor.highlightNodeId === n.id }"
-            @mouseenter="onRowEnter(n.id)"
-            @mouseleave="onRowLeave"
-            @click="onRowClick(n.id)"
-          >
-            <td>
-              {{ n.name || n.id }}
-              <RouterLink
-                v-if="n.child_run_id && props.childRunNavigate"
-                class="child-link"
-                title="查看子 run"
-                :to="`/runs/${n.child_run_id}`"
-                @click.stop
-              >
-                子 run →
-              </RouterLink>
-              <button
-                v-else-if="n.child_run_id"
-                class="child-link"
-                title="查看子 run"
-                @click.stop="openChildRun(n.child_run_id)"
-              >
-                子 run →
-              </button>
-            </td>
-            <td>
-              <span class="run-state" :class="`run-${n.state}`">
-                {{ nodeStateLabel(n.state) }}
-              </span>
-              <div v-if="n.error" class="node-error">{{ n.error }}</div>
-              <div v-else-if="n.reason" class="node-reason">{{ n.reason }}</div>
-              <div v-else-if="n.output !== null && n.output !== undefined" class="node-output" :title="fmtJsonFull(n.output)">
-                {{ fmtJson(n.output) }}
-              </div>
-            </td>
-            <td>{{ n.attempts }}</td>
-            <td>{{ n.duration_ms !== null ? `${n.duration_ms}ms` : "" }}</td>
-          </tr>
-        </tbody>
-      </table>
-    </template>
-    <LogConsole v-else class="monitor-log-console" @select-node="onRowClick" />
   </div>
 </template>
 
 <style scoped>
+/* 布局：main = 状态/输出/信号，detail = 时间线/日志 tab。
+   footer 模式左右分栏（左输出右明细），sidebar 模式上下堆叠（默认，RunDetailView 同形态） */
+.run-monitor {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.run-monitor.footer {
+  flex-direction: row;
+  gap: 12px;
+}
+
+.monitor-main {
+  min-width: 0;
+}
+
+.run-monitor.footer .monitor-main {
+  width: 40%;
+  flex-shrink: 0;
+  overflow-y: auto;
+}
+
+/* 侧栏模式：输出区限高，明细区占剩余空间，各自内部滚动 */
+.run-monitor.sidebar .monitor-main {
+  max-height: 50%;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+
+.monitor-detail {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.run-monitor.footer .monitor-detail {
+  border-left: 1px solid var(--border);
+  padding-left: 12px;
+}
+
+.timeline-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
 .run-tabs {
   display: flex;
   gap: 2px;
@@ -223,7 +292,7 @@ function onRowClick(nodeId: string): void {
 }
 
 .monitor-log-console {
-  /* 底部抽屉形态：给头部/状态行留高度，日志区自身可滚动 */
+  /* tab 内容区：时间线/日志都在 detail 区内滚动，给头部/状态行留高度 */
   min-height: 140px;
 }
 

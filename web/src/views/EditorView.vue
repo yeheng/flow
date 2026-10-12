@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { onBeforeRouteLeave, onBeforeRouteUpdate, useRoute, useRouter } from "vue-router";
 import {
   autoLayout,
@@ -26,10 +26,13 @@ import { promptDialog } from "../state/modal";
 import { monitor, startRun } from "../state/monitor";
 import { saveWorkflowAsNodeTemplate } from "../state/templates";
 import { toast } from "../state/toast";
+import AppButton from "../components/AppButton.vue";
 import NodePalette from "../components/NodePalette.vue";
 import FlowCanvas from "../components/FlowCanvas.vue";
 import ParamsModal from "../components/ParamsModal.vue";
+import ResizeHandle from "../components/ResizeHandle.vue";
 import RunPanel from "../components/RunPanel.vue";
+import { usePanelResize } from "../state/panel-resize";
 
 const route = useRoute();
 const router = useRouter();
@@ -49,6 +52,56 @@ watch(
     if (id) runDrawerOpen.value = true;
   },
 );
+
+// ---- 控制台布局：footer（底部）/ sidebar（右侧栏）两模式，尺寸分模式持久化 ----
+type ConsoleMode = "footer" | "sidebar";
+const CONSOLE_MODE_KEY = "flow.console-mode";
+
+const consoleMode = ref<ConsoleMode>(
+  localStorage.getItem(CONSOLE_MODE_KEY) === "sidebar" ? "sidebar" : "footer",
+);
+
+function toggleConsoleMode(): void {
+  consoleMode.value = consoleMode.value === "footer" ? "sidebar" : "footer";
+  localStorage.setItem(CONSOLE_MODE_KEY, consoleMode.value);
+}
+
+// footer 拖上边缘改高度，sidebar 拖左边缘改宽度，两套尺寸各自持久化
+const drawerEl = ref<HTMLElement | null>(null);
+const footerResize = usePanelResize({
+  target: drawerEl,
+  storageKey: "flow.console-h",
+  fallback: 340,
+  min: 160,
+  max: () => (drawerEl.value?.parentElement?.clientHeight ?? 800) - 120,
+  measure: (rect, e) => rect.bottom - e.clientY,
+});
+const sidebarResize = usePanelResize({
+  target: drawerEl,
+  storageKey: "flow.console-w",
+  fallback: 400,
+  min: 280,
+  max: () => (drawerEl.value?.parentElement?.clientWidth ?? 1200) * 0.7,
+  measure: (rect, e) => rect.right - e.clientX,
+});
+const consoleResize = computed(() =>
+  consoleMode.value === "footer" ? footerResize : sidebarResize,
+);
+
+function onConsoleDragStart(e: PointerEvent): void {
+  consoleResize.value.onDragStart(e);
+}
+
+// 左侧节点面板：拖右边缘改宽度
+const paletteEl = ref<HTMLElement | null>(null);
+const paletteResize = usePanelResize({
+  target: paletteEl,
+  storageKey: "flow.palette-w",
+  fallback: 240,
+  min: 180,
+  max: () => (paletteEl.value?.parentElement?.clientWidth ?? 1200) * 0.5,
+  measure: (rect, e) => e.clientX - rect.left,
+});
 
 async function load(id: string): Promise<void> {
   if (!(await ensureNodeTypes())) return;
@@ -189,16 +242,18 @@ async function saveAsNode(): Promise<void> {
         <span v-if="dirty" class="wf-dirty">（未保存）</span>
       </span>
       <div class="editor-actions">
-        <button title="撤销 (⌘Z)" :disabled="!history.canUndo" @click="undo()">↶ 撤销</button>
-        <button title="重做 (⌘⇧Z)" :disabled="!history.canRedo" @click="redo()">↷ 重做</button>
-        <button :disabled="editor.nodes.length === 0" @click="autoLayout()">自动布局</button>
-        <button
+        <AppButton title="撤销 (⌘Z)" :disabled="!history.canUndo" @click="undo()">↶ 撤销</AppButton>
+        <AppButton title="重做 (⌘⇧Z)" :disabled="!history.canRedo" @click="redo()"
+          >↷ 重做</AppButton
+        >
+        <AppButton :disabled="editor.nodes.length === 0" @click="autoLayout()">自动布局</AppButton>
+        <AppButton
           title="把当前工作流打包成可复用的子流程节点（存入模板区）"
           :disabled="!editor.workflowId"
           @click="saveAsNode()"
         >
           存为节点
-        </button>
+        </AppButton>
         <span ref="validationAnchor" class="validation-anchor">
           <button
             v-if="validationErrors.length > 0"
@@ -241,32 +296,65 @@ async function saveAsNode(): Promise<void> {
         >
           运行记录
         </RouterLink>
-        <button title="保存 (⌘S)" :disabled="saving" @click="save()">
+        <AppButton title="保存 (⌘S)" :disabled="saving" @click="save()">
           {{ saving ? "保存中…" : "保存" }}
-        </button>
-        <button :disabled="publishing" @click="publish()">
+        </AppButton>
+        <AppButton :disabled="publishing" @click="publish()">
           {{ publishing ? "发布中…" : "发布" }}
-        </button>
-        <button class="primary" :disabled="monitor.starting" @click="startRun()">运行</button>
-        <button
+        </AppButton>
+        <AppButton variant="primary" :disabled="monitor.starting" @click="startRun()"
+          >运行</AppButton
+        >
+        <AppButton
           :title="runDrawerOpen ? '收起运行控制台' : '展开运行控制台'"
           @click="runDrawerOpen = !runDrawerOpen"
         >
           {{ runDrawerOpen ? "控制台 ▾" : "控制台 ▴" }}
-        </button>
+        </AppButton>
       </div>
     </div>
-    <main class="editor-main">
-      <aside class="left" :class="{ collapsed: paletteCollapsed }">
-        <NodePalette />
-      </aside>
-      <section class="center">
-        <FlowCanvas />
+    <main class="editor-main" :class="`console-${consoleMode}`">
+      <div class="editor-body">
+        <aside
+          ref="paletteEl"
+          class="left"
+          :class="{ collapsed: paletteCollapsed, resizing: paletteResize.active.value }"
+          :style="paletteCollapsed ? undefined : { width: paletteResize.size.value + 'px' }"
+        >
+          <NodePalette />
+          <ResizeHandle
+            v-if="!paletteCollapsed"
+            orientation="vertical"
+            class="edge-right"
+            @dragstart="paletteResize.onDragStart"
+          />
+        </aside>
+        <section class="center">
+          <FlowCanvas />
+        </section>
+      </div>
+      <section
+        v-if="runDrawerOpen"
+        ref="drawerEl"
+        class="run-drawer"
+        :style="
+          consoleMode === 'footer'
+            ? { height: consoleResize.size.value + 'px' }
+            : { width: consoleResize.size.value + 'px' }
+        "
+      >
+        <ResizeHandle
+          :orientation="consoleMode === 'footer' ? 'horizontal' : 'vertical'"
+          :class="consoleMode === 'footer' ? 'edge-top' : 'edge-left'"
+          @dragstart="onConsoleDragStart"
+        />
+        <RunPanel
+          :layout="consoleMode"
+          @collapse="runDrawerOpen = false"
+          @toggle-layout="toggleConsoleMode"
+        />
       </section>
     </main>
-    <section v-if="runDrawerOpen" class="run-drawer">
-      <RunPanel @collapse="runDrawerOpen = false" />
-    </section>
     <ParamsModal />
   </div>
 </template>
@@ -285,14 +373,35 @@ async function saveAsNode(): Promise<void> {
   min-height: 0;
 }
 
-/* 左侧节点面板：可收起（宽度动画；收起后不占位、不留滚动条） */
+.editor-main.console-footer {
+  flex-direction: column;
+}
+
+.editor-main.console-sidebar {
+  flex-direction: row;
+}
+
+.editor-body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+  min-width: 0;
+}
+
+/* 左侧节点面板：可收起（宽度动画；收起后不占位、不留滚动条）、可拖右边缘调宽 */
 aside.left {
+  position: relative;
   width: 240px;
   flex-shrink: 0;
   transition:
     width 0.18s ease,
     padding 0.18s ease,
     border-color 0.18s ease;
+}
+
+/* 拖拽时关掉宽度动画，否则跟手延迟 */
+aside.left.resizing {
+  transition: none;
 }
 
 aside.left.collapsed {
@@ -314,15 +423,37 @@ aside.left.collapsed {
   flex: 1;
 }
 
-/* 运行抽屉：固定高度、内容内部滚动 */
+/* 运行抽屉：footer 模式占底部（可变高），sidebar 模式占右侧（可变宽），内容内部滚动 */
 .run-drawer {
   flex-shrink: 0;
-  height: 340px;
   min-height: 0;
+  min-width: 0;
   display: flex;
   flex-direction: column;
-  border-top: 1px solid var(--border);
+  position: relative;
   background: var(--surface);
+}
+
+.console-footer .run-drawer {
+  border-top: 1px solid var(--border);
+}
+
+.console-sidebar .run-drawer {
+  border-left: 1px solid var(--border);
+}
+
+/* ResizeHandle 贴边定位（条带尺寸/光标在组件内） */
+.edge-top {
+  top: -2px;
+}
+
+.edge-left {
+  left: -2px;
+}
+
+/* 面板有 overflow-y: auto，手柄放内侧避免挤出横向滚动条 */
+.edge-right {
+  right: 0;
 }
 
 .editor-topbar {

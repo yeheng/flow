@@ -8,6 +8,7 @@ import { mergeRunPage, nextCursor } from "../state/run-list";
 import { runBadgeClass, runStatusLabel, sourceLabel } from "../state/labels";
 import { toast } from "../state/toast";
 import type { RunRecord } from "../types";
+import AppButton from "../components/AppButton.vue";
 
 /** 全局运行历史（/runs）与单工作流运行历史（/workflows/:id/runs）共用：后者传 workflowId 过滤 */
 const props = defineProps<{ workflowId?: string }>();
@@ -207,14 +208,14 @@ watch(
           <td>{{ fmtDuration(r) }}</td>
           <td class="actions">
             <RouterLink class="link" :to="`/runs/${r.id}`">详情</RouterLink>
-            <button
+            <AppButton
               v-if="r.status === 'running'"
-              class="link danger"
+              variant="link-danger"
               :disabled="cancellingId === r.id"
               @click="onCancel(r)"
             >
               取消
-            </button>
+            </AppButton>
           </td>
         </tr>
       </tbody>
@@ -222,7 +223,7 @@ watch(
     <p v-if="!loaded" class="wf-empty">加载中…</p>
     <p v-else-if="runs.length === 0" class="wf-empty">暂无运行记录</p>
     <div v-if="hasMore" class="load-more">
-      <button :disabled="loadingMore" @click="loadMore">加载更多</button>
+      <AppButton :disabled="loadingMore" @click="loadMore">加载更多</AppButton>
     </div>
   </div>
 </template>

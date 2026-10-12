@@ -542,9 +542,13 @@ impl TaskRunner {
                     .await
             }
             kind @ (NodeType::HttpCall | NodeType::Email) => {
-                self.http_node(node, kind, prepared, inputs, audit).await
+                self.http_node(node, kind, prepared, inputs, audit, &logger)
+                    .await
             }
-            NodeType::Harness => self.harness_node(node, prepared, inputs, audit).await,
+            NodeType::Harness => {
+                self.harness_node(node, prepared, inputs, audit, &logger)
+                    .await
+            }
             NodeType::Delay => {
                 let params = materialize_prepared_params(self, prepared).await?;
                 let ms = params["ms"]
@@ -558,6 +562,14 @@ impl TaskRunner {
                             .map_err(|_| TaskError::Business("delay overflow".into()))?,
                     )
                     .ok_or_else(|| TaskError::Business("delay overflow".into()))?;
+                let wake_at = chrono::DateTime::from_timestamp_millis(wake)
+                    .map(|at| {
+                        at.with_timezone(&chrono::Local)
+                            .format("%Y-%m-%d %H:%M:%S")
+                            .to_string()
+                    })
+                    .unwrap_or_else(|| wake.to_string());
+                logger.info(format!("delay {ms}ms，等待至 {wake_at}"));
                 Ok(ResultOutcome::Wait {
                     wait: WaitRequest {
                         kind: "delay".into(),
@@ -568,15 +580,18 @@ impl TaskRunner {
                     },
                 })
             }
-            NodeType::HumanTask => Ok(ResultOutcome::Wait {
-                wait: WaitRequest {
-                    kind: "signal".into(),
-                    wake_at: None,
-                    output: None,
-                    workflow_id: None,
-                    input_mapping: None,
-                },
-            }),
+            NodeType::HumanTask => {
+                logger.info("等待人工信号（run.signal）");
+                Ok(ResultOutcome::Wait {
+                    wait: WaitRequest {
+                        kind: "signal".into(),
+                        wake_at: None,
+                        output: None,
+                        workflow_id: None,
+                        input_mapping: None,
+                    },
+                })
+            }
             NodeType::SubWorkflow => {
                 let params = materialize_prepared_params(self, prepared).await?;
                 let workflow_id = params["workflow_id"]
@@ -584,6 +599,7 @@ impl TaskRunner {
                     .ok_or_else(|| TaskError::Business("child workflow required".into()))?
                     .to_owned();
                 let input_mapping = params.get("input_mapping").cloned();
+                logger.info(format!("启动子工作流 {workflow_id}"));
                 Ok(ResultOutcome::Wait {
                     wait: WaitRequest {
                         kind: "child".into(),
@@ -763,9 +779,11 @@ impl TaskRunner {
         prepared: &Prepared,
         _inputs: &TaskInputs,
         audit: &mut AuditStream,
+        logger: &flow_engine::NodeLogger,
     ) -> Result<ResultOutcome, TaskError> {
         // 恢复路径：已有 Outcome 直接派生输出，不重发请求。
         if let Some(outcome_value) = self.task.previous_outcome.clone() {
+            logger.info("已有捕获的 operation outcome，不重复发起请求（恢复）");
             let outcome: StoredValue =
                 serde_json::from_value(outcome_value).map_err(TaskError::from)?;
             let output = self.http_output(&outcome, kind, audit).await?;
@@ -779,6 +797,15 @@ impl TaskRunner {
             .materialize_stored(&prepared.params, "in:prepared-params", &mut budget)
             .await?;
         if kind == NodeType::Email {
+            let recipients = match &params["to"] {
+                Value::Array(list) => list
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                other => other.as_str().unwrap_or("").to_owned(),
+            };
+            logger.info(format!("→ email to {recipients}"));
             let name = params["api_key"]
                 .as_str()
                 .filter(|s| !s.trim().is_empty())
@@ -861,9 +888,18 @@ impl TaskRunner {
         build_outbound(None)?;
         let credential = self.authorize_operation(request).await?;
         let outbound_request = build_outbound(credential)?;
+        // 展示面用的 URL（日志行）：query 里的敏感参数值脱敏，发起请求用的
+        // 永远是原始 `url`。
+        let url_label = flow_engine::redact_url(&url);
+        logger.info(format!("→ {method} {url_label}"));
+        let started = std::time::Instant::now();
         let mut response = match client.execute(outbound_request).await {
             Ok(response) => response,
             Err(error) => {
+                logger.error(format!(
+                    "请求 {url_label} 失败（{}ms）：{error}",
+                    started.elapsed().as_millis()
+                ));
                 // 授权后调用失败：Outcome 未知，交主进程按 uncertain 处理。
                 return Err(TaskError::Uncertain(error.to_string()));
             }
@@ -894,6 +930,17 @@ impl TaskRunner {
                 ));
             }
             raw.extend_from_slice(&bytes);
+        }
+        // 响应元信息一行：状态码、耗时、体量；非 2xx/3xx 升级 warn
+        let response_line = format!(
+            "← HTTP {status}（{}ms，body {}B）",
+            started.elapsed().as_millis(),
+            raw.len()
+        );
+        if status >= 400 {
+            logger.warn(response_line);
+        } else {
+            logger.info(response_line);
         }
         let raw_stored = store_bytes(audit, &self.journal_id, &raw, ValueCodec::Bytes).await?;
         // 捕获的原始字节留在本地装配器，供输出派生阶段复用（不重读 journal）。
@@ -1017,9 +1064,11 @@ impl TaskRunner {
         prepared: &Prepared,
         _inputs: &TaskInputs,
         audit: &mut AuditStream,
+        logger: &flow_engine::NodeLogger,
     ) -> Result<ResultOutcome, TaskError> {
         // 恢复路径：已有 Outcome 直接派生输出，不重跑进程。
         if let Some(outcome_value) = self.task.previous_outcome.clone() {
+            logger.info("已有捕获的 operation outcome，不重复启动进程（恢复）");
             let outcome: StoredValue =
                 serde_json::from_value(outcome_value).map_err(TaskError::from)?;
             let output = self.harness_output(&outcome, audit).await?;
@@ -1043,10 +1092,18 @@ impl TaskRunner {
             "prompt": prompt,
         });
         self.authorize_operation(request).await?;
+        // prompt 可能含敏感内容，不进日志；只记命令行与超时。
+        logger.info(format!(
+            "→ harness {} {}（timeout {timeout_ms}ms）",
+            command,
+            args.join(" ")
+        ));
+        let started = std::time::Instant::now();
         let mut child =
             match flow_engine::exec::harness_command(&command, &args, workdir.as_deref()).spawn() {
                 Ok(child) => child,
                 Err(error) => {
+                    logger.error(format!("harness 启动失败：{error}"));
                     // 进程从未启动：结果确定。记录 Outcome 后按业务失败收口
                     let outcome = StoredValue::inline(json!({"spawn_error": error.to_string()}))?;
                     let outcome_seq = audit.push(
@@ -1079,11 +1136,25 @@ impl TaskRunner {
                 Ok(Err(e)) => return Err(TaskError::Uncertain(e.to_string())),
                 // 超时：wait_with_output 被 drop，kill_on_drop 杀掉子进程
                 Err(_) => {
+                    logger.error(format!(
+                        "harness 超时（{}ms，进程已杀死）",
+                        started.elapsed().as_millis()
+                    ));
                     return Err(TaskError::Uncertain(format!(
                         "harness timed out after {timeout_ms}ms (process killed)"
-                    )))
+                    )));
                 }
             };
+        let exit_code = output
+            .status
+            .code()
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "signal".into());
+        logger.info(format!(
+            "← exit {exit_code}（{}ms，stdout {}B）",
+            started.elapsed().as_millis(),
+            output.stdout.len()
+        ));
         let raw_stored =
             store_bytes(audit, &self.journal_id, &output.stdout, ValueCodec::Bytes).await?;
         // 捕获的原始字节留在本地装配器，供输出派生阶段复用（不重读 journal）。
