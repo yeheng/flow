@@ -13,7 +13,8 @@ cargo build -p flow-rpc --bin flow-journal-server --features journal-cluster --l
 ```
 
 各节点使用不同数据目录与 node_id，共用 PG 数据库和 cluster_id。各自使用现有
-in_process、ipc 或 remote 执行模式。配置示例：
+`ipc` 或 `remote` 执行模式（`in_process` 仅非 unix 过渡态；T7 起 unix 上已删除）。
+配置示例：
 
 ```toml
 [journal]

@@ -455,6 +455,23 @@ async fn killing_executor_mid_script_recovers_with_new_process() {
         }
     };
     assert_eq!(done.status, "failed");
+    // T7：这段同时接管原 `PanicOnScript` 的职责——执行器硬猝死（这里是真的
+    // SIGKILL 执行器进程）必须把涉及节点判死并把操作证据封闭，driver 继续服务。
+    // kill 时机决定死在 start 还是 script 节点上，因此按「实际失败的那个节点」
+    // 断言，而不是假设凶手一定是 script。
+    let failed_nodes: Vec<_> = done
+        .nodes
+        .iter()
+        .filter(|(_, node)| node.status == "failed")
+        .collect();
+    assert!(!failed_nodes.is_empty(), "no failed node: {:?}", done.nodes);
+    for (id, node) in failed_nodes {
+        assert!(
+            node.attempts.values().all(|attempt| attempt.sealed),
+            "killed executor left unsealed attempts on {id}: {:?}",
+            node.attempts
+        );
+    }
     // 新派发在健康会话上继续（新进程）：立即可判定的脚本。
     let quick = install(
         &backend,
@@ -566,7 +583,7 @@ async fn journal_events_equivalent_between_in_process_and_ipc() {
     let backend_a = JournalBackend::open(&root_a, JournalOptions::default())
         .await
         .unwrap();
-    backend_a.start_execution().await.unwrap();
+    start_ipc(&backend_a, 16).await;
     let workflow_a = install(&backend_a, definition.clone()).await;
     let run_a = start_run(&backend_a, &workflow_a, json!({"n": 1})).await;
     let done_a = until(&backend_a, &run_a, Run::terminal).await;
@@ -986,4 +1003,28 @@ async fn inline_sized_run_input_dispatches_via_data_channel() {
     let _ = output;
     backend.close().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
+}
+
+/// T7：unix 上进程内执行路径已删除，本地语义套件一律走真实 IPC 执行器
+/// （`cargo build --workspace --bins` 先产出 flow-executor）。Windows 过渡态
+/// 仍用 in_process，行为与 T7 之前一致。
+#[cfg(unix)]
+async fn start_ipc(backend: &std::sync::Arc<flow_backend::journal::JournalBackend>, x_max: usize) {
+    backend
+        .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
+            flow_backend::execution::IpcOptions {
+                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
+                    flow_test_support::io::executor_bin(),
+                ),
+                x_max,
+                tag: None,
+            },
+        ))
+        .await
+        .unwrap();
+}
+
+#[cfg(not(unix))]
+async fn start_ipc(backend: &std::sync::Arc<flow_backend::journal::JournalBackend>, x_max: usize) {
+    backend.start_execution_with_limit(x_max).await.unwrap();
 }

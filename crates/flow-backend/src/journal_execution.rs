@@ -1,14 +1,26 @@
 use crate::journal::{JournalBackend, JournalError};
 use crate::journal_commands::{id, node_event};
+#[cfg(not(unix))]
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use flow_engine::journal_state::{Operation, Prepared, Run, Wait};
+use flow_engine::journal_state::Run;
+#[cfg(not(unix))]
+use flow_engine::journal_state::{Operation, Prepared, Wait};
+#[cfg(not(unix))]
 use flow_engine::{NodeLogger, NodeType};
+#[cfg(not(unix))]
 use flow_journal::value::{Chunk, ValueCodec};
-use flow_journal::{EventKind, StoredValue, ValueRef};
+use flow_journal::EventKind;
+#[cfg(not(unix))]
+use flow_journal::StoredValue;
+#[cfg(not(unix))]
+use flow_journal::ValueRef;
 use serde_json::{json, Value};
+#[cfg(not(unix))]
 use sha2::{Digest, Sha256};
+#[cfg(not(unix))]
 use std::collections::BTreeMap;
 use std::sync::Arc;
+#[cfg(not(unix))]
 use std::time::Duration;
 
 type Result<T> = std::result::Result<T, JournalError>;
@@ -67,6 +79,7 @@ impl Attempt {
             .await
             .ok_or_else(|| invalid("run missing").into())
     }
+    #[cfg(not(unix))]
     pub async fn audit(&self, kind: EventKind, payload: Value) -> Result<()> {
         self.backend
             .internal(|state| {
@@ -87,6 +100,7 @@ impl Attempt {
             })
             .await
     }
+    #[cfg(not(unix))]
     pub async fn json(&self, value: Value) -> Result<StoredValue> {
         let bytes = flow_journal::codec::bounded_json(&value, 8 * 1024 * 1024)?;
         if bytes.len() <= flow_journal::INLINE_BYTES {
@@ -98,6 +112,7 @@ impl Attempt {
         }
         Ok(StoredValue::Ref(stream.finish().await?))
     }
+    #[cfg(not(unix))]
     pub async fn stream(
         &self,
         input: &mut (impl tokio::io::AsyncRead + Unpin),
@@ -117,6 +132,7 @@ impl Attempt {
         }
         Ok(StoredValue::Ref(capture.finish().await?))
     }
+    #[cfg(not(unix))]
     pub async fn prepare(
         &self,
         node: &flow_engine::Node,
@@ -182,6 +198,7 @@ impl Attempt {
             .await?;
         Ok(prepared)
     }
+    #[cfg(not(unix))]
     async fn materialize(&self, value: &StoredValue, budget: &mut usize) -> Result<Value> {
         let n = usize::try_from(value.bytes()?).map_err(|_| invalid("value length overflow"))?;
         if n > *budget {
@@ -232,6 +249,7 @@ impl Attempt {
             })
             .await
     }
+    #[cfg(not(unix))]
     pub async fn compute(
         &self,
         node: &flow_engine::Node,
@@ -270,6 +288,7 @@ impl Attempt {
             (node.kind() == Some(NodeType::Condition)).then(|| flow_engine::exec::truthy(&result));
         Ok((self.json(result).await?, branch))
     }
+    #[cfg(not(unix))]
     pub async fn wait(&self, wait: Wait) -> Result<()> {
         self.finish(EventKind::WaitRegistered, json!({"wait":wait}))
             .await
@@ -278,6 +297,7 @@ impl Attempt {
     /// 外部操作的授权落盘：Intent + Authorized 同事务，副作用发生之前必走这里。
     /// http 与 harness 共用；授权后进程崩溃 → 恢复见「operation 无 outcome」进
     /// uncertain 等待人工裁决（journal_driver）。
+    #[cfg(not(unix))]
     async fn authorize(&self, prepared: &Prepared, request: Value) -> Result<()> {
         let fingerprint = flow_journal::codec::digest(&flow_journal::codec::bounded_json(
             &request,
@@ -341,6 +361,7 @@ impl Attempt {
     /// Intent/Authorized 再 spawn——与 http 同一条「不自动重发」路径。
     /// 退出码非 0 → outcome 留存、节点判死；超时/等待失败 → outcome 未知，
     /// 进 uncertain 等人工裁决。
+    #[cfg(not(unix))]
     pub async fn harness(&self, prepared: &Prepared) -> Result<StoredValue> {
         let mut budget = 8 * 1024 * 1024;
         let params = self.materialize(&prepared.params, &mut budget).await?;
@@ -413,6 +434,7 @@ impl Attempt {
     }
 
     /// harness 的 Outcome → 节点输出（恢复路径重放同一派生，不重跑进程）。
+    #[cfg(not(unix))]
     pub async fn harness_output(&self, outcome: &StoredValue) -> Result<StoredValue> {
         let mut budget = flow_journal::INLINE_BYTES;
         let outcome = self.materialize(outcome, &mut budget).await?;
@@ -451,6 +473,7 @@ impl Attempt {
 
     /// Request construction is derived from the committed prepared parameters. Authorization
     /// is durably recorded with intent before reqwest is called, and never reused after restart.
+    #[cfg(not(unix))]
     pub async fn http(&self, prepared: &Prepared, kind: NodeType) -> Result<StoredValue> {
         let mut budget = 8 * 1024 * 1024;
         let mut params = self.materialize(&prepared.params, &mut budget).await?;
@@ -542,6 +565,7 @@ impl Attempt {
             .await?;
         self.http_output(&outcome, kind).await
     }
+    #[cfg(not(unix))]
     pub async fn http_output(&self, outcome: &StoredValue, kind: NodeType) -> Result<StoredValue> {
         use serde::Deserialize;
         use std::io::{Seek, SeekFrom};
@@ -621,6 +645,7 @@ impl Attempt {
     }
 }
 
+#[cfg(not(unix))]
 struct Capture<'a> {
     attempt: &'a Attempt,
     output_id: String,
@@ -630,6 +655,7 @@ struct Capture<'a> {
     hash: Sha256,
     pending: Vec<u8>,
 }
+#[cfg(not(unix))]
 impl<'a> Capture<'a> {
     fn new(attempt: &'a Attempt, codec: ValueCodec) -> Self {
         Self {

@@ -85,7 +85,7 @@ async fn v2_subscription_backfills_from_run_sequence_and_closes_after_terminal()
     let module = flow_rpc::journal_v2::module(backend.clone(), token.clone()).unwrap();
     let request=json!({"jsonrpc":"2.0","id":1,"method":"run.subscribe","params":{"run_id":run_id,"_token":token,"event_format":"v2","from_seq":"1"}}).to_string();
     let (_, mut stream) = module.raw_json_request(&request, 32).await.unwrap();
-    backend.start_execution().await.unwrap();
+    start_ipc(&backend, 16).await;
     let mut seqs = Vec::new();
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         while let Some(message) = stream.recv().await {
@@ -291,7 +291,7 @@ async fn slow_subscription_can_resume_by_pages_and_terminal_audit_stays_live() {
     let module = flow_rpc::journal_v2::module(b.clone(), token.clone()).unwrap();
     let request=json!({"jsonrpc":"2.0","id":1,"method":"run.subscribe","params":{"_token":token,"run_id":id,"event_format":"v2","from_seq":"0"}}).to_string();
     let (_, mut stream) = module.raw_json_request(&request, 1).await.unwrap();
-    b.start_execution().await.unwrap();
+    start_ipc(&b, 16).await;
     // Leave the one-message subscription buffer unread beyond the 2s send deadline.
     tokio::time::sleep(std::time::Duration::from_millis(2300)).await;
     let receipt = b.workflow_create("not blocked", None).await.unwrap();
@@ -529,4 +529,28 @@ async fn product_creation_reports_commit_during_projection_delay() {
     assert_eq!(retry["result"]["visible"], true);
     assert_eq!(backend.state().await.schedules.len(), 1);
     backend.close().await.unwrap();
+}
+
+/// T7：unix 上进程内执行路径已删除，本地语义套件一律走真实 IPC 执行器
+/// （`cargo build --workspace --bins` 先产出 flow-executor）。Windows 过渡态
+/// 仍用 in_process，行为与 T7 之前一致。
+#[cfg(unix)]
+async fn start_ipc(backend: &std::sync::Arc<flow_backend::journal::JournalBackend>, x_max: usize) {
+    backend
+        .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
+            flow_backend::execution::IpcOptions {
+                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
+                    flow_test_support::io::executor_bin(),
+                ),
+                x_max,
+                tag: None,
+            },
+        ))
+        .await
+        .unwrap();
+}
+
+#[cfg(not(unix))]
+async fn start_ipc(backend: &std::sync::Arc<flow_backend::journal::JournalBackend>, x_max: usize) {
+    backend.start_execution_with_limit(x_max).await.unwrap();
 }

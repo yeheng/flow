@@ -122,12 +122,25 @@ flow-executor（子进程，节点语义的唯一居所）
 - **桌面打包**：tauri.conf.json `externalBin: ["bin/flow-executor"]`；release.yml 在 tauri build 前构建 executor 拷至 `bin/flow-executor-<triple>`（macOS 进 Contents/MacOS/ 满足 locate() 同目录契约）；**Windows 占位文件**过渡（B 方案 in_process 不调用，随 A 方案命名管道换真实产物）；`scripts/build-desktop-executor.sh` 本地开发前置；桌面测试注入 FLOW_EXECUTOR_BIN。
 - **backend-perf 修复（main 预存 bug）**：collect_arrivals 读旧信封格式（顶层 `run_id/type`），订阅协议事件体包在 `envelope["event"]` 层后 perf 未跟上——0 事件断言炸；对齐后恢复可用。
 - **验收**：backend-e2e 全量 **59/59 在 ipc 默认下绿**；桌面测试 3/3（ipc 默认下跑通）；journal_ipc 12/12（单线程/并行）；remote_ops/tls 各 3/3；flow-config 7/7；RSS 有界用例（release）：master 22MiB / executor peak 11MiB、无孤儿进程；perf 对比留档（debug/200 runs）：chain 3.18 vs 3.21 runs/s、fanout 2.57 vs 2.64 runs/s，**ipc 与 in_process 差 ±3% 内**（往返开销被 journal 写延迟掩盖）。
+- **收尾（668aea3）**：T6 提交后 main CI 转红——`flow-cli tests/cli.rs`、`flow-rpc tests/contracts.rs`、`flow-rpc tests/journal_cluster.rs` 在默认 ipc 下定位不到兄弟执行器、`web/e2e/global-setup.ts` 的服务端起不来。三处套件显式指定执行模式 + e2e 注入 `FLOW_EXECUTOR_BIN` 后 CI 全绿（windows-check / e2e / journal-cluster / web / build 均绿）。
 
-### ⏳ T7 · 删除进程内执行路径（T6 后沉淀一个版本周期）
+### ✅ T7 · 删除进程内执行路径（完成）
 
-- `ExecutionPort::InProcess` 删除；journal_driver.rs `execute()` 与 journal_execution.rs 计算类函数删除（`Attempt` 的 master 侧职责——finish/snapshot/裁决——按调用图保留，不按文件删）。
-- `PanicOnScript` 改注入 executor 猝死（杀进程测试已有先例）。
-- DESIGN.md 写入三链路定论图 + 模式矩阵（原 T5 文档分层并入本任务）。
+范围定稿：**unix 删除、非 unix 保留**（Windows 过渡态是 B 方案，等命名管道 A 方案落地后再删）。
+节点执行语义在 unix 上只剩 `flow-executor`；master 只做裁决与调度。
+
+- **执行端口**：`ExecutionPort::InProcess` 变 `#[cfg(not(unix))]`；`start_execution` / `start_execution_with_limit` 只在非 unix 编译；`ExecutionMode::InProcess` 同样 cfg 门控（unix 上该枚举只剩 `Ipc`）。
+- **master 侧进程内实现删除**：`journal_driver::execute()` / `start_child()`，以及 `journal_execution` 的 `prepare` / `materialize` / `compute` / `wait` / `authorize` / `harness(_output)` / `http(_output)` / `audit` / `json` / `stream` / `Capture` 全部 `#[cfg(not(unix))]`——unix 编译产物里不存在；`Attempt` 只留 master 侧职责（begin/snapshot/finish）。
+- **明确拒绝、不静默换模式**：`flow-config` validate、`execution::mode_from_config`、`mode_from_env_with`、`flow-backend::start_execution` 四处在 unix 对 `in_process` 报 `IN_PROCESS_REMOVED`；`FLOW_EXECUTION_MODE=""` 仍是「未设置 → 平台默认」。
+- **删码引发的一个真实语义缺口（已修）**：删除进程内实现后，`journal_execution` 与 `flow-executor::task` 的 http 语义差异暴露——**执行器原先先授权后构造请求**，畸形请求（换行 header / 非法 URL / 非法 proxy）会先进 uncertain，违反「畸形请求必须在授权前判死」。修复：`http_node` 增加授权前预检（`build_outbound(None)`），与进程内实现的原顺序对齐。
+- **删码引发的第二个真实缺陷（已修）**：`JournalBackend::close()` 原先用同一个 `shutdown` token 既停协调器又停投影。协调器退出前可能正卡在 `command()` 的可见性等待（如取消 64 个子 run 的 `run_cancel`），投影先停就永远等不到 `applied_lsn`，每个等待吃满 `wait_timeout`（30s）× N → `close()` 表现为挂死（`journal_acceptance::cancelled_fanout_tree_finishes_after_restart` 迁移到 IPC 后必现）。修复：拆出 `projector_stop` token，`close()` 先停协调器并 join，**投影继续跑**，之后才停投影（该用例从挂死 >2min 变 4.5s 通过）。
+- **执行槽位语义对齐**：`start_execution_ipc` 原先把协调器派发窗口硬编码 16，忽略 `x_max`；现按 `x_max.clamp(1,16)` 同时作为池容量与 A_max，与 `start_execution_with_limit` 语义一致（`x_max=1` 的串行断言才有意义）。
+- **测试迁移（约 35 处调用点）**：journal_execution / journal_acceptance / journal_capacity / journal_remote / journal_ipc / flow-rpc journal_v2 / flow-cli / flow-rpc contracts 从 `start_execution[_with_limit]()` 改为新 `start_ipc(backend, x_max)` 助手（显式指向工作区 flow-executor，`#[cfg(not(unix))]` 分支保留原 in_process 行为）；`journal_ipc_packaging` 的模式解析断言按平台拆分（unix：`in_process` 报错、`""`=ipc）。
+- **PanicOnScript → executor 猝死**：原 lib 单测（注入 panic）删除，职责并入 `journal_ipc::killing_executor_mid_script_recovers_with_new_process`——真 SIGKILL 执行器 → 节点 failed + attempts 全 sealed + 新会话继续服务。
+- **`transient_materialize_error_retries_without_another_command` 改造**：失败注入点从「128KiB 脚本体」改为「128KiB 定义 padding」——节点体受协议 v2 控制帧 `CONTROL_MAX_FRAME/2`（32KiB）预检约束，只有控制帧外的定义体积超过 `INLINE_BYTES` 才落分块值存储，把 `root/journal` 值目录挪走才能制造 materialize 失败。
+- **CI**：journal-cluster 作业新增 `cargo build -p flow-executor`（该作业起真服务端，unix 默认 ipc 需要它的绝对路径）。
+- **文档**：DESIGN.md §2.1 三链路定论图 + 模式矩阵；OPS.md 单机进程矩阵 / §2 / §2.1；JSONL_DEVELOPMENT、JOURNAL_CLUSTER、flow.config.example.toml、web 设置页帮助文本同步（`in_process` 标注为仅非 unix）。
+- **验证**：`cargo test --workspace --all-targets` 全绿（含 backend-e2e 59、journal_ipc、journal_execution 8、journal_acceptance、journal_capacity、remote 套件在真实执行器下）；`cargo fmt --all --check` + `cargo clippy --workspace --all-targets -- -D warnings` 绿；journal-cluster 本地 PG 18 上 6+2 绿；web vitest 111/111、playwright 13/13。
 
 ---
 
@@ -146,6 +159,9 @@ flow-executor（子进程，节点语义的唯一居所）
 4. Windows 先 B（in_process 过渡）后 A（命名管道）。
 5. `previous_outcome` 判定为描述符类留在控制帧（体已走 op-body）。
 6. executor/agent 二进制为 unix 产品，Windows check 用 `--exclude` 排除而非门控其内部。
+7. T7 **只删 unix** 的进程内路径，Windows 保留 `#[cfg(not(unix))]` 过渡态（B 方案）；没有全平台一起删，避免桌面在命名管道 A 方案落地前出现功能真空。
+8. T7 把 IPC 的 `x_max` 同时当作协调器派发窗口（A_max）——原先硬编码 16 会让「执行槽位」这同一个旋钮在两个层面各说各话。
+9. 删掉进程内实现后暴露的 http 授权顺序差异，按**进程内原有语义**修执行器（畸形请求授权前判死），而不是改测试迁就执行器。
 
 ## 五、验证命令速查
 
@@ -153,8 +169,13 @@ flow-executor（子进程，节点语义的唯一居所）
 cargo build --workspace --bins                 # 测试前置：产出真实二进制
 cargo test -p flow-engine --lib                # 协议单测（含 FD 排列）
 cargo test -p flow-backend --test journal_ipc  # IPC e2e（真实执行器）
+cargo test -p flow-backend --test journal_execution --test journal_acceptance --test journal_capacity
 cargo test -p flow-backend --test journal_remote_ops --test journal_remote_tls
 cargo test -p backend-e2e                      # T4 哨兵套件
-cd web && npx vitest run                       # web 单测
+cd web && npx vitest run && npm run test:e2e   # web 单测 + 浏览器 e2e（自建 flow-executor）
+# 集群作业（T7 起需要执行器；本地用 PG 18 起临时库）：
+# FLOW_CLUSTER_TEST_DATABASE_URL=postgres://flow:flow-test@127.0.0.1:55432/flow_cluster_test \
+#   cargo build -p flow-executor && cargo test -p flow-rpc --features journal-cluster \
+#   --test journal_cluster -- --ignored
 cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
 ```

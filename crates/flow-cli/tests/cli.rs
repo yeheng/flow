@@ -38,14 +38,10 @@ impl TestServer {
         let backend = JournalBackend::open(scratch.path(), Default::default())
             .await
             .expect("打开 journal 后端失败");
-        // CLI 测试只覆盖 CLI/JSON-RPC 契约；执行模式默认值（unix=ipc）由
-        // backend-e2e / journal_ipc / 桌面套件覆盖。这里显式 in_process：
-        // 服务端在测试进程内（测试二进制位于 deps/），locate() 找不到兄弟
-        // flow-executor；CLI 契约测试不应背上「先构建 executor」的隐式依赖。
-        let execution = flow_config::ExecutionConfig {
-            mode: flow_config::ExecutionModeKind::InProcess,
-            ..Default::default()
-        };
+        // T7：unix 本地执行只有 ipc（进程内路径已删除）。服务端在测试进程内
+        // （测试二进制位于 deps/），locate() 找不到兄弟 flow-executor，
+        // 因此显式指向工作区执行器产物；Windows 过渡态仍用 in_process。
+        let execution = execution_config();
         flow_backend::start_execution(&execution, &backend)
             .await
             .expect("启动执行驱动失败");
@@ -590,5 +586,26 @@ async fn wait_terminal(server: &TestServer, run_id: &str) -> Value {
             "run {run_id} 未在 20s 内终结"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// T7：unix 上进程内执行路径已删除，本地执行只有 ipc——显式指向工作区产出的
+/// flow-executor（`cargo build --workspace --bins` 先产出）；Windows 过渡态
+/// 仍用 in_process。
+fn execution_config() -> flow_config::ExecutionConfig {
+    #[cfg(unix)]
+    {
+        flow_config::ExecutionConfig {
+            mode: flow_config::ExecutionModeKind::Ipc,
+            executor_bin: Some(flow_test_support::io::executor_bin().display().to_string()),
+            ..Default::default()
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        flow_config::ExecutionConfig {
+            mode: flow_config::ExecutionModeKind::InProcess,
+            ..Default::default()
+        }
     }
 }

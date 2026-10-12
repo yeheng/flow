@@ -111,6 +111,10 @@ jobs:
         with:
           key: journal-cluster
       - run: cargo clippy -p flow-rpc -p flow-backend --all-targets --features journal-cluster --locked -- -D warnings
+      # T7：unix 上进程内执行路径已删除，产品服务端只有 ipc。flow-rpc 的集群
+      # 套件起真服务端，必须能定位到 flow-executor（该作业不跑 workspace 全量
+      # 测试，这里单独产出）。
+      - run: cargo build -p flow-executor --locked
       - run: cargo test -p flow-backend --features journal-cluster --test journal_cluster --locked -- --ignored
       - run: cargo test -p flow-rpc --features journal-cluster --test journal_cluster --locked -- --ignored
 

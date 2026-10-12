@@ -60,7 +60,7 @@ async fn sustained_mixed_business() {
     ] {
         workflows.push(install(&b,json!([{"id":"s","type":"start"},{"id":"n","type":kind,"params":params},{"id":"e","type":"end"}]),json!([{"from":"s","to":"n"},{"from":"n","to":"e"}])).await);
     }
-    b.start_execution_with_limit(16).await.unwrap();
+    start_ipc(&b, 16).await;
     let start = Instant::now();
     let before = b.journal.stats();
     let mut tasks = tokio::task::JoinSet::new();
@@ -154,7 +154,7 @@ async fn observation_failure_and_flood_do_not_change_business_result() {
         if mode == "unwritable" {
             std::fs::create_dir(root.join("observations/00000001.jsonl")).unwrap();
         }
-        b.start_execution().await.unwrap();
+        start_ipc(&b, 16).await;
         let receipt = b
             .run_start(&w, None, json!({}), "manual", None, None)
             .await
@@ -210,7 +210,7 @@ async fn cancelled_fanout_tree_finishes_after_restart() {
         .await
         .unwrap();
     let parent = r.result["run_id"].as_str().unwrap().to_owned();
-    b.start_execution_with_limit(4).await.unwrap();
+    start_ipc(&b, 4).await;
     tokio::time::timeout(Duration::from_secs(90), async {
         loop {
             if b.state().await.runs.len() == 65 {
@@ -227,7 +227,7 @@ async fn cancelled_fanout_tree_finishes_after_restart() {
     let b = JournalBackend::open(temp.path(), Default::default())
         .await
         .unwrap();
-    b.start_execution_with_limit(1).await.unwrap();
+    start_ipc(&b, 1).await;
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if b.state()
@@ -300,7 +300,7 @@ async fn aggregate_predecessors_and_oversize_output_fail_within_budget() {
         {"id":"j","type":"script","params":{"code":"throw new Error('USER_CODE_RAN');"}},
         {"id":"e","type":"end"}
     ]),json!([{"from":"s","to":"a"},{"from":"s","to":"b"},{"from":"a","to":"j"},{"from":"b","to":"j"},{"from":"j","to":"e"}])).await;
-    b.start_execution_with_limit(2).await.unwrap();
+    start_ipc(&b, 2).await;
     let receipt = b
         .run_start(&w, None, json!({}), "manual", None, None)
         .await
@@ -355,7 +355,7 @@ async fn cancel_authorized_http_before_response_never_advances_or_resends() {
             .is_ok()
     });
     let w=install(&b,json!([{"id":"s","type":"start"},{"id":"h","type":"http_call","params":{"url":format!("http://{addr}")}},{"id":"e","type":"end"}]),json!([{"from":"s","to":"h"},{"from":"h","to":"e"}])).await;
-    b.start_execution().await.unwrap();
+    start_ipc(&b, 16).await;
     let r = b
         .run_start(&w, None, json!({}), "manual", None, None)
         .await
@@ -373,7 +373,7 @@ async fn cancel_authorized_http_before_response_never_advances_or_resends() {
     let b = JournalBackend::open(temp.path(), Default::default())
         .await
         .unwrap();
-    b.start_execution().await.unwrap();
+    start_ipc(&b, 16).await;
     let r = terminal(&b, &id).await;
     assert_eq!(r.status, "cancelled");
     assert!(!r.nodes.contains_key("e"));
@@ -387,7 +387,7 @@ async fn authorized_crash_child() {
     let b = JournalBackend::open(&root, Default::default())
         .await
         .unwrap();
-    b.start_execution().await.unwrap();
+    start_ipc(&b, 16).await;
     std::future::pending::<()>().await;
 }
 #[tokio::test]
@@ -426,7 +426,7 @@ async fn sigkill_after_external_request_recovers_uncertain_without_resend() {
     let b = JournalBackend::open(temp.path(), Default::default())
         .await
         .unwrap();
-    b.start_execution().await.unwrap();
+    start_ipc(&b, 16).await;
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let s = b.state().await;
@@ -509,7 +509,7 @@ async fn enospc_observations_and_backup_target_do_not_damage_authority() {
         );
     }
     assert!(filled < 40 * 1024 * 1024);
-    b.start_execution().await.unwrap();
+    start_ipc(&b, 16).await;
     let r = b
         .run_start(
             &w,
@@ -568,7 +568,7 @@ async fn http_without_length_expansion_hits_output_budget_and_retains_outcome() 
         .run_start(&w, None, json!({}), "manual", None, None)
         .await
         .unwrap();
-    b.start_execution_with_limit(1).await.unwrap();
+    start_ipc(&b, 1).await;
     let run = terminal(&b, r.result["run_id"].as_str().unwrap()).await;
     server.await.unwrap();
     assert_eq!(run.status, "failed");
@@ -635,7 +635,7 @@ async fn sixteen_active_tasks_and_simultaneous_release_are_bounded() {
             .unwrap();
         ids.push(r.result["run_id"].as_str().unwrap().to_owned());
     }
-    b.start_execution_with_limit(16).await.unwrap();
+    start_ipc(&b, 16).await;
     tokio::time::timeout(Duration::from_secs(30), wait)
         .await
         .unwrap()
@@ -657,4 +657,28 @@ async fn sixteen_active_tasks_and_simultaneous_release_are_bounded() {
     println!("16 active HTTP tasks, 1 MiB responses then JS, all released together; drain={:?}; peak_active={}",start.elapsed(),b.execution_peak());
     assert!(start.elapsed() < Duration::from_secs(30));
     b.close().await.unwrap();
+}
+
+/// T7：unix 上进程内执行路径已删除，本地语义套件一律走真实 IPC 执行器
+/// （`cargo build --workspace --bins` 先产出 flow-executor）。Windows 过渡态
+/// 仍用 in_process，行为与 T7 之前一致。
+#[cfg(unix)]
+async fn start_ipc(backend: &std::sync::Arc<flow_backend::journal::JournalBackend>, x_max: usize) {
+    backend
+        .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
+            flow_backend::execution::IpcOptions {
+                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
+                    flow_test_support::io::executor_bin(),
+                ),
+                x_max,
+                tag: None,
+            },
+        ))
+        .await
+        .unwrap();
+}
+
+#[cfg(not(unix))]
+async fn start_ipc(backend: &std::sync::Arc<flow_backend::journal::JournalBackend>, x_max: usize) {
+    backend.start_execution_with_limit(x_max).await.unwrap();
 }

@@ -41,7 +41,7 @@ async fn thousand_waiting_runs_release_slots_and_recover_bounded_dispatch() {
         .is_err());
     latency.sort_unstable();
     assert!(latency[990] < 250_000, "projected p99 us={}", latency[990]);
-    backend.start_execution_with_limit(2).await.unwrap();
+    start_ipc(&backend, 2).await;
     tokio::time::timeout(Duration::from_secs(180), async {
         loop {
             if backend
@@ -85,7 +85,7 @@ async fn thousand_waiting_runs_release_slots_and_recover_bounded_dispatch() {
         .unwrap();
     assert_eq!(backend.state().await.runs.len(), 1000);
     assert!(restart.elapsed() < Duration::from_secs(60));
-    backend.start_execution_with_limit(1).await.unwrap();
+    start_ipc(&backend, 1).await;
     for run in &runs {
         backend
             .run_cancel(run, Some("capacity-cancel"))
@@ -189,4 +189,28 @@ async fn capacity_crash_child() {
     assert_eq!(backend.state().await.runs.len(), 1000);
     std::fs::write(std::env::var("FLOW_CAPACITY_READY").unwrap(), b"loaded").unwrap();
     std::future::pending::<()>().await;
+}
+
+/// T7：unix 上进程内执行路径已删除，本地语义套件一律走真实 IPC 执行器
+/// （`cargo build --workspace --bins` 先产出 flow-executor）。Windows 过渡态
+/// 仍用 in_process，行为与 T7 之前一致。
+#[cfg(unix)]
+async fn start_ipc(backend: &std::sync::Arc<flow_backend::journal::JournalBackend>, x_max: usize) {
+    backend
+        .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
+            flow_backend::execution::IpcOptions {
+                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
+                    flow_test_support::io::executor_bin(),
+                ),
+                x_max,
+                tag: None,
+            },
+        ))
+        .await
+        .unwrap();
+}
+
+#[cfg(not(unix))]
+async fn start_ipc(backend: &std::sync::Arc<flow_backend::journal::JournalBackend>, x_max: usize) {
+    backend.start_execution_with_limit(x_max).await.unwrap();
 }

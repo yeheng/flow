@@ -218,6 +218,7 @@ export interface RemoteExecutionConfig {
 }
 
 export interface ExecutionConfig {
+  /** T7：unix 上 `in_process` 已删除（配置校验会拒绝），仅 Windows 过渡态合法。 */
   mode: "in_process" | "ipc" | "remote";
   executor_bin: string | null;
   x_max: number;

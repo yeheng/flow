@@ -95,7 +95,7 @@ const sections: SectionDesc[] = [
         label: "执行模式",
         type: "enum",
         options: ["in_process", "ipc", "remote"],
-        help: "in_process=进程内；ipc=本机执行器子进程；remote=远程 agent",
+        help: "ipc=本机执行器子进程（unix 缺省）；remote=远程 agent；in_process=进程内（仅 Windows，unix 上会被拒绝）",
       },
       { key: "executor_bin", label: "执行器二进制", help: "留空 = 自召唤 flow executor" },
       { key: "x_max", label: "执行槽位（1..=16）", type: "number" },

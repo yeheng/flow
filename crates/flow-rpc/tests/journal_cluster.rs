@@ -7,12 +7,13 @@ use std::time::Duration;
 
 fn spawn(dir: &TempDir, cluster: &str, node: &str) -> common::ServerProc {
     let config = dir.path().join("flow.toml");
-    // 显式 in_process：本套件只验证 PG 注册/租约语义，不起 run；集群作业
-    // 不构建 flow-executor（默认 ipc 会因定位不到兄弟二进制而拒绝启动）。
+    // T7：unix 上进程内执行路径已删除，产品服务端只有 ipc——显式指向工作区
+    // 产出的 flow-executor（集群作业因此需要先构建它）。本套件不起 run，
+    // 执行器只在启动时完成定位/装配。
     std::fs::write(
         &config,
         format!(
-            "[server]\nscheduler_enabled=false\n[execution]\nmode=\"in_process\"\n[journal.cluster]\ncluster_id='{cluster}'\nnode_id='{node}'\nheartbeat_ms=500\nlease_ms=2000\n"
+            "[server]\nscheduler_enabled=false\n[execution]\nmode=\"ipc\"\n[journal.cluster]\ncluster_id='{cluster}'\nnode_id='{node}'\nheartbeat_ms=500\nlease_ms=2000\n"
         ),
     )
     .unwrap();
@@ -22,6 +23,7 @@ fn spawn(dir: &TempDir, cluster: &str, node: &str) -> common::ServerProc {
         .env("FLOW_DATA_DIR", dir.path().join("secrets"))
         .env("FLOW_JOURNAL_DATA_DIR", dir.path().join("journal"))
         .env("FLOW_JOURNAL_TOKEN", common::TOKEN)
+        .env("FLOW_EXECUTOR_BIN", flow_test_support::io::executor_bin())
         .env(
             "FLOW_CLUSTER_DATABASE_URL",
             std::env::var("FLOW_CLUSTER_TEST_DATABASE_URL").expect("isolated PG required"),

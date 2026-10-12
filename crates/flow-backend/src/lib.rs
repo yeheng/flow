@@ -47,6 +47,15 @@ pub async fn start_execution(
         crate::journal::JournalError::Journal(flow_journal::Error::Invalid(message))
     };
     match execution.mode {
+        // T7：unix 上进程内执行路径已删除，本地执行只有 ipc；非 unix 保留
+        // in_process 作为 Windows 过渡态（B 方案）。两种情形都明确处理，
+        // 不静默改走别的模式。
+        #[cfg(unix)]
+        flow_config::ExecutionModeKind::InProcess => {
+            let _ = &execution;
+            Err(invalid(execution::IN_PROCESS_REMOVED.into()))
+        }
+        #[cfg(not(unix))]
         flow_config::ExecutionModeKind::InProcess => backend.start_execution().await,
         flow_config::ExecutionModeKind::Ipc => {
             // IPC 执行层是 unix-only（socketpair + pre_exec FD 槽位）；其余
@@ -55,11 +64,6 @@ pub async fn start_execution(
             {
                 let options = match execution::mode_from_config(execution) {
                     Ok(execution::ExecutionMode::Ipc(options)) => options,
-                    Ok(execution::ExecutionMode::InProcess) => {
-                        return Err(invalid(
-                            "execution.mode=ipc: internal parse mismatch".into(),
-                        ))
-                    }
                     Err(error) => return Err(invalid(format!("execution.mode=ipc: {error}"))),
                 };
                 backend

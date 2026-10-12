@@ -117,9 +117,9 @@ flow-journal-server --config /etc/flow/flow.toml
 
 | 执行模式 | 需启动的进程 | 说明 |
 | --- | --- | --- |
-| `in_process`（缺省） | 只 `flow-journal-server` | 无子进程，节点在服务进程内执行 |
-| `ipc` | `flow-journal-server`（同目录备好 `flow-executor`） | `flow-executor` 由主进程按需召唤 |
+| `ipc`（unix 缺省，终态） | `flow-journal-server`（同目录备好 `flow-executor`） | `flow-executor` 由主进程按需召唤 |
 | `remote` | `flow-journal-server` + 每台执行机 `flow-agent` | 执行机上也需 `flow-executor` |
+| `in_process`（仅非 unix） | 只 `flow-journal-server` | 无子进程，节点在服务进程内执行；Windows 过渡态，**unix 上配置即报错**（T7 已删除该路径） |
 
 单机 `ipc` 的完整形态（生产常用，隔离节点执行但不必跨机）：
 
@@ -163,13 +163,18 @@ scripts/build-journal.sh    # → dist/journal/（唯一打包入口）
 
 同一数据集单写者；一个 run 只绑定一种执行模式；`master_epoch` 随执行启动持久提交。
 模式缺失资源（ipc 无执行器、remote 缺 `[execution.remote]`）**直接失败，不静默
-回退进程内**——「进程隔离/远程执行」的部署承诺不能被空气化。
+回退进程内**——「进程隔离/远程执行」的部署承诺不能被空气化。T7 起 unix 上已
+**删除进程内执行路径**：`mode = "in_process"` 在配置期（`flow-config` validate）与
+装配期（`flow-backend::start_execution`）双重拒绝，本地执行只有 `ipc`。
 
-### 2.1 in_process（缺省）
+### 2.1 in_process（仅 Windows 过渡态）
 
-节点在服务进程内执行。`[execution] mode = "in_process"`。适合低隔离要求的内部部署。
+节点在服务进程内执行。`[execution] mode = "in_process"`，**只在非 unix 平台合法**
+（Windows B 方案，等命名管道 transport 的 A 方案）。unix 上配置该模式会明确报错：
+`execution.mode=in_process 已删除：unix 上本地执行只有 ipc（T7）`。Windows 桌面端
+在无配置文件时默认 `x_max = 8`。
 
-### 2.2 ipc（本机执行子进程）
+### 2.2 ipc（unix 缺省 / 本机执行子进程）
 
 模板 / script / condition / HTTP 全部在 `flow-executor` 子进程内执行；journal 语义
 与进程内模式逐字节同构。

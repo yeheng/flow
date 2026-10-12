@@ -770,7 +770,6 @@ impl TaskRunner {
             "proxy": params.get("proxy").cloned().unwrap_or(Value::Null),
             "credential": params.get("credential").cloned().unwrap_or(Value::Null),
         });
-        let credential = self.authorize_operation(request).await?;
         let http_method = reqwest::Method::from_bytes(method.as_bytes())
             .map_err(|e| TaskError::Invalid(e.to_string()))?;
         // proxy：非法 URL 是配置错误（授权前构建请求时就该失败的最晚一刻）
@@ -786,34 +785,42 @@ impl TaskRunner {
         let client = builder
             .build()
             .map_err(|e| TaskError::Invalid(e.to_string()))?;
-        let mut request = client
-            .request(
-                http_method,
-                reqwest::Url::parse(&url).map_err(|e| TaskError::Invalid(e.to_string()))?,
-            )
-            .timeout(Duration::from_millis(
-                params["timeout_ms"].as_u64().unwrap_or(30_000),
-            ));
-        if let Some(headers) = params["headers"].as_object() {
-            for (key, value) in headers {
-                request = request.header(
-                    key,
-                    value
-                        .as_str()
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| value.to_string()),
-                );
+        let build_outbound = |credential: Option<String>| -> Result<reqwest::Request, TaskError> {
+            let mut request = client
+                .request(
+                    http_method.clone(),
+                    reqwest::Url::parse(&url).map_err(|e| TaskError::Invalid(e.to_string()))?,
+                )
+                .timeout(Duration::from_millis(
+                    params["timeout_ms"].as_u64().unwrap_or(30_000),
+                ));
+            if let Some(headers) = params["headers"].as_object() {
+                for (key, value) in headers {
+                    request = request.header(
+                        key,
+                        value
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| value.to_string()),
+                    );
+                }
             }
-        }
-        if !params["body"].is_null() {
-            request = request.json(&params["body"]);
-        }
-        if let Some(secret) = credential {
-            request = request.bearer_auth(secret);
-        }
-        let outbound_request = request
-            .build()
-            .map_err(|e| TaskError::Invalid(e.to_string()))?;
+            if !params["body"].is_null() {
+                request = request.json(&params["body"]);
+            }
+            if let Some(secret) = credential {
+                request = request.bearer_auth(secret);
+            }
+            request
+                .build()
+                .map_err(|e| TaskError::Invalid(e.to_string()))
+        };
+        // T7：畸形请求（换行 header、非法 URL/方法/proxy）必须在授权前失败。
+        // 授权即承诺「副作用可能已发生」，永远发不出去的请求不该进 uncertain——
+        // 这条不变量原先由 master 侧进程内实现保证，删除后由执行器自己守住。
+        build_outbound(None)?;
+        let credential = self.authorize_operation(request).await?;
+        let outbound_request = build_outbound(credential)?;
         let mut response = match client.execute(outbound_request).await {
             Ok(response) => response,
             Err(error) => {

@@ -43,11 +43,19 @@ pub use pool::ExecutorPool;
 
 #[derive(Debug, Clone)]
 pub enum ExecutionMode {
-    /// 一期进程内执行（默认）。
+    /// 进程内执行：Windows 过渡态专用（B 方案，等命名管道 A 方案）。
+    /// unix 已在 T7 删除——本地执行只有 [`ExecutionMode::Ipc`]。
+    #[cfg(not(unix))]
     InProcess,
-    /// 二期本地 IPC 执行子进程。
+    /// 本地 IPC 执行子进程（unix 的本地终态）。
     Ipc(IpcOptions),
 }
+
+/// unix 上 `mode=in_process` 的明确拒绝文案（T7：进程内执行路径已删除，
+/// 不静默改走其它模式）。Windows 过渡态仍在用该模式，见 [`ExecutionMode`]。
+#[cfg(unix)]
+pub const IN_PROCESS_REMOVED: &str =
+    "execution.mode=in_process 已删除：unix 上本地执行只有 ipc（T7）";
 
 #[derive(Debug, Clone)]
 pub struct IpcOptions {
@@ -76,7 +84,10 @@ pub fn mode_from_env() -> Result<ExecutionMode, String> {
 /// 从统一配置解析执行模式（产品入口；env 已由 flow-config 合并进配置值）。
 pub fn mode_from_config(config: &flow_config::ExecutionConfig) -> Result<ExecutionMode, String> {
     match config.mode {
+        #[cfg(not(unix))]
         flow_config::ExecutionModeKind::InProcess => Ok(ExecutionMode::InProcess),
+        #[cfg(unix)]
+        flow_config::ExecutionModeKind::InProcess => Err(IN_PROCESS_REMOVED.into()),
         flow_config::ExecutionModeKind::Ipc => {
             let executor = match &config.executor_bin {
                 Some(bin) => Ok(ExecutorInvocation::explicit(bin.clone())),
@@ -125,8 +136,23 @@ pub fn remote_options_from_config(
 }
 
 pub fn mode_from_env_with(value: &str) -> Result<ExecutionMode, String> {
+    // T6：空值 = 未设置，继承平台默认（unix=ipc / Windows=in_process）。
+    #[cfg(unix)]
+    let value = if value.is_empty() { "ipc" } else { value };
+    #[cfg(not(unix))]
+    let value = if value.is_empty() {
+        "in_process"
+    } else {
+        value
+    };
     match value {
-        "" | "in_process" => Ok(ExecutionMode::InProcess),
+        "in_process" => {
+            // T7：unix 已无进程内执行路径——显式拒绝，不静默改走 ipc。
+            #[cfg(unix)]
+            return Err(IN_PROCESS_REMOVED.into());
+            #[cfg(not(unix))]
+            return Ok(ExecutionMode::InProcess);
+        }
         "ipc" => {
             let executor = locate_executor()?;
             Ok(ExecutionMode::Ipc(IpcOptions {
@@ -136,7 +162,20 @@ pub fn mode_from_env_with(value: &str) -> Result<ExecutionMode, String> {
             }))
         }
         other => Err(format!(
-            "invalid {EXECUTION_MODE_ENV}={other:?}; expected in_process|ipc"
+            "invalid {EXECUTION_MODE_ENV}={other:?}; expected {}",
+            expected_modes()
         )),
+    }
+}
+
+/// 合法的 `FLOW_EXECUTION_MODE` 取值（unix 上 in_process 已删除）。
+fn expected_modes() -> &'static str {
+    #[cfg(unix)]
+    {
+        "ipc"
+    }
+    #[cfg(not(unix))]
+    {
+        "in_process|ipc"
     }
 }

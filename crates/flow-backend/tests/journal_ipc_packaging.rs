@@ -34,6 +34,20 @@ async fn install(b: &JournalBackend, definition: serde_json::Value) -> String {
 #[test]
 fn mode_env_parsing_rejects_invalid_values() {
     use flow_backend::execution::{mode_from_env_with, ExecutionMode};
+    // T7：unix 已删除进程内执行路径——"in_process" 必须明确报错，而不是
+    // 静默改走 ipc；空值（未设置）继承平台默认 ipc。
+    #[cfg(unix)]
+    {
+        let err = mode_from_env_with("in_process").expect_err("in_process removed on unix");
+        assert!(err.contains("in_process"), "{err}");
+        std::env::set_var("FLOW_EXECUTOR_BIN", executor_bin());
+        assert!(matches!(mode_from_env_with(""), Ok(ExecutionMode::Ipc(_))));
+        std::env::remove_var("FLOW_EXECUTOR_BIN");
+        // 未设置 + 定位不到执行器 → 明确报错，不静默回退。
+        assert!(mode_from_env_with("").is_err());
+    }
+    // Windows 过渡态：in_process 仍是合法值（B 方案，等命名管道 A 方案）。
+    #[cfg(not(unix))]
     for value in ["", "in_process"] {
         assert!(
             matches!(mode_from_env_with(value), Ok(ExecutionMode::InProcess)),

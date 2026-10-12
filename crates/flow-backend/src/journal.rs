@@ -59,7 +59,11 @@ pub struct JournalBackend {
     projected: Arc<Notify>,
     changed: Arc<Notify>,
     paused: Arc<AtomicBool>,
+    /// 协调器停止信号（`cancellation()` 返回它）。**不用于停投影**：协调器
+    /// 退出前可能正卡在 `command()` 的可见性等待上，投影一停就永远等不到。
     shutdown: CancellationToken,
+    /// 投影停止信号：由 `close()` 在协调器 join 之后才触发。
+    projector_stop: CancellationToken,
     projector: Mutex<Option<tokio::task::JoinHandle<()>>>,
     projection_error: Arc<Mutex<Option<String>>>,
     /// 投影游标的内存镜像：projector 每批 apply 后 fetch_max 更新。等待者
@@ -259,6 +263,7 @@ impl JournalBackend {
             changed: Arc::new(Notify::new()),
             paused: Arc::new(AtomicBool::new(false)),
             shutdown: CancellationToken::new(),
+            projector_stop: CancellationToken::new(),
             projector: Mutex::new(None),
             projection_error: Arc::new(Mutex::new(None)),
             projected_lsn: AtomicU64::new(projected_cursor),
@@ -273,11 +278,11 @@ impl JournalBackend {
         let task = tokio::spawn(async move {
             loop {
                 let Some(b) = weak.upgrade() else { return };
-                if b.shutdown.is_cancelled() {
+                if b.projector_stop.is_cancelled() {
                     return;
                 }
                 let changed = b.changed.clone();
-                let shutdown = b.shutdown.clone();
+                let shutdown = b.projector_stop.clone();
                 if b.paused.load(Ordering::Relaxed) || state.applied_lsn >= b.journal.durable_lsn()
                 {
                     drop(b);
@@ -614,10 +619,14 @@ impl JournalBackend {
         self.wait_timeout_ms.store(ms, Ordering::Relaxed);
     }
     pub async fn close(&self) -> Result<()> {
+        // 顺序要紧：先让协调器停，**投影继续跑**——协调器在飞的
+        // `run_cancel`/`command` 还要等 `applied_lsn >= commit_lsn`；投影先停
+        // 会让每个等待吃满 wait_timeout（默认 30s），close 表现为挂死。
         self.shutdown.cancel();
         if let Some(task) = self.execution.lock().await.take() {
             let _ = task.await;
         }
+        self.projector_stop.cancel();
         if let Some(task) = self.projector.lock().await.take() {
             let _ = task.await;
         }

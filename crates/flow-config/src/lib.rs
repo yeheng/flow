@@ -389,6 +389,13 @@ impl Config {
         if !(1..=16).contains(&self.execution.x_max) {
             return Err("execution.x_max 必须在 1..=16".into());
         }
+        // T7：unix 上进程内执行路径已删除（本地执行只有 ipc），配置期就明确
+        // 拒绝——比等到执行装配时才报错更早、更贴近用户输入。非 unix 保留
+        // in_process 作为 Windows 过渡态。
+        #[cfg(unix)]
+        if self.execution.mode == ExecutionModeKind::InProcess {
+            return Err("execution.mode=in_process 已删除：unix 上本地执行只有 ipc（T7）".into());
+        }
         if self.execution.mode == ExecutionModeKind::Remote && self.execution.remote.is_none() {
             return Err("execution.mode=remote 时必须配置 [execution.remote]".into());
         }

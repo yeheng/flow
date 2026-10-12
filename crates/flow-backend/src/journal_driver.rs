@@ -1,14 +1,21 @@
 //! V2 coordinator. Persistent waits occupy no active execution task.
-//! IPC mode (phase 2) replaces the in-process node executor with a managed
-//! subprocess pool; journal semantics are byte-identical between modes.
+//! Node execution semantics live only in the executor: unix drives them through
+//! the local IPC subprocess pool (T7 removed the in-process path), Windows keeps
+//! the in-process port as a transition until the named-pipe transport lands.
 use crate::execution::remote::{RemoteDispatcher, RemoteOptions};
 #[cfg(unix)]
 use crate::execution::{ExecutionMode, IpcDispatcher};
 use crate::journal::{JournalBackend, JournalError};
-use crate::journal_commands::{id, node_event, now};
+use crate::journal_commands::node_event;
+#[cfg(not(unix))]
+use crate::journal_commands::{id, now};
 use crate::journal_execution::Attempt;
-use flow_engine::journal_state::{Parent, Run, Wait};
-use flow_engine::{Definition, NodeLogger, NodeType};
+#[cfg(not(unix))]
+use flow_engine::journal_state::Parent;
+use flow_engine::journal_state::{Run, Wait};
+#[cfg(not(unix))]
+use flow_engine::{journal_state::Prepared, NodeLogger};
+use flow_engine::{Definition, NodeType};
 use flow_journal::{Event, EventKind, StoredValue};
 use futures::FutureExt;
 use serde_json::{json, Value};
@@ -17,12 +24,12 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// 节点执行端口：一期进程内 / 二期本地 IPC（unix）/ 三期远程 agent。
+/// 节点执行端口：unix 本地 IPC / 远程 agent；Windows 过渡态另有进程内。
 #[derive(Clone)]
 pub(crate) enum ExecutionPort {
+    /// 进程内执行：Windows 过渡态专用（T7 起 unix 不再有该路径）。
+    #[cfg(not(unix))]
     InProcess,
-    #[cfg(test)]
-    PanicOnScript,
     #[cfg(unix)]
     Ipc(Arc<IpcDispatcher>),
     Remote(Arc<RemoteDispatcher>),
@@ -33,6 +40,7 @@ fn invalid(s: impl Into<String>) -> flow_journal::Error {
     flow_journal::Error::Invalid(s.into())
 }
 
+#[cfg(not(unix))]
 impl JournalBackend {
     pub async fn start_execution(self: &Arc<Self>) -> Result<()> {
         self.start_execution_with_port(16, ExecutionPort::InProcess)
@@ -45,14 +53,16 @@ impl JournalBackend {
         self.start_execution_with_port(limit, ExecutionPort::InProcess)
             .await
     }
+}
+
+impl JournalBackend {
     /// 二期 IPC 模式：先持久提交新 master_epoch，再创建进程池与派发器
     /// （取得独占写权后持久提交新任期，再派发任务；二期 §3.2）。
     /// Unix only：子进程承载依赖 socketpair + pre_exec FD 槽位。
     #[cfg(unix)]
     pub async fn start_execution_ipc(self: &Arc<Self>, mode: ExecutionMode) -> Result<()> {
-        let crate::execution::ExecutionMode::Ipc(options) = mode else {
-            return self.start_execution().await;
-        };
+        // unix 上 ExecutionMode 只有 Ipc 一个变体（T7 删了 InProcess）。
+        let ExecutionMode::Ipc(options) = mode;
         // I09：启用 IPC 时二进制缺失直接失败，不静默回退进程内执行。
         if !options.executor.program.is_file() {
             return Err(invalid(format!(
@@ -62,9 +72,12 @@ impl JournalBackend {
             .into());
         }
         let epoch = self.bump_master_epoch().await?;
+        // 协调器的派发窗口与执行槽位是同一个旋钮：IPC 的 x_max 同时是池容量与
+        // A_max（与进程内 `start_execution_with_limit` 语义一致）。16 是协议上限。
+        let limit = options.x_max.clamp(1, 16);
         let pool = crate::execution::ExecutorPool::new(options, self.journal.id().into(), epoch);
         let dispatcher = Arc::new(IpcDispatcher::new(pool));
-        self.start_execution_with_port(16, ExecutionPort::Ipc(dispatcher))
+        self.start_execution_with_port(limit, ExecutionPort::Ipc(dispatcher))
             .await
     }
     /// 持久提交新任期并返回新 epoch。
@@ -247,10 +260,7 @@ impl JournalBackend {
                             let node=node.clone();let observation=observation.clone();let port=port.clone();
                             tasks.spawn(async move {
                                 let result=AssertUnwindSafe(async { match &port{
-                                    #[cfg(test)]
-                                    ExecutionPort::PanicOnScript if node.kind() == Some(NodeType::Script) => panic!("injected execution panic"),
-                                    #[cfg(test)]
-                                    ExecutionPort::PanicOnScript => execute(&attempt, &node, predecessors.clone(), NodeLogger::disabled()).await,
+                                    #[cfg(not(unix))]
                                     ExecutionPort::InProcess=>{
                                         let logger=observation.map(|store|NodeLogger::observation(store.logger(attempt.run_id.clone(),attempt.dispatch_id.clone()),attempt.node_id.clone(),1)).unwrap_or_else(NodeLogger::disabled);
                                         execute(&attempt,&node,predecessors.clone(),logger).await
@@ -390,6 +400,9 @@ async fn join_values(
     Ok(StoredValue::Ref(value))
 }
 
+/// 进程内节点执行（Windows 过渡态专用）：T7 起 unix 不再编译这段——节点
+/// 执行语义只存在于 flow-executor，master 只做裁决与调度。
+#[cfg(not(unix))]
 async fn execute(
     attempt: &Attempt,
     node: &flow_engine::Node,
@@ -478,6 +491,7 @@ async fn execute(
         .await
 }
 
+#[cfg(not(unix))]
 async fn start_child(
     attempt: &Attempt,
     prepared: &flow_engine::journal_state::Prepared,
@@ -537,13 +551,31 @@ async fn finish_run(
 #[cfg(test)]
 mod regression_tests {
     use super::*;
-    async fn install(backend: &JournalBackend, code: String) -> String {
+    /// T7：unix 本地执行只有 IPC（进程内路径已删除）。单测显式指向工作区
+    /// 产出的真实执行器（`cargo build --workspace --bins` 先产出）。
+    #[cfg(unix)]
+    async fn start_local(backend: &Arc<JournalBackend>, x_max: usize) {
+        backend
+            .start_execution_ipc(crate::execution::ExecutionMode::Ipc(
+                crate::execution::IpcOptions {
+                    executor:
+                        flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
+                            flow_test_support::io::executor_bin(),
+                        ),
+                    x_max,
+                    tag: None,
+                },
+            ))
+            .await
+            .unwrap();
+    }
+    async fn install(backend: &JournalBackend, definition: Value) -> String {
         let created = backend
             .workflow_create("driver-regression", None)
             .await
             .unwrap();
         let id = created.result["workflow_id"].as_str().unwrap();
-        backend.workflow_update(id, json!({"nodes":[{"id":"s","type":"start"},{"id":"n","type":"script","params":{"code":code}},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"n"},{"from":"n","to":"e"}]}), None).await.unwrap();
+        backend.workflow_update(id, definition, None).await.unwrap();
         backend.workflow_publish(id, 1, None).await.unwrap();
         let started = backend
             .run_start(id, None, json!(null), "manual", None, None)
@@ -564,43 +596,40 @@ mod regression_tests {
         .await
         .unwrap()
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn transient_materialize_error_retries_without_another_command() {
         let root = tempfile::tempdir().unwrap();
         let backend = JournalBackend::open(root.path(), Default::default())
             .await
             .unwrap();
-        let id = install(&backend, format!("return 1; //{}", "x".repeat(128 * 1024))).await;
+        // T7：unix 走 IPC，节点定义要进控制帧且受 `CONTROL_MAX_FRAME/2`（32KiB）
+        // 预检——旧用例的 128KiB 脚本体会被干净拒绝（进程内没有这条边界）。
+        // 失败注入点改放在**定义体积**上：只有超过 INLINE_BYTES 的值才落分块
+        // 存储（root/journal 值目录），把该目录临时挪走才会让 materialize 失败。
+        // 节点本身保持小体积，留在帧预算内。
+        let id = install(
+            &backend,
+            json!({
+                "nodes":[{"id":"s","type":"start"},{"id":"n","type":"script","params":{"code":"return 1;"}},{"id":"e","type":"end"}],
+                "edges":[{"from":"s","to":"n"},{"from":"n","to":"e"}],
+                "_padding": "x".repeat(128 * 1024),
+            }),
+        )
+        .await;
         let path = root.path().join("journal");
         let hidden = root.path().join("temporarily-unavailable");
         std::fs::rename(&path, &hidden).unwrap();
-        backend.start_execution().await.unwrap();
+        start_local(&backend, 16).await;
         tokio::time::sleep(Duration::from_millis(150)).await;
-        assert!(backend.state().await.runs[&id].nodes.is_empty());
+        assert!(
+            backend.state().await.runs[&id].nodes.is_empty(),
+            "hidden-journal nodes: {:?}",
+            backend.state().await.runs[&id].nodes
+        );
         std::fs::rename(&hidden, &path).unwrap();
-        assert_eq!(terminal(&backend, &id).await.status, "succeeded");
-        backend.close().await.unwrap();
-    }
-    #[tokio::test]
-    async fn node_panic_seals_failure_and_driver_keeps_serving() {
-        let root = tempfile::tempdir().unwrap();
-        let backend = JournalBackend::open(root.path(), Default::default())
-            .await
-            .unwrap();
-        backend
-            .start_execution_with_port(2, ExecutionPort::PanicOnScript)
-            .await
-            .unwrap();
-        for _ in 0..2 {
-            let id = install(&backend, "return 1;".into()).await;
-            let run = terminal(&backend, &id).await;
-            assert_eq!(run.status, "failed");
-            assert!(run.nodes["n"].error.as_ref().unwrap().contains("panicked"));
-            assert!(run.nodes["n"]
-                .attempts
-                .values()
-                .all(|attempt| attempt.sealed));
-        }
+        let run = terminal(&backend, &id).await;
+        assert_eq!(run.status, "succeeded", "run={run:?}");
         backend.close().await.unwrap();
     }
 }

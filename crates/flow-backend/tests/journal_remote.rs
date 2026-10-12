@@ -198,7 +198,7 @@ async fn relay_path_produces_identical_authoritative_facts() {
     let direct = JournalBackend::open(&root_direct, JournalOptions::default())
         .await
         .unwrap();
-    direct.start_execution().await.unwrap();
+    start_ipc(&direct, 16).await;
     let flow_direct = install(&direct, serde_json::from_str(WORKFLOW).unwrap()).await;
     let created = direct
         .run_start(&flow_direct, None, json!({"n": 41}), "manual", None, None)
@@ -501,4 +501,28 @@ async fn remote_http_and_large_output_commit_refs() {
     assert_eq!(big_value["blob"].as_str().unwrap().len(), 70_000);
     backend.close().await.unwrap();
     server.abort();
+}
+
+/// T7：unix 上进程内执行路径已删除，本地语义套件一律走真实 IPC 执行器
+/// （`cargo build --workspace --bins` 先产出 flow-executor）。Windows 过渡态
+/// 仍用 in_process，行为与 T7 之前一致。
+#[cfg(unix)]
+async fn start_ipc(backend: &std::sync::Arc<flow_backend::journal::JournalBackend>, x_max: usize) {
+    backend
+        .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
+            flow_backend::execution::IpcOptions {
+                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
+                    flow_test_support::io::executor_bin(),
+                ),
+                x_max,
+                tag: None,
+            },
+        ))
+        .await
+        .unwrap();
+}
+
+#[cfg(not(unix))]
+async fn start_ipc(backend: &std::sync::Arc<flow_backend::journal::JournalBackend>, x_max: usize) {
+    backend.start_execution_with_limit(x_max).await.unwrap();
 }

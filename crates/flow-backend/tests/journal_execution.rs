@@ -28,7 +28,7 @@ async fn pure_retry_preserves_preparation_and_original_deadline_across_restart()
         .await
         .unwrap();
     let run_id = created.result["run_id"].as_str().unwrap();
-    backend.start_execution().await.unwrap();
+    start_ipc(&backend, 16).await;
     let waiting = until(&backend, run_id, |r| {
         r.nodes
             .get("n")
@@ -50,7 +50,7 @@ async fn pure_retry_preserves_preparation_and_original_deadline_across_restart()
             .wake_at,
         deadline
     );
-    backend.start_execution().await.unwrap();
+    start_ipc(&backend, 16).await;
     let done = until(&backend, run_id, Run::terminal).await;
     assert_eq!(done.status, "failed");
     assert_eq!(done.nodes["n"].attempt, 2);
@@ -186,7 +186,7 @@ async fn manual_resolution_binds_operation_and_never_fabricates_outcome() {
         .await
         .unwrap();
     assert_eq!(receipt.commit_cursor, duplicate.commit_cursor);
-    backend.start_execution().await.unwrap();
+    start_ipc(&backend, 16).await;
     let done = until(&backend, run_id, Run::terminal).await;
     assert_eq!(done.status, "succeeded");
     assert!(done.nodes["h"]
@@ -256,7 +256,7 @@ async fn integration_adapters_capture_results_without_persisting_resolved_creden
     let backend = JournalBackend::open(&root, Default::default())
         .await
         .unwrap();
-    backend.start_execution().await.unwrap();
+    start_ipc(&backend, 16).await;
     for (kind, params, expected) in [
         (
             "email",
@@ -335,7 +335,7 @@ async fn script_actual_values_and_delay_survive_restart() {
         .await
         .unwrap();
     let run_id = created.result["run_id"].as_str().unwrap();
-    backend.start_execution().await.unwrap();
+    start_ipc(&backend, 16).await;
     let waiting = until(&backend, run_id, |r| {
         r.nodes.get("d").is_some_and(|n| n.wait.is_some())
     })
@@ -366,7 +366,7 @@ async fn script_actual_values_and_delay_survive_restart() {
             .wake_at,
         wake_at
     );
-    backend.start_execution().await.unwrap();
+    start_ipc(&backend, 16).await;
     let done = until(&backend, run_id, |r| r.terminal()).await;
     assert_eq!(done.status, "succeeded");
     assert_eq!(
@@ -392,7 +392,7 @@ async fn child_completion_wakes_parent_and_signal_is_idempotent() {
         .await
         .unwrap();
     let run_id = created.result["run_id"].as_str().unwrap();
-    backend.start_execution_with_limit(1).await.unwrap();
+    start_ipc(&backend, 1).await;
     let waiting = until(&backend, run_id, |r| {
         r.nodes.get("c").is_some_and(|n| n.wait.is_some())
     })
@@ -466,7 +466,7 @@ async fn http_result_is_complete_and_never_resent_after_wait_restart() {
         .await
         .unwrap();
     let run_id = created.result["run_id"].as_str().unwrap();
-    backend.start_execution().await.unwrap();
+    start_ipc(&backend, 16).await;
     let waiting = until(&backend, run_id, |r| {
         r.nodes.get("d").is_some_and(|n| n.wait.is_some())
     })
@@ -494,7 +494,7 @@ async fn http_result_is_complete_and_never_resent_after_wait_restart() {
     let backend = JournalBackend::open(&root, JournalOptions::default())
         .await
         .unwrap();
-    backend.start_execution().await.unwrap();
+    start_ipc(&backend, 16).await;
     let done = until(&backend, run_id, |r| r.terminal()).await;
     assert_eq!(done.status, "succeeded");
     assert_eq!(calls.load(Ordering::Relaxed), 1);
@@ -518,7 +518,7 @@ async fn three_generations_complete_with_one_active_slot() {
         .run_start(&workflow, None, json!({"proof":42}), "manual", None, None)
         .await
         .unwrap();
-    backend.start_execution_with_limit(1).await.unwrap();
+    start_ipc(&backend, 1).await;
     let run = until(
         &backend,
         receipt.result["run_id"].as_str().unwrap(),
@@ -544,7 +544,7 @@ async fn malformed_request_fails_before_operation_authorization() {
         .run_start(&workflow, None, json!({}), "manual", None, None)
         .await
         .unwrap();
-    backend.start_execution().await.unwrap();
+    start_ipc(&backend, 16).await;
     let run = until(
         &backend,
         receipt.result["run_id"].as_str().unwrap(),
@@ -556,4 +556,28 @@ async fn malformed_request_fails_before_operation_authorization() {
     backend.close().await.unwrap();
     drop(backend);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+/// T7：unix 上进程内执行路径已删除，本地语义套件一律走真实 IPC 执行器
+/// （`cargo build --workspace --bins` 先产出 flow-executor）。Windows 过渡态
+/// 仍用 in_process，行为与 T7 之前一致。
+#[cfg(unix)]
+async fn start_ipc(backend: &std::sync::Arc<flow_backend::journal::JournalBackend>, x_max: usize) {
+    backend
+        .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
+            flow_backend::execution::IpcOptions {
+                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
+                    flow_test_support::io::executor_bin(),
+                ),
+                x_max,
+                tag: None,
+            },
+        ))
+        .await
+        .unwrap();
+}
+
+#[cfg(not(unix))]
+async fn start_ipc(backend: &std::sync::Arc<flow_backend::journal::JournalBackend>, x_max: usize) {
+    backend.start_execution_with_limit(x_max).await.unwrap();
 }
