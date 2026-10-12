@@ -137,10 +137,9 @@ fn agent_main(
         Ok(v) => v,
         Err(err) => return fail(&err),
     };
-    let data_addr = match required(flag_data_addr, agent.data_addr.clone(), "data_addr") {
-        Ok(v) => v,
-        Err(err) => return fail(&err),
-    };
+    // data_addr 已废弃（v3 单条 TLS 上联）：CLI/配置字段为兼容保留，忽略。
+    let _ = flag_data_addr;
+    let _ = &agent.data_addr;
     let agent_id = match required(flag_agent_id, agent.agent_id.clone(), "agent_id") {
         Ok(v) => v,
         Err(err) => return fail(&err),
@@ -191,7 +190,6 @@ fn agent_main(
     let config = flow_agent::runtime::AgentConfig {
         agent_id,
         control_addr,
-        data_addr,
         ca_cert: ca_cert.into(),
         cert: cert.into(),
         key: key.into(),

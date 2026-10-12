@@ -1,16 +1,48 @@
 //! Disposable v2 projection. Business mutations enter as complete journal transactions only.
 use serde_json::Value;
-use sqlx::{Row, SqlitePool};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use std::path::Path;
 
 pub struct Projector {
     pool: SqlitePool,
     journal_id: String,
 }
+
 pub struct ProjectedRow {
     pub kind: String,
     pub key: String,
     pub value: Option<Value>,
+}
+
+#[derive(Default)]
+pub struct RunsQuery<'a> {
+    pub workflow_id: Option<&'a str>,
+    pub status: Option<&'a str>,
+    pub source: Option<&'a str>,
+    pub before_run_id: Option<&'a str>,
+    pub limit: usize,
+}
+
+fn created_order(kind: &str, value: &Value) -> Result<String, sqlx::Error> {
+    if !matches!(
+        kind,
+        "run" | "workflow" | "schedule" | "webhook" | "template"
+    ) {
+        return Ok(String::new());
+    }
+    value
+        .get("created_at")
+        .and_then(Value::as_str)
+        .map(|raw| {
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .map(|ts| {
+                    ts.with_timezone(&chrono::Utc)
+                        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+                })
+                .map_err(|e| sqlx::Error::Decode(Box::new(e)))
+        })
+        .transpose()
+        .map(|v| v.unwrap_or_default())
 }
 
 impl Projector {
@@ -31,12 +63,15 @@ impl Projector {
             .await?;
         for row in rows {
             if let Some(value) = row.value {
-                sqlx::query("INSERT INTO journal_entities(kind,key,body) VALUES(?,?,?)")
-                    .bind(row.kind)
-                    .bind(row.key)
-                    .bind(value.to_string())
-                    .execute(&mut *tx)
-                    .await?;
+                sqlx::query(
+                    "INSERT INTO journal_entities(kind,key,body,created_order) VALUES(?,?,?,?)",
+                )
+                .bind(&row.kind)
+                .bind(row.key)
+                .bind(value.to_string())
+                .bind(created_order(&row.kind, &value)?)
+                .execute(&mut *tx)
+                .await?;
             }
         }
         sqlx::query("UPDATE journal_cursor SET applied_lsn=? WHERE singleton=1")
@@ -58,6 +93,56 @@ impl Projector {
             .await?;
         sqlx::query("CREATE TABLE IF NOT EXISTS journal_cursor (singleton INTEGER PRIMARY KEY CHECK(singleton=1), journal_id TEXT NOT NULL, applied_lsn TEXT NOT NULL)").execute(&pool).await?;
         sqlx::query("CREATE TABLE IF NOT EXISTS journal_entities (kind TEXT NOT NULL, key TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY(kind,key))").execute(&pool).await?;
+        let columns = sqlx::query("PRAGMA table_info(journal_entities)")
+            .fetch_all(&pool)
+            .await?;
+        if !columns
+            .iter()
+            .any(|r| r.get::<&str, _>("name") == "created_order")
+        {
+            sqlx::query("ALTER TABLE journal_entities ADD COLUMN created_order TEXT")
+                .execute(&pool)
+                .await?;
+        }
+        // Migrate old disposable projections one body at a time, preserving nanoseconds
+        // and timezone equivalence rather than relying on raw RFC3339 lexical order.
+        loop {
+            let keys = sqlx::query(
+                "SELECT kind,key FROM journal_entities WHERE created_order IS NULL LIMIT 128",
+            )
+            .fetch_all(&pool)
+            .await?;
+            if keys.is_empty() {
+                break;
+            }
+            let mut tx = pool.begin().await?;
+            for key in keys {
+                let kind = key.get::<&str, _>("kind");
+                let key = key.get::<&str, _>("key");
+                let body: String =
+                    sqlx::query_scalar("SELECT body FROM journal_entities WHERE kind=? AND key=?")
+                        .bind(kind)
+                        .bind(key)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                let value: Value =
+                    serde_json::from_str(&body).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+                sqlx::query("UPDATE journal_entities SET created_order=? WHERE kind=? AND key=?")
+                    .bind(created_order(kind, &value)?)
+                    .bind(kind)
+                    .bind(key)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await?;
+        }
+        for statement in [
+            "CREATE INDEX IF NOT EXISTS journal_created_order_v2 ON journal_entities(kind,created_order DESC,key DESC)",
+            "CREATE INDEX IF NOT EXISTS journal_workflow_order_v2 ON journal_entities(kind,json_extract(body,'$.workflow_id'),created_order DESC,key DESC)",
+            "CREATE INDEX IF NOT EXISTS journal_status_order_v2 ON journal_entities(kind,json_extract(body,'$.status'),created_order DESC,key DESC)",
+            "CREATE INDEX IF NOT EXISTS journal_source_order_v2 ON journal_entities(kind,json_extract(body,'$.source'),created_order DESC,key DESC)",
+            "CREATE INDEX IF NOT EXISTS journal_name_order ON journal_entities(kind,json_extract(body,'$.name'),key)",
+        ] { sqlx::query(statement).execute(&pool).await?; }
         sqlx::query("INSERT OR IGNORE INTO journal_cursor VALUES(1,?, '0')")
             .bind(journal_id)
             .execute(&pool)
@@ -116,8 +201,8 @@ impl Projector {
         }
         for row in rows {
             if let Some(value) = row.value {
-                sqlx::query("INSERT INTO journal_entities(kind,key,body) VALUES(?,?,?) ON CONFLICT(kind,key) DO UPDATE SET body=excluded.body")
-                    .bind(row.kind).bind(row.key).bind(value.to_string()).execute(&mut *tx).await?;
+                sqlx::query("INSERT INTO journal_entities(kind,key,body,created_order) VALUES(?,?,?,?) ON CONFLICT(kind,key) DO UPDATE SET body=excluded.body,created_order=excluded.created_order")
+                    .bind(&row.kind).bind(row.key).bind(value.to_string()).bind(created_order(&row.kind, &value)?).execute(&mut *tx).await?;
             } else {
                 sqlx::query("DELETE FROM journal_entities WHERE kind=? AND key=?")
                     .bind(row.kind)
@@ -203,5 +288,323 @@ impl Projector {
     }
     pub async fn close(&self) {
         self.pool.close().await;
+    }
+
+    /// Filter, keyset ordering and LIMIT execute in the same SQLite snapshot as the cursor.
+    pub async fn runs_page(&self, filter: RunsQuery<'_>) -> Result<(u64, Vec<Value>), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let cursor: Option<String> = match filter.before_run_id {
+            Some(id) => {
+                sqlx::query_scalar(
+                    "SELECT created_order FROM journal_entities WHERE kind='run' AND key=?",
+                )
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?
+            }
+            None => None,
+        };
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT key,length(CAST(body AS BLOB)) AS bytes FROM journal_entities WHERE kind='run'",
+        );
+        for (field, value) in [
+            ("workflow_id", filter.workflow_id),
+            ("status", filter.status),
+            ("source", filter.source),
+        ] {
+            if let Some(value) = value {
+                query
+                    .push(format!(" AND json_extract(body,'$.{field}')="))
+                    .push_bind(value);
+            }
+        }
+        if let Some(created) = &cursor {
+            query
+                .push(" AND (created_order,key)<(")
+                .push_bind(created)
+                .push(",")
+                .push_bind(filter.before_run_id.unwrap())
+                .push(")");
+        }
+        query
+            .push(" ORDER BY created_order DESC,key DESC LIMIT ")
+            .push_bind(filter.limit.min(500) as i64);
+        let rows = query.build().fetch_all(&mut *tx).await?;
+        Self::bodies(&mut tx, "run", rows).await
+    }
+
+    /// Product collections retain their existing order without cloning reducer history.
+    pub async fn ordered(
+        &self,
+        kind: &str,
+        workflow_id: Option<&str>,
+        by_name: bool,
+    ) -> Result<Vec<Value>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT key,length(CAST(body AS BLOB)) AS bytes FROM journal_entities WHERE kind=",
+        );
+        query.push_bind(kind);
+        if let Some(id) = workflow_id {
+            query
+                .push(" AND json_extract(body,'$.workflow_id')=")
+                .push_bind(id);
+        }
+        query.push(if by_name {
+            " ORDER BY json_extract(body,'$.name'),key"
+        } else {
+            " ORDER BY created_order DESC,key DESC"
+        });
+        query.push(" LIMIT 10001");
+        let rows = query.build().fetch_all(&mut *tx).await?;
+        if rows.len() > 10000 {
+            return Err(sqlx::Error::Protocol("RESPONSE_TOO_LARGE".into()));
+        }
+        Ok(Self::bodies(&mut tx, kind, rows).await?.1)
+    }
+
+    async fn bodies(
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        kind: &str,
+        rows: Vec<sqlx::sqlite::SqliteRow>,
+    ) -> Result<(u64, Vec<Value>), sqlx::Error> {
+        let bytes: i64 = rows.iter().map(|r| r.get::<i64, _>("bytes")).sum();
+        if bytes > 8 * 1024 * 1024 {
+            return Err(sqlx::Error::Protocol("RESPONSE_TOO_LARGE".into()));
+        }
+        let mut values = Vec::with_capacity(rows.len());
+        for row in rows {
+            let body: String =
+                sqlx::query_scalar("SELECT body FROM journal_entities WHERE kind=? AND key=?")
+                    .bind(kind)
+                    .bind(row.get::<&str, _>("key"))
+                    .fetch_one(&mut **tx)
+                    .await?;
+            values.push(serde_json::from_str(&body).map_err(|e| sqlx::Error::Decode(Box::new(e)))?);
+        }
+        let lsn: String =
+            sqlx::query_scalar("SELECT applied_lsn FROM journal_cursor WHERE singleton=1")
+                .fetch_one(&mut **tx)
+                .await?;
+        Ok((
+            lsn.parse()
+                .map_err(|_| sqlx::Error::Protocol("invalid cursor".into()))?,
+            values,
+        ))
+    }
+
+    pub async fn run_counts(
+        &self,
+        workflow_id: Option<&str>,
+    ) -> Result<Vec<(String, String, i64)>, sqlx::Error> {
+        let mut query=QueryBuilder::<Sqlite>::new("SELECT json_extract(body,'$.workflow_id') AS workflow,json_extract(body,'$.status') AS status,COUNT(*) AS count FROM journal_entities WHERE kind='run'");
+        if let Some(id) = workflow_id {
+            query
+                .push(" AND json_extract(body,'$.workflow_id')=")
+                .push_bind(id);
+        }
+        query.push(" GROUP BY json_extract(body,'$.workflow_id'),json_extract(body,'$.status')");
+        Ok(query
+            .build()
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|r| (r.get("workflow"), r.get("status"), r.get("count")))
+            .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flow_test_support::io::TempDir;
+    use serde_json::json;
+
+    fn row(id: &str, timestamp: &str, workflow: &str, status: &str) -> ProjectedRow {
+        ProjectedRow {
+            kind: "run".into(),
+            key: id.into(),
+            value: Some(json!({
+                "run_id": id, "created_at": timestamp, "workflow_id": workflow,
+                "status": status, "source": "manual"
+            })),
+        }
+    }
+    fn ids(values: Vec<Value>) -> Vec<String> {
+        values
+            .into_iter()
+            .map(|v| v["run_id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn keyset_pages_normalize_time_and_push_filters_before_limit() {
+        let dir = TempDir::new("projection-pages");
+        let p = Projector::open(&dir.join("view.db"), "j").await.unwrap();
+        p.apply(
+            "j",
+            1,
+            vec![
+                row("a", "2026-01-01T00:00:00Z", "w", "completed"),
+                row("b", "2026-01-01T00:00:00.000000001Z", "w", "completed"),
+                row("c", "2026-01-01T08:00:00.000000001+08:00", "w", "completed"),
+                row("d", "2026-01-02T00:00:00Z", "other", "completed"),
+                row("e", "2026-01-03T00:00:00Z", "w", "failed"),
+            ],
+        )
+        .await
+        .unwrap();
+        let query = RunsQuery {
+            workflow_id: Some("w"),
+            status: Some("completed"),
+            source: Some("manual"),
+            limit: 2,
+            ..Default::default()
+        };
+        let (lsn, page) = p.runs_page(query).await.unwrap();
+        assert_eq!(lsn, 1);
+        assert_eq!(ids(page), ["c", "b"]);
+        p.apply(
+            "j",
+            2,
+            vec![row("new", "2026-01-04T00:00:00Z", "w", "completed")],
+        )
+        .await
+        .unwrap();
+        let (_, page) = p
+            .runs_page(RunsQuery {
+                workflow_id: Some("w"),
+                status: Some("completed"),
+                before_run_id: Some("b"),
+                limit: 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(ids(page), ["a"]);
+        assert_eq!(
+            p.run_counts(Some("w"))
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.2)
+                .sum::<i64>(),
+            5
+        );
+        assert!(p
+            .runs_page(RunsQuery::default())
+            .await
+            .unwrap()
+            .1
+            .is_empty());
+        let plan=sqlx::query("EXPLAIN QUERY PLAN SELECT key FROM journal_entities WHERE kind='run' AND json_extract(body,'$.workflow_id')='w' AND (created_order,key)<('2026','b') ORDER BY created_order DESC,key DESC LIMIT 2").fetch_all(&p.pool).await.unwrap();
+        let plan = plan
+            .iter()
+            .map(|r| r.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(plan.contains("journal_workflow_order_v2"), "{plan}");
+        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        p.close().await;
+    }
+
+    #[tokio::test]
+    async fn only_page_bodies_are_loaded_and_aggregate_response_is_bounded() {
+        let dir = TempDir::new("projection-budget");
+        let p = Projector::open(&dir.join("view.db"), "j").await.unwrap();
+        let mut large = row("old", "2026-01-01T00:00:00Z", "w", "completed");
+        large.value.as_mut().unwrap()["padding"] = json!("x".repeat(8 * 1024 * 1024));
+        p.apply(
+            "j",
+            1,
+            vec![large, row("new", "2026-01-02T00:00:00Z", "w", "completed")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ids(p
+                .runs_page(RunsQuery {
+                    limit: 1,
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .1),
+            ["new"]
+        );
+        assert!(p
+            .runs_page(RunsQuery {
+                limit: 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("RESPONSE_TOO_LARGE"));
+        assert_eq!(p.run_counts(None).await.unwrap()[0].2, 2);
+        p.close().await;
+    }
+
+    #[tokio::test]
+    async fn old_projection_is_migrated_without_replaying_journal() {
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        let dir = TempDir::new("projection-migration");
+        let path = dir.join("view.db");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE journal_entities(kind TEXT NOT NULL,key TEXT NOT NULL,body TEXT NOT NULL,PRIMARY KEY(kind,key))").execute(&pool).await.unwrap();
+        let old = row("old", "2026-01-01T00:00:00Z", "w", "completed");
+        sqlx::query("INSERT INTO journal_entities VALUES('run','old',?)")
+            .bind(old.value.unwrap().to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        let p = Projector::open(&path, "j").await.unwrap();
+        assert_eq!(
+            ids(p
+                .runs_page(RunsQuery {
+                    limit: 1,
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .1),
+            ["old"]
+        );
+        let normalized: String =
+            sqlx::query_scalar("SELECT created_order FROM journal_entities WHERE key='old'")
+                .fetch_one(&p.pool)
+                .await
+                .unwrap();
+        assert_eq!(normalized, "2026-01-01T00:00:00.000000000Z");
+        p.close().await;
+    }
+
+    #[tokio::test]
+    async fn opaque_entities_do_not_acquire_timestamp_validation() {
+        let dir = TempDir::new("projection-opaque");
+        let p = Projector::open(&dir.join("view.db"), "j").await.unwrap();
+        let value = json!({"created_at":"business data, not a timestamp"});
+        p.apply(
+            "j",
+            1,
+            vec![ProjectedRow {
+                kind: "legacy".into(),
+                key: "row".into(),
+                value: Some(value.clone()),
+            }],
+        )
+        .await
+        .unwrap();
+        assert_eq!(p.get("legacy", "row").await.unwrap().1, Some(value));
+        p.close().await;
     }
 }

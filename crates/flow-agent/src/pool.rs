@@ -56,8 +56,10 @@ pub async fn bind_executor(
     executor_id: &str,
     dispatch_id: &str,
 ) -> Result<ExecutorHandle, PoolError> {
+    let mut invocation = executor.clone();
+    invocation.prefix.push("--remote-relay".into());
     let (pair, mut child, child_side) =
-        spawn_executor_process(executor, Some(&format!("agent:{executor_id}")))
+        spawn_executor_process(&invocation, Some(&format!("agent:{executor_id}")))
             .map_err(|e| PoolError::Bind(format!("spawn executor: {e}")))?;
     drop(child_side);
     let mut transport = FrameTransport::spawn(pair, 64);

@@ -956,6 +956,7 @@ dependencies = [
 name = "flow-store"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "flow-test-support",
  "serde",
  "serde_json",
@@ -3347,6 +3348,7 @@ dependencies = [
  "futures-core",
  "futures-io",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",

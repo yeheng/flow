@@ -325,6 +325,29 @@ async fn sub_workflow_child_created_and_parent_completes() {
 }
 
 #[tokio::test]
+async fn child_mapping_larger_than_control_frame_uses_durable_params() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = ipc_backend_explicit(root.path()).await;
+    let child = install(
+        &backend,
+        json!({"nodes":[
+        {"id":"s","type":"start"},
+        {"id":"n","type":"script","params":{"code":"return {length: input.payload.length};"}},
+        {"id":"e","type":"end"}],"edges":[{"from":"s","to":"n"},{"from":"n","to":"e"}]}),
+    )
+    .await;
+    let parent=install(&backend,json!({"nodes":[
+        {"id":"s","type":"start"},
+        {"id":"w","type":"sub_workflow","params":{"workflow_id":child,"input_mapping":{"payload":"${input.payload}"}}},
+        {"id":"e","type":"end"}],"edges":[{"from":"s","to":"w"},{"from":"w","to":"e"}]})).await;
+    let run_id = start_run(&backend, &parent, json!({"payload":"x".repeat(300_000)})).await;
+    let done = until(&backend, &run_id, Run::terminal).await;
+    assert_eq!(done.status, "succeeded", "{:?}", done.error);
+    assert_eq!(materialize(&backend, &done, "e").await["length"], 300_000);
+    backend.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn cancel_during_http_marks_uncertain_and_never_resends() {
     let root = temp();
     let backend = ipc_backend_explicit(&root).await;
@@ -643,7 +666,7 @@ async fn wait_for_tagged_executor(tag: &str) -> u32 {
 fn tagged_executor_pids(tag: &str) -> Vec<u32> {
     std::process::Command::new("pgrep")
         .arg("-f")
-        .arg(format!("flow-executor --tag {tag}"))
+        .arg(format!("flow-executor.*--tag {tag}"))
         .output()
         .ok()
         .map(|o| {
@@ -1022,29 +1045,32 @@ async fn start_ipc(backend: &std::sync::Arc<flow_backend::journal::JournalBacken
         .unwrap();
 }
 
-/// T2 4b：结果输出落在「可 inline 但装不进控制帧」的窄带里时必须平安落地。
+/// 控制帧预算收口（原 T2 4b「杀区」的终态）：
 ///
-/// 历史缺陷：`Result`/`Wait` 是控制帧（上限 `CONTROL_MAX_FRAME` = 64KiB），而
-/// 值存储的 inline 阈值 `INLINE_BYTES` 也是 64KiB——于是序列化 JSON 在
-/// ≈65289..=65536 字节（远程链路 64922 起）的输出会被帧层拒收（FrameTooLarge），
-/// 写循环置 broken，执行器随后退出：节点既没有成功也没有失败结果，只剩
-/// 「主进程解绑 + 节点失败」的会话级死亡。修复后执行器在 `emit_result`
-/// 把超预算的值改成审计分块 + `ValueRef`。
+/// 历史缺陷：`Result`/`Wait` 是控制帧，上限与值存储 inline 阈值
+/// `INLINE_BYTES` 同为 64KiB——「可 inline 但装不进控制帧」窄带（编码后
+/// ≈65289..=65536 字节）的输出被帧层拒收（FrameTooLarge），写循环置
+/// broken，执行器退出：节点只剩「会话级死亡」。v3 起 `CONTROL_MAX_FRAME`
+/// 提到 128KiB：64KiB 值编码 + 信封恒有余量，窄带在算术上不可达，内联值
+/// 保持 `Inline` 原样落地，不再降级为审计分块。
 #[tokio::test]
 async fn result_output_in_control_frame_kill_band_survives() {
-    use flow_engine::execution_protocol::contract::CONTROL_INLINE_MAX;
+    use flow_engine::execution_protocol::contract::CONTROL_MAX_FRAME;
+    use flow_journal::INLINE_BYTES;
 
     let root = temp();
     let backend = ipc_backend_explicit(&root).await;
-    // 判定看的是**编码后的值**（`{"pad":"…"}` 比 pad 多几字节），所以边界用例
-    // 各留一点余量；后面三个是旧「杀区」的上下沿。
+    // 判定看的是**编码后的值**：`{"pad":"…"}` 比 pad 恰好多 10 字节，
+    // 编码 ≤ INLINE_BYTES(65536) 的 pad 上界是 65526；覆盖原「杀区」
+    // 上下沿（65_289..=65_536 pad 中编码仍 ≤64KiB 的部分必须 Inline）。
     for (size, expect_ref) in [
-        (CONTROL_INLINE_MAX - 64, false),
-        (CONTROL_INLINE_MAX + 1024, true),
-        (60_000, true),
-        (65_289, true),
-        (65_300, true),
+        (60_000, false),
+        (65_289, false),
+        (65_300, false),
+        (65_526, false),
+        (65_527, true),
         (65_536, true),
+        (70_000, true),
     ] {
         let workflow = install(
             &backend,
@@ -1064,15 +1090,30 @@ async fn result_output_in_control_frame_kill_band_survives() {
         );
         let node_output = done.nodes["n"].output.clone().unwrap();
         if expect_ref {
+            // 超过 INLINE_BYTES（按编码后字节数）才走标准审计分块。
             assert!(
                 matches!(node_output, StoredValue::Ref(_)),
                 "size={size} must be chunked into a Ref, got {node_output:?}"
             );
         } else {
-            // 预算内的值保持 inline：journal 形状与 v2 逐字节一致。
+            // ≤ INLINE_BYTES 的内联值保持 Inline：不再被控制帧预算降级。
             assert!(
                 matches!(node_output, StoredValue::Inline(_)),
                 "size={size} should stay inline, got {node_output:?}"
+            );
+            let encoded = serde_json::to_vec(&match node_output {
+                StoredValue::Inline(value) => value,
+                StoredValue::Ref(_) => unreachable!(),
+            })
+            .unwrap()
+            .len();
+            assert!(
+                encoded + 1024 <= CONTROL_MAX_FRAME,
+                "inline band must always fit the control frame: encoded={encoded}"
+            );
+            assert!(
+                encoded <= INLINE_BYTES,
+                "inline threshold violated: encoded={encoded}"
             );
         }
         let materialized = materialize(&backend, &done, "n").await;

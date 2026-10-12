@@ -395,8 +395,10 @@ impl Config {
             return Err("execution.mode=remote 时必须配置 [execution.remote]".into());
         }
         if let Some(remote) = &self.execution.remote {
-            if remote.control_addr.is_empty() || remote.data_addr.is_empty() {
-                return Err("execution.remote.control_addr / data_addr 不能为空".into());
+            // data_addr 已废弃（上联 v3 收敛为单条 TLS 连接）：字段为存量
+            // 配置兼容保留，值被忽略，不再强制非空。
+            if remote.control_addr.is_empty() {
+                return Err("execution.remote.control_addr 不能为空".into());
             }
             if remote.ca_cert.as_os_str().is_empty()
                 || remote.cert.as_os_str().is_empty()

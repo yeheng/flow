@@ -42,7 +42,29 @@ const observationLoss = shallowRef<unknown>();
 let refreshing = false;
 let frame: number | undefined;
 let stop: (() => Promise<void>) | undefined;
-let timer: ReturnType<typeof setInterval> | undefined;
+let disposed = false;
+
+/** 会改变 run 状态的事件（journal EventKind 的 snake_case 名）：
+ *  这些事件到达后需要补拉 run.get 摘要与观测页 */
+const RUN_LIFECYCLE_KINDS = new Set([
+  "run_started",
+  "run_cancelled",
+  "run_completed",
+  "run_failed",
+]);
+let runRefreshQueued = false;
+/** 摘要刷新的防抖：同一 tick 多条事件只刷一次；在途时由 refreshRun 的 refreshing 守卫去重 */
+function scheduleRunRefresh(): void {
+  if (runRefreshQueued) return;
+  runRefreshQueued = true;
+  void Promise.resolve().then(() => {
+    runRefreshQueued = false;
+    if (disposed) return;
+    void refreshRun().catch((e) => {
+      message.value = String(e);
+    });
+  });
+}
 
 /** JSON 字段即时校验：非法时行内报错并禁用对应提交按钮（Monaco 标红之外的显式拦截） */
 function jsonError(text: string): string {
@@ -118,7 +140,6 @@ async function connect() {
   api.value?.close();
   await stop?.();
   stop = undefined;
-  if (timer) clearInterval(timer);
   run.value = undefined;
   api.value = new JournalClient(url.value, token.value, http.value);
   await load();
@@ -182,16 +203,19 @@ async function refreshRun() {
 
 async function watchRun(id: string) {
   await stop?.();
-  if (timer) clearInterval(timer);
   windowed.value = new EventWindow();
   page.value = undefined;
   stop = await api.value!.monitor(
     id,
     (v) => {
       run.value = v;
+      // snapshot 回调在初次对齐、丢包重排、断线重连（JournalClient 内部
+      // onReconnect → align）后都会到达：这些时点观测页可能错过数据，补拉一次
+      scheduleRunRefresh();
     },
     (e) => {
       windowed.value.push(e);
+      if (RUN_LIFECYCLE_KINDS.has(e.event.kind)) scheduleRunRefresh();
       if (frame === undefined)
         frame = requestAnimationFrame(() => {
           frame = undefined;
@@ -202,11 +226,6 @@ async function watchRun(id: string) {
       if (n) message.value = `实时缓冲丢弃 ${n} 条，已按快照重新对齐；历史可分页读取。`;
     },
   );
-  timer = setInterval(() => {
-    void refreshRun().catch((e) => {
-      message.value = String(e);
-    });
-  }, 2000);
   await refreshRun();
 }
 
@@ -243,10 +262,10 @@ async function copyRunId(id: string) {
 }
 
 onBeforeUnmount(() => {
+  disposed = true;
   api.value?.close();
   if (frame !== undefined) cancelAnimationFrame(frame);
   void stop?.();
-  if (timer) clearInterval(timer);
 });
 </script>
 

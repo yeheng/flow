@@ -188,9 +188,14 @@ impl Journal {
         let root = root.as_ref().to_path_buf();
         let disk_root = root.clone();
         let faults = options.faults;
-        let disk = tokio::task::spawn_blocking(move || Disk::open(&disk_root, faults))
-            .await
-            .map_err(|e| Error::Unavailable(e.to_string()))??;
+        let disk = tokio::task::spawn_blocking(move || {
+            let disk = Disk::open(&disk_root, faults)?;
+            // This is a disposable cache; reads can rebuild it if cache IO fails.
+            let _ = crate::address::rebuild(&disk_root, disk.last_lsn);
+            Ok::<_, Error>(disk)
+        })
+        .await
+        .map_err(|e| Error::Unavailable(e.to_string()))??;
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
                 stats: WriterStats {
@@ -418,6 +423,7 @@ fn pump(mut disk: Disk, shared: Arc<Shared>, options: JournalOptions) {
         queue.stats.directory_sync_latency = disk.directory_latency.clone();
         match outcome {
             Ok(()) => {
+                crate::address::committed(&disk.root, &commits);
                 queue.stats.durable_lsn = disk.last_lsn;
                 queue.stats.batches += 1;
                 queue.stats.transactions += batch.len() as u64;

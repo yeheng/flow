@@ -42,7 +42,6 @@ fn agent_config(agent_id: &str, slots: u32) -> AgentConfig {
     AgentConfig {
         agent_id: agent_id.into(),
         control_addr: String::new(),
-        data_addr: String::new(),
         ca_cert: "unused".into(),
         cert: "unused".into(),
         key: "unused".into(),
@@ -58,16 +57,15 @@ async fn spawn_agent(
     handles: Handles,
 ) {
     let (control_a, control_b) = tokio::io::duplex(256 * 1024);
-    let (data_a, data_b) = tokio::io::duplex(256 * 1024);
     manager
-        .attach_inprocess(agent_id.to_string(), control_a, data_a)
+        .attach_inprocess(agent_id.to_string(), control_a)
         .await;
     let config = agent_config(agent_id, slots);
     let shutdown = tokio_util::sync::CancellationToken::new();
     let agent_id = agent_id.to_string();
     tokio::spawn(async move {
         use flow_engine::execution_protocol::Message;
-        let mut transport = FrameTransport::spawn_streams(control_b, data_b, 128);
+        let mut transport = FrameTransport::spawn(control_b, 128);
         let boot = flow_engine::execution_protocol::transport::fresh_boot_id();
         if transport
             .send(Message::AgentHello {
@@ -95,23 +93,11 @@ async fn spawn_agent(
             journal_id,
             master_epoch,
             link_session_id,
-            data_credential,
             ..
         } = welcome
         else {
             return;
         };
-        if transport
-            .send(Message::DataBind {
-                agent_boot_id: boot.clone(),
-                link_session_id: link_session_id.clone(),
-                credential: data_credential,
-            })
-            .await
-            .is_err()
-        {
-            return;
-        }
         let relay = Arc::new(parking_lot::Mutex::new(flow_agent::relay::Relay::new(
             agent_id,
             boot,

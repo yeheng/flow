@@ -1,10 +1,10 @@
 //! 执行子进程池与可靠回收（二期 §3.1/§3.7/§3.9，I03）。
 //!
-//! 每进程同一时刻一个任务。通道承载按平台选择：unix 用 socketpair +
-//! pre_exec FD 槽位（dup2 落位后关闭其余继承 FD，其余 FD 默认
-//! close-on-exec）；其余平台用 TCP loopback 回连。父关闭子端、子关闭
-//! 父端，兄弟进程不继承连接。任一通道故障 → 会话 Draining → 宽限后
-//! kill → wait/reap；已取消/故障任务的进程统一回收重建，不直接复用。
+//! 每进程同一时刻一个任务。通道承载按平台选择：unix 用单 socketpair
+//! （argv 传 FD 原号，pre_exec 关闭其余继承 FD）；其余平台用 TCP loopback
+//! 单连接回连。父关闭子端、子关闭父端，兄弟进程不继承连接。通道故障 →
+//! 会话 Draining → 宽限后 kill → wait/reap；已取消/故障任务的进程统一
+//! 回收重建，不直接复用。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -171,8 +171,9 @@ impl ExecutorPool {
     }
 }
 
-/// 平台通道承载：unix socketpair（pre_exec FD 槽位，父端关闭子端副本）；
-/// 其余平台 TCP loopback 回连。差异在此收口，下游只见 FrameTransport。
+/// 平台通道承载：unix socketpair（argv 传 FD 原号，父端关闭子端副本）；
+/// 其余平台 TCP loopback 单连接回连。差异在此收口，下游只见 FrameTransport
+/// 单流端点（帧内通道标签）。
 async fn spawn_transport(
     executor: &flow_engine::execution_protocol::contract::ExecutorInvocation,
     tag: Option<&str>,
@@ -182,17 +183,17 @@ async fn spawn_transport(
         let (parent, child, child_pair) =
             flow_engine::execution_protocol::spawn::spawn_executor_process(executor, tag)
                 .map_err(|e| PoolError::Spawn(format!("{}: {e}", executor.program.display())))?;
-        // 父进程关闭子端副本（子进程内已 dup2 到槽位）。
+        // 父进程关闭子端副本（子进程内按 argv 原号持有）。
         drop(child_pair);
-        Ok((FrameTransport::spawn(parent, 128), child))
+        Ok((FrameTransport::spawn_local(parent, 128), child))
     }
     #[cfg(not(unix))]
     {
-        let (control, child, data) =
+        let (channel, child) =
             flow_engine::execution_protocol::loopback::spawn_executor_loopback(executor, tag)
                 .await
                 .map_err(|e| PoolError::Spawn(format!("{}: {e}", executor.program.display())))?;
-        Ok((FrameTransport::spawn_streams(control, data, 128), child))
+        Ok((FrameTransport::spawn(channel, 128), child))
     }
 }
 

@@ -203,7 +203,7 @@ async fn tls_agent_end_to_end_business() {
         .await
         .unwrap();
     // 确认监听可达。
-    for port in &ports {
+    for port in &ports[..1] {
         let probe = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await;
         assert!(probe.is_ok(), "listener {port} must be reachable");
     }
@@ -269,9 +269,9 @@ async fn tls_agent_end_to_end_business() {
 }
 
 #[tokio::test]
-async fn wrong_data_credential_rejected_and_single_cancel_keeps_uplink() {
-    // 凭据校验（管理级）：data 绑定凭据错误 → 会话拒绝。
-    // 这里用进程内注入验证（无需完整 agent）：错误 DataBind 后会话关闭。
+async fn unexpected_session_frame_rejected_and_single_cancel_keeps_uplink() {
+    // 会话级协议校验：v3 单流上联已无 DataBind；握手后发送过时的
+    // DataBind 帧属意外消息，必须整会话拒绝（不能静默容忍）。
     use flow_engine::execution_protocol::transport::FrameTransport;
     use flow_engine::execution_protocol::Message;
     let dir = temp();
@@ -285,11 +285,10 @@ async fn wrong_data_credential_rejected_and_single_cancel_keeps_uplink() {
         1,
     );
     let (control_a, control_b) = tokio::io::duplex(64 * 1024);
-    let (data_a, data_b) = tokio::io::duplex(64 * 1024);
     manager
-        .attach_inprocess("agent-bad".to_string(), control_a, data_a)
+        .attach_inprocess("agent-bad".to_string(), control_a)
         .await;
-    let mut transport = FrameTransport::spawn_streams(control_b, data_b, 16);
+    let mut transport = FrameTransport::spawn(control_b, 16);
     transport
         .send(Message::AgentHello {
             agent_boot_id: "boot-bad".into(),
@@ -311,7 +310,7 @@ async fn wrong_data_credential_rejected_and_single_cancel_keeps_uplink() {
     else {
         unreachable!()
     };
-    // 错误凭据 → data 绑定失败 → 会话关闭。
+    // 过时的 DataBind（v2 双流遗留）→ 意外消息 → 会话关闭。
     transport
         .send(Message::DataBind {
             agent_boot_id: "boot-bad".into(),
@@ -328,7 +327,7 @@ async fn wrong_data_credential_rejected_and_single_cancel_keeps_uplink() {
         }
     })
     .await;
-    assert!(closed.is_ok(), "bad data credential must close session");
+    assert!(closed.is_ok(), "unexpected session frame must close session");
     drop(transport);
     backend.close().await.unwrap();
     std::fs::remove_dir_all(&dir).unwrap();

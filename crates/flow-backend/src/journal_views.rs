@@ -120,27 +120,27 @@ fn workflow_summary(workflow: &JournalWorkflow) -> Result<WorkflowSummary> {
 }
 
 pub async fn list_workflows(backend: &JournalBackend) -> Result<Vec<WorkflowSummary>> {
-    let state = backend.state().await;
-    let mut summaries = Vec::new();
-    for workflow in state.workflows.values() {
-        summaries.push(workflow_summary(workflow)?);
-    }
-    summaries.sort_by_key(|s| std::cmp::Reverse(s.created_at));
-    Ok(summaries)
+    backend
+        .projection
+        .ordered("workflow", None, false)
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .map(|v| workflow_summary(&serde_json::from_value(v).map_err(internal)?))
+        .collect()
 }
 
-fn run_record(backend: &JournalBackend, run: &JournalRun) -> Result<RunRecord> {
+fn run_record(root: &std::path::Path, upper: u64, run: &JournalRun) -> Result<RunRecord> {
+    let materialize = |value: &StoredValue| {
+        flow_journal::value::materialize(root, upper, value, VALUE_BUDGET).map_err(internal)
+    };
     Ok(RunRecord {
         id: run.run_id.clone(),
         workflow_id: run.workflow_id.clone(),
         workflow_version: run.workflow_version as i64,
         status: run.status.clone(),
-        input: materialize(backend, &run.input, VALUE_BUDGET)?,
-        output: run
-            .output
-            .as_ref()
-            .map(|stored| materialize(backend, stored, VALUE_BUDGET))
-            .transpose()?,
+        input: materialize(&run.input)?,
+        output: run.output.as_ref().map(materialize).transpose()?,
         error: run.error.clone(),
         source: run.source.clone(),
         source_detail: run.source_detail.clone(),
@@ -152,12 +152,44 @@ fn run_record(backend: &JournalBackend, run: &JournalRun) -> Result<RunRecord> {
 }
 
 pub async fn get_run(backend: &JournalBackend, run_id: &str) -> Result<RunRecord> {
-    let state = backend.state().await;
-    let run = state
-        .runs
-        .get(run_id)
-        .ok_or_else(|| ViewError::RunNotFound(run_id.to_string()))?;
-    run_record(backend, run)
+    let (_, value) = backend
+        .projection
+        .get("run", run_id)
+        .await
+        .map_err(internal)?;
+    let run =
+        serde_json::from_value(value.ok_or_else(|| ViewError::RunNotFound(run_id.to_owned()))?)
+            .map_err(internal)?;
+    Ok(materialize_runs(backend, vec![run]).await?.remove(0))
+}
+
+async fn materialize_runs(
+    backend: &JournalBackend,
+    runs: Vec<JournalRun>,
+) -> Result<Vec<RunRecord>> {
+    // Account for the entire response before allocating any referenced business values.
+    let mut bytes = 0usize;
+    for run in &runs {
+        for value in std::iter::once(&run.input).chain(run.output.iter()) {
+            let n = match value {
+                StoredValue::Ref(r) => usize::try_from(r.total_bytes).map_err(internal)?,
+                StoredValue::Inline(v) => flow_journal::codec::bounded_json(v, VALUE_BUDGET)
+                    .map_err(internal)?
+                    .len(),
+            };
+            bytes = bytes
+                .checked_add(n)
+                .ok_or_else(|| internal("RESPONSE_TOO_LARGE"))?;
+            if bytes > VALUE_BUDGET {
+                return Err(internal("RESPONSE_TOO_LARGE"));
+            }
+        }
+    }
+    let root = backend.journal.root().to_path_buf();
+    let upper = backend.journal.durable_lsn();
+    tokio::task::spawn_blocking(move || runs.iter().map(|r| run_record(&root, upper, r)).collect())
+        .await
+        .map_err(internal)?
 }
 
 pub async fn list_runs(
@@ -168,56 +200,51 @@ pub async fn list_runs(
     before_run_id: Option<&str>,
     limit: i64,
 ) -> Result<Vec<RunRecord>> {
-    let state = backend.state().await;
-    // Cursor follows the same ordering as the list, including equal timestamps.
-    let cursor_time = before_run_id
-        .and_then(|id| state.runs.get(id))
-        .map(|r| (r.created_at.clone(), r.run_id.clone()));
-    let mut selected: Vec<&JournalRun> = state
-        .runs
-        .values()
-        .filter(|run| {
-            workflow_id.is_none_or(|id| run.workflow_id == id)
-                && status.is_none_or(|s| run.status == s)
-                && source.is_none_or(|s| run.source == s)
-                && cursor_time
-                    .as_ref()
-                    .is_none_or(|t| (run.created_at.clone(), run.run_id.clone()) < *t)
+    let (_, values) = backend
+        .projection
+        .runs_page(flow_store::projection::RunsQuery {
+            workflow_id,
+            status,
+            source,
+            before_run_id,
+            limit: limit.max(0) as usize,
         })
-        .collect();
-    selected.sort_by_key(|r| std::cmp::Reverse((r.created_at.clone(), r.run_id.clone())));
-    selected
-        .into_iter()
-        .take(limit.max(0) as usize)
-        .map(|run| run_record(backend, run))
-        .collect()
+        .await
+        .map_err(internal)?;
+    materialize_runs(
+        backend,
+        values
+            .into_iter()
+            .map(serde_json::from_value)
+            .collect::<std::result::Result<_, _>>()
+            .map_err(internal)?,
+    )
+    .await
 }
 
 pub async fn run_stats(backend: &JournalBackend, workflow_id: Option<&str>) -> Result<RunStats> {
-    let state = backend.state().await;
     let mut stats = RunStats {
         total: 0,
         by_status: BTreeMap::new(),
         by_workflow: Vec::new(),
     };
     let mut grouped: BTreeMap<String, WorkflowRunStats> = BTreeMap::new();
-    for run in state
-        .runs
-        .values()
-        .filter(|r| workflow_id.is_none_or(|id| r.workflow_id == id))
+    for (workflow, status, count) in backend
+        .projection
+        .run_counts(workflow_id)
+        .await
+        .map_err(internal)?
     {
-        stats.total += 1;
-        *stats.by_status.entry(run.status.clone()).or_insert(0) += 1;
+        stats.total += count;
+        *stats.by_status.entry(status.clone()).or_insert(0) += count;
         if workflow_id.is_none() {
-            let entry = grouped
-                .entry(run.workflow_id.clone())
-                .or_insert(WorkflowRunStats {
-                    workflow_id: run.workflow_id.clone(),
-                    total: 0,
-                    by_status: BTreeMap::new(),
-                });
-            entry.total += 1;
-            *entry.by_status.entry(run.status.clone()).or_insert(0) += 1;
+            let entry = grouped.entry(workflow.clone()).or_insert(WorkflowRunStats {
+                workflow_id: workflow,
+                total: 0,
+                by_status: BTreeMap::new(),
+            });
+            entry.total += count;
+            *entry.by_status.entry(status).or_insert(0) += count;
         }
     }
     stats.by_workflow = grouped.into_values().collect();
@@ -226,11 +253,8 @@ pub async fn run_stats(backend: &JournalBackend, workflow_id: Option<&str>) -> R
 
 pub async fn is_live(backend: &JournalBackend, run_id: &str) -> bool {
     backend
-        .state()
+        .inspect(|state| state.runs.get(run_id).is_some_and(|run| !run.terminal()))
         .await
-        .runs
-        .get(run_id)
-        .is_some_and(|run| !run.terminal())
 }
 
 fn schedule_from_config(config: &Value) -> Result<Schedule> {
@@ -285,30 +309,28 @@ pub async fn list_schedules(
     backend: &JournalBackend,
     workflow_id: Option<&str>,
 ) -> Result<Vec<Schedule>> {
-    let state = backend.state().await;
-    let mut schedules: Vec<Schedule> = state
-        .schedules
-        .values()
-        .filter(|config| workflow_id.is_none_or(|id| config["workflow_id"] == id))
+    backend
+        .projection
+        .ordered("schedule", workflow_id, false)
+        .await
+        .map_err(internal)?
+        .iter()
         .map(schedule_from_config)
-        .collect::<Result<_>>()?;
-    schedules.sort_by_key(|s| std::cmp::Reverse(s.created_at));
-    Ok(schedules)
+        .collect()
 }
 
 pub async fn list_webhooks(
     backend: &JournalBackend,
     workflow_id: Option<&str>,
 ) -> Result<Vec<Webhook>> {
-    let state = backend.state().await;
-    let mut webhooks: Vec<Webhook> = state
-        .webhooks
-        .values()
-        .filter(|config| workflow_id.is_none_or(|id| config["workflow_id"] == id))
+    backend
+        .projection
+        .ordered("webhook", workflow_id, false)
+        .await
+        .map_err(internal)?
+        .iter()
         .map(webhook_from_config)
-        .collect::<Result<_>>()?;
-    webhooks.sort_by_key(|w| std::cmp::Reverse(w.created_at));
-    Ok(webhooks)
+        .collect()
 }
 
 fn template_from_config(config: &Value) -> Result<NodeTemplate> {
@@ -338,10 +360,13 @@ fn template_from_config(config: &Value) -> Result<NodeTemplate> {
 }
 
 pub async fn template_list(backend: &JournalBackend) -> Result<Vec<NodeTemplateSummary>> {
-    let state = backend.state().await;
-    let mut templates: Vec<NodeTemplateSummary> = state
-        .templates
-        .values()
+    let configs = backend
+        .projection
+        .ordered("template", None, true)
+        .await
+        .map_err(internal)?;
+    configs
+        .iter()
         .map(|config| {
             Ok(NodeTemplateSummary {
                 id: config["id"]
@@ -366,9 +391,7 @@ pub async fn template_list(backend: &JournalBackend) -> Result<Vec<NodeTemplateS
                 )?,
             })
         })
-        .collect::<Result<_>>()?;
-    templates.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(templates)
+        .collect()
 }
 
 pub async fn template_get(backend: &JournalBackend, id: &str) -> Result<NodeTemplate> {

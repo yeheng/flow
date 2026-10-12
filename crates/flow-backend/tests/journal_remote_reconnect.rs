@@ -38,7 +38,6 @@ fn agent_config() -> AgentConfig {
     AgentConfig {
         agent_id: "agent-r2".into(),
         control_addr: String::new(),
-        data_addr: String::new(),
         ca_cert: "unused".into(),
         cert: "unused".into(),
         key: "unused".into(),
@@ -52,21 +51,16 @@ async fn proxy_pair(
     agent_id: &str,
 ) -> (
     tokio::io::DuplexStream,
-    tokio::io::DuplexStream,
     Vec<tokio::task::JoinHandle<()>>,
 ) {
-    // (agent 侧流, master 侧代理持有) ×2 —— 简化：agent 侧直连 pair；
-    // master 侧经代理由我们持柄。
-    let (agent_control, master_a) = tokio::io::duplex(256 * 1024);
-    let (test_control, master_b) = tokio::io::duplex(256 * 1024);
-    let control_proxy = tokio::spawn(bidirectional_copy(master_a, master_b));
-    let (agent_data, master_c) = tokio::io::duplex(256 * 1024);
-    let (test_data, master_d) = tokio::io::duplex(256 * 1024);
-    let data_proxy = tokio::spawn(bidirectional_copy(master_c, master_d));
+    // agent 侧直连 pair；master 侧经代理由测试持柄（abort 代理即模拟断链）。
+    let (agent_stream, master_a) = tokio::io::duplex(256 * 1024);
+    let (test_stream, master_b) = tokio::io::duplex(256 * 1024);
+    let proxy = tokio::spawn(bidirectional_copy(master_a, master_b));
     manager
-        .attach_inprocess(agent_id.to_string(), test_control, test_data)
+        .attach_inprocess(agent_id.to_string(), test_stream)
         .await;
-    (agent_control, agent_data, vec![control_proxy, data_proxy])
+    (agent_stream, vec![proxy])
 }
 
 async fn bidirectional_copy(a: tokio::io::DuplexStream, b: tokio::io::DuplexStream) {
@@ -89,12 +83,12 @@ async fn start_agent(
     Vec<tokio::task::JoinHandle<()>>,
     tokio::task::JoinHandle<()>,
 ) {
-    let (control, data, proxies) = proxy_pair(manager, "agent-r2").await;
+    let (stream, proxies) = proxy_pair(manager, "agent-r2").await;
     let config = agent_config();
     let shutdown = tokio_util::sync::CancellationToken::new();
     let session = tokio::spawn(async move {
-        // 首连握手（与 R0 相同序列）。
-        let mut transport = FrameTransport::spawn_streams(control, data, 128);
+        // 首连握手（与 R0 相同序列；v3 单流无 DataBind）。
+        let mut transport = FrameTransport::spawn(stream, 128);
         use flow_engine::execution_protocol::Message;
         let boot = flow_engine::execution_protocol::transport::fresh_boot_id();
         transport
@@ -116,20 +110,11 @@ async fn start_agent(
             journal_id,
             master_epoch,
             link_session_id,
-            data_credential,
             ..
         } = welcome
         else {
             unreachable!()
         };
-        transport
-            .send(Message::DataBind {
-                agent_boot_id: boot.clone(),
-                link_session_id: link_session_id.clone(),
-                credential: data_credential,
-            })
-            .await
-            .expect("data bind");
         let relay = Arc::new(parking_lot::Mutex::new(flow_agent::relay::Relay::new(
             "agent-r2".into(),
             boot,
@@ -242,12 +227,12 @@ async fn uplink_drop_then_reconnect_resumes_without_double_execution() {
         snapshot.status
     );
     // 重连：新流 + 同一 handles → resume → 裁决续跑。
-    let (control, data, _reconnected_proxies) = proxy_pair(&manager, "agent-r2").await;
+    let (stream, _reconnected_proxies) = proxy_pair(&manager, "agent-r2").await;
     let config = agent_config();
     let shutdown = tokio_util::sync::CancellationToken::new();
     let handles_reconnect = handles.clone();
     tokio::spawn(async move {
-        let transport = FrameTransport::spawn_streams(control, data, 128);
+        let transport = FrameTransport::spawn(stream, 128);
         let boot = flow_engine::execution_protocol::transport::fresh_boot_id();
         let (_link, reason) = flow_agent::runtime::reconnect_session(
             &config,
@@ -323,12 +308,12 @@ async fn cancel_during_disconnect_drains_after_resume() {
     disconnect(proxies, session).await;
     backend.run_cancel(&run_id, None).await.unwrap();
     // 重连 → resume → CancelAndDrain → 执行器回收、节点封口。
-    let (control, data, _reconnected_proxies) = proxy_pair(&manager, "agent-r2").await;
+    let (stream, _reconnected_proxies) = proxy_pair(&manager, "agent-r2").await;
     let config = agent_config();
     let shutdown = tokio_util::sync::CancellationToken::new();
     let handles_reconnect = handles.clone();
     tokio::spawn(async move {
-        let transport = FrameTransport::spawn_streams(control, data, 128);
+        let transport = FrameTransport::spawn(stream, 128);
         let boot = flow_engine::execution_protocol::transport::fresh_boot_id();
         let (link, reason) = flow_agent::runtime::reconnect_session(
             &config,

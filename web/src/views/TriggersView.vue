@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import * as api from "../api/flow";
 import { webhookBase } from "../api/flow";
-import { errText } from "../rpc/client";
+import { client, errText } from "../rpc/client";
 import { editor, refreshWorkflows } from "../state/editor";
 import { confirmDialog } from "../state/modal";
 import { toast } from "../state/toast";
@@ -16,10 +16,9 @@ const schedules = ref<Schedule[]>([]);
 const webhooks = ref<Webhook[]>([]);
 /** 首次拉取完成前不展示空态，避免「暂无…」闪烁 */
 const loaded = ref(false);
-/** 轮询失败只在 ok→error 跳变时 toast，避免每 10s 重复弹错 */
+/** 失败只在 ok→error 跳变时 toast：首刷/手动/重连可能连续触发，避免重复弹错 */
 const pollFailed = ref(false);
-let timer: ReturnType<typeof setInterval> | null = null;
-/** 轮询在途守卫：慢响应时请求不叠加 */
+/** 在途守卫：慢响应时手动/重连触发的刷新不叠加 */
 let refreshing = false;
 
 // 新建调度表单
@@ -171,15 +170,16 @@ async function onDeleteWebhook(w: Webhook): Promise<void> {
   }
 }
 
-onMounted(async () => {
+// 一次性加载 + 手动刷新 + 重连补齐；next_fire_at 只在刷新时更新，不做倒计时
+const offReconnect = client.onReconnect(() => void refresh());
+
+onMounted(() => {
   if (editor.workflows.length === 0) void refreshWorkflows();
-  await refresh();
-  // 页面激活期间每 10s 轮询：next_fire_at 会随时间走；离开页面停止
-  timer = setInterval(() => void refresh(), 10000);
+  void refresh();
 });
 
 onUnmounted(() => {
-  if (timer) clearInterval(timer);
+  offReconnect();
 });
 </script>
 
@@ -190,7 +190,10 @@ onUnmounted(() => {
         触发器
         <span class="muted">{{ workflowName || workflowId }}</span>
       </h2>
-      <RouterLink class="link" :to="`/workflows/${workflowId}`">打开编辑器 →</RouterLink>
+      <div class="header-actions">
+        <AppButton @click="refresh()">刷新</AppButton>
+        <RouterLink class="link" :to="`/workflows/${workflowId}`">打开编辑器 →</RouterLink>
+      </div>
     </div>
 
     <section class="section">
@@ -325,6 +328,12 @@ onUnmounted(() => {
 
 .section-header h3 {
   margin: 0;
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 
 .create-form {

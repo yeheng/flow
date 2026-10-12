@@ -1,9 +1,9 @@
 //! flow-executor：受管理执行子进程（bin: flow-executor）。
 //!
-//! 通道引导两种形态：unix 由主进程 pre_exec 固定 FD 槽位（control=100，
-//! data=101，env 可覆盖）；其余平台经 `FLOW_EXECUTOR_CONNECT_ADDR` 回连
-//! loopback。stdout/stderr 不携带协议帧，只用于诊断输出；未知参数忽略
-//! （`--tag` 等诊断标记由主进程追加）。
+//! 通道引导两种形态：unix 由主进程 argv 传入 `--channel-fd <N>`（socketpair
+//! 子端原号，无 CLOEXEC，pre_exec 后其余 FD 已关闭）；其余平台经
+//! `FLOW_EXECUTOR_CONNECT_ADDR` 单连接回连 loopback。stdout/stderr 不携带
+//! 协议帧，只用于诊断输出；未知参数忽略（`--tag` 等诊断标记由主进程追加）。
 //!
 //! 定位契约：主进程（flow-server / flow-agent）经
 //! `flow_engine::execution_protocol::contract::ExecutorInvocation::locate`
@@ -38,33 +38,30 @@ fn main() -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-/// 解析通道引导：回连地址 env 优先（非 unix 的唯一形态）；否则 unix FD
-/// 槽位（env 覆盖或缺省 100/101）。
+/// 解析通道引导：回连地址 env 优先（非 unix 的唯一形态）；否则 unix
+/// `--channel-fd <N>`（主进程 spawn 时注入 argv）。
 fn bootstrap_config() -> Option<ExecutorConfig> {
+    let remote_replay = std::env::args().any(|arg| arg == "--remote-relay");
     if let Ok(addr) = std::env::var(flow_engine::execution_protocol::CONNECT_ADDR_ENV) {
         if !addr.is_empty() {
             return Some(ExecutorConfig {
                 bootstrap: ChannelBootstrap::Loopback { addr },
                 queue_depth: 128,
+                remote_replay,
             });
         }
     }
     #[cfg(unix)]
     {
-        let control_fd = std::env::var("FLOW_EXECUTOR_CONTROL_FD")
-            .ok()
-            .and_then(|v| v.parse::<i32>().ok())
-            .unwrap_or(flow_engine::execution_protocol::EXECUTOR_CONTROL_FD_SLOT);
-        let data_fd = std::env::var("FLOW_EXECUTOR_DATA_FD")
-            .ok()
-            .and_then(|v| v.parse::<i32>().ok())
-            .unwrap_or(flow_engine::execution_protocol::EXECUTOR_DATA_FD_SLOT);
+        let args: Vec<String> = std::env::args().collect();
+        let channel_fd = args
+            .windows(2)
+            .find(|w| w[0] == "--channel-fd")
+            .and_then(|w| w[1].parse::<i32>().ok())?;
         Some(ExecutorConfig {
-            bootstrap: ChannelBootstrap::FdSlots {
-                control_fd,
-                data_fd,
-            },
+            bootstrap: ChannelBootstrap::Fd { channel_fd },
             queue_depth: 128,
+            remote_replay,
         })
     }
     #[cfg(not(unix))]

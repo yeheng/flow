@@ -18,19 +18,18 @@ use flow_engine::execution_protocol::transport::{
     executor_handshake, FrameTransport, NegotiatedLimits, SessionIdentity,
 };
 #[cfg(unix)]
-use flow_engine::execution_protocol::unix::channels_from_raw;
+use flow_engine::execution_protocol::unix::channel_from_raw;
 
 use crate::task::{TaskEnd, TaskRunner};
 use crate::transfer::IncomingTransfers;
 use crate::{EXECUTOR_BUILD, EXECUTOR_CAPABILITIES};
 
-/// 通道引导方式：unix 由主进程 pre_exec 落位 FD 槽位；其余平台经
-/// [`FLOW_EXECUTOR_CONNECT_ADDR`] 回连 loopback（见 execution_protocol::loopback）。
+/// 通道引导方式：unix 由主进程 argv `--channel-fd` 指定 socketpair 原号；
+/// 其余平台经 [`FLOW_EXECUTOR_CONNECT_ADDR`] 单连接回连 loopback。
 pub enum ChannelBootstrap {
     #[cfg(unix)]
-    FdSlots {
-        control_fd: i32,
-        data_fd: i32,
+    Fd {
+        channel_fd: i32,
     },
     Loopback {
         addr: String,
@@ -39,6 +38,8 @@ pub enum ChannelBootstrap {
 
 pub struct ExecutorConfig {
     pub bootstrap: ChannelBootstrap,
+    /// Only an agent's reconnectable remote uplink needs application replay.
+    pub remote_replay: bool,
     /// 会话心跳与限额来自 Welcome。
     pub queue_depth: usize,
 }
@@ -56,13 +57,10 @@ struct CurrentTask {
 pub async fn run_executor(config: ExecutorConfig) -> i32 {
     let mut transport = match &config.bootstrap {
         #[cfg(unix)]
-        ChannelBootstrap::FdSlots {
-            control_fd,
-            data_fd,
-        } => match channels_from_raw(*control_fd, *data_fd) {
-            Ok(pair) => FrameTransport::spawn(pair, config.queue_depth),
+        ChannelBootstrap::Fd { channel_fd } => match channel_from_raw(*channel_fd) {
+            Ok(stream) => FrameTransport::spawn_local(stream, config.queue_depth),
             Err(error) => {
-                eprintln!("flow-executor: channel fds unavailable: {error}");
+                eprintln!("flow-executor: channel fd unavailable: {error}");
                 return 71;
             }
         },
@@ -72,8 +70,8 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
                 connect_loopback(addr),
             )
             .await;
-            let (control, data) = match connected {
-                Ok(Ok(pair)) => pair,
+            let stream = match connected {
+                Ok(Ok(stream)) => stream,
                 Ok(Err(error)) => {
                     eprintln!("flow-executor: loopback connect failed: {error}");
                     return 71;
@@ -83,7 +81,7 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
                     return 71;
                 }
             };
-            FrameTransport::spawn_streams(control, data, config.queue_depth)
+            FrameTransport::spawn(stream, config.queue_depth)
         }
     };
     let (identity, limits) = match tokio::time::timeout(
@@ -118,13 +116,10 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
     ));
     let mut current: Option<CurrentTask> = None;
     let mut exit_code = 0;
-    // 转投队列（FIFO）：避免单槽覆盖丢失——双通道帧可能连续到达，
+    // 转投队列（FIFO）：避免单槽覆盖丢失——任务 mail 通道容量有限，
     // 单槽在 permit 获取窗口内被覆盖会把整条 TransferChunk 静默丢掉，
     // 执行器死等 InputReady 永不到来（材料不齐），主进程等到 deadline。
     let mut pending: std::collections::VecDeque<(mpsc::Sender<Message>, Message)> =
-        std::collections::VecDeque::new();
-    // 无主 transfer 帧：先于 Execute 到达（双通道乱序）时缓存，任务建立后补投。
-    let mut orphan_transfers: std::collections::VecDeque<Message> =
         std::collections::VecDeque::new();
     loop {
         if !pending.is_empty() {
@@ -190,11 +185,11 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
                     }
                 }
             }
-            received = transport.recv(), if pending.is_empty() => {
+                received = transport.recv(), if pending.is_empty() => {
                 match received {
                     Ok((channel, message)) => {
                         let _ = channel;
-                        if let Some(code) = handle_message(&mut current, &mut pending, &mut orphan_transfers, message, &outbound_tx, &identity, limits_ref) {
+                        if let Some(code) = handle_message(&mut current, &mut pending, message, &outbound_tx, &identity, limits_ref, config.remote_replay) {
                             exit_code = code;
                             break;
                         }
@@ -231,11 +226,11 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
 fn handle_message(
     current: &mut Option<CurrentTask>,
     pending: &mut std::collections::VecDeque<(mpsc::Sender<Message>, Message)>,
-    orphan_transfers: &mut std::collections::VecDeque<Message>,
     message: Message,
     outbound: &mpsc::Sender<Message>,
     identity: &SessionIdentity,
     limits: NegotiatedLimits,
+    remote_replay: bool,
 ) -> Option<i32> {
     match message {
         Message::Execute {
@@ -274,6 +269,7 @@ fn handle_message(
                 cancel: cancel.clone(),
                 journal_id: identity.journal_id.clone(),
                 window_bytes: limits.window_bytes,
+                remote_replay,
                 transfers: IncomingTransfers::default(),
                 last_result: None,
             };
@@ -281,7 +277,6 @@ fn handle_message(
                 let end = runner.run().await;
                 let _ = done_tx.send(end);
             });
-            let mail_tx_for_orphans = mail_tx.clone();
             *current = Some(CurrentTask {
                 dispatch_id,
                 mail: mail_tx,
@@ -290,17 +285,6 @@ fn handle_message(
                 done: done_rx,
                 phase: "starting".into(),
             });
-            // 双通道乱序（二期 §3.6）：TransferChunk/InputReady 可能先于
-            // Execute 到达——建立任务后补投缓存的无主 transfer 帧，否则
-            // 输入字节永久丢失，执行器死等 InputReady 的配套块。
-            let current_dispatch = current.as_ref().unwrap().dispatch_id.clone();
-            while orphan_transfers
-                .front()
-                .is_some_and(|m| m.dispatch_id() == Some(current_dispatch.as_str()))
-            {
-                let orphan = orphan_transfers.pop_front().unwrap();
-                pending.push_back((mail_tx_for_orphans.clone(), orphan));
-            }
             None
         }
         Message::Cancel { dispatch_id, .. } => {
@@ -339,14 +323,18 @@ fn handle_message(
             None
         }
         Message::TransferChunk { .. } | Message::InputReady { .. } => {
+            // 单流承载下 Execute 恒先于其传输帧到达；不属于当前派发的
+            // 传输帧只可能是前序派发的迟到残留（取消/回收竞态），丢弃计数。
             let dispatch_id = message.dispatch_id().unwrap_or_default().to_string();
-            // 仅当帧属于当前派发时直接转投；Execute 未到（双通道乱序）或
-            // 已不属于当前任务时缓存为无主帧，绝不静默丢弃。
             match current {
                 Some(task) if task.dispatch_id == dispatch_id => {
                     pending.push_back((task.mail.clone(), message));
                 }
-                _ => orphan_transfers.push_back(message),
+                _ => tracing::debug!(
+                    dispatch = %dispatch_id,
+                    kind = message.type_name(),
+                    "stale transfer frame dropped"
+                ),
             }
             None
         }

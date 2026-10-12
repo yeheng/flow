@@ -15,9 +15,7 @@ use sha2::Digest as _;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use flow_engine::execution_protocol::contract::{
-    bounded_control_text, CONTROL_INLINE_MAX, DURABLE_WAIT_TIMEOUT_MS,
-};
+use flow_engine::execution_protocol::contract::{bounded_control_text, DURABLE_WAIT_TIMEOUT_MS};
 use flow_engine::execution_protocol::message::{
     ExecuteTask, Message, ResultOutcome, TaskValue, WaitRequest,
 };
@@ -30,7 +28,7 @@ use flow_journal::StoredValue;
 
 use crate::audit::AuditStream;
 use crate::observe::{ObservationBridge, ObservationClose};
-use crate::transfer::{store_bytes, store_value, store_value_ref, IncomingTransfers};
+use crate::transfer::{store_bytes, store_value, IncomingTransfers};
 
 /// 输入面预算（与一期 materialize 8 MiB 一致）。
 pub const INPUT_BUDGET: usize = 8 * 1024 * 1024;
@@ -85,6 +83,7 @@ pub struct TaskRunner {
     pub cancel: CancellationToken,
     pub journal_id: String,
     pub window_bytes: u64,
+    pub remote_replay: bool,
     /// 本任务全部输入/重传装配（生命周期覆盖整个派发）。
     pub transfers: IncomingTransfers,
     /// 已发出的唯一 Result 帧（回执丢失时按节奏幂等重发）。
@@ -102,6 +101,17 @@ pub struct InputFace {
 }
 
 impl TaskRunner {
+    async fn receive_until(
+        &mut self,
+        deadline: tokio::time::Instant,
+        context: &str,
+    ) -> Result<Message, TaskError> {
+        tokio::select! {
+            message = self.mail.recv() => message.ok_or_else(|| TaskError::Closed("mailbox closed".into())),
+            _ = self.cancel.cancelled() => Err(TaskError::Cancelled),
+            _ = tokio::time::sleep_until(deadline), if self.remote_replay => Err(TaskError::Closed(format!("{context} timeout"))),
+        }
+    }
     pub async fn run(mut self) -> TaskEnd {
         let result = self.execute().await;
         match result {
@@ -138,6 +148,7 @@ impl TaskRunner {
             self.window_bytes,
             self.ack_tx.subscribe(),
         );
+        audit.configure(self.remote_replay, self.cancel.clone());
         // 观测桥（未启用时静默丢弃）。尾批必须在 Result 之前入队，否则会被
         // 复用会话的下一个派发错认领（见 ObservationClose）。
         let (logger, obs_close) = if self.task.observability {
@@ -265,19 +276,25 @@ impl TaskRunner {
     async fn emit_result(
         &mut self,
         audit: &mut AuditStream,
-        outcome: ResultOutcome,
+        mut outcome: ResultOutcome,
     ) -> Result<(), TaskError> {
-        // 控制帧预算收口（T2 4b）：结果/等待值里超出内联预算的字节必须落
-        // 审计分块 + Ref，自由文本定长化——下一条 Result 是控制帧，装不下
-        // 就是会话级死亡（帧层拒收）。
-        let outcome = self.control_safe_outcome(audit, outcome).await?;
+        // 控制帧预算由常量保证：inline 值编码 ≤ INLINE_BYTES(64 KiB)，
+        // CONTROL_MAX_FRAME(128 KiB) − 值编码 − 信封恒有余量，无需降级。
+        // 自由文本（Failure.error）仍按 bounded_control_text 定长化。
+        if let ResultOutcome::Failure { error, .. } = &mut outcome {
+            *error = bounded_control_text(std::mem::take(error));
+        }
         let last_audit_seq = audit.next_seq().saturating_sub(1);
-        tokio::time::timeout(
-            Duration::from_millis(DURABLE_WAIT_TIMEOUT_MS),
-            audit.await_durable(last_audit_seq, &self.cancel),
-        )
-        .await
-        .map_err(|_| TaskError::Closed("final audit acknowledgement timeout".into()))??;
+        if self.remote_replay {
+            tokio::time::timeout(
+                Duration::from_millis(DURABLE_WAIT_TIMEOUT_MS),
+                audit.await_durable(last_audit_seq, &self.cancel),
+            )
+            .await
+            .map_err(|_| TaskError::Closed("final audit acknowledgement timeout".into()))??;
+        } else {
+            audit.await_durable(last_audit_seq, &self.cancel).await?;
+        }
         let result_id = uuid::Uuid::now_v7().to_string();
         let result_message = Message::Result {
             dispatch_id: self.dispatch_id.clone(),
@@ -289,47 +306,17 @@ impl TaskRunner {
             .send(result_message.clone())
             .await
             .map_err(|e| TaskError::Closed(e.to_string()))?;
-        self.last_result = Some(result_message);
-        tokio::time::timeout(
-            Duration::from_millis(DURABLE_WAIT_TIMEOUT_MS),
-            self.wait_committed(&result_id),
-        )
-        .await
-        .map_err(|_| TaskError::Closed("ResultCommitted timeout".into()))?
-    }
-
-    /// `Result`/`Wait` 是控制帧：把其中可能无界的部分收进预算内。
-    ///
-    /// - 值：inline 且编码后超过 [`CONTROL_INLINE_MAX`] → 审计分块 + `Ref`；
-    /// - 自由文本：`Failure.error` 按 [`bounded_control_text`] 截断。
-    ///
-    /// 小结果保持 inline——journal 形状与协议 v2 逐字节一致，只有落在
-    /// 「可 inline 但装不进控制帧」窄带里的值才换表示。
-    async fn control_safe_outcome(
-        &mut self,
-        audit: &mut AuditStream,
-        outcome: ResultOutcome,
-    ) -> Result<ResultOutcome, TaskError> {
-        let journal_id = self.journal_id.clone();
-        Ok(match outcome {
-            ResultOutcome::Success { output, branch } => ResultOutcome::Success {
-                output: shrink_control_value(audit, &journal_id, output).await?,
-                branch,
-            },
-            ResultOutcome::Wait { mut wait } => {
-                if let Some(output) = wait.output.take() {
-                    wait.output = Some(shrink_control_value(audit, &journal_id, output).await?);
-                }
-                ResultOutcome::Wait { wait }
-            }
-            ResultOutcome::Failure {
-                error,
-                uncertain_operation,
-            } => ResultOutcome::Failure {
-                error: bounded_control_text(error),
-                uncertain_operation,
-            },
-        })
+        if self.remote_replay {
+            self.last_result = Some(result_message);
+            tokio::time::timeout(
+                Duration::from_millis(DURABLE_WAIT_TIMEOUT_MS),
+                self.wait_committed(&result_id),
+            )
+            .await
+            .map_err(|_| TaskError::Closed("ResultCommitted timeout".into()))?
+        } else {
+            self.wait_committed(&result_id).await
+        }
     }
 
     async fn wait_committed(&mut self, result_id: &str) -> Result<(), TaskError> {
@@ -337,9 +324,10 @@ impl TaskRunner {
         loop {
             let message = tokio::select! {
                 message = self.mail.recv() => message,
+                _ = self.cancel.cancelled() => return Err(TaskError::Cancelled),
                 _ = tokio::time::sleep(Duration::from_millis(
                     flow_engine::execution_protocol::ACK_RETRANSMIT_MS / 2 + 1,
-                )) => {
+                )), if self.remote_replay => {
                     // 结果回执可能在上联/中继中丢失：周期性重发同一
                     // result_id 的 Result（主进程幂等返回原提交）。
                     if last_send.is_none_or(|at| {
@@ -373,6 +361,12 @@ impl TaskRunner {
                     return Err(TaskError::Cancelled);
                 }
                 Message::AuditAck { .. } | Message::Heartbeat { .. } => continue,
+                message @ Message::TransferChunk { .. } if self.remote_replay => {
+                    self.transfers.feed(&message)?;
+                }
+                message @ Message::InputReady { .. } if self.remote_replay => {
+                    self.transfers.input_ready(&message)?;
+                }
                 other => {
                     return Err(TaskError::Invalid(format!(
                         "unexpected message while waiting commit: {}",
@@ -404,10 +398,7 @@ impl TaskRunner {
         }
         let deadline = tokio::time::Instant::now() + timeout;
         while ids.iter().any(|id| !self.transfers.is_ready(id)) {
-            let message = tokio::time::timeout_at(deadline, self.mail.recv())
-                .await
-                .map_err(|_| TaskError::Closed("input transfer timeout".into()))?
-                .ok_or_else(|| TaskError::Closed("mailbox closed".into()))?;
+            let message = self.receive_until(deadline, "input transfer").await?;
             match message {
                 Message::TransferChunk { .. } => self.transfers.feed(&message)?,
                 Message::InputReady { .. } => self.transfers.input_ready(&message)?,
@@ -533,11 +524,19 @@ impl TaskRunner {
             }
             expanded
         };
-        let params = store_value(audit, &self.journal_id, &params, 8 * 1024 * 1024).await?;
+        let stored_params = store_value(audit, &self.journal_id, &params, INPUT_BUDGET).await?;
+        if matches!(stored_params, StoredValue::Ref(_)) {
+            // Freshly prepared bytes are already here. Do not wait for a transfer
+            // which is only sent by the master on a resumed attempt.
+            self.transfers.insert_ready(
+                TransferKey::PreparedParams.to_wire(),
+                flow_journal::codec::bounded_json(&params, INPUT_BUDGET)?,
+            );
+        }
         let prepared = Prepared {
             input: face_input,
             predecessors,
-            params,
+            params: stored_params,
             engine_build: crate::EXECUTOR_BUILD.into(),
             node_semantics: 1,
         };
@@ -633,7 +632,6 @@ impl TaskRunner {
                     .as_str()
                     .ok_or_else(|| TaskError::Business("child workflow required".into()))?
                     .to_owned();
-                let input_mapping = params.get("input_mapping").cloned();
                 logger.info(format!("启动子工作流 {workflow_id}"));
                 Ok(ResultOutcome::Wait {
                     wait: WaitRequest {
@@ -641,7 +639,8 @@ impl TaskRunner {
                         wake_at: None,
                         output: None,
                         workflow_id: Some(workflow_id),
-                        input_mapping,
+                        // The mapping is already durable in InputPrepared.params.
+                        input_mapping: None,
                     },
                 })
             }
@@ -778,10 +777,7 @@ impl TaskRunner {
             if let Some(bytes) = self.transfers.take(transfer_id) {
                 return Ok(bytes);
             }
-            let message = tokio::time::timeout_at(deadline, self.mail.recv())
-                .await
-                .map_err(|_| TaskError::Closed("transfer wait timeout".into()))?
-                .ok_or_else(|| TaskError::Closed("mailbox closed".into()))?;
+            let message = self.receive_until(deadline, "transfer wait").await?;
             match message {
                 Message::TransferChunk { .. } => self.transfers.feed(&message)?,
                 Message::InputReady { .. } => self.transfers.input_ready(&message)?,
@@ -1070,14 +1066,10 @@ impl TaskRunner {
             })
             .await
             .map_err(|e| TaskError::Closed(e.to_string()))?;
+        let permit_deadline =
+            tokio::time::Instant::now() + Duration::from_millis(DURABLE_WAIT_TIMEOUT_MS);
         let credential = loop {
-            let message = tokio::time::timeout(
-                Duration::from_millis(DURABLE_WAIT_TIMEOUT_MS),
-                self.mail.recv(),
-            )
-            .await
-            .map_err(|_| TaskError::Closed("permit timeout".into()))?
-            .ok_or_else(|| TaskError::Closed("mailbox closed".into()))?;
+            let message = self.receive_until(permit_deadline, "permit").await?;
             match message {
                 Message::OperationPermit {
                     dispatch_id,
@@ -1387,23 +1379,6 @@ async fn materialize_prepared_params(
             &mut budget,
         )
         .await
-}
-
-/// inline 值超出控制帧内联预算 → 审计分块 + `Ref`（即既有的大值路径）；
-/// 预算内原样保留，journal 形状不变。
-async fn shrink_control_value(
-    audit: &mut AuditStream,
-    journal_id: &str,
-    value: StoredValue,
-) -> Result<StoredValue, TaskError> {
-    let StoredValue::Inline(inner) = &value else {
-        return Ok(value);
-    };
-    let bytes = flow_journal::codec::bounded_json(inner, flow_journal::INLINE_BYTES)?;
-    if bytes.len() <= CONTROL_INLINE_MAX {
-        return Ok(value);
-    }
-    store_value_ref(audit, journal_id, inner, flow_journal::INLINE_BYTES).await
 }
 
 /// 排空观测尾批：在每个发 Result 控制帧的出口前调用。`logger` 必须是

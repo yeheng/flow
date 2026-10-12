@@ -13,20 +13,18 @@
 //! `R_MAX` 不得代入窗口预算公式，`A_MAX` 不得用来论证主进程状态内存，
 //! `X_MAX` 不得用来论证审计吞吐。
 
-/// IPC 协议版本。v1 = 二期本地 socketpair 版本。
-pub const PROTOCOL_VERSION: u32 = 2;
+/// IPC 协议版本。v3 = 执行器本地通道收敛为单流（帧内 1 字节通道标签）；
+/// v2 = 二期本地 socketpair 双流版本。
+pub const PROTOCOL_VERSION: u32 = 3;
 
-/// control 通道单帧 JSON 上限（不含 4 字节长度头）。握手只可协商到本上限以内。
-pub const CONTROL_MAX_FRAME: usize = 64 * 1024;
-/// 控制帧里**内联业务值**的预算（T2 4b）：结果/等待值超过它就改走审计分块 +
-/// `ValueRef`，控制帧只留定长描述符。
+/// control 通道单帧 JSON 上限（不含 4 字节长度头与 1 字节通道标签）。握手
+/// 只可协商到本上限以内。
 ///
-/// 为什么不能沿用 `INLINE_BYTES`（64KiB）：那是「值存储」的 inline 阈值，而
-/// `CONTROL_MAX_FRAME` 也是 64KiB——「可 inline 但装不进控制帧」的窄带
-/// （序列化 JSON ≈65289..=65536 字节，远程链路 64922 起）会被帧层拒收并杀掉
-/// 会话，节点连结果都留不下。取一半给信封、dispatch_id/result_id 与 branch
-/// 留足余量。
-pub const CONTROL_INLINE_MAX: usize = CONTROL_MAX_FRAME / 2;
+/// 取 128 KiB 的约束：内联业务值上限 `flow_journal::INLINE_BYTES` 是 64 KiB
+/// （按编码后字节数计），`Result`/`Wait` 控制帧 = 值编码 + 信封必须永远
+/// 装得下——64 KiB 值 + 64 KiB 余量使「可 inline 但装不进控制帧」的窄带
+/// 在算术上不可达，不再需要降级补丁。
+pub const CONTROL_MAX_FRAME: usize = 128 * 1024;
 /// 控制帧里自由文本（错误消息 / 拒绝原因）的上限。JS 抛出的消息长度用户可控，
 /// 无界文本同样会撑爆控制帧并杀会话。
 pub const CONTROL_TEXT_MAX: usize = 8 * 1024;
@@ -164,9 +162,6 @@ impl ExecutorInvocation {
         ))
     }
 }
-/// 主进程通过环境变量把固定 FD 槽位告知执行器（pre_exec 中 dup2 的目标）。
-pub const EXECUTOR_CONTROL_FD_SLOT: i32 = 100;
-pub const EXECUTOR_DATA_FD_SLOT: i32 = 101;
 /// 显式指定执行器二进制路径的环境变量（优先级最高，I09）。
 pub const EXECUTOR_BIN_ENV: &str = "FLOW_EXECUTOR_BIN";
 /// 执行模式环境变量：unix 默认 ipc（T6 终态，非 unix 过渡态默认

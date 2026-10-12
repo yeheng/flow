@@ -28,7 +28,6 @@ use crate::tls;
 pub struct AgentConfig {
     pub agent_id: String,
     pub control_addr: String,
-    pub data_addr: String,
     pub ca_cert: PathBuf,
     pub cert: PathBuf,
     pub key: PathBuf,
@@ -115,27 +114,26 @@ pub async fn run_agent(config: AgentConfig, shutdown: CancellationToken) -> Stri
     }
 }
 
-/// 建立上联：control TLS → AgentHello → AgentWelcome → data TLS → DataBind。
+/// 建立上联：单条 TLS 连接（v3 标签帧）→ AgentHello → AgentWelcome。
 async fn connect(
     config: &AgentConfig,
     agent_boot_id: &str,
 ) -> std::result::Result<(FrameTransport, String, String, u64), String> {
     let connector = tls::client_config_from_files(&config.ca_cert, &config.cert, &config.key)
         .map_err(|e| format!("tls config: {e}"))?;
-    // control
-    let control_stream = tokio::net::TcpStream::connect(&config.control_addr)
+    let tcp = tokio::net::TcpStream::connect(&config.control_addr)
         .await
-        .map_err(|e| format!("control connect: {e}"))?;
-    let mut control = connector
+        .map_err(|e| format!("connect: {e}"))?;
+    let mut stream = connector
         .connect(
             rustls::pki_types::ServerName::try_from("flow-server".to_string())
                 .map_err(|e| format!("sni: {e}"))?,
-            control_stream,
+            tcp,
         )
         .await
-        .map_err(|e| format!("control tls: {e}"))?;
+        .map_err(|e| format!("tls: {e}"))?;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    // 简化握手：control 首帧 AgentHello（复用帧编解码器直接写）。
+    // 简化握手：首帧 AgentHello（复用标签帧编解码器直接写）。
     let hello = Message::AgentHello {
         agent_boot_id: agent_boot_id.to_string(),
         build: crate::AGENT_BUILD.into(),
@@ -145,29 +143,27 @@ async fn connect(
             .collect(),
         slots: config.slots,
     };
-    let frame = flow_engine::execution_protocol::frame::encode_frame(&hello)
+    let frame = flow_engine::execution_protocol::frame::encode_tagged_frame(&hello)
         .map_err(|e| format!("encode hello: {e}"))?;
-    control
+    stream
         .write_all(&frame)
         .await
         .map_err(|e| format!("send hello: {e}"))?;
-    // 读 Welcome（裸帧）。
-    let mut decoder = flow_engine::execution_protocol::frame::FrameDecoder::new(
-        flow_engine::execution_protocol::CONTROL_MAX_FRAME,
-    );
+    // 读 Welcome（裸帧，标签格式）。
+    let mut decoder = flow_engine::execution_protocol::frame::FrameDecoder::new_tagged();
     let welcome = loop {
         let mut chunk = [0u8; 16 * 1024];
-        let n = control
+        let n = stream
             .read(&mut chunk)
             .await
             .map_err(|e| format!("read welcome: {e}"))?;
         if n == 0 {
-            return Err("control closed before welcome".into());
+            return Err("stream closed before welcome".into());
         }
         decoder
             .feed(&chunk[..n])
             .map_err(|e| format!("welcome frame: {e}"))?;
-        if let Some(json) = decoder.pop_frame().map_err(|e| e.to_string())? {
+        if let Some((_, json)) = decoder.pop_tagged_frame().map_err(|e| e.to_string())? {
             let value: serde_json::Value =
                 serde_json::from_slice(&json).map_err(|e| e.to_string())?;
             break Message::from_envelope(value).map_err(|e| e.to_string())?;
@@ -177,7 +173,6 @@ async fn connect(
         journal_id,
         master_epoch,
         link_session_id,
-        data_credential,
         ..
     } = welcome
     else {
@@ -185,45 +180,8 @@ async fn connect(
     };
     // journal_id / master_epoch 是权威身份：执行器握手与 ValueRef 盖章都以它
     // 为准（主进程 reducer 会拒绝 journal_id 不符的发布）。
-    // data
-    let data_stream = tokio::net::TcpStream::connect(&config.data_addr)
-        .await
-        .map_err(|e| format!("data connect: {e}"))?;
-    let data = connector
-        .connect(
-            rustls::pki_types::ServerName::try_from("flow-server".to_string())
-                .map_err(|e| format!("sni: {e}"))?,
-            data_stream,
-        )
-        .await
-        .map_err(|e| format!("data tls: {e}"))?;
-    let mut transport = FrameTransport::spawn_streams(control, data, 128);
-    let link = handshake(
-        &mut transport,
-        agent_boot_id,
-        &link_session_id,
-        data_credential,
-    )
-    .await?;
-    Ok((transport, link, journal_id, master_epoch))
-}
-
-/// 上联会话建立（R0 in-process 复用）：发 DataBind 完成双通道绑定。
-pub async fn handshake(
-    transport: &mut FrameTransport,
-    agent_boot_id: &str,
-    link_session_id: &str,
-    data_credential: String,
-) -> std::result::Result<String, String> {
-    transport
-        .send(Message::DataBind {
-            agent_boot_id: agent_boot_id.to_string(),
-            link_session_id: link_session_id.to_string(),
-            credential: data_credential,
-        })
-        .await
-        .map_err(|e| format!("data bind: {e}"))?;
-    Ok(link_session_id.to_string())
+    let transport = FrameTransport::spawn(stream, 128);
+    Ok((transport, link_session_id, journal_id, master_epoch))
 }
 
 /// 对账：分页上报 Resume 清单并应用裁决（取消项回收本地执行器）。
@@ -684,23 +642,11 @@ pub async fn reconnect_session(
         journal_id,
         master_epoch,
         link_session_id,
-        data_credential,
         ..
     } = welcome
     else {
         return (String::new(), "expected welcome".into());
     };
-    if transport
-        .send(Message::DataBind {
-            agent_boot_id: agent_boot_id.to_string(),
-            link_session_id: link_session_id.clone(),
-            credential: data_credential,
-        })
-        .await
-        .is_err()
-    {
-        return (link_session_id, "send data bind failed".into());
-    }
     let relay = Arc::new(parking_lot::Mutex::new(Relay::new(
         config.agent_id.clone(),
         agent_boot_id.to_string(),

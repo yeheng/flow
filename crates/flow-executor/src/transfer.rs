@@ -58,12 +58,44 @@ impl IncomingTransfers {
         else {
             return Ok(());
         };
-        let stream = self.streams.entry(transfer_id.clone()).or_default();
+        if transfer_id.len() > 256
+            || (!self.streams.contains_key(transfer_id) && self.streams.len() >= 4096)
+        {
+            return Err(TransferError::Oversize(self.streams.len() as u64));
+        }
+        if bytes.len() > CHUNK_BYTES.div_ceil(3) * 4 {
+            return Err(TransferError::Oversize(bytes.len() as u64));
+        }
         let raw = STANDARD
             .decode(bytes)
             .map_err(|_| TransferError::Digest(*offset))?;
         if hex::encode(Sha256::digest(&raw)) != *digest {
             return Err(TransferError::Digest(*offset));
+        }
+        let end = offset
+            .checked_add(raw.len() as u64)
+            .ok_or(TransferError::Oversize(*offset))?;
+        let limit = if transfer_id.starts_with("in:") {
+            crate::task::INPUT_BUDGET as u64
+        } else {
+            MAX_VALUE_BYTES
+        };
+        if raw.is_empty() || raw.len() > CHUNK_BYTES || end > limit {
+            return Err(TransferError::Oversize(end));
+        }
+        let total: u64 = self.streams.values().map(|s| s.received).sum();
+        let inputs: u64 = self
+            .streams
+            .iter()
+            .filter(|(id, _)| id.starts_with("in:"))
+            .map(|(_, s)| s.received)
+            .sum();
+        let stream = self.streams.entry(transfer_id.clone()).or_default();
+        if let Some(assembled) = &stream.assembled {
+            if assembled.get(*offset as usize..end as usize) == Some(raw.as_slice()) {
+                return Ok(());
+            }
+            return Err(TransferError::Duplicate(transfer_id.clone(), *offset));
         }
         // 幂等重传：同 offset 同内容跳过；异内容拒绝（三期重连补发）。
         if let Some(previous) = stream.chunks.get(offset) {
@@ -72,10 +104,22 @@ impl IncomingTransfers {
             }
             return Err(TransferError::Duplicate(transfer_id.clone(), *offset));
         }
-        stream.received += raw.len() as u64;
-        if stream.received > MAX_VALUE_BYTES {
-            return Err(TransferError::Oversize(stream.received));
+        if total + raw.len() as u64 > MAX_VALUE_BYTES
+            || (transfer_id.starts_with("in:")
+                && inputs + raw.len() as u64 > crate::task::INPUT_BUDGET as u64)
+        {
+            return Err(TransferError::Oversize(total + raw.len() as u64));
         }
+        if stream
+            .chunks
+            .range(..offset)
+            .next_back()
+            .is_some_and(|(start, bytes)| *start + bytes.len() as u64 > *offset)
+            || stream.chunks.range(*offset..end).next().is_some()
+        {
+            return Err(TransferError::Duplicate(transfer_id.clone(), *offset));
+        }
+        stream.received += raw.len() as u64;
         stream.chunks.insert(*offset, raw);
         self.try_assemble(transfer_id)
     }
@@ -90,6 +134,17 @@ impl IncomingTransfers {
         else {
             return Ok(());
         };
+        let limit = if transfer_id.starts_with("in:") {
+            crate::task::INPUT_BUDGET as u64
+        } else {
+            MAX_VALUE_BYTES
+        };
+        if *total_bytes > limit
+            || transfer_id.len() > 256
+            || (!self.streams.contains_key(transfer_id) && self.streams.len() >= 4096)
+        {
+            return Err(TransferError::Oversize(*total_bytes));
+        }
         let stream = self
             .streams
             .entry(transfer_id.clone())
@@ -99,6 +154,14 @@ impl IncomingTransfers {
                 ready: None,
                 assembled: None,
             });
+        if let Some(previous) = &stream.ready {
+            if *previous != (*total_bytes, digest.clone()) {
+                return Err(TransferError::Incomplete("conflicting readiness".into()));
+            }
+            if stream.assembled.is_some() {
+                return Ok(());
+            }
+        }
         stream.ready = Some((*total_bytes, digest.clone()));
         // control 帧可能先于 data 块到达（双通道乱序，二期 §3.6）：标记就绪
         // 后等块齐再装配，不在此处报错。
@@ -138,6 +201,7 @@ impl IncomingTransfers {
             return Err(TransferError::Digest(total));
         }
         self.streams.get_mut(transfer_id).unwrap().assembled = Some(assembled);
+        self.streams.get_mut(transfer_id).unwrap().chunks.clear();
         Ok(())
     }
 
@@ -160,6 +224,7 @@ impl IncomingTransfers {
         if stream.assembled.is_none() {
             let total = bytes.len() as u64;
             stream.ready = Some((total, hex::encode(Sha256::digest(&bytes))));
+            stream.received = total;
             stream.assembled = Some(bytes);
         }
     }
@@ -202,25 +267,6 @@ pub async fn store_value(
     store_bytes(audit, journal_id, &bytes, ValueCodec::Json).await
 }
 
-/// 结果/等待值的强制分块编码：**不走 inline 快路径**，一律落
-/// ValueChunk/ValuePublished 并返回 `Ref`。
-///
-/// 存在理由（T2 4b）：`Result`/`Wait` 是控制帧，受 `CONTROL_MAX_FRAME`
-/// （64KiB）约束；而 `INLINE_BYTES` 也是 64KiB，于是「可 inline 但装不进
-/// 控制帧」的窄带（序列化 JSON 约 65289..=65536 字节，远程链路 64922 起）
-/// 会被帧层拒收，直接杀掉会话。结果值超过控制帧预算时改走已经在用的大值
-/// 路径（审计分块 + Ref），控制帧里只剩定长描述符。
-pub async fn store_value_ref(
-    audit: &mut AuditStream,
-    journal_id: &str,
-    value: &Value,
-    limit: usize,
-) -> Result<StoredValue, crate::task::TaskError> {
-    let bytes = flow_journal::codec::bounded_json(value, limit)?;
-    flow_journal::codec::validate_depth(value, 0)?;
-    store_bytes_ref(audit, journal_id, &bytes, ValueCodec::Json).await
-}
-
 /// 任意字节（HTTP 原始响应）走 Bytes 编码。
 pub async fn store_bytes(
     audit: &mut AuditStream,
@@ -237,14 +283,16 @@ pub async fn store_bytes(
     store_bytes_ref(audit, journal_id, bytes, codec).await
 }
 
-/// [`store_bytes`] 的分块分支（也供 [`store_value_ref`] 复用）：只发
-/// 审计分块 + 发布，绝不 inline。
+/// [`store_bytes`] 的分块分支：只发审计分块 + 发布，绝不 inline。
 pub async fn store_bytes_ref(
     audit: &mut AuditStream,
     journal_id: &str,
     bytes: &[u8],
     codec: ValueCodec,
 ) -> Result<StoredValue, crate::task::TaskError> {
+    if bytes.len() as u64 > MAX_VALUE_BYTES {
+        return Err(TransferError::Oversize(bytes.len() as u64).into());
+    }
     let output_id = uuid::Uuid::now_v7().to_string();
     let mut index = 0u64;
     let mut total = 0u64;
@@ -255,10 +303,12 @@ pub async fn store_bytes_ref(
             chunk_index: index,
             data: STANDARD.encode(chunk),
         };
-        audit.push(
-            "value_chunk",
-            serde_json::to_value(&record).expect("chunk json"),
-        )?;
+        audit
+            .push_wait(
+                "value_chunk",
+                serde_json::to_value(&record).expect("chunk json"),
+            )
+            .await?;
         hash.update(chunk);
         total += chunk.len() as u64;
         index += 1;
@@ -272,10 +322,14 @@ pub async fn store_bytes_ref(
         total_bytes: total,
         digest: hex::encode(hash.finalize()),
     };
-    audit.push(
-        "value_published",
-        serde_json::to_value(&reference).expect("ref json"),
-    )?;
+    let seq = audit
+        .push_wait(
+            "value_published",
+            serde_json::to_value(&reference).expect("ref json"),
+        )
+        .await?;
+    // Publication is a barrier: callers can safely queue small metadata afterwards.
+    audit.await_published(seq).await?;
     Ok(StoredValue::Ref(reference))
 }
 

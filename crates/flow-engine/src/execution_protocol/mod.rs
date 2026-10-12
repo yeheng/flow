@@ -27,4 +27,4 @@ pub use message::{
 };
 pub use transfer_key::TransferKey;
 #[cfg(unix)]
-pub use unix::{channels_from_raw, socketpair_channels, ChannelPair};
+pub use unix::{channel_from_raw, socketpair_channel};

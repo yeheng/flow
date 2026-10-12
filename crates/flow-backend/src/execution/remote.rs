@@ -18,7 +18,7 @@ use tokio::sync::{mpsc, oneshot, Mutex, Notify, Semaphore};
 use tokio_rustls::TlsAcceptor;
 
 use flow_engine::execution_protocol::contract::{A_MAX, STARTUP_TIMEOUT_MS, W_BYTES};
-use flow_engine::execution_protocol::message::{Message, ProtocolError};
+use flow_engine::execution_protocol::message::Message;
 use flow_engine::execution_protocol::remote::{
     capability, validate_route_identity, ResumeAction, ResumeDecision, ResumeItem, RouteEnvelope,
 };
@@ -45,6 +45,8 @@ pub(crate) fn is_link_dead(error: &crate::journal::JournalError) -> bool {
 #[derive(Debug, Clone)]
 pub struct RemoteOptions {
     pub control_addr: String,
+    /// 已废弃：v3 起上联收敛为单条 TLS 连接（帧内通道标签），本字段仅为
+    /// 存量配置兼容保留，值被忽略。
     pub data_addr: String,
     pub ca_cert: PathBuf,
     pub server_cert: PathBuf,
@@ -198,18 +200,10 @@ pub struct AgentManager {
     agents: Mutex<BTreeMap<String, Arc<AgentRegistration>>>,
     bindings: Mutex<BTreeMap<String, Arc<BoundDispatch>>>,
     capacity_changed: Notify,
-    pending_data: Mutex<BTreeMap<String, Arc<PendingData>>>,
     pending_binds: Mutex<BTreeMap<String, PendingBind>>,
     session_counter: AtomicU64,
     agent_counter: AtomicU64,
     shutdown: tokio_util::sync::CancellationToken,
-}
-
-// 等待 data 流汇入的槽（control 先握手，data 后合并——避免双方互等的
-// 协议死锁：agent 收到 Welcome 才发起 data 连接）。
-struct PendingData {
-    data: tokio::sync::Mutex<Option<BoxedStream>>,
-    notify: Notify,
 }
 
 // bind 挂起登记：agent_id/executor_id 在超时清理与诊断路径读取。
@@ -232,7 +226,6 @@ impl AgentManager {
             agents: Mutex::new(BTreeMap::new()),
             bindings: Mutex::new(BTreeMap::new()),
             capacity_changed: Notify::new(),
-            pending_data: Mutex::new(BTreeMap::new()),
             pending_binds: Mutex::new(BTreeMap::new()),
             session_counter: AtomicU64::new(0),
             agent_counter: AtomicU64::new(0),
@@ -245,139 +238,96 @@ impl AgentManager {
         &self.global
     }
 
-    // TLS 监听入口（真实网络，三期 §1.2）。
+    // TLS 监听入口（真实网络，三期 §1.2）。单条 mTLS 连接承载整条上联
+    // （v3：control/data 由帧内通道标签区分），不再有第二条 data 连接。
     pub async fn listen_tls(self: &Arc<Self>, options: RemoteOptions) -> Result<()> {
         install_crypto_provider();
         let tls =
             TlsServer::from_files(&options.ca_cert, &options.server_cert, &options.server_key)
                 .map_err(|e| invalid(format!("agent TLS config: {e}")))?;
-        let control = TcpListener::bind(&options.control_addr)
+        let listener = TcpListener::bind(&options.control_addr)
             .await
-            .map_err(|e| invalid(format!("agent control listen: {e}")))?;
-        let data = TcpListener::bind(&options.data_addr)
-            .await
-            .map_err(|e| invalid(format!("agent data listen: {e}")))?;
+            .map_err(|e| invalid(format!("agent listen: {e}")))?;
         tracing::info!(
-            control = %control.local_addr().map_err(|e| invalid(e.to_string()))?,
-            data = %data.local_addr().map_err(|e| invalid(e.to_string()))?,
-            "agent TLS listeners ready"
+            listen = %listener.local_addr().map_err(|e| invalid(e.to_string()))?,
+            "agent TLS listener ready"
         );
-        for (listener, is_control, acceptor) in [
-            (control, true, tls.acceptor.clone()),
-            (data, false, tls.acceptor.clone()),
-        ] {
+        let acceptor = tls.acceptor.clone();
+        loop {
+            let Ok((socket, _)) = listener.accept().await else {
+                return Ok(());
+            };
+            let acceptor = acceptor.clone();
             let manager = self.clone();
             tokio::spawn(async move {
-                loop {
-                    let Ok((socket, _)) = listener.accept().await else {
-                        return;
-                    };
-                    let acceptor = acceptor.clone();
-                    let manager = manager.clone();
-                    tokio::spawn(async move {
-                        let Ok(stream) = acceptor.accept(socket).await else {
-                            return;
-                        };
-                        let agent_id = stream
-                            .get_ref()
-                            .1
-                            .peer_certificates()
-                            .and_then(|certs| certs.first())
-                            .and_then(|c| cert_common_name(c.as_ref()));
-                        let Some(agent_id) = agent_id else {
-                            tracing::warn!("agent TLS connection without client cert");
-                            return;
-                        };
-                        let side = if is_control {
-                            Side::Control
-                        } else {
-                            Side::Data
-                        };
-                        manager
-                            .inject_stream(agent_id, side, Box::pin(stream))
-                            .await;
-                    });
-                }
+                let Ok(stream) = acceptor.accept(socket).await else {
+                    return;
+                };
+                let agent_id = stream
+                    .get_ref()
+                    .1
+                    .peer_certificates()
+                    .and_then(|certs| certs.first())
+                    .and_then(|c| cert_common_name(c.as_ref()));
+                let Some(agent_id) = agent_id else {
+                    tracing::warn!("agent TLS connection without client cert");
+                    return;
+                };
+                manager
+                    .inject_stream(agent_id, Box::pin(stream))
+                    .await;
             });
         }
-        Ok(())
     }
 
-    // R0 模拟中继入口：直接注入双流（无 TLS；身份由注入方保证）。
+    // R0 模拟中继入口：直接注入单流（无 TLS；身份由注入方保证）。
     pub async fn attach_inprocess(
         self: &Arc<Self>,
         agent_id: String,
-        control: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
-        data: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        stream: impl AsyncReadWrite + Send + 'static,
     ) {
-        self.inject_stream(agent_id.clone(), Side::Control, Box::pin(control))
-            .await;
-        self.inject_stream(agent_id, Side::Data, Box::pin(data))
-            .await;
+        self.inject_stream(agent_id, Box::pin(stream)).await;
     }
 
-    async fn inject_stream(self: &Arc<Self>, agent_id: String, side: Side, stream: BoxedStream) {
-        match side {
-            Side::Control => {
-                // control 到达即启动会话。
-                let manager = self.clone();
-                let agent_id = agent_id.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = manager.run_session(agent_id, stream).await {
-                        tracing::warn!(%error, "agent session ended");
-                    }
-                });
+    async fn inject_stream(self: &Arc<Self>, agent_id: String, stream: BoxedStream) {
+        let manager = self.clone();
+        let agent_id = agent_id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = manager.run_session(agent_id, stream).await {
+                tracing::warn!(%error, "agent session ended");
             }
-            Side::Data => {
-                // 统一在注册表登记（与会话任务使用同一槽位，避免注入先于
-                // 会话注册时凭空创建无人等待的槽）。
-                let mut slots = self.pending_data.lock().await;
-                let slot = slots
-                    .entry(agent_id.clone())
-                    .or_insert_with(|| {
-                        Arc::new(PendingData {
-                            data: tokio::sync::Mutex::new(None),
-                            notify: Notify::new(),
-                        })
-                    })
-                    .clone();
-                *slot.data.lock().await = Some(stream);
-                slot.notify.notify_one();
-            }
-        }
+        });
     }
 
-    // 单个 agent 会话：control 先裸帧握手（Hello/Welcome），随后等 data
-    // 流汇入并完成 DataBind → 转发。
+    // 单个 agent 会话：裸帧读 AgentHello/回 AgentWelcome 后，整条单流
+    // 交给统一 transport（v3：帧内通道标签，无需第二条连接与 DataBind）。
     async fn run_session(
         self: &Arc<Self>,
         agent_id: String,
-        control: BoxedStream,
+        stream: BoxedStream,
     ) -> std::result::Result<(), String> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let control = tokio::io::BufStream::new(control);
-        let (mut control_read, mut control_write) = tokio::io::split(control);
-        // 1) control 裸帧握手。
+        let stream = tokio::io::BufStream::new(stream);
+        let (mut stream_read, mut stream_write) = tokio::io::split(stream);
+        // 1) 裸帧握手（单流标签帧格式）。
         let (agent_boot_id, _build, capabilities, slots) = {
-            let mut decoder = flow_engine::execution_protocol::frame::FrameDecoder::new(
-                flow_engine::execution_protocol::CONTROL_MAX_FRAME,
-            );
+            let mut decoder = flow_engine::execution_protocol::frame::FrameDecoder::new_tagged();
             let hello = loop {
                 let mut chunk = [0u8; 16 * 1024];
                 let n = tokio::time::timeout(
                     Duration::from_millis(STARTUP_TIMEOUT_MS * 2),
-                    control_read.read(&mut chunk),
+                    stream_read.read(&mut chunk),
                 )
                 .await
                 .map_err(|_| "agent hello timeout".to_string())?
                 .map_err(|e| format!("read hello: {e}"))?;
                 if n == 0 {
-                    return Err("control closed before hello".into());
+                    return Err("stream closed before hello".into());
                 }
                 decoder
                     .feed(&chunk[..n])
                     .map_err(|e| format!("hello frame: {e}"))?;
-                if let Some(json) = decoder.pop_frame().map_err(|e| e.to_string())? {
+                if let Some((_, json)) = decoder.pop_tagged_frame().map_err(|e| e.to_string())? {
                     let value: serde_json::Value =
                         serde_json::from_slice(&json).map_err(|e| e.to_string())?;
                     break Message::from_envelope(value).map_err(|e| e.to_string())?;
@@ -407,85 +357,32 @@ impl AgentManager {
             "link-{}",
             self.session_counter.fetch_add(1, Ordering::Relaxed)
         );
-        let data_credential = flow_engine::execution_protocol::transport::fresh_boot_id();
-        // 裸写 Welcome（agent 在 data 连接前等待它）。
+        // 裸写 Welcome（字段保留 data_credential：Message 信封结构冻结，
+        // v3 单流下已无第二条连接需要绑定，值不再被消费）。
         {
             let welcome = Message::AgentWelcome {
                 journal_id: self.journal_id.clone(),
                 master_epoch: self.master_epoch,
                 link_session_id: link_session_id.clone(),
                 agent_id: agent_id.clone(),
-                data_credential: data_credential.clone(),
+                data_credential: flow_engine::execution_protocol::transport::fresh_boot_id(),
                 heartbeat_ms: flow_engine::execution_protocol::HEARTBEAT_INTERVAL_MS,
                 agent_window_bytes: W_BYTES * A_MAX as u64,
             };
-            let frame = flow_engine::execution_protocol::frame::encode_frame(&welcome)
+            let frame = flow_engine::execution_protocol::frame::encode_tagged_frame(&welcome)
                 .map_err(|e| format!("encode welcome: {e}"))?;
-            control_write
+            stream_write
                 .write_all(&frame)
                 .await
                 .map_err(|e| format!("write welcome: {e}"))?;
-            control_write
+            stream_write
                 .flush()
                 .await
                 .map_err(|e| format!("flush welcome: {e}"))?;
         }
-        // 2) 等 data 流汇入（agent 收到 Welcome 后发起）。
-        let data_slot = {
-            let mut slots = self.pending_data.lock().await;
-            slots
-                .entry(agent_id.clone())
-                .or_insert_with(|| {
-                    Arc::new(PendingData {
-                        data: tokio::sync::Mutex::new(None),
-                        notify: Notify::new(),
-                    })
-                })
-                .clone()
-        };
-        let data = tokio::time::timeout(Duration::from_millis(STARTUP_TIMEOUT_MS * 4), async {
-            loop {
-                if let Some(data) = data_slot.data.lock().await.take() {
-                    return Ok::<BoxedStream, ()>(data);
-                }
-                data_slot.notify.notified().await;
-            }
-        })
-        .await
-        .map_err(|_| "data connection timeout".to_string())?
-        .map_err(|_| "data connection cancelled".to_string())?;
-        // 重组握手后的流交给统一 transport（BufStream 缓冲已由裸读消化）。
-        let control = control_read.unsplit(control_write);
-        let data = tokio::io::BufStream::new(data);
-        let mut transport = FrameTransport::spawn_streams(control, data, 128);
-        // 3) data 首帧 DataBind（防连接串配：同主体、boot、会话、一次性凭据）。
-        tokio::time::timeout(Duration::from_millis(STARTUP_TIMEOUT_MS * 2), async {
-            loop {
-                let (channel, message) = transport.recv().await?;
-                if channel == flow_engine::execution_protocol::Channel::Data {
-                    if let Message::DataBind {
-                        agent_boot_id: bind_boot,
-                        link_session_id: bind_session,
-                        credential,
-                    } = message
-                    {
-                        if bind_boot != agent_boot_id
-                            || bind_session != link_session_id
-                            || credential != data_credential
-                        {
-                            return Err(ProtocolError::Malformed("data bind mismatch".into()));
-                        }
-                        return Ok(());
-                    }
-                    return Err(ProtocolError::Malformed(
-                        "expected DataBind on data channel".into(),
-                    ));
-                }
-            }
-        })
-        .await
-        .map_err(|_| "data bind timeout".to_string())?
-        .map_err(|e: ProtocolError| e.to_string())?;
+        // 2) 握手后的单流直接交给统一 transport（BufStream 缓冲已由裸读消化）。
+        let stream = stream_read.unsplit(stream_write);
+        let mut transport = FrameTransport::spawn(stream, 128);
 
         // 3) 注册会话（替换旧会话：旧 outbound 关闭 → 相关 runner link-dead）。
         let (outbound, mut commands) = mpsc::channel::<ToSession>(256);
@@ -1109,11 +1006,6 @@ fn dead_to_session() -> mpsc::Sender<ToSession> {
     let (tx, mut rx) = mpsc::channel(1);
     rx.close();
     tx
-}
-
-enum Side {
-    Control,
-    Data,
 }
 
 // 依主日志裁决单项 resume（三期 §1.4 表）：run 终态/派发被替代 →

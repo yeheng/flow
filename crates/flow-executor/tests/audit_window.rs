@@ -35,7 +35,7 @@ async fn window_blocks_until_prefix_acked_then_resumes() {
     let unit = flow_engine::execution_protocol::record_bytes(1, "business_audit", &payload());
     let (mut audit, mut rx, acks) = stream(unit + 16);
     assert_eq!(audit.push("business_audit", payload()).unwrap(), 1);
-    assert_eq!(audit.push("business_audit", payload()).unwrap(), 2);
+    assert!(audit.push("business_audit", payload()).is_err());
     audit.flush().await.unwrap();
     let first = rx.recv().await.unwrap();
     match &first {
@@ -59,6 +59,10 @@ async fn window_blocks_until_prefix_acked_then_resumes() {
     let cancel = tokio_util::sync::CancellationToken::new();
     let (done_tx, done_rx) = oneshot::channel();
     let waiter = tokio::spawn(async move {
+        assert_eq!(
+            audit.push_wait("business_audit", payload()).await.unwrap(),
+            2
+        );
         let _ = done_tx.send(audit.await_durable(2, &cancel).await);
     });
     acks.send((1, unit)).unwrap();
@@ -104,4 +108,80 @@ async fn await_durable_is_cancellable() {
     cancel.cancel();
     let error = audit.await_durable(1, &cancel).await.unwrap_err();
     assert!(matches!(error, AuditError::Cancelled));
+}
+
+#[tokio::test]
+async fn only_remote_uplink_replays_unacknowledged_batches() {
+    let (mut local, mut local_rx, _local_acks) = stream(flow_engine::execution_protocol::W_BYTES);
+    let (mut remote, mut remote_rx, _remote_acks) =
+        stream(flow_engine::execution_protocol::W_BYTES);
+    let local_cancel = tokio_util::sync::CancellationToken::new();
+    let remote_cancel = tokio_util::sync::CancellationToken::new();
+    local.configure(false, local_cancel.clone());
+    remote.configure(true, remote_cancel.clone());
+    local.push("business_audit", payload()).unwrap();
+    remote.push("business_audit", payload()).unwrap();
+    let local_task = tokio::spawn(async move { local.await_published(1).await });
+    let remote_task = tokio::spawn(async move { remote.await_published(1).await });
+    local_rx.recv().await.unwrap();
+    remote_rx.recv().await.unwrap();
+    let replay = tokio::time::timeout(Duration::from_secs(4), remote_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(replay, Message::AuditBatch { first_seq: 1, .. }));
+    assert!(
+        local_rx.try_recv().is_err(),
+        "reliable local IPC must send once"
+    );
+    local_cancel.cancel();
+    remote_cancel.cancel();
+    assert!(matches!(
+        local_task.await.unwrap(),
+        Err(AuditError::Cancelled)
+    ));
+    assert!(matches!(
+        remote_task.await.unwrap(),
+        Err(AuditError::Cancelled)
+    ));
+}
+
+#[tokio::test]
+async fn large_output_production_stays_inside_window_and_frame_limit() {
+    use flow_engine::execution_protocol::{
+        contract::{DATA_MAX_FRAME, W_BYTES},
+        frame::encode_tagged_frame,
+    };
+    let (mut audit, mut rx, acks) = stream(W_BYTES);
+    let producer = tokio::spawn(async move {
+        flow_executor::transfer::store_bytes_ref(
+            &mut audit,
+            "j",
+            &vec![b'x'; 6 * 1024 * 1024],
+            flow_journal::value::ValueCodec::Bytes,
+        )
+        .await
+        .unwrap();
+        assert!(audit.queued_bytes() <= W_BYTES);
+    });
+    let consumer = tokio::spawn(async move {
+        let mut bytes = 0;
+        let mut records_seen = 0;
+        while let Some(message) = rx.recv().await {
+            assert!(encode_tagged_frame(&message).unwrap().len() <= DATA_MAX_FRAME + 4);
+            if let Message::AuditBatch { records, .. } = message {
+                let last = records.last().unwrap().audit_seq;
+                records_seen += records.len();
+                bytes += records.iter().map(|r| r.encoded_bytes()).sum::<u64>();
+                let _ = acks.send((last, bytes));
+            }
+        }
+        assert_eq!(records_seen, 25);
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        producer.await.unwrap();
+        consumer.await.unwrap();
+    })
+    .await
+    .unwrap();
 }

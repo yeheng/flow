@@ -9,7 +9,7 @@ import {
   type ClusterPage,
   type ClusterNode,
 } from "../api/cluster";
-import { errText, RpcError } from "../rpc/client";
+import { client, errText, RpcError } from "../rpc/client";
 import { confirmDialog } from "../state/modal";
 import { toast } from "../state/toast";
 import AppButton from "../components/AppButton.vue";
@@ -21,7 +21,6 @@ const busy = ref(false);
 const removing = ref("");
 const after = ref("");
 const pending = new Map<string, string>();
-let timer: ReturnType<typeof setInterval> | undefined;
 let disposed = false;
 const labels: Record<ClusterNode["status"], string> = {
   online: "在线",
@@ -76,13 +75,14 @@ async function remove(node: ClusterNode) {
     removing.value = "";
   }
 }
+// 一次性加载 + 手动刷新；断线期间错过的租约/心跳变化由重连回调补齐
+const offReconnect = client.onReconnect(() => void refresh());
 onMounted(() => {
   void refresh();
-  timer = setInterval(() => void refresh(), 5000);
 });
 onBeforeUnmount(() => {
   disposed = true;
-  clearInterval(timer);
+  offReconnect();
 });
 </script>
 
@@ -189,7 +189,7 @@ onBeforeUnmount(() => {
         <AppButton :disabled="!after || busy" @click="refresh('')">首页</AppButton
         ><AppButton :disabled="!page.next_after || busy" @click="refresh(page.next_after ?? '')">
           下一页</AppButton
-        ><span>每 5 秒刷新当前页</span>
+        >
       </footer>
     </template>
     <p v-else-if="busy">正在读取注册状态…</p>

@@ -7,6 +7,7 @@ use flow_journal::value::ValueCodec;
 use flow_journal::{StoredValue, ValueRef};
 use serde_json::{json, Value};
 
+use super::contract::PROTOCOL_VERSION;
 use super::message::{
     AuditRecord, ExecuteTask, Message, ObservationLine, ResultOutcome, TaskValue, WaitRequest,
 };
@@ -184,24 +185,25 @@ pub fn failure_result() -> Message {
     }
 }
 
-/// 必须被明确拒绝的畸形信封。
+/// 必须被明确拒绝的畸形信封。版本字段用 [`PROTOCOL_VERSION`] 常量构造
+/// （字面量会随协议升级失真：构造意图是「其它字段畸形」，不是版本不符）。
 pub fn malformed_envelopes() -> Vec<Value> {
     vec![
         json!("not an object"),
         json!({}),
-        json!({"v": 3, "type": "Ready"}),  // 版本不兼容
-        json!({"v": 2}),                   // 缺 type
-        json!({"v": 2, "type": "Result"}), // 缺 dispatch/body
-        json!({"v": 2, "type": "AuditAck", "dispatch_id": "d", "body": {"durable_audit_seq": "x", "durable_bytes": "1", "commit_lsn": "1"}}), // 非十进制
-        json!({"v": 2, "type": "AuditAck", "dispatch_id": "d", "body": {"durable_audit_seq": 5, "durable_bytes": "1", "commit_lsn": "1"}}), // 数字而非字符串
-        json!({"v": 2, "type": "Execute", "dispatch_id": "d", "body": {"command_id": "c", "task": {}}}), // 缺字段
-        json!({"v": 2, "type": "AuditBatch", "dispatch_id": "d", "body": {"first_seq": "1", "records": [{"audit_seq": "1", "kind": "k"}]}}), // 记录缺 payload
+        json!({"v": PROTOCOL_VERSION + 1, "type": "Ready"}),  // 版本不兼容
+        json!({"v": PROTOCOL_VERSION}),                   // 缺 type
+        json!({"v": PROTOCOL_VERSION, "type": "Result"}), // 缺 dispatch/body
+        json!({"v": PROTOCOL_VERSION, "type": "AuditAck", "dispatch_id": "d", "body": {"durable_audit_seq": "x", "durable_bytes": "1", "commit_lsn": "1"}}), // 非十进制
+        json!({"v": PROTOCOL_VERSION, "type": "AuditAck", "dispatch_id": "d", "body": {"durable_audit_seq": 5, "durable_bytes": "1", "commit_lsn": "1"}}), // 数字而非字符串
+        json!({"v": PROTOCOL_VERSION, "type": "Execute", "dispatch_id": "d", "body": {"command_id": "c", "task": {}}}), // 缺字段
+        json!({"v": PROTOCOL_VERSION, "type": "AuditBatch", "dispatch_id": "d", "body": {"first_seq": "1", "records": [{"audit_seq": "1", "kind": "k"}]}}), // 记录缺 payload
     ]
 }
 
 pub fn unknown_type_envelope() -> Value {
     // 注意：三期已把 Resume/ResumeReply 纳入目录；未知类型用目录外名称。
-    json!({"v": 2, "type": "TeleportRequest", "body": {}})
+    json!({"v": PROTOCOL_VERSION, "type": "TeleportRequest", "body": {}})
 }
 
 /// 同 dispatch 同序号异内容样本（必须拒绝）。

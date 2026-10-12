@@ -3,13 +3,12 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use serde_json::ser::Formatter as _;
 use serde::{Deserialize, Serialize};
+use serde_json::ser::Formatter as _;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::codec::{bounded_json, Event, EventKind};
-use crate::storage::scan_until;
 use crate::{
     invalid, Error, Journal, QueueClass, Result, CHUNK_BYTES, INLINE_BYTES, MAX_VALUE_BYTES,
 };
@@ -323,7 +322,10 @@ pub fn read_value(
     let mut total = 0;
     let mut hash = Sha256::new();
     let mut published = false;
-    let report = scan_until(root, upper_lsn, |tx, _| {
+    for location in crate::address::locations(root, upper_lsn, &value.journal_id, &value.output_id)?
+    {
+        let location = location?;
+        let tx = crate::codec::decode(&crate::maintenance::read_location(root, &location)?)?;
         if tx.journal_id != value.journal_id {
             return Err(invalid("foreign value journal"));
         }
@@ -364,10 +366,6 @@ pub fn read_value(
                 published = true;
             }
         }
-        Ok(())
-    })?;
-    if let Some(fault) = report.fault {
-        return Err(invalid(fault.reason));
     }
     if index != value.chunk_count
         || total != value.total_bytes
@@ -599,7 +597,9 @@ mod object_writer_tests {
             object.key("status").unwrap();
             object.value(&404u64).unwrap();
             object.key("weird \"key\"\n").unwrap();
-            object.value(&serde_json::json!({"a": [1, 2, null]})).unwrap();
+            object
+                .value(&serde_json::json!({"a": [1, 2, null]}))
+                .unwrap();
             object.key("raw").unwrap();
             object.raw_value_bytes(b"{\"streamed\":true}").unwrap();
             object.finish().unwrap();

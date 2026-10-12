@@ -1323,11 +1323,29 @@ fn body_value(value: impl Serialize) -> Option<Value> {
     serde_json::to_value(value).ok()
 }
 
-/// 通道标识。control 与 data 分离消除流内队头阻塞（二期 §3.1）。
+/// 通道标识。单流承载下编码为帧内 1 字节标签（见 frame.rs）；agent 上联
+/// 仍按双物理流承载，靠流本身区分。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Channel {
     Control,
     Data,
+}
+
+impl Channel {
+    pub fn tag(self) -> u8 {
+        match self {
+            Channel::Control => 0,
+            Channel::Data => 1,
+        }
+    }
+
+    pub fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Channel::Control),
+            1 => Some(Channel::Data),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

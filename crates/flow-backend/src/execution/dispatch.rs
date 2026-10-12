@@ -113,12 +113,11 @@ pub(crate) struct DispatchRunner {
     committed: BTreeMap<u64, String>,
     pending_result: Option<PendingResult>,
     op_transfers: BTreeMap<String, OpTransfer>,
-    /// RequestOperation 先于其 data 块到达时挂起（双通道乱序，二期 §3.6）。
-    pending_operation_request: Option<Message>,
     cancel_sent: bool,
     session_healthy: bool,
     /// 本次派发的尝试序号（观测日志归属用；在 drive_link 读记录时对齐）。
     task_attempt: u32,
+    remote_replay: bool,
 }
 
 impl DispatchRunner {
@@ -138,10 +137,10 @@ impl DispatchRunner {
             committed: BTreeMap::new(),
             pending_result: None,
             op_transfers: BTreeMap::new(),
-            pending_operation_request: None,
             cancel_sent: false,
             session_healthy: true,
             task_attempt: 1,
+            remote_replay: false,
         }
     }
 
@@ -157,6 +156,7 @@ impl DispatchRunner {
         link: &mut DispatchLink,
         resume: bool,
     ) -> Result<()> {
+        self.remote_replay = true;
         self.drive_link(link, resume).await
     }
 
@@ -272,7 +272,7 @@ impl DispatchRunner {
         let transfer_preds = self.predecessors.clone();
         let transfer_prepared = record.prepared.clone();
         let transfer_outcome = previous_outcome.clone();
-        let transfer = tokio::spawn(transfer_inputs(
+        let mut transfer = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(transfer_inputs(
             transfer_session,
             self.attempt.dispatch_id.clone(),
             transfer_backend,
@@ -280,24 +280,47 @@ impl DispatchRunner {
             transfer_preds,
             transfer_prepared,
             transfer_outcome,
-        ));
+        )));
+        let mut transfer_done = false;
         // 主事件循环。
         let deadline = tokio::time::Instant::now() + Duration::from_millis(DURABLE_WAIT_TIMEOUT_MS);
         let mut cancel_tick = tokio::time::interval(Duration::from_millis(100));
         let mut error: Option<crate::journal::JournalError> = None;
         loop {
             if let Some(err) = error.take() {
-                let _ = transfer.await;
+                transfer.abort();
+                if !transfer_done {
+                    let _ = (&mut transfer).await;
+                }
                 return Err(err);
             }
             tokio::select! {
+                result = &mut transfer, if !transfer_done => {
+                    transfer_done = true;
+                    match result {
+                        Ok(Ok(())) => {},
+                        Ok(Err(InputTransferError::LinkClosed)) => {
+                            self.session_healthy = false;
+                            return Err(JournalError::LinkClosed("input transfer link closed".into()));
+                        }
+                        Ok(Err(InputTransferError::Invalid(reason))) => {
+                            self.session_healthy = false;
+                            return Err(invalid(format!("input transfer failed: {reason}")));
+                        }
+                        Err(error) => {
+                            self.session_healthy = false;
+                            return Err(invalid(format!("input transfer stopped: {error}")));
+                        }
+                    }
+                }
                 event = link.events.recv() => {
                     match event {
                         Some(FromSession::Incoming(message)) => {
                             match self.handle(*message, link).await {
                                 Ok(Some(())) => {
                                     // 任务完成（ResultCommitted 已发）。
-                                    let _ = transfer.await;
+                                    transfer.abort();
+                                    if !transfer_done { let _ = (&mut transfer).await; }
                                     return Ok(());
                                 }
                                 Ok(None) => {}
@@ -312,7 +335,8 @@ impl DispatchRunner {
                         }
                         Some(FromSession::Dead(reason)) => {
                             let cancelled = self.cancel_sent;
-                            let _ = transfer.await;
+                            transfer.abort();
+                            if !transfer_done { let _ = (&mut transfer).await; }
                             if cancelled {
                                 return Err(invalid(format!("executor stopped after cancel: {reason}")));
                             }
@@ -320,7 +344,8 @@ impl DispatchRunner {
                             return Err(JournalError::LinkClosed(format!("executor session dead: {reason}")));
                         }
                         None => {
-                            let _ = transfer.await;
+                            transfer.abort();
+                            if !transfer_done { let _ = (&mut transfer).await; }
                             self.session_healthy = false;
                             return Err(JournalError::LinkClosed("executor session closed".into()));
                         }
@@ -343,9 +368,12 @@ impl DispatchRunner {
                     }
                 }
             }
-            if tokio::time::Instant::now() > deadline && !self.cancel_sent {
+            if self.remote_replay && tokio::time::Instant::now() > deadline && !self.cancel_sent {
                 self.session_healthy = false;
-                let _ = transfer.await;
+                transfer.abort();
+                if !transfer_done {
+                    let _ = (&mut transfer).await;
+                }
                 return Err(invalid("dispatch deadline exceeded"));
             }
         }
@@ -415,7 +443,8 @@ impl DispatchRunner {
                 Ok(None)
             }
             Message::RequestOperation { .. } => {
-                // 请求字节在 data 通道，可能未齐：未齐时挂起，块到齐后重试。
+                // 单流承载（v3）：执行器按「块 → InputReady → 请求」的顺序
+                // 提交，请求到达时块必然已齐；不齐即传输损坏，明确拒绝。
                 let incomplete = match &message {
                     Message::RequestOperation { transfer_id, .. } => {
                         !self.op_transfer_complete(transfer_id)
@@ -423,8 +452,9 @@ impl DispatchRunner {
                     _ => unreachable!(),
                 };
                 if incomplete {
-                    self.pending_operation_request = Some(message);
-                    return Ok(None);
+                    return Err(invalid(
+                        "operation request arrived before its transfer completed",
+                    ));
                 }
                 self.handle_request_operation(message, link).await?;
                 Ok(None)
@@ -468,7 +498,6 @@ impl DispatchRunner {
                 if entry.chunks.insert(offset, raw).is_some() {
                     return Err(invalid("duplicate transfer chunk"));
                 }
-                self.try_pending_operation(link).await?;
                 Ok(None)
             }
             Message::InputReady {
@@ -489,7 +518,6 @@ impl DispatchRunner {
                     ready: None,
                 });
                 entry.ready = Some((total_bytes, digest));
-                self.try_pending_operation(link).await?;
                 Ok(None)
             }
             Message::ObservabilityBatch { dispatch_id, lines } => {
@@ -498,9 +526,9 @@ impl DispatchRunner {
                 };
                 let batch_dispatch =
                     dispatch_id.unwrap_or_else(|| self.attempt.dispatch_id.clone());
-                // 双通道（control/data）传输没有跨通道顺序：观测尾批可能晚于
-                // Result 到达，此时会话已被下一个派发复用。批自带的
-                // dispatch_id 是唯一可靠归属——错记到当前节点比丢弃更糟。
+                // 单流承载（v3）：观测批先于 Result 提交（同一发送队列），
+                // 到达序即提交序；dispatch_id 归属回退仍保留——防中继/重传
+                // 路径的迟到副本错记到当前节点（错记比丢弃更糟）。
                 let (run_id, node_id, attempt) = if batch_dispatch == self.attempt.dispatch_id {
                     (
                         self.attempt.run_id.clone(),
@@ -576,22 +604,6 @@ impl DispatchRunner {
             hash.update(chunk);
         }
         hex::encode(hash.finalize()) == *digest
-    }
-
-    /// 挂起的 RequestOperation 在块齐后重试。
-    async fn try_pending_operation(&mut self, link: &mut DispatchLink) -> Result<()> {
-        let ready = match &self.pending_operation_request {
-            Some(Message::RequestOperation { transfer_id, .. }) => {
-                self.op_transfer_complete(transfer_id)
-            }
-            _ => false,
-        };
-        if ready {
-            if let Some(message) = self.pending_operation_request.take() {
-                self.handle_request_operation(message, link).await?;
-            }
-        }
-        Ok(())
     }
 
     /// 审计批次：连续性 + 同序号同内容幂等 + 单事务持久化 + AuditAck。
@@ -797,6 +809,21 @@ impl DispatchRunner {
             .prepared
             .clone()
             .ok_or_else(|| invalid("child registration before preparation"))?;
+        // Avoid putting an arbitrarily large mapping in the Result control frame.
+        let input_mapping = match input_mapping {
+            Some(mapping) => Some(mapping),
+            None => {
+                let root = self.attempt.backend.journal.root().to_path_buf();
+                let upper = self.attempt.backend.journal.durable_lsn();
+                let params = prepared.params.clone();
+                let params = tokio::task::spawn_blocking(move || {
+                    flow_journal::value::materialize(&root, upper, &params, 8 * 1024 * 1024)
+                })
+                .await
+                .map_err(|e| invalid(e.to_string()))??;
+                params.get("input_mapping").cloned()
+            }
+        };
         let input = if let Some(mapping) = input_mapping {
             let bytes = flow_journal::codec::bounded_json(&mapping, 8 * 1024 * 1024)?;
             if bytes.len() <= flow_journal::INLINE_BYTES {
@@ -1068,6 +1095,12 @@ enum ByteSource {
     Memory(Vec<u8>),
 }
 
+#[derive(Debug)]
+enum InputTransferError {
+    Invalid(String),
+    LinkClosed,
+}
+
 /// StoredValue → 控制帧声明：Ref 保留 journal 身份（输出回引），
 /// Inline 只声明存在（字节走 data 通道）。
 fn task_value(stored: &StoredValue) -> flow_engine::execution_protocol::TaskValue {
@@ -1097,7 +1130,7 @@ async fn transfer_inputs(
     predecessors: BTreeMap<String, StoredValue>,
     prepared: Option<Prepared>,
     previous_outcome: Option<Value>,
-) {
+) -> std::result::Result<(), InputTransferError> {
     let root = backend.journal.root().to_path_buf();
     let upper = backend.journal.durable_lsn();
     // 声明与 ExecuteTask.inputs 对齐：run 输入、每个前驱输出、已提交准备
@@ -1132,16 +1165,12 @@ async fn transfer_inputs(
         }
     }
     for (transfer_id, source) in transfers {
-        let Ok(source) = source else { return };
-        match source {
+        let source =
+            source.map_err(|_| InputTransferError::Invalid("input encoding failed".into()))?;
+        let ready = match source {
             ByteSource::Memory(bytes) => {
                 let mut cursor = std::io::Cursor::new(bytes);
-                if transfer_one(&session, &dispatch_id, &transfer_id, &mut cursor)
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
+                transfer_one(&session, &dispatch_id, &transfer_id, &mut cursor).await?
             }
             ByteSource::Journal(reference) => {
                 let root = root.clone();
@@ -1162,13 +1191,23 @@ async fn transfer_inputs(
                 });
                 let mut reader = reader;
                 let send = transfer_one(&session, &dispatch_id, &transfer_id, &mut reader).await;
+                // Close the bounded pipe before joining its blocking producer.
+                drop(reader);
                 let production = produce.await;
-                if send.is_err() || production.is_err() {
-                    return;
-                }
+                let ready = send?;
+                production
+                    .map_err(|e| InputTransferError::Invalid(e.to_string()))?
+                    .map_err(|e| InputTransferError::Invalid(e.to_string()))?;
+                ready
             }
-        }
+        };
+        // Publish readiness only after read_value's final integrity check succeeds.
+        session
+            .send(ToSession::Send(Box::new(ready)))
+            .await
+            .map_err(|_| InputTransferError::LinkClosed)?;
     }
+    Ok(())
 }
 
 /// 单值分块传输：边读边发（有界管道 → 主进程内存有界）。
@@ -1177,13 +1216,16 @@ async fn transfer_one(
     dispatch_id: &str,
     transfer_id: &str,
     reader: &mut (impl tokio::io::AsyncRead + Unpin),
-) -> std::result::Result<(), ()> {
+) -> std::result::Result<Message, InputTransferError> {
     use tokio::io::AsyncReadExt;
     let mut buffer = vec![0u8; TRANSFER_CHUNK_BYTES];
     let mut offset = 0u64;
     let mut hash = sha2::Sha256::new();
     loop {
-        let n = reader.read(&mut buffer).await.map_err(|_| ())?;
+        let n = reader
+            .read(&mut buffer)
+            .await
+            .map_err(|e| InputTransferError::Invalid(e.to_string()))?;
         if n == 0 {
             break;
         }
@@ -1197,19 +1239,15 @@ async fn transfer_one(
                 digest: hex_sha(&buffer[..n]),
             })))
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| InputTransferError::LinkClosed)?;
         offset += n as u64;
     }
-    session
-        .send(ToSession::Send(Box::new(Message::InputReady {
-            dispatch_id: dispatch_id.into(),
-            transfer_id: transfer_id.into(),
-            total_bytes: offset,
-            digest: hex_sha_result(&hash),
-        })))
-        .await
-        .map_err(|_| ())?;
-    Ok(())
+    Ok(Message::InputReady {
+        dispatch_id: dispatch_id.into(),
+        transfer_id: transfer_id.into(),
+        total_bytes: offset,
+        digest: hex_sha_result(&hash),
+    })
 }
 
 fn hex_sha(bytes: &[u8]) -> String {
@@ -1279,6 +1317,61 @@ fn stream_of(stream: &str) -> flow_engine::log_types::LogStream {
 #[cfg(test)]
 mod transfer_budget_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn journal_transfer_closes_pipe_on_failure_and_never_publishes_bad_value() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = JournalBackend::open(root.path(), flow_journal::JournalOptions::default())
+            .await
+            .unwrap();
+        let bytes = vec![b'x'; 2 * 1024 * 1024];
+        let reference = flow_journal::value::store_stream(
+            &backend.journal,
+            &mut bytes.as_slice(),
+            ValueCodec::Bytes,
+        )
+        .await
+        .unwrap();
+        let (sender, receiver) = mpsc::channel(16);
+        drop(receiver);
+        let closed = tokio::time::timeout(
+            Duration::from_secs(5),
+            transfer_inputs(
+                sender,
+                "d".into(),
+                backend.clone(),
+                StoredValue::Ref(reference.clone()),
+                BTreeMap::new(),
+                None,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(closed, Err(InputTransferError::LinkClosed)));
+        let (sender, mut receiver) = mpsc::channel(16);
+        let mut bad = reference;
+        bad.digest = "0".repeat(64);
+        let corrupt = tokio::time::timeout(
+            Duration::from_secs(5),
+            transfer_inputs(
+                sender,
+                "d".into(),
+                backend.clone(),
+                StoredValue::Ref(bad),
+                BTreeMap::new(),
+                None,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(corrupt, Err(InputTransferError::Invalid(_))));
+        while let Some(ToSession::Send(message)) = receiver.recv().await {
+            assert!(!matches!(*message, Message::InputReady { .. }));
+        }
+        backend.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn malformed_transfers_are_bounded_before_retention() {

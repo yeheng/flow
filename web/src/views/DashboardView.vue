@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import * as api from "../api/flow";
-import { errText } from "../rpc/client";
+import { client, errText } from "../rpc/client";
 import { activeCount, perWorkflowRates, successRate, type WorkflowRate } from "../state/dashboard";
 import { editor, refreshWorkflows } from "../state/editor";
 import { toast } from "../state/toast";
 import type { RunRecord, RunStats } from "../types";
+import AppButton from "../components/AppButton.vue";
 
 /** 仪表盘：全局概览。统计来自 run.stats（服务端 GROUP BY 精确计数）；
  *  最近运行表只是展示窗口，走 run.list(limit 10) */
@@ -13,9 +14,8 @@ const stats = ref<RunStats>({ total: 0, by_status: {}, by_workflow: [] });
 const runs = ref<RunRecord[]>([]);
 /** 首次拉取完成前不展示空态，避免「暂无…」闪烁 */
 const loaded = ref(false);
-/** 轮询失败只在 ok→error 跳变时 toast，避免每 5s 重复弹错 */
+/** 失败只在 ok→error 跳变时 toast：首刷/手动/重连可能连续触发，避免重复弹错 */
 const pollFailed = ref(false);
-let timer: ReturnType<typeof setInterval> | null = null;
 
 const workflowNames = computed(() => new Map(editor.workflows.map((w) => [w.workflow_id, w.name])));
 const summary = computed(() => ({
@@ -73,13 +73,15 @@ async function copyRunId(id: string): Promise<void> {
   }
 }
 
-onMounted(async () => {
-  await refresh();
-  timer = setInterval(() => void refresh(), 5000);
+// 一次性加载 + 手动刷新；断线期间错过的事件由重连回调补齐，无需常驻轮询
+const offReconnect = client.onReconnect(() => void refresh());
+
+onMounted(() => {
+  void refresh();
 });
 
 onUnmounted(() => {
-  if (timer) clearInterval(timer);
+  offReconnect();
 });
 </script>
 
@@ -87,6 +89,7 @@ onUnmounted(() => {
   <div class="page">
     <div class="page-header">
       <h2>仪表盘</h2>
+      <AppButton @click="refresh()">刷新</AppButton>
     </div>
 
     <div class="cards">

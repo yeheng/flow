@@ -37,7 +37,7 @@ fn remote_options() -> flow_backend::execution::remote::RemoteOptions {
     }
 }
 
-/// 启动 in-process 模拟 agent（双 duplex 流，无 TLS）：等价于 flow-agent
+/// 启动 in-process 模拟 agent（单 duplex 流，无 TLS）：等价于 flow-agent
 /// 的上联会话，但身份由测试注入。
 async fn spawn_simulated_agent(
     manager: &Arc<flow_backend::execution::remote::AgentManager>,
@@ -45,14 +45,12 @@ async fn spawn_simulated_agent(
     slots: u32,
 ) {
     let (control_a, control_b) = tokio::io::duplex(256 * 1024);
-    let (data_a, data_b) = tokio::io::duplex(256 * 1024);
     manager
-        .attach_inprocess(agent_id.to_string(), control_a, data_a)
+        .attach_inprocess(agent_id.to_string(), control_a)
         .await;
     let config = AgentConfig {
         agent_id: agent_id.to_string(),
         control_addr: String::new(),
-        data_addr: String::new(),
         ca_cert: "unused".into(),
         cert: "unused".into(),
         key: "unused".into(),
@@ -61,11 +59,9 @@ async fn spawn_simulated_agent(
     };
     let shutdown = tokio_util::sync::CancellationToken::new();
     tokio::spawn(async move {
-        // 模拟 agent：transport 建立后直接进入服务循环（跳过 TLS 与外层
-        // AgentHello——manager 的 in-process 注入路径在握手时同样要求
-        // AgentHello/DataBind；为满足握手，先用裸帧完成 Hello/Welcome/
-        // DataBind 再交 serve。
-        let mut transport = FrameTransport::spawn_streams(control_b, data_b, 128);
+        // 模拟 agent：单流 transport 上先裸握手（AgentHello → AgentWelcome，
+        // v3 无 DataBind），再交 serve。
+        let mut transport = FrameTransport::spawn(control_b, 128);
         let boot = flow_engine::execution_protocol::transport::fresh_boot_id();
         transport
             .send(flow_engine::execution_protocol::Message::AgentHello {
@@ -86,20 +82,11 @@ async fn spawn_simulated_agent(
             journal_id,
             master_epoch,
             link_session_id,
-            data_credential,
             ..
         } = welcome
         else {
             unreachable!()
         };
-        transport
-            .send(flow_engine::execution_protocol::Message::DataBind {
-                agent_boot_id: boot.clone(),
-                link_session_id: link_session_id.clone(),
-                credential: data_credential,
-            })
-            .await
-            .expect("send data bind");
         // serve 内部依赖 relay/绑定/执行器循环；直接复用 run_agent 的 serve。
         let relay = Arc::new(parking_lot::Mutex::new(flow_agent::relay::Relay::new(
             agent_id_placeholder(&config),
@@ -288,14 +275,13 @@ async fn wrong_route_frames_never_reach_authority() {
         backend.journal.id().into(),
         1,
     );
-    // 直接注入恶意流：AgentHello 合法 → 收 Welcome → DataBind → 发送
-    // 伪造路由帧（未绑定 dispatch）。
+    // 直接注入恶意流：AgentHello 合法 → 收 Welcome → 发送伪造路由帧
+    // （未绑定 dispatch）。
     let (control_a, control_b) = tokio::io::duplex(64 * 1024);
-    let (data_a, data_b) = tokio::io::duplex(64 * 1024);
     manager
-        .attach_inprocess("agent-evil".to_string(), control_a, data_a)
+        .attach_inprocess("agent-evil".to_string(), control_a)
         .await;
-    let mut transport = FrameTransport::spawn_streams(control_b, data_b, 16);
+    let mut transport = FrameTransport::spawn(control_b, 16);
     transport
         .send(Message::AgentHello {
             agent_boot_id: "boot-evil".into(),
@@ -311,22 +297,7 @@ async fn wrong_route_frames_never_reach_authority() {
             break message;
         }
     };
-    let Message::AgentWelcome {
-        link_session_id,
-        data_credential,
-        ..
-    } = welcome
-    else {
-        unreachable!()
-    };
-    transport
-        .send(Message::DataBind {
-            agent_boot_id: "boot-evil".into(),
-            link_session_id,
-            credential: data_credential,
-        })
-        .await
-        .unwrap();
+    let _ = welcome;
     // 伪造：为未绑定派发上报审计。
     transport
         .send(Message::Routed {
