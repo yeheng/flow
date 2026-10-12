@@ -152,7 +152,24 @@ impl JournalBackend {
                 let Some(backend) = weak.upgrade() else {
                     return;
                 };
-                if backend.journal.stats().failure.is_some() {
+                backend
+                    .coordinator_ticks
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                backend.coordinator_last_tick_ms.store(
+                    chrono::Utc::now().timestamp_millis(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                if let Some(failure) = backend.journal.stats().failure {
+                    // journal 写入永久故障：协调循环持续空转，不吭声会让停摆
+                    // 看起来像挂死。限频报错（每 2s 至多一条）。
+                    static FAILURE_LOGGED_AT: std::sync::atomic::AtomicI64 =
+                        std::sync::atomic::AtomicI64::new(0);
+                    let now = chrono::Utc::now().timestamp_millis();
+                    let last = FAILURE_LOGGED_AT.load(std::sync::atomic::Ordering::Relaxed);
+                    if now.saturating_sub(last) > 2000 {
+                        FAILURE_LOGGED_AT.store(now, std::sync::atomic::Ordering::Relaxed);
+                        tracing::error!(%failure, "coordinator stalled: journal writer failed");
+                    }
                     continue;
                 }
                 if let Some(run) = finished {

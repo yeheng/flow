@@ -73,7 +73,7 @@ async fn until(b: &Arc<JournalBackend>, run_id: &str, predicate: impl Fn(&Run) -
         }
     })
     .await
-    .unwrap()
+    .expect("condition timeout in until")
 }
 
 async fn start_run(backend: &JournalBackend, workflow: &str, input: Value) -> String {
@@ -971,10 +971,14 @@ async fn inline_sized_run_input_dispatches_via_data_channel() {
     let run_id = start_run(&backend, &workflow, json!({ "pad": pad })).await;
     let done = until(&backend, &run_id, Run::terminal).await;
     assert_eq!(
-        done.status, "succeeded",
+        done.status,
+        "succeeded",
         "run failed: {:?} nodes={:?}",
         done.error,
-        done.nodes.values().map(|n| (&n.status, &n.error)).collect::<Vec<_>>()
+        done.nodes
+            .values()
+            .map(|n| (&n.status, &n.error))
+            .collect::<Vec<_>>()
     );
     let output = done.nodes.values().find(|n| n.status == "succeeded");
     let _ = output;

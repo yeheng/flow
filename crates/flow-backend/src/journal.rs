@@ -2,7 +2,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
     Arc,
 };
 use std::time::Duration;
@@ -71,6 +71,9 @@ pub struct JournalBackend {
     pub(crate) execution: Mutex<Option<tokio::task::JoinHandle<()>>>,
     execution_changed: Arc<Notify>,
     pub(crate) execution_peak: AtomicUsize,
+    /// 诊断：协调循环心跳（每轮 select 醒来自增；挂死排查用）。
+    pub(crate) coordinator_ticks: AtomicU64,
+    pub(crate) coordinator_last_tick_ms: AtomicI64,
 }
 
 impl JournalBackend {
@@ -263,6 +266,8 @@ impl JournalBackend {
             execution: Mutex::new(None),
             execution_changed: Arc::new(Notify::new()),
             execution_peak: AtomicUsize::new(0),
+            coordinator_ticks: AtomicU64::new(0),
+            coordinator_last_tick_ms: AtomicI64::new(0),
         });
         let weak = Arc::downgrade(&backend);
         let task = tokio::spawn(async move {
@@ -533,8 +538,7 @@ impl JournalBackend {
                 notified.await;
             }
         };
-        let timeout =
-            Duration::from_millis(self.wait_timeout_ms.load(Ordering::Relaxed).max(1));
+        let timeout = Duration::from_millis(self.wait_timeout_ms.load(Ordering::Relaxed).max(1));
         if !matches!(tokio::time::timeout(timeout, wait).await, Ok(Ok(()))) {
             return Err(JournalError::CommittedNotVisible(receipt));
         }
@@ -677,6 +681,30 @@ impl JournalBackend {
     }
     pub(crate) async fn defer_runs(&self, ids: Vec<String>) {
         self.state.lock().await.dirty_runs.extend(ids);
+    }
+
+    /// 诊断快照：挂死排查用（零日志冻结时看内部游标、队列与等待者）。
+    pub async fn diagnostics(&self) -> serde_json::Value {
+        let committed = self.state.lock().await;
+        let applied_lsn = committed.state.applied_lsn;
+        let pending = committed.pending.is_some();
+        let dirty: Vec<String> = committed.dirty_runs.iter().cloned().collect();
+        drop(committed);
+        let stats = self.journal.stats();
+        serde_json::json!({
+            "applied_lsn": applied_lsn,
+            "projected_lsn": self.projected_lsn.load(std::sync::atomic::Ordering::Acquire),
+            "durable_lsn": stats.durable_lsn,
+            "writer_failure": stats.failure,
+            "commit_pending": pending,
+            "peak_queued_requests": stats.peak_queued_requests,
+            "dirty_runs": dirty,
+            "projection_error": self.projection_error.lock().await.clone(),
+            "executor_peak": self.execution_peak(),
+            "coordinator_ticks": self.coordinator_ticks.load(Ordering::Relaxed),
+            "coordinator_last_tick_ms": self.coordinator_last_tick_ms.load(Ordering::Relaxed),
+            "now_ms": chrono::Utc::now().timestamp_millis(),
+        })
     }
 }
 

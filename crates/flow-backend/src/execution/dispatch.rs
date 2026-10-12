@@ -200,10 +200,12 @@ impl DispatchRunner {
                 .iter()
                 .map(|(id, value)| (id.clone(), task_value(value)))
                 .collect(),
-            prepared: record.prepared.as_ref().map(|committed| flow_engine::execution_protocol::PreparedMeta {
-                engine_build: committed.engine_build.clone(),
-                node_semantics: committed.node_semantics,
-                params: task_value(&committed.params),
+            prepared: record.prepared.as_ref().map(|committed| {
+                flow_engine::execution_protocol::PreparedMeta {
+                    engine_build: committed.engine_build.clone(),
+                    node_semantics: committed.node_semantics,
+                    params: task_value(&committed.params),
+                }
             }),
             previous_outcome: previous_outcome.clone(),
             observability: self.observations.is_some(),
@@ -1036,7 +1038,9 @@ fn task_value(stored: &StoredValue) -> flow_engine::execution_protocol::TaskValu
 fn byte_source(stored: &StoredValue) -> std::result::Result<ByteSource, ()> {
     match stored {
         StoredValue::Ref(reference) => Ok(ByteSource::Journal(reference.clone())),
-        StoredValue::Inline(value) => serde_json::to_vec(value).map(ByteSource::Memory).map_err(|_| ()),
+        StoredValue::Inline(value) => serde_json::to_vec(value)
+            .map(ByteSource::Memory)
+            .map_err(|_| ()),
     }
 }
 
@@ -1063,8 +1067,12 @@ async fn transfer_inputs(
         transfers.push(("in:prepared-params".into(), byte_source(&prepared.params)));
     }
     if let Some(outcome) = &previous_outcome {
+        // previous_outcome 是 StoredValue 的序列化（{"type":..,"value":{..}}）。
+        // body_raw 在内层 value 里——与执行器侧 materialize_inputs 的
+        // pointer("/value/body_raw") 取法对齐；取错层级会漏发 op-body 传输，
+        // 执行器死等 InputReady（材料不齐）直到 deadline。
         if let Some(raw) = outcome
-            .get("body_raw")
+            .pointer("/value/body_raw")
             .and_then(|v| serde_json::from_value::<flow_journal::ValueRef>(v.clone()).ok())
         {
             transfers.push((
@@ -1092,8 +1100,13 @@ async fn transfer_inputs(
                 let produce = tokio::task::spawn_blocking(move || {
                     use std::io::Write;
                     let mut bridge = tokio_util::io::SyncIoBridge::new(writer);
-                    let result =
-                        flow_journal::value::read_value(&root, upper, &reference, true, &mut bridge);
+                    let result = flow_journal::value::read_value(
+                        &root,
+                        upper,
+                        &reference,
+                        true,
+                        &mut bridge,
+                    );
                     let _ = bridge.flush();
                     result
                 });

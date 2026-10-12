@@ -280,6 +280,10 @@ async fn write_loop(
     let mut queue = queue;
     while let Some(message) = queue.recv().await {
         if broken.load(std::sync::atomic::Ordering::SeqCst) {
+            tracing::warn!(
+                type_name = message.type_name(),
+                "writer exit: session broken"
+            );
             return;
         }
         let frame = match encode_frame(&message) {

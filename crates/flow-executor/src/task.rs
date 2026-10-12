@@ -370,7 +370,9 @@ impl TaskRunner {
                                 .map_err(|e| TaskError::Invalid(e.to_string()))?,
                         ),
                         ValueCodec::Bytes => {
-                            return Err(TaskError::Invalid("binary value in JSON input face".into()))
+                            return Err(TaskError::Invalid(
+                                "binary value in JSON input face".into(),
+                            ))
                         }
                     };
                     Ok((StoredValue::Ref(reference.clone()), value))

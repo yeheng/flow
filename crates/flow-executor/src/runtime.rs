@@ -89,13 +89,36 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
     ));
     let mut current: Option<CurrentTask> = None;
     let mut exit_code = 0;
-    let mut pending: Option<(mpsc::Sender<Message>, Message)> = None;
+    // 转投队列（FIFO）：避免单槽覆盖丢失——双通道帧可能连续到达，
+    // 单槽在 permit 获取窗口内被覆盖会把整条 TransferChunk 静默丢掉，
+    // 执行器死等 InputReady 永不到来（材料不齐），主进程等到 deadline。
+    let mut pending: std::collections::VecDeque<(mpsc::Sender<Message>, Message)> =
+        std::collections::VecDeque::new();
+    // 无主 transfer 帧：先于 Execute 到达（双通道乱序）时缓存，任务建立后补投。
+    let mut orphan_transfers: std::collections::VecDeque<Message> =
+        std::collections::VecDeque::new();
     loop {
+        if !pending.is_empty() {
+            // 先把队首能立即投递的消息确定性转发（有容量即送，无需等待）。
+            let (mail, message) = pending.front().unwrap().clone();
+            match mail.try_send(message) {
+                Ok(()) => {
+                    pending.pop_front();
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    exit_code = 75;
+                    break;
+                }
+            }
+        }
         tokio::select! {
             biased;
-            permit = async { pending.as_ref().unwrap().0.clone().reserve_owned().await }, if pending.is_some() => {
-                let (_, message) = pending.take().unwrap();
-                match permit { Ok(permit) => { permit.send(message); }, Err(_) => {exit_code = 75; break;} }
+            _ = async {
+                if pending.is_empty() { std::future::pending().await } else { let (mail, _) = pending.front().unwrap(); mail.clone().reserve_owned().await.map(|_| ()) }
+            }, if !pending.is_empty() => {
+                // 容量可用：回到循环顶部确定性转发。
+                continue;
             }
             outbound = outbound_rx.recv() => {
                 match outbound {
@@ -138,11 +161,11 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
                     }
                 }
             }
-            received = transport.recv(), if pending.is_none() => {
+            received = transport.recv(), if pending.is_empty() => {
                 match received {
                     Ok((channel, message)) => {
                         let _ = channel;
-                        if let Some(code) = handle_message(&mut current, &mut pending, message, &outbound_tx, &identity, limits_ref) {
+                        if let Some(code) = handle_message(&mut current, &mut pending, &mut orphan_transfers, message, &outbound_tx, &identity, limits_ref) {
                             exit_code = code;
                             break;
                         }
@@ -178,7 +201,8 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
 /// 处理一条入站消息。返回 Some(exit_code) 表示应退出进程。
 fn handle_message(
     current: &mut Option<CurrentTask>,
-    pending: &mut Option<(mpsc::Sender<Message>, Message)>,
+    pending: &mut std::collections::VecDeque<(mpsc::Sender<Message>, Message)>,
+    orphan_transfers: &mut std::collections::VecDeque<Message>,
     message: Message,
     outbound: &mpsc::Sender<Message>,
     identity: &SessionIdentity,
@@ -228,6 +252,7 @@ fn handle_message(
                 let end = runner.run().await;
                 let _ = done_tx.send(end);
             });
+            let mail_tx_for_orphans = mail_tx.clone();
             *current = Some(CurrentTask {
                 dispatch_id,
                 mail: mail_tx,
@@ -236,6 +261,17 @@ fn handle_message(
                 done: done_rx,
                 phase: "starting".into(),
             });
+            // 双通道乱序（二期 §3.6）：TransferChunk/InputReady 可能先于
+            // Execute 到达——建立任务后补投缓存的无主 transfer 帧，否则
+            // 输入字节永久丢失，执行器死等 InputReady 的配套块。
+            let current_dispatch = current.as_ref().unwrap().dispatch_id.clone();
+            while orphan_transfers
+                .front()
+                .is_some_and(|m| m.dispatch_id() == Some(current_dispatch.as_str()))
+            {
+                let orphan = orphan_transfers.pop_front().unwrap();
+                pending.push_back((mail_tx_for_orphans.clone(), orphan));
+            }
             None
         }
         Message::Cancel { dispatch_id, .. } => {
@@ -268,14 +304,20 @@ fn handle_message(
             };
             if let Some(task) = current {
                 if task.dispatch_id == dispatch_id {
-                    *pending = Some((task.mail.clone(), message));
+                    pending.push_back((task.mail.clone(), message));
                 }
             }
             None
         }
         Message::TransferChunk { .. } | Message::InputReady { .. } => {
-            if let Some(task) = current {
-                *pending = Some((task.mail.clone(), message));
+            let dispatch_id = message.dispatch_id().unwrap_or_default().to_string();
+            // 仅当帧属于当前派发时直接转投；Execute 未到（双通道乱序）或
+            // 已不属于当前任务时缓存为无主帧，绝不静默丢弃。
+            match current {
+                Some(task) if task.dispatch_id == dispatch_id => {
+                    pending.push_back((task.mail.clone(), message));
+                }
+                _ => orphan_transfers.push_back(message),
             }
             None
         }

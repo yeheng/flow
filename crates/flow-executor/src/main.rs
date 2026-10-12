@@ -9,11 +9,16 @@
 //! 在自身同目录召唤本二进制，或用 FLOW_EXECUTOR_BIN 显式指定。
 
 fn main() -> std::process::ExitCode {
+    // 主进程把 stdout 接到 null（协议帧不走 stdio）；诊断日志必须走 stderr，
+    // 否则 tracing 默认的 stdout 会被丢进 /dev/null（挂死排查时不可见）。
+    // 多执行器并存时用 PID 区分进程（测试的 nocapture 会汇合多个子进程 stderr）。
     let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .try_init();
+    tracing::info!(pid = std::process::id(), "executor process starting");
     let control_fd = std::env::var("FLOW_EXECUTOR_CONTROL_FD")
         .ok()
         .and_then(|v| v.parse::<i32>().ok())
