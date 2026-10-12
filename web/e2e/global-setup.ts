@@ -38,10 +38,15 @@ async function waitReady(url: string, timeoutMs: number): Promise<void> {
 
 export default async function globalSetup(): Promise<void> {
   // 确保二进制是最新的（缓存命中时毫秒级）。服务端 bin 是 flow-rpc 的 `flow-journal-server`。
-  execSync("cargo build -p flow-rpc --bin flow-journal-server --locked", {
-    cwd: REPO_ROOT,
-    stdio: "inherit",
-  });
+  // T6：默认执行模式已切 ipc，服务端需要 flow-executor（与产品默认路径一致）；
+  // 本目录下没有兄弟 flow-executor，用 FLOW_EXECUTOR_BIN 显式指向构建产物。
+  execSync(
+    "cargo build -p flow-rpc --bin flow-journal-server --locked && cargo build -p flow-executor --locked",
+    {
+      cwd: REPO_ROOT,
+      stdio: "inherit",
+    },
+  );
 
   const dir = mkdtempSync(path.join(tmpdir(), "flow-e2e-"));
   writeFileSync(path.join(dir, "flow.toml"), "");
@@ -53,6 +58,7 @@ export default async function globalSetup(): Promise<void> {
       FLOW_JOURNAL_DATA_DIR: path.join(dir, "journal"),
       FLOW_JOURNAL_TOKEN: E2E_TOKEN,
       FLOW_CONFIG: path.join(dir, "flow.toml"),
+      FLOW_EXECUTOR_BIN: path.join(REPO_ROOT, "target/debug/flow-executor"),
       FLOW_JOURNAL_ADDR: "127.0.0.1:19311",
       FLOW_JOURNAL_HTTP_ADDR: "127.0.0.1:19312",
       RUST_LOG: "warn",

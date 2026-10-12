@@ -38,7 +38,15 @@ impl TestServer {
         let backend = JournalBackend::open(scratch.path(), Default::default())
             .await
             .expect("打开 journal 后端失败");
-        flow_backend::start_execution(&flow_config::ExecutionConfig::default(), &backend)
+        // CLI 测试只覆盖 CLI/JSON-RPC 契约；执行模式默认值（unix=ipc）由
+        // backend-e2e / journal_ipc / 桌面套件覆盖。这里显式 in_process：
+        // 服务端在测试进程内（测试二进制位于 deps/），locate() 找不到兄弟
+        // flow-executor；CLI 契约测试不应背上「先构建 executor」的隐式依赖。
+        let execution = flow_config::ExecutionConfig {
+            mode: flow_config::ExecutionModeKind::InProcess,
+            ..Default::default()
+        };
+        flow_backend::start_execution(&execution, &backend)
             .await
             .expect("启动执行驱动失败");
         let (handle, addr) = flow_rpc::journal_v2::serve(

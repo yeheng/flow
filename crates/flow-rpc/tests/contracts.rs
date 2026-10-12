@@ -21,7 +21,15 @@ impl Fixture {
         let backend = JournalBackend::open(&root, Default::default())
             .await
             .unwrap();
-        flow_backend::start_execution(&flow_config::ExecutionConfig::default(), &backend)
+        // 契约测试只验证 RPC/状态语义；执行模式默认值（unix=ipc）的端到端
+        // 路径由 backend-e2e / journal_ipc / 桌面套件覆盖。此处显式 in_process：
+        // 服务端在测试进程内（测试二进制在 deps/），locate() 找不到兄弟
+        // flow-executor，不应为契约测试引入「先构建 executor」的隐式依赖。
+        let execution = flow_config::ExecutionConfig {
+            mode: flow_config::ExecutionModeKind::InProcess,
+            ..Default::default()
+        };
+        flow_backend::start_execution(&execution, &backend)
             .await
             .unwrap();
         let workflow = backend.workflow_create("test", None).await.unwrap();

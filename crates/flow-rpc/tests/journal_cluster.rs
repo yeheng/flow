@@ -7,7 +7,15 @@ use std::time::Duration;
 
 fn spawn(dir: &TempDir, cluster: &str, node: &str) -> common::ServerProc {
     let config = dir.path().join("flow.toml");
-    std::fs::write(&config, format!("[server]\nscheduler_enabled=false\n[journal.cluster]\ncluster_id='{cluster}'\nnode_id='{node}'\nheartbeat_ms=500\nlease_ms=2000\n")).unwrap();
+    // 显式 in_process：本套件只验证 PG 注册/租约语义，不起 run；集群作业
+    // 不构建 flow-executor（默认 ipc 会因定位不到兄弟二进制而拒绝启动）。
+    std::fs::write(
+        &config,
+        format!(
+            "[server]\nscheduler_enabled=false\n[execution]\nmode=\"in_process\"\n[journal.cluster]\ncluster_id='{cluster}'\nnode_id='{node}'\nheartbeat_ms=500\nlease_ms=2000\n"
+        ),
+    )
+    .unwrap();
     let mut cmd = Command::new(common::server_bin());
     cmd.arg("--config")
         .arg(config)
