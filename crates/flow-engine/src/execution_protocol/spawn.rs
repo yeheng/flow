@@ -115,6 +115,20 @@ mod tests {
     use super::*;
     use std::os::fd::FromRawFd;
 
+    /// 子进程侧要跑的占用排列：交叉互占（control=101/data=100）、单侧占用、
+    /// 以及无占用的常态。
+    const CASES: &[(Option<i32>, Option<i32>)] = &[
+        (None, None),
+        (Some(100), None),
+        (None, Some(100)),
+        (Some(101), None),
+        (None, Some(101)),
+        (Some(100), Some(101)),
+        (Some(101), Some(100)),
+    ];
+    /// 子进程用哪个排列（父进程按 case 号 fork 一次）。
+    const CASE_ENV: &str = "FLOW_PLACE_FDS_CASE";
+
     fn pipe() -> (std::os::unix::io::RawFd, std::os::unix::io::RawFd) {
         let mut fds = [0i32; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
@@ -135,58 +149,81 @@ mod tests {
         std::io::Write::write_all(&mut file, &[byte]).unwrap();
     }
 
-    /// 原始 FD 落在 100/101 雷区的所有排列下，落位后槽位必须指向原连接：
-    /// 交叉互占（control=101/data=100）、单侧占用、以及无占用的常态。
+    /// 原始 FD 落在 100/101 雷区的所有排列下，落位后槽位必须指向原连接。
+    ///
+    /// **每个排列都在独立子进程里跑**：`place_fds` 会 `dup2` 到固定的
+    /// 100/101，覆盖同进程其它线程此刻持有的同号 FD——在测试进程内并行跑时，
+    /// 被覆盖的 `OwnedFd` 析构会撞上 `IO Safety violation: owned file
+    /// descriptor already closed`（SIGABRT，整个测试二进制挂掉）。生产里
+    /// `place_fds` 只在 `pre_exec`（fork 之后、子进程单线程）执行，子进程
+    /// 宿主才是与真实语义一致的隔离。
     #[test]
     fn place_fds_survives_slot_occupation() {
-        for (control_at, data_at) in [
-            (None, None),
-            (Some(100), None),
-            (None, Some(100)),
-            (Some(101), None),
-            (None, Some(101)),
-            (Some(100), Some(101)),
-            (Some(101), Some(100)),
-        ] {
-            let (control_read, control_write) = pipe();
-            let (data_read, data_write) = pipe();
-            let move_to = |fd: i32, slot: Option<i32>| match slot {
-                // SAFETY: dup2 到测试自选槽位；原 FD 由测试关闭。
-                Some(slot) => unsafe {
-                    let moved = libc::dup(fd);
-                    libc::dup2(moved, slot);
-                    libc::close(moved);
-                    libc::close(fd);
-                    slot
-                },
-                None => fd,
-            };
-            let control_fd = move_to(control_read, control_at);
-            let data_fd = move_to(data_read, data_at);
-            place_fds(control_fd, data_fd).unwrap();
-            write_byte(control_write, 0xA1);
-            write_byte(data_write, 0xD2);
-            assert_eq!(
-                read_one_byte(100),
-                0xA1,
-                "control broken at occupation {control_at:?}/{data_at:?}"
+        let exe = std::env::current_exe().expect("test binary path");
+        for (case, (control_at, data_at)) in CASES.iter().enumerate() {
+            let status = std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "execution_protocol::spawn::tests::place_fds_case_child",
+                    "--nocapture",
+                ])
+                .env(CASE_ENV, case.to_string())
+                .status()
+                .expect("spawn fd-case child");
+            assert!(
+                status.success(),
+                "case {case} (control={control_at:?} data={data_at:?}) failed in child: {status}"
             );
-            assert_eq!(
-                read_one_byte(101),
-                0xD2,
-                "data broken at occupation {control_at:?}/{data_at:?}"
-            );
-            // 收尾：写端与原始残留 FD。
-            // SAFETY: 测试自管的 FD。
-            unsafe {
-                libc::close(control_write);
-                libc::close(data_write);
-                if control_fd < 100 {
-                    libc::close(control_fd);
-                }
-                if data_fd < 100 {
-                    libc::close(data_fd);
-                }
+        }
+    }
+
+    /// 子进程侧用例：按 [`CASE_ENV`] 选一个排列，落位后校验槽位指向原连接。
+    /// 无环境变量时直接返回（作为普通用例被其它入口跑到时是 no-op）。
+    #[test]
+    fn place_fds_case_child() {
+        let Ok(case) = std::env::var(CASE_ENV) else {
+            return;
+        };
+        let case: usize = case.parse().expect("case index");
+        let (control_at, data_at) = CASES[case];
+        let (control_read, control_write) = pipe();
+        let (data_read, data_write) = pipe();
+        let move_to = |fd: i32, slot: Option<i32>| match slot {
+            // SAFETY: dup2 到测试自选槽位；原 FD 由测试关闭。
+            Some(slot) => unsafe {
+                let moved = libc::dup(fd);
+                libc::dup2(moved, slot);
+                libc::close(moved);
+                libc::close(fd);
+                slot
+            },
+            None => fd,
+        };
+        let control_fd = move_to(control_read, control_at);
+        let data_fd = move_to(data_read, data_at);
+        place_fds(control_fd, data_fd).unwrap();
+        write_byte(control_write, 0xA1);
+        write_byte(data_write, 0xD2);
+        assert_eq!(
+            read_one_byte(100),
+            0xA1,
+            "control broken at occupation {control_at:?}/{data_at:?}"
+        );
+        assert_eq!(
+            read_one_byte(101),
+            0xD2,
+            "data broken at occupation {control_at:?}/{data_at:?}"
+        );
+        // 收尾：写端与原始残留 FD。
+        // SAFETY: 测试自管的 FD。
+        unsafe {
+            libc::close(control_write);
+            libc::close(data_write);
+            if control_fd < 100 {
+                libc::close(control_fd);
+            }
+            if data_fd < 100 {
+                libc::close(data_fd);
             }
         }
     }

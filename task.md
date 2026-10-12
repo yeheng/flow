@@ -109,7 +109,7 @@ flow-executor（子进程，节点语义的唯一居所）
 **验证**：journal_ipc 单线程 10/10、并行 5/5 全绿（原：并行 6 挂/单线程 4 挂/修复后偶发 1 挂）；journal_remote_ops 3/3、journal_remote_tls 3/3（偶发 "no agent connected" 环境噪声，重跑即绿）；backend-e2e 59/59；fmt/clippy 绿。
 
 **⚠️ 遗留独立问题（非本次改动引入，已用基线代码验证同样存在）**：
-- `flow-engine --lib` 的 transport socketpair 测试高概率 flake：`fatal runtime error: IO Safety violation: owned file descriptor already closed`（基线 stash 后 6 次 4 挂；涉及 handshake_roundtrip / data_channel / first_message_not_hello，fd 生命周期竞态，待专项修复）。
+- ✅ **已修**（T7 后专项）：`flow-engine --lib` 的 `fatal runtime error: IO Safety violation: owned file descriptor already closed`（SIGABRT 整个测试二进制）**根因不是 transport 生命周期竞态**，而是 T1 回归测试 `place_fds_survives_slot_occupation` **在测试进程内**调用 `place_fds`：它 `dup2` 到固定槽位 100/101，会静默覆盖并行测试线程此刻持有的同号 FD，被覆盖的 `OwnedFd` 稍后析构即 EBADF abort（原记录的 handshake_roundtrip / data_channel / first_message_not_hello 只是**同时运行的受害者**）。修复：该用例改为**每个占用排列起独立子进程**执行（与生产语义一致——`place_fds` 只在 `pre_exec` fork 后的单线程子进程里跑）。验证：连跑 10 次 `cargo test -p flow-engine --lib` 全绿（修前 4 次挂 2 次）。
 - cancel_during_http 曾现 23 分钟挂起后自愈形态（1/9 轮次，http 10s 超时未生效类，最终断言全过；低优先级待查）。
 
 **T2 剩余（4b 队列，本版不做）**：`Result Success.output` / `WaitRequest.output` 的 inline 输出通道化（≈63KiB 脚本输出仍有同类杀区），需重做 executor store_value-经审计分块与 resume/lost_data 语义，单独 PR（协议再升 v3）。
