@@ -194,6 +194,15 @@ impl DispatchRunner {
             &node_value,
             flow_engine::execution_protocol::CONTROL_MAX_FRAME / 2,
         )?;
+        // `previous_outcome` 同样进控制帧（恢复路径的必要描述符）。今天它的
+        // 生产者都有界（stderr_tail ≤512 字节、body_raw 是 ValueRef），但这里
+        // 补上同一道闸：将来任何新生产者都不可能把控制帧撑爆。
+        if let Some(previous) = &previous_outcome {
+            flow_journal::codec::bounded_json(
+                previous,
+                flow_engine::execution_protocol::CONTROL_MAX_FRAME / 2,
+            )?;
+        }
         let task = flow_engine::execution_protocol::ExecuteTask {
             run_id: self.attempt.run_id.clone(),
             node_id: self.attempt.node_id.clone(),

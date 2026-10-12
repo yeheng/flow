@@ -1028,3 +1028,119 @@ async fn start_ipc(backend: &std::sync::Arc<flow_backend::journal::JournalBacken
 async fn start_ipc(backend: &std::sync::Arc<flow_backend::journal::JournalBackend>, x_max: usize) {
     backend.start_execution_with_limit(x_max).await.unwrap();
 }
+
+/// T2 4b：结果输出落在「可 inline 但装不进控制帧」的窄带里时必须平安落地。
+///
+/// 历史缺陷：`Result`/`Wait` 是控制帧（上限 `CONTROL_MAX_FRAME` = 64KiB），而
+/// 值存储的 inline 阈值 `INLINE_BYTES` 也是 64KiB——于是序列化 JSON 在
+/// ≈65289..=65536 字节（远程链路 64922 起）的输出会被帧层拒收（FrameTooLarge），
+/// 写循环置 broken，执行器随后退出：节点既没有成功也没有失败结果，只剩
+/// 「主进程解绑 + 节点失败」的会话级死亡。修复后执行器在 `emit_result`
+/// 把超预算的值改成审计分块 + `ValueRef`。
+#[tokio::test]
+async fn result_output_in_control_frame_kill_band_survives() {
+    use flow_engine::execution_protocol::contract::CONTROL_INLINE_MAX;
+
+    let root = temp();
+    let backend = ipc_backend_explicit(&root).await;
+    // 判定看的是**编码后的值**（`{"pad":"…"}` 比 pad 多几字节），所以边界用例
+    // 各留一点余量；后面三个是旧「杀区」的上下沿。
+    for (size, expect_ref) in [
+        (CONTROL_INLINE_MAX - 64, false),
+        (CONTROL_INLINE_MAX + 1024, true),
+        (60_000, true),
+        (65_289, true),
+        (65_300, true),
+        (65_536, true),
+    ] {
+        let workflow = install(
+            &backend,
+            json!({"nodes":[
+                {"id":"s","type":"start"},
+                {"id":"n","type":"script","params":{"code":format!("return {{pad: 'x'.repeat({size})}};")}},
+                {"id":"e","type":"end"}],
+                "edges":[{"from":"s","to":"n"},{"from":"n","to":"e"}]}),
+        )
+        .await;
+        let run_id = start_run(&backend, &workflow, json!({})).await;
+        let done = until(&backend, &run_id, Run::terminal).await;
+        assert_eq!(
+            done.status, "succeeded",
+            "size={size} run failed: {:?} nodes={:?}",
+            done.error, done.nodes
+        );
+        let node_output = done.nodes["n"].output.clone().unwrap();
+        if expect_ref {
+            assert!(
+                matches!(node_output, StoredValue::Ref(_)),
+                "size={size} must be chunked into a Ref, got {node_output:?}"
+            );
+        } else {
+            // 预算内的值保持 inline：journal 形状与 v2 逐字节一致。
+            assert!(
+                matches!(node_output, StoredValue::Inline(_)),
+                "size={size} should stay inline, got {node_output:?}"
+            );
+        }
+        let materialized = materialize(&backend, &done, "n").await;
+        assert_eq!(
+            materialized["pad"].as_str().map(str::len),
+            Some(size),
+            "size={size} value round-trip"
+        );
+    }
+    backend.close().await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// T2 4b（同类）：失败结果里的自由文本也必须有界。
+///
+/// `Failure.error` 直接来自用户 JS（`throw new Error('x'.repeat(70000))`），
+/// 无界时 `Result` 控制帧会被帧层拒收 → 会话死亡；节点只留下「连接断开」的
+/// 假象。修复后按 `CONTROL_TEXT_MAX` 截断，业务失败语义保持不变，会话存活。
+#[tokio::test]
+async fn oversized_failure_message_is_truncated_not_fatal() {
+    use flow_engine::execution_protocol::contract::CONTROL_TEXT_MAX;
+
+    let root = temp();
+    let backend = ipc_backend_explicit(&root).await;
+    let workflow = install(
+        &backend,
+        json!({"nodes":[
+            {"id":"s","type":"start"},
+            {"id":"n","type":"script","params":{"code":"throw new Error('x'.repeat(70000));"}},
+            {"id":"e","type":"end"}],
+            "edges":[{"from":"s","to":"n"},{"from":"n","to":"e"}]}),
+    )
+    .await;
+    let run_id = start_run(&backend, &workflow, json!({})).await;
+    let done = until(&backend, &run_id, Run::terminal).await;
+    assert_eq!(done.status, "failed");
+    let error = done.nodes["n"].error.clone().unwrap();
+    assert!(
+        error.contains("[truncated]"),
+        "oversized error must be truncated, got len={} head={:?}",
+        error.len(),
+        &error[..error.len().min(120)]
+    );
+    assert!(
+        error.len() <= CONTROL_TEXT_MAX + 32,
+        "truncated error still too long: {}",
+        error.len()
+    );
+    // 会话必须还活着：同一后端上再跑一个正常脚本。
+    let quick = install(
+        &backend,
+        json!({"nodes":[
+            {"id":"s","type":"start"},
+            {"id":"n","type":"script","params":{"code":"return {ok: true};"}},
+            {"id":"e","type":"end"}],
+            "edges":[{"from":"s","to":"n"},{"from":"n","to":"e"}]}),
+    )
+    .await;
+    let run2 = start_run(&backend, &quick, json!({})).await;
+    let done2 = until(&backend, &run2, Run::terminal).await;
+    assert_eq!(done2.status, "succeeded", "{:?}", done2.error);
+    backend.close().await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}

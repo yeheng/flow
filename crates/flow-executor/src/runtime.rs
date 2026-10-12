@@ -10,6 +10,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
+use flow_engine::execution_protocol::contract::bounded_control_text;
 use flow_engine::execution_protocol::contract::STARTUP_TIMEOUT_MS;
 use flow_engine::execution_protocol::message::Message;
 use flow_engine::execution_protocol::transport::{
@@ -217,14 +218,14 @@ fn handle_message(
             if current.is_some() {
                 // 执行进程单任务：占用期拒绝新派发（主进程调度错误）。
                 let _ = outbound.try_send(Message::Reject {
-                    reason: "executor busy; dispatch rejected".into(),
+                    reason: bounded_control_text("executor busy; dispatch rejected".into()),
                 });
                 return None;
             }
             // 派发归属校验：会话上下文绑定（journal/epoch 由握手固定）。
             if task.run_id.is_empty() || task.node_id.is_empty() {
                 let _ = outbound.try_send(Message::Reject {
-                    reason: "execute task identity missing".into(),
+                    reason: bounded_control_text("execute task identity missing".into()),
                 });
                 return None;
             }
@@ -329,7 +330,7 @@ fn handle_message(
         other => {
             // 未知/错位消息：协议错误，明确拒绝后退出。
             let _ = outbound.try_send(Message::Reject {
-                reason: format!("unexpected message {}", other.type_name()),
+                reason: bounded_control_text(format!("unexpected message {}", other.type_name())),
             });
             tracing::warn!("unexpected message {}", other.type_name());
             Some(76)

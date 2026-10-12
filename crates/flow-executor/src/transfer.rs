@@ -202,6 +202,25 @@ pub async fn store_value(
     store_bytes(audit, journal_id, &bytes, ValueCodec::Json).await
 }
 
+/// 结果/等待值的强制分块编码：**不走 inline 快路径**，一律落
+/// ValueChunk/ValuePublished 并返回 `Ref`。
+///
+/// 存在理由（T2 4b）：`Result`/`Wait` 是控制帧，受 `CONTROL_MAX_FRAME`
+/// （64KiB）约束；而 `INLINE_BYTES` 也是 64KiB，于是「可 inline 但装不进
+/// 控制帧」的窄带（序列化 JSON 约 65289..=65536 字节，远程链路 64922 起）
+/// 会被帧层拒收，直接杀掉会话。结果值超过控制帧预算时改走已经在用的大值
+/// 路径（审计分块 + Ref），控制帧里只剩定长描述符。
+pub async fn store_value_ref(
+    audit: &mut AuditStream,
+    journal_id: &str,
+    value: &Value,
+    limit: usize,
+) -> Result<StoredValue, crate::task::TaskError> {
+    let bytes = flow_journal::codec::bounded_json(value, limit)?;
+    flow_journal::codec::validate_depth(value, 0)?;
+    store_bytes_ref(audit, journal_id, &bytes, ValueCodec::Json).await
+}
+
 /// 任意字节（HTTP 原始响应）走 Bytes 编码。
 pub async fn store_bytes(
     audit: &mut AuditStream,
@@ -215,6 +234,17 @@ pub async fn store_bytes(
             return Ok(StoredValue::Inline(value));
         }
     }
+    store_bytes_ref(audit, journal_id, bytes, codec).await
+}
+
+/// [`store_bytes`] 的分块分支（也供 [`store_value_ref`] 复用）：只发
+/// 审计分块 + 发布，绝不 inline。
+pub async fn store_bytes_ref(
+    audit: &mut AuditStream,
+    journal_id: &str,
+    bytes: &[u8],
+    codec: ValueCodec,
+) -> Result<StoredValue, crate::task::TaskError> {
     let output_id = uuid::Uuid::now_v7().to_string();
     let mut index = 0u64;
     let mut total = 0u64;

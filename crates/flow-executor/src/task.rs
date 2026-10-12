@@ -15,7 +15,9 @@ use sha2::Digest as _;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use flow_engine::execution_protocol::contract::DURABLE_WAIT_TIMEOUT_MS;
+use flow_engine::execution_protocol::contract::{
+    bounded_control_text, CONTROL_INLINE_MAX, DURABLE_WAIT_TIMEOUT_MS,
+};
 use flow_engine::execution_protocol::message::{
     ExecuteTask, Message, ResultOutcome, TaskValue, WaitRequest,
 };
@@ -27,7 +29,7 @@ use flow_journal::StoredValue;
 
 use crate::audit::AuditStream;
 use crate::observe::ObservationBridge;
-use crate::transfer::{store_bytes, store_value, IncomingTransfers};
+use crate::transfer::{store_bytes, store_value, store_value_ref, IncomingTransfers};
 
 /// 输入面预算（与一期 materialize 8 MiB 一致）。
 pub const INPUT_BUDGET: usize = 8 * 1024 * 1024;
@@ -110,7 +112,7 @@ impl TaskRunner {
                 let _ = self
                     .outbound
                     .send(Message::Reject {
-                        reason: format!("executor task failed: {error}"),
+                        reason: bounded_control_text(format!("executor task failed: {error}")),
                     })
                     .await;
                 // 给在途帧（含 Reject）一个短暂落地窗口，再退出。
@@ -231,6 +233,10 @@ impl TaskRunner {
         audit: &mut AuditStream,
         outcome: ResultOutcome,
     ) -> Result<(), TaskError> {
+        // 控制帧预算收口（T2 4b）：结果/等待值里超出内联预算的字节必须落
+        // 审计分块 + Ref，自由文本定长化——下一条 Result 是控制帧，装不下
+        // 就是会话级死亡（帧层拒收）。
+        let outcome = self.control_safe_outcome(audit, outcome).await?;
         let last_audit_seq = audit.next_seq().saturating_sub(1);
         tokio::time::timeout(
             Duration::from_millis(DURABLE_WAIT_TIMEOUT_MS),
@@ -256,6 +262,40 @@ impl TaskRunner {
         )
         .await
         .map_err(|_| TaskError::Closed("ResultCommitted timeout".into()))?
+    }
+
+    /// `Result`/`Wait` 是控制帧：把其中可能无界的部分收进预算内。
+    ///
+    /// - 值：inline 且编码后超过 [`CONTROL_INLINE_MAX`] → 审计分块 + `Ref`；
+    /// - 自由文本：`Failure.error` 按 [`bounded_control_text`] 截断。
+    ///
+    /// 小结果保持 inline——journal 形状与协议 v2 逐字节一致，只有落在
+    /// 「可 inline 但装不进控制帧」窄带里的值才换表示。
+    async fn control_safe_outcome(
+        &mut self,
+        audit: &mut AuditStream,
+        outcome: ResultOutcome,
+    ) -> Result<ResultOutcome, TaskError> {
+        let journal_id = self.journal_id.clone();
+        Ok(match outcome {
+            ResultOutcome::Success { output, branch } => ResultOutcome::Success {
+                output: shrink_control_value(audit, &journal_id, output).await?,
+                branch,
+            },
+            ResultOutcome::Wait { mut wait } => {
+                if let Some(output) = wait.output.take() {
+                    wait.output = Some(shrink_control_value(audit, &journal_id, output).await?);
+                }
+                ResultOutcome::Wait { wait }
+            }
+            ResultOutcome::Failure {
+                error,
+                uncertain_operation,
+            } => ResultOutcome::Failure {
+                error: bounded_control_text(error),
+                uncertain_operation,
+            },
+        })
     }
 
     async fn wait_committed(&mut self, result_id: &str) -> Result<(), TaskError> {
@@ -1205,6 +1245,23 @@ async fn materialize_prepared_params(
     runner
         .materialize_stored(&prepared.params, "in:prepared-params", &mut budget)
         .await
+}
+
+/// inline 值超出控制帧内联预算 → 审计分块 + `Ref`（即既有的大值路径）；
+/// 预算内原样保留，journal 形状不变。
+async fn shrink_control_value(
+    audit: &mut AuditStream,
+    journal_id: &str,
+    value: StoredValue,
+) -> Result<StoredValue, TaskError> {
+    let StoredValue::Inline(inner) = &value else {
+        return Ok(value);
+    };
+    let bytes = flow_journal::codec::bounded_json(inner, flow_journal::INLINE_BYTES)?;
+    if bytes.len() <= CONTROL_INLINE_MAX {
+        return Ok(value);
+    }
+    store_value_ref(audit, journal_id, inner, flow_journal::INLINE_BYTES).await
 }
 
 #[allow(dead_code)]

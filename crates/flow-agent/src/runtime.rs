@@ -15,6 +15,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use flow_engine::execution_protocol::contract::bounded_control_text;
 use flow_engine::execution_protocol::contract::{ExecutorInvocation, DRAIN_GRACE_MS};
 use flow_engine::execution_protocol::message::Message;
 use flow_engine::execution_protocol::remote::{ResumeAction, ResumeItem, RESUME_PAGE_MAX};
@@ -421,12 +422,12 @@ pub async fn serve(
                                 Err(RelayError::Unbound(_)) => {
                                     // 错路由：明确拒绝（不静默执行）。
                                     let _ = transport.try_send(Message::Reject {
-                                        reason: "routed frame for unbound dispatch".into(),
+                                        reason: bounded_control_text("routed frame for unbound dispatch".into()),
                                     });
                                 }
                                 Err(error) => {
                                     let _ = transport.try_send(Message::Reject {
-                                        reason: format!("{error}"),
+                                        reason: bounded_control_text(format!("{error}")),
                                     });
                                     return format!("route verify failed: {error}");
                                 }

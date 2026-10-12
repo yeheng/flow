@@ -18,6 +18,34 @@ pub const PROTOCOL_VERSION: u32 = 2;
 
 /// control 通道单帧 JSON 上限（不含 4 字节长度头）。握手只可协商到本上限以内。
 pub const CONTROL_MAX_FRAME: usize = 64 * 1024;
+/// 控制帧里**内联业务值**的预算（T2 4b）：结果/等待值超过它就改走审计分块 +
+/// `ValueRef`，控制帧只留定长描述符。
+///
+/// 为什么不能沿用 `INLINE_BYTES`（64KiB）：那是「值存储」的 inline 阈值，而
+/// `CONTROL_MAX_FRAME` 也是 64KiB——「可 inline 但装不进控制帧」的窄带
+/// （序列化 JSON ≈65289..=65536 字节，远程链路 64922 起）会被帧层拒收并杀掉
+/// 会话，节点连结果都留不下。取一半给信封、dispatch_id/result_id 与 branch
+/// 留足余量。
+pub const CONTROL_INLINE_MAX: usize = CONTROL_MAX_FRAME / 2;
+/// 控制帧里自由文本（错误消息 / 拒绝原因）的上限。JS 抛出的消息长度用户可控，
+/// 无界文本同样会撑爆控制帧并杀会话。
+pub const CONTROL_TEXT_MAX: usize = 8 * 1024;
+
+/// 把控制帧里的自由文本截到 [`CONTROL_TEXT_MAX`]（保持 UTF-8 边界）。
+/// 超限时追加截断标记，便于排障时辨认。
+pub fn bounded_control_text(mut text: String) -> String {
+    if text.len() <= CONTROL_TEXT_MAX {
+        return text;
+    }
+    let mut end = CONTROL_TEXT_MAX;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push_str(" …[truncated]");
+    text
+}
+
 /// data 通道单帧 JSON 上限（不含 4 字节长度头）。
 pub const DATA_MAX_FRAME: usize = 1024 * 1024;
 /// 帧头长度：u32 大端长度，只计算 JSON 部分。
