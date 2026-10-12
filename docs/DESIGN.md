@@ -104,7 +104,7 @@ journal 服务端（flow-backend，唯一权威）
    │  远程链路：Routed 信封 over 双 TLS（execution/remote.rs）
    ▼
 flow-agent（中继，自己不碰 journal）
-   │  执行 IPC：socketpair + 帧（execution_protocol，同一协议）
+   │  执行 IPC：帧协议（unix socketpair / 其余平台 loopback 回连）
    ▼
 flow-executor（子进程，节点语义的唯一居所）
 ```
@@ -112,28 +112,32 @@ flow-executor（子进程，节点语义的唯一居所）
 **焊死的规则**：
 
 1. master↔executor 是同一种 IPC 协议；master = backend（单机直连）或 agent
-   （远程中继），两处 pool 调同一 `spawn_executor_process`。
-2. 节点执行语义只许存在于 `flow-executor`；master 只做裁决和调度。T7 已删除
-   master 侧的进程内实现（`execute()` / `journal_execution` 的计算类函数），
-   只剩 Windows 过渡态的 `#[cfg(not(unix))]` 分支。
+   （远程中继），协议层与握手完全一致，只是物理承载不同。
+2. 节点执行语义只许存在于 `flow-executor`；master 只做裁决和调度。进程内
+   实现已**全平台删除**（`execute()` / `journal_execution` 的计算类函数），
+   `journal_execution` 只剩 Attempt 簿记（begin/snapshot/finish）。
 3. 控制通道只走定长身份与元数据；一切变长业务值走 data 通道（协议 v2），
    再小也走。
 4. 服务端在写 RPC 响应前等到 `applied_lsn >= commit_lsn`；-32020 只作投影
    病理阀，健康路径永不触发，客户端零恢复逻辑。
-5. IPC 执行层 unix-only：非 unix 编译干净、`execution.mode=ipc` 明确报错、
-   不静默落回。
+5. 本地 IPC 承载按平台选择，对上层透明：unix 用 socketpair + pre_exec
+   FD 槽位（100/101）；Windows 及其余平台用 **TCP loopback 回连**
+   （父进程 bind `127.0.0.1:0`，执行器按 `FLOW_EXECUTOR_CONNECT_ADDR`
+   回连出 control/data 双通道，`execution_protocol::loopback`）。信任域与
+   单用户本机工具一致（RPC 端点本就 loopback + token）。
 
 **执行模式矩阵**：
 
 | 模式 | 平台 | 节点执行位置 | 备注 |
 | --- | --- | --- | --- |
-| `ipc` | unix（缺省，终态） | `flow-executor` 子进程（socketpair + FD 槽位） | 执行器缺失/协议版本不符直接失败，不静默回退 |
+| `ipc` | 全平台（缺省） | `flow-executor` 子进程（unix socketpair + FD 槽位；其余 TCP loopback 回连） | 执行器缺失/协议版本不符直接失败，不静默回退 |
 | `remote` | 全平台 | 经 `flow-agent` 中继的远端执行器 | 双 TLS；`mode=remote` 时 `[execution.remote]` 必填 |
-| `in_process` | 非 unix（过渡态） | 服务进程内 | Windows B 方案，等命名管道 A 方案；unix 上配置即报错（T7 删除） |
+| `in_process` | 已删除 | — | 全平台配置即报错；历史模式（T7 删 unix 路径，loopback 传输落地后删 Windows 过渡态） |
 
-执行模式在**配置期与装配期双重把关**：`flow-config` 的 validate 在 unix 拒绝
-`in_process`（并校验 `x_max` 与 remote 必填项），`flow-backend::start_execution`
-在运行期再拒一次；两处都明确报错，任何平台都不静默换模式。
+执行模式在**配置期与装配期双重把关**：`flow-config` 的 validate 在任何
+平台拒绝 `in_process`（并校验 `x_max` 与 remote 必填项），
+`flow-backend::start_execution` 在运行期再拒一次；两处都明确报错，任何
+平台都不静默换模式。
 
 依赖方向（与 Cargo.toml 对齐的**现状**）：
 

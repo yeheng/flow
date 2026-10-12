@@ -38,7 +38,7 @@ impl TestServer {
         let backend = JournalBackend::open(scratch.path(), Default::default())
             .await
             .expect("打开 journal 后端失败");
-        // T7：unix 本地执行只有 ipc（进程内路径已删除）。服务端在测试进程内
+        // 本地执行只有 ipc（进程内路径已全平台删除）。服务端在测试进程内
         // （测试二进制位于 deps/），locate() 找不到兄弟 flow-executor，
         // 因此显式指向工作区执行器产物；Windows 过渡态仍用 in_process。
         let execution = execution_config();
@@ -589,23 +589,13 @@ async fn wait_terminal(server: &TestServer, run_id: &str) -> Value {
     }
 }
 
-/// T7：unix 上进程内执行路径已删除，本地执行只有 ipc——显式指向工作区产出的
+/// 进程内执行路径已全平台删除，本地执行只有 ipc——显式指向工作区产出的
 /// flow-executor（`cargo build --workspace --bins` 先产出）；Windows 过渡态
 /// 仍用 in_process。
 fn execution_config() -> flow_config::ExecutionConfig {
-    #[cfg(unix)]
-    {
-        flow_config::ExecutionConfig {
-            mode: flow_config::ExecutionModeKind::Ipc,
-            executor_bin: Some(flow_test_support::io::executor_bin().display().to_string()),
-            ..Default::default()
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        flow_config::ExecutionConfig {
-            mode: flow_config::ExecutionModeKind::InProcess,
-            ..Default::default()
-        }
+    flow_config::ExecutionConfig {
+        mode: flow_config::ExecutionModeKind::Ipc,
+        executor_bin: Some(flow_test_support::io::executor_bin().display().to_string()),
+        ..Default::default()
     }
 }

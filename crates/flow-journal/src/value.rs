@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
+use serde_json::ser::Formatter as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -495,99 +496,128 @@ pub fn copy_bounded(mut from: impl Read, to: &mut impl Write, max: u64) -> Resul
     Ok(n)
 }
 
-pub enum JsonPart {
-    Literal(Vec<u8>),
-    Value(StoredValue),
-    /// Caller has stream-validated that these original bytes form one complete JSON value.
-    RawJson(ValueRef),
-    /// Raw bytes decoded as UTF-8 with replacement, escaped as a JSON string incrementally.
-    Text(ValueRef),
+/// Structured JSON object composer. serde_json's formatter owns every
+/// structural byte (`{`, `,`, `:`, `}`) and every key escape; callers only
+/// supply complete values. Hand-splicing these bytes is forbidden: one
+/// misplaced comma produces a broken document that takes down every
+/// downstream parser.
+pub struct ObjectWriter<W: Write> {
+    writer: W,
+    formatter: serde_json::ser::CompactFormatter,
+    first: bool,
 }
 
-/// Reassemble values through a fixed 64 KiB pipe. Fan-in and HTTP wrapping do not materialize
-/// whole objects. The returned task must be joined; dropping the reader cancels production.
-pub fn compose(
+impl<W: Write> ObjectWriter<W> {
+    /// Writes the opening brace; every structural byte after it comes from
+    /// the serde_json formatter.
+    pub fn begin(writer: W) -> Result<Self> {
+        let mut object = Self {
+            writer,
+            formatter: serde_json::ser::CompactFormatter,
+            first: true,
+        };
+        object.formatter.begin_object(&mut object.writer)?;
+        Ok(object)
+    }
+    /// Serialize one key and position the stream at its value slot.
+    pub fn key(&mut self, key: &str) -> Result<()> {
+        self.formatter
+            .begin_object_key(&mut self.writer, self.first)?;
+        serde_json::to_writer(&mut self.writer, key)?;
+        self.formatter.begin_object_value(&mut self.writer)?;
+        self.first = false;
+        Ok(())
+    }
+    /// Serialize one value through serde.
+    pub fn value<V: serde::Serialize + ?Sized>(&mut self, value: &V) -> Result<()> {
+        serde_json::to_writer(&mut self.writer, value)?;
+        Ok(())
+    }
+    /// Stream one complete JSON value's raw bytes (published-reference
+    /// contents or caller-validated fragments).
+    pub fn raw_value_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        self.writer.write_all(bytes)?;
+        Ok(())
+    }
+    /// Value slot for streaming writers ([`read_value`]): the bytes written
+    /// here must form exactly one complete JSON value.
+    pub fn value_writer(&mut self) -> &mut W {
+        &mut self.writer
+    }
+    /// Writes the closing brace and returns the wrapped writer.
+    pub fn finish(self) -> Result<W> {
+        let mut object = self;
+        object.formatter.end_object(&mut object.writer)?;
+        Ok(object.writer)
+    }
+}
+
+/// Compose one JSON object from stored entries without materializing whole
+/// values: inline entries serialize through serde, references stream through
+/// the fixed 64 KiB pipe. Fan-in does not materialize whole objects. The
+/// returned task must be joined; dropping the reader cancels production.
+pub fn compose_object(
     root: std::path::PathBuf,
     upper: u64,
-    parts: Vec<JsonPart>,
+    entries: Vec<(String, StoredValue)>,
 ) -> (tokio::io::DuplexStream, tokio::task::JoinHandle<Result<()>>) {
     let (reader, writer) = tokio::io::duplex(64 * 1024);
     let task = tokio::task::spawn_blocking(move || {
         let mut writer = tokio_util::io::SyncIoBridge::new(writer);
-        for part in parts {
-            match part {
-                JsonPart::Literal(bytes) => writer.write_all(&bytes)?,
-                JsonPart::Value(StoredValue::Inline(value)) => {
-                    writer.write_all(&bounded_json(&value, INLINE_BYTES)?)?
+        let mut object = ObjectWriter::begin(&mut writer)?;
+        for (key, value) in entries {
+            object.key(&key)?;
+            match value {
+                StoredValue::Inline(value) => {
+                    bounded_json(&value, INLINE_BYTES)?;
+                    serde_json::to_writer(object.value_writer(), &value)?;
                 }
-                JsonPart::Value(StoredValue::Ref(value)) => {
+                StoredValue::Ref(value) => {
                     if value.codec != ValueCodec::Json {
                         return Err(invalid("non-JSON reference in JSON composition"));
                     }
-                    read_value(&root, upper, &value, true, &mut writer)?;
-                }
-                JsonPart::RawJson(value) => read_value(&root, upper, &value, true, &mut writer)?,
-                JsonPart::Text(value) => {
-                    writer.write_all(b"\"")?;
-                    let mut escaped = EscapedUtf8 {
-                        writer: &mut writer,
-                        pending: Vec::new(),
-                    };
-                    read_value(&root, upper, &value, true, &mut escaped)?;
-                    if !escaped.pending.is_empty() {
-                        escaped.writer.write_all("�".as_bytes())?;
-                    }
-                    writer.write_all(b"\"")?;
+                    read_value(&root, upper, &value, true, object.value_writer())?;
                 }
             }
         }
+        object.finish()?;
         writer.flush()?;
         Ok(())
     });
     (reader, task)
 }
 
-struct EscapedUtf8<'a, W: Write> {
-    writer: &'a mut W,
-    pending: Vec<u8>,
-}
-impl<W: Write> EscapedUtf8<'_, W> {
-    fn text(&mut self, text: &str) -> std::io::Result<()> {
-        // Encode bounded chunks with serde's escaping semantics; remove only the quotes.
-        let encoded = serde_json::to_vec(text).map_err(std::io::Error::other)?;
-        self.writer.write_all(&encoded[1..encoded.len() - 1])
-    }
-}
-impl<W: Write> Write for EscapedUtf8<'_, W> {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        let mut input = std::mem::take(&mut self.pending);
-        input.extend_from_slice(bytes);
-        let mut offset = 0;
-        while offset < input.len() {
-            match std::str::from_utf8(&input[offset..]) {
-                Ok(text) => {
-                    self.text(text)?;
-                    offset = input.len();
-                }
-                Err(error) => {
-                    let valid = error.valid_up_to();
-                    if valid > 0 {
-                        self.text(std::str::from_utf8(&input[offset..offset + valid]).unwrap())?;
-                        offset += valid;
-                    }
-                    if let Some(n) = error.error_len() {
-                        self.text("�")?;
-                        offset += n;
-                    } else {
-                        self.pending.extend_from_slice(&input[offset..]);
-                        break;
-                    }
-                }
-            }
+#[cfg(test)]
+mod object_writer_tests {
+    use super::*;
+
+    #[test]
+    fn structure_and_escapes_are_owned_by_serde() {
+        let mut bytes = Vec::new();
+        {
+            let mut object = ObjectWriter::begin(&mut bytes).unwrap();
+            object.key("status").unwrap();
+            object.value(&404u64).unwrap();
+            object.key("weird \"key\"\n").unwrap();
+            object.value(&serde_json::json!({"a": [1, 2, null]})).unwrap();
+            object.key("raw").unwrap();
+            object.raw_value_bytes(b"{\"streamed\":true}").unwrap();
+            object.finish().unwrap();
         }
-        Ok(bytes.len())
+        let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["status"], 404);
+        assert_eq!(parsed["raw"], serde_json::json!({"streamed": true}));
+        assert_eq!(parsed["weird \"key\"\n"]["a"][1], 2);
     }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.writer.flush()
+
+    #[test]
+    fn empty_object_is_valid_json() {
+        let mut bytes = Vec::new();
+        let object = ObjectWriter::begin(&mut bytes).unwrap();
+        let _ = object.finish().unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap(),
+            serde_json::json!({})
+        );
     }
 }

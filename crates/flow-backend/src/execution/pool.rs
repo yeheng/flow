@@ -1,9 +1,10 @@
 //! 执行子进程池与可靠回收（二期 §3.1/§3.7/§3.9，I03）。
 //!
-//! 每进程同一时刻一个任务；spawn 仅映射目标 socketpair FD（dup2 到固定
-//! 槽位后关闭其余继承 FD），其余 FD 默认 close-on-exec。父关闭子端、子
-//! 关闭父端，兄弟进程不继承连接。任一通道故障 → 会话 Draining → 宽限
-//! 后 kill → wait/reap；已取消/故障任务的进程统一回收重建，不直接复用。
+//! 每进程同一时刻一个任务。通道承载按平台选择：unix 用 socketpair +
+//! pre_exec FD 槽位（dup2 落位后关闭其余继承 FD，其余 FD 默认
+//! close-on-exec）；其余平台用 TCP loopback 回连。父关闭子端、子关闭
+//! 父端，兄弟进程不继承连接。任一通道故障 → 会话 Draining → 宽限后
+//! kill → wait/reap；已取消/故障任务的进程统一回收重建，不直接复用。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -170,6 +171,31 @@ impl ExecutorPool {
     }
 }
 
+/// 平台通道承载：unix socketpair（pre_exec FD 槽位，父端关闭子端副本）；
+/// 其余平台 TCP loopback 回连。差异在此收口，下游只见 FrameTransport。
+async fn spawn_transport(
+    executor: &flow_engine::execution_protocol::contract::ExecutorInvocation,
+    tag: Option<&str>,
+) -> Result<(FrameTransport, Child), PoolError> {
+    #[cfg(unix)]
+    {
+        let (parent, child, child_pair) =
+            flow_engine::execution_protocol::spawn::spawn_executor_process(executor, tag)
+                .map_err(|e| PoolError::Spawn(format!("{}: {e}", executor.program.display())))?;
+        // 父进程关闭子端副本（子进程内已 dup2 到槽位）。
+        drop(child_pair);
+        Ok((FrameTransport::spawn(parent, 128), child))
+    }
+    #[cfg(not(unix))]
+    {
+        let (control, child, data) =
+            flow_engine::execution_protocol::loopback::spawn_executor_loopback(executor, tag)
+                .await
+                .map_err(|e| PoolError::Spawn(format!("{}: {e}", executor.program.display())))?;
+        Ok((FrameTransport::spawn_streams(control, data, 128), child))
+    }
+}
+
 /// spawn 执行器并完成握手；子进程由会话驱动任务持有并负责 kill/reap。
 async fn spawn_and_handshake(
     executor: &flow_engine::execution_protocol::contract::ExecutorInvocation,
@@ -179,13 +205,8 @@ async fn spawn_and_handshake(
     session_id: &str,
     tag: Option<&str>,
 ) -> Result<RawSession, PoolError> {
-    let (parent, mut child, child_pair) =
-        flow_engine::execution_protocol::spawn::spawn_executor_process(executor, tag)
-            .map_err(|e| PoolError::Spawn(format!("{}: {e}", executor.program.display())))?;
+    let (mut transport, mut child) = spawn_transport(executor, tag).await?;
     let child_pid = child.id();
-    // 父进程关闭子端副本（子进程内已 dup2 到槽位）。
-    drop(child_pair);
-    let mut transport = FrameTransport::spawn(parent, 128);
     let hello = tokio::time::timeout(
         Duration::from_millis(STARTUP_TIMEOUT_MS * 2),
         master_handshake(

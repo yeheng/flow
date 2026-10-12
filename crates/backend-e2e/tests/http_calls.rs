@@ -196,6 +196,15 @@ e2e_test!(
             engine.iter().any(|m| m.starts_with("← HTTP 200")),
             "缺少响应行：{engine:?}"
         );
+        // 生命周期叙事行包住动作行：开始执行 → 请求/响应 → 执行完成
+        assert!(
+            engine.iter().any(|m| m.starts_with("开始执行：HTTP 请求")),
+            "缺少开始行：{engine:?}"
+        );
+        assert!(
+            engine.iter().any(|m| m.starts_with("执行完成（")),
+            "缺少完成行：{engine:?}"
+        );
     })
 );
 

@@ -12,31 +12,35 @@ use tokio_util::sync::CancellationToken;
 
 use flow_engine::execution_protocol::contract::bounded_control_text;
 use flow_engine::execution_protocol::contract::STARTUP_TIMEOUT_MS;
+use flow_engine::execution_protocol::loopback::connect_loopback;
 use flow_engine::execution_protocol::message::Message;
 use flow_engine::execution_protocol::transport::{
     executor_handshake, FrameTransport, NegotiatedLimits, SessionIdentity,
 };
+#[cfg(unix)]
 use flow_engine::execution_protocol::unix::channels_from_raw;
 
 use crate::task::{TaskEnd, TaskRunner};
 use crate::transfer::IncomingTransfers;
 use crate::{EXECUTOR_BUILD, EXECUTOR_CAPABILITIES};
 
-pub struct ExecutorConfig {
-    pub control_fd: i32,
-    pub data_fd: i32,
-    /// 会话心跳与限额来自 Welcome。
-    pub queue_depth: usize,
+/// 通道引导方式：unix 由主进程 pre_exec 落位 FD 槽位；其余平台经
+/// [`FLOW_EXECUTOR_CONNECT_ADDR`] 回连 loopback（见 execution_protocol::loopback）。
+pub enum ChannelBootstrap {
+    #[cfg(unix)]
+    FdSlots {
+        control_fd: i32,
+        data_fd: i32,
+    },
+    Loopback {
+        addr: String,
+    },
 }
 
-impl Default for ExecutorConfig {
-    fn default() -> Self {
-        Self {
-            control_fd: flow_engine::execution_protocol::EXECUTOR_CONTROL_FD_SLOT,
-            data_fd: flow_engine::execution_protocol::EXECUTOR_DATA_FD_SLOT,
-            queue_depth: 128,
-        }
-    }
+pub struct ExecutorConfig {
+    pub bootstrap: ChannelBootstrap,
+    /// 会话心跳与限额来自 Welcome。
+    pub queue_depth: usize,
 }
 
 struct CurrentTask {
@@ -50,14 +54,38 @@ struct CurrentTask {
 
 /// 执行器主循环。返回进程退出码语义：0 = 干净结束，非 0 = 需要回收。
 pub async fn run_executor(config: ExecutorConfig) -> i32 {
-    let pair = match channels_from_raw(config.control_fd, config.data_fd) {
-        Ok(pair) => pair,
-        Err(error) => {
-            eprintln!("flow-executor: channel fds unavailable: {error}");
-            return 71;
+    let mut transport = match &config.bootstrap {
+        #[cfg(unix)]
+        ChannelBootstrap::FdSlots {
+            control_fd,
+            data_fd,
+        } => match channels_from_raw(*control_fd, *data_fd) {
+            Ok(pair) => FrameTransport::spawn(pair, config.queue_depth),
+            Err(error) => {
+                eprintln!("flow-executor: channel fds unavailable: {error}");
+                return 71;
+            }
+        },
+        ChannelBootstrap::Loopback { addr } => {
+            let connected = tokio::time::timeout(
+                Duration::from_millis(STARTUP_TIMEOUT_MS),
+                connect_loopback(addr),
+            )
+            .await;
+            let (control, data) = match connected {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(error)) => {
+                    eprintln!("flow-executor: loopback connect failed: {error}");
+                    return 71;
+                }
+                Err(_) => {
+                    eprintln!("flow-executor: loopback connect timeout");
+                    return 71;
+                }
+            };
+            FrameTransport::spawn_streams(control, data, config.queue_depth)
         }
     };
-    let mut transport = FrameTransport::spawn(pair, config.queue_depth);
     let (identity, limits) = match tokio::time::timeout(
         Duration::from_millis(STARTUP_TIMEOUT_MS * 2),
         executor_handshake(&mut transport, EXECUTOR_BUILD, EXECUTOR_CAPABILITIES),

@@ -32,10 +32,16 @@ test("运行链路：点运行 → RunPanel 终态 → 列表来源=手动 → �
   await expect(row).toContainText("手动");
   await expect(row.getByRole("link", { name: "详情" })).toBeVisible();
 
-  // 详情页：状态徽章 + 时间线有 3 个节点行
+  // 详情页：状态徽章 + 活动流按步骤叙事（start/end 是框架节点不出现）
   await row.getByRole("link", { name: "详情" }).click();
   await expect(page).toHaveURL(/\/runs\/[0-9a-f-]{36}/);
   await expect(page.locator(".run-header .badge").first()).toContainText("成功");
+  await expect(page.locator(".activity-item")).toHaveCount(1);
+  await expect(page.locator(".activity-item").first()).toContainText("脚本");
+
+  // 开发者模式：时间线表格回归可见（3 个节点行）
+  await page.locator(".dev-toggle input").check();
+  await page.getByRole("button", { name: "时间线" }).click();
   await expect(page.locator("table.timeline tbody tr")).toHaveCount(3);
 
   // 后端确认已终结（双保险，防 UI 假绿）

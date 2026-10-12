@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 
 use flow_backend::journal::JournalBackend;
+use flow_backend::ProductCommand;
 use std::sync::Arc;
 const TOKEN: &str = "flow-hook-test-token-at-least-32-bytes";
 use serde_json::{json, Value};
@@ -61,8 +62,8 @@ impl Fixture {
         let created = self
             .backend
             .product_command(
-                "webhook.create",
-                &json!({"workflow_id":wf}),
+                ProductCommand::parse("webhook.create", &json!({"workflow_id": wf})).unwrap(),
+                &json!({"workflow_id": wf}),
                 &uuid::Uuid::now_v7().to_string(),
             )
             .await
@@ -72,8 +73,11 @@ impl Fixture {
     async fn enable(&self, token: &str, enabled: bool) {
         self.backend
             .product_command(
-                "webhook.set_enabled",
-                &json!({"token":token,"enabled":enabled}),
+                ProductCommand::WebhookSetEnabled {
+                    token: token.into(),
+                    enabled,
+                },
+                &json!({"token": token, "enabled": enabled}),
                 &uuid::Uuid::now_v7().to_string(),
             )
             .await

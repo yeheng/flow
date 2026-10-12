@@ -5,6 +5,7 @@
  */
 import { reactive } from "vue";
 import * as api from "../api/flow";
+import { deepCloneJson } from "./clone";
 import type { FragmentNode, NodeTemplate, NodeTemplateSummary } from "../types";
 import { errText } from "../rpc/client";
 import { editor, insertFragment } from "./editor";
@@ -52,7 +53,7 @@ export async function saveSelectionAsTemplate(name: string): Promise<NodeTemplat
       id: n.id,
       type: n.data.nodeType.type,
       name: n.data.name,
-      params: JSON.parse(JSON.stringify(n.data.params ?? {})),
+      params: deepCloneJson(n.data.params ?? {}),
       position: { x: n.position.x, y: n.position.y },
     }));
     const edges = editor.edges

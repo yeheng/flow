@@ -15,8 +15,9 @@ FLOW_EXECUTION_MODE=ipc cargo run -p flow-backend --bin flow-journal-dev -- --da
 FLOW_EXECUTION_MODE=ipc cargo run -p flow-rpc --bin flow-journal-server
 ```
 
-- 默认（T6）：unix 上 `ipc`（执行层终态）；非 unix 过渡态 `in_process`（Windows 命名管道 transport 另行交付）。`ipc` 模式二进制缺失/版本不兼容直接失败，不静默回退；`FLOW_EXECUTION_MODE` 显式覆盖。执行器环境隔离：spawn 后 `env_clear`，仅回填 `RUST_LOG`。
-- T7：unix 上**删除进程内执行路径**——`ExecutionPort::InProcess`（只剩 `#[cfg(not(unix))]` 的 Windows 过渡态）、`journal_driver::execute()`、`journal_execution` 的计算类函数（prepare/compute/harness/http 等）均只在非 unix 编译；unix 上 `mode=in_process` 在 `flow-config` 校验与 `flow-backend::start_execution` 两处明确报错。节点执行语义只存在于 `flow-executor`，master 只做裁决与调度。
+- 默认（T6）：全平台 `ipc`。`ipc` 模式二进制缺失/版本不兼容直接失败，不静默回退；`FLOW_EXECUTION_MODE` 显式覆盖。执行器环境隔离：spawn 后 `env_clear`，仅回填 `RUST_LOG`（非 unix 平台另注入回连地址）。
+- 进程内执行路径已**全平台删除**（T7 先删 unix；Windows 过渡态随 loopback 传输落地一并删除）——`ExecutionMode::InProcess`、`journal_driver::execute()`、`journal_execution` 的计算类函数（prepare/compute/harness/http 等）不再存在，`mode=in_process` 在 `flow-config` 校验与 `flow-backend::start_execution` 两处明确报错。节点执行语义只存在于 `flow-executor`，master 只做裁决与调度。
+- 物理承载按平台选择（对上层透明）：unix 用 socketpair + `pre_exec` FD 槽位（100/101）；Windows 及其余平台用 TCP loopback 回连（父进程 bind `127.0.0.1:0`，执行器按 `FLOW_EXECUTOR_CONNECT_ADDR` 回连 control/data 双通道，见 `flow_engine::execution_protocol::loopback`）。传输键（`in:run-input` / `in:<node_id>` / `in:prepared-params` / `op-body:<output_id>` / `op:<operation_id>`）统一由 `execution_protocol::TransferKey` 构造与解析，wire 字符串冻结。
 - **本机 release 构建**：若遇 `dlopen ... mis-aligned LINKEDIT string pool`（Xcode 21 ld 对部分
   proc-macro dylib 产生未对齐符号表，机器级 bug），用
   `scripts/release.sh cargo <command>` 包装（改用 rustc 自带 rust-lld + 26.5

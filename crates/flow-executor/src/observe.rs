@@ -36,20 +36,39 @@ pub struct ObservationLoss {
 /// 无实例状态（所有事实经 `Arc<ObservationLoss>` 返回给调用方）。
 pub struct ObservationBridge;
 
+/// 观测转发任务的收尾句柄。
+///
+/// 出站通道是 FIFO：批进入队列的顺序就是主进程看到的顺序。尾批若晚于
+/// Result 控制帧发出，派发已结束、会话已归还进程池，下一个租约会把这批
+/// 日志**错认领到别的节点头上**。所以调用方必须在发任何 Result 之前
+/// 释放全部 logger 克隆并 `close()`，让尾批先入队。
+pub struct ObservationClose {
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl ObservationClose {
+    /// 等转发任务排空退出。带超时防御：若有 logger 克隆泄漏，转发任务
+    /// 永远等不到通道关闭——观测可丢弃，节点执行不能陪葬（超时后泄漏的
+    /// 克隆再触发尾批，由主进程的陈旧批次拒收兜底）。
+    pub async fn close(self) {
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), self.join).await;
+    }
+}
+
 impl ObservationBridge {
     /// 启动观测转发：NodeLogger 的 unbounded 出口（日志永远不影响执行）
     /// 转成有界 ObservabilityBatch（data 通道）。超限丢弃并计数。
     pub fn start(
         dispatch_id: String,
         outbound: mpsc::Sender<Message>,
-    ) -> (NodeLogger, Arc<ObservationLoss>) {
+    ) -> (NodeLogger, Arc<ObservationLoss>, ObservationClose) {
         let loss = Arc::new(ObservationLoss::default());
         let (tx, mut rx) = mpsc::unbounded_channel::<LogLine>();
         let logger = NodeLogger::new(tx, flow_engine::nodelog::LogBudget::new(usize::MAX), "", 1);
         let forward_loss = loss.clone();
         let forward_dispatch = dispatch_id.clone();
         let forward_outbound = outbound.clone();
-        tokio::spawn(async move {
+        let join = tokio::spawn(async move {
             let mut lines: Vec<ObservationLine> = Vec::new();
             let mut batch_bytes = 0usize;
             loop {
@@ -97,7 +116,7 @@ impl ObservationBridge {
                 }
             }
         });
-        (logger, loss)
+        (logger, loss, ObservationClose { join })
     }
 
     /// 观测关闭：logger 静默丢弃（主进程未配置观测存储时不产生流量）。
@@ -188,7 +207,7 @@ mod tests {
     #[tokio::test]
     async fn flood_of_escapable_lines_stays_within_frame_budget() {
         let (outbound, mut rx) = mpsc::channel::<Message>(2); // 故意小出站，制造 Full
-        let (logger, loss) = ObservationBridge::start("dispatch-test".into(), outbound);
+        let (logger, loss, close) = ObservationBridge::start("dispatch-test".into(), outbound);
         // 8 KiB 的引号洪水：转义估计 ~48 KiB/行。
         let flood = "\"".repeat(8 * 1024);
         for _ in 0..64 {
@@ -219,5 +238,27 @@ mod tests {
             dropped_lines > 0 || encoded_batches >= 30,
             "小出站队列下：要么丢批计数，要么全部送达（实际批数 {encoded_batches}，丢弃 {dropped_lines}）"
         );
+        drop(logger);
+        close.close().await;
+    }
+
+    /// 尾批必须能在 close() 里被冲出去：调用方靠它保证尾批先于 Result 帧入队。
+    #[tokio::test]
+    async fn close_flushes_the_tail_batch() {
+        let (outbound, mut rx) = mpsc::channel::<Message>(8);
+        let (logger, _loss, close) = ObservationBridge::start("dispatch-tail".into(), outbound);
+        logger.info("尾批");
+        // 不 close 前不 flush：批的触发条件是容量或通道关闭
+        assert!(rx.try_recv().is_err(), "容量未满时不得提前发批");
+        drop(logger);
+        close.close().await;
+        match rx.try_recv() {
+            Ok(Message::ObservabilityBatch { dispatch_id, lines }) => {
+                assert_eq!(dispatch_id.as_deref(), Some("dispatch-tail"));
+                assert_eq!(lines.len(), 1);
+                assert_eq!(lines[0].message, "尾批");
+            }
+            other => panic!("close 后应收到尾批：{other:?}"),
+        }
     }
 }

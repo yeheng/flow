@@ -5,6 +5,7 @@ import { errText } from "../rpc/client";
 import { isDesktop } from "../platform";
 import { apiToken, setApiToken, rpcUrl } from "../config";
 import { refreshSecrets } from "../state/editor";
+import { deepCloneJson } from "../state/clone";
 import { confirmDialog } from "../state/modal";
 import { toast } from "../state/toast";
 import type { ConfigView, FlowConfig, SecretInfo } from "../types";
@@ -138,7 +139,7 @@ async function refresh(): Promise<void> {
   try {
     const view: ConfigView = await api.getConfig();
     original.value = view.config;
-    copy.value = JSON.parse(JSON.stringify(view.config)) as FlowConfig;
+    copy.value = deepCloneJson(view.config) as FlowConfig;
     configPath.value = view.config_path;
     envOverrides.value = view.env_overrides;
     secrets.value = await api.listSecrets();
@@ -197,7 +198,7 @@ async function onSave(): Promise<void> {
   try {
     const view = await api.updateConfig(copy.value);
     original.value = view.config;
-    copy.value = JSON.parse(JSON.stringify(view.config)) as FlowConfig;
+    copy.value = deepCloneJson(view.config) as FlowConfig;
     configPath.value = view.config_path;
     envOverrides.value = view.env_overrides;
     toast.success("配置已保存，重启 flow 后生效");
@@ -211,7 +212,7 @@ async function onSave(): Promise<void> {
 async function onReset(): Promise<void> {
   if (!original.value) return;
   if (!(await confirmDialog("确定放弃所有未保存的修改？"))) return;
-  copy.value = JSON.parse(JSON.stringify(original.value)) as FlowConfig;
+  copy.value = deepCloneJson(original.value) as FlowConfig;
 }
 
 // ---- 密钥 ----

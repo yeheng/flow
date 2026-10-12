@@ -235,7 +235,7 @@ onUnmounted(() => {
             :class="{ active: activeTab === 'timeline' }"
             @click="activeTab = 'timeline'"
           >
-            时间线
+            运行
           </button>
           <button
             class="aside-tab"

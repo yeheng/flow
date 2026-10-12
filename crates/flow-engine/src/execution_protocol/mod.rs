@@ -9,18 +9,22 @@
 pub mod contract;
 pub mod fixtures;
 pub mod frame;
+pub mod loopback;
 pub mod message;
 pub mod remote;
 #[cfg(unix)]
 pub mod spawn;
+pub mod transfer_key;
 pub mod transport;
 #[cfg(unix)]
 pub mod unix;
 
 pub use contract::*;
+pub use loopback::{connect_loopback, spawn_executor_loopback, CONNECT_ADDR_ENV};
 pub use message::{
     record_bytes, AuditRecord, Channel, ExecuteTask, Message, ObservationLine, PreparedMeta,
     ProtocolError, ResultOutcome, TaskValue, WaitRequest,
 };
+pub use transfer_key::TransferKey;
 #[cfg(unix)]
 pub use unix::{channels_from_raw, socketpair_channels, ChannelPair};

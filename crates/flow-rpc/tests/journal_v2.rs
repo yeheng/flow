@@ -531,10 +531,8 @@ async fn product_creation_reports_commit_during_projection_delay() {
     backend.close().await.unwrap();
 }
 
-/// T7：unix 上进程内执行路径已删除，本地语义套件一律走真实 IPC 执行器
-/// （`cargo build --workspace --bins` 先产出 flow-executor）。Windows 过渡态
-/// 仍用 in_process，行为与 T7 之前一致。
-#[cfg(unix)]
+/// 本地语义套件一律走真实 IPC 执行器（`cargo build --workspace --bins`
+/// 先产出 flow-executor）；全平台同一入口（unix socketpair / 其余 loopback）。
 async fn start_ipc(backend: &std::sync::Arc<flow_backend::journal::JournalBackend>, x_max: usize) {
     backend
         .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
@@ -548,9 +546,4 @@ async fn start_ipc(backend: &std::sync::Arc<flow_backend::journal::JournalBacken
         ))
         .await
         .unwrap();
-}
-
-#[cfg(not(unix))]
-async fn start_ipc(backend: &std::sync::Arc<flow_backend::journal::JournalBackend>, x_max: usize) {
-    backend.start_execution_with_limit(x_max).await.unwrap();
 }

@@ -261,6 +261,18 @@ function sourceStyle(index: number, total: number) {
 .flow-node.run-running {
   border-color: var(--run);
   background: rgba(88, 166, 255, 0.12);
+  /* 轻脉冲让画布「看得见」在动，静态配色容易被当成卡死 */
+  animation: run-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes run-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(88, 166, 255, 0.4);
+  }
+  50% {
+    box-shadow: 0 0 0 7px rgba(88, 166, 255, 0);
+  }
 }
 
 .flow-node.run-retrying {

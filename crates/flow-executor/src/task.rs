@@ -21,6 +21,7 @@ use flow_engine::execution_protocol::contract::{
 use flow_engine::execution_protocol::message::{
     ExecuteTask, Message, ResultOutcome, TaskValue, WaitRequest,
 };
+use flow_engine::execution_protocol::TransferKey;
 use flow_engine::journal_state::Prepared;
 use flow_engine::model::Node;
 use flow_engine::{NodeType, HTTP_METHODS};
@@ -28,7 +29,7 @@ use flow_journal::value::ValueCodec;
 use flow_journal::StoredValue;
 
 use crate::audit::AuditStream;
-use crate::observe::ObservationBridge;
+use crate::observe::{ObservationBridge, ObservationClose};
 use crate::transfer::{store_bytes, store_value, store_value_ref, IncomingTransfers};
 
 /// 输入面预算（与一期 materialize 8 MiB 一致）。
@@ -137,14 +138,25 @@ impl TaskRunner {
             self.window_bytes,
             self.ack_tx.subscribe(),
         );
-        // 观测桥（未启用时静默丢弃）。
-        let logger = if self.task.observability {
-            let (logger, _loss) =
+        // 观测桥（未启用时静默丢弃）。尾批必须在 Result 之前入队，否则会被
+        // 复用会话的下一个派发错认领（见 ObservationClose）。
+        let (logger, obs_close) = if self.task.observability {
+            let (logger, _loss, close) =
                 ObservationBridge::start(self.dispatch_id.clone(), self.outbound.clone());
-            logger
+            (logger, Some(close))
         } else {
-            ObservationBridge::disabled_logger()
+            (ObservationBridge::disabled_logger(), None)
         };
+        // 每次尝试一条开始行 + 一条终态行：没有它们，script/condition 节点
+        // （脚本不打 console 时）在观测日志里整段静默，用户看不到节点在跑。
+        // start/end 是零工作量的流程节点，不产生叙事。
+        let narrative = narrative_kind(node.kind());
+        if let Some(label) = narrative {
+            logger.info(format!(
+                "开始执行：{label}{}",
+                attempt_label(self.task.attempt)
+            ));
+        }
         // 1) 输入装配（Ref 走 transfer；inline 直接可用）。
         let inputs = self
             .materialize_inputs(Duration::from_millis(DURABLE_WAIT_TIMEOUT_MS))
@@ -177,6 +189,10 @@ impl TaskRunner {
                     prepared
                 }
                 Err(TaskError::Business(error)) => {
+                    if narrative.is_some() {
+                        logger.error(format!("执行失败：{error}"));
+                    }
+                    drain_observations(logger, obs_close).await;
                     self.emit_failure(&mut audit, error, false).await?;
                     return Ok(());
                 }
@@ -185,6 +201,8 @@ impl TaskRunner {
         };
         // 3) 执行（按节点类型）；业务失败/未定外部结果转失败 Result
         // （同一派发；uncertain 由主进程依操作状态登记）。
+        let attempt_logger = logger.clone();
+        let started = std::time::Instant::now();
         let outcome = match self
             .execute_node(&node, &prepared, &inputs, &mut audit, logger)
             .await
@@ -197,6 +215,8 @@ impl TaskRunner {
             Err(TaskError::Uncertain(error)) => {
                 // 授权后调用未得到可验证 Outcome：失败 Result 携带 uncertain
                 // 标记，主进程按一期规则登记 uncertain 等待。
+                attempt_logger.error(format!("外部操作结果未确定，等待裁决：{error}"));
+                drain_observations(attempt_logger, obs_close).await;
                 self.emit_failure(
                     &mut audit,
                     format!("external outcome uncertain: {error}"),
@@ -207,6 +227,20 @@ impl TaskRunner {
             }
             Err(other) => return Err(other),
         };
+        // Wait 不打终态行：等待中的节点由各自的等待说明（delay/人工任务/
+        // 子工作流）交代去向，恢复由 WaitResolved 叙事。
+        if narrative.is_some() {
+            match &outcome {
+                ResultOutcome::Success { .. } => {
+                    attempt_logger.info(format!("执行完成（{}）", elapsed_label(started.elapsed())))
+                }
+                ResultOutcome::Failure { error, .. } => {
+                    attempt_logger.error(format!("执行失败：{error}"));
+                }
+                ResultOutcome::Wait { .. } => {}
+            }
+        }
+        drain_observations(attempt_logger, obs_close).await;
         self.emit_result(&mut audit, outcome).await
     }
 
@@ -354,17 +388,17 @@ impl TaskRunner {
     /// [`Self::face`]，resume 重建 Prepared / fresh prepare 复用。
     async fn materialize_inputs(&mut self, timeout: Duration) -> Result<TaskInputs, TaskError> {
         let mut budget = INPUT_BUDGET;
-        let mut ids: Vec<String> = vec!["in:run-input".into()];
+        let mut ids: Vec<String> = vec![TransferKey::RunInput.to_wire()];
         for (node_id, _) in &self.task.predecessors {
-            ids.push(format!("in:{node_id}"));
+            ids.push(TransferKey::NodeInput(node_id.clone()).to_wire());
         }
         if self.task.prepared.is_some() {
-            ids.push("in:prepared-params".into());
+            ids.push(TransferKey::PreparedParams.to_wire());
         }
         if let Some(outcome) = &self.task.previous_outcome {
             if let Some(raw) = outcome.pointer("/value/body_raw") {
                 if let Some(output_id) = raw.get("output_id").and_then(Value::as_str) {
-                    ids.push(format!("op-body:{output_id}"));
+                    ids.push(TransferKey::OperationBody(output_id.to_owned()).to_wire());
                 }
             }
         }
@@ -423,16 +457,17 @@ impl TaskRunner {
                 }
             }
         };
-        let (input_stored, input) = decode(&self.task.input, "in:run-input")?;
+        let (input_stored, input) = decode(&self.task.input, &TransferKey::RunInput.to_wire())?;
         let mut nodes = serde_json::Map::new();
         let mut predecessors = BTreeMap::new();
         for (node_id, value) in &self.task.predecessors {
-            let (stored, decoded) = decode(value, &format!("in:{node_id}"))?;
+            let (stored, decoded) =
+                decode(value, &TransferKey::NodeInput(node_id.clone()).to_wire())?;
             predecessors.insert(node_id.clone(), stored);
             nodes.insert(node_id.clone(), decoded);
         }
         let prepared_params = match &self.task.prepared {
-            Some(meta) => Some(decode(&meta.params, "in:prepared-params")?.0),
+            Some(meta) => Some(decode(&meta.params, &TransferKey::PreparedParams.to_wire())?.0),
             None => None,
         };
         self.face = Some(InputFace {
@@ -651,7 +686,9 @@ impl TaskRunner {
                             "non-JSON reference in JSON composition".into(),
                         ));
                     }
-                    let bytes = self.take_transfer(&format!("in:{key}")).await?;
+                    let bytes = self
+                        .take_transfer(&TransferKey::NodeInput(key.clone()).to_wire())
+                        .await?;
                     composed.extend_from_slice(&bytes);
                 }
             }
@@ -674,7 +711,11 @@ impl TaskRunner {
         // 物化（Ref 已在装配阶段就位）。
         let mut budget = INPUT_BUDGET;
         let params_value = self
-            .materialize_stored(&prepared.params, "in:prepared-params", &mut budget)
+            .materialize_stored(
+                &prepared.params,
+                &TransferKey::PreparedParams.to_wire(),
+                &mut budget,
+            )
             .await?;
         let code = match kind {
             NodeType::Script => params_value["code"].as_str().unwrap_or("").to_owned(),
@@ -692,14 +733,22 @@ impl TaskRunner {
                 .min(30_000),
         );
         let input = self
-            .materialize_stored(&prepared.input, "in:run-input", &mut budget)
+            .materialize_stored(
+                &prepared.input,
+                &TransferKey::RunInput.to_wire(),
+                &mut budget,
+            )
             .await?;
         let mut nodes = serde_json::Map::new();
         for (node_id, value) in &prepared.predecessors {
             nodes.insert(
                 node_id.clone(),
-                self.materialize_stored(value, &format!("in:{node_id}"), &mut budget)
-                    .await?,
+                self.materialize_stored(
+                    value,
+                    &TransferKey::NodeInput(node_id.clone()).to_wire(),
+                    &mut budget,
+                )
+                .await?,
             );
         }
         let logger = logger.clone();
@@ -794,7 +843,11 @@ impl TaskRunner {
         }
         let mut budget = INPUT_BUDGET;
         let mut params = self
-            .materialize_stored(&prepared.params, "in:prepared-params", &mut budget)
+            .materialize_stored(
+                &prepared.params,
+                &TransferKey::PreparedParams.to_wire(),
+                &mut budget,
+            )
             .await?;
         if kind == NodeType::Email {
             let recipients = match &params["to"] {
@@ -953,8 +1006,10 @@ impl TaskRunner {
             StoredValue::Inline(_) => String::new(),
         };
         if !body_output_id.is_empty() {
-            self.transfers
-                .insert_ready(format!("op-body:{body_output_id}"), raw);
+            self.transfers.insert_ready(
+                TransferKey::OperationBody(body_output_id.clone()).to_wire(),
+                raw,
+            );
         }
         let outcome = StoredValue::inline(
             json!({"status": status, "headers": headers, "body_raw": body_ref}),
@@ -978,7 +1033,7 @@ impl TaskRunner {
         let fingerprint = flow_journal::codec::digest(&request_bytes);
         let operation_id = uuid::Uuid::now_v7().to_string();
         // v2：请求字节一律走 data 通道（再小也走），控制帧只带身份与指纹。
-        let transfer_id = format!("op:{operation_id}");
+        let transfer_id = TransferKey::OperationRequest(operation_id.clone()).to_wire();
         {
             let mut offset = 0u64;
             for chunk in request_bytes.chunks(flow_engine::execution_protocol::TRANSFER_CHUNK_BYTES)
@@ -1008,7 +1063,7 @@ impl TaskRunner {
         self.outbound
             .send(Message::RequestOperation {
                 dispatch_id: self.dispatch_id.clone(),
-                command_id: format!("op:{operation_id}"),
+                command_id: TransferKey::OperationRequest(operation_id.clone()).to_wire(),
                 operation_id: operation_id.clone(),
                 request_fingerprint: fingerprint.clone(),
                 transfer_id,
@@ -1079,7 +1134,11 @@ impl TaskRunner {
         }
         let mut budget = INPUT_BUDGET;
         let params = self
-            .materialize_stored(&prepared.params, "in:prepared-params", &mut budget)
+            .materialize_stored(
+                &prepared.params,
+                &TransferKey::PreparedParams.to_wire(),
+                &mut budget,
+            )
             .await?;
         let (command, args, workdir, timeout_ms, prompt) =
             flow_engine::exec::harness_request(&params)
@@ -1167,8 +1226,10 @@ impl TaskRunner {
             StoredValue::Inline(_) => String::new(),
         };
         if !body_output_id.is_empty() {
-            self.transfers
-                .insert_ready(format!("op-body:{body_output_id}"), output.stdout);
+            self.transfers.insert_ready(
+                TransferKey::OperationBody(body_output_id.clone()).to_wire(),
+                output.stdout,
+            );
         }
         // 字段名沿用 http 的 body_raw：恢复路径按这个名字重传原始字节
         let outcome = StoredValue::inline(json!({
@@ -1250,7 +1311,7 @@ impl TaskRunner {
                 ));
             }
             let bytes = self
-                .take_transfer(&format!("op-body:{}", raw.output_id))
+                .take_transfer(&TransferKey::OperationBody(raw.output_id.clone()).to_wire())
                 .await
                 .ok();
             // 恢复路径：body 不在本进程时需要主进程送回；v1 由
@@ -1264,25 +1325,31 @@ impl TaskRunner {
             return store_value(audit, &self.journal_id, &output, 8 * 1024 * 1024).await;
         }
         // HTTP 输出：body 为完整 JSON 时原样嵌入，否则转义为文本。
-        let mut prefix = flow_journal::codec::bounded_json(
-            &json!({"status": status, "headers": outcome_value["headers"]}),
-            flow_journal::INLINE_BYTES,
-        )?;
-        prefix.pop();
-        prefix.extend_from_slice(b",\"body\":");
+        // 结构字节（{ , : }）由 flow_journal::value::ObjectWriter 的
+        // serde_json Formatter 拥有，这里只提供完整值。
         let body = self.raw_bytes(&raw).await?;
         let valid_json = {
             let mut de = serde_json::Deserializer::from_slice(&body);
             serde::de::IgnoredAny::deserialize(&mut de).is_ok() && de.end().is_ok()
         };
-        let mut composed = prefix;
-        if valid_json {
-            composed.extend_from_slice(&body);
-        } else {
-            let text = serde_json::to_string(&String::from_utf8_lossy(&body).into_owned())?;
-            composed.extend_from_slice(text.as_bytes());
+        let mut composed = Vec::with_capacity(body.len() + 256);
+        {
+            let mut object = flow_journal::value::ObjectWriter::begin(&mut composed)?;
+            object.key("status")?;
+            object.value(&status)?;
+            object.key("headers")?;
+            object.value(&outcome_value["headers"])?;
+            object.key("body")?;
+            if valid_json {
+                object.raw_value_bytes(&body)?;
+            } else {
+                serde_json::to_writer(
+                    object.value_writer(),
+                    &String::from_utf8_lossy(&body).into_owned(),
+                )?;
+            }
+            object.finish()?;
         }
-        composed.push(b'}');
         let output = store_bytes(audit, &self.journal_id, &composed, ValueCodec::Json).await?;
         if status >= 400 {
             return Err(TaskError::Business(format!(
@@ -1297,8 +1364,8 @@ impl TaskRunner {
         reference: &flow_journal::ValueRef,
     ) -> Result<Vec<u8>, TaskError> {
         // 当前进程刚捕获的响应：从内存取；恢复路径由主进程随
-        // previous_outcome 重传（transfer id 约定 op-body:<output_id>）。
-        self.take_transfer(&format!("op-body:{}", reference.output_id))
+        // previous_outcome 重传（transfer id 约定见 TransferKey::OperationBody）。
+        self.take_transfer(&TransferKey::OperationBody(reference.output_id.clone()).to_wire())
             .await
     }
 }
@@ -1314,7 +1381,11 @@ async fn materialize_prepared_params(
 ) -> Result<Value, TaskError> {
     let mut budget = INPUT_BUDGET;
     runner
-        .materialize_stored(&prepared.params, "in:prepared-params", &mut budget)
+        .materialize_stored(
+            &prepared.params,
+            &TransferKey::PreparedParams.to_wire(),
+            &mut budget,
+        )
         .await
 }
 
@@ -1333,6 +1404,49 @@ async fn shrink_control_value(
         return Ok(value);
     }
     store_value_ref(audit, journal_id, inner, flow_journal::INLINE_BYTES).await
+}
+
+/// 排空观测尾批：在每个发 Result 控制帧的出口前调用。`logger` 必须是
+/// 最后一个克隆——drop 它关闭通道，转发任务才能 flush 完退出（顺序契约
+/// 见 [`ObservationClose`]）。
+async fn drain_observations(logger: flow_engine::NodeLogger, close: Option<ObservationClose>) {
+    drop(logger);
+    if let Some(close) = close {
+        close.close().await;
+    }
+}
+
+/// 节点类型的叙事名：观测日志的开始/终态行用它拼出人话。
+fn narrative_kind(kind: Option<NodeType>) -> Option<&'static str> {
+    match kind? {
+        NodeType::Script => Some("脚本"),
+        NodeType::Condition => Some("条件判断"),
+        NodeType::HttpCall => Some("HTTP 请求"),
+        NodeType::Email => Some("发送邮件"),
+        NodeType::Harness => Some("本地命令"),
+        NodeType::Delay => Some("延时等待"),
+        NodeType::HumanTask => Some("人工任务"),
+        NodeType::SubWorkflow => Some("子工作流"),
+        NodeType::Start | NodeType::End => None,
+    }
+}
+
+/// 重试尝试的归属后缀；第 1 次尝试不标（避免每次执行都带冗余括号）。
+fn attempt_label(attempt: u32) -> String {
+    if attempt > 1 {
+        format!("（第 {attempt} 次尝试）")
+    } else {
+        String::new()
+    }
+}
+
+fn elapsed_label(elapsed: Duration) -> String {
+    let ms = elapsed.as_millis();
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    }
 }
 
 #[allow(dead_code)]

@@ -21,13 +21,13 @@ use crate::journal_execution::Attempt;
 use flow_engine::execution_protocol::contract::{DURABLE_WAIT_TIMEOUT_MS, TRANSFER_CHUNK_BYTES};
 use flow_engine::execution_protocol::message::{Message, ResultOutcome};
 use flow_engine::execution_protocol::record_bytes;
+use flow_engine::execution_protocol::TransferKey;
 use flow_engine::journal_state::{Prepared, Run, Wait};
 use flow_engine::observation::ObservationStore;
 use flow_engine::{Node, NodeType};
 use flow_journal::value::ValueCodec;
 use flow_journal::{EventKind, StoredValue};
 
-#[cfg(unix)]
 use super::pool::ExecutorPool;
 use super::{FromSession, ToSession};
 
@@ -41,9 +41,8 @@ fn fj(s: impl Into<String>) -> flow_journal::Error {
 }
 
 /// IPC 派发器：journal_driver 调度循环的执行端口（替换进程内 execute）。
-/// 本地池是 unix-only（socketpair spawn）；驱动逻辑见 DispatchRunner（全平台，
-/// 远程 agent 链路复用）。
-#[cfg(unix)]
+/// 本地池全平台（unix socketpair / 其余 loopback 回连）；驱动逻辑见
+/// DispatchRunner（远程 agent 链路复用）。
 #[derive(Clone)]
 pub struct IpcDispatcher {
     pool: Arc<ExecutorPool>,
@@ -56,7 +55,6 @@ pub(crate) struct DispatchLink {
     pub events: mpsc::Receiver<FromSession>,
 }
 
-#[cfg(unix)]
 impl IpcDispatcher {
     pub fn new(pool: Arc<ExecutorPool>) -> Self {
         Self { pool }
@@ -119,6 +117,8 @@ pub(crate) struct DispatchRunner {
     pending_operation_request: Option<Message>,
     cancel_sent: bool,
     session_healthy: bool,
+    /// 本次派发的尝试序号（观测日志归属用；在 drive_link 读记录时对齐）。
+    task_attempt: u32,
 }
 
 impl DispatchRunner {
@@ -141,6 +141,7 @@ impl DispatchRunner {
             pending_operation_request: None,
             cancel_sent: false,
             session_healthy: true,
+            task_attempt: 1,
         }
     }
 
@@ -181,6 +182,7 @@ impl DispatchRunner {
         if record.dispatch_id != self.attempt.dispatch_id {
             return Err(invalid("stale dispatch"));
         }
+        self.task_attempt = record.attempt;
         let previous_outcome = record
             .operation
             .as_ref()
@@ -491,20 +493,42 @@ impl DispatchRunner {
                 Ok(None)
             }
             Message::ObservabilityBatch { dispatch_id, lines } => {
-                if let Some(store) = &self.observations {
-                    let logger = store.logger(
+                let Some(store) = &self.observations else {
+                    return Ok(None);
+                };
+                let batch_dispatch =
+                    dispatch_id.unwrap_or_else(|| self.attempt.dispatch_id.clone());
+                // 双通道（control/data）传输没有跨通道顺序：观测尾批可能晚于
+                // Result 到达，此时会话已被下一个派发复用。批自带的
+                // dispatch_id 是唯一可靠归属——错记到当前节点比丢弃更糟。
+                let (run_id, node_id, attempt) = if batch_dispatch == self.attempt.dispatch_id {
+                    (
                         self.attempt.run_id.clone(),
-                        dispatch_id.unwrap_or_else(|| self.attempt.dispatch_id.clone()),
-                    );
-                    for line in lines {
-                        logger.emit(flow_engine::nodelog::LogLine {
-                            node_id: self.attempt.node_id.clone(),
-                            attempt: 1,
-                            level: level_of(&line.level),
-                            stream: stream_of(&line.stream),
-                            message: line.message,
-                        });
+                        self.attempt.node_id.clone(),
+                        self.task_attempt,
+                    )
+                } else {
+                    match resolve_dispatch(&self.attempt.backend, &batch_dispatch).await {
+                        Some(found) => found,
+                        None => {
+                            tracing::warn!(
+                                stale = %batch_dispatch,
+                                count = lines.len(),
+                                "unresolvable observability batch dropped"
+                            );
+                            return Ok(None);
+                        }
                     }
+                };
+                let logger = store.logger(run_id, batch_dispatch);
+                for line in lines {
+                    logger.emit(flow_engine::nodelog::LogLine {
+                        node_id: node_id.clone(),
+                        attempt,
+                        level: level_of(&line.level),
+                        stream: stream_of(&line.stream),
+                        message: line.message,
+                    });
                 }
                 Ok(None)
             }
@@ -904,6 +928,11 @@ impl DispatchRunner {
         if dispatch_id != self.attempt.dispatch_id {
             return Err(invalid("operation request for foreign dispatch"));
         }
+        // 传输键与操作身份必须同源：执行器按 TransferKey::OperationRequest
+        // 构造两者，错位说明对端协议实现漂移——拒绝而不是猜。
+        if transfer_id != TransferKey::OperationRequest(operation_id.clone()).to_wire() {
+            return Err(invalid("operation transfer id does not match operation"));
+        }
         let request_bytes: Vec<u8> = {
             let entry = self
                 .op_transfers
@@ -1074,12 +1103,18 @@ async fn transfer_inputs(
     // 声明与 ExecuteTask.inputs 对齐：run 输入、每个前驱输出、已提交准备
     // 参数、恢复路径的历史 Outcome 体。
     let mut transfers: Vec<(String, std::result::Result<ByteSource, ()>)> = Vec::new();
-    transfers.push(("in:run-input".into(), byte_source(&input)));
+    transfers.push((TransferKey::RunInput.to_wire(), byte_source(&input)));
     for (node_id, value) in &predecessors {
-        transfers.push((format!("in:{node_id}"), byte_source(value)));
+        transfers.push((
+            TransferKey::NodeInput(node_id.clone()).to_wire(),
+            byte_source(value),
+        ));
     }
     if let Some(prepared) = &prepared {
-        transfers.push(("in:prepared-params".into(), byte_source(&prepared.params)));
+        transfers.push((
+            TransferKey::PreparedParams.to_wire(),
+            byte_source(&prepared.params),
+        ));
     }
     if let Some(outcome) = &previous_outcome {
         // previous_outcome 是 StoredValue 的序列化（{"type":..,"value":{..}}）。
@@ -1091,7 +1126,7 @@ async fn transfer_inputs(
             .and_then(|v| serde_json::from_value::<flow_journal::ValueRef>(v.clone()).ok())
         {
             transfers.push((
-                format!("op-body:{}", raw.output_id),
+                TransferKey::OperationBody(raw.output_id.clone()).to_wire(),
                 Ok(ByteSource::Journal(raw)),
             ));
         }
@@ -1198,6 +1233,30 @@ fn event_kind(kind: &str) -> Option<EventKind> {
         "operation_outcome" => EventKind::OperationOutcome,
         _ => return None,
     })
+}
+
+/// 反查派发归属 `(run_id, node_id, attempt)`。
+///
+/// 观测尾批晚于 Result 到达时（双通道无跨通道顺序），批里的 dispatch_id
+/// 是唯一可靠归属。当前派发命中的是节点的 `dispatch_id` 字段；更旧的
+/// （重试前的）只能命中 attempts 账本，历史尝试号无处可查，用节点当前
+/// 值——归属正确，号偏保守。
+async fn resolve_dispatch(
+    backend: &JournalBackend,
+    dispatch_id: &str,
+) -> Option<(String, String, u32)> {
+    backend
+        .inspect(|state| {
+            for (run_id, run) in &state.runs {
+                for (node_id, node) in &run.nodes {
+                    if node.dispatch_id == dispatch_id || node.attempts.contains_key(dispatch_id) {
+                        return Some((run_id.clone(), node_id.clone(), node.attempt));
+                    }
+                }
+            }
+            None
+        })
+        .await
 }
 
 fn level_of(level: &str) -> flow_engine::log_types::LogLevel {

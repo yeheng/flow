@@ -690,6 +690,23 @@ e2e_test!(
             .iter()
             .any(|log| log["line"]["stream"] == json!("stderr")
                 && log["line"]["level"] == json!("error")));
+        // 生命周期叙事：每个非 start/end 节点尝试都有开始行与终态行，
+        // 脚本不打 console 时用户也能看到节点在跑、何时结束
+        let n1_engine: Vec<&str> = logs
+            .iter()
+            .filter(|log| {
+                log["line"]["node_id"] == json!("n1") && log["line"]["stream"] == json!("engine")
+            })
+            .filter_map(|log| log["line"]["message"].as_str())
+            .collect();
+        assert!(
+            n1_engine.iter().any(|m| m.starts_with("开始执行：脚本")),
+            "缺少脚本开始行：{n1_engine:?}"
+        );
+        assert!(
+            n1_engine.iter().any(|m| m.starts_with("执行完成（")),
+            "缺少脚本完成行：{n1_engine:?}"
+        );
         let events: Value = call_json(&client, "run.events.view", json!({"run_id": run_id})).await;
         let events = events["events"].as_array().unwrap();
 

@@ -7,6 +7,7 @@ pub mod journal;
 #[cfg(feature = "journal-cluster")]
 pub mod journal_cluster;
 mod journal_commands;
+pub use journal_commands::ProductCommand;
 mod journal_driver;
 mod journal_execution;
 pub mod journal_import;
@@ -47,36 +48,19 @@ pub async fn start_execution(
         crate::journal::JournalError::Journal(flow_journal::Error::Invalid(message))
     };
     match execution.mode {
-        // T7：unix 上进程内执行路径已删除，本地执行只有 ipc；非 unix 保留
-        // in_process 作为 Windows 过渡态（B 方案）。两种情形都明确处理，
-        // 不静默改走别的模式。
-        #[cfg(unix)]
+        // 进程内执行路径已全平台删除（节点执行语义只在 flow-executor）；
+        // 配置期就明确拒绝，不静默改走别的模式。
         flow_config::ExecutionModeKind::InProcess => {
-            let _ = &execution;
             Err(invalid(execution::IN_PROCESS_REMOVED.into()))
         }
-        #[cfg(not(unix))]
-        flow_config::ExecutionModeKind::InProcess => backend.start_execution().await,
         flow_config::ExecutionModeKind::Ipc => {
-            // IPC 执行层是 unix-only（socketpair + pre_exec FD 槽位）；其余
-            // 平台明确拒绝，不静默落回进程内执行（与二进制缺失同规则）。
-            #[cfg(unix)]
-            {
-                let options = match execution::mode_from_config(execution) {
-                    Ok(execution::ExecutionMode::Ipc(options)) => options,
-                    Err(error) => return Err(invalid(format!("execution.mode=ipc: {error}"))),
-                };
-                backend
-                    .start_execution_ipc(execution::ExecutionMode::Ipc(options))
-                    .await
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = &execution;
-                Err(invalid(
-                    "execution.mode=ipc requires a unix platform (socketpair transport)".into(),
-                ))
-            }
+            let options = match execution::mode_from_config(execution) {
+                Ok(execution::ExecutionMode::Ipc(options)) => options,
+                Err(error) => return Err(invalid(format!("execution.mode=ipc: {error}"))),
+            };
+            backend
+                .start_execution_ipc(execution::ExecutionMode::Ipc(options))
+                .await
         }
         flow_config::ExecutionModeKind::Remote => {
             let options = execution::remote_options_from_config(execution).map_err(invalid)?;

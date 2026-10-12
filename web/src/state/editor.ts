@@ -11,6 +11,7 @@ import type {
   WorkflowSummary,
 } from "../types";
 import { commit, resetHistory } from "./history";
+import { deepCloneJson } from "./clone";
 import { layeredPositions } from "./layout";
 import { confirmDialog } from "./modal";
 import { toast } from "./toast";
@@ -435,10 +436,10 @@ export function addNode(type: string, position: { x: number; y: number }): boole
   let seq = 1;
   while (editor.nodes.some((n) => n.id === `${type}_${seq}`)) seq++;
   // 默认值在节点创建时从 schema 落进 params，与后端 default 语义一致。
-  // default 可能是 reactive Proxy（structuredClone 无法克隆），它来自 JSON-RPC，用 JSON 往返脱壳
+  // default 可能是 reactive Proxy——deepCloneJson 内部先 toRaw 剥壳再克隆。
   const params: Record<string, unknown> = {};
   for (const [key, prop] of Object.entries(desc.params_schema.properties ?? {})) {
-    if (prop.default !== undefined) params[key] = JSON.parse(JSON.stringify(prop.default));
+    if (prop.default !== undefined) params[key] = deepCloneJson(prop.default);
   }
   commit();
   for (const node of editor.nodes) node.selected = false;
@@ -647,7 +648,7 @@ function selectionFragment(): { nodes: ClipboardNode[]; edges: ClipboardEdge[] }
       id: n.id,
       type: n.data.nodeType.type,
       name: n.data.name,
-      params: JSON.parse(JSON.stringify(n.data.params ?? {})),
+      params: deepCloneJson(n.data.params ?? {}),
       position: { x: n.position.x, y: n.position.y },
     })),
     edges: editor.edges
@@ -723,7 +724,7 @@ export function insertFragment(
       id,
       type: "flow",
       position: { x: cn.position.x + offset.x, y: cn.position.y + offset.y },
-      data: { name: cn.name, nodeType: desc, params: JSON.parse(JSON.stringify(cn.params)) },
+      data: { name: cn.name, nodeType: desc, params: deepCloneJson(cn.params) },
       selected,
     });
   }

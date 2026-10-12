@@ -1,5 +1,6 @@
 import { reactive } from "vue";
 import { editor, type EditorEdge, type EditorNode } from "./editor";
+import { deepCloneJson } from "./clone";
 
 /**
  * 编辑器撤销/重做：快照式历史栈。
@@ -32,8 +33,7 @@ function cloneNode(n: EditorNode): EditorNode {
     data: {
       name: n.data.name,
       nodeType: n.data.nodeType,
-      // params 可能带 reactive Proxy，JSON 往返脱壳
-      params: JSON.parse(JSON.stringify(n.data.params ?? {})),
+      params: deepCloneJson(n.data.params ?? {}),
     },
   };
 }

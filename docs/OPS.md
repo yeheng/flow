@@ -117,9 +117,9 @@ flow-journal-server --config /etc/flow/flow.toml
 
 | 执行模式 | 需启动的进程 | 说明 |
 | --- | --- | --- |
-| `ipc`（unix 缺省，终态） | `flow-journal-server`（同目录备好 `flow-executor`） | `flow-executor` 由主进程按需召唤 |
+| `ipc`（全平台缺省） | `flow-journal-server`（同目录备好 `flow-executor`） | `flow-executor` 由主进程按需召唤（unix socketpair / 其余平台 loopback 回连） |
 | `remote` | `flow-journal-server` + 每台执行机 `flow-agent` | 执行机上也需 `flow-executor` |
-| `in_process`（仅非 unix） | 只 `flow-journal-server` | 无子进程，节点在服务进程内执行；Windows 过渡态，**unix 上配置即报错**（T7 已删除该路径） |
+| `in_process`（已删除） | — | 全平台配置即报错；节点执行语义只在 `flow-executor`（历史模式，T7 删 unix 路径，loopback 传输落地后删 Windows 过渡态） |
 
 单机 `ipc` 的完整形态（生产常用，隔离节点执行但不必跨机）：
 
@@ -163,21 +163,30 @@ scripts/build-journal.sh    # → dist/journal/（唯一打包入口）
 
 同一数据集单写者；一个 run 只绑定一种执行模式；`master_epoch` 随执行启动持久提交。
 模式缺失资源（ipc 无执行器、remote 缺 `[execution.remote]`）**直接失败，不静默
-回退进程内**——「进程隔离/远程执行」的部署承诺不能被空气化。T7 起 unix 上已
-**删除进程内执行路径**：`mode = "in_process"` 在配置期（`flow-config` validate）与
-装配期（`flow-backend::start_execution`）双重拒绝，本地执行只有 `ipc`。
+回退**——「进程隔离/远程执行」的部署承诺不能被空气化。进程内执行路径已
+**全平台删除**（T7 删 unix 路径，loopback 传输落地后删 Windows 过渡态）：
+`mode = "in_process"` 在配置期（`flow-config` validate）与装配期
+（`flow-backend::start_execution`）双重拒绝，本地执行只有 `ipc`。
 
-### 2.1 in_process（仅 Windows 过渡态）
+### 2.1 in_process（已删除）
 
-节点在服务进程内执行。`[execution] mode = "in_process"`，**只在非 unix 平台合法**
-（Windows B 方案，等命名管道 transport 的 A 方案）。unix 上配置该模式会明确报错：
-`execution.mode=in_process 已删除：unix 上本地执行只有 ipc（T7）`。Windows 桌面端
-在无配置文件时默认 `x_max = 8`。
+历史模式（节点在服务进程内执行）。T7 先删 unix 路径，Windows 过渡态在
+TCP loopback 回连传输落地后一并删除。任何平台配置该模式都会明确报错：
+`execution.mode=in_process 已删除：本地执行只有 ipc`。存量配置把
+`mode = "in_process"` 改为 `"ipc"` 即可（需在主进程同目录备好
+`flow-executor`，见 §2.2）。
 
-### 2.2 ipc（unix 缺省 / 本机执行子进程）
+### 2.2 ipc（全平台缺省 / 本机执行子进程）
 
 模板 / script / condition / HTTP 全部在 `flow-executor` 子进程内执行；journal 语义
-与进程内模式逐字节同构。
+不变，master 只做裁决与调度。桌面端在无配置文件时默认 `x_max = 8`。
+
+物理承载按平台自动选择，部署形态与运维面完全一致：unix 用 socketpair +
+`pre_exec` FD 槽位；Windows 及其余平台用 **TCP loopback 回连**——主进程
+bind `127.0.0.1` 临时端口，执行器按 `FLOW_EXECUTOR_CONNECT_ADDR` 回连出
+control/data 双通道（`flow_engine::execution_protocol::loopback`）。回连端口
+只在本机可见，与单用户本机工具的信任域一致；执行器 spawn 仍走
+`env_clear`（仅回填 `RUST_LOG` 与回连地址）。
 
 ```toml
 [execution]

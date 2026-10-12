@@ -238,13 +238,37 @@ e2e_test!(
                 "订阅流 seq 严格递增：{streamed:?}"
             );
         }
-        let observations =
-            call_json(&client, "run.observations.page", json!({"run_id": run_id})).await;
-        let logs = observations["records"].as_array().unwrap();
-        assert_eq!(logs.len(), 5, "全部 console 日志可读取：{observations}");
-        for (index, log) in logs.iter().enumerate() {
-            assert_eq!(log["line"]["message"], json!(format!("line {index}")));
-        }
+        // engine 叙事行（开始执行/执行完成）与 console 输出同流异源，
+        // 只对 stdout 段断言数量与顺序。观测面异步落盘（pump 线程），
+        // 轮询到收敛而不是立即断言。
+        let console = {
+            let deadline = std::time::Instant::now() + TIMEOUT;
+            loop {
+                let observations =
+                    call_json(&client, "run.observations.page", json!({"run_id": run_id})).await;
+                let logs = observations["records"].as_array().unwrap();
+                let console: Vec<String> = logs
+                    .iter()
+                    .filter(|log| log["line"]["stream"] == json!("stdout"))
+                    .filter_map(|log| log["line"]["message"].as_str().map(str::to_owned))
+                    .collect();
+                if console.len() == 5
+                    && console
+                        .iter()
+                        .enumerate()
+                        .all(|(index, message)| message == &format!("line {index}"))
+                {
+                    break console;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "console 日志未收敛到 5 条有序记录：{observations}"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        assert_eq!(console.len(), 5);
+        assert_eq!(console[4], "line 4");
         assert_eq!(
             streamed.last().unwrap()["event"]["kind"],
             json!("run_completed")

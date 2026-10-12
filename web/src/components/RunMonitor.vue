@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, reactive, ref } from "vue";
+import { computed, reactive, ref, watch } from "vue";
+import { useRouter } from "vue-router";
 import {
   backToParentRun,
   cancelRun,
@@ -13,6 +14,7 @@ import { editor } from "../state/editor";
 import { nodeStateLabel, runStatusLabel } from "../state/labels";
 import { confirmDialog } from "../state/modal";
 import { toast } from "../state/toast";
+import ActivityFeed from "./ActivityFeed.vue";
 import LogConsole from "./LogConsole.vue";
 import AppButton from "./AppButton.vue";
 
@@ -21,7 +23,17 @@ const props = withDefaults(
   { childRunNavigate: false, layout: "sidebar" },
 );
 
-const activeTab = ref<"timeline" | "logs">("timeline");
+const router = useRouter();
+
+/** 「活动」是默认叙事视图；时间线表格与原始日志是开发者界面 */
+const activeTab = ref<"activity" | "timeline" | "logs">("activity");
+
+const DEV_MODE_KEY = "flow.run.devMode";
+const devMode = ref(localStorage.getItem(DEV_MODE_KEY) === "1");
+watch(devMode, (on) => {
+  if (!on && activeTab.value !== "activity") activeTab.value = "activity";
+  localStorage.setItem(DEV_MODE_KEY, on ? "1" : "0");
+});
 
 /** run 状态文案：单一来源 monitor.status，配色与文案同源 */
 const runStateText = computed(() => (monitor.status ? runStatusLabel(monitor.status) : ""));
@@ -79,6 +91,12 @@ function onRowLeave(): void {
 /** 点击行选中画布节点：仅在画布仍展示该 run 所属工作流时有效 */
 function onRowClick(nodeId: string): void {
   if (monitor.workflowId === editor.workflowId) editor.selectedNodeId = nodeId;
+}
+
+/** 活动流的子 run 钻取：详情页路由跳转，编辑器面板内嵌切换 */
+function onOpenChildRun(childRunId: string): void {
+  if (props.childRunNavigate) router.push(`/runs/${childRunId}`);
+  else void openChildRun(childRunId);
 }
 </script>
 
@@ -140,20 +158,40 @@ function onRowClick(nodeId: string): void {
       <div class="run-tabs">
         <button
           class="run-tab"
-          :class="{ active: activeTab === 'timeline' }"
-          @click="activeTab = 'timeline'"
+          :class="{ active: activeTab === 'activity' }"
+          @click="activeTab = 'activity'"
         >
-          时间线
+          活动
         </button>
-        <button
-          class="run-tab"
-          :class="{ active: activeTab === 'logs' }"
-          @click="activeTab = 'logs'"
-        >
-          日志（{{ monitor.logs.length }}）
-        </button>
+        <template v-if="devMode">
+          <button
+            class="run-tab"
+            :class="{ active: activeTab === 'timeline' }"
+            @click="activeTab = 'timeline'"
+          >
+            时间线
+          </button>
+          <button
+            class="run-tab"
+            :class="{ active: activeTab === 'logs' }"
+            @click="activeTab = 'logs'"
+          >
+            日志（{{ monitor.logs.length }}）
+          </button>
+        </template>
+        <label class="dev-toggle" title="显示时间线表格与原始日志控制台">
+          <input v-model="devMode" type="checkbox" />
+          开发者
+        </label>
       </div>
-      <div v-if="activeTab === 'timeline'" class="timeline-wrap">
+      <ActivityFeed
+        v-if="activeTab === 'activity'"
+        class="monitor-activity"
+        @select-node="onRowClick"
+        @hover-node="(id) => (id === null ? onRowLeave() : onRowEnter(id))"
+        @open-child="onOpenChildRun"
+      />
+      <div v-else-if="activeTab === 'timeline'" class="timeline-wrap">
         <table class="timeline">
           <thead>
             <tr>
@@ -289,6 +327,21 @@ function onRowClick(nodeId: string): void {
 .run-tab.active {
   color: var(--text);
   border-bottom-color: var(--run);
+}
+
+.dev-toggle {
+  margin-left: auto;
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  font-size: 11px;
+  color: var(--text3);
+  cursor: pointer;
+  user-select: none;
+}
+
+.monitor-activity {
+  min-height: 140px;
 }
 
 .monitor-log-console {

@@ -149,12 +149,9 @@ pub struct ExecutionConfig {
 impl Default for ExecutionConfig {
     fn default() -> Self {
         ExecutionConfig {
-            // T6：unix 上默认 ipc（socketpair 执行层终态）；非 unix 保持
-            // in_process（Windows 过渡态，命名管道 transport 另行交付）。
-            #[cfg(unix)]
+            // 默认 ipc（全平台）：unix 走 socketpair，其余走 loopback 回连；
+            // in_process 已全平台删除（配置期即拒绝）。
             mode: ExecutionModeKind::Ipc,
-            #[cfg(not(unix))]
-            mode: ExecutionModeKind::InProcess,
             executor_bin: None,
             x_max: 4,
             remote: None,
@@ -389,12 +386,10 @@ impl Config {
         if !(1..=16).contains(&self.execution.x_max) {
             return Err("execution.x_max 必须在 1..=16".into());
         }
-        // T7：unix 上进程内执行路径已删除（本地执行只有 ipc），配置期就明确
-        // 拒绝——比等到执行装配时才报错更早、更贴近用户输入。非 unix 保留
-        // in_process 作为 Windows 过渡态。
-        #[cfg(unix)]
+        // 进程内执行路径已全平台删除（节点执行语义只在 flow-executor），
+        // 配置期就明确拒绝——比等到执行装配时才报错更早、更贴近用户输入。
         if self.execution.mode == ExecutionModeKind::InProcess {
-            return Err("execution.mode=in_process 已删除：unix 上本地执行只有 ipc（T7）".into());
+            return Err("execution.mode=in_process 已删除：本地执行只有 ipc".into());
         }
         if self.execution.mode == ExecutionModeKind::Remote && self.execution.remote.is_none() {
             return Err("execution.mode=remote 时必须配置 [execution.remote]".into());
@@ -720,11 +715,8 @@ mod tests {
         config.validate().expect("默认值必须合法");
         assert_eq!(config.storage.backend, StorageBackend::Journal);
         assert_eq!(config.storage.data_dir, "data");
-        // T6：unix 默认 ipc（执行层终态）；非 unix 过渡态保持 in_process。
-        #[cfg(unix)]
+        // 默认 ipc（全平台；进程内执行已删除）。
         assert_eq!(config.execution.mode, ExecutionModeKind::Ipc);
-        #[cfg(not(unix))]
-        assert_eq!(config.execution.mode, ExecutionModeKind::InProcess);
         assert_eq!(config.execution.x_max, 4);
         assert!(config.server.scheduler_enabled);
         assert_eq!(config.server.journal_trigger_tick_secs, 20);

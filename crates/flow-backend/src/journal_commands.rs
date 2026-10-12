@@ -27,145 +27,176 @@ async fn deduped(
 ) -> Result<Option<CommandReceipt>> {
     backend.deduped_command(scope, request_id, request).await
 }
+/// 产品面 CRUD 的强类型载荷：在 RPC 边缘经 [`ProductCommand::parse`] 一次
+/// 解析，内部只传枚举。`input`/`nodes` 等纯透传的用户数据保留 `Value`；
+/// 事件载荷与命令指纹的 wire 形状不变（协议冻结，只改 Rust 内部表示）。
+#[derive(Debug, Clone)]
+pub enum ProductCommand {
+    ScheduleCreate {
+        key: String,
+        workflow_id: String,
+        cron: String,
+        enabled: Option<bool>,
+        input: Value,
+    },
+    ScheduleUpdate {
+        id: String,
+        /// 原样透传：非法形状由 trigger_decision 在锁内裁决（语义保持）。
+        cron: Option<Value>,
+        input: Option<Value>,
+        enabled: Option<Value>,
+    },
+    ScheduleDelete {
+        id: String,
+    },
+    WebhookCreate {
+        key: String,
+        workflow_id: String,
+    },
+    WebhookSetEnabled {
+        token: String,
+        enabled: bool,
+    },
+    WebhookDelete {
+        token: String,
+    },
+    TemplateUpsert {
+        /// true = create（key 在解析时生成）；false = update（key 来自请求）。
+        creating: bool,
+        id: String,
+        name: Option<Value>,
+        category: Option<Value>,
+        nodes: Option<Value>,
+        edges: Option<Value>,
+    },
+    TemplateDelete {
+        id: String,
+    },
+}
+
+impl ProductCommand {
+    /// RPC 边缘解析。错误文本是 wire 契约的一部分，与旧字段级获取器逐字相同。
+    pub fn parse(method: &str, p: &Value) -> flow_journal::Result<Self> {
+        let field = |key: &str| {
+            p[key]
+                .as_str()
+                .ok_or_else(|| invalid(format!("missing string {key}")))
+        };
+        Ok(match method {
+            "schedule.create" => Self::ScheduleCreate {
+                key: id(),
+                workflow_id: field("workflow_id")?.to_owned(),
+                cron: field("cron")?.to_owned(),
+                enabled: p["enabled"].as_bool(),
+                input: p["input"].clone(),
+            },
+            "schedule.update" => Self::ScheduleUpdate {
+                id: field("id")?.to_owned(),
+                cron: p.get("cron").cloned(),
+                input: p.get("input").cloned(),
+                enabled: p.get("enabled").cloned(),
+            },
+            "schedule.delete" => Self::ScheduleDelete {
+                id: field("id")?.to_owned(),
+            },
+            "webhook.create" => Self::WebhookCreate {
+                key: uuid::Uuid::now_v7().simple().to_string(),
+                workflow_id: field("workflow_id")?.to_owned(),
+            },
+            "webhook.set_enabled" => Self::WebhookSetEnabled {
+                token: field("token")?.to_owned(),
+                enabled: p["enabled"]
+                    .as_bool()
+                    .ok_or_else(|| invalid("enabled flag required"))?,
+            },
+            "webhook.delete" => Self::WebhookDelete {
+                token: field("token")?.to_owned(),
+            },
+            "template.create" | "template.update" => Self::TemplateUpsert {
+                creating: method == "template.create",
+                id: if method == "template.create" {
+                    id()
+                } else {
+                    field("id")?.to_owned()
+                },
+                name: p.get("name").cloned(),
+                category: p.get("category").cloned(),
+                nodes: p.get("nodes").cloned(),
+                edges: p.get("edges").cloned(),
+            },
+            "template.delete" => Self::TemplateDelete {
+                id: field("id")?.to_owned(),
+            },
+            _ => return Err(invalid("invalid product command")),
+        })
+    }
+
+    /// 命令 scope（幂等键的一部分）= 方法名，与 wire 方法名一致。
+    pub fn method(&self) -> &'static str {
+        match self {
+            Self::ScheduleCreate { .. } => "schedule.create",
+            Self::ScheduleUpdate { .. } => "schedule.update",
+            Self::ScheduleDelete { .. } => "schedule.delete",
+            Self::WebhookCreate { .. } => "webhook.create",
+            Self::WebhookSetEnabled { .. } => "webhook.set_enabled",
+            Self::WebhookDelete { .. } => "webhook.delete",
+            Self::TemplateUpsert { creating: true, .. } => "template.create",
+            Self::TemplateUpsert { creating: false, .. } => "template.update",
+            Self::TemplateDelete { .. } => "template.delete",
+        }
+    }
+    fn namespace(&self) -> &'static str {
+        match self {
+            Self::ScheduleCreate { .. }
+            | Self::ScheduleUpdate { .. }
+            | Self::ScheduleDelete { .. } => "schedule",
+            Self::WebhookCreate { .. }
+            | Self::WebhookSetEnabled { .. }
+            | Self::WebhookDelete { .. } => "webhook",
+            Self::TemplateUpsert { .. } | Self::TemplateDelete { .. } => "template",
+        }
+    }
+    fn creating(&self) -> bool {
+        matches!(
+            self,
+            Self::ScheduleCreate { .. }
+                | Self::WebhookCreate { .. }
+                | Self::TemplateUpsert { creating: true, .. }
+        )
+    }
+    fn deleting(&self) -> bool {
+        matches!(
+            self,
+            Self::ScheduleDelete { .. } | Self::WebhookDelete { .. } | Self::TemplateDelete { .. }
+        )
+    }
+    fn key(&self) -> &str {
+        match self {
+            Self::ScheduleCreate { key, .. }
+            | Self::WebhookCreate { key, .. } => key,
+            Self::ScheduleUpdate { id, .. }
+            | Self::TemplateUpsert { id, .. }
+            | Self::ScheduleDelete { id }
+            | Self::TemplateDelete { id } => id,
+            Self::WebhookSetEnabled { token, .. } | Self::WebhookDelete { token } => token,
+        }
+    }
+}
+
 impl JournalBackend {
-    /// Product CRUD uses the caller's identity and arguments for the durable command.
-    /// IDs, timestamps, existence checks and the mutation are decided under the same lock.
+    /// Product CRUD uses the caller's identity and arguments for the durable
+    /// command. IDs, timestamps, existence checks and the mutation are decided
+    /// under the same lock. `fingerprint` keeps the raw wire params (minus
+    /// request_id) for command dedup — the typed enum is the parsed view.
     pub async fn product_command(
         &self,
-        method: &str,
-        params: &Value,
+        command: ProductCommand,
+        fingerprint: &Value,
         request_id: &str,
     ) -> Result<CommandReceipt> {
-        self.command(method, Some(request_id), params, |state| {
-            let field = |key: &str| {
-                params[key]
-                    .as_str()
-                    .ok_or_else(|| invalid(format!("missing string {key}")))
-            };
-            let (namespace, action) = method
-                .split_once('.')
-                .ok_or_else(|| invalid("invalid product command"))?;
-            let creating = action == "create";
-            let deleting = action == "delete";
-            let key = if creating {
-                if namespace == "webhook" {
-                    uuid::Uuid::now_v7().simple().to_string()
-                } else {
-                    id()
-                }
-            } else {
-                field(if namespace == "webhook" {
-                    "token"
-                } else {
-                    "id"
-                })?
-                .to_owned()
-            };
-            if key.is_empty() || key.len() > 128 {
-                return Err(invalid("invalid entity key"));
-            }
-            let map = match namespace {
-                "schedule" => &state.schedules,
-                "webhook" => &state.webhooks,
-                "template" => &state.templates,
-                _ => return Err(invalid("invalid product command")),
-            };
-            if !creating && !map.contains_key(&key) {
-                if namespace == "template" && deleting {
-                    return Ok((vec![], json!({"deleted":false})));
-                }
-                return Err(invalid(format!("{namespace} not found")));
-            }
-            let mut patch = serde_json::Map::new();
-            if deleting {
-                patch.insert("deleted".into(), json!(true));
-            } else {
-                match (namespace, action) {
-                    ("schedule", "create" | "update") => {
-                        if creating {
-                            patch.insert("workflow_id".into(), json!(field("workflow_id")?));
-                            patch.insert(
-                                "enabled".into(),
-                                json!(params["enabled"].as_bool().unwrap_or(true)),
-                            );
-                            patch.insert("input".into(), params["input"].clone());
-                            patch.insert("cron_expr".into(), json!(field("cron")?));
-                        } else {
-                            for (source, target) in [
-                                ("cron", "cron_expr"),
-                                ("input", "input"),
-                                ("enabled", "enabled"),
-                            ] {
-                                if let Some(value) = params.get(source) {
-                                    patch.insert(target.into(), value.clone());
-                                }
-                            }
-                        }
-                    }
-                    ("webhook", "create") => {
-                        patch.insert("workflow_id".into(), json!(field("workflow_id")?));
-                        patch.insert("enabled".into(), json!(true));
-                    }
-                    ("webhook", "set_enabled") => {
-                        patch.insert(
-                            "enabled".into(),
-                            params
-                                .get("enabled")
-                                .filter(|v| v.is_boolean())
-                                .cloned()
-                                .ok_or_else(|| invalid("enabled flag required"))?,
-                        );
-                    }
-                    ("template", "create" | "update") => {
-                        for key in ["name", "category", "nodes", "edges"] {
-                            if let Some(value) = params.get(key) {
-                                patch.insert(key.into(), value.clone());
-                            }
-                        }
-                        if creating {
-                            patch.entry("category").or_insert(Value::Null);
-                        }
-                    }
-                    _ => return Err(invalid("invalid product command")),
-                }
-            }
-            let (events, mut value) = if namespace == "template" {
-                template_decision(state, &key, &Value::Object(patch))?
-            } else {
-                trigger_decision(
-                    state,
-                    if namespace == "schedule" {
-                        EventKind::ScheduleChanged
-                    } else {
-                        EventKind::WebhookChanged
-                    },
-                    &key,
-                    &Value::Object(patch),
-                )?
-            };
-            let result = if deleting {
-                json!({"deleted":true})
-            } else if namespace == "webhook" && !creating {
-                json!({"updated":true})
-            } else if namespace == "schedule" {
-                let next = value["cron_expr"]
-                    .as_str()
-                    .and_then(|expr| expr.parse::<cron_parser::Schedule>().ok())
-                    .and_then(|cron| cron.next_after(&chrono::Local::now()))
-                    .map(|t| t.to_rfc3339());
-                value["next_fire_at"] = json!(next);
-                if creating {
-                    value.as_object_mut().unwrap().remove("input");
-                    value
-                } else {
-                    json!({"updated":true})
-                }
-            } else {
-                value.as_object_mut().unwrap().remove("nodes");
-                value.as_object_mut().unwrap().remove("edges");
-                value
-            };
-            Ok((events, result))
+        let method = command.method();
+        self.command(method, Some(request_id), fingerprint, |state| {
+            product_decision(state, &command)
         })
         .await
     }
@@ -730,6 +761,135 @@ pub(crate) fn node_event(
         event.run_seq = run.last_run_seq + 1;
     }
     event
+}
+
+/// 锁内的产品命令决策：存在性检查、patch 组装与存储文档裁决都在同一把
+/// 锁下完成。patch 字段是持久化文档的一部分，保持既有 JSON 形状。
+fn product_decision(
+    state: &State,
+    command: &ProductCommand,
+) -> flow_journal::Result<(Vec<Event>, Value)> {
+    let namespace = command.namespace();
+    let creating = command.creating();
+    let deleting = command.deleting();
+    let key = command.key();
+    if key.is_empty() || key.len() > 128 {
+        return Err(invalid("invalid entity key"));
+    }
+    let map = match namespace {
+        "schedule" => &state.schedules,
+        "webhook" => &state.webhooks,
+        "template" => &state.templates,
+        _ => return Err(invalid("invalid product command")),
+    };
+    if !creating && !map.contains_key(key) {
+        if namespace == "template" && deleting {
+            return Ok((vec![], json!({"deleted": false})));
+        }
+        return Err(invalid(format!("{namespace} not found")));
+    }
+    let mut patch = serde_json::Map::new();
+    if deleting {
+        patch.insert("deleted".into(), json!(true));
+    } else {
+        match command {
+            ProductCommand::ScheduleCreate {
+                workflow_id,
+                enabled,
+                input,
+                cron,
+                ..
+            } => {
+                patch.insert("workflow_id".into(), json!(workflow_id));
+                patch.insert("enabled".into(), json!(enabled.unwrap_or(true)));
+                patch.insert("input".into(), input.clone());
+                patch.insert("cron_expr".into(), json!(cron));
+            }
+            ProductCommand::ScheduleUpdate {
+                cron,
+                input,
+                enabled,
+                ..
+            } => {
+                if let Some(value) = cron {
+                    patch.insert("cron_expr".into(), value.clone());
+                }
+                if let Some(value) = input {
+                    patch.insert("input".into(), value.clone());
+                }
+                if let Some(value) = enabled {
+                    patch.insert("enabled".into(), value.clone());
+                }
+            }
+            ProductCommand::WebhookCreate { workflow_id, .. } => {
+                patch.insert("workflow_id".into(), json!(workflow_id));
+                patch.insert("enabled".into(), json!(true));
+            }
+            ProductCommand::WebhookSetEnabled { enabled, .. } => {
+                patch.insert("enabled".into(), json!(enabled));
+            }
+            ProductCommand::TemplateUpsert {
+                name,
+                category,
+                nodes,
+                edges,
+                creating,
+                ..
+            } => {
+                for (key, value) in [
+                    ("name", name),
+                    ("category", category),
+                    ("nodes", nodes),
+                    ("edges", edges),
+                ] {
+                    if let Some(value) = value {
+                        patch.insert(key.into(), value.clone());
+                    }
+                }
+                if *creating {
+                    patch.entry("category").or_insert(Value::Null);
+                }
+            }
+            _ => return Err(invalid("invalid product command")),
+        }
+    }
+    let (events, mut value) = if namespace == "template" {
+        template_decision(state, key, &Value::Object(patch))?
+    } else {
+        trigger_decision(
+            state,
+            if namespace == "schedule" {
+                EventKind::ScheduleChanged
+            } else {
+                EventKind::WebhookChanged
+            },
+            key,
+            &Value::Object(patch),
+        )?
+    };
+    let result = if deleting {
+        json!({"deleted": true})
+    } else if namespace == "webhook" && !creating {
+        json!({"updated": true})
+    } else if namespace == "schedule" {
+        let next = value["cron_expr"]
+            .as_str()
+            .and_then(|expr| expr.parse::<cron_parser::Schedule>().ok())
+            .and_then(|cron| cron.next_after(&chrono::Local::now()))
+            .map(|t| t.to_rfc3339());
+        value["next_fire_at"] = json!(next);
+        if creating {
+            value.as_object_mut().unwrap().remove("input");
+            value
+        } else {
+            json!({"updated": true})
+        }
+    } else {
+        value.as_object_mut().unwrap().remove("nodes");
+        value.as_object_mut().unwrap().remove("edges");
+        value
+    };
+    Ok((events, result))
 }
 
 fn trigger_decision(

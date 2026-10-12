@@ -66,6 +66,48 @@ export function nodeStateLabel(state: string): string {
   }
 }
 
+/** 节点类型中文名（与服务端 nodetypes descriptor 的 label 对齐；未知类型原样） */
+export function nodeTypeLabel(type: string): string {
+  switch (type) {
+    case "start":
+      return "开始";
+    case "end":
+      return "结束";
+    case "script":
+      return "脚本";
+    case "condition":
+      return "条件分支";
+    case "delay":
+      return "等待";
+    case "http_call":
+      return "HTTP 请求";
+    case "email":
+      return "邮件";
+    case "harness":
+      return "Harness 代理";
+    case "human_task":
+      return "人工节点";
+    case "sub_workflow":
+      return "子工作流";
+    default:
+      return type;
+  }
+}
+
+/** 节点被跳过的原因（NodeSkipped 的 reason）→ 人话 */
+export function skipReasonLabel(reason: string): string {
+  switch (reason) {
+    case "upstream_failed":
+      return "上游节点失败，本步未执行";
+    case "upstream_skipped":
+      return "上游节点被跳过，本步未执行";
+    case "branch_not_taken":
+      return "条件分支未选中，本步未执行";
+    default:
+      return reason;
+  }
+}
+
 /** run.source 的中文展示映射（词汇表：flow-dto RunSource）；未知值原样显示 */
 export function sourceLabel(source: string): string {
   switch (source) {
