@@ -27,7 +27,9 @@ use flow_engine::{Node, NodeType};
 use flow_journal::value::ValueCodec;
 use flow_journal::{EventKind, StoredValue};
 
-use super::pool::{ExecutorPool, FromSession, ToSession};
+#[cfg(unix)]
+use super::pool::ExecutorPool;
+use super::{FromSession, ToSession};
 
 type Result<T> = std::result::Result<T, crate::journal::JournalError>;
 fn invalid(s: impl Into<String>) -> crate::journal::JournalError {
@@ -39,6 +41,9 @@ fn fj(s: impl Into<String>) -> flow_journal::Error {
 }
 
 /// IPC 派发器：journal_driver 调度循环的执行端口（替换进程内 execute）。
+/// 本地池是 unix-only（socketpair spawn）；驱动逻辑见 DispatchRunner（全平台，
+/// 远程 agent 链路复用）。
+#[cfg(unix)]
 #[derive(Clone)]
 pub struct IpcDispatcher {
     pool: Arc<ExecutorPool>,
@@ -51,6 +56,7 @@ pub(crate) struct DispatchLink {
     pub events: mpsc::Receiver<FromSession>,
 }
 
+#[cfg(unix)]
 impl IpcDispatcher {
     pub fn new(pool: Arc<ExecutorPool>) -> Self {
         Self { pool }

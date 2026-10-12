@@ -25,7 +25,7 @@ use flow_engine::execution_protocol::remote::{
 use flow_engine::execution_protocol::transport::FrameTransport;
 
 use crate::execution::dispatch::DispatchLink;
-use crate::execution::pool::ToSession;
+use crate::execution::ToSession;
 use crate::journal::JournalBackend;
 
 type Result<T> = std::result::Result<T, flow_journal::Error>;
@@ -155,7 +155,7 @@ pub(crate) enum AttachOutcome {
 // 会话侧持有的路由（dispatch → 事件通道）。
 struct SessionRouting {
     envelope: RouteEnvelope,
-    events: mpsc::Sender<crate::execution::pool::FromSession>,
+    events: mpsc::Sender<crate::execution::FromSession>,
 }
 
 // 跨会话存活的派发绑定。
@@ -218,7 +218,7 @@ struct PendingBind {
     agent_id: String,
     link_session_id: String,
     executor_id: String,
-    events: mpsc::Sender<crate::execution::pool::FromSession>,
+    events: mpsc::Sender<crate::execution::FromSession>,
     ack: oneshot::Sender<Result<String>>,
 }
 
@@ -612,7 +612,7 @@ impl AgentManager {
                                 }
                                 let _ = routing
                                     .events
-                                    .send(crate::execution::pool::FromSession::Incoming(inner))
+                                    .send(crate::execution::FromSession::Incoming(inner))
                                     .await;
                             }
                             Message::BindExecutorAck {
@@ -935,7 +935,7 @@ impl AgentManager {
         dispatch_id: String,
         run_id: String,
         node_id: String,
-    ) -> Result<mpsc::Receiver<crate::execution::pool::FromSession>> {
+    ) -> Result<mpsc::Receiver<crate::execution::FromSession>> {
         let registration = loop {
             let changed = self.capacity_changed.notified();
             tokio::pin!(changed);

@@ -50,13 +50,12 @@ export class RpcClient {
       if (enriched["request_id"] === undefined) enriched["request_id"] = crypto.randomUUID();
       requestId = enriched["request_id"] as string;
     }
-    let reply: {
+    const reply: {
       committed?: boolean;
       result?: unknown;
       request_id?: string;
       visible?: boolean;
-    };
-    reply = await this.transport.call(method, enriched);
+    } = await this.transport.call(method, enriched);
     // 服务端在写响应前等到投影可见（applied_lsn >= commit_lsn），-32020 在
     // 健康路径不会出现；若到达即投影病理，直接上抛。
     // 主工作台使用物化结果；JournalClient 消费完整回执。

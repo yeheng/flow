@@ -505,6 +505,7 @@ thread_local! {
 /// 生成 16 字节随机 boot_id（hex）。从 getrandom 读；失败时退化为时间+计数
 /// 组合，仍然保证本进程内唯一。
 pub fn fresh_boot_id() -> String {
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut bytes = [0u8; 16];
     #[cfg(unix)]
     let filled = unsafe {

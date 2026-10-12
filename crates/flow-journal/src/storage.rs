@@ -282,6 +282,7 @@ fn private_dir_recorded(path: &Path, latency: &mut SyncLatency) -> Result<()> {
         if !parent.exists() {
             private_dir_recorded(parent, latency)?;
         }
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
         {

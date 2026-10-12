@@ -422,7 +422,9 @@ async fn killing_executor_mid_script_recovers_with_new_process() {
     unsafe {
         libc::kill(victim as i32, libc::SIGKILL);
     }
-    let done = tokio::time::timeout(Duration::from_secs(20), async {
+    // CI 慢机器：SIGKILL 后会话死亡检测依赖 10s 心跳超时，叠加恢复调度
+    // 延迟，20s 窗口在 2 核 runner 上紧张；放宽到 60s（正常路径 ≈12s）。
+    let done = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let run = backend.state().await.runs[&run_id].clone();
             if run.terminal() {

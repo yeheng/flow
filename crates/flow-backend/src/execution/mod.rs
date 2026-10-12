@@ -4,11 +4,31 @@
 //! 绑定一种执行模式。启用 IPC 时二进制缺失/版本不兼容直接失败，不静默
 //! 落回进程内执行。
 
-#[cfg(unix)]
 pub mod dispatch;
 #[cfg(unix)]
 pub mod pool;
 pub mod remote;
+
+use flow_engine::execution_protocol::message::Message;
+
+/// 主进程 → 会话驱动命令。`Send` 装箱：`Message` 最大变体携带完整
+/// `ExecuteTask`，装箱使枚举收缩到指针大小，命令队列每个槽位少搬数百字节。
+/// 会话层协议类型（全平台）：本地池会话（unix）与远程 agent 链路共用。
+pub enum ToSession {
+    Send(Box<Message>),
+    /// 持久取消已提交：发 Cancel 并等待排空（宽限后 kill）。
+    CancelDispatch(String),
+    /// 会话整体回收（派发失败/通道故障/关停）。
+    Recycle,
+}
+
+/// 会话驱动 → 当前派发的事件。`Incoming` 装箱理由同 `ToSession::Send`：
+/// 消息流经有界队列，槽位大小决定每帧的复制成本。
+pub enum FromSession {
+    Incoming(Box<Message>),
+    /// 会话死亡（通道 EOF/错误/心跳超时或回收完成）；此后不再有事件。
+    Dead(String),
+}
 
 use std::path::PathBuf;
 

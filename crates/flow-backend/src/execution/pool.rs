@@ -19,7 +19,7 @@ use flow_engine::execution_protocol::contract::{
 use flow_engine::execution_protocol::message::Message;
 use flow_engine::execution_protocol::transport::{master_handshake, FrameTransport};
 
-use super::IpcOptions;
+use super::{FromSession, IpcOptions, ToSession};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PoolError {
@@ -29,24 +29,6 @@ pub enum PoolError {
     Handshake(String),
     #[error("executor session unavailable: {0}")]
     Unavailable(String),
-}
-
-/// 主进程 → 会话驱动命令。`Send` 装箱：`Message` 最大变体携带完整
-/// `ExecuteTask`，装箱使枚举收缩到指针大小，命令队列每个槽位少搬数百字节。
-pub enum ToSession {
-    Send(Box<Message>),
-    /// 持久取消已提交：发 Cancel 并等待排空（宽限后 kill）。
-    CancelDispatch(String),
-    /// 会话整体回收（派发失败/通道故障/关停）。
-    Recycle,
-}
-
-/// 会话驱动 → 当前派发的事件。`Incoming` 装箱理由同 `ToSession::Send`：
-/// 消息流经有界队列，槽位大小决定每帧的复制成本。
-pub enum FromSession {
-    Incoming(Box<Message>),
-    /// 会话死亡（通道 EOF/错误/心跳超时或回收完成）；此后不再有事件。
-    Dead(String),
 }
 
 /// 裸会话（无信号量份额）：spawn/握手完成即可用。

@@ -401,7 +401,7 @@ async fn concurrent_writes_all_return_visible_without_committed_not_visible() {
     for i in 0..500 {
         let b = backend.clone();
         tasks.spawn(async move {
-            let scope = format!("workflow.create");
+            let scope = "workflow.create".to_string();
             let request = format!("concurrent-{i}");
             let receipt = b
                 .command(&scope, Some(&request), &json!({"n": i}), |state| {

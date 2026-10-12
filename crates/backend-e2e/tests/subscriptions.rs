@@ -185,26 +185,6 @@ e2e_test!(subscriptions_isolate_runs, |ctx: &mut Ctx| Box::pin(
     }
 ));
 
-async fn wait_node_running(
-    client: &backend_e2e::common::Conn,
-    run_id: &str,
-    node_id: &str,
-    timeout: Duration,
-) -> Value {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        let timeline: Value = call_json(client, "run.timeline", json!({"run_id": run_id})).await;
-        if timeline_node(&timeline, node_id)["state"] == json!("running") {
-            return timeline;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "等待节点 {node_id} 到 running 超时：{timeline}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
 /// 等节点等待登记（wait 结构非空）。signal/取消的前置是 wait 已提交；
 /// display 态 running 同时覆盖 dispatching 与 waiting，不可区分。
 async fn wait_node_waiting(
