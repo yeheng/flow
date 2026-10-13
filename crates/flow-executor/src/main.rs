@@ -39,15 +39,20 @@ fn main() -> std::process::ExitCode {
 }
 
 /// 解析通道引导：回连地址 env 优先（非 unix 的唯一形态）；否则 unix
-/// `--channel-fd <N>`（主进程 spawn 时注入 argv）。
+/// `--channel-fd <N>`（主进程 spawn 时注入 argv）。回连形态同时携带
+/// 会话令牌（Hello 回验，防本机抢连）；socketpair 形态走 FD 能力，无令牌。
 fn bootstrap_config() -> Option<ExecutorConfig> {
     let remote_replay = std::env::args().any(|arg| arg == "--remote-relay");
+    let session_token = std::env::var(flow_engine::execution_protocol::SESSION_TOKEN_ENV)
+        .ok()
+        .filter(|token| !token.is_empty());
     if let Ok(addr) = std::env::var(flow_engine::execution_protocol::CONNECT_ADDR_ENV) {
         if !addr.is_empty() {
             return Some(ExecutorConfig {
                 bootstrap: ChannelBootstrap::Loopback { addr },
                 queue_depth: 128,
                 remote_replay,
+                session_token,
             });
         }
     }
@@ -62,6 +67,7 @@ fn bootstrap_config() -> Option<ExecutorConfig> {
             bootstrap: ChannelBootstrap::Fd { channel_fd },
             queue_depth: 128,
             remote_replay,
+            session_token: None,
         })
     }
     #[cfg(not(unix))]

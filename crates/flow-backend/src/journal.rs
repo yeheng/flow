@@ -569,7 +569,10 @@ impl JournalBackend {
         if !committed.dirty_runs.is_empty() {
             self.execution_changed.notify_one();
         }
-        self.changed.notify_waiters();
+        // notify_one（非 notify_waiters）：投影循环在批次间隙重新注册
+        // waited future 之前到达的通知会丢；notify_one 会留存一个许可，
+        // 把视图滞后从「最长 20ms 轮询间隔」压到「批次处理时间」。
+        self.changed.notify_one();
         Ok(submitted)
     }
     fn receipt(&self, record: &CommandRecord) -> CommandReceipt {
@@ -665,7 +668,7 @@ impl JournalBackend {
     }
     pub fn pause_projection(&self, paused: bool) {
         self.paused.store(paused, Ordering::Relaxed);
-        self.changed.notify_waiters();
+        self.changed.notify_one();
     }
     /// 调整写命令等到投影可见的上限（毫秒）。测试注入用；产品默认 30s，
     /// 健康路径下投影在毫秒级追平，超时即投影病理。

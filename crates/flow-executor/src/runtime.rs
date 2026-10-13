@@ -42,6 +42,9 @@ pub struct ExecutorConfig {
     pub remote_replay: bool,
     /// 会话心跳与限额来自 Welcome。
     pub queue_depth: usize,
+    /// loopback 回连的会话令牌（主进程 spawn 时经 env 注入；Hello 回验）。
+    /// socketpair 形态走 FD 能力，为 None。
+    pub session_token: Option<String>,
 }
 
 struct CurrentTask {
@@ -50,7 +53,6 @@ struct CurrentTask {
     ack_tx: watch::Sender<(u64, u64)>,
     cancel: CancellationToken,
     done: tokio::sync::oneshot::Receiver<TaskEnd>,
-    phase: String,
 }
 
 /// 执行器主循环。返回进程退出码语义：0 = 干净结束，非 0 = 需要回收。
@@ -86,7 +88,12 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
     };
     let (identity, limits) = match tokio::time::timeout(
         Duration::from_millis(STARTUP_TIMEOUT_MS * 2),
-        executor_handshake(&mut transport, EXECUTOR_BUILD, EXECUTOR_CAPABILITIES),
+        executor_handshake(
+            &mut transport,
+            EXECUTOR_BUILD,
+            EXECUTOR_CAPABILITIES,
+            config.session_token.clone(),
+        ),
     )
     .await
     {
@@ -300,7 +307,6 @@ fn handle_message(
                 ack_tx,
                 cancel,
                 done: done_rx,
-                phase: "starting".into(),
             });
             None
         }
@@ -308,7 +314,6 @@ fn handle_message(
             if let Some(task) = current {
                 if task.dispatch_id == dispatch_id {
                     task.cancel.cancel();
-                    task.phase = "cancelling".into();
                 }
             }
             None

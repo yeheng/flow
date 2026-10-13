@@ -2,6 +2,13 @@
 pub const DEFAULT_JS_TIMEOUT_MS: u64 = 2_000;
 pub const DEFAULT_HTTP_TIMEOUT_MS: u64 = 30_000;
 pub const DEFAULT_HARNESS_TIMEOUT_MS: u64 = 300_000;
+
+/// 节点级超时的 clamp 上界。`timeout_ms` 是用户可配参数，不设上限时一个
+/// 巨大值会让执行槽位被无限占用（本地/远程都没有对应的 wall-clock 预算，
+/// 只有取消能救）。上界取「远超任何合理集成调用」的量级：正常用例应远
+/// 低于它，配超了说明是配置错误，按配置失败比静默挂死可诊断。
+pub const HTTP_TIMEOUT_MAX_MS: u64 = 10 * 60 * 1000;
+pub const HARNESS_TIMEOUT_MAX_MS: u64 = 60 * 60 * 1000;
 use serde_json::Value;
 /// 节点执行失败。`retryable` 决定引擎是重试还是把 run 判为失败；
 /// `platform` 表示基础设施故障（IO/Backend/日志损坏）——不是工作流失败，

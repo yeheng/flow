@@ -4,17 +4,19 @@
 //! 平台用「父进程 bind 127.0.0.1:0 → 经 env 告知子进程 → 子进程单连接
 //! 回连」承载 v4 单流通道（帧头 kind 与 raw blob，见 [`super::frame`]）。
 //!
-//! 信任域：临时端口只在本机可见，且单用户本机工具的 RPC 端点、journal
-//! 目录与密钥存储本就同处一个信任域（loopback + token）；unix 的
-//! close-on-exec 隔离目标是「不向无关子进程泄漏 FD」，不是抵御敌意本地
-//! 进程——回连端口在毫秒窗口内被抢连的前提已经是本机有敌意代码。
+//! 信任域：回连端口只在本机可见，任何本机进程都可能在毫秒窗口内抢连
+//! （unix 侧靠「exec 前关闭其余继承 FD」的 FD 能力防串配，loopback 没有
+//! 对应机制）。缓解：spawn 时随机生成会话令牌经 env 注入执行器，Hello
+//! 里回验（见 [`SESSION_TOKEN_ENV`]）——抢连者拿不到该值。同 uid 进程
+//! 理论上可读 /proc/<pid>/environ，但同 uid 等于已完全失陷；不同 uid 的
+//! 本地进程被令牌挡在门外。
 
 use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
 
-use super::contract::{ExecutorInvocation, STARTUP_TIMEOUT_MS};
+use super::contract::{ExecutorInvocation, STARTUP_TIMEOUT_MS, SESSION_TOKEN_ENV};
 
 /// 主进程告知执行器回连地址的环境变量（仅 spawn 时由父进程注入；执行器
 /// env_clear 后仍可见）。
@@ -23,10 +25,12 @@ pub const CONNECT_ADDR_ENV: &str = "FLOW_EXECUTOR_CONNECT_ADDR";
 /// spawn 一个执行器进程并等它回连出单通道。返回 (通道, 子进程句柄)。
 ///
 /// 与 [`super::spawn::spawn_executor_process`] 同一套环境隔离规则：
-/// env_clear 后只回填 RUST_LOG 与回连地址；stdout/stderr 不携带协议帧。
+/// env_clear 后只回填 RUST_LOG、回连地址与随机会话令牌；stdout/stderr 不
+/// 携带协议帧。
 pub async fn spawn_executor_loopback(
     executor: &ExecutorInvocation,
     tag: Option<&str>,
+    session_token: String,
 ) -> std::io::Result<(TcpStream, Child)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
@@ -45,6 +49,7 @@ pub async fn spawn_executor_loopback(
         command.env("RUST_LOG", log);
     }
     command.env(CONNECT_ADDR_ENV, addr.to_string());
+    command.env(SESSION_TOKEN_ENV, &session_token);
     let mut child = command.spawn()?;
     // 单连接即整条会话；执行器起不来（缺二进制/秒退）时靠超时收口。
     let accept = async { listener.accept().await.map(|(stream, _)| stream) };
@@ -106,9 +111,13 @@ mod tests {
             .build()
             .expect("parent runtime");
         runtime.block_on(async {
-            let (mut channel, mut child) = spawn_executor_loopback(&executor, None)
-                .await
-                .expect("spawn");
+            let (mut channel, mut child) = spawn_executor_loopback(
+                &executor,
+                None,
+                "test-session-token".into(),
+            )
+            .await
+            .expect("spawn");
             assert!(child.id().is_some(), "child process handle");
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             channel.write_all(b"Z").await.unwrap();
@@ -155,9 +164,10 @@ mod tests {
             .expect("runtime");
         runtime.block_on(async {
             use tokio::io::AsyncReadExt;
-            let (mut channel, mut child) = spawn_executor_loopback(&invocation, None)
-                .await
-                .expect("loopback session");
+            let (mut channel, mut child) =
+                spawn_executor_loopback(&invocation, None, "tok".into())
+                    .await
+                    .expect("loopback session");
             let mut buf = [0u8; 4];
             tokio::time::timeout(Duration::from_secs(5), channel.read_exact(&mut buf))
                 .await
@@ -170,6 +180,10 @@ mod tests {
         std::env::remove_var("FLOW_T10_LOOP_LEAK");
         let dump = std::fs::read_to_string(&env_dump).unwrap_or_default();
         assert!(dump.contains(CONNECT_ADDR_ENV), "回连地址必须注入:\n{dump}");
+        assert!(
+            dump.contains(SESSION_TOKEN_ENV),
+            "会话令牌必须注入（抢连防御）：\n{dump}"
+        );
         assert!(
             !dump.contains("FLOW_T10_LOOP_LEAK"),
             "env_clear 必须丢弃父进程无关变量:\n{dump}"
@@ -188,7 +202,9 @@ mod tests {
             let missing = super::super::contract::ExecutorInvocation::explicit(
                 "/nonexistent/flow-executor",
             );
-            assert!(spawn_executor_loopback(&missing, None).await.is_err());
+            assert!(spawn_executor_loopback(&missing, None, "tok".into())
+                .await
+                .is_err());
         });
         #[cfg(unix)]
         {
@@ -197,7 +213,8 @@ mod tests {
             let exec = script(&dir, "exit 1");
             let invocation = super::super::contract::ExecutorInvocation::explicit(exec);
             let start = std::time::Instant::now();
-            let result = runtime.block_on(spawn_executor_loopback(&invocation, None));
+            let result =
+                runtime.block_on(spawn_executor_loopback(&invocation, None, "tok".into()));
             assert!(result.is_err(), "child exit must surface as error");
             assert!(
                 start.elapsed() < Duration::from_secs(20),

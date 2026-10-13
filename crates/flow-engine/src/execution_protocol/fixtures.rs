@@ -44,6 +44,7 @@ pub fn valid_messages() -> Vec<Message> {
                 "http".into(),
                 "transfer".into(),
             ],
+            session_token: None,
         },
         Message::Welcome {
             journal_id: "journal-fixture".into(),

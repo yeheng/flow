@@ -194,11 +194,11 @@ impl ExecutorPool {
 
 /// 平台通道承载：unix socketpair（argv 传 FD 原号，父端关闭子端副本）；
 /// 其余平台 TCP loopback 单连接回连。差异在此收口，下游只见 FrameTransport
-/// 单流端点（帧内通道标签）。
+/// 单流端点。回连形态额外产出随机会话令牌（Hello 回验，防本机抢连）。
 async fn spawn_transport(
     executor: &flow_engine::execution_protocol::contract::ExecutorInvocation,
     tag: Option<&str>,
-) -> Result<(FrameTransport, Child), PoolError> {
+) -> Result<(FrameTransport, Child, Option<String>), PoolError> {
     #[cfg(unix)]
     {
         let (parent, child, child_pair) =
@@ -206,15 +206,24 @@ async fn spawn_transport(
                 .map_err(|e| PoolError::Spawn(format!("{}: {e}", executor.program.display())))?;
         // 父进程关闭子端副本（子进程内按 argv 原号持有）。
         drop(child_pair);
-        Ok((FrameTransport::spawn_local(parent, 128), child))
+        Ok((FrameTransport::spawn_local(parent, 128), child, None))
     }
     #[cfg(not(unix))]
     {
+        let session_token = flow_engine::execution_protocol::transport::fresh_boot_id();
         let (channel, child) =
-            flow_engine::execution_protocol::loopback::spawn_executor_loopback(executor, tag)
-                .await
-                .map_err(|e| PoolError::Spawn(format!("{}: {e}", executor.program.display())))?;
-        Ok((FrameTransport::spawn(channel, 128), child))
+            flow_engine::execution_protocol::loopback::spawn_executor_loopback(
+                executor,
+                tag,
+                session_token.clone(),
+            )
+            .await
+            .map_err(|e| PoolError::Spawn(format!("{}: {e}", executor.program.display())))?;
+        Ok((
+            FrameTransport::spawn(channel, 128),
+            child,
+            Some(session_token),
+        ))
     }
 }
 
@@ -227,7 +236,7 @@ async fn spawn_and_handshake(
     session_id: &str,
     tag: Option<&str>,
 ) -> Result<RawSession, PoolError> {
-    let (mut transport, mut child) = spawn_transport(executor, tag).await?;
+    let (mut transport, mut child, session_token) = spawn_transport(executor, tag).await?;
     let child_pid = child.id();
     let hello = tokio::time::timeout(
         Duration::from_millis(STARTUP_TIMEOUT_MS * 2),
@@ -237,6 +246,7 @@ async fn spawn_and_handshake(
             master_epoch,
             executor_id,
             session_id,
+            session_token.as_deref(),
         ),
     )
     .await
@@ -316,14 +326,23 @@ async fn session_driver(
                 match received {
                     Ok((_channel, message)) => {
                         last_seen = tokio::time::Instant::now();
-                        if matches!(message, Message::Heartbeat { .. }) {
-                            continue;
-                        }
-                        if event_tx
-                            .send(FromSession::Incoming(Box::new(message)))
-                            .await
-                            .is_err()
-                        {
+                        // 心跳也作为事件转发：派发侧的空闲计时把它算作活跃
+                        // 证据（长任务执行期间唯一持续的流量），handle()
+                        // 对 Heartbeat 是 no-op。空闲会话（无租约）时接收端
+                        // 无人排空，心跳用 try_send——满则丢弃这一拍，绝不
+                        // 阻塞会话驱动；其余消息仍是 awaited 正确性路径。
+                        let heartbeat = matches!(message, Message::Heartbeat { .. });
+                        let delivered = if heartbeat {
+                            event_tx
+                                .try_send(FromSession::Incoming(Box::new(message)))
+                                .is_ok()
+                        } else {
+                            event_tx
+                                .send(FromSession::Incoming(Box::new(message)))
+                                .await
+                                .is_ok()
+                        };
+                        if !delivered && !heartbeat {
                             // 派发端已离开：保留会话等待下一个租约或回收。
                         }
                     }

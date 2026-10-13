@@ -82,13 +82,20 @@ impl Fixture {
     }
 
     async fn wait_finished(&self, run: &str) -> Value {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                let state = self.backend.state().await;
-                if let Some(row) = state.runs.get(run).filter(|r| r.terminal()) {
+                // 等**投影可见**（run.get 读投影）：本文件的断言面
+                // （run.list/run.stats）同源。等内存态终局会在投影追赶
+                // （异步、批次级）之前返回，视图断言因此偶发少一条 run。
+                let row = self.call("run.get", json!({"run_id": run})).await;
+                let status = row["result"]["run"]["status"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                if status == "succeeded" || status == "failed" || status == "cancelled" {
                     return json!({
-                        "status": row.status,
-                        "error": row.error,
+                        "status": status,
+                        "error": row["result"]["run"]["error"].clone(),
                     });
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;

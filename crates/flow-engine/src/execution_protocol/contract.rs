@@ -1,4 +1,4 @@
-//! 冻结的本地 IPC 契约（v3）。
+//! 冻结的本地 IPC 契约（v4 单流）。
 //!
 //! 这些常量是协议冻结面：主进程与执行器实现都必须在同一组上限内工作，
 //! 任何一方都不允许在握手之外重新协商硬上限。修改本文件即构成协议版本
@@ -161,6 +161,11 @@ pub const EXECUTOR_BIN_ENV: &str = "FLOW_EXECUTOR_BIN";
 /// 执行模式环境变量：默认 ipc（全平台）；显式值 `ipc` 覆盖默认，
 /// `in_process` 已全平台删除、显式设置即报错。
 pub const EXECUTION_MODE_ENV: &str = "FLOW_EXECUTION_MODE";
+
+/// 回连承载的会话令牌环境变量（loopback 防本机抢连）：主进程 spawn 时
+/// 随机生成并注入，执行器在 Hello 里回验；unix socketpair 走 FD 能力
+/// （exec 前关闭其余继承 FD）不需要，不注入。
+pub const SESSION_TOKEN_ENV: &str = "FLOW_EXECUTOR_SESSION_TOKEN";
 
 /// 执行器在 Hello 中声明的能力目录。缺失必需能力的主进程必须明确拒绝，
 /// 不降级执行（二期 §3.2）。

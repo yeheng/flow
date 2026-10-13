@@ -68,7 +68,7 @@ pub async fn run_agent(config: AgentConfig, shutdown: CancellationToken) -> Stri
             result = tokio::time::timeout(Duration::from_secs(15), connect(&config, &agent_boot_id)) => result.unwrap_or_else(|_| Err("agent connect timeout".into())),
         };
         match connection {
-            Ok((mut transport, link_session_id, journal_id, master_epoch)) => {
+            Ok((mut transport, link_session_id, journal_id, master_epoch, heartbeat_ms)) => {
                 tracing::info!(%link_session_id, "agent uplink ready");
                 backoff = Duration::from_millis(500);
                 let relay = Arc::new(parking_lot::Mutex::new(Relay::new(
@@ -93,6 +93,7 @@ pub async fn run_agent(config: AgentConfig, shutdown: CancellationToken) -> Stri
                     &link_session_id,
                     &journal_id,
                     master_epoch,
+                    heartbeat_ms,
                     transport,
                     relay,
                     executor_handles.clone(),
@@ -124,7 +125,7 @@ pub async fn run_agent(config: AgentConfig, shutdown: CancellationToken) -> Stri
 async fn connect(
     config: &AgentConfig,
     agent_boot_id: &str,
-) -> std::result::Result<(FrameTransport, String, String, u64), String> {
+) -> std::result::Result<(FrameTransport, String, String, u64, u64), String> {
     if config.wss_url.is_some() {
         return connect_wss(config, agent_boot_id).await;
     }
@@ -149,11 +150,14 @@ async fn connect(
 }
 
 /// WSS 上联（T13）：明文 TCP（代理终止 TLS）+ 显式认证头；同一套帧/握手。
+/// 客户端侧同样设单消息上限（与服务端 1 MiB 对称）——不用 tungstenite
+/// 默认的 64 MiB，避免对端（或受损 master）用大消息灌爆本端缓冲。
 async fn connect_wss(
     config: &AgentConfig,
     agent_boot_id: &str,
-) -> std::result::Result<(FrameTransport, String, String, u64), String> {
+) -> std::result::Result<(FrameTransport, String, String, u64, u64), String> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
     let url = config
         .wss_url
         .clone()
@@ -176,9 +180,17 @@ async fn connect_wss(
             .parse()
             .map_err(|_| "invalid token header".to_string())?,
     );
-    let (ws, _response) = tokio_tungstenite::connect_async(request)
-        .await
-        .map_err(|e| format!("wss connect: {e}"))?;
+    let limit = Some(flow_engine::execution_protocol::ws::MAX_WS_MESSAGE_BYTES);
+    let ws_config = WebSocketConfig::default()
+        .max_message_size(limit)
+        .max_frame_size(limit);
+    let (ws, _response) = tokio_tungstenite::connect_async_with_config(
+        request,
+        Some(ws_config),
+        false,
+    )
+    .await
+    .map_err(|e| format!("wss connect: {e}"))?;
     let transport = FrameTransport::spawn(
         flow_engine::execution_protocol::ws::WsByteStream::new(ws),
         128,
@@ -187,11 +199,12 @@ async fn connect_wss(
 }
 
 /// 上联握手：AgentHello → AgentWelcome（transport 已建立，与承载无关）。
+/// 返回协商出的心跳周期（master 侧 Suspect 看门狗的同一边界值）。
 async fn handshake(
     mut transport: FrameTransport,
     config: &AgentConfig,
     agent_boot_id: &str,
-) -> std::result::Result<(FrameTransport, String, String, u64), String> {
+) -> std::result::Result<(FrameTransport, String, String, u64, u64), String> {
     let hello = Message::AgentHello {
         agent_boot_id: agent_boot_id.to_string(),
         build: crate::AGENT_BUILD.into(),
@@ -219,12 +232,19 @@ async fn handshake(
         journal_id,
         master_epoch,
         link_session_id,
+        heartbeat_ms,
         ..
     } = message
     else {
         return Err("expected AgentWelcome".into());
     };
-    Ok((transport, link_session_id, journal_id, master_epoch))
+    Ok((
+        transport,
+        link_session_id,
+        journal_id,
+        master_epoch,
+        heartbeat_ms,
+    ))
 }
 
 /// 对账：分页上报 Resume 清单并应用裁决（取消项回收本地执行器）。
@@ -287,8 +307,40 @@ pub async fn resume(
                 .recv()
                 .await
                 .map_err(|e| format!("resume reply: {e}"))?;
-            if let Message::ResumeReply { .. } = message {
-                break message;
+            match message {
+                Message::ResumeReply { .. } => break message,
+                // 主进程在裁决期间会抢先发 Routed Cancel / ResultCommitted
+                // （对账动作本身）。它们落在 ResumeReply 之前到达——旧实现
+                // 在这里整帧丢弃，只靠 decisions 兜底；现在显式应用，语义
+                // 与 decisions 一致（幂等），且未来新增帧类型不会静默丢失。
+                Message::Routed { envelope, inner } => {
+                    let dispatch_id = envelope.dispatch_id.unwrap_or_default();
+                    match *inner {
+                        Message::Cancel { .. } => {
+                            if let Some(handle) = handles.lock().await.get(&dispatch_id) {
+                                handle.cancel.cancel();
+                            }
+                        }
+                        Message::ResultCommitted { .. } => {
+                            if let Some(handle) = handles.lock().await.get(&dispatch_id) {
+                                handle.committed.store(true, Ordering::Release);
+                                handle.cancel.cancel();
+                            }
+                        }
+                        other => {
+                            return Err(format!(
+                                "unexpected frame during resume: {}",
+                                other.type_name()
+                            ))
+                        }
+                    }
+                }
+                other => {
+                    return Err(format!(
+                        "unexpected frame during resume: {}",
+                        other.type_name()
+                    ))
+                }
             }
         };
         if let Message::ResumeReply {
@@ -357,6 +409,7 @@ pub async fn serve(
     _link_session_id: &str,
     journal_id: &str,
     master_epoch: u64,
+    heartbeat_ms: u64,
     mut transport: FrameTransport,
     relay: Arc<parking_lot::Mutex<Relay>>,
     handles: Arc<tokio::sync::Mutex<BTreeMap<String, ExecutorHandle>>>,
@@ -372,6 +425,12 @@ pub async fn serve(
     let mut send_backlog =
         flow_engine::execution_protocol::transport::SendBacklog::with_capacity(16);
     let mut housekeeping = tokio::time::interval(Duration::from_millis(20));
+    // 上联心跳（§3.7）：按 Welcome 协商周期发送；master 侧以它为活跃
+    // 证据（静默超时即判失联）。积压占用时跳拍（下一拍再试）——心跳是
+    // 可丢失的活性信号，不该因队列满把会话判死。
+    let heartbeat_every = Duration::from_millis(heartbeat_ms.clamp(1_000, 60_000));
+    let mut heartbeat_tick = tokio::time::interval(heartbeat_every);
+    heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         if send_backlog.flush(&transport).is_err() {
             return "uplink send failed".into();
@@ -380,8 +439,13 @@ pub async fn serve(
             permit = async { pending.as_ref().unwrap().0.clone().reserve_owned().await }, if pending.is_some() => {
                 let (_, message) = pending.take().unwrap();
                 match permit {
-                    Ok(permit) => { permit.send(message); }
-                    Err(_) => return "executor inbox closed".into(),
+                    Ok(permit) => { let _ = permit.send(message); }
+                    Err(_) => {
+                        // 单个执行器的 inbox 已关（executor_loop 退出）：
+                        // 只丢这一条待投帧。它的执行器已死、housekeeping 会
+                        // 回收句柄——不值得让整条上联会话退出重连。
+                        tracing::debug!("executor inbox closed; dropping queued frame");
+                    }
                 }
             }
             _ = housekeeping.tick() => {
@@ -406,6 +470,18 @@ pub async fn serve(
                     .await;
                     transport.flush_and_close(Duration::from_millis(DRAIN_GRACE_MS)).await;
                     return "drained".into();
+                }
+            }
+            _ = heartbeat_tick.tick() => {
+                if send_backlog.is_empty() {
+                    let _ = queue_uplink(
+                        &transport,
+                        &mut send_backlog,
+                        Message::Heartbeat {
+                            dispatch_id: None,
+                            phase: "agent-alive".into(),
+                        },
+                    );
                 }
             }
             _ = shutdown.cancelled() => {
@@ -699,6 +775,7 @@ pub async fn serve_for_tests(
         "test-link",
         journal_id,
         master_epoch,
+        flow_engine::execution_protocol::HEARTBEAT_INTERVAL_MS,
         transport,
         session_relay,
         handles,
@@ -749,6 +826,7 @@ pub async fn reconnect_session(
         journal_id,
         master_epoch,
         link_session_id,
+        heartbeat_ms,
         ..
     } = welcome
     else {
@@ -772,6 +850,7 @@ pub async fn reconnect_session(
         &link_session_id,
         &journal_id,
         master_epoch,
+        heartbeat_ms,
         transport,
         relay,
         handles,

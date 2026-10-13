@@ -335,16 +335,6 @@ async fn read_loop_tagged(
                     let Some((channel, message)) = popped else {
                         break;
                     };
-                    if message.channel() != channel {
-                        let error = ProtocolError::Malformed(format!(
-                            "channel tag {:?} mismatches message {}",
-                            channel,
-                            message.type_name()
-                        ));
-                        let _ = events.send(IoEvent::Failed(channel, error)).await;
-                        state.stop();
-                        return;
-                    }
                     if events
                         .send(IoEvent::Frame(channel, Box::new(message)))
                         .await
@@ -405,10 +395,6 @@ async fn write_loop_tagged(
         let frame = match encode_frame(&message) {
             Ok(frame) => frame,
             Err(error) => {
-                eprintln!(
-                    "flow-transport: frame encode failed type={} error={error}",
-                    message.type_name()
-                );
                 // 观测是可丢弃数据：编码失败丢帧计数，绝不为它拆除
                 // golden source 会话（审计/结果/传输帧失败仍然断线——
                 // 那是正确性路径，该炸就炸）。
@@ -422,18 +408,12 @@ async fn write_loop_tagged(
             }
         };
         if let Err(error) = stream.write_all(&frame).await {
-            eprintln!(
-                "flow-transport: frame write failed type={} error={error}",
-                message.type_name()
-            );
+            tracing::error!(type_name = message.type_name(), %error, "frame write failed");
             state.fail(ProtocolError::Io(error));
             return;
         }
         if let Err(error) = stream.flush().await {
-            eprintln!(
-                "flow-transport: frame flush failed type={} error={error}",
-                message.type_name()
-            );
+            tracing::error!(type_name = message.type_name(), %error, "frame flush failed");
             state.fail(ProtocolError::Io(error));
             return;
         }
@@ -529,14 +509,34 @@ fn validate_identity(value: &str) -> Result<(), ProtocolError> {
     Ok(())
 }
 
-/// 主进程侧握手：接收 Hello（校验版本/能力/boot 唯一性），回 Welcome，
-/// 等待 Ready。任一步失败即明确拒绝，不降级。
+/// 校验 Hello 的会话令牌与主进程期望值一致。
+///
+/// loopback 回连承载（非 unix 本地执行）在 spawn 时经 env 注入随机令牌：
+/// 回连端口只在本机可见，但毫秒窗口内任何本机进程都可能抢连——抢连者
+/// 拿不到注入给执行器的令牌。unix socketpair 走 FD 能力（exec 前已关闭
+/// 其余继承 FD），不需要令牌，双方都是 `None`。
+fn validate_session_token(
+    presented: Option<&str>,
+    expected: Option<&str>,
+) -> Result<(), ProtocolError> {
+    match (presented, expected) {
+        (Some(presented), Some(expected)) if presented == expected => Ok(()),
+        (None, None) => Ok(()),
+        _ => Err(ProtocolError::Malformed(
+            "session token mismatch on loopback channel".into(),
+        )),
+    }
+}
+
+/// 主进程侧握手：接收 Hello（校验版本/能力/boot 唯一性/会话令牌），回
+/// Welcome，等待 Ready。任一步失败即明确拒绝，不降级。
 pub async fn master_handshake(
     transport: &mut FrameTransport,
     journal_id: &str,
     master_epoch: u64,
     executor_id: &str,
     session_id: &str,
+    expected_session_token: Option<&str>,
 ) -> Result<ExecutorHello, ProtocolError> {
     let (channel, message) = tokio::time::timeout(
         std::time::Duration::from_millis(super::contract::STARTUP_TIMEOUT_MS),
@@ -548,6 +548,7 @@ pub async fn master_handshake(
         boot_id,
         build,
         capabilities,
+        session_token,
     } = message
     else {
         return Err(ProtocolError::Malformed(format!(
@@ -556,6 +557,7 @@ pub async fn master_handshake(
     };
     validate_identity(&boot_id)?;
     validate_identity(&build)?;
+    validate_session_token(session_token.as_deref(), expected_session_token)?;
     for capability in REQUIRED_CAPABILITIES {
         if !capabilities.iter().any(|c| c == capability) {
             return Err(ProtocolError::Malformed(format!(
@@ -594,11 +596,13 @@ pub async fn master_handshake(
     }
 }
 
-/// 执行器侧握手：发 Hello，校验 Welcome 限额 ≤ 本端硬上限，回 Ready。
+/// 执行器侧握手：发 Hello（携带本会话令牌），校验 Welcome 限额 ≤ 本端
+/// 硬上限，回 Ready。
 pub async fn executor_handshake(
     transport: &mut FrameTransport,
     build: &str,
     capabilities: &[&str],
+    session_token: Option<String>,
 ) -> Result<(SessionIdentity, NegotiatedLimits), ProtocolError> {
     let boot_id = fresh_boot_id();
     transport
@@ -606,6 +610,7 @@ pub async fn executor_handshake(
             boot_id: boot_id.clone(),
             build: build.into(),
             capabilities: capabilities.iter().map(|s| s.to_string()).collect(),
+            session_token,
         })
         .await?;
     let (_, message) = tokio::time::timeout(
@@ -668,11 +673,6 @@ pub struct NegotiatedLimits {
 /// 协议版本常量重导出（握手层比对用）。
 pub const VERSION: u32 = PROTOCOL_VERSION;
 
-thread_local! {
-    /// 退化的 boot_id 兜底（未用）。
-    static _BOOT_ID: String = fresh_boot_id();
-}
-
 /// 生成 16 字节随机 boot_id（hex）。从 getrandom 读；失败时退化为时间+计数
 /// 组合，仍然保证本进程内唯一。
 pub fn fresh_boot_id() -> String {
@@ -731,12 +731,12 @@ mod tests {
         let (mut master, mut worker) = pair().await;
         let worker_task = tokio::spawn(async move {
             let (identity, limits) =
-                executor_handshake(&mut worker, "0.1.0", REQUIRED_CAPABILITIES)
+                executor_handshake(&mut worker, "0.1.0", REQUIRED_CAPABILITIES, None)
                     .await
                     .expect("executor handshake");
             (identity, limits)
         });
-        let hello = master_handshake(&mut master, "journal-1", 7, "exec-1", "session-1")
+        let hello = master_handshake(&mut master, "journal-1", 7, "exec-1", "session-1", None)
             .await
             .expect("master handshake");
         assert_eq!(hello.build, "0.1.0");
@@ -754,9 +754,9 @@ mod tests {
         let (mut master, mut worker) = pair().await;
         let worker_task = tokio::spawn(async move {
             // 只声明 execute，缺 js/http/transfer
-            executor_handshake(&mut worker, "0.1.0", &["execute"]).await
+            executor_handshake(&mut worker, "0.1.0", &["execute"], None).await
         });
-        let error = master_handshake(&mut master, "journal-1", 1, "e", "s")
+        let error = master_handshake(&mut master, "journal-1", 1, "e", "s", None)
             .await
             .expect_err("must reject missing capability");
         assert!(error.to_string().contains("required capability"));
@@ -767,10 +767,45 @@ mod tests {
     async fn first_message_not_hello_rejected() {
         let (mut a, mut _worker) = pair().await;
         _worker.send(Message::Ready).await.unwrap();
-        let error = master_handshake(&mut a, "j", 1, "e", "s")
+        let error = master_handshake(&mut a, "j", 1, "e", "s", None)
             .await
             .expect_err("non-hello rejected");
         assert!(error.to_string().contains("expected Hello"));
+    }
+
+    /// loopback 会话令牌：正确令牌通过；缺失/错值一律拒绝（抢连防御）。
+    #[tokio::test]
+    async fn session_token_roundtrip_and_mismatch_rejected() {
+        let (mut master, mut worker) = pair().await;
+        let worker_task = tokio::spawn(async move {
+            executor_handshake(&mut worker, "0.1.0", REQUIRED_CAPABILITIES, Some("tok".into()))
+                .await
+        });
+        master_handshake(&mut master, "j", 1, "e", "s", Some("tok"))
+            .await
+            .expect("matching token accepted");
+        worker_task.await.unwrap().expect("executor handshake");
+
+        let (mut master, mut worker) = pair().await;
+        let worker_task = tokio::spawn(async move {
+            executor_handshake(&mut worker, "0.1.0", REQUIRED_CAPABILITIES, None).await
+        });
+        let error = master_handshake(&mut master, "j", 1, "e", "s", Some("tok"))
+            .await
+            .expect_err("missing token rejected");
+        assert!(error.to_string().contains("session token"), "{error}");
+        let _ = worker_task.await;
+
+        let (mut master, mut worker) = pair().await;
+        let worker_task = tokio::spawn(async move {
+            executor_handshake(&mut worker, "0.1.0", REQUIRED_CAPABILITIES, Some("wrong".into()))
+                .await
+        });
+        let error = master_handshake(&mut master, "j", 1, "e", "s", Some("tok"))
+            .await
+            .expect_err("wrong token rejected");
+        assert!(error.to_string().contains("session token"), "{error}");
+        let _ = worker_task.await;
     }
 
     #[tokio::test]

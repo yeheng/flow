@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use flow_engine::execution_protocol::contract::{DRAIN_GRACE_MS, STARTUP_TIMEOUT_MS};
+use flow_engine::execution_protocol::contract::{DRAIN_GRACE_MS, HEARTBEAT_TIMEOUT_MS, STARTUP_TIMEOUT_MS};
 use flow_engine::execution_protocol::message::Message;
 use flow_engine::execution_protocol::spawn::spawn_executor_process;
 use flow_engine::execution_protocol::transport::{master_handshake, FrameTransport};
@@ -71,6 +71,7 @@ pub async fn bind_executor(
             master_epoch,
             executor_id,
             &format!("local-{dispatch_id}"),
+            None,
         ),
     )
     .await
@@ -144,11 +145,25 @@ async fn executor_loop(
     done: Arc<AtomicBool>,
     committed: Arc<AtomicBool>,
 ) {
+    let mut last_seen = tokio::time::Instant::now();
+    let heartbeat_timeout = Duration::from_millis(HEARTBEAT_TIMEOUT_MS);
+    let mut heartbeat =
+        tokio::time::interval_at(tokio::time::Instant::now() + heartbeat_timeout, heartbeat_timeout);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
                 forced_kill.store(true, Ordering::Relaxed);
                 break;
+            }
+            _ = heartbeat.tick() => {
+                // 执行器失联（心跳停）：与后端本地池同语义——宽限后 kill/reap。
+                if last_seen.elapsed() > heartbeat_timeout {
+                    if result.lock().await.is_none() {
+                        lost_data.store(true, Ordering::Relaxed);
+                    }
+                    break;
+                }
             }
             inbound = inbox.recv() => {
                 let Some(message) = inbound else { break };
@@ -160,8 +175,19 @@ async fn executor_loop(
                 if transport.send(message).await.is_err() { break; }
             }
             received = transport.recv() => {
+                last_seen = tokio::time::Instant::now();
                 match received {
                     Ok((_channel, message)) => {
+                        // 执行器心跳不带 dispatch_id（会话级）：补上本派发
+                        // 归属，否则上联包装器按「无归属」丢弃，master 永远
+                        // 收不到远程活跃证据（长任务会被误判空闲）。
+                        let message = match message {
+                            Message::Heartbeat { dispatch_id: None, phase } => Message::Heartbeat {
+                                dispatch_id: Some(dispatch_id.clone()),
+                                phase,
+                            },
+                            other => other,
+                        };
                         match &message {
                             Message::AuditAck { durable_audit_seq, .. } => {
                                 last_acked.fetch_max(*durable_audit_seq, Ordering::Relaxed);

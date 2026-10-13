@@ -62,6 +62,11 @@ impl RemoteOptions {
     }
 }
 
+/// 监听侧并发 TLS/WSS 握手上限（防连接洪泛无界 spawn task/做握手）。
+/// 握手是最贵的一步（证书解析/验证）；通过认证的会话受 CA/令牌约束，
+/// 数量自然有界。超限直接关闭——agent 会退避重连。
+pub const MAX_AGENT_SESSIONS: usize = 256;
+
 // mTLS：验证 agent 客户端证书。
 pub struct TlsServer {
     pub acceptor: TlsAcceptor,
@@ -125,6 +130,16 @@ impl TlsServer {
 
 fn bad_data<E: std::fmt::Display>(e: E) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+}
+
+/// WSS 认证失败的 401 响应（`ErrorResponse = http::Response<Option<String>>`，
+/// `new()` 默认 200，这里显式 401）。
+fn unauthorized() -> tokio_tungstenite::tungstenite::handshake::server::ErrorResponse {
+    let mut response = tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(
+        Some("unauthorized agent".to_string()),
+    );
+    *response.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::UNAUTHORIZED;
+    response
 }
 
 // 提取证书 CN（TLS 身份映射 agent_id；不信客户端自报字段）。
@@ -241,7 +256,7 @@ impl AgentManager {
     }
 
     // TLS 监听入口（真实网络，三期 §1.2）。单条 mTLS 连接承载整条上联
-    // （v3：control/data 由帧内通道标签区分），不再有第二条 data 连接。
+    // （v4 单流：帧头 kind 区分载荷形态），不再有第二条 data 连接。
     pub async fn listen_tls(self: &Arc<Self>, options: RemoteOptions) -> Result<()> {
         install_crypto_provider();
         let tls =
@@ -259,15 +274,26 @@ impl AgentManager {
         // 直接 await 会把 start_execution_remote（含生产 remote 模式启动）
         // 永久阻塞在 accept 循环上。
         let manager = self.clone();
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         tokio::spawn(async move {
             loop {
                 let Ok((socket, _)) = listener.accept().await else {
                     return;
                 };
+                if active.load(std::sync::atomic::Ordering::Acquire) >= MAX_AGENT_SESSIONS {
+                    tracing::warn!(
+                        limit = MAX_AGENT_SESSIONS,
+                        "agent TLS connection dropped: session limit reached"
+                    );
+                    continue;
+                }
+                active.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 let acceptor = acceptor.clone();
                 let manager = manager.clone();
+                let active = active.clone();
                 tokio::spawn(async move {
                     let Ok(stream) = acceptor.accept(socket).await else {
+                        active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                         return;
                     };
                     let agent_id = stream
@@ -278,9 +304,11 @@ impl AgentManager {
                         .and_then(|c| cert_common_name(c.as_ref()));
                     let Some(agent_id) = agent_id else {
                         tracing::warn!("agent TLS connection without client cert");
+                        active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                         return;
                     };
                     manager.inject_stream(agent_id, Box::pin(stream)).await;
+                    active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                 });
             }
         });
@@ -293,13 +321,11 @@ impl AgentManager {
     ///
     /// 直连 mTLS 路径（[`AgentManager::listen_tls`]）不变。
     ///
-    /// 协议层面：一条完整 v3 帧对应一条 WS Binary 消息；Text/超限消息拒绝；
+    /// 协议层面：一条完整 v4 帧对应一条（或分片后多条）WS Binary 消息；Text/超限消息拒绝；
     /// 协商上限由 [`MAX_WS_MESSAGE_BYTES`] 硬约束。
     #[allow(clippy::result_large_err)] // accept_hdr 回调签名固定，ErrorResponse 为大类型
     pub async fn listen_wss(self: &Arc<Self>, addr: String, token: String) -> Result<()> {
-        use tokio_tungstenite::tungstenite::handshake::server::{
-            ErrorResponse, Request, Response,
-        };
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
         use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
         let listener = TcpListener::bind(&addr)
@@ -316,13 +342,23 @@ impl AgentManager {
                 .max_message_size(limit)
                 .max_frame_size(limit),
         );
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         tokio::spawn(async move {
             loop {
                 let Ok((socket, _)) = listener.accept().await else {
                     return;
                 };
+                if active.load(std::sync::atomic::Ordering::Acquire) >= MAX_AGENT_SESSIONS {
+                    tracing::warn!(
+                        limit = MAX_AGENT_SESSIONS,
+                        "agent WSS connection dropped: session limit reached"
+                    );
+                    continue;
+                }
+                active.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 let manager = manager.clone();
                 let token = token.clone();
+                let active = active.clone();
                 tokio::spawn(async move {
                     let agent_slot: std::sync::Arc<std::sync::Mutex<Option<String>>> =
                         std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -336,15 +372,14 @@ impl AgentManager {
                                         Some(agent_id);
                                     Ok(response)
                                 }
-                                None => Err(ErrorResponse::new(Some(
-                                    "unauthorized agent".to_string(),
-                                ))),
+                                None => Err(unauthorized()),
                             }
                         },
                         config,
                     )
                     .await;
                     let Ok(ws) = handshake else {
+                        active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                         return;
                     };
                     let agent_id = agent_slot
@@ -352,6 +387,7 @@ impl AgentManager {
                         .unwrap_or_else(|p| p.into_inner())
                         .take();
                     let Some(agent_id) = agent_id else {
+                        active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                         return;
                     };
                     manager
@@ -360,6 +396,7 @@ impl AgentManager {
                             Box::pin(flow_engine::execution_protocol::ws::WsByteStream::new(ws)),
                         )
                         .await;
+                    active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                 });
             }
         });
@@ -386,7 +423,7 @@ impl AgentManager {
     }
 
     // 单个 agent 会话（T02）：握手与业务帧共用同一条 transport
-    // （v3：帧内通道标签，无需第二条连接与 DataBind）。
+    // （v4 单流：无需第二条连接与 DataBind）。
     async fn run_session(
         self: &Arc<Self>,
         agent_id: String,
@@ -467,6 +504,15 @@ impl AgentManager {
         self.capacity_changed.notify_waiters();
         tracing::info!(%agent_id, slots, "agent session registered");
         let mut routings: BTreeMap<String, SessionRouting> = BTreeMap::new();
+        // 上联活跃看门狗（§3.7 Suspect）：agent 周期性发心跳，任何入站帧
+        // 都算活跃证据；彻底静默超过 HEARTBEAT_TIMEOUT_MS 即判失联，
+        // 结束会话（绑定转入 Resume 对账，agent 会退避重连）。没有它，
+        // 静默网络分区会留下僵尸 registration：bind 每次烧满超时才失败。
+        let mut liveness = tokio::time::Instant::now();
+        let mut liveness_tick = tokio::time::interval(Duration::from_millis(
+            flow_engine::execution_protocol::HEARTBEAT_TIMEOUT_MS,
+        ));
+        liveness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Bounded receipts absorb in-flight duplicates after the live route is released.
         let mut completed: std::collections::VecDeque<(RouteEnvelope, Option<String>)> =
             Default::default();
@@ -476,6 +522,18 @@ impl AgentManager {
                 tokio::select! {
                     _ = registration.cancel.cancelled() => return Ok(()),
                     _ = self.shutdown.cancelled() => return Ok(()),
+                    _ = liveness_tick.tick() => {
+                        if liveness.elapsed()
+                            > Duration::from_millis(
+                                flow_engine::execution_protocol::HEARTBEAT_TIMEOUT_MS,
+                            )
+                        {
+                            return Err(format!(
+                                "agent {agent_id} uplink silent for over {}ms",
+                                flow_engine::execution_protocol::HEARTBEAT_TIMEOUT_MS
+                            ));
+                        }
+                    }
                     command = commands.recv() => {
                         let Some(command) = command else { return Ok(()); };
                         match command {
@@ -539,6 +597,7 @@ impl AgentManager {
                         }
                     }
                     received = transport.recv() => {
+                        liveness = tokio::time::Instant::now();
                         let (_channel, message) = received.map_err(|e| format!("recv: {e}"))?;
                         match message {
                             Message::Routed { envelope, inner } => {
