@@ -1,7 +1,9 @@
 //! IPC 消息目录（二期 §3.3/§3.4，I01 冻结）。
 //!
-//! 物理帧为 `u32 大端长度 + UTF-8 JSON`；JSON 是一个信封：
-//! `{"v":1,"type":"AuditBatch","dispatch_id":"…","body":{…}}`。
+//! 物理帧为 v4 单流：`u32 body_len | u8 kind | u32 meta_len | JSON meta |
+//! raw blob`。kind=0 时 meta 是一个信封
+//! `{"v":4,"type":"AuditBatch","dispatch_id":"…","body":{…}}`；kind=1/2
+//! 时 meta 是不含 bytes 的元数据信封、blob 承载原始字节。
 //! epoch、序号、字节累计位置等可能超过 JavaScript 安全整数范围的值统一
 //! 使用十进制字符串（[`flow_journal::decimal`]）。会话身份由连接上下文
 //! 提供，任务帧只携带 dispatch_id 及必要业务字段。
@@ -225,6 +227,10 @@ pub enum Message {
         boot_id: String,
         build: String,
         capabilities: Vec<String>,
+        /// 回连承载的会话令牌（loopback 防本机抢连；unix socketpair 走 FD
+        /// 能力不需要，为 None）。主进程在 spawn 时经 env 注入，Hello 里
+        /// 回验——抢连者在毫秒窗口内拿不到该值。
+        session_token: Option<String>,
     },
     /// control，主→子。选定版本、会话身份、限额与超时。
     Welcome {
@@ -533,6 +539,8 @@ impl Message {
             boot_id: &'a str,
             build: &'a str,
             capabilities: &'a [String],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            session_token: Option<&'a str>,
         }
         #[derive(Serialize)]
         struct WelcomeW {
@@ -585,10 +593,12 @@ impl Message {
                 boot_id,
                 build,
                 capabilities,
+                session_token,
             } => body_value(&HelloW {
                 boot_id,
                 build,
                 capabilities,
+                session_token: session_token.as_deref(),
             }),
             Message::Welcome {
                 journal_id,
@@ -894,12 +904,15 @@ impl Message {
                     boot_id: String,
                     build: String,
                     capabilities: Vec<String>,
+                    #[serde(default)]
+                    session_token: Option<String>,
                 }
                 let wire: Wire = body.parse(type_name)?;
                 Message::Hello {
                     boot_id: wire.boot_id,
                     build: wire.build,
                     capabilities: wire.capabilities,
+                    session_token: wire.session_token,
                 }
             }
             kind::WELCOME => {
@@ -1339,13 +1352,17 @@ fn transfer_chunk_meta(
 }
 
 /// Routed 信封 + 内层 TransferChunk 元数据（远程 raw 承载的中继形态）。
-fn routed_transfer_meta(envelope: &super::remote::RouteEnvelope, inner_meta: Value) -> Value {
+/// 外层 `dispatch_id` 与内层必须一致（路由键 = 载荷归属）：包络自身缺失
+/// 时以内层为准，保证本端编码出的帧一定能过解码端的一致性校验。
+fn routed_transfer_meta(
+    envelope: &super::remote::RouteEnvelope,
+    inner_meta: Value,
+    inner_dispatch_id: &str,
+) -> Value {
     let mut outer = serde_json::Map::new();
     outer.insert("v".into(), json!(PROTOCOL_VERSION));
     outer.insert("type".into(), json!(kind::ROUTED));
-    if let Some(dispatch_id) = envelope.dispatch_id.as_deref() {
-        outer.insert("dispatch_id".into(), json!(dispatch_id));
-    }
+    outer.insert("dispatch_id".into(), json!(inner_dispatch_id));
     outer.insert(
         "body".into(),
         json!({
@@ -1357,6 +1374,8 @@ fn routed_transfer_meta(envelope: &super::remote::RouteEnvelope, inner_meta: Val
 }
 
 /// 从 TransferChunk 元数据信封 + blob 还原消息。
+/// 元数据必须自带版本与类型标识（与 kind=1 分支同等校验），dispatch_id
+/// 必填——静默补空串会让路由键与载荷归属分离。
 fn transfer_chunk_from_meta(envelope: &Value, blob: &[u8]) -> Result<Message> {
     if blob.len() > super::contract::TRANSFER_CHUNK_BYTES {
         return Err(ProtocolError::FrameTooLarge(
@@ -1364,10 +1383,22 @@ fn transfer_chunk_from_meta(envelope: &Value, blob: &[u8]) -> Result<Message> {
             super::contract::TRANSFER_CHUNK_BYTES,
         ));
     }
+    let version = envelope.get("v").and_then(Value::as_u64).unwrap_or(0);
+    if version != PROTOCOL_VERSION as u64 {
+        return Err(ProtocolError::Malformed(format!(
+            "transfer meta version {version} not supported"
+        )));
+    }
+    if envelope.get("type").and_then(Value::as_str) != Some(kind::TRANSFER_CHUNK) {
+        return Err(ProtocolError::Malformed(
+            "transfer meta type mismatch".into(),
+        ));
+    }
     let dispatch_id = envelope
         .get("dispatch_id")
         .and_then(Value::as_str)
-        .unwrap_or_default()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| ProtocolError::InvalidPayload("transfer meta dispatch_id".into()))?
         .to_string();
     #[derive(Deserialize)]
     struct BodyW {
@@ -1390,7 +1421,8 @@ fn transfer_chunk_from_meta(envelope: &Value, blob: &[u8]) -> Result<Message> {
 impl Message {
     /// 帧载荷拆分（T12）：返回 `(kind, JSON meta, raw blob)`。只有带
     /// 二进制体的类型（TransferChunk）走 raw；其余类型 kind=0、meta 即
-    /// 完整 v3 信封、blob 为空。内存表示与 v3 完全一致（单一业务路径）。
+    /// 完整 v4 信封、blob 为空。内存表示与业务路径完全一致（单一业务
+    /// 逻辑，无 v3/v4 双轨）。
     pub fn to_frame_parts(&self) -> Result<(u8, Vec<u8>, Vec<u8>)> {
         match self {
             Message::TransferChunk {
@@ -1427,6 +1459,7 @@ impl Message {
                 let meta = routed_transfer_meta(
                     envelope,
                     transfer_chunk_meta(dispatch_id, transfer_id, *offset, digest),
+                    dispatch_id,
                 );
                 let meta = serde_json::to_vec(&meta)
                     .map_err(|e| ProtocolError::Malformed(format!("meta: {e}")))?;
@@ -1441,9 +1474,21 @@ impl Message {
     }
 
     /// 帧载荷重组：kind/meta/blob → 消息。
+    ///
+    /// 校验对称性（v4 契约「明确拒绝，不降级」）：三个 kind 的同构字段
+    /// （版本 `v`、meta `type` 与 kind 一致、dispatch_id 必填）必须同等
+    /// 校验；kind=0 不得携带 raw blob；kind=2 的外层 meta、body.envelope
+    /// 与内层三处 dispatch_id 必须一致（路由键 = 载荷归属）。
     pub fn from_frame_parts(kind_byte: u8, meta: &[u8], blob: &[u8]) -> Result<Self> {
         match kind_byte {
-            KIND_JSON => Self::decode_envelope(meta),
+            KIND_JSON => {
+                if !blob.is_empty() {
+                    return Err(ProtocolError::Malformed(
+                        "JSON frame must not carry a raw blob".into(),
+                    ));
+                }
+                Self::decode_envelope(meta)
+            }
             KIND_TRANSFER_CHUNK => {
                 #[derive(Deserialize)]
                 struct MetaW {
@@ -1491,8 +1536,10 @@ impl Message {
             KIND_ROUTED_TRANSFER_CHUNK => {
                 #[derive(Deserialize)]
                 struct MetaW {
-                    #[serde(default)]
-                    dispatch_id: Option<String>,
+                    v: u64,
+                    #[serde(rename = "type")]
+                    kind: String,
+                    dispatch_id: String,
                     body: BodyW,
                 }
                 #[derive(Deserialize)]
@@ -1502,8 +1549,32 @@ impl Message {
                 }
                 let wire: MetaW = serde_json::from_slice(meta)
                     .map_err(|e| ProtocolError::Malformed(format!("routed meta: {e}")))?;
-                let _ = wire.dispatch_id;
+                if wire.v != PROTOCOL_VERSION as u64 {
+                    return Err(ProtocolError::Malformed(format!(
+                        "protocol version {} not supported",
+                        wire.v
+                    )));
+                }
+                if wire.kind != kind::ROUTED {
+                    return Err(ProtocolError::Malformed(format!(
+                        "frame kind {kind_byte} mismatches meta type {}",
+                        wire.kind
+                    )));
+                }
                 let inner = transfer_chunk_from_meta(&wire.body.inner, blob)?;
+                let inner_id = inner
+                    .dispatch_id()
+                    .expect("transfer meta dispatch_id validated non-empty");
+                // 路由键一致性：外层 meta 与 body.envelope 的 dispatch_id 都
+                // 必须等于内层载荷的归属。任一处缺失/错位都拒绝——否则路由
+                // 键与载荷归属可被分离构造，包络校验形同虚设。
+                if wire.dispatch_id != inner_id
+                    || wire.body.envelope.dispatch_id.as_deref() != Some(inner_id)
+                {
+                    return Err(ProtocolError::InvalidPayload(
+                        "routed transfer dispatch_id mismatch".into(),
+                    ));
+                }
                 if !super::remote::routable(&inner) {
                     return Err(ProtocolError::InvalidPayload(
                         "Routed inner must be a business message".into(),
@@ -1525,8 +1596,9 @@ fn body_value(value: impl Serialize) -> Option<Value> {
     serde_json::to_value(value).ok()
 }
 
-/// 通道标识。v3 全部承载都是单流：编码为帧内 1 字节标签（见 frame.rs）。
-/// 通道只是消息分类与预算上限的依据（control 禁大载荷、data 独立预算）。
+/// 通道标识。v4 全部承载都是单流：帧头只有 `u32 body_len | u8 kind |
+/// u32 meta_len`，没有通道标签字节——通道由消息类型声明，只作为消息
+/// 分类与预算上限的依据（control 禁大载荷、data 独立预算）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Channel {
     Control,

@@ -186,8 +186,11 @@ TCP loopback 回连传输落地后一并删除。任何平台配置该模式都�
 Windows 及其余平台用 **TCP loopback 回连**——主进程
 bind `127.0.0.1` 临时端口，执行器按 `FLOW_EXECUTOR_CONNECT_ADDR` 回连出单条
 连接（v4 单流，`flow_engine::execution_protocol::loopback`）。回连端口
-只在本机可见，与单用户本机工具的信任域一致；执行器 spawn 仍走
-`env_clear`（仅回填 `RUST_LOG` 与回连地址）。
+只在本机可见，但毫秒窗口内任何本机进程都可能抢连（unix 侧靠 FD 能力防串配，
+loopback 没有对应机制）：spawn 时随机生成会话令牌经
+`FLOW_EXECUTOR_SESSION_TOKEN` 注入执行器、Hello 里回验，抢连者拿不到该值
+（同 uid 进程理论上可读 `/proc/<pid>/environ`，但同 uid 等于已完全失陷）。
+执行器 spawn 仍走 `env_clear`（仅回填 `RUST_LOG`、回连地址与会话令牌）。
 
 ```toml
 [execution]
@@ -552,8 +555,17 @@ agent 明确失败。drain 期间其他 agent 不受影响。
 
 ### 7.1 agent 失联
 
-任务挂起等 Resume（`attach_timeout` 后失败封口）。已授权未封口的操作按 uncertain
-规则保留；缺口与 uncertain 按 §7.5 处理。**其他机器任务不受影响。**
+agent 按 Welcome 协商周期（默认 2s）发上联心跳，主进程以 `HEARTBEAT_TIMEOUT_MS`
+（10s）为界：彻底静默即判失联、结束会话，绑定转入 Resume 对账（§7.3）——
+静默网络分区不会留下僵尸注册。任务挂起等 Resume（`attach_timeout` 后失败封口）。
+已授权未封口的操作按 uncertain 规则保留；缺口与 uncertain 按 §7.5 处理。
+**其他机器任务不受影响。**
+
+派发侧时限语义：`DURABLE_WAIT_TIMEOUT_MS` 是「等待持久 ACK 的空闲上限」，
+不是派发总墙钟——执行期间的心跳/审计流量持续重置计时，长任务（harness 默认
+300s、长 HTTP）不会被误杀；彻底静默超时按失联进入 Resume 对账，连续两次
+（重挂后仍无活跃证据）才硬失败。节点级 `timeout_ms` 有 clamp 上界
+（HTTP 10min / harness 1h），超限等待不会无限占用执行槽位。
 
 ### 7.2 agent 崩溃 / 被杀
 

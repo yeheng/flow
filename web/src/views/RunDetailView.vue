@@ -45,6 +45,17 @@ const asideResize = usePanelResize({
   measure: (rect, e) => rect.right - e.clientX,
 });
 
+// 底部面板：拖上边缘改高度（画布在上、面板在下，上下可调）
+const bottomEl = ref<HTMLElement | null>(null);
+const bottomResize = usePanelResize({
+  target: bottomEl,
+  storageKey: "flow.rundetail-h",
+  fallback: 280,
+  min: 160,
+  max: () => (bottomEl.value?.parentElement?.clientHeight ?? 800) * 0.8,
+  measure: (rect, e) => rect.bottom - e.clientY,
+});
+
 watch(
   () => editor.selectedNodeId,
   (id) => {
@@ -94,6 +105,16 @@ async function copyRunId(): Promise<void> {
   try {
     await navigator.clipboard.writeText(record.value.id);
     toast.info("已复制 run id");
+  } catch {
+    toast.error("复制失败");
+  }
+}
+
+async function copyOutput(): Promise<void> {
+  if (!record.value) return;
+  try {
+    await navigator.clipboard.writeText(fmtJson(record.value.output));
+    toast.info("已复制输出");
   } catch {
     toast.error("复制失败");
   }
@@ -198,31 +219,45 @@ onUnmounted(() => {
           </RouterLink>
         </span>
       </div>
-      <div class="run-header-row">
-        <span class="muted">输入</span>
-        <code class="run-io">{{ fmtJson(record.input) || "（空）" }}</code>
-      </div>
-      <div v-if="record.error" class="run-header-row">
-        <span class="muted">错误</span>
-        <code class="run-io run-io-error">{{ record.error }}</code>
-      </div>
-      <div v-else-if="record.output !== null && record.output !== undefined" class="run-header-row">
-        <span class="muted">输出</span>
-        <code class="run-io">{{ fmtJson(record.output) }}</code>
-      </div>
     </div>
 
-    <div class="run-detail-main">
-      <section class="center">
-        <RunCanvas
-          v-if="definition"
-          :definition="definition"
-          @node-click="onSelectNode"
-          @open-child="onOpenChild"
-        />
-        <div v-else-if="loadingDefinition" class="canvas-hint">加载中…</div>
-        <div v-else class="canvas-hint">工作流定义不可用，仅展示时间线</div>
-      </section>
+    <section class="center">
+      <RunCanvas
+        v-if="definition"
+        :definition="definition"
+        @node-click="onSelectNode"
+        @open-child="onOpenChild"
+      />
+      <div v-else-if="loadingDefinition" class="canvas-hint">加载中…</div>
+      <div v-else class="canvas-hint">工作流定义不可用，仅展示时间线</div>
+    </section>
+
+    <div ref="bottomEl" class="bottom" :style="{ height: bottomResize.size.value + 'px' }">
+      <ResizeHandle
+        orientation="horizontal"
+        class="edge-top"
+        @dragstart="bottomResize.onDragStart"
+      />
+      <div class="io-panel">
+        <template v-if="record">
+          <div class="io-block">
+            <div class="io-label muted">输入</div>
+            <code class="run-io">{{ fmtJson(record.input) || "（空）" }}</code>
+          </div>
+          <div v-if="record.error" class="io-block">
+            <div class="io-label muted">错误</div>
+            <code class="run-io run-io-error">{{ record.error }}</code>
+          </div>
+          <div v-else-if="record.output !== null && record.output !== undefined" class="io-block">
+            <div class="io-label muted">
+              输出
+              <button class="run-copy" title="复制输出 JSON" @click="copyOutput">复制</button>
+            </div>
+            <code class="run-io">{{ fmtJson(record.output) }}</code>
+          </div>
+        </template>
+        <p v-else class="run-hint">加载中…</p>
+      </div>
       <aside ref="asideEl" class="right" :style="{ width: asideResize.size.value + 'px' }">
         <ResizeHandle
           orientation="vertical"
@@ -340,15 +375,42 @@ onUnmounted(() => {
   color: var(--danger);
 }
 
-.run-detail-main {
+.center {
   flex: 1;
-  display: flex;
   min-height: 0;
+  position: relative;
 }
 
-.run-detail-main .center {
+/* 底部面板：左输入/输出，右运行/日志；上边缘拖高度，中间缝拖宽度 */
+.bottom {
+  position: relative;
+  flex-shrink: 0;
+  display: flex;
+  min-height: 0;
+  border-top: 1px solid var(--border);
+}
+
+.edge-top {
+  top: 0;
+}
+
+.io-panel {
   flex: 1;
   min-width: 0;
+  overflow-y: auto;
+  padding: 10px 12px;
+}
+
+.io-block {
+  margin-bottom: 10px;
+}
+
+.io-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  margin-bottom: 2px;
 }
 
 .right {

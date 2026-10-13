@@ -18,11 +18,15 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
-/// 单条 WS 消息字节上限：必须容纳最大 data 帧（`DATA_MAX_FRAME` = 512 KiB）
-/// 及其通道标签，留余量。
+/// 单条 WS 消息字节上限：必须容纳最大 data 帧（`DATA_MAX_FRAME` = 1 MiB）
+/// 的分片。单帧（4 字节头 + ≤1 MiB body）超限时按上限切分为多条 Binary
+/// 消息，读侧帧解码器自会重组——上限本身不需要装下整帧。
 pub const MAX_WS_MESSAGE_BYTES: usize = 1024 * 1024;
-/// 待 flush 写缓冲上限：一次 `write_all` 的整帧不会超过此值。
-pub const MAX_WS_WRITE_BYTES: usize = 1024 * 1024;
+/// 待 flush 写缓冲上限：一次 `write_all` 的整帧不会超过此值。取
+/// `FRAME_LENGTH_BYTES + DATA_MAX_FRAME + 余量`：帧层允许的
+/// `body_len ≤ DATA_MAX_FRAME`，整帧 = 4 + body_len，若上限只取 1 MiB，
+/// 贴着上限的合法帧会在 WSS 上写失败（WouldBlock）而 TCP 上正常。
+pub const MAX_WS_WRITE_BYTES: usize = 1024 * 1024 + 4 + 64;
 
 /// 把 WebSocket 二进制消息适配为字节流（`AsyncRead + AsyncWrite`）。
 pub struct WsByteStream<S> {

@@ -907,7 +907,10 @@ impl TaskRunner {
                     reqwest::Url::parse(&url).map_err(|e| TaskError::Invalid(e.to_string()))?,
                 )
                 .timeout(Duration::from_millis(
-                    params["timeout_ms"].as_u64().unwrap_or(30_000),
+                    params["timeout_ms"]
+                        .as_u64()
+                        .unwrap_or(flow_engine::exec::DEFAULT_HTTP_TIMEOUT_MS)
+                        .clamp(1, flow_engine::exec::HTTP_TIMEOUT_MAX_MS),
                 ));
             if let Some(headers) = params["headers"].as_object() {
                 for (key, value) in headers {
@@ -1134,6 +1137,9 @@ impl TaskRunner {
         let (command, args, workdir, timeout_ms, prompt) =
             flow_engine::exec::harness_request(&params)
                 .map_err(|e| TaskError::Business(e.message))?;
+        // 用户可配 timeout_ms 同样设上限：超限的等待会无限占用执行槽位
+        // （本地/远程都没有对应 wall-clock 预算）。
+        let timeout_ms = timeout_ms.clamp(1, flow_engine::exec::HARNESS_TIMEOUT_MAX_MS);
         let request = json!({
             "command": command,
             "args": args,

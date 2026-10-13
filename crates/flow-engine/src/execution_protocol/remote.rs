@@ -113,11 +113,16 @@ pub fn validate_route_identity(value: &str) -> bool {
     !value.is_empty() && value.len() <= IDENTITY_MAX_BYTES
 }
 
-/// 内层消息必须是可路由的业务帧（禁止嵌套 Routed / 上联管理帧）。
+/// 内层消息必须是可路由的业务帧（禁止嵌套 Routed / 上联管理帧 /
+/// 握手帧）。`Reject` 与 `Heartbeat` 允许：执行器的任务失败通知与心跳
+/// 要经 agent 中继给主进程。
 pub fn routable(inner: &Message) -> bool {
     !matches!(
         inner,
         Message::Routed { .. }
+            | Message::Hello { .. }
+            | Message::Welcome { .. }
+            | Message::Ready
             | Message::AgentHello { .. }
             | Message::AgentWelcome { .. }
             | Message::CapacityReport { .. }

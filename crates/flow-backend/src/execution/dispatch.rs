@@ -185,6 +185,9 @@ pub(crate) struct DispatchRunner {
     /// 本次派发的尝试序号（观测日志归属用；在 drive_link 读记录时对齐）。
     task_attempt: u32,
     remote_replay: bool,
+    /// 连续空闲超时次数（远程链路）：首次按失联走 Resume 对账，第二次
+    /// 硬失败——防「静默执行器 ↔ 重挂」无限循环占用槽位。
+    idle_strikes: u32,
 }
 
 impl DispatchRunner {
@@ -208,6 +211,7 @@ impl DispatchRunner {
             session_healthy: true,
             task_attempt: 1,
             remote_replay: false,
+            idle_strikes: 0,
         }
     }
 
@@ -350,7 +354,17 @@ impl DispatchRunner {
         )));
         let mut transfer_done = false;
         // 主事件循环。
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(DURABLE_WAIT_TIMEOUT_MS);
+        //
+        // 时限语义（契约 §3.7/DURABLE_WAIT_TIMEOUT_MS）：这是「等待持久
+        // ACK 的总超时上限」，不是派发总墙钟——长任务（harness 默认 300s、
+        // 长 HTTP）在执行期间持续有心跳/审计流量，按空闲判定：任何入站
+        // 事件或输入传输完成都重置计时。彻底静默超过上限才按失联处理
+        // （远程进入 Resume 对账，与 contract 的「按失联处理进入排空」
+        // 一致）；连续两次空闲（重挂后仍无活跃证据）才硬失败，防无限
+        // 占用槽位。本地会话另有 10s 心跳看门狗（pool::session_driver），
+        // 空闲上限只对远程链路生效。
+        let idle_limit = Duration::from_millis(DURABLE_WAIT_TIMEOUT_MS);
+        let mut last_progress = tokio::time::Instant::now();
         let mut cancel_tick = tokio::time::interval(Duration::from_millis(100));
         let mut error: Option<crate::journal::JournalError> = None;
         loop {
@@ -361,9 +375,31 @@ impl DispatchRunner {
                 }
                 return Err(err);
             }
+            if self.remote_replay
+                && !self.cancel_sent
+                && last_progress.elapsed() > idle_limit
+            {
+                transfer.abort();
+                if !transfer_done {
+                    let _ = (&mut transfer).await;
+                }
+                self.idle_strikes += 1;
+                self.session_healthy = false;
+                if self.idle_strikes >= 2 {
+                    // 重挂后仍然彻底静默：执行器已失联且对账无法恢复，
+                    // 硬失败（journal_driver 按授权操作状态包装 uncertain）。
+                    return Err(invalid(
+                        "dispatch idle timeout after reconnect; giving up",
+                    ));
+                }
+                return Err(JournalError::LinkClosed(
+                    "dispatch idle timeout; awaiting reconciliation".into(),
+                ));
+            }
             tokio::select! {
                 result = &mut transfer, if !transfer_done => {
                     transfer_done = true;
+                    last_progress = tokio::time::Instant::now();
                     match result {
                         Ok(Ok(())) => {},
                         Ok(Err(InputTransferError::LinkClosed)) => {
@@ -383,6 +419,8 @@ impl DispatchRunner {
                 event = link.events.recv() => {
                     match event {
                         Some(FromSession::Incoming(message)) => {
+                            // 任何入站帧（审计/ACK/结果/心跳）都是活跃证据。
+                            last_progress = tokio::time::Instant::now();
                             match self.handle(*message, link).await {
                                 Ok(Some(())) => {
                                     // 任务完成（ResultCommitted 已发）。
@@ -420,28 +458,28 @@ impl DispatchRunner {
                 }
                 _ = cancel_tick.tick() => {
                     // 持久取消观察：run 终态即发 Cancel 并排空回收。
+                    // 只读终态判定，不 clone 整个 run（大 run 下每 100ms 全量
+                    // 深拷贝是纯浪费）。
                     if !self.cancel_sent {
-                        if let Ok(run) = self.snapshot().await {
-                            if run.terminal() {
-                                self.cancel_sent = true;
-                                self.session_healthy = false; // 取消后进程整体回收
-                                let dispatch = self.attempt.dispatch_id.clone();
-                                let _ = link
-                                    .commands
-                                    .send(ToSession::CancelDispatch(dispatch))
-                                    .await;
-                            }
+                        let run_id = self.attempt.run_id.clone();
+                        let terminal = self
+                            .attempt
+                            .backend
+                            .inspect(|s| {
+                                s.runs.get(&run_id).is_some_and(|run| run.terminal())
+                            })
+                            .await;
+                        if terminal {
+                            self.cancel_sent = true;
+                            self.session_healthy = false; // 取消后进程整体回收
+                            let dispatch = self.attempt.dispatch_id.clone();
+                            let _ = link
+                                .commands
+                                .send(ToSession::CancelDispatch(dispatch))
+                                .await;
                         }
                     }
                 }
-            }
-            if self.remote_replay && tokio::time::Instant::now() > deadline && !self.cancel_sent {
-                self.session_healthy = false;
-                transfer.abort();
-                if !transfer_done {
-                    let _ = (&mut transfer).await;
-                }
-                return Err(invalid("dispatch deadline exceeded"));
             }
         }
     }

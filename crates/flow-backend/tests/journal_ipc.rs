@@ -448,10 +448,17 @@ async fn killing_executor_mid_script_recovers_with_new_process() {
         r.nodes.get("hang").is_some_and(|n| n.prepared.is_some())
     })
     .await;
-    // 只杀本测试标记的执行器，避免并行测试误伤。
-    let victim = wait_for_tagged_executor(&tag).await;
-    unsafe {
-        libc::kill(victim as i32, libc::SIGKILL);
+    // 只杀本测试标记的执行器，避免并行测试误伤。杀「全部」标记进程：
+    // pgrep 首个匹配可能是已被回收的空闲会话（pool 复用/重建的竞态），
+    // 只杀一个会漏掉真正在跑脚本的执行器——那种竞态下运行反而成功，
+    // 是被测语义之外的时序噪声。prepared 已提交 ⇒ 该派发的执行器必然
+    // 在跑脚本（30s hang），此刻杀掉即确定性猝死。
+    let victims = wait_for_tagged_executors(&tag).await;
+    assert!(!victims.is_empty(), "tagged executor process appeared");
+    for pid in victims {
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
     }
     // CI 慢机器：SIGKILL 后会话死亡检测依赖 10s 心跳超时，叠加恢复调度
     // 延迟，20s 窗口在 2 核 runner 上紧张；放宽到 60s（正常路径 ≈12s）。
@@ -658,11 +665,12 @@ async fn journal_events_equivalent_between_in_process_and_ipc() {
 }
 
 /// 等待并返回带指定标记的执行器 PID（测试隔离：只杀自己的进程）。
-async fn wait_for_tagged_executor(tag: &str) -> u32 {
+async fn wait_for_tagged_executors(tag: &str) -> Vec<u32> {
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            if let Some(pid) = tagged_executor_pids(tag).first().cloned() {
-                return pid;
+            let pids = tagged_executor_pids(tag);
+            if !pids.is_empty() {
+                return pids;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

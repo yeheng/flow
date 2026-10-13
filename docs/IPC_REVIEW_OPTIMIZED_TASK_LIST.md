@@ -19,7 +19,13 @@
 | T13 WSS 上联 | ✅ 完成 | `WsByteStream` + `listen_wss` 认证 + agent 客户端 + 集成测试 |
 | **T14 Windows Agent** | ⛔ **未做（条件未触发）** | 无 Windows 产品要求；交叉检查被 rquickjs-sys/aws-lc-sys 原生依赖与缺失 MSVC 工具链阻断，需真实 Windows CI |
 
-补充说明：
+- 第七轮（全面 review 修复，2026-10-13）：
+  - **远程派发时限改为空闲门控**：`DURABLE_WAIT_TIMEOUT_MS` 还原为「等待持久 ACK 的空闲上限」（任何入站帧/输入传输完成重置计时），删除把整个派发当墙钟上限的实现——远程 harness 默认 300s 超时不再被 120s 误杀；连续两次空闲才硬失败（防无限占用槽位）；本地会话另有 10s 心跳看门狗。节点级 `timeout_ms` 增加 clamp 上界（HTTP 10min / harness 1h）。
+  - **v4 帧校验对称化**：kind=0 拒携 raw blob；kind=2（routed-transfer）补校验外层 `v`/`type`、内层元数据 `v`/`type`/dispatch_id 必填，且外层 meta 与 body.envelope 的 dispatch_id 必须等于内层（路由键 = 载荷归属）。
+  - **loopback 防抢连**：spawn 注入随机会话令牌（`FLOW_EXECUTOR_SESSION_TOKEN`），Hello 回验；文档与实现对齐（旧注释声称的 token 并不存在）。
+  - **agent 上联心跳闭环**：agent 按协商周期发心跳；执行器心跳经 agent 补 dispatch_id 中继给主进程（远程长任务的活跃证据）；主进程侧 10s 静默判失联（Suspect 语义落地）；agent 本地执行器会话增加同等看门狗。
+  - 其余加固：监听侧并发握手上限（256）；resume 窗口不再丢弃非 ResumeReply 帧（内联应用 Routed Cancel/ResultCommitted）；WSS 客户端对称 1 MiB 上限 + 认证失败 401；单个执行器 inbox 关闭不再拖翻整条上联；`routable` 收严（禁路由握手帧）；投影通知 `notify_waiters`→`notify_one`（视图滞后从 20ms 轮询压到批次时间，修复 3 个 flow-rpc 契约测试的投影竞态）；帧解码零拷贝、取消观察免全量 clone、`MAX_WS_WRITE_BYTES` 防溢、杀进程测试改杀全部标记进程（消除 pgrep 首匹配竞态）。
+- 既有说明：
 - T12 最终形态是「v4 唯一协议」：v3 帧编解码、base64 `TransferChunk` 路径、`protocol` 配置开关与 `spawn_v4` 双轨全部删除，`PROTOCOL_VERSION = 4`；Journal schema 不变（仍 base64 ValueChunk），WSS 复用同一帧格式。
 - 期间修复的存量缺陷：`listen_tls` 启动阻塞（v3 收敛时改为直跑 accept 死循环）；`data_addr` 存量配置兼容回归。
 - 唯一已知抖动：`journal_ipc::killing_executor_mid_script_recovers_with_new_process`（SIGKILL 时序）在并行负载下偶发失败，单独运行稳定通过。
