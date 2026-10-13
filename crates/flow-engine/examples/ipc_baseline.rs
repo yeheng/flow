@@ -183,6 +183,138 @@ fn main() {
     transport_throughput(500);
     cancel_latency_under_flood();
     t12_breakdown();
+    t12_v4_prototype();
+}
+
+/// T12 实测：同一逻辑内容（256 KiB 传输块）在 v3（base64 + JSON 信封）与
+/// v4 原型（`u32 body_len + u8 kind + u32 meta_len + JSON meta + raw`）下的
+/// 完整往返成本与线字节。v3 计入发送端 base64 编码（真实生产路径在构造
+/// TransferChunk 时做）。
+fn t12_v4_prototype() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let ops = 2_000u64;
+    let raw = vec![0xa5u8; flow_engine::execution_protocol::TRANSFER_CHUNK_BYTES];
+    let digest = hex::encode(sha2::Sha256::digest(&raw));
+    let dispatch = "dispatch-t12";
+    let transfer_id = "in:baseline";
+
+    // ---------- v3：base64 编码 + JSON 信封往返 ----------
+    let mut v3_wire = 0u64;
+    let start = Instant::now();
+    for _ in 0..ops {
+        let encoded = STANDARD.encode(&raw);
+        let message = Message::TransferChunk {
+            dispatch_id: dispatch.into(),
+            transfer_id: transfer_id.into(),
+            offset: 0,
+            bytes: encoded,
+            digest: digest.clone(),
+        };
+        let frame = encode_tagged_frame(&message).expect("encode");
+        v3_wire = frame.len() as u64;
+        let json = &frame[flow_engine::execution_protocol::FRAME_HEADER_BYTES + 1..];
+        let decoded = Message::decode_envelope(json).expect("decode");
+        let Message::TransferChunk { bytes, .. } = &decoded else {
+            unreachable!()
+        };
+        let roundtrip = STANDARD.decode(bytes).expect("b64 decode");
+        std::hint::black_box(roundtrip);
+    }
+    let v3 = start.elapsed();
+
+    // ---------- v4 原型：小 JSON meta + raw 字节 ----------
+    let meta = serde_json::json!({
+        "type": "TransferChunk",
+        "dispatch_id": dispatch,
+        "transfer_id": transfer_id,
+        "offset": "0",
+        "digest": digest,
+    });
+    let meta_bytes = serde_json::to_vec(&meta).unwrap();
+    let mut v4_wire = 0u64;
+    let start = Instant::now();
+    for _ in 0..ops {
+        // encode：预留头 + meta + raw
+        let mut frame = Vec::with_capacity(12 + meta_bytes.len() + raw.len());
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        frame.push(1u8); // kind: TransferChunk
+        frame.extend_from_slice(&(meta_bytes.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&meta_bytes);
+        frame.extend_from_slice(&raw);
+        let body_len = frame.len() - 4;
+        frame[..4].copy_from_slice(&(body_len as u32).to_be_bytes());
+        v4_wire = frame.len() as u64;
+        // decode：解析长度、借用 raw、解析 meta
+        // 布局：0..4 body_len | 4 kind | 5..9 meta_len | 9.. meta | raw
+        let meta_len = u32::from_be_bytes([frame[5], frame[6], frame[7], frame[8]]) as usize;
+        let meta_slice = &frame[9..9 + meta_len];
+        let payload = &frame[9 + meta_len..];
+        let parsed: serde_json::Value = serde_json::from_slice(meta_slice).expect("meta");
+        std::hint::black_box((parsed, payload));
+    }
+    let v4 = start.elapsed();
+
+    let us = |d: std::time::Duration| d.as_micros() as f64 / ops as f64;
+    let (v3_us, v4_us) = (us(v3), us(v4));
+    println!(
+        "\nT12 v3 vs v4 原型 (256KiB transfer, full roundtrip):\n  \
+         v3(base64+json): {v3_us:>8.2} µs/op  wire={v3_wire:>7} B\n  \
+         v4(meta+raw):    {v4_us:>8.2} µs/op  wire={v4_wire:>7} B\n  \
+         speedup={:.2}x  wire_reduction={:.1}%",
+        v3_us / v4_us,
+        (v3_wire - v4_wire) as f64 / v3_wire as f64 * 100.0
+    );
+
+    // ---------- 现实口径：Journal 仍存 base64（Master 边界转回）----------
+    // v3（审计方向）：executor: b64_encode + JSON ser（350KB 字符串）；
+    //               master: JSON parse。
+    // v4（审计方向）：executor: raw 拷贝入帧 + 小 meta；
+    //               master: b64_encode（写 Journal）。
+    // 两端 base64 工作量相抵，实际差异 = 大字符串的 JSON ser+parse。
+    let start = Instant::now();
+    for _ in 0..ops {
+        let encoded = STANDARD.encode(&raw);
+        let message = Message::AuditBatch {
+            dispatch_id: dispatch.into(),
+            first_seq: 1,
+            records: vec![AuditRecord {
+                audit_seq: 1,
+                kind: "value_chunk".into(),
+                payload: serde_json::json!({"data": encoded}),
+            }],
+        };
+        let frame = encode_tagged_frame(&message).expect("encode");
+        let json = &frame[flow_engine::execution_protocol::FRAME_HEADER_BYTES + 1..];
+        let decoded = Message::decode_envelope(json).expect("decode");
+        std::hint::black_box(decoded);
+    }
+    let v3_audit = start.elapsed();
+
+    let start = Instant::now();
+    for _ in 0..ops {
+        let mut frame = Vec::with_capacity(12 + meta_bytes.len() + raw.len());
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        frame.push(1u8);
+        frame.extend_from_slice(&(meta_bytes.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&meta_bytes);
+        frame.extend_from_slice(&raw);
+        let meta_len = u32::from_be_bytes([frame[5], frame[6], frame[7], frame[8]]) as usize;
+        let payload = &frame[9 + meta_len..];
+        let _ = serde_json::from_slice::<serde_json::Value>(&frame[9..9 + meta_len]).expect("meta");
+        // master 边界：raw → base64（写 Journal，schema 不变）。
+        let journal_chunk = STANDARD.encode(payload);
+        std::hint::black_box(journal_chunk);
+    }
+    let v4_audit = start.elapsed();
+    println!(
+        "T12 现实口径 (audit, Journal 仍存 base64):\n  \
+         v3: {:.2} µs/op\n  \
+         v4: {:.2} µs/op\n  \
+         speedup={:.2}x",
+        us(v3_audit),
+        us(v4_audit),
+        us(v3_audit) / us(v4_audit),
+    );
 }
 
 /// T12 进入条件测量：把最大传输块的处理成本拆成「信封 JSON」「base64

@@ -17,6 +17,7 @@ pub mod remote;
 pub mod spawn;
 pub mod transfer_key;
 pub mod transport;
+pub mod ws;
 #[cfg(unix)]
 pub mod unix;
 

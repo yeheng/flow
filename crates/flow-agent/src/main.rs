@@ -52,6 +52,12 @@ struct Agent {
     /// 本机执行槽位。
     #[arg(long, env = "FLOW_AGENT_SLOTS")]
     slots: Option<u32>,
+    /// WSS 上联地址（T13，代理终止 TLS 场景）；设置后优先于 mTLS 直连。
+    #[arg(long, env = "FLOW_AGENT_WSS_URL")]
+    wss_url: Option<String>,
+    /// WSS 共享令牌（与 agent_id 一起做显式认证映射）。
+    #[arg(long, env = "FLOW_AGENT_TOKEN")]
+    token: Option<String>,
 }
 
 fn main() -> std::process::ExitCode {
@@ -81,6 +87,8 @@ fn main() -> std::process::ExitCode {
         key,
         executor_bin,
         slots,
+        wss_url,
+        token,
         ..
     } = agent;
     // data_addr 已废弃（v3 单条 TLS 上联）：仅为存量启动参数兼容保留，忽略。
@@ -94,6 +102,8 @@ fn main() -> std::process::ExitCode {
         key,
         executor_bin,
         slots,
+        wss_url,
+        token,
     );
     if code != 0 {
         return std::process::ExitCode::from(code.clamp(0, 255) as u8);
@@ -117,6 +127,8 @@ fn agent_main(
     flag_key: Option<String>,
     flag_executor_bin: Option<String>,
     flag_slots: Option<u32>,
+    flag_wss_url: Option<String>,
+    flag_token: Option<String>,
 ) -> i32 {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -130,42 +142,45 @@ fn agent_main(
                 format!("缺少 {name}：用 CLI 参数、{name} 对应环境变量或配置文件 [agent] 分区提供")
             })
         };
-    let control_addr = match required(
-        flag_control_addr,
-        agent.control_addr.clone(),
-        "control_addr",
-    ) {
-        Ok(v) => v,
-        Err(err) => return fail(&err),
+    // WSS 模式（T13）：走代理承载，mTLS 证书与 control_addr 不必配置。
+    let wss_url = flag_wss_url.or(agent.wss_url.clone());
+    let token = flag_token.or(agent.token.clone());
+    let wss_mode = wss_url.is_some();
+    let control_addr = if wss_mode {
+        flag_control_addr
+            .or(agent.control_addr.clone())
+            .unwrap_or_default()
+    } else {
+        match required(
+            flag_control_addr,
+            agent.control_addr.clone(),
+            "control_addr",
+        ) {
+            Ok(v) => v,
+            Err(err) => return fail(&err),
+        }
     };
     let agent_id = match required(flag_agent_id, agent.agent_id.clone(), "agent_id") {
         Ok(v) => v,
         Err(err) => return fail(&err),
     };
-    let ca_cert = match required(
-        flag_ca_cert,
-        agent
-            .ca_cert
-            .clone()
-            .map(|p| p.to_string_lossy().into_owned()),
-        "ca_cert",
-    ) {
+    let optional_path = |flag: Option<String>, configured: Option<PathBuf>, name: &str| -> Result<String, String> {
+        if wss_mode {
+            return Ok(flag
+                .or(configured.map(|p| p.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| "unused".into()));
+        }
+        required(flag, configured.map(|p| p.to_string_lossy().into_owned()), name)
+    };
+    let ca_cert = match optional_path(flag_ca_cert, agent.ca_cert.clone(), "ca_cert") {
         Ok(v) => v,
         Err(err) => return fail(&err),
     };
-    let cert = match required(
-        flag_cert,
-        agent.cert.clone().map(|p| p.to_string_lossy().into_owned()),
-        "cert",
-    ) {
+    let cert = match optional_path(flag_cert, agent.cert.clone(), "cert") {
         Ok(v) => v,
         Err(err) => return fail(&err),
     };
-    let key = match required(
-        flag_key,
-        agent.key.clone().map(|p| p.to_string_lossy().into_owned()),
-        "key",
-    ) {
+    let key = match optional_path(flag_key, agent.key.clone(), "key") {
         Ok(v) => v,
         Err(err) => return fail(&err),
     };
@@ -193,6 +208,8 @@ fn agent_main(
         key: key.into(),
         executor,
         slots,
+        wss_url,
+        token,
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

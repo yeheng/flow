@@ -34,6 +34,10 @@ pub struct AgentConfig {
     /// 执行器召唤方式：合并二进制自召唤（缺省）或显式独立二进制。
     pub executor: ExecutorInvocation,
     pub slots: u32,
+    /// WSS 上联地址（T13，代理终止 TLS 场景）；设置后优先于 mTLS 直连。
+    pub wss_url: Option<String>,
+    /// WSS 共享令牌（与 `x-flow-agent-id` 一起做显式认证映射）。
+    pub token: Option<String>,
 }
 
 /// agent 运行入口：循环「连接 → 服务 → 断线 → 退避重连」，直到 shutdown。
@@ -115,11 +119,15 @@ pub async fn run_agent(config: AgentConfig, shutdown: CancellationToken) -> Stri
     }
 }
 
-/// 建立上联：单条 TLS 连接（v3 标签帧）→ AgentHello → AgentWelcome。
+/// 建立上联（T13）：按配置选择 mTLS 直连或 WSS，随后走同一套
+/// AgentHello/AgentWelcome 握手（transport 复用）。
 async fn connect(
     config: &AgentConfig,
     agent_boot_id: &str,
 ) -> std::result::Result<(FrameTransport, String, String, u64), String> {
+    if config.wss_url.is_some() {
+        return connect_wss(config, agent_boot_id).await;
+    }
     let connector = tls::client_config_from_files(&config.ca_cert, &config.cert, &config.key)
         .map_err(|e| format!("tls config: {e}"))?;
     let tcp = tokio::net::TcpStream::connect(&config.control_addr)
@@ -136,7 +144,54 @@ async fn connect(
     // 握手全程走同一条 transport（T02）：先建传输再收发 AgentHello/
     // AgentWelcome。不再用临时 decoder 取首帧后丢弃——一次 read 里 Welcome
     // 之后的尾随字节不会在交接时丢失。
-    let mut transport = FrameTransport::spawn(stream, 128);
+    let transport = FrameTransport::spawn(stream, 128);
+    handshake(transport, config, agent_boot_id).await
+}
+
+/// WSS 上联（T13）：明文 TCP（代理终止 TLS）+ 显式认证头；同一套帧/握手。
+async fn connect_wss(
+    config: &AgentConfig,
+    agent_boot_id: &str,
+) -> std::result::Result<(FrameTransport, String, String, u64), String> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let url = config
+        .wss_url
+        .clone()
+        .ok_or_else(|| "wss url missing".to_string())?;
+    let token = config.token.clone().unwrap_or_default();
+    let mut request = url
+        .into_client_request()
+        .map_err(|e| format!("wss request: {e}"))?;
+    let headers = request.headers_mut();
+    headers.insert(
+        "x-flow-agent-id",
+        config
+            .agent_id
+            .parse()
+            .map_err(|_| "invalid agent id header".to_string())?,
+    );
+    headers.insert(
+        "authorization",
+        format!("Bearer {token}")
+            .parse()
+            .map_err(|_| "invalid token header".to_string())?,
+    );
+    let (ws, _response) = tokio_tungstenite::connect_async(request)
+        .await
+        .map_err(|e| format!("wss connect: {e}"))?;
+    let transport = FrameTransport::spawn(
+        flow_engine::execution_protocol::ws::WsByteStream::new(ws),
+        128,
+    );
+    handshake(transport, config, agent_boot_id).await
+}
+
+/// 上联握手：AgentHello → AgentWelcome（transport 已建立，与承载无关）。
+async fn handshake(
+    mut transport: FrameTransport,
+    config: &AgentConfig,
+    agent_boot_id: &str,
+) -> std::result::Result<(FrameTransport, String, String, u64), String> {
     let hello = Message::AgentHello {
         agent_boot_id: agent_boot_id.to_string(),
         build: crate::AGENT_BUILD.into(),
@@ -169,8 +224,6 @@ async fn connect(
     else {
         return Err("expected AgentWelcome".into());
     };
-    // journal_id / master_epoch 是权威身份：执行器握手与 ValueRef 盖章都以它
-    // 为准（主进程 reducer 会拒绝 journal_id 不符的发布）。
     Ok((transport, link_session_id, journal_id, master_epoch))
 }
 
@@ -297,6 +350,7 @@ fn queue_uplink(
         .map_err(|_| "uplink send failed".to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     config: &AgentConfig,
     _agent_boot_id: &str,

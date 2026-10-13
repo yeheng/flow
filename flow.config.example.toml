@@ -46,6 +46,9 @@ x_max = 4
 # key = "/etc/flow/agent-1.key"
 # executor_bin = "/usr/local/bin/flow-executor"
 # slots = 4
+# WSS 上联（T13，反向代理终止 TLS 场景）；设置后优先于 mTLS 直连，证书可省。
+# wss_url = "ws://127.0.0.1:9710/ws/agent"
+# token = "共享令牌（FLOW_AGENT_TOKEN）"
 
 # `flow-journal-server`（JSONL v2 产品服务）；token 仍是环境变量 FLOW_JOURNAL_TOKEN（凭据不进配置文件）
 # [journal]

@@ -50,6 +50,10 @@ pub struct RemoteOptions {
     pub server_key: PathBuf,
     // 断链后等待 agent 重连对账的总时限（超时按派发失败处理）。
     pub attach_timeout_ms: u64,
+    // WSS 接入监听地址（T13，代理终止 TLS 场景的附加承载）；缺省关闭。
+    pub wss_addr: Option<String>,
+    // WSS 共享令牌（与 x-flow-agent-id 一起做显式认证映射）。
+    pub agent_token: Option<String>,
 }
 
 impl RemoteOptions {
@@ -276,6 +280,85 @@ impl AgentManager {
                         return;
                     };
                     manager.inject_stream(agent_id, Box::pin(stream)).await;
+                });
+            }
+        });
+        Ok(())
+    }
+
+    /// WSS 接入（T13）：反向代理/统一入口场景的**附加**承载。明文 TCP，
+    /// 由代理终止 TLS；身份通过显式认证映射（`Authorization: Bearer <token>`
+    /// + `x-flow-agent-id`）确定，不信任客户端自报以外的任何隐式身份。
+    ///
+    /// 直连 mTLS 路径（[`AgentManager::listen_tls`]）不变。
+    ///
+    /// 协议层面：一条完整 v3 帧对应一条 WS Binary 消息；Text/超限消息拒绝；
+    /// 协商上限由 [`MAX_WS_MESSAGE_BYTES`] 硬约束。
+    #[allow(clippy::result_large_err)] // accept_hdr 回调签名固定，ErrorResponse 为大类型
+    pub async fn listen_wss(self: &Arc<Self>, addr: String, token: String) -> Result<()> {
+        use tokio_tungstenite::tungstenite::handshake::server::{
+            ErrorResponse, Request, Response,
+        };
+        use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+
+        let listener = TcpListener::bind(&addr)
+            .await
+            .map_err(|e| invalid(format!("agent wss listen: {e}")))?;
+        tracing::info!(
+            listen = %listener.local_addr().map_err(|e| invalid(e.to_string()))?,
+            "agent WSS listener ready"
+        );
+        let manager = self.clone();
+        let limit = Some(flow_engine::execution_protocol::ws::MAX_WS_MESSAGE_BYTES);
+        let config = Some(
+            WebSocketConfig::default()
+                .max_message_size(limit)
+                .max_frame_size(limit),
+        );
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let manager = manager.clone();
+                let token = token.clone();
+                tokio::spawn(async move {
+                    let agent_slot: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+                        std::sync::Arc::new(std::sync::Mutex::new(None));
+                    let slot = agent_slot.clone();
+                    let handshake = tokio_tungstenite::accept_hdr_async_with_config(
+                        socket,
+                        move |request: &Request, response: Response| {
+                            match authenticate_wss(request, &token) {
+                                Some(agent_id) => {
+                                    *slot.lock().unwrap_or_else(|p| p.into_inner()) =
+                                        Some(agent_id);
+                                    Ok(response)
+                                }
+                                None => Err(ErrorResponse::new(Some(
+                                    "unauthorized agent".to_string(),
+                                ))),
+                            }
+                        },
+                        config,
+                    )
+                    .await;
+                    let Ok(ws) = handshake else {
+                        return;
+                    };
+                    let agent_id = agent_slot
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .take();
+                    let Some(agent_id) = agent_id else {
+                        return;
+                    };
+                    manager
+                        .inject_stream(
+                            agent_id,
+                            Box::pin(flow_engine::execution_protocol::ws::WsByteStream::new(ws)),
+                        )
+                        .await;
                 });
             }
         });
@@ -1165,6 +1248,40 @@ impl Drop for BindingGuard {
             manager.unbind(&dispatch_id, false).await;
         });
     }
+}
+
+/// WSS 认证映射（T13）：校验 `Authorization: Bearer <token>`（常量时间比较）
+/// 并取显式 `x-flow-agent-id`；返回已认证的 agent_id。代理终止 TLS 场景下
+/// 这是唯一的身份来源——绝不信任客户端自报以外的隐式身份。
+fn authenticate_wss(
+    request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+    token: &str,
+) -> Option<String> {
+    let provided = request
+        .headers()
+        .get("authorization")?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")?;
+    if !constant_time_eq(provided.as_bytes(), token.as_bytes()) {
+        return None;
+    }
+    let agent_id = request.headers().get("x-flow-agent-id")?.to_str().ok()?;
+    if !validate_route_identity(agent_id) {
+        return None;
+    }
+    Some(agent_id.to_string())
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 #[cfg(test)]

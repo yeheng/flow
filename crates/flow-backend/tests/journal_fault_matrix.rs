@@ -24,6 +24,8 @@ fn remote_options() -> flow_backend::execution::remote::RemoteOptions {
         server_cert: "c.pem".into(),
         server_key: "k.pem".into(),
         attach_timeout_ms: 10_000,
+        wss_addr: None,
+        agent_token: None,
     }
 }
 
@@ -39,6 +41,8 @@ fn agent_config(agent_id: &str, slots: u32) -> AgentConfig {
             prefix: vec![],
         },
         slots,
+        wss_url: None,
+        token: None,
     }
 }
 
@@ -325,7 +329,7 @@ async fn matrix_disconnect_before_result_committed_no_duplicate_side_effect() {
         run_now
             .nodes
             .iter()
-            .map(|(id, node)| (id.clone(), node.status.clone(), node.error.clone()))
+            .map(|(id, node)| (id.clone(), node.status, node.error.clone()))
             .collect::<Vec<_>>()
     );
     tokio::time::sleep(Duration::from_millis(500)).await;

@@ -125,7 +125,11 @@ impl JournalBackend {
             epoch,
         );
         manager.listen_tls(options.clone()).await?;
-        let dispatcher = Arc::new(RemoteDispatcher::new(manager, options));
+        // T13：配置了 WSS 时附加启动代理接入监听（直连 mTLS 不变）。
+        if let (Some(addr), Some(token)) = (&options.wss_addr, &options.agent_token) {
+            manager.listen_wss(addr.clone(), token.clone()).await?;
+        }
+        let dispatcher = Arc::new(RemoteDispatcher::new(manager, options.clone()));
         self.start_execution_with_port(16, ExecutionPort::Remote(dispatcher))
             .await
     }

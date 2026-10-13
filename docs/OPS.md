@@ -242,6 +242,34 @@ slots   = 4
 # executor_bin 缺省定位同目录 flow-executor；FLOW_EXECUTOR_BIN 亦可覆盖
 ```
 
+#### WSS 上联（T13：反向代理/统一入口的附加承载）
+
+当 agent 位于反向代理之后（代理终止 TLS、统一入口），可用 WSS 承载，**不替换**
+直连 mTLS——两者复用同一套帧格式、握手、会话校验与裁决，Executor 不感知 WS。
+
+主进程侧（`[execution.remote]` 追加；配置即附加启动 WSS 监听）：
+
+```toml
+[execution.remote]
+# ... control_addr / 证书同前 ...
+wss_addr    = "127.0.0.1:9710"   # 仅本机/代理回环；代理负责 TLS 终止
+agent_token = "共享令牌"          # 与 x-flow-agent-id 一起做显式认证映射
+```
+
+执行机侧：
+
+```sh
+flow-agent --wss-url ws://127.0.0.1:9710/ws/agent   --agent-id agent-a --token 共享令牌 --slots 4
+# 或 [agent].wss_url / [agent].token；env：FLOW_AGENT_WSS_URL / FLOW_AGENT_TOKEN
+```
+
+- **认证边界**：代理终止 TLS 后，身份只能来自显式映射——请求必须带
+  `Authorization: Bearer <agent_token>`（常量时间比较）与 `x-flow-agent-id`
+  （须为合法身份串）。任缺即拒；不信任客户端自报以外的隐式身份。
+- **协议**：一条完整 v3 帧对应一条 WS Binary 消息；Text 与超限消息拒绝；
+  Ping 自动回 Pong；Close 视作 EOF。读写缓冲与消息长度均有硬上限。
+- 直连（无代理）场景继续用上面的 mTLS 路径；`wss_addr` 缺省关闭。
+
 #### 证书与身份（mTLS 是安全边界，不是可选项）
 
 - PKI：内部 CA 签发 server 证书与每台 agent 证书。**证书 CN 即 agent_id**：主进程

@@ -109,6 +109,8 @@ pub fn remote_options_from_config(
         server_cert: remote.cert.clone(),
         server_key: remote.key.clone(),
         attach_timeout_ms: remote.attach_timeout_ms,
+        wss_addr: remote.wss_addr.clone(),
+        agent_token: remote.agent_token.clone(),
     })
 }
 

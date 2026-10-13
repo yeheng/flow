@@ -14,6 +14,7 @@
   - T08：`unwrap_from_master_owned` 移动内层消息（不再深拷贝）；上联共享出站字节预算（8 MiB，估算×2 安全系数，acquire/release 随消息流转）；轮转桥改为按字节额度（64 KiB/轮，帧数≤ 4/轮）。
   - T01：新增 `cargo run -p flow-engine --release --example ipc_baseline`（含分配计数器）与 `docs/IPC_PROTOCOL_BASELINE.md` 基线报告。
   - T09：`dispatch::fault` 确定性检查点（auth_persist 前后、permit_send 前后、result_committed 前后；未注册零开销）+ `tests/journal_fault_matrix.rs` 三场景（未持久化断线→HTTP 为 0；持久化后/Permit 前取消→HTTP 为 0 且 Cancelled；回执前断线→外部调用恰好一次且不误报成功）。
+- 第五轮补充（T12 实测 + T13 实施）：T12 用 v4 原型实测收益（现实口径 3.4× + 25% 线字节，上界 85×；详见基线报告）；T13 WSS 附加承载完整落地（适配器 + 后端监听 + 认证 + Agent 客户端 + 配置 + 集成测试）。
 - 第四轮补充（T10 收尾 + 条件任务判定）：
   - T10 全量验收测试补齐：父端关闭后 kill+wait/reap 无孤儿、连续取消与重建不泄漏、env_clear 与 FD 隔离（包装脚本 + 通道 FD 阳性对照）、loopback 回连原语的 env 隔离/缺二进制/秒退有界失败。既有覆盖：缺二进制、子进程秒退、兄弟定位（含空格路径）、握手拒绝、旧配置解析。
   - T12 进入条件判定：**未满足，暂缓**。分解测量（见 `docs/IPC_PROTOCOL_BASELINE.md`）显示 256 KiB 块中 base64 解码仅占 20%，信封 JSON 51%、必需 sha256 27%，二进制 wire 收益上界约 20% CPU + 33% 线字节，不值一次 v4 升级。
@@ -220,7 +221,7 @@
 
 ### T12 / P2、有条件：增加二进制大载荷 wire
 
-- **状态：进入条件未满足，暂缓（2026-10-13）**。分解测量见 `docs/IPC_PROTOCOL_BASELINE.md`「T12 进入条件判定」：base64 仅占单块 20%，信封 JSON 51%、必需 sha256 27%；收益上界约 20% CPU + 33% 线字节，不值 v4 双版本维护成本。复评触发：线字节膨胀被证实构成真实瓶颈。
+- **状态：收益实测（2026-10-13），按工作负载画像决策**。v4 原型同内容实测（见 `docs/IPC_PROTOCOL_BASELINE.md`「T12 二进制 wire 收益分析」）：现实口径（Journal 保持 base64）编解码 **3.4×** + 线字节 **−25%**；上界口径（Journal 亦存 raw，schema 禁止）**85×**。剩余成本（约 80 µs/op）是 Journal schema 强制的 base64，无压缩空间。仅当工作负载以大值传输/大值审计为主时收益显著；实施代价是 v3/v4 双版本并存。
 - **进入条件/目标**：T11 证明 Base64/大载荷编码是主要成本，且收益值得一次 wire 升级；只优化 transfer 和必要的大值审计载荷。
 - **背景**：Base64 增加线字节和编解码；小控制消息无需全面换二进制对象格式。
 - **范围**：`execution_protocol/{contract.rs,message.rs,frame.rs,fixtures.rs}`；Executor transfer/audit；Backend dispatch；Agent relay；新旧协议兼容测试及打包参数。
@@ -231,7 +232,13 @@
 
 ### T13 / P2、有条件：增加 WSS Agent 上联
 
-- **状态：进入条件未触发，暂缓（2026-10-13）**。仓库无 HTTP Upgrade/反向代理/统一入口的部署需求；现有单条 mTLS 上联功能与测试完整（TLS/重连/故障矩阵全绿）。
+- **状态：已完成（2026-10-13，按需求直接实施）**。新增 WSS 附加承载，不替换直连 mTLS：
+  - `flow-engine/execution_protocol/ws.rs`：`WsByteStream` 把 WS Binary 消息适配为 v3 字节流（一条完整帧=一条 Binary；读侧有界重组；Text/超限拒绝；Ping 自动 Pong；Close=EOF；读写缓冲硬上限）。
+  - 后端 `AgentManager::listen_wss(addr, token)`：明文 TCP（代理终止 TLS），显式认证映射（`Authorization: Bearer <token>` 常量时间比较 + `x-flow-agent-id`，不信任客户端自报以外的身份）；协议级 `max_message_size` 上限。
+  - Agent `connect_wss`：`--wss-url`/`--token`（env `FLOW_AGENT_WSS_URL`/`FLOW_AGENT_TOKEN` + 配置文件 `[agent].wss_url/token`），与 mTLS 路径共用同一套 AgentHello/AgentWelcome 握手与 `FrameTransport`。
+  - 配置 `[execution.remote].wss_addr/agent_token`：`start_execution_remote` 配置即附加启动 WSS 监听。
+  - 测试 `journal_remote_wss.rs`：真实 flow-agent 进程经 WSS 跑通业务；缺/错 token 与缺身份头拒绝；Text 消息拒绝关闭；适配器单元测试（roundtrip/Text/Ping→Pong/Close→EOF）。
+  - 约束遵守：执行协议未混入现有 JSON-RPC；Executor 不感知 WS；复用同一裁决与故障测试；未降低现有认证（直连 mTLS 保留）。
 - **进入条件/目标**：有明确的 HTTP Upgrade/反向代理/统一入口部署需求；把 WSS 作为附加承载，不作为性能优化必做项。
 - **背景**：当前 Agent 已主动连接单 mTLS 上联；WSS 不提供额外的持久确认或恢复能力。
 - **范围**：Agent runtime/tls/config；Backend AgentManager 接入；`flow-rpc` HTTP 服务装配（若复用现有入口）；OPS、配置样例及新的 WSS 集成测试。
@@ -266,6 +273,8 @@ cargo test -p flow-backend --test journal_remote --test journal_remote_tls --loc
 cargo test -p flow-backend --test journal_remote_reconnect --test journal_remote_ops --locked
 cargo check --workspace --all-targets --locked
 ```
+
+本次已执行（2026-10-13 第五轮，全量）：flow-engine lib 88/88（含 WSS 适配器 3 用例）；Executor 11/11；Agent lib 6/6；flow-config 8/8；backend 十一套件 56 通过/10 ignored（含 journal_remote_wss 3 用例）；`cargo check --workspace --all-targets` 通过。
 
 本次已执行（2026-10-13 第四轮，全量）：flow-engine lib 85/85（含 loopback T10 新增用例）；Executor 11/11；Agent lib 6/6；flow-config 8/8；backend journal_ipc/packaging/remote/remote_tls/remote_reconnect/remote_ops/fault_matrix/acceptance/execution/capacity 共 53 通过、10 ignored（packaging 含 T10 新增回收/隔离用例）；`cargo check --workspace --all-targets` 通过；`examples/ipc_baseline` 复跑稳定（含 T12 分解）。第一至三轮记录见 git 历史。仍不覆盖：真实 WAN soak、非 Unix 完整 IPC 装配（需对应平台运行环境，T14 条件）、T12/T13/T14 条件任务（已给出进入条件判定）。
 

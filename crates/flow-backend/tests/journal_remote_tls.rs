@@ -80,6 +80,8 @@ fn remote_options(
         server_cert: dir.join("server.pem"),
         server_key: dir.join("server.key"),
         attach_timeout_ms: 10_000,
+        wss_addr: None,
+        agent_token: None,
     }
 }
 

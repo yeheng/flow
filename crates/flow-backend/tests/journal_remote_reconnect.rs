@@ -31,6 +31,8 @@ fn remote_options() -> flow_backend::execution::remote::RemoteOptions {
         server_cert: "unused".into(),
         server_key: "unused".into(),
         attach_timeout_ms: 15_000,
+        wss_addr: None,
+        agent_token: None,
     }
 }
 
@@ -43,6 +45,8 @@ fn agent_config() -> AgentConfig {
         key: "unused".into(),
         executor: executor(),
         slots: 4,
+        wss_url: None,
+        token: None,
     }
 }
 

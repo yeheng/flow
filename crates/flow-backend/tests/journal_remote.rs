@@ -34,6 +34,8 @@ fn remote_options() -> flow_backend::execution::remote::RemoteOptions {
         server_cert: "unused".into(),
         server_key: "unused".into(),
         attach_timeout_ms: 30_000,
+        wss_addr: None,
+        agent_token: None,
     }
 }
 
@@ -56,6 +58,8 @@ async fn spawn_simulated_agent(
         key: "unused".into(),
         executor: executor(),
         slots,
+        wss_url: None,
+        token: None,
     };
     let shutdown = tokio_util::sync::CancellationToken::new();
     tokio::spawn(async move {

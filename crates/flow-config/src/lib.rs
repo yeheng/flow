@@ -171,6 +171,10 @@ pub struct RemoteExecutionConfig {
     pub cert: PathBuf,
     pub key: PathBuf,
     pub attach_timeout_ms: u64,
+    /// WSS 接入监听地址（T13，代理终止 TLS 场景的附加承载）；缺省关闭。
+    pub wss_addr: Option<String>,
+    /// WSS 共享令牌（与 `x-flow-agent-id` 一起做显式认证映射）。
+    pub agent_token: Option<String>,
 }
 
 impl Default for RemoteExecutionConfig {
@@ -182,6 +186,8 @@ impl Default for RemoteExecutionConfig {
             cert: PathBuf::new(),
             key: PathBuf::new(),
             attach_timeout_ms: 120_000,
+            wss_addr: None,
+            agent_token: None,
         }
     }
 }
@@ -201,6 +207,10 @@ pub struct AgentConfig {
     pub key: Option<PathBuf>,
     pub executor_bin: Option<String>,
     pub slots: u32,
+    /// WSS 上联地址（T13，代理终止 TLS 场景）；设置后优先于 mTLS 直连。
+    pub wss_url: Option<String>,
+    /// WSS 共享令牌（与 agent_id 一起做显式认证映射）。
+    pub token: Option<String>,
 }
 
 impl Default for AgentConfig {
@@ -214,6 +224,8 @@ impl Default for AgentConfig {
             key: None,
             executor_bin: None,
             slots: 4,
+            wss_url: None,
+            token: None,
         }
     }
 }
@@ -403,6 +415,13 @@ impl Config {
         if let Some(remote) = &self.execution.remote {
             if remote.control_addr.is_empty() {
                 return Err("execution.remote.control_addr 不能为空".into());
+            }
+            // T13：WSS 监听地址与共享令牌必须成对配置（认证不能留空）。
+            if remote.wss_addr.is_some() != remote.agent_token.is_some() {
+                return Err(
+                    "execution.remote.wss_addr 与 agent_token 必须同时配置（WSS 认证不可留空）"
+                        .into(),
+                );
             }
             if remote.ca_cert.as_os_str().is_empty()
                 || remote.cert.as_os_str().is_empty()
@@ -775,6 +794,18 @@ data_dir = "/var/lib/flow/journal"
         assert!(stale.is_err(), "退役的 [server] 键必须被拒绝");
         let result = Config::merge_patch(&Config::default(), &serde_json::json!({"bogus": {}}));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn wss_requires_addr_and_token_together() {
+        // T13：WSS 监听与共享令牌成对；单边配置必须报错。
+        let base = "[execution.remote]\ncontrol_addr = \"127.0.0.1:1\"\nca_cert = \"a\"\ncert = \"b\"\nkey = \"c\"\n";
+        let only_addr = toml::from_str::<Config>(&format!("{base}wss_addr = \"127.0.0.1:2\"\n")).unwrap();
+        assert!(only_addr.validate().is_err());
+        let only_token = toml::from_str::<Config>(&format!("{base}agent_token = \"t\"\n")).unwrap();
+        assert!(only_token.validate().is_err());
+        let both = toml::from_str::<Config>(&format!("{base}wss_addr = \"127.0.0.1:2\"\nagent_token = \"t\"\n")).unwrap();
+        assert!(both.validate().is_ok());
     }
 
     #[test]
