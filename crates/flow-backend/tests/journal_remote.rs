@@ -14,6 +14,7 @@ use flow_journal::{JournalOptions, StoredValue};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
+use flow_engine::journal_state::{RunStatus};
 
 fn temp() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("flow-journal-r0-{}", uuid::Uuid::now_v7()))
@@ -29,7 +30,6 @@ fn executor() -> flow_engine::execution_protocol::contract::ExecutorInvocation {
 fn remote_options() -> flow_backend::execution::remote::RemoteOptions {
     flow_backend::execution::remote::RemoteOptions {
         control_addr: "127.0.0.1:0".into(),
-        data_addr: "127.0.0.1:0".into(),
         ca_cert: "unused".into(),
         server_cert: "unused".into(),
         server_key: "unused".into(),
@@ -193,7 +193,7 @@ async fn relay_path_produces_identical_authoritative_facts() {
         .unwrap();
     let run_direct = created.result["run_id"].as_str().unwrap().to_string();
     let done_direct = until(&direct, &run_direct, Run::terminal).await;
-    assert_eq!(done_direct.status, "succeeded");
+    assert_eq!(done_direct.status, RunStatus::Succeeded);
     direct.close().await.unwrap();
 
     // 中继路径（三期 in-process agent + 真实执行器）。
@@ -220,14 +220,14 @@ async fn relay_path_produces_identical_authoritative_facts() {
         .unwrap();
     let run_relay = created.result["run_id"].as_str().unwrap().to_string();
     let done_relay = until(&relay_backend, &run_relay, Run::terminal).await;
-    if done_relay.status != "succeeded" {
+    if done_relay.status != RunStatus::Succeeded {
         let mut report = String::new();
         for (id, n) in &done_relay.nodes {
             report.push_str(&format!(
                 "  {id}: {} err={:?} wait={:?}\n",
                 n.status,
                 n.error,
-                n.wait.as_ref().map(|w| w.kind.clone())
+                n.wait.as_ref().map(|w| w.kind)
             ));
         }
         panic!("relay run failed: {:?}\n{}", done_relay.error, report);
@@ -366,7 +366,6 @@ fn relay_cannot_wrap_authoritative_control_frames() {
         master_epoch: 1,
         link_session_id: "l".into(),
         agent_id: "a".into(),
-        data_credential: "c".into(),
         heartbeat_ms: 1,
         agent_window_bytes: 1,
     }));
@@ -442,12 +441,12 @@ async fn remote_http_and_large_output_commit_refs() {
     let done = until(&backend, &run_id, Run::terminal).await;
     assert_eq!(
         done.status,
-        "succeeded",
+        RunStatus::Succeeded,
         "remote 非_inline 值必须能提交：{:?}; nodes: {:?}",
         done.error,
         done.nodes
             .iter()
-            .map(|(id, n)| (id.clone(), n.status.clone(), n.error.clone()))
+            .map(|(id, n)| (id.clone(), n.status, n.error.clone()))
             .collect::<Vec<_>>()
     );
 

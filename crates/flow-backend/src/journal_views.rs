@@ -6,7 +6,7 @@ use flow_dto::{
     NodeTemplate, NodeTemplateSummary, RunRecord, RunStats, Schedule, Webhook, WorkflowRunStats,
     WorkflowSummary, WorkflowVersion, STATUS_DRAFT, STATUS_PUBLISHED,
 };
-use flow_engine::journal_state::{Run as JournalRun, Workflow as JournalWorkflow};
+use flow_engine::journal_state::{Run as JournalRun, WaitKind, Workflow as JournalWorkflow};
 use flow_journal::{StoredValue, MAX_LINE_BYTES};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -138,7 +138,7 @@ fn run_record(root: &std::path::Path, upper: u64, run: &JournalRun) -> Result<Ru
         id: run.run_id.clone(),
         workflow_id: run.workflow_id.clone(),
         workflow_version: run.workflow_version as i64,
-        status: run.status.clone(),
+        status: run.status.as_str().to_owned(),
         input: materialize(&run.input)?,
         output: run.output.as_ref().map(materialize).transpose()?,
         error: run.error.clone(),
@@ -428,7 +428,7 @@ pub async fn timeline(backend: &JournalBackend, run_id: &str) -> Result<Value> {
             "waiting" => {
                 if node
                     .and_then(|n| n.wait.as_ref())
-                    .is_some_and(|w| w.kind == "retry")
+                    .is_some_and(|w| w.kind == WaitKind::Retry)
                 {
                     "retrying"
                 } else {

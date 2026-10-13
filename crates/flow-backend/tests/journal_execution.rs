@@ -4,6 +4,7 @@ use flow_journal::{JournalOptions, StoredValue};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
+use flow_engine::journal_state::{RunStatus, WaitKind};
 
 fn temp() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("flow-journal-exec-{}", uuid::Uuid::now_v7()))
@@ -32,7 +33,7 @@ async fn pure_retry_preserves_preparation_and_original_deadline_across_restart()
     let waiting = until(&backend, run_id, |r| {
         r.nodes
             .get("n")
-            .is_some_and(|n| n.wait.as_ref().is_some_and(|w| w.kind == "retry"))
+            .is_some_and(|n| n.wait.as_ref().is_some_and(|w| w.kind == WaitKind::Retry))
     })
     .await;
     let deadline = waiting.nodes["n"].wait.as_ref().unwrap().wake_at;
@@ -52,7 +53,7 @@ async fn pure_retry_preserves_preparation_and_original_deadline_across_restart()
     );
     start_ipc(&backend, 16).await;
     let done = until(&backend, run_id, Run::terminal).await;
-    assert_eq!(done.status, "failed");
+    assert_eq!(done.status, RunStatus::Failed);
     assert_eq!(done.nodes["n"].attempt, 2);
     assert_eq!(done.nodes["n"].prepared, prepared);
     assert_eq!(done.nodes["n"].attempts.len(), 2);
@@ -188,7 +189,7 @@ async fn manual_resolution_binds_operation_and_never_fabricates_outcome() {
     assert_eq!(receipt.commit_cursor, duplicate.commit_cursor);
     start_ipc(&backend, 16).await;
     let done = until(&backend, run_id, Run::terminal).await;
-    assert_eq!(done.status, "succeeded");
+    assert_eq!(done.status, RunStatus::Succeeded);
     assert!(done.nodes["h"]
         .operation
         .as_ref()
@@ -280,7 +281,7 @@ async fn integration_adapters_capture_results_without_persisting_resolved_creden
             Run::terminal,
         )
         .await;
-        assert_eq!(done.status, "succeeded", "{:?}", done.error);
+        assert_eq!(done.status, RunStatus::Succeeded, "{:?}", done.error);
         assert_eq!(done.output, Some(StoredValue::Inline(expected)));
         assert!(done.nodes["a"]
             .operation
@@ -368,7 +369,7 @@ async fn script_actual_values_and_delay_survive_restart() {
     );
     start_ipc(&backend, 16).await;
     let done = until(&backend, run_id, |r| r.terminal()).await;
-    assert_eq!(done.status, "succeeded");
+    assert_eq!(done.status, RunStatus::Succeeded);
     assert_eq!(
         done.output,
         Some(StoredValue::Inline(json!({"slept_ms":1000})))
@@ -418,7 +419,7 @@ async fn child_completion_wakes_parent_and_signal_is_idempotent() {
         .unwrap();
     assert_eq!(duplicate.commit_cursor, receipt.commit_cursor);
     let done = until(&backend, run_id, |r| r.terminal()).await;
-    assert_eq!(done.status, "succeeded");
+    assert_eq!(done.status, RunStatus::Succeeded);
     assert_eq!(done.output, Some(StoredValue::Inline(json!({"ok":true}))));
     backend.close().await.unwrap();
     drop(backend);
@@ -496,7 +497,7 @@ async fn http_result_is_complete_and_never_resent_after_wait_restart() {
         .unwrap();
     start_ipc(&backend, 16).await;
     let done = until(&backend, run_id, |r| r.terminal()).await;
-    assert_eq!(done.status, "succeeded");
+    assert_eq!(done.status, RunStatus::Succeeded);
     assert_eq!(calls.load(Ordering::Relaxed), 1);
     backend.close().await.unwrap();
     drop(backend);
@@ -525,7 +526,7 @@ async fn three_generations_complete_with_one_active_slot() {
         Run::terminal,
     )
     .await;
-    assert_eq!(run.status, "succeeded", "{:?}", run.error);
+    assert_eq!(run.status, RunStatus::Succeeded, "{:?}", run.error);
     assert_eq!(backend.state().await.runs.len(), 3);
     assert!(backend.execution_peak() <= 1);
     backend.close().await.unwrap();
@@ -551,7 +552,7 @@ async fn malformed_request_fails_before_operation_authorization() {
         Run::terminal,
     )
     .await;
-    assert_eq!(run.status, "failed");
+    assert_eq!(run.status, RunStatus::Failed);
     assert!(run.nodes["h"].operation.is_none());
     backend.close().await.unwrap();
     drop(backend);

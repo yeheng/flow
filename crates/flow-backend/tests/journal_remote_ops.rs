@@ -12,6 +12,7 @@ use flow_journal::JournalOptions;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
+use flow_engine::journal_state::{RunStatus};
 
 fn temp() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("flow-journal-r3-{}", uuid::Uuid::now_v7()))
@@ -27,7 +28,6 @@ fn executor() -> flow_engine::execution_protocol::contract::ExecutorInvocation {
 fn remote_options() -> flow_backend::execution::remote::RemoteOptions {
     flow_backend::execution::remote::RemoteOptions {
         control_addr: "127.0.0.1:0".into(),
-        data_addr: "127.0.0.1:0".into(),
         ca_cert: "unused".into(),
         server_cert: "unused".into(),
         server_key: "unused".into(),
@@ -237,8 +237,8 @@ async fn slots_bound_enforces_serial_dispatch() {
         .unwrap();
     release.add_permits(1);
     let (r1, r2) = (first.await.unwrap(), second.await.unwrap());
-    assert_eq!(r1.status, "succeeded", "{:?}", r1.error);
-    assert_eq!(r2.status, "succeeded", "{:?}", r2.error);
+    assert_eq!(r1.status, RunStatus::Succeeded, "{:?}", r1.error);
+    assert_eq!(r2.status, RunStatus::Succeeded, "{:?}", r2.error);
     server.await.unwrap();
     manager.shutdown().await;
     backend.close().await.unwrap();
@@ -268,7 +268,7 @@ async fn one_agent_offline_others_continue() {
     let flow = install(&backend, serde_json::from_str(FLOW).unwrap()).await;
     // 基线：两台均可承接。
     let warm = run_and_finish(&backend, &flow, 10).await;
-    assert_eq!(warm.status, "succeeded", "{:?}", warm.error);
+    assert_eq!(warm.status, RunStatus::Succeeded, "{:?}", warm.error);
     // agent-a 下线（drain：回收其执行器并退出上联）。
     manager.drain("agent-a", 1000).await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -283,7 +283,7 @@ async fn one_agent_offline_others_continue() {
     .expect("agent-a executors recycled");
     // agent-b 继续承接新任务（单机故障不拖死全局）。
     let after = run_and_finish(&backend, &flow, 20).await;
-    assert_eq!(after.status, "succeeded", "{:?}", after.error);
+    assert_eq!(after.status, RunStatus::Succeeded, "{:?}", after.error);
     backend.close().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -321,7 +321,7 @@ async fn drain_stops_new_dispatch_and_recycles() {
     let flow = install(&backend, serde_json::from_str(FLOW).unwrap()).await;
     let done = run_and_finish(&backend, &flow, 1).await;
     assert_eq!(
-        done.status, "failed",
+        done.status, RunStatus::Failed,
         "no agent after drain must fail loudly"
     );
     backend.close().await.unwrap();

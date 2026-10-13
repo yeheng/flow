@@ -7,7 +7,9 @@ use crate::execution::{ExecutionMode, IpcDispatcher};
 use crate::journal::{JournalBackend, JournalError};
 use crate::journal_commands::node_event;
 use crate::journal_execution::Attempt;
-use flow_engine::journal_state::{Node as NodeState, Run, Wait};
+use flow_engine::journal_state::{
+    Node as NodeState, NodeStatus, Run, RunStatus, Wait, WaitKind,
+};
 use flow_engine::{Definition, NodeLogger, NodeType};
 use flow_journal::{Event, EventKind, StoredValue};
 use futures::FutureExt;
@@ -59,6 +61,15 @@ enum NodeGate {
     Skip(&'static str),
     /// 可派发，携带已接受的前驱输出。
     Ready(BTreeMap<String, StoredValue>),
+}
+
+/// 入边判定所需的最小前驱视图：状态 / 分支结论 / 输出声明。
+/// （不带 attempts 账本——那是结果屏障的账，与汇合判定无关。）
+#[derive(Debug, Clone)]
+struct GateNode {
+    status: NodeStatus,
+    branch: Option<bool>,
+    output: Option<StoredValue>,
 }
 
 type Result<T> = std::result::Result<T, JournalError>;
@@ -281,29 +292,56 @@ async fn advance_run(
         .await
         .ok_or_else(|| invalid("run missing"))?;
     if run.terminal() {
+        // 终态 run 的定义缓存条目随之逐出（定义不可变，重进即重物化）。
+        backend.evict_definition(run_id).await;
         return Ok(());
     }
     if cancel_if_parent_cancelled(backend, &run).await? {
         return Ok(());
     }
-    let definition = load_definition(backend, &run).await?;
+    let definition = backend
+        .cached_definition(&run.run_id, &run.definition)
+        .await?;
     for node in &definition.nodes {
         if coord.active.contains(&(run_id.to_owned(), node.id.clone())) {
             continue;
         }
-        let snapshot = backend
-            .inspect(|s| s.runs.get(run_id).cloned())
+        // 循环内会写事件（NodeSkipped/DispatchStarted），状态读取必须保持
+        // 每节点新鲜；但只取推进所需的最小视图（终态位 + 本节点记录 + 入边
+        // 前驱的 gate 三元组），不再整克隆 Run（definition/输入/attempts
+        // 账本与单节点推进无关）。
+        let (terminal, record, gate_view) = backend
+            .inspect(|s| {
+                let run = s.runs.get(run_id)?;
+                let view: BTreeMap<String, GateNode> = definition
+                    .incoming(&node.id)
+                    .into_iter()
+                    .filter_map(|edge| {
+                        run.nodes.get(&edge.from).map(|from| {
+                            (
+                                edge.from.clone(),
+                                GateNode {
+                                    status: from.status,
+                                    branch: from.branch,
+                                    output: from.output.clone(),
+                                },
+                            )
+                        })
+                    })
+                    .collect();
+                Some((run.terminal(), run.nodes.get(&node.id).cloned(), view))
+            })
             .await
             .ok_or_else(|| invalid("run missing"))?;
-        if snapshot.terminal() {
+        if terminal {
             break;
         }
-        if let Some(record) = snapshot.nodes.get(&node.id) {
-            if advance_committed_node(backend, run_id, node, record, &mut coord.wakes).await? {
+        if let Some(record) = record {
+            if advance_committed_node(backend, run_id, node, &record, &mut coord.wakes).await? {
                 continue;
             }
         }
-        match incoming_gate(&definition, &snapshot, node) {
+        match incoming_gate(&definition, &gate_view, node) {
             NodeGate::Skip(reason) => {
                 backend
                     .internal(|s| {
@@ -339,7 +377,7 @@ async fn cancel_if_parent_cancelled(backend: &Arc<JournalBackend>, run: &Run) ->
             .inspect(|s| {
                 s.runs
                     .get(&parent.run_id)
-                    .is_some_and(|r| r.status == "cancelled")
+                    .is_some_and(|r| r.status == RunStatus::Cancelled)
             })
             .await;
         if cancelled {
@@ -361,12 +399,12 @@ async fn advance_committed_node(
     wakes: &mut BTreeMap<i64, BTreeSet<String>>,
 ) -> Result<bool> {
     let now = chrono::Utc::now().timestamp_millis();
-    if record.status == "waiting" {
+    if record.status == NodeStatus::Waiting {
         let wait = record
             .wait
             .as_ref()
             .ok_or_else(|| invalid("waiting node missing wait"))?;
-        if wait.kind == "delay" && wait.wake_at.is_some_and(|at| at <= now) {
+        if wait.kind == WaitKind::Delay && wait.wake_at.is_some_and(|at| at <= now) {
             backend
                 .internal(|s| {
                     let r = &s.runs[run_id];
@@ -380,22 +418,22 @@ async fn advance_committed_node(
                 })
                 .await?;
         }
-        if matches!(wait.kind.as_str(), "delay" | "retry") {
+        if matches!(wait.kind, WaitKind::Delay | WaitKind::Retry) {
             if let Some(at) = wait.wake_at.filter(|at| *at > now) {
                 wakes.entry(at).or_default().insert(run_id.to_owned());
             }
         }
-        if wait.kind != "retry" || wait.wake_at.is_none_or(|at| at > now) {
+        if wait.kind != WaitKind::Retry || wait.wake_at.is_none_or(|at| at > now) {
             return Ok(true);
         }
     }
-    if matches!(record.status.as_str(), "succeeded" | "skipped") {
+    if matches!(record.status, NodeStatus::Succeeded | NodeStatus::Skipped) {
         return Ok(true);
     }
     // v1 语义（DESIGN §6.6，engine_recovery 钉死）：节点失败不立即终结
     // run——独立分支继续跑完，失败分支的下游被跳过（reason=upstream_failed），
     // 全部节点终态后由收尾判定写 RunFailed。
-    if record.status == "failed" {
+    if record.status == NodeStatus::Failed {
         return Ok(true);
     }
     if record.operation.as_ref().is_some_and(|op| op.outcome.is_none()) {
@@ -408,7 +446,7 @@ async fn advance_committed_node(
         attempt
             .finish(
                 EventKind::WaitRegistered,
-                json!({"wait": Wait{kind:"uncertain".into(), wake_at:None, child_run_id:None, output:None},"integrity":"unknown"}),
+                json!({"wait": Wait{kind:WaitKind::Uncertain, wake_at:None, child_run_id:None, output:None},"integrity":"unknown"}),
             )
             .await?;
         return Ok(true);
@@ -417,28 +455,34 @@ async fn advance_committed_node(
 }
 
 /// 纯函数：入边在当前快照下的推进结论（无 IO、无副作用）。
-fn incoming_gate(definition: &Definition, snapshot: &Run, node: &flow_engine::Node) -> NodeGate {
+/// 入参是入边前驱的最小视图（[`GateNode`]），不是整份 Run——本函数只读
+/// 汇合判定所需的状态/分支/输出三件事。
+fn incoming_gate(
+    definition: &Definition,
+    view: &BTreeMap<String, GateNode>,
+    node: &flow_engine::Node,
+) -> NodeGate {
     let mut ready = true;
     let mut skip = false;
     let mut predecessors = BTreeMap::new();
     let mut skip_reason = "";
     for edge in definition.incoming(&node.id) {
-        match snapshot.nodes.get(&edge.from) {
-            Some(n) if n.status == "skipped" => {
+        match view.get(&edge.from) {
+            Some(n) if n.status == NodeStatus::Skipped => {
                 skip = true;
                 ready = false;
                 if skip_reason.is_empty() {
                     skip_reason = "upstream_skipped";
                 }
             }
-            Some(n) if n.status == "failed" => {
+            Some(n) if n.status == NodeStatus::Failed => {
                 skip = true;
                 ready = false;
                 if skip_reason.is_empty() {
                     skip_reason = "upstream_failed";
                 }
             }
-            Some(n) if n.status == "succeeded" => {
+            Some(n) if n.status == NodeStatus::Succeeded => {
                 let accepted = edge
                     .port
                     .as_deref()
@@ -534,7 +578,7 @@ async fn execute_node(
             };
             let uncertain = n.operation.as_ref().is_some_and(|o| o.outcome.is_none());
             let mut payload = if uncertain {
-                json!({"wait": Wait{kind:"uncertain".into(), wake_at:None, child_run_id:None, output:None}, "integrity":"unknown"})
+                json!({"wait": Wait{kind:WaitKind::Uncertain, wake_at:None, child_run_id:None, output:None}, "integrity":"unknown"})
             } else {
                 json!({"error": error.to_string(), "preparation_failed": n.prepared.is_none(), "original_input": snapshot.input, "predecessors": predecessors, "integrity":"incomplete"})
             };
@@ -590,7 +634,7 @@ async fn settle_run(
             snapshot
                 .nodes
                 .get(&n.id)
-                .is_some_and(|n| matches!(n.status.as_str(), "succeeded" | "skipped" | "failed"))
+                .is_some_and(|n| matches!(n.status, NodeStatus::Succeeded | NodeStatus::Skipped | NodeStatus::Failed))
         })
     {
         return Ok(());
@@ -598,7 +642,7 @@ async fn settle_run(
     let failed = definition
         .nodes
         .iter()
-        .find(|n| snapshot.nodes.get(&n.id).is_some_and(|r| r.status == "failed"));
+        .find(|n| snapshot.nodes.get(&n.id).is_some_and(|r| r.status == NodeStatus::Failed));
     match failed {
         Some(failed_node) => {
             let error = backend
@@ -629,17 +673,6 @@ async fn settle_run(
     Ok(())
 }
 
-async fn load_definition(backend: &JournalBackend, run: &Run) -> Result<Definition> {
-    let root = backend.journal.root().to_path_buf();
-    let value = run.definition.clone();
-    let upper = backend.journal.durable_lsn();
-    let value = tokio::task::spawn_blocking(move || {
-        flow_journal::value::materialize(&root, upper, &value, flow_journal::MAX_LINE_BYTES)
-    })
-    .await
-    .map_err(|e| invalid(e.to_string()))??;
-    Ok(flow_engine::journal_state::validate_definition(&value)?)
-}
 async fn join_values(
     backend: &JournalBackend,
     mut values: BTreeMap<String, StoredValue>,
@@ -714,30 +747,20 @@ mod gate_tests {
     }
 
     /// (id, status, branch, output)——output 为业务值，此处包装成 inline StoredValue。
-    fn snapshot(nodes: &[(&str, &str, Option<bool>, Option<Value>)]) -> Run {
-        let map = nodes
+    fn view(nodes: &[(&str, &str, Option<bool>, Option<Value>)]) -> BTreeMap<String, GateNode> {
+        nodes
             .iter()
             .map(|(id, status, branch, output)| {
                 let output = output
                     .as_ref()
-                    .map(|value| json!({"type": "inline", "value": value}))
-                    .unwrap_or(Value::Null);
-                let state: NodeState = serde_json::from_value(json!({
-                    "node_execution_id": "nx", "attempt": 1, "dispatch_id": "",
-                    "status": status, "branch": branch, "output": output, "attempts": {}
-                }))
-                .unwrap();
-                ((*id).to_string(), state)
+                    .map(|value| StoredValue::inline(value.clone()).unwrap());
+                ((*id).to_string(), GateNode {
+                    status: serde_json::from_value::<NodeStatus>(json!(status)).unwrap(),
+                    branch: *branch,
+                    output,
+                })
             })
-            .collect::<BTreeMap<String, NodeState>>();
-        serde_json::from_value(json!({
-            "run_id": "r", "workflow_id": "w", "workflow_version": 1,
-            "definition": {"type":"inline","value":null},
-            "input": {"type":"inline","value":null},
-            "source": "manual", "created_at": "t", "status": "running", "depth": 0,
-            "last_run_seq": "0", "nodes": map
-        }))
-        .unwrap()
+            .collect()
     }
 
     #[test]
@@ -746,10 +769,10 @@ mod gate_tests {
             {"from":"s","to":"a"},{"from":"s","to":"b"},
             {"from":"a","to":"e"},{"from":"b","to":"e"}
         ]));
-        let run = snapshot(&[("s","succeeded",None,None), ("a","succeeded",None,Some(json!(1)))]);
-        assert!(matches!(incoming_gate(&def, &run, node("e", &def)), NodeGate::Blocked));
+        let settled = view(&[("s","succeeded",None,None), ("a","succeeded",None,Some(json!(1)))]);
+        assert!(matches!(incoming_gate(&def, &settled, node("e", &def)), NodeGate::Blocked));
         // 未注册的入边节点（缺前驱记录）同样阻塞。
-        let empty = snapshot(&[]);
+        let empty = view(&[]);
         assert!(matches!(incoming_gate(&def, &empty, node("a", &def)), NodeGate::Blocked));
     }
 
@@ -759,12 +782,12 @@ mod gate_tests {
             {"from":"s","to":"a"},{"from":"s","to":"b"},
             {"from":"a","to":"e"},{"from":"b","to":"e"}
         ]));
-        let run = snapshot(&[
+        let view = view(&[
             ("s","succeeded",None,None),
             ("a","succeeded",None,Some(json!({"a":1}))),
             ("b","succeeded",None,Some(json!(2))),
         ]);
-        let NodeGate::Ready(predecessors) = incoming_gate(&def, &run, node("e", &def)) else {
+        let NodeGate::Ready(predecessors) = incoming_gate(&def, &view, node("e", &def)) else {
             panic!("expected ready");
         };
         assert_eq!(
@@ -782,14 +805,14 @@ mod gate_tests {
             {"from":"s","to":"a"},{"from":"s","to":"b"},
             {"from":"a","to":"e"},{"from":"b","to":"e"}
         ]));
-        let run = snapshot(&[("s","succeeded",None,None), ("a","failed",None,None), ("b","skipped",None,None)]);
+        let failed = view(&[("s","succeeded",None,None), ("a","failed",None,None), ("b","skipped",None,None)]);
         assert!(matches!(
-            incoming_gate(&def, &run, node("e", &def)),
+            incoming_gate(&def, &failed, node("e", &def)),
             NodeGate::Skip("upstream_failed")
         ));
-        let run = snapshot(&[("s","succeeded",None,None), ("a","skipped",None,None), ("b","skipped",None,None)]);
+        let view = view(&[("s","succeeded",None,None), ("a","skipped",None,None), ("b","skipped",None,None)]);
         assert!(matches!(
-            incoming_gate(&def, &run, node("e", &def)),
+            incoming_gate(&def, &view, node("e", &def)),
             NodeGate::Skip("upstream_skipped")
         ));
     }
@@ -800,18 +823,18 @@ mod gate_tests {
             {"from":"a","to":"x","port":"true"},
             {"from":"a","to":"y","port":"false"}
         ]));
-        let run = snapshot(&[("a","succeeded",Some(false),Some(json!(1)))]);
+        let view = view(&[("a","succeeded",Some(false),Some(json!(1)))]);
         assert!(matches!(
-            incoming_gate(&def, &run, node("x", &def)),
+            incoming_gate(&def, &view, node("x", &def)),
             NodeGate::Skip("branch_not_taken")
         ));
-        let NodeGate::Ready(predecessors) = incoming_gate(&def, &run, node("y", &def)) else {
+        let NodeGate::Ready(predecessors) = incoming_gate(&def, &view, node("y", &def)) else {
             panic!("expected ready");
         };
         assert_eq!(predecessors["a"], StoredValue::Inline(json!(1)));
         // 无端口的边不受分支影响。
         let plain = definition(json!([{"from":"a","to":"x"}]));
-        let NodeGate::Ready(_) = incoming_gate(&plain, &run, node("x", &plain)) else {
+        let NodeGate::Ready(_) = incoming_gate(&plain, &view, node("x", &plain)) else {
             panic!("expected ready");
         };
     }
@@ -819,8 +842,8 @@ mod gate_tests {
     #[test]
     fn node_without_incoming_edges_is_ready() {
         let def = definition(json!([{"from":"s","to":"a"}]));
-        let run = snapshot(&[]);
-        assert!(matches!(incoming_gate(&def, &run, node("s", &def)), NodeGate::Ready(_)));
+        let view = view(&[]);
+        assert!(matches!(incoming_gate(&def, &view, node("s", &def)), NodeGate::Ready(_)));
     }
 }
 
@@ -890,7 +913,7 @@ mod regression_tests {
         .await;
         start_local(&backend, 16).await;
         let run = terminal(&backend, &id).await;
-        assert_eq!(run.status, "succeeded", "run={run:?}");
+        assert_eq!(run.status, RunStatus::Succeeded, "run={run:?}");
         let store = backend.observations.as_ref().expect("observation store");
         store.flush();
         let records = store.page(&id, None, 0, 256).unwrap();
@@ -947,7 +970,7 @@ mod regression_tests {
         );
         std::fs::rename(&hidden, &path).unwrap();
         let run = terminal(&backend, &id).await;
-        assert_eq!(run.status, "succeeded", "run={run:?}");
+        assert_eq!(run.status, RunStatus::Succeeded, "run={run:?}");
         backend.close().await.unwrap();
     }
 }

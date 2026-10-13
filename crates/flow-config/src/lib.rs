@@ -163,7 +163,6 @@ impl Default for ExecutionConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct RemoteExecutionConfig {
     pub control_addr: String,
-    pub data_addr: String,
     pub ca_cert: PathBuf,
     pub cert: PathBuf,
     pub key: PathBuf,
@@ -174,7 +173,6 @@ impl Default for RemoteExecutionConfig {
     fn default() -> Self {
         RemoteExecutionConfig {
             control_addr: String::new(),
-            data_addr: String::new(),
             ca_cert: PathBuf::new(),
             cert: PathBuf::new(),
             key: PathBuf::new(),
@@ -188,7 +186,6 @@ impl Default for RemoteExecutionConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct AgentConfig {
     pub control_addr: Option<String>,
-    pub data_addr: Option<String>,
     pub agent_id: Option<String>,
     pub ca_cert: Option<PathBuf>,
     pub cert: Option<PathBuf>,
@@ -201,7 +198,6 @@ impl Default for AgentConfig {
     fn default() -> Self {
         AgentConfig {
             control_addr: None,
-            data_addr: None,
             agent_id: None,
             ca_cert: None,
             cert: None,
@@ -395,8 +391,6 @@ impl Config {
             return Err("execution.mode=remote 时必须配置 [execution.remote]".into());
         }
         if let Some(remote) = &self.execution.remote {
-            // data_addr 已废弃（上联 v3 收敛为单条 TLS 连接）：字段为存量
-            // 配置兼容保留，值被忽略，不再强制非空。
             if remote.control_addr.is_empty() {
                 return Err("execution.remote.control_addr 不能为空".into());
             }
@@ -568,14 +562,6 @@ fn apply_env(config: &mut Config) -> Result<Vec<String>, String> {
             .control_addr = v;
         applied.push("FLOW_REMOTE_CONTROL_ADDR".into());
     }
-    if let Some(v) = env_str("FLOW_REMOTE_DATA_ADDR") {
-        config
-            .execution
-            .remote
-            .get_or_insert_with(Default::default)
-            .data_addr = v;
-        applied.push("FLOW_REMOTE_DATA_ADDR".into());
-    }
     if let Some(v) = env_str("FLOW_REMOTE_CA") {
         config
             .execution
@@ -613,10 +599,6 @@ fn apply_env(config: &mut Config) -> Result<Vec<String>, String> {
     if let Some(v) = env_str("FLOW_AGENT_CONTROL_ADDR") {
         config.agent.control_addr = Some(v);
         applied.push("FLOW_AGENT_CONTROL_ADDR".into());
-    }
-    if let Some(v) = env_str("FLOW_AGENT_DATA_ADDR") {
-        config.agent.data_addr = Some(v);
-        applied.push("FLOW_AGENT_DATA_ADDR".into());
     }
     if let Some(v) = env_str("FLOW_AGENT_ID") {
         config.agent.agent_id = Some(v);

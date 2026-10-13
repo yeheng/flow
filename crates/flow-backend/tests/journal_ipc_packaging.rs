@@ -10,6 +10,7 @@ use flow_backend::journal::JournalBackend;
 use flow_journal::JournalOptions;
 use serde_json::json;
 use std::time::Duration;
+use flow_engine::journal_state::{RunStatus};
 
 fn temp() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("flow-journal-ipc9-{}", uuid::Uuid::now_v7()))
@@ -230,7 +231,7 @@ async fn incompatible_executor_binary_fails_handshake_and_node_errors() {
     .await
     .expect("run terminates");
     assert_eq!(
-        done.status, "failed",
+        done.status, RunStatus::Failed,
         "incompatible binary must fail loudly"
     );
     backend.close().await.unwrap();

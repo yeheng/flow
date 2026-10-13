@@ -1,5 +1,16 @@
 //! Explicit v2 coordinator foundation. Commands are journal decisions, SQLite is disposable.
 use std::collections::BTreeSet;
+
+/// 在飞（非终态）run 状态数上限：约束主进程 run 状态内存与调度表。
+/// 这是后端状态内存约束，不是协议量——协议并发面（A_max/X_max）见
+/// `flow_engine::execution_protocol::contract`，两者不得互相代用。
+/// 执行点：`journal_commands::run_start` 与 `execution::dispatch::register_child_run`
+/// （同一常量，不另写数字）。
+pub const R_MAX: usize = 1000;
+
+/// 定义缓存硬顶：正常路径靠 run 终态逐出，这里只兜底防泄漏
+/// （超过即任意逐出——缓存只省磁盘读，正确性不依赖它）。
+const DEFINITION_CACHE_MAX: usize = 128;
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
@@ -78,6 +89,10 @@ pub struct JournalBackend {
     /// 诊断：协调循环心跳（每轮 select 醒来自增；挂死排查用）。
     pub(crate) coordinator_ticks: AtomicU64,
     pub(crate) coordinator_last_tick_ms: AtomicI64,
+    /// 物化后的 run 定义缓存：definition 随 run 钉死版本、创建后不可变，
+    /// 是天然缓存键——每个 run 只物化一次（从 journal 值目录拼 chunk），
+    /// 终态即逐出。调度循环每个 tick 都要用定义，不该每趟重读磁盘。
+    definitions: Mutex<std::collections::HashMap<String, Arc<flow_engine::Definition>>>,
 }
 
 impl JournalBackend {
@@ -273,6 +288,7 @@ impl JournalBackend {
             execution_peak: AtomicUsize::new(0),
             coordinator_ticks: AtomicU64::new(0),
             coordinator_last_tick_ms: AtomicI64::new(0),
+            definitions: Mutex::new(std::collections::HashMap::new()),
         });
         let weak = Arc::downgrade(&backend);
         let task = tokio::spawn(async move {
@@ -354,6 +370,44 @@ impl JournalBackend {
     }
     pub(crate) async fn inspect<T>(&self, read: impl FnOnce(&State) -> T) -> T {
         read(&self.state.lock().await.state)
+    }
+
+    /// 取（或首次物化并缓存）某 run 的已校验 definition。definition 随
+    /// run 钉死版本、创建后不可变——每个 run 只物化一次；终态由调度循环
+    /// 调 [`Self::evict_definition`] 逐出。物化/校验失败不缓存，瞬时故障
+    /// （如值目录暂不可读）的重试路径照常工作。
+    pub(crate) async fn cached_definition(
+        &self,
+        run_id: &str,
+        definition: &flow_journal::StoredValue,
+    ) -> Result<Arc<flow_engine::Definition>> {
+        if let Some(hit) = self.definitions.lock().await.get(run_id) {
+            return Ok(hit.clone());
+        }
+        let root = self.journal.root().to_path_buf();
+        let upper = self.journal.durable_lsn();
+        let stored = definition.clone();
+        let materialized = tokio::task::spawn_blocking(move || {
+            flow_journal::value::materialize(&root, upper, &stored, flow_journal::MAX_LINE_BYTES)
+        })
+        .await
+        .map_err(|e| flow_journal::Error::Unavailable(e.to_string()))??;
+        let parsed = Arc::new(flow_engine::journal_state::validate_definition(&materialized)?);
+        let mut cache = self.definitions.lock().await;
+        cache.insert(run_id.to_owned(), parsed.clone());
+        while cache.len() > DEFINITION_CACHE_MAX {
+            if let Some(oldest) = cache.keys().next().cloned() {
+                cache.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        Ok(parsed)
+    }
+
+    /// run 终态后逐出其定义缓存条目。
+    pub(crate) async fn evict_definition(&self, run_id: &str) {
+        self.definitions.lock().await.remove(run_id);
     }
     pub(crate) async fn internal<T>(
         &self,

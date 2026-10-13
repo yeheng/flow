@@ -2,6 +2,7 @@
 use flow_backend::journal::JournalBackend;
 use serde_json::json;
 use std::time::{Duration, Instant};
+use flow_engine::journal_state::{NodeStatus, RunStatus};
 
 #[tokio::test]
 #[ignore = "1000-run phase-one acceptance load"]
@@ -49,7 +50,7 @@ async fn thousand_waiting_runs_release_slots_and_recover_bounded_dispatch() {
                 .await
                 .runs
                 .values()
-                .all(|r| r.nodes.get("h").is_some_and(|n| n.status == "waiting"))
+                .all(|r| r.nodes.get("h").is_some_and(|n| n.status == NodeStatus::Waiting))
             {
                 break;
             }
@@ -97,7 +98,7 @@ async fn thousand_waiting_runs_release_slots_and_recover_bounded_dispatch() {
         .await
         .runs
         .values()
-        .all(|r| r.status == "cancelled"));
+        .all(|r| r.status == RunStatus::Cancelled));
     println!("1000 in-flight, A_max=2 peak; create projected p99={} us; create+wait={elapsed:?}; recovery+cancel={:?}",latency[990],restart.elapsed());
     backend.close().await.unwrap();
 }

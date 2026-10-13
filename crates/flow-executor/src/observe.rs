@@ -221,7 +221,7 @@ mod tests {
             let Message::ObservabilityBatch { lines, .. } = message else {
                 continue;
             };
-            let frame = flow_engine::execution_protocol::frame::encode_frame(
+            let frame = flow_engine::execution_protocol::frame::encode_tagged_frame(
                 &Message::ObservabilityBatch {
                     dispatch_id: Some("dispatch-test".into()),
                     lines,

@@ -22,7 +22,7 @@ use flow_engine::execution_protocol::contract::{DURABLE_WAIT_TIMEOUT_MS, TRANSFE
 use flow_engine::execution_protocol::message::{Message, ResultOutcome};
 use flow_engine::execution_protocol::record_bytes;
 use flow_engine::execution_protocol::TransferKey;
-use flow_engine::journal_state::{Prepared, Run, Wait};
+use flow_engine::journal_state::{Prepared, Run, RunStatus, Wait, WaitKind};
 use flow_engine::observation::ObservationStore;
 use flow_engine::{Node, NodeType};
 use flow_journal::value::ValueCodec;
@@ -733,7 +733,7 @@ impl DispatchRunner {
                     self.attempt
                         .finish(
                             EventKind::WaitRegistered,
-                            json!({"wait": Wait{kind: "uncertain".into(), wake_at: None, child_run_id: None, output: None}, "integrity": "unknown"}),
+                            json!({"wait": Wait{kind: WaitKind::Uncertain, wake_at: None, child_run_id: None, output: None}, "integrity": "unknown"}),
                         )
                         .await?;
                 } else {
@@ -760,30 +760,41 @@ impl DispatchRunner {
                     self.attempt.finish(EventKind::NodeFailed, payload).await?;
                 }
             }
-            ResultOutcome::Wait { wait } => match wait.kind.as_str() {
-                "delay" | "signal" => {
-                    self.attempt
-                        .finish(
-                            EventKind::WaitRegistered,
-                            json!({"wait": Wait{
-                                kind: wait.kind.clone(),
-                                wake_at: wait.wake_at,
-                                child_run_id: None,
-                                output: wait.output.clone(),
-                            }}),
-                        )
-                        .await?;
+            ResultOutcome::Wait { wait } => {
+                // wire 的 WaitRequest.kind 是字符串（冻结契约）；在这里一次性
+                // 解析进词汇表 enum，之后不再有裸字符串比对。
+                let kind = match wait.kind.as_str() {
+                    "delay" => WaitKind::Delay,
+                    "signal" => WaitKind::Signal,
+                    "child" => WaitKind::Child,
+                    other => return Err(invalid(format!("unknown wait kind {other}"))),
+                };
+                match kind {
+                    WaitKind::Delay | WaitKind::Signal => {
+                        self.attempt
+                            .finish(
+                                EventKind::WaitRegistered,
+                                json!({"wait": Wait{
+                                    kind,
+                                    wake_at: wait.wake_at,
+                                    child_run_id: None,
+                                    output: wait.output.clone(),
+                                }}),
+                            )
+                            .await?;
+                    }
+                    WaitKind::Child => {
+                        let workflow_id = wait
+                            .workflow_id
+                            .clone()
+                            .ok_or_else(|| invalid("child wait missing workflow"))?;
+                        self.register_child_run(&workflow_id, wait.input_mapping.clone())
+                            .await?;
+                    }
+                    // Uncertain/Retry 由主进程派生，不是执行器可请求的等待类别。
+                    _ => return Err(invalid("wait kind not requestable")),
                 }
-                "child" => {
-                    let workflow_id = wait
-                        .workflow_id
-                        .clone()
-                        .ok_or_else(|| invalid("child wait missing workflow"))?;
-                    self.register_child_run(&workflow_id, wait.input_mapping.clone())
-                        .await?;
-                }
-                other => return Err(invalid(format!("unknown wait kind {other}"))),
-            },
+            }
         }
         // 结果已提交：回执使执行器释放槽位（重复派发返回原提交）。
         let _ = link
@@ -861,9 +872,12 @@ impl DispatchRunner {
                     .values()
                     .filter(|r| !r.terminal())
                     .count()
-                    >= 1000
+                    >= crate::journal::R_MAX
                 {
-                    return Err(flow_journal::Error::Limit("R_max=1000".into()));
+                    return Err(flow_journal::Error::Limit(format!(
+                        "R_max={}",
+                        crate::journal::R_MAX
+                    )));
                 }
                 let definition = state
                     .workflows
@@ -885,7 +899,7 @@ impl DispatchRunner {
                     }),
                     depth: parent.depth + 1,
                     created_at: crate::journal_commands::now(),
-                    status: "running".into(),
+                    status: RunStatus::Running,
                     output: None,
                     error: None,
                     last_run_seq: 0,
@@ -906,7 +920,7 @@ impl DispatchRunner {
                     parent,
                     &node_id,
                     EventKind::WaitRegistered,
-                    json!({"wait": Wait{kind: "child".into(), wake_at: None, child_run_id: Some(child_id), output: None}, "sealed_through": sealed.to_string()}),
+                    json!({"wait": Wait{kind: WaitKind::Child, wake_at: None, child_run_id: Some(child_id), output: None}, "sealed_through": sealed.to_string()}),
                     true,
                 );
                 Ok((vec![created, wait_event], ()))

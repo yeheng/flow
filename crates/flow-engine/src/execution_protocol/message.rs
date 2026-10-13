@@ -207,7 +207,6 @@ pub mod kind {
     pub const ROUTED: &str = "Routed";
     pub const AGENT_HELLO: &str = "AgentHello";
     pub const AGENT_WELCOME: &str = "AgentWelcome";
-    pub const DATA_BIND: &str = "DataBind";
     pub const CAPACITY_REPORT: &str = "CapacityReport";
     pub const BIND_EXECUTOR: &str = "BindExecutor";
     pub const BIND_EXECUTOR_ACK: &str = "BindExecutorAck";
@@ -357,22 +356,16 @@ pub enum Message {
         capabilities: Vec<String>,
         slots: u32,
     },
-    /// control，主→agent。选定 link_session、限额与一次性 data 绑定凭据。
+    /// control，主→agent。选定 link_session、限额与心跳周期（v3 单流上联，
+    /// 无第二条 data 连接，也就没有 v2 的 data 绑定凭据）。
     AgentWelcome {
         journal_id: String,
         master_epoch: u64,
         link_session_id: String,
         agent_id: String,
-        data_credential: String,
         heartbeat_ms: u64,
         /// agent 级转发预算（C_agent，字节）。
         agent_window_bytes: u64,
-    },
-    /// data，agent→主（data 连接首帧）。绑定到 control 会话；凭据一次性。
-    DataBind {
-        agent_boot_id: String,
-        link_session_id: String,
-        credential: String,
     },
     /// control，agent→主。资源报告。
     CapacityReport { capacity: Capacity },
@@ -489,7 +482,6 @@ impl Message {
             Message::Routed { .. } => kind::ROUTED,
             Message::AgentHello { .. } => kind::AGENT_HELLO,
             Message::AgentWelcome { .. } => kind::AGENT_WELCOME,
-            Message::DataBind { .. } => kind::DATA_BIND,
             Message::CapacityReport { .. } => kind::CAPACITY_REPORT,
             Message::BindExecutor { .. } => kind::BIND_EXECUTOR,
             Message::BindExecutorAck { .. } => kind::BIND_EXECUTOR_ACK,
@@ -504,11 +496,8 @@ impl Message {
     /// 此表拒绝放错通道的消息。
     pub fn channel(&self) -> Channel {
         match self {
-            Message::TransferChunk { .. }
-            | Message::ObservabilityBatch { .. }
-            | Message::AuditBatch { .. }
-            // data 连接绑定帧：必须走 data 通道（三期 §1.2 防连接串配）。
-            | Message::DataBind { .. } => Channel::Data,
+            Message::TransferChunk { .. } | Message::ObservabilityBatch { .. }
+            | Message::AuditBatch { .. } => Channel::Data,
             // 路由帧跟随内层通道（审计/传输走 data，其余 control）。
             Message::Routed { inner, .. } => inner.channel(),
             _ => Channel::Control,
@@ -771,7 +760,6 @@ impl Message {
                 master_epoch,
                 link_session_id,
                 agent_id,
-                data_credential,
                 heartbeat_ms,
                 agent_window_bytes,
             } => {
@@ -782,7 +770,6 @@ impl Message {
                     master_epoch: u64,
                     link_session_id: String,
                     agent_id: String,
-                    data_credential: String,
                     #[serde(with = "flow_journal::decimal")]
                     heartbeat_ms: u64,
                     #[serde(with = "flow_journal::decimal")]
@@ -793,20 +780,10 @@ impl Message {
                     master_epoch: *master_epoch,
                     link_session_id: link_session_id.clone(),
                     agent_id: agent_id.clone(),
-                    data_credential: data_credential.clone(),
                     heartbeat_ms: *heartbeat_ms,
                     agent_window_bytes: *agent_window_bytes,
                 })
             }
-            Message::DataBind {
-                agent_boot_id,
-                link_session_id,
-                credential,
-            } => body_value(serde_json::json!({
-                "agent_boot_id": agent_boot_id,
-                "link_session_id": link_session_id,
-                "credential": credential,
-            })),
             Message::CapacityReport { capacity } => {
                 body_value(serde_json::json!({"capacity": capacity}))
             }
@@ -1184,7 +1161,6 @@ impl Message {
                     master_epoch: u64,
                     link_session_id: String,
                     agent_id: String,
-                    data_credential: String,
                     #[serde(with = "flow_journal::decimal")]
                     heartbeat_ms: u64,
                     #[serde(with = "flow_journal::decimal")]
@@ -1196,23 +1172,8 @@ impl Message {
                     master_epoch: wire.master_epoch,
                     link_session_id: wire.link_session_id,
                     agent_id: wire.agent_id,
-                    data_credential: wire.data_credential,
                     heartbeat_ms: wire.heartbeat_ms,
                     agent_window_bytes: wire.agent_window_bytes,
-                }
-            }
-            kind::DATA_BIND => {
-                #[derive(Deserialize)]
-                struct Wire {
-                    agent_boot_id: String,
-                    link_session_id: String,
-                    credential: String,
-                }
-                let wire: Wire = from_body(&body, type_name)?;
-                Message::DataBind {
-                    agent_boot_id: wire.agent_boot_id,
-                    link_session_id: wire.link_session_id,
-                    credential: wire.credential,
                 }
             }
             kind::CAPACITY_REPORT => {
@@ -1323,8 +1284,8 @@ fn body_value(value: impl Serialize) -> Option<Value> {
     serde_json::to_value(value).ok()
 }
 
-/// 通道标识。单流承载下编码为帧内 1 字节标签（见 frame.rs）；agent 上联
-/// 仍按双物理流承载，靠流本身区分。
+/// 通道标识。v3 全部承载都是单流：编码为帧内 1 字节标签（见 frame.rs）。
+/// 通道只是消息分类与预算上限的依据（control 禁大载荷、data 独立预算）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Channel {
     Control,

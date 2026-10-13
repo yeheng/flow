@@ -120,7 +120,6 @@ pub fn routable(inner: &Message) -> bool {
         Message::Routed { .. }
             | Message::AgentHello { .. }
             | Message::AgentWelcome { .. }
-            | Message::DataBind { .. }
             | Message::CapacityReport { .. }
             | Message::BindExecutor { .. }
             | Message::BindExecutorAck { .. }

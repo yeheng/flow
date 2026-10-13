@@ -1,20 +1,20 @@
-//! 冻结的本地 IPC 契约（JSONL 重构二期 §2/§3.5）。
+//! 冻结的本地 IPC 契约（v3）。
 //!
-//! 这些常量在 I01 冻结：主进程与执行器实现都必须在同一组上限内工作，
+//! 这些常量是协议冻结面：主进程与执行器实现都必须在同一组上限内工作，
 //! 任何一方都不允许在握手之外重新协商硬上限。修改本文件即构成协议版本
-//! 变更，必须 bump [`PROTOCOL_VERSION`] 并按二期 §2 声明兼容边界。
+//! 变更，必须 bump [`PROTOCOL_VERSION`]。
 //!
-//! 三类并发面符号（二期 §3.5，全文唯一，不得互相代用）：
-//! - `R_MAX` 在飞 run 状态数（含持久等待中的 run），约束主进程状态内存；
+//! 两类协议并发面符号（不得互相代用）：
 //! - `A_MAX` 活跃派发上界（同时持有 dispatch 事实、占窗口预算），窗口全局
 //!   预算 = `A_MAX × W_BYTES × K_FACTOR`；
 //! - `X_MAX_DEFAULT` 执行槽位数（同时运行的执行子进程），约束进程数 × RSS。
 //!
-//! `R_MAX` 不得代入窗口预算公式，`A_MAX` 不得用来论证主进程状态内存，
-//! `X_MAX` 不得用来论证审计吞吐。
+//! `A_MAX` 不得用来论证主进程状态内存，`X_MAX` 不得用来论证审计吞吐。
+//! 在飞 run 状态数上限（`R_MAX`）是主进程状态内存约束、不是协议量，其
+//! 唯一定义与执行点在 `flow-backend`（`journal.rs::R_MAX`）。
 
 /// IPC 协议版本。v3 = 执行器本地通道收敛为单流（帧内 1 字节通道标签）；
-/// v2 = 二期本地 socketpair 双流版本。
+/// v2 = 本地 socketpair 双流版本（已删除）。
 pub const PROTOCOL_VERSION: u32 = 3;
 
 /// control 通道单帧 JSON 上限（不含 4 字节长度头与 1 字节通道标签）。握手
@@ -52,10 +52,6 @@ pub const FRAME_HEADER_BYTES: usize = 4;
 /// 执行槽位数 X_max 默认值（可配置 1..=16）。每进程一个任务；常驻内存
 /// ≈ X_max × 单进程 RSS（JS heap 32 MiB 上限 + 输入面预算 8 MiB）。
 pub const X_MAX_DEFAULT: usize = 4;
-
-/// 在飞 run 状态数上限（一期 F02/F17 基线，`R_max ≥ 1000`）。
-/// 只约束主进程 run 状态内存、调度表与可卸载索引；与窗口预算无关。
-pub const R_MAX: usize = 1000;
 
 /// 活跃派发上界（继承一期执行并发 1..=16；主进程调度器同值限制）。
 /// 全局窗口预算按它反推：`A_MAX × W_BYTES × K_FACTOR`。
@@ -111,7 +107,7 @@ pub const ACK_RETRANSMIT_MS: u64 = 2_000;
 pub const DURABLE_WAIT_TIMEOUT_MS: u64 = 120_000;
 
 /// 执行器二进制名称（独立二进制的打包/定位契约，I09）。
-/// 主进程（flow-server / flow-agent）缺省在自身同目录定位该名字的兄弟文件。
+/// 主进程（flow-journal-server / flow-agent）缺省在自身同目录定位该名字的兄弟文件。
 pub const EXECUTOR_BIN_NAME: &str = "flow-executor";
 
 /// 执行器进程召唤描述：程序路径 + 前导参数。
@@ -164,8 +160,8 @@ impl ExecutorInvocation {
 }
 /// 显式指定执行器二进制路径的环境变量（优先级最高，I09）。
 pub const EXECUTOR_BIN_ENV: &str = "FLOW_EXECUTOR_BIN";
-/// 执行模式环境变量：unix 默认 ipc（T6 终态，非 unix 过渡态默认
-/// in_process）；显式值 `in_process` | `ipc` 覆盖平台默认。
+/// 执行模式环境变量：默认 ipc（全平台）；显式值 `ipc` 覆盖默认，
+/// `in_process` 已全平台删除、显式设置即报错。
 pub const EXECUTION_MODE_ENV: &str = "FLOW_EXECUTION_MODE";
 
 /// 执行器在 Hello 中声明的能力目录。缺失必需能力的主进程必须明确拒绝，

@@ -1,15 +1,10 @@
-//! 传输边界与会话校验（二期 §3.1/§3.2；v3 单流收敛）。
+//! 传输边界与会话校验（v3 单流）。
 //!
-//! 两种承载共享本类型：
-//!
-//! - **单流（执行器本地 IPC，v3）**：`spawn` 在一条双向流上复用 control 与
-//!   data（帧内 1 字节通道标签，见 [`super::frame`]）。单写任务保证帧按
-//!   提交序串行发出——Execute 先于其 TransferChunk、RequestOperation 晚于
-//!   其请求块，跨通道乱序在物理上不存在，双方无需重组暂存。
-//! - **双流（二期遗留，已无生产调用方）**：`spawn_streams` 在两条独立流上
-//!   承载 control（握手、派发、取消、确认、心跳，禁止大载荷）与 data（输入
-//!   分块、审计批次、观测，独立预算类别）。v3 起 agent 上联与本地 IPC 都用
-//!   单流 [`FrameTransport::spawn`]，本方法保留供测试与外部兼容。
+//! 唯一承载形态：`spawn` 在一条双向流上复用 control 与 data（帧内 1 字节
+//! 通道标签，见 [`super::frame`]）。单写任务保证帧按提交序串行发出——
+//! Execute 先于其 TransferChunk、RequestOperation 晚于其请求块，跨通道乱序
+//! 在物理上不存在，双方无需重组暂存。执行器本地 IPC 与 agent 上联同用本
+//! 类型；v2 双物理流承载已随 v3 删除。
 //!
 //! 每条连接一个串行帧写入器（单写任务按序写帧，避免并发写导致帧交错），
 //! 读任务独立于节点执行持续运行（主进程不能等节点执行返回才读取审计）。
@@ -18,10 +13,10 @@
 use tokio::sync::mpsc;
 
 use super::contract::{
-    CONTROL_MAX_FRAME, DATA_MAX_FRAME, DRAIN_GRACE_MS, HEARTBEAT_INTERVAL_MS, IDENTITY_MAX_BYTES,
-    MAX_AUDIT_RECORD_BYTES, PROTOCOL_VERSION, REQUIRED_CAPABILITIES, W_BYTES,
+    DRAIN_GRACE_MS, HEARTBEAT_INTERVAL_MS, IDENTITY_MAX_BYTES, MAX_AUDIT_RECORD_BYTES,
+    PROTOCOL_VERSION, REQUIRED_CAPABILITIES, W_BYTES,
 };
-use super::frame::{encode_frame, encode_tagged_frame, FrameDecoder};
+use super::frame::{encode_tagged_frame, FrameDecoder};
 use super::message::{Channel, Message, ProtocolError};
 
 /// 一条通道的读任务产物。`Frame` 装箱：`Message` 最大变体携带完整
@@ -85,58 +80,6 @@ impl FrameTransport {
             io: IoHandle {
                 readers: vec![reader],
                 writers: vec![writer],
-                broken,
-            },
-        }
-    }
-
-    /// 双流承载（二期遗留，已无生产调用方）：control 与 data 各一条流，
-    /// 每通道独立串行写。v3 起 agent 上联与本地 IPC 都走单流 [`Self::spawn`]；
-    /// 传输层不依赖 Unix，本方法保留供测试与外部兼容。
-    pub fn spawn_streams<S>(control: S, data: S, queue_depth: usize) -> Self
-    where
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-    {
-        let (event_tx, incoming) = mpsc::channel(queue_depth.max(8));
-        let (control_tx, control_rx) = mpsc::channel::<Message>(queue_depth.max(8));
-        let (data_tx, data_rx) = mpsc::channel::<Message>(queue_depth.max(8));
-        let broken = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // 读写半拆分：读任务与串行写任务各自持有独立句柄。
-        let (control_read, control_write) = tokio::io::split(control);
-        let (data_read, data_write) = tokio::io::split(data);
-        let control_read: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>> =
-            Box::pin(control_read);
-        let reader_control = tokio::spawn(read_loop(
-            control_read,
-            Channel::Control,
-            CONTROL_MAX_FRAME,
-            event_tx.clone(),
-            broken.clone(),
-        ));
-        let data_read: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>> = Box::pin(data_read);
-        let reader_data = tokio::spawn(read_loop(
-            data_read,
-            Channel::Data,
-            DATA_MAX_FRAME,
-            event_tx.clone(),
-            broken.clone(),
-        ));
-        let writer_control = tokio::spawn(write_loop(control_write, control_rx, broken.clone()));
-        let writer_data = tokio::spawn(write_loop(
-            Box::pin(data_write) as std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>,
-            data_rx,
-            broken.clone(),
-        ));
-        drop(event_tx);
-        Self {
-            incoming,
-            pending_error: None,
-            ended: false,
-            control_out: control_tx,
-            data_out: data_tx,
-            io: IoHandle {
-                readers: vec![reader_control, reader_data],
-                writers: vec![writer_control, writer_data],
                 broken,
             },
         }
@@ -255,118 +198,6 @@ impl FrameTransport {
     }
 }
 
-async fn read_loop(
-    stream: impl tokio::io::AsyncRead + Unpin + Send,
-    channel: Channel,
-    limit: usize,
-    events: mpsc::Sender<IoEvent>,
-    broken: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) {
-    use tokio::io::AsyncReadExt;
-    let mut stream = stream;
-    let mut decoder = FrameDecoder::new(limit);
-    let mut buffer = vec![0u8; 64 * 1024];
-    loop {
-        match stream.read(&mut buffer).await {
-            Ok(0) => {
-                let _ = events.send(IoEvent::Eof(channel)).await;
-                broken.store(true, std::sync::atomic::Ordering::SeqCst);
-                return;
-            }
-            Ok(n) => {
-                if let Err(error) = decoder.feed(&buffer[..n]) {
-                    let _ = events.send(IoEvent::Failed(channel, error)).await;
-                    broken.store(true, std::sync::atomic::Ordering::SeqCst);
-                    return;
-                }
-                while let Ok(Some(json)) = decoder.pop_frame() {
-                    let message = match serde_json::from_slice::<serde_json::Value>(&json)
-                        .map_err(|e| ProtocolError::Malformed(format!("envelope: {e}")))
-                        .and_then(Message::from_envelope)
-                    {
-                        Ok(message) => message,
-                        Err(error) => {
-                            let _ = events.send(IoEvent::Failed(channel, error)).await;
-                            broken.store(true, std::sync::atomic::Ordering::SeqCst);
-                            return;
-                        }
-                    };
-                    if events
-                        .send(IoEvent::Frame(channel, Box::new(message)))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-            }
-            Err(error) => {
-                let _ = events
-                    .send(IoEvent::Failed(channel, ProtocolError::Io(error)))
-                    .await;
-                broken.store(true, std::sync::atomic::Ordering::SeqCst);
-                return;
-            }
-        }
-    }
-}
-
-async fn write_loop(
-    stream: impl tokio::io::AsyncWrite + Unpin + Send,
-    queue: mpsc::Receiver<Message>,
-    broken: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) {
-    use tokio::io::AsyncWriteExt;
-    let mut stream = stream;
-    let mut queue = queue;
-    while let Some(message) = queue.recv().await {
-        if broken.load(std::sync::atomic::Ordering::SeqCst) {
-            tracing::warn!(
-                type_name = message.type_name(),
-                "writer exit: session broken"
-            );
-            return;
-        }
-        let frame = match encode_frame(&message) {
-            Ok(frame) => frame,
-            Err(error) => {
-                eprintln!(
-                    "flow-transport: frame encode failed type={} error={error}",
-                    message.type_name()
-                );
-                // 观测是可丢弃数据：编码失败丢帧计数，绝不为它拆除
-                // golden source 会话（审计/结果/传输帧失败仍然断线——
-                // 那是正确性路径，该炸就炸）。
-                if !matches!(message, Message::ObservabilityBatch { .. }) {
-                    tracing::error!(type_name = message.type_name(), %error, "frame encode failed");
-                    broken.store(true, std::sync::atomic::Ordering::SeqCst);
-                    return;
-                }
-                tracing::warn!(type_name = message.type_name(), %error, "observability frame dropped");
-                continue;
-            }
-        };
-        // 大载荷分多次 write；写不动时天然背压到发送队列。
-        if let Err(error) = stream.write_all(&frame).await {
-            eprintln!(
-                "flow-transport: frame write failed type={} error={error}",
-                message.type_name()
-            );
-            broken.store(true, std::sync::atomic::Ordering::SeqCst);
-            return;
-        }
-        if let Err(error) = stream.flush().await {
-            eprintln!(
-                "flow-transport: frame flush failed type={} error={error}",
-                message.type_name()
-            );
-            broken.store(true, std::sync::atomic::Ordering::SeqCst);
-            return;
-        }
-    }
-    let _ = stream.shutdown().await;
-}
-
 /// 已关闭的死发送通道（close() 后占位）。
 fn dead_sender() -> mpsc::Sender<Message> {
     let (tx, mut rx) = mpsc::channel(1);
@@ -445,7 +276,7 @@ async fn read_loop_tagged(
     }
 }
 
-/// 单流写任务：与 [`write_loop`] 同一丢弃策略，帧格式带通道标签。
+/// 单流写任务：按提交序串行写帧；观测帧编码失败丢帧计数，其余断线。
 async fn write_loop_tagged(
     stream: impl tokio::io::AsyncWrite + Unpin + Send,
     queue: mpsc::Receiver<Message>,
@@ -861,10 +692,9 @@ mod terminal_event_tests {
     async fn graceful_close_writes_queued_control_frame() {
         use tokio::io::AsyncReadExt;
         let (ca, mut cb) = tokio::io::duplex(4096);
-        let (da, _db) = tokio::io::duplex(4096);
-        let transport = FrameTransport::spawn_streams(ca, da, 8);
+        let transport = FrameTransport::spawn(ca, 8);
         let message = Message::DrainComplete { drained: 3 };
-        let expected = encode_frame(&message).unwrap();
+        let expected = super::super::frame::encode_tagged_frame(&message).unwrap();
         transport.send(message).await.unwrap();
         transport
             .flush_and_close(std::time::Duration::from_secs(1))
@@ -886,9 +716,8 @@ mod terminal_event_tests {
             ProtocolError::Closed,
             ProtocolError::Malformed("bad frame".into()),
         ] {
-            let (control, _control_peer) = tokio::io::duplex(1024);
-            let (data, _data_peer) = tokio::io::duplex(1024);
-            let mut transport = FrameTransport::spawn_streams(control, data, 4);
+            let (stream, _peer) = tokio::io::duplex(1024);
+            let mut transport = FrameTransport::spawn(stream, 4);
             // Inject the read task event: no scheduling sleep or second EOF can mask the failure.
             let (events, incoming) = mpsc::channel(4);
             transport.incoming = incoming;

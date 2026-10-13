@@ -1,5 +1,5 @@
 use crate::journal::{CommandReceipt, JournalBackend, JournalError};
-use flow_engine::journal_state::{DefinitionVersion, Run, State, Workflow};
+use flow_engine::journal_state::{DefinitionVersion, Run, RunStatus, State, WaitKind, Workflow};
 use flow_journal::{Event, EventKind};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -317,7 +317,7 @@ impl JournalBackend {
         self.command(&format!("run.adjudicate:{run_id}"),Some(request_id),&request,|state|{
             let run=state.runs.get(run_id).ok_or_else(||invalid("run not found"))?;
             let node=run.nodes.get(node_id).ok_or_else(||invalid("node not found"))?;
-            if run.terminal() || node.wait.as_ref().is_none_or(|w|w.kind!="uncertain")
+            if run.terminal() || node.wait.as_ref().is_none_or(|w| w.kind != WaitKind::Uncertain)
                 || node.operation.as_ref().is_none_or(|o|o.operation_id!=operation_id || o.outcome.is_some()) {
                 return Err(invalid("manual resolution requires the current uncertain operation"));
             }
@@ -533,8 +533,11 @@ impl JournalBackend {
                     return Err(invalid("trigger disabled or changed before commit"));
                 }
             }
-            if state.runs.values().filter(|r| !r.terminal()).count() >= 1000 {
-                return Err(flow_journal::Error::Limit("R_max=1000".into()));
+            if state.runs.values().filter(|r| !r.terminal()).count() >= crate::journal::R_MAX {
+                return Err(flow_journal::Error::Limit(format!(
+                    "R_max={}",
+                    crate::journal::R_MAX
+                )));
             }
             let workflow = state
                 .workflows
@@ -569,7 +572,7 @@ impl JournalBackend {
                 parent: None,
                 depth: 0,
                 created_at: now(),
-                status: "running".into(),
+                status: RunStatus::Running,
                 output: None,
                 error: None,
                 last_run_seq: 0,
@@ -653,7 +656,7 @@ impl JournalBackend {
                     .nodes
                     .get(node_id)
                     .ok_or_else(|| invalid("node not waiting"))?;
-                if !run.terminal() && node.wait.as_ref().is_some_and(|w| w.kind == "uncertain") {
+                if !run.terminal() && node.wait.as_ref().is_some_and(|w| w.kind == WaitKind::Uncertain) {
                     let operation = node.operation.as_ref()
                         .filter(|op| op.outcome.is_none())
                         .ok_or_else(|| invalid("current uncertain operation required"))?;
@@ -670,7 +673,7 @@ impl JournalBackend {
                         json!({"operation_id":operation.operation_id,"reason":reason,"decision":decision,"output":adjudicated_output}), true);
                     return Ok((vec![event], json!({"delivered":true,"status":"applied","signal_id":request_id})));
                 }
-                if run.terminal() || node.wait.as_ref().is_none_or(|w| w.kind != "signal") {
+                if run.terminal() || node.wait.as_ref().is_none_or(|w| w.kind != WaitKind::Signal) {
                     return Err(invalid("node not waiting for signal"));
                 }
                 let mut signal = node_event(

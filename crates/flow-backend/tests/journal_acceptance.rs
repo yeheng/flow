@@ -1,5 +1,6 @@
 //! Non-power-loss phase-one acceptance. All datasets are disposable.
 use flow_backend::journal::JournalBackend;
+use flow_engine::journal_state::{NodeStatus, RunStatus, WaitKind};
 use serde_json::{json, Value};
 use std::{
     sync::Arc,
@@ -93,7 +94,7 @@ async fn sustained_mixed_business() {
                         if b.state().await.runs[id]
                             .nodes
                             .get("n")
-                            .is_some_and(|n| n.status == "waiting")
+                            .is_some_and(|n| n.status == NodeStatus::Waiting)
                         {
                             break;
                         }
@@ -109,7 +110,7 @@ async fn sustained_mixed_business() {
             let r = terminal(&b, id).await;
             assert_eq!(
                 r.status,
-                if i % 5 == 4 { "cancelled" } else { "succeeded" },
+                if i % 5 == 4 { RunStatus::Cancelled } else { RunStatus::Succeeded },
                 "{:?}",
                 r.error
             );
@@ -160,7 +161,7 @@ async fn observation_failure_and_flood_do_not_change_business_result() {
             .await
             .unwrap();
         let r = terminal(&b, receipt.result["run_id"].as_str().unwrap()).await;
-        assert_eq!(r.status, "succeeded", "mode={mode} {:?}", r.error);
+        assert_eq!(r.status, RunStatus::Succeeded, "mode={mode} {:?}", r.error);
         assert_eq!(
             r.output,
             Some(flow_journal::StoredValue::Inline(json!({"ok":true})))
@@ -234,7 +235,7 @@ async fn cancelled_fanout_tree_finishes_after_restart() {
                 .await
                 .runs
                 .values()
-                .all(|r| r.status == "cancelled")
+                .all(|r| r.status == RunStatus::Cancelled)
             {
                 break;
             }
@@ -306,9 +307,9 @@ async fn aggregate_predecessors_and_oversize_output_fail_within_budget() {
         .await
         .unwrap();
     let r = terminal(&b, receipt.result["run_id"].as_str().unwrap()).await;
-    assert_eq!(r.status, "failed");
-    assert_eq!(r.nodes["a"].status, "succeeded");
-    assert_eq!(r.nodes["b"].status, "succeeded");
+    assert_eq!(r.status, RunStatus::Failed);
+    assert_eq!(r.nodes["a"].status, NodeStatus::Succeeded);
+    assert_eq!(r.nodes["b"].status, NodeStatus::Succeeded);
     let error = format!("{:?}", r.error);
     assert!(!error.contains("USER_CODE_RAN"), "{error}");
     assert!(
@@ -321,7 +322,7 @@ async fn aggregate_predecessors_and_oversize_output_fail_within_budget() {
         .await
         .unwrap();
     let run = terminal(&b, r.result["run_id"].as_str().unwrap()).await;
-    assert_eq!(run.status, "failed");
+    assert_eq!(run.status, RunStatus::Failed);
     println!(
         "resource boundaries rejected aggregate 10 MiB predecessors and 9 MiB output; error={:?}",
         run.error
@@ -375,7 +376,7 @@ async fn cancel_authorized_http_before_response_never_advances_or_resends() {
         .unwrap();
     start_ipc(&b, 16).await;
     let r = terminal(&b, &id).await;
-    assert_eq!(r.status, "cancelled");
+    assert_eq!(r.status, RunStatus::Cancelled);
     assert!(!r.nodes.contains_key("e"));
     b.close().await.unwrap();
 }
@@ -431,7 +432,7 @@ async fn sigkill_after_external_request_recovers_uncertain_without_resend() {
         loop {
             let s = b.state().await;
             let n = &s.runs[&id].nodes["h"];
-            if n.wait.as_ref().is_some_and(|w| w.kind == "uncertain") {
+            if n.wait.as_ref().is_some_and(|w| w.kind == WaitKind::Uncertain) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -522,7 +523,7 @@ async fn enospc_observations_and_backup_target_do_not_damage_authority() {
         .await
         .unwrap();
     let run = terminal(&b, r.result["run_id"].as_str().unwrap()).await;
-    assert_eq!(run.status, "succeeded");
+    assert_eq!(run.status, RunStatus::Succeeded);
     b.observations.as_ref().unwrap().flush();
     assert!(b.observations.as_ref().unwrap().loss().storage_dropped > 0);
     let upper = b.journal.durable_lsn();
@@ -571,7 +572,7 @@ async fn http_without_length_expansion_hits_output_budget_and_retains_outcome() 
     start_ipc(&b, 1).await;
     let run = terminal(&b, r.result["run_id"].as_str().unwrap()).await;
     server.await.unwrap();
-    assert_eq!(run.status, "failed");
+    assert_eq!(run.status, RunStatus::Failed);
     assert!(
         run.error.as_ref().unwrap().contains("captured value size"),
         "{:?}",
@@ -645,7 +646,7 @@ async fn sixteen_active_tasks_and_simultaneous_release_are_bounded() {
     release.send(()).unwrap();
     for id in ids {
         let r = terminal(&b, &id).await;
-        assert_eq!(r.status, "succeeded", "{:?}", r.error);
+        assert_eq!(r.status, RunStatus::Succeeded, "{:?}", r.error);
         assert_eq!(
             r.output,
             Some(flow_journal::StoredValue::Inline(

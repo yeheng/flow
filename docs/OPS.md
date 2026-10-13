@@ -247,8 +247,9 @@ slots   = 4
 - PKI：内部 CA 签发 server 证书与每台 agent 证书。**证书 CN 即 agent_id**：主进程
   从 TLS 客户端证书取 CN，不信 agent 自报字段。
 - 单连接（v3 单流）：control（握手 / 管理帧 / Resume / Drain）与 data（业务帧）
-  复用同一条 mTLS 连接，帧内 1 字节通道标签区分；不再有独立 data 端口、
-  `DataBind` 握手或一次性 `data_credential`（相关字段为存量兼容保留并被忽略）。
+  复用同一条 mTLS 连接，帧内 1 字节通道标签区分；v2 时代的独立 data 端口、
+  `DataBind` 握手与一次性 `data_credential` 已随 v3 从协议目录与配置中删除
+  （过时帧在会话层按目录外类型整链拒绝）。
 - 协议版本：`PROTOCOL_VERSION = 3`，帧信封 `v` 不符即拒。agent 必报能力
   `relay` / `resource_report` / `reconnect`；缺一即拒。
 - 凭证：业务密钥以最小引用经 OperationPermit 按任务下发（主进程解析，**不复制主

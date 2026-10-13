@@ -96,8 +96,8 @@ const sections: SectionDesc[] = [
         key: "mode",
         label: "执行模式",
         type: "enum",
-        options: ["in_process", "ipc", "remote"],
-        help: "ipc=本机执行器子进程（unix 缺省）；remote=远程 agent；in_process=进程内（仅 Windows，unix 上会被拒绝）",
+        options: ["ipc", "remote"],
+        help: "ipc=本机执行器子进程（全平台缺省）；remote=远程 agent；in_process 已删除",
       },
       { key: "executor_bin", label: "执行器二进制", help: "留空 = 自召唤 flow executor" },
       { key: "x_max", label: "执行槽位（1..=16）", type: "number" },
@@ -108,7 +108,6 @@ const sections: SectionDesc[] = [
     label: "Agent（远程执行）",
     fields: [
       { key: "control_addr", label: "control 地址" },
-      { key: "data_addr", label: "data 地址" },
       { key: "agent_id", label: "agent 身份", help: "须与客户端证书 CN 一致" },
       { key: "ca_cert", label: "CA 证书路径" },
       { key: "cert", label: "证书路径" },

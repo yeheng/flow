@@ -38,7 +38,7 @@ pub fn channel_from_raw(fd: i32) -> std::io::Result<UnixStream> {
     // SAFETY: FD 由父进程 spawn 链保证有效，且只移交一次。
     let stream = unsafe { StdStream::from_raw_fd(fd) };
     stream.set_nonblocking(true)?;
-    Ok(UnixStream::from_std(stream)?)
+    UnixStream::from_std(stream)
 }
 
 impl FrameTransport {

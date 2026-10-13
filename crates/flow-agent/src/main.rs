@@ -32,9 +32,6 @@ struct Agent {
     /// 主进程 control TLS 地址（v3 起这是唯一的上联地址）。
     #[arg(long, env = "FLOW_AGENT_CONTROL_ADDR")]
     control_addr: Option<String>,
-    /// 已废弃：v3 起上联收敛为单条 TLS 连接，本参数被忽略（兼容保留）。
-    #[arg(long, env = "FLOW_AGENT_DATA_ADDR")]
-    data_addr: Option<String>,
     /// agent 身份（须与客户端证书 CN 一致）。
     #[arg(long, env = "FLOW_AGENT_ID")]
     agent_id: Option<String>,
@@ -73,7 +70,6 @@ fn main() -> std::process::ExitCode {
     };
     let Agent {
         control_addr,
-        data_addr,
         agent_id,
         ca_cert,
         cert,
@@ -85,7 +81,6 @@ fn main() -> std::process::ExitCode {
     let code = agent_main(
         loaded.config,
         control_addr,
-        data_addr,
         agent_id,
         ca_cert,
         cert,
@@ -109,7 +104,6 @@ fn exit_fail(err: &dyn std::fmt::Display) -> std::process::ExitCode {
 fn agent_main(
     config: Config,
     flag_control_addr: Option<String>,
-    flag_data_addr: Option<String>,
     flag_agent_id: Option<String>,
     flag_ca_cert: Option<String>,
     flag_cert: Option<String>,
@@ -137,9 +131,6 @@ fn agent_main(
         Ok(v) => v,
         Err(err) => return fail(&err),
     };
-    // data_addr 已废弃（v3 单条 TLS 上联）：CLI/配置字段为兼容保留，忽略。
-    let _ = flag_data_addr;
-    let _ = &agent.data_addr;
     let agent_id = match required(flag_agent_id, agent.agent_id.clone(), "agent_id") {
         Ok(v) => v,
         Err(err) => return fail(&err),

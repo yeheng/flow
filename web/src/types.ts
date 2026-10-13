@@ -210,7 +210,6 @@ export interface StorageConfig {
 
 export interface RemoteExecutionConfig {
   control_addr: string;
-  data_addr: string;
   ca_cert: string;
   cert: string;
   key: string;
@@ -218,8 +217,8 @@ export interface RemoteExecutionConfig {
 }
 
 export interface ExecutionConfig {
-  /** T7：unix 上 `in_process` 已删除（配置校验会拒绝），仅 Windows 过渡态合法。 */
-  mode: "in_process" | "ipc" | "remote";
+  /** in_process 已全平台删除（配置校验会拒绝），只有 ipc / remote。 */
+  mode: "ipc" | "remote";
   executor_bin: string | null;
   x_max: number;
   remote: RemoteExecutionConfig | null;
@@ -227,7 +226,6 @@ export interface ExecutionConfig {
 
 export interface AgentConfig {
   control_addr: string | null;
-  data_addr: string | null;
   agent_id: string | null;
   ca_cert: string | null;
   cert: string | null;

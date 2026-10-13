@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
+use flow_engine::journal_state::{NodeStatus, RunStatus, WaitKind};
 
 fn temp() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("flow-journal-ipc-{}", uuid::Uuid::now_v7()))
@@ -125,14 +126,14 @@ async fn script_condition_and_templates_execute_in_subprocess() {
     )
     .await;
     let done = until(&backend, &run_id, Run::terminal).await;
-    if done.status != "succeeded" {
+    if done.status != RunStatus::Succeeded {
         let mut report = String::new();
         for (id, n) in &done.nodes {
             report.push_str(&format!(
                 "  {id}: status={} error={:?} wait={:?}\n",
                 n.status,
                 n.error,
-                n.wait.as_ref().map(|w| w.kind.clone())
+                n.wait.as_ref().map(|w| w.kind)
             ));
         }
         panic!("run failed: {:?}\n{}", done.error, report);
@@ -150,7 +151,7 @@ async fn script_condition_and_templates_execute_in_subprocess() {
     // end 的直接前驱是 condition：单值直通。
     let output = materialize(&backend, &done, "e").await;
     assert_eq!(output, json!(true));
-    assert!(done.nodes["x"].status == "skipped");
+    assert!(done.nodes["x"].status == NodeStatus::Skipped);
     // 观测经 data 通道落地（console 行）。
     backend.close().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
@@ -222,7 +223,7 @@ async fn http_call_requires_permit_and_persists_outcome_via_ipc() {
     .await;
     let run_id = start_run(&backend, &workflow, json!({})).await;
     let done = until(&backend, &run_id, Run::terminal).await;
-    assert_eq!(done.status, "succeeded");
+    assert_eq!(done.status, RunStatus::Succeeded);
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     let output = materialize(&backend, &done, "e").await;
     assert_eq!(output["status"], 200);
@@ -253,7 +254,7 @@ async fn delay_and_signal_waits_release_executor_slots() {
     let run_id = start_run(&backend, &workflow, json!({})).await;
     // delay 等待登记后不占执行进程；human_task 等信号。
     let waiting = until(&backend, &run_id, |r| {
-        r.nodes.get("h").is_some_and(|n| n.status == "waiting") || r.terminal()
+        r.nodes.get("h").is_some_and(|n| n.status == NodeStatus::Waiting) || r.terminal()
     })
     .await;
     if waiting.terminal() {
@@ -263,19 +264,19 @@ async fn delay_and_signal_waits_release_executor_slots() {
                 "  {id}: status={} error={:?} wait={:?}\n",
                 n.status,
                 n.error,
-                n.wait.as_ref().map(|w| w.kind.clone())
+                n.wait.as_ref().map(|w| w.kind)
             ));
         }
         panic!("run terminal early: {:?}\n{}", waiting.error, report);
     }
-    assert_eq!(waiting.nodes["d"].status, "succeeded");
+    assert_eq!(waiting.nodes["d"].status, NodeStatus::Succeeded);
     assert!(waiting.nodes["d"].wait.is_none());
     backend
         .run_signal(&run_id, "h", json!({"decision": true}), Some("signal"))
         .await
         .unwrap();
     let done = until(&backend, &run_id, Run::terminal).await;
-    assert_eq!(done.status, "succeeded");
+    assert_eq!(done.status, RunStatus::Succeeded);
     let output = materialize(&backend, &done, "e").await;
     assert_eq!(output["decision"], true);
     backend.close().await.unwrap();
@@ -306,7 +307,7 @@ async fn sub_workflow_child_created_and_parent_completes() {
     .await;
     let run_id = start_run(&backend, &parent, json!({"base": 21})).await;
     let done = until(&backend, &run_id, Run::terminal).await;
-    assert_eq!(done.status, "succeeded");
+    assert_eq!(done.status, RunStatus::Succeeded);
     let output = materialize(&backend, &done, "e").await;
     assert_eq!(output["child"], true);
     assert_eq!(output["n"], 42);
@@ -318,7 +319,7 @@ async fn sub_workflow_child_created_and_parent_completes() {
         .filter(|r| r.parent.as_ref().is_some_and(|p| p.run_id == run_id))
         .collect();
     assert_eq!(children.len(), 1);
-    assert_eq!(children[0].status, "succeeded");
+    assert_eq!(children[0].status, RunStatus::Succeeded);
     drop(state);
     backend.close().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
@@ -342,7 +343,7 @@ async fn child_mapping_larger_than_control_frame_uses_durable_params() {
         {"id":"e","type":"end"}],"edges":[{"from":"s","to":"w"},{"from":"w","to":"e"}]})).await;
     let run_id = start_run(&backend, &parent, json!({"payload":"x".repeat(300_000)})).await;
     let done = until(&backend, &run_id, Run::terminal).await;
-    assert_eq!(done.status, "succeeded", "{:?}", done.error);
+    assert_eq!(done.status, RunStatus::Succeeded, "{:?}", done.error);
     assert_eq!(materialize(&backend, &done, "e").await["length"], 300_000);
     backend.close().await.unwrap();
 }
@@ -382,7 +383,7 @@ async fn cancel_during_http_marks_uncertain_and_never_resends() {
     .await;
     backend.run_cancel(&run_id, None).await.unwrap();
     let cancelled = until(&backend, &run_id, |r| {
-        r.status == "cancelled"
+        r.status == RunStatus::Cancelled
             && r.nodes.get("h").is_some_and(|n| {
                 n.attempts
                     .get(n.dispatch_id.as_str())
@@ -414,7 +415,7 @@ async fn cancel_during_http_marks_uncertain_and_never_resends() {
     backend.close().await.unwrap();
     drop(backend);
     let backend = ipc_backend_explicit(&root).await;
-    let still = until(&backend, &run_id, |r| r.status == "cancelled").await;
+    let still = until(&backend, &run_id, |r| r.status == RunStatus::Cancelled).await;
     assert_eq!(
         still.nodes["h"].operation.as_ref().unwrap().outcome,
         None,
@@ -467,7 +468,7 @@ async fn killing_executor_mid_script_recovers_with_new_process() {
                     "  {id}: status={} error={:?} wait={:?} attempt={}\n",
                     n.status,
                     n.error,
-                    n.wait.as_ref().map(|w| w.kind.clone()),
+                    n.wait.as_ref().map(|w| w.kind),
                     n.attempt
                 ));
             }
@@ -477,7 +478,7 @@ async fn killing_executor_mid_script_recovers_with_new_process() {
             );
         }
     };
-    assert_eq!(done.status, "failed");
+    assert_eq!(done.status, RunStatus::Failed);
     // T7：这段同时接管原 `PanicOnScript` 的职责——执行器硬猝死（这里是真的
     // SIGKILL 执行器进程）必须把涉及节点判死并把操作证据封闭，driver 继续服务。
     // kill 时机决定死在 start 还是 script 节点上，因此按「实际失败的那个节点」
@@ -485,7 +486,7 @@ async fn killing_executor_mid_script_recovers_with_new_process() {
     let failed_nodes: Vec<_> = done
         .nodes
         .iter()
-        .filter(|(_, node)| node.status == "failed")
+        .filter(|(_, node)| node.status == NodeStatus::Failed)
         .collect();
     assert!(!failed_nodes.is_empty(), "no failed node: {:?}", done.nodes);
     for (id, node) in failed_nodes {
@@ -507,8 +508,8 @@ async fn killing_executor_mid_script_recovers_with_new_process() {
     .await;
     let run2 = start_run(&backend, &quick, json!({})).await;
     let done2 = until(&backend, &run2, Run::terminal).await;
-    assert_eq!(done2.status, "failed");
-    assert_eq!(done2.nodes["n"].status, "failed");
+    assert_eq!(done2.status, RunStatus::Failed);
+    assert_eq!(done2.nodes["n"].status, NodeStatus::Failed);
     backend.close().await.unwrap();
     // 无遗留：本测试标记的执行器全部回收。
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -541,7 +542,7 @@ async fn restart_reuses_committed_preparation_without_reevaluation() {
     let waiting = until(&backend, &run_id, |r| {
         r.nodes
             .get("n")
-            .is_some_and(|n| n.wait.as_ref().is_some_and(|w| w.kind == "retry"))
+            .is_some_and(|n| n.wait.as_ref().is_some_and(|w| w.kind == WaitKind::Retry))
     })
     .await;
     let prepared = waiting.nodes["n"].prepared.clone();
@@ -550,7 +551,7 @@ async fn restart_reuses_committed_preparation_without_reevaluation() {
     let backend = ipc_backend_explicit(&root).await;
     let done = until(&backend, &run_id, Run::terminal).await;
     // attempt 1 重试、attempt 2 耗尽重试后终失败；准备输入跨进程复用。
-    assert_eq!(done.status, "failed");
+    assert_eq!(done.status, RunStatus::Failed);
     assert_eq!(done.nodes["n"].attempt, 2);
     assert_eq!(done.nodes["n"].prepared, prepared, "committed input reused");
     assert_eq!(done.nodes["n"].attempts.len(), 2);
@@ -575,7 +576,7 @@ async fn large_output_chunks_cross_result_barrier() {
     .await;
     let run_id = start_run(&backend, &workflow, json!({})).await;
     let done = until(&backend, &run_id, Run::terminal).await;
-    if done.status != "succeeded" {
+    if done.status != RunStatus::Succeeded {
         let mut report = String::new();
         for (id, n) in &done.nodes {
             report.push_str(&format!(
@@ -610,7 +611,7 @@ async fn journal_events_equivalent_between_in_process_and_ipc() {
     let workflow_a = install(&backend_a, definition.clone()).await;
     let run_a = start_run(&backend_a, &workflow_a, json!({"n": 1})).await;
     let done_a = until(&backend_a, &run_a, Run::terminal).await;
-    assert_eq!(done_a.status, "succeeded");
+    assert_eq!(done_a.status, RunStatus::Succeeded);
     backend_a.close().await.unwrap();
 
     let root_b = temp();
@@ -618,7 +619,7 @@ async fn journal_events_equivalent_between_in_process_and_ipc() {
     let workflow_b = install(&backend_b, definition).await;
     let run_b = start_run(&backend_b, &workflow_b, json!({"n": 1})).await;
     let done_b = until(&backend_b, &run_b, Run::terminal).await;
-    assert_eq!(done_b.status, "succeeded");
+    assert_eq!(done_b.status, RunStatus::Succeeded);
     backend_b.close().await.unwrap();
 
     // 状态等价：每节点状态/输出/attempt/audit_seq/等待结构一致。
@@ -825,7 +826,7 @@ async fn ipc_mixed_business_matrix() {
                             "  {id}: {} err={:?} wait={:?} attempt={}\n",
                             n.status,
                             n.error,
-                            n.wait.as_ref().map(|w| w.kind.clone()),
+                            n.wait.as_ref().map(|w| w.kind),
                             n.attempt
                         ));
                     }
@@ -834,7 +835,7 @@ async fn ipc_mixed_business_matrix() {
             };
             terminal_count.fetch_add(1, Ordering::Relaxed);
             assert!(
-                matches!(done.status.as_str(), "succeeded" | "cancelled"),
+                matches!(done.status, RunStatus::Succeeded | RunStatus::Cancelled),
                 "unexpected status {}",
                 done.status
             );
@@ -934,7 +935,7 @@ async fn result_larger_than_audit_window_commits_all_chunks() {
     .await;
     let run_id = start_run(&backend, &workflow, json!(null)).await;
     let done = until(&backend, &run_id, Run::terminal).await;
-    assert_eq!(done.status, "succeeded", "{:?}", done.error);
+    assert_eq!(done.status, RunStatus::Succeeded, "{:?}", done.error);
     let output = materialize(&backend, &done, "n").await;
     assert_eq!(output.as_str().unwrap(), "x".repeat(3 * 1024 * 1024));
     backend.close().await.unwrap();
@@ -969,7 +970,7 @@ async fn oversized_http_capture_is_uncertain_without_resend() {
             run.nodes
                 .get("h")
                 .and_then(|node| node.wait.as_ref())
-                .is_some_and(|wait| wait.kind == "uncertain")
+                .is_some_and(|wait| wait.kind == WaitKind::Uncertain)
         }),
     )
     .await
@@ -1014,7 +1015,7 @@ async fn inline_sized_run_input_dispatches_via_data_channel() {
     let done = until(&backend, &run_id, Run::terminal).await;
     assert_eq!(
         done.status,
-        "succeeded",
+        RunStatus::Succeeded,
         "run failed: {:?} nodes={:?}",
         done.error,
         done.nodes
@@ -1022,7 +1023,7 @@ async fn inline_sized_run_input_dispatches_via_data_channel() {
             .map(|n| (&n.status, &n.error))
             .collect::<Vec<_>>()
     );
-    let output = done.nodes.values().find(|n| n.status == "succeeded");
+    let output = done.nodes.values().find(|n| n.status == NodeStatus::Succeeded);
     let _ = output;
     backend.close().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
@@ -1084,7 +1085,7 @@ async fn result_output_in_control_frame_kill_band_survives() {
         let run_id = start_run(&backend, &workflow, json!({})).await;
         let done = until(&backend, &run_id, Run::terminal).await;
         assert_eq!(
-            done.status, "succeeded",
+            done.status, RunStatus::Succeeded,
             "size={size} run failed: {:?} nodes={:?}",
             done.error, done.nodes
         );
@@ -1149,7 +1150,7 @@ async fn oversized_failure_message_is_truncated_not_fatal() {
     .await;
     let run_id = start_run(&backend, &workflow, json!({})).await;
     let done = until(&backend, &run_id, Run::terminal).await;
-    assert_eq!(done.status, "failed");
+    assert_eq!(done.status, RunStatus::Failed);
     let error = done.nodes["n"].error.clone().unwrap();
     assert!(
         error.contains("[truncated]"),
@@ -1174,7 +1175,7 @@ async fn oversized_failure_message_is_truncated_not_fatal() {
     .await;
     let run2 = start_run(&backend, &quick, json!({})).await;
     let done2 = until(&backend, &run2, Run::terminal).await;
-    assert_eq!(done2.status, "succeeded", "{:?}", done2.error);
+    assert_eq!(done2.status, RunStatus::Succeeded, "{:?}", done2.error);
     backend.close().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }

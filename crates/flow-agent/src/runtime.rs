@@ -774,9 +774,8 @@ mod tests {
             "session".into(),
         )));
         let (ca, cb) = tokio::io::duplex(1024 * 1024);
-        let (da, db) = tokio::io::duplex(1024 * 1024);
-        let mut agent = FrameTransport::spawn_streams(ca, da, 16);
-        let mut master = FrameTransport::spawn_streams(cb, db, 16);
+        let mut agent = FrameTransport::spawn(ca, 16);
+        let mut master = FrameTransport::spawn(cb, 16);
         let server = tokio::spawn(async move {
             let mut reported = std::collections::BTreeSet::new();
             loop {

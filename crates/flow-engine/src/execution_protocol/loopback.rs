@@ -50,7 +50,7 @@ pub async fn spawn_executor_loopback(
     let accept = async { listener.accept().await.map(|(stream, _)| stream) };
     let channel = tokio::time::timeout(Duration::from_millis(STARTUP_TIMEOUT_MS), accept).await;
     match channel {
-        Ok(Ok(mut stream)) => {
+        Ok(Ok(stream)) => {
             stream.set_nodelay(true)?;
             Ok((stream, child))
         }

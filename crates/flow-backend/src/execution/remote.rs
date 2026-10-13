@@ -45,9 +45,6 @@ pub(crate) fn is_link_dead(error: &crate::journal::JournalError) -> bool {
 #[derive(Debug, Clone)]
 pub struct RemoteOptions {
     pub control_addr: String,
-    /// 已废弃：v3 起上联收敛为单条 TLS 连接（帧内通道标签），本字段仅为
-    /// 存量配置兼容保留，值被忽略。
-    pub data_addr: String,
     pub ca_cert: PathBuf,
     pub server_cert: PathBuf,
     pub server_key: PathBuf,
@@ -357,15 +354,13 @@ impl AgentManager {
             "link-{}",
             self.session_counter.fetch_add(1, Ordering::Relaxed)
         );
-        // 裸写 Welcome（字段保留 data_credential：Message 信封结构冻结，
-        // v3 单流下已无第二条连接需要绑定，值不再被消费）。
+        // 裸写 Welcome（会话尚未交给统一 transport，先手工编码一帧）。
         {
             let welcome = Message::AgentWelcome {
                 journal_id: self.journal_id.clone(),
                 master_epoch: self.master_epoch,
                 link_session_id: link_session_id.clone(),
                 agent_id: agent_id.clone(),
-                data_credential: flow_engine::execution_protocol::transport::fresh_boot_id(),
                 heartbeat_ms: flow_engine::execution_protocol::HEARTBEAT_INTERVAL_MS,
                 agent_window_bytes: W_BYTES * A_MAX as u64,
             };
@@ -471,15 +466,10 @@ impl AgentManager {
                         }
                     }
                     received = transport.recv() => {
-                        let (channel, message) = received.map_err(|e| format!("recv: {e}"))?;
+                        let (_channel, message) = received.map_err(|e| format!("recv: {e}"))?;
                         match message {
                             Message::Routed { envelope, inner } => {
                                 tracing::trace!(kind = inner.type_name(), dispatch = ?envelope.dispatch_id, "agent routed message");
-                                if channel == flow_engine::execution_protocol::Channel::Control
-                                    && matches!(&*inner, Message::DataBind { .. })
-                                {
-                                    return Err("nested DataBind".into());
-                                }
                                 // 包络校验：会话身份 + 绑定归属 + boot 一致。
                                 if envelope.agent_id != agent_id
                                     || envelope.agent_boot_id != agent_boot_id

@@ -31,9 +31,98 @@ mod snapshot_decimal {
     }
 }
 
-/// 幂等回执保留窗口：超过即按 lsn 淘汰最旧一半（远大于 R_max=1000 的
-/// 在飞 run 数，正常重试永远落在窗口内）。
+/// 幂等回执保留窗口：超过即按 lsn 淘汰最旧一半（远大于后端在飞 run 上限
+/// R_MAX=1000，正常重试永远落在窗口内）。
 const COMMAND_WINDOW: usize = 8192;
+
+/// run 生命周期状态词汇表（journal 域单一来源）。wire 是 snake_case 字符串，
+/// 与既有 journal 日志、checkpoint 逐字兼容——加变体编译器会逼所有
+/// match 跟上，不再有散落字符串比对漏改的通道。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStatus {
+    Running,
+    AwaitingResume,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+impl RunStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::AwaitingResume => "awaiting_resume",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+    pub fn terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
+    }
+}
+
+impl std::fmt::Display for RunStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// 节点执行状态（`Node.status`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeStatus {
+    Pending,
+    Running,
+    Waiting,
+    Succeeded,
+    Skipped,
+    Failed,
+}
+
+impl NodeStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Waiting => "waiting",
+            Self::Succeeded => "succeeded",
+            Self::Skipped => "skipped",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl std::fmt::Display for NodeStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// 持久等待类别（`Wait.kind`，WaitRegistered 携带）。事件载荷里的裸字符串
+/// 比对一律经 [`WaitKind::as_str`]，不写第二份字面量。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitKind {
+    Delay,
+    Signal,
+    Child,
+    Retry,
+    Uncertain,
+}
+
+impl WaitKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Delay => "delay",
+            Self::Signal => "signal",
+            Self::Child => "child",
+            Self::Retry => "retry",
+            Self::Uncertain => "uncertain",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workflow {
@@ -62,7 +151,7 @@ pub struct Run {
     pub parent: Option<Parent>,
     pub depth: u32,
     pub created_at: String,
-    pub status: String,
+    pub status: RunStatus,
     pub output: Option<StoredValue>,
     pub error: Option<String>,
     #[serde(with = "snapshot_decimal")]
@@ -79,7 +168,7 @@ pub struct Node {
     pub node_execution_id: String,
     pub attempt: u32,
     pub dispatch_id: String,
-    pub status: String,
+    pub status: NodeStatus,
     pub output: Option<StoredValue>,
     pub branch: Option<bool>,
     pub prepared: Option<Prepared>,
@@ -114,7 +203,7 @@ pub struct Prepared {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Wait {
-    pub kind: String,
+    pub kind: WaitKind,
     pub wake_at: Option<i64>,
     pub child_run_id: Option<String>,
     #[serde(default)]
@@ -170,7 +259,7 @@ pub fn command_key(scope: &str, request_id: &str) -> String {
 
 impl Run {
     pub fn terminal(&self) -> bool {
-        matches!(self.status.as_str(), "succeeded" | "failed" | "cancelled")
+        self.status.terminal()
     }
 }
 
@@ -523,7 +612,7 @@ impl State {
         }
         match event.kind {
             EventKind::RunCancelled => {
-                run.status = "cancelled".into();
+                run.status = RunStatus::Cancelled;
                 run.error = None;
                 return Ok(());
             }
@@ -531,13 +620,13 @@ impl State {
                 if run.terminal() {
                     return Err(invalid("terminal run completion"));
                 }
-                run.status = "succeeded".into();
+                run.status = RunStatus::Succeeded;
                 run.output = Some(serde_json::from_value(p["output"].clone())?);
                 return Ok(());
             }
             EventKind::RunFailed => {
                 if !run.terminal() {
-                    run.status = "failed".into();
+                    run.status = RunStatus::Failed;
                     run.error = Some(string(p, "error")?);
                 }
                 return Ok(());
@@ -565,7 +654,7 @@ impl State {
                 node_execution_id: execution.clone(),
                 attempt: 0,
                 dispatch_id: String::new(),
-                status: "pending".into(),
+                status: NodeStatus::Pending,
                 output: None,
                 branch: None,
                 prepared: None,
@@ -581,10 +670,10 @@ impl State {
             {
                 return Err(invalid("unsafe dispatch retry"));
             }
-            run.status = "running".into();
+            run.status = RunStatus::Running;
             node.attempt = attempt;
             node.dispatch_id = dispatch_id.clone();
-            node.status = "running".into();
+            node.status = NodeStatus::Running;
             node.wait = None;
             node.attempts.insert(
                 dispatch_id,
@@ -607,7 +696,7 @@ impl State {
                     node_execution_id: String::new(),
                     attempt: 0,
                     dispatch_id: String::new(),
-                    status: "skipped".into(),
+                    status: NodeStatus::Skipped,
                     output: None,
                     branch: None,
                     prepared: None,
@@ -633,7 +722,7 @@ impl State {
                 if run
                     .nodes
                     .get(id)
-                    .is_none_or(|n| n.status != "succeeded" || n.output.as_ref() != Some(value))
+                    .is_none_or(|n| n.status != NodeStatus::Succeeded || n.output.as_ref() != Some(value))
                 {
                     return Err(invalid(
                         "prepared predecessor differs from committed output",
@@ -737,45 +826,45 @@ impl State {
                 }
                 match event.kind {
                     EventKind::NodeCompleted => {
-                        node.status = "succeeded".into();
+                        node.status = NodeStatus::Succeeded;
                         node.output = Some(serde_json::from_value(p["output"].clone())?);
                         node.branch = p.get("branch").and_then(Value::as_bool);
                     }
                     EventKind::WaitRegistered => {
-                        node.status = "waiting".into();
+                        node.status = NodeStatus::Waiting;
                         node.wait = Some(serde_json::from_value(p["wait"].clone())?);
                         // 与 v1 词汇对齐：正常业务等待（delay/human/child/
                         // retry）期间 run 仍是 running；只有不确定外部结果
                         // （平台故障面）才进入 awaiting_resume——同词同义，
                         // 运维看到 awaiting_resume 即代表需要人工介入。
                         run.status = if wait_kind_uncertain(p) {
-                            "awaiting_resume".into()
+                            RunStatus::AwaitingResume
                         } else {
-                            "running".into()
+                            RunStatus::Running
                         };
                     }
                     _ => {
-                        node.status = "failed".into();
+                        node.status = NodeStatus::Failed;
                         node.error = Some(string(p, "error")?);
                         if let Some(wake_at) = p.get("retry_wake_at").and_then(Value::as_i64) {
                             if node.operation.is_some() {
                                 return Err(invalid("external operation cannot use pure retry"));
                             }
-                            node.status = "waiting".into();
+                            node.status = NodeStatus::Waiting;
                             node.wait = Some(Wait {
-                                kind: "retry".into(),
+                                kind: WaitKind::Retry,
                                 wake_at: Some(wake_at),
                                 child_run_id: None,
                                 output: None,
                             });
-                            run.status = "running".into();
+                            run.status = RunStatus::Running;
                         }
                     }
                 }
             }
             EventKind::WaitResolved => {
                 if !terminal {
-                    node.status = "succeeded".into();
+                    node.status = NodeStatus::Succeeded;
                     node.wait = None;
                     node.output = Some(serde_json::from_value(p["output"].clone())?);
                 }
@@ -783,7 +872,7 @@ impl State {
             EventKind::Adjudicated => {
                 let decision = p["decision"].as_str().unwrap_or_default();
                 if terminal
-                    || node.wait.as_ref().is_none_or(|w| w.kind != "uncertain")
+                    || node.wait.as_ref().is_none_or(|w| w.kind != WaitKind::Uncertain)
                     || node
                         .operation
                         .as_ref()
@@ -796,7 +885,7 @@ impl State {
                 match decision {
                     // 人工显式接受产出（不伪造外部响应被捕获的事实）
                     "accept_output" => {
-                        node.status = "succeeded".into();
+                        node.status = NodeStatus::Succeeded;
                         node.wait = None;
                         node.output = Some(serde_json::from_value(p["output"].clone())?);
                     }
@@ -804,7 +893,7 @@ impl State {
                     // 以 attempt+1 重新派发（绝不自动重发的禁令针对机器，人工
                     // 裁决就是授权凭据）。审计历史保留在 attempts 里。
                     "retry" => {
-                        node.status = "pending".into();
+                        node.status = NodeStatus::Pending;
                         node.wait = None;
                         node.operation = None;
                         node.error = None;
@@ -812,14 +901,14 @@ impl State {
                     }
                     // 人工判定失败：节点终态 failed，run 由收尾判定写 RunFailed
                     _ => {
-                        node.status = "failed".into();
+                        node.status = NodeStatus::Failed;
                         node.wait = None;
                         node.error = Some(string(p, "reason")?);
                     }
                 }
                 // 裁决即人工介入完成：awaiting_resume 回到 running（终态由
                 // 后续 RunCompleted/RunFailed 事件落定）
-                run.status = "running".into();
+                run.status = RunStatus::Running;
             }
             EventKind::ValueChunk | EventKind::ValuePublished | EventKind::LateAudit => {}
             _ => return Err(invalid("unsupported event for node")),
@@ -842,7 +931,7 @@ fn restore<T>(map: &mut BTreeMap<String, T>, undo: BTreeMap<String, Option<T>>) 
 
 /// WaitRegistered 载荷的等待是否「不确定外部结果」（uncertain）。
 fn wait_kind_uncertain(payload: &Value) -> bool {
-    payload["wait"]["kind"].as_str() == Some("uncertain")
+    payload["wait"]["kind"].as_str() == Some(WaitKind::Uncertain.as_str())
 }
 fn replace_config(map: &mut BTreeMap<String, Value>, payload: &Value, key: &str) -> Result<()> {
     let id = string(payload, key)?;

@@ -29,7 +29,6 @@ pub enum FromSession {
     Dead(String),
 }
 
-use std::path::PathBuf;
 
 use flow_engine::execution_protocol::contract::{
     ExecutorInvocation, EXECUTION_MODE_ENV, X_MAX_DEFAULT,
@@ -95,16 +94,6 @@ pub fn mode_from_config(config: &flow_config::ExecutionConfig) -> Result<Executi
     }
 }
 
-/// 远程模式环境变量（R1/R3 运维入口）。
-pub struct RemoteEnv {
-    pub control_addr: String,
-    pub data_addr: String,
-    pub ca_cert: PathBuf,
-    pub server_cert: PathBuf,
-    pub server_key: PathBuf,
-    pub attach_timeout_ms: u64,
-}
-
 /// 从统一配置解析远程模式选项（mode=remote 时 [execution.remote] 必填，
 /// validate 已把关，这里是取值转换）。
 pub fn remote_options_from_config(
@@ -116,7 +105,6 @@ pub fn remote_options_from_config(
         .ok_or("execution.mode=remote requires [execution.remote]")?;
     Ok(crate::execution::remote::RemoteOptions {
         control_addr: remote.control_addr.clone(),
-        data_addr: remote.data_addr.clone(),
         ca_cert: remote.ca_cert.clone(),
         server_cert: remote.cert.clone(),
         server_key: remote.key.clone(),

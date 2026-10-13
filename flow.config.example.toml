@@ -32,7 +32,6 @@ x_max = 4
 # mode = "remote" 时必填（control_addr + 证书三件套 + 超时；原 FLOW_REMOTE_* 四件套）
 # [execution.remote]
 # control_addr = "10.0.0.8:9700"
-# data_addr = "10.0.0.8:9701"   # 已废弃（v3 单条 mTLS 上联）：保留字段，值被忽略
 # ca_cert = "/etc/flow/ca.pem"
 # cert = "/etc/flow/server.pem"
 # key = "/etc/flow/server.key"
@@ -41,7 +40,6 @@ x_max = 4
 # `flow-agent` 的部署参数（原先只能 CLI 参数 / 环境变量；CLI flag 仍可逐项覆盖）
 # [agent]
 # control_addr = "10.0.0.8:9700"
-# data_addr = "10.0.0.8:9701"   # 已废弃（v3 单条 mTLS 上联）：保留字段，值被忽略
 # agent_id = "agent-1"
 # ca_cert = "/etc/flow/ca.pem"
 # cert = "/etc/flow/agent-1.pem"

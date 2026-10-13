@@ -1,7 +1,7 @@
 //! 三期 R1-01：flow-agent 双 TLS（mTLS）与资源准入的网络集成回归。
 //!
 //! 真实 flow-agent 二进制进程 + 真实 TLS 监听 + 真实执行器子进程：
-//! 端到端业务（script/HTTP）、data 绑定凭据校验、单任务取消不关上联。
+//! 端到端业务（script/HTTP）、过时 v2 帧拒绝、单任务取消不关上联。
 
 use flow_backend::journal::JournalBackend;
 use flow_engine::journal_state::Run;
@@ -9,6 +9,7 @@ use flow_journal::{JournalOptions, StoredValue};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
+use flow_engine::journal_state::{RunStatus};
 
 fn temp() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("flow-journal-r1-{}", uuid::Uuid::now_v7()))
@@ -72,11 +73,9 @@ fn generate_pki(
 fn remote_options(
     dir: &std::path::Path,
     control: u16,
-    data: u16,
 ) -> flow_backend::execution::remote::RemoteOptions {
     flow_backend::execution::remote::RemoteOptions {
         control_addr: format!("127.0.0.1:{control}"),
-        data_addr: format!("127.0.0.1:{data}"),
         ca_cert: dir.join("ca.pem"),
         server_cert: dir.join("server.pem"),
         server_key: dir.join("server.key"),
@@ -128,7 +127,6 @@ impl Drop for AgentProcess {
 fn spawn_agent(
     dir: &std::path::Path,
     control: u16,
-    data: u16,
     agent_cn: &str,
     slots: u32,
 ) -> AgentProcess {
@@ -136,8 +134,6 @@ fn spawn_agent(
         .args([
             "--control-addr",
             &format!("127.0.0.1:{control}"),
-            "--data-addr",
-            &format!("127.0.0.1:{data}"),
             "--agent-id",
             agent_cn,
             "--ca-cert",
@@ -194,12 +190,12 @@ async fn tls_agent_end_to_end_business() {
     std::fs::create_dir_all(&dir).unwrap();
     let (ca, _sc, _sk, _ac, _ak) = generate_pki(&dir, "agent-tls-1");
     let _ = ca;
-    let ports = free_ports(2);
+    let ports = free_ports(1);
     let backend = JournalBackend::open(&dir.join("data"), JournalOptions::default())
         .await
         .unwrap();
     backend
-        .start_execution_remote(remote_options(&dir, ports[0], ports[1]))
+        .start_execution_remote(remote_options(&dir, ports[0]))
         .await
         .unwrap();
     // 确认监听可达。
@@ -207,7 +203,7 @@ async fn tls_agent_end_to_end_business() {
         let probe = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await;
         assert!(probe.is_ok(), "listener {port} must be reachable");
     }
-    let mut _agent = spawn_agent(&dir, ports[0], ports[1], "agent-tls-1", 4);
+    let mut _agent = spawn_agent(&dir, ports[0], "agent-tls-1", 4);
     // 等会话注册。
     tokio::time::sleep(Duration::from_millis(500)).await;
     let workflow = install(
@@ -226,7 +222,7 @@ async fn tls_agent_end_to_end_business() {
         .unwrap();
     let run_id = created.result["run_id"].as_str().unwrap().to_string();
     let done = until(&backend, &run_id, Run::terminal).await;
-    if done.status != "succeeded" {
+    if done.status != RunStatus::Succeeded {
         panic!(
             "tls run failed: {:?}; agent stderr:\n{}",
             done.error,
@@ -270,10 +266,21 @@ async fn tls_agent_end_to_end_business() {
 
 #[tokio::test]
 async fn unexpected_session_frame_rejected_and_single_cancel_keeps_uplink() {
-    // 会话级协议校验：v3 单流上联已无 DataBind；握手后发送过时的
-    // DataBind 帧属意外消息，必须整会话拒绝（不能静默容忍）。
-    use flow_engine::execution_protocol::transport::FrameTransport;
-    use flow_engine::execution_protocol::Message;
+    // 会话级协议校验：v3 单流上联已无 DataBind（v2 遗留，目录外类型）；
+    // 握手后注入过时的 DataBind 裸帧必须整会话拒绝（不能静默容忍）。
+    // 走裸帧注入而不是 Message 构造：目录里已没有这个变体，拒绝路径
+    // 恰恰是 from_envelope 的 UnknownMessage。
+    use flow_engine::execution_protocol::contract::PROTOCOL_VERSION;
+    use flow_engine::execution_protocol::frame::FrameDecoder;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    fn raw_frame(json: &Value) -> Vec<u8> {
+        let bytes = serde_json::to_vec(json).unwrap();
+        let mut frame = Vec::with_capacity(bytes.len() + 5);
+        frame.extend_from_slice(&((bytes.len() + 1) as u32).to_be_bytes());
+        frame.push(0u8); // control 标签
+        frame.extend_from_slice(&bytes);
+        frame
+    }
     let dir = temp();
     std::fs::create_dir_all(&dir).unwrap();
     let backend = JournalBackend::open(&dir.join("data"), JournalOptions::default())
@@ -284,51 +291,53 @@ async fn unexpected_session_frame_rejected_and_single_cancel_keeps_uplink() {
         backend.journal.id().into(),
         1,
     );
-    let (control_a, control_b) = tokio::io::duplex(64 * 1024);
+    let (control_a, mut client) = tokio::io::duplex(64 * 1024);
     manager
         .attach_inprocess("agent-bad".to_string(), control_a)
         .await;
-    let mut transport = FrameTransport::spawn(control_b, 16);
-    transport
-        .send(Message::AgentHello {
-            agent_boot_id: "boot-bad".into(),
-            build: "t".into(),
-            capabilities: vec!["relay".into(), "resource_report".into(), "reconnect".into()],
-            slots: 1,
-        })
-        .await
-        .unwrap();
+    // AgentHello 裸帧（与 flow-agent 上联同格式：v3 标签帧）。
+    let hello = json!({
+        "v": PROTOCOL_VERSION, "type": "AgentHello",
+        "body": {
+            "agent_boot_id": "boot-bad", "build": "t",
+            "capabilities": ["relay", "resource_report", "reconnect"],
+            "slots": "1"
+        }
+    });
+    client.write_all(&raw_frame(&hello)).await.unwrap();
+    // 读 AgentWelcome（裸帧解码）。
+    let mut decoder = FrameDecoder::new_tagged();
     let welcome = loop {
-        let (_, message) = transport.recv().await.unwrap();
-        if matches!(message, Message::AgentWelcome { .. }) {
-            break message;
+        let mut chunk = [0u8; 16 * 1024];
+        let n = client.read(&mut chunk).await.unwrap();
+        assert!(n > 0, "stream closed before welcome");
+        decoder.feed(&chunk[..n]).unwrap();
+        if let Some((_, body)) = decoder.pop_tagged_frame().unwrap() {
+            break serde_json::from_slice::<Value>(&body).unwrap();
         }
     };
-    let Message::AgentWelcome {
-        link_session_id, ..
-    } = welcome
-    else {
-        unreachable!()
-    };
-    // 过时的 DataBind（v2 双流遗留）→ 意外消息 → 会话关闭。
-    transport
-        .send(Message::DataBind {
-            agent_boot_id: "boot-bad".into(),
-            link_session_id,
-            credential: "wrong-credential".into(),
-        })
-        .await
-        .unwrap();
+    assert_eq!(welcome["type"], "AgentWelcome");
+    // 过时的 DataBind（v2 双流遗留、v3 目录外）→ UnknownMessage → 会话关闭。
+    let stale = json!({
+        "v": PROTOCOL_VERSION, "type": "DataBind",
+        "body": {
+            "agent_boot_id": "boot-bad",
+            "link_session_id": welcome["body"]["link_session_id"],
+            "credential": "wrong-credential"
+        }
+    });
+    client.write_all(&raw_frame(&stale)).await.unwrap();
     let closed = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if transport.recv().await.is_err() {
+            let mut chunk = [0u8; 16 * 1024];
+            if client.read(&mut chunk).await.unwrap_or(0) == 0 {
                 return;
             }
         }
     })
     .await;
     assert!(closed.is_ok(), "unexpected session frame must close session");
-    drop(transport);
+    drop(client);
     backend.close().await.unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -338,15 +347,15 @@ async fn single_task_cancel_keeps_agent_uplink_alive() {
     let dir = temp();
     std::fs::create_dir_all(&dir).unwrap();
     generate_pki(&dir, "agent-cancel");
-    let ports = free_ports(2);
+    let ports = free_ports(1);
     let backend = JournalBackend::open(&dir.join("data"), JournalOptions::default())
         .await
         .unwrap();
     backend
-        .start_execution_remote(remote_options(&dir, ports[0], ports[1]))
+        .start_execution_remote(remote_options(&dir, ports[0]))
         .await
         .unwrap();
-    let agent = spawn_agent(&dir, ports[0], ports[1], "agent-cancel", 4);
+    let agent = spawn_agent(&dir, ports[0], "agent-cancel", 4);
     tokio::time::sleep(Duration::from_millis(500)).await;
     // 挂起 HTTP：取消第一个 run 的单个任务。
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -379,8 +388,8 @@ async fn single_task_cancel_keeps_agent_uplink_alive() {
     })
     .await;
     backend.run_cancel(&hang_run, None).await.unwrap();
-    let cancelled = until(&backend, &hang_run, |r| r.status == "cancelled").await;
-    assert_eq!(cancelled.status, "cancelled");
+    let cancelled = until(&backend, &hang_run, |r| r.status == RunStatus::Cancelled).await;
+    assert_eq!(cancelled.status, RunStatus::Cancelled);
     // 上联保持：agent 进程仍在，第二个 run 正常完成。
     let ok_flow = install(
         &backend,
@@ -398,7 +407,7 @@ async fn single_task_cancel_keeps_agent_uplink_alive() {
     let ok_run = created.result["run_id"].as_str().unwrap().to_string();
     let done = until(&backend, &ok_run, Run::terminal).await;
     assert_eq!(
-        done.status, "succeeded",
+        done.status, RunStatus::Succeeded,
         "uplink must survive single cancel"
     );
     drop(agent);

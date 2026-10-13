@@ -11,6 +11,7 @@ use flow_journal::{JournalOptions, StoredValue};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
+use flow_engine::journal_state::{RunStatus};
 
 fn temp() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("flow-journal-r2-{}", uuid::Uuid::now_v7()))
@@ -26,7 +27,6 @@ fn executor() -> flow_engine::execution_protocol::contract::ExecutorInvocation {
 fn remote_options() -> flow_backend::execution::remote::RemoteOptions {
     flow_backend::execution::remote::RemoteOptions {
         control_addr: "127.0.0.1:0".into(),
-        data_addr: "127.0.0.1:0".into(),
         ca_cert: "unused".into(),
         server_cert: "unused".into(),
         server_key: "unused".into(),
@@ -246,7 +246,7 @@ async fn uplink_drop_then_reconnect_resumes_without_double_execution() {
         let _ = reason;
     });
     let done = until(&backend, &run_id, Run::terminal).await;
-    assert_eq!(done.status, "succeeded", "error={:?}", done.error);
+    assert_eq!(done.status, RunStatus::Succeeded, "error={:?}", done.error);
     // 无双重执行：一次 dispatch、audit_seq 连续无重复。
     let node = &done.nodes["n"];
     assert_eq!(node.attempt, 1);
@@ -328,7 +328,7 @@ async fn cancel_during_disconnect_drains_after_resume() {
     });
     // 等取消 + 封口（重连 resume → CancelAndDrain → 包装器封口）。
     let done = until(&backend, &run_id, |r| {
-        r.status == "cancelled"
+        r.status == RunStatus::Cancelled
             && r.nodes.get("h").is_some_and(|n| {
                 n.attempts
                     .get(n.dispatch_id.as_str())

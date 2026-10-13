@@ -1,8 +1,9 @@
-//! 本地执行 IPC 协议（JSONL 重构二期 §3）。
+//! 执行 IPC 协议（v3 单流）。
 //!
 //! DTO、物理帧、传输与会话校验都在本模块；业务层只依赖 [`message`] 的
 //! 消息目录与 [`transport`] 的小型 Transport 边界（按 control/data 发帧、
-//! 收帧、关闭），不依赖 Unix FD、PID 或机器路径。远程适配在三期定义。
+//! 收帧、关闭），不依赖 Unix FD、PID 或机器路径。远程中继（agent）复用
+//! 同一消息目录与帧格式（`remote` 模块）。
 //!
 //! 子进程不得打开 store/journal；本模块不引入任何存储依赖。
 
