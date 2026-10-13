@@ -622,7 +622,7 @@ mod tests {
         // Hello 变体（索引 0）+ version=1 + boot_id 长度声明 u64::MAX
         // varint（9 字节 0xFF 前缀 + 0x3F 终结）。
         let mut body = vec![0u8, 1];
-        body.extend_from_slice(&[0xFF; 9][..8].to_vec());
+        body.extend_from_slice(&[0xFF; 9][..8]);
         body.push(0x3F);
         assert!(
             postcard::from_bytes::<Message>(&body).is_err(),
