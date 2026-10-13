@@ -1,4 +1,4 @@
-//! 执行 IPC 协议（v3 单流）。
+//! 执行 IPC 协议（v4 单流）。
 //!
 //! DTO、物理帧、传输与会话校验都在本模块；业务层只依赖 [`message`] 的
 //! 消息目录与 [`transport`] 的小型 Transport 边界（按 control/data 发帧、

@@ -11,7 +11,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
 use sha2::Digest as _;
 use tokio::sync::mpsc;
@@ -528,9 +527,8 @@ impl DispatchRunner {
                 if dispatch_id != self.attempt.dispatch_id {
                     return Err(invalid("transfer chunk for foreign dispatch"));
                 }
-                let raw = STANDARD
-                    .decode(&bytes)
-                    .map_err(|_| invalid("transfer chunk base64"))?;
+                // T12：bytes 已是内存中的原始字节。
+                let raw = bytes.clone();
                 let expected = hex_sha(&raw);
                 if expected != digest {
                     return Err(invalid("transfer chunk digest mismatch"));
@@ -1304,7 +1302,7 @@ async fn transfer_one(
                 dispatch_id: dispatch_id.into(),
                 transfer_id: transfer_id.into(),
                 offset,
-                bytes: STANDARD.encode(&buffer[..n]),
+                bytes: buffer[..n].to_vec(),
                 digest: hex_sha(&buffer[..n]),
             })))
             .await
@@ -1482,7 +1480,7 @@ mod transfer_budget_tests {
             dispatch_id: "d".into(),
             transfer_id: id.into(),
             offset,
-            bytes: STANDARD.encode(bytes),
+            bytes: bytes.to_vec(),
             digest: hex_sha(bytes),
         };
         assert!(runner

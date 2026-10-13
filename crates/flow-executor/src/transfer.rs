@@ -38,7 +38,7 @@ pub struct IncomingTransfers {
     streams: BTreeMap<String, TransferBuffer>,
 }
 
-/// 单个 transfer 的连续接收缓冲（T07）：v3 单流下块按序到达，接收端只
+/// 单个 transfer 的连续接收缓冲（T07）：v4 单流下块按序到达，接收端只
 /// 维护连续前缀（`buf`）。`offset == 已接收长度` 时追加；完全落在已接收
 /// 前缀且字节相同的是幂等重复（重连后全量重发）；缺口、跨边界重叠或异
 /// 内容一律拒绝。不再维护块树与装配副本（消除排序 + 整体二次拷贝）。
@@ -66,12 +66,11 @@ impl IncomingTransfers {
         {
             return Err(TransferError::Oversize(self.streams.len() as u64));
         }
-        if bytes.len() > CHUNK_BYTES.div_ceil(3) * 4 {
+        if bytes.len() > CHUNK_BYTES {
             return Err(TransferError::Oversize(bytes.len() as u64));
         }
-        let raw = STANDARD
-            .decode(bytes)
-            .map_err(|_| TransferError::Digest(*offset))?;
+        // T12：内存中 bytes 已是原始字节（v3 wire 的 base64 在解码层还原）。
+        let raw = bytes.clone();
         if hex::encode(Sha256::digest(&raw)) != *digest {
             return Err(TransferError::Digest(*offset));
         }
@@ -326,7 +325,7 @@ mod tests {
             dispatch_id: "d".into(),
             transfer_id: id.into(),
             offset,
-            bytes: STANDARD.encode(data),
+            bytes: data.to_vec(),
             digest: hex::encode(Sha256::digest(data)),
         }
     }

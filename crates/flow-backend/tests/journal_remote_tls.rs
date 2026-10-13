@@ -266,19 +266,22 @@ async fn tls_agent_end_to_end_business() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// 构造 v3 单流裸帧（control 标签）——测试注入用。
+/// 构造 v4 单流裸帧（kind=0 JSON 信封）——测试注入用。
 fn raw_frame(json: &Value) -> Vec<u8> {
+    // v4 kind=0 帧：u32 body_len | u8 kind | u32 meta_len | JSON meta
     let bytes = serde_json::to_vec(json).unwrap();
-    let mut frame = Vec::with_capacity(bytes.len() + 5);
-    frame.extend_from_slice(&((bytes.len() + 1) as u32).to_be_bytes());
-    frame.push(0u8); // control 标签
+    let body_len = 5 + bytes.len();
+    let mut frame = Vec::with_capacity(4 + body_len);
+    frame.extend_from_slice(&(body_len as u32).to_be_bytes());
+    frame.push(0u8); // KIND_JSON
+    frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
     frame.extend_from_slice(&bytes);
     frame
 }
 
 #[tokio::test]
 async fn unexpected_session_frame_rejected_and_single_cancel_keeps_uplink() {
-    // 会话级协议校验：v3 单流上联已无 DataBind（v2 遗留，目录外类型）；
+    // 会话级协议校验：v4 单流上联已无 DataBind（v2 遗留，目录外类型）；
     // 握手后注入过时的 DataBind 裸帧必须整会话拒绝（不能静默容忍）。
     // 走裸帧注入而不是 Message 构造：目录里已没有这个变体，拒绝路径
     // 恰恰是 from_envelope 的 UnknownMessage。
@@ -299,7 +302,7 @@ async fn unexpected_session_frame_rejected_and_single_cancel_keeps_uplink() {
     manager
         .attach_inprocess("agent-bad".to_string(), control_a)
         .await;
-    // AgentHello 裸帧（与 flow-agent 上联同格式：v3 标签帧）。
+    // AgentHello 裸帧（与 flow-agent 上联同格式：v4 kind=0 JSON 信封帧）。
     let hello = json!({
         "v": PROTOCOL_VERSION, "type": "AgentHello",
         "body": {
@@ -310,14 +313,14 @@ async fn unexpected_session_frame_rejected_and_single_cancel_keeps_uplink() {
     });
     client.write_all(&raw_frame(&hello)).await.unwrap();
     // 读 AgentWelcome（裸帧解码）。
-    let mut decoder = FrameDecoder::new_tagged();
+    let mut decoder = FrameDecoder::new();
     let welcome = loop {
         let mut chunk = [0u8; 16 * 1024];
         let n = client.read(&mut chunk).await.unwrap();
         assert!(n > 0, "stream closed before welcome");
         decoder.feed(&chunk[..n]).unwrap();
-        if let Some((_, body)) = decoder.pop_tagged_frame().unwrap() {
-            break serde_json::from_slice::<Value>(&body).unwrap();
+        if let Some((_, message)) = decoder.pop().unwrap() {
+            break serde_json::to_value(message.to_envelope()).unwrap();
         }
     };
     assert_eq!(welcome["type"], "AgentWelcome");
@@ -482,7 +485,7 @@ async fn coalesced_welcome_and_trailing_frame_not_lost_by_agent() {
     // agent 握手经统一 transport 后必须消费尾帧并断开会话；若握手临时
     // decoder 丢弃尾字节，agent 只能干等心跳超时（10s 级），测试在 5 秒
     // 内断言连接关闭即可区分两种实现。
-    use flow_engine::execution_protocol::frame::{encode_tagged_frame, FrameDecoder};
+    use flow_engine::execution_protocol::frame::{encode_frame, FrameDecoder};
     use flow_engine::execution_protocol::message::Message;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     // 测试进程内安装 rustls provider（与 flow-agent/flow-backend 进程一致）。
@@ -524,18 +527,18 @@ async fn coalesced_welcome_and_trailing_frame_not_lost_by_agent() {
         let (socket, _) = listener.accept().await.unwrap();
         let mut tls = acceptor.accept(socket).await.unwrap();
         // 读 AgentHello（首帧，可能分多次到达）。
-        let mut decoder = FrameDecoder::new_tagged();
+        let mut decoder = FrameDecoder::new();
         loop {
             let mut chunk = [0u8; 16 * 1024];
             let n = tls.read(&mut chunk).await.unwrap();
             assert!(n > 0, "closed before agent hello");
             decoder.feed(&chunk[..n]).unwrap();
-            if let Some((_, _)) = decoder.pop_tagged_frame().unwrap() {
+            if let Some((_, _)) = decoder.pop().unwrap() {
                 break;
             }
         }
         // 关键：Welcome + 过时 DataBind（目录外类型）拼接后单次写回。
-        let welcome = encode_tagged_frame(&Message::AgentWelcome {
+        let welcome = encode_frame(&Message::AgentWelcome {
             journal_id: "journal-wc".into(),
             master_epoch: 1,
             link_session_id: "link-wc".into(),

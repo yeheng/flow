@@ -2,7 +2,7 @@
 //!
 //! socketpair + pre_exec FD 传递是 unix 专属（见 [`super::spawn`]）；其余
 //! 平台用「父进程 bind 127.0.0.1:0 → 经 env 告知子进程 → 子进程单连接
-//! 回连」承载 v3 单流通道（帧内通道标签，见 [`super::frame`]）。
+//! 回连」承载 v4 单流通道（帧头 kind 与 raw blob，见 [`super::frame`]）。
 //!
 //! 信任域：临时端口只在本机可见，且单用户本机工具的 RPC 端点、journal
 //! 目录与密钥存储本就同处一个信任域（loopback + token）；unix 的

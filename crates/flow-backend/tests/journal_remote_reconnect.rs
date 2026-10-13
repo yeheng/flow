@@ -91,7 +91,7 @@ async fn start_agent(
     let config = agent_config();
     let shutdown = tokio_util::sync::CancellationToken::new();
     let session = tokio::spawn(async move {
-        // 首连握手（与 R0 相同序列；v3 单流无 DataBind）。
+        // 首连握手（与 R0 相同序列；v4 单流无 DataBind）。
         let mut transport = FrameTransport::spawn(stream, 128);
         use flow_engine::execution_protocol::Message;
         let boot = flow_engine::execution_protocol::transport::fresh_boot_id();

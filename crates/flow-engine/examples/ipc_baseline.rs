@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use sha2::Digest;
 
-use flow_engine::execution_protocol::frame::encode_tagged_frame;
+use flow_engine::execution_protocol::frame::{encode_frame, FrameDecoder};
 use flow_engine::execution_protocol::message::{AuditRecord, Message};
 use flow_engine::execution_protocol::transport::FrameTransport;
 
@@ -111,48 +111,28 @@ fn max_transfer_chunk(dispatch: &str) -> Message {
         dispatch_id: dispatch.into(),
         transfer_id: "in:baseline".into(),
         offset: 0,
-        bytes: b64(&raw),
+        bytes: raw,
         digest,
     }
 }
 
-fn b64(raw: &[u8]) -> String {
-    // dev 依赖里手写最小 base64（标准字母表，含 padding）——避免为示例
-    // 给 flow-engine 增加 base64 运行时依赖。
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(raw.len().div_ceil(3) * 4);
-    for chunk in raw.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        out.push(TABLE[(n >> 18) as usize & 63] as char);
-        out.push(TABLE[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            TABLE[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            TABLE[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
+
 
 fn codec_scenario(name: &str, ops: u64, message: &Message, wire_bytes: u64) {
     // 语义等价断言先于计时（基线必须先证明 roundtrip 正确）。
-    let frame = encode_tagged_frame(message).expect("encode");
-    let json = &frame[flow_engine::execution_protocol::FRAME_HEADER_BYTES + 1..];
-    let decoded = Message::decode_envelope(json).expect("decode");
+    let frame = encode_frame(message).expect("encode");
+    let mut decoder = FrameDecoder::new();
+    decoder.feed(&frame).unwrap();
+    let (_, decoded) = decoder.pop().unwrap().expect("frame");
     assert_eq!(decoded, *message, "roundtrip must be semantically equal");
 
     let before = snapshot();
     let start = Instant::now();
     for _ in 0..ops {
-        let frame = encode_tagged_frame(message).expect("encode");
-        let json = &frame[flow_engine::execution_protocol::FRAME_HEADER_BYTES + 1..];
-        let decoded = Message::decode_envelope(json).expect("decode");
+        let frame = encode_frame(message).expect("encode");
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&frame).unwrap();
+        let (_, decoded) = decoder.pop().unwrap().expect("frame");
         std::hint::black_box(decoded);
     }
     let elapsed = start.elapsed();
@@ -168,11 +148,11 @@ fn main() {
     let batch = audit_batch("dispatch-baseline", 64, 1024);
     let max_chunk = max_transfer_chunk("dispatch-baseline");
 
-    let wire_small = encode_tagged_frame(&small).unwrap().len() as u64;
-    let wire_batch = encode_tagged_frame(&batch).unwrap().len() as u64;
-    let wire_max = encode_tagged_frame(&max_chunk).unwrap().len() as u64;
+    let wire_small = encode_frame(&small).unwrap().len() as u64;
+    let wire_batch = encode_frame(&batch).unwrap().len() as u64;
+    let wire_max = encode_frame(&max_chunk).unwrap().len() as u64;
 
-    println!("flow-engine v3 协议基线（release，单线程编解码）");
+    println!("flow-engine v4 协议基线（release，单线程编解码）");
     println!("wire bytes: control={} audit_batch(64×1KiB)={} max_chunk={}\n", wire_small, wire_batch, wire_max);
 
     codec_scenario("control_small (Heartbeat)", ops_small, &small, wire_small);
@@ -182,185 +162,9 @@ fn main() {
     // ---- 端到端 transport（duplex 承载）：吞吐 + 取消排队延迟 ----
     transport_throughput(500);
     cancel_latency_under_flood();
-    t12_breakdown();
-    t12_v4_prototype();
 }
 
-/// T12 实测：同一逻辑内容（256 KiB 传输块）在 v3（base64 + JSON 信封）与
-/// v4 原型（`u32 body_len + u8 kind + u32 meta_len + JSON meta + raw`）下的
-/// 完整往返成本与线字节。v3 计入发送端 base64 编码（真实生产路径在构造
-/// TransferChunk 时做）。
-fn t12_v4_prototype() {
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
-    let ops = 2_000u64;
-    let raw = vec![0xa5u8; flow_engine::execution_protocol::TRANSFER_CHUNK_BYTES];
-    let digest = hex::encode(sha2::Sha256::digest(&raw));
-    let dispatch = "dispatch-t12";
-    let transfer_id = "in:baseline";
 
-    // ---------- v3：base64 编码 + JSON 信封往返 ----------
-    let mut v3_wire = 0u64;
-    let start = Instant::now();
-    for _ in 0..ops {
-        let encoded = STANDARD.encode(&raw);
-        let message = Message::TransferChunk {
-            dispatch_id: dispatch.into(),
-            transfer_id: transfer_id.into(),
-            offset: 0,
-            bytes: encoded,
-            digest: digest.clone(),
-        };
-        let frame = encode_tagged_frame(&message).expect("encode");
-        v3_wire = frame.len() as u64;
-        let json = &frame[flow_engine::execution_protocol::FRAME_HEADER_BYTES + 1..];
-        let decoded = Message::decode_envelope(json).expect("decode");
-        let Message::TransferChunk { bytes, .. } = &decoded else {
-            unreachable!()
-        };
-        let roundtrip = STANDARD.decode(bytes).expect("b64 decode");
-        std::hint::black_box(roundtrip);
-    }
-    let v3 = start.elapsed();
-
-    // ---------- v4 原型：小 JSON meta + raw 字节 ----------
-    let meta = serde_json::json!({
-        "type": "TransferChunk",
-        "dispatch_id": dispatch,
-        "transfer_id": transfer_id,
-        "offset": "0",
-        "digest": digest,
-    });
-    let meta_bytes = serde_json::to_vec(&meta).unwrap();
-    let mut v4_wire = 0u64;
-    let start = Instant::now();
-    for _ in 0..ops {
-        // encode：预留头 + meta + raw
-        let mut frame = Vec::with_capacity(12 + meta_bytes.len() + raw.len());
-        frame.extend_from_slice(&0u32.to_be_bytes());
-        frame.push(1u8); // kind: TransferChunk
-        frame.extend_from_slice(&(meta_bytes.len() as u32).to_be_bytes());
-        frame.extend_from_slice(&meta_bytes);
-        frame.extend_from_slice(&raw);
-        let body_len = frame.len() - 4;
-        frame[..4].copy_from_slice(&(body_len as u32).to_be_bytes());
-        v4_wire = frame.len() as u64;
-        // decode：解析长度、借用 raw、解析 meta
-        // 布局：0..4 body_len | 4 kind | 5..9 meta_len | 9.. meta | raw
-        let meta_len = u32::from_be_bytes([frame[5], frame[6], frame[7], frame[8]]) as usize;
-        let meta_slice = &frame[9..9 + meta_len];
-        let payload = &frame[9 + meta_len..];
-        let parsed: serde_json::Value = serde_json::from_slice(meta_slice).expect("meta");
-        std::hint::black_box((parsed, payload));
-    }
-    let v4 = start.elapsed();
-
-    let us = |d: std::time::Duration| d.as_micros() as f64 / ops as f64;
-    let (v3_us, v4_us) = (us(v3), us(v4));
-    println!(
-        "\nT12 v3 vs v4 原型 (256KiB transfer, full roundtrip):\n  \
-         v3(base64+json): {v3_us:>8.2} µs/op  wire={v3_wire:>7} B\n  \
-         v4(meta+raw):    {v4_us:>8.2} µs/op  wire={v4_wire:>7} B\n  \
-         speedup={:.2}x  wire_reduction={:.1}%",
-        v3_us / v4_us,
-        (v3_wire - v4_wire) as f64 / v3_wire as f64 * 100.0
-    );
-
-    // ---------- 现实口径：Journal 仍存 base64（Master 边界转回）----------
-    // v3（审计方向）：executor: b64_encode + JSON ser（350KB 字符串）；
-    //               master: JSON parse。
-    // v4（审计方向）：executor: raw 拷贝入帧 + 小 meta；
-    //               master: b64_encode（写 Journal）。
-    // 两端 base64 工作量相抵，实际差异 = 大字符串的 JSON ser+parse。
-    let start = Instant::now();
-    for _ in 0..ops {
-        let encoded = STANDARD.encode(&raw);
-        let message = Message::AuditBatch {
-            dispatch_id: dispatch.into(),
-            first_seq: 1,
-            records: vec![AuditRecord {
-                audit_seq: 1,
-                kind: "value_chunk".into(),
-                payload: serde_json::json!({"data": encoded}),
-            }],
-        };
-        let frame = encode_tagged_frame(&message).expect("encode");
-        let json = &frame[flow_engine::execution_protocol::FRAME_HEADER_BYTES + 1..];
-        let decoded = Message::decode_envelope(json).expect("decode");
-        std::hint::black_box(decoded);
-    }
-    let v3_audit = start.elapsed();
-
-    let start = Instant::now();
-    for _ in 0..ops {
-        let mut frame = Vec::with_capacity(12 + meta_bytes.len() + raw.len());
-        frame.extend_from_slice(&0u32.to_be_bytes());
-        frame.push(1u8);
-        frame.extend_from_slice(&(meta_bytes.len() as u32).to_be_bytes());
-        frame.extend_from_slice(&meta_bytes);
-        frame.extend_from_slice(&raw);
-        let meta_len = u32::from_be_bytes([frame[5], frame[6], frame[7], frame[8]]) as usize;
-        let payload = &frame[9 + meta_len..];
-        let _ = serde_json::from_slice::<serde_json::Value>(&frame[9..9 + meta_len]).expect("meta");
-        // master 边界：raw → base64（写 Journal，schema 不变）。
-        let journal_chunk = STANDARD.encode(payload);
-        std::hint::black_box(journal_chunk);
-    }
-    let v4_audit = start.elapsed();
-    println!(
-        "T12 现实口径 (audit, Journal 仍存 base64):\n  \
-         v3: {:.2} µs/op\n  \
-         v4: {:.2} µs/op\n  \
-         speedup={:.2}x",
-        us(v3_audit),
-        us(v4_audit),
-        us(v3_audit) / us(v4_audit),
-    );
-}
-
-/// T12 进入条件测量：把最大传输块的处理成本拆成「信封 JSON」「base64
-/// 编解码」「整值 sha256」三块，判断二进制 wire 是否值得一次 v4 升级。
-/// 输出各分量 µs/op 与 base64 占比（量化收益上界）。
-fn t12_breakdown() {
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
-    let ops = 2_000u64;
-    let raw = vec![0xa5u8; flow_engine::execution_protocol::TRANSFER_CHUNK_BYTES];
-    let encoded = b64(&raw);
-
-    // 分量 1：base64 解码（执行器 transfer.feed 的主要开销）。
-    let start = Instant::now();
-    for _ in 0..ops {
-        let decoded = STANDARD.decode(&encoded).expect("b64 decode");
-        std::hint::black_box(decoded);
-    }
-    let b64_decode = start.elapsed();
-
-    // 分量 2：整值 sha256（每块校验）。
-    let start = Instant::now();
-    for _ in 0..ops {
-        std::hint::black_box(sha2::Sha256::digest(&raw));
-    }
-    let sha = start.elapsed();
-
-    // 分量 3：信封 JSON 往返（生产编解码已去掉 body 深拷贝，见 T05）。
-    let message = max_transfer_chunk("dispatch-t12");
-    let start = Instant::now();
-    for _ in 0..ops {
-        let frame = encode_tagged_frame(&message).expect("encode");
-        let json = &frame[flow_engine::execution_protocol::FRAME_HEADER_BYTES + 1..];
-        let decoded = Message::decode_envelope(json).expect("decode");
-        std::hint::black_box(decoded);
-    }
-    let envelope = start.elapsed();
-
-    let us = |d: std::time::Duration| d.as_micros() as f64 / ops as f64;
-    let (b, h, e) = (us(b64_decode), us(sha), us(envelope));
-    let base64_share = b / (b + h + e) * 100.0;
-    println!(
-        "\nT12 breakdown (256KiB chunk): b64_decode={b:.2} µs  sha256={h:.2} µs  envelope_json={e:.2} µs  \
-         base64_share={base64_share:.0}%  wire_inflation={:.0}%",
-        (encoded.len() as f64 / raw.len() as f64 - 1.0) * 100.0
-    );
-}
 
 fn transport_throughput(batches: u64) {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -372,7 +176,7 @@ fn transport_throughput(batches: u64) {
         let sender = FrameTransport::spawn(a, 128);
         let mut receiver = FrameTransport::spawn(b, 128);
         let batch = audit_batch("dispatch-baseline", 64, 1024);
-        let wire = encode_tagged_frame(&batch).unwrap().len() as u64;
+        let wire = encode_frame(&batch).unwrap().len() as u64;
 
         let producer = tokio::spawn(async move {
             for _ in 0..batches {

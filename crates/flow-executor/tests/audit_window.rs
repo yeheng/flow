@@ -150,7 +150,7 @@ async fn only_remote_uplink_replays_unacknowledged_batches() {
 async fn large_output_production_stays_inside_window_and_frame_limit() {
     use flow_engine::execution_protocol::{
         contract::{DATA_MAX_FRAME, W_BYTES},
-        frame::encode_tagged_frame,
+        frame::encode_frame,
     };
     let (mut audit, mut rx, acks) = stream(W_BYTES);
     let producer = tokio::spawn(async move {
@@ -168,7 +168,7 @@ async fn large_output_production_stays_inside_window_and_frame_limit() {
         let mut bytes = 0;
         let mut records_seen = 0;
         while let Some(message) = rx.recv().await {
-            assert!(encode_tagged_frame(&message).unwrap().len() <= DATA_MAX_FRAME + 4);
+            assert!(encode_frame(&message).unwrap().len() <= DATA_MAX_FRAME + 4);
             if let Message::AuditBatch { records, .. } = message {
                 let last = records.last().unwrap().audit_seq;
                 records_seen += records.len();

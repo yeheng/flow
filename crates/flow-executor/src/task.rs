@@ -8,7 +8,6 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use base64::Engine as _;
 use serde::Deserialize as _;
 use serde_json::{json, Value};
 use sha2::Digest as _;
@@ -1039,7 +1038,7 @@ impl TaskRunner {
                         dispatch_id: self.dispatch_id.clone(),
                         transfer_id: transfer_id.clone(),
                         offset,
-                        bytes: base64::engine::general_purpose::STANDARD.encode(chunk),
+                        bytes: chunk.to_vec(),
                         digest: hex::encode(sha2::Sha256::digest(chunk)),
                     })
                     .await

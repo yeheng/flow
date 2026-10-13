@@ -234,6 +234,7 @@ impl AgentManager {
         })
     }
 
+
     // 全局活跃派发准入（A_max）。
     pub(crate) fn global_slots(&self) -> &Arc<Semaphore> {
         &self.global

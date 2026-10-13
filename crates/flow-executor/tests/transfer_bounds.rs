@@ -1,4 +1,3 @@
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use flow_engine::execution_protocol::message::Message;
 use flow_executor::transfer::IncomingTransfers;
 use sha2::{Digest, Sha256};
@@ -8,7 +7,7 @@ fn chunk(id: &str, offset: u64, bytes: &[u8]) -> Message {
         dispatch_id: "d".into(),
         transfer_id: id.into(),
         offset,
-        bytes: STANDARD.encode(bytes),
+        bytes: bytes.to_vec(),
         digest: hex::encode(Sha256::digest(bytes)),
     }
 }

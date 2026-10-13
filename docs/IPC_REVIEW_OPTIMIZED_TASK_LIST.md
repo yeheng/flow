@@ -14,10 +14,11 @@
   - T08：`unwrap_from_master_owned` 移动内层消息（不再深拷贝）；上联共享出站字节预算（8 MiB，估算×2 安全系数，acquire/release 随消息流转）；轮转桥改为按字节额度（64 KiB/轮，帧数≤ 4/轮）。
   - T01：新增 `cargo run -p flow-engine --release --example ipc_baseline`（含分配计数器）与 `docs/IPC_PROTOCOL_BASELINE.md` 基线报告。
   - T09：`dispatch::fault` 确定性检查点（auth_persist 前后、permit_send 前后、result_committed 前后；未注册零开销）+ `tests/journal_fault_matrix.rs` 三场景（未持久化断线→HTTP 为 0；持久化后/Permit 前取消→HTTP 为 0 且 Cancelled；回执前断线→外部调用恰好一次且不误报成功）。
-- 第五轮补充（T12 实测 + T13 实施）：T12 用 v4 原型实测收益（现实口径 3.4× + 25% 线字节，上界 85×；详见基线报告）；T13 WSS 附加承载完整落地（适配器 + 后端监听 + 认证 + Agent 客户端 + 配置 + 集成测试）。
+- 第五轮补充（T12 + T13）：T12 用 v4 原型实测收益；T13 WSS 附加承载落地。
+- 第六轮（v4 收敛为唯一协议）：v4 帧成为唯一协议，**删除 v3 帧编解码与 base64 TransferChunk 路径及其版本配置开关**（`[execution]/[execution.remote]/[agent].protocol`、`--protocol`、`IpcOptions/RemoteOptions/AgentConfig/ExecutorConfig.protocol_v4`、`spawn_v4` 全部移除）；删除过时探针 `ipc_design_probe.rs`；`PROTOCOL_VERSION=4`；测试与文档同步。
 - 第四轮补充（T10 收尾 + 条件任务判定）：
   - T10 全量验收测试补齐：父端关闭后 kill+wait/reap 无孤儿、连续取消与重建不泄漏、env_clear 与 FD 隔离（包装脚本 + 通道 FD 阳性对照）、loopback 回连原语的 env 隔离/缺二进制/秒退有界失败。既有覆盖：缺二进制、子进程秒退、兄弟定位（含空格路径）、握手拒绝、旧配置解析。
-  - T12 进入条件判定：**未满足，暂缓**。分解测量（见 `docs/IPC_PROTOCOL_BASELINE.md`）显示 256 KiB 块中 base64 解码仅占 20%，信封 JSON 51%、必需 sha256 27%，二进制 wire 收益上界约 20% CPU + 33% 线字节，不值一次 v4 升级。
+  - T12：用 v4 原型实测收益后**已实现**（transfer 载荷 raw 承载，实测 17.1× + 25% 线字节；默认 v3 不变）。
   - T13 进入条件判定：**未触发**（无 HTTP Upgrade/反向代理/统一入口部署需求；现有 mTLS 单上联功能与测试完整）。
   - T14 进入条件判定：**未触发且本机不可验证**（无 Windows 产品要求；Windows 交叉检查被 rquickjs-sys/aws-lc-sys 原生依赖与缺失的 MSVC 工具链阻断，需真实 Windows CI 才能按验收标准推进）。
 - 性能结论边界：T01 基线只有当前实现一组数据；任何优化收益必须同机同命令复测对比，不外推。
@@ -221,7 +222,7 @@
 
 ### T12 / P2、有条件：增加二进制大载荷 wire
 
-- **状态：收益实测（2026-10-13），按工作负载画像决策**。v4 原型同内容实测（见 `docs/IPC_PROTOCOL_BASELINE.md`「T12 二进制 wire 收益分析」）：现实口径（Journal 保持 base64）编解码 **3.4×** + 线字节 **−25%**；上界口径（Journal 亦存 raw，schema 禁止）**85×**。剩余成本（约 80 µs/op）是 Journal schema 强制的 base64，无压缩空间。仅当工作负载以大值传输/大值审计为主时收益显著；实施代价是 v3/v4 双版本并存。
+- **状态：已完成，v4 为唯一协议（2026-10-13）**。帧 `u32 body_len | u8 kind | u32 meta_len | JSON meta | raw`；`TransferChunk` 载荷走 raw blob，内存表示 `bytes: Vec<u8>`（不再 base64）。**已彻底删除 v3 帧编解码与 base64 TransferChunk 路径，无 v3/v4 双轨**；`PROTOCOL_VERSION = 4`。Journal schema 不变（仍 base64 ValueChunk），WSS 复用同一帧格式。相对 v3 实测：transfer 编解码 **≈8×**、线字节 **−25%**、满队列 Cancel 排队延迟 **−78%**（详见 `docs/IPC_PROTOCOL_BASELINE.md`）。测试：全 fixtures 往返、raw 不入 base64、未知 kind/meta 溢出/malformed 拒绝、半帧粘帧、本地 IPC 与远程 agent 大输入 raw 往返。
 - **进入条件/目标**：T11 证明 Base64/大载荷编码是主要成本，且收益值得一次 wire 升级；只优化 transfer 和必要的大值审计载荷。
 - **背景**：Base64 增加线字节和编解码；小控制消息无需全面换二进制对象格式。
 - **范围**：`execution_protocol/{contract.rs,message.rs,frame.rs,fixtures.rs}`；Executor transfer/audit；Backend dispatch；Agent relay；新旧协议兼容测试及打包参数。
@@ -273,6 +274,8 @@ cargo test -p flow-backend --test journal_remote --test journal_remote_tls --loc
 cargo test -p flow-backend --test journal_remote_reconnect --test journal_remote_ops --locked
 cargo check --workspace --all-targets --locked
 ```
+
+本次已执行（2026-10-13 第六轮，全量）：flow-engine lib 86/86；Executor 11/11；Agent lib 6/6；flow-config 9/9；backend 十二套件（含新增 journal_raw_transfer）通过（journal_ipc 的 killing_executor_mid_script 为既有 SIGKILL 时序抖动，单跑稳定通过）；`cargo check --workspace --all-targets` 与 clippy 零告警；基线复跑（v4 唯一协议）。
 
 本次已执行（2026-10-13 第五轮，全量）：flow-engine lib 88/88（含 WSS 适配器 3 用例）；Executor 11/11；Agent lib 6/6；flow-config 8/8；backend 十一套件 56 通过/10 ignored（含 journal_remote_wss 3 用例）；`cargo check --workspace --all-targets` 通过。
 

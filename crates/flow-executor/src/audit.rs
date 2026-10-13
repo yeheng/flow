@@ -270,7 +270,7 @@ impl AuditStream {
                             break;
                         }
                         bytes += entry.bytes;
-                        batch.push((*records.next().unwrap()).record.clone());
+                        batch.push(records.next().unwrap().record.clone());
                     }
                     let first_seq = batch[0].audit_seq;
                     tokio::select! {

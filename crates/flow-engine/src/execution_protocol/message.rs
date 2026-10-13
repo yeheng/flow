@@ -285,7 +285,7 @@ pub enum Message {
         /// 主进程解析的凭证值（仅本次调用使用，不进入授权事实）。
         credential: Option<String>,
     },
-    /// data，双向。输入分块传输：offset + bytes(base64) + digest。
+    /// data，双向。输入分块传输：offset + raw bytes（帧内 blob）+ digest。
     /// `dispatch_id` 是路由键：三期中继按它把帧包进 Routed 信封发往归属
     /// 执行器（没有它，run_session 查不到路由会静默丢帧——Ref 输入在
     /// remote 模式下全部黑洞）。
@@ -293,8 +293,8 @@ pub enum Message {
         dispatch_id: String,
         transfer_id: String,
         offset: u64,
-        /// base64 编码后的原始字节；计费包含编码后的体积。
-        bytes: String,
+        /// 原始字节（内存中不 base64）；帧内作为 raw blob 承载。
+        bytes: Vec<u8>,
         digest: String,
     },
     /// control，发送方。输入接收器校验并准备完成；不表示新的权威提交，
@@ -356,7 +356,7 @@ pub enum Message {
         capabilities: Vec<String>,
         slots: u32,
     },
-    /// control，主→agent。选定 link_session、限额与心跳周期（v3 单流上联，
+    /// control，主→agent。选定 link_session、限额与心跳周期（v4 单流上联，
     /// 无第二条 data 连接，也就没有 v2 的 data 绑定凭据）。
     AgentWelcome {
         journal_id: String,
@@ -560,14 +560,6 @@ impl Message {
             commit_lsn: u64,
         }
         #[derive(Serialize)]
-        struct ChunkW {
-            transfer_id: String,
-            #[serde(with = "flow_journal::decimal")]
-            offset: u64,
-            bytes: String,
-            digest: String,
-        }
-        #[derive(Serialize)]
         struct ReadyW {
             transfer_id: String,
             #[serde(with = "flow_journal::decimal")]
@@ -672,18 +664,19 @@ impl Message {
                 "request_fingerprint": request_fingerprint,
                 "credential": credential,
             })),
+            // TransferChunk 生产路径恒走 raw kind（见 to_frame_parts）；此处
+            // 仅提供不含 bytes 的元数据信封（JSON 携带 TransferChunk 会被
+            // 解码端明确拒绝，不做 base64 兼容）。
             Message::TransferChunk {
-                dispatch_id: _,
                 transfer_id,
                 offset,
-                bytes,
                 digest,
-            } => body_value(&ChunkW {
-                transfer_id: transfer_id.clone(),
-                offset: *offset,
-                bytes: bytes.clone(),
-                digest: digest.clone(),
-            }),
+                ..
+            } => Some(json!({
+                "transfer_id": transfer_id,
+                "offset": offset.to_string(),
+                "digest": digest,
+            })),
             Message::InputReady {
                 dispatch_id: _,
                 transfer_id,
@@ -1030,22 +1023,10 @@ impl Message {
                 }
             }
             kind::TRANSFER_CHUNK => {
-                #[derive(Deserialize)]
-                struct Wire {
-                    transfer_id: String,
-                    #[serde(with = "flow_journal::decimal")]
-                    offset: u64,
-                    bytes: String,
-                    digest: String,
-                }
-                let wire: Wire = body.parse(type_name)?;
-                Message::TransferChunk {
-                    dispatch_id: dispatch_id(envelope_dispatch)?,
-                    transfer_id: wire.transfer_id,
-                    offset: wire.offset,
-                    bytes: wire.bytes,
-                    digest: wire.digest,
-                }
+                // v4 恒用 raw kind 承载 TransferChunk；JSON 信封携带即协议错误。
+                return Err(ProtocolError::Malformed(
+                    "TransferChunk must use the raw frame kind".into(),
+                ));
             }
             kind::INPUT_READY => {
                 #[derive(Deserialize)]
@@ -1327,6 +1308,219 @@ impl BodySource for serde_json::value::RawValue {
     }
 }
 
+/// 帧 kind 字节：0 = meta 即完整 JSON 信封（无 raw）；1 = TransferChunk
+/// （meta 为不含 bytes 的元数据，raw 承载原始字节）；2 = Routed 信封内层为
+/// TransferChunk（远程中继：meta 为不含 bytes 的 Routed 信封，raw 承载内层
+/// 原始字节）。
+pub const KIND_JSON: u8 = 0;
+pub const KIND_TRANSFER_CHUNK: u8 = 1;
+pub const KIND_ROUTED_TRANSFER_CHUNK: u8 = 2;
+
+/// TransferChunk 的元数据信封（不含 bytes）：`{"v","type","dispatch_id","body"}`。
+fn transfer_chunk_meta(
+    dispatch_id: &str,
+    transfer_id: &str,
+    offset: u64,
+    digest: &str,
+) -> Value {
+    let mut envelope = serde_json::Map::new();
+    envelope.insert("v".into(), json!(PROTOCOL_VERSION));
+    envelope.insert("type".into(), json!(kind::TRANSFER_CHUNK));
+    envelope.insert("dispatch_id".into(), json!(dispatch_id));
+    envelope.insert(
+        "body".into(),
+        json!({
+            "transfer_id": transfer_id,
+            "offset": offset.to_string(),
+            "digest": digest,
+        }),
+    );
+    Value::Object(envelope)
+}
+
+/// Routed 信封 + 内层 TransferChunk 元数据（远程 raw 承载的中继形态）。
+fn routed_transfer_meta(envelope: &super::remote::RouteEnvelope, inner_meta: Value) -> Value {
+    let mut outer = serde_json::Map::new();
+    outer.insert("v".into(), json!(PROTOCOL_VERSION));
+    outer.insert("type".into(), json!(kind::ROUTED));
+    if let Some(dispatch_id) = envelope.dispatch_id.as_deref() {
+        outer.insert("dispatch_id".into(), json!(dispatch_id));
+    }
+    outer.insert(
+        "body".into(),
+        json!({
+            "envelope": envelope,
+            "inner": inner_meta,
+        }),
+    );
+    Value::Object(outer)
+}
+
+/// 从 TransferChunk 元数据信封 + blob 还原消息。
+fn transfer_chunk_from_meta(envelope: &Value, blob: &[u8]) -> Result<Message> {
+    if blob.len() > super::contract::TRANSFER_CHUNK_BYTES {
+        return Err(ProtocolError::FrameTooLarge(
+            blob.len(),
+            super::contract::TRANSFER_CHUNK_BYTES,
+        ));
+    }
+    let dispatch_id = envelope
+        .get("dispatch_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    #[derive(Deserialize)]
+    struct BodyW {
+        transfer_id: String,
+        #[serde(with = "flow_journal::decimal")]
+        offset: u64,
+        digest: String,
+    }
+    let body: BodyW = serde_json::from_value(envelope.get("body").cloned().unwrap_or(Value::Null))
+        .map_err(|e| ProtocolError::Malformed(format!("transfer meta: {e}")))?;
+    Ok(Message::TransferChunk {
+        dispatch_id,
+        transfer_id: body.transfer_id,
+        offset: body.offset,
+        bytes: blob.to_vec(),
+        digest: body.digest,
+    })
+}
+
+impl Message {
+    /// 帧载荷拆分（T12）：返回 `(kind, JSON meta, raw blob)`。只有带
+    /// 二进制体的类型（TransferChunk）走 raw；其余类型 kind=0、meta 即
+    /// 完整 v3 信封、blob 为空。内存表示与 v3 完全一致（单一业务路径）。
+    pub fn to_frame_parts(&self) -> Result<(u8, Vec<u8>, Vec<u8>)> {
+        match self {
+            Message::TransferChunk {
+                dispatch_id,
+                transfer_id,
+                offset,
+                bytes,
+                digest,
+            } => {
+                let meta = serde_json::to_vec(&transfer_chunk_meta(
+                    dispatch_id,
+                    transfer_id,
+                    *offset,
+                    digest,
+                ))
+                .map_err(|e| ProtocolError::Malformed(format!("meta: {e}")))?;
+                Ok((KIND_TRANSFER_CHUNK, meta, bytes.clone()))
+            }
+            // 远程中继：Routed 内层是 TransferChunk 时同样走 raw（meta 的
+            // inner 为不含 bytes 的 TransferChunk 元数据，blob 承载内层字节）。
+            Message::Routed { envelope, inner }
+                if matches!(**inner, Message::TransferChunk { .. }) =>
+            {
+                let Message::TransferChunk {
+                    dispatch_id,
+                    transfer_id,
+                    offset,
+                    bytes,
+                    digest,
+                } = &**inner
+                else {
+                    unreachable!()
+                };
+                let meta = routed_transfer_meta(
+                    envelope,
+                    transfer_chunk_meta(dispatch_id, transfer_id, *offset, digest),
+                );
+                let meta = serde_json::to_vec(&meta)
+                    .map_err(|e| ProtocolError::Malformed(format!("meta: {e}")))?;
+                Ok((KIND_ROUTED_TRANSFER_CHUNK, meta, bytes.clone()))
+            }
+            other => {
+                let meta = serde_json::to_vec(&other.to_envelope())
+                    .map_err(|e| ProtocolError::Malformed(format!("envelope: {e}")))?;
+                Ok((KIND_JSON, meta, Vec::new()))
+            }
+        }
+    }
+
+    /// 帧载荷重组：kind/meta/blob → 消息。
+    pub fn from_frame_parts(kind_byte: u8, meta: &[u8], blob: &[u8]) -> Result<Self> {
+        match kind_byte {
+            KIND_JSON => Self::decode_envelope(meta),
+            KIND_TRANSFER_CHUNK => {
+                #[derive(Deserialize)]
+                struct MetaW {
+                    v: u64,
+                    #[serde(rename = "type")]
+                    kind: String,
+                    dispatch_id: String,
+                    body: BodyW,
+                }
+                #[derive(Deserialize)]
+                struct BodyW {
+                    transfer_id: String,
+                    #[serde(with = "flow_journal::decimal")]
+                    offset: u64,
+                    digest: String,
+                }
+                let wire: MetaW = serde_json::from_slice(meta)
+                    .map_err(|e| ProtocolError::Malformed(format!("v4 meta: {e}")))?;
+                if wire.v != PROTOCOL_VERSION as u64 {
+                    return Err(ProtocolError::Malformed(format!(
+                        "protocol version {} not supported",
+                        wire.v
+                    )));
+                }
+                if wire.kind != kind::TRANSFER_CHUNK {
+                    return Err(ProtocolError::Malformed(format!(
+                        "v4 kind {} mismatches meta type {}",
+                        kind_byte, wire.kind
+                    )));
+                }
+                if blob.len() > super::contract::TRANSFER_CHUNK_BYTES {
+                    return Err(ProtocolError::FrameTooLarge(
+                        blob.len(),
+                        super::contract::TRANSFER_CHUNK_BYTES,
+                    ));
+                }
+                Ok(Message::TransferChunk {
+                    dispatch_id: wire.dispatch_id,
+                    transfer_id: wire.body.transfer_id,
+                    offset: wire.body.offset,
+                    bytes: blob.to_vec(),
+                    digest: wire.body.digest,
+                })
+            }
+            KIND_ROUTED_TRANSFER_CHUNK => {
+                #[derive(Deserialize)]
+                struct MetaW {
+                    #[serde(default)]
+                    dispatch_id: Option<String>,
+                    body: BodyW,
+                }
+                #[derive(Deserialize)]
+                struct BodyW {
+                    envelope: super::remote::RouteEnvelope,
+                    inner: serde_json::Value,
+                }
+                let wire: MetaW = serde_json::from_slice(meta)
+                    .map_err(|e| ProtocolError::Malformed(format!("routed meta: {e}")))?;
+                let _ = wire.dispatch_id;
+                let inner = transfer_chunk_from_meta(&wire.body.inner, blob)?;
+                if !super::remote::routable(&inner) {
+                    return Err(ProtocolError::InvalidPayload(
+                        "Routed inner must be a business message".into(),
+                    ));
+                }
+                Ok(Message::Routed {
+                    envelope: wire.body.envelope,
+                    inner: Box::new(inner),
+                })
+            }
+            other => Err(ProtocolError::Malformed(format!(
+                "unknown frame kind {other}"
+            ))),
+        }
+    }
+}
+
 fn body_value(value: impl Serialize) -> Option<Value> {
     serde_json::to_value(value).ok()
 }
@@ -1337,23 +1531,6 @@ fn body_value(value: impl Serialize) -> Option<Value> {
 pub enum Channel {
     Control,
     Data,
-}
-
-impl Channel {
-    pub fn tag(self) -> u8 {
-        match self {
-            Channel::Control => 0,
-            Channel::Data => 1,
-        }
-    }
-
-    pub fn from_tag(tag: u8) -> Option<Self> {
-        match tag {
-            0 => Some(Channel::Control),
-            1 => Some(Channel::Data),
-            _ => None,
-        }
-    }
 }
 
 #[cfg(test)]

@@ -101,7 +101,7 @@ crates/
    │  JSON-RPC over WebSocket（产品面，flow-rpc）
    ▼
 journal 服务端（flow-backend，唯一权威）
-   │  远程链路：Routed 信封 over 单条 mTLS（execution/remote.rs，v3 单流）
+   │  远程链路：Routed 信封 over 单条 mTLS（execution/remote.rs，v4 单流）
    ▼
 flow-agent（中继，自己不碰 journal）
    │  执行 IPC：单流标签帧（unix socketpair / 其余平台 loopback 回连）
@@ -116,7 +116,7 @@ flow-executor（子进程，节点语义的唯一居所）
 2. 节点执行语义只许存在于 `flow-executor`；master 只做裁决和调度。进程内
    实现已**全平台删除**（`execute()` / `journal_execution` 的计算类函数），
    `journal_execution` 只剩 Attempt 簿记（begin/snapshot/finish）。
-3. 协议 v3 单流：控制与数据复用同一条双向流，帧内 1 字节通道标签区分；
+3. 协议 v4 单流：控制与数据复用同一条双向流，帧内 1 字节通道标签区分；
    控制帧只走定长身份与元数据，变长业务值走 data 标签（再小也走 data）。
 4. 服务端在写 RPC 响应前等到 `applied_lsn >= commit_lsn`；-32020 只作投影
    病理阀，健康路径永不触发，客户端零恢复逻辑。
@@ -132,7 +132,7 @@ flow-executor（子进程，节点语义的唯一居所）
 | 模式 | 平台 | 节点执行位置 | 备注 |
 | --- | --- | --- | --- |
 | `ipc` | 全平台（缺省） | `flow-executor` 子进程（unix socketpair + argv 传通道 FD；其余 TCP loopback 回连） | 执行器缺失/协议版本不符直接失败，不静默回退 |
-| `remote` | 全平台 | 经 `flow-agent` 中继的远端执行器 | 单条 mTLS（v3 单流）；`mode=remote` 时 `[execution.remote]` 必填 |
+| `remote` | 全平台 | 经 `flow-agent` 中继的远端执行器 | 单条 mTLS（v4 单流）；`mode=remote` 时 `[execution.remote]` 必填 |
 | `in_process` | 已删除 | — | 全平台配置即报错；历史模式（T7 删 unix 路径，loopback 传输落地后删 Windows 过渡态） |
 
 执行模式在**配置期与装配期双重把关**：`flow-config` 的 validate 在任何

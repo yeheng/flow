@@ -13,11 +13,11 @@
 //! 在飞 run 状态数上限（`R_MAX`）是主进程状态内存约束、不是协议量，其
 //! 唯一定义与执行点在 `flow-backend`（`journal.rs::R_MAX`）。
 
-/// IPC 协议版本。v3 = 执行器本地通道收敛为单流（帧内 1 字节通道标签）；
-/// v2 = 本地 socketpair 双流版本（已删除）。
-pub const PROTOCOL_VERSION: u32 = 3;
+/// IPC 协议版本。v4 = 单流帧 `u32 body_len | u8 kind | u32 meta_len | JSON
+/// meta | raw blob`（v3 标签帧与 v2 双流均已删除）。
+pub const PROTOCOL_VERSION: u32 = 4;
 
-/// control 通道单帧 JSON 上限（不含 4 字节长度头与 1 字节通道标签）。握手
+/// control 通道单帧上限（不含 4 字节长度头）。握手
 /// 只可协商到本上限以内。
 ///
 /// 取 128 KiB 的约束：内联业务值上限 `flow_journal::INLINE_BYTES` 是 64 KiB
@@ -46,8 +46,6 @@ pub fn bounded_control_text(mut text: String) -> String {
 
 /// data 通道单帧 JSON 上限（不含 4 字节长度头）。
 pub const DATA_MAX_FRAME: usize = 1024 * 1024;
-/// 帧头长度：u32 大端长度，只计算 JSON 部分。
-pub const FRAME_HEADER_BYTES: usize = 4;
 
 /// 执行槽位数 X_max 默认值（可配置 1..=16）。每进程一个任务；常驻内存
 /// ≈ X_max × 单进程 RSS（JS heap 32 MiB 上限 + 输入面预算 8 MiB）。
@@ -59,7 +57,7 @@ pub const A_MAX: usize = 16;
 
 /// 单派发持久确认窗口 W（审计在途字节，按编码后字节数计费）。
 /// 依据：单条编码记录 ≤ [`MAX_AUDIT_RECORD_BYTES`]（512 KiB），W 取 4 条
-/// 记录的余量，允许一个 256 KiB 原始 chunk 的 base64 编码记录在飞的
+/// 记录的余量，允许一个 256 KiB 原始 chunk 记录在飞的
 /// 同时仍有空间继续推进；由允许常驻内存上界（128 MiB）反推。
 pub const W_BYTES: u64 = 2 * 1024 * 1024;
 
@@ -72,10 +70,10 @@ pub const K_FACTOR: u64 = 4;
 pub const GLOBAL_DISPATCH_BUDGET_BYTES: u64 = A_MAX as u64 * W_BYTES * K_FACTOR;
 
 /// 单条审计记录的最大协议编码字节数。必须 ≤ W，否则存在永远无法发送的
-/// 记录（二期 §3.5 死锁条款）。base64(256 KiB chunk) ≈ 350 KiB < 512 KiB。
+/// 记录（二期 §3.5 死锁条款）。256 KiB chunk + 元数据 < DATA_MAX_FRAME。
 pub const MAX_AUDIT_RECORD_BYTES: u64 = 512 * 1024;
 
-/// 输入/操作请求传输的原始块字节数（base64 前）。与一期 CHUNK_BYTES 对齐，
+/// 输入/操作请求传输的原始块字节数。与一期 CHUNK_BYTES 对齐，
 /// 避免主进程重切日志 chunk。
 pub const TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
 /// 输入传输在途窗口（独立于审计窗口；二期 §3.5 末段）。

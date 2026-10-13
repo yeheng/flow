@@ -53,7 +53,7 @@ graph TB
   subgraph remote 模式追加
     A["flow-agent<br/>（每台执行机一个）"]
     E2["flow-executor"]
-    S <-->|"单条 mTLS<br/>（v3 单流）"| A
+    S <-->|"单条 mTLS<br/>（v4 单流）"| A
     A -->|本机池| E2
   end
 
@@ -185,7 +185,7 @@ TCP loopback 回连传输落地后一并删除。任何平台配置该模式都�
 原号经 argv `--channel-fd` 传递（`pre_exec` 只关闭其余继承 FD，不做 dup2 落位）；
 Windows 及其余平台用 **TCP loopback 回连**——主进程
 bind `127.0.0.1` 临时端口，执行器按 `FLOW_EXECUTOR_CONNECT_ADDR` 回连出单条
-连接（v3 单流，`flow_engine::execution_protocol::loopback`）。回连端口
+连接（v4 单流，`flow_engine::execution_protocol::loopback`）。回连端口
 只在本机可见，与单用户本机工具的信任域一致；执行器 spawn 仍走
 `env_clear`（仅回填 `RUST_LOG` 与回连地址）。
 
@@ -266,7 +266,7 @@ flow-agent --wss-url ws://127.0.0.1:9710/ws/agent   --agent-id agent-a --token �
 - **认证边界**：代理终止 TLS 后，身份只能来自显式映射——请求必须带
   `Authorization: Bearer <agent_token>`（常量时间比较）与 `x-flow-agent-id`
   （须为合法身份串）。任缺即拒；不信任客户端自报以外的隐式身份。
-- **协议**：一条完整 v3 帧对应一条 WS Binary 消息；Text 与超限消息拒绝；
+- **协议**：一条完整 v4 帧对应一条 WS Binary 消息；Text 与超限消息拒绝；
   Ping 自动回 Pong；Close 视作 EOF。读写缓冲与消息长度均有硬上限。
 - 直连（无代理）场景继续用上面的 mTLS 路径；`wss_addr` 缺省关闭。
 
@@ -274,11 +274,11 @@ flow-agent --wss-url ws://127.0.0.1:9710/ws/agent   --agent-id agent-a --token �
 
 - PKI：内部 CA 签发 server 证书与每台 agent 证书。**证书 CN 即 agent_id**：主进程
   从 TLS 客户端证书取 CN，不信 agent 自报字段。
-- 单连接（v3 单流）：control（握手 / 管理帧 / Resume / Drain）与 data（业务帧）
-  复用同一条 mTLS 连接，帧内 1 字节通道标签区分；v2 时代的独立 data 端口、
-  `DataBind` 握手与一次性 `data_credential` 已随 v3 从协议目录与配置中删除
-  （过时帧在会话层按目录外类型整链拒绝）。
-- 协议版本：`PROTOCOL_VERSION = 3`，帧信封 `v` 不符即拒。agent 必报能力
+- 单连接（v4 单流）：control（握手 / 管理帧 / Resume / Drain）与 data（业务帧）
+  复用同一条 mTLS 连接，帧头 kind 字节与 raw blob 区分；v2/v3 时代的独立
+data 端口、`DataBind` 握手、一次性 `data_credential` 与标签帧已从协议目录
+与配置中删除（过时帧在会话层按目录外类型整链拒绝）。
+- 协议版本：`PROTOCOL_VERSION = 4`，帧信封 `v` 不符即拒。agent 必报能力
   `relay` / `resource_report` / `reconnect`；缺一即拒。
 - 凭证：业务密钥以最小引用经 OperationPermit 按任务下发（主进程解析，**不复制主
   进程环境到 agent**；凭证值不进入授权事实，不进 journal）。
@@ -291,7 +291,7 @@ flow-agent --wss-url ws://127.0.0.1:9710/ws/agent   --agent-id agent-a --token �
             │  flow-journal-server（mode=remote）   │
             │  data_dir/journal ← 唯一权威  │
             └───────────┬──────────────────┘
-                        │ control :9700（mTLS，v3 单流）
+                        │ control :9700（mTLS，v4 单流）
         ┌───────────────┼───────────────┐
         ▼               ▼               ▼
   ┌──────────┐    ┌──────────┐    ┌──────────┐

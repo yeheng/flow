@@ -1,7 +1,7 @@
-//! 传输边界与会话校验（v3 单流）。
+//! 传输边界与会话校验（v4 单流）。
 //!
-//! 唯一承载形态：`spawn` 在一条双向流上复用 control 与 data（帧内 1 字节
-//! 通道标签，见 [`super::frame`]）。单写任务保证帧按提交序串行发出——
+//! 唯一承载形态：`spawn` 在一条双向流上复用 control 与 data（帧头 kind 字节
+//! 与 raw blob，见 [`super::frame`]）。单写任务保证帧按提交序串行发出——
 //! Execute 先于其 TransferChunk、RequestOperation 晚于其请求块，跨通道乱序
 //! 在物理上不存在，双方无需重组暂存。执行器本地 IPC 与 agent 上联同用本
 //! 类型；v2 双物理流承载已随 v3 删除。
@@ -16,7 +16,7 @@ use super::contract::{
     DRAIN_GRACE_MS, HEARTBEAT_INTERVAL_MS, IDENTITY_MAX_BYTES, MAX_AUDIT_RECORD_BYTES,
     PROTOCOL_VERSION, REQUIRED_CAPABILITIES, W_BYTES,
 };
-use super::frame::{encode_tagged_frame, FrameDecoder};
+use super::frame::{encode_frame, FrameDecoder};
 use super::message::{Channel, Message, ProtocolError};
 
 /// 一条通道的读任务产物。`Frame` 装箱：`Message` 最大变体携带完整
@@ -83,8 +83,9 @@ impl SessionState {
 }
 
 impl FrameTransport {
-    /// 单流承载（v3 执行器本地 IPC）：标签帧 + 单队列串行写。
-    /// 控制与数据共用一条发送队列，帧序即提交序。
+    /// 单流承载（v4）：`u32 body_len | u8 kind | u32 meta_len | JSON meta |
+    /// raw`；只有带二进制体的类型走 raw。控制与数据共用一条发送队列，
+    /// 帧序即提交序。
     pub fn spawn<S>(stream: S, queue_depth: usize) -> Self
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -99,7 +100,11 @@ impl FrameTransport {
         });
         let (read_half, write_half) = tokio::io::split(stream);
         let read_half: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>> = Box::pin(read_half);
-        let reader = tokio::spawn(read_loop_tagged(read_half, event_tx.clone(), state.clone()));
+        let reader = tokio::spawn(read_loop_tagged(
+            read_half,
+            event_tx.clone(),
+            state.clone(),
+        ));
         let writer = tokio::spawn(write_loop_tagged(
             Box::pin(write_half) as std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>,
             outbound_rx,
@@ -291,7 +296,7 @@ async fn read_loop_tagged(
 ) {
     use tokio::io::AsyncReadExt;
     let mut stream = stream;
-    let mut decoder = FrameDecoder::new_tagged();
+    let mut decoder = FrameDecoder::new();
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
         // 会话已在别处终止：不再发起新的读。
@@ -316,15 +321,19 @@ async fn read_loop_tagged(
                     state.stop();
                     return;
                 }
-                while let Ok(Some((channel, json))) = decoder.pop_tagged_frame() {
-                    // T05：借用信封 + 类型化单遍解析（不建 Value 树、无 body 深拷贝）。
-                    let message = match Message::decode_envelope(&json) {
-                        Ok(message) => message,
+                loop {
+                    // T05：解码器内部借用信封 + 类型化单遍解析（V3）或
+                    // kind/meta/blob 重组（T12 V4）。
+                    let popped = match decoder.pop() {
+                        Ok(popped) => popped,
                         Err(error) => {
-                            let _ = events.send(IoEvent::Failed(channel, error)).await;
+                            let _ = events.send(IoEvent::Failed(Channel::Control, error)).await;
                             state.stop();
                             return;
                         }
+                    };
+                    let Some((channel, message)) = popped else {
+                        break;
                     };
                     if message.channel() != channel {
                         let error = ProtocolError::Malformed(format!(
@@ -393,7 +402,7 @@ async fn write_loop_tagged(
             );
             return;
         }
-        let frame = match encode_tagged_frame(&message) {
+        let frame = match encode_frame(&message) {
             Ok(frame) => frame,
             Err(error) => {
                 eprintln!(
@@ -774,7 +783,7 @@ mod tests {
             dispatch_id: "d".into(),
             transfer_id: "t".into(),
             offset: 0,
-            bytes: "aGk=".into(),
+            bytes: b"hi".to_vec(),
             digest: "d".into(),
         })
         .await
@@ -788,12 +797,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn channel_tag_mismatch_fails_session() {
-        // 手工构造「control 标签 + data 消息」的帧：读端必须拒绝。
+    async fn unknown_frame_kind_fails_session() {
+        // 注入未知 kind 字节的帧：读端必须拒绝并关闭会话。
         let (parent, child) = socketpair_channel().unwrap();
         use tokio::io::AsyncWriteExt;
         let raw = {
-            // 在包进 transport 前取原始 FD 的独立副本注入坏帧。
             let fd = std::os::fd::AsRawFd::as_raw_fd(&child);
             // SAFETY: dup 只复制句柄，原 stream 生命周期不受影响。
             let dup = unsafe { libc::dup(fd) };
@@ -803,22 +811,14 @@ mod tests {
         let mut a = FrameTransport::spawn(parent, 8);
         raw.set_nonblocking(true).unwrap();
         let mut raw = tokio::net::UnixStream::from_std(raw).unwrap();
-        let message = Message::TransferChunk {
-            dispatch_id: "d".into(),
-            transfer_id: "t".into(),
-            offset: 0,
-            bytes: "aGk=".into(),
-            digest: "d".into(),
-        };
-        // 用 control 标签发 data 消息。
-        let json = serde_json::to_vec(&message.to_envelope()).unwrap();
-        let mut frame = Vec::with_capacity(json.len() + 5);
-        frame.extend_from_slice(&((json.len() + 1) as u32).to_be_bytes());
-        frame.push(Channel::Control.tag());
-        frame.extend_from_slice(&json);
+        // body_len=5（仅 kind+meta_len），kind=99（未知），meta_len=0。
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&5u32.to_be_bytes());
+        frame.push(99u8);
+        frame.extend_from_slice(&0u32.to_be_bytes());
         raw.write_all(&frame).await.unwrap();
-        let error = a.recv().await.expect_err("tag mismatch must fail");
-        assert!(error.to_string().contains("mismatches"), "{error}");
+        let error = a.recv().await.expect_err("unknown kind must fail");
+        assert!(error.to_string().contains("unknown"), "{error}");
     }
 
     #[tokio::test]
@@ -942,7 +942,7 @@ mod terminal_event_tests {
         let (ca, mut cb) = tokio::io::duplex(4096);
         let transport = FrameTransport::spawn(ca, 8);
         let message = Message::DrainComplete { drained: 3 };
-        let expected = super::super::frame::encode_tagged_frame(&message).unwrap();
+        let expected = super::super::frame::encode_frame(&message).unwrap();
         transport.send(message).await.unwrap();
         transport
             .flush_and_close(std::time::Duration::from_secs(1))
