@@ -44,8 +44,42 @@ pub struct FrameTransport {
 struct IoHandle {
     readers: Vec<tokio::task::JoinHandle<()>>,
     writers: Vec<tokio::task::JoinHandle<()>>,
-    /// 出错后置位：拒绝继续发送。
-    broken: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 会话共享故障状态（T03）：任一 I/O 方向失败即整会话终止。
+    state: std::sync::Arc<SessionState>,
+}
+
+/// 会话级故障状态。写任务失败没有自然的事件通道可走——读事件队列归读端
+/// 消费，而读端可能正永久 pending 在一个永远不完成的 read 上。失败事实
+/// 必须绕开这个死角直达 `recv`，并终止读写两个任务。
+struct SessionState {
+    /// 出错后置位：拒绝继续发送；读任务据此退出读循环。
+    broken: std::sync::atomic::AtomicBool,
+    /// 首个失败的真实错误（后续 `recv` 观察到它，而不是笼统的 Closed）。
+    error: parking_lot::Mutex<Option<ProtocolError>>,
+    /// `recv` 的失败唤醒。notify_one 在无等待者时留存许可，不依赖
+    /// `recv` 恰好已经在等待。
+    failed: tokio::sync::Notify,
+    /// 会话终止信号：唤醒阻塞中的读任务与写任务（close 同样触发）。
+    terminate: tokio_util::sync::CancellationToken,
+}
+
+impl SessionState {
+    /// 会话停止但无错误事实（EOF / 主动 close）：只终止任务，不占用错误槽。
+    fn stop(&self) {
+        self.broken.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.terminate.cancel();
+    }
+
+    /// 记录会话失败（首个错误保留）：停止任务并唤醒 `recv`。
+    fn fail(&self, error: ProtocolError) {
+        self.stop();
+        let mut slot = self.error.lock();
+        if slot.is_none() {
+            *slot = Some(error);
+        }
+        drop(slot);
+        self.failed.notify_one();
+    }
 }
 
 impl FrameTransport {
@@ -57,18 +91,19 @@ impl FrameTransport {
     {
         let (event_tx, incoming) = mpsc::channel(queue_depth.max(8));
         let (outbound_tx, outbound_rx) = mpsc::channel::<Message>(queue_depth.max(8));
-        let broken = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let state = std::sync::Arc::new(SessionState {
+            broken: std::sync::atomic::AtomicBool::new(false),
+            error: parking_lot::Mutex::new(None),
+            failed: tokio::sync::Notify::new(),
+            terminate: tokio_util::sync::CancellationToken::new(),
+        });
         let (read_half, write_half) = tokio::io::split(stream);
         let read_half: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>> = Box::pin(read_half);
-        let reader = tokio::spawn(read_loop_tagged(
-            read_half,
-            event_tx.clone(),
-            broken.clone(),
-        ));
+        let reader = tokio::spawn(read_loop_tagged(read_half, event_tx.clone(), state.clone()));
         let writer = tokio::spawn(write_loop_tagged(
             Box::pin(write_half) as std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>,
             outbound_rx,
-            broken.clone(),
+            state.clone(),
         ));
         drop(event_tx);
         Self {
@@ -80,14 +115,16 @@ impl FrameTransport {
             io: IoHandle {
                 readers: vec![reader],
                 writers: vec![writer],
-                broken,
+                state,
             },
         }
     }
 
     /// 发送一条消息（自动路由到其声明通道；通道不符即协议错误）。
+    /// 会话故障（读写任一失败/close）后阻塞中的发送也会被释放：写任务退出
+    /// 丢弃出站队列，等待中的 send 以 Closed 返回。
     pub async fn send(&self, message: Message) -> Result<(), ProtocolError> {
-        if self.io.broken.load(std::sync::atomic::Ordering::SeqCst) {
+        if self.io.state.broken.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(ProtocolError::Closed);
         }
         match message.channel() {
@@ -106,6 +143,7 @@ impl FrameTransport {
 
     /// 接收下一条消息。任一通道 EOF/错误时返回 [`ProtocolError::Closed`]；
     /// 协议帧错误（非法长度/未知类型/畸形信封）先返回错误，随后通道关闭。
+    /// 写任务失败时没有读事件可等：失败信号直达（已排队的帧先于错误交付）。
     pub async fn recv(&mut self) -> Result<(Channel, Message), ProtocolError> {
         if let Some(error) = self.pending_error.take() {
             return Err(error);
@@ -113,7 +151,21 @@ impl FrameTransport {
         if self.ended {
             return Err(ProtocolError::Closed);
         }
-        match self.incoming.recv().await {
+        let event = tokio::select! {
+            biased;
+            event = self.incoming.recv() => event,
+            _ = self.io.state.failed.notified() => {
+                self.ended = true;
+                return Err(self
+                    .io
+                    .state
+                    .error
+                    .lock()
+                    .take()
+                    .unwrap_or(ProtocolError::Closed));
+            }
+        };
+        match event {
             Some(IoEvent::Frame(channel, message)) => Ok((channel, *message)),
             Some(IoEvent::Failed(_, error)) => {
                 self.ended = true;
@@ -121,14 +173,22 @@ impl FrameTransport {
             }
             Some(IoEvent::Eof(_)) | None => {
                 self.ended = true;
-                Err(ProtocolError::Closed)
+                // 通道关闭（读/写任务退出）可能先于失败通知被 poll：
+                // 已记录的真实错误优先于笼统的 Closed。
+                Err(self
+                    .io
+                    .state
+                    .error
+                    .lock()
+                    .take()
+                    .unwrap_or(ProtocolError::Closed))
             }
         }
     }
 
     /// 非阻塞发送（队列满/已关即失败；agent 拒绝路径使用）。
     pub fn try_send(&self, message: Message) -> Result<(), ProtocolError> {
-        if self.io.broken.load(std::sync::atomic::Ordering::SeqCst) {
+        if self.io.state.broken.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(ProtocolError::Closed);
         }
         let sender = match message.channel() {
@@ -175,12 +235,11 @@ impl FrameTransport {
         }
     }
 
-    /// 关闭全部通道并停止 I/O 任务。幂等。
+    /// 关闭全部通道并停止 I/O 任务。幂等。终止信号唤醒阻塞中的读/写任务，
+    /// 不依赖对端 EOF 或后续流量。
     pub fn close(&mut self) {
         self.ended = true;
-        self.io
-            .broken
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.io.state.stop();
         // 丢弃发送端使写任务退出并 shutdown 流；用死通道占位保持类型。
         self.control_out = dead_sender();
         self.data_out = dead_sender();
@@ -206,26 +265,37 @@ fn dead_sender() -> mpsc::Sender<Message> {
 }
 
 /// 单流读任务：标签声明通道，且必须与消息类型声明的通道一致（双重校验）。
+/// 会话在别处失败（写任务/close）时由终止信号唤醒退出，不等对端 EOF。
 async fn read_loop_tagged(
     stream: impl tokio::io::AsyncRead + Unpin + Send,
     events: mpsc::Sender<IoEvent>,
-    broken: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    state: std::sync::Arc<SessionState>,
 ) {
     use tokio::io::AsyncReadExt;
     let mut stream = stream;
     let mut decoder = FrameDecoder::new_tagged();
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
-        match stream.read(&mut buffer).await {
+        // 会话已在别处终止：不再发起新的读。
+        if state.broken.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let read = tokio::select! {
+            biased;
+            read = stream.read(&mut buffer) => read,
+            _ = state.terminate.cancelled() => return,
+        };
+        match read {
             Ok(0) => {
                 let _ = events.send(IoEvent::Eof(Channel::Control)).await;
-                broken.store(true, std::sync::atomic::Ordering::SeqCst);
+                state.stop();
                 return;
             }
             Ok(n) => {
                 if let Err(error) = decoder.feed(&buffer[..n]) {
+                    // 错误事实随事件送达（优先于后续排队帧）；会话停止。
                     let _ = events.send(IoEvent::Failed(Channel::Control, error)).await;
-                    broken.store(true, std::sync::atomic::Ordering::SeqCst);
+                    state.stop();
                     return;
                 }
                 while let Ok(Some((channel, json))) = decoder.pop_tagged_frame() {
@@ -236,21 +306,18 @@ async fn read_loop_tagged(
                         Ok(message) => message,
                         Err(error) => {
                             let _ = events.send(IoEvent::Failed(channel, error)).await;
-                            broken.store(true, std::sync::atomic::Ordering::SeqCst);
+                            state.stop();
                             return;
                         }
                     };
                     if message.channel() != channel {
-                        let _ = events.send(IoEvent::Failed(
+                        let error = ProtocolError::Malformed(format!(
+                            "channel tag {:?} mismatches message {}",
                             channel,
-                            ProtocolError::Malformed(format!(
-                                "channel tag {:?} mismatches message {}",
-                                channel,
-                                message.type_name()
-                            )),
-                        ))
-                        .await;
-                        broken.store(true, std::sync::atomic::Ordering::SeqCst);
+                            message.type_name()
+                        ));
+                        let _ = events.send(IoEvent::Failed(channel, error)).await;
+                        state.stop();
                         return;
                     }
                     if events
@@ -269,7 +336,8 @@ async fn read_loop_tagged(
                         ProtocolError::Io(error),
                     ))
                     .await;
-                broken.store(true, std::sync::atomic::Ordering::SeqCst);
+                // 读失败的错误事实已随事件送达；这里只停会话，不覆盖错误槽。
+                state.stop();
                 return;
             }
         }
@@ -277,16 +345,32 @@ async fn read_loop_tagged(
 }
 
 /// 单流写任务：按提交序串行写帧；观测帧编码失败丢帧计数，其余断线。
+/// 失败事实经 [`SessionState::fail`] 直达 recv（写端没有读事件可投递）；
+/// 出站队列关闭（发送端全部 drop）走正常收尾 shutdown。
 async fn write_loop_tagged(
     stream: impl tokio::io::AsyncWrite + Unpin + Send,
     queue: mpsc::Receiver<Message>,
-    broken: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    state: std::sync::Arc<SessionState>,
 ) {
     use tokio::io::AsyncWriteExt;
     let mut stream = stream;
     let mut queue = queue;
-    while let Some(message) = queue.recv().await {
-        if broken.load(std::sync::atomic::Ordering::SeqCst) {
+    loop {
+        let message = tokio::select! {
+            biased;
+            message = queue.recv() => {
+                match message {
+                    Some(message) => message,
+                    None => break,
+                }
+            }
+            // 会话在别处失败（读任务/close）：立即退出，释放阻塞中的发送方。
+            _ = state.terminate.cancelled() => {
+                tracing::warn!("writer exit: session broken");
+                return;
+            }
+        };
+        if state.broken.load(std::sync::atomic::Ordering::SeqCst) {
             tracing::warn!(
                 type_name = message.type_name(),
                 "writer exit: session broken"
@@ -305,7 +389,7 @@ async fn write_loop_tagged(
                 // 那是正确性路径，该炸就炸）。
                 if !matches!(message, Message::ObservabilityBatch { .. }) {
                     tracing::error!(type_name = message.type_name(), %error, "frame encode failed");
-                    broken.store(true, std::sync::atomic::Ordering::SeqCst);
+                    state.fail(error);
                     return;
                 }
                 tracing::warn!(type_name = message.type_name(), %error, "observability frame dropped");
@@ -317,7 +401,7 @@ async fn write_loop_tagged(
                 "flow-transport: frame write failed type={} error={error}",
                 message.type_name()
             );
-            broken.store(true, std::sync::atomic::Ordering::SeqCst);
+            state.fail(ProtocolError::Io(error));
             return;
         }
         if let Err(error) = stream.flush().await {
@@ -325,7 +409,7 @@ async fn write_loop_tagged(
                 "flow-transport: frame flush failed type={} error={error}",
                 message.type_name()
             );
-            broken.store(true, std::sync::atomic::Ordering::SeqCst);
+            state.fail(ProtocolError::Io(error));
             return;
         }
     }
@@ -682,6 +766,91 @@ mod tests {
         evil.write_all(&u32::MAX.to_be_bytes()).await.unwrap();
         let error = a.recv().await.expect_err("illegal length must fail");
         assert!(matches!(error, ProtocolError::FrameTooLarge(_, _)));
+    }
+
+    /// 读端永久 pending、写端必错的流：验证写任务失败不再留下永久阻塞的
+    /// recv（T03 故障传播）。
+    struct DeadWritePendingRead;
+
+    impl tokio::io::AsyncRead for DeadWritePendingRead {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl tokio::io::AsyncWrite for DeadWritePendingRead {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "write side dead",
+            )))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "write side dead",
+            )))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "write side dead",
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_failure_wakes_blocked_recv_with_real_error() {
+        // 写失败必须唤醒阻塞中的 recv 并携带真实 I/O 错误；后续 recv 稳定
+        // Closed，阻塞中的发送方也被释放（写任务退出丢弃出站队列）。
+        let mut transport = FrameTransport::spawn(DeadWritePendingRead, 8);
+        transport
+            .try_send(Message::Ready)
+            .expect("queue before writer failure");
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), transport.recv())
+            .await
+            .expect("recv must wake on writer failure");
+        assert!(
+            matches!(outcome, Err(ProtocolError::Io(_))),
+            "real io error expected: {outcome:?}"
+        );
+        assert!(matches!(transport.recv().await, Err(ProtocolError::Closed)));
+        assert!(matches!(
+            transport.try_send(Message::Ready),
+            Err(ProtocolError::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn close_terminates_pending_reader_and_recv() {
+        // close() 必须让读端永久 pending 的会话稳定收尾：recv 立即 Closed，
+        // 读任务由终止信号唤醒退出，不依赖对端 EOF。
+        let mut transport = FrameTransport::spawn(DeadWritePendingRead, 8);
+        transport.close();
+        assert!(matches!(transport.recv().await, Err(ProtocolError::Closed)));
+        let reader_finished = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !transport.io.readers[0].is_finished() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(reader_finished.is_ok(), "reader task must exit after close");
     }
 }
 

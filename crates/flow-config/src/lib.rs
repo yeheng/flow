@@ -163,6 +163,10 @@ impl Default for ExecutionConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct RemoteExecutionConfig {
     pub control_addr: String,
+    /// 已废弃（v3 上联收敛为单条 TLS 连接）：仅为存量配置兼容保留，
+    /// 值被忽略（T10 约束：旧配置不应突然被拒绝）。
+    #[serde(default)]
+    pub data_addr: Option<String>,
     pub ca_cert: PathBuf,
     pub cert: PathBuf,
     pub key: PathBuf,
@@ -173,6 +177,7 @@ impl Default for RemoteExecutionConfig {
     fn default() -> Self {
         RemoteExecutionConfig {
             control_addr: String::new(),
+            data_addr: None,
             ca_cert: PathBuf::new(),
             cert: PathBuf::new(),
             key: PathBuf::new(),
@@ -186,6 +191,10 @@ impl Default for RemoteExecutionConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct AgentConfig {
     pub control_addr: Option<String>,
+    /// 已废弃（v3 上联收敛为单条 TLS 连接）：仅为存量配置兼容保留，
+    /// 值被忽略。
+    #[serde(default)]
+    pub data_addr: Option<String>,
     pub agent_id: Option<String>,
     pub ca_cert: Option<PathBuf>,
     pub cert: Option<PathBuf>,
@@ -198,6 +207,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         AgentConfig {
             control_addr: None,
+            data_addr: None,
             agent_id: None,
             ca_cert: None,
             cert: None,
@@ -765,6 +775,25 @@ data_dir = "/var/lib/flow/journal"
         assert!(stale.is_err(), "退役的 [server] 键必须被拒绝");
         let result = Config::merge_patch(&Config::default(), &serde_json::json!({"bogus": {}}));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn deprecated_data_addr_is_accepted_and_ignored() {
+        // T10：v2 双流时代的 data_addr 在存量配置里广泛存在，v3 单流后
+        // 字段废弃但必须继续解析（值被忽略），不能因 deny_unknown_fields
+        // 突然拒绝旧配置。
+        let config = toml::from_str::<Config>(
+            "[execution.remote]\ncontrol_addr = \"127.0.0.1:9801\"\
+             \ndata_addr = \"127.0.0.1:9802\"\
+             \nca_cert = \"ca.pem\"\ncert = \"c.pem\"\nkey = \"k.pem\"\n\n\
+             [agent]\ndata_addr = \"127.0.0.1:9803\"\n",
+        )
+        .expect("存量 data_addr 配置必须可解析");
+        config.validate().expect("废弃字段不影响校验");
+        let remote = config.execution.remote.expect("remote section");
+        assert_eq!(remote.control_addr, "127.0.0.1:9801");
+        assert_eq!(remote.data_addr.as_deref(), Some("127.0.0.1:9802"));
+        assert_eq!(config.agent.data_addr.as_deref(), Some("127.0.0.1:9803"));
     }
 
     #[test]

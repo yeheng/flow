@@ -32,6 +32,10 @@ struct Agent {
     /// 主进程 control TLS 地址（v3 起这是唯一的上联地址）。
     #[arg(long, env = "FLOW_AGENT_CONTROL_ADDR")]
     control_addr: Option<String>,
+    /// 已废弃：v3 起上联收敛为单条 TLS 连接，本参数被忽略（兼容保留，
+    /// 存量启动脚本不因此报错）。
+    #[arg(long, env = "FLOW_AGENT_DATA_ADDR")]
+    data_addr: Option<String>,
     /// agent 身份（须与客户端证书 CN 一致）。
     #[arg(long, env = "FLOW_AGENT_ID")]
     agent_id: Option<String>,
@@ -70,6 +74,7 @@ fn main() -> std::process::ExitCode {
     };
     let Agent {
         control_addr,
+        data_addr,
         agent_id,
         ca_cert,
         cert,
@@ -78,6 +83,8 @@ fn main() -> std::process::ExitCode {
         slots,
         ..
     } = agent;
+    // data_addr 已废弃（v3 单条 TLS 上联）：仅为存量启动参数兼容保留，忽略。
+    let _ = data_addr;
     let code = agent_main(
         loaded.config,
         control_addr,

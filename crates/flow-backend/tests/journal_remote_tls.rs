@@ -264,6 +264,16 @@ async fn tls_agent_end_to_end_business() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// 构造 v3 单流裸帧（control 标签）——测试注入用。
+fn raw_frame(json: &Value) -> Vec<u8> {
+    let bytes = serde_json::to_vec(json).unwrap();
+    let mut frame = Vec::with_capacity(bytes.len() + 5);
+    frame.extend_from_slice(&((bytes.len() + 1) as u32).to_be_bytes());
+    frame.push(0u8); // control 标签
+    frame.extend_from_slice(&bytes);
+    frame
+}
+
 #[tokio::test]
 async fn unexpected_session_frame_rejected_and_single_cancel_keeps_uplink() {
     // 会话级协议校验：v3 单流上联已无 DataBind（v2 遗留，目录外类型）；
@@ -273,14 +283,6 @@ async fn unexpected_session_frame_rejected_and_single_cancel_keeps_uplink() {
     use flow_engine::execution_protocol::contract::PROTOCOL_VERSION;
     use flow_engine::execution_protocol::frame::FrameDecoder;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    fn raw_frame(json: &Value) -> Vec<u8> {
-        let bytes = serde_json::to_vec(json).unwrap();
-        let mut frame = Vec::with_capacity(bytes.len() + 5);
-        frame.extend_from_slice(&((bytes.len() + 1) as u32).to_be_bytes());
-        frame.push(0u8); // control 标签
-        frame.extend_from_slice(&bytes);
-        frame
-    }
     let dir = temp();
     std::fs::create_dir_all(&dir).unwrap();
     let backend = JournalBackend::open(&dir.join("data"), JournalOptions::default())
@@ -412,5 +414,165 @@ async fn single_task_cancel_keeps_agent_uplink_alive() {
     );
     drop(agent);
     backend.close().await.unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn coalesced_hello_and_trailing_frame_not_lost_by_master() {
+    // T02 主进程侧：AgentHello 与尾随过时 DataBind 同一次 write。握手经
+    // 统一 transport 收发后，尾随帧必须交付（表现为整会话拒绝关闭）；
+    // 若握手用临时 decoder 取首帧后丢弃，尾帧丢失、会话悬挂不关闭。
+    use flow_engine::execution_protocol::contract::PROTOCOL_VERSION;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = temp();
+    std::fs::create_dir_all(&dir).unwrap();
+    let backend = JournalBackend::open(&dir.join("data"), JournalOptions::default())
+        .await
+        .unwrap();
+    let manager = flow_backend::execution::remote::AgentManager::new(
+        backend.clone(),
+        backend.journal.id().into(),
+        1,
+    );
+    let (control_a, mut client) = tokio::io::duplex(64 * 1024);
+    manager
+        .attach_inprocess("agent-coal".to_string(), control_a)
+        .await;
+    let hello = json!({
+        "v": PROTOCOL_VERSION, "type": "AgentHello",
+        "body": {
+            "agent_boot_id": "boot-coal", "build": "t",
+            "capabilities": ["relay", "resource_report", "reconnect"],
+            "slots": "1"
+        }
+    });
+    let stale = json!({
+        "v": PROTOCOL_VERSION, "type": "DataBind",
+        "body": {"agent_boot_id": "boot-coal", "credential": "x"}
+    });
+    // 关键：两帧拼接后单次写入。
+    let mut bytes = raw_frame(&hello);
+    bytes.extend_from_slice(&raw_frame(&stale));
+    client.write_all(&bytes).await.unwrap();
+    // 尾随 DataBind 必须被交付：会话以协议错误拒绝并关闭（5 秒内 EOF）。
+    // 若握手交接丢失尾帧，会话将永远悬挂等不到关闭。
+    let closed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut chunk = [0u8; 16 * 1024];
+            if client.read(&mut chunk).await.unwrap_or(0) == 0 {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "coalesced trailing frame must be delivered and close session"
+    );
+    drop(client);
+    backend.close().await.unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn coalesced_welcome_and_trailing_frame_not_lost_by_agent() {
+    // T02 agent 侧：假 master 在同一次 write 里回 Welcome + 过时 DataBind。
+    // agent 握手经统一 transport 后必须消费尾帧并断开会话；若握手临时
+    // decoder 丢弃尾字节，agent 只能干等心跳超时（10s 级），测试在 5 秒
+    // 内断言连接关闭即可区分两种实现。
+    use flow_engine::execution_protocol::frame::{encode_tagged_frame, FrameDecoder};
+    use flow_engine::execution_protocol::message::Message;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // 测试进程内安装 rustls provider（与 flow-agent/flow-backend 进程一致）。
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = temp();
+    std::fs::create_dir_all(&dir).unwrap();
+    let (ca, server_cert, server_key, _agent_cert, _agent_key) = generate_pki(&dir, "agent-wc");
+    // mTLS server：镜像 AgentManager 的接入配置（客户端证书由 CA 签发）。
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut std::io::Cursor::new(
+        std::fs::read(&ca).unwrap(),
+    ))
+    .collect::<std::result::Result<Vec<_>, _>>()
+    .unwrap()
+    {
+        roots.add(cert).unwrap();
+    }
+    let verifier = rustls::server::WebPkiClientVerifier::builder(std::sync::Arc::new(roots))
+        .build()
+        .unwrap();
+    let server_certs: Vec<_> = rustls_pemfile::certs(&mut std::io::Cursor::new(
+        std::fs::read(&server_cert).unwrap(),
+    ))
+    .collect::<std::result::Result<Vec<_>, _>>()
+    .unwrap();
+    let server_key = rustls_pemfile::private_key(&mut std::io::Cursor::new(
+        std::fs::read(&server_key).unwrap(),
+    ))
+    .unwrap()
+    .unwrap();
+    let config = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(server_certs, server_key)
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server_task = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut tls = acceptor.accept(socket).await.unwrap();
+        // 读 AgentHello（首帧，可能分多次到达）。
+        let mut decoder = FrameDecoder::new_tagged();
+        loop {
+            let mut chunk = [0u8; 16 * 1024];
+            let n = tls.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "closed before agent hello");
+            decoder.feed(&chunk[..n]).unwrap();
+            if let Some((_, _)) = decoder.pop_tagged_frame().unwrap() {
+                break;
+            }
+        }
+        // 关键：Welcome + 过时 DataBind（目录外类型）拼接后单次写回。
+        let welcome = encode_tagged_frame(&Message::AgentWelcome {
+            journal_id: "journal-wc".into(),
+            master_epoch: 1,
+            link_session_id: "link-wc".into(),
+            agent_id: "agent-wc".into(),
+            heartbeat_ms: flow_engine::execution_protocol::HEARTBEAT_INTERVAL_MS,
+            agent_window_bytes: 8 * 1024 * 1024,
+        })
+        .unwrap();
+        let stale = raw_frame(&serde_json::json!({
+            "v": flow_engine::execution_protocol::PROTOCOL_VERSION,
+            "type": "DataBind",
+            "body": {"agent_boot_id": "boot-wc", "credential": "x"}
+        }));
+        let mut out = welcome;
+        out.extend_from_slice(&stale);
+        tls.write_all(&out).await.unwrap();
+        tls.flush().await.unwrap();
+        // agent 必须消费尾帧、拒绝会话并断开（EOF）。
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut chunk = [0u8; 16 * 1024];
+                if tls.read(&mut chunk).await.unwrap_or(0) == 0 {
+                    return;
+                }
+            }
+        })
+        .await;
+        closed.is_ok()
+    });
+    let mut agent = spawn_agent(&dir, port, "agent-wc", 1);
+    let delivered = tokio::time::timeout(Duration::from_secs(20), server_task)
+        .await
+        .expect("fake master session completes")
+        .unwrap();
+    assert!(
+        delivered,
+        "agent must consume coalesced trailing frame and close uplink; stderr:\n{}",
+        agent.dump_stderr()
+    );
+    drop(agent);
     std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -124,7 +124,7 @@ async fn connect(
     let tcp = tokio::net::TcpStream::connect(&config.control_addr)
         .await
         .map_err(|e| format!("connect: {e}"))?;
-    let mut stream = connector
+    let stream = connector
         .connect(
             rustls::pki_types::ServerName::try_from("flow-server".to_string())
                 .map_err(|e| format!("sni: {e}"))?,
@@ -132,8 +132,10 @@ async fn connect(
         )
         .await
         .map_err(|e| format!("tls: {e}"))?;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    // 简化握手：首帧 AgentHello（复用标签帧编解码器直接写）。
+    // 握手全程走同一条 transport（T02）：先建传输再收发 AgentHello/
+    // AgentWelcome。不再用临时 decoder 取首帧后丢弃——一次 read 里 Welcome
+    // 之后的尾随字节不会在交接时丢失。
+    let mut transport = FrameTransport::spawn(stream, 128);
     let hello = Message::AgentHello {
         agent_boot_id: agent_boot_id.to_string(),
         build: crate::AGENT_BUILD.into(),
@@ -143,44 +145,31 @@ async fn connect(
             .collect(),
         slots: config.slots,
     };
-    let frame = flow_engine::execution_protocol::frame::encode_tagged_frame(&hello)
-        .map_err(|e| format!("encode hello: {e}"))?;
-    stream
-        .write_all(&frame)
+    transport
+        .send(hello)
         .await
         .map_err(|e| format!("send hello: {e}"))?;
-    // 读 Welcome（裸帧，标签格式）。
-    let mut decoder = flow_engine::execution_protocol::frame::FrameDecoder::new_tagged();
-    let welcome = loop {
-        let mut chunk = [0u8; 16 * 1024];
-        let n = stream
-            .read(&mut chunk)
-            .await
-            .map_err(|e| format!("read welcome: {e}"))?;
-        if n == 0 {
-            return Err("stream closed before welcome".into());
-        }
-        decoder
-            .feed(&chunk[..n])
-            .map_err(|e| format!("welcome frame: {e}"))?;
-        if let Some((_, json)) = decoder.pop_tagged_frame().map_err(|e| e.to_string())? {
-            let value: serde_json::Value =
-                serde_json::from_slice(&json).map_err(|e| e.to_string())?;
-            break Message::from_envelope(value).map_err(|e| e.to_string())?;
-        }
-    };
+    let (channel, message) = tokio::time::timeout(
+        Duration::from_millis(flow_engine::execution_protocol::STARTUP_TIMEOUT_MS),
+        transport.recv(),
+    )
+    .await
+    .map_err(|_| "welcome timeout".to_string())?
+    .map_err(|e| format!("read welcome: {e}"))?;
+    if channel != flow_engine::execution_protocol::Channel::Control {
+        return Err(format!("expected AgentWelcome on control, got {channel:?}"));
+    }
     let Message::AgentWelcome {
         journal_id,
         master_epoch,
         link_session_id,
         ..
-    } = welcome
+    } = message
     else {
         return Err("expected AgentWelcome".into());
     };
     // journal_id / master_epoch 是权威身份：执行器握手与 ValueRef 盖章都以它
     // 为准（主进程 reducer 会拒绝 journal_id 不符的发布）。
-    let transport = FrameTransport::spawn(stream, 128);
     Ok((transport, link_session_id, journal_id, master_epoch))
 }
 

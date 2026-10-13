@@ -250,31 +250,36 @@ impl AgentManager {
             "agent TLS listener ready"
         );
         let acceptor = tls.acceptor.clone();
-        loop {
-            let Ok((socket, _)) = listener.accept().await else {
-                return Ok(());
-            };
-            let acceptor = acceptor.clone();
-            let manager = self.clone();
-            tokio::spawn(async move {
-                let Ok(stream) = acceptor.accept(socket).await else {
+        // 绑定即返回：accept 循环作为后台任务（与 v2 时代语义一致）。
+        // 直接 await 会把 start_execution_remote（含生产 remote 模式启动）
+        // 永久阻塞在 accept 循环上。
+        let manager = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
                     return;
                 };
-                let agent_id = stream
-                    .get_ref()
-                    .1
-                    .peer_certificates()
-                    .and_then(|certs| certs.first())
-                    .and_then(|c| cert_common_name(c.as_ref()));
-                let Some(agent_id) = agent_id else {
-                    tracing::warn!("agent TLS connection without client cert");
-                    return;
-                };
-                manager
-                    .inject_stream(agent_id, Box::pin(stream))
-                    .await;
-            });
-        }
+                let acceptor = acceptor.clone();
+                let manager = manager.clone();
+                tokio::spawn(async move {
+                    let Ok(stream) = acceptor.accept(socket).await else {
+                        return;
+                    };
+                    let agent_id = stream
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .and_then(|certs| certs.first())
+                        .and_then(|c| cert_common_name(c.as_ref()));
+                    let Some(agent_id) = agent_id else {
+                        tracing::warn!("agent TLS connection without client cert");
+                        return;
+                    };
+                    manager.inject_stream(agent_id, Box::pin(stream)).await;
+                });
+            }
+        });
+        Ok(())
     }
 
     // R0 模拟中继入口：直接注入单流（无 TLS；身份由注入方保证）。
@@ -296,46 +301,34 @@ impl AgentManager {
         });
     }
 
-    // 单个 agent 会话：裸帧读 AgentHello/回 AgentWelcome 后，整条单流
-    // 交给统一 transport（v3：帧内通道标签，无需第二条连接与 DataBind）。
+    // 单个 agent 会话（T02）：握手与业务帧共用同一条 transport
+    // （v3：帧内通道标签，无需第二条连接与 DataBind）。
     async fn run_session(
         self: &Arc<Self>,
         agent_id: String,
         stream: BoxedStream,
     ) -> std::result::Result<(), String> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let stream = tokio::io::BufStream::new(stream);
-        let (mut stream_read, mut stream_write) = tokio::io::split(stream);
-        // 1) 裸帧握手（单流标签帧格式）。
+        // 1) 握手全程走同一条 transport（T02）：先建传输再收发 AgentHello/
+        // AgentWelcome。不再用临时 decoder 取首帧后丢弃——同一次 read 里
+        // Hello 之后的尾随帧不会在交接时丢失（帧上限/版本/能力校验不变）。
+        let mut transport = FrameTransport::spawn(stream, 128);
         let (agent_boot_id, _build, capabilities, slots) = {
-            let mut decoder = flow_engine::execution_protocol::frame::FrameDecoder::new_tagged();
-            let hello = loop {
-                let mut chunk = [0u8; 16 * 1024];
-                let n = tokio::time::timeout(
-                    Duration::from_millis(STARTUP_TIMEOUT_MS * 2),
-                    stream_read.read(&mut chunk),
-                )
-                .await
-                .map_err(|_| "agent hello timeout".to_string())?
-                .map_err(|e| format!("read hello: {e}"))?;
-                if n == 0 {
-                    return Err("stream closed before hello".into());
-                }
-                decoder
-                    .feed(&chunk[..n])
-                    .map_err(|e| format!("hello frame: {e}"))?;
-                if let Some((_, json)) = decoder.pop_tagged_frame().map_err(|e| e.to_string())? {
-                    let value: serde_json::Value =
-                        serde_json::from_slice(&json).map_err(|e| e.to_string())?;
-                    break Message::from_envelope(value).map_err(|e| e.to_string())?;
-                }
-            };
+            let (channel, message) = tokio::time::timeout(
+                Duration::from_millis(STARTUP_TIMEOUT_MS * 2),
+                transport.recv(),
+            )
+            .await
+            .map_err(|_| "agent hello timeout".to_string())?
+            .map_err(|e| format!("read hello: {e}"))?;
+            if channel != flow_engine::execution_protocol::Channel::Control {
+                return Err(format!("expected AgentHello on control, got {channel:?}"));
+            }
             let Message::AgentHello {
                 agent_boot_id,
                 build,
                 capabilities,
                 slots,
-            } = hello
+            } = message
             else {
                 return Err("expected AgentHello".into());
             };
@@ -354,30 +347,18 @@ impl AgentManager {
             "link-{}",
             self.session_counter.fetch_add(1, Ordering::Relaxed)
         );
-        // 裸写 Welcome（会话尚未交给统一 transport，先手工编码一帧）。
-        {
-            let welcome = Message::AgentWelcome {
+        // 2) Welcome 经同一条 transport 发出（不再手工裸写帧）。
+        transport
+            .send(Message::AgentWelcome {
                 journal_id: self.journal_id.clone(),
                 master_epoch: self.master_epoch,
                 link_session_id: link_session_id.clone(),
                 agent_id: agent_id.clone(),
                 heartbeat_ms: flow_engine::execution_protocol::HEARTBEAT_INTERVAL_MS,
                 agent_window_bytes: W_BYTES * A_MAX as u64,
-            };
-            let frame = flow_engine::execution_protocol::frame::encode_tagged_frame(&welcome)
-                .map_err(|e| format!("encode welcome: {e}"))?;
-            stream_write
-                .write_all(&frame)
-                .await
-                .map_err(|e| format!("write welcome: {e}"))?;
-            stream_write
-                .flush()
-                .await
-                .map_err(|e| format!("flush welcome: {e}"))?;
-        }
-        // 2) 握手后的单流直接交给统一 transport（BufStream 缓冲已由裸读消化）。
-        let stream = stream_read.unsplit(stream_write);
-        let mut transport = FrameTransport::spawn(stream, 128);
+            })
+            .await
+            .map_err(|e| format!("write welcome: {e}"))?;
 
         // 3) 注册会话（替换旧会话：旧 outbound 关闭 → 相关 runner link-dead）。
         let (outbound, mut commands) = mpsc::channel::<ToSession>(256);
@@ -440,20 +421,28 @@ impl AgentManager {
                                 } else {
                                     *message
                                 };
-                                transport.send(frame).await.map_err(|e| format!("send: {e}"))?;
+                                // 出站拥塞（满队列阻塞在 send）期间关闭/替换仍可处理（T03）。
+                                tokio::select! {
+                                    result = transport.send(frame) => result.map_err(|e| format!("send: {e}"))?,
+                                    _ = registration.cancel.cancelled() => return Ok(()),
+                                    _ = self.shutdown.cancelled() => return Ok(()),
+                                }
                             }
                             ToSession::CancelDispatch(dispatch_id) => {
                                 let Some(routing) = routings.get(&dispatch_id) else { continue };
                                 let envelope = routing.envelope.clone();
-                                transport.send(Message::Routed {
+                                let cancel_frame = Message::Routed {
                                     envelope,
                                     inner: Box::new(Message::Cancel {
                                         command_id: format!("cancel-{dispatch_id}"),
                                         dispatch_id: dispatch_id.clone(),
                                     }),
-                                })
-                                .await
-                                .map_err(|e| format!("cancel: {e}"))?;
+                                };
+                                tokio::select! {
+                                    result = transport.send(cancel_frame) => result.map_err(|e| format!("cancel: {e}"))?,
+                                    _ = registration.cancel.cancelled() => return Ok(()),
+                                    _ = self.shutdown.cancelled() => return Ok(()),
+                                }
                                 if let Some(route) = routings.remove(&dispatch_id) {
                                     completed.push_back((route.envelope, None));
                                     if completed.len() > 256 { completed.pop_front(); }
@@ -481,9 +470,13 @@ impl AgentManager {
                                     if let Some((previous, result_id)) = completed.iter().find(|(previous, _)| previous == &envelope) {
                                         if let (Some(result_id), Message::Result { result_id: id, .. }) = (result_id, &*inner) {
                                             if id == result_id {
-                                                transport.send(Message::Routed { envelope: previous.clone(), inner: Box::new(Message::ResultCommitted {
-                                                    dispatch_id: envelope.dispatch_id.clone().unwrap(), result_id: result_id.clone(),
-                                                })}).await.map_err(|e| e.to_string())?;
+                                                tokio::select! {
+                                                    result = transport.send(Message::Routed { envelope: previous.clone(), inner: Box::new(Message::ResultCommitted {
+                                                        dispatch_id: envelope.dispatch_id.clone().unwrap(), result_id: result_id.clone(),
+                                                    })}) => result.map_err(|e| e.to_string())?,
+                                                    _ = registration.cancel.cancelled() => return Ok(()),
+                                                    _ = self.shutdown.cancelled() => return Ok(()),
+                                                }
                                             }
                                         }
                                         continue;
