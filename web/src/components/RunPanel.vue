@@ -1,25 +1,28 @@
 <script setup lang="ts">
+import { computed } from "vue";
 import { monitor } from "../state/monitor";
+import { editor, flowToDefinition } from "../state/editor";
+import { discoverInputKeys } from "../state/run-input";
 import RunMonitor from "./RunMonitor.vue";
+import WorkflowInputForm from "./WorkflowInputForm.vue";
 import AppButton from "./AppButton.vue";
 
 withDefaults(defineProps<{ layout?: "footer" | "sidebar" }>(), { layout: "footer" });
 defineEmits<{ collapse: []; "toggle-layout": [] }>();
+
+/**
+ * 运行输入表单字段：扫当前画布定义的 input 引用。
+ * 实际运行的是最新已发布版本，与画布有未发布差异时字段可能不完全对齐，
+ * 此时可切 JSON 模式手动补齐。
+ */
+const inputKeys = computed(() => discoverInputKeys(flowToDefinition(), editor.nodeTypes));
 </script>
 
 <template>
   <div class="run-panel" :class="layout">
     <div class="run-panel-head">
       <h3>运行</h3>
-      <textarea
-        v-model="monitor.inputText"
-        class="code run-input"
-        title="运行输入 JSON（可选）"
-        aria-label="运行输入 JSON（可选）"
-        rows="1"
-        spellcheck="false"
-        placeholder='运行输入 JSON（可选），如 {"key": "value"}'
-      ></textarea>
+      <WorkflowInputForm v-model="monitor.inputText" class="run-input" :input-keys="inputKeys" />
       <AppButton
         :title="layout === 'footer' ? '切换为右侧栏' : '切换为底部栏'"
         @click="$emit('toggle-layout')"

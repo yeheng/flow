@@ -3,11 +3,13 @@ import { computed, onMounted, onUnmounted, ref } from "vue";
 import * as api from "../api/flow";
 import { webhookBase } from "../api/flow";
 import { client, errText } from "../rpc/client";
-import { editor, refreshWorkflows } from "../state/editor";
+import { editor, ensureNodeTypes, refreshWorkflows } from "../state/editor";
+import { discoverInputKeys } from "../state/run-input";
 import { confirmDialog } from "../state/modal";
 import { toast } from "../state/toast";
-import type { Schedule, Webhook } from "../types";
+import type { Definition, Schedule, Webhook } from "../types";
 import AppButton from "../components/AppButton.vue";
+import WorkflowInputForm from "../components/WorkflowInputForm.vue";
 
 /** 触发器页：定时调度（schedule.*）+ webhook（webhook.*），作用于单个工作流 */
 const props = defineProps<{ workflowId: string }>();
@@ -29,6 +31,12 @@ const creatingWebhook = ref(false);
 /** 正在启停的行（schedule.id / webhook.token）：只禁用对应按钮 */
 const togglingScheduleId = ref<string | null>(null);
 const togglingWebhookToken = ref<string | null>(null);
+
+/** 输入表单的字段来源：最新版定义 + 节点类型 schema；拿不到时退化为纯 JSON 输入 */
+const definition = ref<Definition | null>(null);
+const inputKeys = computed(() =>
+  definition.value ? discoverInputKeys(definition.value, editor.nodeTypes) : [],
+);
 
 const workflowName = computed(
   () => editor.workflows.find((w) => w.workflow_id === props.workflowId)?.name ?? "",
@@ -176,6 +184,14 @@ const offReconnect = client.onReconnect(() => void refresh());
 onMounted(() => {
   if (editor.workflows.length === 0) void refreshWorkflows();
   void refresh();
+  void (async () => {
+    if (!(await ensureNodeTypes())) return;
+    try {
+      definition.value = (await api.getWorkflow(props.workflowId)).definition;
+    } catch {
+      // 定义拉不到不影响调度管理，输入区退化为纯 JSON 文本域
+    }
+  })();
 });
 
 onUnmounted(() => {
@@ -206,11 +222,11 @@ onUnmounted(() => {
           class="code cron-input"
           placeholder="cron 表达式（分 时 日 月 周），如 */5 * * * *"
         />
-        <textarea
+        <WorkflowInputForm
           v-model="newInput"
-          class="code input-json"
+          :input-keys="inputKeys"
+          :rows="2"
           placeholder='输入 JSON（可选），每次触发作为 run 的 input，如 {"src":"cron"}'
-          rows="2"
         />
         <AppButton variant="primary" type="submit" :disabled="creating || !newCron.trim()">
           新建调度
@@ -346,11 +362,6 @@ onUnmounted(() => {
 .cron-input {
   width: 280px;
   flex-shrink: 0;
-}
-
-.input-json {
-  flex: 1;
-  resize: vertical;
 }
 
 .create-form button {

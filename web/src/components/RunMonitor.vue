@@ -53,6 +53,28 @@ function fmtJsonFull(v: unknown): string {
   return JSON.stringify(v);
 }
 
+/** run 输出默认一行预览，超长时可展开查看全文并复制 */
+const outputExpanded = ref(false);
+const outputText = computed(() => fmtJsonFull(monitor.output));
+const outputLong = computed(() => outputText.value.length > 200);
+const outputPretty = computed(() => {
+  if (monitor.output === undefined || monitor.output === null) return "";
+  return JSON.stringify(monitor.output, null, 2);
+});
+watch(
+  () => monitor.runId,
+  () => (outputExpanded.value = false),
+);
+
+async function copyOutput(): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(outputText.value);
+    toast.info("已复制输出");
+  } catch {
+    toast.error("复制失败");
+  }
+}
+
 async function onCancelRun(): Promise<void> {
   if (!(await confirmDialog("确定取消该运行？", { danger: true }))) return;
   await cancelRun();
@@ -130,7 +152,19 @@ function onOpenChildRun(childRunId: string): void {
       </div>
       <div v-if="monitor.fatalError" class="run-fatal">{{ monitor.fatalError }}</div>
       <div v-if="monitor.output !== undefined" class="run-output">
-        输出：<code>{{ fmtJson(monitor.output) }}</code>
+        <div class="run-output-head">
+          输出
+          <button class="run-output-btn" title="复制完整输出 JSON" @click="copyOutput">复制</button>
+          <button
+            v-if="outputLong"
+            class="run-output-btn"
+            @click="outputExpanded = !outputExpanded"
+          >
+            {{ outputExpanded ? "收起" : "展开全文" }}
+          </button>
+        </div>
+        <pre v-if="outputExpanded && outputLong" class="run-output-full">{{ outputPretty }}</pre>
+        <code v-else>{{ fmtJson(monitor.output) }}</code>
       </div>
 
       <div v-for="n in waitingHumanTasks" :key="n.id" class="signal-box">
@@ -405,6 +439,30 @@ function onOpenChildRun(childRunId: string): void {
 .run-output {
   margin-bottom: 8px;
   word-break: break-all;
+}
+
+.run-output-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 2px;
+}
+
+.run-output-btn {
+  padding: 1px 8px;
+  font-size: 11px;
+}
+
+/* 展开的全文输出：限高内滚动，可全选复制 */
+.run-output-full {
+  margin: 4px 0 0;
+  max-height: 240px;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: text;
 }
 
 .signal-box {
