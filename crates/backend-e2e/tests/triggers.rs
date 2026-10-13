@@ -1,7 +1,7 @@
 //! 触发器端到端：cron 调度（CRUD / next_fire_at / 真触发 / 停用不触发）与
 //! webhook HTTP 入口（全部分支）。
 //!
-//! 契约来源：DESIGN.md §9.2（触发器）。
+//! 契约来源：DESIGN.md §11.5（触发器）。
 
 use backend_e2e::common::fixtures::linear_def;
 use backend_e2e::common::{

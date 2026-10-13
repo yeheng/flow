@@ -85,7 +85,7 @@ async fn spawn_agent(
         }
         let welcome = loop {
             match transport.recv().await {
-                Ok((_, message)) => {
+                Ok(message) => {
                     if let Message::AgentWelcome { .. } = message {
                         break message;
                     }

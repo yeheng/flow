@@ -142,7 +142,7 @@ fn result_conversion_matches_json_stringify() {
 }
 
 /// BigInt 结果精确转回 JSON 整数：脚本内 BigInt 算术不再被 stringify 拒绝，
-/// 也不再静默丢值（DESIGN §10 大整数边界）。
+/// 也不再静默丢值（DESIGN.md §10 大整数边界）。
 #[test]
 fn bigint_results_convert_exactly() {
     let (input, nodes) = ctx();

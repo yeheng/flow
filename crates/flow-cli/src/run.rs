@@ -2,7 +2,7 @@
 //!
 //! 触发（`run start`）与服务端 `run.start` 一对一：CLI 只负责收集参数与
 //! 轮询终态，「published 才能执行」「创建前校验定义」仍由服务端单点裁决
-//! （DESIGN.md §9 的 `resolve_runnable_definition`）。
+//! （DESIGN.md §11 的 `resolve_runnable_definition`）。
 //!
 //! 等待策略是有意的简单：`run.get` 300ms 轮询到终态或超时。订阅流
 //! （`run.subscribe`）能把等待降到事件驱动，但那是服务端推送优化，对 CLI

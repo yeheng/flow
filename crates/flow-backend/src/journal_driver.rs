@@ -471,7 +471,7 @@ async fn advance_committed_node(
     if matches!(record.status, NodeStatus::Succeeded | NodeStatus::Skipped) {
         return Ok(true);
     }
-    // v1 语义（DESIGN §6.6，engine_recovery 钉死）：节点失败不立即终结
+    // v1 语义（DESIGN.md §9.2，engine_recovery 钉死）：节点失败不立即终结
     // run——独立分支继续跑完，失败分支的下游被跳过（reason=upstream_failed），
     // 全部节点终态后由收尾判定写 RunFailed。
     if record.status == NodeStatus::Failed {

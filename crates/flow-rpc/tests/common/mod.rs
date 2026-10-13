@@ -3,8 +3,8 @@
 //!
 //! 进程脚手架统一在这里：`ServerProc` / `free_port` / `wait_ready` / `connect` /
 //! `named` / `call` / `call_err` / `line_def` 这些跨用例共用的东西只此一份
-//! （DESIGN §13：共享夹具不逐文件复制——复制品会各自漂移）。
-//! 就绪判定用 TCP connect 轮询（DESIGN.md §13 的约定）；`connect` 带重试，
+//! （DESIGN.md §14：共享夹具不逐文件复制——复制品会各自漂移）。
+//! 就绪判定用 TCP connect 轮询（DESIGN.md §14 的约定）；`connect` 带重试，
 //! 因为进程刚 bind 上端口时 RPC 路由可能还没装完。
 //!
 //! common 被多个 Journal 测试二进制共享，各自使用不同的辅助函数。

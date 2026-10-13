@@ -40,6 +40,9 @@ axum = "0.8"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 rquickjs = "0.14"
 libc = "0.2"
+getrandom = "0.3"
+interprocess = { version = "2", features = ["tokio"] }
+postcard = { version = "1", features = ["use-std"] }
 tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"

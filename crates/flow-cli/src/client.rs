@@ -2,7 +2,7 @@
 //!
 //! CLI 与服务的**唯一**通道。这里刻意保持「薄」：只做连接、动态方法调用与
 //! 错误归一化，不内置任何业务规则——「published 才能执行」「定义校验」等
-//! 全部留在服务端 single source of truth（DESIGN.md §9），CLI 多一份判断
+//! 全部留在服务端 single source of truth（DESIGN.md §11），CLI 多一份判断
 //! 就会多一处会过时的副本。
 //!
 //! 参数用 `serde_json::Map` 动态拼装（方法面是开放的字符串表，没有编译期
@@ -41,7 +41,7 @@ pub fn object(pairs: Vec<(&str, Value)>) -> Map<String, Value> {
 }
 
 /// 动态调用一个 RPC 方法。params 为空对象时方法仍会收到 `{}`——服务端解析层
-/// 把整体省略（null）与 `{}` 同等对待（DESIGN.md §9），这里统一发对象更直观。
+/// 把整体省略（null）与 `{}` 同等对待（DESIGN.md §11），这里统一发对象更直观。
 pub async fn call(
     client: &WsClient,
     method: &str,

@@ -1,6 +1,6 @@
 # backend-e2e：端到端测试项目（真起 flow-journal-server 进程，journal v2 产品面）。
 #
-# 覆盖策略（DESIGN.md §13 的延伸）：
+# 覆盖策略（DESIGN.md §14 的延伸）：
 # - 每个用例独占一个临时 journal 目录（v2 唯一权威，全新数据集），经真实
 #   wire（进程外 WS + HTTP）钉 v2 协议与物化数据形状；
 # - v1 RPC 面（flow-server）与 Postgres 后端均已删除，无对应测试臂。

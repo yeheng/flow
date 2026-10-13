@@ -127,7 +127,7 @@ fn codec_scenario(name: &str, ops: u64, message: &Message, wire_bytes: u64) {
     let frame = encode_frame(message).expect("encode");
     let mut decoder = FrameDecoder::new();
     decoder.feed(&frame).unwrap();
-    let (_, decoded) = decoder.pop().unwrap().expect("frame");
+    let decoded = decoder.pop().unwrap().expect("frame");
     assert_eq!(decoded, *message, "roundtrip must be semantically equal");
 
     let before = snapshot();
@@ -136,7 +136,7 @@ fn codec_scenario(name: &str, ops: u64, message: &Message, wire_bytes: u64) {
         let frame = encode_frame(message).expect("encode");
         let mut decoder = FrameDecoder::new();
         decoder.feed(&frame).unwrap();
-        let (_, decoded) = decoder.pop().unwrap().expect("frame");
+        let decoded = decoder.pop().unwrap().expect("frame");
         std::hint::black_box(decoded);
     }
     let elapsed = start.elapsed();
@@ -196,7 +196,7 @@ fn transport_throughput(batches: u64) {
         let start = Instant::now();
         let received = {
             let mut count = 0u64;
-            while let Ok((_, message)) = receiver.recv().await {
+            while let Ok(message) = receiver.recv().await {
                 std::hint::black_box(&message);
                 count += 1;
             }
@@ -240,7 +240,7 @@ fn cancel_latency_under_flood() {
         let start = Instant::now();
         let mut saw_cancel = false;
         let mut frames = 0u64;
-        while let Ok((_, message)) = receiver.recv().await {
+        while let Ok(message) = receiver.recv().await {
             frames += 1;
             if matches!(message, Message::Cancel { .. }) {
                 saw_cancel = true;

@@ -1,7 +1,7 @@
 //! sub_workflow 端到端语义：子 run 输出透传、child_run_id、失败传导、
 //! 无发布版本、取消级联、嵌套深度上限。
 //!
-//! 契约来源：DESIGN.md §6.8（子工作流）。
+//! 契约来源：DESIGN.md §8.1（子工作流）。
 
 use backend_e2e::common::fixtures::{
     deep_chain_defs, human_def, linear_def, set_sub_wf, sub_def, timeline_node,

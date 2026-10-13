@@ -429,16 +429,13 @@ impl AgentManager {
         // Hello 之后的尾随帧不会在交接时丢失（帧上限/版本/能力校验不变）。
         let mut transport = FrameTransport::spawn(stream, 128);
         let (agent_boot_id, _build, capabilities, slots) = {
-            let (channel, message) = tokio::time::timeout(
+            let message = tokio::time::timeout(
                 Duration::from_millis(STARTUP_TIMEOUT_MS * 2),
                 transport.recv(),
             )
             .await
             .map_err(|_| "agent hello timeout".to_string())?
             .map_err(|e| format!("read hello: {e}"))?;
-            if channel != flow_engine::execution_protocol::Channel::Control {
-                return Err(format!("expected AgentHello on control, got {channel:?}"));
-            }
             let Message::AgentHello {
                 agent_boot_id,
                 build,
@@ -593,7 +590,7 @@ impl AgentManager {
                     }
                     received = transport.recv() => {
                         liveness = tokio::time::Instant::now();
-                        let (_channel, message) = received.map_err(|e| format!("recv: {e}"))?;
+                        let message = received.map_err(|e| format!("recv: {e}"))?;
                         match message {
                             Message::Routed { envelope, inner } => {
                                 tracing::trace!(kind = inner.type_name(), dispatch = ?envelope.dispatch_id, "agent routed message");

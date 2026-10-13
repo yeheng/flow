@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
 use flow_engine::execution_protocol::contract::{
@@ -41,6 +41,10 @@ pub struct ExecutorHandle {
     /// executor_loop 走完回收（自然完成或被杀）；drain 宽限等待用。
     pub done: Arc<AtomicBool>,
     pub committed: Arc<AtomicBool>,
+    /// 出站帧到达信号：executor_loop 每次 out.send 后 notify_one，
+    /// fair_mux_bridge 空闲时等它而不是固定轮询（新增执行器由 50ms
+    /// 安全网兜底——它尚不在桥的等待集内）。
+    pub notify: Arc<Notify>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -99,6 +103,7 @@ pub async fn bind_executor(
     let lost_data = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
     let committed = Arc::new(AtomicBool::new(false));
+    let notify = Arc::new(Notify::new());
     tokio::spawn(executor_loop(
         dispatch_id.to_string(),
         transport,
@@ -112,6 +117,7 @@ pub async fn bind_executor(
         lost_data.clone(),
         done.clone(),
         committed.clone(),
+        notify.clone(),
     ));
     Ok(ExecutorHandle {
         dispatch_id: dispatch_id.to_string(),
@@ -126,6 +132,7 @@ pub async fn bind_executor(
         lost_data,
         done,
         committed,
+        notify,
     })
 }
 
@@ -146,6 +153,7 @@ async fn executor_loop(
     lost_data: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
     committed: Arc<AtomicBool>,
+    notify: Arc<Notify>,
 ) {
     let mut last_seen = tokio::time::Instant::now();
     let heartbeat_timeout = Duration::from_millis(HEARTBEAT_TIMEOUT_MS);
@@ -181,7 +189,7 @@ async fn executor_loop(
             received = transport.recv() => {
                 last_seen = tokio::time::Instant::now();
                 match received {
-                    Ok((_channel, message)) => {
+                    Ok(message) => {
                         // 执行器心跳不带 dispatch_id（会话级）：补上本派发
                         // 归属，否则上联包装器按「无归属」丢弃，master 永远
                         // 收不到远程活跃证据（长任务会被误判空闲）。
@@ -204,7 +212,7 @@ async fn executor_loop(
                         // 有界出站：满则停止读取（端到端背压，不提前确认）。
                         tokio::select! {
                             _ = cancel.cancelled() => { forced_kill.store(true, Ordering::Relaxed); break; },
-                            sent = out.send(message) => { if sent.is_err() { break; } },
+                            sent = out.send(message) => { if sent.is_err() { break; } notify.notify_one(); },
                         }
                     }
                     Err(_) => {
@@ -227,7 +235,7 @@ async fn executor_loop(
             })
             .await;
         let deadline = tokio::time::Instant::now() + Duration::from_millis(DRAIN_GRACE_MS);
-        while let Ok(Ok((_, message))) = tokio::time::timeout_at(deadline, transport.recv()).await {
+        while let Ok(Ok(message)) = tokio::time::timeout_at(deadline, transport.recv()).await {
             if let Message::Result {
                 result_id,
                 last_audit_seq,
@@ -244,6 +252,7 @@ async fn executor_loop(
             {
                 break;
             }
+            notify.notify_one();
         }
     }
     transport.close();

@@ -1,39 +1,80 @@
-//! 非 unix 平台的执行器 spawn 传输：本地 TCP loopback 单连接回连。
+//! 回连承载：本地 socket（IPC7，替代 v4 的 TCP loopback）。
 //!
 //! socketpair + pre_exec FD 传递是 unix 专属（见 [`super::spawn`]）；其余
-//! 平台用「父进程 bind 127.0.0.1:0 → 经 env 告知子进程 → 子进程单连接
-//! 回连」承载 v4 单流通道（帧头 kind 与 raw blob，见 [`super::frame`]）。
+//! 平台（Windows named pipe）与本模块自身的测试路径用「父进程先建
+//! listener → 经 env 告知子进程名 → 子进程单连接回连」承载单流通道。
+//! 相比 TCP loopback：不占用网络栈、无本机端口抢连窗口（named pipe 按
+//! 对象名寻址，fs socket 按路径寻址）。会话令牌仍保留（spawn 时随机生成
+//! 经 env 注入，Hello 回验，见 [`SESSION_TOKEN_ENV`]）作纵深防御——同机
+//! 其他进程理论上仍可抢连知名对象，令牌把门外汉挡在握手。
 //!
-//! 信任域：回连端口只在本机可见，任何本机进程都可能在毫秒窗口内抢连
-//! （unix 侧靠「exec 前关闭其余继承 FD」的 FD 能力防串配，loopback 没有
-//! 对应机制）。缓解：spawn 时随机生成会话令牌经 env 注入执行器，Hello
-//! 里回验（见 [`SESSION_TOKEN_ENV`]）——抢连者拿不到该值。同 uid 进程
-//! 理论上可读 /proc/<pid>/environ，但同 uid 等于已完全失陷；不同 uid 的
-//! 本地进程被令牌挡在门外。
+//! 名字按平台选择：Windows 用 namespaced（named pipe 名）；unix 用文件
+//! 系统 socket 路径（仅测试/回退路径——生产 unix 本地执行走 socketpair，
+//! 不经过本模块）。承载类型与名字类型由 interprocess 统一。
 
 use std::time::Duration;
 
-use tokio::net::{TcpListener, TcpStream};
+use interprocess::local_socket::tokio::Stream;
+use interprocess::local_socket::traits::tokio::{Listener as _, Stream as _};
+use interprocess::local_socket::ListenerOptions;
 use tokio::process::{Child, Command};
 
 use super::contract::{ExecutorInvocation, SESSION_TOKEN_ENV, STARTUP_TIMEOUT_MS};
 
 /// 主进程告知执行器回连地址的环境变量（仅 spawn 时由父进程注入；执行器
-/// env_clear 后仍可见）。
+/// env_clear 后仍可见）。值在 Windows 是 named pipe 名，unix 是 socket 路径。
 pub const CONNECT_ADDR_ENV: &str = "FLOW_EXECUTOR_CONNECT_ADDR";
+
+/// 一次性回连名：Windows named pipe（namespaced），unix 文件系统 socket
+/// 路径。随机后缀防撞名/抢注。
+fn fresh_local_name() -> String {
+    let unique = super::transport::fresh_boot_id();
+    if cfg!(windows) {
+        format!("flow-executor-{unique}")
+    } else {
+        std::env::temp_dir()
+            .join(format!("flow-executor-{unique}.sock"))
+            .display()
+            .to_string()
+    }
+}
+
+/// 把回连地址（env 值）解析为本平台本地 socket 名。
+fn parse_local_name(addr: &str) -> std::io::Result<interprocess::local_socket::Name<'_>> {
+    #[cfg(windows)]
+    {
+        use interprocess::local_socket::{GenericNamespaced, ToNsName};
+        addr.to_ns_name::<GenericNamespaced>()
+    }
+    #[cfg(unix)]
+    {
+        use interprocess::local_socket::{GenericFilePath, ToFsName};
+        addr.to_fs_name::<GenericFilePath>()
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = addr;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no local socket backend on this platform",
+        ))
+    }
+}
 
 /// spawn 一个执行器进程并等它回连出单通道。返回 (通道, 子进程句柄)。
 ///
 /// 与 [`super::spawn::spawn_executor_process`] 同一套环境隔离规则：
-/// env_clear 后只回填 RUST_LOG、回连地址与随机会话令牌；stdout/stderr 不
+/// env_clear 后只回填 RUST_LOG、回连名与会话令牌；stdout/stderr 不
 /// 携带协议帧。
 pub async fn spawn_executor_loopback(
     executor: &ExecutorInvocation,
     tag: Option<&str>,
     session_token: String,
-) -> std::io::Result<(TcpStream, Child)> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
+) -> std::io::Result<(Stream, Child)> {
+    let addr = fresh_local_name();
+    let listener = ListenerOptions::new()
+        .name(parse_local_name(&addr)?)
+        .create_tokio()?;
     let mut command = Command::new(&executor.program);
     command.args(&executor.prefix);
     if let Some(tag) = tag {
@@ -48,17 +89,14 @@ pub async fn spawn_executor_loopback(
     if let Some(log) = std::env::var_os("RUST_LOG") {
         command.env("RUST_LOG", log);
     }
-    command.env(CONNECT_ADDR_ENV, addr.to_string());
+    command.env(CONNECT_ADDR_ENV, &addr);
     command.env(SESSION_TOKEN_ENV, &session_token);
     let mut child = command.spawn()?;
     // 单连接即整条会话；执行器起不来（缺二进制/秒退）时靠超时收口。
-    let accept = async { listener.accept().await.map(|(stream, _)| stream) };
+    let accept = async { listener.accept().await };
     let channel = tokio::time::timeout(Duration::from_millis(STARTUP_TIMEOUT_MS), accept).await;
     match channel {
-        Ok(Ok(stream)) => {
-            stream.set_nodelay(true)?;
-            Ok((stream, child))
-        }
+        Ok(Ok(stream)) => Ok((stream, child)),
         Ok(Err(error)) => {
             let _ = child.start_kill();
             Err(error)
@@ -74,10 +112,8 @@ pub async fn spawn_executor_loopback(
 }
 
 /// 执行器侧：按 [`CONNECT_ADDR_ENV`] 指示的地址回连主进程（单连接）。
-pub async fn connect_loopback(addr: &str) -> std::io::Result<TcpStream> {
-    let stream = TcpStream::connect(addr).await?;
-    stream.set_nodelay(true)?;
-    Ok(stream)
+pub async fn connect_loopback(addr: &str) -> std::io::Result<Stream> {
+    Stream::connect(parse_local_name(addr)?).await
 }
 
 #[cfg(test)]
@@ -139,16 +175,17 @@ mod tests {
     }
 
     /// T10：回连承载的 env_clear 隔离（父进程无关变量不泄漏；回连地址注入）。
+    /// 子进程用 python 的 AF_UNIX socket 回连（回连名是 fs socket 路径）。
     #[cfg(unix)]
     #[test]
     fn loopback_child_env_is_cleared() {
-        let dir = std::env::temp_dir().join(format!("flow-loop-{}", uuid::Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!("flow-loop-{}", fresh_local_name()));
         std::fs::create_dir_all(&dir).unwrap();
         let env_dump = dir.join("env.txt");
         let exec = script(
             &dir,
             &format!(
-                "env > {dump}\nexec python3 -c 'import os,socket; a=os.environ[\"{env}\"]; h,p=a.rsplit(\":\",1); s=socket.create_connection((h,int(p))); s.sendall(b\"ping\"); s.close()'",
+                "env > {dump}\nexec python3 -c 'import os,socket; a=os.environ[\"{env}\"]; s=socket.socket(socket.AF_UNIX); s.connect(a); s.sendall(b\"ping\"); s.close()'",
                 dump = env_dump.display(),
                 env = CONNECT_ADDR_ENV,
             ),
@@ -203,7 +240,7 @@ mod tests {
         });
         #[cfg(unix)]
         {
-            let dir = std::env::temp_dir().join(format!("flow-loop-{}", uuid::Uuid::now_v7()));
+            let dir = std::env::temp_dir().join(format!("flow-loop-{}", fresh_local_name()));
             std::fs::create_dir_all(&dir).unwrap();
             let exec = script(&dir, "exit 1");
             let invocation = super::super::contract::ExecutorInvocation::explicit(exec);

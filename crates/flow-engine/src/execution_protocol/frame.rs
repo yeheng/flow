@@ -1,43 +1,48 @@
-//! 物理帧编解码（v4 单流，T12）。
+//! 物理帧编解码（v5 postcard，IPC8）。
 //!
-//! 唯一帧格式：`u32 body_len | u8 kind | u32 meta_len | JSON meta | raw blob`。
-//! `body_len` 计 kind + meta_len + meta + blob（不含 4 字节长度头）。带二进制
-//! 体的类型（`TransferChunk`）的载荷作为 raw blob 承载；其余类型 kind=0、
-//! meta 即完整 JSON 信封。一条流内的帧序即双方提交序。
+//! 唯一帧格式：`u32 body_len | postcard(Message)`。变体索引即帧类型；
+//! TransferChunk 的字节由 postcard 原生承载（len varint + 原始字节，无
+//! base64、无 JSON meta 与 blob 的拼接）。一条流内的帧序即双方提交序。
 //!
-//! 读端处理半帧/粘帧：长度头一到就校验上限（分配前拒绝非法长度），并按
-//! 消息通道复核 control/data 预算。
+//! 读端处理半帧/粘帧：长度头一到就校验上限（分配任何载荷缓冲前拒绝非法
+//! 长度），解码后按消息类型复核 control/data 预算，并要求 postcard 恰好
+//! 消费完整个帧体（尾随字节 = 协议错误，防帧内走私）。
+//!
+//! 对抗性输入（v5 验收项）：postcard 对 String/bytes 的长度声明先做
+//! 边界检查再取字节、对超出的 seq 长度声明抑制 size_hint——巨型声明
+//! 在小帧内立即报错，不会先按声明分配（见 message.rs 的对应测试）。
 
 use super::contract::{CONTROL_MAX_FRAME, DATA_MAX_FRAME};
-use super::message::{Channel, Message, ProtocolError};
+use super::message::{Message, ProtocolError};
 
 /// 长度头字节数（`u32 body_len`）。
 pub const FRAME_LENGTH_BYTES: usize = 4;
-/// kind(1) + meta_len(4)。
-const KIND_META_HEADER: usize = 5;
 
-/// 单流帧编码：kind/meta 由消息声明，raw blob 承载二进制体。
-pub fn encode_frame(message: &Message) -> Result<Vec<u8>, ProtocolError> {
-    let (kind_byte, meta, blob) = message.to_frame_parts()?;
-    let body_len = KIND_META_HEADER + meta.len() + blob.len();
-    let limit = frame_limit(message.channel());
-    if body_len > limit {
-        return Err(ProtocolError::FrameTooLarge(body_len, limit));
+/// 消息级帧预算：大载荷类型（data 语义）放宽到 DATA_MAX_FRAME，其余
+/// （control 语义）收紧到 CONTROL_MAX_FRAME——分类只服务预算上限，
+/// v4 的通道概念已随单流化删除。
+fn frame_limit(message: &Message) -> usize {
+    match message {
+        Message::TransferChunk { .. }
+        | Message::ObservabilityBatch { .. }
+        | Message::AuditBatch { .. }
+        | Message::Routed { .. } => DATA_MAX_FRAME,
+        _ => CONTROL_MAX_FRAME,
     }
-    let mut frame = Vec::with_capacity(FRAME_LENGTH_BYTES + body_len);
-    frame.extend_from_slice(&(body_len as u32).to_be_bytes());
-    frame.push(kind_byte);
-    frame.extend_from_slice(&(meta.len() as u32).to_be_bytes());
-    frame.extend_from_slice(&meta);
-    frame.extend_from_slice(&blob);
-    Ok(frame)
 }
 
-pub(crate) fn frame_limit(channel: Channel) -> usize {
-    match channel {
-        Channel::Control => CONTROL_MAX_FRAME,
-        Channel::Data => DATA_MAX_FRAME,
+/// 单流帧编码：`u32 body_len | postcard(Message)`。
+pub fn encode_frame(message: &Message) -> Result<Vec<u8>, ProtocolError> {
+    let body = postcard::to_allocvec(message)
+        .map_err(|e| ProtocolError::Malformed(format!("postcard: {e}")))?;
+    let limit = frame_limit(message);
+    if body.len() > limit {
+        return Err(ProtocolError::FrameTooLarge(body.len(), limit));
     }
+    let mut frame = Vec::with_capacity(FRAME_LENGTH_BYTES + body.len());
+    frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&body);
+    Ok(frame)
 }
 
 /// 流式帧解码器：喂入任意切分的字节，弹出完整消息。
@@ -65,7 +70,8 @@ impl FrameDecoder {
         self.buffer.extend_from_slice(bytes);
         if self.buffer.len() >= FRAME_LENGTH_BYTES {
             let body_len = self.head_length();
-            if !(KIND_META_HEADER..=DATA_MAX_FRAME).contains(&body_len) {
+            // 最小合法体 = 单个变体索引字节（如 Ready）。
+            if !(1..=DATA_MAX_FRAME).contains(&body_len) {
                 return Err(ProtocolError::FrameTooLarge(body_len, DATA_MAX_FRAME));
             }
         }
@@ -85,51 +91,40 @@ impl FrameDecoder {
         ]) as usize
     }
 
-    /// 弹出一个完整消息（含通道）；无完整帧返回 None。帧在缓冲内原地
-    /// 解析（不复制帧体），仅在帧完整且校验通过后才从缓冲摘除。
-    pub fn pop(&mut self) -> Result<Option<(Channel, Message)>, ProtocolError> {
+    /// 弹出一个完整消息；无完整帧返回 None。解码在缓冲内进行，仅在
+    /// 帧完整、postcard 恰好消费完帧体且预算通过后才从缓冲摘除。
+    pub fn pop(&mut self) -> Result<Option<Message>, ProtocolError> {
         if self.buffer.len() < FRAME_LENGTH_BYTES {
             return Ok(None);
         }
         let body_len = self.head_length();
-        if !(KIND_META_HEADER..=DATA_MAX_FRAME).contains(&body_len) {
+        if !(1..=DATA_MAX_FRAME).contains(&body_len) {
             return Err(ProtocolError::FrameTooLarge(body_len, DATA_MAX_FRAME));
         }
         let total = FRAME_LENGTH_BYTES + body_len;
         if self.buffer.len() < total {
             return Ok(None);
         }
-        let kind_byte = self.buffer[FRAME_LENGTH_BYTES];
-        let meta_len = u32::from_be_bytes([
-            self.buffer[FRAME_LENGTH_BYTES + 1],
-            self.buffer[FRAME_LENGTH_BYTES + 2],
-            self.buffer[FRAME_LENGTH_BYTES + 3],
-            self.buffer[FRAME_LENGTH_BYTES + 4],
-        ]) as usize;
-        // meta 必须完整落在本帧 body 内（body_len 已含 kind+meta_len+meta+blob）。
-        if meta_len > body_len - KIND_META_HEADER {
+        let body = &self.buffer[FRAME_LENGTH_BYTES..total];
+        let (message, rest) = postcard::take_from_bytes::<Message>(body)
+            .map_err(|e| ProtocolError::Malformed(format!("postcard: {e}")))?;
+        if !rest.is_empty() {
             return Err(ProtocolError::Malformed(
-                "frame meta length exceeds body".into(),
+                "frame body has trailing bytes".into(),
             ));
         }
-        let meta_start = FRAME_LENGTH_BYTES + KIND_META_HEADER;
-        let meta = &self.buffer[meta_start..meta_start + meta_len];
-        let blob = &self.buffer[meta_start + meta_len..total];
-        let message = Message::from_frame_parts(kind_byte, meta, blob)?;
-        // 通道预算复核（control 收紧到 CONTROL_MAX_FRAME）。
-        let limit = frame_limit(message.channel());
+        let limit = frame_limit(&message);
         if body_len > limit {
             return Err(ProtocolError::FrameTooLarge(body_len, limit));
         }
         self.buffer.drain(..total);
-        Ok(Some((message.channel(), message)))
+        Ok(Some(message))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::fixtures;
-    use super::super::message::KIND_JSON;
     use super::*;
 
     #[test]
@@ -140,8 +135,7 @@ mod tests {
             // 半帧 + 粘帧喂入
             decoder.feed(&frame[..3]).unwrap();
             decoder.feed(&frame[3..]).unwrap();
-            let (channel, decoded) = decoder.pop().expect("pop").expect("frame");
-            assert_eq!(channel, message.channel());
+            let decoded = decoder.pop().expect("pop").expect("frame");
             assert_eq!(decoded, message);
         }
     }
@@ -156,28 +150,27 @@ mod tests {
             digest: "digest".into(),
         };
         let frame = encode_frame(&message).unwrap();
-        // 原始字节作为 blob 直接出现（无 base64 膨胀）。
+        // 原始字节作为 body 直邻出现（无 base64 膨胀）。
         assert!(frame.windows(5).any(|w| w == [0u8, 255, 1, 2, 3]));
         let mut decoder = FrameDecoder::new();
         decoder.feed(&frame).unwrap();
-        let (_, decoded) = decoder.pop().unwrap().unwrap();
+        let decoded = decoder.pop().unwrap().unwrap();
         assert_eq!(decoded, message);
     }
 
+    /// 远程中继：Routed 内层 TransferChunk 的字节同样原样承载（嵌套枚举
+    /// 序列化，无 v4 的专用帧 kind 与 meta 拼接）。
     #[test]
     fn routed_transfer_chunk_carries_raw_bytes() {
-        // 远程中继：Routed 内层 TransferChunk 也必须走 raw（帧内 blob），
-        // 不经 JSON / base64。
-        use super::super::message::Message as M;
         use super::super::remote::RouteEnvelope;
-        let inner = M::TransferChunk {
+        let inner = Message::TransferChunk {
             dispatch_id: "d".into(),
             transfer_id: "in:op".into(),
             offset: 0,
             bytes: vec![7u8; 4096],
             digest: "digest".into(),
         };
-        let message = M::Routed {
+        let message = Message::Routed {
             envelope: RouteEnvelope {
                 agent_id: "a".into(),
                 agent_boot_id: "b".into(),
@@ -189,125 +182,21 @@ mod tests {
             inner: Box::new(inner),
         };
         let frame = encode_frame(&message).unwrap();
-        // 大块 raw 直接出现（无 base64 膨胀；4096 个 0x07 连续）。
         assert!(frame.windows(64).any(|w| w.iter().all(|b| *b == 7)));
         let mut decoder = FrameDecoder::new();
         decoder.feed(&frame).unwrap();
-        let (_, decoded) = decoder.pop().unwrap().unwrap();
+        let decoded = decoder.pop().unwrap().unwrap();
         assert_eq!(decoded, message);
     }
 
+    /// v5 对抗性验收：损坏帧必须明确拒绝（不静默、不崩溃、不先分配）。
     #[test]
-    fn json_frame_with_blob_is_rejected() {
-        // kind=0 帧携带非空 raw blob：blob 会被静默丢弃（v4 前），必须拒绝。
-        let mut frame = Vec::new();
-        let meta = serde_json::to_vec(&serde_json::json!({"v": 4, "type": "Ready"})).unwrap();
-        let body_len = KIND_META_HEADER + meta.len() + 4;
-        frame.extend_from_slice(&(body_len as u32).to_be_bytes());
-        frame.push(KIND_JSON);
-        frame.extend_from_slice(&(meta.len() as u32).to_be_bytes());
-        frame.extend_from_slice(&meta);
-        frame.extend_from_slice(b"junk");
-        let mut decoder = FrameDecoder::new();
-        decoder.feed(&frame).unwrap();
-        assert!(
-            decoder.pop().is_err(),
-            "JSON frame carrying a blob must be rejected"
-        );
-    }
-
-    #[test]
-    fn routed_transfer_meta_must_be_self_consistent() {
-        // kind=2 的外层 meta / body.envelope / 内层三处 dispatch_id 不一致
-        // 时必须拒绝（路由键与载荷归属不得分离）。
-        use super::super::message::Message as M;
-        use super::super::remote::RouteEnvelope;
-        let inner = M::TransferChunk {
-            dispatch_id: "d".into(),
-            transfer_id: "t".into(),
-            offset: 0,
-            bytes: vec![1u8, 2, 3],
-            digest: "digest".into(),
-        };
-        let good = M::Routed {
-            envelope: RouteEnvelope {
-                agent_id: "a".into(),
-                agent_boot_id: "b".into(),
-                link_session_id: "l".into(),
-                executor_id: "e".into(),
-                executor_boot_id: "eb".into(),
-                dispatch_id: Some("d".into()),
-            },
-            inner: Box::new(inner),
-        };
-        // 篡改外层 meta 的 dispatch_id（与内层错位）。
-        let (kind_byte, meta, blob) = good.to_frame_parts().unwrap();
-        assert_eq!(kind_byte, super::super::message::KIND_ROUTED_TRANSFER_CHUNK);
-        let mut value: serde_json::Value = serde_json::from_slice(&meta).unwrap();
-        value["dispatch_id"] = serde_json::json!("other");
-        let tampered = serde_json::to_vec(&value).unwrap();
-        assert!(M::from_frame_parts(kind_byte, &tampered, &blob).is_err());
-        // 篡改 body.envelope.dispatch_id。
-        let mut value: serde_json::Value = serde_json::from_slice(&meta).unwrap();
-        value["body"]["envelope"]["dispatch_id"] = serde_json::json!("other");
-        let tampered = serde_json::to_vec(&value).unwrap();
-        assert!(M::from_frame_parts(kind_byte, &tampered, &blob).is_err());
-        // 未篡改：往返成立。
-        assert_eq!(M::from_frame_parts(kind_byte, &meta, &blob).unwrap(), good);
-    }
-
-    #[test]
-    fn rejects_unknown_kind_and_bad_meta_length() {
-        // 未知 kind 字节。
-        let mut frame = Vec::new();
-        let meta = b"{}";
-        let body_len = KIND_META_HEADER + meta.len();
-        frame.extend_from_slice(&(body_len as u32).to_be_bytes());
-        frame.push(99u8);
-        frame.extend_from_slice(&(meta.len() as u32).to_be_bytes());
-        frame.extend_from_slice(meta);
-        let mut decoder = FrameDecoder::new();
-        decoder.feed(&frame).unwrap();
-        assert!(decoder.pop().is_err(), "unknown kind must be rejected");
-
-        // meta_len 超出帧边界。
-        let mut frame = Vec::new();
-        let body_len = KIND_META_HEADER; // 声明没有 meta
-        frame.extend_from_slice(&(body_len as u32).to_be_bytes());
-        frame.push(KIND_JSON);
-        frame.extend_from_slice(&(9999u32).to_be_bytes());
-        let mut decoder = FrameDecoder::new();
-        decoder.feed(&frame).unwrap();
-        assert!(decoder.pop().is_err(), "meta overflow must be rejected");
-    }
-
-    #[test]
-    fn rejects_malformed_envelopes() {
-        for bad in fixtures::malformed_envelopes() {
-            let json = serde_json::to_vec(&bad).unwrap();
-            let mut frame = Vec::new();
-            let body_len = KIND_META_HEADER + json.len();
-            frame.extend_from_slice(&(body_len as u32).to_be_bytes());
-            frame.push(KIND_JSON);
-            frame.extend_from_slice(&(json.len() as u32).to_be_bytes());
-            frame.extend_from_slice(&json);
+    fn corrupt_frames_are_rejected() {
+        for frame in fixtures::corrupt_frames() {
             let mut decoder = FrameDecoder::new();
             decoder.feed(&frame).unwrap();
-            assert!(
-                decoder.pop().is_err(),
-                "malformed envelope must be rejected: {bad}"
-            );
+            assert!(decoder.pop().is_err(), "损坏帧必须被拒绝: {frame:02x?}");
         }
-        let unknown = serde_json::to_vec(&fixtures::unknown_type_envelope()).unwrap();
-        let mut frame = Vec::new();
-        let body_len = KIND_META_HEADER + unknown.len();
-        frame.extend_from_slice(&(body_len as u32).to_be_bytes());
-        frame.push(KIND_JSON);
-        frame.extend_from_slice(&(unknown.len() as u32).to_be_bytes());
-        frame.extend_from_slice(&unknown);
-        let mut decoder = FrameDecoder::new();
-        decoder.feed(&frame).unwrap();
-        assert!(decoder.pop().is_err());
     }
 
     #[test]
@@ -318,8 +207,8 @@ mod tests {
         // 粘帧：两帧一次喂入 → 依次弹出。
         let mut decoder = FrameDecoder::new();
         decoder.feed(&[a.clone(), b.clone()].concat()).unwrap();
-        let (_, first) = decoder.pop().unwrap().unwrap();
-        let (_, second) = decoder.pop().unwrap().unwrap();
+        let first = decoder.pop().unwrap().unwrap();
+        let second = decoder.pop().unwrap().unwrap();
         assert_eq!(first, messages[0]);
         assert_eq!(second, messages[1]);
         // 半帧：逐字节喂入也能重组。
@@ -327,7 +216,47 @@ mod tests {
         for byte in &a {
             decoder.feed(std::slice::from_ref(byte)).unwrap();
         }
-        let (_, decoded) = decoder.pop().unwrap().unwrap();
+        let decoded = decoder.pop().unwrap().unwrap();
         assert_eq!(decoded, messages[0]);
+    }
+
+    /// 帧内走私：合法消息后附加任意字节（帧长含垃圾）必须拒绝。
+    #[test]
+    fn trailing_bytes_inside_frame_rejected() {
+        let mut frame = encode_frame(&Message::Ready).unwrap();
+        frame.extend_from_slice(b"junk");
+        let body_len = (frame.len() - FRAME_LENGTH_BYTES) as u32;
+        frame[..FRAME_LENGTH_BYTES].copy_from_slice(&body_len.to_be_bytes());
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&frame).unwrap();
+        let error = decoder.pop().unwrap_err();
+        assert!(error.to_string().contains("trailing"), "{error}");
+    }
+
+    /// 控制帧预算复核：data 语义消息按 CONTROL_MAX_FRAME 编码会被拒。
+    #[test]
+    fn control_budget_enforced_by_message_type() {
+        // 大 AuditBatch（data 语义）在 DATA_MAX_FRAME 内放行；
+        // 它塞进 Routed 也仍是 data 语义；Ready 是 control 语义但天然小。
+        let big = Message::TransferChunk {
+            dispatch_id: "d".into(),
+            transfer_id: "t".into(),
+            offset: 0,
+            bytes: vec![1u8; 256 * 1024],
+            digest: String::new(),
+        };
+        assert!(encode_frame(&big).is_ok());
+        // 构造一个 control 语义超限消息：Hello.capabilities 巨大。
+        let fat = Message::Hello {
+            version: super::super::contract::PROTOCOL_VERSION,
+            boot_id: "b".into(),
+            build: "x".into(),
+            capabilities: vec!["c".repeat(200 * 1024); 1],
+            session_token: None,
+        };
+        assert!(matches!(
+            encode_frame(&fat),
+            Err(ProtocolError::FrameTooLarge(_, CONTROL_MAX_FRAME))
+        ));
     }
 }

@@ -23,7 +23,7 @@ use tokio::process::Command;
 const CLI_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 一个独占临时目录，Drop 时整体删除。
-/// 只删自己建的目录，不碰系统临时目录本身（DESIGN.md §13）。
+/// 只删自己建的目录，不碰系统临时目录本身（DESIGN.md §14）。
 ///
 /// 进程内的 flow-journal-server（随机端口）。持有 handle 即持有服务实例。
 struct TestServer {

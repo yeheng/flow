@@ -1,6 +1,6 @@
 //! 工作流定义生命周期：create / update / publish / get / list / delete / versions。
 //!
-//! 契约来源：DESIGN.md §5（定义模型与校验）、§8（存储约束）、§9（RPC 方法表）。
+//! 契约来源：DESIGN.md §8.2（定义模型与校验）、§3.6（存储约束）、§11.1（RPC 方法表）。
 
 use backend_e2e::common::fixtures::linear_def;
 use backend_e2e::common::{

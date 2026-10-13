@@ -1,10 +1,10 @@
-//! 传输边界与会话校验（v4 单流）。
+//! 传输边界与会话校验（v5 postcard 单流）。
 //!
-//! 唯一承载形态：`spawn` 在一条双向流上复用 control 与 data（帧头 kind 字节
-//! 与 raw blob，见 [`super::frame`]）。单写任务保证帧按提交序串行发出——
-//! Execute 先于其 TransferChunk、RequestOperation 晚于其请求块，跨通道乱序
-//! 在物理上不存在，双方无需重组暂存。执行器本地 IPC 与 agent 上联同用本
-//! 类型；v2 双物理流承载已随 v3 删除。
+//! 唯一承载形态：`spawn` 在一条双向流上复用全部消息（帧 = `u32 body_len |
+//! postcard(Message)`，见 [`super::frame`]）。单写任务保证帧按提交序串行
+//! 发出——Execute 先于其 TransferChunk、RequestOperation 晚于其请求块，
+//! 跨通道乱序在物理上不存在，双方无需重组暂存。执行器本地 IPC 与 agent
+//! 上联同用本类型。
 //!
 //! 每条连接一个串行帧写入器（单写任务按序写帧，避免并发写导致帧交错），
 //! 读任务独立于节点执行持续运行（主进程不能等节点执行返回才读取审计）。
@@ -17,18 +17,16 @@ use super::contract::{
     PROTOCOL_VERSION, REQUIRED_CAPABILITIES, W_BYTES,
 };
 use super::frame::{encode_frame, FrameDecoder};
-use super::message::{Channel, Message, ProtocolError};
+use super::message::{Message, ProtocolError};
 
 /// 一条通道的读任务产物。`Frame` 装箱：`Message` 最大变体携带完整
 /// `ExecuteTask`（数百字节），装箱后事件枚举与队列槽位收缩到指针大小——
 /// I/O 事件量等于消息流量，不装箱等于每帧复制整个 payload。
-/// `Failed`/`Eof` 只经 recv 消费，构造态字段本身不被读；allow 随装箱后
-/// 变体差异收窄仍保留（错误码分支保持不变）。
 #[allow(dead_code)]
 enum IoEvent {
-    Frame(Channel, Box<Message>),
-    Failed(Channel, ProtocolError),
-    Eof(Channel),
+    Frame(Box<Message>),
+    Failed(ProtocolError),
+    Eof,
 }
 
 /// 消息级传输端点：业务层唯一的收/发/关闭边界。
@@ -36,8 +34,7 @@ pub struct FrameTransport {
     incoming: mpsc::Receiver<IoEvent>,
     pending_error: Option<ProtocolError>,
     ended: bool,
-    control_out: mpsc::Sender<Message>,
-    data_out: mpsc::Sender<Message>,
+    outbound: mpsc::Sender<Message>,
     io: IoHandle,
 }
 
@@ -83,15 +80,14 @@ impl SessionState {
 }
 
 impl FrameTransport {
-    /// 单流承载（v4）：`u32 body_len | u8 kind | u32 meta_len | JSON meta |
-    /// raw`；只有带二进制体的类型走 raw。控制与数据共用一条发送队列，
+    /// 单流承载（v5）：`u32 body_len | postcard(Message)`；发送队列一条，
     /// 帧序即提交序。
     pub fn spawn<S>(stream: S, queue_depth: usize) -> Self
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let (event_tx, incoming) = mpsc::channel(queue_depth.max(8));
-        let (outbound_tx, outbound_rx) = mpsc::channel::<Message>(queue_depth.max(8));
+        let (outbound, outbound_rx) = mpsc::channel::<Message>(queue_depth.max(8));
         let state = std::sync::Arc::new(SessionState {
             broken: std::sync::atomic::AtomicBool::new(false),
             error: parking_lot::Mutex::new(None),
@@ -100,8 +96,8 @@ impl FrameTransport {
         });
         let (read_half, write_half) = tokio::io::split(stream);
         let read_half: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>> = Box::pin(read_half);
-        let reader = tokio::spawn(read_loop_tagged(read_half, event_tx.clone(), state.clone()));
-        let writer = tokio::spawn(write_loop_tagged(
+        let reader = tokio::spawn(read_loop(read_half, event_tx.clone(), state.clone()));
+        let writer = tokio::spawn(write_loop(
             Box::pin(write_half) as std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>,
             outbound_rx,
             state.clone(),
@@ -111,8 +107,7 @@ impl FrameTransport {
             incoming,
             pending_error: None,
             ended: false,
-            control_out: outbound_tx.clone(),
-            data_out: outbound_tx,
+            outbound,
             io: IoHandle {
                 readers: vec![reader],
                 writers: vec![writer],
@@ -121,9 +116,8 @@ impl FrameTransport {
         }
     }
 
-    /// 发送一条消息（自动路由到其声明通道；通道不符即协议错误）。
-    /// 会话故障（读写任一失败/close）后阻塞中的发送也会被释放：写任务退出
-    /// 丢弃出站队列，等待中的 send 以 Closed 返回。
+    /// 发送一条消息。会话故障（读写任一失败/close）后阻塞中的发送也会被
+    /// 释放：写任务退出丢弃出站队列，等待中的 send 以 Closed 返回。
     pub async fn send(&self, message: Message) -> Result<(), ProtocolError> {
         if self
             .io
@@ -133,24 +127,16 @@ impl FrameTransport {
         {
             return Err(ProtocolError::Closed);
         }
-        match message.channel() {
-            Channel::Control => self
-                .control_out
-                .send(message)
-                .await
-                .map_err(|_| ProtocolError::Closed),
-            Channel::Data => self
-                .data_out
-                .send(message)
-                .await
-                .map_err(|_| ProtocolError::Closed),
-        }
+        self.outbound
+            .send(message)
+            .await
+            .map_err(|_| ProtocolError::Closed)
     }
 
-    /// 接收下一条消息。任一通道 EOF/错误时返回 [`ProtocolError::Closed`]；
-    /// 协议帧错误（非法长度/未知类型/畸形信封）先返回错误，随后通道关闭。
+    /// 接收下一条消息。EOF/错误时返回 [`ProtocolError::Closed`]；
+    /// 协议帧错误（非法长度/损坏 postcard 体）先返回错误，随后通道关闭。
     /// 写任务失败时没有读事件可等：失败信号直达（已排队的帧先于错误交付）。
-    pub async fn recv(&mut self) -> Result<(Channel, Message), ProtocolError> {
+    pub async fn recv(&mut self) -> Result<Message, ProtocolError> {
         if let Some(error) = self.pending_error.take() {
             return Err(error);
         }
@@ -172,12 +158,12 @@ impl FrameTransport {
             }
         };
         match event {
-            Some(IoEvent::Frame(channel, message)) => Ok((channel, *message)),
-            Some(IoEvent::Failed(_, error)) => {
+            Some(IoEvent::Frame(message)) => Ok(*message),
+            Some(IoEvent::Failed(error)) => {
                 self.ended = true;
                 Err(error)
             }
-            Some(IoEvent::Eof(_)) | None => {
+            Some(IoEvent::Eof) | None => {
                 self.ended = true;
                 // 通道关闭（读/写任务退出）可能先于失败通知被 poll：
                 // 已记录的真实错误优先于笼统的 Closed。
@@ -202,14 +188,12 @@ impl FrameTransport {
         {
             return Err(ProtocolError::Closed);
         }
-        let sender = match message.channel() {
-            Channel::Control => &self.control_out,
-            Channel::Data => &self.data_out,
-        };
-        sender.try_send(message).map_err(|_| ProtocolError::Closed)
+        self.outbound
+            .try_send(message)
+            .map_err(|_| ProtocolError::Closed)
     }
 
-    /// 非阻塞发送，队列满时原样退回消息（T03 服务循环积压重试用）。
+    /// 非阻塞发送，队列满时原样退回消息（服务循环积压重试用）。
     /// 成功 `Ok(None)`；满 `Ok(Some(message))`（调用方保留重试，不得丢弃）；
     /// 会话已关/写任务已退 `Err(Closed)`。丢弃式调用方用 [`Self::try_send`]。
     pub fn try_send_requeue(&self, message: Message) -> Result<Option<Message>, ProtocolError> {
@@ -221,11 +205,7 @@ impl FrameTransport {
         {
             return Err(ProtocolError::Closed);
         }
-        let sender = match message.channel() {
-            Channel::Control => &self.control_out,
-            Channel::Data => &self.data_out,
-        };
-        match sender.try_send(message) {
+        match self.outbound.try_send(message) {
             Ok(()) => Ok(None),
             Err(tokio::sync::mpsc::error::TrySendError::Full(message)) => Ok(Some(message)),
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(ProtocolError::Closed),
@@ -233,18 +213,18 @@ impl FrameTransport {
     }
 
     /// 尽力先弹出已缓冲帧；无则 None（非阻塞窥视）。
-    pub fn try_recv(&mut self) -> Option<(Channel, Message)> {
+    pub fn try_recv(&mut self) -> Option<Message> {
         if self.ended {
             return None;
         }
         match self.incoming.try_recv() {
-            Ok(IoEvent::Frame(channel, message)) => Some((channel, *message)),
-            Ok(IoEvent::Failed(_, error)) => {
+            Ok(IoEvent::Frame(message)) => Some(*message),
+            Ok(IoEvent::Failed(error)) => {
                 self.ended = true;
                 self.pending_error = Some(error);
                 None
             }
-            Ok(IoEvent::Eof(_)) | Err(mpsc::error::TryRecvError::Disconnected) => {
+            Ok(IoEvent::Eof) | Err(mpsc::error::TryRecvError::Disconnected) => {
                 self.ended = true;
                 self.pending_error = Some(ProtocolError::Closed);
                 None
@@ -255,8 +235,7 @@ impl FrameTransport {
 
     /// Finish queued frames before closing. The deadline also bounds blocked writers.
     pub async fn flush_and_close(mut self, timeout: std::time::Duration) {
-        self.control_out = dead_sender();
-        self.data_out = dead_sender();
+        self.outbound = dead_sender();
         let _ = tokio::time::timeout(timeout, async {
             for writer in &mut self.io.writers {
                 let _ = writer.await;
@@ -275,8 +254,7 @@ impl FrameTransport {
         self.ended = true;
         self.io.state.stop();
         // 丢弃发送端使写任务退出并 shutdown 流；用死通道占位保持类型。
-        self.control_out = dead_sender();
-        self.data_out = dead_sender();
+        self.outbound = dead_sender();
     }
 
     /// 等待全部 I/O 任务退出（关闭后回收）。
@@ -298,9 +276,9 @@ fn dead_sender() -> mpsc::Sender<Message> {
     tx
 }
 
-/// 单流读任务：标签声明通道，且必须与消息类型声明的通道一致（双重校验）。
-/// 会话在别处失败（写任务/close）时由终止信号唤醒退出，不等对端 EOF。
-async fn read_loop_tagged(
+/// 单流读任务：会话在别处失败（写任务/close）时由终止信号唤醒退出，
+/// 不等对端 EOF。
+async fn read_loop(
     stream: impl tokio::io::AsyncRead + Unpin + Send,
     events: mpsc::Sender<IoEvent>,
     state: std::sync::Arc<SessionState>,
@@ -321,33 +299,31 @@ async fn read_loop_tagged(
         };
         match read {
             Ok(0) => {
-                let _ = events.send(IoEvent::Eof(Channel::Control)).await;
+                let _ = events.send(IoEvent::Eof).await;
                 state.stop();
                 return;
             }
             Ok(n) => {
                 if let Err(error) = decoder.feed(&buffer[..n]) {
                     // 错误事实随事件送达（优先于后续排队帧）；会话停止。
-                    let _ = events.send(IoEvent::Failed(Channel::Control, error)).await;
+                    let _ = events.send(IoEvent::Failed(error)).await;
                     state.stop();
                     return;
                 }
                 loop {
-                    // T05：解码器内部借用信封 + 类型化单遍解析（V3）或
-                    // kind/meta/blob 重组（T12 V4）。
                     let popped = match decoder.pop() {
                         Ok(popped) => popped,
                         Err(error) => {
-                            let _ = events.send(IoEvent::Failed(Channel::Control, error)).await;
+                            let _ = events.send(IoEvent::Failed(error)).await;
                             state.stop();
                             return;
                         }
                     };
-                    let Some((channel, message)) = popped else {
+                    let Some(message) = popped else {
                         break;
                     };
                     if events
-                        .send(IoEvent::Frame(channel, Box::new(message)))
+                        .send(IoEvent::Frame(Box::new(message)))
                         .await
                         .is_err()
                     {
@@ -356,9 +332,7 @@ async fn read_loop_tagged(
                 }
             }
             Err(error) => {
-                let _ = events
-                    .send(IoEvent::Failed(Channel::Control, ProtocolError::Io(error)))
-                    .await;
+                let _ = events.send(IoEvent::Failed(ProtocolError::Io(error))).await;
                 // 读失败的错误事实已随事件送达；这里只停会话，不覆盖错误槽。
                 state.stop();
                 return;
@@ -368,9 +342,7 @@ async fn read_loop_tagged(
 }
 
 /// 单流写任务：按提交序串行写帧；观测帧编码失败丢帧计数，其余断线。
-/// 失败事实经 [`SessionState::fail`] 直达 recv（写端没有读事件可投递）；
-/// 出站队列关闭（发送端全部 drop）走正常收尾 shutdown。
-async fn write_loop_tagged(
+async fn write_loop(
     stream: impl tokio::io::AsyncWrite + Unpin + Send,
     queue: mpsc::Receiver<Message>,
     state: std::sync::Arc<SessionState>,
@@ -537,7 +509,8 @@ fn validate_session_token(
 }
 
 /// 主进程侧握手：接收 Hello（校验版本/能力/boot 唯一性/会话令牌），回
-/// Welcome，等待 Ready。任一步失败即明确拒绝，不降级。
+/// Welcome，等待 Ready。任一步失败即明确拒绝，不降级。v5 起版本门集中在
+/// 此处（帧不再自带版本号）。
 pub async fn master_handshake(
     transport: &mut FrameTransport,
     journal_id: &str,
@@ -546,13 +519,14 @@ pub async fn master_handshake(
     session_id: &str,
     expected_session_token: Option<&str>,
 ) -> Result<ExecutorHello, ProtocolError> {
-    let (channel, message) = tokio::time::timeout(
+    let message = tokio::time::timeout(
         std::time::Duration::from_millis(super::contract::STARTUP_TIMEOUT_MS),
         transport.recv(),
     )
     .await
     .map_err(|_| ProtocolError::Malformed("handshake timeout".into()))??;
     let Message::Hello {
+        version,
         boot_id,
         build,
         capabilities,
@@ -560,9 +534,15 @@ pub async fn master_handshake(
     } = message
     else {
         return Err(ProtocolError::Malformed(format!(
-            "expected Hello on control, got {channel:?} first message"
+            "expected Hello as first message, got {}",
+            message.type_name()
         )));
     };
+    if version != PROTOCOL_VERSION {
+        return Err(ProtocolError::Malformed(format!(
+            "protocol version {version} not supported (expected {PROTOCOL_VERSION})"
+        )));
+    }
     validate_identity(&boot_id)?;
     validate_identity(&build)?;
     validate_session_token(session_token.as_deref(), expected_session_token)?;
@@ -575,6 +555,7 @@ pub async fn master_handshake(
     }
     transport
         .send(Message::Welcome {
+            version: PROTOCOL_VERSION,
             journal_id: journal_id.into(),
             master_epoch,
             session_id: session_id.into(),
@@ -585,7 +566,7 @@ pub async fn master_handshake(
             drain_grace_ms: DRAIN_GRACE_MS,
         })
         .await?;
-    let (_, message) = tokio::time::timeout(
+    let message = tokio::time::timeout(
         std::time::Duration::from_millis(super::contract::STARTUP_TIMEOUT_MS),
         transport.recv(),
     )
@@ -604,8 +585,8 @@ pub async fn master_handshake(
     }
 }
 
-/// 执行器侧握手：发 Hello（携带本会话令牌），校验 Welcome 限额 ≤ 本端
-/// 硬上限，回 Ready。
+/// 执行器侧握手：发 Hello（携带本端协议版本与会话令牌），校验 Welcome
+/// 版本与限额 ≤ 本端硬上限，回 Ready。
 pub async fn executor_handshake(
     transport: &mut FrameTransport,
     build: &str,
@@ -614,20 +595,21 @@ pub async fn executor_handshake(
 ) -> Result<(SessionIdentity, NegotiatedLimits), ProtocolError> {
     let boot_id = fresh_boot_id();
     transport
-        .send(Message::Hello {
-            boot_id: boot_id.clone(),
-            build: build.into(),
-            capabilities: capabilities.iter().map(|s| s.to_string()).collect(),
+        .send(Message::hello(
+            boot_id.clone(),
+            build,
+            capabilities.iter().map(|s| s.to_string()).collect(),
             session_token,
-        })
+        ))
         .await?;
-    let (_, message) = tokio::time::timeout(
+    let message = tokio::time::timeout(
         std::time::Duration::from_millis(super::contract::STARTUP_TIMEOUT_MS),
         transport.recv(),
     )
     .await
     .map_err(|_| ProtocolError::Malformed("handshake timeout".into()))??;
     let Message::Welcome {
+        version,
         journal_id,
         master_epoch,
         session_id,
@@ -640,6 +622,11 @@ pub async fn executor_handshake(
     else {
         return Err(ProtocolError::Malformed("expected Welcome".into()));
     };
+    if version != PROTOCOL_VERSION {
+        return Err(ProtocolError::Malformed(format!(
+            "master protocol version {version} not supported (expected {PROTOCOL_VERSION})"
+        )));
+    }
     for identity in [&journal_id, &session_id, &executor_id] {
         validate_identity(identity)?;
     }
@@ -681,42 +668,13 @@ pub struct NegotiatedLimits {
 /// 协议版本常量重导出（握手层比对用）。
 pub const VERSION: u32 = PROTOCOL_VERSION;
 
-/// 生成 16 字节随机 boot_id（hex）。从 getrandom 读；失败时退化为时间+计数
-/// 组合，仍然保证本进程内唯一。
+/// 生成 16 字节随机 boot_id（hex）。getrandom 全平台统一（含 Windows），
+/// 失败即 OS 熵系统故障——立即暴露，不做时间+计数退化：boot_id 的唯一性
+/// 是会话身份与失联判定的事实来源，弱身份比崩溃更糟。
 pub fn fresh_boot_id() -> String {
-    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut bytes = [0u8; 16];
-    #[cfg(unix)]
-    let filled = unsafe {
-        // macOS: getentropy; Linux: getrandom。
-        #[cfg(target_os = "macos")]
-        {
-            libc::getentropy(bytes.as_mut_ptr() as *mut libc::c_void, bytes.len()) == 0
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            libc::getrandom(bytes.as_mut_ptr() as *mut libc::c_void, bytes.len(), 0)
-                == bytes.len() as isize
-        }
-    };
-    #[cfg(not(unix))]
-    let filled = false;
-    if filled {
-        hex_encode(&bytes)
-    } else {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        hex_encode(&nanos.to_be_bytes()) + &hex_encode(&n.to_be_bytes())
-    }
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    getrandom::fill(&mut bytes).expect("os entropy unavailable");
+    hex::encode(bytes)
 }
 
 #[cfg(all(test, unix))]
@@ -827,9 +785,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn single_stream_preserves_submission_order_across_channels() {
-        // 单流承载的契约：跨通道的发送序 = 到达序。Execute（control）先于
-        // 其 TransferChunk（data）提交，接收端必须按此顺序看到。
+    async fn single_stream_preserves_submission_order() {
+        // 单流承载的契约：发送序 = 到达序。Execute（control 语义）先于其
+        // TransferChunk（data 语义）提交，接收端必须按此顺序看到。
         let (a, mut b) = pair().await;
         a.send(Message::Ready).await.unwrap();
         a.send(Message::TransferChunk {
@@ -841,17 +799,16 @@ mod tests {
         })
         .await
         .unwrap();
-        let (channel, message) = b.recv().await.unwrap();
-        assert_eq!(channel, Channel::Control);
+        let message = b.recv().await.unwrap();
         assert_eq!(message.type_name(), "Ready");
-        let (channel, message) = b.recv().await.unwrap();
-        assert_eq!(channel, Channel::Data);
+        let message = b.recv().await.unwrap();
         assert_eq!(message.type_name(), "TransferChunk");
     }
 
     #[tokio::test]
-    async fn unknown_frame_kind_fails_session() {
-        // 注入未知 kind 字节的帧：读端必须拒绝并关闭会话。
+    async fn unknown_variant_frame_fails_session() {
+        // 注入变体索引越界的帧体（postcard 目录只有 28 个变体）：读端必须
+        // 拒绝并关闭会话。
         let (parent, child) = socketpair_channel().unwrap();
         use tokio::io::AsyncWriteExt;
         let raw = {
@@ -864,14 +821,13 @@ mod tests {
         let mut a = FrameTransport::spawn(parent, 8);
         raw.set_nonblocking(true).unwrap();
         let mut raw = tokio::net::UnixStream::from_std(raw).unwrap();
-        // body_len=5（仅 kind+meta_len），kind=99（未知），meta_len=0。
+        // body_len=1，变体索引 200（越界）。
         let mut frame = Vec::new();
-        frame.extend_from_slice(&5u32.to_be_bytes());
-        frame.push(99u8);
-        frame.extend_from_slice(&0u32.to_be_bytes());
+        frame.extend_from_slice(&1u32.to_be_bytes());
+        frame.push(200u8);
         raw.write_all(&frame).await.unwrap();
-        let error = a.recv().await.expect_err("unknown kind must fail");
-        assert!(error.to_string().contains("unknown"), "{error}");
+        let error = a.recv().await.expect_err("unknown variant must fail");
+        assert!(error.to_string().contains("postcard"), "{error}");
     }
 
     #[tokio::test]
@@ -1023,10 +979,7 @@ mod terminal_event_tests {
             let (events, incoming) = mpsc::channel(4);
             transport.incoming = incoming;
             let expected = error.to_string();
-            events
-                .send(IoEvent::Failed(Channel::Control, error))
-                .await
-                .unwrap();
+            events.send(IoEvent::Failed(error)).await.unwrap();
             assert!(transport.try_recv().is_none());
             assert!(transport.try_recv().is_none());
             assert_eq!(transport.recv().await.unwrap_err().to_string(), expected);

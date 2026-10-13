@@ -215,16 +215,13 @@ async fn handshake(
         .send(hello)
         .await
         .map_err(|e| format!("send hello: {e}"))?;
-    let (channel, message) = tokio::time::timeout(
+    let message = tokio::time::timeout(
         Duration::from_millis(flow_engine::execution_protocol::STARTUP_TIMEOUT_MS),
         transport.recv(),
     )
     .await
     .map_err(|_| "welcome timeout".to_string())?
     .map_err(|e| format!("read welcome: {e}"))?;
-    if channel != flow_engine::execution_protocol::Channel::Control {
-        return Err(format!("expected AgentWelcome on control, got {channel:?}"));
-    }
     let Message::AgentWelcome {
         journal_id,
         master_epoch,
@@ -300,7 +297,7 @@ pub async fn resume(
             .await
             .map_err(|e| format!("send resume: {e}"))?;
         let reply = loop {
-            let (_, message) = transport
+            let message = transport
                 .recv()
                 .await
                 .map_err(|e| format!("resume reply: {e}"))?;
@@ -519,7 +516,7 @@ pub async fn serve(
             }
             received = transport.recv(), if pending.is_none() => {
                 match received {
-                    Ok((_channel, message)) => match message {
+                    Ok(message) => match message {
                         Message::Routed { .. } => {
                             let unwrapped = relay.lock().unwrap_from_master_owned(message);
                             match unwrapped {
@@ -563,6 +560,9 @@ pub async fn serve(
                             match bound {
                                 Ok(handle) => {
                                     let boot = handle.executor_boot_id.clone();
+                                    // 唤醒桥：新执行器不在桥的当前等待集内，
+                                    // 预存许可让下一次等待立即返回。
+                                    handle.notify.notify_one();
                                     handles.lock().await.insert(dispatch_id.clone(), handle);
                                     if queue_uplink(&transport, &mut send_backlog, Message::BindExecutorAck {
                                         executor_id,
@@ -687,7 +687,22 @@ async fn fair_mux_bridge(
         if served.is_some() {
             cursor = served;
         } else {
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            // 空闲等待：事件驱动（executor_loop 每次 out.send 后 notify_one），
+            // 50ms 安全网兜两类角落——新绑定的执行器（尚不在等待集内）与
+            // 任何丢失唤醒。等待集为空（无执行器）时只剩安全网。
+            let notifies: Vec<std::sync::Arc<tokio::sync::Notify>> = {
+                let guard = handles.lock().await;
+                guard.values().map(|handle| handle.notify.clone()).collect()
+            };
+            if notifies.is_empty() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            } else {
+                let waits: Vec<_> = notifies.iter().map(|n| Box::pin(n.notified())).collect();
+                tokio::select! {
+                    _ = futures::future::select_all(waits) => {}
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
+            }
         }
     }
 }
@@ -811,7 +826,7 @@ pub async fn reconnect_session(
     }
     let welcome = loop {
         match transport.recv().await {
-            Ok((_, message)) => {
+            Ok(message) => {
                 if let Message::AgentWelcome { .. } = message {
                     break message;
                 }
@@ -883,6 +898,7 @@ mod tests {
                 lost_data: Arc::new(AtomicBool::new(false)),
                 done: Arc::new(AtomicBool::new(false)),
                 committed: Arc::new(AtomicBool::new(false)),
+                notify: Arc::new(tokio::sync::Notify::new()),
             },
             out_tx,
         )
@@ -963,7 +979,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut reported = std::collections::BTreeSet::new();
             loop {
-                let (_, message) = master.recv().await.unwrap();
+                let message = master.recv().await.unwrap();
                 let Message::Resume { items, page, more } = message else {
                     panic!("expected resume")
                 };

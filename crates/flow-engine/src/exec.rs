@@ -12,7 +12,7 @@ pub const HARNESS_TIMEOUT_MAX_MS: u64 = 60 * 60 * 1000;
 use serde_json::Value;
 /// 节点执行失败。`retryable` 决定引擎是重试还是把 run 判为失败；
 /// `platform` 表示基础设施故障（IO/Backend/日志损坏）——不是工作流失败，
-/// 引擎遇此标志挂起 run（awaiting_resume）而不是写 run_failed（DESIGN §7）。
+/// 引擎遇此标志挂起 run（awaiting_resume）而不是写 run_failed（DESIGN.md §13.3）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodeFailure {
     pub message: String,

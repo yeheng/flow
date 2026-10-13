@@ -211,7 +211,7 @@ impl NodeType {
                     "required": ["workflow_id"],
                     "properties": {
                         "workflow_id": {"type": "string", "x-widget": "workflow-picker", "x-label": "目标工作流",
-                                        "x-help": "调用其最新已发布版本作为子 run；子 run 输出透传为本节点输出；子 run 失败传导为本节点 fatal（DESIGN §6.8），重试策略只覆盖启动/等待类错误"},
+                                        "x-help": "调用其最新已发布版本作为子 run；子 run 输出透传为本节点输出；子 run 失败传导为本节点 fatal（DESIGN.md §8.1），重试策略只覆盖启动/等待类错误"},
                         "input_mapping": {"x-widget": "json", "x-label": "子 run 输入映射",
                                         "x-help": "JSON 对象，值支持 ${input.x} / ${nodes.n.y} 模板；展开结果整体作为子 run 输入。省略 = 沿用父 run 输入"}
                     }
@@ -334,7 +334,7 @@ impl NodeType {
     ///
     /// `script.code` / `condition.expr` 是用户 JS：其中的 `${}` 是 JS 模板
     /// 字面量，不是 flow 模板，展开会破坏用户代码。其余参数一律在执行前
-    /// 统一展开（与 http_call 同一份 `expr::expand_templates`，DESIGN §10）。
+    /// 统一展开（与 http_call 同一份 `expr::expand_templates`，DESIGN.md §10）。
     ///
     /// **从 descriptor 的 `x-opaque: true` 派生**，不另写一张表。不能用
     /// `x-widget: "code"` 代替——那只是「前端用代码编辑器渲染」的 UI 提示，
@@ -734,7 +734,7 @@ impl Definition {
 /// 模板片段不是完整 Definition，不能跑整图规则，但参数规则必须同源。
 pub fn validate_params(node: &Node, kind: NodeType) -> Result<(), String> {
     for key in kind.required_params() {
-        // `${}` 模板放行到执行期判定（DESIGN §5 规则 1）：展开后才知道是不是
+        // `${}` 模板放行到执行期判定（DESIGN.md §10.2）：展开后才知道是不是
         // 整数/非空串，建图期一律认它「填了」。先判模板再判类型，顺序反了会把
         // `ms: "${input.tick}"` 这类合法定义误拒。
         if node.param_str(key).is_some_and(|v| v.contains("${")) {
@@ -794,7 +794,7 @@ pub fn validate_params(node: &Node, kind: NodeType) -> Result<(), String> {
             )),
         },
         NodeType::SubWorkflow => {
-            // input_mapping 省略 = 沿用旧语义（父 run 输入快照，DESIGN §6.8）
+            // input_mapping 省略 = 沿用旧语义（父 run 输入快照，DESIGN.md §8.1）
             match node.params.get("input_mapping") {
                 None | Some(serde_json::Value::Null) => Ok(()),
                 Some(serde_json::Value::Object(_)) => Ok(()),
@@ -1148,7 +1148,7 @@ mod tests {
         }
     }
 
-    /// `${}` 模板参数在建图期放行、执行期判定（DESIGN §5 规则 1、§10）：
+    /// `${}` 模板参数在建图期放行、执行期判定（DESIGN.md §10.2、§10）：
     /// 模板 ms / 模板 method 通过；裸数字串、标量 mapping 仍被拒绝。
     #[test]
     fn template_params_pass_validation_while_ambiguous_forms_are_rejected() {

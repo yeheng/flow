@@ -207,8 +207,7 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
             }
                 received = transport.recv(), if pending.is_empty() => {
                 match received {
-                    Ok((channel, message)) => {
-                        let _ = channel;
+                    Ok(message) => {
                         if let Some(code) = handle_message(&mut current, &mut pending, message, &outbound_tx, &identity, limits_ref, config.remote_replay) {
                             exit_code = code;
                             break;

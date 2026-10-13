@@ -23,7 +23,7 @@ pub const DEFAULT_LOG_BUDGET: usize = 10_000;
 /// 单 run 日志行数**硬顶**（所有级别合计）。
 ///
 /// debug/info 有 `max` 软预算，warn/error 按「错误可观测性不打折」不参与它
-/// （DESIGN §12.17）——但那个前提是「错误量是偶发的」。一个
+/// （DESIGN.md §12.3）——但那个前提是「错误量是偶发的」。一个
 /// `while (true) console.error(…)` 的脚本就能把 event.jsonl / PG run_events
 /// 写到无界：软预算管不住 warn/error，前端环形缓存又只保护浏览器。磁盘比
 /// 「多几条 error」更值得保护，所以给 warn/error 也设一道总量硬顶。
@@ -71,7 +71,7 @@ impl LogBudget {
     /// 本条日志是否放行。放行时内部计数 +1。
     ///
     /// `max` 是 **debug/info 合计**的上限，不是总量：warn/error 不消耗它
-    /// （错误可观测性不打折，DESIGN §12.17）。共享一个计数器会让一个刷 warn
+    /// （错误可观测性不打折，DESIGN.md §12.3）。共享一个计数器会让一个刷 warn
     /// 的节点把整条 run 的 info 日志预算吃光。但 warn/error 也不是无限额
     /// 度的——它们计入 `hard_max`，见 [`HARD_LOG_LINE_LIMIT`]。
     pub fn admit(&self, level: LogLevel) -> bool {
@@ -317,7 +317,7 @@ pub fn redact_value(value: &Value) -> Value {
 
 /// 输入面快照的完整脱敏：先按敏感键走 [`redact_value`]，字符串叶子再过
 /// [`redact_url`]——`url` 不是敏感键，query 里的 `?token=…` 藏在**值**里，
-/// 键名脱敏管不到。快照即展示（DESIGN §6.1「没有第二个出口」），执行用的
+/// 键名脱敏管不到。快照即展示（DESIGN.md §12.3「没有第二个出口」），执行用的
 /// 展开后 params 不经此函数。
 pub fn redact_snapshot(value: &Value) -> Value {
     fn walk(value: &Value) -> Value {
@@ -388,7 +388,7 @@ mod tests {
         assert_eq!(messages[0].attempt, 2, "日志归属到具体 attempt");
     }
 
-    /// 预算是 debug/info 的上限，warn/error 不参与消耗（DESIGN §12.17）。
+    /// 预算是 debug/info 的上限，warn/error 不参与消耗（DESIGN.md §12.3）。
     /// 共享一个计数器的话，刷满 max 条 warn 的节点会把整条 run 的 info 日志
     /// 全部吃掉——包括重试叙事与 HTTP 请求行这些最该看的。
     #[test]

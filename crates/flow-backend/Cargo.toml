@@ -6,6 +6,9 @@ edition.workspace = true
 [features]
 default = []
 journal-cluster = ["sqlx/postgres", "sqlx/json"]
+# 确定性故障注入（dispatch::fault）：生产构建为空壳；集成测试经下方
+# dev 自依赖启用（tokio 同款模式），`cargo test` 无需手工 --features。
+fault-injection = []
 
 [dependencies]
 flow-journal = { path = "../flow-journal" }
@@ -42,6 +45,8 @@ flow-store = { path = "../flow-store" }
 flow-config = { path = "../flow-config" }
 
 [dev-dependencies]
+# 自依赖：只为给集成测试打开 fault-injection feature（不改 lib 默认构建）。
+flow-backend = { path = ".", features = ["fault-injection"] }
 flow-test-support = { path = "../flow-test-support" }
 chrono = { workspace = true }
 parking_lot = { workspace = true }

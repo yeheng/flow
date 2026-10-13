@@ -77,7 +77,7 @@ async fn spawn_simulated_agent(
             .await
             .expect("send agent hello");
         let welcome = loop {
-            let (_, message) = transport.recv().await.expect("welcome");
+            let message = transport.recv().await.expect("welcome");
             if let flow_engine::execution_protocol::Message::AgentWelcome { .. } = message {
                 break message;
             }
@@ -296,7 +296,7 @@ async fn wrong_route_frames_never_reach_authority() {
         .await
         .unwrap();
     let welcome = loop {
-        let (_, message) = transport.recv().await.unwrap();
+        let message = transport.recv().await.unwrap();
         if matches!(message, Message::AgentWelcome { .. }) {
             break message;
         }

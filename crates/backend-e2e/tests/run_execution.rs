@@ -1,7 +1,7 @@
 //! run 执行引擎的端到端语义：script / condition / delay / 输出收集 / 跳过传播 /
 //! 事件日志 / run.list 查询。
 //!
-//! 契约来源：DESIGN.md §3（事件日志）、§4（折叠器）、§6.2-6.4（汇合、输出、真值）。
+//! 契约来源：DESIGN.md §3（事件日志）、§3.3（折叠器）、§9.1-§9.2（汇合、输出、真值）。
 
 use backend_e2e::common::fixtures::{
     condition_def, delay_def, failing_def, join_skip_def, linear_def, multi_end_def,

@@ -6,16 +6,17 @@
 //!
 //! 两类协议并发面符号（不得互相代用）：
 //! - `A_MAX` 活跃派发上界（同时持有 dispatch 事实、占窗口预算），窗口全局
-//!   预算 = `A_MAX × W_BYTES × K_FACTOR`；
+//!   预算 = `A_MAX × W_BYTES`；
 //! - `X_MAX_DEFAULT` 执行槽位数（同时运行的执行子进程），约束进程数 × RSS。
 //!
 //! `A_MAX` 不得用来论证主进程状态内存，`X_MAX` 不得用来论证审计吞吐。
 //! 在飞 run 状态数上限（`R_MAX`）是主进程状态内存约束、不是协议量，其
 //! 唯一定义与执行点在 `flow-backend`（`journal.rs::R_MAX`）。
 
-/// IPC 协议版本。v4 = 单流帧 `u32 body_len | u8 kind | u32 meta_len | JSON
-/// meta | raw blob`（v3 标签帧与 v2 双流均已删除）。
-pub const PROTOCOL_VERSION: u32 = 4;
+/// IPC 协议版本。v5 = 单流帧 `u32 body_len | postcard(Message)`（IPC8：
+/// v4 的 JSON 信封、三种帧 kind、十进制字符串与 Channel 概念均已删除；
+/// 版本门集中在握手 Hello/Welcome 的 version 字段）。
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// control 通道单帧上限（不含 4 字节长度头）。握手
 /// 只可协商到本上限以内。
@@ -57,17 +58,8 @@ pub const A_MAX: usize = 16;
 
 /// 单派发持久确认窗口 W（审计在途字节，按编码后字节数计费）。
 /// 依据：单条编码记录 ≤ [`MAX_AUDIT_RECORD_BYTES`]（512 KiB），W 取 4 条
-/// 记录的余量，允许一个 256 KiB 原始 chunk 记录在飞的
-/// 同时仍有空间继续推进；由允许常驻内存上界（128 MiB）反推。
+/// 记录的余量，允许一个 256 KiB 原始 chunk 记录在飞的同时仍有空间继续推进。
 pub const W_BYTES: u64 = 2 * 1024 * 1024;
-
-/// 每派发实际预算对 W 的倍数 k：生产队列 + 输入 transfer + 重传副本 +
-/// 解码扩张 + 待落盘队列。全局预算 = `A_MAX × W × K` = 128 MiB（估算值，
-/// I10 以真实负载复核）。
-pub const K_FACTOR: u64 = 4;
-
-/// 全局活跃派发预算（常驻内存上界，估算）。
-pub const GLOBAL_DISPATCH_BUDGET_BYTES: u64 = A_MAX as u64 * W_BYTES * K_FACTOR;
 
 /// 单条审计记录的最大协议编码字节数。必须 ≤ W，否则存在永远无法发送的
 /// 记录（二期 §3.5 死锁条款）。256 KiB chunk + 元数据 < DATA_MAX_FRAME。
@@ -75,20 +67,22 @@ pub const MAX_AUDIT_RECORD_BYTES: u64 = 512 * 1024;
 
 /// 输入/操作请求传输的原始块字节数。与一期 CHUNK_BYTES 对齐，
 /// 避免主进程重切日志 chunk。
+///
+/// 传输体积的真实约束不在此文件，由接收侧硬执行：输入流聚合 ≤ 执行器
+/// `INPUT_BUDGET`（8 MiB）、单值 ≤ `flow_journal::MAX_VALUE_BYTES`
+/// （见 flow-executor `transfer.rs` 的 feed/input_ready 拒绝路径）；
+/// agent 侧队列按帧数有界（relay.rs）。本文件不重复声明这些数字。
 pub const TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
-/// 输入传输在途窗口（独立于审计窗口；二期 §3.5 末段）。
-pub const INPUT_TRANSFER_WINDOW_BYTES: u64 = 2 * 1024 * 1024;
 
-/// 观测（可丢弃可观察性记录）通道预算：有界队列深度，超限丢弃并计数。
+/// 观测（可丢弃可观察性记录）：帧级由 [`OBSERVABILITY_BATCH_LINES`] 与
+/// [`OBSERVABILITY_BATCH_BYTES`] 约束（observe.rs 执行）；队列深度由
+/// transport 出站队列按帧数有界；观测行截断由
+/// `flow_engine::nodelog::MAX_LOG_LINE_BYTES` 执行（emit 入口统一截断）。
 /// 观测永不反压 golden source、不占 audit_seq、不占持久窗口（二期 §4.3）。
-pub const OBSERVABILITY_QUEUE_DEPTH: usize = 256;
-/// 单条 ObservabilityBatch 最多行数。
 pub const OBSERVABILITY_BATCH_LINES: usize = 64;
 /// 单条 ObservabilityBatch 的**转义后**字节预算（保守估计累计）：保证
 /// 编码帧必然落在 DATA_MAX_FRAME 内——观测流量自身永远不能把帧打爆。
 pub const OBSERVABILITY_BATCH_BYTES: usize = DATA_MAX_FRAME / 2;
-/// 观测行消息上限（超出即截断为丢弃计数）。
-pub const OBSERVABILITY_LINE_BYTES: usize = 16 * 1024;
 
 /// 执行器心跳间隔（control，执行器→主进程，仅存活/进度提示）。
 pub const HEARTBEAT_INTERVAL_MS: u64 = 2_000;

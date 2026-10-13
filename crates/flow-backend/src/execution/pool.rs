@@ -1,10 +1,10 @@
 //! 执行子进程池与可靠回收（二期 §3.1/§3.7/§3.9，I03）。
 //!
 //! 每进程同一时刻一个任务。通道承载按平台选择：unix 用单 socketpair
-//! （argv 传 FD 原号，pre_exec 关闭其余继承 FD）；其余平台用 TCP loopback
-//! 单连接回连。父关闭子端、子关闭父端，兄弟进程不继承连接。通道故障 →
-//! 会话 Draining → 宽限后 kill → wait/reap；已取消/故障任务的进程统一
-//! 回收重建，不直接复用。
+//! （argv 传 FD 原号，pre_exec 关闭其余继承 FD）；其余平台用本地 socket
+//! 单连接回连（Windows named pipe）。父关闭子端、子关闭父端，兄弟进程
+//! 不继承连接。通道故障 → 会话 Draining → 宽限后 kill → wait/reap；
+//! 已取消/故障任务的进程统一回收重建，不直接复用。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -193,8 +193,9 @@ impl ExecutorPool {
 }
 
 /// 平台通道承载：unix socketpair（argv 传 FD 原号，父端关闭子端副本）；
-/// 其余平台 TCP loopback 单连接回连。差异在此收口，下游只见 FrameTransport
-/// 单流端点。回连形态额外产出随机会话令牌（Hello 回验，防本机抢连）。
+/// 其余平台本地 socket 单连接回连（Windows named pipe）。差异在此收口，
+/// 下游只见 FrameTransport 单流端点。回连形态额外产出随机会话令牌
+/// （Hello 回验，防本机抢连）。
 async fn spawn_transport(
     executor: &flow_engine::execution_protocol::contract::ExecutorInvocation,
     tag: Option<&str>,
@@ -323,7 +324,7 @@ async fn session_driver(
             }
             received = transport.recv() => {
                 match received {
-                    Ok((_channel, message)) => {
+                    Ok(message) => {
                         last_seen = tokio::time::Instant::now();
                         // 心跳也作为事件转发：派发侧的空闲计时把它算作活跃
                         // 证据（长任务执行期间唯一持续的流量），handle()
@@ -366,7 +367,7 @@ async fn session_driver(
     // 回收：宽限期收尾（尽力 Stopped/迟到审计）→ kill → wait/reap。
     let grace = Duration::from_millis(DRAIN_GRACE_MS);
     let _ = tokio::time::timeout(grace, async {
-        while let Ok((_channel, message)) = transport.recv().await {
+        while let Ok(message) = transport.recv().await {
             if event_tx
                 .send(FromSession::Incoming(Box::new(message)))
                 .await

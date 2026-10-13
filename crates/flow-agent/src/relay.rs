@@ -6,8 +6,6 @@
 
 use std::collections::BTreeMap;
 
-use tokio::sync::mpsc;
-
 use flow_engine::execution_protocol::message::Message;
 use flow_engine::execution_protocol::remote::{routable, RouteEnvelope};
 
@@ -167,8 +165,8 @@ impl Relay {
 }
 
 /// 消息估算编码字节数（T08 调度与预算口径）：不序列化、零分配地遍历
-/// 大载荷字段。JSON 转义最坏放大约 2×，预算按 [`weight_budgeted`] 计。
-/// 调度公平性与队列预算用同一估算；精确计量属 T01 基线后续验证项。
+/// 大载荷字段。调度公平性与队列预算共用同一估算；精确计量属 T01 基线
+/// 后续验证项（跨进程序列化无法零成本获得，v5 帧编码时自然携带精确值）。
 pub fn estimate_weight(message: &Message) -> u64 {
     let raw = match message {
         Message::Routed { inner, .. } => 256 + estimate_weight(inner),
@@ -201,10 +199,12 @@ fn estimate_value(value: &serde_json::Value) -> u64 {
     }
 }
 
-/// 预算口径的估算字节数：JSON 转义最坏放大约 2×，按 2× 计入（硬上界
-/// 仍受帧上限约束）。
+/// 预算口径的估算字节数：按 2× 计入 JSON 转义扩张。这是软收紧不是硬
+/// 上限——控制字符转义（\uXXXX）最坏可达 6×，低估的绝对上界由帧级约束
+/// 兜底：单帧 ≤ DATA_MAX_FRAME、各队列按帧数有界（PER_EXECUTOR_QUEUE /
+/// UPLINK_OUT_QUEUE），字节数不会超出帧数 × 帧上限。
 pub fn weight_budgeted(message: &Message) -> u64 {
-    (estimate_weight(message) * 2).min(flow_engine::execution_protocol::DATA_MAX_FRAME as u64 * 2)
+    estimate_weight(message) * 2
 }
 
 /// 共享出站字节预算（T08）：acquire 随消息入队前占用，release 于消息
@@ -264,34 +264,6 @@ impl UplinkBudget {
                 .fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
         }
         self.room.notify_one();
-    }
-}
-
-/// 多执行器 → 单上联的轮转公平仲裁：每轮每个执行器至多发一帧，洪泛
-/// 任务不能独占共享出站（三期 §1.2）。
-pub async fn fair_mux(inputs: Vec<mpsc::Receiver<Message>>, out: mpsc::Sender<Message>) {
-    let mut inputs = inputs;
-    let mut cursor = 0usize;
-    loop {
-        let mut pending = Vec::new();
-        // 每轮从游标起整圈扫描：每个通道至多取 1 帧（真轮转）。
-        for offset in 0..inputs.len() {
-            let index = (cursor + offset) % inputs.len();
-            if let Ok(message) = inputs[index].try_recv() {
-                pending.push(message);
-            }
-        }
-        if pending.is_empty() {
-            // 无待发：让出（退出由上层关闭 out 触发 send 失败）。
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-            continue;
-        }
-        cursor = (cursor + 1) % inputs.len().max(1);
-        for message in pending {
-            if out.send(message).await.is_err() {
-                return;
-            }
-        }
     }
 }
 
@@ -386,45 +358,5 @@ mod tests {
         assert!(relay
             .wrap_to_master("d-1", Message::Drain { grace_ms: 1 })
             .is_err());
-    }
-
-    #[tokio::test]
-    async fn fair_mux_round_robins_under_flood() {
-        let (flood_tx, flood_rx) = mpsc::channel(64);
-        let (quiet_tx, quiet_rx) = mpsc::channel(64);
-        let (out_tx, mut out_rx) = mpsc::channel(16);
-        tokio::spawn(fair_mux(vec![flood_rx, quiet_rx], out_tx));
-        for i in 0..16 {
-            let _ = flood_tx
-                .send(Message::Heartbeat {
-                    dispatch_id: Some(format!("flood-{i}")),
-                    phase: "f".into(),
-                })
-                .await;
-        }
-        let _ = quiet_tx
-            .send(Message::Heartbeat {
-                dispatch_id: Some("quiet".into()),
-                phase: "q".into(),
-            })
-            .await;
-        let mut seen_flood = 0;
-        let mut seen_quiet_before_flood_done = false;
-        for _ in 0..8 {
-            if let Some(Message::Heartbeat { dispatch_id, .. }) = out_rx.recv().await {
-                if dispatch_id
-                    .as_deref()
-                    .is_some_and(|d| d.starts_with("flood"))
-                {
-                    seen_flood += 1;
-                } else {
-                    seen_quiet_before_flood_done = true;
-                }
-            }
-        }
-        assert!(
-            seen_quiet_before_flood_done || seen_flood < 8,
-            "quiet task must not starve"
-        );
     }
 }

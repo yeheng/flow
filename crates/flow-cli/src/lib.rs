@@ -1,6 +1,6 @@
 //! flow-cli：flow 工作流引擎的命令行客户端（lib）。
 //!
-//! 定位与边界（与 docs/DESIGN.md §2 一致）：
+//! 定位与边界（与 docs/DESIGN.md §1 一致）：
 //! - **纯 RPC 客户端**：只连 flow-journal-server 的 JSON-RPC 2.0 over
 //!   WebSocket，不依赖 flow-backend / flow-store，也不读 FLOW_BACKEND——
 //!   存储语义在服务端吸收，CLI 不感知后端；

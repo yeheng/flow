@@ -1,6 +1,6 @@
 //! 定义构造器（fixtures）+ 本地 HTTP stub 服务。
 //!
-//! HTTP stub 全部是确定性的「本地 TcpListener」（DESIGN.md §13 测试约定）：
+//! HTTP stub 全部是确定性的「本地 TcpListener」（DESIGN.md §14 测试约定）：
 //! 卡住 = 接受连接后不响应；断流 = 声明 Content-Length 但发一半即关闭；
 //! 不依赖任何不可路由地址，也不依赖外部服务。
 
@@ -30,7 +30,7 @@ pub fn linear_def(code: &str) -> Value {
 }
 
 /// start → condition → (true → t → end_t) / (false → f → end_f)。
-/// 两个 end 是互斥分支的收尾（AND-join 合同不让它们合流，见 DESIGN §6.2）。
+/// 两个 end 是互斥分支的收尾（AND-join 合同不让它们合流，见 DESIGN.md §9.1）。
 pub fn condition_def(expr: &str, true_code: &str, false_code: &str) -> Value {
     json!({
         "nodes": [

@@ -7,7 +7,7 @@ use serde_json::Value;
 pub const STATUS_DRAFT: &str = "draft";
 pub const STATUS_PUBLISHED: &str = "published";
 
-/// runs.status 的合法词汇表（DESIGN.md §8：单一来源，写入口校验）。
+/// runs.status 的合法词汇表（DESIGN.md §6.1：单一来源，写入口校验）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunStatus {
     Running,

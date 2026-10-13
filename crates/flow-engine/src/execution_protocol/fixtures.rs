@@ -1,13 +1,14 @@
-//! 协议 fixtures（I01 验收：合法/非法/异身份/重复消息样本）。
+//! 协议 fixtures（I01 验收：合法/损坏帧/异身份/重复消息样本）。
 //!
 //! 供 flow-engine 单元测试与 flow-executor / flow-backend 的跨 crate 回归
 //! 复用；这些样本是冻结契约的一部分，修改等于变更协议。
 
 use flow_journal::value::ValueCodec;
 use flow_journal::{StoredValue, ValueRef};
-use serde_json::{json, Value};
+use serde_json::json;
 
 use super::contract::PROTOCOL_VERSION;
+use super::frame::FRAME_LENGTH_BYTES;
 use super::message::{
     AuditRecord, ExecuteTask, Message, ObservationLine, ResultOutcome, TaskValue, WaitRequest,
 };
@@ -36,6 +37,7 @@ pub fn audit_record() -> AuditRecord {
 pub fn valid_messages() -> Vec<Message> {
     vec![
         Message::Hello {
+            version: PROTOCOL_VERSION,
             boot_id: "boot-1".into(),
             build: "0.1.0-test".into(),
             capabilities: vec![
@@ -47,6 +49,7 @@ pub fn valid_messages() -> Vec<Message> {
             session_token: None,
         },
         Message::Welcome {
+            version: PROTOCOL_VERSION,
             journal_id: "journal-fixture".into(),
             master_epoch: 3,
             session_id: "session-1".into(),
@@ -186,25 +189,37 @@ pub fn failure_result() -> Message {
     }
 }
 
-/// 必须被明确拒绝的畸形信封。版本字段用 [`PROTOCOL_VERSION`] 常量构造
-/// （字面量会随协议升级失真：构造意图是「其它字段畸形」，不是版本不符）。
-pub fn malformed_envelopes() -> Vec<Value> {
+/// 必须被明确拒绝的损坏帧（v5 对抗样本，字节级）：
+/// 变体索引越界、截断的 varint、巨型长度声明、帧体尾随垃圾。
+/// 巨型长度声明必须报错而非分配（postcard 先做边界检查，见 message.rs
+/// 对应单元测试）。
+pub fn corrupt_frames() -> Vec<Vec<u8>> {
+    let frame_of = |body: &[u8]| -> Vec<u8> {
+        let mut frame = Vec::with_capacity(FRAME_LENGTH_BYTES + body.len());
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        frame.extend_from_slice(body);
+        frame
+    };
     vec![
-        json!("not an object"),
-        json!({}),
-        json!({"v": PROTOCOL_VERSION + 1, "type": "Ready"}), // 版本不兼容
-        json!({"v": PROTOCOL_VERSION}),                      // 缺 type
-        json!({"v": PROTOCOL_VERSION, "type": "Result"}),    // 缺 dispatch/body
-        json!({"v": PROTOCOL_VERSION, "type": "AuditAck", "dispatch_id": "d", "body": {"durable_audit_seq": "x", "durable_bytes": "1", "commit_lsn": "1"}}), // 非十进制
-        json!({"v": PROTOCOL_VERSION, "type": "AuditAck", "dispatch_id": "d", "body": {"durable_audit_seq": 5, "durable_bytes": "1", "commit_lsn": "1"}}), // 数字而非字符串
-        json!({"v": PROTOCOL_VERSION, "type": "Execute", "dispatch_id": "d", "body": {"command_id": "c", "task": {}}}), // 缺字段
-        json!({"v": PROTOCOL_VERSION, "type": "AuditBatch", "dispatch_id": "d", "body": {"first_seq": "1", "records": [{"audit_seq": "1", "kind": "k"}]}}), // 记录缺 payload
+        // 变体索引越界（目录 28 个变体，索引 0..=27）。
+        frame_of(&[28]),
+        frame_of(&[200]),
+        // 截断的 varint（0x80 起始的连续字节，帧体在此结束）。
+        frame_of(&[0x80, 0x80, 0x80]),
+        // 巨型长度声明：Hello 变体 + version + boot_id 长度声明 ≈ 2^62。
+        {
+            let mut body = vec![0u8, 1, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x3F];
+            body.extend_from_slice(&[0x01]);
+            frame_of(&body)
+        },
+        // 帧体尾随垃圾：合法 Ready 编码 + 2 字节走私。
+        {
+            let body = postcard::to_allocvec(&Message::Ready).unwrap();
+            let mut body = body;
+            body.extend_from_slice(&[0xDE, 0xAD]);
+            frame_of(&body)
+        },
     ]
-}
-
-pub fn unknown_type_envelope() -> Value {
-    // 注意：三期已把 Resume/ResumeReply 纳入目录；未知类型用目录外名称。
-    json!({"v": PROTOCOL_VERSION, "type": "TeleportRequest", "body": {}})
 }
 
 /// 同 dispatch 同序号异内容样本（必须拒绝）。

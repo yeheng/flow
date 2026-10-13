@@ -1,6 +1,6 @@
 //! journal v2 e2e 的公共 harness：被测服务进程、v2 RPC 客户端、fixtures。
 //!
-//! 设计约束（与仓库测试约定一致，DESIGN.md §13）：
+//! 设计约束（与仓库测试约定一致，DESIGN.md §14）：
 //! - 真起 `flow-journal-server` 进程：崩溃恢复只能靠真的 SIGKILL 进程证明；
 //! - 每个用例独占一个临时 journal 目录 + 随机 v2 部署 token，只清理该目录；
 //! - 客户端走真实 wire 并讲 v2 协议（token / request_id / 回执 / -32020 恢复），

@@ -1,14 +1,13 @@
 //! 远程路由层（三期 §1.2）：agent/executor 双层身份、BindExecutor、
 //! Resume/ResumeReply 与容量报告。
 //!
-//! 远程 transport 复用二期的长度帧与业务消息；外层增加路由包络
+//! 远程 transport 复用长度帧与业务消息；外层增加路由包络
 //! `agent_id / agent_boot_id / link_session_id / executor_id /
 //! executor_boot_id / dispatch_id`，内层 [`Message::Routed`] 保留任务消息
 //! 与审计原始编码。agent 是受信任中继：不产生权威 ACK/Permit/
 //! ResultCommitted，不推进 DAG，不写权威状态。
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use super::contract::IDENTITY_MAX_BYTES;
 use super::message::Message;
@@ -18,28 +17,25 @@ use super::message::Message;
 /// 不信执行器/agent 自报机器身份。重建会话可替换经验证的包络，不能修改
 /// dispatch、audit_seq 或记录内容。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RouteEnvelope {
     pub agent_id: String,
     pub agent_boot_id: String,
     pub link_session_id: String,
     pub executor_id: String,
     pub executor_boot_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub dispatch_id: Option<String>,
 }
 
 /// agent 能力/资源报告（三期 §1.6）：主进程按已分配资源扣减，报告有延迟
 /// 也不能重复超配。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Capacity {
     /// 本机受控执行槽位总数。
     pub slots: u32,
     /// 当前在飞派发数（agent 视角）。
     pub in_flight: u32,
     /// 待转发字节（有界队列占用，计入 agent 实际 RSS 预算）。
-    #[serde(with = "flow_journal::decimal")]
     pub pending_bytes: u64,
     /// 可用内存 MiB（粗粒度；仅能力匹配用）。
     pub memory_mib: u32,
@@ -49,22 +45,18 @@ pub struct Capacity {
 
 /// Resume 清单项（三期 §1.4）：重连后 agent 上报本地未决任务事实。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ResumeItem {
     pub dispatch_id: String,
     pub executor_boot_id: String,
     /// 本地任务状态。
-    #[serde(rename = "type")]
     pub state: String, // executing | stopped | result_ready | exited
     /// 最后已获主进程确认的审计序号（agent 观察值；主日志游标优先）。
-    #[serde(with = "flow_journal::decimal")]
     pub durable_audit_seq: u64,
     /// 已生成未确认的固定 result_id（若有）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub result_id: Option<String>,
     /// 结果最后审计序号（result_ready 时）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[serde(with = "super::message::decimal_u64_opt")]
+    #[serde(default)]
     pub result_last_audit_seq: Option<u64>,
     /// 是否丢失未确认数据 / 曾强制终止。
     pub lost_data: bool,
@@ -73,16 +65,12 @@ pub struct ResumeItem {
 
 /// ResumeReply 裁决动作（三期 §1.4 表）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "type")]
 pub enum ResumeAction {
     /// 结果已在权威日志；返回原提交确认，不再执行。
     AlreadyCommitted,
     /// 主进程给出真实 durable_audit_seq；仅补传其后仍保有的记录，
     /// 不授权新外部操作。
-    UploadOnly {
-        #[serde(with = "flow_journal::decimal")]
-        durable_audit_seq: u64,
-    },
+    UploadOnly { durable_audit_seq: u64 },
     /// 派发仍有效且执行器已生成封口结果；提交须过二期 §3.6 屏障。
     SubmitExistingResult,
     /// 持久取消/派发废止；终止旧执行，只收允许的迟到审计。
@@ -93,7 +81,6 @@ pub enum ResumeAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ResumeDecision {
     pub dispatch_id: String,
     pub action: ResumeAction,
@@ -133,14 +120,6 @@ pub fn routable(inner: &Message) -> bool {
             | Message::Drain { .. }
             | Message::DrainComplete { .. }
     )
-}
-
-/// Routed 帧内层信封（保留原始编码：内层 JSON 原样嵌套，不改字段）。
-pub fn routed_envelope_value(envelope: &RouteEnvelope, inner: &Message) -> Value {
-    serde_json::json!({
-        "envelope": envelope,
-        "inner": inner.to_envelope(),
-    })
 }
 
 /// Resume 清单分页上限（控制通道小消息约束）。

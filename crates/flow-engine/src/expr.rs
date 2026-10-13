@@ -25,7 +25,7 @@ const MAX_EXACT_F64_INT: i64 = 9_007_199_254_740_992;
 /// 大整数走 BigInt：|v| > 2^53 的整数经 JS Number（f64）会静默舍入
 /// （9007199254740993 → …992）并沿节点输出向下游传播，转 BigInt 进出
 /// 沙箱后透传/比较/模板展开精确无损。代价是脚本中 BigInt 与 Number
-/// 混算会抛 TypeError——响亮失败好过静默错值（DESIGN §10）。
+/// 混算会抛 TypeError——响亮失败好过静默错值（DESIGN.md §10）。
 fn json_to_js<'js>(
     ctx: &Ctx<'js>,
     value: &Value,

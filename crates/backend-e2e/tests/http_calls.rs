@@ -1,6 +1,6 @@
 //! http_call 端到端语义：模板展开、成功/4xx 分类、挂起取消。
 //!
-//! 契约来源：DESIGN.md §11（http_call 语义）、§10（模板）。
+//! 契约来源：DESIGN.md §8.1（http_call 语义）、§10.2（模板）。
 //! 全部用本地 TcpListener stub——确定性，不依赖外部网络。
 //! （v1 引擎的自动重试语义用例已随 flow-server 退役：v2 里外部操作失败
 //! 一律 uncertain 等人工裁决，见 crash_recovery 的裁决用例。）

@@ -102,7 +102,7 @@ async fn start_agent(
             .await
             .expect("hello");
         let welcome = loop {
-            let (_, message) = transport.recv().await.expect("welcome");
+            let message = transport.recv().await.expect("welcome");
             if let Message::AgentWelcome { .. } = message {
                 break message;
             }

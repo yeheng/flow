@@ -261,27 +261,20 @@ async fn tls_agent_end_to_end_business() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// 构造 v4 单流裸帧（kind=0 JSON 信封）——测试注入用。
-fn raw_frame(json: &Value) -> Vec<u8> {
-    // v4 kind=0 帧：u32 body_len | u8 kind | u32 meta_len | JSON meta
-    let bytes = serde_json::to_vec(json).unwrap();
-    let body_len = 5 + bytes.len();
-    let mut frame = Vec::with_capacity(4 + body_len);
-    frame.extend_from_slice(&(body_len as u32).to_be_bytes());
-    frame.push(0u8); // KIND_JSON
-    frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-    frame.extend_from_slice(&bytes);
+/// 构造 v5 裸帧（u32 body_len | postcard body）——测试注入用。
+fn raw_frame(body: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(4 + body.len());
+    frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    frame.extend_from_slice(body);
     frame
 }
 
 #[tokio::test]
 async fn unexpected_session_frame_rejected_and_single_cancel_keeps_uplink() {
-    // 会话级协议校验：v4 单流上联已无 DataBind（v2 遗留，目录外类型）；
-    // 握手后注入过时的 DataBind 裸帧必须整会话拒绝（不能静默容忍）。
-    // 走裸帧注入而不是 Message 构造：目录里已没有这个变体，拒绝路径
-    // 恰恰是 from_envelope 的 UnknownMessage。
-    use flow_engine::execution_protocol::contract::PROTOCOL_VERSION;
-    use flow_engine::execution_protocol::frame::FrameDecoder;
+    // 会话级协议校验：目录外帧必须整会话拒绝（不能静默容忍）。走裸帧注入
+    // 而不是 Message 构造：拒绝路径恰恰是 postcard 解码的变体索引越界。
+    use flow_engine::execution_protocol::frame::{encode_frame, FrameDecoder};
+    use flow_engine::execution_protocol::message::Message;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let dir = temp();
     std::fs::create_dir_all(&dir).unwrap();
@@ -297,38 +290,37 @@ async fn unexpected_session_frame_rejected_and_single_cancel_keeps_uplink() {
     manager
         .attach_inprocess("agent-bad".to_string(), control_a)
         .await;
-    // AgentHello 裸帧（与 flow-agent 上联同格式：v4 kind=0 JSON 信封帧）。
-    let hello = json!({
-        "v": PROTOCOL_VERSION, "type": "AgentHello",
-        "body": {
-            "agent_boot_id": "boot-bad", "build": "t",
-            "capabilities": ["relay", "resource_report", "reconnect"],
-            "slots": "1"
-        }
-    });
-    client.write_all(&raw_frame(&hello)).await.unwrap();
-    // 读 AgentWelcome（裸帧解码）。
+    // AgentHello 裸帧（与 flow-agent 上联同格式）。
+    let hello = Message::AgentHello {
+        agent_boot_id: "boot-bad".into(),
+        build: "t".into(),
+        capabilities: vec!["relay".into(), "resource_report".into(), "reconnect".into()],
+        slots: 1,
+    };
+    client
+        .write_all(&encode_frame(&hello).unwrap())
+        .await
+        .unwrap();
+    // 读 AgentWelcome（裸帧解码），取 link_session_id 供注入帧使用。
     let mut decoder = FrameDecoder::new();
-    let welcome = loop {
+    let link_session_id = loop {
         let mut chunk = [0u8; 16 * 1024];
         let n = client.read(&mut chunk).await.unwrap();
         assert!(n > 0, "stream closed before welcome");
         decoder.feed(&chunk[..n]).unwrap();
-        if let Some((_, message)) = decoder.pop().unwrap() {
-            break serde_json::to_value(message.to_envelope()).unwrap();
+        if let Some(message) = decoder.pop().unwrap() {
+            match message {
+                Message::AgentWelcome {
+                    link_session_id, ..
+                } => break link_session_id,
+                other => panic!("expected AgentWelcome, got {}", other.type_name()),
+            }
         }
     };
-    assert_eq!(welcome["type"], "AgentWelcome");
-    // 过时的 DataBind（v2 双流遗留、v3 目录外）→ UnknownMessage → 会话关闭。
-    let stale = json!({
-        "v": PROTOCOL_VERSION, "type": "DataBind",
-        "body": {
-            "agent_boot_id": "boot-bad",
-            "link_session_id": welcome["body"]["link_session_id"],
-            "credential": "wrong-credential"
-        }
-    });
-    client.write_all(&raw_frame(&stale)).await.unwrap();
+    assert!(!link_session_id.is_empty());
+    // 目录外变体（索引 200）→ postcard 解码失败 → 会话关闭。
+    let _ = link_session_id;
+    client.write_all(&raw_frame(&[200])).await.unwrap();
     let closed = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let mut chunk = [0u8; 16 * 1024];
@@ -426,7 +418,8 @@ async fn coalesced_hello_and_trailing_frame_not_lost_by_master() {
     // T02 主进程侧：AgentHello 与尾随过时 DataBind 同一次 write。握手经
     // 统一 transport 收发后，尾随帧必须交付（表现为整会话拒绝关闭）；
     // 若握手用临时 decoder 取首帧后丢弃，尾帧丢失、会话悬挂不关闭。
-    use flow_engine::execution_protocol::contract::PROTOCOL_VERSION;
+    use flow_engine::execution_protocol::frame::encode_frame;
+    use flow_engine::execution_protocol::message::Message;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let dir = temp();
     std::fs::create_dir_all(&dir).unwrap();
@@ -442,21 +435,15 @@ async fn coalesced_hello_and_trailing_frame_not_lost_by_master() {
     manager
         .attach_inprocess("agent-coal".to_string(), control_a)
         .await;
-    let hello = json!({
-        "v": PROTOCOL_VERSION, "type": "AgentHello",
-        "body": {
-            "agent_boot_id": "boot-coal", "build": "t",
-            "capabilities": ["relay", "resource_report", "reconnect"],
-            "slots": "1"
-        }
-    });
-    let stale = json!({
-        "v": PROTOCOL_VERSION, "type": "DataBind",
-        "body": {"agent_boot_id": "boot-coal", "credential": "x"}
-    });
-    // 关键：两帧拼接后单次写入。
-    let mut bytes = raw_frame(&hello);
-    bytes.extend_from_slice(&raw_frame(&stale));
+    let hello = Message::AgentHello {
+        agent_boot_id: "boot-coal".into(),
+        build: "t".into(),
+        capabilities: vec!["relay".into(), "resource_report".into(), "reconnect".into()],
+        slots: 1,
+    };
+    // 关键：两帧拼接后单次写入（尾帧 = 目录外变体索引）。
+    let mut bytes = encode_frame(&hello).unwrap();
+    bytes.extend_from_slice(&raw_frame(&[200]));
     client.write_all(&bytes).await.unwrap();
     // 尾随 DataBind 必须被交付：会话以协议错误拒绝并关闭（5 秒内 EOF）。
     // 若握手交接丢失尾帧，会话将永远悬挂等不到关闭。
@@ -530,11 +517,11 @@ async fn coalesced_welcome_and_trailing_frame_not_lost_by_agent() {
             let n = tls.read(&mut chunk).await.unwrap();
             assert!(n > 0, "closed before agent hello");
             decoder.feed(&chunk[..n]).unwrap();
-            if let Some((_, _)) = decoder.pop().unwrap() {
+            if decoder.pop().unwrap().is_some() {
                 break;
             }
         }
-        // 关键：Welcome + 过时 DataBind（目录外类型）拼接后单次写回。
+        // 关键：Welcome + 目录外变体帧拼接后单次写回。
         let welcome = encode_frame(&Message::AgentWelcome {
             journal_id: "journal-wc".into(),
             master_epoch: 1,
@@ -544,13 +531,8 @@ async fn coalesced_welcome_and_trailing_frame_not_lost_by_agent() {
             agent_window_bytes: 8 * 1024 * 1024,
         })
         .unwrap();
-        let stale = raw_frame(&serde_json::json!({
-            "v": flow_engine::execution_protocol::PROTOCOL_VERSION,
-            "type": "DataBind",
-            "body": {"agent_boot_id": "boot-wc", "credential": "x"}
-        }));
         let mut out = welcome;
-        out.extend_from_slice(&stale);
+        out.extend_from_slice(&raw_frame(&[200]));
         tls.write_all(&out).await.unwrap();
         tls.flush().await.unwrap();
         // agent 必须消费尾帧、拒绝会话并断开（EOF）。

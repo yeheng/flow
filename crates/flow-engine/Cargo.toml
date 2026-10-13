@@ -15,6 +15,9 @@ reqwest = { workspace = true }
 parking_lot = { workspace = true }
 rquickjs = { workspace = true }
 libc = { workspace = true }
+getrandom = { workspace = true }
+interprocess = { workspace = true }
+postcard = { workspace = true }
 tracing = { workspace = true }
 aes-gcm = "0.10"
 hex = { workspace = true }

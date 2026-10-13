@@ -97,9 +97,13 @@ impl IpcDispatcher {
 }
 
 /// T09 确定性故障注入：测试在命名检查点注册 hold 开关；未注册时
-/// [`fault::checkpoint`] 立即返回（生产路径零行为差异）。用于在持久化
-/// 前后、Permit 发送前后、ResultCommitted 前后确定性断线/取消——代替
-/// 依赖 sleep 的竞态复现。注册表全局唯一：使用注入的测试必须串行场景。
+/// [`fault::checkpoint`] 立即返回。用于在持久化前后、Permit 发送前后、
+/// ResultCommitted 前后确定性断线/取消——代替依赖 sleep 的竞态复现。
+/// 注册表全局唯一：使用注入的测试必须串行场景。
+/// 仅测试构建与 `fault-injection` feature 编译进二进制（集成测试经
+/// flow-backend 的 dev 自依赖启用该 feature）；生产构建用下方空壳，
+/// 注册表与同步原语不进产物。
+#[cfg(any(test, feature = "fault-injection"))]
 pub mod fault {
     use std::collections::HashMap;
     use std::sync::OnceLock;
@@ -151,6 +155,12 @@ pub mod fault {
             let _ = receiver.wait_for(|hold| !hold).await;
         }
     }
+}
+
+/// 生产构建的空壳：调用点保留、注册表不进产物，checkpoint 立即返回。
+#[cfg(not(any(test, feature = "fault-injection")))]
+pub mod fault {
+    pub async fn checkpoint(_name: &str) {}
 }
 
 const OPERATION_TRANSFER_LIMIT: u64 = 8 * 1024 * 1024;
