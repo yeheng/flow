@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { assembleInput, discoverInputKeys } from "./run-input";
+import { assembleInput, discoverInputKeys, inputFieldText, parseInputFields } from "./run-input";
 import type { Definition, NodeTypeDesc } from "../types";
 
 const NODE_TYPES: NodeTypeDesc[] = [
@@ -54,9 +54,7 @@ describe("discoverInputKeys", () => {
   });
 
   it("普通字符串里的 input.xxx 不算（必须走 ${} 模板）", () => {
-    const d = def([
-      { id: "a", type: "http", params: { url: "https://input.example.com/help" } },
-    ]);
+    const d = def([{ id: "a", type: "http", params: { url: "https://input.example.com/help" } }]);
     expect(discoverInputKeys(d, NODE_TYPES)).toEqual([]);
   });
 
@@ -94,6 +92,18 @@ describe("discoverInputKeys", () => {
     ]);
     expect(discoverInputKeys(d, NODE_TYPES)).toEqual(["a", "z"]);
   });
+
+  it("input 节点声明的字段也是候选（提前填好运行期不挂起）", () => {
+    const d = def([
+      {
+        id: "i",
+        type: "input",
+        params: { fields: [{ key: "token" }, { key: "n", default: 1 }] },
+      },
+      { id: "a", type: "http", params: { url: "${input.token}/x" } },
+    ]);
+    expect(discoverInputKeys(d, NODE_TYPES)).toEqual(["n", "token"]);
+  });
 });
 
 describe("assembleInput", () => {
@@ -109,5 +119,46 @@ describe("assembleInput", () => {
   it("空字段省略，全空返回 undefined", () => {
     expect(assembleInput({ a: "", b: "  " })).toBeUndefined();
     expect(assembleInput({ a: "", b: "x" })).toEqual({ b: "x" });
+  });
+});
+
+describe("parseInputFields", () => {
+  it("解析合法项，忽略非法项", () => {
+    const params = {
+      fields: [
+        { key: "token", label: "令牌" },
+        { key: "n", default: 1 },
+        { key: "  " },
+        { label: "无 key" },
+        "junk",
+      ],
+    };
+    expect(parseInputFields(params)).toEqual([
+      { key: "token", label: "令牌" },
+      { key: "n", default: 1 },
+    ]);
+  });
+
+  it("快照缺失或 fields 非数组时为空", () => {
+    expect(parseInputFields(undefined)).toEqual([]);
+    expect(parseInputFields({})).toEqual([]);
+    expect(parseInputFields({ fields: "${input.fields}" })).toEqual([]);
+  });
+});
+
+describe("inputFieldText", () => {
+  const field = { key: "token", label: "令牌", default: "dft" };
+
+  it("run 输入已有的值优先，字符串原样、对象 JSON 化", () => {
+    expect(inputFieldText(field, { token: "abc" })).toBe("abc");
+    expect(inputFieldText({ key: "o" }, { o: { x: 1 } })).toBe('{"x":1}');
+  });
+
+  it("null 视为未提供，回落默认值，再回落空串", () => {
+    expect(inputFieldText(field, { token: null })).toBe("dft");
+    expect(inputFieldText(field, {})).toBe("dft");
+    expect(inputFieldText({ key: "x" }, { other: 1 })).toBe("");
+    expect(inputFieldText(field, undefined)).toBe("dft");
+    expect(inputFieldText(field, ["not-object"])).toBe("dft");
   });
 });

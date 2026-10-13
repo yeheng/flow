@@ -64,14 +64,16 @@ impl Services {
             root.join("flow")
         };
         if config.journal.cluster.is_some() {
-            return Err("journal.cluster 当前只支持 flow-journal-server；请使用浏览器工作台连接该服务".into());
+            return Err(
+                "journal.cluster 当前只支持 flow-journal-server；请使用浏览器工作台连接该服务"
+                    .into(),
+            );
         }
         let journal = JournalBackend::open(&root.join("journal"), Default::default())
             .await
             .map_err(|e| e.to_string())?;
-        
-        let built =
-            Self::assemble(journal.clone(), config, config_path, data).await;
+
+        let built = Self::assemble(journal.clone(), config, config_path, data).await;
         if built.is_err() {
             let _ = journal.close().await;
         }
@@ -79,7 +81,7 @@ impl Services {
     }
 
     async fn assemble(
-            journal: Arc<JournalBackend>,
+        journal: Arc<JournalBackend>,
         config: flow_config::Config,
         config_path: PathBuf,
         data_dir: PathBuf,

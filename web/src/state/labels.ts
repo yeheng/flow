@@ -87,6 +87,8 @@ export function nodeTypeLabel(type: string): string {
       return "Harness 代理";
     case "human_task":
       return "人工节点";
+    case "input":
+      return "输入";
     case "sub_workflow":
       return "子工作流";
     default:

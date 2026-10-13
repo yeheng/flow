@@ -34,6 +34,10 @@ function collectParams(value: unknown, schema: PropertySchema | undefined, out: 
 export function discoverInputKeys(def: Definition, nodeTypes: NodeTypeDesc[]): string[] {
   const out = new Set<string>();
   for (const node of def.nodes) {
+    // input 节点声明的字段同样是 run input 的候选：启动时提前填好，运行期就不挂起
+    if (node.type === "input") {
+      for (const f of parseInputFields(node.params)) out.add(f.key);
+    }
     const schema = nodeTypes.find((t) => t.type === node.type)?.params_schema;
     collectParams(node.params, schema, out);
   }
@@ -53,4 +57,41 @@ export function assembleInput(values: Record<string, string>): unknown {
     }
   }
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** input 节点声明的字段（params.fields 的合法项；形态在建图期已由后端校验） */
+export interface InputField {
+  key: string;
+  label?: string;
+  default?: unknown;
+}
+
+/** 从节点参数/输入面快照解析 fields，非法项忽略（快照可能缺失或是 ${} 模板原文） */
+export function parseInputFields(params: unknown): InputField[] {
+  const fields = (params as { fields?: unknown } | null | undefined)?.fields;
+  if (!Array.isArray(fields)) return [];
+  const out: InputField[] = [];
+  for (const f of fields) {
+    if (f === null || typeof f !== "object") continue;
+    const { key, label } = f as { key?: unknown; label?: unknown };
+    if (typeof key !== "string" || !key.trim()) continue;
+    const dft = (f as { default?: unknown }).default;
+    out.push({
+      key,
+      ...(typeof label === "string" && label ? { label } : {}),
+      ...(dft !== undefined ? { default: dft } : {}),
+    });
+  }
+  return out;
+}
+
+/** 字段的表单初值文本：run 输入已有的值（null 视为未提供）→ 默认值 → 空 */
+export function inputFieldText(field: InputField, runInput: unknown): string {
+  const src =
+    runInput !== null && typeof runInput === "object" && !Array.isArray(runInput)
+      ? (runInput as Record<string, unknown>)[field.key]
+      : undefined;
+  const v = src ?? field.default;
+  if (v === undefined || v === null) return "";
+  return typeof v === "string" ? v : JSON.stringify(v);
 }

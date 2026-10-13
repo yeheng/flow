@@ -72,7 +72,10 @@ async fn embedded_flow_runs_streams_and_persists_without_a_rpc_listener() {
         json!({"workflow_id":id,"input":{"hello":"desktop"}}),
     )
     .await;
-    assert!(started["result"]["result"]["run_id"].is_string(), "{started}");
+    assert!(
+        started["result"]["result"]["run_id"].is_string(),
+        "{started}"
+    );
     let run = started["result"]["result"]["run_id"].clone();
     let service = host.services.clone();
     let subscribe_run = run.clone();

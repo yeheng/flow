@@ -125,6 +125,21 @@ pub fn human_def() -> Value {
     })
 }
 
+/// start → input → end。fields 逐项 {"key","label"?,"default"?}。
+pub fn input_def(fields: Value) -> Value {
+    json!({
+        "nodes": [
+            {"id": "start", "type": "start", "name": "开始"},
+            {"id": "i", "type": "input", "name": "输入", "params": {"fields": fields}},
+            {"id": "end", "type": "end", "name": "结束"}
+        ],
+        "edges": [
+            {"from": "start", "to": "i"},
+            {"from": "i", "to": "end"}
+        ]
+    })
+}
+
 /// start → http_call → end。
 pub fn http_def(method: &str, url: &str) -> Value {
     json!({

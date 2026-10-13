@@ -16,6 +16,15 @@ defineEmits<{ collapse: []; "toggle-layout": [] }>();
  * 此时可切 JSON 模式手动补齐。
  */
 const inputKeys = computed(() => discoverInputKeys(flowToDefinition(), editor.nodeTypes));
+
+/** 输入节点表单的预填来源：启动草稿里的输入（非法 JSON 时无预填） */
+const launchedInput = computed(() => {
+  try {
+    return JSON.parse(monitor.inputText);
+  } catch {
+    return undefined;
+  }
+});
 </script>
 
 <template>
@@ -32,7 +41,7 @@ const inputKeys = computed(() => discoverInputKeys(flowToDefinition(), editor.no
       <AppButton title="收起运行面板" @click="$emit('collapse')">收起 ▾</AppButton>
     </div>
     <div class="run-panel-body">
-      <RunMonitor v-if="monitor.runId" :layout="layout" />
+      <RunMonitor v-if="monitor.runId" :layout="layout" :run-input="launchedInput" />
       <p v-else class="run-hint">在顶部工具栏点击「运行」启动最新已发布版本，面板随运行自动展开</p>
     </div>
   </div>

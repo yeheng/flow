@@ -290,7 +290,7 @@ onUnmounted(() => {
         />
 
         <template v-if="activeTab === 'timeline'">
-          <RunMonitor v-if="monitor.runId" child-run-navigate />
+          <RunMonitor v-if="monitor.runId" child-run-navigate :run-input="record?.input" />
           <p v-else class="run-hint">正在加载…</p>
         </template>
         <LogConsole v-else class="aside-log-console" @select-node="onSelectNode" />

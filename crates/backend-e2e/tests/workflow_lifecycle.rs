@@ -401,6 +401,7 @@ e2e_test!(
                 "delay",
                 "http_call",
                 "human_task",
+                "input",
                 "sub_workflow",
                 "harness",
                 "email"

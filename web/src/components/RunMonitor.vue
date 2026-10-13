@@ -9,18 +9,20 @@ import {
   openChildRun,
   canCancelRun,
   waitingHumanTasks,
+  waitingInputNodes,
 } from "../state/monitor";
 import { editor } from "../state/editor";
 import { nodeStateLabel, runStatusLabel } from "../state/labels";
 import { confirmDialog } from "../state/modal";
+import { assembleInput, inputFieldText, parseInputFields } from "../state/run-input";
 import { toast } from "../state/toast";
 import ActivityFeed from "./ActivityFeed.vue";
 import LogConsole from "./LogConsole.vue";
 import AppButton from "./AppButton.vue";
 
 const props = withDefaults(
-  defineProps<{ childRunNavigate?: boolean; layout?: "footer" | "sidebar" }>(),
-  { childRunNavigate: false, layout: "sidebar" },
+  defineProps<{ childRunNavigate?: boolean; layout?: "footer" | "sidebar"; runInput?: unknown }>(),
+  { childRunNavigate: false, layout: "sidebar", runInput: undefined },
 );
 
 const router = useRouter();
@@ -40,6 +42,33 @@ const runStateText = computed(() => (monitor.status ? runStatusLabel(monitor.sta
 
 /** human_task 信号输入框内容，key = node_id */
 const signalTexts = reactive<Record<string, string>>({});
+
+/** input 节点表单内容：node_id → field key → 文本（初值 = run 输入已有值 → 字段默认值） */
+const inputFormTexts = reactive<Record<string, Record<string, string>>>({});
+watch(
+  waitingInputNodes,
+  (nodes) => {
+    for (const n of nodes) {
+      if (inputFormTexts[n.id]) continue;
+      const row: Record<string, string> = {};
+      for (const f of parseInputFields(n.input)) row[f.key] = inputFieldText(f, props.runInput);
+      inputFormTexts[n.id] = row;
+    }
+  },
+  { immediate: true },
+);
+
+/** 所有字段都有值才能提交（默认值/预填已兜底的字段天然满足） */
+function inputFormReady(nodeId: string): boolean {
+  const row = inputFormTexts[nodeId];
+  return !!row && Object.values(row).every((v) => v.trim() !== "");
+}
+
+function deliverInputForm(nodeId: string): void {
+  const assembled = assembleInput(inputFormTexts[nodeId] ?? {});
+  if (assembled === undefined) return;
+  void deliverSignal(nodeId, JSON.stringify(assembled));
+}
 
 function fmtJson(v: unknown): string {
   if (v === undefined || v === null) return "";
@@ -165,6 +194,45 @@ function onOpenChildRun(childRunId: string): void {
         </div>
         <pre v-if="outputExpanded && outputLong" class="run-output-full">{{ outputPretty }}</pre>
         <code v-else>{{ fmtJson(monitor.output) }}</code>
+      </div>
+
+      <div v-for="n in waitingInputNodes" :key="n.id" class="signal-box">
+        <div>「{{ n.name || n.id }}」等待输入</div>
+        <template v-if="parseInputFields(n.input).length > 0">
+          <div v-for="f in parseInputFields(n.input)" :key="f.key" class="signal-row">
+            <span class="input-field-label mono" :title="f.key">{{ f.label || f.key }}</span>
+            <input
+              v-model="inputFormTexts[n.id][f.key]"
+              type="text"
+              spellcheck="false"
+              placeholder="值"
+              title="5、true、{...} 等按 JSON 解析，其余按字符串"
+            />
+          </div>
+          <div class="signal-row">
+            <AppButton
+              :disabled="monitor.delivering || !inputFormReady(n.id)"
+              @click="deliverInputForm(n.id)"
+            >
+              提交
+            </AppButton>
+          </div>
+        </template>
+        <template v-else>
+          <div class="signal-row">
+            <input
+              v-model="signalTexts[n.id]"
+              type="text"
+              placeholder='输入 JSON（可选），如 {"key": "value"}'
+            />
+            <AppButton
+              :disabled="monitor.delivering"
+              @click="deliverSignal(n.id, signalTexts[n.id] ?? '')"
+            >
+              交付
+            </AppButton>
+          </div>
+        </template>
       </div>
 
       <div v-for="n in waitingHumanTasks" :key="n.id" class="signal-box">
@@ -477,6 +545,16 @@ function onOpenChildRun(childRunId: string): void {
   display: flex;
   gap: 6px;
   margin-top: 6px;
+  align-items: center;
+}
+
+.input-field-label {
+  flex-shrink: 0;
+  min-width: 72px;
+  font-size: 12px;
+  color: var(--text2);
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .timeline {

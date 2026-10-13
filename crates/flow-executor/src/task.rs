@@ -625,6 +625,53 @@ impl TaskRunner {
                     },
                 })
             }
+            NodeType::Input => {
+                // 逐字段解析：run 输入里已有（非 null）的值优先，否则用字段默认值；
+                // 有字段两者皆无 → 挂起等用户填写，交付的对象成为本节点输出
+                let params = materialize_prepared_params(self, prepared).await?;
+                // 建图期已校验 fields 为数组；走到这里还不是数组，只可能是
+                // ${} 模板展开出了非数组——不能静默放空，按业务错误失败
+                let Some(fields) = params["fields"].as_array() else {
+                    return Err(TaskError::Business(
+                        "input 节点的 fields 必须是数组（模板展开后亦然）".into(),
+                    ));
+                };
+                let run_input = inputs.input.as_object();
+                let mut resolved = serde_json::Map::new();
+                let mut waiting = false;
+                for field in fields {
+                    let Some(key) = field.get("key").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let value = run_input
+                        .and_then(|o| o.get(key))
+                        .filter(|v| !v.is_null())
+                        .or_else(|| field.get("default"));
+                    match value {
+                        Some(v) => {
+                            resolved.insert(key.to_string(), v.clone());
+                        }
+                        None => waiting = true,
+                    }
+                }
+                if !waiting {
+                    logger.info("输入字段已齐，直接放行");
+                    return Ok(ResultOutcome::Success {
+                        output: StoredValue::Inline(Value::Object(resolved)),
+                        branch: None,
+                    });
+                }
+                logger.info("输入字段未齐，等待用户填写（run.signal 交付）");
+                Ok(ResultOutcome::Wait {
+                    wait: WaitRequest {
+                        kind: "signal".into(),
+                        wake_at: None,
+                        output: None,
+                        workflow_id: None,
+                        input_mapping: None,
+                    },
+                })
+            }
             NodeType::SubWorkflow => {
                 let params = materialize_prepared_params(self, prepared).await?;
                 let workflow_id = params["workflow_id"]
@@ -1406,6 +1453,7 @@ fn narrative_kind(kind: Option<NodeType>) -> Option<&'static str> {
         NodeType::Harness => Some("本地命令"),
         NodeType::Delay => Some("延时等待"),
         NodeType::HumanTask => Some("人工任务"),
+        NodeType::Input => Some("输入收集"),
         NodeType::SubWorkflow => Some("子工作流"),
         NodeType::Start | NodeType::End => None,
     }

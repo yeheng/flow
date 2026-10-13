@@ -62,6 +62,11 @@ export const waitingHumanTasks = computed(() =>
   monitor.nodes.filter((n) => n.type === "human_task" && n.wait?.kind === "signal"),
 );
 
+/** input 节点等待用户填写的节点（run 输入未覆盖声明字段时挂起） */
+export const waitingInputNodes = computed(() =>
+  monitor.nodes.filter((n) => n.type === "input" && n.wait?.kind === "signal"),
+);
+
 export function nodeRunState(nodeId: string): string | null {
   if (!monitor.runId || monitor.workflowId !== editor.workflowId) return null;
   return monitor.nodes.find((n) => n.id === nodeId)?.state ?? null;

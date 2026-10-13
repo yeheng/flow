@@ -15,6 +15,9 @@ pub enum NodeType {
     Delay,
     HttpCall,
     HumanTask,
+    /// 输入收集：run 输入已含声明字段（或有默认值）时直接放行输出，
+    /// 否则挂起等用户填写表单（signal 交付）后继续
+    Input,
     /// 调用另一个已发布工作流作为子 run，等待其终态并透传输出
     SubWorkflow,
     /// 外部 agent CLI（kimi / claude / codex 等）：prompt 经 stdin 传入，stdout 作为输出
@@ -31,7 +34,7 @@ pub enum NodeType {
 ///
 /// 表用 `(变体, 字符串)` 而不是靠 `as_str` 反推：字符串是 wire 格式与落库内容，
 /// 让它显式出现在表里，改名时编译器与快照测试一起响。
-const NODE_TYPE_TABLE: [(NodeType, &str); 10] = [
+const NODE_TYPE_TABLE: [(NodeType, &str); 11] = [
     (NodeType::Start, "start"),
     (NodeType::End, "end"),
     (NodeType::Script, "script"),
@@ -39,6 +42,7 @@ const NODE_TYPE_TABLE: [(NodeType, &str); 10] = [
     (NodeType::Delay, "delay"),
     (NodeType::HttpCall, "http_call"),
     (NodeType::HumanTask, "human_task"),
+    (NodeType::Input, "input"),
     (NodeType::SubWorkflow, "sub_workflow"),
     (NodeType::Harness, "harness"),
     (NodeType::Email, "email"),
@@ -46,7 +50,7 @@ const NODE_TYPE_TABLE: [(NodeType, &str); 10] = [
 
 impl NodeType {
     /// 全部节点类型，顺序 = 表的顺序 = `nodetypes.list` 响应顺序 = 前端面板顺序。
-    pub const ALL: [NodeType; 10] = [
+    pub const ALL: [NodeType; 11] = [
         NodeType::Start,
         NodeType::End,
         NodeType::Script,
@@ -54,6 +58,7 @@ impl NodeType {
         NodeType::Delay,
         NodeType::HttpCall,
         NodeType::HumanTask,
+        NodeType::Input,
         NodeType::SubWorkflow,
         NodeType::Harness,
         NodeType::Email,
@@ -184,6 +189,19 @@ impl NodeType {
                     }
                 }
             }),
+            NodeType::Input => serde_json::json!({
+                "label": "输入",
+                "category": "human",
+                "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
+                "params_schema": {
+                    "type": "object",
+                    "required": ["fields"],
+                    "properties": {
+                        "fields": {"type": "array", "x-widget": "json", "x-label": "输入字段",
+                                   "x-help": "JSON 数组，每项 {\"key\":\"token\",\"label\":\"显示名\",\"default\":…}（label/default 可省）。run 输入已覆盖全部字段（默认值可兜底）时直接放行，输出这些字段的值；否则挂起等用户填写（run.signal 交付的对象成为本节点输出）"}
+                    }
+                }
+            }),
             NodeType::SubWorkflow => serde_json::json!({
                 "label": "子工作流",
                 "category": "control",
@@ -256,7 +274,7 @@ impl NodeType {
     /// [`NODE_TYPE_TABLE`] 的顺序与 enum 声明共同决定，
     /// `node_type_table_is_exhaustive` 钉住这条。
     pub fn descriptor(self) -> &'static Value {
-        static DESCRIPTORS: LazyLock<[Value; 10]> = LazyLock::new(|| {
+        static DESCRIPTORS: LazyLock<[Value; 11]> = LazyLock::new(|| {
             std::array::from_fn(|i| {
                 let kind = NodeType::ALL[i];
                 let mut body = kind.descriptor_body();
@@ -733,6 +751,8 @@ pub fn validate_params(node: &Node, kind: NodeType) -> Result<(), String> {
         let missing = match schema_type {
             "integer" | "number" => node.params.get(key).and_then(Value::as_u64).is_none(),
             "boolean" => node.params.get(key).and_then(Value::as_bool).is_none(),
+            // 数组必填（input.fields）：值必须是数组，字符串形态只在含 ${} 时由上面的模板规则放行
+            "array" => node.params.get(key).and_then(Value::as_array).is_none(),
             // 字符串必填：空串与纯空白都算「没填」
             _ => node.param_str(key).is_none_or(|v| v.trim().is_empty()),
         };
@@ -785,6 +805,28 @@ pub fn validate_params(node: &Node, kind: NodeType) -> Result<(), String> {
                 )),
             }
         }
+        NodeType::Input => match node.params.get("fields") {
+            // ${} 模板放行到执行期判定（required 检查同样放行）
+            Some(Value::String(s)) if s.contains("${") => Ok(()),
+            Some(Value::Array(items)) => {
+                let bad = items.iter().any(|f| {
+                    f.get("key")
+                        .and_then(Value::as_str)
+                        .is_none_or(|k| k.trim().is_empty())
+                });
+                if bad {
+                    Err(format!(
+                        "节点 {}（input）的 fields 每项都要含非空 key 字符串",
+                        node.id
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            // 值存在但形态非法（缺失已由上面的 required 检查先报）
+            Some(_) => Err(format!("节点 {}（input）的 fields 必须是数组", node.id)),
+            None => Ok(()),
+        },
         _ => Ok(()),
     }
 }
@@ -1266,6 +1308,7 @@ mod tests {
             "delay",
             "http_call",
             "human_task",
+            "input",
             "sub_workflow",
             "harness",
             "email",
@@ -1273,7 +1316,7 @@ mod tests {
             let parsed = NodeType::parse(kind).unwrap_or_else(|| panic!("{kind} 应可解析"));
             assert_eq!(parsed.as_str(), kind, "{kind} 应原样往返");
         }
-        assert_eq!(NodeType::ALL.len(), 10, "新类型必须登记进 ALL");
+        assert_eq!(NodeType::ALL.len(), 11, "新类型必须登记进 ALL");
         for kind in NodeType::ALL {
             assert_eq!(
                 kind.descriptor()["type"],
@@ -1446,6 +1489,41 @@ mod tests {
         );
         let err = email.validate().unwrap_err();
         assert!(err.contains("to"), "{err}");
+    }
+
+    /// input 节点的 fields：必填、必须是数组、每项含非空 key。
+    #[test]
+    fn input_node_fields_validation() {
+        let input_def = |fields: Value| {
+            def(
+                vec![
+                    node("s", "start"),
+                    json!({"id": "n", "type": "input", "params": {"fields": fields}}),
+                    node("e", "end"),
+                ],
+                vec![json!({"from":"s","to":"n"}), json!({"from":"n","to":"e"})],
+            )
+        };
+        // 缺 fields / 形态非法 / 空 key 都被拒
+        let bare = def(
+            vec![
+                node("s", "start"),
+                json!({"id": "n", "type": "input", "params": {}}),
+                node("e", "end"),
+            ],
+            vec![json!({"from":"s","to":"n"}), json!({"from":"n","to":"e"})],
+        );
+        assert!(bare.validate().unwrap_err().contains("fields"));
+        assert!(input_def(json!("not-array")).validate().is_err());
+        assert!(input_def(json!([{"label": "无 key"}])).validate().is_err());
+        assert!(input_def(json!([{"key": "  "}])).validate().is_err());
+        // 合法：key + 可选 label/default；${} 模板放行到执行期
+        assert!(
+            input_def(json!([{"key": "token", "label": "令牌"}, {"key": "n", "default": 1}]))
+                .validate()
+                .is_ok()
+        );
+        assert!(input_def(json!("${input.fields}")).validate().is_ok());
     }
 
     #[test]
