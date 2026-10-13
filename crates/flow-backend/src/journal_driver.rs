@@ -7,9 +7,7 @@ use crate::execution::{ExecutionMode, IpcDispatcher};
 use crate::journal::{JournalBackend, JournalError};
 use crate::journal_commands::node_event;
 use crate::journal_execution::Attempt;
-use flow_engine::journal_state::{
-    Node as NodeState, NodeStatus, Run, RunStatus, Wait, WaitKind,
-};
+use flow_engine::journal_state::{Node as NodeState, NodeStatus, Run, RunStatus, Wait, WaitKind};
 use flow_engine::{Definition, NodeLogger, NodeType};
 use flow_journal::{Event, EventKind, StoredValue};
 use futures::FutureExt;
@@ -375,13 +373,16 @@ async fn advance_run(
             NodeGate::Skip(reason) => {
                 backend
                     .internal(|s| {
-                        Ok((vec![node_event(
-                            &s.runs[run_id],
-                            &node.id,
-                            EventKind::NodeSkipped,
-                            json!({"reason": reason}),
-                            true,
-                        )], ()))
+                        Ok((
+                            vec![node_event(
+                                &s.runs[run_id],
+                                &node.id,
+                                EventKind::NodeSkipped,
+                                json!({"reason": reason}),
+                                true,
+                            )],
+                            (),
+                        ))
                     })
                     .await?;
             }
@@ -391,8 +392,16 @@ async fn advance_run(
                     backend.defer_run(run_id.to_owned()).await;
                     continue;
                 }
-                spawn_node_attempt(backend, port, observation, run_id, node, predecessors, coord)
-                    .await?;
+                spawn_node_attempt(
+                    backend,
+                    port,
+                    observation,
+                    run_id,
+                    node,
+                    predecessors,
+                    coord,
+                )
+                .await?;
             }
         }
     }
@@ -411,7 +420,9 @@ async fn cancel_if_parent_cancelled(backend: &Arc<JournalBackend>, run: &Run) ->
             })
             .await;
         if cancelled {
-            backend.run_cancel(&run.run_id, Some("parent-cancel")).await?;
+            backend
+                .run_cancel(&run.run_id, Some("parent-cancel"))
+                .await?;
             return Ok(true);
         }
     }
@@ -466,7 +477,11 @@ async fn advance_committed_node(
     if record.status == NodeStatus::Failed {
         return Ok(true);
     }
-    if record.operation.as_ref().is_some_and(|op| op.outcome.is_none()) {
+    if record
+        .operation
+        .as_ref()
+        .is_some_and(|op| op.outcome.is_none())
+    {
         let attempt = Attempt {
             backend: backend.clone(),
             run_id: run_id.to_owned(),
@@ -561,9 +576,7 @@ async fn spawn_node_attempt(
     let port = port.clone();
     coord
         .tasks
-        .spawn(async move {
-            execute_node(port, attempt, node, predecessors, observation).await
-        });
+        .spawn(async move { execute_node(port, attempt, node, predecessors, observation).await });
     Ok(())
 }
 
@@ -596,10 +609,7 @@ async fn execute_node(
     .catch_unwind()
     .await
     .unwrap_or_else(|_| {
-        Err(invalid(
-            "node execution panicked; committed operation evidence retained",
-        )
-        .into())
+        Err(invalid("node execution panicked; committed operation evidence retained").into())
     });
     if let Err(error) = &result {
         if let Ok(snapshot) = attempt.snapshot().await {
@@ -628,7 +638,10 @@ async fn execute_node(
                         attempt.node_id.clone(),
                         n.attempt,
                     )
-                    .warn(format!("第 {} 次尝试失败，{}ms 后自动重试", n.attempt, delay));
+                    .warn(format!(
+                        "第 {} 次尝试失败，{}ms 后自动重试",
+                        n.attempt, delay
+                    ));
                 }
             }
             let _ = attempt
@@ -661,18 +674,22 @@ async fn settle_run(
         .ok_or_else(|| invalid("run missing"))?;
     if snapshot.terminal()
         || !definition.nodes.iter().all(|n| {
-            snapshot
-                .nodes
-                .get(&n.id)
-                .is_some_and(|n| matches!(n.status, NodeStatus::Succeeded | NodeStatus::Skipped | NodeStatus::Failed))
+            snapshot.nodes.get(&n.id).is_some_and(|n| {
+                matches!(
+                    n.status,
+                    NodeStatus::Succeeded | NodeStatus::Skipped | NodeStatus::Failed
+                )
+            })
         })
     {
         return Ok(());
     }
-    let failed = definition
-        .nodes
-        .iter()
-        .find(|n| snapshot.nodes.get(&n.id).is_some_and(|r| r.status == NodeStatus::Failed));
+    let failed = definition.nodes.iter().find(|n| {
+        snapshot
+            .nodes
+            .get(&n.id)
+            .is_some_and(|r| r.status == NodeStatus::Failed)
+    });
     match failed {
         Some(failed_node) => {
             let error = backend
@@ -784,11 +801,14 @@ mod gate_tests {
                 let output = output
                     .as_ref()
                     .map(|value| StoredValue::inline(value.clone()).unwrap());
-                ((*id).to_string(), GateNode {
-                    status: serde_json::from_value::<NodeStatus>(json!(status)).unwrap(),
-                    branch: *branch,
-                    output,
-                })
+                (
+                    (*id).to_string(),
+                    GateNode {
+                        status: serde_json::from_value::<NodeStatus>(json!(status)).unwrap(),
+                        branch: *branch,
+                        output,
+                    },
+                )
             })
             .collect()
     }
@@ -799,11 +819,20 @@ mod gate_tests {
             {"from":"s","to":"a"},{"from":"s","to":"b"},
             {"from":"a","to":"e"},{"from":"b","to":"e"}
         ]));
-        let settled = view(&[("s","succeeded",None,None), ("a","succeeded",None,Some(json!(1)))]);
-        assert!(matches!(incoming_gate(&def, &settled, node("e", &def)), NodeGate::Blocked));
+        let settled = view(&[
+            ("s", "succeeded", None, None),
+            ("a", "succeeded", None, Some(json!(1))),
+        ]);
+        assert!(matches!(
+            incoming_gate(&def, &settled, node("e", &def)),
+            NodeGate::Blocked
+        ));
         // 未注册的入边节点（缺前驱记录）同样阻塞。
         let empty = view(&[]);
-        assert!(matches!(incoming_gate(&def, &empty, node("a", &def)), NodeGate::Blocked));
+        assert!(matches!(
+            incoming_gate(&def, &empty, node("a", &def)),
+            NodeGate::Blocked
+        ));
     }
 
     #[test]
@@ -813,9 +842,9 @@ mod gate_tests {
             {"from":"a","to":"e"},{"from":"b","to":"e"}
         ]));
         let view = view(&[
-            ("s","succeeded",None,None),
-            ("a","succeeded",None,Some(json!({"a":1}))),
-            ("b","succeeded",None,Some(json!(2))),
+            ("s", "succeeded", None, None),
+            ("a", "succeeded", None, Some(json!({"a":1}))),
+            ("b", "succeeded", None, Some(json!(2))),
         ]);
         let NodeGate::Ready(predecessors) = incoming_gate(&def, &view, node("e", &def)) else {
             panic!("expected ready");
@@ -835,12 +864,20 @@ mod gate_tests {
             {"from":"s","to":"a"},{"from":"s","to":"b"},
             {"from":"a","to":"e"},{"from":"b","to":"e"}
         ]));
-        let failed = view(&[("s","succeeded",None,None), ("a","failed",None,None), ("b","skipped",None,None)]);
+        let failed = view(&[
+            ("s", "succeeded", None, None),
+            ("a", "failed", None, None),
+            ("b", "skipped", None, None),
+        ]);
         assert!(matches!(
             incoming_gate(&def, &failed, node("e", &def)),
             NodeGate::Skip("upstream_failed")
         ));
-        let view = view(&[("s","succeeded",None,None), ("a","skipped",None,None), ("b","skipped",None,None)]);
+        let view = view(&[
+            ("s", "succeeded", None, None),
+            ("a", "skipped", None, None),
+            ("b", "skipped", None, None),
+        ]);
         assert!(matches!(
             incoming_gate(&def, &view, node("e", &def)),
             NodeGate::Skip("upstream_skipped")
@@ -853,7 +890,7 @@ mod gate_tests {
             {"from":"a","to":"x","port":"true"},
             {"from":"a","to":"y","port":"false"}
         ]));
-        let view = view(&[("a","succeeded",Some(false),Some(json!(1)))]);
+        let view = view(&[("a", "succeeded", Some(false), Some(json!(1)))]);
         assert!(matches!(
             incoming_gate(&def, &view, node("x", &def)),
             NodeGate::Skip("branch_not_taken")
@@ -873,7 +910,10 @@ mod gate_tests {
     fn node_without_incoming_edges_is_ready() {
         let def = definition(json!([{"from":"s","to":"a"}]));
         let view = view(&[]);
-        assert!(matches!(incoming_gate(&def, &view, node("s", &def)), NodeGate::Ready(_)));
+        assert!(matches!(
+            incoming_gate(&def, &view, node("s", &def)),
+            NodeGate::Ready(_)
+        ));
     }
 }
 

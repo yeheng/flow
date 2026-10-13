@@ -8,11 +8,11 @@ use flow_agent::runtime::{serve_for_tests, AgentConfig};
 use flow_backend::journal::JournalBackend;
 use flow_engine::execution_protocol::transport::FrameTransport;
 use flow_engine::journal_state::Run;
+use flow_engine::journal_state::RunStatus;
 use flow_journal::JournalOptions;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
-use flow_engine::journal_state::{RunStatus};
 
 fn temp() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("flow-journal-r3-{}", uuid::Uuid::now_v7()))
@@ -325,7 +325,8 @@ async fn drain_stops_new_dispatch_and_recycles() {
     let flow = install(&backend, serde_json::from_str(FLOW).unwrap()).await;
     let done = run_and_finish(&backend, &flow, 1).await;
     assert_eq!(
-        done.status, RunStatus::Failed,
+        done.status,
+        RunStatus::Failed,
         "no agent after drain must fail loudly"
     );
     backend.close().await.unwrap();

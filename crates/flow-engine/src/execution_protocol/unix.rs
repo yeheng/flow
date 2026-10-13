@@ -23,14 +23,16 @@ pub fn socketpair_channel() -> std::io::Result<(UnixStream, UnixStream)> {
         }
     }
     // SAFETY: FD 由本函数创建且只移交一次。
-    let (parent, child) = unsafe { (StdStream::from_raw_fd(fds[0]), StdStream::from_raw_fd(fds[1])) };
+    let (parent, child) = unsafe {
+        (
+            StdStream::from_raw_fd(fds[0]),
+            StdStream::from_raw_fd(fds[1]),
+        )
+    };
     // tokio 要求非阻塞；socketpair 默认阻塞。
     parent.set_nonblocking(true)?;
     child.set_nonblocking(true)?;
-    Ok((
-        UnixStream::from_std(parent)?,
-        UnixStream::from_std(child)?,
-    ))
+    Ok((UnixStream::from_std(parent)?, UnixStream::from_std(child)?))
 }
 
 /// 执行器入口：按父进程 `--channel-fd` 指定的原号构建端点。

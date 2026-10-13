@@ -141,7 +141,9 @@ impl ProductCommand {
             Self::WebhookSetEnabled { .. } => "webhook.set_enabled",
             Self::WebhookDelete { .. } => "webhook.delete",
             Self::TemplateUpsert { creating: true, .. } => "template.create",
-            Self::TemplateUpsert { creating: false, .. } => "template.update",
+            Self::TemplateUpsert {
+                creating: false, ..
+            } => "template.update",
             Self::TemplateDelete { .. } => "template.delete",
         }
     }
@@ -172,8 +174,7 @@ impl ProductCommand {
     }
     fn key(&self) -> &str {
         match self {
-            Self::ScheduleCreate { key, .. }
-            | Self::WebhookCreate { key, .. } => key,
+            Self::ScheduleCreate { key, .. } | Self::WebhookCreate { key, .. } => key,
             Self::ScheduleUpdate { id, .. }
             | Self::TemplateUpsert { id, .. }
             | Self::ScheduleDelete { id }

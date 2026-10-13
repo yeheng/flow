@@ -7,11 +7,11 @@ use flow_agent::runtime::{serve_for_tests, AgentConfig};
 use flow_backend::journal::JournalBackend;
 use flow_engine::execution_protocol::transport::FrameTransport;
 use flow_engine::journal_state::Run;
+use flow_engine::journal_state::RunStatus;
 use flow_journal::{JournalOptions, StoredValue};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
-use flow_engine::journal_state::{RunStatus};
 
 fn temp() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("flow-journal-r2-{}", uuid::Uuid::now_v7()))
@@ -53,10 +53,7 @@ fn agent_config() -> AgentConfig {
 async fn proxy_pair(
     manager: &Arc<flow_backend::execution::remote::AgentManager>,
     agent_id: &str,
-) -> (
-    tokio::io::DuplexStream,
-    Vec<tokio::task::JoinHandle<()>>,
-) {
+) -> (tokio::io::DuplexStream, Vec<tokio::task::JoinHandle<()>>) {
     // agent 侧直连 pair；master 侧经代理由测试持柄（abort 代理即模拟断链）。
     let (agent_stream, master_a) = tokio::io::duplex(256 * 1024);
     let (test_stream, master_b) = tokio::io::duplex(256 * 1024);

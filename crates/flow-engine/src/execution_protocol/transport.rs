@@ -100,11 +100,7 @@ impl FrameTransport {
         });
         let (read_half, write_half) = tokio::io::split(stream);
         let read_half: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>> = Box::pin(read_half);
-        let reader = tokio::spawn(read_loop_tagged(
-            read_half,
-            event_tx.clone(),
-            state.clone(),
-        ));
+        let reader = tokio::spawn(read_loop_tagged(read_half, event_tx.clone(), state.clone()));
         let writer = tokio::spawn(write_loop_tagged(
             Box::pin(write_half) as std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>,
             outbound_rx,
@@ -129,7 +125,12 @@ impl FrameTransport {
     /// 会话故障（读写任一失败/close）后阻塞中的发送也会被释放：写任务退出
     /// 丢弃出站队列，等待中的 send 以 Closed 返回。
     pub async fn send(&self, message: Message) -> Result<(), ProtocolError> {
-        if self.io.state.broken.load(std::sync::atomic::Ordering::SeqCst) {
+        if self
+            .io
+            .state
+            .broken
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return Err(ProtocolError::Closed);
         }
         match message.channel() {
@@ -193,7 +194,12 @@ impl FrameTransport {
 
     /// 非阻塞发送（队列满/已关即失败；agent 拒绝路径使用）。
     pub fn try_send(&self, message: Message) -> Result<(), ProtocolError> {
-        if self.io.state.broken.load(std::sync::atomic::Ordering::SeqCst) {
+        if self
+            .io
+            .state
+            .broken
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return Err(ProtocolError::Closed);
         }
         let sender = match message.channel() {
@@ -207,7 +213,12 @@ impl FrameTransport {
     /// 成功 `Ok(None)`；满 `Ok(Some(message))`（调用方保留重试，不得丢弃）；
     /// 会话已关/写任务已退 `Err(Closed)`。丢弃式调用方用 [`Self::try_send`]。
     pub fn try_send_requeue(&self, message: Message) -> Result<Option<Message>, ProtocolError> {
-        if self.io.state.broken.load(std::sync::atomic::Ordering::SeqCst) {
+        if self
+            .io
+            .state
+            .broken
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return Err(ProtocolError::Closed);
         }
         let sender = match message.channel() {
@@ -346,10 +357,7 @@ async fn read_loop_tagged(
             }
             Err(error) => {
                 let _ = events
-                    .send(IoEvent::Failed(
-                        Channel::Control,
-                        ProtocolError::Io(error),
-                    ))
+                    .send(IoEvent::Failed(Channel::Control, ProtocolError::Io(error)))
                     .await;
                 // 读失败的错误事实已随事件送达；这里只停会话，不覆盖错误槽。
                 state.stop();
@@ -778,8 +786,13 @@ mod tests {
     async fn session_token_roundtrip_and_mismatch_rejected() {
         let (mut master, mut worker) = pair().await;
         let worker_task = tokio::spawn(async move {
-            executor_handshake(&mut worker, "0.1.0", REQUIRED_CAPABILITIES, Some("tok".into()))
-                .await
+            executor_handshake(
+                &mut worker,
+                "0.1.0",
+                REQUIRED_CAPABILITIES,
+                Some("tok".into()),
+            )
+            .await
         });
         master_handshake(&mut master, "j", 1, "e", "s", Some("tok"))
             .await
@@ -798,8 +811,13 @@ mod tests {
 
         let (mut master, mut worker) = pair().await;
         let worker_task = tokio::spawn(async move {
-            executor_handshake(&mut worker, "0.1.0", REQUIRED_CAPABILITIES, Some("wrong".into()))
-                .await
+            executor_handshake(
+                &mut worker,
+                "0.1.0",
+                REQUIRED_CAPABILITIES,
+                Some("wrong".into()),
+            )
+            .await
         });
         let error = master_handshake(&mut master, "j", 1, "e", "s", Some("tok"))
             .await

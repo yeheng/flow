@@ -16,7 +16,7 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
 
-use super::contract::{ExecutorInvocation, STARTUP_TIMEOUT_MS, SESSION_TOKEN_ENV};
+use super::contract::{ExecutorInvocation, SESSION_TOKEN_ENV, STARTUP_TIMEOUT_MS};
 
 /// 主进程告知执行器回连地址的环境变量（仅 spawn 时由父进程注入；执行器
 /// env_clear 后仍可见）。
@@ -111,13 +111,10 @@ mod tests {
             .build()
             .expect("parent runtime");
         runtime.block_on(async {
-            let (mut channel, mut child) = spawn_executor_loopback(
-                &executor,
-                None,
-                "test-session-token".into(),
-            )
-            .await
-            .expect("spawn");
+            let (mut channel, mut child) =
+                spawn_executor_loopback(&executor, None, "test-session-token".into())
+                    .await
+                    .expect("spawn");
             assert!(child.id().is_some(), "child process handle");
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             channel.write_all(b"Z").await.unwrap();
@@ -164,10 +161,9 @@ mod tests {
             .expect("runtime");
         runtime.block_on(async {
             use tokio::io::AsyncReadExt;
-            let (mut channel, mut child) =
-                spawn_executor_loopback(&invocation, None, "tok".into())
-                    .await
-                    .expect("loopback session");
+            let (mut channel, mut child) = spawn_executor_loopback(&invocation, None, "tok".into())
+                .await
+                .expect("loopback session");
             let mut buf = [0u8; 4];
             tokio::time::timeout(Duration::from_secs(5), channel.read_exact(&mut buf))
                 .await
@@ -199,9 +195,8 @@ mod tests {
             .build()
             .expect("runtime");
         runtime.block_on(async {
-            let missing = super::super::contract::ExecutorInvocation::explicit(
-                "/nonexistent/flow-executor",
-            );
+            let missing =
+                super::super::contract::ExecutorInvocation::explicit("/nonexistent/flow-executor");
             assert!(spawn_executor_loopback(&missing, None, "tok".into())
                 .await
                 .is_err());
@@ -213,8 +208,7 @@ mod tests {
             let exec = script(&dir, "exit 1");
             let invocation = super::super::contract::ExecutorInvocation::explicit(exec);
             let start = std::time::Instant::now();
-            let result =
-                runtime.block_on(spawn_executor_loopback(&invocation, None, "tok".into()));
+            let result = runtime.block_on(spawn_executor_loopback(&invocation, None, "tok".into()));
             assert!(result.is_err(), "child exit must surface as error");
             assert!(
                 start.elapsed() < Duration::from_secs(20),

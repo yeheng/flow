@@ -29,7 +29,6 @@ pub enum FromSession {
     Dead(String),
 }
 
-
 use flow_engine::execution_protocol::contract::{
     ExecutorInvocation, EXECUTION_MODE_ENV, X_MAX_DEFAULT,
 };

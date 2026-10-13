@@ -167,11 +167,7 @@ impl AuditStream {
     }
 
     /// 入队（编码大小由调用方一次性算好；push_wait 等待窗口与入队复用）。
-    fn push_with_bytes(
-        &mut self,
-        record: AuditRecord,
-        bytes: u64,
-    ) -> Result<u64, AuditError> {
+    fn push_with_bytes(&mut self, record: AuditRecord, bytes: u64) -> Result<u64, AuditError> {
         let limit = self.window.min(MAX_AUDIT_RECORD_BYTES);
         if bytes > limit {
             return Err(AuditError::Oversize(bytes, limit));

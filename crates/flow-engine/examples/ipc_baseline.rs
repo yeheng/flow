@@ -69,7 +69,13 @@ fn delta(before: Counters) -> Counters {
     }
 }
 
-fn report(name: &str, ops: u64, elapsed: std::time::Duration, payload_bytes: u64, allocs: Counters) {
+fn report(
+    name: &str,
+    ops: u64,
+    elapsed: std::time::Duration,
+    payload_bytes: u64,
+    allocs: Counters,
+) {
     let us_per_op = elapsed.as_micros() as f64 / ops as f64;
     let mib_s = (payload_bytes as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64();
     println!(
@@ -116,8 +122,6 @@ fn max_transfer_chunk(dispatch: &str) -> Message {
     }
 }
 
-
-
 fn codec_scenario(name: &str, ops: u64, message: &Message, wire_bytes: u64) {
     // 语义等价断言先于计时（基线必须先证明 roundtrip 正确）。
     let frame = encode_frame(message).expect("encode");
@@ -153,7 +157,10 @@ fn main() {
     let wire_max = encode_frame(&max_chunk).unwrap().len() as u64;
 
     println!("flow-engine v4 协议基线（release，单线程编解码）");
-    println!("wire bytes: control={} audit_batch(64×1KiB)={} max_chunk={}\n", wire_small, wire_batch, wire_max);
+    println!(
+        "wire bytes: control={} audit_batch(64×1KiB)={} max_chunk={}\n",
+        wire_small, wire_batch, wire_max
+    );
 
     codec_scenario("control_small (Heartbeat)", ops_small, &small, wire_small);
     codec_scenario("audit_batch (64×1KiB)", ops_batch, &batch, wire_batch);
@@ -163,8 +170,6 @@ fn main() {
     transport_throughput(500);
     cancel_latency_under_flood();
 }
-
-
 
 fn transport_throughput(batches: u64) {
     let rt = tokio::runtime::Builder::new_current_thread()

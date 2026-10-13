@@ -135,9 +135,9 @@ fn bad_data<E: std::fmt::Display>(e: E) -> std::io::Error {
 /// WSS 认证失败的 401 响应（`ErrorResponse = http::Response<Option<String>>`，
 /// `new()` 默认 200，这里显式 401）。
 fn unauthorized() -> tokio_tungstenite::tungstenite::handshake::server::ErrorResponse {
-    let mut response = tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(
-        Some("unauthorized agent".to_string()),
-    );
+    let mut response = tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(Some(
+        "unauthorized agent".to_string(),
+    ));
     *response.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::UNAUTHORIZED;
     response
 }
@@ -248,7 +248,6 @@ impl AgentManager {
             shutdown: tokio_util::sync::CancellationToken::new(),
         })
     }
-
 
     // 全局活跃派发准入（A_max）。
     pub(crate) fn global_slots(&self) -> &Arc<Semaphore> {
@@ -365,15 +364,14 @@ impl AgentManager {
                     let slot = agent_slot.clone();
                     let handshake = tokio_tungstenite::accept_hdr_async_with_config(
                         socket,
-                        move |request: &Request, response: Response| {
-                            match authenticate_wss(request, &token) {
-                                Some(agent_id) => {
-                                    *slot.lock().unwrap_or_else(|p| p.into_inner()) =
-                                        Some(agent_id);
-                                    Ok(response)
-                                }
-                                None => Err(unauthorized()),
+                        move |request: &Request, response: Response| match authenticate_wss(
+                            request, &token,
+                        ) {
+                            Some(agent_id) => {
+                                *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(agent_id);
+                                Ok(response)
                             }
+                            None => Err(unauthorized()),
                         },
                         config,
                     )
@@ -382,10 +380,7 @@ impl AgentManager {
                         active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                         return;
                     };
-                    let agent_id = agent_slot
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .take();
+                    let agent_id = agent_slot.lock().unwrap_or_else(|p| p.into_inner()).take();
                     let Some(agent_id) = agent_id else {
                         active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                         return;

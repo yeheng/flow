@@ -719,11 +719,9 @@ impl State {
                 ));
             }
             for (id, value) in &prepared.predecessors {
-                if run
-                    .nodes
-                    .get(id)
-                    .is_none_or(|n| n.status != NodeStatus::Succeeded || n.output.as_ref() != Some(value))
-                {
+                if run.nodes.get(id).is_none_or(|n| {
+                    n.status != NodeStatus::Succeeded || n.output.as_ref() != Some(value)
+                }) {
                     return Err(invalid(
                         "prepared predecessor differs from committed output",
                     ));
@@ -872,7 +870,10 @@ impl State {
             EventKind::Adjudicated => {
                 let decision = p["decision"].as_str().unwrap_or_default();
                 if terminal
-                    || node.wait.as_ref().is_none_or(|w| w.kind != WaitKind::Uncertain)
+                    || node
+                        .wait
+                        .as_ref()
+                        .is_none_or(|w| w.kind != WaitKind::Uncertain)
                     || node
                         .operation
                         .as_ref()

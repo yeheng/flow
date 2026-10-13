@@ -164,14 +164,19 @@ fn agent_main(
         Ok(v) => v,
         Err(err) => return fail(&err),
     };
-    let optional_path = |flag: Option<String>, configured: Option<PathBuf>, name: &str| -> Result<String, String> {
-        if wss_mode {
-            return Ok(flag
-                .or(configured.map(|p| p.to_string_lossy().into_owned()))
-                .unwrap_or_else(|| "unused".into()));
-        }
-        required(flag, configured.map(|p| p.to_string_lossy().into_owned()), name)
-    };
+    let optional_path =
+        |flag: Option<String>, configured: Option<PathBuf>, name: &str| -> Result<String, String> {
+            if wss_mode {
+                return Ok(flag
+                    .or(configured.map(|p| p.to_string_lossy().into_owned()))
+                    .unwrap_or_else(|| "unused".into()));
+            }
+            required(
+                flag,
+                configured.map(|p| p.to_string_lossy().into_owned()),
+                name,
+            )
+        };
     let ca_cert = match optional_path(flag_ca_cert, agent.ca_cert.clone(), "ca_cert") {
         Ok(v) => v,
         Err(err) => return fail(&err),

@@ -9,8 +9,8 @@ use flow_engine::execution_protocol::transport::FrameTransport;
 use flow_engine::journal_state::{Run, RunStatus};
 use flow_journal::JournalOptions;
 use serde_json::{json, Value};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 fn temp() -> std::path::PathBuf {
@@ -171,7 +171,12 @@ fn http_flow(url: &str) -> Value {
         "edges":[{"from":"s","to":"n"},{"from":"n","to":"e"}]})
 }
 
-async fn open_backend(root: &std::path::Path) -> (Arc<JournalBackend>, Arc<flow_backend::execution::remote::AgentManager>) {
+async fn open_backend(
+    root: &std::path::Path,
+) -> (
+    Arc<JournalBackend>,
+    Arc<flow_backend::execution::remote::AgentManager>,
+) {
     let backend = JournalBackend::open(&root.join("data"), JournalOptions::default())
         .await
         .unwrap();
@@ -202,8 +207,7 @@ async fn matrix_disconnect_before_auth_persist_blocks_http() {
     let url = counting_http(counter.clone()).await;
     let flow = install(&backend, http_flow(&url)).await;
 
-    let mut gates =
-        flow_backend::execution::dispatch::fault::register(&["auth_persist:before"]);
+    let mut gates = flow_backend::execution::dispatch::fault::register(&["auth_persist:before"]);
     gates
         .get_mut("auth_persist:before")
         .unwrap()
@@ -252,9 +256,11 @@ async fn matrix_cancel_between_persist_and_permit_keeps_http_zero() {
     let url = counting_http(counter.clone()).await;
     let flow = install(&backend, http_flow(&url)).await;
 
-    let mut gates =
-        flow_backend::execution::dispatch::fault::register(&["permit_send:before"]);
-    gates.get_mut("permit_send:before").unwrap().send_replace(true);
+    let mut gates = flow_backend::execution::dispatch::fault::register(&["permit_send:before"]);
+    gates
+        .get_mut("permit_send:before")
+        .unwrap()
+        .send_replace(true);
 
     let created = backend
         .run_start(&flow, None, json!({}), "manual", None, None)

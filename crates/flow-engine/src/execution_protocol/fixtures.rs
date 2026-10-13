@@ -192,9 +192,9 @@ pub fn malformed_envelopes() -> Vec<Value> {
     vec![
         json!("not an object"),
         json!({}),
-        json!({"v": PROTOCOL_VERSION + 1, "type": "Ready"}),  // 版本不兼容
-        json!({"v": PROTOCOL_VERSION}),                   // 缺 type
-        json!({"v": PROTOCOL_VERSION, "type": "Result"}), // 缺 dispatch/body
+        json!({"v": PROTOCOL_VERSION + 1, "type": "Ready"}), // 版本不兼容
+        json!({"v": PROTOCOL_VERSION}),                      // 缺 type
+        json!({"v": PROTOCOL_VERSION, "type": "Result"}),    // 缺 dispatch/body
         json!({"v": PROTOCOL_VERSION, "type": "AuditAck", "dispatch_id": "d", "body": {"durable_audit_seq": "x", "durable_bytes": "1", "commit_lsn": "1"}}), // 非十进制
         json!({"v": PROTOCOL_VERSION, "type": "AuditAck", "dispatch_id": "d", "body": {"durable_audit_seq": 5, "durable_bytes": "1", "commit_lsn": "1"}}), // 数字而非字符串
         json!({"v": PROTOCOL_VERSION, "type": "Execute", "dispatch_id": "d", "body": {"command_id": "c", "task": {}}}), // 缺字段

@@ -6,8 +6,8 @@ use flow_backend::journal::JournalBackend;
 
 use flow_rpc::AppState;
 const TOKEN: &str = "flow-rpc-contract-test-token-32-bytes";
+use flow_engine::journal_state::NodeStatus;
 use serde_json::{json, Value};
-use flow_engine::journal_state::{NodeStatus};
 
 struct Fixture {
     root: PathBuf,
@@ -271,7 +271,11 @@ async fn wait_human_waiting(f: &Fixture, run: &str) -> u64 {
         loop {
             let state = f.backend.state().await;
             if let Some(run) = state.runs.get(run) {
-                if run.nodes.get("h").is_some_and(|n| n.status == NodeStatus::Waiting) {
+                if run
+                    .nodes
+                    .get("h")
+                    .is_some_and(|n| n.status == NodeStatus::Waiting)
+                {
                     return run.last_run_seq;
                 }
             }

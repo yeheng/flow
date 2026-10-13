@@ -502,7 +502,8 @@ impl Message {
     /// 此表拒绝放错通道的消息。
     pub fn channel(&self) -> Channel {
         match self {
-            Message::TransferChunk { .. } | Message::ObservabilityBatch { .. }
+            Message::TransferChunk { .. }
+            | Message::ObservabilityBatch { .. }
             | Message::AuditBatch { .. } => Channel::Data,
             // 路由帧跟随内层通道（审计/传输走 data，其余 control）。
             Message::Routed { inner, .. } => inner.channel(),
@@ -880,8 +881,8 @@ impl Message {
             )));
         }
         // body 缺省视作 null（与 from_envelope 兼容：Wire 解析再报具体错误）。
-        let null_body: &serde_json::value::RawValue = serde_json::from_str("null")
-            .expect("static null RawValue");
+        let null_body: &serde_json::value::RawValue =
+            serde_json::from_str("null").expect("static null RawValue");
         let body = envelope.body.unwrap_or(null_body);
         Self::decode_kind(body, envelope.kind, envelope.dispatch_id)
     }
@@ -1330,12 +1331,7 @@ pub const KIND_TRANSFER_CHUNK: u8 = 1;
 pub const KIND_ROUTED_TRANSFER_CHUNK: u8 = 2;
 
 /// TransferChunk 的元数据信封（不含 bytes）：`{"v","type","dispatch_id","body"}`。
-fn transfer_chunk_meta(
-    dispatch_id: &str,
-    transfer_id: &str,
-    offset: u64,
-    digest: &str,
-) -> Value {
+fn transfer_chunk_meta(dispatch_id: &str, transfer_id: &str, offset: u64, digest: &str) -> Value {
     let mut envelope = serde_json::Map::new();
     envelope.insert("v".into(), json!(PROTOCOL_VERSION));
     envelope.insert("type".into(), json!(kind::TRANSFER_CHUNK));

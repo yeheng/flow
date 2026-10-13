@@ -110,7 +110,11 @@ async fn sustained_mixed_business() {
             let r = terminal(&b, id).await;
             assert_eq!(
                 r.status,
-                if i % 5 == 4 { RunStatus::Cancelled } else { RunStatus::Succeeded },
+                if i % 5 == 4 {
+                    RunStatus::Cancelled
+                } else {
+                    RunStatus::Succeeded
+                },
                 "{:?}",
                 r.error
             );
@@ -432,7 +436,10 @@ async fn sigkill_after_external_request_recovers_uncertain_without_resend() {
         loop {
             let s = b.state().await;
             let n = &s.runs[&id].nodes["h"];
-            if n.wait.as_ref().is_some_and(|w| w.kind == WaitKind::Uncertain) {
+            if n.wait
+                .as_ref()
+                .is_some_and(|w| w.kind == WaitKind::Uncertain)
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;

@@ -226,7 +226,9 @@ mod tests {
             other => panic!("expected binary, got {other:?}"),
         }
         // 反向：原始侧发 Binary，适配器读回。
-        raw.send(Message::Binary(vec![9u8, 8, 7].into())).await.unwrap();
+        raw.send(Message::Binary(vec![9u8, 8, 7].into()))
+            .await
+            .unwrap();
         let mut back = [0u8; 3];
         adapter.read_exact(&mut back).await.unwrap();
         assert_eq!(back, [9, 8, 7]);
@@ -244,7 +246,9 @@ mod tests {
     #[tokio::test]
     async fn ping_gets_pong_and_close_is_eof() {
         let (mut adapter, mut raw) = pair().await;
-        raw.send(Message::Ping(vec![1u8, 2, 3].into())).await.unwrap();
+        raw.send(Message::Ping(vec![1u8, 2, 3].into()))
+            .await
+            .unwrap();
         // 适配器读循环处理 Ping→Pong；随后发 Close。
         raw.send(Message::Close(None)).await.unwrap();
         let mut buf = [0u8; 4];

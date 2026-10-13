@@ -166,7 +166,6 @@ impl Relay {
     }
 }
 
-
 /// 消息估算编码字节数（T08 调度与预算口径）：不序列化、零分配地遍历
 /// 大载荷字段。JSON 转义最坏放大约 2×，预算按 [`weight_budgeted`] 计。
 /// 调度公平性与队列预算用同一估算；精确计量属 T01 基线后续验证项。
@@ -178,11 +177,12 @@ pub fn estimate_weight(message: &Message) -> u64 {
             .iter()
             .map(|record| 512 + record.kind.len() as u64 + estimate_value(&record.payload))
             .sum(),
-        Message::ObservabilityBatch { lines, .. } => 512
-            + lines
+        Message::ObservabilityBatch { lines, .. } => {
+            512 + lines
                 .iter()
                 .map(|line| 256 + line.message.len() as u64)
-                .sum::<u64>(),
+                .sum::<u64>()
+        }
         Message::Result { .. } => 1024,
         _ => 1024,
     };

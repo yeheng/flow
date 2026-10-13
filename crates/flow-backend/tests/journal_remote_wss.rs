@@ -202,10 +202,7 @@ async fn wss_rejects_bad_or_missing_credentials() {
             let mut request = url.into_client_request().unwrap();
             let headers = request.headers_mut();
             if let Some(token) = token {
-                headers.insert(
-                    "authorization",
-                    format!("Bearer {token}").parse().unwrap(),
-                );
+                headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
             }
             if let Some(agent) = agent {
                 headers.insert("x-flow-agent-id", agent.parse().unwrap());
@@ -254,10 +251,9 @@ async fn wss_rejects_text_messages() {
     let mut request = format!("ws://127.0.0.1:{}/ws/agent", ports[0])
         .into_client_request()
         .unwrap();
-    request.headers_mut().insert(
-        "authorization",
-        "Bearer tok".parse().unwrap(),
-    );
+    request
+        .headers_mut()
+        .insert("authorization", "Bearer tok".parse().unwrap());
     request
         .headers_mut()
         .insert("x-flow-agent-id", "agent-text".parse().unwrap());

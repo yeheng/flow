@@ -54,9 +54,7 @@ impl Default for FrameDecoder {
 
 impl FrameDecoder {
     pub fn new() -> Self {
-        Self {
-            buffer: Vec::new(),
-        }
+        Self { buffer: Vec::new() }
     }
 
     /// 追加字节。长度头一到就校验上限（分配任何载荷缓冲前拒绝）。
@@ -79,7 +77,12 @@ impl FrameDecoder {
     }
 
     fn head_length(&self) -> usize {
-        u32::from_be_bytes([self.buffer[0], self.buffer[1], self.buffer[2], self.buffer[3]]) as usize
+        u32::from_be_bytes([
+            self.buffer[0],
+            self.buffer[1],
+            self.buffer[2],
+            self.buffer[3],
+        ]) as usize
     }
 
     /// 弹出一个完整消息（含通道）；无完整帧返回 None。帧在缓冲内原地

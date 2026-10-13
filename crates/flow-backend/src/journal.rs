@@ -392,7 +392,9 @@ impl JournalBackend {
         })
         .await
         .map_err(|e| flow_journal::Error::Unavailable(e.to_string()))??;
-        let parsed = Arc::new(flow_engine::journal_state::validate_definition(&materialized)?);
+        let parsed = Arc::new(flow_engine::journal_state::validate_definition(
+            &materialized,
+        )?);
         let mut cache = self.definitions.lock().await;
         cache.insert(run_id.to_owned(), parsed.clone());
         while cache.len() > DEFINITION_CACHE_MAX {

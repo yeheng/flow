@@ -1,6 +1,6 @@
 //! Versioned, bounded, single-writer JSONL authority. No execution or projection side effects.
-pub mod codec;
 pub mod address;
+pub mod codec;
 pub mod maintenance;
 pub mod page;
 pub mod storage;

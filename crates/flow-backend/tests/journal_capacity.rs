@@ -1,8 +1,8 @@
 //! Explicit acceptance load, not part of the short regression suite.
 use flow_backend::journal::JournalBackend;
+use flow_engine::journal_state::{NodeStatus, RunStatus};
 use serde_json::json;
 use std::time::{Duration, Instant};
-use flow_engine::journal_state::{NodeStatus, RunStatus};
 
 #[tokio::test]
 #[ignore = "1000-run phase-one acceptance load"]
@@ -45,13 +45,11 @@ async fn thousand_waiting_runs_release_slots_and_recover_bounded_dispatch() {
     start_ipc(&backend, 2).await;
     tokio::time::timeout(Duration::from_secs(180), async {
         loop {
-            if backend
-                .state()
-                .await
-                .runs
-                .values()
-                .all(|r| r.nodes.get("h").is_some_and(|n| n.status == NodeStatus::Waiting))
-            {
+            if backend.state().await.runs.values().all(|r| {
+                r.nodes
+                    .get("h")
+                    .is_some_and(|n| n.status == NodeStatus::Waiting)
+            }) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;

@@ -111,9 +111,8 @@ pub mod fault {
     /// 注册检查点（初始 hold=true：到达即暂停，直至发送端置 false 释放）。
     /// 返回各检查点的发送端；重复注册同名点以最后一次为准。
     pub fn register(points: &[&str]) -> HashMap<String, watch::Sender<bool>> {
-        let registry = REGISTRY.get_or_init(|| {
-            std::sync::Mutex::new(HashMap::<String, watch::Receiver<bool>>::new())
-        });
+        let registry = REGISTRY
+            .get_or_init(|| std::sync::Mutex::new(HashMap::<String, watch::Receiver<bool>>::new()));
         let mut guard = registry.lock().unwrap_or_else(|poison| poison.into_inner());
         let mut senders = HashMap::new();
         for point in points {
@@ -375,10 +374,7 @@ impl DispatchRunner {
                 }
                 return Err(err);
             }
-            if self.remote_replay
-                && !self.cancel_sent
-                && last_progress.elapsed() > idle_limit
-            {
+            if self.remote_replay && !self.cancel_sent && last_progress.elapsed() > idle_limit {
                 transfer.abort();
                 if !transfer_done {
                     let _ = (&mut transfer).await;
@@ -388,9 +384,7 @@ impl DispatchRunner {
                 if self.idle_strikes >= 2 {
                     // 重挂后仍然彻底静默：执行器已失联且对账无法恢复，
                     // 硬失败（journal_driver 按授权操作状态包装 uncertain）。
-                    return Err(invalid(
-                        "dispatch idle timeout after reconnect; giving up",
-                    ));
+                    return Err(invalid("dispatch idle timeout after reconnect; giving up"));
                 }
                 return Err(JournalError::LinkClosed(
                     "dispatch idle timeout; awaiting reconciliation".into(),
@@ -705,8 +699,7 @@ impl DispatchRunner {
         let Some((total, digest)) = &entry.ready else {
             return false;
         };
-        entry.buf.len() as u64 == *total
-            && hex::encode(sha2::Sha256::digest(&entry.buf)) == *digest
+        entry.buf.len() as u64 == *total && hex::encode(sha2::Sha256::digest(&entry.buf)) == *digest
     }
 
     /// 审计批次：连续性 + 同序号同内容幂等 + 单事务持久化 + AuditAck。

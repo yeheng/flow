@@ -5,11 +5,11 @@
 
 use flow_backend::journal::JournalBackend;
 use flow_engine::journal_state::Run;
+use flow_engine::journal_state::RunStatus;
 use flow_journal::{JournalOptions, StoredValue};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
-use flow_engine::journal_state::{RunStatus};
 
 fn temp() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("flow-journal-r1-{}", uuid::Uuid::now_v7()))
@@ -126,12 +126,7 @@ impl Drop for AgentProcess {
     }
 }
 
-fn spawn_agent(
-    dir: &std::path::Path,
-    control: u16,
-    agent_cn: &str,
-    slots: u32,
-) -> AgentProcess {
+fn spawn_agent(dir: &std::path::Path, control: u16, agent_cn: &str, slots: u32) -> AgentProcess {
     let child = std::process::Command::new(agent_bin())
         .args([
             "--control-addr",
@@ -343,7 +338,10 @@ async fn unexpected_session_frame_rejected_and_single_cancel_keeps_uplink() {
         }
     })
     .await;
-    assert!(closed.is_ok(), "unexpected session frame must close session");
+    assert!(
+        closed.is_ok(),
+        "unexpected session frame must close session"
+    );
     drop(client);
     backend.close().await.unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
@@ -414,7 +412,8 @@ async fn single_task_cancel_keeps_agent_uplink_alive() {
     let ok_run = created.result["run_id"].as_str().unwrap().to_string();
     let done = until(&backend, &ok_run, Run::terminal).await;
     assert_eq!(
-        done.status, RunStatus::Succeeded,
+        done.status,
+        RunStatus::Succeeded,
         "uplink must survive single cancel"
     );
     drop(agent);
@@ -495,11 +494,9 @@ async fn coalesced_welcome_and_trailing_frame_not_lost_by_agent() {
     let (ca, server_cert, server_key, _agent_cert, _agent_key) = generate_pki(&dir, "agent-wc");
     // mTLS server：镜像 AgentManager 的接入配置（客户端证书由 CA 签发）。
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut std::io::Cursor::new(
-        std::fs::read(&ca).unwrap(),
-    ))
-    .collect::<std::result::Result<Vec<_>, _>>()
-    .unwrap()
+    for cert in rustls_pemfile::certs(&mut std::io::Cursor::new(std::fs::read(&ca).unwrap()))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap()
     {
         roots.add(cert).unwrap();
     }

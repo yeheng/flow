@@ -78,7 +78,11 @@ async fn assert_len_output(b: &Arc<JournalBackend>, done: &Run) {
         )
         .unwrap(),
     };
-    assert_eq!(value["len"], 100 * 1024, "raw transfer must round-trip intact");
+    assert_eq!(
+        value["len"],
+        100 * 1024,
+        "raw transfer must round-trip intact"
+    );
 }
 
 #[tokio::test]
@@ -89,7 +93,9 @@ async fn ipc_raw_transfer_end_to_end() {
         .unwrap();
     let tag = format!("raw-{}", uuid::Uuid::now_v7().simple());
     backend
-        .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(ipc_options(&tag)))
+        .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(ipc_options(
+            &tag,
+        )))
         .await
         .unwrap();
     let workflow = install(&backend, big_input_flow()).await;
@@ -106,7 +112,8 @@ async fn ipc_raw_transfer_end_to_end() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-type Handles = Arc<tokio::sync::Mutex<std::collections::BTreeMap<String, flow_agent::pool::ExecutorHandle>>>;
+type Handles =
+    Arc<tokio::sync::Mutex<std::collections::BTreeMap<String, flow_agent::pool::ExecutorHandle>>>;
 
 async fn spawn_agent(
     manager: &Arc<flow_backend::execution::remote::AgentManager>,

@@ -4,12 +4,12 @@
 
 use flow_backend::journal::JournalBackend;
 use flow_engine::journal_state::Run;
+use flow_engine::journal_state::{NodeStatus, RunStatus, WaitKind};
 use flow_journal::{JournalOptions, StoredValue};
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-use flow_engine::journal_state::{NodeStatus, RunStatus, WaitKind};
 
 fn temp() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("flow-journal-ipc-{}", uuid::Uuid::now_v7()))
@@ -254,7 +254,10 @@ async fn delay_and_signal_waits_release_executor_slots() {
     let run_id = start_run(&backend, &workflow, json!({})).await;
     // delay 等待登记后不占执行进程；human_task 等信号。
     let waiting = until(&backend, &run_id, |r| {
-        r.nodes.get("h").is_some_and(|n| n.status == NodeStatus::Waiting) || r.terminal()
+        r.nodes
+            .get("h")
+            .is_some_and(|n| n.status == NodeStatus::Waiting)
+            || r.terminal()
     })
     .await;
     if waiting.terminal() {
@@ -1038,7 +1041,10 @@ async fn inline_sized_run_input_dispatches_via_data_channel() {
             .map(|n| (&n.status, &n.error))
             .collect::<Vec<_>>()
     );
-    let output = done.nodes.values().find(|n| n.status == NodeStatus::Succeeded);
+    let output = done
+        .nodes
+        .values()
+        .find(|n| n.status == NodeStatus::Succeeded);
     let _ = output;
     backend.close().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
@@ -1100,9 +1106,11 @@ async fn result_output_in_control_frame_kill_band_survives() {
         let run_id = start_run(&backend, &workflow, json!({})).await;
         let done = until(&backend, &run_id, Run::terminal).await;
         assert_eq!(
-            done.status, RunStatus::Succeeded,
+            done.status,
+            RunStatus::Succeeded,
             "size={size} run failed: {:?} nodes={:?}",
-            done.error, done.nodes
+            done.error,
+            done.nodes
         );
         let node_output = done.nodes["n"].output.clone().unwrap();
         if expect_ref {

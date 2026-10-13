@@ -184,13 +184,10 @@ async fn connect_wss(
     let ws_config = WebSocketConfig::default()
         .max_message_size(limit)
         .max_frame_size(limit);
-    let (ws, _response) = tokio_tungstenite::connect_async_with_config(
-        request,
-        Some(ws_config),
-        false,
-    )
-    .await
-    .map_err(|e| format!("wss connect: {e}"))?;
+    let (ws, _response) =
+        tokio_tungstenite::connect_async_with_config(request, Some(ws_config), false)
+            .await
+            .map_err(|e| format!("wss connect: {e}"))?;
     let transport = FrameTransport::spawn(
         flow_engine::execution_protocol::ws::WsByteStream::new(ws),
         128,

@@ -126,7 +126,9 @@ struct WorkflowCreateReq<'a> {
 }
 impl<'a> WorkflowCreateReq<'a> {
     fn parse(p: &'a Value) -> Result<Self, ErrorObjectOwned> {
-        Ok(Self { name: text(p, "name")? })
+        Ok(Self {
+            name: text(p, "name")?,
+        })
     }
 }
 
@@ -490,7 +492,7 @@ async fn dispatch_call(
                     .await
                     .map_err(failure)?,
             )
-            .map_err(invalid)
+            .map_err(invalid);
         }
         "workflow.list" | "run.list" | "legacy.list" => return snapshot_list(b, method, &p).await,
         "workflow.get" | "run.get" | "legacy.get" => return snapshot_get(b, method, &p).await,
@@ -971,8 +973,8 @@ async fn product_command_route(
         map.insert("edges".into(), edges);
     }
     // 边缘一次 struct 化；args 保留原始 wire 形状作为命令幂等指纹。
-    let command = flow_backend::ProductCommand::parse(method, &args)
-        .map_err(|e| failure(e.into()))?;
+    let command =
+        flow_backend::ProductCommand::parse(method, &args).map_err(|e| failure(e.into()))?;
     let receipt = ctx
         .backend
         .product_command(command, &args, text(p, "request_id")?)

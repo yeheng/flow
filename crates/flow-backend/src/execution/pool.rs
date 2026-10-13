@@ -211,14 +211,13 @@ async fn spawn_transport(
     #[cfg(not(unix))]
     {
         let session_token = flow_engine::execution_protocol::transport::fresh_boot_id();
-        let (channel, child) =
-            flow_engine::execution_protocol::loopback::spawn_executor_loopback(
-                executor,
-                tag,
-                session_token.clone(),
-            )
-            .await
-            .map_err(|e| PoolError::Spawn(format!("{}: {e}", executor.program.display())))?;
+        let (channel, child) = flow_engine::execution_protocol::loopback::spawn_executor_loopback(
+            executor,
+            tag,
+            session_token.clone(),
+        )
+        .await
+        .map_err(|e| PoolError::Spawn(format!("{}: {e}", executor.program.display())))?;
         Ok((
             FrameTransport::spawn(channel, 128),
             child,

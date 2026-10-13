@@ -7,10 +7,10 @@
 //! - 版本不兼容（假二进制）在握手处明确失败
 
 use flow_backend::journal::JournalBackend;
+use flow_engine::journal_state::RunStatus;
 use flow_journal::JournalOptions;
 use serde_json::json;
 use std::time::Duration;
-use flow_engine::journal_state::{RunStatus};
 
 fn temp() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("flow-journal-ipc9-{}", uuid::Uuid::now_v7()))
@@ -231,7 +231,8 @@ async fn incompatible_executor_binary_fails_handshake_and_node_errors() {
     .await
     .expect("run terminates");
     assert_eq!(
-        done.status, RunStatus::Failed,
+        done.status,
+        RunStatus::Failed,
         "incompatible binary must fail loudly"
     );
     backend.close().await.unwrap();
@@ -289,7 +290,10 @@ async fn parent_close_reaps_executor_without_orphans() {
     backend.close().await.unwrap();
     // 回收落定后不得残留该 tag 的执行器进程。
     let leaked = wait_pgrep(&tag, Duration::from_secs(5)).await;
-    assert!(!leaked, "executor must be reaped after parent close (tag={tag})");
+    assert!(
+        !leaked,
+        "executor must be reaped after parent close (tag={tag})"
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -364,7 +368,10 @@ async fn repeated_cancel_and_rebuild_leaves_no_orphans() {
     }
     backend.close().await.unwrap();
     let leaked = wait_pgrep(&tag, Duration::from_secs(5)).await;
-    assert!(!leaked, "no executor may leak across cancel/rebuild (tag={tag})");
+    assert!(
+        !leaked,
+        "no executor may leak across cancel/rebuild (tag={tag})"
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -408,10 +415,9 @@ async fn executor_child_gets_cleared_env_and_isolated_fds() {
     backend
         .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
             flow_backend::execution::IpcOptions {
-                executor:
-                    flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
-                        wrapper.clone(),
-                    ),
+                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
+                    wrapper.clone(),
+                ),
                 x_max: 1,
                 tag: None,
             },
@@ -444,7 +450,11 @@ async fn executor_child_gets_cleared_env_and_isolated_fds() {
     .await
     .expect("run terminates");
     std::env::remove_var("FLOW_T10_LEAK");
-    assert_eq!(done.status, RunStatus::Succeeded, "wrapper passthrough must work");
+    assert_eq!(
+        done.status,
+        RunStatus::Succeeded,
+        "wrapper passthrough must work"
+    );
 
     let env_dump = std::fs::read_to_string(&dump).expect("env dump written");
     assert!(
@@ -461,7 +471,11 @@ async fn executor_child_gets_cleared_env_and_isolated_fds() {
         fd_list.contains("channel_present=yes"),
         "channel fd must survive exec:\n{fd_list}"
     );
-    let leaked_name = leaked_path.file_name().unwrap().to_string_lossy().to_string();
+    let leaked_name = leaked_path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
     assert!(
         !fd_list.contains(&leaked_name),
         "inherited non-channel fd must be closed:\n{fd_list}"

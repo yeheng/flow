@@ -458,9 +458,12 @@ impl JournalBackend {
         let projected_lsn = self.projection.applied_lsn().await?;
         let (applied_lsn, master_epoch, run_counts) = self
             .inspect(|s| {
+                // RunStatus 是枚举（无 Ord）：按 wire 字符串聚合（与
+                // Snapshot.run_counts 的 String 键一致，也和 journal 里的
+                // snake_case 逐字兼容）。
                 let mut counts = BTreeMap::new();
                 for run in s.runs.values() {
-                    *counts.entry(run.status.clone()).or_insert(0) += 1;
+                    *counts.entry(run.status.as_str().to_owned()).or_insert(0) += 1;
                 }
                 (s.applied_lsn, s.master_epoch, counts)
             })

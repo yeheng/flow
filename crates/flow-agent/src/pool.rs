@@ -8,7 +8,9 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use flow_engine::execution_protocol::contract::{DRAIN_GRACE_MS, HEARTBEAT_TIMEOUT_MS, STARTUP_TIMEOUT_MS};
+use flow_engine::execution_protocol::contract::{
+    DRAIN_GRACE_MS, HEARTBEAT_TIMEOUT_MS, STARTUP_TIMEOUT_MS,
+};
 use flow_engine::execution_protocol::message::Message;
 use flow_engine::execution_protocol::spawn::spawn_executor_process;
 use flow_engine::execution_protocol::transport::{master_handshake, FrameTransport};
@@ -147,8 +149,10 @@ async fn executor_loop(
 ) {
     let mut last_seen = tokio::time::Instant::now();
     let heartbeat_timeout = Duration::from_millis(HEARTBEAT_TIMEOUT_MS);
-    let mut heartbeat =
-        tokio::time::interval_at(tokio::time::Instant::now() + heartbeat_timeout, heartbeat_timeout);
+    let mut heartbeat = tokio::time::interval_at(
+        tokio::time::Instant::now() + heartbeat_timeout,
+        heartbeat_timeout,
+    );
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {

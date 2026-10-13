@@ -809,11 +809,15 @@ data_dir = "/var/lib/flow/journal"
     fn wss_requires_addr_and_token_together() {
         // T13：WSS 监听与共享令牌成对；单边配置必须报错。
         let base = "[execution.remote]\ncontrol_addr = \"127.0.0.1:1\"\nca_cert = \"a\"\ncert = \"b\"\nkey = \"c\"\n";
-        let only_addr = toml::from_str::<Config>(&format!("{base}wss_addr = \"127.0.0.1:2\"\n")).unwrap();
+        let only_addr =
+            toml::from_str::<Config>(&format!("{base}wss_addr = \"127.0.0.1:2\"\n")).unwrap();
         assert!(only_addr.validate().is_err());
         let only_token = toml::from_str::<Config>(&format!("{base}agent_token = \"t\"\n")).unwrap();
         assert!(only_token.validate().is_err());
-        let both = toml::from_str::<Config>(&format!("{base}wss_addr = \"127.0.0.1:2\"\nagent_token = \"t\"\n")).unwrap();
+        let both = toml::from_str::<Config>(&format!(
+            "{base}wss_addr = \"127.0.0.1:2\"\nagent_token = \"t\"\n"
+        ))
+        .unwrap();
         assert!(both.validate().is_ok());
     }
 

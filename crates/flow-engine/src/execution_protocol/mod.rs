@@ -17,9 +17,9 @@ pub mod remote;
 pub mod spawn;
 pub mod transfer_key;
 pub mod transport;
-pub mod ws;
 #[cfg(unix)]
 pub mod unix;
+pub mod ws;
 
 pub use contract::*;
 pub use loopback::{connect_loopback, spawn_executor_loopback, CONNECT_ADDR_ENV};
