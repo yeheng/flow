@@ -88,6 +88,27 @@ impl ExecutorPool {
         }
     }
 
+    /// 预热：预先 spawn `count` 个空闲会话放入复用池，省去首次派发的
+    /// 进程启动 + 握手延迟。
+    ///
+    /// **只允许协调器任务在开始调度前调用**：调用期间没有并发 `acquire`，
+    /// 因此不会与按槽位计数的懒加载竞争出超过 x_max 的常驻进程。
+    /// 调用方对失败做降级处理（首次派发仍会懒加载），不因预热失败拒绝启动。
+    pub async fn prewarm(self: &Arc<Self>, count: usize) -> Result<usize, PoolError> {
+        // 预热进程占用后续 acquire 的槽位；上限即当前空闲槽位数。
+        let count = count.min(self.slots.available_permits());
+        let mut warmed = 0;
+        for _ in 0..count {
+            if self.shutdown.is_cancelled() {
+                break;
+            }
+            let session = self.spawn_session().await?;
+            self.idle.lock().await.push(session);
+            warmed += 1;
+        }
+        Ok(warmed)
+    }
+
     /// 获取一个执行会话：优先复用空闲会话，否则 spawn 新进程并完成握手。
     pub async fn acquire(self: &Arc<Self>) -> Result<SessionLease, PoolError> {
         let permit = self

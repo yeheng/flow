@@ -441,6 +441,13 @@ async fn killing_executor_mid_script_recovers_with_new_process() {
     )
     .await;
     let run_id = start_run(&backend, &workflow, json!({})).await;
+    // 等 hang 节点真正开始执行（InputPrepared 已提交）再杀：否则可能在
+    // `s` 完成与 `hang` 派发之间杀死空闲会话，pool 会另起进程把脚本跑完，
+    // 运行反而成功——那是调度时序竞态，不是「执行器硬猝死」的被测语义。
+    let _ = until(&backend, &run_id, |r| {
+        r.nodes.get("hang").is_some_and(|n| n.prepared.is_some())
+    })
+    .await;
     // 只杀本测试标记的执行器，避免并行测试误伤。
     let victim = wait_for_tagged_executor(&tag).await;
     unsafe {

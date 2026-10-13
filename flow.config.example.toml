@@ -28,6 +28,9 @@ mode = "ipc"
 # executor_bin = "/usr/local/bin/flow-executor"
 # IPC 执行槽位（1..=16）
 x_max = 4
+# 启动时预热一个空闲执行器：省去首次派发的进程启动 + 握手延迟，代价是
+# 常驻一个空闲进程（占用一个 x_max 槽位）。桌面 app 默认开启，服务端默认关闭。
+# prewarm = false
 
 # mode = "remote" 时必填（control_addr + 证书三件套 + 超时；原 FLOW_REMOTE_* 四件套）
 # [execution.remote]

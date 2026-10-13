@@ -59,7 +59,10 @@ pub async fn start_execution(
                 Err(error) => return Err(invalid(format!("execution.mode=ipc: {error}"))),
             };
             backend
-                .start_execution_ipc(execution::ExecutionMode::Ipc(options))
+                .start_execution_ipc_prewarm(
+                    execution::ExecutionMode::Ipc(options),
+                    execution.prewarm,
+                )
                 .await
         }
         flow_config::ExecutionModeKind::Remote => {

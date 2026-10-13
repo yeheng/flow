@@ -49,6 +49,7 @@ npm run dev                          # 默认 http://127.0.0.1:5173
 | `npm run preview` | 本地预览浏览器构建 |
 | `npm run build:desktop` | 构建当前平台的桌面安装包 |
 | `npm run build:desktop -- --bundles app` | macOS 仅生成 `.app`，跳过 DMG |
+| `npm run build:executor` | 单独构建执行器 sidecar（`src-tauri/bin/`） |
 
 桌面开发需要 Rust stable 与平台构建依赖：macOS 安装 Xcode Command Line Tools；
 Linux 安装 WebKitGTK 4.1 等 [Tauri 系统依赖](https://v2.tauri.app/start/prerequisites/)。
@@ -63,13 +64,21 @@ Linux 安装 WebKitGTK 4.1 等 [Tauri 系统依赖](https://v2.tauri.app/start/p
 默认桌面产物位于 `src-tauri/target/release/bundle/`（设置 `CARGO_TARGET_DIR` 时随之改变）。
 安装包必须在对应平台构建；对外分发的签名、公证需由发布环境配置。
 
+桌面通过 Tauri `externalBin` 携带 `flow-executor` sidecar；`dev:desktop` / `build:desktop`
+会在启动前自动执行 `npm run build:executor`，因此执行器源码改动无需手动重建。
+执行器与主进程的引导协议（`--channel-fd`）必须同源：陈旧的 sidecar 会因 FD 无效而
+启动失败（`channel fd unavailable: Bad file descriptor`）。
+
 桌面数据默认存放在 Tauri 应用数据目录（macOS 为
 `~/Library/Application Support/com.flow.workflow.desktop/`），普通工作流保存在 `flow/`，
 JSONL 工作区保存在独立的 `journal/`，不会混用两套数据。需要隔离开发数据时，在启动前
 设置 `FLOW_DESKTOP_DATA_DIR=/绝对路径`。桌面不会自动导入原服务器数据目录。
 
-应用启动会恢复本地运行并启动定时调度；退出时停止订阅、HTTP 和调度任务，关闭 Journal
-并回收后端运行时。未完成的运行按现有后端恢复规则在下次启动处理，退出不会将它们标为取消。
+应用启动会恢复本地运行并启动定时调度；无 `flow.toml` 时默认开启执行器预热
+（`execution.prewarm = true`）：协调器就绪后立刻拉起一个空闲 `flow-executor`，
+首次运行的节点派发省去进程启动 + 握手延迟；预热失败只告警，首次派发仍会懒加载。
+退出时停止订阅、HTTP 和调度任务，关闭 Journal 并回收后端运行时。未完成的运行按
+现有后端恢复规则在下次启动处理，退出不会将它们标为取消。
 同一数据目录的第二个实例会拒绝启动，避免多个进程同时写入。
 
 webhook 仍需接收 HTTP 请求，桌面仅在 `127.0.0.1` 随机端口开放此入口，触发器页面展示

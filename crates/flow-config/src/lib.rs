@@ -142,6 +142,10 @@ pub struct ExecutionConfig {
     pub executor_bin: Option<String>,
     /// IPC 执行槽位（1..=16；协议常量 X_MAX_DEFAULT 的可配置面）。
     pub x_max: u32,
+    /// 启动时预热一个空闲执行器（省去首次派发的进程启动 + 握手延迟）。
+    /// 预热进程占用一个 x_max 槽位；失败降级为首次派发时懒加载。
+    /// 桌面 app 默认开启（见 web/src-tauri），服务端默认关闭。
+    pub prewarm: bool,
     /// remote 模式的上联与证书；mode=remote 时必填。
     pub remote: Option<RemoteExecutionConfig>,
 }
@@ -154,6 +158,7 @@ impl Default for ExecutionConfig {
             mode: ExecutionModeKind::Ipc,
             executor_bin: None,
             x_max: 4,
+            prewarm: false,
             remote: None,
         }
     }
@@ -731,6 +736,8 @@ mod tests {
         // 默认 ipc（全平台；进程内执行已删除）。
         assert_eq!(config.execution.mode, ExecutionModeKind::Ipc);
         assert_eq!(config.execution.x_max, 4);
+        // 服务端默认不预热；桌面 app 在无配置文件时显式开启。
+        assert!(!config.execution.prewarm);
         assert!(config.server.scheduler_enabled);
         assert_eq!(config.server.journal_trigger_tick_secs, 20);
     }
@@ -749,6 +756,7 @@ data_dir = "/var/lib/flow"
 [execution]
 mode = "ipc"
 x_max = 8
+prewarm = true
 executor_bin = "/usr/local/bin/flow-executor"
 
 [agent]
@@ -767,6 +775,7 @@ data_dir = "/var/lib/flow/journal"
         assert_eq!(config.storage.backend, StorageBackend::Journal);
         assert_eq!(config.execution.mode, ExecutionModeKind::Ipc);
         assert_eq!(config.execution.x_max, 8);
+        assert!(config.execution.prewarm);
         assert_eq!(config.agent.slots, 8);
         assert_eq!(
             config.journal.data_dir.as_deref(),

@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.flow.workflow.desktop",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm run build:executor && npm run dev",
     "devUrl": "http://127.0.0.1:5173",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run build:executor && npm run build",
     "frontendDist": "../dist"
   },
   "app": {

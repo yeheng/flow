@@ -83,6 +83,18 @@ impl JournalBackend {
     /// 全平台：unix 走 socketpair + argv 传通道 FD，其余平台走 loopback
     /// 回连（承载差异在 pool 内部收口）。
     pub async fn start_execution_ipc(self: &Arc<Self>, mode: ExecutionMode) -> Result<()> {
+        self.start_execution_ipc_prewarm(mode, false).await
+    }
+
+    /// 同 [`Self::start_execution_ipc`]，但可在启动时预热一个空闲执行器
+    /// （桌面 app 用；来源 `flow_config::ExecutionConfig::prewarm`）。
+    /// 预热在协调器任务内、开始调度前执行一次：串行于后续派发，不与
+    /// `acquire` 竞争槽位；失败只告警，首次派发仍会懒加载。
+    pub async fn start_execution_ipc_prewarm(
+        self: &Arc<Self>,
+        mode: ExecutionMode,
+        prewarm: bool,
+    ) -> Result<()> {
         // ExecutionMode 只有 Ipc 一个变体（进程内路径已全平台删除）。
         let ExecutionMode::Ipc(options) = mode;
         // I09：启用 IPC 时二进制缺失直接失败，不静默回退进程内执行。
@@ -99,7 +111,7 @@ impl JournalBackend {
         let limit = options.x_max.clamp(1, 16);
         let pool = crate::execution::ExecutorPool::new(options, self.journal.id().into(), epoch);
         let dispatcher = Arc::new(IpcDispatcher::new(pool));
-        self.start_execution_with_port(limit, ExecutionPort::Ipc(dispatcher))
+        self.start_execution_with_port(limit, ExecutionPort::Ipc(dispatcher), prewarm)
             .await
     }
     /// 持久提交新任期并返回新 epoch。
@@ -130,7 +142,7 @@ impl JournalBackend {
             manager.listen_wss(addr.clone(), token.clone()).await?;
         }
         let dispatcher = Arc::new(RemoteDispatcher::new(manager, options.clone()));
-        self.start_execution_with_port(16, ExecutionPort::Remote(dispatcher))
+        self.start_execution_with_port(16, ExecutionPort::Remote(dispatcher), false)
             .await
     }
 
@@ -141,7 +153,7 @@ impl JournalBackend {
         options: RemoteOptions,
     ) -> Result<()> {
         let dispatcher = Arc::new(RemoteDispatcher::new(manager, options));
-        self.start_execution_with_port(16, ExecutionPort::Remote(dispatcher))
+        self.start_execution_with_port(16, ExecutionPort::Remote(dispatcher), false)
             .await
     }
 
@@ -149,6 +161,7 @@ impl JournalBackend {
         self: &Arc<Self>,
         limit: usize,
         port: ExecutionPort,
+        prewarm: bool,
     ) -> Result<()> {
         let mut driver = self.execution.lock().await;
         if driver.as_ref().is_some_and(|handle| !handle.is_finished()) {
@@ -160,6 +173,19 @@ impl JournalBackend {
         let notify = self.execution_notification();
         notify.notify_one();
         *driver = Some(tokio::spawn(async move {
+            // 预热只在协调器任务启动时执行一次（不随 panic 重启重复）。
+            // 本任务独占 `port` 且尚未进入调度循环，故不与任何 acquire 竞争。
+            if prewarm {
+                if let ExecutionPort::Ipc(dispatcher) = &port {
+                    match dispatcher.prewarm(1).await {
+                        Ok(warmed) => tracing::info!(warmed, "executor prewarmed"),
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "executor prewarm failed; first dispatch will spawn lazily"
+                        ),
+                    }
+                }
+            }
             loop {
                 let restarted = AssertUnwindSafe(async {
             let mut coord = Coordinator::new(limit);

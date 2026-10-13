@@ -59,6 +59,15 @@ impl IpcDispatcher {
         Self { pool }
     }
 
+    /// 预热 `count` 个空闲执行器。仅协调器任务在开始调度前调用；
+    /// 失败由调用方降级为首次派发懒加载（见 [`ExecutorPool::prewarm`]）。
+    pub(crate) async fn prewarm(
+        &self,
+        count: usize,
+    ) -> std::result::Result<usize, super::pool::PoolError> {
+        self.pool.prewarm(count).await
+    }
+
     /// 执行一个节点派发。journal 语义与一期 `journal_driver::execute` 等价；
     /// 失败时返回 Err，由 journal_driver 的统一错误包装写入终态/uncertain。
     pub(crate) async fn execute(
