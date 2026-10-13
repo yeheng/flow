@@ -182,6 +182,52 @@ fn main() {
     // ---- 端到端 transport（duplex 承载）：吞吐 + 取消排队延迟 ----
     transport_throughput(500);
     cancel_latency_under_flood();
+    t12_breakdown();
+}
+
+/// T12 进入条件测量：把最大传输块的处理成本拆成「信封 JSON」「base64
+/// 编解码」「整值 sha256」三块，判断二进制 wire 是否值得一次 v4 升级。
+/// 输出各分量 µs/op 与 base64 占比（量化收益上界）。
+fn t12_breakdown() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let ops = 2_000u64;
+    let raw = vec![0xa5u8; flow_engine::execution_protocol::TRANSFER_CHUNK_BYTES];
+    let encoded = b64(&raw);
+
+    // 分量 1：base64 解码（执行器 transfer.feed 的主要开销）。
+    let start = Instant::now();
+    for _ in 0..ops {
+        let decoded = STANDARD.decode(&encoded).expect("b64 decode");
+        std::hint::black_box(decoded);
+    }
+    let b64_decode = start.elapsed();
+
+    // 分量 2：整值 sha256（每块校验）。
+    let start = Instant::now();
+    for _ in 0..ops {
+        std::hint::black_box(sha2::Sha256::digest(&raw));
+    }
+    let sha = start.elapsed();
+
+    // 分量 3：信封 JSON 往返（生产编解码已去掉 body 深拷贝，见 T05）。
+    let message = max_transfer_chunk("dispatch-t12");
+    let start = Instant::now();
+    for _ in 0..ops {
+        let frame = encode_tagged_frame(&message).expect("encode");
+        let json = &frame[flow_engine::execution_protocol::FRAME_HEADER_BYTES + 1..];
+        let decoded = Message::decode_envelope(json).expect("decode");
+        std::hint::black_box(decoded);
+    }
+    let envelope = start.elapsed();
+
+    let us = |d: std::time::Duration| d.as_micros() as f64 / ops as f64;
+    let (b, h, e) = (us(b64_decode), us(sha), us(envelope));
+    let base64_share = b / (b + h + e) * 100.0;
+    println!(
+        "\nT12 breakdown (256KiB chunk): b64_decode={b:.2} µs  sha256={h:.2} µs  envelope_json={e:.2} µs  \
+         base64_share={base64_share:.0}%  wire_inflation={:.0}%",
+        (encoded.len() as f64 / raw.len() as f64 - 1.0) * 100.0
+    );
 }
 
 fn transport_throughput(batches: u64) {

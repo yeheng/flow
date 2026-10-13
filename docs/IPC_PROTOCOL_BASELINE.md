@@ -20,18 +20,22 @@ cargo run -p flow-engine --release --example ipc_baseline --locked
 
 （示例先对每个场景做 roundtrip 语义等价断言，再计时；分配计数由内置全局分配器统计。）
 
-## 结果（2026-10-13 首测）
+## 结果（2026-10-13 第三次复测，含 T12 分解）
 
 ```
 flow-engine v3 协议基线（release，单线程编解码）
 wire bytes: control=92 audit_batch(64×1KiB)=70421 max_chunk=349734
 
-control_small (Heartbeat)    ops=  20000       0.90 µs/op     97.12 MiB/s  allocs/op=   16.0  alloc_bytes/op=    2250.0
-audit_batch (64×1KiB)        ops=   2000     113.28 µs/op    592.84 MiB/s  allocs/op= 1827.0  alloc_bytes/op=  564542.0
-transfer_max (256KiB chunk)  ops=   1000     209.01 µs/op   1595.77 MiB/s  allocs/op=   29.0  alloc_bytes/op= 2099085.0
-transport_duplex throughput  ops=    500     153.56 µs/op    437.35 MiB/s  allocs/op= 2152.1  alloc_bytes/op= 823168.5
-cancel_latency_under_flood     queued_frames_before_cancel=33  latency=8.75 ms
+control_small (Heartbeat)    ops=  20000       1.25 µs/op     70.21 MiB/s  allocs/op=   16.0  alloc_bytes/op=    2250.0
+audit_batch (64×1KiB)        ops=   2000     112.77 µs/op    595.54 MiB/s  allocs/op= 1827.0  alloc_bytes/op=  564542.0
+transfer_max (256KiB chunk)  ops=   1000     205.22 µs/op   1625.26 MiB/s  allocs/op=   29.0  alloc_bytes/op= 2099085.0
+transport_duplex throughput  ops=    500     151.38 µs/op    443.64 MiB/s  allocs/op= 2152.1  alloc_bytes/op= 823168.5
+cancel_latency_under_flood     queued_frames_before_cancel=33  latency=8.54 ms
+
+T12 breakdown (256KiB chunk): b64_decode=80.39 µs  sha256=108.35 µs  envelope_json=205.03 µs  base64_share=20%  wire_inflation=33%
 ```
+
+（首测与第三测在运行间波动范围内一致，未因 T05/T06/T07/T08/T09 改动出现回退。）
 
 ## 场景说明与读数口径
 
@@ -40,6 +44,19 @@ cancel_latency_under_flood     queued_frames_before_cancel=33  latency=8.75 ms
 - **transfer_max**：最大合法 TransferChunk（256 KiB 原始字节，base64 后约 349.7 KiB wire）。alloc_bytes/op ≈ 2 MiB 反映 base64 字符串 + 帧缓冲 + 解码侧字符串的合计。
 - **transport_duplex throughput**：真实 `FrameTransport`（duplex 承载，队列深 128）端到端收发审计批次的吞吐（含任务调度与通道交接）。
 - **cancel_latency_under_flood**：发送队列预填 32 条最大传输帧后提交 Cancel，实测接收端看到 Cancel 的排队延迟（单流契约：Cancel 排在已入队帧之后，不可抢占）。该数值是调度事实，不是协议保证。
+
+## T12 进入条件判定（二进制大载荷 wire）
+
+T12 的进入条件是「Base64/大载荷编码确为主要成本」。分解测量（256 KiB 传输块，`T12 breakdown` 行）：
+
+| 分量 | µs/op | 占比 | 二进制 wire 能否消除 |
+| --- | --- | --- | --- |
+| base64 解码 | 80.39 | 20% | 是 |
+| 整值 sha256 | 108.35 | 27% | **否**（T12 约束：最终内容摘要必须保留） |
+| 信封 JSON 编解码 | 205.03 | 51% | 部分（大载荷字段变 raw，但仍保留 JSON metadata） |
+| 线上字节膨胀 | — | +33% | 是（去掉 base64 的 4/3 膨胀） |
+
+**结论：进入条件未满足，暂缓 T12。** Base64 只占单块处理的 20%；最大单项是信封 JSON（51%）与必需的 sha256（27%），都不是「base64→raw」能解决的。v4 会引入双版本维护/兼容/部署复杂度，而其能消除的收益上界约 20% CPU + 33% 线字节。继续监控：若 T08 字节预算或真实远程链路显示线字节膨胀实际构成瓶颈，再用本分解方法复评。
 
 ## 边界与已知留白
 

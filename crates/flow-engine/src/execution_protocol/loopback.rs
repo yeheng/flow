@@ -122,4 +122,88 @@ mod tests {
             let _ = child.wait().await;
         });
     }
+
+    #[cfg(unix)]
+    fn script(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-executor");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// T10：回连承载的 env_clear 隔离（父进程无关变量不泄漏；回连地址注入）。
+    #[cfg(unix)]
+    #[test]
+    fn loopback_child_env_is_cleared() {
+        let dir = std::env::temp_dir().join(format!("flow-loop-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let env_dump = dir.join("env.txt");
+        let exec = script(
+            &dir,
+            &format!(
+                "env > {dump}\nexec python3 -c 'import os,socket; a=os.environ[\"{env}\"]; h,p=a.rsplit(\":\",1); s=socket.create_connection((h,int(p))); s.sendall(b\"ping\"); s.close()'",
+                dump = env_dump.display(),
+                env = CONNECT_ADDR_ENV,
+            ),
+        );
+        std::env::set_var("FLOW_T10_LOOP_LEAK", "must-not-leak");
+        let invocation = super::super::contract::ExecutorInvocation::explicit(exec);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            use tokio::io::AsyncReadExt;
+            let (mut channel, mut child) = spawn_executor_loopback(&invocation, None)
+                .await
+                .expect("loopback session");
+            let mut buf = [0u8; 4];
+            tokio::time::timeout(Duration::from_secs(5), channel.read_exact(&mut buf))
+                .await
+                .expect("child must connect back")
+                .unwrap();
+            assert_eq!(&buf, b"ping");
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        });
+        std::env::remove_var("FLOW_T10_LOOP_LEAK");
+        let dump = std::fs::read_to_string(&env_dump).unwrap_or_default();
+        assert!(dump.contains(CONNECT_ADDR_ENV), "回连地址必须注入:\n{dump}");
+        assert!(
+            !dump.contains("FLOW_T10_LOOP_LEAK"),
+            "env_clear 必须丢弃父进程无关变量:\n{dump}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// T10：缺二进制/子进程秒退在回连侧必须有界失败（不永久挂起）。
+    #[test]
+    fn loopback_startup_failures_are_bounded() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let missing = super::super::contract::ExecutorInvocation::explicit(
+                "/nonexistent/flow-executor",
+            );
+            assert!(spawn_executor_loopback(&missing, None).await.is_err());
+        });
+        #[cfg(unix)]
+        {
+            let dir = std::env::temp_dir().join(format!("flow-loop-{}", uuid::Uuid::now_v7()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let exec = script(&dir, "exit 1");
+            let invocation = super::super::contract::ExecutorInvocation::explicit(exec);
+            let start = std::time::Instant::now();
+            let result = runtime.block_on(spawn_executor_loopback(&invocation, None));
+            assert!(result.is_err(), "child exit must surface as error");
+            assert!(
+                start.elapsed() < Duration::from_secs(20),
+                "connect timeout must be bounded"
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
 }

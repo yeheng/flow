@@ -4,7 +4,7 @@
 
 【实现进度】（2026-10-13 第三轮更新：推荐范围 T01–T11 全部完成）
 
-- **已完成（全部推荐任务）**：T01、T02、T03、T04、T05、T06、T07、T08、T09、T10（兼容部分）、T11（本轮复测）。
+- **已完成（全部推荐任务）**：T01、T02、T03、T04、T05、T06、T07、T08、T09、T10、T11。
 - 第二轮成果：T02（握手统一经 transport + 双侧粘连帧回归）、T03 传输层（会话级故障状态直达 recv）、listen_tls 启动阻塞修复、data_addr 忽略式兼容恢复。
 - 第三轮成果：
   - T03 收尾：executor 主循环 / agent serve / backend pool 三处服务循环全部改为有界出站积压（`SendBacklog`：满队列暂存重试，入站 Cancel/ACK/心跳始终可处理；新增 `try_send_requeue` 满则原样退回）。
@@ -14,7 +14,11 @@
   - T08：`unwrap_from_master_owned` 移动内层消息（不再深拷贝）；上联共享出站字节预算（8 MiB，估算×2 安全系数，acquire/release 随消息流转）；轮转桥改为按字节额度（64 KiB/轮，帧数≤ 4/轮）。
   - T01：新增 `cargo run -p flow-engine --release --example ipc_baseline`（含分配计数器）与 `docs/IPC_PROTOCOL_BASELINE.md` 基线报告。
   - T09：`dispatch::fault` 确定性检查点（auth_persist 前后、permit_send 前后、result_committed 前后；未注册零开销）+ `tests/journal_fault_matrix.rs` 三场景（未持久化断线→HTTP 为 0；持久化后/Permit 前取消→HTTP 为 0 且 Cancelled；回执前断线→外部调用恰好一次且不误报成功）。
-- 仍未实施（条件任务，按进入条件启动）：T12（二进制大载荷 wire，需复测证明 Base64 是主要成本）、T13（WSS 上联，需 HTTP 代理接入需求）、T14（Windows Agent）。T10 的打包/进程启动全量验收（env_clear/FD 隔离/kill-reap 等）仍待系统化执行。
+- 第四轮补充（T10 收尾 + 条件任务判定）：
+  - T10 全量验收测试补齐：父端关闭后 kill+wait/reap 无孤儿、连续取消与重建不泄漏、env_clear 与 FD 隔离（包装脚本 + 通道 FD 阳性对照）、loopback 回连原语的 env 隔离/缺二进制/秒退有界失败。既有覆盖：缺二进制、子进程秒退、兄弟定位（含空格路径）、握手拒绝、旧配置解析。
+  - T12 进入条件判定：**未满足，暂缓**。分解测量（见 `docs/IPC_PROTOCOL_BASELINE.md`）显示 256 KiB 块中 base64 解码仅占 20%，信封 JSON 51%、必需 sha256 27%，二进制 wire 收益上界约 20% CPU + 33% 线字节，不值一次 v4 升级。
+  - T13 进入条件判定：**未触发**（无 HTTP Upgrade/反向代理/统一入口部署需求；现有 mTLS 单上联功能与测试完整）。
+  - T14 进入条件判定：**未触发且本机不可验证**（无 Windows 产品要求；Windows 交叉检查被 rquickjs-sys/aws-lc-sys 原生依赖与缺失的 MSVC 工具链阻断，需真实 Windows CI 才能按验收标准推进）。
 - 性能结论边界：T01 基线只有当前实现一组数据；任何优化收益必须同机同命令复测对比，不外推。
 
 【品味评分】
@@ -194,7 +198,7 @@
 
 ### T10 / P1：进程启动、旧配置和协议兼容验收
 
-- **状态：部分完成**。共享 `spawn_executor_process`、`--channel-fd`、`--remote-relay`、loopback 与旧地址兼容均在；data_addr 忽略式兼容已在本轮恢复（094034a 曾误删）。未完成部分：打包启动/env_clear/FD 隔离等全量验收（T10 测试清单）。
+- **状态：已完成（2026-10-13）**。打包/启动/兼容全量验收落地：缺二进制与子进程秒退明确失败、握手拒绝、兄弟执行器定位（含空格路径）、旧配置（data_addr）解析、父端关闭 kill+wait/reap 无孤儿、连续取消与重建不泄漏、env_clear 与 FD 隔离（含通道 FD 阳性对照）、loopback 回连原语。`--channel-fd`/`--remote-relay`/旧地址配置保留。
 - **目标**：让用户现有打包、启动参数和配置继续工作。
 - **背景**：Unix Backend 和 Agent 已共用 spawn_executor_process；stdin 并非当前协议 FD。data_addr 已作为旧配置兼容字段忽略，不应重新变成必填或突然拒绝。
 - **范围**：`execution_protocol/{spawn.rs,unix.rs,loopback.rs,contract.rs}`；Backend `execution/pool.rs`；Agent `pool.rs`、Executor `main.rs`；`flow-config/src/lib.rs`；`journal_ipc_packaging.rs`；配置示例与 OPS。
@@ -216,6 +220,7 @@
 
 ### T12 / P2、有条件：增加二进制大载荷 wire
 
+- **状态：进入条件未满足，暂缓（2026-10-13）**。分解测量见 `docs/IPC_PROTOCOL_BASELINE.md`「T12 进入条件判定」：base64 仅占单块 20%，信封 JSON 51%、必需 sha256 27%；收益上界约 20% CPU + 33% 线字节，不值 v4 双版本维护成本。复评触发：线字节膨胀被证实构成真实瓶颈。
 - **进入条件/目标**：T11 证明 Base64/大载荷编码是主要成本，且收益值得一次 wire 升级；只优化 transfer 和必要的大值审计载荷。
 - **背景**：Base64 增加线字节和编解码；小控制消息无需全面换二进制对象格式。
 - **范围**：`execution_protocol/{contract.rs,message.rs,frame.rs,fixtures.rs}`；Executor transfer/audit；Backend dispatch；Agent relay；新旧协议兼容测试及打包参数。
@@ -226,6 +231,7 @@
 
 ### T13 / P2、有条件：增加 WSS Agent 上联
 
+- **状态：进入条件未触发，暂缓（2026-10-13）**。仓库无 HTTP Upgrade/反向代理/统一入口的部署需求；现有单条 mTLS 上联功能与测试完整（TLS/重连/故障矩阵全绿）。
 - **进入条件/目标**：有明确的 HTTP Upgrade/反向代理/统一入口部署需求；把 WSS 作为附加承载，不作为性能优化必做项。
 - **背景**：当前 Agent 已主动连接单 mTLS 上联；WSS 不提供额外的持久确认或恢复能力。
 - **范围**：Agent runtime/tls/config；Backend AgentManager 接入；`flow-rpc` HTTP 服务装配（若复用现有入口）；OPS、配置样例及新的 WSS 集成测试。
@@ -236,6 +242,7 @@
 
 ### T14 / P2、有条件：Windows Agent 启动支持
 
+- **状态：进入条件未触发且本机不可验证，暂缓（2026-10-13）**。无 Windows 产品要求；`cargo check --target x86_64-pc-windows-msvc` 被 rquickjs-sys / aws-lc-sys 原生依赖与缺失的 MSVC 工具链阻断，无法按「禁止以跨目标 check 代替真实运行」的验收标准推进，需真实 Windows CI。
 - **进入条件/目标**：产品要求远程 Agent 支持 Windows；复用已存在的 loopback 承载。
 - **背景**：Backend 非 Unix 路径已经存在，Agent pool 仍直接导入 Unix spawn。原文提出 Windows 并不代表当前 Agent 已跨平台。
 - **范围**：Agent `pool.rs`；`execution_protocol` 的公共进程启动入口；Windows CI 和打包；必要的路径定位代码。
@@ -260,6 +267,6 @@ cargo test -p flow-backend --test journal_remote_reconnect --test journal_remote
 cargo check --workspace --all-targets --locked
 ```
 
-本次已执行（2026-10-13 第三轮，全量）：flow-engine lib 83/83；Executor 11/11；Agent lib 6/6；flow-config 8/8；backend journal_ipc/packaging/remote/remote_tls/remote_reconnect/remote_ops/fault_matrix/acceptance/execution/capacity 共 50 通过、10 ignored；`cargo check --workspace --all-targets` 通过；`examples/ipc_baseline` 复跑稳定。第一轮（34/34 定向）与第二轮（listen_tls 修复后 TLS/远程套件恢复全绿）记录见 git 历史。仍不覆盖：真实 WAN soak、打包/进程启动全量验收（T10 剩余）、T12–T14 条件任务。
+本次已执行（2026-10-13 第四轮，全量）：flow-engine lib 85/85（含 loopback T10 新增用例）；Executor 11/11；Agent lib 6/6；flow-config 8/8；backend journal_ipc/packaging/remote/remote_tls/remote_reconnect/remote_ops/fault_matrix/acceptance/execution/capacity 共 53 通过、10 ignored（packaging 含 T10 新增回收/隔离用例）；`cargo check --workspace --all-targets` 通过；`examples/ipc_baseline` 复跑稳定（含 T12 分解）。第一至三轮记录见 git 历史。仍不覆盖：真实 WAN soak、非 Unix 完整 IPC 装配（需对应平台运行环境，T14 条件）、T12/T13/T14 条件任务（已给出进入条件判定）。
 
 最终交付应包含：实现 diff、兼容说明、上述正确性结果、基线/复测报告、真实队列预算、最新部署说明。验收必须同时证明事实不变、资源有界和收益真实。
