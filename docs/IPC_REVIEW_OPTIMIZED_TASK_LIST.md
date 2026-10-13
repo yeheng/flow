@@ -1,27 +1,28 @@
 # IPC 方案复核、优化方案与实现任务清单
 
-复核日期：2026-10-13。依据当前工作区源码和本次定向测试。原始输入：`review.md`。本文交付方案与任务清单；实现进度见下方【实现进度】。审阅期间工作区另有注释、配置帮助文字和历史设计说明的同步修改，已核对相关 diff；以下任务不把这些已补充说明重复计为待实现功能。
+复核日期：2026-10-13。依据当前工作区源码和本次定向测试。原始输入：`review.md`。本文交付方案与任务清单；实现进度见下方【实现进度】（2026-10-13 汇总；推荐范围 T01–T13 全部完成，仅剩条件任务 T14）
 
-【实现进度】（2026-10-13 第三轮更新：推荐范围 T01–T11 全部完成）
+| 任务 | 状态 | 关键落点 |
+| --- | --- | --- |
+| T01 基线 | ✅ 完成 | `examples/ipc_baseline` + `docs/IPC_PROTOCOL_BASELINE.md`（含分配计数） |
+| T02 握手同帧读取 | ✅ 完成 | agent/master 握手统一经 `FrameTransport`；双侧粘连帧回归 |
+| T03 背压与关闭 | ✅ 完成 | 会话故障状态直达 recv；三个服务循环有界出站积压 `SendBacklog` |
+| T04 收敛单流 | ✅ 完成 | 删除 `spawn_streams`/双流编解码/DataBind |
+| T05 类型化编解码 | ✅ 完成 | 解码 `decode_envelope`（RawValue 借用直析）；编码直写帧缓冲 |
+| T06 审计计量缓存 | ✅ 完成 | 队列项缓存规范编码大小，push/flush/重放共用 |
+| T07 连续 transfer 缓冲 | ✅ 完成 | 执行器与 backend 均改连续前缀缓冲，去块树与二次拷贝 |
+| T08 中继所有权与预算 | ✅ 完成 | `unwrap_from_master_owned` 移动；上联字节预算 + 按字节轮转 |
+| T09 故障矩阵 | ✅ 完成 | `dispatch::fault` 确定性检查点 + `journal_fault_matrix` 三场景 |
+| T10 打包/启动/兼容 | ✅ 完成 | 回收无孤儿、取消重建不泄漏、env_clear + FD 隔离、loopback 原语 |
+| T11 端到端复测 | ✅ 完成 | 全量回归 + 基线复跑 |
+| T12 二进制 wire | ✅ 完成 | v4 是唯一协议（删除 v3）；transfer raw blob；≈8× + 25% 线字节 |
+| T13 WSS 上联 | ✅ 完成 | `WsByteStream` + `listen_wss` 认证 + agent 客户端 + 集成测试 |
+| **T14 Windows Agent** | ⛔ **未做（条件未触发）** | 无 Windows 产品要求；交叉检查被 rquickjs-sys/aws-lc-sys 原生依赖与缺失 MSVC 工具链阻断，需真实 Windows CI |
 
-- **已完成（全部推荐任务）**：T01、T02、T03、T04、T05、T06、T07、T08、T09、T10、T11。
-- 第二轮成果：T02（握手统一经 transport + 双侧粘连帧回归）、T03 传输层（会话级故障状态直达 recv）、listen_tls 启动阻塞修复、data_addr 忽略式兼容恢复。
-- 第三轮成果：
-  - T03 收尾：executor 主循环 / agent serve / backend pool 三处服务循环全部改为有界出站积压（`SendBacklog`：满队列暂存重试，入站 Cancel/ACK/心跳始终可处理；新增 `try_send_requeue` 满则原样退回）。
-  - T06：审计队列项缓存规范编码大小（push/flush/重放不再重复序列化计量；push_wait 与入队共用一次计量）。
-  - T07：执行器输入装配与 backend op_transfers 全部改为连续前缀缓冲（offset==已接收长度才追加；同内容前缀补发幂等接受；缺口/跨边界重叠/异内容立即拒绝；不再有块树排序与整体二次拷贝）。
-  - T05：解码侧借用信封 + RawValue 类型化单遍解析（`decode_envelope`，不建 Value 树、无 body 深拷贝，两入口共用同一套 Wire 校验）；编码侧 JSON 直写预留长度头的帧缓冲；新增全 fixtures 新旧路径等价与畸形拒绝测试。
-  - T08：`unwrap_from_master_owned` 移动内层消息（不再深拷贝）；上联共享出站字节预算（8 MiB，估算×2 安全系数，acquire/release 随消息流转）；轮转桥改为按字节额度（64 KiB/轮，帧数≤ 4/轮）。
-  - T01：新增 `cargo run -p flow-engine --release --example ipc_baseline`（含分配计数器）与 `docs/IPC_PROTOCOL_BASELINE.md` 基线报告。
-  - T09：`dispatch::fault` 确定性检查点（auth_persist 前后、permit_send 前后、result_committed 前后；未注册零开销）+ `tests/journal_fault_matrix.rs` 三场景（未持久化断线→HTTP 为 0；持久化后/Permit 前取消→HTTP 为 0 且 Cancelled；回执前断线→外部调用恰好一次且不误报成功）。
-- 第五轮补充（T12 + T13）：T12 用 v4 原型实测收益；T13 WSS 附加承载落地。
-- 第六轮（v4 收敛为唯一协议）：v4 帧成为唯一协议，**删除 v3 帧编解码与 base64 TransferChunk 路径及其版本配置开关**（`[execution]/[execution.remote]/[agent].protocol`、`--protocol`、`IpcOptions/RemoteOptions/AgentConfig/ExecutorConfig.protocol_v4`、`spawn_v4` 全部移除）；删除过时探针 `ipc_design_probe.rs`；`PROTOCOL_VERSION=4`；测试与文档同步。
-- 第四轮补充（T10 收尾 + 条件任务判定）：
-  - T10 全量验收测试补齐：父端关闭后 kill+wait/reap 无孤儿、连续取消与重建不泄漏、env_clear 与 FD 隔离（包装脚本 + 通道 FD 阳性对照）、loopback 回连原语的 env 隔离/缺二进制/秒退有界失败。既有覆盖：缺二进制、子进程秒退、兄弟定位（含空格路径）、握手拒绝、旧配置解析。
-  - T12：用 v4 原型实测收益后**已实现**（transfer 载荷 raw 承载，实测 17.1× + 25% 线字节；默认 v3 不变）。
-  - T13 进入条件判定：**未触发**（无 HTTP Upgrade/反向代理/统一入口部署需求；现有 mTLS 单上联功能与测试完整）。
-  - T14 进入条件判定：**未触发且本机不可验证**（无 Windows 产品要求；Windows 交叉检查被 rquickjs-sys/aws-lc-sys 原生依赖与缺失的 MSVC 工具链阻断，需真实 Windows CI 才能按验收标准推进）。
-- 性能结论边界：T01 基线只有当前实现一组数据；任何优化收益必须同机同命令复测对比，不外推。
+补充说明：
+- T12 最终形态是「v4 唯一协议」：v3 帧编解码、base64 `TransferChunk` 路径、`protocol` 配置开关与 `spawn_v4` 双轨全部删除，`PROTOCOL_VERSION = 4`；Journal schema 不变（仍 base64 ValueChunk），WSS 复用同一帧格式。
+- 期间修复的存量缺陷：`listen_tls` 启动阻塞（v3 收敛时改为直跑 accept 死循环）；`data_addr` 存量配置兼容回归。
+- 唯一已知抖动：`journal_ipc::killing_executor_mid_script_recovers_with_new_process`（SIGKILL 时序）在并行负载下偶发失败，单独运行稳定通过。
 
 【品味评分】
 
