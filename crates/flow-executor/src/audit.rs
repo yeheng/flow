@@ -27,15 +27,22 @@ pub enum AuditError {
     WindowFull(u64, u64),
 }
 
+/// 待发送/未确认队列项：缓存记录的规范编码大小（T06，与主进程同一计量
+/// 口径），push/flush/重放不再反复序列化计量。
+struct QueuedRecord {
+    record: AuditRecord,
+    bytes: u64,
+}
+
 /// 单派发审计流。dispatch 内从 1 开始；重传不重复占用逻辑窗口，但受
 /// 重传节奏限制，防止重复流量淹没接收端。
 pub struct AuditStream {
     dispatch_id: String,
     outbound: mpsc::Sender<Message>,
     /// 尚未发送（或因窗口暂缓）的记录，按序。
-    pending: VecDeque<AuditRecord>,
+    pending: VecDeque<QueuedRecord>,
     /// 已发送未确认（重传副本源），按序。
-    inflight: VecDeque<AuditRecord>,
+    inflight: VecDeque<QueuedRecord>,
     /// 下一条 audit_seq。
     next_seq: u64,
     /// B(S)：已发送最高连续序号的累计字节。
@@ -106,6 +113,7 @@ impl AuditStream {
         kind: &str,
         payload: serde_json::Value,
     ) -> Result<u64, AuditError> {
+        // 计量一次：窗口等待与入队复用同一编码大小（T06，push 不再重算）。
         let bytes = record_bytes(self.next_seq, kind, &payload);
         let limit = self.window.min(MAX_AUDIT_RECORD_BYTES);
         if bytes > limit {
@@ -115,7 +123,12 @@ impl AuditStream {
             let cancel = self.cancel.clone();
             self.await_durable(self.durable_seq + 1, &cancel).await?;
         }
-        self.push(kind, payload)
+        let record = AuditRecord {
+            audit_seq: self.next_seq,
+            kind: kind.into(),
+            payload,
+        };
+        self.push_with_bytes(record, bytes)
     }
 
     pub fn durable_seq(&self) -> u64 {
@@ -130,7 +143,7 @@ impl AuditStream {
             while self
                 .inflight
                 .front()
-                .is_some_and(|record| record.audit_seq <= durable_seq)
+                .is_some_and(|entry| entry.record.audit_seq <= durable_seq)
             {
                 self.inflight.pop_front();
             }
@@ -142,14 +155,23 @@ impl AuditStream {
     }
 
     /// 追加一条记录（audit_seq 自动分配）。单条记录必须能被窗口容纳。
+    /// 编码大小在入队时计算一次并随记录缓存（T06）。
     pub fn push(&mut self, kind: &str, payload: serde_json::Value) -> Result<u64, AuditError> {
-        let seq = self.next_seq;
         let record = AuditRecord {
-            audit_seq: seq,
+            audit_seq: self.next_seq,
             kind: kind.into(),
             payload,
         };
         let bytes = record.encoded_bytes();
+        self.push_with_bytes(record, bytes)
+    }
+
+    /// 入队（编码大小由调用方一次性算好；push_wait 等待窗口与入队复用）。
+    fn push_with_bytes(
+        &mut self,
+        record: AuditRecord,
+        bytes: u64,
+    ) -> Result<u64, AuditError> {
         let limit = self.window.min(MAX_AUDIT_RECORD_BYTES);
         if bytes > limit {
             return Err(AuditError::Oversize(bytes, limit));
@@ -160,44 +182,47 @@ impl AuditStream {
                 self.window,
             ));
         }
+        let seq = record.audit_seq;
         self.pending_bytes += bytes;
         self.next_seq += 1;
-        self.pending.push_back(record);
+        self.pending.push_back(QueuedRecord { record, bytes });
         Ok(seq)
     }
 
     /// 尽力发送：按窗口许可把 pending 打批发出去。写不动（outbound 满）
-    /// 自然背压。返回本轮发出的条数。
+    /// 自然背压。返回本轮发出的条数。计量全部用入队时缓存的规范大小（T06）。
     pub async fn flush(&mut self) -> Result<usize, AuditError> {
         let mut sent = 0;
         while let Some(first) = self.pending.front() {
             let unacked = self.unacked_bytes();
-            let first_bytes = first.encoded_bytes();
-            let first_seq = first.audit_seq;
+            let first_bytes = first.bytes;
+            let first_seq = first.record.audit_seq;
             if unacked + first_bytes > self.window {
                 break;
             }
             let mut batch: Vec<AuditRecord> = Vec::new();
             let mut batch_bytes = 0u64;
-            while let Some(record) = self.pending.front() {
-                let record_bytes = record.encoded_bytes();
-                if unacked + batch_bytes + record_bytes > self.window
-                    || batch_bytes + record_bytes + batch_overhead() > DATA_MAX_FRAME as u64
+            while let Some(entry) = self.pending.front() {
+                if unacked + batch_bytes + entry.bytes > self.window
+                    || batch_bytes + entry.bytes + batch_overhead() > DATA_MAX_FRAME as u64
                 {
                     break;
                 }
-                batch_bytes += record_bytes;
-                self.pending_bytes -= record_bytes;
-                batch.push(self.pending.pop_front().unwrap());
+                batch_bytes += entry.bytes;
+                self.pending_bytes -= entry.bytes;
+                let entry = self.pending.pop_front().unwrap();
+                if self.remote_replay {
+                    // 未确认副本（重放源）随批缓存，不再重复编码计量。
+                    self.inflight.push_back(QueuedRecord {
+                        record: entry.record.clone(),
+                        bytes: entry.bytes,
+                    });
+                }
+                batch.push(entry.record);
             }
             let last_seq = batch.last().map(|r| r.audit_seq).unwrap_or(first_seq);
             self.sent_bytes += batch_bytes;
             self.sent_seq = last_seq;
-            if self.remote_replay {
-                for record in &batch {
-                    self.inflight.push_back(record.clone());
-                }
-            }
             self.outbound
                 .send(Message::AuditBatch {
                     dispatch_id: self.dispatch_id.clone(),
@@ -235,17 +260,17 @@ impl AuditStream {
                 .last_send
                 .is_none_or(|at| at.elapsed() >= Duration::from_millis(ACK_RETRANSMIT_MS));
             if self.remote_replay && retransmit_due && !self.inflight.is_empty() {
-                // 重传未确认前缀（内容必须一致）。
+                // 重传未确认前缀（内容必须一致；帧预算用缓存计量，T06）。
                 let mut records = self.inflight.iter().peekable();
                 while records.peek().is_some() {
                     let mut batch = Vec::new();
                     let mut bytes = batch_overhead();
-                    while let Some(record) = records.peek() {
-                        if bytes + record.encoded_bytes() > DATA_MAX_FRAME as u64 {
+                    while let Some(entry) = records.peek() {
+                        if bytes + entry.bytes > DATA_MAX_FRAME as u64 {
                             break;
                         }
-                        bytes += record.encoded_bytes();
-                        batch.push((*records.next().unwrap()).clone());
+                        bytes += entry.bytes;
+                        batch.push((*records.next().unwrap()).record.clone());
                     }
                     let first_seq = batch[0].audit_seq;
                     tokio::select! {

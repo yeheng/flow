@@ -38,11 +38,14 @@ pub struct IncomingTransfers {
     streams: BTreeMap<String, TransferBuffer>,
 }
 
+/// 单个 transfer 的连续接收缓冲（T07）：v3 单流下块按序到达，接收端只
+/// 维护连续前缀（`buf`）。`offset == 已接收长度` 时追加；完全落在已接收
+/// 前缀且字节相同的是幂等重复（重连后全量重发）；缺口、跨边界重叠或异
+/// 内容一律拒绝。不再维护块树与装配副本（消除排序 + 整体二次拷贝）。
 struct TransferBuffer {
-    chunks: BTreeMap<u64, Vec<u8>>,
-    received: u64,
+    buf: Vec<u8>,
     ready: Option<(u64, String)>,
-    assembled: Option<Vec<u8>>,
+    assembled: bool,
 }
 
 impl IncomingTransfers {
@@ -83,26 +86,35 @@ impl IncomingTransfers {
         if raw.is_empty() || raw.len() > CHUNK_BYTES || end > limit {
             return Err(TransferError::Oversize(end));
         }
-        let total: u64 = self.streams.values().map(|s| s.received).sum();
+        let total: u64 = self.streams.values().map(|s| s.buf.len() as u64).sum();
         let inputs: u64 = self
             .streams
             .iter()
             .filter(|(id, _)| id.starts_with("in:"))
-            .map(|(_, s)| s.received)
+            .map(|(_, s)| s.buf.len() as u64)
             .sum();
         let stream = self.streams.entry(transfer_id.clone()).or_default();
-        if let Some(assembled) = &stream.assembled {
-            if assembled.get(*offset as usize..end as usize) == Some(raw.as_slice()) {
+        let received = stream.buf.len() as u64;
+        if end <= received {
+            // 幂等重复：完全落在已接收前缀且字节相同（重连后全量重发）。
+            if stream.buf[*offset as usize..end as usize] == raw[..] {
                 return Ok(());
             }
             return Err(TransferError::Duplicate(transfer_id.clone(), *offset));
         }
-        // 幂等重传：同 offset 同内容跳过；异内容拒绝（三期重连补发）。
-        if let Some(previous) = stream.chunks.get(offset) {
-            if *previous == raw {
-                return Ok(());
+        if *offset != received {
+            // 缺口或跨边界重叠：单流按序到达下不存在合法乱序，直接拒绝。
+            if *offset > received {
+                return Err(TransferError::Incomplete(format!(
+                    "gap: offset {offset} > received {received}"
+                )));
             }
             return Err(TransferError::Duplicate(transfer_id.clone(), *offset));
+        }
+        if let Some((total_ready, _)) = &stream.ready {
+            if end > *total_ready {
+                return Err(TransferError::Oversize(end));
+            }
         }
         if total + raw.len() as u64 > MAX_VALUE_BYTES
             || (transfer_id.starts_with("in:")
@@ -110,17 +122,7 @@ impl IncomingTransfers {
         {
             return Err(TransferError::Oversize(total + raw.len() as u64));
         }
-        if stream
-            .chunks
-            .range(..offset)
-            .next_back()
-            .is_some_and(|(start, bytes)| *start + bytes.len() as u64 > *offset)
-            || stream.chunks.range(*offset..end).next().is_some()
-        {
-            return Err(TransferError::Duplicate(transfer_id.clone(), *offset));
-        }
-        stream.received += raw.len() as u64;
-        stream.chunks.insert(*offset, raw);
+        stream.buf.extend_from_slice(&raw);
         self.try_assemble(transfer_id)
     }
 
@@ -149,21 +151,20 @@ impl IncomingTransfers {
             .streams
             .entry(transfer_id.clone())
             .or_insert(TransferBuffer {
-                chunks: BTreeMap::new(),
-                received: 0,
+                buf: Vec::new(),
                 ready: None,
-                assembled: None,
+                assembled: false,
             });
         if let Some(previous) = &stream.ready {
             if *previous != (*total_bytes, digest.clone()) {
                 return Err(TransferError::Incomplete("conflicting readiness".into()));
             }
-            if stream.assembled.is_some() {
+            if stream.assembled {
                 return Ok(());
             }
         }
         stream.ready = Some((*total_bytes, digest.clone()));
-        // 标记就绪后等块齐再装配，不在此处报错（InputReady 与块到达顺序无关）。
+        // 标记就绪后等前缀长齐再校验装配（InputReady 与块到达顺序无关）。
         self.try_assemble(transfer_id)
     }
 
@@ -174,33 +175,18 @@ impl IncomingTransfers {
         let Some((total, digest)) = stream.ready.clone() else {
             return Ok(()); // 就绪标记未到：继续等。
         };
-        // 块未齐：等（不报错；块齐判定用字节数，块序在齐后校验）。
-        if stream.received < total {
+        let received = stream.buf.len() as u64;
+        if received < total {
             return Ok(());
         }
-        if stream.received > total {
-            return Err(TransferError::Oversize(stream.received));
+        if received > total {
+            return Err(TransferError::Oversize(received));
         }
-        let mut assembled = Vec::with_capacity(total as usize);
-        let mut expected = 0u64;
-        for (offset, bytes) in &stream.chunks {
-            if *offset != expected {
-                return Err(TransferError::Incomplete(format!("gap at {expected}")));
-            }
-            expected += bytes.len() as u64;
-            assembled.extend_from_slice(bytes);
-        }
-        if assembled.len() as u64 != total {
-            return Err(TransferError::Incomplete(format!(
-                "assembled {} of {total}",
-                assembled.len()
-            )));
-        }
-        if hex::encode(Sha256::digest(&assembled)) != digest {
+        // 整值摘要：连续前缀即完整内容，无需排序与二次拷贝（T07）。
+        if hex::encode(Sha256::digest(&stream.buf)) != digest {
             return Err(TransferError::Digest(total));
         }
-        self.streams.get_mut(transfer_id).unwrap().assembled = Some(assembled);
-        self.streams.get_mut(transfer_id).unwrap().chunks.clear();
+        stream.assembled = true;
         Ok(())
     }
 
@@ -208,8 +194,8 @@ impl IncomingTransfers {
     /// 任务后续阶段（如 End 汇合）再次读取；任务结束时随装配器释放。
     pub fn take(&mut self, transfer_id: &str) -> Option<Vec<u8>> {
         let stream = self.streams.get_mut(transfer_id)?;
-        if stream.ready.is_some() {
-            stream.assembled.clone()
+        if stream.ready.is_some() && stream.assembled {
+            Some(stream.buf.clone())
         } else {
             None
         }
@@ -220,28 +206,27 @@ impl IncomingTransfers {
     pub fn insert_ready(&mut self, transfer_id: impl Into<String>, bytes: Vec<u8>) {
         let id = transfer_id.into();
         let stream = self.streams.entry(id).or_default();
-        if stream.assembled.is_none() {
+        if !stream.assembled {
             let total = bytes.len() as u64;
             stream.ready = Some((total, hex::encode(Sha256::digest(&bytes))));
-            stream.received = total;
-            stream.assembled = Some(bytes);
+            stream.buf = bytes;
+            stream.assembled = true;
         }
     }
 
     pub fn is_ready(&self, transfer_id: &str) -> bool {
         self.streams
             .get(transfer_id)
-            .is_some_and(|s| s.ready.is_some() && s.assembled.is_some())
+            .is_some_and(|s| s.ready.is_some() && s.assembled)
     }
 }
 
 impl TransferBuffer {
     fn new() -> Self {
         Self {
-            chunks: BTreeMap::new(),
-            received: 0,
+            buf: Vec::new(),
             ready: None,
-            assembled: None,
+            assembled: false,
         }
     }
 }
@@ -368,15 +353,20 @@ mod tests {
     #[test]
     fn gap_and_digest_rejected() {
         let mut incoming = IncomingTransfers::default();
-        incoming.feed(&chunk("t", 10, b"late")).expect("stored");
+        // T07：单流按序到达，非连续 offset 不再暂存等 ready，feed 时立即拒绝。
         incoming
-            .input_ready(&Message::InputReady {
-                dispatch_id: "d".into(),
-                transfer_id: "t".into(),
-                total_bytes: 4,
-                digest: hex::encode(Sha256::digest(b"late")),
-            })
-            .expect_err("gap must fail");
+            .feed(&chunk("t", 10, b"late"))
+            .expect_err("gap must fail at feed");
+        // 连续前缀正确接收后装配校验整值摘要。
+        let mut ok = IncomingTransfers::default();
+        ok.feed(&chunk("t2", 0, b"late")).unwrap();
+        ok.input_ready(&Message::InputReady {
+            dispatch_id: "d".into(),
+            transfer_id: "t2".into(),
+            total_bytes: 4,
+            digest: hex::encode(Sha256::digest(b"late")),
+        })
+        .expect("contiguous transfer assembles");
         let mut bad = incoming;
         bad.feed(&chunk("u", 0, b"data")).unwrap();
         let error = bad.input_ready(&Message::InputReady {

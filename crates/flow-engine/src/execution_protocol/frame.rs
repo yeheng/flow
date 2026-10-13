@@ -10,19 +10,20 @@ use super::contract::{CONTROL_MAX_FRAME, DATA_MAX_FRAME, FRAME_HEADER_BYTES};
 use super::message::{Channel, Message, ProtocolError};
 
 /// 单流帧：长度计标签 + JSON；标签取自消息声明的通道。
+/// JSON 直接写入预留长度头的帧缓冲（T05：无中间 Vec 拷贝）。
 pub fn encode_tagged_frame(message: &Message) -> Result<Vec<u8>, ProtocolError> {
-    let json = serde_json::to_vec(&message.to_envelope())
-        .map_err(|e| ProtocolError::Malformed(format!("encode: {e}")))?;
     let channel = message.channel();
     let limit = frame_limit(channel);
-    if json.len() + 1 > limit {
-        return Err(ProtocolError::FrameTooLarge(json.len() + 1, limit));
-    }
-    let payload_len = json.len() + 1;
-    let mut frame = Vec::with_capacity(payload_len + FRAME_HEADER_BYTES);
-    frame.extend_from_slice(&(payload_len as u32).to_be_bytes());
+    let mut frame = Vec::with_capacity(FRAME_HEADER_BYTES + 256);
+    frame.extend_from_slice(&[0u8; FRAME_HEADER_BYTES]);
     frame.push(channel.tag());
-    frame.extend_from_slice(&json);
+    serde_json::to_writer(&mut frame, &message.to_envelope())
+        .map_err(|e| ProtocolError::Malformed(format!("encode: {e}")))?;
+    let payload_len = frame.len() - FRAME_HEADER_BYTES;
+    if payload_len > limit {
+        return Err(ProtocolError::FrameTooLarge(payload_len, limit));
+    }
+    frame[..4].copy_from_slice(&(payload_len as u32).to_be_bytes());
     Ok(frame)
 }
 
@@ -156,6 +157,35 @@ mod tests {
                     .expect("decode");
             assert_eq!(decoded, message);
         }
+    }
+
+    #[test]
+    fn typed_decode_matches_legacy_on_all_fixtures() {
+        // T05：借用信封直析（decode_envelope）与旧 Value 路径语义等价，
+        // 且与原消息相等（全部合法消息，含嵌套 Routed 与十进制字符串字段）。
+        for message in fixtures::valid_messages() {
+            let frame = encode_tagged_frame(&message).expect("encode");
+            let json = &frame[FRAME_HEADER_BYTES + 1..];
+            let typed = Message::decode_envelope(json).expect("typed decode");
+            let legacy = Message::from_envelope(serde_json::from_slice(json).expect("json"))
+                .expect("legacy decode");
+            assert_eq!(typed, message, "typed decode mismatch");
+            assert_eq!(legacy, typed, "legacy/typed divergence");
+        }
+    }
+
+    #[test]
+    fn typed_decode_rejects_malformed_envelopes() {
+        // T05：拒绝行为与旧路径保持一致（版本/缺字段/非十进制/未知类型）。
+        for bad in fixtures::malformed_envelopes() {
+            let json = serde_json::to_vec(&bad).unwrap();
+            assert!(
+                Message::decode_envelope(&json).is_err(),
+                "must reject: {bad}"
+            );
+        }
+        let unknown = serde_json::to_vec(&fixtures::unknown_type_envelope()).unwrap();
+        assert!(Message::decode_envelope(&unknown).is_err());
     }
 
     #[test]

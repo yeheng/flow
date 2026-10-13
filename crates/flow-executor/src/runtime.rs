@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use flow_engine::execution_protocol::contract::bounded_control_text;
-use flow_engine::execution_protocol::contract::STARTUP_TIMEOUT_MS;
+use flow_engine::execution_protocol::contract::{DRAIN_GRACE_MS, STARTUP_TIMEOUT_MS};
 use flow_engine::execution_protocol::loopback::connect_loopback;
 use flow_engine::execution_protocol::message::Message;
 use flow_engine::execution_protocol::transport::{
@@ -121,7 +121,20 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
     // 执行器死等 InputReady 永不到来（材料不齐），主进程等到 deadline。
     let mut pending: std::collections::VecDeque<(mpsc::Sender<Message>, Message)> =
         std::collections::VecDeque::new();
+    // 出站积压（T03）：transport 队列满时暂存重试，不让阻塞中的 send 卡住
+    // 整个 select——入站 Cancel/ACK 与任务完成始终可被处理；积压占用期间
+    // 不再拉取新出站消息（自然背压到心跳/任务生产方）。
+    let mut send_backlog =
+        flow_engine::execution_protocol::transport::SendBacklog::with_capacity(4);
     loop {
+        if send_backlog.flush(&transport).is_err() {
+            eprintln!("flow-executor: master unreachable; stopping");
+            if let Some(task) = &current {
+                task.cancel.cancel();
+            }
+            exit_code = 74;
+            break;
+        }
         if !pending.is_empty() {
             // 先把队首能立即投递的消息确定性转发（有容量即送，无需等待）。
             let (mail, message) = pending.front().unwrap().clone();
@@ -144,10 +157,10 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
                 // 容量可用：回到循环顶部确定性转发。
                 continue;
             }
-            outbound = outbound_rx.recv() => {
+            outbound = outbound_rx.recv(), if send_backlog.is_empty() => {
                 match outbound {
                     Some(message) => {
-                        if transport.send(message).await.is_err() {
+                        if send_backlog.push(&transport, message).is_err() {
                             // 主进程不可达：停止一切，退出等待回收。
                             eprintln!("flow-executor: master unreachable; stopping");
                             if let Some(task) = &current { task.cancel.cancel(); }
@@ -207,14 +220,18 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
     }
     if let Some(task) = &current {
         task.cancel.cancel();
-        // 尽力封口通知：取消后的 Stopped（通道可能已死，忽略结果）。
+        // 尽力封口通知：取消后的 Stopped（通道可能已死/拥塞，有界等待）。
         let stopped = Message::Stopped {
             dispatch_id: task.dispatch_id.clone(),
             sealed: false,
             last_audit_seq: 0,
             pending_operation: None,
         };
-        let _ = transport.send(stopped).await;
+        let _ = tokio::time::timeout(
+            Duration::from_millis(DRAIN_GRACE_MS),
+            transport.send(stopped),
+        )
+        .await;
     }
     heartbeat_handle.abort();
     transport.close();

@@ -2,12 +2,20 @@
 
 复核日期：2026-10-13。依据当前工作区源码和本次定向测试。原始输入：`review.md`。本文交付方案与任务清单；实现进度见下方【实现进度】。审阅期间工作区另有注释、配置帮助文字和历史设计说明的同步修改，已核对相关 diff；以下任务不把这些已补充说明重复计为待实现功能。
 
-【实现进度】（2026-10-13 第二轮更新）
+【实现进度】（2026-10-13 第三轮更新：推荐范围 T01–T11 全部完成）
 
-- 已完成：T04（094034a）；T02（本轮：agent `connect` 与 master `run_session` 握手统一经 `FrameTransport` 收发，不再用临时 decoder 交接；新增双侧粘连帧集成回归）；T03 传输层与会话循环守卫（本轮：写任务失败经会话状态直达 `recv` 并携带真实错误，close/任一方向失败统一终止读写任务，`run_session` 出站等待纳入终止 select）。执行器/agent 服务循环的发送等待全面纳入主 select 仍待做。
-- 本轮修复的存量缺陷：v3 收敛时 `listen_tls` 由「后台 accept 任务」改为直跑无限循环，`start_execution_remote`（含生产 remote 启动路径）永久阻塞，真实 TLS/远程套件长期挂起。已恢复绑定即返回、accept 后台化的语义。
-- 兼容回归修复：094034a 删除了 `[execution.remote].data_addr`、`[agent].data_addr` 与 flow-agent `--data-addr`，而相关 struct 均为 deny_unknown_fields/clap 严格解析，存量配置与启动脚本会直接报错。已按 T10 约束恢复为忽略式兼容（配置字段 + CLI/env 参数，值忽略）并附回归测试。
-- 仍未实施：T01、T05–T09、T11 及条件任务 T12–T14。
+- **已完成（全部推荐任务）**：T01、T02、T03、T04、T05、T06、T07、T08、T09、T10（兼容部分）、T11（本轮复测）。
+- 第二轮成果：T02（握手统一经 transport + 双侧粘连帧回归）、T03 传输层（会话级故障状态直达 recv）、listen_tls 启动阻塞修复、data_addr 忽略式兼容恢复。
+- 第三轮成果：
+  - T03 收尾：executor 主循环 / agent serve / backend pool 三处服务循环全部改为有界出站积压（`SendBacklog`：满队列暂存重试，入站 Cancel/ACK/心跳始终可处理；新增 `try_send_requeue` 满则原样退回）。
+  - T06：审计队列项缓存规范编码大小（push/flush/重放不再重复序列化计量；push_wait 与入队共用一次计量）。
+  - T07：执行器输入装配与 backend op_transfers 全部改为连续前缀缓冲（offset==已接收长度才追加；同内容前缀补发幂等接受；缺口/跨边界重叠/异内容立即拒绝；不再有块树排序与整体二次拷贝）。
+  - T05：解码侧借用信封 + RawValue 类型化单遍解析（`decode_envelope`，不建 Value 树、无 body 深拷贝，两入口共用同一套 Wire 校验）；编码侧 JSON 直写预留长度头的帧缓冲；新增全 fixtures 新旧路径等价与畸形拒绝测试。
+  - T08：`unwrap_from_master_owned` 移动内层消息（不再深拷贝）；上联共享出站字节预算（8 MiB，估算×2 安全系数，acquire/release 随消息流转）；轮转桥改为按字节额度（64 KiB/轮，帧数≤ 4/轮）。
+  - T01：新增 `cargo run -p flow-engine --release --example ipc_baseline`（含分配计数器）与 `docs/IPC_PROTOCOL_BASELINE.md` 基线报告。
+  - T09：`dispatch::fault` 确定性检查点（auth_persist 前后、permit_send 前后、result_committed 前后；未注册零开销）+ `tests/journal_fault_matrix.rs` 三场景（未持久化断线→HTTP 为 0；持久化后/Permit 前取消→HTTP 为 0 且 Cancelled；回执前断线→外部调用恰好一次且不误报成功）。
+- 仍未实施（条件任务，按进入条件启动）：T12（二进制大载荷 wire，需复测证明 Base64 是主要成本）、T13（WSS 上联，需 HTTP 代理接入需求）、T14（Windows Agent）。T10 的打包/进程启动全量验收（env_clear/FD 隔离/kill-reap 等）仍待系统化执行。
+- 性能结论边界：T01 基线只有当前实现一组数据；任何优化收益必须同机同命令复测对比，不外推。
 
 【品味评分】
 
@@ -87,6 +95,7 @@
 
 ### T01 / P0：冻结 v3 现状、不变量与性能基线
 
+- **状态：已完成（2026-10-13）**。`examples/ipc_baseline`（可复现命令 + 分配计数器）与 `docs/IPC_PROTOCOL_BASELINE.md`（环境、原始数值、口径与边界）已交付；二/三期历史文档已在 v3 收敛时删除（历史保留为历史）。
 - **目标**：让优化针对当前实现，并建立能够复测的收益证据。
 - **背景**：原文仍描述双连接；二、三期历史正文也有双流内容，最新工作区已补充 v3 现状说明，需要验收历史与当前实现的边界。现有未跟踪 `examples/ipc_design_probe.rs` 的解码基准把含长度头的整个 frame 交给 JSON parser，且新路径硬编码字段、并非完整等价实现，不能用于收益结论。
 - **范围**：本文件；`docs/JSONL_MASTER_EXECUTOR_PHASE2_PLAN.md`、`PHASE3_PLAN.md` 的当前状态说明；`crates/backend-perf/src/` 或独立可复用的协议 benchmark。原始探针不纳入生产实现。
@@ -108,7 +117,7 @@
 
 ### T03 / P0：写失败和队列背压不能卡住关闭与接收
 
-- **状态：部分完成（2026-10-13）**。传输层已落地：会话共享故障状态（真实错误槽 + Notify 许可 + 终止信号），写任务失败直达 `recv`、读/写任务与阻塞中的发送方统一被释放，`recv` 终态优先返回已记录真实错误；`run_session` 三处出站等待纳入 cancel/shutdown select。未完成部分：executor/agent 服务循环同类发送点、满队列期间 ACK/接收分支的全面 select 化与对应测试矩阵。
+- **状态：已完成（2026-10-13）**。传输层（会话故障状态：错误槽 + Notify 许可 + 终止信号）与三个服务循环（executor 主循环、agent serve、backend pool 会话）全部落地有界出站积压（`SendBacklog`）；满发送队列期间入站 Cancel/ACK/心跳/关闭均可处理，阻塞中的发送方随写任务退出释放。
 - **目标**：让 I/O 故障、取消和 shutdown 在发送拥塞时仍然可处理。
 - **背景**：当前 writer 失败主要置 `broken`，不直接唤醒阻塞的 `recv`；若 reader 仍然挂起，故障传播依赖后续活动。多个服务循环在 select 分支中直接等待 `transport.send`，满发送队列期间不再选择接收/关闭分支。
 - **范围**：`execution_protocol/transport.rs`；`flow-executor/src/runtime.rs`；`flow-agent/src/runtime.rs`、`pool.rs`；Backend `execution/pool.rs`、`remote.rs` 的相同发送点。
@@ -130,6 +139,7 @@
 
 ### T05 / P1：保持 wire 的类型化单遍编解码
 
+- **状态：已完成（2026-10-13）**。解码：借用信封 + RawValue 类型化单遍解析（`Message::decode_envelope`），与旧 `from_envelope` 共用同一套 Wire 结构与拒绝行为（全 fixtures 等价测试）。编码：JSON 直写预留长度头的帧缓冲（消除中间 Vec 拷贝）。encode 侧信封 Value 树仍在（to_envelope），进一步类型化 Serialize 待复测证明必要后推进。
 - **目标**：减少中间 Value 树与大 body clone，不改变 v3 消息契约。
 - **背景**：`encode_tagged_frame` 先构造信封 Value、再 JSON 编码、再复制到帧；`from_envelope` clone body 后再次转换；解码器也有 payload 和去标签的重复复制。
 - **范围**：`execution_protocol/{message.rs,frame.rs,transport.rs,fixtures.rs}`；远程握手统一后的编解码调用；必要的 Cargo 依赖配置。
@@ -140,6 +150,7 @@
 
 ### T06 / P1：缓存审计编码大小，保留持久信用与远程重放
 
+- **状态：已完成（2026-10-13）**。队列项缓存规范编码大小；push_wait 等待与入队共用一次计量；flush/重放全部用缓存；窗口/ACK/重放语义不变（audit_window 套件全绿）。
 - **目标**：去掉 push/flush/replay 的重复计量序列化，保证持久窗口不变。
 - **背景**：同一 AuditRecord 的 encoded_bytes 被多次调用；本地已不保留重放副本，仍需要 sent/durable 累计量。
 - **范围**：`flow-executor/src/audit.rs`；Backend `execution/dispatch.rs` 审计计量和去重处；`flow-executor/tests/audit_window.rs`。
@@ -150,6 +161,7 @@
 
 ### T07 / P1：连续 transfer 缓冲替代每块 BTreeMap
 
+- **状态：已完成（2026-10-13）**。执行器输入装配与 backend op_transfers 均改为连续前缀缓冲：追加式接收、幂等前缀补发、缺口/重叠/异内容立即拒绝；整值摘要、每块校验、输入总预算与操作指纹保留；消除排序与二次拷贝。
 - **目标**：消除按 offset 排序再整体复制的装配成本，保留重连补发。
 - **背景**：单流同 transfer 正常有序；当前装配器仍维护块树和额外 assembled 缓冲。Backend 操作请求装配也维护块树。
 - **范围**：`flow-executor/src/transfer.rs`；Backend `execution/dispatch.rs` 的 op_transfers；`flow-executor/tests/transfer_bounds.rs`；远程 reconnect 测试。
@@ -160,6 +172,7 @@
 
 ### T08 / P1：中继拥有消息，按字节预算与 dispatch 公平发送
 
+- **状态：已完成（2026-10-13）**。`unwrap_from_master_owned` 移动内层（深拷贝消除）；上联共享出站字节预算（8 MiB，估算×2 安全系数，随消息所有权 acquire/release）；轮转桥按字节额度（64 KiB/轮且≤4 帧/轮）。估算口径（非精确序列化计量）已在代码与基线报告标注，精确化属 T12/复测后续。
 - **目标**：减少 Agent 深拷贝，并防止洪泛和重复补传放大物理缓冲。
 - **背景**：`unwrap_from_master(&Message)` 克隆整个 inner；中继多层 mpsc 主要按条数限制，一层 256 个最大帧就有约 256 MiB 载荷上界。持久窗口不能替代重复帧和所有中间队列的内存预算；目前按帧轮转也不等于按字节公平。
 - **范围**：`flow-agent/src/{relay.rs,runtime.rs,pool.rs}`；必要的 transport 出站预算入口；Agent 相关测试及 backend-perf 远程负载。
@@ -170,6 +183,7 @@
 
 ### T09 / P0：冻结授权、结果提交与重连的故障矩阵
 
+- **状态：已完成（2026-10-13）**。`dispatch::fault` 确定性检查点（未注册零开销）+ `tests/journal_fault_matrix.rs` 三场景：授权持久化前断线→HTTP 副作用为 0；持久化后/Permit 发送前取消→不发 Permit 且外部调用为 0；ResultCommitted 前断线→外部调用恰好一次且不误报成功。Resume 五裁决的既有 reconnect 套件继续覆盖。
 - **目标**：使所有优化都经过同一组业务正确性验收。
 - **背景**：单流消除跨连接乱序，不能消除 Journal 提交、取消与外部调用之间的竞态。远程已经有 Resume 五种裁决，应复用。
 - **范围**：`journal_ipc.rs`、`journal_remote.rs`、`journal_remote_tls.rs`、`journal_remote_reconnect.rs`、`journal_remote_ops.rs`；必要的测试故障注入点。
@@ -191,6 +205,7 @@
 
 ### T11 / P1：端到端复测、文档更新与最终验收
 
+- **状态：已完成（2026-10-13）**。第三轮全量回归：flow-engine lib 83/83；Executor 11/11；Agent 6/6；flow-config 8/8；backend 十套件 50 通过/10 ignored（含 T02 粘连帧、T09 故障矩阵、既有多流取消/重连）；`cargo check --workspace --all-targets` 零告警；基线复跑数值稳定。性能收益的定量结论仍需同机同命令前后对比（当前只有一组基线）。
 - **目标**：完成推荐范围，交付有证据的简化和性能结果。
 - **背景**：微基准减少分配不保证端到端提速，磁盘提交和进程成本也可能占主导。
 - **范围**：T01 的 benchmark/report；相关 crate 检查与测试；二、三期设计/任务文档和 OPS 的当前状态说明。
@@ -245,6 +260,6 @@ cargo test -p flow-backend --test journal_remote_reconnect --test journal_remote
 cargo check --workspace --all-targets --locked
 ```
 
-本次已执行（2026-10-13 第二轮）：flow-engine lib 81/81（含 T03 故障传播新增单元测试）；Executor 11/11；Agent lib 6/6；flow-config 8/8（含 data_addr 兼容回归）；backend journal_ipc+packaging 19 通过；journal_remote_tls 5/5（含 T02 双侧粘连帧新增测试）；journal_remote/reconnect/ops 9/9；journal_acceptance/execution/capacity 14 通过；`cargo check --workspace --all-targets` 通过。其中 tls/remote 三套真实进程测试在修复 `listen_tls` 阻塞前于本机长期挂起超时。本次仍没有执行性能基线（T01）与完整故障矩阵（T09），不对当前吞吐或优化倍数下结论。
+本次已执行（2026-10-13 第三轮，全量）：flow-engine lib 83/83；Executor 11/11；Agent lib 6/6；flow-config 8/8；backend journal_ipc/packaging/remote/remote_tls/remote_reconnect/remote_ops/fault_matrix/acceptance/execution/capacity 共 50 通过、10 ignored；`cargo check --workspace --all-targets` 通过；`examples/ipc_baseline` 复跑稳定。第一轮（34/34 定向）与第二轮（listen_tls 修复后 TLS/远程套件恢复全绿）记录见 git 历史。仍不覆盖：真实 WAN soak、打包/进程启动全量验收（T10 剩余）、T12–T14 条件任务。
 
 最终交付应包含：实现 diff、兼容说明、上述正确性结果、基线/复测报告、真实队列预算、最新部署说明。验收必须同时证明事实不变、资源有界和收益真实。

@@ -16,6 +16,14 @@ use flow_engine::execution_protocol::remote::{routable, RouteEnvelope};
 pub const PER_EXECUTOR_QUEUE: usize = 8;
 /// 上联总出站帧预算（跨执行器）。
 pub const UPLINK_OUT_QUEUE: usize = 256;
+/// 上联共享出站字节预算（T08）：限制 wrapper→serve 队列里滞留的估算
+/// 编码字节总量（不含 transport 出站队列——那层另按帧数有界）。
+pub const UPLINK_OUT_BYTES: u64 = 8 * 1024 * 1024;
+/// 字节公平轮转的每轮额度（T08）：估算编码字节；纯帧数公平会被大帧
+/// 洪泛任务变相独占。
+pub const FAIR_TURN_BYTES: u64 = 64 * 1024;
+/// 每轮帧数上限：小帧洪泛（心跳/观测）不能在一轮内排干队列饿死后继。
+pub const FAIR_TURN_FRAMES: usize = 4;
 
 /// 已确认绑定（agent 视角）：dispatch → 执行器身份。
 #[derive(Debug, Clone)]
@@ -88,6 +96,23 @@ impl Relay {
         Ok((dispatch_id, *inner.clone()))
     }
 
+    /// 消耗式解包（T08 生产路径）：校验后移动内层消息，不做深拷贝。
+    /// 借用式 [`Relay::unwrap_from_master`] 仅为兼容保留。
+    pub fn unwrap_from_master_owned(
+        &self,
+        message: Message,
+    ) -> Result<(String, Message), RelayError> {
+        let Message::Routed { envelope, inner } = message else {
+            return Err(RelayError::NotRoutable(message.type_name().into()));
+        };
+        self.verify(&envelope)?;
+        let dispatch_id = envelope
+            .dispatch_id
+            .clone()
+            .ok_or_else(|| RelayError::Envelope("missing dispatch_id".into()))?;
+        Ok((dispatch_id, *inner))
+    }
+
     /// 执行器→主方向：按已确认归属构造包络（不信任执行器自报机器身份）。
     pub fn wrap_to_master(&self, dispatch_id: &str, inner: Message) -> Result<Message, RelayError> {
         if !routable(&inner) {
@@ -138,6 +163,107 @@ impl Relay {
             return Err(RelayError::Envelope("executor identity mismatch".into()));
         }
         Ok(())
+    }
+}
+
+
+/// 消息估算编码字节数（T08 调度与预算口径）：不序列化、零分配地遍历
+/// 大载荷字段。JSON 转义最坏放大约 2×，预算按 [`weight_budgeted`] 计。
+/// 调度公平性与队列预算用同一估算；精确计量属 T01 基线后续验证项。
+pub fn estimate_weight(message: &Message) -> u64 {
+    let raw = match message {
+        Message::Routed { inner, .. } => 256 + estimate_weight(inner),
+        Message::TransferChunk { bytes, .. } => 512 + bytes.len() as u64,
+        Message::AuditBatch { records, .. } => records
+            .iter()
+            .map(|record| 512 + record.kind.len() as u64 + estimate_value(&record.payload))
+            .sum(),
+        Message::ObservabilityBatch { lines, .. } => 512
+            + lines
+                .iter()
+                .map(|line| 256 + line.message.len() as u64)
+                .sum::<u64>(),
+        Message::Result { .. } => 1024,
+        _ => 1024,
+    };
+    raw.min(flow_engine::execution_protocol::DATA_MAX_FRAME as u64)
+}
+
+fn estimate_value(value: &serde_json::Value) -> u64 {
+    match value {
+        serde_json::Value::String(text) => 16 + text.len() as u64,
+        serde_json::Value::Object(map) => map
+            .iter()
+            .map(|(key, value)| 16 + key.len() as u64 + estimate_value(value))
+            .sum(),
+        serde_json::Value::Array(items) => items.iter().map(estimate_value).sum(),
+        _ => 16,
+    }
+}
+
+/// 预算口径的估算字节数：JSON 转义最坏放大约 2×，按 2× 计入（硬上界
+/// 仍受帧上限约束）。
+pub fn weight_budgeted(message: &Message) -> u64 {
+    (estimate_weight(message) * 2).min(flow_engine::execution_protocol::DATA_MAX_FRAME as u64 * 2)
+}
+
+/// 共享出站字节预算（T08）：acquire 随消息入队前占用，release 于消息
+/// 离开 agent（交 transport 出站队列或发送失败）后归还；预算随消息
+/// 所有权流转，不用无界队列化解背压。
+pub struct UplinkBudget {
+    cap: u64,
+    used: std::sync::atomic::AtomicU64,
+    room: tokio::sync::Notify,
+}
+
+impl UplinkBudget {
+    pub fn new(cap: u64) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            cap,
+            used: std::sync::atomic::AtomicU64::new(0),
+            room: tokio::sync::Notify::new(),
+        })
+    }
+
+    /// 等待并占用 `bytes` 预算（超过 cap 的单帧按 cap 计，不永久等待）。
+    pub async fn acquire(self: &std::sync::Arc<Self>, bytes: u64) {
+        let bytes = bytes.min(self.cap).max(1);
+        loop {
+            let current = self.used.load(std::sync::atomic::Ordering::Acquire);
+            if current.saturating_add(bytes) <= self.cap {
+                if self
+                    .used
+                    .compare_exchange(
+                        current,
+                        current + bytes,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return;
+                }
+                continue;
+            }
+            let notified = self.room.notified();
+            // 已创建等待 future 后重查：避免错过 release 的唤醒。
+            let current = self.used.load(std::sync::atomic::Ordering::Acquire);
+            if current.saturating_add(bytes) <= self.cap {
+                continue;
+            }
+            notified.await;
+        }
+    }
+
+    /// 归还 `bytes` 预算并唤醒一个等待的生产方。
+    pub fn release(&self, bytes: u64) {
+        let current = self.used.load(std::sync::atomic::Ordering::Acquire);
+        let bytes = bytes.min(current);
+        if bytes > 0 {
+            self.used
+                .fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
+        }
+        self.room.notify_one();
     }
 }
 

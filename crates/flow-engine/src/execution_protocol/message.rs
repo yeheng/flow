@@ -835,7 +835,8 @@ impl Message {
         Value::Object(envelope)
     }
 
-    /// 从信封 JSON 解码。未知类型 / 信封字段错误明确拒绝。
+    /// 从信封 JSON 解码（兼容入口：已有 Value 树）。生产路径用
+    /// [`Message::decode_envelope`]（T05：借用信封 + 类型化单遍解析）。
     pub fn from_envelope(value: Value) -> Result<Self> {
         if !value.is_object() {
             return Err(ProtocolError::Malformed("envelope must be object".into()));
@@ -850,9 +851,46 @@ impl Message {
             .as_str()
             .ok_or_else(|| ProtocolError::Malformed("missing type".into()))?;
         let body = value.get("body").cloned().unwrap_or(Value::Null);
-        let dispatch_id = |v: &Value| -> Result<String> {
-            v["dispatch_id"]
-                .as_str()
+        let envelope_dispatch = value.get("dispatch_id").and_then(Value::as_str);
+        Self::decode_kind(&body, type_name, envelope_dispatch)
+    }
+
+    /// 从信封 JSON 字节直接解码（T05 生产路径）：信封借用解析（RawValue
+    /// body 不建 Value 树、不做 body 深拷贝），类型化 Wire 单遍解析。
+    pub fn decode_envelope(bytes: &[u8]) -> Result<Self> {
+        #[derive(serde::Deserialize)]
+        struct Envelope<'a> {
+            v: u64,
+            #[serde(borrow, rename = "type")]
+            kind: &'a str,
+            #[serde(borrow, default)]
+            dispatch_id: Option<&'a str>,
+            #[serde(borrow, default)]
+            body: Option<&'a serde_json::value::RawValue>,
+        }
+        let envelope: Envelope<'_> = serde_json::from_slice(bytes)
+            .map_err(|e| ProtocolError::Malformed(format!("envelope: {e}")))?;
+        if envelope.v != PROTOCOL_VERSION as u64 {
+            return Err(ProtocolError::Malformed(format!(
+                "protocol version {} not supported",
+                envelope.v
+            )));
+        }
+        // body 缺省视作 null（与 from_envelope 兼容：Wire 解析再报具体错误）。
+        let null_body: &serde_json::value::RawValue = serde_json::from_str("null")
+            .expect("static null RawValue");
+        let body = envelope.body.unwrap_or(null_body);
+        Self::decode_kind(body, envelope.kind, envelope.dispatch_id)
+    }
+
+    /// 按类型解码 body（两入口共用同一套 Wire 结构与校验；静态分发）。
+    fn decode_kind<B: BodySource + ?Sized>(
+        body: &B,
+        type_name: &str,
+        envelope_dispatch: Option<&str>,
+    ) -> Result<Self> {
+        let dispatch_id = |envelope_dispatch: Option<&str>| -> Result<String> {
+            envelope_dispatch
                 .map(str::to_owned)
                 .ok_or_else(|| ProtocolError::InvalidPayload(format!("{type_name}: dispatch_id")))
         };
@@ -864,7 +902,7 @@ impl Message {
                     build: String,
                     capabilities: Vec<String>,
                 }
-                let wire: Wire = from_body(&body, type_name)?;
+                let wire: Wire = body.parse(type_name)?;
                 Message::Hello {
                     boot_id: wire.boot_id,
                     build: wire.build,
@@ -888,7 +926,7 @@ impl Message {
                     #[serde(with = "flow_journal::decimal")]
                     drain_grace_ms: u64,
                 }
-                let wire: Wire = from_body(&body, type_name)?;
+                let wire: Wire = body.parse(type_name)?;
                 Message::Welcome {
                     journal_id: wire.journal_id,
                     master_epoch: wire.master_epoch,
@@ -907,10 +945,10 @@ impl Message {
                     command_id: String,
                     task: ExecuteTask,
                 }
-                let wire: Wire = from_body(&body, type_name)?;
+                let wire: Wire = body.parse(type_name)?;
                 Message::Execute {
                     command_id: wire.command_id,
-                    dispatch_id: dispatch_id(&value)?,
+                    dispatch_id: dispatch_id(envelope_dispatch)?,
                     task: wire.task,
                 }
             }
@@ -919,10 +957,10 @@ impl Message {
                 struct Wire {
                     command_id: String,
                 }
-                let wire: Wire = from_body(&body, type_name)?;
+                let wire: Wire = body.parse(type_name)?;
                 Message::Accepted {
                     command_id: wire.command_id,
-                    dispatch_id: dispatch_id(&value)?,
+                    dispatch_id: dispatch_id(envelope_dispatch)?,
                 }
             }
             kind::AUDIT_BATCH => {
@@ -932,9 +970,9 @@ impl Message {
                     first_seq: u64,
                     records: Vec<AuditRecord>,
                 }
-                let wire: Wire = from_body(&body, type_name)?;
+                let wire: Wire = body.parse(type_name)?;
                 Message::AuditBatch {
-                    dispatch_id: dispatch_id(&value)?,
+                    dispatch_id: dispatch_id(envelope_dispatch)?,
                     first_seq: wire.first_seq,
                     records: wire.records,
                 }
@@ -949,9 +987,9 @@ impl Message {
                     #[serde(with = "flow_journal::decimal")]
                     commit_lsn: u64,
                 }
-                let wire: Wire = from_body(&body, type_name)?;
+                let wire: Wire = body.parse(type_name)?;
                 Message::AuditAck {
-                    dispatch_id: dispatch_id(&value)?,
+                    dispatch_id: dispatch_id(envelope_dispatch)?,
                     durable_audit_seq: wire.durable_audit_seq,
                     durable_bytes: wire.durable_bytes,
                     commit_lsn: wire.commit_lsn,
@@ -965,9 +1003,9 @@ impl Message {
                     request_fingerprint: String,
                     transfer_id: String,
                 }
-                let wire: Wire = from_body(&body, type_name)?;
+                let wire: Wire = body.parse(type_name)?;
                 Message::RequestOperation {
-                    dispatch_id: dispatch_id(&value)?,
+                    dispatch_id: dispatch_id(envelope_dispatch)?,
                     command_id: wire.command_id,
                     operation_id: wire.operation_id,
                     request_fingerprint: wire.request_fingerprint,
@@ -982,9 +1020,9 @@ impl Message {
                     request_fingerprint: String,
                     credential: Option<String>,
                 }
-                let wire: Wire = from_body(&body, type_name)?;
+                let wire: Wire = body.parse(type_name)?;
                 Message::OperationPermit {
-                    dispatch_id: dispatch_id(&value)?,
+                    dispatch_id: dispatch_id(envelope_dispatch)?,
                     operation_id: wire.operation_id,
                     permit_id: wire.permit_id,
                     request_fingerprint: wire.request_fingerprint,
@@ -1000,9 +1038,9 @@ impl Message {
                     bytes: String,
                     digest: String,
                 }
-                let wire: Wire = from_body(&body, type_name)?;
+                let wire: Wire = body.parse(type_name)?;
                 Message::TransferChunk {
-                    dispatch_id: dispatch_id(&value)?,
+                    dispatch_id: dispatch_id(envelope_dispatch)?,
                     transfer_id: wire.transfer_id,
                     offset: wire.offset,
                     bytes: wire.bytes,
@@ -1017,9 +1055,9 @@ impl Message {
                     total_bytes: u64,
                     digest: String,
                 }
-                let wire: Wire = from_body(&body, type_name)?;
+                let wire: Wire = body.parse(type_name)?;
                 Message::InputReady {
-                    dispatch_id: dispatch_id(&value)?,
+                    dispatch_id: dispatch_id(envelope_dispatch)?,
                     transfer_id: wire.transfer_id,
                     total_bytes: wire.total_bytes,
                     digest: wire.digest,
@@ -1033,9 +1071,9 @@ impl Message {
                     last_audit_seq: u64,
                     outcome: ResultOutcome,
                 }
-                let wire: Wire = from_body(&body, type_name)?;
+                let wire: Wire = body.parse(type_name)?;
                 Message::Result {
-                    dispatch_id: dispatch_id(&value)?,
+                    dispatch_id: dispatch_id(envelope_dispatch)?,
                     result_id: wire.result_id,
                     last_audit_seq: wire.last_audit_seq,
                     outcome: wire.outcome,
@@ -1046,9 +1084,9 @@ impl Message {
                 struct Wire {
                     result_id: String,
                 }
-                let wire: Wire = from_body(&body, type_name)?;
+                let wire: Wire = body.parse(type_name)?;
                 Message::ResultCommitted {
-                    dispatch_id: dispatch_id(&value)?,
+                    dispatch_id: dispatch_id(envelope_dispatch)?,
                     result_id: wire.result_id,
                 }
             }
@@ -1057,10 +1095,10 @@ impl Message {
                 struct Wire {
                     command_id: String,
                 }
-                let wire: Wire = from_body(&body, type_name)?;
+                let wire: Wire = body.parse(type_name)?;
                 Message::Cancel {
                     command_id: wire.command_id,
-                    dispatch_id: dispatch_id(&value)?,
+                    dispatch_id: dispatch_id(envelope_dispatch)?,
                 }
             }
             kind::STOPPED => {
@@ -1071,9 +1109,9 @@ impl Message {
                     last_audit_seq: u64,
                     pending_operation: Option<String>,
                 }
-                let wire: Wire = from_body(&body, type_name)?;
+                let wire: Wire = body.parse(type_name)?;
                 Message::Stopped {
-                    dispatch_id: dispatch_id(&value)?,
+                    dispatch_id: dispatch_id(envelope_dispatch)?,
                     sealed: wire.sealed,
                     last_audit_seq: wire.last_audit_seq,
                     pending_operation: wire.pending_operation,
@@ -1084,12 +1122,9 @@ impl Message {
                 struct Wire {
                     phase: String,
                 }
-                let wire: Wire = from_body(&body, type_name)?;
+                let wire: Wire = body.parse(type_name)?;
                 Message::Heartbeat {
-                    dispatch_id: value
-                        .get("dispatch_id")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
+                    dispatch_id: envelope_dispatch.map(str::to_owned),
                     phase: wire.phase,
                 }
             }
@@ -1098,12 +1133,9 @@ impl Message {
                 struct Wire {
                     lines: Vec<ObservationLine>,
                 }
-                let wire: Wire = from_body(&body, type_name)?;
+                let wire: Wire = body.parse(type_name)?;
                 Message::ObservabilityBatch {
-                    dispatch_id: value
-                        .get("dispatch_id")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
+                    dispatch_id: envelope_dispatch.map(str::to_owned),
                     lines: wire.lines,
                 }
             }
@@ -1112,7 +1144,7 @@ impl Message {
                 struct Wire {
                     reason: String,
                 }
-                let wire: Wire = from_body(&body, type_name)?;
+                let wire: Wire = body.parse(type_name)?;
                 Message::Reject {
                     reason: wire.reason,
                 }
@@ -1123,7 +1155,7 @@ impl Message {
                     envelope: RouteEnvelope,
                     inner: Value,
                 }
-                let wire: Wire = from_body(&body, type_name)?;
+                let wire: Wire = body.parse(type_name)?;
                 let inner = Message::from_envelope(wire.inner)
                     .map_err(|e| ProtocolError::InvalidPayload(format!("Routed inner: {e}")))?;
                 if !super::remote::routable(&inner) {
@@ -1145,7 +1177,7 @@ impl Message {
                     #[serde(with = "decimal_u32")]
                     slots: u32,
                 }
-                let wire: Wire = from_body(&body, type_name)?;
+                let wire: Wire = body.parse(type_name)?;
                 Message::AgentHello {
                     agent_boot_id: wire.agent_boot_id,
                     build: wire.build,
@@ -1166,7 +1198,7 @@ impl Message {
                     #[serde(with = "flow_journal::decimal")]
                     agent_window_bytes: u64,
                 }
-                let wire: Wire = from_body(&body, type_name)?;
+                let wire: Wire = body.parse(type_name)?;
                 Message::AgentWelcome {
                     journal_id: wire.journal_id,
                     master_epoch: wire.master_epoch,
@@ -1181,7 +1213,7 @@ impl Message {
                 struct Wire {
                     capacity: Capacity,
                 }
-                let wire: Wire = from_body(&body, type_name)?;
+                let wire: Wire = body.parse(type_name)?;
                 Message::CapacityReport {
                     capacity: wire.capacity,
                 }
@@ -1192,7 +1224,7 @@ impl Message {
                     executor_id: String,
                     dispatch_id: String,
                 }
-                let wire: Wire = from_body(&body, type_name)?;
+                let wire: Wire = body.parse(type_name)?;
                 Message::BindExecutor {
                     executor_id: wire.executor_id,
                     dispatch_id: wire.dispatch_id,
@@ -1208,7 +1240,7 @@ impl Message {
                     #[serde(default)]
                     error: Option<String>,
                 }
-                let wire: Wire = from_body(&body, type_name)?;
+                let wire: Wire = body.parse(type_name)?;
                 Message::BindExecutorAck {
                     executor_id: wire.executor_id,
                     executor_boot_id: wire.executor_boot_id,
@@ -1225,7 +1257,7 @@ impl Message {
                     page: u32,
                     more: bool,
                 }
-                let wire: Wire = from_body(&body, type_name)?;
+                let wire: Wire = body.parse(type_name)?;
                 Message::Resume {
                     items: wire.items,
                     page: wire.page,
@@ -1239,7 +1271,7 @@ impl Message {
                     #[serde(with = "decimal_u32")]
                     page: u32,
                 }
-                let wire: Wire = from_body(&body, type_name)?;
+                let wire: Wire = body.parse(type_name)?;
                 Message::ResumeReply {
                     decisions: wire.decisions,
                     page: wire.page,
@@ -1251,7 +1283,7 @@ impl Message {
                     #[serde(with = "flow_journal::decimal")]
                     grace_ms: u64,
                 }
-                let wire: Wire = from_body(&body, type_name)?;
+                let wire: Wire = body.parse(type_name)?;
                 Message::Drain {
                     grace_ms: wire.grace_ms,
                 }
@@ -1262,7 +1294,7 @@ impl Message {
                     #[serde(with = "decimal_u32")]
                     drained: u32,
                 }
-                let wire: Wire = from_body(&body, type_name)?;
+                let wire: Wire = body.parse(type_name)?;
                 Message::DrainComplete {
                     drained: wire.drained,
                 }
@@ -1275,9 +1307,24 @@ impl Message {
     }
 }
 
-fn from_body<T: serde::de::DeserializeOwned>(body: &Value, type_name: &str) -> Result<T> {
-    serde_json::from_value(body.clone())
-        .map_err(|e| ProtocolError::InvalidPayload(format!("{type_name}: {e}")))
+/// 解码 body 来源（T05）：RawValue 借用直析（生产路径，无 Value 树、无
+/// body 深拷贝）与 Value（from_envelope 兼容路径）走同一套类型化 Wire。
+trait BodySource {
+    fn parse<T: serde::de::DeserializeOwned>(&self, type_name: &str) -> Result<T>;
+}
+
+impl BodySource for Value {
+    fn parse<T: serde::de::DeserializeOwned>(&self, type_name: &str) -> Result<T> {
+        serde_json::from_value(self.clone())
+            .map_err(|e| ProtocolError::InvalidPayload(format!("{type_name}: {e}")))
+    }
+}
+
+impl BodySource for serde_json::value::RawValue {
+    fn parse<T: serde::de::DeserializeOwned>(&self, type_name: &str) -> Result<T> {
+        serde_json::from_str(self.get())
+            .map_err(|e| ProtocolError::InvalidPayload(format!("{type_name}: {e}")))
+    }
 }
 
 fn body_value(value: impl Serialize) -> Option<Value> {

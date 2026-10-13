@@ -18,7 +18,7 @@ use flow_engine::execution_protocol::contract::{
     DRAIN_GRACE_MS, HEARTBEAT_TIMEOUT_MS, STARTUP_TIMEOUT_MS,
 };
 use flow_engine::execution_protocol::message::Message;
-use flow_engine::execution_protocol::transport::{master_handshake, FrameTransport};
+use flow_engine::execution_protocol::transport::{master_handshake, FrameTransport, SendBacklog};
 
 use super::{FromSession, IpcOptions, ToSession};
 
@@ -260,22 +260,29 @@ async fn session_driver(
     let timeout = Duration::from_millis(HEARTBEAT_TIMEOUT_MS);
     let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + timeout, timeout);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // 出站积压（T03）：执行器停读/队列满时暂存重试，不让阻塞中的 send
+    // 卡住会话循环——心跳超时与入站 Stopped/审计始终可被处理。
+    let mut send_backlog = SendBacklog::with_capacity(8);
     loop {
+        if send_backlog.flush(&transport).is_err() {
+            break;
+        }
         tokio::select! {
-            command = command_rx.recv() => {
+            command = command_rx.recv(), if send_backlog.is_empty() => {
                 match command {
                     Some(ToSession::Send(message)) => {
-                        if transport.send(*message).await.is_err() {
+                        if send_backlog.push(&transport, *message).is_err() {
                             break;
                         }
                     }
                     Some(ToSession::CancelDispatch(dispatch_id)) => {
-                        let _ = transport
-                            .send(Message::Cancel {
+                        let _ = send_backlog.push(
+                            &transport,
+                            Message::Cancel {
                                 command_id: format!("cancel-{dispatch_id}"),
                                 dispatch_id,
-                            })
-                            .await;
+                            },
+                        );
                         draining = true;
                     }
                     Some(ToSession::Recycle) | None => {

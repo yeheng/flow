@@ -198,6 +198,24 @@ impl FrameTransport {
         sender.try_send(message).map_err(|_| ProtocolError::Closed)
     }
 
+    /// 非阻塞发送，队列满时原样退回消息（T03 服务循环积压重试用）。
+    /// 成功 `Ok(None)`；满 `Ok(Some(message))`（调用方保留重试，不得丢弃）；
+    /// 会话已关/写任务已退 `Err(Closed)`。丢弃式调用方用 [`Self::try_send`]。
+    pub fn try_send_requeue(&self, message: Message) -> Result<Option<Message>, ProtocolError> {
+        if self.io.state.broken.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ProtocolError::Closed);
+        }
+        let sender = match message.channel() {
+            Channel::Control => &self.control_out,
+            Channel::Data => &self.data_out,
+        };
+        match sender.try_send(message) {
+            Ok(()) => Ok(None),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(message)) => Ok(Some(message)),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(ProtocolError::Closed),
+        }
+    }
+
     /// 尽力先弹出已缓冲帧；无则 None（非阻塞窥视）。
     pub fn try_recv(&mut self) -> Option<(Channel, Message)> {
         if self.ended {
@@ -299,10 +317,8 @@ async fn read_loop_tagged(
                     return;
                 }
                 while let Ok(Some((channel, json))) = decoder.pop_tagged_frame() {
-                    let message = match serde_json::from_slice::<serde_json::Value>(&json)
-                        .map_err(|e| ProtocolError::Malformed(format!("envelope: {e}")))
-                        .and_then(Message::from_envelope)
-                    {
+                    // T05：借用信封 + 类型化单遍解析（不建 Value 树、无 body 深拷贝）。
+                    let message = match Message::decode_envelope(&json) {
                         Ok(message) => message,
                         Err(error) => {
                             let _ = events.send(IoEvent::Failed(channel, error)).await;
@@ -414,6 +430,69 @@ async fn write_loop_tagged(
         }
     }
     let _ = stream.shutdown().await;
+}
+
+/// 有界出站积压（T03）：服务循环在传输队列满时按 FIFO 暂存重试，避免
+/// 阻塞中的 `send` 卡住整个 select——入站 Cancel/ACK/心跳始终可被处理。
+/// 积压占用期间调用方应停止拉取新出站消息（自然背压到生产方）；容量
+/// 超限视为会话失效（不用无界队列化解背压）。序保持：积压非空时新消息
+/// 一律排在积压之后。
+pub struct SendBacklog {
+    queue: std::collections::VecDeque<Message>,
+    cap: usize,
+}
+
+impl SendBacklog {
+    /// `cap` 为积压上限（建议与队列深度同量级的小常数）。
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            queue: std::collections::VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    /// 入队一条消息（积压空则直发）。`Err` 表示会话不可用（写任务退出或
+    /// 积压超限），调用方应终止会话路径。
+    pub fn push(
+        &mut self,
+        transport: &FrameTransport,
+        message: Message,
+    ) -> Result<(), ProtocolError> {
+        if self.queue.is_empty() {
+            match transport.try_send_requeue(message) {
+                Ok(None) => Ok(()),
+                Ok(Some(message)) => {
+                    self.queue.push_back(message);
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
+        } else if self.queue.len() < self.cap {
+            self.queue.push_back(message);
+            Ok(())
+        } else {
+            Err(ProtocolError::Closed)
+        }
+    }
+
+    /// 重试冲刷积压（队列满则保留剩余）。`Err` 表示会话不可用。
+    pub fn flush(&mut self, transport: &FrameTransport) -> Result<(), ProtocolError> {
+        while let Some(message) = self.queue.pop_front() {
+            match transport.try_send_requeue(message) {
+                Ok(None) => continue,
+                Ok(Some(message)) => {
+                    self.queue.push_front(message);
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
 }
 
 /// 会话身份（二期 §3.2 表）。保存在会话上下文；任务帧只带 dispatch_id。

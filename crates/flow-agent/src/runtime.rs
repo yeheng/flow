@@ -93,6 +93,7 @@ pub async fn run_agent(config: AgentConfig, shutdown: CancellationToken) -> Stri
                     relay,
                     executor_handles.clone(),
                     &mut uplink_rx.rx,
+                    uplink_rx.budget.clone(),
                     shutdown.clone(),
                 )
                 .await;
@@ -284,6 +285,18 @@ async fn cancel_all(handles: &Arc<tokio::sync::Mutex<BTreeMap<String, ExecutorHa
 /// `_agent_boot_id` / `_link_session_id` 由调用方在别处消费（relay 槽换新），
 /// 这里保留形状签名避免两套入口分流。
 #[allow(clippy::too_many_arguments)]
+/// 入队一条上联消息（T03）：经有界积压重试，队列满不阻塞服务循环；
+/// 积压超限/会话失效返回 Err（不用无界队列化解背压）。
+fn queue_uplink(
+    transport: &FrameTransport,
+    backlog: &mut flow_engine::execution_protocol::transport::SendBacklog,
+    message: Message,
+) -> Result<(), String> {
+    backlog
+        .push(transport, message)
+        .map_err(|_| "uplink send failed".to_string())
+}
+
 pub async fn serve(
     config: &AgentConfig,
     _agent_boot_id: &str,
@@ -293,13 +306,22 @@ pub async fn serve(
     mut transport: FrameTransport,
     relay: Arc<parking_lot::Mutex<Relay>>,
     handles: Arc<tokio::sync::Mutex<BTreeMap<String, ExecutorHandle>>>,
-    uplink_rx: &mut mpsc::Receiver<Message>,
+    uplink_rx: &mut mpsc::Receiver<(Message, u64)>,
+    budget: std::sync::Arc<crate::relay::UplinkBudget>,
     shutdown: CancellationToken,
 ) -> String {
     let mut draining = None;
     let mut pending: Option<(mpsc::Sender<Message>, Message)> = None;
+    // 出站积压（T03）：上联队列满时按 FIFO 有界暂存，不让阻塞中的 send
+    // 卡住服务循环——入站 Cancel/Drain/Resume 始终可被处理；积压占用期间
+    // 不再拉取新出站消息（自然背压到执行器/心跳生产方）。
+    let mut send_backlog =
+        flow_engine::execution_protocol::transport::SendBacklog::with_capacity(16);
     let mut housekeeping = tokio::time::interval(Duration::from_millis(20));
     loop {
+        if send_backlog.flush(&transport).is_err() {
+            return "uplink send failed".into();
+        }
         tokio::select! {
             permit = async { pending.as_ref().unwrap().0.clone().reserve_owned().await }, if pending.is_some() => {
                 let (_, message) = pending.take().unwrap();
@@ -322,7 +344,12 @@ pub async fn serve(
                 drop(guard);
                 if draining.is_some_and(|deadline| all_done || tokio::time::Instant::now() >= deadline) {
                     cancel_all(&handles).await;
-                    let _ = transport.send(Message::DrainComplete { drained: count }).await;
+                    // 尽力发送（有界等待）：随后 flush_and_close 会统一收尾。
+                    let _ = tokio::time::timeout(
+                        Duration::from_millis(DRAIN_GRACE_MS),
+                        transport.send(Message::DrainComplete { drained: count }),
+                    )
+                    .await;
                     transport.flush_and_close(Duration::from_millis(DRAIN_GRACE_MS)).await;
                     return "drained".into();
                 }
@@ -332,18 +359,30 @@ pub async fn serve(
                 transport.close();
                 return "shutdown".into();
             }
-            outbound = uplink_rx.recv() => {
+            outbound = uplink_rx.recv(), if send_backlog.is_empty() => {
                 match outbound {
-                    Some(message) => {
+                    Some((message, budgeted_bytes)) => {
                         // Queued frames may have been wrapped before reconnection.
                         let message = if let Message::Routed { inner, .. } = message {
-                            let Some(id) = inner.dispatch_id().map(str::to_owned) else {continue};
-                            match relay.lock().wrap_to_master(&id, *inner) { Ok(message) => message, Err(RelayError::Unbound(_)) => continue, Err(error) => return error.to_string() }
+                            let Some(id) = inner.dispatch_id().map(str::to_owned) else {
+                                budget.release(budgeted_bytes);
+                                continue;
+                            };
+                            match relay.lock().wrap_to_master(&id, *inner) {
+                                Ok(message) => message,
+                                Err(RelayError::Unbound(_)) => {
+                                    budget.release(budgeted_bytes);
+                                    continue;
+                                }
+                                Err(error) => return error.to_string(),
+                            }
                         } else { message };
-                        if transport.send(message).await.is_err() {
-                            tracing::info!("agent serve exiting: uplink send failed");
-                            return "uplink send failed".into();
+                        if let Err(reason) = queue_uplink(&transport, &mut send_backlog, message) {
+                            tracing::info!(%reason, "agent serve exiting");
+                            return reason;
                         }
+                        // 消息已交给 transport 出站队列（或有界积压）：归还预算。
+                        budget.release(budgeted_bytes);
                     }
                     None => {
                         tracing::info!("agent serve exiting: uplink outbound closed");
@@ -355,7 +394,7 @@ pub async fn serve(
                 match received {
                     Ok((_channel, message)) => match message {
                         Message::Routed { .. } => {
-                            let unwrapped = relay.lock().unwrap_from_master(&message);
+                            let unwrapped = relay.lock().unwrap_from_master_owned(message);
                             match unwrapped {
                                 Ok((dispatch_id, inner)) => {
                                     let handles_guard = handles.lock().await;
@@ -382,7 +421,7 @@ pub async fn serve(
                         }
                         Message::BindExecutor { executor_id, dispatch_id } => {
                             if draining.is_some() || handles.lock().await.values().filter(|handle| !handle.done.load(Ordering::Acquire) && !handle.committed.load(Ordering::Acquire)).count() >= config.slots as usize {
-                                if transport.send(Message::BindExecutorAck { executor_id, executor_boot_id: String::new(), dispatch_id, ok: false, error: Some("agent draining or at capacity".into()) }).await.is_err() { return "bind reject send failed".into(); }
+                                if queue_uplink(&transport, &mut send_backlog, Message::BindExecutorAck { executor_id, executor_boot_id: String::new(), dispatch_id, ok: false, error: Some("agent draining or at capacity".into()) }).is_err() { return "bind reject send failed".into(); }
                                 continue;
                             }
                             let bound = pool::bind_executor(
@@ -398,24 +437,22 @@ pub async fn serve(
                                 Ok(handle) => {
                                     let boot = handle.executor_boot_id.clone();
                                     handles.lock().await.insert(dispatch_id.clone(), handle);
-                                    let sent = transport.send(Message::BindExecutorAck {
+                                    if queue_uplink(&transport, &mut send_backlog, Message::BindExecutorAck {
                                         executor_id,
                                         executor_boot_id: boot,
                                         dispatch_id,
                                         ok: true,
                                         error: None,
-                                    }).await;
-                                    if sent.is_err() { return "bind acknowledgement send failed".into(); }
+                                    }).is_err() { return "bind acknowledgement send failed".into(); }
                                 }
                                 Err(error) => {
-                                    let sent = transport.send(Message::BindExecutorAck {
+                                    if queue_uplink(&transport, &mut send_backlog, Message::BindExecutorAck {
                                         executor_id,
                                         executor_boot_id: String::new(),
                                         dispatch_id,
                                         ok: false,
                                         error: Some(error.to_string()),
-                                    }).await;
-                                    if sent.is_err() { return "bind acknowledgement send failed".into(); }
+                                    }).is_err() { return "bind acknowledgement send failed".into(); }
                                 }
                             }
                         }
@@ -470,7 +507,9 @@ async fn fair_mux_bridge(
     let mut cursor: Option<String> = None;
     loop {
         let mut served: Option<String> = None;
-        let mut outgoing = None;
+        // 本轮取出的帧：锁内只做非阻塞收取，await 发送一律在锁外（满上联
+        // 不能握着执行器表锁等待，否则拖死 BindExecutor/housekeeping）。
+        let mut drained: Vec<Message> = Vec::new();
         if mux_in.is_closed() {
             return;
         }
@@ -486,8 +525,24 @@ async fn fair_mux_bridge(
                     (Some(key), _) => (Bound::Unbounded, Bound::Included(key.clone())),
                 };
                 for (dispatch, handle) in guard.range_mut(range) {
-                    if let Ok(message) = handle.out.try_recv() {
-                        outgoing = Some(message);
+                    // T08 按字节轮转：每执行器每轮最多 FAIR_TURN_BYTES（估算）
+                    // 且至多 FAIR_TURN_FRAMES 条——大帧洪泛受字节额度约束，
+                    // 小帧洪泛受帧数约束（两种形态都不能独占共享出站）。
+                    let mut turn_bytes = 0u64;
+                    let mut turn_frames = 0usize;
+                    while turn_bytes < crate::relay::FAIR_TURN_BYTES
+                        && turn_frames < crate::relay::FAIR_TURN_FRAMES
+                    {
+                        match handle.out.try_recv() {
+                            Ok(message) => {
+                                turn_bytes += crate::relay::estimate_weight(&message);
+                                turn_frames += 1;
+                                drained.push(message);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if !drained.is_empty() {
                         served = Some(dispatch.clone());
                         break;
                     }
@@ -497,7 +552,7 @@ async fn fair_mux_bridge(
                 }
             }
         }
-        if let Some(message) = outgoing {
+        for message in drained {
             if mux_in.send(message).await.is_err() {
                 return;
             }
@@ -514,7 +569,8 @@ async fn fair_mux_bridge(
 /// 返回给 serve 会话消费的出站端；桥与包装任务随管道常驻（断线不拆），
 /// relay 槽里的会话身份由调用方在重连时换新。
 struct UplinkPipeline {
-    rx: mpsc::Receiver<Message>,
+    rx: mpsc::Receiver<(Message, u64)>,
+    budget: std::sync::Arc<crate::relay::UplinkBudget>,
     tasks: [tokio::task::JoinHandle<()>; 2],
 }
 impl Drop for UplinkPipeline {
@@ -529,11 +585,14 @@ fn spawn_uplink_pipeline(
     handles: Arc<tokio::sync::Mutex<BTreeMap<String, ExecutorHandle>>>,
     relay_slot: Arc<parking_lot::Mutex<Arc<parking_lot::Mutex<Relay>>>>,
 ) -> UplinkPipeline {
-    let (uplink_out, uplink_rx) = mpsc::channel::<Message>(UPLINK_OUT_QUEUE);
+    let (uplink_out, uplink_rx) = mpsc::channel::<(Message, u64)>(UPLINK_OUT_QUEUE);
     let (mux_in, mux_in_rx) = mpsc::channel::<Message>(UPLINK_OUT_QUEUE);
+    let budget = crate::relay::UplinkBudget::new(crate::relay::UPLINK_OUT_BYTES);
     let bridge = tokio::spawn(fair_mux_bridge(handles, mux_in));
+    let wrapper_budget = budget.clone();
     let wrapper = tokio::spawn(async move {
         // mux → 包络 → uplink_out（按 dispatch 包装，relay 取当前会话那份）。
+        // T08：入队前占用字节预算，随 (消息, 字节) 元组流转到 serve 归还。
         let mut mux_in_rx = mux_in_rx;
         while let Some(message) = mux_in_rx.recv().await {
             let Some(dispatch_id) = message.dispatch_id().map(str::to_owned) else {
@@ -543,7 +602,10 @@ fn spawn_uplink_pipeline(
             let wrapped = relay.lock().wrap_to_master(&dispatch_id, message);
             match wrapped {
                 Ok(frame) => {
-                    if uplink_out.send(frame).await.is_err() {
+                    let budgeted = crate::relay::weight_budgeted(&frame);
+                    wrapper_budget.acquire(budgeted).await;
+                    if uplink_out.send((frame, budgeted)).await.is_err() {
+                        wrapper_budget.release(budgeted);
                         return;
                     }
                 }
@@ -556,6 +618,7 @@ fn spawn_uplink_pipeline(
     });
     UplinkPipeline {
         rx: uplink_rx,
+        budget,
         tasks: [bridge, wrapper],
     }
 }
@@ -586,6 +649,7 @@ pub async fn serve_for_tests(
         session_relay,
         handles,
         &mut uplink_rx.rx,
+        uplink_rx.budget.clone(),
         shutdown,
     )
     .await
@@ -658,6 +722,7 @@ pub async fn reconnect_session(
         relay,
         handles,
         &mut uplink_rx.rx,
+        uplink_rx.budget.clone(),
         shutdown,
     )
     .await;

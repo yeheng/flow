@@ -88,11 +88,70 @@ impl IpcDispatcher {
     }
 }
 
+/// T09 确定性故障注入：测试在命名检查点注册 hold 开关；未注册时
+/// [`fault::checkpoint`] 立即返回（生产路径零行为差异）。用于在持久化
+/// 前后、Permit 发送前后、ResultCommitted 前后确定性断线/取消——代替
+/// 依赖 sleep 的竞态复现。注册表全局唯一：使用注入的测试必须串行场景。
+pub mod fault {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    use tokio::sync::watch;
+
+    static REGISTRY: OnceLock<std::sync::Mutex<HashMap<String, watch::Receiver<bool>>>> =
+        OnceLock::new();
+
+    /// 注册检查点（初始 hold=true：到达即暂停，直至发送端置 false 释放）。
+    /// 返回各检查点的发送端；重复注册同名点以最后一次为准。
+    pub fn register(points: &[&str]) -> HashMap<String, watch::Sender<bool>> {
+        let registry = REGISTRY.get_or_init(|| {
+            std::sync::Mutex::new(HashMap::<String, watch::Receiver<bool>>::new())
+        });
+        let mut guard = registry.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut senders = HashMap::new();
+        for point in points {
+            let (sender, receiver) = watch::channel(true);
+            guard.insert((*point).to_string(), receiver);
+            senders.insert((*point).to_string(), sender);
+        }
+        senders
+    }
+
+    /// 清空注册表（测试场景隔离：drop 接收端使仍在等待的检查点立即放行，
+    /// 防止上一场景 panic 残留的 hold 毒化后续场景）。
+    pub fn clear() {
+        if let Some(registry) = REGISTRY.get() {
+            registry
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clear();
+        }
+    }
+
+    /// 到达检查点：未注册/已释放立即返回；hold 中则确定性等待释放。
+    pub async fn checkpoint(name: &str) {
+        let Some(registry) = REGISTRY.get() else {
+            return;
+        };
+        let receiver = {
+            registry
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .get(name)
+                .cloned()
+        };
+        if let Some(mut receiver) = receiver {
+            tracing::debug!(name, "fault checkpoint holding");
+            let _ = receiver.wait_for(|hold| !hold).await;
+        }
+    }
+}
+
 const OPERATION_TRANSFER_LIMIT: u64 = 8 * 1024 * 1024;
 const OPERATION_TRANSFER_COUNT: usize = 16;
 
 struct OpTransfer {
-    chunks: BTreeMap<u64, Vec<u8>>,
+    /// 连续接收前缀（T07）：单流按序到达，无需块树与排序装配。
+    buf: Vec<u8>,
     ready: Option<(u64, String)>,
 }
 
@@ -476,12 +535,7 @@ impl DispatchRunner {
                 if expected != digest {
                     return Err(invalid("transfer chunk digest mismatch"));
                 }
-                let received: u64 = self
-                    .op_transfers
-                    .values()
-                    .flat_map(|entry| entry.chunks.values())
-                    .map(|chunk| chunk.len() as u64)
-                    .sum();
+                let received: u64 = self.op_transfers.values().map(|e| e.buf.len() as u64).sum();
                 if offset
                     .checked_add(raw.len() as u64)
                     .is_none_or(|end| end > OPERATION_TRANSFER_LIMIT)
@@ -492,12 +546,28 @@ impl DispatchRunner {
                     return Err(invalid("operation transfer exceeds input budget"));
                 }
                 let entry = self.op_transfers.entry(transfer_id).or_insert(OpTransfer {
-                    chunks: BTreeMap::new(),
+                    buf: Vec::new(),
                     ready: None,
                 });
-                if entry.chunks.insert(offset, raw).is_some() {
+                let end = offset + raw.len() as u64;
+                let received = entry.buf.len() as u64;
+                if end <= received {
+                    // 幂等重复：完全落在已接收前缀且字节相同（重连后全量重发，T07）。
+                    if entry.buf[offset as usize..end as usize] == raw[..] {
+                        return Ok(None);
+                    }
                     return Err(invalid("duplicate transfer chunk"));
                 }
+                if offset != received {
+                    // 缺口/跨边界重叠：单流按序到达下直接拒绝。
+                    return Err(invalid("duplicate transfer chunk"));
+                }
+                if let Some((total, _)) = &entry.ready {
+                    if end > *total {
+                        return Err(invalid("operation transfer exceeds input budget"));
+                    }
+                }
+                entry.buf.extend_from_slice(&raw);
                 Ok(None)
             }
             Message::InputReady {
@@ -514,7 +584,7 @@ impl DispatchRunner {
                     return Err(invalid("invalid operation transfer identity or size"));
                 }
                 let entry = self.op_transfers.entry(transfer_id).or_insert(OpTransfer {
-                    chunks: BTreeMap::new(),
+                    buf: Vec::new(),
                     ready: None,
                 });
                 entry.ready = Some((total_bytes, digest));
@@ -582,7 +652,7 @@ impl DispatchRunner {
         }
     }
 
-    /// 操作请求传输是否已齐（块数与摘要校验）。
+    /// 操作请求传输是否已齐（连续前缀长度与整值摘要校验）。
     fn op_transfer_complete(&self, transfer_id: &str) -> bool {
         let Some(entry) = self.op_transfers.get(transfer_id) else {
             return false;
@@ -590,20 +660,8 @@ impl DispatchRunner {
         let Some((total, digest)) = &entry.ready else {
             return false;
         };
-        let received: u64 = entry.chunks.values().map(|c| c.len() as u64).sum();
-        if received != *total {
-            return false;
-        }
-        let mut hash = sha2::Sha256::new();
-        let mut expected = 0u64;
-        for (offset, chunk) in &entry.chunks {
-            if *offset != expected {
-                return false;
-            }
-            expected += chunk.len() as u64;
-            hash.update(chunk);
-        }
-        hex::encode(hash.finalize()) == *digest
+        entry.buf.len() as u64 == *total
+            && hex::encode(sha2::Sha256::digest(&entry.buf)) == *digest
     }
 
     /// 审计批次：连续性 + 同序号同内容幂等 + 单事务持久化 + AuditAck。
@@ -797,6 +855,7 @@ impl DispatchRunner {
             }
         }
         // 结果已提交：回执使执行器释放槽位（重复派发返回原提交）。
+        fault::checkpoint("result_committed:before").await;
         let _ = link
             .commands
             .send(ToSession::Send(Box::new(Message::ResultCommitted {
@@ -804,6 +863,7 @@ impl DispatchRunner {
                 result_id,
             })))
             .await;
+        fault::checkpoint("result_committed:after").await;
         Ok(())
     }
 
@@ -983,19 +1043,10 @@ impl DispatchRunner {
                 .ready
                 .clone()
                 .ok_or_else(|| invalid("operation transfer incomplete"))?;
-            let mut bytes = Vec::with_capacity(total as usize);
-            let mut expected = 0u64;
-            for (offset, chunk) in &entry.chunks {
-                if *offset != expected {
-                    return Err(invalid("operation transfer gap"));
-                }
-                expected += chunk.len() as u64;
-                bytes.extend_from_slice(chunk);
-            }
-            if bytes.len() as u64 != total || hex_sha(&bytes) != digest {
+            if entry.buf.len() as u64 != total || hex_sha(&entry.buf) != digest {
                 return Err(invalid("operation transfer digest mismatch"));
             }
-            bytes
+            entry.buf.clone()
         };
         // 完整请求校验：主进程不得只校验未经核实的摘要。
         if flow_journal::codec::digest(&request_bytes) != request_fingerprint {
@@ -1030,6 +1081,7 @@ impl DispatchRunner {
         let node_id = self.attempt.node_id.clone();
         let dispatch = self.attempt.dispatch_id.clone();
         let operation_value = serde_json::to_value(&operation)?;
+        fault::checkpoint("auth_persist:before").await;
         let authorize = self
             .attempt
             .backend
@@ -1067,9 +1119,11 @@ impl DispatchRunner {
                 Ok((vec![intent, authorized], ()))
             })
             .await;
+        fault::checkpoint("auth_persist:after").await;
         match authorize {
             Ok(_) => {
                 // 解析凭证（不进入授权事实）。
+                fault::checkpoint("permit_send:before").await;
                 let request_value: Value =
                     serde_json::from_slice(&request_bytes).unwrap_or(Value::Null);
                 let credential = request_value["credential"]["secret_ref"]
@@ -1086,6 +1140,7 @@ impl DispatchRunner {
                         credential,
                     })))
                     .await;
+                fault::checkpoint("permit_send:after").await;
                 Ok(())
             }
             Err(error) => {
