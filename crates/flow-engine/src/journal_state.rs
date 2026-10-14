@@ -31,8 +31,8 @@ mod snapshot_decimal {
     }
 }
 
-/// 幂等回执保留窗口：超过即按 lsn 淘汰最旧一半（远大于后端在飞 run 上限
-/// R_MAX=1000，正常重试永远落在窗口内）。
+/// 通用幂等回执保留窗口：超过即按 lsn 淘汰最旧一半。调度执行身份另由
+/// schedule_fires 保留，业务去重不依赖这个有限重试窗口。
 const COMMAND_WINDOW: usize = 8192;
 
 /// run 生命周期状态词汇表（journal 域单一来源）。wire 是 snake_case 字符串，
@@ -226,6 +226,12 @@ pub struct CommandRecord {
     #[serde(with = "flow_journal::decimal")]
     pub lsn: u64,
 }
+/// Business trigger watermark, independent of the bounded RPC receipt window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleFire {
+    pub at: chrono::DateTime<chrono::Utc>,
+    pub command: CommandRecord,
+}
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct State {
     /// Rebuilt by replay before accepting commands; never trusted from serialized snapshots.
@@ -238,6 +244,8 @@ pub struct State {
     pub workflows: BTreeMap<String, Workflow>,
     pub runs: BTreeMap<String, Run>,
     pub schedules: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub schedule_fires: BTreeMap<String, ScheduleFire>,
     pub webhooks: BTreeMap<String, Value>,
     /// 可复用节点模板（画布片段）：UI 资产而非 run 事实，但持久化必须随
     /// 权威走——journal 是唯一权威，模板以 TemplateChanged 事实落账。
@@ -264,6 +272,17 @@ impl Run {
 }
 
 impl State {
+    /// The latest schedule slot retains its receipt even after unrelated RPC
+    /// commands fill the general dedup window.
+    pub fn command_record(&self, scope: &str, request_id: &str) -> Option<&CommandRecord> {
+        self.commands
+            .get(&command_key(scope, request_id))
+            .or_else(|| {
+                let key = scope.strip_prefix("run.start:schedule:")?;
+                let fire = self.schedule_fires.get(key)?;
+                (fire.command.request_id.as_deref() == Some(request_id)).then_some(&fire.command)
+            })
+    }
     /// Transaction-local staging guarantees that a malformed later event cannot expose its
     /// earlier sibling. Only affected maps/objects are touched by the committed replacement.
     pub fn apply(&mut self, tx: &Transaction) -> Result<()> {
@@ -322,6 +341,7 @@ impl State {
         let mut workflow_undo = BTreeMap::new();
         let mut run_undo = BTreeMap::new();
         let mut schedule_undo = BTreeMap::new();
+        let mut fire_undo = BTreeMap::new();
         let mut webhook_undo = BTreeMap::new();
         let mut template_undo = BTreeMap::new();
         let mut command_undo = BTreeMap::new();
@@ -364,6 +384,9 @@ impl State {
             }
             if event.kind == EventKind::ScheduleChanged {
                 let id = string(&event.payload, "id")?;
+                fire_undo
+                    .entry(id.clone())
+                    .or_insert_with(|| self.schedule_fires.get(&id).cloned());
                 schedule_undo
                     .entry(id.clone())
                     .or_insert_with(|| self.schedules.get(&id).cloned());
@@ -385,6 +408,11 @@ impl State {
             }
             if event.kind == EventKind::Command {
                 let c: CommandRecord = serde_json::from_value(event.payload.clone())?;
+                if let Some(key) = c.scope.strip_prefix("run.start:schedule:") {
+                    fire_undo
+                        .entry(key.to_owned())
+                        .or_insert_with(|| self.schedule_fires.get(key).cloned());
+                }
                 if let Some(id) = c.request_id {
                     let key = command_key(&c.scope, &id);
                     command_undo
@@ -405,6 +433,7 @@ impl State {
             restore(&mut self.workflows, workflow_undo);
             restore(&mut self.runs, run_undo);
             restore(&mut self.schedules, schedule_undo);
+            restore(&mut self.schedule_fires, fire_undo);
             restore(&mut self.webhooks, webhook_undo);
             restore(&mut self.templates, template_undo);
             restore(&mut self.commands, command_undo);
@@ -494,6 +523,33 @@ impl State {
             EventKind::Command => {
                 let mut command: CommandRecord = serde_json::from_value(p.clone())?;
                 command.lsn = lsn;
+                // Also folds old logs: the Command and RunStarted facts already
+                // contain the stable slot identity and result. No business code
+                // runs during this migration/replay.
+                if let Some(key) = command.scope.strip_prefix("run.start:schedule:") {
+                    let at = command
+                        .request_id
+                        .as_deref()
+                        .and_then(|id| chrono::DateTime::parse_from_rfc3339(id).ok());
+                    let run = command.result["run_id"]
+                        .as_str()
+                        .and_then(|id| self.runs.get(id));
+                    if let (Some(at), Some(run)) = (at, run) {
+                        if self.schedules.contains_key(key)
+                            && run.source == "schedule"
+                            && run.source_detail.as_deref() == Some(key)
+                            && self.schedule_fires.get(key).is_none_or(|fire| at > fire.at)
+                        {
+                            self.schedule_fires.insert(
+                                key.to_owned(),
+                                ScheduleFire {
+                                    at: at.with_timezone(&chrono::Utc),
+                                    command: command.clone(),
+                                },
+                            );
+                        }
+                    }
+                }
                 if let Some(id) = &command.request_id {
                     let key = command_key(&command.scope, id);
                     if self.commands.contains_key(&key) {
@@ -558,6 +614,9 @@ impl State {
                 return Ok(());
             }
             EventKind::ScheduleChanged => {
+                if p["deleted"] == true {
+                    self.schedule_fires.remove(&string(p, "id")?);
+                }
                 replace_config(&mut self.schedules, p, "id")?;
                 return Ok(());
             }

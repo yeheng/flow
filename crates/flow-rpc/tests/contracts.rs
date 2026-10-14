@@ -699,7 +699,11 @@ async fn run_source_attribution_and_filter() {
         )
         .await;
     let schedule_id = created["result"]["id"].as_str().unwrap().to_string();
-    flow_rpc::journal_triggers::fire_due(&f.backend, chrono::Local::now()).await;
+    flow_rpc::journal_triggers::fire_due(
+        &f.backend,
+        chrono::Local::now() + chrono::Duration::minutes(2),
+    )
+    .await;
     let list = f
         .call(
             "run.list",

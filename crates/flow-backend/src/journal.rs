@@ -18,7 +18,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use flow_engine::journal_state::{command_key, CommandRecord, State};
+use flow_engine::journal_state::{CommandRecord, State};
 use flow_journal::page::CommitCursor;
 use flow_journal::tail::TailReader;
 use flow_journal::{Event, EventKind, Journal, JournalOptions, Transaction};
@@ -155,7 +155,7 @@ impl JournalBackend {
             tokio::task::spawn_blocking(move || -> flow_journal::Result<CommittedState> {
                 let mut state = State::default();
                 if let Some(checkpoint) =
-                    flow_journal::maintenance::load_checkpoint(&root_owned, 2)?
+                    flow_journal::maintenance::load_checkpoint(&root_owned, 3)?
                 {
                     let restored = (|| -> flow_journal::Result<State> {
                         let mut state: State =
@@ -443,7 +443,7 @@ impl JournalBackend {
         let mut committed = self.state.lock().await;
         self.refresh_locked(&mut committed).await?;
         if let Some(id) = request_id {
-            if let Some(original) = committed.state.commands.get(&command_key(scope, id)) {
+            if let Some(original) = committed.state.command_record(scope, id) {
                 if original.fingerprint != fingerprint {
                     return Err(flow_journal::Error::Conflict(
                         "same request identity with different arguments".into(),
@@ -619,8 +619,7 @@ impl JournalBackend {
         self.refresh_locked(&mut committed).await?;
         let receipt = committed
             .state
-            .commands
-            .get(&command_key(scope, request_id))
+            .command_record(scope, request_id)
             .map(|r| self.receipt(r));
         drop(committed);
         let Some(mut receipt) = receipt else {
@@ -650,12 +649,7 @@ impl JournalBackend {
         let fingerprint = flow_journal::codec::fingerprint(request, 9 * 1024 * 1024)?;
         let mut committed = self.state.lock().await;
         self.refresh_locked(&mut committed).await?;
-        let Some(original) = committed
-            .state
-            .commands
-            .get(&command_key(scope, id))
-            .cloned()
-        else {
+        let Some(original) = committed.state.command_record(scope, id).cloned() else {
             return Ok(None);
         };
         if original.fingerprint != fingerprint {
@@ -727,7 +721,7 @@ impl JournalBackend {
         let root = self.journal.root().to_path_buf();
         drop(committed);
         tokio::task::spawn_blocking(move || {
-            flow_journal::maintenance::write_checkpoint(&root, upper, 2, snapshot)
+            flow_journal::maintenance::write_checkpoint(&root, upper, 3, snapshot)
         })
         .await
         .map_err(|e| JournalError::Projection(e.to_string()))??;

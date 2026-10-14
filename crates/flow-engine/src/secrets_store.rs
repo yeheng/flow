@@ -91,7 +91,7 @@ impl SecretFileStore {
     }
 
     fn decrypt(&self, entry: &Entry) -> Option<String> {
-        let nonce = hex::decode(&entry.nonce).ok()?;
+        let nonce: [u8; 12] = hex::decode(&entry.nonce).ok()?.try_into().ok()?;
         let ciphertext = hex::decode(&entry.value).ok()?;
         let plaintext = self
             .cipher
@@ -114,11 +114,15 @@ impl SecretFileStore {
     pub fn set(&self, name: &str, value: &str) -> Result<(), String> {
         let entry = self.encrypt(value)?;
         let mut secrets = self.inner.lock().unwrap();
-        secrets.insert(name.to_string(), entry);
+        let previous = secrets.insert(name.to_string(), entry);
         let result = self.persist(&secrets);
         if result.is_err() {
             // 落盘失败回滚内存，避免「界面显示已保存、重启后消失」
-            secrets.remove(name);
+            if let Some(previous) = previous {
+                secrets.insert(name.to_string(), previous);
+            } else {
+                secrets.remove(name);
+            }
         }
         result
     }
@@ -195,13 +199,65 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "flow-secrets-test-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            uuid::Uuid::now_v7()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn failed_writes_restore_existing_and_absent_entries() {
+        let dir = tempdir();
+        let store = SecretFileStore::open(&dir).unwrap();
+        store.set("K", "original").unwrap();
+        std::fs::create_dir(dir.join("secrets.tmp")).unwrap();
+        assert!(store.set("K", "replacement").is_err());
+        assert_eq!(store.get("K").as_deref(), Some("original"));
+        assert!(store.set("NEW", "value").is_err());
+        assert_eq!(store.get("NEW"), None);
+        assert!(store.delete("K").is_err());
+        assert_eq!(store.names(), vec!["K".to_owned()]);
+        std::fs::remove_dir(dir.join("secrets.tmp")).unwrap();
+        let reopened = SecretFileStore::open(&dir).unwrap();
+        assert_eq!(reopened.get("K").as_deref(), Some("original"));
+        store.set("K", "replacement").unwrap();
+        assert_eq!(
+            SecretFileStore::open(&dir).unwrap().get("K").as_deref(),
+            Some("replacement")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn corrupt_entries_never_panic_or_poison_the_store() {
+        let dir = tempdir();
+        let store = SecretFileStore::open(&dir).unwrap();
+        store.set("VALID", "value").unwrap();
+        for nonce in [
+            "".to_owned(),
+            "00".repeat(1),
+            "00".repeat(11),
+            "00".repeat(12),
+            "00".repeat(13),
+            "invalid hex".to_owned(),
+        ] {
+            store.inner.lock().unwrap().insert(
+                "BAD".into(),
+                Entry {
+                    nonce,
+                    value: "00".into(),
+                },
+            );
+            store.persist(&store.inner.lock().unwrap()).unwrap();
+            let reopened = SecretFileStore::open(&dir).unwrap();
+            assert_eq!(reopened.get("BAD"), None);
+            assert_eq!(reopened.get("VALID").as_deref(), Some("value"));
+            assert_eq!(reopened.names().len(), 2);
+            reopened.set("BAD", "fixed").unwrap();
+            assert_eq!(reopened.get("BAD").as_deref(), Some("fixed"));
+            assert!(reopened.delete("BAD").unwrap());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

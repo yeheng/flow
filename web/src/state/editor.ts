@@ -131,17 +131,25 @@ export const nodeTypeGroups = computed(() => {
  * 脏标记是派生值：当前画布规范化后的 definition 与保存点不同即为脏。
  * undo 回到保存点快照时自动变干净；保存/加载会移动保存点。
  */
-let savedDefKey: string | null = null;
+const savedDefKey = ref<string | null>(null);
+let editorSession = 0;
+watch(
+  () => editor.workflowId,
+  () => {
+    editorSession++;
+  },
+  { flush: "sync" },
+);
 
 function defKey(): string {
   return JSON.stringify(flowToDefinition());
 }
 
-export const dirty = computed(() => savedDefKey !== null && defKey() !== savedDefKey);
+export const dirty = computed(() => savedDefKey.value !== null && defKey() !== savedDefKey.value);
 
 /** 把当前画布记为保存点（加载/保存成功后调用；测试也可直接使用） */
 export function markSaved(): void {
-  savedDefKey = defKey();
+  savedDefKey.value = defKey();
 }
 
 export const selectedNode = computed<EditorNode | null>(
@@ -285,14 +293,17 @@ export async function selectWorkflow(id: string, version?: number): Promise<void
     toast.error("节点类型清单未加载，无法打开工作流；连接恢复后请重试");
     return;
   }
+  const session = ++editorSession;
   try {
     const w = await api.getWorkflow(id, version);
+    if (session !== editorSession) return;
     editor.version = w.version;
     editor.publishedVersion = w.published_version;
     const flow = definitionToFlow(w.definition);
     editor.nodes = flow.nodes;
     editor.edges = flow.edges;
   } catch (e) {
+    if (session !== editorSession) return;
     // workflow.get 对无版本的工作流报「不存在」（-32011）：仅当未指定版本时按空画布 seed；
     // 指定版本时的 -32011 是「该版本不存在」，如实报错
     if (!(e instanceof RpcError && e.code === -32011) || version !== undefined) {
@@ -517,50 +528,70 @@ export function onConnect(conn: Connection): void {
 export const saving = ref(false);
 export const publishing = ref(false);
 
+interface SavedWorkflow {
+  workflowId: string;
+  version: number;
+}
+
 export async function save(): Promise<boolean> {
-  if (!editor.workflowId || saving.value) return false;
+  return (await saveSnapshot()) !== null;
+}
+
+async function saveSnapshot(): Promise<SavedWorkflow | null> {
+  if (!editor.workflowId || saving.value) return null;
   // 保存前过前端预校验：有错不打 RPC（服务端 validate 仍是最终裁决）
   const errs = validateNow();
   if (errs.length > 0) {
     validationUi.open = true;
     toast.error(`工作流定义有 ${errs.length} 处校验错误，请先修复`);
-    return false;
+    return null;
   }
+  const workflowId = editor.workflowId;
+  const baseVersion = editor.version;
+  const session = editorSession;
+  const definition = deepCloneJson(flowToDefinition());
   saving.value = true;
   try {
     // 软冲突检测：另一标签页/会话可能在我们加载后保存了新版本。
     // 版本 append-only 不会丢数据，但为避免静默分叉先确认。（workflow.update 尚无
     // base_version 强校验，这里有 TOCTOU 窗口，挡住的是最常见的多标签页场景）
-    const latest = await api.getWorkflow(editor.workflowId);
-    if (latest.version > editor.version) {
+    const latest = baseVersion === 0 ? null : await api.getWorkflow(workflowId);
+    if (latest && latest.version > baseVersion) {
       const ok = await confirmDialog(
-        `工作流已有更新的 v${latest.version}（当前画布基于 v${editor.version}）。` +
+        `工作流已有更新的 v${latest.version}（当前画布基于 v${baseVersion}）。` +
           `继续保存将以当前画布内容生成 v${latest.version + 1}。确定继续？`,
       );
-      if (!ok) return false;
+      if (!ok) return null;
     }
-    editor.version = await api.updateWorkflow(editor.workflowId, flowToDefinition());
-    markSaved();
-    toast.success(`已保存 v${editor.version}`);
+    const version = await api.updateWorkflow(workflowId, definition);
+    if (session === editorSession && editor.workflowId === workflowId) {
+      editor.version = version;
+      savedDefKey.value = JSON.stringify(definition);
+    }
+    toast.success(`已保存 v${version}`);
     await refreshWorkflows();
-    return true;
+    return { workflowId, version };
   } catch (e) {
     toast.error(errText(e));
-    return false;
+    return null;
   } finally {
     saving.value = false;
   }
 }
 
 export async function publish(): Promise<void> {
-  if (!editor.workflowId) return;
+  if (!editor.workflowId || publishing.value) return;
+  const session = editorSession;
   publishing.value = true;
   try {
     // 发布前先把画布落库，保证发布的版本就是当前图
-    if (!(await save())) return;
-    await api.publishWorkflow(editor.workflowId, editor.version);
-    editor.publishedVersion = editor.version;
-    toast.success(`已发布 v${editor.version}`);
+    const saved = await saveSnapshot();
+    if (!saved) return;
+    await api.publishWorkflow(saved.workflowId, saved.version);
+    if (session === editorSession && editor.workflowId === saved.workflowId) {
+      editor.publishedVersion = saved.version;
+    }
+    toast.success(`已发布 v${saved.version}`);
     await refreshWorkflows();
   } catch (e) {
     toast.error(errText(e));

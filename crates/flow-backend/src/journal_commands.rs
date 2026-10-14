@@ -533,6 +533,27 @@ impl JournalBackend {
                 {
                     return Err(invalid("trigger disabled or changed before commit"));
                 }
+                if source == "schedule" {
+                    let fire =
+                        request_id.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
+                    if fire.is_some_and(|at| {
+                        state
+                            .schedule_fires
+                            .get(key)
+                            .is_some_and(|last| at <= last.at)
+                    }) {
+                        return Err(flow_journal::Error::Conflict(
+                            "scheduled slot already committed".into(),
+                        ));
+                    }
+                    let since = config["active_since"]
+                        .as_str()
+                        .or_else(|| config["created_at"].as_str())
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
+                    if fire.zip(since).is_some_and(|(fire, since)| fire < since) {
+                        return Err(invalid("scheduled fire predates trigger activation"));
+                    }
+                }
             }
             if state.runs.values().filter(|r| !r.terminal()).count() >= crate::journal::R_MAX {
                 return Err(flow_journal::Error::Limit(format!(
@@ -911,6 +932,8 @@ fn trigger_decision(
         .get(key)
         .cloned()
         .unwrap_or_else(|| json!({"created_at":now()}));
+    let previous_enabled = value["enabled"] == true;
+    let previous_cron = value["cron_expr"].clone();
     if !map.contains_key(key) && map.len() >= 1000 {
         return Err(flow_journal::Error::Limit(
             "maximum 1000 trigger configurations".into(),
@@ -943,6 +966,11 @@ fn trigger_decision(
                 .ok_or_else(|| invalid("cron_expr required"))?;
             expr.parse::<cron_parser::Schedule>()
                 .map_err(|e| invalid(e.to_string()))?;
+            if value["enabled"] == true
+                && (!previous_enabled || previous_cron != value["cron_expr"])
+            {
+                value["active_since"] = json!(now());
+            }
         }
     }
     Ok((vec![Event::new(kind, value.clone())], value))

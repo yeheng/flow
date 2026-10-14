@@ -27,9 +27,18 @@ pub async fn fire_due(backend: &JournalBackend, now: DateTime<Local>) {
         else {
             continue;
         };
-        let Some(fire) = cron.previous_before(&(now + chrono::Duration::seconds(1))) else {
+        let Some(fire) = cron.previous_before(&(now + chrono::Duration::nanoseconds(1))) else {
             continue;
         };
+        // Older configurations have no activation timestamp; their creation time
+        // is the lower bound. Never interpret a historical cron slot as a new fire.
+        let active_since = config["active_since"]
+            .as_str()
+            .or_else(|| config["created_at"].as_str())
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok());
+        if active_since.is_none_or(|since| fire < since) {
+            continue;
+        }
         let key = fire.with_timezone(&Utc).to_rfc3339();
         if let Err(error) = backend
             .trigger_start("schedule", id, &key, Value::Null)

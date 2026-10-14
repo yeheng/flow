@@ -49,6 +49,78 @@ async fn cluster_disabled_mode_is_authenticated_and_does_not_need_postgres() {
     backend.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn schedule_reactivation_and_legacy_creation_boundaries_are_durable() {
+    let dir = flow_test_support::io::TempDir::new("schedule-reactivation");
+    let backend = JournalBackend::open(dir.path(), Default::default())
+        .await
+        .unwrap();
+    let receipt = backend.workflow_create("reactivation", None).await.unwrap();
+    let workflow = receipt.result["workflow_id"].as_str().unwrap();
+    backend.workflow_update(workflow, json!({"nodes":[{"id":"s","type":"start"},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"e"}]}), None).await.unwrap();
+    backend.workflow_publish(workflow, 1, None).await.unwrap();
+    // Replay a legacy configuration with no active_since field.
+    let created = chrono::Utc::now();
+    backend.append(vec![flow_journal::Event::new(flow_journal::EventKind::ScheduleChanged,
+        json!({"id":"legacy","workflow_id":workflow,"enabled":true,"cron_expr":"* * * * *","input":null,"created_at":created.to_rfc3339()}))]).await.unwrap();
+    flow_rpc::journal_triggers::fire_due(&backend, created.with_timezone(&chrono::Local)).await;
+    assert!(backend.state().await.runs.is_empty());
+    backend
+        .config_change(
+            "schedule.change",
+            flow_journal::EventKind::ScheduleChanged,
+            "legacy",
+            json!({"enabled":false}),
+            None,
+        )
+        .await
+        .unwrap();
+    backend
+        .config_change(
+            "schedule.change",
+            flow_journal::EventKind::ScheduleChanged,
+            "legacy",
+            json!({"enabled":true}),
+            None,
+        )
+        .await
+        .unwrap();
+    let state = backend.state().await;
+    let since = chrono::DateTime::parse_from_rfc3339(
+        state.schedules["legacy"]["active_since"].as_str().unwrap(),
+    )
+    .unwrap();
+    assert!(since >= created);
+    let stale_fire = (created - chrono::Duration::minutes(1)).to_rfc3339();
+    assert!(
+        backend
+            .trigger_start("schedule", "legacy", &stale_fire, json!(null))
+            .await
+            .is_err(),
+        "the command decision must reject stale scan results under the state lock"
+    );
+    let now = chrono::Local::now();
+    flow_rpc::journal_triggers::fire_due(&backend, now).await;
+    assert!(backend.state().await.runs.is_empty());
+    backend
+        .config_change(
+            "schedule.change",
+            flow_journal::EventKind::ScheduleChanged,
+            "legacy",
+            json!({"cron_expr":"*/2 * * * *"}),
+            None,
+        )
+        .await
+        .unwrap();
+    let state = backend.state().await;
+    let changed = chrono::DateTime::parse_from_rfc3339(
+        state.schedules["legacy"]["active_since"].as_str().unwrap(),
+    )
+    .unwrap();
+    assert!(changed >= since);
+    backend.close().await.unwrap();
+}
+
 async fn call(
     module: &RpcModule<flow_rpc::journal_v2::Context>,
     method: &str,
@@ -121,7 +193,7 @@ async fn triggers_commit_run_and_dedup_together_and_survive_config_deletion() {
     backend.workflow_update(workflow,json!({"nodes":[{"id":"s","type":"start"},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"e"}]}),None).await.unwrap();
     backend.workflow_publish(workflow, 1, None).await.unwrap();
     backend.config_change("schedule.change",flow_journal::EventKind::ScheduleChanged,"cron",json!({"workflow_id":workflow,"enabled":true,"cron_expr":"* * * * *","input":{"from":"cron"}}),None).await.unwrap();
-    let now = chrono::Local::now();
+    let now = chrono::Local::now() + chrono::Duration::minutes(2);
     tokio::join!(
         flow_rpc::journal_triggers::fire_due(&backend, now),
         flow_rpc::journal_triggers::fire_due(&backend, now)
@@ -171,6 +243,60 @@ async fn triggers_commit_run_and_dedup_together_and_survive_config_deletion() {
     drop(backend);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test]
+async fn schedule_respects_activation_boundary_and_never_fires_early() {
+    let dir = flow_test_support::io::TempDir::new("schedule-boundary");
+    let backend = JournalBackend::open(dir.path(), Default::default())
+        .await
+        .unwrap();
+    let receipt = backend.workflow_create("boundary", None).await.unwrap();
+    let workflow = receipt.result["workflow_id"].as_str().unwrap();
+    backend.workflow_update(workflow, json!({"nodes":[{"id":"s","type":"start"},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"e"}]}), None).await.unwrap();
+    backend.workflow_publish(workflow, 1, None).await.unwrap();
+    backend
+        .config_change(
+            "schedule.change",
+            flow_journal::EventKind::ScheduleChanged,
+            "cron",
+            json!({"workflow_id":workflow,"enabled":true,"cron_expr":"* * * * *","input":null}),
+            None,
+        )
+        .await
+        .unwrap();
+    let now = chrono::Local::now();
+    flow_rpc::journal_triggers::fire_due(&backend, now).await;
+    assert!(
+        backend.state().await.runs.is_empty(),
+        "creation must not backfill a historical slot"
+    );
+    let cron: cron_parser::Schedule = "* * * * *".parse().unwrap();
+    let fire = cron.next_after(&now).unwrap();
+    flow_rpc::journal_triggers::fire_due(&backend, fire - chrono::Duration::milliseconds(500))
+        .await;
+    assert!(
+        backend.state().await.runs.is_empty(),
+        "must not fire before the scheduled instant"
+    );
+    tokio::join!(
+        flow_rpc::journal_triggers::fire_due(&backend, fire),
+        flow_rpc::journal_triggers::fire_due(&backend, fire)
+    );
+    assert_eq!(backend.state().await.runs.len(), 1);
+    backend.close().await.unwrap();
+    drop(backend);
+    let backend = JournalBackend::open(dir.path(), Default::default())
+        .await
+        .unwrap();
+    flow_rpc::journal_triggers::fire_due(&backend, fire).await;
+    assert_eq!(
+        backend.state().await.runs.len(),
+        1,
+        "restart must retain the fire identity"
+    );
+    backend.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn authenticated_commands_attach_and_report_projection_timeout() {
     let root = std::env::temp_dir().join(format!("flow-v2-rpc-{}", uuid::Uuid::now_v7()));
