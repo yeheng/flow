@@ -1,4 +1,4 @@
-//! 执行 IPC 协议（v5 postcard 单流）。
+//! 执行 IPC 协议（postcard 单流帧）。
 //!
 //! DTO、物理帧、传输与会话校验都在本模块；业务层只依赖 [`message`] 的
 //! 消息目录与 [`transport`] 的小型 Transport 边界（发帧、收帧、关闭），
@@ -25,7 +25,7 @@ pub use contract::*;
 pub use loopback::{connect_loopback, spawn_executor_loopback, CONNECT_ADDR_ENV};
 pub use message::{
     record_bytes, AuditRecord, ExecuteTask, Message, ObservationLine, PreparedMeta, ProtocolError,
-    ResultOutcome, TaskValue, WaitRequest,
+    ResultOutcome, TaskValue, WaitKind, WaitRequest,
 };
 pub use transfer_key::TransferKey;
 #[cfg(unix)]

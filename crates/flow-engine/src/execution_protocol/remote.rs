@@ -43,13 +43,28 @@ pub struct Capacity {
     pub capabilities: Vec<String>,
 }
 
-/// Resume 清单项（三期 §1.4）：重连后 agent 上报本地未决任务事实。
+/// Resume 清单项的本地任务状态。闭集枚举上 wire（postcard 变体索引），
+/// 非法变体在解码层即拒——字符串当枚举用时的拼写错/越界值不可能混进来。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeState {
+    /// 执行器仍在跑（无固定结果）。
+    Executing,
+    /// 已停止但未封口。
+    Stopped,
+    /// 已生成固定结果（result_id / result_last_audit_seq 有值）。
+    ResultReady,
+    /// 执行器进程已退出。
+    Exited,
+}
+
+/// Resume 清单项（三阶段）：重连后 agent 上报本地未决任务事实。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResumeItem {
     pub dispatch_id: String,
     pub executor_boot_id: String,
     /// 本地任务状态。
-    pub state: String, // executing | stopped | result_ready | exited
+    pub state: ResumeState,
     /// 最后已获主进程确认的审计序号（agent 观察值；主日志游标优先）。
     pub durable_audit_seq: u64,
     /// 已生成未确认的固定 result_id（若有）。

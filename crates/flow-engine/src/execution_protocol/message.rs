@@ -1,14 +1,17 @@
-//! IPC 消息目录（v5 postcard，IPC8）。
+//! IPC 消息目录（postcard 单流）。
 //!
 //! 物理帧为 `u32 body_len | postcard(Message)`：整个 [`Message`] 枚举经
 //! postcard（LE varint）编解码，二进制体（TransferChunk.bytes）以原始
-//! 字节承载，变体索引即帧 kind——v4 的 JSON 信封、三种帧 kind 与十进制
-//! 字符串（JS 安全整数戒律）已随 v4 删除：本线路两端都是 Rust，且用户
+//! 字节承载，变体索引即帧 kind——旧版 JSON 信封、三种帧 kind 与十进制
+//! 字符串（JS 安全整数戒律）均已删除：本线路两端都是 Rust，且用户
 //! JS 摸到的是节点输入值，不是协议帧。
 //!
-//! 版本控制：每帧不再自带版本号，握手帧 [`Message::Hello`]/
-//! [`Message::Welcome`] 携带 `version`（= [`PROTOCOL_VERSION`]），任一侧
-//! 不匹配即明确拒绝——跨版本配对在握手处收口，不再依赖逐帧校验。
+//! 版本控制：每帧不自带版本号，握手帧携带 [`PROTOCOL_VERSION`] 并在
+//! 握手处双端硬校验：执行器侧 [`Message::Hello`]/[`Message::Welcome`]，
+//! agent 上联侧 [`Message::AgentHello`]/[`Message::AgentWelcome`]。任一
+//! 侧不匹配即明确拒绝——跨版本配对在握手处收口，不依赖逐帧校验。
+//! postcard 变体索引是位置编码，缺版本门的跨版本配对会静默错解成
+//! 另一个消息类型，这是最难查的协议 bug 形态。
 //!
 //! 审计记录的**计费口径**仍用 JSON：[`record_bytes`] 是主进程与执行器
 //! 共用的确定性编码长度函数（窗口预算与幂等比对），与 wire 编码无关。
@@ -262,12 +265,26 @@ pub enum ResultOutcome {
     Wait { wait: WaitRequest },
 }
 
+/// 等待请求类别。闭集枚举上 wire（postcard 变体索引），解码层对
+/// 非法变体直接拒绝——拼写错误与越界值不可能变成另一个意思。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitKind {
+    /// 定时等待：`wake_at`（epoch 毫秒）到期后唤醒。
+    Delay,
+    /// 人工信号等待：run.signal 交付后唤醒。
+    Signal,
+    /// 子工作流等待（sub_workflow）：子 run 由主进程在结果接受事务
+    /// 创建并登记父子关系（执行器不创建子 run）。
+    Child,
+}
+
 /// 等待请求。`wake_at` 为 epoch 毫秒（delay）；child 等待的 child_run_id
 /// 由主进程在结果接受事务创建并登记（执行器不创建子 run）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WaitRequest {
     #[serde(rename = "type")]
-    pub kind: String,
+    pub kind: WaitKind,
     #[serde(default)]
     pub wake_at: Option<i64>,
     #[serde(default, with = "wire_stored::option")]
@@ -284,8 +301,8 @@ pub struct WaitRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Message {
     /// control，子→主。启动检查第一步；不授予任务执行权。`version`
-    /// 必须等于主进程的 [`PROTOCOL_VERSION`]，不匹配即拒绝（v5 起
-    /// 逐帧不再携带版本号，版本门集中在握手）。
+    /// 必须等于主进程的 [`PROTOCOL_VERSION`]，不匹配即拒绝（版本门
+    /// 集中在握手，逐帧不携带版本号）。
     Hello {
         version: u32,
         boot_id: String,
@@ -413,24 +430,28 @@ pub enum Message {
     },
     /// control，双向。协议错误：明确拒绝后关闭连接。
     Reject { reason: String },
-    /// 远程路由帧（三期 §1.2）：外层包络 + 内层业务消息。postcard 下
-    /// 内层 TransferChunk 的字节由嵌套枚举原生承载——v4 的专用
-    /// KIND_ROUTED_TRANSFER_CHUNK 帧与其三处 dispatch_id 一致性校验
+    /// 远程路由帧（三阶段）：外层包络 + 内层业务消息。postcard 下
+    /// 内层 TransferChunk 的字节由嵌套枚举原生承载——旧版专用
+    /// routed-transfer-chunk 帧与其三处 dispatch_id 一致性校验
     /// 随枚举嵌套自然消失。
     Routed {
         envelope: RouteEnvelope,
         inner: Box<Message>,
     },
-    /// control，agent→主。上联握手：TLS 主体映射 agent_id。
+    /// control，agent→主。上联握手：身份由承载层决定（mTLS 证书 CN /
+    /// WSS 凭据映射表），不信客户端自报字段。`version` 必须等于主进程的
+    /// [`PROTOCOL_VERSION`]，不匹配即拒绝。
     AgentHello {
+        version: u32,
         agent_boot_id: String,
         build: String,
         capabilities: Vec<String>,
         slots: u32,
     },
     /// control，主→agent。选定 link_session、限额与心跳周期（单流上联，
-    /// 无第二条 data 连接，也就没有 v2 的 data 绑定凭据）。
+    /// 无第二条 data 连接，也就没有 data 绑定凭据）；`version` 同样必检。
     AgentWelcome {
+        version: u32,
         journal_id: String,
         master_epoch: u64,
         link_session_id: String,
@@ -597,6 +618,22 @@ impl Message {
             session_token,
         }
     }
+
+    /// 构造携带当前协议版本的 AgentHello（agent 上联握手用）。
+    pub fn agent_hello(
+        agent_boot_id: impl Into<String>,
+        build: impl Into<String>,
+        capabilities: Vec<String>,
+        slots: u32,
+    ) -> Self {
+        Message::AgentHello {
+            version: PROTOCOL_VERSION,
+            agent_boot_id: agent_boot_id.into(),
+            build: build.into(),
+            capabilities,
+            slots,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -635,5 +672,21 @@ mod tests {
     fn postcard_decode_rejects_unknown_variant_index() {
         assert!(postcard::from_bytes::<Message>(&[28]).is_err());
         assert!(postcard::from_bytes::<Message>(&[200]).is_err());
+    }
+
+    /// 闭集枚举（替代字符串状态）的非法变体必须在解码层被拒——字符串当
+    /// 枚举用时拼写错/越界值会静默通过，postcard 变体索引不会。
+    #[test]
+    fn closed_set_enums_reject_unknown_variants() {
+        use super::super::remote::ResumeState;
+        // WaitKind：Delay/Signal/Child 三个变体。
+        assert!(postcard::from_bytes::<WaitKind>(&[0]).is_ok());
+        assert!(postcard::from_bytes::<WaitKind>(&[2]).is_ok());
+        assert!(postcard::from_bytes::<WaitKind>(&[3]).is_err());
+        assert!(postcard::from_bytes::<WaitKind>(&[200]).is_err());
+        // ResumeState：Executing/Stopped/ResultReady/Exited 四个变体。
+        assert!(postcard::from_bytes::<ResumeState>(&[3]).is_ok());
+        assert!(postcard::from_bytes::<ResumeState>(&[4]).is_err());
+        assert!(postcard::from_bytes::<ResumeState>(&[200]).is_err());
     }
 }

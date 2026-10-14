@@ -1,4 +1,4 @@
-//! 传输边界与会话校验（v5 postcard 单流）。
+//! 传输边界与会话校验（postcard 单流帧）。
 //!
 //! 唯一承载形态：`spawn` 在一条双向流上复用全部消息（帧 = `u32 body_len |
 //! postcard(Message)`，见 [`super::frame`]）。单写任务保证帧按提交序串行
@@ -80,7 +80,7 @@ impl SessionState {
 }
 
 impl FrameTransport {
-    /// 单流承载（v5）：`u32 body_len | postcard(Message)`；发送队列一条，
+    /// 单流承载：`u32 body_len | postcard(Message)`；发送队列一条，
     /// 帧序即提交序。
     pub fn spawn<S>(stream: S, queue_depth: usize) -> Self
     where
@@ -509,7 +509,7 @@ fn validate_session_token(
 }
 
 /// 主进程侧握手：接收 Hello（校验版本/能力/boot 唯一性/会话令牌），回
-/// Welcome，等待 Ready。任一步失败即明确拒绝，不降级。v5 起版本门集中在
+/// Welcome，等待 Ready。任一步失败即明确拒绝，不降级。版本门集中在
 /// 此处（帧不再自带版本号）。
 pub async fn master_handshake(
     transport: &mut FrameTransport,

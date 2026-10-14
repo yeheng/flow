@@ -14,10 +14,13 @@ use super::contract::ExecutorInvocation;
 use super::unix::socketpair_channel;
 
 /// spawn 一个执行器进程并返回 (父端通道, 子进程句柄, 子端通道副本)。
-/// `tag` 为可选诊断参数（执行器忽略未知参数）。
+/// `tag` 为可选诊断参数（执行器忽略未知参数）；`extra_args` 为调用点
+/// 显式指定的模式/标记参数（如 agent 中继的 `--remote-relay`）——不做
+/// 「预置参数列表」的隐式传递。
 pub fn spawn_executor_process(
     executor: &ExecutorInvocation,
     tag: Option<&str>,
+    extra_args: &[&str],
 ) -> std::io::Result<(UnixStream, Child, UnixStream)> {
     let (parent, child) = socketpair_channel()?;
     let child_fd = child.as_raw_fd();
@@ -31,7 +34,7 @@ pub fn spawn_executor_process(
         ));
     }
     let mut command = Command::new(&executor.program);
-    command.args(&executor.prefix);
+    command.args(extra_args);
     // `--tag` 紧跟程序名：journal_ipc 的进程识别（pgrep -f
     // "flow-executor --tag <tag>"）依赖这段连续子串，通道 FD 参数放其后。
     if let Some(tag) = tag {

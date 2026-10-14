@@ -32,7 +32,7 @@ fn remote_options() -> flow_backend::execution::remote::RemoteOptions {
         server_key: "unused".into(),
         attach_timeout_ms: 15_000,
         wss_addr: None,
-        agent_token: None,
+        wss_agents: Vec::new(),
     }
 }
 
@@ -94,7 +94,8 @@ async fn start_agent(
         let boot = flow_engine::execution_protocol::transport::fresh_boot_id();
         transport
             .send(Message::AgentHello {
-                agent_boot_id: boot.clone(),
+
+                    version: flow_engine::execution_protocol::PROTOCOL_VERSION,agent_boot_id: boot.clone(),
                 build: "sim".into(),
                 capabilities: vec!["relay".into(), "resource_report".into(), "reconnect".into()],
                 slots: 4,
@@ -108,7 +109,8 @@ async fn start_agent(
             }
         };
         let Message::AgentWelcome {
-            journal_id,
+
+                version: flow_engine::execution_protocol::PROTOCOL_VERSION,journal_id,
             master_epoch,
             link_session_id,
             ..

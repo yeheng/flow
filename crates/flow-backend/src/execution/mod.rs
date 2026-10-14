@@ -109,7 +109,14 @@ pub fn remote_options_from_config(
         server_key: remote.key.clone(),
         attach_timeout_ms: remote.attach_timeout_ms,
         wss_addr: remote.wss_addr.clone(),
-        agent_token: remote.agent_token.clone(),
+        wss_agents: remote
+            .agents
+            .iter()
+            .map(|agent| crate::execution::remote::AgentCredential {
+                id: agent.id.clone(),
+                token: agent.token.clone(),
+            })
+            .collect(),
     })
 }
 

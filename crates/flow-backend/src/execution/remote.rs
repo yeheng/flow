@@ -17,12 +17,14 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Mutex, Notify, Semaphore};
 use tokio_rustls::TlsAcceptor;
 
-use flow_engine::execution_protocol::contract::{A_MAX, STARTUP_TIMEOUT_MS, W_BYTES};
+use flow_engine::execution_protocol::contract::{
+    bounded_control_text, A_MAX, PROTOCOL_VERSION, STARTUP_TIMEOUT_MS, W_BYTES,
+};
 use flow_engine::execution_protocol::message::Message;
 use flow_engine::execution_protocol::remote::{
     capability, validate_route_identity, ResumeAction, ResumeDecision, ResumeItem, RouteEnvelope,
 };
-use flow_engine::execution_protocol::transport::FrameTransport;
+use flow_engine::execution_protocol::transport::{FrameTransport, SendBacklog};
 
 use crate::execution::dispatch::DispatchLink;
 use crate::execution::ToSession;
@@ -42,6 +44,16 @@ pub(crate) fn is_link_dead(error: &crate::journal::JournalError) -> bool {
     matches!(error, crate::journal::JournalError::LinkClosed(_))
 }
 
+/// WSS 接入的 agent 凭据：token → agent_id 映射表的一项。
+///
+/// 身份的信任来源跟承载走：mTLS 有证书 CN，WSS 只有 token——那就让
+/// token 直接决定身份，而不是让客户端填一张没人验的表。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentCredential {
+    pub id: String,
+    pub token: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct RemoteOptions {
     pub control_addr: String,
@@ -52,8 +64,9 @@ pub struct RemoteOptions {
     pub attach_timeout_ms: u64,
     // WSS 接入监听地址（T13，代理终止 TLS 场景的附加承载）；缺省关闭。
     pub wss_addr: Option<String>,
-    // WSS 共享令牌（与 x-flow-agent-id 一起做显式认证映射）。
-    pub agent_token: Option<String>,
+    // WSS 凭据映射表（token → agent_id）：身份由凭证反查，客户端自报头
+    // 仅作一致性断言（见 [`authenticate_wss`]）。与 wss_addr 成对配置。
+    pub wss_agents: Vec<AgentCredential>,
 }
 
 impl RemoteOptions {
@@ -254,8 +267,8 @@ impl AgentManager {
         &self.global
     }
 
-    // TLS 监听入口（真实网络，三期 §1.2）。单条 mTLS 连接承载整条上联
-    // （v4 单流：帧头 kind 区分载荷形态），不再有第二条 data 连接。
+    // TLS 监听入口（真实网络）。单条 mTLS 连接承载整条上联（单流帧：
+    // 一帧一形态，变体索引即帧类型），不再有第二条 data 连接。
     pub async fn listen_tls(self: &Arc<Self>, options: RemoteOptions) -> Result<()> {
         install_crypto_provider();
         let tls =
@@ -315,15 +328,15 @@ impl AgentManager {
     }
 
     /// WSS 接入（T13）：反向代理/统一入口场景的**附加**承载。明文 TCP，
-    /// 由代理终止 TLS；身份通过显式认证映射（`Authorization: Bearer <token>`
-    /// + `x-flow-agent-id`）确定，不信任客户端自报以外的任何隐式身份。
+    /// 由代理终止 TLS；身份由 token→agent_id 映射表决定（凭证反查），
+    /// 客户端自报的 `x-flow-agent-id` 只做一致性断言（不匹配即 401）。
     ///
     /// 直连 mTLS 路径（[`AgentManager::listen_tls`]）不变。
     ///
-    /// 协议层面：一条完整 v4 帧对应一条（或分片后多条）WS Binary 消息；Text/超限消息拒绝；
+    /// 协议层面：一条完整帧对应一条（或分片后多条）WS Binary 消息；Text/超限消息拒绝；
     /// 协商上限由 [`MAX_WS_MESSAGE_BYTES`] 硬约束。
     #[allow(clippy::result_large_err)] // accept_hdr 回调签名固定，ErrorResponse 为大类型
-    pub async fn listen_wss(self: &Arc<Self>, addr: String, token: String) -> Result<()> {
+    pub async fn listen_wss(self: &Arc<Self>, addr: String, agents: Vec<AgentCredential>) -> Result<()> {
         use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
         use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
@@ -356,7 +369,7 @@ impl AgentManager {
                 }
                 active.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 let manager = manager.clone();
-                let token = token.clone();
+                let agents = agents.clone();
                 let active = active.clone();
                 tokio::spawn(async move {
                     let agent_slot: std::sync::Arc<std::sync::Mutex<Option<String>>> =
@@ -365,7 +378,7 @@ impl AgentManager {
                     let handshake = tokio_tungstenite::accept_hdr_async_with_config(
                         socket,
                         move |request: &Request, response: Response| match authenticate_wss(
-                            request, &token,
+                            request, &agents,
                         ) {
                             Some(agent_id) => {
                                 *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(agent_id);
@@ -417,8 +430,74 @@ impl AgentManager {
         });
     }
 
+    // agent 上联握手（T02）：AgentHello（版本门）→ 校验 → AgentWelcome。
+    // 与执行器握手同样的「明确拒绝，不降级」：postcard 变体索引是位置
+    // 编码，跨版本配对会静默错解成另一个消息类型，版本不匹配在握手处
+    // 显式拒绝并断链（错误信息含双方版本号）。
+    async fn session_handshake(
+        self: &Arc<Self>,
+        transport: &mut FrameTransport,
+        agent_id: &str,
+    ) -> std::result::Result<(String, u32, String), String> {
+        let message = tokio::time::timeout(
+            Duration::from_millis(STARTUP_TIMEOUT_MS * 2),
+            transport.recv(),
+        )
+        .await
+        .map_err(|_| "agent hello timeout".to_string())?
+        .map_err(|e| format!("read hello: {e}"))?;
+        let Message::AgentHello {
+            version,
+            agent_boot_id,
+            build: _,
+            capabilities,
+            slots,
+        } = message
+        else {
+            return Err("expected AgentHello".into());
+        };
+        if version != PROTOCOL_VERSION {
+            let _ = transport
+                .send(Message::Reject {
+                    reason: bounded_control_text(format!(
+                        "agent protocol version {version} not supported \
+                         (master speaks {PROTOCOL_VERSION})"
+                    )),
+                })
+                .await;
+            return Err(format!(
+                "agent protocol version mismatch: agent={version} master={PROTOCOL_VERSION}"
+            ));
+        }
+        for required in capability::REQUIRED {
+            if !capabilities.iter().any(|c| c == required) {
+                return Err(format!("agent missing capability {required}"));
+            }
+        }
+        if !validate_route_identity(agent_id) || !validate_route_identity(&agent_boot_id) {
+            return Err("invalid agent identity".into());
+        }
+        let link_session_id = format!(
+            "link-{}",
+            self.session_counter.fetch_add(1, Ordering::Relaxed)
+        );
+        transport
+            .send(Message::AgentWelcome {
+                version: PROTOCOL_VERSION,
+                journal_id: self.journal_id.clone(),
+                master_epoch: self.master_epoch,
+                link_session_id: link_session_id.clone(),
+                agent_id: agent_id.to_string(),
+                heartbeat_ms: flow_engine::execution_protocol::HEARTBEAT_INTERVAL_MS,
+                agent_window_bytes: W_BYTES * A_MAX as u64,
+            })
+            .await
+            .map_err(|e| format!("write welcome: {e}"))?;
+        Ok((agent_boot_id, slots, link_session_id))
+    }
+
     // 单个 agent 会话（T02）：握手与业务帧共用同一条 transport
-    // （v4 单流：无需第二条连接与 DataBind）。
+    //（单流：无需第二条连接与 DataBind）。
     async fn run_session(
         self: &Arc<Self>,
         agent_id: String,
@@ -426,53 +505,11 @@ impl AgentManager {
     ) -> std::result::Result<(), String> {
         // 1) 握手全程走同一条 transport（T02）：先建传输再收发 AgentHello/
         // AgentWelcome。不再用临时 decoder 取首帧后丢弃——同一次 read 里
-        // Hello 之后的尾随帧不会在交接时丢失（帧上限/版本/能力校验不变）。
+        // Hello 之后的尾随帧不会在交接时丢失。
         let mut transport = FrameTransport::spawn(stream, 128);
-        let (agent_boot_id, _build, capabilities, slots) = {
-            let message = tokio::time::timeout(
-                Duration::from_millis(STARTUP_TIMEOUT_MS * 2),
-                transport.recv(),
-            )
-            .await
-            .map_err(|_| "agent hello timeout".to_string())?
-            .map_err(|e| format!("read hello: {e}"))?;
-            let Message::AgentHello {
-                agent_boot_id,
-                build,
-                capabilities,
-                slots,
-            } = message
-            else {
-                return Err("expected AgentHello".into());
-            };
-            let _ = build;
-            (agent_boot_id, build, capabilities, slots)
-        };
-        for required in capability::REQUIRED {
-            if !capabilities.iter().any(|c| c == required) {
-                return Err(format!("agent missing capability {required}"));
-            }
-        }
-        if !validate_route_identity(&agent_id) || !validate_route_identity(&agent_boot_id) {
-            return Err("invalid agent identity".into());
-        }
-        let link_session_id = format!(
-            "link-{}",
-            self.session_counter.fetch_add(1, Ordering::Relaxed)
-        );
-        // 2) Welcome 经同一条 transport 发出（不再手工裸写帧）。
-        transport
-            .send(Message::AgentWelcome {
-                journal_id: self.journal_id.clone(),
-                master_epoch: self.master_epoch,
-                link_session_id: link_session_id.clone(),
-                agent_id: agent_id.clone(),
-                heartbeat_ms: flow_engine::execution_protocol::HEARTBEAT_INTERVAL_MS,
-                agent_window_bytes: W_BYTES * A_MAX as u64,
-            })
-            .await
-            .map_err(|e| format!("write welcome: {e}"))?;
-
+        let (agent_boot_id, slots, link_session_id) = self
+            .session_handshake(&mut transport, &agent_id)
+            .await?;
         // 3) 注册会话（替换旧会话：旧 outbound 关闭 → 相关 runner link-dead）。
         let (outbound, mut commands) = mpsc::channel::<ToSession>(256);
         let registration = Arc::new(AgentRegistration {
@@ -509,8 +546,17 @@ impl AgentManager {
         let mut completed: std::collections::VecDeque<(RouteEnvelope, Option<String>)> =
             Default::default();
         let mut resume_items = Vec::new();
+        // 出站积压（T03）：handler 内只 push、循环顶 flush，不 await
+        // `transport.send`——出站阻塞（队列满 + 对端停读）不能卡住整个
+        // select，否则入站心跳/Cancel/Resume 与 liveness 看门狗全部停摆，
+        // 双向饱和时两侧环路互相等死。FIFO 积压保住帧提交序；积压超限
+        // 视为会话失效，显式终止（不用无界队列化解背压）。
+        let mut send_backlog = SendBacklog::with_capacity(16);
         let result: std::result::Result<(), String> = async {
             loop {
+                if let Err(error) = send_backlog.flush(&transport) {
+                    return Err(format!("agent {agent_id} uplink send failed: {error}"));
+                }
                 tokio::select! {
                     _ = registration.cancel.cancelled() => return Ok(()),
                     _ = self.shutdown.cancelled() => return Ok(()),
@@ -526,7 +572,9 @@ impl AgentManager {
                             ));
                         }
                     }
-                    command = commands.recv() => {
+                    // 积压占用期间不拉取新出站消息（自然背压到生产方），
+                    // 也保住帧提交序：积压非空时新帧必须排在其后。
+                    command = commands.recv(), if send_backlog.is_empty() => {
                         let Some(command) = command else { return Ok(()); };
                         match command {
                             ToSession::Send(message) => {
@@ -555,11 +603,12 @@ impl AgentManager {
                                 } else {
                                     *message
                                 };
-                                // 出站拥塞（满队列阻塞在 send）期间关闭/替换仍可处理（T03）。
-                                tokio::select! {
-                                    result = transport.send(frame) => result.map_err(|e| format!("send: {e}"))?,
-                                    _ = registration.cancel.cancelled() => return Ok(()),
-                                    _ = self.shutdown.cancelled() => return Ok(()),
+                                // 出站拥塞不阻塞环路（T03）：进 FIFO 积压，
+                                // 循环顶统一冲刷；积压超限 = 会话失效。
+                                if send_backlog.push(&transport, frame).is_err() {
+                                    return Err(format!(
+                                        "agent {agent_id} uplink send backlog overflow"
+                                    ));
                                 }
                             }
                             ToSession::CancelDispatch(dispatch_id) => {
@@ -572,10 +621,10 @@ impl AgentManager {
                                         dispatch_id: dispatch_id.clone(),
                                     }),
                                 };
-                                tokio::select! {
-                                    result = transport.send(cancel_frame) => result.map_err(|e| format!("cancel: {e}"))?,
-                                    _ = registration.cancel.cancelled() => return Ok(()),
-                                    _ = self.shutdown.cancelled() => return Ok(()),
+                                if send_backlog.push(&transport, cancel_frame).is_err() {
+                                    return Err(format!(
+                                        "agent {agent_id} uplink send backlog overflow"
+                                    ));
                                 }
                                 if let Some(route) = routings.remove(&dispatch_id) {
                                     completed.push_back((route.envelope, None));
@@ -605,12 +654,12 @@ impl AgentManager {
                                     if let Some((previous, result_id)) = completed.iter().find(|(previous, _)| previous == &envelope) {
                                         if let (Some(result_id), Message::Result { result_id: id, .. }) = (result_id, &*inner) {
                                             if id == result_id {
-                                                tokio::select! {
-                                                    result = transport.send(Message::Routed { envelope: previous.clone(), inner: Box::new(Message::ResultCommitted {
+                                                if send_backlog.push(&transport, Message::Routed { envelope: previous.clone(), inner: Box::new(Message::ResultCommitted {
                                                         dispatch_id: envelope.dispatch_id.clone().unwrap(), result_id: result_id.clone(),
-                                                    })}) => result.map_err(|e| e.to_string())?,
-                                                    _ = registration.cancel.cancelled() => return Ok(()),
-                                                    _ = self.shutdown.cancelled() => return Ok(()),
+                                                    })}).is_err() {
+                                                    return Err(format!(
+                                                        "agent {agent_id} uplink send backlog overflow"
+                                                    ));
                                                 }
                                             }
                                         }
@@ -675,12 +724,16 @@ impl AgentManager {
                                     };
                                     completed.push_back((envelope.clone(), None));
                                     if completed.len() > 256 { completed.pop_front(); }
-                                    transport.send(Message::Routed {
+                                    if send_backlog.push(&transport, Message::Routed {
                                         envelope,
                                         inner: Box::new(Message::Cancel {
                                             command_id: format!("late-bind-{dispatch_id}"), dispatch_id,
                                         }),
-                                    }).await.map_err(|e| format!("cancel late bind: {e}"))?;
+                                    }).is_err() {
+                                        return Err(format!(
+                                            "agent {agent_id} uplink send backlog overflow"
+                                        ));
+                                    }
                                 }
                             }
                             Message::CapacityReport { capacity } => {
@@ -708,8 +761,7 @@ impl AgentManager {
                                                 items.iter().find(|i| i.dispatch_id == dispatch_id)
                                             {
                                                 if let Some(result_id) = &item.result_id {
-                                                    let _ = transport
-                                                        .send(Message::Routed {
+                                                    if send_backlog.push(&transport, Message::Routed {
                                                             envelope: resume_envelope(
                                                                 &agent_id,
                                                                 &agent_boot_id,
@@ -720,8 +772,11 @@ impl AgentManager {
                                                                 dispatch_id: dispatch_id.clone(),
                                                                 result_id: result_id.clone(),
                                                             }),
-                                                        })
-                                                        .await;
+                                                        }).is_err() {
+                                                        return Err(format!(
+                                                            "agent {agent_id} uplink send backlog overflow"
+                                                        ));
+                                                    }
                                                 }
                                             }
                                             routings.remove(&dispatch_id);
@@ -730,8 +785,7 @@ impl AgentManager {
                                         }
                                         ResumeAction::CancelAndDrain => {
                                             routings.remove(&dispatch_id);
-                                            let _ = transport
-                                                .send(Message::Routed {
+                                            if send_backlog.push(&transport, Message::Routed {
                                                     envelope: resume_envelope(
                                                         &agent_id,
                                                         &agent_boot_id,
@@ -742,8 +796,11 @@ impl AgentManager {
                                                         command_id: format!("cancel-{dispatch_id}"),
                                                         dispatch_id: dispatch_id.clone(),
                                                     }),
-                                                })
-                                                .await;
+                                                }).is_err() {
+                                                return Err(format!(
+                                                    "agent {agent_id} uplink send backlog overflow"
+                                                ));
+                                            }
                                             self.resolve_binding(
                                                 &dispatch_id,
                                                 AttachOutcome::Cancelled("resume: cancel and drain".into()),
@@ -752,8 +809,7 @@ impl AgentManager {
                                         }
                                         ResumeAction::ReconcileRequired => {
                                             routings.remove(&dispatch_id);
-                                            let _ = transport
-                                                .send(Message::Routed {
+                                            if send_backlog.push(&transport, Message::Routed {
                                                     envelope: resume_envelope(
                                                         &agent_id,
                                                         &agent_boot_id,
@@ -764,8 +820,11 @@ impl AgentManager {
                                                         command_id: format!("cancel-{dispatch_id}"),
                                                         dispatch_id: dispatch_id.clone(),
                                                     }),
-                                                })
-                                                .await;
+                                                }).is_err() {
+                                                return Err(format!(
+                                                    "agent {agent_id} uplink send backlog overflow"
+                                                ));
+                                            }
                                             self.resolve_binding(
                                                 &dispatch_id,
                                                 AttachOutcome::Lost("resume: reconcile required".into()),
@@ -774,10 +833,11 @@ impl AgentManager {
                                         }
                                     }
                                 }
-                                transport
-                                    .send(Message::ResumeReply { decisions: decisions.clone(), page })
-                                    .await
-                                    .map_err(|e| format!("resume reply: {e}"))?;
+                                if send_backlog.push(&transport, Message::ResumeReply { decisions: decisions.clone(), page }).is_err() {
+                                    return Err(format!(
+                                        "agent {agent_id} uplink send backlog overflow"
+                                    ));
+                                }
                                 resume_items.extend(items.iter().cloned());
                                 // Every page establishes routes before the next page arrives.
                                 let continuing: Vec<_> = items.iter().filter(|item| decisions.iter().any(|decision|
@@ -1302,12 +1362,16 @@ impl Drop for BindingGuard {
     }
 }
 
-/// WSS 认证映射（T13）：校验 `Authorization: Bearer <token>`（常量时间比较）
-/// 并取显式 `x-flow-agent-id`；返回已认证的 agent_id。代理终止 TLS 场景下
-/// 这是唯一的身份来源——绝不信任客户端自报以外的隐式身份。
+/// WSS 认证（T13）：`Authorization: Bearer <token>` 对映射表逐项常量时间
+/// 比较，**由表反查 agent_id**——身份来源是凭证，不是客户端填的表单。
+///
+/// 客户端自报的 `x-flow-agent-id` 降级为一致性断言：声明了就必须与凭证
+/// 反查结果一致，否则 401；未声明则直接采用反查结果。任何单一凭证只能
+/// 取得一个 agent 身份，冒充他 agent 在这里就进不了门（会话替换也因此
+/// 天然要求持有同一身份的凭证）。
 fn authenticate_wss(
     request: &tokio_tungstenite::tungstenite::handshake::server::Request,
-    token: &str,
+    agents: &[AgentCredential],
 ) -> Option<String> {
     let provided = request
         .headers()
@@ -1315,14 +1379,24 @@ fn authenticate_wss(
         .to_str()
         .ok()?
         .strip_prefix("Bearer ")?;
-    if !constant_time_eq(provided.as_bytes(), token.as_bytes()) {
+    // 不提前退出：用比较次数泄露 token 位置等于泄露半个凭证。
+    let mut matched: Option<&AgentCredential> = None;
+    for agent in agents {
+        if constant_time_eq(provided.as_bytes(), agent.token.as_bytes()) {
+            matched = Some(agent);
+        }
+    }
+    let agent = matched?;
+    if !validate_route_identity(&agent.id) {
         return None;
     }
-    let agent_id = request.headers().get("x-flow-agent-id")?.to_str().ok()?;
-    if !validate_route_identity(agent_id) {
-        return None;
+    if let Some(claimed) = request.headers().get("x-flow-agent-id") {
+        let claimed = claimed.to_str().ok()?;
+        if claimed != agent.id {
+            return None;
+        }
     }
-    Some(agent_id.to_string())
+    Some(agent.id.clone())
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -1424,6 +1498,244 @@ mod capacity_tests {
         manager.unbind("second", true).await;
         assert!(manager.pending_binds.lock().await.is_empty());
         assert!(manager.bindings.lock().await.is_empty());
+        backend.close().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// W1：WSS 身份由凭证映射表决定；自报 header 只做一致性断言。
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+
+    fn request(token: Option<&str>, claimed: Option<&str>) -> tokio_tungstenite::tungstenite::handshake::server::Request {
+        let mut builder = tokio_tungstenite::tungstenite::http::Request::builder();
+        if let Some(token) = token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        if let Some(claimed) = claimed {
+            builder = builder.header("x-flow-agent-id", claimed);
+        }
+        builder.body(()).unwrap()
+    }
+
+    fn table() -> Vec<AgentCredential> {
+        vec![
+            AgentCredential {
+                id: "agent-a".into(),
+                token: "token-a".into(),
+            },
+            AgentCredential {
+                id: "agent-b".into(),
+                token: "token-b".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn token_decides_identity() {
+        // 正确凭证 + 一致声明 / 不声明：身份都是凭证反查结果。
+        assert_eq!(
+            authenticate_wss(&request(Some("token-a"), Some("agent-a")), &table()),
+            Some("agent-a".into())
+        );
+        assert_eq!(
+            authenticate_wss(&request(Some("token-b"), None), &table()),
+            Some("agent-b".into())
+        );
+    }
+
+    #[test]
+    fn claimed_header_cannot_impersonate_another_agent() {
+        // 持 A 凭证声明 B 身份 / 伪造 header 冒充他 agent / 错缺凭证：一律拒绝。
+        assert_eq!(authenticate_wss(&request(Some("token-a"), Some("agent-b")), &table()), None);
+        assert_eq!(authenticate_wss(&request(Some("token-b"), Some("agent-a")), &table()), None);
+        assert_eq!(authenticate_wss(&request(Some("wrong"), Some("agent-a")), &table()), None);
+        assert_eq!(authenticate_wss(&request(None, Some("agent-a")), &table()), None);
+        assert_eq!(authenticate_wss(&request(Some("token-a"), Some("")), &table()), None);
+    }
+
+    #[test]
+    fn unknown_token_matches_no_identity() {
+        assert_eq!(authenticate_wss(&request(Some("token-c"), None), &table()), None);
+    }
+}
+
+/// W2/W3：上联握手版本门 + 会话环路出站阻塞不再卡死（T03）。
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    async fn manager_with_data() -> (Arc<AgentManager>, Arc<JournalBackend>, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("flow-session-{}", uuid::Uuid::now_v7()));
+        let backend = JournalBackend::open(&root, flow_journal::JournalOptions::default())
+            .await
+            .unwrap();
+        let manager = AgentManager::new(backend.clone(), "journal-test".into(), 1);
+        (manager, backend, root)
+    }
+
+    /// 建立一对单流会话：master 侧走 attach_inprocess，测试侧持 transport。
+    /// 返回 (测试侧 transport, link_session_id)。
+    async fn session_pair(manager: &Arc<AgentManager>, agent_id: &str) -> (FrameTransport, String) {
+        let (a, b) = tokio::io::duplex(256);
+        manager.attach_inprocess(agent_id.to_string(), a).await;
+        let mut transport = FrameTransport::spawn(b, 8);
+        transport
+            .send(Message::agent_hello(
+                "boot-1",
+                "test",
+                capability::REQUIRED.iter().map(|s| s.to_string()).collect(),
+                1,
+            ))
+            .await
+            .unwrap();
+        let welcome = transport.recv().await.unwrap();
+        let Message::AgentWelcome {
+            link_session_id, ..
+        } = welcome
+        else {
+            panic!("expected AgentWelcome, got {}", welcome.type_name());
+        };
+        (transport, link_session_id)
+    }
+
+    /// W3：对端停读 + 出站饱和时入站帧仍被处理（旧版卡死在
+    /// `transport.send().await`，心跳/Cancel/Resume 全部停摆）。
+    #[tokio::test]
+    async fn inbound_flows_while_outbound_is_saturated() {
+        let (manager, backend, root) = manager_with_data().await;
+        let (transport, link_session_id) = session_pair(&manager, "agent-1").await;
+        // 一个待应答的 bind：inbound BindExecutorAck 是「入站仍被处理」的可观察点。
+        let (events, _rx) = mpsc::channel(8);
+        let (ack_tx, ack_rx) = oneshot::channel();
+        manager.pending_binds.lock().await.insert(
+            "d1".into(),
+            PendingBind {
+                agent_id: "agent-1".into(),
+                link_session_id,
+                executor_id: "e1".into(),
+                events,
+                ack: ack_tx,
+            },
+        );
+        // 灌满出站（对端停读）：通道满 = transport 队列 + 底层缓冲已饱和、
+        // 环路不再消费出站命令。
+        let registration = manager.agents.lock().await.get("agent-1").cloned().unwrap();
+        let mut sent = 0usize;
+        loop {
+            match registration
+                .outbound
+                .try_send(ToSession::Send(Box::new(Message::Drain { grace_ms: 0 })))
+            {
+                Ok(()) => sent += 1,
+                Err(mpsc::error::TrySendError::Full(_)) => break,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    panic!("session died during saturation after {sent} frames")
+                }
+            }
+            assert!(sent < 100_000, "outbound never saturated");
+        }
+        // 入站 ack 必须仍被处理并唤醒 binder。
+        transport
+            .send(Message::BindExecutorAck {
+                executor_id: "e1".into(),
+                executor_boot_id: "boot-e1".into(),
+                dispatch_id: "d1".into(),
+                ok: true,
+                error: None,
+            })
+            .await
+            .unwrap();
+        let ack = tokio::time::timeout(Duration::from_secs(5), ack_rx)
+            .await
+            .expect("inbound bind ack must be processed while outbound is saturated")
+            .expect("ack channel")
+            .expect("bind acknowledged");
+        assert_eq!(ack, "boot-e1");
+        manager.shutdown().await;
+        backend.close().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// W3：出站积压超限 = 会话失效，显式终止（不是永久悬挂）。
+    #[tokio::test]
+    async fn outbound_backlog_overflow_terminates_session() {
+        let (manager, backend, root) = manager_with_data().await;
+        let (transport, _link_session_id) = session_pair(&manager, "agent-1").await;
+        let registration = manager.agents.lock().await.get("agent-1").cloned().unwrap();
+        // 对端停读 + 入站洪水：每个 Resume 触发一个 ResumeReply 出站帧，
+        // 积压超限后 push 报错 → 会话终止。
+        let done = tokio::time::timeout(Duration::from_secs(20), async {
+            for page in 0..20_000u32 {
+                if registration.cancel.is_cancelled() {
+                    return;
+                }
+                if transport
+                    .send(Message::Resume {
+                        items: vec![],
+                        page,
+                        more: true,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(done.is_ok(), "会话环路被出站阻塞卡死");
+        assert!(
+            registration.cancel.is_cancelled(),
+            "出站积压超限必须显式终止会话，而不是永久悬挂"
+        );
+        manager.shutdown().await;
+        backend.close().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// W2：跨版本 AgentHello 在握手处显式拒绝（错误信息含双方版本号），
+    /// 不静默错解成另一个消息类型。
+    #[tokio::test]
+    async fn agent_hello_version_mismatch_is_rejected() {
+        let (manager, backend, root) = manager_with_data().await;
+        let (a, b) = tokio::io::duplex(4096);
+        manager.attach_inprocess("agent-1".to_string(), a).await;
+        let mut transport = FrameTransport::spawn(b, 8);
+        transport
+            .send(Message::AgentHello {
+                version: PROTOCOL_VERSION - 1,
+                agent_boot_id: "boot-1".into(),
+                build: "test".into(),
+                capabilities: capability::REQUIRED.iter().map(|s| s.to_string()).collect(),
+                slots: 1,
+            })
+            .await
+            .unwrap();
+        let mut rejected = None;
+        for _ in 0..4 {
+            match tokio::time::timeout(Duration::from_secs(5), transport.recv()).await {
+                Ok(Ok(Message::Reject { reason })) => {
+                    rejected = Some(reason);
+                    break;
+                }
+                Ok(Ok(other)) => panic!("unexpected message before reject: {}", other.type_name()),
+                Ok(Err(_)) => break,
+                Err(_) => break,
+            }
+        }
+        let reason = rejected.expect("版本不匹配必须显式 Reject 并断链");
+        assert!(
+            reason.contains(&(PROTOCOL_VERSION - 1).to_string())
+                && reason.contains(&PROTOCOL_VERSION.to_string()),
+            "拒绝原因必须含双方版本号：{reason}"
+        );
+        assert!(
+            manager.agents.lock().await.is_empty(),
+            "握手失败不得注册会话"
+        );
+        manager.shutdown().await;
         backend.close().await.unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }

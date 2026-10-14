@@ -62,11 +62,14 @@ pub async fn bind_executor(
     executor_id: &str,
     dispatch_id: &str,
 ) -> Result<ExecutorHandle, PoolError> {
-    let mut invocation = executor.clone();
-    invocation.prefix.push("--remote-relay".into());
-    let (pair, mut child, child_side) =
-        spawn_executor_process(&invocation, Some(&format!("agent:{executor_id}")))
-            .map_err(|e| PoolError::Bind(format!("spawn executor: {e}")))?;
+    // 模式标记（中继模式）由调用点显式追加，不做「预置参数列表」传递。
+    let invocation = executor.clone();
+    let (pair, mut child, child_side) = spawn_executor_process(
+        &invocation,
+        Some(&format!("agent:{executor_id}")),
+        &["--remote-relay"],
+    )
+    .map_err(|e| PoolError::Bind(format!("spawn executor: {e}")))?;
     drop(child_side);
     let mut transport = FrameTransport::spawn(pair, 64);
     let hello = tokio::time::timeout(

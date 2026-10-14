@@ -178,8 +178,31 @@ pub struct RemoteExecutionConfig {
     pub attach_timeout_ms: u64,
     /// WSS 接入监听地址（T13，代理终止 TLS 场景的附加承载）；缺省关闭。
     pub wss_addr: Option<String>,
-    /// WSS 共享令牌（与 `x-flow-agent-id` 一起做显式认证映射）。
-    pub agent_token: Option<String>,
+    /// WSS 接入的 agent 凭据映射表（`[[execution.remote.agents]]`）：
+    /// token → agent_id 显式映射，身份由凭证反查，客户端自报头只做
+    /// 一致性断言。与 wss_addr 成对配置（认证不可留空）。
+    #[serde(default)]
+    pub agents: Vec<AgentCredential>,
+}
+
+/// WSS 接入的 agent 凭据（映射表一项）。任何单一凭证只能取得一个
+/// agent 身份；id 与 token 在表内都不得重复。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentCredential {
+    /// agent 身份（会话注册键，对应 x-flow-agent-id 一致性断言）。
+    pub id: String,
+    /// 该 agent 的接入令牌（不共享）。
+    pub token: String,
+}
+
+impl Default for AgentCredential {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            token: String::new(),
+        }
+    }
 }
 
 impl Default for RemoteExecutionConfig {
@@ -192,7 +215,7 @@ impl Default for RemoteExecutionConfig {
             key: PathBuf::new(),
             attach_timeout_ms: 120_000,
             wss_addr: None,
-            agent_token: None,
+            agents: Vec::new(),
         }
     }
 }
@@ -214,7 +237,8 @@ pub struct AgentConfig {
     pub slots: u32,
     /// WSS 上联地址（T13，代理终止 TLS 场景）；设置后优先于 mTLS 直连。
     pub wss_url: Option<String>,
-    /// WSS 共享令牌（与 agent_id 一起做显式认证映射）。
+    /// WSS 接入令牌：本 agent 的凭证，master 侧按 token→agent_id 映射表
+    /// 反查身份（`x-flow-agent-id` 头只做一致性断言）。
     pub token: Option<String>,
 }
 
@@ -421,12 +445,39 @@ impl Config {
             if remote.control_addr.is_empty() {
                 return Err("execution.remote.control_addr 不能为空".into());
             }
-            // T13：WSS 监听地址与共享令牌必须成对配置（认证不能留空）。
-            if remote.wss_addr.is_some() != remote.agent_token.is_some() {
+            // T13：WSS 监听地址与凭据映射表必须成对配置（认证不能留空）。
+            if remote.wss_addr.is_some() != !remote.agents.is_empty() {
                 return Err(
-                    "execution.remote.wss_addr 与 agent_token 必须同时配置（WSS 认证不可留空）"
+                    "execution.remote.wss_addr 与 agents 必须同时配置（WSS 认证不可留空）"
                         .into(),
                 );
+            }
+            // 凭据表的硬约束：id/token 非空、各自唯一——token→身份必须
+            // 一对一，否则同一凭证能取得多个身份。
+            let mut ids = std::collections::BTreeSet::new();
+            let mut tokens = std::collections::BTreeSet::new();
+            for agent in &remote.agents {
+                if agent.id.is_empty() || agent.id.len() > 128 {
+                    return Err("execution.remote.agents[].id 必须非空且不超过 128 字节".into());
+                }
+                if agent.token.is_empty() {
+                    return Err(format!(
+                        "execution.remote.agents[].token 不能为空（agent {}）",
+                        agent.id
+                    ));
+                }
+                if !ids.insert(agent.id.clone()) {
+                    return Err(format!(
+                        "execution.remote.agents 重复的 agent id：{}",
+                        agent.id
+                    ));
+                }
+                if !tokens.insert(agent.token.clone()) {
+                    return Err(format!(
+                        "execution.remote.agents 重复的 token（agent {}）：token→身份必须一对一",
+                        agent.id
+                    ));
+                }
             }
             if remote.ca_cert.as_os_str().is_empty()
                 || remote.cert.as_os_str().is_empty()
@@ -806,19 +857,37 @@ data_dir = "/var/lib/flow/journal"
     }
 
     #[test]
-    fn wss_requires_addr_and_token_together() {
-        // T13：WSS 监听与共享令牌成对；单边配置必须报错。
+    fn wss_requires_addr_and_credentials_together() {
+        // T13：WSS 监听与凭据映射表成对；单边配置必须报错。
         let base = "[execution.remote]\ncontrol_addr = \"127.0.0.1:1\"\nca_cert = \"a\"\ncert = \"b\"\nkey = \"c\"\n";
         let only_addr =
             toml::from_str::<Config>(&format!("{base}wss_addr = \"127.0.0.1:2\"\n")).unwrap();
         assert!(only_addr.validate().is_err());
-        let only_token = toml::from_str::<Config>(&format!("{base}agent_token = \"t\"\n")).unwrap();
-        assert!(only_token.validate().is_err());
+        let only_credential = toml::from_str::<Config>(&format!(
+            "{base}[[execution.remote.agents]]\nid = \"agent-1\"\ntoken = \"t\"\n"
+        ))
+        .unwrap();
+        assert!(only_credential.validate().is_err());
         let both = toml::from_str::<Config>(&format!(
-            "{base}wss_addr = \"127.0.0.1:2\"\nagent_token = \"t\"\n"
+            "{base}wss_addr = \"127.0.0.1:2\"\n[[execution.remote.agents]]\nid = \"agent-1\"\ntoken = \"t\"\n"
         ))
         .unwrap();
         assert!(both.validate().is_ok());
+        // token→身份必须一对一：重复 token / 重复 id 都在配置期报错。
+        let duplicate_token = toml::from_str::<Config>(&format!(
+            "{base}wss_addr = \"127.0.0.1:2\"\n\
+             [[execution.remote.agents]]\nid = \"agent-1\"\ntoken = \"t\"\n\
+             [[execution.remote.agents]]\nid = \"agent-2\"\ntoken = \"t\"\n"
+        ))
+        .unwrap();
+        assert!(duplicate_token.validate().is_err());
+        let duplicate_id = toml::from_str::<Config>(&format!(
+            "{base}wss_addr = \"127.0.0.1:2\"\n\
+             [[execution.remote.agents]]\nid = \"agent-1\"\ntoken = \"t1\"\n\
+             [[execution.remote.agents]]\nid = \"agent-1\"\ntoken = \"t2\"\n"
+        ))
+        .unwrap();
+        assert!(duplicate_id.validate().is_err());
     }
 
     #[test]

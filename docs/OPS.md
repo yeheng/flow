@@ -108,8 +108,10 @@ ca_cert = "..."                   # 三者都不能为空
 cert = "..."
 key = "..."
 attach_timeout_ms = 120000
-wss_addr = null                   # 代理终止 TLS 场景；与 agent_token 成对
-agent_token = null
+wss_addr = null                   # 代理终止 TLS 场景；与 [[execution.remote.agents]] 成对
+# [[execution.remote.agents]]      # token → agent_id 映射表（每 agent 一张凭证，不共享）
+# id = "agent-01"
+# token = "…"                      # id/token 在表内都不得重复（token→身份必须一对一）
 # data_addr 已废弃：值被忽略，仅为存量配置兼容保留
 #   （上联自 v4 单流化起只有一条连接，v5 延续；不存在独立的 data 通道）
 
@@ -194,7 +196,8 @@ dist/journal/run-server.sh
 | `mode=remote` 但缺 `[execution.remote]` | `execution.mode=remote 时必须配置 [execution.remote]` |
 | `mode=in_process` | `execution.mode=in_process 已删除：本地执行只有 ipc` |
 | `x_max` 越界 | `execution.x_max 必须在 1..=16` |
-| WSS 只配了一半 | `wss_addr 与 agent_token 必须同时配置` |
+| WSS 只配了一半 | `wss_addr 与 agents 必须同时配置` |
+| 凭据表重复 id/token | `execution.remote.agents 重复的 agent id：…` / `…重复的 token…` |
 
 ---
 
@@ -213,8 +216,9 @@ flow-agent \
 - **证书 CN 必须与 `--agent-id` 一致**，否则握手被拒。
 - agent 侧能力目录必须是 `[relay, resource_report, reconnect]` 的超集。
 - `flow-executor` 同样要在 agent 同目录（或用 `--executor-bin` / `FLOW_EXECUTOR_BIN`）。
-- WSS 场景（代理终止 TLS）：`--wss-url wss://... --token <共享令牌>`，
-  此时 `agent_id` 与 token 一起做显式认证映射。
+- WSS 场景（代理终止 TLS）：`--wss-url wss://... --token <本 agent 的令牌>`；
+  master 侧按 `[[execution.remote.agents]]` 的 token→agent_id 映射表反查身份，
+  自报的 `x-flow-agent-id` 头只做一致性断言（不匹配即 401）。
 
 **优先级**：`CLI flag > env > flow.toml [agent] > 报错`。
 `--data-addr` 已废弃——上联自 v4 单流化起就是单条 TLS 连接（v5 延续），该参数被
@@ -476,19 +480,16 @@ flow-journal-dev import-legacy --source <v1 数据目录> --database <v1 sqlite>
 
 ### 9.2 协议版本
 
-`PROTOCOL_VERSION = 5`（v5 postcard 单流帧：`u32 body_len | postcard(Message)`）。
-**master 与 executor 必须同版本**——握手 `Hello`/`Welcome` 的 `version` 字段不符
-直接失败，不协商、不降级、不逐帧校验（v5 起版本门集中在握手）。
+`PROTOCOL_VERSION = 6`（postcard 单流帧：`u32 body_len | postcard(Message)`）。
+**master 与 executor/agent 必须同版本**——执行器握手 `Hello`/`Welcome` 与
+agent 上联握手 `AgentHello`/`AgentWelcome` 的 `version` 字段不符直接失败，
+不协商、不降级、不逐帧校验（版本门集中在握手）。postcard 的变体索引是
+位置编码，没有版本门的跨版本配对会静默错解成另一个消息类型。
 
 改 `flow-engine/src/execution_protocol/contract.rs` 的任何常量都构成协议变更，
 必须 bump `PROTOCOL_VERSION`。升级 = **同批替换全部二进制**
 （`flow-journal-server` + `flow-executor` + `flow-agent`）。
-
-> **在途状态（2026-10-13）**：工作区正在做 IPC8（v4 → v5）。该目录当前有未提交
-> 改动且 `cargo build -p flow-engine` 不过（错误全在 `execution_protocol/`）；
-> pristine HEAD 可编译且是 v4。**在 IPC8 落地前不要跨版本混布二进制**——v4 与 v5
-> 的帧格式不兼容（JSON 信封 vs postcard），握手层会拒绝，但那之前连接可能已因
-> 帧解析失败而中断。
+v5（无 agent 上联版本门）与 v6 握手不兼容，两端都会在握手处显式拒绝。
 
 ### 9.3 升级步骤
 

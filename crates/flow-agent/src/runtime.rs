@@ -16,9 +16,13 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use flow_engine::execution_protocol::contract::bounded_control_text;
-use flow_engine::execution_protocol::contract::{ExecutorInvocation, DRAIN_GRACE_MS};
+use flow_engine::execution_protocol::contract::{
+    ExecutorInvocation, DRAIN_GRACE_MS, PROTOCOL_VERSION,
+};
 use flow_engine::execution_protocol::message::Message;
-use flow_engine::execution_protocol::remote::{ResumeAction, ResumeItem, RESUME_PAGE_MAX};
+use flow_engine::execution_protocol::remote::{
+    ResumeAction, ResumeItem, ResumeState, RESUME_PAGE_MAX,
+};
 use flow_engine::execution_protocol::transport::FrameTransport;
 
 use crate::pool::{self, ExecutorHandle};
@@ -36,7 +40,8 @@ pub struct AgentConfig {
     pub slots: u32,
     /// WSS 上联地址（T13，代理终止 TLS 场景）；设置后优先于 mTLS 直连。
     pub wss_url: Option<String>,
-    /// WSS 共享令牌（与 `x-flow-agent-id` 一起做显式认证映射）。
+    /// WSS 接入令牌：本 agent 的凭证，master 侧按 token→agent_id 映射表
+    /// 反查身份（自报的 x-flow-agent-id 头只做一致性断言）。
     pub token: Option<String>,
 }
 
@@ -167,6 +172,8 @@ async fn connect_wss(
         .into_client_request()
         .map_err(|e| format!("wss request: {e}"))?;
     let headers = request.headers_mut();
+    // 自报身份头只做一致性断言（master 由 token 反查身份）：声明了就
+    // 必须与凭证对应的身份一致，否则 401。带上它便于代理/网关排障。
     headers.insert(
         "x-flow-agent-id",
         config
@@ -202,15 +209,15 @@ async fn handshake(
     config: &AgentConfig,
     agent_boot_id: &str,
 ) -> std::result::Result<(FrameTransport, String, String, u64, u64), String> {
-    let hello = Message::AgentHello {
-        agent_boot_id: agent_boot_id.to_string(),
-        build: crate::AGENT_BUILD.into(),
-        capabilities: crate::AGENT_CAPABILITIES
+    let hello = Message::agent_hello(
+        agent_boot_id,
+        crate::AGENT_BUILD,
+        crate::AGENT_CAPABILITIES
             .iter()
             .map(|s| s.to_string())
             .collect(),
-        slots: config.slots,
-    };
+        config.slots,
+    );
     transport
         .send(hello)
         .await
@@ -223,6 +230,7 @@ async fn handshake(
     .map_err(|_| "welcome timeout".to_string())?
     .map_err(|e| format!("read welcome: {e}"))?;
     let Message::AgentWelcome {
+        version,
         journal_id,
         master_epoch,
         link_session_id,
@@ -232,6 +240,13 @@ async fn handshake(
     else {
         return Err("expected AgentWelcome".into());
     };
+    // 版本门：postcard 变体索引是位置编码，跨版本配对会静默错解成
+    // 另一个消息类型——握手处显式拒绝（不降级、不留兼容垫片）。
+    if version != PROTOCOL_VERSION {
+        return Err(format!(
+            "master protocol version {version} not supported (agent speaks {PROTOCOL_VERSION})"
+        ));
+    }
     Ok((
         transport,
         link_session_id,
@@ -266,9 +281,9 @@ pub async fn resume(
                     dispatch_id: dispatch.clone(),
                     executor_boot_id: handle.executor_boot_id.clone(),
                     state: if result.is_some() {
-                        "result_ready".into()
+                        ResumeState::ResultReady
                     } else {
-                        "executing".into()
+                        ResumeState::Executing
                     },
                     durable_audit_seq: handle.last_acked.load(Ordering::Relaxed),
                     result_id: result.as_ref().map(|(id, _)| id.clone()),
@@ -810,15 +825,15 @@ pub async fn reconnect_session(
 ) -> (String, String) {
     // 握手（与二进制 connect 相同序列）。
     if transport
-        .send(Message::AgentHello {
-            agent_boot_id: agent_boot_id.to_string(),
-            build: crate::AGENT_BUILD.into(),
-            capabilities: crate::AGENT_CAPABILITIES
+        .send(Message::agent_hello(
+            agent_boot_id,
+            crate::AGENT_BUILD,
+            crate::AGENT_CAPABILITIES
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
             slots,
-        })
+        ))
         .await
         .is_err()
     {
@@ -835,6 +850,7 @@ pub async fn reconnect_session(
         }
     };
     let Message::AgentWelcome {
+        version,
         journal_id,
         master_epoch,
         link_session_id,
@@ -844,6 +860,15 @@ pub async fn reconnect_session(
     else {
         return (String::new(), "expected welcome".into());
     };
+    // 版本门（与握手路径同规则）：不匹配即拒绝。
+    if version != PROTOCOL_VERSION {
+        return (
+            String::new(),
+            format!(
+                "master protocol version {version} not supported (agent speaks {PROTOCOL_VERSION})"
+            ),
+        );
+    }
     let relay = Arc::new(parking_lot::Mutex::new(Relay::new(
         config.agent_id.clone(),
         agent_boot_id.to_string(),

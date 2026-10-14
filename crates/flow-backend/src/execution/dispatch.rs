@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use crate::journal::JournalBackend;
 use crate::journal_execution::Attempt;
 use flow_engine::execution_protocol::contract::{DURABLE_WAIT_TIMEOUT_MS, TRANSFER_CHUNK_BYTES};
-use flow_engine::execution_protocol::message::{Message, ResultOutcome};
+use flow_engine::execution_protocol::message::{Message, ResultOutcome, WaitKind as WaitRequestKind};
 use flow_engine::execution_protocol::record_bytes;
 use flow_engine::execution_protocol::TransferKey;
 use flow_engine::journal_state::{Prepared, Run, RunStatus, Wait, WaitKind};
@@ -867,13 +867,13 @@ impl DispatchRunner {
                 }
             }
             ResultOutcome::Wait { wait } => {
-                // wire 的 WaitRequest.kind 是字符串（冻结契约）；在这里一次性
-                // 解析进词汇表 enum，之后不再有裸字符串比对。
-                let kind = match wait.kind.as_str() {
-                    "delay" => WaitKind::Delay,
-                    "signal" => WaitKind::Signal,
-                    "child" => WaitKind::Child,
-                    other => return Err(invalid(format!("unknown wait kind {other}"))),
+                // wire 的 WaitRequest.kind 是闭集枚举（postcard 变体索引，
+                // 非法变体在解码层即拒）；这里映射进 journal 词汇表，
+                // 不再有裸字符串比对。
+                let kind = match wait.kind {
+                    WaitRequestKind::Delay => WaitKind::Delay,
+                    WaitRequestKind::Signal => WaitKind::Signal,
+                    WaitRequestKind::Child => WaitKind::Child,
                 };
                 match kind {
                     WaitKind::Delay | WaitKind::Signal => {

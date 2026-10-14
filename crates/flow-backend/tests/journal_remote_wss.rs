@@ -2,7 +2,8 @@
 //!
 //! - 真实 flow-agent 进程经 WSS（代理承载模拟：明文 TCP + token 认证）
 //!   上联并跑通业务（执行器 → 中继 → 权威日志）。
-//! - 认证拒绝：缺/错 token、缺 agent 身份头。
+//! - 认证：身份由 token→agent_id 映射表决定，自报 header 只做一致性
+//!   断言（错/缺 token、持 A 凭证声明 B 身份、伪造 header 冒充都拒绝）。
 //! - Text 消息拒绝：认证通过后发 Text，会话必须拒绝关闭。
 
 use flow_backend::journal::JournalBackend;
@@ -38,7 +39,7 @@ fn plain_remote_options() -> flow_backend::execution::remote::RemoteOptions {
         server_key: "unused".into(),
         attach_timeout_ms: 10_000,
         wss_addr: None,
-        agent_token: None,
+        wss_agents: Vec::new(),
     }
 }
 
@@ -133,7 +134,13 @@ async fn wss_agent_end_to_end_business() {
         .await
         .unwrap();
     manager
-        .listen_wss(format!("127.0.0.1:{}", ports[0]), "wss-secret".into())
+        .listen_wss(
+            format!("127.0.0.1:{}", ports[0]),
+            vec![flow_backend::execution::remote::AgentCredential {
+                id: "agent-wss-1".into(),
+                token: "wss-secret".into(),
+            }],
+        )
         .await
         .unwrap();
     let mut agent = spawn_agent_wss(ports[0], "agent-wss-1", 2, "wss-secret");
@@ -170,8 +177,10 @@ async fn wss_agent_end_to_end_business() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// W1：WSS 身份由 token→agent_id 映射表决定，客户端自报 header 只做
+/// 一致性断言——任何单一凭证只能取得一个 agent 身份，冒充进不了门。
 #[tokio::test]
-async fn wss_rejects_bad_or_missing_credentials() {
+async fn wss_identity_comes_from_token_not_client_header() {
     let root = temp();
     std::fs::create_dir_all(&root).unwrap();
     let ports = free_ports(1);
@@ -188,7 +197,19 @@ async fn wss_rejects_bad_or_missing_credentials() {
         .await
         .unwrap();
     manager
-        .listen_wss(format!("127.0.0.1:{}", ports[0]), "right-token".into())
+        .listen_wss(
+            format!("127.0.0.1:{}", ports[0]),
+            vec![
+                flow_backend::execution::remote::AgentCredential {
+                    id: "agent-a".into(),
+                    token: "token-a".into(),
+                },
+                flow_backend::execution::remote::AgentCredential {
+                    id: "agent-b".into(),
+                    token: "token-b".into(),
+                },
+            ],
+        )
         .await
         .unwrap();
     let url = format!("ws://127.0.0.1:{}/ws/agent", ports[0]);
@@ -211,14 +232,17 @@ async fn wss_rejects_bad_or_missing_credentials() {
         }
     };
 
-    // 错 token → 拒绝。
-    assert!(attempt(Some("wrong"), Some("agent-x")).await.is_err());
-    // 缺 token → 拒绝。
-    assert!(attempt(None, Some("agent-x")).await.is_err());
-    // 缺身份头 → 拒绝。
-    assert!(attempt(Some("right-token"), None).await.is_err());
-    // 正确凭据 → 通过握手（随后会话等待 AgentHello，但握手本身成功）。
-    assert!(attempt(Some("right-token"), Some("agent-ok")).await.is_ok());
+    // 错 token / 缺 token → 拒绝。
+    assert!(attempt(Some("wrong"), Some("agent-a")).await.is_err());
+    assert!(attempt(None, Some("agent-a")).await.is_err());
+    // 持 A 凭证声明 B 身份 → 拒绝（自报 header 降级为一致性断言）。
+    assert!(attempt(Some("token-a"), Some("agent-b")).await.is_err());
+    // 伪造 header 冒充他 agent（token 对不上）→ 拒绝。
+    assert!(attempt(Some("token-b"), Some("agent-a")).await.is_err());
+    // 正确凭证 + 一致声明 → 通过。
+    assert!(attempt(Some("token-a"), Some("agent-a")).await.is_ok());
+    // 正确凭证 + 不声明 → 身份由凭证反查，照样通过。
+    assert!(attempt(Some("token-b"), None).await.is_ok());
 
     manager.shutdown().await;
     backend.close().await.unwrap();
@@ -244,7 +268,13 @@ async fn wss_rejects_text_messages() {
         .await
         .unwrap();
     manager
-        .listen_wss(format!("127.0.0.1:{}", ports[0]), "tok".into())
+        .listen_wss(
+            format!("127.0.0.1:{}", ports[0]),
+            vec![flow_backend::execution::remote::AgentCredential {
+                id: "agent-text".into(),
+                token: "tok".into(),
+            }],
+        )
         .await
         .unwrap();
 

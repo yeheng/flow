@@ -39,6 +39,16 @@ x_max = 4
 # cert = "/etc/flow/server.pem"
 # key = "/etc/flow/server.key"
 # attach_timeout_ms = 120000
+# WSS 接入（T13，代理终止 TLS 场景的附加承载）：与凭据映射表成对配置。
+# wss_addr = "0.0.0.0:9710"
+# 身份由 token 反查 agent_id（每 agent 一张凭证，不共享）；客户端自报的
+# x-flow-agent-id 头只做一致性断言。id 与 token 在表内都不得重复。
+# [[execution.remote.agents]]
+# id = "agent-1"
+# token = "agent-1 的接入令牌"
+# [[execution.remote.agents]]
+# id = "agent-2"
+# token = "agent-2 的接入令牌"
 
 # `flow-agent` 的部署参数（原先只能 CLI 参数 / 环境变量；CLI flag 仍可逐项覆盖）
 # [agent]
@@ -51,7 +61,7 @@ x_max = 4
 # slots = 4
 # WSS 上联（T13，反向代理终止 TLS 场景）；设置后优先于 mTLS 直连，证书可省。
 # wss_url = "ws://127.0.0.1:9710/ws/agent"
-# token = "共享令牌（FLOW_AGENT_TOKEN）"
+# token = "本 agent 的接入令牌（FLOW_AGENT_TOKEN）；master 按 token→agent_id 映射表反查身份"
 
 # `flow-journal-server`（JSONL v2 产品服务）；token 仍是环境变量 FLOW_JOURNAL_TOKEN（凭据不进配置文件）
 # [journal]

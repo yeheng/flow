@@ -1,4 +1,4 @@
-//! 冻结的本地 IPC 契约（v4 单流）。
+//! 冻结的 IPC 契约（单流 postcard 帧）。
 //!
 //! 这些常量是协议冻结面：主进程与执行器实现都必须在同一组上限内工作，
 //! 任何一方都不允许在握手之外重新协商硬上限。修改本文件即构成协议版本
@@ -13,10 +13,14 @@
 //! 在飞 run 状态数上限（`R_MAX`）是主进程状态内存约束、不是协议量，其
 //! 唯一定义与执行点在 `flow-backend`（`journal.rs::R_MAX`）。
 
-/// IPC 协议版本。v5 = 单流帧 `u32 body_len | postcard(Message)`（IPC8：
-/// v4 的 JSON 信封、三种帧 kind、十进制字符串与 Channel 概念均已删除；
-/// 版本门集中在握手 Hello/Welcome 的 version 字段）。
-pub const PROTOCOL_VERSION: u32 = 5;
+/// IPC/上联协议版本。单流帧 `u32 body_len | postcard(Message)`：旧版 JSON
+/// 信封、三种帧 kind、十进制字符串与 Channel 概念均已删除。版本门集中在
+/// 握手的 version 字段——执行器侧 Hello/Welcome 与 agent 上联侧
+/// AgentHello/AgentWelcome 都必须携带并校验它。postcard 的变体索引是位置
+/// 编码，跨版本配对会静默错解成另一个消息类型，没有版本门的网络侧握手
+/// 等于把「未定义但不报错」留给部署。v6 = 上联握手补上版本门（旧 agent
+/// 无法安全共存，不提供兼容垫片）。
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// control 通道单帧上限（不含 4 字节长度头）。握手
 /// 只可协商到本上限以内。
@@ -45,7 +49,9 @@ pub fn bounded_control_text(mut text: String) -> String {
     text
 }
 
-/// data 通道单帧 JSON 上限（不含 4 字节长度头）。
+/// 单帧 body 上限（不含 4 字节长度头）：data 语义消息（TransferChunk /
+/// AuditBatch / ObservabilityBatch / Routed）按此预算，control 语义消息
+/// 收紧到 [`CONTROL_MAX_FRAME`]。
 pub const DATA_MAX_FRAME: usize = 1024 * 1024;
 
 /// 执行槽位数 X_max 默认值（可配置 1..=16）。每进程一个任务；常驻内存
@@ -102,15 +108,14 @@ pub const DURABLE_WAIT_TIMEOUT_MS: u64 = 120_000;
 /// 主进程（flow-journal-server / flow-agent）缺省在自身同目录定位该名字的兄弟文件。
 pub const EXECUTOR_BIN_NAME: &str = "flow-executor";
 
-/// 执行器进程召唤描述：程序路径 + 前导参数。
+/// 执行器进程召唤描述：程序路径。
 ///
-/// 执行器是独立二进制，prefix 恒为空（字段保留：spawn_executor_process 的
-/// 命令行构造契约是 program + prefix + 诊断标记；执行器侧忽略未知参数，
-/// `--tag` 等标记始终追加在前导参数之后）。
+/// 执行器是独立二进制，召唤只带程序路径；模式/诊断标记（`--remote-relay`、
+/// `--tag`、`--channel-fd`）由 spawn 入口按调用点显式追加，不做「预置参数
+/// 列表」的隐式传递。
 #[derive(Debug, Clone)]
 pub struct ExecutorInvocation {
     pub program: std::path::PathBuf,
-    pub prefix: Vec<String>,
 }
 
 impl ExecutorInvocation {
@@ -118,7 +123,6 @@ impl ExecutorInvocation {
     pub fn explicit(bin: impl Into<std::path::PathBuf>) -> Self {
         Self {
             program: bin.into(),
-            prefix: Vec::new(),
         }
     }
 

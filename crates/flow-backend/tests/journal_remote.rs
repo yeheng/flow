@@ -35,7 +35,7 @@ fn remote_options() -> flow_backend::execution::remote::RemoteOptions {
         server_key: "unused".into(),
         attach_timeout_ms: 30_000,
         wss_addr: None,
-        agent_token: None,
+        wss_agents: Vec::new(),
     }
 }
 
@@ -69,7 +69,8 @@ async fn spawn_simulated_agent(
         let boot = flow_engine::execution_protocol::transport::fresh_boot_id();
         transport
             .send(flow_engine::execution_protocol::Message::AgentHello {
-                agent_boot_id: boot.clone(),
+
+                    version: flow_engine::execution_protocol::PROTOCOL_VERSION,agent_boot_id: boot.clone(),
                 build: "sim".into(),
                 capabilities: vec!["relay".into(), "resource_report".into(), "reconnect".into()],
                 slots,
@@ -83,7 +84,8 @@ async fn spawn_simulated_agent(
             }
         };
         let flow_engine::execution_protocol::Message::AgentWelcome {
-            journal_id,
+
+                version: flow_engine::execution_protocol::PROTOCOL_VERSION,journal_id,
             master_epoch,
             link_session_id,
             ..
@@ -288,7 +290,8 @@ async fn wrong_route_frames_never_reach_authority() {
     let mut transport = FrameTransport::spawn(control_b, 16);
     transport
         .send(Message::AgentHello {
-            agent_boot_id: "boot-evil".into(),
+
+                version: flow_engine::execution_protocol::PROTOCOL_VERSION,agent_boot_id: "boot-evil".into(),
             build: "t".into(),
             capabilities: vec!["relay".into(), "resource_report".into(), "reconnect".into()],
             slots: 2,
@@ -352,7 +355,8 @@ fn relay_cannot_wrap_authoritative_control_frames() {
     relay.bind("d", "exec", "eboot");
     for forbidden in [
         Message::AgentHello {
-            agent_boot_id: "x".into(),
+
+                version: flow_engine::execution_protocol::PROTOCOL_VERSION,agent_boot_id: "x".into(),
             build: "x".into(),
             capabilities: vec![],
             slots: 1,
@@ -366,7 +370,8 @@ fn relay_cannot_wrap_authoritative_control_frames() {
     // 已被 routable() 拒绝。
     use flow_engine::execution_protocol::remote::routable;
     assert!(!routable(&Message::AgentWelcome {
-        journal_id: "j".into(),
+
+            version: flow_engine::execution_protocol::PROTOCOL_VERSION,journal_id: "j".into(),
         master_epoch: 1,
         link_session_id: "l".into(),
         agent_id: "a".into(),

@@ -81,7 +81,7 @@ fn remote_options(
         server_key: dir.join("server.key"),
         attach_timeout_ms: 10_000,
         wss_addr: None,
-        agent_token: None,
+        wss_agents: Vec::new(),
     }
 }
 
@@ -292,7 +292,8 @@ async fn unexpected_session_frame_rejected_and_single_cancel_keeps_uplink() {
         .await;
     // AgentHello 裸帧（与 flow-agent 上联同格式）。
     let hello = Message::AgentHello {
-        agent_boot_id: "boot-bad".into(),
+
+            version: flow_engine::execution_protocol::PROTOCOL_VERSION,agent_boot_id: "boot-bad".into(),
         build: "t".into(),
         capabilities: vec!["relay".into(), "resource_report".into(), "reconnect".into()],
         slots: 1,
@@ -311,7 +312,8 @@ async fn unexpected_session_frame_rejected_and_single_cancel_keeps_uplink() {
         if let Some(message) = decoder.pop().unwrap() {
             match message {
                 Message::AgentWelcome {
-                    link_session_id, ..
+
+                        version: flow_engine::execution_protocol::PROTOCOL_VERSION,link_session_id, ..
                 } => break link_session_id,
                 other => panic!("expected AgentWelcome, got {}", other.type_name()),
             }
@@ -436,7 +438,8 @@ async fn coalesced_hello_and_trailing_frame_not_lost_by_master() {
         .attach_inprocess("agent-coal".to_string(), control_a)
         .await;
     let hello = Message::AgentHello {
-        agent_boot_id: "boot-coal".into(),
+
+            version: flow_engine::execution_protocol::PROTOCOL_VERSION,agent_boot_id: "boot-coal".into(),
         build: "t".into(),
         capabilities: vec!["relay".into(), "resource_report".into(), "reconnect".into()],
         slots: 1,
@@ -523,7 +526,8 @@ async fn coalesced_welcome_and_trailing_frame_not_lost_by_agent() {
         }
         // 关键：Welcome + 目录外变体帧拼接后单次写回。
         let welcome = encode_frame(&Message::AgentWelcome {
-            journal_id: "journal-wc".into(),
+
+                version: flow_engine::execution_protocol::PROTOCOL_VERSION,journal_id: "journal-wc".into(),
             master_epoch: 1,
             link_session_id: "link-wc".into(),
             agent_id: "agent-wc".into(),

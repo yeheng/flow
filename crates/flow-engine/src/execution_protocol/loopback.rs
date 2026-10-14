@@ -1,4 +1,4 @@
-//! 回连承载：本地 socket（IPC7，替代 v4 的 TCP loopback）。
+//! 回连承载：本地 socket（IPC7，替代旧版 TCP loopback）。
 //!
 //! socketpair + pre_exec FD 传递是 unix 专属（见 [`super::spawn`]）；其余
 //! 平台（Windows named pipe）与本模块自身的测试路径用「父进程先建
@@ -11,6 +11,11 @@
 //! 名字按平台选择：Windows 用 namespaced（named pipe 名）；unix 用文件
 //! 系统 socket 路径（仅测试/回退路径——生产 unix 本地执行走 socketpair，
 //! 不经过本模块）。承载类型与名字类型由 interprocess 统一。
+//!
+//! unix socket 文件的收尾：interprocess 的 Listener drop 已实现名字回收
+//!（drop 时 `remove_file`，见其「Name reclamation」文档），进程不崩溃就
+//! 不会在临时目录累积 `.sock`；崩溃残留需人工清（随机后缀防撞名）。
+//! 本模块的测试断言 spawn 返回后路径已不存在。
 
 use std::time::Duration;
 
@@ -62,6 +67,8 @@ fn parse_local_name(addr: &str) -> std::io::Result<interprocess::local_socket::N
 }
 
 /// spawn 一个执行器进程并等它回连出单通道。返回 (通道, 子进程句柄)。
+/// `extra_args` 为调用点显式指定的模式/标记参数（见
+/// [`super::spawn::spawn_executor_process`]）。
 ///
 /// 与 [`super::spawn::spawn_executor_process`] 同一套环境隔离规则：
 /// env_clear 后只回填 RUST_LOG、回连名与会话令牌；stdout/stderr 不
@@ -70,13 +77,25 @@ pub async fn spawn_executor_loopback(
     executor: &ExecutorInvocation,
     tag: Option<&str>,
     session_token: String,
+    extra_args: &[&str],
 ) -> std::io::Result<(Stream, Child)> {
     let addr = fresh_local_name();
+    spawn_executor_loopback_at(&addr, executor, tag, session_token, extra_args).await
+}
+
+/// 指定回连名的 spawn（测试用：名字已知才能断言 socket 文件收尾）。
+async fn spawn_executor_loopback_at(
+    addr: &str,
+    executor: &ExecutorInvocation,
+    tag: Option<&str>,
+    session_token: String,
+    extra_args: &[&str],
+) -> std::io::Result<(Stream, Child)> {
     let listener = ListenerOptions::new()
-        .name(parse_local_name(&addr)?)
+        .name(parse_local_name(addr)?)
         .create_tokio()?;
     let mut command = Command::new(&executor.program);
-    command.args(&executor.prefix);
+    command.args(extra_args);
     if let Some(tag) = tag {
         command.arg("--tag").arg(tag);
     }
@@ -89,7 +108,7 @@ pub async fn spawn_executor_loopback(
     if let Some(log) = std::env::var_os("RUST_LOG") {
         command.env("RUST_LOG", log);
     }
-    command.env(CONNECT_ADDR_ENV, &addr);
+    command.env(CONNECT_ADDR_ENV, addr);
     command.env(SESSION_TOKEN_ENV, &session_token);
     let mut child = command.spawn()?;
     // 单连接即整条会话；执行器起不来（缺二进制/秒退）时靠超时收口。
@@ -148,7 +167,7 @@ mod tests {
             .expect("parent runtime");
         runtime.block_on(async {
             let (mut channel, mut child) =
-                spawn_executor_loopback(&executor, None, "test-session-token".into())
+                spawn_executor_loopback(&executor, None, "test-session-token".into(), &[])
                     .await
                     .expect("spawn");
             assert!(child.id().is_some(), "child process handle");
@@ -163,6 +182,54 @@ mod tests {
             let _ = child.start_kill();
             let _ = child.wait().await;
         });
+    }
+
+    /// unix socket 文件不残留：interprocess 的 Listener drop 回收名字
+    ///（drop 时 remove_file）。用已知名字的入口断言「listen 期间路径存在、
+    /// spawn 返回后路径消失」——每次 spawn 留一个文件不是小事。
+    #[cfg(unix)]
+    #[test]
+    fn loopback_socket_file_is_reclaimed_on_drop() {
+        if std::env::var(CONNECT_ADDR_ENV).is_ok() {
+            return;
+        }
+        let unique = super::super::transport::fresh_boot_id();
+        let dir = std::env::temp_dir().join(format!("flow-loop-{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("sock.txt");
+        let exec = script(
+            &dir,
+            &format!(
+                "test -S \"${env}\" && echo present > {marker}\n\
+                 exec python3 -c 'import os,socket; a=os.environ[\"{env}\"]; s=socket.socket(socket.AF_UNIX); s.connect(a); s.close()'",
+                env = CONNECT_ADDR_ENV,
+                marker = marker.display(),
+            ),
+        );
+        let addr = fresh_local_name();
+        let invocation = super::super::contract::ExecutorInvocation::explicit(exec);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (_channel, mut child) =
+                spawn_executor_loopback_at(&addr, &invocation, None, "tok".into(), &[])
+                    .await
+                    .expect("loopback session");
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        });
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap_or_default().trim(),
+            "present",
+            "listen 期间 socket 路径必须存在"
+        );
+        assert!(
+            !std::path::Path::new(&addr).exists(),
+            "spawn 返回后 socket 路径必须被回收"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(unix)]
@@ -198,7 +265,7 @@ mod tests {
             .expect("runtime");
         runtime.block_on(async {
             use tokio::io::AsyncReadExt;
-            let (mut channel, mut child) = spawn_executor_loopback(&invocation, None, "tok".into())
+            let (mut channel, mut child) = spawn_executor_loopback(&invocation, None, "tok".into(), &[])
                 .await
                 .expect("loopback session");
             let mut buf = [0u8; 4];
@@ -234,7 +301,7 @@ mod tests {
         runtime.block_on(async {
             let missing =
                 super::super::contract::ExecutorInvocation::explicit("/nonexistent/flow-executor");
-            assert!(spawn_executor_loopback(&missing, None, "tok".into())
+            assert!(spawn_executor_loopback(&missing, None, "tok".into(), &[])
                 .await
                 .is_err());
         });
@@ -245,7 +312,8 @@ mod tests {
             let exec = script(&dir, "exit 1");
             let invocation = super::super::contract::ExecutorInvocation::explicit(exec);
             let start = std::time::Instant::now();
-            let result = runtime.block_on(spawn_executor_loopback(&invocation, None, "tok".into()));
+            let result =
+                runtime.block_on(spawn_executor_loopback(&invocation, None, "tok".into(), &[]));
             assert!(result.is_err(), "child exit must surface as error");
             assert!(
                 start.elapsed() < Duration::from_secs(20),

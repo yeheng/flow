@@ -203,7 +203,7 @@ async fn spawn_transport(
     #[cfg(unix)]
     {
         let (parent, child, child_pair) =
-            flow_engine::execution_protocol::spawn::spawn_executor_process(executor, tag)
+            flow_engine::execution_protocol::spawn::spawn_executor_process(executor, tag, &[])
                 .map_err(|e| PoolError::Spawn(format!("{}: {e}", executor.program.display())))?;
         // 父进程关闭子端副本（子进程内按 argv 原号持有）。
         drop(child_pair);
@@ -216,6 +216,7 @@ async fn spawn_transport(
             executor,
             tag,
             session_token.clone(),
+            &[],
         )
         .await
         .map_err(|e| PoolError::Spawn(format!("{}: {e}", executor.program.display())))?;

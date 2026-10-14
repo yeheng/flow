@@ -10,7 +10,8 @@ use serde_json::json;
 use super::contract::PROTOCOL_VERSION;
 use super::frame::FRAME_LENGTH_BYTES;
 use super::message::{
-    AuditRecord, ExecuteTask, Message, ObservationLine, ResultOutcome, TaskValue, WaitRequest,
+    AuditRecord, ExecuteTask, Message, ObservationLine, ResultOutcome, TaskValue, WaitKind,
+    WaitRequest,
 };
 
 pub fn value_ref() -> ValueRef {
@@ -156,6 +157,25 @@ pub fn valid_messages() -> Vec<Message> {
         Message::Reject {
             reason: "fixture".into(),
         },
+        // 上联握手样本：与执行器 Hello/Welcome 同样带版本门。
+        Message::agent_hello(
+            "agent-boot-1",
+            "0.1.0-test",
+            super::remote::capability::REQUIRED
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            4,
+        ),
+        Message::AgentWelcome {
+            version: PROTOCOL_VERSION,
+            journal_id: "journal-fixture".into(),
+            master_epoch: 3,
+            link_session_id: "link-1".into(),
+            agent_id: "agent-1".into(),
+            heartbeat_ms: 2000,
+            agent_window_bytes: 2 * 1024 * 1024,
+        },
     ]
 }
 
@@ -167,7 +187,7 @@ pub fn wait_result() -> Message {
         last_audit_seq: 2,
         outcome: ResultOutcome::Wait {
             wait: WaitRequest {
-                kind: "delay".into(),
+                kind: WaitKind::Delay,
                 wake_at: Some(1790000000000),
                 output: Some(StoredValue::Inline(json!({"slept_ms": 100}))),
                 workflow_id: None,
@@ -189,7 +209,7 @@ pub fn failure_result() -> Message {
     }
 }
 
-/// 必须被明确拒绝的损坏帧（v5 对抗样本，字节级）：
+/// 必须被明确拒绝的损坏帧（对抗样本，字节级）：
 /// 变体索引越界、截断的 varint、巨型长度声明、帧体尾随垃圾。
 /// 巨型长度声明必须报错而非分配（postcard 先做边界检查，见 message.rs
 /// 对应单元测试）。

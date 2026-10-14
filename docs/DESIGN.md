@@ -852,12 +852,13 @@ sequenceDiagram
 
     AG->>AM: TLS 连接（客户端证书 CN = agent_id）
     AM->>AM: 校验 CN 与声明的 agent_id 一致
-    AG->>AM: AgentHello{agent_boot_id, build, capabilities, slots}
+    AG->>AM: AgentHello{version, agent_boot_id, build, capabilities, slots}
+    AM->>AM: 校验 version == PROTOCOL_VERSION（不符即 Reject 断链）
     AM->>AM: 校验 capabilities ⊇ [relay, resource_report, reconnect]
     AM->>AM: 校验 agent_id/boot_id 非空且 ≤ IDENTITY_MAX_BYTES(128)
     AM->>AM: 登记 agents[agent_id]（无连接数上限；并发由下面两道闸约束）
     AM->>BE: inspect(journal_id, master_epoch)
-    AM->>AG: AgentWelcome{journal_id, master_epoch, link_session_id, heartbeat_ms}
+    AM->>AG: AgentWelcome{version, journal_id, master_epoch, link_session_id, heartbeat_ms}
     Note over AG,AM: link_session_id 本次上联的唯一标识
 
     loop 运行期

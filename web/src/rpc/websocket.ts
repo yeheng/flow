@@ -8,6 +8,8 @@ interface PendingCall {
   reject: (e: unknown) => void;
   /** 该请求是订阅建立请求：响应 result 是服务端 subscription id */
   localSub?: number;
+  /** 调用超时计时器：悬挂时间有上界，触发时 reject 并清理 pending */
+  timer?: ReturnType<typeof setTimeout>;
 }
 
 interface Subscription {
@@ -17,6 +19,9 @@ interface Subscription {
   /** 本连接上是否已发出过订阅请求：防止「连接未建立时发起订阅」与 onopen 重建叠加成重复订阅 */
   active: boolean;
 }
+
+/** call 的默认调用超时：服务端连接活着但不回时，悬挂时间必须有上界。 */
+export const DEFAULT_CALL_TIMEOUT_MS = 30_000;
 
 /**
  * JSON-RPC 2.0 over WebSocket 客户端，直连 flow-server（协议见 docs/DESIGN.md §9）。
@@ -40,7 +45,10 @@ export class WebSocketClient {
     this.ws = null;
     this.connected.value = false;
     const error = new RpcError(-32000, "RPC client closed");
-    for (const pending of this.pending.values()) pending.reject(error);
+    for (const pending of this.pending.values()) {
+      if (pending.timer !== undefined) clearTimeout(pending.timer);
+      pending.reject(error);
+    }
     this.pending.clear();
     for (const waiter of this.openWaiters.splice(0)) waiter.reject(error);
     this.subs.clear(); this.serverToLocal.clear(); this.reconnectCbs = [];
@@ -66,12 +74,36 @@ export class WebSocketClient {
     return () => { this.reconnectCbs = this.reconnectCbs.filter(item => item !== cb); };
   }
 
-  async call<T>(method: string, params: Record<string, unknown> | unknown[]): Promise<T> {
-    await this.waitOpen();
+  /**
+   * 发起调用。悬挂时间有上界：默认 [`DEFAULT_CALL_TIMEOUT_MS`] 超时（可按
+   * 方法覆盖），超时 reject 并清理 pending——服务端连接活着但不回时不再
+   * 挂到连接断开为止。订阅事件流不设超时（长连接是常态）。
+   */
+  async call<T>(
+    method: string,
+    params: Record<string, unknown> | unknown[],
+    timeoutMs: number = DEFAULT_CALL_TIMEOUT_MS,
+  ): Promise<T> {
     const id = this.nextId++;
     return new Promise<T>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.ws!.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+      const timer = setTimeout(() => {
+        if (!this.pending.delete(id)) return;
+        reject(new RpcError(-32001, `RPC 调用超时（${timeoutMs}ms）：${method}`));
+      }, timeoutMs);
+      this.pending.set(id, { resolve, reject, timer });
+      void this.waitOpen()
+        .then(() => {
+          // 超时/断开已把 pending 清掉的请求不再发出。
+          if (this.pending.has(id)) {
+            this.ws!.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+          }
+        })
+        .catch((e) => {
+          if (this.pending.delete(id)) {
+            clearTimeout(timer);
+            reject(e);
+          }
+        });
     });
   }
 
@@ -158,7 +190,10 @@ export class WebSocketClient {
       this.connected.value = false;
       this.ws = null;
       const err = new RpcError(-32000, "与 flow-server 的连接已断开");
-      for (const p of this.pending.values()) p.reject(err);
+      for (const p of this.pending.values()) {
+        if (p.timer !== undefined) clearTimeout(p.timer);
+        p.reject(err);
+      }
       this.pending.clear();
       for (const w of this.openWaiters.splice(0)) w.reject(err);
       this.reconnectTimer = setTimeout(() => {
@@ -197,6 +232,8 @@ export class WebSocketClient {
     try {
       msg = JSON.parse(raw);
     } catch {
+      // 畸形帧不能静默丢掉：排障时只看到「没反应」是最难查的一类问题。
+      console.warn("[flow-rpc] 无法解析服务端消息（已丢弃）：", raw.slice(0, 200));
       return;
     }
     if (msg.method) {
@@ -207,6 +244,7 @@ export class WebSocketClient {
     const p = this.pending.get(msg.id ?? -1);
     if (!p) return;
     this.pending.delete(msg.id ?? -1);
+    if (p.timer !== undefined) clearTimeout(p.timer);
     if (msg.error) {
       p.reject(new RpcError(msg.error.code, msg.error.message, msg.error.data));
       return;

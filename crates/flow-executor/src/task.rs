@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use flow_engine::execution_protocol::contract::{bounded_control_text, DURABLE_WAIT_TIMEOUT_MS};
 use flow_engine::execution_protocol::message::{
-    ExecuteTask, Message, ResultOutcome, TaskValue, WaitRequest,
+    ExecuteTask, Message, ResultOutcome, TaskValue, WaitKind, WaitRequest,
 };
 use flow_engine::execution_protocol::TransferKey;
 use flow_engine::journal_state::Prepared;
@@ -605,7 +605,7 @@ impl TaskRunner {
                 logger.info(format!("delay {ms}ms，等待至 {wake_at}"));
                 Ok(ResultOutcome::Wait {
                     wait: WaitRequest {
-                        kind: "delay".into(),
+                        kind: WaitKind::Delay,
                         wake_at: Some(wake),
                         output: Some(StoredValue::Inline(json!({"slept_ms": ms}))),
                         workflow_id: None,
@@ -617,7 +617,7 @@ impl TaskRunner {
                 logger.info("等待人工信号（run.signal）");
                 Ok(ResultOutcome::Wait {
                     wait: WaitRequest {
-                        kind: "signal".into(),
+                        kind: WaitKind::Signal,
                         wake_at: None,
                         output: None,
                         workflow_id: None,
@@ -664,7 +664,7 @@ impl TaskRunner {
                 logger.info("输入字段未齐，等待用户填写（run.signal 交付）");
                 Ok(ResultOutcome::Wait {
                     wait: WaitRequest {
-                        kind: "signal".into(),
+                        kind: WaitKind::Signal,
                         wake_at: None,
                         output: None,
                         workflow_id: None,
@@ -681,7 +681,7 @@ impl TaskRunner {
                 logger.info(format!("启动子工作流 {workflow_id}"));
                 Ok(ResultOutcome::Wait {
                     wait: WaitRequest {
-                        kind: "child".into(),
+                        kind: WaitKind::Child,
                         wake_at: None,
                         output: None,
                         workflow_id: Some(workflow_id),

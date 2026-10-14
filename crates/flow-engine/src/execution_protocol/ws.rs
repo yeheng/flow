@@ -1,11 +1,13 @@
-//! WSS 承载（T13）：WebSocket 二进制消息 ↔ v4 单流字节流的适配。
+//! WSS 承载（T13）：WebSocket 二进制消息 ↔ 单流字节流（postcard 帧）的适配。
 //!
 //! - **写**：transport 对整帧调用一次 `write_all` + `flush`，适配器把整帧
 //!   作为**一条** Binary 消息发出（超限时按上限切分，读侧帧解码器自会重组）。
 //! - **读**：Binary 消息字节按需交给上层；半帧/粘帧由 [`super::frame`] 的
 //!   FrameDecoder 处理。Text 明确拒绝；单条消息超限拒绝；Ping 自动回 Pong；
 //!   Close 视作 EOF。
-//! - **有界**：写缓冲与单消息长度均有硬上限（不用无界队列化解背压）。
+//! - **有界**：写缓冲与单消息长度均有硬上限（不用无界队列化解背压）；
+//!   超出单帧写上限是硬错误（[`std::io::ErrorKind::InvalidInput`]），不是
+//!   背压信号——帧上限是硬边界，调用方必须自己切分。
 //!
 //! 该类型是 `FrameTransport` 的字节流承载面：直连 mTLS 与 WSS 复用同一
 //! 传输/握手/会话校验逻辑，WSS 只替换物理承载。
@@ -28,6 +30,10 @@ pub const MAX_WS_MESSAGE_BYTES: usize = 1024 * 1024;
 /// 贴着上限的合法帧会在 WSS 上写失败（WouldBlock）而 TCP 上正常。
 pub const MAX_WS_WRITE_BYTES: usize = 1024 * 1024 + 4 + 64;
 
+/// 待发控制帧（Pong）队列上限：有界，满则丢最旧——Pong 是活性提示，
+/// 不是正确性路径。丢弃是安全的（对端下一个 Ping 仍会被应答）。
+const MAX_PENDING_CONTROL: usize = 8;
+
 /// 把 WebSocket 二进制消息适配为字节流（`AsyncRead + AsyncWrite`）。
 pub struct WsByteStream<S> {
     stream: WebSocketStream<S>,
@@ -35,6 +41,10 @@ pub struct WsByteStream<S> {
     read_pos: usize,
     write_buf: Vec<u8>,
     pending: std::collections::VecDeque<Message>,
+    /// sink 内可能还有未冲刷字节（start_send 后 poll_flush 曾为 Pending）。
+    /// 有了它，poll_read 入口才知道要重试冲刷——否则排队中的 Pong 会
+    /// 停在 sink 缓冲里，直到下一个 Ping 或业务写才被带出去。
+    write_dirty: bool,
     eof: bool,
 }
 
@@ -46,6 +56,7 @@ impl<S> WsByteStream<S> {
             read_pos: 0,
             write_buf: Vec::new(),
             pending: std::collections::VecDeque::new(),
+            write_dirty: false,
             eof: false,
         }
     }
@@ -64,6 +75,7 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> WsByteStream<S> {
                         if let Err(error) = Pin::new(&mut self.stream).start_send(message) {
                             return Poll::Ready(Err(ws_io(error)));
                         }
+                        self.write_dirty = true;
                     }
                 }
                 continue;
@@ -83,13 +95,17 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> WsByteStream<S> {
                     {
                         return Poll::Ready(Err(ws_io(error)));
                     }
+                    self.write_dirty = true;
                 }
             }
         }
         match Pin::new(&mut self.stream).poll_flush(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(error)) => Poll::Ready(Err(ws_io(error))),
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Ok(())) => {
+                self.write_dirty = false;
+                Poll::Ready(Ok(()))
+            }
         }
     }
 }
@@ -101,6 +117,12 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> AsyncRead for WsBy
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         loop {
+            // 先冲待发控制帧（Pong）与未冲刷字节：不依赖下一个 Ping 或
+            // 业务写触发 flush。poll_ready 为 Pending 时保留待发并已注册
+            // waker，就绪后被唤醒的 poll_read 会在此把它冲出去。
+            if !self.pending.is_empty() || self.write_dirty {
+                let _ = self.poll_send_pending(cx);
+            }
             if self.read_pos < self.read_buf.len() {
                 let take = (self.read_buf.len() - self.read_pos).min(buf.remaining());
                 buf.put_slice(&self.read_buf[self.read_pos..self.read_pos + take]);
@@ -135,9 +157,10 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> AsyncRead for WsBy
                         )));
                     }
                     Message::Ping(payload) => {
-                        // 回 Pong（best-effort，待发队列有界 1 条）。
+                        // 回 Pong（best-effort）：待发队列有界
+                        // [`MAX_PENDING_CONTROL`] 条，满则丢最旧。
                         self.pending.push_back(Message::Pong(payload));
-                        if self.pending.len() > 8 {
+                        if self.pending.len() > MAX_PENDING_CONTROL {
                             self.pending.pop_front();
                         }
                         let _ = self.poll_send_pending(cx);
@@ -159,10 +182,14 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> AsyncWrite for WsB
         _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
+        // AsyncWrite 契约：缓冲不足不是 WouldBlock（那是「稍后重试同一写入」
+        // 的背压语义，但本适配器永远不会变出更多缓冲），而是硬错误。
+        // 帧层保证单帧 ≤ MAX_WS_WRITE_BYTES（write_all 恰好一次装下），
+        // 走到这里只可能是调用方违反单帧上限。
         if self.write_buf.len() + buf.len() > MAX_WS_WRITE_BYTES {
             return Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "ws write buffer exceeds limit",
+                std::io::ErrorKind::InvalidInput,
+                "ws write exceeds MAX_WS_WRITE_BYTES (one frame per write_all)",
             )));
         }
         self.write_buf.extend_from_slice(buf);
@@ -270,5 +297,142 @@ mod tests {
         .await;
         let n = adapter.read(&mut buf).await.unwrap();
         assert_eq!(n, 0, "close must surface as EOF");
+    }
+
+    /// 超出单帧写上限是硬错误（InvalidInput），不是 WouldBlock 背压信号：
+    /// 缓冲永远不会变大，报背压等于把调用方挂在一个永不完成的重试上。
+    #[tokio::test]
+    async fn oversized_write_is_a_hard_error() {
+        let (mut adapter, _raw) = pair().await;
+        let too_big = vec![0u8; MAX_WS_WRITE_BYTES + 1];
+        let error = adapter.write(&too_big).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        // 上限内的写入不受影响。
+        assert_eq!(adapter.write(&[1u8, 2, 3]).await.unwrap(), 3);
+    }
+
+    /// Ping 在写侧拥塞（poll_ready = Pending）期间到达：Pong 只能排队；
+    /// 写侧恢复后，即便没有下一个 Ping、也没有业务写，poll_read 也必须
+    /// 把排队中的 Pong 冲出去（否则对端等到下一个 Ping 才看到响应）。
+    #[tokio::test]
+    async fn queued_pong_is_flushed_without_next_ping() {
+        let (a, b) = tokio::io::duplex(4096);
+        let gate = Gate::default();
+        gate.open();
+        let (client, server) = tokio::join!(
+            tokio_tungstenite::client_async(
+                "ws://localhost/ws/agent",
+                GatedStream::new(a, gate.clone())
+            ),
+            tokio_tungstenite::accept_async(b),
+        );
+        let mut adapter = WsByteStream::new(client.unwrap().0);
+        let mut raw = server.unwrap();
+        // 关闸制造写侧拥塞：业务帧滞留，start_send 的 WouldBlock 使
+        // poll_ready 进入 Pending 重试态。
+        gate.close();
+        adapter.write_all(&[7u8; 32]).await.unwrap();
+        let flush = tokio::time::timeout(std::time::Duration::from_millis(50), adapter.flush()).await;
+        assert!(flush.is_err(), "写侧拥塞下 flush 必须停在 pending");
+        // Ping 在写侧不可用时到达：Pong 只能排队，此刻发不出去。
+        raw.send(Message::Ping(vec![1u8, 2, 3].into())).await.unwrap();
+        let read =
+            tokio::time::timeout(std::time::Duration::from_millis(50), adapter.read(&mut [0u8; 1]))
+                .await;
+        assert!(read.is_err(), "无入站数据时读必须停在 pending");
+        // 开闸（写侧恢复）：不发第二个 Ping、也不做业务写，排队的 Pong
+        // 必须随 poll_read 的入口冲刷发出。
+        gate.open();
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_millis(50), adapter.read(&mut [0u8; 1]))
+                .await;
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), raw.next())
+            .await
+            .expect("滞留的业务帧随开闸写出")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(first, Message::Binary(data) if data.len() == 32));
+        let pong = tokio::time::timeout(std::time::Duration::from_secs(2), raw.next())
+            .await
+            .expect("排队的 Pong 必须发出，不依赖下一个 Ping")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(pong, Message::Pong(payload) if payload.to_vec() == vec![1, 2, 3]));
+    }
+
+    /// 可控背压的字节流：gate 关闭时 poll_write 返回 Pending 并登记 waker，
+    /// 模拟底层写侧拥塞（WS 层 poll_ready 停在 Pending 重试态）。
+    struct GatedStream {
+        inner: tokio::io::DuplexStream,
+        gate: Gate,
+    }
+
+    impl GatedStream {
+        fn new(inner: tokio::io::DuplexStream, gate: Gate) -> Self {
+            Self { inner, gate }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct Gate {
+        open: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        waker: std::sync::Arc<std::sync::Mutex<Option<std::task::Waker>>>,
+    }
+
+    impl Gate {
+        fn open(&self) {
+            self.open.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.wake();
+        }
+        fn close(&self) {
+            self.open.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn wake(&self) {
+            if let Some(waker) = self.waker.lock().unwrap().take() {
+                waker.wake();
+            }
+        }
+    }
+
+    impl tokio::io::AsyncRead for GatedStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for GatedStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if !self.gate.open.load(std::sync::atomic::Ordering::SeqCst) {
+                *self.gate.waker.lock().unwrap() = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if !self.gate.open.load(std::sync::atomic::Ordering::SeqCst) {
+                *self.gate.waker.lock().unwrap() = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
     }
 }
