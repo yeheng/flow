@@ -34,13 +34,5 @@ jsonrpsee = { version = "0.26", features = ["client", "ws-client"] }
 chrono = { workspace = true }
 reqwest.workspace = true
 
-[dev-dependencies]
-# 测试自己起服务端：进程内 flow_rpc::serve + SQLite 后端（显式路径，不碰 env），
-# 被测的 flow-cli 仍是真子进程。后端契约本身由 backend-e2e / flow-rpc 覆盖。
-tokio = { workspace = true }
-serde_json = { workspace = true }
-jsonrpsee = { version = "0.26", features = ["server"] }
-flow-rpc = { path = "../flow-rpc" }
-flow-backend = { path = "../flow-backend" }
-flow-config = { path = "../flow-config" }
-flow-test-support = { path = "../flow-test-support" }
+# 无 dev-dependencies：原 tests/（CLI 子进程往返）已并入 backend-e2e 套件；
+# src 内单测只用正常依赖（serde_json）。

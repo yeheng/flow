@@ -76,8 +76,8 @@ impl RemoteOptions {
 }
 
 /// 监听侧并发 TLS/WSS 握手上限（防连接洪泛无界 spawn task/做握手）。
-/// 握手是最贵的一步（证书解析/验证）；通过认证的会话受 CA/令牌约束，
-/// 数量自然有界。超限直接关闭——agent 会退避重连。
+/// TLS/WSS 各自使用独立握手 permit 和启动期限；已认证 agent 注册表
+/// 另受同一数量上限约束，同身份重连可替换旧会话。超限关闭后由 agent 退避。
 pub const MAX_AGENT_SESSIONS: usize = 256;
 
 // mTLS：验证 agent 客户端证书。
@@ -233,6 +233,7 @@ pub struct AgentManager {
     session_counter: AtomicU64,
     agent_counter: AtomicU64,
     shutdown: tokio_util::sync::CancellationToken,
+    tasks: tokio_util::task::TaskTracker,
 }
 
 // bind 挂起登记：agent_id/executor_id 在超时清理与诊断路径读取。
@@ -259,6 +260,7 @@ impl AgentManager {
             session_counter: AtomicU64::new(0),
             agent_counter: AtomicU64::new(0),
             shutdown: tokio_util::sync::CancellationToken::new(),
+            tasks: tokio_util::task::TaskTracker::new(),
         })
     }
 
@@ -286,26 +288,26 @@ impl AgentManager {
         // 直接 await 会把 start_execution_remote（含生产 remote 模式启动）
         // 永久阻塞在 accept 循环上。
         let manager = self.clone();
-        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        tokio::spawn(async move {
+        let handshakes = Arc::new(Semaphore::new(MAX_AGENT_SESSIONS));
+        self.tasks.spawn(async move {
             loop {
-                let Ok((socket, _)) = listener.accept().await else {
+                let accepted = tokio::select! {
+                    _ = manager.shutdown.cancelled() => return,
+                    result = listener.accept() => result,
+                };
+                let Ok((socket, _)) = accepted else {
                     return;
                 };
-                if active.load(std::sync::atomic::Ordering::Acquire) >= MAX_AGENT_SESSIONS {
-                    tracing::warn!(
-                        limit = MAX_AGENT_SESSIONS,
-                        "agent TLS connection dropped: session limit reached"
-                    );
-                    continue;
-                }
-                active.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                let Ok(permit) = handshakes.clone().try_acquire_owned() else { continue; };
                 let acceptor = acceptor.clone();
                 let manager = manager.clone();
-                let active = active.clone();
-                tokio::spawn(async move {
-                    let Ok(stream) = acceptor.accept(socket).await else {
-                        active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                manager.tasks.clone().spawn(async move {
+                    let _permit = permit;
+                    let handshake = tokio::select! {
+                        _ = manager.shutdown.cancelled() => return,
+                        result = tokio::time::timeout(Duration::from_millis(STARTUP_TIMEOUT_MS), acceptor.accept(socket)) => result,
+                    };
+                    let Ok(Ok(stream)) = handshake else {
                         return;
                     };
                     let agent_id = stream
@@ -316,11 +318,9 @@ impl AgentManager {
                         .and_then(|c| cert_common_name(c.as_ref()));
                     let Some(agent_id) = agent_id else {
                         tracing::warn!("agent TLS connection without client cert");
-                        active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                         return;
                     };
                     manager.inject_stream(agent_id, Box::pin(stream)).await;
-                    active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                 });
             }
         });
@@ -336,7 +336,11 @@ impl AgentManager {
     /// 协议层面：一条完整帧对应一条（或分片后多条）WS Binary 消息；Text/超限消息拒绝；
     /// 协商上限由 [`MAX_WS_MESSAGE_BYTES`] 硬约束。
     #[allow(clippy::result_large_err)] // accept_hdr 回调签名固定，ErrorResponse 为大类型
-    pub async fn listen_wss(self: &Arc<Self>, addr: String, agents: Vec<AgentCredential>) -> Result<()> {
+    pub async fn listen_wss(
+        self: &Arc<Self>,
+        addr: String,
+        agents: Vec<AgentCredential>,
+    ) -> Result<()> {
         use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
         use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
@@ -354,24 +358,21 @@ impl AgentManager {
                 .max_message_size(limit)
                 .max_frame_size(limit),
         );
-        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        tokio::spawn(async move {
+        let handshakes = Arc::new(Semaphore::new(MAX_AGENT_SESSIONS));
+        self.tasks.spawn(async move {
             loop {
-                let Ok((socket, _)) = listener.accept().await else {
+                let accepted = tokio::select! {
+                    _ = manager.shutdown.cancelled() => return,
+                    result = listener.accept() => result,
+                };
+                let Ok((socket, _)) = accepted else {
                     return;
                 };
-                if active.load(std::sync::atomic::Ordering::Acquire) >= MAX_AGENT_SESSIONS {
-                    tracing::warn!(
-                        limit = MAX_AGENT_SESSIONS,
-                        "agent WSS connection dropped: session limit reached"
-                    );
-                    continue;
-                }
-                active.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                let Ok(permit) = handshakes.clone().try_acquire_owned() else { continue; };
                 let manager = manager.clone();
                 let agents = agents.clone();
-                let active = active.clone();
-                tokio::spawn(async move {
+                manager.tasks.clone().spawn(async move {
+                    let _permit = permit;
                     let agent_slot: std::sync::Arc<std::sync::Mutex<Option<String>>> =
                         std::sync::Arc::new(std::sync::Mutex::new(None));
                     let slot = agent_slot.clone();
@@ -387,15 +388,16 @@ impl AgentManager {
                             None => Err(unauthorized()),
                         },
                         config,
-                    )
-                    .await;
-                    let Ok(ws) = handshake else {
-                        active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                    );
+                    let handshake = tokio::select! {
+                        _ = manager.shutdown.cancelled() => return,
+                        result = tokio::time::timeout(Duration::from_millis(STARTUP_TIMEOUT_MS), handshake) => result,
+                    };
+                    let Ok(Ok(ws)) = handshake else {
                         return;
                     };
                     let agent_id = agent_slot.lock().unwrap_or_else(|p| p.into_inner()).take();
                     let Some(agent_id) = agent_id else {
-                        active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                         return;
                     };
                     manager
@@ -404,7 +406,6 @@ impl AgentManager {
                             Box::pin(flow_engine::execution_protocol::ws::WsByteStream::new(ws)),
                         )
                         .await;
-                    active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                 });
             }
         });
@@ -423,9 +424,12 @@ impl AgentManager {
     async fn inject_stream(self: &Arc<Self>, agent_id: String, stream: BoxedStream) {
         let manager = self.clone();
         let agent_id = agent_id.clone();
-        tokio::spawn(async move {
-            if let Err(error) = manager.run_session(agent_id, stream).await {
-                tracing::warn!(%error, "agent session ended");
+        self.tasks.spawn(async move {
+            tokio::select! {
+                _ = manager.shutdown.cancelled() => {},
+                result = manager.run_session(agent_id, stream) => {
+                    if let Err(error) = result { tracing::warn!(%error, "agent session ended"); }
+                }
             }
         });
     }
@@ -507,9 +511,11 @@ impl AgentManager {
         // AgentWelcome。不再用临时 decoder 取首帧后丢弃——同一次 read 里
         // Hello 之后的尾随帧不会在交接时丢失。
         let mut transport = FrameTransport::spawn(stream, 128);
-        let (agent_boot_id, slots, link_session_id) = self
-            .session_handshake(&mut transport, &agent_id)
-            .await?;
+        let (agent_boot_id, slots, link_session_id) = tokio::select! {
+            _ = self.shutdown.cancelled() => return Ok(()),
+            result = tokio::time::timeout(Duration::from_millis(STARTUP_TIMEOUT_MS), self.session_handshake(&mut transport, &agent_id)) =>
+                result.map_err(|_| "agent handshake deadline exceeded".to_string())??,
+        };
         // 3) 注册会话（替换旧会话：旧 outbound 关闭 → 相关 runner link-dead）。
         let (outbound, mut commands) = mpsc::channel::<ToSession>(256);
         let registration = Arc::new(AgentRegistration {
@@ -521,11 +527,13 @@ impl AgentManager {
             draining: AtomicBool::new(false),
             cancel: tokio_util::sync::CancellationToken::new(),
         });
-        let previous = self
-            .agents
-            .lock()
-            .await
-            .insert(agent_id.clone(), registration.clone());
+        let previous = {
+            let mut agents = self.agents.lock().await;
+            if agents.len() >= MAX_AGENT_SESSIONS && !agents.contains_key(&agent_id) {
+                return Err("authenticated agent session limit reached".into());
+            }
+            agents.insert(agent_id.clone(), registration.clone())
+        };
         if let Some(previous) = previous {
             previous.cancel.cancel();
             tracing::info!(%agent_id, "agent reconnected; old uplink replaced");
@@ -653,15 +661,14 @@ impl AgentManager {
                                 let Some(routing) = routings.get(&envelope.dispatch_id.clone().unwrap_or_default()) else {
                                     if let Some((previous, result_id)) = completed.iter().find(|(previous, _)| previous == &envelope) {
                                         if let (Some(result_id), Message::Result { result_id: id, .. }) = (result_id, &*inner) {
-                                            if id == result_id {
-                                                if send_backlog.push(&transport, Message::Routed { envelope: previous.clone(), inner: Box::new(Message::ResultCommitted {
+                                            if id == result_id
+                                                && send_backlog.push(&transport, Message::Routed { envelope: previous.clone(), inner: Box::new(Message::ResultCommitted {
                                                         dispatch_id: envelope.dispatch_id.clone().unwrap(), result_id: result_id.clone(),
                                                     })}).is_err() {
                                                     return Err(format!(
                                                         "agent {agent_id} uplink send backlog overflow"
                                                     ));
                                                 }
-                                            }
                                         }
                                         continue;
                                     }
@@ -674,10 +681,12 @@ impl AgentManager {
                                 if envelope.executor_boot_id != routing.envelope.executor_boot_id {
                                     return Err("executor boot mismatch in envelope".into());
                                 }
-                                let _ = routing
-                                    .events
-                                    .send(crate::execution::FromSession::Incoming(inner))
-                                    .await;
+                                // Correctness frames cannot be dropped, and a slow runner
+                                // must not hold the shared uplink select loop indefinitely.
+                                // A full per-dispatch queue invalidates this session; journal
+                                // facts and Resume adjudication decide recovery.
+                                routing.events.try_send(crate::execution::FromSession::Incoming(inner))
+                                    .map_err(|_| "dispatch inbound queue full or closed; resume required".to_string())?;
                             }
                             Message::BindExecutorAck {
                                 executor_id,
@@ -1177,6 +1186,10 @@ impl AgentManager {
 
     pub async fn shutdown(&self) {
         self.shutdown.cancel();
+        self.tasks.close();
+        self.tasks.wait().await;
+        self.agents.lock().await.clear();
+        self.pending_binds.lock().await.clear();
     }
 }
 
@@ -1508,7 +1521,10 @@ mod capacity_tests {
 mod auth_tests {
     use super::*;
 
-    fn request(token: Option<&str>, claimed: Option<&str>) -> tokio_tungstenite::tungstenite::handshake::server::Request {
+    fn request(
+        token: Option<&str>,
+        claimed: Option<&str>,
+    ) -> tokio_tungstenite::tungstenite::handshake::server::Request {
         let mut builder = tokio_tungstenite::tungstenite::http::Request::builder();
         if let Some(token) = token {
             builder = builder.header("authorization", format!("Bearer {token}"));
@@ -1548,16 +1564,34 @@ mod auth_tests {
     #[test]
     fn claimed_header_cannot_impersonate_another_agent() {
         // 持 A 凭证声明 B 身份 / 伪造 header 冒充他 agent / 错缺凭证：一律拒绝。
-        assert_eq!(authenticate_wss(&request(Some("token-a"), Some("agent-b")), &table()), None);
-        assert_eq!(authenticate_wss(&request(Some("token-b"), Some("agent-a")), &table()), None);
-        assert_eq!(authenticate_wss(&request(Some("wrong"), Some("agent-a")), &table()), None);
-        assert_eq!(authenticate_wss(&request(None, Some("agent-a")), &table()), None);
-        assert_eq!(authenticate_wss(&request(Some("token-a"), Some("")), &table()), None);
+        assert_eq!(
+            authenticate_wss(&request(Some("token-a"), Some("agent-b")), &table()),
+            None
+        );
+        assert_eq!(
+            authenticate_wss(&request(Some("token-b"), Some("agent-a")), &table()),
+            None
+        );
+        assert_eq!(
+            authenticate_wss(&request(Some("wrong"), Some("agent-a")), &table()),
+            None
+        );
+        assert_eq!(
+            authenticate_wss(&request(None, Some("agent-a")), &table()),
+            None
+        );
+        assert_eq!(
+            authenticate_wss(&request(Some("token-a"), Some("")), &table()),
+            None
+        );
     }
 
     #[test]
     fn unknown_token_matches_no_identity() {
-        assert_eq!(authenticate_wss(&request(Some("token-c"), None), &table()), None);
+        assert_eq!(
+            authenticate_wss(&request(Some("token-c"), None), &table()),
+            None
+        );
     }
 }
 
@@ -1573,6 +1607,34 @@ mod session_tests {
             .unwrap();
         let manager = AgentManager::new(backend.clone(), "journal-test".into(), 1);
         (manager, backend, root)
+    }
+
+    #[tokio::test]
+    async fn shutdown_reclaims_listener_and_silent_handshake() {
+        let (manager, backend, root) = manager_with_data().await;
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = probe.local_addr().unwrap();
+        drop(probe);
+        manager
+            .listen_wss(
+                address.to_string(),
+                vec![AgentCredential {
+                    id: "agent".into(),
+                    token: "secret".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        let _silent = tokio::net::TcpStream::connect(address).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), manager.shutdown())
+            .await
+            .expect("shutdown must interrupt handshake");
+        let _rebound = TcpListener::bind(address)
+            .await
+            .expect("listener port must be released");
+        assert!(manager.tasks.is_empty());
+        backend.close().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// 建立一对单流会话：master 侧走 attach_inprocess，测试侧持 transport。

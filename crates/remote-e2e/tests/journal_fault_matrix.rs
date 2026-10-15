@@ -71,8 +71,8 @@ async fn spawn_agent(
         let boot = flow_engine::execution_protocol::transport::fresh_boot_id();
         if transport
             .send(Message::AgentHello {
-
-                    version: flow_engine::execution_protocol::PROTOCOL_VERSION,agent_boot_id: boot.clone(),
+                version: flow_engine::execution_protocol::PROTOCOL_VERSION,
+                agent_boot_id: boot.clone(),
                 build: "sim".into(),
                 capabilities: vec!["relay".into(), "resource_report".into(), "reconnect".into()],
                 slots,
@@ -93,8 +93,8 @@ async fn spawn_agent(
             }
         };
         let Message::AgentWelcome {
-
-                version: flow_engine::execution_protocol::PROTOCOL_VERSION,journal_id,
+            version: flow_engine::execution_protocol::PROTOCOL_VERSION,
+            journal_id,
             master_epoch,
             link_session_id,
             ..

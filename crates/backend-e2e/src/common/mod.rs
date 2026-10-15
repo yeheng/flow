@@ -12,6 +12,7 @@
 pub mod client;
 pub mod fixtures;
 pub mod server;
+pub mod wire;
 
 pub use client::{
     call, call_err, call_json, collect_run_events, connect, http_post_hook, named,

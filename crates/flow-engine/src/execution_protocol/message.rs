@@ -328,10 +328,13 @@ pub enum Message {
     /// control，子→主。I/O 循环初始化完成，可接任务。
     Ready,
     /// control，主→子。一次节点派发：内部准备与执行共用同一 dispatch。
+    /// `task` 装箱：ExecuteTask 是枚举里最大的变体（含节点定义与前驱声明），
+    /// 不装则整个 Message 被拍到 440+ 字节、每个 clone/排队都放大拷贝；
+    /// postcard 对 Box 透明，wire 格式不变。
     Execute {
         command_id: String,
         dispatch_id: String,
-        task: ExecuteTask,
+        task: Box<ExecuteTask>,
     },
     /// control，子→主。仅表示接收；已提交 Execute 授权纯计算。
     Accepted {

@@ -45,16 +45,7 @@ flow-store = { path = "../flow-store" }
 flow-config = { path = "../flow-config" }
 
 [dev-dependencies]
-# 自依赖：只为给集成测试打开 fault-injection feature（不改 lib 默认构建）。
-flow-backend = { path = ".", features = ["fault-injection"] }
+# 自依赖只为给集成测试打开 fault-injection feature 的历史使命已终结：相关
+# 用例（journal_fault_matrix）已迁往 remote-e2e，由那边的依赖链启用；
+# dispatch::fault 在本 crate 单测下由 cfg(any(test, ..)) 自带。
 flow-test-support = { path = "../flow-test-support" }
-chrono = { workspace = true }
-parking_lot = { workspace = true }
-tokio = { workspace = true, features = ["test-util"] }
-libc = { workspace = true }
-tokio-rustls = { workspace = true }
-rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
-tracing-subscriber = { workspace = true }
-flow-agent = { path = "../flow-agent" }
-rcgen = { workspace = true }

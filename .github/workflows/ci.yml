@@ -110,13 +110,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: journal-cluster
-      - run: cargo clippy -p flow-rpc -p flow-backend --all-targets --features journal-cluster --locked -- -D warnings
-      # T7：unix 上进程内执行路径已删除，产品服务端只有 ipc。flow-rpc 的集群
-      # 套件起真服务端，必须能定位到 flow-executor（该作业不跑 workspace 全量
-      # 测试，这里单独产出）。
-      - run: cargo build -p flow-executor --locked
-      - run: cargo test -p flow-backend --features journal-cluster --test journal_cluster --locked -- --ignored
-      - run: cargo test -p flow-rpc --features journal-cluster --test journal_cluster --locked -- --ignored
+      - run: cargo clippy -p flow-rpc -p flow-backend -p remote-e2e --all-targets --features journal-cluster --locked -- -D warnings
+      # T7：unix 上进程内执行路径已删除，产品服务端只有 ipc。集群套件（已迁入
+      # remote-e2e）起真服务端，必须能定位到 flow-executor 与 flow-journal-server
+      # （该作业不跑 workspace 全量测试，这里单独产出）。
+      - run: cargo build -p flow-executor -p flow-rpc --bins --locked
+      - run: cargo test -p remote-e2e --features journal-cluster --test cluster_registry --locked -- --ignored
+      - run: cargo test -p remote-e2e --features journal-cluster --test cluster_process --locked -- --ignored
 
   # ---- 多架构构建：gnu 原生编，musl 用 cross ----
   # gnu target 用各自架构的原生 runner 编（与 test 矩阵同一批 runner）：

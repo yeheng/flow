@@ -158,6 +158,22 @@ pub struct Run {
     pub last_run_seq: u64,
     pub nodes: BTreeMap<String, Node>,
 }
+impl Run {
+    /// Terminal facts win; otherwise all outstanding uncertain waits participate.
+    pub fn refresh_status(&mut self) {
+        if !self.status.terminal() {
+            self.status = if self.nodes.values().any(|node| {
+                node.wait
+                    .as_ref()
+                    .is_some_and(|wait| wait.kind == WaitKind::Uncertain)
+            }) {
+                RunStatus::AwaitingResume
+            } else {
+                RunStatus::Running
+            };
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Parent {
     pub run_id: String,
@@ -426,6 +442,9 @@ impl State {
                 self.values.apply(event, &tx.journal_id)?;
                 self.check_values(event)?;
                 self.apply_event(event, tx.lsn, &mut command_undo)?;
+                if let Some(run) = event.run_id.as_ref().and_then(|id| self.runs.get_mut(id)) {
+                    run.refresh_status();
+                }
             }
             Ok(())
         })();
@@ -1080,5 +1099,62 @@ mod command_window_tests {
             serde_json::to_value(&state).unwrap(),
             serde_json::to_value(&replay).unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod aggregate_status_tests {
+    use super::*;
+    #[test]
+    fn unresolved_parallel_waits_survive_other_branch_activity_and_terminal_wins() {
+        let mut run: Run = serde_json::from_value(serde_json::json!({
+            "run_id":"r", "workflow_id":"w", "workflow_version":1,
+            "definition":serde_json::to_value(StoredValue::Inline(Value::Null)).unwrap(), "input":serde_json::to_value(StoredValue::Inline(Value::Null)).unwrap(),
+            "source":"manual", "source_detail":null, "parent":null, "depth":0,
+            "created_at":"now", "status":"running", "output":null, "error":null,
+            "last_run_seq":"1", "nodes":{}
+        })).unwrap();
+        let node = |wait: bool| Node {
+            node_execution_id: "n".into(),
+            attempt: 1,
+            dispatch_id: "d".into(),
+            status: if wait {
+                NodeStatus::Waiting
+            } else {
+                NodeStatus::Running
+            },
+            output: None,
+            branch: None,
+            prepared: None,
+            wait: if wait {
+                Some(Wait {
+                    kind: WaitKind::Uncertain,
+                    wake_at: None,
+                    child_run_id: None,
+                    output: None,
+                })
+            } else {
+                None
+            },
+            operation: None,
+            attempts: BTreeMap::new(),
+            error: None,
+            skip_reason: None,
+        };
+        run.nodes.insert("a".into(), node(true));
+        run.nodes.insert("b".into(), node(true));
+        run.refresh_status();
+        assert_eq!(run.status, RunStatus::AwaitingResume);
+        run.nodes.get_mut("b").unwrap().wait = None;
+        run.status = RunStatus::Running;
+        run.refresh_status();
+        assert_eq!(run.status, RunStatus::AwaitingResume);
+        run.nodes.get_mut("a").unwrap().wait = None;
+        run.refresh_status();
+        assert_eq!(run.status, RunStatus::Running);
+        run.nodes.insert("a".into(), node(true));
+        run.status = RunStatus::Cancelled;
+        run.refresh_status();
+        assert_eq!(run.status, RunStatus::Cancelled);
     }
 }

@@ -142,10 +142,26 @@ pub struct NodeLogger {
 #[derive(Clone)]
 enum LogTarget {
     Legacy(UnboundedSender<LogLine>),
+    Bounded(tokio::sync::mpsc::Sender<LogLine>, Arc<LogQueueLoss>),
     Observation(crate::observation::ObservationLogger),
 }
 
+#[derive(Default)]
+pub struct LogQueueLoss {
+    pub dropped_lines: std::sync::atomic::AtomicU64,
+    pub dropped_bytes: std::sync::atomic::AtomicU64,
+}
+
 impl NodeLogger {
+    pub fn bounded(tx: tokio::sync::mpsc::Sender<LogLine>, loss: Arc<LogQueueLoss>) -> Self {
+        Self {
+            tx: LogTarget::Bounded(tx, loss),
+            budget: LogBudget::new(DEFAULT_LOG_BUDGET),
+            node_id: String::new(),
+            attempt: 1,
+        }
+    }
+
     pub fn new(
         tx: UnboundedSender<LogLine>,
         budget: Arc<LogBudget>,
@@ -180,7 +196,13 @@ impl NodeLogger {
     }
 
     pub fn log(&self, level: LogLevel, stream: LogStream, message: impl Into<String>) {
+        let message = message.into();
         if !self.budget.admit(level) {
+            if let LogTarget::Bounded(_, loss) = &self.tx {
+                loss.dropped_lines.fetch_add(1, Ordering::Relaxed);
+                loss.dropped_bytes
+                    .fetch_add(message.len() as u64, Ordering::Relaxed);
+            }
             return;
         }
         let line = LogLine {
@@ -188,11 +210,19 @@ impl NodeLogger {
             attempt: self.attempt,
             level,
             stream,
-            message: truncate_message(&message.into()),
+            message: truncate_message(&message),
         };
         match &self.tx {
             LogTarget::Legacy(tx) => {
                 let _ = tx.send(line);
+            }
+            LogTarget::Bounded(tx, loss) => {
+                let bytes = line.message.len();
+                if tx.try_send(line).is_err() {
+                    loss.dropped_lines.fetch_add(1, Ordering::Relaxed);
+                    loss.dropped_bytes
+                        .fetch_add(bytes as u64, Ordering::Relaxed);
+                }
             }
             LogTarget::Observation(target) => target.emit(line),
         }

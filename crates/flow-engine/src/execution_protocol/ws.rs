@@ -332,20 +332,27 @@ mod tests {
         // poll_ready 进入 Pending 重试态。
         gate.close();
         adapter.write_all(&[7u8; 32]).await.unwrap();
-        let flush = tokio::time::timeout(std::time::Duration::from_millis(50), adapter.flush()).await;
+        let flush =
+            tokio::time::timeout(std::time::Duration::from_millis(50), adapter.flush()).await;
         assert!(flush.is_err(), "写侧拥塞下 flush 必须停在 pending");
         // Ping 在写侧不可用时到达：Pong 只能排队，此刻发不出去。
-        raw.send(Message::Ping(vec![1u8, 2, 3].into())).await.unwrap();
-        let read =
-            tokio::time::timeout(std::time::Duration::from_millis(50), adapter.read(&mut [0u8; 1]))
-                .await;
+        raw.send(Message::Ping(vec![1u8, 2, 3].into()))
+            .await
+            .unwrap();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            adapter.read(&mut [0u8; 1]),
+        )
+        .await;
         assert!(read.is_err(), "无入站数据时读必须停在 pending");
         // 开闸（写侧恢复）：不发第二个 Ping、也不做业务写，排队的 Pong
         // 必须随 poll_read 的入口冲刷发出。
         gate.open();
-        let _ =
-            tokio::time::timeout(std::time::Duration::from_millis(50), adapter.read(&mut [0u8; 1]))
-                .await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            adapter.read(&mut [0u8; 1]),
+        )
+        .await;
         let first = tokio::time::timeout(std::time::Duration::from_secs(2), raw.next())
             .await
             .expect("滞留的业务帧随开闸写出")
@@ -417,10 +424,7 @@ mod tests {
             Pin::new(&mut self.inner).poll_write(cx, buf)
         }
 
-        fn poll_flush(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<std::io::Result<()>> {
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             if !self.gate.open.load(std::sync::atomic::Ordering::SeqCst) {
                 *self.gate.waker.lock().unwrap() = Some(cx.waker().clone());
                 return Poll::Pending;

@@ -139,19 +139,29 @@ impl JournalBackend {
         // 身份由 token→agent_id 映射表决定，凭据表不可留空。
         if let Some(addr) = &options.wss_addr {
             if options.wss_agents.is_empty() {
+                manager.shutdown().await;
                 return Err(crate::journal::JournalError::Journal(
                     flow_journal::Error::Invalid(
                         "execution.remote.wss_addr 配置了但 agents 凭据表为空".into(),
                     ),
                 ));
             }
-            manager
+            if let Err(error) = manager
                 .listen_wss(addr.clone(), options.wss_agents.clone())
-                .await?;
+                .await
+            {
+                manager.shutdown().await;
+                return Err(error.into());
+            }
         }
-        let dispatcher = Arc::new(RemoteDispatcher::new(manager, options.clone()));
-        self.start_execution_with_port(16, ExecutionPort::Remote(dispatcher), false)
-            .await
+        let dispatcher = Arc::new(RemoteDispatcher::new(manager.clone(), options.clone()));
+        let result = self
+            .start_execution_with_port(16, ExecutionPort::Remote(dispatcher), false)
+            .await;
+        if result.is_err() {
+            manager.shutdown().await;
+        }
+        result
     }
 
     /// 三期远程（测试/in-process 入口）：用既有 manager 启动远程端口。

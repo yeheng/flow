@@ -171,6 +171,9 @@ impl JournalBackend {
                                 "state checkpoint boundary mismatch".into(),
                             ));
                         }
+                        for run in state.runs.values_mut() {
+                            run.refresh_status();
+                        }
                         Ok(state)
                     })();
                     if let Err(error) = &restored {

@@ -2,13 +2,15 @@ use flow_backend::journal::JournalBackend;
 use jsonrpsee::RpcModule;
 use serde_json::{json, Value};
 
-#[cfg(not(feature = "journal-cluster"))]
+// 用产品 flow-journal-server（而非 e2e 薄壳）：e2e 壳只从环境变量读配置、
+// 不解析 --config，而本用例钉的是「产品 bin 在无 feature 构建下拒绝集群配置」
+// 的启动契约（与 remote-e2e 的 cluster_process 同一指向）。
 #[test]
 fn configured_cluster_requires_feature_before_opening_the_journal() {
     let dir = flow_test_support::io::TempDir::new("cluster-requires-feature");
     let path = dir.path().join("flow.toml");
     std::fs::write(&path, "[journal.cluster]\ncluster_id='test'\nnode_id='a'\n").unwrap();
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_flow-journal-server"))
+    let output = std::process::Command::new(flow_test_support::io::server_bin())
         .arg("--config")
         .arg(path)
         .env(

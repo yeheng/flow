@@ -122,3 +122,51 @@ async fn legacy_import_is_reentrant_preserves_raw_tail_and_reports_missing_input
         .is_err());
     assert_eq!(first["counts"]["runs"], Value::from(1));
 }
+
+#[tokio::test]
+async fn wal_import_preserves_evidence_and_is_reentrant() {
+    let temp = tempfile::tempdir().unwrap();
+    let live = temp.path().join("live.db");
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&live)
+                .create_if_missing(true)
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal),
+        )
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE workflows (id TEXT PRIMARY KEY, name TEXT, created_at TEXT)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO workflows VALUES ('w', 'wal', '2026-10-14T00:00:00Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let source = temp.path().join("snapshot");
+    std::fs::create_dir(&source).unwrap();
+    for suffix in ["", "-wal"] {
+        std::fs::copy(
+            temp.path().join(format!("live.db{suffix}")),
+            source.join(format!("flow.db{suffix}")),
+        )
+        .unwrap();
+    }
+    pool.close().await;
+    let destination = temp.path().join("import");
+    let first = journal_import::import(&source, &source.join("flow.db"), &destination)
+        .await
+        .unwrap();
+    let second = journal_import::import(&source, &source.join("flow.db"), &destination)
+        .await
+        .unwrap();
+    assert_eq!(first, second);
+    for suffix in ["", "-wal"] {
+        assert_eq!(
+            std::fs::read(source.join(format!("flow.db{suffix}"))).unwrap(),
+            std::fs::read(destination.join(format!("legacy-source/flow.db{suffix}"))).unwrap()
+        );
+    }
+}

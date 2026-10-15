@@ -281,6 +281,8 @@ fn handle_message(
             let runner_ack = ack_tx.clone();
             let cancel = CancellationToken::new();
             let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            // 解箱：TaskRunner 持有裸 ExecuteTask（下游全是借用，无字段移出）。
+            let task = *task;
             let runner = TaskRunner {
                 face: None,
                 command_id,

@@ -27,12 +27,5 @@ flow-journal = { path = "../flow-journal" }
 flow-engine = { path = "../flow-engine" }
 flow-config = { path = "../flow-config" }
 
-[dev-dependencies]
-uuid = { workspace = true }
-reqwest = { workspace = true }
-chrono = { workspace = true }
-sqlx = { workspace = true, features = ["postgres", "json"] }
-flow-engine = { path = "../flow-engine" }
-flow-store = { path = "../flow-store" }
-flow-config = { path = "../flow-config" }
-flow-test-support = { path = "../flow-test-support" }
+# 无 dev-dependencies：原 tests/（wire 契约/集群）已并入 backend-e2e 与
+# remote-e2e 套件；src 内单测只用正常依赖（serde_json 等）。

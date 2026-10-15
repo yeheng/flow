@@ -2,7 +2,7 @@
 //! FLOW_BACKEND=journal 起真实服务进程，跑全量 RPC 面
 //! （workflow / run / 触发器 / 模板 / config）。
 
-mod common;
+use backend_e2e::common::wire as common;
 
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
@@ -19,7 +19,7 @@ async fn spawn_journal_opt(dir: std::path::PathBuf, explicit_backend: bool) -> c
     use common::spawn_reporting_ports;
     use std::process::{Command, Stdio};
 
-    let mut cmd = Command::new(common::server_bin());
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_flow-journal-server-e2e"));
     if explicit_backend {
         cmd.env("FLOW_BACKEND", "journal");
     }
@@ -323,7 +323,7 @@ async fn default_backend_is_journal_on_fresh_directory() {
     let v1dir = flow_test_support::io::TempDir::new("flow-rpc-default-v1");
     std::fs::write(v1dir.path().join("flow.db"), b"legacy").unwrap();
     use std::process::{Command, Stdio};
-    let output = Command::new(common::server_bin())
+    let output = Command::new(env!("CARGO_BIN_EXE_flow-journal-server-e2e"))
         .env("FLOW_DATA_DIR", v1dir.path().join("secrets"))
         .env("FLOW_JOURNAL_DATA_DIR", v1dir.path())
         .env("FLOW_JOURNAL_TOKEN", common::TOKEN)

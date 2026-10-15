@@ -47,6 +47,12 @@ pub struct ExecutorHandle {
     pub notify: Arc<Notify>,
 }
 
+impl Drop for ExecutorHandle {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PoolError {
     #[error("bind failed: {0}")]

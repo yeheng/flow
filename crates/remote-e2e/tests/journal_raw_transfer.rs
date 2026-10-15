@@ -144,8 +144,8 @@ async fn spawn_agent(
         let boot = flow_engine::execution_protocol::transport::fresh_boot_id();
         if transport
             .send(Message::AgentHello {
-
-                    version: flow_engine::execution_protocol::PROTOCOL_VERSION,agent_boot_id: boot.clone(),
+                version: flow_engine::execution_protocol::PROTOCOL_VERSION,
+                agent_boot_id: boot.clone(),
                 build: "sim".into(),
                 capabilities: vec!["relay".into(), "resource_report".into(), "reconnect".into()],
                 slots,
@@ -166,8 +166,8 @@ async fn spawn_agent(
             }
         };
         let Message::AgentWelcome {
-
-                version: flow_engine::execution_protocol::PROTOCOL_VERSION,journal_id,
+            version: flow_engine::execution_protocol::PROTOCOL_VERSION,
+            journal_id,
             master_epoch,
             link_session_id,
             ..
@@ -224,4 +224,52 @@ async fn remote_raw_transfer_end_to_end() {
     manager.shutdown().await;
     backend.close().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn input_node_large_result_uses_reference_and_preserves_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let backend = JournalBackend::open(directory.path(), JournalOptions::default())
+        .await
+        .unwrap();
+    backend
+        .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(ipc_options(
+            "input-large",
+        )))
+        .await
+        .unwrap();
+    let workflow = install(
+        &backend,
+        json!({"nodes":[
+        {"id":"s","type":"start"},
+        {"id":"n","type":"input","params":{"fields":[{"key":"blob"}]}},
+        {"id":"e","type":"end"}],
+        "edges":[{"from":"s","to":"n"},{"from":"n","to":"e"}]}),
+    )
+    .await;
+    let input = json!({"blob":"x".repeat(100 * 1024)});
+    let created = backend
+        .run_start(&workflow, None, input.clone(), "manual", None, None)
+        .await
+        .unwrap();
+    let done = until(
+        &backend,
+        created.result["run_id"].as_str().unwrap(),
+        Run::terminal,
+    )
+    .await;
+    assert_eq!(done.status, RunStatus::Succeeded, "{:?}", done.error);
+    let output = done.nodes["n"].output.as_ref().unwrap();
+    assert!(matches!(output, flow_journal::StoredValue::Ref(_)));
+    assert_eq!(
+        flow_journal::value::materialize(
+            backend.journal.root(),
+            backend.journal.durable_lsn(),
+            output,
+            8 * 1024 * 1024
+        )
+        .unwrap(),
+        input
+    );
+    backend.close().await.unwrap();
 }

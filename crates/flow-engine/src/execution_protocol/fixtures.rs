@@ -64,7 +64,7 @@ pub fn valid_messages() -> Vec<Message> {
         Message::Execute {
             command_id: "cmd-1".into(),
             dispatch_id: "dispatch-09".into(),
-            task: ExecuteTask {
+            task: Box::new(ExecuteTask {
                 run_id: "run-1".into(),
                 node_id: "n1".into(),
                 node_execution_id: "ne-1".into(),
@@ -75,7 +75,7 @@ pub fn valid_messages() -> Vec<Message> {
                 prepared: None,
                 previous_outcome: None,
                 observability: true,
-            },
+            }),
         },
         Message::Accepted {
             command_id: "cmd-1".into(),

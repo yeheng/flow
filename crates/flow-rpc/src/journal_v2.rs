@@ -1000,7 +1000,8 @@ async fn config_update(ctx: &Context, p: &Value) -> Result<Value, ErrorObjectOwn
         .config
         .as_ref()
         .ok_or_else(|| invalid("此实例未启用配置文件读写，无法修改配置"))?;
-    let base = cs.config.read().unwrap().clone();
+    let mut current = cs.config.write().unwrap();
+    let base = current.clone();
     let merged =
         flow_config::Config::merge_patch(&base, &patch).map_err(|e| invalid(e.to_string()))?;
     let write_path = cs
@@ -1010,7 +1011,8 @@ async fn config_update(ctx: &Context, p: &Value) -> Result<Value, ErrorObjectOwn
     merged
         .save(&write_path)
         .map_err(|e| invalid(format!("配置写入失败：{e}")))?;
-    *cs.config.write().unwrap() = merged;
+    *current = merged;
+    drop(current);
     Ok(crate::config_view(&product))
 }
 

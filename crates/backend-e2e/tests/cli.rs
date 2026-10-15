@@ -85,7 +85,7 @@ async fn cli(server: &TestServer, args: &[&str]) -> (i32, String, String) {
 
 async fn run_cli(server: &TestServer, args: &[&str]) -> Output {
     tokio::time::timeout(CLI_TIMEOUT, async {
-        Command::new(env!("CARGO_BIN_EXE_flow-cli"))
+        Command::new(flow_test_support::io::cli_bin())
             .env("FLOW_JOURNAL_TOKEN", TOKEN)
             .args(args)
             .env("FLOW_RPC", server.url())
@@ -440,7 +440,7 @@ async fn url_flag_overrides_env() {
     let server = TestServer::spawn().await;
     // FLOW_RPC 给一个死地址，--url 指活地址：命令行必须赢
     let output = tokio::time::timeout(CLI_TIMEOUT, async {
-        Command::new(env!("CARGO_BIN_EXE_flow-cli"))
+        Command::new(flow_test_support::io::cli_bin())
             .env("FLOW_JOURNAL_TOKEN", TOKEN)
             .args(["workflow", "list", "--url", &server.url()])
             .env("FLOW_RPC", "ws://127.0.0.1:9")
@@ -457,7 +457,7 @@ async fn url_flag_overrides_env() {
 async fn unreachable_server_is_a_local_error_with_hint() {
     // 不起服务：错误必须是 exit 1 + 提示起服务，而不是难懂的传输层堆栈
     let output = tokio::time::timeout(CLI_TIMEOUT, async {
-        Command::new(env!("CARGO_BIN_EXE_flow-cli"))
+        Command::new(flow_test_support::io::cli_bin())
             .env("FLOW_JOURNAL_TOKEN", TOKEN)
             .args(["workflow", "list", "--url", "ws://127.0.0.1:9"])
             .output()
@@ -542,7 +542,7 @@ async fn input_forms_inline_file_and_stdin_agree() {
 
     // '-' 读标准输入
     let mut child = tokio::time::timeout(CLI_TIMEOUT, async {
-        Command::new(env!("CARGO_BIN_EXE_flow-cli"))
+        Command::new(flow_test_support::io::cli_bin())
             .env("FLOW_JOURNAL_TOKEN", TOKEN)
             .args(["run", "start", "cli-demo", "--input", "-"])
             .env("FLOW_RPC", server.url())

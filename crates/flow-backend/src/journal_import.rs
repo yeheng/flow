@@ -138,15 +138,17 @@ fn copy_evidence(source: &Path, target: &Path, inventory: &BTreeMap<String, Stri
 }
 async fn baseline(b: &JournalBackend, key: &str, data: Value) -> Result<()> {
     let request = json!({"key":key,"data":data});
-    let request_id = flow_journal::codec::digest(key.as_bytes());
-    if b.command_status("legacy.import", &request_id)
-        .await?
-        .is_some()
-    {
-        b.command("legacy.import", Some(&request_id), &request, |_| {
-            unreachable!("existing import decision")
-        })
-        .await?;
+    if let Some(existing) = b.inspect(|state| state.legacy.get(key).cloned()).await {
+        let stored: StoredValue = serde_json::from_value(existing["data"].clone())?;
+        let original = flow_journal::value::materialize(
+            b.journal.root(),
+            b.journal.durable_lsn(),
+            &stored,
+            8 * 1024 * 1024,
+        )?;
+        if original != data {
+            return Err(format!("legacy baseline differs: {key}").into());
+        }
         return Ok(());
     }
     let mut mapped = Vec::new();
@@ -249,12 +251,16 @@ pub async fn import(source: &Path, db: &Path, destination: &Path) -> Result<Valu
     // 源库可能带着崩溃遗留的 -wal（清单允许没有 -shm）：只读打开无法跑
     // WAL 恢复会直接失败。先以可写打开**副本**（不动源）checkpoint 归并
     // WAL，再切换只读读取——源证据保持字节原样。
+    let working = destination.join(format!(".legacy-working-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&working)?;
+    let _working_cleanup = WorkingCopy(working.clone());
+    copy_evidence(&backup, &working, &inventory)?;
     {
-        let recover=sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(backup.join(&relative_db))).await?;
+        let recover=sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(working.join(&relative_db))).await?;
         sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&recover).await?;
         recover.close().await;
     }
-    let pool=sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(backup.join(&relative_db)).read_only(true)).await?;
+    let pool=sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(working.join(&relative_db)).read_only(true)).await?;
     let mut snapshot=pool.begin().await?;
     let mut counts=BTreeMap::new();
     for (table,query) in [("workflows","SELECT * FROM workflows ORDER BY id"),("workflow_versions","SELECT * FROM workflow_versions ORDER BY workflow_id, version"),("runs","SELECT * FROM runs ORDER BY id"),("schedules","SELECT * FROM schedules ORDER BY id"),("webhooks","SELECT * FROM webhooks ORDER BY token"),("schedule_fires","SELECT * FROM schedule_fires ORDER BY schedule_id, fire_at")] {
@@ -288,7 +294,11 @@ pub async fn import(source: &Path, db: &Path, destination: &Path) -> Result<Valu
         while offset<length {
             let key=format!("raw/{name}/{offset}");let request_id=flow_journal::codec::digest(key.as_bytes());
             let n=(length-offset).min(128*1024*1024);
-            if backend.command_status("legacy.raw",&request_id).await?.is_some(){use tokio::io::AsyncSeekExt;file.seek(std::io::SeekFrom::Start(offset+n)).await?;offset+=n;continue;}
+            if let Some(existing) = backend.inspect(|state| state.legacy.get(&key).cloned()).await {
+                if existing["source_digest"] != *digest || existing["path"] != *name || existing["offset"] != offset {
+                    return Err("legacy raw fragment differs".into());
+                }
+use tokio::io::AsyncSeekExt;file.seek(std::io::SeekFrom::Start(offset+n)).await?;offset+=n;continue;}
             let mut fragment=(&mut file).take(n);
             let stored=StoredValue::Ref(flow_journal::value::store_stream(&backend.journal,&mut fragment,flow_journal::value::ValueCodec::Bytes).await?);
             backend.command("legacy.raw",Some(&request_id),&json!({"source":identity,"path":name,"offset":offset,"bytes":n}),|_|Ok((vec![Event::new(EventKind::LegacyImport,json!({"key":key,"data":stored,"path":name,"offset":offset.to_string(),"source_digest":digest,"integrity":"legacy_unproven"}))],json!({"key":key})))).await?;
@@ -301,4 +311,11 @@ pub async fn import(source: &Path, db: &Path, destination: &Path) -> Result<Valu
     }.await;
     backend.close().await?;
     result
+}
+
+struct WorkingCopy(PathBuf);
+impl Drop for WorkingCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }

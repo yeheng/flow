@@ -154,19 +154,38 @@ impl SecretSource for SecretFileStore {
 
 /// 0600 写入（unix；其他平台尽力而为）。tmp + rename 原子落盘。
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let tmp = path.with_extension("tmp");
-    {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode_0600()
-            .open(&tmp)
-            .map_err(|e| format!("写入 {} 失败：{e}", tmp.display()))?;
-        file.write_all(bytes)
-            .map_err(|e| format!("写入 {} 失败：{e}", tmp.display()))?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let tmp = parent.join(format!(
+        ".flow-secret-{}.tmp",
+        crate::execution_protocol::transport::fresh_boot_id()
+    ));
+    let result = (|| {
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode_0600()
+                .open(&tmp)
+                .map_err(|e| format!("写入 {} 失败：{e}", tmp.display()))?;
+            file.write_all(bytes)
+                .map_err(|e| format!("写入 {} 失败：{e}", tmp.display()))?;
+            file.sync_all()
+                .map_err(|e| format!("同步 {} 失败：{e}", tmp.display()))?;
+        }
+        std::fs::rename(&tmp, path).map_err(|e| format!("落盘 {} 失败：{e}", path.display()))?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)
+            .and_then(|file| file.sync_all())
+            .map_err(|e| format!("同步目录 {} 失败：{e}", parent.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::rename(&tmp, path).map_err(|e| format!("落盘 {} 失败：{e}", path.display()))
+    result
 }
 
 #[cfg(unix)]
@@ -210,14 +229,16 @@ mod tests {
         let dir = tempdir();
         let store = SecretFileStore::open(&dir).unwrap();
         store.set("K", "original").unwrap();
-        std::fs::create_dir(dir.join("secrets.tmp")).unwrap();
+        std::fs::rename(dir.join("secrets.json"), dir.join("saved.json")).unwrap();
+        std::fs::create_dir(dir.join("secrets.json")).unwrap();
         assert!(store.set("K", "replacement").is_err());
         assert_eq!(store.get("K").as_deref(), Some("original"));
         assert!(store.set("NEW", "value").is_err());
         assert_eq!(store.get("NEW"), None);
         assert!(store.delete("K").is_err());
         assert_eq!(store.names(), vec!["K".to_owned()]);
-        std::fs::remove_dir(dir.join("secrets.tmp")).unwrap();
+        std::fs::remove_dir(dir.join("secrets.json")).unwrap();
+        std::fs::rename(dir.join("saved.json"), dir.join("secrets.json")).unwrap();
         let reopened = SecretFileStore::open(&dir).unwrap();
         assert_eq!(reopened.get("K").as_deref(), Some("original"));
         store.set("K", "replacement").unwrap();
@@ -235,7 +256,7 @@ mod tests {
         store.set("VALID", "value").unwrap();
         for nonce in [
             "".to_owned(),
-            "00".repeat(1),
+            "0".to_owned(),
             "00".repeat(11),
             "00".repeat(12),
             "00".repeat(13),

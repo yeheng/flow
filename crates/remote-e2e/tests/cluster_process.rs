@@ -1,5 +1,5 @@
 #![cfg(feature = "journal-cluster")]
-mod common;
+use backend_e2e::common::wire as common;
 use flow_test_support::io::TempDir;
 use serde_json::{json, Value};
 use std::process::{Command, Stdio};
@@ -17,7 +17,7 @@ fn spawn(dir: &TempDir, cluster: &str, node: &str) -> common::ServerProc {
         ),
     )
     .unwrap();
-    let mut cmd = Command::new(common::server_bin());
+    let mut cmd = Command::new(flow_test_support::io::server_bin());
     cmd.arg("--config")
         .arg(config)
         .env("FLOW_DATA_DIR", dir.path().join("secrets"))

@@ -13,7 +13,7 @@
 //! - 单行超过预算：丢行并计数（NodeLogger 已把行截到 8 KiB，这一条只是
 //!   防御性兜底）。
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
@@ -26,11 +26,7 @@ use flow_engine::log_types::{LogLevel, LogStream};
 use flow_engine::nodelog::{LogLine, NodeLogger};
 
 /// 观测丢弃计数（进程级，退出前回报诊断用）。
-#[derive(Default)]
-pub struct ObservationLoss {
-    pub dropped_lines: AtomicU64,
-    pub dropped_bytes: AtomicU64,
-}
+pub use flow_engine::nodelog::LogQueueLoss as ObservationLoss;
 
 /// 观测转发的命名空间：`start` 起后台转发，`disabled_logger` 起静默出口；
 /// 无实例状态（所有事实经 `Arc<ObservationLoss>` 返回给调用方）。
@@ -48,31 +44,47 @@ pub struct ObservationClose {
 
 impl ObservationClose {
     /// 等转发任务排空退出。带超时防御：若有 logger 克隆泄漏，转发任务
-    /// 永远等不到通道关闭——观测可丢弃，节点执行不能陪葬（超时后泄漏的
-    /// 克隆再触发尾批，由主进程的陈旧批次拒收兜底）。
-    pub async fn close(self) {
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), self.join).await;
+    /// 永远等不到通道关闭；超时后 abort 并等待任务退出，关闭观测入口。
+    pub async fn close(mut self) {
+        if tokio::time::timeout(std::time::Duration::from_millis(500), &mut self.join)
+            .await
+            .is_err()
+        {
+            self.join.abort();
+            let _ = (&mut self.join).await;
+        }
     }
 }
 
 impl ObservationBridge {
-    /// 启动观测转发：NodeLogger 的 unbounded 出口（日志永远不影响执行）
-    /// 转成有界 ObservabilityBatch（data 通道）。超限丢弃并计数。
+    /// 启动有界非阻塞日志入口，按容量、100 ms 周期或关闭发送观测批次。
+    /// 入口与出站超限都丢弃并计数，不阻塞执行。
     pub fn start(
         dispatch_id: String,
         outbound: mpsc::Sender<Message>,
     ) -> (NodeLogger, Arc<ObservationLoss>, ObservationClose) {
         let loss = Arc::new(ObservationLoss::default());
-        let (tx, mut rx) = mpsc::unbounded_channel::<LogLine>();
-        let logger = NodeLogger::new(tx, flow_engine::nodelog::LogBudget::new(usize::MAX), "", 1);
+        // 256 lines, each capped by NodeLogger to 8 KiB plus a small truncation suffix.
+        let (tx, mut rx) = mpsc::channel::<LogLine>(256);
+        let logger = NodeLogger::bounded(tx, loss.clone());
         let forward_loss = loss.clone();
         let forward_dispatch = dispatch_id.clone();
         let forward_outbound = outbound.clone();
         let join = tokio::spawn(async move {
             let mut lines: Vec<ObservationLine> = Vec::new();
             let mut batch_bytes = 0usize;
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            tick.tick().await;
             loop {
-                let maybe_line = rx.recv().await;
+                let maybe_line = tokio::select! {
+                    line = rx.recv() => line,
+                    _ = tick.tick() => {
+                        flush(&forward_outbound, &forward_loss, &forward_dispatch, &mut lines);
+                        batch_bytes = 0;
+                        continue;
+                    }
+                };
                 match maybe_line {
                     None => {
                         flush(
@@ -202,6 +214,32 @@ pub fn dropped(loss: &ObservationLoss) -> (u64, u64) {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn sparse_logs_flush_while_logger_is_alive() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let (logger, _, close) = ObservationBridge::start("sparse".into(), tx);
+        logger.info("live");
+        let message = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(message, Message::ObservabilityBatch { .. }));
+        drop(logger);
+        close.close().await;
+    }
+
+    #[tokio::test]
+    async fn stalled_forwarder_has_bounded_ingress_and_counts_loss() {
+        let (tx, _rx) = mpsc::channel(1);
+        let (logger, loss, close) = ObservationBridge::start("flood".into(), tx);
+        for _ in 0..1000 {
+            logger.error("x".repeat(8192));
+        }
+        assert!(dropped(&loss).0 >= 744);
+        drop(logger);
+        close.close().await;
+    }
+
     /// 回归：引号/控制字符洪水下，批的编码体积必须落在帧限内，且不丢
     /// 行（预算触发分批，而不是超限）；出站队列满时丢批并计数。
     #[tokio::test]
@@ -248,8 +286,8 @@ mod tests {
         let (outbound, mut rx) = mpsc::channel::<Message>(8);
         let (logger, _loss, close) = ObservationBridge::start("dispatch-tail".into(), outbound);
         logger.info("尾批");
-        // 不 close 前不 flush：批的触发条件是容量或通道关闭
-        assert!(rx.try_recv().is_err(), "容量未满时不得提前发批");
+        // Before the forwarding task runs, the tail remains in the ingress queue.
+        assert!(rx.try_recv().is_err());
         drop(logger);
         close.close().await;
         match rx.try_recv() {

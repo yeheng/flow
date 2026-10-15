@@ -445,9 +445,8 @@ pub struct Edge {
 /// 工作流图。前端拖拽的产物，整体作为一个不可变版本存入数据库。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Definition {
-    pub nodes: Vec<Node>,
-    #[serde(default)]
-    pub edges: Vec<Edge>,
+    #[serde(flatten)]
+    data: DefinitionData,
     /// 邻接索引，一次构建。**必须 skip**：Definition 是落库的版本快照，
     /// `flow_store` 还按它的序列化字节算 checksum 决定是否复用版本号
     /// （store/src/lib.rs）。让索引进入序列化就等于给每个 definition 的
@@ -457,6 +456,32 @@ pub struct Definition {
     /// 确实没有任何调用方用结构体字面量构造 `Definition`。
     #[serde(skip)]
     adj: OnceLock<DefinitionIndex>,
+}
+
+/// Editable definition DTO. Compile an edited copy to obtain a fresh indexed graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DefinitionData {
+    pub nodes: Vec<Node>,
+    #[serde(default)]
+    pub edges: Vec<Edge>,
+}
+
+impl std::ops::Deref for Definition {
+    type Target = DefinitionData;
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+impl DefinitionData {
+    pub fn compile(self) -> Result<Definition, String> {
+        let definition = Definition {
+            data: self,
+            adj: OnceLock::new(),
+        };
+        definition.validate()?;
+        Ok(definition)
+    }
 }
 
 /// 邻接索引：按 id 预分组入边/出边 + 节点直查。
@@ -487,14 +512,12 @@ impl PartialEq for Definition {
 }
 
 impl Definition {
-    /// 一次性构建的邻接索引。
-    ///
-    /// **契约：`nodes` / `edges` 在构造后不可变。** 全仓库唯一的构造入口是
-    /// `serde_json::from_value`（`nodes`/`edges` 是 `pub`，但没有任何调用方写过
-    /// 它们——全仓 `\.nodes\s*=` / `\.edges\s*=` 零命中），所以这里不做失效判断：
-    /// 那是为不存在的场景写的机制。要改定义，走新的反序列化，拿到的是全新
-    /// `Definition`。若日后有人开始写这两个字段，`OnceLock` 会静默返回**过期**
-    /// 的索引——那时必须换成每次重建或改字段可见性。
+    /// Editable copy; modifications become visible only by compiling a new definition.
+    pub fn editable(&self) -> DefinitionData {
+        self.data.clone()
+    }
+
+    /// The cached index is bound to private immutable data; no DerefMut is provided.
     fn index(&self) -> &DefinitionIndex {
         self.adj.get_or_init(|| {
             let mut by_id = HashMap::with_capacity(self.nodes.len());
@@ -562,6 +585,17 @@ impl Definition {
         for node in &self.nodes {
             if node.id.trim().is_empty() {
                 return Err("存在空的节点 id".into());
+            }
+            // v5 transfer keys share the in: namespace. Reject ambiguous identities
+            // rather than silently renaming nodes in existing definitions.
+            if matches!(node.id.as_str(), "run-input" | "prepared-params") {
+                return Err(format!(
+                    "节点 id 使用了传输协议保留名：{}；请创建使用新 id 的定义版本",
+                    node.id
+                ));
+            }
+            if node.id.len() > 253 {
+                return Err("节点 id 的 UTF-8 编码不得超过 253 字节（含 in: 前缀总长 256）".into());
             }
             if !seen.insert(node.id.as_str()) {
                 return Err(format!("节点 id 重复：{}", node.id));
@@ -842,6 +876,50 @@ mod tests {
 
     /// 一个带合法默认参数的节点。用它的前提是想验证**图结构**规则，
     /// 不想被「缺参数」提前挡下——所以按类型补上必填参数。
+    #[test]
+    fn edited_definition_recompiles_without_stale_index() {
+        let definition: Definition = serde_json::from_value(serde_json::json!({
+            "nodes":[{"id":"s","type":"start"},{"id":"e","type":"end"}],
+            "edges":[{"from":"s","to":"e"}]
+        }))
+        .unwrap();
+        assert_eq!(definition.incoming_count("e"), 1);
+        let original = serde_json::to_value(&definition).unwrap();
+        let mut edited = definition.editable();
+        edited.nodes[1].id = "new".into();
+        edited.edges[0].to = "new".into();
+        let compiled = edited.compile().unwrap();
+        assert_eq!(compiled.incoming_count("e"), 0);
+        assert_eq!(compiled.incoming_count("new"), 1);
+        assert!(compiled.node("e").is_none());
+        assert_eq!(serde_json::to_value(&definition).unwrap(), original);
+        assert_eq!(definition.incoming_count("e"), 1);
+    }
+
+    #[test]
+    fn transport_identity_limits_are_checked_at_definition_boundary() {
+        for id in [
+            "run-input".to_string(),
+            "prepared-params".to_string(),
+            "x".repeat(254),
+            "界".repeat(85),
+        ] {
+            let definition: Definition = serde_json::from_value(serde_json::json!({
+                "nodes":[{"id":"s","type":"start"},{"id":id,"type":"end"}],
+                "edges":[{"from":"s","to":id}]
+            }))
+            .unwrap();
+            assert!(definition.validate().is_err());
+        }
+        let id = "x".repeat(253);
+        let definition: Definition = serde_json::from_value(serde_json::json!({
+            "nodes":[{"id":"s","type":"start"},{"id":id,"type":"end"}],
+            "edges":[{"from":"s","to":id}]
+        }))
+        .unwrap();
+        definition.validate().unwrap();
+    }
+
     fn node(id: &str, kind: &str) -> Value {
         let params = match kind {
             "script" => json!({"code": "return 1;"}),

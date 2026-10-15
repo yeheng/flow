@@ -293,7 +293,7 @@ mod tests {
         let fat_execute = Message::Execute {
             command_id: "cmd".into(),
             dispatch_id: "d".into(),
-            task: ExecuteTask {
+            task: Box::new(ExecuteTask {
                 run_id: "r".into(),
                 node_id: "n".into(),
                 node_execution_id: "ne".into(),
@@ -304,7 +304,7 @@ mod tests {
                 prepared: None,
                 previous_outcome: None,
                 observability: false,
-            },
+            }),
         };
         assert!(matches!(
             encode_frame(&fat_execute),

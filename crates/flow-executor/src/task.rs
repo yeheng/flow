@@ -657,7 +657,13 @@ impl TaskRunner {
                 if !waiting {
                     logger.info("输入字段已齐，直接放行");
                     return Ok(ResultOutcome::Success {
-                        output: StoredValue::Inline(Value::Object(resolved)),
+                        output: store_value(
+                            audit,
+                            &self.journal_id,
+                            &Value::Object(resolved),
+                            INPUT_BUDGET,
+                        )
+                        .await?,
                         branch: None,
                     });
                 }
@@ -1219,35 +1225,13 @@ impl TaskRunner {
                     )));
                 }
             };
-        use tokio::io::AsyncWriteExt;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| TaskError::Invalid("harness stdin unavailable".into()))?;
-        // 对端不读 stdin 提前退出时 EPIPE 不算失败——退出码会说明一切
-        match stdin.write_all(prompt.as_bytes()).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
-            Err(e) => return Err(TaskError::Uncertain(format!("harness stdin: {e}"))),
-        }
-        drop(stdin);
-        let output =
-            match tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait_with_output())
-                .await
-            {
-                Ok(Ok(output)) => output,
-                Ok(Err(e)) => return Err(TaskError::Uncertain(e.to_string())),
-                // 超时：wait_with_output 被 drop，kill_on_drop 杀掉子进程
-                Err(_) => {
-                    logger.error(format!(
-                        "harness 超时（{}ms，进程已杀死）",
-                        started.elapsed().as_millis()
-                    ));
-                    return Err(TaskError::Uncertain(format!(
-                        "harness timed out after {timeout_ms}ms (process killed)"
-                    )));
-                }
-            };
+        let output = capture_harness(
+            &mut child,
+            prompt.as_bytes(),
+            Duration::from_millis(timeout_ms),
+            &self.cancel,
+        )
+        .await?;
         let exit_code = output
             .status
             .code()
@@ -1479,3 +1463,155 @@ fn elapsed_label(elapsed: Duration) -> String {
 
 #[allow(dead_code)]
 fn unused() {}
+
+/// Capture all three pipes concurrently under one deadline. Partial output is never success.
+async fn capture_harness(
+    child: &mut tokio::process::Child,
+    prompt: &[u8],
+    timeout: Duration,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<std::process::Output, TaskError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| TaskError::Invalid("harness stdin unavailable".into()))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| TaskError::Invalid("harness stdout unavailable".into()))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| TaskError::Invalid("harness stderr unavailable".into()))?;
+    let capture = async {
+        let input = async {
+            match stdin.write_all(prompt).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                Err(e) => return Err(e),
+            }
+            drop(stdin);
+            Ok::<_, std::io::Error>(())
+        };
+        let out = async {
+            let mut bytes = Vec::new();
+            let mut buffer = [0; 8192];
+            loop {
+                let n = stdout.read(&mut buffer).await?;
+                if n == 0 {
+                    break;
+                }
+                if bytes.len() as u64 + n as u64 > flow_journal::MAX_VALUE_BYTES {
+                    return Err(std::io::Error::other(
+                        "harness stdout exceeds capture limit; result incomplete",
+                    ));
+                }
+                bytes.extend_from_slice(&buffer[..n]);
+            }
+            Ok::<_, std::io::Error>(bytes)
+        };
+        let err = async {
+            let mut tail = std::collections::VecDeque::with_capacity(512);
+            let mut buffer = [0; 8192];
+            loop {
+                let n = stderr.read(&mut buffer).await?;
+                if n == 0 {
+                    break;
+                }
+                for byte in &buffer[..n] {
+                    if tail.len() == 512 {
+                        tail.pop_front();
+                    }
+                    tail.push_back(*byte);
+                }
+            }
+            Ok::<_, std::io::Error>(tail.into_iter().collect::<Vec<_>>())
+        };
+        let (_, stdout, stderr, status) = tokio::try_join!(input, out, err, child.wait())?;
+        Ok::<_, std::io::Error>(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    };
+    let result = tokio::select! {
+        result = tokio::time::timeout(timeout, capture) => match result {
+            Ok(Ok(output)) => Ok(output),
+            Ok(Err(error)) => Err(TaskError::Uncertain(format!("harness capture: {error}"))),
+            Err(_) => Err(TaskError::Uncertain("harness deadline exceeded; result incomplete".into())),
+        },
+        _ = cancel.cancelled() => Err(TaskError::Uncertain("harness cancelled; result incomplete".into())),
+    };
+    if result.is_err() {
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    }
+    result
+}
+
+#[cfg(all(test, unix))]
+mod harness_capture_tests {
+    use super::*;
+    async fn capture(
+        script: &str,
+        input: &[u8],
+        timeout: Duration,
+    ) -> Result<std::process::Output, TaskError> {
+        let mut child =
+            flow_engine::exec::harness_command("/bin/sh", &["-c".into(), script.into()], None)
+                .spawn()
+                .unwrap();
+        let result = capture_harness(
+            &mut child,
+            input,
+            timeout,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        assert!(child.try_wait().unwrap().is_some(), "child must be reaped");
+        result
+    }
+    #[tokio::test]
+    async fn blocked_stdin_obeys_deadline_and_reaps() {
+        assert!(matches!(
+            capture(
+                "exec sleep 30",
+                &vec![0; 1024 * 1024],
+                Duration::from_millis(50)
+            )
+            .await,
+            Err(TaskError::Uncertain(_))
+        ));
+    }
+    #[tokio::test]
+    async fn drains_output_while_writing_prompt() {
+        let output = capture(
+            "head -c 131072 /dev/zero; cat",
+            &vec![b'x'; 131072],
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.stdout.len(), 262144);
+    }
+    #[tokio::test]
+    async fn stdout_overflow_never_returns_truncated_success() {
+        assert!(matches!(
+            capture("exec yes", b"", Duration::from_secs(3)).await,
+            Err(TaskError::Uncertain(_))
+        ));
+    }
+    #[tokio::test]
+    async fn stderr_capture_keeps_only_tail() {
+        let output = capture(
+            "head -c 1048576 /dev/zero >&2; printf tail >&2",
+            b"",
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.stderr.len(), 512);
+        assert!(output.stderr.ends_with(b"tail"));
+    }
+}

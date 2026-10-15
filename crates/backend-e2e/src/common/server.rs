@@ -151,6 +151,33 @@ pub struct ServerProc {
 }
 
 impl ServerProc {
+    /// 由已启动的子进程与报出的端口组装（自定义环境形态的 spawn 用，
+    /// 如 wire 契约测试与集群用例自带 FLOW_* 环境变量起进程）。
+    pub fn from_parts(child: Child, addr: SocketAddr, http_addr: SocketAddr) -> Self {
+        ServerProc {
+            child,
+            addr,
+            http_addr,
+        }
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    pub fn http_addr(&self) -> SocketAddr {
+        self.http_addr
+    }
+
+    pub fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait().expect("check server process")
+    }
+
+    /// wire 客户端（固定 TOKEN 的 v2 协议助手，见 [`crate::common::wire`]）。
+    pub async fn client(&self) -> jsonrpsee::ws_client::WsClient {
+        crate::common::wire::connect(self.addr).await
+    }
+
     fn spawn(
         bin: &std::path::Path,
         journal_dir: &std::path::Path,

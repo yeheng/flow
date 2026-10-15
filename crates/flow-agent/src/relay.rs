@@ -211,65 +211,50 @@ pub fn weight_budgeted(message: &Message) -> u64 {
 /// 离开 agent（交 transport 出站队列或发送失败）后归还；预算随消息
 /// 所有权流转，不用无界队列化解背压。
 pub struct UplinkBudget {
-    cap: u64,
-    used: std::sync::atomic::AtomicU64,
-    room: tokio::sync::Notify,
+    cap: u32,
+    semaphore: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl UplinkBudget {
     pub fn new(cap: u64) -> std::sync::Arc<Self> {
+        let cap = u32::try_from(cap)
+            .expect("uplink budget exceeds semaphore limit")
+            .max(1);
         std::sync::Arc::new(Self {
             cap,
-            used: std::sync::atomic::AtomicU64::new(0),
-            room: tokio::sync::Notify::new(),
+            semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(cap as usize)),
         })
     }
 
-    /// 等待并占用 `bytes` 预算（超过 cap 的单帧按 cap 计，不永久等待）。
-    pub async fn acquire(self: &std::sync::Arc<Self>, bytes: u64) {
-        let bytes = bytes.min(self.cap).max(1);
-        loop {
-            let current = self.used.load(std::sync::atomic::Ordering::Acquire);
-            if current.saturating_add(bytes) <= self.cap {
-                if self
-                    .used
-                    .compare_exchange(
-                        current,
-                        current + bytes,
-                        std::sync::atomic::Ordering::AcqRel,
-                        std::sync::atomic::Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    return;
-                }
-                continue;
-            }
-            let notified = self.room.notified();
-            // 已创建等待 future 后重查：避免错过 release 的唤醒。
-            let current = self.used.load(std::sync::atomic::Ordering::Acquire);
-            if current.saturating_add(bytes) <= self.cap {
-                continue;
-            }
-            notified.await;
-        }
-    }
-
-    /// 归还 `bytes` 预算并唤醒一个等待的生产方。
-    pub fn release(&self, bytes: u64) {
-        let current = self.used.load(std::sync::atomic::Ordering::Acquire);
-        let bytes = bytes.min(current);
-        if bytes > 0 {
-            self.used
-                .fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
-        }
-        self.room.notify_one();
+    pub async fn acquire(&self, bytes: u64) -> tokio::sync::OwnedSemaphorePermit {
+        self.semaphore
+            .clone()
+            .acquire_many_owned(bytes.min(self.cap as u64).max(1) as u32)
+            .await
+            .expect("uplink budget never closed")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dropped_and_failed_queue_messages_return_budget() {
+        let budget = UplinkBudget::new(8);
+        for _ in 0..32 {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            let permit = budget.acquire(8).await;
+            tx.send((Message::Ready, permit)).await.unwrap();
+            drop(rx);
+            let permit =
+                tokio::time::timeout(std::time::Duration::from_millis(100), budget.acquire(8))
+                    .await
+                    .unwrap();
+            drop(tx.send((Message::Ready, permit)).await.unwrap_err());
+        }
+        assert_eq!(budget.semaphore.available_permits(), 8);
+    }
 
     fn relay_with_binding() -> Relay {
         let mut relay = Relay::new("agent-1".into(), "boot-1".into(), "link-1".into());

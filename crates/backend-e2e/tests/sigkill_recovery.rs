@@ -5,7 +5,7 @@
 //!    进 uncertain。
 //! 2. 恢复后人工裁决 failed → run 终态 failed（裁决决策面回归）。
 
-mod common;
+use backend_e2e::common::wire as common;
 
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
@@ -16,7 +16,7 @@ async fn spawn_journal(dir: &std::path::Path) -> common::ServerProc {
     use common::spawn_reporting_ports;
     use std::process::{Command, Stdio};
 
-    let mut cmd = Command::new(common::server_bin());
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_flow-journal-server-e2e"));
     cmd.env("FLOW_BACKEND", "journal")
         .env("FLOW_DATA_DIR", dir.join("secrets"))
         .env("FLOW_JOURNAL_DATA_DIR", dir.join("journal"))

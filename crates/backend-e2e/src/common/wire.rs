@@ -1,76 +1,34 @@
-//! flow-rpc 集成测试基建：真起 `flow-journal-server` 进程（隔离 Journal 目录）、
-//! JSON-RPC 客户端助手、定义构造器。
+//! wire 级进程 harness：真起 `flow-journal-server` 进程 + v2 JSON-RPC 客户端助手。
 //!
-//! 进程脚手架统一在这里：`ServerProc` / `free_port` / `wait_ready` / `connect` /
-//! `named` / `call` / `call_err` / `line_def` 这些跨用例共用的东西只此一份
-//! （DESIGN.md §14：共享夹具不逐文件复制——复制品会各自漂移）。
-//! 就绪判定用 TCP connect 轮询（DESIGN.md §14 的约定）；`connect` 带重试，
-//! 因为进程刚 bind 上端口时 RPC 路由可能还没装完。
+//! 来源：原 `flow-rpc/tests/common/mod.rs`（测试随套件拆分迁入 backend-e2e，
+//! 见 docs/e2e-coverage.md 的 E01 盘点）。单点维护原则不变（DESIGN.md §14）：
+//! [`ServerProc`] 的进程管理真身在 [`crate::common::server`]（与 e2e_test! 宏
+//! 的 Ctx 共用一份），这里只补 `from_parts` 装配口和客户端协议助手。
 //!
-//! common 被多个 Journal 测试二进制共享，各自使用不同的辅助函数。
-#![allow(dead_code)]
+//! 与 `client.rs` 的分工：那边的 `Conn` 绑定 e2e 随机 token（e2e_test! 用例）；
+//! 这边是固定 TOKEN + 具名参数 + `.view` 物化 + request_id 注入的 v2 wire
+//! 约定，供迁移过来的 wire 契约测试（journal_v2 / ws_journal / sigkill /
+//! cluster）继续讲同一套协议。
+//!
+//! 被测二进制定位**不在这里**：`env!("CARGO_BIN_EXE_*")` 只在测试 target
+//! 编译期注入，lib 里取不到。各测试自己解析：
+//! - backend-e2e 内：`env!("CARGO_BIN_EXE_flow-journal-server-e2e")`
+//! - 其他 crate（remote-e2e）：`flow_test_support::io::server_bin()`
 
 pub use flow_test_support::io::spawn_reporting_ports;
-pub fn server_bin() -> std::path::PathBuf {
-    env!("CARGO_BIN_EXE_flow-journal-server").into()
-}
+
+pub use crate::common::server::ServerProc;
+
+/// 固定部署 token（迁移前的 flow-rpc 进程测试沿用同一约定）。
 pub const TOKEN: &str = "flow-rpc-process-test-token-32-bytes";
 
 use std::net::SocketAddr;
-use std::process::Child;
 use std::time::{Duration, Instant};
 
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::core::params::ObjectParams;
 use jsonrpsee::ws_client::{WsClient, WsClientBuilder};
 use serde_json::{json, Value};
-
-/// 一个被测 flow-journal-server 进程。Drop 保证 SIGKILL + wait（不漏僵尸）。
-pub struct ServerProc {
-    child: Child,
-    addr: SocketAddr,
-    http_addr: SocketAddr,
-}
-
-impl ServerProc {
-    /// 由已启动的子进程与报出的端口组装（自定义环境形态的 spawn 用）。
-    pub fn from_parts(
-        child: std::process::Child,
-        addr: SocketAddr,
-        http_addr: SocketAddr,
-    ) -> ServerProc {
-        ServerProc {
-            child,
-            addr,
-            http_addr,
-        }
-    }
-
-    pub fn addr(&self) -> SocketAddr {
-        self.addr
-    }
-
-    pub fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
-        self.child.try_wait().expect("check server process")
-    }
-
-    pub async fn client(&self) -> WsClient {
-        connect(self.addr).await
-    }
-
-    /// SIGKILL：崩溃恢复必须是「没机会做任何清理」的死法。
-    pub fn kill(&mut self) {
-        self.child.kill().expect("kill 失败");
-        self.child.wait().expect("wait 失败");
-    }
-}
-
-impl Drop for ServerProc {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
 
 /// 连上 WebSocket 服务端，失败重试到超时（进程刚 bind 上端口时路由可能还没装完）。
 pub async fn connect(addr: SocketAddr) -> WsClient {

@@ -18,7 +18,9 @@ use tokio::sync::mpsc;
 use crate::journal::JournalBackend;
 use crate::journal_execution::Attempt;
 use flow_engine::execution_protocol::contract::{DURABLE_WAIT_TIMEOUT_MS, TRANSFER_CHUNK_BYTES};
-use flow_engine::execution_protocol::message::{Message, ResultOutcome, WaitKind as WaitRequestKind};
+use flow_engine::execution_protocol::message::{
+    Message, ResultOutcome, WaitKind as WaitRequestKind,
+};
 use flow_engine::execution_protocol::record_bytes;
 use flow_engine::execution_protocol::TransferKey;
 use flow_engine::journal_state::{Prepared, Run, RunStatus, Wait, WaitKind};
@@ -313,7 +315,7 @@ impl DispatchRunner {
                 .send(ToSession::Send(Box::new(Message::Execute {
                     command_id: command_id.clone(),
                     dispatch_id: self.attempt.dispatch_id.clone(),
-                    task,
+                    task: Box::new(task),
                 })))
                 .await
                 .map_err(|_| invalid("executor session closed before execute"))?;

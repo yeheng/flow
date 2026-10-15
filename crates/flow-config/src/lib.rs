@@ -189,20 +189,12 @@ pub struct RemoteExecutionConfig {
 /// agent 身份；id 与 token 在表内都不得重复。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[derive(Default)]
 pub struct AgentCredential {
     /// agent 身份（会话注册键，对应 x-flow-agent-id 一致性断言）。
     pub id: String,
     /// 该 agent 的接入令牌（不共享）。
     pub token: String,
-}
-
-impl Default for AgentCredential {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            token: String::new(),
-        }
-    }
 }
 
 impl Default for RemoteExecutionConfig {
@@ -448,8 +440,7 @@ impl Config {
             // T13：WSS 监听地址与凭据映射表必须成对配置（认证不能留空）。
             if remote.wss_addr.is_some() != !remote.agents.is_empty() {
                 return Err(
-                    "execution.remote.wss_addr 与 agents 必须同时配置（WSS 认证不可留空）"
-                        .into(),
+                    "execution.remote.wss_addr 与 agents 必须同时配置（WSS 认证不可留空）".into(),
                 );
             }
             // 凭据表的硬约束：id/token 非空、各自唯一——token→身份必须
@@ -510,18 +501,7 @@ impl Config {
             "# flow 统一配置（flow config update 会整文件重写，手工注释不会保留）\n\
              # 分层：CLI --config > 环境变量 > 本文件 > 内置默认值\n\n",
         );
-        let tmp = path.with_extension("toml.tmp");
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
-        std::fs::write(&tmp, body).map_err(|source| ConfigError::Io {
-            path: tmp.clone(),
-            source,
-        })?;
-        std::fs::rename(&tmp, path).map_err(|source| ConfigError::Io {
+        durable_write(path, body.as_bytes()).map_err(|source| ConfigError::Io {
             path: path.to_path_buf(),
             source,
         })?;
@@ -954,4 +934,41 @@ data_dir = "/var/lib/flow/journal"
         let result = Config::load(Some(Path::new("/nonexistent/flow-config-test.toml")));
         assert!(matches!(result, Err(ConfigError::Io { .. })));
     }
+}
+
+/// Atomic replacement; Unix success includes syncing the file and parent directory.
+fn durable_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let (tmp, mut file) = loop {
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = parent.join(format!(".flow-config-{}-{id}.tmp", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => break (tmp, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    result
 }

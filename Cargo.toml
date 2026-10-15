@@ -13,6 +13,7 @@ members = [
     "crates/flow-cli",
     "crates/flow-test-support",
     "crates/backend-e2e",
+    "crates/remote-e2e",
     "crates/backend-perf",
 ]
 

@@ -1,9 +1,13 @@
-# backend-e2e：端到端测试项目（真起 flow-journal-server 进程，journal v2 产品面）。
+# backend-e2e：单机 E2E 套件（真起 flow-journal-server 进程，journal v2 产品面）。
 #
-# 覆盖策略（DESIGN.md §14 的延伸）：
+# 覆盖策略（DESIGN.md §14 的延伸，docs/e2e-coverage.md 的「单机」臂）：
 # - 每个用例独占一个临时 journal 目录（v2 唯一权威，全新数据集），经真实
 #   wire（进程外 WS + HTTP）钉 v2 协议与物化数据形状；
-# - v1 RPC 面（flow-server）与 Postgres 后端均已删除，无对应测试臂。
+# - 原产品 crate（flow-backend / flow-rpc / flow-cli）的 tests/ 已并入本套件：
+#   journal_* 为后端进程内/IPC 集成，journal_v2 / ws_journal / sigkill /
+#   webhook / contracts 为 wire 契约，cli* 为 CLI 子进程往返；
+# - 分布式（agent/集群）用例在 remote-e2e；v1 RPC 面（flow-server）与
+#   Postgres 后端均已删除，无对应测试臂。
 #
 # 运行：cargo test -p backend-e2e
 # 环境变量：
@@ -21,11 +25,13 @@ serde_json = { workspace = true }
 serde = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
-jsonrpsee = { version = "0.26", features = ["client", "ws-client"] }
+jsonrpsee = { version = "0.26", features = ["client", "ws-client", "server"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 flow-backend = { path = "../flow-backend" }
 flow-rpc = { path = "../flow-rpc" }
 flow-config = { path = "../flow-config" }
+flow-engine = { path = "../flow-engine" }
+flow-journal = { path = "../flow-journal" }
 flow-test-support = { path = "../flow-test-support" }
 rustls = { workspace = true }
 
@@ -47,3 +53,13 @@ path = "src/bin/flow-journal-server-e2e.rs"
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+tempfile = "3"
+tracing-subscriber = { workspace = true }
+parking_lot = { workspace = true }
+tokio-util = { workspace = true }
+axum = { workspace = true }
+cron-parser = { workspace = true }
+sqlx = { workspace = true }
+libc = { workspace = true }
+flow-dto = { path = "../flow-dto" }
+flow-store = { path = "../flow-store" }

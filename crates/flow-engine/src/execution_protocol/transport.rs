@@ -244,7 +244,10 @@ impl FrameTransport {
         .await;
         self.close();
         for task in self.io.readers.iter_mut().chain(self.io.writers.iter_mut()) {
-            task.abort();
+            if !task.is_finished() {
+                task.abort();
+                let _ = task.await;
+            }
         }
     }
 
@@ -258,14 +261,55 @@ impl FrameTransport {
     }
 
     /// 等待全部 I/O 任务退出（关闭后回收）。
-    pub async fn join(self) {
-        let io = self.io;
-        for reader in io.readers {
-            let _ = reader.await;
+    pub async fn join(mut self) {
+        for task in self.io.readers.iter_mut().chain(self.io.writers.iter_mut()) {
+            let _ = task.await;
         }
-        for writer in io.writers {
-            let _ = writer.await;
+    }
+}
+
+impl Drop for FrameTransport {
+    fn drop(&mut self) {
+        self.outbound = dead_sender();
+        for task in &self.io.readers {
+            task.abort();
         }
+        let mut writers = std::mem::take(&mut self.io.writers);
+        let state = self.io.state.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_millis(DRAIN_GRACE_MS), async {
+                        for writer in &mut writers {
+                            let _ = writer.await;
+                        }
+                    })
+                    .await;
+                state.stop();
+                for writer in &mut writers {
+                    if !writer.is_finished() {
+                        writer.abort();
+                        let _ = writer.await;
+                    }
+                }
+            });
+        } else {
+            state.stop();
+            for writer in writers {
+                writer.abort();
+            }
+        }
+    }
+}
+
+async fn deliver(
+    events: &mpsc::Sender<IoEvent>,
+    event: IoEvent,
+    state: &SessionState,
+) -> Result<(), ()> {
+    tokio::select! {
+        result = events.send(event) => result.map_err(|_| ()),
+        _ = state.terminate.cancelled() => Err(()),
     }
 }
 
@@ -299,14 +343,14 @@ async fn read_loop(
         };
         match read {
             Ok(0) => {
-                let _ = events.send(IoEvent::Eof).await;
+                let _ = deliver(&events, IoEvent::Eof, &state).await;
                 state.stop();
                 return;
             }
             Ok(n) => {
                 if let Err(error) = decoder.feed(&buffer[..n]) {
                     // 错误事实随事件送达（优先于后续排队帧）；会话停止。
-                    let _ = events.send(IoEvent::Failed(error)).await;
+                    let _ = deliver(&events, IoEvent::Failed(error), &state).await;
                     state.stop();
                     return;
                 }
@@ -314,7 +358,7 @@ async fn read_loop(
                     let popped = match decoder.pop() {
                         Ok(popped) => popped,
                         Err(error) => {
-                            let _ = events.send(IoEvent::Failed(error)).await;
+                            let _ = deliver(&events, IoEvent::Failed(error), &state).await;
                             state.stop();
                             return;
                         }
@@ -322,8 +366,7 @@ async fn read_loop(
                     let Some(message) = popped else {
                         break;
                     };
-                    if events
-                        .send(IoEvent::Frame(Box::new(message)))
+                    if deliver(&events, IoEvent::Frame(Box::new(message)), &state)
                         .await
                         .is_err()
                     {
@@ -332,7 +375,7 @@ async fn read_loop(
                 }
             }
             Err(error) => {
-                let _ = events.send(IoEvent::Failed(ProtocolError::Io(error))).await;
+                let _ = deliver(&events, IoEvent::Failed(ProtocolError::Io(error)), &state).await;
                 // 读失败的错误事实已随事件送达；这里只停会话，不覆盖错误槽。
                 state.stop();
                 return;
@@ -387,18 +430,29 @@ async fn write_loop(
                 continue;
             }
         };
-        if let Err(error) = stream.write_all(&frame).await {
+        let written = tokio::select! {
+            result = stream.write_all(&frame) => result,
+            _ = state.terminate.cancelled() => return,
+        };
+        if let Err(error) = written {
             tracing::error!(type_name = message.type_name(), %error, "frame write failed");
             state.fail(ProtocolError::Io(error));
             return;
         }
-        if let Err(error) = stream.flush().await {
+        let flushed = tokio::select! {
+            result = stream.flush() => result,
+            _ = state.terminate.cancelled() => return,
+        };
+        if let Err(error) = flushed {
             tracing::error!(type_name = message.type_name(), %error, "frame flush failed");
             state.fail(ProtocolError::Io(error));
             return;
         }
     }
-    let _ = stream.shutdown().await;
+    tokio::select! {
+        _ = stream.shutdown() => {},
+        _ = state.terminate.cancelled() => {},
+    }
 }
 
 /// 有界出站积压（T03）：服务循环在传输队列满时按 FIFO 暂存重试，避免
@@ -945,6 +999,33 @@ mod tests {
 #[cfg(test)]
 mod terminal_event_tests {
     use super::*;
+    #[tokio::test]
+    async fn close_interrupts_blocked_writer() {
+        let (stream, _peer) = tokio::io::duplex(1);
+        let mut transport = FrameTransport::spawn(stream, 8);
+        transport.send(Message::Ready).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        transport.close();
+        tokio::time::timeout(std::time::Duration::from_millis(200), transport.join())
+            .await
+            .expect("blocked writer must stop");
+    }
+
+    #[tokio::test]
+    async fn close_interrupts_full_incoming_queue() {
+        let (stream, peer) = tokio::io::duplex(4096);
+        let mut transport = FrameTransport::spawn(stream, 8);
+        let sender = FrameTransport::spawn(peer, 32);
+        for _ in 0..24 {
+            sender.send(Message::Ready).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        transport.close();
+        tokio::time::timeout(std::time::Duration::from_millis(200), transport.join())
+            .await
+            .expect("full incoming queue must stop");
+    }
+
     #[tokio::test]
     async fn graceful_close_writes_queued_control_frame() {
         use tokio::io::AsyncReadExt;

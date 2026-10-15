@@ -265,9 +265,10 @@ mod tests {
             .expect("runtime");
         runtime.block_on(async {
             use tokio::io::AsyncReadExt;
-            let (mut channel, mut child) = spawn_executor_loopback(&invocation, None, "tok".into(), &[])
-                .await
-                .expect("loopback session");
+            let (mut channel, mut child) =
+                spawn_executor_loopback(&invocation, None, "tok".into(), &[])
+                    .await
+                    .expect("loopback session");
             let mut buf = [0u8; 4];
             tokio::time::timeout(Duration::from_secs(5), channel.read_exact(&mut buf))
                 .await
@@ -312,8 +313,12 @@ mod tests {
             let exec = script(&dir, "exit 1");
             let invocation = super::super::contract::ExecutorInvocation::explicit(exec);
             let start = std::time::Instant::now();
-            let result =
-                runtime.block_on(spawn_executor_loopback(&invocation, None, "tok".into(), &[]));
+            let result = runtime.block_on(spawn_executor_loopback(
+                &invocation,
+                None,
+                "tok".into(),
+                &[],
+            ));
             assert!(result.is_err(), "child exit must surface as error");
             assert!(
                 start.elapsed() < Duration::from_secs(20),
