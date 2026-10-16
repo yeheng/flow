@@ -305,13 +305,18 @@ version = "0.1.0"
 dependencies = [
  "backend-e2e",
  "chrono",
+ "flow-backend",
  "flow-config",
+ "flow-engine",
+ "flow-journal",
  "flow-rpc",
  "futures",
  "jsonrpsee",
+ "libc",
  "rustls",
  "serde",
  "serde_json",
+ "sqlx",
  "tokio",
  "uuid",
 ]
@@ -1008,8 +1013,10 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "flow-test-support",
+ "hex",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "tokio",
 ]

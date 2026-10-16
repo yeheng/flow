@@ -31,7 +31,7 @@ impl Attempt {
     ) -> Result<Self> {
         let dispatch_id = id();
         backend
-            .internal(|state| {
+            .internal_for_run(&run_id, |state| {
                 let run = state
                     .runs
                     .get(&run_id)
@@ -62,13 +62,13 @@ impl Attempt {
     }
     pub async fn snapshot(&self) -> Result<Run> {
         self.backend
-            .inspect(|s| s.runs.get(&self.run_id).cloned())
-            .await
+            .run_snapshot(&self.run_id)
+            .await?
             .ok_or_else(|| invalid("run missing").into())
     }
     pub async fn finish(&self, kind: EventKind, mut payload: Value) -> Result<()> {
         self.backend
-            .internal(|state| {
+            .internal_for_run(&self.run_id, |state| {
                 let run = state
                     .runs
                     .get(&self.run_id)

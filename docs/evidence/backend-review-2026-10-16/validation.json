@@ -1,0 +1,22 @@
+{
+  "workspace_tests": {
+    "passed": 398,
+    "failed": 0,
+    "ignored": 11,
+    "panic_found": false,
+    "log": "/private/tmp/flow-cold-workspace-final.log"
+  },
+  "pool_lifecycle_tests": {
+    "passed": 2,
+    "failed": 0
+  },
+  "legacy_baseline_feature_check": "passed",
+  "notes": [
+    "PG runtime, Windows and actual power loss not tested",
+    "Performance measurements have separate reports; test pass is not capacity acceptance"
+  ],
+  "workspace_build": "passed",
+  "strict_clippy_all_targets": "passed",
+  "journal_cluster_compile": "passed",
+  "diff_check": "passed"
+}

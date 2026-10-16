@@ -438,7 +438,7 @@ async fn sigkill_after_external_request_recovers_uncertain_without_resend() {
             let n = &s.runs[&id].nodes["h"];
             if n.wait
                 .as_ref()
-                .is_some_and(|w| w.kind == WaitKind::Uncertain)
+                .is_some_and(|w| w.kind() == WaitKind::Uncertain)
             {
                 break;
             }

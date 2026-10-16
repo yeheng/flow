@@ -1,0 +1,143 @@
+{
+  "arch": "aarch64",
+  "generated_at": "2026-10-16T06:44:38.394955Z",
+  "legacy_baseline": true,
+  "os": "macos",
+  "profile": "release",
+  "result": {
+    "audits": 100000,
+    "errors": 0,
+    "mode": "audits",
+    "samples": [
+      {
+        "audits": 1000,
+        "batch_commit": {
+          "count": 16,
+          "max_ms": 11.63075,
+          "p50_ms": 10.981582999999999,
+          "p95_ms": 11.63075,
+          "p99_ms": 11.63075
+        },
+        "checkpoint_error": null,
+        "checkpoint_ok": true,
+        "diagnostics": {
+          "applied_lsn": 21,
+          "commit_pending": false,
+          "coordinator_last_tick_ms": 0,
+          "coordinator_ticks": 0,
+          "dirty_runs": [
+            "audit"
+          ],
+          "durable_lsn": 21,
+          "executor_peak": 0,
+          "now_ms": 1792133046419,
+          "peak_queued_requests": 1,
+          "projected_lsn": 21,
+          "projection_error": null,
+          "writer_failure": null,
+          "dirty_run_count": 1,
+          "dirty_run_ids_truncated": false
+        },
+        "disk_bytes": 1864446,
+        "elapsed_secs": 0.191996084,
+        "resources": {
+          "children": [],
+          "master": {
+            "fds": 16,
+            "pid": 47630,
+            "rss_bytes": 16007168,
+            "threads": 9
+          },
+          "tokio_tasks": 2
+        }
+      },
+      {
+        "audits": 10000,
+        "batch_commit": {
+          "count": 141,
+          "max_ms": 15.75,
+          "p50_ms": 11.639167,
+          "p95_ms": 14.035292,
+          "p99_ms": 15.261875
+        },
+        "checkpoint_error": null,
+        "checkpoint_ok": true,
+        "diagnostics": {
+          "applied_lsn": 162,
+          "commit_pending": false,
+          "coordinator_last_tick_ms": 0,
+          "coordinator_ticks": 0,
+          "dirty_runs": [
+            "audit"
+          ],
+          "durable_lsn": 162,
+          "executor_peak": 0,
+          "now_ms": 1792133048114,
+          "peak_queued_requests": 1,
+          "projected_lsn": 162,
+          "projection_error": null,
+          "writer_failure": null,
+          "dirty_run_count": 1,
+          "dirty_run_ids_truncated": false
+        },
+        "disk_bytes": 9538241,
+        "elapsed_secs": 1.887035625,
+        "resources": {
+          "children": [],
+          "master": {
+            "fds": 16,
+            "pid": 47630,
+            "rss_bytes": 56049664,
+            "threads": 9
+          },
+          "tokio_tasks": 2
+        }
+      },
+      {
+        "audits": 100000,
+        "batch_commit": {
+          "count": 1407,
+          "max_ms": 144.554541,
+          "p50_ms": 16.895375,
+          "p95_ms": 23.485333,
+          "p99_ms": 27.153416999999997
+        },
+        "checkpoint_error": null,
+        "checkpoint_ok": true,
+        "diagnostics": {
+          "applied_lsn": 1569,
+          "commit_pending": false,
+          "coordinator_last_tick_ms": 0,
+          "coordinator_ticks": 0,
+          "dirty_runs": [
+            "audit"
+          ],
+          "durable_lsn": 1569,
+          "executor_peak": 0,
+          "now_ms": 1792133072539,
+          "peak_queued_requests": 1,
+          "projected_lsn": 837,
+          "projection_error": null,
+          "writer_failure": null,
+          "dirty_run_count": 1,
+          "dirty_run_ids_truncated": false
+        },
+        "disk_bytes": 47355138,
+        "elapsed_secs": 26.3120835,
+        "resources": {
+          "children": [],
+          "master": {
+            "fds": 16,
+            "pid": 47630,
+            "rss_bytes": 5268045824,
+            "threads": 9
+          },
+          "tokio_tasks": 2
+        }
+      }
+    ],
+    "timeouts": 0
+  },
+  "source_report": "/private/tmp/flow-baseline-audits-100k.json",
+  "baseline_commit": "e58b9ab84a0a26d97a2c1f52ac20529385b2adaf"
+}

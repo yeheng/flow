@@ -33,3 +33,21 @@ backend-e2e = { path = "../backend-e2e" }
 
 flow-config = { path = "../flow-config" }
 rustls = { workspace = true }
+
+[[bin]]
+name = "flow-capacity"
+path = "src/capacity.rs"
+
+[features]
+legacy-baseline = []
+
+[dependencies.flow-backend]
+path = "../flow-backend"
+[dependencies.flow-engine]
+path = "../flow-engine"
+[dependencies.flow-journal]
+path = "../flow-journal"
+[dependencies.sqlx]
+workspace = true
+[dependencies.libc]
+workspace = true

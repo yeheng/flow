@@ -1,0 +1,134 @@
+{
+  "arch": "aarch64",
+  "generated_at": "2026-10-16T03:51:52.516153Z",
+  "legacy_baseline": false,
+  "os": "macos",
+  "profile": "release",
+  "result": {
+    "crash_prefix_probes": [
+      {
+        "acknowledged": 128,
+        "acknowledged_prefix_intact": true,
+        "fault": "SIGKILL with next transaction unacknowledged/open",
+        "power_loss_tested": false,
+        "recovered": 129,
+        "storage": "journal"
+      },
+      {
+        "acknowledged": 128,
+        "acknowledged_prefix_intact": true,
+        "fault": "SIGKILL with next transaction unacknowledged/open",
+        "power_loss_tested": false,
+        "recovered": 128,
+        "storage": "sqlite"
+      }
+    ],
+    "errors": 0,
+    "mode": "storage-comparison",
+    "results": [
+      {
+        "batch": 1,
+        "commit": {
+          "count": 10000,
+          "max_ms": 17.449209,
+          "p50_ms": 10.945875000000001,
+          "p95_ms": 11.718458,
+          "p99_ms": 12.221333
+        },
+        "disk_bytes": 13157003,
+        "events": 10000,
+        "replay_ms": 47.064542,
+        "resources": {
+          "children": [],
+          "master": {
+            "fds": 10,
+            "pid": 33189,
+            "rss_bytes": 8765440,
+            "threads": 6
+          },
+          "tokio_tasks": 0
+        },
+        "storage": "journal",
+        "write_secs": 108.338304709
+      },
+      {
+        "batch": 1,
+        "commit": {
+          "count": 10000,
+          "max_ms": 313.46054200000003,
+          "p50_ms": 0.071583,
+          "p95_ms": 0.097042,
+          "p99_ms": 0.15670800000000001
+        },
+        "disk_bytes": 13697024,
+        "events": 10000,
+        "replay_ms": 16.525667000000002,
+        "resources": {
+          "children": [],
+          "master": {
+            "fds": 13,
+            "pid": 33189,
+            "rss_bytes": 14663680,
+            "threads": 7
+          },
+          "tokio_tasks": 1
+        },
+        "storage": "sqlite-events-full-wal",
+        "write_secs": 1.141740375
+      },
+      {
+        "batch": 64,
+        "commit": {
+          "count": 157,
+          "max_ms": 14.330167,
+          "p50_ms": 12.407334,
+          "p95_ms": 13.639708,
+          "p99_ms": 14.256958000000001
+        },
+        "disk_bytes": 11318292,
+        "events": 10000,
+        "replay_ms": 33.627417,
+        "resources": {
+          "children": [],
+          "master": {
+            "fds": 10,
+            "pid": 33189,
+            "rss_bytes": 15728640,
+            "threads": 6
+          },
+          "tokio_tasks": 0
+        },
+        "storage": "journal",
+        "write_secs": 1.960675375
+      },
+      {
+        "batch": 64,
+        "commit": {
+          "count": 157,
+          "max_ms": 6.800040999999999,
+          "p50_ms": 0.6025419999999999,
+          "p95_ms": 0.967959,
+          "p99_ms": 6.474457999999999
+        },
+        "disk_bytes": 13697024,
+        "events": 10000,
+        "replay_ms": 16.33825,
+        "resources": {
+          "children": [],
+          "master": {
+            "fds": 13,
+            "pid": 33189,
+            "rss_bytes": 15958016,
+            "threads": 7
+          },
+          "tokio_tasks": 1
+        },
+        "storage": "sqlite-events-full-wal",
+        "write_secs": 0.1204125
+      }
+    ],
+    "scope": "append and bounded replay of identical 1 KiB logical facts; not a full workflow-engine migration or power-loss proof",
+    "timeouts": 0
+  },
+  "source_report": "/private/tmp/flow-cold-storage-10k.json"
+}

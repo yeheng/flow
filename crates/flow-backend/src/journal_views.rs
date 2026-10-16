@@ -21,25 +21,22 @@ fn parse_ts(raw: &str) -> Result<DateTime<Utc>> {
         .map_err(|e| internal(format!("invalid timestamp {raw}: {e}")))
 }
 
-fn materialize(backend: &JournalBackend, stored: &StoredValue, limit: usize) -> Result<Value> {
-    flow_journal::value::materialize(
-        backend.journal.root(),
-        backend.journal.durable_lsn(),
-        stored,
-        limit,
-    )
-    .map_err(|e| internal(format!("value materialization: {e}")))
-}
-
 fn workflow_version(
-    backend: &JournalBackend,
+    root: &std::path::Path,
+    upper: u64,
     workflow_id: &str,
     version: &flow_engine::journal_state::DefinitionVersion,
 ) -> Result<WorkflowVersion> {
     Ok(WorkflowVersion {
         workflow_id: workflow_id.to_string(),
         version: version.version as i64,
-        definition: materialize(backend, &version.definition, MAX_LINE_BYTES)?,
+        definition: flow_journal::value::materialize(
+            root,
+            upper,
+            &version.definition,
+            MAX_LINE_BYTES,
+        )
+        .map_err(internal)?,
         checksum: version.checksum.clone(),
         status: if version.published {
             STATUS_PUBLISHED.into()
@@ -55,53 +52,113 @@ pub async fn get_version(
     workflow_id: &str,
     version: Option<i64>,
 ) -> Result<WorkflowVersion> {
-    let state = backend.state().await;
-    let workflow = state
-        .workflows
-        .get(workflow_id)
-        .ok_or_else(|| ViewError::WorkflowNotFound(workflow_id.to_string()))?;
-    match version {
-        Some(v) => {
-            let stored = workflow
-                .versions
-                .get(&(v as u64))
-                .ok_or_else(|| ViewError::VersionNotFound(workflow_id.to_string(), v))?;
-            workflow_version(backend, workflow_id, stored)
-        }
-        None => {
-            let (_, latest) = workflow
-                .versions
-                .last_key_value()
-                .ok_or_else(|| ViewError::WorkflowNotFound(workflow_id.to_string()))?;
-            workflow_version(backend, workflow_id, latest)
-        }
-    }
+    let stored = backend
+        .inspect(|state| {
+            let workflow = state
+                .workflows
+                .get(workflow_id)
+                .ok_or_else(|| ViewError::WorkflowNotFound(workflow_id.into()))?;
+            match version {
+                Some(v) => workflow
+                    .versions
+                    .get(&(v as u64))
+                    .cloned()
+                    .ok_or_else(|| ViewError::VersionNotFound(workflow_id.into(), v)),
+                None => workflow
+                    .versions
+                    .last_key_value()
+                    .map(|(_, v)| v.clone())
+                    .ok_or_else(|| ViewError::WorkflowNotFound(workflow_id.into())),
+            }
+        })
+        .await?;
+    let root = backend.journal.root().to_path_buf();
+    let upper = backend.journal.durable_lsn();
+    let workflow_id = workflow_id.to_owned();
+    tokio::task::spawn_blocking(move || workflow_version(&root, upper, &workflow_id, &stored))
+        .await
+        .map_err(internal)?
 }
 
 pub async fn latest_published(backend: &JournalBackend, workflow_id: &str) -> Result<Option<i64>> {
     Ok(backend
-        .state()
-        .await
-        .workflows
-        .get(workflow_id)
-        .and_then(|w| w.versions.iter().rev().find(|(_, v)| v.published))
-        .map(|(v, _)| *v as i64))
+        .inspect(|state| {
+            state
+                .workflows
+                .get(workflow_id)
+                .and_then(|w| w.versions.iter().rev().find(|(_, v)| v.published))
+                .map(|(v, _)| *v as i64)
+        })
+        .await)
 }
 
 pub async fn list_versions(
     backend: &JournalBackend,
     workflow_id: &str,
 ) -> Result<Vec<WorkflowVersion>> {
-    let state = backend.state().await;
-    let workflow = state
-        .workflows
-        .get(workflow_id)
-        .ok_or_else(|| ViewError::WorkflowNotFound(workflow_id.to_string()))?;
-    let mut versions = Vec::new();
-    for (_, stored) in workflow.versions.iter().rev() {
-        versions.push(workflow_version(backend, workflow_id, stored)?);
+    let stored = backend
+        .inspect(|state| {
+            state
+                .workflows
+                .get(workflow_id)
+                .map(|w| w.versions.values().rev().cloned().collect::<Vec<_>>())
+                .ok_or_else(|| ViewError::WorkflowNotFound(workflow_id.into()))
+        })
+        .await?;
+    reserve_values(stored.iter().map(|v| &v.definition))?;
+    let root = backend.journal.root().to_path_buf();
+    let upper = backend.journal.durable_lsn();
+    let workflow_id = workflow_id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        stored
+            .iter()
+            .map(|v| workflow_version(&root, upper, &workflow_id, v))
+            .collect()
+    })
+    .await
+    .map_err(internal)?
+}
+
+/// Metadata reads never open definition value files or clone execution history.
+pub async fn version_metadata(backend: &JournalBackend, workflow_id: &str) -> Result<Vec<Value>> {
+    backend
+        .inspect(|state| {
+            let workflow = state
+                .workflows
+                .get(workflow_id)
+                .ok_or_else(|| ViewError::WorkflowNotFound(workflow_id.into()))?;
+            workflow
+                .versions
+                .values()
+                .rev()
+                .map(|v| {
+                    Ok(json!({
+                        "version": v.version as i64,
+                        "status": if v.published { STATUS_PUBLISHED } else { STATUS_DRAFT },
+                        "checksum": v.checksum,
+                        "created_at": parse_ts(&v.created_at)?,
+                    }))
+                })
+                .collect()
+        })
+        .await
+}
+
+/// Reserve the complete encoded business-value size before reading value files.
+fn reserve_values<'a>(values: impl IntoIterator<Item = &'a StoredValue>) -> Result<()> {
+    let mut remaining = VALUE_BUDGET;
+    for value in values {
+        let size = match value {
+            StoredValue::Ref(r) => usize::try_from(r.total_bytes).map_err(internal)?,
+            StoredValue::Inline(v) => flow_journal::codec::bounded_json(v, remaining)
+                .map_err(internal)?
+                .len(),
+        };
+        remaining = remaining
+            .checked_sub(size)
+            .ok_or_else(|| internal("RESPONSE_TOO_LARGE"))?;
     }
-    Ok(versions)
+    Ok(())
 }
 
 fn workflow_summary(workflow: &JournalWorkflow) -> Result<WorkflowSummary> {
@@ -154,7 +211,7 @@ fn run_record(root: &std::path::Path, upper: u64, run: &JournalRun) -> Result<Ru
 pub async fn get_run(backend: &JournalBackend, run_id: &str) -> Result<RunRecord> {
     let (_, value) = backend
         .projection
-        .get("run", run_id)
+        .get_summary("run", run_id)
         .await
         .map_err(internal)?;
     let run =
@@ -395,40 +452,53 @@ pub async fn template_list(backend: &JournalBackend) -> Result<Vec<NodeTemplateS
 }
 
 pub async fn template_get(backend: &JournalBackend, id: &str) -> Result<NodeTemplate> {
-    let state = backend.state().await;
-    let config = state
-        .templates
-        .get(id)
-        .ok_or_else(|| ViewError::TemplateNotFound(id.to_string()))?;
-    template_from_config(config)
+    backend
+        .inspect(|state| {
+            let config = state
+                .templates
+                .get(id)
+                .ok_or_else(|| ViewError::TemplateNotFound(id.into()))?;
+            template_from_config(config)
+        })
+        .await
 }
 
 /// One committed-state snapshot supplies status, node states, waiting and child relationships.
 pub async fn timeline(backend: &JournalBackend, run_id: &str) -> Result<Value> {
-    let state = backend.state().await;
-    let run = state
-        .runs
-        .get(run_id)
-        .ok_or_else(|| ViewError::RunNotFound(run_id.into()))?;
+    let (lsn, run) = backend
+        .run_snapshot_with_cursor(run_id)
+        .await
+        .map_err(internal)?;
+    let run = run.ok_or_else(|| ViewError::RunNotFound(run_id.into()))?;
+    let children = backend.run_children(run_id, lsn).await.map_err(internal)?;
+    reserve_values(
+        std::iter::once(&run.definition)
+            .chain(run.output.iter())
+            .chain(
+                run.nodes
+                    .values()
+                    .flat_map(|n| n.output.iter().chain(n.prepared.iter().map(|p| &p.params))),
+            ),
+    )?;
+    let root = backend.journal.root().to_path_buf();
+    let upper = backend.journal.durable_lsn();
+    let journal_id = backend.journal.id().to_owned();
+    tokio::task::spawn_blocking(move || {
+    let materialize = |v: &StoredValue| flow_journal::value::materialize(&root, upper, v, VALUE_BUDGET).map_err(internal);
     let definition: flow_engine::Definition =
-        serde_json::from_value(materialize(backend, &run.definition, VALUE_BUDGET)?)
+        serde_json::from_value(materialize(&run.definition)?)
             .map_err(internal)?;
     let mut nodes = Vec::new();
     for spec in &definition.nodes {
         let node = run.nodes.get(&spec.id);
-        let child = state.runs.values().find(|child| {
-            child
-                .parent
-                .as_ref()
-                .is_some_and(|p| p.run_id == run.run_id && p.node_id == spec.id)
-        });
+        let child = children.get(&spec.id);
         let status = node.map_or("pending", |n| n.status.as_str());
         let display_state = match status {
             "succeeded" => "completed",
             "waiting" => {
                 if node
                     .and_then(|n| n.wait.as_ref())
-                    .is_some_and(|w| w.kind == WaitKind::Retry)
+                    .is_some_and(|w| w.kind() == WaitKind::Retry)
                 {
                     "retrying"
                 } else {
@@ -439,12 +509,12 @@ pub async fn timeline(backend: &JournalBackend, run_id: &str) -> Result<Value> {
         };
         let output = node
             .and_then(|n| n.output.as_ref())
-            .map(|v| materialize(backend, v, VALUE_BUDGET).map(|v| flow_engine::redact_value(&v)))
+            .map(|v| materialize(v).map(|v| flow_engine::redact_value(&v)))
             .transpose()?;
         let input = node
             .and_then(|n| n.prepared.as_ref())
             .map(|p| {
-                materialize(backend, &p.params, VALUE_BUDGET).map(|v| flow_engine::redact_value(&v))
+                materialize(&p.params).map(|v| flow_engine::redact_value(&v))
             })
             .transpose()?;
         nodes.push(json!({"id":spec.id,"name":spec.name,"type":spec.node_type,"state":display_state,
@@ -453,13 +523,36 @@ pub async fn timeline(backend: &JournalBackend, run_id: &str) -> Result<Value> {
             "reason":node.and_then(|n| n.skip_reason.as_ref()),
             "wait":node.and_then(|n| n.wait.as_ref()),
             "operation_id":node.and_then(|n| n.operation.as_ref()).map(|o| &o.operation_id),
-            "child_run_id":child.map(|c| &c.run_id)}));
+            "child_run_id":child}));
     }
     Ok(
         json!({"run_id":run.run_id,"status":run.status,"workflow_id":run.workflow_id,
         "workflow_version":run.workflow_version,"started_at":run.created_at,"ended_at":null,
-        "output":run.output.as_ref().map(|v| materialize(backend,v,VALUE_BUDGET)).transpose()?,
+        "output":run.output.as_ref().map(materialize).transpose()?,
         "fatal_error":run.error,"last_seq":run.last_run_seq,"nodes":nodes,
-        "snapshot_cursor":{"journal_id":backend.journal.id(),"lsn":state.applied_lsn.to_string()}}),
+        "snapshot_cursor":{"journal_id":journal_id,"lsn":lsn.to_string()}}),
     )
+    }).await.map_err(internal)?
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    #[test]
+    fn cumulative_values_are_rejected_before_opening_files() {
+        let value = StoredValue::Ref(flow_journal::value::ValueRef {
+            journal_id: "j".into(),
+            output_id: "absent".into(),
+            codec: flow_journal::value::ValueCodec::Json,
+            version: 1,
+            chunk_count: 1,
+            total_bytes: VALUE_BUDGET as u64 / 2 + 1,
+            digest: "a".repeat(64),
+        });
+        assert!(reserve_values([&value]).is_ok());
+        assert!(reserve_values([&value, &value])
+            .unwrap_err()
+            .to_string()
+            .contains("RESPONSE_TOO_LARGE"));
+    }
 }

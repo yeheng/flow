@@ -335,10 +335,10 @@ async fn advance_run(
     run_id: &str,
     coord: &mut Coordinator,
 ) -> Result<()> {
-    let run = backend
-        .inspect(|s| s.runs.get(run_id).cloned())
-        .await
-        .ok_or_else(|| invalid("run missing"))?;
+    let Some(run) = backend.inspect(|s| s.runs.get(run_id).cloned()).await else {
+        backend.evict_definition(run_id).await;
+        return Ok(());
+    };
     if run.terminal() {
         // 终态 run 的定义缓存条目随之逐出（定义不可变，重进即重物化）。
         backend.evict_definition(run_id).await;
@@ -392,7 +392,7 @@ async fn advance_run(
         match incoming_gate(&definition, &gate_view, node) {
             NodeGate::Skip(reason) => {
                 backend
-                    .internal(|s| {
+                    .internal_for_run(run_id, |s| {
                         Ok((
                             vec![node_event(
                                 &s.runs[run_id],
@@ -432,13 +432,7 @@ async fn advance_run(
 /// restart resumes propagation without a giant transaction.
 async fn cancel_if_parent_cancelled(backend: &Arc<JournalBackend>, run: &Run) -> Result<bool> {
     if let Some(parent) = &run.parent {
-        let cancelled = backend
-            .inspect(|s| {
-                s.runs
-                    .get(&parent.run_id)
-                    .is_some_and(|r| r.status == RunStatus::Cancelled)
-            })
-            .await;
+        let cancelled = backend.run_status(&parent.run_id).await? == Some(RunStatus::Cancelled);
         if cancelled {
             backend
                 .run_cancel(&run.run_id, Some("parent-cancel"))
@@ -465,26 +459,26 @@ async fn advance_committed_node(
             .wait
             .as_ref()
             .ok_or_else(|| invalid("waiting node missing wait"))?;
-        if wait.kind == WaitKind::Delay && wait.wake_at.is_some_and(|at| at <= now) {
+        if wait.kind() == WaitKind::Delay && wait.wake_at().is_some_and(|at| at <= now) {
             backend
-                .internal(|s| {
+                .internal_for_run(run_id, |s| {
                     let r = &s.runs[run_id];
                     Ok((vec![node_event(
                         r,
                         &node.id,
                         EventKind::WaitResolved,
-                        json!({"output": wait.output.clone().unwrap_or(StoredValue::Inline(Value::Null))}),
+                        json!({"output": wait.output().cloned().unwrap_or(StoredValue::Inline(Value::Null))}),
                         true,
                     )], ()))
                 })
                 .await?;
         }
-        if matches!(wait.kind, WaitKind::Delay | WaitKind::Retry) {
-            if let Some(at) = wait.wake_at.filter(|at| *at > now) {
+        if matches!(wait.kind(), WaitKind::Delay | WaitKind::Retry) {
+            if let Some(at) = wait.wake_at().filter(|at| *at > now) {
                 wakes.entry(at).or_default().insert(run_id.to_owned());
             }
         }
-        if wait.kind != WaitKind::Retry || wait.wake_at.is_none_or(|at| at > now) {
+        if wait.kind() != WaitKind::Retry || wait.wake_at().is_none_or(|at| at > now) {
             return Ok(true);
         }
     }
@@ -511,7 +505,7 @@ async fn advance_committed_node(
         attempt
             .finish(
                 EventKind::WaitRegistered,
-                json!({"wait": Wait{kind:WaitKind::Uncertain, wake_at:None, child_run_id:None, output:None},"integrity":"unknown"}),
+                json!({"wait": Wait::Uncertain,"integrity":"unknown"}),
             )
             .await?;
         return Ok(true);
@@ -638,7 +632,7 @@ async fn execute_node(
             };
             let uncertain = n.operation.as_ref().is_some_and(|o| o.outcome.is_none());
             let mut payload = if uncertain {
-                json!({"wait": Wait{kind:WaitKind::Uncertain, wake_at:None, child_run_id:None, output:None}, "integrity":"unknown"})
+                json!({"wait": Wait::Uncertain, "integrity":"unknown"})
             } else {
                 json!({"error": error.to_string(), "preparation_failed": n.prepared.is_none(), "original_input": snapshot.input, "predecessors": predecessors, "integrity":"incomplete"})
             };
@@ -688,10 +682,9 @@ async fn settle_run(
     run_id: &str,
     definition: &Definition,
 ) -> Result<()> {
-    let snapshot = backend
-        .inspect(|s| s.runs.get(run_id).cloned())
-        .await
-        .ok_or_else(|| invalid("run missing"))?;
+    let Some(snapshot) = backend.inspect(|s| s.runs.get(run_id).cloned()).await else {
+        return Ok(());
+    };
     if snapshot.terminal()
         || !definition.nodes.iter().all(|n| {
             snapshot.nodes.get(&n.id).is_some_and(|n| {
@@ -712,9 +705,7 @@ async fn settle_run(
     });
     match failed {
         Some(failed_node) => {
-            let error = backend
-                .inspect(|s| s.runs[run_id].nodes[&failed_node.id].error.clone())
-                .await;
+            let error = snapshot.nodes[&failed_node.id].error.clone();
             finish_run(backend, run_id, None, error).await?;
         }
         None => {
@@ -774,13 +765,12 @@ async fn finish_run(
     output: Option<StoredValue>,
     error: Option<String>,
 ) -> Result<()> {
-    backend.internal(|s|{
+    backend.internal_for_run(run_id, |s|{
         let run=&s.runs[run_id];if run.terminal(){return Ok((vec![],()))}
         let mut event=Event::new(if error.is_some(){EventKind::RunFailed}else{EventKind::RunCompleted},json!({"output":output,"error":error}));event.run_id=Some(run_id.into());event.run_seq=run.last_run_seq+1;
         let mut events=vec![event];
         if let Some(parent)=&run.parent {
-            let parent_run=&s.runs[&parent.run_id];
-            if !parent_run.terminal(){
+            if let Some(parent_run)=s.runs.get(&parent.run_id).filter(|r| !r.terminal()) {
                 let node=&parent_run.nodes[&parent.node_id];
                 let payload=if error.is_some(){json!({"error":error,"sealed_through":node.attempts[&node.dispatch_id].audit_seq.to_string()})}else{json!({"output":output})};
                 events.push(node_event(parent_run,&parent.node_id,if error.is_some(){EventKind::NodeFailed}else{EventKind::WaitResolved},payload,true));

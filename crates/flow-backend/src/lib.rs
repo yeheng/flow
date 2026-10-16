@@ -10,6 +10,7 @@ mod journal_commands;
 pub use journal_commands::ProductCommand;
 mod journal_driver;
 mod journal_execution;
+mod journal_history;
 pub mod journal_import;
 pub mod journal_views;
 #[derive(Debug, Error)]

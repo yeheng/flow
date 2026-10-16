@@ -90,9 +90,13 @@ pub fn scan_until(
 /// Fast inventory recovery trusts checkpoint-verified sealed bytes, but still checks every
 /// known segment name, identity and length via load_checkpoint. Full verify always uses scan.
 pub fn scan_fast(root: &Path) -> Result<Recovery> {
-    let checkpoint = crate::maintenance::load_checkpoint(root, 3)?
-        .or(crate::maintenance::load_checkpoint(root, 2)?)
-        .or(crate::maintenance::load_checkpoint(root, 1)?);
+    let mut checkpoint = None;
+    for version in [5, 4, 3, 2, 1] {
+        if let Some(found) = crate::maintenance::load_checkpoint(root, version)? {
+            checkpoint = Some(found);
+            break;
+        }
+    }
     scan_using(
         root,
         u64::MAX,

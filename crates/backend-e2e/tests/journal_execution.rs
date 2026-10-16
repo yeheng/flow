@@ -33,10 +33,10 @@ async fn pure_retry_preserves_preparation_and_original_deadline_across_restart()
     let waiting = until(&backend, run_id, |r| {
         r.nodes
             .get("n")
-            .is_some_and(|n| n.wait.as_ref().is_some_and(|w| w.kind == WaitKind::Retry))
+            .is_some_and(|n| n.wait.as_ref().is_some_and(|w| w.kind() == WaitKind::Retry))
     })
     .await;
-    let deadline = waiting.nodes["n"].wait.as_ref().unwrap().wake_at;
+    let deadline = waiting.nodes["n"].wait.as_ref().unwrap().wake_at();
     let prepared = waiting.nodes["n"].prepared.clone();
     backend.close().await.unwrap();
     drop(backend);
@@ -48,7 +48,7 @@ async fn pure_retry_preserves_preparation_and_original_deadline_across_restart()
             .wait
             .as_ref()
             .unwrap()
-            .wake_at,
+            .wake_at(),
         deadline
     );
     start_ipc(&backend, 16).await;
@@ -353,7 +353,7 @@ async fn script_actual_values_and_delay_survive_restart() {
         .unwrap()
         .predecessors
         .contains_key("s"));
-    let wake_at = waiting.nodes["d"].wait.as_ref().unwrap().wake_at;
+    let wake_at = waiting.nodes["d"].wait.as_ref().unwrap().wake_at();
     backend.close().await.unwrap();
     drop(backend);
     let backend = JournalBackend::open(&root, JournalOptions::default())
@@ -364,7 +364,7 @@ async fn script_actual_values_and_delay_survive_restart() {
             .wait
             .as_ref()
             .unwrap()
-            .wake_at,
+            .wake_at(),
         wake_at
     );
     start_ipc(&backend, 16).await;
@@ -402,8 +402,7 @@ async fn child_completion_wakes_parent_and_signal_is_idempotent() {
         .wait
         .as_ref()
         .unwrap()
-        .child_run_id
-        .as_ref()
+        .child_run_id()
         .unwrap();
     until(&backend, child_id, |r| {
         r.nodes.get("h").is_some_and(|n| n.wait.is_some())

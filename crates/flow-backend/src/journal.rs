@@ -59,12 +59,14 @@ struct CommittedState {
     reader: TailReader,
     pending: Option<tokio::task::JoinHandle<flow_journal::Result<flow_journal::Commit>>>,
     dirty_runs: BTreeSet<String>,
+    applying: Option<Transaction>,
 }
 pub struct JournalBackend {
     #[cfg(feature = "journal-cluster")]
     cluster: std::sync::OnceLock<Arc<crate::journal_cluster::Membership>>,
     pub journal: Journal,
     pub projection: Arc<Projector>,
+    audit_index: Arc<Projector>,
     pub observations: Option<flow_engine::observation::ObservationStore>,
     state: Mutex<CommittedState>,
     projected: Arc<Notify>,
@@ -126,15 +128,34 @@ impl JournalBackend {
         let projection = Projector::open(destination, identity)
             .await
             .map_err(|e| JournalError::Projection(e.to_string()))?;
+        let temporary = tempfile::tempdir_in(destination.parent().unwrap_or(Path::new(".")))
+            .map_err(flow_journal::Error::Io)?;
+        let history = Projector::open(&temporary.path().join("execution.sqlite"), identity)
+            .await
+            .map_err(|e| JournalError::Projection(e.to_string()))?;
         let mut reader = TailReader::new(root, identity);
-        let mut state = State::default();
+        let mut state = State {
+            compact_audits: true,
+            ..Default::default()
+        };
         while let Some((tx, _)) = reader.next(report.last_lsn)? {
+            crate::journal_history::prepare(&history, &mut state, &tx).await?;
             state.apply(&tx)?;
+            history
+                .apply(
+                    identity,
+                    tx.lsn,
+                    crate::journal_history::index_rows(&state, &tx)?,
+                )
+                .await
+                .map_err(|e| JournalError::Projection(e.to_string()))?;
             projection
                 .apply(identity, tx.lsn, project_rows(&state, &tx)?)
                 .await
                 .map_err(|e| JournalError::Projection(e.to_string()))?;
+            crate::journal_history::trim(&mut state);
         }
+        history.close().await;
         projection.close().await;
         let parent = destination
             .parent()
@@ -148,63 +169,97 @@ impl JournalBackend {
 
     pub async fn open(root: &Path, options: JournalOptions) -> Result<Arc<Self>> {
         let journal = Journal::open(root, options).await?;
-        let mut reader = TailReader::new(root, journal.id());
-        let root_owned = root.to_path_buf();
+        let history_path = root.join("execution-index.sqlite");
+        let audit_index = Arc::new(
+            Projector::open(&history_path, journal.id())
+                .await
+                .map_err(|e| JournalError::Projection(e.to_string()))?,
+        );
+        let indexed = audit_index
+            .applied_lsn()
+            .await
+            .map_err(|e| JournalError::Projection(e.to_string()))?;
         let upper = journal.durable_lsn();
-        let committed =
-            tokio::task::spawn_blocking(move || -> flow_journal::Result<CommittedState> {
-                let mut state = State::default();
-                if let Some(checkpoint) =
-                    flow_journal::maintenance::load_checkpoint(&root_owned, 3)?
-                {
-                    let restored = (|| -> flow_journal::Result<State> {
-                        let mut state: State =
-                            serde_json::from_value(checkpoint.state["state"].clone())?;
-                        state.values = flow_journal::value::ValueCatalog::from_snapshot(
-                            checkpoint.state["values"].clone(),
-                        )?;
-                        if state.journal_id != checkpoint.journal_id
-                            || state.applied_lsn != checkpoint.lsn
-                            || state.applied_lsn > upper
-                        {
-                            return Err(flow_journal::Error::Invalid(
-                                "state checkpoint boundary mismatch".into(),
-                            ));
+        if indexed > upper {
+            return Err(JournalError::Projection(
+                "execution index ahead of journal".into(),
+            ));
+        }
+        let root_owned = root.to_path_buf();
+        let identity = journal.id().to_owned();
+        let (mut state, reader) =
+            tokio::task::spawn_blocking(move || -> flow_journal::Result<_> {
+                let mut state = State {
+                    compact_audits: true,
+                    ..Default::default()
+                };
+                let mut reader = TailReader::new(&root_owned, &identity);
+                if let Some(cp) = flow_journal::maintenance::load_checkpoint(&root_owned, 5)? {
+                    if cp.lsn <= indexed && cp.lsn <= upper && cp.journal_id == identity {
+                        let restored = (|| -> flow_journal::Result<State> {
+                            let mut s: State = serde_json::from_value(cp.state["state"].clone())?;
+                            s.values = flow_journal::value::ValueCatalog::from_snapshot(
+                                cp.state["values"].clone(),
+                            )?;
+                            if s.applied_lsn != cp.lsn
+                                || s.journal_id != identity
+                                || s.runs.values().any(|r| r.terminal())
+                            {
+                                return Err(flow_journal::Error::Invalid(
+                                    "active checkpoint boundary mismatch".into(),
+                                ));
+                            }
+                            s.compact_audits = true;
+                            Ok(s)
+                        })();
+                        match restored {
+                            Ok(s) => {
+                                state = s;
+                                reader = TailReader::after(&root_owned, &identity, &cp.boundary)?;
+                            }
+                            Err(e) => {
+                                tracing::warn!(%e, "invalid active checkpoint; replaying journal")
+                            }
                         }
-                        for run in state.runs.values_mut() {
-                            run.refresh_status();
-                        }
-                        Ok(state)
-                    })();
-                    if let Err(error) = &restored {
-                        tracing::warn!(%error, "invalid checkpoint; replaying journal");
-                    }
-                    if let Ok(restored) = restored {
-                        reader = TailReader::after(
-                            &root_owned,
-                            &checkpoint.journal_id,
-                            &checkpoint.boundary,
-                        )?;
-                        state = restored;
                     }
                 }
-                while let Some((tx, _)) = reader.next(upper)? {
-                    state.apply(&tx)?;
-                }
-                Ok(CommittedState {
-                    dirty_runs: state
-                        .runs
-                        .values()
-                        .filter(|r| !r.terminal())
-                        .map(|r| r.run_id.clone())
-                        .collect(),
-                    state,
-                    reader,
-                    pending: None,
-                })
+                Ok((state, reader))
             })
             .await
             .map_err(|e| JournalError::Projection(e.to_string()))??;
+        let (send, mut receive) = tokio::sync::mpsc::channel(1);
+        let scan = tokio::task::spawn_blocking(move || -> flow_journal::Result<TailReader> {
+            let mut reader = reader;
+            while let Some((tx, _)) = reader.next(upper)? {
+                if send.blocking_send(tx).is_err() {
+                    break;
+                }
+            }
+            Ok(reader)
+        });
+        while let Some(tx) = receive.recv().await {
+            crate::journal_history::prepare(&audit_index, &mut state, &tx).await?;
+            state.apply(&tx)?;
+            audit_index
+                .apply(
+                    journal.id(),
+                    tx.lsn,
+                    crate::journal_history::index_rows(&state, &tx)?,
+                )
+                .await
+                .map_err(|e| JournalError::Projection(e.to_string()))?;
+            crate::journal_history::trim(&mut state);
+        }
+        let reader = scan
+            .await
+            .map_err(|e| JournalError::Projection(e.to_string()))??;
+        let committed = CommittedState {
+            dirty_runs: state.runs.keys().cloned().collect(),
+            state,
+            reader,
+            pending: None,
+            applying: None,
+        };
         let projection = Arc::new(
             Projector::open(&root.join("projection.sqlite"), journal.id())
                 .await
@@ -225,43 +280,16 @@ impl JournalBackend {
             .await
             .map_err(|e| JournalError::Projection(e.to_string()))?
             < upper
+            || projection
+                .requires_split_runs()
+                .await
+                .map_err(|e| JournalError::Projection(e.to_string()))?
         {
-            let mut rows = Vec::new();
-            for (key, value) in &committed.state.workflows {
-                rows.push(ProjectedRow {
-                    kind: "workflow".into(),
-                    key: key.clone(),
-                    value: Some(serde_json::to_value(value)?),
-                });
-            }
-            for (key, value) in &committed.state.runs {
-                rows.push(ProjectedRow {
-                    kind: "run".into(),
-                    key: key.clone(),
-                    value: Some(serde_json::to_value(value)?),
-                });
-            }
-            for (kind, map) in [
-                ("schedule", &committed.state.schedules),
-                ("webhook", &committed.state.webhooks),
-                ("template", &committed.state.templates),
-                ("legacy", &committed.state.legacy),
-            ] {
-                for (key, value) in map {
-                    rows.push(ProjectedRow {
-                        kind: kind.into(),
-                        key: key.clone(),
-                        value: Some(value.clone()),
-                    });
-                }
-            }
             projection
-                .restore_snapshot(journal.id(), upper, rows)
+                .restore_history(&history_path, upper)
                 .await
                 .map_err(|e| JournalError::Projection(e.to_string()))?;
         }
-        let mut tail = committed.reader.fork();
-        let mut state = committed.state.clone();
         let projected_cursor = projection
             .applied_lsn()
             .await
@@ -276,6 +304,7 @@ impl JournalBackend {
             .ok(),
             journal,
             projection,
+            audit_index,
             state: Mutex::new(committed),
             projected: Arc::new(Notify::new()),
             changed: Arc::new(Notify::new()),
@@ -302,52 +331,31 @@ impl JournalBackend {
                 }
                 let changed = b.changed.clone();
                 let shutdown = b.projector_stop.clone();
-                if b.paused.load(Ordering::Relaxed) || state.applied_lsn >= b.journal.durable_lsn()
-                {
-                    drop(b);
-                    tokio::select! {_=changed.notified()=>{},_=shutdown.cancelled()=>return,_=tokio::time::sleep(Duration::from_millis(20))=>{}}
-                    continue;
+                let next = b.projected_lsn.load(Ordering::Acquire) + 1;
+                let result = async {
+                    let upper = b.audit_index.applied_lsn().await?;
+                    if b.paused.load(Ordering::Relaxed) || next > upper {
+                        return Ok::<_, sqlx::Error>(false);
+                    }
+                    let rows = b.audit_index.history_changes(next).await?;
+                    b.projection.apply(b.journal.id(), next, rows).await?;
+                    b.projected_lsn.store(next, Ordering::Release);
+                    b.projected.notify_waiters();
+                    Ok(true)
                 }
-                let upper = b.journal.durable_lsn();
-                let processed = tokio::task::spawn_blocking(move || -> flow_journal::Result<_> {
-                    let mut batch = Vec::new();
-                    let mut bytes = 0;
-                    while bytes < 4 * 1024 * 1024 {
-                        let Some((tx, location)) = tail.next(upper)? else {
-                            break;
-                        };
-                        state.apply(&tx)?;
-                        let rows = project_rows(&state, &tx)?;
-                        bytes += location.bytes as usize;
-                        batch.push((tx.lsn, rows));
-                    }
-                    Ok((tail, state, batch))
-                })
                 .await;
-                let (next_tail, next_state, batch) = match processed {
-                    Ok(Ok(v)) => v,
-                    Ok(Err(e)) => {
-                        *b.projection_error.lock().await = Some(e.to_string());
-                        b.projected.notify_waiters();
-                        return;
-                    }
+                match result {
+                    Ok(true) => continue,
                     Err(e) => {
                         *b.projection_error.lock().await = Some(e.to_string());
                         b.projected.notify_waiters();
                         return;
                     }
-                };
-                tail = next_tail;
-                state = next_state;
-                for (lsn, rows) in batch {
-                    if let Err(e) = b.projection.apply(b.journal.id(), lsn, rows).await {
-                        *b.projection_error.lock().await = Some(e.to_string());
-                        b.projected.notify_waiters();
-                        return;
-                    }
-                    b.projected_lsn.fetch_max(lsn, Ordering::Release);
-                    b.projected.notify_waiters();
+                    Ok(false) => {}
                 }
+                drop(b);
+                tokio::select! { _=changed.notified()=>{}, _=shutdown.cancelled()=>return,
+                _=tokio::time::sleep(Duration::from_millis(20))=>{} }
             }
         });
         *backend.projector.lock().await = Some(task);
@@ -365,8 +373,122 @@ impl JournalBackend {
         Ok(backend)
     }
 
+    /// Explicit whole-history diagnostic export. Production reads use run_snapshot,
+    /// metadata projections or journal pages instead of allocating this export.
     pub async fn state(&self) -> State {
-        self.state.lock().await.state.clone()
+        self.full_state()
+            .await
+            .expect("verified execution index unavailable")
+    }
+    pub async fn full_state(&self) -> Result<State> {
+        let mut committed = self.state.lock().await;
+        self.refresh_locked(&mut committed).await?;
+        let mut state = committed.state.clone();
+        let upper = state.applied_lsn;
+        drop(committed);
+        let mut after = String::new();
+        loop {
+            let keys = self
+                .audit_index
+                .history_keys("run", None, &after, upper, 256)
+                .await
+                .map_err(|e| JournalError::Projection(e.to_string()))?;
+            if keys.is_empty() {
+                break;
+            }
+            for id in &keys {
+                if let Some(run) =
+                    crate::journal_history::run_at(&self.audit_index, id, upper, true).await?
+                {
+                    state.runs.insert(id.clone(), run);
+                }
+            }
+            after = keys.last().unwrap().clone();
+        }
+        Ok(state)
+    }
+    pub(crate) async fn run_status(
+        &self,
+        id: &str,
+    ) -> Result<Option<flow_engine::journal_state::RunStatus>> {
+        let committed = self.state.lock().await;
+        if let Some(run) = committed.state.runs.get(id) {
+            return Ok(Some(run.status));
+        }
+        let upper = committed.state.applied_lsn;
+        drop(committed);
+        self.audit_index
+            .history_at("run", id, upper)
+            .await
+            .map_err(|e| JournalError::Projection(e.to_string()))?
+            .map(|v| serde_json::from_value(v["status"].clone()).map_err(JournalError::from))
+            .transpose()
+    }
+    pub async fn run_snapshot(&self, id: &str) -> Result<Option<flow_engine::journal_state::Run>> {
+        Ok(self.run_snapshot_with_cursor(id).await?.1)
+    }
+    pub(crate) async fn run_snapshot_with_cursor(
+        &self,
+        id: &str,
+    ) -> Result<(u64, Option<flow_engine::journal_state::Run>)> {
+        let mut committed = self.state.lock().await;
+        self.refresh_locked(&mut committed).await?;
+        let upper = committed.state.applied_lsn;
+        if let Some(run) = committed.state.runs.get(id) {
+            return Ok((upper, Some(run.clone())));
+        }
+        drop(committed);
+        Ok((
+            upper,
+            crate::journal_history::run_at(&self.audit_index, id, upper, false).await?,
+        ))
+    }
+    pub(crate) async fn run_children(
+        &self,
+        id: &str,
+        upper: u64,
+    ) -> Result<std::collections::BTreeMap<String, String>> {
+        Ok(self
+            .audit_index
+            .history_children(id, upper)
+            .await
+            .map_err(|e| JournalError::Projection(e.to_string()))?
+            .into_iter()
+            .collect())
+    }
+    pub(crate) async fn dispatch_owner(
+        &self,
+        dispatch: &str,
+    ) -> Result<Option<(String, String, u32)>> {
+        let owner = self
+            .audit_index
+            .dispatch_owner(dispatch)
+            .await
+            .map_err(|e| JournalError::Projection(e.to_string()))?;
+        owner
+            .map(|owner| {
+                let run = flow_engine::journal_state::string(&owner, "run_id")?;
+                let node = flow_engine::journal_state::string(&owner, "node_id")?;
+                let attempt = owner["attempt"]
+                    .as_str()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| JournalError::Projection("invalid indexed attempt".into()))?;
+                Ok((run, node, attempt))
+            })
+            .transpose()
+    }
+    async fn load_selected(&self, state: &mut State, id: Option<&str>) -> Result<()> {
+        if let Some(id) = id {
+            if !state.runs.contains_key(id) {
+                if let Some(run) =
+                    crate::journal_history::run_at(&self.audit_index, id, state.applied_lsn, false)
+                        .await?
+                {
+                    state.runs.insert(id.into(), run);
+                }
+            }
+        }
+        Ok(())
     }
     pub fn execution_peak(&self) -> usize {
         self.execution_peak.load(Ordering::Relaxed)
@@ -414,13 +536,30 @@ impl JournalBackend {
     pub(crate) async fn evict_definition(&self, run_id: &str) {
         self.definitions.lock().await.remove(run_id);
     }
+    pub(crate) async fn internal_for_run<T>(
+        &self,
+        id: &str,
+        decide: impl FnOnce(&State) -> flow_journal::Result<(Vec<Event>, T)>,
+    ) -> Result<T> {
+        self.internal_selected(Some(id), decide).await
+    }
     pub(crate) async fn internal<T>(
         &self,
         decide: impl FnOnce(&State) -> flow_journal::Result<(Vec<Event>, T)>,
     ) -> Result<T> {
+        self.internal_selected(None, decide).await
+    }
+    async fn internal_selected<T>(
+        &self,
+        selected: Option<&str>,
+        decide: impl FnOnce(&State) -> flow_journal::Result<(Vec<Event>, T)>,
+    ) -> Result<T> {
         let mut committed = self.state.lock().await;
         self.refresh_locked(&mut committed).await?;
-        let (events, result) = decide(&committed.state)?;
+        self.load_selected(&mut committed.state, selected).await?;
+        let decision = decide(&committed.state);
+        crate::journal_history::trim(&mut committed.state);
+        let (events, result) = decision?;
         if !events.is_empty() {
             self.commit_locked(&mut committed, events).await?;
         }
@@ -434,6 +573,28 @@ impl JournalBackend {
         scope: &str,
         request_id: Option<&str>,
         request: &Value,
+        decide: impl FnOnce(&State) -> flow_journal::Result<(Vec<Event>, Value)>,
+    ) -> Result<CommandReceipt> {
+        self.command_selected(scope, request_id, request, None, decide)
+            .await
+    }
+    pub(crate) async fn command_for_run(
+        &self,
+        run_id: &str,
+        scope: &str,
+        request_id: Option<&str>,
+        request: &Value,
+        decide: impl FnOnce(&State) -> flow_journal::Result<(Vec<Event>, Value)>,
+    ) -> Result<CommandReceipt> {
+        self.command_selected(scope, request_id, request, Some(run_id), decide)
+            .await
+    }
+    async fn command_selected(
+        &self,
+        scope: &str,
+        request_id: Option<&str>,
+        request: &Value,
+        selected: Option<&str>,
         decide: impl FnOnce(&State) -> flow_journal::Result<(Vec<Event>, Value)>,
     ) -> Result<CommandReceipt> {
         if scope.is_empty()
@@ -458,7 +619,10 @@ impl JournalBackend {
                 return self.visible(receipt).await;
             }
         }
-        let (mut events, result) = decide(&committed.state)?;
+        self.load_selected(&mut committed.state, selected).await?;
+        let decision = decide(&committed.state);
+        crate::journal_history::trim(&mut committed.state);
+        let (mut events, result) = decision?;
         flow_journal::codec::bounded_json(&result, flow_journal::INLINE_BYTES)?;
         let record = CommandRecord {
             scope: scope.into(),
@@ -483,33 +647,28 @@ impl JournalBackend {
         self.refresh_locked(&mut state).await?;
         if let [event] = events.as_slice() {
             if event.audit_seq > 0 {
-                if let Some(attempt) = event
-                    .run_id
-                    .as_ref()
-                    .and_then(|id| state.state.runs.get(id))
-                    .and_then(|r| event.node_id.as_ref().and_then(|id| r.nodes.get(id)))
-                    .and_then(|n| event.dispatch_id.as_ref().and_then(|id| n.attempts.get(id)))
-                {
-                    if let Some(digest) = attempt.audit_digests.get(&event.audit_seq) {
-                        let incoming =
-                            flow_journal::codec::digest(&flow_journal::codec::bounded_json(
-                                event,
-                                flow_journal::MAX_LINE_BYTES,
-                            )?);
-                        if *digest != incoming {
-                            return Err(flow_journal::Error::Conflict(
-                                "same audit identity with different content".into(),
-                            )
-                            .into());
-                        }
-                        return attempt
-                            .audit_lsns
-                            .get(&event.audit_seq)
-                            .copied()
-                            .ok_or_else(|| {
-                                JournalError::Projection("missing original audit receipt".into())
-                            });
+                let (_, original) = self
+                    .audit_index
+                    .get("audit", &audit_key(event)?)
+                    .await
+                    .map_err(|e| JournalError::Projection(e.to_string()))?;
+                if let Some(original) = original {
+                    let incoming = flow_journal::codec::digest(&flow_journal::codec::bounded_json(
+                        event,
+                        flow_journal::MAX_LINE_BYTES,
+                    )?);
+                    if original["digest"].as_str() != Some(incoming.as_str()) {
+                        return Err(flow_journal::Error::Conflict(
+                            "same audit identity with different content".into(),
+                        )
+                        .into());
                     }
+                    return original["lsn"]
+                        .as_str()
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| {
+                            JournalError::Projection("invalid original audit receipt".into())
+                        });
                 }
             }
         }
@@ -529,7 +688,10 @@ impl JournalBackend {
             tx_id: uuid::Uuid::now_v7().to_string(),
             events,
         };
-        committed.state.check(&tx)?;
+        crate::journal_history::prepare(&self.audit_index, &mut committed.state, &tx).await?;
+        let checked = committed.state.check(&tx);
+        crate::journal_history::trim(&mut committed.state);
+        checked?;
         let journal = self.journal.clone();
         committed.pending = Some(tokio::spawn(async move {
             journal
@@ -551,11 +713,40 @@ impl JournalBackend {
             committed.pending = None;
             submitted = Some(result??.transaction.lsn);
         }
-        while let Some((tx, _)) = committed.reader.next(self.journal.durable_lsn())? {
-            committed.state.apply(&tx)?;
+        loop {
+            if committed.applying.is_none() {
+                committed.applying = committed
+                    .reader
+                    .next(self.journal.durable_lsn())?
+                    .map(|(tx, _)| tx);
+            }
+            let Some(tx) = committed.applying.as_ref() else {
+                break;
+            };
+            // Keep the transaction owned across cancellation; a retry can idempotently
+            // finish the index before exposing reducer state or acknowledging the audit.
+            if committed.state.applied_lsn < tx.lsn {
+                crate::journal_history::prepare(&self.audit_index, &mut committed.state, tx)
+                    .await?;
+                committed.state.apply(tx)?;
+            }
+            self.audit_index
+                .apply(
+                    self.journal.id(),
+                    tx.lsn,
+                    crate::journal_history::index_rows(&committed.state, tx)?,
+                )
+                .await
+                .map_err(|e| JournalError::Projection(e.to_string()))?;
+            crate::journal_history::trim(&mut committed.state);
+            let tx = committed.applying.take().expect("owned transaction");
             for event in &tx.events {
                 if let Some(id) = &event.run_id {
-                    committed.dirty_runs.insert(id.clone());
+                    if committed.state.runs.get(id).is_some_and(|r| !r.terminal()) {
+                        committed.dirty_runs.insert(id.clone());
+                    } else {
+                        committed.dirty_runs.remove(id);
+                    }
                     if event.kind == EventKind::RunCancelled {
                         let children = committed
                             .state
@@ -696,6 +887,7 @@ impl JournalBackend {
             cluster.close(snapshot.as_ref()).await;
         }
         self.projection.close().await;
+        self.audit_index.close().await;
         closed?;
         Ok(())
     }
@@ -724,7 +916,7 @@ impl JournalBackend {
         let root = self.journal.root().to_path_buf();
         drop(committed);
         tokio::task::spawn_blocking(move || {
-            flow_journal::maintenance::write_checkpoint(&root, upper, 3, snapshot)
+            flow_journal::maintenance::write_checkpoint(&root, upper, 5, snapshot)
         })
         .await
         .map_err(|e| JournalError::Projection(e.to_string()))??;
@@ -742,28 +934,48 @@ impl JournalBackend {
             .collect()
     }
     pub(crate) async fn defer_run(&self, id: String) {
-        self.state.lock().await.dirty_runs.insert(id);
+        let mut state = self.state.lock().await;
+        if state.state.runs.get(&id).is_some_and(|r| !r.terminal()) {
+            state.dirty_runs.insert(id);
+        }
     }
     pub(crate) async fn defer_runs(&self, ids: Vec<String>) {
-        self.state.lock().await.dirty_runs.extend(ids);
+        let mut state = self.state.lock().await;
+        for id in ids {
+            if state.state.runs.get(&id).is_some_and(|r| !r.terminal()) {
+                state.dirty_runs.insert(id);
+            }
+        }
     }
 
     /// 诊断快照：挂死排查用（零日志冻结时看内部游标、队列与等待者）。
     pub async fn diagnostics(&self) -> serde_json::Value {
         let committed = self.state.lock().await;
         let applied_lsn = committed.state.applied_lsn;
+        let resident_runs = committed.state.runs.len();
+        let resident_attempts: usize = committed
+            .state
+            .runs
+            .values()
+            .flat_map(|r| r.nodes.values())
+            .map(|n| n.attempts.len())
+            .sum();
+        let cached_publications = committed.state.values.cached_publications();
         let pending = committed.pending.is_some();
-        let dirty: Vec<String> = committed.dirty_runs.iter().cloned().collect();
+        let dirty_count = committed.dirty_runs.len();
+        let dirty: Vec<String> = committed.dirty_runs.iter().take(256).cloned().collect();
         drop(committed);
         let stats = self.journal.stats();
         serde_json::json!({
             "applied_lsn": applied_lsn,
+            "resident_runs":resident_runs,"resident_attempts":resident_attempts,"cached_publications":cached_publications,
             "projected_lsn": self.projected_lsn.load(std::sync::atomic::Ordering::Acquire),
             "durable_lsn": stats.durable_lsn,
             "writer_failure": stats.failure,
             "commit_pending": pending,
             "peak_queued_requests": stats.peak_queued_requests,
             "dirty_runs": dirty,
+            "dirty_run_count": dirty_count,
             "projection_error": self.projection_error.lock().await.clone(),
             "executor_peak": self.execution_peak(),
             "coordinator_ticks": self.coordinator_ticks.load(Ordering::Relaxed),
@@ -773,11 +985,86 @@ impl JournalBackend {
     }
 }
 
-fn project_rows(state: &State, tx: &Transaction) -> flow_journal::Result<Vec<ProjectedRow>> {
+fn audit_key(event: &Event) -> flow_journal::Result<String> {
+    let run = event
+        .run_id
+        .as_deref()
+        .ok_or_else(|| flow_journal::Error::Invalid("audit missing run".into()))?;
+    let node = event
+        .node_id
+        .as_deref()
+        .or_else(|| event.payload["node_id"].as_str())
+        .ok_or_else(|| flow_journal::Error::Invalid("audit missing node".into()))?;
+    let dispatch = event
+        .dispatch_id
+        .as_deref()
+        .ok_or_else(|| flow_journal::Error::Invalid("audit missing dispatch".into()))?;
+    Ok(serde_json::to_string(&(
+        run,
+        node,
+        dispatch,
+        event.audit_seq,
+    ))?)
+}
+pub(crate) fn audit_rows(tx: &Transaction) -> flow_journal::Result<Vec<ProjectedRow>> {
+    tx.events.iter().filter(|event| event.audit_seq > 0).map(|event| {
+        Ok(ProjectedRow { kind: "audit".into(), key: audit_key(event)?, value: Some(serde_json::json!({
+            "digest": flow_journal::codec::digest(&flow_journal::codec::bounded_json(event, flow_journal::MAX_LINE_BYTES)?),
+            "lsn": tx.lsn.to_string(),
+        })) })
+    }).collect()
+}
+
+fn run_row(run: &flow_engine::journal_state::Run) -> flow_journal::Result<Value> {
+    let mut value = serde_json::to_value(run.summary())?;
+    value["_node_layout"] = Value::String("split-v1".into());
+    Ok(value)
+}
+
+pub(crate) fn project_rows(
+    state: &State,
+    tx: &Transaction,
+) -> flow_journal::Result<Vec<ProjectedRow>> {
     let mut keys = BTreeSet::new();
     for e in &tx.events {
         if let Some(id) = &e.run_id {
-            keys.insert(("run", id.clone()));
+            // Audit payloads update the permanent receipt index, not the product run row.
+            if !matches!(
+                e.kind,
+                EventKind::ValueChunk | EventKind::ValuePublished | EventKind::LateAudit
+            ) {
+                keys.insert(("run", id.clone()));
+                if e.kind == EventKind::RunStarted {
+                    if let Some(run) = state.runs.get(id) {
+                        for node_id in run.nodes.keys() {
+                            keys.insert(("run_node", serde_json::to_string(&(id, node_id))?));
+                        }
+                    }
+                } else if let Some(node_id) = e
+                    .node_id
+                    .as_deref()
+                    .or_else(|| e.payload["node_id"].as_str())
+                {
+                    keys.insert(("run_node", serde_json::to_string(&(id, node_id))?));
+                }
+            }
+        }
+        if let (Some(run), Some(node), Some(dispatch)) = (
+            e.run_id.as_deref(),
+            e.node_id
+                .as_deref()
+                .or_else(|| e.payload["node_id"].as_str()),
+            e.dispatch_id.as_deref(),
+        ) {
+            keys.insert((
+                "run_attempt",
+                serde_json::to_string(&(run, node, dispatch))?,
+            ));
+        }
+        if e.run_seq > 0 {
+            if let Some(id) = &e.run_id {
+                keys.insert(("run", id.clone()));
+            }
         }
         match e.kind {
             EventKind::LegacyImport => {
@@ -818,7 +1105,31 @@ fn project_rows(state: &State, tx: &Transaction) -> flow_journal::Result<Vec<Pro
     keys.into_iter()
         .map(|(kind, key)| {
             let value = match kind {
-                "run" => state.runs.get(&key).map(serde_json::to_value).transpose()?,
+                "run" => state.runs.get(&key).map(run_row).transpose()?,
+                "run_node" => {
+                    let (run_id, node_id): (String, String) = serde_json::from_str(&key)?;
+                    state
+                        .runs
+                        .get(&run_id)
+                        .and_then(|r| r.nodes.get(&node_id))
+                        .map(|node| {
+                            let mut value = serde_json::to_value(node.summary())?;
+                            value["_attempt_layout"] = Value::String("split-v1".into());
+                            Ok::<_, serde_json::Error>(value)
+                        })
+                        .transpose()?
+                }
+                "run_attempt" => {
+                    let (run, node, dispatch): (String, String, String) =
+                        serde_json::from_str(&key)?;
+                    state
+                        .runs
+                        .get(&run)
+                        .and_then(|r| r.nodes.get(&node))
+                        .and_then(|n| n.attempts.get(&dispatch))
+                        .map(serde_json::to_value)
+                        .transpose()?
+                }
                 "workflow" => state
                     .workflows
                     .get(&key)

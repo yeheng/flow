@@ -62,7 +62,7 @@ fn reference(run: &Run, id: &str) -> Option<ValueRef> {
             values.extend(prepared.predecessors.values());
         }
         if let Some(wait) = &node.wait {
-            values.extend(wait.output.iter());
+            values.extend(wait.output());
         }
         if let Some(op) = &node.operation {
             values.push(&op.request);
@@ -155,7 +155,7 @@ async fn download(
         Ok(p) => p,
         Err(_) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
     };
-    let (upper, row) = match state.backend.projection.get("run", &run_id).await {
+    let (upper, row) = match state.backend.projection.get_execution(&run_id).await {
         Ok(v) => v,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };

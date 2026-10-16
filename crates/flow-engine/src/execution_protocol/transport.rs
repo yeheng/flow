@@ -236,18 +236,14 @@ impl FrameTransport {
     /// Finish queued frames before closing. The deadline also bounds blocked writers.
     pub async fn flush_and_close(mut self, timeout: std::time::Duration) {
         self.outbound = dead_sender();
-        let _ = tokio::time::timeout(timeout, async {
-            for writer in &mut self.io.writers {
-                let _ = writer.await;
-            }
-        })
-        .await;
+        let _ = tokio::time::timeout(timeout, drain_tasks(&mut self.io.writers)).await;
         self.close();
-        for task in self.io.readers.iter_mut().chain(self.io.writers.iter_mut()) {
-            if !task.is_finished() {
-                task.abort();
-                let _ = task.await;
-            }
+        for task in self.io.readers.iter().chain(self.io.writers.iter()) {
+            task.abort();
+        }
+        for task in self.io.readers.drain(..).chain(self.io.writers.drain(..)) {
+            task.abort();
+            let _ = task.await;
         }
     }
 
@@ -262,43 +258,52 @@ impl FrameTransport {
 
     /// 等待全部 I/O 任务退出（关闭后回收）。
     pub async fn join(mut self) {
-        for task in self.io.readers.iter_mut().chain(self.io.writers.iter_mut()) {
-            let _ = task.await;
-        }
+        drain_tasks(&mut self.io.readers).await;
+        drain_tasks(&mut self.io.writers).await;
     }
 }
 
 impl Drop for FrameTransport {
     fn drop(&mut self) {
         self.outbound = dead_sender();
-        for task in &self.io.readers {
+        let readers = std::mem::take(&mut self.io.readers);
+        for task in &readers {
             task.abort();
         }
         let mut writers = std::mem::take(&mut self.io.writers);
         let state = self.io.state.clone();
+        if readers.is_empty() && writers.is_empty() {
+            state.stop();
+            return;
+        }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                let _ =
-                    tokio::time::timeout(std::time::Duration::from_millis(DRAIN_GRACE_MS), async {
-                        for writer in &mut writers {
-                            let _ = writer.await;
-                        }
-                    })
-                    .await;
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(DRAIN_GRACE_MS),
+                    drain_tasks(&mut writers),
+                )
+                .await;
                 state.stop();
-                for writer in &mut writers {
-                    if !writer.is_finished() {
-                        writer.abort();
-                        let _ = writer.await;
-                    }
+                for task in readers.into_iter().chain(writers) {
+                    task.abort();
+                    let _ = task.await;
                 }
             });
         } else {
             state.stop();
-            for writer in writers {
-                writer.abort();
+            for task in writers {
+                task.abort();
             }
         }
+    }
+}
+
+/// Remove each completed handle before polling another one. If interrupted by a
+/// deadline/cancellation, the owner still holds every handle that needs reaping.
+async fn drain_tasks(tasks: &mut Vec<tokio::task::JoinHandle<()>>) {
+    while let Some(task) = tasks.last_mut() {
+        let _ = task.await;
+        tasks.pop();
     }
 }
 
@@ -1024,6 +1029,28 @@ mod terminal_event_tests {
         tokio::time::timeout(std::time::Duration::from_millis(200), transport.join())
             .await
             .expect("full incoming queue must stop");
+    }
+
+    #[tokio::test]
+    async fn partial_drain_never_repolls_completed_handles() {
+        let blocked = tokio::spawn(std::future::pending::<()>());
+        let completed = tokio::spawn(async {});
+        let mut tasks = vec![blocked, completed];
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            drain_tasks(&mut tasks)
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            tasks.len(),
+            1,
+            "completed handles must leave the owner immediately"
+        );
+        tasks[0].abort();
+        drain_tasks(&mut tasks).await;
+        assert!(tasks.is_empty());
+        drain_tasks(&mut tasks).await;
     }
 
     #[tokio::test]

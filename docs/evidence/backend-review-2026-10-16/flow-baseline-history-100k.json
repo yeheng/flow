@@ -1,0 +1,201 @@
+{
+  "arch": "aarch64",
+  "generated_at": "2026-10-16T02:54:49.601268Z",
+  "legacy_baseline": true,
+  "os": "macos",
+  "profile": "release",
+  "result": {
+    "errors": 0,
+    "fixed_active_runs": 1,
+    "mode": "history",
+    "payload": "verified synthetic facts, 1 KiB prepared params and one publication per terminal run",
+    "restart_diagnostics": {
+      "applied_lsn": 6259,
+      "commit_pending": false,
+      "coordinator_last_tick_ms": 0,
+      "coordinator_ticks": 0,
+      "dirty_runs": [
+        "active"
+      ],
+      "durable_lsn": 6259,
+      "executor_peak": 0,
+      "now_ms": 1792119287294,
+      "peak_queued_requests": 0,
+      "projected_lsn": 6259,
+      "projection_error": null,
+      "writer_failure": null,
+      "dirty_run_count": 1,
+      "dirty_run_ids_truncated": false
+    },
+    "restart_ms": 51457.270583000005,
+    "restart_resources": {
+      "children": [],
+      "master": {
+        "fds": 9,
+        "pid": 17545,
+        "rss_bytes": 10522771456,
+        "threads": 6
+      },
+      "tokio_tasks": 0
+    },
+    "samples": [
+      {
+        "checkpoint_bytes": 3332703,
+        "checkpoint_error": null,
+        "checkpoint_ms": 75.776458,
+        "checkpoint_ok": true,
+        "diagnostics": {
+          "applied_lsn": 68,
+          "commit_pending": false,
+          "coordinator_last_tick_ms": 0,
+          "coordinator_ticks": 0,
+          "dirty_runs": [
+            "active",
+            "history-00000000",
+            "history-00000001",
+            "history-00000002",
+            "history-00000003",
+            "history-00000004",
+            "history-00000005",
+            "history-00000006"
+          ],
+          "durable_lsn": 68,
+          "executor_peak": 0,
+          "now_ms": 1792119048432,
+          "peak_queued_requests": 1,
+          "projected_lsn": 68,
+          "projection_error": null,
+          "writer_failure": null,
+          "dirty_run_count": 1001,
+          "dirty_run_ids_truncated": true
+        },
+        "disk_bytes": 14737483,
+        "elapsed_secs": 1.739052,
+        "read": {
+          "count": 100,
+          "max_ms": 6.082709,
+          "p50_ms": 2.401417,
+          "p95_ms": 2.785958,
+          "p99_ms": 3.224916
+        },
+        "resources": {
+          "children": [],
+          "master": {
+            "fds": 16,
+            "pid": 17545,
+            "rss_bytes": 129384448,
+            "threads": 9
+          },
+          "tokio_tasks": 2
+        },
+        "runs": 1000
+      },
+      {
+        "checkpoint_bytes": 3332703,
+        "checkpoint_error": "journal limit exceeded: JSON exceeds 16777216 bytes",
+        "checkpoint_ms": 484.447834,
+        "checkpoint_ok": false,
+        "diagnostics": {
+          "applied_lsn": 631,
+          "commit_pending": false,
+          "coordinator_last_tick_ms": 0,
+          "coordinator_ticks": 0,
+          "dirty_runs": [
+            "active",
+            "history-00000000",
+            "history-00000001",
+            "history-00000002",
+            "history-00000003",
+            "history-00000004",
+            "history-00000005",
+            "history-00000006"
+          ],
+          "durable_lsn": 631,
+          "executor_peak": 0,
+          "now_ms": 1792119064912,
+          "peak_queued_requests": 1,
+          "projected_lsn": 631,
+          "projection_error": null,
+          "writer_failure": null,
+          "dirty_run_count": 10001,
+          "dirty_run_ids_truncated": true
+        },
+        "disk_bytes": 88130585,
+        "elapsed_secs": 18.21914725,
+        "read": {
+          "count": 100,
+          "max_ms": 64.058916,
+          "p50_ms": 38.40625,
+          "p95_ms": 40.348375,
+          "p99_ms": 43.576042
+        },
+        "resources": {
+          "children": [],
+          "master": {
+            "fds": 16,
+            "pid": 17545,
+            "rss_bytes": 1131020288,
+            "threads": 9
+          },
+          "tokio_tasks": 2
+        },
+        "runs": 10000
+      },
+      {
+        "checkpoint_bytes": 3332703,
+        "checkpoint_error": "journal limit exceeded: JSON exceeds 8388608 bytes",
+        "checkpoint_ms": 2668.5555,
+        "checkpoint_ok": false,
+        "diagnostics": {
+          "applied_lsn": 6258,
+          "commit_pending": false,
+          "coordinator_last_tick_ms": 0,
+          "coordinator_ticks": 0,
+          "dirty_runs": [
+            "active",
+            "history-00000000",
+            "history-00000001",
+            "history-00000002",
+            "history-00000003",
+            "history-00000004",
+            "history-00000005",
+            "history-00000006"
+          ],
+          "durable_lsn": 6258,
+          "executor_peak": 0,
+          "now_ms": 1792119231850,
+          "peak_queued_requests": 1,
+          "projected_lsn": 6258,
+          "projection_error": null,
+          "writer_failure": null,
+          "dirty_run_count": 100001,
+          "dirty_run_ids_truncated": true
+        },
+        "disk_bytes": 814280069,
+        "elapsed_secs": 185.150309209,
+        "read": {
+          "count": 100,
+          "max_ms": 659.5046249999999,
+          "p50_ms": 397.15937499999995,
+          "p95_ms": 412.450083,
+          "p99_ms": 427.26679099999996
+        },
+        "resources": {
+          "children": [],
+          "master": {
+            "fds": 16,
+            "pid": 17545,
+            "rss_bytes": 8309768192,
+            "threads": 8
+          },
+          "tokio_tasks": 2
+        },
+        "runs": 100000
+      }
+    ],
+    "terminal_runs": 100000,
+    "timeouts": 0
+  },
+  "source_report": "/private/tmp/flow-baseline-history-100k.json",
+  "baseline_commit": "e58b9ab84a0a26d97a2c1f52ac20529385b2adaf"
+}

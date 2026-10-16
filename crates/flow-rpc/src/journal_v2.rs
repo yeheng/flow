@@ -699,7 +699,7 @@ async fn cluster_route(
 async fn observations_page(b: &JournalBackend, p: &Value) -> Result<Value, ErrorObjectOwned> {
     let run_id = text(p, "run_id")?.to_owned();
     if b.projection
-        .get("run", &run_id)
+        .get_summary("run", &run_id)
         .await
         .map_err(invalid)?
         .1
@@ -790,7 +790,7 @@ async fn events_page(
     let run_id = text(p, "run_id")?.to_owned();
     let (upper, run) = b
         .projection
-        .get("run", &run_id)
+        .get_summary("run", &run_id)
         .await
         .map_err(projection_failure)?;
     if run.is_none() {
@@ -851,20 +851,9 @@ async fn workflow_get_view(b: &JournalBackend, p: &Value) -> Result<Value, Error
 
 /// 产品面：工作流版本列表。
 async fn workflow_versions(b: &JournalBackend, p: &Value) -> Result<Value, ErrorObjectOwned> {
-    let versions = flow_backend::journal_views::list_versions(b, text(p, "workflow_id")?)
+    let versions = flow_backend::journal_views::version_metadata(b, text(p, "workflow_id")?)
         .await
         .map_err(view_failure)?;
-    let versions: Vec<Value> = versions
-        .into_iter()
-        .map(|v| {
-            json!({
-                "version": v.version,
-                "status": v.status,
-                "checksum": v.checksum,
-                "created_at": v.created_at,
-            })
-        })
-        .collect();
     Ok(json!({"versions": versions}))
 }
 
@@ -1119,7 +1108,7 @@ async fn subscribe_run_events(
         flow_journal::tail::TailReader::new(ctx.backend.journal.root(), ctx.backend.journal.id());
     let mut scanned = 0;
     loop {
-        let (upper, row) = match ctx.backend.projection.get("run", &run_id).await {
+        let (upper, row) = match ctx.backend.projection.get_summary("run", &run_id).await {
             Ok(v) => v,
             Err(_) => return,
         };

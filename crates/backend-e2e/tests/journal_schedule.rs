@@ -151,7 +151,7 @@ async fn legacy_checkpoint_replays_evicted_schedule_identity_without_executing_a
     drop(backend);
     // Simulate an old checkpoint: its state has no business watermark and its
     // general window has already evicted the slot. Original journal facts are unchanged.
-    let cp = flow_journal::maintenance::load_checkpoint(root.path(), 3)
+    let cp = flow_journal::maintenance::load_checkpoint(root.path(), 5)
         .unwrap()
         .unwrap();
     let mut snapshot = cp.state;

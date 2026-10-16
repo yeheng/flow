@@ -903,14 +903,17 @@ impl AgentManager {
 
     // Resume 裁决（三期 §1.4 表）：以主日志为准，不信 agent 自报游标。
     async fn adjudicate_resume(&self, agent_id: &str, items: &[ResumeItem]) -> Vec<ResumeDecision> {
-        let state = self.backend.state().await;
         let bindings = self.bindings.lock().await.clone();
         let mut decisions = Vec::new();
         for item in items {
             let action = match bindings.get(&item.dispatch_id) {
                 Some(binding) if binding.agent_id == agent_id => {
                     let boot = binding.executor_boot_id.lock().await.clone();
-                    adjudicate_against_journal(&state, binding, item, boot.as_deref())
+                    self.backend
+                        .inspect(|state| {
+                            adjudicate_against_journal(state, binding, item, boot.as_deref())
+                        })
+                        .await
                 }
                 _ => ResumeAction::ReconcileRequired,
             };
@@ -1775,19 +1778,10 @@ mod session_tests {
             })
             .await
             .unwrap();
-        let mut rejected = None;
-        for _ in 0..4 {
-            match tokio::time::timeout(Duration::from_secs(5), transport.recv()).await {
-                Ok(Ok(Message::Reject { reason })) => {
-                    rejected = Some(reason);
-                    break;
-                }
-                Ok(Ok(other)) => panic!("unexpected message before reject: {}", other.type_name()),
-                Ok(Err(_)) => break,
-                Err(_) => break,
-            }
-        }
-        let reason = rejected.expect("版本不匹配必须显式 Reject 并断链");
+        let reason = match tokio::time::timeout(Duration::from_secs(5), transport.recv()).await {
+            Ok(Ok(Message::Reject { reason })) => reason,
+            other => panic!("版本不匹配必须显式 Reject 并断链: {other:?}"),
+        };
         assert!(
             reason.contains(&(PROTOCOL_VERSION - 1).to_string())
                 && reason.contains(&PROTOCOL_VERSION.to_string()),

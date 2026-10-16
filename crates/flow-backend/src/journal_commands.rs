@@ -232,8 +232,8 @@ impl JournalBackend {
                 .as_str()
                 .ok_or_else(|| invalid("invalid trigger receipt"))?;
             let run = self
-                .inspect(|s| s.runs.get(run_id).cloned())
-                .await
+                .run_snapshot(run_id)
+                .await?
                 .ok_or_else(|| invalid("missing committed trigger run"))?;
             let input = if source == "schedule" {
                 flow_journal::value::materialize(
@@ -315,10 +315,10 @@ impl JournalBackend {
         }
         let output =
             flow_journal::value::store_json(&self.journal, output, 8 * 1024 * 1024).await?;
-        self.command(&format!("run.adjudicate:{run_id}"),Some(request_id),&request,|state|{
+        self.command_for_run(run_id, &format!("run.adjudicate:{run_id}"),Some(request_id),&request,|state|{
             let run=state.runs.get(run_id).ok_or_else(||invalid("run not found"))?;
             let node=run.nodes.get(node_id).ok_or_else(||invalid("node not found"))?;
-            if run.terminal() || node.wait.as_ref().is_none_or(|w| w.kind != WaitKind::Uncertain)
+            if run.terminal() || node.wait.as_ref().is_none_or(|w| w.kind() != WaitKind::Uncertain)
                 || node.operation.as_ref().is_none_or(|o|o.operation_id!=operation_id || o.outcome.is_some()) {
                 return Err(invalid("manual resolution requires the current uncertain operation"));
             }
@@ -464,11 +464,7 @@ impl JournalBackend {
                 if !state.workflows.contains_key(workflow_id) {
                     return Err(invalid("workflow not found"));
                 }
-                if state
-                    .runs
-                    .values()
-                    .any(|run| run.workflow_id == workflow_id)
-                {
+                if state.run_workflows.contains(workflow_id) {
                     return Err(flow_journal::Error::Conflict(
                         "workflow has runs; cannot delete".into(),
                     ));
@@ -615,7 +611,8 @@ impl JournalBackend {
         run_id: &str,
         request_id: Option<&str>,
     ) -> Result<CommandReceipt> {
-        self.command(
+        self.command_for_run(
+            run_id,
             &format!("run.cancel:{run_id}"),
             request_id,
             &json!({"run_id":run_id}),
@@ -662,7 +659,8 @@ impl JournalBackend {
             8 * 1024 * 1024,
         )
         .await?;
-        self.command(
+        self.command_for_run(
+            run_id,
             &format!("run.signal:{run_id}"),
             request_id,
             &request,
@@ -678,7 +676,7 @@ impl JournalBackend {
                     .nodes
                     .get(node_id)
                     .ok_or_else(|| invalid("node not waiting"))?;
-                if !run.terminal() && node.wait.as_ref().is_some_and(|w| w.kind == WaitKind::Uncertain) {
+                if !run.terminal() && node.wait.as_ref().is_some_and(|w| w.kind() == WaitKind::Uncertain) {
                     let operation = node.operation.as_ref()
                         .filter(|op| op.outcome.is_none())
                         .ok_or_else(|| invalid("current uncertain operation required"))?;
@@ -695,7 +693,7 @@ impl JournalBackend {
                         json!({"operation_id":operation.operation_id,"reason":reason,"decision":decision,"output":adjudicated_output}), true);
                     return Ok((vec![event], json!({"delivered":true,"status":"applied","signal_id":request_id})));
                 }
-                if run.terminal() || node.wait.as_ref().is_none_or(|w| w.kind != WaitKind::Signal) {
+                if run.terminal() || node.wait.as_ref().is_none_or(|w| w.kind() != WaitKind::Signal) {
                     return Err(invalid("node not waiting for signal"));
                 }
                 let mut signal = node_event(

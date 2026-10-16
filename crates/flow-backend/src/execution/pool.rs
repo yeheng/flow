@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use tokio::process::Child;
 use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use flow_engine::execution_protocol::contract::{
     DRAIN_GRACE_MS, HEARTBEAT_TIMEOUT_MS, STARTUP_TIMEOUT_MS,
@@ -40,6 +40,7 @@ pub struct RawSession {
     pub boot_id: String,
     pub session_id: String,
     pub child_pid: Option<u32>,
+    cancel: CancellationToken,
 }
 
 /// 一个可派发的会话租约：持有 X_max 信号量份额与会话命令通道。
@@ -50,6 +51,7 @@ pub struct SessionLease {
     pub boot_id: String,
     pub session_id: String,
     pub child_pid: Option<u32>,
+    lifecycle: tokio_util::sync::DropGuard,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -62,6 +64,7 @@ pub struct ExecutorPool {
     executor_counter: AtomicU64,
     session_counter: AtomicU64,
     shutdown: CancellationToken,
+    tasks: TaskTracker,
 }
 
 impl ExecutorPool {
@@ -76,16 +79,20 @@ impl ExecutorPool {
             executor_counter: AtomicU64::new(0),
             session_counter: AtomicU64::new(0),
             shutdown: CancellationToken::new(),
+            tasks: TaskTracker::new(),
         })
     }
 
     /// 关停：回收全部会话（kill + wait/reap）。
     pub async fn shutdown(&self) {
         self.shutdown.cancel();
-        let mut idle = self.idle.lock().await;
-        while let Some(session) = idle.pop() {
-            let _ = session.to_session.send(ToSession::Recycle).await;
+        self.slots.close();
+        let idle = std::mem::take(&mut *self.idle.lock().await);
+        for session in idle {
+            let _ = session.to_session.try_send(ToSession::Recycle);
         }
+        self.tasks.close();
+        self.tasks.wait().await;
     }
 
     /// 预热：预先 spawn `count` 个空闲会话放入复用池，省去首次派发的
@@ -111,12 +118,10 @@ impl ExecutorPool {
 
     /// 获取一个执行会话：优先复用空闲会话，否则 spawn 新进程并完成握手。
     pub async fn acquire(self: &Arc<Self>) -> Result<SessionLease, PoolError> {
-        let permit = self
-            .slots
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| PoolError::Unavailable("pool closed".into()))?;
+        let permit = tokio::select! {
+            permit=self.slots.clone().acquire_owned()=>permit.map_err(|_|PoolError::Unavailable("pool closed".into()))?,
+            _=self.shutdown.cancelled()=>return Err(PoolError::Unavailable("pool closed".into())),
+        };
         loop {
             let reused = self.idle.lock().await.pop();
             if let Some(session) = reused {
@@ -130,6 +135,7 @@ impl ExecutorPool {
                     boot_id: session.boot_id,
                     session_id: session.session_id,
                     child_pid: session.child_pid,
+                    lifecycle: session.cancel.drop_guard(),
                     _permit: permit,
                 });
             }
@@ -141,6 +147,7 @@ impl ExecutorPool {
                 boot_id: session.boot_id,
                 session_id: session.session_id,
                 child_pid: session.child_pid,
+                lifecycle: session.cancel.drop_guard(),
                 _permit: permit,
             });
         }
@@ -155,6 +162,7 @@ impl ExecutorPool {
             boot_id,
             session_id,
             child_pid,
+            lifecycle,
             _permit,
         } = lease;
         if healthy && !self.shutdown.is_cancelled() {
@@ -165,13 +173,22 @@ impl ExecutorPool {
                 boot_id,
                 session_id,
                 child_pid,
+                cancel: lifecycle.disarm(),
             });
         } else {
-            let _ = to_session.send(ToSession::Recycle).await;
+            // Do not wait on a potentially full command queue after its reader
+            // stopped draining correctness events. The owned guard wakes all waits.
+            drop(lifecycle);
         }
     }
 
     async fn spawn_session(self: &Arc<Self>) -> Result<RawSession, PoolError> {
+        // Track startup before checking cancellation: shutdown must also wait for
+        // a handshake that has not yet installed its session driver.
+        let _starting = self.tasks.token();
+        if self.shutdown.is_cancelled() {
+            return Err(PoolError::Unavailable("pool closed".into()));
+        }
         let executor_id = format!(
             "exec-{}",
             self.executor_counter.fetch_add(1, Ordering::Relaxed)
@@ -180,15 +197,7 @@ impl ExecutorPool {
             "session-{}",
             self.session_counter.fetch_add(1, Ordering::Relaxed)
         );
-        spawn_and_handshake(
-            &self.options.executor,
-            &self.journal_id,
-            self.master_epoch,
-            &executor_id,
-            &session_id,
-            self.options.tag.as_deref(),
-        )
-        .await
+        spawn_and_handshake(self, &executor_id, &session_id, self.shutdown.child_token()).await
     }
 }
 
@@ -230,44 +239,40 @@ async fn spawn_transport(
 
 /// spawn 执行器并完成握手；子进程由会话驱动任务持有并负责 kill/reap。
 async fn spawn_and_handshake(
-    executor: &flow_engine::execution_protocol::contract::ExecutorInvocation,
-    journal_id: &str,
-    master_epoch: u64,
+    pool: &ExecutorPool,
     executor_id: &str,
     session_id: &str,
-    tag: Option<&str>,
+    shutdown: CancellationToken,
 ) -> Result<RawSession, PoolError> {
-    let (mut transport, mut child, session_token) = spawn_transport(executor, tag).await?;
+    let (mut transport, mut child, session_token) =
+        spawn_transport(&pool.options.executor, pool.options.tag.as_deref()).await?;
     let child_pid = child.id();
-    let hello = tokio::time::timeout(
-        Duration::from_millis(STARTUP_TIMEOUT_MS * 2),
-        master_handshake(
-            &mut transport,
-            journal_id,
-            master_epoch,
-            executor_id,
-            session_id,
-            session_token.as_deref(),
-        ),
-    )
-    .await
-    .map_err(|_| {
-        let _ = child.start_kill();
-        PoolError::Handshake("handshake timeout".into())
-    })?
-    .map_err(|error| {
-        let _ = child.start_kill();
-        PoolError::Handshake(error.to_string())
-    })?;
+    let handshake = tokio::select! {
+        result=tokio::time::timeout(Duration::from_millis(STARTUP_TIMEOUT_MS * 2),
+            master_handshake(&mut transport,&pool.journal_id,pool.master_epoch,executor_id,session_id,session_token.as_deref())) =>
+            match result { Ok(Ok(hello))=>Ok(hello), Ok(Err(e))=>Err(e.to_string()), Err(_)=>Err("handshake timeout".into()) },
+        _=shutdown.cancelled()=>Err("pool closed during handshake".into()),
+    };
+    let hello = match handshake {
+        Ok(hello) => hello,
+        Err(error) => {
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+            transport.close();
+            transport.join().await;
+            return Err(PoolError::Handshake(error));
+        }
+    };
     let boot_id = hello.boot_id.clone();
     let (to_session, command_rx) = mpsc::channel::<ToSession>(64);
     let (event_tx, events) = mpsc::channel::<FromSession>(256);
-    tokio::spawn(session_driver(
+    pool.tasks.spawn(session_driver(
         transport,
         child,
         command_rx,
         event_tx,
         executor_id.to_string(),
+        shutdown.clone(),
     ));
     Ok(RawSession {
         to_session,
@@ -276,6 +281,7 @@ async fn spawn_and_handshake(
         boot_id,
         session_id: session_id.to_string(),
         child_pid,
+        cancel: shutdown,
     })
 }
 
@@ -286,6 +292,7 @@ async fn session_driver(
     mut command_rx: mpsc::Receiver<ToSession>,
     event_tx: mpsc::Sender<FromSession>,
     executor_id: String,
+    shutdown: CancellationToken,
 ) {
     let mut draining = false;
     let mut last_seen = tokio::time::Instant::now();
@@ -300,6 +307,7 @@ async fn session_driver(
             break;
         }
         tokio::select! {
+            _=shutdown.cancelled()=>break,
             command = command_rx.recv(), if send_backlog.is_empty() => {
                 match command {
                     Some(ToSession::Send(message)) => {
@@ -338,28 +346,24 @@ async fn session_driver(
                                 .try_send(FromSession::Incoming(Box::new(message)))
                                 .is_ok()
                         } else {
-                            event_tx
-                                .send(FromSession::Incoming(Box::new(message)))
-                                .await
-                                .is_ok()
+                            tokio::select! {
+                                result=event_tx.send(FromSession::Incoming(Box::new(message)))=>result.is_ok(),
+                                _=shutdown.cancelled()=>break,
+                            }
                         };
                         if !delivered && !heartbeat {
                             // 派发端已离开：保留会话等待下一个租约或回收。
                         }
                     }
                     Err(error) => {
-                        let _ = event_tx
-                            .send(FromSession::Dead(format!("channel failed: {error}")))
-                            .await;
+                        tokio::select! { _=event_tx.send(FromSession::Dead(format!("channel failed: {error}")))=>{}, _=shutdown.cancelled()=>{} }
                         break;
                     }
                 }
             }
             _ = heartbeat.tick() => {
                 if last_seen.elapsed() > timeout && !draining {
-                    let _ = event_tx
-                        .send(FromSession::Dead("heartbeat timeout".into()))
-                        .await;
+                    tokio::select! { _=event_tx.send(FromSession::Dead("heartbeat timeout".into()))=>{}, _=shutdown.cancelled()=>{} }
                     break;
                 }
             }
@@ -385,5 +389,102 @@ async fn session_driver(
         tracing::debug!(%executor_id, %status, "executor reaped");
     }
     tracing::debug!(%executor_id, "executor session recycled");
-    drop(transport);
+    transport.close();
+    transport.join().await;
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    #[tokio::test]
+    async fn unhealthy_release_and_abandoned_lease_do_not_wait_for_command_capacity() {
+        let options = IpcOptions {
+            executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
+                "unused",
+            ),
+            x_max: 1,
+            tag: None,
+        };
+        let pool = ExecutorPool::new(options, "j".into(), 1);
+        for abandon in [false, true] {
+            let cancel = CancellationToken::new();
+            let (commands, _held_receiver) = mpsc::channel(1);
+            commands.try_send(ToSession::Recycle).unwrap();
+            let (_, events) = mpsc::channel(1);
+            let lease = SessionLease {
+                to_session: commands,
+                events,
+                executor_id: "e".into(),
+                boot_id: "b".into(),
+                session_id: "s".into(),
+                child_pid: None,
+                lifecycle: cancel.clone().drop_guard(),
+                _permit: pool.slots.clone().acquire_owned().await.unwrap(),
+            };
+            if abandon {
+                drop(lease)
+            } else {
+                tokio::time::timeout(Duration::from_millis(100), pool.release(lease, false))
+                    .await
+                    .expect("release cannot wait behind a full command queue");
+            }
+            assert!(cancel.is_cancelled());
+            assert_eq!(pool.slots.available_permits(), 1);
+        }
+        pool.shutdown().await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_shutdown_interrupts_full_event_queue_and_reaps_child() {
+        let child = tokio::process::Command::new("/bin/sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let (a, b) = tokio::io::duplex(4096);
+        let transport = FrameTransport::spawn(a, 8);
+        let mut peer = FrameTransport::spawn(b, 8);
+        let (_commands, command_rx) = mpsc::channel(1);
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let mut task = tokio::spawn(session_driver(
+            transport,
+            child,
+            command_rx,
+            event_tx,
+            "fixture".into(),
+            cancel.clone(),
+        ));
+        peer.send(Message::Reject {
+            reason: "first".into(),
+        })
+        .await
+        .unwrap();
+        peer.send(Message::Reject {
+            reason: "second".into(),
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while event_rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_millis(DRAIN_GRACE_MS + 1000), &mut task)
+            .await
+            .expect("session must be reaped despite an abandoned runner")
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::kill(pid as i32, 0) },
+            -1,
+            "child remains after shutdown"
+        );
+        peer.close();
+        peer.join().await;
+    }
 }

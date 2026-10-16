@@ -159,13 +159,33 @@ pub struct Run {
     pub nodes: BTreeMap<String, Node>,
 }
 impl Run {
+    /// Run metadata without the per-node execution ledger.
+    pub fn summary(&self) -> Self {
+        Self {
+            run_id: self.run_id.clone(),
+            workflow_id: self.workflow_id.clone(),
+            workflow_version: self.workflow_version,
+            definition: self.definition.clone(),
+            input: self.input.clone(),
+            source: self.source.clone(),
+            source_detail: self.source_detail.clone(),
+            parent: self.parent.clone(),
+            depth: self.depth,
+            created_at: self.created_at.clone(),
+            status: self.status,
+            output: self.output.clone(),
+            error: self.error.clone(),
+            last_run_seq: self.last_run_seq,
+            nodes: BTreeMap::new(),
+        }
+    }
     /// Terminal facts win; otherwise all outstanding uncertain waits participate.
     pub fn refresh_status(&mut self) {
         if !self.status.terminal() {
             self.status = if self.nodes.values().any(|node| {
                 node.wait
                     .as_ref()
-                    .is_some_and(|wait| wait.kind == WaitKind::Uncertain)
+                    .is_some_and(|wait| wait.kind() == WaitKind::Uncertain)
             }) {
                 RunStatus::AwaitingResume
             } else {
@@ -196,6 +216,25 @@ pub struct Node {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skip_reason: Option<String>,
 }
+impl Node {
+    /// Execution fields only; attempt history is staged and indexed independently.
+    pub fn summary(&self) -> Self {
+        Self {
+            node_execution_id: self.node_execution_id.clone(),
+            attempt: self.attempt,
+            dispatch_id: self.dispatch_id.clone(),
+            status: self.status,
+            output: self.output.clone(),
+            branch: self.branch,
+            prepared: self.prepared.clone(),
+            wait: self.wait.clone(),
+            operation: self.operation.clone(),
+            attempts: BTreeMap::new(),
+            error: self.error.clone(),
+            skip_reason: self.skip_reason.clone(),
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Attempt {
     pub audit_seq: u64,
@@ -217,13 +256,107 @@ pub struct Prepared {
     pub engine_build: String,
     pub node_semantics: u32,
 }
+/// Internal waits carry the fields required by their kind. The adapter preserves
+/// the original checkpoint/event JSON shape, including explicit null fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Wait {
-    pub kind: WaitKind,
-    pub wake_at: Option<i64>,
-    pub child_run_id: Option<String>,
+#[serde(try_from = "WaitWire", into = "WaitWire")]
+pub enum Wait {
+    Delay {
+        wake_at: i64,
+        output: Option<StoredValue>,
+    },
+    Signal {
+        output: Option<StoredValue>,
+    },
+    Child {
+        child_run_id: String,
+    },
+    Retry {
+        wake_at: i64,
+    },
+    Uncertain,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WaitWire {
+    kind: WaitKind,
+    wake_at: Option<i64>,
+    child_run_id: Option<String>,
     #[serde(default)]
-    pub output: Option<StoredValue>,
+    output: Option<StoredValue>,
+}
+impl TryFrom<WaitWire> for Wait {
+    type Error = &'static str;
+    fn try_from(w: WaitWire) -> std::result::Result<Self, Self::Error> {
+        if w.child_run_id.is_some() && w.kind != WaitKind::Child {
+            return Err("child_run_id on non-child wait");
+        }
+        if w.wake_at.is_some() && !matches!(w.kind, WaitKind::Delay | WaitKind::Retry) {
+            return Err("wake_at on non-timed wait");
+        }
+        if w.output.is_some() && !matches!(w.kind, WaitKind::Delay | WaitKind::Signal) {
+            return Err("output on non-value wait");
+        }
+        Ok(match w.kind {
+            WaitKind::Delay => Self::Delay {
+                wake_at: w.wake_at.ok_or("delay missing wake_at")?,
+                output: w.output,
+            },
+            WaitKind::Signal => Self::Signal { output: w.output },
+            WaitKind::Child => Self::Child {
+                child_run_id: w
+                    .child_run_id
+                    .filter(|id| !id.is_empty())
+                    .ok_or("child missing child_run_id")?,
+            },
+            WaitKind::Retry => Self::Retry {
+                wake_at: w.wake_at.ok_or("retry missing wake_at")?,
+            },
+            WaitKind::Uncertain => Self::Uncertain,
+        })
+    }
+}
+impl From<Wait> for WaitWire {
+    fn from(w: Wait) -> Self {
+        let mut wire = Self {
+            kind: w.kind(),
+            wake_at: w.wake_at(),
+            child_run_id: None,
+            output: w.output().cloned(),
+        };
+        if let Wait::Child { child_run_id } = w {
+            wire.child_run_id = Some(child_run_id);
+        }
+        wire
+    }
+}
+impl Wait {
+    pub fn kind(&self) -> WaitKind {
+        match self {
+            Self::Delay { .. } => WaitKind::Delay,
+            Self::Signal { .. } => WaitKind::Signal,
+            Self::Child { .. } => WaitKind::Child,
+            Self::Retry { .. } => WaitKind::Retry,
+            Self::Uncertain => WaitKind::Uncertain,
+        }
+    }
+    pub fn wake_at(&self) -> Option<i64> {
+        match self {
+            Self::Delay { wake_at, .. } | Self::Retry { wake_at } => Some(*wake_at),
+            _ => None,
+        }
+    }
+    pub fn child_run_id(&self) -> Option<&String> {
+        match self {
+            Self::Child { child_run_id } => Some(child_run_id),
+            _ => None,
+        }
+    }
+    pub fn output(&self) -> Option<&StoredValue> {
+        match self {
+            Self::Delay { output, .. } | Self::Signal { output } => output.as_ref(),
+            _ => None,
+        }
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Operation {
@@ -253,12 +386,18 @@ pub struct State {
     /// Rebuilt by replay before accepting commands; never trusted from serialized snapshots.
     #[serde(skip)]
     pub values: flow_journal::value::ValueCatalog,
+    /// Backend keeps permanent audit receipts in a rebuildable disk index.
+    #[serde(skip)]
+    pub compact_audits: bool,
     pub version: u32,
     pub journal_id: String,
     #[serde(with = "snapshot_decimal")]
     pub applied_lsn: u64,
     pub workflows: BTreeMap<String, Workflow>,
     pub runs: BTreeMap<String, Run>,
+    /// Permanent workflow/run relationship, bounded by workflow count rather than run history.
+    #[serde(default)]
+    pub run_workflows: std::collections::BTreeSet<String>,
     pub schedules: BTreeMap<String, Value>,
     #[serde(default)]
     pub schedule_fires: BTreeMap<String, ScheduleFire>,
@@ -315,6 +454,16 @@ impl State {
             return Err(invalid("reducer identity/LSN mismatch"));
         }
         for (index, event) in tx.events.iter().enumerate() {
+            if event.audit_seq > 0
+                && (event.run_id.is_none()
+                    || event
+                        .node_id
+                        .as_deref()
+                        .or_else(|| event.payload["node_id"].as_str())
+                        .is_none())
+            {
+                return Err(invalid("audit requires run and node identity"));
+            }
             if event.kind == EventKind::MasterEpochStarted {
                 if event.run_id.is_some()
                     || event.dispatch_id.is_some()
@@ -354,8 +503,34 @@ impl State {
             }
         }
         // Undo only changed entities, not the full historical state. Inline values are bounded.
+        // Payload-only audits change counters and one receipt entry, never node state.
+        // Their rollback cost is independent of the accumulated run history.
+        let audit_only = tx.events.iter().all(|e| {
+            matches!(
+                e.kind,
+                EventKind::ValueChunk | EventKind::ValuePublished | EventKind::LateAudit
+            )
+        });
+        let mut audit_undo = Vec::new();
+        let mut run_seq_undo = BTreeMap::new();
         let mut workflow_undo = BTreeMap::new();
         let mut run_undo = BTreeMap::new();
+        let mut node_undo = BTreeMap::new();
+        let mut attempt_undo = BTreeMap::new();
+        let mut membership_undo = BTreeMap::new();
+        let replaced_nodes: std::collections::BTreeSet<_> = tx
+            .events
+            .iter()
+            .filter(|e| e.kind == EventKind::NodeSkipped)
+            .filter_map(|e| {
+                Some((
+                    e.run_id.clone()?,
+                    e.node_id
+                        .clone()
+                        .or_else(|| e.payload["node_id"].as_str().map(str::to_owned))?,
+                ))
+            })
+            .collect();
         let mut schedule_undo = BTreeMap::new();
         let mut fire_undo = BTreeMap::new();
         let mut webhook_undo = BTreeMap::new();
@@ -365,6 +540,12 @@ impl State {
         let mut legacy_undo = BTreeMap::new();
         let mut epoch_undo: Option<u64> = None;
         for event in &tx.events {
+            if event.kind == EventKind::RunStarted {
+                let workflow = string(&event.payload, "workflow_id")?;
+                membership_undo
+                    .entry(workflow.clone())
+                    .or_insert(self.run_workflows.contains(&workflow));
+            }
             if event.kind == EventKind::LegacyImport {
                 let key = string(&event.payload, "key")?;
                 legacy_undo
@@ -394,9 +575,71 @@ impl State {
                 }
             }
             if let Some(id) = &event.run_id {
-                run_undo
-                    .entry(id.clone())
-                    .or_insert_with(|| self.runs.get(id).cloned());
+                if audit_only {
+                    if let Some(run) = self.runs.get(id) {
+                        run_seq_undo
+                            .entry(id.clone())
+                            .or_insert((run.last_run_seq, run.status));
+                        let node_id = event
+                            .node_id
+                            .clone()
+                            .or_else(|| event.payload["node_id"].as_str().map(str::to_owned));
+                        if let (Some(node_id), Some(dispatch)) = (&node_id, &event.dispatch_id) {
+                            if let Some(attempt) = run
+                                .nodes
+                                .get(node_id)
+                                .and_then(|n| n.attempts.get(dispatch))
+                            {
+                                audit_undo.push((
+                                    id.clone(),
+                                    node_id.clone(),
+                                    dispatch.clone(),
+                                    event.audit_seq,
+                                    attempt.audit_seq,
+                                    attempt.audit_digests.get(&event.audit_seq).cloned(),
+                                    attempt.audit_lsns.get(&event.audit_seq).copied(),
+                                ));
+                            }
+                        }
+                    }
+                } else {
+                    run_undo
+                        .entry(id.clone())
+                        .or_insert_with(|| self.runs.get(id).map(Run::summary));
+                    if let Some(node_id) = event
+                        .node_id
+                        .as_deref()
+                        .or_else(|| event.payload["node_id"].as_str())
+                    {
+                        node_undo
+                            .entry((id.clone(), node_id.to_owned()))
+                            .or_insert_with(|| {
+                                self.runs
+                                    .get(id)
+                                    .and_then(|r| r.nodes.get(node_id))
+                                    .map(|n| {
+                                        if replaced_nodes
+                                            .contains(&(id.clone(), node_id.to_owned()))
+                                        {
+                                            n.clone()
+                                        } else {
+                                            n.summary()
+                                        }
+                                    })
+                            });
+                        if let Some(dispatch) = &event.dispatch_id {
+                            attempt_undo
+                                .entry((id.clone(), node_id.to_owned(), dispatch.clone()))
+                                .or_insert_with(|| {
+                                    self.runs
+                                        .get(id)
+                                        .and_then(|r| r.nodes.get(node_id))
+                                        .and_then(|n| n.attempts.get(dispatch))
+                                        .cloned()
+                                });
+                        }
+                    }
+                }
             }
             if event.kind == EventKind::ScheduleChanged {
                 let id = string(&event.payload, "id")?;
@@ -443,14 +686,83 @@ impl State {
                 self.check_values(event)?;
                 self.apply_event(event, tx.lsn, &mut command_undo)?;
                 if let Some(run) = event.run_id.as_ref().and_then(|id| self.runs.get_mut(id)) {
-                    run.refresh_status();
+                    if !audit_only {
+                        run.refresh_status();
+                    }
                 }
             }
             Ok(())
         })();
         if result.is_err() || !commit {
             restore(&mut self.workflows, workflow_undo);
-            restore(&mut self.runs, run_undo);
+            for (id, previous) in run_undo {
+                if let Some(mut previous) = previous {
+                    if let Some(current) = self.runs.get_mut(&id) {
+                        previous.nodes = std::mem::take(&mut current.nodes);
+                    }
+                    self.runs.insert(id, previous);
+                } else {
+                    self.runs.remove(&id);
+                }
+            }
+            for ((run_id, node_id), previous) in node_undo {
+                if let Some(run) = self.runs.get_mut(&run_id) {
+                    if let Some(mut previous) = previous {
+                        if !replaced_nodes.contains(&(run_id.clone(), node_id.clone())) {
+                            if let Some(current) = run.nodes.get_mut(&node_id) {
+                                previous.attempts = std::mem::take(&mut current.attempts);
+                            }
+                        }
+                        run.nodes.insert(node_id, previous);
+                    } else {
+                        run.nodes.remove(&node_id);
+                    }
+                }
+            }
+            for ((run_id, node_id, dispatch), previous) in attempt_undo {
+                if let Some(node) = self
+                    .runs
+                    .get_mut(&run_id)
+                    .and_then(|r| r.nodes.get_mut(&node_id))
+                {
+                    if let Some(previous) = previous {
+                        node.attempts.insert(dispatch, previous);
+                    } else {
+                        node.attempts.remove(&dispatch);
+                    }
+                }
+            }
+            for (workflow, existed) in membership_undo {
+                if !existed {
+                    self.run_workflows.remove(&workflow);
+                }
+            }
+            for (id, (seq, status)) in run_seq_undo {
+                let run = self.runs.get_mut(&id).expect("existing audit run");
+                run.last_run_seq = seq;
+                run.status = status;
+            }
+            for (run, node, dispatch, seq, previous_seq, digest, lsn) in
+                audit_undo.into_iter().rev()
+            {
+                let attempt = self
+                    .runs
+                    .get_mut(&run)
+                    .and_then(|r| r.nodes.get_mut(&node))
+                    .and_then(|n| n.attempts.get_mut(&dispatch))
+                    .expect("existing audit attempt");
+                attempt.audit_seq = previous_seq;
+                if let Some(digest) = digest {
+                    attempt.audit_digests.insert(seq, digest);
+                } else {
+                    attempt.audit_digests.remove(&seq);
+                }
+                if let Some(lsn) = lsn {
+                    attempt.audit_lsns.insert(seq, lsn);
+                } else {
+                    attempt.audit_lsns.remove(&seq);
+                }
+            }
             restore(&mut self.schedules, schedule_undo);
             restore(&mut self.schedule_fires, fire_undo);
             restore(&mut self.webhooks, webhook_undo);
@@ -512,8 +824,8 @@ impl State {
             }
             EventKind::WaitRegistered => {
                 let wait: Wait = serde_json::from_value(p["wait"].clone())?;
-                if let Some(value) = wait.output {
-                    self.values.check(&value)?;
+                if let Some(value) = wait.output() {
+                    self.values.check(value)?;
                 }
             }
             _ => {}
@@ -656,6 +968,7 @@ impl State {
                     return Err(invalid("invalid run creation"));
                 }
                 run.last_run_seq = 1;
+                self.run_workflows.insert(run.workflow_id.clone());
                 self.runs.insert(run.run_id.clone(), run);
                 return Ok(());
             }
@@ -831,14 +1144,16 @@ impl State {
                 return Err(invalid("audit gap/duplicate or sealed dispatch"));
             }
             attempt.audit_seq = event.audit_seq;
-            attempt.audit_lsns.insert(event.audit_seq, lsn);
-            attempt.audit_digests.insert(
-                event.audit_seq,
-                flow_journal::codec::digest(&flow_journal::codec::bounded_json(
-                    event,
-                    flow_journal::MAX_LINE_BYTES,
-                )?),
-            );
+            if !self.compact_audits {
+                attempt.audit_lsns.insert(event.audit_seq, lsn);
+                attempt.audit_digests.insert(
+                    event.audit_seq,
+                    flow_journal::codec::digest(&flow_journal::codec::bounded_json(
+                        event,
+                        flow_journal::MAX_LINE_BYTES,
+                    )?),
+                );
+            }
         }
         match event.kind {
             EventKind::InputPrepared => {
@@ -927,12 +1242,7 @@ impl State {
                                 return Err(invalid("external operation cannot use pure retry"));
                             }
                             node.status = NodeStatus::Waiting;
-                            node.wait = Some(Wait {
-                                kind: WaitKind::Retry,
-                                wake_at: Some(wake_at),
-                                child_run_id: None,
-                                output: None,
-                            });
+                            node.wait = Some(Wait::Retry { wake_at });
                             run.status = RunStatus::Running;
                         }
                     }
@@ -951,7 +1261,7 @@ impl State {
                     || node
                         .wait
                         .as_ref()
-                        .is_none_or(|w| w.kind != WaitKind::Uncertain)
+                        .is_none_or(|w| w.kind() != WaitKind::Uncertain)
                     || node
                         .operation
                         .as_ref()
@@ -1126,16 +1436,7 @@ mod aggregate_status_tests {
             output: None,
             branch: None,
             prepared: None,
-            wait: if wait {
-                Some(Wait {
-                    kind: WaitKind::Uncertain,
-                    wake_at: None,
-                    child_run_id: None,
-                    output: None,
-                })
-            } else {
-                None
-            },
+            wait: if wait { Some(Wait::Uncertain) } else { None },
             operation: None,
             attempts: BTreeMap::new(),
             error: None,
@@ -1156,5 +1457,42 @@ mod aggregate_status_tests {
         run.status = RunStatus::Cancelled;
         run.refresh_status();
         assert_eq!(run.status, RunStatus::Cancelled);
+    }
+}
+
+#[cfg(test)]
+mod wait_compat_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn legacy_wait_shapes_round_trip_and_illegal_combinations_fail() {
+        for (kind, wake_at, child_run_id) in [
+            ("delay", json!(123), Value::Null),
+            ("retry", json!(456), Value::Null),
+            ("child", Value::Null, json!("child-1")),
+            ("signal", Value::Null, Value::Null),
+            ("uncertain", Value::Null, Value::Null),
+        ] {
+            let old =
+                json!({"kind":kind,"wake_at":wake_at,"child_run_id":child_run_id,"output":null});
+            let wait: Wait = serde_json::from_value(old.clone()).unwrap();
+            assert_eq!(serde_json::to_value(wait).unwrap(), old);
+        }
+        for bad in [
+            json!({"kind":"delay"}),
+            json!({"kind":"retry"}),
+            json!({"kind":"child"}),
+            json!({"kind":"child","child_run_id":""}),
+            json!({"kind":"signal","wake_at":1}),
+            json!({"kind":"uncertain","child_run_id":"c"}),
+            json!({"kind":"retry","wake_at":1,"output":{"type":"inline","value":null}}),
+        ] {
+            assert!(
+                serde_json::from_value::<Wait>(bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
+        let signal: Wait = serde_json::from_value(json!({"kind":"signal"})).unwrap();
+        assert_eq!(signal.kind(), WaitKind::Signal);
     }
 }

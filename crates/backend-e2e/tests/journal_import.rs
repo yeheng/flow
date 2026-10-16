@@ -43,6 +43,30 @@ async fn legacy_import_is_reentrant_preserves_raw_tail_and_reports_missing_input
     let first = journal_import::import(&source, &db, &destination)
         .await
         .unwrap();
+    // Permanent import progress must survive eviction of the general RPC window.
+    let backend = JournalBackend::open(&destination, Default::default())
+        .await
+        .unwrap();
+    for batch in 0..33 {
+        let events = (0..256)
+            .map(|i| {
+                flow_journal::Event::new(
+                    flow_journal::EventKind::Command,
+                    json!({"scope":"evict-import-receipts","request_id":format!("{batch}-{i}"),
+                "fingerprint":"unrelated","result":null,"lsn":"0"}),
+                )
+            })
+            .collect();
+        backend.append(events).await.unwrap();
+    }
+    assert!(backend
+        .state()
+        .await
+        .commands
+        .values()
+        .all(|c| !c.scope.starts_with("legacy.")));
+    backend.close().await.unwrap();
+    drop(backend);
     // Model interruption before publishing one copied evidence file. The journal
     // baseline already exists, and unrelated partial temp data must not become truth.
     let copied = destination.join("legacy-source/runs/run-1/event.jsonl");

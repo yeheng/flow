@@ -1,0 +1,191 @@
+{
+  "arch": "aarch64",
+  "generated_at": "2026-10-16T03:40:35.284355Z",
+  "legacy_baseline": false,
+  "os": "macos",
+  "profile": "release",
+  "result": {
+    "errors": 0,
+    "fixed_active_runs": 1,
+    "mode": "history",
+    "payload": "verified synthetic facts, 1 KiB prepared params and one publication per terminal run",
+    "restart_diagnostics": {
+      "applied_lsn": 6259,
+      "cached_publications": 8192,
+      "commit_pending": false,
+      "coordinator_last_tick_ms": 0,
+      "coordinator_ticks": 0,
+      "dirty_run_count": 1,
+      "dirty_runs": [
+        "active"
+      ],
+      "durable_lsn": 6259,
+      "executor_peak": 0,
+      "now_ms": 1792122032881,
+      "peak_queued_requests": 0,
+      "projected_lsn": 6259,
+      "projection_error": null,
+      "resident_attempts": 0,
+      "resident_runs": 1,
+      "writer_failure": null,
+      "dirty_run_ids_truncated": false
+    },
+    "restart_ms": 40065.755000000005,
+    "restart_resources": {
+      "children": [],
+      "master": {
+        "fds": 9,
+        "pid": 26430,
+        "rss_bytes": 62947328,
+        "threads": 6
+      },
+      "tokio_tasks": 0
+    },
+    "samples": [
+      {
+        "checkpoint_bytes": 240952,
+        "checkpoint_error": null,
+        "checkpoint_ms": 56.455167,
+        "checkpoint_ok": true,
+        "diagnostics": {
+          "applied_lsn": 68,
+          "cached_publications": 1000,
+          "commit_pending": false,
+          "coordinator_last_tick_ms": 0,
+          "coordinator_ticks": 0,
+          "dirty_run_count": 1,
+          "dirty_runs": [
+            "active"
+          ],
+          "durable_lsn": 68,
+          "executor_peak": 0,
+          "now_ms": 1792121336442,
+          "peak_queued_requests": 1,
+          "projected_lsn": 68,
+          "projection_error": null,
+          "resident_attempts": 0,
+          "resident_runs": 1,
+          "writer_failure": null,
+          "dirty_run_ids_truncated": false
+        },
+        "disk_bytes": 28877500,
+        "elapsed_secs": 1.8285967090000002,
+        "read": {
+          "count": 100,
+          "max_ms": 0.454541,
+          "p50_ms": 0.15754100000000001,
+          "p95_ms": 0.24575,
+          "p99_ms": 0.28275
+        },
+        "resources": {
+          "children": [],
+          "master": {
+            "fds": 19,
+            "pid": 26430,
+            "rss_bytes": 22970368,
+            "threads": 10
+          },
+          "tokio_tasks": 3
+        },
+        "runs": 1000
+      },
+      {
+        "checkpoint_bytes": 1959847,
+        "checkpoint_error": null,
+        "checkpoint_ms": 276.645709,
+        "checkpoint_ok": true,
+        "diagnostics": {
+          "applied_lsn": 631,
+          "cached_publications": 8192,
+          "commit_pending": false,
+          "coordinator_last_tick_ms": 0,
+          "coordinator_ticks": 0,
+          "dirty_run_count": 1,
+          "dirty_runs": [
+            "active"
+          ],
+          "durable_lsn": 631,
+          "executor_peak": 0,
+          "now_ms": 1792121352536,
+          "peak_queued_requests": 1,
+          "projected_lsn": 631,
+          "projection_error": null,
+          "resident_attempts": 0,
+          "resident_runs": 1,
+          "writer_failure": null,
+          "dirty_run_ids_truncated": false
+        },
+        "disk_bytes": 219646625,
+        "elapsed_secs": 17.922906125,
+        "read": {
+          "count": 100,
+          "max_ms": 0.33475,
+          "p50_ms": 0.19316599999999998,
+          "p95_ms": 0.258542,
+          "p99_ms": 0.331708
+        },
+        "resources": {
+          "children": [],
+          "master": {
+            "fds": 19,
+            "pid": 26430,
+            "rss_bytes": 45793280,
+            "threads": 10
+          },
+          "tokio_tasks": 3
+        },
+        "runs": 10000
+      },
+      {
+        "checkpoint_bytes": 1960012,
+        "checkpoint_error": null,
+        "checkpoint_ms": 2345.434208,
+        "checkpoint_ok": true,
+        "diagnostics": {
+          "applied_lsn": 6258,
+          "cached_publications": 8192,
+          "commit_pending": false,
+          "coordinator_last_tick_ms": 0,
+          "coordinator_ticks": 0,
+          "dirty_run_count": 1,
+          "dirty_runs": [
+            "active"
+          ],
+          "durable_lsn": 6258,
+          "executor_peak": 0,
+          "now_ms": 1792121501725,
+          "peak_queued_requests": 1,
+          "projected_lsn": 6258,
+          "projection_error": null,
+          "resident_attempts": 0,
+          "resident_runs": 1,
+          "writer_failure": null,
+          "dirty_run_ids_truncated": false
+        },
+        "disk_bytes": 2106194034,
+        "elapsed_secs": 167.110215042,
+        "read": {
+          "count": 100,
+          "max_ms": 0.453708,
+          "p50_ms": 0.206541,
+          "p95_ms": 0.26129199999999997,
+          "p99_ms": 0.33545800000000003
+        },
+        "resources": {
+          "children": [],
+          "master": {
+            "fds": 19,
+            "pid": 26430,
+            "rss_bytes": 48037888,
+            "threads": 10
+          },
+          "tokio_tasks": 3
+        },
+        "runs": 100000
+      }
+    ],
+    "terminal_runs": 100000,
+    "timeouts": 0
+  },
+  "source_report": "/private/tmp/flow-cold-history-final-100k.json"
+}

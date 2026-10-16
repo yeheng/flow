@@ -233,7 +233,7 @@ async fn relay_path_produces_identical_authoritative_facts() {
                 "  {id}: {} err={:?} wait={:?}\n",
                 n.status,
                 n.error,
-                n.wait.as_ref().map(|w| w.kind)
+                n.wait.as_ref().map(|w| w.kind())
             ));
         }
         panic!("relay run failed: {:?}\n{}", done_relay.error, report);

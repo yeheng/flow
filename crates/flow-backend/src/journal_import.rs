@@ -241,9 +241,9 @@ pub async fn import(source: &Path, db: &Path, destination: &Path) -> Result<Valu
     let identity = flow_journal::codec::fingerprint(&json!(inventory), 16 * 1024 * 1024)?;
     let backend = JournalBackend::open(destination, Default::default()).await?;
     let result: Result<Value> = async {
-    let state=backend.state().await;
-    if state.legacy.is_empty() && (!state.workflows.is_empty() || !state.runs.is_empty() || !state.commands.is_empty()) {return Err("legacy import requires a new dataset or the same unfinished import".into());}
-    drop(state);
+    if backend.inspect(|state| state.legacy.is_empty() && (!state.workflows.is_empty() || !state.runs.is_empty() || !state.commands.is_empty())).await {
+        return Err("legacy import requires a new dataset or the same unfinished import".into());
+    }
     // Fixed request identity rejects a changed source during interrupted-import resume.
     baseline(&backend,"source",json!({"source_id":identity,"database":relative_db,"files":inventory})).await?;
     let backup=destination.join("legacy-source");
@@ -295,7 +295,7 @@ pub async fn import(source: &Path, db: &Path, destination: &Path) -> Result<Valu
             let key=format!("raw/{name}/{offset}");let request_id=flow_journal::codec::digest(key.as_bytes());
             let n=(length-offset).min(128*1024*1024);
             if let Some(existing) = backend.inspect(|state| state.legacy.get(&key).cloned()).await {
-                if existing["source_digest"] != *digest || existing["path"] != *name || existing["offset"] != offset {
+                if existing["source_digest"] != *digest || existing["path"] != *name || existing["offset"].as_str().and_then(|s| s.parse::<u64>().ok()) != Some(offset) {
                     return Err("legacy raw fragment differs".into());
                 }
 use tokio::io::AsyncSeekExt;file.seek(std::io::SeekFrom::Start(offset+n)).await?;offset+=n;continue;}

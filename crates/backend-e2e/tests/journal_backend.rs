@@ -421,3 +421,155 @@ async fn concurrent_writes_all_return_visible_without_committed_not_visible() {
     backend.close().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test]
+async fn audit_receipts_survive_compaction_restart_and_index_rebuild() {
+    let root = tempfile::tempdir().unwrap();
+    let b = JournalBackend::open(root.path(), Default::default())
+        .await
+        .unwrap();
+    let created = b.workflow_create("audit-index", None).await.unwrap();
+    let workflow = created.result["workflow_id"].as_str().unwrap();
+    b.workflow_update(workflow, json!({"nodes":[{"id":"s","type":"start"},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"e"}]}), None).await.unwrap();
+    b.workflow_publish(workflow, 1, None).await.unwrap();
+    let started = b
+        .run_start(workflow, None, Value::Null, "manual", None, None)
+        .await
+        .unwrap();
+    let run_id = started.result["run_id"].as_str().unwrap().to_owned();
+    let mut dispatch = Event::new(
+        EventKind::DispatchStarted,
+        json!({"node_execution_id":"exec-s","attempt":"1"}),
+    );
+    dispatch.run_id = Some(run_id.clone());
+    dispatch.run_seq = 2;
+    dispatch.node_id = Some("s".into());
+    dispatch.dispatch_id = Some("dispatch-s".into());
+    b.append(vec![dispatch]).await.unwrap();
+    let audit = |seq| {
+        let mut event = Event::new(
+            EventKind::LateAudit,
+            json!({"evidence":"retained in journal"}),
+        );
+        event.run_id = Some(run_id.clone());
+        event.node_id = Some("s".into());
+        event.dispatch_id = Some("dispatch-s".into());
+        event.audit_seq = seq;
+        event
+    };
+    let first = audit(1);
+    let original = b.append(vec![first.clone()]).await.unwrap();
+    for seq in 2..=128 {
+        b.append(vec![audit(seq)]).await.unwrap();
+    }
+    let before = b.journal.durable_lsn();
+    assert!(b.append(vec![audit(129), audit(131)]).await.is_err());
+    assert_eq!(b.journal.durable_lsn(), before);
+    let snapshot = b.state().await;
+    let attempt = &snapshot.runs[&run_id].nodes["s"].attempts["dispatch-s"];
+    assert_eq!(attempt.audit_seq, 128);
+    assert!(attempt.audit_digests.is_empty());
+    assert!(attempt.audit_lsns.is_empty());
+    b.append(vec![audit(129)]).await.unwrap();
+    let before_fallback = serde_json::to_value(b.state().await).unwrap();
+    let mut fallback = audit(130);
+    fallback.node_id = None;
+    fallback.payload["node_id"] = json!("s");
+    assert!(b.append(vec![fallback, audit(132)]).await.is_err());
+    assert_eq!(
+        serde_json::to_value(b.state().await).unwrap(),
+        before_fallback
+    );
+    let mut missing_run = audit(130);
+    missing_run.run_id = None;
+    assert!(b.append(vec![missing_run]).await.is_err());
+    assert_eq!(b.append(vec![first.clone()]).await.unwrap(), original);
+    let mut changed = first.clone();
+    changed.payload = json!({"evidence":"different"});
+    assert!(b.append(vec![changed.clone()]).await.is_err());
+    b.close().await.unwrap();
+    drop(b);
+    for rebuild in [false, true] {
+        if rebuild {
+            std::fs::remove_file(root.path().join("execution-index.sqlite")).unwrap();
+        }
+        let b = JournalBackend::open(root.path(), Default::default())
+            .await
+            .unwrap();
+        assert_eq!(b.append(vec![first.clone()]).await.unwrap(), original);
+        assert!(b.append(vec![changed.clone()]).await.is_err());
+        assert_eq!(
+            b.state().await.runs[&run_id].nodes["s"].attempts["dispatch-s"].audit_seq,
+            129
+        );
+        b.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn metadata_does_not_read_definitions_and_old_run_projection_is_rebuilt() {
+    let root = tempfile::tempdir().unwrap();
+    let b = JournalBackend::open(root.path(), Default::default())
+        .await
+        .unwrap();
+    let created = b.workflow_create("metadata", None).await.unwrap();
+    let workflow = created.result["workflow_id"].as_str().unwrap();
+    b.workflow_update(workflow, json!({"nodes":[{"id":"s","type":"start","name":"x".repeat(100 * 1024)},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"e"}]}), None).await.unwrap();
+    b.workflow_publish(workflow, 1, None).await.unwrap();
+    assert!(matches!(
+        b.state().await.workflows[workflow].versions[&1].definition,
+        flow_journal::StoredValue::Ref(_)
+    ));
+    // Temporarily hide the journal bytes: a metadata list has no reason to touch them.
+    std::fs::rename(
+        root.path().join("journal"),
+        root.path().join("held-journal"),
+    )
+    .unwrap();
+    let metadata = flow_backend::journal_views::version_metadata(&b, workflow).await;
+    let definition = flow_backend::journal_views::get_version(&b, workflow, Some(1)).await;
+    std::fs::rename(
+        root.path().join("held-journal"),
+        root.path().join("journal"),
+    )
+    .unwrap();
+    assert_eq!(metadata.unwrap()[0]["version"], 1);
+    assert!(definition.is_err());
+    let started = b
+        .run_start(workflow, None, Value::Null, "manual", None, None)
+        .await
+        .unwrap();
+    let run_id = started.result["run_id"].as_str().unwrap().to_owned();
+    b.run_cancel(&run_id, None).await.unwrap();
+    let full = b.projection.get("run", &run_id).await.unwrap().1.unwrap();
+    b.close().await.unwrap();
+    drop(b);
+    assert!(flow_journal::maintenance::load_checkpoint(root.path(), 5)
+        .unwrap()
+        .is_some());
+    assert!(flow_journal::maintenance::load_checkpoint(root.path(), 3)
+        .unwrap()
+        .is_none());
+    let pool = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        root.path().join("projection.sqlite").display()
+    ))
+    .await
+    .unwrap();
+    sqlx::query("UPDATE journal_entities SET body=? WHERE kind='run' AND key=?")
+        .bind(full.to_string())
+        .bind(&run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let b = JournalBackend::open(root.path(), Default::default())
+        .await
+        .unwrap();
+    assert!(!b.projection.requires_split_runs().await.unwrap());
+    assert_eq!(
+        b.projection.get("run", &run_id).await.unwrap().1.unwrap(),
+        full
+    );
+    b.close().await.unwrap();
+}

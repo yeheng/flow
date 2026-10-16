@@ -139,18 +139,15 @@ pub struct ValueProgress {
     chunks: u64,
     bytes: u64,
 }
-/// 快照的发布尾部缓冲：live 引用之外的最近发布也保留（在飞窗口）。
+/// 发布描述符缓存上限；不是永久去重或引用有效性的保留期限。
 pub const PUBLISHED_TAIL: usize = 8192;
 
 pub type ValueUndo = (String, Option<ValueProgress>, Option<ValueRef>);
 impl ValueCatalog {
-    /// 快照保留 `live` 引用到的已发布值 ∪ **最近 [`PUBLISHED_TAIL`] 条发布**。
-    ///
-    /// 只留 live 不够：audit 事务发布值与引用它的 NodeCompleted/结果事务
-    /// 是**两个事务**，checkpoint 落在中间时，重放后缀的 values.check 会因
-    /// published 缺项而拒绝重放。uuid v7 键序 = 发布时间序，尾部缓冲覆盖
-    /// 一切在飞窗口（在飞发布数 ≤ A_max=16 全局并发，≪ 8192）；终态 run
-    /// 的历史值越过缓冲后照常逐出——checkpoint 不再被无界 published 打死。
+    /// 快照保留缓存中的 live 描述符和按键排序的尾部。
+    /// 发布和引用可以位于不同事务，不能依赖键序推断在飞窗口；backend
+    /// 在 reducer 检查前从 committed execution index 按原前缀恢复缺项。
+    /// 永久 publication 身份留在该派生索引及权威 journal，不随缓存逐出。
     pub fn snapshot(&self, live: &std::collections::HashSet<String>) -> Result<Value> {
         use sha2::digest::common::hazmat::SerializableState;
         let tail_start = self.published.len().saturating_sub(PUBLISHED_TAIL);
@@ -223,6 +220,29 @@ impl ValueCatalog {
         }
         Ok(catalog)
     }
+    /// Seed only descriptors read from the verified committed-prefix disk index.
+    /// The reducer still compares every business reference against this catalog.
+    pub fn remember_verified(&mut self, value: ValueRef) -> Result<()> {
+        value.validate()?;
+        if let Some(previous) = self.published.get(&value.output_id) {
+            if previous != &value {
+                return Err(invalid("conflicting indexed publication"));
+            }
+        }
+        self.published.insert(value.output_id.clone(), value);
+        Ok(())
+    }
+    pub fn trim_cache(&mut self) {
+        while self.published.len() > PUBLISHED_TAIL {
+            self.published.pop_first();
+        }
+    }
+    pub fn cached_publications(&self) -> usize {
+        self.published.len()
+    }
+    pub fn open_streams(&self) -> usize {
+        self.streams.len()
+    }
     pub fn save(&self, id: &str) -> ValueUndo {
         (
             id.into(),
@@ -257,6 +277,9 @@ impl ValueCatalog {
                     return Err(invalid("chunk after publication"));
                 }
                 let bytes = chunk.decode()?;
+                if !self.streams.contains_key(&chunk.output_id) && self.streams.len() >= 8192 {
+                    return Err(Error::Limit("open value stream budget".into()));
+                }
                 let stream = self.streams.entry(chunk.output_id).or_default();
                 if stream.chunks != chunk.chunk_index
                     || stream.bytes + bytes.len() as u64 > MAX_VALUE_BYTES

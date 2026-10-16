@@ -93,7 +93,14 @@ impl IpcDispatcher {
         let outcome = runner.drive(&mut link).await;
         // 归还真实事件流（供空闲会话复用）。
         lease.events = std::mem::replace(&mut link.events, mpsc::channel(1).1);
-        self.pool.release(lease, outcome.is_ok()).await;
+        // A late durable result can win after Cancel was already queued. Its
+        // business result is valid, but the process is draining and cannot be reused.
+        self.pool
+            .release(
+                lease,
+                outcome.is_ok() && runner.session_healthy && !runner.cancel_sent,
+            )
+            .await;
         outcome
     }
 }
@@ -472,7 +479,7 @@ impl DispatchRunner {
                             .attempt
                             .backend
                             .inspect(|s| {
-                                s.runs.get(&run_id).is_some_and(|run| run.terminal())
+                                s.runs.get(&run_id).is_none_or(|run| run.terminal())
                             })
                             .await;
                         if terminal {
@@ -493,8 +500,8 @@ impl DispatchRunner {
     async fn snapshot(&self) -> Result<Run> {
         self.attempt
             .backend
-            .inspect(|s| s.runs.get(&self.attempt.run_id).cloned())
-            .await
+            .run_snapshot(&self.attempt.run_id)
+            .await?
             .ok_or_else(|| invalid("run missing"))
     }
 
@@ -757,7 +764,7 @@ impl DispatchRunner {
                 .collect::<Vec<_>>();
             self.attempt
                 .backend
-                .internal(move |state| {
+                .internal_for_run(&self.attempt.run_id, move |state| {
                     let run = state.runs.get(&run_id).ok_or_else(|| fj("run missing"))?;
                     let node = run
                         .nodes
@@ -841,7 +848,7 @@ impl DispatchRunner {
                     self.attempt
                         .finish(
                             EventKind::WaitRegistered,
-                            json!({"wait": Wait{kind: WaitKind::Uncertain, wake_at: None, child_run_id: None, output: None}, "integrity": "unknown"}),
+                            json!({"wait": Wait::Uncertain, "integrity": "unknown"}),
                         )
                         .await?;
                 } else {
@@ -882,11 +889,12 @@ impl DispatchRunner {
                         self.attempt
                             .finish(
                                 EventKind::WaitRegistered,
-                                json!({"wait": Wait{
-                                    kind,
-                                    wake_at: wait.wake_at,
-                                    child_run_id: None,
-                                    output: wait.output.clone(),
+                                json!({"wait": match kind {
+                                    WaitKind::Delay => Wait::Delay {
+                                        wake_at: wait.wake_at.ok_or_else(|| invalid("delay missing wake_at"))?,
+                                        output: wait.output.clone(),
+                                    },
+                                    _ => Wait::Signal { output: wait.output.clone() },
                                 }}),
                             )
                             .await?;
@@ -969,7 +977,7 @@ impl DispatchRunner {
         let dispatch_id = self.attempt.dispatch_id.clone();
         let workflow_id = workflow_id.to_string();
         backend
-            .internal(move |state| {
+            .internal_for_run(&self.attempt.run_id, move |state| {
                 let parent = &state.runs[&run_id];
                 if parent.terminal() {
                     return Err(fj("parent terminal"));
@@ -1030,7 +1038,7 @@ impl DispatchRunner {
                     parent,
                     &node_id,
                     EventKind::WaitRegistered,
-                    json!({"wait": Wait{kind: WaitKind::Child, wake_at: None, child_run_id: Some(child_id), output: None}, "sealed_through": sealed.to_string()}),
+                    json!({"wait": Wait::Child { child_run_id: child_id }, "sealed_through": sealed.to_string()}),
                     true,
                 );
                 Ok((vec![created, wait_event], ()))
@@ -1135,7 +1143,7 @@ impl DispatchRunner {
         let authorize = self
             .attempt
             .backend
-            .internal(move |state| {
+            .internal_for_run(&self.attempt.run_id, move |state| {
                 let run = state.runs.get(&run_id).ok_or_else(|| fj("run missing"))?;
                 let node = &run.nodes[&node_id];
                 if run.terminal() || node.dispatch_id != dispatch {
@@ -1402,18 +1410,13 @@ async fn resolve_dispatch(
     backend: &JournalBackend,
     dispatch_id: &str,
 ) -> Option<(String, String, u32)> {
-    backend
-        .inspect(|state| {
-            for (run_id, run) in &state.runs {
-                for (node_id, node) in &run.nodes {
-                    if node.dispatch_id == dispatch_id || node.attempts.contains_key(dispatch_id) {
-                        return Some((run_id.clone(), node_id.clone(), node.attempt));
-                    }
-                }
-            }
+    match backend.dispatch_owner(dispatch_id).await {
+        Ok(owner) => owner,
+        Err(error) => {
+            tracing::warn!(%error, "observation dispatch lookup failed");
             None
-        })
-        .await
+        }
+    }
 }
 
 fn level_of(level: &str) -> flow_engine::log_types::LogLevel {

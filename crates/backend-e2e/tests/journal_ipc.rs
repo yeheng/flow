@@ -133,7 +133,7 @@ async fn script_condition_and_templates_execute_in_subprocess() {
                 "  {id}: status={} error={:?} wait={:?}\n",
                 n.status,
                 n.error,
-                n.wait.as_ref().map(|w| w.kind)
+                n.wait.as_ref().map(|w| w.kind())
             ));
         }
         panic!("run failed: {:?}\n{}", done.error, report);
@@ -267,7 +267,7 @@ async fn delay_and_signal_waits_release_executor_slots() {
                 "  {id}: status={} error={:?} wait={:?}\n",
                 n.status,
                 n.error,
-                n.wait.as_ref().map(|w| w.kind)
+                n.wait.as_ref().map(|w| w.kind())
             ));
         }
         panic!("run terminal early: {:?}\n{}", waiting.error, report);
@@ -485,7 +485,7 @@ async fn killing_executor_mid_script_recovers_with_new_process() {
                     "  {id}: status={} error={:?} wait={:?} attempt={}\n",
                     n.status,
                     n.error,
-                    n.wait.as_ref().map(|w| w.kind),
+                    n.wait.as_ref().map(|w| w.kind()),
                     n.attempt
                 ));
             }
@@ -559,7 +559,7 @@ async fn restart_reuses_committed_preparation_without_reevaluation() {
     let waiting = until(&backend, &run_id, |r| {
         r.nodes
             .get("n")
-            .is_some_and(|n| n.wait.as_ref().is_some_and(|w| w.kind == WaitKind::Retry))
+            .is_some_and(|n| n.wait.as_ref().is_some_and(|w| w.kind() == WaitKind::Retry))
     })
     .await;
     let prepared = waiting.nodes["n"].prepared.clone();
@@ -844,7 +844,7 @@ async fn ipc_mixed_business_matrix() {
                             "  {id}: {} err={:?} wait={:?} attempt={}\n",
                             n.status,
                             n.error,
-                            n.wait.as_ref().map(|w| w.kind),
+                            n.wait.as_ref().map(|w| w.kind()),
                             n.attempt
                         ));
                     }
@@ -988,7 +988,7 @@ async fn oversized_http_capture_is_uncertain_without_resend() {
             run.nodes
                 .get("h")
                 .and_then(|node| node.wait.as_ref())
-                .is_some_and(|wait| wait.kind == WaitKind::Uncertain)
+                .is_some_and(|wait| wait.kind() == WaitKind::Uncertain)
         }),
     )
     .await
@@ -1201,4 +1201,65 @@ async fn oversized_failure_message_is_truncated_not_fatal() {
     assert_eq!(done2.status, RunStatus::Succeeded, "{:?}", done2.error);
     backend.close().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn timeline_rejects_cumulative_values_while_single_run_value_remains_readable() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = ipc_backend_explicit(root.path()).await;
+    let mut nodes = vec![json!({"id":"s","type":"start"})];
+    let mut edges = Vec::new();
+    let mut previous = "s".to_owned();
+    for i in 0..4 {
+        let id = format!("n{i}");
+        nodes.push(json!({"id":id,"type":"script","params":{"code":"return {blob: 'x'.repeat(2 * 1024 * 1024)};"}}));
+        edges.push(json!({"from":previous,"to":id}));
+        previous = id;
+    }
+    nodes.push(json!({"id":"e","type":"end"}));
+    edges.push(json!({"from":previous,"to":"e"}));
+    let workflow = install(&backend, json!({"nodes":nodes,"edges":edges})).await;
+    let run_id = start_run(&backend, &workflow, Value::Null).await;
+    let done = until(&backend, &run_id, Run::terminal).await;
+    assert_eq!(done.status, RunStatus::Succeeded, "{:?}", done.error);
+    backend
+        .command("test.timeline-visible", None, &Value::Null, |_| {
+            Ok((Vec::new(), Value::Null))
+        })
+        .await
+        .unwrap();
+    let error = flow_backend::journal_views::timeline(&backend, &run_id)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("RESPONSE_TOO_LARGE"), "{error}");
+    let record = flow_backend::journal_views::get_run(&backend, &run_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        record.output.unwrap()["blob"].as_str().unwrap().len(),
+        2 * 1024 * 1024
+    );
+    backend.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancellation_never_contaminates_the_next_dispatch_on_a_single_slot() {
+    let root = tempfile::tempdir().unwrap();
+    let b = ipc_backend_sized(root.path(), None, 1).await;
+    let cancelled=install(&b,json!({"nodes":[{"id":"s","type":"start"},{"id":"n","type":"script","params":{"code":"const t = Date.now(); while (Date.now() - t < 95) {} return {ok:true};"}},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"n"},{"from":"n","to":"e"}]})).await;
+    let clean=install(&b,json!({"nodes":[{"id":"s","type":"start"},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"e"}]})).await;
+    for i in 0..30 {
+        let id = start_run(&b, &cancelled, json!({"i":i})).await;
+        until(&b, &id, |r| r.terminal() || r.nodes.get("n").is_some()).await;
+        b.run_cancel(&id, None).await.unwrap();
+        let next = start_run(&b, &clean, json!({"i":i})).await;
+        let done = until(&b, &next, Run::terminal).await;
+        assert_eq!(
+            done.status,
+            RunStatus::Succeeded,
+            "cancelled predecessor poisoned next run: {:?}",
+            done.error
+        );
+    }
+    b.close().await.unwrap();
 }
