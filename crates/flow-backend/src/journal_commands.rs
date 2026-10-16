@@ -1,7 +1,7 @@
 use crate::journal::{CommandReceipt, JournalBackend, JournalError};
 use flow_engine::journal_state::{DefinitionVersion, Run, RunStatus, State, WaitKind, Workflow};
 use flow_journal::{Event, EventKind};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 type Result<T> = std::result::Result<T, JournalError>;
@@ -313,8 +313,7 @@ impl JournalBackend {
         {
             return Ok(receipt);
         }
-        let output =
-            flow_journal::value::store_json(&self.journal, output, 8 * 1024 * 1024).await?;
+        let output = self.store_json(output, 8 * 1024 * 1024).await?;
         self.command_for_run(run_id, &format!("run.adjudicate:{run_id}"),Some(request_id),&request,|state|{
             let run=state.runs.get(run_id).ok_or_else(||invalid("run not found"))?;
             let node=run.nodes.get(node_id).ok_or_else(||invalid("node not found"))?;
@@ -383,12 +382,9 @@ impl JournalBackend {
             )
             .into());
         }
-        let stored = flow_journal::value::store_json(
-            &self.journal,
-            definition,
-            flow_journal::MAX_LINE_BYTES,
-        )
-        .await?;
+        let stored = self
+            .store_json(definition, flow_journal::MAX_LINE_BYTES)
+            .await?;
         self.command(
             "workflow.update",
             request_id,
@@ -513,7 +509,7 @@ impl JournalBackend {
         if let Some(receipt) = deduped(self, &scope, request_id, &request).await? {
             return Ok(receipt);
         }
-        let stored = flow_journal::value::store_json(&self.journal, input, 8 * 1024 * 1024).await?;
+        let stored = self.store_json(input, 8 * 1024 * 1024).await?;
         self.command(&scope, request_id, &request, |state| {
             if matches!(source, "schedule" | "webhook") {
                 let key = source_detail.ok_or_else(|| invalid("trigger identity required"))?;
@@ -650,15 +646,13 @@ impl JournalBackend {
         {
             return Ok(receipt);
         }
-        let output =
-            flow_journal::value::store_json(&self.journal, payload.clone(), 8 * 1024 * 1024)
-                .await?;
-        let adjudicated_output = flow_journal::value::store_json(
-            &self.journal,
-            payload.get("output").cloned().unwrap_or(Value::Null),
-            8 * 1024 * 1024,
-        )
-        .await?;
+        let output = self.store_json(payload.clone(), 8 * 1024 * 1024).await?;
+        let adjudicated_output = self
+            .store_json(
+                payload.get("output").cloned().unwrap_or(Value::Null),
+                8 * 1024 * 1024,
+            )
+            .await?;
         self.command_for_run(
             run_id,
             &format!("run.signal:{run_id}"),
@@ -733,6 +727,17 @@ impl JournalBackend {
         }
         if key.is_empty() || key.len() > 128 {
             return Err(invalid("invalid config key").into());
+        }
+        let fields = patch
+            .as_object()
+            .ok_or_else(|| invalid("config must be object"))?;
+        for field in fields.keys() {
+            if !matches!(
+                field.as_str(),
+                "workflow_id" | "enabled" | "input" | "cron_expr" | "deleted"
+            ) {
+                return Err(invalid(format!("config field is not writable: {field}")).into());
+            }
         }
         self.command(
             scope,

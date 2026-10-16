@@ -13,8 +13,8 @@ pub const R_MAX: usize = 1000;
 const DEFINITION_CACHE_MAX: usize = 128;
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
@@ -56,7 +56,9 @@ type Result<T> = std::result::Result<T, JournalError>;
 
 struct CommittedState {
     state: State,
-    reader: TailReader,
+    reader: Option<TailReader>,
+    reading:
+        Option<tokio::task::JoinHandle<(TailReader, flow_journal::Result<Option<Transaction>>)>>,
     pending: Option<tokio::task::JoinHandle<flow_journal::Result<flow_journal::Commit>>>,
     dirty_runs: BTreeSet<String>,
     applying: Option<Transaction>,
@@ -175,7 +177,7 @@ impl JournalBackend {
                 .await
                 .map_err(|e| JournalError::Projection(e.to_string()))?,
         );
-        let indexed = audit_index
+        let mut indexed = audit_index
             .applied_lsn()
             .await
             .map_err(|e| JournalError::Projection(e.to_string()))?;
@@ -184,6 +186,22 @@ impl JournalBackend {
             return Err(JournalError::Projection(
                 "execution index ahead of journal".into(),
             ));
+        }
+        // Old derived indexes lack permanent receipts and unfinished stream state.
+        // Rebuild from authority once; never reinterpret an old checkpoint as that index.
+        if indexed > 0
+            && audit_index
+                .get("index_format", "single-v2")
+                .await
+                .map_err(|e| JournalError::Projection(e.to_string()))?
+                .1
+                .is_none()
+        {
+            audit_index
+                .restore_snapshot(journal.id(), 0, vec![])
+                .await
+                .map_err(|e| JournalError::Projection(e.to_string()))?;
+            indexed = 0;
         }
         let root_owned = root.to_path_buf();
         let identity = journal.id().to_owned();
@@ -256,7 +274,8 @@ impl JournalBackend {
         let committed = CommittedState {
             dirty_runs: state.runs.keys().cloned().collect(),
             state,
-            reader,
+            reader: Some(reader),
+            reading: None,
             pending: None,
             applying: None,
         };
@@ -607,14 +626,14 @@ impl JournalBackend {
         let mut committed = self.state.lock().await;
         self.refresh_locked(&mut committed).await?;
         if let Some(id) = request_id {
-            if let Some(original) = committed.state.command_record(scope, id) {
+            if let Some(original) = self.command_record(&committed.state, scope, id).await? {
                 if original.fingerprint != fingerprint {
                     return Err(flow_journal::Error::Conflict(
                         "same request identity with different arguments".into(),
                     )
                     .into());
                 }
-                let receipt = self.receipt(original);
+                let receipt = self.receipt(&original);
                 drop(committed);
                 return self.visible(receipt).await;
             }
@@ -674,6 +693,53 @@ impl JournalBackend {
         }
         self.commit_locked(&mut state, events).await
     }
+    pub async fn store_stream(
+        &self,
+        input: &mut (impl tokio::io::AsyncRead + Unpin),
+        codec: flow_journal::value::ValueCodec,
+    ) -> Result<flow_journal::ValueRef> {
+        flow_journal::value::store_stream_using(self.journal.id(), input, codec, |event| async {
+            self.append(vec![event]).await.map(|_| ())
+        })
+        .await
+    }
+    pub async fn store_json(
+        &self,
+        value: Value,
+        limit: usize,
+    ) -> Result<flow_journal::StoredValue> {
+        let bytes = flow_journal::codec::bounded_json(&value, limit)?;
+        if bytes.len() <= flow_journal::INLINE_BYTES {
+            return Ok(flow_journal::StoredValue::Inline(value));
+        }
+        Ok(flow_journal::StoredValue::Ref(
+            self.store_stream(&mut bytes.as_slice(), flow_journal::value::ValueCodec::Json)
+                .await?,
+        ))
+    }
+    async fn command_record(
+        &self,
+        state: &State,
+        scope: &str,
+        id: &str,
+    ) -> Result<Option<CommandRecord>> {
+        if let Some(record) = state.command_record(scope, id) {
+            return Ok(Some(record.clone()));
+        }
+        let value = self
+            .audit_index
+            .get(
+                "command",
+                &flow_engine::journal_state::command_key(scope, id),
+            )
+            .await
+            .map_err(|e| JournalError::Projection(e.to_string()))?
+            .1;
+        value
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(JournalError::from)
+    }
     async fn commit_locked(
         &self,
         committed: &mut CommittedState,
@@ -715,10 +781,40 @@ impl JournalBackend {
         }
         loop {
             if committed.applying.is_none() {
-                committed.applying = committed
-                    .reader
-                    .next(self.journal.durable_lsn())?
-                    .map(|(tx, _)| tx);
+                if committed.reading.is_none() {
+                    let upper = self.journal.durable_lsn();
+                    if committed.state.applied_lsn >= upper {
+                        break;
+                    }
+                    let mut reader = committed.reader.take().expect("owned journal reader");
+                    let applied = committed.state.applied_lsn;
+                    committed.reading = Some(tokio::task::spawn_blocking(move || {
+                        let next = (|| {
+                            while let Some((tx, _)) = reader.next(upper)? {
+                                if tx.lsn > applied {
+                                    return Ok(Some(tx));
+                                }
+                            }
+                            Ok(None)
+                        })();
+                        (reader, next)
+                    }));
+                }
+                // Await by reference so cancelled RPCs cannot lose the reader or its position.
+                let result = committed.reading.as_mut().unwrap().await;
+                committed.reading = None;
+                let (reader, next) = match result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        // A panicked worker cannot return its reader. Re-scan on the next
+                        // attempt; already applied LSNs are skipped below.
+                        committed.reader =
+                            Some(TailReader::new(self.journal.root(), self.journal.id()));
+                        return Err(JournalError::Projection(error.to_string()));
+                    }
+                };
+                committed.reader = Some(reader);
+                committed.applying = next?;
             }
             let Some(tx) = committed.applying.as_ref() else {
                 break;
@@ -738,6 +834,14 @@ impl JournalBackend {
                 )
                 .await
                 .map_err(|e| JournalError::Projection(e.to_string()))?;
+            let parents: Vec<_> = committed
+                .state
+                .runs
+                .values()
+                .filter(|r| r.terminal())
+                .filter_map(|r| r.parent.as_ref().map(|p| p.run_id.clone()))
+                .collect();
+            committed.dirty_runs.extend(parents);
             crate::journal_history::trim(&mut committed.state);
             let tx = committed.applying.take().expect("owned transaction");
             for event in &tx.events {
@@ -811,10 +915,10 @@ impl JournalBackend {
         let mut committed = self.state.lock().await;
         // A cancelled caller may have left a durable decision awaiting reducer apply.
         self.refresh_locked(&mut committed).await?;
-        let receipt = committed
-            .state
-            .command_record(scope, request_id)
-            .map(|r| self.receipt(r));
+        let receipt = self
+            .command_record(&committed.state, scope, request_id)
+            .await?
+            .map(|r| self.receipt(&r));
         drop(committed);
         let Some(mut receipt) = receipt else {
             return Ok(None);
@@ -843,7 +947,7 @@ impl JournalBackend {
         let fingerprint = flow_journal::codec::fingerprint(request, 9 * 1024 * 1024)?;
         let mut committed = self.state.lock().await;
         self.refresh_locked(&mut committed).await?;
-        let Some(original) = committed.state.command_record(scope, id).cloned() else {
+        let Some(original) = self.command_record(&committed.state, scope, id).await? else {
             return Ok(None);
         };
         if original.fingerprint != fingerprint {

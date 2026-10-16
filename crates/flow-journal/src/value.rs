@@ -2,15 +2,15 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::Path;
 
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
-use serde_json::ser::Formatter as _;
 use serde_json::Value;
+use serde_json::ser::Formatter as _;
 use sha2::{Digest, Sha256};
 
-use crate::codec::{bounded_json, Event, EventKind};
+use crate::codec::{Event, EventKind, bounded_json};
 use crate::{
-    invalid, Error, Journal, QueueClass, Result, CHUNK_BYTES, INLINE_BYTES, MAX_VALUE_BYTES,
+    CHUNK_BYTES, Error, INLINE_BYTES, Journal, MAX_VALUE_BYTES, QueueClass, Result, invalid,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -243,6 +243,31 @@ impl ValueCatalog {
     pub fn open_streams(&self) -> usize {
         self.streams.len()
     }
+    /// Backend spills unfinished validation state to its rebuildable execution index.
+    /// Raw chunks remain journal evidence; dropping this cache does not abandon a value.
+    pub fn stream_snapshot(&self, id: &str) -> Option<Value> {
+        use sha2::digest::common::hazmat::SerializableState;
+        self.streams.get(id).map(|s| {
+            serde_json::json!({
+                "id":id,"chunks":s.chunks.to_string(),"bytes":s.bytes.to_string(),
+                "sha256_state":STANDARD.encode(s.hash.serialize())
+            })
+        })
+    }
+    pub fn remember_stream(&mut self, id: &str, value: Value) -> Result<()> {
+        if value["id"].as_str() != Some(id) {
+            return Err(invalid("indexed stream identity mismatch"));
+        }
+        let mut restored = Self::from_snapshot(serde_json::json!({
+            "version":1,"streams":[value],"published":{}
+        }))?;
+        self.streams
+            .insert(id.into(), restored.streams.remove(id).unwrap());
+        Ok(())
+    }
+    pub fn clear_stream_cache(&mut self) {
+        self.streams.clear();
+    }
     pub fn save(&self, id: &str) -> ValueUndo {
         (
             id.into(),
@@ -407,6 +432,32 @@ pub async fn store_stream(
     input: &mut (impl tokio::io::AsyncRead + Unpin),
     codec: ValueCodec,
 ) -> Result<ValueRef> {
+    store_stream_using(journal.id(), input, codec, |event| async {
+        let class = if event.kind == EventKind::ValueChunk {
+            QueueClass::Audit(event.payload["output_id"].as_str().unwrap().into())
+        } else {
+            QueueClass::Control
+        };
+        journal
+            .submit(uuid::Uuid::now_v7().to_string(), vec![event], class)
+            .await?;
+        Ok(())
+    })
+    .await
+}
+
+/// Share chunk encoding while letting the backend enforce its normal fact admission.
+pub async fn store_stream_using<F, Fut, E>(
+    journal_id: &str,
+    input: &mut (impl tokio::io::AsyncRead + Unpin),
+    codec: ValueCodec,
+    mut submit: F,
+) -> std::result::Result<ValueRef, E>
+where
+    F: FnMut(Event) -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<(), E>>,
+    E: From<Error>,
+{
     use tokio::io::AsyncReadExt;
     let output_id = uuid::Uuid::now_v7().to_string();
     let mut hash = Sha256::new();
@@ -414,13 +465,13 @@ pub async fn store_stream(
     let mut index = 0;
     let mut buffer = vec![0; CHUNK_BYTES];
     loop {
-        let n = input.read(&mut buffer).await?;
+        let n = input.read(&mut buffer).await.map_err(Error::from)?;
         if n == 0 {
             break;
         }
         total += n as u64;
         if total > MAX_VALUE_BYTES {
-            return Err(Error::Limit("value bytes; captured prefix retained".into()));
+            return Err(Error::Limit("value bytes; captured prefix retained".into()).into());
         }
         hash.update(&buffer[..n]);
         let chunk = Chunk {
@@ -428,20 +479,15 @@ pub async fn store_stream(
             chunk_index: index,
             data: STANDARD.encode(&buffer[..n]),
         };
-        journal
-            .submit(
-                uuid::Uuid::now_v7().to_string(),
-                vec![Event::new(
-                    EventKind::ValueChunk,
-                    serde_json::to_value(chunk)?,
-                )],
-                QueueClass::Audit(output_id.clone()),
-            )
-            .await?;
+        submit(Event::new(
+            EventKind::ValueChunk,
+            serde_json::to_value(chunk).map_err(Error::from)?,
+        ))
+        .await?;
         index += 1;
     }
     let value = ValueRef {
-        journal_id: journal.id().into(),
+        journal_id: journal_id.into(),
         output_id,
         codec,
         version: 1,
@@ -449,16 +495,11 @@ pub async fn store_stream(
         total_bytes: total,
         digest: hex::encode(hash.finalize()),
     };
-    journal
-        .submit(
-            uuid::Uuid::now_v7().to_string(),
-            vec![Event::new(
-                EventKind::ValuePublished,
-                serde_json::to_value(&value)?,
-            )],
-            QueueClass::Control,
-        )
-        .await?;
+    submit(Event::new(
+        EventKind::ValuePublished,
+        serde_json::to_value(&value).map_err(Error::from)?,
+    ))
+    .await?;
     Ok(value)
 }
 

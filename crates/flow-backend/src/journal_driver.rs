@@ -11,7 +11,7 @@ use flow_engine::journal_state::{Node as NodeState, NodeStatus, Run, RunStatus, 
 use flow_engine::{Definition, NodeLogger, NodeType};
 use flow_journal::{Event, EventKind, StoredValue};
 use futures::FutureExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -459,6 +459,33 @@ async fn advance_committed_node(
             .wait
             .as_ref()
             .ok_or_else(|| invalid("waiting node missing wait"))?;
+        if let Wait::Child { child_run_id } = wait {
+            let child = backend
+                .run_snapshot(child_run_id)
+                .await?
+                .ok_or_else(|| invalid("waiting child missing"))?;
+            if child.terminal() {
+                backend.internal_for_run(run_id, |s| {
+                    let parent = &s.runs[run_id];
+                    let current = &parent.nodes[&node.id];
+                    if parent.terminal() || current.wait.as_ref().and_then(Wait::child_run_id) != Some(child_run_id) {
+                        return Ok((vec![], ()));
+                    }
+                    let (kind, payload) = if child.status == RunStatus::Succeeded {
+                        (EventKind::WaitResolved, json!({"output":child.output.clone().unwrap_or(StoredValue::Inline(Value::Null))}))
+                    } else {
+                        (EventKind::NodeFailed, json!({"error":child.error.clone().unwrap_or_else(||format!("child run {}",child.status)),"sealed_through":current.attempts[&current.dispatch_id].audit_seq.to_string()}))
+                    };
+                    Ok((vec![node_event(parent,&node.id,kind,payload,true)], ()))
+                }).await?;
+            } else {
+                wakes
+                    .entry(now.saturating_add(1000))
+                    .or_default()
+                    .insert(run_id.to_owned());
+            }
+            return Ok(true);
+        }
         if wait.kind() == WaitKind::Delay && wait.wake_at().is_some_and(|at| at <= now) {
             backend
                 .internal_for_run(run_id, |s| {
@@ -746,12 +773,9 @@ async fn join_values(
         backend.journal.durable_lsn(),
         values.into_iter().collect(),
     );
-    let result = flow_journal::value::store_stream(
-        &backend.journal,
-        &mut reader,
-        flow_journal::value::ValueCodec::Json,
-    )
-    .await;
+    let result = backend
+        .store_stream(&mut reader, flow_journal::value::ValueCodec::Json)
+        .await;
     drop(reader);
     let production = producer.await.map_err(|e| invalid(e.to_string()))?;
     let value = result?;

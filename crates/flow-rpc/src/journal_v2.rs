@@ -10,8 +10,8 @@
 //! 文本、回执形状）逐字保持，改动仅限内部组织。
 use flow_backend::journal::{JournalBackend, JournalError};
 use flow_journal::page::{Cursor, Filter};
-use jsonrpsee::{types::ErrorObjectOwned, RpcModule};
-use serde_json::{json, Value};
+use jsonrpsee::{RpcModule, types::ErrorObjectOwned};
+use serde_json::{Value, json};
 use std::{net::SocketAddr, sync::Arc};
 
 pub const COMMITTED_NOT_VISIBLE: i32 = -32020;
@@ -586,7 +586,7 @@ async fn dispatch_call(
         "run.timeline" => {
             return flow_backend::journal_views::timeline(b, text(&p, "run_id")?)
                 .await
-                .map_err(view_failure)
+                .map_err(view_failure);
         }
         "run.events.view" => return events_view(b, &p).await,
         "schedule.list" => return schedule_list(b, &p).await,
@@ -901,8 +901,12 @@ async fn run_list_view(b: &JournalBackend, p: &Value) -> Result<Value, ErrorObje
 /// 产品面：run 事件视图（from_seq 起的事件流）。
 async fn events_view(b: &JournalBackend, p: &Value) -> Result<Value, ErrorObjectOwned> {
     let run_id = text(p, "run_id")?.to_owned();
-    let upper = b.journal.durable_lsn();
-    if !b.state().await.runs.contains_key(&run_id) {
+    let (upper, run) = b
+        .projection
+        .get_summary("run", &run_id)
+        .await
+        .map_err(projection_failure)?;
+    if run.is_none() {
         return Err(ErrorObjectOwned::owned(-32011, "run not found", None::<()>));
     }
     let from = p["from_seq"].as_u64().unwrap_or(0);

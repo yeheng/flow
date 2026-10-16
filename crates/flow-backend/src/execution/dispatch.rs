@@ -11,18 +11,18 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::Digest as _;
 use tokio::sync::mpsc;
 
 use crate::journal::JournalBackend;
 use crate::journal_execution::Attempt;
+use flow_engine::execution_protocol::TransferKey;
 use flow_engine::execution_protocol::contract::{DURABLE_WAIT_TIMEOUT_MS, TRANSFER_CHUNK_BYTES};
 use flow_engine::execution_protocol::message::{
     Message, ResultOutcome, WaitKind as WaitRequestKind,
 };
 use flow_engine::execution_protocol::record_bytes;
-use flow_engine::execution_protocol::TransferKey;
 use flow_engine::journal_state::{Prepared, Run, RunStatus, Wait, WaitKind};
 use flow_engine::observation::ObservationStore;
 use flow_engine::{Node, NodeType};
@@ -960,12 +960,10 @@ impl DispatchRunner {
             } else {
                 let mut reader = bytes.as_slice();
                 StoredValue::Ref(
-                    flow_journal::value::store_stream(
-                        &self.attempt.backend.journal,
-                        &mut reader,
-                        ValueCodec::Json,
-                    )
-                    .await?,
+                    self.attempt
+                        .backend
+                        .store_stream(&mut reader, ValueCodec::Json)
+                        .await?,
                 )
             }
         } else {
@@ -1118,12 +1116,10 @@ impl DispatchRunner {
         } else {
             let mut reader = request_bytes.as_slice();
             StoredValue::Ref(
-                flow_journal::value::store_stream(
-                    &self.attempt.backend.journal,
-                    &mut reader,
-                    ValueCodec::Json,
-                )
-                .await?,
+                self.attempt
+                    .backend
+                    .store_stream(&mut reader, ValueCodec::Json)
+                    .await?,
             )
         };
         // 取当前提交状态（准备/授权串行裁决在 internal 事务内完成）。
@@ -1522,14 +1518,18 @@ mod transfer_budget_tests {
             total_bytes,
             digest: String::new(),
         };
-        assert!(runner
-            .handle(ready("foreign", "t", 0), &mut link)
-            .await
-            .is_err());
-        assert!(runner
-            .handle(ready("d", "t", u64::MAX), &mut link)
-            .await
-            .is_err());
+        assert!(
+            runner
+                .handle(ready("foreign", "t", 0), &mut link)
+                .await
+                .is_err()
+        );
+        assert!(
+            runner
+                .handle(ready("d", "t", u64::MAX), &mut link)
+                .await
+                .is_err()
+        );
         assert!(runner.op_transfers.is_empty());
         let chunk = |id: &str, offset, bytes: &[u8]| Message::TransferChunk {
             dispatch_id: "d".into(),
@@ -1538,10 +1538,12 @@ mod transfer_budget_tests {
             bytes: bytes.to_vec(),
             digest: hex_sha(bytes),
         };
-        assert!(runner
-            .handle(chunk("t", u64::MAX, b"x"), &mut link)
-            .await
-            .is_err());
+        assert!(
+            runner
+                .handle(chunk("t", u64::MAX, b"x"), &mut link)
+                .await
+                .is_err()
+        );
         let half = vec![b'x'; OPERATION_TRANSFER_LIMIT as usize / 2];
         runner
             .handle(chunk("a", 0, &half), &mut link)
@@ -1560,10 +1562,12 @@ mod transfer_budget_tests {
                 .await
                 .unwrap();
         }
-        assert!(runner
-            .handle(ready("d", "overflow", 0), &mut link)
-            .await
-            .is_err());
+        assert!(
+            runner
+                .handle(ready("d", "overflow", 0), &mut link)
+                .await
+                .is_err()
+        );
         assert_eq!(runner.op_transfers.len(), OPERATION_TRANSFER_COUNT);
         backend.close().await.unwrap();
         std::fs::remove_dir_all(root).unwrap();

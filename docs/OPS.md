@@ -6,6 +6,9 @@
 > 本文所有数字都能在代码里对上。凡代码里没有的能力，本文一律标注「未实现」，
 > 不按路线图描述。
 
+> 2026-10-16 单机保证以 [ADR 0002](adr/0002-single-machine-journal-baseline.md)
+> 为基线；当前不提供日志复制或 master 高可用。
+
 ---
 
 ## 1. 部署形态
@@ -307,11 +310,14 @@ flow-journal-dev rebuild-projection --destination /tmp/projection-new.sqlite
 
 | 路径 | 删除后果 |
 | --- | --- |
-| `projection.sqlite` | 重启后从 journal 重建；期间读不可用 |
+| `projection.sqlite` | 停服务后移走，重启从 journal 重建；期间读不可用 |
+| `execution-index.sqlite` | 停服务后移走，重启从 journal 重建冷历史索引 |
 | `indexes/` | 重启后重建 |
 | `observations/` | **节点日志永久丢失**，run 状态不受影响 |
 
-**不可删**：`journal/`、`checkpoints/`。这两个是权威。
+**不可作为缓存删除**：`journal/`，包含权威事务和值字节。
+`checkpoints/` 是校验后使用的恢复加速数据，不是第二权威；缺失时可回放原 journal，
+不能用 checkpoint 替代丢失的日志段。维护前先停服务并保留原目录；不要在线删除打开的数据库文件。
 
 ---
 

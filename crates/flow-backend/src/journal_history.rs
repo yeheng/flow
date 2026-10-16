@@ -1,9 +1,9 @@
 //! Versioned, disposable execution index. Journal facts remain the sole authority.
-use crate::journal::{audit_rows, project_rows, JournalError};
+use crate::journal::{JournalError, audit_rows, project_rows};
 use flow_engine::journal_state::{Run, State};
 use flow_journal::{EventKind, StoredValue, Transaction, ValueRef};
 use flow_store::projection::{ProjectedRow, Projector};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 type Result<T> = std::result::Result<T, JournalError>;
 fn db(e: sqlx::Error) -> JournalError {
@@ -150,6 +150,15 @@ pub(crate) async fn prepare(index: &Projector, state: &mut State, tx: &Transacti
         ) {
             if let Some(id) = event.payload["output_id"].as_str() {
                 descriptors.insert(id.into(), None);
+                if let Some(record) = index.history_at("stream", id, upper).await.map_err(db)? {
+                    let lsn = record["lsn"]
+                        .as_str()
+                        .and_then(|n| n.parse::<u64>().ok())
+                        .ok_or_else(|| db(sqlx::Error::Protocol("invalid stream prefix".into())))?;
+                    if lsn <= upper {
+                        state.values.remember_stream(id, record["value"].clone())?;
+                    }
+                }
             }
         }
     }
@@ -186,6 +195,11 @@ pub(crate) fn index_rows(
     tx: &Transaction,
 ) -> flow_journal::Result<Vec<ProjectedRow>> {
     let mut rows = audit_rows(tx)?;
+    rows.push(ProjectedRow {
+        kind: "index_format".into(),
+        key: "single-v2".into(),
+        value: Some(json!({"version":2})),
+    });
     for row in project_rows(state, tx)? {
         let value = serde_json::to_value(row.value)?;
         let digest = flow_journal::codec::digest(&serde_json::to_vec(&value)?);
@@ -196,6 +210,36 @@ pub(crate) fn index_rows(
         });
     }
     for event in &tx.events {
+        if event.kind == EventKind::Command {
+            let mut record: flow_engine::journal_state::CommandRecord =
+                serde_json::from_value(event.payload.clone())?;
+            record.lsn = tx.lsn;
+            if let Some(id) = &record.request_id {
+                rows.push(ProjectedRow {
+                    kind: "command".into(),
+                    key: flow_engine::journal_state::command_key(&record.scope, id),
+                    value: Some(serde_json::to_value(record)?),
+                });
+            }
+        }
+        if matches!(
+            event.kind,
+            EventKind::ValueChunk | EventKind::ValuePublished
+        ) {
+            if let Some(id) = event.payload["output_id"].as_str() {
+                let value = state
+                    .values
+                    .stream_snapshot(id)
+                    .map(|value| json!({"lsn":tx.lsn.to_string(),"value":value}));
+                let body = serde_json::to_value(value)?;
+                let digest = flow_journal::codec::digest(&serde_json::to_vec(&body)?);
+                rows.push(ProjectedRow {
+                    kind: "history".into(),
+                    key: serde_json::to_string(&("stream", id, format!("{:020}", tx.lsn), digest))?,
+                    value: Some(body),
+                });
+            }
+        }
         if event.kind == EventKind::ValuePublished {
             if let Some(id) = event.payload["output_id"].as_str() {
                 rows.push(ProjectedRow {
@@ -243,4 +287,5 @@ pub(crate) fn trim(state: &mut State) {
         }
     }
     state.values.trim_cache();
+    state.values.clear_stream_cache();
 }

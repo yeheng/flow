@@ -15,6 +15,7 @@ fs2.workspace = true
 uuid.workspace = true
 base64 = "0.22"
 clap.workspace = true
+rusqlite = "0.32.1"
 
 [dev-dependencies]
 tempfile = "3"

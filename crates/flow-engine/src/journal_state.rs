@@ -974,7 +974,7 @@ impl State {
             }
             // Master-produced values precede their referencing business fact and have no run.
             EventKind::ValueChunk | EventKind::ValuePublished if event.run_id.is_none() => {
-                return Ok(())
+                return Ok(());
             }
             EventKind::LegacyImport => {
                 let key = string(p, "key")?;
@@ -1236,6 +1236,7 @@ impl State {
                     }
                     _ => {
                         node.status = NodeStatus::Failed;
+                        node.wait = None;
                         node.error = Some(string(p, "error")?);
                         if let Some(wake_at) = p.get("retry_wake_at").and_then(Value::as_i64) {
                             if node.operation.is_some() {

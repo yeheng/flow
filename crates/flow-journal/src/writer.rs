@@ -4,11 +4,11 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 use crate::codec::{self, Event, EventKind, Transaction};
 use crate::storage::{Disk, FaultInjection, Location};
-use crate::{invalid, Error, Result, MAX_LINE_BYTES};
+use crate::{Error, MAX_LINE_BYTES, Result, invalid};
 
 #[derive(Debug, Clone)]
 pub struct JournalOptions {
@@ -191,7 +191,7 @@ impl Journal {
         let disk = tokio::task::spawn_blocking(move || {
             let disk = Disk::open(&disk_root, faults)?;
             // This is a disposable cache; reads can rebuild it if cache IO fails.
-            let _ = crate::address::rebuild(&disk_root, disk.last_lsn);
+            let _ = crate::address::initialize(&disk_root, disk.last_lsn, &disk.id);
             Ok::<_, Error>(disk)
         })
         .await

@@ -23,10 +23,10 @@
 
 use std::sync::Arc;
 
-use flow_backend::journal::JournalBackend;
 use flow_backend::NodeType;
+use flow_backend::journal::JournalBackend;
 use jsonrpsee::types::error::{ErrorObject, ErrorObjectOwned};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub mod journal_download;
 pub mod journal_triggers;
@@ -231,14 +231,14 @@ pub async fn serve_journal_product(
     let interrupted = if let Some(cluster) = backend.cluster() {
         let lost = cluster.lost();
         tokio::select! {
-            result = tokio::signal::ctrl_c() => result,
+            result = shutdown_signal() => result,
             _ = lost.cancelled() => { tracing::error!("PG 注册租约失效，停止节点服务"); Ok(()) },
         }
     } else {
-        tokio::signal::ctrl_c().await
+        shutdown_signal().await
     };
     #[cfg(not(feature = "journal-cluster"))]
-    let interrupted = tokio::signal::ctrl_c().await;
+    let interrupted = shutdown_signal().await;
     tracing::info!("正在停止 journal 节点");
     scheduler.abort();
     let _ = scheduler.await;
@@ -258,15 +258,31 @@ pub async fn serve_journal_product(
     Ok(())
 }
 
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
+}
+
 /// 前端拖拽面板 + 参数表单所需的能力清单。
 ///
 /// 单条描述的唯一来源是 `flow_engine::NodeType::descriptor`（与引擎共用一份
 /// 定义），这里只负责按序组装；schema 约定见 descriptor 的文档注释。
 pub(crate) fn node_types() -> Value {
-    json!(NodeType::ALL
-        .iter()
-        .map(|kind| kind.descriptor().clone())
-        .collect::<Vec<Value>>())
+    json!(
+        NodeType::ALL
+            .iter()
+            .map(|kind| kind.descriptor().clone())
+            .collect::<Vec<Value>>()
+    )
 }
 
 /// cron 合法性校验（标准 5 字段，分 时 日 月 周，本地时间）。非法表达式

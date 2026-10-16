@@ -4,11 +4,9 @@
 > 历史设计记录；被删除的 v1（SQLite/Postgres 双后端、Driver/Engine/fold 事件面、
 > `run_tail`、NodeSlot 状态机）相关内容已不在本文件中。
 >
-> **执行协议处于在途重构（IPC8：v4 → v5）**。工作区 `execution_protocol/` 已改为
-> postcard 单流、删除 `Channel` 概念与十进制字符串戒律，本文按**工作区现状**
-> 描述。该目录当前有未提交改动且 `cargo build -p flow-engine` 无法通过（错误全部
-> 集中在 `execution_protocol/`）， pristine HEAD 可编译且为 v4——协议章按在途的
-> v5 写，若该重构回退，§2.2 规则 3 与 §13.5 需一并回退。
+> 当前优先固化[单机 journal 基线](adr/0002-single-machine-journal-baseline.md)
+> （2026-10-16）。执行协议使用 v5 postcard 单流；此前“工作区无法编译”的说明已过时。
+> 集群复制方案仅为未来草案，不属于当前单机承诺。
 >
 > **部署与运维见 [OPS.md](OPS.md)**（部署形态、执行模式、启动重启终止、离线维护、
 > 升级、故障处置、容量预算与安全边界）；本文只描述语义与结构。
@@ -44,8 +42,9 @@
    缓存，崩溃后以日志重放为准。
 2. **不知道就不动**：`uncertain` 是唯一允许的「停下来」状态，它属于**平台故障面**
    （IO/断链/崩溃），不属于工作流失败面。二者绝不互相冒充（§13.3）。
-3. **能删的都能删**：`projection.sqlite`、`indexes/`、`observations/` 全部可随时
-   删除并由 journal 重建。任何「删了就不能恢复」的派生数据都是设计错误。
+3. **派生状态可重建**：停服务后可移走 `projection.sqlite`、`execution-index.sqlite`
+   和 `indexes/`，再由 journal 重建。`observations/` 是独立观测日志，删除后不能重建；
+   它不参与业务状态裁决。
 
 ---
 

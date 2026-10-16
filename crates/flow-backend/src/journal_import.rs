@@ -3,7 +3,7 @@
 use crate::journal::JournalBackend;
 use flow_journal::{Event, EventKind, StoredValue};
 use futures::TryStreamExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{Column, Row, TypeInfo, ValueRef as _};
 use std::{
@@ -161,9 +161,9 @@ async fn baseline(b: &JournalBackend, key: &str, data: Value) -> Result<()> {
                 .ok_or("legacy definition must be JSON text")?,
         )?;
         flow_engine::journal_state::validate_definition(&definition)?;
-        let definition =
-            flow_journal::value::store_json(&b.journal, definition, flow_journal::MAX_LINE_BYTES)
-                .await?;
+        let definition = b
+            .store_json(definition, flow_journal::MAX_LINE_BYTES)
+            .await?;
         mapped.push(Event::new(EventKind::WorkflowUpdated,json!({"workflow_id":data["workflow_id"],"version":{"version":data["version"],"definition":definition,"checksum":data["checksum"],"published":data["status"]=="published","created_at":data["created_at"]}})));
     } else if key.starts_with("schedules/") || key.starts_with("webhooks/") {
         let mut config = data.clone();
@@ -184,7 +184,7 @@ async fn baseline(b: &JournalBackend, key: &str, data: Value) -> Result<()> {
             config,
         ));
     }
-    let stored = flow_journal::value::store_json(&b.journal, data, 8 * 1024 * 1024).await?;
+    let stored = b.store_json(data, 8 * 1024 * 1024).await?;
     b.command(
         "legacy.import",
         Some(&flow_journal::codec::digest(key.as_bytes())),
@@ -300,7 +300,7 @@ pub async fn import(source: &Path, db: &Path, destination: &Path) -> Result<Valu
                 }
 use tokio::io::AsyncSeekExt;file.seek(std::io::SeekFrom::Start(offset+n)).await?;offset+=n;continue;}
             let mut fragment=(&mut file).take(n);
-            let stored=StoredValue::Ref(flow_journal::value::store_stream(&backend.journal,&mut fragment,flow_journal::value::ValueCodec::Bytes).await?);
+            let stored=StoredValue::Ref(backend.store_stream(&mut fragment,flow_journal::value::ValueCodec::Bytes).await?);
             backend.command("legacy.raw",Some(&request_id),&json!({"source":identity,"path":name,"offset":offset,"bytes":n}),|_|Ok((vec![Event::new(EventKind::LegacyImport,json!({"key":key,"data":stored,"path":name,"offset":offset.to_string(),"source_digest":digest,"integrity":"legacy_unproven"}))],json!({"key":key})))).await?;
             offset+=n;
         }

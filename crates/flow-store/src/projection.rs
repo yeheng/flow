@@ -43,7 +43,9 @@ fn created_order(kind: &str, value: &Value) -> Result<String, sqlx::Error> {
                     ts.with_timezone(&chrono::Utc)
                         .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
                 })
-                .map_err(|e| sqlx::Error::Decode(Box::new(e)))
+                // Old journals may contain invalid display timestamps. Preserve the
+                // original fact, sorting it last instead of making replay impossible.
+                .or_else(|_| Ok::<_, sqlx::Error>(String::new()))
         })
         .transpose()
         .map(|v| v.unwrap_or_default())
@@ -176,7 +178,9 @@ impl Projector {
             "CREATE INDEX IF NOT EXISTS journal_status_order_v2 ON journal_entities(kind,json_extract(body,'$.status'),created_order DESC,key DESC)",
             "CREATE INDEX IF NOT EXISTS journal_source_order_v2 ON journal_entities(kind,json_extract(body,'$.source'),created_order DESC,key DESC)",
             "CREATE INDEX IF NOT EXISTS journal_name_order ON journal_entities(kind,json_extract(body,'$.name'),key)",
-        ] { sqlx::query(statement).execute(&pool).await?; }
+        ] {
+            sqlx::query(statement).execute(&pool).await?;
+        }
         sqlx::query("INSERT OR IGNORE INTO journal_cursor VALUES(1,?, '0')")
             .bind(journal_id)
             .execute(&pool)
@@ -235,8 +239,18 @@ impl Projector {
         }
         for row in rows {
             if let Some(value) = row.value {
-                sqlx::query("INSERT INTO journal_entities(kind,key,body,created_order) VALUES(?,?,?,?) ON CONFLICT(kind,key) DO UPDATE SET body=excluded.body,created_order=excluded.created_order")
-                    .bind(&row.kind).bind(row.key).bind(value.to_string()).bind(created_order(&row.kind, &value)?).execute(&mut *tx).await?;
+                let statement = if row.kind == "command" {
+                    "INSERT INTO journal_entities(kind,key,body,created_order) VALUES(?,?,?,?) ON CONFLICT(kind,key) DO NOTHING"
+                } else {
+                    "INSERT INTO journal_entities(kind,key,body,created_order) VALUES(?,?,?,?) ON CONFLICT(kind,key) DO UPDATE SET body=excluded.body,created_order=excluded.created_order"
+                };
+                sqlx::query(statement)
+                    .bind(&row.kind)
+                    .bind(row.key)
+                    .bind(value.to_string())
+                    .bind(created_order(&row.kind, &value)?)
+                    .execute(&mut *tx)
+                    .await?;
             } else {
                 sqlx::query("DELETE FROM journal_entities WHERE kind=? AND key=?")
                     .bind(row.kind)
@@ -295,7 +309,9 @@ impl Projector {
             if let Some(run) = value.as_mut().filter(|r| r["_node_layout"] == "split-v1") {
                 let node_size: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(length(CAST(body AS BLOB))+length(CAST(key AS BLOB))+4),0) FROM journal_entities WHERE kind='run_node' AND json_extract(key,'$[0]')=?")
                     .bind(key).fetch_one(&mut *tx).await?;
-                let mut size_query = QueryBuilder::<Sqlite>::new("SELECT COALESCE(SUM(length(CAST(body AS BLOB))+length(CAST(key AS BLOB))+4),0) FROM journal_entities WHERE kind='run_attempt' AND ");
+                let mut size_query = QueryBuilder::<Sqlite>::new(
+                    "SELECT COALESCE(SUM(length(CAST(body AS BLOB))+length(CAST(key AS BLOB))+4),0) FROM journal_entities WHERE kind='run_attempt' AND ",
+                );
                 attempt_filter(&mut size_query, key, all_attempts);
                 let size = node_size
                     + size_query
@@ -316,7 +332,9 @@ impl Projector {
                             .map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
                     );
                 }
-                let mut attempt_query = QueryBuilder::<Sqlite>::new("SELECT json_extract(key,'$[1]') AS node_id,json_extract(key,'$[2]') AS dispatch_id,body FROM journal_entities WHERE kind='run_attempt' AND ");
+                let mut attempt_query = QueryBuilder::<Sqlite>::new(
+                    "SELECT json_extract(key,'$[1]') AS node_id,json_extract(key,'$[2]') AS dispatch_id,body FROM journal_entities WHERE kind='run_attempt' AND ",
+                );
                 attempt_filter(&mut attempt_query, key, all_attempts);
                 let attempts = attempt_query.build().fetch_all(&mut *tx).await?;
                 for attempt in attempts {
@@ -360,6 +378,20 @@ impl Projector {
             .execute(&mut conn)
             .await?;
         let mut tx = conn.begin().await?;
+        // ATTACH reads and installation share this transaction's source snapshot.
+        // Check bounded pages, including tombstones, before replacing the target.
+        let mut after = String::new();
+        loop {
+            let rows = sqlx::query("SELECT key,body FROM history_source.journal_entities WHERE kind='history' AND key>? AND json_extract(key,'$[2]')<=? ORDER BY key LIMIT 128")
+                .bind(&after).bind(format!("{upper:020}")).fetch_all(&mut *tx).await?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in &rows {
+                decode_history(row)?;
+            }
+            after = rows.last().unwrap().get("key");
+        }
         sqlx::query("DELETE FROM journal_entities")
             .execute(&mut *tx)
             .await?;
@@ -394,7 +426,9 @@ impl Projector {
         upper: u64,
         limit: usize,
     ) -> Result<Vec<String>, sqlx::Error> {
-        let mut q = QueryBuilder::<Sqlite>::new("SELECT DISTINCT json_extract(key,'$[1]') AS entity FROM journal_entities WHERE kind='history' AND json_extract(key,'$[0]')=");
+        let mut q = QueryBuilder::<Sqlite>::new(
+            "SELECT DISTINCT json_extract(key,'$[1]') AS entity FROM journal_entities WHERE kind='history' AND json_extract(key,'$[0]')=",
+        );
         q.push_bind(kind)
             .push(" AND json_extract(key,'$[2]')<=")
             .push_bind(format!("{upper:020}"));
@@ -592,7 +626,9 @@ impl Projector {
         &self,
         workflow_id: Option<&str>,
     ) -> Result<Vec<(String, String, i64)>, sqlx::Error> {
-        let mut query=QueryBuilder::<Sqlite>::new("SELECT json_extract(body,'$.workflow_id') AS workflow,json_extract(body,'$.status') AS status,COUNT(*) AS count FROM journal_entities WHERE kind='run'");
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT json_extract(body,'$.workflow_id') AS workflow,json_extract(body,'$.status') AS status,COUNT(*) AS count FROM journal_entities WHERE kind='run'",
+        );
         if let Some(id) = workflow_id {
             query
                 .push(" AND json_extract(body,'$.workflow_id')=")
@@ -686,12 +722,13 @@ mod tests {
                 .sum::<i64>(),
             5
         );
-        assert!(p
-            .runs_page(RunsQuery::default())
-            .await
-            .unwrap()
-            .1
-            .is_empty());
+        assert!(
+            p.runs_page(RunsQuery::default())
+                .await
+                .unwrap()
+                .1
+                .is_empty()
+        );
         let plan=sqlx::query("EXPLAIN QUERY PLAN SELECT key FROM journal_entities WHERE kind='run' AND json_extract(body,'$.workflow_id')='w' AND (created_order,key)<('2026','b') ORDER BY created_order DESC,key DESC LIMIT 2").fetch_all(&p.pool).await.unwrap();
         let plan = plan
             .iter()
@@ -727,15 +764,16 @@ mod tests {
                 .1),
             ["new"]
         );
-        assert!(p
-            .runs_page(RunsQuery {
+        assert!(
+            p.runs_page(RunsQuery {
                 limit: 2,
                 ..Default::default()
             })
             .await
             .unwrap_err()
             .to_string()
-            .contains("RESPONSE_TOO_LARGE"));
+            .contains("RESPONSE_TOO_LARGE")
+        );
         assert_eq!(p.run_counts(None).await.unwrap()[0].2, 2);
         p.close().await;
     }
@@ -828,11 +866,16 @@ mod tests {
         assert_eq!(lsn, 1);
         assert_eq!(full.unwrap()["nodes"][node]["status"], "running");
         // A later invalid row must roll back the preceding node update and cursor.
-        let invalid = row("bad", "not-a-time", "w", "running");
-        assert!(p
-            .apply("j", 2, vec![node_row("succeeded"), invalid])
-            .await
-            .is_err());
+        let invalid = ProjectedRow {
+            kind: "run_node".into(),
+            key: "not-json".into(),
+            value: Some(json!({"status":"running"})),
+        };
+        assert!(
+            p.apply("j", 2, vec![node_row("succeeded"), invalid])
+                .await
+                .is_err()
+        );
         let (lsn, full) = p.get("run", run_id).await.unwrap();
         assert_eq!(lsn, 1);
         assert_eq!(full.unwrap()["nodes"][node]["status"], "running");
@@ -874,12 +917,13 @@ mod tests {
             Some(json!({"state":"before"}))
         );
         sqlx::query("UPDATE journal_entities SET body='{}' WHERE kind='history' AND json_extract(key,'$[2]')=?").bind(format!("{:020}",2)).execute(&p.pool).await.unwrap();
-        assert!(p
-            .history_at("run", "r", 2)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("checksum"));
+        assert!(
+            p.history_at("run", "r", 2)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("checksum")
+        );
         assert!(p.history_changes(2).await.is_err());
         assert!(p.history_at("run", "r", 1).await.is_ok());
         p.close().await;
