@@ -3,7 +3,7 @@
 use crate::journal::JournalBackend;
 use flow_journal::{Event, EventKind, StoredValue};
 use futures::TryStreamExt;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{Column, Row, TypeInfo, ValueRef as _};
 use std::{

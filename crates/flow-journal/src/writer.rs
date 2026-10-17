@@ -4,15 +4,15 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 
 use crate::codec::{self, Event, EventKind, Transaction};
-use crate::storage::{Disk, FaultInjection, Location};
-use crate::{Error, MAX_LINE_BYTES, Result, invalid};
+use crate::sqlite::{Disk, EntityChange};
+use crate::storage::{FaultInjection, Location};
+use crate::{invalid, Error, Result, MAX_LINE_BYTES};
 
 #[derive(Debug, Clone)]
 pub struct JournalOptions {
-    pub segment_bytes: u64,
     pub batch_bytes: usize,
     pub control_bytes: usize,
     pub audit_bytes: usize,
@@ -23,7 +23,6 @@ pub struct JournalOptions {
 impl Default for JournalOptions {
     fn default() -> Self {
         Self {
-            segment_bytes: 256 * 1024 * 1024,
             batch_bytes: 4 * 1024 * 1024,
             control_bytes: 4 * 1024 * 1024,
             audit_bytes: 16 * 1024 * 1024,
@@ -48,6 +47,9 @@ pub struct Commit {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct WriterStats {
+    pub in_flight: bool,
+    pub queued_requests: usize,
+    pub queued_bytes: usize,
     pub transactions: u64,
     pub events: u64,
     pub encoded_bytes: u64,
@@ -66,6 +68,8 @@ pub struct WriterStats {
 
 struct Pending {
     tx: Transaction,
+    expected_lsn: Option<u64>,
+    changes: Vec<EntityChange>,
     bytes: usize,
     ack: oneshot::Sender<std::result::Result<Commit, String>>,
     _bytes: OwnedSemaphorePermit,
@@ -119,6 +123,16 @@ impl WriteAdmission {
     }
 }
 impl Queue {
+    fn next_bytes(&self) -> Option<usize> {
+        if !self.control.is_empty() && (self.control_turn || self.round.is_empty()) {
+            self.control.front().map(|p| p.bytes)
+        } else {
+            self.round
+                .front()
+                .and_then(|key| self.audit.get(key)?.front())
+                .map(|p| p.bytes)
+        }
+    }
     fn pop(&mut self) -> Option<Pending> {
         let control = !self.control.is_empty() && (self.control_turn || self.round.is_empty());
         self.control_turn = !control;
@@ -155,6 +169,9 @@ struct Inner {
     audit: Arc<Semaphore>,
     control_slots: Arc<Semaphore>,
     audit_slots: Arc<Semaphore>,
+    control_budget: usize,
+    audit_budget: usize,
+    batch_budget: usize,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 impl Drop for Inner {
@@ -180,7 +197,6 @@ impl Journal {
             || options.control_bytes > u32::MAX as usize
             || options.audit_bytes > u32::MAX as usize
             || options.queue_requests == 0
-            || options.segment_bytes < 4096
             || options.group_wait > Duration::from_millis(5)
         {
             return Err(invalid("invalid journal resource options"));
@@ -188,14 +204,9 @@ impl Journal {
         let root = root.as_ref().to_path_buf();
         let disk_root = root.clone();
         let faults = options.faults;
-        let disk = tokio::task::spawn_blocking(move || {
-            let disk = Disk::open(&disk_root, faults)?;
-            // This is a disposable cache; reads can rebuild it if cache IO fails.
-            let _ = crate::address::initialize(&disk_root, disk.last_lsn, &disk.id);
-            Ok::<_, Error>(disk)
-        })
-        .await
-        .map_err(|e| Error::Unavailable(e.to_string()))??;
+        let disk = tokio::task::spawn_blocking(move || Disk::open(&disk_root, faults))
+            .await
+            .map_err(|e| Error::Unavailable(e.to_string()))??;
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
                 stats: WriterStats {
@@ -218,6 +229,9 @@ impl Journal {
             audit: Arc::new(Semaphore::new(options.audit_bytes)),
             control_slots: Arc::new(Semaphore::new(options.queue_requests)),
             audit_slots: Arc::new(Semaphore::new(options.queue_requests)),
+            control_budget: options.control_bytes,
+            audit_budget: options.audit_bytes,
+            batch_budget: options.batch_bytes,
             thread: Mutex::new(None),
         });
         let handle = std::thread::Builder::new()
@@ -233,7 +247,12 @@ impl Journal {
         &self.inner.root
     }
     pub fn stats(&self) -> WriterStats {
-        self.inner.shared.queue.lock().unwrap().stats.clone()
+        let queue = self.inner.shared.queue.lock().unwrap();
+        let mut stats = queue.stats.clone();
+        stats.in_flight = queue.in_flight;
+        stats.queued_requests = queue.requests;
+        stats.queued_bytes = queue.bytes;
+        stats
     }
     pub fn durable_lsn(&self) -> u64 {
         self.stats().durable_lsn
@@ -255,6 +274,37 @@ impl Journal {
         events: Vec<Event>,
         class: QueueClass,
     ) -> Result<Commit> {
+        self.submit_inner(tx_id, events, class, None, Vec::new())
+            .await
+    }
+
+    /// Submit a checked domain transition. Facts, current state and receipts are atomic.
+    pub async fn submit_prepared(
+        &self,
+        tx: Transaction,
+        changes: Vec<EntityChange>,
+    ) -> Result<Commit> {
+        if tx.journal_id != self.id() {
+            return Err(invalid("foreign prepared transition"));
+        }
+        self.submit_inner(
+            tx.tx_id,
+            tx.events,
+            QueueClass::Control,
+            Some(tx.lsn),
+            changes,
+        )
+        .await
+    }
+
+    async fn submit_inner(
+        &self,
+        tx_id: String,
+        events: Vec<Event>,
+        class: QueueClass,
+        expected_lsn: Option<u64>,
+        changes: Vec<EntityChange>,
+    ) -> Result<Commit> {
         if events
             .iter()
             .any(|e| matches!(e.kind, EventKind::SegmentStarted | EventKind::SegmentSealed))
@@ -275,9 +325,28 @@ impl Journal {
             .acquire_owned()
             .await
             .map_err(|e| Error::Unavailable(e.to_string()))?;
+        // Changes are already bounded by the reducer. Account for their encoded size as
+        // well as facts; never silently exceed the configured byte budget.
+        let change_bytes = if changes.is_empty() {
+            0
+        } else {
+            codec::bounded_json(&changes, crate::sqlite::MAX_ENTITY_BYTES)?.len()
+        };
+        let reserve = MAX_LINE_BYTES
+            .checked_add(change_bytes)
+            .ok_or_else(|| invalid("queue byte overflow"))?;
+        let max_capacity = match class {
+            QueueClass::Control => self.inner.control_budget,
+            QueueClass::Audit(_) => self.inner.audit_budget,
+        };
+        if reserve > max_capacity || reserve > self.inner.batch_budget {
+            return Err(Error::Limit(
+                "prepared transition exceeds writer byte budget".into(),
+            ));
+        }
         let mut permit = semaphore
             .clone()
-            .acquire_many_owned(MAX_LINE_BYTES as u32)
+            .acquire_many_owned(reserve as u32)
             .await
             .map_err(|e| Error::Unavailable(e.to_string()))?;
         let tx = Transaction {
@@ -287,11 +356,11 @@ impl Journal {
             tx_id,
             events,
         };
-        let bytes = codec::encode(&tx)?.len();
+        let bytes = codec::encode(&tx)?.len() + change_bytes;
         if matches!(class, QueueClass::Audit(_)) && bytes > 512 * 1024 {
             return Err(Error::Limit("audit transaction exceeds 512 KiB".into()));
         }
-        drop(permit.split(MAX_LINE_BYTES - bytes));
+        drop(permit.split(reserve - bytes));
         let (ack, result) = oneshot::channel();
         {
             let mut queue = self.inner.shared.queue.lock().unwrap();
@@ -310,6 +379,8 @@ impl Journal {
             queue.stats.peak_queued_requests = queue.stats.peak_queued_requests.max(queue.requests);
             let pending = Pending {
                 tx,
+                changes,
+                expected_lsn,
                 bytes,
                 ack,
                 _bytes: permit,
@@ -372,8 +443,11 @@ fn pump(mut disk: Disk, shared: Arc<Shared>, options: JournalOptions) {
             }
             let mut batch = Vec::new();
             let mut bytes = 0;
-            // Conservative reservation means no transaction can make the physical batch exceed its cap.
-            while queue.requests > 0 && bytes + MAX_LINE_BYTES <= options.batch_bytes {
+            // Bound admitted logical bytes. SQLite page/index/WAL writes are separate costs.
+            while queue
+                .next_bytes()
+                .is_some_and(|n| bytes + n <= options.batch_bytes)
+            {
                 let item = queue.pop().expect("nonempty queue");
                 bytes += item.bytes;
                 batch.push(item);
@@ -384,26 +458,30 @@ fn pump(mut disk: Disk, shared: Arc<Shared>, options: JournalOptions) {
         let mut commits = Vec::with_capacity(batch.len());
         let mut encoded_bytes = 0;
         let outcome: Result<()> = (|| {
+            disk.begin()?;
             for pending in &batch {
                 if let Some(admission) = &admission {
                     admission.check()?;
-                }
-                if disk.bytes + pending.bytes as u64 > options.segment_bytes
-                    && disk.last_lsn > disk.first_lsn
-                {
-                    disk.rotate()?;
                 }
                 let mut tx = pending.tx.clone();
                 tx.lsn = disk
                     .last_lsn
                     .checked_add(1)
                     .ok_or_else(|| invalid("LSN overflow"))?;
-                let line = codec::encode(&tx)?;
+                if pending
+                    .expected_lsn
+                    .is_some_and(|expected| expected != tx.lsn)
+                {
+                    return Err(Error::Conflict(
+                        "prepared transition sequence changed".into(),
+                    ));
+                }
                 if let Some(admission) = &admission {
                     admission.check()?;
                 }
-                let location = disk.append(&line, tx.lsn)?;
-                encoded_bytes += line.len();
+                let location =
+                    disk.append(&tx, &pending.changes, pending.expected_lsn.is_some())?;
+                encoded_bytes += pending.bytes;
                 commits.push(Commit {
                     transaction: Arc::new(tx),
                     location,
@@ -423,7 +501,6 @@ fn pump(mut disk: Disk, shared: Arc<Shared>, options: JournalOptions) {
         queue.stats.directory_sync_latency = disk.directory_latency.clone();
         match outcome {
             Ok(()) => {
-                crate::address::committed(&disk.root, &commits);
                 queue.stats.durable_lsn = disk.last_lsn;
                 queue.stats.batches += 1;
                 queue.stats.transactions += batch.len() as u64;
@@ -439,6 +516,7 @@ fn pump(mut disk: Disk, shared: Arc<Shared>, options: JournalOptions) {
                 }
             }
             Err(error) => {
+                disk.rollback();
                 let failure = error.to_string();
                 queue.stats.failure = Some(failure.clone());
                 for pending in batch {

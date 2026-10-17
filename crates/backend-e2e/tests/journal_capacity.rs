@@ -107,7 +107,7 @@ async fn gib_history_checkpoint_and_streamed_verify_remain_bounded() {
     use tokio::io::AsyncReadExt;
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("journal");
-    let journal = flow_journal::Journal::open(&root, Default::default())
+    let journal = JournalBackend::open(&root, Default::default())
         .await
         .unwrap();
     let mut tasks = tokio::task::JoinSet::new();
@@ -115,13 +115,10 @@ async fn gib_history_checkpoint_and_streamed_verify_remain_bounded() {
         let journal = journal.clone();
         tasks.spawn(async move {
             let mut input = tokio::io::repeat(42).take(128 * 1024 * 1024);
-            flow_journal::value::store_stream(
-                &journal,
-                &mut input,
-                flow_journal::value::ValueCodec::Bytes,
-            )
-            .await
-            .unwrap()
+            journal
+                .store_stream(&mut input, flow_journal::value::ValueCodec::Bytes)
+                .await
+                .unwrap()
         });
     }
     let mut values = Vec::new();
@@ -152,12 +149,14 @@ async fn gib_history_checkpoint_and_streamed_verify_remain_bounded() {
         "checkpoint recovery {fast_elapsed:?}"
     );
     for value in &values {
-        backend
-            .state()
-            .await
-            .values
-            .check(&flow_journal::StoredValue::Ref(value.clone()))
-            .unwrap();
+        flow_journal::value::read_value(
+            &root,
+            backend.journal.durable_lsn(),
+            value,
+            true,
+            &mut std::io::sink(),
+        )
+        .unwrap();
     }
     // Read a complete 128 MiB object into a counting/validation sink, never a Vec.
     struct Verify(u64);

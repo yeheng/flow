@@ -119,7 +119,8 @@ async fn legacy_import_is_reentrant_preserves_raw_tail_and_reports_missing_input
         .workflow_create("post-import", Some("new-write"))
         .await
         .unwrap();
-    let expected = serde_json::to_value(backend.state().await).unwrap();
+    let mut expected = serde_json::to_value(backend.state().await).unwrap();
+    expected.as_object_mut().unwrap().remove("commands");
     let upper = backend.journal.durable_lsn();
     backend.close().await.unwrap();
     drop(backend);
@@ -135,10 +136,11 @@ async fn legacy_import_is_reentrant_preserves_raw_tail_and_reports_missing_input
         .await
         .unwrap();
     assert!(output.status.success(), "{:?}", output);
-    let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let mut actual: Value = serde_json::from_slice(&output.stdout).unwrap();
+    actual.as_object_mut().unwrap().remove("commands");
     assert_eq!(
         actual, expected,
-        "packaged compatible binary must recover imports and newer writes from JSONL only"
+        "packaged binary must recover imports and newer writes from the consistent SQLite backup"
     );
     std::fs::write(dir.join("event.jsonl"), b"changed").unwrap();
     assert!(journal_import::import(&source, &db, &destination)

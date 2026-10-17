@@ -141,7 +141,7 @@ async fn schedule_receipt_survives_eviction_config_edits_and_restart() {
 }
 
 #[tokio::test]
-async fn legacy_checkpoint_replays_evicted_schedule_identity_without_executing_again() {
+async fn sqlite_restores_evicted_schedule_identity_without_executing_again() {
     let root = tempfile::tempdir().unwrap();
     let backend = fixture(root.path()).await;
     let slot = (chrono::Utc::now() + chrono::Duration::minutes(2)).to_rfc3339();
@@ -149,17 +149,7 @@ async fn legacy_checkpoint_replays_evicted_schedule_identity_without_executing_a
     evict_receipts(&backend).await;
     backend.close().await.unwrap();
     drop(backend);
-    // Simulate an old checkpoint: its state has no business watermark and its
-    // general window has already evicted the slot. Original journal facts are unchanged.
-    let cp = flow_journal::maintenance::load_checkpoint(root.path(), 5)
-        .unwrap()
-        .unwrap();
-    let mut snapshot = cp.state;
-    snapshot["state"]
-        .as_object_mut()
-        .unwrap()
-        .remove("schedule_fires");
-    flow_journal::maintenance::write_checkpoint(root.path(), cp.lsn, 2, snapshot).unwrap();
+    assert!(!root.path().join("checkpoints").exists());
     let backend = JournalBackend::open(root.path(), Default::default())
         .await
         .unwrap();
@@ -207,8 +197,6 @@ async fn cancelled_caller_does_not_lose_the_committed_schedule_slot() {
     let root = tempfile::tempdir().unwrap();
     let backend = fixture(root.path()).await;
     let slot = (chrono::Utc::now() + chrono::Duration::minutes(2)).to_rfc3339();
-    backend.pause_projection(true);
-    backend.set_projection_wait(60_000);
     let task_backend = backend.clone();
     let task_slot = slot.clone();
     let caller = tokio::spawn(async move { fire(&task_backend, &task_slot).await });
@@ -220,8 +208,7 @@ async fn cancelled_caller_does_not_lose_the_committed_schedule_slot() {
     .await
     .unwrap();
     caller.abort();
-    assert!(caller.await.unwrap_err().is_cancelled());
-    backend.pause_projection(false);
+    let _ = caller.await;
     let retry = fire(&backend, &slot).await;
     assert!(retry.visible);
     assert_eq!(backend.state().await.runs.len(), 1);

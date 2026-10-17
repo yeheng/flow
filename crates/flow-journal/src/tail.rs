@@ -1,88 +1,77 @@
-use crate::codec::{self, EventKind, Transaction};
-use crate::storage::{segment_path, Location};
-use crate::{invalid, Result};
-use std::fs::File;
-use std::io::{BufReader, Seek, SeekFrom};
+use crate::storage::Location;
+use crate::{invalid, Result, Transaction};
 use std::path::{Path, PathBuf};
 
-/// Incremental reader of an externally supplied durable boundary. It never attempts to read
-/// the writer's unsynced tail and keeps only a single bounded physical transaction in memory.
+/// Incremental indexed fact reader. No WAL snapshot is retained between calls.
 pub struct TailReader {
     root: PathBuf,
     journal_id: String,
-    segment: u64,
-    offset: u64,
     next_lsn: u64,
-    reader: Option<BufReader<File>>,
+    run: Option<String>,
+    conn: Option<rusqlite::Connection>,
 }
 impl TailReader {
-    pub fn fork(&self) -> Self {
-        Self {
-            root: self.root.clone(),
-            journal_id: self.journal_id.clone(),
-            segment: self.segment,
-            offset: self.offset,
-            next_lsn: self.next_lsn,
-            reader: None,
-        }
-    }
-    pub fn after(root: &Path, journal_id: &str, location: &Location) -> Result<Self> {
-        let tx = codec::decode(&crate::maintenance::read_location(root, location)?)?;
-        if tx.journal_id != journal_id {
-            return Err(invalid("foreign checkpoint boundary"));
-        }
-        let sealed = tx.events[0].kind == EventKind::SegmentSealed;
-        Ok(Self {
-            root: root.into(),
-            journal_id: journal_id.into(),
-            segment: location.segment + u64::from(sealed),
-            offset: if sealed {
-                0
-            } else {
-                location.offset + location.bytes
-            },
-            next_lsn: location.lsn + 1,
-            reader: None,
-        })
-    }
     pub fn new(root: &Path, journal_id: &str) -> Self {
         Self {
             root: root.into(),
             journal_id: journal_id.into(),
-            segment: 1,
-            offset: 0,
             next_lsn: 1,
-            reader: None,
+            run: None,
+            conn: None,
         }
+    }
+    pub fn for_run(root: &Path, journal_id: &str, run: &str) -> Self {
+        let mut reader = Self::new(root, journal_id);
+        reader.run = Some(run.into());
+        reader
     }
     pub fn next(&mut self, durable_lsn: u64) -> Result<Option<(Transaction, Location)>> {
         if self.next_lsn > durable_lsn {
             return Ok(None);
         }
-        if self.reader.is_none() {
-            let mut file = File::open(segment_path(&self.root, self.segment))?;
-            file.seek(SeekFrom::Start(self.offset))?;
-            self.reader = Some(BufReader::new(file));
+        if self.conn.is_none() {
+            let conn = crate::sqlite::read_connection(&self.root)?;
+            if crate::sqlite::metadata(&conn)?.0 != self.journal_id {
+                return Err(invalid("foreign dataset"));
+            }
+            self.conn = Some(conn);
         }
-        let line = codec::read_line(self.reader.as_mut().unwrap())?
-            .ok_or_else(|| invalid("durable boundary beyond journal"))?;
-        let tx = codec::decode(&line)?;
-        if tx.journal_id != self.journal_id || tx.lsn != self.next_lsn {
-            return Err(invalid("tail dataset/sequence mismatch"));
+        if let Some(run) = &self.run {
+            let next: Option<String> = self
+                .conn
+                .as_ref()
+                .unwrap()
+                .query_row(
+                    "SELECT MIN(lsn) FROM events WHERE run_id=? AND lsn>=? AND lsn<=?",
+                    rusqlite::params![
+                        run,
+                        format!("{:020}", self.next_lsn),
+                        format!("{durable_lsn:020}")
+                    ],
+                    |r| r.get(0),
+                )
+                .map_err(crate::sqlite::db)?;
+            let Some(next) = next else {
+                self.next_lsn = durable_lsn.saturating_add(1);
+                return Ok(None);
+            };
+            self.next_lsn = next
+                .parse()
+                .map_err(|_| invalid("invalid run fact sequence"))?;
         }
+        let tx = crate::sqlite::transaction(
+            self.conn.as_ref().unwrap(),
+            &self.journal_id,
+            self.next_lsn,
+        )?;
         let location = Location {
-            segment: self.segment,
-            offset: self.offset,
-            bytes: line.len() as u64,
+            bytes: crate::codec::encode(&tx)?.len() as u64,
             lsn: tx.lsn,
         };
-        self.next_lsn += 1;
-        self.offset += line.len() as u64;
-        if tx.events[0].kind == EventKind::SegmentSealed {
-            self.segment += 1;
-            self.offset = 0;
-            self.reader = None;
-        }
+        self.next_lsn = self
+            .next_lsn
+            .checked_add(1)
+            .ok_or_else(|| invalid("sequence overflow"))?;
         Ok(Some((tx, location)))
     }
 }

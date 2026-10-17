@@ -9,7 +9,7 @@ use axum::{
 };
 use chrono::{DateTime, Local, Utc};
 use flow_backend::journal::{JournalBackend, JournalError};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::sync::Arc;
 
 pub async fn fire_due(backend: &JournalBackend, now: DateTime<Local>) {
@@ -112,11 +112,6 @@ async fn hook(
         .await
     {
         Ok(receipt) => Json(receipt).into_response(),
-        Err(JournalError::CommittedNotVisible(receipt)) => (
-            StatusCode::ACCEPTED,
-            Json(json!({"code":"COMMITTED_NOT_VISIBLE","receipt":receipt})),
-        )
-            .into_response(),
         Err(JournalError::Journal(flow_journal::Error::Conflict(_))) => {
             StatusCode::CONFLICT.into_response()
         }

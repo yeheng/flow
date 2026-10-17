@@ -51,7 +51,7 @@ fn prepared(id: &str) -> Event {
     )
 }
 #[tokio::test]
-async fn cold_terminal_history_survives_older_checkpoint_and_deleted_indexes() {
+async fn cold_terminal_history_and_receipts_restore_from_current_sqlite_rows() {
     let dir = tempfile::tempdir().unwrap();
     let b = JournalBackend::open(dir.path(), Default::default())
         .await
@@ -102,15 +102,7 @@ async fn cold_terminal_history_survives_older_checkpoint_and_deleted_indexes() {
     );
     b.close().await.unwrap();
     drop(b);
-    let checkpoint = std::fs::read(dir.path().join("checkpoints/latest.json")).unwrap();
-    assert!(
-        checkpoint.len() < 256 * 1024,
-        "cold histories leaked into checkpoint: {}",
-        checkpoint.len()
-    );
-    assert!(flow_journal::maintenance::load_checkpoint(dir.path(), 5)
-        .unwrap()
-        .is_some());
+    assert!(!dir.path().join("checkpoints").exists());
     let b = JournalBackend::open(dir.path(), Default::default())
         .await
         .unwrap();
@@ -125,8 +117,6 @@ async fn cold_terminal_history_survives_older_checkpoint_and_deleted_indexes() {
     let late_lsn = b.append(vec![late.clone()]).await.unwrap();
     b.close().await.unwrap();
     drop(b);
-    // Index contains the future revision. Replay must request the older checkpoint prefix.
-    std::fs::write(dir.path().join("checkpoints/latest.json"), checkpoint).unwrap();
     let b = JournalBackend::open(dir.path(), Default::default())
         .await
         .unwrap();
@@ -137,16 +127,8 @@ async fn cold_terminal_history_survives_older_checkpoint_and_deleted_indexes() {
     assert_eq!(b.append(vec![late.clone()]).await.unwrap(), late_lsn);
     b.close().await.unwrap();
     drop(b);
-    std::fs::rename(
-        dir.path().join("execution-index.sqlite"),
-        dir.path().join("saved-index.sqlite"),
-    )
-    .unwrap();
-    std::fs::rename(
-        dir.path().join("projection.sqlite"),
-        dir.path().join("saved-projection.sqlite"),
-    )
-    .unwrap();
+    assert!(!dir.path().join("execution-index.sqlite").exists());
+    assert!(!dir.path().join("projection.sqlite").exists());
     let b = JournalBackend::open(dir.path(), Default::default())
         .await
         .unwrap();
@@ -155,7 +137,7 @@ async fn cold_terminal_history_survives_older_checkpoint_and_deleted_indexes() {
     assert_eq!(b.state().await.runs.len(), 64);
     assert_eq!(b.diagnostics().await["resident_runs"], 0);
     assert_eq!(
-        b.projection.get_execution("r000").await.unwrap().1.unwrap()["nodes"]["s"]["output"],
+        b.store.get_execution("r000").await.unwrap().1.unwrap()["nodes"]["s"]["output"],
         json!(inline(json!(0)))
     );
     b.close().await.unwrap();
@@ -207,14 +189,14 @@ async fn retry_attempts_are_offloaded_and_old_dispatch_audit_is_isolated() {
         .await
         .unwrap();
     assert_eq!(
-        b.projection.get_execution("r").await.unwrap().1.unwrap()["nodes"]["s"]["attempts"]
+        b.store.get_execution("r").await.unwrap().1.unwrap()["nodes"]["s"]["attempts"]
             .as_object()
             .unwrap()
             .len(),
         1
     );
     assert_eq!(
-        b.projection.get("run", "r").await.unwrap().1.unwrap()["nodes"]["s"]["attempts"]
+        b.store.get("run", "r").await.unwrap().1.unwrap()["nodes"]["s"]["attempts"]
             .as_object()
             .unwrap()
             .len(),

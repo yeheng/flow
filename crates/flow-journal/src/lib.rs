@@ -1,8 +1,8 @@
-//! Versioned, bounded, single-writer JSONL authority. No execution or projection side effects.
-pub mod address;
+//! Bounded single-writer SQLite authority. Facts and current state commit together.
 pub mod codec;
 pub mod maintenance;
 pub mod page;
+pub mod sqlite;
 pub mod storage;
 pub mod tail;
 pub mod value;

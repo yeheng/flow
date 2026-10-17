@@ -1,4 +1,4 @@
-use flow_backend::journal::{JournalBackend, JournalError};
+use flow_backend::journal::JournalBackend;
 use flow_engine::journal_state::Workflow;
 use flow_journal::{Event, EventKind, JournalOptions};
 use serde_json::{json, Value};
@@ -100,19 +100,21 @@ async fn publication_and_business_references_require_a_complete_value_closure() 
     let backend = JournalBackend::open(&root, Default::default())
         .await
         .unwrap();
-    assert!(backend
-        .state()
-        .await
-        .values
-        .check(&StoredValue::Ref(value))
-        .is_ok());
+    flow_journal::value::read_value(
+        &root,
+        backend.journal.durable_lsn(),
+        &value,
+        true,
+        &mut std::io::sink(),
+    )
+    .unwrap();
     backend.close().await.unwrap();
     drop(backend);
     std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
-async fn concurrent_same_identity_attaches_and_projection_is_disposable() {
+async fn concurrent_identity_attaches_and_state_receipt_restore_from_one_database() {
     let root = temp();
     let backend = JournalBackend::open(&root, JournalOptions::default())
         .await
@@ -140,7 +142,7 @@ async fn concurrent_same_identity_attaches_and_projection_is_disposable() {
     assert!(lsns.iter().all(|v| *v == lsns[0]));
     assert_eq!(backend.journal.stats().transactions, 1);
     assert!(backend
-        .projection
+        .store
         .get("workflow", "w1")
         .await
         .unwrap()
@@ -155,36 +157,26 @@ async fn concurrent_same_identity_attaches_and_projection_is_disposable() {
         )
         .await
         .is_err());
-    let before = serde_json::to_value(backend.state().await).unwrap();
+    let before = backend.journal.durable_lsn();
     backend.close().await.unwrap();
     drop(backend);
-    let rebuilt = root.join("rebuilt.sqlite");
-    let rebuilt_lsn = JournalBackend::rebuild_projection(&root, &rebuilt)
-        .await
-        .unwrap();
-    let projected =
-        flow_store::projection::Projector::open(&rebuilt, before["journal_id"].as_str().unwrap())
-            .await
-            .unwrap();
-    assert_eq!(
-        projected.get("workflow", "w1").await.unwrap().0,
-        rebuilt_lsn
-    );
-    assert!(projected.get("workflow", "w1").await.unwrap().1.is_some());
-    projected.close().await;
-    assert!(JournalBackend::rebuild_projection(&root, &rebuilt)
-        .await
-        .is_err());
-    std::fs::remove_file(root.join("projection.sqlite")).unwrap();
+    assert!(root.join("flow.sqlite").is_file());
+    for obsolete in [
+        "journal",
+        "checkpoints",
+        "indexes",
+        "execution-index.sqlite",
+        "projection.sqlite",
+    ] {
+        assert!(!root.join(obsolete).exists());
+    }
     let recovered = JournalBackend::open(&root, JournalOptions::default())
         .await
         .unwrap();
-    assert_eq!(
-        serde_json::to_value(recovered.state().await).unwrap(),
-        before
-    );
+    assert_eq!(recovered.journal.durable_lsn(), before);
+    assert_eq!(recovered.state().await.workflows.len(), 1);
     assert!(recovered
-        .projection
+        .store
         .get("workflow", "w1")
         .await
         .unwrap()
@@ -203,47 +195,38 @@ async fn concurrent_same_identity_attaches_and_projection_is_disposable() {
 }
 
 #[tokio::test]
-async fn paused_projection_returns_committed_result_and_retry_does_not_duplicate() {
+async fn committed_state_is_immediately_visible_and_retry_does_not_duplicate() {
     let root = temp();
-    let backend = JournalBackend::open(&root, JournalOptions::default())
+    let backend = JournalBackend::open(&root, Default::default())
         .await
         .unwrap();
-    backend.set_projection_wait(100);
-    backend.pause_projection(true);
-    let result = backend
+    let receipt = backend
         .command("create", Some("r"), &json!({}), |_| Ok(creation("w")))
-        .await;
-    let receipt = match result {
-        Err(JournalError::CommittedNotVisible(r)) => r,
-        other => panic!("{other:?}"),
-    };
-    assert!(receipt.committed);
-    assert!(!receipt.visible);
-    assert_eq!(receipt.result["workflow_id"], "w");
+        .await
+        .unwrap();
+    assert!(receipt.committed && receipt.visible);
     assert!(backend
-        .projection
+        .store
         .get("workflow", "w")
         .await
         .unwrap()
         .1
-        .is_none());
+        .is_some());
     assert!(
-        !backend
+        backend
             .command_status("create", "r")
             .await
             .unwrap()
             .unwrap()
             .visible
     );
-    backend.pause_projection(false);
     let retry = backend
         .command("create", Some("r"), &json!({}), |_| {
-            panic!("must not execute duplicate decision")
+            panic!("duplicate decision")
         })
         .await
         .unwrap();
     assert_eq!(retry.commit_cursor, receipt.commit_cursor);
-    assert!(retry.visible);
     assert_eq!(backend.journal.stats().transactions, 1);
     backend.close().await.unwrap();
     drop(backend);
@@ -271,7 +254,7 @@ async fn invalid_multi_event_transaction_never_reaches_journal_or_projection() {
     assert!(backend.state().await.workflows.is_empty());
     assert_eq!(backend.journal.durable_lsn(), before);
     assert!(backend
-        .projection
+        .store
         .get("workflow", "w")
         .await
         .unwrap()
@@ -330,7 +313,96 @@ async fn disconnected_command_is_joined_before_retry_decision() {
 }
 
 #[tokio::test]
-async fn checkpoint_resumes_partial_value_and_corrupt_cache_replays() {
+async fn cancelled_run_start_is_scheduled_without_a_retry_or_state_read() {
+    let root = tempfile::tempdir().unwrap();
+    let b = JournalBackend::open(
+        root.path(),
+        JournalOptions {
+            faults: flow_journal::storage::FaultInjection {
+                sync_delay_ms: 100,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let workflow = b
+        .workflow_create("cancelled-caller", None)
+        .await
+        .unwrap()
+        .result["workflow_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    b.workflow_update(&workflow,json!({"nodes":[{"id":"s","type":"start"},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"e"}]}),None).await.unwrap();
+    b.workflow_publish(&workflow, 1, None).await.unwrap();
+    b.start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
+        flow_backend::execution::IpcOptions {
+            executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
+                flow_test_support::io::executor_bin(),
+            ),
+            x_max: 1,
+            tag: None,
+        },
+    ))
+    .await
+    .unwrap();
+    let owner = b.clone();
+    let caller = tokio::spawn(async move {
+        owner
+            .run_start(
+                &workflow,
+                None,
+                Value::Null,
+                "manual",
+                None,
+                Some("lost-start"),
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !b.journal.stats().in_flight {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    // Query only SQLite. No call here can finish the coordinator's pending reducer.
+    let run = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let (_, rows) = b
+                .store
+                .runs_page(flow_store::store::RunsQuery {
+                    status: Some("succeeded"),
+                    limit: 1,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            if let Some(run) = rows.into_iter().next() {
+                break run;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        b.command_status("run.start:manual:", "lost-start")
+            .await
+            .unwrap()
+            .unwrap()
+            .result["run_id"],
+        run["run_id"]
+    );
+    b.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn unfinished_value_resumes_from_sqlite_progress_after_restart() {
     let root = temp();
     let backend = JournalBackend::open(&root, Default::default())
         .await
@@ -345,7 +417,7 @@ async fn checkpoint_resumes_partial_value_and_corrupt_cache_replays() {
     let identity = backend.journal.id().to_owned();
     backend.close().await.unwrap();
     drop(backend);
-    assert!(root.join("checkpoints/latest.json").exists());
+    assert!(!root.join("checkpoints").exists());
     let backend = JournalBackend::open(&root, Default::default())
         .await
         .unwrap();
@@ -371,16 +443,20 @@ async fn checkpoint_resumes_partial_value_and_corrupt_cache_replays() {
         .unwrap();
     backend.close().await.unwrap();
     drop(backend);
-    std::fs::write(root.join("checkpoints/latest.json"), b"corrupt cache").unwrap();
+
     let backend = JournalBackend::open(&root, Default::default())
         .await
         .unwrap();
-    backend
-        .state()
-        .await
-        .values
-        .check(&flow_journal::StoredValue::Ref(value))
-        .unwrap();
+    let mut bytes = Vec::new();
+    flow_journal::value::read_value(
+        &root,
+        backend.journal.durable_lsn(),
+        &value,
+        true,
+        &mut bytes,
+    )
+    .unwrap();
+    assert_eq!(bytes, b"{}");
     backend.close().await.unwrap();
     drop(backend);
     std::fs::remove_dir_all(root).unwrap();
@@ -423,7 +499,7 @@ async fn concurrent_writes_all_return_visible_without_committed_not_visible() {
 }
 
 #[tokio::test]
-async fn audit_receipts_survive_compaction_restart_and_index_rebuild() {
+async fn audit_receipts_survive_cache_eviction_and_repeated_restart() {
     let root = tempfile::tempdir().unwrap();
     let b = JournalBackend::open(root.path(), Default::default())
         .await
@@ -489,10 +565,7 @@ async fn audit_receipts_survive_compaction_restart_and_index_rebuild() {
     assert!(b.append(vec![changed.clone()]).await.is_err());
     b.close().await.unwrap();
     drop(b);
-    for rebuild in [false, true] {
-        if rebuild {
-            std::fs::remove_file(root.path().join("execution-index.sqlite")).unwrap();
-        }
+    for _ in 0..2 {
         let b = JournalBackend::open(root.path(), Default::default())
             .await
             .unwrap();
@@ -507,69 +580,51 @@ async fn audit_receipts_survive_compaction_restart_and_index_rebuild() {
 }
 
 #[tokio::test]
-async fn metadata_does_not_read_definitions_and_old_run_projection_is_rebuilt() {
+async fn metadata_skips_blob_reads_and_definition_versions_are_stored_once() {
     let root = tempfile::tempdir().unwrap();
     let b = JournalBackend::open(root.path(), Default::default())
         .await
         .unwrap();
     let created = b.workflow_create("metadata", None).await.unwrap();
     let workflow = created.result["workflow_id"].as_str().unwrap();
-    b.workflow_update(workflow, json!({"nodes":[{"id":"s","type":"start","name":"x".repeat(100 * 1024)},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"e"}]}), None).await.unwrap();
+    b.workflow_update(workflow,json!({"nodes":[{"id":"s","type":"start","name":"x".repeat(100*1024)},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"e"}]}),None).await.unwrap();
     b.workflow_publish(workflow, 1, None).await.unwrap();
-    assert!(matches!(
-        b.state().await.workflows[workflow].versions[&1].definition,
-        flow_journal::StoredValue::Ref(_)
-    ));
-    // Temporarily hide the journal bytes: a metadata list has no reason to touch them.
-    std::fs::rename(
-        root.path().join("journal"),
-        root.path().join("held-journal"),
-    )
-    .unwrap();
-    let metadata = flow_backend::journal_views::version_metadata(&b, workflow).await;
-    let definition = flow_backend::journal_views::get_version(&b, workflow, Some(1)).await;
-    std::fs::rename(
-        root.path().join("held-journal"),
-        root.path().join("journal"),
-    )
-    .unwrap();
-    assert_eq!(metadata.unwrap()[0]["version"], 1);
-    assert!(definition.is_err());
-    let started = b
-        .run_start(workflow, None, Value::Null, "manual", None, None)
-        .await
-        .unwrap();
-    let run_id = started.result["run_id"].as_str().unwrap().to_owned();
-    b.run_cancel(&run_id, None).await.unwrap();
-    let full = b.projection.get("run", &run_id).await.unwrap().1.unwrap();
-    b.close().await.unwrap();
-    drop(b);
-    assert!(flow_journal::maintenance::load_checkpoint(root.path(), 5)
-        .unwrap()
-        .is_some());
-    assert!(flow_journal::maintenance::load_checkpoint(root.path(), 3)
-        .unwrap()
-        .is_none());
     let pool = sqlx::SqlitePool::connect(&format!(
         "sqlite://{}",
-        root.path().join("projection.sqlite").display()
+        root.path().join("flow.sqlite").display()
     ))
     .await
     .unwrap();
-    sqlx::query("UPDATE journal_entities SET body=? WHERE kind='run' AND key=?")
-        .bind(full.to_string())
-        .bind(&run_id)
+    sqlx::query("UPDATE value_chunks SET bytes=zeroblob(length(bytes))")
         .execute(&pool)
         .await
         .unwrap();
-    pool.close().await;
-    let b = JournalBackend::open(root.path(), Default::default())
-        .await
-        .unwrap();
-    assert!(!b.projection.requires_split_runs().await.unwrap());
     assert_eq!(
-        b.projection.get("run", &run_id).await.unwrap().1.unwrap(),
-        full
+        flow_backend::journal_views::version_metadata(&b, workflow)
+            .await
+            .unwrap()[0]["version"],
+        1
     );
+    assert!(
+        flow_backend::journal_views::get_version(&b, workflow, Some(1))
+            .await
+            .is_err()
+    );
+    let summary: String =
+        sqlx::query_scalar("SELECT body FROM current_entities WHERE kind='workflow'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&summary).unwrap()["versions"],
+        json!({})
+    );
+    let versions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM current_entities WHERE kind='workflow_version'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(versions, 1);
+    pool.close().await;
     b.close().await.unwrap();
 }

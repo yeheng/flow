@@ -1,9 +1,7 @@
-use std::fs::{self, OpenOptions};
-use std::io::Write;
 use std::time::Duration;
 
 use flow_journal::codec::{decode, digest, encode, read_line};
-use flow_journal::storage::{segment_path, FaultInjection};
+use flow_journal::storage::FaultInjection;
 use flow_journal::value::{materialize, read_value, store_stream, ValueCodec};
 use flow_journal::{
     scan, Event, EventKind, Journal, JournalOptions, QueueClass, StoredValue, Transaction,
@@ -113,7 +111,7 @@ async fn batch_durability_round_robin_lock_and_restart() {
         assert!(journal.durable_lsn() >= c.transaction.lsn);
     }
     lsns.sort_unstable();
-    assert_eq!(lsns, (2..=129).collect::<Vec<_>>());
+    assert_eq!(lsns, (1..=128).collect::<Vec<_>>());
     assert!(
         journal.stats().data_syncs < 128 / 4,
         "{:?}",
@@ -133,7 +131,7 @@ async fn batch_durability_round_robin_lock_and_restart() {
     })
     .unwrap();
     assert!(report.fault.is_none());
-    assert_eq!(report.last_lsn, 129);
+    assert_eq!(report.last_lsn, 128);
     let next = Journal::open(dir.path(), JournalOptions::default())
         .await
         .unwrap();
@@ -144,175 +142,9 @@ async fn batch_durability_round_robin_lock_and_restart() {
             .unwrap()
             .transaction
             .lsn,
-        130
+        129
     );
     next.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn rotation_chain_missing_segment_and_ambiguous_tail_are_preserved() {
-    let dir = tempfile::tempdir().unwrap();
-    let options = JournalOptions {
-        segment_bytes: 4096,
-        group_wait: Duration::ZERO,
-        ..Default::default()
-    };
-    let journal = Journal::open(dir.path(), options.clone()).await.unwrap();
-    for i in 0..15 {
-        journal
-            .submit(
-                i.to_string(),
-                vec![Event::new(EventKind::Command, json!("x".repeat(1200)))],
-                QueueClass::Control,
-            )
-            .await
-            .unwrap();
-    }
-    journal.close().await.unwrap();
-    let report = scan(dir.path(), |_, _| Ok(())).unwrap();
-    assert!(report.fault.is_none(), "{report:?}");
-    assert!(report.segments.len() > 2);
-    let tail = segment_path(dir.path(), report.segments.last().unwrap().number);
-    OpenOptions::new()
-        .append(true)
-        .open(&tail)
-        .unwrap()
-        .write_all(b"{\"data\":")
-        .unwrap();
-    let before = fs::read(&tail).unwrap();
-    let broken = scan(dir.path(), |_, _| Ok(())).unwrap();
-    assert!(broken.fault.is_some());
-    assert!(Journal::open(dir.path(), options.clone()).await.is_err());
-    assert_eq!(fs::read(&tail).unwrap(), before);
-    fs::remove_file(segment_path(dir.path(), 2)).unwrap();
-    let broken = scan(dir.path(), |_, _| Ok(())).unwrap();
-    assert!(broken.fault.unwrap().reason.contains("missing segment"));
-}
-
-#[tokio::test]
-async fn injected_sync_failure_freezes_and_complete_unknown_receipt_recovers() {
-    let dir = tempfile::tempdir().unwrap();
-    let journal = Journal::open(
-        dir.path(),
-        JournalOptions {
-            faults: FaultInjection {
-                fail_data_sync: Some(2),
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    assert!(journal
-        .submit("unknown-receipt".into(), vec![event()], QueueClass::Control)
-        .await
-        .is_err());
-    assert_eq!(journal.durable_lsn(), 1);
-    assert!(journal
-        .submit("must-not-append".into(), vec![event()], QueueClass::Control)
-        .await
-        .is_err());
-    assert!(Journal::open(dir.path(), JournalOptions::default())
-        .await
-        .is_err());
-    assert!(journal.close().await.is_err());
-    let mut ids = Vec::new();
-    let report = scan(dir.path(), |tx, _| {
-        ids.push(tx.tx_id.clone());
-        Ok(())
-    })
-    .unwrap();
-    assert!(report.fault.is_none());
-    assert_eq!(ids.len(), 2);
-    assert_eq!(ids[1], "unknown-receipt");
-    let recovered = Journal::open(dir.path(), JournalOptions::default())
-        .await
-        .unwrap();
-    assert_eq!(recovered.durable_lsn(), 2);
-    recovered.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn short_writes_complete_but_partial_write_never_confirms_or_repairs() {
-    let dir = tempfile::tempdir().unwrap();
-    let journal = Journal::open(
-        dir.path(),
-        JournalOptions {
-            faults: FaultInjection {
-                short_write_bytes: Some(3),
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    journal
-        .submit("short".into(), vec![event()], QueueClass::Control)
-        .await
-        .unwrap();
-    journal.close().await.unwrap();
-    let journal = Journal::open(
-        dir.path(),
-        JournalOptions {
-            faults: FaultInjection {
-                fail_after_bytes: Some(19),
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    assert!(journal
-        .submit("partial".into(), vec![event()], QueueClass::Control)
-        .await
-        .is_err());
-    assert_eq!(journal.durable_lsn(), 2);
-    assert!(journal.close().await.is_err());
-    let report = scan(dir.path(), |_, _| Ok(())).unwrap();
-    assert_eq!(report.last_lsn, 2);
-    assert!(report.fault.is_some());
-    assert!(Journal::open(dir.path(), JournalOptions::default())
-        .await
-        .is_err());
-}
-
-#[tokio::test]
-async fn directory_sync_failure_does_not_acknowledge_rotation() {
-    let dir = tempfile::tempdir().unwrap();
-    let journal = Journal::open(
-        dir.path(),
-        JournalOptions {
-            segment_bytes: 4096,
-            faults: FaultInjection {
-                fail_dir_sync: Some(2),
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    journal
-        .submit(
-            "first".into(),
-            vec![Event::new(EventKind::Command, json!("x".repeat(3000)))],
-            QueueClass::Control,
-        )
-        .await
-        .unwrap();
-    assert!(journal
-        .submit(
-            "rotation".into(),
-            vec![Event::new(EventKind::Command, json!("x".repeat(3000)))],
-            QueueClass::Control
-        )
-        .await
-        .is_err());
-    assert_eq!(journal.durable_lsn(), 2);
-    assert!(journal.close().await.is_err());
 }
 
 #[tokio::test]
@@ -424,162 +256,4 @@ async fn slow_disk_and_full_queues_keep_both_classes_progressing() {
     assert!(stats.peak_queued_bytes <= 2 * MAX_LINE_BYTES);
     journal.close().await.unwrap();
     assert!(scan(dir.path(), |_, _| Ok(())).unwrap().fault.is_none());
-}
-
-#[tokio::test]
-async fn sync_failure_matrix_never_loses_acknowledged_prefix() {
-    for (data, dir) in (1..=10)
-        .map(|n| (Some(n), None))
-        .chain((1..=4).map(|n| (None, Some(n))))
-    {
-        let temp = tempfile::tempdir().unwrap();
-        let opened = Journal::open(
-            temp.path(),
-            JournalOptions {
-                segment_bytes: 4096,
-                faults: FaultInjection {
-                    fail_data_sync: data,
-                    fail_dir_sync: dir,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        )
-        .await;
-        let j = match opened {
-            Ok(journal) => journal,
-            Err(error) => {
-                assert!(
-                    error.to_string().contains("injected"),
-                    "unexpected open error: {error}"
-                );
-                assert!(
-                    data == Some(1) || dir.is_some(),
-                    "late data fault cannot fail initial open: {data:?}"
-                );
-                continue;
-            }
-        };
-        let mut acknowledged = Vec::new();
-        let mut failed = false;
-        for i in 0..12 {
-            match j
-                .submit(
-                    format!("matrix-{i}"),
-                    vec![Event::new(
-                        EventKind::Command,
-                        json!({"n":i,"pad":"x".repeat(2500)}),
-                    )],
-                    QueueClass::Control,
-                )
-                .await
-            {
-                Ok(receipt) => acknowledged.push(receipt.transaction.tx_id.clone()),
-                Err(_) => {
-                    failed = true;
-                    break;
-                }
-            }
-        }
-        if failed {
-            let before = j.durable_lsn();
-            assert!(j
-                .submit("after-failure".into(), vec![event()], QueueClass::Control)
-                .await
-                .is_err());
-            assert_eq!(j.durable_lsn(), before);
-        }
-        let _ = j.close().await;
-        drop(j);
-        let mut recovered = Vec::new();
-        flow_journal::scan(temp.path(), |tx, _| {
-            recovered.push(tx.tx_id.clone());
-            Ok(())
-        })
-        .unwrap();
-        for id in acknowledged {
-            assert!(
-                recovered.contains(&id),
-                "lost ack data={data:?} dir={dir:?}"
-            );
-        }
-    }
-}
-
-#[tokio::test]
-#[ignore = "requires isolated 32 MiB FLOW_ENOSPC_VOLUME disk image"]
-async fn real_enospc_freezes_writer_and_preserves_acknowledged_prefix() {
-    use std::io::Write;
-    let volume = std::path::PathBuf::from(
-        std::env::var("FLOW_ENOSPC_VOLUME").expect("isolated volume required"),
-    );
-    assert_eq!(volume, std::path::Path::new("/tmp/flow-acceptance-volume"));
-    let root = volume.join(format!("journal-{}", uuid::Uuid::now_v7()));
-    let j = Journal::open(&root, Default::default()).await.unwrap();
-    let ack = j
-        .submit("before-full".into(), vec![event()], QueueClass::Control)
-        .await
-        .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        assert_ne!(
-            std::fs::metadata(&volume).unwrap().dev(),
-            std::fs::metadata(volume.parent().unwrap()).unwrap().dev(),
-            "requires an isolated mounted filesystem"
-        );
-    }
-    let fill = volume.join("fill.bin");
-    let mut file = std::fs::File::create(&fill).unwrap();
-    let block = vec![0xab; 1024 * 1024];
-    let mut filled = 0;
-    loop {
-        assert!(
-            filled < 40 * 1024 * 1024,
-            "refuse to fill an oversized filesystem"
-        );
-        match file.write_all(&block) {
-            Ok(()) => filled += block.len(),
-            Err(e) => {
-                assert_eq!(e.raw_os_error(), Some(28));
-                break;
-            }
-        }
-    }
-    assert!(filled < 40 * 1024 * 1024, "unexpected backing filesystem");
-    let result = j
-        .submit(
-            "disk-full".into(),
-            vec![Event::new(
-                EventKind::Command,
-                json!({"data":"x".repeat(700_000)}),
-            )],
-            QueueClass::Control,
-        )
-        .await;
-    assert!(result.is_err());
-    assert_eq!(j.durable_lsn(), ack.transaction.lsn);
-    assert!(j
-        .submit("after-full".into(), vec![event()], QueueClass::Control)
-        .await
-        .is_err());
-    let _ = j.close().await;
-    drop(j);
-    drop(file);
-    std::fs::remove_file(fill).unwrap();
-    let mut ids = Vec::new();
-    let report = flow_journal::scan(&root, |tx, _| {
-        ids.push(tx.tx_id.clone());
-        Ok(())
-    })
-    .unwrap();
-    assert!(ids.contains(&"before-full".to_string()));
-    let destination = volume.join("repaired");
-    if report.fault.is_some() {
-        flow_journal::maintenance::repair(&root, &destination, true).unwrap();
-    }
-    println!(
-        "real ENOSPC after {filled} bytes; acknowledged prefix retained; ambiguous_tail={}",
-        report.fault.is_some()
-    );
 }

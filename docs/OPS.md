@@ -232,92 +232,47 @@ flow-agent \
 
 ## 4. 关机与重启
 
-### 4.1 优雅停止的顺序是load-bearing
+### 4.1 优雅停止
 
-`JournalBackend::close()` 的顺序**不能改**（`flow-backend/src/journal.rs`）：
+停止协调循环并等待执行任务退出，接续 owner 已持有的提交，关闭写入线程，释放成员资格，
+最后关闭只读查询连接。没有独立 projector，不需要等异步可见性。
 
-```
-1. shutdown.cancel()          # 停协调循环
-2. await + take execution     # 等在飞派发
-3. projector_stop.cancel()    # 停投影器
-4. await + take projector
-5. checkpoint()               # 写 checkpoint（失败只 warn，不阻塞退出）
-6. journal.close()            # 关写者、刷段
-7. cluster close              # 释放 PG 成员资格
-8. projection.close()
-```
+发送 SIGTERM/SIGINT 并等待退出。SIGKILL 后 SQLite 恢复已提交事务；正常重启不依赖
+应用 checkpoint 或完整历史重放。子进程生命周期及未知外部操作仍按执行协议处理。
 
-**为什么第 3 步必须在第 5 步之前**：在飞的 `command()` / `run_cancel()` 可能阻塞在
-`visible()` 里等投影追平。如果先写 checkpoint 再停投影器，每个等待者都会烧完
-30 秒超时，`close()` 看起来像挂死。
+### 4.2 重启
 
-**实务**：发 `SIGTERM`/`SIGINT`，等它自己退。**不要 `SIGKILL`**——虽然 journal 是
-崩溃安全的（`SIGKILL` 后能恢复），但 `SIGKILL` 会跳过 checkpoint，下次启动要全量
-重放，且执行器子进程会变孤儿。
+取得 flock，打开 flow.sqlite/WAL，加载控制元数据与非终态执行，播种 dirty runs，
+提交新 master epoch 后继续安全工作。已授权而结果未知的操作停在 awaiting_resume，
+必须明确裁决，不能借重启重新发送。
 
-### 4.2 重启后自动发生什么
+## 5. 离线维护（flow-journal-tool）
 
-1. `flock(data_dir)` 抢到排他锁 → 成为唯一写者；
-2. 读 checkpoint + 全量重放到 `durable_lsn`；
-3. `dirty_runs` 播种**全部非终态 run**；
-4. 投影器从 `projected_lsn` 续跑，追平后才对外可见（`visible()` 阻塞到追平）；
-5. 协调循环从折叠态继续推进。
-
-**运维不需要做任何事**。`awaiting_resume` 的 run 会停在原处等人工裁决——
-这是设计行为，不是卡住。
-
----
-
-## 5. 离线维护（`flow-journal-tool`）
-
-**所有子命令都先取排他锁**（`offline_lock` = 对 root 目录 `try_lock_exclusive`），
-所以**必须在服务停止时运行**。
+CLI 先取数据目录排他锁，须在服务停止时运行：
 
 ```sh
-# 全量字节校验 + 已发布值闭环检查
-flow-journal-tool verify --data-dir /var/lib/flow/journal
-
-# 重建位置索引（一次性派生缓存，可随时删除）
-flow-journal-tool rebuild-index --data-dir /var/lib/flow/journal
-
-# 备份可恢复前缀到新目录
-flow-journal-tool backup --data-dir <源> --destination <目标>
-
-# 打印可恢复前缀；--confirm 才真正写入新目录
-flow-journal-tool repair --data-dir <源> --destination <目标> [--confirm]
+flow-journal-tool verify <data_dir>
+flow-journal-tool rebuild-index <data_dir>
+flow-journal-tool backup <data_dir> <new_destination>
 ```
 
-| 命令 | 语义 |
+- verify：SQLite integrity/foreign-key 检查、事实与当前实体摘要、已发布正文闭环检查。
+- rebuild-index：SQLite 原生 REINDEX；不创建应用位置索引。
+- backup：一致快照包含当前状态、事实、回执与正文；校验完成后发布独立主文件。
+  目标必须不存在。不要在线只复制 flow.sqlite；活跃 WAL 也是提交数据的一部分。
+
+不再提供 rebuild-projection 或日志前缀 repair。损坏数据保留证据，从经过 verify 的
+一致备份恢复；不能把不完整事实前缀当成当前执行状态。
+
+### 5.1 文件职责
+
+| 路径 | 职责 |
 | --- | --- |
-| `verify` | 全量扫描 + 每个已发布值以 `require_published=true` 重新读回 |
-| `rebuild-index` | 重建 `indexes/locations.jsonl`（纯派生缓存） |
-| `backup` | 复制**已验证**前缀，并在目的地**重新校验**一遍 |
-| `repair` | **永不修改原文件**；只把可恢复前缀写进新目录 |
+| flow.sqlite、活跃 WAL | 唯一业务权威，不可当缓存删除 |
+| SQLite shm | SQLite 自行管理，不在运行中手工操作 |
+| observations/ | 独立观测日志，删除后不可恢复，不影响业务状态 |
 
-### 5.1 重建投影
-
-投影损坏/丢失时（DESIGN §3.6：只有两张通用表，删了能重建）：
-
-```sh
-# 离线重建进新的 SQLite 文件（不执行任何工作流）
-flow-journal-dev rebuild-projection --destination /tmp/projection-new.sqlite
-```
-
-`rebuild_projection` 持 `offline_lock`，拒绝损坏的 journal，建新文件（`create_new`，
-权限 0600）并 fsync 父目录。
-
-### 5.2 可以随时删除的派生数据
-
-| 路径 | 删除后果 |
-| --- | --- |
-| `projection.sqlite` | 停服务后移走，重启从 journal 重建；期间读不可用 |
-| `execution-index.sqlite` | 停服务后移走，重启从 journal 重建冷历史索引 |
-| `indexes/` | 重启后重建 |
-| `observations/` | **节点日志永久丢失**，run 状态不受影响 |
-
-**不可作为缓存删除**：`journal/`，包含权威事务和值字节。
-`checkpoints/` 是校验后使用的恢复加速数据，不是第二权威；缺失时可回放原 journal，
-不能用 checkpoint 替代丢失的日志段。维护前先停服务并保留原目录；不要在线删除打开的数据库文件。
+不生成 journal/checkpoints/indexes、execution-index.sqlite 或 projection.sqlite。
 
 ---
 
@@ -328,9 +283,6 @@ flow-journal-dev rebuild-projection --destination /tmp/projection-new.sqlite
 | 症状 | 原因 | 处置 |
 | --- | --- | --- |
 | 起不来：`data directory is locked` | 同目录已有写者（或上次没退干净） | `ps` 找进程；确认无存活进程后重启。**不要**手动删锁文件 |
-| 起不来：`projection cursor is ahead of authoritative journal` | journal 被回退/替换过 | **不要绕过**。确认哪个 journal 是新的；从备份恢复 |
-| 起不来：`state checkpoint boundary mismatch` | checkpoint 与段不一致 | 会自动 warn `invalid checkpoint; replaying journal` 并全量重放；若仍失败则 journal 损坏，走 §6.3 |
-| RPC 返回 `-32020 COMMITTED_NOT_VISIBLE` | 投影暂时落后 | 客户端重试。**偶发正常，持续出现说明投影器卡住**（查 `projection_error`） |
 | 写全部返回 `-32021 limit` | 在飞 run 数达 `R_MAX = 1000` | 等 run 终态；不要调大（这是主进程状态内存约束） |
 | 日志刷 `coordinator stalled: journal writer failed` | journal 写入**永久**失败 | 磁盘满/权限/IO 错误。**系统已停摆**，修磁盘后重启 |
 | run 卡在 `awaiting_resume` | 外部操作结果不明 | **设计行为**。去外部系统查明，用 `run.adjudicate` 明确告诉引擎 |
@@ -365,19 +317,10 @@ flow-cli run adjudicate --run-id <id> --node-id <n> \
 - **裁决前务必真的查过外部系统**。`retry` 是你在用运维权限覆盖「不自动重发」
   这条铁律——覆盖错了就是重复扣款。
 
-### 6.3 journal 损坏
+### 6.3 数据库损坏
 
-```
-flow-journal-tool verify --data-dir <dir>          # 定位坏在哪
-flow-journal-tool repair --data-dir <dir> --destination <new> --confirm
-```
-
-- `verify` 全量扫描 + 每个已发布值重新读回闭环；
-- `repair` **永不改原文件**，只把可恢复前缀写进新目录；
-- 然后用新目录起服务，或者从 `backup` 恢复。
-
-**半条写入的行**（`sha256` 不匹配）是预期会遇到的——崩溃正好发生在写一半时。
-系统不会猜内容，会明确报错。
+停服务、保留原库和 WAL，运行 `flow-journal-tool verify <data_dir>` 定位结构、事实或正文错误。
+从校验通过的一致备份恢复到独立目录，再启动服务。不截断原库，不自动重新发送未知副作用。
 
 ---
 
@@ -401,19 +344,18 @@ flow-journal-tool repair --data-dir <dir> --destination <new> --confirm
 
 ### 7.2 磁盘
 
-| 项 | 值 |
+| 项 | 边界 |
 | --- | --- |
-| 段文件 | 256 MiB 轮转 |
-| 单行 | ≤ 1 MiB（`MAX_LINE_BYTES`） |
-| inline 阈值 | ≤ 64 KiB（`INLINE_BYTES`） |
-| 分块 | 256 KiB（`CHUNK_BYTES`） |
-| 单值上限 | 256 MiB（`MAX_VALUE_BYTES`） |
-| checkpoint | ≤ 16 MiB |
-| 观测日志行 | ≤ 16 KiB（单行截断 8 KiB）；默认 10000 行/节点，硬上限 100000 |
+| 业务数据库 | flow.sqlite，WAL + synchronous=FULL |
+| 接受事务编码预算 | ≤1 MiB |
+| inline 阈值 | ≤64 KiB |
+| BLOB 分块 | ≤256 KiB/块，单值≤256 MiB |
+| 当前实体 | 覆盖更新，不保存永久整态版本 |
+| 历史/正文/回执 | 本次保留全部，不引入 TTL 或 GC |
+| observations | 独立的容量与条数限额 |
 
-**规划公式**：`journal 增长 ≈ Σ(节点输出 + 输入面 + 审计) × 事件膨胀`。
-审计流量通常远大于业务值——每条 `AuditBatch` 都占一条 `audit_seq`。压测用
-`flow-journal-bench` / `crates/backend-perf/` 实测，不要估算。
+容量测量分开统计当前实体、事实、BLOB、索引、WAL 和空闲页。长读和大值会影响 WAL
+回收与备份成本。checkpoint 是 SQLite WAL 维护，不再产生应用状态快照。
 
 ### 7.3 网络（remote 模式）
 
@@ -469,20 +411,10 @@ flow-journal-tool repair --data-dir <dir> --destination <new> --confirm
 
 ## 9. 升级
 
-### 9.1 v1 → v2 已完成
+### 9.1 SQLite 存储格式
 
-2026-10-10 起 JSONL v2 是唯一后端。**历史数据不做迁移，已舍弃**。
-`StorageBackend` enum 只剩 `Journal` 一个变体，`sqlite`/`postgres` 已删除。
-
-升级路径：**新起一个空的 journal 目录**，重新发布定义。不要试图搬旧数据。
-
-旧数据保全（只读，可选）：
-
-```sh
-flow-journal-dev import-legacy --source <v1 数据目录> --database <v1 sqlite>
-```
-
-产出是一个只读 baseline 目录（`LegacyImport` 事件标记），供追溯查询，不参与执行。
+本地业务库为 flow.sqlite，格式版本 1。新建空数据目录，旧 JSONL/派生库目录不自动转换，
+本次不提供历史数据迁移。完整结构与恢复契约见 [ADR 0002](adr/0002-sqlite-persistence.md)。
 
 ### 9.2 协议版本
 
@@ -502,10 +434,10 @@ v5（无 agent 上联版本门）与 v6 握手不兼容，两端都会在握手�
 ```sh
 # 1. 停服务（等优雅退出，见 §4.1）
 # 2. 备份
-flow-journal-tool backup --data-dir <dir> --destination <backup>
+flow-journal-tool backup <dir> <backup>
 # 3. 替换全部二进制（同目录！）
 # 4. 校验
-flow-journal-tool verify --data-dir <dir>
+flow-journal-tool verify <dir>
 # 5. 起服务，看启动行的 local_addr=/http_addr=
 # 6. 确认没有 run 卡在意外状态
 flow-cli run list --status awaiting_resume
@@ -520,11 +452,9 @@ flow-cli run list --status awaiting_resume
 dist/journal/run-server.sh
 
 # 维护（服务停止时）
-flow-journal-tool verify --data-dir <dir>
-flow-journal-tool backup --data-dir <dir> --destination <dst>
-flow-journal-tool repair --data-dir <dir> --destination <dst> --confirm
-flow-journal-tool rebuild-index --data-dir <dir>
-flow-journal-dev rebuild-projection --destination <new.sqlite>
+flow-journal-tool verify <dir>
+flow-journal-tool backup <dir> <dst>
+flow-journal-tool rebuild-index <dir>
 
 # 开发
 flow-journal-dev run --definition wf.json --input in.json
@@ -550,8 +480,6 @@ flow-journal-bench
      - data directory is locked → 有残留进程
 
 □ 2. 投影追平了吗？
-     - RPC 间歇 -32020 → 投影落后，重试
-     - 持续 -32020 → 投影器卡死，查 projection_error / 磁盘
 
 □ 3. 写者健康吗？
      - 日志有 "coordinator stalled: journal writer failed" → 磁盘问题，已停摆

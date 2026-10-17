@@ -10,11 +10,10 @@
 //! 文本、回执形状）逐字保持，改动仅限内部组织。
 use flow_backend::journal::{JournalBackend, JournalError};
 use flow_journal::page::{Cursor, Filter};
-use jsonrpsee::{RpcModule, types::ErrorObjectOwned};
-use serde_json::{Value, json};
+use jsonrpsee::{types::ErrorObjectOwned, RpcModule};
+use serde_json::{json, Value};
 use std::{net::SocketAddr, sync::Arc};
 
-pub const COMMITTED_NOT_VISIBLE: i32 = -32020;
 pub struct Context {
     backend: Arc<JournalBackend>,
     token: String,
@@ -25,11 +24,6 @@ pub struct Context {
 use crate::invalid;
 fn failure(error: JournalError) -> ErrorObjectOwned {
     match error {
-        JournalError::CommittedNotVisible(receipt) => ErrorObjectOwned::owned(
-            COMMITTED_NOT_VISIBLE,
-            "COMMITTED_NOT_VISIBLE",
-            Some(receipt),
-        ),
         JournalError::Journal(flow_journal::Error::Conflict(message)) => {
             ErrorObjectOwned::owned(-32012, message, None::<()>)
         }
@@ -82,7 +76,7 @@ fn view_failure(error: flow_backend::ViewError) -> ErrorObjectOwned {
         other => ErrorObjectOwned::owned(-32603, other.to_string(), None::<()>),
     }
 }
-fn projection_failure(error: impl ToString) -> ErrorObjectOwned {
+fn storage_failure(error: impl ToString) -> ErrorObjectOwned {
     if error.to_string().contains("RESPONSE_TOO_LARGE") {
         ErrorObjectOwned::owned(-32021, "RESPONSE_TOO_LARGE", None::<()>)
     } else {
@@ -698,7 +692,7 @@ async fn cluster_route(
 /// 标记（history_incomplete）。
 async fn observations_page(b: &JournalBackend, p: &Value) -> Result<Value, ErrorObjectOwned> {
     let run_id = text(p, "run_id")?.to_owned();
-    if b.projection
+    if b.store
         .get_summary("run", &run_id)
         .await
         .map_err(invalid)?
@@ -741,14 +735,14 @@ async fn snapshot_list(
     let kind = method.split('.').next().unwrap();
     let after = p["after"].as_str().unwrap_or("");
     let (lsn, values) = b
-        .projection
+        .store
         .list(
             kind,
             after,
             p["limit"].as_u64().unwrap_or(64).min(256) as usize,
         )
         .await
-        .map_err(projection_failure)?;
+        .map_err(storage_failure)?;
     Ok(json!({
         "snapshot_cursor": {"journal_id": b.journal.id(), "lsn": lsn.to_string()},
         "values": values,
@@ -770,11 +764,7 @@ async fn snapshot_get(
             _ => "workflow_id",
         },
     )?;
-    let (lsn, value) = b
-        .projection
-        .get(kind, key)
-        .await
-        .map_err(projection_failure)?;
+    let (lsn, value) = b.store.get(kind, key).await.map_err(storage_failure)?;
     Ok(json!({
         "snapshot_cursor": {"journal_id": b.journal.id(), "lsn": lsn.to_string()},
         "value": value,
@@ -789,10 +779,10 @@ async fn events_page(
 ) -> Result<Value, ErrorObjectOwned> {
     let run_id = text(p, "run_id")?.to_owned();
     let (upper, run) = b
-        .projection
+        .store
         .get_summary("run", &run_id)
         .await
-        .map_err(projection_failure)?;
+        .map_err(storage_failure)?;
     if run.is_none() {
         return Err(ErrorObjectOwned::owned(-32011, "run not found", None::<()>));
     }
@@ -902,10 +892,10 @@ async fn run_list_view(b: &JournalBackend, p: &Value) -> Result<Value, ErrorObje
 async fn events_view(b: &JournalBackend, p: &Value) -> Result<Value, ErrorObjectOwned> {
     let run_id = text(p, "run_id")?.to_owned();
     let (upper, run) = b
-        .projection
+        .store
         .get_summary("run", &run_id)
         .await
-        .map_err(projection_failure)?;
+        .map_err(storage_failure)?;
     if run.is_none() {
         return Err(ErrorObjectOwned::owned(-32011, "run not found", None::<()>));
     }
@@ -1108,11 +1098,14 @@ async fn subscribe_run_events(
         Ok(s) => s,
         Err(_) => return,
     };
-    let mut tail =
-        flow_journal::tail::TailReader::new(ctx.backend.journal.root(), ctx.backend.journal.id());
+    let mut tail = flow_journal::tail::TailReader::for_run(
+        ctx.backend.journal.root(),
+        ctx.backend.journal.id(),
+        &run_id,
+    );
     let mut scanned = 0;
     loop {
-        let (upper, row) = match ctx.backend.projection.get_summary("run", &run_id).await {
+        let (upper, row) = match ctx.backend.store.get_summary("run", &run_id).await {
             Ok(v) => v,
             Err(_) => return,
         };

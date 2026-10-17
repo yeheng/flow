@@ -1,7 +1,7 @@
 use crate::journal::{CommandReceipt, JournalBackend, JournalError};
 use flow_engine::journal_state::{DefinitionVersion, Run, RunStatus, State, WaitKind, Workflow};
 use flow_journal::{Event, EventKind};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 type Result<T> = std::result::Result<T, JournalError>;

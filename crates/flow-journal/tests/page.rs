@@ -3,7 +3,7 @@ use flow_journal::{Event, EventKind, Journal, JournalOptions, QueueClass};
 use serde_json::json;
 
 #[tokio::test]
-async fn cursor_binds_snapshot_and_empty_pages_advance() {
+async fn indexed_cursor_skips_other_runs_and_binds_the_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let journal = Journal::open(
         dir.path(),
@@ -37,7 +37,14 @@ async fn cursor_binds_snapshot_and_empty_pages_advance() {
         2,
     )
     .unwrap();
-    assert!(first.events.is_empty());
+    assert_eq!(
+        first
+            .events
+            .iter()
+            .map(|e| e.event.run_seq)
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
     let next = first.next_cursor.unwrap();
     assert!(next.next_lsn > 1);
     let mut wrong = next.clone();
@@ -60,7 +67,7 @@ async fn cursor_binds_snapshot_and_empty_pages_advance() {
         .await
         .unwrap();
     let mut next = Some(next);
-    let mut seqs = vec![];
+    let mut seqs = vec![1, 2];
     while let Some(cursor) = next {
         let p = page(
             dir.path(),

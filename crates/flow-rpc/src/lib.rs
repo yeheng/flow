@@ -14,7 +14,7 @@
 //! 节点类型目录与产品面校验（cron / 模板片段 / 密钥名）。
 //!
 //! 错误码词汇（v2 单一来源）：`-32001` unauthorized、`-32011` not found、
-//! `-32012` conflict、`-32020` COMMITTED_NOT_VISIBLE、`-32021` limit/超限、
+//! `-32012` conflict、`-32021` limit/超限、
 //! `-32602` invalid params、`-32603` internal。
 //!
 //! `-32020` 是投影病理阀：服务端在写响应前等到 `applied_lsn >= commit_lsn`

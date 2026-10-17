@@ -161,29 +161,25 @@ fn reserve_values<'a>(values: impl IntoIterator<Item = &'a StoredValue>) -> Resu
     Ok(())
 }
 
-fn workflow_summary(workflow: &JournalWorkflow) -> Result<WorkflowSummary> {
+fn workflow_summary(value: &Value) -> Result<WorkflowSummary> {
+    let workflow: JournalWorkflow = serde_json::from_value(value.clone()).map_err(internal)?;
     Ok(WorkflowSummary {
         workflow_id: workflow.workflow_id.clone(),
         name: workflow.name.clone(),
-        latest_version: workflow.versions.last_key_value().map_or(0, |(v, _)| *v) as i64,
-        published_version: workflow
-            .versions
-            .iter()
-            .rev()
-            .find(|(_, v)| v.published)
-            .map(|(v, _)| *v as i64),
+        latest_version: value["latest_version"].as_u64().unwrap_or(0) as i64,
+        published_version: value["published_version"].as_u64().map(|v| v as i64),
         created_at: parse_ts(&workflow.created_at)?,
     })
 }
 
 pub async fn list_workflows(backend: &JournalBackend) -> Result<Vec<WorkflowSummary>> {
     backend
-        .projection
+        .store
         .ordered("workflow", None, false)
         .await
         .map_err(internal)?
         .into_iter()
-        .map(|v| workflow_summary(&serde_json::from_value(v).map_err(internal)?))
+        .map(|v| workflow_summary(&v))
         .collect()
 }
 
@@ -210,7 +206,7 @@ fn run_record(root: &std::path::Path, upper: u64, run: &JournalRun) -> Result<Ru
 
 pub async fn get_run(backend: &JournalBackend, run_id: &str) -> Result<RunRecord> {
     let (_, value) = backend
-        .projection
+        .store
         .get_summary("run", run_id)
         .await
         .map_err(internal)?;
@@ -258,8 +254,8 @@ pub async fn list_runs(
     limit: i64,
 ) -> Result<Vec<RunRecord>> {
     let (_, values) = backend
-        .projection
-        .runs_page(flow_store::projection::RunsQuery {
+        .store
+        .runs_page(flow_store::store::RunsQuery {
             workflow_id,
             status,
             source,
@@ -287,7 +283,7 @@ pub async fn run_stats(backend: &JournalBackend, workflow_id: Option<&str>) -> R
     };
     let mut grouped: BTreeMap<String, WorkflowRunStats> = BTreeMap::new();
     for (workflow, status, count) in backend
-        .projection
+        .store
         .run_counts(workflow_id)
         .await
         .map_err(internal)?
@@ -367,7 +363,7 @@ pub async fn list_schedules(
     workflow_id: Option<&str>,
 ) -> Result<Vec<Schedule>> {
     backend
-        .projection
+        .store
         .ordered("schedule", workflow_id, false)
         .await
         .map_err(internal)?
@@ -381,7 +377,7 @@ pub async fn list_webhooks(
     workflow_id: Option<&str>,
 ) -> Result<Vec<Webhook>> {
     backend
-        .projection
+        .store
         .ordered("webhook", workflow_id, false)
         .await
         .map_err(internal)?
@@ -418,7 +414,7 @@ fn template_from_config(config: &Value) -> Result<NodeTemplate> {
 
 pub async fn template_list(backend: &JournalBackend) -> Result<Vec<NodeTemplateSummary>> {
     let configs = backend
-        .projection
+        .store
         .ordered("template", None, true)
         .await
         .map_err(internal)?;

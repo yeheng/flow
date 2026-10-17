@@ -300,7 +300,7 @@ async fn schedule_respects_activation_boundary_and_never_fires_early() {
 }
 
 #[tokio::test]
-async fn authenticated_commands_attach_and_report_projection_timeout() {
+async fn authenticated_commands_attach_and_are_atomically_visible() {
     let root = std::env::temp_dir().join(format!("flow-v2-rpc-{}", uuid::Uuid::now_v7()));
     let backend = JournalBackend::open(&root, Default::default())
         .await
@@ -310,14 +310,10 @@ async fn authenticated_commands_attach_and_report_projection_timeout() {
     let denied = call(&module, "workflow.create", json!({"name":"test"})).await;
     assert_eq!(denied["error"]["code"], -32001);
     assert!(backend.state().await.workflows.is_empty());
-    backend.pause_projection(true);
     let params = json!({"_token":token,"name":"test","request_id":"same"});
     let first = call(&module, "workflow.create", params.clone()).await;
-    assert_eq!(
-        first["error"]["code"],
-        flow_rpc::journal_v2::COMMITTED_NOT_VISIBLE
-    );
-    let receipt = &first["error"]["data"];
+    let receipt = &first["result"];
+    assert_eq!(receipt["visible"], true);
     assert_eq!(receipt["committed"], true);
     let status = call(
         &module,
@@ -326,7 +322,6 @@ async fn authenticated_commands_attach_and_report_projection_timeout() {
     )
     .await;
     assert_eq!(status["result"]["commit_cursor"], receipt["commit_cursor"]);
-    backend.pause_projection(false);
     let duplicate = call(&module, "workflow.create", params).await;
     assert_eq!(
         duplicate["result"]["commit_cursor"],
@@ -618,7 +613,7 @@ async fn product_crud_replays_receipts_and_rejects_changed_arguments() {
 }
 
 #[tokio::test]
-async fn product_creation_reports_commit_during_projection_delay() {
+async fn product_creation_is_visible_in_the_commit_receipt() {
     let root = flow_test_support::io::TempDir::new("v2-product-projection-delay");
     let backend = JournalBackend::open(root.path(), Default::default())
         .await
@@ -631,16 +626,11 @@ async fn product_creation_reports_commit_during_projection_delay() {
         .unwrap()
         .result["workflow_id"]
         .clone();
-    backend.pause_projection(true);
     let args =
         json!({"_token":token,"request_id":"stable","workflow_id":workflow,"cron":"* * * * *"});
     let response = call(&module, "schedule.create", args.clone()).await;
-    assert_eq!(
-        response["error"]["code"],
-        flow_rpc::journal_v2::COMMITTED_NOT_VISIBLE,
-        "{response}"
-    );
-    let original = response["error"]["data"].clone();
+    let original = response["result"].clone();
+    assert_eq!(original["visible"], true);
     assert_eq!(original["committed"], true);
     assert_eq!(original["request_id"], "stable");
     let status = call(
@@ -650,7 +640,6 @@ async fn product_creation_reports_commit_during_projection_delay() {
     )
     .await;
     assert_eq!(status["result"], original);
-    backend.pause_projection(false);
     let retry = call(&module, "schedule.create", args).await;
     assert_eq!(retry["result"]["commit_cursor"], original["commit_cursor"]);
     assert_eq!(retry["result"]["result"], original["result"]);

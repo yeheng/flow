@@ -11,7 +11,7 @@ use flow_engine::journal_state::{Node as NodeState, NodeStatus, Run, RunStatus, 
 use flow_engine::{Definition, NodeLogger, NodeType};
 use flow_journal::{Event, EventKind, StoredValue};
 use futures::FutureExt;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -1048,11 +1048,9 @@ mod regression_tests {
         let backend = JournalBackend::open(root.path(), Default::default())
             .await
             .unwrap();
-        // T7：unix 走 IPC，节点定义要进控制帧且受 `CONTROL_MAX_FRAME/2`（32KiB）
-        // 预检——旧用例的 128KiB 脚本体会被干净拒绝（进程内没有这条边界）。
-        // 失败注入点改放在**定义体积**上：只有超过 INLINE_BYTES 的值才落分块
-        // 存储（root/journal 值目录），把该目录临时挪走才会让 materialize 失败。
-        // 节点本身保持小体积，留在帧预算内。
+        // The definition is a BLOB reference while each executable node stays small.
+        // Temporarily corrupt only its bytes: current-state queries and writer admission
+        // remain available, but materialization must fail and later retry without a command.
         let id = install(
             &backend,
             json!({
@@ -1062,17 +1060,38 @@ mod regression_tests {
             }),
         )
         .await;
-        let path = root.path().join("journal");
-        let hidden = root.path().join("temporarily-unavailable");
-        std::fs::rename(&path, &hidden).unwrap();
+        use sqlx::Row as _;
+        let pool = sqlx::SqlitePool::connect(&format!(
+            "sqlite://{}",
+            root.path().join("flow.sqlite").display()
+        ))
+        .await
+        .unwrap();
+        let row = sqlx::query(
+            "SELECT output_id,chunk_index,bytes FROM value_chunks ORDER BY lsn LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let output: String = row.get("output_id");
+        let chunk: i64 = row.get("chunk_index");
+        let bytes: Vec<u8> = row.get("bytes");
+        sqlx::query("UPDATE value_chunks SET bytes=zeroblob(length(bytes)) WHERE output_id=? AND chunk_index=?").bind(&output).bind(chunk).execute(&pool).await.unwrap();
         start_local(&backend, 16).await;
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(
             backend.state().await.runs[&id].nodes.is_empty(),
-            "hidden-journal nodes: {:?}",
+            "unavailable-definition nodes: {:?}",
             backend.state().await.runs[&id].nodes
         );
-        std::fs::rename(&hidden, &path).unwrap();
+        sqlx::query("UPDATE value_chunks SET bytes=? WHERE output_id=? AND chunk_index=?")
+            .bind(bytes)
+            .bind(output)
+            .bind(chunk)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
         let run = terminal(&backend, &id).await;
         assert_eq!(run.status, RunStatus::Succeeded, "run={run:?}");
         backend.close().await.unwrap();

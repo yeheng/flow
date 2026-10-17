@@ -6,7 +6,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 #[cfg(unix)]
 #[tokio::test]
-async fn termination_signals_checkpoint_and_exit_cleanly() {
+async fn termination_signals_commit_and_exit_cleanly() {
     use backend_e2e::common::wire as common;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -44,18 +44,17 @@ async fn termination_signals_checkpoint_and_exit_cleanly() {
             assert!(Instant::now() < deadline, "shutdown timed out");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(root.join("checkpoints/latest.json").is_file());
+        assert!(root.join("flow.sqlite").is_file());
+        assert!(!root.join("checkpoints").exists());
         let backend = JournalBackend::open(&root, Default::default())
             .await
             .unwrap();
-        assert!(
-            backend
-                .full_state()
-                .await
-                .unwrap()
-                .workflows
-                .contains_key(created["workflow_id"].as_str().unwrap())
-        );
+        assert!(backend
+            .full_state()
+            .await
+            .unwrap()
+            .workflows
+            .contains_key(created["workflow_id"].as_str().unwrap()));
         backend.close().await.unwrap();
     }
 }
@@ -81,20 +80,18 @@ async fn evicted_request_identity_keeps_original_receipt() {
             .collect();
         b.append(events).await.unwrap();
     }
-    assert!(
-        b.command_status("workflow.create", "stable-id")
-            .await
-            .unwrap()
-            .is_some()
-    );
+    assert!(b
+        .command_status("workflow.create", "stable-id")
+        .await
+        .unwrap()
+        .is_some());
     let second = b.workflow_create("once", Some("stable-id")).await.unwrap();
     assert_eq!(first.result, second.result);
     assert_eq!(first.commit_cursor, second.commit_cursor);
-    assert!(
-        b.workflow_create("different", Some("stable-id"))
-            .await
-            .is_err()
-    );
+    assert!(b
+        .workflow_create("different", Some("stable-id"))
+        .await
+        .is_err());
     b.close().await.unwrap();
     drop(b);
     for file in [
@@ -117,7 +114,7 @@ async fn evicted_request_identity_keeps_original_receipt() {
 }
 
 #[tokio::test]
-async fn stream_progress_replays_from_an_older_checkpoint() {
+async fn stream_progress_restores_from_current_sqlite_state() {
     let dir = tempfile::tempdir().unwrap();
     let b = JournalBackend::open(dir.path(), Default::default())
         .await
@@ -130,7 +127,6 @@ async fn stream_progress_replays_from_an_older_checkpoint() {
     };
     b.append(vec![chunk(0)]).await.unwrap();
     b.checkpoint().await.unwrap();
-    let checkpoint = std::fs::read(dir.path().join("checkpoints/latest.json")).unwrap();
     b.append(vec![chunk(1)]).await.unwrap();
     let value = flow_journal::ValueRef {
         journal_id: b.journal.id().into(),
@@ -149,7 +145,6 @@ async fn stream_progress_replays_from_an_older_checkpoint() {
     .unwrap();
     b.close().await.unwrap();
     drop(b);
-    std::fs::write(dir.path().join("checkpoints/latest.json"), checkpoint).unwrap();
     let b = JournalBackend::open(dir.path(), Default::default())
         .await
         .unwrap();
@@ -167,50 +162,29 @@ async fn stream_progress_replays_from_an_older_checkpoint() {
 }
 
 #[tokio::test]
-async fn bulk_restore_rejects_corrupt_history_atomically() {
-    use flow_store::projection::{ProjectedRow, Projector};
+async fn current_state_corruption_is_rejected_without_replaying_or_repairing() {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("history.db");
-    let index = Projector::open(&source, "j").await.unwrap();
-    let body = json!({"name":"original"});
-    let key = serde_json::to_string(&(
-        "workflow",
-        "w",
-        format!("{:020}", 1),
-        flow_journal::codec::digest(body.to_string().as_bytes()),
-    ))
-    .unwrap();
-    index
-        .apply(
-            "j",
-            1,
-            vec![ProjectedRow {
-                kind: "history".into(),
-                key,
-                value: Some(body),
-            }],
-        )
+    let b = JournalBackend::open(dir.path(), Default::default())
         .await
         .unwrap();
+    b.workflow_create("original", None).await.unwrap();
+    b.close().await.unwrap();
+    drop(b);
+    let path = dir.path().join("flow.sqlite");
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
-        .connect_with(SqliteConnectOptions::new().filename(&source))
+        .connect_with(SqliteConnectOptions::new().filename(&path))
         .await
         .unwrap();
-    sqlx::query(r#"UPDATE journal_entities SET body='{"name":"corrupted"}' WHERE kind='history'"#)
+    sqlx::query(r#"UPDATE current_entities SET body='{"name":"corrupted"}' WHERE kind='workflow'"#)
         .execute(&pool)
         .await
         .unwrap();
-    assert!(index.history_at("workflow", "w", 1).await.is_err());
-    let target = Projector::open(&dir.path().join("projection.db"), "j")
-        .await
-        .unwrap();
-    assert!(target.restore_history(&source, 1).await.is_err());
-    assert_eq!(target.applied_lsn().await.unwrap(), 0);
-    assert!(target.get("workflow", "w").await.unwrap().1.is_none());
-    target.close().await;
     pool.close().await;
-    index.close().await;
+    assert!(JournalBackend::open(dir.path(), Default::default())
+        .await
+        .is_err());
+    assert!(flow_journal::maintenance::verify(dir.path()).is_err());
 }
 
 #[tokio::test]

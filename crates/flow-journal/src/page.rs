@@ -1,11 +1,8 @@
-use std::fs::File;
-use std::io::{BufReader, Seek, SeekFrom};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::codec::{self, Event, EventKind};
-use crate::storage::segment_path;
 use crate::{invalid, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,10 +23,6 @@ pub struct Cursor {
     pub upper_lsn: u64,
     #[serde(with = "crate::decimal")]
     pub next_lsn: u64,
-    #[serde(with = "crate::decimal")]
-    pub segment: u64,
-    #[serde(with = "crate::decimal")]
-    pub offset: u64,
     pub event_index: usize,
 }
 impl Cursor {
@@ -41,8 +34,6 @@ impl Cursor {
             filter,
             upper_lsn,
             next_lsn: 1,
-            segment: 1,
-            offset: 0,
             event_index: 0,
         }
     }
@@ -85,7 +76,6 @@ pub fn page(
         || cursor.filter != filter
         || cursor.upper_lsn > durable_lsn
         || cursor.next_lsn == 0
-        || cursor.segment == 0
         || limit == 0
     {
         return Err(invalid("cursor binding/boundary mismatch"));
@@ -96,10 +86,37 @@ pub fn page(
     };
     let mut events = Vec::new();
     let mut bytes = 2048;
-    let mut file = File::open(segment_path(root, cursor.segment))?;
-    file.seek(SeekFrom::Start(cursor.offset))?;
-    let mut reader = BufReader::new(file);
-    for _ in 0..1024 {
+    let conn = crate::sqlite::read_connection(root)?;
+    if crate::sqlite::metadata(&conn)?.0 != journal_id {
+        return Err(invalid("foreign dataset"));
+    }
+    // Seek directly to this run's next fact, rather than scanning other runs.
+    let predicate = match filter {
+        Filter::All => "",
+        Filter::Events => " AND run_event=1",
+        Filter::Audit => " AND audit_event=1",
+    };
+    let sql=format!("SELECT DISTINCT lsn FROM events WHERE run_id=? AND lsn>=? AND lsn<=?{predicate} ORDER BY lsn LIMIT 1024");
+    let mut statement = conn.prepare(&sql).map_err(crate::sqlite::db)?;
+    let lsns = statement
+        .query_map(
+            rusqlite::params![
+                run_id,
+                format!("{:020}", cursor.next_lsn),
+                format!("{:020}", cursor.upper_lsn)
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(crate::sqlite::db)?;
+    for lsn in lsns {
+        let lsn: u64 = lsn
+            .map_err(crate::sqlite::db)?
+            .parse()
+            .map_err(|_| invalid("invalid fact sequence"))?;
+        if lsn != cursor.next_lsn {
+            cursor.event_index = 0;
+        }
+        cursor.next_lsn = lsn;
         if cursor.next_lsn > cursor.upper_lsn {
             return Ok(Page {
                 events,
@@ -107,9 +124,7 @@ pub fn page(
                 snapshot_cursor,
             });
         }
-        let line = codec::read_line(&mut reader)?
-            .ok_or_else(|| invalid("cursor points past available segment"))?;
-        let tx = codec::decode(&line)?;
+        let tx = crate::sqlite::transaction(&conn, journal_id, lsn)?;
         if tx.journal_id != journal_id
             || tx.lsn != cursor.next_lsn
             || cursor.event_index >= tx.events.len()
@@ -146,14 +161,20 @@ pub fn page(
         }
         cursor.event_index = 0;
         cursor.next_lsn += 1;
-        cursor.offset += line.len() as u64;
-        if tx.events[0].kind == EventKind::SegmentSealed && cursor.next_lsn <= cursor.upper_lsn {
-            cursor.segment += 1;
-            cursor.offset = 0;
-            reader = BufReader::new(File::open(segment_path(root, cursor.segment))?);
-        }
     }
-    let next_cursor = (cursor.next_lsn <= cursor.upper_lsn).then_some(cursor);
+    // A bounded seek may end before the upper watermark. Check for another run fact.
+    let more: bool = conn
+        .query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM events WHERE run_id=? AND lsn>=? AND lsn<=?{predicate})"),
+            rusqlite::params![
+                run_id,
+                format!("{:020}", cursor.next_lsn),
+                format!("{:020}", cursor.upper_lsn)
+            ],
+            |r| r.get(0),
+        )
+        .map_err(crate::sqlite::db)?;
+    let next_cursor = more.then_some(cursor);
     Ok(Page {
         events,
         next_cursor,

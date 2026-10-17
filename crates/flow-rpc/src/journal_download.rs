@@ -102,7 +102,7 @@ fn historical_reference(
     id: &str,
     upper: u64,
 ) -> flow_journal::Result<Option<ValueRef>> {
-    let mut tail = flow_journal::tail::TailReader::new(root, journal);
+    let mut tail = flow_journal::tail::TailReader::for_run(root, journal, run);
     while let Some((tx, _)) = tail.next(upper)? {
         for event in tx.events {
             if event.run_id.as_deref() == Some(run) {
@@ -155,7 +155,7 @@ async fn download(
         Ok(p) => p,
         Err(_) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
     };
-    let (upper, row) = match state.backend.projection.get_execution(&run_id).await {
+    let (upper, row) = match state.backend.store.get_execution(&run_id).await {
         Ok(v) => v,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };

@@ -1,7 +1,6 @@
 use flow_journal::value::{read_value, store_stream, ValueCodec};
 use flow_journal::{Event, EventKind, Journal, JournalOptions, QueueClass};
 use serde_json::json;
-use std::io::{Read, Seek, SeekFrom, Write};
 
 #[tokio::test]
 async fn addressed_reads_skip_unrelated_history_and_validate_own_bytes() {
@@ -28,21 +27,20 @@ async fn addressed_reads_skip_unrelated_history_and_validate_own_bytes() {
     let mut out = Vec::new();
     read_value(dir.path(), upper, &value, true, &mut out).unwrap();
     assert_eq!(out, bytes);
-    // Damage a different transaction after indexing. An addressed read must not
-    // parse it again; the explicit whole-journal verifier must still notice it.
-    let path = flow_journal::storage::segment_path(dir.path(), unrelated.location.segment);
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
+    // A value read uses its BLOB index, not a scan of unrelated accepted facts.
+    let conn = rusqlite::Connection::open(dir.path().join("flow.sqlite")).unwrap();
+    let original: String = conn
+        .query_row(
+            "SELECT body FROM events WHERE lsn=?",
+            [format!("{:020}", unrelated.transaction.lsn)],
+            |r| r.get(0),
+        )
         .unwrap();
-    file.seek(SeekFrom::Start(unrelated.location.offset + 20))
-        .unwrap();
-    let mut original = [0];
-    file.read_exact(&mut original).unwrap();
-    file.seek(SeekFrom::Start(unrelated.location.offset + 20))
-        .unwrap();
-    file.write_all(&[original[0] ^ 1]).unwrap();
+    conn.execute(
+        "UPDATE events SET body='{}' WHERE lsn=?",
+        [format!("{:020}", unrelated.transaction.lsn)],
+    )
+    .unwrap();
     let mut addressed = Vec::new();
     read_value(dir.path(), upper, &value, true, &mut addressed).unwrap();
     assert_eq!(addressed, bytes);
@@ -54,19 +52,18 @@ async fn addressed_reads_skip_unrelated_history_and_validate_own_bytes() {
     wrong.digest = "0".repeat(64);
     assert!(read_value(dir.path(), upper, &wrong, true, &mut std::io::sink()).is_err());
     assert!(read_value(dir.path(), upper - 1, &value, true, &mut std::io::sink()).is_err());
-    file.seek(SeekFrom::Start(unrelated.location.offset + 20))
-        .unwrap();
-    file.write_all(&original).unwrap();
+    conn.execute(
+        "UPDATE events SET body=? WHERE lsn=?",
+        rusqlite::params![original, format!("{:020}", unrelated.transaction.lsn)],
+    )
+    .unwrap();
     journal.close().await.unwrap();
 }
 
 #[tokio::test]
-async fn missing_addresses_rebuild_and_rotation_survives_reopen() {
+async fn blob_reads_need_no_external_address_cache_and_survive_reopen() {
     let dir = tempfile::tempdir().unwrap();
-    let options = JournalOptions {
-        segment_bytes: 4096,
-        ..Default::default()
-    };
+    let options = JournalOptions::default();
     let journal = Journal::open(dir.path(), options.clone()).await.unwrap();
     let bytes = vec![b'a'; 800_000];
     let value = store_stream(&journal, &mut bytes.as_slice(), ValueCodec::Bytes)
@@ -74,7 +71,7 @@ async fn missing_addresses_rebuild_and_rotation_survives_reopen() {
         .unwrap();
     let upper = journal.durable_lsn();
     read_value(dir.path(), upper, &value, true, &mut std::io::sink()).unwrap();
-    std::fs::remove_dir_all(dir.path().join("indexes/value-addresses")).unwrap();
+    assert!(!dir.path().join("indexes").exists());
     let mut out = Vec::new();
     read_value(dir.path(), upper, &value, true, &mut out).unwrap();
     assert_eq!(out, bytes);

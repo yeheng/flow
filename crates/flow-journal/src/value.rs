@@ -2,15 +2,15 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::Path;
 
-use base64::{Engine, engine::general_purpose::STANDARD};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use serde_json::ser::Formatter as _;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::codec::{Event, EventKind, bounded_json};
+use crate::codec::{bounded_json, Event, EventKind};
 use crate::{
-    CHUNK_BYTES, Error, INLINE_BYTES, Journal, MAX_VALUE_BYTES, QueueClass, Result, invalid,
+    invalid, Error, Journal, QueueClass, Result, CHUNK_BYTES, INLINE_BYTES, MAX_VALUE_BYTES,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -366,54 +366,60 @@ pub fn read_value(
     out: &mut impl Write,
 ) -> Result<()> {
     value.validate()?;
+    let conn = crate::sqlite::read_connection(root)?;
+    conn.execute_batch("BEGIN").map_err(crate::sqlite::db)?;
+    let (identity, durable) = crate::sqlite::metadata(&conn)?;
+    if identity != value.journal_id || upper_lsn > durable {
+        return Err(invalid("foreign value dataset/boundary"));
+    }
+    let publication = crate::sqlite::entity(&conn, "published", &value.output_id)?;
+    let published = if let Some(record) = publication {
+        let lsn = record["lsn"]
+            .as_str()
+            .and_then(|n| n.parse::<u64>().ok())
+            .ok_or_else(|| invalid("invalid publication sequence"))?;
+        if lsn <= upper_lsn {
+            if serde_json::from_value::<ValueRef>(record["value"].clone())? != *value {
+                return Err(invalid("mismatched publication"));
+            }
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if require_published && !published {
+        return Err(invalid("value is not published"));
+    }
     let mut index = 0;
     let mut total = 0;
     let mut hash = Sha256::new();
-    let mut published = false;
-    for location in crate::address::locations(root, upper_lsn, &value.journal_id, &value.output_id)?
-    {
-        let location = location?;
-        let tx = crate::codec::decode(&crate::maintenance::read_location(root, &location)?)?;
-        if tx.journal_id != value.journal_id {
-            return Err(invalid("foreign value journal"));
+    let mut statement=conn.prepare("SELECT chunk_index,bytes,digest FROM value_chunks WHERE output_id=? AND lsn<=? ORDER BY chunk_index").map_err(crate::sqlite::db)?;
+    let mut rows = statement
+        .query(rusqlite::params![
+            value.output_id,
+            format!("{upper_lsn:020}")
+        ])
+        .map_err(crate::sqlite::db)?;
+    while let Some(row) = rows.next().map_err(crate::sqlite::db)? {
+        let chunk_index: u64 = row.get(0).map_err(crate::sqlite::db)?;
+        let bytes: Vec<u8> = row.get(1).map_err(crate::sqlite::db)?;
+        let digest: String = row.get(2).map_err(crate::sqlite::db)?;
+        if chunk_index != index
+            || bytes.is_empty()
+            || bytes.len() > CHUNK_BYTES
+            || crate::codec::digest(&bytes) != digest
+        {
+            return Err(invalid("non-contiguous or corrupt chunk"));
         }
-        for event in &tx.events {
-            if event.kind == EventKind::ValueChunk
-                && event.payload.get("output_id").and_then(Value::as_str)
-                    == Some(value.output_id.as_str())
-            {
-                if published {
-                    return Err(invalid("chunk after publication"));
-                }
-                let chunk: Chunk = serde_json::from_value(event.payload.clone())?;
-                if chunk.chunk_index != index {
-                    return Err(invalid("non-contiguous or duplicate chunk"));
-                }
-                let bytes = chunk.decode()?;
-                total += bytes.len() as u64;
-                if total > value.total_bytes {
-                    return Err(invalid("value length exceeds descriptor"));
-                }
-                hash.update(&bytes);
-                out.write_all(&bytes)?;
-                index += 1;
-            }
-            if event.kind == EventKind::ValuePublished
-                && event.payload.get("output_id").and_then(Value::as_str)
-                    == Some(value.output_id.as_str())
-            {
-                let descriptor: ValueRef = serde_json::from_value(event.payload.clone())?;
-                if descriptor != *value
-                    || published
-                    || index != value.chunk_count
-                    || total != value.total_bytes
-                    || hex::encode(hash.clone().finalize()) != value.digest
-                {
-                    return Err(invalid("invalid value publication"));
-                }
-                published = true;
-            }
+        total += bytes.len() as u64;
+        if total > value.total_bytes {
+            return Err(invalid("value length exceeds descriptor"));
         }
+        hash.update(&bytes);
+        out.write_all(&bytes)?;
+        index += 1;
     }
     if index != value.chunk_count
         || total != value.total_bytes

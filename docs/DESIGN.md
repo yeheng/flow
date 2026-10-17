@@ -1,12 +1,12 @@
 # flow 工作流引擎设计文档
 
-> 状态：**当前工作区代码的实际语义**（2026-10-13）。本文描述工作区实现，不保留
+> 状态：**当前工作区代码的实际语义**（2026-10-17）。本文描述工作区实现，不保留
 > 历史设计记录；被删除的 v1（SQLite/Postgres 双后端、Driver/Engine/fold 事件面、
 > `run_tail`、NodeSlot 状态机）相关内容已不在本文件中。
 >
-> 当前优先固化[单机 journal 基线](adr/0002-single-machine-journal-baseline.md)
-> （2026-10-16）。执行协议使用 v5 postcard 单流；此前“工作区无法编译”的说明已过时。
-> 集群复制方案仅为未来草案，不属于当前单机承诺。
+> 本地持久化采用 [SQLite 数据结构与提交协议](adr/0002-sqlite-persistence.md)。
+> `flow.sqlite` 同事务保存接受事实、当前状态、回执和待处理动作；不迁移旧数据。
+> 计算扩容不提供 master 高可用。
 >
 > **部署与运维见 [OPS.md](OPS.md)**（部署形态、执行模式、启动重启终止、离线维护、
 > 升级、故障处置、容量预算与安全边界）；本文只描述语义与结构。
@@ -27,7 +27,7 @@
 
 | # | 抉择 | 目的（不这样做的代价） |
 | --- | --- | --- |
-| **C1** | **JSONL journal 是唯一权威，SQLite 只是可随时删除重建的投影** | 若数据库是权威，崩溃恢复就要依赖「DB 与副作用一致」这个无法验证的假设。改成日志权威后，执行状态永远可以从完整字节链重建，投影损坏/丢失只影响查询性能，不影响正确性。代价是写路径多一次 fsync，且查询面必须容忍投影落后（`-32020` 回执）。 |
+| **C1** | **SQLite 是唯一业务权威，事实与当前状态同事务提交** | 减少应用自行维护的分段、索引追赶、快照与恢复协议；外部副作用仍由授权、未决状态和人工裁决约束。数据库事务不等于外部操作恰好一次。 |
 | **C2** | **节点执行语义只存在于 `flow-executor` 子进程；master 只做裁决与调度** | 工作流定义事实上是可执行代码（任意 JS + 任意出站 HTTP）。若在主进程内执行，一个失控脚本就能拖垮权威写者、让整个 journal 不可用。进程隔离把「用户代码」与「权威状态」分成两个故障域。进程内执行路径已全平台删除（`ExecutionMode` 只剩 `Ipc`）。 |
 | **C3** | **外部副作用发生前，意图必须先落盘**（`OperationIntent` + `OperationAuthorized` 同一事务） | 崩溃窗口的本质困难是「请求发出去了吗？」。只有把「我要发这个请求」变成 journal 事实，恢复期才能区分「从未发出」（可安全重试）与「已授权、结果未知」（必须人工裁决）。没有这个事实，任何自动重试都是赌博。 |
 | **C4** | **结果不明的已授权外部操作，绝不自动重发；挂起等人工裁决** | 自动重试会把「至少一次」悄悄变成「可能多次」，而重复扣款/重复发信比失败更难收拾。系统选择**响亮地停下来**（run 进 `awaiting_resume`）而不是安静地猜。人工 `run.adjudicate` 就是授权凭据。 |
@@ -39,19 +39,18 @@
 
 1. **没有事实就没有决策**：协调器的每一次状态迁移都必须落到一条 journal 事件上
    （`journal_driver::advance_run` → `backend.internal(...)`）。内存里的推断只是
-   缓存，崩溃后以日志重放为准。
+   缓存，崩溃后以 SQLite 已提交状态为准。
 2. **不知道就不动**：`uncertain` 是唯一允许的「停下来」状态，它属于**平台故障面**
    （IO/断链/崩溃），不属于工作流失败面。二者绝不互相冒充（§13.3）。
-3. **派生状态可重建**：停服务后可移走 `projection.sqlite`、`execution-index.sqlite`
-   和 `indexes/`，再由 journal 重建。`observations/` 是独立观测日志，删除后不能重建；
-   它不参与业务状态裁决。
+3. **同一提交决定**：事实、当前状态、永久回执与后续动作一起提交到 `flow.sqlite`。
+   该库及其活跃 WAL 不可作为缓存删除。`observations/` 独立且可丢弃，不参与业务裁决。
 
 ---
 
 ## 1. 定位、目标与非目标
 
 flow 是一个**工作流执行引擎**：发布不可变的流程定义（DAG），以 run 为单位执行，
-进程崩溃后从完整的磁盘日志恢复。日志丢失或损坏时隔离并报告错误，不猜测副作用。
+进程崩溃后从 SQLite 当前状态恢复。数据库损坏时隔离并报告错误，不猜测副作用。
 
 **已实现的产品面**：`web/`（Vue 3 + @vue-flow 画布，直连本服务 JSON-RPC WebSocket）、
 `flow-cli`（纯 RPC 命令行）、Tauri 桌面内嵌服务（进程内调用同一 RPC 模块）。
@@ -73,10 +72,10 @@ flow 是一个**工作流执行引擎**：发布不可变的流程定义（DAG�
 crates/
   flow-dto        领域 DTO 与状态词汇表（零依赖叶子）：RunRecord / WorkflowSummary / …
   flow-config     统一配置（flow.toml，叶子 crate）：分层加载 + validate + 原子写回
-  flow-journal    JSONL journal 库（叶子）：事务日志、分页、codec 预算、值存储、离线维护
+  flow-journal    SQLite 写入 owner、事实分页、codec 预算、BLOB 值存储、离线维护
   flow-engine     执行引擎共享能力：定义模型与校验、JS 沙箱、表达式/模板、
                   journal_state（run 状态折叠）、观测日志、密钥、执行协议（v5 postcard 单流）
-  flow-store      SQLite 投影层（可随时重建，非权威）
+  flow-store      同一 SQLite 库的只读执行与产品查询
   flow-backend    journal 唯一权威后端：journal.rs（JournalBackend）+ journal_commands
                   （产品 CRUD，request_id 幂等）+ journal_views（物化读面）+
                   journal_driver（协调循环）+ journal_execution（Attempt 簿记）+
@@ -96,20 +95,20 @@ crates/
 
 | bin | 所属 crate | 职责 |
 | --- | --- | --- |
-| `flow-journal-server` | flow-rpc | JSONL v2 产品服务（WS RPC + cron + webhook + 下载） |
+| `flow-journal-server` | flow-rpc | SQLite 产品服务（WS RPC + cron + webhook + 下载） |
 | `flow-cli` | flow-cli | 命令行客户端（纯 RPC） |
 | `flow-executor` | flow-executor | 受管理执行子进程（通道 FD 经 argv `--channel-fd` 传递） |
 | `flow-agent` | flow-agent | 受信任远程执行中继 |
-| `flow-journal-tool` | flow-journal | journal 离线维护（verify/rebuild-index/backup/repair） |
+| `flow-journal-tool` | flow-journal | journal 离线维护（verify/rebuild-index/backup） |
 | `flow-journal-bench` | flow-journal | journal 写入基准 |
-| `flow-journal-dev` | flow-backend | 开发运行器（run/resume/status/import-legacy/rebuild-projection） |
+| `flow-journal-dev` | flow-backend | 开发运行器（run/resume/status/import-legacy） |
 
 依赖方向（与 Cargo.toml 对齐的现状）：
 
 ```
 flow-rpc ──> flow-backend ──> flow-engine ──> flow-dto
            ├─> flow-journal  （v2 值分页/下载）
-           └─> flow-store    （SQLite 投影）
+           └─> flow-store    （同库只读查询）
 flow-backend ──> flow-journal / flow-dto / flow-store
               └─> [dev-dependencies] flow-agent
 flow-engine ──> flow-dto
@@ -138,8 +137,8 @@ graph TB
         BE["JournalBackend<br/>flow-backend"]
         COORD["协调循环<br/>journal_driver::Coordinator"]
         W["Journal 写者线程<br/>flow-journal::Journal"]
-        PROJ["SQLite 投影<br/>flow-store::Projector"]
-        DISK[("data_dir/<br/>journal/NNNNNNNN.jsonl")]
+        PROJ["同库只读查询<br/>flow-store::store::Store"]
+        DISK[("data_dir/flow.sqlite<br/>事实 + 当前状态 + 回执 + BLOB")]
     end
 
     subgraph L3["链路 3：执行面（v5 postcard 单流 IPC）"]
@@ -156,8 +155,8 @@ graph TB
     BE --> COORD
     BE --> W
     BE --> PROJ
-    W -->|"fsync 组提交"| DISK
-    PROJ -.->|"可随时删除重建"| DISK
+    W -->|"WAL + FULL 事务提交"| DISK
+    PROJ -->|"一致快照读取"| DISK
 
     COORD -->|"ipc 模式"| POOL
     COORD -->|"remote 模式"| AM
@@ -181,8 +180,7 @@ graph TB
    `TransferChunk`/`AuditBatch`/`ObservabilityBatch`/`Routed` 四类放宽到
    `DATA_MAX_FRAME`（1 MiB），其余收紧到 `CONTROL_MAX_FRAME`（128 KiB）。
    v4 的 JSON 信封、三种帧 kind、十进制字符串戒律与 `Channel` 概念已随 v4 删除。
-4. 服务端在写 RPC 响应前等到 `projected_lsn >= commit_lsn`；`-32020` 只作投影
-   病理阀，健康路径永不触发，客户端零恢复逻辑。
+4. 写响应在 SQLite COMMIT 后返回，状态与回执已同时可见，没有异步投影追赶。
 5. 本地 IPC 承载按平台选择，对上层透明：unix 用 socketpair，通道 FD 原号经 argv
    `--channel-fd <N>` 传给执行器（`pre_exec` 只关闭其余继承 FD，不做 dup2 落位）；
    Windows 及其余平台用 **TCP loopback 回连**（父进程 bind `127.0.0.1:0`，执行器按
@@ -210,35 +208,24 @@ graph TB
 
 ---
 
-## 3. 权威数据模型：journal 是唯一真相
+## 3. 权威数据模型：一个业务数据库
 
-这是 C1 的落地。**磁盘上的 JSONL 段链是 run 执行状态的唯一权威**，SQLite 只是
-可随时删除重建的查询索引。
+结构、生命周期与验收的完整决定见 [ADR 0002](adr/0002-sqlite-persistence.md)。
 
 ### 3.1 事务、事件与 LSN
 
-一行一个**事务**（不是事件）：
+- `Transaction { v: 2, journal_id, lsn, tx_id, events: Vec<Event> }`。
+- `Event { v: 1, kind, run_id?, run_seq, dispatch_id?, node_id?, audit_seq, payload }`。
+- 首次业务提交为 LSN 1；提交序号由唯一写者分配，失败事务不占序号。
+- 事实存为 transactions/events 关系记录；保存完整事务摘要并在读取事实时校验。
+- JSONL envelope 仅用于显式导出及编码检查，不再是磁盘权威格式。
+- `lsn` 是事务序号，`run_seq` 是 run 内业务序号，`audit_seq` 是 dispatch 内审计序号。
 
-```
-{"data": <Transaction JSON 原文字节>, "sha256": <这些字节的十六进制摘要>}\n
-```
-
-- `Transaction { v: 2, journal_id, lsn, tx_id, events: Vec<Event> }`
-- `Event { v: 1, kind, run_id?, run_seq, dispatch_id?, node_id?, audit_seq, payload }`
-- `lsn` 是**全局无缺口计数器**，跨段连续；第一条 `SegmentStarted` 是 LSN 1。
-  LSN 由写者线程在落盘前分配，调用方提交时带的是占位值 `u64::MAX`。
-- `sha256` 覆盖 `data` 的**原文字节**（借用 `&RawValue`，不重新序列化），因此
-  非规范空格的旧行照样校验通过。
-- 三种序号分工明确，不得互代：
-  - `lsn`——事务全局序号（权威游标）；
-  - `run_seq`——run 内业务事件序号（`run.events.view` / 订阅 control 模式用它过滤）；
-  - `audit_seq`——dispatch 内审计事件序号（审计屏障与去重靠它）。
-
-### 3.2 事件全集（31 种）
+### 3.2 领域事件
 
 | 事件 | 归属 | 语义 |
 | --- | --- | --- |
-| `SegmentStarted` / `SegmentSealed` | 结构 | 写者自有；调用方提交即被拒（`structural events are writer-owned`） |
+| `SegmentStarted` / `SegmentSealed` | 保留编码枚举 | SQLite 不生成分段事件，外部提交仍拒绝 |
 | `Command` | 命令 | 写命令回执落账（scope / request_id / fingerprint / result / lsn） |
 | `WorkflowCreated` / `WorkflowUpdated` / `WorkflowPublished` / `WorkflowDeleted` | 产品 | 定义生命周期；版本号必须连续（`non-contiguous definition version`） |
 | `ScheduleChanged` / `WebhookChanged` / `TemplateChanged` | 产品 | 触发器与节点模板（UI 资产也随权威走） |
@@ -263,16 +250,16 @@ graph TB
   `node_id`/`payload` 全同、两者 `audit_seq` 都为 0；
 - `OperationAuthorized` 的前一条必须是 `OperationIntent`。
 
-### 3.3 State 折叠：一个状态机，两个消费者
+### 3.3 State：唯一领域转移规则
 
 `flow-engine/src/journal_state.rs` 的 `State::apply(&Transaction)` 是**唯一**的状态
-转移函数。启动恢复（重建协调器所需状态）与只读时间线（前端渲染）共用它，不存在
-第二份状态语义。
+转移函数。提交前用同一规则预演并生成当前实体变更，预演始终撤销；COMMIT 后才更新内存。
+启动加载当前实体，正常启动不重放事实账本。离线事实核验仍可以使用 reducer。
 
 ```
 Transaction 流 ──apply──> State {
     journal_id, applied_lsn, master_epoch, version,
-    values: ValueCatalog,              // 只从 journal 事实重建的已发布值目录
+    values: ValueCatalog,              // 当前库按需加载的值描述符/验证进度缓存
     workflows: BTreeMap<String, Workflow>,
     runs:     BTreeMap<String, Run>,
     schedules / webhooks / templates / legacy: BTreeMap<String, Value>,
@@ -338,78 +325,47 @@ Wait       { kind: WaitKind, wake_at, child_run_id, output }
 
 ### 3.4 写序协议与组提交
 
-```
+协调器串行决定 → reducer 预演并撤销 → 有界写入 owner → 一个 SQLite 事务：
+事实、当前实体、永久回执、值正文/描述符及提交水位 → COMMIT → 内存 apply → 确认与调度。
 
-append(事实) → fsync → 返回（durable）
-
-```
-
-**崩溃安全边界就是 fsync**。批量 fsync 不松这个边界：
-
-- 写者单线程（`writer.rs::pump`）独占 `Disk`，是进程内唯一的段文件写者；
-- 两类队列：`Control`（业务/命令）与 `Audit(dispatch_id)`（审计/值分块），
-  带 round-robin 翻转，避免审计流量饿死控制流量；
-- **组提交**：攒批直到 `batch_bytes`（4 MiB）或 `group_wait`（5 ms）到期，
-  整批一次 `disk.sync()`。低负载批=1 零额外延迟，高负载批≈并发 append 数；
-- 每条提交前先按 `MAX_LINE_BYTES`（1 MiB）**预占**字节许可，序列化后把多余部分
-  `permit.split` 还回去——「可 inline 但装不进行」的窄带在算术上不可达；
-- 段轮转：`disk.bytes + pending.bytes > segment_bytes`（256 MiB）且当前段已有
-  数据时 `rotate()`；目录 fsync 只发生在**创建新段文件**时；
-- 写失败是**永久**的：置 `stats.failure`、失败批内全部 ack、排空队列全部失败，
-  然后持锁阻塞到 close。后续 submit 一律 `Error::Unavailable(failure)`。
-  协调循环见此会限频报错（每 2s 至多一条）并继续空转，不静默停摆。
-
-**committed vs visible**：
-
-| 概念 | 含义 | 生产者 |
-| --- | --- | --- |
-| `committed` | 已 fsync 进段，`Commit{transaction, location}` 已返回 | 写者线程 |
-| `visible` | 已被投影器消费并写进 SQLite，`projected_lsn` 已推进 | 投影器线程 |
-
-投影落后时读路径返回 `-32020 COMMITTED_NOT_VISIBLE`。这是**设计内的可见性窗口**，
-不是错误；调用方重试即可。RPC 层对写方法统一在响应前等 `projected_lsn >= commit_lsn`，
-所以**写后读永远不需要重试**，只有并发读撞上窗口才会看到它。
+- 专用线程独占写连接；`WAL + synchronous=FULL`，支持的平台同时开启 fullfsync。
+- 控制与审计队列继续按字节和请求数背压、轮转；当前实体变更也计入字节预算。
+- 批次最多等待 5 ms，SQLite 事务提交整批；失败时整批回滚并冻结 writer，不能确认半套数据。
+- 调用方取消不取消 owner 已持有的提交；后续请求和协调循环会接续其结果。
+- 查询连接只读，读取相同数据库；`committed` 与 `visible` 对应同一提交，无独立 projector。
+- 外部副作用只能在授权提交后发送；未知结果继续等待人工裁决。
 
 ### 3.5 磁盘布局
 
-```
-
+```text
 <data_dir>/
-  journal/NNNNNNNN.jsonl     # 段文件，编号跨段连续，8 位零填充
-  checkpoints/latest.json    # ≤16 MiB，tmp+rename+目录 fsync 原子写
-  indexes/locations.jsonl    # (lsn, segment, offset) 定位索引
-  indexes/value-addresses/<sha256(output_id)>.jsonl
-  projection.sqlite          # 投影（可删，见 §3.6）
-  observations/manifest.json + NNNNNNNN.jsonl
-  backup-manifest.json
-
+  flow.sqlite              # 唯一业务数据库
+  flow.sqlite-wal          # SQLite 管理；运行中不可单独删除
+  flow.sqlite-shm           # SQLite 管理
+  observations/            # 独立、有界、允许丢弃的日志
 ```
 
-- 目录 0700、文件 0600；符号链接一律拒绝。
-- 段内单行 ≤ 1 MiB；值 ≤ 64 KiB 直接 inline 进事件，更大的拆 `ValueChunk`
-  （256 KiB/块）后由 `ValuePublished` 给描述符；单值上限 256 MiB。
+目录 0700、主文件 0600，拒绝数据库符号链接。小值 ≤64 KiB 内联；大值按 ≤256 KiB
+分块保存在 value_chunks 的 BLOB，单值上限 256 MiB。事实记录只保留 chunk 元数据，
+读取/导出时恢复编码，正文不在事件 JSON 内重复保存。
 
-### 3.6 SQLite 投影只有两张表
+### 3.6 表与索引
 
-```sql
-journal_cursor    -- 单行：journal_id, applied_lsn
-journal_entities  -- (kind, key, body, created_order)，PRIMARY KEY(kind, key)
-```
+权威 DDL：[`flow-journal/src/schema.sql`](../crates/flow-journal/src/schema.sql)。
 
-**没有** run/node/dispatch 专用表。`created_order` 是后加的列（`ALTER TABLE` 增量
-迁移，为 `NULL` 的行在启动时回填），索引建在它上面：
-
-| 索引 | 服务什么查询 |
+| 表 | 职责 |
 | --- | --- |
-| `(kind, created_order DESC, key DESC)` | 列表分页 |
-| `(kind, json_extract(body,'$.workflow_id'), created_order DESC, key DESC)` | 按工作流过滤 |
-| `(kind, json_extract(body,'$.status'), created_order DESC, key DESC)` | 按 run 状态过滤 |
-| `(kind, json_extract(body,'$.source'), created_order DESC, key DESC)` | 按来源过滤 |
-| `(kind, json_extract(body,'$.name'), key)` | 按名称查找 |
+| store_meta | 数据集身份、提交水位和领域提交模式 |
+| transactions / events | 接受事实、完整事务摘要、run/dispatch 关联 |
+| current_entities | 每个 `(kind,key)` 唯一当前对象、摘要和排序键；覆盖更新 |
+| value_chunks | output/chunk 索引下的原始正文与摘要 |
 
-**`json_extract` 下推是有的**，但只到「单字段等值 + 排序」这一层；复杂组合仍在
-`journal_views` 内存物化后过滤。这样设计的原因：journal 事件模式演进不需要迁移
-投影 schema，代价是读面表达力受限于表达式索引能覆盖的范围。
+workflow 元数据与每个 definition version 分开；run 与 node 分开；node 与 attempt 分开。
+command/audit 回执、值发布及流进度、父子关系和 dispatch 所有权使用有明确用途的当前记录。
+不保留每次修改后的完整实体版本，不另建 execution index、projection、应用 checkpoint 或位置文件。
+
+列表过滤、排序、分页与计数在 SQLite 执行，表达式索引覆盖 workflow/status/source/name，
+另有 run-node、attempt、child、definition-version 和 run-event 索引。正常启动只取活跃 run。
 
 ---
 
@@ -642,35 +598,18 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    autonumber
-    participant OS as 进程
-    participant D as data_dir
-    participant NB as 新进程
-    participant P as 投影器
-
-    OS->>D: 运行中（已 fsync 到 LSN 5000）
-    OS--xOS: SIGKILL / panic / 掉电
-    Note over D: 段文件停留在 LSN 5000<br/>checkpoint ≤ 5000，projected_lsn ≤ 5000
-
-    NB->>D: flock(排他) 成功 → 唯一写者
-    NB->>D: 读 checkpoint + 全量扫描段
-    NB->>NB: State::apply 重放到 applied_lsn=5000
-    NB->>D: 读值存储，重建 ValueCatalog
-    NB->>NB: 找非终态 run → defer_runs()
-    NB->>P: 启动投影器，从 projected_lsn 续跑
-    loop 直到 projected_lsn == durable_lsn
-        P->>D: 读新事务 → 写 journal_entities
-    end
-    NB->>NB: 协调循环从折叠态继续 advance_run
+    participant N as 新协调器
+    participant S as flow.sqlite
+    N->>S: flock 数据目录，打开 SQLite/WAL
+    Note over S: SQLite 恢复完整已提交事务，未提交事务不可见
+    N->>S: 读取提交水位和控制元数据
+    N->>S: 加载非终态 run、node、当前 attempt
+    N->>N: dirty_runs 播种，持久化新 master epoch
+    N->>N: 安全工作继续；未知授权结果进入 uncertain
 ```
 
-**恢复期不猜的三件事**：
-
-1. 半条写入的行——`sha256` 不匹配即判定损坏，报错隔离，**不猜内容**。
-2. `OperationAuthorized` 之后没有 `OperationOutcome`——节点停在
-   `Waiting{Uncertain}`，等人工裁决（C4）。
-3. 未完成的 `ValueChunk` 序列——`ValuePublished` 未出现即视为未发布，
-   该 `StoredValue::Ref` 不可读。
+未发布值不能被业务引用；正文按需读取并核验。事实账本的全量检查属于显式 verify，
+不是每次启动的前置扫描。损坏状态/正文报错，不自动以历史前缀冒充完整执行状态。
 
 ---
 
@@ -1300,15 +1239,15 @@ pure retry`）。这是 C4 的又一道闸门——有外部副作用的操作�
 每个写方法接受调用方提供的 `request_id`（1..=128 字节）：
 
 1. `fingerprint = sha256(请求体, 上限 9 MiB)`；
-2. 查 `commands` 表：同一 `(scope, request_id)` 已有记录且 fingerprint **相同**
+2. 查永久 command 回执：同一 `(scope, request_id)` 已有记录且 fingerprint **相同**
    → 直接返回上次结果，**不重复执行**；
 3. fingerprint **不同** → `-32012 conflict`（`same request identity with
    different arguments`）；
 4. 新请求 → 执行 + 落 `Command` 事件（含 `result`，受 `INLINE_BYTES` 限制）。
 
-**窗口**：`COMMAND_WINDOW = 8192` 条命令记录，超窗按 lsn 序淘汰最旧一半。
-淘汰只依赖事件序，所以**重放确定性不受影响**——但超过窗口的 `request_id`
-不再享受去重，调用方会拿到重复执行。
+**缓存窗口**：内存最多保留 `COMMAND_WINDOW = 8192` 条，超窗淘汰旧缓存。
+永久回执仍在 current_entities；命令先查缓存再查库，缓存逐出和重启不会放行旧身份。
+本次不引入回执 TTL。
 
 ### 11.3 订阅：`run.subscribe`
 
@@ -1322,10 +1261,10 @@ sequenceDiagram
     participant C as 客户端
     participant S as SubscriptionTask
     participant T as TailReader(journal)
-    participant P as SQLite 投影
+    participant P as SQLite 查询
 
     C->>S: run.subscribe{run_id, mode, from_seq, from_lsn}
-    S->>P: projection.get("run", run_id)
+    S->>P: store.get("run", run_id)
     P-->>S: 无此行 → 立即结束（不发任何通知）
     loop 固定 50ms 轮询（无 caught_up 标志、无补帧状态机）
         S->>T: tail.next(upper) 取下一事务
@@ -1358,7 +1297,6 @@ audit 按 `lsn` + `audit_seq` 推进（含执行器审计事实与迟到的 `Lat
 | `-32001` | unauthorized | token 缺失/不符（恒定时间比较，`admit_call` 对所有方法生效） |
 | `-32011` | not found | **仅**六个精确串：`run`/`workflow`/`workflow version`/`schedule`/`webhook`/`template not found` |
 | `-32012` | conflict | `flow_journal::Error::Conflict` / `ViewError::Conflict` / `TemplateNameTaken` / `request_id` 撞车 |
-| `-32020` | COMMITTED_NOT_VISIBLE | 已提交但投影未跟上（§3.4） |
 | `-32021` | limit | `flow_journal::Error::Limit`、`RESPONSE_TOO_LARGE` |
 | `-32602` | invalid params | `invalid()` 助手 + jsonrpsee 参数解析失败 |
 | `-32603` | internal | catch-all：journal 不可用、投影不可用、cluster 注册表不可用、密钥 IO 失败 |
@@ -1394,51 +1332,28 @@ body ≤ 8 MiB。
 
 ### 12.1 启动序列
 
-```mermaid
-flowchart TB
-    A["Journal::open"] --> B["flock(data_dir) 排他"]
-    B -->|"失败"| E["Conflict: data directory is locked"]
-    B -->|"成功"| C["读 checkpoint/latest.json"]
-    C --> D{"校验"}
-    D -->|"journal_id 不符"| E2["Invalid"]
-    D -->|"applied_lsn != checkpoint.lsn"| E2
-    D -->|"applied_lsn > durable_lsn"| E2
-    D -->|"通过"| F["全量重放到 durable_lsn"]
-    C -->|"checkpoint 损坏"| F
-    F --> G["读值存储 → 重建 ValueCatalog"]
-    G --> H["dirty_runs ← 全部非终态 run"]
-    H --> I["Projector::open(projection.sqlite)"]
-    I --> J{"projected_lsn > applied_lsn?"}
-    J -->|"是"| E3["Invalid: projection cursor is<br/>ahead of authoritative journal"]
-    J -->|"否"| K["从内存态恢复快照行"]
-    K --> L["启动投影器 + 协调循环"]
-    L --> M["visible(initial)：等到投影追平"]
+1. 抢占数据目录 flock，校验 SQLite 格式和数据集身份；旧格式目录拒绝打开，不自动迁移。
+2. 打开只读查询连接，加载控制元数据、schedule fire 水位、活跃 run/node/current attempt。
+3. 终态 run、旧 attempt 和值进度按需读取；缓存不承担永久去重职责。
+4. 播种 dirty runs，安装协调器，提交 master epoch 后继续安全执行。
 
-    style E fill:#fbb,stroke:#333
-    style E2 fill:#fbb,stroke:#333
-    style E3 fill:#fbb,stroke:#333
-    style M fill:#bfb,stroke:#333
-```
+不需要应用 checkpoint，也不等待独立投影。WAL 的恢复由 SQLite 完成。
 
-### 12.2 三种「不一致」的处置
+### 12.2 故障处置
 
-| 现象 | 判定 | 处置 |
-| --- | --- | --- |
-| 半条写入 / 校验和不符 | `sha256` 不匹配 | **报错隔离**，不猜内容。`verify` 全量扫描定位坏段 |
-| 投影落后于 journal | `projected_lsn < applied_lsn` | 正常，续跑追上 |
-| 投影**超前**于 journal | `projected_lsn > applied_lsn` | **Invalid**——投影不可能包含权威日志里没有的事实，说明 journal 被回退/替换 |
+| 现象 | 处置 |
+| --- | --- |
+| 当前实体摘要不符 | 报错停止使用；不自动覆盖权威数据 |
+| 写入/COMMIT 出错 | writer 冻结，修复介质条件后重开；原请求结果可能未知，按身份查回执 |
+| 历史事实或正文校验失败 | 显式报告；停写、保留证据、从校验通过的一致备份恢复 |
 
-第三种是刻意的硬失败：它是「有人拿旧 journal 覆盖了新 journal」的信号，
-静默继续会让整个系统建立在一个假前提上。
+备份使用 SQLite Backup API 的一致快照，包含事实、当前状态、回执和 BLOB。
+不支持把任意旧 LSN 的日志前缀直接恢复成完整当前库。
 
 ### 12.3 观测日志不是权威
 
-节点日志写到 `<root>/observations/%08u.jsonl`（专用线程 + `sync_channel`，
-队列 64 条、行上限 16 KiB、单行截断 8 KiB、默认预算 10000 行/节点、硬上限
-100000 行）。
-
-**它们是可丢弃的**：删除 `observations/` 不影响任何 run 状态。这与
-`projection.sqlite` 同属铁律 3（§0.2）——**能删的都能删**。
+observations 使用独立队列与磁盘限额。删除后日志永久丢失，但不改变执行结果。
+`flow.sqlite` 及运行中的 WAL 不具备这种可删除属性。
 
 ### 12.4 故障注入
 
@@ -1457,10 +1372,10 @@ flowchart TB
 
 | # | 不变量 |
 | --- | --- |
-| I1 | journal 是 run 执行状态的唯一权威；`projection.sqlite` 可随时删除并由 journal 重建 |
-| I2 | `lsn` 全局无缺口、跨段连续；LSN 由写者线程在落盘前分配 |
+| I1 | flow.sqlite 是业务权威；事实、当前状态、回执和待处理动作原子提交 |
+| I2 | `lsn` 全局无缺口；唯一写者分配，失败事务不占号 |
 | I3 | 同一 `data_dir` 同时只有一个写者（flock 排他，进程内 + OS 双层） |
-| I4 | `committed` 必先于 `visible`；`projected_lsn > applied_lsn` 是硬失败 |
+| I4 | 接受事实与查询状态同时提交，不存在独立投影进度 |
 | I5 | 所有 run 状态迁移都是 `State::apply` 折叠的结果，不存在第二份状态语义 |
 
 ### 13.2 副作用安全（C3/C4）
@@ -1602,11 +1517,9 @@ bug 的栖息地。
 
 **已知取舍**：
 
-- **读面表达力受限**：SQLite 只有两张通用表 + 5 个表达式索引（§3.6），复杂组合
-  仍在 `journal_views` 内存物化后过滤。靠 `R_MAX = 1000` 在飞 run 上限兜住内存；
-  超出即 `-32021 limit`。
+- **单写者与 WAL 成本**：写入由唯一 owner 串行决定，长读、大正文与维护会影响 WAL 和尾延迟；不提供多协调器 HA。
 - **订阅是轮询**：固定 50ms，无 gap-fill 状态机（§11.3）。
-- **命令幂等窗口有限**：`COMMAND_WINDOW = 8192`，超窗的 `request_id` 不再去重。
+- **历史保留未裁剪**：事实、永久回执、旧 attempt 与正文继续增长；本次没有引入 TTL 或 GC。
 - **审计吞吐受 W_BYTES 约束**：单 dispatch 在飞审计 ≤ 2 MiB，是协议硬上限。
 
 ---
@@ -1623,4 +1536,4 @@ bug 的栖息地。
 | 加 RPC 方法 | `flow-rpc/src/journal_v2.rs` 的 `READ_METHODS`/`WRITE_METHODS` + 对应 handler |
 | 改触发器 | `flow-rpc/src/journal_triggers.rs` |
 | 改 agent 中继 | `flow-agent/src/{runtime,relay,pool}.rs` |
-| 离线维护 | `flow-journal/src/bin/flow-journal-tool.rs`（`verify`/`rebuild-index`/`backup`/`repair`） |
+| 离线维护 | `flow-journal/src/bin/flow-journal-tool.rs`（`verify`/`rebuild-index`/`backup`） |

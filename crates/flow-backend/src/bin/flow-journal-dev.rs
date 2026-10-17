@@ -1,9 +1,8 @@
-//! flow-journal-dev：JSONL v2 开发运行器（bin: flow-journal-dev）。
+//! flow-journal-dev：SQLite 开发运行器（bin: flow-journal-dev）。
 //!
-//! run / resume / status / import-legacy / rebuild-projection。
+//! run / resume / status / import-legacy。
 //! run 安装定义并真实执行；resume 只恢复「按已提交事实安全」的工作；
 //! import-legacy 把停写 legacy（v1 SQLite）数据集保全为只读基线；
-//! rebuild-projection 离线把 journal 重建进**新** SQLite 文件（不执行工作流）。
 //!
 //! 运行：cargo run -p flow-backend --bin flow-journal-dev -- --data-dir <dir> status
 
@@ -15,7 +14,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "flow-journal-dev",
     version,
-    about = "JSONL v2 开发运行器（run / resume / status / import-legacy）",
+    about = "SQLite 开发运行器（run / resume / status / import-legacy）",
     arg_required_else_help = true
 )]
 struct JournalDev {
@@ -42,17 +41,12 @@ enum JournalDevCommand {
     Resume,
     /// Print recovered state without starting any execution.
     Status,
-    /// Preserve a stopped legacy dataset as a read-only baseline in a new JSONL directory.
+    /// Preserve a stopped legacy dataset as a read-only baseline in a new SQLite dataset.
     ImportLegacy {
         #[arg(long)]
         source: PathBuf,
         #[arg(long)]
         database: PathBuf,
-    },
-    /// Offline: rebuild into a NEW SQLite file, without executing any workflow.
-    RebuildProjection {
-        #[arg(long)]
-        destination: PathBuf,
     },
 }
 
@@ -127,14 +121,6 @@ async fn journal_dev(
     if let JournalDevCommand::ImportLegacy { source, database } = &command {
         let report = flow_backend::journal_import::import(source, database, &data_dir).await?;
         println!("{}", serde_json::to_string_pretty(&report)?);
-        return Ok(());
-    }
-    if let JournalDevCommand::RebuildProjection { destination } = &command {
-        let lsn = JournalBackend::rebuild_projection(&data_dir, destination).await?;
-        println!(
-            "{}",
-            serde_json::json!({"applied_lsn":lsn.to_string(),"destination":destination})
-        );
         return Ok(());
     }
     let backend = JournalBackend::open(&data_dir, JournalOptions::default()).await?;

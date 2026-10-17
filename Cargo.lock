@@ -994,6 +994,7 @@ name = "flow-journal"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
  "clap",
  "fs2",
  "hex",
@@ -1036,12 +1037,9 @@ dependencies = [
 name = "flow-store"
 version = "0.1.0"
 dependencies = [
- "chrono",
+ "flow-journal",
  "flow-test-support",
- "hex",
- "serde",
  "serde_json",
- "sha2 0.11.0",
  "sqlx",
  "tokio",
 ]

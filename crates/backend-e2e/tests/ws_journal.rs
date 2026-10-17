@@ -315,8 +315,9 @@ async fn default_backend_is_journal_on_fresh_directory() {
     let client = proc.client().await;
     let created: Value = call(&client, "workflow.create", json!({"name": "default"})).await;
     assert!(created["workflow_id"].is_string());
-    // journal 根布局落成（段目录存在；没有 v1 的 flow.db）
-    assert!(dir.path().join("journal").is_dir());
+    // 配置的数据根包含单一业务库；不创建 JSONL 段目录。
+    assert!(dir.path().join("journal/flow.sqlite").is_file());
+    assert!(!dir.path().join("journal/journal").exists());
     assert!(!dir.path().join("flow.db").exists());
 
     // v1 布局目录 + 缺省（journal）→ 启动即拒绝
@@ -337,7 +338,7 @@ async fn default_backend_is_journal_on_fresh_directory() {
     assert!(!output.status.success(), "v1 布局必须拒绝启动");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("empty data directory") && stderr.contains("import legacy data offline"),
-        "错误必须指明 v1 布局与迁移指引：{stderr}"
+        stderr.contains("empty data directory") && stderr.contains("old formats are not imported"),
+        "错误必须指明需要新目录且不导入旧格式：{stderr}"
     );
 }

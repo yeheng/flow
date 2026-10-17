@@ -84,9 +84,7 @@ impl Default for ServerConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageBackend {
-    /// JSONL v2 journal 权威（`<data_dir>/` 即 journal 根，SQLite 只是
-    /// 可重建投影）。唯一后端；v1 的 sqlite/postgres 已删除，历史数据
-    /// 不做迁移，见 docs/SQLITE_V1_TO_V2_MIGRATION.md。
+    /// 本地 SQLite 业务权威，配置名称保留 journal；不导入旧数据格式。
     Journal,
 }
 

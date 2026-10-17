@@ -455,7 +455,7 @@ impl Membership {
 
 impl JournalBackend {
     pub async fn cluster_snapshot(&self) -> Result<Snapshot> {
-        let projected_lsn = self.projection.applied_lsn().await?;
+        let projected_lsn = self.store.applied_lsn().await?;
         let (applied_lsn, master_epoch, run_counts) = self
             .inspect(|s| {
                 // RunStatus 是枚举（无 Ord）：按 wire 字符串聚合（与
@@ -476,7 +476,7 @@ impl JournalBackend {
             master_epoch,
             run_counts,
             writer_error: stats.failure,
-            projection_error: self.projection_failure().await,
+            projection_error: None,
         })
     }
 }

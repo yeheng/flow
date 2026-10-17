@@ -57,7 +57,7 @@ impl Services {
         }
         // 密钥与历史 v1 数据仍住在原 data 目录（密钥是用户资产，不随权威
         // 切换搬家；v1 数据按「历史舍弃」原则保留只读）。工作流/run 的
-        // 权威是 root/journal（v2 唯一权威，主服务与 /journal 工作区同源）。
+        // 权威是 root/flow.sqlite，主服务与 /journal 工作区同源。
         let data = if has_config_file {
             root.join(&config.storage.data_dir)
         } else {
@@ -220,7 +220,7 @@ impl Services {
         for task in tasks {
             let _ = task.await;
         }
-        // Drain accepted calls before closing the journal/projector.
+        // Drain accepted calls before closing the SQLite writer and query handles.
         let _gate = self.gate.write().await;
         let journal = self.journal.close().await.map_err(|e| e.to_string());
         journal

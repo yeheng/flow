@@ -259,16 +259,12 @@ async fn committed_projection_crash_child() {
     let b = JournalBackend::open(&root, Default::default())
         .await
         .unwrap();
-    b.set_projection_wait(100);
-    b.pause_projection(true);
-    assert!(matches!(
-        b.workflow_create("crash", Some("original")).await,
-        Err(flow_backend::journal::JournalError::CommittedNotVisible(_))
-    ));
+    let receipt = b.workflow_create("crash", Some("original")).await.unwrap();
+    assert!(receipt.committed && receipt.visible);
     std::process::exit(70); // deliberate abrupt exit: no backend close or Rust drops
 }
 #[tokio::test]
-async fn abrupt_exit_after_commit_before_projection_recovers_original_receipt() {
+async fn abrupt_exit_after_sqlite_commit_recovers_state_and_original_receipt() {
     let temp = tempfile::tempdir().unwrap();
     let status = tokio::process::Command::new(std::env::current_exe().unwrap())
         .args(["--ignored", "--exact", "committed_projection_crash_child"])

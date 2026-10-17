@@ -1,4 +1,4 @@
-//! Explicit v2 coordinator foundation. Commands are journal decisions, SQLite is disposable.
+//! Single-coordinator decisions. SQLite atomically owns facts and current execution state.
 use std::collections::BTreeSet;
 
 /// 在飞（非终态）run 状态数上限：约束主进程 run 状态内存与调度表。
@@ -13,16 +13,14 @@ pub const R_MAX: usize = 1000;
 const DEFINITION_CACHE_MAX: usize = 128;
 use std::path::Path;
 use std::sync::{
+    atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering},
     Arc,
-    atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
 };
-use std::time::Duration;
 
 use flow_engine::journal_state::{CommandRecord, State};
 use flow_journal::page::CommitCursor;
-use flow_journal::tail::TailReader;
 use flow_journal::{Event, EventKind, Journal, JournalOptions, Transaction};
-use flow_store::projection::{ProjectedRow, Projector};
+use flow_store::store::{EntityChange, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Mutex, Notify};
@@ -42,10 +40,8 @@ pub enum JournalError {
     LinkClosed(String),
     #[error("{0}")]
     Journal(#[from] flow_journal::Error),
-    #[error("projection: {0}")]
-    Projection(String),
-    #[error("COMMITTED_NOT_VISIBLE")]
-    CommittedNotVisible(CommandReceipt),
+    #[error("storage: {0}")]
+    Storage(String),
 }
 impl From<serde_json::Error> for JournalError {
     fn from(e: serde_json::Error) -> Self {
@@ -56,37 +52,17 @@ type Result<T> = std::result::Result<T, JournalError>;
 
 struct CommittedState {
     state: State,
-    reader: Option<TailReader>,
-    reading:
-        Option<tokio::task::JoinHandle<(TailReader, flow_journal::Result<Option<Transaction>>)>>,
     pending: Option<tokio::task::JoinHandle<flow_journal::Result<flow_journal::Commit>>>,
     dirty_runs: BTreeSet<String>,
-    applying: Option<Transaction>,
 }
 pub struct JournalBackend {
     #[cfg(feature = "journal-cluster")]
     cluster: std::sync::OnceLock<Arc<crate::journal_cluster::Membership>>,
     pub journal: Journal,
-    pub projection: Arc<Projector>,
-    audit_index: Arc<Projector>,
+    pub store: Arc<Store>,
     pub observations: Option<flow_engine::observation::ObservationStore>,
     state: Mutex<CommittedState>,
-    projected: Arc<Notify>,
-    changed: Arc<Notify>,
-    paused: Arc<AtomicBool>,
-    /// 协调器停止信号（`cancellation()` 返回它）。**不用于停投影**：协调器
-    /// 退出前可能正卡在 `command()` 的可见性等待上，投影一停就永远等不到。
     shutdown: CancellationToken,
-    /// 投影停止信号：由 `close()` 在协调器 join 之后才触发。
-    projector_stop: CancellationToken,
-    projector: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    projection_error: Arc<Mutex<Option<String>>>,
-    /// 投影游标的内存镜像：projector 每批 apply 后 fetch_max 更新。等待者
-    /// 用一次原子读判可见，不再按唤醒逐次查 SQLite。
-    projected_lsn: AtomicU64,
-    /// 写命令等到可见的上限（病理阀：健康路径毫秒级追平；超时才发
-    /// -32020，意味着投影坏了而非投影慢）。测试可调小。
-    wait_timeout_ms: AtomicU64,
     pub(crate) execution: Mutex<Option<tokio::task::JoinHandle<()>>>,
     execution_changed: Arc<Notify>,
     pub(crate) execution_peak: AtomicUsize,
@@ -100,240 +76,31 @@ pub struct JournalBackend {
 }
 
 impl JournalBackend {
-    /// Offline rebuild into a new SQLite file. Holds the authority lock throughout;
-    /// neither the existing projection nor any authoritative file is modified.
-    pub async fn rebuild_projection(root: &Path, destination: &Path) -> Result<u64> {
-        let _lock = flow_journal::maintenance::offline_lock(root)?;
-        let report = flow_journal::maintenance::verify(root)?;
-        if report.fault.is_some() {
-            return Err(
-                flow_journal::Error::Invalid("cannot rebuild a corrupt journal".into()).into(),
-            );
-        }
-        let identity = report.journal_id.as_str();
-        if identity.is_empty() {
-            return Err(flow_journal::Error::Invalid("missing journal identity".into()).into());
-        }
-        // Exclusive creation prevents clobbering the old projection or another operator's work.
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        options
-            .open(destination)
-            .map_err(flow_journal::Error::Io)?
-            .sync_all()
-            .map_err(flow_journal::Error::Io)?;
-        let projection = Projector::open(destination, identity)
-            .await
-            .map_err(|e| JournalError::Projection(e.to_string()))?;
-        let temporary = tempfile::tempdir_in(destination.parent().unwrap_or(Path::new(".")))
-            .map_err(flow_journal::Error::Io)?;
-        let history = Projector::open(&temporary.path().join("execution.sqlite"), identity)
-            .await
-            .map_err(|e| JournalError::Projection(e.to_string()))?;
-        let mut reader = TailReader::new(root, identity);
-        let mut state = State {
-            compact_audits: true,
-            ..Default::default()
-        };
-        while let Some((tx, _)) = reader.next(report.last_lsn)? {
-            crate::journal_history::prepare(&history, &mut state, &tx).await?;
-            state.apply(&tx)?;
-            history
-                .apply(
-                    identity,
-                    tx.lsn,
-                    crate::journal_history::index_rows(&state, &tx)?,
-                )
-                .await
-                .map_err(|e| JournalError::Projection(e.to_string()))?;
-            projection
-                .apply(identity, tx.lsn, project_rows(&state, &tx)?)
-                .await
-                .map_err(|e| JournalError::Projection(e.to_string()))?;
-            crate::journal_history::trim(&mut state);
-        }
-        history.close().await;
-        projection.close().await;
-        let parent = destination
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        std::fs::File::open(parent)
-            .and_then(|f| f.sync_all())
-            .map_err(flow_journal::Error::Io)?;
-        Ok(report.last_lsn)
-    }
-
     pub async fn open(root: &Path, options: JournalOptions) -> Result<Arc<Self>> {
         let journal = Journal::open(root, options).await?;
-        let history_path = root.join("execution-index.sqlite");
-        let audit_index = Arc::new(
-            Projector::open(&history_path, journal.id())
+        let store = Arc::new(
+            Store::open(&root.join(flow_journal::sqlite::DATABASE), journal.id())
                 .await
-                .map_err(|e| JournalError::Projection(e.to_string()))?,
+                .map_err(|e| JournalError::Storage(e.to_string()))?,
         );
-        let mut indexed = audit_index
-            .applied_lsn()
-            .await
-            .map_err(|e| JournalError::Projection(e.to_string()))?;
-        let upper = journal.durable_lsn();
-        if indexed > upper {
-            return Err(JournalError::Projection(
-                "execution index ahead of journal".into(),
-            ));
-        }
-        // Old derived indexes lack permanent receipts and unfinished stream state.
-        // Rebuild from authority once; never reinterpret an old checkpoint as that index.
-        if indexed > 0
-            && audit_index
-                .get("index_format", "single-v2")
-                .await
-                .map_err(|e| JournalError::Projection(e.to_string()))?
-                .1
-                .is_none()
-        {
-            audit_index
-                .restore_snapshot(journal.id(), 0, vec![])
-                .await
-                .map_err(|e| JournalError::Projection(e.to_string()))?;
-            indexed = 0;
-        }
-        let root_owned = root.to_path_buf();
-        let identity = journal.id().to_owned();
-        let (mut state, reader) =
-            tokio::task::spawn_blocking(move || -> flow_journal::Result<_> {
-                let mut state = State {
-                    compact_audits: true,
-                    ..Default::default()
-                };
-                let mut reader = TailReader::new(&root_owned, &identity);
-                if let Some(cp) = flow_journal::maintenance::load_checkpoint(&root_owned, 5)? {
-                    if cp.lsn <= indexed && cp.lsn <= upper && cp.journal_id == identity {
-                        let restored = (|| -> flow_journal::Result<State> {
-                            let mut s: State = serde_json::from_value(cp.state["state"].clone())?;
-                            s.values = flow_journal::value::ValueCatalog::from_snapshot(
-                                cp.state["values"].clone(),
-                            )?;
-                            if s.applied_lsn != cp.lsn
-                                || s.journal_id != identity
-                                || s.runs.values().any(|r| r.terminal())
-                            {
-                                return Err(flow_journal::Error::Invalid(
-                                    "active checkpoint boundary mismatch".into(),
-                                ));
-                            }
-                            s.compact_audits = true;
-                            Ok(s)
-                        })();
-                        match restored {
-                            Ok(s) => {
-                                state = s;
-                                reader = TailReader::after(&root_owned, &identity, &cp.boundary)?;
-                            }
-                            Err(e) => {
-                                tracing::warn!(%e, "invalid active checkpoint; replaying journal")
-                            }
-                        }
-                    }
-                }
-                Ok((state, reader))
-            })
-            .await
-            .map_err(|e| JournalError::Projection(e.to_string()))??;
-        let (send, mut receive) = tokio::sync::mpsc::channel(1);
-        let scan = tokio::task::spawn_blocking(move || -> flow_journal::Result<TailReader> {
-            let mut reader = reader;
-            while let Some((tx, _)) = reader.next(upper)? {
-                if send.blocking_send(tx).is_err() {
-                    break;
-                }
-            }
-            Ok(reader)
-        });
-        while let Some(tx) = receive.recv().await {
-            crate::journal_history::prepare(&audit_index, &mut state, &tx).await?;
-            state.apply(&tx)?;
-            audit_index
-                .apply(
-                    journal.id(),
-                    tx.lsn,
-                    crate::journal_history::index_rows(&state, &tx)?,
-                )
-                .await
-                .map_err(|e| JournalError::Projection(e.to_string()))?;
-            crate::journal_history::trim(&mut state);
-        }
-        let reader = scan
-            .await
-            .map_err(|e| JournalError::Projection(e.to_string()))??;
-        let committed = CommittedState {
-            dirty_runs: state.runs.keys().cloned().collect(),
-            state,
-            reader: Some(reader),
-            reading: None,
-            pending: None,
-            applying: None,
-        };
-        let projection = Arc::new(
-            Projector::open(&root.join("projection.sqlite"), journal.id())
-                .await
-                .map_err(|e| JournalError::Projection(e.to_string()))?,
-        );
-        if projection
-            .applied_lsn()
-            .await
-            .map_err(|e| JournalError::Projection(e.to_string()))?
-            > upper
-        {
-            return Err(JournalError::Projection(
-                "projection cursor is ahead of authoritative journal".into(),
-            ));
-        }
-        if projection
-            .applied_lsn()
-            .await
-            .map_err(|e| JournalError::Projection(e.to_string()))?
-            < upper
-            || projection
-                .requires_split_runs()
-                .await
-                .map_err(|e| JournalError::Projection(e.to_string()))?
-        {
-            projection
-                .restore_history(&history_path, upper)
-                .await
-                .map_err(|e| JournalError::Projection(e.to_string()))?;
-        }
-        let projected_cursor = projection
-            .applied_lsn()
-            .await
-            .map_err(|e| JournalError::Projection(e.to_string()))?;
+        let state =
+            crate::journal_history::load(&store, journal.id(), journal.durable_lsn()).await?;
         let backend = Arc::new(Self {
             #[cfg(feature = "journal-cluster")]
             cluster: std::sync::OnceLock::new(),
+            state: Mutex::new(CommittedState {
+                dirty_runs: state.runs.keys().cloned().collect(),
+                state,
+                pending: None,
+            }),
             observations: flow_engine::observation::ObservationStore::open(
                 root.join("observations"),
                 Default::default(),
             )
             .ok(),
             journal,
-            projection,
-            audit_index,
-            state: Mutex::new(committed),
-            projected: Arc::new(Notify::new()),
-            changed: Arc::new(Notify::new()),
-            paused: Arc::new(AtomicBool::new(false)),
+            store,
             shutdown: CancellationToken::new(),
-            projector_stop: CancellationToken::new(),
-            projector: Mutex::new(None),
-            projection_error: Arc::new(Mutex::new(None)),
-            projected_lsn: AtomicU64::new(projected_cursor),
-            wait_timeout_ms: AtomicU64::new(30_000),
             execution: Mutex::new(None),
             execution_changed: Arc::new(Notify::new()),
             execution_peak: AtomicUsize::new(0),
@@ -341,83 +108,34 @@ impl JournalBackend {
             coordinator_last_tick_ms: AtomicI64::new(0),
             definitions: Mutex::new(std::collections::HashMap::new()),
         });
-        let weak = Arc::downgrade(&backend);
-        let task = tokio::spawn(async move {
-            loop {
-                let Some(b) = weak.upgrade() else { return };
-                if b.projector_stop.is_cancelled() {
-                    return;
-                }
-                let changed = b.changed.clone();
-                let shutdown = b.projector_stop.clone();
-                let next = b.projected_lsn.load(Ordering::Acquire) + 1;
-                let result = async {
-                    let upper = b.audit_index.applied_lsn().await?;
-                    if b.paused.load(Ordering::Relaxed) || next > upper {
-                        return Ok::<_, sqlx::Error>(false);
-                    }
-                    let rows = b.audit_index.history_changes(next).await?;
-                    b.projection.apply(b.journal.id(), next, rows).await?;
-                    b.projected_lsn.store(next, Ordering::Release);
-                    b.projected.notify_waiters();
-                    Ok(true)
-                }
-                .await;
-                match result {
-                    Ok(true) => continue,
-                    Err(e) => {
-                        *b.projection_error.lock().await = Some(e.to_string());
-                        b.projected.notify_waiters();
-                        return;
-                    }
-                    Ok(false) => {}
-                }
-                drop(b);
-                tokio::select! { _=changed.notified()=>{}, _=shutdown.cancelled()=>return,
-                _=tokio::time::sleep(Duration::from_millis(20))=>{} }
-            }
-        });
-        *backend.projector.lock().await = Some(task);
-        let initial = CommandReceipt {
-            committed: true,
-            commit_cursor: CommitCursor {
-                journal_id: backend.journal.id().into(),
-                lsn: upper,
-            },
-            request_id: None,
-            result: Value::Null,
-            visible: false,
-        };
-        backend.visible(initial).await?;
         Ok(backend)
     }
 
     /// Explicit whole-history diagnostic export. Production reads use run_snapshot,
-    /// metadata projections or journal pages instead of allocating this export.
+    /// metadata queries or fact pages instead of allocating this export.
     pub async fn state(&self) -> State {
         self.full_state()
             .await
-            .expect("verified execution index unavailable")
+            .expect("SQLite current state unavailable")
     }
     pub async fn full_state(&self) -> Result<State> {
         let mut committed = self.state.lock().await;
         self.refresh_locked(&mut committed).await?;
         let mut state = committed.state.clone();
         let upper = state.applied_lsn;
-        drop(committed);
         let mut after = String::new();
         loop {
             let keys = self
-                .audit_index
-                .history_keys("run", None, &after, upper, 256)
+                .store
+                .current_keys("run", None, &after, upper, 256)
                 .await
-                .map_err(|e| JournalError::Projection(e.to_string()))?;
+                .map_err(|e| JournalError::Storage(e.to_string()))?;
             if keys.is_empty() {
                 break;
             }
             for id in &keys {
                 if let Some(run) =
-                    crate::journal_history::run_at(&self.audit_index, id, upper, true).await?
+                    crate::journal_history::run_at(&self.store, id, upper, true).await?
                 {
                     state.runs.insert(id.clone(), run);
                 }
@@ -435,11 +153,10 @@ impl JournalBackend {
             return Ok(Some(run.status));
         }
         let upper = committed.state.applied_lsn;
-        drop(committed);
-        self.audit_index
-            .history_at("run", id, upper)
+        self.store
+            .current_at("run", id, upper)
             .await
-            .map_err(|e| JournalError::Projection(e.to_string()))?
+            .map_err(|e| JournalError::Storage(e.to_string()))?
             .map(|v| serde_json::from_value(v["status"].clone()).map_err(JournalError::from))
             .transpose()
     }
@@ -456,10 +173,9 @@ impl JournalBackend {
         if let Some(run) = committed.state.runs.get(id) {
             return Ok((upper, Some(run.clone())));
         }
-        drop(committed);
         Ok((
             upper,
-            crate::journal_history::run_at(&self.audit_index, id, upper, false).await?,
+            crate::journal_history::run_at(&self.store, id, upper, false).await?,
         ))
     }
     pub(crate) async fn run_children(
@@ -468,10 +184,10 @@ impl JournalBackend {
         upper: u64,
     ) -> Result<std::collections::BTreeMap<String, String>> {
         Ok(self
-            .audit_index
-            .history_children(id, upper)
+            .store
+            .children(id, upper)
             .await
-            .map_err(|e| JournalError::Projection(e.to_string()))?
+            .map_err(|e| JournalError::Storage(e.to_string()))?
             .into_iter()
             .collect())
     }
@@ -480,10 +196,10 @@ impl JournalBackend {
         dispatch: &str,
     ) -> Result<Option<(String, String, u32)>> {
         let owner = self
-            .audit_index
+            .store
             .dispatch_owner(dispatch)
             .await
-            .map_err(|e| JournalError::Projection(e.to_string()))?;
+            .map_err(|e| JournalError::Storage(e.to_string()))?;
         owner
             .map(|owner| {
                 let run = flow_engine::journal_state::string(&owner, "run_id")?;
@@ -491,7 +207,7 @@ impl JournalBackend {
                 let attempt = owner["attempt"]
                     .as_str()
                     .and_then(|s| s.parse().ok())
-                    .ok_or_else(|| JournalError::Projection("invalid indexed attempt".into()))?;
+                    .ok_or_else(|| JournalError::Storage("invalid indexed attempt".into()))?;
                 Ok((run, node, attempt))
             })
             .transpose()
@@ -500,7 +216,7 @@ impl JournalBackend {
         if let Some(id) = id {
             if !state.runs.contains_key(id) {
                 if let Some(run) =
-                    crate::journal_history::run_at(&self.audit_index, id, state.applied_lsn, false)
+                    crate::journal_history::run_at(&self.store, id, state.applied_lsn, false)
                         .await?
                 {
                     state.runs.insert(id.into(), run);
@@ -586,7 +302,7 @@ impl JournalBackend {
     }
 
     /// The decision and conflicting command are serialized until durability and reducer apply.
-    /// No successful public return bypasses the projection barrier, including deduplicated calls.
+    /// Facts, current state and permanent receipts share one SQLite commit.
     pub async fn command(
         &self,
         scope: &str,
@@ -667,10 +383,10 @@ impl JournalBackend {
         if let [event] = events.as_slice() {
             if event.audit_seq > 0 {
                 let (_, original) = self
-                    .audit_index
+                    .store
                     .get("audit", &audit_key(event)?)
                     .await
-                    .map_err(|e| JournalError::Projection(e.to_string()))?;
+                    .map_err(|e| JournalError::Storage(e.to_string()))?;
                 if let Some(original) = original {
                     let incoming = flow_journal::codec::digest(&flow_journal::codec::bounded_json(
                         event,
@@ -686,7 +402,7 @@ impl JournalBackend {
                         .as_str()
                         .and_then(|s| s.parse().ok())
                         .ok_or_else(|| {
-                            JournalError::Projection("invalid original audit receipt".into())
+                            JournalError::Storage("invalid original audit receipt".into())
                         });
                 }
             }
@@ -727,13 +443,13 @@ impl JournalBackend {
             return Ok(Some(record.clone()));
         }
         let value = self
-            .audit_index
+            .store
             .get(
                 "command",
                 &flow_engine::journal_state::command_key(scope, id),
             )
             .await
-            .map_err(|e| JournalError::Projection(e.to_string()))?
+            .map_err(|e| JournalError::Storage(e.to_string()))?
             .1;
         value
             .map(serde_json::from_value)
@@ -754,126 +470,67 @@ impl JournalBackend {
             tx_id: uuid::Uuid::now_v7().to_string(),
             events,
         };
-        crate::journal_history::prepare(&self.audit_index, &mut committed.state, &tx).await?;
-        let checked = committed.state.check(&tx);
-        crate::journal_history::trim(&mut committed.state);
-        checked?;
+        crate::journal_history::prepare(&self.store, &mut committed.state, &tx).await?;
+        let rows = committed
+            .state
+            .preview(&tx, |next| crate::journal_history::index_rows(next, &tx))?;
         let journal = self.journal.clone();
+        let changed = self.execution_changed.clone();
         committed.pending = Some(tokio::spawn(async move {
-            journal
-                .submit(tx.tx_id, tx.events, flow_journal::QueueClass::Control)
-                .await
+            let result = journal.submit_prepared(tx, rows).await;
+            changed.notify_one();
+            result
         }));
         self.refresh_locked(committed)
             .await?
-            .ok_or_else(|| JournalError::Projection("missing pending commit receipt".into()))
+            .ok_or_else(|| JournalError::Storage("missing pending commit receipt".into()))
     }
     async fn refresh_locked(&self, committed: &mut CommittedState) -> Result<Option<u64>> {
-        let mut submitted = None;
-        if let Some(pending) = committed.pending.as_mut() {
-            // Await by reference: aborting the RPC leaves this pending decision owned by the
-            // coordinator. A conflicting retry first joins it, then consults committed state.
-            let result = pending
-                .await
-                .map_err(|e| JournalError::Projection(e.to_string()));
-            committed.pending = None;
-            submitted = Some(result??.transaction.lsn);
-        }
-        loop {
-            if committed.applying.is_none() {
-                if committed.reading.is_none() {
-                    let upper = self.journal.durable_lsn();
-                    if committed.state.applied_lsn >= upper {
-                        break;
-                    }
-                    let mut reader = committed.reader.take().expect("owned journal reader");
-                    let applied = committed.state.applied_lsn;
-                    committed.reading = Some(tokio::task::spawn_blocking(move || {
-                        let next = (|| {
-                            while let Some((tx, _)) = reader.next(upper)? {
-                                if tx.lsn > applied {
-                                    return Ok(Some(tx));
-                                }
-                            }
-                            Ok(None)
-                        })();
-                        (reader, next)
-                    }));
+        let Some(pending) = committed.pending.as_mut() else {
+            return Ok(None);
+        };
+        // Await by reference: cancellation leaves the complete accepted decision owned here.
+        let outcome = pending
+            .await
+            .map_err(|e| JournalError::Storage(e.to_string()));
+        committed.pending = None;
+        let commit = outcome??;
+        let tx = &commit.transaction;
+        committed.state.apply(tx)?;
+        let parents: Vec<_> = committed
+            .state
+            .runs
+            .values()
+            .filter(|r| r.terminal())
+            .filter_map(|r| r.parent.as_ref().map(|p| p.run_id.clone()))
+            .collect();
+        committed.dirty_runs.extend(parents);
+        crate::journal_history::trim(&mut committed.state);
+        for event in &tx.events {
+            if let Some(id) = &event.run_id {
+                if committed.state.runs.get(id).is_some_and(|r| !r.terminal()) {
+                    committed.dirty_runs.insert(id.clone());
+                } else {
+                    committed.dirty_runs.remove(id);
                 }
-                // Await by reference so cancelled RPCs cannot lose the reader or its position.
-                let result = committed.reading.as_mut().unwrap().await;
-                committed.reading = None;
-                let (reader, next) = match result {
-                    Ok(result) => result,
-                    Err(error) => {
-                        // A panicked worker cannot return its reader. Re-scan on the next
-                        // attempt; already applied LSNs are skipped below.
-                        committed.reader =
-                            Some(TailReader::new(self.journal.root(), self.journal.id()));
-                        return Err(JournalError::Projection(error.to_string()));
-                    }
-                };
-                committed.reader = Some(reader);
-                committed.applying = next?;
-            }
-            let Some(tx) = committed.applying.as_ref() else {
-                break;
-            };
-            // Keep the transaction owned across cancellation; a retry can idempotently
-            // finish the index before exposing reducer state or acknowledging the audit.
-            if committed.state.applied_lsn < tx.lsn {
-                crate::journal_history::prepare(&self.audit_index, &mut committed.state, tx)
-                    .await?;
-                committed.state.apply(tx)?;
-            }
-            self.audit_index
-                .apply(
-                    self.journal.id(),
-                    tx.lsn,
-                    crate::journal_history::index_rows(&committed.state, tx)?,
-                )
-                .await
-                .map_err(|e| JournalError::Projection(e.to_string()))?;
-            let parents: Vec<_> = committed
-                .state
-                .runs
-                .values()
-                .filter(|r| r.terminal())
-                .filter_map(|r| r.parent.as_ref().map(|p| p.run_id.clone()))
-                .collect();
-            committed.dirty_runs.extend(parents);
-            crate::journal_history::trim(&mut committed.state);
-            let tx = committed.applying.take().expect("owned transaction");
-            for event in &tx.events {
-                if let Some(id) = &event.run_id {
-                    if committed.state.runs.get(id).is_some_and(|r| !r.terminal()) {
-                        committed.dirty_runs.insert(id.clone());
-                    } else {
-                        committed.dirty_runs.remove(id);
-                    }
-                    if event.kind == EventKind::RunCancelled {
-                        let children = committed
-                            .state
-                            .runs
-                            .values()
-                            .filter(|r| {
-                                !r.terminal() && r.parent.as_ref().is_some_and(|p| p.run_id == *id)
-                            })
-                            .map(|r| r.run_id.clone())
-                            .collect::<Vec<_>>();
-                        committed.dirty_runs.extend(children);
-                    }
+                if event.kind == EventKind::RunCancelled {
+                    let children = committed
+                        .state
+                        .runs
+                        .values()
+                        .filter(|r| {
+                            !r.terminal() && r.parent.as_ref().is_some_and(|p| p.run_id == *id)
+                        })
+                        .map(|r| r.run_id.clone())
+                        .collect::<Vec<_>>();
+                    committed.dirty_runs.extend(children);
                 }
             }
         }
         if !committed.dirty_runs.is_empty() {
             self.execution_changed.notify_one();
         }
-        // notify_one（非 notify_waiters）：投影循环在批次间隙重新注册
-        // waited future 之前到达的通知会丢；notify_one 会留存一个许可，
-        // 把视图滞后从「最长 20ms 轮询间隔」压到「批次处理时间」。
-        self.changed.notify_one();
-        Ok(submitted)
+        Ok(Some(tx.lsn))
     }
     fn receipt(&self, record: &CommandRecord) -> CommandReceipt {
         CommandReceipt {
@@ -888,22 +545,7 @@ impl JournalBackend {
         }
     }
     async fn visible(&self, mut receipt: CommandReceipt) -> Result<CommandReceipt> {
-        let wait = async {
-            loop {
-                let notified = self.projected.notified();
-                if self.projected_lsn.load(Ordering::Acquire) >= receipt.commit_cursor.lsn {
-                    return Ok::<(), JournalError>(());
-                }
-                if self.projection_error.lock().await.is_some() {
-                    return Err(JournalError::Projection("projector unavailable".into()));
-                }
-                notified.await;
-            }
-        };
-        let timeout = Duration::from_millis(self.wait_timeout_ms.load(Ordering::Relaxed).max(1));
-        if !matches!(tokio::time::timeout(timeout, wait).await, Ok(Ok(()))) {
-            return Err(JournalError::CommittedNotVisible(receipt));
-        }
+        // The current rows and receipt became visible at the same COMMIT as their facts.
         receipt.visible = true;
         Ok(receipt)
     }
@@ -924,10 +566,10 @@ impl JournalBackend {
             return Ok(None);
         };
         receipt.visible = self
-            .projection
+            .store
             .applied_lsn()
             .await
-            .map_err(|e| JournalError::Projection(e.to_string()))?
+            .map_err(|e| JournalError::Storage(e.to_string()))?
             >= receipt.commit_cursor.lsn;
         Ok(Some(receipt))
     }
@@ -960,38 +602,23 @@ impl JournalBackend {
         drop(committed);
         Ok(Some(self.visible(receipt).await?))
     }
-    pub fn pause_projection(&self, paused: bool) {
-        self.paused.store(paused, Ordering::Relaxed);
-        self.changed.notify_one();
-    }
-    /// 调整写命令等到投影可见的上限（毫秒）。测试注入用；产品默认 30s，
-    /// 健康路径下投影在毫秒级追平，超时即投影病理。
-    pub fn set_projection_wait(&self, ms: u64) {
-        self.wait_timeout_ms.store(ms, Ordering::Relaxed);
-    }
     pub async fn close(&self) -> Result<()> {
-        // 顺序要紧：先让协调器停，**投影继续跑**——协调器在飞的
-        // `run_cancel`/`command` 还要等 `applied_lsn >= commit_lsn`；投影先停
-        // 会让每个等待吃满 wait_timeout（默认 30s），close 表现为挂死。
         self.shutdown.cancel();
         if let Some(task) = self.execution.lock().await.take() {
             let _ = task.await;
         }
-        self.projector_stop.cancel();
-        if let Some(task) = self.projector.lock().await.take() {
-            let _ = task.await;
-        }
-        if let Err(error) = self.checkpoint().await {
-            tracing::warn!(%error,"checkpoint unavailable; next startup will replay journal");
-        }
+        let pending = {
+            let mut committed = self.state.lock().await;
+            self.refresh_locked(&mut committed).await
+        };
         let closed = self.journal.close().await;
         #[cfg(feature = "journal-cluster")]
         if let Some(cluster) = self.cluster.get() {
             let snapshot = self.cluster_snapshot().await.ok();
             cluster.close(snapshot.as_ref()).await;
         }
-        self.projection.close().await;
-        self.audit_index.close().await;
+        self.store.close().await;
+        pending?;
         closed?;
         Ok(())
     }
@@ -1003,27 +630,11 @@ impl JournalBackend {
     pub fn install_cluster(&self, cluster: Arc<crate::journal_cluster::Membership>) -> bool {
         self.cluster.set(cluster).is_ok()
     }
-    #[cfg(feature = "journal-cluster")]
-    pub(crate) async fn projection_failure(&self) -> Option<String> {
-        self.projection_error.lock().await.clone()
-    }
     pub async fn checkpoint(&self) -> Result<()> {
-        let mut committed = self.state.lock().await;
-        self.refresh_locked(&mut committed).await?;
-        let upper = committed.state.applied_lsn;
-        // 已发布值快照只保留仍被状态引用的 Ref：终态 run 的历史值不进
-        // checkpoint（见 ValueCatalog::snapshot 的安全依据）。
-        let state = serde_json::to_value(&committed.state)?;
-        let live = live_output_ids(&state);
-        let snapshot =
-            serde_json::json!({"state":state,"values":committed.state.values.snapshot(&live)?});
         let root = self.journal.root().to_path_buf();
-        drop(committed);
-        tokio::task::spawn_blocking(move || {
-            flow_journal::maintenance::write_checkpoint(&root, upper, 5, snapshot)
-        })
-        .await
-        .map_err(|e| JournalError::Projection(e.to_string()))??;
+        tokio::task::spawn_blocking(move || flow_journal::maintenance::checkpoint(&root))
+            .await
+            .map_err(|e| JournalError::Storage(e.to_string()))??;
         Ok(())
     }
     pub(crate) fn cancellation(&self) -> CancellationToken {
@@ -1033,7 +644,13 @@ impl JournalBackend {
         self.execution_changed.clone()
     }
     pub(crate) async fn take_dirty_runs(&self) -> Vec<String> {
-        std::mem::take(&mut self.state.lock().await.dirty_runs)
+        let mut committed = self.state.lock().await;
+        if let Err(error) = self.refresh_locked(&mut committed).await {
+            tracing::error!(%error,"cannot finish accepted SQLite transition");
+            self.shutdown.cancel();
+            return Vec::new();
+        }
+        std::mem::take(&mut committed.dirty_runs)
             .into_iter()
             .collect()
     }
@@ -1073,14 +690,14 @@ impl JournalBackend {
         serde_json::json!({
             "applied_lsn": applied_lsn,
             "resident_runs":resident_runs,"resident_attempts":resident_attempts,"cached_publications":cached_publications,
-            "projected_lsn": self.projected_lsn.load(std::sync::atomic::Ordering::Acquire),
+            "projected_lsn": stats.durable_lsn,
             "durable_lsn": stats.durable_lsn,
             "writer_failure": stats.failure,
             "commit_pending": pending,
             "peak_queued_requests": stats.peak_queued_requests,
             "dirty_runs": dirty,
             "dirty_run_count": dirty_count,
-            "projection_error": self.projection_error.lock().await.clone(),
+            "projection_error": Option::<String>::None,
             "executor_peak": self.execution_peak(),
             "coordinator_ticks": self.coordinator_ticks.load(Ordering::Relaxed),
             "coordinator_last_tick_ms": self.coordinator_last_tick_ms.load(Ordering::Relaxed),
@@ -1110,9 +727,9 @@ fn audit_key(event: &Event) -> flow_journal::Result<String> {
         event.audit_seq,
     ))?)
 }
-pub(crate) fn audit_rows(tx: &Transaction) -> flow_journal::Result<Vec<ProjectedRow>> {
+pub(crate) fn audit_rows(tx: &Transaction) -> flow_journal::Result<Vec<EntityChange>> {
     tx.events.iter().filter(|event| event.audit_seq > 0).map(|event| {
-        Ok(ProjectedRow { kind: "audit".into(), key: audit_key(event)?, value: Some(serde_json::json!({
+        Ok(EntityChange { kind: "audit".into(), key: audit_key(event)?, value: Some(serde_json::json!({
             "digest": flow_journal::codec::digest(&flow_journal::codec::bounded_json(event, flow_journal::MAX_LINE_BYTES)?),
             "lsn": tx.lsn.to_string(),
         })) })
@@ -1120,15 +737,13 @@ pub(crate) fn audit_rows(tx: &Transaction) -> flow_journal::Result<Vec<Projected
 }
 
 fn run_row(run: &flow_engine::journal_state::Run) -> flow_journal::Result<Value> {
-    let mut value = serde_json::to_value(run.summary())?;
-    value["_node_layout"] = Value::String("split-v1".into());
-    Ok(value)
+    Ok(serde_json::to_value(run.summary())?)
 }
 
 pub(crate) fn project_rows(
     state: &State,
     tx: &Transaction,
-) -> flow_journal::Result<Vec<ProjectedRow>> {
+) -> flow_journal::Result<Vec<EntityChange>> {
     let mut keys = BTreeSet::new();
     for e in &tx.events {
         if let Some(id) = &e.run_id {
@@ -1183,6 +798,19 @@ pub(crate) fn project_rows(
             | EventKind::WorkflowDeleted => {
                 if let Some(id) = e.payload["workflow_id"].as_str() {
                     keys.insert(("workflow", id.into()));
+                    let version = match e.kind {
+                        EventKind::WorkflowUpdated => e.payload["version"]["version"].as_u64(),
+                        EventKind::WorkflowPublished => {
+                            Some(flow_engine::journal_state::number(&e.payload, "version")?)
+                        }
+                        _ => None,
+                    };
+                    if let Some(version) = version {
+                        keys.insert((
+                            "workflow_version",
+                            serde_json::to_string(&(id, format!("{version:020}")))?,
+                        ));
+                    }
                 }
             }
             EventKind::ScheduleChanged => {
@@ -1217,9 +845,7 @@ pub(crate) fn project_rows(
                         .get(&run_id)
                         .and_then(|r| r.nodes.get(&node_id))
                         .map(|node| {
-                            let mut value = serde_json::to_value(node.summary())?;
-                            value["_attempt_layout"] = Value::String("split-v1".into());
-                            Ok::<_, serde_json::Error>(value)
+                            serde_json::to_value(node.summary())
                         })
                         .transpose()?
                 }
@@ -1234,55 +860,28 @@ pub(crate) fn project_rows(
                         .map(serde_json::to_value)
                         .transpose()?
                 }
-                "workflow" => state
-                    .workflows
-                    .get(&key)
-                    .map(serde_json::to_value)
-                    .transpose()?,
+                "workflow" => state.workflows.get(&key).map(|workflow| {
+                    let mut summary=serde_json::json!({"workflow_id":workflow.workflow_id,"name":workflow.name,"created_at":workflow.created_at,"versions":{}});
+                    summary["latest_version"]=serde_json::json!(workflow.versions.last_key_value().map_or(0,|(v,_)|*v));
+                    summary["published_version"]=serde_json::json!(workflow.versions.iter().rev().find(|(_,v)|v.published).map(|(v,_)|*v));
+                    summary
+                }),
+                "workflow_version" => {
+                    let (id,version):(String,String)=serde_json::from_str(&key)?;
+                    let version=version.parse::<u64>().map_err(|_|flow_journal::Error::Invalid("invalid version key".into()))?;
+                    state.workflows.get(&id).and_then(|w|w.versions.get(&version)).map(serde_json::to_value).transpose()?
+                },
                 "schedule" => state.schedules.get(&key).cloned(),
                 "webhook" => state.webhooks.get(&key).cloned(),
                 "template" => state.templates.get(&key).cloned(),
                 "legacy" => state.legacy.get(&key).cloned(),
                 _ => None,
             };
-            Ok(ProjectedRow {
+            Ok(EntityChange {
                 kind: kind.into(),
                 key,
                 value,
             })
         })
         .collect()
-}
-
-/// 状态仍引用的已发布值 id 集：把整个状态序列化后递归扫 ValueRef 的
-/// serde 形状（`journal_id`+`output_id`+`digest` 三键同现即命中）。
-/// 任何被 runs/workflows/commands/attempts 持有的 StoredValue::Ref 都
-/// 躲不过这层扫描——按字段枚举引用面则永远怕漏一处。
-fn live_output_ids(state: &Value) -> std::collections::HashSet<String> {
-    fn walk(value: &Value, live: &mut std::collections::HashSet<String>) {
-        match value {
-            Value::Object(map) => {
-                if map.contains_key("journal_id")
-                    && map.contains_key("digest")
-                    && map.contains_key("chunk_count")
-                {
-                    if let Some(output_id) = map.get("output_id").and_then(Value::as_str) {
-                        live.insert(output_id.to_string());
-                    }
-                }
-                for child in map.values() {
-                    walk(child, live);
-                }
-            }
-            Value::Array(items) => {
-                for child in items {
-                    walk(child, live);
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut live = std::collections::HashSet::new();
-    walk(state, &mut live);
-    live
 }

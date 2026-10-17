@@ -1,9 +1,3 @@
-//! flow-store：journal v2 的 SQLite 投影。
-//!
-//! v1 的 `Store`（flow.db 元数据权威）已随 v1 后端删除（历史数据
-//! 不迁移——见 docs/SQLITE_V1_TO_V2_MIGRATION.md）。本 crate 只剩
-//! [`projection`]：journal 权威的一次性查询投影，可随时由
-//! `flow-journal-dev rebuild-projection` 重建。定义 checksum 的实现由
-//! 各使用方自带同算法副本。
-
-pub mod projection;
+//! Read-only product and execution queries over flow.sqlite.
+//! The flow-journal writer atomically owns facts, current entities and receipts.
+pub mod store;

@@ -441,12 +441,31 @@ impl State {
     /// Transaction-local staging guarantees that a malformed later event cannot expose its
     /// earlier sibling. Only affected maps/objects are touched by the committed replacement.
     pub fn apply(&mut self, tx: &Transaction) -> Result<()> {
-        self.apply_mode(tx, true)
+        self.apply_mode(tx, true, |_| Ok(()))
     }
     pub fn check(&mut self, tx: &Transaction) -> Result<()> {
-        self.apply_mode(tx, false)
+        self.apply_mode(tx, false, |_| Ok(()))
     }
-    fn apply_mode(&mut self, tx: &Transaction, commit: bool) -> Result<()> {
+    /// Inspect the proposed state and always restore the old state, including when
+    /// encoding fails. Uses the same affected-entity undo as apply(), not a full clone.
+    pub fn preview<T>(
+        &mut self,
+        tx: &Transaction,
+        inspect: impl FnOnce(&State) -> Result<T>,
+    ) -> Result<T> {
+        let mut output = None;
+        self.apply_mode(tx, false, |state| {
+            output = Some(inspect(state)?);
+            Ok(())
+        })?;
+        Ok(output.expect("successful preview"))
+    }
+    fn apply_mode(
+        &mut self,
+        tx: &Transaction,
+        commit: bool,
+        inspect: impl FnOnce(&State) -> Result<()>,
+    ) -> Result<()> {
         tx.validate()?;
         if tx.lsn != self.applied_lsn + 1
             || (!self.journal_id.is_empty() && self.journal_id != tx.journal_id)
@@ -691,6 +710,7 @@ impl State {
                     }
                 }
             }
+            inspect(self)?;
             Ok(())
         })();
         if result.is_err() || !commit {
