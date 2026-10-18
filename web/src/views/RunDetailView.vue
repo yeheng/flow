@@ -3,9 +3,12 @@ import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import * as api from "../api/flow";
 import { errText } from "../rpc/client";
+import { isResponseTooLarge } from "../rpc/errors";
 import { editor, ensureNodeTypes, refreshWorkflows } from "../state/editor";
 import { attachRun, detachRun, monitor } from "../state/monitor";
-import { runStatusLabel, sourceLabel } from "../state/labels";
+import { runBadgeClass, runStatusLabel, sourceLabel, TERMINAL_RUN_STATUSES } from "../state/labels";
+import { regressionBaseline } from "../state/regression";
+import { describeStoredValue, rawRunToRecord, type ValueMarker } from "../state/run-raw";
 import { toast } from "../state/toast";
 import type { Definition, RunEvent, RunRecord } from "../types";
 import RunCanvas from "../components/RunCanvas.vue";
@@ -14,6 +17,8 @@ import LogConsole from "../components/LogConsole.vue";
 import NodeInspector from "../components/NodeInspector.vue";
 import ResizeHandle from "../components/ResizeHandle.vue";
 import AppButton from "../components/AppButton.vue";
+import RegressionDialog from "../components/RegressionDialog.vue";
+import RunComparePanel from "../components/RunComparePanel.vue";
 import { usePanelResize } from "../state/panel-resize";
 
 const props = defineProps<{ runId: string }>();
@@ -27,9 +32,111 @@ const definition = ref<Definition | null>(null);
 const loadingDefinition = ref(false);
 const showEvents = ref(false);
 const events = ref<RunEvent[] | null>(null);
+const eventsCursor = ref<Record<string, unknown> | null>(null);
+const eventsLoading = ref(false);
 const activeTab = ref<"timeline" | "logs">("timeline");
 /** 快速切换 run（子 run 链接）时旧加载的响应一律丢弃 */
 let generation = 0;
+
+/** 回归：以当前 run 为基线发起候选；候选 run 反过来给出基线与对比入口 */
+const showRegression = ref(false);
+const showCompare = ref(false);
+const compareBaseline = ref<string | null>(null);
+const compareCandidate = ref("");
+/** 回归候选终结后自动打开对比，同一页面只自动弹一次 */
+const autoCompared = ref(false);
+
+/**
+ * 大值降级：物化视图（run.get.view）超 8MB 预算整体失败时走原始信封渲染，
+ * 输入/输出给下载入口，时间线/日志不可用（timeline 同样物化大值会失败）。
+ */
+const liteMode = ref(false);
+const inputValue = computed(() => describeStoredValue(record.value?.input));
+const outputValue = computed(() => describeStoredValue(record.value?.output));
+const downloading = ref("");
+
+async function downloadRef(marker: ValueMarker): Promise<void> {
+  if (!record.value || !marker.outputId || downloading.value) return;
+  downloading.value = marker.outputId;
+  try {
+    await api.downloadValue(record.value.id, marker.outputId);
+    toast.info("已开始下载完整值");
+  } catch (e) {
+    toast.error(errText(e));
+  } finally {
+    downloading.value = "";
+  }
+}
+
+/** 以本 run 为基线的回归候选（扫描本工作流最近 500 条，按 source_detail 归属） */
+const candidates = ref<RunRecord[] | null>(null);
+const candidatesLoading = ref(false);
+let candidatesLoaded = false;
+
+async function loadCandidates(): Promise<void> {
+  const current = record.value;
+  if (!current || candidatesLoaded || candidatesLoading.value) return;
+  candidatesLoading.value = true;
+  candidatesLoaded = true;
+  try {
+    const runs = await api.listRuns({ workflowId: current.workflow_id, limit: 500 });
+    candidates.value = runs.filter((r) => regressionBaseline(r.source_detail) === current.id);
+  } catch (e) {
+    candidatesLoaded = false;
+    toast.error(errText(e));
+  } finally {
+    candidatesLoading.value = false;
+  }
+}
+
+function onCandidatesToggle(e: Event): void {
+  if ((e.target as HTMLDetailsElement).open) void loadCandidates();
+}
+
+/** 实时状态：monitor 正挂在这个 run 上时以订阅投影为准（run.get 快照不会自己刷新） */
+const currentStatus = computed(() => {
+  const r = record.value;
+  if (!r) return "";
+  return monitor.runId === r.id ? (monitor.status ?? r.status) : r.status;
+});
+const isTerminalRun = computed(() => TERMINAL_RUN_STATUSES.has(currentStatus.value));
+/** 本 run 若由回归创建，source_detail = regression:<baseline> */
+const regressionBase = computed(() => regressionBaseline(record.value?.source_detail));
+
+function openCompare(prefill?: string | null, candidate?: string): void {
+  compareBaseline.value = prefill ?? regressionBase.value ?? null;
+  compareCandidate.value = candidate ?? record.value?.id ?? "";
+  showCompare.value = true;
+}
+
+function onRegressionCreated(runId: string): void {
+  showRegression.value = false;
+  void router.push(`/runs/${runId}`);
+}
+
+// 回归候选一旦终结就自动对比基线（这就是它存在的目的）；失败由面板内联展示
+watch([currentStatus, regressionBase, () => record.value?.id], () => {
+  if (autoCompared.value || !record.value || !regressionBase.value || !isTerminalRun.value) return;
+  autoCompared.value = true;
+  openCompare(regressionBase.value);
+});
+
+// 运行中打开的 run：run.get 快照不会自己刷新。monitor 投影进入终态后补拉一次
+// record，让输出/错误/「实时」徽章与右侧时间线一致。journal 不记录终态墙钟，
+// ended_at 仍可能为空——这是数据面限制，不用客户端时间编造。
+watch(currentStatus, async (status) => {
+  const current = record.value;
+  if (!current || !status || status === current.status) return;
+  const gen = generation;
+  try {
+    const fresh = await api.getRun(current.id);
+    if (gen !== generation || record.value?.id !== current.id) return;
+    record.value = fresh.run;
+    live.value = fresh.live;
+  } catch {
+    // 订阅已给出终态，补拉失败不打断页面；下次进入会重新加载
+  }
+});
 
 /** 节点检查器：画布/时间线/日志点击节点时打开 */
 const inspectorNodeId = ref<string | null>(null);
@@ -113,22 +220,33 @@ async function copyRunId(): Promise<void> {
 async function copyOutput(): Promise<void> {
   if (!record.value) return;
   try {
-    await navigator.clipboard.writeText(fmtJson(record.value.output));
+    await navigator.clipboard.writeText(fmtJson(liteMode.value ? outputValue.value : record.value.output));
     toast.info("已复制输出");
   } catch {
     toast.error("复制失败");
   }
 }
 
+/** 原始事件按游标分页，长 run 不全量拉取 */
+async function loadEvents(cursor: Record<string, unknown> | null): Promise<void> {
+  if (eventsLoading.value) return;
+  const gen = generation;
+  eventsLoading.value = true;
+  try {
+    const page = await api.runEventsPage(props.runId, cursor);
+    if (gen !== generation) return;
+    events.value = [...(events.value ?? []), ...page.events];
+    eventsCursor.value = page.nextCursor;
+  } catch (e) {
+    if (gen === generation) toast.error(errText(e));
+  } finally {
+    if (gen === generation) eventsLoading.value = false;
+  }
+}
+
 async function toggleEvents(): Promise<void> {
   showEvents.value = !showEvents.value;
-  if (showEvents.value && events.value === null) {
-    try {
-      events.value = await api.runEvents(props.runId);
-    } catch (e) {
-      toast.error(errText(e));
-    }
-  }
+  if (showEvents.value && events.value === null) await loadEvents(null);
 }
 
 async function load(runId: string): Promise<void> {
@@ -137,7 +255,17 @@ async function load(runId: string): Promise<void> {
   definition.value = null;
   loadingDefinition.value = true;
   events.value = null;
+  eventsCursor.value = null;
+  eventsLoading.value = false;
   showEvents.value = false;
+  showRegression.value = false;
+  showCompare.value = false;
+  compareBaseline.value = null;
+  compareCandidate.value = "";
+  autoCompared.value = false;
+  liteMode.value = false;
+  candidates.value = null;
+  candidatesLoaded = false;
   try {
     const r = await api.getRun(runId);
     if (gen !== generation) return;
@@ -145,10 +273,26 @@ async function load(runId: string): Promise<void> {
     live.value = r.live;
   } catch (e) {
     if (gen !== generation) return;
-    loadingDefinition.value = false;
-    toast.error(`加载 run 失败：${errText(e)}`);
-    void router.replace("/runs");
-    return;
+    if (isResponseTooLarge(e)) {
+      // 降级：原始信封 + 下载入口，不挂时间线（timeline 同样物化大值会失败）
+      try {
+        const raw = await api.getRunRaw(runId);
+        if (gen !== generation) return;
+        record.value = rawRunToRecord(raw);
+        live.value = false;
+        liteMode.value = true;
+      } catch (e2) {
+        loadingDefinition.value = false;
+        toast.error(`加载 run 失败：${errText(e2)}`);
+        void router.replace("/runs");
+        return;
+      }
+    } else {
+      loadingDefinition.value = false;
+      toast.error(`加载 run 失败：${errText(e)}`);
+      void router.replace("/runs");
+      return;
+    }
   }
   // RunRecord 含 workflow_id + workflow_version：拉取 run 钉死的那版定义渲染只读 DAG
   if (await ensureNodeTypes()) {
@@ -160,6 +304,7 @@ async function load(runId: string): Promise<void> {
     }
   }
   if (gen === generation) loadingDefinition.value = false;
+  if (liteMode.value) return;
   try {
     await attachRun(runId);
   } catch (e) {
@@ -189,8 +334,8 @@ onUnmounted(() => {
   <div class="run-detail">
     <div v-if="record" class="run-header">
       <div class="run-header-row">
-        <span class="badge" :class="`run-${record.status}`">
-          {{ runStatusLabel(record.status) }}
+        <span class="badge" :class="runBadgeClass(currentStatus)">
+          {{ runStatusLabel(currentStatus) }}
         </span>
         <span class="mono run-full-id" :title="record.id">{{ record.id }}</span>
         <button class="run-copy" title="复制 run id" @click="copyRunId">复制</button>
@@ -203,6 +348,21 @@ onUnmounted(() => {
           <RouterLink class="link" :to="`/workflows/${record.workflow_id}/runs`">
             该工作流的运行记录
           </RouterLink>
+          <AppButton
+            v-if="isTerminalRun"
+            variant="link"
+            title="以本运行为基线，用指定版本重新执行（复用已记录的外部结果，不产生副作用）"
+            @click="showRegression = true"
+          >
+            回归
+          </AppButton>
+          <AppButton
+            variant="link"
+            title="与另一个 run 比较状态、输出与节点结果"
+            @click="openCompare()"
+          >
+            对比基线
+          </AppButton>
         </span>
       </div>
       <div class="run-header-row run-header-meta">
@@ -216,6 +376,12 @@ onUnmounted(() => {
             :to="`/workflows/${record.workflow_id}/triggers`"
           >
             （触发器）
+          </RouterLink>
+        </span>
+        <span v-if="regressionBase" class="run-regression-source">
+          回归自基线
+          <RouterLink class="link" :to="`/runs/${regressionBase}`" :title="regressionBase">
+            {{ regressionBase.slice(0, 8) }}…
           </RouterLink>
         </span>
       </div>
@@ -240,9 +406,22 @@ onUnmounted(() => {
       />
       <div class="io-panel">
         <template v-if="record">
+          <p v-if="liteMode" class="run-hint run-lite-hint">
+            该运行含超大值，已降级展示：时间线/日志不可用，输入/输出可下载完整值。
+          </p>
           <div class="io-block">
             <div class="io-label muted">输入</div>
-            <code class="run-io">{{ fmtJson(record.input) || "（空）" }}</code>
+            <div v-if="liteMode && inputValue.kind === 'ref'" class="io-ref">
+              大值 {{ inputValue.totalBytes ?? "?" }} 字节
+              <AppButton
+                variant="link"
+                :disabled="downloading === inputValue.outputId"
+                @click="downloadRef(inputValue)"
+              >
+                {{ downloading === inputValue.outputId ? "下载中…" : "下载完整值" }}
+              </AppButton>
+            </div>
+            <code v-else class="run-io">{{ fmtJson(liteMode ? inputValue.value : record.input) || "（空）" }}</code>
           </div>
           <div v-if="record.error" class="io-block">
             <div class="io-label muted">错误</div>
@@ -251,10 +430,45 @@ onUnmounted(() => {
           <div v-else-if="record.output !== null && record.output !== undefined" class="io-block">
             <div class="io-label muted">
               输出
-              <button class="run-copy" title="复制输出 JSON" @click="copyOutput">复制</button>
+              <button
+                v-if="!(liteMode && outputValue.kind === 'ref')"
+                class="run-copy"
+                title="复制输出 JSON"
+                @click="copyOutput"
+              >
+                复制
+              </button>
             </div>
-            <code class="run-io">{{ fmtJson(record.output) }}</code>
+            <div v-if="liteMode && outputValue.kind === 'ref'" class="io-ref">
+              大值 {{ outputValue.totalBytes ?? "?" }} 字节
+              <AppButton
+                variant="link"
+                :disabled="downloading === outputValue.outputId"
+                @click="downloadRef(outputValue)"
+              >
+                {{ downloading === outputValue.outputId ? "下载中…" : "下载完整值" }}
+              </AppButton>
+            </div>
+            <code v-else class="run-io">{{ fmtJson(liteMode ? outputValue.value : record.output) }}</code>
           </div>
+          <details class="run-candidates" @toggle="onCandidatesToggle">
+            <summary>回归候选（以本 run 为基线，点开加载）</summary>
+            <p v-if="candidatesLoading" class="run-hint">加载中…</p>
+            <template v-else-if="candidates && candidates.length">
+              <div v-for="c in candidates" :key="c.id" class="candidate-row">
+                <RouterLink class="link mono" :to="`/runs/${c.id}`" :title="c.id">
+                  {{ c.id.slice(0, 8) }}…
+                </RouterLink>
+                <span class="badge" :class="runBadgeClass(c.status)">
+                  {{ runStatusLabel(c.status) }}
+                </span>
+                <AppButton variant="link" @click="openCompare(record.id, c.id)">与它对比</AppButton>
+              </div>
+            </template>
+            <p v-else-if="candidates" class="run-hint">
+              暂无回归候选（按来源标记扫描本工作流最近 500 条）
+            </p>
+          </details>
         </template>
         <p v-else class="run-hint">加载中…</p>
       </div>
@@ -308,10 +522,32 @@ onUnmounted(() => {
               <span v-if="e.event.node_id" class="muted">{{ e.event.node_id }}</span>
             </div>
             <p v-if="events.length === 0" class="run-hint">无事件</p>
+            <AppButton
+              v-if="eventsCursor"
+              type="button"
+              variant="link"
+              :disabled="eventsLoading"
+              @click="loadEvents(eventsCursor)"
+            >
+              {{ eventsLoading ? "加载中…" : "加载更多事件" }}
+            </AppButton>
           </template>
         </div>
       </aside>
     </div>
+
+    <RegressionDialog
+      v-if="showRegression && record"
+      :baseline="record"
+      @close="showRegression = false"
+      @created="onRegressionCreated"
+    />
+    <RunComparePanel
+      v-if="showCompare && record"
+      :candidate-run-id="compareCandidate"
+      :initial-baseline="compareBaseline"
+      @close="showCompare = false"
+    />
   </div>
 </template>
 
@@ -344,6 +580,10 @@ onUnmounted(() => {
   font-size: 12px;
 }
 
+.run-regression-source {
+  color: var(--accent2);
+}
+
 .run-header-links {
   margin-left: auto;
   display: flex;
@@ -373,6 +613,36 @@ onUnmounted(() => {
 
 .run-io-error {
   color: var(--danger);
+}
+
+.run-lite-hint {
+  color: var(--warn);
+}
+
+.io-ref {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text2);
+}
+
+.run-candidates {
+  margin-top: 12px;
+  font-size: 12px;
+}
+
+.run-candidates summary {
+  cursor: pointer;
+  color: var(--text2);
+}
+
+.candidate-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
 }
 
 .center {

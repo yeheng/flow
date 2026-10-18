@@ -135,6 +135,15 @@ onBeforeRouteUpdate(async (to) => {
 
 onBeforeRouteLeave(() => confirmDiscardIfDirty());
 
+// 刷新/关页没有路由守卫可拦：仅 dirty 时触发浏览器原生确认（与编辑器同一份 dirty 判定）
+function onBeforeUnload(e: BeforeUnloadEvent): void {
+  if (!dirty.value) return;
+  e.preventDefault();
+  e.returnValue = "";
+}
+onMounted(() => window.addEventListener("beforeunload", onBeforeUnload));
+onUnmounted(() => window.removeEventListener("beforeunload", onBeforeUnload));
+
 function isEditableTarget(t: EventTarget | null): boolean {
   return (
     t instanceof HTMLElement && t.closest("input, textarea, select, [contenteditable]") !== null

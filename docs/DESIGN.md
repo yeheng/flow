@@ -1,11 +1,11 @@
 # flow 工作流引擎设计文档
 
-> 状态：**当前工作区代码的实际语义**（2026-10-17）。本文描述工作区实现，不保留
+> 状态：**当前工作区代码的实际语义**（2026-10-18）。本文描述工作区实现，不保留
 > 历史设计记录；被删除的 v1（SQLite/Postgres 双后端、Driver/Engine/fold 事件面、
 > `run_tail`、NodeSlot 状态机）相关内容已不在本文件中。
 >
 > 本地持久化采用 [SQLite 数据结构与提交协议](adr/0002-sqlite-persistence.md)。
-> `flow.sqlite` 同事务保存接受事实、当前状态、回执和待处理动作；不迁移旧数据。
+> `flow.sqlite` 同事务保存接受事实、当前状态、回执和待处理动作；SQLite v3 可离线复制升级到 v4。
 > 计算扩容不提供 master 高可用。
 >
 > **部署与运维见 [OPS.md](OPS.md)**（部署形态、执行模式、启动重启终止、离线维护、
@@ -13,11 +13,13 @@
 >
 > 相关文档：`docs/observability-design.md`（节点可观察性）、
 > `docs/opentelemetry-design.md`（已定未实现）、
-> `docs/IPC_PROTOCOL_BASELINE.md`（执行协议基线——**写于 v4，未随 IPC8 更新**，
+> `docs/IPC_PROTOCOL_BASELINE.md`（执行协议基线——**写于 v4，未随 v7 更新**，
 > 其中的帧格式与 `PROTOCOL_VERSION=4` 已过时；权威以 `contract.rs`/`message.rs`
 > 为准）。
 
 ---
+
+新版定义语义、固定依赖/执行上下文、业务调用、LLM、regression、证据包和格式升级的完整合同见 [EXECUTION.md](EXECUTION.md)。
 
 ## 0. 核心设计抉择
 
@@ -30,7 +32,7 @@
 | **C1** | **SQLite 是唯一业务权威，事实与当前状态同事务提交** | 减少应用自行维护的分段、索引追赶、快照与恢复协议；外部副作用仍由授权、未决状态和人工裁决约束。数据库事务不等于外部操作恰好一次。 |
 | **C2** | **节点执行语义只存在于 `flow-executor` 子进程；master 只做裁决与调度** | 工作流定义事实上是可执行代码（任意 JS + 任意出站 HTTP）。若在主进程内执行，一个失控脚本就能拖垮权威写者、让整个 journal 不可用。进程隔离把「用户代码」与「权威状态」分成两个故障域。进程内执行路径已全平台删除（`ExecutionMode` 只剩 `Ipc`）。 |
 | **C3** | **外部副作用发生前，意图必须先落盘**（`OperationIntent` + `OperationAuthorized` 同一事务） | 崩溃窗口的本质困难是「请求发出去了吗？」。只有把「我要发这个请求」变成 journal 事实，恢复期才能区分「从未发出」（可安全重试）与「已授权、结果未知」（必须人工裁决）。没有这个事实，任何自动重试都是赌博。 |
-| **C4** | **结果不明的已授权外部操作，绝不自动重发；挂起等人工裁决** | 自动重试会把「至少一次」悄悄变成「可能多次」，而重复扣款/重复发信比失败更难收拾。系统选择**响亮地停下来**（run 进 `awaiting_resume`）而不是安静地猜。人工 `run.adjudicate` 就是授权凭据。 |
+| **C4** | **未知外部结果默认等人工裁决；显式 repeatable 节点可获持久重试授权** | 自动重试会把「至少一次」悄悄变成「可能多次」，而重复扣款/重复发信比失败更难收拾。系统选择**响亮地停下来**（run 进 `awaiting_resume`）而不是安静地猜。人工 `run.adjudicate` 是默认授权路径；`effect_policy=repeatable` 还须提交 `OperationRetryAuthorized` 并受尝试次数限制，见 [执行合同](EXECUTION.md)。 |
 | **C5** | **单写者 + 数据目录排他 flock；计算容量可横向扩展，权威与提交点只有一份** | 分布式共识（Raft/多主复制）的工程与运维成本极高，而当前产品面的需求是「单机并发 + 计算扩容」。flock 让「双写者」在操作系统层不可能；`flow-agent` 只扩算力，**不提供 master 高可用**——这一点在代码与文档里都明确，不宣称 HA。 |
 | **C6** | **控制帧只携带身份与元数据，用户值字节一律走 data 语义帧分块传输** | 若值能进控制帧，一个 200 MiB 的节点输出就能把会话帧撑爆（协议层只能杀会话）。v2 起 `ExecuteTask` 里的 `input`/`predecessors`/`params` 只是**声明**（`TaskValue::{Ref, Local}`），字节由 `TransferChunk` 按 256 KiB 分块送。控制帧因此有确定性上界（128 KiB）。 |
 | **C7** | **每个 RPC 调用都要 token，但 token 是单用户凭据、不是多租户授权** | 系统没有用户体系，做成「多租户授权」会是假承诺。缺省只监听 loopback，对外暴露必须在外层自备 TLS + 认证。这个边界必须写在最前面，否则运维会误以为拿到 token 的不同人是不同租户。 |
@@ -74,7 +76,7 @@ crates/
   flow-config     统一配置（flow.toml，叶子 crate）：分层加载 + validate + 原子写回
   flow-journal    SQLite 写入 owner、事实分页、codec 预算、BLOB 值存储、离线维护
   flow-engine     执行引擎共享能力：定义模型与校验、JS 沙箱、表达式/模板、
-                  journal_state（run 状态折叠）、观测日志、密钥、执行协议（v5 postcard 单流）
+                  journal_state（run 状态折叠）、观测日志、密钥、执行协议（v7 postcard 单流）
   flow-store      同一 SQLite 库的只读执行与产品查询
   flow-backend    journal 唯一权威后端：journal.rs（JournalBackend）+ journal_commands
                   （产品 CRUD，request_id 幂等）+ journal_views（物化读面）+
@@ -100,6 +102,7 @@ crates/
 | `flow-executor` | flow-executor | 受管理执行子进程（通道 FD 经 argv `--channel-fd` 传递） |
 | `flow-agent` | flow-agent | 受信任远程执行中继 |
 | `flow-journal-tool` | flow-journal | journal 离线维护（verify/rebuild-index/backup） |
+| `flow-journal-dev` | flow-backend | 开发运行器，含 `check-projection` 事实重放校验 |
 | `flow-journal-bench` | flow-journal | journal 写入基准 |
 | `flow-journal-dev` | flow-backend | 开发运行器（run/resume/status/import-legacy） |
 
@@ -141,7 +144,7 @@ graph TB
         DISK[("data_dir/flow.sqlite<br/>事实 + 当前状态 + 回执 + BLOB")]
     end
 
-    subgraph L3["链路 3：执行面（v5 postcard 单流 IPC）"]
+    subgraph L3["链路 3：执行面（v7 postcard 单流 IPC）"]
         POOL["ExecutorPool<br/>x_max 个子进程"]
         EX["flow-executor<br/>节点语义唯一居所"]
         AM["AgentManager<br/>mTLS :9700 / WSS"]
@@ -172,7 +175,7 @@ graph TB
 
 1. master↔executor 是同一种 IPC 协议；master = backend（单机）或 agent（远程中继）。
 2. 节点执行语义只许存在于 `flow-executor`；master 只做裁决和调度。
-3. 协议 v5 postcard 单流：控制与数据复用**同一条双向流、同一个 `Message` 枚举**，
+3. 协议 v7 postcard 单流：控制与数据复用**同一条双向流、同一个 `Message` 枚举**，
    帧格式唯一——`u32 body_len(大端) | postcard(Message)`。没有独立的 data 通道、
    没有帧内 1 字节 `kind`：**postcard 的变体索引即帧类型**，`TransferChunk` 的
    二进制体由 postcard 原生承载（len varint + 原始字节，无 base64、无 JSON meta
@@ -192,7 +195,7 @@ graph TB
 | 模式 | 平台 | 节点执行位置 | 备注 |
 | --- | --- | --- | --- |
 | `ipc` | 全平台（缺省） | `flow-executor` 子进程 | 执行器缺失/协议版本不符直接失败，不静默回退 |
-| `remote` | 全平台 | 经 `flow-agent` 中继的远端执行器 | 单条 mTLS 或 WSS（v5 postcard 单流）；`mode=remote` 时 `[execution.remote]` 必填 |
+| `remote` | 全平台 | 经 `flow-agent` 中继的远端执行器 | 单条 mTLS 或 WSS（v7 postcard 单流）；`mode=remote` 时 `[execution.remote]` 必填 |
 | `in_process` | **已删除** | — | 全平台配置即报错；`ExecutionMode` enum 只剩 `Ipc` |
 
 执行模式在**配置期与装配期双重把关**：`flow-config` 的 validate 在任何平台拒绝
@@ -218,7 +221,7 @@ graph TB
 - `Event { v: 1, kind, run_id?, run_seq, dispatch_id?, node_id?, audit_seq, payload }`。
 - 首次业务提交为 LSN 1；提交序号由唯一写者分配，失败事务不占序号。
 - 事实存为 transactions/events 关系记录；保存完整事务摘要并在读取事实时校验。
-- JSONL envelope 仅用于显式导出及编码检查，不再是磁盘权威格式。
+- CLI 与运行证据包可导出 JSONL；磁盘权威是 SQLite 行，提交时只序列化一次。
 - `lsn` 是事务序号，`run_seq` 是 run 内业务序号，`audit_seq` 是 dispatch 内审计序号。
 
 ### 3.2 领域事件
@@ -302,7 +305,7 @@ Wait       { kind: WaitKind, wake_at, child_run_id, output }
   +1，否则 `unsafe dispatch retry`）、新建 `attempts[dispatch_id]`。
   **带未决 `operation`（outcome 为 None）时拒绝再次派发**——这是 C4 的折叠层闸门。
 - `NodeSkipped`：整条替换记录为 `Skipped` + `skip_reason`，不带 attempts 账本。
-- `InputPrepared`：校验 `prepared.input == run.input`、`node_semantics == 1`、
+- `InputPrepared`：校验 `prepared.input == run.input`、`node_semantics ∈ {1,2}`、
   每个前驱必须已 `Succeeded` 且输出逐字相同——**准备事实不得与已提交事实漂移**。
 - 任何 `audit_seq > 0` 的事件：必须 `audit_seq == attempt.audit_seq + 1`，且
   dispatch 已 sealed 时只接受 `LateAudit`（`audit gap/duplicate or sealed dispatch`）。
@@ -356,15 +359,18 @@ Wait       { kind: WaitKind, wake_at, child_run_id, output }
 | 表 | 职责 |
 | --- | --- |
 | store_meta | 数据集身份、提交水位和领域提交模式 |
-| transactions / events | 接受事实、完整事务摘要、run/dispatch 关联 |
-| current_entities | 每个 `(kind,key)` 唯一当前对象、摘要和排序键；覆盖更新 |
+| transactions / events | 接受事实、完整事务摘要与提交字节数、run/dispatch 关联 |
+| current_entities | 每个 `(kind,key)` 唯一当前对象；`parent/slot/extra` 是写时解析的键列，`workflow_id/status/source/name/dispatch_id` 是由 body 生成的查询列；覆盖更新 |
 | value_chunks | output/chunk 索引下的原始正文与摘要 |
 
-workflow 元数据与每个 definition version 分开；run 与 node 分开；node 与 attempt 分开。
-command/audit 回执、值发布及流进度、父子关系和 dispatch 所有权使用有明确用途的当前记录。
+当前行仍以 JSON body 作为 wire/事实投影的载体，但所有查询用显式列和 `WHERE kind=...` 分区索引，
+不再对 `key`/`body` 做 `json_extract` 表达式索引。workflow 元数据与每个 definition version 分开；
+run 与 node 分开；node 与 attempt 分开。
+command/audit 回执、值发布描述符、父子关系和 dispatch 所有权使用有明确用途的当前记录。
+未完成流的进度不落盘：值连续性、总字节和摘要由写者在提交时校验一次。
 不保留每次修改后的完整实体版本，不另建 execution index、projection、应用 checkpoint 或位置文件。
 
-列表过滤、排序、分页与计数在 SQLite 执行，表达式索引覆盖 workflow/status/source/name，
+列表过滤、排序、分页与计数在 SQLite 执行，`WHERE kind=...` 分区索引覆盖 workflow/status/source/name，
 另有 run-node、attempt、child、definition-version 和 run-event 索引。正常启动只取活跃 run。
 
 ---
@@ -767,7 +773,7 @@ graph TB
 
 **关键结构**：
 
-- **单条上联，双向复用**。v5 postcard 单流：agent 到 master 只有一条物理连接，
+- **单条上联，双向复用**。v7 postcard 单流：agent 到 master 只有一条物理连接，
   所有帧（控制语义与 data 语义）都在它上面跑，靠 `frame_limit()` 按消息类型分
   预算，不靠物理分通道。`FAIR_TURN_BYTES = 64 KiB` / `FAIR_TURN_FRAMES = 4` 做
   多个 dispatch 之间的公平轮转，防止一个大数据量 dispatch 饿死其他 dispatch。
@@ -1033,7 +1039,7 @@ Cargo feature：`journal-cluster`（依赖 `flow-backend/src/journal_cluster.rs`
 
 ## 8. 定义模型与校验
 
-### 8.1 节点类型（11 种）
+### 8.1 节点类型（12 种）
 
 | 类型 | wire 名 | 外部副作用 | 崩溃后可安全重放 | 说明 |
 | --- | --- | --- | --- | --- |
@@ -1048,8 +1054,9 @@ Cargo feature：`journal-cluster`（依赖 `flow-backend/src/journal_cluster.rs`
 | `SubWorkflow` | `sub_workflow` | 间接 | 是 | 子 run，等终态透传输出 |
 | `Harness` | `harness` | **是** | **否** | 外部 agent CLI（prompt 经 stdin，stdout 为输出） |
 | `Email` | `email` | **是** | **否** | Resend 兼容 HTTP API |
+| `Llm` | `llm` | **是** | **否** | 一次持久录制的 HTTP JSON 模型调用；工具操作用独立节点 |
 
-**`has_side_effect()` 是 C3/C4 的开关**：只有这三种类型会走
+**`has_side_effect()` 是 C3/C4 的开关**：这四种外部类型会走
 `OperationIntent`/`OperationAuthorized` 授权路径。其余类型失败后可以放心重试。
 
 **节点类型表的单一来源原则**：`NODE_TYPE_TABLE` 是 `(NodeType, &str)` 的常量表，
@@ -1072,7 +1079,13 @@ Cargo feature：`journal-cluster`（依赖 `flow-backend/src/journal_cluster.rs`
 
 ## 9. 执行语义
 
-### 9.1 汇合：AND-join，不是 OR-join
+### 9.1 汇合：按定义语义选择
+
+v2 默认 `selected`：等待所有入边确定后，收集选中且成功的前驱；未选路径不阻断
+汇合，全部路径 inactive 才传播 inactive，失败仍阻断下游。可用 `params.join: all`
+显式要求全部前驱成功。它不在第一个前驱完成时提前启动。
+
+以下图和优先级描述历史 v1 的 AND-join；v2 完整合同见 [EXECUTION.md](EXECUTION.md)。
 
 `incoming_gate`（纯函数，无 IO）对每条入边求值：
 
@@ -1118,7 +1131,7 @@ flowchart TB
 多个 end → 恒为 `map[end_id → output]`（**形状恒定**，不会因某个 end 被跳过
 而从 map 退化成标量）。
 
-### 9.3 重试：只有 `script`/`condition` 的执行期失败会自动重试
+### 9.3 重试：纯计算与显式 repeatable 外部操作
 
 `execute_node` 的错误路径（全部转成已提交证据）：
 
@@ -1149,18 +1162,7 @@ pure retry`）。这是 C4 的又一道闸门——有外部副作用的操作�
 `RetryPolicy` 缺省 `max_attempts = 1`、`backoff_ms = 0`，即**缺省不重试**；
 `max_attempts` 上限 clamp 到 100。
 
-**别把描述器里的 `supports_retry` 当成引擎的重试授权**。节点描述器给
-`script`/`condition`/`http_call`/`sub_workflow`/`harness`/`email` 六种类型都标了
-`supports_retry: true`，但引擎的自动重试只认上面四个条件（其中第三条把范围缩到
-`script`/`condition`）。两者的用途不同：
-
-| | 谁读它 | 含义 |
-| --- | --- | --- |
-| `supports_retry`（描述器） | 前端 | 「这个节点失败时值得给用户一个重试按钮」 |
-| 自动重试（`journal_driver`） | 引擎 | 「这个失败可以无人值守地再跑一次」 |
-
-`http_call` 标了 `supports_retry` 却不会被自动重试，正是 C4 的要求：外部副作用
-一旦发出，重试就不是纯计算了。
+外部节点的描述器公开 `retry_scope=declared_repeatable_only`。默认 `effect_policy=manual` 不自动重发；只有显式声明重复调用始终安全且配置了剩余尝试次数时，协调器才能提交 `OperationRetryAuthorized`，清除当前未知操作并进入持久 backoff，再创建下一次尝试。有限有效期幂等协议不应使用此声明。详细边界见 [EXECUTION.md](EXECUTION.md)。
 
 ### 9.4 输入节点：逐字段三级兜底
 
@@ -1191,7 +1193,7 @@ pure retry`）。这是 C4 的又一道闸门——有外部副作用的操作�
 | 输出预算 | 8 MiB |
 | JSON 深度 | 64 层（`validate_depth`，入参即校验） |
 | 超时 | `DEFAULT_JS_TIMEOUT_MS = 2000`，靠 `set_interrupt_handler` 轮询 deadline |
-| **BigInt 边界** | **BigInt 不得跨边界传递**——入参/出参一律经 JSON，BigInt 在序列化处即报错 |
+| **BigInt 边界** | 超过 JS 精确整数域的 i64/u64 使用 BigInt 无损进出；超出 i64/u64 的结果拒绝 |
 
 `JsLimits` 是**单一定义处**（`flow-engine/src/expr.rs`），本地与远程执行共用同一组
 数字——否则「本机能跑、远程 OOM」会成为一类无法复现的问题。
@@ -1220,10 +1222,10 @@ pure retry`）。这是 C4 的又一道闸门——有外部副作用的操作�
 
 ### 11.1 方法面
 
-`flow-rpc/src/journal_v2.rs` 注册 **50 个方法** + 1 个订阅（`run.subscribe`）。
+`flow-rpc/src/journal_v2.rs` 注册 **52 个方法** + 1 个订阅（`run.subscribe`）。
 所有方法共用一个入口：`module_product` 里的方法名数组 + `admit_call` 准入门。
 
-方法按访问性质分两张清单——`READ_METHODS` 27 项 / `WRITE_METHODS` 23 项。**注意
+方法按访问性质分两张清单——`READ_METHODS` 28 项 / `WRITE_METHODS` 24 项。**注意
 这两张表不做权限分级，也没有「暂停期」语义**（不存在维护窗口：没有 paused 标志，
 读写在运行期同权）。它们只服务三件事：
 
@@ -1323,8 +1325,8 @@ body ≤ 8 MiB。
 | `401` | Bearer 不符 |
 | `400` | 载荷非法 |
 | `409` | `Idempotency-Key` 重复且载荷不同 |
-| `202` | 已受理（run 已创建） |
-| `503` | 写入暂停期 |
+| `200` | 旧 hook 已受理（run 已创建）；独立业务入口 `/invoke/{id}` 使用 202 |
+| `503` | 存储或服务暂不可用 |
 
 ---
 
@@ -1357,7 +1359,7 @@ observations 使用独立队列与磁盘限额。删除后日志永久丢失，�
 
 ### 12.4 故障注入
 
-`flow-backend/src/execution/fault.rs` 提供一个**全局**命名观测点注册表
+`flow-backend/src/execution/dispatch.rs::fault` 提供一个**全局**命名观测点注册表
 （`register` / `clear` / `checkpoint`），测试用它确定性地在「结果提交前」
 「取消后」等精确位置切断。因为注册表是全局的，注入测试必须串行执行。
 
@@ -1384,7 +1386,7 @@ observations 使用独立队列与磁盘限额。删除后日志永久丢失，�
 | --- | --- |
 | I6 | 任何外部副作用发生前，`OperationIntent` + `OperationAuthorized` 必须已作为**同一事务**落盘 |
 | I7 | `operation.outcome` 为 None 的节点不得再次派发（`unsafe dispatch retry`） |
-| I8 | 结果不明的已授权操作不得自动重发；唯一出路是 `WaitRegistered{Uncertain}` → 人工 `run.adjudicate` |
+| I8 | 未知结果默认等待人工裁决；仅显式 repeatable 且持久提交机器重试授权时可自动重试 |
 | I9 | `retry_wake_at` 与 `operation` 互斥（`external operation cannot use pure retry`） |
 | I10 | `OperationIntent` 与 `OperationAuthorized` 在事务内相邻、载荷全同、`audit_seq` 均为 0 |
 | I11 | `OperationAuthorized` 的 `fingerprint` 必须等于请求字节摘要 |
@@ -1405,7 +1407,7 @@ observations 使用独立队列与磁盘限额。删除后日志永久丢失，�
 | I16 | `audit_seq` 在 dispatch 内严格 +1；重复序号必须内容相同（`audit retransmit with different content` 是错误） |
 | I17 | 结果事件的 `sealed_through` 必须等于 `attempt.audit_seq`（`NodeCompleted` 额外 +1） |
 | I18 | dispatch 已 sealed 后只接受 `LateAudit`，且不得推进 `run_seq` |
-| I19 | `InputPrepared` 的 `prepared.input` 必须等于 `run.input`，`node_semantics` 必须为 1 |
+| I19 | `InputPrepared` 的 `prepared.input` 必须等于 `run.input`，`node_semantics` 必须为 1 或 2 |
 | I20 | `Attempt::finish` 幂等：同 dispatch 已有结果时，比较 kind 与去掉 `sealed_through` 的载荷 |
 
 ### 13.5 进程与协议边界
@@ -1418,7 +1420,7 @@ observations 使用独立队列与磁盘限额。删除后日志永久丢失，�
 | I24 | `ResultCommitted` 之前执行器不得退出（否则「已算未落盘」无法判别） |
 | I25 | `in_process` 执行模式在任何平台都不可配置 |
 
-### 13.6 执行协议线路（v5 postcard 单流）
+### 13.6 执行协议线路（v7 postcard 单流）
 
 **唯一帧格式**：`u32 body_len（大端）| postcard(Message)`。整条线只有这一种帧，
 没有第二种物理通道；postcard 的**变体索引即帧类型**。
@@ -1444,7 +1446,7 @@ observations 使用独立队列与磁盘限额。删除后日志永久丢失，�
 `CONTROL_MAX_FRAME` 上限（`frame.rs` 用 200 KiB 的能力列表钉住这条）。
 
 **版本门集中在握手**：v5 起每帧不再自带版本号，`Hello`/`Welcome` 携带
-`version`（= `PROTOCOL_VERSION` = 5），任一侧不匹配即明确拒绝。跨版本配对在握手
+`version`（= `PROTOCOL_VERSION` = 7），任一侧不匹配即明确拒绝。跨版本配对在握手
 处收口，不依赖逐帧校验。
 
 **审计计费与 wire 编码解耦**：`record_bytes()` 是主进程与执行器共用的确定性
@@ -1492,9 +1494,9 @@ v5 起内层 `TransferChunk` 的字节由嵌套枚举原生承载，v4 那个专
 | 层 | 位置 | 覆盖 |
 | --- | --- | --- |
 | **单元** | 各 crate `#[cfg(test)]` | 折叠规则、gate 判定、模板展开、codec 预算、协议编解码、幂等去重 |
-| **e2e** | `crates/backend-e2e/tests/` | **11 个文件、63 个 `e2e_test!` 用例**，真起进程（server + executor + agent） |
+| **e2e** | `crates/backend-e2e/tests/` | 与 `remote-e2e` 共同覆盖真实 server/executor/agent、故障注入和新版产品合同 |
 | **性能** | `crates/backend-perf/` | 黑盒压测 harness |
-| **故障注入** | `execution/fault.rs` | 在「结果提交前」「取消后」等精确位置确定性切断 |
+| **故障注入** | `execution/dispatch.rs::fault` | 在「结果提交前」「取消后」等精确位置确定性切断 |
 
 **e2e 是这份设计的真正守门人**。原因：本文档的多数不变量（I6–I24）只有在
 「进程真的被杀、连接真的断」时才可能被违反。单测里 mock 掉的时序，恰是这些
@@ -1536,4 +1538,4 @@ bug 的栖息地。
 | 加 RPC 方法 | `flow-rpc/src/journal_v2.rs` 的 `READ_METHODS`/`WRITE_METHODS` + 对应 handler |
 | 改触发器 | `flow-rpc/src/journal_triggers.rs` |
 | 改 agent 中继 | `flow-agent/src/{runtime,relay,pool}.rs` |
-| 离线维护 | `flow-journal/src/bin/flow-journal-tool.rs`（`verify`/`rebuild-index`/`backup`） |
+| 离线维护 | `flow-journal/src/bin/flow-journal-tool.rs`（`verify`/`rebuild-index`/`backup`）；`flow-journal-dev check-projection`（事实重放 diff） |

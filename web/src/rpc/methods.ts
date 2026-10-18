@@ -5,6 +5,7 @@ export const WRITE_METHODS = new Set([
   "workflow.publish",
   "workflow.delete",
   "run.start",
+  "run.regress",
   "run.cancel",
   "run.signal",
   "run.adjudicate",

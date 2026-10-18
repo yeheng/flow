@@ -404,7 +404,8 @@ e2e_test!(
                 "input",
                 "sub_workflow",
                 "harness",
-                "email"
+                "email",
+                "llm"
             ],
             "node 类型闭集：{ids:?}"
         );

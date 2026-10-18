@@ -6,6 +6,18 @@ use std::{io::Read, path::PathBuf};
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Execute a candidate against recorded external outcomes; fail CI on differences.
+    Regress {
+        baseline: String,
+        #[arg(long)]
+        workflow_id: Option<String>,
+        #[arg(long)]
+        version: Option<u64>,
+        #[arg(long, default_value_t = 60)]
+        timeout: u64,
+    },
+    /// Compare two terminal runs and return exit code 4 on differences.
+    Compare { baseline: String, candidate: String },
     /// Call a v2 method. Writes should include a stable request_id in the JSON file.
     Call {
         method: String,
@@ -63,6 +75,57 @@ pub async fn dispatch(client: &WsClient, command: Command) -> Result<(), CliErro
     let token =
         std::env::var("FLOW_JOURNAL_TOKEN").map_err(|_| error("FLOW_JOURNAL_TOKEN required"))?;
     match command {
+        Command::Regress {
+            baseline,
+            workflow_id,
+            version,
+            timeout,
+        } => {
+            let receipt = call(
+                client,
+                &token,
+                "run.regress",
+                json!({"baseline":baseline,"workflow_id":workflow_id,"version":version}),
+            )
+            .await?;
+            let candidate = receipt["result"]["run_id"]
+                .as_str()
+                .or_else(|| receipt["run_id"].as_str())
+                .ok_or_else(|| error("missing candidate run_id"))?
+                .to_owned();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout);
+            loop {
+                let report = call(
+                    client,
+                    &token,
+                    "run.compare",
+                    json!({"baseline":baseline,"candidate":candidate}),
+                )
+                .await?;
+                if report["complete"] == true {
+                    return print_comparison(report, &candidate);
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(error(format!(
+                        "regression timed out; candidate {candidate}"
+                    )));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+        Command::Compare {
+            baseline,
+            candidate,
+        } => print_comparison(
+            call(
+                client,
+                &token,
+                "run.compare",
+                json!({"baseline":baseline,"candidate":candidate}),
+            )
+            .await?,
+            &candidate,
+        )?,
         Command::Call { method, params } => {
             let mut bytes = Vec::new();
             std::fs::File::open(params)
@@ -146,4 +209,17 @@ pub async fn dispatch(client: &WsClient, command: Command) -> Result<(), CliErro
         }
     }
     Ok(())
+}
+
+fn print_comparison(report: Value, candidate: &str) -> Result<(), CliError> {
+    println!("{}", serde_json::to_string_pretty(&report).map_err(error)?);
+    if report["passed"] == true {
+        Ok(())
+    } else {
+        Err(CliError::RunFailed {
+            run_id: candidate.into(),
+            status: "regression_difference".into(),
+            error: Some("candidate did not match baseline".into()),
+        })
+    }
 }

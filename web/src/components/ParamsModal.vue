@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, useId, watch } from "vue";
 import { editor, selectedNode } from "../state/editor";
 import { commitParams } from "../state/history";
 import SchemaField from "./SchemaField.vue";
@@ -13,11 +13,24 @@ const nameInput = ref<HTMLInputElement>();
 
 const open = computed(() => editor.paramsOpen && !!node.value);
 
-// 右键「编辑参数」要直达改名：打开弹窗即聚焦名称输入框
+const dialogEl = ref<HTMLElement | null>(null);
+const titleId = useId();
+/** 打开弹窗前的焦点目标（触发按钮/画布节点）：关闭时还原 */
+const prevFocus = ref<HTMLElement | null>(null);
+
+// 右键「编辑参数」要直达改名：打开弹窗即聚焦名称输入框；关闭时把焦点还给打开前的元素
 watch(
   [open, () => node.value?.id],
   async ([isOpen], [, prevId], onCleanup) => {
-    if (!isOpen) return;
+    if (!isOpen) {
+      const el = prevFocus.value;
+      prevFocus.value = null;
+      el?.focus();
+      return;
+    }
+    if (prevFocus.value === null) {
+      prevFocus.value = (document.activeElement as HTMLElement | null) ?? null;
+    }
     let cancelled = false;
     onCleanup(() => (cancelled = true));
     await nextTick();
@@ -32,6 +45,36 @@ watch(
 function close(): void {
   editor.paramsOpen = false;
 }
+
+// Esc/Tab 挂 window：点过消息区、焦点跑到弹窗外也响应
+function onWindowKeydown(e: KeyboardEvent): void {
+  if (!open.value) return;
+  if (e.key === "Escape") {
+    e.preventDefault();
+    close();
+  } else if (e.key === "Tab") {
+    trapTab(e);
+  }
+}
+
+/** Tab 焦点只在弹窗内循环；内部非边缘焦点交给控件本身（Monaco 靠 Tab 缩进） */
+const FOCUSABLE = 'button, [href], input, textarea, select, [tabindex]:not([tabindex="-1"])';
+
+function trapTab(e: KeyboardEvent): void {
+  const items = Array.from(dialogEl.value?.querySelectorAll<HTMLElement>(FOCUSABLE) ?? []).filter(
+    (el) => !el.hasAttribute("disabled"),
+  );
+  if (items.length === 0) return;
+  const active = document.activeElement;
+  const inside = dialogEl.value?.contains(active) ?? false;
+  const edge = e.shiftKey ? items[0] : items[items.length - 1];
+  if (inside && active !== edge) return;
+  e.preventDefault();
+  (e.shiftKey ? items[items.length - 1] : items[0]).focus();
+}
+
+onMounted(() => window.addEventListener("keydown", onWindowKeydown));
+onUnmounted(() => window.removeEventListener("keydown", onWindowKeydown));
 
 function onName(ev: Event): void {
   if (!data.value || !node.value) return;
@@ -65,9 +108,15 @@ function setRetry(key: "max_attempts" | "backoff_ms", ev: Event): void {
 
 <template>
   <div v-if="open" class="params-overlay" @click.self="close">
-    <div class="params-modal" role="dialog" aria-modal="true" aria-label="编辑节点参数">
+    <div
+      ref="dialogEl"
+      class="params-modal"
+      role="dialog"
+      aria-modal="true"
+      :aria-labelledby="titleId"
+    >
       <header class="params-header">
-        <h3>编辑参数</h3>
+        <h3 :id="titleId">编辑参数</h3>
         <span v-if="node && data" class="params-subtitle">
           {{ data.nodeType.label }} · {{ node.id }}
         </span>
@@ -95,9 +144,16 @@ function setRetry(key: "max_attempts" | "backoff_ms", ev: Event): void {
           />
           <fieldset v-if="desc.supports_retry" class="retry">
             <legend>重试</legend>
+            <p v-if="desc.retry_scope === 'declared_repeatable_only'" class="retry-warning">
+              自动重试只对显式声明可重复（effect_policy=repeatable）的失败生效
+            </p>
+            <p v-if="desc.side_effect" class="retry-warning">
+              该节点会产生外部副作用：自动重试只用于脚本/条件等可安全重算的失败；崩溃恢复后结果未知的操作会挂起等人工裁决，不会自动重发。
+            </p>
             <div class="field">
-              <label>最大尝试次数</label>
+              <label for="retry-max-attempts">最大尝试次数</label>
               <input
+                id="retry-max-attempts"
                 type="number"
                 min="1"
                 :value="retry.max_attempts ?? ''"
@@ -106,8 +162,9 @@ function setRetry(key: "max_attempts" | "backoff_ms", ev: Event): void {
               />
             </div>
             <div class="field">
-              <label>退避（毫秒）</label>
+              <label for="retry-backoff-ms">退避（毫秒）</label>
               <input
+                id="retry-backoff-ms"
                 type="number"
                 min="0"
                 :value="retry.backoff_ms ?? ''"
@@ -216,5 +273,12 @@ fieldset.retry {
 fieldset.retry legend {
   color: var(--text2);
   font-size: 12px;
+}
+
+.retry-warning {
+  margin: 6px 0 8px;
+  color: var(--warn);
+  font-size: 11px;
+  line-height: 1.5;
 }
 </style>

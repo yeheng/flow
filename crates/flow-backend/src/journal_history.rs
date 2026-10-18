@@ -232,23 +232,6 @@ pub(crate) async fn prepare(index: &Store, state: &mut State, tx: &Transaction) 
             }
         }
         refs(&event.payload, &mut descriptors);
-        if matches!(
-            event.kind,
-            EventKind::ValueChunk | EventKind::ValuePublished
-        ) {
-            if let Some(id) = event.payload["output_id"].as_str() {
-                descriptors.insert(id.into(), None);
-                if let Some(record) = index.current_at("stream", id, upper).await.map_err(db)? {
-                    let lsn = record["lsn"]
-                        .as_str()
-                        .and_then(|n| n.parse::<u64>().ok())
-                        .ok_or_else(|| db(sqlx::Error::Protocol("invalid stream prefix".into())))?;
-                    if lsn <= upper {
-                        state.values.remember_stream(id, record["value"].clone())?;
-                    }
-                }
-            }
-        }
     }
     for (id, expected) in descriptors {
         if let Some(expected) = &expected {
@@ -270,7 +253,7 @@ pub(crate) async fn prepare(index: &Store, state: &mut State, tx: &Transaction) 
                 // A mismatched reference remains a reducer error; user JSON can also contain
                 // objects that happen to look like descriptors, so do not reject it here.
                 if expected.as_ref().is_none_or(|r| r == &descriptor) {
-                    state.values.remember_verified(descriptor)?;
+                    state.values.remember(descriptor)?;
                 }
             }
         }
@@ -376,5 +359,4 @@ pub(crate) fn trim(state: &mut State) {
         }
     }
     state.values.trim_cache();
-    state.values.clear_stream_cache();
 }

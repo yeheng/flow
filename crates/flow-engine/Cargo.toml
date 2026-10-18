@@ -31,3 +31,6 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = ["c
 flow-test-support = { path = "../flow-test-support" }
 uuid = { workspace = true }
 sha2 = { workspace = true }
+
+[build-dependencies]
+sha2.workspace = true

@@ -185,6 +185,50 @@ impl ProductCommand {
 }
 
 impl JournalBackend {
+    pub async fn invoke_start(
+        &self,
+        hook: &str,
+        request_id: &str,
+        input: Value,
+        correlation: &str,
+        key_hash: &str,
+    ) -> Result<CommandReceipt> {
+        let config = self
+            .inspect(|s| s.webhooks.get(hook).cloned())
+            .await
+            .ok_or_else(|| invalid("webhook not found"))?;
+        let workflow = config["workflow_id"]
+            .as_str()
+            .ok_or_else(|| invalid("workflow_id required"))?;
+        let scope = format!("run.start:webhook:invocation:{hook}");
+        let version = if let Some(receipt) = self.command_status(&scope, request_id).await? {
+            let run = self
+                .run_snapshot(
+                    receipt.result["run_id"]
+                        .as_str()
+                        .ok_or_else(|| invalid("invalid invocation receipt"))?,
+                )
+                .await?
+                .ok_or_else(|| invalid("run not found"))?;
+            run.workflow_version
+        } else {
+            config["invoke_version"]
+                .as_u64()
+                .ok_or_else(|| invalid("invocation version is not configured"))?
+        };
+        self.start_with_regression(
+            workflow,
+            Some(version),
+            input,
+            "webhook",
+            Some(hook),
+            Some(request_id),
+            None,
+            Some(correlation),
+            Some(key_hash),
+        )
+        .await
+    }
     /// Product CRUD uses the caller's identity and arguments for the durable
     /// command. IDs, timestamps, existence checks and the mutation are decided
     /// under the same lock. `fingerprint` keeps the raw wire params (minus
@@ -355,11 +399,14 @@ impl JournalBackend {
     pub async fn workflow_update(
         &self,
         workflow_id: &str,
-        definition: Value,
+        mut definition: Value,
         request_id: Option<&str>,
     ) -> Result<CommandReceipt> {
-        let parsed = flow_engine::journal_state::validate_definition(&definition)?;
         let fingerprint_request = json!({"workflow_id":workflow_id,"definition":definition});
+        if let Some(object) = definition.as_object_mut() {
+            object.entry("semantics").or_insert(json!(2));
+        }
+        let parsed = flow_engine::journal_state::validate_definition(&definition)?;
         let checksum = flow_journal::codec::digest(&flow_journal::codec::bounded_json(
             &definition,
             flow_journal::MAX_LINE_BYTES,
@@ -501,15 +548,87 @@ impl JournalBackend {
         source_detail: Option<&str>,
         request_id: Option<&str>,
     ) -> Result<CommandReceipt> {
+        self.start_with_regression(
+            workflow_id,
+            version,
+            input,
+            source,
+            source_detail,
+            request_id,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn start_with_regression(
+        &self,
+        workflow_id: &str,
+        version: Option<u64>,
+        input: Value,
+        source: &str,
+        source_detail: Option<&str>,
+        request_id: Option<&str>,
+        regression: Option<flow_engine::journal_state::ExecutionSnapshot>,
+        correlation_id: Option<&str>,
+        invocation_key_hash: Option<&str>,
+    ) -> Result<CommandReceipt> {
         if !flow_dto::RunSource::is_valid_str(source) {
             return Err(invalid("invalid run source").into());
         }
-        let request = json!({"workflow_id":workflow_id,"version":version,"input":input,"source":source,"source_detail":source_detail});
-        let scope = format!("run.start:{source}:{}", source_detail.unwrap_or(""));
+        let mut request = json!({"workflow_id":workflow_id,"version":version,"input":input,"source":source,"source_detail":source_detail});
+        if let Some(regression) = &regression {
+            request["regression"] = serde_json::to_value(regression)?;
+        }
+        if let Some(correlation) = correlation_id {
+            if correlation.is_empty() || correlation.len() > 128 {
+                return Err(invalid("correlation_id must contain 1..=128 bytes").into());
+            }
+            request["correlation_id"] = json!(correlation);
+        }
+        if let Some(hash) = invocation_key_hash {
+            request["invocation_key_hash"] = json!(hash);
+        }
+        let scope = format!(
+            "run.start:{source}:{}{}",
+            if correlation_id.is_some() {
+                "invocation:"
+            } else {
+                ""
+            },
+            source_detail.unwrap_or("")
+        );
         if let Some(receipt) = deduped(self, &scope, request_id, &request).await? {
             return Ok(receipt);
         }
+        let (selected, frozen_definition, mut execution) =
+            self.freeze_execution(workflow_id, version).await?;
+        if correlation_id.is_some() && execution.is_none() {
+            return Err(invalid("invocation requires semantics 2").into());
+        }
+        let definition = self
+            .cached_definition(
+                &format!("start:{workflow_id}@{selected}"),
+                &frozen_definition,
+            )
+            .await?;
+        if let Some(schema) = &definition.input_schema {
+            flow_engine::schema::validate(schema, &input).map_err(invalid)?;
+        }
         let stored = self.store_json(input, 8 * 1024 * 1024).await?;
+        if let Some(execution) = &mut execution {
+            execution.correlation_id = correlation_id.map(str::to_owned);
+        }
+        if let Some(recorded) = regression {
+            let snapshot = execution
+                .as_mut()
+                .ok_or_else(|| invalid("regression requires semantics 2"))?;
+            snapshot.clock_ms = recorded.clock_ms;
+            snapshot.seed = recorded.seed;
+            snapshot.regression = recorded.regression;
+        }
         self.command(&scope, request_id, &request, |state| {
             if matches!(source, "schedule" | "webhook") {
                 let key = source_detail.ok_or_else(|| invalid("trigger identity required"))?;
@@ -524,6 +643,12 @@ impl JournalBackend {
                     || (source == "schedule" && config["input"] != request["input"])
                 {
                     return Err(invalid("trigger disabled or changed before commit"));
+                }
+                if correlation_id.is_some()
+                    && (config["invoke_version"].as_u64() != Some(selected)
+                        || config["invoke_key_hash"].as_str() != invocation_key_hash)
+                {
+                    return Err(invalid("invocation configuration changed before commit"));
                 }
                 if source == "schedule" {
                     let fire =
@@ -557,16 +682,6 @@ impl JournalBackend {
                 .workflows
                 .get(workflow_id)
                 .ok_or_else(|| invalid("workflow not found"))?;
-            let selected = version
-                .or_else(|| {
-                    workflow
-                        .versions
-                        .iter()
-                        .rev()
-                        .find(|(_, v)| v.published)
-                        .map(|(v, _)| *v)
-                })
-                .ok_or_else(|| invalid("no published version"))?;
             let definition = workflow
                 .versions
                 .get(&selected)
@@ -579,7 +694,7 @@ impl JournalBackend {
                 run_id: run_id.clone(),
                 workflow_id: workflow_id.into(),
                 workflow_version: selected,
-                definition: definition.definition.clone(),
+                definition: frozen_definition,
                 input: stored,
                 source: source.into(),
                 source_detail: source_detail.map(str::to_owned),
@@ -591,6 +706,11 @@ impl JournalBackend {
                 error: None,
                 last_run_seq: 0,
                 nodes: BTreeMap::new(),
+                signals: execution
+                    .as_ref()
+                    .map(|e| e.signal_inputs())
+                    .unwrap_or_default(),
+                execution,
             };
             let mut event = Event::new(EventKind::RunStarted, serde_json::to_value(run)?);
             event.run_id = Some(run_id.clone());
@@ -646,6 +766,17 @@ impl JournalBackend {
         {
             return Ok(receipt);
         }
+        let snapshot = self
+            .run_snapshot(run_id)
+            .await?
+            .ok_or_else(|| invalid("run not found"))?;
+        let definition = self.cached_definition(run_id, &snapshot.definition).await?;
+        let accepts_inbox = definition.node_type(node_id).is_some_and(|k| {
+            matches!(
+                k,
+                flow_engine::NodeType::HumanTask | flow_engine::NodeType::Input
+            )
+        });
         let output = self.store_json(payload.clone(), 8 * 1024 * 1024).await?;
         let adjudicated_output = self
             .store_json(
@@ -666,10 +797,17 @@ impl JournalBackend {
                 if run.terminal() {
                     return Err(flow_journal::Error::Conflict("run is terminal; cannot deliver signal".into()));
                 }
-                let node = run
-                    .nodes
-                    .get(node_id)
-                    .ok_or_else(|| invalid("node not waiting"))?;
+                let waiting = run.nodes.get(node_id).is_some_and(|n| n.wait.as_ref().is_some_and(|w| matches!(w.kind(), WaitKind::Signal | WaitKind::Uncertain)));
+                if !waiting {
+                    if !accepts_inbox || request_id.is_none() || run.nodes.get(node_id).is_some_and(|n| matches!(n.status, flow_engine::journal_state::NodeStatus::Succeeded | flow_engine::journal_state::NodeStatus::Failed | flow_engine::journal_state::NodeStatus::Skipped)) {
+                        return Err(invalid("node does not accept a pending signal"));
+                    }
+                    if run.signals.contains_key(node_id) { return Err(flow_journal::Error::Conflict("signal already queued for node".into())); }
+                    let mut event = Event::new(EventKind::SignalReceived, json!({"payload":output,"queued":true}));
+                    event.run_id = Some(run_id.into()); event.node_id = Some(node_id.into()); event.run_seq = run.last_run_seq + 1;
+                    return Ok((vec![event], json!({"delivered":true,"status":"queued","signal_id":request_id})));
+                }
+                let node = &run.nodes[node_id];
                 if !run.terminal() && node.wait.as_ref().is_some_and(|w| w.kind() == WaitKind::Uncertain) {
                     let operation = node.operation.as_ref()
                         .filter(|op| op.outcome.is_none())
@@ -734,7 +872,13 @@ impl JournalBackend {
         for field in fields.keys() {
             if !matches!(
                 field.as_str(),
-                "workflow_id" | "enabled" | "input" | "cron_expr" | "deleted"
+                "workflow_id"
+                    | "enabled"
+                    | "input"
+                    | "cron_expr"
+                    | "deleted"
+                    | "invoke_version"
+                    | "invoke_key_hash"
             ) {
                 return Err(invalid(format!("config field is not writable: {field}")).into());
             }
@@ -956,8 +1100,9 @@ fn trigger_decision(
     if value["deleted"] != true {
         let workflow = value["workflow_id"]
             .as_str()
-            .ok_or_else(|| invalid("workflow_id required"))?;
-        if !state.workflows.contains_key(workflow) {
+            .ok_or_else(|| invalid("workflow_id required"))?
+            .to_owned();
+        if !state.workflows.contains_key(&workflow) {
             return Err(invalid("workflow not found"));
         }
         if !value["enabled"].is_boolean() {
@@ -973,6 +1118,26 @@ fn trigger_decision(
                 && (!previous_enabled || previous_cron != value["cron_expr"])
             {
                 value["active_since"] = json!(now());
+            }
+        }
+        if kind == EventKind::WebhookChanged
+            && (!value["invoke_version"].is_null() || !value["invoke_key_hash"].is_null())
+        {
+            let version = value["invoke_version"]
+                .as_u64()
+                .ok_or_else(|| invalid("invoke_version must be an integer"))?;
+            if !state.workflows[&workflow]
+                .versions
+                .get(&version)
+                .is_some_and(|v| v.published)
+            {
+                return Err(invalid("invocation version must be published"));
+            }
+            let hash = value["invoke_key_hash"]
+                .as_str()
+                .ok_or_else(|| invalid("invoke_key_hash required"))?;
+            if hash.len() != 64 || hash.bytes().any(|c| !c.is_ascii_hexdigit()) {
+                return Err(invalid("invoke_key_hash must be a SHA-256 hex digest"));
             }
         }
     }

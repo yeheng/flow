@@ -241,11 +241,18 @@ fn run_js(
 }
 
 #[derive(Clone, Copy)]
+pub struct JsDeterminism {
+    pub clock_ms: i64,
+    pub seed: u32,
+}
+
+#[derive(Clone, Copy)]
 pub struct JsLimits {
     pub input_bytes: usize,
     pub heap_bytes: usize,
     pub output_bytes: usize,
     pub depth: usize,
+    pub determinism: Option<JsDeterminism>,
 }
 impl Default for JsLimits {
     fn default() -> Self {
@@ -254,6 +261,7 @@ impl Default for JsLimits {
             heap_bytes: 32 * 1024 * 1024,
             output_bytes: 8 * 1024 * 1024,
             depth: 64,
+            determinism: None,
         }
     }
 }
@@ -302,6 +310,46 @@ fn run_js_limited(
 
     let outcome = context.with(|ctx| -> Result<Result<Value, String>, rquickjs::Error> {
         let globals = ctx.globals();
+        if let Some(recorded) = limits.and_then(|l| l.determinism) {
+            let install = format!(r#"(function () {{
+                const NativeDate = Date, clock = {}, initialSeed = {};
+                function parseRecorded(text) {{
+                    if (typeof text !== 'string' || !/^\d{{4}}-\d{{2}}-\d{{2}}(?:T.*(?:Z|[+-]\d{{2}}:\d{{2}}))?$/.test(text)) throw new Error('recorded Date parsing requires ISO date or explicit timezone');
+                    return NativeDate.parse(text);
+                }}
+                function RecordedDate(...args) {{
+                    if (!new.target) return new NativeDate(clock).toISOString();
+                    let values = args.length > 1 ? [NativeDate.UTC(...args)] : args.length ? [typeof args[0] === 'string' ? parseRecorded(args[0]) : args[0]] : [clock];
+                    return Reflect.construct(NativeDate, values, new.target);
+                }}
+                RecordedDate.prototype = NativeDate.prototype;
+                Object.defineProperty(RecordedDate.prototype, 'constructor', {{value: RecordedDate}});
+                Object.defineProperties(RecordedDate, {{
+                    now: {{value: () => clock}}, parse: {{value: parseRecorded}}, UTC: {{value: NativeDate.UTC}}
+                }});
+                for (const name of ['FullYear','Month','Date','Day','Hours','Minutes','Seconds','Milliseconds']) {{
+                    const p = NativeDate.prototype;
+                    p['get' + name] = p['getUTC' + name];
+                    if (p['setUTC' + name]) p['set' + name] = p['setUTC' + name];
+                }}
+                NativeDate.prototype.getTimezoneOffset = () => 0;
+                NativeDate.prototype.getYear = function () {{return this.getUTCFullYear() - 1900}};
+                NativeDate.prototype.setYear = function (year) {{return this.setUTCFullYear(year >= 0 && year <= 99 ? Number(year) + 1900 : year)}};
+                NativeDate.prototype.toString = NativeDate.prototype.toISOString;
+                NativeDate.prototype.toDateString = function () {{return this.toISOString().slice(0,10)}};
+                NativeDate.prototype.toTimeString = function () {{return this.toISOString().slice(11)}};
+                NativeDate.prototype.toLocaleString = NativeDate.prototype.toISOString;
+                NativeDate.prototype.toLocaleDateString = function () {{return this.toISOString().slice(0,10)}};
+                NativeDate.prototype.toLocaleTimeString = function () {{return this.toISOString().slice(11,23)}};
+                globalThis.Date = RecordedDate;
+                let state = initialSeed || 1;
+                Object.defineProperty(Math, 'random', {{configurable:false, writable:false, value: () => {{
+                    state ^= state << 13; state ^= state >>> 17; state ^= state << 5;
+                    return (state >>> 0) / 4294967296;
+                }}}});
+            }})();"#, recorded.clock_ms, recorded.seed);
+            ctx.eval::<(), _>(install)?;
+        }
         // 与 JSON.parse 一致的属性定义（__proto__ 等键不会触发 setter）
         let define = ctx.eval::<Function, _>(
             "(function (o, k, v) { Object.defineProperty(o, k, { value: v, enumerable: true, writable: true, configurable: true }); })",
@@ -385,6 +433,17 @@ pub fn eval_body_bounded(
     timeout: Duration,
     logger: &NodeLogger,
 ) -> Result<Value, EngineError> {
+    eval_body_recorded(body, input, nodes, timeout, logger, None)
+}
+
+pub fn eval_body_recorded(
+    body: &str,
+    input: &Value,
+    nodes: &Value,
+    timeout: Duration,
+    logger: &NodeLogger,
+    determinism: Option<JsDeterminism>,
+) -> Result<Value, EngineError> {
     run_js_limited(
         body,
         input,
@@ -392,7 +451,10 @@ pub fn eval_body_bounded(
         &Value::Null,
         timeout,
         logger,
-        Some(JsLimits::default()),
+        Some(JsLimits {
+            determinism,
+            ..JsLimits::default()
+        }),
     )
 }
 
@@ -461,6 +523,24 @@ pub fn expand_templates_bounded(
     timeout: Duration,
 ) -> Result<Value, EngineError> {
     expand_templates_impl(tpl, input, nodes, timeout, Some(JsLimits::default()))
+}
+pub fn expand_templates_recorded(
+    tpl: &Value,
+    input: &Value,
+    nodes: &Value,
+    timeout: Duration,
+    determinism: Option<JsDeterminism>,
+) -> Result<Value, EngineError> {
+    expand_templates_impl(
+        tpl,
+        input,
+        nodes,
+        timeout,
+        Some(JsLimits {
+            determinism,
+            ..JsLimits::default()
+        }),
+    )
 }
 fn expand_templates_impl(
     tpl: &Value,

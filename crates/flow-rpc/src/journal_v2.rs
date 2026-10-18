@@ -263,6 +263,7 @@ pub const READ_METHODS: &[&str] = &[
     "legacy.list",
     "workflow.get",
     "run.get",
+    "run.compare",
     "legacy.get",
     "run.events.page",
     "run.audit.page",
@@ -290,6 +291,7 @@ pub const WRITE_METHODS: &[&str] = &[
     "workflow.publish",
     "workflow.delete",
     "run.start",
+    "run.regress",
     "run.cancel",
     "run.signal",
     "run.adjudicate",
@@ -322,6 +324,10 @@ pub fn is_read_method(method: &str) -> bool {
 pub fn command_scope(method: &str, params: &Value) -> String {
     match method {
         "run.start" => "run.start:manual:".to_string(),
+        "run.regress" => format!(
+            "run.start:manual:regression:{}",
+            params["baseline"].as_str().unwrap_or("")
+        ),
         "run.cancel" | "run.signal" | "run.adjudicate" => {
             format!("{method}:{}", params["run_id"].as_str().unwrap_or(""))
         }
@@ -359,6 +365,8 @@ pub fn module_product(
         "workflow.publish",
         "workflow.delete",
         "run.start",
+        "run.regress",
+        "run.compare",
         "run.cancel",
         "run.signal",
         "run.adjudicate",
@@ -522,6 +530,27 @@ async fn dispatch_call(
                 request,
             )
             .await
+        }
+        "run.regress" => {
+            b.run_regression_with_fixtures(
+                text(&p, "baseline")?,
+                p["workflow_id"].as_str(),
+                p["version"].as_u64(),
+                p.get("fixtures")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(invalid)?
+                    .unwrap_or_default(),
+                request.ok_or_else(|| invalid("request_id required"))?,
+            )
+            .await
+        }
+        "run.compare" => {
+            return b
+                .compare_runs(text(&p, "baseline")?, text(&p, "candidate")?)
+                .await
+                .map_err(failure)
         }
         "run.cancel" => {
             let req = RunCancelReq::parse(&p)?;
@@ -1128,9 +1157,7 @@ async fn subscribe_run_events(
                 for (index, event) in tx.events.into_iter().enumerate() {
                     if event.run_id.as_deref() == Some(&id)
                         && (if audit {
-                            tx.lsn > from_lsn
-                                && (event.audit_seq > 0
-                                    || event.kind == flow_journal::EventKind::LateAudit)
+                            tx.lsn > from_lsn && event.is_audit()
                         } else {
                             event.run_seq > from_seq
                         })

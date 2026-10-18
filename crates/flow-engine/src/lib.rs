@@ -7,9 +7,12 @@ pub mod log_types;
 pub mod model;
 pub mod nodelog;
 pub mod observation;
+pub mod schema;
 pub mod secrets;
 pub mod secrets_store;
 pub const MAX_SUB_WORKFLOW_DEPTH: u32 = 16;
+/// Source/dependency identity shared by the coordinator and executor.
+pub const RUNTIME_ID: &str = env!("FLOW_RUNTIME_ID");
 pub use error::EngineError;
 pub use log_types::{LogLevel, LogStream};
 pub use model::{Definition, Edge, Node, NodeType, Position, RetryPolicy, HTTP_METHODS};

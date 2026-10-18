@@ -1,7 +1,14 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import { monitor } from "../state/monitor";
-import { nodeStateLabel } from "../state/labels";
+import { friendlyDuration } from "../state/activity";
+import {
+  nodeStateLabel,
+  nodeTypeLabel,
+  skipReasonLabel,
+  traceGranularityLabel,
+} from "../state/labels";
+import { nodeTypeDesc } from "../state/editor";
 import type { LogLine, TimelineNode } from "../types";
 import JsonNode from "./JsonNode.vue";
 
@@ -30,6 +37,12 @@ const logsByAttempt = computed<Array<[number, LogLine[]]>>(() => {
   return [...groups.entries()];
 });
 
+/** 证据粒度提示（nodetypes.list 下发 trace_granularity，词汇表在 labels.ts） */
+const traceLabel = computed(() => {
+  const g = node.value ? nodeTypeDesc(node.value.type)?.trace_granularity : undefined;
+  return g ? traceGranularityLabel(g) : "";
+});
+
 const hasInput = computed(() => node.value?.input !== undefined && node.value?.input !== null);
 const hasOutput = computed(
   () =>
@@ -49,7 +62,7 @@ function fmtTime(ts: string): string {
   <div v-if="node" class="inspector">
     <div class="inspector-header">
       <span class="inspector-name">{{ node.name || node.id }}</span>
-      <span class="inspector-type">{{ node.type }}</span>
+      <span class="inspector-type">{{ nodeTypeLabel(node.type) }}</span>
       <span class="run-state" :class="`run-${node.state}`">
         {{ nodeStateLabel(node.state) }}
       </span>
@@ -58,7 +71,8 @@ function fmtTime(ts: string): string {
 
     <div class="inspector-meta">
       <span>尝试 {{ node.attempts }}</span>
-      <span v-if="node.duration_ms !== null">耗时 {{ node.duration_ms }}ms</span>
+      <span v-if="node.duration_ms !== null">耗时 {{ friendlyDuration(node.duration_ms) }}</span>
+      <span v-if="traceLabel" class="inspector-trace">证据粒度：{{ traceLabel }}</span>
       <button
         v-if="node.child_run_id"
         class="link inspector-child"
@@ -69,7 +83,7 @@ function fmtTime(ts: string): string {
     </div>
 
     <div v-if="node.error" class="inspector-error">{{ node.error }}</div>
-    <div v-else-if="node.reason" class="inspector-reason">跳过原因：{{ node.reason }}</div>
+    <div v-else-if="node.reason" class="inspector-reason">跳过原因：{{ skipReasonLabel(node.reason) }}</div>
 
     <details class="inspector-block" :open="hasInput">
       <summary>输入面（模板展开后）</summary>

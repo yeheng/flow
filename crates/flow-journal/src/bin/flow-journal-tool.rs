@@ -23,6 +23,11 @@ struct JournalTool {
 
 #[derive(Subcommand)]
 enum JournalToolCommand {
+    /// Upgrade a stopped format-3 database into a NEW format-4 directory.
+    Upgrade {
+        source: PathBuf,
+        destination: PathBuf,
+    },
     /// 全量字节校验 + 已发布值闭环检查
     Verify { data_dir: PathBuf },
     /// 重建 SQLite 自有索引（不创建应用索引文件）
@@ -56,6 +61,19 @@ fn main() -> std::process::ExitCode {
 /// 离线维护（全部动作先取数据目录排他锁）。
 fn journal_tool_main(command: JournalToolCommand) -> i32 {
     let report = match command {
+        JournalToolCommand::Upgrade {
+            source,
+            destination,
+        } => {
+            let _lock = match flow_journal::maintenance::offline_lock(&source) {
+                Ok(v) => v,
+                Err(e) => return fail(&e),
+            };
+            match flow_journal::maintenance::upgrade(&source, &destination) {
+                Ok(v) => v,
+                Err(e) => return fail(&e),
+            }
+        }
         JournalToolCommand::Verify { data_dir } => {
             let _lock = match flow_journal::maintenance::offline_lock(&data_dir) {
                 Ok(lock) => lock,

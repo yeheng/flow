@@ -1,12 +1,12 @@
 # flow 运维手册
 
-> 状态：**当前代码实际语义**（2026-10-13）。设计与语义见 [DESIGN.md](DESIGN.md)；
-> 本文只讲**怎么部署、怎么跑、坏了怎么办**。
+> 状态：**当前代码实际语义**（2026-10-18）。设计与语义见 [DESIGN.md](DESIGN.md)；
+> 本文只讲**怎么部署、怎么跑、坏了怎么办**。业务接口、回归和证据资产工具见 [EXECUTION.md](EXECUTION.md)。
 >
 > 本文所有数字都能在代码里对上。凡代码里没有的能力，本文一律标注「未实现」，
 > 不按路线图描述。
 
-> 2026-10-16 单机保证以 [ADR 0002](adr/0002-single-machine-journal-baseline.md)
+> 2026-10-16 单机保证以 [ADR 0002](adr/0002-sqlite-persistence.md)
 > 为基线；当前不提供日志复制或 master 高可用。
 
 ---
@@ -254,14 +254,19 @@ CLI 先取数据目录排他锁，须在服务停止时运行：
 flow-journal-tool verify <data_dir>
 flow-journal-tool rebuild-index <data_dir>
 flow-journal-tool backup <data_dir> <new_destination>
+flow-journal-dev --data-dir <data_dir> check-projection
 ```
 
 - verify：SQLite integrity/foreign-key 检查、事实与当前实体摘要、已发布正文闭环检查。
 - rebuild-index：SQLite 原生 REINDEX；不创建应用位置索引。
 - backup：一致快照包含当前状态、事实、回执与正文；校验完成后发布独立主文件。
   目标必须不存在。不要在线只复制 flow.sqlite；活跃 WAL 也是提交数据的一部分。
+- check-projection：停写后用 reducer 从 LSN 1 重放全部事实，把应得的
+  `current_entities` 与库中当前行逐行比较；报告 body/`last_lsn`/缺失/多余行。
+  它只读事实、不就地修复；不一致时保留原库作为证据。
 
-不再提供 rebuild-projection 或日志前缀 repair。损坏数据保留证据，从经过 verify 的
+未发布值不能被业务引用；值连续性、总字节和摘要只在写入时校验一次。
+不提供就地 rebuild-projection 或日志前缀 repair。损坏数据保留证据，从经过 verify 的
 一致备份恢复；不能把不完整事实前缀当成当前执行状态。
 
 ### 5.1 文件职责
@@ -413,12 +418,11 @@ flow-cli run adjudicate --run-id <id> --node-id <n> \
 
 ### 9.1 SQLite 存储格式
 
-本地业务库为 flow.sqlite，格式版本 1。新建空数据目录，旧 JSONL/派生库目录不自动转换，
-本次不提供历史数据迁移。完整结构与恢复契约见 [ADR 0002](adr/0002-sqlite-persistence.md)。
+本地业务库为 flow.sqlite，格式版本 4。旧 JSONL/派生库目录不自动转换。SQLite v3 使用 `flow-journal-tool upgrade OLD NEW` 离线复制到新目录，源目录不修改；升级后执行 `check-projection` 再切换数据目录。完整结构与恢复契约见 [ADR 0002](adr/0002-sqlite-persistence.md)。
 
 ### 9.2 协议版本
 
-`PROTOCOL_VERSION = 6`（postcard 单流帧：`u32 body_len | postcard(Message)`）。
+`PROTOCOL_VERSION = 7`（postcard 单流帧：`u32 body_len | postcard(Message)`）。
 **master 与 executor/agent 必须同版本**——执行器握手 `Hello`/`Welcome` 与
 agent 上联握手 `AgentHello`/`AgentWelcome` 的 `version` 字段不符直接失败，
 不协商、不降级、不逐帧校验（版本门集中在握手）。postcard 的变体索引是
@@ -427,7 +431,7 @@ agent 上联握手 `AgentHello`/`AgentWelcome` 的 `version` 字段不符直接�
 改 `flow-engine/src/execution_protocol/contract.rs` 的任何常量都构成协议变更，
 必须 bump `PROTOCOL_VERSION`。升级 = **同批替换全部二进制**
 （`flow-journal-server` + `flow-executor` + `flow-agent`）。
-v5（无 agent 上联版本门）与 v6 握手不兼容，两端都会在握手处显式拒绝。
+v7 的执行上下文和 regression 隔离要求同批替换全部二进制，旧执行器/agent 在握手处拒绝。
 
 ### 9.3 升级步骤
 
@@ -455,6 +459,7 @@ dist/journal/run-server.sh
 flow-journal-tool verify <dir>
 flow-journal-tool backup <dir> <dst>
 flow-journal-tool rebuild-index <dir>
+flow-journal-dev --data-dir <dir> check-projection
 
 # 开发
 flow-journal-dev run --definition wf.json --input in.json

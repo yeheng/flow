@@ -11,12 +11,12 @@ use sha2::{Digest, Sha256};
 
 use crate::codec::{self, Event, EventKind, Transaction};
 use crate::storage::{private_dir, sync_dir, FaultInjection, Location, SyncLatency};
-use crate::value::{Chunk, ValueCatalog, ValueRef};
-use crate::{invalid, Error, Result};
+use crate::value::{Chunk, ValueRef};
+use crate::{invalid, Error, Result, MAX_VALUE_BYTES};
 
 pub const DATABASE: &str = "flow.sqlite";
-pub const FORMAT: i64 = 1;
-pub const MAX_ENTITY_BYTES: usize = 8 * 1024 * 1024;
+pub const FORMAT: i64 = 4;
+pub const MAX_ENTITY_BYTES: usize = 2 * 1024 * 1024;
 
 /// A current object, not a historical copy of every revision. None is a deletion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,7 +51,7 @@ pub fn read_connection(root: &Path) -> Result<Connection> {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(db)?;
     if version != FORMAT {
-        return Err(invalid("unsupported SQLite storage format"));
+        return Err(invalid("unsupported SQLite storage format; use flow-journal-tool upgrade <source> <new-directory> for format 3"));
     }
     Ok(conn)
 }
@@ -105,6 +105,19 @@ fn created_order(kind: &str, value: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// Decode the canonical key tuple once at write time into typed columns. Reads then
+/// use plain indexed columns instead of `json_extract(key, ...)`.
+fn key_parts(kind: &str, key: &str) -> (String, String, String) {
+    let parts: Vec<String> = serde_json::from_str(key).unwrap_or_default();
+    let get = |index: usize| parts.get(index).cloned().unwrap_or_default();
+    match kind {
+        "run_node" | "command" => (get(0), get(1), String::new()),
+        "run_attempt" | "child" | "audit" => (get(0), get(1), get(2)),
+        "workflow_version" => (get(0), get(1), String::new()),
+        _ => (String::new(), String::new(), String::new()),
+    }
+}
+
 pub(crate) fn apply_entity(conn: &Connection, lsn: u64, row: &EntityChange) -> Result<()> {
     if let Some(value) = &row.value {
         let body =
@@ -118,8 +131,9 @@ pub(crate) fn apply_entity(conn: &Connection, lsn: u64, row: &EntityChange) -> R
                 return Ok(());
             }
         }
-        conn.execute("INSERT INTO current_entities(kind,key,body,digest,created_order,last_lsn) VALUES(?,?,?,?,?,?) ON CONFLICT(kind,key) DO UPDATE SET body=excluded.body,digest=excluded.digest,created_order=excluded.created_order,last_lsn=excluded.last_lsn",
-            params![row.kind,row.key,body,entity_digest(&row.kind,&row.key,&body),created_order(&row.kind,value),format!("{lsn:020}")]).map_err(db)?;
+        let (parent, slot, extra) = key_parts(&row.kind, &row.key);
+        conn.execute("INSERT INTO current_entities(kind,key,parent,slot,extra,body,digest,created_order,last_lsn) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(kind,key) DO UPDATE SET parent=excluded.parent,slot=excluded.slot,extra=excluded.extra,body=excluded.body,digest=excluded.digest,created_order=excluded.created_order,last_lsn=excluded.last_lsn",
+            params![row.kind,row.key,parent,slot,extra,body,entity_digest(&row.kind,&row.key,&body),created_order(&row.kind,value),format!("{lsn:020}")]).map_err(db)?;
     } else {
         conn.execute(
             "DELETE FROM current_entities WHERE kind=? AND key=?",
@@ -132,11 +146,20 @@ pub(crate) fn apply_entity(conn: &Connection, lsn: u64, row: &EntityChange) -> R
 
 /// Reconstruct a bounded accepted transaction; raw chunk bytes exist only in value_chunks.
 pub fn transaction(conn: &Connection, identity: &str, lsn: u64) -> Result<Transaction> {
-    let (tx_id, count, digest): (String, usize, String) = conn
+    transaction_with_size(conn, identity, lsn).map(|(tx, _)| tx)
+}
+
+/// Same reconstruction, plus the recorded encoded size used by tail/subscription budgets.
+pub fn transaction_with_size(
+    conn: &Connection,
+    identity: &str,
+    lsn: u64,
+) -> Result<(Transaction, u64)> {
+    let (tx_id, count, digest, recorded_bytes): (String, usize, String, u64) = conn
         .query_row(
-            "SELECT tx_id,event_count,digest FROM transactions WHERE lsn=?",
+            "SELECT tx_id,event_count,digest,bytes FROM transactions WHERE lsn=?",
             [format!("{lsn:020}")],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .map_err(db)?;
     let mut statement = conn
@@ -160,9 +183,7 @@ pub fn transaction(conn: &Connection, identity: &str, lsn: u64) -> Result<Transa
         if run_id != event.run_id
             || dispatch_id != event.dispatch_id
             || run_event != (event.run_seq > 0)
-            || audit_event
-                != (event.audit_seq > 0
-                    || matches!(event.kind, EventKind::ValueChunk | EventKind::LateAudit))
+            || audit_event != event.is_audit()
         {
             return Err(invalid("accepted event index identity mismatch"));
         }
@@ -202,13 +223,15 @@ pub fn transaction(conn: &Connection, identity: &str, lsn: u64) -> Result<Transa
         tx_id,
         events,
     };
+    let body = codec::bounded_json(&tx, crate::MAX_LINE_BYTES)?;
     if tx.events.len() != count
-        || codec::digest(&codec::bounded_json(&tx, crate::MAX_LINE_BYTES)?) != digest
+        || body.len() as u64 != recorded_bytes
+        || codec::digest(&body) != digest
     {
-        return Err(invalid("accepted transaction checksum mismatch"));
+        return Err(invalid("accepted transaction checksum/size mismatch"));
     }
     tx.validate()?;
-    Ok(tx)
+    Ok((tx, recorded_bytes))
 }
 
 pub(crate) struct Disk {
@@ -261,7 +284,7 @@ impl Disk {
                 }
                 initialize = true;
             } else if version != FORMAT {
-                return Err(invalid("unsupported SQLite storage format"));
+                return Err(invalid("unsupported SQLite storage format; format 3 can be copied with flow-journal-tool upgrade <source> <new-directory>"));
             } else {
                 metadata(&conn)?;
             }
@@ -305,11 +328,15 @@ impl Disk {
         self.before_batch = self.last_lsn;
         self.conn.execute_batch("BEGIN IMMEDIATE").map_err(db)
     }
+    /// `bytes`/`digest` are the canonical encoded transaction computed once by the
+    /// writer, never recomputed here. `changes` are the derived current rows.
     pub fn append(
         &mut self,
         tx: &Transaction,
         changes: &[EntityChange],
         prepared: bool,
+        bytes: u64,
+        digest: &str,
     ) -> Result<Location> {
         let domain: bool = self
             .conn
@@ -330,22 +357,22 @@ impl Disk {
                 .execute("UPDATE store_meta SET domain_mode=1 WHERE singleton=1", [])
                 .map_err(db)?;
         }
-        let bytes = codec::encode(tx)?.len();
         if self
             .faults
             .fail_after_bytes
-            .is_some_and(|n| self.written.saturating_add(bytes as u64) > n)
+            .is_some_and(|n| self.written.saturating_add(bytes) > n)
         {
             return Err(std::io::Error::other("injected SQLite write failure").into());
         }
         self.conn
             .execute(
-                "INSERT INTO transactions VALUES(?,?,?,?)",
+                "INSERT INTO transactions VALUES(?,?,?,?,?)",
                 params![
                     format!("{:020}", tx.lsn),
                     tx.tx_id,
                     tx.events.len(),
-                    codec::digest(&codec::bounded_json(tx, crate::MAX_LINE_BYTES)?)
+                    digest,
+                    bytes as i64
                 ],
             )
             .map_err(db)?;
@@ -368,8 +395,7 @@ impl Disk {
                         event.run_id,
                         event.dispatch_id,
                         event.run_seq > 0,
-                        event.audit_seq > 0
-                            || matches!(event.kind, EventKind::ValueChunk | EventKind::LateAudit),
+                        event.is_audit(),
                         serde_json::to_string(&stored)?
                     ],
                 )
@@ -405,48 +431,90 @@ impl Disk {
                 [tx.lsn.to_string()],
             )
             .map_err(db)?;
-        self.written += bytes as u64;
+        self.written += bytes;
         self.last_lsn = tx.lsn;
-        Ok(Location {
-            bytes: bytes as u64,
-            lsn: tx.lsn,
-        })
+        Ok(Location { bytes, lsn: tx.lsn })
     }
+    /// Value validation happens once, here, while the bytes are in hand. The reducer
+    /// only keeps verified publication descriptors; it never re-hashes a stream.
     fn apply_value(&self, event: &Event, lsn: u64) -> Result<()> {
         let id = event.payload["output_id"]
             .as_str()
             .ok_or_else(|| invalid("missing value identity"))?;
-        let mut catalog = ValueCatalog::default();
-        if let Some(record) = entity(&self.conn, "stream", id)? {
-            catalog.remember_stream(id, record["value"].clone())?;
+        let published: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM current_entities WHERE kind='published' AND key=?)",
+                [id],
+                |r| r.get(0),
+            )
+            .map_err(db)?;
+        if published {
+            return Err(invalid("value chunk/publication after publication"));
         }
-        if let Some(record) = entity(&self.conn, "published", id)? {
-            catalog
-                .remember_verified(serde_json::from_value::<ValueRef>(record["value"].clone())?)?;
+        if event.kind == EventKind::ValueChunk {
+            // The current row is already inserted, so its index must be the last one.
+            let chunk: Chunk = serde_json::from_value(event.payload.clone())?;
+            chunk.decode()?;
+            let (count, total): (u64, u64) = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*),COALESCE(SUM(length(bytes)),0) FROM value_chunks WHERE output_id=?",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(db)?;
+            if chunk.chunk_index.checked_add(1) != Some(count) || total > MAX_VALUE_BYTES {
+                return Err(invalid("value chunk gap/duplicate/limit"));
+            }
+            return Ok(());
         }
-        catalog.apply(event, &self.id)?;
+        let value: ValueRef = serde_json::from_value(event.payload.clone())?;
+        value.validate()?;
+        if value.journal_id != self.id {
+            return Err(invalid("published value belongs to another journal"));
+        }
+        let (count, total): (u64, u64) = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*),COALESCE(SUM(length(bytes)),0) FROM value_chunks WHERE output_id=?",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(db)?;
+        if value.chunk_count != count || value.total_bytes != total {
+            return Err(invalid("publication requires complete matching chunks"));
+        }
+        let mut hash = Sha256::new();
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT chunk_index,bytes FROM value_chunks WHERE output_id=? ORDER BY chunk_index",
+            )
+            .map_err(db)?;
+        let mut rows = statement.query([id]).map_err(db)?;
+        let mut expected = 0u64;
+        while let Some(row) = rows.next().map_err(db)? {
+            let index: u64 = row.get(0).map_err(db)?;
+            let bytes: Vec<u8> = row.get(1).map_err(db)?;
+            if index != expected {
+                return Err(invalid("non-contiguous stored value chunk"));
+            }
+            hash.update(&bytes);
+            expected += 1;
+        }
+        if hex::encode(hash.finalize()) != value.digest {
+            return Err(invalid("publication digest mismatch"));
+        }
         apply_entity(
             &self.conn,
             lsn,
             &EntityChange {
-                kind: "stream".into(),
+                kind: "published".into(),
                 key: id.into(),
-                value: catalog
-                    .stream_snapshot(id)
-                    .map(|value| serde_json::json!({"lsn":lsn.to_string(),"value":value})),
+                value: Some(serde_json::json!({"lsn":lsn.to_string(),"value":event.payload})),
             },
         )?;
-        if event.kind == EventKind::ValuePublished {
-            apply_entity(
-                &self.conn,
-                lsn,
-                &EntityChange {
-                    kind: "published".into(),
-                    key: id.into(),
-                    value: Some(serde_json::json!({"lsn":lsn.to_string(),"value":event.payload})),
-                },
-            )?;
-        }
         Ok(())
     }
     pub fn sync(&mut self) -> Result<()> {
@@ -483,6 +551,7 @@ mod tests {
             events: vec![Event::new(EventKind::Command, serde_json::json!({}))],
         };
         disk.begin().unwrap();
+        let body = codec::bounded_json(&tx, crate::MAX_LINE_BYTES).unwrap();
         disk.append(
             &tx,
             &[EntityChange {
@@ -491,6 +560,8 @@ mod tests {
                 value: Some(serde_json::json!({"status":"before"})),
             }],
             true,
+            body.len() as u64,
+            &codec::digest(&body),
         )
         .unwrap();
         disk.sync().unwrap();
@@ -506,7 +577,16 @@ mod tests {
         candidate.tx_id = "too-large".into();
         candidate.events[0].payload = Value::String("x".repeat(512 * 1024));
         disk.begin().unwrap();
-        let error = disk.append(&candidate, &[], true).unwrap_err();
+        let body = codec::bounded_json(&candidate, crate::MAX_LINE_BYTES).unwrap();
+        let error = disk
+            .append(
+                &candidate,
+                &[],
+                true,
+                body.len() as u64,
+                &codec::digest(&body),
+            )
+            .unwrap_err();
         assert!(error.to_string().contains("full"), "{error}");
         disk.rollback();
         drop(disk);

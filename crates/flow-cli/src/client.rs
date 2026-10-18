@@ -65,6 +65,7 @@ pub(crate) fn is_write_method(method: &str) -> bool {
             | "workflow.publish"
             | "workflow.delete"
             | "run.start"
+            | "run.regress"
             | "run.cancel"
             | "run.signal"
             | "run.adjudicate"

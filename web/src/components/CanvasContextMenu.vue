@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from "vue";
+import { nextTick, onMounted, onUnmounted, ref } from "vue";
 
 /** 子菜单项：group 相邻不同时渲染分组小标题（「添加节点」按分类分组） */
 export interface MenuSubEntry {
@@ -37,6 +37,8 @@ onMounted(() => {
     pos.value.left = Math.max(4, Math.min(props.x, window.innerWidth - rect.width - 8));
     pos.value.top = Math.max(4, Math.min(props.y, window.innerHeight - rect.height - 8));
   }
+  // 打开即聚焦首项，键盘可以直接操作
+  focusItemAt(0);
   window.addEventListener("pointerdown", onPointerDownOutside, true);
   window.addEventListener("keydown", onKeydown, true);
 });
@@ -52,8 +54,66 @@ function onPointerDownOutside(e: PointerEvent): void {
   emit("close");
 }
 
+/** 可聚焦菜单项（role=menuitem 且未禁用）；子菜单项只在展开时存在于 DOM */
+function itemEls(): HTMLElement[] {
+  return Array.from(root.value?.querySelectorAll<HTMLElement>('[role="menuitem"]') ?? []).filter(
+    (el) => !el.classList.contains("disabled"),
+  );
+}
+
+/** 漫游 tabindex：同一时刻只有当前项在 Tab 序列里 */
+function focusItem(el: HTMLElement): void {
+  for (const x of itemEls()) x.setAttribute("tabindex", x === el ? "0" : "-1");
+  el.focus();
+}
+
+function focusItemAt(i: number): void {
+  const els = itemEls();
+  if (els.length === 0) return;
+  focusItem(els[((i % els.length) + els.length) % els.length]);
+}
+
+/** 焦点进当前展开的子菜单首项 */
+function focusFirstSub(): void {
+  const first = root.value?.querySelector<HTMLElement>('.ctx-sub [role="menuitem"]:not(.disabled)');
+  if (first) focusItem(first);
+}
+
 function onKeydown(e: KeyboardEvent): void {
-  if (e.key === "Escape") emit("close");
+  const els = itemEls();
+  const cur = els.indexOf(document.activeElement as HTMLElement);
+  switch (e.key) {
+    case "Escape":
+      e.preventDefault();
+      emit("close");
+      return;
+    case "ArrowDown":
+      e.preventDefault();
+      focusItemAt(cur + 1);
+      return;
+    case "ArrowUp":
+      e.preventDefault();
+      focusItemAt(cur <= 0 ? els.length - 1 : cur - 1);
+      return;
+    case "Home":
+      e.preventDefault();
+      focusItemAt(0);
+      return;
+    case "End":
+      e.preventDefault();
+      focusItemAt(els.length - 1);
+      return;
+    case "Enter":
+    case " ": {
+      // 焦点在项上触发该项；焦点不在任何元素上（刚打开）时触发首项
+      const active = document.activeElement;
+      const target = els[cur] ?? (active === document.body ? els[0] : undefined);
+      if (!target) return;
+      e.preventDefault();
+      target.click();
+      return;
+    }
+  }
 }
 
 function run(entry: MenuEntry | MenuSubEntry): void {
@@ -67,8 +127,23 @@ function onItemEnter(entry: MenuEntry, el: HTMLElement): void {
     openSub.value = null;
     return;
   }
+  openSubmenu(entry, el);
+}
+
+function openSubmenu(entry: MenuEntry, el: HTMLElement): void {
   const rect = el.getBoundingClientRect();
   openSub.value = { key: entry.key, flip: rect.right + 230 > window.innerWidth };
+}
+
+/** 点击/Enter：叶子项执行动作，带子菜单的项展开并把焦点交给其首项 */
+function onItemClick(entry: MenuEntry, el: HTMLElement): void {
+  if (entry.disabled) return;
+  if (entry.children && entry.children.length > 0) {
+    openSubmenu(entry, el);
+    void nextTick().then(focusFirstSub);
+    return;
+  }
+  run(entry);
 }
 </script>
 
@@ -76,28 +151,50 @@ function onItemEnter(entry: MenuEntry, el: HTMLElement): void {
   <div
     ref="root"
     class="ctx-menu"
+    role="menu"
     :style="{ left: `${pos.left}px`, top: `${pos.top}px` }"
     tabindex="-1"
     @contextmenu.prevent
   >
     <template v-for="e in entries" :key="e.key">
-      <div v-if="!e.label" class="ctx-sep" />
+      <div v-if="!e.label" class="ctx-sep" role="separator" />
       <div
         v-else
         class="ctx-item"
+        role="menuitem"
+        tabindex="-1"
         :class="{ danger: e.danger, disabled: e.disabled, 'has-sub': !!e.children }"
+        :aria-disabled="e.disabled ? 'true' : undefined"
+        :aria-haspopup="e.children ? 'menu' : undefined"
+        :aria-expanded="e.children ? openSub?.key === e.key : undefined"
         @pointerenter="onItemEnter(e, $event.currentTarget as HTMLElement)"
-        @click="!e.children && run(e)"
+        @click="onItemClick(e, $event.currentTarget as HTMLElement)"
       >
         <span class="ctx-label">{{ e.label }}</span>
         <span v-if="e.hint" class="ctx-hint">{{ e.hint }}</span>
         <span v-if="e.children" class="ctx-arrow" aria-hidden="true">›</span>
-        <div v-if="e.children && openSub?.key === e.key" class="ctx-sub" :class="{ flip: openSub.flip }">
+        <div
+          v-if="e.children && openSub?.key === e.key"
+          class="ctx-sub"
+          :class="{ flip: openSub.flip }"
+          role="menu"
+        >
           <template v-for="(s, i) in e.children" :key="s.key">
-            <div v-if="s.group && s.group !== e.children![i - 1]?.group" class="ctx-group">
+            <div
+              v-if="s.group && s.group !== e.children![i - 1]?.group"
+              class="ctx-group"
+              role="presentation"
+            >
               {{ s.group }}
             </div>
-            <div class="ctx-item" :class="{ disabled: s.disabled }" @click.stop="run(s)">
+            <div
+              class="ctx-item"
+              role="menuitem"
+              tabindex="-1"
+              :class="{ disabled: s.disabled }"
+              :aria-disabled="s.disabled ? 'true' : undefined"
+              @click.stop="run(s)"
+            >
               <span class="ctx-label">{{ s.label }}</span>
             </div>
           </template>

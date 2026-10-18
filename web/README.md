@@ -11,7 +11,7 @@ Vue 3 + Vite + TypeScript + vue-router + Tauri 2，支持浏览器与桌面应�
 | `/workflows`              | 工作流列表：新建 / 打开编辑器 / 触发器 / 运行记录 / 删除                              |
 | `/workflows/:id`          | 编辑器：顶部条（保存/发布/运行）+ 左节点面板、中画布、右参数与运行面板                |
 | `/workflows/:id/versions` | 版本历史：版本表格（状态/校验和/时间）+ 加载到编辑器 / 以此版本发布 + 两版结构化 diff |
-| `/workflows/:id/triggers` | 触发器：定时调度（cron + 下次触发，10s 轮询）与 webhook（hook URL 复制 / curl 示例）  |
+| `/workflows/:id/triggers` | 触发器：定时调度（cron/input 行内编辑 + 下次触发，10s 轮询）与 webhook（hook URL 复制 / curl 示例 / 调用合同） |
 | `/workflows/:id/runs`     | 该工作流的运行历史（3s 轮询）                                                         |
 | `/runs`                   | 全局运行历史（同上组件，不过滤）                                                      |
 | `/runs/:runId`            | 运行详情：信息头 + 只读 DAG（按 run 钉死的版本渲染、保留运行态着色）+ 实时时间线      |
@@ -182,9 +182,28 @@ teardown 杀进程删目录。种子数据直接走 JSON-RPC WebSocket（`e2e/he
     下次触发时间本地化显示、启停、删除）。`next_fire_at` 由服务端算好
     （`schedule.create`/`schedule.list` 返回），前端不解析 cron；非法 cron 由后端
     -32010 经 toast 展示；页面激活期间 10s 轮询；
+  - 调度编辑：行内「编辑」改 cron + 触发 input（JSON 文本域），保存走
+    `schedule.update`（`api.updateSchedule`），只提交改动项——input 保持原样 = 不改
+    （`undefined`），清空 = 删除输入（`null`），改成新 JSON = 替换；非法 JSON 前端拦截，
+    保存成功后 toast 并刷新列表；
   - Webhook：新建按钮 + 列表（完整 hook URL 一键复制、curl 示例展开、启停、删除）。
     hook URL 基址 = `VITE_FLOW_HTTP`（默认 `http://127.0.0.1:9801`），因为
-    flow-server 的 HTTP 端口前端无法自知。POST body（JSON）即 run 的 input。
+    flow-server 的 HTTP 端口前端无法自知。POST body（JSON）即 run 的 input；
+  - 调用合同（每张 webhook 卡片的折叠区）：
+    - **版本固定**：下拉只列 `workflow.versions` 中 `status === "published"` 的版本，
+      保存走 `webhook.change` patch（`api.updateWebhookInvoke`）固定 `invoke_version`；
+    - **调用密钥**：「生成密钥」（32 字节 hex）或「粘贴已有密钥」（≥32 字节）两种入口；
+      明文只显示一次（复制按钮 + 「服务端只存哈希，丢失需重设」警示），保存只提交
+      `invoke_key_hash` = 明文的 SHA-256 hex；重设密钥覆盖旧键是不可逆操作，先确认弹窗；
+    - **展示策略**：`webhook.list` 不回显 `invoke_version`/`invoke_key_hash`，未回显时
+      显示「保存后立即生效，列表接口暂不回显」；服务端将来回显则直接显示
+      「已固定 vN / 密钥已设置」+ 哈希前缀；
+    - **调用示例**：`POST /invoke/{token}`（Bearer 调用密钥 + 必填 `Idempotency-Key`
+      + 可选 `X-Correlation-Id`，body=run 输入）→ 202 受理回执（`run_id`/`run_token`/
+      `result_url`/`events_url`/`receipt`）。202 只表示受理≠业务完成；重试复用同一
+      `Idempotency-Key` 保证只触发一次；`run_token` 只绑定该次 run，用于
+      `GET /invocations/{run_id}` 查结果（413 时返回 `output_ref`+`download_url`），
+      不要外发管理令牌。
 - **仪表盘** `/`：工作流总数、运行总数、成功率、进行中四张卡片 + 最近运行 +
   按工作流成功率。统计走 `run.stats`（服务端 GROUP BY 精确计数），派生值纯函数
   在 `src/state/dashboard.ts`（vitest 覆盖）；最近运行表只是展示窗口，走
@@ -192,6 +211,39 @@ teardown 杀进程删目录。种子数据直接走 JSON-RPC WebSocket（`e2e/he
 - **运行归因**：runs 表带 `source`（手动 / 定时调度 / Webhook / 子流程）与
   `source_detail`（schedule id / webhook token）。运行记录页有「来源」列与
   来源筛选下拉；运行详情信息头显示来源，定时调度来源的 run 附「触发器」页链接。
+
+## 回归运行与结果对比（P1）
+
+- 运行详情（终态）顶部「回归」：以当前 run 为基线，选择**同一工作流**的候选版本启动新 run
+  （`run.regress`）。候选复用基线记录的时钟/种子、人工输入与外部操作结果，不会重新发起
+  HTTP/harness 副作用；请求摘要与基线不一致的节点会显式失败。候选版本默认取最新已发布版本。
+- 回归候选的来源是 `manual` + `source_detail=regression:<baseline>`：详情头显示「回归自基线」，
+  运行列表「来源」列带「回归」回链。
+- 候选终结后自动打开「与基线比较」（`run.compare`）：展示运行状态、最终输出与逐节点结果的差异；
+  `StoredValue` 大值引用以可行动占位展示，不泄漏内部指针。也可在运行详情手动「对比基线」
+  输入任意基线 run id。
+- 跨工作流回归会被限制为基线工作流：外部操作 fixture 按节点身份匹配，换工作流基本必然 miss。
+- 基线 run 详情的「回归候选」折叠区按来源标记扫描本工作流最近 500 条运行，列出候选并可一键
+  「与它对比」；对比覆盖递归子 run（`children.*`）、错误与请求指纹（`nodes.*.request`）差异，
+  差异超过 64 条时提示截断。
+- 回归弹窗「高级：覆盖外部操作结果」可显式替换录制 fixture（键是节点路径的紧凑 JSON 数组、
+  fingerprint 是 64 位请求指纹、outcome 写业务值）；覆盖会落为事实，仅用于测试场景。
+
+## 大值与列表降级（P1）
+
+- 产品读面把 journal 值物化成业务值时有 8MB 预算：超预算时运行详情自动降级为原始信封渲染
+  （时间线/日志不可用），输入/输出给「下载完整值」入口（桌面原生保存对话框 / 浏览器流式保存，
+  不支持时整块下载）。
+- 运行列表整页超预算时降级为原始快照扫描（手动刷新；单次最多扫描 8192 条，被截断会明示）。
+- 运行列表的状态/来源筛选写入 URL：链接可分享、后退/刷新还原。
+
+## 人工裁决 uncertain 操作（P1）
+
+- 外部操作（http_call/harness/email）在崩溃/断链后进入「已授权但结果未知」的 uncertain 等待：
+  系统绝不自动重发。运行面板显示「外部操作结果待确认」，必须人工核对后裁决：
+  接受产出（可填人工认定的产出 JSON）、授权重发（明示可能重复副作用）、判定失败。
+- 裁决理由必填（≤4096 字节），经 `run.adjudicate` 落为 journal 事实；它是重发的唯一授权凭据，
+  自动重试只覆盖脚本/条件等可安全重算的场景。
 
 ## 使用
 
@@ -203,21 +255,21 @@ teardown 杀进程删目录。种子数据直接走 JSON-RPC WebSocket（`e2e/he
 4. 「保存」（或 Ctrl/Cmd+S）生成 draft 版本（服务端强制 validate），「发布」后可「运行」；
 5. 运行时画布按节点状态着色（运行中蓝 / 完成绿 / 失败红 / 重试中黄 / 跳过灰），
    运行中节点的下游边流动动画；右侧时间线实时更新，行 hover/click 与画布节点联动；
-   human_task 等待时可交付信号，运行中可取消。
-
-### 可观察性（节点日志与输入面）
-
-- 后端把节点日志（script 的 console.*、http_call 请求/响应行、condition 求值、
-  重试/接管/等待等引擎叙事）作为 `node_log` 事件写进同一条事件流——与状态事件
-  同一 seq 空间、同一订阅回放，无第二套日志管道（设计见 `docs/observability-design.md`）。
-- 前端两处呈现：**日志页签**（整个 run 的时间轴，级别/节点/文本过滤、跟随模式）
-  与**节点检查器**（点画布节点或日志行打开：输入面 = 模板展开后 params（已脱敏）、
-  输出、错误、按 attempt 分组的节点日志）。
-- `run.timeline` 节点条目带 `input`（输入面快照）；固定敏感键
-  （authorization/token/password/cookie…）在展示层脱敏，`run.get` 的数据面不变。
+   human_task 等待时可交付信号，运行中可取消；uncertain 外部操作在运行面板人工裁决。
 6. sub_workflow 子流程节点：参数面板用下拉选择目标工作流（未发布/不存在有警告），
    双击节点钻取子流程（画布上方面包屑可逐级返回）；运行时节点和时间线上的
    「子 run →」链接可切换监控；编辑器内钻取用「← 父 run」返回，
    运行详情页内则跳转 `/runs/:childRunId`。
+
+### 可观察性（节点日志与输入面）
+
+- 节点日志（script 的 console.*、http_call 请求/响应行、condition 求值、重试/接管/等待等
+  引擎叙事）写入独立的 observation store：有损、可丢弃、**不是 journal 权威事实**，
+  与状态事件不是同一条管道。前端经 `run.observations.page` 按 seq 增量拉取。
+- 前端两处呈现：**日志页签**（整个 run 的时间轴，级别/节点/文本过滤、跟随模式，顶部明示
+  丢弃计数/历史不完整）与**节点检查器**（点画布节点或日志行打开：输入面 = 模板展开后
+  params（已脱敏）、输出、错误、按 attempt 分组的节点日志）。
+- `run.timeline` 节点条目带 `input`（输入面快照）；固定敏感键
+  （authorization/token/password/cookie…）在展示层脱敏，`run.get` 的数据面不变。
 
 其他画布能力：右下 Minimap、吸附网格（16px）、旧定义缺 position 时按拓扑分层兜底布局。

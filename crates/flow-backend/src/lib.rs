@@ -8,11 +8,15 @@ pub mod journal;
 pub mod journal_cluster;
 mod journal_commands;
 pub use journal_commands::ProductCommand;
+pub mod bundle;
+mod execution_snapshot;
 mod journal_driver;
 mod journal_execution;
 mod journal_history;
 pub mod journal_import;
 pub mod journal_views;
+pub mod projection_check;
+mod regression;
 #[derive(Debug, Error)]
 pub enum ViewError {
     #[error("工作流不存在：{0}")]

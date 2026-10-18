@@ -91,6 +91,32 @@ describe("RpcClient：请求/响应匹配与订阅映射", () => {
     expect(err.code).toBe(-32011);
   });
 
+  it("写方法清单漏项：服务端提示缺 request_id 时补键重试一次并解包回执", async () => {
+    const client = await freshClient();
+    const p = client.call("future.write", { x: 1 });
+    const ws = MockWebSocket.instances[0];
+    ws.open();
+    await vi.waitFor(() => expect(ws.sent).toHaveLength(1));
+    const first = ws.lastSent();
+    expect((first.params as Record<string, unknown>).request_id).toBeUndefined();
+    ws.receive({
+      jsonrpc: "2.0",
+      id: first.id,
+      error: { code: -32602, message: "request_id required for write commands" },
+    });
+    // 准入阶段拒绝 = 命令未被接受：补幂等键重试是安全的
+    await vi.waitFor(() => expect(ws.sent).toHaveLength(2));
+    const second = ws.lastSent();
+    expect(second.id).not.toBe(first.id);
+    expect(typeof (second.params as Record<string, unknown>).request_id).toBe("string");
+    ws.receive({
+      jsonrpc: "2.0",
+      id: second.id,
+      result: { committed: true, visible: true, result: { ok: true } },
+    });
+    await expect(p).resolves.toEqual({ ok: true });
+  });
+
   it("并发请求各自按 id 匹配，乱序响应不错位", async () => {
     const client = await freshClient();
     const p1 = client.call("m1", {});

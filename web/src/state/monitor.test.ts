@@ -13,7 +13,8 @@ vi.mock("../api/flow", () => ({
 }));
 
 import * as api from "../api/flow";
-import { attachRun, canCancelRun, detachRun, monitor, needReattach } from "./monitor";
+import { editor } from "./editor";
+import { attachRun, canCancelRun, detachRun, monitor, needReattach, startRun } from "./monitor";
 
 function timeline(runId: string): Timeline {
   return {
@@ -146,5 +147,15 @@ describe("timeline 拉取失败的降级路径", () => {
     expect(canCancelRun.value).toBe(true);
     expect(needReattach.value).toBe(true);
     await detachRun();
+  });
+});
+
+describe("startRun 前置校验", () => {
+  it("未发布工作流点运行：不发 run.start（避免服务端英文 -32602）", async () => {
+    editor.workflowId = "wf-unpublished";
+    editor.publishedVersion = null;
+    monitor.inputText = "";
+    await startRun();
+    expect(api.startRun).not.toHaveBeenCalled();
   });
 });

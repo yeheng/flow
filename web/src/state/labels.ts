@@ -87,12 +87,30 @@ export function nodeTypeLabel(type: string): string {
       return "Harness 代理";
     case "human_task":
       return "人工节点";
+    case "llm":
+      return "模型调用";
     case "input":
       return "输入";
     case "sub_workflow":
       return "子工作流";
     default:
       return type;
+  }
+}
+
+/** 证据粒度（NodeTypeDesc.trace_granularity）→ 人话；未知值原样 */
+export function traceGranularityLabel(granularity: string): string {
+  switch (granularity) {
+    case "node":
+      return "节点级证据";
+    case "external_call":
+      return "外部调用证据";
+    case "process":
+      return "进程级证据";
+    case "model_call":
+      return "模型调用证据";
+    default:
+      return granularity;
   }
 }
 

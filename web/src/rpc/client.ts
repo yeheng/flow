@@ -1,10 +1,20 @@
 import { isDesktop } from "../platform";
 import { apiToken } from "../config";
+import { RpcError } from "./errors";
 import { NativeClient } from "./native";
 import { WebSocketClient } from "./websocket";
 import { WRITE_METHODS } from "./methods";
 export { RpcError, errText } from "./errors";
 export type Service = "flow" | "journal";
+
+/** 服务端对写命令的准入错误：缺 request_id（命令尚未被接受，补键重试安全） */
+function missingRequestId(error: unknown): boolean {
+  return (
+    error instanceof RpcError &&
+    error.code === -32602 &&
+    error.message.includes("request_id required for write commands")
+  );
+}
 
 /**
  * v2 协议包装：JSON-RPC 之下的 journal v2 语义。
@@ -50,15 +60,26 @@ export class RpcClient {
       if (enriched["request_id"] === undefined) enriched["request_id"] = crypto.randomUUID();
       requestId = enriched["request_id"] as string;
     }
-    const reply: {
+    let reply: {
       committed?: boolean;
       result?: unknown;
       request_id?: string;
       visible?: boolean;
-    } = await this.transport.call(method, enriched);
-    // 服务端在写响应前等到投影可见（applied_lsn >= commit_lsn），-32020 在
-    // 健康路径不会出现；若到达即投影病理，直接上抛。
-    // 主工作台使用物化结果；JournalClient 消费完整回执。
+    };
+    try {
+      reply = await this.transport.call(method, enriched);
+    } catch (error) {
+      // 浏览器端的写方法清单是手抄的（桌面端由 Tauri 按后端清单兜底注入）：
+      // 漏项时服务端在准入阶段就拒绝，命令未被接受，补 request_id 重试一次安全。
+      // 已有幂等键仍报缺键说明不是清单问题，直接上抛。
+      if (requestId !== undefined || !missingRequestId(error)) throw error;
+      requestId = crypto.randomUUID();
+      enriched["request_id"] = requestId;
+      reply = await this.transport.call(method, enriched);
+    }
+    // SQLite 单事务提交事实 + 当前状态，写回执的 visible 恒为 true（-32020
+    // COMMITTED_NOT_VISIBLE 已无生产者）。主工作台解包回执取物化结果；
+    // JournalClient 另行消费完整回执。
     if (this.service === "flow" && requestId !== undefined && reply?.committed === true) {
       return reply.result as T;
     }

@@ -37,8 +37,8 @@ export class JournalClient {
   call<T>(method: string, params: Record<string, unknown> = {}): Promise<T> {
     return this.rpc.call<T>(method, { ...params, _token: this.token });
   }
-  /** 服务端在写响应前等到投影可见（applied_lsn >= commit_lsn）；-32020 到达
-   * 即投影病理，直接上抛，不做恢复轮询。 */
+  /** 写命令回执。SQLite 单事务提交后 visible 恒为 true；-32020 已无生产者，
+   * 这里仍保留完整回执形状供原生协议读面使用。 */
   command(method: string, params: Record<string, unknown>, _scope = method, requestId: string = crypto.randomUUID()): Promise<Receipt> {
     return this.call<Receipt>(method, { ...params, request_id: requestId });
   }

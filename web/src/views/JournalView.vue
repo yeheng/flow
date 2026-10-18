@@ -17,6 +17,7 @@ import { runBadgeClass, runStatusLabel } from "../state/labels";
 import { usePanelResize } from "../state/panel-resize";
 import { confirmDialog } from "../state/modal";
 import { toast } from "../state/toast";
+import type { ObservationRecord } from "../types";
 
 const desktop = isDesktop();
 const url = ref("ws://127.0.0.1:9802");
@@ -37,12 +38,57 @@ const audit = ref(false);
 const message = ref("");
 const busy = ref(false);
 const windowed = shallowRef(new EventWindow());
-const observations = shallowRef<unknown[]>([]);
+const observations = shallowRef<ObservationRecord[]>([]);
 const observationLoss = shallowRef<unknown>();
 let refreshing = false;
 let frame: number | undefined;
 let stop: (() => Promise<void>) | undefined;
 let disposed = false;
+
+/** 观测增量水位：已展示的最大 seq（十进制字符串），作为下一页 from_seq。
+ *  run.observations.page 的 from_seq 是闭区间（seq >= from_seq），追加时跳过水位上的那条 */
+let obsSeq = "0";
+/** 观测拉取在途守卫：事件密集时不叠加请求 */
+let obsLoading = false;
+/** 观测拉取节流窗口：任何订阅事件/对齐都请求一次，窗口内合并成一次 */
+const OBS_PULL_INTERVAL_MS = 250;
+let obsTimer: ReturnType<typeof setTimeout> | undefined;
+
+function appendObservations(records: ObservationRecord[]): void {
+  const fresh = records.filter((r) => BigInt(r.seq) > BigInt(obsSeq));
+  const last = fresh[fresh.length - 1];
+  if (last) obsSeq = last.seq;
+  if (fresh.length) observations.value = [...observations.value, ...fresh];
+}
+
+/** 观测增量拉取：from_seq=水位继续分页，只追加；loss 显示仍整包替换 */
+async function pullObservations() {
+  if (!api.value || !run.value || obsLoading) return;
+  obsLoading = true;
+  try {
+    const id = run.value.run_id;
+    const logs = await api.value.call<{ records: ObservationRecord[]; loss: unknown }>(
+      "run.observations.page",
+      { run_id: id, from_seq: obsSeq, limit: 100 },
+    );
+    if (run.value?.run_id !== id) return;
+    appendObservations(logs.records);
+    observationLoss.value = logs.loss;
+  } finally {
+    obsLoading = false;
+  }
+}
+
+function scheduleObsRefresh(): void {
+  if (obsTimer !== undefined) return;
+  obsTimer = setTimeout(() => {
+    obsTimer = undefined;
+    if (disposed) return;
+    void pullObservations().catch((e) => {
+      message.value = String(e);
+    });
+  }, OBS_PULL_INTERVAL_MS);
+}
 
 /** 会改变 run 状态的事件（journal EventKind 的 snake_case 名）：
  *  这些事件到达后需要补拉 run.get 摘要与观测页 */
@@ -181,6 +227,7 @@ async function start() {
   await load();
 }
 
+/** run 摘要刷新：只补拉 run.get；观测走 pullObservations 的 from_seq 增量 */
 async function refreshRun() {
   if (!api.value || !run.value || refreshing) return;
   refreshing = true;
@@ -189,13 +236,6 @@ async function refreshRun() {
     const current = await api.value.call<{ value: RunSnapshot }>("run.get", { run_id: id });
     if (run.value?.run_id !== id) return;
     run.value = current.value;
-    const logs = await api.value.call<{ records: unknown[]; loss: unknown }>(
-      "run.observations.page",
-      { run_id: id, limit: 100 },
-    );
-    if (run.value?.run_id !== id) return;
-    observations.value = logs.records;
-    observationLoss.value = logs.loss;
   } finally {
     refreshing = false;
   }
@@ -205,16 +245,22 @@ async function watchRun(id: string) {
   await stop?.();
   windowed.value = new EventWindow();
   page.value = undefined;
+  observations.value = [];
+  observationLoss.value = undefined;
+  obsSeq = "0";
   stop = await api.value!.monitor(
     id,
     (v) => {
       run.value = v;
       // snapshot 回调在初次对齐、丢包重排、断线重连（JournalClient 内部
-      // onReconnect → align）后都会到达：这些时点观测页可能错过数据，补拉一次
+      // onReconnect → align）后都会到达：这些时点摘要与观测页可能错过数据，补拉一次
       scheduleRunRefresh();
+      scheduleObsRefresh();
     },
     (e) => {
       windowed.value.push(e);
+      // 任何事件都可能伴随观测落库：节流拉增量，不必区分事件类型
+      scheduleObsRefresh();
       if (RUN_LIFECYCLE_KINDS.has(e.event.kind)) scheduleRunRefresh();
       if (frame === undefined)
         frame = requestAnimationFrame(() => {
@@ -227,6 +273,7 @@ async function watchRun(id: string) {
     },
   );
   await refreshRun();
+  await pullObservations();
 }
 
 async function nextPage(reset = false) {
@@ -265,6 +312,7 @@ onBeforeUnmount(() => {
   disposed = true;
   api.value?.close();
   if (frame !== undefined) cancelAnimationFrame(frame);
+  if (obsTimer !== undefined) clearTimeout(obsTimer);
   void stop?.();
 });
 </script>
@@ -384,8 +432,15 @@ onBeforeUnmount(() => {
             </thead>
             <tbody>
               <tr v-for="r in runs" :key="r.run_id">
-                <td class="mono copyable" :title="r.run_id" @click="copyRunId(r.run_id)">
-                  {{ r.run_id.slice(0, 8) }}…
+                <td>
+                  <button
+                    type="button"
+                    class="copy-id"
+                    :title="r.run_id"
+                    @click="copyRunId(r.run_id)"
+                  >
+                    {{ r.run_id.slice(0, 8) }}…
+                  </button>
                 </td>
                 <td>
                   <span class="badge" :class="runBadgeClass(r.status)">
@@ -412,9 +467,9 @@ onBeforeUnmount(() => {
           </AppButton>
         </div>
         <div class="journal-runhead">
-          <span class="mono copyable" :title="run.run_id" @click="copyRunId(run.run_id)">
+          <button type="button" class="copy-id" :title="run.run_id" @click="copyRunId(run.run_id)">
             {{ run.run_id.slice(0, 8) }}…
-          </span>
+          </button>
           <span class="badge" :class="runBadgeClass(run.status)">
             {{ runStatusLabel(run.status) }}
           </span>
@@ -459,6 +514,12 @@ onBeforeUnmount(() => {
         <p class="muted journal-hint">以下丢弃计数属于整个观测存储，不代表业务数据丢失。</p>
         <pre class="code-block">{{ JSON.stringify(observationLoss) }}</pre>
         <JournalLogList :items="observations" empty-text="暂无观测日志" />
+        <div class="journal-obs-more">
+          <AppButton type="button" :disabled="obsLoading" @click="act(() => pullObservations())">
+            加载更多
+          </AppButton>
+          <span class="muted journal-hint">从当前 seq 水位继续分页读取</span>
+        </div>
       </section>
     </div>
   </main>
@@ -570,8 +631,29 @@ onBeforeUnmount(() => {
   gap: 10px;
 }
 
-.copyable {
+/* copy-cell 按钮化：剥掉 button 默认外观，保持原可点击文本单元格样式 */
+.copy-id {
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  font-family: var(--mono);
+  text-align: left;
   cursor: pointer;
+}
+
+.copy-id:hover {
+  background: none;
+  border-color: transparent;
+  text-decoration: underline;
+}
+
+.journal-obs-more {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 8px;
 }
 
 .journal-downloads {

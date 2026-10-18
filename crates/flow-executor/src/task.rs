@@ -133,6 +133,16 @@ impl TaskRunner {
     }
 
     async fn execute(&mut self) -> Result<(), TaskError> {
+        if let Some(runtime) = self
+            .task
+            .node
+            .pointer("/_flow_execution/runtime")
+            .and_then(Value::as_str)
+        {
+            if runtime != flow_engine::RUNTIME_ID {
+                return Err(TaskError::Invalid("executor runtime mismatch".into()));
+            }
+        }
         self.outbound
             .send(Message::Accepted {
                 command_id: self.command_id.clone(),
@@ -486,6 +496,7 @@ impl TaskRunner {
                 .ok_or_else(|| TaskError::Invalid("inputs not materialized".into()))?;
             (face.input.clone(), face.predecessors.clone())
         };
+        let determinism = self.determinism();
         let templates = serde_json::to_string(&node.params)?.contains("${");
         let params = if !templates {
             node.params.clone()
@@ -504,11 +515,12 @@ impl TaskRunner {
                 let input = inputs.input.clone();
                 let nodes = inputs.nodes.clone();
                 move || {
-                    flow_engine::expr::expand_templates_bounded(
+                    flow_engine::expr::expand_templates_recorded(
                         &params,
                         &input,
                         &nodes,
                         Duration::from_secs(2),
+                        determinism,
                     )
                 }
             })
@@ -536,8 +548,8 @@ impl TaskRunner {
             input: face_input,
             predecessors,
             params: stored_params,
-            engine_build: crate::EXECUTOR_BUILD.into(),
-            node_semantics: 1,
+            engine_build: flow_engine::RUNTIME_ID.into(),
+            node_semantics: if determinism.is_some() { 2 } else { 1 },
         };
         audit.push(
             "input_prepared",
@@ -574,7 +586,7 @@ impl TaskRunner {
                 self.compute(node, kind, prepared, inputs, audit, logger)
                     .await
             }
-            kind @ (NodeType::HttpCall | NodeType::Email) => {
+            kind @ (NodeType::HttpCall | NodeType::Email | NodeType::Llm) => {
                 self.http_node(node, kind, prepared, inputs, audit, &logger)
                     .await
             }
@@ -803,13 +815,15 @@ impl TaskRunner {
             );
         }
         let logger = logger.clone();
+        let determinism = self.determinism();
         let result = tokio::task::spawn_blocking(move || {
-            flow_engine::expr::eval_body_bounded(
+            flow_engine::expr::eval_body_recorded(
                 &code,
                 &input,
                 &Value::Object(nodes),
                 timeout,
                 &logger,
+                determinism,
             )
         })
         .await
@@ -818,6 +832,15 @@ impl TaskRunner {
         let branch = (kind == NodeType::Condition).then(|| flow_engine::exec::truthy(&result));
         let output = store_value(audit, &self.journal_id, &result, 8 * 1024 * 1024).await?;
         Ok(ResultOutcome::Success { output, branch })
+    }
+
+    fn determinism(&self) -> Option<flow_engine::expr::JsDeterminism> {
+        let context = self.task.node.get("_flow_execution")?;
+        let digest = flow_journal::codec::digest(context["seed"].as_str()?.as_bytes());
+        Some(flow_engine::expr::JsDeterminism {
+            clock_ms: context["clock_ms"].as_i64()?,
+            seed: u32::from_str_radix(&digest[..8], 16).ok()?,
+        })
     }
 
     async fn take_transfer(&mut self, transfer_id: &str) -> Result<Vec<u8>, TaskError> {
@@ -879,7 +902,12 @@ impl TaskRunner {
         logger: &flow_engine::NodeLogger,
     ) -> Result<ResultOutcome, TaskError> {
         // 恢复路径：已有 Outcome 直接派生输出，不重发请求。
-        if let Some(outcome_value) = self.task.previous_outcome.clone() {
+        if let Some(outcome_value) = self
+            .task
+            .previous_outcome
+            .clone()
+            .filter(|_| !self.is_regression())
+        {
             logger.info("已有捕获的 operation outcome，不重复发起请求（恢复）");
             let outcome: StoredValue =
                 serde_json::from_value(outcome_value).map_err(TaskError::from)?;
@@ -922,6 +950,9 @@ impl TaskRunner {
                 "credential": {"scheme": "bearer", "secret_ref": name},
             });
         }
+        if kind == NodeType::Llm {
+            params["method"] = json!("POST");
+        }
         let method = params["method"].as_str().unwrap_or("GET").to_uppercase();
         if !HTTP_METHODS.contains(&method.as_str()) {
             return Err(TaskError::Invalid("invalid HTTP method".into()));
@@ -930,7 +961,7 @@ impl TaskRunner {
             .as_str()
             .ok_or_else(|| TaskError::Business("HTTP URL missing".into()))?
             .to_owned();
-        let request = json!({
+        let mut request = json!({
             "method": method,
             "url": url,
             "headers": params.get("headers").cloned().unwrap_or(json!({})),
@@ -938,6 +969,17 @@ impl TaskRunner {
             "proxy": params.get("proxy").cloned().unwrap_or(Value::Null),
             "credential": params.get("credential").cloned().unwrap_or(Value::Null),
         });
+        if kind == NodeType::Llm {
+            request["adapter"] = json!("llm");
+        }
+        if self.is_regression() {
+            let outcome = self.fixture_outcome(&request)?;
+            let output = self.http_output(&outcome, kind, audit).await?;
+            return Ok(ResultOutcome::Success {
+                output,
+                branch: None,
+            });
+        }
         let http_method = reqwest::Method::from_bytes(method.as_bytes())
             .map_err(|e| TaskError::Invalid(e.to_string()))?;
         // proxy：非法 URL 是配置错误（授权前构建请求时就该失败的最晚一刻）
@@ -1080,6 +1122,11 @@ impl TaskRunner {
     /// 外部操作的请求发送与许可等待（http/harness 共用）：RequestOperation →
     /// OperationPermit（取消/断线唤醒）。返回许可携带的 credential（harness 不用）。
     async fn authorize_operation(&mut self, request: Value) -> Result<Option<String>, TaskError> {
+        if self.is_regression() {
+            return Err(TaskError::Business(
+                "external operations are disabled in regression".into(),
+            ));
+        }
         let request_bytes = flow_journal::codec::bounded_json(&request, INPUT_BUDGET)?;
         let fingerprint = flow_journal::codec::digest(&request_bytes);
         let operation_id = uuid::Uuid::now_v7().to_string();
@@ -1169,7 +1216,12 @@ impl TaskRunner {
         logger: &flow_engine::NodeLogger,
     ) -> Result<ResultOutcome, TaskError> {
         // 恢复路径：已有 Outcome 直接派生输出，不重跑进程。
-        if let Some(outcome_value) = self.task.previous_outcome.clone() {
+        if let Some(outcome_value) = self
+            .task
+            .previous_outcome
+            .clone()
+            .filter(|_| !self.is_regression())
+        {
             logger.info("已有捕获的 operation outcome，不重复启动进程（恢复）");
             let outcome: StoredValue =
                 serde_json::from_value(outcome_value).map_err(TaskError::from)?;
@@ -1200,6 +1252,14 @@ impl TaskRunner {
             "timeout_ms": timeout_ms,
             "prompt": prompt,
         });
+        if self.is_regression() {
+            let outcome = self.fixture_outcome(&request)?;
+            let output = self.harness_output(&outcome, audit).await?;
+            return Ok(ResultOutcome::Success {
+                output,
+                branch: None,
+            });
+        }
         self.authorize_operation(request).await?;
         // prompt 可能含敏感内容，不进日志；只记命令行与超时。
         logger.info(format!(
@@ -1275,6 +1335,32 @@ impl TaskRunner {
             output,
             branch: None,
         })
+    }
+
+    fn is_regression(&self) -> bool {
+        self.task.node.pointer("/_flow_execution/regression") == Some(&Value::Bool(true))
+    }
+
+    fn fixture_outcome(&self, request: &Value) -> Result<StoredValue, TaskError> {
+        let expected = self
+            .task
+            .node
+            .pointer("/_flow_execution/fixture_fingerprint")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                TaskError::Business("missing regression fixture; no external call performed".into())
+            })?;
+        let actual = flow_journal::codec::fingerprint(request, INPUT_BUDGET)?;
+        if actual != expected {
+            return Err(TaskError::Business(format!("regression request differs from recorded fixture (expected {expected}, actual {actual}); no external call performed")));
+        }
+        serde_json::from_value(
+            self.task
+                .previous_outcome
+                .clone()
+                .ok_or_else(|| TaskError::Business("regression outcome missing".into()))?,
+        )
+        .map_err(Into::into)
     }
 
     /// 一期 `Attempt::harness_output` 等价：Outcome → 节点输出（重跑同一派生）。
@@ -1356,6 +1442,23 @@ impl TaskRunner {
         // 结构字节（{ , : }）由 flow_journal::value::ObjectWriter 的
         // serde_json Formatter 拥有，这里只提供完整值。
         let body = self.raw_bytes(&raw).await?;
+        if kind == NodeType::Llm {
+            if body.len() > INPUT_BUDGET {
+                return Err(TaskError::Business(
+                    "model response exceeds 8 MiB; raw outcome retained".into(),
+                ));
+            }
+            let response: Value = serde_json::from_slice(&body).map_err(|e| {
+                TaskError::Business(format!(
+                    "model response must be JSON: {e}; outcome retained"
+                ))
+            })?;
+            if let Some(schema) = self.task.node.pointer("/params/response_schema") {
+                flow_engine::schema::validate(schema, &response).map_err(|e| {
+                    TaskError::Business(format!("model response contract: {e}; outcome retained"))
+                })?;
+            }
+        }
         let valid_json = {
             let mut de = serde_json::Deserializer::from_slice(&body);
             serde::de::IgnoredAny::deserialize(&mut de).is_ok() && de.end().is_ok()
@@ -1435,6 +1538,7 @@ fn narrative_kind(kind: Option<NodeType>) -> Option<&'static str> {
         NodeType::HttpCall => Some("HTTP 请求"),
         NodeType::Email => Some("发送邮件"),
         NodeType::Harness => Some("本地命令"),
+        NodeType::Llm => Some("模型调用"),
         NodeType::Delay => Some("延时等待"),
         NodeType::HumanTask => Some("人工任务"),
         NodeType::Input => Some("输入收集"),

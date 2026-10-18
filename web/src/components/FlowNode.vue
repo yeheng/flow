@@ -39,6 +39,7 @@ const icons: Record<string, string> = {
   human_task: '<circle cx="8" cy="5" r="2.2"/><path d="M3.5 13c.6-2.6 2.4-4 4.5-4s3.9 1.4 4.5 4"/>',
   input: '<rect x="2" y="4" width="12" height="8" rx="1.5"/><path d="M5 8h4"/>',
   harness: '<path d="M8 1.8l1.5 4.7L14.2 8l-4.7 1.5L8 14.2 6.5 9.5 1.8 8l4.7-1.5Z"/>',
+  llm: '<path d="M6.2 2.2 7.3 5 10.1 6.1 7.3 7.2 6.2 10 5.1 7.2 2.3 6.1 5.1 5Z"/><path d="M11.6 9.4 12.2 10.8 13.6 11.4 12.2 12 11.6 13.4 11 12 9.6 11.4 11 10.8Z"/>',
   email: '<rect x="2" y="3.5" width="12" height="9" rx="1.5"/><path d="M2.5 4.5 8 9l5.5-4.5"/>',
   sub_workflow:
     '<rect x="2.5" y="2.5" width="8" height="8" rx="1.5"/><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/>',

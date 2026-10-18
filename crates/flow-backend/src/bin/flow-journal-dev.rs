@@ -48,6 +48,15 @@ enum JournalDevCommand {
         #[arg(long)]
         database: PathBuf,
     },
+    /// Replay committed facts and prove they reproduce the current rows (service stopped).
+    CheckProjection,
+    /// Export a run and its child/value closure into a NEW evidence directory.
+    ExportRun {
+        run_id: String,
+        destination: PathBuf,
+    },
+    /// Verify and inspect evidence without starting any execution.
+    InspectBundle { source: PathBuf },
 }
 
 fn main() -> std::process::ExitCode {
@@ -121,6 +130,41 @@ async fn journal_dev(
     if let JournalDevCommand::ImportLegacy { source, database } = &command {
         let report = flow_backend::journal_import::import(source, database, &data_dir).await?;
         println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    if let JournalDevCommand::ExportRun {
+        run_id,
+        destination,
+    } = &command
+    {
+        let _lock = flow_journal::maintenance::offline_lock(&data_dir)?;
+        let report = flow_backend::bundle::export(&data_dir, run_id, destination)
+            .map_err(|e| e.to_string())?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    if let JournalDevCommand::InspectBundle { source } = &command {
+        let (manifest, state) = flow_backend::bundle::inspect(source).map_err(|e| e.to_string())?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &serde_json::json!({"manifest":manifest,"runs":state.runs})
+            )?
+        );
+        return Ok(());
+    }
+    if matches!(command, JournalDevCommand::CheckProjection) {
+        // The checker must not race a live writer; hold the data-directory lock.
+        let _lock = flow_journal::maintenance::offline_lock(&data_dir)?;
+        let report = flow_backend::projection_check::check(&data_dir).await?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        if !report.mismatches.is_empty() {
+            return Err(format!(
+                "projection check found {} mismatch(es)",
+                report.mismatches.len()
+            )
+            .into());
+        }
         return Ok(());
     }
     let backend = JournalBackend::open(&data_dir, JournalOptions::default()).await?;

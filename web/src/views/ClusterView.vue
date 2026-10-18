@@ -30,6 +30,12 @@ const labels: Record<ClusterNode["status"], string> = {
   removed: "已剔除",
 };
 const online = computed(() => page.value?.nodes.filter((n) => n.status === "online").length ?? 0);
+/** 非法/缺失时间戳回退原值或 "—"，避免页面出现 Invalid Date */
+function fmtTime(iso: string | null): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
+}
 async function refresh(cursor = after.value) {
   if (busy.value) return;
   busy.value = true;
@@ -117,8 +123,7 @@ onBeforeUnmount(() => {
           <small>当前页在线 / 节点数</small><strong>{{ online }} / {{ page.nodes.length }}</strong>
         </div>
         <div>
-          <small>PG 查询时间</small
-          ><strong>{{ new Date(page.server_time).toLocaleString() }}</strong>
+          <small>PG 查询时间</small><strong>{{ fmtTime(page.server_time) }}</strong>
         </div>
       </section>
       <p class="hint">
@@ -174,11 +179,11 @@ onBeforeUnmount(() => {
           </div>
           <div>
             <dt>最近心跳</dt>
-            <dd>{{ new Date(node.last_seen_at).toLocaleString() }}</dd>
+            <dd>{{ fmtTime(node.last_seen_at) }}</dd>
           </div>
           <div>
             <dt>租约到期（PG 时间）</dt>
-            <dd>{{ new Date(node.lease_until).toLocaleString() }}</dd>
+            <dd>{{ fmtTime(node.lease_until) }}</dd>
           </div>
         </dl>
         <p v-if="node.snapshot.writer_error || node.snapshot.projection_error" class="error">

@@ -59,15 +59,12 @@ impl TailReader {
                 .parse()
                 .map_err(|_| invalid("invalid run fact sequence"))?;
         }
-        let tx = crate::sqlite::transaction(
+        let (tx, bytes) = crate::sqlite::transaction_with_size(
             self.conn.as_ref().unwrap(),
             &self.journal_id,
             self.next_lsn,
         )?;
-        let location = Location {
-            bytes: crate::codec::encode(&tx)?.len() as u64,
-            lsn: tx.lsn,
-        };
+        let location = Location { bytes, lsn: tx.lsn };
         self.next_lsn = self
             .next_lsn
             .checked_add(1)

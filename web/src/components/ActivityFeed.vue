@@ -37,14 +37,26 @@ const elapsed = computed(() => {
   if (active.value) {
     return runElapsedMs(monitor.nodes, null, now.value);
   }
-  // 终态：monitor 不携带 run 级结束时间，用最晚节点的结束时间封口
+  // 终态：monitor 不携带 run 级结束时间，用最晚节点的结束时间封口。
+  // 节点时间戳目前恒为空（journal 不记录墙钟），此时宁可不显示用时，
+  // 也不能拿 now() 让已结束 run 的「用时」一直增长。
   let last: number | null = null;
   for (const n of monitor.nodes) {
     if (n.ended_at === null) continue;
     const at = Date.parse(n.ended_at);
     if (!Number.isNaN(at) && (last === null || at > last)) last = at;
   }
-  return runElapsedMs(monitor.nodes, last === null ? null : new Date(last).toISOString(), now.value);
+  return last === null ? null : runElapsedMs(monitor.nodes, new Date(last).toISOString(), now.value);
+});
+
+/** 观测日志丢失：活动流也是日志读面，静默少行会让叙事不可信 */
+const lossText = computed(() => {
+  const loss = monitor.observationLoss;
+  const total =
+    (loss.queue_dropped ?? 0) + (loss.retention_dropped ?? 0) + (loss.storage_dropped ?? 0);
+  if (total > 0) return `日志丢弃 ${total} 条`;
+  if (loss.history_incomplete) return "日志历史不完整";
+  return "";
 });
 
 /** 单卡片默认收起的日志行数：够看到「正在做什么」，又不让长脚本淹没流 */
@@ -140,6 +152,10 @@ function onSelectNode(id: string): void {
         <span v-else>用时 {{ friendlyDuration(elapsed) }}</span>
       </template>
       <template v-else>{{ progress.total }} 个步骤</template>
+      <template v-if="lossText">
+        <span class="progress-sep">·</span>
+        <span class="activity-loss">{{ lossText }}</span>
+      </template>
     </div>
 
     <div ref="listEl" class="activity-list" @scroll="onScroll">
@@ -239,6 +255,10 @@ function onSelectNode(id: string): void {
 .progress-sep {
   margin: 0 4px;
   color: var(--text3);
+}
+
+.activity-loss {
+  color: var(--warn);
 }
 
 .activity-list {

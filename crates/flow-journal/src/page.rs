@@ -2,7 +2,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::codec::{self, Event, EventKind};
+use crate::codec::{self, Event};
 use crate::{invalid, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,8 +132,7 @@ pub fn page(
             return Err(invalid("cursor position mismatch"));
         }
         for (index, event) in tx.events.iter().enumerate().skip(cursor.event_index) {
-            let audit = event.audit_seq > 0
-                || matches!(event.kind, EventKind::ValueChunk | EventKind::LateAudit);
+            let audit = event.is_audit();
             let include = event.run_id.as_deref() == Some(run_id)
                 && match filter {
                     Filter::All => true,

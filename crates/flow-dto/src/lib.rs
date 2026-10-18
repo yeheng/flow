@@ -7,8 +7,9 @@ use serde_json::Value;
 pub const STATUS_DRAFT: &str = "draft";
 pub const STATUS_PUBLISHED: &str = "published";
 
-/// runs.status 的合法词汇表（DESIGN.md §6.1：单一来源，写入口校验）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// runs.status 的合法词汇表（全工作区唯一来源；engine 直接 re-export）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     Running,
     AwaitingResume,
@@ -56,6 +57,17 @@ impl RunStatus {
             self,
             RunStatus::Succeeded | RunStatus::Failed | RunStatus::Cancelled
         )
+    }
+
+    /// 与 `is_terminal` 同义的历史名称，保留现有调用点语义。
+    pub fn terminal(self) -> bool {
+        self.is_terminal()
+    }
+}
+
+impl std::fmt::Display for RunStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -147,7 +159,7 @@ pub struct RunRecord {
     pub id: String,
     pub workflow_id: String,
     pub workflow_version: i64,
-    pub status: String,
+    pub status: RunStatus,
     pub input: Value,
     pub output: Option<Value>,
     pub error: Option<String>,

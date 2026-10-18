@@ -35,39 +35,9 @@ mod snapshot_decimal {
 /// schedule_fires 保留，业务去重不依赖这个有限重试窗口。
 const COMMAND_WINDOW: usize = 8192;
 
-/// run 生命周期状态词汇表（journal 域单一来源）。wire 是 snake_case 字符串，
-/// 与既有 journal 日志、checkpoint 逐字兼容——加变体编译器会逼所有
-/// match 跟上，不再有散落字符串比对漏改的通道。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RunStatus {
-    Running,
-    AwaitingResume,
-    Succeeded,
-    Failed,
-    Cancelled,
-}
-
-impl RunStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Running => "running",
-            Self::AwaitingResume => "awaiting_resume",
-            Self::Succeeded => "succeeded",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-        }
-    }
-    pub fn terminal(self) -> bool {
-        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
-    }
-}
-
-impl std::fmt::Display for RunStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+/// run 生命周期词汇表的唯一定义在 `flow-dto`；这里只 re-export，
+/// 避免出现第二份 `ALL`/`as_str`。
+pub use flow_dto::RunStatus;
 
 /// 节点执行状态（`Node.status`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +127,61 @@ pub struct Run {
     #[serde(with = "snapshot_decimal")]
     pub last_run_seq: u64,
     pub nodes: BTreeMap<String, Node>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ExecutionSnapshot>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub signals: BTreeMap<String, StoredValue>,
+}
+
+/// Immutable dependencies and deterministic inputs, inherited by child runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionSnapshot {
+    pub runtime: String,
+    pub clock_ms: i64,
+    pub seed: String,
+    pub path: Vec<String>,
+    pub definitions: BTreeMap<String, DefinitionVersion>,
+    pub bindings: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regression: Option<Regression>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+}
+impl ExecutionSnapshot {
+    pub fn node_key(&self, node: &str) -> String {
+        let mut path = self.path.clone();
+        path.push(node.into());
+        serde_json::to_string(&path).unwrap()
+    }
+    pub fn signal_inputs(&self) -> BTreeMap<String, StoredValue> {
+        self.regression
+            .as_ref()
+            .map(|r| {
+                r.signals
+                    .iter()
+                    .filter_map(|(path, value)| {
+                        let mut path: Vec<String> = serde_json::from_str(path).ok()?;
+                        let node = path.pop()?;
+                        (path == self.path).then(|| (node, value.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Regression {
+    pub baseline: String,
+    pub fixtures: BTreeMap<String, OperationFixture>,
+    #[serde(default)]
+    pub signals: BTreeMap<String, StoredValue>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub overrides: std::collections::BTreeSet<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationFixture {
+    pub fingerprint: String,
+    pub outcome: StoredValue,
 }
 impl Run {
     /// Run metadata without the per-node execution ledger.
@@ -177,6 +202,8 @@ impl Run {
             error: self.error.clone(),
             last_run_seq: self.last_run_seq,
             nodes: BTreeMap::new(),
+            execution: self.execution.clone(),
+            signals: self.signals.clone(),
         }
     }
     /// Terminal facts win; otherwise all outstanding uncertain waits participate.
@@ -385,7 +412,7 @@ pub struct ScheduleFire {
 pub struct State {
     /// Rebuilt by replay before accepting commands; never trusted from serialized snapshots.
     #[serde(skip)]
-    pub values: flow_journal::value::ValueCatalog,
+    pub values: flow_journal::value::Publications,
     /// Backend keeps permanent audit receipts in a rebuildable disk index.
     #[serde(skip)]
     pub compact_audits: bool,
@@ -441,7 +468,17 @@ impl State {
     /// Transaction-local staging guarantees that a malformed later event cannot expose its
     /// earlier sibling. Only affected maps/objects are touched by the committed replacement.
     pub fn apply(&mut self, tx: &Transaction) -> Result<()> {
-        self.apply_mode(tx, true, |_| Ok(()))
+        self.apply_with(tx, |_| Ok(()))
+    }
+    /// Commit the transaction and inspect the post-transaction state. The inspect
+    /// callback sees exactly what `apply` would leave behind; on error the state is
+    /// restored from the affected-entity undo.
+    pub fn apply_with<T>(
+        &mut self,
+        tx: &Transaction,
+        inspect: impl FnOnce(&State) -> Result<T>,
+    ) -> Result<T> {
+        self.apply_mode(tx, true, inspect)
     }
     pub fn check(&mut self, tx: &Transaction) -> Result<()> {
         self.apply_mode(tx, false, |_| Ok(()))
@@ -460,12 +497,12 @@ impl State {
         })?;
         Ok(output.expect("successful preview"))
     }
-    fn apply_mode(
+    fn apply_mode<T>(
         &mut self,
         tx: &Transaction,
         commit: bool,
-        inspect: impl FnOnce(&State) -> Result<()>,
-    ) -> Result<()> {
+        inspect: impl FnOnce(&State) -> Result<T>,
+    ) -> Result<T> {
         tx.validate()?;
         if tx.lsn != self.applied_lsn + 1
             || (!self.journal_id.is_empty() && self.journal_id != tx.journal_id)
@@ -710,8 +747,7 @@ impl State {
                     }
                 }
             }
-            inspect(self)?;
-            Ok(())
+            inspect(self)
         })();
         if result.is_err() || !commit {
             restore(&mut self.workflows, workflow_undo);
@@ -815,6 +851,36 @@ impl State {
             EventKind::RunStarted => {
                 check(&p["input"])?;
                 check(&p["definition"])?;
+                let run: Run = serde_json::from_value(p.clone())?;
+                for signal in run.signals.values() {
+                    self.values.check(signal)?;
+                }
+                if let Some(execution) = &run.execution {
+                    if execution.definitions.len() > 128
+                        || execution.path.len() > crate::MAX_SUB_WORKFLOW_DEPTH as usize
+                        || execution.runtime.len() != 64
+                    {
+                        return Err(invalid("invalid execution snapshot"));
+                    }
+                    for definition in execution.definitions.values() {
+                        self.values.check(&definition.definition)?;
+                    }
+                    if let Some(regression) = &execution.regression {
+                        for fixture in regression.fixtures.values() {
+                            self.values.check(&fixture.outcome)?;
+                            if let StoredValue::Inline(v) = &fixture.outcome {
+                                if let Some(raw) = v.get("body_raw") {
+                                    self.values.check(&StoredValue::Ref(
+                                        serde_json::from_value(raw.clone())?,
+                                    ))?;
+                                }
+                            }
+                        }
+                        for value in regression.signals.values() {
+                            self.values.check(value)?;
+                        }
+                    }
+                }
             }
             EventKind::InputPrepared => {
                 let prepared: Prepared = serde_json::from_value(p["prepared"].clone())?;
@@ -1042,7 +1108,25 @@ impl State {
                 }
                 return Ok(());
             }
-            EventKind::SignalReceived => return Ok(()),
+            EventKind::SignalReceived => {
+                if p["queued"] == true {
+                    if run.terminal() {
+                        return Err(invalid("signal on terminal run"));
+                    }
+                    let id = event
+                        .node_id
+                        .clone()
+                        .ok_or_else(|| invalid("signal node required"))?;
+                    if run
+                        .signals
+                        .insert(id, serde_json::from_value(p["payload"].clone())?)
+                        .is_some()
+                    {
+                        return Err(invalid("signal inbox slot already occupied"));
+                    }
+                }
+                return Ok(());
+            }
             _ => {}
         }
         let node_id = event
@@ -1124,7 +1208,7 @@ impl State {
         }
         if event.kind == EventKind::InputPrepared {
             let prepared: Prepared = serde_json::from_value(p["prepared"].clone())?;
-            if prepared.input != run.input || prepared.node_semantics != 1 {
+            if prepared.input != run.input || !matches!(prepared.node_semantics, 1 | 2) {
                 return Err(invalid(
                     "prepared input/semantics differs from committed run",
                 ));
@@ -1271,6 +1355,8 @@ impl State {
             }
             EventKind::WaitResolved => {
                 if !terminal {
+                    run.signals
+                        .remove(event.node_id.as_deref().unwrap_or_default());
                     node.status = NodeStatus::Succeeded;
                     node.wait = None;
                     node.output = Some(serde_json::from_value(p["output"].clone())?);
@@ -1318,6 +1404,28 @@ impl State {
                 }
                 // 裁决即人工介入完成：awaiting_resume 回到 running（终态由
                 // 后续 RunCompleted/RunFailed 事件落定）
+                run.status = RunStatus::Running;
+            }
+            EventKind::OperationRetryAuthorized => {
+                if terminal
+                    || node.prepared.is_none()
+                    || node.operation.as_ref().is_none_or(|o| {
+                        o.outcome.is_some()
+                            || p["operation_id"] != o.operation_id
+                            || p["fingerprint"] != o.fingerprint
+                    })
+                    || p["policy"] != "repeatable"
+                {
+                    return Err(invalid("invalid repeatable-operation retry authorization"));
+                }
+                node.operation = None;
+                node.status = NodeStatus::Waiting;
+                node.wait = Some(Wait::Retry {
+                    wake_at: p["wake_at"]
+                        .as_i64()
+                        .ok_or_else(|| invalid("retry deadline required"))?,
+                });
+                node.error = None;
                 run.status = RunStatus::Running;
             }
             EventKind::ValueChunk | EventKind::ValuePublished | EventKind::LateAudit => {}

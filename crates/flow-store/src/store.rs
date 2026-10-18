@@ -8,7 +8,7 @@ pub struct Store {
 }
 
 // Startup must scale with live runs even before SQLite has collected statistics.
-const ACTIVE_RUNS_SQL:&str="SELECT key FROM current_entities INDEXED BY entity_active_runs WHERE kind='run' AND json_extract(body,'$.status') IN ('running','awaiting_resume') AND key>? ORDER BY key LIMIT 256";
+const ACTIVE_RUNS_SQL:&str="SELECT key FROM current_entities INDEXED BY entity_active_runs WHERE kind='run' AND status IN ('running','awaiting_resume') AND key>? ORDER BY key LIMIT 256";
 
 pub use flow_journal::sqlite::EntityChange;
 
@@ -22,12 +22,12 @@ pub struct RunsQuery<'a> {
 }
 
 fn attempt_filter(q: &mut QueryBuilder<Sqlite>, run: &str, all: bool) {
-    if all {
-        q.push("json_extract(key,'$[0]')=").push_bind(run);
-    } else {
-        q.push("key IN (SELECT json_array(").push_bind(run)
-            .push(",json_extract(key,'$[1]'),json_extract(body,'$.dispatch_id')) FROM current_entities WHERE kind='run_node' AND json_extract(key,'$[0]')=")
-            .push_bind(run).push(")");
+    q.push("parent=").push_bind(run);
+    if !all {
+        // Only the attempt that currently owns the node, not its historical attempts.
+        q.push(" AND extra IN (SELECT dispatch_id FROM current_entities WHERE kind='run_node' AND parent=")
+            .push_bind(run)
+            .push(")");
     }
 }
 
@@ -121,11 +121,11 @@ impl Store {
             .transpose()?;
         if kind == "workflow" && with_nodes {
             if let Some(workflow) = value.as_mut() {
-                let size:i64=sqlx::query_scalar("SELECT COALESCE(SUM(length(CAST(body AS BLOB))),0) FROM current_entities WHERE kind='workflow_version' AND json_extract(key,'$[0]')=?").bind(key).fetch_one(&mut *tx).await?;
+                let size:i64=sqlx::query_scalar("SELECT COALESCE(SUM(length(CAST(body AS BLOB))),0) FROM current_entities WHERE kind='workflow_version' AND parent=?").bind(key).fetch_one(&mut *tx).await?;
                 if size > 8 * 1024 * 1024 {
                     return Err(sqlx::Error::Protocol("RESPONSE_TOO_LARGE".into()));
                 }
-                let rows=sqlx::query("SELECT key,body,digest FROM current_entities WHERE kind='workflow_version' AND json_extract(key,'$[0]')=? ORDER BY key").bind(key).fetch_all(&mut *tx).await?;
+                let rows=sqlx::query("SELECT key,body,digest FROM current_entities WHERE kind='workflow_version' AND parent=? ORDER BY key").bind(key).fetch_all(&mut *tx).await?;
                 for row in rows {
                     let version = decode_body(
                         "workflow_version",
@@ -143,7 +143,7 @@ impl Store {
         }
         if kind == "run" && with_nodes {
             if let Some(run) = value.as_mut() {
-                let node_size: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(length(CAST(body AS BLOB))+length(CAST(key AS BLOB))+4),0) FROM current_entities WHERE kind='run_node' AND json_extract(key,'$[0]')=?")
+                let node_size: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(length(CAST(body AS BLOB))+length(CAST(key AS BLOB))+4),0) FROM current_entities WHERE kind='run_node' AND parent=?")
                     .bind(key).fetch_one(&mut *tx).await?;
                 let mut size_query = QueryBuilder::<Sqlite>::new(
                     "SELECT COALESCE(SUM(length(CAST(body AS BLOB))+length(CAST(key AS BLOB))+4),0) FROM current_entities WHERE kind='run_attempt' AND ",
@@ -157,7 +157,7 @@ impl Store {
                 if size > (8 * 1024 * 1024 - body.as_ref().map_or(0, String::len)) as i64 {
                     return Err(sqlx::Error::Protocol("RESPONSE_TOO_LARGE".into()));
                 }
-                let nodes = sqlx::query("SELECT json_extract(key,'$[1]') AS node_id,key,body,digest FROM current_entities WHERE kind='run_node' AND json_extract(key,'$[0]')=?")
+                let nodes = sqlx::query("SELECT slot AS node_id,key,body,digest FROM current_entities WHERE kind='run_node' AND parent=?")
                     .bind(key).fetch_all(&mut *tx).await?;
                 let mut map = serde_json::Map::new();
                 for node in nodes {
@@ -168,7 +168,7 @@ impl Store {
                     );
                 }
                 let mut attempt_query = QueryBuilder::<Sqlite>::new(
-                    "SELECT json_extract(key,'$[1]') AS node_id,json_extract(key,'$[2]') AS dispatch_id,key,body,digest FROM current_entities WHERE kind='run_attempt' AND ",
+                    "SELECT slot AS node_id,extra AS dispatch_id,key,body,digest FROM current_entities WHERE kind='run_attempt' AND ",
                 );
                 attempt_filter(&mut attempt_query, key, all_attempts);
                 let attempts = attempt_query.build().fetch_all(&mut *tx).await?;
@@ -234,7 +234,7 @@ impl Store {
             .push(" AND last_lsn<=")
             .push_bind(format!("{upper:020}"));
         if let Some(parent) = parent {
-            q.push(" AND json_extract(key,'$[0]')=").push_bind(parent);
+            q.push(" AND parent=").push_bind(parent);
         }
         q.push(" ORDER BY key LIMIT ")
             .push_bind(limit.min(256) as i64);
@@ -245,7 +245,7 @@ impl Store {
         parent: &str,
         upper: u64,
     ) -> Result<Vec<(String, String)>, sqlx::Error> {
-        sqlx::query_as("SELECT json_extract(key,'$[1]'),MIN(json_extract(key,'$[2]')) FROM current_entities WHERE kind='child' AND json_extract(key,'$[0]')=? AND last_lsn<=? GROUP BY json_extract(key,'$[1]')")
+        sqlx::query_as("SELECT slot,MIN(extra) FROM current_entities WHERE kind='child' AND parent=? AND last_lsn<=? GROUP BY slot")
             .bind(parent).bind(format!("{upper:020}")).fetch_all(&self.pool).await
     }
     pub async fn dispatch_owner(&self, dispatch: &str) -> Result<Option<Value>, sqlx::Error> {
@@ -333,9 +333,7 @@ impl Store {
             ("source", filter.source),
         ] {
             if let Some(value) = value {
-                query
-                    .push(format!(" AND json_extract(body,'$.{field}')="))
-                    .push_bind(value);
+                query.push(format!(" AND {field}=")).push_bind(value);
             }
         }
         if let Some(created) = &cursor {
@@ -366,12 +364,10 @@ impl Store {
         );
         query.push_bind(kind);
         if let Some(id) = workflow_id {
-            query
-                .push(" AND json_extract(body,'$.workflow_id')=")
-                .push_bind(id);
+            query.push(" AND workflow_id=").push_bind(id);
         }
         query.push(if by_name {
-            " ORDER BY json_extract(body,'$.name'),key"
+            " ORDER BY name,key"
         } else {
             " ORDER BY created_order DESC,key DESC"
         });
@@ -423,14 +419,12 @@ impl Store {
         workflow_id: Option<&str>,
     ) -> Result<Vec<(String, String, i64)>, sqlx::Error> {
         let mut query = QueryBuilder::<Sqlite>::new(
-            "SELECT json_extract(body,'$.workflow_id') AS workflow,json_extract(body,'$.status') AS status,COUNT(*) AS count FROM current_entities WHERE kind='run'",
+            "SELECT workflow_id AS workflow,status AS status,COUNT(*) AS count FROM current_entities WHERE kind='run'",
         );
         if let Some(id) = workflow_id {
-            query
-                .push(" AND json_extract(body,'$.workflow_id')=")
-                .push_bind(id);
+            query.push(" AND workflow_id=").push_bind(id);
         }
-        query.push(" GROUP BY json_extract(body,'$.workflow_id'),json_extract(body,'$.status')");
+        query.push(" GROUP BY workflow_id,status");
         Ok(query
             .build()
             .fetch_all(&self.pool)

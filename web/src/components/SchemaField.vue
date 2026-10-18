@@ -44,6 +44,12 @@ const widget = computed<Widget>(() => {
   }
 });
 
+// label 与控件的 for/id 关联：key-value 一行多控件、code 是 Monaco 自定义控件，无法单点关联
+const fieldId = useId();
+const labelTarget = computed(() =>
+  widget.value === "key-value" || widget.value === "code" ? undefined : fieldId,
+);
+
 function onText(ev: Event): void {
   emit("update:modelValue", (ev.target as HTMLInputElement).value);
 }
@@ -235,36 +241,46 @@ function setChild(key: string, value: unknown): void {
   </fieldset>
 
   <div v-else class="field">
-    <label>
+    <label :for="labelTarget">
       {{ label }}
       <em v-if="required" class="required">*</em>
     </label>
 
     <input
       v-if="widget === 'text'"
+      :id="fieldId"
       type="text"
       :value="(modelValue as string) ?? ''"
       @input="onText"
     />
     <input
       v-else-if="widget === 'number'"
+      :id="fieldId"
       type="number"
       :value="(modelValue as number) ?? ''"
       @input="onNumber"
     />
     <input
       v-else-if="widget === 'boolean'"
+      :id="fieldId"
       type="checkbox"
       class="checkbox"
       :checked="Boolean(modelValue)"
       @change="onBoolean"
     />
-    <select v-else-if="widget === 'enum'" :value="(modelValue as string) ?? ''" @change="onSelect">
+    <select
+      v-else-if="widget === 'enum'"
+      :id="fieldId"
+      :value="(modelValue as string) ?? ''"
+      :aria-label="label"
+      @change="onSelect"
+    >
       <option v-if="!required" value="">（不设置）</option>
       <option v-for="opt in schema.enum" :key="opt" :value="opt">{{ opt }}</option>
     </select>
     <template v-else-if="widget === 'secret'">
       <input
+        :id="fieldId"
         type="text"
         :list="secretListId"
         placeholder="密钥名称"
@@ -287,6 +303,7 @@ function setChild(key: string, value: unknown): void {
     />
     <template v-else-if="widget === 'json'">
       <textarea
+        :id="fieldId"
         v-model="jsonText"
         class="code"
         rows="4"
@@ -332,7 +349,12 @@ function setChild(key: string, value: unknown): void {
       <div v-if="kvDupKeys.size > 0" class="field-error">存在重复的键，重复行未保存</div>
     </template>
     <template v-else-if="widget === 'workflow-picker'">
-      <select :value="(modelValue as string) ?? ''" @change="onPickWorkflow">
+      <select
+        :id="fieldId"
+        :value="(modelValue as string) ?? ''"
+        :aria-label="label"
+        @change="onPickWorkflow"
+      >
         <option value="">（选择工作流）</option>
         <option v-for="w in editor.workflows" :key="w.workflow_id" :value="w.workflow_id">
           {{ w.name }}

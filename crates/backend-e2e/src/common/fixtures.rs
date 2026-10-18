@@ -1,3 +1,4 @@
+// These fixtures pin the original execution contract; product_contract covers semantics 2.
 //! 定义构造器（fixtures）+ 本地 HTTP stub 服务。
 //!
 //! HTTP stub 全部是确定性的「本地 TcpListener」（DESIGN.md §14 测试约定）：
@@ -17,6 +18,7 @@ use tokio::net::{TcpListener, TcpStream};
 /// start → script → end。
 pub fn linear_def(code: &str) -> Value {
     json!({
+        "semantics": 1,
         "nodes": [
             {"id": "start", "type": "start", "name": "开始"},
             {"id": "n1", "type": "script", "name": "脚本", "params": {"code": code}},
@@ -33,6 +35,7 @@ pub fn linear_def(code: &str) -> Value {
 /// 两个 end 是互斥分支的收尾（AND-join 合同不让它们合流，见 DESIGN.md §9.1）。
 pub fn condition_def(expr: &str, true_code: &str, false_code: &str) -> Value {
     json!({
+        "semantics": 1,
         "nodes": [
             {"id": "start", "type": "start", "name": "开始"},
             {"id": "cond", "type": "condition", "name": "条件",
@@ -56,6 +59,7 @@ pub fn condition_def(expr: &str, true_code: &str, false_code: &str) -> Value {
 /// true 分支直接 end。用于钉住「跳过必须推进到不动点」。
 pub fn skip_chain_def(expr: &str) -> Value {
     json!({
+        "semantics": 1,
         "nodes": [
             {"id": "start", "type": "start", "name": "开始"},
             {"id": "cond", "type": "condition", "name": "条件", "params": {"expr": expr}},
@@ -78,6 +82,7 @@ pub fn skip_chain_def(expr: &str) -> Value {
 /// AND-join：一条入边 Unsatisfied 就整节点跳过。
 pub fn join_skip_def(expr: &str) -> Value {
     json!({
+        "semantics": 1,
         "nodes": [
             {"id": "start", "type": "start", "name": "开始"},
             {"id": "cond", "type": "condition", "name": "条件", "params": {"expr": expr}},
@@ -98,6 +103,7 @@ pub fn join_skip_def(expr: &str) -> Value {
 /// start → delay → end。
 pub fn delay_def(ms: u64) -> Value {
     json!({
+        "semantics": 1,
         "nodes": [
             {"id": "start", "type": "start", "name": "开始"},
             {"id": "d", "type": "delay", "name": "等待", "params": {"ms": ms}},
@@ -113,6 +119,7 @@ pub fn delay_def(ms: u64) -> Value {
 /// start → human_task → end。
 pub fn human_def() -> Value {
     json!({
+        "semantics": 1,
         "nodes": [
             {"id": "start", "type": "start", "name": "开始"},
             {"id": "h", "type": "human_task", "name": "人工", "params": {"prompt": "请审批"}},
@@ -128,6 +135,7 @@ pub fn human_def() -> Value {
 /// start → input → end。fields 逐项 {"key","label"?,"default"?}。
 pub fn input_def(fields: Value) -> Value {
     json!({
+        "semantics": 1,
         "nodes": [
             {"id": "start", "type": "start", "name": "开始"},
             {"id": "i", "type": "input", "name": "输入", "params": {"fields": fields}},
@@ -143,6 +151,7 @@ pub fn input_def(fields: Value) -> Value {
 /// start → http_call → end。
 pub fn http_def(method: &str, url: &str) -> Value {
     json!({
+        "semantics": 1,
         "nodes": [
             {"id": "start", "type": "start", "name": "开始"},
             {"id": "call", "type": "http_call", "name": "请求",
@@ -159,6 +168,7 @@ pub fn http_def(method: &str, url: &str) -> Value {
 /// 全参数 http_call（headers / body / 重试策略 / 超时）。
 pub fn http_def_full(params: Value) -> Value {
     json!({
+        "semantics": 1,
         "nodes": [
             {"id": "start", "type": "start", "name": "开始"},
             {"id": "call", "type": "http_call", "name": "请求", "params": params},
@@ -174,6 +184,7 @@ pub fn http_def_full(params: Value) -> Value {
 /// start → s1 → end_a；start → s2 → end_b（两个 end → 输出按节点 id 映射）。
 pub fn multi_end_def() -> Value {
     json!({
+        "semantics": 1,
         "nodes": [
             {"id": "start", "type": "start", "name": "开始"},
             {"id": "s1", "type": "script", "name": "一", "params": {"code": "return 1;"}},
@@ -193,6 +204,7 @@ pub fn multi_end_def() -> Value {
 /// start → s1, s2 → end（AND-join 两汇都满足 → end 输出为前驱映射）。
 pub fn multi_pred_def() -> Value {
     json!({
+        "semantics": 1,
         "nodes": [
             {"id": "start", "type": "start", "name": "开始"},
             {"id": "s1", "type": "script", "name": "一", "params": {"code": "return 'a';"}},
@@ -215,6 +227,7 @@ pub fn failing_def(code: &str, retry: Option<Value>) -> Value {
         params["retry"] = retry;
     }
     json!({
+        "semantics": 1,
         "nodes": [
             {"id": "start", "type": "start", "name": "开始"},
             {"id": "boom", "type": "script", "name": "炸", "params": params},
@@ -230,6 +243,7 @@ pub fn failing_def(code: &str, retry: Option<Value>) -> Value {
 /// start → sub_workflow(→ child_wf) → end。
 pub fn sub_def(child_wf: &str) -> Value {
     json!({
+        "semantics": 1,
         "nodes": [
             {"id": "start", "type": "start", "name": "开始"},
             {"id": "sub", "type": "sub_workflow", "name": "子流程",

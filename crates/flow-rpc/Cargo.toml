@@ -26,6 +26,8 @@ flow-backend = { path = "../flow-backend" }
 flow-journal = { path = "../flow-journal" }
 flow-engine = { path = "../flow-engine" }
 flow-config = { path = "../flow-config" }
+sha2.workspace = true
+hex.workspace = true
 
 # 无 dev-dependencies：原 tests/（wire 契约/集群）已并入 backend-e2e 与
 # remote-e2e 套件；src 内单测只用正常依赖（serde_json 等）。

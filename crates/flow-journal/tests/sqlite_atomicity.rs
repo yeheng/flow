@@ -85,10 +85,19 @@ async fn state_facts_receipt_and_cursor_roll_back_together_on_constraint_failure
         ],
     );
     assert!(j.submit_prepared(tx, rows).await.is_err());
-    assert!(j.close().await.is_err());
+    // A rejected transaction is a caller error, not an authority failure: the writer
+    // stays usable and the next prepared transition commits normally.
+    let (tx, rows) = prepared(
+        &j,
+        2,
+        "after-rejection",
+        vec![row("new", json!({"result":"recovered"}))],
+    );
+    j.submit_prepared(tx, rows).await.unwrap();
+    j.close().await.unwrap();
     drop(j);
     let j = Journal::open(dir.path(), Default::default()).await.unwrap();
-    assert_eq!(j.durable_lsn(), 1);
+    assert_eq!(j.durable_lsn(), 2);
     let conn = flow_journal::sqlite::read_connection(dir.path()).unwrap();
     let facts: i64 = conn
         .query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0))
@@ -96,7 +105,7 @@ async fn state_facts_receipt_and_cursor_roll_back_together_on_constraint_failure
     let current: i64 = conn
         .query_row("SELECT COUNT(*) FROM current_entities", [], |r| r.get(0))
         .unwrap();
-    assert_eq!((facts, current), (1, 1));
+    assert_eq!((facts, current), (2, 2));
     let body: String = conn
         .query_row(
             "SELECT body FROM current_entities WHERE key='stable'",
@@ -193,7 +202,8 @@ async fn current_objects_are_overwritten_and_domain_facts_cannot_bypass_material
         )
         .await
         .is_err());
-    assert!(j.close().await.is_err());
+    // Invalid domain input must not freeze the only writer.
+    j.close().await.unwrap();
 }
 
 #[tokio::test]

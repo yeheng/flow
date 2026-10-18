@@ -77,6 +77,18 @@ describe("cluster management", () => {
     expect(w.text()).toContain("当前显示上一次成功查询的数据");
     expect(w.text()).toContain("journal-a");
   });
+  it("非法时间戳回退原值，不显示 Invalid Date", async () => {
+    vi.mocked(clusterNodes).mockResolvedValue({
+      cluster_id: "production",
+      server_time: "not-a-time",
+      nodes: [{ ...node, last_seen_at: "not-a-time", lease_until: "not-a-time" }],
+      next_after: null,
+    });
+    const w = create();
+    await flushPromises();
+    expect(w.text()).not.toContain("Invalid Date");
+    expect(w.text()).toContain("not-a-time");
+  });
   it("confirms removal and preserves the same command ID across an ambiguous retry", async () => {
     const w = create();
     await flushPromises();

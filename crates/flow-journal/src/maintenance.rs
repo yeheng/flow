@@ -128,8 +128,9 @@ pub fn backup(root: &Path, destination: &Path, upper_lsn: u64) -> Result<Recover
     // hard_link gives no-replace publication on the same filesystem.
     fs::hard_link(&path, destination.join(crate::sqlite::DATABASE))?;
     sync_dir(destination)?;
-    fs::remove_file(&path)?;
-    fs::remove_dir(&staging)?;
+    // The sealed backup may still carry a -shm left by the WAL to DELETE switch.
+    // Only the main database file is published; drop the whole staging directory.
+    fs::remove_dir_all(&staging)?;
     sync_dir(destination)?;
     Ok(report)
 }
@@ -144,6 +145,57 @@ pub fn rebuild_index(root: &Path, upper_lsn: u64) -> Result<Recovery> {
         .map_err(crate::sqlite::db)?;
     conn.execute_batch("PRAGMA synchronous=FULL; REINDEX;")
         .map_err(crate::sqlite::db)?;
+    Ok(report)
+}
+
+/// Format 4 fences older executors from interpreting semantics-2 runs as legacy
+/// DAGs. The SQL schema is unchanged. Upgrade a consistent COPY; never edit or
+/// overwrite the source. The caller must hold the source's offline lock.
+pub fn upgrade(source: &Path, destination: &Path) -> Result<Recovery> {
+    if fs::symlink_metadata(destination).is_ok() {
+        return Err(Error::Conflict("upgrade destination already exists".into()));
+    }
+    let database = source.join(crate::sqlite::DATABASE);
+    if fs::symlink_metadata(&database)?.file_type().is_symlink() {
+        return Err(invalid("symlink source database"));
+    }
+    let source =
+        rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(crate::sqlite::db)?;
+    let version: i64 = source
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .map_err(crate::sqlite::db)?;
+    if version != 3 {
+        return Err(invalid("upgrade supports only SQLite format 3 -> 4"));
+    }
+    private_dir(destination)?;
+    let staging = destination.join(format!(".upgrade-{}", uuid::Uuid::now_v7()));
+    private_dir(&staging)?;
+    let path = staging.join(crate::sqlite::DATABASE);
+    drop(private_file(&path, true)?);
+    let mut target = rusqlite::Connection::open(&path).map_err(crate::sqlite::db)?;
+    rusqlite::backup::Backup::new(&source, &mut target)
+        .map_err(crate::sqlite::db)?
+        .run_to_completion(128, std::time::Duration::from_millis(1), None)
+        .map_err(crate::sqlite::db)?;
+    target
+        .execute_batch(
+            "PRAGMA synchronous=FULL; PRAGMA user_version=4; PRAGMA journal_mode=DELETE;",
+        )
+        .map_err(crate::sqlite::db)?;
+    drop(target);
+    File::open(&path)?.sync_all()?;
+    let report = verify(&staging)?;
+    if report.fault.is_some() {
+        return Err(invalid(
+            "upgraded copy failed verification; source unchanged",
+        ));
+    }
+    fs::hard_link(&path, destination.join(crate::sqlite::DATABASE))?;
+    sync_dir(destination)?;
+    fs::remove_dir_all(&staging)?;
+    sync_dir(destination)?;
+    sync_dir(destination.parent().unwrap_or(Path::new(".")))?;
     Ok(report)
 }
 

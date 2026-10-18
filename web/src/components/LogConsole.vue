@@ -5,8 +5,8 @@ import { logWindow } from "../state/monitor-logic";
 import type { LogLine, LogLevel } from "../types";
 
 /**
- * 日志控制台：一个 run 的时间轴叙事（node_log 事件流）。
- * 历史段来自订阅回放（seq=1 起完整重放），运行中实时追加——同一条流。
+ * 日志控制台：一个 run 的时间轴叙事（observation store，有损、非 journal 事实）。
+ * 按 observation seq 增量轮询；运行中实时追加，丢失计数在列表上方明示。
  */
 const emit = defineEmits<{ "select-node": [nodeId: string] }>();
 
@@ -23,6 +23,17 @@ const LEVEL_ORDER: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, erro
 const nodeName = computed(() => {
   const map = new Map(monitor.nodes.map((n) => [n.id, n.name || n.id]));
   return (id: string) => map.get(id) ?? (id ? id : "引擎");
+});
+
+/** 观测日志的丢失计数（会竞争预算/保留期）：非空时在列表上方常驻提示 */
+const lossText = computed(() => {
+  const loss = monitor.observationLoss;
+  const parts: string[] = [];
+  if (loss.queue_dropped) parts.push(`队列丢弃 ${loss.queue_dropped} 条`);
+  if (loss.retention_dropped) parts.push(`保留期丢弃 ${loss.retention_dropped} 条`);
+  if (loss.storage_dropped) parts.push(`存储丢弃 ${loss.storage_dropped} 条`);
+  if (loss.history_incomplete) parts.push("历史记录不完整");
+  return parts.join("，");
 });
 
 /**
@@ -189,6 +200,11 @@ function onSelectNode(id: string): void {
       <input v-model="searchText" type="search" class="log-search" placeholder="搜索日志…" />
     </div>
 
+    <!-- 观测日志是有损的（预算/保留期），丢失必须显式提示，不能假装完整 -->
+    <p v-if="lossText" class="log-loss" role="status">
+      日志不完整：{{ lossText }}
+    </p>
+
     <!-- 空态/列表都只读 frame 快照：不直接摸 monitor.logs，见 LogFrame 注释 -->
     <div v-if="!frame.hasLogs" class="log-empty">
       暂无日志<span v-if="monitor.status === 'running'">（等待节点输出…）</span>
@@ -254,6 +270,15 @@ function onSelectNode(id: string): void {
 .log-search {
   flex: 1;
   min-width: 0;
+  font-size: 11px;
+}
+
+.log-loss {
+  margin: 0 0 6px;
+  padding: 4px 8px;
+  border: 1px solid var(--warn);
+  border-radius: 6px;
+  color: var(--warn);
   font-size: 11px;
 }
 

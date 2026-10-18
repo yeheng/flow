@@ -110,7 +110,10 @@ test("可观察性：Journal 观测日志与节点检查器展示输入面/输�
   await page.getByRole("button", { name: "新建", exact: true }).click();
   await expect(page.locator(".journal-status")).toHaveText("已提交并可见");
   await expect(page.locator(".journal-side select option:checked")).toHaveText(journalName);
-  const runRow = page.locator("tr").filter({ has: page.locator(`td[title="${runId}"]`) });
+  // 复制单元格是 <button class="copy-id" :title="run_id">（a11y 按钮化后 title 在按钮上）
+  const runRow = page
+    .locator("tr")
+    .filter({ has: page.locator(`button.copy-id[title="${runId}"]`) });
   await runRow.getByRole("button", { name: "监控", exact: true }).click();
   const observations = page.locator(".journal-detail .journal-log").last();
   await expect(observations).toContainText("hello e2e");

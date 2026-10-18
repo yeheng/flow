@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
+import * as api from "../api/flow";
 import { createWorkflow, editor, refreshWorkflows, removeWorkflow } from "../state/editor";
 import { importWorkflow, parseImportDocument } from "../state/workflow-io";
 import { errText } from "../rpc/client";
@@ -12,13 +13,26 @@ const router = useRouter();
 
 /** 首次拉取完成前不展示空态，避免「暂无…」闪烁 */
 const loaded = ref(false);
+/** 拉取失败：展示错误条与重试，而不是把空列表当成「暂无工作流」 */
+const error = ref("");
 const creating = ref(false);
 /** 正在删除的工作流 id：只禁用对应行的删除按钮 */
 const deletingId = ref<string | null>(null);
 
-onMounted(async () => {
-  await refreshWorkflows();
-  loaded.value = true;
+async function refresh(): Promise<void> {
+  try {
+    // 直接走 api：refreshWorkflows 内部吞掉错误并 toast，本页需要失败态来区分「空」和「拉取失败」
+    editor.workflows = await api.listWorkflows();
+    error.value = "";
+  } catch (e) {
+    error.value = errText(e);
+  } finally {
+    loaded.value = true;
+  }
+}
+
+onMounted(() => {
+  void refresh();
 });
 
 async function onCreate(): Promise<void> {
@@ -112,6 +126,10 @@ async function onFileChange(event: Event): Promise<void> {
       class="import-input"
       @change="onFileChange"
     />
+    <div v-if="error" role="alert" class="error-banner">
+      <span>加载工作流失败：{{ error }}</span>
+      <AppButton @click="refresh()">重试</AppButton>
+    </div>
     <table class="data-table">
       <thead>
         <tr>
@@ -123,7 +141,7 @@ async function onFileChange(event: Event): Promise<void> {
       </thead>
       <tbody>
         <tr v-for="w in editor.workflows" :key="w.workflow_id">
-          <td>
+          <td class="wf-cell">
             <RouterLink class="link" :to="`/workflows/${w.workflow_id}`">{{ w.name }}</RouterLink>
           </td>
           <td>v{{ w.latest_version }}</td>
@@ -150,7 +168,9 @@ async function onFileChange(event: Event): Promise<void> {
       </tbody>
     </table>
     <p v-if="!loaded" class="wf-empty">加载中…</p>
-    <p v-else-if="editor.workflows.length === 0" class="wf-empty">暂无工作流，点击「新建」开始</p>
+    <p v-else-if="!error && editor.workflows.length === 0" class="wf-empty">
+      暂无工作流，点击「新建」开始
+    </p>
   </div>
 </template>
 
@@ -163,5 +183,24 @@ async function onFileChange(event: Event): Promise<void> {
 /* 文件选择器只作按钮背后的通道，不占布局 */
 .import-input {
   display: none;
+}
+
+/* 长名称可能没有空白/为中文，允许折行避免横向撑破表格 */
+.wf-cell {
+  word-break: break-all;
+}
+
+.error-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+  font-size: 12px;
 }
 </style>

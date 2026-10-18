@@ -1,5 +1,5 @@
 //! SQLite inspection and filesystem initialization. Locations identify logical facts.
-use crate::codec::{self, Transaction};
+use crate::codec::Transaction;
 use crate::{invalid, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -52,8 +52,7 @@ pub fn scan_until(
     };
     for lsn in 1..=upper {
         let result = (|| {
-            let tx = crate::sqlite::transaction(&conn, &identity, lsn)?;
-            let bytes = codec::encode(&tx)?.len() as u64;
+            let (tx, bytes) = crate::sqlite::transaction_with_size(&conn, &identity, lsn)?;
             apply(&tx, &Location { bytes, lsn })
         })();
         if let Err(error) = result {

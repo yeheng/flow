@@ -24,6 +24,8 @@ pub enum NodeType {
     Harness,
     /// 经 HTTP API（Resend 兼容格式）发邮件
     Email,
+    /// One recorded model request. Tool effects remain separate workflow nodes.
+    Llm,
 }
 
 /// 节点类型与其字符串名的对应表：**变体清单的唯一来源**。
@@ -34,7 +36,7 @@ pub enum NodeType {
 ///
 /// 表用 `(变体, 字符串)` 而不是靠 `as_str` 反推：字符串是 wire 格式与落库内容，
 /// 让它显式出现在表里，改名时编译器与快照测试一起响。
-const NODE_TYPE_TABLE: [(NodeType, &str); 11] = [
+const NODE_TYPE_TABLE: [(NodeType, &str); 12] = [
     (NodeType::Start, "start"),
     (NodeType::End, "end"),
     (NodeType::Script, "script"),
@@ -46,11 +48,12 @@ const NODE_TYPE_TABLE: [(NodeType, &str); 11] = [
     (NodeType::SubWorkflow, "sub_workflow"),
     (NodeType::Harness, "harness"),
     (NodeType::Email, "email"),
+    (NodeType::Llm, "llm"),
 ];
 
 impl NodeType {
     /// 全部节点类型，顺序 = 表的顺序 = `nodetypes.list` 响应顺序 = 前端面板顺序。
-    pub const ALL: [NodeType; 11] = [
+    pub const ALL: [NodeType; 12] = [
         NodeType::Start,
         NodeType::End,
         NodeType::Script,
@@ -62,6 +65,7 @@ impl NodeType {
         NodeType::SubWorkflow,
         NodeType::Harness,
         NodeType::Email,
+        NodeType::Llm,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -83,7 +87,7 @@ impl NodeType {
     pub fn has_side_effect(self) -> bool {
         matches!(
             self,
-            NodeType::HttpCall | NodeType::Harness | NodeType::Email
+            NodeType::HttpCall | NodeType::Harness | NodeType::Email | NodeType::Llm
         )
     }
 
@@ -211,7 +215,8 @@ impl NodeType {
                     "required": ["workflow_id"],
                     "properties": {
                         "workflow_id": {"type": "string", "x-widget": "workflow-picker", "x-label": "目标工作流",
-                                        "x-help": "调用其最新已发布版本作为子 run；子 run 输出透传为本节点输出；子 run 失败传导为本节点 fatal（DESIGN.md §8.1），重试策略只覆盖启动/等待类错误"},
+                                        "x-help": "v2 在运行启动时固定已发布子流程；输出透传，失败向上传导"},
+                        "version":{"type":"integer","x-label":"子流程版本","x-help":"省略时在运行启动时固定最新已发布版本"},
                         "input_mapping": {"x-widget": "json", "x-label": "子 run 输入映射",
                                         "x-help": "JSON 对象，值支持 ${input.x} / ${nodes.n.y} 模板；展开结果整体作为子 run 输入。省略 = 沿用父 run 输入"}
                     }
@@ -227,7 +232,7 @@ impl NodeType {
                     "required": ["command", "prompt"],
                     "properties": {
                         "command": {"type": "string", "x-label": "命令",
-                                    "x-help": "要执行的 harness CLI（如 kimi / claude / codex）；prompt 经 stdin 传入，stdout 作为输出"},
+                                    "x-help": "进程级记录：prompt 经 stdin，最终 stdout 作为输出；逐模型/工具记录使用模型调用和 HTTP 节点"},
                         "prompt": {"type": "string", "x-widget": "code", "x-label": "提示词"},
                         "args": {"type": "array", "items": {"type": "string"}, "x-widget": "json", "x-label": "额外参数"},
                         "workdir": {"type": "string", "x-label": "工作目录"},
@@ -236,6 +241,18 @@ impl NodeType {
                 },
                 "supports_retry": true,
                 "side_effect": true
+            }),
+            NodeType::Llm => serde_json::json!({
+                "label":"模型调用", "category":"ai", "side_effect":true, "supports_retry":false,
+                "ports":[{"id":"in","label":"入"},{"id":"out","label":"出"}],
+                "params_schema":{"type":"object","required":["url","body"],"properties":{
+                    "url":{"type":"string","x-label":"模型 API 地址"},
+                    "body":{"type":"object","x-widget":"json","x-label":"模型请求"},
+                    "headers":{"x-widget":"key-value","default":{},"x-label":"请求头"},
+                    "credential":{"type":"object","x-widget":"json","x-label":"凭据引用","x-help":"{scheme: bearer, secret_ref: 密钥名称}"},
+                    "response_schema":{"type":"object","x-widget":"json","x-label":"响应约束"},
+                    "timeout_ms":{"type":"integer","default":30000,"x-label":"超时（毫秒）"}
+                }}
             }),
             NodeType::Email => serde_json::json!({
                 "label": "邮件",
@@ -274,10 +291,24 @@ impl NodeType {
     /// [`NODE_TYPE_TABLE`] 的顺序与 enum 声明共同决定，
     /// `node_type_table_is_exhaustive` 钉住这条。
     pub fn descriptor(self) -> &'static Value {
-        static DESCRIPTORS: LazyLock<[Value; 11]> = LazyLock::new(|| {
+        static DESCRIPTORS: LazyLock<[Value; 12]> = LazyLock::new(|| {
             std::array::from_fn(|i| {
                 let kind = NodeType::ALL[i];
                 let mut body = kind.descriptor_body();
+                if kind != NodeType::Start {
+                    body["params_schema"]["properties"]["join"] = serde_json::json!({"type":"string","enum":["selected","all"],"x-label":"合流规则","x-help":"selected 等全部入边确定后执行已选路径；all 要求每个前驱成功。省略时沿用流程版本的默认规则"});
+                }
+                if kind.has_side_effect() {
+                    body["supports_retry"] = serde_json::json!(true);
+                    body["retry_scope"] = serde_json::json!("declared_repeatable_only");
+                    body["params_schema"]["properties"]["effect_policy"] = serde_json::json!({"type":"string","enum":["manual","repeatable"],"default":"manual","x-label":"未知结果恢复","x-help":"manual 等人工核对；repeatable 仅用于重复调用仍安全且无时效限制的接口，并受重试次数限制"});
+                }
+                body["trace_granularity"] = serde_json::json!(match kind {
+                    NodeType::Harness => "process",
+                    NodeType::Llm => "model_call",
+                    NodeType::HttpCall | NodeType::Email => "external_call",
+                    _ => "node",
+                });
                 body.as_object_mut()
                     .expect("descriptor_body 顶层必为对象")
                     .insert("type".into(), Value::String(kind.as_str().into()));
@@ -459,11 +490,28 @@ pub struct Definition {
 }
 
 /// Editable definition DTO. Compile an edited copy to obtain a fresh indexed graph.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DefinitionData {
+    /// Missing means the original all-success dependency contract.
+    #[serde(
+        default = "legacy_semantics",
+        skip_serializing_if = "is_legacy_semantics"
+    )]
+    pub semantics: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
     pub nodes: Vec<Node>,
     #[serde(default)]
     pub edges: Vec<Edge>,
+}
+
+fn legacy_semantics() -> u32 {
+    1
+}
+fn is_legacy_semantics(value: &u32) -> bool {
+    *value == 1
 }
 
 impl std::ops::Deref for Definition {
@@ -507,7 +555,7 @@ struct DefinitionIndex {
 /// 那条契约。
 impl PartialEq for Definition {
     fn eq(&self, other: &Self) -> bool {
-        self.nodes == other.nodes && self.edges == other.edges
+        self.data == other.data
     }
 }
 
@@ -577,6 +625,15 @@ impl Definition {
 
     /// 建图即校验：拖拽生成的图在发布前必须过这一关。
     pub fn validate(&self) -> Result<(), String> {
+        for schema in [&self.input_schema, &self.output_schema]
+            .into_iter()
+            .flatten()
+        {
+            crate::schema::check(schema)?;
+        }
+        if !matches!(self.semantics, 1 | 2) {
+            return Err("unsupported workflow semantics".into());
+        }
         if self.nodes.is_empty() {
             return Err("工作流没有任何节点".into());
         }
@@ -604,6 +661,11 @@ impl Definition {
                 .kind()
                 .ok_or_else(|| format!("节点 {} 的类型未知：{}", node.id, node.node_type))?;
             validate_params(node, kind)?;
+            if let Some(join) = node.params.get("join") {
+                if !matches!(join.as_str(), Some("all" | "selected")) {
+                    return Err(format!("node {}: join must be all | selected", node.id));
+                }
+            }
         }
 
         let starts = self
@@ -653,10 +715,11 @@ impl Definition {
                     // 跳掉，run 仍记成功。这是错误建模，不是分支合流：真要合流
                     // 应指向不同节点，或引入显式 join 策略。建图期拒掉，别让运行期
                     // 静默跳过。
-                    if !condition_targets
-                        .entry(edge.from.as_str())
-                        .or_default()
-                        .insert(edge.to.as_str())
+                    if self.semantics == 1
+                        && !condition_targets
+                            .entry(edge.from.as_str())
+                            .or_default()
+                            .insert(edge.to.as_str())
                     {
                         return Err(format!(
                             "condition 节点 {} 的多个端口不能指向同一节点 {}\
@@ -767,6 +830,14 @@ impl Definition {
 /// `pub`：整图校验（`validate`）与节点模板的**逐节点**校验共用这一份——
 /// 模板片段不是完整 Definition，不能跑整图规则，但参数规则必须同源。
 pub fn validate_params(node: &Node, kind: NodeType) -> Result<(), String> {
+    if let Some(schema) = node.params.get("response_schema") {
+        crate::schema::check(schema)?;
+    }
+    if let Some(policy) = node.params.get("effect_policy") {
+        if !kind.has_side_effect() || !matches!(policy.as_str(), Some("manual" | "repeatable")) {
+            return Err("effect_policy must be manual | repeatable on an external node".into());
+        }
+    }
     for key in kind.required_params() {
         // `${}` 模板放行到执行期判定（DESIGN.md §10.2）：展开后才知道是不是
         // 整数/非空串，建图期一律认它「填了」。先判模板再判类型，顺序反了会把
@@ -787,6 +858,7 @@ pub fn validate_params(node: &Node, kind: NodeType) -> Result<(), String> {
             "boolean" => node.params.get(key).and_then(Value::as_bool).is_none(),
             // 数组必填（input.fields）：值必须是数组，字符串形态只在含 ${} 时由上面的模板规则放行
             "array" => node.params.get(key).and_then(Value::as_array).is_none(),
+            "object" => node.params.get(key).is_none_or(|v| !v.is_object()),
             // 字符串必填：空串与纯空白都算「没填」
             _ => node.param_str(key).is_none_or(|v| v.trim().is_empty()),
         };
@@ -1394,7 +1466,7 @@ mod tests {
             let parsed = NodeType::parse(kind).unwrap_or_else(|| panic!("{kind} 应可解析"));
             assert_eq!(parsed.as_str(), kind, "{kind} 应原样往返");
         }
-        assert_eq!(NodeType::ALL.len(), 11, "新类型必须登记进 ALL");
+        assert_eq!(NodeType::ALL.len(), 12, "新类型必须登记进 ALL");
         for kind in NodeType::ALL {
             assert_eq!(
                 kind.descriptor()["type"],
@@ -1406,7 +1478,12 @@ mod tests {
         assert!(NodeType::parse("").is_none());
 
         // http_call / harness / email 有外部副作用（崩溃后不可安全重放）
-        for kind in [NodeType::HttpCall, NodeType::Harness, NodeType::Email] {
+        for kind in [
+            NodeType::HttpCall,
+            NodeType::Harness,
+            NodeType::Email,
+            NodeType::Llm,
+        ] {
             assert!(kind.has_side_effect(), "{kind:?} 应有副作用");
         }
         for kind in [

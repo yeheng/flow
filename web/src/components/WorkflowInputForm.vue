@@ -4,8 +4,7 @@
  * 值组装成 JSON 文本写入 v-model（与原始 JSON 文本域同一数据源，
  * startRun / schedule.create 的解析链路不变）；无字段时退化为纯 JSON 文本域。
  */
-import { reactive, ref, watch } from "vue";
-import { assembleInput } from "../state/run-input";
+import { computed, reactive, ref, watch } from "vue";
 
 const props = withDefaults(
   defineProps<{
@@ -21,9 +20,20 @@ const emit = defineEmits<{ "update:modelValue": [value: string] }>();
 const mode = ref<"form" | "json">("form");
 const values = reactive<Record<string, string>>({});
 
-function emitForm(): void {
-  const assembled = assembleInput(values);
-  emit("update:modelValue", assembled === undefined ? "" : JSON.stringify(assembled));
+/**
+ * modelValue 解析出的 JSON 对象：空文本 → {}；非对象（数组/标量）或非法 JSON → undefined。
+ * 后者不能从表单无损重建，只能保持原文不动（见 emitForm/formBlocked）。
+ */
+function parseBase(): Record<string, unknown> | undefined {
+  const raw = props.modelValue.trim();
+  if (!raw) return {};
+  try {
+    const v: unknown = JSON.parse(raw);
+    if (v === null || typeof v !== "object" || Array.isArray(v)) return undefined;
+    return v as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
 }
 
 /** 字段显示值：字符串原样，其余 JSON 化（回填后再次提交能解析回原类型） */
@@ -31,28 +41,68 @@ function toText(v: unknown): string {
   return typeof v === "string" ? v : JSON.stringify(v);
 }
 
-/** 从 JSON 文本回填表单（挂载与切回表单模式时） */
-function hydrate(): void {
-  let obj: unknown;
-  try {
-    obj = JSON.parse(props.modelValue);
-  } catch {
-    return;
-  }
-  if (obj === null || typeof obj !== "object" || Array.isArray(obj)) return;
+/** 从 modelValue 回填字段显示值——只读，绝不 emit；避免重写用户刚输入的内容 */
+function hydrate(onlyMissing = false): void {
+  const base = parseBase();
+  if (base === undefined) return;
   for (const k of props.inputKeys) {
-    const v = (obj as Record<string, unknown>)[k];
+    if (onlyMissing && k in values) continue;
+    const v = base[k];
     values[k] = v === undefined ? "" : toText(v);
   }
 }
 
+/**
+ * 只有用户输入事件才写回 modelValue：以当前 JSON 对象为基底 merge 声明字段，
+ * 未声明的键原样保留。基底不是 JSON 对象（数组/标量/半截 JSON）时无可无损合并的
+ * 结构，保持原文不动——表单编辑被 formBlocked 提示拦下，切 JSON 模式可继续改。
+ */
+function emitForm(): void {
+  const base = parseBase();
+  if (base === undefined) return;
+  const next: Record<string, unknown> = { ...base };
+  for (const k of props.inputKeys) {
+    const raw = (values[k] ?? "").trim();
+    if (!raw) {
+      delete next[k];
+      continue;
+    }
+    try {
+      next[k] = JSON.parse(raw);
+    } catch {
+      next[k] = raw;
+    }
+  }
+  emit("update:modelValue", Object.keys(next).length > 0 ? JSON.stringify(next) : "");
+}
+
+/** 表单无法表示当前原文：给出明确提示，避免用户以为输入生效了 */
+const formBlocked = computed(() => {
+  if (mode.value !== "form") return false;
+  const raw = props.modelValue.trim();
+  if (!raw) return false;
+  try {
+    const v: unknown = JSON.parse(raw);
+    return v === null || typeof v !== "object" || Array.isArray(v);
+  } catch {
+    return true;
+  }
+});
+
+let knownKeys: string[] | null = null;
 watch(
   () => props.inputKeys,
   (keys) => {
+    const prev = knownKeys;
+    knownKeys = [...keys];
+    // 字段清单变化只同步表单显示：删掉已移除字段，新增字段从当前 JSON 回填
     for (const k of Object.keys(values)) if (!keys.includes(k)) delete values[k];
+    hydrate(true);
     for (const k of keys) if (!(k in values)) values[k] = "";
-    hydrate();
-    emitForm();
+    // 挂载首次不 emit；只有 form 模式且键集合确实增删时才写回 merge 结果
+    if (!prev) return;
+    const changed = keys.length !== prev.length || keys.some((k) => !prev.includes(k));
+    if (changed && mode.value === "form") emitForm();
   },
   { immediate: true },
 );
@@ -60,10 +110,8 @@ watch(
 function switchMode(next: "form" | "json"): void {
   if (next === mode.value) return;
   mode.value = next;
-  if (next === "form") {
-    hydrate();
-    emitForm();
-  }
+  // 切回表单只回填显示，不写回：JSON 模式的原文（含半截 JSON）必须原样保留
+  if (next === "form") hydrate();
 }
 </script>
 
@@ -82,6 +130,9 @@ function switchMode(next: "form" | "json"): void {
             @input="emitForm"
           />
         </label>
+        <p v-if="formBlocked" class="wf-input-warn">
+          当前输入不是 JSON 对象，表单编辑不会写回；请切换到 JSON 模式修改
+        </p>
       </div>
       <textarea
         v-else
@@ -143,6 +194,13 @@ function switchMode(next: "form" | "json"): void {
 .wf-input-key {
   font-size: 11px;
   color: var(--text2);
+}
+
+.wf-input-warn {
+  width: 100%;
+  margin: 0;
+  font-size: 11px;
+  color: var(--warn);
 }
 
 .wf-input-field input {

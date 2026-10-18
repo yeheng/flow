@@ -88,8 +88,8 @@ async fn keyset_pagination_normalizes_time_and_filters_before_limit() {
         5
     );
     let conn = flow_journal::sqlite::read_connection(dir.path()).unwrap();
-    let plan:String=conn.prepare("EXPLAIN QUERY PLAN SELECT key FROM current_entities WHERE kind='run' AND json_extract(body,'$.workflow_id')='w' AND (created_order,key)<('2026','b') ORDER BY created_order DESC,key DESC LIMIT 2").unwrap().query_map([],|r|r.get::<_,String>(3)).unwrap().map(Result::unwrap).collect::<Vec<_>>().join(" ");
-    assert!(plan.contains("entity_workflow_order"), "{plan}");
+    let plan:String=conn.prepare("EXPLAIN QUERY PLAN SELECT key FROM current_entities WHERE kind='run' AND workflow_id='w' AND (created_order,key)<('2026','b') ORDER BY created_order DESC,key DESC LIMIT 2").unwrap().query_map([],|r|r.get::<_,String>(3)).unwrap().map(Result::unwrap).collect::<Vec<_>>().join(" ");
+    assert!(plan.contains("entity_run_workflow"), "{plan}");
     assert!(!plan.contains("TEMP B-TREE"), "{plan}");
     p.close().await;
     j.close().await.unwrap();

@@ -1,10 +1,10 @@
 import { computed, reactive } from "vue";
 import * as api from "../api/flow";
 import { client, errText } from "../rpc/client";
-import type { LogLine, TimelineNode } from "../types";
+import type { AdjudicateDecision, LogLine, ObservationLoss, TimelineNode } from "../types";
 import { editor } from "./editor";
 import { TERMINAL_RUN_STATUSES } from "./labels";
-import { appendObservations } from "./monitor-logic";
+import { appendObservations, mergeObservationLoss } from "./monitor-logic";
 import { toast } from "./toast";
 
 export const monitor = reactive({
@@ -24,19 +24,26 @@ export const monitor = reactive({
   lastSeq: 0,
   /** 定义顺序的节点状态，来自 run.timeline 初始对齐 + run.event 增量 */
   nodes: [] as TimelineNode[],
-  /** 节点日志（node_log 事件流，历史段来自订阅回放） */
+  /** 节点日志（observation store，有损；经 run.observations.page 按 seq 增量拉取） */
   logs: [] as LogLine[],
   /** `logs` 按 node_id 的索引（与 logs 同步维护，见 monitor-logic.applyLog） */
   logsByNode: {} as Record<string, LogLine[]>,
-  /** 日志去重水位：已收到的最大 node_log seq */
+  /** 观测日志去重水位：已收到的最大 observation seq */
   lastLogSeq: "0",
   /** 子 run 钻取栈：栈顶是当前 run 的直接父 run */
   breadcrumb: [] as { runId: string; workflowId: string }[],
-  observationLoss: false,
+  /** 观测日志有损：按来源累计丢弃计数（会竞争预算/保留期，UI 必须明示） */
+  observationLoss: {
+    queue_dropped: 0,
+    retention_dropped: 0,
+    storage_dropped: 0,
+    history_incomplete: false,
+  } as ObservationLoss,
   starting: false,
-  /** 取消/交付信号进行中（按钮禁用，防重复点击） */
+  /** 取消/交付信号/裁决进行中（按钮禁用，防重复点击） */
   cancelling: false,
   delivering: false,
+  adjudicating: false,
 });
 
 /**
@@ -67,6 +74,11 @@ export const waitingInputNodes = computed(() =>
   monitor.nodes.filter((n) => n.type === "input" && n.wait?.kind === "signal"),
 );
 
+/** uncertain 外部操作：已授权发出但结果未知，只能人工裁决，系统绝不自动重发 */
+export const uncertainNodes = computed(() =>
+  monitor.nodes.filter((n) => n.wait?.kind === "uncertain"),
+);
+
 export function nodeRunState(nodeId: string): string | null {
   if (!monitor.runId || monitor.workflowId !== editor.workflowId) return null;
   return monitor.nodes.find((n) => n.id === nodeId)?.state ?? null;
@@ -90,6 +102,11 @@ let attachToken = 0;
 export async function startRun(): Promise<void> {
   if (!editor.workflowId) {
     toast.error("先选择一个工作流");
+    return;
+  }
+  // run.start 只跑最新已发布版本：未发布时服务端报英文 -32602，这里提前给中文引导
+  if (editor.publishedVersion === null) {
+    toast.error("当前工作流尚未发布，请先发布再运行");
     return;
   }
   let input: unknown;
@@ -147,7 +164,12 @@ async function attach(runId: string): Promise<boolean> {
   monitor.fatalError = initial?.fatal_error ?? null;
   monitor.lastSeq = initial?.last_seq ?? 0;
   monitor.logs = []; monitor.logsByNode = {}; monitor.lastLogSeq = "0";
-  monitor.observationLoss = false;
+  monitor.observationLoss = {
+    queue_dropped: 0,
+    retention_dropped: 0,
+    storage_dropped: 0,
+    history_incomplete: false,
+  };
   const refresh = async () => {
     if (!current() || syncing) return;
     syncing = true;
@@ -165,7 +187,7 @@ async function attach(runId: string): Promise<boolean> {
         const observations = await api.runObservations(runId, monitor.lastLogSeq);
         if (!current()) return;
         appendObservations(monitor, observations.records);
-        monitor.observationLoss ||= Object.values(observations.loss).some(Boolean);
+        monitor.observationLoss = mergeObservationLoss(monitor.observationLoss, observations.loss);
         if (observations.records.length < 256) break;
       }
     } catch { dirty = true; }
@@ -214,7 +236,12 @@ export async function detachRun(): Promise<void> {
   monitor.logsByNode = {};
   monitor.lastLogSeq = "0";
   monitor.breadcrumb = [];
-  monitor.observationLoss = false;
+  monitor.observationLoss = {
+    queue_dropped: 0,
+    retention_dropped: 0,
+    storage_dropped: 0,
+    history_incomplete: false,
+  };
 }
 
 /** 钻取 sub_workflow 节点的子 run */
@@ -271,6 +298,46 @@ export async function deliverSignal(nodeId: string, payloadText: string): Promis
     toast.error(errText(e));
   } finally {
     monitor.delivering = false;
+  }
+}
+
+/**
+ * 人工裁决当前 uncertain 操作。accept_output 的 outputText 是人工认定的产出
+ * （按 JSON 解析）；retry/failed 忽略 output。成功返回 true，由调用方清理草稿。
+ */
+export async function adjudicate(
+  nodeId: string,
+  operationId: string,
+  decision: AdjudicateDecision,
+  reason: string,
+  outputText = "",
+): Promise<boolean> {
+  if (!monitor.runId || monitor.adjudicating) return false;
+  if (!reason.trim()) {
+    toast.error("请填写裁决理由");
+    return false;
+  }
+  let output: unknown = null;
+  if (decision === "accept_output") {
+    const raw = outputText.trim();
+    if (raw) {
+      try {
+        output = JSON.parse(raw);
+      } catch {
+        toast.error("裁决产出不是合法 JSON");
+        return false;
+      }
+    }
+  }
+  monitor.adjudicating = true;
+  try {
+    await api.adjudicateRun(monitor.runId, nodeId, operationId, decision, reason.trim(), output);
+    return true;
+  } catch (e) {
+    toast.error(errText(e));
+    return false;
+  } finally {
+    monitor.adjudicating = false;
   }
 }
 

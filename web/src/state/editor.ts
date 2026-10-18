@@ -70,6 +70,7 @@ interface EditorState {
   publishedVersion: number | null;
   nodes: EditorNode[];
   edges: EditorEdge[];
+  definitionOptions: Omit<Definition, "nodes" | "edges">;
   selectedNodeId: string | null;
   /** 参数编辑弹窗是否打开（编辑入口：点节点/右键「编辑参数」/校验错误定位） */
   paramsOpen: boolean;
@@ -91,6 +92,7 @@ export const editor = reactive<EditorState>({
   publishedVersion: null,
   nodes: [],
   edges: [],
+  definitionOptions: {},
   selectedNodeId: null,
   paramsOpen: false,
   highlightNodeId: null,
@@ -299,6 +301,8 @@ export async function selectWorkflow(id: string, version?: number): Promise<void
     if (session !== editorSession) return;
     editor.version = w.version;
     editor.publishedVersion = w.published_version;
+    const { nodes: _nodes, edges: _edges, ...options } = w.definition;
+    editor.definitionOptions = deepCloneJson(options);
     const flow = definitionToFlow(w.definition);
     editor.nodes = flow.nodes;
     editor.edges = flow.edges;
@@ -312,6 +316,7 @@ export async function selectWorkflow(id: string, version?: number): Promise<void
     }
     editor.version = 0;
     editor.publishedVersion = null;
+    editor.definitionOptions = {};
     if (!seedCanvas()) return;
   }
   editor.workflowId = id;
@@ -415,6 +420,7 @@ function cleanParams(params: Record<string, unknown>): Record<string, unknown> {
 
 export function flowToDefinition(): Definition {
   return {
+    ...deepCloneJson(editor.definitionOptions),
     nodes: editor.nodes.map((n) => ({
       id: n.id,
       type: n.data!.nodeType.type,

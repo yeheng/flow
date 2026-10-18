@@ -179,12 +179,15 @@ async function copyChecksum(checksum: string): Promise<void> {
               {{ v.status === "published" ? "已发布" : "草稿" }}
             </span>
           </td>
-          <td
-            class="mono muted copyable"
-            :title="v.checksum"
-            @click="copyChecksum(v.checksum)"
-          >
-            {{ v.checksum.slice(0, 12) }}
+          <td class="mono muted">
+            <button
+              type="button"
+              class="copy-id"
+              :title="v.checksum"
+              @click="copyChecksum(v.checksum)"
+            >
+              {{ v.checksum.slice(0, 12) }}
+            </button>
           </td>
           <td :title="v.created_at">{{ fmtTime(v.created_at) }}</td>
           <td class="actions">
@@ -331,7 +334,21 @@ async function copyChecksum(checksum: string): Promise<void> {
   word-break: break-all;
 }
 
-.copyable {
+/* copy-cell 按钮化：剥掉 button 默认外观，保持原可点击文本单元格样式（mono/muted 在 td 上） */
+.copy-id {
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  font-family: var(--mono);
+  text-align: left;
   cursor: pointer;
+}
+
+.copy-id:hover {
+  background: none;
+  border-color: transparent;
+  text-decoration: underline;
 }
 </style>

@@ -191,7 +191,7 @@ fn run_record(root: &std::path::Path, upper: u64, run: &JournalRun) -> Result<Ru
         id: run.run_id.clone(),
         workflow_id: run.workflow_id.clone(),
         workflow_version: run.workflow_version as i64,
-        status: run.status.as_str().to_owned(),
+        status: run.status,
         input: materialize(&run.input)?,
         output: run.output.as_ref().map(materialize).transpose()?,
         error: run.error.clone(),

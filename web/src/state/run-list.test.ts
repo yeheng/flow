@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mergeRunPage, nextCursor } from "./run-list";
+import { mergeRunPage, nextCursor, parseRunFilters, serializeRunFilters } from "./run-list";
 import { sourceLabel } from "./labels";
 import type { RunRecord } from "../types";
 
@@ -45,5 +45,30 @@ describe("run.source 中文映射", () => {
     expect(sourceLabel("webhook")).toBe("Webhook");
     expect(sourceLabel("sub_workflow")).toBe("子流程");
     expect(sourceLabel("something_new")).toBe("something_new");
+  });
+});
+
+describe("筛选条件的 URL 往返", () => {
+  it("解析：字符串合法值保留，未知/非字符串回落全部", () => {
+    expect(parseRunFilters({ status: "failed", source: "manual" })).toEqual({
+      status: "failed",
+      source: "manual",
+    });
+    expect(parseRunFilters({ status: "bogus", source: ["a"] })).toEqual({
+      status: "",
+      source: "",
+    });
+  });
+
+  it("序列化：「全部」不入 URL", () => {
+    expect(serializeRunFilters({ status: "", source: "" })).toEqual({});
+    expect(serializeRunFilters({ status: "failed", source: "webhook" })).toEqual({
+      status: "failed",
+      source: "webhook",
+    });
+    expect(parseRunFilters(serializeRunFilters({ status: "failed", source: "webhook" }))).toEqual({
+      status: "failed",
+      source: "webhook",
+    });
   });
 });

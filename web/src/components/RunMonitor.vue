@@ -2,20 +2,23 @@
 import { computed, reactive, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import {
+  adjudicate,
   backToParentRun,
   cancelRun,
   deliverSignal,
   monitor,
   openChildRun,
   canCancelRun,
+  uncertainNodes,
   waitingHumanTasks,
   waitingInputNodes,
 } from "../state/monitor";
 import { editor } from "../state/editor";
-import { nodeStateLabel, runStatusLabel } from "../state/labels";
+import { nodeStateLabel, runBadgeClass, runStatusLabel } from "../state/labels";
 import { confirmDialog } from "../state/modal";
 import { assembleInput, inputFieldText, parseInputFields } from "../state/run-input";
 import { toast } from "../state/toast";
+import type { AdjudicateDecision, TimelineNode } from "../types";
 import ActivityFeed from "./ActivityFeed.vue";
 import LogConsole from "./LogConsole.vue";
 import AppButton from "./AppButton.vue";
@@ -31,32 +34,26 @@ const router = useRouter();
 const activeTab = ref<"activity" | "timeline" | "logs">("activity");
 
 const DEV_MODE_KEY = "flow.run.devMode";
-const devMode = ref(localStorage.getItem(DEV_MODE_KEY) === "1");
+function savedDevMode(): boolean {
+  try { return globalThis.localStorage?.getItem(DEV_MODE_KEY) === "1"; }
+  catch { return false; }
+}
+const devMode = ref(savedDevMode());
 watch(devMode, (on) => {
   if (!on && activeTab.value !== "activity") activeTab.value = "activity";
-  localStorage.setItem(DEV_MODE_KEY, on ? "1" : "0");
+  try { globalThis.localStorage?.setItem(DEV_MODE_KEY, on ? "1" : "0"); }
+  catch { /* Storage is optional; the preference still applies to this session. */ }
 });
 
 /** run 状态文案：单一来源 monitor.status，配色与文案同源 */
 const runStateText = computed(() => (monitor.status ? runStatusLabel(monitor.status) : ""));
+const runStateClass = computed(() => (monitor.status ? runBadgeClass(monitor.status) : ""));
 
 /** human_task 信号输入框内容，key = node_id */
 const signalTexts = reactive<Record<string, string>>({});
 
 /** input 节点表单内容：node_id → field key → 文本（初值 = run 输入已有值 → 字段默认值） */
 const inputFormTexts = reactive<Record<string, Record<string, string>>>({});
-watch(
-  waitingInputNodes,
-  (nodes) => {
-    for (const n of nodes) {
-      if (inputFormTexts[n.id]) continue;
-      const row: Record<string, string> = {};
-      for (const f of parseInputFields(n.input)) row[f.key] = inputFieldText(f, props.runInput);
-      inputFormTexts[n.id] = row;
-    }
-  },
-  { immediate: true },
-);
 
 /** 所有字段都有值才能提交（默认值/预填已兜底的字段天然满足） */
 function inputFormReady(nodeId: string): boolean {
@@ -90,10 +87,64 @@ const outputPretty = computed(() => {
   if (monitor.output === undefined || monitor.output === null) return "";
   return JSON.stringify(monitor.output, null, 2);
 });
+/** 不确定外部操作的人工裁决草稿，key = node_id */
+interface AdjudicationDraft {
+  decision: AdjudicateDecision;
+  output: string;
+  reason: string;
+}
+const adjudications = reactive<Record<string, AdjudicationDraft>>({});
+
+/** 切换 run 时清空上一 run 的临时输入，防止把 A run 的 payload/字段值交付给 B run */
+function resetRunScopedInputs(): void {
+  for (const k of Object.keys(signalTexts)) delete signalTexts[k];
+  for (const k of Object.keys(inputFormTexts)) delete inputFormTexts[k];
+  for (const k of Object.keys(adjudications)) delete adjudications[k];
+  outputExpanded.value = false;
+}
+
+/**
+ * run 切换与等待节点变化放在同一个 watcher：先按 runId 清理旧状态，再初始化当前
+ * run 的 input 表单初值。attach 会在同一 tick 内同时换入 runId 与 nodes，拆成两个
+ * watcher 时初始化可能被随后的清理覆盖，留下空行。
+ */
+let formRunId: string | null = monitor.runId;
 watch(
-  () => monitor.runId,
-  () => (outputExpanded.value = false),
+  [() => monitor.runId, waitingInputNodes, uncertainNodes],
+  ([runId, nodes, uncertain]) => {
+    if (runId !== formRunId) {
+      formRunId = runId;
+      resetRunScopedInputs();
+    }
+    for (const n of nodes) {
+      if (inputFormTexts[n.id]) continue;
+      const row: Record<string, string> = {};
+      for (const f of parseInputFields(n.input)) row[f.key] = inputFieldText(f, props.runInput);
+      inputFormTexts[n.id] = row;
+    }
+    for (const n of uncertain) {
+      adjudications[n.id] ??= { decision: "accept_output", output: "", reason: "" };
+    }
+  },
+  { immediate: true },
 );
+
+/** 提交裁决：accept_output 的产出按 JSON 解析；retry/failed 忽略产出 */
+async function submitAdjudication(node: TimelineNode): Promise<void> {
+  const draft = adjudications[node.id];
+  if (!draft || !node.operation_id) return;
+  const ok = await adjudicate(
+    node.id,
+    node.operation_id,
+    draft.decision,
+    draft.reason,
+    draft.output,
+  );
+  if (ok) {
+    toast.success("已提交裁决");
+    delete adjudications[node.id];
+  }
+}
 
 async function copyOutput(): Promise<void> {
   try {
@@ -172,7 +223,7 @@ function onOpenChildRun(childRunId: string): void {
         <button v-if="monitor.runId" class="run-copy" title="复制 run id" @click="copyRunId">
           复制
         </button>
-        <span v-if="monitor.status" class="run-phase" :class="`run-${monitor.status}`">
+        <span v-if="monitor.status" class="run-phase" :class="runStateClass">
           {{ runStateText }}
         </span>
         <AppButton v-if="canCancelRun" :disabled="monitor.cancelling" @click="onCancelRun"
@@ -253,6 +304,45 @@ function onOpenChildRun(childRunId: string): void {
         <div v-if="signalIsNonJson(signalTexts[n.id])" class="field-help">
           非 JSON，将作为字符串交付
         </div>
+      </div>
+
+      <div v-for="n in uncertainNodes" :key="n.id" class="signal-box signal-uncertain">
+        <div>「{{ n.name || n.id }}」外部操作结果待确认</div>
+        <div class="field-help">
+          已授权发出但结果未知（崩溃/断链）。系统不会自动重发，请人工核对后裁决。
+        </div>
+        <template v-if="adjudications[n.id]">
+          <div class="signal-row">
+            <select v-model="adjudications[n.id].decision" aria-label="裁决决定">
+              <option value="accept_output">接受产出，按输出继续</option>
+              <option value="retry">授权重发（可能重复副作用）</option>
+              <option value="failed">判定失败</option>
+            </select>
+          </div>
+          <div v-if="adjudications[n.id].decision === 'accept_output'" class="signal-row">
+            <input
+              v-model="adjudications[n.id].output"
+              type="text"
+              spellcheck="false"
+              placeholder='人工认定的产出 JSON（可选），如 {"ok": true}'
+            />
+          </div>
+          <div class="signal-row">
+            <input v-model="adjudications[n.id].reason" type="text" placeholder="裁决理由（必填）" />
+            <AppButton
+              :disabled="monitor.adjudicating || !adjudications[n.id].reason.trim()"
+              @click="submitAdjudication(n)"
+            >
+              提交裁决
+            </AppButton>
+          </div>
+          <div
+            v-if="adjudications[n.id].decision === 'retry'"
+            class="field-help field-help-danger"
+          >
+            重发会产生真实外部副作用（可能重复扣款/发信等），仅在确认首次调用未生效时使用。
+          </div>
+        </template>
       </div>
     </div>
 
@@ -474,7 +564,7 @@ function onOpenChildRun(childRunId: string): void {
 }
 
 /* 挂起待恢复：不是终态也不是正常推进，用 warn 与 running 区分开 */
-.run-phase.run-awaiting_resume {
+.run-phase.run-awaiting {
   color: var(--warn);
 }
 
@@ -539,6 +629,15 @@ function onOpenChildRun(childRunId: string): void {
   border-radius: 6px;
   padding: 8px;
   margin-bottom: 8px;
+}
+
+.signal-uncertain {
+  border-color: var(--danger);
+  background: rgba(248, 81, 73, 0.08);
+}
+
+.field-help-danger {
+  color: var(--danger);
 }
 
 .signal-row {

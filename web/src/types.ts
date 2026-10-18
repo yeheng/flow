@@ -21,6 +21,9 @@ export interface DefinitionEdge {
 }
 
 export interface Definition {
+  semantics?: number;
+  input_schema?: unknown;
+  output_schema?: unknown;
   nodes: DefinitionNode[];
   edges: DefinitionEdge[];
 }
@@ -36,7 +39,7 @@ export interface PortDesc {
  * 未识别的 x-* 键一律忽略，新增扩展键不需要改前端。
  */
 export interface PropertySchema {
-  type?: "string" | "integer" | "number" | "boolean" | "object";
+  type?: "string" | "integer" | "number" | "boolean" | "object" | "array";
   enum?: string[];
   default?: unknown;
   required?: string[];
@@ -70,6 +73,10 @@ export interface NodeTypeDesc {
   params_schema: ParamsSchema;
   supports_retry?: boolean;
   side_effect?: boolean;
+  /** 证据粒度：node / external_call / process / model_call（LLM 适配器用） */
+  trace_granularity?: "node" | "external_call" | "process" | "model_call" | string;
+  /** 自动重试的作用域：declared_repeatable_only 只对显式声明可重复的节点生效 */
+  retry_scope?: "declared_repeatable_only" | string;
 }
 
 export interface WorkflowSummary {
@@ -116,6 +123,9 @@ export interface Webhook {
   workflow_id: string;
   enabled: boolean;
   created_at: string;
+  /** 调用合同（服务端回显时才有；webhook.list 不回显则刷新后不可见） */
+  invoke_version?: number | null;
+  invoke_key_hash?: string | null;
 }
 
 /** run.list / run.get 返回的运行记录（crates/flow-dto/src/lib.rs RunRecord） */
@@ -134,6 +144,77 @@ export interface RunRecord {
   source_detail: string | null;
   started_at: string;
   ended_at: string | null;
+}
+
+/** run.compare 的一处差异（crates/flow-backend/src/regression.rs compare_runs） */
+export interface RunComparisonDifference {
+  /**
+   * 差异路径，句点分段：
+   * status / error / output / nodes.<id> / nodes.<id>.request /
+   * children.<key>（子 run 只存在于一侧）/ children.<key>.…（递归子 run 内部）
+   */
+  path: string;
+  expected?: unknown;
+  actual?: unknown;
+  /** 节点差异的两种形态 */
+  expected_status?: string | null;
+  actual_status?: string | null;
+  expected_output?: unknown;
+  actual_output?: unknown;
+}
+
+/** run.compare 返回：两侧都终结才 complete；差异为空才 passed */
+export interface RunComparison {
+  baseline: string;
+  candidate: string;
+  complete: boolean;
+  passed: boolean;
+  differences: RunComparisonDifference[];
+  /** 差异超过 64 条被截断（服务端 record_difference 上限） */
+  truncated?: boolean;
+}
+
+/** journal 值信封（run.get / run.list 原始快照里的 StoredValue wire） */
+export interface StoredValueRef {
+  type: "ref";
+  value: {
+    journal_id: string;
+    output_id: string;
+    codec: string;
+    version: number;
+    /** 十进制字符串（服务端 decimal 编码） */
+    chunk_count: string;
+    total_bytes: string;
+    digest: string;
+  };
+}
+
+export interface StoredValueInline {
+  type: "inline";
+  value: unknown;
+}
+
+export type StoredValue = StoredValueRef | StoredValueInline;
+
+/** run.get / run.list 原始快照条目（journal Run.summary，input/output 是信封） */
+export interface RawRunSnapshot {
+  run_id: string;
+  workflow_id: string;
+  workflow_version: number;
+  status: string;
+  input: StoredValue;
+  output: StoredValue | null;
+  error: string | null;
+  source: string;
+  source_detail: string | null;
+  created_at: string;
+  [key: string]: unknown;
+}
+
+/** webhook 调用合同：invoke_version 固定版本 / invoke_key_hash 调用密钥 SHA-256 哈希 */
+export interface WebhookInvokeConfig {
+  invoke_version: number;
+  invoke_key_hash: string;
 }
 
 /** run.stats 返回（GROUP BY 精确计数） */
@@ -214,6 +295,18 @@ export interface RemoteExecutionConfig {
   cert: string;
   key: string;
   attach_timeout_ms: number;
+  /** 已废弃（v3 收敛为单条 TLS 连接），仅存量兼容 */
+  data_addr?: string | null;
+  /** WSS 接入监听地址（代理终止 TLS 场景的附加承载）；缺省关闭 */
+  wss_addr?: string | null;
+  /** WSS 接入的 agent 凭据映射（token→agent_id），与 wss_addr 成对配置 */
+  agents?: AgentCredential[];
+}
+
+/** WSS 接入的 agent 凭据（id 与 token 表内唯一） */
+export interface AgentCredential {
+  id: string;
+  token: string;
 }
 
 export interface ExecutionConfig {
@@ -221,6 +314,8 @@ export interface ExecutionConfig {
   mode: "ipc" | "remote";
   executor_bin: string | null;
   x_max: number;
+  /** 启动时预热一个空闲执行器（占一个 x_max 槽位；失败降级懒加载） */
+  prewarm?: boolean;
   remote: RemoteExecutionConfig | null;
 }
 
@@ -232,6 +327,12 @@ export interface AgentConfig {
   key: string | null;
   executor_bin: string | null;
   slots: number;
+  /** 已废弃（v3 收敛为单条 TLS 连接），仅存量兼容 */
+  data_addr?: string | null;
+  /** WSS 上联地址；设置后优先于 mTLS 直连 */
+  wss_url?: string | null;
+  /** WSS 接入令牌（master 侧按 token→agent_id 映射反查身份） */
+  token?: string | null;
 }
 
 export interface JournalConfig {
@@ -290,11 +391,17 @@ export interface TimelineNode {
 
 export type RunPhase = "running" | "succeeded" | "failed" | "cancelled";
 
+/** run.adjudicate 的人工决定：接受产出 / 人工授权重发 / 判定失败（服务端词汇表） */
+export type AdjudicateDecision = "accept_output" | "retry" | "failed";
+
 /** 节点日志级别/来源（与 crates/flow-engine/src/event.rs 的词汇表对齐） */
 export type LogLevel = "debug" | "info" | "warn" | "error";
 export type LogStream = "engine" | "stdout" | "stderr";
 
-/** 前端日志行：node_log 事件的前端形态（日志控制台/节点检查器共用） */
+/**
+ * 前端日志行：来自 observation store 的节点日志（日志控制台/节点检查器共用）。
+ * 观测日志有损且不是 journal 权威事实，丢失计数见 ObservationLoss。
+ */
 export interface LogLine {
   seq: string;
   ts: string;
@@ -330,4 +437,12 @@ export interface ObservationRecord {
   dispatch_id: string;
   ts: string;
   line: Omit<LogLine, "seq" | "ts">;
+}
+
+/** observation store 的有损标记：日志可能少行，UI 必须明示（run.observations.page 的 loss） */
+export interface ObservationLoss {
+  queue_dropped?: number;
+  retention_dropped?: number;
+  storage_dropped?: number;
+  history_incomplete?: boolean;
 }

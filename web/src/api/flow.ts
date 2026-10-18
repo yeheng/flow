@@ -1,7 +1,10 @@
 import { client } from "../rpc/client";
 export { JournalClient, EventWindow } from "./journal";
+export { downloadValue, runValueUrl } from "./download";
 import { httpUrl } from "../config";
+import { rawRunToRecord, selectRawRuns } from "../state/run-raw";
 import type {
+  AdjudicateDecision,
   ConfigView,
   Definition,
   FlowConfig,
@@ -12,6 +15,9 @@ import type {
   NodeTemplateSummary,
   RunEvent,
   ObservationRecord,
+  ObservationLoss,
+  RawRunSnapshot,
+  RunComparison,
   RunRecord,
   RunStats,
   Schedule,
@@ -19,6 +25,7 @@ import type {
   Timeline,
   VersionMeta,
   Webhook,
+  WebhookInvokeConfig,
   WorkflowDetail,
   WorkflowSummary,
 } from "../types";
@@ -174,22 +181,124 @@ export async function getRun(runId: string): Promise<{ run: RunRecord; live: boo
   return client.call("run.get.view", { run_id: runId });
 }
 
+/** 原始 run 快照（StoredValue 信封，不物化）：物化视图超 8MB 预算时的降级读面 */
+export async function getRunRaw(runId: string): Promise<RawRunSnapshot> {
+  const r = await client.call<{ value: RawRunSnapshot | null }>("run.get", { run_id: runId });
+  if (!r.value) throw new Error("run 不存在");
+  return r.value;
+}
+
+/**
+ * 降级运行列表：raw run.list 只有键升序，无过滤/降序，扫描最近 RAW_SCAN_PAGES
+ * 页取最新 limit 条匹配行。仅在物化列表超预算时使用；scanned=false 表示被
+ * 扫描上限截断（更旧数据未知）。
+ */
+export async function listRunsLite(
+  opts: ListRunsOptions = {},
+): Promise<{ runs: RunRecord[]; hasMore: boolean; scanned: boolean }> {
+  const RAW_PAGE = 256;
+  const RAW_SCAN_PAGES = 32;
+  const limit = opts.limit ?? 50;
+  const pages: RawRunSnapshot[][] = [];
+  let after = "";
+  let complete = true;
+  for (let i = 0; i < RAW_SCAN_PAGES; i++) {
+    const page = await client.call<{ values: RawRunSnapshot[] }>("run.list", {
+      after,
+      limit: RAW_PAGE,
+    });
+    const values = page.values ?? [];
+    pages.push(values);
+    if (values.length === 0) break;
+    after = values[values.length - 1].run_id;
+    if (opts.beforeRunId !== undefined && after >= opts.beforeRunId) break;
+    if (i === RAW_SCAN_PAGES - 1) complete = false;
+  }
+  const selected = selectRawRuns(
+    pages,
+    {
+      workflowId: opts.workflowId,
+      status: opts.status,
+      source: opts.source,
+      beforeRunId: opts.beforeRunId,
+    },
+    limit,
+    complete,
+  );
+  return { runs: selected.rows.map(rawRunToRecord), hasMore: selected.hasMore, scanned: complete };
+}
+
 export async function runTimeline(runId: string): Promise<Timeline> {
   return client.call<Timeline>("run.timeline", { run_id: runId });
 }
 
-export async function runEvents(runId: string): Promise<RunEvent[]> {
-  const events: RunEvent[] = [];
-  let cursor: Record<string, unknown> | null = null;
-  do {
-    const page: { events: RunEvent[]; next_cursor: Record<string, unknown> | null } = await client.call("run.events.page", {run_id:runId,cursor,limit:256});
-    events.push(...page.events); cursor=page.next_cursor;
-  } while (cursor);
-  return events;
+/** 原始事件分页：一页 256 条，按游标继续取（长 run 不做全量拉取） */
+export async function runEventsPage(
+  runId: string,
+  cursor?: Record<string, unknown> | null,
+): Promise<{ events: RunEvent[]; nextCursor: Record<string, unknown> | null }> {
+  const page = await client.call<{
+    events: RunEvent[];
+    next_cursor: Record<string, unknown> | null;
+  }>("run.events.page", { run_id: runId, cursor, limit: 256 });
+  return { events: page.events, nextCursor: page.next_cursor };
 }
 
-export function runObservations(runId: string, fromSeq = "0"): Promise<{ records: ObservationRecord[]; loss: { history_incomplete?: boolean; queue_dropped?: number; retention_dropped?: number; storage_dropped?: number } }> {
-  return client.call("run.observations.page", {run_id:runId,from_seq:fromSeq,limit:256});
+export function runObservations(
+  runId: string,
+  fromSeq = "0",
+): Promise<{ records: ObservationRecord[]; loss: ObservationLoss }> {
+  return client.call("run.observations.page", { run_id: runId, from_seq: fromSeq, limit: 256 });
+}
+
+/**
+ * 以 baseline run 为基线创建候选运行（run.regress）。
+ * 候选复用基线记录的时钟/种子、人工输入与外部操作结果，不重新发起 HTTP/harness
+ * 副作用；请求摘要不一致的节点会显式失败。baseline 必须已终结且带执行上下文。
+ * fixtures 可显式覆盖外部操作结果（键是节点路径 JSON 数组，如 "[\"n1\"]"）。
+ */
+export async function startRegression(
+  baselineRunId: string,
+  opts: {
+    workflowId?: string;
+    version?: number;
+    fixtures?: Record<string, { fingerprint: string; outcome: unknown }>;
+  } = {},
+): Promise<{ run_id: string; workflow_version: number }> {
+  const params: Record<string, unknown> = { baseline: baselineRunId };
+  if (opts.workflowId !== undefined) params.workflow_id = opts.workflowId;
+  if (opts.version !== undefined) params.version = opts.version;
+  if (opts.fixtures !== undefined) {
+    // outcome 允许写业务值：wire 上包一层 inline 信封（已是信封则透传）
+    params.fixtures = Object.fromEntries(
+      Object.entries(opts.fixtures).map(([key, fixture]) => [
+        key,
+        {
+          fingerprint: fixture.fingerprint,
+          outcome: isStoredEnvelope(fixture.outcome)
+            ? fixture.outcome
+            : { type: "inline", value: fixture.outcome },
+        },
+      ]),
+    );
+  }
+  return client.call("run.regress", params);
+}
+
+function isStoredEnvelope(value: unknown): boolean {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Object.keys(value).length === 2 &&
+    "value" in (value as Record<string, unknown>) &&
+    typeof (value as { type?: unknown }).type === "string"
+  );
+}
+
+/** 比较两个 run 的最终状态、输出与逐节点结果（run.compare） */
+export function compareRuns(baselineRunId: string, candidateRunId: string): Promise<RunComparison> {
+  return client.call("run.compare", { baseline: baselineRunId, candidate: candidateRunId });
 }
 
 export async function runCancel(runId: string): Promise<void> {
@@ -201,6 +310,28 @@ export async function runSignal(runId: string, nodeId: string, payload: unknown)
     run_id: runId,
     node_id: nodeId,
     payload,
+  });
+}
+
+/**
+ * 人工裁决 uncertain 外部操作（run.adjudicate）。系统绝不自动重发，
+ * 人工决定就是授权凭据：reason 必填（≤4096 字节）；retry 可能产生重复副作用。
+ */
+export async function adjudicateRun(
+  runId: string,
+  nodeId: string,
+  operationId: string,
+  decision: AdjudicateDecision,
+  reason: string,
+  output?: unknown,
+): Promise<void> {
+  await client.call("run.adjudicate", {
+    run_id: runId,
+    node_id: nodeId,
+    operation_id: operationId,
+    decision,
+    reason,
+    output: output ?? null,
   });
 }
 
@@ -269,6 +400,22 @@ export async function setWebhookEnabled(token: string, enabled: boolean): Promis
 
 export async function deleteWebhook(token: string): Promise<void> {
   await client.call("webhook.delete", { token });
+}
+
+/**
+ * 设置 webhook 调用合同（webhook.change patch）：invoke_version 固定调用版本、
+ * invoke_key_hash 调用密钥的 SHA-256 hex（明文只在生成时展示一次）。
+ * 返回服务端合并后的完整配置（webhook.list 不回显这两个字段）。
+ */
+export async function updateWebhookInvoke(
+  token: string,
+  config: WebhookInvokeConfig,
+): Promise<Record<string, unknown>> {
+  const receipt = await client.call<Record<string, unknown>>("webhook.change", {
+    key: token,
+    patch: config,
+  });
+  return receipt;
 }
 
 /** webhook HTTP 入口基址：v2 形态 POST /hooks/<key>（Bearer token 认证）。

@@ -49,4 +49,60 @@ describe("WorkflowInputForm", () => {
     await w.find(".wf-input-toggle").trigger("click");
     expect((w.find(".wf-input-field input").element as HTMLInputElement).value).toBe("2");
   });
+
+  // P0-2: inputKeys 是父组件 computed，节点参数一变就返回新数组引用；
+  // 旧实现无条件 hydrate + emitForm，会把 JSON 模式的原文/未声明键重写掉。
+  it("modelValue 非对象时键变化不得改写原文（数组不被清成 / 兜底不丢原文）", async () => {
+    const w = mountForm(["k"], "[1,2]");
+    // 同内容新引用：不得 emit
+    await w.setProps({ inputKeys: ["k"] });
+    // 键集合变化：仍不得 emit（解析不出对象基底，无法无损 merge）
+    await w.setProps({ inputKeys: ["k", "x"] });
+    expect(w.emitted("update:modelValue")).toBeUndefined();
+    // 兜底提示明确：表单编辑不写回
+    expect(w.find(".wf-input-warn").exists()).toBe(true);
+    await w.findAll(".wf-input-field input")[0].setValue("9");
+    expect(w.emitted("update:modelValue")).toBeUndefined();
+  });
+
+  it("JSON→表单切换不 emit，未声明键在后续编辑中保留", async () => {
+    const w = mountForm(["k"], '{"k":1,"extra":2}');
+    await w.find(".wf-input-toggle").trigger("click"); // form → json
+    await w.find(".wf-input-toggle").trigger("click"); // json → form
+    expect(w.emitted("update:modelValue")).toBeUndefined();
+    expect((w.find(".wf-input-field input").element as HTMLInputElement).value).toBe("1");
+
+    await w.find(".wf-input-field input").setValue("2");
+    expect(lastEmit(w)).toEqual(['{"k":2,"extra":2}']);
+  });
+
+  it("JSON 模式下键变化不 emit，半截 JSON 不会被改写", async () => {
+    const w = mountForm(["k"], "");
+    await w.find(".wf-input-toggle").trigger("click"); // form → json
+    const ta = w.find(".wf-input-json");
+    await ta.setValue('{"k":');
+    expect((ta.element as HTMLTextAreaElement).value).toBe('{"k":');
+    const before = w.emitted("update:modelValue")!.length;
+
+    await w.setProps({ inputKeys: ["k", "x"] });
+    expect(w.emitted("update:modelValue")).toHaveLength(before);
+  });
+
+  it("表单模式下同内容的新数组引用不 emit（父组件 computed 每次重算）", async () => {
+    const w = mountForm(["a"], '{"a":1}');
+    await w.setProps({ inputKeys: ["a"] });
+    expect(w.emitted("update:modelValue")).toBeUndefined();
+  });
+
+  it("表单模式下键增删才 emit merge 结果（保留未声明键）", async () => {
+    const w = mountForm(["a"], '{"a":1,"extra":2}');
+    await w.findAll(".wf-input-field input")[0].setValue("1"); // 同值输入：emit 带额外键
+    expect(lastEmit(w)).toEqual(['{"a":1,"extra":2}']);
+
+    await w.setProps({ modelValue: lastEmit(w)[0] as string });
+    await w.setProps({ inputKeys: ["a", "b"] });
+    expect(lastEmit(w)).toEqual(['{"a":1,"extra":2}']);
+    await w.findAll(".wf-input-field input")[1].setValue("3");
+    expect(lastEmit(w)).toEqual(['{"a":1,"extra":2,"b":3}']);
+  });
 });

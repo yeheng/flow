@@ -151,11 +151,20 @@ async fn download(
     {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let permit = match state.slots.clone().try_acquire_owned() {
+    download_authorized(&state.backend, &state.slots, run_id, output_id).await
+}
+
+pub(crate) async fn download_authorized(
+    backend: &Arc<JournalBackend>,
+    slots: &Arc<tokio::sync::Semaphore>,
+    run_id: String,
+    output_id: String,
+) -> Response {
+    let permit = match slots.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
     };
-    let (upper, row) = match state.backend.store.get_execution(&run_id).await {
+    let (upper, row) = match backend.store.get_execution(&run_id).await {
         Ok(v) => v,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
@@ -164,10 +173,10 @@ async fn download(
         None => return StatusCode::NOT_FOUND.into_response(),
     };
     let value = match reference(&run, &output_id) {
-        Some(v) if v.journal_id == state.backend.journal.id() => v,
+        Some(v) if v.journal_id == backend.journal.id() => v,
         _ => {
-            let root = state.backend.journal.root().to_path_buf();
-            let journal = state.backend.journal.id().to_owned();
+            let root = backend.journal.root().to_path_buf();
+            let journal = backend.journal.id().to_owned();
             let run = run_id.clone();
             let output = output_id.clone();
             match tokio::task::spawn_blocking(move || {
@@ -181,7 +190,7 @@ async fn download(
             }
         }
     };
-    let root = state.backend.journal.root().to_path_buf();
+    let root = backend.journal.root().to_path_buf();
     let (tx, rx) = tokio::sync::mpsc::channel(4);
     tracing::info!(principal="local-token",%run_id,%output_id,action="value.download","JSONL value access");
     tokio::task::spawn_blocking(move || {

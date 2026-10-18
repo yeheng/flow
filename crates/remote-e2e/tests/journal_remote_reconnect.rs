@@ -201,10 +201,11 @@ async fn uplink_drop_then_reconnect_resumes_without_double_execution() {
     let (proxies, session) = start_agent(&manager, handles.clone()).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // 慢脚本：执行中剪断上联。
+    // Legacy wall-clock script: recorded v2 Date.now intentionally does not advance.
+    // This test exercises reconnection of the original execution contract.
     let workflow = install(
         &backend,
-        json!({"nodes":[
+        json!({"semantics":1,"nodes":[
             {"id":"s","type":"start"},
             {"id":"n","type":"script","params":{"code":"var t=Date.now(); while(Date.now()-t<1500){} return {n: input.n + 1};"}},
             {"id":"e","type":"end"}],

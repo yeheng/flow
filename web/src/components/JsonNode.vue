@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
 
 /**
  * 递归 JSON 值查看器：对象/数组可折叠（浅层默认展开），标量按类型着色。
@@ -10,6 +10,9 @@ const props = withDefaults(
   { name: "", depth: 0, comma: false },
 );
 
+/** 单层最多渲染的子项数：超大对象/数组（5000 键）全量渲染会卡死检查器 */
+const MAX_CHILDREN = 200;
+
 const isObject = computed(() => props.value !== null && typeof props.value === "object");
 
 const entries = computed<Array<[string, unknown]>>(() => {
@@ -17,6 +20,13 @@ const entries = computed<Array<[string, unknown]>>(() => {
   const v = props.value as Record<string, unknown> | unknown[];
   return Array.isArray(v) ? v.map((item, i) => [String(i), item]) : Object.entries(v);
 });
+
+/** 默认只渲染前 MAX_CHILDREN 项，其余点击提示条展开 */
+const showAll = ref(false);
+const visibleEntries = computed(() =>
+  showAll.value ? entries.value : entries.value.slice(0, MAX_CHILDREN),
+);
+const hiddenCount = computed(() => entries.value.length - visibleEntries.value.length);
 
 const kindClass = computed(() => {
   const v = props.value;
@@ -56,13 +66,16 @@ const metaText = computed(() =>
     </summary>
     <div class="json-children">
       <JsonNode
-        v-for="[key, child] in entries"
+        v-for="([key, child], i) in visibleEntries"
         :key="key"
         :value="child"
         :name="Array.isArray(value) ? undefined : key"
         :depth="depth + 1"
-        :comma="entries.length > 1"
+        :comma="i < entries.length - 1"
       />
+      <button v-if="hiddenCount > 0" type="button" class="json-more" @click="showAll = true">
+        显示剩余 {{ hiddenCount }} 项
+      </button>
     </div>
   </details>
   <div v-else class="json-leaf">
@@ -128,5 +141,19 @@ details[open] > .json-summary::before {
 
 .j-punct {
   color: var(--text3);
+}
+
+.json-more {
+  padding: 0 4px;
+  border: none;
+  background: none;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text3);
+  cursor: pointer;
+}
+
+.json-more:hover {
+  color: var(--text);
 }
 </style>

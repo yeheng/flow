@@ -68,6 +68,7 @@ struct GateNode {
     status: NodeStatus,
     branch: Option<bool>,
     output: Option<StoredValue>,
+    inactive: bool,
 }
 
 type Result<T> = std::result::Result<T, JournalError>;
@@ -181,6 +182,25 @@ impl JournalBackend {
         port: ExecutionPort,
         prewarm: bool,
     ) -> Result<()> {
+        if let Some(run) = self
+            .inspect(|s| {
+                s.runs
+                    .values()
+                    .find(|r| {
+                        !r.terminal()
+                            && r.execution
+                                .as_ref()
+                                .is_some_and(|e| e.runtime != flow_engine::RUNTIME_ID)
+                    })
+                    .map(|r| r.run_id.clone())
+            })
+            .await
+        {
+            return Err(invalid(format!(
+                "run {run} requires its recorded executor runtime; execution was not started"
+            ))
+            .into());
+        }
         let mut driver = self.execution.lock().await;
         if driver.as_ref().is_some_and(|handle| !handle.is_finished()) {
             return Ok(());
@@ -372,6 +392,10 @@ async fn advance_run(
                                     status: from.status,
                                     branch: from.branch,
                                     output: from.output.clone(),
+                                    inactive: matches!(
+                                        from.skip_reason.as_deref(),
+                                        Some("branch_not_taken" | "inactive")
+                                    ),
                                 },
                             )
                         })
@@ -454,11 +478,48 @@ async fn advance_committed_node(
     wakes: &mut BTreeMap<i64, BTreeSet<String>>,
 ) -> Result<bool> {
     let now = chrono::Utc::now().timestamp_millis();
+    if node.params["effect_policy"] == "repeatable"
+        && record
+            .operation
+            .as_ref()
+            .is_some_and(|o| o.outcome.is_none())
+        && record.attempt < node.retry().max_attempts.min(100)
+    {
+        let deadline = now.saturating_add(node.retry().backoff_ms.min(i64::MAX as u64) as i64);
+        backend.internal_for_run(run_id,|s| {
+            let run=&s.runs[run_id]; let current=&run.nodes[&node.id];
+            if run.terminal() || current.dispatch_id!=record.dispatch_id {return Ok((vec![],()));}
+            let Some(operation)=current.operation.as_ref().filter(|o|o.outcome.is_none()) else{return Ok((vec![],()));};
+            Ok((vec![node_event(run,&node.id,EventKind::OperationRetryAuthorized,json!({"operation_id":operation.operation_id,"fingerprint":operation.fingerprint,"policy":"repeatable","wake_at":deadline}),true)],()))
+        }).await?;
+        return Ok(true);
+    }
     if record.status == NodeStatus::Waiting {
         let wait = record
             .wait
             .as_ref()
             .ok_or_else(|| invalid("waiting node missing wait"))?;
+        if wait.kind() == WaitKind::Signal {
+            backend
+                .internal_for_run(run_id, |s| {
+                    let run = &s.runs[run_id];
+                    let Some(output) = run.signals.get(&node.id) else {
+                        return Ok((vec![], ()));
+                    };
+                    Ok((
+                        vec![node_event(
+                            run,
+                            &node.id,
+                            EventKind::WaitResolved,
+                            json!({"output":output}),
+                            true,
+                        )],
+                        (),
+                    ))
+                })
+                .await?;
+            return Ok(true);
+        }
         if let Wait::Child { child_run_id } = wait {
             let child = backend
                 .run_snapshot(child_run_id)
@@ -548,6 +609,45 @@ fn incoming_gate(
     view: &BTreeMap<String, GateNode>,
     node: &flow_engine::Node,
 ) -> NodeGate {
+    let selected = node.params["join"]
+        .as_str()
+        .map_or(definition.semantics >= 2, |j| j == "selected");
+    if selected {
+        let mut pending = false;
+        let mut failed = false;
+        let mut active = 0;
+        let mut predecessors = BTreeMap::new();
+        for edge in definition.incoming(&node.id) {
+            match view.get(&edge.from) {
+                Some(n) if n.status == NodeStatus::Skipped && n.inactive => {}
+                Some(n) if matches!(n.status, NodeStatus::Failed | NodeStatus::Skipped) => {
+                    failed = true
+                }
+                Some(n) if n.status == NodeStatus::Succeeded => {
+                    if edge
+                        .port
+                        .as_deref()
+                        .is_none_or(|p| n.branch == Some(p == "true"))
+                    {
+                        active += 1;
+                        if let Some(output) = &n.output {
+                            predecessors.insert(edge.from.clone(), output.clone());
+                        }
+                    }
+                }
+                _ => pending = true,
+            }
+        }
+        return if pending {
+            NodeGate::Blocked
+        } else if failed {
+            NodeGate::Skip("upstream_failed")
+        } else if active == 0 && definition.incoming_count(&node.id) > 0 {
+            NodeGate::Skip("inactive")
+        } else {
+            NodeGate::Ready(predecessors)
+        };
+    }
     let mut ready = true;
     let mut skip = false;
     let mut predecessors = BTreeMap::new();
@@ -736,10 +836,34 @@ async fn settle_run(
             finish_run(backend, run_id, None, error).await?;
         }
         None => {
+            if definition.semantics >= 2
+                && !definition.nodes.iter().any(|n| {
+                    n.kind() == Some(NodeType::End)
+                        && snapshot
+                            .nodes
+                            .get(&n.id)
+                            .is_some_and(|n| n.status == NodeStatus::Succeeded)
+                })
+            {
+                return finish_run(
+                    backend,
+                    run_id,
+                    None,
+                    Some("no active end node completed".into()),
+                )
+                .await;
+            }
             let ends = definition
                 .nodes
                 .iter()
                 .filter(|n| n.kind() == Some(NodeType::End))
+                .filter(|n| {
+                    definition.semantics == 1
+                        || snapshot
+                            .nodes
+                            .get(&n.id)
+                            .is_some_and(|r| r.status == NodeStatus::Succeeded)
+                })
                 .map(|n| {
                     (
                         n.id.clone(),
@@ -752,6 +876,35 @@ async fn settle_run(
                 })
                 .collect();
             let output = join_values(backend, ends).await?;
+            if let Some(schema) = &definition.output_schema {
+                let actual = match flow_journal::value::materialize(
+                    backend.journal.root(),
+                    backend.journal.durable_lsn(),
+                    &output,
+                    8 * 1024 * 1024,
+                ) {
+                    Ok(value) => value,
+                    Err(flow_journal::Error::Limit(_)) => {
+                        return finish_run(
+                            backend,
+                            run_id,
+                            None,
+                            Some("output contract exceeds 8 MiB validation budget".into()),
+                        )
+                        .await
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                if let Err(error) = flow_engine::schema::validate(schema, &actual) {
+                    return finish_run(
+                        backend,
+                        run_id,
+                        None,
+                        Some(format!("output contract: {error}")),
+                    )
+                    .await;
+                }
+            }
             finish_run(backend, run_id, Some(output), None).await?;
         }
     }
@@ -841,6 +994,7 @@ mod gate_tests {
                         status: serde_json::from_value::<NodeStatus>(json!(status)).unwrap(),
                         branch: *branch,
                         output,
+                        inactive: *status == "skipped",
                     },
                 )
             })

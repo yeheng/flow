@@ -20,7 +20,9 @@
 /// 编码，跨版本配对会静默错解成另一个消息类型，没有版本门的网络侧握手
 /// 等于把「未定义但不报错」留给部署。v6 = 上联握手补上版本门（旧 agent
 /// 无法安全共存，不提供兼容垫片）。
-pub const PROTOCOL_VERSION: u32 = 6;
+/// v7 adds recorded execution context, strict regression isolation and native model calls;
+/// older executors must not silently ignore this task metadata.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// control 通道单帧上限（不含 4 字节长度头）。握手
 /// 只可协商到本上限以内。

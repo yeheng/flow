@@ -1,7 +1,20 @@
-import type { LogLine, ObservationRecord } from "../types";
+import type { LogLine, ObservationLoss, ObservationRecord } from "../types";
 export const MAX_LOG_LINES = 10000;
 const KEEP_LOG_LINES = 8000;
 export interface LogProjection { logs: LogLine[]; logsByNode: Record<string, LogLine[]>; lastLogSeq: string }
+
+/** 多次分页/轮询读到的 loss 取并集：计数只增不减，history_incomplete 一旦为真保持为真 */
+export function mergeObservationLoss(
+  current: ObservationLoss,
+  incoming: ObservationLoss,
+): ObservationLoss {
+  return {
+    queue_dropped: Math.max(current.queue_dropped ?? 0, incoming.queue_dropped ?? 0),
+    retention_dropped: Math.max(current.retention_dropped ?? 0, incoming.retention_dropped ?? 0),
+    storage_dropped: Math.max(current.storage_dropped ?? 0, incoming.storage_dropped ?? 0),
+    history_incomplete: Boolean(current.history_incomplete || incoming.history_incomplete),
+  };
+}
 export function logWindow(
   total: number,
   cap: number,

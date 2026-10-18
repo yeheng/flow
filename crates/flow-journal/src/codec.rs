@@ -42,6 +42,8 @@ pub enum EventKind {
     LateAudit,
     MasterEpochStarted,
     LegacyImport,
+    /// Explicit machine retry authorization for a declared repeatable operation.
+    OperationRetryAuthorized,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -75,6 +77,12 @@ impl Event {
             payload,
         }
     }
+
+    /// The single audit predicate. Storage flags, fact pages and subscriptions all
+    /// derive from it; no caller hand-writes `ValueChunk | LateAudit` again.
+    pub fn is_audit(&self) -> bool {
+        self.audit_seq > 0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -107,6 +115,11 @@ impl Transaction {
             }
             if event.run_seq > 0 && event.run_id.is_none() {
                 return Err(invalid("run sequence without run"));
+            }
+            if event.kind == EventKind::LateAudit && (!event.is_audit() || event.run_seq != 0) {
+                return Err(invalid(
+                    "late audit requires audit sequence and no run sequence",
+                ));
             }
             validate_depth(&event.payload, 0)?;
             if event

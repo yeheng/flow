@@ -4,6 +4,7 @@ import * as api from "../api/flow";
 import { client, errText } from "../rpc/client";
 import { activeCount, perWorkflowRates, successRate, type WorkflowRate } from "../state/dashboard";
 import { editor, refreshWorkflows } from "../state/editor";
+import { runBadgeClass, runStatusLabel } from "../state/labels";
 import { toast } from "../state/toast";
 import type { RunRecord, RunStats } from "../types";
 import AppButton from "../components/AppButton.vue";
@@ -14,6 +15,10 @@ const stats = ref<RunStats>({ total: 0, by_status: {}, by_workflow: [] });
 const runs = ref<RunRecord[]>([]);
 /** 首次拉取完成前不展示空态，避免「暂无…」闪烁 */
 const loaded = ref(false);
+/** 刷新失败：展示错误条并保留上一次成功的 stats/最近运行，成功后清空 */
+const error = ref("");
+/** 是否已有过一次成功拉取：失败时据此说明表格里是旧数据 */
+const hasData = ref(false);
 /** 失败只在 ok→error 跳变时 toast：首刷/手动/重连可能连续触发，避免重复弹错 */
 const pollFailed = ref(false);
 
@@ -25,18 +30,14 @@ const summary = computed(() => ({
 }));
 const rates = computed(() => perWorkflowRates(stats.value.by_workflow));
 
-const statusLabel: Record<string, string> = {
-  running: "运行中",
-  awaiting_resume: "挂起待恢复",
-  succeeded: "成功",
-  failed: "失败",
-  cancelled: "已取消",
-};
-
-function badgeClass(status: string): string {
-  if (status === "awaiting_resume") return "run-awaiting";
-  return `run-${status}`;
-}
+/** 容量口径来自 OPS.md / 服务端常量：R_MAX=1000 在飞 run 上限（平台上限，加执行
+ *  节点不提高）；A_MAX=16 在飞派发上限。非终态 = running + awaiting_resume */
+const RUN_CAP = 1000;
+const DISPATCH_CAP = 16;
+const capacity = computed(() => {
+  const active = activeCount(stats.value.by_status);
+  return { active, warn: active >= RUN_CAP * 0.8 };
+});
 
 function fmtTime(iso: string): string {
   const d = new Date(iso);
@@ -55,8 +56,11 @@ async function refresh(): Promise<void> {
   try {
     if (editor.workflows.length === 0) await refreshWorkflows();
     [stats.value, runs.value] = await Promise.all([api.runStats(), api.listRuns({ limit: 10 })]);
+    error.value = "";
+    hasData.value = true;
     pollFailed.value = false;
   } catch (e) {
+    error.value = errText(e);
     if (!pollFailed.value) toast.error(errText(e));
     pollFailed.value = true;
   } finally {
@@ -92,6 +96,14 @@ onUnmounted(() => {
       <AppButton @click="refresh()">刷新</AppButton>
     </div>
 
+    <div v-if="error" role="alert" class="error-banner">
+      <span>
+        加载失败：{{ error }}
+        <template v-if="hasData">· 当前显示上一次成功刷新的数据</template>
+      </span>
+      <AppButton @click="refresh()">重试</AppButton>
+    </div>
+
     <div class="cards">
       <div class="card">
         <div class="card-value">{{ editor.workflows.length }}</div>
@@ -111,6 +123,12 @@ onUnmounted(() => {
       </div>
     </div>
 
+    <p class="capacity" :class="{ warn: capacity.warn }">
+      非终态 {{ capacity.active }} / {{ RUN_CAP }}（平台上限，加执行节点不提高）
+      <span class="capacity-sub">· 在飞派发上限 {{ DISPATCH_CAP }}</span>
+      <span class="capacity-src">数值口径来自 OPS.md / 服务端常量</span>
+    </p>
+
     <section class="section">
       <h3>最近运行</h3>
       <table class="data-table">
@@ -125,16 +143,18 @@ onUnmounted(() => {
         </thead>
         <tbody>
           <tr v-for="r in runs" :key="r.id">
-            <td class="mono copyable" :title="r.id" @click="copyRunId(r.id)">
-              {{ r.id.slice(0, 8) }}…
+            <td>
+              <button type="button" class="copy-id" :title="r.id" @click="copyRunId(r.id)">
+                {{ r.id.slice(0, 8) }}…
+              </button>
             </td>
             <td class="wf-cell">
               {{ workflowNames.get(r.workflow_id) ?? r.workflow_id }}
               <span class="muted">v{{ r.workflow_version }}</span>
             </td>
             <td>
-              <span class="badge" :class="badgeClass(r.status)">
-                {{ statusLabel[r.status] ?? r.status }}
+              <span class="badge" :class="runBadgeClass(r.status)">
+                {{ runStatusLabel(r.status) }}
               </span>
             </td>
             <td :title="r.started_at">{{ fmtTime(r.started_at) }}</td>
@@ -145,7 +165,7 @@ onUnmounted(() => {
         </tbody>
       </table>
       <p v-if="!loaded" class="wf-empty">加载中…</p>
-      <p v-else-if="runs.length === 0" class="wf-empty">暂无运行记录</p>
+      <p v-else-if="!error && runs.length === 0" class="wf-empty">暂无运行记录</p>
     </section>
 
     <section class="section">
@@ -173,12 +193,26 @@ onUnmounted(() => {
         </tbody>
       </table>
       <p v-if="!loaded" class="wf-empty">加载中…</p>
-      <p v-else-if="rates.length === 0" class="wf-empty">暂无数据</p>
+      <p v-else-if="!error && rates.length === 0" class="wf-empty">暂无数据</p>
     </section>
   </div>
 </template>
 
 <style scoped>
+.error-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+  font-size: 12px;
+}
+
 .cards {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
@@ -217,8 +251,42 @@ onUnmounted(() => {
   margin-bottom: 24px;
 }
 
-.copyable {
+/* 容量口径小字：≥80% 用 warn 色提示接近平台上限 */
+.capacity {
+  margin: -12px 0 20px;
+  font-size: 11px;
+  color: var(--text3);
+}
+
+.capacity.warn {
+  color: var(--warn);
+}
+
+.capacity-sub {
+  margin-left: 8px;
+}
+
+.capacity-src {
+  margin-left: 8px;
+  opacity: 0.8;
+}
+
+/* copy-cell 按钮化：剥掉 button 默认外观，保持原可点击文本单元格样式 */
+.copy-id {
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  font-family: var(--mono);
+  text-align: left;
   cursor: pointer;
+}
+
+.copy-id:hover {
+  background: none;
+  border-color: transparent;
+  text-decoration: underline;
 }
 
 /* 名称缺失时回退渲染 36 字符 workflow_id，允许折行避免撑破表格 */

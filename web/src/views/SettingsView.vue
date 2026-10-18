@@ -8,7 +8,13 @@ import { refreshSecrets } from "../state/editor";
 import { deepCloneJson } from "../state/clone";
 import { confirmDialog } from "../state/modal";
 import { toast } from "../state/toast";
-import type { ConfigView, FlowConfig, SecretInfo } from "../types";
+import type {
+  AgentCredential,
+  ConfigView,
+  FlowConfig,
+  RemoteExecutionConfig,
+  SecretInfo,
+} from "../types";
 import AppButton from "../components/AppButton.vue";
 
 /**
@@ -58,6 +64,8 @@ interface FieldDesc {
   type?: "string" | "number" | "bool" | "enum" | "password";
   options?: string[];
   help?: string;
+  /** 已废弃字段：只读展示（存量值随整包 round-trip 原样保留） */
+  deprecated?: boolean;
 }
 
 interface SectionDesc {
@@ -101,6 +109,12 @@ const sections: SectionDesc[] = [
       },
       { key: "executor_bin", label: "执行器二进制", help: "留空 = 自召唤 flow executor" },
       { key: "x_max", label: "执行槽位（1..=16）", type: "number" },
+      {
+        key: "prewarm",
+        label: "预热执行器",
+        type: "bool",
+        help: "启动时预热一个空闲执行器（占一个 x_max 槽位；失败降级懒加载）",
+      },
     ],
   },
   {
@@ -113,6 +127,19 @@ const sections: SectionDesc[] = [
       { key: "cert", label: "证书路径" },
       { key: "key", label: "私钥路径" },
       { key: "slots", label: "本机执行槽位", type: "number" },
+      { key: "wss_url", label: "WSS 上联地址", help: "设置后优先于 mTLS 直连" },
+      {
+        key: "token",
+        label: "WSS 接入令牌",
+        type: "password",
+        help: "master 侧按 token→agent_id 映射反查身份",
+      },
+      {
+        key: "data_addr",
+        label: "data 地址",
+        deprecated: true,
+        help: "已废弃，仅存量兼容（v3 收敛为单条 TLS 连接，值被忽略）",
+      },
     ],
   },
   {
@@ -133,6 +160,26 @@ const visibleSections = computed(() =>
     return true;
   }),
 );
+
+/** execution.remote 嵌套块的强类型入口；remote 为空（mode=ipc 常态）时 WSS 接入不可配 */
+const remoteCfg = computed(() => copy.value?.execution.remote ?? null);
+
+function addAgent(): void {
+  const r: RemoteExecutionConfig | null = remoteCfg.value;
+  if (!r) return;
+  r.agents = [...(r.agents ?? []), { id: "", token: "" } satisfies AgentCredential];
+}
+
+function removeAgent(index: number): void {
+  const r: RemoteExecutionConfig | null = remoteCfg.value;
+  if (!r?.agents) return;
+  r.agents = r.agents.filter((_, i) => i !== index);
+}
+
+/** 已废弃字段的只读回显：null/undefined 显示为空，不回写 */
+function str(v: unknown): string {
+  return v == null ? "" : String(v);
+}
 
 async function refresh(): Promise<void> {
   try {
@@ -315,6 +362,13 @@ async function onDeleteSecret(name: string): Promise<void> {
             <span>{{ model[s.sect][f.key] ? "开启" : "关闭" }}</span>
           </label>
           <input
+            v-else-if="f.deprecated"
+            class="deprecated"
+            :value="str(model[s.sect][f.key])"
+            disabled
+            spellcheck="false"
+          />
+          <input
             v-else
             v-model="model[s.sect][f.key]"
             :type="f.type === 'number' ? 'number' : f.type === 'password' ? 'password' : 'text'"
@@ -323,6 +377,45 @@ async function onDeleteSecret(name: string): Promise<void> {
           />
           <div v-if="f.help" class="help">{{ f.help }}</div>
         </div>
+
+        <!-- execution.remote 嵌套块：wss_addr 与 agents 凭据成对；整包 config.update 时分区替换 -->
+        <template v-if="s.sect === 'execution'">
+          <template v-if="remoteCfg">
+            <div class="field">
+              <label>WSS 接入地址</label>
+              <input
+                v-model="remoteCfg.wss_addr"
+                placeholder="缺省关闭"
+                spellcheck="false"
+              />
+              <div class="help">
+                代理终止 TLS 场景的附加承载（execution.remote.wss_addr），与下方 agent 凭据成对配置
+              </div>
+            </div>
+            <div class="field">
+              <label>WSS agent 凭据</label>
+              <div class="agents">
+                <div v-for="(a, i) in remoteCfg.agents ?? []" :key="i" class="agent-row">
+                  <input v-model="a.id" placeholder="agent id" spellcheck="false" />
+                  <input v-model="a.token" placeholder="token" spellcheck="false" />
+                  <AppButton variant="link-danger" @click="removeAgent(i)">删除</AppButton>
+                </div>
+                <AppButton @click="addAgent">添加凭据</AppButton>
+              </div>
+              <div class="help">
+                execution.remote.agents：token→agent_id 显式映射；id 与 token 表内不得重复
+              </div>
+            </div>
+            <div class="field">
+              <label>data 地址</label>
+              <input class="deprecated" :value="str(remoteCfg.data_addr)" disabled spellcheck="false" />
+              <div class="help">已废弃，仅存量兼容（v3 收敛为单条 TLS 连接，值被忽略）</div>
+            </div>
+          </template>
+          <div v-else class="help remote-empty">
+            execution.remote 未配置（mode=remote 需要 control 地址与证书三件套），WSS 接入暂不可编辑
+          </div>
+        </template>
       </section>
     </template>
 
@@ -509,6 +602,28 @@ async function onDeleteSecret(name: string): Promise<void> {
   align-items: center;
   gap: 8px;
   color: var(--text);
+}
+
+.agents {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.agent-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  gap: 6px;
+  align-items: center;
+}
+
+/* 已废弃字段只读回显 */
+.field input.deprecated {
+  color: var(--text3);
+}
+
+.remote-empty {
+  margin: 4px 0 0;
 }
 
 .table {

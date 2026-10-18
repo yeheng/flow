@@ -69,6 +69,8 @@ pub struct WriterStats {
 struct Pending {
     tx: Transaction,
     expected_lsn: Option<u64>,
+    /// Canonical size/digest when the LSN was known at submission time.
+    wire: Option<(u64, String)>,
     changes: Vec<EntityChange>,
     bytes: usize,
     ack: oneshot::Sender<std::result::Result<Commit, String>>,
@@ -340,26 +342,29 @@ impl Journal {
             QueueClass::Audit(_) => self.inner.audit_budget,
         };
         if reserve > max_capacity || reserve > self.inner.batch_budget {
-            return Err(Error::Limit(
-                "prepared transition exceeds writer byte budget".into(),
-            ));
+            return Err(Error::Limit("transition exceeds writer byte budget".into()));
         }
         let mut permit = semaphore
             .clone()
             .acquire_many_owned(reserve as u32)
             .await
             .map_err(|e| Error::Unavailable(e.to_string()))?;
+        // Prepared transitions already know their LSN. Encode once here and reuse the
+        // canonical body/digest at append; non-prepared events encode again after the
+        // writer assigns the LSN. Never three times, never just to count bytes.
         let tx = Transaction {
             v: 2,
             journal_id: self.id().into(),
-            lsn: u64::MAX,
+            lsn: expected_lsn.unwrap_or(u64::MAX),
             tx_id,
             events,
         };
-        let bytes = codec::encode(&tx)?.len() + change_bytes;
+        let body = codec::bounded_json(&tx, MAX_LINE_BYTES)?;
+        let bytes = body.len() + change_bytes;
         if matches!(class, QueueClass::Audit(_)) && bytes > 512 * 1024 {
             return Err(Error::Limit("audit transaction exceeds 512 KiB".into()));
         }
+        let wire = expected_lsn.map(|_| (body.len() as u64, codec::digest(&body)));
         drop(permit.split(reserve - bytes));
         let (ack, result) = oneshot::channel();
         {
@@ -381,6 +386,7 @@ impl Journal {
                 tx,
                 changes,
                 expected_lsn,
+                wire,
                 bytes,
                 ack,
                 _bytes: permit,
@@ -479,8 +485,21 @@ fn pump(mut disk: Disk, shared: Arc<Shared>, options: JournalOptions) {
                 if let Some(admission) = &admission {
                     admission.check()?;
                 }
-                let location =
-                    disk.append(&tx, &pending.changes, pending.expected_lsn.is_some())?;
+                let (bytes, digest) = match &pending.wire {
+                    // Prepared transactions already carry the final LSN and digest.
+                    Some((bytes, digest)) => (*bytes, digest.clone()),
+                    None => {
+                        let body = codec::bounded_json(&tx, MAX_LINE_BYTES)?;
+                        (body.len() as u64, codec::digest(&body))
+                    }
+                };
+                let location = disk.append(
+                    &tx,
+                    &pending.changes,
+                    pending.expected_lsn.is_some(),
+                    bytes,
+                    &digest,
+                )?;
                 encoded_bytes += pending.bytes;
                 commits.push(Commit {
                     transaction: Arc::new(tx),
@@ -518,19 +537,26 @@ fn pump(mut disk: Disk, shared: Arc<Shared>, options: JournalOptions) {
             Err(error) => {
                 disk.rollback();
                 let failure = error.to_string();
-                queue.stats.failure = Some(failure.clone());
                 for pending in batch {
                     let _ = pending.ack.send(Err(failure.clone()));
                 }
-                while let Some(pending) = queue.pop() {
-                    let _ = pending.ack.send(Err(failure.clone()));
+                // A rejected transaction (invalid input, limit, stale prepared LSN) must not
+                // brick the only writer. Only platform/storage faults freeze the authority.
+                if !matches!(
+                    error,
+                    Error::Invalid(_) | Error::Limit(_) | Error::Conflict(_)
+                ) {
+                    queue.stats.failure = Some(failure.clone());
+                    while let Some(pending) = queue.pop() {
+                        let _ = pending.ack.send(Err(failure.clone()));
+                    }
+                    // Keep the data-directory lock until all handles close. A new writer must not
+                    // start while callers still hold this unavailable authority.
+                    while !queue.closing {
+                        queue = shared.ready.wait(queue).unwrap();
+                    }
+                    return;
                 }
-                // Keep the data-directory lock until all handles close. A new writer must not
-                // start while callers still hold this unavailable authority.
-                while !queue.closing {
-                    queue = shared.ready.wait(queue).unwrap();
-                }
-                return;
             }
         }
     }
