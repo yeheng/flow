@@ -1382,6 +1382,7 @@ name = "flow-desktop"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "dirs 6.0.0",
  "flow-backend",
  "flow-config",
  "flow-rpc",

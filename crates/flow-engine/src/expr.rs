@@ -564,7 +564,7 @@ fn expand_templates_impl(
       }
       if (Array.isArray(v)) { return v.map(function (x) { return __expand(x, input, nodes); }); }
       if (v && typeof v === 'object') {
-        var o = {};
+        var o = Object.create(null);
         Object.keys(v).forEach(function (k) { o[k] = __expand(v[k], input, nodes); });
         return o;
       }

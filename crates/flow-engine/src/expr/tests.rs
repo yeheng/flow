@@ -319,3 +319,30 @@ fn sandbox_has_no_std_os_or_module_loader() {
         assert_eq!(out, json!("undefined"), "{probe} 必须不可用");
     }
 }
+
+#[test]
+fn templates_preserve_special_json_keys() {
+    let template: Value = serde_json::from_str(r#"{"__proto__":{"kept":true},"nested":[{"__proto__":"${input.x}","constructor":1,"prototype":2}]}"#).unwrap();
+    let result = expand_templates(
+        &template,
+        &json!({"x":42}),
+        &Value::Null,
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let expected: Value = serde_json::from_str(
+        r#"{"__proto__":{"kept":true},"nested":[{"__proto__":42,"constructor":1,"prototype":2}]}"#,
+    )
+    .unwrap();
+    assert_eq!(result, expected);
+    assert_eq!(
+        expand_templates(
+            &expected,
+            &Value::Null,
+            &Value::Null,
+            Duration::from_secs(1)
+        )
+        .unwrap(),
+        expected
+    );
+}

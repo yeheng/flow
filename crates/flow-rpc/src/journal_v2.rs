@@ -322,17 +322,7 @@ pub fn is_read_method(method: &str) -> bool {
 /// 写命令的服务端命令 scope（`command.status` 查询键）。run.start 带来源
 /// 归因、run 族按 run_id 分域；其余就是方法名。
 pub fn command_scope(method: &str, params: &Value) -> String {
-    match method {
-        "run.start" => "run.start:manual:".to_string(),
-        "run.regress" => format!(
-            "run.start:manual:regression:{}",
-            params["baseline"].as_str().unwrap_or("")
-        ),
-        "run.cancel" | "run.signal" | "run.adjudicate" => {
-            format!("{method}:{}", params["run_id"].as_str().unwrap_or(""))
-        }
-        other => other.to_string(),
-    }
+    flow_dto::command_scope(method, params)
 }
 
 pub fn module(
@@ -1024,16 +1014,15 @@ async fn config_update(ctx: &Context, p: &Value) -> Result<Value, ErrorObjectOwn
     let (write_path, first_write) = match existing {
         Some(path) => (path, false),
         None => (
-            cs.default_path
-                .clone()
-                .ok_or_else(|| invalid("无法确定配置文件落点：请通过 --config 或 FLOW_CONFIG 指定路径"))?,
+            cs.default_path.clone().ok_or_else(|| {
+                invalid("无法确定配置文件落点：请通过 --config 或 FLOW_CONFIG 指定路径")
+            })?,
             true,
         ),
     };
     if let Some(parent) = write_path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| invalid(format!("配置写入失败：{e}")))?;
+            std::fs::create_dir_all(parent).map_err(|e| invalid(format!("配置写入失败：{e}")))?;
         }
     }
     merged
@@ -1153,6 +1142,9 @@ async fn subscribe_run_events(
     );
     let mut scanned = 0;
     loop {
+        if sink.is_closed() {
+            return;
+        }
         let (upper, row) = match ctx.backend.store.get_summary("run", &run_id).await {
             Ok(v) => v,
             Err(_) => return,
@@ -1169,6 +1161,9 @@ async fn subscribe_run_events(
             let mut latest = scanned;
             while bytes < flow_journal::MAX_LINE_BYTES {
                 let Some((tx, location)) = tail.next(upper)? else {
+                    // A filtered reader may exhaust this snapshot without returning
+                    // a transaction at upper. Progress is scan work, not event delivery.
+                    latest = upper;
                     break;
                 };
                 latest = tx.lsn;

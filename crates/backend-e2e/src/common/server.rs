@@ -12,12 +12,7 @@ use std::process::{Child, Command, Stdio};
 use futures::FutureExt;
 
 use crate::common::client;
-use flow_test_support::io::{wait_ready_child, Ready, PORT_RETRY_ATTEMPTS};
-
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定临时端口失败");
-    listener.local_addr().expect("读取本地地址失败").port()
-}
+use flow_test_support::io::spawn_reporting_ports;
 
 /// 一个用例的上下文：v2 服务进程 + journal 目录 + 部署 token。
 ///
@@ -184,60 +179,30 @@ impl ServerProc {
         token: &str,
         extra_env: &[(&str, &str)],
     ) -> Self {
-        // 端口是「建议」不是「预留」：free_port 放掉到被测进程 bind 之间会被
-        // 并行用例抢走（TOCTOU，CI 多核上会真发生）。被抢时子进程因 AddrInUse
-        // 立刻退出，换端口重来。
-        let mut last = String::new();
-        for _ in 1..=PORT_RETRY_ATTEMPTS {
-            match Self::spawn_once(bin, journal_dir, token, extra_env) {
-                Ok(proc) => return proc,
-                Err(reason) => last = reason,
-            }
-        }
-        panic!("{last}（已重试 {PORT_RETRY_ATTEMPTS} 次）");
-    }
-
-    /// 起一次并等就绪。`Err` 表示该端口不可用，换一个重试即可。
-    fn spawn_once(
-        bin: &std::path::Path,
-        journal_dir: &std::path::Path,
-        token: &str,
-        extra_env: &[(&str, &str)],
-    ) -> Result<Self, String> {
-        let addr = socket_addr(free_port());
-        let http_addr = socket_addr(free_port());
         let mut cmd = Command::new(bin);
-        cmd.env("FLOW_JOURNAL_ADDR", addr.to_string())
-            .env("FLOW_JOURNAL_HTTP_ADDR", http_addr.to_string())
-            .env("FLOW_JOURNAL_DATA_DIR", journal_dir)
+        cmd.env("FLOW_JOURNAL_DATA_DIR", journal_dir)
             .env("FLOW_JOURNAL_TOKEN", token)
             // 持久化密钥存储（storage.data_dir）也落在临时目录，别污染 CWD
             .env("FLOW_DATA_DIR", journal_dir)
             .env(
                 "RUST_LOG",
-                std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
+                format!(
+                    "{},flow_rpc=info",
+                    std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into())
+                ),
             )
             .stdin(Stdio::null());
-        // FLOW_E2E_SERVER_LOG=<文件>：被测进程的 stdout/stderr（tracing 默认写 stdout）
-        // 重定向过去排障；默认 stdout 丢弃、stderr 继承
-        if let Ok(path) = std::env::var("FLOW_E2E_SERVER_LOG") {
-            let open = || {
+        let log_path = std::env::var_os("FLOW_E2E_SERVER_LOG").map(PathBuf::from);
+        if let Some(path) = &log_path {
+            cmd.stderr(Stdio::from(
                 std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
-                    .open(&path)
-                    .ok()
-            };
-            match (open(), open()) {
-                (Some(out), Some(err)) => {
-                    cmd.stdout(Stdio::from(out)).stderr(Stdio::from(err));
-                }
-                _ => {
-                    cmd.stdout(Stdio::null()).stderr(Stdio::inherit());
-                }
-            }
+                    .open(path)
+                    .expect("open server log"),
+            ));
         } else {
-            cmd.stdout(Stdio::null()).stderr(Stdio::inherit());
+            cmd.stderr(Stdio::inherit());
         }
         // T6：默认执行模式已切 ipc。被测 server 的二进制位于 deps/ 目录，
         // locate() 找不到同目录兄弟 flow-executor——注入工作区构建产物路径
@@ -251,23 +216,17 @@ impl ServerProc {
         for (key, value) in extra_env {
             cmd.env(key, value);
         }
-        let mut child = cmd
-            .spawn()
-            .unwrap_or_else(|e| panic!("启动 flow-journal-server 失败：{e}"));
-        match wait_ready_child(addr, &mut child) {
-            Ready::Ready => Ok(ServerProc {
-                child,
-                addr,
-                http_addr,
-            }),
-            Ready::ChildExited(status) => Err(format!(
-                "flow-journal-server 端口 {addr} 上启动即退出（{status}）——端口被并行用例占用"
-            )),
-            Ready::TimedOut => {
-                let _ = child.kill();
-                let _ = child.wait();
-                Err(format!("flow-journal-server {addr} 未在就绪超时内起来"))
-            }
+        let (child, ports) = spawn_reporting_ports(
+            &mut cmd,
+            "FLOW_JOURNAL_ADDR",
+            "FLOW_JOURNAL_HTTP_ADDR",
+            log_path,
+        )
+        .unwrap_or_else(|e| panic!("启动 flow-journal-server 失败：{e}"));
+        Self {
+            child,
+            addr: ports.rpc,
+            http_addr: ports.http,
         }
     }
 
@@ -297,8 +256,4 @@ impl Drop for ServerProc {
     fn drop(&mut self) {
         self.kill();
     }
-}
-
-fn socket_addr(port: u16) -> SocketAddr {
-    SocketAddr::from(([127, 0, 0, 1], port))
 }

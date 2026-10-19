@@ -15,7 +15,7 @@ const kindFilter = ref("");
 const searchText = ref("");
 const expanded = reactive(new Set<string>());
 
-/** 单次渲染上限：EventWindow 全量可达 4096 条，超出部分提示用分页/审计读取 */
+/** 单次渲染上限：审计/观测列表可随分页无限追加，超出部分提示继续分页读取 */
 const RENDER_CAP = 1000;
 
 const rows = computed(() => props.items.map((item, i) => summarizeJournalRecord(item, i)));

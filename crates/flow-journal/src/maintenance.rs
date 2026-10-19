@@ -111,9 +111,7 @@ fn prepare_destination(destination: &Path, staging_prefix: &str, label: &str) ->
             .is_some_and(|name| name.to_string_lossy().starts_with(staging_prefix));
         if !ours {
             // 有任何外来内容就整体拒绝：自家残骸也原样保留，不动现场。
-            return Err(Error::Conflict(format!(
-                "{label} destination not empty"
-            )));
+            return Err(Error::Conflict(format!("{label} destination not empty")));
         }
         leftovers.push(path);
     }

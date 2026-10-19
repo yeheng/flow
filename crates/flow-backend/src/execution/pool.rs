@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::process::Child;
+use flow_engine::process::ManagedChild as Child;
 use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
@@ -201,42 +201,6 @@ impl ExecutorPool {
     }
 }
 
-/// 平台通道承载：unix socketpair（argv 传 FD 原号，父端关闭子端副本）；
-/// 其余平台本地 socket 单连接回连（Windows named pipe）。差异在此收口，
-/// 下游只见 FrameTransport 单流端点。回连形态额外产出随机会话令牌
-/// （Hello 回验，防本机抢连）。
-async fn spawn_transport(
-    executor: &flow_engine::execution_protocol::contract::ExecutorInvocation,
-    tag: Option<&str>,
-) -> Result<(FrameTransport, Child, Option<String>), PoolError> {
-    #[cfg(unix)]
-    {
-        let (parent, child, child_pair) =
-            flow_engine::execution_protocol::spawn::spawn_executor_process(executor, tag, &[])
-                .map_err(|e| PoolError::Spawn(format!("{}: {e}", executor.program.display())))?;
-        // 父进程关闭子端副本（子进程内按 argv 原号持有）。
-        drop(child_pair);
-        Ok((FrameTransport::spawn_local(parent, 128), child, None))
-    }
-    #[cfg(not(unix))]
-    {
-        let session_token = flow_engine::execution_protocol::transport::fresh_boot_id();
-        let (channel, child) = flow_engine::execution_protocol::loopback::spawn_executor_loopback(
-            executor,
-            tag,
-            session_token.clone(),
-            &[],
-        )
-        .await
-        .map_err(|e| PoolError::Spawn(format!("{}: {e}", executor.program.display())))?;
-        Ok((
-            FrameTransport::spawn(channel, 128),
-            child,
-            Some(session_token),
-        ))
-    }
-}
-
 /// spawn 执行器并完成握手；子进程由会话驱动任务持有并负责 kill/reap。
 async fn spawn_and_handshake(
     pool: &ExecutorPool,
@@ -245,7 +209,14 @@ async fn spawn_and_handshake(
     shutdown: CancellationToken,
 ) -> Result<RawSession, PoolError> {
     let (mut transport, mut child, session_token) =
-        spawn_transport(&pool.options.executor, pool.options.tag.as_deref()).await?;
+        flow_engine::execution_protocol::bootstrap::spawn_executor_transport(
+            &pool.options.executor,
+            pool.options.tag.as_deref(),
+            &[],
+            128,
+        )
+        .await
+        .map_err(|e| PoolError::Spawn(e.to_string()))?;
     let child_pid = child.id();
     let handshake = tokio::select! {
         result=tokio::time::timeout(Duration::from_millis(STARTUP_TIMEOUT_MS * 2),
@@ -436,11 +407,8 @@ mod lifecycle_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn session_shutdown_interrupts_full_event_queue_and_reaps_child() {
-        let child = tokio::process::Command::new("/bin/sleep")
-            .arg("60")
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
+        let child =
+            Child::spawn_executor(tokio::process::Command::new("/bin/sleep").arg("60")).unwrap();
         let pid = child.id().unwrap();
         let (a, b) = tokio::io::duplex(4096);
         let transport = FrameTransport::spawn(a, 8);

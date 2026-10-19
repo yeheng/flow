@@ -216,3 +216,18 @@ pub struct NodeTemplateSummary {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
+
+/// Durable command namespace used to recover a write after a lost reply.
+pub fn command_scope(method: &str, params: &Value) -> String {
+    match method {
+        "run.start" => "run.start:manual:".into(),
+        "run.regress" => format!(
+            "run.start:manual:regression:{}",
+            params["baseline"].as_str().unwrap_or("")
+        ),
+        "run.cancel" | "run.signal" | "run.adjudicate" => {
+            format!("{method}:{}", params["run_id"].as_str().unwrap_or(""))
+        }
+        other => other.into(),
+    }
+}

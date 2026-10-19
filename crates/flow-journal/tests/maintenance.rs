@@ -127,7 +127,11 @@ async fn backup_reclaims_stale_leftovers_and_rejects_foreign_content() {
     let target = dir.path().join("backup");
     let stale = target.join(".backup-stale");
     std::fs::create_dir_all(stale.join("inner")).unwrap();
-    std::fs::write(stale.join("inner").join(flow_journal::sqlite::DATABASE), b"half copy").unwrap();
+    std::fs::write(
+        stale.join("inner").join(flow_journal::sqlite::DATABASE),
+        b"half copy",
+    )
+    .unwrap();
     let report = backup(&root, &target, u64::MAX).unwrap();
     assert!(target.join(flow_journal::sqlite::DATABASE).exists());
     assert!(!stale.exists(), "自家残骸应被回收");

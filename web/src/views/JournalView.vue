@@ -1,58 +1,44 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, shallowRef, triggerRef } from "vue";
-import {
-  EventWindow,
-  JournalClient,
-  type JournalPage,
-  type Receipt,
-  type RunSnapshot,
-} from "../api/journal";
+import { computed, onBeforeUnmount, ref, shallowRef } from "vue";
+import { JournalClient, type JournalPage, type RunSnapshot } from "../api/journal";
 import { isDesktop } from "../platform";
-import CodeEditor from "../components/CodeEditor.vue";
 import JsonNode from "../components/JsonNode.vue";
 import JournalLogList from "../components/JournalLogList.vue";
 import ResizeHandle from "../components/ResizeHandle.vue";
 import AppButton from "../components/AppButton.vue";
 import { runBadgeClass, runStatusLabel } from "../state/labels";
 import { usePanelResize } from "../state/panel-resize";
-import { confirmDialog } from "../state/modal";
 import { toast } from "../state/toast";
 import type { ObservationRecord } from "../types";
+
+/**
+ * 事件审计检查台（运维/调试面）：直连任意 journal 工作区，按 run 查看
+ * 审计记录（run.audit.page）、原始快照（run.get）与观测原始记录
+ * （run.observations.page）。工作流 CRUD、发起运行、实时监控分别在
+ * 工作流列表/编辑器/运行记录页，本页不做二次实现。
+ */
 
 const desktop = isDesktop();
 const url = ref("ws://127.0.0.1:9802");
 const http = ref("http://127.0.0.1:9803");
 const token = ref("");
 const api = shallowRef<JournalClient>();
-const workflows = ref<Array<{ workflow_id: string; name: string }>>([]);
 const runs = ref<RunSnapshot[]>([]);
-const workflow = ref("");
-const name = ref("");
-const input = ref("{}");
-const definition = ref(
-  '{"nodes":[{"id":"start","type":"start"},{"id":"end","type":"end"}],"edges":[{"from":"start","to":"end"}]}',
-);
+const runId = ref("");
 const run = shallowRef<RunSnapshot>();
 const page = shallowRef<JournalPage>();
-const audit = ref(false);
+/** 审计流开关：默认审计（本页主旨）；取消勾选看 control 业务事件流 */
+const audit = ref(true);
 const message = ref("");
 const busy = ref(false);
-const windowed = shallowRef(new EventWindow());
 const observations = shallowRef<ObservationRecord[]>([]);
 const observationLoss = shallowRef<unknown>();
-let refreshing = false;
-let frame: number | undefined;
-let stop: (() => Promise<void>) | undefined;
-let disposed = false;
 
 /** 观测增量水位：已展示的最大 seq（十进制字符串），作为下一页 from_seq。
  *  run.observations.page 的 from_seq 是闭区间（seq >= from_seq），追加时跳过水位上的那条 */
 let obsSeq = "0";
 /** 观测拉取在途守卫：事件密集时不叠加请求 */
 let obsLoading = false;
-/** 观测拉取节流窗口：任何订阅事件/对齐都请求一次，窗口内合并成一次 */
-const OBS_PULL_INTERVAL_MS = 250;
-let obsTimer: ReturnType<typeof setTimeout> | undefined;
 
 function appendObservations(records: ObservationRecord[]): void {
   const fresh = records.filter((r) => BigInt(r.seq) > BigInt(obsSeq));
@@ -63,66 +49,21 @@ function appendObservations(records: ObservationRecord[]): void {
 
 /** 观测增量拉取：from_seq=水位继续分页，只追加；loss 显示仍整包替换 */
 async function pullObservations() {
-  if (!api.value || !run.value || obsLoading) return;
+  if (!api.value || !runId.value || obsLoading) return;
   obsLoading = true;
   try {
-    const id = run.value.run_id;
+    const id = runId.value;
     const logs = await api.value.call<{ records: ObservationRecord[]; loss: unknown }>(
       "run.observations.page",
       { run_id: id, from_seq: obsSeq, limit: 100 },
     );
-    if (run.value?.run_id !== id) return;
+    if (runId.value !== id) return;
     appendObservations(logs.records);
     observationLoss.value = logs.loss;
   } finally {
     obsLoading = false;
   }
 }
-
-function scheduleObsRefresh(): void {
-  if (obsTimer !== undefined) return;
-  obsTimer = setTimeout(() => {
-    obsTimer = undefined;
-    if (disposed) return;
-    void pullObservations().catch((e) => {
-      message.value = String(e);
-    });
-  }, OBS_PULL_INTERVAL_MS);
-}
-
-/** 会改变 run 状态的事件（journal EventKind 的 snake_case 名）：
- *  这些事件到达后需要补拉 run.get 摘要与观测页 */
-const RUN_LIFECYCLE_KINDS = new Set([
-  "run_started",
-  "run_cancelled",
-  "run_completed",
-  "run_failed",
-]);
-let runRefreshQueued = false;
-/** 摘要刷新的防抖：同一 tick 多条事件只刷一次；在途时由 refreshRun 的 refreshing 守卫去重 */
-function scheduleRunRefresh(): void {
-  if (runRefreshQueued) return;
-  runRefreshQueued = true;
-  void Promise.resolve().then(() => {
-    runRefreshQueued = false;
-    if (disposed) return;
-    void refreshRun().catch((e) => {
-      message.value = String(e);
-    });
-  });
-}
-
-/** JSON 字段即时校验：非法时行内报错并禁用对应提交按钮（Monaco 标红之外的显式拦截） */
-function jsonError(text: string): string {
-  try {
-    JSON.parse(text);
-    return "";
-  } catch (e) {
-    return String(e);
-  }
-}
-const definitionError = computed(() => jsonError(definition.value));
-const inputError = computed(() => jsonError(input.value));
 
 // 左栏（表单区）：拖右边缘改宽度；经 CSS 变量传给 grid,1100px 以下的单列媒体查询不受影响
 const sideEl = ref<HTMLElement | null>(null);
@@ -134,13 +75,7 @@ const sideResize = usePanelResize({
   max: () => Math.min(640, (sideEl.value?.parentElement?.clientWidth ?? 1200) * 0.5),
   measure: (rect, e) => e.clientX - rect.left,
 });
-function formatJsonText(text: string): string {
-  try {
-    return JSON.stringify(JSON.parse(text), null, 2);
-  } catch {
-    return text; // 按钮在非法时已禁用，这里是兜底
-  }
-}
+
 const downloads = computed(() => {
   const refs = new Set<string>();
   const visit = (v: unknown): void => {
@@ -168,135 +103,57 @@ async function act(work: () => Promise<void>) {
   }
 }
 
-function receipt(r: Receipt) {
-  message.value = r.visible
-    ? "已提交并可见"
-    : `已提交，投影尚未可见。请求 ${r.request_id}，提交 ${r.commit_cursor.lsn}；请查询原请求，勿重复创建。`;
-}
-
 async function load() {
   if (!api.value) return;
-  workflows.value = (
-    await api.value.call<{ values: typeof workflows.value }>("workflow.list", { limit: 64 })
-  ).values;
   runs.value = (await api.value.call<{ values: RunSnapshot[] }>("run.list", { limit: 64 })).values;
 }
 
 async function connect() {
   api.value?.close();
-  await stop?.();
-  stop = undefined;
+  runId.value = "";
   run.value = undefined;
-  api.value = new JournalClient(url.value, token.value, http.value);
-  await load();
-}
-
-async function create() {
-  if (!api.value) return;
-  const r = await api.value.command("workflow.create", { name: name.value });
-  receipt(r);
-  workflow.value = String(r.result.workflow_id);
-  await load();
-}
-
-async function save() {
-  if (!api.value) return;
-  if (definition.value.length > 1024 * 1024) throw new Error("定义超过 1 MiB");
-  const r = await api.value.command("workflow.update", {
-    workflow_id: workflow.value,
-    definition: JSON.parse(definition.value),
-  });
-  receipt(r);
-  if (!r.visible) return;
-  const published = await api.value.command("workflow.publish", {
-    workflow_id: workflow.value,
-    version: r.result.version,
-  });
-  receipt(published);
-}
-
-async function start() {
-  if (!api.value) return;
-  const r = await api.value.command(
-    "run.start",
-    { workflow_id: workflow.value, input: JSON.parse(input.value) },
-    "run.start:manual:",
-  );
-  receipt(r);
-  if (r.visible) await watchRun(String(r.result.run_id));
-  await load();
-}
-
-/** run 摘要刷新：只补拉 run.get；观测走 pullObservations 的 from_seq 增量 */
-async function refreshRun() {
-  if (!api.value || !run.value || refreshing) return;
-  refreshing = true;
-  try {
-    const id = run.value.run_id;
-    const current = await api.value.call<{ value: RunSnapshot }>("run.get", { run_id: id });
-    if (run.value?.run_id !== id) return;
-    run.value = current.value;
-  } finally {
-    refreshing = false;
-  }
-}
-
-async function watchRun(id: string) {
-  await stop?.();
-  windowed.value = new EventWindow();
   page.value = undefined;
   observations.value = [];
   observationLoss.value = undefined;
   obsSeq = "0";
-  stop = await api.value!.monitor(
-    id,
-    (v) => {
-      run.value = v;
-      // snapshot 回调在初次对齐、丢包重排、断线重连（JournalClient 内部
-      // onReconnect → align）后都会到达：这些时点摘要与观测页可能错过数据，补拉一次
-      scheduleRunRefresh();
-      scheduleObsRefresh();
-    },
-    (e) => {
-      windowed.value.push(e);
-      // 任何事件都可能伴随观测落库：节流拉增量，不必区分事件类型
-      scheduleObsRefresh();
-      if (RUN_LIFECYCLE_KINDS.has(e.event.kind)) scheduleRunRefresh();
-      if (frame === undefined)
-        frame = requestAnimationFrame(() => {
-          frame = undefined;
-          triggerRef(windowed);
-        });
-    },
-    (n) => {
-      if (n) message.value = `实时缓冲丢弃 ${n} 条，已按快照重新对齐；历史可分页读取。`;
-    },
-  );
+  api.value = new JournalClient(url.value, token.value, http.value);
+  await load();
+}
+
+/** 选择 run：重置分页/观测水位，拉一次快照与首页观测 */
+async function selectRun(id: string) {
+  if (!api.value || !id) return;
+  runId.value = id;
+  run.value = undefined;
+  page.value = undefined;
+  observations.value = [];
+  observationLoss.value = undefined;
+  obsSeq = "0";
+  await refreshRun();
+  await pullObservations();
+}
+
+async function refreshRun() {
+  if (!api.value || !runId.value) return;
+  const id = runId.value;
+  const current = await api.value.call<{ value: RunSnapshot }>("run.get", { run_id: id });
+  if (runId.value !== id) return;
+  run.value = current.value;
+}
+
+/** 手动刷新：补拉 run 摘要，并从观测水位继续拉增量 */
+async function refreshAll() {
   await refreshRun();
   await pullObservations();
 }
 
 async function nextPage(reset = false) {
-  if (!api.value || !run.value) return;
+  if (!api.value || !runId.value) return;
   page.value = await api.value.page(
-    run.value.run_id,
+    runId.value,
     audit.value,
     reset ? undefined : page.value?.next_cursor,
   );
-}
-
-async function cancel() {
-  if (!api.value || !run.value) return;
-  if (!(await confirmDialog(`确定取消 run ${run.value.run_id.slice(0, 8)}…？`, { danger: true })))
-    return;
-  receipt(
-    await api.value.command(
-      "run.cancel",
-      { run_id: run.value.run_id },
-      `run.cancel:${run.value.run_id}`,
-    ),
-  );
-  await refreshRun();
 }
 
 async function copyRunId(id: string) {
@@ -309,11 +166,7 @@ async function copyRunId(id: string) {
 }
 
 onBeforeUnmount(() => {
-  disposed = true;
   api.value?.close();
-  if (frame !== undefined) cancelAnimationFrame(frame);
-  if (obsTimer !== undefined) clearTimeout(obsTimer);
-  void stop?.();
 });
 </script>
 
@@ -322,7 +175,7 @@ onBeforeUnmount(() => {
     <div class="page-header">
       <div class="page-title">
         <h2>事件审计</h2>
-        <p class="muted page-sub">journal v2 事件与审计检查台（运维/调试面）</p>
+        <p class="muted page-sub">journal v2 审计记录与原始数据检查台（运维/调试面）</p>
       </div>
       <span v-if="api" class="muted mono journal-endpoint">{{ desktop ? "本地数据" : url }}</span>
     </div>
@@ -361,70 +214,11 @@ onBeforeUnmount(() => {
           @dragstart="sideResize.onDragStart"
         />
         <section class="panel">
-          <h3>工作流</h3>
-          <div class="field">
-            <label>选择工作流</label>
-            <select v-model="workflow">
-              <option value="">选择工作流</option>
-              <option v-for="w in workflows" :key="w.workflow_id" :value="w.workflow_id">
-                {{ w.name }}
-              </option>
-            </select>
-          </div>
-          <div class="field journal-new">
-            <input v-model="name" placeholder="新工作流名称" />
-            <AppButton type="button" :disabled="busy || !name" @click="act(create)">新建</AppButton>
-          </div>
-          <div class="field">
-            <label>定义 JSON</label>
-            <CodeEditor v-model="definition" language="json" height="220px" />
-            <div v-if="definitionError" class="field-error">{{ definitionError }}</div>
-            <button
-              v-else
-              type="button"
-              class="link journal-format"
-              @click="definition = formatJsonText(definition)"
-            >
-              格式化
-            </button>
-          </div>
-          <AppButton
-            type="button"
-            variant="primary"
-            :disabled="busy || !workflow || !!definitionError"
-            @click="act(save)"
-          >
-            保存并发布新版本
-          </AppButton>
-          <div class="field">
-            <label>运行输入 JSON</label>
-            <CodeEditor v-model="input" language="json" height="110px" />
-            <div v-if="inputError" class="field-error">{{ inputError }}</div>
-            <button
-              v-else
-              type="button"
-              class="link journal-format"
-              @click="input = formatJsonText(input)"
-            >
-              格式化
-            </button>
-          </div>
-          <AppButton
-            type="button"
-            variant="primary"
-            :disabled="busy || !workflow || !!inputError"
-            @click="act(start)"
-          >
-            开始运行
-          </AppButton>
-        </section>
-
-        <section class="panel">
           <div class="panel-head">
             <h3>运行记录</h3>
             <AppButton type="button" :disabled="busy" @click="act(load)">刷新</AppButton>
           </div>
-          <p class="muted journal-hint">每次最多展示 64 条。完整历史可通过分页接口读取。</p>
+          <p class="muted journal-hint">每次最多展示 64 条，选择一行开始审计。</p>
           <table v-if="runs.length" class="data-table">
             <thead>
               <tr>
@@ -451,8 +245,8 @@ onBeforeUnmount(() => {
                   </span>
                 </td>
                 <td>
-                  <AppButton type="button" variant="link" @click="act(() => watchRun(r.run_id))">
-                    监控
+                  <AppButton type="button" variant="link" :disabled="busy" @click="act(() => selectRun(r.run_id))">
+                    查看
                   </AppButton>
                 </td>
               </tr>
@@ -465,8 +259,8 @@ onBeforeUnmount(() => {
       <section v-if="run" class="panel journal-detail">
         <div class="panel-head">
           <h3>运行详情</h3>
-          <AppButton type="button" variant="danger" :disabled="busy" @click="act(cancel)">
-            取消运行
+          <AppButton type="button" :disabled="busy" @click="act(refreshAll)">
+            刷新
           </AppButton>
         </div>
         <div class="journal-runhead">
@@ -495,18 +289,12 @@ onBeforeUnmount(() => {
           </div>
         </template>
 
-        <h3>
-          实时事件
-          <span class="muted journal-hint">展示丢弃 {{ windowed.dropped }} 条</span>
-        </h3>
-        <JournalLogList :items="windowed.events" empty-text="暂无实时事件" />
-
         <h3>历史事件与审计</h3>
         <div class="journal-audit">
           <label class="journal-check">
             <input v-model="audit" type="checkbox" @change="page = undefined" /> 审计记录
           </label>
-          <AppButton type="button" @click="act(() => nextPage(true))">读取新快照</AppButton>
+          <AppButton type="button" @click="act(() => nextPage(true))">重新读取</AppButton>
           <AppButton type="button" :disabled="!page?.next_cursor" @click="act(() => nextPage())">
             下一页
           </AppButton>
@@ -616,15 +404,6 @@ onBeforeUnmount(() => {
   right: -8px;
 }
 
-.journal-new {
-  display: flex;
-  gap: 8px;
-}
-
-.journal-new button {
-  flex-shrink: 0;
-}
-
 .journal-hint {
   font-size: 11px;
   font-weight: 400;
@@ -711,10 +490,6 @@ onBeforeUnmount(() => {
 /* JsonNode 容器：不用 pre 的 pre-wrap，由折叠树自己换行 */
 .journal-json {
   white-space: normal;
-}
-
-.journal-format {
-  margin-top: 4px;
 }
 
 .code-block::-webkit-scrollbar {

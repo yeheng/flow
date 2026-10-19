@@ -23,9 +23,10 @@ publish = false
 default = []
 # PG 注册表面（Registry/集群服务进程）：与 flow-rpc/flow-backend 的同名
 # feature 同语义——测试按 #![cfg(feature)] 门控，CI 在专用 PG 作业里开。
-journal-cluster = ["flow-backend/journal-cluster"]
+journal-cluster = ["flow-backend/journal-cluster", "dep:sqlx"]
 
 [dependencies]
+sqlx = { workspace = true, optional = true, features = ["postgres"] }
 tokio = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }

@@ -1250,7 +1250,7 @@ async fn cancellation_never_contaminates_the_next_dispatch_on_a_single_slot() {
     let clean=install(&b,json!({"nodes":[{"id":"s","type":"start"},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"e"}]})).await;
     for i in 0..30 {
         let id = start_run(&b, &cancelled, json!({"i":i})).await;
-        until(&b, &id, |r| r.terminal() || r.nodes.get("n").is_some()).await;
+        until(&b, &id, |r| r.terminal() || r.nodes.contains_key("n")).await;
         b.run_cancel(&id, None).await.unwrap();
         let next = start_run(&b, &clean, json!({"i":i})).await;
         let done = until(&b, &next, Run::terminal).await;

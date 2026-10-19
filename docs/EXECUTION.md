@@ -15,7 +15,7 @@
 
 **输入输出合同**
 
-定义可带 `input_schema`、`output_schema`。支持明确的子集：type、properties、required、additionalProperties、items、enum、min/maxLength、minimum/maximum、min/maxItems，以及 title/description/default 注解。不支持的关键字在保存时拒绝。输入在创建 run 前验证；输出不合约时 run 失败。完整 schema 验证预算为 8 MiB。
+定义可带 `input_schema`、`output_schema`。支持明确的子集：type、properties、required、additionalProperties、items、enum、min/maxLength、minimum/maximum、min/maxItems，以及 title/description/default 注解。不支持的关键字在保存时拒绝。根流程与子流程的输入均在创建 run 前验证（子流程校验已固定版本的 schema）；输出不合约时 run 失败。完整 schema 验证预算为 8 MiB。
 
 **业务接口**
 
@@ -35,6 +35,8 @@
 **模型、工具和外部操作**
 
 原生 `llm` 节点是一次非流式 HTTP JSON 模型调用：`params.url`、`params.body` 必填；支持 headers、credential、timeout_ms、response_schema。请求使用 POST，原始响应和结果持久记录。`body` 保持供应商原始 JSON，不把任意模型协议冒充通用标准。输出与 HTTP 节点一样是 `{status, headers, body}`。
+
+受管理 harness 在超时、取消及正常结束时回收后代进程；执行器退出时，父进程还会回收其会话内的 harness 进程组。Unix 使用执行器会话和 harness 进程组，Windows 使用启动前绑定的 Job Object。主动脱离会话/作业的 daemon、跨主进程与执行器同时强杀的系统故障，仍需部署级进程容器或服务管理器约束；这不改变未知外部结果必须裁决的合同。
 
 模型决定应由脚本/条件节点读取，业务工具由独立 HTTP 或子流程节点执行。每个模型调用和工具操作拥有独立的请求、授权和结果证据；可以对整个场景回归。`harness` 继续提供进程级证据，其内部调用不会被假定为独立受控工具操作。节点能力接口公开 `trace_granularity`。
 
@@ -87,3 +89,13 @@ flow-journal-dev --data-dir NEW_DATA_DIRECTORY check-projection
 升级不修改源目录，复制后校验事实、当前行、正文和摘要，再发布新库。停止旧服务、完成升级检查后，将服务的数据目录切换到新目录。原目录继续保留，不同时运行源目录与升级后的目录。新版本正常启动不会全量重放，也不会静默迁移未知格式；损坏时显式拒绝，不自动覆盖。
 
 业务事实、回执和引用正文仍全部保留；没有引入 TTL 或 GC。16 个在飞 dispatch、1000 个非终态 run 的预算保持不变。
+
+**CLI 不确定交付恢复**
+
+常规写命令可传全局 `--request-id KEY`。同一操作重试必须保留同一个键和原参数；传输失败会在 stderr 输出请求身份和命令 scope，不改变 stdout 的 JSON/管道合同。对提供持久回执的命令，使用 `command.status` 查询该 scope 与 request_id，再决定是否重试。`config.update`、`secrets.set/delete` 没有业务 journal 命令回执，应读取当前配置或密钥状态核对。
+
+```sh
+flow-cli --request-id order-20261019-42 run start WORKFLOW_ID --input '{"id":42}' --detach
+# 将 {"scope":"run.start:manual:","request_id":"order-20261019-42"} 写入 status.json
+flow-cli journal call command.status --params status.json
+```

@@ -7,8 +7,9 @@
 
 use std::os::fd::AsRawFd;
 
+use crate::process::ManagedChild as Child;
 use tokio::net::UnixStream;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 
 use super::contract::ExecutorInvocation;
 use super::unix::socketpair_channel;
@@ -84,7 +85,7 @@ pub fn spawn_executor_process(
             Ok(())
         });
     }
-    let spawned = command.spawn()?;
+    let spawned = Child::spawn_executor(&mut command)?;
     // 注意：子端副本由调用方 drop（本函数返回它以明确生命周期）。
     Ok((parent, spawned, child))
 }

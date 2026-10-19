@@ -51,6 +51,7 @@ name = "flow-journal-server-e2e"
 path = "src/bin/flow-journal-server-e2e.rs"
 
 [dev-dependencies]
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 sha2 = { workspace = true }
 hex = { workspace = true }
 tempfile = "3"

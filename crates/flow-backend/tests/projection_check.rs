@@ -62,7 +62,7 @@ async fn replaying_facts_reproduces_current_rows() {
     let report = check(&root).await.unwrap();
     assert!(report.mismatches.is_empty(), "{:?}", report.mismatches);
     assert!(report.entities > 0);
-    assert_eq!(report.last_lsn > 0, true);
+    assert!(report.last_lsn > 0);
 
     // Rewrite one row with a matching checksum: only a replay can catch this.
     let db = pool(&root).await;

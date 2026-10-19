@@ -87,9 +87,14 @@ impl Services {
         data_dir: PathBuf,
     ) -> Result<Arc<Self>> {
         let token = uuid::Uuid::new_v4().to_string();
+        // 桌面配置默认落点：用户主目录 `~/.flow/flow.toml`（不随 app 数据目录
+        // 重置而丢失）。仅当 path 为 None（启动时无配置文件）时 config.update
+        // 才回退到此写入；当前桌面 path 恒为 Some(<root>/flow.toml)，故此为兜底。
+        let default_path = dirs::home_dir().map(|home| home.join(".flow").join("flow.toml"));
         let config_state = flow_rpc::ConfigState {
             config: std::sync::RwLock::new(config.clone()),
-            path: Some(config_path),
+            path: std::sync::RwLock::new(Some(config_path)),
+            default_path,
             env_overrides: Vec::new(),
         };
         let (state, _secrets) =

@@ -7,6 +7,7 @@ pub mod log_types;
 pub mod model;
 pub mod nodelog;
 pub mod observation;
+pub mod process;
 pub mod schema;
 pub mod secrets;
 pub mod secrets_store;

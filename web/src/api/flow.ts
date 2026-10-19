@@ -1,5 +1,5 @@
 import { client } from "../rpc/client";
-export { JournalClient, EventWindow } from "./journal";
+export { JournalClient } from "./journal";
 export { downloadValue, runValueUrl } from "./download";
 import { httpUrl } from "../config";
 import { rawRunToRecord, selectRawRuns } from "../state/run-raw";

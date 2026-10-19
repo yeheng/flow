@@ -195,9 +195,8 @@ jobs:
 
   # ---- Windows 编译门禁 ----
   # 桌面版（Tauri）依赖 flow-backend/flow-rpc 全链，Windows 是产品面；IPC
-  # 执行层是 unix-only（socketpair/FD 槽位），非 unix 构建必须保持可编译、
-  # 且 ipc 配置在运行期明确报错而非静默落回。只 check 不跑测试：C 依赖
-  # （rquickjs/aws-lc）能链接，测试矩阵由 linux/mac 覆盖。
+  # 全部执行链路必须在 Windows 编译，包括本地 socket 引导与 Job 回收。
+  # 真实运行测试仍需相应平台作业。
   windows-check:
     name: check (x86_64-pc-windows-msvc)
     runs-on: windows-latest
@@ -213,7 +212,7 @@ jobs:
         with:
           key: windows-check
       - name: cargo check
-        run: cargo check --workspace --exclude flow-executor --exclude flow-agent --locked --target x86_64-pc-windows-msvc
+        run: cargo check --workspace --locked --target x86_64-pc-windows-msvc
 
   # ---- 前端：单架构 ----
   # lint / 单测 / 构建都是 node 侧的事，与 CPU 架构无关；playwright 的 e2e 里

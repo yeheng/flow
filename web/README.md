@@ -15,7 +15,7 @@ Vue 3 + Vite + TypeScript + vue-router + Tauri 2，支持浏览器与桌面应�
 | `/workflows/:id/runs`     | 该工作流的运行历史（3s 轮询）                                                         |
 | `/runs`                   | 全局运行历史（同上组件，不过滤）                                                      |
 | `/runs/:runId`            | 运行详情：信息头 + 只读 DAG（按 run 钉死的版本渲染、保留运行态着色）+ 实时时间线      |
-| `/journal`                | 事件审计：journal v2 事件与审计检查台（运维/调试面）                                   |
+| `/journal`                | 事件审计：journal v2 审计记录、原始快照与观测记录检查台（运维/调试面，可直连任意 journal 工作区）   |
 | `/cluster`                | 集群节点：节点注册、归属、租约与同步进度                                              |
 
 全局通知走右上角 Toast，确认/输入走 Modal（替代原生 prompt/confirm）；

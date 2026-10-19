@@ -4,6 +4,10 @@ use jsonrpsee::{core::client::ClientT, ws_client::WsClient};
 use serde_json::{json, Value};
 use std::{io::Read, path::PathBuf};
 
+tokio::task_local! {
+    pub(crate) static REQUEST_ID: Option<String>;
+}
+
 #[derive(Subcommand)]
 pub enum Command {
     /// Execute a candidate against recorded external outcomes; fail CI on differences.
@@ -57,7 +61,15 @@ pub(crate) async fn call(
             .as_object_mut()
             .unwrap()
             .entry("request_id")
-            .or_insert_with(|| Value::String(uuid::Uuid::now_v7().to_string()));
+            .or_insert_with(|| {
+                Value::String(
+                    REQUEST_ID
+                        .try_with(Clone::clone)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
+                )
+            });
     }
     match client
         .request::<Value, _>(method, params.as_object().unwrap().clone())
@@ -68,6 +80,17 @@ pub(crate) async fn call(
             code: e.code(),
             message: e.message().into(),
         }),
+        Err(e) if crate::client::is_write_method(method) => {
+            let identity = json!({"scope":flow_dto::command_scope(method, &params), "request_id":params["request_id"]});
+            let recovery = if matches!(method, "config.update" | "secrets.set" | "secrets.delete") {
+                "此方法没有持久命令回执；请查询当前配置或密钥状态后再决定是否重试。"
+            } else {
+                "使用 command.status 查询回执；重试必须使用同一 request_id 与原参数，不能换新键。"
+            };
+            Err(error(format!(
+                "{e}\n写入交付状态未知，请保留命令身份：{identity}\n{recovery}"
+            )))
+        }
         Err(e) => Err(error(e)),
     }
 }

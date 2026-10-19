@@ -622,9 +622,7 @@ impl JournalBackend {
                 &frozen_definition,
             )
             .await?;
-        if let Some(schema) = &definition.input_schema {
-            flow_engine::schema::validate(schema, &input).map_err(invalid)?;
-        }
+        validate_run_input(&definition, &input)?;
         let stored = self.store_json(input, 8 * 1024 * 1024).await?;
         if let Some(execution) = &mut execution {
             execution.correlation_id = correlation_id.map(str::to_owned);
@@ -1204,4 +1202,17 @@ fn template_decision(
         vec![Event::new(EventKind::TemplateChanged, value.clone())],
         value,
     ))
+}
+
+/// Every run creation path validates the same input contract before dispatch.
+pub(crate) fn validate_run_input(
+    definition: &flow_engine::Definition,
+    input: &Value,
+) -> flow_journal::Result<()> {
+    if let Some(schema) = &definition.input_schema {
+        flow_journal::codec::bounded_json(input, 8 * 1024 * 1024)?;
+        flow_engine::schema::validate(schema, input)
+            .map_err(|e| invalid(format!("input contract: {e}")))?;
+    }
+    Ok(())
 }

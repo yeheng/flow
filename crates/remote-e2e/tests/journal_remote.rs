@@ -269,15 +269,15 @@ async fn relay_path_produces_identical_authoritative_facts() {
 }
 
 /// 收集下一个 BindExecutor 帧（跳过其他帧）；超时返回 None。
-async fn next_bind_opt(
-    transport: &mut FrameTransport,
-    wait: Duration,
-) -> Option<(String, String)> {
+async fn next_bind_opt(transport: &mut FrameTransport, wait: Duration) -> Option<(String, String)> {
     use flow_engine::execution_protocol::Message;
     let deadline = tokio::time::Instant::now() + wait;
     loop {
         let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
-        let message = tokio::time::timeout(remaining, transport.recv()).await.ok()?.ok()?;
+        let message = tokio::time::timeout(remaining, transport.recv())
+            .await
+            .ok()?
+            .ok()?;
         if let Message::BindExecutor {
             executor_id,
             dispatch_id,
@@ -392,11 +392,7 @@ async fn capacity_report_raises_admission_slots() {
             version: flow_engine::execution_protocol::PROTOCOL_VERSION,
             agent_boot_id: "boot-cap".into(),
             build: "sim".into(),
-            capabilities: vec![
-                "relay".into(),
-                "resource_report".into(),
-                "reconnect".into(),
-            ],
+            capabilities: vec!["relay".into(), "resource_report".into(), "reconnect".into()],
             slots: 1,
         })
         .await

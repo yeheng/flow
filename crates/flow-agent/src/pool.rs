@@ -8,11 +8,11 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
+use flow_engine::execution_protocol::bootstrap::spawn_executor_transport;
 use flow_engine::execution_protocol::contract::{
     DRAIN_GRACE_MS, HEARTBEAT_TIMEOUT_MS, STARTUP_TIMEOUT_MS,
 };
 use flow_engine::execution_protocol::message::Message;
-use flow_engine::execution_protocol::spawn::spawn_executor_process;
 use flow_engine::execution_protocol::transport::{master_handshake, FrameTransport};
 
 use crate::relay::{Relay, PER_EXECUTOR_QUEUE};
@@ -62,7 +62,7 @@ pub enum PoolError {
 /// 失败路径回收：kill 之后必须 wait/reap。只 kill 不 wait 会把 Child 随
 /// 错误值一起 drop，SIGKILL 后的子进程无人收割成为僵尸；执行器二进制
 /// 损坏或启动慢导致握手反复超时时，僵尸会线性累积。
-async fn kill_and_reap(mut child: tokio::process::Child) {
+async fn kill_and_reap(mut child: flow_engine::process::ManagedChild) {
     let _ = child.start_kill();
     let _ = child.wait().await;
 }
@@ -78,14 +78,14 @@ pub async fn bind_executor(
 ) -> Result<ExecutorHandle, PoolError> {
     // 模式标记（中继模式）由调用点显式追加，不做「预置参数列表」传递。
     let invocation = executor.clone();
-    let (pair, child, child_side) = spawn_executor_process(
+    let (mut transport, child, session_token) = spawn_executor_transport(
         &invocation,
         Some(&format!("agent:{executor_id}")),
         &["--remote-relay"],
+        64,
     )
+    .await
     .map_err(|e| PoolError::Bind(format!("spawn executor: {e}")))?;
-    drop(child_side);
-    let mut transport = FrameTransport::spawn(pair, 64);
     let hello = match tokio::time::timeout(
         Duration::from_millis(STARTUP_TIMEOUT_MS * 2),
         master_handshake(
@@ -94,7 +94,7 @@ pub async fn bind_executor(
             master_epoch,
             executor_id,
             &format!("local-{dispatch_id}"),
-            None,
+            session_token.as_deref(),
         ),
     )
     .await
@@ -163,7 +163,7 @@ pub async fn bind_executor(
 async fn executor_loop(
     dispatch_id: String,
     mut transport: FrameTransport,
-    mut child: tokio::process::Child,
+    mut child: flow_engine::process::ManagedChild,
     mut inbox: mpsc::Receiver<Message>,
     out: mpsc::Sender<Message>,
     cancel: CancellationToken,

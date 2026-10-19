@@ -1280,23 +1280,24 @@ impl TaskRunner {
             args.join(" ")
         ));
         let started = std::time::Instant::now();
-        let mut child =
-            match flow_engine::exec::harness_command(&command, &args, workdir.as_deref()).spawn() {
-                Ok(child) => child,
-                Err(error) => {
-                    logger.error(format!("harness 启动失败：{error}"));
-                    // 进程从未启动：结果确定。记录 Outcome 后按业务失败收口
-                    let outcome = StoredValue::inline(json!({"spawn_error": error.to_string()}))?;
-                    let outcome_seq = audit.push(
-                        "operation_outcome",
-                        json!({"outcome": serde_json::to_value(&outcome)?}),
-                    )?;
-                    audit.await_durable(outcome_seq, &self.cancel).await?;
-                    return Err(TaskError::Business(format!(
-                        "harness spawn failed: {error}"
-                    )));
-                }
-            };
+        let mut child = match flow_engine::process::ManagedChild::spawn_harness(
+            &mut flow_engine::exec::harness_command(&command, &args, workdir.as_deref()),
+        ) {
+            Ok(child) => child,
+            Err(error) => {
+                logger.error(format!("harness 启动失败：{error}"));
+                // 进程从未启动：结果确定。记录 Outcome 后按业务失败收口
+                let outcome = StoredValue::inline(json!({"spawn_error": error.to_string()}))?;
+                let outcome_seq = audit.push(
+                    "operation_outcome",
+                    json!({"outcome": serde_json::to_value(&outcome)?}),
+                )?;
+                audit.await_durable(outcome_seq, &self.cancel).await?;
+                return Err(TaskError::Business(format!(
+                    "harness spawn failed: {error}"
+                )));
+            }
+        };
         let output = capture_harness(
             &mut child,
             prompt.as_bytes(),
@@ -1589,7 +1590,7 @@ fn unused() {}
 
 /// Capture all three pipes concurrently under one deadline. Partial output is never success.
 async fn capture_harness(
-    child: &mut tokio::process::Child,
+    child: &mut flow_engine::process::ManagedChild,
     prompt: &[u8],
     timeout: Duration,
     cancel: &tokio_util::sync::CancellationToken,
@@ -1681,10 +1682,10 @@ mod harness_capture_tests {
         input: &[u8],
         timeout: Duration,
     ) -> Result<std::process::Output, TaskError> {
-        let mut child =
-            flow_engine::exec::harness_command("/bin/sh", &["-c".into(), script.into()], None)
-                .spawn()
-                .unwrap();
+        let mut child = flow_engine::process::ManagedChild::spawn_harness(
+            &mut flow_engine::exec::harness_command("/bin/sh", &["-c".into(), script.into()], None),
+        )
+        .unwrap();
         let result = capture_harness(
             &mut child,
             input,

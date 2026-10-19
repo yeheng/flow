@@ -7,6 +7,7 @@
 //!
 //! 子进程不得打开 store/journal；本模块不引入任何存储依赖。
 
+pub mod bootstrap;
 pub mod contract;
 pub mod fixtures;
 pub mod frame;

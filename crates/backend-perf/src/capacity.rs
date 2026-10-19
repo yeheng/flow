@@ -115,21 +115,77 @@ fn process(pid: i32) -> Value {
         json!({"pid":pid,"rss_bytes":null,"fds":null})
     }
 }
+#[cfg(target_os = "linux")]
+fn child_pids(pid: i32) -> std::io::Result<Vec<i32>> {
+    let mut pids = std::collections::BTreeSet::new();
+    // Children belong to the thread that spawned them, not necessarily the leader.
+    for thread in std::fs::read_dir(format!("/proc/{pid}/task"))? {
+        let path = thread?.path().join("children");
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        for raw in text.split_whitespace() {
+            pids.insert(
+                raw.parse()
+                    .map_err(|_| std::io::Error::other("invalid child PID"))?,
+            );
+        }
+    }
+    Ok(pids.into_iter().collect())
+}
+#[cfg(target_os = "macos")]
+fn child_pids(pid: i32) -> std::io::Result<Vec<i32>> {
+    unsafe {
+        let count = libc::proc_listchildpids(pid, std::ptr::null_mut(), 0);
+        if count < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut pids = vec![0i32; count as usize + 1024];
+        let n = libc::proc_listchildpids(
+            pid,
+            pids.as_mut_ptr().cast(),
+            std::mem::size_of_val(pids.as_slice()) as i32,
+        );
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(pids.into_iter().filter(|pid| *pid > 0).collect())
+    }
+}
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn child_pids(_: i32) -> std::io::Result<Vec<i32>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "process enumeration unavailable",
+    ))
+}
 fn resources() -> Value {
     let pid = std::process::id() as i32;
-    #[cfg(target_os = "macos")]
-    let children = unsafe {
-        let mut pids = vec![0i32; 1024];
-        let n = libc::proc_listchildpids(pid, pids.as_mut_ptr().cast(), (pids.len() * 4) as i32);
-        pids.into_iter()
-            .take(if n > 0 { 1024 } else { 0 })
-            .filter(|pid| *pid > 0)
-            .map(process)
-            .collect::<Vec<_>>()
-    };
-    #[cfg(not(target_os = "macos"))]
-    let children = Vec::<Value>::new();
-    json!({"master":process(pid),"children":children,"tokio_tasks":tokio::runtime::Handle::current().metrics().num_alive_tasks()})
+    let mut todo = vec![pid];
+    let mut seen = std::collections::BTreeSet::from([pid]);
+    let mut children = Vec::new();
+    let mut errors = Vec::new();
+    while let Some(parent) = todo.pop() {
+        match child_pids(parent) {
+            Ok(pids) => {
+                for child in pids {
+                    if seen.len() >= 4096 {
+                        errors.push("process count exceeds 4096".into());
+                        break;
+                    }
+                    if seen.insert(child) {
+                        children.push(process(child));
+                        todo.push(child);
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // process exited during sampling
+            Err(e) => errors.push(format!("pid {parent}: {e}")),
+        }
+    }
+    json!({"master":process(pid),"children":children,"children_collection":{"supported":cfg!(any(target_os="macos",target_os="linux")),"complete":errors.is_empty(),"errors":errors},"tokio_tasks":tokio::runtime::Handle::current().metrics().num_alive_tasks()})
 }
 fn scoped(
     kind: EventKind,
@@ -778,4 +834,19 @@ async fn storage_crash_probe(root: &Path, kind: &str) -> Result<Value> {
     Ok(
         json!({"storage":kind,"acknowledged":128,"recovered":recovered,"acknowledged_prefix_intact":true,"fault":"SIGKILL with next transaction unacknowledged/open","power_loss_tested":false}),
     )
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod resource_tests {
+    #[test]
+    fn sampling_includes_a_live_child() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 30"])
+            .spawn()
+            .unwrap();
+        let pids = super::child_pids(std::process::id() as i32);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(pids.unwrap().contains(&(child.id() as i32)));
+    }
 }

@@ -19,10 +19,11 @@
 
 use std::time::Duration;
 
+use crate::process::ManagedChild as Child;
 use interprocess::local_socket::tokio::Stream;
 use interprocess::local_socket::traits::tokio::{Listener as _, Stream as _};
 use interprocess::local_socket::ListenerOptions;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 
 use super::contract::{ExecutorInvocation, SESSION_TOKEN_ENV, STARTUP_TIMEOUT_MS};
 
@@ -110,7 +111,7 @@ async fn spawn_executor_loopback_at(
     }
     command.env(CONNECT_ADDR_ENV, addr);
     command.env(SESSION_TOKEN_ENV, &session_token);
-    let mut child = command.spawn()?;
+    let mut child = Child::spawn_executor(&mut command)?;
     // 单连接即整条会话；执行器起不来（缺二进制/秒退）时靠超时收口。
     let accept = async { listener.accept().await };
     let channel = tokio::time::timeout(Duration::from_millis(STARTUP_TIMEOUT_MS), accept).await;
@@ -118,10 +119,12 @@ async fn spawn_executor_loopback_at(
         Ok(Ok(stream)) => Ok((stream, child)),
         Ok(Err(error)) => {
             let _ = child.start_kill();
+            let _ = child.wait().await;
             Err(error)
         }
         Err(_) => {
             let _ = child.start_kill();
+            let _ = child.wait().await;
             Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "executor loopback connect timeout",

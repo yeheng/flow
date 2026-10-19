@@ -626,10 +626,7 @@ async fn tls_sni_is_configurable_and_verified() {
             let tcp = tokio::net::TcpStream::connect(&addr).await.unwrap();
             tokio::time::timeout(
                 Duration::from_secs(5),
-                connector.connect(
-                    rustls::pki_types::ServerName::try_from(name).unwrap(),
-                    tcp,
-                ),
+                connector.connect(rustls::pki_types::ServerName::try_from(name).unwrap(), tcp),
             )
             .await
             .map(|result| result.is_ok())

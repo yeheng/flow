@@ -151,7 +151,10 @@ async fn connect(
     let tcp = tokio::net::TcpStream::connect(&config.control_addr)
         .await
         .map_err(|e| format!("connect: {e}"))?;
-    let sni = config.sni.clone().unwrap_or_else(|| "flow-server".to_string());
+    let sni = config
+        .sni
+        .clone()
+        .unwrap_or_else(|| "flow-server".to_string());
     let stream = connector
         .connect(
             rustls::pki_types::ServerName::try_from(sni).map_err(|e| format!("sni: {e}"))?,

@@ -87,6 +87,8 @@ pub enum Ready {
 }
 
 /// 轮询到 `addr` 上能接受 TCP 连接**且 `child` 仍活着**为止。
+/// 这不证明监听器属于该 child；新服务进程必须使用 `spawn_reporting_ports`。
+/// 本助手只适用于调用者已经另行确认端口归属的场景。
 ///
 /// 「子进程还活着」是必要条件而非锦上添花：只判 TCP 可连时，若该端口已被
 /// 另一个用例的进程占着，我们会连上**那个**进程并把它的响应当成自己服务端的
@@ -331,10 +333,11 @@ pub fn spawn_reporting_ports(
 
     match rx.recv_timeout(READY_TIMEOUT) {
         Ok(ports) if ports.rpc.port() != 0 && ports.http.port() != 0 => Ok((child, ports)),
-        Ok(_) | Err(_) => Err(format!(
-            "被测进程未在 {READY_TIMEOUT:?} 内报出实际端口\
-             （期望日志含 {RPC_MARKER} 与 {HTTP_MARKER}）"
-        )),
+        Ok(_) | Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(format!("被测进程未在 {READY_TIMEOUT:?} 内报出实际端口（期望日志含 {RPC_MARKER} 与 {HTTP_MARKER}）"))
+        }
     }
 }
 

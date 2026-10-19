@@ -167,6 +167,14 @@ fn less(a: &Value, b: &Value) -> bool {
     }
 }
 
+fn bounds(s: &Value, n: u64, min: &str, max: &str, path: &str) -> Result<(), String> {
+    if s[min].as_u64().is_some_and(|b| n < b) || s[max].as_u64().is_some_and(|b| n > b) {
+        Err(format!("{path}: size outside bounds"))
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,12 +205,5 @@ mod tests {
             &json!(9_007_199_254_740_993u64)
         )
         .is_err());
-    }
-}
-fn bounds(s: &Value, n: u64, min: &str, max: &str, path: &str) -> Result<(), String> {
-    if s[min].as_u64().is_some_and(|b| n < b) || s[max].as_u64().is_some_and(|b| n > b) {
-        Err(format!("{path}: size outside bounds"))
-    } else {
-        Ok(())
     }
 }

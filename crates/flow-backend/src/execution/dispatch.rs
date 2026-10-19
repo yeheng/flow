@@ -122,19 +122,30 @@ pub mod fault {
     use std::sync::OnceLock;
     use tokio::sync::watch;
 
-    static REGISTRY: OnceLock<std::sync::Mutex<HashMap<String, watch::Receiver<bool>>>> =
-        OnceLock::new();
+    #[derive(Clone)]
+    struct Gate {
+        hold: watch::Receiver<bool>,
+        reached: watch::Sender<bool>,
+    }
+    static REGISTRY: OnceLock<std::sync::Mutex<HashMap<String, Gate>>> = OnceLock::new();
 
     /// 注册检查点（初始 hold=true：到达即暂停，直至发送端置 false 释放）。
     /// 返回各检查点的发送端；重复注册同名点以最后一次为准。
     pub fn register(points: &[&str]) -> HashMap<String, watch::Sender<bool>> {
-        let registry = REGISTRY
-            .get_or_init(|| std::sync::Mutex::new(HashMap::<String, watch::Receiver<bool>>::new()));
+        let registry =
+            REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::<String, Gate>::new()));
         let mut guard = registry.lock().unwrap_or_else(|poison| poison.into_inner());
         let mut senders = HashMap::new();
         for point in points {
             let (sender, receiver) = watch::channel(true);
-            guard.insert((*point).to_string(), receiver);
+            let (reached, _) = watch::channel(false);
+            guard.insert(
+                (*point).to_string(),
+                Gate {
+                    hold: receiver,
+                    reached,
+                },
+            );
             senders.insert((*point).to_string(), sender);
         }
         senders
@@ -151,6 +162,29 @@ pub mod fault {
         }
     }
 
+    /// Wait for an actual checkpoint arrival, rather than guessing from elapsed time.
+    pub async fn wait_reached(name: &str) {
+        let mut reached = REGISTRY
+            .get()
+            .expect("registered gate")
+            .lock()
+            .unwrap()
+            .get(name)
+            .expect("registered gate")
+            .reached
+            .subscribe();
+        reached
+            .wait_for(|value| *value)
+            .await
+            .expect("gate sender retained");
+    }
+
+    /// A node-scoped gate does not accidentally stop a predecessor's receipt.
+    pub async fn checkpoint_for(name: &str, node: &str) {
+        checkpoint(&format!("{name}:{node}")).await;
+        checkpoint(name).await;
+    }
+
     /// 到达检查点：未注册/已释放立即返回；hold 中则确定性等待释放。
     pub async fn checkpoint(name: &str) {
         let Some(registry) = REGISTRY.get() else {
@@ -163,9 +197,10 @@ pub mod fault {
                 .get(name)
                 .cloned()
         };
-        if let Some(mut receiver) = receiver {
+        if let Some(mut gate) = receiver {
+            gate.reached.send_replace(true);
             tracing::debug!(name, "fault checkpoint holding");
-            let _ = receiver.wait_for(|hold| !hold).await;
+            let _ = gate.hold.wait_for(|hold| !hold).await;
         }
     }
 }
@@ -174,6 +209,7 @@ pub mod fault {
 #[cfg(not(any(test, feature = "fault-injection")))]
 pub mod fault {
     pub async fn checkpoint(_name: &str) {}
+    pub async fn checkpoint_for(_name: &str, _node: &str) {}
 }
 
 const OPERATION_TRANSFER_LIMIT: u64 = 8 * 1024 * 1024;
@@ -967,7 +1003,7 @@ impl DispatchRunner {
             }
         }
         // 结果已提交：回执使执行器释放槽位（重复派发返回原提交）。
-        fault::checkpoint("result_committed:before").await;
+        fault::checkpoint_for("result_committed:before", &self.attempt.node_id).await;
         let _ = link
             .commands
             .send(ToSession::Send(Box::new(Message::ResultCommitted {
@@ -975,7 +1011,7 @@ impl DispatchRunner {
                 result_id,
             })))
             .await;
-        fault::checkpoint("result_committed:after").await;
+        fault::checkpoint_for("result_committed:after", &self.attempt.node_id).await;
         Ok(())
     }
 
@@ -1024,6 +1060,28 @@ impl DispatchRunner {
             prepared.input.clone()
         };
         let backend = self.attempt.backend.clone();
+        let frozen = backend
+            .inspect(|state| {
+                child_definition(state, &run, workflow_id, &self.attempt.node_id).cloned()
+            })
+            .await?;
+        let definition = backend
+            .cached_definition(
+                &format!("child:{workflow_id}@{}:{}", frozen.version, frozen.checksum),
+                &frozen.definition,
+            )
+            .await?;
+        if definition.input_schema.is_some() {
+            let root = backend.journal.root().to_path_buf();
+            let upper = backend.journal.durable_lsn();
+            let value = input.clone();
+            let actual = tokio::task::spawn_blocking(move || {
+                flow_journal::value::materialize(&root, upper, &value, 8 * 1024 * 1024)
+            })
+            .await
+            .map_err(|e| invalid(e.to_string()))??;
+            crate::journal_commands::validate_run_input(&definition, &actual)?;
+        }
         let run_id = self.attempt.run_id.clone();
         let node_id = self.attempt.node_id.clone();
         let dispatch_id = self.attempt.dispatch_id.clone();
@@ -1049,16 +1107,10 @@ impl DispatchRunner {
                         crate::journal::R_MAX
                     )));
                 }
-                let definition = if let Some(execution) = &parent.execution {
-                    let binding = format!("{}@{}/{}", parent.workflow_id, parent.workflow_version, node_id);
-                    let key = execution.bindings.get(&binding).ok_or_else(|| fj("child dependency not pinned"))?;
-                    if !key.starts_with(&format!("{workflow_id}@")) { return Err(fj("child differs from pinned dependency")); }
-                    execution.definitions.get(key).ok_or_else(|| fj("pinned child definition missing"))?
-                } else {
-                    state.workflows.get(&workflow_id)
-                        .and_then(|w| w.versions.values().rev().find(|v| v.published))
-                        .ok_or_else(|| fj("child published definition missing"))?
-                };
+                let definition = child_definition(state, parent, &workflow_id, &node_id)?;
+                if definition.version != frozen.version || definition.checksum != frozen.checksum {
+                    return Err(flow_journal::Error::Conflict("child definition changed before registration".into()));
+                }
                 let child_id = crate::journal_commands::id();
                 let child = flow_engine::journal_state::Run {
                     run_id: child_id.clone(),
@@ -1260,16 +1312,42 @@ impl DispatchRunner {
                     .as_str()
                     .and_then(flow_engine::secrets::get_secret)
                     .filter(|v| !v.is_empty());
-                let _ = link
+                // Reserve capacity before taking the decision lock. Enqueue under
+                // that same lock: a cancellation committed before this point must
+                // prevent delivery, not merely stop a later scheduling tick.
+                let permit = link
                     .commands
-                    .send(ToSession::Send(Box::new(Message::OperationPermit {
-                        dispatch_id: self.attempt.dispatch_id.clone(),
-                        operation_id,
-                        permit_id: operation.permit_id.clone(),
-                        request_fingerprint,
-                        credential,
-                    })))
-                    .await;
+                    .clone()
+                    .reserve_owned()
+                    .await
+                    .map_err(|_| invalid("operation permit session closed"))?;
+                self.attempt
+                    .backend
+                    .internal_for_run(&self.attempt.run_id, |state| {
+                        let run = state
+                            .runs
+                            .get(&self.attempt.run_id)
+                            .ok_or_else(|| fj("run missing"))?;
+                        let node = &run.nodes[&self.attempt.node_id];
+                        if run.terminal()
+                            || node.dispatch_id != self.attempt.dispatch_id
+                            || node
+                                .operation
+                                .as_ref()
+                                .is_none_or(|op| op.permit_id != operation.permit_id)
+                        {
+                            return Err(fj("operation cancelled/stale before permit delivery"));
+                        }
+                        permit.send(ToSession::Send(Box::new(Message::OperationPermit {
+                            dispatch_id: self.attempt.dispatch_id.clone(),
+                            operation_id,
+                            permit_id: operation.permit_id.clone(),
+                            request_fingerprint,
+                            credential,
+                        })));
+                        Ok((vec![], ()))
+                    })
+                    .await?;
                 fault::checkpoint("permit_send:after").await;
                 Ok(())
             }
@@ -1507,6 +1585,37 @@ fn stream_of(stream: &str) -> flow_engine::log_types::LogStream {
         "engine" => flow_engine::log_types::LogStream::Engine,
         _ => flow_engine::log_types::LogStream::Stdout,
     }
+}
+
+fn child_definition<'a>(
+    state: &'a flow_engine::journal_state::State,
+    parent: &'a Run,
+    workflow_id: &str,
+    node_id: &str,
+) -> flow_journal::Result<&'a flow_engine::journal_state::DefinitionVersion> {
+    Ok(if let Some(execution) = &parent.execution {
+        let binding = format!(
+            "{}@{}/{}",
+            parent.workflow_id, parent.workflow_version, node_id
+        );
+        let key = execution
+            .bindings
+            .get(&binding)
+            .ok_or_else(|| fj("child dependency not pinned"))?;
+        if !key.starts_with(&format!("{workflow_id}@")) {
+            return Err(fj("child differs from pinned dependency"));
+        }
+        execution
+            .definitions
+            .get(key)
+            .ok_or_else(|| fj("pinned child definition missing"))?
+    } else {
+        state
+            .workflows
+            .get(workflow_id)
+            .and_then(|w| w.versions.values().rev().find(|v| v.published))
+            .ok_or_else(|| fj("child published definition missing"))?
+    })
 }
 
 #[cfg(test)]

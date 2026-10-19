@@ -13,6 +13,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+static SCENARIO: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn reached(point: &str) {
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        flow_backend::execution::dispatch::fault::wait_reached(point),
+    )
+    .await
+    .expect("target fault checkpoint reached");
+}
+
 fn temp() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("flow-fault-{}", uuid::Uuid::now_v7()))
 }
@@ -198,6 +209,7 @@ async fn open_backend(
 /// （未持久化不得 HTTP），run 不得 Succeeded。
 #[tokio::test]
 async fn matrix_disconnect_before_auth_persist_blocks_http() {
+    let _scenario = SCENARIO.lock().await;
     flow_backend::execution::dispatch::fault::clear();
     let root = temp();
     std::fs::create_dir_all(&root).unwrap();
@@ -221,7 +233,7 @@ async fn matrix_disconnect_before_auth_persist_blocks_http() {
         .unwrap();
     let run_id = created.result["run_id"].as_str().unwrap().to_string();
     // 等执行器到达授权检查点（确定性：检查点 hold 住请求处理）。
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    reached("auth_persist:before").await;
     // 断线（杀 agent 会话）后释放检查点，并主动取消 run（不依赖
     // 120s durable-wait 超时走到终态）。
     shutdown.cancel();
@@ -247,6 +259,7 @@ async fn matrix_disconnect_before_auth_persist_blocks_http() {
 /// 外部调用不发生、run 取消且授权事实保留（不透明重跑）。
 #[tokio::test]
 async fn matrix_cancel_between_persist_and_permit_keeps_http_zero() {
+    let _scenario = SCENARIO.lock().await;
     flow_backend::execution::dispatch::fault::clear();
     let root = temp();
     std::fs::create_dir_all(&root).unwrap();
@@ -270,7 +283,7 @@ async fn matrix_cancel_between_persist_and_permit_keeps_http_zero() {
         .unwrap();
     let run_id = created.result["run_id"].as_str().unwrap().to_string();
     // 等待到达 permit 发送前（授权已持久化）。
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    reached("permit_send:before").await;
     backend.run_cancel(&run_id, None).await.unwrap();
     gates
         .get_mut("permit_send:before")
@@ -289,9 +302,10 @@ async fn matrix_cancel_between_persist_and_permit_keeps_http_zero() {
 }
 
 /// 场景 C（T09 矩阵）：ResultCommitted 发送**前**断线 → 外部调用恰好一次
-/// （无重复），run 不因断线而误 Succeeded；权威事实只由持久回执推进。
+/// （无重复），已持久结果不因确认丢失而撤销。
 #[tokio::test]
 async fn matrix_disconnect_before_result_committed_no_duplicate_side_effect() {
+    let _scenario = SCENARIO.lock().await;
     flow_backend::execution::dispatch::fault::clear();
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -311,9 +325,9 @@ async fn matrix_disconnect_before_result_committed_no_duplicate_side_effect() {
     let flow = install(&backend, http_flow(&url)).await;
 
     let mut gates =
-        flow_backend::execution::dispatch::fault::register(&["result_committed:before"]);
+        flow_backend::execution::dispatch::fault::register(&["result_committed:before:n"]);
     gates
-        .get_mut("result_committed:before")
+        .get_mut("result_committed:before:n")
         .unwrap()
         .send_replace(true);
 
@@ -340,20 +354,24 @@ async fn matrix_disconnect_before_result_committed_no_duplicate_side_effect() {
             .map(|(id, node)| (id.clone(), node.status, node.error.clone()))
             .collect::<Vec<_>>()
     );
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    reached("result_committed:before:n").await;
     shutdown.cancel();
     gates
-        .get_mut("result_committed:before")
+        .get_mut("result_committed:before:n")
         .unwrap()
         .send_replace(false);
-    let run = until(&backend, &run_id, Run::terminal).await;
-    // 断线于回执前：run 不得 Succeeded（权威成功只由持久路径推进），
-    // 且外部副作用恰好一次（不得重跑）。
-    assert_ne!(
-        run.status,
-        RunStatus::Succeeded,
-        "receipt lost at link death must not report success"
+    let run = until(&backend, &run_id, |r| {
+        r.nodes
+            .get("n")
+            .is_some_and(|n| n.status == flow_engine::journal_state::NodeStatus::Succeeded)
+    })
+    .await;
+    assert!(
+        run.nodes["n"].operation.as_ref().unwrap().outcome.is_some(),
+        "committed external outcome survives lost ResultCommitted"
     );
+    // The result precedes the acknowledgement. The run may already have
+    // succeeded, or later nodes may need recovery; neither revokes this result.
     assert_eq!(
         counter.load(Ordering::SeqCst),
         1,
@@ -361,5 +379,10 @@ async fn matrix_disconnect_before_result_committed_no_duplicate_side_effect() {
     );
     manager.shutdown().await;
     backend.close().await.unwrap();
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "cleanup must not repeat the external call"
+    );
     std::fs::remove_dir_all(root).unwrap();
 }

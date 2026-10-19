@@ -27,6 +27,9 @@ pub struct Cli {
     /// 打印服务端返回的原始 JSON（2 空格缩进），供 jq 等工具消费
     #[arg(long, global = true)]
     json: bool,
+    /// Stable identity for writes; reuse it with identical arguments after a lost reply.
+    #[arg(long, global = true, value_parser = parse_request_id)]
+    request_id: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -161,7 +164,11 @@ pub enum RunCommand {
 pub async fn run_from_args(argv: &[String]) -> i32 {
     // parse_from 的首元素是程序名占位：`flow-cli` 是展示名，实际参数从 argv 起。
     let cli = Cli::parse_from(std::iter::once("flow-cli".to_string()).chain(argv.iter().cloned()));
-    match dispatch(cli).await {
+    let request_id = cli.request_id.clone();
+    match crate::journal::REQUEST_ID
+        .scope(request_id, dispatch(cli))
+        .await
+    {
         Ok(()) => 0,
         Err(err) => {
             eprintln!("error: {err}");
@@ -179,4 +186,11 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
         }
         Command::Run { command } => crate::run::dispatch(&client, cli.json, command).await,
     }
+}
+
+fn parse_request_id(value: &str) -> Result<String, String> {
+    if value.is_empty() || value.len() > 128 {
+        return Err("request_id must contain 1..=128 bytes".into());
+    }
+    Ok(value.into())
 }

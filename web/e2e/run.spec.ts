@@ -98,23 +98,18 @@ test("可观察性：Journal 观测日志与节点检查器展示输入面/输�
   await expect(inspector).toContainText("输出");
   await expect(inspector).toContainText("ok");
 
-  // 真实 /journal 客户端以原生 V2 格式订阅，并显示独立观测日志。
+  // 真实 /journal 客户端直连隔离的 journal 工作区：审计面展示独立观测日志。
   await page.goto("/journal");
   const inputs = page.locator(".connect-bar input");
   await inputs.nth(0).fill("ws://127.0.0.1:19311");
   await inputs.nth(1).fill("http://127.0.0.1:19312");
   await inputs.nth(2).fill(E2E_TOKEN);
   await page.getByRole("button", { name: "连接", exact: true }).click();
-  const journalName = uniq("e2e-Journal回执");
-  await page.getByPlaceholder("新工作流名称").fill(journalName);
-  await page.getByRole("button", { name: "新建", exact: true }).click();
-  await expect(page.locator(".journal-status")).toHaveText("已提交并可见");
-  await expect(page.locator(".journal-side select option:checked")).toHaveText(journalName);
   // 复制单元格是 <button class="copy-id" :title="run_id">（a11y 按钮化后 title 在按钮上）
   const runRow = page
     .locator("tr")
     .filter({ has: page.locator(`button.copy-id[title="${runId}"]`) });
-  await runRow.getByRole("button", { name: "监控", exact: true }).click();
+  await runRow.getByRole("button", { name: "查看", exact: true }).click();
   const observations = page.locator(".journal-detail .journal-log").last();
   await expect(observations).toContainText("hello e2e");
   await expect(observations).toContainText("boom e2e");
