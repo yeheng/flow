@@ -36,10 +36,10 @@ pub fn verify(root: &Path) -> Result<Recovery> {
         return Err(invalid("SQLite foreign key violation"));
     }
     let (identity, upper) = crate::sqlite::metadata(&conn)?;
-    let count: u64 = conn
+    let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0))
         .map_err(crate::sqlite::db)?;
-    if count != upper {
+    if count != upper as i64 {
         return Err(invalid("SQLite fact count and commit watermark mismatch"));
     }
     let mut report = Recovery {

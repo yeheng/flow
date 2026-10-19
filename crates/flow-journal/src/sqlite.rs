@@ -166,13 +166,16 @@ pub fn transaction_with_size(
     identity: &str,
     lsn: u64,
 ) -> Result<(Transaction, u64)> {
-    let (tx_id, count, digest, recorded_bytes): (String, usize, String, u64) = conn
+    let (tx_id, count, digest, recorded_bytes): (String, i64, String, i64) = conn
         .query_row(
             "SELECT tx_id,event_count,digest,bytes FROM transactions WHERE lsn=?",
             [format!("{lsn:020}")],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .map_err(db)?;
+    // rusqlite 0.38 dropped u64/usize FromSql/ToSql; SQLite integers are i64.
+    let count: usize = usize::try_from(count).map_err(|_| invalid("invalid stored transaction metadata"))?;
+    let recorded_bytes = u64::try_from(recorded_bytes).map_err(|_| invalid("invalid stored transaction metadata"))?;
     let mut statement = conn
         .prepare("SELECT event_index,body,run_id,dispatch_id,run_event,audit_event FROM events WHERE lsn=? ORDER BY event_index")
         .map_err(db)?;
@@ -180,10 +183,10 @@ pub fn transaction_with_size(
     let mut events = Vec::new();
     let mut bytes = 0usize;
     while let Some(row) = rows.next().map_err(db)? {
-        let index: usize = row.get(0).map_err(db)?;
+        let index: i64 = row.get(0).map_err(db)?;
         let body: String = row.get(1).map_err(db)?;
         bytes = bytes.saturating_add(body.len());
-        if index != events.len() || bytes > crate::MAX_LINE_BYTES {
+        if index != events.len() as i64 || bytes > crate::MAX_LINE_BYTES {
             return Err(invalid("invalid stored transaction size/sequence"));
         }
         let mut event: Event = serde_json::from_str(&body)?;
@@ -199,13 +202,15 @@ pub fn transaction_with_size(
             return Err(invalid("accepted event index identity mismatch"));
         }
         if event.kind == EventKind::ValueChunk {
-            let (output, indexed_chunk, raw, hash): (String, u64, Vec<u8>, String) = conn
+            let (output, indexed_chunk, raw, hash): (String, i64, Vec<u8>, String) = conn
                 .query_row(
                     "SELECT output_id,chunk_index,bytes,digest FROM value_chunks WHERE lsn=? AND event_index=?",
                     params![format!("{lsn:020}"), index],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
                 .map_err(db)?;
+            let indexed_chunk = u64::try_from(indexed_chunk)
+                .map_err(|_| invalid("invalid stored chunk index"))?;
             if Some(output.as_str()) != event.payload["output_id"].as_str()
                 || Some(indexed_chunk)
                     != event.payload["chunk_index"]
@@ -381,7 +386,7 @@ impl Disk {
                 params![
                     format!("{:020}", tx.lsn),
                     tx.tx_id,
-                    tx.events.len(),
+                    tx.events.len() as i64,
                     digest,
                     bytes as i64
                 ],
@@ -405,7 +410,7 @@ impl Disk {
                     "INSERT INTO events VALUES(?,?,?,?,?,?,?)",
                     params![
                         format!("{:020}", tx.lsn),
-                        index,
+                        index as i64,
                         event.run_id,
                         event.dispatch_id,
                         event.run_seq > 0,
@@ -420,9 +425,9 @@ impl Disk {
                         "INSERT INTO value_chunks VALUES(?,?,?,?,?,?)",
                         params![
                             chunk.output_id,
-                            chunk.chunk_index,
+                            chunk.chunk_index as i64,
                             format!("{:020}", tx.lsn),
-                            index,
+                            index as i64,
                             raw,
                             codec::digest(&raw)
                         ],
@@ -471,7 +476,7 @@ impl Disk {
             let chunk: Chunk = serde_json::from_value(event.payload.clone())
                 .map_err(|e| invalid(format!("malformed value chunk payload: {e}")))?;
             chunk.decode()?;
-            let (count, total): (u64, u64) = self
+            let (count, total): (i64, i64) = self
                 .conn
                 .query_row(
                     "SELECT COUNT(*),COALESCE(SUM(length(bytes)),0) FROM value_chunks WHERE output_id=?",
@@ -479,6 +484,7 @@ impl Disk {
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .map_err(db)?;
+            let (count, total) = (count as u64, total as u64);
             if chunk.chunk_index.checked_add(1) != Some(count) || total > MAX_VALUE_BYTES {
                 return Err(invalid("value chunk gap/duplicate/limit"));
             }
@@ -490,7 +496,7 @@ impl Disk {
         if value.journal_id != self.id {
             return Err(invalid("published value belongs to another journal"));
         }
-        let (count, total): (u64, u64) = self
+        let (count, total): (i64, i64) = self
             .conn
             .query_row(
                 "SELECT COUNT(*),COALESCE(SUM(length(bytes)),0) FROM value_chunks WHERE output_id=?",
@@ -498,6 +504,7 @@ impl Disk {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .map_err(db)?;
+        let (count, total) = (count as u64, total as u64);
         if value.chunk_count != count || value.total_bytes != total {
             return Err(invalid("publication requires complete matching chunks"));
         }
@@ -509,9 +516,9 @@ impl Disk {
             )
             .map_err(db)?;
         let mut rows = statement.query([id]).map_err(db)?;
-        let mut expected = 0u64;
+        let mut expected = 0i64;
         while let Some(row) = rows.next().map_err(db)? {
-            let index: u64 = row.get(0).map_err(db)?;
+            let index: i64 = row.get(0).map_err(db)?;
             let bytes: Vec<u8> = row.get(1).map_err(db)?;
             if index != expected {
                 return Err(invalid("non-contiguous stored value chunk"));

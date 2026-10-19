@@ -49,6 +49,7 @@ fn generate_pki_named(
     let ca_key = KeyPair::generate().unwrap();
     let mut ca_params = CertificateParams::new(vec![]).unwrap();
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
     let ca_cert = ca_params.self_signed(&ca_key).unwrap();
 
     let server_key = KeyPair::generate().unwrap();
@@ -58,7 +59,7 @@ fn generate_pki_named(
         rcgen::DnValue::Utf8String(server_name.into()),
     );
     let server_cert = server_params
-        .signed_by(&server_key, &ca_cert, &ca_key)
+        .signed_by(&server_key, &ca_issuer)
         .unwrap();
 
     let agent_key = KeyPair::generate().unwrap();
@@ -68,7 +69,7 @@ fn generate_pki_named(
         rcgen::DnValue::Utf8String(agent_cn.into()),
     );
     let agent_cert = agent_params
-        .signed_by(&agent_key, &ca_cert, &ca_key)
+        .signed_by(&agent_key, &ca_issuer)
         .unwrap();
 
     let write = |name: &str, content: String| {

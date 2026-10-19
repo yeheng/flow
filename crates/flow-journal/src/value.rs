@@ -253,10 +253,10 @@ pub fn read_value(
         ])
         .map_err(crate::sqlite::db)?;
     while let Some(row) = rows.next().map_err(crate::sqlite::db)? {
-        let chunk_index: u64 = row.get(0).map_err(crate::sqlite::db)?;
+        let chunk_index: i64 = row.get(0).map_err(crate::sqlite::db)?;
         let bytes: Vec<u8> = row.get(1).map_err(crate::sqlite::db)?;
         let digest: String = row.get(2).map_err(crate::sqlite::db)?;
-        if chunk_index != index
+        if chunk_index != index as i64
             || bytes.is_empty()
             || bytes.len() > CHUNK_BYTES
             || crate::codec::digest(&bytes) != digest
