@@ -96,7 +96,7 @@ onBeforeUnmount(() => {
   <main class="cluster-page">
     <header>
       <div>
-        <h1>Journal 节点管理</h1>
+        <h1>集群节点</h1>
         <p>各节点独立保存 journal，PG 管理注册、归属、租约和同步进度。</p>
       </div>
       <AppButton :disabled="busy" @click="refresh()">{{ busy ? "刷新中…" : "刷新" }}</AppButton>

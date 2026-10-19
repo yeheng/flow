@@ -6,6 +6,9 @@
  */
 
 :root {
+  /* 自绘暗色主题：声明 color-scheme，让滚动条/checkbox/select 等原生控件
+   * 在浅色 OS 下也按暗色渲染，避免与自绘 UI 割裂 */
+  color-scheme: dark;
   --bg: #0f0f11;
   --surface: #18181c;
   --surface2: #222228;
@@ -84,11 +87,9 @@ aside.left {
 
 h3 {
   margin: 0 0 8px;
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 600;
-  letter-spacing: 0.1em;
-  color: var(--text3);
-  text-transform: uppercase;
+  color: var(--text2);
 }
 
 button {
@@ -347,7 +348,8 @@ input.code {
 .field-help {
   margin-top: 3px;
   color: var(--text3);
-  font-size: 11px;
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .field-error {

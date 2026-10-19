@@ -39,6 +39,16 @@ const capacity = computed(() => {
   return { active, warn: active >= RUN_CAP * 0.8 };
 });
 
+/** 零数据首屏：给引导，而不是先展示 0/— 与运维口径 */
+const firstRun = computed(
+  () => loaded.value && !error.value && stats.value.total === 0 && editor.workflows.length === 0,
+);
+
+const capacityTitle = computed(
+  () =>
+    `非终态上限 ${RUN_CAP}（平台上限，加执行节点不提高）；在飞派发上限 ${DISPATCH_CAP}。口径见 OPS.md`,
+);
+
 function fmtTime(iso: string): string {
   const d = new Date(iso);
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
@@ -104,6 +114,18 @@ onUnmounted(() => {
       <AppButton @click="refresh()">重试</AppButton>
     </div>
 
+    <section v-if="firstRun" class="first-run">
+      <h3>从这里开始</h3>
+      <p>
+        Flow 把流程编排成可发布的 DAG：编辑画布 → 发布 → 运行，在运行详情看节点、日志与输入输出；
+        外部操作结果不明时会挂起等你裁决。
+      </p>
+      <div class="first-run-actions">
+        <RouterLink class="link first-run-cta" to="/workflows">新建或导入工作流</RouterLink>
+        <span class="muted">从左侧「工作流」进入，点「新建」即可开始。</span>
+      </div>
+    </section>
+
     <div class="cards">
       <div class="card">
         <div class="card-value">{{ editor.workflows.length }}</div>
@@ -123,10 +145,9 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <p class="capacity" :class="{ warn: capacity.warn }">
-      非终态 {{ capacity.active }} / {{ RUN_CAP }}（平台上限，加执行节点不提高）
+    <p v-if="!firstRun" class="capacity" :class="{ warn: capacity.warn }" :title="capacityTitle">
+      非终态 {{ capacity.active }} / {{ RUN_CAP }}
       <span class="capacity-sub">· 在飞派发上限 {{ DISPATCH_CAP }}</span>
-      <span class="capacity-src">数值口径来自 OPS.md / 服务端常量</span>
     </p>
 
     <section class="section">
@@ -215,9 +236,39 @@ onUnmounted(() => {
 
 .cards {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   gap: 12px;
   margin-bottom: 24px;
+}
+
+.first-run {
+  margin-bottom: 20px;
+  padding: 16px 18px;
+  border: 1px solid var(--border2);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.first-run h3 {
+  margin: 0 0 6px;
+}
+
+.first-run p {
+  margin: 0 0 10px;
+  color: var(--text2);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.first-run-actions {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.first-run-cta {
+  font-weight: 600;
 }
 
 .card {

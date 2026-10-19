@@ -1,26 +1,35 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mount } from "@vue/test-utils";
 import { flushPromises } from "@vue/test-utils";
-import CanvasContextMenu, { type MenuEntry } from "./CanvasContextMenu.vue";
+import CanvasContextMenu, { type MenuEntry, type MenuPayload } from "./CanvasContextMenu.vue";
+import { closeAllOverlays, openOverlay, overlaysOf, type OverlayEntry } from "../state/overlays";
 
 /** 从 window 派发键盘事件：菜单监听挂 window（capture），任何焦点位置都收得到 */
 function key(k: string): void {
   window.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true, cancelable: true }));
 }
 
+/** 打开菜单 = 压一条 context-menu 栈条目（FlowCanvas 的做法），再渲染该条目 */
 function mountMenu(entries: MenuEntry[]) {
-  return mount(CanvasContextMenu, { props: { x: 20, y: 20, entries }, attachTo: document.body });
+  const entry = openOverlay<MenuPayload>("context-menu", { x: 20, y: 20, entries });
+  const w = mount(CanvasContextMenu, { props: { entry }, attachTo: document.body });
+  return { w, entry };
+}
+
+function isOpen(entry: OverlayEntry<MenuPayload>): boolean {
+  return overlaysOf("context-menu").some((e) => e.id === entry.id);
 }
 
 afterEach(() => {
   document.body.innerHTML = "";
+  closeAllOverlays();
 });
 
 describe("CanvasContextMenu：键盘可达（role=menu/menuitem）", () => {
-  it("打开即聚焦首项；Enter 触发该项动作并关闭", () => {
+  it("打开即聚焦首项；Enter 触发该项动作并关闭条目", () => {
     const edit = vi.fn();
     const copy = vi.fn();
-    const w = mountMenu([
+    const { w, entry } = mountMenu([
       { key: "edit", label: "编辑参数", action: edit },
       { key: "copy", label: "复制", action: copy },
       { key: "sep" },
@@ -33,14 +42,14 @@ describe("CanvasContextMenu：键盘可达（role=menu/menuitem）", () => {
     key("Enter");
     expect(edit).toHaveBeenCalledTimes(1);
     expect(copy).not.toHaveBeenCalled();
-    expect(w.emitted("close")).toHaveLength(1);
+    expect(isOpen(entry)).toBe(false);
     w.unmount();
   });
 
   it("Space 触发当前项；方向键上下移动焦点并回绕", () => {
     const first = vi.fn();
     const last = vi.fn();
-    const w = mountMenu([
+    const { w, entry } = mountMenu([
       { key: "a", label: "A", action: first },
       { key: "b", label: "B", action: vi.fn() },
       { key: "c", label: "C", action: last },
@@ -58,20 +67,13 @@ describe("CanvasContextMenu：键盘可达（role=menu/menuitem）", () => {
 
     key(" ");
     expect(last).toHaveBeenCalledTimes(1);
-    expect(w.emitted("close")).toHaveLength(1);
-    w.unmount();
-  });
-
-  it("Esc 关闭菜单", () => {
-    const w = mountMenu([{ key: "a", label: "A", action: vi.fn() }]);
-    key("Escape");
-    expect(w.emitted("close")).toHaveLength(1);
+    expect(isOpen(entry)).toBe(false);
     w.unmount();
   });
 
   it("menuitem 带漫游 tabindex；禁用项不聚焦不触发", () => {
     const del = vi.fn();
-    const w = mountMenu([
+    const { w } = mountMenu([
       { key: "del", label: "删除", action: del, disabled: true },
       { key: "copy", label: "复制", action: vi.fn() },
     ]);
@@ -88,7 +90,7 @@ describe("CanvasContextMenu：键盘可达（role=menu/menuitem）", () => {
 
   it("Enter 展开子菜单并聚焦首项，再 Enter 执行子项动作", async () => {
     const addLlm = vi.fn();
-    const w = mountMenu([
+    const { w, entry } = mountMenu([
       {
         key: "add",
         label: "添加节点",
@@ -111,7 +113,29 @@ describe("CanvasContextMenu：键盘可达（role=menu/menuitem）", () => {
 
     key("Enter"); // 子项：执行动作并关闭
     expect(addLlm).toHaveBeenCalledTimes(1);
-    expect(w.emitted("close")).toHaveLength(1);
+    expect(isOpen(entry)).toBe(false);
+    w.unmount();
+  });
+});
+
+describe("CanvasContextMenu：Esc 归全局弹层栈", () => {
+  it("Esc 关菜单（host 关栈顶，菜单自身不监听 Escape）", () => {
+    const { w, entry } = mountMenu([{ key: "a", label: "A", action: vi.fn() }]);
+    key("Escape");
+    expect(isOpen(entry)).toBe(false);
+    w.unmount();
+  });
+
+  it("Esc 叠层只关一层：菜单压在参数弹层上时先关菜单", () => {
+    const params = openOverlay("params", { nodeId: "n1" });
+    const { w, entry } = mountMenu([{ key: "a", label: "A", action: vi.fn() }]);
+
+    key("Escape");
+    expect(isOpen(entry)).toBe(false); // 只关栈顶
+    expect(overlaysOf("params").map((e) => e.id)).toEqual([params.id]);
+
+    key("Escape");
+    expect(overlaysOf("params")).toEqual([]);
     w.unmount();
   });
 });

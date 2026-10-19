@@ -5,6 +5,7 @@ import type { AdjudicateDecision, LogLine, ObservationLoss, TimelineNode } from 
 import { editor } from "./editor";
 import { TERMINAL_RUN_STATUSES } from "./labels";
 import { appendObservations, mergeObservationLoss } from "./monitor-logic";
+import { staleGuard } from "./stale";
 import { toast } from "./toast";
 
 export const monitor = reactive({
@@ -39,6 +40,11 @@ export const monitor = reactive({
     storage_dropped: 0,
     history_incomplete: false,
   } as ObservationLoss,
+  /**
+   * run.timeline 拉取失败（大 run 超物化预算 / 服务端错误）：时间线不可用，
+   * 停止对 timeline 的 250ms 重试（否则必失败的请求风暴），观测与原始事件仍可看。
+   */
+  timelineUnavailable: false,
   starting: false,
   /** 取消/交付信号/裁决进行中（按钮禁用，防重复点击） */
   cancelling: false,
@@ -92,12 +98,12 @@ export function nodeChildRunId(nodeId: string): string | null {
 
 let unsubscribe: (() => Promise<void>) | null = null;
 /**
- * attach 令牌：单调递增，每次 attach/detach 抢占一次。
+ * attach 令牌：每次 attach/detach 抢占一次（staleGuard，全站同一份代际原语）。
  * 投影全程在局部变量里构建（订阅缓冲 → timeline 对齐 → 缓冲回放），换入前比对令牌——
  * 不是最新的就退订走人。monitor 从头到尾要么完全是旧 run、要么完全是新 run，
  * 没有中间态，也就不需要快照回滚。
  */
-let attachToken = 0;
+const attachStale = staleGuard();
 
 export async function startRun(): Promise<void> {
   if (!editor.workflowId) {
@@ -140,25 +146,49 @@ export async function startRun(): Promise<void> {
  * 订阅失败抛出（monitor 保持原状，调用方只报错）。
  */
 async function attach(runId: string): Promise<boolean> {
-  const token = ++attachToken;
+  const token = attachStale.begin();
   if (unsubscribe) { await unsubscribe().catch(() => {}); unsubscribe = null; }
   let closed = false, dirty = false, syncing = false;
   // 轮询句柄装在持有者里：dispose 闭包先定义（陈旧 attach 路径可能先于
   // 首个 tick 启动就被调用），句柄在投影原子换入之后才创建。
   const poll: { timer?: ReturnType<typeof setInterval> } = {};
-  const current = () => !closed && token === attachToken;
+  const current = () => !closed && !attachStale.stale(token);
   const unsub = await api.subscribeRun(runId, record => {
     if (!record.event || record.event.run_id === runId) dirty = true;
   });
-  const dispose = async () => { closed = true; if (poll.timer) clearInterval(poll.timer); await unsub(); };
+  /** 终态后的收尾：停轮询 + 完成通知；finalSweep 保证只补拉一次观测 */
+  let finalSweep = false;
+  const stopPolling = () => {
+    if (poll.timer) {
+      clearInterval(poll.timer);
+      poll.timer = undefined;
+    }
+  };
+  const dispose = async () => {
+    closed = true;
+    stopPolling();
+    await unsub();
+  };
+  /** 状态跳变通知：只在 refresh 观察到 active→terminal 时发一次（初始加载不发） */
+  let previousStatus: string | null = null;
+  function notifyTerminal(status: string): void {
+    if (!previousStatus || TERMINAL_RUN_STATUSES.has(previousStatus)) return;
+    const run = runId.slice(0, 8) + "…";
+    if (status === "succeeded") toast.success(`运行完成 · run ${run}`);
+    else if (status === "failed") toast.error(`运行失败 · run ${run}`);
+    else if (status === "cancelled") toast.info(`运行已取消 · run ${run}`);
+  }
   const initial = await api.runTimeline(runId).catch((e: unknown) => {
-    if (current()) toast.error(errText(e)); return null;
+    if (current()) toast.error(errText(e));
+    return null;
   });
   if (!current()) { await dispose().catch(() => {}); return false; }
   unsubscribe = dispose;
   monitor.runId = runId;
   monitor.workflowId = initial?.workflow_id ?? null;
   monitor.status = initial?.status ?? null;
+  previousStatus = monitor.status;
+  monitor.timelineUnavailable = initial === null;
   monitor.nodes = initial?.nodes ?? [];
   monitor.output = initial?.output;
   monitor.fatalError = initial?.fatal_error ?? null;
@@ -174,13 +204,22 @@ async function attach(runId: string): Promise<boolean> {
     if (!current() || syncing) return;
     syncing = true;
     try {
-      if (dirty || monitor.status === null) {
+      // 时间线不可用（大 run 超预算）时不再重试：只拉观测，避免必失败的请求风暴
+      if (!monitor.timelineUnavailable && (dirty || monitor.status === null)) {
         dirty = false;
-        const snapshot = await api.runTimeline(runId);
-        if (!current()) return;
-        monitor.status = snapshot.status; monitor.nodes = snapshot.nodes;
-        monitor.workflowId = snapshot.workflow_id; monitor.lastSeq = snapshot.last_seq;
-        monitor.output = snapshot.output; monitor.fatalError = snapshot.fatal_error;
+        try {
+          const snapshot = await api.runTimeline(runId);
+          if (!current()) return;
+          previousStatus = monitor.status;
+          monitor.status = snapshot.status; monitor.nodes = snapshot.nodes;
+          monitor.workflowId = snapshot.workflow_id; monitor.lastSeq = snapshot.last_seq;
+          monitor.output = snapshot.output; monitor.fatalError = snapshot.fatal_error;
+          notifyTerminal(snapshot.status);
+        } catch {
+          if (!current()) return;
+          monitor.timelineUnavailable = true;
+          toast.error("时间线不可用（数据量大或读取失败）；日志与原始事件仍可查看");
+        }
       }
       // The observation store flushes independently of the last control event.
       for (let page = 0; page < 4 && current(); page++) {
@@ -189,6 +228,16 @@ async function attach(runId: string): Promise<boolean> {
         appendObservations(monitor, observations.records);
         monitor.observationLoss = mergeObservationLoss(monitor.observationLoss, observations.loss);
         if (observations.records.length < 256) break;
+      }
+      // 终态：停掉 250ms 轮询；再补一次观测（存储异步 flush）后彻底停
+      if (monitor.status !== null && TERMINAL_RUN_STATUSES.has(monitor.status)) {
+        stopPolling();
+        if (!finalSweep) {
+          finalSweep = true;
+          setTimeout(() => {
+            if (current()) void refresh();
+          }, 800);
+        }
       }
     } catch { dirty = true; }
     finally { syncing = false; }
@@ -220,7 +269,7 @@ export async function attachRun(runId: string): Promise<boolean> {
 
 /** 离开运行详情页：退订并清空 monitor，使进行中的 attach 在换入前自动放弃 */
 export async function detachRun(): Promise<void> {
-  attachToken++;
+  attachStale.invalidate();
   if (unsubscribe) {
     await unsubscribe().catch(() => {});
     unsubscribe = null;
@@ -242,6 +291,7 @@ export async function detachRun(): Promise<void> {
     storage_dropped: 0,
     history_incomplete: false,
   };
+  monitor.timelineUnavailable = false;
 }
 
 /** 钻取 sub_workflow 节点的子 run */

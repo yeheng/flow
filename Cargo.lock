@@ -882,6 +882,7 @@ dependencies = [
  "futures",
  "hex",
  "libc",
+ "postcard",
  "rcgen",
  "reqwest",
  "rustls",

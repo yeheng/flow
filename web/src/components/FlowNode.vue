@@ -95,7 +95,7 @@ function sourceStyle(index: number, total: number) {
       <svg class="node-icon" viewBox="0 0 16 16" v-html="icon"></svg>
       <span class="node-name">{{ data.name || data.nodeType.label }}</span>
       <span v-if="subWarning" class="node-badge" :title="subWarning">!</span>
-      <span v-else-if="isSubWorkflow" class="node-drill" title="双击钻取子流程">⤢</span>
+      <span v-else-if="isSubWorkflow" class="node-drill" title="双击编辑参数；右键菜单可钻取子流程">⤢</span>
     </div>
     <div v-if="!isCapsule" class="node-body">
       <div class="node-type">{{ data.nodeType.label }}</div>

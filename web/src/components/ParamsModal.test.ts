@@ -7,15 +7,14 @@ import type { NodeTypeDesc } from "../types";
 vi.mock("./CodeEditor.vue", () => ({ default: defineComponent({ template: "<div />" }) }));
 vi.mock("../state/history", () => ({ commitParams: vi.fn() }));
 vi.mock("../state/editor", async () => {
-  const { reactive, ref } = await import("vue");
-  return {
-    editor: reactive({ paramsOpen: false, secrets: [] as string[], workflows: [] }),
-    selectedNode: ref(null),
-  };
+  const { ref } = await import("vue");
+  return { selectedNode: ref(null) };
 });
 
 import ParamsModal from "./ParamsModal.vue";
-import { editor, selectedNode } from "../state/editor";
+import { selectedNode } from "../state/editor";
+import { closeAllOverlays, openOverlay, overlaysOf, topOverlay } from "../state/overlays";
+import { confirmDialog } from "../state/modal";
 
 function openParams(desc: Partial<NodeTypeDesc>): void {
   (selectedNode as unknown as { value: unknown }).value = {
@@ -33,7 +32,7 @@ function openParams(desc: Partial<NodeTypeDesc>): void {
       },
     },
   };
-  editor.paramsOpen = true;
+  openOverlay("params", { nodeId: "n1" });
 }
 
 function key(k: string, init: KeyboardEventInit = {}): void {
@@ -44,7 +43,7 @@ function key(k: string, init: KeyboardEventInit = {}): void {
 
 afterEach(() => {
   document.body.innerHTML = "";
-  editor.paramsOpen = false;
+  closeAllOverlays();
   (selectedNode as unknown as { value: unknown }).value = null;
 });
 
@@ -66,7 +65,7 @@ describe("ParamsModal：retry_scope 提示", () => {
     await flushPromises();
     expect(w.text()).not.toContain("自动重试只对显式声明可重复");
 
-    editor.paramsOpen = false;
+    closeAllOverlays();
     (selectedNode as unknown as { value: unknown }).value = null;
     await flushPromises();
     openParams({ supports_retry: false, retry_scope: "declared_repeatable_only" });
@@ -77,7 +76,7 @@ describe("ParamsModal：retry_scope 提示", () => {
 });
 
 describe("ParamsModal：焦点管理", () => {
-  it("打开聚焦名称输入框；Esc 关闭并把焦点还原到打开前元素", async () => {
+  it("打开聚焦名称输入框；Esc（全局弹层栈）关闭并把焦点还原到打开前元素", async () => {
     const trigger = document.createElement("button");
     document.body.appendChild(trigger);
     trigger.focus();
@@ -90,7 +89,7 @@ describe("ParamsModal：焦点管理", () => {
     expect(document.activeElement).toBe(nameInput);
 
     key("Escape");
-    expect(editor.paramsOpen).toBe(false);
+    expect(overlaysOf("params")).toEqual([]);
     await flushPromises();
     expect(document.activeElement).toBe(trigger);
     w.unmount();
@@ -131,6 +130,30 @@ describe("ParamsModal：焦点管理", () => {
     expect(id).toBeTruthy();
     expect(w.find("h3").attributes("id")).toBe(id);
     expect(w.find("h3").text()).toBe("编辑参数");
+    w.unmount();
+  });
+});
+
+describe("ParamsModal：弹层栈", () => {
+  it("Esc 叠层只关一层：confirm 压在参数弹层上时先关 confirm", async () => {
+    openParams({});
+    const w = mount(ParamsModal, { attachTo: document.body });
+    await flushPromises();
+    const p = confirmDialog("继续？");
+    await flushPromises();
+    expect(topOverlay.value?.kind).toBe("modal");
+
+    key("Escape");
+    await expect(p).resolves.toBe(false);
+    // 只关栈顶：参数弹层还在
+    expect(overlaysOf("params")).toHaveLength(1);
+    expect(topOverlay.value?.kind).toBe("params");
+    expect(w.find(".params-modal").exists()).toBe(true);
+
+    key("Escape");
+    await flushPromises();
+    expect(overlaysOf("params")).toEqual([]);
+    expect(w.find(".params-modal").exists()).toBe(false);
     w.unmount();
   });
 });

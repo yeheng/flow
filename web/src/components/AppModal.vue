@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { nextTick, onMounted, onUnmounted, ref, useId, watch } from "vue";
-import { modalState, settleModal } from "../state/modal";
+import { computed, nextTick, onMounted, onUnmounted, ref, useId, watch } from "vue";
+import { modalEntries, settleModal, type ModalEntry } from "../state/modal";
 import AppButton from "./AppButton.vue";
 
 const text = ref("");
@@ -11,14 +11,17 @@ const titleId = useId();
 /** 打开弹窗前的焦点目标：关闭时还原（否则焦点被弹窗吃掉后掉回 body） */
 const prevFocus = ref<HTMLElement | null>(null);
 
+/** 打开语义保证同刻至多一条；Esc 由全局弹层栈统一关栈顶，此处不再监听 */
+const current = computed<ModalEntry | null>(() => modalEntries()[0] ?? null);
+
 watch(
-  () => modalState.current,
-  async (cur) => {
-    if (cur) {
-      prevFocus.value = (document.activeElement as HTMLElement | null) ?? null;
-      text.value = cur.defaultValue;
+  () => current.value?.id,
+  async (id) => {
+    if (id !== undefined) {
+      if (!prevFocus.value) prevFocus.value = (document.activeElement as HTMLElement | null) ?? null;
+      text.value = current.value?.payload.defaultValue ?? "";
       await nextTick();
-      if (cur.kind === "prompt") {
+      if (current.value?.payload.kind === "prompt") {
         inputEl.value?.focus();
         inputEl.value?.select();
       } else {
@@ -33,27 +36,25 @@ watch(
 );
 
 function ok(): void {
-  settleModal(modalState.current?.kind === "prompt" ? text.value : "");
+  const entry = current.value;
+  if (entry) settleModal(entry, entry.payload.kind === "prompt" ? text.value : "");
 }
 
 function cancel(): void {
-  settleModal(null);
+  const entry = current.value;
+  if (entry) settleModal(entry, null);
 }
 
-// keydown 挂 window：点过消息区等非可聚焦区域后 Esc/Tab 仍响应
+// keydown 挂 window：点过消息区等非可聚焦区域后 Enter/Tab 仍响应（Esc 走弹层栈）
 function onWindowKeydown(e: KeyboardEvent): void {
-  if (!modalState.current) return;
-  if (e.key === "Escape") {
-    e.preventDefault();
-    cancel();
-    return;
-  }
+  const entry = current.value;
+  if (!entry) return;
   if (e.key === "Tab") {
     trapTab(e);
     return;
   }
   // Enter 确认只对 confirm 生效；焦点在按钮上时交给按钮自身，避免双触发
-  if (e.key === "Enter" && modalState.current.kind === "confirm" && !isButton(e.target)) {
+  if (e.key === "Enter" && entry.payload.kind === "confirm" && !isButton(e.target)) {
     ok();
   }
 }
@@ -83,11 +84,11 @@ onUnmounted(() => window.removeEventListener("keydown", onWindowKeydown));
 </script>
 
 <template>
-  <div v-if="modalState.current" class="modal-overlay" @click.self="cancel">
+  <div v-if="current" class="modal-overlay" @click.self="cancel">
     <div ref="dialogEl" class="modal" role="dialog" aria-modal="true" :aria-labelledby="titleId">
-      <p :id="titleId" class="modal-message">{{ modalState.current.message }}</p>
+      <p :id="titleId" class="modal-message">{{ current.payload.message }}</p>
       <input
-        v-if="modalState.current.kind === 'prompt'"
+        v-if="current.payload.kind === 'prompt'"
         ref="inputEl"
         v-model="text"
         type="text"
@@ -95,12 +96,8 @@ onUnmounted(() => window.removeEventListener("keydown", onWindowKeydown));
       />
       <div class="modal-actions">
         <AppButton @click="cancel">取消</AppButton>
-        <AppButton
-          ref="okEl"
-          :variant="modalState.current.danger ? 'danger' : 'primary'"
-          @click="ok"
-        >
-          {{ modalState.current.confirmText ?? "确定" }}
+        <AppButton ref="okEl" :variant="current.payload.danger ? 'danger' : 'primary'" @click="ok">
+          {{ current.payload.confirmText ?? "确定" }}
         </AppButton>
       </div>
     </div>

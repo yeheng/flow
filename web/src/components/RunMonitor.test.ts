@@ -29,6 +29,8 @@ vi.mock("../state/editor", () => ({
 import { mount } from "@vue/test-utils";
 import RunMonitor from "./RunMonitor.vue";
 import * as api from "../api/flow";
+import { devMode } from "../state/dev";
+import { editor } from "../state/editor";
 import { monitor } from "../state/monitor";
 import type { TimelineNode } from "../types";
 
@@ -224,6 +226,54 @@ describe("RunMonitor：uncertain 外部操作人工裁决", () => {
       .find('input[placeholder="裁决理由（必填）"]')
       .element as HTMLInputElement;
     expect(reason.value).toBe("");
+    w.unmount();
+  });
+});
+
+describe("RunMonitor：键盘可达（时间线行 / 活动卡片）", () => {
+  beforeEach(() => {
+    monitor.runId = "A";
+    monitor.workflowId = "w1";
+    monitor.status = "running";
+    monitor.output = undefined;
+    monitor.nodes = [node({ id: "n1" })];
+    monitor.logs = [];
+    monitor.logsByNode = {};
+    monitor.breadcrumb = [];
+    editor.selectedNodeId = null;
+    devMode.value = true;
+  });
+
+  it("时间线行 tabindex + Enter/Space 与点击一致（选中画布节点）", async () => {
+    const w = mountMonitor();
+    await w
+      .findAll(".run-tab")
+      .find((b) => b.text() === "时间线")!
+      .trigger("click");
+    const row = w.find("table.timeline tbody tr");
+    expect(row.attributes("tabindex")).toBe("0");
+
+    await row.trigger("keydown", { key: "enter" });
+    expect(editor.selectedNodeId).toBe("n1");
+    editor.selectedNodeId = null;
+    await row.trigger("keydown", { key: " " });
+    expect(editor.selectedNodeId).toBe("n1");
+    devMode.value = false;
+    w.unmount();
+  });
+
+  it("活动卡片 role=button + Enter/Space 触发 select-node", async () => {
+    const w = mountMonitor();
+    const card = w.find(".activity-item");
+    expect(card.attributes("role")).toBe("button");
+    expect(card.attributes("tabindex")).toBe("0");
+
+    await card.trigger("keydown", { key: "enter" });
+    expect(editor.selectedNodeId).toBe("n1");
+    editor.selectedNodeId = null;
+    await card.trigger("keydown", { key: " " });
+    expect(editor.selectedNodeId).toBe("n1");
+    devMode.value = false;
     w.unmount();
   });
 });

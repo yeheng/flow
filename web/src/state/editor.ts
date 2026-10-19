@@ -14,6 +14,8 @@ import { commit, resetHistory } from "./history";
 import { deepCloneJson } from "./clone";
 import { layeredPositions } from "./layout";
 import { confirmDialog } from "./modal";
+import { overlaysOf } from "./overlays";
+import { staleGuard } from "./stale";
 import { toast } from "./toast";
 import { validateDefinition, type ValidationError } from "./validation";
 
@@ -72,8 +74,6 @@ interface EditorState {
   edges: EditorEdge[];
   definitionOptions: Omit<Definition, "nodes" | "edges">;
   selectedNodeId: string | null;
-  /** 参数编辑弹窗是否打开（编辑入口：点节点/右键「编辑参数」/校验错误定位） */
-  paramsOpen: boolean;
   /** RunPanel 行 hover/click 联动画布高亮 */
   highlightNodeId: string | null;
   /** 右键拖拽连线时悬停的合法目标节点（画布高亮用，拖拽结束清空） */
@@ -94,7 +94,6 @@ export const editor = reactive<EditorState>({
   edges: [],
   definitionOptions: {},
   selectedNodeId: null,
-  paramsOpen: false,
   highlightNodeId: null,
   linkTargetId: null,
   breadcrumb: [],
@@ -134,14 +133,23 @@ export const nodeTypeGroups = computed(() => {
  * undo 回到保存点快照时自动变干净；保存/加载会移动保存点。
  */
 const savedDefKey = ref<string | null>(null);
-let editorSession = 0;
+/**
+ * 编辑器会话代际（staleGuard 唯一实例）：async 响应写回前用 stale(token) 比对，
+ * 切换/新会话使其过期——旧响应（并发加载、切换中的保存）一律丢弃。
+ */
+const session = staleGuard();
 watch(
   () => editor.workflowId,
   () => {
-    editorSession++;
+    session.invalidate();
   },
   { flush: "sync" },
 );
+
+/** 参数面板条目（kind="params"）：删节点/切工作流时随手关闭，不留下看不见的栈层 */
+function closeParamsOverlays(): void {
+  for (const entry of overlaysOf("params")) entry.close();
+}
 
 function defKey(): string {
   return JSON.stringify(flowToDefinition());
@@ -289,16 +297,16 @@ function seedCanvas(): boolean {
   return true;
 }
 
-export async function selectWorkflow(id: string, version?: number): Promise<void> {
+export async function selectWorkflow(id: string, version?: number): Promise<boolean> {
   // nodeTypes 未就绪时 toFlow/seedCanvas 的类型断言都会落空：先挡住并提示
   if (editor.nodeTypes.length === 0) {
     toast.error("节点类型清单未加载，无法打开工作流；连接恢复后请重试");
-    return;
+    return false;
   }
-  const session = ++editorSession;
+  const token = session.begin();
   try {
     const w = await api.getWorkflow(id, version);
-    if (session !== editorSession) return;
+    if (session.stale(token)) return false;
     editor.version = w.version;
     editor.publishedVersion = w.published_version;
     const { nodes: _nodes, edges: _edges, ...options } = w.definition;
@@ -307,24 +315,25 @@ export async function selectWorkflow(id: string, version?: number): Promise<void
     editor.nodes = flow.nodes;
     editor.edges = flow.edges;
   } catch (e) {
-    if (session !== editorSession) return;
+    if (session.stale(token)) return false;
     // workflow.get 对无版本的工作流报「不存在」（-32011）：仅当未指定版本时按空画布 seed；
     // 指定版本时的 -32011 是「该版本不存在」，如实报错
     if (!(e instanceof RpcError && e.code === -32011) || version !== undefined) {
       toast.error(errText(e));
-      return;
+      return false;
     }
     editor.version = 0;
     editor.publishedVersion = null;
     editor.definitionOptions = {};
-    if (!seedCanvas()) return;
+    if (!seedCanvas()) return false;
   }
   editor.workflowId = id;
   editor.workflowName = editor.workflows.find((w) => w.workflow_id === id)?.name ?? "";
   editor.selectedNodeId = null;
-  editor.paramsOpen = false;
+  closeParamsOverlays();
   markSaved();
   resetHistory();
+  return true;
 }
 
 /** 当前工作流的最新版本号（workflows 清单未载时回落当前编辑版本） */
@@ -483,7 +492,7 @@ export function deleteSelection(): boolean {
   );
   if (editor.selectedNodeId && ids.has(editor.selectedNodeId)) {
     editor.selectedNodeId = null;
-    editor.paramsOpen = false;
+    closeParamsOverlays();
   }
   if (editor.highlightNodeId && ids.has(editor.highlightNodeId)) editor.highlightNodeId = null;
   return true;
@@ -543,7 +552,7 @@ export async function save(): Promise<boolean> {
   return (await saveSnapshot()) !== null;
 }
 
-async function saveSnapshot(): Promise<SavedWorkflow | null> {
+async function saveSnapshot(token?: number): Promise<SavedWorkflow | null> {
   if (!editor.workflowId || saving.value) return null;
   // 保存前过前端预校验：有错不打 RPC（服务端 validate 仍是最终裁决）
   const errs = validateNow();
@@ -554,7 +563,9 @@ async function saveSnapshot(): Promise<SavedWorkflow | null> {
   }
   const workflowId = editor.workflowId;
   const baseVersion = editor.version;
-  const session = editorSession;
+  // 会话令牌：publish 复用外层传入的同一枚。用 mark()（只捕获不作废他人）：
+  // 保存不应作废同一刻在飞的加载；切换工作流（invalidate）仍作废保存的写回
+  const sessionToken = token ?? session.mark();
   const definition = deepCloneJson(flowToDefinition());
   saving.value = true;
   try {
@@ -570,7 +581,7 @@ async function saveSnapshot(): Promise<SavedWorkflow | null> {
       if (!ok) return null;
     }
     const version = await api.updateWorkflow(workflowId, definition);
-    if (session === editorSession && editor.workflowId === workflowId) {
+    if (!session.stale(sessionToken) && editor.workflowId === workflowId) {
       editor.version = version;
       savedDefKey.value = JSON.stringify(definition);
     }
@@ -587,14 +598,15 @@ async function saveSnapshot(): Promise<SavedWorkflow | null> {
 
 export async function publish(): Promise<void> {
   if (!editor.workflowId || publishing.value) return;
-  const session = editorSession;
+  // publish 与内部 saveSnapshot 共用同一会话令牌：发布写回的判定基准是保存发起的那一刻
+  const token = session.mark();
   publishing.value = true;
   try {
     // 发布前先把画布落库，保证发布的版本就是当前图
-    const saved = await saveSnapshot();
+    const saved = await saveSnapshot(token);
     if (!saved) return;
     await api.publishWorkflow(saved.workflowId, saved.version);
-    if (session === editorSession && editor.workflowId === saved.workflowId) {
+    if (!session.stale(token) && editor.workflowId === saved.workflowId) {
       editor.publishedVersion = saved.version;
     }
     toast.success(`已发布 v${saved.version}`);

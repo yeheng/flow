@@ -141,6 +141,13 @@ describe("comparisonSummary", () => {
       },
     );
   });
+
+  it("truncated：差异被截到 64 条上限，摘要给下界而不是精确计数", () => {
+    const differences = Array.from({ length: 64 }, (_, i) => ({ path: `nodes.n${i}` }));
+    expect(
+      comparisonSummary(report({ passed: false, differences, truncated: true })),
+    ).toEqual({ label: "≥64 处与基线不同", tone: "danger" });
+  });
 });
 
 describe("comparisonPathLabel：子 run / 请求指纹 / 错误", () => {

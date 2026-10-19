@@ -186,8 +186,9 @@ graph TB
 4. 写响应在 SQLite COMMIT 后返回，状态与回执已同时可见，没有异步投影追赶。
 5. 本地 IPC 承载按平台选择，对上层透明：unix 用 socketpair，通道 FD 原号经 argv
    `--channel-fd <N>` 传给执行器（`pre_exec` 只关闭其余继承 FD，不做 dup2 落位）；
-   Windows 及其余平台用 **TCP loopback 回连**（父进程 bind `127.0.0.1:0`，执行器按
-   `FLOW_EXECUTOR_CONNECT_ADDR` 回连出单条连接）。loopback 没有 FD 能力防串配，
+   Windows 及其余平台用 **本地 socket 回连**（named pipe / 文件系统 socket，由
+   interprocess 统一实现；不占网络栈、无端口抢连窗口），执行器按
+   `FLOW_EXECUTOR_CONNECT_ADDR` 回连出单条连接）。本地 socket 没有 FD 能力防串配，
    因此 spawn 时随机生成会话令牌经 `FLOW_EXECUTOR_SESSION_TOKEN` 注入、Hello 里回验。
 
 ### 2.3 执行模式矩阵
@@ -1472,6 +1473,12 @@ v5 起内层 `TransferChunk` 的字节由嵌套枚举原生承载，v4 那个专
 
 `routable()` 规定内层禁止嵌套 `Routed`、禁止上联管理帧与握手帧；`Reject` 与
 `Heartbeat` 例外——执行器的任务失败通知与心跳必须能经 agent 中继给主进程。
+这条规则在**出站 wrap 侧与入站解包侧双向执行**（master 解包 `Routed` 时同样
+校验内层）；`Reject` 自身没有派发归属字段，由 agent 的 fair_mux 桥按来源句柄
+注入归属标签后再包装——否则上联包装器按「无归属」静默丢弃，master 的终态
+错误入口就收不到远程基础设施故障。取消后的排空有截止时间
+（`CANCEL_REAP_TIMEOUT_MS` = 30s）：持续心跳但不响应 Cancel 的执行器到点由
+master 派发方放弃等待、agent 侧强制收割，不能无限占用槽位。
 
 **对抗性输入的防线**（`message.rs`/`frame.rs` 的单测各钉一条）：
 
@@ -1479,7 +1486,12 @@ v5 起内层 `TransferChunk` 的字节由嵌套枚举原生承载，v4 那个专
 - 巨型长度声明（`String` len varint = `u64::MAX` 量级）→ 先做边界检查再取字节，
   小帧内立即报错，**不先按声明长度分配**；
 - 变体索引越界（目录 28 个）→ 明确拒绝；
-- 半帧/粘帧 → `FrameDecoder` 累积缓冲，仅在帧完整、预算通过后才从缓冲摘除。
+- 半帧/粘帧 → `FrameDecoder` 累积缓冲，仅在帧完整、预算通过后才从缓冲摘除；
+- **`Routed` 嵌套深度**（`ROUTED_MAX_DEPTH` = 8）→ `Routed.inner` 的反序列化带
+  深度计数，超限在解码层拒绝。没有这道门，每层仅约 7 字节的嵌套可在 1 MiB 合法
+  帧内塞约 15 万层递归，postcard 递归下降解码（及派生 Drop/Debug）栈溢出 abort，
+  且发生在握手/令牌校验之前——对等端一发帧即可打崩单写者权威进程。深度门同时
+  让成功解码值的派生递归有界。
 
 **为什么删掉 `Channel`**：v4 用一字节 `kind` + JSON meta 区分三种帧、另设
 `Channel` 概念表达 data 归属；v5 把整个 `Message` 枚举交给 postcard 后，变体索引

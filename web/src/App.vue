@@ -1,25 +1,44 @@
 <script setup lang="ts">
 import { computed } from "vue";
+import { useRoute } from "vue-router";
 import { client } from "./rpc/client";
 import AppToasts from "./components/AppToasts.vue";
 import AppModal from "./components/AppModal.vue";
 
+const route = useRoute();
 const connected = computed(() => client.connected.value);
+
+/** 导航高亮：`/` 精确命中，其余按路径段前缀（/workflows/:id 归「工作流」、/runs/:id 归「运行记录」） */
+function navActive(path: string, to: string): boolean {
+  return to === "/" ? path === "/" : path === to || path.startsWith(`${to}/`);
+}
 </script>
 
 <template>
   <header>
     <span class="logo">Flow</span>
     <nav class="nav">
-      <RouterLink to="/">仪表盘</RouterLink>
-      <RouterLink to="/workflows">工作流</RouterLink>
-      <RouterLink to="/runs">运行记录</RouterLink>
-      <RouterLink to="/journal">JSONL 工作区</RouterLink>
-      <RouterLink to="/cluster">节点管理</RouterLink>
-      <RouterLink to="/settings">设置</RouterLink>
+      <RouterLink to="/" :class="{ 'nav-active': navActive(route.path, '/') }">仪表盘</RouterLink>
+      <RouterLink to="/workflows" :class="{ 'nav-active': navActive(route.path, '/workflows') }">
+        工作流
+      </RouterLink>
+      <RouterLink to="/runs" :class="{ 'nav-active': navActive(route.path, '/runs') }">
+        运行记录
+      </RouterLink>
+      <RouterLink to="/journal" :class="{ 'nav-active': navActive(route.path, '/journal') }">
+        事件审计
+      </RouterLink>
+      <RouterLink to="/cluster" :class="{ 'nav-active': navActive(route.path, '/cluster') }">
+        集群节点
+      </RouterLink>
+      <RouterLink to="/settings" :class="{ 'nav-active': navActive(route.path, '/settings') }">
+        设置
+      </RouterLink>
     </nav>
-    <span class="conn" :class="{ ok: connected }">
-      {{ connected ? "已连接" : "未连接" }} {{ client.url }}
+    <!-- 业务 chrome 不常显 RPC 地址：连接态只留圆点+文案，地址进 tooltip -->
+    <span class="conn" :class="{ ok: connected }" :title="client.url">
+      <span class="conn-dot" aria-hidden="true" />
+      {{ connected ? "已连接" : "未连接" }}
     </span>
   </header>
   <RouterView />
@@ -77,13 +96,18 @@ header {
   color: var(--text);
 }
 
-.nav a.router-link-active {
+/* 高亮由 nav-active 判定（useRoute 路径前缀），router-link-active 仅兜底 */
+.nav a.router-link-active,
+.nav a.nav-active {
   color: var(--text);
   border-bottom-color: var(--accent);
 }
 
 .conn {
   margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   color: var(--danger);
   font-size: 11px;
   font-family: var(--mono);
@@ -91,6 +115,13 @@ header {
 
 .conn.ok {
   color: var(--ok);
+}
+
+.conn-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
 }
 @media (max-width: 700px) {
   .conn {

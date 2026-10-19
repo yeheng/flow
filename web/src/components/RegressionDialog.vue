@@ -1,25 +1,31 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import * as api from "../api/flow";
 import { errText } from "../rpc/client";
 import { editor, refreshWorkflows } from "../state/editor";
 import { normalizeFixtures } from "../state/regression";
 import { toast } from "../state/toast";
+import type { OverlayEntry } from "../state/overlays";
 import type { RunRecord, VersionMeta } from "../types";
 import AppButton from "./AppButton.vue";
 
 /**
- * 回归发起弹窗：baseline run 必须已终结且带执行上下文（服务端校验）。
- * 目标工作流固定为基线所属工作流——fixtures 按 node_key 命中，跨工作流回归
- * 基本必然 fixture miss；候选默认取该工作流最新已发布版本，即「同一资产的新版本」。
+ * 回归发起弹窗（全局弹层栈 kind="regression" 的渲染方）：baseline run 必须
+ * 已终结且带执行上下文（服务端校验）。目标工作流固定为基线所属工作流——
+ * fixtures 按 node_key 命中，跨工作流回归基本必然 fixture miss；候选默认取
+ * 该工作流最新已发布版本，即「同一资产的新版本」。Esc 由全局弹层栈关栈顶。
  */
-const props = defineProps<{ baseline: RunRecord }>();
-const emit = defineEmits<{ close: []; created: [runId: string] }>();
+export interface RegressionPayload {
+  baseline: RunRecord;
+}
 
-const workflowId = props.baseline.workflow_id;
+const props = defineProps<{ entry: OverlayEntry<RegressionPayload> }>();
+const emit = defineEmits<{ created: [runId: string] }>();
+
+const baseline = computed(() => props.entry.payload.baseline);
+const workflowId = baseline.value.workflow_id;
 const workflowName = computed(
-  () =>
-    editor.workflows.find((w) => w.workflow_id === workflowId)?.name ?? props.baseline.workflow_id,
+  () => editor.workflows.find((w) => w.workflow_id === workflowId)?.name ?? workflowId,
 );
 const version = ref<number | null>(null);
 const versions = ref<VersionMeta[]>([]);
@@ -29,6 +35,10 @@ const error = ref("");
 /** 高级：覆盖外部操作结果（JSON 表，空=全部用基线录制结果） */
 const fixturesText = ref("");
 const fixturesError = computed(() => normalizeFixtures(fixturesText.value).error);
+
+function close(): void {
+  if (!submitting.value) props.entry.close();
+}
 
 const publishedVersions = computed(() =>
   versions.value.filter((v) => v.status === "published").sort((a, b) => b.version - a.version),
@@ -50,17 +60,10 @@ async function loadVersions(): Promise<void> {
   }
 }
 
-function onKeydown(e: KeyboardEvent): void {
-  if (e.key === "Escape" && !submitting.value) emit("close");
-}
-
 onMounted(async () => {
-  window.addEventListener("keydown", onKeydown);
   if (editor.workflows.length === 0) await refreshWorkflows();
   await loadVersions();
 });
-
-onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
 
 async function submit(): Promise<void> {
   if (!canSubmit.value || version.value === null) return;
@@ -72,13 +75,14 @@ async function submit(): Promise<void> {
   submitting.value = true;
   error.value = "";
   try {
-    const created = await api.startRegression(props.baseline.id, {
+    const created = await api.startRegression(baseline.value.id, {
       workflowId,
       version: version.value,
       ...(normalized.fixtures ? { fixtures: normalized.fixtures } : {}),
     });
     toast.success("已创建回归运行");
     emit("created", created.run_id);
+    props.entry.close();
   } catch (e) {
     error.value = errText(e);
   } finally {
@@ -88,11 +92,11 @@ async function submit(): Promise<void> {
 </script>
 
 <template>
-  <div class="regress-overlay" @click.self="!submitting && emit('close')">
+  <div class="regress-overlay" @click.self="close">
     <div class="regress-modal" role="dialog" aria-modal="true" aria-label="以本运行为基线回归">
       <header class="regress-header">
         <h3>回归运行</h3>
-        <button class="regress-close" title="关闭 (Esc)" @click="emit('close')">×</button>
+        <button class="regress-close" title="关闭 (Esc)" @click="close">×</button>
       </header>
       <div class="regress-body">
         <div class="field">
@@ -155,7 +159,7 @@ async function submit(): Promise<void> {
         <p v-if="error" class="regress-error" role="alert">{{ error }}</p>
       </div>
       <footer class="regress-footer">
-        <AppButton :disabled="submitting" @click="emit('close')">取消</AppButton>
+        <AppButton :disabled="submitting" @click="close">取消</AppButton>
         <AppButton variant="primary" :disabled="!canSubmit" @click="submit">
           {{ submitting ? "创建中…" : "开始回归" }}
         </AppButton>

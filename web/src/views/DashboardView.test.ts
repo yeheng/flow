@@ -125,7 +125,9 @@ describe("capacity display", () => {
     const cap = w.find(".capacity");
     expect(cap.text()).toContain("非终态 800 / 1000");
     expect(cap.text()).toContain("在飞派发上限 16");
-    expect(cap.text()).toContain("OPS.md");
+    // 运维口径收进 tooltip，不占首屏正文
+    expect(cap.text()).not.toContain("OPS.md");
+    expect(cap.attributes("title")).toContain("OPS.md");
   });
 
   it("≥80% 用 warn 配色提示接近平台上限", async () => {

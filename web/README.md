@@ -15,6 +15,8 @@ Vue 3 + Vite + TypeScript + vue-router + Tauri 2，支持浏览器与桌面应�
 | `/workflows/:id/runs`     | 该工作流的运行历史（3s 轮询）                                                         |
 | `/runs`                   | 全局运行历史（同上组件，不过滤）                                                      |
 | `/runs/:runId`            | 运行详情：信息头 + 只读 DAG（按 run 钉死的版本渲染、保留运行态着色）+ 实时时间线      |
+| `/journal`                | 事件审计：journal v2 事件与审计检查台（运维/调试面）                                   |
+| `/cluster`                | 集群节点：节点注册、归属、租约与同步进度                                              |
 
 全局通知走右上角 Toast，确认/输入走 Modal（替代原生 prompt/confirm）；
 有未保存修改时离开编辑器路由会先确认。
@@ -71,7 +73,7 @@ Linux 安装 WebKitGTK 4.1 等 [Tauri 系统依赖](https://v2.tauri.app/start/p
 
 桌面数据默认存放在 Tauri 应用数据目录（macOS 为
 `~/Library/Application Support/com.flow.workflow.desktop/`），普通工作流保存在 `flow/`，
-JSONL 工作区保存在独立的 `journal/`，不会混用两套数据。需要隔离开发数据时，在启动前
+事件审计（journal v2）保存在独立的 `journal/`，不会混用两套数据。需要隔离开发数据时，在启动前
 设置 `FLOW_DESKTOP_DATA_DIR=/绝对路径`。桌面不会自动导入原服务器数据目录。
 
 应用启动会恢复本地运行并启动定时调度；无 `flow.toml` 时默认开启执行器预热
@@ -82,7 +84,7 @@ JSONL 工作区保存在独立的 `journal/`，不会混用两套数据。需要
 同一数据目录的第二个实例会拒绝启动，避免多个进程同时写入。
 
 webhook 仍需接收 HTTP 请求，桌面仅在 `127.0.0.1` 随机端口开放此入口，触发器页面展示
-实际地址（每次启动可能变化）。JSONL 工作区在桌面直接打开本地数据，无需地址和令牌；
+实际地址（每次启动可能变化）。事件审计页在桌面直接打开本地数据，无需地址和令牌；
 完整值下载走原生保存对话框和 Rust 流式写入。浏览器下载仍使用 `showSaveFilePicker`，
 不支持该 API 时提示使用 CLI。
 
@@ -116,12 +118,21 @@ VITE_FLOW_HTTP=http://127.0.0.1:9801 npm run dev   # webhook HTTP 入口（触�
   目录 `secrets.json` + 主密钥 `secret.key`，值永不出服务端）。执行时优先用这里
   的密钥，其次回落 `FLOW_SECRET_*` 环境变量；来自环境变量的密钥只能显示、不能删。
 
-## 可复用节点模板
+## 节点面板与业务节点（drawio 式）
 
-编辑器左侧面板底部是「模板」区：选中若干节点（内部连线一起）→「存为模板」→
-在任意流程中点击或拖拽模板插入（id 重生成、按 max_instances 检查、入 undo 栈）。
-模板持久化在服务端 `node_templates` 表，跨流程、跨设备可用；完整子流程复用仍
-建议用 `sub_workflow` 节点（可钻取、run 溯源）。
+编辑器左侧是 drawio 式节点面板：**搜索框 + 可折叠分组**。节点类型按功能分组
+（控制/计算/集成/人工/AI/通知…），组头点击折叠/展开（折叠态按组持久化）；搜索时
+自动展开并隐藏空组，同时匹配节点类型与业务节点。
+
+**业务节点**：预配置好的节点或子图（含参数与内部连线），保存后出现在面板最上的
+「业务节点」区（按分类分组），可直接拖拽或点击插入任意流程：
+
+- 选中一个节点（或若干节点/整个子图）→ 右键「存为业务节点」或面板「存为业务节点」按钮 →
+  填名称与分类（分类可复用已有值）→ 保存；
+- 顶部条「存为业务节点」把当前工作流打包成 `sub_workflow` 单节点业务节点（分类「子流程」）；
+- 业务节点持久化在服务端 `node_templates` 表，跨流程、跨设备可用；面板项 hover 可重命名/删除
+  （已插入的节点不受影响）。插入时 id 重生成、按 max_instances 检查、入 undo 栈；
+- 需要 run 溯源的完整子流程仍建议用 `sub_workflow` 节点（可钻取）。
 
 ## 工程化
 
@@ -151,7 +162,7 @@ teardown 杀进程删目录。种子数据直接走 JSON-RPC WebSocket（`e2e/he
 - **多选与复制粘贴**：Shift+左键拖框选、Cmd/Ctrl+点击多选；Cmd/Ctrl+C 复制选中节点及其内部边，
   Cmd/Ctrl+V 粘贴（重新生成节点 id、位置逐次偏移 32px、内部边重连、外部边不复制、
   受 max_instances 限制）；Delete/Backspace 删除选中。快捷键在输入框聚焦时不劫持。
-- **右键交互**：原地右键弹自定义菜单——节点上（编辑参数/复制/创建副本/存为模板/删除，
+- **右键交互**：原地右键弹自定义菜单——节点上（编辑参数/复制/创建副本/存为业务节点/删除，
   sub_workflow 另有钻取）、边上（删除连线）、空白处（添加节点子菜单按类别分组、粘贴到落点、
   自动布局、适应视图）；按住右键拖动：起点在节点上进入连线模式（多出端口按鼠标就近选择，
   悬停的合法目标节点绿色高亮，非法落点静默取消），起点在空白处平移画布。位移小于 4px
@@ -186,7 +197,7 @@ teardown 杀进程删目录。种子数据直接走 JSON-RPC WebSocket（`e2e/he
     `schedule.update`（`api.updateSchedule`），只提交改动项——input 保持原样 = 不改
     （`undefined`），清空 = 删除输入（`null`），改成新 JSON = 替换；非法 JSON 前端拦截，
     保存成功后 toast 并刷新列表；
-  - Webhook：新建按钮 + 列表（完整 hook URL 一键复制、curl 示例展开、启停、删除）。
+  - Webhook：新建按钮 + 列表（完整 hook URL 一键复制、调用示例展开、启停、删除）。
     hook URL 基址 = `VITE_FLOW_HTTP`（默认 `http://127.0.0.1:9801`），因为
     flow-server 的 HTTP 端口前端无法自知。POST body（JSON）即 run 的 input；
   - 调用合同（每张 webhook 卡片的折叠区）：
@@ -198,12 +209,13 @@ teardown 杀进程删目录。种子数据直接走 JSON-RPC WebSocket（`e2e/he
     - **展示策略**：`webhook.list` 不回显 `invoke_version`/`invoke_key_hash`，未回显时
       显示「保存后立即生效，列表接口暂不回显」；服务端将来回显则直接显示
       「已固定 vN / 密钥已设置」+ 哈希前缀；
-    - **调用示例**：`POST /invoke/{token}`（Bearer 调用密钥 + 必填 `Idempotency-Key`
-      + 可选 `X-Correlation-Id`，body=run 输入）→ 202 受理回执（`run_id`/`run_token`/
-      `result_url`/`events_url`/`receipt`）。202 只表示受理≠业务完成；重试复用同一
-      `Idempotency-Key` 保证只触发一次；`run_token` 只绑定该次 run，用于
-      `GET /invocations/{run_id}` 查结果（413 时返回 `output_ref`+`download_url`），
-      不要外发管理令牌。
+    - **调用示例**（主次按合同状态）：已配置调用合同时以 `POST /invoke/{token}`
+      （Bearer 调用密钥 + 必填 `Idempotency-Key` + 可选 `X-Correlation-Id`，body=run 输入）
+      为主示例 → 202 受理回执（`run_id`/`run_token`/`result_url`/`events_url`/`receipt`）。
+      202 只表示受理≠业务完成；重试复用同一 `Idempotency-Key` 保证只触发一次；`run_token`
+      只绑定该次 run，用于 `GET /invocations/{run_id}` 查结果（413 时返回 `output_ref`+
+      `download_url`），不要外发管理令牌。`POST /hooks/{token}` 标注为运维/管理调用
+      （管理 token），非业务主入口。
 - **仪表盘** `/`：工作流总数、运行总数、成功率、进行中四张卡片 + 最近运行 +
   按工作流成功率。统计走 `run.stats`（服务端 GROUP BY 精确计数），派生值纯函数
   在 `src/state/dashboard.ts`（vitest 覆盖）；最近运行表只是展示窗口，走
@@ -219,7 +231,8 @@ teardown 杀进程删目录。种子数据直接走 JSON-RPC WebSocket（`e2e/he
   HTTP/harness 副作用；请求摘要与基线不一致的节点会显式失败。候选版本默认取最新已发布版本。
 - 回归候选的来源是 `manual` + `source_detail=regression:<baseline>`：详情头显示「回归自基线」，
   运行列表「来源」列带「回归」回链。
-- 候选终结后自动打开「与基线比较」（`run.compare`）：展示运行状态、最终输出与逐节点结果的差异；
+- 候选终结后详情头亮出「与基线比较」入口（`run.compare`，需手动点开）：展示运行状态、
+  最终输出与逐节点结果的差异；
   `StoredValue` 大值引用以可行动占位展示，不泄漏内部指针。也可在运行详情手动「对比基线」
   输入任意基线 run id。
 - 跨工作流回归会被限制为基线工作流：外部操作 fixture 按节点身份匹配，换工作流基本必然 miss。
@@ -257,7 +270,7 @@ teardown 杀进程删目录。种子数据直接走 JSON-RPC WebSocket（`e2e/he
    运行中节点的下游边流动动画；右侧时间线实时更新，行 hover/click 与画布节点联动；
    human_task 等待时可交付信号，运行中可取消；uncertain 外部操作在运行面板人工裁决。
 6. sub_workflow 子流程节点：参数面板用下拉选择目标工作流（未发布/不存在有警告），
-   双击节点钻取子流程（画布上方面包屑可逐级返回）；运行时节点和时间线上的
+   右键菜单「钻取子流程」进入目标工作流（画布上方面包屑可逐级返回）；运行时节点和时间线上的
    「子 run →」链接可切换监控；编辑器内钻取用「← 父 run」返回，
    运行详情页内则跳转 `/runs/:childRunId`。
 

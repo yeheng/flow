@@ -2,8 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mount, flushPromises } from "@vue/test-utils";
 import * as api from "../api/flow";
 import { RpcError } from "../rpc/errors";
+import { editor } from "../state/editor";
 import RunListView from "./RunListView.vue";
-import type { RunRecord } from "../types";
+import type { RunRecord, WorkflowSummary } from "../types";
 
 vi.mock("../api/flow", async (original) => ({
   ...(await original<typeof import("../api/flow")>()),
@@ -25,6 +26,19 @@ vi.mock("../state/editor", () => ({
 }));
 vi.mock("../state/modal", () => ({ confirmDialog: vi.fn(async () => true) }));
 vi.mock("../state/toast", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+
+/** RouterLink 桩渲染 href，互跳路由可断言 */
+const RouterLinkStub = { props: ["to"], template: '<a :href="to"><slot /></a>' };
+
+function workflow(workflowId: string, name: string): WorkflowSummary {
+  return {
+    workflow_id: workflowId,
+    name,
+    latest_version: 1,
+    published_version: 1,
+    created_at: "2026-10-18T00:00:00Z",
+  };
+}
 
 function run(id: string, workflowId: string): RunRecord {
   return {
@@ -49,11 +63,12 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
 }
 
 const wrappers: ReturnType<typeof mount>[] = [];
-function create() {
+function create(props: { workflowId?: string } = {}) {
   const wrapper = mount(RunListView, {
+    props,
     global: {
       stubs: {
-        RouterLink: { props: ["to"], template: "<a><slot /></a>" },
+        RouterLink: RouterLinkStub,
       },
     },
   });
@@ -63,6 +78,7 @@ function create() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  editor.workflows.splice(0);
 });
 
 afterEach(() => {
@@ -103,11 +119,7 @@ describe("run list refresh", () => {
       .mockImplementationOnce(() => first.promise)
       .mockImplementationOnce(() => second.promise);
 
-    const w = mount(RunListView, {
-      props: { workflowId: "wf-a" },
-      global: { stubs: { RouterLink: { props: ["to"], template: "<a><slot /></a>" } } },
-    });
-    wrappers.push(w);
+    const w = create({ workflowId: "wf-a" });
     await flushPromises();
     expect(api.listRuns).toHaveBeenCalledTimes(1);
 
@@ -137,5 +149,49 @@ describe("run list 大值降级", () => {
     expect(api.listRunsLite).toHaveBeenCalledTimes(1);
     expect(w.text()).toContain("lite-workflow");
     expect(w.text()).toContain("已降级为原始快照扫描");
+  });
+});
+
+describe("run list workflow 模式页头与互跳", () => {
+  it("页头显示工作流名（缺失回退 id），并给出编辑器/版本/触发器互跳", async () => {
+    editor.workflows.push(workflow("wf-a", "订单流程"));
+    vi.mocked(api.listRuns).mockResolvedValue([]);
+    const w = create({ workflowId: "wf-a" });
+    await flushPromises();
+
+    expect(w.find(".page-header h2").text()).toContain("订单流程");
+    expect(
+      w
+        .findAll(".wf-links a")
+        .map((a) => a.attributes("href")),
+    ).toEqual(["/workflows/wf-a", "/workflows/wf-a/versions", "/workflows/wf-a/triggers"]);
+  });
+
+  it("工作流不在清单里时回退显示 id", async () => {
+    vi.mocked(api.listRuns).mockResolvedValue([]);
+    const w = create({ workflowId: "wf-unknown" });
+    await flushPromises();
+
+    expect(w.find(".page-header h2").text()).toContain("wf-unknown");
+    expect(w.find(".wf-links").exists()).toBe(true);
+  });
+
+  it("run id 复制单元格是 button.copy-id，点击复制并保留 title", async () => {
+    const writeText = vi.fn(async () => {});
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+    vi.mocked(api.listRuns).mockResolvedValue([run("run-00000001", "wf-1")]);
+    const w = create();
+    await flushPromises();
+
+    const cell = w.find("button.copy-id");
+    expect(cell.exists()).toBe(true);
+    expect(cell.attributes("title")).toBe("run-00000001");
+    await cell.trigger("click");
+    expect(writeText).toHaveBeenCalledWith("run-00000001");
+    // 全局模式没有工作流互跳区
+    expect(w.find(".wf-links").exists()).toBe(false);
   });
 });

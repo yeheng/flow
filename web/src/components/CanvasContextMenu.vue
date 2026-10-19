@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { nextTick, onMounted, onUnmounted, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
+import type { OverlayEntry } from "../state/overlays";
 
 /** 子菜单项：group 相邻不同时渲染分组小标题（「添加节点」按分类分组） */
 export interface MenuSubEntry {
@@ -22,20 +23,32 @@ export interface MenuEntry {
   children?: MenuSubEntry[];
 }
 
-const props = defineProps<{ x: number; y: number; entries: MenuEntry[] }>();
-const emit = defineEmits<{ close: [] }>();
+/** 栈上 context-menu 条目的载荷（渲染方 FlowCanvas） */
+export interface MenuPayload {
+  x: number;
+  y: number;
+  entries: MenuEntry[];
+}
+
+const props = defineProps<{ entry: OverlayEntry<MenuPayload> }>();
 
 const root = ref<HTMLElement>();
-const pos = ref({ left: props.x, top: props.y });
+const pos = ref({ left: props.entry.payload.x, top: props.entry.payload.y });
+const entries = computed(() => props.entry.payload.entries);
 /** hover 展开的子菜单：key + 是否向左翻转（右侧放不下时） */
 const openSub = ref<{ key: string; flip: boolean } | null>(null);
+
+/** 唯一关闭出口：Esc 由全局弹层栈关栈顶（=本条目），此处不再监听 Escape */
+function close(): void {
+  props.entry.close();
+}
 
 onMounted(() => {
   // 越界钳制：菜单尽量完整落在视口内
   const rect = root.value?.getBoundingClientRect();
   if (rect) {
-    pos.value.left = Math.max(4, Math.min(props.x, window.innerWidth - rect.width - 8));
-    pos.value.top = Math.max(4, Math.min(props.y, window.innerHeight - rect.height - 8));
+    pos.value.left = Math.max(4, Math.min(pos.value.left, window.innerWidth - rect.width - 8));
+    pos.value.top = Math.max(4, Math.min(pos.value.top, window.innerHeight - rect.height - 8));
   }
   // 打开即聚焦首项，键盘可以直接操作
   focusItemAt(0);
@@ -51,7 +64,7 @@ onUnmounted(() => {
 function onPointerDownOutside(e: PointerEvent): void {
   // 点在菜单内：交给各项的 click 处理（pointerdown 先于 click，不能提前卸载）
   if (root.value?.contains(e.target as Node)) return;
-  emit("close");
+  close();
 }
 
 /** 可聚焦菜单项（role=menuitem 且未禁用）；子菜单项只在展开时存在于 DOM */
@@ -79,14 +92,11 @@ function focusFirstSub(): void {
   if (first) focusItem(first);
 }
 
+/** 菜单内键盘导航；Escape 不在此处理——全局弹层栈关栈顶（=本菜单） */
 function onKeydown(e: KeyboardEvent): void {
   const els = itemEls();
   const cur = els.indexOf(document.activeElement as HTMLElement);
   switch (e.key) {
-    case "Escape":
-      e.preventDefault();
-      emit("close");
-      return;
     case "ArrowDown":
       e.preventDefault();
       focusItemAt(cur + 1);
@@ -116,10 +126,11 @@ function onKeydown(e: KeyboardEvent): void {
   }
 }
 
-function run(entry: MenuEntry | MenuSubEntry): void {
-  if (entry.disabled) return;
-  entry.action?.();
-  emit("close");
+/** 执行菜单项动作后关闭（close 是唯一关闭出口） */
+function run(item: MenuEntry | MenuSubEntry): void {
+  if (item.disabled) return;
+  item.action?.();
+  close();
 }
 
 function onItemEnter(entry: MenuEntry, el: HTMLElement): void {

@@ -24,12 +24,14 @@ import {
 import { history, redo, undo } from "../state/history";
 import { promptDialog } from "../state/modal";
 import { monitor, startRun } from "../state/monitor";
+import { openOverlay, topOverlay } from "../state/overlays";
 import { saveWorkflowAsNodeTemplate } from "../state/templates";
 import { toast } from "../state/toast";
 import AppButton from "../components/AppButton.vue";
 import NodePalette from "../components/NodePalette.vue";
 import FlowCanvas from "../components/FlowCanvas.vue";
 import ParamsModal from "../components/ParamsModal.vue";
+import BusinessNodeDialog from "../components/BusinessNodeDialog.vue";
 import ResizeHandle from "../components/ResizeHandle.vue";
 import RunPanel from "../components/RunPanel.vue";
 import { usePanelResize } from "../state/panel-resize";
@@ -66,6 +68,18 @@ function toggleConsoleMode(): void {
   localStorage.setItem(CONSOLE_MODE_KEY, consoleMode.value);
 }
 
+// ---- 窄屏降级：窗口 <1080px 时控制台强制底部，只影响显示、不写用户保存的偏好 ----
+const viewportW = ref(window.innerWidth);
+function onViewportResize(): void {
+  viewportW.value = window.innerWidth;
+}
+onMounted(() => window.addEventListener("resize", onViewportResize));
+onUnmounted(() => window.removeEventListener("resize", onViewportResize));
+
+const effectiveConsoleMode = computed<ConsoleMode>(() =>
+  viewportW.value < 1080 ? "footer" : consoleMode.value,
+);
+
 // footer 拖上边缘改高度，sidebar 拖左边缘改宽度，两套尺寸各自持久化
 const drawerEl = ref<HTMLElement | null>(null);
 const footerResize = usePanelResize({
@@ -85,7 +99,7 @@ const sidebarResize = usePanelResize({
   measure: (rect, e) => rect.right - e.clientX,
 });
 const consoleResize = computed(() =>
-  consoleMode.value === "footer" ? footerResize : sidebarResize,
+  effectiveConsoleMode.value === "footer" ? footerResize : sidebarResize,
 );
 
 function onConsoleDragStart(e: PointerEvent): void {
@@ -94,14 +108,18 @@ function onConsoleDragStart(e: PointerEvent): void {
 
 // 左侧节点面板：拖右边缘改宽度
 const paletteEl = ref<HTMLElement | null>(null);
+/** 面板宽度上限 clamp 到 min(240px, 32vw)：窄屏不挤占画布，宽屏也不越拖越宽 */
+const paletteMax = computed(() => Math.min(240, viewportW.value * 0.32));
 const paletteResize = usePanelResize({
   target: paletteEl,
   storageKey: "flow.palette-w",
   fallback: 240,
   min: 180,
-  max: () => (paletteEl.value?.parentElement?.clientWidth ?? 1200) * 0.5,
+  max: () => paletteMax.value,
   measure: (rect, e) => e.clientX - rect.left,
 });
+/** 显示宽度同样过 clamp：旧偏好值可能大于当前上限 */
+const paletteWidth = computed(() => Math.min(paletteResize.size.value, paletteMax.value));
 
 async function load(id: string): Promise<void> {
   if (!(await ensureNodeTypes())) return;
@@ -152,11 +170,10 @@ function isEditableTarget(t: EventTarget | null): boolean {
 
 // 快捷键只在编辑器页注册（运行详情等只读页不受影响）；输入框聚焦时不劫持
 function onKeydown(e: KeyboardEvent): void {
-  // 弹窗打开时吞掉全部快捷键：防删除/撤销/保存穿透到弹窗后面的画布
-  if (editor.paramsOpen) {
-    if (e.key === "Escape") editor.paramsOpen = false;
-    return;
-  }
+  // 有弹层（参数面板/业务节点/右键菜单/confirm…）开着时吞掉全部快捷键：
+  // 防删除/撤销/保存穿透到弹层后面的画布；Esc 由全局弹层栈关栈顶
+  if (topOverlay.value) return;
+  // Esc 关校验浮层只在无弹层时生效
   if (e.key === "Escape" && validationUi.open) {
     validationUi.open = false;
     return;
@@ -213,21 +230,21 @@ onUnmounted(() => window.removeEventListener("pointerdown", onPointerDownOutside
 function locateError(nodeId?: string): void {
   if (nodeId) {
     editor.selectedNodeId = nodeId;
-    editor.paramsOpen = true;
+    openOverlay("params", { nodeId });
   }
   validationUi.open = false;
 }
 
-/** 一键存为常用节点：把当前工作流打包成 sub_workflow 单节点模板进模板区 */
+/** 一键存为业务节点：把当前工作流打包成 sub_workflow 单节点业务节点（分类「子流程」） */
 async function saveAsNode(): Promise<void> {
   if (!editor.workflowId) return;
   const name = await promptDialog(
-    "将当前工作流打包为可复用的子流程节点，存入左侧模板区，之后可在其他工作流中直接插入。注意：该工作流需要有已发布版本，才能作为子流程运行。",
+    "将当前工作流打包为可复用的子流程节点，存入左侧「业务节点」区，之后可在其他工作流中直接插入。注意：该工作流需要有已发布版本，才能作为子流程运行。",
     editor.workflowName,
   );
   if (!name?.trim()) return;
   const created = await saveWorkflowAsNodeTemplate(editor.workflowId, name);
-  if (created) toast.success("已存为常用节点，可在模板区插入");
+  if (created) toast.success("已存为业务节点（子流程），可在「业务节点」区插入");
 }
 </script>
 
@@ -250,6 +267,20 @@ async function saveAsNode(): Promise<void> {
         </span>
         <span v-if="dirty" class="wf-dirty">（未保存）</span>
       </span>
+      <!-- 工作流子页互跳：版本/触发器/运行记录一条紧凑链接行 -->
+      <nav class="editor-subnav">
+        <template v-if="editor.workflowId">
+          <RouterLink class="link" :to="`/workflows/${editor.workflowId}/versions`"
+            >版本</RouterLink
+          >
+          <RouterLink class="link" :to="`/workflows/${editor.workflowId}/triggers`">
+            触发器
+          </RouterLink>
+          <RouterLink class="link" :to="`/workflows/${editor.workflowId}/runs`"
+            >运行记录</RouterLink
+          >
+        </template>
+      </nav>
       <div class="editor-actions">
         <AppButton title="撤销 (⌘Z)" :disabled="!history.canUndo" @click="undo()">↶ 撤销</AppButton>
         <AppButton title="重做 (⌘⇧Z)" :disabled="!history.canRedo" @click="redo()"
@@ -257,11 +288,11 @@ async function saveAsNode(): Promise<void> {
         >
         <AppButton :disabled="editor.nodes.length === 0" @click="autoLayout()">自动布局</AppButton>
         <AppButton
-          title="把当前工作流打包成可复用的子流程节点（存入模板区）"
+          title="把当前工作流打包成可复用的子流程节点（存入「业务节点」区）"
           :disabled="!editor.workflowId"
           @click="saveAsNode()"
         >
-          存为节点
+          存为业务节点
         </AppButton>
         <span ref="validationAnchor" class="validation-anchor">
           <button
@@ -284,27 +315,6 @@ async function saveAsNode(): Promise<void> {
             </button>
           </div>
         </span>
-        <RouterLink
-          v-if="editor.workflowId"
-          class="link"
-          :to="`/workflows/${editor.workflowId}/versions`"
-        >
-          版本
-        </RouterLink>
-        <RouterLink
-          v-if="editor.workflowId"
-          class="link"
-          :to="`/workflows/${editor.workflowId}/triggers`"
-        >
-          触发器
-        </RouterLink>
-        <RouterLink
-          v-if="editor.workflowId"
-          class="link"
-          :to="`/workflows/${editor.workflowId}/runs`"
-        >
-          运行记录
-        </RouterLink>
         <AppButton title="保存 (⌘S)" :disabled="saving" @click="save()">
           {{ saving ? "保存中…" : "保存" }}
         </AppButton>
@@ -322,13 +332,13 @@ async function saveAsNode(): Promise<void> {
         </AppButton>
       </div>
     </div>
-    <main class="editor-main" :class="`console-${consoleMode}`">
+    <main class="editor-main" :class="`console-${effectiveConsoleMode}`">
       <div class="editor-body">
         <aside
           ref="paletteEl"
           class="left"
           :class="{ collapsed: paletteCollapsed, resizing: paletteResize.active.value }"
-          :style="paletteCollapsed ? undefined : { width: paletteResize.size.value + 'px' }"
+          :style="paletteCollapsed ? undefined : { width: paletteWidth + 'px' }"
         >
           <NodePalette />
           <ResizeHandle
@@ -347,24 +357,25 @@ async function saveAsNode(): Promise<void> {
         ref="drawerEl"
         class="run-drawer"
         :style="
-          consoleMode === 'footer'
+          effectiveConsoleMode === 'footer'
             ? { height: consoleResize.size.value + 'px' }
             : { width: consoleResize.size.value + 'px' }
         "
       >
         <ResizeHandle
-          :orientation="consoleMode === 'footer' ? 'horizontal' : 'vertical'"
-          :class="consoleMode === 'footer' ? 'edge-top' : 'edge-left'"
+          :orientation="effectiveConsoleMode === 'footer' ? 'horizontal' : 'vertical'"
+          :class="effectiveConsoleMode === 'footer' ? 'edge-top' : 'edge-left'"
           @dragstart="onConsoleDragStart"
         />
         <RunPanel
-          :layout="consoleMode"
+          :layout="effectiveConsoleMode"
           @collapse="runDrawerOpen = false"
           @toggle-layout="toggleConsoleMode"
         />
       </section>
     </main>
     <ParamsModal />
+    <BusinessNodeDialog />
   </div>
 </template>
 
@@ -495,6 +506,14 @@ aside.left.collapsed {
 .wf-dirty {
   color: var(--warn);
   font-weight: 400;
+}
+
+/* 工作流子页互跳：紧凑链接行 */
+.editor-subnav {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
 }
 
 .editor-actions {

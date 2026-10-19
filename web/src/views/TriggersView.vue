@@ -307,6 +307,11 @@ function invokeEchoed(w: Webhook): boolean {
   return w.invoke_version != null || w.invoke_key_hash != null;
 }
 
+/** 调用合同已配置（固定版本或调用密钥任一）：调用示例以 /invoke/{token} 为主 */
+function contractReady(w: Webhook): boolean {
+  return fixedVersionOf(w) !== null || keyHashOf(w) !== null;
+}
+
 function keyHashPrefix(w: Webhook): string {
   return (keyHashOf(w) ?? "").slice(0, 12);
 }
@@ -419,6 +424,9 @@ onUnmounted(() => {
       </h2>
       <div class="header-actions">
         <AppButton @click="refresh()">刷新</AppButton>
+        <!-- 工作流子页互跳 -->
+        <RouterLink class="link" :to="`/workflows/${workflowId}/versions`">版本</RouterLink>
+        <RouterLink class="link" :to="`/workflows/${workflowId}/runs`">运行记录</RouterLink>
         <RouterLink class="link" :to="`/workflows/${workflowId}`">打开编辑器 →</RouterLink>
       </div>
     </div>
@@ -570,8 +578,24 @@ onUnmounted(() => {
             <tr class="curl-row">
               <td colspan="4">
                 <details>
-                  <summary class="muted">curl 示例</summary>
-                  <pre class="mono curl-example">{{ curlExample(w) }}</pre>
+                  <summary class="muted">调用示例</summary>
+                  <!-- 主次：已配置调用合同时业务调用 /invoke/{token} 为主示例 -->
+                  <template v-if="contractReady(w)">
+                    <p class="muted curl-label">
+                      业务调用：POST /invoke/{{ w.token }}（Bearer 调用密钥 + Idempotency-Key）
+                    </p>
+                    <pre class="mono curl-example">{{ invokeCurl(webhookBase(), w.token) }}</pre>
+                    <pre class="mono curl-example">{{ resultCurl(webhookBase()) }}</pre>
+                    <p class="muted curl-label">运维/管理调用（管理 token）</p>
+                    <pre class="mono curl-example">{{ curlExample(w) }}</pre>
+                  </template>
+                  <template v-else>
+                    <p class="muted curl-label">
+                      未配置调用合同：以下为运维/管理调用（管理 token）；配置调用合同后主示例为
+                      /invoke/{token}
+                    </p>
+                    <pre class="mono curl-example">{{ curlExample(w) }}</pre>
+                  </template>
                 </details>
               </td>
             </tr>
@@ -734,6 +758,11 @@ onUnmounted(() => {
 
 .curl-row summary {
   cursor: pointer;
+  font-size: 11px;
+}
+
+.curl-label {
+  margin: 6px 0 2px;
   font-size: 11px;
 }
 

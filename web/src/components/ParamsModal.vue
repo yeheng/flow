@@ -1,9 +1,15 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, useId, watch } from "vue";
-import { editor, selectedNode } from "../state/editor";
+import { selectedNode } from "../state/editor";
 import { commitParams } from "../state/history";
+import { overlaysOf, type OverlayEntry } from "../state/overlays";
 import SchemaField from "./SchemaField.vue";
 import AppButton from "./AppButton.vue";
+
+/** 栈上 params 条目的载荷：nodeId 标识编辑目标（入口：双击节点/右键「编辑参数」/校验定位） */
+export interface ParamsPayload {
+  nodeId: string;
+}
 
 const node = selectedNode;
 const data = computed(() => node.value?.data ?? null);
@@ -11,7 +17,11 @@ const desc = computed(() => data.value?.nodeType ?? null);
 const schema = computed(() => desc.value?.params_schema ?? null);
 const nameInput = ref<HTMLInputElement>();
 
-const open = computed(() => editor.paramsOpen && !!node.value);
+/** 开 = 栈上有 params 条目且选中节点还在；Esc 由全局弹层栈关栈顶，此处不再监听 */
+const entry = computed<OverlayEntry<ParamsPayload> | null>(
+  () => overlaysOf<ParamsPayload>("params")[0] ?? null,
+);
+const open = computed(() => !!entry.value && !!node.value);
 
 const dialogEl = ref<HTMLElement | null>(null);
 const titleId = useId();
@@ -43,18 +53,13 @@ watch(
 );
 
 function close(): void {
-  editor.paramsOpen = false;
+  entry.value?.close();
 }
 
-// Esc/Tab 挂 window：点过消息区、焦点跑到弹窗外也响应
+// Tab 挂 window：点过消息区、焦点跑到弹窗外也循环（Esc 走全局弹层栈）
 function onWindowKeydown(e: KeyboardEvent): void {
-  if (!open.value) return;
-  if (e.key === "Escape") {
-    e.preventDefault();
-    close();
-  } else if (e.key === "Tab") {
-    trapTab(e);
-  }
+  if (!open.value || e.key !== "Tab") return;
+  trapTab(e);
 }
 
 /** Tab 焦点只在弹窗内循环；内部非边缘焦点交给控件本身（Monaco 靠 Tab 缩进） */

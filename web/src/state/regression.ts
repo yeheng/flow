@@ -21,6 +21,10 @@ export function regressionBaseline(sourceDetail: string | null | undefined): str
  * `{type:"ref",value:{output_id,total_bytes,…}}`），而 run.get.view 返回业务值。
  * 展示前只解包「恰好 type+value 两个键」的信封，避免误伤业务对象；ref 是不可
  * 内联的大值，给出可行动占位而不是内部指针。
+ *
+ * ⚠ 契约债（临时补丁）：信封嗅探可能把「恰好长成信封形状的业务值」误判拆包。
+ * 根因是 run.compare 不物化业务值；待后端 compare_runs 物化 output 后，
+ * **删除这里的解包逻辑**，直接按业务值渲染。
  */
 export function unwrapComparisonValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(unwrapComparisonValue);
@@ -188,10 +192,15 @@ export interface ComparisonSummary {
   tone: "ok" | "danger" | "warn";
 }
 
+/** 差异条目被服务端截断的上限（run.compare 的 record_difference 上限，见 RunComparison.truncated） */
+const COMPARISON_DIFF_CAP = 64;
+
 /** 对比结论：两侧未终结时不做通过/失败断言（complete=false） */
 export function comparisonSummary(report: RunComparison): ComparisonSummary {
   if (!report.complete) return { label: "两侧运行尚未结束，暂不能判定", tone: "warn" };
   if (report.passed) return { label: "与基线一致", tone: "ok" };
+  // truncated：差异只返回到上限，differences.length 是下界而非精确计数
+  if (report.truncated) return { label: `≥${COMPARISON_DIFF_CAP} 处与基线不同`, tone: "danger" };
   return { label: `${report.differences.length} 处与基线不同`, tone: "danger" };
 }
 

@@ -3,11 +3,13 @@ import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import * as api from "../api/flow";
 import { errText } from "../rpc/client";
-import { isResponseTooLarge } from "../rpc/errors";
 import { editor, ensureNodeTypes, refreshWorkflows } from "../state/editor";
 import { attachRun, detachRun, monitor } from "../state/monitor";
+import { devMode } from "../state/dev";
 import { runBadgeClass, runStatusLabel, sourceLabel, TERMINAL_RUN_STATUSES } from "../state/labels";
 import { regressionBaseline } from "../state/regression";
+import { openOverlay, overlaysOf } from "../state/overlays";
+import { staleGuard } from "../state/stale";
 import { describeStoredValue, rawRunToRecord, type ValueMarker } from "../state/run-raw";
 import { toast } from "../state/toast";
 import type { Definition, RunEvent, RunRecord } from "../types";
@@ -35,16 +37,24 @@ const events = ref<RunEvent[] | null>(null);
 const eventsCursor = ref<Record<string, unknown> | null>(null);
 const eventsLoading = ref(false);
 const activeTab = ref<"timeline" | "logs">("timeline");
+// 关掉开发者模式时回到默认运行视图（日志页签属于调试面）
+watch(devMode, (on) => {
+  if (!on) activeTab.value = "timeline";
+});
 /** 快速切换 run（子 run 链接）时旧加载的响应一律丢弃 */
-let generation = 0;
+const loadStale = staleGuard();
 
-/** 回归：以当前 run 为基线发起候选；候选 run 反过来给出基线与对比入口 */
-const showRegression = ref(false);
-const showCompare = ref(false);
-const compareBaseline = ref<string | null>(null);
-const compareCandidate = ref("");
-/** 回归候选终结后自动打开对比，同一页面只自动弹一次 */
-const autoCompared = ref(false);
+/** 回归：以当前 run 为基线发起候选；候选 run 反过来给出基线与对比入口。
+ * 弹层状态归全局弹层栈（kind="compare"/"regression"），本视图只渲染条目。 */
+const compareEntries = computed(() =>
+  overlaysOf<{ baseline: string | null; candidate: string }>("compare"),
+);
+const regressionEntries = computed(() => overlaysOf<{ baseline: RunRecord }>("regression"));
+
+/** 视图自有弹层：切 run/卸载时关闭，防路由切换残留 */
+function closeRunOverlays(): void {
+  for (const entry of [...compareEntries.value, ...regressionEntries.value]) entry.close();
+}
 
 /**
  * 大值降级：物化视图（run.get.view）超 8MB 预算整体失败时走原始信封渲染，
@@ -104,22 +114,22 @@ const isTerminalRun = computed(() => TERMINAL_RUN_STATUSES.has(currentStatus.val
 const regressionBase = computed(() => regressionBaseline(record.value?.source_detail));
 
 function openCompare(prefill?: string | null, candidate?: string): void {
-  compareBaseline.value = prefill ?? regressionBase.value ?? null;
-  compareCandidate.value = candidate ?? record.value?.id ?? "";
-  showCompare.value = true;
+  openOverlay("compare", {
+    baseline: prefill ?? regressionBase.value ?? null,
+    candidate: candidate ?? record.value?.id ?? "",
+  });
+}
+
+function openRegression(): void {
+  if (record.value) openOverlay("regression", { baseline: record.value });
 }
 
 function onRegressionCreated(runId: string): void {
-  showRegression.value = false;
   void router.push(`/runs/${runId}`);
 }
 
-// 回归候选一旦终结就自动对比基线（这就是它存在的目的）；失败由面板内联展示
-watch([currentStatus, regressionBase, () => record.value?.id], () => {
-  if (autoCompared.value || !record.value || !regressionBase.value || !isTerminalRun.value) return;
-  autoCompared.value = true;
-  openCompare(regressionBase.value);
-});
+// 回归候选终结后不自动弹遮罩：只亮「与基线对比」入口（UI 不做用户没要求的动作）
+const compareReady = computed(() => !!regressionBase.value && isTerminalRun.value);
 
 // 运行中打开的 run：run.get 快照不会自己刷新。monitor 投影进入终态后补拉一次
 // record，让输出/错误/「实时」徽章与右侧时间线一致。journal 不记录终态墙钟，
@@ -127,10 +137,10 @@ watch([currentStatus, regressionBase, () => record.value?.id], () => {
 watch(currentStatus, async (status) => {
   const current = record.value;
   if (!current || !status || status === current.status) return;
-  const gen = generation;
+  const gen = loadStale.mark();
   try {
     const fresh = await api.getRun(current.id);
-    if (gen !== generation || record.value?.id !== current.id) return;
+    if (loadStale.stale(gen) || record.value?.id !== current.id) return;
     record.value = fresh.run;
     live.value = fresh.live;
   } catch {
@@ -230,17 +240,17 @@ async function copyOutput(): Promise<void> {
 /** 原始事件按游标分页，长 run 不全量拉取 */
 async function loadEvents(cursor: Record<string, unknown> | null): Promise<void> {
   if (eventsLoading.value) return;
-  const gen = generation;
+  const gen = loadStale.mark();
   eventsLoading.value = true;
   try {
     const page = await api.runEventsPage(props.runId, cursor);
-    if (gen !== generation) return;
+    if (loadStale.stale(gen)) return;
     events.value = [...(events.value ?? []), ...page.events];
     eventsCursor.value = page.nextCursor;
   } catch (e) {
-    if (gen === generation) toast.error(errText(e));
+    if (!loadStale.stale(gen)) toast.error(errText(e));
   } finally {
-    if (gen === generation) eventsLoading.value = false;
+    if (!loadStale.stale(gen)) eventsLoading.value = false;
   }
 }
 
@@ -250,7 +260,7 @@ async function toggleEvents(): Promise<void> {
 }
 
 async function load(runId: string): Promise<void> {
-  const gen = ++generation;
+  const gen = loadStale.begin();
   record.value = null;
   definition.value = null;
   loadingDefinition.value = true;
@@ -258,38 +268,27 @@ async function load(runId: string): Promise<void> {
   eventsCursor.value = null;
   eventsLoading.value = false;
   showEvents.value = false;
-  showRegression.value = false;
-  showCompare.value = false;
-  compareBaseline.value = null;
-  compareCandidate.value = "";
-  autoCompared.value = false;
+  closeRunOverlays();
   liteMode.value = false;
   candidates.value = null;
   candidatesLoaded = false;
   try {
     const r = await api.getRun(runId);
-    if (gen !== generation) return;
+    if (loadStale.stale(gen)) return;
     record.value = r.run;
     live.value = r.live;
-  } catch (e) {
-    if (gen !== generation) return;
-    if (isResponseTooLarge(e)) {
-      // 降级：原始信封 + 下载入口，不挂时间线（timeline 同样物化大值会失败）
-      try {
-        const raw = await api.getRunRaw(runId);
-        if (gen !== generation) return;
-        record.value = rawRunToRecord(raw);
-        live.value = false;
-        liteMode.value = true;
-      } catch (e2) {
-        loadingDefinition.value = false;
-        toast.error(`加载 run 失败：${errText(e2)}`);
-        void router.replace("/runs");
-        return;
-      }
-    } else {
+  } catch {
+    if (loadStale.stale(gen)) return;
+    // 物化读面失败（超大值 / 服务端错误）：不猜错误码，直接试原始信封读面
+    try {
+      const raw = await api.getRunRaw(runId);
+      if (loadStale.stale(gen)) return;
+      record.value = rawRunToRecord(raw);
+      live.value = false;
+      liteMode.value = true;
+    } catch (e2) {
       loadingDefinition.value = false;
-      toast.error(`加载 run 失败：${errText(e)}`);
+      toast.error(`加载 run 失败：${errText(e2)}`);
       void router.replace("/runs");
       return;
     }
@@ -298,17 +297,21 @@ async function load(runId: string): Promise<void> {
   if (await ensureNodeTypes()) {
     try {
       const w = await api.getWorkflow(record.value.workflow_id, record.value.workflow_version);
-      if (gen === generation) definition.value = w.definition;
+      if (!loadStale.stale(gen)) definition.value = w.definition;
     } catch (e) {
-      if (gen === generation) toast.error(`加载工作流定义失败：${errText(e)}`);
+      if (!loadStale.stale(gen)) toast.error(`加载工作流定义失败：${errText(e)}`);
     }
   }
-  if (gen === generation) loadingDefinition.value = false;
-  if (liteMode.value) return;
+  if (!loadStale.stale(gen)) loadingDefinition.value = false;
+  if (liteMode.value) {
+    // 降级页不挂载监控：先清掉上一个 run 的投影，否则右侧会显示别的 run 的数据
+    await detachRun();
+    return;
+  }
   try {
     await attachRun(runId);
   } catch (e) {
-    if (gen === generation) toast.error(errText(e));
+    if (!loadStale.stale(gen)) toast.error(errText(e));
   }
 }
 
@@ -324,8 +327,10 @@ watch(
   },
 );
 
-// 离开时 detach：仅当 monitor 仍挂在当前 run 上，避免误杀编辑器/其他页新建的 attach
+// 离开时 detach：仅当 monitor 仍挂在当前 run 上，避免误杀编辑器/其他页新建的 attach；
+// 自有弹层一并关闭，防路由切换残留
 onUnmounted(() => {
+  closeRunOverlays();
   if (monitor.runId === props.runId) void detachRun();
 });
 </script>
@@ -334,6 +339,7 @@ onUnmounted(() => {
   <div class="run-detail">
     <div v-if="record" class="run-header">
       <div class="run-header-row">
+        <RouterLink class="link run-back" to="/runs">← 运行记录</RouterLink>
         <span class="badge" :class="runBadgeClass(currentStatus)">
           {{ runStatusLabel(currentStatus) }}
         </span>
@@ -352,7 +358,7 @@ onUnmounted(() => {
             v-if="isTerminalRun"
             variant="link"
             title="以本运行为基线，用指定版本重新执行（复用已记录的外部结果，不产生副作用）"
-            @click="showRegression = true"
+            @click="openRegression()"
           >
             回归
           </AppButton>
@@ -361,7 +367,7 @@ onUnmounted(() => {
             title="与另一个 run 比较状态、输出与节点结果"
             @click="openCompare()"
           >
-            对比基线
+            与基线比较
           </AppButton>
         </span>
       </div>
@@ -383,6 +389,15 @@ onUnmounted(() => {
           <RouterLink class="link" :to="`/runs/${regressionBase}`" :title="regressionBase">
             {{ regressionBase.slice(0, 8) }}…
           </RouterLink>
+          <!-- 候选终结后亮对比入口（不自动弹遮罩） -->
+          <AppButton
+            v-if="compareReady"
+            variant="link"
+            title="比较本候选与基线的状态、输出与节点结果"
+            @click="openCompare()"
+          >
+            与基线比较
+          </AppButton>
         </span>
       </div>
     </div>
@@ -462,7 +477,7 @@ onUnmounted(() => {
                 <span class="badge" :class="runBadgeClass(c.status)">
                   {{ runStatusLabel(c.status) }}
                 </span>
-                <AppButton variant="link" @click="openCompare(record.id, c.id)">与它对比</AppButton>
+                <AppButton variant="link" @click="openCompare(record.id, c.id)">比较</AppButton>
               </div>
             </template>
             <p v-else-if="candidates" class="run-hint">
@@ -472,82 +487,99 @@ onUnmounted(() => {
         </template>
         <p v-else class="run-hint">加载中…</p>
       </div>
-      <aside ref="asideEl" class="right" :style="{ width: asideResize.size.value + 'px' }">
+      <aside
+        ref="asideEl"
+        class="right"
+        :style="{ width: asideResize.size.value + 'px', maxWidth: '45vw' }"
+      >
         <ResizeHandle
           orientation="vertical"
           class="edge-left"
           @dragstart="asideResize.onDragStart"
         />
-        <div class="aside-tabs">
-          <button
-            class="aside-tab"
-            :class="{ active: activeTab === 'timeline' }"
-            @click="activeTab = 'timeline'"
-          >
-            运行
-          </button>
-          <button
-            class="aside-tab"
-            :class="{ active: activeTab === 'logs' }"
-            @click="activeTab = 'logs'"
-          >
-            日志（{{ monitor.logs.length }}）
-          </button>
-        </div>
-
-        <NodeInspector
-          v-if="inspectorNodeId"
-          class="aside-inspector"
-          :node-id="inspectorNodeId"
-          @close="closeInspector"
-          @open-child="onOpenChild"
-        />
-
-        <template v-if="activeTab === 'timeline'">
-          <RunMonitor v-if="monitor.runId" child-run-navigate :run-input="record?.input" />
-          <p v-else class="run-hint">正在加载…</p>
+        <template v-if="liteMode">
+          <p class="run-hint run-lite-hint">
+            该运行含超大值：时间线/日志不可用。完整输入/输出可在左侧下载。
+          </p>
         </template>
-        <LogConsole v-else class="aside-log-console" @select-node="onSelectNode" />
-
-        <div class="events-toggle">
-          <AppButton type="button" variant="link" @click="toggleEvents">
-            {{ showEvents ? "收起原始事件" : "展开原始事件" }}
-          </AppButton>
-        </div>
-        <div v-if="showEvents" class="events-list">
-          <p v-if="events === null" class="run-hint">加载中…</p>
-          <template v-else>
-            <div v-for="e in events" :key="`${e.lsn}:${e.event_index}`" class="events-item mono">
-              <span class="muted">#{{ e.event.run_seq }}</span> {{ e.event.kind }}
-              <span v-if="e.event.node_id" class="muted">{{ e.event.node_id }}</span>
-            </div>
-            <p v-if="events.length === 0" class="run-hint">无事件</p>
-            <AppButton
-              v-if="eventsCursor"
-              type="button"
-              variant="link"
-              :disabled="eventsLoading"
-              @click="loadEvents(eventsCursor)"
+        <template v-else>
+          <div v-if="devMode" class="aside-tabs">
+            <button
+              class="aside-tab"
+              :class="{ active: activeTab === 'timeline' }"
+              @click="activeTab = 'timeline'"
             >
-              {{ eventsLoading ? "加载中…" : "加载更多事件" }}
-            </AppButton>
+              运行
+            </button>
+            <button
+              class="aside-tab"
+              :class="{ active: activeTab === 'logs' }"
+              @click="activeTab = 'logs'"
+            >
+              日志（{{ monitor.logs.length }}）
+            </button>
+          </div>
+
+          <NodeInspector
+            v-if="inspectorNodeId"
+            class="aside-inspector"
+            :node-id="inspectorNodeId"
+            @close="closeInspector"
+            @open-child="onOpenChild"
+          />
+
+          <!-- 时间线超物化预算：停止重试并回落到日志面，不让面板永远空白 -->
+          <template v-if="monitor.timelineUnavailable">
+            <p class="run-hint">时间线不可用（数据量大或读取失败）；日志与原始事件仍可查看。</p>
+            <LogConsole class="aside-log-console" @select-node="onSelectNode" />
           </template>
-        </div>
+          <template v-else-if="activeTab === 'logs'">
+            <LogConsole class="aside-log-console" @select-node="onSelectNode" />
+          </template>
+          <template v-else>
+            <RunMonitor v-if="monitor.runId" child-run-navigate :run-input="record?.input" />
+            <p v-else class="run-hint">正在加载…</p>
+          </template>
+
+          <!-- 原始事件属于调试面：只在开发者模式显示 -->
+          <template v-if="devMode">
+            <div class="events-toggle">
+              <AppButton type="button" variant="link" @click="toggleEvents">
+                {{ showEvents ? "收起原始事件" : "展开原始事件" }}
+              </AppButton>
+            </div>
+            <div v-if="showEvents" class="events-list">
+              <p v-if="events === null" class="run-hint">加载中…</p>
+              <template v-else>
+                <div v-for="e in events" :key="`${e.lsn}:${e.event_index}`" class="events-item mono">
+                  <span class="muted">#{{ e.event.run_seq }}</span> {{ e.event.kind }}
+                  <span v-if="e.event.node_id" class="muted">{{ e.event.node_id }}</span>
+                </div>
+                <p v-if="events.length === 0" class="run-hint">无事件</p>
+                <AppButton
+                  v-if="eventsCursor"
+                  type="button"
+                  variant="link"
+                  :disabled="eventsLoading"
+                  @click="loadEvents(eventsCursor)"
+                >
+                  {{ eventsLoading ? "加载中…" : "加载更多事件" }}
+                </AppButton>
+              </template>
+            </div>
+          </template>
+        </template>
       </aside>
     </div>
 
+    <!-- 弹层栈条目渲染：Esc 由全局 host 关栈顶，逐层关闭 -->
     <RegressionDialog
-      v-if="showRegression && record"
-      :baseline="record"
-      @close="showRegression = false"
+      v-for="entry in regressionEntries"
+      :key="entry.id"
+      :entry="entry"
       @created="onRegressionCreated"
     />
-    <RunComparePanel
-      v-if="showCompare && record"
-      :candidate-run-id="compareCandidate"
-      :initial-baseline="compareBaseline"
-      @close="showCompare = false"
-    />
+    <RunComparePanel v-for="entry in compareEntries" :key="entry.id" :entry="entry" />
   </div>
 </template>
 
@@ -573,6 +605,11 @@ onUnmounted(() => {
   display: flex;
   align-items: baseline;
   gap: 10px;
+  flex-wrap: wrap;
+}
+
+.run-back {
+  white-space: nowrap;
 }
 
 .run-header-meta {
@@ -589,6 +626,8 @@ onUnmounted(() => {
   display: flex;
   gap: 10px;
   align-items: baseline;
+  flex-wrap: wrap;
+  min-width: 0;
 }
 
 .run-full-id {

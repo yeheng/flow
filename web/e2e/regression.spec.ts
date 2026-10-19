@@ -21,7 +21,7 @@ async function publishVersion(workflowId: string, code: string): Promise<number>
   return version;
 }
 
-test("回归：同版本复现基线，自动对比通过", async ({ page }) => {
+test("回归：同版本复现基线，对比入口一键对比通过", async ({ page }) => {
   const name = uniq("e2e-回归复现");
   const wf = await seedWorkflow(name, "return {time: Date.now(), random: Math.random()};");
   const { run_id: baseline } = await rpc<{ run_id: string }>("run.start", {
@@ -45,10 +45,12 @@ test("回归：同版本复现基线，自动对比通过", async ({ page }) => 
   await expect(page.locator(".run-header .badge").first()).toContainText("成功", {
     timeout: 15_000,
   });
-  // 回归候选终结后自动打开对比：同版本复现 → 一致
+  // 回归候选终结后亮「与基线对比」入口（不自动弹遮罩），点开才弹对比面板：同版本复现 → 一致
+  await expect(page.locator(".run-header-meta")).toContainText("回归自基线");
+  await expect(page.locator(".compare-modal")).toHaveCount(0);
+  await page.getByRole("button", { name: "与基线对比", exact: true }).click();
   await expect(page.locator(".compare-modal")).toBeVisible({ timeout: 15_000 });
   await expect(page.locator(".compare-modal")).toContainText("与基线一致");
-  await expect(page.locator(".run-header-meta")).toContainText("回归自基线");
 });
 
 test("回归：候选版本输出变化，对比给出差异", async ({ page }) => {
@@ -71,6 +73,8 @@ test("回归：候选版本输出变化，对比给出差异", async ({ page }) 
   expect(candidate).toBeTruthy();
   expect(await waitTerminal(candidate)).toBe("succeeded");
 
+  await expect(page.locator(".compare-modal")).toHaveCount(0);
+  await page.getByRole("button", { name: "与基线对比", exact: true }).click();
   await expect(page.locator(".compare-modal")).toBeVisible({ timeout: 15_000 });
   await expect(page.locator(".compare-modal")).toContainText(/处与基线不同/);
   await expect(page.locator(".compare-modal")).toContainText("最终输出");

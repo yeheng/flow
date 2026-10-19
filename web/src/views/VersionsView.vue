@@ -16,6 +16,8 @@ const router = useRouter();
 const versions = ref<VersionMeta[]>([]);
 /** 首次拉取完成前不展示空态，避免「暂无…」闪烁 */
 const loaded = ref(false);
+/** 拉取失败：错误条 + 重试，而不是把失败当「还没有保存过版本」 */
+const error = ref("");
 const compareA = ref<number | null>(null);
 const compareB = ref<number | null>(null);
 const publishing = ref(false);
@@ -37,8 +39,9 @@ const publishedVersion = computed(() => {
 async function load(): Promise<void> {
   try {
     versions.value = await api.listVersions(props.workflowId);
+    error.value = "";
   } catch (e) {
-    toast.error(errText(e));
+    error.value = errText(e);
     loaded.value = true;
     return;
   }
@@ -84,10 +87,9 @@ onMounted(async () => {
 /** 把该版本定义载入编辑器作为编辑基础；保存时走正常 workflow.update 生成新版本 */
 async function loadToEditor(version: number): Promise<void> {
   if (!(await confirmDiscardIfDirty())) return;
-  await selectWorkflow(props.workflowId, version);
-  if (editor.workflowId === props.workflowId) {
-    void router.push(`/workflows/${props.workflowId}`);
-  }
+  // selectWorkflow 失败时返回 false：不能带着旧画布跳进编辑器
+  if (!(await selectWorkflow(props.workflowId, version))) return;
+  void router.push(`/workflows/${props.workflowId}`);
 }
 
 /**
@@ -151,7 +153,16 @@ async function copyChecksum(checksum: string): Promise<void> {
         版本历史
         <span class="muted">{{ workflowName || workflowId }}</span>
       </h2>
-      <RouterLink class="link" :to="`/workflows/${workflowId}`">打开编辑器 →</RouterLink>
+      <span class="header-links">
+        <RouterLink class="link" :to="`/workflows/${workflowId}`">打开编辑器 →</RouterLink>
+        <RouterLink class="link" :to="`/workflows/${workflowId}/triggers`">触发器</RouterLink>
+        <RouterLink class="link" :to="`/workflows/${workflowId}/runs`">运行记录</RouterLink>
+      </span>
+    </div>
+
+    <div v-if="error" role="alert" class="error-banner">
+      <span>加载版本失败：{{ error }}</span>
+      <AppButton @click="load()">重试</AppButton>
     </div>
 
     <table class="data-table">
@@ -200,7 +211,7 @@ async function copyChecksum(checksum: string): Promise<void> {
       </tbody>
     </table>
     <p v-if="!loaded" class="wf-empty">加载中…</p>
-    <p v-else-if="versions.length === 0" class="wf-empty">该工作流还没有保存过版本</p>
+    <p v-else-if="!error && versions.length === 0" class="wf-empty">该工作流还没有保存过版本</p>
 
     <div v-if="versions.length > 0" class="diff-section">
       <h3>版本对比</h3>
@@ -350,5 +361,11 @@ async function copyChecksum(checksum: string): Promise<void> {
   background: none;
   border-color: transparent;
   text-decoration: underline;
+}
+
+.header-links {
+  display: inline-flex;
+  gap: 12px;
+  align-items: baseline;
 }
 </style>

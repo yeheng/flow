@@ -14,6 +14,7 @@ import {
   waitingInputNodes,
 } from "../state/monitor";
 import { editor } from "../state/editor";
+import { devMode } from "../state/dev";
 import { nodeStateLabel, runBadgeClass, runStatusLabel } from "../state/labels";
 import { confirmDialog } from "../state/modal";
 import { assembleInput, inputFieldText, parseInputFields } from "../state/run-input";
@@ -30,19 +31,11 @@ const props = withDefaults(
 
 const router = useRouter();
 
-/** 「活动」是默认叙事视图；时间线表格与原始日志是开发者界面 */
+/** 「活动」是默认叙事视图；时间线表格与原始日志是开发者界面（开关是共享偏好，state/dev） */
 const activeTab = ref<"activity" | "timeline" | "logs">("activity");
 
-const DEV_MODE_KEY = "flow.run.devMode";
-function savedDevMode(): boolean {
-  try { return globalThis.localStorage?.getItem(DEV_MODE_KEY) === "1"; }
-  catch { return false; }
-}
-const devMode = ref(savedDevMode());
 watch(devMode, (on) => {
   if (!on && activeTab.value !== "activity") activeTab.value = "activity";
-  try { globalThis.localStorage?.setItem(DEV_MODE_KEY, on ? "1" : "0"); }
-  catch { /* Storage is optional; the preference still applies to this session. */ }
 });
 
 /** run 状态文案：单一来源 monitor.status，配色与文案同源 */
@@ -52,17 +45,22 @@ const runStateClass = computed(() => (monitor.status ? runBadgeClass(monitor.sta
 /** human_task 信号输入框内容，key = node_id */
 const signalTexts = reactive<Record<string, string>>({});
 
+/** 草稿键带 run 作用域（`${runId}:${nodeId}`）：跨 run 天然隔离，无需切换清理 */
+function draftKey(nodeId: string): string {
+  return `${monitor.runId}:${nodeId}`;
+}
+
 /** input 节点表单内容：node_id → field key → 文本（初值 = run 输入已有值 → 字段默认值） */
 const inputFormTexts = reactive<Record<string, Record<string, string>>>({});
 
 /** 所有字段都有值才能提交（默认值/预填已兜底的字段天然满足） */
 function inputFormReady(nodeId: string): boolean {
-  const row = inputFormTexts[nodeId];
+  const row = inputFormTexts[draftKey(nodeId)];
   return !!row && Object.values(row).every((v) => v.trim() !== "");
 }
 
 function deliverInputForm(nodeId: string): void {
-  const assembled = assembleInput(inputFormTexts[nodeId] ?? {});
+  const assembled = assembleInput(inputFormTexts[draftKey(nodeId)] ?? {});
   if (assembled === undefined) return;
   void deliverSignal(nodeId, JSON.stringify(assembled));
 }
@@ -80,7 +78,9 @@ function fmtJsonFull(v: unknown): string {
 }
 
 /** run 输出默认一行预览，超长时可展开查看全文并复制 */
-const outputExpanded = ref(false);
+/** 输出全文展开记在 run 维度：切 run 自然收起（比布尔+清理 watcher 更简单） */
+const expandedOutputRun = ref<string | null>(null);
+const outputExpanded = computed(() => expandedOutputRun.value === monitor.runId);
 const outputText = computed(() => fmtJsonFull(monitor.output));
 const outputLong = computed(() => outputText.value.length > 200);
 const outputPretty = computed(() => {
@@ -95,35 +95,22 @@ interface AdjudicationDraft {
 }
 const adjudications = reactive<Record<string, AdjudicationDraft>>({});
 
-/** 切换 run 时清空上一 run 的临时输入，防止把 A run 的 payload/字段值交付给 B run */
-function resetRunScopedInputs(): void {
-  for (const k of Object.keys(signalTexts)) delete signalTexts[k];
-  for (const k of Object.keys(inputFormTexts)) delete inputFormTexts[k];
-  for (const k of Object.keys(adjudications)) delete adjudications[k];
-  outputExpanded.value = false;
-}
-
 /**
- * run 切换与等待节点变化放在同一个 watcher：先按 runId 清理旧状态，再初始化当前
- * run 的 input 表单初值。attach 会在同一 tick 内同时换入 runId 与 nodes，拆成两个
- * watcher 时初始化可能被随后的清理覆盖，留下空行。
+ * 等待节点出现时按草稿键初始化表单初值/裁决草稿（每 (run,node) 只初始化一次）。
+ * 草稿键带 run 作用域，切 run 不需要清理——A run 的 payload 物理上到不了 B run。
  */
-let formRunId: string | null = monitor.runId;
 watch(
   [() => monitor.runId, waitingInputNodes, uncertainNodes],
-  ([runId, nodes, uncertain]) => {
-    if (runId !== formRunId) {
-      formRunId = runId;
-      resetRunScopedInputs();
-    }
+  ([, nodes, uncertain]) => {
     for (const n of nodes) {
-      if (inputFormTexts[n.id]) continue;
+      const key = draftKey(n.id);
+      if (inputFormTexts[key]) continue;
       const row: Record<string, string> = {};
       for (const f of parseInputFields(n.input)) row[f.key] = inputFieldText(f, props.runInput);
-      inputFormTexts[n.id] = row;
+      inputFormTexts[key] = row;
     }
     for (const n of uncertain) {
-      adjudications[n.id] ??= { decision: "accept_output", output: "", reason: "" };
+      adjudications[draftKey(n.id)] ??= { decision: "accept_output", output: "", reason: "" };
     }
   },
   { immediate: true },
@@ -131,7 +118,7 @@ watch(
 
 /** 提交裁决：accept_output 的产出按 JSON 解析；retry/failed 忽略产出 */
 async function submitAdjudication(node: TimelineNode): Promise<void> {
-  const draft = adjudications[node.id];
+  const draft = adjudications[draftKey(node.id)];
   if (!draft || !node.operation_id) return;
   const ok = await adjudicate(
     node.id,
@@ -142,7 +129,7 @@ async function submitAdjudication(node: TimelineNode): Promise<void> {
   );
   if (ok) {
     toast.success("已提交裁决");
-    delete adjudications[node.id];
+    delete adjudications[draftKey(node.id)];
   }
 }
 
@@ -238,7 +225,7 @@ function onOpenChildRun(childRunId: string): void {
           <button
             v-if="outputLong"
             class="run-output-btn"
-            @click="outputExpanded = !outputExpanded"
+            @click="expandedOutputRun = expandedOutputRun === monitor.runId ? null : monitor.runId"
           >
             {{ outputExpanded ? "收起" : "展开全文" }}
           </button>
@@ -253,7 +240,7 @@ function onOpenChildRun(childRunId: string): void {
           <div v-for="f in parseInputFields(n.input)" :key="f.key" class="signal-row">
             <span class="input-field-label mono" :title="f.key">{{ f.label || f.key }}</span>
             <input
-              v-model="inputFormTexts[n.id][f.key]"
+              v-model="inputFormTexts[draftKey(n.id)][f.key]"
               type="text"
               spellcheck="false"
               placeholder="值"
@@ -272,13 +259,13 @@ function onOpenChildRun(childRunId: string): void {
         <template v-else>
           <div class="signal-row">
             <input
-              v-model="signalTexts[n.id]"
+              v-model="signalTexts[draftKey(n.id)]"
               type="text"
               placeholder='输入 JSON（可选），如 {"key": "value"}'
             />
             <AppButton
               :disabled="monitor.delivering"
-              @click="deliverSignal(n.id, signalTexts[n.id] ?? '')"
+              @click="deliverSignal(n.id, signalTexts[draftKey(n.id)] ?? '')"
             >
               交付
             </AppButton>
@@ -290,18 +277,18 @@ function onOpenChildRun(childRunId: string): void {
         <div>「{{ n.name || n.id }}」等待人工交付</div>
         <div class="signal-row">
           <input
-            v-model="signalTexts[n.id]"
+            v-model="signalTexts[draftKey(n.id)]"
             type="text"
             placeholder='信号 payload（JSON），如 {"approved": true}'
           />
           <AppButton
             :disabled="monitor.delivering"
-            @click="deliverSignal(n.id, signalTexts[n.id] ?? '')"
+            @click="deliverSignal(n.id, signalTexts[draftKey(n.id)] ?? '')"
           >
             交付
           </AppButton>
         </div>
-        <div v-if="signalIsNonJson(signalTexts[n.id])" class="field-help">
+        <div v-if="signalIsNonJson(signalTexts[draftKey(n.id)])" class="field-help">
           非 JSON，将作为字符串交付
         </div>
       </div>
@@ -311,33 +298,33 @@ function onOpenChildRun(childRunId: string): void {
         <div class="field-help">
           已授权发出但结果未知（崩溃/断链）。系统不会自动重发，请人工核对后裁决。
         </div>
-        <template v-if="adjudications[n.id]">
+        <template v-if="adjudications[draftKey(n.id)]">
           <div class="signal-row">
-            <select v-model="adjudications[n.id].decision" aria-label="裁决决定">
+            <select v-model="adjudications[draftKey(n.id)].decision" aria-label="裁决决定">
               <option value="accept_output">接受产出，按输出继续</option>
               <option value="retry">授权重发（可能重复副作用）</option>
               <option value="failed">判定失败</option>
             </select>
           </div>
-          <div v-if="adjudications[n.id].decision === 'accept_output'" class="signal-row">
+          <div v-if="adjudications[draftKey(n.id)].decision === 'accept_output'" class="signal-row">
             <input
-              v-model="adjudications[n.id].output"
+              v-model="adjudications[draftKey(n.id)].output"
               type="text"
               spellcheck="false"
               placeholder='人工认定的产出 JSON（可选），如 {"ok": true}'
             />
           </div>
           <div class="signal-row">
-            <input v-model="adjudications[n.id].reason" type="text" placeholder="裁决理由（必填）" />
+            <input v-model="adjudications[draftKey(n.id)].reason" type="text" placeholder="裁决理由（必填）" />
             <AppButton
-              :disabled="monitor.adjudicating || !adjudications[n.id].reason.trim()"
+              :disabled="monitor.adjudicating || !adjudications[draftKey(n.id)].reason.trim()"
               @click="submitAdjudication(n)"
             >
               提交裁决
             </AppButton>
           </div>
           <div
-            v-if="adjudications[n.id].decision === 'retry'"
+            v-if="adjudications[draftKey(n.id)].decision === 'retry'"
             class="field-help field-help-danger"
           >
             重发会产生真实外部副作用（可能重复扣款/发信等），仅在确认首次调用未生效时使用。
@@ -398,9 +385,12 @@ function onOpenChildRun(childRunId: string): void {
               v-for="n in monitor.nodes"
               :key="n.id"
               :class="{ highlighted: editor.highlightNodeId === n.id }"
+              tabindex="0"
               @mouseenter="onRowEnter(n.id)"
               @mouseleave="onRowLeave"
               @click="onRowClick(n.id)"
+              @keydown.enter.prevent="onRowClick(n.id)"
+              @keydown.space.prevent="onRowClick(n.id)"
             >
               <td>
                 {{ n.name || n.id }}

@@ -16,6 +16,7 @@ import {
 } from "../state/run-list";
 import { runBadgeClass, runStatusLabel, sourceLabel } from "../state/labels";
 import { regressionBaseline } from "../state/regression";
+import { staleGuard } from "../state/stale";
 import { toast } from "../state/toast";
 import type { RunRecord } from "../types";
 import AppButton from "../components/AppButton.vue";
@@ -72,8 +73,8 @@ function fmtDuration(r: RunRecord): string {
   return `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s`;
 }
 
-/** 请求代际：筛选/工作流变化时递增，旧请求的响应（含轮询与翻页）一律丢弃 */
-let refreshGen = 0;
+/** 请求代际：筛选/工作流变化时作废在飞响应（staleGuard，全站同一份原语） */
+const listStale = staleGuard();
 /** 请求在途时又收到刷新：等它结束后按最新条件补拉一次，避免丢刷新 */
 let pendingRefresh = false;
 
@@ -91,7 +92,7 @@ function currentQuery(): {
 
 /** 筛选/工作流变化：丢弃在途响应与已翻页数据，从第一页重拉 */
 function resetAndRefresh(): void {
-  refreshGen++;
+  listStale.invalidate();
   runs.value = [];
   hasMore.value = false;
   loaded.value = false;
@@ -113,27 +114,27 @@ async function refresh(): Promise<void> {
     pendingRefresh = true;
     return;
   }
-  const gen = ++refreshGen;
+  const gen = listStale.begin();
   refreshing = true;
   let switched = false;
   try {
     let page: RunRecord[];
     if (degraded.value) {
       const lite = await api.listRunsLite({ ...currentQuery(), limit: PAGE_SIZE });
-      if (gen !== refreshGen) return;
+      if (listStale.stale(gen)) return;
       page = lite.runs;
       hasMore.value = lite.hasMore;
       degradedScanTruncated.value = !lite.scanned;
     } else {
       const probe = await api.listRuns({ ...currentQuery(), limit: PAGE_SIZE + 1 });
-      if (gen !== refreshGen) return;
+      if (listStale.stale(gen)) return;
       page = probe.slice(0, PAGE_SIZE);
       hasMore.value = probe.length > PAGE_SIZE;
     }
     runs.value = mergeRunPage(page, runs.value);
     pollFailed.value = false;
   } catch (e) {
-    if (gen !== refreshGen) return;
+    if (listStale.stale(gen)) return;
     if (isResponseTooLarge(e)) {
       // 物化列表整页超预算（列表里的大值运行）：切原始快照降级路径重拉
       degraded.value = true;
@@ -146,7 +147,7 @@ async function refresh(): Promise<void> {
     }
   } finally {
     refreshing = false;
-    if (gen === refreshGen && !switched) loaded.value = true;
+    if (!listStale.stale(gen) && !switched) loaded.value = true;
     if (pendingRefresh) {
       pendingRefresh = false;
       void refresh();
@@ -157,12 +158,12 @@ async function refresh(): Promise<void> {
 async function loadMore(): Promise<void> {
   const cursor = nextCursor(runs.value);
   if (!cursor || loadingMore.value) return;
-  const gen = refreshGen;
+  const gen = listStale.mark();
   loadingMore.value = true;
   try {
     if (degraded.value) {
       const lite = await api.listRunsLite({ ...currentQuery(), beforeRunId: cursor, limit: PAGE_SIZE });
-      if (gen !== refreshGen) return;
+      if (listStale.stale(gen)) return;
       hasMore.value = lite.hasMore;
       runs.value = mergeRunPage(runs.value, lite.runs);
       degradedScanTruncated.value = !lite.scanned;
@@ -172,12 +173,12 @@ async function loadMore(): Promise<void> {
         beforeRunId: cursor,
         limit: PAGE_SIZE + 1,
       });
-      if (gen !== refreshGen) return;
+      if (listStale.stale(gen)) return;
       hasMore.value = probe.length > PAGE_SIZE;
       runs.value = mergeRunPage(runs.value, probe.slice(0, PAGE_SIZE));
     }
   } catch (e) {
-    if (gen === refreshGen) toast.error(errText(e));
+    if (!listStale.stale(gen)) toast.error(errText(e));
   } finally {
     loadingMore.value = false;
   }
@@ -247,7 +248,10 @@ watch(() => props.workflowId, resetAndRefresh);
 <template>
   <div class="page">
     <div class="page-header">
-      <h2>运行记录</h2>
+      <h2>
+        运行记录
+        <span v-if="workflowId" class="muted">{{ workflowNames.get(workflowId) ?? workflowId }}</span>
+      </h2>
       <div class="header-tools">
         <select v-model="sourceFilter" class="status-filter" aria-label="来源筛选">
           <option v-for="o in SOURCE_OPTIONS" :key="o.value" :value="o.value">
@@ -259,9 +263,11 @@ watch(() => props.workflowId, resetAndRefresh);
             {{ o.label }}
           </option>
         </select>
-        <RouterLink v-if="workflowId" class="link" :to="`/workflows/${workflowId}`">
-          打开编辑器 →
-        </RouterLink>
+        <span v-if="workflowId" class="wf-links">
+          <RouterLink class="link" :to="`/workflows/${workflowId}`">编辑器</RouterLink>
+          <RouterLink class="link" :to="`/workflows/${workflowId}/versions`">版本</RouterLink>
+          <RouterLink class="link" :to="`/workflows/${workflowId}/triggers`">触发器</RouterLink>
+        </span>
       </div>
     </div>
     <table class="data-table">
@@ -278,8 +284,10 @@ watch(() => props.workflowId, resetAndRefresh);
       </thead>
       <tbody>
         <tr v-for="r in runs" :key="r.id">
-          <td class="mono copyable" :title="r.id" @click="copyRunId(r.id)">
-            {{ r.id.slice(0, 8) }}…
+          <td>
+            <button type="button" class="copy-id" :title="r.id" @click="copyRunId(r.id)">
+              {{ r.id.slice(0, 8) }}…
+            </button>
           </td>
           <td v-if="!workflowId" class="wf-cell">
             {{ workflowNames.get(r.workflow_id) ?? r.workflow_id }}
@@ -347,8 +355,29 @@ watch(() => props.workflowId, resetAndRefresh);
   justify-content: center;
 }
 
-.copyable {
+/* 工作流子页互跳（编辑器/版本/触发器）：紧凑一组 */
+.wf-links {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* copy-cell 按钮化：剥掉 button 默认外观，保持原可点击文本单元格样式 */
+.copy-id {
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  font-family: var(--mono);
+  text-align: left;
   cursor: pointer;
+}
+
+.copy-id:hover {
+  background: none;
+  border-color: transparent;
+  text-decoration: underline;
 }
 
 .run-regression-tag {

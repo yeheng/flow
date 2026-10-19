@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { mount, flushPromises } from "@vue/test-utils";
 import AppModal from "./AppModal.vue";
-import { confirmDialog, modalState, promptDialog } from "../state/modal";
+import { confirmDialog, modalEntries, promptDialog } from "../state/modal";
+import { closeAllOverlays } from "../state/overlays";
 
 /** keydown 派发到 window：弹窗监听挂 window，消息区点过/失焦后也响应 */
 function key(k: string, init: KeyboardEventInit = {}): void {
@@ -12,7 +13,7 @@ function key(k: string, init: KeyboardEventInit = {}): void {
 
 afterEach(() => {
   document.body.innerHTML = "";
-  modalState.current = null;
+  closeAllOverlays();
 });
 
 describe("AppModal：焦点管理", () => {
@@ -31,7 +32,7 @@ describe("AppModal：焦点管理", () => {
 
     key("Escape");
     await expect(p).resolves.toBeNull();
-    expect(modalState.current).toBeNull();
+    expect(modalEntries()).toEqual([]);
     expect(document.activeElement).toBe(trigger);
     w.unmount();
     trigger.remove();
@@ -47,7 +48,7 @@ describe("AppModal：焦点管理", () => {
     await w.find(".modal-message").trigger("click");
     key("Enter");
     await expect(p).resolves.toBe(true);
-    expect(modalState.current).toBeNull();
+    expect(modalEntries()).toEqual([]);
     w.unmount();
   });
 
@@ -85,6 +86,24 @@ describe("AppModal：焦点管理", () => {
 
     key("Escape");
     await p;
+    w.unmount();
+  });
+
+  it("Esc 只关栈顶一层：业务弹层压在弹窗上时先关业务弹层", async () => {
+    const w = mount(AppModal, { attachTo: document.body });
+    const p = confirmDialog("底层确认？");
+    await flushPromises();
+    const { openOverlay, topOverlay } = await import("../state/overlays");
+    openOverlay("biz-save", { defaultName: "" });
+
+    key("Escape");
+    // 栈顶（biz-save）被关，弹窗仍在
+    expect(topOverlay.value?.kind).toBe("modal");
+    expect(modalEntries().length).toBe(1);
+
+    key("Escape");
+    await expect(p).resolves.toBe(false);
+    expect(modalEntries()).toEqual([]);
     w.unmount();
   });
 });

@@ -23,12 +23,12 @@ import {
   type EditorEdge,
   type EditorNode,
 } from "../state/editor";
-import { insertTemplate, saveSelectionAsTemplate } from "../state/templates";
-import { promptDialog } from "../state/modal";
+import { insertTemplate, openTemplateSave } from "../state/templates";
 import { beginDrag, commit, endDrag } from "../state/history";
 import { monitor, openChildRun } from "../state/monitor";
+import { openOverlay, overlaysOf } from "../state/overlays";
 import FlowNode from "./FlowNode.vue";
-import CanvasContextMenu, { type MenuEntry } from "./CanvasContextMenu.vue";
+import CanvasContextMenu, { type MenuEntry, type MenuPayload } from "./CanvasContextMenu.vue";
 
 const { screenToFlowCoordinate, setViewport, getViewport, fitView } = useVueFlow();
 const defaultEdgeOptions = {
@@ -55,7 +55,7 @@ function onNodeClick(e: NodeMouseEvent): void {
 // sub_workflow 的钻取不走双击，走右键菜单「钻取子流程」
 function onNodeDoubleClick(e: NodeMouseEvent): void {
   editor.selectedNodeId = e.node.id;
-  editor.paramsOpen = true;
+  openOverlay("params", { nodeId: e.node.id });
 }
 
 // 删除键在 vue-flow 处理前先入 undo 栈（canvas-wrap 在冒泡路径上先于 window 监听器执行）
@@ -84,7 +84,8 @@ watch(
 // ---- 右键交互：节点上按住拖动 = 连线，空白处按住拖动 = 平移，原地松开 = 菜单 ----
 
 const wrapEl = ref<HTMLElement>();
-const menu = shallowRef<{ x: number; y: number; entries: MenuEntry[] } | null>(null);
+/** 右键菜单条目归全局弹层栈（kind="context-menu"）：Esc 先关菜单，本视图只渲染条目 */
+const menuEntries = computed(() => overlaysOf<MenuPayload>("context-menu"));
 /** 右键拖拽的临时连线（canvas-wrap 本地坐标）；valid 表示当前落点是合法目标 */
 const linkLine = shallowRef<{ x1: number; y1: number; x2: number; y2: number; valid: boolean } | null>(
   null,
@@ -116,7 +117,7 @@ let rmb: RmbState | null = null;
 function onCanvasMouseDown(e: MouseEvent): void {
   if (e.button !== 2) return;
   e.preventDefault();
-  menu.value = null;
+  for (const entry of menuEntries.value) entry.close();
   const target = e.target as Element;
   const nodeId = target.closest(".vue-flow__node")?.getAttribute("data-id") ?? null;
   const state: RmbState = { kind: "pan", startX: e.clientX, startY: e.clientY, active: false };
@@ -246,15 +247,15 @@ function onWindowMouseUp(e: MouseEvent): void {
 function openMenu(state: RmbState, x: number, y: number): void {
   const node = state.hitNodeId ? editor.nodes.find((n) => n.id === state.hitNodeId) : undefined;
   if (node) {
-    menu.value = { x, y, entries: nodeMenu(node) };
+    openOverlay<MenuPayload>("context-menu", { x, y, entries: nodeMenu(node) });
     return;
   }
   const edge = state.hitEdgeId ? editor.edges.find((e) => e.id === state.hitEdgeId) : undefined;
   if (edge) {
-    menu.value = { x, y, entries: edgeMenu(edge) };
+    openOverlay<MenuPayload>("context-menu", { x, y, entries: edgeMenu(edge) });
     return;
   }
-  menu.value = { x, y, entries: paneMenu(x, y) };
+  openOverlay<MenuPayload>("context-menu", { x, y, entries: paneMenu(x, y) });
 }
 
 /** 菜单动作以「选中」为前提（复制/删除等都吃 selected），先把选择收敛到目标上 */
@@ -271,7 +272,7 @@ function nodeMenu(node: EditorNode): MenuEntry[] {
       label: "编辑参数",
       action: () => {
         selectOnlyNode(node.id);
-        editor.paramsOpen = true;
+        openOverlay("params", { nodeId: node.id });
       },
     },
     {
@@ -293,8 +294,8 @@ function nodeMenu(node: EditorNode): MenuEntry[] {
     },
     {
       key: "tpl",
-      label: "存为模板",
-      action: () => void saveNodeAsTemplate(node.id),
+      label: "存为业务节点",
+      action: () => saveNodeAsTemplate(node.id),
     },
   ];
   if (node.data.nodeType.type === "sub_workflow") {
@@ -320,13 +321,11 @@ function nodeMenu(node: EditorNode): MenuEntry[] {
   return entries;
 }
 
-async function saveNodeAsTemplate(id: string): Promise<void> {
+function saveNodeAsTemplate(id: string): void {
   const node = editor.nodes.find((n) => n.id === id);
   if (!node) return;
   selectOnlyNode(id);
-  const name = await promptDialog(`模板名称（保存节点「${node.data.name || id}」及其连线）`, "");
-  if (name === null || !name.trim()) return;
-  await saveSelectionAsTemplate(name);
+  openTemplateSave(node.data.name || id);
 }
 
 function edgeMenu(edge: EditorEdge): MenuEntry[] {
@@ -464,11 +463,9 @@ onUnmounted(() => {
       />
     </svg>
     <CanvasContextMenu
-      v-if="menu"
-      :x="menu.x"
-      :y="menu.y"
-      :entries="menu.entries"
-      @close="menu = null"
+      v-for="entry in menuEntries"
+      :key="entry.id"
+      :entry="entry"
     />
     <div v-if="!editor.workflowId" class="canvas-hint">在左侧新建或选择一个工作流</div>
   </div>

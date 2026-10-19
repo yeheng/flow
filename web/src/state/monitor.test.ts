@@ -14,6 +14,7 @@ vi.mock("../api/flow", () => ({
 
 import * as api from "../api/flow";
 import { editor } from "./editor";
+import { toast } from "./toast";
 import { attachRun, canCancelRun, detachRun, monitor, needReattach, startRun } from "./monitor";
 
 function timeline(runId: string): Timeline {
@@ -157,5 +158,70 @@ describe("startRun 前置校验", () => {
     monitor.inputText = "";
     await startRun();
     expect(api.startRun).not.toHaveBeenCalled();
+  });
+});
+
+describe("monitor 生命周期（终态收尾/降级）", () => {
+  it("终态后停止时间线轮询，不再重复拉取", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(api.runTimeline).mockResolvedValue({
+        ...timeline("run-done"),
+        status: "succeeded",
+      });
+      vi.mocked(api.runObservations).mockResolvedValue({ records: [], loss: {} });
+      expect(await attachRun("run-done")).toBe(true);
+      expect(api.runTimeline).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(2000);
+      // 终态后 250ms 轮询必须停掉（只允许 800ms 收尾补拉不触发 timeline）
+      expect(api.runTimeline).toHaveBeenCalledTimes(1);
+      await detachRun();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("运行中→终态跳变发一次完成通知", async () => {
+    vi.useFakeTimers();
+    try {
+      let onEvent: ((e: unknown) => void) | null = null;
+      vi.mocked(api.subscribeRun).mockImplementation(async (_id: string, cb: unknown) => {
+        onEvent = cb as (e: unknown) => void;
+        return async () => {};
+      });
+      vi.mocked(api.runObservations).mockResolvedValue({ records: [], loss: {} });
+      vi.mocked(api.runTimeline).mockResolvedValue(timeline("run-finish"));
+      expect(await attachRun("run-finish")).toBe(true);
+
+      const success = vi.spyOn(toast, "success").mockImplementation(() => {});
+      vi.mocked(api.runTimeline).mockResolvedValue({
+        ...timeline("run-finish"),
+        status: "succeeded",
+      });
+      onEvent!({ event: { run_id: "run-finish" } });
+      await vi.advanceTimersByTimeAsync(250);
+      expect(success).toHaveBeenCalledTimes(1);
+      await detachRun();
+      success.mockRestore();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("timeline 拉取失败：标记降级、停止重试，detach 后复位", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(api.runTimeline).mockRejectedValue(new Error("RESPONSE_TOO_LARGE"));
+      vi.mocked(api.runObservations).mockResolvedValue({ records: [], loss: {} });
+      expect(await attachRun("run-big")).toBe(true);
+      expect(monitor.timelineUnavailable).toBe(true);
+      expect(api.runTimeline).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(api.runTimeline).toHaveBeenCalledTimes(1);
+      await detachRun();
+      expect(monitor.timelineUnavailable).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

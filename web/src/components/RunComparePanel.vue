@@ -1,31 +1,42 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import * as api from "../api/flow";
 import { errText } from "../rpc/client";
 import { comparisonRows, comparisonSummary } from "../state/regression";
+import type { OverlayEntry } from "../state/overlays";
 import type { RunComparison } from "../types";
 import AppButton from "./AppButton.vue";
 
 /**
- * 基线 vs 候选的差异面板。回归候选自带 source_detail=regression:<baseline>，
- * 打开时预填基线并自动比较；也可手动输入任意基线 run id。
+ * 基线 vs 候选的差异面板（全局弹层栈 kind="compare" 的渲染方）。
+ * 回归候选自带 source_detail=regression:<baseline>，打开时预填基线并自动比较；
+ * 也可手动输入任意基线 run id。Esc 由全局弹层栈关栈顶，本组件不监听键盘。
  */
-const props = defineProps<{ candidateRunId: string; initialBaseline?: string | null }>();
-const emit = defineEmits<{ close: [] }>();
+export interface ComparePayload {
+  baseline: string | null;
+  candidate: string;
+}
 
-const baseline = ref(props.initialBaseline ?? "");
+const props = defineProps<{ entry: OverlayEntry<ComparePayload> }>();
+
+const baseline = ref(props.entry.payload.baseline ?? "");
+const candidateRunId = computed(() => props.entry.payload.candidate);
 const report = ref<RunComparison | null>(null);
 const loading = ref(false);
 const error = ref("");
 
+function close(): void {
+  props.entry.close();
+}
+
 const summary = computed(() => (report.value ? comparisonSummary(report.value) : null));
 const rows = computed(() => (report.value ? comparisonRows(report.value.differences) : []));
-const sameRun = computed(() => baseline.value.trim() === props.candidateRunId);
+const sameRun = computed(() => baseline.value.trim() === candidateRunId.value);
 
 async function compare(): Promise<void> {
   const base = baseline.value.trim();
   if (!base || loading.value) return;
-  if (base === props.candidateRunId) {
+  if (base === candidateRunId.value) {
     error.value = "基线不能与候选是同一个 run";
     report.value = null;
     return;
@@ -33,7 +44,7 @@ async function compare(): Promise<void> {
   loading.value = true;
   error.value = "";
   try {
-    report.value = await api.compareRuns(base, props.candidateRunId);
+    report.value = await api.compareRuns(base, candidateRunId.value);
   } catch (e) {
     report.value = null;
     error.value = errText(e);
@@ -42,25 +53,18 @@ async function compare(): Promise<void> {
   }
 }
 
-function onKeydown(e: KeyboardEvent): void {
-  if (e.key === "Escape") emit("close");
-}
-
 onMounted(async () => {
-  window.addEventListener("keydown", onKeydown);
-  if (props.initialBaseline) await compare();
+  if (props.entry.payload.baseline) await compare();
 });
-
-onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
 </script>
 
 <template>
-  <div class="compare-overlay" @click.self="emit('close')">
+  <div class="compare-overlay" @click.self="close">
     <div class="compare-modal" role="dialog" aria-modal="true" aria-label="与基线比较">
       <header class="compare-header">
         <h3>与基线比较</h3>
         <span class="muted compare-subtitle mono">候选 {{ candidateRunId.slice(0, 8) }}…</span>
-        <button class="compare-close" title="关闭 (Esc)" @click="emit('close')">×</button>
+        <button class="compare-close" title="关闭 (Esc)" @click="close">×</button>
       </header>
       <div class="compare-body">
         <div class="compare-form">

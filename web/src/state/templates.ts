@@ -9,6 +9,7 @@ import { deepCloneJson } from "./clone";
 import type { FragmentNode, NodeTemplate, NodeTemplateSummary } from "../types";
 import { errText } from "../rpc/client";
 import { editor, insertFragment } from "./editor";
+import { openOverlay } from "./overlays";
 import { toast } from "./toast";
 
 interface TemplatesState {
@@ -40,8 +41,11 @@ export async function ensureTemplates(force = false): Promise<boolean> {
   }
 }
 
-/** 把当前画布选中片段存为模板；成功后刷新清单并返回新模板 */
-export async function saveSelectionAsTemplate(name: string): Promise<NodeTemplate | null> {
+/** 把当前画布选中片段存为业务节点（单节点/多节点子图均可）；成功后刷新清单并返回新模板 */
+export async function saveSelectionAsTemplate(
+  name: string,
+  category?: string | null,
+): Promise<NodeTemplate | null> {
   try {
     const selected = editor.nodes.filter((n) => n.selected);
     if (selected.length === 0) {
@@ -64,13 +68,39 @@ export async function saveSelectionAsTemplate(name: string): Promise<NodeTemplat
         sourceHandle: e.sourceHandle,
         targetHandle: e.targetHandle,
       }));
-    const template = await api.createTemplate(name.trim(), nodes, edges);
+    const template = await api.createTemplate(
+      name.trim(),
+      nodes,
+      edges,
+      category?.trim() || undefined,
+    );
     await ensureTemplates(true);
     return template;
   } catch (e) {
     toast.error(errText(e));
     return null;
   }
+}
+
+// ---- 「存为业务节点」对话框（画布右键与面板按钮共用一个入口） ----
+
+/** 栈上 biz-save 条目的载荷（渲染方 BusinessNodeDialog） */
+export interface TemplateSavePayload {
+  defaultName: string;
+}
+
+/**
+ * 打开「存为业务节点」对话框：弹层状态归全局弹层栈（kind="biz-save"），
+ * 保存/取消由对话框直接 entry.close() 收场，Esc 走全局栈（=取消）。
+ */
+export function openTemplateSave(defaultName = ""): void {
+  openOverlay<TemplateSavePayload>("biz-save", { defaultName });
+}
+
+/** 分类候选：已在用的分类 + 默认两项（对话框 datalist 用） */
+export function templateCategoryOptions(): string[] {
+  const used = templates.list.map((t) => t.category).filter((c): c is string => !!c);
+  return [...new Set(["业务", "子流程", ...used])];
 }
 
 /** 一键存为常用节点：把当前工作流打包成 sub_workflow 单节点模板（预填 workflow_id）。

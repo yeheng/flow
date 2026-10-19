@@ -1,5 +1,6 @@
 import { RpcClient } from "../rpc/client";
 import { isDesktop } from "../platform";
+import { staleGuard } from "../state/stale";
 import { invoke } from "@tauri-apps/api/core";
 
 export interface CommitCursor { journal_id: string; lsn: string }
@@ -47,7 +48,8 @@ export class JournalClient {
   }
   async monitor(run: string, snapshot: (run: RunSnapshot) => void, event: (event: JournalEvent) => void, loss: (count: number) => void): Promise<() => Promise<void>> {
     let ready = false, stopped = false;
-    let upper = 0n, generation = 0;
+    let upper = 0n;
+    const alignStale = staleGuard();
     let buffer = new EventWindow();
     let syncing: Promise<void> | undefined;
     const deliver = (record: JournalEvent) => {
@@ -56,14 +58,14 @@ export class JournalClient {
     };
     const align = (): Promise<void> => {
       ready = false;
-      generation++;
+      alignStale.invalidate();
       if (syncing) return syncing;
       syncing = (async () => {
         while (!stopped) {
-          const current = generation;
+          const token = alignStale.begin();
           const initial = await this.call<{value: RunSnapshot}>("run.get", {run_id: run});
           if (stopped) return;
-          if (current !== generation) continue;
+          if (alignStale.stale(token)) continue;
           if (!initial.value) throw new Error("run not found");
           snapshot(initial.value); upper = BigInt(initial.value.last_run_seq);
           if (buffer.dropped) {

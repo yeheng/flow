@@ -168,7 +168,11 @@ function onSelectNode(id: string): void {
         :key="e.node.id"
         class="activity-item"
         :class="`st-${e.node.state}`"
+        role="button"
+        tabindex="0"
         @click="onSelectNode(e.node.id)"
+        @keydown.enter.prevent="onSelectNode(e.node.id)"
+        @keydown.space.prevent="onSelectNode(e.node.id)"
         @mouseenter="emit('hover-node', e.node.id)"
         @mouseleave="emit('hover-node', null)"
       >
@@ -207,6 +211,7 @@ function onSelectNode(id: string): void {
             v-if="nodeLogs(e.node.id, e.logs.length).collapsed"
             class="log-expand"
             @click.stop="toggleLogs(e.node.id)"
+            @keydown.stop
           >
             展开全部 {{ e.logs.length }} 行
           </button>
@@ -214,6 +219,7 @@ function onSelectNode(id: string): void {
             v-else-if="expandedNodes.has(e.node.id)"
             class="log-expand"
             @click.stop="toggleLogs(e.node.id)"
+            @keydown.stop
           >
             收起日志
           </button>
@@ -229,6 +235,7 @@ function onSelectNode(id: string): void {
           class="item-child"
           title="查看子工作流运行"
           @click.stop="emit('open-child', e.node.child_run_id!)"
+          @keydown.stop
         >
           子工作流运行详情 →
         </button>

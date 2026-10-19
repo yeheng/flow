@@ -18,12 +18,16 @@ const props = withDefaults(
 const emit = defineEmits<{ "update:modelValue": [value: string] }>();
 
 const mode = ref<"form" | "json">("form");
-const values = reactive<Record<string, string>>({});
 
 /**
- * modelValue 解析出的 JSON 对象：空文本 → {}；非对象（数组/标量）或非法 JSON → undefined。
- * 后者不能从表单无损重建，只能保持原文不动（见 emitForm/formBlocked）。
+ * 字段编辑缓冲：用户逐键输入的原文（"5.0"/"1e3" 这类输入不能被回写规范化
+ * 吃掉字符——所以缓冲不从 modelValue 派生）。已提交真相始终是 modelValue；
+ * 两者的关系只有两条规则：syncFields 从 modelValue 补齐显示、emitForm 由用户
+ * 输入触发合并写回。
  */
+const values = reactive<Record<string, string>>({});
+
+/** modelValue 解析出的 JSON 对象：空文本 → {}；非对象/非法 JSON → undefined（不可无损合并） */
 function parseBase(): Record<string, unknown> | undefined {
   const raw = props.modelValue.trim();
   if (!raw) return {};
@@ -41,22 +45,22 @@ function toText(v: unknown): string {
   return typeof v === "string" ? v : JSON.stringify(v);
 }
 
-/** 从 modelValue 回填字段显示值——只读，绝不 emit；避免重写用户刚输入的内容 */
-function hydrate(onlyMissing = false): void {
+/**
+ * 同步显示缓冲到当前字段清单（只读，不 emit）：删掉已移除字段；缺字段从
+ * modelValue 回填。overwrite=true 时已存在字段也覆盖——外部改写（切回表单）
+ * 必须以 modelValue 为准；false 只补缺失，保留用户逐键输入的缓冲。
+ */
+function syncFields(overwrite = false): void {
   const base = parseBase();
-  if (base === undefined) return;
+  for (const k of Object.keys(values)) if (!props.inputKeys.includes(k)) delete values[k];
   for (const k of props.inputKeys) {
-    if (onlyMissing && k in values) continue;
-    const v = base[k];
+    if (!overwrite && k in values) continue;
+    const v = base?.[k];
     values[k] = v === undefined ? "" : toText(v);
   }
 }
 
-/**
- * 只有用户输入事件才写回 modelValue：以当前 JSON 对象为基底 merge 声明字段，
- * 未声明的键原样保留。基底不是 JSON 对象（数组/标量/半截 JSON）时无可无损合并的
- * 结构，保持原文不动——表单编辑被 formBlocked 提示拦下，切 JSON 模式可继续改。
- */
+/** 用户输入才写回：以 modelValue 为基底 merge 声明字段，未声明键保留；基底不可合并时不动原文 */
 function emitForm(): void {
   const base = parseBase();
   if (base === undefined) return;
@@ -76,7 +80,7 @@ function emitForm(): void {
   emit("update:modelValue", Object.keys(next).length > 0 ? JSON.stringify(next) : "");
 }
 
-/** 表单无法表示当前原文：给出明确提示，避免用户以为输入生效了 */
+/** 表单无法表示当前原文（数组/标量/半截 JSON）：明确提示，避免用户以为输入生效了 */
 const formBlocked = computed(() => {
   if (mode.value !== "form") return false;
   const raw = props.modelValue.trim();
@@ -89,19 +93,12 @@ const formBlocked = computed(() => {
   }
 });
 
-let knownKeys: string[] | null = null;
 watch(
   () => props.inputKeys,
-  (keys) => {
-    const prev = knownKeys;
-    knownKeys = [...keys];
-    // 字段清单变化只同步表单显示：删掉已移除字段，新增字段从当前 JSON 回填
-    for (const k of Object.keys(values)) if (!keys.includes(k)) delete values[k];
-    hydrate(true);
-    for (const k of keys) if (!(k in values)) values[k] = "";
-    // 挂载首次不 emit；只有 form 模式且键集合确实增删时才写回 merge 结果
-    if (!prev) return;
-    const changed = keys.length !== prev.length || keys.some((k) => !prev.includes(k));
+  (keys, prev) => {
+    syncFields();
+    // 字段清单真的增删才写回 merge（父组件 computed 每次给新数组引用不算变化）
+    const changed = !!prev && (keys.length !== prev.length || keys.some((k) => !prev.includes(k)));
     if (changed && mode.value === "form") emitForm();
   },
   { immediate: true },
@@ -110,8 +107,8 @@ watch(
 function switchMode(next: "form" | "json"): void {
   if (next === mode.value) return;
   mode.value = next;
-  // 切回表单只回填显示，不写回：JSON 模式的原文（含半截 JSON）必须原样保留
-  if (next === "form") hydrate();
+  // 切回表单只同步显示（外部改写→覆盖缓冲），不写回：JSON 模式的原文必须原样保留
+  if (next === "form") syncFields(true);
 }
 </script>
 

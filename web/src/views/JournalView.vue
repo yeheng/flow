@@ -320,7 +320,10 @@ onBeforeUnmount(() => {
 <template>
   <main class="page journal">
     <div class="page-header">
-      <h2>JSONL 工作区</h2>
+      <div class="page-title">
+        <h2>事件审计</h2>
+        <p class="muted page-sub">journal v2 事件与审计检查台（运维/调试面）</p>
+      </div>
       <span v-if="api" class="muted mono journal-endpoint">{{ desktop ? "本地数据" : url }}</span>
     </div>
 
@@ -526,6 +529,18 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.page-title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+
+.page-sub {
+  margin: 0;
+  font-size: 11px;
+}
+
 .journal-endpoint {
   font-size: 11px;
 }

@@ -47,7 +47,7 @@ test("编辑器：画布渲染、顶部条、改参数保存无错误", async ({
   await expect(page.locator(".wf-dirty")).toHaveCount(0);
 });
 
-test("可复用节点模板：存为模板 → 另一流程插入 → 刷新仍在", async ({ page }) => {
+test("业务节点：存为业务节点 → 另一流程插入 → 刷新仍在", async ({ page }) => {
   const name = uniq("e2e-模板");
   const wf = await seedWorkflow(name, "return 1;");
 
@@ -70,15 +70,17 @@ test("可复用节点模板：存为模板 → 另一流程插入 → 刷新仍�
   await expect(page.locator(".vue-flow__node")).toHaveCount(3);
   await page.locator(".vue-flow__node").nth(1).click();
 
-  // 存为模板：面板按钮 → prompt 弹窗输入名称
+  // 存为业务节点：面板按钮 → 业务节点对话框（名称 + 分类）
   await page.locator(".palette-save").click();
-  const promptInput = page.locator(".modal input");
-  await expect(promptInput).toBeVisible();
-  const tplName = uniq("模板-取数");
-  await promptInput.fill(tplName);
-  await page.locator(".modal-actions button", { hasText: "确定" }).click();
+  const nameInput = page.locator("#biz-name");
+  await expect(nameInput).toBeVisible();
+  const tplName = uniq("业务-取数");
+  await nameInput.fill(tplName);
+  await page.locator("#biz-category").fill("e2e分类");
+  await page.locator(".biz-modal button[type=submit]").click();
+  await expect(page.locator(".biz-modal")).toHaveCount(0);
 
-  // 面板「模板」区出现新模板
+  // 面板「业务节点」区出现新模板（按分类分组）
   const tplItem = page.locator(".palette-template", { hasText: tplName });
   await expect(tplItem).toBeVisible();
 
