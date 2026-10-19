@@ -1,0 +1,423 @@
+# flow 工作流定义与导入指南
+
+> 面向 AI 助手与开发者的 flow 工作流定义参考。flow 是一个单机优先、事件溯源的工作流引擎：工作流以 JSON 定义的**不可变版本快照**保存，只有**已发布（published）**的版本可以执行。本文说明如何编写一份合法的工作流定义，以及如何通过 CLI / Web / JSON-RPC 三条路径导入并运行它。
+>
+> 所有规则均来自代码事实：`crates/flow-engine/src/model.rs`（定义模型与校验）、`crates/flow-engine/src/expr.rs`（JS 沙箱与模板）、`crates/flow-cli/src/workflow.rs`（导入导出）。示例中的每一份定义都经过引擎 `Definition::validate` 实测通过。
+
+## 快速开始
+
+三步走：写定义 → 导入发布 → 触发运行。
+
+```sh
+# 1. 启动服务（开发态）
+export FLOW_JOURNAL_TOKEN="$(openssl rand -base64 48)"   # 必须 ≥ 32 字节
+export FLOW_JOURNAL_DATA_DIR=./data/journal
+cargo run --bin flow-journal-server                    # 默认 ws://127.0.0.1:9802
+
+# 2. 导入并发布（同名工作流 = 追加新版本）
+flow-cli workflow import my-flow.workflow.json
+# 或：flow-cli workflow import my.json --name other-name --no-publish
+
+# 3. 触发一次运行（默认等待终态并打印输出）
+flow-cli run start my-flow --input '{"order_id":"o-1"}'
+```
+
+`flow-cli` 同样需要 `FLOW_JOURNAL_TOKEN`；服务地址用 `--url` 或 `FLOW_RPC` 覆盖（缺省 `ws://127.0.0.1:9802`）。
+
+## 定义文件格式
+
+导入文件有两种形态，引擎只认第二种：
+
+```jsonc
+// A. 信封形态（推荐）：name 决定 upsert 身份，导入导出可逆
+{
+  "name": "github-trending",          // 必填（也可由 --name 或文件名推导）
+  "description": "可选，仅供人读",
+  "definition": { /* 见下 */ }
+}
+
+// B. 裸定义：顶层就是 definition，name 回退到文件名去后缀
+{ "nodes": [...], "edges": [...] }
+```
+
+**name 解析优先级**：`--name` 参数 > 信封 `name` > 文件名去扩展名（`a.workflow.json` → `a`）。从标准输入（`-`）读取时没有文件名，必须显式给 `--name`。
+
+信封里的 `version` / `status` / `workflow_id` 字段在导入时被忽略（它们是 `export` 的产物）。
+
+## definition 结构
+
+```jsonc
+{
+  "semantics": 2,                // 可选，缺省写入 2；1 = 兼容旧语义，2 = 当前语义
+  "input_schema": { },           // 可选，run 输入合同（JSON Schema 子集）
+  "output_schema": { },          // 可选，run 输出合同，不满足则 run 失败
+  "nodes": [ /* 至少 1 个 */ ],
+  "edges": [ /* 可为空数组，但不能缺字段 */ ]
+}
+```
+
+节点与边的字段：
+
+```jsonc
+{
+  "id": "risk",                       // 必填，非空、唯一、≤ 253 字节
+  "type": "http_call",                // 必填，见下方节点类型表
+  "name": "风控评分",                  // 可选，仅 UI 显示
+  "position": {"x": 280, "y": 80},    // 可选，画布坐标
+  "params": { }                       // 可选（多数类型有必填项）
+}
+
+{ "from": "start", "to": "risk" }                  // 普通边
+{ "from": "big", "to": "approve", "port": "true" } // 仅 condition 出边可带 port
+```
+
+### 建图校验规则（导入时全部生效）
+
+任一条不满足，`workflow.update` 即返回 `-32602`，**不会**写入任何版本：
+
+- 恰好一个 `start` 节点，至少一个 `end` 节点；
+- `start` 无入边，`end` 无出边，中间节点必须有入边（否则永远不触发）；
+- 无环（必须是 DAG），且所有节点从 `start` 可达；
+- 节点 id 唯一、非空；不得使用传输协议保留名 `run-input` / `prepared-params`；
+- 边的两端必须是已存在的节点，禁止自环，禁止重复边；
+- `condition` 的出边必须带 `port: "true" | "false"`，其他节点出边不得带 port；
+- `semantics: 1` 下，`condition` 的多个端口**不得指向同一节点**（AND-join 会让未被选中的端口把目标整体跳过，run 却仍记成功）；semantics 2 用 selected 合流，不受此限；
+- 每种类型的必填参数必须存在且非空；`${}` 模板值在建图期放行、运行期判定。
+
+### semantics 1 与 2 的差别
+
+- **v2（当前默认）**：节点等待**全部入边确定**后再启动，收集"被选中且成功"的前驱输出；未选中的分支记为 inactive 且不阻断下游；前驱失败仍阻断下游。
+- **v1（兼容）**：AND-join，全部前驱必须成功，任一被跳过会让本节点跳过。
+- `params.join` 可逐节点显式覆盖：`"all"` 强制要求全部前驱成功，`"selected"` 用v2 语义（**不会**在第一个前驱成功时提前启动）。
+
+新定义一律写 `"semantics": 2`；只有需要复现旧行为时才显式写 `1`。
+
+## 节点类型（12 种）
+
+| type | 必填 params | 可选 params | 输出形状 | 外部副作用 |
+| --- | --- | --- | --- | --- |
+| `start` | — | — | — | 否 |
+| `end` | — | — | 计入 run output | 否 |
+| `script` | `code` | `timeout_ms`（默认 2000） | `code` 的返回值 | 否 |
+| `condition` | `expr` | `timeout_ms`（默认 2000） | `{branch: bool}` | 否 |
+| `delay` | `ms`（整数或 `${}`） | — | — | 否 |
+| `http_call` | `url` | `method`、`headers`、`body`、`proxy`、`timeout_ms`、`effect_policy`、`retry` | `{status, headers, body}` | **是** |
+| `human_task` | — | `prompt` | `run.signal` 交付的 payload | 否（等信号） |
+| `input` | `fields` | — | 逐字段解析结果 | 否（等信号） |
+| `sub_workflow` | `workflow_id` | `version`、`input_mapping` | 子 run 输出透传 | 间接 |
+| `harness` | `command`、`prompt` | `args`、`workdir`、`timeout_ms` | `{exit_code, stdout, stderr, result?}` | **是** |
+| `email` | `api_key`、`from`、`to`、`subject`、`body` | `endpoint` | — | **是** |
+| `llm` | `url`、`body` | `headers`、`credential`、`response_schema`、`timeout_ms` | `{status, headers, body}` | **是** |
+
+所有非 `start` 节点都可加`join`。`http_call` / `harness` / `email` / `llm` 可加 `effect_policy`。
+
+### 各类型的参数细节
+
+**`script`** — `code` 是一段**带 `return` 的函数体**。沙箱内可用全局：`input`（run 输入）、`nodes`（上游节点输出，按节点 id 索引）、`console`（log/info/debug → stdout，warn/error → stderr）。
+
+```jsonc
+{
+  "id": "parse",
+  "type": "script",
+  "params": {
+    "code": "var items = nodes.fetch.body.items || [];\nreturn { count: items.length, first: items[0] || null };"
+  }
+}
+```
+
+**`condition`** — `expr` 是一个**表达式**，不是函数体（引擎会包成 `return (expr);`）。按真值判定：非空字符串、非零数字为真。
+
+```jsonc
+{ "id": "big", "type": "condition", "params": {"expr": "nodes.risk.body.score > 800"} }
+```
+
+**`http_call`** — `method` 取`GET`/`POST`/`PUT`/`PATCH`/`DELETE`（大小写不敏感，默认 GET）。响应体能解析为 JSON 时 `body` 是解析结果，否则是字符串。
+
+**`input`** — `fields` 是数组，每项 `{"key": "token", "label": "令牌", "default": …}`（`label`/`default` 可省，`key` 必填）。逐字段三级兜底：`run.input[key]` → `params.default` → 挂起等用户填写。
+
+**`sub_workflow`** — `workflow_id` 在 semantics 2 下**必须是静态字面量**（不能含 `${}`）：子流程在根 run 启动时就被固定。`version` 省略时取最新已发布版本。`input_mapping` 是对象，值支持模板。
+
+**`email`** — Resend 兼容接口，`api_key` 存的是**密钥名称**而非真值（见下方密钥章节）。
+
+**`llm`** — 一次非流式 HTTP JSON 模型调用，`body` 保持供应商原始 JSON。**工具调用要用独立的 `http_call` / `sub_workflow` 节点**，不要塞进模型节点。
+
+## 数据引用与模板展开
+
+除 `script.code` 与 `condition.expr`（`x-opaque`）之外，所有 params 在执行前统一做模板展开。
+
+**整值 vs 插值**：
+
+```jsonc
+"url": "https://api.example.com/orders/${input.order_id}"  // 插值 → 结果恒为 string
+"qty":  "${input.quantity}"                                  // 整值 → 保留原类型（number/对象/数组）
+"body": {"id": "${input.id}", "raw": "${nodes.prev.body}"}    // 递归进入对象与数组
+```
+
+`${}` 内部是 JS 表达式，可访问 `input` 与 `nodes`。`undefined` 归一为 `null`；BigInt 走 `toString` 取精确十进制。
+
+**常用引用**：
+
+| 写法 | 含义 |
+| --- | --- |
+| `${input.order_id}` | run 输入的顶层字段 |
+| `${input.user.name}` | 嵌套字段（不存在则为 `undefined`） |
+| `${nodes.risk.body.score}` | 上游节点 `risk` 的输出字段 |
+| `${nodes.fetch_all.body}` | `http_call` 节点解析后的响应体 |
+
+**脚本沙箱边界**（刻意不给的能力，不要在 `script` 里尝试）：无文件系统、无 `require`、无动态 `import`、无网络。堆上限 32 MiB、栈512 KiB、输入与输出各 8 MiB、JSON 深度 64 层、默认超时 2 秒。网络访问只能用 `http_call` / `email` / `llm` 节点。
+
+## 完整示例
+
+下面这份定义涵盖条件分支、人工节点、密钥引用与输入输出合同，已通过引擎校验：
+
+```json
+{
+  "name": "order-fulfill",
+  "description": "下单 → 风控校验 → 超阈值走人工审批 → 扣库存并发货邮件",
+  "definition": {
+    "semantics": 2,
+    "input_schema": {
+      "type": "object",
+      "required": ["order_id", "amount"],
+      "properties": {
+        "order_id": {"type": "string", "minLength": 1},
+        "amount": {"type": "integer", "minimum": 1},
+        "channel": {"type": "string", "enum": ["web", "app"], "default": "web"}
+      },
+      "additionalProperties": false
+    },
+    "output_schema": {
+      "type": "object",
+      "required": ["order_id", "status"],
+      "properties": {
+        "order_id": {"type": "string"},
+        "status": {"type": "string"}
+      }
+    },
+    "nodes": [
+      {"id": "start", "type": "start", "name": "开始"},
+      {
+        "id": "risk",
+        "type": "http_call",
+        "name": "风控评分",
+        "params": {
+          "method": "POST",
+          "url": "https://risk.internal/score",
+          "headers": {"Content-Type": "application/json"},
+          "body": {"order_id": "${input.order_id}", "amount": "${input.amount}"},
+          "timeout_ms": 10000,
+          "effect_policy": "repeatable",
+          "retry": {"max_attempts": 3, "backoff_ms": 500}
+        }
+      },
+      {
+        "id": "big",
+        "type": "condition",
+        "name": "是否超阈值",
+        "params": {"expr": "nodes.risk.body.score > 800"}
+      },
+      {
+        "id": "approve",
+        "type": "human_task",
+        "name": "人工审批",
+        "params": {"prompt": "订单 ${input.order_id} 风控分 ${nodes.risk.body.score}，请审批"}
+      },
+      {
+        "id": "reserve",
+        "type": "http_call",
+        "name": "扣减库存",
+        "params": {
+          "method": "POST",
+          "url": "https://inventory.internal/reserve",
+          "body": {"order_id": "${input.order_id}", "qty": 1},
+          "effect_policy": "manual"
+        }
+      },
+      {
+        "id": "notify",
+        "type": "email",
+        "name": "发货通知",
+        "params": {
+          "api_key": "RESEND_KEY",
+          "from": "orders@example.com",
+          "to": "${input.customer_email}",
+          "subject": "订单 ${input.order_id} 已发货",
+          "body": "您的订单 ${input.order_id} 已发货。"
+        }
+      },
+      {"id": "end", "type": "end", "name": "结束"}
+    ],
+    "edges": [
+      {"from": "start", "to": "risk"},
+      {"from": "risk", "to": "big"},
+      {"from": "big", "to": "approve", "port": "true"},
+      {"from": "big", "to": "reserve", "port": "false"},
+      {"from": "approve", "to": "reserve"},
+      {"from": "reserve", "to": "notify"},
+      {"from": "notify", "to": "end"}
+    ]
+  }
+}
+```
+
+注意 `approve` 与 `reserve` 都汇入 `reserve`（id重复出现在不同边上是允许的）：走人工审批时 `big` 的 false 分支让 `approve` 变inactive，不会阻断 `reserve`。
+
+### 并行分支的合流
+
+多个上游汇入同一节点时，semantics 2 会等全部入边确定再启动：
+
+```jsonc
+{
+  "nodes": [
+    {"id": "start", "type": "start"},
+    {"id": "fetch_all", "type": "http_call", "params": {"url": "https://api/trending?all=1"}},
+    {"id": "fetch_zh",  "type": "http_call", "params": {"url": "https://api/trending?zh=1"}},
+    {"id": "merge", "type": "script", "params": {"code": "return { all: nodes.fetch_all.body, zh: nodes.fetch_zh.body };"}},
+    {"id": "end", "type": "end"}
+  ],
+  "edges": [
+    {"from": "start", "to": "fetch_all"},
+    {"from": "start", "to": "fetch_zh"},
+    {"from": "fetch_all", "to": "merge"},
+    {"from": "fetch_zh", "to": "merge"},
+    {"from": "merge", "to": "end"}
+  ]
+}
+```
+
+需要"任一分支完成即启动"或"必须等全部成功"时，在目标节点加 `params.join`。
+
+## 导入方式
+
+三条路径语义完全一致（都是客户端编排 `workflow.list` → `create`/`update` → `publish`，服务端不新增导入方法）。
+
+### 1. CLI（推荐）
+
+```sh
+flow-cli workflow import my-flow.workflow.json              # 导入并发布
+flow-cli workflow import my.json --name prod-only --no-publish   # 保持 draft
+flow-cli workflow import - --name from-stdin < my.json       # 从 stdin读
+
+flow-cli workflow list                # 查看（可看到 published 版本）
+flow-cli workflow get my-flow          # 导出最新版本的纯 definition
+flow-cli workflow export my-flow -o my-flow.workflow.json   # 导出为可再导入的信封
+```
+
+触发运行时，`--input` 接受三种形态：内联 JSON、`@文件路径`、`-`（标准输入）；省略时传 `null`。
+
+```sh
+flow-cli run start my-flow --input '{"order_id":"o-1"}'
+flow-cli run start my-flow --input @payload.json
+flow-cli run start my-flow --version 3 --detach     # 不等终态，直接返回 run_id
+```
+
+### 2. JSON-RPC（脚本 / CI）
+
+WebSocket JSON-RPC 2.0。写方法必须带 `request_id`（1..=128 字节）作幂等键，同键同参返回上次结果、同键异参报 `-32012`。
+
+```js
+// upsert：按 name 复用已有工作流，否则新建
+const { workflows } = await call("workflow.list", {});
+const existing = workflows.find((w) => w.name === name);
+const workflow_id = existing?.workflow_id
+  ?? (await call("workflow.create", { name, request_id: rid() })).workflow_id;
+
+const { version } = (await call("workflow.update", {
+  workflow_id, definition, request_id: rid(),
+})).result;
+await call("workflow.publish", { workflow_id, version: Number(version), request_id: rid() });
+```
+
+完整可运行示例见 `examples/run-workflow.mjs`（Node，无需依赖）。
+
+### 3. Web 编辑器
+
+前端工作台支持同格式导入（`web/src/state/workflow-io.ts`），语义与 CLI 一致：name 解析规则相同，upsert 规则相同，服务端校验仍是最终裁决。
+
+## 版本与执行语义
+
+- 定义以**不可变版本快照**保存。同名工作流重复导入 = 追加新版本，已在跑的 run 仍钉死旧版本。
+- checksum 相同（定义逐字节一致）时**复用版本号**，不产生新版本——重复保存不会刷版本号。
+- **只有 published 版本可以执行**。`run start` 省略 `--version` 时取最新已发布版本。
+- 输入在 `run` 创建前按 `input_schema` 校验，不通过则拒绝创建；输出在收口时按 `output_schema` 校验，不通过则 run 失败。
+
+### run 输出形状
+
+`end` 节点的输出汇成 run output：**单个** end 直接取其值；**多个** end 恒为 `{end_id: output}` 映射（形状恒定）；没有有效 end 完成时为 `null`。
+
+## 失败、重试与副作用
+
+- **失败不立即终结 run**：独立分支继续跑完，失败分支下游被跳过（`upstream_failed`），全部节点终态后收口。
+- **重试缺省关闭**：`retry` 缺省 `max_attempts = 1`、`backoff_ms = 0`。`script` / `condition` / `sub_workflow` 支持纯计算重试。
+- **外部节点默认不自动重试**：`http_call` / `harness` / `email` / `llm` 的 `effect_policy` 默认为 `manual`——已授权但结果不明时挂起等人工裁决。只有显式声明 `repeatable`（重复调用始终安全）并配置了 `retry.max_attempts`，协调器才会自动重试。平台**不会**根据 GET 方法自动推断安全，也不承诺任意外部系统 exactly-once。
+- 人工介入点：`human_task` / `input` 等`run.signal`；外部操作结果不明时 `awaiting_resume` 等`run.signal` 裁决（`action: "succeeded" | "failed" | "retry"`）。
+
+## 密钥
+
+定义里**只存密钥名称**，真值来自环境变量 `FLOW_SECRET_<名称>`，执行时注入，永不落 journal 明文。
+
+```jsonc
+{ "id": "notify", "type": "email",
+  "params": { "api_key": "RESEND_KEY", /* ... */ } }   // 存名称，不是真值
+```
+
+```sh
+export FLOW_SECRET_RESEND_KEY="re_xxxxx"
+```
+
+`workflow.update` 会**提前校验**引用的密钥名是否存在——环境变量缺失时导入即失败，不会等到运行期。`llm` 节点的凭据用`credential: {"scheme": "bearer", "secret_ref": "OPENAI_KEY"}` 声明，同样只存名称。
+
+## 本地校验（不启动服务）
+
+导入前想快速验证定义合法性，可直接跑引擎的校验器（不需要启动服务）：
+
+```sh
+cargo run -q -p flow-engine --example validate_def -- my-flow.workflow.json
+cat my-flow.workflow.json | cargo run -q -p flow-engine --example validate_def
+# OK: 定义通过校验（7 节点 / 7 边）
+# 校验失败：工作流存在环，必须是 DAG
+```
+
+退出码：`0` 通过、`1` 校验失败、`2` 文件不是合法 JSON。它与服务端 `workflow.update` 调的是同一个 `Definition::validate`，报错文案一致——这里红了，导入一定也红。它只覆盖建图期校验：密钥存在性与 `input_schema` 取值仍在服务端校验。
+
+## 常见错误对照
+
+| 现象 / 错误码 | 原因与处理 |
+| --- | --- |
+| `-32011` not found | 六个精确串之一：`run` / `workflow` / `workflow version` / `schedule` / `webhook` / `template not found` |
+| `-32012` conflict | 冲突，如同一 `request_id` 换了参数、删除已有 run 的工作流 |
+| `-32602` invalid params | 定义非法（含全部建图校验失败）、缺 `request_id`、schema 用了不支持的关键字 |
+| `-32021` limit | 超出限额，如子流程依赖闭包超过 128 份定义 |
+| `必须且只能有一个 start 节点` | 有 0 个或 ≥2 个 start |
+| `节点 X 没有入边，永远无法触发` | 中间节点没连入边 |
+| `condition 节点 X 的多个端口不能指向同一节点` | semantics 1 下true/false 指向同一节点，会造成静默跳过 |
+| `missing secret NAME` | 引用的密钥未配置 `FLOW_SECRET_NAME` |
+| `no published version` | 导入用了 `--no-publish`，或该工作流从未发布 |
+| 节点被跳过但 run 仍成功 | 走了 `condition` 未选中的分支，或上游 inactive |
+
+## 编写检查清单
+
+1. 有且仅有一个 `start`，至少一个 `end`，图是 DAG 且全部从 start 可达；
+2. 节点 id 唯一、非简短语义、不使用 `run-input` / `prepared-params`；
+3. `condition` 出边带 `port`，且两个端口指向**不同**节点（semantics 1 的硬性要求）；
+4. 每类节点的必填参数齐全（`script.code`、`condition.expr`、`delay.ms`、`http_call.url`、`input.fields`、`sub_workflow.workflow_id`、`harness.command`+`prompt`、`email` 五项、`llm.url`+`body`）；
+5. `script.code` 用 `return` 返回值，`condition.expr` **不写** `return`；
+6. 外部副作用节点明确 `effect_policy`（不确定重复调用是否安全就留 `manual`）；
+7. 密钥只写名称；
+8. 有 `input_schema` 就让必填字段真正必填，并用 `input` 节点承接运行期补充输入；
+9. 用 `flow-cli workflow import --no-publish` 先试跑一次 `run start`，确认无误再发布。
+
+## 相关文件
+
+| 路径 | 内容 |
+| --- | --- |
+| `crates/flow-engine/src/model.rs` | 节点类型表、params schema、建图校验规则的单一来源 |
+| `crates/flow-engine/src/expr.rs` | QuickJS 沙箱边界与 `${}` 模板展开 |
+| `crates/flow-cli/src/workflow.rs` | 导入导出的客户端编排与 name 解析 |
+| `crates/flow-engine/examples/validate_def.rs` | 离线定义校验器 |
+| `examples/github-trending.workflow.json` | 完整可运行示例（并行 HTTP + 脚本解析） |
+| `examples/build-github-trending.py` | 上述示例的生成脚本（改这里而非手改 JSON） |
+| `examples/run-workflow.mjs` | 无依赖的 RPC 导入 + 运行 + 落盘示例 |
+| `docs/DESIGN.md` | 设计文档（§8 定义模型、§9 执行语义、§10 沙箱） |
+| `docs/EXECUTION.md` | 执行与业务调用合同 |
+| `docs/OPS.md` | 部署、配置、故障处置 |
