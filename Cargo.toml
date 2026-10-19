@@ -41,19 +41,25 @@ axum = "0.8"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 rquickjs = "0.14"
 libc = "0.2"
-getrandom = "0.3"
+getrandom = "0.4"
 interprocess = { version = "2", features = ["tokio"] }
 postcard = { version = "1", features = ["use-std"] }
 tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
-x509-parser = "0.17"
-rcgen = "0.13"
+x509-parser = "0.18"
+rcgen = "0.14"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3"
 async-trait = "0.1"
 tokio-stream = "0.1"
+dirs = "7"
+toml = "1"
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake"] }
+base64 = "0.23"
+tempfile = "3"
+rusqlite = { version = "0.38", features = ["backup"] }
 
 [profile.dev]
 debug = 1

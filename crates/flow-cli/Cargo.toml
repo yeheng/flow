@@ -30,7 +30,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 clap = { workspace = true, features = ["env"] }
-jsonrpsee = { version = "0.26", features = ["client", "ws-client"] }
+jsonrpsee = { workspace = true }
 chrono = { workspace = true }
 reqwest.workspace = true
 

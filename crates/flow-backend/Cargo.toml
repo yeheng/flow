@@ -15,7 +15,7 @@ flow-journal = { path = "../flow-journal" }
 reqwest.workspace = true
 sha2.workspace = true
 hex.workspace = true
-base64 = "0.22"
+base64 = { workspace = true }
 libc = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
@@ -26,7 +26,7 @@ rcgen = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 cron-parser.workspace = true
 sqlx.workspace = true
-tempfile = "3"
+tempfile = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true, features = ["rt"] }
 async-trait = { workspace = true }
@@ -40,7 +40,7 @@ tracing = { workspace = true }
 fs2 = { workspace = true }
 futures = { workspace = true }
 flow-engine = { path = "../flow-engine" }
-tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake"] }
+tokio-tungstenite = { workspace = true }
 flow-dto = { path = "../flow-dto" }
 flow-store = { path = "../flow-store" }
 flow-config = { path = "../flow-config" }
