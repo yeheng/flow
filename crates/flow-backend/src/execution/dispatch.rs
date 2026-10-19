@@ -17,7 +17,9 @@ use tokio::sync::mpsc;
 
 use crate::journal::JournalBackend;
 use crate::journal_execution::Attempt;
-use flow_engine::execution_protocol::contract::{DURABLE_WAIT_TIMEOUT_MS, TRANSFER_CHUNK_BYTES};
+use flow_engine::execution_protocol::contract::{
+    CANCEL_REAP_TIMEOUT_MS, DURABLE_WAIT_TIMEOUT_MS, TRANSFER_CHUNK_BYTES,
+};
 use flow_engine::execution_protocol::message::{
     Message, ResultOutcome, WaitKind as WaitRequestKind,
 };
@@ -36,6 +38,8 @@ type Result<T> = std::result::Result<T, crate::journal::JournalError>;
 fn invalid(s: impl Into<String>) -> crate::journal::JournalError {
     crate::journal::JournalError::Journal(flow_journal::Error::Invalid(s.into()))
 }
+/// 取消后排空截止（P2-8）：见 contract 的 [`CANCEL_REAP_TIMEOUT_MS`]。
+const CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_millis(CANCEL_REAP_TIMEOUT_MS);
 /// internal() 闭包内的错误类型（flow_journal::Error）。
 fn fj(s: impl Into<String>) -> flow_journal::Error {
     flow_journal::Error::Invalid(s.into())
@@ -199,6 +203,9 @@ pub(crate) struct DispatchRunner {
     pending_result: Option<PendingResult>,
     op_transfers: BTreeMap<String, OpTransfer>,
     cancel_sent: bool,
+    /// Cancel 发出时刻：取消后的排空必须有截止时间——持续心跳但不响应
+    /// Cancel 的执行器不能无限占用信号量槽位与会话。
+    cancel_sent_at: Option<tokio::time::Instant>,
     session_healthy: bool,
     /// 本次派发的尝试序号（观测日志归属用；在 drive_link 读记录时对齐）。
     task_attempt: u32,
@@ -226,6 +233,7 @@ impl DispatchRunner {
             pending_result: None,
             op_transfers: BTreeMap::new(),
             cancel_sent: false,
+            cancel_sent_at: None,
             session_healthy: true,
             task_attempt: 1,
             remote_replay: false,
@@ -297,21 +305,6 @@ impl DispatchRunner {
                 "fixture_fingerprint": fixture.map(|f| &f.fingerprint),
             });
         }
-        // node 定义是控制帧唯一允许的变长项：超限在这里拒绝（可读错误），
-        // 而不是等 transport 编码失败把整条会话判死。
-        flow_journal::codec::bounded_json(
-            &node_value,
-            flow_engine::execution_protocol::CONTROL_MAX_FRAME / 2,
-        )?;
-        // `previous_outcome` 同样进控制帧（恢复路径的必要描述符）。今天它的
-        // 生产者都有界（stderr_tail ≤512 字节、body_raw 是 ValueRef），但这里
-        // 补上同一道闸：将来任何新生产者都不可能把控制帧撑爆。
-        if let Some(previous) = &previous_outcome {
-            flow_journal::codec::bounded_json(
-                previous,
-                flow_engine::execution_protocol::CONTROL_MAX_FRAME / 2,
-            )?;
-        }
         let task = flow_engine::execution_protocol::ExecuteTask {
             run_id: self.attempt.run_id.clone(),
             node_id: self.attempt.node_id.clone(),
@@ -335,13 +328,30 @@ impl DispatchRunner {
             observability: self.observations.is_some(),
         };
         let command_id = format!("cmd-{}", uuid::Uuid::now_v7());
+        let execute = Message::Execute {
+            command_id,
+            dispatch_id: self.attempt.dispatch_id.clone(),
+            task: Box::new(task),
+        };
+        // 整帧预检（C6/I23，P2-7）：对整个 Execute 消息的真实 wire 编码长度
+        // 做上限校验。半预算分别预检 node/previous_outcome 会漏掉两者相加
+        // 再加 predecessors 声明的越界——超限若漏到会话编码点爆发，
+        // `encode_frame` 报 FrameTooLarge 会杀掉整条会话（远程模式是整条
+        // agent 上联），这正是「拒绝派发而不是杀会话」要防的失败模式。
+        if !resume {
+            let encoded = postcard::to_allocvec(&execute)
+                .map_err(|e| invalid(format!("execute encode probe: {e}")))?;
+            if encoded.len() > flow_engine::execution_protocol::CONTROL_MAX_FRAME {
+                return Err(invalid(format!(
+                    "execute frame exceeds control budget: {} bytes > {}",
+                    encoded.len(),
+                    flow_engine::execution_protocol::CONTROL_MAX_FRAME
+                )));
+            }
+        }
         if !resume {
             link.commands
-                .send(ToSession::Send(Box::new(Message::Execute {
-                    command_id: command_id.clone(),
-                    dispatch_id: self.attempt.dispatch_id.clone(),
-                    task: Box::new(task),
-                })))
+                .send(ToSession::Send(Box::new(execute)))
                 .await
                 .map_err(|_| invalid("executor session closed before execute"))?;
         } else {
@@ -411,6 +421,28 @@ impl DispatchRunner {
                 }
                 return Err(err);
             }
+            // 取消后排空有截止时间（P2-8）：持续心跳但不响应 Cancel 的
+            // 执行器（用户脚本/执行器 bug）不能无限占用 x_max 槽位与协调
+            // 任务——本地池 draining 期间看门狗停摆、idle 判定被 cancel_sent
+            // 跳过，没有这道闸几个这样的派发就能停摆全部本地执行。本地会话
+            // 直接 Recycle（单执行器一会话）；远程路由已在 CancelDispatch
+            // 移除，这里只释放派发方，agent 侧有自己的收割截止。
+            if self.cancel_sent
+                && self
+                    .cancel_sent_at
+                    .is_some_and(|at| at.elapsed() > CANCEL_DRAIN_TIMEOUT)
+            {
+                transfer.abort();
+                if !transfer_done {
+                    let _ = (&mut transfer).await;
+                }
+                if !self.remote_replay {
+                    let _ = link.commands.send(ToSession::Recycle).await;
+                }
+                return Err(invalid(
+                    "executor did not stop after cancel within drain deadline",
+                ));
+            }
             if self.remote_replay && !self.cancel_sent && last_progress.elapsed() > idle_limit {
                 transfer.abort();
                 if !transfer_done {
@@ -431,6 +463,7 @@ impl DispatchRunner {
                 result = &mut transfer, if !transfer_done => {
                     transfer_done = true;
                     last_progress = tokio::time::Instant::now();
+                    self.idle_strikes = 0;
                     match result {
                         Ok(Ok(())) => {},
                         Ok(Err(InputTransferError::LinkClosed)) => {
@@ -450,8 +483,10 @@ impl DispatchRunner {
                 event = link.events.recv() => {
                     match event {
                         Some(FromSession::Incoming(message)) => {
-                            // 任何入站帧（审计/ACK/结果/心跳）都是活跃证据。
+                            // 任何入站帧（审计/ACK/结果/心跳）都是活跃证据，
+                            // 也复位空闲计数——「连续两次」应为相邻空闲。
                             last_progress = tokio::time::Instant::now();
+                            self.idle_strikes = 0;
                             match self.handle(*message, link).await {
                                 Ok(Some(())) => {
                                     // 任务完成（ResultCommitted 已发）。
@@ -502,6 +537,7 @@ impl DispatchRunner {
                             .await;
                         if terminal {
                             self.cancel_sent = true;
+                            self.cancel_sent_at = Some(tokio::time::Instant::now());
                             self.session_healthy = false; // 取消后进程整体回收
                             let dispatch = self.attempt.dispatch_id.clone();
                             let _ = link
@@ -870,13 +906,12 @@ impl DispatchRunner {
                         )
                         .await?;
                 } else {
-                    let mut payload = json!({
-                        "error": message,
-                        "preparation_failed": record.prepared.is_none(),
-                        "original_input": snapshot.input,
-                        "predecessors": self.predecessors.clone(),
-                        "integrity": "incomplete",
-                    });
+                    let mut payload = crate::journal_execution::failure_evidence(
+                        &message,
+                        record.prepared.is_none(),
+                        &snapshot.input,
+                        &self.predecessors,
+                    );
                     let policy = self.node.retry();
                     if record.prepared.is_some()
                         && record.operation.is_none()
@@ -1055,6 +1090,12 @@ impl DispatchRunner {
                 let node = &parent.nodes[&node_id];
                 if node.dispatch_id != dispatch_id {
                     return Err(fj("stale dispatch"));
+                }
+                // 幂等闸门（I20 的契约精神）：同一 dispatch 的 child 等待结果
+                // 已提交时，重复提交原样返回，不再创建第二个子 run——子流程
+                // 可含外部副作用节点，重复创建不是可重入操作。
+                if node.attempts[&dispatch_id].result.is_some() {
+                    return Ok((vec![], ()));
                 }
                 let sealed = node.attempts[&node.dispatch_id].audit_seq;
                 let wait_event = crate::journal_commands::node_event(

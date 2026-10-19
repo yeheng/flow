@@ -365,20 +365,37 @@ pub fn redact_snapshot(value: &Value) -> Value {
     walk(&redact_value(value))
 }
 
-/// URL 的 query 串脱敏：命中敏感键的参数值替换为 `"***"`。
+/// URL 的 query 串与 fragment 脱敏：命中敏感键的参数值替换为 `"***"`。
 ///
 /// `redact_value` 只认识 JSON 键，URL 是字符串、管不到；而 `?api_key=…`
-/// `?access_token=…` 这类把凭据放 query 的接口很常见，日志行和失败消息都会
-/// 原样带上它。host / path / 非敏感参数**原样保留**——排查时要看的是
-/// 「打了哪个接口」，不是「接口的完整签名」。
+/// `?access_token=…` 这类把凭据放 query 的接口很常见，`#access_token=…`
+/// 的 implicit-flow 回调同理——日志行和失败消息都会原样带上它们。
+/// host / path / 非敏感参数**原样保留**——排查时要看的是「打了哪个
+/// 接口」，不是「接口的完整签名」。
 ///
 /// 只用于**展示/日志面**：发起请求用的永远是原始 URL（本函数不碰入参的
 /// 所有权语义之外的东西，调用方传 `&str`，自己决定用原值还是脱敏值）。
 pub fn redact_url(url: &str) -> String {
     let Some((base, query)) = url.split_once('?') else {
-        return url.to_string();
+        // 无 query：fragment（`#access_token=…`）仍可能携带凭据。
+        let Some((base, fragment)) = url.split_once('#') else {
+            return url.to_string();
+        };
+        return format!("{base}#{}", redact_params(fragment));
     };
-    let redacted = query
+    // query 之后可能还有 fragment：两侧分别脱敏再拼回。
+    let (query, fragment) = match query.split_once('#') {
+        Some((query, fragment)) => (
+            redact_params(query),
+            format!("#{}", redact_params(fragment)),
+        ),
+        None => (redact_params(query), String::new()),
+    };
+    format!("{base}?{query}{fragment}")
+}
+
+fn redact_params(params: &str) -> String {
+    params
         .split('&')
         .map(|pair| match pair.split_once('=') {
             // 键命中即脱敏值；没有 `=` 的裸参数（`?debug`）没有值可泄，原样
@@ -386,8 +403,7 @@ pub fn redact_url(url: &str) -> String {
             _ => pair.to_string(),
         })
         .collect::<Vec<_>>()
-        .join("&");
-    format!("{base}?{redacted}")
+        .join("&")
 }
 
 #[cfg(test)]

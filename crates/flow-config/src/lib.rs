@@ -601,17 +601,21 @@ fn apply_env(config: &mut Config) -> Result<Vec<String>, String> {
 
     // ---- [execution] ----
     if let Some(v) = env_str("FLOW_EXECUTION_MODE") {
-        match v.as_str() {
-            // 空值视为未设置（不覆盖平台默认）；显式值覆盖。
-            "" => {}
-            "in_process" => config.execution.mode = ExecutionModeKind::InProcess,
-            "ipc" => config.execution.mode = ExecutionModeKind::Ipc,
-            "remote" => config.execution.mode = ExecutionModeKind::Remote,
-            _ => {}
-        }
-        if !v.is_empty() {
-            applied.push("FLOW_EXECUTION_MODE".into());
-        }
+        // 空值视为未设置（不覆盖平台默认）；显式值覆盖；非法值必须报错
+        // 而不是静默回落文件值——拼写错误（ipcc 之类）静默换执行模式比
+        // 启动失败危险得多（同变量另一入口 execution::mode_from_env
+        // 也是这个语义）。
+        config.execution.mode = match v.as_str() {
+            "in_process" => ExecutionModeKind::InProcess,
+            "ipc" => ExecutionModeKind::Ipc,
+            "remote" => ExecutionModeKind::Remote,
+            other => {
+                return Err(format!(
+                    "FLOW_EXECUTION_MODE 非法值 {other:?}（可选 ipc | remote；in_process 已删除）"
+                ))
+            }
+        };
+        applied.push("FLOW_EXECUTION_MODE".into());
     }
     if let Some(v) = env_str("FLOW_EXECUTOR_BIN") {
         config.execution.executor_bin = Some(v);
@@ -680,7 +684,9 @@ fn apply_env(config: &mut Config) -> Result<Vec<String>, String> {
         applied.push("FLOW_AGENT_KEY".into());
     }
     if let Some(v) = env_u64("FLOW_AGENT_SLOTS") {
-        config.agent.slots = v as u32;
+        // u64→u32 截断会把 2^32+8 静默变 8；显式报错。
+        config.agent.slots =
+            u32::try_from(v).map_err(|_| format!("FLOW_AGENT_SLOTS 超出 u32 范围：{v}"))?;
         applied.push("FLOW_AGENT_SLOTS".into());
     }
 

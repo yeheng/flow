@@ -579,21 +579,28 @@ async fn advance_committed_node(
     if record.status == NodeStatus::Failed {
         return Ok(true);
     }
-    if record
-        .operation
-        .as_ref()
-        .is_some_and(|op| op.outcome.is_none())
-    {
+    // 重启恢复:在飞派发只留下 operation 事实时,节点没有活动任务
+    // (coord.active 为空),两种形态都折进 Uncertain 等待——outcome 未决
+    // = 请求可能已发(unknown);outcome 已提交 = 外部结果已被捕获、输出
+    // 推导未达(outcome_retained)。不重派发:重派发的新执行器会撞
+    // 「operation already authorized」,把平台故障写成 NodeFailed。
+    // 迟到的 Result(resume 对账/SubmitExistingResult)仍能正常完成节点。
+    if let Some(op) = record.operation.as_ref() {
         let attempt = Attempt {
             backend: backend.clone(),
             run_id: run_id.to_owned(),
             node_id: node.id.clone(),
             dispatch_id: record.dispatch_id.clone(),
         };
+        let integrity = if op.outcome.is_none() {
+            "unknown"
+        } else {
+            "outcome_retained"
+        };
         attempt
             .finish(
                 EventKind::WaitRegistered,
-                json!({"wait": Wait::Uncertain,"integrity":"unknown"}),
+                json!({"wait": Wait::Uncertain,"integrity":integrity}),
             )
             .await?;
         return Ok(true);
@@ -757,11 +764,29 @@ async fn execute_node(
             let Some(n) = snapshot.nodes.get(&attempt.node_id) else {
                 return (key, Err(invalid("dispatch node missing").into()));
             };
-            let uncertain = n.operation.as_ref().is_some_and(|o| o.outcome.is_none());
+            // 铁律 2:已授权外部操作的节点在执行期断链/崩溃属于平台故障面,
+            // 不得写成 NodeFailed。两种形态都折进 Uncertain 等待:
+            // - outcome 为 None:请求可能已发出,结果未知(unknown);
+            // - outcome 已提交:外部结果已被审计事实捕获,只是输出推导/
+            //   Result 未送达(outcome_retained)——写成失败等于把可能已
+            //   成功的外部调用冒充成工作流失败,且节点 Failed 后
+            //   run_adjudicate 不再有出口。
+            let operation = n.operation.as_ref();
+            let uncertain = operation.is_some();
             let mut payload = if uncertain {
-                json!({"wait": Wait::Uncertain, "integrity":"unknown"})
+                let integrity = if operation.is_some_and(|o| o.outcome.is_none()) {
+                    "unknown"
+                } else {
+                    "outcome_retained"
+                };
+                json!({"wait": Wait::Uncertain, "integrity": integrity, "delivery_error": error.to_string()})
             } else {
-                json!({"error": error.to_string(), "preparation_failed": n.prepared.is_none(), "original_input": snapshot.input, "predecessors": predecessors, "integrity":"incomplete"})
+                crate::journal_execution::failure_evidence(
+                    &error.to_string(),
+                    n.prepared.is_none(),
+                    &snapshot.input,
+                    &predecessors,
+                )
             };
             let policy = node.retry();
             if !uncertain
@@ -785,7 +810,10 @@ async fn execute_node(
                     ));
                 }
             }
-            let _ = attempt
+            // 失败证据落账失败必须留痕（铁律 1 的运维面）：吞错会让节点
+            // 保持 Running、下一轮重派发——至少把错误打出来，避免「不知
+            // 道却不报」。
+            if let Err(finish_error) = attempt
                 .finish(
                     if uncertain {
                         EventKind::WaitRegistered
@@ -794,7 +822,15 @@ async fn execute_node(
                     },
                     payload,
                 )
-                .await;
+                .await
+            {
+                tracing::error!(
+                    error = %finish_error,
+                    run_id = %attempt.run_id,
+                    node_id = %attempt.node_id,
+                    "node failure evidence could not be committed"
+                );
+            }
         }
     }
     (key, result)
@@ -1142,7 +1178,7 @@ mod regression_tests {
     async fn terminal(backend: &JournalBackend, id: &str) -> Run {
         tokio::time::timeout(Duration::from_secs(8), async {
             loop {
-                let run = backend.state().await.runs[id].clone();
+                let run = backend.state().await.unwrap().runs[id].clone();
                 if run.terminal() {
                     return run;
                 }
@@ -1234,9 +1270,9 @@ mod regression_tests {
         start_local(&backend, 16).await;
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(
-            backend.state().await.runs[&id].nodes.is_empty(),
+            backend.state().await.unwrap().runs[&id].nodes.is_empty(),
             "unavailable-definition nodes: {:?}",
-            backend.state().await.runs[&id].nodes
+            backend.state().await.unwrap().runs[&id].nodes
         );
         sqlx::query("UPDATE value_chunks SET bytes=? WHERE output_id=? AND chunk_index=?")
             .bind(bytes)

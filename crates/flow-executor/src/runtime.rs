@@ -199,7 +199,9 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
                         TaskEnd::Recycle => {
                             tracing::warn!("task stopped uncommitted; exiting for recycle");
                             exit_code = 0; // 预期内回收，非错误
-                            current = None;
+                            // 不清 current：循环尾的封口 Stopped 依赖它携带
+                            // 派发归属，提前清掉会让回收对 master 完全静默
+                            // （只能靠空闲超时才发现）。
                             break;
                         }
                     }
@@ -239,6 +241,15 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
         )
         .await;
     }
+    // 退出前排干在途出站（I24：已排队未送达的帧——含 Result/Reject——
+    // 不能随进程退出丢弃）：先收尽 outbound_rx 残留进 backlog，再冲刷，
+    // 最后 close。任务已结束，不会再有新帧，排空是有界的。
+    while let Ok(message) = outbound_rx.try_recv() {
+        if send_backlog.push(&transport, message).is_err() {
+            break;
+        }
+    }
+    let _ = send_backlog.flush(&transport);
     heartbeat_handle.abort();
     transport.close();
     transport.join().await;

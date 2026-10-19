@@ -66,7 +66,7 @@ async fn schedule_reactivation_and_legacy_creation_boundaries_are_durable() {
     backend.append(vec![flow_journal::Event::new(flow_journal::EventKind::ScheduleChanged,
         json!({"id":"legacy","workflow_id":workflow,"enabled":true,"cron_expr":"* * * * *","input":null,"created_at":created.to_rfc3339()}))]).await.unwrap();
     flow_rpc::journal_triggers::fire_due(&backend, created.with_timezone(&chrono::Local)).await;
-    assert!(backend.state().await.runs.is_empty());
+    assert!(backend.state().await.unwrap().runs.is_empty());
     backend
         .config_change(
             "schedule.change",
@@ -87,7 +87,7 @@ async fn schedule_reactivation_and_legacy_creation_boundaries_are_durable() {
         )
         .await
         .unwrap();
-    let state = backend.state().await;
+    let state = backend.state().await.unwrap();
     let since = chrono::DateTime::parse_from_rfc3339(
         state.schedules["legacy"]["active_since"].as_str().unwrap(),
     )
@@ -103,7 +103,7 @@ async fn schedule_reactivation_and_legacy_creation_boundaries_are_durable() {
     );
     let now = chrono::Local::now();
     flow_rpc::journal_triggers::fire_due(&backend, now).await;
-    assert!(backend.state().await.runs.is_empty());
+    assert!(backend.state().await.unwrap().runs.is_empty());
     backend
         .config_change(
             "schedule.change",
@@ -114,7 +114,7 @@ async fn schedule_reactivation_and_legacy_creation_boundaries_are_durable() {
         )
         .await
         .unwrap();
-    let state = backend.state().await;
+    let state = backend.state().await.unwrap();
     let changed = chrono::DateTime::parse_from_rfc3339(
         state.schedules["legacy"]["active_since"].as_str().unwrap(),
     )
@@ -200,7 +200,7 @@ async fn triggers_commit_run_and_dedup_together_and_survive_config_deletion() {
         flow_rpc::journal_triggers::fire_due(&backend, now),
         flow_rpc::journal_triggers::fire_due(&backend, now)
     );
-    assert_eq!(backend.state().await.runs.len(), 1);
+    assert_eq!(backend.state().await.unwrap().runs.len(), 1);
     backend
         .config_change(
             "webhook.change",
@@ -240,7 +240,7 @@ async fn triggers_commit_run_and_dedup_together_and_survive_config_deletion() {
         .trigger_start("webhook", "hook", "new-delivery", json!({"n":1}))
         .await
         .is_err());
-    assert_eq!(backend.state().await.runs.len(), 2);
+    assert_eq!(backend.state().await.unwrap().runs.len(), 2);
     backend.close().await.unwrap();
     drop(backend);
     std::fs::remove_dir_all(root).unwrap();
@@ -269,7 +269,7 @@ async fn schedule_respects_activation_boundary_and_never_fires_early() {
     let now = chrono::Local::now();
     flow_rpc::journal_triggers::fire_due(&backend, now).await;
     assert!(
-        backend.state().await.runs.is_empty(),
+        backend.state().await.unwrap().runs.is_empty(),
         "creation must not backfill a historical slot"
     );
     let cron: cron_parser::Schedule = "* * * * *".parse().unwrap();
@@ -277,14 +277,14 @@ async fn schedule_respects_activation_boundary_and_never_fires_early() {
     flow_rpc::journal_triggers::fire_due(&backend, fire - chrono::Duration::milliseconds(500))
         .await;
     assert!(
-        backend.state().await.runs.is_empty(),
+        backend.state().await.unwrap().runs.is_empty(),
         "must not fire before the scheduled instant"
     );
     tokio::join!(
         flow_rpc::journal_triggers::fire_due(&backend, fire),
         flow_rpc::journal_triggers::fire_due(&backend, fire)
     );
-    assert_eq!(backend.state().await.runs.len(), 1);
+    assert_eq!(backend.state().await.unwrap().runs.len(), 1);
     backend.close().await.unwrap();
     drop(backend);
     let backend = JournalBackend::open(dir.path(), Default::default())
@@ -292,7 +292,7 @@ async fn schedule_respects_activation_boundary_and_never_fires_early() {
         .unwrap();
     flow_rpc::journal_triggers::fire_due(&backend, fire).await;
     assert_eq!(
-        backend.state().await.runs.len(),
+        backend.state().await.unwrap().runs.len(),
         1,
         "restart must retain the fire identity"
     );
@@ -309,7 +309,7 @@ async fn authenticated_commands_attach_and_are_atomically_visible() {
     let module = flow_rpc::journal_v2::module(backend.clone(), token.clone()).unwrap();
     let denied = call(&module, "workflow.create", json!({"name":"test"})).await;
     assert_eq!(denied["error"]["code"], -32001);
-    assert!(backend.state().await.workflows.is_empty());
+    assert!(backend.state().await.unwrap().workflows.is_empty());
     let params = json!({"_token":token,"name":"test","request_id":"same"});
     let first = call(&module, "workflow.create", params.clone()).await;
     let receipt = &first["result"];
@@ -328,7 +328,7 @@ async fn authenticated_commands_attach_and_are_atomically_visible() {
         receipt["commit_cursor"]
     );
     assert_eq!(duplicate["result"]["visible"], true);
-    assert_eq!(backend.state().await.workflows.len(), 1);
+    assert_eq!(backend.state().await.unwrap().workflows.len(), 1);
     let denied = call(
         &module,
         "run.audit.page",
@@ -358,7 +358,7 @@ async fn value_download_checks_token_and_run_binding_and_streams_original_bytes(
         .await
         .unwrap();
     let run_id = created.result["run_id"].as_str().unwrap();
-    let snapshot = backend.state().await;
+    let snapshot = backend.state().await.unwrap();
     let flow_journal::StoredValue::Ref(value) = &snapshot.runs[run_id].input else {
         panic!("expected reference")
     };
@@ -451,7 +451,7 @@ async fn slow_subscription_can_resume_by_pages_and_terminal_audit_stays_live() {
             break;
         }
     }
-    let state = b.state().await;
+    let state = b.state().await.unwrap();
     let run = &state.runs[id];
     assert!(run.terminal());
     assert_eq!(
@@ -477,7 +477,7 @@ async fn slow_subscription_can_resume_by_pages_and_terminal_audit_stays_live() {
         .unwrap();
     let v: Value = serde_json::from_str(message.get()).unwrap();
     assert_eq!(v["params"]["result"]["event"]["kind"], "late_audit");
-    assert_eq!(b.state().await.runs[id].last_run_seq, before);
+    assert_eq!(b.state().await.unwrap().runs[id].last_run_seq, before);
     drop(audit);
     drop(stream);
     drop(module);
@@ -607,7 +607,7 @@ async fn product_crud_replays_receipts_and_rejects_changed_arguments() {
         // Replaying a creation must return its original receipt even after deletion.
         assert_eq!(first, call(&module, &method, args).await);
     }
-    let state = backend.state().await;
+    let state = backend.state().await.unwrap();
     assert!(state.schedules.is_empty() && state.webhooks.is_empty() && state.templates.is_empty());
     backend.close().await.unwrap();
 }
@@ -644,7 +644,7 @@ async fn product_creation_is_visible_in_the_commit_receipt() {
     assert_eq!(retry["result"]["commit_cursor"], original["commit_cursor"]);
     assert_eq!(retry["result"]["result"], original["result"]);
     assert_eq!(retry["result"]["visible"], true);
-    assert_eq!(backend.state().await.schedules.len(), 1);
+    assert_eq!(backend.state().await.unwrap().schedules.len(), 1);
     backend.close().await.unwrap();
 }
 

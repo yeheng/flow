@@ -134,7 +134,7 @@ async fn cold_terminal_history_and_receipts_restore_from_current_sqlite_rows() {
         .unwrap();
     assert_eq!(b.append(vec![original]).await.unwrap(), original_lsn);
     assert_eq!(b.append(vec![late]).await.unwrap(), late_lsn);
-    assert_eq!(b.state().await.runs.len(), 64);
+    assert_eq!(b.state().await.unwrap().runs.len(), 64);
     assert_eq!(b.diagnostics().await["resident_runs"], 0);
     assert_eq!(
         b.store.get_execution("r000").await.unwrap().1.unwrap()["nodes"]["s"]["output"],

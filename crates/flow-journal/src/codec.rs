@@ -83,6 +83,16 @@ impl Event {
     pub fn is_audit(&self) -> bool {
         self.audit_seq > 0
     }
+
+    /// 事件只动审计面（值分块/发布与迟到审计），不改任何业务实体状态。
+    /// 折叠 undo 策略（engine）与 current_entities 投影（backend）共用这
+    /// 一份清单——两处手写 `matches!` 会随新事件类型漂移成第二份语义。
+    pub fn is_audit_only(&self) -> bool {
+        matches!(
+            self.kind,
+            EventKind::ValueChunk | EventKind::ValuePublished | EventKind::LateAudit
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

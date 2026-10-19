@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
 async fn snapshot(b: &JournalBackend, id: &str) -> Result<Option<Run>> {
     #[cfg(feature = "legacy-baseline")]
     {
-        Ok(b.state().await.runs.get(id).cloned())
+        Ok(b.state().await.unwrap().runs.get(id).cloned())
     }
     #[cfg(not(feature = "legacy-baseline"))]
     {

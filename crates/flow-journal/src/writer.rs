@@ -178,9 +178,14 @@ struct Inner {
 }
 impl Drop for Inner {
     fn drop(&mut self) {
-        self.shared.queue.lock().unwrap().closing = true;
+        lock_queue(&self.shared).closing = true;
         self.shared.ready.notify_one();
-        if let Some(handle) = self.thread.lock().unwrap().take() {
+        if let Some(handle) = self
+            .thread
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+        {
             let _ = handle.join();
         }
     }
@@ -239,7 +244,10 @@ impl Journal {
         let handle = std::thread::Builder::new()
             .name("flow-journal".into())
             .spawn(move || pump(disk, shared, options))?;
-        *inner.thread.lock().unwrap() = Some(handle);
+        *inner
+            .thread
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(handle);
         Ok(Self { inner })
     }
     pub fn id(&self) -> &str {
@@ -249,7 +257,7 @@ impl Journal {
         &self.inner.root
     }
     pub fn stats(&self) -> WriterStats {
-        let queue = self.inner.shared.queue.lock().unwrap();
+        let queue = lock_queue(&self.inner.shared);
         let mut stats = queue.stats.clone();
         stats.in_flight = queue.in_flight;
         stats.queued_requests = queue.requests;
@@ -261,7 +269,7 @@ impl Journal {
     }
 
     pub fn set_write_admission(&self, admission: Arc<WriteAdmission>) -> Result<()> {
-        let mut queue = self.inner.shared.queue.lock().unwrap();
+        let mut queue = lock_queue(&self.inner.shared);
         if queue.admission.is_some() || queue.requests != 0 || queue.in_flight || queue.closing {
             return Err(invalid("write admission already installed or writer busy"));
         }
@@ -368,7 +376,7 @@ impl Journal {
         drop(permit.split(reserve - bytes));
         let (ack, result) = oneshot::channel();
         {
-            let mut queue = self.inner.shared.queue.lock().unwrap();
+            let mut queue = lock_queue(&self.inner.shared);
             if let Some(failure) = &queue.stats.failure {
                 return Err(Error::Unavailable(failure.clone()));
             }
@@ -414,9 +422,14 @@ impl Journal {
         self.inner.audit.close();
         self.inner.control_slots.close();
         self.inner.audit_slots.close();
-        self.inner.shared.queue.lock().unwrap().closing = true;
+        lock_queue(&self.inner.shared).closing = true;
         self.inner.shared.ready.notify_one();
-        let handle = self.inner.thread.lock().unwrap().take();
+        let handle = self
+            .inner
+            .thread
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
         if let Some(handle) = handle {
             tokio::task::spawn_blocking(move || handle.join())
                 .await
@@ -432,132 +445,199 @@ impl Journal {
 
 fn pump(mut disk: Disk, shared: Arc<Shared>, options: JournalOptions) {
     loop {
-        let (batch, admission) = {
-            let mut queue = shared.queue.lock().unwrap();
-            while queue.requests == 0 && !queue.closing {
-                queue = shared.ready.wait(queue).unwrap();
-            }
-            if queue.requests == 0 && queue.closing {
+        // pump 线程 panic 必须可见（铁律 2 的运维面）：排队者不能永久挂在
+        // oneshot 上、健康检查（stats.failure）不能永远看不到故障。panic
+        // 视同平台故障冻结权威——批次内的 Pending 随 unwind 丢失 ack，
+        // 提交方经 RecvError 得到 Unavailable，幂等由命令回执兜底。
+        let step = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pump_step(&mut disk, &shared, &options)
+        })) {
+            Ok(step) => step,
+            Err(panic) => {
+                let reason = if let Some(s) = panic.downcast_ref::<&str>() {
+                    (*s).to_string()
+                } else if let Some(s) = panic.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".into()
+                };
+                freeze(&shared, format!("journal pump panicked: {reason}"));
                 return;
             }
-            let deadline = Instant::now() + options.group_wait;
-            while !queue.closing && queue.bytes < options.batch_bytes {
-                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                    break;
-                };
-                queue = shared.ready.wait_timeout(queue, remaining).unwrap().0;
-            }
-            let mut batch = Vec::new();
-            let mut bytes = 0;
-            // Bound admitted logical bytes. SQLite page/index/WAL writes are separate costs.
-            while queue
-                .next_bytes()
-                .is_some_and(|n| bytes + n <= options.batch_bytes)
-            {
-                let item = queue.pop().expect("nonempty queue");
-                bytes += item.bytes;
-                batch.push(item);
-            }
-            queue.in_flight = true;
-            (batch, queue.admission.clone())
         };
-        let mut commits = Vec::with_capacity(batch.len());
-        let mut encoded_bytes = 0;
-        let outcome: Result<()> = (|| {
-            disk.begin()?;
-            for pending in &batch {
-                if let Some(admission) = &admission {
-                    admission.check()?;
-                }
-                let mut tx = pending.tx.clone();
-                tx.lsn = disk
-                    .last_lsn
-                    .checked_add(1)
-                    .ok_or_else(|| invalid("LSN overflow"))?;
-                if pending
-                    .expected_lsn
-                    .is_some_and(|expected| expected != tx.lsn)
-                {
-                    return Err(Error::Conflict(
-                        "prepared transition sequence changed".into(),
-                    ));
-                }
-                if let Some(admission) = &admission {
-                    admission.check()?;
-                }
-                let (bytes, digest) = match &pending.wire {
-                    // Prepared transactions already carry the final LSN and digest.
-                    Some((bytes, digest)) => (*bytes, digest.clone()),
-                    None => {
-                        let body = codec::bounded_json(&tx, MAX_LINE_BYTES)?;
-                        (body.len() as u64, codec::digest(&body))
-                    }
-                };
-                let location = disk.append(
-                    &tx,
-                    &pending.changes,
-                    pending.expected_lsn.is_some(),
-                    bytes,
-                    &digest,
-                )?;
-                encoded_bytes += pending.bytes;
-                commits.push(Commit {
-                    transaction: Arc::new(tx),
-                    location,
-                });
-            }
-            disk.sync()?;
+        match step {
+            PumpStep::Continue => continue,
+            PumpStep::Closing | PumpStep::Frozen => return,
+        }
+    }
+}
+
+/// 一次泵迭代的结果：继续、队列关闭退出、或权威已冻结退出。
+enum PumpStep {
+    Continue,
+    Closing,
+    Frozen,
+}
+
+/// 平台故障冻结：记录 failure、清空队列（排队者拿到明确错误）、持有
+/// flock 直到全部句柄关闭——新写者不得在旧权威仍被持有时启动。
+fn freeze(shared: &Shared, failure: String) {
+    let mut queue = lock_queue(shared);
+    queue.in_flight = false;
+    queue.stats.failure = Some(failure.clone());
+    while let Some(pending) = queue.pop() {
+        let _ = pending.ack.send(Err(failure.clone()));
+    }
+    while !queue.closing {
+        queue = shared
+            .ready
+            .wait(queue)
+            .unwrap_or_else(|poison| poison.into_inner());
+    }
+}
+
+/// 锁中毒不连锁 panic：pump panic 可能发生在持锁窗口；队列不变量在
+/// panic 后只剩「可能少了已弹出的项」，清理/关闭路径仍可安全恢复。
+fn lock_queue(shared: &Shared) -> std::sync::MutexGuard<'_, Queue> {
+    shared
+        .queue
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+fn pump_step(disk: &mut Disk, shared: &Arc<Shared>, options: &JournalOptions) -> PumpStep {
+    let (batch, admission) = {
+        let mut queue = lock_queue(shared);
+        while queue.requests == 0 && !queue.closing {
+            queue = shared
+                .ready
+                .wait(queue)
+                .unwrap_or_else(|poison| poison.into_inner());
+        }
+        if queue.requests == 0 && queue.closing {
+            return PumpStep::Closing;
+        }
+        let deadline = Instant::now() + options.group_wait;
+        while !queue.closing && queue.bytes < options.batch_bytes {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            queue = shared
+                .ready
+                .wait_timeout(queue, remaining)
+                .unwrap_or_else(|poison| poison.into_inner())
+                .0;
+        }
+        let mut batch = Vec::new();
+        let mut bytes = 0;
+        // Bound admitted logical bytes. SQLite page/index/WAL writes are separate costs.
+        while queue
+            .next_bytes()
+            .is_some_and(|n| bytes + n <= options.batch_bytes)
+        {
+            let item = queue.pop().expect("nonempty queue");
+            bytes += item.bytes;
+            batch.push(item);
+        }
+        queue.in_flight = true;
+        (batch, queue.admission.clone())
+    };
+    let mut commits = Vec::with_capacity(batch.len());
+    let mut encoded_bytes = 0;
+    let outcome: Result<()> = (|| {
+        disk.begin()?;
+        for pending in &batch {
             if let Some(admission) = &admission {
                 admission.check()?;
             }
-            Ok(())
-        })();
-        let mut queue = shared.queue.lock().unwrap();
-        queue.in_flight = false;
-        queue.stats.data_syncs = disk.data_syncs;
-        queue.stats.directory_syncs = disk.directory_latency.samples;
-        queue.stats.data_sync_latency = disk.data_latency.clone();
-        queue.stats.directory_sync_latency = disk.directory_latency.clone();
-        match outcome {
-            Ok(()) => {
-                queue.stats.durable_lsn = disk.last_lsn;
-                queue.stats.batches += 1;
-                queue.stats.transactions += batch.len() as u64;
-                queue.stats.events += batch.iter().map(|p| p.tx.events.len() as u64).sum::<u64>();
-                queue.stats.encoded_bytes += encoded_bytes as u64;
-                queue.stats.max_batch_transactions =
-                    queue.stats.max_batch_transactions.max(batch.len());
-                queue.stats.max_batch_bytes = queue.stats.max_batch_bytes.max(encoded_bytes);
+            let mut tx = pending.tx.clone();
+            tx.lsn = disk
+                .last_lsn
+                .checked_add(1)
+                .ok_or_else(|| invalid("LSN overflow"))?;
+            // 写侧校验闭合（I1/I2 的精神）：读路径 transaction_with_size
+            // 强制同一套规则，写路径此前只受 schema CHECK 约束——一条绕过
+            // 调用方校验的畸形事务能提交成功却永远读不回（audit_seq 无
+            // dispatch 之类），并截断 scan。落盘前拒绝（Invalid 不冻结）。
+            tx.validate()?;
+            if pending
+                .expected_lsn
+                .is_some_and(|expected| expected != tx.lsn)
+            {
+                return Err(Error::Conflict(
+                    "prepared transition sequence changed".into(),
+                ));
+            }
+            if let Some(admission) = &admission {
+                admission.check()?;
+            }
+            let (bytes, digest) = match &pending.wire {
+                // Prepared transactions already carry the final LSN and digest.
+                Some((bytes, digest)) => (*bytes, digest.clone()),
+                None => {
+                    let body = codec::bounded_json(&tx, MAX_LINE_BYTES)?;
+                    (body.len() as u64, codec::digest(&body))
+                }
+            };
+            let location = disk.append(
+                &tx,
+                &pending.changes,
+                pending.expected_lsn.is_some(),
+                bytes,
+                &digest,
+            )?;
+            encoded_bytes += pending.bytes;
+            commits.push(Commit {
+                transaction: Arc::new(tx),
+                location,
+            });
+        }
+        disk.sync()?;
+        if let Some(admission) = &admission {
+            admission.check()?;
+        }
+        Ok(())
+    })();
+    let mut queue = lock_queue(shared);
+    queue.in_flight = false;
+    queue.stats.data_syncs = disk.data_syncs;
+    queue.stats.directory_syncs = disk.directory_latency.samples;
+    queue.stats.data_sync_latency = disk.data_latency.clone();
+    queue.stats.directory_sync_latency = disk.directory_latency.clone();
+    match outcome {
+        Ok(()) => {
+            queue.stats.durable_lsn = disk.last_lsn;
+            queue.stats.batches += 1;
+            queue.stats.transactions += batch.len() as u64;
+            queue.stats.events += batch.iter().map(|p| p.tx.events.len() as u64).sum::<u64>();
+            queue.stats.encoded_bytes += encoded_bytes as u64;
+            queue.stats.max_batch_transactions =
+                queue.stats.max_batch_transactions.max(batch.len());
+            queue.stats.max_batch_bytes = queue.stats.max_batch_bytes.max(encoded_bytes);
+            drop(queue);
+            // Lost receivers do not roll back the persisted transaction.
+            for (pending, commit) in batch.into_iter().zip(commits) {
+                let _ = pending.ack.send(Ok(commit));
+            }
+            PumpStep::Continue
+        }
+        Err(error) => {
+            disk.rollback();
+            let failure = error.to_string();
+            for pending in batch {
+                let _ = pending.ack.send(Err(failure.clone()));
+            }
+            // A rejected transaction (invalid input, limit, stale prepared LSN) must not
+            // brick the only writer. Only platform/storage faults freeze the authority.
+            if !matches!(
+                error,
+                Error::Invalid(_) | Error::Limit(_) | Error::Conflict(_)
+            ) {
                 drop(queue);
-                // Lost receivers do not roll back the persisted transaction.
-                for (pending, commit) in batch.into_iter().zip(commits) {
-                    let _ = pending.ack.send(Ok(commit));
-                }
+                freeze(shared, failure);
+                return PumpStep::Frozen;
             }
-            Err(error) => {
-                disk.rollback();
-                let failure = error.to_string();
-                for pending in batch {
-                    let _ = pending.ack.send(Err(failure.clone()));
-                }
-                // A rejected transaction (invalid input, limit, stale prepared LSN) must not
-                // brick the only writer. Only platform/storage faults freeze the authority.
-                if !matches!(
-                    error,
-                    Error::Invalid(_) | Error::Limit(_) | Error::Conflict(_)
-                ) {
-                    queue.stats.failure = Some(failure.clone());
-                    while let Some(pending) = queue.pop() {
-                        let _ = pending.ack.send(Err(failure.clone()));
-                    }
-                    // Keep the data-directory lock until all handles close. A new writer must not
-                    // start while callers still hold this unavailable authority.
-                    while !queue.closing {
-                        queue = shared.ready.wait(queue).unwrap();
-                    }
-                    return;
-                }
-            }
+            PumpStep::Continue
         }
     }
 }

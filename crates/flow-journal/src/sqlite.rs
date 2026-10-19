@@ -27,6 +27,17 @@ pub struct EntityChange {
 }
 
 pub(crate) fn db(error: rusqlite::Error) -> Error {
+    // 约束违例（UNIQUE tx_id / CHECK event_count 等）意味着被拒的是这笔
+    // 事务的内容，不是存储平台故障——按 Invalid 分类，不冻结唯一写者
+    // （writer 的失败分类只放行 Invalid/Limit/Conflict）。误冻结会把一条
+    // 坏输入升级成「权威不可用直到进程重启」。
+    if matches!(
+        error,
+        rusqlite::Error::SqliteFailure(ref failure, _)
+            if failure.code == rusqlite::ErrorCode::ConstraintViolation
+    ) {
+        return Error::Invalid(format!("SQLite constraint violation: {error}"));
+    }
     Error::Unavailable(format!("SQLite: {error}"))
 }
 
@@ -379,7 +390,10 @@ impl Disk {
         for (index, event) in tx.events.iter().enumerate() {
             let mut stored = event.clone();
             let chunk = if event.kind == EventKind::ValueChunk {
-                let chunk: Chunk = serde_json::from_value(event.payload.clone())?;
+                // 载荷形状错误是调用方输入问题（Invalid 不冻结），不是平台
+                // 故障——Err(Json) 会被 writer 当存储故障冻结唯一写者。
+                let chunk: Chunk = serde_json::from_value(event.payload.clone())
+                    .map_err(|e| invalid(format!("malformed value chunk payload: {e}")))?;
                 let raw = chunk.decode()?;
                 stored.payload["data"] = Value::Null;
                 Some((chunk, raw))
@@ -454,7 +468,8 @@ impl Disk {
         }
         if event.kind == EventKind::ValueChunk {
             // The current row is already inserted, so its index must be the last one.
-            let chunk: Chunk = serde_json::from_value(event.payload.clone())?;
+            let chunk: Chunk = serde_json::from_value(event.payload.clone())
+                .map_err(|e| invalid(format!("malformed value chunk payload: {e}")))?;
             chunk.decode()?;
             let (count, total): (u64, u64) = self
                 .conn
@@ -469,7 +484,8 @@ impl Disk {
             }
             return Ok(());
         }
-        let value: ValueRef = serde_json::from_value(event.payload.clone())?;
+        let value: ValueRef = serde_json::from_value(event.payload.clone())
+            .map_err(|e| invalid(format!("malformed value ref payload: {e}")))?;
         value.validate()?;
         if value.journal_id != self.id {
             return Err(invalid("published value belongs to another journal"));

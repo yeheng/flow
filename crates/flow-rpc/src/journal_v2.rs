@@ -928,7 +928,9 @@ async fn events_view(b: &JournalBackend, p: &Value) -> Result<Value, ErrorObject
     if run.is_none() {
         return Err(ErrorObjectOwned::owned(-32011, "run not found", None::<()>));
     }
-    let from = p["from_seq"].as_u64().unwrap_or(0);
+    // from_seq 与平台序号参数规范同口径（十进制字符串）：传 JSON 数字
+    // 必须显式报错，静默当 0 会从头发送全部事件。
+    let from = decimal_param(p, "from_seq")?;
     let identity = b.journal.id().to_owned();
     let root = b.journal.root().to_path_buf();
     let cursor = match p.get("cursor").filter(|v| !v.is_null()) {

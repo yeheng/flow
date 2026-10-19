@@ -62,6 +62,7 @@ async fn legacy_import_is_reentrant_preserves_raw_tail_and_reports_missing_input
     assert!(backend
         .state()
         .await
+        .unwrap()
         .commands
         .values()
         .all(|c| !c.scope.starts_with("legacy.")));
@@ -81,7 +82,7 @@ async fn legacy_import_is_reentrant_preserves_raw_tail_and_reports_missing_input
     let backend = JournalBackend::open(&destination, Default::default())
         .await
         .unwrap();
-    let state = backend.state().await;
+    let state = backend.state().await.unwrap();
     let entry = &state.legacy["reports/run-1"];
     let value: flow_journal::StoredValue = serde_json::from_value(entry["data"].clone()).unwrap();
     let report = flow_journal::value::materialize(
@@ -119,7 +120,7 @@ async fn legacy_import_is_reentrant_preserves_raw_tail_and_reports_missing_input
         .workflow_create("post-import", Some("new-write"))
         .await
         .unwrap();
-    let mut expected = serde_json::to_value(backend.state().await).unwrap();
+    let mut expected = serde_json::to_value(backend.state().await.unwrap()).unwrap();
     expected.as_object_mut().unwrap().remove("commands");
     let upper = backend.journal.durable_lsn();
     backend.close().await.unwrap();

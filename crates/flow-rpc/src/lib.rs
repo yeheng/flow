@@ -102,6 +102,17 @@ pub(crate) fn config_view(state: &AppState) -> Value {
         ),
         None => (None, None, Vec::new()),
     };
+    // WSS agent 凭据不回显（与 cluster 连接串「stays in this environment
+    // variable, never config.get」同一标准）：多 agent 运维下，任一持
+    // master token 的调用方不该借此拿到全部 agent 的接入令牌。
+    let config = config.map(|mut config: flow_config::Config| {
+        if let Some(remote) = config.execution.remote.as_mut() {
+            for agent in &mut remote.agents {
+                agent.token = "***".into();
+            }
+        }
+        config
+    });
     json!({
         "config": config.unwrap_or_default(),
         "config_path": path,
@@ -291,7 +302,9 @@ pub(crate) fn validate_cron(expr: &str) -> Result<(), ErrorObjectOwned> {
         .map_err(|e| invalid(format!("非法的 cron 表达式：{e}")))
 }
 
-/// schedule 响应：实体字段 + 服务端算好的 next_fire_at（RFC3339，本地时区偏移）。
+/// schedule 响应：实体字段 + 服务端算好的 next_fire_at（RFC3339）。
+/// cron 字段按本地时间解释（产品契约），参考时刻取 Local、输出统一转
+/// UTC 表示——与 create 路径持久化的口径一致（同一时刻、可比的字符串）。
 /// 存量数据 cron 损坏时 next_fire_at 为 null，不让 list 整个失败。
 pub(crate) fn schedule_value(schedule: &flow_dto::Schedule) -> Value {
     let next_fire_at = schedule
@@ -299,7 +312,7 @@ pub(crate) fn schedule_value(schedule: &flow_dto::Schedule) -> Value {
         .parse::<cron_parser::Schedule>()
         .ok()
         .and_then(|cron| cron.next_after(&chrono::Local::now()))
-        .map(|t| t.to_rfc3339());
+        .map(|t| t.with_timezone(&chrono::Utc).to_rfc3339());
     let mut value = json!(schedule);
     value["next_fire_at"] = json!(next_fire_at);
     value

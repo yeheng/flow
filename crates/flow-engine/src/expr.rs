@@ -229,17 +229,6 @@ fn console_stream(name: &str) -> LogStream {
     }
 }
 
-fn run_js(
-    body: &str,
-    input: &Value,
-    nodes: &Value,
-    tpl: &Value,
-    timeout: Duration,
-    logger: &NodeLogger,
-) -> Result<Value, EngineError> {
-    run_js_limited(body, input, nodes, tpl, timeout, logger, None)
-}
-
 #[derive(Clone, Copy)]
 pub struct JsDeterminism {
     pub clock_ms: i64,
@@ -416,6 +405,10 @@ fn run_js_limited(
 
 /// 脚本节点：body 是一段带 `return` 的函数体，可用 `input` 与 `nodes`。
 /// `logger` 承接脚本内的 console.* 输出（level 透传，log/info→stdout，warn/error→stderr）。
+///
+/// 与 `_bounded` 同一份默认预算（32 MiB 堆 / 512 KiB 栈 / 深度 64 / 入出
+/// 8 MiB）：不留无界入口——深嵌套输入会直接打爆原生栈（abort，不可捕获），
+/// 「无限制」在这个沙箱面里只能是事故，不是特性。
 pub fn eval_body(
     body: &str,
     input: &Value,
@@ -423,7 +416,7 @@ pub fn eval_body(
     timeout: Duration,
     logger: &NodeLogger,
 ) -> Result<Value, EngineError> {
-    run_js(body, input, nodes, &Value::Null, timeout, logger)
+    eval_body_recorded(body, input, nodes, timeout, logger, None)
 }
 
 pub fn eval_body_bounded(
@@ -459,6 +452,7 @@ pub fn eval_body_recorded(
 }
 
 /// 条件节点：求值单个表达式。console 可用（disabled logger，输出丢弃）。
+/// 预算规则与 [`eval_body`] 相同：默认有界，不存在无界求值入口。
 pub fn eval_expr(
     expr: &str,
     input: &Value,
@@ -466,13 +460,14 @@ pub fn eval_expr(
     timeout: Duration,
 ) -> Result<Value, EngineError> {
     let body = format!("    return ({expr});");
-    run_js(
+    run_js_limited(
         &body,
         input,
         nodes,
         &Value::Null,
         timeout,
         &NodeLogger::disabled(),
+        Some(JsLimits::default()),
     )
 }
 
@@ -514,7 +509,7 @@ pub fn expand_templates(
     nodes: &Value,
     timeout: Duration,
 ) -> Result<Value, EngineError> {
-    expand_templates_impl(tpl, input, nodes, timeout, None)
+    expand_templates_impl(tpl, input, nodes, timeout, Some(JsLimits::default()))
 }
 pub fn expand_templates_bounded(
     tpl: &Value,

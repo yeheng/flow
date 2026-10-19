@@ -132,7 +132,7 @@ async fn install(b: &JournalBackend, definition: Value) -> String {
 async fn until(b: &Arc<JournalBackend>, run_id: &str, predicate: impl Fn(&Run) -> bool) -> Run {
     tokio::time::timeout(Duration::from_secs(40), async {
         loop {
-            let run = b.state().await.runs[run_id].clone();
+            let run = b.state().await.unwrap().runs[run_id].clone();
             if predicate(&run) {
                 return run;
             }
@@ -328,7 +328,7 @@ async fn matrix_disconnect_before_result_committed_no_duplicate_side_effect() {
         }
     })
     .await;
-    let run_now = backend.state().await.runs[&run_id].clone();
+    let run_now = backend.state().await.unwrap().runs[&run_id].clone();
     assert!(
         http_done.is_ok(),
         "external call must have happened exactly once; run status={:?} nodes={:?}",

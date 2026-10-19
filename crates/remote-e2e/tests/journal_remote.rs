@@ -129,7 +129,7 @@ async fn install(b: &JournalBackend, definition: Value) -> String {
 async fn until(b: &Arc<JournalBackend>, run_id: &str, predicate: impl Fn(&Run) -> bool) -> Run {
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            let run = b.state().await.runs[run_id].clone();
+            let run = b.state().await.unwrap().runs[run_id].clone();
             if predicate(&run) {
                 return run;
             }
@@ -338,7 +338,7 @@ async fn wrong_route_frames_never_reach_authority() {
     })
     .await;
     assert!(closed.is_ok(), "session must reject unbound routed frames");
-    let state = backend.state().await;
+    let state = backend.state().await.unwrap();
     assert!(
         state.runs.is_empty(),
         "forged route must not enter authority"

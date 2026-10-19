@@ -561,12 +561,7 @@ impl State {
         // Undo only changed entities, not the full historical state. Inline values are bounded.
         // Payload-only audits change counters and one receipt entry, never node state.
         // Their rollback cost is independent of the accumulated run history.
-        let audit_only = tx.events.iter().all(|e| {
-            matches!(
-                e.kind,
-                EventKind::ValueChunk | EventKind::ValuePublished | EventKind::LateAudit
-            )
-        });
+        let audit_only = tx.events.iter().all(|e| e.is_audit_only());
         let mut audit_undo = Vec::new();
         let mut run_seq_undo = BTreeMap::new();
         let mut workflow_undo = BTreeMap::new();
@@ -1054,6 +1049,11 @@ impl State {
                     return Err(invalid("invalid run creation"));
                 }
                 run.last_run_seq = 1;
+                // 出生态钉死（§6.1：Running 是唯一出生态）：载荷里的 status
+                // 与 nodes 不是可信输入——「终态出生」或预置节点账本只能经
+                // 畸形事实混入，这里强制归一到 writer 契约形状。
+                run.status = RunStatus::Running;
+                run.nodes.clear();
                 self.run_workflows.insert(run.workflow_id.clone());
                 self.runs.insert(run.run_id.clone(), run);
                 return Ok(());
@@ -1089,8 +1089,13 @@ impl State {
         }
         match event.kind {
             EventKind::RunCancelled => {
-                run.status = RunStatus::Cancelled;
-                run.error = None;
+                // 终态不可被 Cancelled 改写（与 RunFailed 的终态无操作对齐）：
+                // 一条 Cancelled 事实不得把已 Succeeded/Failed 的 run 改写成
+                // Cancelled 并抹掉 error——命令层有守卫，折叠层是重放权威。
+                if !run.terminal() {
+                    run.status = RunStatus::Cancelled;
+                    run.error = None;
+                }
                 return Ok(());
             }
             EventKind::RunCompleted => {
@@ -1185,6 +1190,20 @@ impl State {
             return Ok(());
         }
         if event.kind == EventKind::NodeSkipped {
+            // 折叠层守卫（I5/铁律 1 的精神）：skip 只能作用于「从未派发」的
+            // 节点——已派发节点的 attempts 账本是权威审计历史（I17 屏障的
+            // 落点），一条 skip 事件不能整体抹掉它。writer 侧当前不对已派发
+            // 节点发 skip；这道闸防的是 writer 演进出错。
+            if let Some(existing) = run.nodes.get(&node_id) {
+                if existing.status != NodeStatus::Pending
+                    || !existing.dispatch_id.is_empty()
+                    || !existing.attempts.is_empty()
+                    || existing.prepared.is_some()
+                    || existing.operation.is_some()
+                {
+                    return Err(invalid("cannot skip dispatched node"));
+                }
+            }
             run.nodes.insert(
                 node_id,
                 Node {
@@ -1364,15 +1383,17 @@ impl State {
             }
             EventKind::Adjudicated => {
                 let decision = p["decision"].as_str().unwrap_or_default();
+                // 与命令层同规则:outcome 已提交时仍可 accept_output/failed
+                // (人工用已捕获的外部结果收口),仅 retry 要求未决 outcome。
                 if terminal
                     || node
                         .wait
                         .as_ref()
                         .is_none_or(|w| w.kind() != WaitKind::Uncertain)
-                    || node
-                        .operation
-                        .as_ref()
-                        .is_none_or(|o| o.outcome.is_some() || p["operation_id"] != o.operation_id)
+                    || node.operation.as_ref().is_none_or(|o| {
+                        p["operation_id"] != o.operation_id
+                            || (o.outcome.is_some() && decision == "retry")
+                    })
                     || p["reason"].as_str().is_none_or(|s| s.trim().is_empty())
                     || !matches!(decision, "accept_output" | "retry" | "failed")
                 {

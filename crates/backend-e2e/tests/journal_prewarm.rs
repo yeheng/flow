@@ -59,7 +59,7 @@ async fn start_run(backend: &JournalBackend, workflow: &str, input: Value) -> St
 async fn until(b: &Arc<JournalBackend>, run_id: &str, predicate: impl Fn(&Run) -> bool) -> Run {
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            let run = b.state().await.runs[run_id].clone();
+            let run = b.state().await.unwrap().runs[run_id].clone();
             if predicate(&run) {
                 return run;
             }

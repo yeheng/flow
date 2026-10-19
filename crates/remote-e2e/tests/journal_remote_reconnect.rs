@@ -162,7 +162,7 @@ async fn install(b: &JournalBackend, definition: Value) -> String {
 async fn until(b: &Arc<JournalBackend>, run_id: &str, predicate: impl Fn(&Run) -> bool) -> Run {
     tokio::time::timeout(Duration::from_secs(40), async {
         loop {
-            let run = b.state().await.runs[run_id].clone();
+            let run = b.state().await.unwrap().runs[run_id].clone();
             if predicate(&run) {
                 return run;
             }
@@ -224,7 +224,7 @@ async fn uplink_drop_then_reconnect_resumes_without_double_execution() {
     .await;
     disconnect(proxies, session).await;
     // 断线期间 run 不得终态（主进程挂起等对账，不判死重跑）。
-    let snapshot = backend.state().await.runs[&run_id].clone();
+    let snapshot = backend.state().await.unwrap().runs[&run_id].clone();
     assert!(
         !snapshot.terminal(),
         "run must stay pending during uplink loss (status={})",

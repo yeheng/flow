@@ -66,7 +66,7 @@ async fn install(b: &JournalBackend, definition: Value) -> String {
 async fn until(b: &Arc<JournalBackend>, run_id: &str, predicate: impl Fn(&Run) -> bool) -> Run {
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            let run = b.state().await.runs[run_id].clone();
+            let run = b.state().await.unwrap().runs[run_id].clone();
             if predicate(&run) {
                 return run;
             }
@@ -315,7 +315,7 @@ async fn sub_workflow_child_created_and_parent_completes() {
     assert_eq!(output["child"], true);
     assert_eq!(output["n"], 42);
     // 子 run 完成且登记了父子关系。
-    let state = backend.state().await;
+    let state = backend.state().await.unwrap();
     let children: Vec<&Run> = state
         .runs
         .values()
@@ -467,7 +467,7 @@ async fn killing_executor_mid_script_recovers_with_new_process() {
     // 延迟，20s 窗口在 2 核 runner 上紧张；放宽到 60s（正常路径 ≈12s）。
     let done = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
-            let run = backend.state().await.runs[&run_id].clone();
+            let run = backend.state().await.unwrap().runs[&run_id].clone();
             if run.terminal() {
                 return run;
             }
@@ -478,7 +478,7 @@ async fn killing_executor_mid_script_recovers_with_new_process() {
     let done = match done {
         Ok(run) => run,
         Err(_) => {
-            let run = backend.state().await.runs[&run_id].clone();
+            let run = backend.state().await.unwrap().runs[&run_id].clone();
             let mut report = String::new();
             for (id, n) in &run.nodes {
                 report.push_str(&format!(
@@ -814,7 +814,7 @@ async fn ipc_mixed_business_matrix() {
             if cancel {
                 // 等授权提交后取消（制造真实取消竞争窗口）。
                 loop {
-                    let run = backend.state().await.runs[&run_id].clone();
+                    let run = backend.state().await.unwrap().runs[&run_id].clone();
                     let authorized = run.nodes.get("h").is_some_and(|n| n.operation.is_some());
                     let terminal = run.terminal();
                     if authorized || terminal {
@@ -826,7 +826,7 @@ async fn ipc_mixed_business_matrix() {
             }
             let done = match tokio::time::timeout(Duration::from_secs(120), async {
                 loop {
-                    let run = backend.state().await.runs[&run_id].clone();
+                    let run = backend.state().await.unwrap().runs[&run_id].clone();
                     if run.terminal() {
                         return run;
                     }
@@ -837,7 +837,7 @@ async fn ipc_mixed_business_matrix() {
             {
                 Ok(run) => run,
                 Err(_) => {
-                    let run = backend.state().await.runs[&run_id].clone();
+                    let run = backend.state().await.unwrap().runs[&run_id].clone();
                     let mut report = format!("stuck run status={}\n", run.status);
                     for (id, n) in &run.nodes {
                         report.push_str(&format!(

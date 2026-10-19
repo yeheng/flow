@@ -518,8 +518,14 @@ pub async fn serve(
             }
             _ = housekeeping.tick() => {
                 let mut guard = handles.lock().await;
+                // 回收条件：executor_loop 已走完（进程已 kill+reap、transport
+                // 已关）且出站通道没有未转发帧。不要求 committed/forced_kill
+                // ——自然死亡（心跳超时/EOF/失联）的句柄同样要回收，否则
+                // 永久滞留表内并占着 relay 绑定，死派发的 Cancel/
+                // ResultCommitted 只能进已关的 inbox 被静默丢弃。done 蕴含
+                // out 发送端已 drop：is_empty 即「不会再有帧」，不会丢数据。
                 let finished: Vec<_> = guard.iter().filter(|(_, handle)| handle.done.load(Ordering::Acquire)
-                    && (handle.committed.load(Ordering::Acquire) || handle.forced_kill.load(Ordering::Relaxed)))
+                    && handle.out.is_empty())
                     .map(|(id, _)| id.clone()).collect();
                 for id in finished {
                     guard.remove(&id);
@@ -675,7 +681,7 @@ pub async fn serve(
 /// （与 relay::fair_mux 的游标语义一致；有对应洪泛回归测试）。
 async fn fair_mux_bridge(
     handles: Arc<tokio::sync::Mutex<BTreeMap<String, ExecutorHandle>>>,
-    mux_in: mpsc::Sender<Message>,
+    mux_in: mpsc::Sender<(Message, Option<String>)>,
 ) {
     use std::ops::Bound;
     let mut cursor: Option<String> = None;
@@ -683,7 +689,9 @@ async fn fair_mux_bridge(
         let mut served: Option<String> = None;
         // 本轮取出的帧：锁内只做非阻塞收取，await 发送一律在锁外（满上联
         // 不能握着执行器表锁等待，否则拖死 BindExecutor/housekeeping）。
-        let mut drained: Vec<Message> = Vec::new();
+        // 元组第二项是来源派发标签：给 Reject 这类无归属字段的帧补上路由
+        // 键（包装器按它选路由），有归属的帧仍以自身字段为准。
+        let mut drained: Vec<(Message, Option<String>)> = Vec::new();
         if mux_in.is_closed() {
             return;
         }
@@ -711,7 +719,7 @@ async fn fair_mux_bridge(
                             Ok(message) => {
                                 turn_bytes += crate::relay::estimate_weight(&message);
                                 turn_frames += 1;
-                                drained.push(message);
+                                drained.push((message, Some(dispatch.clone())));
                             }
                             Err(_) => break,
                         }
@@ -726,8 +734,8 @@ async fn fair_mux_bridge(
                 }
             }
         }
-        for message in drained {
-            if mux_in.send(message).await.is_err() {
+        for tagged in drained {
+            if mux_in.send(tagged).await.is_err() {
                 return;
             }
         }
@@ -776,7 +784,7 @@ fn spawn_uplink_pipeline(
 ) -> UplinkPipeline {
     let (uplink_out, uplink_rx) =
         mpsc::channel::<(Message, tokio::sync::OwnedSemaphorePermit)>(UPLINK_OUT_QUEUE);
-    let (mux_in, mux_in_rx) = mpsc::channel::<Message>(UPLINK_OUT_QUEUE);
+    let (mux_in, mux_in_rx) = mpsc::channel::<(Message, Option<String>)>(UPLINK_OUT_QUEUE);
     let budget = crate::relay::UplinkBudget::new(crate::relay::UPLINK_OUT_BYTES);
     let bridge = tokio::spawn(fair_mux_bridge(handles, mux_in));
     let wrapper_budget = budget.clone();
@@ -784,8 +792,14 @@ fn spawn_uplink_pipeline(
         // mux → 包络 → uplink_out（按 dispatch 包装，relay 取当前会话那份）。
         // T08：入队前占用字节预算，随 (消息, 字节) 元组流转到 serve 归还。
         let mut mux_in_rx = mux_in_rx;
-        while let Some(message) = mux_in_rx.recv().await {
-            let Some(dispatch_id) = message.dispatch_id().map(str::to_owned) else {
+        while let Some((message, origin)) = mux_in_rx.recv().await {
+            // Reject 没有派发归属字段：桥按来源句柄打上 origin 标签，此处
+            // 优先采用——否则执行器的任务失败通知被当「无归属」静默丢弃，
+            // master 的终态错误入口（dispatch runner 以 Reject 收口）收不到
+            // 远程基础设施故障，只能靠 120s 空闲超时间接发现（§13.6 为
+            // Reject 开 routable 例外的初衷正在于此）。
+            let Some(dispatch_id) = origin.or_else(|| message.dispatch_id().map(str::to_owned))
+            else {
                 continue;
             };
             let relay = relay_slot.lock().clone();
@@ -979,7 +993,7 @@ mod tests {
         let (b, b_tx) = handle("b");
         handles.lock().await.insert("a".into(), a);
         handles.lock().await.insert("b".into(), b);
-        let (mux_in, mut mux_rx) = mpsc::channel::<Message>(256);
+        let (mux_in, mut mux_rx) = mpsc::channel::<(Message, Option<String>)>(256);
         let bridge = tokio::spawn(fair_mux_bridge(handles, mux_in));
 
         // 洪泛：a 塞满自己的出站队列；b 只发一条。
@@ -991,7 +1005,7 @@ mod tests {
         // 前 8 条里必须出现 b 的帧（洪泛不能独占）。
         let mut saw_b = false;
         for _ in 0..8 {
-            let message = tokio::time::timeout(Duration::from_secs(2), mux_rx.recv())
+            let (message, _) = tokio::time::timeout(Duration::from_secs(2), mux_rx.recv())
                 .await
                 .expect("bridge stalled")
                 .expect("bridge exited");
@@ -1079,8 +1093,8 @@ mod tests {
         let handles = Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
         let (entry, source) = handle("a");
         handles.lock().await.insert("a".into(), entry);
-        let (sink, mut received) = mpsc::channel(1);
-        sink.send(Message::Ready).await.unwrap();
+        let (sink, mut received) = mpsc::channel::<(Message, Option<String>)>(1);
+        sink.send((Message::Ready, None)).await.unwrap();
         source.send(Message::Ready).await.unwrap();
         let bridge = tokio::spawn(fair_mux_bridge(handles.clone(), sink));
         // Let the bridge consume the frame and encounter outbound backpressure.
@@ -1091,7 +1105,36 @@ mod tests {
         assert!(guard["a"].out.is_empty());
         drop(guard);
         received.recv().await.unwrap();
-        assert!(matches!(received.recv().await, Some(Message::Ready)));
+        assert!(matches!(received.recv().await, Some((Message::Ready, _))));
+        bridge.abort();
+    }
+
+    /// 回归（Reject 归属）：Reject 没有派发归属字段，桥必须按来源句柄打
+    /// 标签——否则上联包装器按「无归属」静默丢弃，master 的终态错误入口
+    /// （dispatch runner 以 Reject 收口）收不到远程基础设施故障。
+    #[tokio::test]
+    async fn bridge_tags_reject_with_source_dispatch() {
+        let handles = Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+        let (entry, source) = handle("dispatch-7");
+        handles.lock().await.insert("dispatch-7".into(), entry);
+        let (mux_in, mut mux_rx) = mpsc::channel::<(Message, Option<String>)>(16);
+        let bridge = tokio::spawn(fair_mux_bridge(handles, mux_in));
+        source
+            .send(Message::Reject {
+                reason: "transfer digest mismatch".into(),
+            })
+            .await
+            .unwrap();
+        let (message, origin) = tokio::time::timeout(Duration::from_secs(2), mux_rx.recv())
+            .await
+            .expect("bridge stalled")
+            .expect("bridge exited");
+        assert!(matches!(message, Message::Reject { .. }));
+        assert_eq!(
+            origin.as_deref(),
+            Some("dispatch-7"),
+            "Reject 必须携带来源派发标签，否则被包装器丢弃"
+        );
         bridge.abort();
     }
 }

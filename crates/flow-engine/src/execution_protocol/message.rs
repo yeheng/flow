@@ -296,6 +296,36 @@ pub struct WaitRequest {
     pub input_mapping: Option<Value>,
 }
 
+/// `Routed` 包络的最大嵌套层数。合法拓扑（agent 对业务帧 wrap 一次）只
+/// 需要 1 层；留余量到 8。超过即拒绝——深度门必须先于解码展开。
+pub const ROUTED_MAX_DEPTH: u32 = 8;
+
+thread_local! {
+    /// `Routed.inner` 的当前解码深度。解码全程同步（无 await 点），
+    /// 线程本地计数不会跨任务交错。
+    static ROUTED_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// `Routed.inner` 字段的反序列化入口：每进入一层包络深度 +1，超限直接
+/// 报错，不展开 `Box<Message>`。成功解码的值深度 ≤ [`ROUTED_MAX_DEPTH`]，
+/// 派生的 Drop/Debug/frame_limit 递归因此同样有界。
+fn deserialize_bounded_inner<'de, D>(deserializer: D) -> Result<Box<Message>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let depth = ROUTED_DEPTH.with(|c| c.get());
+    if depth >= ROUTED_MAX_DEPTH {
+        return Err(serde::de::Error::custom(format!(
+            "routed nesting exceeds {} levels",
+            ROUTED_MAX_DEPTH
+        )));
+    }
+    ROUTED_DEPTH.with(|c| c.set(depth + 1));
+    let result = Box::<Message>::deserialize(deserializer);
+    ROUTED_DEPTH.with(|c| c.set(depth));
+    result
+}
+
 /// 统一消息目录（28 个变体）。通道与方向约束见二期 §3.4；帧级预算按
 /// 消息类型分类（frame.rs 的 frame_limit：大载荷类型走 DATA 上限）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -437,8 +467,15 @@ pub enum Message {
     /// 内层 TransferChunk 的字节由嵌套枚举原生承载——旧版专用
     /// routed-transfer-chunk 帧与其三处 dispatch_id 一致性校验
     /// 随枚举嵌套自然消失。
+    ///
+    /// `inner` 的反序列化带递归深度门（[`ROUTED_MAX_DEPTH`]）：嵌套在
+    /// wire 上每层只占约 7 字节，1 MiB 的合法长度 data 帧可承载约 15 万层
+    /// `Box<Message>` 递归，postcard 递归下降解码（以及派生的 Drop/Debug/
+    /// frame_limit）都会栈溢出——abort，不可捕获。这道门在握手与令牌
+    /// 校验之前，是唯一能拦住对等端深度炸弹的位置。
     Routed {
         envelope: RouteEnvelope,
+        #[serde(deserialize_with = "deserialize_bounded_inner")]
         inner: Box<Message>,
     },
     /// control，agent→主。上联握手：身份由承载层决定（mTLS 证书 CN /
@@ -675,6 +712,49 @@ mod tests {
     fn postcard_decode_rejects_unknown_variant_index() {
         assert!(postcard::from_bytes::<Message>(&[28]).is_err());
         assert!(postcard::from_bytes::<Message>(&[200]).is_err());
+    }
+
+    /// `Routed` 嵌套深度炸弹：每层包络在 wire 上仅约 7 字节，1 MiB 的
+    /// data 帧可承载约 15 万层递归——没有深度门，postcard 递归下降解码
+    /// （及派生 Drop/Debug）会栈溢出 abort，且发生在握手/令牌校验之前。
+    /// 超过 [`ROUTED_MAX_DEPTH`] 的嵌套必须在解码层被拒。
+    #[test]
+    fn postcard_decode_rejects_deep_routed_nesting() {
+        let envelope = RouteEnvelope {
+            agent_id: "agent".into(),
+            agent_boot_id: "aboot".into(),
+            link_session_id: "link".into(),
+            executor_id: "exec".into(),
+            executor_boot_id: "eboot".into(),
+            dispatch_id: Some("dispatch-1".into()),
+        };
+        let wrap = |inner: Message| Message::Routed {
+            envelope: envelope.clone(),
+            inner: Box::new(inner),
+        };
+        // 恰好在限内（ROUTED_MAX_DEPTH 层）必须可往返。
+        let mut bounded = Message::Ready;
+        for _ in 0..ROUTED_MAX_DEPTH {
+            bounded = wrap(bounded);
+        }
+        let bytes = postcard::to_allocvec(&bounded).unwrap();
+        assert_eq!(postcard::from_bytes::<Message>(&bytes).unwrap(), bounded);
+        // 超限一层即拒绝——错误在解码层返回，不是栈溢出。
+        let mut deep = wrap(bounded);
+        for _ in 0..3 {
+            deep = wrap(deep);
+        }
+        let bytes = postcard::to_allocvec(&deep).unwrap();
+        assert!(
+            postcard::from_bytes::<Message>(&bytes).is_err(),
+            "超过 ROUTED_MAX_DEPTH 的嵌套必须被拒绝"
+        );
+        // 深度计数在成功/失败解码后都要归零（不污染同线程后续解码）。
+        assert_eq!(
+            postcard::from_bytes::<Message>(&postcard::to_allocvec(&Message::Ready).unwrap())
+                .unwrap(),
+            Message::Ready
+        );
     }
 
     /// 闭集枚举（替代字符串状态）的非法变体必须在解码层被拒——字符串当

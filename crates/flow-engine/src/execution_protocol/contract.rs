@@ -100,6 +100,10 @@ pub const HEARTBEAT_TIMEOUT_MS: u64 = 10_000;
 pub const STARTUP_TIMEOUT_MS: u64 = 10_000;
 /// Draining 宽限期：尽力封口窗口，到期 kill 并 wait/reap（二期 §3.9）。
 pub const DRAIN_GRACE_MS: u64 = 5_000;
+/// 取消后排空截止：Cancel 发出后执行器仍不停（持续心跳但不处理 Cancel）
+/// 时，master 派发方放弃等待、agent 侧强制收割的最长时限。必须显著大于
+/// [`DRAIN_GRACE_MS`]（执行器自身的尽力封口窗口）与若干审计冲刷轮次。
+pub const CANCEL_REAP_TIMEOUT_MS: u64 = 30_000;
 /// AuditAck 等待超时后重传同序号同内容（幂等；二期 §3.5）。
 pub const ACK_RETRANSMIT_MS: u64 = 2_000;
 /// 等待持久 ACK（AuditAck/Permit/ResultCommitted）的总超时上限，防无限占用

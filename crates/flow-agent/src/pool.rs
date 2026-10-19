@@ -59,6 +59,14 @@ pub enum PoolError {
     Bind(String),
 }
 
+/// 失败路径回收：kill 之后必须 wait/reap。只 kill 不 wait 会把 Child 随
+/// 错误值一起 drop，SIGKILL 后的子进程无人收割成为僵尸；执行器二进制
+/// 损坏或启动慢导致握手反复超时时，僵尸会线性累积。
+async fn kill_and_reap(mut child: tokio::process::Child) {
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
 /// 绑定一个派发到新执行器进程并完成本地握手（确认后才转发 Execute）。
 pub async fn bind_executor(
     executor: &flow_engine::execution_protocol::contract::ExecutorInvocation,
@@ -70,7 +78,7 @@ pub async fn bind_executor(
 ) -> Result<ExecutorHandle, PoolError> {
     // 模式标记（中继模式）由调用点显式追加，不做「预置参数列表」传递。
     let invocation = executor.clone();
-    let (pair, mut child, child_side) = spawn_executor_process(
+    let (pair, child, child_side) = spawn_executor_process(
         &invocation,
         Some(&format!("agent:{executor_id}")),
         &["--remote-relay"],
@@ -78,7 +86,7 @@ pub async fn bind_executor(
     .map_err(|e| PoolError::Bind(format!("spawn executor: {e}")))?;
     drop(child_side);
     let mut transport = FrameTransport::spawn(pair, 64);
-    let hello = tokio::time::timeout(
+    let hello = match tokio::time::timeout(
         Duration::from_millis(STARTUP_TIMEOUT_MS * 2),
         master_handshake(
             &mut transport,
@@ -90,14 +98,17 @@ pub async fn bind_executor(
         ),
     )
     .await
-    .map_err(|_| {
-        let _ = child.start_kill();
-        PoolError::Bind("local handshake timeout".into())
-    })?
-    .map_err(|e| {
-        let _ = child.start_kill();
-        PoolError::Bind(format!("local handshake: {e}"))
-    })?;
+    {
+        Ok(Ok(hello)) => hello,
+        Ok(Err(e)) => {
+            kill_and_reap(child).await;
+            return Err(PoolError::Bind(format!("local handshake: {e}")));
+        }
+        Err(_) => {
+            kill_and_reap(child).await;
+            return Err(PoolError::Bind("local handshake timeout".into()));
+        }
+    };
     let executor_boot_id = hello.boot_id;
     // 登记归属（R0：确认后才允许 Execute 转发）。
     relay
@@ -171,6 +182,12 @@ async fn executor_loop(
         heartbeat_timeout,
     );
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Cancel 转发后的收割截止（P2-8）：持续心跳但不处理 Cancel 的执行器
+    // （用户脚本/执行器 bug）到点强制 kill——没有这道闸它会永久占一个
+    // agent 槽位，master 派发方早已放弃等待，无人再触发回收。
+    let cancel_reap_timeout =
+        Duration::from_millis(flow_engine::execution_protocol::contract::CANCEL_REAP_TIMEOUT_MS);
+    let mut cancel_sent_at: Option<tokio::time::Instant> = None;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -178,6 +195,11 @@ async fn executor_loop(
                 break;
             }
             _ = heartbeat.tick() => {
+                if cancel_sent_at.is_some_and(|at| at.elapsed() > cancel_reap_timeout) {
+                    tracing::warn!(%dispatch_id, "executor ignored cancel; force reaping");
+                    forced_kill.store(true, Ordering::Relaxed);
+                    break;
+                }
                 // 执行器失联（心跳停）：与后端本地池同语义——宽限后 kill/reap。
                 if last_seen.elapsed() > heartbeat_timeout {
                     if result.lock().await.is_none() {
@@ -188,6 +210,9 @@ async fn executor_loop(
             }
             inbound = inbox.recv() => {
                 let Some(message) = inbound else { break };
+                if matches!(message, Message::Cancel { .. }) {
+                    cancel_sent_at.get_or_insert_with(tokio::time::Instant::now);
+                }
                 if let Message::AuditAck { durable_audit_seq, .. } = &message {
                     last_acked.fetch_max(*durable_audit_seq, Ordering::Relaxed);
                 }

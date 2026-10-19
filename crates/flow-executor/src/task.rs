@@ -1059,11 +1059,21 @@ impl TaskRunner {
             ));
         }
         let status = response.status().as_u16();
-        let headers: serde_json::Map<String, Value> = response
-            .headers()
-            .iter()
-            .map(|(k, v)| (k.to_string(), json!(v.to_str().unwrap_or(""))))
-            .collect();
+        // 重名响应头（Set-Cookie 等）按 RFC 7230 语义合并为逗号分隔，
+        // 不能让后者覆盖前者——headers 是审计证据的保真面，丢多值即失真。
+        let mut headers: serde_json::Map<String, Value> = serde_json::Map::new();
+        for (name, value) in response.headers() {
+            let value = value.to_str().unwrap_or("");
+            headers
+                .entry(name.to_string())
+                .and_modify(|existing| {
+                    if let Value::String(joined) = existing {
+                        joined.push_str(", ");
+                        joined.push_str(value);
+                    }
+                })
+                .or_insert_with(|| json!(value));
+        }
         let mut raw: Vec<u8> = Vec::new();
         while let Some(bytes) = response
             .chunk()
@@ -1434,7 +1444,14 @@ impl TaskRunner {
                 Some(bytes) => bytes,
                 None => return Err(TaskError::Invalid("outcome body bytes unavailable".into())),
             };
-            let response: Value = serde_json::from_slice(&bytes)?;
+            // 2xx 但非 JSON 的代理响应是业务层约定破裂，不是基础设施
+            // 故障——outcome 已留存，按业务失败收口（Reject/回收路径会把
+            // 平台故障放大成 uncertain 人工裁决）。
+            let response: Value = serde_json::from_slice(&bytes).map_err(|e| {
+                TaskError::Business(format!(
+                    "email response must be JSON: {e}; outcome retained"
+                ))
+            })?;
             let output = json!({"status": status, "id": response["id"]});
             return store_value(audit, &self.journal_id, &output, 8 * 1024 * 1024).await;
         }

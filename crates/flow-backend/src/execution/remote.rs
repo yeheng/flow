@@ -658,6 +658,14 @@ impl AgentManager {
                                 {
                                     return Err(format!("route envelope mismatch from agent {agent_id}"));
                                 }
+                                // 内层必须是可路由业务帧（出站 wrap 侧的同一规则，
+                                // 在入站方向补齐）：嵌套 Routed / 上联管理帧 / 握手帧
+                                // 是协议违规，关闭会话而不是往派发队列里转发。
+                                if !flow_engine::execution_protocol::remote::routable(&inner) {
+                                    return Err(format!(
+                                        "non-routable inner message from agent {agent_id} rejected"
+                                    ));
+                                }
                                 let Some(routing) = routings.get(&envelope.dispatch_id.clone().unwrap_or_default()) else {
                                     if let Some((previous, result_id)) = completed.iter().find(|(previous, _)| previous == &envelope) {
                                         if let (Some(result_id), Message::Result { result_id: id, .. }) = (result_id, &*inner) {

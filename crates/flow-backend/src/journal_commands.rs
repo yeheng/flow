@@ -361,8 +361,13 @@ impl JournalBackend {
         self.command_for_run(run_id, &format!("run.adjudicate:{run_id}"),Some(request_id),&request,|state|{
             let run=state.runs.get(run_id).ok_or_else(||invalid("run not found"))?;
             let node=run.nodes.get(node_id).ok_or_else(||invalid("node not found"))?;
+            // outcome 已提交(结果被捕获、输出推导未达)的 Uncertain 节点同样
+            // 允许人工收口:accept_output/failed 可用已提交证据裁决;只有
+            // retry 需要未决 outcome——结果已捕获后重发授权没有意义,重派发
+            // 会撞「operation already authorized」。
             if run.terminal() || node.wait.as_ref().is_none_or(|w| w.kind() != WaitKind::Uncertain)
-                || node.operation.as_ref().is_none_or(|o|o.operation_id!=operation_id || o.outcome.is_some()) {
+                || node.operation.as_ref().is_none_or(|o|o.operation_id!=operation_id
+                    || (o.outcome.is_some() && decision == "retry")) {
                 return Err(invalid("manual resolution requires the current uncertain operation"));
             }
             let event=node_event(run,node_id,EventKind::Adjudicated,json!({"operation_id":operation_id,"reason":reason,"decision":decision,"output":output}),true);
@@ -402,10 +407,13 @@ impl JournalBackend {
         mut definition: Value,
         request_id: Option<&str>,
     ) -> Result<CommandReceipt> {
-        let fingerprint_request = json!({"workflow_id":workflow_id,"definition":definition});
+        // 先注入 semantics 缺省再取指纹：指纹必须与语义裁决同源——同一
+        // 有效定义（显式 semantics:2 vs 缺省）不能因指纹口径不同而漏判
+        // 幂等窗口（checksum 用注入后的定义，指纹也要）。
         if let Some(object) = definition.as_object_mut() {
             object.entry("semantics").or_insert(json!(2));
         }
+        let fingerprint_request = json!({"workflow_id":workflow_id,"definition":definition});
         let parsed = flow_engine::journal_state::validate_definition(&definition)?;
         let checksum = flow_journal::codec::digest(&flow_journal::codec::bounded_json(
             &definition,
@@ -1044,11 +1052,15 @@ fn product_decision(
     } else if namespace == "webhook" && !creating {
         json!({"updated": true})
     } else if namespace == "schedule" {
+        // next_fire_at 是派生展示值，但会随 ScheduleChanged 事实持久化进
+        // 权威配置——表示必须与全库其余时间戳同口径（UTC）。cron 字段
+        // 本身按产品契约是本地时间解释（"0 9 * * *" = 本地 9 点），因此
+        // 用 Local 参考时刻求值、再转 UTC 表示：同一时刻，可比的字符串。
         let next = value["cron_expr"]
             .as_str()
             .and_then(|expr| expr.parse::<cron_parser::Schedule>().ok())
             .and_then(|cron| cron.next_after(&chrono::Local::now()))
-            .map(|t| t.to_rfc3339());
+            .map(|t| t.with_timezone(&chrono::Utc).to_rfc3339());
         value["next_fire_at"] = json!(next);
         if creating {
             value.as_object_mut().unwrap().remove("input");

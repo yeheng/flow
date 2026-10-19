@@ -269,7 +269,7 @@ fn human_def() -> Value {
 async fn wait_human_waiting(f: &Fixture, run: &str) -> u64 {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let state = f.backend.state().await;
+            let state = f.backend.state().await.unwrap();
             if let Some(run) = state.runs.get(run) {
                 if run
                     .nodes
@@ -399,7 +399,7 @@ async fn subscribe_with_run_id_replays_follows_and_naturally_ends() {
     }
     assert_eq!(
         seqs,
-        (1..=f.backend.state().await.runs[&run].last_run_seq).collect::<Vec<_>>()
+        (1..=f.backend.state().await.unwrap().runs[&run].last_run_seq).collect::<Vec<_>>()
     );
 }
 

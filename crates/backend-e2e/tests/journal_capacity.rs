@@ -45,7 +45,7 @@ async fn thousand_waiting_runs_release_slots_and_recover_bounded_dispatch() {
     start_ipc(&backend, 2).await;
     tokio::time::timeout(Duration::from_secs(180), async {
         loop {
-            if backend.state().await.runs.values().all(|r| {
+            if backend.state().await.unwrap().runs.values().all(|r| {
                 r.nodes
                     .get("h")
                     .is_some_and(|n| n.status == NodeStatus::Waiting)
@@ -82,7 +82,7 @@ async fn thousand_waiting_runs_release_slots_and_recover_bounded_dispatch() {
     let backend = JournalBackend::open(&root, Default::default())
         .await
         .unwrap();
-    assert_eq!(backend.state().await.runs.len(), 1000);
+    assert_eq!(backend.state().await.unwrap().runs.len(), 1000);
     assert!(restart.elapsed() < Duration::from_secs(60));
     start_ipc(&backend, 1).await;
     for run in &runs {
@@ -94,6 +94,7 @@ async fn thousand_waiting_runs_release_slots_and_recover_bounded_dispatch() {
     assert!(backend
         .state()
         .await
+        .unwrap()
         .runs
         .values()
         .all(|r| r.status == RunStatus::Cancelled));
@@ -184,7 +185,7 @@ async fn capacity_crash_child() {
     let backend = JournalBackend::open(&root, Default::default())
         .await
         .unwrap();
-    assert_eq!(backend.state().await.runs.len(), 1000);
+    assert_eq!(backend.state().await.unwrap().runs.len(), 1000);
     std::fs::write(std::env::var("FLOW_CAPACITY_READY").unwrap(), b"loaded").unwrap();
     std::future::pending::<()>().await;
 }

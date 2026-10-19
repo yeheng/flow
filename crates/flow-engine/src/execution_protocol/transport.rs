@@ -226,7 +226,17 @@ impl FrameTransport {
             }
             Ok(IoEvent::Eof) | Err(mpsc::error::TryRecvError::Disconnected) => {
                 self.ended = true;
-                self.pending_error = Some(ProtocolError::Closed);
+                // 与 recv() 同规则：通道关闭可能先于失败通知被 poll，已记录
+                // 的真实协议错误优先于笼统的 Closed——排障事实不能在非阻塞
+                // 路径上丢失。
+                self.pending_error = Some(
+                    self.io
+                        .state
+                        .error
+                        .lock()
+                        .take()
+                        .unwrap_or(ProtocolError::Closed),
+                );
                 None
             }
             Err(mpsc::error::TryRecvError::Empty) => None,
@@ -689,9 +699,16 @@ pub async fn executor_handshake(
     for identity in [&journal_id, &session_id, &executor_id] {
         validate_identity(identity)?;
     }
+    // 时间限额同样 ≤ 本端硬上限：0 会退化成自旋（执行器侧已钳制下限，
+    // 这里补齐握手承诺的另一半），无界值让等待语义失去确定性。
+    const LIMIT_TIME_MAX_MS: u64 = 300_000;
     if window_bytes > W_BYTES
         || max_record_bytes > MAX_AUDIT_RECORD_BYTES
         || max_record_bytes > window_bytes
+        || heartbeat_ms == 0
+        || heartbeat_ms > LIMIT_TIME_MAX_MS
+        || drain_grace_ms == 0
+        || drain_grace_ms > LIMIT_TIME_MAX_MS
     {
         return Err(ProtocolError::Malformed(
             "welcome limits exceed local hard caps".into(),

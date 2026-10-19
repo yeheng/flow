@@ -604,7 +604,7 @@ e2e_test!(
         let tail: Value = call_json(
             &client,
             "run.events.view",
-            json!({"run_id": run_id, "from_seq": 2}),
+            json!({"run_id": run_id, "from_seq": "2"}),
         )
         .await;
         let tail = tail["events"].as_array().unwrap();
@@ -619,7 +619,7 @@ e2e_test!(
         let beyond: Value = call_json(
             &client,
             "run.events.view",
-            json!({"run_id": run_id, "from_seq": 9999}),
+            json!({"run_id": run_id, "from_seq": "9999"}),
         )
         .await;
         assert_eq!(beyond["events"].as_array().unwrap().len(), 0);

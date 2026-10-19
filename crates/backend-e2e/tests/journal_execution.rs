@@ -44,7 +44,7 @@ async fn pure_retry_preserves_preparation_and_original_deadline_across_restart()
         .await
         .unwrap();
     assert_eq!(
-        backend.state().await.runs[run_id].nodes["n"]
+        backend.state().await.unwrap().runs[run_id].nodes["n"]
             .wait
             .as_ref()
             .unwrap()
@@ -140,7 +140,7 @@ async fn manual_resolution_binds_operation_and_never_fabricates_outcome() {
     let mut conflicting = late;
     conflicting.payload["status"] = json!(500);
     assert!(backend.append(vec![conflicting]).await.is_err());
-    let snapshot = backend.state().await;
+    let snapshot = backend.state().await.unwrap();
     assert_eq!(snapshot.runs[run_id].last_run_seq, 5);
     assert_eq!(
         snapshot.runs[run_id].nodes["h"].attempts["dispatch"]
@@ -306,7 +306,7 @@ async fn integration_adapters_capture_results_without_persisting_resolved_creden
 async fn until(b: &Arc<JournalBackend>, run_id: &str, predicate: impl Fn(&Run) -> bool) -> Run {
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            let run = b.state().await.runs[run_id].clone();
+            let run = b.state().await.unwrap().runs[run_id].clone();
             if predicate(&run) {
                 return run;
             }
@@ -360,7 +360,7 @@ async fn script_actual_values_and_delay_survive_restart() {
         .await
         .unwrap();
     assert_eq!(
-        backend.state().await.runs[run_id].nodes["d"]
+        backend.state().await.unwrap().runs[run_id].nodes["d"]
             .wait
             .as_ref()
             .unwrap()
@@ -526,7 +526,7 @@ async fn three_generations_complete_with_one_active_slot() {
     )
     .await;
     assert_eq!(run.status, RunStatus::Succeeded, "{:?}", run.error);
-    assert_eq!(backend.state().await.runs.len(), 3);
+    assert_eq!(backend.state().await.unwrap().runs.len(), 3);
     assert!(backend.execution_peak() <= 1);
     backend.close().await.unwrap();
     drop(backend);

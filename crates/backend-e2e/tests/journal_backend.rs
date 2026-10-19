@@ -77,12 +77,14 @@ async fn publication_and_business_references_require_a_complete_value_closure() 
     assert!(backend
         .state()
         .await
+        .unwrap()
         .values
         .check(&StoredValue::Ref(value.clone()))
         .is_ok());
     assert!(backend
         .state()
         .await
+        .unwrap()
         .values
         .check(&StoredValue::Ref(wrong))
         .is_err());
@@ -174,7 +176,7 @@ async fn concurrent_identity_attaches_and_state_receipt_restore_from_one_databas
         .await
         .unwrap();
     assert_eq!(recovered.journal.durable_lsn(), before);
-    assert_eq!(recovered.state().await.workflows.len(), 1);
+    assert_eq!(recovered.state().await.unwrap().workflows.len(), 1);
     assert!(recovered
         .store
         .get("workflow", "w1")
@@ -251,7 +253,7 @@ async fn invalid_multi_event_transaction_never_reaches_journal_or_projection() {
         })
         .await;
     assert!(result.is_err());
-    assert!(backend.state().await.workflows.is_empty());
+    assert!(backend.state().await.unwrap().workflows.is_empty());
     assert_eq!(backend.journal.durable_lsn(), before);
     assert!(backend
         .store
@@ -541,19 +543,19 @@ async fn audit_receipts_survive_cache_eviction_and_repeated_restart() {
     let before = b.journal.durable_lsn();
     assert!(b.append(vec![audit(129), audit(131)]).await.is_err());
     assert_eq!(b.journal.durable_lsn(), before);
-    let snapshot = b.state().await;
+    let snapshot = b.state().await.unwrap();
     let attempt = &snapshot.runs[&run_id].nodes["s"].attempts["dispatch-s"];
     assert_eq!(attempt.audit_seq, 128);
     assert!(attempt.audit_digests.is_empty());
     assert!(attempt.audit_lsns.is_empty());
     b.append(vec![audit(129)]).await.unwrap();
-    let before_fallback = serde_json::to_value(b.state().await).unwrap();
+    let before_fallback = serde_json::to_value(b.state().await.unwrap()).unwrap();
     let mut fallback = audit(130);
     fallback.node_id = None;
     fallback.payload["node_id"] = json!("s");
     assert!(b.append(vec![fallback, audit(132)]).await.is_err());
     assert_eq!(
-        serde_json::to_value(b.state().await).unwrap(),
+        serde_json::to_value(b.state().await.unwrap()).unwrap(),
         before_fallback
     );
     let mut missing_run = audit(130);
@@ -572,7 +574,7 @@ async fn audit_receipts_survive_cache_eviction_and_repeated_restart() {
         assert_eq!(b.append(vec![first.clone()]).await.unwrap(), original);
         assert!(b.append(vec![changed.clone()]).await.is_err());
         assert_eq!(
-            b.state().await.runs[&run_id].nodes["s"].attempts["dispatch-s"].audit_seq,
+            b.state().await.unwrap().runs[&run_id].nodes["s"].attempts["dispatch-s"].audit_seq,
             129
         );
         b.close().await.unwrap();

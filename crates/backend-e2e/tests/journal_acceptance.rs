@@ -18,7 +18,7 @@ async fn install(b: &JournalBackend, nodes: Value, edges: Value) -> String {
 async fn terminal(b: &JournalBackend, id: &str) -> flow_engine::journal_state::Run {
     tokio::time::timeout(Duration::from_secs(90), async {
         loop {
-            let r = b.state().await.runs[id].clone();
+            let r = b.state().await.unwrap().runs[id].clone();
             if r.terminal() {
                 return r;
             }
@@ -91,7 +91,7 @@ async fn sustained_mixed_business() {
             if i % 5 == 3 {
                 tokio::time::timeout(Duration::from_secs(60), async {
                     loop {
-                        if b.state().await.runs[id]
+                        if b.state().await.unwrap().runs[id]
                             .nodes
                             .get("n")
                             .is_some_and(|n| n.status == NodeStatus::Waiting)
@@ -218,7 +218,7 @@ async fn cancelled_fanout_tree_finishes_after_restart() {
     start_ipc(&b, 4).await;
     tokio::time::timeout(Duration::from_secs(90), async {
         loop {
-            if b.state().await.runs.len() == 65 {
+            if b.state().await.unwrap().runs.len() == 65 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -237,6 +237,7 @@ async fn cancelled_fanout_tree_finishes_after_restart() {
         loop {
             if b.state()
                 .await
+                .unwrap()
                 .runs
                 .values()
                 .all(|r| r.status == RunStatus::Cancelled)
@@ -248,7 +249,7 @@ async fn cancelled_fanout_tree_finishes_after_restart() {
     })
     .await
     .unwrap();
-    assert_eq!(b.state().await.runs.len(), 65);
+    assert_eq!(b.state().await.unwrap().runs.len(), 65);
     b.close().await.unwrap();
 }
 
@@ -284,7 +285,7 @@ async fn abrupt_exit_after_sqlite_commit_recovers_state_and_original_receipt() {
     let retry = b.workflow_create("crash", Some("original")).await.unwrap();
     assert_eq!(original.commit_cursor, retry.commit_cursor);
     assert!(retry.visible);
-    assert_eq!(b.state().await.workflows.len(), 1);
+    assert_eq!(b.state().await.unwrap().workflows.len(), 1);
     b.close().await.unwrap();
 }
 
@@ -430,7 +431,7 @@ async fn sigkill_after_external_request_recovers_uncertain_without_resend() {
     start_ipc(&b, 16).await;
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            let s = b.state().await;
+            let s = b.state().await.unwrap();
             let n = &s.runs[&id].nodes["h"];
             if n.wait
                 .as_ref()
@@ -448,7 +449,7 @@ async fn sigkill_after_external_request_recovers_uncertain_without_resend() {
             .await
             .is_err()
     );
-    assert!(b.state().await.runs[&id].nodes["h"]
+    assert!(b.state().await.unwrap().runs[&id].nodes["h"]
         .operation
         .as_ref()
         .unwrap()

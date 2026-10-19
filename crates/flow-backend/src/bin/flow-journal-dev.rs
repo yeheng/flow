@@ -185,14 +185,14 @@ async fn journal_dev(
         println!("{}", serde_json::to_string(&receipt)?);
     }
     if matches!(command, JournalDevCommand::Status) {
-        serde_json::to_writer_pretty(std::io::stdout(), &backend.state().await)?;
+        serde_json::to_writer_pretty(std::io::stdout(), &backend.state().await?)?;
         println!();
         backend.close().await?;
         return Ok(());
     }
     let mut pending = backend
         .state()
-        .await
+        .await?
         .runs
         .values()
         .filter(|r| !r.terminal())
@@ -201,7 +201,13 @@ async fn journal_dev(
     flow_backend::start_execution(&execution, &backend).await?;
     while !pending.is_empty() {
         tokio::select! {_=tokio::signal::ctrl_c()=>break,_=tokio::time::sleep(std::time::Duration::from_millis(100))=>{}}
-        for run in backend.state().await.runs.values().filter(|r| r.terminal()) {
+        for run in backend
+            .state()
+            .await?
+            .runs
+            .values()
+            .filter(|r| r.terminal())
+        {
             if pending.remove(&run.run_id) {
                 serde_json::to_writer(std::io::stdout(), run)?;
                 println!();

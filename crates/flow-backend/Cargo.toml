@@ -33,6 +33,7 @@ async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+postcard = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

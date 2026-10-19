@@ -100,7 +100,7 @@ async fn missing_executor_binary_fails_loudly_without_fallback() {
     assert!(result.is_err(), "missing binary must fail startup");
     // 不回退：节点不执行（保持无派发），run 不被进程内路径悄悄完成。
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let run = backend.state().await.runs[&run_id].clone();
+    let run = backend.state().await.unwrap().runs[&run_id].clone();
     assert!(run.nodes.is_empty(), "no silent in-process fallback");
     backend.close().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
@@ -221,7 +221,7 @@ async fn incompatible_executor_binary_fails_handshake_and_node_errors() {
     // 派发在握手失败处报错；节点失败，不静默回退。
     let done = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
-            let run = backend.state().await.runs[&run_id].clone();
+            let run = backend.state().await.unwrap().runs[&run_id].clone();
             if run.terminal() {
                 return run;
             }
@@ -277,7 +277,7 @@ async fn parent_close_reaps_executor_without_orphans() {
     let run_id = created.result["run_id"].as_str().unwrap().to_string();
     let done = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
-            let run = backend.state().await.runs[&run_id].clone();
+            let run = backend.state().await.unwrap().runs[&run_id].clone();
             if run.terminal() {
                 return run;
             }
@@ -346,7 +346,7 @@ async fn repeated_cancel_and_rebuild_leaves_no_orphans() {
         // 等到任务进入外部操作等待再取消。
         let _ = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
-                let run = backend.state().await.runs[&run_id].clone();
+                let run = backend.state().await.unwrap().runs[&run_id].clone();
                 if run.nodes.get("h").is_some_and(|n| n.operation.is_some()) || run.terminal() {
                     return;
                 }
@@ -357,7 +357,7 @@ async fn repeated_cancel_and_rebuild_leaves_no_orphans() {
         backend.run_cancel(&run_id, None).await.unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                let run = backend.state().await.runs[&run_id].clone();
+                let run = backend.state().await.unwrap().runs[&run_id].clone();
                 if run.terminal() {
                     return;
                 }
@@ -440,7 +440,7 @@ async fn executor_child_gets_cleared_env_and_isolated_fds() {
     let run_id = created.result["run_id"].as_str().unwrap().to_string();
     let done = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
-            let run = backend.state().await.runs[&run_id].clone();
+            let run = backend.state().await.unwrap().runs[&run_id].clone();
             if run.terminal() {
                 return run;
             }

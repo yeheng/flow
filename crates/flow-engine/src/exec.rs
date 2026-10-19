@@ -48,6 +48,11 @@ impl NodeFailure {
 }
 
 pub fn singular_or_map(mut entries: Vec<(String, Value)>) -> Value {
+    // 空输入返回 null（DESIGN §9.2：无 end 或全无输出 → null），不是空
+    // 对象——`{}` 是「有一个空对象输出」，语义不同。
+    if entries.is_empty() {
+        return Value::Null;
+    }
     if entries.len() == 1 {
         let (_, value) = entries.pop().unwrap();
         return value;

@@ -113,10 +113,11 @@ impl JournalBackend {
 
     /// Explicit whole-history diagnostic export. Production reads use run_snapshot,
     /// metadata queries or fact pages instead of allocating this export.
-    pub async fn state(&self) -> State {
-        self.full_state()
-            .await
-            .expect("SQLite current state unavailable")
+    ///
+    /// Dev/诊断便捷入口：存储故障以 Err 上抛而不是 panic——这是 pub API，
+    /// 一旦被 RPC 层引入，expect 就成了远程可触发的进程崩溃。
+    pub async fn state(&self) -> Result<State> {
+        self.full_state().await
     }
     pub async fn full_state(&self) -> Result<State> {
         let mut committed = self.state.lock().await;
@@ -748,10 +749,7 @@ pub(crate) fn project_rows(
     for e in &tx.events {
         if let Some(id) = &e.run_id {
             // Audit payloads update the permanent receipt index, not the product run row.
-            if !matches!(
-                e.kind,
-                EventKind::ValueChunk | EventKind::ValuePublished | EventKind::LateAudit
-            ) {
+            if !e.is_audit_only() {
                 keys.insert(("run", id.clone()));
                 if e.kind == EventKind::RunStarted {
                     if let Some(run) = state.runs.get(id) {
