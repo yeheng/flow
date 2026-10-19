@@ -364,10 +364,10 @@ onUnmounted(() => {
           </AppButton>
           <AppButton
             variant="link"
-            title="与另一个 run 比较状态、输出与节点结果"
+            title="输入任意基线 run id，比较状态、输出与节点结果"
             @click="openCompare()"
           >
-            与基线比较
+            比较运行
           </AppButton>
         </span>
       </div>

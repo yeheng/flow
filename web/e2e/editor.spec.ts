@@ -12,7 +12,11 @@ test("编辑器：画布渲染、顶部条、改参数保存无错误", async ({
   // 顶部条：工作流名 + 版本入口
   await expect(page.locator(".editor-title")).toContainText(name);
   await expect(page.locator(".editor-title")).toContainText("v1");
-  await expect(page.locator(".editor-actions").getByRole("link", { name: "版本" })).toBeVisible();
+  // 子页互跳在独立 subnav 行：版本/触发器/运行记录
+  const subnav = page.locator(".editor-subnav");
+  await expect(subnav.getByRole("link", { name: "版本" })).toBeVisible();
+  await expect(subnav.getByRole("link", { name: "触发器" })).toBeVisible();
+  await expect(subnav.getByRole("link", { name: "运行记录" })).toBeVisible();
 
   // 左侧节点面板可收起/展开（顶栏按钮；⌘B 同效）
   const palette = page.locator(".palette");

@@ -108,8 +108,13 @@ function onConsoleDragStart(e: PointerEvent): void {
 
 // 左侧节点面板：拖右边缘改宽度
 const paletteEl = ref<HTMLElement | null>(null);
-/** 面板宽度上限 clamp 到 min(240px, 32vw)：窄屏不挤占画布，宽屏也不越拖越宽 */
-const paletteMax = computed(() => Math.min(240, viewportW.value * 0.32));
+/** 面板宽度上限：宽屏沿用原上限（父容器 50%），窄屏收紧到 32vw 防挤占画布 */
+const paletteMax = computed(() => {
+  const parent = paletteEl.value?.parentElement?.clientWidth ?? 1200;
+  return viewportW.value < 1080
+    ? Math.min(parent * 0.5, viewportW.value * 0.32)
+    : parent * 0.5;
+});
 const paletteResize = usePanelResize({
   target: paletteEl,
   storageKey: "flow.palette-w",
