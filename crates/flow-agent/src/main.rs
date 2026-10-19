@@ -45,6 +45,9 @@ struct Agent {
     cert: Option<String>,
     #[arg(long, env = "FLOW_AGENT_KEY")]
     key: Option<String>,
+    /// mTLS 服务端证书校验名/SNI（缺省 flow-server，对应服务端证书 SAN）。
+    #[arg(long, env = "FLOW_AGENT_SNI")]
+    sni: Option<String>,
     /// 本机执行器二进制。缺省定位同目录兄弟 flow-executor；
     /// FLOW_EXECUTOR_BIN 环境变量同样生效。
     #[arg(long)]
@@ -85,6 +88,7 @@ fn main() -> std::process::ExitCode {
         ca_cert,
         cert,
         key,
+        sni,
         executor_bin,
         slots,
         wss_url,
@@ -100,6 +104,7 @@ fn main() -> std::process::ExitCode {
         ca_cert,
         cert,
         key,
+        sni,
         executor_bin,
         slots,
         wss_url,
@@ -125,6 +130,7 @@ fn agent_main(
     flag_ca_cert: Option<String>,
     flag_cert: Option<String>,
     flag_key: Option<String>,
+    flag_sni: Option<String>,
     flag_executor_bin: Option<String>,
     flag_slots: Option<u32>,
     flag_wss_url: Option<String>,
@@ -211,6 +217,7 @@ fn agent_main(
         ca_cert: ca_cert.into(),
         cert: cert.into(),
         key: key.into(),
+        sni: flag_sni.or(agent.sni.clone()),
         executor,
         slots,
         wss_url,

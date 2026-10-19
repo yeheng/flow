@@ -6,6 +6,7 @@
 //! 分别派发。
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize as _;
@@ -440,7 +441,7 @@ impl TaskRunner {
                     let value = match reference.codec {
                         ValueCodec::Json => serde_json::from_slice(&bytes)?,
                         ValueCodec::Utf8 => Value::String(
-                            String::from_utf8(bytes)
+                            String::from_utf8(bytes.to_vec())
                                 .map_err(|e| TaskError::Invalid(e.to_string()))?,
                         ),
                         ValueCodec::Bytes => {
@@ -843,7 +844,7 @@ impl TaskRunner {
         })
     }
 
-    async fn take_transfer(&mut self, transfer_id: &str) -> Result<Vec<u8>, TaskError> {
+    async fn take_transfer(&mut self, transfer_id: &str) -> Result<Arc<Vec<u8>>, TaskError> {
         // 输入装配在 execute 前完成；此处从会话级缓冲取。TaskRunner 的
         // transfers 在 materialize_inputs 中局部持有，这里简化为重新等待
         // InputReady（已就位时立即返回）。
@@ -881,7 +882,8 @@ impl TaskRunner {
                 match reference.codec {
                     ValueCodec::Json => Ok(serde_json::from_slice(&bytes)?),
                     ValueCodec::Utf8 => Ok(Value::String(
-                        String::from_utf8(bytes).map_err(|e| TaskError::Invalid(e.to_string()))?,
+                        String::from_utf8(bytes.to_vec())
+                            .map_err(|e| TaskError::Invalid(e.to_string()))?,
                     )),
                     ValueCodec::Bytes => {
                         Err(TaskError::Invalid("binary value in JSON input face".into()))
@@ -1510,7 +1512,7 @@ impl TaskRunner {
     async fn raw_bytes(
         &mut self,
         reference: &flow_journal::ValueRef,
-    ) -> Result<Vec<u8>, TaskError> {
+    ) -> Result<Arc<Vec<u8>>, TaskError> {
         // 当前进程刚捕获的响应：从内存取；恢复路径由主进程随
         // previous_outcome 重传（transfer id 约定见 TransferKey::OperationBody）。
         self.take_transfer(&TransferKey::OperationBody(reference.output_id.clone()).to_wire())

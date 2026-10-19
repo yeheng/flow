@@ -940,7 +940,8 @@ async fn config_get_update_roundtrip_writes_file() {
         backend: backend.clone(),
         config: Some(flow_rpc::ConfigState {
             config: std::sync::RwLock::new(flow_config::Config::default()),
-            path: Some(config_path.clone()),
+            path: std::sync::RwLock::new(Some(config_path.clone())),
+            default_path: None,
             env_overrides: vec!["FLOW_DATA_DIR".to_string()],
         }),
         secrets: None,
@@ -1002,6 +1003,65 @@ async fn config_get_update_roundtrip_writes_file() {
         .call("config.update", json!({"patch": {"bogus": {}}}))
         .await;
     assert_eq!(bad["error"]["code"], -32602);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 启动时无配置文件：update 落到默认落点（非 CWD），首次落盘后
+/// config_path 回填可见，二次 update 走同一落点。
+#[tokio::test]
+async fn config_update_without_file_lands_on_default_target() {
+    let root = std::env::temp_dir().join(format!("flow-config-rpc-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&root).unwrap();
+    let default_path = root.join("default").join("flow.toml");
+    let backend = JournalBackend::open(&root, Default::default())
+        .await
+        .unwrap();
+    let state = Arc::new(AppState {
+        backend: backend.clone(),
+        config: Some(flow_rpc::ConfigState {
+            config: std::sync::RwLock::new(flow_config::Config::default()),
+            path: std::sync::RwLock::new(None),
+            default_path: Some(default_path.clone()),
+            env_overrides: Vec::new(),
+        }),
+        secrets: None,
+    });
+    let f = Fixture {
+        root: root.clone(),
+        backend: backend.clone(),
+        state,
+        workflow: String::new(),
+    };
+
+    // 启动无配置文件：config_path 为空
+    let resp = f.call("config.get", json!({})).await;
+    assert!(resp["result"]["config_path"].is_null());
+
+    // 首次 update 落到默认落点（父目录自动创建），响应即回填 config_path
+    let resp = f
+        .call(
+            "config.update",
+            json!({"patch": {"server": {"scheduler_enabled": true, "journal_trigger_tick_secs": 45}}}),
+        )
+        .await;
+    assert_eq!(resp["result"]["config_path"], json!(default_path));
+    assert_eq!(
+        resp["result"]["config"]["server"]["journal_trigger_tick_secs"],
+        45
+    );
+    let text = std::fs::read_to_string(&default_path).unwrap();
+    assert!(text.contains("journal_trigger_tick_secs = 45"));
+
+    // 二次 update 落到同一路径
+    let resp = f
+        .call(
+            "config.update",
+            json!({"patch": {"storage": {"backend": "journal", "data_dir": "data3"}}}),
+        )
+        .await;
+    assert_eq!(resp["result"]["config_path"], json!(default_path));
+    assert_eq!(resp["result"]["config"]["storage"]["data_dir"], "data3");
 
     let _ = std::fs::remove_dir_all(&root);
 }

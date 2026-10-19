@@ -56,6 +56,7 @@ async fn spawn_simulated_agent(
         ca_cert: "unused".into(),
         cert: "unused".into(),
         key: "unused".into(),
+        sni: None,
         executor: executor(),
         slots,
         wss_url: None,
@@ -265,6 +266,217 @@ async fn relay_path_produces_identical_authoritative_facts() {
     relay_backend.close().await.unwrap();
     std::fs::remove_dir_all(root_direct).unwrap();
     std::fs::remove_dir_all(root_relay).unwrap();
+}
+
+/// 收集下一个 BindExecutor 帧（跳过其他帧）；超时返回 None。
+async fn next_bind_opt(
+    transport: &mut FrameTransport,
+    wait: Duration,
+) -> Option<(String, String)> {
+    use flow_engine::execution_protocol::Message;
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
+        let message = tokio::time::timeout(remaining, transport.recv()).await.ok()?.ok()?;
+        if let Message::BindExecutor {
+            executor_id,
+            dispatch_id,
+        } = message
+        {
+            return Some((executor_id, dispatch_id));
+        }
+    }
+}
+
+/// CapacityReport 周期上报（三期 §1.6）：serve 循环与心跳同拍上报资源——
+/// 首拍（注册后）立即到达并按心跳周期重复；slots/in_flight 携带真实值。
+#[tokio::test]
+async fn capacity_report_arrives_immediately_and_repeats() {
+    use flow_engine::execution_protocol::Message;
+    let (agent_side, master_side) = tokio::io::duplex(64 * 1024);
+    let agent_transport = FrameTransport::spawn(agent_side, 16);
+    let mut master_transport = FrameTransport::spawn(master_side, 16);
+    let config = AgentConfig {
+        agent_id: "agent-cap".into(),
+        control_addr: String::new(),
+        ca_cert: "unused".into(),
+        cert: "unused".into(),
+        key: "unused".into(),
+        sni: None,
+        executor: executor(),
+        slots: 3,
+        wss_url: None,
+        token: None,
+    };
+    let relay = Arc::new(parking_lot::Mutex::new(flow_agent::relay::Relay::new(
+        "agent-cap".into(),
+        "boot-cap".into(),
+        "link-cap".into(),
+    )));
+    let handles = Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let stop = shutdown.clone();
+    tokio::spawn(async move {
+        let _ = flow_agent::runtime::serve_for_tests(
+            &config,
+            "journal-cap",
+            1,
+            agent_transport,
+            relay,
+            handles,
+            stop,
+        )
+        .await;
+    });
+
+    let mut reports = Vec::new();
+    let mut heartbeats = 0u32;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    while reports.len() < 2 && tokio::time::Instant::now() < deadline {
+        let remaining = deadline - tokio::time::Instant::now();
+        let Ok(Ok(message)) = tokio::time::timeout(remaining, master_transport.recv()).await else {
+            break;
+        };
+        match message {
+            Message::CapacityReport { capacity } => {
+                reports.push((tokio::time::Instant::now(), capacity));
+            }
+            Message::Heartbeat { .. } => heartbeats += 1,
+            _ => {}
+        }
+    }
+    assert!(
+        reports.len() >= 2,
+        "注册后立即上报并按心跳周期重复，实际 {reports:?}"
+    );
+    assert!(heartbeats >= 1, "容量上报与心跳同拍");
+    let (_, first) = &reports[0];
+    assert_eq!(first.slots, 3);
+    assert_eq!(first.in_flight, 0);
+    assert!(first.capabilities.iter().any(|c| c == "resource_report"));
+    let spacing = reports[1].0.duration_since(reports[0].0);
+    assert!(
+        spacing >= Duration::from_millis(500),
+        "两拍之间应有心跳周期间隔，实际 {spacing:?}"
+    );
+    shutdown.cancel();
+}
+
+/// CapacityReport 动态抬高准入：slots_total=1 时第二个派发被准入挡住，
+/// 报告到达（notify 唤醒 binder）后立即绑上——「used < slots_total 才允许
+/// bind」的动态路径。
+#[tokio::test]
+async fn capacity_report_raises_admission_slots() {
+    use flow_engine::execution_protocol::remote::Capacity;
+    use flow_engine::execution_protocol::Message;
+    let root = temp();
+    let backend = JournalBackend::open(&root, JournalOptions::default())
+        .await
+        .unwrap();
+    let manager = flow_backend::execution::remote::AgentManager::new(
+        backend.clone(),
+        backend.journal.id().into(),
+        1,
+    );
+    backend
+        .start_execution_remote_manager(manager.clone(), remote_options())
+        .await
+        .unwrap();
+    let (control_a, control_b) = tokio::io::duplex(64 * 1024);
+    manager
+        .attach_inprocess("agent-cap".to_string(), control_a)
+        .await;
+    let mut transport = FrameTransport::spawn(control_b, 16);
+    transport
+        .send(Message::AgentHello {
+            version: flow_engine::execution_protocol::PROTOCOL_VERSION,
+            agent_boot_id: "boot-cap".into(),
+            build: "sim".into(),
+            capabilities: vec![
+                "relay".into(),
+                "resource_report".into(),
+                "reconnect".into(),
+            ],
+            slots: 1,
+        })
+        .await
+        .unwrap();
+    loop {
+        let message = transport.recv().await.unwrap();
+        if matches!(message, Message::AgentWelcome { .. }) {
+            break;
+        }
+    }
+
+    let workflow = install(
+        &backend,
+        json!({"nodes":[
+            {"id":"s","type":"start"},
+            {"id":"n","type":"script","params":{"code":"return {ok: 1};"}},
+            {"id":"e","type":"end"}],
+            "edges":[{"from":"s","to":"n"},{"from":"n","to":"e"}]}),
+    )
+    .await;
+    // 第一个派发绑上并确认（绑定在挑选时即占用槽位）。
+    let _ = backend
+        .run_start(&workflow, None, json!({}), "manual", None, None)
+        .await
+        .unwrap();
+    let (executor_id, dispatch_id) = tokio::time::timeout(
+        Duration::from_secs(10),
+        next_bind_opt(&mut transport, Duration::from_secs(10)),
+    )
+    .await
+    .expect("first bind")
+    .expect("first bind frame");
+    let first_dispatch = dispatch_id.clone();
+    transport
+        .send(Message::BindExecutorAck {
+            executor_id,
+            executor_boot_id: "eb-1".into(),
+            dispatch_id,
+            ok: true,
+            error: None,
+        })
+        .await
+        .unwrap();
+
+    // slots_total=1：第二个派发不得绑上。
+    let _ = backend
+        .run_start(&workflow, None, json!({}), "manual", None, None)
+        .await
+        .unwrap();
+    assert!(
+        next_bind_opt(&mut transport, Duration::from_secs(2))
+            .await
+            .is_none(),
+        "slots_total=1 时不得重复超配"
+    );
+
+    // CapacityReport 抬高 slots_total 并唤醒准入 → 第二个派发绑上。
+    transport
+        .send(Message::CapacityReport {
+            capacity: Capacity {
+                slots: 2,
+                in_flight: 1,
+                pending_bytes: 0,
+                memory_mib: 0,
+                capabilities: vec![],
+            },
+        })
+        .await
+        .unwrap();
+    let second = tokio::time::timeout(
+        Duration::from_secs(10),
+        next_bind_opt(&mut transport, Duration::from_secs(10)),
+    )
+    .await
+    .expect("bind after capacity report")
+    .expect("second bind frame");
+    assert_ne!(second.1, first_dispatch, "报告唤醒的是新派发的准入");
+
+    backend.close().await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]

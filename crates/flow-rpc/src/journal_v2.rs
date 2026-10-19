@@ -1018,13 +1018,30 @@ async fn config_update(ctx: &Context, p: &Value) -> Result<Value, ErrorObjectOwn
     let base = current.clone();
     let merged =
         flow_config::Config::merge_patch(&base, &patch).map_err(|e| invalid(e.to_string()))?;
-    let write_path = cs
-        .path
-        .clone()
-        .unwrap_or_else(|| std::path::PathBuf::from("flow.toml"));
+    // 落点只认启动时发现的配置文件，其次默认落点（FLOW_CONFIG 声明值或
+    // 平台配置目录）；绝不用进程 CWD——换目录启动会丢配置。
+    let existing = cs.path.read().unwrap().clone();
+    let (write_path, first_write) = match existing {
+        Some(path) => (path, false),
+        None => (
+            cs.default_path
+                .clone()
+                .ok_or_else(|| invalid("无法确定配置文件落点：请通过 --config 或 FLOW_CONFIG 指定路径"))?,
+            true,
+        ),
+    };
+    if let Some(parent) = write_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| invalid(format!("配置写入失败：{e}")))?;
+        }
+    }
     merged
         .save(&write_path)
         .map_err(|e| invalid(format!("配置写入失败：{e}")))?;
+    if first_write {
+        *cs.path.write().unwrap() = Some(write_path);
+    }
     *current = merged;
     drop(current);
     Ok(crate::config_view(&product))

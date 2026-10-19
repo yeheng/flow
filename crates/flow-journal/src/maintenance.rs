@@ -85,13 +85,74 @@ pub fn verify(root: &Path) -> Result<Recovery> {
     Ok(report)
 }
 
+/// 发布目标前置检查（backup / upgrade 共用）。不变量：目标要么空、要么已含
+/// 发布成品——失败残骸不算占用。已发布主文件或外来内容 → Conflict 且现场
+/// 原样不动；仅自家 staging 残骸（`.backup-*` / `.upgrade-*`，上次失败或进程
+/// 崩溃留下）→ 清理后视为空目标，同路径直接重试，无需人工清理。
+/// 返回 true 表示目录由本次调用创建。
+fn prepare_destination(destination: &Path, staging_prefix: &str, label: &str) -> Result<bool> {
+    let meta = match fs::symlink_metadata(destination) {
+        Ok(meta) => meta,
+        Err(_) => {
+            private_dir(destination)?;
+            return Ok(true);
+        }
+    };
+    if !meta.is_dir() || fs::symlink_metadata(destination.join(crate::sqlite::DATABASE)).is_ok() {
+        return Err(Error::Conflict(format!(
+            "{label} destination already exists"
+        )));
+    }
+    let mut leftovers = Vec::new();
+    for entry in fs::read_dir(destination)? {
+        let path = entry?.path();
+        let ours = path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(staging_prefix));
+        if !ours {
+            // 有任何外来内容就整体拒绝：自家残骸也原样保留，不动现场。
+            return Err(Error::Conflict(format!(
+                "{label} destination not empty"
+            )));
+        }
+        leftovers.push(path);
+    }
+    for leftover in leftovers {
+        if fs::symlink_metadata(&leftover)?.file_type().is_dir() {
+            fs::remove_dir_all(leftover)?;
+        } else {
+            fs::remove_file(leftover)?;
+        }
+    }
+    Ok(false)
+}
+
+/// staging 清理守卫：发布成功后解除；任何中途失败 best-effort 清掉 staging
+/// 与本次创建的空目标目录——目标要么是验证过的成品，要么什么都不是。
+struct StagingGuard<'a> {
+    destination: &'a Path,
+    staging: &'a Path,
+    created: bool,
+    armed: bool,
+}
+
+impl Drop for StagingGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = fs::remove_dir_all(self.staging);
+        if self.created {
+            let _ = fs::remove_dir(self.destination);
+        }
+    }
+}
+
 /// Back up one SQLite read snapshot, including state, receipts, facts and BLOBs.
 /// A requested old prefix is rejected: its corresponding current state is not retained.
-/// u64::MAX selects the current snapshot. No destination is overwritten.
+/// u64::MAX selects the current snapshot. No destination is overwritten, and a
+/// failed attempt leaves nothing behind: the same destination can be retried.
 pub fn backup(root: &Path, destination: &Path, upper_lsn: u64) -> Result<Recovery> {
-    if fs::symlink_metadata(destination).is_ok() {
-        return Err(Error::Conflict("backup destination already exists".into()));
-    }
     let source = crate::sqlite::read_connection(root)?;
     source.execute_batch("BEGIN").map_err(crate::sqlite::db)?;
     let (journal_id, last_lsn) = crate::sqlite::metadata(&source)?;
@@ -100,10 +161,16 @@ pub fn backup(root: &Path, destination: &Path, upper_lsn: u64) -> Result<Recover
             "backup boundary changed or is historical; select a current snapshot".into(),
         ));
     }
-    private_dir(destination)?;
-    // Publish only a fully verified standalone file. Failed copies remain staging
-    // evidence, and cannot be opened as a fresh coordinator database.
+    let created = prepare_destination(destination, ".backup-", "backup")?;
+    // Publish only a fully verified standalone file. StagingGuard discards a
+    // failed attempt, so a half-copied database never survives at the target.
     let staging = destination.join(format!(".backup-{}", uuid::Uuid::now_v7()));
+    let mut guard = StagingGuard {
+        destination,
+        staging: &staging,
+        created,
+        armed: true,
+    };
     private_dir(&staging)?;
     let path = staging.join(crate::sqlite::DATABASE);
     drop(private_file(&path, true)?);
@@ -132,6 +199,7 @@ pub fn backup(root: &Path, destination: &Path, upper_lsn: u64) -> Result<Recover
     // Only the main database file is published; drop the whole staging directory.
     fs::remove_dir_all(&staging)?;
     sync_dir(destination)?;
+    guard.armed = false;
     Ok(report)
 }
 
@@ -152,9 +220,6 @@ pub fn rebuild_index(root: &Path, upper_lsn: u64) -> Result<Recovery> {
 /// DAGs. The SQL schema is unchanged. Upgrade a consistent COPY; never edit or
 /// overwrite the source. The caller must hold the source's offline lock.
 pub fn upgrade(source: &Path, destination: &Path) -> Result<Recovery> {
-    if fs::symlink_metadata(destination).is_ok() {
-        return Err(Error::Conflict("upgrade destination already exists".into()));
-    }
     let database = source.join(crate::sqlite::DATABASE);
     if fs::symlink_metadata(&database)?.file_type().is_symlink() {
         return Err(invalid("symlink source database"));
@@ -168,8 +233,14 @@ pub fn upgrade(source: &Path, destination: &Path) -> Result<Recovery> {
     if version != 3 {
         return Err(invalid("upgrade supports only SQLite format 3 -> 4"));
     }
-    private_dir(destination)?;
+    let created = prepare_destination(destination, ".upgrade-", "upgrade")?;
     let staging = destination.join(format!(".upgrade-{}", uuid::Uuid::now_v7()));
+    let mut guard = StagingGuard {
+        destination,
+        staging: &staging,
+        created,
+        armed: true,
+    };
     private_dir(&staging)?;
     let path = staging.join(crate::sqlite::DATABASE);
     drop(private_file(&path, true)?);
@@ -196,6 +267,7 @@ pub fn upgrade(source: &Path, destination: &Path) -> Result<Recovery> {
     fs::remove_dir_all(&staging)?;
     sync_dir(destination)?;
     sync_dir(destination.parent().unwrap_or(Path::new(".")))?;
+    guard.armed = false;
     Ok(report)
 }
 

@@ -30,6 +30,21 @@ fn generate_pki(
     std::path::PathBuf,
     std::path::PathBuf,
 ) {
+    generate_pki_named(dir, agent_cn, "flow-server")
+}
+
+/// 生成测试 PKI（指定服务端 SAN/CN 名）：CA + server(server_name) + agent(CN=agent_id)。
+fn generate_pki_named(
+    dir: &std::path::Path,
+    agent_cn: &str,
+    server_name: &str,
+) -> (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
     use rcgen::{CertificateParams, KeyPair};
     let ca_key = KeyPair::generate().unwrap();
     let mut ca_params = CertificateParams::new(vec![]).unwrap();
@@ -37,10 +52,10 @@ fn generate_pki(
     let ca_cert = ca_params.self_signed(&ca_key).unwrap();
 
     let server_key = KeyPair::generate().unwrap();
-    let mut server_params = CertificateParams::new(vec!["flow-server".to_string()]).unwrap();
+    let mut server_params = CertificateParams::new(vec![server_name.to_string()]).unwrap();
     server_params.distinguished_name.push(
         rcgen::DnType::CommonName,
-        rcgen::DnValue::Utf8String("flow-server".into()),
+        rcgen::DnValue::Utf8String(server_name.into()),
     );
     let server_cert = server_params
         .signed_by(&server_key, &ca_cert, &ca_key)
@@ -127,25 +142,36 @@ impl Drop for AgentProcess {
 }
 
 fn spawn_agent(dir: &std::path::Path, control: u16, agent_cn: &str, slots: u32) -> AgentProcess {
-    let child = std::process::Command::new(agent_bin())
-        .args([
-            "--control-addr",
-            &format!("127.0.0.1:{control}"),
-            "--agent-id",
-            agent_cn,
-            "--ca-cert",
-        ])
-        .arg(dir.join("ca.pem"))
-        .arg("--cert")
-        .arg(dir.join("agent.pem"))
-        .arg("--key")
-        .arg(dir.join("agent.key"))
-        .arg("--slots")
-        .arg(slots.to_string())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn flow-agent");
-    let mut child = child;
+    spawn_agent_with_sni(dir, control, agent_cn, slots, None)
+}
+
+fn spawn_agent_with_sni(
+    dir: &std::path::Path,
+    control: u16,
+    agent_cn: &str,
+    slots: u32,
+    sni: Option<&str>,
+) -> AgentProcess {
+    let mut cmd = std::process::Command::new(agent_bin());
+    cmd.args([
+        "--control-addr",
+        &format!("127.0.0.1:{control}"),
+        "--agent-id",
+        agent_cn,
+        "--ca-cert",
+    ])
+    .arg(dir.join("ca.pem"))
+    .arg("--cert")
+    .arg(dir.join("agent.pem"))
+    .arg("--key")
+    .arg(dir.join("agent.key"))
+    .arg("--slots")
+    .arg(slots.to_string())
+    .stderr(std::process::Stdio::piped());
+    if let Some(sni) = sni {
+        cmd.arg("--sni").arg(sni);
+    }
+    let mut child = cmd.spawn().expect("spawn flow-agent");
     let stderr = child.stderr.take();
     AgentProcess { child, stderr }
 }
@@ -560,6 +586,85 @@ async fn coalesced_welcome_and_trailing_frame_not_lost_by_agent() {
     assert!(
         delivered,
         "agent must consume coalesced trailing frame and close uplink; stderr:\n{}",
+        agent.dump_stderr()
+    );
+    drop(agent);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// SNI 可配置：服务端证书 SAN 非缺省名时，`--sni` 指定校验名可握手注册并执行；
+/// 缺省名（flow-server）对该证书握手失败。握手断言直接走 flow-agent 客户端栈。
+#[tokio::test]
+async fn tls_sni_is_configurable_and_verified() {
+    init_tracing();
+    let dir = temp();
+    std::fs::create_dir_all(&dir).unwrap();
+    generate_pki_named(&dir, "agent-sni", "flow.internal");
+    let ports = free_ports(1);
+    let backend = JournalBackend::open(&dir.join("data"), JournalOptions::default())
+        .await
+        .unwrap();
+    backend
+        .start_execution_remote(remote_options(&dir, ports[0]))
+        .await
+        .unwrap();
+    let addr = format!("127.0.0.1:{}", ports[0]);
+
+    // 握手层（flow-agent 客户端栈）：缺省 SNI 对 SAN=flow.internal 必须失败，
+    // 显式 SNI 必须成功——校验名跟着 SNI 走，没有绕过验证的路径。
+    let handshake = |name: &str| {
+        let addr = addr.clone();
+        let dir = dir.clone();
+        let name = name.to_string();
+        async move {
+            let connector = flow_agent::tls::client_config_from_files(
+                &dir.join("ca.pem"),
+                &dir.join("agent.pem"),
+                &dir.join("agent.key"),
+            )
+            .unwrap();
+            let tcp = tokio::net::TcpStream::connect(&addr).await.unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                connector.connect(
+                    rustls::pki_types::ServerName::try_from(name).unwrap(),
+                    tcp,
+                ),
+            )
+            .await
+            .map(|result| result.is_ok())
+            .unwrap_or(false)
+        }
+    };
+    assert!(
+        !handshake("flow-server").await,
+        "缺省 SNI 对自定义 SAN 必须握手失败"
+    );
+    assert!(handshake("flow.internal").await, "显式 SNI 必须握手成功");
+
+    // 端到端：真实 agent 二进制 --sni flow.internal 注册并完成执行。
+    let mut agent = spawn_agent_with_sni(&dir, ports[0], "agent-sni", 4, Some("flow.internal"));
+    // 等会话注册（与本套件其他用例同一节奏）。
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let workflow = install(
+        &backend,
+        json!({"nodes":[
+            {"id":"s","type":"start"},
+            {"id":"n","type":"script","params":{"code":"return {ok: 1};"}},
+            {"id":"e","type":"end"}],
+            "edges":[{"from":"s","to":"n"},{"from":"n","to":"e"}]}),
+    )
+    .await;
+    let created = backend
+        .run_start(&workflow, None, json!({}), "manual", None, None)
+        .await
+        .unwrap();
+    let run_id = created.result["run_id"].as_str().unwrap().to_string();
+    let done = until(&backend, &run_id, Run::terminal).await;
+    assert_eq!(
+        done.status,
+        RunStatus::Succeeded,
+        "custom sni run failed; agent stderr:\n{}",
         agent.dump_stderr()
     );
     drop(agent);

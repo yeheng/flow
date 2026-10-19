@@ -36,6 +36,7 @@ fn agent_config(agent_id: &str, slots: u32) -> AgentConfig {
         ca_cert: Default::default(),
         cert: Default::default(),
         key: Default::default(),
+        sni: None,
         executor: flow_engine::execution_protocol::ExecutorInvocation {
             program: flow_test_support::io::executor_bin(),
         },

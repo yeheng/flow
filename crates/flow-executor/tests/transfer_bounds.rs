@@ -32,7 +32,10 @@ fn offset_overflow_and_overlapping_chunks_are_rejected() {
     transfers
         .input_ready(&ready("in:run-input", b"abc"))
         .unwrap();
-    assert_eq!(transfers.take("in:run-input").unwrap(), b"abc");
+    assert_eq!(
+        transfers.take("in:run-input").unwrap().as_slice(),
+        b"abc".as_slice()
+    );
     // Completed buffers still accept exact remote replay without retaining chunks twice.
     transfers.feed(&chunk("in:run-input", 0, b"abc")).unwrap();
     transfers

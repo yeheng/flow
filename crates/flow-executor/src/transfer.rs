@@ -9,6 +9,7 @@
 //! 持久化，journal 字节与一期进程内路径一致。
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::Value;
@@ -42,8 +43,10 @@ pub struct IncomingTransfers {
 /// 维护连续前缀（`buf`）。`offset == 已接收长度` 时追加；完全落在已接收
 /// 前缀且字节相同的是幂等重复（重连后全量重发）；缺口、跨边界重叠或异
 /// 内容一律拒绝。不再维护块树与装配副本（消除排序 + 整体二次拷贝）。
+/// 装配期独占可写（Arc::make_mut 无克隆）；装配完成后 [`IncomingTransfers::take`]
+/// 只发共享句柄，重复读（End 汇合、恢复重放）不再整段复制。
 struct TransferBuffer {
-    buf: Vec<u8>,
+    buf: Arc<Vec<u8>>,
     ready: Option<(u64, String)>,
     assembled: bool,
 }
@@ -70,19 +73,18 @@ impl IncomingTransfers {
             return Err(TransferError::Oversize(bytes.len() as u64));
         }
         // T12：内存中 bytes 已是原始字节（v3 wire 的 base64 在解码层还原）。
-        let raw = bytes.clone();
-        if hex::encode(Sha256::digest(&raw)) != *digest {
+        if hex::encode(Sha256::digest(bytes)) != *digest {
             return Err(TransferError::Digest(*offset));
         }
         let end = offset
-            .checked_add(raw.len() as u64)
+            .checked_add(bytes.len() as u64)
             .ok_or(TransferError::Oversize(*offset))?;
         let limit = if transfer_id.starts_with("in:") {
             crate::task::INPUT_BUDGET as u64
         } else {
             MAX_VALUE_BYTES
         };
-        if raw.is_empty() || raw.len() > CHUNK_BYTES || end > limit {
+        if bytes.is_empty() || bytes.len() > CHUNK_BYTES || end > limit {
             return Err(TransferError::Oversize(end));
         }
         let total: u64 = self.streams.values().map(|s| s.buf.len() as u64).sum();
@@ -96,7 +98,7 @@ impl IncomingTransfers {
         let received = stream.buf.len() as u64;
         if end <= received {
             // 幂等重复：完全落在已接收前缀且字节相同（重连后全量重发）。
-            if stream.buf[*offset as usize..end as usize] == raw[..] {
+            if stream.buf[*offset as usize..end as usize] == bytes[..] {
                 return Ok(());
             }
             return Err(TransferError::Duplicate(transfer_id.clone(), *offset));
@@ -115,13 +117,13 @@ impl IncomingTransfers {
                 return Err(TransferError::Oversize(end));
             }
         }
-        if total + raw.len() as u64 > MAX_VALUE_BYTES
+        if total + bytes.len() as u64 > MAX_VALUE_BYTES
             || (transfer_id.starts_with("in:")
-                && inputs + raw.len() as u64 > crate::task::INPUT_BUDGET as u64)
+                && inputs + bytes.len() as u64 > crate::task::INPUT_BUDGET as u64)
         {
-            return Err(TransferError::Oversize(total + raw.len() as u64));
+            return Err(TransferError::Oversize(total + bytes.len() as u64));
         }
-        stream.buf.extend_from_slice(&raw);
+        Arc::make_mut(&mut stream.buf).extend_from_slice(bytes);
         self.try_assemble(transfer_id)
     }
 
@@ -150,7 +152,7 @@ impl IncomingTransfers {
             .streams
             .entry(transfer_id.clone())
             .or_insert(TransferBuffer {
-                buf: Vec::new(),
+                buf: Arc::new(Vec::new()),
                 ready: None,
                 assembled: false,
             });
@@ -182,17 +184,18 @@ impl IncomingTransfers {
             return Err(TransferError::Oversize(received));
         }
         // 整值摘要：连续前缀即完整内容，无需排序与二次拷贝（T07）。
-        if hex::encode(Sha256::digest(&stream.buf)) != digest {
+        if hex::encode(Sha256::digest(stream.buf.as_slice())) != digest {
             return Err(TransferError::Digest(total));
         }
         stream.assembled = true;
         Ok(())
     }
 
-    /// 取出装配完成的字节（InputReady 且校验通过）。保留缓存副本供同一
-    /// 任务后续阶段（如 End 汇合）再次读取；任务结束时随装配器释放。
-    pub fn take(&mut self, transfer_id: &str) -> Option<Vec<u8>> {
-        let stream = self.streams.get_mut(transfer_id)?;
+    /// 取出装配完成的字节（InputReady 且校验通过）。返回共享句柄——缓存
+    /// 保留给同一任务后续阶段（如 End 汇合）重复读取，重复读零拷贝；
+    /// 任务结束时随装配器释放。
+    pub fn take(&self, transfer_id: &str) -> Option<Arc<Vec<u8>>> {
+        let stream = self.streams.get(transfer_id)?;
         if stream.ready.is_some() && stream.assembled {
             Some(stream.buf.clone())
         } else {
@@ -208,7 +211,7 @@ impl IncomingTransfers {
         if !stream.assembled {
             let total = bytes.len() as u64;
             stream.ready = Some((total, hex::encode(Sha256::digest(&bytes))));
-            stream.buf = bytes;
+            stream.buf = Arc::new(bytes);
             stream.assembled = true;
         }
     }
@@ -223,7 +226,7 @@ impl IncomingTransfers {
 impl TransferBuffer {
     fn new() -> Self {
         Self {
-            buf: Vec::new(),
+            buf: Arc::new(Vec::new()),
             ready: None,
             assembled: false,
         }
@@ -346,7 +349,11 @@ mod tests {
                 digest: hex::encode(Sha256::digest(&data)),
             })
             .expect("ready");
-        assert_eq!(incoming.take("t1").unwrap(), data);
+        assert_eq!(incoming.take("t1").unwrap().as_slice(), data.as_slice());
+        // 重复读共享同一份字节（Arc），不再整段克隆。
+        let first = incoming.take("t1").unwrap();
+        let second = incoming.take("t1").unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]

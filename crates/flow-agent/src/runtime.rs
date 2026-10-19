@@ -21,7 +21,7 @@ use flow_engine::execution_protocol::contract::{
 };
 use flow_engine::execution_protocol::message::Message;
 use flow_engine::execution_protocol::remote::{
-    ResumeAction, ResumeItem, ResumeState, RESUME_PAGE_MAX,
+    Capacity, ResumeAction, ResumeItem, ResumeState, RESUME_PAGE_MAX,
 };
 use flow_engine::execution_protocol::transport::FrameTransport;
 
@@ -35,6 +35,9 @@ pub struct AgentConfig {
     pub ca_cert: PathBuf,
     pub cert: PathBuf,
     pub key: PathBuf,
+    /// mTLS 服务端证书校验名/SNI；None 时用 `flow-server`（与服务端证书
+    /// SAN 的缺省对应）。
+    pub sni: Option<String>,
     /// 执行器召唤方式：合并二进制自召唤（缺省）或显式独立二进制。
     pub executor: ExecutorInvocation,
     pub slots: u32,
@@ -148,10 +151,10 @@ async fn connect(
     let tcp = tokio::net::TcpStream::connect(&config.control_addr)
         .await
         .map_err(|e| format!("connect: {e}"))?;
+    let sni = config.sni.clone().unwrap_or_else(|| "flow-server".to_string());
     let stream = connector
         .connect(
-            rustls::pki_types::ServerName::try_from("flow-server".to_string())
-                .map_err(|e| format!("sni: {e}"))?,
+            rustls::pki_types::ServerName::try_from(sni).map_err(|e| format!("sni: {e}"))?,
             tcp,
         )
         .await
@@ -446,7 +449,7 @@ pub async fn serve(
     relay: Arc<parking_lot::Mutex<Relay>>,
     handles: Arc<tokio::sync::Mutex<BTreeMap<String, ExecutorHandle>>>,
     uplink_rx: &mut mpsc::Receiver<(Message, tokio::sync::OwnedSemaphorePermit)>,
-    _budget: std::sync::Arc<crate::relay::UplinkBudget>,
+    budget: std::sync::Arc<crate::relay::UplinkBudget>,
     shutdown: CancellationToken,
 ) -> String {
     let mut draining = None;
@@ -554,6 +557,27 @@ pub async fn serve(
                         Message::Heartbeat {
                             dispatch_id: None,
                             phase: "agent-alive".into(),
+                        },
+                    );
+                    // 容量周期上报（三期 §1.6）：与心跳同拍，首次 tick 即
+                    // 注册后立报。master 据 slots 更新准入（used < slots_total），
+                    // 其余字段是遥测。报告可丢——下一拍补，不为它保留队列。
+                    let in_flight = handles.lock().await.len() as u32;
+                    let _ = queue_uplink(
+                        &transport,
+                        &mut send_backlog,
+                        Message::CapacityReport {
+                            capacity: Capacity {
+                                slots: config.slots,
+                                in_flight,
+                                pending_bytes: budget.pending_bytes(),
+                                // 可用内存未采集（无跨平台来源）；0 表示未知。
+                                memory_mib: 0,
+                                capabilities: crate::AGENT_CAPABILITIES
+                                    .iter()
+                                    .map(|cap| (*cap).to_string())
+                                    .collect(),
+                            },
                         },
                     );
                 }

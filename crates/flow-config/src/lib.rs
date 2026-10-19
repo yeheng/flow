@@ -223,6 +223,10 @@ pub struct AgentConfig {
     pub ca_cert: Option<PathBuf>,
     pub cert: Option<PathBuf>,
     pub key: Option<PathBuf>,
+    /// mTLS 服务端证书校验名/SNI（缺省 `flow-server`，与服务端证书 SAN
+    /// 对应；使用自有 PKI 且 SAN 不同时在此指定）。
+    #[serde(default)]
+    pub sni: Option<String>,
     pub executor_bin: Option<String>,
     pub slots: u32,
     /// WSS 上联地址（T13，代理终止 TLS 场景）；设置后优先于 mTLS 直连。
@@ -241,6 +245,7 @@ impl Default for AgentConfig {
             ca_cert: None,
             cert: None,
             key: None,
+            sni: None,
             executor_bin: None,
             slots: 4,
             wss_url: None,
@@ -409,6 +414,20 @@ impl Config {
         dirs::config_dir()
             .map(|dir| dir.join("flow").join(CONFIG_FILE_NAME))
             .filter(|p| p.exists())
+    }
+
+    /// config.update 在启动时无配置文件情况下的落点：运维声明的
+    /// `FLOW_CONFIG`（即使启动时文件尚不存在）→ 平台配置目录
+    /// （与 [`Config::find_default_file`] 检索序末位一致，写下去下次启动
+    /// 一定找得到）。绝不落到进程 CWD——换目录启动会丢配置。
+    /// 返回 `None` 只可能发生在无平台配置目录的环境，调用方应拒绝写入。
+    pub fn default_write_path() -> Option<PathBuf> {
+        if let Ok(path) = std::env::var(CONFIG_FILE_ENV) {
+            if !path.is_empty() {
+                return Some(PathBuf::from(path));
+            }
+        }
+        dirs::config_dir().map(|dir| dir.join("flow").join(CONFIG_FILE_NAME))
     }
 
     /// 写入口统一校验。所有监听地址必须可解析；枚举值在 deserialize 层已把关，
@@ -688,6 +707,10 @@ fn apply_env(config: &mut Config) -> Result<Vec<String>, String> {
         config.agent.slots =
             u32::try_from(v).map_err(|_| format!("FLOW_AGENT_SLOTS 超出 u32 范围：{v}"))?;
         applied.push("FLOW_AGENT_SLOTS".into());
+    }
+    if let Some(v) = env_str("FLOW_AGENT_SNI") {
+        config.agent.sni = Some(v);
+        applied.push("FLOW_AGENT_SNI".into());
     }
 
     // ---- [journal] ----

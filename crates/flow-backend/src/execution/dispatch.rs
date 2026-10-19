@@ -181,7 +181,8 @@ const OPERATION_TRANSFER_COUNT: usize = 16;
 
 struct OpTransfer {
     /// 连续接收前缀（T07）：单流按序到达，无需块树与排序装配。
-    buf: Vec<u8>,
+    /// 装配期独占可写；消费侧取共享句柄（跨 await 逃借不整段克隆）。
+    buf: Arc<Vec<u8>>,
     ready: Option<(u64, String)>,
 }
 
@@ -642,30 +643,29 @@ impl DispatchRunner {
                     return Err(invalid("transfer chunk for foreign dispatch"));
                 }
                 // T12：bytes 已是内存中的原始字节。
-                let raw = bytes.clone();
-                let expected = hex_sha(&raw);
+                let expected = hex_sha(&bytes);
                 if expected != digest {
                     return Err(invalid("transfer chunk digest mismatch"));
                 }
                 let received: u64 = self.op_transfers.values().map(|e| e.buf.len() as u64).sum();
                 if offset
-                    .checked_add(raw.len() as u64)
+                    .checked_add(bytes.len() as u64)
                     .is_none_or(|end| end > OPERATION_TRANSFER_LIMIT)
-                    || received.saturating_add(raw.len() as u64) > OPERATION_TRANSFER_LIMIT
+                    || received.saturating_add(bytes.len() as u64) > OPERATION_TRANSFER_LIMIT
                     || (!self.op_transfers.contains_key(&transfer_id)
                         && self.op_transfers.len() >= OPERATION_TRANSFER_COUNT)
                 {
                     return Err(invalid("operation transfer exceeds input budget"));
                 }
                 let entry = self.op_transfers.entry(transfer_id).or_insert(OpTransfer {
-                    buf: Vec::new(),
+                    buf: Arc::new(Vec::new()),
                     ready: None,
                 });
-                let end = offset + raw.len() as u64;
+                let end = offset + bytes.len() as u64;
                 let received = entry.buf.len() as u64;
                 if end <= received {
                     // 幂等重复：完全落在已接收前缀且字节相同（重连后全量重发，T07）。
-                    if entry.buf[offset as usize..end as usize] == raw[..] {
+                    if entry.buf[offset as usize..end as usize] == bytes[..] {
                         return Ok(None);
                     }
                     return Err(invalid("duplicate transfer chunk"));
@@ -679,7 +679,7 @@ impl DispatchRunner {
                         return Err(invalid("operation transfer exceeds input budget"));
                     }
                 }
-                entry.buf.extend_from_slice(&raw);
+                Arc::make_mut(&mut entry.buf).extend_from_slice(&bytes);
                 Ok(None)
             }
             Message::InputReady {
@@ -696,7 +696,7 @@ impl DispatchRunner {
                     return Err(invalid("invalid operation transfer identity or size"));
                 }
                 let entry = self.op_transfers.entry(transfer_id).or_insert(OpTransfer {
-                    buf: Vec::new(),
+                    buf: Arc::new(Vec::new()),
                     ready: None,
                 });
                 entry.ready = Some((total_bytes, digest));
@@ -772,7 +772,8 @@ impl DispatchRunner {
         let Some((total, digest)) = &entry.ready else {
             return false;
         };
-        entry.buf.len() as u64 == *total && hex::encode(sha2::Sha256::digest(&entry.buf)) == *digest
+        entry.buf.len() as u64 == *total
+            && hex::encode(sha2::Sha256::digest(entry.buf.as_slice())) == *digest
     }
 
     /// 审计批次：连续性 + 同序号同内容幂等 + 单事务持久化 + AuditAck。
@@ -1165,7 +1166,7 @@ impl DispatchRunner {
         if transfer_id != TransferKey::OperationRequest(operation_id.clone()).to_wire() {
             return Err(invalid("operation transfer id does not match operation"));
         }
-        let request_bytes: Vec<u8> = {
+        let request_bytes: Arc<Vec<u8>> = {
             let entry = self
                 .op_transfers
                 .get(&transfer_id)
@@ -1474,9 +1475,10 @@ fn event_kind(kind: &str) -> Option<EventKind> {
 /// 反查派发归属 `(run_id, node_id, attempt)`。
 ///
 /// 观测尾批晚于 Result 到达时（单流下帧序 = 提交序，但观测与结果分属不同队列），批里的 dispatch_id
-/// 是唯一可靠归属。当前派发命中的是节点的 `dispatch_id` 字段；更旧的
-/// （重试前的）只能命中 attempts 账本，历史尝试号无处可查，用节点当前
-/// 值——归属正确，号偏保守。
+/// 是唯一可靠归属。dispatch 索引按 DispatchStarted 事件投影，每个 dispatch
+/// 携带自己的尝试号（含重试前的历史派发——见 backend-e2e
+/// `retry_attempts_are_offloaded_and_old_dispatch_audit_is_isolated` 回归）；
+/// 查无索引行的批直接丢弃，不回落节点当前值——错归属比丢弃更糟。
 async fn resolve_dispatch(
     backend: &JournalBackend,
     dispatch_id: &str,

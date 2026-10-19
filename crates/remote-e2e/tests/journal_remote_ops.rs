@@ -47,6 +47,7 @@ fn agent_config(agent_id: &str, slots: u32) -> AgentConfig {
         ca_cert: "unused".into(),
         cert: "unused".into(),
         key: "unused".into(),
+        sni: None,
         executor: executor(),
         slots,
         wss_url: None,

@@ -131,6 +131,7 @@ async fn spawn_agent(
         ca_cert: Default::default(),
         cert: Default::default(),
         key: Default::default(),
+        sni: None,
         executor: ExecutorInvocation::explicit(flow_test_support::io::executor_bin()),
         slots,
         wss_url: None,

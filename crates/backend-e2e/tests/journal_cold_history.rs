@@ -182,6 +182,14 @@ async fn retry_attempts_are_offloaded_and_old_dispatch_audit_is_isolated() {
     assert_eq!(run.nodes["s"].attempt, 256);
     assert_eq!(run.nodes["s"].attempts.len(), 1);
     assert_eq!(run.nodes["s"].attempts["r-256"].audit_seq, 0);
+    // 派发归属索引保留每个 dispatch 自己的历史尝试号（观测归属反查用）：
+    // 重试前的 dispatch 不回落节点当前值。
+    let owner = b.store.dispatch_owner("r-1").await.unwrap().unwrap();
+    assert_eq!(owner["run_id"], "r");
+    assert_eq!(owner["node_id"], "s");
+    assert_eq!(owner["attempt"], "1");
+    let latest = b.store.dispatch_owner("r-256").await.unwrap().unwrap();
+    assert_eq!(latest["attempt"], "256");
     let full = b.full_state().await.unwrap();
     assert_eq!(full.runs["r"].nodes["s"].attempts.len(), 256);
     assert_eq!(full.runs["r"].nodes["s"].attempts["r-1"].audit_seq, 2);

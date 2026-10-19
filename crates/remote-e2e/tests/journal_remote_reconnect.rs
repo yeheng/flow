@@ -43,6 +43,7 @@ fn agent_config() -> AgentConfig {
         ca_cert: "unused".into(),
         cert: "unused".into(),
         key: "unused".into(),
+        sni: None,
         executor: executor(),
         slots: 4,
         wss_url: None,

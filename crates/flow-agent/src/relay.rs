@@ -233,6 +233,12 @@ impl UplinkBudget {
             .await
             .expect("uplink budget never closed")
     }
+
+    /// 未归还的出站字节许可（已入队、尚未交到上联的字节数）——
+    /// CapacityReport.pending_bytes 的来源。
+    pub fn pending_bytes(&self) -> u64 {
+        (self.cap as u64).saturating_sub(self.semaphore.available_permits() as u64)
+    }
 }
 
 #[cfg(test)]
@@ -254,6 +260,16 @@ mod tests {
             drop(tx.send((Message::Ready, permit)).await.unwrap_err());
         }
         assert_eq!(budget.semaphore.available_permits(), 8);
+    }
+
+    #[tokio::test]
+    async fn pending_bytes_tracks_outstanding_permits() {
+        let budget = UplinkBudget::new(1024);
+        assert_eq!(budget.pending_bytes(), 0);
+        let permit = budget.acquire(300).await;
+        assert_eq!(budget.pending_bytes(), 300);
+        drop(permit);
+        assert_eq!(budget.pending_bytes(), 0);
     }
 
     fn relay_with_binding() -> Relay {

@@ -48,8 +48,12 @@ pub struct AppState {
 /// 进程启动时装配的配置工作副本。
 pub struct ConfigState {
     pub config: std::sync::RwLock<flow_config::Config>,
-    /// 配置文件路径；None 时 update 会落到 `./flow.toml`。
-    pub path: Option<std::path::PathBuf>,
+    /// 启动时发现的配置文件路径（内层 None = 启动无配置文件）。config.update
+    /// 首次落盘后回填实际写入路径，config.get 的 config_path 立即可见。
+    pub path: std::sync::RwLock<Option<std::path::PathBuf>>,
+    /// 启动无配置文件时 config.update 的落点
+    /// （[`flow_config::Config::default_write_path`]）；None 时 update 拒绝写入。
+    pub default_path: Option<std::path::PathBuf>,
     /// 启动时生效的 env 覆盖名单（仅名称，值可能含凭据不回传）。
     pub env_overrides: Vec<String>,
 }
@@ -97,7 +101,7 @@ pub(crate) fn config_view(state: &AppState) -> Value {
     let (config, path, env_overrides) = match &state.config {
         Some(cs) => (
             Some(cs.config.read().unwrap().clone()),
-            cs.path.clone(),
+            cs.path.read().unwrap().clone(),
             cs.env_overrides.clone(),
         ),
         None => (None, None, Vec::new()),
@@ -175,7 +179,8 @@ pub async fn serve_journal_product(
     };
     let config_state = ConfigState {
         config: std::sync::RwLock::new(file_config),
-        path: config_path.clone(),
+        path: std::sync::RwLock::new(config_path.clone()),
+        default_path: flow_config::Config::default_write_path(),
         env_overrides: flow_config::Config::load(config_path.as_deref())?.env_overrides,
     };
     let backend = JournalBackend::open(&root, Default::default()).await?;
