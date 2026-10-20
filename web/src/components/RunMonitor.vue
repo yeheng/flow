@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from "vue";
+import { computed, onUnmounted, reactive, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import {
   adjudicate,
@@ -17,7 +17,7 @@ import { editor } from "../state/editor";
 import { devMode } from "../state/dev";
 import { nodeStateLabel, runBadgeClass, runStatusLabel } from "../state/labels";
 import { friendlyDuration } from "../state/time";
-import { confirmDialog } from "../state/modal";
+import { confirmDialog, formDialog } from "../state/modal";
 import { assembleInput, inputFieldText, parseInputFields } from "../state/run-input";
 import { toast } from "../state/toast";
 import { copyWithToast } from "../state/clipboard";
@@ -67,6 +67,51 @@ function deliverInputForm(nodeId: string): void {
   void deliverSignal(nodeId, JSON.stringify(assembled));
 }
 
+let inputDialogs: Promise<void> = Promise.resolve();
+const inputControllers = new Map<string, AbortController>();
+onUnmounted(() => {
+  for (const controller of inputControllers.values()) controller.abort();
+});
+function openInputDialog(node: TimelineNode): void {
+  const runId = monitor.runId;
+  const key = draftKey(node.id);
+  if (inputControllers.has(key)) return;
+  const controller = new AbortController();
+  inputControllers.set(key, controller);
+  inputDialogs = inputDialogs
+    .then(async () => {
+      if (
+        controller.signal.aborted ||
+        monitor.runId !== runId ||
+        !waitingInputNodes.value.some((n) => n.id === node.id)
+      )
+        return;
+      const fields = parseInputFields(node.input);
+      if (!fields.length) return;
+      const values = await formDialog(
+        `填写「${node.name || node.id}」`,
+        fields.map((f) => ({
+          key: f.key,
+          label: f.label ?? f.key,
+          required: true,
+          defaultValue: inputFieldText(f, props.runInput),
+        })),
+        { confirmText: "提交并继续", signal: controller.signal },
+      );
+      if (
+        !values ||
+        monitor.runId !== runId ||
+        !waitingInputNodes.value.some((n) => n.id === node.id)
+      )
+        return;
+      await deliverSignal(node.id, JSON.stringify(values));
+    })
+    .catch(() => {
+      toast.error("提交输入失败，请重试");
+    })
+    .finally(() => inputControllers.delete(key));
+}
+
 function fmtJson(v: unknown): string {
   if (v === undefined || v === null) return "";
   const s = JSON.stringify(v);
@@ -104,12 +149,16 @@ const adjudications = reactive<Record<string, AdjudicationDraft>>({});
 watch(
   [() => monitor.runId, waitingInputNodes, uncertainNodes],
   ([, nodes, uncertain]) => {
+    for (const [key, controller] of inputControllers) {
+      if (!nodes.some((n) => draftKey(n.id) === key)) controller.abort();
+    }
     for (const n of nodes) {
       const key = draftKey(n.id);
       if (inputFormTexts[key]) continue;
       const row: Record<string, string> = {};
       for (const f of parseInputFields(n.input)) row[f.key] = inputFieldText(f, props.runInput);
       inputFormTexts[key] = row;
+      openInputDialog(n);
     }
     for (const n of uncertain) {
       adjudications[draftKey(n.id)] ??= { decision: "accept_output", output: "", reason: "" };
@@ -239,6 +288,9 @@ function onOpenChildRun(childRunId: string): void {
             />
           </div>
           <div class="signal-row">
+            <AppButton :disabled="monitor.delivering" @click="openInputDialog(n)"
+              >填写表单</AppButton
+            >
             <AppButton
               :disabled="monitor.delivering || !inputFormReady(n.id)"
               @click="deliverInputForm(n.id)"
@@ -306,7 +358,11 @@ function onOpenChildRun(childRunId: string): void {
             />
           </div>
           <div class="signal-row">
-            <input v-model="adjudications[draftKey(n.id)].reason" type="text" placeholder="裁决理由（必填）" />
+            <input
+              v-model="adjudications[draftKey(n.id)].reason"
+              type="text"
+              placeholder="裁决理由（必填）"
+            />
             <AppButton
               :disabled="monitor.adjudicating || !adjudications[draftKey(n.id)].reason.trim()"
               @click="submitAdjudication(n)"

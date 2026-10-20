@@ -3,8 +3,12 @@ import { computed, nextTick, onMounted, onUnmounted, ref, useId, watch } from "v
 import { modalEntries, settleModal, type ModalEntry } from "../state/modal";
 import { trapTabIn } from "../state/modal-a11y";
 import AppButton from "./AppButton.vue";
+import ModalFields from "./ModalFields.vue";
+import { fieldText, parseFormFields } from "../state/form-fields";
 
 const text = ref("");
+const fields = ref<Record<string, string>>({});
+const error = ref("");
 const inputEl = ref<HTMLInputElement | null>(null);
 const okEl = ref<InstanceType<typeof AppButton> | null>(null);
 const dialogEl = ref<HTMLElement | null>(null);
@@ -19,12 +23,28 @@ watch(
   () => current.value?.id,
   async (id) => {
     if (id !== undefined) {
-      if (!prevFocus.value) prevFocus.value = (document.activeElement as HTMLElement | null) ?? null;
+      if (!prevFocus.value)
+        prevFocus.value = (document.activeElement as HTMLElement | null) ?? null;
       text.value = current.value?.payload.defaultValue ?? "";
+      error.value = "";
+      fields.value = Object.fromEntries(
+        (current.value?.payload.fields ?? []).map((field) => {
+          const initial = current.value?.payload.values ?? {};
+          const value = Object.prototype.hasOwnProperty.call(initial, field.key)
+            ? initial[field.key]
+            : field.defaultValue;
+          return [
+            field.key,
+            field.enum && value !== undefined ? JSON.stringify(value) : fieldText(value),
+          ];
+        }),
+      );
       await nextTick();
       if (current.value?.payload.kind === "prompt") {
         inputEl.value?.focus();
         inputEl.value?.select();
+      } else if (current.value?.payload.kind === "form") {
+        dialogEl.value?.querySelector<HTMLElement>("input, select, textarea")?.focus();
       } else {
         okEl.value?.focus();
       }
@@ -38,6 +58,16 @@ watch(
 
 function ok(): void {
   const entry = current.value;
+  if (entry?.payload.kind === "form") {
+    try {
+      const values = parseFormFields(entry.payload.fields ?? [], fields.value);
+      error.value = entry.payload.validate?.(values) ?? "";
+      if (!error.value) entry.close(values);
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : String(e);
+    }
+    return;
+  }
   if (entry) settleModal(entry, entry.payload.kind === "prompt" ? text.value : "");
 }
 
@@ -64,7 +94,6 @@ function isButton(t: EventTarget | null): boolean {
   return t instanceof HTMLElement && t.closest("button") !== null;
 }
 
-
 onMounted(() => window.addEventListener("keydown", onWindowKeydown));
 onUnmounted(() => window.removeEventListener("keydown", onWindowKeydown));
 </script>
@@ -80,6 +109,18 @@ onUnmounted(() => window.removeEventListener("keydown", onWindowKeydown));
         type="text"
         @keyup.enter="ok"
       />
+      <ModalFields
+        v-if="current.payload.kind === 'form'"
+        :fields="current.payload.fields ?? []"
+        :values="fields"
+        @change="
+          (key, value) => {
+            fields[key] = value;
+            error = '';
+          }
+        "
+      />
+      <p v-if="error" role="alert" class="form-error">{{ error }}</p>
       <div class="modal-actions">
         <AppButton @click="cancel">取消</AppButton>
         <AppButton ref="okEl" :variant="current.payload.danger ? 'danger' : 'primary'" @click="ok">
@@ -103,12 +144,18 @@ onUnmounted(() => window.removeEventListener("keydown", onWindowKeydown));
 }
 
 .modal {
-  width: 360px;
+  width: min(480px, calc(100vw - 40px));
+  max-height: 72vh;
+  overflow-y: auto;
   background: var(--surface);
   border: 1px solid var(--border2);
   border-radius: var(--radius);
   box-shadow: 0 8px 32px var(--shadow-hover);
   padding: 16px;
+}
+
+.form-error {
+  color: var(--danger);
 }
 
 .modal-message {

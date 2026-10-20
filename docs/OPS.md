@@ -509,13 +509,10 @@ flow-journal-bench
 
 ### 分发
 
-`flow-harness-agent` 与 `flow-executor` **同目录分发、同批发布**：runner 不带
-`RUNTIME_ID`，协议面（`CONGA_*` 非敏感环境变量名、stdin 单行 JSON、stdout
-单行 JSON 与退出码 0/1/130/2）由同一 workspace/Cargo.lock 与 conga 固定 rev
-锁步挡住漂移。executor 按以下顺序定位 runner：`FLOW_HARNESS_AGENT_BIN`（绝对
-路径；本地 master 与远端 flow-agent 各自透传自己机器上的路径）→ executor
-自身同目录的兄弟。桌面打包在 `tauri.conf.json` 的 `externalBin`；服务端
-`scripts/build-journal.sh` 的 BINS 已包含。
+harness agent 模式**内联在 flow-executor 内执行**（conga-host 无头装配，
+无独立 runner 二进制）：分发面与 command 模式完全一致，无需额外二进制。
+executor 依赖 conga 固定 rev（见 `crates/flow-executor/Cargo.toml`），rev
+变更需全量回归 agent e2e；master/executor 仍按 `RUNTIME_ID` 锁步升级。
 
 ### 配置与密钥
 
@@ -523,13 +520,13 @@ flow-journal-bench
   **run 启动时冻结进执行快照**：重启后改配置只影响新 run；回归候选继承
   baseline 的冻结配置。Settings 页保存后需重启生效。
 - API key 只以密钥名出现在节点参数（`api_key`，`x-secret`）；真值来自密钥
-  管理体系（stored 优先、`FLOW_SECRET_*` 兜底），经授权许可（内存）→ runner
-  stdin → conga-host 结构体。**任何环境变量都不携带 key**：runner 的
-  `/proc/<pid>/environ`、workdir 的 `.conga/hooks.json` 钩子、bash 工具的
-  子进程都读不到。
-- `CONGA_CONFIG_DIR` 由 conga-host 在 runner 进程内钉进本次 run 的临时根并
-  自检：settings.json 在 flow 路径上**永不被读**（stream_fn 注入使加载分支
-  不可达），workdir 的 `.env`/`.conga/config.toml` 不被自动装配。
+  管理体系（stored 优先、`FLOW_SECRET_*` 兜底），经授权许可（内存）以**参数**
+  传入 conga-host 无头装配。**任何环境变量都不携带 key**：workdir 的
+  `.conga/hooks.json` 钩子、bash 工具的子进程都读不到。
+- `CONGA_CONFIG_DIR`/`CONGA_PROJECT_DIR` 由无头装配的 RAII 钉根守卫钉进
+  本次 run 的临时根（任务结束恢复）：settings.json 在 flow 路径上**永不被读**
+  （stream_fn 注入使加载分支不可达），workdir 的 `.env`/`.conga/config.toml`
+  不被自动装配。执行器串行处理任务，钉根期间无并发读者。
 
 ### 已知取舍
 

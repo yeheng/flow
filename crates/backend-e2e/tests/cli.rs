@@ -430,9 +430,14 @@ async fn delete_requires_yes_outside_interactive_use() {
     );
 
     let (code, _, stderr) = cli(&server, &["workflow", "delete", "cli-demo", "-y"]).await;
-    assert_eq!(code, 2, "{stderr}");
-    // 已有 run 记录时服务端拒删（事件日志不能变孤儿）
-    assert!(stderr.contains("code -32012"), "{stderr}");
+    assert_eq!(code, 0, "{stderr}");
+    // Logical deletion hides workflows with history from normal listing.
+    let (code, stdout, stderr) = cli(&server, &["workflow", "list", "--json"]).await;
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout_json(&stdout)["workflows"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]

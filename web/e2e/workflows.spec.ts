@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { uniq } from "./helpers";
+import { rpc, seedWorkflow, startRun, uniq, waitTerminal } from "./helpers";
 
 test("工作流列表：渲染、modal 新建、跳转编辑器、列表出现新行", async ({ page }) => {
   await page.goto("/workflows");
@@ -42,13 +42,19 @@ test("导入工作流 JSON：文件选择 → 名字弹窗 → 列表出现且�
   await page.locator(".page-header button", { hasText: "导入" }).click();
   await page
     .locator("input[type=file]")
-    .setInputFiles({ name: "import-case.json", mimeType: "application/json", buffer: Buffer.from(envelope) });
+    .setInputFiles({
+      name: "import-case.json",
+      mimeType: "application/json",
+      buffer: Buffer.from(envelope),
+    });
 
   // 名字弹窗预填信封 name，确定后导入并发布
   await expect(page.locator(".modal input")).toHaveValue(name);
   await page.locator(".modal").getByRole("button", { name: "确定" }).click();
   await expect(page.locator(".toast-success")).toContainText("已导入");
 
+  await expect(page).toHaveURL(/\/workflows\/[0-9a-f-]{36}/);
+  await page.goto("/workflows");
   // 列表出现新行且已有发布版本
   const row = page.locator(".data-table tr", { hasText: name });
   await expect(row).toBeVisible();
@@ -78,8 +84,187 @@ test("导入工作流 JSON：文件选择 → 名字弹窗 → 列表出现且�
   await page.locator(".page-header button", { hasText: "导入" }).click();
   await page
     .locator("input[type=file]")
-    .setInputFiles({ name: "import-case.json", mimeType: "application/json", buffer: Buffer.from(changed) });
+    .setInputFiles({
+      name: "import-case.json",
+      mimeType: "application/json",
+      buffer: Buffer.from(changed),
+    });
   await page.locator(".modal").getByRole("button", { name: "确定" }).click();
   await expect(page.locator(".toast-success")).toContainText("追加版本");
-  await expect(page.locator(".data-table tr", { hasText: name }).locator("td").nth(1)).toHaveText("v2");
+  await expect(page).toHaveURL(/\/workflows\/[0-9a-f-]{36}/);
+  await page.goto("/workflows");
+  await expect(page.locator(".data-table tr", { hasText: name }).locator("td").nth(1)).toHaveText(
+    "v2",
+  );
+});
+
+const simpleDefinition = {
+  nodes: [
+    { id: "s", type: "start" },
+    { id: "e", type: "end" },
+  ],
+  edges: [{ from: "s", to: "e" }],
+};
+
+test("无效导入和取消补填都不产生空记录", async ({ page }) => {
+  await page.goto("/workflows");
+  const name = uniq("e2e-非法导入");
+  await page
+    .locator("input[type=file]")
+    .setInputFiles({
+      name: "invalid.json",
+      mimeType: "application/json",
+      buffer: Buffer.from(JSON.stringify({ name, definition: { nodes: [], edges: [] } })),
+    });
+  await page.locator(".modal").getByRole("button", { name: "确定" }).click();
+  await expect(page.locator(".toast-error")).toBeVisible();
+  let listed = await rpc<{ workflows: { name: string }[] }>("workflow.list.view");
+  expect(listed.workflows.some((w) => w.name === name)).toBe(false);
+
+  await page.locator("input[type=file]").setInputFiles({
+    name: "missing.json",
+    mimeType: "application/json",
+    buffer: Buffer.from(
+      JSON.stringify({
+        name,
+        definition: {
+          nodes: [
+            { id: "s", type: "start" },
+            { id: "n", type: "script", params: {} },
+            { id: "e", type: "end" },
+          ],
+          edges: [
+            { from: "s", to: "n" },
+            { from: "n", to: "e" },
+          ],
+        },
+      }),
+    ),
+  });
+  await page.locator(".modal").getByRole("button", { name: "确定" }).click();
+  await expect(page.locator(".modal-message")).toHaveText("补全工作流配置");
+  await page.locator(".modal").getByRole("button", { name: "取消" }).click();
+  listed = await rpc("workflow.list.view");
+  expect(listed.workflows.some((w) => w.name === name)).toBe(false);
+});
+
+test("导入缺失密钥：密码表单补齐后再校验、发布", async ({ page }) => {
+  const name = uniq("e2e-密钥导入");
+  const secret = `IMPORT_${Date.now()}`;
+  await page.goto("/workflows");
+  await page.locator("input[type=file]").setInputFiles({
+    name: "secret.json",
+    mimeType: "application/json",
+    buffer: Buffer.from(
+      JSON.stringify({
+        name,
+        definition: {
+          nodes: [
+            { id: "s", type: "start" },
+            {
+              id: "n",
+              type: "harness",
+              params: { mode: "agent", prompt: "test", api_key: secret },
+            },
+            { id: "e", type: "end" },
+          ],
+          edges: [
+            { from: "s", to: "n" },
+            { from: "n", to: "e" },
+          ],
+        },
+      }),
+    ),
+  });
+  await page.locator(".modal").getByRole("button", { name: "确定" }).click();
+  await expect(page.locator(".modal-message")).toHaveText("配置工作流需要的密钥");
+  await page.locator(".modal input[type=password]").fill("test-import-secret-value");
+  await page.locator(".modal").getByRole("button", { name: "保存并校验" }).click();
+  await expect(page.locator(".toast-success")).toContainText("已导入");
+  await expect(page).toHaveURL(/\/workflows\/[0-9a-f-]{36}/);
+  const listed = await rpc<{ workflows: { name: string; published_version: number }[] }>(
+    "workflow.list.view",
+  );
+  expect(listed.workflows.find((w) => w.name === name)?.published_version).toBe(1);
+});
+
+test("运行按发布版本的必填合同弹表单，取消不创建 run", async ({ page }) => {
+  const name = uniq("e2e-必填输入");
+  const workflow = await rpc<{ workflow_id: string }>("workflow.import", {
+    name,
+    definition: {
+      ...simpleDefinition,
+      input_schema: {
+        type: "object",
+        required: ["project"],
+        properties: { project: { type: "string", title: "项目名称", minLength: 1 } },
+        additionalProperties: false,
+      },
+    },
+  });
+  await page.goto(`/workflows/${workflow.workflow_id}`);
+  await page.getByRole("button", { name: "运行", exact: true }).click();
+  await expect(page.locator(".modal-message")).toHaveText("填写工作流运行输入");
+  await page.locator(".modal").getByRole("button", { name: "运行", exact: true }).click();
+  await expect(page.locator(".modal [role=alert]")).toContainText("项目名称");
+  await page.locator(".modal").getByRole("button", { name: "取消" }).click();
+  const runs = await rpc<{ runs: unknown[] }>("run.list.view", {
+    workflow_id: workflow.workflow_id,
+  });
+  expect(runs.runs).toHaveLength(0);
+  await page.getByRole("button", { name: "运行", exact: true }).click();
+  await page.locator(".modal").getByLabel("项目名称").fill("00123");
+  await page.locator(".modal").getByRole("button", { name: "运行", exact: true }).click();
+  await expect(page.locator(".run-monitor .run-phase")).toHaveText("成功", { timeout: 15000 });
+  const records = await rpc<{ runs: { input: unknown }[] }>("run.list.view", {
+    workflow_id: workflow.workflow_id,
+  });
+  expect(records.runs[0].input).toEqual({ project: "00123" });
+});
+
+test("执行过的工作流可以删除：列表隐藏且运行历史可读", async ({ page }) => {
+  const name = uniq("e2e-逻辑删除");
+  const workflow = await seedWorkflow(name, "return 1;");
+  const runId = await startRun(workflow.id);
+  await waitTerminal(runId);
+  await page.goto("/workflows");
+  const row = page.locator("tbody tr", { hasText: name });
+  await row.getByRole("button", { name: "删除" }).click();
+  await expect(page.locator(".modal-message")).toContainText("已有运行记录会保留");
+  await page.locator(".modal").getByRole("button", { name: "确定" }).click();
+  await expect(row).toHaveCount(0);
+  const history = await rpc<{ run: { id: string } }>("run.get.view", { run_id: runId });
+  expect(history.run.id).toBe(runId);
+  await page.goto(`/runs/${runId}`);
+  await expect(page.locator(".run-header .badge").first()).toContainText("成功");
+});
+
+test("运行中等待 input 节点时自动弹表单，提交后继续执行", async ({ page }) => {
+  const workflow = await rpc<{ workflow_id: string }>("workflow.import", {
+    name: uniq("e2e-人工输入"),
+    definition: {
+      nodes: [
+        { id: "s", type: "start" },
+        {
+          id: "input",
+          type: "input",
+          name: "人工确认",
+          params: { fields: [{ key: "approval", label: "审批编号" }] },
+        },
+        { id: "e", type: "end" },
+      ],
+      edges: [
+        { from: "s", to: "input" },
+        { from: "input", to: "e" },
+      ],
+    },
+  });
+  const runId = await startRun(workflow.workflow_id);
+  await page.goto(`/runs/${runId}`);
+  await expect(page.locator(".modal-message")).toHaveText("填写「人工确认」");
+  await page.locator(".modal").getByRole("button", { name: "取消" }).click();
+  await page.getByRole("button", { name: "填写表单" }).click();
+  await page.locator(".modal").getByLabel("审批编号").fill("approved");
+  await page.locator(".modal").getByRole("button", { name: "提交并继续" }).click();
+  expect(await waitTerminal(runId)).toBe("succeeded");
 });

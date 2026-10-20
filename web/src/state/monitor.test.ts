@@ -8,6 +8,7 @@ vi.mock("../api/flow", () => ({
   runTimeline: vi.fn(),
   runObservations: vi.fn(),
   startRun: vi.fn(),
+  getWorkflow: vi.fn(),
   runCancel: vi.fn(),
   runSignal: vi.fn(),
 }));
@@ -16,6 +17,9 @@ import * as api from "../api/flow";
 import { editor } from "./editor";
 import { toast } from "./toast";
 import { attachRun, canCancelRun, detachRun, monitor, needReattach, startRun } from "./monitor";
+import { closeAllOverlays } from "./overlays";
+import { modalEntries } from "./modal";
+import { flushPromises } from "@vue/test-utils";
 
 function timeline(runId: string): Timeline {
   return {
@@ -152,6 +156,31 @@ describe("timeline 拉取失败的降级路径", () => {
 });
 
 describe("startRun 前置校验", () => {
+  it("读取固定发布版本的必填合同，取消表单不创建运行", async () => {
+    editor.workflowId = "wf-contract";
+    editor.publishedVersion = 2;
+    monitor.inputText = "";
+    vi.mocked(api.getWorkflow).mockResolvedValue({
+      workflow_id: "wf-contract",
+      version: 2,
+      status: "published",
+      published_version: 2,
+      definition: {
+        nodes: [],
+        edges: [],
+        input_schema: { type: "object", required: ["id"], properties: { id: { type: "string" } } },
+      },
+    });
+    const pending = startRun();
+    await flushPromises();
+    expect(api.getWorkflow).toHaveBeenCalledWith("wf-contract", 2);
+    expect(modalEntries()[0]?.payload.kind).toBe("form");
+    expect(api.startRun).not.toHaveBeenCalled();
+    closeAllOverlays();
+    await pending;
+    expect(api.startRun).not.toHaveBeenCalled();
+    expect(monitor.starting).toBe(false);
+  });
   it("未发布工作流点运行：不发 run.start（避免服务端英文 -32602）", async () => {
     editor.workflowId = "wf-unpublished";
     editor.publishedVersion = null;

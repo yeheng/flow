@@ -12,6 +12,7 @@ impl JournalBackend {
         let workflows = self.inspect(|s| s.workflows.clone()).await;
         let root = workflows
             .get(workflow)
+            .filter(|w| !w.deleted)
             .ok_or_else(|| Error::Invalid("workflow not found".into()))?;
         let selected = version
             .or_else(|| {
@@ -65,6 +66,7 @@ impl JournalBackend {
                     })?;
                 let workflow = workflows
                     .get(child)
+                    .filter(|w| !w.deleted)
                     .ok_or_else(|| Error::Invalid("child workflow not found".into()))?;
                 let version = match node.params.get("version") {
                     Some(v) => workflow.versions.get(&v.as_u64().ok_or_else(|| {

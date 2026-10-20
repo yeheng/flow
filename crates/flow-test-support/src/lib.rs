@@ -10,3 +10,5 @@
 //! （v1 Postgres 后端的 docker 测试库基建已随后端一并删除。）
 
 pub mod io;
+
+pub mod provider;

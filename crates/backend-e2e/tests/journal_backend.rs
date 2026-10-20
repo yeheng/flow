@@ -11,6 +11,7 @@ fn creation(id: &str) -> (Vec<Event>, Value) {
         name: "test".into(),
         created_at: "2026-09-30T00:00:00Z".into(),
         versions: BTreeMap::new(),
+        deleted: false,
     };
     (
         vec![Event::new(

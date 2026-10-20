@@ -1,17 +1,21 @@
 /**
- * confirm/prompt 两种系统弹窗：叠在全局弹层栈上（kind="modal"），
+ * confirm/prompt/form 系统弹窗：叠在全局弹层栈上（kind="modal"），
  * 对外仍是 Promise API。打开新弹窗时旧弹窗按取消收场，避免 Promise 悬挂
  * （原有语义）。类型安全：confirm 解析 boolean、prompt 解析 string|null，
  * 不再有跨类型强转。
  */
 import { openOverlay, overlaysOf, type OverlayEntry } from "./overlays";
+import type { FormField } from "./form-fields";
 
 export interface ModalPayload {
-  kind: "confirm" | "prompt";
+  kind: "confirm" | "prompt" | "form";
   message: string;
   defaultValue: string;
   danger?: boolean;
   confirmText?: string;
+  fields?: FormField[];
+  values?: Record<string, unknown>;
+  validate?: (values: Record<string, unknown>) => string | undefined;
 }
 
 export type ModalEntry = OverlayEntry<ModalPayload>;
@@ -52,6 +56,40 @@ export function promptDialog(message: string, defaultValue = ""): Promise<string
     openOverlay<ModalPayload>("modal", { kind: "prompt", message, defaultValue }, (result) =>
       resolve(typeof result === "string" ? result : null),
     );
+  });
+}
+
+export function formDialog(
+  message: string,
+  fields: FormField[],
+  opts: {
+    values?: Record<string, unknown>;
+    validate?: ModalPayload["validate"];
+    confirmText?: string;
+    signal?: AbortSignal;
+  } = {},
+): Promise<Record<string, unknown> | null> {
+  return new Promise((resolve) => {
+    const { signal, ...payload } = opts;
+    if (signal?.aborted) {
+      resolve(null);
+      return;
+    }
+    cancelExisting();
+    const abort = () => entry.close(null);
+    const entry = openOverlay<ModalPayload>(
+      "modal",
+      { kind: "form", message, defaultValue: "", fields, ...payload },
+      (result) => {
+        signal?.removeEventListener("abort", abort);
+        resolve(
+          result !== null && typeof result === "object" && !Array.isArray(result)
+            ? (result as Record<string, unknown>)
+            : null,
+        );
+      },
+    );
+    signal?.addEventListener("abort", abort, { once: true });
   });
 }
 

@@ -7,13 +7,21 @@ import { WRITE_METHODS } from "./methods";
 export { RpcError, errText } from "./errors";
 export type Service = "flow" | "journal";
 
-/** 服务端对写命令的准入错误：缺 request_id（命令尚未被接受，补键重试安全） */
+/** missing request_id（命令尚未被接受，补键重试安全） */
 function missingRequestId(error: unknown): boolean {
   return (
     error instanceof RpcError &&
     error.code === -32602 &&
     error.message.includes("request_id required for write commands")
   );
+}
+
+/** 参数过线规范化：RPC 载荷必须是纯 JSON。JSON 往返剥掉 Vue 的
+ * reactive Proxy / 误入的 ref（desktop 走 Tauri invoke，隔离层
+ * postMessage 的结构化克隆会对它们抛 DataCloneError）；undefined 成员
+ * 顺带按 JSON 语义丢弃。*/
+function toWire<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
 }
 
 /**
@@ -66,16 +74,17 @@ export class RpcClient {
       request_id?: string;
       visible?: boolean;
     };
+    const wire = toWire(enriched);
     try {
-      reply = await this.transport.call(method, enriched);
+      reply = await this.transport.call(method, wire);
     } catch (error) {
       // 浏览器端的写方法清单是手抄的（桌面端由 Tauri 按后端清单兜底注入）：
       // 漏项时服务端在准入阶段就拒绝，命令未被接受，补 request_id 重试一次安全。
       // 已有幂等键仍报缺键说明不是清单问题，直接上抛。
       if (requestId !== undefined || !missingRequestId(error)) throw error;
       requestId = crypto.randomUUID();
-      enriched["request_id"] = requestId;
-      reply = await this.transport.call(method, enriched);
+      wire["request_id"] = requestId;
+      reply = await this.transport.call(method, wire);
     }
     // SQLite 单事务提交事实 + 当前状态，写回执的 visible 恒为 true（-32020
     // COMMITTED_NOT_VISIBLE 已无生产者）。主工作台解包回执取物化结果；
@@ -104,7 +113,7 @@ export class RpcClient {
       // 主工作台订阅：journal v2 事件原形（服务端唯一支持格式）
       enriched["event_format"] = "v2";
     }
-    return this.transport.subscribe(method, enriched, onEvent);
+    return this.transport.subscribe(method, toWire(enriched), onEvent);
   }
 }
 export const client = new RpcClient();

@@ -310,68 +310,20 @@ async fn import(
     let document = parse_json(&text, &format!("定义文件 {file}"))?;
     let (name, definition) = split_document(&document, file, name_override)?;
 
-    // 反查同名工作流：存在则追加版本（run 钉死旧版本，不受影响），否则新建
-    let listed = call(client, "workflow.list.view", object(vec![])).await?;
-    let existing = listed["workflows"]
-        .as_array()
-        .map(Vec::as_slice)
-        .unwrap_or_default()
-        .iter()
-        .find(|workflow| workflow["name"].as_str() == Some(name.as_str()))
-        .and_then(|workflow| workflow["workflow_id"].as_str())
-        .map(str::to_string);
-    let (workflow_id, created) = match existing {
-        Some(workflow_id) => (workflow_id, false),
-        None => {
-            let result = call(
-                client,
-                "workflow.create",
-                object(vec![("name", json!(name))]),
-            )
-            .await?;
-            (
-                result["workflow_id"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string(),
-                true,
-            )
-        }
-    };
-
-    let saved = call(
+    // Validation, name upsert and publication share one server transaction.
+    let result = call(
         client,
-        "workflow.update",
+        "workflow.import",
         object(vec![
-            ("workflow_id", json!(workflow_id)),
+            ("name", json!(name)),
             ("definition", definition),
+            ("publish", json!(!no_publish)),
         ]),
     )
     .await?;
-    let version = saved["version"].as_i64().unwrap_or_default();
-
-    let status = if no_publish {
-        "draft".to_string()
-    } else {
-        call(
-            client,
-            "workflow.publish",
-            object(vec![
-                ("workflow_id", json!(workflow_id)),
-                ("version", json!(version)),
-            ]),
-        )
-        .await?;
-        "published".to_string()
-    };
-
-    let result = json!({
-        "workflow_id": workflow_id,
-        "name": name,
-        "version": version,
-        "status": status,
-        "created": created,
-    });
+    let workflow_id = result["workflow_id"].as_str().unwrap_or_default();
+    let version = result["version"].as_i64().unwrap_or_default();
+    let created = result["created"].as_bool().unwrap_or_default();
     if json {
         print_json(&result);
         return Ok(());

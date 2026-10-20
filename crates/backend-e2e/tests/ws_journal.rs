@@ -261,14 +261,20 @@ async fn journal_backend_serves_full_rpc_surface() {
         config["env_overrides"]
     );
 
-    // ---- 已有 run 的工作流删除被拒（v1 Conflict）----
-    let err = common::call_err(
+    // Workflows with execution history are hidden, while runs remain readable.
+    let deleted: Value = call(
         client,
         "workflow.delete",
-        json!({"workflow_id": workflow_id, "yes": true}),
+        json!({"workflow_id": workflow_id}),
     )
     .await;
-    assert!(err.contains("-32012"), "{err}");
+    assert_eq!(deleted["ok"], true);
+    let listed: Value = call(client, "workflow.list.view", json!({})).await;
+    assert!(listed["workflows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|w| w["workflow_id"] != workflow_id));
 }
 
 #[tokio::test]

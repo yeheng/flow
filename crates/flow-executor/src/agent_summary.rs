@@ -1,45 +1,28 @@
-//! flow-harness-agent：harness 节点 agent 模式的 runner。
-//!
-//! 对 conga-host headless 装配入口（`conga_host::headless`）的直接调用：
-//! settings.json 永不读、API key 只经 stdin 进结构体（任何环境变量都不
-//! 携带）、workdir 的 `.env`/`.conga/config.toml` 不被装配（headless 不调
-//! dotenvy/config 发现）。本 crate 不依赖任何 flow crate——与 executor 的
-//! 契约只有三样：`CONGA_*` 非敏感 env、stdin 的单行 JSON、stdout 的单行
-//! JSON + 退出码（0 完成 / 1 回合失败 / 130 中止 / 2 装配或输入错误）。
+//! harness agent 模式（mode=agent）的结果投影：把 conga `run_turn` 的
+//! `TurnSummary` 投影成 outcome 字段（exit_code/text/stderr 元数据语义与
+//! 原 runner 二进制的退出码契约一致：0 完成 / 1 回合失败或 max_turns
+//! 耗尽 / 130 中止）。
 
 use conga::{AgentMessage, ContentBlock, StopReason, TurnEndReason};
 use conga_host::TurnSummary;
 
-/// stdin 载荷：密钥真值、任务文本与 agent 工作根（canonical 后的绝对路径）。
-/// 不落盘、不进 journal；`workdir` 经 `headless_prepare` 成为 `CONGA_PROJECT_DIR`。
-#[derive(Debug, serde::Deserialize)]
-pub struct RunnerInput {
-    pub api_key: String,
-    pub prompt: String,
-    pub workdir: std::path::PathBuf,
-}
-
-/// stdout 单行结果。成功/失败都尽力输出，executor 按行解析。
-#[derive(Debug, serde::Serialize)]
-pub struct RunnerOutcome {
-    pub text: String,
-    pub stop_reason: String,
-    pub error: Option<String>,
-    #[serde(skip)]
-    pub exit_code: i32,
-}
-
-/// 最终文本上限。flow 派生期按 `body_raw > 8 MiB` 拒绝（flow-executor
-/// task.rs），8 MiB 文本 + 截断标记会恰好越过那条线；留出标记与余量。
+/// stdout/body_raw 的最终文本上限。journal 派生按 `body_raw > 8 MiB` 拒绝，
+/// 8 MiB 文本 + 截断标记会恰好越过那条线；留出标记与余量。
 pub const TEXT_LIMIT_BYTES: usize = 7 * 1024 * 1024 + 512 * 1024;
 const TRUNCATED_MARKER: &str = "\n[truncated]";
 
-/// 把一次 `run_turn` 的结果投影成单行输出与退出码。
-///
-/// 成功判定（R5）：`Completed` 且末条 assistant 的 stop_reason 为
-/// `EndTurn`；末条 `ToolUse` = max_turns 耗尽（失败，末轮工具副作用已
-/// 发生）；中间 `MaxTokens` 不单独判死——只看**末条** assistant。
-pub fn summarize(summary: &TurnSummary) -> RunnerOutcome {
+/// 一次 `run_turn` 的投影结果（outcome 组装用）。
+pub struct AgentTurnResult {
+    pub text: String,
+    pub stop_reason: String,
+    pub error: Option<String>,
+    pub exit_code: i32,
+}
+
+/// 成功判定（与 conga 语义对齐）：`Completed` 且末条 assistant 的
+/// stop_reason 为 `EndTurn`；末条 `ToolUse` = max_turns 耗尽（失败，末轮
+/// 工具副作用已发生）；中间 `MaxTokens` 不单独判死——只看**末条**。
+pub fn summarize(summary: &TurnSummary) -> AgentTurnResult {
     let last_assistant = summary.new_messages.iter().rev().find_map(|m| match m {
         AgentMessage::Assistant(a) => Some(a),
         _ => None,
@@ -73,19 +56,19 @@ pub fn summarize(summary: &TurnSummary) -> RunnerOutcome {
                 Some(StopReason::EndTurn)
             );
             if ok {
-                RunnerOutcome {
+                AgentTurnResult {
                     text,
-                    stop_reason: stop_reason.clone(),
+                    stop_reason,
                     error: None,
                     exit_code: 0,
                 }
             } else if stop_reason == "tool_use" {
-                RunnerOutcome {
+                AgentTurnResult {
                     text,
-                    stop_reason: stop_reason.clone(),
+                    stop_reason,
                     error: Some(
                         "max turns exceeded (last assistant stopped on tool_use); \
-                                side effects of the final turn's tools have already happened"
+                         side effects of the final turn's tools have already happened"
                             .into(),
                     ),
                     exit_code: 1,
@@ -93,7 +76,7 @@ pub fn summarize(summary: &TurnSummary) -> RunnerOutcome {
             } else {
                 let detail =
                     format!("turn completed without end_turn (last stop_reason: {stop_reason})");
-                RunnerOutcome {
+                AgentTurnResult {
                     text,
                     stop_reason,
                     error: Some(detail),
@@ -101,17 +84,17 @@ pub fn summarize(summary: &TurnSummary) -> RunnerOutcome {
                 }
             }
         }
-        TurnEndReason::Error { message } => RunnerOutcome {
+        TurnEndReason::Error { message } => AgentTurnResult {
             text,
-            stop_reason: stop_reason.clone(),
+            stop_reason,
             error: Some(message.clone()),
             exit_code: 1,
         },
-        // 防御性：flow 的取消/超时走进程组 SIGKILL（executor 侧 Uncertain），
-        // 不依赖这条路径。
-        TurnEndReason::Aborted { .. } => RunnerOutcome {
+        // 防御性：flow 的取消/超时在 agent_run 的 select 分支直接判
+        // Uncertain，不经过这里。
+        TurnEndReason::Aborted { .. } => AgentTurnResult {
             text,
-            stop_reason: stop_reason.clone(),
+            stop_reason,
             error: Some("turn aborted".into()),
             exit_code: 130,
         },
@@ -138,7 +121,8 @@ fn cap_text(text: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use conga::types::message::{AssistantMessage, FunctionCall};
+    use conga::types::message::{AssistantMessage, FunctionCall, ToolCall};
+    use conga::{AgentMessage, ContentBlock, StopReason};
 
     fn assistant(stop: StopReason, text: &str) -> AgentMessage {
         AgentMessage::Assistant(AssistantMessage {
@@ -232,7 +216,7 @@ mod tests {
             content: vec![
                 ContentBlock::text("part one "),
                 ContentBlock::ToolCall {
-                    tool_call: conga::types::message::ToolCall {
+                    tool_call: ToolCall {
                         id: "t1".into(),
                         function: FunctionCall {
                             name: "bash".into(),
@@ -267,7 +251,6 @@ mod tests {
         let out = summarize(&s);
         assert!(out.text.ends_with(TRUNCATED_MARKER), "{}", out.text.len());
         assert!(out.text.len() <= TEXT_LIMIT_BYTES + TRUNCATED_MARKER.len());
-        // 截断只砍字节不换性质：仍是成功结果
         assert_eq!(out.exit_code, 0);
     }
 }

@@ -162,3 +162,10 @@ describe("inputFieldText", () => {
     expect(inputFieldText(field, ["not-object"])).toBe("dft");
   });
 });
+
+// Runtime prompts use the contract declared in the definition.
+describe("运行输入 schema", () => {
+  it("声明字段即使没有模板引用也被发现", () => {
+    expect(discoverInputKeys({nodes:[],edges:[],input_schema:{type:"object",required:["id"],properties:{count:{type:"integer"}}}}, [])).toEqual(["count","id"]);
+  });
+});

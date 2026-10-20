@@ -240,7 +240,7 @@ impl NodeType {
                         "args": {"type": "array", "items": {"type": "string"}, "x-widget": "json", "x-label": "额外参数",
                                  "x-help": "仅 mode=command 可用"},
                         "workdir": {"type": "string", "x-label": "工作目录",
-                                    "x-help": "mode=agent 时必填（绝对路径；agent 工具沙箱根）；command 模式可选"},
+                                    "x-help": "仅 mode=agent；可选。缺省 = 每次 run 的临时沙箱（结束后删除）；配置后为 agent 工作根（绝对路径且须存在，agent 可读写其中文件）"},
                         "timeout_ms": {"type": "number", "default": 300000, "x-label": "超时 (ms)"},
                         "api_key": {"type": "string", "x-secret": true, "x-label": "API 密钥名称",
                                     "x-help": "仅 mode=agent：只存密钥名称，真值来自密钥管理（secrets.list 提供候选）"}
@@ -966,28 +966,23 @@ pub fn validate_params(node: &Node, kind: NodeType) -> Result<(), String> {
             };
             let filled = |key: &str| node.param_str(key).is_some_and(|v| !v.trim().is_empty());
             if agent_mode {
-                // workdir 保存期只查字面量（非空/绝对/非模板）；存在性与
-                // canonicalize 在 executor 授权前——remote 模式下 master
-                // 看不到远端路径，保存期判存在会误拒合法定义。
-                let workdir = filled("workdir")
-                    .then(|| node.param_str("workdir").unwrap_or_default())
-                    .ok_or_else(|| {
-                        format!(
-                            "节点 {}（harness）缺少参数 workdir（mode=agent 必填）",
+                // workdir 可选：缺省 = executor 为本次 run 建随机临时沙箱
+                // （用完即删）。配置了才做字面量校验（非模板/绝对路径）；
+                // 存在性由 executor 授权前在本机验证——remote 模式下
+                // master 看不到远端路径，保存期判存在会误拒合法定义。
+                if let Some(workdir) = node.param_str("workdir").filter(|v| !v.trim().is_empty()) {
+                    if workdir.contains("${") {
+                        return Err(format!(
+                            "节点 {}（harness）mode=agent 的 workdir 不接受 ${{}} 模板（回归指纹需要确定路径）",
                             node.id
-                        )
-                    })?;
-                if workdir.contains("${") {
-                    return Err(format!(
-                        "节点 {}（harness）mode=agent 的 workdir 不接受 ${{}} 模板（回归指纹需要确定路径）",
-                        node.id
-                    ));
-                }
-                if !std::path::Path::new(workdir).is_absolute() {
-                    return Err(format!(
-                        "节点 {}（harness）mode=agent 的 workdir 必须是绝对路径：{workdir:?}",
-                        node.id
-                    ));
+                        ));
+                    }
+                    if !std::path::Path::new(workdir).is_absolute() {
+                        return Err(format!(
+                            "节点 {}（harness）mode=agent 的 workdir 必须是绝对路径：{workdir:?}",
+                            node.id
+                        ));
+                    }
                 }
                 if !filled("api_key") {
                     return Err(format!(
@@ -1783,11 +1778,14 @@ mod tests {
             .validate()
             .unwrap_err();
         assert!(err.contains("api_key"), "{err}");
-        // agent 模式：缺 workdir / 缺 api_key / 相对路径 / 模板 workdir / 带 command / 带非空 args
-        let err = harness_def(json!({"mode": "agent", "prompt": "p", "api_key": "K"}), 2)
-            .validate()
-            .unwrap_err();
-        assert!(err.contains("workdir"), "{err}");
+        // agent 模式：缺 api_key / 相对路径 / 模板 workdir / 带 command / 带非空 args
+        //（workdir 可选：缺省 = executor 的随机临时沙箱）
+        assert!(
+            harness_def(json!({"mode": "agent", "prompt": "p", "api_key": "K"}), 2)
+                .validate()
+                .is_ok(),
+            "缺省 workdir 应合法（临时沙箱）"
+        );
         let err = harness_def(
             json!({"mode": "agent", "prompt": "p", "workdir": "/tmp/w"}),
             2,

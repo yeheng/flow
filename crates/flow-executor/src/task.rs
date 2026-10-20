@@ -1418,28 +1418,56 @@ impl TaskRunner {
                 branch: None,
             });
         }
-        // workdir 运行期校验（授权前）：保存期只查了字面量；存在性与
-        // canonicalize 是本机事实，remote 模式下只有 executor 看得到。
-        let workdir = std::path::Path::new(&agent_params.workdir)
-            .canonicalize()
-            .map_err(|e| {
-                TaskError::Business(format!(
-                    "harness agent workdir 不可用（{}）：{e}",
-                    agent_params.workdir
-                ))
-            })?;
-        if !workdir.is_dir() {
-            return Err(TaskError::Business(format!(
-                "harness agent workdir 不是目录：{}",
-                workdir.display()
-            )));
-        }
+        // workdir 运行期校验（授权前，仅对显式配置的路径）：保存期只查了
+        // 字面量；存在性与 canonicalize 是本机事实，remote 模式下只有
+        // executor 看得到。缺省（未配置）走 roots 下的临时沙箱，授权后创建。
+        let configured_workdir = match &agent_params.workdir {
+            Some(configured) => {
+                let canonical = std::path::Path::new(configured)
+                    .canonicalize()
+                    .map_err(|e| {
+                        TaskError::Business(format!(
+                            "harness agent workdir 不可用（{configured}）：{e}"
+                        ))
+                    })?;
+                if !canonical.is_dir() {
+                    return Err(TaskError::Business(format!(
+                        "harness agent workdir 不是目录：{}",
+                        canonical.display()
+                    )));
+                }
+                Some(canonical)
+            }
+            None => None,
+        };
         let credential = self.authorize_operation(request).await?;
-        // prompt/密钥不进日志：只记模型、工作目录与超时。
+        let started = std::time::Instant::now();
+        let roots =
+            std::env::temp_dir().join(format!("flow-harness-{}", uuid::Uuid::now_v7().simple()));
+        // prompt/密钥不进日志：只记模型、工作目录与超时（缺省时目录是临时
+        // 沙箱，标注 default 以示来源）。
+        let default_workdir = configured_workdir.is_none();
+        let workdir = match configured_workdir {
+            Some(canonical) => canonical,
+            None => {
+                let scratch = roots.join("workdir");
+                std::fs::create_dir_all(&scratch).map_err(|e| {
+                    TaskError::Business(format!("harness agent 临时沙箱创建失败：{e}"))
+                })?;
+                scratch.canonicalize().map_err(|e| {
+                    TaskError::Business(format!("harness agent 临时沙箱不可用：{e}"))
+                })?
+            }
+        };
         logger.info(format!(
-            "→ harness agent（model {}，workdir {}，timeout {timeout_ms}ms）",
+            "→ harness agent（model {}，workdir {}{}，timeout {timeout_ms}ms）",
             config.model,
-            workdir.display()
+            workdir.display(),
+            if default_workdir {
+                "（默认临时沙箱）"
+            } else {
+                ""
+            }
         ));
         let Some(api_key) = credential.filter(|key| !key.trim().is_empty()) else {
             // 授权成功但凭据缺失：确定性失败，落 outcome B 让恢复派生稳定。
@@ -1457,9 +1485,6 @@ impl TaskRunner {
                 )
                 .await;
         };
-        let started = std::time::Instant::now();
-        let roots =
-            std::env::temp_dir().join(format!("flow-harness-{}", uuid::Uuid::now_v7().simple()));
         let result = self
             .agent_run(
                 &config,
@@ -1482,8 +1507,10 @@ impl TaskRunner {
         result
     }
 
-    /// 授权后的 runner 执行段。确定性失败（临时根不可建、runner 缺失、
-    /// 输出不可解析）落封闭 outcome；超时/取消/IO 失败原样传播 Uncertain。
+    /// 授权后的内联执行段：直接调用 conga-host 的 headless 装配（无
+    /// runner 子进程、无 stdin/stdout 协议）。确定性失败（临时根不可建、
+    /// 装配失败）落封闭 outcome；超时/取消传播 Uncertain（取消先给协作
+    /// 中止一个短窗，工具边界响应信号后收尾）。
     #[allow(clippy::too_many_arguments)]
     async fn agent_run(
         &mut self,
@@ -1498,70 +1525,94 @@ impl TaskRunner {
     ) -> Result<ResultOutcome, TaskError> {
         std::fs::create_dir_all(roots.join("tmp"))
             .map_err(|e| TaskError::Business(format!("harness agent 临时目录创建失败：{e}")))?;
-        let runner = match resolve_runner_bin() {
-            Ok(runner) => runner,
-            Err(error) => {
-                let outcome = StoredValue::inline(json!({ "agent_error": error.clone() }))?;
-                return self
-                    .commit_agent_failure(outcome, audit, format!("harness agent: {error}"))
-                    .await;
-            }
-        };
         let started = std::time::Instant::now();
-        let mut child = match flow_engine::process::ManagedChild::spawn_harness(
-            &mut flow_engine::exec::agent_command(&runner, roots, config),
-        ) {
-            Ok(child) => child,
-            Err(error) => {
-                logger.error(format!("harness agent 启动失败：{error}"));
-                let outcome = StoredValue::inline(json!({ "spawn_error": error.to_string() }))?;
-                return self
-                    .commit_agent_failure(
-                        outcome,
-                        audit,
-                        format!("harness agent spawn failed: {error}"),
-                    )
-                    .await;
-            }
+        // typed 配置直入（不经 CONGA_* env）；key 走参数。装配失败（代理
+        // 非法/规格空）是确定性失败 → outcome B。
+        let spec = conga_host::headless::HeadlessSpec {
+            base_url: config.base_url.clone(),
+            model: config.model.clone(),
+            api: config.api.clone(),
+            proxy: config.proxy.clone(),
+            max_turns: config.max_turns.map(|v| v as usize),
+            max_tool_calls_per_turn: config.max_tool_calls_per_turn.map(|v| v as usize),
+            max_tokens: config.max_tokens.map(|v| v as usize),
+            tool_timeout_secs: config.tool_timeout_secs,
         };
-        let stdin_payload =
-            flow_engine::exec::agent_stdin(prompt, api_key, &workdir.to_string_lossy());
-        let output = capture_harness(
-            &mut child,
-            &stdin_payload,
-            Duration::from_millis(timeout_ms),
-            &self.cancel,
+        let session = match conga_host::headless::build_headless_with(
+            api_key,
+            &spec,
+            roots,
+            workdir,
+            conga_host::permission::Mode::FullAuto,
         )
-        .await?;
-        let exit_code = output.status.code();
-        logger.info(format!(
-            "← exit {}（{}ms，stdout {}B）",
-            exit_code.map_or_else(|| "signal".into(), |code| code.to_string()),
-            started.elapsed().as_millis(),
-            output.stdout.len()
-        ));
-        let parsed = match flow_engine::exec::parse_agent_result(&output.stdout) {
-            Ok(parsed) => parsed,
+        .await
+        {
+            Ok(session) => session,
             Err(error) => {
-                let outcome = StoredValue::inline(json!({
-                    "agent_error": format!("runner output invalid: {error}"),
-                    "stderr": flow_engine::exec::stderr_tail(
-                        &String::from_utf8_lossy(&output.stderr)
-                    ),
-                }))?;
+                let outcome = StoredValue::inline(json!({ "agent_error": error.to_string() }))?;
                 return self
                     .commit_agent_failure(
                         outcome,
                         audit,
-                        format!("harness agent output invalid: {error}"),
+                        format!("harness agent assembly failed: {error}"),
                     )
                     .await;
             }
         };
-        // runner 的 error 行同时进 stderr（A6）：Business 文案不只剩退出码。
-        let mut stderr = flow_engine::exec::stderr_tail(&String::from_utf8_lossy(&output.stderr));
+        let session_id = session.host.session().current_id();
+        // 取消/超时语义：先走 conga 的协作中止（工具边界响应），给短窗
+        // 收尾；仍未完成 → Uncertain（无 outcome）。Host drop 时
+        // kill_on_drop 回收工具直接子进程；孙进程依赖执行器会话级回收
+        // （执行器退出时整会话收割，见 EXECUTION.md）。
+        let turn = {
+            let run = session.host.run_turn(prompt, |_| {});
+            tokio::pin!(run);
+            let outcome = tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => {
+                    session.host.signal().cancel();
+                    match tokio::time::timeout(Duration::from_secs(5), &mut run).await {
+                        Ok(Ok(summary)) => Ok(summary),
+                        _ => Err(TaskError::Uncertain(
+                            "harness agent cancelled; result incomplete".into(),
+                        )),
+                    }
+                }
+                result = tokio::time::timeout(
+                    Duration::from_millis(timeout_ms),
+                    &mut run,
+                ) => match result {
+                    Ok(inner) => Ok(inner.map_err(|error| TaskError::Uncertain(
+                        format!("harness agent turn failed: {error}"),
+                    ))?),
+                    Err(_) => {
+                        session.host.signal().cancel();
+                        let _ = tokio::time::timeout(Duration::from_secs(5), &mut run).await;
+                        Err(TaskError::Uncertain(
+                            "harness agent deadline exceeded; result incomplete".into(),
+                        ))
+                    }
+                },
+            };
+            outcome
+        };
+        conga_host::session_cleanup::cleanup_session_resources(&session_id).await;
+        let summary = turn?;
+        let parsed = crate::agent_summary::summarize(&summary);
+        logger.info(format!(
+            "← agent {}（{}ms，{} turns）",
+            if parsed.exit_code == 0 {
+                "完成"
+            } else {
+                "失败"
+            },
+            started.elapsed().as_millis(),
+            summary.new_messages.len()
+        ));
+        // error 行同时进 stderr（A6）：Business 文案不只剩退出码。
+        let mut stderr = String::new();
         if let Some(error) = &parsed.error {
-            stderr.push_str(&format!("\n[agent] {error}"));
+            stderr.push_str(&format!("[agent] {error}"));
         }
         let raw_stored = store_bytes(
             audit,
@@ -1588,7 +1639,7 @@ impl TaskRunner {
             "elapsed_ms": started.elapsed().as_millis() as u64,
         });
         let outcome = StoredValue::inline(json!({
-            "exit_code": exit_code,
+            "exit_code": parsed.exit_code,
             "body_raw": body_ref,
             "stderr": stderr,
             "agent": agent_meta,
@@ -1894,26 +1945,6 @@ fn elapsed_label(elapsed: Duration) -> String {
 
 #[allow(dead_code)]
 fn unused() {}
-
-/// runner 定位：`FLOW_HARNESS_AGENT_BIN`（部署事实，spawn 时由 master/agent
-/// 透传）优先；否则取 executor 自身可执行文件同目录的兄弟。找不到是部署
-/// 错误，文案直接指向两种修法。
-fn resolve_runner_bin() -> Result<std::path::PathBuf, String> {
-    if let Some(bin) = std::env::var_os("FLOW_HARNESS_AGENT_BIN") {
-        if !bin.is_empty() {
-            return Ok(std::path::PathBuf::from(bin));
-        }
-    }
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join("flow-harness-agent")))
-        .filter(|path| path.exists())
-        .ok_or_else(|| {
-            "flow-harness-agent 未找到：期望与 flow-executor 同目录分发，或设置 \
-             FLOW_HARNESS_AGENT_BIN 指向其绝对路径"
-                .to_string()
-        })
-}
 
 /// Capture all three pipes concurrently under one deadline. Partial output is never success.
 async fn capture_harness(

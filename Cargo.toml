@@ -11,7 +11,6 @@ members = [
     "crates/flow-config",
     "crates/flow-rpc",
     "crates/flow-cli",
-    "crates/flow-harness-agent",
     "crates/flow-test-support",
     "crates/backend-e2e",
     "crates/remote-e2e",

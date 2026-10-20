@@ -882,6 +882,7 @@ pub(crate) fn project_rows(
                 }
                 "workflow" => state.workflows.get(&key).map(|workflow| {
                     let mut summary=serde_json::json!({"workflow_id":workflow.workflow_id,"name":workflow.name,"created_at":workflow.created_at,"versions":{}});
+                    summary["deleted"]=serde_json::json!(workflow.deleted);
                     summary["latest_version"]=serde_json::json!(workflow.versions.last_key_value().map_or(0,|(v,_)|*v));
                     summary["published_version"]=serde_json::json!(workflow.versions.iter().rev().find(|(_,v)|v.published).map(|(v,_)|*v));
                     summary

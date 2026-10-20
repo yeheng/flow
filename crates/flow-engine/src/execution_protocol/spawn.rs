@@ -54,17 +54,12 @@ pub(crate) const EXECUTOR_ENV_WHITELIST: &[&str] = &[
     "LANG",
 ];
 
-/// 把白名单环境（加上部署变量 `FLOW_HARNESS_AGENT_BIN`）应用到执行器命令。
-/// `FLOW_HARNESS_AGENT_BIN` 是部署事实（executor 本地解析 runner 路径），
-/// 与 `RUST_LOG` 同类——显式透传，不进通用白名单（`FLOW_*` 默认全排除）。
+/// 把白名单环境应用到执行器命令。
 pub(crate) fn apply_executor_env_whitelist(command: &mut Command) {
     for name in EXECUTOR_ENV_WHITELIST {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
         }
-    }
-    if let Some(bin) = std::env::var_os("FLOW_HARNESS_AGENT_BIN") {
-        command.env("FLOW_HARNESS_AGENT_BIN", bin);
     }
 }
 
@@ -206,15 +201,18 @@ mod tests {
     // 真实 flow-executor 二进制跑完整派发。本单元测试二进制的参数由
     // libtest 解析，无法扮演执行器接收 --channel-fd。
 
+    /// 白名单测试做进程 env 手术；锁保留以防未来新增同类测试并行践踏。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[cfg(unix)]
     #[test]
     fn executor_env_whitelist_passes_toolchain_and_blocks_protocol_vars() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut command = Command::new("true");
         // 测试进程环境里必然存在的工具链变量应进入白名单集
         unsafe {
             std::env::set_var("CONGA_LLM_KEY", "sk-leak");
             std::env::set_var("FLOW_SECRET_X", "leak");
-            std::env::remove_var("FLOW_HARNESS_AGENT_BIN");
         }
         apply_executor_env_whitelist(&mut command);
         let envs = command
@@ -231,26 +229,6 @@ mod tests {
         unsafe {
             std::env::remove_var("CONGA_LLM_KEY");
             std::env::remove_var("FLOW_SECRET_X");
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn executor_env_whitelist_forwards_runner_bin_when_set() {
-        let mut command = Command::new("true");
-        unsafe {
-            std::env::set_var("FLOW_HARNESS_AGENT_BIN", "/opt/flow-harness-agent");
-        }
-        apply_executor_env_whitelist(&mut command);
-        let forwarded = command
-            .as_std()
-            .get_envs()
-            .find(|(k, _)| *k == "FLOW_HARNESS_AGENT_BIN")
-            .and_then(|(_, v)| v)
-            .map(|v| v.to_string_lossy().into_owned());
-        assert_eq!(forwarded.as_deref(), Some("/opt/flow-harness-agent"));
-        unsafe {
-            std::env::remove_var("FLOW_HARNESS_AGENT_BIN");
         }
     }
 }

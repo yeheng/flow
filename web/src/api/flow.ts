@@ -82,7 +82,7 @@ export async function createTemplate(
 ): Promise<NodeTemplate> {
   const params: Record<string, unknown> = { name, nodes, edges };
   if (category) params.category = category;
-  const created = await client.call<{id:string}>("template.create", params);
+  const created = await client.call<{ id: string }>("template.create", params);
   return getTemplate(created.id);
 }
 
@@ -109,6 +109,29 @@ export async function listWorkflows(): Promise<WorkflowSummary[]> {
 export async function createWorkflow(name: string): Promise<string> {
   const r = await client.call<{ workflow_id: string }>("workflow.create", { name });
   return r.workflow_id;
+}
+
+export interface WorkflowValidation {
+  valid: boolean;
+  missing_secrets: { node_id: string; name: string }[];
+}
+
+export async function validateWorkflow(definition: Definition): Promise<WorkflowValidation> {
+  return client.call("workflow.validate", { definition });
+}
+
+export async function importWorkflowDefinition(
+  name: string,
+  definition: Definition,
+  publish = true,
+): Promise<{
+  workflow_id: string;
+  name: string;
+  version: number;
+  created: boolean;
+  status: string;
+}> {
+  return client.call("workflow.import", { name, definition, publish });
 }
 
 export async function updateWorkflow(workflowId: string, definition: Definition): Promise<number> {
@@ -143,9 +166,11 @@ export async function deleteWorkflow(workflowId: string): Promise<void> {
 export async function startRun(
   workflowId: string,
   input?: unknown,
+  version?: number,
 ): Promise<{ run_id: string; workflow_version: number }> {
   const params: Record<string, unknown> = { workflow_id: workflowId };
   if (input !== undefined) params.input = input;
+  if (version !== undefined) params.version = version;
   return client.call("run.start", params);
 }
 
@@ -351,8 +376,8 @@ export async function createSchedule(
 ): Promise<Schedule> {
   const params: Record<string, unknown> = { workflow_id: workflowId, cron };
   if (input !== undefined) params.input = input;
-  const created = await client.call<{id:string}>("schedule.create", params);
-  const schedule = (await listSchedules(workflowId)).find(s => s.id === created.id);
+  const created = await client.call<{ id: string }>("schedule.create", params);
+  const schedule = (await listSchedules(workflowId)).find((s) => s.id === created.id);
   if (!schedule) throw new Error("已提交的调度未出现在读面中");
   return schedule;
 }

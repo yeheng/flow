@@ -267,6 +267,7 @@ pub const READ_METHODS: &[&str] = &[
     "legacy.get",
     "run.events.page",
     "run.audit.page",
+    "workflow.validate",
     "workflow.get.view",
     "workflow.list.view",
     "workflow.versions",
@@ -286,6 +287,7 @@ pub const READ_METHODS: &[&str] = &[
 
 pub const WRITE_METHODS: &[&str] = &[
     "journal.cluster.remove",
+    "workflow.import",
     "workflow.create",
     "workflow.update",
     "workflow.publish",
@@ -350,6 +352,8 @@ pub fn module_product(
         "journal.cluster.status",
         "journal.cluster.nodes",
         "journal.cluster.remove",
+        "workflow.validate",
+        "workflow.import",
         "workflow.create",
         "workflow.update",
         "workflow.publish",
@@ -491,6 +495,23 @@ async fn dispatch_call(
         "run.events.page" | "run.audit.page" => return events_page(b, method, &p).await,
 
         // ---- 写命令（CommandReceipt 回执面）：边缘一次 struct 化 ----
+        "workflow.validate" => {
+            return b
+                .workflow_validate(p["definition"].clone())
+                .map_err(failure)
+        }
+        "workflow.import" => {
+            let publish = p
+                .get("publish")
+                .map(|v| {
+                    v.as_bool()
+                        .ok_or_else(|| invalid("publish must be boolean"))
+                })
+                .transpose()?
+                .unwrap_or(true);
+            b.workflow_import(text(&p, "name")?, p["definition"].clone(), publish, request)
+                .await
+        }
         "workflow.create" => {
             let req = WorkflowCreateReq::parse(&p)?;
             b.workflow_create(req.name, request).await

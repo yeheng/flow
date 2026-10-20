@@ -100,6 +100,8 @@ pub struct Workflow {
     pub name: String,
     pub created_at: String,
     pub versions: BTreeMap<u64, DefinitionVersion>,
+    #[serde(default)]
+    pub deleted: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DefinitionVersion {
@@ -1027,7 +1029,9 @@ impl State {
                 return Ok(());
             }
             EventKind::WorkflowDeleted => {
-                self.workflows.remove(&string(p, "workflow_id")?);
+                if let Some(workflow) = self.workflows.get_mut(&string(p, "workflow_id")?) {
+                    workflow.deleted = true;
+                }
                 return Ok(());
             }
             EventKind::ScheduleChanged => {

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { mount, flushPromises } from "@vue/test-utils";
 import AppModal from "./AppModal.vue";
-import { confirmDialog, modalEntries, promptDialog } from "../state/modal";
+import { confirmDialog, formDialog, modalEntries, promptDialog } from "../state/modal";
 import { closeAllOverlays } from "../state/overlays";
 
 /** keydown 派发到 window：弹窗监听挂 window，消息区点过/失焦后也响应 */
@@ -17,6 +17,39 @@ afterEach(() => {
 });
 
 describe("AppModal：焦点管理", () => {
+  it("必填表单阻止空值，按声明类型保留字符串、数字、false 和枚举", async () => {
+    const w = mount(AppModal, { attachTo: document.body });
+    const pending = formDialog("输入", [
+      { key: "id", label: "编号", type: "string", required: true },
+      { key: "count", label: "数量", type: "integer", defaultValue: 0 },
+      { key: "enabled", label: "启用", type: "boolean", defaultValue: false },
+      { key: "kind", label: "类型", type: "string", enum: ["a", "b"], defaultValue: "b" },
+    ]);
+    await flushPromises();
+    await w.findAll("button")[1].trigger("click");
+    expect(w.get('[role="alert"]').text()).toContain("编号");
+    await w.get("input").setValue("00123");
+    await w.findAll("button")[1].trigger("click");
+    await expect(pending).resolves.toEqual({ id: "00123", count: 0, enabled: false, kind: "b" });
+    w.unmount();
+  });
+
+  it("表单校验错误保持弹窗，取消不返回输入", async () => {
+    const w = mount(AppModal);
+    const pending = formDialog(
+      "数量",
+      [{ key: "n", label: "数量", type: "integer", defaultValue: 1 }],
+      {
+        validate: (values) => (Number(values.n) < 2 ? "至少为 2" : undefined),
+      },
+    );
+    await flushPromises();
+    await w.findAll("button")[1].trigger("click");
+    expect(w.get('[role="alert"]').text()).toBe("至少为 2");
+    await w.findAll("button")[0].trigger("click");
+    await expect(pending).resolves.toBeNull();
+    w.unmount();
+  });
   it("prompt 打开聚焦输入框；Esc 取消并把焦点还原到打开前元素", async () => {
     const trigger = document.createElement("button");
     document.body.appendChild(trigger);

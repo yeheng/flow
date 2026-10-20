@@ -7,6 +7,7 @@ import { TERMINAL_RUN_STATUSES } from "./labels";
 import { appendObservations, mergeObservationLoss } from "./monitor-logic";
 import { staleGuard } from "./stale";
 import { toast } from "./toast";
+import { requestRunInput } from "./run-input";
 
 export const monitor = reactive({
   runId: null as string | null,
@@ -106,6 +107,7 @@ let unsubscribe: (() => Promise<void>) | null = null;
 const attachStale = staleGuard();
 
 export async function startRun(): Promise<void> {
+  if (monitor.starting) return;
   if (!editor.workflowId) {
     toast.error("先选择一个工作流");
     return;
@@ -126,12 +128,19 @@ export async function startRun(): Promise<void> {
     }
   }
   monitor.starting = true;
+  const workflowId = editor.workflowId;
+  const version = editor.publishedVersion;
   try {
-    const { run_id } = await api.startRun(editor.workflowId, input);
+    const published = await api.getWorkflow(workflowId, version);
+    const prepared = await requestRunInput(published.definition, editor.nodeTypes, input);
+    if (!prepared || editor.workflowId !== workflowId) return;
+    input = prepared.input;
+    monitor.inputText = input === undefined ? "" : JSON.stringify(input);
+    const { run_id } = await api.startRun(workflowId, input, version);
     // breadcrumb/workflowId 只在 attach 成功后切换：失败时 monitor 保持旧 run，栈要跟着留
     if (await attach(run_id)) {
       monitor.breadcrumb = [];
-      monitor.workflowId = editor.workflowId;
+      monitor.workflowId = workflowId;
     }
   } catch (e) {
     toast.error(errText(e));

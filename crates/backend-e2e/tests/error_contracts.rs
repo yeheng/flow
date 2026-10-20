@@ -80,13 +80,13 @@ e2e_test!(
         assert_eq!(err.code(), -32602, "{err}");
 
         let run_id = start_run(&client, &workflow_id, json!({})).await;
-        let err = call_err(
+        let deleted: Value = call(
             &client,
             "workflow.delete",
             json!({"workflow_id": workflow_id}),
         )
         .await;
-        assert_eq!(err.code(), -32012, "{err}");
+        assert_eq!(deleted["ok"], true);
         let run = backend_e2e::common::wait_run_terminal(&client, &run_id, TIMEOUT).await;
         assert_eq!(run["run"]["status"], json!("succeeded"));
         // v2 语义：终态 run 取消是幂等空操作（committed 回执，无事件），不报冲突

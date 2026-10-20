@@ -4,7 +4,7 @@ set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DIST="$ROOT/dist/journal"
 cd "$ROOT"
-BINS="flow-journal-server flow-executor flow-harness-agent flow-agent flow-cli flow-journal-tool flow-journal-bench flow-journal-dev"
+BINS="flow-journal-server flow-executor flow-agent flow-cli flow-journal-tool flow-journal-bench flow-journal-dev"
 mkdir -p "$DIST/bin"
 "$ROOT/scripts/release.sh" cargo build --release --workspace --locked "$@"
 for bin in $BINS; do

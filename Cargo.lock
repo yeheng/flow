@@ -583,7 +583,7 @@ dependencies = [
 [[package]]
 name = "conga"
 version = "2.0.0"
-source = "git+https://github.com/yeheng/conga?rev=e27c671#e27c671440b80fcd0175cd886c2ed820f7caaabf"
+source = "git+https://github.com/yeheng/conga?rev=425d786#425d78657df8e0e9235dadb5ec99416fc23f9d5a"
 dependencies = [
  "async-stream",
  "dirs 6.0.0",
@@ -601,7 +601,7 @@ dependencies = [
 [[package]]
 name = "conga-host"
 version = "2.0.0"
-source = "git+https://github.com/yeheng/conga?rev=e27c671#e27c671440b80fcd0175cd886c2ed820f7caaabf"
+source = "git+https://github.com/yeheng/conga?rev=425d786#425d78657df8e0e9235dadb5ec99416fc23f9d5a"
 dependencies = [
  "conga",
  "dom_query",
@@ -765,7 +765,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d045de693cb712d0b22c6a64be5b953f67b3ce00ab5ad3dd5d8b441886ab8e1a"
 dependencies = [
  "quote",
- "syn 3.0.9",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1163,6 +1163,8 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
+ "conga",
+ "conga-host",
  "flow-engine",
  "flow-journal",
  "futures",
@@ -1177,20 +1179,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
-]
-
-[[package]]
-name = "flow-harness-agent"
-version = "0.1.0"
-dependencies = [
- "conga",
- "conga-host",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -1254,6 +1242,9 @@ dependencies = [
 name = "flow-test-support"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "serde_json",
+ "tokio",
  "uuid",
 ]
 

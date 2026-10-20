@@ -1053,7 +1053,7 @@ Cargo feature：`journal-cluster`（依赖 `flow-backend/src/journal_cluster.rs`
 | `HumanTask` | `human_task` | 否 | 否（等 signal） | 人工任务，挂起等 `run.signal` |
 | `Input` | `input` | 否 | 否（等 signal） | 表单收集，缺字段挂起 |
 | `SubWorkflow` | `sub_workflow` | 间接 | 是 | 子 run，等终态透传输出 |
-| `Harness` | `harness` | **是** | **否** | agent CLI/内置 runner：`mode=command` 跑外部 CLI（prompt 经 stdin，stdout 为输出）；`mode=agent` 跑 flow 自带的 flow-harness-agent（conga-host 无头装配，配置冻结自 `[harness.agent]`，密钥经 permit→stdin） |
+| `Harness` | `harness` | **是** | **否** | agent CLI/内置 runner：`mode=command` 跑外部 CLI（prompt 经 stdin，stdout 为输出）；`mode=agent` 由执行器内联驱动 conga-host 无头装配（typed 配置、密钥走参数、无独立 runner；配置冻结自 `[harness.agent]`；workdir 可选，缺省为每次 run 的临时沙箱） |
 | `Email` | `email` | **是** | **否** | Resend 兼容 HTTP API |
 | `Llm` | `llm` | **是** | **否** | 一次持久录制的 HTTP JSON 模型调用；工具操作用独立节点 |
 

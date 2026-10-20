@@ -1,4 +1,6 @@
 import type { Definition, NodeTypeDesc, PropertySchema } from "../types";
+import { schemaFields, schemaObject, validateInputSchema, type FormField } from "./form-fields";
+import { formDialog } from "./modal";
 
 /**
  * 工作流运行输入发现：扫描定义里的 `${input.xxx}` 模板引用与脚本
@@ -32,7 +34,7 @@ function collectParams(value: unknown, schema: PropertySchema | undefined, out: 
 
 /** 节点类型未知（schema 缺失）时按模板引用扫描，不会碰脚本代码 */
 export function discoverInputKeys(def: Definition, nodeTypes: NodeTypeDesc[]): string[] {
-  const out = new Set<string>();
+  const out = new Set<string>(schemaFields(def.input_schema).map((f) => f.key));
   for (const node of def.nodes) {
     // input 节点声明的字段同样是 run input 的候选：启动时提前填好，运行期就不挂起
     if (node.type === "input") {
@@ -42,6 +44,77 @@ export function discoverInputKeys(def: Definition, nodeTypes: NodeTypeDesc[]): s
     collectParams(node.params, schema, out);
   }
   return [...out].sort();
+}
+
+/** Fields come from the published contract, with legacy references as a fallback. */
+export async function requestRunInput(
+  def: Definition,
+  nodeTypes: NodeTypeDesc[],
+  input: unknown,
+): Promise<{ input: unknown } | null> {
+  const schema = schemaObject(def.input_schema);
+  const isObject = input !== null && typeof input === "object" && !Array.isArray(input);
+  const base = isObject ? (input as Record<string, unknown>) : {};
+  const fields = schemaFields(def.input_schema);
+  const declared = new Set(fields.map((f) => f.key));
+  if (schema.type === undefined || schema.type === "object") {
+    for (const node of def.nodes.filter((n) => n.type === "input")) {
+      for (const f of parseInputFields(node.params)) {
+        if (!fields.some((field) => field.key === f.key))
+          fields.push({
+            key: f.key,
+            label: f.label ?? f.key,
+            required: true,
+            defaultValue: f.default,
+          });
+      }
+    }
+    if (schema.additionalProperties !== false) {
+      for (const key of discoverInputKeys(def, nodeTypes)) {
+        if (!fields.some((f) => f.key === key)) fields.push({ key, label: key });
+      }
+    }
+  }
+  const candidate =
+    input === undefined ? (schema.type === "object" || fields.length ? {} : null) : input;
+  const error = validateInputSchema(def.input_schema, candidate);
+  const missing = fields.some(
+    (f) =>
+      (declared.has(f.key) ? f.required : f.defaultValue == null) &&
+      !Object.prototype.hasOwnProperty.call(base, f.key),
+  );
+  if (!error && !missing)
+    return { input: input === undefined && schema.type === "object" ? {} : input };
+  if (
+    (schema.type === undefined || schema.type === "object") &&
+    fields.length &&
+    (input === undefined || isObject)
+  ) {
+    const merge = (values: Record<string, unknown>) => {
+      const next = { ...base };
+      for (const field of fields) delete next[field.key];
+      return { ...next, ...values };
+    };
+    const values = await formDialog("填写工作流运行输入", fields, {
+      values: base,
+      confirmText: "运行",
+      validate: (values) => validateInputSchema(def.input_schema, merge(values)),
+    });
+    return values ? { input: merge(values) } : null;
+  }
+  const rootField: FormField = {
+    key: "$",
+    label: "运行输入 JSON",
+    type: "json",
+    required: true,
+    defaultValue: input ?? schema.default,
+    help: typeof schema.description === "string" ? schema.description : error,
+  };
+  const values = await formDialog("填写工作流运行输入", [rootField], {
+    confirmText: "运行",
+    validate: (values) => validateInputSchema(def.input_schema, values.$),
+  });
+  return values ? { input: values.$ } : null;
 }
 
 /** 表单值 → run input：空字段省略；能 JSON.parse 的用解析值（数字/布尔/对象），否则按字符串 */

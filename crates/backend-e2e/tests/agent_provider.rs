@@ -1,104 +1,32 @@
-//! harness agent 模式的全链路 e2e：**真实 flow-harness-agent runner + 真实
-//! conga-host 装配 + mock OpenAI 兼容 provider**。覆盖：
+//! harness agent 模式的全链路 e2e：executor **内联**调用 conga-host 无头
+//! 装配 + mock OpenAI 兼容 provider。覆盖：
 //!
-//! - 密钥经 stdin → conga provider 的 Bearer 头真值到达（且只在这里到达）；
+//! - 密钥经参数 → conga provider 的 Bearer 头真值到达（且只在这里到达）；
 //! - 多轮工具调用：第一轮 tool_calls 触发 conga 内置 bash 在 workdir 执行，
 //!   第二轮请求携带 role=tool 回执、返回最终文本；
-//! - 节点输出 = runner 单行结果的 text，agent 元数据随输出；
-//! - 内置 coding prompt / 工具集来自 conga 无头装配（system 消息含
-//!   CODING_AGENT_PROMPT，tools 含 bash）。
+//! - 节点输出 = 最终文本 + agent 元数据（model/stop_reason）；
+//! - 内置 coding prompt / 工具集来自无头装配（system 消息非空、tools 含 bash）。
 
-use axum::extract::State;
 use flow_backend::journal::JournalBackend;
 use flow_engine::journal_state::RunStatus;
+use flow_test_support::provider::{spawn_mock_openai, Turn};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-/// mock provider 的共享捕获状态。
-type ProviderState = (
-    Arc<AtomicUsize>,
-    Arc<Mutex<Vec<String>>>,
-    Arc<Mutex<Vec<Value>>>,
-    String,
-);
-
-/// 一次 SSE 响应：把若干 chunk JSON 包装成 data: 行。
-fn sse_body(chunks: &[Value]) -> String {
-    let mut body = String::new();
-    for chunk in chunks {
-        body.push_str(&format!("data: {chunk}\n\n"));
-    }
-    body.push_str("data: [DONE]\n\n");
-    body
-}
-
 #[tokio::test]
-async fn agent_node_full_stack_with_real_runner_and_mock_provider() {
-    // ---- mock provider：两轮流式响应 + 请求捕获 ----
-    let calls = Arc::new(AtomicUsize::new(0));
-    let seen_bearer = Arc::new(Mutex::new(Vec::<String>::new()));
-    let seen_bodies = Arc::new(Mutex::new(Vec::<Value>::new()));
+async fn agent_node_full_stack_with_inline_conga_and_mock_provider() {
     let workdir = tempfile::tempdir().unwrap();
     let marker = workdir.path().join("tool-ran-marker");
-    let marker_arg = marker.to_string_lossy().into_owned();
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let state = (
-        calls.clone(),
-        seen_bearer.clone(),
-        seen_bodies.clone(),
-        marker_arg,
-    );
-    let app = axum::Router::new()
-        .route(
-            "/v1/chat/completions",
-            axum::routing::post(
-                move |State((calls, seen_bearer, seen_bodies, marker_arg)): State<ProviderState>,
-                headers: axum::http::HeaderMap,
-                body: String| async move {
-                    let turn = calls.fetch_add(1, Ordering::SeqCst);
-                    seen_bearer
-                        .lock()
-                        .unwrap()
-                        .push(headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string());
-                    seen_bodies
-                        .lock()
-                        .unwrap()
-                        .push(serde_json::from_str(&body).unwrap_or(Value::Null));
-                    let tool_arguments = serde_json::to_string(&json!({
-                        "command": format!("echo ran > '{marker_arg}'"),
-                    }))
-                    .unwrap();
-                    let chunks: Vec<Value> = if turn == 0 {
-                        vec![
-                            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":tool_arguments}}]}}]}),
-                            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
-                        ]
-                    } else {
-                        vec![
-                            json!({"choices":[{"delta":{"content":"mock agent final answer"}}]}),
-                            json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
-                            json!({"choices":[{"delta":{}}],"usage":{"prompt_tokens":11,"completion_tokens":7}}),
-                        ]
-                    };
-                    (
-                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
-                        sse_body(&chunks),
-                    )
-                },
-            ),
-        )
-        .with_state(state);
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-    // ---- 环境：真实 runner + 密钥 ----
-    std::env::set_var(
-        "FLOW_HARNESS_AGENT_BIN",
-        flow_test_support::io::harness_agent_bin(),
-    );
+    let provider = spawn_mock_openai(vec![
+        Turn::Tool {
+            command: format!("echo ran > '{}'", marker.display()),
+        },
+        Turn::Final {
+            text: "mock agent final answer".into(),
+        },
+    ])
+    .await;
     std::env::set_var("FLOW_SECRET_E2EPROVIDER", "sk-mock-provider-key");
     let dir = tempfile::tempdir().unwrap();
 
@@ -107,7 +35,7 @@ async fn agent_node_full_stack_with_real_runner_and_mock_provider() {
         .unwrap();
     backend
         .install_harness_agent(Some(flow_engine::AgentRunConfig {
-            base_url: format!("http://{addr}/v1"),
+            base_url: provider.base_url(),
             model: "mock-model".into(),
             api: "openai".into(),
             proxy: None,
@@ -187,42 +115,46 @@ async fn agent_node_full_stack_with_real_runner_and_mock_provider() {
 
     // ---- 断言：多轮 + 工具真执行 + 密钥只在 Bearer 头 ----
     assert_eq!(
-        calls.load(Ordering::SeqCst),
+        provider.hits(),
         2,
         "两轮 provider 调用（tool_calls → final）"
     );
-    let bearers = seen_bearer.lock().unwrap().clone();
-    assert_eq!(bearers.len(), 2);
-    for bearer in &bearers {
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
         assert_eq!(
-            bearer, "Bearer sk-mock-provider-key",
+            request.bearer, "Bearer sk-mock-provider-key",
             "密钥真值必须经 provider Bearer 头到达"
         );
     }
-    let bodies = seen_bodies.lock().unwrap().clone();
-    // 第一轮：内置 coding prompt（conga 无头装配）+ bash 工具集
-    let first = &bodies[0];
-    let system = first["messages"][0]["content"].as_str().unwrap_or_default();
+    // 第一轮：内置 coding prompt（无头装配）+ bash 工具集
+    let first = &requests[0];
+    let system = first.body["messages"][0]["content"]
+        .as_str()
+        .unwrap_or_default();
     assert!(!system.is_empty(), "system prompt 应存在");
     assert!(
-        first["tools"]
+        first.body["tools"]
             .as_array()
-            .is_some_and(|tools| { tools.iter().any(|t| t["function"]["name"] == "bash") }),
-        "内置工具集应含 bash：{}",
-        serde_json::to_string(&first["tools"]).unwrap_or_default()
+            .is_some_and(|tools| tools.iter().any(|t| t["function"]["name"] == "bash")),
+        "内置工具集应含 bash"
     );
-    assert_eq!(first["model"], "mock-model");
+    assert_eq!(first.body["model"], "mock-model");
     // 第二轮：assistant tool_calls 回显 + role=tool 回执（bash 真的执行过）
-    let second = &bodies[1];
-    let messages = second["messages"].as_array().cloned().unwrap_or_default();
-    assert!(
-        messages.iter().any(|m| m["role"] == "tool"),
-        "第二轮请求应含工具结果消息：{second}"
-    );
-    let tool_msg = messages.iter().find(|m| m["role"] == "tool").unwrap();
-    let tool_content = tool_msg["content"].as_str().unwrap_or_default().to_string();
+    let second = &requests[1];
+    let messages = second.body["messages"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let tool_msg = messages
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .expect("第二轮请求应含工具结果消息");
     // echo 的输出重定向进了 marker 文件，无 stdout → conga 回执为退出码摘要
-    assert_eq!(tool_content.trim(), "[exit 0]");
+    assert_eq!(
+        tool_msg["content"].as_str().unwrap_or_default().trim(),
+        "[exit 0]"
+    );
 
     // bash 工具在 workdir 真实执行过的物证
     assert!(
@@ -239,7 +171,6 @@ async fn agent_node_full_stack_with_real_runner_and_mock_provider() {
     assert_eq!(node_output["exit_code"], 0);
     assert_eq!(node_output["agent"]["model"], "mock-model");
     assert_eq!(node_output["agent"]["stop_reason"], "end_turn");
-    // 输出面无密钥
     assert!(
         !serde_json::to_string(&node_output)
             .unwrap_or_default()
@@ -248,7 +179,6 @@ async fn agent_node_full_stack_with_real_runner_and_mock_provider() {
     );
 
     backend.close().await.unwrap();
-    server.abort();
-    std::env::remove_var("FLOW_HARNESS_AGENT_BIN");
+    provider.stop().await;
     std::env::remove_var("FLOW_SECRET_E2EPROVIDER");
 }

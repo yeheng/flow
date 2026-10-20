@@ -20,6 +20,10 @@ hex = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 futures = { workspace = true }
+# conga 固定 rev（headless 内联执行：typed 配置直入、key 走参数、
+# settings 不可达、状态根 RAII 钉定）。rev 变更需全量回归 agent e2e。
+conga = { git = "https://github.com/yeheng/conga", rev = "425d786", default-features = false }
+conga-host = { git = "https://github.com/yeheng/conga", rev = "425d786", default-features = false }
 
 
 [lib]

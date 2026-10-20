@@ -1,24 +1,27 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { importWorkflow, nameFromFile, parseImportDocument } from "./workflow-io";
-import type { WorkflowSummary } from "../types";
 
-const listWorkflows = vi.fn();
-const createWorkflow = vi.fn();
-const updateWorkflow = vi.fn();
-const publishWorkflow = vi.fn();
-
-vi.mock("../api/flow", () => ({
-  listWorkflows: (...a: unknown[]) => listWorkflows(...a),
-  createWorkflow: (...a: unknown[]) => createWorkflow(...a),
-  updateWorkflow: (...a: unknown[]) => updateWorkflow(...a),
-  publishWorkflow: (...a: unknown[]) => publishWorkflow(...a),
+const api = vi.hoisted(() => ({
+  listNodeTypes: vi.fn(),
+  validateWorkflow: vi.fn(),
+  importWorkflowDefinition: vi.fn(),
+  setSecret: vi.fn(),
 }));
+const ask = vi.hoisted(() => vi.fn());
+vi.mock("../api/flow", () => api);
+vi.mock("./modal", () => ({ formDialog: ask }));
 
 beforeEach(() => {
-  listWorkflows.mockReset().mockResolvedValue([] as WorkflowSummary[]);
-  createWorkflow.mockReset().mockResolvedValue("wf-new");
-  updateWorkflow.mockReset().mockResolvedValue(1);
-  publishWorkflow.mockReset().mockResolvedValue(undefined);
+  vi.resetAllMocks();
+  api.listNodeTypes.mockResolvedValue([]);
+  api.validateWorkflow.mockResolvedValue({ valid: true, missing_secrets: [] });
+  api.importWorkflowDefinition.mockResolvedValue({
+    workflow_id: "wf-new",
+    name: "new",
+    version: 1,
+    created: true,
+    status: "published",
+  });
 });
 
 describe("nameFromFile", () => {
@@ -69,45 +72,77 @@ describe("parseImportDocument", () => {
   });
 });
 
-describe("importWorkflow（按 name upsert）", () => {
-  const definition = { nodes: [], edges: [] } as never;
-
-  it("同名存在：追加版本不新建，默认发布", async () => {
-    listWorkflows.mockResolvedValue([
-      { workflow_id: "wf-old", name: "已存在", latest_version: 3, published_version: 2, created_at: "" },
-    ] as unknown as WorkflowSummary[]);
-    updateWorkflow.mockResolvedValue(4);
-    const result = await importWorkflow("已存在", definition);
-    expect(createWorkflow).not.toHaveBeenCalled();
-    expect(updateWorkflow).toHaveBeenCalledWith("wf-old", definition);
-    expect(publishWorkflow).toHaveBeenCalledWith("wf-old", 4);
-    expect(result).toEqual({
-      workflow_id: "wf-old",
-      name: "已存在",
-      version: 4,
-      created: false,
-      status: "published",
+describe("importWorkflow 先校验再原子提交", () => {
+  const definition = { nodes: [], edges: [] };
+  it("校验通过后只调用原子导入", async () => {
+    const result = await importWorkflow("new", definition);
+    expect(api.validateWorkflow).toHaveBeenCalledWith(definition);
+    expect(api.importWorkflowDefinition).toHaveBeenCalledWith("new", definition, true);
+    expect(result?.created).toBe(true);
+  });
+  it("校验失败和请求失败都不提交", async () => {
+    api.validateWorkflow.mockRejectedValueOnce(new Error("非法图"));
+    await expect(importWorkflow("bad", definition)).rejects.toThrow("非法图");
+    expect(api.importWorkflowDefinition).not.toHaveBeenCalled();
+  });
+  it("缺少密钥时弹表单，保存后重新校验；重复引用只填一次", async () => {
+    api.validateWorkflow.mockResolvedValueOnce({
+      valid: false,
+      missing_secrets: [
+        { node_id: "a", name: "TOKEN" },
+        { node_id: "b", name: "TOKEN" },
+      ],
     });
+    ask.mockResolvedValue({ TOKEN: "secret" });
+    await importWorkflow("new", definition);
+    expect(ask.mock.calls[0][1]).toHaveLength(1);
+    expect(ask.mock.calls[0][1][0].secret).toBe(true);
+    expect(api.setSecret).toHaveBeenCalledWith("TOKEN", "secret");
+    expect(api.validateWorkflow).toHaveBeenCalledTimes(2);
+    expect(api.importWorkflowDefinition).toHaveBeenCalledTimes(1);
   });
-
-  it("不存在：create → update → publish", async () => {
-    updateWorkflow.mockResolvedValue(1);
-    const result = await importWorkflow("新工作流", definition);
-    expect(createWorkflow).toHaveBeenCalledWith("新工作流");
-    expect(updateWorkflow).toHaveBeenCalledWith("wf-new", definition);
-    expect(result.created).toBe(true);
-    expect(result.status).toBe("published");
+  it("取消密钥补填不提交、不保存密钥", async () => {
+    api.validateWorkflow.mockResolvedValue({
+      valid: false,
+      missing_secrets: [{ node_id: "a", name: "TOKEN" }],
+    });
+    ask.mockResolvedValue(null);
+    expect(await importWorkflow("new", definition)).toBeNull();
+    expect(api.setSecret).not.toHaveBeenCalled();
+    expect(api.importWorkflowDefinition).not.toHaveBeenCalled();
   });
-
-  it("publish: false 保持 draft", async () => {
-    await importWorkflow("x", definition, { publish: false });
-    expect(publishWorkflow).not.toHaveBeenCalled();
+  it("缺少节点必填配置时先补齐，保持原始 JSON 不变", async () => {
+    api.listNodeTypes.mockResolvedValue([
+      {
+        type: "http_call",
+        params_schema: {
+          required: ["url"],
+          properties: { url: { type: "string", "x-label": "地址" } },
+        },
+      },
+    ]);
+    const original = { nodes: [{ id: "a", type: "http_call", params: {} }], edges: [] };
+    ask.mockResolvedValue({ [JSON.stringify([0, "url"])]: "https://example.test" });
+    await importWorkflow("new", original, { publish: false });
+    expect(api.validateWorkflow).toHaveBeenCalledWith({
+      nodes: [{ id: "a", type: "http_call", params: { url: "https://example.test" } }],
+      edges: [],
+    });
+    expect(original.nodes[0].params).toEqual({});
+    expect(api.importWorkflowDefinition.mock.calls[0][2]).toBe(false);
   });
-
-  it("服务端校验失败（update 抛错）原样上抛，调用方 toast", async () => {
-    updateWorkflow.mockRejectedValue(new Error("非法"));
-    await expect(importWorkflow("x", definition)).rejects.toThrow("非法");
-    // 已建的壳不回滚（与 CLI 语义一致：重新导入同名会复用）
-    expect(createWorkflow).toHaveBeenCalledTimes(1);
+  it("取消配置补填时没有校验或提交请求", async () => {
+    api.listNodeTypes.mockResolvedValue([
+      { type: "http_call", params_schema: { required: ["url"] } },
+    ]);
+    ask.mockResolvedValue(null);
+    expect(
+      await importWorkflow("new", {
+        nodes: [{ id: "a", type: "http_call", params: {} }],
+        edges: [],
+      }),
+    ).toBeNull();
+    expect(api.validateWorkflow).not.toHaveBeenCalled();
+    expect(api.importWorkflowDefinition).not.toHaveBeenCalled();
   });
 });

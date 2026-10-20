@@ -179,13 +179,19 @@ e2e_test!(create_update_publish_get_list_roundtrip, |ctx: &mut Ctx| {
         )
         .await;
         assert_eq!(deleted["ok"], json!(true));
-        let err = call_err(
+        let retained: Value = call_json(
             &client,
             "workflow.get.view",
-            json!({"workflow_id": workflow_id}),
+            json!({"workflow_id":workflow_id}),
         )
         .await;
-        assert_eq!(err.code(), -32011, "{err}");
+        assert_eq!(retained["version"], json!(1));
+        let listed: Value = call_json(&client, "workflow.list.view", json!({})).await;
+        assert!(listed["workflows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|w| w["workflow_id"] != workflow_id));
     })
 });
 
@@ -351,21 +357,26 @@ e2e_test!(publish_unknown_version_is_not_found, |ctx: &mut Ctx| {
     })
 });
 
-e2e_test!(delete_workflow_with_runs_is_rejected, |ctx: &mut Ctx| {
+e2e_test!(delete_workflow_with_runs_is_hidden, |ctx: &mut Ctx| {
     Box::pin(async move {
         let client = ctx.client().await;
         let (workflow_id, _) =
             publish_workflow(&client, "有 run 的流", linear_def("return 1;")).await;
         start_run(&client, &workflow_id, json!({})).await;
 
-        // 有 run 记录时拒删（事件日志不能变孤儿，§8）
-        let err = call_err(
+        let deleted: Value = call(
             &client,
             "workflow.delete",
             json!({"workflow_id": workflow_id}),
         )
         .await;
-        assert_eq!(err.code(), -32012, "{err}");
+        assert_eq!(deleted["ok"], json!(true));
+        let list: Value = call_json(&client, "workflow.list.view", json!({})).await;
+        assert!(list["workflows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|w| w["workflow_id"] != workflow_id));
 
         // 删除未知 workflow：-32011
         let err = call_err(&client, "workflow.delete", json!({"workflow_id": "ghost"})).await;

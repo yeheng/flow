@@ -38,7 +38,7 @@
 
 受管理 harness 在超时、取消及正常结束时回收后代进程；执行器退出时，父进程还会回收其会话内的 harness 进程组。Unix 使用执行器会话和 harness 进程组，Windows 使用启动前绑定的 Job Object。主动脱离会话/作业的 daemon、跨主进程与执行器同时强杀的系统故障，仍需部署级进程容器或服务管理器约束；这不改变未知外部结果必须裁决的合同。
 
-`harness` 节点有两种模式（`mode` 参数，缺省 `command`）。`command` 运行用户自备的外部 agent CLI（请求恰好 5 字段，行为不变）。`agent` 使用 flow 内置的 `flow-harness-agent` runner：执行器用同一受管子进程机制启动它（超时/取消/回收合同不变），runner 内部经 conga-host 的无头装配驱动完整 coding agent（内置工具、AGENTS.md、compaction）。配置（base_url/model/限额等）来自 `[harness.agent]`，run 启动时冻结进执行快照；API key 只以密钥名出现在节点参数，真值经授权许可与 stdin 管道下发，任何环境变量都不携带。agent 模式同样是**单次受管 operation**：runner 内部的模型/工具调用不逐个受控、不逐轮记录，证据粒度仍是进程级（`trace_granularity=process`）。
+`harness` 节点有两种模式（`mode` 参数，缺省 `command`）。`command` 运行用户自备的外部 agent CLI（请求恰好 5 字段，行为不变）。`agent` 由执行器**内联**驱动：直接调用 conga-host 的无头装配（typed 配置直入、API key 走参数、conga settings 永不被读），无独立 runner 子进程。超时/取消先走 conga 的协作中止信号（工具边界响应），未能在短窗内收尾即判 Uncertain。工具子进程由 conga 的 kill-on-drop 回收**直接子进程**；孙进程依赖执行器会话级回收（执行器退出时整会话收割，见上文受管理 harness 合同）——agent 模式不再提供独立进程组级的即时后代回收，这是内联执行的明确取舍。workdir 可选：缺省时执行器为每次 run 创建随机临时沙箱（结束后删除）；显式配置的路径须存在（授权前在执行器本机校验）。配置（base_url/model/限额等）来自 `[harness.agent]`，run 启动时冻结进执行快照；API key 只以密钥名出现在节点参数，真值经授权许可与 stdin 管道下发，任何环境变量都不携带。agent 模式同样是**单次受管 operation**：runner 内部的模型/工具调用不逐个受控、不逐轮记录，证据粒度仍是进程级（`trace_granularity=process`）。
 
 模型决定应由脚本/条件节点读取，业务工具由独立 HTTP 或子流程节点执行。每个模型调用和工具操作拥有独立的请求、授权和结果证据；可以对整个场景回归。`harness` 继续提供进程级证据，其内部调用不会被假定为独立受控工具操作。节点能力接口公开 `trace_granularity`。
 

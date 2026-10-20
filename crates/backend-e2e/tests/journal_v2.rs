@@ -487,7 +487,7 @@ async fn slow_subscription_can_resume_by_pages_and_terminal_audit_stays_live() {
 }
 
 #[tokio::test]
-async fn delete_workflow_with_runs_is_rejected_by_authoritative_rpc() {
+async fn delete_workflow_with_runs_preserves_history_and_blocks_new_runs() {
     let root = flow_test_support::io::TempDir::new("v2-delete-guard");
     let backend = JournalBackend::open(root.path(), Default::default())
         .await
@@ -504,14 +504,23 @@ async fn delete_workflow_with_runs_is_rejected_by_authoritative_rpc() {
         .unwrap();
     let run = run.result["run_id"].as_str().unwrap();
     let before = backend.journal.durable_lsn();
-    let rejected = call(
+    let deleted = call(
         &module,
         "workflow.delete",
         json!({"_token":token,"request_id":"delete","workflow_id":workflow}),
     )
     .await;
-    assert_eq!(rejected["error"]["code"], -32012, "{rejected}");
-    assert_eq!(backend.journal.durable_lsn(), before);
+    assert!(deleted.get("error").is_none(), "{deleted}");
+    assert!(backend.journal.durable_lsn() > before);
+    assert!(backend.state().await.unwrap().workflows[workflow].deleted);
+    assert!(flow_backend::journal_views::list_workflows(&backend)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(backend
+        .run_start(workflow, None, Value::Null, "manual", None, None)
+        .await
+        .is_err());
     assert!(
         flow_backend::journal_views::get_version(&backend, workflow, Some(1))
             .await
@@ -524,7 +533,31 @@ async fn delete_workflow_with_runs_is_rejected_by_authoritative_rpc() {
     )
     .await;
     assert!(timeline.get("error").is_none(), "{timeline}");
+    let workflow = workflow.to_owned();
     backend.close().await.unwrap();
+    drop(module);
+    drop(backend);
+    let recovered = JournalBackend::open(root.path(), Default::default())
+        .await
+        .unwrap();
+    assert!(recovered.state().await.unwrap().workflows[&workflow].deleted);
+    assert!(flow_backend::journal_views::list_workflows(&recovered)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(
+        flow_backend::journal_views::get_version(&recovered, &workflow, Some(1))
+            .await
+            .is_ok()
+    );
+    assert!(recovered
+        .run_start(&workflow, None, Value::Null, "manual", None, None)
+        .await
+        .is_err());
+    let replacement = recovered.workflow_import("history", json!({"nodes":[{"id":"s","type":"start"},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"e"}]}), true, None).await.unwrap();
+    assert_eq!(replacement.result["created"], true);
+    assert_ne!(replacement.result["workflow_id"], workflow);
+    recovered.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -663,4 +696,78 @@ async fn start_ipc(backend: &std::sync::Arc<flow_backend::journal::JournalBacken
         ))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn workflow_import_preflight_and_atomic_commit() {
+    let root = flow_test_support::io::TempDir::new("workflow-atomic-import");
+    let backend = JournalBackend::open(root.path(), Default::default())
+        .await
+        .unwrap();
+    let token = "workflow-import-token-at-least-32-bytes";
+    let module = flow_rpc::journal_v2::module(backend.clone(), token.into()).unwrap();
+    let before = backend.journal.durable_lsn();
+    let invalid = json!({"nodes":[],"edges":[]});
+    let result = call(
+        &module,
+        "workflow.import",
+        json!({"_token":token,"request_id":"bad","name":"bad","definition":invalid}),
+    )
+    .await;
+    assert!(result.get("error").is_some(), "{result}");
+    assert_eq!(backend.journal.durable_lsn(), before);
+    assert!(backend.state().await.unwrap().workflows.is_empty());
+    let definition = json!({"nodes":[{"id":"s","type":"start"},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"e"}]});
+    let valid = call(
+        &module,
+        "workflow.validate",
+        json!({"_token":token,"definition":definition}),
+    )
+    .await;
+    assert_eq!(valid["result"]["valid"], true, "{valid}");
+    assert_eq!(backend.journal.durable_lsn(), before);
+    let args =
+        json!({"_token":token,"request_id":"import","name":"imported","definition":definition});
+    let imported = call(&module, "workflow.import", args.clone()).await;
+    assert!(imported.get("error").is_none(), "{imported}");
+    let receipt = &imported["result"];
+    assert_eq!(receipt["result"]["status"], "published");
+    assert_eq!(receipt["result"]["version"], 1);
+    let after = backend.journal.durable_lsn();
+    let replay = call(&module, "workflow.import", args).await;
+    assert_eq!(replay["result"], imported["result"]);
+    assert_eq!(backend.journal.durable_lsn(), after);
+    let again = backend
+        .workflow_import("imported", definition, true, Some("again"))
+        .await
+        .unwrap();
+    assert_eq!(again.result["created"], false);
+    assert_eq!(again.result["version"], 1);
+    assert_eq!(backend.state().await.unwrap().workflows.len(), 1);
+    backend.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn workflow_import_reports_missing_secrets_without_creating_records() {
+    let root = flow_test_support::io::TempDir::new("workflow-import-missing-secret");
+    let backend = JournalBackend::open(root.path(), Default::default())
+        .await
+        .unwrap();
+    let definition = json!({"nodes":[{"id":"s","type":"start"},
+        {"id":"agent","type":"harness","params":{"mode":"agent","prompt":"test","api_key":"WORKFLOW_IMPORT_MISSING_SECRET_TEST"}},
+        {"id":"e","type":"end"}],"edges":[{"from":"s","to":"agent"},{"from":"agent","to":"e"}]});
+    let before = backend.journal.durable_lsn();
+    let validation = backend.workflow_validate(definition.clone()).unwrap();
+    assert_eq!(validation["valid"], false);
+    assert_eq!(
+        validation["missing_secrets"],
+        json!([{"node_id":"agent","name":"WORKFLOW_IMPORT_MISSING_SECRET_TEST"}])
+    );
+    assert!(backend
+        .workflow_import("missing", definition, true, Some("missing"))
+        .await
+        .is_err());
+    assert_eq!(backend.journal.durable_lsn(), before);
+    assert!(backend.state().await.unwrap().workflows.is_empty());
+    backend.close().await.unwrap();
 }

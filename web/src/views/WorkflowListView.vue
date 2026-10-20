@@ -51,7 +51,7 @@ async function onCreate(): Promise<void> {
 async function onDelete(id: string): Promise<void> {
   if (deletingId.value) return;
   if (
-    await confirmDialog("确定删除该工作流？已有 run 记录的工作流会被服务端拒绝。", {
+    await confirmDialog("确定删除该工作流？删除后将从列表隐藏并移除触发器，已有运行记录会保留。", {
       danger: true,
     })
   ) {
@@ -95,6 +95,7 @@ async function onFileChange(event: Event): Promise<void> {
   importing.value = true;
   try {
     const result = await importWorkflow(name.trim(), parsed.definition);
+    if (!result) return;
     toast.success(
       `已导入 ${result.name} v${result.version}（${result.created ? "新建" : "追加版本"}，已发布）`,
     );

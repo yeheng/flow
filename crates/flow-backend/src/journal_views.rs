@@ -179,6 +179,7 @@ pub async fn list_workflows(backend: &JournalBackend) -> Result<Vec<WorkflowSumm
         .await
         .map_err(internal)?
         .into_iter()
+        .filter(|v| v["deleted"] != true)
         .map(|v| workflow_summary(&v))
         .collect()
 }

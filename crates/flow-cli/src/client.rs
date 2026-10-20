@@ -60,7 +60,8 @@ pub async fn call(
 pub(crate) fn is_write_method(method: &str) -> bool {
     matches!(
         method,
-        "workflow.create"
+        "workflow.import"
+            | "workflow.create"
             | "workflow.update"
             | "workflow.publish"
             | "workflow.delete"

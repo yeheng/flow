@@ -4,6 +4,7 @@
 //! （模板、script、condition）与外部 HTTP 调用在本进程执行。一切持久
 //! 事实经 IPC 发回主进程提交，socket 收到数据不等于持久回执。
 
+pub mod agent_summary;
 pub mod audit;
 pub mod observe;
 pub mod runtime;

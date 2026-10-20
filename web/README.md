@@ -286,3 +286,34 @@ teardown 杀进程删目录。种子数据直接走 JSON-RPC WebSocket（`e2e/he
   （authorization/token/password/cookie…）在展示层脱敏，`run.get` 的数据面不变。
 
 其他画布能力：右下 Minimap、吸附网格（16px）、旧定义缺 position 时按拓扑分层兜底布局。
+
+## 工作流 JSON 的人工输入与导入
+
+在 definition 的 `input_schema` 中声明运行输入，`required` 指定必填字段。
+点击运行时，界面读取实际执行的已发布版本，缺少输入或输入不符合约束时弹出表单；
+填写后才创建运行。字段支持 `title`、`description`、`default`、`enum` 和类型约束。
+例如：
+
+```json
+{
+  "input_schema": {
+    "type": "object",
+    "required": ["project", "count"],
+    "properties": {
+      "project": { "type": "string", "title": "项目名称", "minLength": 1 },
+      "count": { "type": "integer", "title": "数量", "minimum": 1, "default": 5 }
+    },
+    "additionalProperties": false
+  },
+  "nodes": [
+    { "id": "start", "type": "start" },
+    { "id": "end", "type": "end" }
+  ],
+  "edges": [{ "from": "start", "to": "end" }]
+}
+```
+
+执行中的 `input` 节点缺少人工输入时自动弹出字段表单；取消后可在运行面板点击「填写表单」继续。
+导入先补齐缺少的节点必填参数，再由服务端校验；缺少密钥时弹出密码表单，保存到密钥管理后重新校验。
+通过校验后，创建或更新版本及发布在同一事务中完成；取消、校验失败均不会留下空工作流。
+删除工作流采用逻辑删除：列表隐藏、触发器移除、禁止新运行，已有定义版本和运行历史保留，重启后仍可查看。
