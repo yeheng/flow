@@ -1,7 +1,8 @@
 {
   "name": "github-trending",
-  "description": "拉取 GitHub Trending 日报（全量 + spoken_language_code=zh），输出 中文 / 非中文 两组项目 JSON",
+  "description": "拉取 GitHub Trending 日报（全量 + spoken_language_code=zh），解析成 中文 / 非中文 两组项目后，用内置 harness agent 总结榜单趋势并推荐有趣的项目（含介绍与卖点）。需配置 [harness.agent] 模型、密钥 DEEPSEEK_API_KEY，并把 recommend 节点的 workdir 改成已存在的绝对路径",
   "definition": {
+    "semantics": 2,
     "nodes": [
       {
         "id": "start",
@@ -62,11 +63,40 @@
         }
       },
       {
+        "id": "recommend",
+        "type": "harness",
+        "name": "Harness agent 总结并推荐有趣项目",
+        "position": {
+          "x": 820,
+          "y": 200
+        },
+        "params": {
+          "mode": "agent",
+          "prompt": "你是一位资深的技术编辑与开源项目策展人，擅长从海量项目里挑出真正值得关注的那几个，并用简洁有力的中文讲清楚它是什么、解决什么问题、妙在哪里。判断独立犀利，不写空话套话。这是纯分析任务，直接给出最终结果即可，无需读写文件或执行命令。\n\n以下是今天 GitHub Trending 的榜单数据（生成于 ${nodes.parse.generated_at}），含中文榜与非中文榜两组项目（JSON）：\n\n${nodes.parse}\n\n请作为策展人完成以下任务，严格只输出一个 JSON 对象（不要任何解释文字，不要用 markdown 代码块包裹）。JSON 结构如下：\n\n{\n  \"overview\": \"<2-3 句话概括今天榜单的整体趋势：哪些技术方向在升温、有什么共性>\",\n  \"picks\": [\n    {\n      \"repo\": \"<owner/name，原样保留>\",\n      \"url\": \"<仓库地址>\",\n      \"language\": \"<主要语言，未知填 null>\",\n      \"stars_today\": <今日新增 star 数，未知填 null>,\n      \"intro\": \"<50-120 字中文介绍：这是什么项目、解决什么痛点、为什么现在值得看>\",\n      \"highlights\": [\"<卖点1>\", \"<卖点2>\", \"<卖点3>\"]\n    }\n  ]\n}\n\n挑选标准：从两组榜单里挑 5-8 个最有趣或最值得关注的项目，按有趣程度从高到低排序；优先新颖独特、解决真实痛点、增长势头猛或技术上有巧思的项目；避开纯教程、纯资源列表、营销性质的项目；尽量覆盖不同技术方向与语言。highlights 给 3-5 条，每条一句话，突出最独特、最实用或最有前景的地方。",
+          "workdir": "/absolute/path/to/workdir",
+          "api_key": "DEEPSEEK_API_KEY",
+          "timeout_ms": 300000
+        }
+      },
+      {
+        "id": "digest",
+        "type": "script",
+        "name": "整理推荐结果",
+        "position": {
+          "x": 1080,
+          "y": 200
+        },
+        "params": {
+          "code": "// harness agent 输出 {exit_code, stdout, stderr, agent, result?}。\n// result 是 stdout 以 { / [ 开头且能解析成对象/数组时的投影；缺省回退 stdout 手工解析。\nvar out = nodes.recommend || {};\nvar parsed = out.result;\nif (parsed === undefined || parsed === null) {\n  var text = typeof out.stdout === \"string\" ? out.stdout : \"\";\n  // 有些模型会用 ```json ... ``` 包裹，先剥掉再解析\n  text = text.trim().replace(/^```[a-zA-Z]*\\s*/, \"\").replace(/\\s*```$/, \"\");\n  if (text === \"\") {\n    throw new Error(\"harness agent 无文本输出：\" + JSON.stringify(out).slice(0, 800));\n  }\n  try {\n    parsed = JSON.parse(text);\n  } catch (e) {\n    throw new Error(\"agent 返回的不是合法 JSON：\" + e.message + \"；原文开头：\" + text.slice(0, 800));\n  }\n}\nreturn {\n  generated_at: new Date().toISOString(),\n  model: (out.agent && out.agent.model) || null,\n  overview: typeof parsed.overview === \"string\" ? parsed.overview : \"\",\n  picks: Array.isArray(parsed.picks) ? parsed.picks : []\n};",
+          "timeout_ms": 10000
+        }
+      },
+      {
         "id": "done",
         "type": "end",
         "name": "结束",
         "position": {
-          "x": 840,
+          "x": 1340,
           "y": 200
         }
       }
@@ -90,6 +120,14 @@
       },
       {
         "from": "parse",
+        "to": "recommend"
+      },
+      {
+        "from": "recommend",
+        "to": "digest"
+      },
+      {
+        "from": "digest",
         "to": "done"
       }
     ]

@@ -106,6 +106,67 @@ return {
 };
 """.strip()
 
+# ---- Harness agent 策展节点：总结榜单趋势 + 推荐有趣项目 ----
+# 内置 flow-harness-agent（conga-host 无头装配，FullAuto：可读写 workdir、联网、起 shell）。
+# 与 llm 节点的区别：
+#   - 模型配置（base_url/model/api）在 flow.toml 的 [harness.agent]，不在这里；
+#   - api_key 只存密钥**名称**，真值经密钥体系（stored 优先、FLOW_SECRET_* 兜底）注入，
+#     任何环境变量 / journal / 日志都不携带；
+#   - workdir 是 agent 工具沙箱根，必须是已存在的绝对路径（运行前 canonicalize 校验）。
+AGENT_SECRET = "DEEPSEEK_API_KEY"            # 密钥名 → FLOW_SECRET_DEEPSEEK_API_KEY 或 Web 密钥管理
+AGENT_WORKDIR = "/absolute/path/to/workdir"  # TODO: 改成已存在的绝对路径（agent 沙箱根）
+
+# prompt 经 stdin 进 runner；${nodes.parse} 整值插值成 parse 节点的 JSON。
+AGENT_PROMPT = """你是一位资深的技术编辑与开源项目策展人，擅长从海量项目里挑出真正值得关注的那几个，并用简洁有力的中文讲清楚它是什么、解决什么问题、妙在哪里。判断独立犀利，不写空话套话。这是纯分析任务，直接给出最终结果即可，无需读写文件或执行命令。
+
+以下是今天 GitHub Trending 的榜单数据（生成于 ${nodes.parse.generated_at}），含中文榜与非中文榜两组项目（JSON）：
+
+${nodes.parse}
+
+请作为策展人完成以下任务，严格只输出一个 JSON 对象（不要任何解释文字，不要用 markdown 代码块包裹）。JSON 结构如下：
+
+{
+  "overview": "<2-3 句话概括今天榜单的整体趋势：哪些技术方向在升温、有什么共性>",
+  "picks": [
+    {
+      "repo": "<owner/name，原样保留>",
+      "url": "<仓库地址>",
+      "language": "<主要语言，未知填 null>",
+      "stars_today": <今日新增 star 数，未知填 null>,
+      "intro": "<50-120 字中文介绍：这是什么项目、解决什么痛点、为什么现在值得看>",
+      "highlights": ["<卖点1>", "<卖点2>", "<卖点3>"]
+    }
+  ]
+}
+
+挑选标准：从两组榜单里挑 5-8 个最有趣或最值得关注的项目，按有趣程度从高到低排序；优先新颖独特、解决真实痛点、增长势头猛或技术上有巧思的项目；避开纯教程、纯资源列表、营销性质的项目；尽量覆盖不同技术方向与语言。highlights 给 3-5 条，每条一句话，突出最独特、最实用或最有前景的地方。"""
+
+DIGEST_CODE = r"""
+// harness agent 输出 {exit_code, stdout, stderr, agent, result?}。
+// result 是 stdout 以 { / [ 开头且能解析成对象/数组时的投影；缺省回退 stdout 手工解析。
+var out = nodes.recommend || {};
+var parsed = out.result;
+if (parsed === undefined || parsed === null) {
+  var text = typeof out.stdout === "string" ? out.stdout : "";
+  // 有些模型会用 ```json ... ``` 包裹，先剥掉再解析
+  text = text.trim().replace(/^```[a-zA-Z]*\s*/, "").replace(/\s*```$/, "");
+  if (text === "") {
+    throw new Error("harness agent 无文本输出：" + JSON.stringify(out).slice(0, 800));
+  }
+  try {
+    parsed = JSON.parse(text);
+  } catch (e) {
+    throw new Error("agent 返回的不是合法 JSON：" + e.message + "；原文开头：" + text.slice(0, 800));
+  }
+}
+return {
+  generated_at: new Date().toISOString(),
+  model: (out.agent && out.agent.model) || null,
+  overview: typeof parsed.overview === "string" ? parsed.overview : "",
+  picks: Array.isArray(parsed.picks) ? parsed.picks : []
+};
+""".strip()
+
 HEADERS = {"User-Agent": "flow-github-trending", "Accept": "text/html"}
 
 
@@ -125,6 +186,7 @@ def http(node_id, name, url, x, y):
 
 
 definition = {
+    "semantics": 2,
     "nodes": [
         {"id": "start", "type": "start", "name": "开始", "position": {"x": 40, "y": 200}},
         http(
@@ -148,20 +210,42 @@ definition = {
             "position": {"x": 560, "y": 200},
             "params": {"code": CODE, "timeout_ms": 10000},
         },
-        {"id": "done", "type": "end", "name": "结束", "position": {"x": 840, "y": 200}},
+        {
+            "id": "recommend",
+            "type": "harness",
+            "name": "Harness agent 总结并推荐有趣项目",
+            "position": {"x": 820, "y": 200},
+            "params": {
+                "mode": "agent",
+                "prompt": AGENT_PROMPT,
+                "workdir": AGENT_WORKDIR,
+                "api_key": AGENT_SECRET,
+                "timeout_ms": 300000,
+            },
+        },
+        {
+            "id": "digest",
+            "type": "script",
+            "name": "整理推荐结果",
+            "position": {"x": 1080, "y": 200},
+            "params": {"code": DIGEST_CODE, "timeout_ms": 10000},
+        },
+        {"id": "done", "type": "end", "name": "结束", "position": {"x": 1340, "y": 200}},
     ],
     "edges": [
         {"from": "start", "to": "fetch_all"},
         {"from": "start", "to": "fetch_zh"},
         {"from": "fetch_all", "to": "parse"},
         {"from": "fetch_zh", "to": "parse"},
-        {"from": "parse", "to": "done"},
+        {"from": "parse", "to": "recommend"},
+        {"from": "recommend", "to": "digest"},
+        {"from": "digest", "to": "done"},
     ],
 }
 
 doc = {
     "name": "github-trending",
-    "description": "拉取 GitHub Trending 日报（全量 + spoken_language_code=zh），输出 中文 / 非中文 两组项目 JSON",
+    "description": "拉取 GitHub Trending 日报（全量 + spoken_language_code=zh），解析成 中文 / 非中文 两组项目后，用内置 harness agent 总结榜单趋势并推荐有趣的项目（含介绍与卖点）。需配置 [harness.agent] 模型、密钥 DEEPSEEK_API_KEY，并把 recommend 节点的 workdir 改成已存在的绝对路径",
     "definition": definition,
 }
 

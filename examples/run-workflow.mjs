@@ -109,7 +109,11 @@ async function main() {
 
     const counts = run.output?.counts;
     console.log(`✔ run ${runId} 成功 → ${outPath}`);
-    if (counts) {
+    // 新流程末尾是 harness agent 策展：输出 { overview, picks[] }；旧流程输出 { counts }。
+    const picks = run.output?.picks;
+    if (Array.isArray(picks)) {
+      console.log(`  推荐 ${picks.length} 个项目：${picks.map((p) => p.repo).join("、")}`);
+    } else if (counts) {
       console.log(
         `  chinese ${counts.chinese} / non_chinese ${counts.non_chinese}（全量榜 ${counts.all}）`,
       );

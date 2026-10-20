@@ -415,7 +415,7 @@ cat my-flow.workflow.json | cargo run -q -p flow-engine --example validate_def
 | `crates/flow-engine/src/expr.rs` | QuickJS 沙箱边界与 `${}` 模板展开 |
 | `crates/flow-cli/src/workflow.rs` | 导入导出的客户端编排与 name 解析 |
 | `crates/flow-engine/examples/validate_def.rs` | 离线定义校验器 |
-| `examples/github-trending.workflow.json` | 完整可运行示例（并行 HTTP + 脚本解析） |
+| `examples/github-trending.workflow.json` | 完整可运行示例（并行 HTTP + 脚本解析 + harness agent 策展推荐） |
 | `examples/build-github-trending.py` | 上述示例的生成脚本（改这里而非手改 JSON） |
 | `examples/run-workflow.mjs` | 无依赖的 RPC 导入 + 运行 + 落盘示例 |
 | `docs/DESIGN.md` | 设计文档（§8 定义模型、§9 执行语义、§10 沙箱） |
