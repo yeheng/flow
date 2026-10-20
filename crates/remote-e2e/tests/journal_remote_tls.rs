@@ -58,9 +58,7 @@ fn generate_pki_named(
         rcgen::DnType::CommonName,
         rcgen::DnValue::Utf8String(server_name.into()),
     );
-    let server_cert = server_params
-        .signed_by(&server_key, &ca_issuer)
-        .unwrap();
+    let server_cert = server_params.signed_by(&server_key, &ca_issuer).unwrap();
 
     let agent_key = KeyPair::generate().unwrap();
     let mut agent_params = CertificateParams::new(vec![]).unwrap();
@@ -68,9 +66,7 @@ fn generate_pki_named(
         rcgen::DnType::CommonName,
         rcgen::DnValue::Utf8String(agent_cn.into()),
     );
-    let agent_cert = agent_params
-        .signed_by(&agent_key, &ca_issuer)
-        .unwrap();
+    let agent_cert = agent_params.signed_by(&agent_key, &ca_issuer).unwrap();
 
     let write = |name: &str, content: String| {
         let path = dir.join(name);

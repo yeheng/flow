@@ -15,10 +15,14 @@ export class JournalClient {
   call<T>(method: string, params: Record<string, unknown> = {}): Promise<T> {
     return this.rpc.call<T>(method, { ...params, _token: this.token });
   }
-  /** 写命令回执。SQLite 单事务提交后 visible 恒为 true；-32020 已无生产者，
-   * 这里仍保留完整回执形状供原生协议读面使用。 */
-  command(method: string, params: Record<string, unknown>, _scope = method, requestId: string = crypto.randomUUID()): Promise<Receipt> {
-    return this.call<Receipt>(method, { ...params, request_id: requestId });
+  /**
+   * 写命令：调用方持有显式幂等键（断链重发时同键不产生双写）。
+   * `scope` 只服务调用侧的恢复指引（丢失回复时按 scope+request_id 复原），
+   * 不上链；返回**完整回执**——journal 侧的 committed/visible/commit_cursor
+   * 都是调用方要消费的事实，不解包 result。
+   */
+  command<T>(method: string, params: Record<string, unknown>, _scope: string, request_id: string): Promise<T> {
+    return this.call<T>(method, { ...params, request_id });
   }
   page(run: string, audit = false, cursor?: Record<string, unknown> | null): Promise<JournalPage> {
     return this.call(audit ? "run.audit.page" : "run.events.page", { run_id: run, cursor, limit: 100 });

@@ -5,7 +5,9 @@ import * as api from "../api/flow";
 import { errText } from "../rpc/client";
 import { confirmDiscardIfDirty, editor, refreshWorkflows, selectWorkflow } from "../state/editor";
 import { confirmDialog } from "../state/modal";
+import { fmtTime } from "../state/time";
 import { toast } from "../state/toast";
+import { copyWithToast } from "../state/clipboard";
 import { diffDefinitions, isEmptyDiff, type DefinitionDiff } from "../state/diff";
 import type { Definition, VersionMeta } from "../types";
 import AppButton from "../components/AppButton.vue";
@@ -84,6 +86,22 @@ onMounted(async () => {
   await load();
 });
 
+// RouterView 无 key：跨工作流前进/后退复用实例，参数变化时重置对比态并按新 id 重拉
+watch(
+  () => props.workflowId,
+  (id, prev) => {
+    if (!id || id === prev) return;
+    versions.value = [];
+    error.value = "";
+    loaded.value = false;
+    compareA.value = null;
+    compareB.value = null;
+    diff.value = null;
+    defCache.clear();
+    void load();
+  },
+);
+
 /** 把该版本定义载入编辑器作为编辑基础；保存时走正常 workflow.update 生成新版本 */
 async function loadToEditor(version: number): Promise<void> {
   if (!(await confirmDiscardIfDirty())) return;
@@ -121,10 +139,6 @@ async function publishFromVersion(version: number): Promise<void> {
   }
 }
 
-function fmtTime(iso: string): string {
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
-}
 
 function fmtVal(v: unknown): string {
   if (v === undefined) return "（空）";
@@ -137,12 +151,7 @@ function fmtEdge(e: { from: string; to: string; port?: string }): string {
 }
 
 async function copyChecksum(checksum: string): Promise<void> {
-  try {
-    await navigator.clipboard.writeText(checksum);
-    toast.success("已复制校验和");
-  } catch {
-    toast.error("复制失败，请手动复制");
-  }
+  await copyWithToast(checksum, "校验和");
 }
 </script>
 
@@ -345,23 +354,6 @@ async function copyChecksum(checksum: string): Promise<void> {
   word-break: break-all;
 }
 
-/* copy-cell 按钮化：剥掉 button 默认外观，保持原可点击文本单元格样式（mono/muted 在 td 上） */
-.copy-id {
-  background: none;
-  border: none;
-  padding: 0;
-  color: inherit;
-  font: inherit;
-  font-family: var(--mono);
-  text-align: left;
-  cursor: pointer;
-}
-
-.copy-id:hover {
-  background: none;
-  border-color: transparent;
-  text-decoration: underline;
-}
 
 .header-links {
   display: inline-flex;

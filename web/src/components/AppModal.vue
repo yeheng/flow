@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, useId, watch } from "vue";
 import { modalEntries, settleModal, type ModalEntry } from "../state/modal";
+import { trapTabIn } from "../state/modal-a11y";
 import AppButton from "./AppButton.vue";
 
 const text = ref("");
@@ -50,7 +51,7 @@ function onWindowKeydown(e: KeyboardEvent): void {
   const entry = current.value;
   if (!entry) return;
   if (e.key === "Tab") {
-    trapTab(e);
+    trapTabIn(dialogEl.value, e);
     return;
   }
   // Enter 确认只对 confirm 生效；焦点在按钮上时交给按钮自身，避免双触发
@@ -63,21 +64,6 @@ function isButton(t: EventTarget | null): boolean {
   return t instanceof HTMLElement && t.closest("button") !== null;
 }
 
-/** Tab 焦点只在弹窗内循环 */
-const FOCUSABLE = 'button, [href], input, textarea, select, [tabindex]:not([tabindex="-1"])';
-
-function trapTab(e: KeyboardEvent): void {
-  const items = Array.from(dialogEl.value?.querySelectorAll<HTMLElement>(FOCUSABLE) ?? []).filter(
-    (el) => !el.hasAttribute("disabled"),
-  );
-  if (items.length === 0) return;
-  const active = document.activeElement;
-  const inside = dialogEl.value?.contains(active) ?? false;
-  const edge = e.shiftKey ? items[0] : items[items.length - 1];
-  if (inside && active !== edge) return;
-  e.preventDefault();
-  (e.shiftKey ? items[items.length - 1] : items[0]).focus();
-}
 
 onMounted(() => window.addEventListener("keydown", onWindowKeydown));
 onUnmounted(() => window.removeEventListener("keydown", onWindowKeydown));

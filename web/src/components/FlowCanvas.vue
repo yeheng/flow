@@ -24,7 +24,7 @@ import {
   type EditorNode,
 } from "../state/editor";
 import { insertTemplate, openTemplateSave } from "../state/templates";
-import { beginDrag, commit, endDrag } from "../state/history";
+import { beginDrag, endDrag } from "../state/history";
 import { monitor, openChildRun } from "../state/monitor";
 import { openOverlay, overlaysOf } from "../state/overlays";
 import FlowNode from "./FlowNode.vue";
@@ -56,14 +56,6 @@ function onNodeClick(e: NodeMouseEvent): void {
 function onNodeDoubleClick(e: NodeMouseEvent): void {
   editor.selectedNodeId = e.node.id;
   openOverlay("params", { nodeId: e.node.id });
-}
-
-// 删除键在 vue-flow 处理前先入 undo 栈（canvas-wrap 在冒泡路径上先于 window 监听器执行）
-function onKeydown(e: KeyboardEvent): void {
-  if (e.key !== "Delete" && e.key !== "Backspace") return;
-  if (e.target instanceof HTMLElement && e.target.closest("input, textarea, [contenteditable]"))
-    return;
-  if (editor.nodes.some((n) => n.selected) || editor.edges.some((edge) => edge.selected)) commit();
 }
 
 // 运行中节点的下游边做流动动画
@@ -401,7 +393,6 @@ onUnmounted(() => {
     @contextmenu.prevent
     @drop="onDrop"
     @dragover.prevent
-    @keydown="onKeydown"
   >
     <div v-if="editor.breadcrumb.length" class="breadcrumb">
       <template v-for="(c, i) in editor.breadcrumb" :key="`${i}:${c.workflowId}`">
@@ -412,11 +403,13 @@ onUnmounted(() => {
       </template>
       <span class="crumb-current">{{ editor.workflowName || editor.workflowId }}</span>
     </div>
+    <!-- vue-flow 自带删除注册在 document 层、不走 undo 栈（焦点不在画布内或弹层开着时也会删）。
+         必须关掉：删除统一走 EditorView 的 window 键监听，经 deleteSelection 先 commit 再删，⌘Z 可恢复。 -->
     <VueFlow
       v-model:nodes="editor.nodes"
       v-model:edges="editor.edges"
       :is-valid-connection="isValidConnection"
-      :delete-key-code="['Backspace', 'Delete']"
+      :delete-key-code="null"
       :selection-key-code="'Shift'"
       :multi-selection-key-code="['Meta', 'Control']"
       :default-viewport="{ zoom: 1 }"

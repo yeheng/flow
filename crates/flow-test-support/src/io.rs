@@ -238,6 +238,12 @@ pub fn executor_bin() -> PathBuf {
     workspace_bin("flow-executor")
 }
 
+/// harness agent 模式的 runner 二进制（与 executor 同 workspace 构建；
+/// e2e 需要真实 runner 时用它注入 `FLOW_HARNESS_AGENT_BIN`）。
+pub fn harness_agent_bin() -> PathBuf {
+    workspace_bin("flow-harness-agent")
+}
+
 pub fn journal_server_bin() -> PathBuf {
     workspace_bin("flow-journal-server")
 }

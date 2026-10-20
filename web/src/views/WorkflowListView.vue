@@ -99,6 +99,7 @@ async function onFileChange(event: Event): Promise<void> {
       `已导入 ${result.name} v${result.version}（${result.created ? "新建" : "追加版本"}，已发布）`,
     );
     await refreshWorkflows();
+    void router.push(`/workflows/${result.workflow_id}`);
   } catch (e) {
     toast.error(errText(e));
   } finally {
@@ -188,19 +189,5 @@ async function onFileChange(event: Event): Promise<void> {
 /* 长名称可能没有空白/为中文，允许折行避免横向撑破表格 */
 .wf-cell {
   word-break: break-all;
-}
-
-.error-banner {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 12px;
-  padding: 8px 12px;
-  border: 1px solid var(--danger);
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--danger) 12%, transparent);
-  color: var(--danger);
-  font-size: 12px;
 }
 </style>

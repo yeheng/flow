@@ -64,6 +64,18 @@ function config(): FlowConfig {
       data_dir: null,
       cluster: null,
     },
+    harness: {
+      agent: {
+        base_url: null,
+        model: null,
+        api: null,
+        proxy: null,
+        max_turns: null,
+        max_tool_calls_per_turn: null,
+        max_tokens: null,
+        tool_timeout_secs: null,
+      },
+    },
   };
 }
 
@@ -175,5 +187,43 @@ describe("settings execution/agent fields", () => {
     // 已废弃字段只读回显，随整包原样保留
     expect(patch.agent?.data_addr).toBeNull();
     expect(patch.execution?.remote?.data_addr).toBe("legacy-addr");
+  });
+});
+
+describe("settings harness.agent fields", () => {
+  // harness 分区标签有包含关系（base_url 的帮助文案提到 model），按 label 精确匹配
+  function exactField(w: ReturnType<typeof mount>, label: string) {
+    const f = w
+      .findAll(".field")
+      .find((el) => el.find("label").exists() && el.find("label").text().trim() === label);
+    if (!f) throw new Error(`找不到字段：${label}`);
+    return f;
+  }
+
+  it("base_url/model/api 可编辑并随整包保存；api_key 提示指向密钥管理", async () => {
+    const w = create();
+    await flushPromises();
+
+    await exactField(w, "base_url").find("input").setValue("https://api.deepseek.com/v1");
+    await exactField(w, "model").find("input").setValue("deepseek-chat");
+    const apiSelect = exactField(w, "api").find("select");
+    await apiSelect.setValue("anthropic");
+
+    await buttonByText(w, "保存（重启后生效）").trigger("click");
+    await flushPromises();
+
+    const patch = vi.mocked(api.updateConfig).mock.calls[0][0];
+    expect(patch.harness?.agent?.base_url).toBe("https://api.deepseek.com/v1");
+    expect(patch.harness?.agent?.model).toBe("deepseek-chat");
+    expect(patch.harness?.agent?.api).toBe("anthropic");
+    // 未编辑字段保持原值（整节替换语义下不丢）
+    expect(patch.harness?.agent?.proxy).toBeNull();
+    expect(patch.server?.journal_trigger_tick_secs).toBe(30);
+  });
+
+  it("成对校验提示：base_url 有帮助文案说明与 model 成对启用", async () => {
+    const w = create();
+    await flushPromises();
+    expect(w.text()).toContain("与 model 成对配置才启用");
   });
 });

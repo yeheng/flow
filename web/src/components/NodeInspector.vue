@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import { monitor } from "../state/monitor";
-import { friendlyDuration } from "../state/activity";
+import { fmtClock } from "../state/time";
+import { friendlyDuration } from "../state/time";
 import {
   nodeStateLabel,
   nodeTypeLabel,
@@ -26,10 +27,20 @@ const node = computed<TimelineNode | null>(
 // 直读按 node_id 的索引（store 侧与 logs 同步维护），不再每次全量扫 8000 行
 const nodeLogs = computed(() => monitor.logsByNode[props.nodeId] ?? []);
 
+/** 单次渲染上限：话痨节点可拖到 store 上限（万行），默认截尾只渲染最新，可一键展开 */
+const RENDER_CAP = 1500;
+const showAllLogs = ref(false);
+const visibleLogs = computed(() =>
+  showAllLogs.value || nodeLogs.value.length <= RENDER_CAP
+    ? nodeLogs.value
+    : nodeLogs.value.slice(-RENDER_CAP),
+);
+const logsTruncated = computed(() => nodeLogs.value.length > visibleLogs.value.length);
+
 /** 按 attempt 分组：重试的日志不串 */
 const logsByAttempt = computed<Array<[number, LogLine[]]>>(() => {
   const groups = new Map<number, LogLine[]>();
-  for (const line of nodeLogs.value) {
+  for (const line of visibleLogs.value) {
     const list = groups.get(line.attempt) ?? [];
     list.push(line);
     groups.set(line.attempt, list);
@@ -51,11 +62,6 @@ const hasOutput = computed(
     node.value?.state !== "pending",
 );
 
-/** 与 LogConsole 一致的时间格式 */
-function fmtTime(ts: string): string {
-  const d = new Date(ts);
-  return Number.isNaN(d.getTime()) ? ts : d.toLocaleTimeString();
-}
 </script>
 
 <template>
@@ -104,6 +110,10 @@ function fmtTime(ts: string): string {
     <details class="inspector-block" :open="nodeLogs.length > 0">
       <summary>节点日志（{{ nodeLogs.length }}）</summary>
       <p v-if="nodeLogs.length === 0" class="inspector-empty">该节点没有日志</p>
+      <p v-if="logsTruncated" class="inspector-empty">
+        仅渲染最新 {{ RENDER_CAP }} 条
+        <button type="button" class="link" @click="showAllLogs = true">显示全部</button>
+      </p>
       <div v-for="[attempt, lines] in logsByAttempt" :key="attempt" class="inspector-attempt">
         <p class="inspector-attempt-label">第 {{ attempt }} 次尝试</p>
         <div
@@ -112,7 +122,7 @@ function fmtTime(ts: string): string {
           class="inspector-log"
           :class="`log-${line.level}`"
         >
-          <span class="log-ts">{{ fmtTime(line.ts) }}</span>
+          <span class="log-ts">{{ fmtClock(line.ts) }}</span>
           <span class="inspector-log-level">{{ line.level }}</span>
           <span class="inspector-log-msg">{{ line.message }}</span>
         </div>

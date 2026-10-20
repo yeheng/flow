@@ -1227,7 +1227,9 @@ impl TaskRunner {
         audit: &mut AuditStream,
         logger: &flow_engine::NodeLogger,
     ) -> Result<ResultOutcome, TaskError> {
-        // 恢复路径：已有 Outcome 直接派生输出，不重跑进程。
+        // 恢复路径：已有 Outcome 直接派生输出，不重跑进程。两种模式的
+        // outcome 形状不同（agent 带 agent_error/agent 元数据），按节点
+        // mode 选派生函数——mode 是保存期校验过的字面量。
         if let Some(outcome_value) = self
             .task
             .previous_outcome
@@ -1237,7 +1239,11 @@ impl TaskRunner {
             logger.info("已有捕获的 operation outcome，不重复启动进程（恢复）");
             let outcome: StoredValue =
                 serde_json::from_value(outcome_value).map_err(TaskError::from)?;
-            let output = self.harness_output(&outcome, audit).await?;
+            let output = if self.node_is_agent_mode() {
+                self.agent_output_from_outcome(&outcome, audit).await?
+            } else {
+                self.harness_output(&outcome, audit).await?
+            };
             return Ok(ResultOutcome::Success {
                 output,
                 branch: None,
@@ -1251,6 +1257,9 @@ impl TaskRunner {
                 &mut budget,
             )
             .await?;
+        if self.node_is_agent_mode() {
+            return self.agent_node(&params, audit, logger).await;
+        }
         let (command, args, workdir, timeout_ms, prompt) =
             flow_engine::exec::harness_request(&params)
                 .map_err(|e| TaskError::Business(e.message))?;
@@ -1352,6 +1361,304 @@ impl TaskRunner {
 
     fn is_regression(&self) -> bool {
         self.task.node.pointer("/_flow_execution/regression") == Some(&Value::Bool(true))
+    }
+
+    /// mode 是否为 agent。`mode` 是保存期校验过的字面量（禁止模板），
+    /// 原始节点参数即可判定，不需要等模板展开。
+    fn node_is_agent_mode(&self) -> bool {
+        self.task
+            .node
+            .get("params")
+            .and_then(|params| params.get("mode"))
+            .and_then(Value::as_str)
+            .is_some_and(|mode| mode.trim() == "agent")
+    }
+
+    /// harness agent 模式：内置 flow-harness-agent runner 子进程。授权 /
+    /// Outcome / 恢复 / 回归与 command 模式同一条骨架；差异是请求构造
+    /// （冻结配置 + 密钥名）、runner 环境（临时根 + 非敏感 `CONGA_*`）
+    /// 与输出派生（附 agent 元数据）。
+    async fn agent_node(
+        &mut self,
+        params: &Value,
+        audit: &mut AuditStream,
+        logger: &flow_engine::NodeLogger,
+    ) -> Result<ResultOutcome, TaskError> {
+        let agent_params =
+            flow_engine::exec::agent_params(params).map_err(|e| TaskError::Business(e.message))?;
+        let timeout_ms = agent_params
+            .timeout_ms
+            .clamp(1, flow_engine::exec::HARNESS_TIMEOUT_MAX_MS);
+        // 配置缺失/畸形发生在授权之前：请求指纹必须包含冻结配置，没有它
+        // 就无法授权，也就没有可落账的 operation——直接 Business。
+        let config = flow_engine::exec::frozen_agent_config(&self.task.node)
+            .map_err(TaskError::Invalid)?
+            .ok_or_else(|| {
+                TaskError::Business(
+                    "harness agent 配置未随派发下发（[harness.agent] 未配置，或 master \
+                     版本过旧）；无法构造授权请求"
+                        .into(),
+                )
+            })?;
+        let request = flow_engine::exec::agent_request(
+            &flow_engine::exec::AgentParams {
+                prompt: agent_params.prompt.clone(),
+                workdir: agent_params.workdir.clone(),
+                api_key: agent_params.api_key.clone(),
+                timeout_ms,
+            },
+            &config,
+        );
+        if self.is_regression() {
+            // 0 runner / 0 网络：指纹比较用 baseline 冻结的配置构造。
+            let outcome = self.fixture_outcome(&request)?;
+            let output = self.agent_output_from_outcome(&outcome, audit).await?;
+            return Ok(ResultOutcome::Success {
+                output,
+                branch: None,
+            });
+        }
+        // workdir 运行期校验（授权前）：保存期只查了字面量；存在性与
+        // canonicalize 是本机事实，remote 模式下只有 executor 看得到。
+        let workdir = std::path::Path::new(&agent_params.workdir)
+            .canonicalize()
+            .map_err(|e| {
+                TaskError::Business(format!(
+                    "harness agent workdir 不可用（{}）：{e}",
+                    agent_params.workdir
+                ))
+            })?;
+        if !workdir.is_dir() {
+            return Err(TaskError::Business(format!(
+                "harness agent workdir 不是目录：{}",
+                workdir.display()
+            )));
+        }
+        let credential = self.authorize_operation(request).await?;
+        // prompt/密钥不进日志：只记模型、工作目录与超时。
+        logger.info(format!(
+            "→ harness agent（model {}，workdir {}，timeout {timeout_ms}ms）",
+            config.model,
+            workdir.display()
+        ));
+        let Some(api_key) = credential.filter(|key| !key.trim().is_empty()) else {
+            // 授权成功但凭据缺失：确定性失败，落 outcome B 让恢复派生稳定。
+            let outcome = StoredValue::inline(json!({
+                "agent_error": format!(
+                    "密钥 {} 未配置或为空（设置页密钥管理；环境兜底 FLOW_SECRET_*）",
+                    agent_params.api_key
+                ),
+            }))?;
+            return self
+                .commit_agent_failure(
+                    outcome,
+                    audit,
+                    format!("harness agent credential missing: {}", agent_params.api_key),
+                )
+                .await;
+        };
+        let started = std::time::Instant::now();
+        let roots =
+            std::env::temp_dir().join(format!("flow-harness-{}", uuid::Uuid::now_v7().simple()));
+        let result = self
+            .agent_run(
+                &config,
+                &agent_params.prompt,
+                &api_key,
+                &workdir,
+                timeout_ms,
+                &roots,
+                audit,
+                logger,
+            )
+            .await;
+        // 成功/失败/超时/取消都收走临时根；Windows 上文件锁可能让删除失败，
+        // 重试一次，仍失败交给 OS 的 tmp 清理兜底。
+        if std::fs::remove_dir_all(&roots).is_err() {
+            std::thread::sleep(Duration::from_millis(100));
+            let _ = std::fs::remove_dir_all(&roots);
+        }
+        let _ = started;
+        result
+    }
+
+    /// 授权后的 runner 执行段。确定性失败（临时根不可建、runner 缺失、
+    /// 输出不可解析）落封闭 outcome；超时/取消/IO 失败原样传播 Uncertain。
+    #[allow(clippy::too_many_arguments)]
+    async fn agent_run(
+        &mut self,
+        config: &flow_engine::AgentRunConfig,
+        prompt: &str,
+        api_key: &str,
+        workdir: &std::path::Path,
+        timeout_ms: u64,
+        roots: &std::path::Path,
+        audit: &mut AuditStream,
+        logger: &flow_engine::NodeLogger,
+    ) -> Result<ResultOutcome, TaskError> {
+        std::fs::create_dir_all(roots.join("tmp"))
+            .map_err(|e| TaskError::Business(format!("harness agent 临时目录创建失败：{e}")))?;
+        let runner = match resolve_runner_bin() {
+            Ok(runner) => runner,
+            Err(error) => {
+                let outcome = StoredValue::inline(json!({ "agent_error": error.clone() }))?;
+                return self
+                    .commit_agent_failure(outcome, audit, format!("harness agent: {error}"))
+                    .await;
+            }
+        };
+        let started = std::time::Instant::now();
+        let mut child = match flow_engine::process::ManagedChild::spawn_harness(
+            &mut flow_engine::exec::agent_command(&runner, roots, config),
+        ) {
+            Ok(child) => child,
+            Err(error) => {
+                logger.error(format!("harness agent 启动失败：{error}"));
+                let outcome = StoredValue::inline(json!({ "spawn_error": error.to_string() }))?;
+                return self
+                    .commit_agent_failure(
+                        outcome,
+                        audit,
+                        format!("harness agent spawn failed: {error}"),
+                    )
+                    .await;
+            }
+        };
+        let stdin_payload =
+            flow_engine::exec::agent_stdin(prompt, api_key, &workdir.to_string_lossy());
+        let output = capture_harness(
+            &mut child,
+            &stdin_payload,
+            Duration::from_millis(timeout_ms),
+            &self.cancel,
+        )
+        .await?;
+        let exit_code = output.status.code();
+        logger.info(format!(
+            "← exit {}（{}ms，stdout {}B）",
+            exit_code.map_or_else(|| "signal".into(), |code| code.to_string()),
+            started.elapsed().as_millis(),
+            output.stdout.len()
+        ));
+        let parsed = match flow_engine::exec::parse_agent_result(&output.stdout) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                let outcome = StoredValue::inline(json!({
+                    "agent_error": format!("runner output invalid: {error}"),
+                    "stderr": flow_engine::exec::stderr_tail(
+                        &String::from_utf8_lossy(&output.stderr)
+                    ),
+                }))?;
+                return self
+                    .commit_agent_failure(
+                        outcome,
+                        audit,
+                        format!("harness agent output invalid: {error}"),
+                    )
+                    .await;
+            }
+        };
+        // runner 的 error 行同时进 stderr（A6）：Business 文案不只剩退出码。
+        let mut stderr = flow_engine::exec::stderr_tail(&String::from_utf8_lossy(&output.stderr));
+        if let Some(error) = &parsed.error {
+            stderr.push_str(&format!("\n[agent] {error}"));
+        }
+        let raw_stored = store_bytes(
+            audit,
+            &self.journal_id,
+            parsed.text.as_bytes(),
+            ValueCodec::Bytes,
+        )
+        .await?;
+        let body_ref = match &raw_stored {
+            StoredValue::Ref(reference) => serde_json::to_value(reference)?,
+            StoredValue::Inline(value) => value.clone(),
+        };
+        if let StoredValue::Ref(reference) = &raw_stored {
+            if !reference.output_id.is_empty() {
+                self.transfers.insert_ready(
+                    TransferKey::OperationBody(reference.output_id.clone()).to_wire(),
+                    parsed.text.as_bytes().to_vec(),
+                );
+            }
+        }
+        let agent_meta = json!({
+            "model": config.model,
+            "stop_reason": parsed.stop_reason,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+        });
+        let outcome = StoredValue::inline(json!({
+            "exit_code": exit_code,
+            "body_raw": body_ref,
+            "stderr": stderr,
+            "agent": agent_meta,
+        }))?;
+        let outcome_seq = audit.push(
+            "operation_outcome",
+            json!({"outcome": serde_json::to_value(&outcome)?}),
+        )?;
+        audit.await_durable(outcome_seq, &self.cancel).await?;
+        let output = self.agent_output_from_outcome(&outcome, audit).await?;
+        Ok(ResultOutcome::Success {
+            output,
+            branch: None,
+        })
+    }
+
+    /// agent 模式的 Outcome → 节点输出（恢复与首跑共用同一派生）。
+    /// 封闭形状：`spawn_error` / `agent_error` / 正常三选一。
+    async fn agent_output_from_outcome(
+        &mut self,
+        outcome: &StoredValue,
+        audit: &mut AuditStream,
+    ) -> Result<StoredValue, TaskError> {
+        let outcome_value = match outcome {
+            StoredValue::Inline(value) => value.clone(),
+            StoredValue::Ref(_) => return Err(TaskError::Invalid("outcome must be inline".into())),
+        };
+        if let Some(error) = outcome_value["spawn_error"].as_str() {
+            return Err(TaskError::Business(format!(
+                "harness agent spawn failed: {error}"
+            )));
+        }
+        if let Some(error) = outcome_value["agent_error"].as_str() {
+            return Err(TaskError::Business(format!("harness agent error: {error}")));
+        }
+        let exit_code = outcome_value["exit_code"].as_i64().map(|code| code as i32);
+        let stderr = outcome_value["stderr"].as_str().unwrap_or("").to_owned();
+        let agent = outcome_value.get("agent").cloned().unwrap_or(Value::Null);
+        let raw: flow_journal::ValueRef =
+            serde_json::from_value(outcome_value["body_raw"].clone()).map_err(TaskError::from)?;
+        if raw.total_bytes > 8 * 1024 * 1024 {
+            return Err(TaskError::Business(
+                "agent text exceeds 8 MiB; raw outcome retained".into(),
+            ));
+        }
+        let stdout = self.raw_bytes(&raw).await?;
+        let output = flow_engine::exec::agent_output(
+            exit_code,
+            String::from_utf8_lossy(&stdout).into_owned(),
+            stderr,
+            agent,
+        )
+        .map_err(|e| TaskError::Business(format!("{}; outcome retained", e.message)))?;
+        store_value(audit, &self.journal_id, &output, 8 * 1024 * 1024).await
+    }
+
+    /// 落一个封闭失败 outcome（B/C 形状）并以 Business 收口；恢复路径经
+    /// [`Self::agent_output_from_outcome`] 重放同一失败文案。
+    async fn commit_agent_failure(
+        &mut self,
+        outcome: StoredValue,
+        audit: &mut AuditStream,
+        message: String,
+    ) -> Result<ResultOutcome, TaskError> {
+        let outcome_seq = audit.push(
+            "operation_outcome",
+            json!({"outcome": serde_json::to_value(&outcome)?}),
+        )?;
+        audit.await_durable(outcome_seq, &self.cancel).await?;
+        Err(TaskError::Business(message))
     }
 
     fn fixture_outcome(&self, request: &Value) -> Result<StoredValue, TaskError> {
@@ -1587,6 +1894,26 @@ fn elapsed_label(elapsed: Duration) -> String {
 
 #[allow(dead_code)]
 fn unused() {}
+
+/// runner 定位：`FLOW_HARNESS_AGENT_BIN`（部署事实，spawn 时由 master/agent
+/// 透传）优先；否则取 executor 自身可执行文件同目录的兄弟。找不到是部署
+/// 错误，文案直接指向两种修法。
+fn resolve_runner_bin() -> Result<std::path::PathBuf, String> {
+    if let Some(bin) = std::env::var_os("FLOW_HARNESS_AGENT_BIN") {
+        if !bin.is_empty() {
+            return Ok(std::path::PathBuf::from(bin));
+        }
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("flow-harness-agent")))
+        .filter(|path| path.exists())
+        .ok_or_else(|| {
+            "flow-harness-agent 未找到：期望与 flow-executor 同目录分发，或设置 \
+             FLOW_HARNESS_AGENT_BIN 指向其绝对路径"
+                .to_string()
+        })
+}
 
 /// Capture all three pipes concurrently under one deadline. Partial output is never success.
 async fn capture_harness(

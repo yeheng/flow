@@ -231,3 +231,47 @@ pub fn command_scope(method: &str, params: &Value) -> String {
         other => other.into(),
     }
 }
+
+/// `[harness.agent]` 的运行期形态：run 启动时冻结进 `ExecutionSnapshot`，
+/// 派发时随 `_flow_execution.agent` 下发，并进 operation 请求（回归指纹）。
+///
+/// 只含非敏感标量——API key 只以密钥名出现在节点参数（`x-secret`），真值经
+/// `OperationPermit` → executor 内存 → runner stdin，任何环境变量都不携带。
+/// runner 侧经 conga 的 `CONGA_*` 环境变量面消费（变量名契约由固定 rev 锁步）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentRunConfig {
+    /// OpenAI 兼容 / Anthropic 端点；与 model 成对出现（空 = 未启用 agent 模式）。
+    pub base_url: String,
+    pub model: String,
+    /// `openai`（默认，OpenAI 兼容）| `anthropic`。
+    pub api: String,
+    /// LLM 出口代理（http(s)://host:port；禁 userinfo/query）。
+    pub proxy: Option<String>,
+    pub max_turns: Option<u64>,
+    pub max_tool_calls_per_turn: Option<u64>,
+    pub max_tokens: Option<u64>,
+    pub tool_timeout_secs: Option<u64>,
+}
+
+impl Default for AgentRunConfig {
+    fn default() -> Self {
+        AgentRunConfig {
+            base_url: String::new(),
+            model: String::new(),
+            api: "openai".into(),
+            proxy: None,
+            max_turns: None,
+            max_tool_calls_per_turn: None,
+            max_tokens: None,
+            tool_timeout_secs: None,
+        }
+    }
+}
+
+impl AgentRunConfig {
+    /// base_url 与 model 都非空才算启用；任一为空 = `[harness.agent]` 未配置。
+    pub fn enabled(&self) -> bool {
+        !self.base_url.trim().is_empty() && !self.model.trim().is_empty()
+    }
+}

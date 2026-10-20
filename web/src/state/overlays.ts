@@ -65,11 +65,6 @@ export function overlaysOf<P>(kind: string): OverlayEntry<P>[] {
   return stack.entries.filter((e) => e.kind === kind) as OverlayEntry<P>[];
 }
 
-/** 某 kind 是否在栈顶（弹层内部「吞快捷键」等判定用） */
-export function isOverlayTop(kind: string): boolean {
-  return topOverlay.value?.kind === kind;
-}
-
 let escInstalled = false;
 
 /**

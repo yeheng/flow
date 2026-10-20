@@ -335,12 +335,18 @@ impl DispatchRunner {
             if let Some(fixture) = fixture {
                 previous_outcome = Some(serde_json::to_value(&fixture.outcome)?);
             }
-            node_value["_flow_execution"] = json!({
+            let mut execution_value = json!({
                 "runtime": execution.runtime, "clock_ms":execution.clock_ms,
                 "seed": format!("{}:{}", execution.seed, execution.node_key(&self.node.id)),
                 "regression": execution.regression.is_some(),
                 "fixture_fingerprint": fixture.map(|f| &f.fingerprint),
             });
+            // 冻结的 agent 配置（与 operation 请求里的 agent 是同一份快照的
+            // 两次序列化；测试断言两者相等）。旧 journal / 未配置时无此键。
+            if let Some(agent) = &execution.agent {
+                execution_value["agent"] = serde_json::to_value(agent)?;
+            }
+            node_value["_flow_execution"] = execution_value;
         }
         let task = flow_engine::execution_protocol::ExecuteTask {
             run_id: self.attempt.run_id.clone(),

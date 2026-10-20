@@ -350,12 +350,31 @@ export interface JournalConfig {
   } | null;
 }
 
+/** `[harness.agent]`：harness 节点 agent 模式的模型配置（run 启动时冻结） */
+export interface HarnessAgentConfig {
+  base_url: string | null;
+  model: string | null;
+  /** openai（默认，OpenAI 兼容）| anthropic */
+  api: string | null;
+  /** LLM 出口代理；禁止 userinfo/query */
+  proxy: string | null;
+  max_turns: number | null;
+  max_tool_calls_per_turn: number | null;
+  max_tokens: number | null;
+  tool_timeout_secs: number | null;
+}
+
+export interface HarnessConfig {
+  agent: HarnessAgentConfig;
+}
+
 export interface FlowConfig {
   server: ServerConfig;
   storage: StorageConfig;
   execution: ExecutionConfig;
   agent: AgentConfig;
   journal: JournalConfig;
+  harness: HarnessConfig;
 }
 
 /** config.get / config.update 的响应 */
@@ -389,7 +408,6 @@ export interface TimelineNode {
   child_run_id?: string;
 }
 
-export type RunPhase = "running" | "succeeded" | "failed" | "cancelled";
 
 /** run.adjudicate 的人工决定：接受产出 / 人工授权重发 / 判定失败（服务端词汇表） */
 export type AdjudicateDecision = "accept_output" | "retry" | "failed";

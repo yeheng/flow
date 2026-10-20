@@ -75,3 +75,16 @@ x_max = 4
 # - FLOW_JOURNAL_TOKEN（每工作区凭据，仅环境变量）
 # - 执行协议常量（帧上限/超时族，crates/flow-engine/src/execution_protocol/contract.rs，改即协议变更）
 # - FLOW_RUN_LOG_BUDGET 等 engine 内部预算（读取点在 driver 深处，维持环境变量）
+
+# harness 节点 agent 模式（内置 flow-harness-agent，复用 conga-host 无头装配）
+# base_url 与 model 成对配置才启用；api_key 不在这里——节点参数只存密钥名称，
+# 真值经密钥管理（secrets.*：stored 优先、FLOW_SECRET_* 兜底）下发。
+# [harness.agent]
+# base_url = "https://api.deepseek.com/v1"
+# model = "deepseek-chat"
+# api = "openai"                  # openai（OpenAI 兼容，默认）| anthropic
+# proxy = "http://127.0.0.1:7890" # 禁止 userinfo/query（代理凭据不进请求/journal）
+# max_turns = 50                  # 1..=200
+# max_tool_calls_per_turn = 20    # 1..=100
+# max_tokens = 4096               # 1..=1_000_000
+# tool_timeout_secs = 600         # 省略 = 无引擎级工具超时（取消/超时由 executor 杀进程组）

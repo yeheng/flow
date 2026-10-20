@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, useId, watch } from "vue";
-import { selectedNode } from "../state/editor";
+import { computed, nextTick, ref, useId, watch } from "vue";
+import { nodeValidationError, selectedNode } from "../state/editor";
+import { useModalFocusTrap } from "../state/modal-a11y";
 import { commitParams } from "../state/history";
 import { overlaysOf, type OverlayEntry } from "../state/overlays";
 import SchemaField from "./SchemaField.vue";
@@ -15,6 +16,8 @@ const node = selectedNode;
 const data = computed(() => node.value?.data ?? null);
 const desc = computed(() => data.value?.nodeType ?? null);
 const schema = computed(() => desc.value?.params_schema ?? null);
+// 校验错误内联展示：弹层盖住画布，节点上的红框在编辑期间不可见
+const invalidMsg = computed(() => (node.value ? nodeValidationError(node.value.id) : null));
 const nameInput = ref<HTMLInputElement>();
 
 /** 开 = 栈上有 params 条目且选中节点还在；Esc 由全局弹层栈关栈顶，此处不再监听 */
@@ -56,30 +59,8 @@ function close(): void {
   entry.value?.close();
 }
 
-// Tab 挂 window：点过消息区、焦点跑到弹窗外也循环（Esc 走全局弹层栈）
-function onWindowKeydown(e: KeyboardEvent): void {
-  if (!open.value || e.key !== "Tab") return;
-  trapTab(e);
-}
-
-/** Tab 焦点只在弹窗内循环；内部非边缘焦点交给控件本身（Monaco 靠 Tab 缩进） */
-const FOCUSABLE = 'button, [href], input, textarea, select, [tabindex]:not([tabindex="-1"])';
-
-function trapTab(e: KeyboardEvent): void {
-  const items = Array.from(dialogEl.value?.querySelectorAll<HTMLElement>(FOCUSABLE) ?? []).filter(
-    (el) => !el.hasAttribute("disabled"),
-  );
-  if (items.length === 0) return;
-  const active = document.activeElement;
-  const inside = dialogEl.value?.contains(active) ?? false;
-  const edge = e.shiftKey ? items[0] : items[items.length - 1];
-  if (inside && active !== edge) return;
-  e.preventDefault();
-  (e.shiftKey ? items[items.length - 1] : items[0]).focus();
-}
-
-onMounted(() => window.addEventListener("keydown", onWindowKeydown));
-onUnmounted(() => window.removeEventListener("keydown", onWindowKeydown));
+// Tab 焦点圈定在弹层内（Esc 走全局弹层栈）
+useModalFocusTrap(dialogEl, open);
 
 function onName(ev: Event): void {
   if (!data.value || !node.value) return;
@@ -129,6 +110,7 @@ function setRetry(key: "max_attempts" | "backoff_ms", ev: Event): void {
       </header>
       <div class="params-body">
         <template v-if="node && data && desc">
+          <p v-if="invalidMsg" role="alert" class="params-invalid">{{ invalidMsg }}</p>
           <div class="field">
             <label>节点 id</label>
             <div class="field-static">{{ node.id }}</div>
@@ -253,6 +235,17 @@ function setRetry(key: "max_attempts" | "backoff_ms", ev: Event): void {
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+.params-invalid {
+  margin: 0;
+  padding: 8px 12px;
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .params-footer {

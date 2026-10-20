@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from "vue";
 import * as api from "../api/flow";
 import { errText } from "../rpc/client";
 import { comparisonRows, comparisonSummary } from "../state/regression";
+import { useModalFocusTrap } from "../state/modal-a11y";
 import type { OverlayEntry } from "../state/overlays";
 import type { RunComparison } from "../types";
 import AppButton from "./AppButton.vue";
@@ -28,6 +29,10 @@ const error = ref("");
 function close(): void {
   props.entry.close();
 }
+
+// Tab 焦点圈定在弹层内（此前没有陷阱，Tab 会穿透到背后页面）
+const dialogEl = ref<HTMLElement | null>(null);
+useModalFocusTrap(dialogEl, ref(true));
 
 const summary = computed(() => (report.value ? comparisonSummary(report.value) : null));
 const rows = computed(() => (report.value ? comparisonRows(report.value.differences) : []));
@@ -60,7 +65,7 @@ onMounted(async () => {
 
 <template>
   <div class="compare-overlay" @click.self="close">
-    <div class="compare-modal" role="dialog" aria-modal="true" aria-label="与基线比较">
+    <div ref="dialogEl" class="compare-modal" role="dialog" aria-modal="true" aria-label="与基线比较">
       <header class="compare-header">
         <h3>与基线比较</h3>
         <span class="muted compare-subtitle mono">候选 {{ candidateRunId.slice(0, 8) }}…</span>

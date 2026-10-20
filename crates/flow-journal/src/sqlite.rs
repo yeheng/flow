@@ -174,8 +174,10 @@ pub fn transaction_with_size(
         )
         .map_err(db)?;
     // rusqlite 0.38 dropped u64/usize FromSql/ToSql; SQLite integers are i64.
-    let count: usize = usize::try_from(count).map_err(|_| invalid("invalid stored transaction metadata"))?;
-    let recorded_bytes = u64::try_from(recorded_bytes).map_err(|_| invalid("invalid stored transaction metadata"))?;
+    let count: usize =
+        usize::try_from(count).map_err(|_| invalid("invalid stored transaction metadata"))?;
+    let recorded_bytes = u64::try_from(recorded_bytes)
+        .map_err(|_| invalid("invalid stored transaction metadata"))?;
     let mut statement = conn
         .prepare("SELECT event_index,body,run_id,dispatch_id,run_event,audit_event FROM events WHERE lsn=? ORDER BY event_index")
         .map_err(db)?;
@@ -209,8 +211,8 @@ pub fn transaction_with_size(
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
                 .map_err(db)?;
-            let indexed_chunk = u64::try_from(indexed_chunk)
-                .map_err(|_| invalid("invalid stored chunk index"))?;
+            let indexed_chunk =
+                u64::try_from(indexed_chunk).map_err(|_| invalid("invalid stored chunk index"))?;
             if Some(output.as_str()) != event.payload["output_id"].as_str()
                 || Some(indexed_chunk)
                     != event.payload["chunk_index"]

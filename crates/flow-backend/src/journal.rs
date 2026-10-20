@@ -73,9 +73,30 @@ pub struct JournalBackend {
     /// 是天然缓存键——每个 run 只物化一次（从 journal 值目录拼 chunk），
     /// 终态即逐出。调度循环每个 tick 都要用定义，不该每趟重读磁盘。
     definitions: Mutex<std::collections::HashMap<String, Arc<flow_engine::Definition>>>,
+    /// 启动时安装的 `[harness.agent]` 运行配置：**新 run 快照的唯一来源**。
+    /// 派发时从 `run.execution.agent` 读冻结值，不从这里现取——配置在进程
+    /// 重启后修改只影响新 run，in-flight run 的重试/恢复身份不变。
+    harness_agent: std::sync::OnceLock<Option<flow_dto::AgentRunConfig>>,
 }
 
 impl JournalBackend {
+    /// 安装启动时解析的 `[harness.agent]` 配置（`start_execution` 的唯一
+    /// 调用点；重复调用是编程错误，fail loud）。`None` = 未启用。
+    pub fn install_harness_agent(
+        &self,
+        config: Option<flow_dto::AgentRunConfig>,
+    ) -> std::result::Result<(), &'static str> {
+        self.harness_agent
+            .set(config)
+            .map(|_| ())
+            .map_err(|_| "harness agent config installed twice; startup path must call this once")
+    }
+
+    /// 新 run 快照的 agent 配置来源：未安装（旧调用路径/测试）视为未启用。
+    pub(crate) fn harness_agent_config(&self) -> Option<flow_dto::AgentRunConfig> {
+        self.harness_agent.get().cloned().flatten()
+    }
+
     pub async fn open(root: &Path, options: JournalOptions) -> Result<Arc<Self>> {
         let journal = Journal::open(root, options).await?;
         let store = Arc::new(
@@ -107,6 +128,7 @@ impl JournalBackend {
             coordinator_ticks: AtomicU64::new(0),
             coordinator_last_tick_ms: AtomicI64::new(0),
             definitions: Mutex::new(std::collections::HashMap::new()),
+            harness_agent: std::sync::OnceLock::new(),
         });
         Ok(backend)
     }

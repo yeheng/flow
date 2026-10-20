@@ -2,6 +2,7 @@
 import { computed, nextTick, ref, watch } from "vue";
 import { editor } from "../state/editor";
 import { overlaysOf, type OverlayEntry } from "../state/overlays";
+import { useModalFocusTrap } from "../state/modal-a11y";
 import {
   saveSelectionAsTemplate,
   templateCategoryOptions,
@@ -25,6 +26,10 @@ const entry = computed<OverlayEntry<TemplateSavePayload> | null>(
   () => overlaysOf<TemplateSavePayload>("biz-save")[0] ?? null,
 );
 const open = computed(() => !!entry.value);
+
+// Tab 焦点圈定在弹层内（此前没有陷阱，Tab 会穿透到背后页面）
+const dialogEl = ref<HTMLElement | null>(null);
+useModalFocusTrap(dialogEl, open);
 
 const selectedCount = computed(() => editor.nodes.filter((n) => n.selected).length);
 const categoryOptions = computed(() => templateCategoryOptions());
@@ -70,6 +75,7 @@ async function submit(): Promise<void> {
 <template>
   <div v-if="open" class="biz-overlay" @click.self="cancel">
     <form
+      ref="dialogEl"
       class="biz-modal"
       role="dialog"
       aria-modal="true"

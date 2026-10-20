@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import * as api from "../api/flow";
 import { errText } from "../rpc/client";
@@ -14,10 +14,13 @@ import {
   RUN_STATUS_OPTIONS,
   serializeRunFilters,
 } from "../state/run-list";
-import { runBadgeClass, runStatusLabel, sourceLabel } from "../state/labels";
+import { runBadgeClass, runStatusLabel, sourceLabel, TERMINAL_RUN_STATUSES } from "../state/labels";
 import { regressionBaseline } from "../state/regression";
+import { fmtTime, runDuration } from "../state/time";
 import { staleGuard } from "../state/stale";
+import { usePolling } from "../state/polling";
 import { toast } from "../state/toast";
+import { copyWithToast } from "../state/clipboard";
 import type { RunRecord } from "../types";
 import AppButton from "../components/AppButton.vue";
 
@@ -39,6 +42,8 @@ const loadingMore = ref(false);
 const loaded = ref(false);
 /** 轮询失败只在 ok→error 跳变时 toast，避免每 3s 重复弹错 */
 const pollFailed = ref(false);
+/** 最近一次刷新的错误：表区无数据时升级为横幅（否则"暂无运行记录"是假空态） */
+const loadError = ref<string | null>(null);
 /** 正在取消的 run id：只禁用对应行的取消按钮 */
 const cancellingId = ref<string | null>(null);
 /**
@@ -48,7 +53,6 @@ const cancellingId = ref<string | null>(null);
 const degraded = ref(false);
 /** 降级扫描被上限截断：更旧数据未知 */
 const degradedScanTruncated = ref(false);
-let timer: ReturnType<typeof setInterval> | null = null;
 /** 轮询在途守卫：断线重连等慢响应场景下请求不叠加 */
 let refreshing = false;
 
@@ -58,20 +62,6 @@ const workflowNames = computed(() => new Map(editor.workflows.map((w) => [w.work
 const STATUS_OPTIONS = RUN_STATUS_OPTIONS;
 const SOURCE_OPTIONS = RUN_SOURCE_OPTIONS;
 
-function fmtTime(iso: string | null): string {
-  if (!iso) return "—";
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
-}
-
-function fmtDuration(r: RunRecord): string {
-  if (!r.ended_at) return "—";
-  const ms = new Date(r.ended_at).getTime() - new Date(r.started_at).getTime();
-  if (Number.isNaN(ms)) return "—";
-  if (ms < 1000) return `${ms}ms`;
-  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
-  return `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s`;
-}
 
 /** 请求代际：筛选/工作流变化时作废在飞响应（staleGuard，全站同一份原语） */
 const listStale = staleGuard();
@@ -99,13 +89,8 @@ function resetAndRefresh(): void {
   void refresh();
 }
 
-/** 降级扫描：停掉轮询，改为手动刷新（每次扫描是 O(n) 全量走键） */
-function stopPolling(): void {
-  if (timer) {
-    clearInterval(timer);
-    timer = null;
-  }
-}
+/** 页面激活期间每 3 秒轮询首页（页面不可见自动暂停）；降级扫描时 stop 切手动刷新 */
+const { stop: stopPolling } = usePolling(refresh, 3000);
 
 /** 轮询只刷首页（最新的 PAGE_SIZE 条），已翻出的旧页保持不动。
  * 多取一条探测是否还有更旧数据，避免「总数恰好整除页大小」时 hasMore 假阳性 */
@@ -133,6 +118,7 @@ async function refresh(): Promise<void> {
     }
     runs.value = mergeRunPage(page, runs.value);
     pollFailed.value = false;
+    loadError.value = null;
   } catch (e) {
     if (listStale.stale(gen)) return;
     if (isResponseTooLarge(e)) {
@@ -142,6 +128,7 @@ async function refresh(): Promise<void> {
       pendingRefresh = true;
       stopPolling();
     } else {
+      loadError.value = errText(e);
       if (!pollFailed.value) toast.error(errText(e));
       pollFailed.value = true;
     }
@@ -199,12 +186,7 @@ async function onCancel(r: RunRecord): Promise<void> {
 }
 
 async function copyRunId(id: string): Promise<void> {
-  try {
-    await navigator.clipboard.writeText(id);
-    toast.success("已复制 run id");
-  } catch {
-    toast.error("复制失败，请手动复制");
-  }
+  await copyWithToast(id, "run id");
 }
 
 /** 筛选变化 → 同步路由 query（空值不入 URL），再回到第一页 */
@@ -234,12 +216,8 @@ watch(
 onMounted(async () => {
   if (editor.workflows.length === 0) await refreshWorkflows();
   await refresh();
-  // 页面激活期间每 3 秒轮询；降级模式是全量扫描，只保留手动刷新
-  if (!degraded.value) timer = setInterval(() => void refresh(), 3000);
-});
-
-onUnmounted(() => {
-  stopPolling();
+  // 降级模式是全量扫描，只保留手动刷新（轮询由 usePolling 统一管理）
+  if (degraded.value) stopPolling();
 });
 
 watch(() => props.workflowId, resetAndRefresh);
@@ -310,11 +288,12 @@ watch(() => props.workflowId, resetAndRefresh);
             </RouterLink>
           </td>
           <td :title="r.started_at">{{ fmtTime(r.started_at) }}</td>
-          <td>{{ fmtDuration(r) }}</td>
+          <td>{{ runDuration(r.started_at, r.ended_at) }}</td>
           <td class="actions">
             <RouterLink class="link" :to="`/runs/${r.id}`">详情</RouterLink>
+            <!-- 非终态即可取消（含挂起等续跑的 awaiting_resume；服务端对终态 no-op） -->
             <AppButton
-              v-if="r.status === 'running'"
+              v-if="!TERMINAL_RUN_STATUSES.has(r.status)"
               variant="link-danger"
               :disabled="cancellingId === r.id"
               @click="onCancel(r)"
@@ -331,6 +310,10 @@ watch(() => props.workflowId, resetAndRefresh);
       <template v-if="degradedScanTruncated"> · 扫描被截断，更旧数据未知</template>
     </p>
     <p v-if="!loaded" class="wf-empty">加载中…</p>
+    <div v-else-if="loadError && runs.length === 0" role="alert" class="error-banner">
+      <span>加载运行记录失败：{{ loadError }}</span>
+      <AppButton variant="link" @click="resetAndRefresh">重试</AppButton>
+    </div>
     <p v-else-if="runs.length === 0" class="wf-empty">暂无运行记录</p>
     <div v-if="hasMore" class="load-more">
       <AppButton :disabled="loadingMore" @click="loadMore">加载更多</AppButton>
@@ -360,24 +343,6 @@ watch(() => props.workflowId, resetAndRefresh);
   display: flex;
   align-items: center;
   gap: 10px;
-}
-
-/* copy-cell 按钮化：剥掉 button 默认外观，保持原可点击文本单元格样式 */
-.copy-id {
-  background: none;
-  border: none;
-  padding: 0;
-  color: inherit;
-  font: inherit;
-  font-family: var(--mono);
-  text-align: left;
-  cursor: pointer;
-}
-
-.copy-id:hover {
-  background: none;
-  border-color: transparent;
-  text-decoration: underline;
 }
 
 .run-regression-tag {

@@ -42,7 +42,7 @@ impl TestServer {
         // （测试二进制位于 deps/），locate() 找不到兄弟 flow-executor，
         // 因此显式指向工作区执行器产物；Windows 过渡态仍用 in_process。
         let execution = execution_config();
-        flow_backend::start_execution(&execution, &backend)
+        flow_backend::start_execution(&execution, None, &backend)
             .await
             .expect("启动执行驱动失败");
         let (handle, addr) = flow_rpc::journal_v2::serve(

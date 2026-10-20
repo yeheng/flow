@@ -7,7 +7,7 @@ describe("JSONL client",()=>{
     const receipt={committed:true,visible:false,request_id:"request",commit_cursor:{journal_id:"dataset",lsn:"7"},result:{run_id:"run"}};
     const call=vi.spyOn(RpcClient.prototype,"call").mockRejectedValueOnce(new RpcError(-32020,"COMMITTED_NOT_VISIBLE",receipt));
     const client=new JournalClient("ws://localhost:9802","secret","http://localhost:9803");
-    await expect(client.command("run.start",{workflow_id:"w"},"run.start:manual:","request")).rejects.toMatchObject({code:-32020});
+    await expect(client.call("run.start",{workflow_id:"w",request_id:"request"})).rejects.toMatchObject({code:-32020});
     expect(call.mock.calls.map(v=>v[0])).toEqual(["run.start"]);
   });
 });

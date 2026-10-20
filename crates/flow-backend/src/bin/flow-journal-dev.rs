@@ -80,8 +80,10 @@ fn main() -> std::process::ExitCode {
         .enable_all()
         .build()
         .expect("journal-dev tokio runtime");
+    let harness_agent = flow_backend::harness_agent_run_config(&loaded.config.harness.agent);
     let code = match runtime.block_on(journal_dev(
         loaded.config.execution,
+        harness_agent,
         dev.data_dir,
         dev.command,
     )) {
@@ -104,6 +106,7 @@ fn exit_fail(err: &dyn std::fmt::Display) -> std::process::ExitCode {
 
 async fn journal_dev(
     execution: flow_config::ExecutionConfig,
+    harness_agent: Option<flow_dto::AgentRunConfig>,
     data_dir: PathBuf,
     command: JournalDevCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -198,7 +201,7 @@ async fn journal_dev(
         .filter(|r| !r.terminal())
         .map(|r| r.run_id.clone())
         .collect::<BTreeSet<_>>();
-    flow_backend::start_execution(&execution, &backend).await?;
+    flow_backend::start_execution(&execution, harness_agent, &backend).await?;
     while !pending.is_empty() {
         tokio::select! {_=tokio::signal::ctrl_c()=>break,_=tokio::time::sleep(std::time::Duration::from_millis(100))=>{}}
         for run in backend

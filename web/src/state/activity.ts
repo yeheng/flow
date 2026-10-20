@@ -53,16 +53,6 @@ export function runProgress(nodes: TimelineNode[]): { done: number; total: numbe
   return { done, total };
 }
 
-/** 友好耗时：null（未开始）→ 空串；<1s 毫秒；<60s 秒；再往上分秒 */
-export function friendlyDuration(ms: number | null): string {
-  if (ms === null) return "";
-  if (ms < 1000) return `${ms}ms`;
-  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
-  const minutes = Math.floor(ms / 60_000);
-  const seconds = Math.round((ms % 60_000) / 1000);
-  return `${minutes}m ${seconds}s`;
-}
-
 /**
  * 运行时长（活动流头部）：最早节点开始 → 结束（或当前时刻）。
  * 没有任何节点开始时返回 null（头部显示「准备中」而不是误导性的 0s）。

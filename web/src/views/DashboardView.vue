@@ -5,7 +5,9 @@ import { client, errText } from "../rpc/client";
 import { activeCount, perWorkflowRates, successRate, type WorkflowRate } from "../state/dashboard";
 import { editor, refreshWorkflows } from "../state/editor";
 import { runBadgeClass, runStatusLabel } from "../state/labels";
+import { fmtTime } from "../state/time";
 import { toast } from "../state/toast";
+import { copyWithToast } from "../state/clipboard";
 import type { RunRecord, RunStats } from "../types";
 import AppButton from "../components/AppButton.vue";
 
@@ -49,10 +51,6 @@ const capacityTitle = computed(
     `非终态上限 ${RUN_CAP}（平台上限，加执行节点不提高）；在飞派发上限 ${DISPATCH_CAP}。口径见 OPS.md`,
 );
 
-function fmtTime(iso: string): string {
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
-}
 
 function fmtRate(rate: number | null): string {
   return rate === null ? "—" : `${(rate * 100).toFixed(0)}%`;
@@ -79,12 +77,7 @@ async function refresh(): Promise<void> {
 }
 
 async function copyRunId(id: string): Promise<void> {
-  try {
-    await navigator.clipboard.writeText(id);
-    toast.success("已复制 run id");
-  } catch {
-    toast.error("复制失败，请手动复制");
-  }
+  await copyWithToast(id, "run id");
 }
 
 // 一次性加载 + 手动刷新；断线期间错过的事件由重连回调补齐，无需常驻轮询
@@ -220,19 +213,6 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-.error-banner {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 12px;
-  padding: 8px 12px;
-  border: 1px solid var(--danger);
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--danger) 12%, transparent);
-  color: var(--danger);
-  font-size: 12px;
-}
 
 .cards {
   display: grid;
@@ -317,28 +297,7 @@ onUnmounted(() => {
   margin-left: 8px;
 }
 
-.capacity-src {
-  margin-left: 8px;
-  opacity: 0.8;
-}
 
-/* copy-cell 按钮化：剥掉 button 默认外观，保持原可点击文本单元格样式 */
-.copy-id {
-  background: none;
-  border: none;
-  padding: 0;
-  color: inherit;
-  font: inherit;
-  font-family: var(--mono);
-  text-align: left;
-  cursor: pointer;
-}
-
-.copy-id:hover {
-  background: none;
-  border-color: transparent;
-  text-decoration: underline;
-}
 
 /* 名称缺失时回退渲染 36 字符 workflow_id，允许折行避免撑破表格 */
 .wf-cell {

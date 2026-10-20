@@ -109,6 +109,7 @@ async fn spawn_executor_loopback_at(
     if let Some(log) = std::env::var_os("RUST_LOG") {
         command.env("RUST_LOG", log);
     }
+    super::spawn::apply_executor_env_whitelist(&mut command);
     command.env(CONNECT_ADDR_ENV, addr);
     command.env(SESSION_TOKEN_ENV, &session_token);
     let mut child = Child::spawn_executor(&mut command)?;

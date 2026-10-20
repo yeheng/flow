@@ -7,11 +7,14 @@ import { editor, ensureNodeTypes, refreshWorkflows } from "../state/editor";
 import { attachRun, detachRun, monitor } from "../state/monitor";
 import { devMode } from "../state/dev";
 import { runBadgeClass, runStatusLabel, sourceLabel, TERMINAL_RUN_STATUSES } from "../state/labels";
+import { fmtTime, runDuration } from "../state/time";
 import { regressionBaseline } from "../state/regression";
 import { openOverlay, overlaysOf } from "../state/overlays";
 import { staleGuard } from "../state/stale";
 import { describeStoredValue, rawRunToRecord, type ValueMarker } from "../state/run-raw";
 import { toast } from "../state/toast";
+import { copyWithToast } from "../state/clipboard";
+import { confirmDialog } from "../state/modal";
 import type { Definition, RunEvent, RunRecord } from "../types";
 import RunCanvas from "../components/RunCanvas.vue";
 import RunMonitor from "../components/RunMonitor.vue";
@@ -124,6 +127,27 @@ function openRegression(): void {
   if (record.value) openOverlay("regression", { baseline: record.value });
 }
 
+/** 取消当前 run：非终态均可（含挂起等续跑的 awaiting_resume）；状态由 monitor 投影/补拉刷新 */
+const cancelling = ref(false);
+async function onCancelRun(): Promise<void> {
+  const current = record.value;
+  if (!current || cancelling.value) return;
+  if (!(await confirmDialog(`确定取消 run ${current.id.slice(0, 8)}…？`, { danger: true }))) return;
+  cancelling.value = true;
+  try {
+    await api.runCancel(current.id);
+    const fresh = await api.getRun(current.id);
+    if (record.value?.id === current.id) {
+      record.value = fresh.run;
+      live.value = fresh.live;
+    }
+  } catch (e) {
+    toast.error(errText(e));
+  } finally {
+    cancelling.value = false;
+  }
+}
+
 function onRegressionCreated(runId: string): void {
   void router.push(`/runs/${runId}`);
 }
@@ -206,11 +230,6 @@ const workflowName = computed(() => {
   return editor.workflows.find((w) => w.workflow_id === wf)?.name ?? wf ?? "";
 });
 
-function fmtTime(iso: string | null): string {
-  if (!iso) return "—";
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
-}
 
 function fmtJson(v: unknown): string {
   if (v === undefined || v === null) return "";
@@ -218,23 +237,12 @@ function fmtJson(v: unknown): string {
 }
 
 async function copyRunId(): Promise<void> {
-  if (!record.value) return;
-  try {
-    await navigator.clipboard.writeText(record.value.id);
-    toast.info("已复制 run id");
-  } catch {
-    toast.error("复制失败");
-  }
+  if (record.value) await copyWithToast(record.value.id, "run id");
 }
 
 async function copyOutput(): Promise<void> {
-  if (!record.value) return;
-  try {
-    await navigator.clipboard.writeText(fmtJson(liteMode.value ? outputValue.value : record.value.output));
-    toast.info("已复制输出");
-  } catch {
-    toast.error("复制失败");
-  }
+  if (record.value)
+    await copyWithToast(fmtJson(liteMode.value ? outputValue.value : record.value.output), "输出");
 }
 
 /** 原始事件按游标分页，长 run 不全量拉取 */
@@ -355,6 +363,14 @@ onUnmounted(() => {
             该工作流的运行记录
           </RouterLink>
           <AppButton
+            v-if="!isTerminalRun"
+            variant="link-danger"
+            :disabled="cancelling"
+            @click="onCancelRun()"
+          >
+            取消
+          </AppButton>
+          <AppButton
             v-if="isTerminalRun"
             variant="link"
             title="以本运行为基线，用指定版本重新执行（复用已记录的外部结果，不产生副作用）"
@@ -374,6 +390,7 @@ onUnmounted(() => {
       <div class="run-header-row run-header-meta">
         <span>开始 {{ fmtTime(record.started_at) }}</span>
         <span>结束 {{ fmtTime(record.ended_at) }}</span>
+        <span>耗时 {{ runDuration(record.started_at, record.ended_at) }}</span>
         <span>
           来源 {{ sourceLabel(record.source) }}
           <RouterLink

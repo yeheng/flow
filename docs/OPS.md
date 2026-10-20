@@ -504,3 +504,40 @@ flow-journal-bench
 
 **`coordinator_ticks` 与 `coordinator_last_tick_ms` 是最有用的两个诊断字段**：
 前者不涨 = 协调循环死了；后者不动 = 循环卡住。二者都可以从诊断接口读到。
+
+## Harness Agent（内置 agent 模式）部署与安全边界
+
+### 分发
+
+`flow-harness-agent` 与 `flow-executor` **同目录分发、同批发布**：runner 不带
+`RUNTIME_ID`，协议面（`CONGA_*` 非敏感环境变量名、stdin 单行 JSON、stdout
+单行 JSON 与退出码 0/1/130/2）由同一 workspace/Cargo.lock 与 conga 固定 rev
+锁步挡住漂移。executor 按以下顺序定位 runner：`FLOW_HARNESS_AGENT_BIN`（绝对
+路径；本地 master 与远端 flow-agent 各自透传自己机器上的路径）→ executor
+自身同目录的兄弟。桌面打包在 `tauri.conf.json` 的 `externalBin`；服务端
+`scripts/build-journal.sh` 的 BINS 已包含。
+
+### 配置与密钥
+
+- 模型配置在 `[harness.agent]`（base_url/model 成对启用；api/proxy/限额可选）。
+  **run 启动时冻结进执行快照**：重启后改配置只影响新 run；回归候选继承
+  baseline 的冻结配置。Settings 页保存后需重启生效。
+- API key 只以密钥名出现在节点参数（`api_key`，`x-secret`）；真值来自密钥
+  管理体系（stored 优先、`FLOW_SECRET_*` 兜底），经授权许可（内存）→ runner
+  stdin → conga-host 结构体。**任何环境变量都不携带 key**：runner 的
+  `/proc/<pid>/environ`、workdir 的 `.conga/hooks.json` 钩子、bash 工具的
+  子进程都读不到。
+- `CONGA_CONFIG_DIR` 由 conga-host 在 runner 进程内钉进本次 run 的临时根并
+  自检：settings.json 在 flow 路径上**永不被读**（stream_fn 注入使加载分支
+  不可达），workdir 的 `.env`/`.conga/config.toml` 不被自动装配。
+
+### 已知取舍
+
+- runner 的 HOME/XDG/CARGO_HOME 全部指向本次 run 的临时目录（run 结束删除）：
+  真实 HOME 的 git/ssh 配置不可用（需要时在 workdir 的 `.git/config` 配身份），
+  私有 registry 凭据不继承（公开依赖可正常下载；每次 run 全新 CARGO_HOME
+  会重复下载，成本实测记录在 PR）。
+- FullAuto：agent 可读写 workdir、联网、起 shell——与外部 CLI harness 等价。
+  安全边界是「一个 OperationIntent 覆盖整次运行」；回归模式 0 外部调用。
+- 取消/超时走进程组 SIGKILL（executor 侧 Uncertain 裁决），依赖
+  `EXECUTION.md` 的受管 harness 合同，不依赖工具级超时。

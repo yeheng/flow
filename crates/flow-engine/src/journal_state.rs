@@ -146,6 +146,11 @@ pub struct ExecutionSnapshot {
     pub regression: Option<Regression>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
+    /// 内置 agent 的模型配置（run 启动时冻结；回归候选继承 baseline）。
+    /// 模型/端点/限额与 runtime/seed 同级，都是外部依赖身份——重试/恢复/
+    /// 回归必须用同一份。旧 journal 反序列化为 None（未配置时代）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<flow_dto::AgentRunConfig>,
 }
 impl ExecutionSnapshot {
     pub fn node_key(&self, node: &str) -> String {

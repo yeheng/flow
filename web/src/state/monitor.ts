@@ -200,10 +200,15 @@ async function attach(runId: string): Promise<boolean> {
     storage_dropped: 0,
     history_incomplete: false,
   };
-  const refresh = async () => {
+  /** 空闲降频计数：观测存储独立于控制事件 flush，dirty 时紧跟拉取，
+   * 否则每 4 拍（约 1Hz）拉一次，挂着的运行页不再每 250ms 白打 RPC */
+  let ticks = 0;
+  const refresh = async (forceObservations = false) => {
     if (!current() || syncing) return;
     syncing = true;
     try {
+      ticks++;
+      const pollObservations = forceObservations || dirty || ticks === 1 || ticks % 4 === 0;
       // 时间线不可用（大 run 超预算）时不再重试：只拉观测，避免必失败的请求风暴
       if (!monitor.timelineUnavailable && (dirty || monitor.status === null)) {
         dirty = false;
@@ -221,13 +226,14 @@ async function attach(runId: string): Promise<boolean> {
           toast.error("时间线不可用（数据量大或读取失败）；日志与原始事件仍可查看");
         }
       }
-      // The observation store flushes independently of the last control event.
-      for (let page = 0; page < 4 && current(); page++) {
-        const observations = await api.runObservations(runId, monitor.lastLogSeq);
-        if (!current()) return;
-        appendObservations(monitor, observations.records);
-        monitor.observationLoss = mergeObservationLoss(monitor.observationLoss, observations.loss);
-        if (observations.records.length < 256) break;
+      if (pollObservations) {
+        for (let page = 0; page < 4 && current(); page++) {
+          const observations = await api.runObservations(runId, monitor.lastLogSeq);
+          if (!current()) return;
+          appendObservations(monitor, observations.records);
+          monitor.observationLoss = mergeObservationLoss(monitor.observationLoss, observations.loss);
+          if (observations.records.length < 256) break;
+        }
       }
       // 终态：停掉 250ms 轮询；再补一次观测（存储异步 flush）后彻底停
       if (monitor.status !== null && TERMINAL_RUN_STATUSES.has(monitor.status)) {
@@ -235,7 +241,8 @@ async function attach(runId: string): Promise<boolean> {
         if (!finalSweep) {
           finalSweep = true;
           setTimeout(() => {
-            if (current()) void refresh();
+            // 收尾补拉只拉观测（终态时间线不会再变），force 绕过空闲降频门控
+            if (current()) void refresh(true);
           }, 800);
         }
       }

@@ -1,0 +1,24 @@
+[package]
+name = "flow-harness-agent"
+edition.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+# conga 固定 rev e27c671（含三 patch：CONGA_CONFIG_DIR 钉根、subagent tap
+# 改 tracing、headless 装配入口）。rev 与 executor 同批发布（S4）：env 变量
+# 名与单行输出格式即协议，漂移由锁步构建挡住。
+conga = { git = "https://github.com/yeheng/conga", rev = "e27c671", default-features = false }
+conga-host = { git = "https://github.com/yeheng/conga", rev = "e27c671", default-features = false }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bin]]
+name = "flow-harness-agent"
+path = "src/main.rs"

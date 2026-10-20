@@ -4,6 +4,7 @@ import * as api from "../api/flow";
 import { errText } from "../rpc/client";
 import { editor, refreshWorkflows } from "../state/editor";
 import { normalizeFixtures } from "../state/regression";
+import { useModalFocusTrap } from "../state/modal-a11y";
 import { toast } from "../state/toast";
 import type { OverlayEntry } from "../state/overlays";
 import type { RunRecord, VersionMeta } from "../types";
@@ -39,6 +40,10 @@ const fixturesError = computed(() => normalizeFixtures(fixturesText.value).error
 function close(): void {
   if (!submitting.value) props.entry.close();
 }
+
+// Tab 焦点圈定在弹层内（此前没有陷阱，Tab 会穿透到背后页面）
+const dialogEl = ref<HTMLElement | null>(null);
+useModalFocusTrap(dialogEl, ref(true));
 
 const publishedVersions = computed(() =>
   versions.value.filter((v) => v.status === "published").sort((a, b) => b.version - a.version),
@@ -93,7 +98,7 @@ async function submit(): Promise<void> {
 
 <template>
   <div class="regress-overlay" @click.self="close">
-    <div class="regress-modal" role="dialog" aria-modal="true" aria-label="以本运行为基线回归">
+    <div ref="dialogEl" class="regress-modal" role="dialog" aria-modal="true" aria-label="以本运行为基线回归">
       <header class="regress-header">
         <h3>回归运行</h3>
         <button class="regress-close" title="关闭 (Esc)" @click="close">×</button>

@@ -11,6 +11,7 @@ import {
 } from "../api/cluster";
 import { client, errText, RpcError } from "../rpc/client";
 import { confirmDialog } from "../state/modal";
+import { fmtTime } from "../state/time";
 import { toast } from "../state/toast";
 import AppButton from "../components/AppButton.vue";
 
@@ -30,12 +31,6 @@ const labels: Record<ClusterNode["status"], string> = {
   removed: "已剔除",
 };
 const online = computed(() => page.value?.nodes.filter((n) => n.status === "online").length ?? 0);
-/** 非法/缺失时间戳回退原值或 "—"，避免页面出现 Invalid Date */
-function fmtTime(iso: string | null): string {
-  if (!iso) return "—";
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
-}
 async function refresh(cursor = after.value) {
   if (busy.value) return;
   busy.value = true;

@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
+import { onBeforeRouteLeave } from "vue-router";
 import * as api from "../api/flow";
 import { errText } from "../rpc/client";
 import { isDesktop } from "../platform";
@@ -152,6 +153,12 @@ const sections: SectionDesc[] = [
       { key: "data_dir", label: "数据目录" },
     ],
   },
+  {
+    // harness.agent 是嵌套分区，平铺字段留空；表单在下方专用模板块渲染
+    sect: "harness",
+    label: "Harness Agent",
+    fields: [],
+  },
 ];
 
 const visibleSections = computed(() =>
@@ -163,6 +170,21 @@ const visibleSections = computed(() =>
 
 /** execution.remote 嵌套块的强类型入口；remote 为空（mode=ipc 常态）时 WSS 接入不可配 */
 const remoteCfg = computed(() => copy.value?.execution.remote ?? null);
+
+/** harness.agent 嵌套块入口；旧后端未回传时兜底空对象（保存前会补全结构） */
+const harnessAgent = computed(
+  () =>
+    copy.value?.harness?.agent ?? {
+      base_url: null,
+      model: null,
+      api: null,
+      proxy: null,
+      max_turns: null,
+      max_tool_calls_per_turn: null,
+      max_tokens: null,
+      tool_timeout_secs: null,
+    },
+);
 
 function addAgent(): void {
   const r: RemoteExecutionConfig | null = remoteCfg.value;
@@ -204,8 +226,25 @@ function onRetryLoad(): void {
   void refresh();
 }
 
+// 未保存的配置改动：路由离开先确认，刷新/关页走浏览器原生确认（与编辑器同一套守卫）
+onBeforeRouteLeave(async () => {
+  if (!dirty.value) return true;
+  return confirmDialog("当前设置有未保存的修改，离开后会丢失，确定继续？");
+});
+
+function onBeforeUnload(e: BeforeUnloadEvent): void {
+  if (!dirty.value) return;
+  e.preventDefault();
+  e.returnValue = "";
+}
+
 onMounted(() => {
   void refresh();
+  window.addEventListener("beforeunload", onBeforeUnload);
+});
+
+onUnmounted(() => {
+  window.removeEventListener("beforeunload", onBeforeUnload);
 });
 
 function isOverridden(sect: string): boolean {
@@ -414,6 +453,48 @@ async function onDeleteSecret(name: string): Promise<void> {
           </template>
           <div v-else class="help remote-empty">
             execution.remote 未配置（mode=remote 需要 control 地址与证书三件套），WSS 接入暂不可编辑
+          </div>
+        </template>
+        <!-- harness.agent 嵌套块：base_url/model 成对启用；api_key 不在这里（节点参数引用密钥名） -->
+        <template v-if="s.sect === 'harness'">
+          <div class="field">
+            <label>base_url</label>
+            <input v-model="harnessAgent.base_url" placeholder="https://api.deepseek.com/v1" spellcheck="false" />
+            <div class="help">与 model 成对配置才启用；都留空 = 关闭内置 agent（http(s)、禁 userinfo/query）</div>
+          </div>
+          <div class="field">
+            <label>model</label>
+            <input v-model="harnessAgent.model" placeholder="deepseek-chat" spellcheck="false" />
+          </div>
+          <div class="field">
+            <label>api</label>
+            <select v-model="harnessAgent.api">
+              <option :value="null">openai（默认）</option>
+              <option value="openai">openai</option>
+              <option value="anthropic">anthropic</option>
+            </select>
+            <div class="help">openai = OpenAI 兼容端点；anthropic = Anthropic 端点</div>
+          </div>
+          <div class="field">
+            <label>proxy</label>
+            <input v-model="harnessAgent.proxy" placeholder="http://127.0.0.1:7890" spellcheck="false" />
+            <div class="help">LLM 出口代理（http(s)、禁 userinfo/query——代理凭据不进请求/journal）</div>
+          </div>
+          <div class="field">
+            <label>max_turns</label>
+            <input v-model.number="harnessAgent.max_turns" type="number" placeholder="50（1..=200）" />
+          </div>
+          <div class="field">
+            <label>max_tool_calls_per_turn</label>
+            <input v-model.number="harnessAgent.max_tool_calls_per_turn" type="number" placeholder="conga 默认（1..=100）" />
+          </div>
+          <div class="field">
+            <label>max_tokens</label>
+            <input v-model.number="harnessAgent.max_tokens" type="number" placeholder="conga 默认（1..=1,000,000）" />
+          </div>
+          <div class="field">
+            <label>tool_timeout_secs</label>
+            <input v-model.number="harnessAgent.tool_timeout_secs" type="number" placeholder="无引擎级工具超时（取消/超时由 executor 杀进程组）" />
           </div>
         </template>
       </section>

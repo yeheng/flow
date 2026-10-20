@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import {
   closeAllOverlays,
   closeTopOverlay,
-  isOverlayTop,
   openOverlay,
   overlaysOf,
   topOverlay,
@@ -13,8 +12,6 @@ describe("overlays：全局弹层栈", () => {
     const a = openOverlay("params", { nodeId: "n1" });
     const b = openOverlay("modal", { message: "m" });
     expect(topOverlay.value?.id).toBe(b.id);
-    expect(isOverlayTop("modal")).toBe(true);
-    expect(isOverlayTop("params")).toBe(false);
     expect(overlaysOf("params").map((e) => e.id)).toEqual([a.id]);
 
     b.close();

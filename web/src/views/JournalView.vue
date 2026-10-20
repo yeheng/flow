@@ -8,7 +8,7 @@ import ResizeHandle from "../components/ResizeHandle.vue";
 import AppButton from "../components/AppButton.vue";
 import { runBadgeClass, runStatusLabel } from "../state/labels";
 import { usePanelResize } from "../state/panel-resize";
-import { toast } from "../state/toast";
+import { copyWithToast } from "../state/clipboard";
 import type { ObservationRecord } from "../types";
 
 /**
@@ -157,12 +157,7 @@ async function nextPage(reset = false) {
 }
 
 async function copyRunId(id: string) {
-  try {
-    await navigator.clipboard.writeText(id);
-    toast.success("已复制 run id");
-  } catch {
-    toast.error("复制失败");
-  }
+  await copyWithToast(id, "run id");
 }
 
 onBeforeUnmount(() => {
@@ -425,23 +420,6 @@ onBeforeUnmount(() => {
   gap: 10px;
 }
 
-/* copy-cell 按钮化：剥掉 button 默认外观，保持原可点击文本单元格样式 */
-.copy-id {
-  background: none;
-  border: none;
-  padding: 0;
-  color: inherit;
-  font: inherit;
-  font-family: var(--mono);
-  text-align: left;
-  cursor: pointer;
-}
-
-.copy-id:hover {
-  background: none;
-  border-color: transparent;
-  text-decoration: underline;
-}
 
 .journal-obs-more {
   display: flex;

@@ -117,7 +117,8 @@ impl Services {
             "http://{}",
             listener.local_addr().map_err(|e| e.to_string())?
         );
-        flow_backend::start_execution(&config.execution, &journal)
+        let harness_agent = flow_backend::harness_agent_run_config(&config.harness.agent);
+        flow_backend::start_execution(&config.execution, harness_agent, &journal)
             .await
             .map_err(|e| e.to_string())?;
         // 主后端 = journal：触发器走 journal_triggers（命令身份去重），

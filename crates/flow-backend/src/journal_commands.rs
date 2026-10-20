@@ -634,6 +634,10 @@ impl JournalBackend {
             snapshot.clock_ms = recorded.clock_ms;
             snapshot.seed = recorded.seed;
             snapshot.regression = recorded.regression;
+            // 回归候选必须继承 baseline 冻结的 agent 配置：请求指纹里含
+            // 配置，若按当前配置构造，baseline 后改过 [harness.agent] 的
+            // 回归会因指纹漂移而失配——那正是快照要消除的漂移。
+            snapshot.agent = recorded.agent.clone();
         }
         self.command(&scope, request_id, &request, |state| {
             if matches!(source, "schedule" | "webhook") {

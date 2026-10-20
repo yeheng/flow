@@ -1,11 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  activityEntries,
-  friendlyDuration,
-  isFrameNode,
-  runElapsedMs,
-  runProgress,
-} from "./activity";
+import { activityEntries, isFrameNode, runElapsedMs, runProgress } from "./activity";
 import type { LogLine, TimelineNode } from "../types";
 
 function node(overrides: Partial<TimelineNode>): TimelineNode {
@@ -73,6 +67,8 @@ describe("runProgress", () => {
     expect(progress).toEqual({ done: 3, total: 5 });
   });
 });
+
+import { friendlyDuration } from "./time";
 
 describe("friendlyDuration", () => {
   it("null → 空串；毫秒/秒/分钟三档", () => {

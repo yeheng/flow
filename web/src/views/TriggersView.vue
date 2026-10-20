@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import * as api from "../api/flow";
 import { webhookBase } from "../api/flow";
 import { client, errText } from "../rpc/client";
@@ -7,7 +7,10 @@ import { editor, ensureNodeTypes, refreshWorkflows } from "../state/editor";
 import { discoverInputKeys } from "../state/run-input";
 import { generateInvokeKey, invokeCurl, resultCurl, sha256Hex } from "../state/invocation";
 import { confirmDialog } from "../state/modal";
+import { fmtTime } from "../state/time";
+import { usePolling } from "../state/polling";
 import { toast } from "../state/toast";
+import { copyWithToast } from "../state/clipboard";
 import type { Definition, Schedule, VersionMeta, Webhook } from "../types";
 import AppButton from "../components/AppButton.vue";
 import WorkflowInputForm from "../components/WorkflowInputForm.vue";
@@ -25,8 +28,6 @@ const error = ref("");
 const pollFailed = ref(false);
 /** 在途守卫：慢响应时手动/轮询/重连触发的刷新不叠加 */
 let refreshing = false;
-/** 10s 轮询定时器（README 声称的行为），离开页面清理 */
-let timer: ReturnType<typeof setInterval> | null = null;
 
 // 新建调度表单
 const newCron = ref("");
@@ -46,11 +47,33 @@ const editCron = ref("");
 const editInput = ref("");
 const savingScheduleIds = ref(new Set<string>());
 
-/** 已发布版本：调用合同的版本固定只允许已发布（服务端同样校验 published） */
 const publishedVersions = ref<VersionMeta[]>([]);
+const definition = ref<Definition | null>(null);
 
 /** 输入表单的字段来源：最新版定义 + 节点类型 schema；拿不到时退化为纯 JSON 输入 */
-const definition = ref<Definition | null>(null);
+function loadDefinition(): void {
+  void (async () => {
+    if (!(await ensureNodeTypes())) return;
+    try {
+      definition.value = (await api.getWorkflow(props.workflowId)).definition;
+    } catch {
+      // 定义拉不到不影响调度管理，输入区退化为纯 JSON 文本域
+    }
+  })();
+}
+
+/** 已发布版本：调用合同的版本固定只允许已发布（服务端同样校验 published） */
+function loadPublishedVersions(): void {
+  void (async () => {
+    try {
+      publishedVersions.value = (await api.listVersions(props.workflowId))
+        .filter((v) => v.status === "published")
+        .sort((a, b) => b.version - a.version);
+    } catch {
+      // 版本拉不到不影响触发器管理，调用合同下拉为空并给出提示
+    }
+  })();
+}
 const inputKeys = computed(() =>
   definition.value ? discoverInputKeys(definition.value, editor.nodeTypes) : [],
 );
@@ -80,11 +103,6 @@ async function refresh(): Promise<void> {
   }
 }
 
-function fmtTime(iso: string | null): string {
-  if (!iso) return "—";
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
-}
 
 function fmtInput(input: unknown): string {
   if (input === null || input === undefined) return "—";
@@ -208,12 +226,7 @@ function curlExample(w: Webhook): string {
 }
 
 async function onCopy(w: Webhook): Promise<void> {
-  try {
-    await navigator.clipboard.writeText(hookUrl(w));
-    toast.success("已复制 webhook URL");
-  } catch {
-    toast.error("复制失败，请手动复制");
-  }
+  await copyWithToast(hookUrl(w), "webhook URL");
 }
 
 async function onCreateWebhook(): Promise<void> {
@@ -333,12 +346,7 @@ function onUsePastedKey(w: Webhook): void {
 }
 
 async function onCopyInvokeKey(w: Webhook): Promise<void> {
-  try {
-    await navigator.clipboard.writeText(formFor(w).keyDraft);
-    toast.success("已复制调用密钥");
-  } catch {
-    toast.error("复制失败，请手动复制");
-  }
+  await copyWithToast(formFor(w).keyDraft, "调用密钥");
 }
 
 async function onSaveInvoke(w: Webhook): Promise<void> {
@@ -383,34 +391,39 @@ async function onSaveInvoke(w: Webhook): Promise<void> {
   }
 }
 
-// 首拉 + 10s 轮询 + 手动刷新 + 重连补齐；next_fire_at 只在刷新时更新，不做倒计时
+// 首拉 + 10s 轮询（页面不可见自动暂停）+ 手动刷新 + 重连补齐；next_fire_at 只在刷新时更新，不做倒计时
 const offReconnect = client.onReconnect(() => void refresh());
+usePolling(refresh, 10_000);
 
 onMounted(() => {
   if (editor.workflows.length === 0) void refreshWorkflows();
   void refresh();
-  timer = setInterval(() => void refresh(), 10_000);
-  void (async () => {
-    if (!(await ensureNodeTypes())) return;
-    try {
-      definition.value = (await api.getWorkflow(props.workflowId)).definition;
-    } catch {
-      // 定义拉不到不影响调度管理，输入区退化为纯 JSON 文本域
-    }
-  })();
-  void (async () => {
-    try {
-      publishedVersions.value = (await api.listVersions(props.workflowId))
-        .filter((v) => v.status === "published")
-        .sort((a, b) => b.version - a.version);
-    } catch {
-      // 版本拉不到不影响触发器管理，调用合同下拉为空并给出提示
-    }
-  })();
+  loadDefinition();
+  loadPublishedVersions();
 });
 
+// RouterView 无 key：跨工作流前进/后退复用实例，参数变化时重置行内编辑态并按新 id 重拉
+watch(
+  () => props.workflowId,
+  (id, prev) => {
+    if (!id || id === prev) return;
+    schedules.value = [];
+    webhooks.value = [];
+    loaded.value = false;
+    error.value = "";
+    editingScheduleId.value = null;
+    newCron.value = "";
+    newInput.value = "";
+    for (const k of Object.keys(invokeForms)) delete invokeForms[k];
+    definition.value = null;
+    publishedVersions.value = [];
+    void refresh();
+    loadDefinition();
+    loadPublishedVersions();
+  },
+);
+
 onUnmounted(() => {
-  if (timer) clearInterval(timer);
   offReconnect();
 });
 </script>
@@ -694,19 +707,6 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-.error-banner {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 16px;
-  padding: 8px 12px;
-  border: 1px solid var(--danger);
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--danger) 12%, transparent);
-  color: var(--danger);
-  font-size: 12px;
-}
 
 .section {
   margin-bottom: 28px;

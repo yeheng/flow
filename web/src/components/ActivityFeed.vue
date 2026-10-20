@@ -1,11 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onUnmounted, ref, watch } from "vue";
-import {
-  activityEntries,
-  friendlyDuration,
-  runElapsedMs,
-  runProgress,
-} from "../state/activity";
+import { activityEntries, runElapsedMs, runProgress } from "../state/activity";
+import { friendlyDuration } from "../state/time";
 import { monitor } from "../state/monitor";
 import { nodeStateLabel, nodeTypeLabel, skipReasonLabel } from "../state/labels";
 import type { TimelineNode } from "../types";
@@ -31,7 +27,10 @@ const now = ref(Date.now());
 const active = computed(
   () => monitor.status === "running" || monitor.status === "awaiting_resume",
 );
-const timer = setInterval(() => (now.value = Date.now()), 1000);
+// 页面不可见时跳过赋值（渲染本来就不可见），恢复可见后下一秒自然跟上
+const timer = setInterval(() => {
+  if (!document.hidden) now.value = Date.now();
+}, 1000);
 onUnmounted(() => clearInterval(timer));
 const elapsed = computed(() => {
   if (active.value) {
@@ -61,10 +60,12 @@ const lossText = computed(() => {
 
 /** 单卡片默认收起的日志行数：够看到「正在做什么」，又不让长脚本淹没流 */
 const COLLAPSED_LOG_LINES = 8;
+/** 展开态的渲染上限：话痨节点可拖到 store 上限（万行），超出截尾保留最新 */
+const EXPANDED_LOG_CAP = 2000;
 const expandedNodes = ref(new Set<string>());
 function nodeLogs(id: string, logs: number): { visible: number; collapsed: boolean } {
   return expandedNodes.value.has(id)
-    ? { visible: logs, collapsed: false }
+    ? { visible: Math.min(logs, EXPANDED_LOG_CAP), collapsed: false }
     : { visible: Math.min(logs, COLLAPSED_LOG_LINES), collapsed: logs > COLLAPSED_LOG_LINES };
 }
 function toggleLogs(id: string): void {
@@ -213,7 +214,11 @@ function onSelectNode(id: string): void {
             @click.stop="toggleLogs(e.node.id)"
             @keydown.stop
           >
-            展开全部 {{ e.logs.length }} 行
+            {{
+              e.logs.length > EXPANDED_LOG_CAP
+                ? `展开最新 ${EXPANDED_LOG_CAP} 行（共 ${e.logs.length} 行）`
+                : `展开全部 ${e.logs.length} 行`
+            }}
           </button>
           <button
             v-else-if="expandedNodes.has(e.node.id)"

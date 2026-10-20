@@ -229,14 +229,21 @@ impl NodeType {
                 "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
                 "params_schema": {
                     "type": "object",
-                    "required": ["command", "prompt"],
+                    "required": ["prompt"],
                     "properties": {
-                        "command": {"type": "string", "x-label": "命令",
-                                    "x-help": "进程级记录：prompt 经 stdin，最终 stdout 作为输出；逐模型/工具记录使用模型调用和 HTTP 节点"},
+                        "mode": {"type": "string", "enum": ["command", "agent"], "default": "command",
+                                 "x-label": "模式",
+                                 "x-help": "command 运行外部 CLI（需 command 参数）；agent 使用内置 flow-harness-agent（需 workdir 与 api_key，模型配置见设置页 [harness.agent]）"},
                         "prompt": {"type": "string", "x-widget": "code", "x-label": "提示词"},
-                        "args": {"type": "array", "items": {"type": "string"}, "x-widget": "json", "x-label": "额外参数"},
-                        "workdir": {"type": "string", "x-label": "工作目录"},
-                        "timeout_ms": {"type": "number", "default": 300000, "x-label": "超时 (ms)"}
+                        "command": {"type": "string", "x-label": "命令",
+                                    "x-help": "mode=command 时必填；进程级记录：prompt 经 stdin，最终 stdout 作为输出；逐模型/工具记录使用模型调用和 HTTP 节点"},
+                        "args": {"type": "array", "items": {"type": "string"}, "x-widget": "json", "x-label": "额外参数",
+                                 "x-help": "仅 mode=command 可用"},
+                        "workdir": {"type": "string", "x-label": "工作目录",
+                                    "x-help": "mode=agent 时必填（绝对路径；agent 工具沙箱根）；command 模式可选"},
+                        "timeout_ms": {"type": "number", "default": 300000, "x-label": "超时 (ms)"},
+                        "api_key": {"type": "string", "x-secret": true, "x-label": "API 密钥名称",
+                                    "x-help": "仅 mode=agent：只存密钥名称，真值来自密钥管理（secrets.list 提供候选）"}
                     }
                 },
                 "supports_retry": true,
@@ -661,6 +668,17 @@ impl Definition {
                 .kind()
                 .ok_or_else(|| format!("节点 {} 的类型未知：{}", node.id, node.node_type))?;
             validate_params(node, kind)?;
+            // v1 定义没有执行快照，agent 配置无处冻结——保存/发布期直接拒绝，
+            // 不留「运行期恒 Business 且报错误导」的缺口。
+            if self.semantics == 1
+                && kind == NodeType::Harness
+                && node.param_str("mode").is_some_and(|m| m.trim() == "agent")
+            {
+                return Err(format!(
+                    "节点 {}：semantics=1 不支持内置 agent（无执行快照），请升级工作流语义",
+                    node.id
+                ));
+            }
             if let Some(join) = node.params.get("join") {
                 if !matches!(join.as_str(), Some("all" | "selected")) {
                     return Err(format!("node {}: join must be all | selected", node.id));
@@ -933,6 +951,85 @@ pub fn validate_params(node: &Node, kind: NodeType) -> Result<(), String> {
             Some(_) => Err(format!("节点 {}（input）的 fields 必须是数组", node.id)),
             None => Ok(()),
         },
+        NodeType::Harness => {
+            // mode：缺省 command；分支选择是结构事实，不接受 ${} 模板
+            // （模板会让「哪个参数必填」在保存期无法判定）。
+            let agent_mode = match node.param_str("mode").map(str::trim) {
+                None | Some("") | Some("command") => false,
+                Some("agent") => true,
+                Some(other) => {
+                    return Err(format!(
+                        "节点 {}（harness）的 mode 非法：{other:?}（允许 command | agent，不接受 ${{}} 模板）",
+                        node.id
+                    ));
+                }
+            };
+            let filled = |key: &str| node.param_str(key).is_some_and(|v| !v.trim().is_empty());
+            if agent_mode {
+                // workdir 保存期只查字面量（非空/绝对/非模板）；存在性与
+                // canonicalize 在 executor 授权前——remote 模式下 master
+                // 看不到远端路径，保存期判存在会误拒合法定义。
+                let workdir = filled("workdir")
+                    .then(|| node.param_str("workdir").unwrap_or_default())
+                    .ok_or_else(|| {
+                        format!(
+                            "节点 {}（harness）缺少参数 workdir（mode=agent 必填）",
+                            node.id
+                        )
+                    })?;
+                if workdir.contains("${") {
+                    return Err(format!(
+                        "节点 {}（harness）mode=agent 的 workdir 不接受 ${{}} 模板（回归指纹需要确定路径）",
+                        node.id
+                    ));
+                }
+                if !std::path::Path::new(workdir).is_absolute() {
+                    return Err(format!(
+                        "节点 {}（harness）mode=agent 的 workdir 必须是绝对路径：{workdir:?}",
+                        node.id
+                    ));
+                }
+                if !filled("api_key") {
+                    return Err(format!(
+                        "节点 {}（harness）缺少参数 api_key（mode=agent 必填，填密钥名称）",
+                        node.id
+                    ));
+                }
+                // 跨模式参数不静默忽略：填了就报错，别让用户以为它生效。
+                if filled("command") {
+                    return Err(format!(
+                        "节点 {}（harness）mode=agent 不接受 command（跨模式参数）",
+                        node.id
+                    ));
+                }
+                if node
+                    .params
+                    .get("args")
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| !items.is_empty())
+                {
+                    return Err(format!(
+                        "节点 {}（harness）mode=agent 不接受 args（跨模式参数）",
+                        node.id
+                    ));
+                }
+            } else {
+                // command 从 required 移到按模式校验（agent 模式下禁止）。
+                if !filled("command") {
+                    return Err(format!(
+                        "节点 {}（harness）缺少参数 command（mode=command 必填）",
+                        node.id
+                    ));
+                }
+                if filled("api_key") {
+                    return Err(format!(
+                        "节点 {}（harness）mode=command 不接受 api_key（跨模式参数）",
+                        node.id
+                    ));
+                }
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -1006,6 +1103,13 @@ mod tests {
 
     fn def(nodes: Vec<Value>, edges: Vec<Value>) -> Definition {
         serde_json::from_value(json!({"nodes": nodes, "edges": edges}))
+            .expect("测试定义应可反序列化")
+    }
+
+    /// 同 [`def`]，但显式带 semantics（缺省反序列化为 1，无法事后修改——
+    /// Definition 是编译后的不可变形态）。
+    fn def_with_semantics(nodes: Vec<Value>, edges: Vec<Value>, semantics: u32) -> Definition {
+        serde_json::from_value(json!({"nodes": nodes, "edges": edges, "semantics": semantics}))
             .expect("测试定义应可反序列化")
     }
 
@@ -1496,7 +1600,7 @@ mod tests {
         }
     }
 
-    /// x-secret 参数就是 email 的 `api_key`，且**只在**这个类型上。
+    /// x-secret 参数只在 email 与 harness 上，键名都是 `api_key`。
     ///
     /// 清单已从 descriptor 派生（`x-secret: true` 扫描），所以这里断言的是
     /// 「哪些类型该有密钥」这个业务事实，而不是「派生是否一致」——后者已由
@@ -1504,8 +1608,9 @@ mod tests {
     #[test]
     fn secret_params_are_the_expected_keys() {
         assert_eq!(NodeType::Email.secret_params(), vec!["api_key"]);
+        assert_eq!(NodeType::Harness.secret_params(), vec!["api_key"]);
         for kind in NodeType::ALL {
-            let expected = matches!(kind, NodeType::Email);
+            let expected = matches!(kind, NodeType::Email | NodeType::Harness);
             assert_eq!(
                 !kind.secret_params().is_empty(),
                 expected,
@@ -1644,6 +1749,107 @@ mod tests {
         );
         let err = email.validate().unwrap_err();
         assert!(err.contains("to"), "{err}");
+    }
+
+    /// harness 模式契约：mode 枚举、条件必填、跨模式参数拒绝、
+    /// workdir 字面量约束、semantics=1 拒绝 agent。
+    #[test]
+    fn harness_mode_validation() {
+        let harness_def = |params: Value, semantics: u32| {
+            def_with_semantics(
+                vec![
+                    node("s", "start"),
+                    json!({"id": "n", "type": "harness", "params": params}),
+                    node("e", "end"),
+                ],
+                vec![json!({"from":"s","to":"n"}), json!({"from":"n","to":"e"})],
+                semantics,
+            )
+        };
+        // mode 模板 / 未知值拒绝
+        for mode in ["${input.x}", "agentic", "Command"] {
+            let err = harness_def(json!({"mode": mode, "command": "kimi", "prompt": "p"}), 2)
+                .validate()
+                .unwrap_err();
+            assert!(err.contains("mode"), "{err}");
+        }
+        // command 模式缺 command（required 已不含它）
+        let err = harness_def(json!({"prompt": "p"}), 2)
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("command"), "{err}");
+        // command 模式带 api_key：跨模式拒绝
+        let err = harness_def(json!({"command": "kimi", "prompt": "p", "api_key": "K"}), 2)
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("api_key"), "{err}");
+        // agent 模式：缺 workdir / 缺 api_key / 相对路径 / 模板 workdir / 带 command / 带非空 args
+        let err = harness_def(json!({"mode": "agent", "prompt": "p", "api_key": "K"}), 2)
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("workdir"), "{err}");
+        let err = harness_def(
+            json!({"mode": "agent", "prompt": "p", "workdir": "/tmp/w"}),
+            2,
+        )
+        .validate()
+        .unwrap_err();
+        assert!(err.contains("api_key"), "{err}");
+        let err = harness_def(
+            json!({"mode": "agent", "prompt": "p", "api_key": "K", "workdir": "tmp/w"}),
+            2,
+        )
+        .validate()
+        .unwrap_err();
+        assert!(err.contains("绝对"), "{err}");
+        let err = harness_def(
+            json!({"mode": "agent", "prompt": "p", "api_key": "K", "workdir": "${input.w}"}),
+            2,
+        )
+        .validate()
+        .unwrap_err();
+        assert!(err.contains("模板"), "{err}");
+        let err = harness_def(
+            json!({"mode": "agent", "prompt": "p", "api_key": "K", "workdir": "/tmp/w", "command": "kimi"}),
+            2,
+        )
+        .validate()
+        .unwrap_err();
+        assert!(err.contains("command"), "{err}");
+        let err = harness_def(
+            json!({"mode": "agent", "prompt": "p", "api_key": "K", "workdir": "/tmp/w", "args": ["-x"]}),
+            2,
+        )
+        .validate()
+        .unwrap_err();
+        assert!(err.contains("args"), "{err}");
+        // 合法 agent 节点（semantics=2）
+        assert!(harness_def(
+            json!({"mode": "agent", "prompt": "p", "api_key": "K", "workdir": "/tmp/w"}),
+            2
+        )
+        .validate()
+        .is_ok());
+        // 空 args 在 agent 模式下可容忍（等价未设置）
+        assert!(harness_def(
+            json!({"mode": "agent", "prompt": "p", "api_key": "K", "workdir": "/tmp/w", "args": []}),
+            2
+        )
+        .validate()
+        .is_ok());
+
+        // semantics=1 + agent 节点：保存期拒绝
+        let err = harness_def(
+            json!({"mode": "agent", "prompt": "p", "api_key": "K", "workdir": "/tmp/w"}),
+            1,
+        )
+        .validate()
+        .unwrap_err();
+        assert!(err.contains("semantics=1"), "{err}");
+        // semantics=1 + command 节点不受影响
+        assert!(harness_def(json!({"command": "kimi", "prompt": "p"}), 1)
+            .validate()
+            .is_ok());
     }
 
     /// input 节点的 fields：必填、必须是数组、每项含非空 key。

@@ -91,6 +91,7 @@ impl JournalBackend {
                 bindings,
                 regression: None,
                 correlation_id: None,
+                agent: self.harness_agent_config(),
             }),
         ))
     }

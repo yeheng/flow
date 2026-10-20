@@ -60,6 +60,7 @@ pub struct Config {
     pub execution: ExecutionConfig,
     pub agent: AgentConfig,
     pub journal: JournalConfig,
+    pub harness: HarnessConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -252,6 +253,104 @@ impl Default for AgentConfig {
             token: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct HarnessConfig {
+    /// harness 节点 agent 模式的模型配置（run 启动时冻结进执行快照）。
+    pub agent: HarnessAgentConfig,
+}
+
+/// `[harness.agent]`：内置 agent 的模型配置。`base_url` 与 `model` 成对
+/// 配置才启用（都留空 = 关闭，agent 模式运行期报清晰错误）。
+/// 真值校验（URL 形态/数值边界）在 [`HarnessAgentConfig::validate`]。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct HarnessAgentConfig {
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    /// `openai`（默认，OpenAI 兼容）| `anthropic`
+    pub api: Option<String>,
+    /// LLM 出口代理；禁止 userinfo/query（代理凭据不进请求/journal）。
+    pub proxy: Option<String>,
+    /// 1..=200（省略 = conga 默认 50）
+    pub max_turns: Option<u64>,
+    /// 1..=100（省略 = conga 默认）
+    pub max_tool_calls_per_turn: Option<u64>,
+    /// 1..=1_000_000
+    pub max_tokens: Option<u64>,
+    /// 省略 = conga 默认（无引擎级工具超时；取消/超时由 executor 杀进程组）
+    pub tool_timeout_secs: Option<u64>,
+}
+
+impl HarnessAgentConfig {
+    fn non_empty(value: &Option<String>) -> Option<&str> {
+        value.as_deref().filter(|v| !v.trim().is_empty())
+    }
+
+    /// 启用判定与跨字段校验。返回 Err 的文案直接面向配置编辑者。
+    pub fn validate(&self) -> Result<(), String> {
+        let base_url = Self::non_empty(&self.base_url);
+        let model = Self::non_empty(&self.model);
+        match (base_url, model) {
+            (Some(_), None) => {
+                return Err("harness.agent.model 与 base_url 必须成对配置".into());
+            }
+            (None, Some(_)) => {
+                return Err("harness.agent.base_url 与 model 必须成对配置".into());
+            }
+            _ => {}
+        }
+        if let Some(url) = base_url {
+            check_endpoint(url, "harness.agent.base_url")?;
+        }
+        if let Some(api) = self.api.as_deref().filter(|v| !v.trim().is_empty()) {
+            if !matches!(api, "openai" | "anthropic") {
+                return Err(format!(
+                    "harness.agent.api 非法：{api:?}（允许 openai | anthropic）"
+                ));
+            }
+        }
+        if let Some(proxy) = Self::non_empty(&self.proxy) {
+            check_endpoint(proxy, "harness.agent.proxy")?;
+        }
+        for (name, value, max) in [
+            ("max_turns", self.max_turns, 200u64),
+            ("max_tool_calls_per_turn", self.max_tool_calls_per_turn, 100),
+            ("max_tokens", self.max_tokens, 1_000_000),
+            ("tool_timeout_secs", self.tool_timeout_secs, 86_400),
+        ] {
+            if let Some(v) = value {
+                if v == 0 || v > max {
+                    return Err(format!("harness.agent.{name} 必须在 1..={max}"));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 端点 URL 校验：http(s)、无 userinfo、无 query。
+fn check_endpoint(url: &str, field: &str) -> Result<(), String> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .ok_or_else(|| format!("{field} 必须是 http(s):// URL（当前 {url:?}）"))?;
+    // scheme 之后、首个路径/query/fragment 之前是 authority；userinfo 以 @ 分隔
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.contains('@') {
+        return Err(format!(
+            "{field} 禁止携带 userinfo（凭据不进配置/请求/journal）：{url:?}"
+        ));
+    }
+    if url.contains('?') {
+        return Err(format!("{field} 禁止携带 query：{url:?}"));
+    }
+    if authority.is_empty() {
+        return Err(format!("{field} 缺少主机名：{url:?}"));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -497,6 +596,7 @@ impl Config {
         if self.agent.slots == 0 {
             return Err("agent.slots 必须 > 0".into());
         }
+        self.harness.agent.validate()?;
         let _ = parse_addr(&self.journal.addr, "journal.addr")?;
         let _ = parse_addr(&self.journal.http_addr, "journal.http_addr")?;
         Ok(())
@@ -545,9 +645,10 @@ impl Config {
                 "execution" => replace_section!(out.execution, "execution", value),
                 "agent" => replace_section!(out.agent, "agent", value),
                 "journal" => replace_section!(out.journal, "journal", value),
+                "harness" => replace_section!(out.harness, "harness", value),
                 other => {
                     return Err(ConfigError::Invalid(format!(
-                        "未知配置分区 {other:?}（合法：server/storage/execution/agent/journal）"
+                        "未知配置分区 {other:?}（合法：server/storage/execution/agent/journal/harness）"
                     )))
                 }
             }
@@ -778,6 +879,83 @@ fn durable_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn harness_agent_section_validates_pairing_urls_and_bounds() {
+        // 旧 toml（无 section）可解析，默认关闭
+        let legacy: Config = toml::from_str("[server]\n").unwrap();
+        assert_eq!(legacy.harness, HarnessConfig::default());
+        legacy.validate().unwrap();
+
+        // 成对 + 合法配置
+        let ok: Config = toml::from_str(
+            "[harness.agent]\nbase_url='https://api.deepseek.com/v1'\nmodel='deepseek-chat'\napi='anthropic'\nmax_turns=50\n",
+        )
+        .unwrap();
+        ok.validate().unwrap();
+
+        // 成对校验：只配一半拒绝
+        for half in ["base_url='https://x/v1'", "model='m'"] {
+            let config: Config = toml::from_str(&format!("[harness.agent]\n{half}\n")).unwrap();
+            assert!(config.validate().is_err(), "{half} 不该单独出现");
+        }
+
+        // URL 形态：非 http(s) / userinfo / query 拒绝（base_url 与 proxy 同规则）
+        for bad_url in [
+            "ftp://x",
+            "https://user:pass@x/v1",
+            "https://x/v1?token=1",
+            "not-a-url",
+        ] {
+            for field in ["base_url", "proxy"] {
+                let body = if field == "base_url" {
+                    format!("base_url='{bad_url}'\nmodel='m'\n")
+                } else {
+                    format!("base_url='https://x/v1'\nmodel='m'\n{field}='{bad_url}'\n")
+                };
+                let config: Config = toml::from_str(&format!("[harness.agent]\n{body}")).unwrap();
+                assert!(config.validate().is_err(), "{field}={bad_url} 应被拒绝");
+            }
+        }
+
+        // api 枚举与数值边界
+        for bad in [
+            "api='bedrock'",
+            "max_turns=0",
+            "max_turns=201",
+            "max_tool_calls_per_turn=0",
+            "max_tool_calls_per_turn=101",
+            "max_tokens=0",
+            "max_tokens=1000001",
+            "tool_timeout_secs=0",
+        ] {
+            let config: Config = toml::from_str(&format!(
+                "[harness.agent]\nbase_url='https://x/v1'\nmodel='m'\n{bad}\n"
+            ))
+            .unwrap();
+            assert!(config.validate().is_err(), "{bad} 应被拒绝");
+        }
+
+        // merge_patch 整节替换 + 未知分区仍拒绝
+        let patched = Config::merge_patch(
+            &Config::default(),
+            &serde_json::json!({"harness": {"agent": {"base_url": "http://127.0.0.1:1/v1", "model": "m"}}}),
+        )
+        .unwrap();
+        assert_eq!(
+            patched.harness.agent.base_url.as_deref(),
+            Some("http://127.0.0.1:1/v1")
+        );
+        assert!(Config::merge_patch(
+            &patched,
+            &serde_json::json!({"harness": {"agent": {"proxy": "socks5://127.0.0.1:1080"}}})
+        )
+        .is_err());
+
+        // 序列化往返
+        let encoded = toml::to_string(&ok).unwrap();
+        assert_eq!(toml::from_str::<Config>(&encoded).unwrap(), ok);
+    }
+
     #[test]
     fn journal_cluster_is_opt_in_and_validates_identity_and_lease() {
         let config: super::Config =

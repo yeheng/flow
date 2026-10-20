@@ -38,7 +38,7 @@ function cloneNode(n: EditorNode): EditorNode {
   };
 }
 
-export function takeSnapshot(): Snapshot {
+function takeSnapshot(): Snapshot {
   return {
     nodes: editor.nodes.map(cloneNode),
     edges: editor.edges.map((e) => ({ ...e })),

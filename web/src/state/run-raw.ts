@@ -36,10 +36,6 @@ export function describeStoredValue(value: unknown): ValueMarker {
   return { kind: "inline", value };
 }
 
-export function isStoredValueRef(value: unknown): value is StoredValueRef {
-  return describeStoredValue(value).kind === "ref";
-}
-
 /** 原始快照 → RunRecord 形状（input/output 保留信封原文，供大值占位/下载） */
 export function rawRunToRecord(raw: RawRunSnapshot): RunRecord {
   return {

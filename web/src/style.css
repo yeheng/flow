@@ -322,6 +322,39 @@ input.code {
   align-items: center;
 }
 
+/* 列表页错误横幅（加载失败 + 重试入口；加载成功前的失败态） */
+.error-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+  font-size: 12px;
+}
+
+/* copy-cell 按钮化：剥掉 button 默认外观，保持原可点击文本单元格样式 */
+.copy-id {
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  font-family: var(--mono);
+  text-align: left;
+  cursor: pointer;
+}
+
+.copy-id:hover {
+  background: none;
+  border-color: transparent;
+  text-decoration: underline;
+}
+
 /* ---- 共享表单字段（ParamsModal / RunPanel / SchemaField） ---- */
 
 .field {

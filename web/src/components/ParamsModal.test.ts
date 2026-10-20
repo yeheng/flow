@@ -8,7 +8,7 @@ vi.mock("./CodeEditor.vue", () => ({ default: defineComponent({ template: "<div 
 vi.mock("../state/history", () => ({ commitParams: vi.fn() }));
 vi.mock("../state/editor", async () => {
   const { ref } = await import("vue");
-  return { selectedNode: ref(null) };
+  return { selectedNode: ref(null), nodeValidationError: () => null };
 });
 
 import ParamsModal from "./ParamsModal.vue";

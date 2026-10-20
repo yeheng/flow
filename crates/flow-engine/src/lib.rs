@@ -3,6 +3,7 @@ pub mod exec;
 pub mod execution_protocol;
 pub mod expr;
 pub mod journal_state;
+pub use flow_dto::AgentRunConfig;
 pub mod log_types;
 pub mod model;
 pub mod nodelog;

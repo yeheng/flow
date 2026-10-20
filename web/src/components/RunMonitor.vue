@@ -16,9 +16,11 @@ import {
 import { editor } from "../state/editor";
 import { devMode } from "../state/dev";
 import { nodeStateLabel, runBadgeClass, runStatusLabel } from "../state/labels";
+import { friendlyDuration } from "../state/time";
 import { confirmDialog } from "../state/modal";
 import { assembleInput, inputFieldText, parseInputFields } from "../state/run-input";
 import { toast } from "../state/toast";
+import { copyWithToast } from "../state/clipboard";
 import type { AdjudicateDecision, TimelineNode } from "../types";
 import ActivityFeed from "./ActivityFeed.vue";
 import LogConsole from "./LogConsole.vue";
@@ -134,12 +136,7 @@ async function submitAdjudication(node: TimelineNode): Promise<void> {
 }
 
 async function copyOutput(): Promise<void> {
-  try {
-    await navigator.clipboard.writeText(outputText.value);
-    toast.info("已复制输出");
-  } catch {
-    toast.error("复制失败");
-  }
+  await copyWithToast(outputText.value, "输出");
 }
 
 async function onCancelRun(): Promise<void> {
@@ -160,13 +157,7 @@ function signalIsNonJson(text: string | undefined): boolean {
 }
 
 async function copyRunId(): Promise<void> {
-  if (!monitor.runId) return;
-  try {
-    await navigator.clipboard.writeText(monitor.runId);
-    toast.info("已复制 run id");
-  } catch {
-    toast.error("复制失败");
-  }
+  if (monitor.runId) await copyWithToast(monitor.runId, "run id");
 }
 
 function onRowEnter(nodeId: string): void {
@@ -427,7 +418,7 @@ function onOpenChildRun(childRunId: string): void {
                 </div>
               </td>
               <td>{{ n.attempts }}</td>
-              <td>{{ n.duration_ms !== null ? `${n.duration_ms}ms` : "" }}</td>
+              <td>{{ friendlyDuration(n.duration_ms) }}</td>
             </tr>
           </tbody>
         </table>
