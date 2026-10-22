@@ -201,9 +201,7 @@ fn big_int_mixing_number_fails_loudly() {
         &NodeLogger::disabled(),
     )
     .unwrap_err();
-    let EngineError::Expr(msg) = &err else {
-        panic!("应为 Expr 错误：{err}")
-    };
+    let EngineError::Expr(msg) = &err;
     assert!(
         msg.to_lowercase().contains("bigint"),
         "错误应指向 BigInt 混算：{msg}"

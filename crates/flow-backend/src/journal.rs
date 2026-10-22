@@ -23,7 +23,7 @@ use flow_journal::{Event, EventKind, Journal, JournalOptions, Transaction};
 use flow_store::store::{EntityChange, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +50,18 @@ impl From<serde_json::Error> for JournalError {
 }
 type Result<T> = std::result::Result<T, JournalError>;
 
+fn validate_command_identity(scope: &str, request_id: Option<&str>) -> flow_journal::Result<()> {
+    if scope.is_empty()
+        || scope.len() > 256
+        || request_id.is_some_and(|s| s.is_empty() || s.len() > 128)
+    {
+        return Err(flow_journal::Error::Invalid(
+            "invalid request identity".into(),
+        ));
+    }
+    Ok(())
+}
+
 struct CommittedState {
     state: State,
     pending: Option<tokio::task::JoinHandle<flow_journal::Result<flow_journal::Commit>>>,
@@ -62,6 +74,10 @@ pub struct JournalBackend {
     pub store: Arc<Store>,
     pub observations: Option<flow_engine::observation::ObservationStore>,
     state: Mutex<CommittedState>,
+    /// Workflow mutations take the write guard before the state lock. Dependency
+    /// freezing holds a read guard, so it can copy only selected versions while
+    /// retaining one consistent metadata view across asynchronous value reads.
+    pub(crate) workflow_metadata: RwLock<()>,
     shutdown: CancellationToken,
     pub(crate) execution: Mutex<Option<tokio::task::JoinHandle<()>>>,
     execution_changed: Arc<Notify>,
@@ -114,6 +130,7 @@ impl JournalBackend {
                 state,
                 pending: None,
             }),
+            workflow_metadata: RwLock::new(()),
             observations: flow_engine::observation::ObservationStore::open(
                 root.join("observations"),
                 Default::default(),
@@ -255,6 +272,17 @@ impl JournalBackend {
         read(&self.state.lock().await.state)
     }
 
+    /// Finish any commit whose caller was cancelled before its receipt arrived.
+    /// Workflow preflight must see that committed version before storing values.
+    pub(crate) async fn inspect_committed<T>(
+        &self,
+        read: impl FnOnce(&State) -> flow_journal::Result<T>,
+    ) -> Result<T> {
+        let mut committed = self.state.lock().await;
+        self.refresh_locked(&mut committed).await?;
+        Ok(read(&committed.state)?)
+    }
+
     /// 取（或首次物化并缓存）某 run 的已校验 definition。definition 随
     /// run 钉死版本、创建后不可变——每个 run 只物化一次；终态由调度循环
     /// 调 [`Self::evict_definition`] 逐出。物化/校验失败不缓存，瞬时故障
@@ -355,12 +383,7 @@ impl JournalBackend {
         selected: Option<&str>,
         decide: impl FnOnce(&State) -> flow_journal::Result<(Vec<Event>, Value)>,
     ) -> Result<CommandReceipt> {
-        if scope.is_empty()
-            || scope.len() > 256
-            || request_id.is_some_and(|s| s.is_empty() || s.len() > 128)
-        {
-            return Err(flow_journal::Error::Invalid("invalid request identity".into()).into());
-        }
+        validate_command_identity(scope, request_id)?;
         let fingerprint = flow_journal::codec::fingerprint(request, 9 * 1024 * 1024)?;
         let mut committed = self.state.lock().await;
         self.refresh_locked(&mut committed).await?;
@@ -401,6 +424,20 @@ impl JournalBackend {
     }
 
     pub async fn append(&self, events: Vec<Event>) -> Result<u64> {
+        // Raw metadata facts (offline import/maintenance) obey the same ordering.
+        let _metadata = if events.iter().any(|e| {
+            matches!(
+                e.kind,
+                EventKind::WorkflowCreated
+                    | EventKind::WorkflowUpdated
+                    | EventKind::WorkflowPublished
+                    | EventKind::WorkflowDeleted
+            )
+        }) {
+            Some(self.workflow_metadata.write().await)
+        } else {
+            None
+        };
         let mut state = self.state.lock().await;
         self.refresh_locked(&mut state).await?;
         if let [event] = events.as_slice() {
@@ -606,7 +643,8 @@ impl JournalBackend {
         request_id: Option<&str>,
         request: &Value,
     ) -> Result<Option<CommandReceipt>> {
-        let Some(id) = request_id.filter(|id| !id.is_empty()) else {
+        validate_command_identity(scope, request_id)?;
+        let Some(id) = request_id else {
             return Ok(None);
         };
         let fingerprint = flow_journal::codec::fingerprint(request, 9 * 1024 * 1024)?;

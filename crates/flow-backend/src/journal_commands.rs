@@ -41,6 +41,24 @@ impl PreparedDefinition {
             checksum: flow_journal::codec::digest(&bytes),
         })
     }
+    /// Caller holds the metadata write guard through the eventual command commit.
+    /// Reusing an equal version must not publish a second, unreferenced value.
+    async fn store(
+        self,
+        backend: &JournalBackend,
+        latest: Option<&DefinitionVersion>,
+    ) -> Result<(String, flow_journal::StoredValue)> {
+        self.require_secrets()?;
+        let stored = match latest.filter(|v| v.checksum == self.checksum) {
+            Some(version) => version.definition.clone(),
+            None => {
+                backend
+                    .store_json(self.value, flow_journal::MAX_LINE_BYTES)
+                    .await?
+            }
+        };
+        Ok((self.checksum, stored))
+    }
     fn missing_secrets(&self) -> Vec<(String, String)> {
         flow_engine::secrets::missing_secrets(&self.parsed)
     }
@@ -59,6 +77,20 @@ impl PreparedDefinition {
                 .join("; "),
         ))
     }
+}
+
+fn import_target<'a>(state: &'a State, name: &str) -> flow_journal::Result<Option<&'a Workflow>> {
+    let mut matches = state
+        .workflows
+        .values()
+        .filter(|w| !w.deleted && w.name == name);
+    let target = matches.next();
+    if matches.next().is_some() {
+        return Err(flow_journal::Error::Conflict(format!(
+            "multiple workflows named {name}; update by workflow_id or use a unique import name"
+        )));
+    }
+    Ok(target)
 }
 
 /// Repeated saves/imports reuse the latest version and its publication state.
@@ -464,19 +496,21 @@ impl JournalBackend {
         validate_workflow_name(name)?;
         let prepared = PreparedDefinition::new(definition)?;
         let request = json!({"name":name,"definition":prepared.value,"publish":publish});
+        let _metadata = self.workflow_metadata.write().await;
         if let Some(receipt) = deduped(self, "workflow.import", request_id, &request).await? {
             return Ok(receipt);
         }
-        prepared.require_secrets()?;
-        let checksum = prepared.checksum;
-        let stored = self
-            .store_json(prepared.value, flow_journal::MAX_LINE_BYTES)
+        let latest = self
+            .inspect_committed(|state| {
+                Ok::<_, flow_journal::Error>(
+                    import_target(state, name)?
+                        .and_then(|w| w.versions.last_key_value().map(|(_, v)| v.clone())),
+                )
+            })
             .await?;
+        let (checksum, stored) = prepared.store(self, latest.as_ref()).await?;
         self.command("workflow.import", request_id, &request, |state| {
-            let existing = state
-                .workflows
-                .values()
-                .find(|w| !w.deleted && w.name == name);
+            let existing = import_target(state, name)?;
             let created = existing.is_none();
             let workflow_id = existing.map(|w| w.workflow_id.clone()).unwrap_or_else(id);
             let mut events = Vec::new();
@@ -518,6 +552,7 @@ impl JournalBackend {
         request_id: Option<&str>,
     ) -> Result<CommandReceipt> {
         validate_workflow_name(name)?;
+        let _metadata = self.workflow_metadata.write().await;
         self.command("workflow.create", request_id, &json!({"name":name}), |_| {
             let workflow_id = id();
             let w = Workflow {
@@ -545,16 +580,25 @@ impl JournalBackend {
     ) -> Result<CommandReceipt> {
         let prepared = PreparedDefinition::new(definition)?;
         let fingerprint_request = json!({"workflow_id":workflow_id,"definition":prepared.value});
+        let _metadata = self.workflow_metadata.write().await;
         if let Some(receipt) =
             deduped(self, "workflow.update", request_id, &fingerprint_request).await?
         {
             return Ok(receipt);
         }
-        prepared.require_secrets()?;
-        let checksum = prepared.checksum;
-        let stored = self
-            .store_json(prepared.value, flow_journal::MAX_LINE_BYTES)
+        let latest = self
+            .inspect_committed(|state| {
+                let workflow = state
+                    .workflows
+                    .get(workflow_id)
+                    .filter(|w| !w.deleted)
+                    .ok_or_else(|| flow_journal::Error::NotFound("workflow not found".into()))?;
+                Ok::<_, flow_journal::Error>(
+                    workflow.versions.last_key_value().map(|(_, v)| v.clone()),
+                )
+            })
             .await?;
+        let (checksum, stored) = prepared.store(self, latest.as_ref()).await?;
         self.command(
             "workflow.update",
             request_id,
@@ -581,6 +625,7 @@ impl JournalBackend {
         version: u64,
         request_id: Option<&str>,
     ) -> Result<CommandReceipt> {
+        let _metadata = self.workflow_metadata.write().await;
         self.command(
             "workflow.publish",
             request_id,
@@ -610,6 +655,7 @@ impl JournalBackend {
         workflow_id: &str,
         request_id: Option<&str>,
     ) -> Result<CommandReceipt> {
+        let _metadata = self.workflow_metadata.write().await;
         self.command(
             "workflow.delete",
             request_id,
@@ -1025,7 +1071,7 @@ impl JournalBackend {
 
     /// 可复用节点模板的落账命令（TemplateChanged 事实）。patch 合并语义与
     /// config_change 一致；`deleted=true` 删除。非删除模板要求 name 唯一、
-    /// nodes/edges 为数组（逐节点结构校验在 RPC 边缘，这里只做形状与唯一性）。
+    /// name/category/nodes/edges 共用引擎模板规则，合并后再验证完整片段。
     pub async fn template_change(
         &self,
         key: &str,
@@ -1309,7 +1355,7 @@ fn trigger_event(
     Ok((vec![Event::new(kind, value.clone())], value))
 }
 
-// Compatibility entry point used by bundle import and the raw template command.
+// Raw patch entry point shares the final domain validation with typed commands.
 fn template_decision(
     state: &State,
     key: &str,
@@ -1339,12 +1385,7 @@ fn template_event(
     }
     value["id"] = json!(key);
     if value["deleted"] != true {
-        let name = value["name"]
-            .as_str()
-            .ok_or_else(|| invalid("template name required"))?;
-        if name.is_empty() || name.len() > 1024 {
-            return Err(invalid("invalid template name"));
-        }
+        flow_engine::template::normalize(&mut value)?;
         // name 唯一（UI 以名为键）：撞别的模板即拒绝，不静默改名。
         if state
             .templates
@@ -1354,11 +1395,6 @@ fn template_event(
             return Err(flow_journal::Error::Conflict(
                 "template name already taken".into(),
             ));
-        }
-        for field in ["nodes", "edges"] {
-            if !value[field].is_array() {
-                return Err(invalid(format!("template {field} must be an array")));
-            }
         }
         value["updated_at"] = json!(now());
     }

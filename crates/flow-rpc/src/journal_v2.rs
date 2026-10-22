@@ -821,15 +821,20 @@ async fn product_command_route(
             )?;
         }
     }
-    let mut fragment = None;
-    if method.starts_with("template.") && method != "template.delete" {
-        if method == "template.create" || p.get("name").is_some() {
-            crate::validate_template_name(text(p, "name")?)?;
-        }
-        if method == "template.create" || p.get("nodes").is_some() || p.get("edges").is_some() {
-            fragment = Some(crate::validate_fragment(&p["nodes"], &p["edges"])?);
-        }
-    }
+    // Preserve the existing normalized wire fingerprint when a complete fragment
+    // is supplied. Partial updates are merged and validated by the backend.
+    let fragment = if method.starts_with("template.")
+        && method != "template.delete"
+        && p.get("nodes").is_some()
+        && p.get("edges").is_some()
+    {
+        Some(
+            flow_engine::template::normalize_fragment(&p["nodes"], &p["edges"])
+                .map_err(|e| failure(e.into()))?,
+        )
+    } else {
+        None
+    };
     let mut args = p.clone();
     let map = args.as_object_mut().unwrap();
     map.remove("request_id");

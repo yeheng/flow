@@ -23,6 +23,8 @@ pub mod schema;
 pub mod secrets;
 #[cfg(feature = "runtime")]
 pub mod secrets_store;
+#[cfg(feature = "runtime")]
+pub mod template;
 pub const MAX_SUB_WORKFLOW_DEPTH: u32 = 16;
 /// Execution compatibility, frozen into runs. Bump when node semantics, snapshot
 /// interpretation or executor contracts become incompatible. Never accept an old
