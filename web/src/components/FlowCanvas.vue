@@ -7,6 +7,7 @@ import { Controls } from "@vue-flow/controls";
 import { MiniMap } from "@vue-flow/minimap";
 import {
   addNode,
+  CANVAS_SNAP_GRID,
   autoLayout,
   canPaste,
   copySelection,
@@ -79,9 +80,13 @@ const wrapEl = ref<HTMLElement>();
 /** 右键菜单条目归全局弹层栈（kind="context-menu"）：Esc 先关菜单，本视图只渲染条目 */
 const menuEntries = computed(() => overlaysOf<MenuPayload>("context-menu"));
 /** 右键拖拽的临时连线（canvas-wrap 本地坐标）；valid 表示当前落点是合法目标 */
-const linkLine = shallowRef<{ x1: number; y1: number; x2: number; y2: number; valid: boolean } | null>(
-  null,
-);
+const linkLine = shallowRef<{
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  valid: boolean;
+} | null>(null);
 /** 激活后的右键模式（决定光标样式；「menu」模式不激活） */
 const rmbMode = ref<"pan" | "link" | null>(null);
 
@@ -126,18 +131,14 @@ function onCanvasMouseDown(e: MouseEvent): void {
       state.sourceHandleEl = picked?.el ?? null;
     }
   } else {
-    state.hitEdgeId =
-      target.closest(".vue-flow__edge")?.getAttribute("data-id") ?? undefined;
+    state.hitEdgeId = target.closest(".vue-flow__edge")?.getAttribute("data-id") ?? undefined;
     state.origin = getViewport();
   }
   rmb = state;
 }
 
 /** 节点有多个出端口（condition 真/假）时，取离鼠标最近的端口 */
-function nearestSourceHandle(
-  nodeId: string,
-  e: MouseEvent,
-): { id: string; el: Element } | null {
+function nearestSourceHandle(nodeId: string, e: MouseEvent): { id: string; el: Element } | null {
   const nodeEl = wrapEl.value?.querySelector(`.vue-flow__node[data-id="${CSS.escape(nodeId)}"]`);
   const handles = nodeEl?.querySelectorAll(".vue-flow__handle.source") ?? [];
   let best: { id: string; el: Element; dist: number } | null = null;
@@ -417,7 +418,7 @@ onUnmounted(() => {
       :min-zoom="0.2"
       :max-zoom="2"
       :snap-to-grid="true"
-      :snap-grid="[16, 16]"
+      :snap-grid="[CANVAS_SNAP_GRID, CANVAS_SNAP_GRID]"
       color-mode="dark"
       fit-view-on-init
       @connect="onConnect"
@@ -455,11 +456,7 @@ onUnmounted(() => {
         :class="linkLine.valid ? 'valid' : 'invalid'"
       />
     </svg>
-    <CanvasContextMenu
-      v-for="entry in menuEntries"
-      :key="entry.id"
-      :entry="entry"
-    />
+    <CanvasContextMenu v-for="entry in menuEntries" :key="entry.id" :entry="entry" />
     <div v-if="!editor.workflowId" class="canvas-hint">在左侧新建或选择一个工作流</div>
   </div>
 </template>

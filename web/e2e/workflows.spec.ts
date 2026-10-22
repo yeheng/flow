@@ -40,13 +40,11 @@ test("导入工作流 JSON：文件选择 → 名字弹窗 → 列表出现且�
     },
   });
   await page.locator(".page-header button", { hasText: "导入" }).click();
-  await page
-    .locator("input[type=file]")
-    .setInputFiles({
-      name: "import-case.json",
-      mimeType: "application/json",
-      buffer: Buffer.from(envelope),
-    });
+  await page.locator("input[type=file]").setInputFiles({
+    name: "import-case.json",
+    mimeType: "application/json",
+    buffer: Buffer.from(envelope),
+  });
 
   // 名字弹窗预填信封 name，确定后导入并发布
   await expect(page.locator(".modal input")).toHaveValue(name);
@@ -82,13 +80,11 @@ test("导入工作流 JSON：文件选择 → 名字弹窗 → 列表出现且�
     },
   });
   await page.locator(".page-header button", { hasText: "导入" }).click();
-  await page
-    .locator("input[type=file]")
-    .setInputFiles({
-      name: "import-case.json",
-      mimeType: "application/json",
-      buffer: Buffer.from(changed),
-    });
+  await page.locator("input[type=file]").setInputFiles({
+    name: "import-case.json",
+    mimeType: "application/json",
+    buffer: Buffer.from(changed),
+  });
   await page.locator(".modal").getByRole("button", { name: "确定" }).click();
   await expect(page.locator(".toast-success")).toContainText("追加版本");
   await expect(page).toHaveURL(/\/workflows\/[0-9a-f-]{36}/);
@@ -109,13 +105,11 @@ const simpleDefinition = {
 test("无效导入和取消补填都不产生空记录", async ({ page }) => {
   await page.goto("/workflows");
   const name = uniq("e2e-非法导入");
-  await page
-    .locator("input[type=file]")
-    .setInputFiles({
-      name: "invalid.json",
-      mimeType: "application/json",
-      buffer: Buffer.from(JSON.stringify({ name, definition: { nodes: [], edges: [] } })),
-    });
+  await page.locator("input[type=file]").setInputFiles({
+    name: "invalid.json",
+    mimeType: "application/json",
+    buffer: Buffer.from(JSON.stringify({ name, definition: { nodes: [], edges: [] } })),
+  });
   await page.locator(".modal").getByRole("button", { name: "确定" }).click();
   await expect(page.locator(".toast-error")).toBeVisible();
   let listed = await rpc<{ workflows: { name: string }[] }>("workflow.list.view");
@@ -267,4 +261,91 @@ test("运行中等待 input 节点时自动弹表单，提交后继续执行", a
   await page.locator(".modal").getByLabel("审批编号").fill("approved");
   await page.locator(".modal").getByRole("button", { name: "提交并继续" }).click();
   expect(await waitTerminal(runId)).toBe("succeeded");
+});
+
+test("运行表单回填、字符串类型保持和跨工作流输入隔离", async ({ page }) => {
+  const contract = {
+    type: "object",
+    required: ["id", "count"],
+    properties: { id: { type: "string" }, count: { type: "integer" } },
+    additionalProperties: false,
+  };
+  const a = await rpc<{ workflow_id: string }>("workflow.import", {
+    name: uniq("e2e-输入A"),
+    definition: { ...simpleDefinition, input_schema: contract },
+  });
+  const nameB = uniq("e2e-输入B");
+  const b = await rpc<{ workflow_id: string }>("workflow.import", {
+    name: nameB,
+    definition: { ...simpleDefinition, input_schema: contract },
+  });
+  await page.goto(`/workflows/${a.workflow_id}`);
+  await expect(page.locator(".vue-flow__node")).toHaveCount(2);
+  await expect(page.locator(".wf-dirty")).toHaveCount(0);
+  await page.getByRole("button", { name: "控制台 ▴" }).click();
+  const panel = page.locator(".run-panel");
+  await expect(panel.getByLabel("id", { exact: true })).toHaveValue("");
+  await page.getByRole("button", { name: "运行", exact: true }).click();
+  await page.locator(".modal").getByLabel("id", { exact: false }).fill("true");
+  await page.locator(".modal").getByLabel("count", { exact: false }).fill("1");
+  await page.locator(".modal").getByRole("button", { name: "运行", exact: true }).click();
+  await expect(page.locator(".run-monitor .run-phase")).toHaveText("成功");
+  await expect(panel.getByLabel("id", { exact: true })).toHaveValue("true");
+  await panel.getByLabel("count", { exact: true }).fill("2");
+  await page.getByRole("button", { name: "运行", exact: true }).click();
+  await expect
+    .poll(
+      async () =>
+        (await rpc<{ runs: { input: unknown }[] }>("run.list.view", { workflow_id: a.workflow_id }))
+          .runs.length,
+    )
+    .toBe(2);
+  await expect(page.locator(".modal")).toHaveCount(0);
+  const runs = await rpc<{ runs: { input: unknown }[] }>("run.list.view", {
+    workflow_id: a.workflow_id,
+  });
+  expect(runs.runs[0].input).toEqual({ id: "true", count: 2 });
+  await page.getByRole("link", { name: "← 工作流列表" }).click();
+  await page
+    .locator("tbody tr", { hasText: nameB })
+    .getByRole("link", { name: "打开", exact: true })
+    .click();
+  await expect(page).toHaveURL(`/workflows/${b.workflow_id}`);
+  await expect(page.locator(".editor-title")).toContainText(nameB);
+  await expect(panel.getByLabel("id", { exact: true })).toHaveValue("");
+});
+
+test("直接访问版本页也可以加载版本到编辑器", async ({ page }) => {
+  const workflow = await seedWorkflow(uniq("e2e-版本直达"), "return 1;");
+  await page.goto(`/workflows/${workflow.id}/versions`);
+  await page.getByRole("button", { name: "加载到编辑器" }).click();
+  await expect(page).toHaveURL(`/workflows/${workflow.id}`);
+  await expect(page.locator(".vue-flow__node")).toHaveCount(3);
+  await expect(page.locator(".toast-error")).toHaveCount(0);
+});
+
+test("浏览器返回离开编辑器时关闭待输入弹窗，不启动运行", async ({ page }) => {
+  const name = uniq("e2e-取消待输入");
+  const workflow = await rpc<{ workflow_id: string }>("workflow.import", {
+    name,
+    definition: {
+      ...simpleDefinition,
+      input_schema: { type: "object", required: ["id"], properties: { id: { type: "string" } } },
+    },
+  });
+  await page.goto("/workflows");
+  await page
+    .locator("tbody tr", { hasText: name })
+    .getByRole("link", { name: "打开", exact: true })
+    .click();
+  await expect(page).toHaveURL(`/workflows/${workflow.workflow_id}`);
+  await page.getByRole("button", { name: "运行", exact: true }).click();
+  await expect(page.locator(".modal-message")).toHaveText("填写工作流运行输入");
+  await page.goBack();
+  await expect(page).toHaveURL("/workflows");
+  await expect(page.locator(".modal")).toHaveCount(0);
+  const runs = await rpc<{ runs: unknown[] }>("run.list.view", {
+    workflow_id: workflow.workflow_id,
+  });
+  expect(runs.runs).toHaveLength(0);
 });

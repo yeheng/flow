@@ -1033,7 +1033,6 @@ dependencies = [
  "clap",
  "flow-config",
  "flow-engine",
- "flow-journal",
  "futures",
  "libc",
  "parking_lot",
@@ -1235,6 +1234,7 @@ dependencies = [
  "flow-test-support",
  "serde_json",
  "sqlx",
+ "thiserror 2.0.21",
  "tokio",
 ]
 

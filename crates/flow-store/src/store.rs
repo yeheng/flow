@@ -3,6 +3,14 @@ use serde_json::Value;
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use std::path::Path;
 
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("RESPONSE_TOO_LARGE")]
+    ResponseTooLarge,
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+}
+
 pub struct Store {
     pool: SqlitePool,
 }
@@ -31,18 +39,16 @@ fn attempt_filter(q: &mut QueryBuilder<Sqlite>, run: &str, all: bool) {
     }
 }
 
-fn decode_body(kind: &str, key: &str, body: &str, digest: &str) -> Result<Value, sqlx::Error> {
+fn decode_body(kind: &str, key: &str, body: &str, digest: &str) -> Result<Value, Error> {
     if flow_journal::sqlite::entity_digest(kind, key, body) != digest {
-        return Err(sqlx::Error::Protocol(
-            "current entity checksum mismatch".into(),
-        ));
+        return Err(sqlx::Error::Protocol("current entity checksum mismatch".into()).into());
     }
-    serde_json::from_str(body).map_err(|e| sqlx::Error::Decode(Box::new(e)))
+    serde_json::from_str(body).map_err(|e| Error::Database(sqlx::Error::Decode(Box::new(e))))
 }
 
 impl Store {
     /// Opens only an existing authoritative database. This query handle cannot write it.
-    pub async fn open(path: &Path, journal_id: &str) -> Result<Self, sqlx::Error> {
+    pub async fn open(path: &Path, journal_id: &str) -> Result<Self, Error> {
         use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
         let pool = SqlitePoolOptions::new()
             .max_connections(4)
@@ -52,45 +58,40 @@ impl Store {
             .fetch_one(&pool)
             .await?;
         if version != flow_journal::sqlite::FORMAT {
-            return Err(sqlx::Error::Protocol(
-                "unsupported SQLite storage format".into(),
-            ));
+            return Err(sqlx::Error::Protocol("unsupported SQLite storage format".into()).into());
         }
         let identity: String =
             sqlx::query_scalar("SELECT journal_id FROM store_meta WHERE singleton=1")
                 .fetch_one(&pool)
                 .await?;
         if identity != journal_id {
-            return Err(sqlx::Error::Protocol("foreign SQLite authority".into()));
+            return Err(sqlx::Error::Protocol("foreign SQLite authority".into()).into());
         }
         Ok(Self { pool })
     }
-    pub async fn applied_lsn(&self) -> Result<u64, sqlx::Error> {
+    pub async fn applied_lsn(&self) -> Result<u64, Error> {
         let raw: String =
             sqlx::query_scalar("SELECT committed_lsn FROM store_meta WHERE singleton=1")
                 .fetch_one(&self.pool)
                 .await?;
         raw.parse()
-            .map_err(|_| sqlx::Error::Protocol("invalid commit cursor".into()))
+            .map_err(|_| Error::Database(sqlx::Error::Protocol("invalid commit cursor".into())))
     }
-    pub async fn domain_mode(&self) -> Result<bool, sqlx::Error> {
+    pub async fn domain_mode(&self) -> Result<bool, Error> {
         sqlx::query_scalar("SELECT domain_mode FROM store_meta WHERE singleton=1")
             .fetch_one(&self.pool)
             .await
+            .map_err(Error::from)
     }
     /// State and its cursor share one SQLite read transaction.
-    pub async fn get(&self, kind: &str, key: &str) -> Result<(u64, Option<Value>), sqlx::Error> {
+    pub async fn get(&self, kind: &str, key: &str) -> Result<(u64, Option<Value>), Error> {
         self.get_entity(kind, key, true, true).await
     }
     /// Read run metadata without assembling its node ledger.
-    pub async fn get_summary(
-        &self,
-        kind: &str,
-        key: &str,
-    ) -> Result<(u64, Option<Value>), sqlx::Error> {
+    pub async fn get_summary(&self, kind: &str, key: &str) -> Result<(u64, Option<Value>), Error> {
         self.get_entity(kind, key, false, false).await
     }
-    pub async fn get_execution(&self, key: &str) -> Result<(u64, Option<Value>), sqlx::Error> {
+    pub async fn get_execution(&self, key: &str) -> Result<(u64, Option<Value>), Error> {
         self.get_entity("run", key, true, false).await
     }
     async fn get_entity(
@@ -99,7 +100,7 @@ impl Store {
         key: &str,
         with_nodes: bool,
         all_attempts: bool,
-    ) -> Result<(u64, Option<Value>), sqlx::Error> {
+    ) -> Result<(u64, Option<Value>), Error> {
         let mut tx = self.pool.begin().await?;
         let lsn: String =
             sqlx::query_scalar("SELECT committed_lsn FROM store_meta WHERE singleton=1")
@@ -113,7 +114,7 @@ impl Store {
                 .await?;
         let body: Option<String> = body_row.as_ref().map(|r| r.get(0));
         if body.as_deref() == Some("RESPONSE_TOO_LARGE") {
-            return Err(sqlx::Error::Protocol("RESPONSE_TOO_LARGE".into()));
+            return Err(Error::ResponseTooLarge);
         }
         let mut value: Option<Value> = body
             .as_ref()
@@ -123,7 +124,7 @@ impl Store {
             if let Some(workflow) = value.as_mut() {
                 let size:i64=sqlx::query_scalar("SELECT COALESCE(SUM(length(CAST(body AS BLOB))),0) FROM current_entities WHERE kind='workflow_version' AND parent=?").bind(key).fetch_one(&mut *tx).await?;
                 if size > 8 * 1024 * 1024 {
-                    return Err(sqlx::Error::Protocol("RESPONSE_TOO_LARGE".into()));
+                    return Err(Error::ResponseTooLarge);
                 }
                 let rows=sqlx::query("SELECT key,body,digest FROM current_entities WHERE kind='workflow_version' AND parent=? ORDER BY key").bind(key).fetch_all(&mut *tx).await?;
                 for row in rows {
@@ -155,7 +156,7 @@ impl Store {
                         .fetch_one(&mut *tx)
                         .await?;
                 if size > (8 * 1024 * 1024 - body.as_ref().map_or(0, String::len)) as i64 {
-                    return Err(sqlx::Error::Protocol("RESPONSE_TOO_LARGE".into()));
+                    return Err(Error::ResponseTooLarge);
                 }
                 let nodes = sqlx::query("SELECT slot AS node_id,key,body,digest FROM current_entities WHERE kind='run_node' AND parent=?")
                     .bind(key).fetch_all(&mut *tx).await?;
@@ -201,7 +202,7 @@ impl Store {
         kind: &str,
         key: &str,
         upper: u64,
-    ) -> Result<Option<Value>, sqlx::Error> {
+    ) -> Result<Option<Value>, Error> {
         let row =
             sqlx::query("SELECT body,digest,last_lsn FROM current_entities WHERE kind=? AND key=?")
                 .bind(kind)
@@ -213,7 +214,8 @@ impl Store {
             if revision > format!("{upper:020}") {
                 return Err(sqlx::Error::Protocol(
                     "current state is newer than decision boundary".into(),
-                ));
+                )
+                .into());
             }
             decode_body(kind, key, row.get("body"), row.get("digest"))
         })
@@ -226,7 +228,7 @@ impl Store {
         after: &str,
         upper: u64,
         limit: usize,
-    ) -> Result<Vec<String>, sqlx::Error> {
+    ) -> Result<Vec<String>, Error> {
         let mut q = QueryBuilder::<Sqlite>::new("SELECT key FROM current_entities WHERE kind=");
         q.push_bind(kind)
             .push(" AND key>")
@@ -238,31 +240,31 @@ impl Store {
         }
         q.push(" ORDER BY key LIMIT ")
             .push_bind(limit.min(256) as i64);
-        q.build_query_scalar().fetch_all(&self.pool).await
+        q.build_query_scalar()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(Error::from)
     }
-    pub async fn children(
-        &self,
-        parent: &str,
-        upper: u64,
-    ) -> Result<Vec<(String, String)>, sqlx::Error> {
+    pub async fn children(&self, parent: &str, upper: u64) -> Result<Vec<(String, String)>, Error> {
         sqlx::query_as("SELECT slot,MIN(extra) FROM current_entities WHERE kind='child' AND parent=? AND last_lsn<=? GROUP BY slot")
-            .bind(parent).bind(format!("{upper:020}")).fetch_all(&self.pool).await
+            .bind(parent).bind(format!("{upper:020}")).fetch_all(&self.pool).await.map_err(Error::from)
     }
-    pub async fn dispatch_owner(&self, dispatch: &str) -> Result<Option<Value>, sqlx::Error> {
+    pub async fn dispatch_owner(&self, dispatch: &str) -> Result<Option<Value>, Error> {
         Ok(self.get("dispatch", dispatch).await?.1)
     }
-    pub async fn active_run_ids(&self, after: &str) -> Result<Vec<String>, sqlx::Error> {
+    pub async fn active_run_ids(&self, after: &str) -> Result<Vec<String>, Error> {
         sqlx::query_scalar(ACTIVE_RUNS_SQL)
             .bind(after)
             .fetch_all(&self.pool)
             .await
+            .map_err(Error::from)
     }
     pub async fn list(
         &self,
         kind: &str,
         after: &str,
         limit: usize,
-    ) -> Result<(u64, Vec<Value>), sqlx::Error> {
+    ) -> Result<(u64, Vec<Value>), Error> {
         let mut tx = self.pool.begin().await?;
         let lsn: String =
             sqlx::query_scalar("SELECT committed_lsn FROM store_meta WHERE singleton=1")
@@ -282,7 +284,7 @@ impl Store {
             let n: i64 = row.get("bytes");
             if bytes + n > 4 * 1024 * 1024 {
                 if values.is_empty() {
-                    return Err(sqlx::Error::Protocol("RESPONSE_TOO_LARGE".into()));
+                    return Err(Error::ResponseTooLarge);
                 }
                 break;
             }
@@ -311,7 +313,7 @@ impl Store {
     }
 
     /// Filter, keyset ordering and LIMIT execute in the same SQLite snapshot as the cursor.
-    pub async fn runs_page(&self, filter: RunsQuery<'_>) -> Result<(u64, Vec<Value>), sqlx::Error> {
+    pub async fn runs_page(&self, filter: RunsQuery<'_>) -> Result<(u64, Vec<Value>), Error> {
         let mut tx = self.pool.begin().await?;
         let cursor: Option<String> = match filter.before_run_id {
             Some(id) => {
@@ -357,7 +359,7 @@ impl Store {
         kind: &str,
         workflow_id: Option<&str>,
         by_name: bool,
-    ) -> Result<Vec<Value>, sqlx::Error> {
+    ) -> Result<Vec<Value>, Error> {
         let mut tx = self.pool.begin().await?;
         let mut query = QueryBuilder::<Sqlite>::new(
             "SELECT key,length(CAST(body AS BLOB)) AS bytes FROM current_entities WHERE kind=",
@@ -374,7 +376,7 @@ impl Store {
         query.push(" LIMIT 10001");
         let rows = query.build().fetch_all(&mut *tx).await?;
         if rows.len() > 10000 {
-            return Err(sqlx::Error::Protocol("RESPONSE_TOO_LARGE".into()));
+            return Err(Error::ResponseTooLarge);
         }
         Ok(Self::bodies(&mut tx, kind, rows).await?.1)
     }
@@ -383,10 +385,10 @@ impl Store {
         tx: &mut sqlx::Transaction<'_, Sqlite>,
         kind: &str,
         rows: Vec<sqlx::sqlite::SqliteRow>,
-    ) -> Result<(u64, Vec<Value>), sqlx::Error> {
+    ) -> Result<(u64, Vec<Value>), Error> {
         let bytes: i64 = rows.iter().map(|r| r.get::<i64, _>("bytes")).sum();
         if bytes > 8 * 1024 * 1024 {
-            return Err(sqlx::Error::Protocol("RESPONSE_TOO_LARGE".into()));
+            return Err(Error::ResponseTooLarge);
         }
         let mut values = Vec::with_capacity(rows.len());
         for row in rows {
@@ -417,7 +419,7 @@ impl Store {
     pub async fn run_counts(
         &self,
         workflow_id: Option<&str>,
-    ) -> Result<Vec<(String, String, i64)>, sqlx::Error> {
+    ) -> Result<Vec<(String, String, i64)>, Error> {
         let mut query = QueryBuilder::<Sqlite>::new(
             "SELECT workflow_id AS workflow,status AS status,COUNT(*) AS count FROM current_entities WHERE kind='run'",
         );

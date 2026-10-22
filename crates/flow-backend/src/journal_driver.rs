@@ -6,6 +6,7 @@ use crate::execution::remote::{RemoteDispatcher, RemoteOptions};
 use crate::execution::{ExecutionMode, IpcDispatcher};
 use crate::journal::{JournalBackend, JournalError};
 use crate::journal_commands::node_event;
+use crate::journal_commands::runtime_mismatched;
 use crate::journal_execution::Attempt;
 use flow_engine::journal_state::{Node as NodeState, NodeStatus, Run, RunStatus, Wait, WaitKind};
 use flow_engine::{Definition, NodeLogger, NodeType};
@@ -182,25 +183,6 @@ impl JournalBackend {
         port: ExecutionPort,
         prewarm: bool,
     ) -> Result<()> {
-        if let Some(run) = self
-            .inspect(|s| {
-                s.runs
-                    .values()
-                    .find(|r| {
-                        !r.terminal()
-                            && r.execution
-                                .as_ref()
-                                .is_some_and(|e| e.runtime != flow_engine::RUNTIME_ID)
-                    })
-                    .map(|r| r.run_id.clone())
-            })
-            .await
-        {
-            return Err(invalid(format!(
-                "run {run} requires its recorded executor runtime; execution was not started"
-            ))
-            .into());
-        }
         let mut driver = self.execution.lock().await;
         if driver.as_ref().is_some_and(|handle| !handle.is_finished()) {
             return Ok(());
@@ -290,6 +272,19 @@ impl JournalBackend {
                             .defer_runs(std::iter::once(run_id).chain(runs).collect())
                             .await;
                         break;
+                    }
+                    // 旧执行器 runtime 的在途 run 永远无法被当前执行器恢复
+                    // （执行身份随快照锁死）：跳过——保持非终态原样（不隔离、
+                    // 不判死，用户可手动取消），也不调度重试（advance 对它
+                    // 必败，重试就是无限空转）。新事件把它带回 dirty 集时
+                    // 仍会走到这里同样跳过，代价一次内存读。
+                    if backend
+                        .inspect(|s| {
+                            s.runs.get(&run_id).is_some_and(runtime_mismatched)
+                        })
+                        .await
+                    {
+                        continue;
                     }
                     let result = AssertUnwindSafe(advance_run(
                         &backend,

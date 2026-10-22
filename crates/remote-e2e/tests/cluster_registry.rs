@@ -110,9 +110,8 @@ async fn atomic_snapshots_are_monotonic_exact_and_cluster_scoped() {
     let snapshot = Snapshot {
         durable_lsn: big,
         applied_lsn: big - 1,
-        projected_lsn: big - 2,
         master_epoch: 1,
-        projection_error: Some("paused".into()),
+        writer_error: Some("paused".into()),
         ..Default::default()
     };
     r.publish(&lease, &snapshot).await.unwrap();

@@ -23,7 +23,7 @@ import {
 } from "../state/editor";
 import { history, redo, undo } from "../state/history";
 import { promptDialog } from "../state/modal";
-import { monitor, startRun } from "../state/monitor";
+import { cancelRunStart, monitor, startRun } from "../state/monitor";
 import { openOverlay, topOverlay } from "../state/overlays";
 import { saveWorkflowAsNodeTemplate } from "../state/templates";
 import { toast } from "../state/toast";
@@ -111,9 +111,7 @@ const paletteEl = ref<HTMLElement | null>(null);
 /** 面板宽度上限：宽屏沿用原上限（父容器 50%），窄屏收紧到 32vw 防挤占画布 */
 const paletteMax = computed(() => {
   const parent = paletteEl.value?.parentElement?.clientWidth ?? 1200;
-  return viewportW.value < 1080
-    ? Math.min(parent * 0.5, viewportW.value * 0.32)
-    : parent * 0.5;
+  return viewportW.value < 1080 ? Math.min(parent * 0.5, viewportW.value * 0.32) : parent * 0.5;
 });
 const paletteResize = usePanelResize({
   target: paletteEl,
@@ -127,6 +125,7 @@ const paletteResize = usePanelResize({
 const paletteWidth = computed(() => Math.min(paletteResize.size.value, paletteMax.value));
 
 async function load(id: string): Promise<void> {
+  cancelRunStart();
   if (!(await ensureNodeTypes())) return;
   // 密钥名称清单不阻断加载：拉不到时 x-secret 字段仍可手输，重连后自动重试
   void ensureSecrets();
@@ -142,6 +141,7 @@ async function load(id: string): Promise<void> {
 }
 
 onMounted(() => load(route.params.id as string));
+onUnmounted(cancelRunStart);
 
 // 同组件参数切换（如浏览器前进/后退）：先过脏检查，再加载新工作流
 watch(

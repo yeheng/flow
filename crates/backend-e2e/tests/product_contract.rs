@@ -610,7 +610,7 @@ async fn unknown_operations_retry_only_with_explicit_repeatable_policy() {
 }
 
 #[tokio::test]
-async fn incompatible_runtime_refuses_execution_without_failing_active_runs() {
+async fn incompatible_runtime_leaves_active_runs_untouched_and_starts_execution() {
     let dir = tempfile::tempdir().unwrap();
     let b = JournalBackend::open(dir.path(), Default::default())
         .await
@@ -627,26 +627,33 @@ async fn incompatible_runtime_refuses_execution_without_failing_active_runs() {
     event.run_id = Some("different-runtime".into());
     event.run_seq = 1;
     b.append(vec![event]).await.unwrap();
-    let result = b
-        .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
-            flow_backend::execution::IpcOptions {
-                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
-                    flow_test_support::io::executor_bin(),
-                ),
-                x_max: 1,
-                tag: None,
-            },
-        ))
-        .await;
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("recorded executor runtime"));
-    for id in [id.as_str(), "different-runtime"] {
-        let r = b.run_snapshot(id).await.unwrap().unwrap();
-        assert_eq!(r.status, RunStatus::Running);
-        assert!(r.nodes.is_empty());
-    }
+    // 旧 runtime 的在途 run 不拒绝启动、不判死：执行照常启动，当前
+    // runtime 的 run 正常执行；陈旧 run 原样保留（协调器跳过，不空转），
+    // 用户可手动取消。拒绝启动会把桌面 app 整体带崩（setup hook 失败）。
+    b.start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
+        flow_backend::execution::IpcOptions {
+            executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
+                flow_test_support::io::executor_bin(),
+            ),
+            x_max: 1,
+            tag: None,
+        },
+    ))
+    .await
+    .unwrap();
+    let r = until(&b, &id, Run::terminal).await;
+    assert_eq!(
+        r.status,
+        RunStatus::Succeeded,
+        "当前 runtime 的 run 应正常执行"
+    );
+    let stale = b.run_snapshot("different-runtime").await.unwrap().unwrap();
+    assert_eq!(stale.status, RunStatus::Running, "陈旧 run 应原样保留");
+    assert!(stale.nodes.is_empty(), "陈旧 run 不应被推进");
+    // 用户逃生口：手动取消把陈旧 run 收口
+    b.run_cancel("different-runtime", None).await.unwrap();
+    let stale = b.run_snapshot("different-runtime").await.unwrap().unwrap();
+    assert_eq!(stale.status, RunStatus::Cancelled);
     b.close().await.unwrap();
 }
 

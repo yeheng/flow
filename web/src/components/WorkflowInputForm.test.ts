@@ -12,6 +12,43 @@ function lastEmit(w: ReturnType<typeof mountForm>): unknown[] {
 }
 
 describe("WorkflowInputForm", () => {
+  it("外部补填和清空立即回填表单，不反写旧值", async () => {
+    const w = mountForm(["id"], "");
+    await w.setProps({ modelValue: '{"id":"from-dialog"}' });
+    expect((w.get("input").element as HTMLInputElement).value).toBe("from-dialog");
+    await w.setProps({ modelValue: "" });
+    expect((w.get("input").element as HTMLInputElement).value).toBe("");
+    expect(w.emitted("update:modelValue")).toBeUndefined();
+  });
+
+  it("自身输入回显保留 5.0 的编辑缓冲", async () => {
+    const w = mountForm(["count"], "");
+    await w.get("input").setValue("5.0");
+    await w.setProps({ modelValue: lastEmit(w)[0] as string });
+    expect((w.get("input").element as HTMLInputElement).value).toBe("5.0");
+  });
+
+  it("改动其他字段不会将 schema 声明的字符串变成数字或布尔值", async () => {
+    const w = mountForm(["id", "count"], '{"id":"true","count":1}');
+    await w.setProps({
+      inputSchema: {
+        type: "object",
+        properties: { id: { type: "string" }, count: { type: "integer" } },
+      },
+    });
+    await w.findAll("input")[1].setValue("2");
+    expect(JSON.parse(lastEmit(w)[0] as string)).toEqual({ id: "true", count: 2 });
+  });
+
+  it("字段和输入同时切换时不把旧工作流的值写进新工作流", async () => {
+    const w = mountForm(["id"], '{"id":"old"}');
+    await w.setProps({ inputKeys: ["id", "count"], modelValue: '{"id":"new","count":2}' });
+    expect(w.findAll("input").map((i) => (i.element as HTMLInputElement).value)).toEqual([
+      "new",
+      "2",
+    ]);
+    expect(w.emitted("update:modelValue")).toBeUndefined();
+  });
   it("无字段时只渲染 JSON 文本域", () => {
     const w = mountForm([], "");
     expect(w.find(".wf-input-json").exists()).toBe(true);

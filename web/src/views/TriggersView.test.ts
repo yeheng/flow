@@ -6,6 +6,8 @@ import { confirmDialog } from "../state/modal";
 import { toast } from "../state/toast";
 import type { Schedule, VersionMeta, Webhook } from "../types";
 import TriggersView from "./TriggersView.vue";
+import { ensureNodeTypes } from "../state/editor";
+import { discoverInputKeys } from "../state/run-input";
 
 vi.mock("../api/flow", () => ({
   listSchedules: vi.fn(),
@@ -85,6 +87,7 @@ function create() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(ensureNodeTypes).mockResolvedValue(false);
   vi.mocked(api.listSchedules).mockResolvedValue([schedule("s1")]);
   vi.mocked(api.listWebhooks).mockResolvedValue([]);
   vi.mocked(api.listVersions).mockResolvedValue([]);
@@ -97,6 +100,61 @@ afterEach(() => {
 });
 
 describe("triggers first load", () => {
+  it("旧工作流仍在刷新时立即加载新工作流，迟到响应不能覆盖新列表", async () => {
+    const old = deferred<Schedule[]>();
+    vi.mocked(api.listSchedules).mockImplementation((id) =>
+      id === "wf-1" ? old.promise : Promise.resolve([schedule("new")]),
+    );
+    const w = create();
+    await w.setProps({ workflowId: "wf-2" });
+    await flushPromises();
+    expect(api.listSchedules).toHaveBeenCalledWith("wf-2");
+    expect(w.text()).toContain("#new");
+    old.resolve([schedule("old")]);
+    await flushPromises();
+    expect(w.text()).toContain("#new");
+    expect(w.text()).not.toContain("#old");
+  });
+
+  it("创建旧工作流的调度完成后不清空新工作流的表单", async () => {
+    const pending = deferred<Schedule>();
+    vi.mocked(api.createSchedule).mockReturnValueOnce(pending.promise);
+    const w = create();
+    await flushPromises();
+    await w.get(".cron-input").setValue("*/5 * * * *");
+    await w.get(".create-form").trigger("submit");
+    await w.setProps({ workflowId: "wf-2" });
+    await w.get(".cron-input").setValue("*/10 * * * *");
+    pending.resolve(schedule("created"));
+    await flushPromises();
+    expect((w.get(".cron-input").element as HTMLInputElement).value).toBe("*/10 * * * *");
+  });
+
+  it("调度输入字段取已发布定义，避免读到尚未发布的草稿", async () => {
+    vi.mocked(ensureNodeTypes).mockResolvedValue(true);
+    const draft = {
+      nodes: [],
+      edges: [],
+      input_schema: { properties: { draft: { type: "string" } } },
+    };
+    const published = {
+      nodes: [],
+      edges: [],
+      input_schema: { properties: { live: { type: "string" } } },
+    };
+    vi.mocked(api.getWorkflow).mockImplementation(async (_id, version) => ({
+      workflow_id: "wf-1",
+      version: version ?? 2,
+      status: "draft",
+      published_version: 1,
+      definition: version === 1 ? published : draft,
+    }));
+    const w = create();
+    await flushPromises();
+    expect(api.getWorkflow).toHaveBeenCalledWith("wf-1", 1);
+    expect(discoverInputKeys).toHaveBeenLastCalledWith(published, []);
+    expect(w.exists()).toBe(true);
+  });
   it("首拉失败显示错误条而不是「暂无调度」，重试成功后恢复空态", async () => {
     vi.mocked(api.listSchedules).mockRejectedValueOnce(new Error("offline"));
     const w = create();
@@ -226,10 +284,7 @@ describe("triggers 调度编辑", () => {
     await flushPromises();
 
     expect(api.updateSchedule).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(api.updateSchedule).mock.calls[0]).toEqual([
-      "s1",
-      { cron: "*/10 * * * *" },
-    ]);
+    expect(vi.mocked(api.updateSchedule).mock.calls[0]).toEqual(["s1", { cron: "*/10 * * * *" }]);
     // input 未改：不传字段即「不改」，绝不能误传 null 清掉存量输入
     expect(vi.mocked(api.updateSchedule).mock.calls[0]![1]).not.toHaveProperty("input");
     expect(toast.success).toHaveBeenCalledWith("调度已更新");

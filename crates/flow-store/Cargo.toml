@@ -8,6 +8,7 @@ flow-journal = { path = "../flow-journal" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
+thiserror.workspace = true
 
 # tests/ 只用：共用测试基建（TempDir / 端口等待）
 [dev-dependencies]

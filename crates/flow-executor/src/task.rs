@@ -549,7 +549,7 @@ impl TaskRunner {
             input: face_input,
             predecessors,
             params: stored_params,
-            engine_build: flow_engine::RUNTIME_ID.into(),
+            engine_build: flow_engine::BUILD_ID.into(),
             node_semantics: if determinism.is_some() { 2 } else { 1 },
         };
         audit.push(

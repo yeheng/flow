@@ -13,7 +13,14 @@ use std::collections::BTreeMap;
 const VALUE_BUDGET: usize = 8 * 1024 * 1024;
 pub type Result<T> = std::result::Result<T, ViewError>;
 fn internal(error: impl std::fmt::Display) -> ViewError {
-    ViewError::Internal(error.to_string())
+    ViewError::Unavailable(error.to_string())
+}
+fn storage(error: crate::StorageError) -> ViewError {
+    if matches!(error, crate::StorageError::ResponseTooLarge) {
+        ViewError::Limit("RESPONSE_TOO_LARGE".into())
+    } else {
+        internal(error)
+    }
 }
 fn parse_ts(raw: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(raw)
@@ -35,8 +42,7 @@ fn workflow_version(
             upper,
             &version.definition,
             MAX_LINE_BYTES,
-        )
-        .map_err(internal)?,
+        )?,
         checksum: version.checksum.clone(),
         status: if version.published {
             STATUS_PUBLISHED.into()
@@ -52,26 +58,25 @@ pub async fn get_version(
     workflow_id: &str,
     version: Option<i64>,
 ) -> Result<WorkflowVersion> {
-    let stored = backend
-        .inspect(|state| {
-            let workflow = state
-                .workflows
-                .get(workflow_id)
-                .ok_or_else(|| ViewError::WorkflowNotFound(workflow_id.into()))?;
-            match version {
-                Some(v) => workflow
-                    .versions
-                    .get(&(v as u64))
-                    .cloned()
-                    .ok_or_else(|| ViewError::VersionNotFound(workflow_id.into(), v)),
-                None => workflow
-                    .versions
-                    .last_key_value()
-                    .map(|(_, v)| v.clone())
-                    .ok_or_else(|| ViewError::WorkflowNotFound(workflow_id.into())),
-            }
-        })
-        .await?;
+    let stored =
+        backend
+            .inspect(|state| {
+                let workflow = state
+                    .workflows
+                    .get(workflow_id)
+                    .ok_or_else(|| ViewError::NotFound(format!("工作流不存在：{workflow_id}")))?;
+                match version {
+                    Some(v) => workflow.versions.get(&(v as u64)).cloned().ok_or_else(|| {
+                        ViewError::NotFound(format!("版本不存在：{workflow_id} v{v}"))
+                    }),
+                    None => workflow
+                        .versions
+                        .last_key_value()
+                        .map(|(_, v)| v.clone())
+                        .ok_or_else(|| ViewError::NotFound(format!("工作流不存在：{workflow_id}"))),
+                }
+            })
+            .await?;
     let root = backend.journal.root().to_path_buf();
     let upper = backend.journal.durable_lsn();
     let workflow_id = workflow_id.to_owned();
@@ -102,7 +107,7 @@ pub async fn list_versions(
                 .workflows
                 .get(workflow_id)
                 .map(|w| w.versions.values().rev().cloned().collect::<Vec<_>>())
-                .ok_or_else(|| ViewError::WorkflowNotFound(workflow_id.into()))
+                .ok_or_else(|| ViewError::NotFound(format!("工作流不存在：{workflow_id}")))
         })
         .await?;
     reserve_values(stored.iter().map(|v| &v.definition))?;
@@ -126,7 +131,7 @@ pub async fn version_metadata(backend: &JournalBackend, workflow_id: &str) -> Re
             let workflow = state
                 .workflows
                 .get(workflow_id)
-                .ok_or_else(|| ViewError::WorkflowNotFound(workflow_id.into()))?;
+                .ok_or_else(|| ViewError::NotFound(format!("工作流不存在：{workflow_id}")))?;
             workflow
                 .versions
                 .values()
@@ -150,13 +155,11 @@ fn reserve_values<'a>(values: impl IntoIterator<Item = &'a StoredValue>) -> Resu
     for value in values {
         let size = match value {
             StoredValue::Ref(r) => usize::try_from(r.total_bytes).map_err(internal)?,
-            StoredValue::Inline(v) => flow_journal::codec::bounded_json(v, remaining)
-                .map_err(internal)?
-                .len(),
+            StoredValue::Inline(v) => flow_journal::codec::bounded_json(v, remaining)?.len(),
         };
         remaining = remaining
             .checked_sub(size)
-            .ok_or_else(|| internal("RESPONSE_TOO_LARGE"))?;
+            .ok_or_else(|| ViewError::Limit("RESPONSE_TOO_LARGE".into()))?;
     }
     Ok(())
 }
@@ -177,7 +180,7 @@ pub async fn list_workflows(backend: &JournalBackend) -> Result<Vec<WorkflowSumm
         .store
         .ordered("workflow", None, false)
         .await
-        .map_err(internal)?
+        .map_err(storage)?
         .into_iter()
         .filter(|v| v["deleted"] != true)
         .map(|v| workflow_summary(&v))
@@ -185,9 +188,8 @@ pub async fn list_workflows(backend: &JournalBackend) -> Result<Vec<WorkflowSumm
 }
 
 fn run_record(root: &std::path::Path, upper: u64, run: &JournalRun) -> Result<RunRecord> {
-    let materialize = |value: &StoredValue| {
-        flow_journal::value::materialize(root, upper, value, VALUE_BUDGET).map_err(internal)
-    };
+    let materialize =
+        |value: &StoredValue| flow_journal::value::materialize(root, upper, value, VALUE_BUDGET);
     Ok(RunRecord {
         id: run.run_id.clone(),
         workflow_id: run.workflow_id.clone(),
@@ -210,10 +212,11 @@ pub async fn get_run(backend: &JournalBackend, run_id: &str) -> Result<RunRecord
         .store
         .get_summary("run", run_id)
         .await
-        .map_err(internal)?;
-    let run =
-        serde_json::from_value(value.ok_or_else(|| ViewError::RunNotFound(run_id.to_owned()))?)
-            .map_err(internal)?;
+        .map_err(storage)?;
+    let run = serde_json::from_value(
+        value.ok_or_else(|| ViewError::NotFound(format!("run 不存在：{run_id}")))?,
+    )
+    .map_err(internal)?;
     Ok(materialize_runs(backend, vec![run]).await?.remove(0))
 }
 
@@ -227,15 +230,13 @@ async fn materialize_runs(
         for value in std::iter::once(&run.input).chain(run.output.iter()) {
             let n = match value {
                 StoredValue::Ref(r) => usize::try_from(r.total_bytes).map_err(internal)?,
-                StoredValue::Inline(v) => flow_journal::codec::bounded_json(v, VALUE_BUDGET)
-                    .map_err(internal)?
-                    .len(),
+                StoredValue::Inline(v) => flow_journal::codec::bounded_json(v, VALUE_BUDGET)?.len(),
             };
             bytes = bytes
                 .checked_add(n)
-                .ok_or_else(|| internal("RESPONSE_TOO_LARGE"))?;
+                .ok_or_else(|| ViewError::Limit("RESPONSE_TOO_LARGE".into()))?;
             if bytes > VALUE_BUDGET {
-                return Err(internal("RESPONSE_TOO_LARGE"));
+                return Err(ViewError::Limit("RESPONSE_TOO_LARGE".into()));
             }
         }
     }
@@ -264,7 +265,7 @@ pub async fn list_runs(
             limit: limit.max(0) as usize,
         })
         .await
-        .map_err(internal)?;
+        .map_err(storage)?;
     materialize_runs(
         backend,
         values
@@ -287,7 +288,7 @@ pub async fn run_stats(backend: &JournalBackend, workflow_id: Option<&str>) -> R
         .store
         .run_counts(workflow_id)
         .await
-        .map_err(internal)?
+        .map_err(storage)?
     {
         stats.total += count;
         *stats.by_status.entry(status.clone()).or_insert(0) += count;
@@ -367,7 +368,7 @@ pub async fn list_schedules(
         .store
         .ordered("schedule", workflow_id, false)
         .await
-        .map_err(internal)?
+        .map_err(storage)?
         .iter()
         .map(schedule_from_config)
         .collect()
@@ -381,7 +382,7 @@ pub async fn list_webhooks(
         .store
         .ordered("webhook", workflow_id, false)
         .await
-        .map_err(internal)?
+        .map_err(storage)?
         .iter()
         .map(webhook_from_config)
         .collect()
@@ -418,7 +419,7 @@ pub async fn template_list(backend: &JournalBackend) -> Result<Vec<NodeTemplateS
         .store
         .ordered("template", None, true)
         .await
-        .map_err(internal)?;
+        .map_err(storage)?;
     configs
         .iter()
         .map(|config| {
@@ -454,7 +455,7 @@ pub async fn template_get(backend: &JournalBackend, id: &str) -> Result<NodeTemp
             let config = state
                 .templates
                 .get(id)
-                .ok_or_else(|| ViewError::TemplateNotFound(id.into()))?;
+                .ok_or_else(|| ViewError::NotFound(format!("节点模板不存在：{id}")))?;
             template_from_config(config)
         })
         .await
@@ -466,7 +467,7 @@ pub async fn timeline(backend: &JournalBackend, run_id: &str) -> Result<Value> {
         .run_snapshot_with_cursor(run_id)
         .await
         .map_err(internal)?;
-    let run = run.ok_or_else(|| ViewError::RunNotFound(run_id.into()))?;
+    let run = run.ok_or_else(|| ViewError::NotFound(format!("run 不存在：{run_id}")))?;
     let children = backend.run_children(run_id, lsn).await.map_err(internal)?;
     reserve_values(
         std::iter::once(&run.definition)

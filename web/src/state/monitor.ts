@@ -1,4 +1,4 @@
-import { computed, reactive } from "vue";
+import { computed, reactive, watch } from "vue";
 import * as api from "../api/flow";
 import { client, errText } from "../rpc/client";
 import type { AdjudicateDecision, LogLine, ObservationLoss, TimelineNode } from "../types";
@@ -14,6 +14,8 @@ export const monitor = reactive({
   /** 当前查看的 run 所属工作流：画布着色只在仍选中同一工作流时生效 */
   workflowId: null as string | null,
   inputText: "",
+  /** 当前运行的已提交输入，与下一次运行的编辑草稿分开。 */
+  runInput: undefined as unknown,
   /**
    * run 状态，唯一出处（run.timeline 的 status）。此前还有一份 `phase`
    * （timeline 的 fold 相位），两者对 awaiting_resume 不一致——phase 仍是
@@ -33,7 +35,7 @@ export const monitor = reactive({
   /** 观测日志去重水位：已收到的最大 observation seq */
   lastLogSeq: "0",
   /** 子 run 钻取栈：栈顶是当前 run 的直接父 run */
-  breadcrumb: [] as { runId: string; workflowId: string }[],
+  breadcrumb: [] as { runId: string; workflowId: string; input?: unknown }[],
   /** 观测日志有损：按来源累计丢弃计数（会竞争预算/保留期，UI 必须明示） */
   observationLoss: {
     queue_dropped: 0,
@@ -105,6 +107,22 @@ let unsubscribe: (() => Promise<void>) | null = null;
  * 没有中间态，也就不需要快照回滚。
  */
 const attachStale = staleGuard();
+let startingController: AbortController | null = null;
+
+export function cancelRunStart(): void {
+  startingController?.abort();
+  startingController = null;
+  monitor.starting = false;
+}
+
+watch(
+  () => editor.workflowId,
+  () => {
+    cancelRunStart();
+    monitor.inputText = "";
+  },
+  { flush: "sync" },
+);
 
 export async function startRun(): Promise<void> {
   if (monitor.starting) return;
@@ -128,24 +146,36 @@ export async function startRun(): Promise<void> {
     }
   }
   monitor.starting = true;
+  const controller = new AbortController();
+  startingController = controller;
   const workflowId = editor.workflowId;
   const version = editor.publishedVersion;
   try {
     const published = await api.getWorkflow(workflowId, version);
-    const prepared = await requestRunInput(published.definition, editor.nodeTypes, input);
-    if (!prepared || editor.workflowId !== workflowId) return;
+    if (controller.signal.aborted) return;
+    const prepared = await requestRunInput(
+      published.definition,
+      editor.nodeTypes,
+      input,
+      controller.signal,
+    );
+    if (!prepared || controller.signal.aborted || editor.workflowId !== workflowId) return;
     input = prepared.input;
     monitor.inputText = input === undefined ? "" : JSON.stringify(input);
     const { run_id } = await api.startRun(workflowId, input, version);
+    if (controller.signal.aborted) return;
     // breadcrumb/workflowId 只在 attach 成功后切换：失败时 monitor 保持旧 run，栈要跟着留
-    if (await attach(run_id)) {
+    if (await attach(run_id, input, controller.signal)) {
       monitor.breadcrumb = [];
       monitor.workflowId = workflowId;
     }
   } catch (e) {
-    toast.error(errText(e));
+    if (!controller.signal.aborted) toast.error(errText(e));
   } finally {
-    monitor.starting = false;
+    if (startingController === controller) {
+      startingController = null;
+      monitor.starting = false;
+    }
   }
 }
 
@@ -154,15 +184,22 @@ export async function startRun(): Promise<void> {
  * 返回 true 表示本次 attach 完成换入；被更新的 attach/detach 取代返回 false；
  * 订阅失败抛出（monitor 保持原状，调用方只报错）。
  */
-async function attach(runId: string): Promise<boolean> {
+async function attach(runId: string, input?: unknown, signal?: AbortSignal): Promise<boolean> {
   const token = attachStale.begin();
-  if (unsubscribe) { await unsubscribe().catch(() => {}); unsubscribe = null; }
-  let closed = false, dirty = false, syncing = false;
+  if (unsubscribe) {
+    await unsubscribe().catch(() => {});
+    unsubscribe = null;
+  }
+  let closed = false,
+    attached = false,
+    dirty = false,
+    syncing = false;
   // 轮询句柄装在持有者里：dispose 闭包先定义（陈旧 attach 路径可能先于
   // 首个 tick 启动就被调用），句柄在投影原子换入之后才创建。
   const poll: { timer?: ReturnType<typeof setInterval> } = {};
-  const current = () => !closed && !attachStale.stale(token);
-  const unsub = await api.subscribeRun(runId, record => {
+  // 取消启动只阻止尚未换入的运行；已经换入的运行继续观测，直到显式退订。
+  const current = () => !closed && (attached || !signal?.aborted) && !attachStale.stale(token);
+  const unsub = await api.subscribeRun(runId, (record) => {
     if (!record.event || record.event.run_id === runId) dirty = true;
   });
   /** 终态后的收尾：停轮询 + 完成通知；finalSweep 保证只补拉一次观测 */
@@ -191,9 +228,14 @@ async function attach(runId: string): Promise<boolean> {
     if (current()) toast.error(errText(e));
     return null;
   });
-  if (!current()) { await dispose().catch(() => {}); return false; }
+  if (!current()) {
+    await dispose().catch(() => {});
+    return false;
+  }
+  attached = true;
   unsubscribe = dispose;
   monitor.runId = runId;
+  monitor.runInput = input;
   monitor.workflowId = initial?.workflow_id ?? null;
   monitor.status = initial?.status ?? null;
   previousStatus = monitor.status;
@@ -202,7 +244,9 @@ async function attach(runId: string): Promise<boolean> {
   monitor.output = initial?.output;
   monitor.fatalError = initial?.fatal_error ?? null;
   monitor.lastSeq = initial?.last_seq ?? 0;
-  monitor.logs = []; monitor.logsByNode = {}; monitor.lastLogSeq = "0";
+  monitor.logs = [];
+  monitor.logsByNode = {};
+  monitor.lastLogSeq = "0";
   monitor.observationLoss = {
     queue_dropped: 0,
     retention_dropped: 0,
@@ -225,9 +269,12 @@ async function attach(runId: string): Promise<boolean> {
           const snapshot = await api.runTimeline(runId);
           if (!current()) return;
           previousStatus = monitor.status;
-          monitor.status = snapshot.status; monitor.nodes = snapshot.nodes;
-          monitor.workflowId = snapshot.workflow_id; monitor.lastSeq = snapshot.last_seq;
-          monitor.output = snapshot.output; monitor.fatalError = snapshot.fatal_error;
+          monitor.status = snapshot.status;
+          monitor.nodes = snapshot.nodes;
+          monitor.workflowId = snapshot.workflow_id;
+          monitor.lastSeq = snapshot.last_seq;
+          monitor.output = snapshot.output;
+          monitor.fatalError = snapshot.fatal_error;
           notifyTerminal(snapshot.status);
         } catch {
           if (!current()) return;
@@ -240,7 +287,10 @@ async function attach(runId: string): Promise<boolean> {
           const observations = await api.runObservations(runId, monitor.lastLogSeq);
           if (!current()) return;
           appendObservations(monitor, observations.records);
-          monitor.observationLoss = mergeObservationLoss(monitor.observationLoss, observations.loss);
+          monitor.observationLoss = mergeObservationLoss(
+            monitor.observationLoss,
+            observations.loss,
+          );
           if (observations.records.length < 256) break;
         }
       }
@@ -255,10 +305,15 @@ async function attach(runId: string): Promise<boolean> {
           }, 800);
         }
       }
-    } catch { dirty = true; }
-    finally { syncing = false; }
+    } catch {
+      dirty = true;
+    } finally {
+      syncing = false;
+    }
   };
-  poll.timer = setInterval(() => { void refresh(); }, 250);
+  poll.timer = setInterval(() => {
+    void refresh();
+  }, 250);
   await refresh();
   return current();
 }
@@ -270,7 +325,7 @@ async function attach(runId: string): Promise<boolean> {
  */
 async function reattachFor(runId: string): Promise<void> {
   try {
-    await attach(runId);
+    await attach(runId, monitor.runInput);
   } catch {
     // 连接尚未就绪等瞬时错误：onReconnect 会再次触发，不弹错
   }
@@ -291,6 +346,7 @@ export async function detachRun(): Promise<void> {
     unsubscribe = null;
   }
   monitor.runId = null;
+  monitor.runInput = undefined;
   monitor.workflowId = null;
   monitor.status = null;
   monitor.output = undefined;
@@ -313,7 +369,7 @@ export async function detachRun(): Promise<void> {
 /** 钻取 sub_workflow 节点的子 run */
 export async function openChildRun(childRunId: string): Promise<void> {
   if (!monitor.runId || !monitor.workflowId || childRunId === monitor.runId) return;
-  const parent = { runId: monitor.runId, workflowId: monitor.workflowId };
+  const parent = { runId: monitor.runId, workflowId: monitor.workflowId, input: monitor.runInput };
   try {
     if (await attach(childRunId)) monitor.breadcrumb.push(parent);
   } catch (e) {
@@ -327,7 +383,7 @@ export async function backToParentRun(): Promise<void> {
   if (!parent) return;
   try {
     // 只有 attach 成功才弹栈：失败时 monitor 仍是原 run，父级要留在栈里
-    if (await attach(parent.runId)) monitor.breadcrumb.pop();
+    if (await attach(parent.runId, parent.input)) monitor.breadcrumb.pop();
   } catch (e) {
     toast.error(errText(e));
   }

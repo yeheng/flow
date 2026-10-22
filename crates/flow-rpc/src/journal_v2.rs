@@ -30,54 +30,18 @@ fn failure(error: JournalError) -> ErrorObjectOwned {
         JournalError::Journal(flow_journal::Error::Limit(message)) => {
             ErrorObjectOwned::owned(-32021, message, None::<()>)
         }
-        JournalError::Journal(flow_journal::Error::Invalid(message))
-            if matches!(
-                message.as_str(),
-                "run not found"
-                    | "workflow not found"
-                    | "workflow version not found"
-                    | "schedule not found"
-                    | "webhook not found"
-                    | "template not found"
-            ) =>
-        {
+        JournalError::Journal(flow_journal::Error::NotFound(message)) => {
             ErrorObjectOwned::owned(-32011, message, None::<()>)
         }
         JournalError::Journal(flow_journal::Error::Invalid(message)) => invalid(message),
         _ => ErrorObjectOwned::owned(-32603, "journal service unavailable", None::<()>),
     }
 }
-/// 产品视图错误 → v2 错误码（与 failure() 的 journal 错误同语义分层）。
 fn view_failure(error: flow_backend::ViewError) -> ErrorObjectOwned {
-    match error {
-        flow_backend::ViewError::WorkflowNotFound(m) => {
-            ErrorObjectOwned::owned(-32011, format!("工作流不存在：{m}"), None::<()>)
-        }
-        flow_backend::ViewError::VersionNotFound(w, v) => {
-            ErrorObjectOwned::owned(-32011, format!("版本不存在：{w} v{v}"), None::<()>)
-        }
-        flow_backend::ViewError::RunNotFound(m) => {
-            ErrorObjectOwned::owned(-32011, format!("run 不存在：{m}"), None::<()>)
-        }
-        flow_backend::ViewError::ScheduleNotFound(m) => {
-            ErrorObjectOwned::owned(-32011, format!("schedule 不存在：{m}"), None::<()>)
-        }
-        flow_backend::ViewError::WebhookNotFound(m) => {
-            ErrorObjectOwned::owned(-32011, format!("webhook 不存在：{m}"), None::<()>)
-        }
-        flow_backend::ViewError::TemplateNotFound(m) => {
-            ErrorObjectOwned::owned(-32011, format!("节点模板不存在：{m}"), None::<()>)
-        }
-        flow_backend::ViewError::TemplateNameTaken(m) => {
-            ErrorObjectOwned::owned(-32012, format!("模板名已存在：{m}"), None::<()>)
-        }
-        flow_backend::ViewError::Invalid(m) => invalid(m),
-        flow_backend::ViewError::Conflict(m) => ErrorObjectOwned::owned(-32012, m, None::<()>),
-        other => ErrorObjectOwned::owned(-32603, other.to_string(), None::<()>),
-    }
+    failure(error.into())
 }
-fn storage_failure(error: impl ToString) -> ErrorObjectOwned {
-    if error.to_string().contains("RESPONSE_TOO_LARGE") {
+fn storage_failure(error: flow_backend::StorageError) -> ErrorObjectOwned {
+    if matches!(error, flow_backend::StorageError::ResponseTooLarge) {
         ErrorObjectOwned::owned(-32021, "RESPONSE_TOO_LARGE", None::<()>)
     } else {
         ErrorObjectOwned::owned(-32603, "projection unavailable", None::<()>)
@@ -251,75 +215,7 @@ impl<'a> CommandStatusReq<'a> {
     }
 }
 
-/// 读方法清单。注册层与客户端
-/// （backend-e2e harness、flow-cli）共用同一份，避免两处各抄一份漂移。
-pub const READ_METHODS: &[&str] = &[
-    "journal.cluster.status",
-    "journal.cluster.nodes",
-    "run.observations.page",
-    "command.status",
-    "workflow.list",
-    "run.list",
-    "legacy.list",
-    "workflow.get",
-    "run.get",
-    "run.compare",
-    "legacy.get",
-    "run.events.page",
-    "run.audit.page",
-    "workflow.validate",
-    "workflow.get.view",
-    "workflow.list.view",
-    "workflow.versions",
-    "run.get.view",
-    "run.list.view",
-    "run.stats",
-    "run.timeline",
-    "run.events.view",
-    "schedule.list",
-    "webhook.list",
-    "template.list",
-    "template.get",
-    "config.get",
-    "secrets.list",
-    "nodetypes.list",
-];
-
-pub const WRITE_METHODS: &[&str] = &[
-    "journal.cluster.remove",
-    "workflow.import",
-    "workflow.create",
-    "workflow.update",
-    "workflow.publish",
-    "workflow.delete",
-    "run.start",
-    "run.regress",
-    "run.cancel",
-    "run.signal",
-    "run.adjudicate",
-    "schedule.change",
-    "schedule.create",
-    "schedule.update",
-    "schedule.delete",
-    "webhook.change",
-    "webhook.create",
-    "webhook.set_enabled",
-    "webhook.delete",
-    "template.create",
-    "template.update",
-    "template.delete",
-    "secrets.set",
-    "secrets.delete",
-    "config.update",
-];
-pub fn is_write_method(method: &str) -> bool {
-    WRITE_METHODS.contains(&method)
-}
-
-/// 方法是否为读面（写命令需要 request_id 幂等键与回执解包）。
-pub fn is_read_method(method: &str) -> bool {
-    READ_METHODS.contains(&method)
-}
+pub use flow_dto::rpc::{is_read_method, is_write_method, READ_METHODS, WRITE_METHODS};
 
 /// 写命令的服务端命令 scope（`command.status` 查询键）。run.start 带来源
 /// 归因、run 族按 run_id 分域；其余就是方法名。
@@ -348,63 +244,7 @@ pub fn module_product(
         token,
         product,
     });
-    for method in [
-        "journal.cluster.status",
-        "journal.cluster.nodes",
-        "journal.cluster.remove",
-        "workflow.validate",
-        "workflow.import",
-        "workflow.create",
-        "workflow.update",
-        "workflow.publish",
-        "workflow.delete",
-        "run.start",
-        "run.regress",
-        "run.compare",
-        "run.cancel",
-        "run.signal",
-        "run.adjudicate",
-        "command.status",
-        "workflow.get",
-        "run.get",
-        "run.events.page",
-        "run.audit.page",
-        "schedule.change",
-        "webhook.change",
-        "workflow.list",
-        "run.list",
-        "legacy.get",
-        "legacy.list",
-        "run.observations.page",
-        // ---- 产品面（v2 协议 + V2 product views；前端主工作台用） ----
-        "workflow.get.view",
-        "workflow.list.view",
-        "workflow.versions",
-        "run.get.view",
-        "run.list.view",
-        "run.stats",
-        "run.timeline",
-        "run.events.view",
-        "schedule.create",
-        "schedule.update",
-        "schedule.delete",
-        "schedule.list",
-        "webhook.create",
-        "webhook.set_enabled",
-        "webhook.delete",
-        "webhook.list",
-        "template.create",
-        "template.update",
-        "template.delete",
-        "template.list",
-        "template.get",
-        "config.get",
-        "config.update",
-        "secrets.list",
-        "secrets.set",
-        "secrets.delete",
-        "nodetypes.list",
-    ] {
+    for &method in READ_METHODS.iter().chain(WRITE_METHODS) {
         module.register_async_method(method, move |params, ctx, _| {
             let method: &'static str = method;
             async move { dispatch_call(&ctx, method, params).await }
@@ -1307,6 +1147,34 @@ pub(crate) async fn bind_product_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn error_codes_follow_types_instead_of_message_text() {
+        assert_eq!(
+            failure(flow_journal::Error::NotFound("任意文案".into()).into()).code(),
+            -32011
+        );
+        assert_eq!(
+            failure(flow_journal::Error::Invalid("workflow not found".into()).into()).code(),
+            -32602
+        );
+        assert_eq!(
+            view_failure(flow_backend::ViewError::NotFound("new wording".into())).code(),
+            -32011
+        );
+        assert_eq!(
+            view_failure(flow_backend::ViewError::Limit("budget".into())).code(),
+            -32021
+        );
+    }
+
+    #[test]
+    fn storage_limit_mapping_does_not_depend_on_database_messages() {
+        assert_eq!(
+            storage_failure(flow_backend::StorageError::ResponseTooLarge).code(),
+            -32021
+        );
+    }
+
     #[test]
     fn sequence_parameters_are_lossless_canonical_decimal_strings() {
         assert_eq!(decimal_param(&json!({}), "from_lsn").unwrap(), 0);

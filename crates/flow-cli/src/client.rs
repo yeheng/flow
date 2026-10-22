@@ -57,35 +57,7 @@ pub async fn call(
     }
 }
 
-pub(crate) fn is_write_method(method: &str) -> bool {
-    matches!(
-        method,
-        "workflow.import"
-            | "workflow.create"
-            | "workflow.update"
-            | "workflow.publish"
-            | "workflow.delete"
-            | "run.start"
-            | "run.regress"
-            | "run.cancel"
-            | "run.signal"
-            | "run.adjudicate"
-            | "schedule.change"
-            | "schedule.create"
-            | "schedule.update"
-            | "schedule.delete"
-            | "webhook.change"
-            | "webhook.create"
-            | "webhook.set_enabled"
-            | "webhook.delete"
-            | "template.create"
-            | "template.update"
-            | "template.delete"
-            | "config.update"
-            | "secrets.set"
-            | "secrets.delete"
-    )
-}
+pub(crate) use flow_dto::rpc::is_write_method;
 
 #[cfg(test)]
 mod tests {

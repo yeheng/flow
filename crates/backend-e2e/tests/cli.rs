@@ -388,18 +388,18 @@ async fn invalid_definition_is_rejected_by_server_validation() {
     let (code, _, stderr) = cli(&server, &["workflow", "import", file.to_str().unwrap()]).await;
     assert_eq!(code, 2, "{stderr}");
     assert!(stderr.contains("code -32602"), "{stderr}");
-    // 失败不回滚：create 是已发生的副作用，留下一个没有版本的壳，
-    // 且不会被当成可执行工作流（latest 0 / published null）
+    // 原子导入先校验再提交：拒绝时不产生任何副作用（无壳残留）
     let (code, stdout, _) = cli(&server, &["workflow", "list", "--json"]).await;
     assert_eq!(code, 0);
     let workflows = stdout_json(&stdout)["workflows"]
         .as_array()
         .unwrap()
         .clone();
-    assert_eq!(workflows.len(), 1);
-    assert_eq!(workflows[0]["name"], json!("cli-invalid"));
-    assert_eq!(workflows[0]["latest_version"], json!(0));
-    assert!(workflows[0]["published_version"].is_null());
+    assert_eq!(
+        workflows.len(),
+        0,
+        "原子导入被拒时不得留下工作流壳：{workflows:?}"
+    );
 }
 
 #[tokio::test]

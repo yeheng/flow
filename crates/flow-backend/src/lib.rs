@@ -1,7 +1,6 @@
 //! V2 Journal coordinator, execution ports and product read models.
 pub use flow_dto::{RunSource, RunStatus};
 pub use flow_engine::{redact_value, secrets, Definition, NodeType, HTTP_METHODS};
-use thiserror::Error;
 pub mod execution;
 pub mod journal;
 #[cfg(feature = "journal-cluster")]
@@ -17,33 +16,9 @@ pub mod journal_import;
 pub mod journal_views;
 pub mod projection_check;
 mod regression;
-#[derive(Debug, Error)]
-pub enum ViewError {
-    #[error("工作流不存在：{0}")]
-    WorkflowNotFound(String),
-    #[error("版本不存在：{0} v{1}")]
-    VersionNotFound(String, i64),
-    #[error("版本尚未发布：{0} v{1}")]
-    VersionNotPublished(String, i64),
-    #[error("run 不存在：{0}")]
-    RunNotFound(String),
-    #[error("signal 不存在：{0}")]
-    SignalNotFound(String),
-    #[error("schedule 不存在：{0}")]
-    ScheduleNotFound(String),
-    #[error("webhook 不存在：{0}")]
-    WebhookNotFound(String),
-    #[error("节点模板不存在：{0}")]
-    TemplateNotFound(String),
-    #[error("模板名已存在：{0}")]
-    TemplateNameTaken(String),
-    #[error("参数非法：{0}")]
-    Invalid(String),
-    #[error("冲突：{0}")]
-    Conflict(String),
-    #[error("内部错误：{0}")]
-    Internal(String),
-}
+/// Read and write paths share the same typed error categories.
+pub use flow_journal::Error as ViewError;
+pub use flow_store::store::Error as StorageError;
 
 /// `[harness.agent]`（用户输入 schema）→ 冻结快照用的运行期形态。唯一的
 /// 转换点：base_url 与 model 都非空才启用（成对校验在 flow-config 已把关，

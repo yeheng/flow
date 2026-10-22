@@ -11,7 +11,17 @@ fn files(root: &Path, out: &mut Vec<PathBuf>) {
         }
     }
 }
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn main() {
+    // Explicit semantic compatibility: bump for incompatible execution changes.
+    // Keep the existing 64-hex snapshot representation, independently of sources.
+    let version = "flow-execution-v1";
+    let compatibility = hex(&Sha256::digest(version.as_bytes()));
+    println!("cargo:rustc-env=FLOW_RUNTIME_VERSION={version}");
+    println!("cargo:rustc-env=FLOW_COMPATIBILITY_ID={compatibility}");
     let root = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("../..");
     let mut paths = Vec::new();
     for dir in ["crates/flow-engine/src", "crates/flow-executor/src"] {
@@ -38,6 +48,6 @@ fn main() {
         hash.update((bytes.len() as u64).to_le_bytes());
         hash.update(bytes);
     }
-    let identity: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    println!("cargo:rustc-env=FLOW_RUNTIME_ID={identity}");
+    let identity = hex(&hash.finalize());
+    println!("cargo:rustc-env=FLOW_BUILD_ID={identity}");
 }

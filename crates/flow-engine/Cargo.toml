@@ -3,23 +3,27 @@ name = "flow-engine"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["runtime"]
+runtime = ["flow-journal/storage", "dep:reqwest", "dep:rquickjs", "dep:aes-gcm"]
+
 [dependencies]
-flow-journal = { path = "../flow-journal" }
+flow-journal = { path = "../flow-journal", default-features = false }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, optional = true }
 parking_lot = { workspace = true }
-rquickjs = { workspace = true }
+rquickjs = { workspace = true, optional = true }
 libc = { workspace = true }
 getrandom = { workspace = true }
 interprocess = { workspace = true }
 postcard = { workspace = true }
 tracing = { workspace = true }
-aes-gcm = "0.10"
+aes-gcm = { version = "0.10", optional = true }
 hex = { workspace = true }
 flow-dto = { path = "../flow-dto" }
 futures = { workspace = true }

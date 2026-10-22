@@ -86,7 +86,7 @@ impl Attempt {
                 let run = state
                     .runs
                     .get(&run_id)
-                    .ok_or_else(|| invalid("run not found"))?;
+                    .ok_or_else(|| flow_journal::Error::NotFound("run not found".into()))?;
                 if run.terminal() {
                     return Err(invalid("run terminal"));
                 }

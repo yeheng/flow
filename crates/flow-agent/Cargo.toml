@@ -4,9 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-flow-engine = { path = "../flow-engine" }
+flow-engine = { path = "../flow-engine", default-features = false }
 tokio-tungstenite = { workspace = true }
-flow-journal = { path = "../flow-journal" }
 flow-config = { path = "../flow-config" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

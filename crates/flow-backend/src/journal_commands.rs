@@ -15,6 +15,76 @@ pub(crate) fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+fn validate_workflow_name(name: &str) -> flow_journal::Result<()> {
+    if name.trim().is_empty() || name.len() > 1024 {
+        return Err(invalid("invalid workflow name"));
+    }
+    Ok(())
+}
+
+/// Shared normalization, validation and checksum for preflight, import and save.
+struct PreparedDefinition {
+    value: Value,
+    parsed: flow_engine::Definition,
+    checksum: String,
+}
+impl PreparedDefinition {
+    fn new(mut value: Value) -> flow_journal::Result<Self> {
+        if let Some(object) = value.as_object_mut() {
+            object.entry("semantics").or_insert(json!(2));
+        }
+        let parsed = flow_engine::journal_state::validate_definition(&value)?;
+        let bytes = flow_journal::codec::bounded_json(&value, flow_journal::MAX_LINE_BYTES)?;
+        Ok(Self {
+            value,
+            parsed,
+            checksum: flow_journal::codec::digest(&bytes),
+        })
+    }
+    fn missing_secrets(&self) -> Vec<(String, String)> {
+        flow_engine::secrets::missing_secrets(&self.parsed)
+    }
+    fn require_secrets(&self) -> flow_journal::Result<()> {
+        let missing = self.missing_secrets();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(invalid(
+            missing
+                .iter()
+                .map(|(node, name)| {
+                    format!("node {node}: missing secret {name} (FLOW_SECRET_{name})")
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+        ))
+    }
+}
+
+/// Repeated saves/imports reuse the latest version and its publication state.
+fn prepare_version(
+    workflow_id: &str,
+    latest: Option<&DefinitionVersion>,
+    definition: flow_journal::StoredValue,
+    checksum: String,
+) -> (DefinitionVersion, Option<Event>) {
+    if let Some(latest) = latest.filter(|v| v.checksum == checksum) {
+        return (latest.clone(), None);
+    }
+    let value = DefinitionVersion {
+        version: latest.map_or(1, |v| v.version + 1),
+        definition,
+        checksum,
+        published: false,
+        created_at: now(),
+    };
+    let event = Event::new(
+        EventKind::WorkflowUpdated,
+        json!({"workflow_id":workflow_id,"version":value}),
+    );
+    (value, Some(event))
+}
+
 /// 命令幂等前置检查：命中已提交回执直接返回，**不重复 store 输入值**。
 /// store_json 每次都生成新 output_id，重试若先 store 再去重，journal 里
 /// 会累积无主的值垃圾；顺序重试经此检查零垃圾（同键并发的窄窗口仍由
@@ -36,15 +106,14 @@ pub enum ProductCommand {
         key: String,
         workflow_id: String,
         cron: String,
-        enabled: Option<bool>,
+        enabled: bool,
         input: Value,
     },
     ScheduleUpdate {
         id: String,
-        /// 原样透传：非法形状由 trigger_decision 在锁内裁决（语义保持）。
-        cron: Option<Value>,
+        cron: Option<String>,
         input: Option<Value>,
-        enabled: Option<Value>,
+        enabled: Option<bool>,
     },
     ScheduleDelete {
         id: String,
@@ -64,18 +133,29 @@ pub enum ProductCommand {
         /// true = create（key 在解析时生成）；false = update（key 来自请求）。
         creating: bool,
         id: String,
-        name: Option<Value>,
-        category: Option<Value>,
-        nodes: Option<Value>,
-        edges: Option<Value>,
+        name: Option<String>,
+        category: Option<Option<String>>,
+        nodes: Option<Vec<Value>>,
+        edges: Option<Vec<Value>>,
     },
     TemplateDelete {
         id: String,
     },
 }
 
+/// Missing fields remain distinct from present fields of the wrong type.
+fn optional_field<T: serde::de::DeserializeOwned>(
+    p: &Value,
+    key: &str,
+    message: &str,
+) -> flow_journal::Result<Option<T>> {
+    p.get(key)
+        .map(|v| serde_json::from_value(v.clone()).map_err(|_| invalid(message)))
+        .transpose()
+}
+
 impl ProductCommand {
-    /// RPC 边缘解析。错误文本是 wire 契约的一部分，与旧字段级获取器逐字相同。
+    /// Parse control fields once at the RPC boundary; arbitrary user input stays JSON.
     pub fn parse(method: &str, p: &Value) -> flow_journal::Result<Self> {
         let field = |key: &str| {
             p[key]
@@ -87,14 +167,14 @@ impl ProductCommand {
                 key: id(),
                 workflow_id: field("workflow_id")?.to_owned(),
                 cron: field("cron")?.to_owned(),
-                enabled: p["enabled"].as_bool(),
+                enabled: optional_field(p, "enabled", "enabled flag required")?.unwrap_or(true),
                 input: p["input"].clone(),
             },
             "schedule.update" => Self::ScheduleUpdate {
                 id: field("id")?.to_owned(),
-                cron: p.get("cron").cloned(),
+                cron: optional_field(p, "cron", "cron_expr required")?,
                 input: p.get("input").cloned(),
-                enabled: p.get("enabled").cloned(),
+                enabled: optional_field(p, "enabled", "enabled flag required")?,
             },
             "schedule.delete" => Self::ScheduleDelete {
                 id: field("id")?.to_owned(),
@@ -119,10 +199,14 @@ impl ProductCommand {
                 } else {
                     field("id")?.to_owned()
                 },
-                name: p.get("name").cloned(),
-                category: p.get("category").cloned(),
-                nodes: p.get("nodes").cloned(),
-                edges: p.get("edges").cloned(),
+                name: optional_field(p, "name", "template name required")?,
+                category: optional_field(
+                    p,
+                    "category",
+                    "template category must be a string or null",
+                )?,
+                nodes: optional_field(p, "nodes", "template nodes must be an array")?,
+                edges: optional_field(p, "edges", "template edges must be an array")?,
             },
             "template.delete" => Self::TemplateDelete {
                 id: field("id")?.to_owned(),
@@ -147,29 +231,12 @@ impl ProductCommand {
             Self::TemplateDelete { .. } => "template.delete",
         }
     }
-    fn namespace(&self) -> &'static str {
-        match self {
-            Self::ScheduleCreate { .. }
-            | Self::ScheduleUpdate { .. }
-            | Self::ScheduleDelete { .. } => "schedule",
-            Self::WebhookCreate { .. }
-            | Self::WebhookSetEnabled { .. }
-            | Self::WebhookDelete { .. } => "webhook",
-            Self::TemplateUpsert { .. } | Self::TemplateDelete { .. } => "template",
-        }
-    }
     fn creating(&self) -> bool {
         matches!(
             self,
             Self::ScheduleCreate { .. }
                 | Self::WebhookCreate { .. }
                 | Self::TemplateUpsert { creating: true, .. }
-        )
-    }
-    fn deleting(&self) -> bool {
-        matches!(
-            self,
-            Self::ScheduleDelete { .. } | Self::WebhookDelete { .. } | Self::TemplateDelete { .. }
         )
     }
     fn key(&self) -> &str {
@@ -196,7 +263,7 @@ impl JournalBackend {
         let config = self
             .inspect(|s| s.webhooks.get(hook).cloned())
             .await
-            .ok_or_else(|| invalid("webhook not found"))?;
+            .ok_or_else(|| flow_journal::Error::NotFound("webhook not found".into()))?;
         let workflow = config["workflow_id"]
             .as_str()
             .ok_or_else(|| invalid("workflow_id required"))?;
@@ -209,7 +276,7 @@ impl JournalBackend {
                         .ok_or_else(|| invalid("invalid invocation receipt"))?,
                 )
                 .await?
-                .ok_or_else(|| invalid("run not found"))?;
+                .ok_or_else(|| flow_journal::Error::NotFound("run not found".into()))?;
             run.workflow_version
         } else {
             config["invoke_version"]
@@ -359,7 +426,7 @@ impl JournalBackend {
         }
         let output = self.store_json(output, 8 * 1024 * 1024).await?;
         self.command_for_run(run_id, &format!("run.adjudicate:{run_id}"),Some(request_id),&request,|state|{
-            let run=state.runs.get(run_id).ok_or_else(||invalid("run not found"))?;
+            let run=state.runs.get(run_id).ok_or_else(||flow_journal::Error::NotFound("run not found".into()))?;
             let node=run.nodes.get(node_id).ok_or_else(||invalid("node not found"))?;
             // outcome 已提交(结果被捕获、输出推导未达)的 Uncertain 节点同样
             // 允许人工收口:accept_output/failed 可用已提交证据裁决;只有
@@ -375,14 +442,82 @@ impl JournalBackend {
         }).await
     }
 
+    /// Preflight has no journal writes. Missing secrets are repairable by the import form.
+    pub fn workflow_validate(&self, definition: Value) -> Result<Value> {
+        let prepared = PreparedDefinition::new(definition)?;
+        let missing: Vec<Value> = prepared
+            .missing_secrets()
+            .into_iter()
+            .map(|(node_id, name)| json!({"node_id":node_id,"name":name}))
+            .collect();
+        Ok(json!({"valid":missing.is_empty(),"missing_secrets":missing}))
+    }
+
+    /// Name upsert, version creation and publication commit as one transaction.
+    pub async fn workflow_import(
+        &self,
+        name: &str,
+        definition: Value,
+        publish: bool,
+        request_id: Option<&str>,
+    ) -> Result<CommandReceipt> {
+        validate_workflow_name(name)?;
+        let prepared = PreparedDefinition::new(definition)?;
+        let request = json!({"name":name,"definition":prepared.value,"publish":publish});
+        if let Some(receipt) = deduped(self, "workflow.import", request_id, &request).await? {
+            return Ok(receipt);
+        }
+        prepared.require_secrets()?;
+        let checksum = prepared.checksum;
+        let stored = self
+            .store_json(prepared.value, flow_journal::MAX_LINE_BYTES)
+            .await?;
+        self.command("workflow.import", request_id, &request, |state| {
+            let existing = state
+                .workflows
+                .values()
+                .find(|w| !w.deleted && w.name == name);
+            let created = existing.is_none();
+            let workflow_id = existing.map(|w| w.workflow_id.clone()).unwrap_or_else(id);
+            let mut events = Vec::new();
+            if created {
+                events.push(Event::new(
+                    EventKind::WorkflowCreated,
+                    serde_json::to_value(Workflow {
+                        workflow_id: workflow_id.clone(),
+                        name: name.into(),
+                        created_at: now(),
+                        versions: BTreeMap::new(),
+                        deleted: false,
+                    })?,
+                ));
+            }
+            let latest = existing.and_then(|w| w.versions.last_key_value().map(|(_, v)| v));
+            let (value, event) = prepare_version(&workflow_id, latest, stored, checksum);
+            let version = value.version;
+            events.extend(event);
+            let published = value.published || publish;
+            if publish && !value.published {
+                events.push(Event::new(
+                    EventKind::WorkflowPublished,
+                    json!({"workflow_id":workflow_id,"version":version.to_string()}),
+                ));
+            }
+            Ok((
+                events,
+                json!({"workflow_id":workflow_id,"name":name,"version":version,
+                "created":created,"status":if published {"published"} else {"draft"}}),
+            ))
+        })
+        .await
+    }
+
     pub async fn workflow_create(
         &self,
         name: &str,
         request_id: Option<&str>,
     ) -> Result<CommandReceipt> {
-        if name.is_empty() || name.len() > 1024 {
-            return Err(invalid("invalid workflow name").into());
-        }
+        validate_workflow_name(name)?;
         self.command("workflow.create", request_id, &json!({"name":name}), |_| {
             let workflow_id = id();
             let w = Workflow {
@@ -390,6 +525,7 @@ impl JournalBackend {
                 name: name.into(),
                 created_at: now(),
                 versions: BTreeMap::new(),
+                deleted: false,
             };
             Ok((
                 vec![Event::new(
@@ -404,41 +540,20 @@ impl JournalBackend {
     pub async fn workflow_update(
         &self,
         workflow_id: &str,
-        mut definition: Value,
+        definition: Value,
         request_id: Option<&str>,
     ) -> Result<CommandReceipt> {
-        // 先注入 semantics 缺省再取指纹：指纹必须与语义裁决同源——同一
-        // 有效定义（显式 semantics:2 vs 缺省）不能因指纹口径不同而漏判
-        // 幂等窗口（checksum 用注入后的定义，指纹也要）。
-        if let Some(object) = definition.as_object_mut() {
-            object.entry("semantics").or_insert(json!(2));
-        }
-        let fingerprint_request = json!({"workflow_id":workflow_id,"definition":definition});
-        let parsed = flow_engine::journal_state::validate_definition(&definition)?;
-        let checksum = flow_journal::codec::digest(&flow_journal::codec::bounded_json(
-            &definition,
-            flow_journal::MAX_LINE_BYTES,
-        )?);
+        let prepared = PreparedDefinition::new(definition)?;
+        let fingerprint_request = json!({"workflow_id":workflow_id,"definition":prepared.value});
         if let Some(receipt) =
             deduped(self, "workflow.update", request_id, &fingerprint_request).await?
         {
             return Ok(receipt);
         }
-        let missing = flow_engine::secrets::missing_secrets(&parsed);
-        if !missing.is_empty() {
-            return Err(invalid(
-                missing
-                    .iter()
-                    .map(|(node, name)| {
-                        format!("node {node}: missing secret {name} (FLOW_SECRET_{name})")
-                    })
-                    .collect::<Vec<_>>()
-                    .join("; "),
-            )
-            .into());
-        }
+        prepared.require_secrets()?;
+        let checksum = prepared.checksum;
         let stored = self
-            .store_json(definition, flow_journal::MAX_LINE_BYTES)
+            .store_json(prepared.value, flow_journal::MAX_LINE_BYTES)
             .await?;
         self.command(
             "workflow.update",
@@ -448,28 +563,13 @@ impl JournalBackend {
                 let w = state
                     .workflows
                     .get(workflow_id)
-                    .ok_or_else(|| invalid("workflow not found"))?;
-                // v1 §8 语义：与最新版本 checksum 相同的定义复用该版本号
-                //（编辑器重复保存不刷版本；命令回执空事件即幂等）
-                if let Some((_, latest)) = w.versions.last_key_value() {
-                    if latest.checksum == checksum {
-                        return Ok((vec![], json!({"version": latest.version})));
-                    }
-                }
-                let version = w.versions.last_key_value().map_or(1, |(v, _)| v + 1);
-                let value = DefinitionVersion {
-                    version,
-                    definition: stored,
-                    checksum,
-                    published: false,
-                    created_at: now(),
-                };
+                    .filter(|w| !w.deleted)
+                    .ok_or_else(|| flow_journal::Error::NotFound("workflow not found".into()))?;
+                let latest = w.versions.last_key_value().map(|(_, v)| v);
+                let (value, event) = prepare_version(workflow_id, latest, stored, checksum);
                 Ok((
-                    vec![Event::new(
-                        EventKind::WorkflowUpdated,
-                        json!({"workflow_id":workflow_id,"version":value}),
-                    )],
-                    json!({"version":version}),
+                    event.into_iter().collect(),
+                    json!({"version":value.version}),
                 ))
             },
         )
@@ -489,8 +589,11 @@ impl JournalBackend {
                 state
                     .workflows
                     .get(workflow_id)
+                    .filter(|w| !w.deleted)
                     .and_then(|w| w.versions.get(&version))
-                    .ok_or_else(|| invalid("workflow version not found"))?;
+                    .ok_or_else(|| {
+                        flow_journal::Error::NotFound("workflow version not found".into())
+                    })?;
                 Ok((
                     vec![Event::new(
                         EventKind::WorkflowPublished,
@@ -512,13 +615,12 @@ impl JournalBackend {
             request_id,
             &json!({"workflow_id":workflow_id}),
             |state| {
-                if !state.workflows.contains_key(workflow_id) {
-                    return Err(invalid("workflow not found"));
-                }
-                if state.run_workflows.contains(workflow_id) {
-                    return Err(flow_journal::Error::Conflict(
-                        "workflow has runs; cannot delete".into(),
-                    ));
+                let workflow = state
+                    .workflows
+                    .get(workflow_id)
+                    .ok_or_else(|| flow_journal::Error::NotFound("workflow not found".into()))?;
+                if workflow.deleted {
+                    return Ok((vec![], json!({"ok":true})));
                 }
                 let mut events = vec![Event::new(
                     EventKind::WorkflowDeleted,
@@ -639,6 +741,25 @@ impl JournalBackend {
             // 回归会因指纹漂移而失配——那正是快照要消除的漂移。
             snapshot.agent = recorded.agent.clone();
         }
+        // agent 节点的配置前置校验：快照里没有冻结配置就没有可授权的
+        // 请求。放在 run 提交前而不是 executor 派发后——用户立刻知道
+        // 去哪修（回归分支上面已继承 baseline 配置，不受当前安装影响）。
+        if execution
+            .as_ref()
+            .is_none_or(|snapshot| snapshot.agent.is_none())
+            && definition.nodes.iter().any(|node| {
+                node.kind() == Some(flow_engine::NodeType::Harness)
+                    && node
+                        .param_str("mode")
+                        .is_some_and(|mode| mode.trim() == "agent")
+            })
+        {
+            return Err(invalid(
+                "工作流包含 mode=agent 的 harness 节点，但 [harness.agent] 未启用：\
+                 请在设置页配置 base_url 与 model（成对填写）并重启 flow 后重试",
+            )
+            .into());
+        }
         self.command(&scope, request_id, &request, |state| {
             if matches!(source, "schedule" | "webhook") {
                 let key = source_detail.ok_or_else(|| invalid("trigger identity required"))?;
@@ -691,11 +812,11 @@ impl JournalBackend {
             let workflow = state
                 .workflows
                 .get(workflow_id)
-                .ok_or_else(|| invalid("workflow not found"))?;
-            let definition = workflow
-                .versions
-                .get(&selected)
-                .ok_or_else(|| invalid("workflow version not found"))?;
+                .filter(|w| !w.deleted)
+                .ok_or_else(|| flow_journal::Error::NotFound("workflow not found".into()))?;
+            let definition = workflow.versions.get(&selected).ok_or_else(|| {
+                flow_journal::Error::NotFound("workflow version not found".into())
+            })?;
             if !definition.published {
                 return Err(invalid("version not published"));
             }
@@ -746,7 +867,7 @@ impl JournalBackend {
                 let run = state
                     .runs
                     .get(run_id)
-                    .ok_or_else(|| invalid("run not found"))?;
+                    .ok_or_else(|| flow_journal::Error::NotFound("run not found".into()))?;
                 let mut events = Vec::new();
                 if !run.terminal() {
                     let mut event =
@@ -779,7 +900,7 @@ impl JournalBackend {
         let snapshot = self
             .run_snapshot(run_id)
             .await?
-            .ok_or_else(|| invalid("run not found"))?;
+            .ok_or_else(|| flow_journal::Error::NotFound("run not found".into()))?;
         let definition = self.cached_definition(run_id, &snapshot.definition).await?;
         let accepts_inbox = definition.node_type(node_id).is_some_and(|k| {
             matches!(
@@ -803,7 +924,7 @@ impl JournalBackend {
                 let run = state
                     .runs
                     .get(run_id)
-                    .ok_or_else(|| invalid("run not found"))?;
+                    .ok_or_else(|| flow_journal::Error::NotFound("run not found".into()))?;
                 if run.terminal() {
                     return Err(flow_journal::Error::Conflict("run is terminal; cannot deliver signal".into()));
                 }
@@ -945,137 +1066,150 @@ pub(crate) fn node_event(
     event
 }
 
-/// 锁内的产品命令决策：存在性检查、patch 组装与存储文档裁决都在同一把
-/// 锁下完成。patch 字段是持久化文档的一部分，保持既有 JSON 形状。
+/// Typed commands decide directly against committed state. JSON is produced only
+/// for the persisted document; legacy patch endpoints share the final validators.
 fn product_decision(
     state: &State,
     command: &ProductCommand,
 ) -> flow_journal::Result<(Vec<Event>, Value)> {
-    let namespace = command.namespace();
-    let creating = command.creating();
-    let deleting = command.deleting();
     let key = command.key();
     if key.is_empty() || key.len() > 128 {
         return Err(invalid("invalid entity key"));
     }
-    let map = match namespace {
-        "schedule" => &state.schedules,
-        "webhook" => &state.webhooks,
-        "template" => &state.templates,
-        _ => return Err(invalid("invalid product command")),
-    };
-    if !creating && !map.contains_key(key) {
-        if namespace == "template" && deleting {
-            return Ok((vec![], json!({"deleted": false})));
-        }
-        return Err(invalid(format!("{namespace} not found")));
-    }
-    let mut patch = serde_json::Map::new();
-    if deleting {
-        patch.insert("deleted".into(), json!(true));
-    } else {
-        match command {
-            ProductCommand::ScheduleCreate {
-                workflow_id,
-                enabled,
-                input,
-                cron,
-                ..
-            } => {
-                patch.insert("workflow_id".into(), json!(workflow_id));
-                patch.insert("enabled".into(), json!(enabled.unwrap_or(true)));
-                patch.insert("input".into(), input.clone());
-                patch.insert("cron_expr".into(), json!(cron));
+    let creating = command.creating();
+    match command {
+        ProductCommand::ScheduleCreate { .. }
+        | ProductCommand::ScheduleUpdate { .. }
+        | ProductCommand::ScheduleDelete { .. } => {
+            let previous = state.schedules.get(key);
+            if !creating && previous.is_none() {
+                return Err(flow_journal::Error::NotFound("schedule not found".into()));
             }
-            ProductCommand::ScheduleUpdate {
-                cron,
-                input,
-                enabled,
-                ..
-            } => {
-                if let Some(value) = cron {
-                    patch.insert("cron_expr".into(), value.clone());
+            let mut value = previous
+                .cloned()
+                .unwrap_or_else(|| json!({"created_at":now()}));
+            match command {
+                ProductCommand::ScheduleCreate {
+                    workflow_id,
+                    cron,
+                    enabled,
+                    input,
+                    ..
+                } => {
+                    value["workflow_id"] = json!(workflow_id);
+                    value["cron_expr"] = json!(cron);
+                    value["enabled"] = json!(enabled);
+                    value["input"] = input.clone();
                 }
-                if let Some(value) = input {
-                    patch.insert("input".into(), value.clone());
-                }
-                if let Some(value) = enabled {
-                    patch.insert("enabled".into(), value.clone());
-                }
-            }
-            ProductCommand::WebhookCreate { workflow_id, .. } => {
-                patch.insert("workflow_id".into(), json!(workflow_id));
-                patch.insert("enabled".into(), json!(true));
-            }
-            ProductCommand::WebhookSetEnabled { enabled, .. } => {
-                patch.insert("enabled".into(), json!(enabled));
-            }
-            ProductCommand::TemplateUpsert {
-                name,
-                category,
-                nodes,
-                edges,
-                creating,
-                ..
-            } => {
-                for (key, value) in [
-                    ("name", name),
-                    ("category", category),
-                    ("nodes", nodes),
-                    ("edges", edges),
-                ] {
-                    if let Some(value) = value {
-                        patch.insert(key.into(), value.clone());
+                ProductCommand::ScheduleUpdate {
+                    cron,
+                    enabled,
+                    input,
+                    ..
+                } => {
+                    if let Some(cron) = cron {
+                        value["cron_expr"] = json!(cron);
+                    }
+                    if let Some(enabled) = enabled {
+                        value["enabled"] = json!(enabled);
+                    }
+                    if let Some(input) = input {
+                        value["input"] = input.clone();
                     }
                 }
-                if *creating {
-                    patch.entry("category").or_insert(Value::Null);
-                }
+                ProductCommand::ScheduleDelete { .. } => value["deleted"] = json!(true),
+                _ => unreachable!(),
             }
-            _ => return Err(invalid("invalid product command")),
+            let (events, mut value) = trigger_event(state, EventKind::ScheduleChanged, key, value)?;
+            let result = if matches!(command, ProductCommand::ScheduleDelete { .. }) {
+                json!({"deleted":true})
+            } else if creating {
+                value["next_fire_at"] = json!(value["cron_expr"]
+                    .as_str()
+                    .and_then(|expr| expr.parse::<cron_parser::Schedule>().ok())
+                    .and_then(|cron| cron.next_after(&chrono::Local::now()))
+                    .map(|t| t.with_timezone(&chrono::Utc).to_rfc3339()));
+                value.as_object_mut().unwrap().remove("input");
+                value
+            } else {
+                json!({"updated":true})
+            };
+            Ok((events, result))
+        }
+        ProductCommand::WebhookCreate { .. }
+        | ProductCommand::WebhookSetEnabled { .. }
+        | ProductCommand::WebhookDelete { .. } => {
+            let previous = state.webhooks.get(key);
+            if !creating && previous.is_none() {
+                return Err(flow_journal::Error::NotFound("webhook not found".into()));
+            }
+            let mut value = previous
+                .cloned()
+                .unwrap_or_else(|| json!({"created_at":now()}));
+            match command {
+                ProductCommand::WebhookCreate { workflow_id, .. } => {
+                    value["workflow_id"] = json!(workflow_id);
+                    value["enabled"] = json!(true);
+                }
+                ProductCommand::WebhookSetEnabled { enabled, .. } => {
+                    value["enabled"] = json!(enabled)
+                }
+                ProductCommand::WebhookDelete { .. } => value["deleted"] = json!(true),
+                _ => unreachable!(),
+            }
+            let (events, value) = trigger_event(state, EventKind::WebhookChanged, key, value)?;
+            let result = match command {
+                ProductCommand::WebhookCreate { .. } => value,
+                ProductCommand::WebhookDelete { .. } => json!({"deleted":true}),
+                _ => json!({"updated":true}),
+            };
+            Ok((events, result))
+        }
+        ProductCommand::TemplateUpsert { .. } | ProductCommand::TemplateDelete { .. } => {
+            let previous = state.templates.get(key);
+            if !creating && previous.is_none() {
+                return if matches!(command, ProductCommand::TemplateDelete { .. }) {
+                    Ok((vec![], json!({"deleted":false})))
+                } else {
+                    Err(flow_journal::Error::NotFound("template not found".into()))
+                };
+            }
+            let mut value = previous
+                .cloned()
+                .unwrap_or_else(|| json!({"created_at":now(),"category":null}));
+            match command {
+                ProductCommand::TemplateUpsert {
+                    name,
+                    category,
+                    nodes,
+                    edges,
+                    ..
+                } => {
+                    if let Some(name) = name {
+                        value["name"] = json!(name);
+                    }
+                    if let Some(category) = category {
+                        value["category"] = json!(category);
+                    }
+                    if let Some(nodes) = nodes {
+                        value["nodes"] = json!(nodes);
+                    }
+                    if let Some(edges) = edges {
+                        value["edges"] = json!(edges);
+                    }
+                }
+                ProductCommand::TemplateDelete { .. } => value["deleted"] = json!(true),
+                _ => unreachable!(),
+            }
+            let (events, mut value) = template_event(state, key, value)?;
+            if matches!(command, ProductCommand::TemplateDelete { .. }) {
+                return Ok((events, json!({"deleted":true})));
+            }
+            value.as_object_mut().unwrap().remove("nodes");
+            value.as_object_mut().unwrap().remove("edges");
+            Ok((events, value))
         }
     }
-    let (events, mut value) = if namespace == "template" {
-        template_decision(state, key, &Value::Object(patch))?
-    } else {
-        trigger_decision(
-            state,
-            if namespace == "schedule" {
-                EventKind::ScheduleChanged
-            } else {
-                EventKind::WebhookChanged
-            },
-            key,
-            &Value::Object(patch),
-        )?
-    };
-    let result = if deleting {
-        json!({"deleted": true})
-    } else if namespace == "webhook" && !creating {
-        json!({"updated": true})
-    } else if namespace == "schedule" {
-        // next_fire_at 是派生展示值，但会随 ScheduleChanged 事实持久化进
-        // 权威配置——表示必须与全库其余时间戳同口径（UTC）。cron 字段
-        // 本身按产品契约是本地时间解释（"0 9 * * *" = 本地 9 点），因此
-        // 用 Local 参考时刻求值、再转 UTC 表示：同一时刻，可比的字符串。
-        let next = value["cron_expr"]
-            .as_str()
-            .and_then(|expr| expr.parse::<cron_parser::Schedule>().ok())
-            .and_then(|cron| cron.next_after(&chrono::Local::now()))
-            .map(|t| t.with_timezone(&chrono::Utc).to_rfc3339());
-        value["next_fire_at"] = json!(next);
-        if creating {
-            value.as_object_mut().unwrap().remove("input");
-            value
-        } else {
-            json!({"updated": true})
-        }
-    } else {
-        value.as_object_mut().unwrap().remove("nodes");
-        value.as_object_mut().unwrap().remove("edges");
-        value
-    };
-    Ok((events, result))
 }
 
 fn trigger_decision(
@@ -1093,18 +1227,35 @@ fn trigger_decision(
         .get(key)
         .cloned()
         .unwrap_or_else(|| json!({"created_at":now()}));
-    let previous_enabled = value["enabled"] == true;
-    let previous_cron = value["cron_expr"].clone();
-    if !map.contains_key(key) && map.len() >= 1000 {
-        return Err(flow_journal::Error::Limit(
-            "maximum 1000 trigger configurations".into(),
-        ));
-    }
     let object = patch
         .as_object()
         .ok_or_else(|| invalid("config must be object"))?;
     for (k, v) in object {
         value[k] = v.clone();
+    }
+    trigger_event(state, kind, key, value)
+}
+
+fn trigger_event(
+    state: &State,
+    kind: EventKind,
+    key: &str,
+    mut value: Value,
+) -> flow_journal::Result<(Vec<Event>, Value)> {
+    let map = if kind == EventKind::ScheduleChanged {
+        &state.schedules
+    } else {
+        &state.webhooks
+    };
+    let previous = map.get(key);
+    let previous_enabled = previous.is_some_and(|v| v["enabled"] == true);
+    let previous_cron = previous
+        .map(|v| v["cron_expr"].clone())
+        .unwrap_or(Value::Null);
+    if previous.is_none() && map.len() >= 1000 {
+        return Err(flow_journal::Error::Limit(
+            "maximum 1000 trigger configurations".into(),
+        ));
     }
     value[if kind == EventKind::ScheduleChanged {
         "id"
@@ -1116,8 +1267,8 @@ fn trigger_decision(
             .as_str()
             .ok_or_else(|| invalid("workflow_id required"))?
             .to_owned();
-        if !state.workflows.contains_key(&workflow) {
-            return Err(invalid("workflow not found"));
+        if state.workflows.get(&workflow).is_none_or(|w| w.deleted) {
+            return Err(flow_journal::Error::NotFound("workflow not found".into()));
         }
         if !value["enabled"].is_boolean() {
             return Err(invalid("enabled flag required"));
@@ -1158,6 +1309,7 @@ fn trigger_decision(
     Ok((vec![Event::new(kind, value.clone())], value))
 }
 
+// Compatibility entry point used by bundle import and the raw template command.
 fn template_decision(
     state: &State,
     key: &str,
@@ -1168,14 +1320,22 @@ fn template_decision(
         .get(key)
         .cloned()
         .unwrap_or_else(|| json!({"created_at":now()}));
-    if !state.templates.contains_key(key) && state.templates.len() >= 1000 {
-        return Err(flow_journal::Error::Limit("maximum 1000 templates".into()));
-    }
     let object = patch
         .as_object()
         .ok_or_else(|| invalid("template patch must be object"))?;
     for (k, v) in object {
         value[k] = v.clone();
+    }
+    template_event(state, key, value)
+}
+
+fn template_event(
+    state: &State,
+    key: &str,
+    mut value: Value,
+) -> flow_journal::Result<(Vec<Event>, Value)> {
+    if !state.templates.contains_key(key) && state.templates.len() >= 1000 {
+        return Err(flow_journal::Error::Limit("maximum 1000 templates".into()));
     }
     value["id"] = json!(key);
     if value["deleted"] != true {
@@ -1219,4 +1379,84 @@ pub(crate) fn validate_run_input(
             .map_err(|e| invalid(format!("input contract: {e}")))?;
     }
     Ok(())
+}
+
+/// 非终态 run 的记录 runtime 与当前执行器不符 → 永远无法恢复（启动隔离对象）。
+pub(crate) fn runtime_mismatched(run: &Run) -> bool {
+    !run.terminal()
+        && run
+            .execution
+            .as_ref()
+            .is_some_and(|e| e.runtime != flow_engine::RUNTIME_ID)
+}
+
+#[cfg(test)]
+mod runtime_mismatch_tests {
+    use super::*;
+
+    fn waiting_run(runtime: &str) -> Run {
+        // 最小非终态 run：status=running + execution 快照（runtime 可注入）。
+        // StoredValue 是 tag=type/content=value 的外部标记枚举；ValueRef 需
+        // journal_id/output_id/codec/version/chunk_count/total_bytes/digest。
+        let value_ref = json!({
+            "type": "ref",
+            "value": {
+                "journal_id": "j",
+                "output_id": "v1",
+                "codec": "json",
+                "version": 1,
+                "chunk_count": "1",
+                "total_bytes": "2",
+                "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+        });
+        serde_json::from_value(json!({
+            "run_id": "01JTEST",
+            "workflow_id": "wf",
+            "workflow_version": 1,
+            "definition": value_ref,
+            "input": value_ref,
+            "source": "manual",
+            "source_detail": null,
+            "parent": null,
+            "depth": 0,
+            "created_at": "2026-10-20T00:00:00Z",
+            "status": "running",
+            "output": null,
+            "error": null,
+            "last_run_seq": "0",
+            "nodes": {},
+            "execution": {
+                "runtime": runtime,
+                "clock_ms": 0,
+                "seed": "s",
+                "path": [],
+                "definitions": {},
+                "bindings": {}
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn runtime_mismatch_targets_only_stale_non_terminal_runs() {
+        // 历史构建指纹不自动升级为执行兼容版本。
+        let stale = "0".repeat(64);
+        let stale = if stale == flow_engine::RUNTIME_ID {
+            "1".repeat(64)
+        } else {
+            stale
+        };
+        assert!(runtime_mismatched(&waiting_run(&stale)));
+        // 当前 runtime 的在途 run 不隔离
+        assert!(!runtime_mismatched(&waiting_run(flow_engine::RUNTIME_ID)));
+        // 终态（failed）的陈旧 run 不隔离
+        let mut failed = waiting_run(&stale);
+        failed.status = RunStatus::Failed;
+        assert!(!runtime_mismatched(&failed));
+        // 无执行快照（semantics=1）不隔离
+        let mut legacy = waiting_run(&stale);
+        legacy.execution = None;
+        assert!(!runtime_mismatched(&legacy));
+    }
 }

@@ -16,22 +16,18 @@ defineEmits<{ collapse: []; "toggle-layout": [] }>();
  * 此时可切 JSON 模式手动补齐。
  */
 const inputKeys = computed(() => discoverInputKeys(flowToDefinition(), editor.nodeTypes));
-
-/** 输入节点表单的预填来源：启动草稿里的输入（非法 JSON 时无预填） */
-const launchedInput = computed(() => {
-  try {
-    return JSON.parse(monitor.inputText);
-  } catch {
-    return undefined;
-  }
-});
 </script>
 
 <template>
   <div class="run-panel" :class="layout">
     <div class="run-panel-head">
       <h3>运行</h3>
-      <WorkflowInputForm v-model="monitor.inputText" class="run-input" :input-keys="inputKeys" />
+      <WorkflowInputForm
+        v-model="monitor.inputText"
+        class="run-input"
+        :input-keys="inputKeys"
+        :input-schema="editor.definitionOptions.input_schema"
+      />
       <AppButton
         :title="layout === 'footer' ? '切换为右侧栏' : '切换为底部栏'"
         @click="$emit('toggle-layout')"
@@ -41,7 +37,7 @@ const launchedInput = computed(() => {
       <AppButton title="收起运行面板" @click="$emit('collapse')">收起 ▾</AppButton>
     </div>
     <div class="run-panel-body">
-      <RunMonitor v-if="monitor.runId" :layout="layout" :run-input="launchedInput" />
+      <RunMonitor v-if="monitor.runId" :layout="layout" :run-input="monitor.runInput" />
       <p v-else class="run-hint">在顶部工具栏点击「运行」启动最新已发布版本，面板随运行自动展开</p>
     </div>
   </div>

@@ -51,7 +51,9 @@ export async function requestRunInput(
   def: Definition,
   nodeTypes: NodeTypeDesc[],
   input: unknown,
+  signal?: AbortSignal,
 ): Promise<{ input: unknown } | null> {
+  if (signal?.aborted) return null;
   const schema = schemaObject(def.input_schema);
   const isObject = input !== null && typeof input === "object" && !Array.isArray(input);
   const base = isObject ? (input as Record<string, unknown>) : {};
@@ -60,7 +62,7 @@ export async function requestRunInput(
   if (schema.type === undefined || schema.type === "object") {
     for (const node of def.nodes.filter((n) => n.type === "input")) {
       for (const f of parseInputFields(node.params)) {
-        if (!fields.some((field) => field.key === f.key))
+        if (schema.additionalProperties !== false && !fields.some((field) => field.key === f.key))
           fields.push({
             key: f.key,
             label: f.label ?? f.key,
@@ -88,6 +90,8 @@ export async function requestRunInput(
   if (
     (schema.type === undefined || schema.type === "object") &&
     fields.length &&
+    (schema.additionalProperties !== false ||
+      Object.keys(base).every((key) => declared.has(key))) &&
     (input === undefined || isObject)
   ) {
     const merge = (values: Record<string, unknown>) => {
@@ -98,6 +102,7 @@ export async function requestRunInput(
     const values = await formDialog("填写工作流运行输入", fields, {
       values: base,
       confirmText: "运行",
+      signal,
       validate: (values) => validateInputSchema(def.input_schema, merge(values)),
     });
     return values ? { input: merge(values) } : null;
@@ -112,6 +117,7 @@ export async function requestRunInput(
   };
   const values = await formDialog("填写工作流运行输入", [rootField], {
     confirmText: "运行",
+    signal,
     validate: (values) => validateInputSchema(def.input_schema, values.$),
   });
   return values ? { input: values.$ } : null;

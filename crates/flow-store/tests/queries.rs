@@ -124,3 +124,28 @@ async fn current_reads_reject_old_revision_requests_and_detect_content_corruptio
     p.close().await;
     j.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn aggregate_response_budget_returns_a_typed_limit() {
+    let dir = flow_test_support::io::TempDir::new("sqlite-response-budget");
+    let j = Journal::open(dir.path(), Default::default()).await.unwrap();
+    // Individually valid rows exceed the collection budget together.
+    for index in 0..9 {
+        write(
+            &j,
+            vec![EntityChange {
+                kind: "template".into(),
+                key: format!("t{index}"),
+                value: Some(json!({"id":format!("t{index}"),"nodes":["x".repeat(1024*1024)]})),
+            }],
+        )
+        .await;
+    }
+    let store = Store::open(&dir.join("flow.sqlite"), j.id()).await.unwrap();
+    assert!(matches!(
+        store.ordered("template", None, false).await,
+        Err(flow_store::store::Error::ResponseTooLarge)
+    ));
+    store.close().await;
+    j.close().await.unwrap();
+}

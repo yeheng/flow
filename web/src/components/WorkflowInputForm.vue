@@ -5,11 +5,13 @@
  * startRun / schedule.create 的解析链路不变）；无字段时退化为纯 JSON 文本域。
  */
 import { computed, reactive, ref, watch } from "vue";
+import { schemaFields } from "../state/form-fields";
 
 const props = withDefaults(
   defineProps<{
     inputKeys: string[];
     modelValue: string;
+    inputSchema?: unknown;
     rows?: number;
     placeholder?: string;
   }>(),
@@ -25,7 +27,11 @@ const mode = ref<"form" | "json">("form");
  * 两者的关系只有两条规则：syncFields 从 modelValue 补齐显示、emitForm 由用户
  * 输入触发合并写回。
  */
-const values = reactive<Record<string, string>>({});
+const values = reactive<Record<string, string>>(Object.create(null));
+const declaredFields = computed(
+  () => new Map(schemaFields(props.inputSchema).map((f) => [f.key, f])),
+);
+let lastFormEmission: string | undefined;
 
 /** modelValue 解析出的 JSON 对象：空文本 → {}；非对象/非法 JSON → undefined（不可无损合并） */
 function parseBase(): Record<string, unknown> | undefined {
@@ -66,18 +72,24 @@ function emitForm(): void {
   if (base === undefined) return;
   const next: Record<string, unknown> = { ...base };
   for (const k of props.inputKeys) {
-    const raw = (values[k] ?? "").trim();
-    if (!raw) {
+    const raw = values[k] ?? "";
+    if (!raw.trim()) {
       delete next[k];
       continue;
     }
-    try {
-      next[k] = JSON.parse(raw);
-    } catch {
+    const field = declaredFields.value.get(k);
+    if (field?.type === "string" || field?.enum?.some((v) => v === raw)) {
       next[k] = raw;
+    } else {
+      try {
+        next[k] = JSON.parse(raw);
+      } catch {
+        next[k] = raw;
+      }
     }
   }
-  emit("update:modelValue", Object.keys(next).length > 0 ? JSON.stringify(next) : "");
+  lastFormEmission = Object.keys(next).length > 0 ? JSON.stringify(next) : "";
+  emit("update:modelValue", lastFormEmission);
 }
 
 /** 表单无法表示当前原文（数组/标量/半截 JSON）：明确提示，避免用户以为输入生效了 */
@@ -94,12 +106,12 @@ const formBlocked = computed(() => {
 });
 
 watch(
-  () => props.inputKeys,
-  (keys, prev) => {
-    syncFields();
-    // 字段清单真的增删才写回 merge（父组件 computed 每次给新数组引用不算变化）
-    const changed = !!prev && (keys.length !== prev.length || keys.some((k) => !prev.includes(k)));
-    if (changed && mode.value === "form") emitForm();
+  [() => props.inputKeys, () => props.modelValue],
+  ([, model], previous) => {
+    const changed = previous && model !== previous[1];
+    // 自身输入的回显保留 5.0/1e3 缓冲；外部补填、清空和切换工作流则重新回填。
+    syncFields(!!changed && model !== lastFormEmission);
+    if (changed) lastFormEmission = undefined;
   },
   { immediate: true },
 );

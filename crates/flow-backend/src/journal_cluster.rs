@@ -1,4 +1,4 @@
-//! PostgreSQL membership and progress reports for independent JSONL journals.
+//! PostgreSQL membership and progress reports for independent SQLite journals.
 //! No business events, run ownership or log replication are stored here.
 use std::collections::BTreeMap;
 use std::sync::{Arc, Weak};
@@ -27,23 +27,40 @@ pub enum ClusterError {
 }
 pub type Result<T> = std::result::Result<T, ClusterError>;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Snapshot {
     #[serde(with = "flow_journal::decimal")]
     pub durable_lsn: u64,
     #[serde(with = "flow_journal::decimal")]
     pub applied_lsn: u64,
     #[serde(with = "flow_journal::decimal")]
-    pub projected_lsn: u64,
-    #[serde(with = "flow_journal::decimal")]
     pub master_epoch: u64,
     pub run_counts: BTreeMap<String, u64>,
     pub writer_error: Option<String>,
-    pub projection_error: Option<String>,
 }
+/// Keep legacy wire fields at the serialization boundary only. There is no
+/// independently progressing projection or projection failure in SQLite mode.
+impl Serialize for Snapshot {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut wire = serializer.serialize_struct("Snapshot", 7)?;
+        wire.serialize_field("durable_lsn", &self.durable_lsn.to_string())?;
+        wire.serialize_field("applied_lsn", &self.applied_lsn.to_string())?;
+        wire.serialize_field("projected_lsn", &self.durable_lsn.to_string())?;
+        wire.serialize_field("master_epoch", &self.master_epoch.to_string())?;
+        wire.serialize_field("run_counts", &self.run_counts)?;
+        wire.serialize_field("writer_error", &self.writer_error)?;
+        wire.serialize_field("projection_error", &Option::<String>::None)?;
+        wire.end()
+    }
+}
+
 impl Snapshot {
     fn counters(&self) -> Result<[i64; 4]> {
-        if self.applied_lsn > self.durable_lsn || self.projected_lsn > self.durable_lsn {
+        if self.applied_lsn > self.durable_lsn {
             return Err(ClusterError::Invalid(
                 "progress exceeds durable journal".into(),
             ));
@@ -52,7 +69,7 @@ impl Snapshot {
         for (slot, value) in result.iter_mut().zip([
             self.durable_lsn,
             self.applied_lsn,
-            self.projected_lsn,
+            self.durable_lsn, // Legacy SQL column: projection commits with facts.
             self.master_epoch,
         ]) {
             *slot = i64::try_from(value)
@@ -61,7 +78,7 @@ impl Snapshot {
         Ok(result)
     }
     fn health(&self) -> &'static str {
-        if self.writer_error.is_some() || self.projection_error.is_some() {
+        if self.writer_error.is_some() {
             "degraded"
         } else {
             "online"
@@ -455,7 +472,6 @@ impl Membership {
 
 impl JournalBackend {
     pub async fn cluster_snapshot(&self) -> Result<Snapshot> {
-        let projected_lsn = self.store.applied_lsn().await?;
         let (applied_lsn, master_epoch, run_counts) = self
             .inspect(|s| {
                 // RunStatus 是枚举（无 Ord）：按 wire 字符串聚合（与
@@ -472,11 +488,9 @@ impl JournalBackend {
         Ok(Snapshot {
             durable_lsn: stats.durable_lsn,
             applied_lsn,
-            projected_lsn,
             master_epoch,
             run_counts,
             writer_error: stats.failure,
-            projection_error: None,
         })
     }
 }
@@ -484,6 +498,21 @@ impl JournalBackend {
 #[cfg(test)]
 mod tests {
     use super::validate_endpoint;
+    #[test]
+    fn obsolete_projection_fields_are_wire_aliases_only() {
+        let snapshot: super::Snapshot = serde_json::from_value(serde_json::json!({
+            "durable_lsn":"42", "applied_lsn":"40", "master_epoch":"1",
+            "run_counts":{}, "writer_error":null,
+            "projected_lsn":"17", "projection_error":"obsolete"
+        }))
+        .unwrap();
+        assert_eq!(snapshot.health(), "online");
+        assert_eq!(snapshot.counters().unwrap(), [42, 40, 42, 1]);
+        let wire = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(wire["projected_lsn"], "42");
+        assert!(wire["projection_error"].is_null());
+    }
+
     #[test]
     fn advertised_endpoints_reject_wildcard_hosts_and_credentials() {
         for endpoint in [

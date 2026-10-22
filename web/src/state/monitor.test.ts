@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { Timeline } from "../types";
+import type { Timeline, WorkflowDetail } from "../types";
 
 // monitor 的 attach 竞态语义：局部构建 + 令牌比对 + 原子换入。
 // mock api 层，验证「被取代的 attach 不得写回 monitor、不得泄漏订阅」。
@@ -16,7 +16,17 @@ vi.mock("../api/flow", () => ({
 import * as api from "../api/flow";
 import { editor } from "./editor";
 import { toast } from "./toast";
-import { attachRun, canCancelRun, detachRun, monitor, needReattach, startRun } from "./monitor";
+import {
+  attachRun,
+  backToParentRun,
+  cancelRunStart,
+  canCancelRun,
+  detachRun,
+  monitor,
+  needReattach,
+  openChildRun,
+  startRun,
+} from "./monitor";
 import { closeAllOverlays } from "./overlays";
 import { modalEntries } from "./modal";
 import { flushPromises } from "@vue/test-utils";
@@ -45,6 +55,8 @@ function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
 const unsubs: Record<string, ReturnType<typeof vi.fn>> = {};
 
 beforeEach(() => {
+  cancelRunStart();
+  closeAllOverlays();
   vi.clearAllMocks();
   for (const k of Object.keys(unsubs)) delete unsubs[k];
   vi.mocked(api.subscribeRun).mockImplementation(async (runId: string) => {
@@ -156,6 +168,150 @@ describe("timeline 拉取失败的降级路径", () => {
 });
 
 describe("startRun 前置校验", () => {
+  it("运行已换入后离开编辑器，仍继续观测该运行直到终态", async () => {
+    const observations = deferred<Awaited<ReturnType<typeof api.runObservations>>>();
+    let markDirty!: () => void;
+    vi.mocked(api.subscribeRun).mockImplementationOnce(async (_id, onEvent) => {
+      markDirty = () =>
+        onEvent({
+          lsn: "1",
+          event_index: 0,
+          event: { run_id: "observed", run_seq: "2", kind: "RunCompleted", payload: null },
+        });
+      return async () => {};
+    });
+    editor.workflowId = "wf-observed";
+    editor.publishedVersion = 1;
+    monitor.inputText = "";
+    vi.mocked(api.getWorkflow).mockResolvedValueOnce({
+      workflow_id: "wf-observed",
+      version: 1,
+      status: "published",
+      published_version: 1,
+      definition: { nodes: [], edges: [] },
+    });
+    vi.mocked(api.startRun).mockResolvedValueOnce({ run_id: "observed", workflow_version: 1 });
+    vi.mocked(api.runTimeline).mockResolvedValue(timeline("observed"));
+    vi.mocked(api.runObservations).mockReturnValueOnce(observations.promise);
+    const started = startRun();
+    await flushPromises();
+    expect(monitor.runId).toBe("observed");
+    cancelRunStart();
+    observations.resolve({ records: [], loss: {} });
+    await started;
+    vi.mocked(api.runTimeline).mockResolvedValue({ ...timeline("observed"), status: "succeeded" });
+    markDirty();
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(monitor.status).toBe("succeeded");
+    } finally {
+      await detachRun();
+    }
+  });
+  it("查看子运行再返回时恢复父运行输入", async () => {
+    monitor.runId = "parent";
+    monitor.workflowId = "wf-parent";
+    monitor.runInput = { project: "parent-input" };
+    vi.mocked(api.runTimeline).mockImplementation(async (id) => ({
+      ...timeline(id),
+      status: "succeeded",
+    }));
+    await openChildRun("child");
+    expect(monitor.runInput).toBeUndefined();
+    await backToParentRun();
+    expect(monitor.runInput).toEqual({ project: "parent-input" });
+    await detachRun();
+  });
+  it("切换工作流清空旧输入，旧定义迟到时不在新页面打开表单", async () => {
+    const pending = deferred<WorkflowDetail>();
+    editor.workflowId = "wf-old";
+    editor.publishedVersion = 1;
+    monitor.inputText = '{"token":"old-secret"}';
+    vi.mocked(api.getWorkflow).mockReturnValueOnce(pending.promise);
+    const started = startRun();
+    editor.workflowId = "wf-new";
+    expect(monitor.inputText).toBe("");
+    expect(monitor.starting).toBe(false);
+    pending.resolve({
+      workflow_id: "wf-old",
+      version: 1,
+      status: "published",
+      published_version: 1,
+      definition: { nodes: [], edges: [], input_schema: { type: "object", required: ["name"] } },
+    });
+    await started;
+    expect(modalEntries()).toHaveLength(0);
+    expect(api.startRun).not.toHaveBeenCalled();
+  });
+
+  it("离开编辑器时取消等待输入的启动，并关闭对应表单", async () => {
+    editor.workflowId = "wf-close";
+    editor.publishedVersion = 1;
+    monitor.inputText = "";
+    vi.mocked(api.getWorkflow).mockResolvedValueOnce({
+      workflow_id: "wf-close",
+      version: 1,
+      status: "published",
+      published_version: 1,
+      definition: { nodes: [], edges: [], input_schema: { type: "object", required: ["name"] } },
+    });
+    const started = startRun();
+    await flushPromises();
+    expect(modalEntries()).toHaveLength(1);
+    cancelRunStart();
+    await started;
+    expect(modalEntries()).toHaveLength(0);
+    expect(api.startRun).not.toHaveBeenCalled();
+  });
+
+  it("旧启动取消后迟到的 finally 不解除新启动的忙碌状态", async () => {
+    const old = deferred<WorkflowDetail>();
+    const next = deferred<WorkflowDetail>();
+    editor.workflowId = "wf-old";
+    editor.publishedVersion = 1;
+    vi.mocked(api.getWorkflow).mockReturnValueOnce(old.promise).mockReturnValueOnce(next.promise);
+    const a = startRun();
+    editor.workflowId = "wf-new";
+    const b = startRun();
+    old.resolve({
+      workflow_id: "wf-old",
+      version: 1,
+      status: "published",
+      published_version: 1,
+      definition: { nodes: [], edges: [] },
+    });
+    await a;
+    expect(monitor.starting).toBe(true);
+    cancelRunStart();
+    next.resolve({
+      workflow_id: "wf-new",
+      version: 1,
+      status: "published",
+      published_version: 1,
+      definition: { nodes: [], edges: [] },
+    });
+    await b;
+    expect(api.startRun).not.toHaveBeenCalled();
+  });
+
+  it("修改下一次运行的草稿不改变已启动运行的输入", async () => {
+    editor.workflowId = "wf-snapshot";
+    editor.publishedVersion = 1;
+    monitor.inputText = '{"project":"original"}';
+    vi.mocked(api.getWorkflow).mockResolvedValueOnce({
+      workflow_id: "wf-snapshot",
+      version: 1,
+      status: "published",
+      published_version: 1,
+      definition: { nodes: [], edges: [] },
+    });
+    vi.mocked(api.startRun).mockResolvedValueOnce({ run_id: "snapshot", workflow_version: 1 });
+    vi.mocked(api.runTimeline).mockResolvedValue({ ...timeline("snapshot"), status: "succeeded" });
+    await startRun();
+    monitor.inputText = '{"project":"next"}';
+    expect(monitor.runInput).toEqual({ project: "original" });
+    await detachRun();
+  });
   it("读取固定发布版本的必填合同，取消表单不创建运行", async () => {
     editor.workflowId = "wf-contract";
     editor.publishedVersion = 2;

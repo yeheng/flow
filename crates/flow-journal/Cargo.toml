@@ -3,6 +3,10 @@ name = "flow-journal"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["storage"]
+storage = ["dep:rusqlite", "dep:fs2", "dep:clap"]
+
 [dependencies]
 tokio.workspace = true
 tokio-util.workspace = true
@@ -11,11 +15,11 @@ serde_json.workspace = true
 sha2.workspace = true
 hex.workspace = true
 thiserror.workspace = true
-fs2.workspace = true
+fs2 = { workspace = true, optional = true }
 uuid.workspace = true
 base64.workspace = true
-clap.workspace = true
-rusqlite.workspace = true
+clap = { workspace = true, optional = true }
+rusqlite = { workspace = true, optional = true }
 chrono.workspace = true
 
 [dev-dependencies]

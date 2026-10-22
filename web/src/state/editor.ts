@@ -56,6 +56,9 @@ export interface EditorEdge {
   selected?: boolean;
 }
 
+/** 与画布初始化和拖拽使用同一网格，避免 Vue Flow 自动吸附被误判为用户编辑。 */
+export const CANVAS_SNAP_GRID = 16;
+
 interface BreadcrumbEntry {
   workflowId: string;
   name: string;
@@ -434,7 +437,10 @@ export function flowToDefinition(): Definition {
       id: n.id,
       type: n.data!.nodeType.type,
       name: n.data!.name,
-      position: { x: Math.round(n.position.x), y: Math.round(n.position.y) },
+      position: {
+        x: Math.round(n.position.x / CANVAS_SNAP_GRID) * CANVAS_SNAP_GRID,
+        y: Math.round(n.position.y / CANVAS_SNAP_GRID) * CANVAS_SNAP_GRID,
+      },
       params: cleanParams(n.data!.params),
     })),
     edges: editor.edges.map((e) => {
@@ -723,7 +729,9 @@ export function copySelection(): boolean {
 /** 创建副本不改写剪贴板；节点参数与内部连线沿用片段插入规则。 */
 export function duplicateSelection(): boolean {
   const fragment = selectionFragment();
-  return fragment ? insertFragment(fragment.nodes, fragment.edges, { offset: { x: 32, y: 32 } }) : false;
+  return fragment
+    ? insertFragment(fragment.nodes, fragment.edges, { offset: { x: 32, y: 32 } })
+    : false;
 }
 
 export interface InsertOptions {

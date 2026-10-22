@@ -6,7 +6,7 @@ use flow_store::store::{EntityChange, Store};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 type Result<T> = std::result::Result<T, JournalError>;
-fn db(e: sqlx::Error) -> JournalError {
+fn db(e: flow_store::store::Error) -> JournalError {
     JournalError::Storage(e.to_string())
 }
 

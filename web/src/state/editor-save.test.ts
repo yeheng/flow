@@ -59,6 +59,15 @@ it("invalidates the computed dirty flag when the saved snapshot changes", () => 
   expect(dirty.value).toBe(false);
 });
 
+it("画布自动网格吸附不产生未保存标记，实际移动到其他网格仍标记为修改", () => {
+  editor.nodes[0]!.position = { x: 300, y: 200 };
+  markSaved();
+  editor.nodes[0]!.position = { x: 304, y: 208 };
+  expect(dirty.value).toBe(false);
+  editor.nodes[0]!.position.x = 320;
+  expect(dirty.value).toBe(true);
+});
+
 it("does not hide read failures for an existing version", async () => {
   editor.version = 1;
   vi.mocked(api.getWorkflow).mockRejectedValue(new RpcError(-32011, "deleted"));

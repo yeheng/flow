@@ -20,6 +20,34 @@ const definition: Definition = {
 };
 
 describe("运行前输入弹窗", () => {
+  it("严格输入合同里的多余字段可以切到 JSON 表单移除，不被锁在无法通过的字段表单", async () => {
+    vi.mocked(formDialog).mockResolvedValue({ $: { name: "fixed" } });
+    const strict = {
+      ...definition,
+      input_schema: {
+        type: "object",
+        required: ["name"],
+        properties: { name: { type: "string" } },
+        additionalProperties: false,
+      },
+    };
+    expect(await requestRunInput(strict, [], { name: "original", extra: true })).toEqual({
+      input: { name: "fixed" },
+    });
+    expect(vi.mocked(formDialog).mock.calls[0][1][0]).toMatchObject({ key: "$", type: "json" });
+    expect(
+      vi.mocked(formDialog).mock.calls[0][2]!.validate!({ $: { name: "fixed" } }),
+    ).toBeUndefined();
+  });
+  it("严格合同不强制把运行中 input 节点的私有字段提前加入 run input", async () => {
+    const runtime = {
+      ...definition,
+      nodes: [{ id: "approval", type: "input", params: { fields: [{ key: "approval" }] } }],
+      input_schema: { type: "object", properties: {}, additionalProperties: false },
+    };
+    expect(await requestRunInput(runtime, [], {})).toEqual({ input: {} });
+    expect(formDialog).not.toHaveBeenCalled();
+  });
   it("无必填字段的对象合同可以直接用空对象运行", async () => {
     expect(
       await requestRunInput(

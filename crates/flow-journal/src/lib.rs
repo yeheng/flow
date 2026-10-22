@@ -1,16 +1,24 @@
 //! Bounded single-writer SQLite authority. Facts and current state commit together.
 pub mod codec;
+#[cfg(feature = "storage")]
 pub mod maintenance;
+#[cfg(feature = "storage")]
 pub mod page;
+#[cfg(feature = "storage")]
 pub mod sqlite;
+#[cfg(feature = "storage")]
 pub mod storage;
+#[cfg(feature = "storage")]
 pub mod tail;
 pub mod value;
+#[cfg(feature = "storage")]
 pub mod writer;
 
 pub use codec::{Event, EventKind, Transaction};
+#[cfg(feature = "storage")]
 pub use storage::{scan, Location, Recovery, ScanFault};
 pub use value::{StoredValue, ValueRef};
+#[cfg(feature = "storage")]
 pub use writer::{Commit, Journal, JournalOptions, QueueClass};
 
 pub const MAX_LINE_BYTES: usize = 1024 * 1024;
@@ -26,6 +34,8 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("invalid journal: {0}")]
     Invalid(String),
+    #[error("{0}")]
+    NotFound(String),
     #[error("journal limit exceeded: {0}")]
     Limit(String),
     #[error("journal unavailable: {0}")]

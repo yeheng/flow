@@ -275,3 +275,5 @@ impl AgentRunConfig {
         !self.base_url.trim().is_empty() && !self.model.trim().is_empty()
     }
 }
+
+pub mod rpc;

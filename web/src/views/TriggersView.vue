@@ -9,6 +9,7 @@ import { generateInvokeKey, invokeCurl, resultCurl, sha256Hex } from "../state/i
 import { confirmDialog } from "../state/modal";
 import { fmtTime } from "../state/time";
 import { usePolling } from "../state/polling";
+import { staleGuard } from "../state/stale";
 import { toast } from "../state/toast";
 import { copyWithToast } from "../state/clipboard";
 import type { Definition, Schedule, VersionMeta, Webhook } from "../types";
@@ -27,7 +28,8 @@ const error = ref("");
 /** 失败只在 ok→error 跳变时 toast：首刷/轮询/手动/重连可能连续触发，避免重复弹错 */
 const pollFailed = ref(false);
 /** 在途守卫：慢响应时手动/轮询/重连触发的刷新不叠加 */
-let refreshing = false;
+let refreshing: number | null = null;
+const scope = staleGuard();
 
 // 新建调度表单
 const newCron = ref("");
@@ -50,12 +52,20 @@ const savingScheduleIds = ref(new Set<string>());
 const publishedVersions = ref<VersionMeta[]>([]);
 const definition = ref<Definition | null>(null);
 
-/** 输入表单的字段来源：最新版定义 + 节点类型 schema；拿不到时退化为纯 JSON 输入 */
+/** 输入表单取调度实际执行的已发布定义；拿不到时退化为纯 JSON 输入。 */
 function loadDefinition(): void {
+  const workflowId = props.workflowId;
+  const token = scope.mark();
   void (async () => {
     if (!(await ensureNodeTypes())) return;
+    if (scope.stale(token)) return;
     try {
-      definition.value = (await api.getWorkflow(props.workflowId)).definition;
+      let workflow = await api.getWorkflow(workflowId);
+      if (scope.stale(token)) return;
+      if (workflow.published_version !== null && workflow.published_version !== workflow.version) {
+        workflow = await api.getWorkflow(workflowId, workflow.published_version);
+      }
+      if (!scope.stale(token)) definition.value = workflow.definition;
     } catch {
       // 定义拉不到不影响调度管理，输入区退化为纯 JSON 文本域
     }
@@ -64,11 +74,14 @@ function loadDefinition(): void {
 
 /** 已发布版本：调用合同的版本固定只允许已发布（服务端同样校验 published） */
 function loadPublishedVersions(): void {
+  const workflowId = props.workflowId;
+  const token = scope.mark();
   void (async () => {
     try {
-      publishedVersions.value = (await api.listVersions(props.workflowId))
+      const result = (await api.listVersions(workflowId))
         .filter((v) => v.status === "published")
         .sort((a, b) => b.version - a.version);
+      if (!scope.stale(token)) publishedVersions.value = result;
     } catch {
       // 版本拉不到不影响触发器管理，调用合同下拉为空并给出提示
     }
@@ -83,26 +96,31 @@ const workflowName = computed(
 );
 
 async function refresh(): Promise<void> {
-  if (refreshing) return;
-  refreshing = true;
+  const token = scope.mark();
+  const workflowId = props.workflowId;
+  if (refreshing === token) return;
+  refreshing = token;
   try {
-    [schedules.value, webhooks.value] = await Promise.all([
-      api.listSchedules(props.workflowId),
-      api.listWebhooks(props.workflowId),
+    const [nextSchedules, nextWebhooks] = await Promise.all([
+      api.listSchedules(workflowId),
+      api.listWebhooks(workflowId),
     ]);
+    if (scope.stale(token)) return;
+    schedules.value = nextSchedules;
+    webhooks.value = nextWebhooks;
     for (const w of webhooks.value) formFor(w);
     error.value = "";
     pollFailed.value = false;
   } catch (e) {
+    if (scope.stale(token)) return;
     error.value = errText(e);
     if (!pollFailed.value) toast.error(errText(e));
     pollFailed.value = true;
   } finally {
-    refreshing = false;
-    loaded.value = true;
+    if (refreshing === token) refreshing = null;
+    if (!scope.stale(token)) loaded.value = true;
   }
 }
-
 
 function fmtInput(input: unknown): string {
   if (input === null || input === undefined) return "—";
@@ -111,6 +129,9 @@ function fmtInput(input: unknown): string {
 }
 
 async function onCreateSchedule(): Promise<void> {
+  if (creating.value) return;
+  const workflowId = props.workflowId;
+  const token = scope.mark();
   const cron = newCron.value.trim();
   if (!cron) return;
   // input 文本域：空 = 无输入；非空必须是合法 JSON（前端先拦，cron 非法由后端 -32010 toast）
@@ -126,15 +147,16 @@ async function onCreateSchedule(): Promise<void> {
   }
   creating.value = true;
   try {
-    await api.createSchedule(props.workflowId, cron, input);
+    await api.createSchedule(workflowId, cron, input);
+    if (scope.stale(token)) return;
     newCron.value = "";
     newInput.value = "";
     toast.success("调度已创建");
     await refresh();
   } catch (e) {
-    toast.error(errText(e));
+    if (!scope.stale(token)) toast.error(errText(e));
   } finally {
-    creating.value = false;
+    if (!scope.stale(token)) creating.value = false;
   }
 }
 
@@ -177,6 +199,7 @@ function cancelEditSchedule(): void {
 
 async function onSaveSchedule(s: Schedule): Promise<void> {
   if (savingScheduleIds.value.has(s.id)) return;
+  const token = scope.mark();
   const cron = editCron.value.trim();
   if (!cron) {
     toast.error("cron 表达式不能为空");
@@ -206,6 +229,7 @@ async function onSaveSchedule(s: Schedule): Promise<void> {
   savingScheduleIds.value.add(s.id);
   try {
     await api.updateSchedule(s.id, params);
+    if (scope.stale(token)) return;
     editingScheduleId.value = null;
     toast.success("调度已更新");
     await refresh();
@@ -231,15 +255,18 @@ async function onCopy(w: Webhook): Promise<void> {
 
 async function onCreateWebhook(): Promise<void> {
   if (creatingWebhook.value) return;
+  const workflowId = props.workflowId;
+  const token = scope.mark();
   creatingWebhook.value = true;
   try {
-    await api.createWebhook(props.workflowId);
+    await api.createWebhook(workflowId);
+    if (scope.stale(token)) return;
     toast.success("webhook 已创建");
     await refresh();
   } catch (e) {
-    toast.error(errText(e));
+    if (!scope.stale(token)) toast.error(errText(e));
   } finally {
-    creatingWebhook.value = false;
+    if (!scope.stale(token)) creatingWebhook.value = false;
   }
 }
 
@@ -407,10 +434,14 @@ watch(
   () => props.workflowId,
   (id, prev) => {
     if (!id || id === prev) return;
+    scope.invalidate();
     schedules.value = [];
     webhooks.value = [];
     loaded.value = false;
     error.value = "";
+    pollFailed.value = false;
+    creating.value = false;
+    creatingWebhook.value = false;
     editingScheduleId.value = null;
     newCron.value = "";
     newInput.value = "";
@@ -424,6 +455,7 @@ watch(
 );
 
 onUnmounted(() => {
+  scope.invalidate();
   offReconnect();
 });
 </script>
@@ -462,6 +494,7 @@ onUnmounted(() => {
         <WorkflowInputForm
           v-model="newInput"
           :input-keys="inputKeys"
+          :input-schema="definition?.input_schema"
           :rows="2"
           placeholder='输入 JSON（可选），每次触发作为 run 的 input，如 {"src":"cron"}'
         />
@@ -513,7 +546,11 @@ onUnmounted(() => {
             <tr v-if="editingScheduleId === s.id" class="edit-row">
               <td colspan="6">
                 <div class="edit-form">
-                  <input v-model="editCron" class="code cron-input edit-cron" placeholder="cron 表达式" />
+                  <input
+                    v-model="editCron"
+                    class="code cron-input edit-cron"
+                    placeholder="cron 表达式"
+                  />
                   <textarea
                     v-model="editInput"
                     class="code edit-input"
@@ -629,7 +666,8 @@ onUnmounted(() => {
                       <span v-else class="muted">密钥未设置</span>
                     </div>
                     <p v-if="!invokeEchoed(w)" class="muted contract-note">
-                      保存后立即生效，列表接口暂不回显 invoke_version / invoke_key_hash；下方状态是本次会话的记忆，刷新后如需改版本或密钥，需重设密钥。
+                      保存后立即生效，列表接口暂不回显 invoke_version /
+                      invoke_key_hash；下方状态是本次会话的记忆，刷新后如需改版本或密钥，需重设密钥。
                     </p>
                     <div class="key-area">
                       <template v-if="formFor(w).keyDraft">
@@ -686,7 +724,10 @@ onUnmounted(() => {
                     </p>
                     <ul class="contract-notes muted">
                       <li>202 只表示受理，不代表业务完成；结果用回执里的 run_token 查询。</li>
-                      <li>重试必须复用同一 Idempotency-Key，保证只触发一次；X-Correlation-Id 可选，用于业务关联。</li>
+                      <li>
+                        重试必须复用同一 Idempotency-Key，保证只触发一次；X-Correlation-Id
+                        可选，用于业务关联。
+                      </li>
                       <li>run_token 只绑定该次 run，不要外发管理令牌。</li>
                     </ul>
                     <pre class="mono curl-example">{{ invokeCurl(webhookBase(), w.token) }}</pre>
@@ -707,7 +748,6 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-
 .section {
   margin-bottom: 28px;
 }

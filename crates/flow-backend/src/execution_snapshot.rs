@@ -13,7 +13,7 @@ impl JournalBackend {
         let root = workflows
             .get(workflow)
             .filter(|w| !w.deleted)
-            .ok_or_else(|| Error::Invalid("workflow not found".into()))?;
+            .ok_or_else(|| Error::NotFound("workflow not found".into()))?;
         let selected = version
             .or_else(|| {
                 root.versions
@@ -26,7 +26,7 @@ impl JournalBackend {
         let root = root
             .versions
             .get(&selected)
-            .ok_or_else(|| Error::Invalid("workflow version not found".into()))?
+            .ok_or_else(|| Error::NotFound("workflow version not found".into()))?
             .clone();
         if !root.published {
             return Err(Error::Invalid("version not published".into()).into());

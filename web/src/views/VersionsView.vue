@@ -1,9 +1,16 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import * as api from "../api/flow";
 import { errText } from "../rpc/client";
-import { confirmDiscardIfDirty, editor, refreshWorkflows, selectWorkflow } from "../state/editor";
+import {
+  confirmDiscardIfDirty,
+  editor,
+  ensureNodeTypes,
+  refreshWorkflows,
+  selectWorkflow,
+} from "../state/editor";
+import { staleGuard } from "../state/stale";
 import { confirmDialog } from "../state/modal";
 import { fmtTime } from "../state/time";
 import { toast } from "../state/toast";
@@ -24,9 +31,11 @@ const compareA = ref<number | null>(null);
 const compareB = ref<number | null>(null);
 const publishing = ref(false);
 /** version → definition 缓存：diff 与发布共用，避免重复拉取 */
-const defCache = new Map<number, Definition>();
+const defCache = new Map<string, Definition>();
 const diff = ref<DefinitionDiff | null>(null);
 let diffGen = 0;
+const scope = staleGuard();
+const loads = staleGuard();
 
 const workflowName = computed(
   () => editor.workflows.find((w) => w.workflow_id === props.workflowId)?.name ?? "",
@@ -39,10 +48,15 @@ const publishedVersion = computed(() => {
 });
 
 async function load(): Promise<void> {
+  const workflowId = props.workflowId;
+  const token = loads.begin();
   try {
-    versions.value = await api.listVersions(props.workflowId);
+    const result = await api.listVersions(workflowId);
+    if (loads.stale(token)) return;
+    versions.value = result;
     error.value = "";
   } catch (e) {
+    if (loads.stale(token)) return;
     error.value = errText(e);
     loaded.value = true;
     return;
@@ -53,16 +67,19 @@ async function load(): Promise<void> {
   compareA.value = versions.value[1]?.version ?? compareB.value;
 }
 
-async function definitionOf(version: number): Promise<Definition> {
-  const cached = defCache.get(version);
+async function definitionOf(version: number, workflowId = props.workflowId): Promise<Definition> {
+  const key = `${workflowId}@${version}`;
+  const token = scope.mark();
+  const cached = defCache.get(key);
   if (cached) return cached;
-  const w = await api.getWorkflow(props.workflowId, version);
-  defCache.set(version, w.definition);
+  const w = await api.getWorkflow(workflowId, version);
+  if (!scope.stale(token)) defCache.set(key, w.definition);
   return w.definition;
 }
 
 async function recomputeDiff(): Promise<void> {
   const gen = ++diffGen;
+  const workflowId = props.workflowId;
   const a = compareA.value;
   const b = compareB.value;
   // 先清空旧 diff：切换版本期间不展示过期对比结果
@@ -71,7 +88,10 @@ async function recomputeDiff(): Promise<void> {
     return;
   }
   try {
-    const [defA, defB] = await Promise.all([definitionOf(a), definitionOf(b)]);
+    const [defA, defB] = await Promise.all([
+      definitionOf(a, workflowId),
+      definitionOf(b, workflowId),
+    ]);
     if (gen !== diffGen) return;
     diff.value = diffDefinitions(defA, defB);
   } catch (e) {
@@ -91,6 +111,10 @@ watch(
   () => props.workflowId,
   (id, prev) => {
     if (!id || id === prev) return;
+    scope.invalidate();
+    loads.invalidate();
+    diffGen++;
+    publishing.value = false;
     versions.value = [];
     error.value = "";
     loaded.value = false;
@@ -102,12 +126,21 @@ watch(
   },
 );
 
+onUnmounted(() => {
+  scope.invalidate();
+  loads.invalidate();
+  diffGen++;
+});
+
 /** 把该版本定义载入编辑器作为编辑基础；保存时走正常 workflow.update 生成新版本 */
 async function loadToEditor(version: number): Promise<void> {
+  const workflowId = props.workflowId;
+  const token = scope.mark();
   if (!(await confirmDiscardIfDirty())) return;
+  if (scope.stale(token) || !(await ensureNodeTypes()) || scope.stale(token)) return;
   // selectWorkflow 失败时返回 false：不能带着旧画布跳进编辑器
-  if (!(await selectWorkflow(props.workflowId, version))) return;
-  void router.push(`/workflows/${props.workflowId}`);
+  if (!(await selectWorkflow(workflowId, version)) || scope.stale(token)) return;
+  void router.push(`/workflows/${workflowId}`);
 }
 
 /**
@@ -116,29 +149,33 @@ async function loadToEditor(version: number): Promise<void> {
  * 因此「发布旧版」= 复制旧版定义为新草稿 → 发布新版本。
  */
 async function publishFromVersion(version: number): Promise<void> {
-  if (
-    !(await confirmDialog(
-      `将以 v${version} 的内容生成一个新版本并发布（不是把已发布指针拨回 v${version}）。继续？`,
-    ))
-  ) {
-    return;
-  }
+  if (publishing.value) return;
+  const workflowId = props.workflowId;
+  const token = scope.mark();
   publishing.value = true;
   try {
-    const def = await definitionOf(version);
-    const newVersion = await api.updateWorkflow(props.workflowId, def);
-    await api.publishWorkflow(props.workflowId, newVersion);
+    if (
+      !(await confirmDialog(
+        `将以 v${version} 的内容生成一个新版本并发布（不是把已发布指针拨回 v${version}）。继续？`,
+      )) ||
+      scope.stale(token)
+    )
+      return;
+    const def = await definitionOf(version, workflowId);
+    if (scope.stale(token)) return;
+    const newVersion = await api.updateWorkflow(workflowId, def);
+    await api.publishWorkflow(workflowId, newVersion);
+    void refreshWorkflows();
+    if (scope.stale(token)) return;
     toast.success(`已发布 v${newVersion}（内容同 v${version}）`);
     defCache.clear();
     await load();
-    void refreshWorkflows();
   } catch (e) {
-    toast.error(errText(e));
+    if (!scope.stale(token)) toast.error(errText(e));
   } finally {
-    publishing.value = false;
+    if (!scope.stale(token)) publishing.value = false;
   }
 }
-
 
 function fmtVal(v: unknown): string {
   if (v === undefined) return "（空）";
@@ -353,7 +390,6 @@ async function copyChecksum(checksum: string): Promise<void> {
   font-size: 12px;
   word-break: break-all;
 }
-
 
 .header-links {
   display: inline-flex;

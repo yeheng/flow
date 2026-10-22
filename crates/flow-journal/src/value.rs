@@ -1,17 +1,19 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
+#[cfg(feature = "storage")]
 use std::path::Path;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use serde_json::ser::Formatter as _;
 use serde_json::Value;
+#[cfg(feature = "storage")]
 use sha2::{Digest, Sha256};
 
 use crate::codec::{bounded_json, Event, EventKind};
-use crate::{
-    invalid, Error, Journal, QueueClass, Result, CHUNK_BYTES, INLINE_BYTES, MAX_VALUE_BYTES,
-};
+use crate::{invalid, Error, Result, CHUNK_BYTES, INLINE_BYTES, MAX_VALUE_BYTES};
+#[cfg(feature = "storage")]
+use crate::{Journal, QueueClass};
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(
@@ -208,6 +210,7 @@ impl Publications {
 /// Scan only this object's chunks. Memory is bounded by one transaction and one raw chunk.
 /// A candidate may be checked before publication; consumers must set require_published=true.
 /// Bytes can be delivered before the final checksum: callers must abort their stream on error.
+#[cfg(feature = "storage")]
 pub fn read_value(
     root: &Path,
     upper_lsn: u64,
@@ -283,6 +286,7 @@ pub fn read_value(
 
 /// Bounded producer. Callers supply a real stream; no whole-body buffering before chunking.
 /// Execution audit identity is attached at the execution facade, not manufactured here.
+#[cfg(feature = "storage")]
 pub async fn store_stream(
     journal: &Journal,
     input: &mut (impl tokio::io::AsyncRead + Unpin),
@@ -303,6 +307,7 @@ pub async fn store_stream(
 }
 
 /// Share chunk encoding while letting the backend enforce its normal fact admission.
+#[cfg(feature = "storage")]
 pub async fn store_stream_using<F, Fut, E>(
     journal_id: &str,
     input: &mut (impl tokio::io::AsyncRead + Unpin),
@@ -359,6 +364,7 @@ where
     Ok(value)
 }
 
+#[cfg(feature = "storage")]
 pub async fn store_json(
     journal: &Journal,
     value: Value,
@@ -374,6 +380,7 @@ pub async fn store_json(
     ))
 }
 
+#[cfg(feature = "storage")]
 pub fn materialize(
     root: &Path,
     upper_lsn: u64,
@@ -474,6 +481,7 @@ impl<W: Write> ObjectWriter<W> {
 /// values: inline entries serialize through serde, references stream through
 /// the fixed 64 KiB pipe. Fan-in does not materialize whole objects. The
 /// returned task must be joined; dropping the reader cancels production.
+#[cfg(feature = "storage")]
 pub fn compose_object(
     root: std::path::PathBuf,
     upper: u64,
