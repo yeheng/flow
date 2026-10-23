@@ -316,9 +316,6 @@ async fn dispatch_call(
     let request = request_id.as_deref();
     let b = &ctx.backend;
     let receipt = match method {
-        Method::JournalClusterStatus
-        | Method::JournalClusterNodes
-        | Method::JournalClusterRemove => return cluster_route(b, method, &p, request).await,
         // ---- 观测 / 读面（直接返回，不走回执解包） ----
         Method::RunObservationsPage => return observations_page(b, &p).await,
         Method::CommandStatus => {
@@ -508,69 +505,6 @@ async fn dispatch_call(
     }
     .map_err(failure)?;
     serde_json::to_value(receipt).map_err(invalid)
-}
-
-/// journal.cluster.* 族：registry 装配与 feature 双重开关，未装配时
-/// status 报 disabled、其余报 -32012。
-async fn cluster_route(
-    b: &JournalBackend,
-    method: Method,
-    p: &Value,
-    request: Option<&str>,
-) -> Result<Value, ErrorObjectOwned> {
-    #[cfg(not(feature = "journal-cluster"))]
-    let _ = (b, p, request);
-    #[cfg(feature = "journal-cluster")]
-    if let Some(cluster) = b.cluster() {
-        let map = |error: flow_backend::journal_cluster::ClusterError| {
-            use flow_backend::journal_cluster::ClusterError;
-            match error {
-                ClusterError::Conflict(message) => {
-                    ErrorObjectOwned::owned(-32012, message, None::<()>)
-                }
-                ClusterError::Invalid(message) => invalid(message),
-                _ => ErrorObjectOwned::owned(-32603, "journal registry unavailable", None::<()>),
-            }
-        };
-        return match method {
-            Method::JournalClusterStatus => Ok(json!({
-                "enabled": true,
-                "cluster_id": cluster.cluster_id,
-                "node_id": cluster.lease.node_id,
-            })),
-            Method::JournalClusterNodes => cluster
-                .registry
-                .nodes(
-                    p["after"].as_str().unwrap_or(""),
-                    p["limit"].as_u64().unwrap_or(64).min(256) as usize,
-                )
-                .await
-                .map_err(map),
-            Method::JournalClusterRemove => {
-                if p["expected_epoch"].is_null() {
-                    return Err(invalid("expected_epoch required"));
-                }
-                cluster
-                    .registry
-                    .remove(
-                        text(p, "node_id")?,
-                        decimal_param(p, "expected_epoch")?,
-                        request.unwrap(),
-                    )
-                    .await
-                    .map_err(map)
-            }
-            _ => Err(invalid("not a cluster method")),
-        };
-    }
-    if method == Method::JournalClusterStatus {
-        return Ok(json!({"enabled": false}));
-    }
-    Err(ErrorObjectOwned::owned(
-        -32012,
-        "journal cluster is not configured",
-        None::<()>,
-    ))
 }
 
 /// 观测分页：run 存在性以 projection 为准；store 未启用时返回空页 + 丢失

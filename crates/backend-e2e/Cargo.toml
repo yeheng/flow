@@ -6,7 +6,7 @@
 # - 原产品 crate（flow-backend / flow-rpc / flow-cli）的 tests/ 已并入本套件：
 #   journal_* 为后端进程内/IPC 集成，journal_v2 / ws_journal / sigkill /
 #   webhook / contracts 为 wire 契约，cli* 为 CLI 子进程往返；
-# - 分布式（agent/集群）用例在 remote-e2e；v1 RPC 面（flow-server）与
+# - 远程执行（agent）用例在 remote-e2e；v1 RPC 面（flow-server）与
 #   Postgres 后端均已删除，无对应测试臂。
 #
 # 运行：cargo test -p backend-e2e

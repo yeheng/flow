@@ -218,9 +218,7 @@ async fn rpc_registration_uses_the_shared_catalogue() {
             "unregistered: {name}"
         );
     }
-    assert!(flow_rpc::journal_v2::is_write_method(
-        "journal.cluster.remove"
-    ));
+    assert!(flow_rpc::journal_v2::is_write_method("run.start"));
     b.close().await.unwrap();
 }
 

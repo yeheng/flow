@@ -68,8 +68,6 @@ struct CommittedState {
     dirty_runs: BTreeSet<String>,
 }
 pub struct JournalBackend {
-    #[cfg(feature = "journal-cluster")]
-    cluster: std::sync::OnceLock<Arc<crate::journal_cluster::Membership>>,
     pub journal: Journal,
     pub store: Arc<Store>,
     pub observations: Option<flow_engine::observation::ObservationStore>,
@@ -123,8 +121,6 @@ impl JournalBackend {
         let state =
             crate::journal_history::load(&store, journal.id(), journal.durable_lsn()).await?;
         let backend = Arc::new(Self {
-            #[cfg(feature = "journal-cluster")]
-            cluster: std::sync::OnceLock::new(),
             state: Mutex::new(CommittedState {
                 dirty_runs: state.runs.keys().cloned().collect(),
                 state,
@@ -828,23 +824,10 @@ impl JournalBackend {
             self.refresh_locked(&mut committed).await
         };
         let closed = self.journal.close().await;
-        #[cfg(feature = "journal-cluster")]
-        if let Some(cluster) = self.cluster.get() {
-            let snapshot = self.cluster_snapshot().await.ok();
-            cluster.close(snapshot.as_ref()).await;
-        }
         self.store.close().await;
         pending?;
         closed?;
         Ok(())
-    }
-    #[cfg(feature = "journal-cluster")]
-    pub fn cluster(&self) -> Option<&Arc<crate::journal_cluster::Membership>> {
-        self.cluster.get()
-    }
-    #[cfg(feature = "journal-cluster")]
-    pub fn install_cluster(&self, cluster: Arc<crate::journal_cluster::Membership>) -> bool {
-        self.cluster.set(cluster).is_ok()
     }
     pub async fn checkpoint(&self) -> Result<()> {
         let root = self.journal.root().to_path_buf();

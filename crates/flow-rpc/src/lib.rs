@@ -106,9 +106,7 @@ pub(crate) fn config_view(state: &AppState) -> Value {
         ),
         None => (None, None, Vec::new()),
     };
-    // WSS agent 凭据不回显（与 cluster 连接串「stays in this environment
-    // variable, never config.get」同一标准）：多 agent 运维下，任一持
-    // master token 的调用方不该借此拿到全部 agent 的接入令牌。
+    // WSS agent tokens stay out of config.get responses.
     let config = config.map(|mut config: flow_config::Config| {
         if let Some(remote) = config.execution.remote.as_mut() {
             for agent in &mut remote.agents {
@@ -166,12 +164,7 @@ pub async fn serve_journal_product(
         return Err("FLOW_JOURNAL_TOKEN must contain at least 32 bytes".into());
     }
     config.validate()?;
-    #[cfg(not(feature = "journal-cluster"))]
-    if config.journal.cluster.is_some() {
-        return Err("journal.cluster requires a build with --features journal-cluster".into());
-    }
-    // Finish fallible setup before exposing RPC/HTTP or starting cron. Any failure
-    // after registration closes the backend and releases its PG membership.
+    // Finish fallible setup before exposing RPC/HTTP or starting cron.
     let data_dir = std::path::PathBuf::from(&config.storage.data_dir);
     let file_config = match &config_path {
         Some(path) => toml_config_from_str(&std::fs::read_to_string(path)?)?,
@@ -193,27 +186,9 @@ pub async fn serve_journal_product(
             .merge(journal_triggers::router(backend.clone(), token.clone()));
         let (state, _secrets) =
             AppState::for_production(backend.clone(), config_state, &data_dir).await;
-        #[cfg(feature = "journal-cluster")]
-        if let Some(cluster_config) = &config.journal.cluster {
-            let cluster = flow_backend::journal_cluster::Membership::join(
-                &backend,
-                cluster_config,
-                &format!("ws://{bound_rpc}"),
-                &format!("http://{bound_http}"),
-            )
-            .await?;
-            assert!(backend.install_cluster(cluster));
-        }
         let module = journal_v2::module_product(backend.clone(), token, Some(state))?;
         let harness_agent = flow_backend::harness_agent_run_config(&config.harness.agent);
         flow_backend::start_execution(&config.execution, harness_agent, &backend).await?;
-        #[cfg(feature = "journal-cluster")]
-        if backend
-            .cluster()
-            .is_some_and(|cluster| cluster.lost().is_cancelled())
-        {
-            return Err("journal membership lost during startup".into());
-        }
         Ok::<_, Box<dyn std::error::Error>>((
             listener, bound_http, rpc_server, bound_rpc, router, module,
         ))
@@ -244,17 +219,6 @@ pub async fn serve_journal_product(
         tracing::info!("scheduler_enabled=false，cron 触发器未启动");
         tokio::spawn(async {})
     };
-    #[cfg(feature = "journal-cluster")]
-    let interrupted = if let Some(cluster) = backend.cluster() {
-        let lost = cluster.lost();
-        tokio::select! {
-            result = shutdown_signal() => result,
-            _ = lost.cancelled() => { tracing::error!("PG 注册租约失效，停止节点服务"); Ok(()) },
-        }
-    } else {
-        shutdown_signal().await
-    };
-    #[cfg(not(feature = "journal-cluster"))]
     let interrupted = shutdown_signal().await;
     tracing::info!("正在停止 journal 节点");
     scheduler.abort();

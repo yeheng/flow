@@ -5,7 +5,6 @@ edition.workspace = true
 
 [features]
 default = []
-journal-cluster = ["sqlx/postgres", "sqlx/json"]
 # 确定性故障注入（dispatch::fault）：生产构建为空壳；集成测试经下方
 # dev 自依赖启用（tokio 同款模式），`cargo test` 无需手工 --features。
 fault-injection = []

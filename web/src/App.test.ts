@@ -49,7 +49,7 @@ describe("App 导航：active 按路径前缀判定", () => {
 
   it("其余子页按前缀高亮，不误伤相邻路径", () => {
     expect(activeLabels("/journal")).toEqual(["事件审计"]);
-    expect(activeLabels("/cluster")).toEqual(["集群节点"]);
+    expect(activeLabels("/cluster")).toEqual([]);
     expect(activeLabels("/settings")).toEqual(["设置"]);
     expect(activeLabels("/settings/foo")).toEqual(["设置"]);
     expect(activeLabels("/workflowsx")).toEqual([]);
@@ -57,7 +57,7 @@ describe("App 导航：active 按路径前缀判定", () => {
 });
 
 describe("App 顶栏文案与连接状态", () => {
-  it("导航用新术语（事件审计/集群节点）；连接状态只留圆点+文案，RPC 地址进 title", () => {
+  it("导航保留工作流与事件审计入口；连接状态只留圆点+文案，RPC 地址进 title", () => {
     state.path = "/";
     const w = mountApp();
     expect(w.findAll("nav.nav a").map((a) => a.text().trim())).toEqual([
@@ -65,7 +65,6 @@ describe("App 顶栏文案与连接状态", () => {
       "工作流",
       "运行记录",
       "事件审计",
-      "集群节点",
       "设置",
     ]);
 

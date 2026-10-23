@@ -28,9 +28,6 @@ function navActive(path: string, to: string): boolean {
       <RouterLink to="/journal" :class="{ 'nav-active': navActive(route.path, '/journal') }">
         事件审计
       </RouterLink>
-      <RouterLink to="/cluster" :class="{ 'nav-active': navActive(route.path, '/cluster') }">
-        集群节点
-      </RouterLink>
       <RouterLink to="/settings" :class="{ 'nav-active': navActive(route.path, '/settings') }">
         设置
       </RouterLink>

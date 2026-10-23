@@ -5,28 +5,18 @@
 # - journal_remote*：模拟中继 / 断线对账 / drain 与容量 / 双 TLS / WSS 上联；
 # - journal_fault_matrix：授权/结果提交四时点故障注入（确定性检查点）；
 # - journal_raw_transfer：本地 IPC 与远程 agent 两条接入的大载荷等价性；
-# - cluster_registry / cluster_process：PG 注册表与真服务进程的租约/成员面
-#   （需 --features journal-cluster + FLOW_CLUSTER_TEST_DATABASE_URL，默认跳过）。
 #
 # fault-injection 经本 crate 的依赖常开（对 flow-backend 的 dev 自依赖已随
 # 迁移移除）；产品构建不受影响（publish = false，不进产品二进制）。
 #
 # 运行：cargo test -p remote-e2e
-# 集群：cargo test -p remote-e2e --features journal-cluster --test cluster_registry -- --ignored
 [package]
 name = "remote-e2e"
 version.workspace = true
 edition.workspace = true
 publish = false
 
-[features]
-default = []
-# PG 注册表面（Registry/集群服务进程）：与 flow-rpc/flow-backend 的同名
-# feature 同语义——测试按 #![cfg(feature)] 门控，CI 在专用 PG 作业里开。
-journal-cluster = ["flow-backend/journal-cluster", "dep:sqlx"]
-
 [dependencies]
-sqlx = { workspace = true, optional = true, features = ["postgres"] }
 tokio = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }

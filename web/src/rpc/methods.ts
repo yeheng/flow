@@ -1,5 +1,4 @@
 export const WRITE_METHODS = new Set([
-  "journal.cluster.remove",
   "workflow.create",
   "workflow.import",
   "workflow.update",

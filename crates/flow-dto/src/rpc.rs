@@ -21,8 +21,6 @@ macro_rules! methods {
 }
 methods! {
     read {
-        JournalClusterStatus => "journal.cluster.status",
-        JournalClusterNodes => "journal.cluster.nodes",
         RunObservationsPage => "run.observations.page",
         CommandStatus => "command.status",
         WorkflowList => "workflow.list",
@@ -52,7 +50,6 @@ methods! {
         NodetypesList => "nodetypes.list",
     }
     write {
-        JournalClusterRemove => "journal.cluster.remove",
         WorkflowImport => "workflow.import",
         WorkflowCreate => "workflow.create",
         WorkflowUpdate => "workflow.update",

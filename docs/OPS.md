@@ -1,6 +1,6 @@
 # flow 运维手册
 
-> 状态：**当前代码实际语义**（2026-10-18）。设计与语义见 [DESIGN.md](DESIGN.md)；
+> 状态：**当前代码实际语义**（2026-10-23）。设计与语义见 [DESIGN.md](DESIGN.md)；
 > 本文只讲**怎么部署、怎么跑、坏了怎么办**。业务接口、回归和证据资产工具见 [EXECUTION.md](EXECUTION.md)。
 >
 > 本文所有数字都能在代码里对上。凡代码里没有的能力，本文一律标注「未实现」，
@@ -134,18 +134,16 @@ addr = "127.0.0.1:9802"           # WS RPC
 http_addr = "127.0.0.1:9803"      # 下载 + webhook（Bearer 认证）
 data_dir = null                   # journal 权威目录
 
-[journal.cluster]                 # 需要 --features journal-cluster
-cluster_id = ""
-node_id = ""
-database_url_env = "FLOW_CLUSTER_DATABASE_URL"
-rpc_url = null
-http_url = null
-heartbeat_ms = 5000               # >= 100
-lease_ms = 30000                  # >= 3 × heartbeat_ms，且 <= 300000
 ```
 
 **`deny_unknown_fields`**：配置里出现已删除的键（如 `[server].rpc_addr`、
 `FLOW_ADDR`）会**显式报错**，不会静默忽略。存量配置升级时必须先清理。
+
+cluster 注册中心已移除。升级时删除整个 `[journal.cluster]` 段、部署参数
+`--features journal-cluster` 及 `FLOW_CLUSTER_DATABASE_URL` 环境变量。旧 RPC
+`journal.cluster.status/nodes/remove` 返回 `-32601`（method not found），前端不再提供集群页面。
+现有 `flow.sqlite` 继续原样使用，无需格式迁移；旧 PG 注册数据保留作归档，由运维另行清理。
+本次升级不会连接或删除旧 PG 表。远程 agent 的配置与连接方式保持不变。
 
 ### 2.3 环境变量
 
@@ -195,7 +193,7 @@ dist/journal/run-server.sh
 | data_dir 未配置 | `journal 数据目录缺失` |
 | 同目录已有写者 | `data directory is locked` |
 | 找不到 flow-executor | `cannot locate flow-executor next to ...` |
-| 配置了 cluster 但没开 feature | `journal.cluster requires a build with --features journal-cluster` |
+| 存量配置包含 `[journal.cluster]` | “unknown field cluster”；删除整个配置段后重启 |
 | `mode=remote` 但缺 `[execution.remote]` | `execution.mode=remote 时必须配置 [execution.remote]` |
 | `mode=in_process` | `execution.mode=in_process 已删除：本地执行只有 ipc` |
 | `x_max` 越界 | `execution.x_max 必须在 1..=16` |

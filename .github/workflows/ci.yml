@@ -75,7 +75,7 @@ jobs:
         with:
           key: ${{ matrix.arch.target }}
       # --all-targets：lib / bins / tests / benches / examples 一起验。
-      # 默认 journal 构建无需 PG；可选注册 feature 另设真实 PG 测试。
+      # Local and remote-agent tests use the same single-master journal build.
       # 先产出普通二进制：cargo test 不落 target/<triple>/<profile>/flow-*，
       # 而 remote/IPC 集成测试按工作区布局定位真实二进制（flow-test-support
       # 的 workspace_bin）——不先 build 就会 panic "binary not built"。
@@ -83,40 +83,6 @@ jobs:
         run: cargo build --workspace --bins --locked --target ${{ matrix.arch.target }}
       - name: test
         run: cargo test --workspace --all-targets --locked --target ${{ matrix.arch.target }}
-
-  journal-cluster:
-    name: journal cluster / PostgreSQL
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    services:
-      postgres:
-        image: postgres:18
-        env:
-          POSTGRES_USER: flow
-          POSTGRES_PASSWORD: flow-test
-          POSTGRES_DB: flow_cluster_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U flow -d flow_cluster_test"
-          --health-interval 5s --health-timeout 5s --health-retries 10
-    env:
-      FLOW_CLUSTER_TEST_DATABASE_URL: postgres://flow:flow-test@127.0.0.1:5432/flow_cluster_test
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: journal-cluster
-      - run: cargo clippy -p flow-rpc -p flow-backend -p remote-e2e --all-targets --features journal-cluster --locked -- -D warnings
-      # T7：unix 上进程内执行路径已删除，产品服务端只有 ipc。集群套件（已迁入
-      # remote-e2e）起真服务端，必须能定位到 flow-executor 与 flow-journal-server
-      # （该作业不跑 workspace 全量测试，这里单独产出）。
-      - run: cargo build -p flow-executor -p flow-rpc --bins --locked
-      - run: cargo test -p remote-e2e --features journal-cluster --test cluster_registry --locked -- --ignored
-      - run: cargo test -p remote-e2e --features journal-cluster --test cluster_process --locked -- --ignored
 
   # ---- 多架构构建：gnu 原生编，musl 用 cross ----
   # gnu target 用各自架构的原生 runner 编（与 test 矩阵同一批 runner）：

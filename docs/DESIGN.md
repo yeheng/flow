@@ -81,7 +81,6 @@ crates/
   flow-backend    journal 唯一权威后端：journal.rs（JournalBackend）+ journal_commands
                   （产品 CRUD，request_id 幂等）+ journal_views（物化读面）+
                   journal_driver（协调循环）+ journal_execution（Attempt 簿记）+
-                  journal_cluster（PG 注册，feature: journal-cluster）+
                   journal_import（legacy 只读保全）+ execution/（ipc 池 / remote 派发）
   flow-executor   受管理执行子进程：节点语义的唯一居所
   flow-agent      受信任远程执行中继（单条 mTLS/WSS 上联 + 本机执行器池）
@@ -720,17 +719,11 @@ stateDiagram-v2
 
 ---
 
-## 7. 多 executor 与 cluster
+## 7. 多 executor 与远程执行
 
-> **先把两个不同的「多机」概念分开**，混淆它们是这份文档最大的风险：
->
-> | 概念 | 代码开关 | 真实语义 | 提供什么 |
-> | --- | --- | --- | --- |
-> | **多 executor 计算扩容** | `[execution] mode = "remote"` | 多台 `flow-agent`，各带本机执行器池 | **算力横向扩展** |
-> | **journal-cluster 注册中心** | Cargo feature `journal-cluster` + PG | 成员/租约/进度登记 | **只有登记，没有业务调度、没有接管** |
->
-> 前者是今天可用的功能；后者是一个**未完成的脚手架**（§7.7）。任何人都不应从
-> PG 注册中心推出「flow 支持多主/高可用」的结论——C5 明确否定了这一点。
+一个 master 管理一个 SQLite 数据目录，并通过本地 IPC 或远程 agent 扩展计算容量。
+远程 agent 的连接、心跳、容量、drain 与断线对账继续保留；它们不承担 master 接管。
+PG 节点注册中心及其配置、RPC、前端和租约准入已删除；后续有明确的多控制平面需求时另行设计。
 
 ### 7.1 remote 模式架构
 
@@ -1012,29 +1005,12 @@ sequenceDiagram
 **drain 与崩溃走同一条对账路径**，这是刻意的：两种情况的观测完全相同——
 「master 不知道远端执行器到哪了」。区别只在运维是否主动发起。
 
-### 7.7 journal-cluster（PG 注册中心）：现状与未实现
+### 7.7 控制平面范围
 
-Cargo feature：`journal-cluster`（依赖 `flow-backend/src/journal_cluster.rs`）。
-
-**已实现**：
-
-- PostgreSQL 成员注册、心跳租约（`heartbeat_ms = 5000`、`lease_ms = 30000`）；
-- 进度登记（`projected_lsn` / `durable_lsn` 上报）；
-- 配置面 `JournalClusterConfig{cluster_id, node_id, database_url_env, rpc_url, http_url}`。
-
-**明确未实现**（不要按已实现规划）：
-
-| 能力 | 状态 |
-| --- | --- |
-| 业务调度分发到其他节点 | **未实现** |
-| run/节点状态在其他节点间接管（failover） | **未实现** |
-| journal 复制 / 多写者 | **未实现**（与 C5 冲突） |
-| 基于租约的 master 选举 | **未实现** |
-| 跨节点值寻址 | **未实现** |
-
-**结论**：开 `journal-cluster` 得到的是「一个成员表 + 租约 + 进度上报」。
-它**不**改变单写者模型，**不**提供 HA。要 HA 必须在外面套一层（如用 PG 租约
-选出唯一 master 的外部编排），而那部分不在本仓库内。
+每个数据目录只由一个 master 持有，本地目录锁与 SQLite 单写者约束继续生效。
+执行端的 master_epoch、dispatch 身份和结果对账保持原有规则。
+当前没有跨 master 的节点注册、租约、接管或日志复制功能；不为未来需求保留注册表脚手架。
+删除后的配置和部署迁移见 [cluster 裁剪记录](plans/2026-10-23-remove-journal-cluster.md)。
 
 ---
 
@@ -1223,10 +1199,10 @@ pure retry`）。这是 C4 的又一道闸门——有外部副作用的操作�
 
 ### 11.1 方法面
 
-`flow-rpc/src/journal_v2.rs` 注册 **52 个方法** + 1 个订阅（`run.subscribe`）。
-所有方法共用一个入口：`module_product` 里的方法名数组 + `admit_call` 准入门。
+`flow-rpc/src/journal_v2.rs` 注册 **51 个方法** + 1 个订阅（`run.subscribe`）。
+所有方法共用一个入口：`flow_dto::rpc::Method` 目录和 `admit_call` 准入门。
 
-方法按访问性质分两张清单——`READ_METHODS` 28 项 / `WRITE_METHODS` 24 项。**注意
+方法按访问性质分两张清单——`READ_METHODS` 27 项 / `WRITE_METHODS` 24 项。**注意
 这两张表不做权限分级，也没有「暂停期」语义**（不存在维护窗口：没有 paused 标志，
 读写在运行期同权）。它们只服务三件事：
 
@@ -1302,7 +1278,7 @@ audit 按 `lsn` + `audit_seq` 推进（含执行器审计事实与迟到的 `Lat
 | `-32012` | conflict | `flow_journal::Error::Conflict` / `ViewError::Conflict` / `TemplateNameTaken` / `request_id` 撞车 |
 | `-32021` | limit | `flow_journal::Error::Limit`、`RESPONSE_TOO_LARGE` |
 | `-32602` | invalid params | `invalid()` 助手 + jsonrpsee 参数解析失败 |
-| `-32603` | internal | catch-all：journal 不可用、投影不可用、cluster 注册表不可用、密钥 IO 失败 |
+| `-32603` | internal | catch-all：journal 不可用、投影不可用、密钥 IO 失败 |
 
 `-32011` 的窄映射值得注意：**只有那六个字符串**会被认成 not-found，其余
 `Invalid` 一律降级为 `-32602`。新增一类「不存在」错误时必须同步加进
@@ -1523,7 +1499,7 @@ bug 的栖息地。
 | 项 | 状态 |
 | --- | --- |
 | master 高可用 / journal 复制 / 多写者 | 未实现，与 C5 冲突 |
-| journal-cluster 的业务调度与接管 | 未实现（§7.7） |
+| 多 master 调度与接管 | 非当前产品范围（§7.7） |
 | 多租户授权与用户体系 | 未实现（C7） |
 | 恰好一次外部调用 | **不可能实现**（§11.4） |
 | OpenTelemetry 链路追踪 | 已定未实现（`docs/opentelemetry-design.md`） |

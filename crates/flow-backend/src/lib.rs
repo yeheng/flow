@@ -3,8 +3,6 @@ pub use flow_dto::{RunSource, RunStatus};
 pub use flow_engine::{redact_value, secrets, Definition, NodeType, HTTP_METHODS};
 pub mod execution;
 pub mod journal;
-#[cfg(feature = "journal-cluster")]
-pub mod journal_cluster;
 mod journal_commands;
 pub use journal_commands::ProductCommand;
 pub mod bundle;

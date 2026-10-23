@@ -13,7 +13,7 @@
 //! - `tests/*.rs`：两类用例——`e2e_test!` 宏的 journal v2 产品面进程测试；
 //!   以及自产品 crate 迁入的单机集成面（`journal_*` 后端/IPC、`journal_v2` /
 //!   `ws_journal` / `sigkill` / `webhook` / `contracts` wire 契约、`cli*`
-//!   子进程往返）。分布式（agent/集群）用例在 remote-e2e 套件。
+//!   子进程往返）。远程执行（agent）用例在 remote-e2e 套件。
 //!
 //! 运行：`cargo test -p backend-e2e`（无外部依赖；崩溃恢复用 SIGKILL 真杀；
 //! 覆盖矩阵见 docs/e2e-coverage.md）。

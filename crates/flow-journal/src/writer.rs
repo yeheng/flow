@@ -92,50 +92,8 @@ struct Queue {
     bytes: usize,
     requests: usize,
     stats: WriterStats,
-    admission: Option<Arc<WriteAdmission>>,
 }
 
-/// A conservative local lease deadline. Expiry is permanent for this writer;
-/// delayed renewal must never revive a process that has lost authority.
-pub struct WriteAdmission {
-    deadline: Mutex<Option<Instant>>,
-}
-impl WriteAdmission {
-    pub fn new(deadline: Instant) -> Self {
-        Self {
-            deadline: Mutex::new(Some(deadline)),
-        }
-    }
-    fn lock_deadline(&self) -> std::sync::MutexGuard<'_, Option<Instant>> {
-        self.deadline.lock().unwrap_or_else(|poison| {
-            let mut guard = poison.into_inner();
-            // A poisoned authority lease is uncertain: never revive it silently.
-            *guard = None;
-            guard
-        })
-    }
-    pub fn renew(&self, deadline: Instant) -> bool {
-        let mut current = self.lock_deadline();
-        if current.is_some_and(|value| value > Instant::now()) && deadline > Instant::now() {
-            *current = Some(deadline);
-            true
-        } else {
-            *current = None;
-            false
-        }
-    }
-    pub fn revoke(&self) {
-        *self.lock_deadline() = None;
-    }
-    fn check(&self) -> Result<()> {
-        let mut deadline = self.lock_deadline();
-        if deadline.is_some_and(|value| value > Instant::now()) {
-            return Ok(());
-        }
-        *deadline = None;
-        Err(Error::Unavailable("journal membership lease lost".into()))
-    }
-}
 impl Queue {
     fn next_bytes(&self) -> Option<usize> {
         if !self.control.is_empty() && (self.control_turn || self.round.is_empty()) {
@@ -280,16 +238,6 @@ impl Journal {
     }
     pub fn durable_lsn(&self) -> u64 {
         self.stats().durable_lsn
-    }
-
-    pub fn set_write_admission(&self, admission: Arc<WriteAdmission>) -> Result<()> {
-        let mut queue = lock_queue(&self.inner.shared);
-        if queue.admission.is_some() || queue.requests != 0 || queue.in_flight || queue.closing {
-            return Err(invalid("write admission already installed or writer busy"));
-        }
-        admission.check()?;
-        queue.admission = Some(admission);
-        Ok(())
     }
 
     pub async fn submit(
@@ -447,9 +395,6 @@ impl Journal {
             if queue.closing {
                 return Err(Error::Unavailable("writer closed".into()));
             }
-            if let Some(admission) = &queue.admission {
-                admission.check()?;
-            }
             queue.bytes += bytes;
             queue.requests += 1;
             queue.stats.peak_queued_bytes = queue.stats.peak_queued_bytes.max(queue.bytes);
@@ -572,7 +517,7 @@ fn lock_queue(shared: &Shared) -> std::sync::MutexGuard<'_, Queue> {
 }
 
 fn pump_step(disk: &mut Disk, shared: &Arc<Shared>, options: &JournalOptions) -> PumpStep {
-    let (mut batch, admission) = {
+    let mut batch = {
         let mut queue = lock_queue(shared);
         while queue.requests == 0 && !queue.closing {
             queue = shared
@@ -606,7 +551,7 @@ fn pump_step(disk: &mut Disk, shared: &Arc<Shared>, options: &JournalOptions) ->
             batch.push(item);
         }
         queue.in_flight = true;
-        (batch, queue.admission.clone())
+        batch
     };
     let mut commits = Vec::with_capacity(batch.len());
     let mut encoded_bytes = 0;
@@ -635,9 +580,6 @@ fn pump_step(disk: &mut Disk, shared: &Arc<Shared>, options: &JournalOptions) ->
                         .ok_or_else(|| invalid("LSN overflow"))?,
                 );
                 for (index, metadata) in prefix.into_iter().enumerate() {
-                    if let Some(admission) = &admission {
-                        admission.check()?;
-                    }
                     let mut chunk_tx = metadata.clone();
                     chunk_tx.events[0].payload =
                         serde_json::to_value(value.read_chunk(index as u64)?)?;
@@ -653,9 +595,6 @@ fn pump_step(disk: &mut Disk, shared: &Arc<Shared>, options: &JournalOptions) ->
                     encoded_bytes += body.len();
                     value_prefix.push(metadata);
                 }
-            }
-            if let Some(admission) = &admission {
-                admission.check()?;
             }
             let mut tx = pending.tx.clone();
             tx.lsn = disk
@@ -674,9 +613,6 @@ fn pump_step(disk: &mut Disk, shared: &Arc<Shared>, options: &JournalOptions) ->
                 return Err(Error::Conflict(
                     "prepared transition sequence changed".into(),
                 ));
-            }
-            if let Some(admission) = &admission {
-                admission.check()?;
             }
             let (bytes, digest) = match &pending.wire {
                 // Prepared transactions already carry the final LSN and digest.
@@ -706,9 +642,6 @@ fn pump_step(disk: &mut Disk, shared: &Arc<Shared>, options: &JournalOptions) ->
             });
         }
         disk.sync()?;
-        if let Some(admission) = &admission {
-            admission.check()?;
-        }
         Ok(())
     })();
     let mut queue = lock_queue(shared);
@@ -769,22 +702,5 @@ fn pump_step(disk: &mut Disk, shared: &Arc<Shared>, options: &JournalOptions) ->
             }
             PumpStep::Continue
         }
-    }
-}
-
-#[cfg(test)]
-mod admission_tests {
-    use super::*;
-    #[test]
-    fn poisoned_lease_is_revoked_without_panicking_or_being_revived() {
-        let lease = WriteAdmission::new(Instant::now() + Duration::from_secs(60));
-        let _ = std::panic::catch_unwind(|| {
-            let _guard = lease.deadline.lock().unwrap();
-            panic!("lease update interrupted");
-        });
-        assert!(matches!(lease.check(), Err(Error::Unavailable(_))));
-        assert!(!lease.renew(Instant::now() + Duration::from_secs(120)));
-        lease.revoke();
-        assert!(lease.check().is_err());
     }
 }

@@ -1,6 +1,6 @@
 # flow-web 前端拖拽流程编辑器
 
-Vue 3 + Vite + TypeScript + vue-router + Tauri 2，支持浏览器与桌面应用，画布基于 @vue-flow/core。直连 flow-server
+Vue 3 + Vite + TypeScript + vue-router + Tauri 2，支持浏览器与桌面应用，画布基于 @vue-flow/core。直连 flow-journal-server
 （JSON-RPC 2.0 over WebSocket），覆盖 编辑 → 保存 → 发布 → 运行 → 实时监控 全流程。
 
 ## 页面结构
@@ -16,7 +16,8 @@ Vue 3 + Vite + TypeScript + vue-router + Tauri 2，支持浏览器与桌面应�
 | `/runs`                   | 全局运行历史（同上组件，不过滤）                                                      |
 | `/runs/:runId`            | 运行详情：信息头 + 只读 DAG（按 run 钉死的版本渲染、保留运行态着色）+ 实时时间线      |
 | `/journal`                | 事件审计：journal v2 审计记录、原始快照与观测记录检查台（运维/调试面，可直连任意 journal 工作区）   |
-| `/cluster`                | 集群节点：节点注册、归属、租约与同步进度                                              |
+
+服务部署模型为单 master／SQLite，可通过远程 agent 扩展执行容量。前端不再包含 cluster 注册或节点汇总页面。
 
 全局通知走右上角 Toast，确认/输入走 Modal（替代原生 prompt/confirm）；
 有未保存修改时离开编辑器路由会先确认。
@@ -25,21 +26,25 @@ Vue 3 + Vite + TypeScript + vue-router + Tauri 2，支持浏览器与桌面应�
 
 ```bash
 # 终端 1：后端（仓库根）
-cargo run -p flow-rpc --bin flow-server   # 默认 ws://127.0.0.1:9800
+cargo build -p flow-executor
+FLOW_JOURNAL_TOKEN='replace-with-at-least-32-random-characters' \
+FLOW_JOURNAL_DATA_DIR="$PWD/.flow-journal" \
+cargo run -p flow-rpc --bin flow-journal-server  # 默认 ws://127.0.0.1:9802
 
 # 终端 2：前端
 cd web
 npm install
-npm run dev                          # 默认 http://127.0.0.1:5173
+VITE_FLOW_TOKEN='replace-with-at-least-32-random-characters' npm run dev
+# 默认 http://127.0.0.1:5173；token 与后端一致，也可在 UI 中填写
 ```
 
 ### 浏览器 / 桌面双入口
 
 两种模式共用 `src/` 和服务端方法实现，调用层自动选择：
 
-- **桌面**：应用启动时自动启动内嵌的 flow-server 服务，普通请求经 Tauri `invoke`
+- **桌面**：应用启动时自动启动内嵌的 journal 服务，普通请求经 Tauri `invoke`
   直接调用 Rust 方法模块，订阅经 Tauri Channel 推送，无需另开后端进程或 RPC 端口。
-- **浏览器**：经原有 JSON-RPC WebSocket API 连接独立的 `flow-server`，支持远程部署。
+- **浏览器**：经原有 JSON-RPC WebSocket API 连接独立的 `flow-journal-server`，支持远程部署。
 
 桌面开发与安装包行为一致，执行 `npm run dev:desktop` 或打开 `Flow.app` 即可使用。
 
@@ -55,7 +60,7 @@ npm run dev                          # 默认 http://127.0.0.1:5173
 
 桌面开发需要 Rust stable 与平台构建依赖：macOS 安装 Xcode Command Line Tools；
 Linux 安装 WebKitGTK 4.1 等 [Tauri 系统依赖](https://v2.tauri.app/start/prerequisites/)。
-当前内嵌后端沿用仓库的 Unix 运行时依赖，已验证 macOS；Windows 还需要后端适配。
+当前内嵌后端沿用仓库的 Unix 运行时依赖，已验证 macOS；Windows 仍需原生端到端验收。
 浏览器前端构建只需要 Node.js。
 
 `dev:desktop` 自动启动 Vite，不需要提前运行 `dev`；5173 被占用时会明确报错。
@@ -68,12 +73,11 @@ Linux 安装 WebKitGTK 4.1 等 [Tauri 系统依赖](https://v2.tauri.app/start/p
 
 桌面通过 Tauri `externalBin` 携带 `flow-executor` sidecar；`dev:desktop` / `build:desktop`
 会在启动前自动执行 `npm run build:executor`，因此执行器源码改动无需手动重建。
-执行器与主进程的引导协议（`--channel-fd`）必须同源：陈旧的 sidecar 会因 FD 无效而
-启动失败（`channel fd unavailable: Bad file descriptor`）。
+执行器与主进程必须使用匹配的执行协议；缺失或不兼容的 sidecar 会明确拒绝启动。
 
 桌面数据默认存放在 Tauri 应用数据目录（macOS 为
-`~/Library/Application Support/com.flow.workflow.desktop/`），普通工作流保存在 `flow/`，
-事件审计（journal v2）保存在独立的 `journal/`，不会混用两套数据。需要隔离开发数据时，在启动前
+`~/Library/Application Support/com.flow.workflow.desktop/`），工作流、运行与权威事件保存在 `journal/flow.sqlite`，
+密钥与保留的旧数据使用 `flow/` 目录。需要隔离开发数据时，在启动前
 设置 `FLOW_DESKTOP_DATA_DIR=/绝对路径`。桌面不会自动导入原服务器数据目录。
 
 应用启动会恢复本地运行并启动定时调度；无 `flow.toml` 时默认开启执行器预热
@@ -91,11 +95,11 @@ webhook 仍需接收 HTTP 请求，桌面仅在 `127.0.0.1` 随机端口开放�
 传输适配位于 `src/rpc/`，内嵌服务和 Tauri 命令位于 `src-tauri/src/`。桌面始终使用
 本地服务；以下 `config.json` 和 `VITE_FLOW_*` 地址设置仅作用于浏览器。
 
-浏览器 flow-server 地址可用环境变量覆盖（需在 vite 启动前设置）：
+浏览器 flow-journal-server 地址可用环境变量覆盖（需在 vite 启动前设置）：
 
 ```bash
-VITE_FLOW_RPC=ws://127.0.0.1:9800 npm run dev      # JSON-RPC WebSocket
-VITE_FLOW_HTTP=http://127.0.0.1:9801 npm run dev   # webhook HTTP 入口（触发器页展示 hook URL 用）
+VITE_FLOW_RPC=ws://127.0.0.1:9802 npm run dev      # JSON-RPC WebSocket
+VITE_FLOW_HTTP=http://127.0.0.1:9803 npm run dev   # webhook HTTP 入口（触发器页展示 hook URL 用）
 ```
 
 部署时也可不改构建：在 web 根目录放 `config.json`（见 `public/config.example.json`），
@@ -111,9 +115,8 @@ VITE_FLOW_HTTP=http://127.0.0.1:9801 npm run dev   # webhook HTTP 入口（触�
 
 - **统一配置**：读写服务端 `flow.toml`（分层：CLI `--config` > 环境变量 > 配置文件
   > 内置默认值；示例见仓库根 `flow.config.example.toml`）。修改**重启后生效**，
-  页面会标注哪些分区仍被环境变量覆盖（如 `FLOW_ADDR`）。`database_url` 只写不读
-  （回显为「已设置」），清除需显式清空保存。桌面端隐藏服务器地址类分区（内嵌
-  服务无网络监听），桌面配置文件位于应用数据目录 `flow.toml`；
+  页面会标注哪些分区仍被环境变量覆盖（如 `FLOW_JOURNAL_ADDR`）。桌面端隐藏独立
+  RPC 监听地址类分区，桌面配置文件位于应用数据目录 `flow.toml`；
 - **密钥**：工作流 x-secret 参数引用的密钥可在此增删（AES-GCM 加密落盘于数据
   目录 `secrets.json` + 主密钥 `secret.key`，值永不出服务端）。执行时优先用这里
   的密钥，其次回落 `FLOW_SECRET_*` 环境变量；来自环境变量的密钥只能显示、不能删。
@@ -198,7 +201,7 @@ teardown 杀进程删目录。种子数据直接走 JSON-RPC WebSocket（`e2e/he
     （`undefined`），清空 = 删除输入（`null`），改成新 JSON = 替换；非法 JSON 前端拦截，
     保存成功后 toast 并刷新列表；
   - Webhook：新建按钮 + 列表（完整 hook URL 一键复制、调用示例展开、启停、删除）。
-    hook URL 基址 = `VITE_FLOW_HTTP`（默认 `http://127.0.0.1:9801`），因为
+    hook URL 基址 = `VITE_FLOW_HTTP`（默认 `http://127.0.0.1:9803`），因为
     flow-server 的 HTTP 端口前端无法自知。POST body（JSON）即 run 的 input；
   - 调用合同（每张 webhook 卡片的折叠区）：
     - **版本固定**：下拉只列 `workflow.versions` 中 `status === "published"` 的版本，

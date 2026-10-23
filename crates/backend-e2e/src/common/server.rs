@@ -147,7 +147,7 @@ pub struct ServerProc {
 
 impl ServerProc {
     /// 由已启动的子进程与报出的端口组装（自定义环境形态的 spawn 用，
-    /// 如 wire 契约测试与集群用例自带 FLOW_* 环境变量起进程）。
+    /// 如 wire 契约测试与远程执行用例自带 FLOW_* 环境变量起进程）。
     pub fn from_parts(child: Child, addr: SocketAddr, http_addr: SocketAddr) -> Self {
         ServerProc {
             child,
