@@ -243,3 +243,58 @@ async fn wait_node_state(
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
+
+e2e_test!(
+    http_call_explicit_proxy_handles_target_without_local_dns,
+    |ctx: &mut Ctx| Box::pin(async move {
+        let proxy = StubHttp::fixed(200, json!({"via":"proxy"})).await;
+        let client = ctx.client().await;
+        let target = "http://proxy-target.invalid/items?q=1";
+        let mut definition = http_def("GET", target);
+        definition["nodes"][1]["params"]["proxy"] = json!(proxy.url(""));
+        let (workflow, _) = publish_workflow(&client, "explicit proxy", definition).await;
+        let run = start_run(&client, &workflow, json!({})).await;
+        let completed = wait_run_terminal(&client, &run, TIMEOUT).await;
+        assert_eq!(completed["run"]["status"], "succeeded", "{completed}");
+        let requests = proxy.requests();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(request_line(&requests[0]), format!("GET {target} HTTP/1.1"));
+    })
+);
+
+e2e_test!(
+    http_call_https_uses_proxy_connect,
+    |ctx: &mut Ctx| Box::pin(async move {
+        let proxy = StubHttp::fixed(407, json!({"error": "proxy authentication required"})).await;
+        let client = ctx.client().await;
+        let mut definition = http_def(
+            "GET",
+            "https://proxy-target.invalid/items?token=private-query-value",
+        );
+        definition["nodes"][1]["params"]["proxy"] = json!(proxy.url(""));
+        let (workflow, _) = publish_workflow(&client, "HTTPS proxy", definition).await;
+        let run = start_run(&client, &workflow, json!({})).await;
+        let waiting = wait_run_status(&client, &run, "awaiting_resume", TIMEOUT).await;
+        let requests = proxy.requests();
+        assert_eq!(requests.len(), 1, "{waiting}: {requests:?}");
+        assert_eq!(
+            request_line(&requests[0]),
+            "CONNECT proxy-target.invalid:443 HTTP/1.1"
+        );
+        let observations =
+            call_json(&client, "run.observations.page", json!({"run_id": run})).await;
+        assert!(
+            observations["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|log| {
+                    log["line"]["message"].as_str().is_some_and(|message| {
+                        message.contains("tunnel error: proxy authorization required")
+                    })
+                }),
+            "必须保留代理认证失败的具体原因：{observations}"
+        );
+        assert!(!observations.to_string().contains("private-query-value"));
+    })
+);

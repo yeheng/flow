@@ -63,6 +63,20 @@ impl From<serde_json::Error> for TaskError {
     }
 }
 
+/// reqwest 的 Display 只有顶层概述；代理 CONNECT、DNS、TLS 的原因在 source 链。
+fn http_error_message(error: reqwest::Error) -> String {
+    // URL 单独以脱敏后的标签记录，避免错误链重新带出 query 凭据。
+    let error = error.without_url();
+    let mut message = error.to_string();
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    flow_engine::nodelog::redact_text(&message)
+}
+
 /// 任务结束方式（运行时据此决定是否释放/回收进程）。
 #[derive(Debug)]
 pub enum TaskEnd {
@@ -1049,12 +1063,13 @@ impl TaskRunner {
         let mut response = match client.execute(outbound_request).await {
             Ok(response) => response,
             Err(error) => {
+                let error = http_error_message(error);
                 logger.error(format!(
                     "请求 {url_label} 失败（{}ms）：{error}",
                     started.elapsed().as_millis()
                 ));
                 // 授权后调用失败：Outcome 未知，交主进程按 uncertain 处理。
-                return Err(TaskError::Uncertain(error.to_string()));
+                return Err(TaskError::Uncertain(error));
             }
         };
         if response
@@ -1085,7 +1100,7 @@ impl TaskRunner {
         while let Some(bytes) = response
             .chunk()
             .await
-            .map_err(|e| TaskError::Uncertain(e.to_string()))?
+            .map_err(|e| TaskError::Uncertain(http_error_message(e)))?
         {
             if raw.len() as u64 + bytes.len() as u64 > flow_journal::MAX_VALUE_BYTES {
                 return Err(TaskError::Uncertain(
@@ -1432,7 +1447,7 @@ impl TaskRunner {
                     .canonicalize()
                     .map_err(|e| {
                         TaskError::Business(format!(
-                            "harness agent workdir 不可用（{configured}）：{e}"
+                            "harness agent workdir 不可用（{configured}）：{e}；请清空 workdir 使用默认临时工作目录，或填写执行器所在机器上已存在的绝对目录，发布后启动新运行"
                         ))
                     })?;
                 if !canonical.is_dir() {
@@ -1577,7 +1592,11 @@ impl TaskRunner {
         // The caller bounds assembly, the turn, cleanup and outcome publication
         // with one deadline. Dropping this future is always followed by retiring
         // the entire executor session, including tool process groups.
-        let turn = session.host.run_turn(prompt, |_| {}).await;
+        let mut progress = crate::agent_progress::AgentProgress::new(logger);
+        let turn = session
+            .host
+            .run_turn(prompt, |event| progress.on_event(event))
+            .await;
         conga_host::session_cleanup::cleanup_session_resources(&session_id).await;
         let summary = turn
             .map_err(|error| TaskError::Uncertain(format!("harness agent turn failed: {error}")))?;
@@ -1590,7 +1609,7 @@ impl TaskRunner {
                 "失败"
             },
             started.elapsed().as_millis(),
-            summary.new_messages.len()
+            progress.rounds()
         ));
         // error 行同时进 stderr（A6）：Business 文案不只剩退出码。
         let mut stderr = String::new();

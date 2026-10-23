@@ -326,9 +326,14 @@ async function saveAsNode(): Promise<void> {
         <AppButton :disabled="publishing" @click="publish()">
           {{ publishing ? "发布中…" : "发布" }}
         </AppButton>
-        <AppButton variant="primary" :disabled="monitor.starting" @click="startRun()"
-          >运行</AppButton
+        <AppButton
+          variant="primary"
+          title="运行已发布版本；修改参数后请先发布"
+          :disabled="monitor.starting"
+          @click="startRun()"
         >
+          运行
+        </AppButton>
         <AppButton
           :title="runDrawerOpen ? '收起运行控制台' : '展开运行控制台'"
           @click="runDrawerOpen = !runDrawerOpen"

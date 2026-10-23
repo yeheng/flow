@@ -18,12 +18,14 @@ use std::time::Duration;
 async fn agent_node_full_stack_with_inline_conga_and_mock_provider() {
     let workdir = tempfile::tempdir().unwrap();
     let marker = workdir.path().join("tool-ran-marker");
+    let final_gate = Arc::new(tokio::sync::Notify::new());
     let provider = spawn_mock_openai(vec![
         Turn::Tool {
             command: format!("echo ran > '{}'", marker.display()),
         },
-        Turn::Final {
+        Turn::GatedFinal {
             text: "mock agent final answer".into(),
+            gate: final_gate.clone(),
         },
     ])
     .await;
@@ -94,6 +96,42 @@ async fn agent_node_full_stack_with_inline_conga_and_mock_provider() {
         .as_str()
         .unwrap()
         .to_owned();
+
+    // 第二轮 provider 尚未返回时，第一轮与工具进度就必须可读。
+    let observations = backend.observations.as_ref().unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            observations.flush();
+            let logs = observations.page(&run_id, None, 0, 256).unwrap();
+            if logs
+                .iter()
+                .any(|record| record.line.message.contains("第 2 轮 → 模型请求"))
+            {
+                assert!(logs.iter().all(|record| record.line.node_id == "a"));
+                assert!(logs
+                    .iter()
+                    .any(|record| record.line.message.contains("第 1 轮开始")));
+                assert!(logs
+                    .iter()
+                    .any(|record| record.line.message.contains("工具 bash 开始")));
+                assert!(logs
+                    .iter()
+                    .any(|record| record.line.message.contains("工具 bash 完成")));
+                assert!(logs
+                    .iter()
+                    .any(|record| record.line.message.contains("第 1 轮结束")));
+                assert_eq!(
+                    backend.run_snapshot(&run_id).await.unwrap().unwrap().status,
+                    RunStatus::Running
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("agent 运行中应实时显示多轮进度");
+    final_gate.notify_one();
 
     let run = tokio::time::timeout(Duration::from_secs(90), async {
         loop {
@@ -177,6 +215,24 @@ async fn agent_node_full_stack_with_inline_conga_and_mock_provider() {
             .contains("sk-mock-provider-key"),
         "节点输出不得包含密钥真值"
     );
+
+    observations.flush();
+    let logs = observations.page(&run_id, None, 0, 256).unwrap();
+    assert!(logs
+        .iter()
+        .any(|record| record.line.message.contains("多轮循环结束（共 2 轮）")));
+    let display = serde_json::to_string(&logs).unwrap();
+    for private in [
+        "sk-mock-provider-key",
+        "run the echo tool then finish",
+        "echo ran",
+        "mock agent final answer",
+    ] {
+        assert!(
+            !display.contains(private),
+            "进度日志不应记录密钥、prompt 或工具/模型正文：{private}"
+        );
+    }
 
     backend.close().await.unwrap();
     provider.stop().await;

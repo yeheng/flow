@@ -293,6 +293,14 @@ flow-journal-dev --data-dir <data_dir> check-projection
 | agent 连不上 | 证书 CN 与 `agent_id` 不符 / 网络 | 看握手日志；`STARTUP_TIMEOUT_MS = 10s` 内没 Welcome 即失败 |
 | 远端派发全部 `LinkClosed` | 上联断 | agent 会自动重连 + Resume 对账；查对账裁决结果 |
 
+HTTP 节点的 `proxy` 属于工作流版本参数。修改后须发布再启动新运行；编辑器会拦截
+未保存或未发布的画布，避免静默运行旧配置。已启动运行保留启动时的版本。
+
+`proxy = "http://127.0.0.1:7890"` 也可代理 HTTPS 目标（通过 CONNECT 隧道）。
+`https://` 表示连接**代理服务器本身**时使用 TLS，不是按目标 URL 的协议填写。
+地址须从执行器所在机器可达；remote 模式的 `127.0.0.1` 指 agent 所在机器。
+代理连接失败时，节点日志会包含 CONNECT、认证、DNS 或 TLS 的底层错误原因。
+
 ### 6.2 `awaiting_resume` 处置流程
 
 这是**唯一需要人工介入的状态**（DESIGN §C4）。步骤：
@@ -516,6 +524,10 @@ executor 依赖 conga 固定 rev（见 `crates/flow-executor/Cargo.toml`），re
 
 ### 配置与密钥
 
+- `mode=agent` 的节点 `workdir` 可留空，执行器会创建临时工作目录并在结束后清理。
+  仅在需要访问项目文件时填写执行器所在机器上已存在的绝对目录。
+  旧 GitHub Trending 示例的 `/absolute/path/to/workdir` 是占位值；已导入的工作流
+  请清空 `recommend` 节点的该字段，发布后启动新运行。
 - 模型配置在 `[harness.agent]`（base_url/model 成对启用；api/proxy/限额可选）。
   **run 启动时冻结进执行快照**：重启后改配置只影响新 run；回归候选继承
   baseline 的冻结配置。Settings 页保存后需重启生效。

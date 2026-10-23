@@ -16,6 +16,11 @@ pub enum Turn {
     Final { text: String },
     /// Holds a real request open, for deadline/cancel and mixed-load checks.
     DelayedFinal { text: String, delay_ms: u64 },
+    /// 等待测试放行，验证运行结束前就能看到进度日志。
+    GatedFinal {
+        text: String,
+        gate: Arc<tokio::sync::Notify>,
+    },
     /// Reusable per-session two-turn script, safe under concurrent requests.
     ToolThenFinal {
         command: String,
@@ -102,6 +107,13 @@ async fn completions(
         ],
         Turn::DelayedFinal { text, delay_ms } => {
             tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
+            vec![
+                json!({"choices":[{"delta":{"content":text}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ]
+        }
+        Turn::GatedFinal { text, gate } => {
+            gate.notified().await;
             vec![
                 json!({"choices":[{"delta":{"content":text}}]}),
                 json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),

@@ -14,7 +14,7 @@ vi.mock("../api/flow", () => ({
 }));
 
 import * as api from "../api/flow";
-import { editor } from "./editor";
+import { definitionToFlow, editor, markSaved } from "./editor";
 import { toast } from "./toast";
 import {
   attachRun,
@@ -58,6 +58,11 @@ beforeEach(() => {
   cancelRunStart();
   closeAllOverlays();
   vi.clearAllMocks();
+  editor.version = 1;
+  editor.nodes = [];
+  editor.edges = [];
+  editor.definitionOptions = {};
+  markSaved();
   for (const k of Object.keys(unsubs)) delete unsubs[k];
   vi.mocked(api.subscribeRun).mockImplementation(async (runId: string) => {
     unsubs[runId] = vi.fn(async () => {});
@@ -168,6 +173,35 @@ describe("timeline 拉取失败的降级路径", () => {
 });
 
 describe("startRun 前置校验", () => {
+  it("保存了代理但未发布时，不能静默运行不含代理的旧发布版本", async () => {
+    editor.workflowId = "wf-proxy-draft";
+    editor.version = 2;
+    editor.publishedVersion = 1;
+    const error = vi.spyOn(toast, "error");
+    await startRun();
+    expect(error).toHaveBeenCalledWith("当前画布 v2 尚未发布，请先发布再运行（已发布 v1）");
+    expect(api.getWorkflow).not.toHaveBeenCalled();
+    expect(api.startRun).not.toHaveBeenCalled();
+  });
+
+  it("参数尚未保存时，不能静默运行原来的发布版本", async () => {
+    editor.workflowId = "wf-proxy-unsaved";
+    editor.publishedVersion = 1;
+    editor.nodes = definitionToFlow({
+      nodes: [{
+        id: "http",
+        type: "http_call",
+        params: { url: "https://proxy-target.invalid", proxy: "http://127.0.0.1:7890" },
+      }],
+      edges: [],
+    }).nodes;
+    const error = vi.spyOn(toast, "error");
+    await startRun();
+    expect(error).toHaveBeenCalledWith("当前画布有未发布修改，请先发布再运行（已发布 v1）");
+    expect(api.getWorkflow).not.toHaveBeenCalled();
+    expect(api.startRun).not.toHaveBeenCalled();
+  });
+
   it("运行已换入后离开编辑器，仍继续观测该运行直到终态", async () => {
     const observations = deferred<Awaited<ReturnType<typeof api.runObservations>>>();
     let markDirty!: () => void;
@@ -314,6 +348,7 @@ describe("startRun 前置校验", () => {
   });
   it("读取固定发布版本的必填合同，取消表单不创建运行", async () => {
     editor.workflowId = "wf-contract";
+    editor.version = 2;
     editor.publishedVersion = 2;
     monitor.inputText = "";
     vi.mocked(api.getWorkflow).mockResolvedValue({

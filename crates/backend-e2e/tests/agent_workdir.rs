@@ -110,10 +110,13 @@ async fn agent_workdir_default_scratch_configured_checked_and_regression_stable(
     let hits_before = provider.hits();
     let run = run_agent(&b, definition(Some("/absolute/path/that/does/not/exist"))).await;
     assert_eq!(run.status, RunStatus::Failed);
+    let error = run.error.unwrap_or_default();
+    assert!(error.contains("workdir 不可用"), "{error}");
     assert!(
-        run.error.unwrap_or_default().contains("workdir 不可用"),
-        "应明确指出 workdir 不可用"
+        error.contains("清空 workdir 使用默认临时工作目录"),
+        "{error}"
     );
+    assert!(error.contains("执行器所在机器"), "{error}");
     assert_eq!(provider.hits(), hits_before, "失败路径不得调用 provider");
 
     // ---- 配置了且存在：按配置走 ----

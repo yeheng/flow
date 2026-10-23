@@ -233,7 +233,7 @@ impl NodeType {
                     "properties": {
                         "mode": {"type": "string", "enum": ["command", "agent"], "default": "command",
                                  "x-label": "模式",
-                                 "x-help": "command 运行外部 CLI（需 command 参数）；agent 使用内置 flow-harness-agent（需 workdir 与 api_key，模型配置见设置页 [harness.agent]）"},
+                                 "x-help": "command 运行外部 CLI（需 command 参数）；agent 使用内置 flow-harness-agent（需 api_key，workdir 可留空，模型配置见设置页 [harness.agent]）"},
                         "prompt": {"type": "string", "x-widget": "code", "x-label": "提示词"},
                         "command": {"type": "string", "x-label": "命令",
                                     "x-help": "mode=command 时必填；进程级记录：prompt 经 stdin，最终 stdout 作为输出；逐模型/工具记录使用模型调用和 HTTP 节点"},

@@ -163,7 +163,7 @@ function setRetry(key: "max_attempts" | "backoff_ms", ev: Event): void {
         </template>
       </div>
       <footer class="params-footer">
-        <span class="muted params-hint">修改即时生效，⌘Z 可撤销</span>
+        <span class="muted params-hint">修改应用到画布，发布后用于新运行；⌘Z 可撤销</span>
         <AppButton variant="primary" @click="close">完成</AppButton>
       </footer>
     </div>

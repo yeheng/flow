@@ -112,9 +112,9 @@ return {
 #   - 模型配置（base_url/model/api）在 flow.toml 的 [harness.agent]，不在这里；
 #   - api_key 只存密钥**名称**，真值经密钥体系（stored 优先、FLOW_SECRET_* 兜底）注入，
 #     任何环境变量 / journal / 日志都不携带；
-#   - workdir 是 agent 工具沙箱根，必须是已存在的绝对路径（运行前 canonicalize 校验）。
+#   - 不配置 workdir，使用执行器创建并清理的临时工作目录；纯分析任务无需固定目录。
+#     需要访问项目文件时，再显式填写执行器机器上已存在的绝对目录。
 AGENT_SECRET = "DEEPSEEK_API_KEY"            # 密钥名 → FLOW_SECRET_DEEPSEEK_API_KEY 或 Web 密钥管理
-AGENT_WORKDIR = "/absolute/path/to/workdir"  # TODO: 改成已存在的绝对路径（agent 沙箱根）
 
 # prompt 经 stdin 进 runner；${nodes.parse} 整值插值成 parse 节点的 JSON。
 AGENT_PROMPT = """你是一位资深的技术编辑与开源项目策展人，擅长从海量项目里挑出真正值得关注的那几个，并用简洁有力的中文讲清楚它是什么、解决什么问题、妙在哪里。判断独立犀利，不写空话套话。这是纯分析任务，直接给出最终结果即可，无需读写文件或执行命令。
@@ -218,7 +218,6 @@ definition = {
             "params": {
                 "mode": "agent",
                 "prompt": AGENT_PROMPT,
-                "workdir": AGENT_WORKDIR,
                 "api_key": AGENT_SECRET,
                 "timeout_ms": 300000,
             },
@@ -245,7 +244,7 @@ definition = {
 
 doc = {
     "name": "github-trending",
-    "description": "拉取 GitHub Trending 日报（全量 + spoken_language_code=zh），解析成 中文 / 非中文 两组项目后，用内置 harness agent 总结榜单趋势并推荐有趣的项目（含介绍与卖点）。需配置 [harness.agent] 模型、密钥 DEEPSEEK_API_KEY，并把 recommend 节点的 workdir 改成已存在的绝对路径",
+    "description": "拉取 GitHub Trending 日报（全量 + spoken_language_code=zh），解析成 中文 / 非中文 两组项目后，用内置 harness agent 总结榜单趋势并推荐有趣的项目（含介绍与卖点）。需配置 [harness.agent] 模型、密钥 DEEPSEEK_API_KEY；recommend 节点默认使用临时工作目录，无需配置 workdir",
     "definition": definition,
 }
 

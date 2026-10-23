@@ -2,7 +2,7 @@ import { computed, reactive, watch } from "vue";
 import * as api from "../api/flow";
 import { client, errText } from "../rpc/client";
 import type { AdjudicateDecision, LogLine, ObservationLoss, TimelineNode } from "../types";
-import { editor } from "./editor";
+import { dirty, editor } from "./editor";
 import { TERMINAL_RUN_STATUSES } from "./labels";
 import { appendObservations, mergeObservationLoss } from "./monitor-logic";
 import { staleGuard } from "./stale";
@@ -130,9 +130,14 @@ export async function startRun(): Promise<void> {
     toast.error("先选择一个工作流");
     return;
   }
-  // run.start 只跑最新已发布版本：未发布时服务端报英文 -32602，这里提前给中文引导
+  // 运行固定发布版本；不能让画布上的代理等修改被静默忽略。
   if (editor.publishedVersion === null) {
     toast.error("当前工作流尚未发布，请先发布再运行");
+    return;
+  }
+  if (dirty.value || editor.version !== editor.publishedVersion) {
+    const state = dirty.value ? "有未发布修改" : ` v${editor.version} 尚未发布`;
+    toast.error(`当前画布${state}，请先发布再运行（已发布 v${editor.publishedVersion}）`);
     return;
   }
   let input: unknown;
