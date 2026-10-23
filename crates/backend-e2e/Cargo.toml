@@ -31,7 +31,7 @@ flow-backend = { path = "../flow-backend" }
 flow-rpc = { path = "../flow-rpc" }
 flow-config = { path = "../flow-config" }
 flow-engine = { path = "../flow-engine" }
-flow-journal = { path = "../flow-journal" }
+flow-journal = { path = "../flow-journal", default-features = false, features = ["storage"] }
 flow-test-support = { path = "../flow-test-support" }
 rustls = { workspace = true }
 

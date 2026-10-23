@@ -16,6 +16,69 @@ fn passthrough() -> Value {
     json!({"semantics":2,"nodes":[{"id":"s","type":"start"},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"e"}]})
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn backend_close_waits_for_idle_executor_reaping() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("executor-pid");
+    let b = JournalBackend::open(dir.path(), Default::default())
+        .await
+        .unwrap();
+    b.start_execution_ipc_prewarm(
+        flow_backend::execution::ExecutionMode::Ipc(flow_backend::execution::IpcOptions {
+            executor: flow_engine::execution_protocol::ExecutorInvocation::explicit(
+                flow_test_support::io::executor_bin(),
+            ),
+            x_max: 1,
+            tag: None,
+        }),
+        true,
+    )
+    .await
+    .unwrap();
+    let workflow = install(&b, json!({"semantics":2,"nodes":[
+        {"id":"s","type":"start"},{"id":"n","type":"harness","params":{
+            "command":"/bin/sh","args":["-c",format!("echo $PPID > '{}'", pid_file.display())],"prompt":"record executor pid"
+        }},{"id":"e","type":"end"}
+    ],"edges":[{"from":"s","to":"n"},{"from":"n","to":"e"}]})).await;
+    let receipt = b
+        .run_start(&workflow, None, Value::Null, "manual", None, None)
+        .await
+        .unwrap();
+    let id = receipt.result["run_id"].as_str().unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !b.run_snapshot(id).await.unwrap().unwrap().terminal() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let pid: i32 = std::fs::read_to_string(pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(pid > 1);
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "healthy executor should still be reusable"
+    );
+    tokio::time::timeout(Duration::from_secs(10), b.close())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "close returned before executor reap"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+}
+
 #[tokio::test]
 async fn terminal_subscription_closes_after_unrelated_commits() {
     let dir = tempfile::tempdir().unwrap();

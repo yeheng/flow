@@ -479,12 +479,6 @@ async fn hook(
         .await
     {
         Ok(receipt) => Json(receipt).into_response(),
-        Err(JournalError::Journal(flow_journal::Error::Conflict(_))) => {
-            StatusCode::CONFLICT.into_response()
-        }
-        Err(JournalError::Journal(flow_journal::Error::Invalid(_))) => {
-            StatusCode::BAD_REQUEST.into_response()
-        }
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(error) => invocation_error(error),
     }
 }

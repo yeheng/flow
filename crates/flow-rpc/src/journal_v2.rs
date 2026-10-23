@@ -215,6 +215,7 @@ impl<'a> CommandStatusReq<'a> {
     }
 }
 
+use flow_dto::rpc::Method;
 pub use flow_dto::rpc::{is_read_method, is_write_method, READ_METHODS, WRITE_METHODS};
 
 /// 写命令的服务端命令 scope（`command.status` 查询键）。run.start 带来源
@@ -244,10 +245,9 @@ pub fn module_product(
         token,
         product,
     });
-    for &method in READ_METHODS.iter().chain(WRITE_METHODS) {
-        module.register_async_method(method, move |params, ctx, _| {
-            let method: &'static str = method;
-            async move { dispatch_call(&ctx, method, params).await }
+    for &method in Method::ALL {
+        module.register_async_method(method.as_str(), move |params, ctx, _| async move {
+            dispatch_call(&ctx, method, params).await
         })?;
     }
     module.register_subscription(
@@ -309,19 +309,19 @@ async fn admit_call(
 /// 单条方法分发：cluster 族与读面直接返回；写命令产出回执。
 async fn dispatch_call(
     ctx: &Context,
-    method: &'static str,
+    method: Method,
     params: jsonrpsee::types::Params<'_>,
 ) -> Result<Value, ErrorObjectOwned> {
-    let (p, request_id) = admit_call(ctx, method, params).await?;
+    let (p, request_id) = admit_call(ctx, method.as_str(), params).await?;
     let request = request_id.as_deref();
     let b = &ctx.backend;
-    if method.starts_with("journal.cluster.") {
-        return cluster_route(b, method, &p, request).await;
-    }
     let receipt = match method {
+        Method::JournalClusterStatus
+        | Method::JournalClusterNodes
+        | Method::JournalClusterRemove => return cluster_route(b, method, &p, request).await,
         // ---- 观测 / 读面（直接返回，不走回执解包） ----
-        "run.observations.page" => return observations_page(b, &p).await,
-        "command.status" => {
+        Method::RunObservationsPage => return observations_page(b, &p).await,
+        Method::CommandStatus => {
             let req = CommandStatusReq::parse(&p)?;
             return serde_json::to_value(
                 b.command_status(req.scope, req.request_id)
@@ -330,17 +330,23 @@ async fn dispatch_call(
             )
             .map_err(invalid);
         }
-        "workflow.list" | "run.list" | "legacy.list" => return snapshot_list(b, method, &p).await,
-        "workflow.get" | "run.get" | "legacy.get" => return snapshot_get(b, method, &p).await,
-        "run.events.page" | "run.audit.page" => return events_page(b, method, &p).await,
+        Method::WorkflowList | Method::RunList | Method::LegacyList => {
+            return snapshot_list(b, method.as_str(), &p).await
+        }
+        Method::WorkflowGet | Method::RunGet | Method::LegacyGet => {
+            return snapshot_get(b, method.as_str(), &p).await
+        }
+        Method::RunEventsPage | Method::RunAuditPage => {
+            return events_page(b, method.as_str(), &p).await
+        }
 
         // ---- 写命令（CommandReceipt 回执面）：边缘一次 struct 化 ----
-        "workflow.validate" => {
+        Method::WorkflowValidate => {
             return b
                 .workflow_validate(p["definition"].clone())
                 .map_err(failure)
         }
-        "workflow.import" => {
+        Method::WorkflowImport => {
             let publish = p
                 .get("publish")
                 .map(|v| {
@@ -352,25 +358,25 @@ async fn dispatch_call(
             b.workflow_import(text(&p, "name")?, p["definition"].clone(), publish, request)
                 .await
         }
-        "workflow.create" => {
+        Method::WorkflowCreate => {
             let req = WorkflowCreateReq::parse(&p)?;
             b.workflow_create(req.name, request).await
         }
-        "workflow.update" => {
+        Method::WorkflowUpdate => {
             let req = WorkflowUpdateReq::parse(&p)?;
             b.workflow_update(req.workflow_id, req.definition, request)
                 .await
         }
-        "workflow.publish" => {
+        Method::WorkflowPublish => {
             let req = WorkflowPublishReq::parse(&p)?;
             b.workflow_publish(req.workflow_id, req.version, request)
                 .await
         }
-        "workflow.delete" => {
+        Method::WorkflowDelete => {
             let req = WorkflowDeleteReq::parse(&p)?;
             b.workflow_delete(req.workflow_id, request).await
         }
-        "run.start" => {
+        Method::RunStart => {
             let req = RunStartReq::parse(&p)?;
             b.run_start(
                 req.workflow_id,
@@ -382,11 +388,11 @@ async fn dispatch_call(
             )
             .await
         }
-        "run.regress" => {
+        Method::RunRegress => {
             b.run_regression_with_fixtures(
                 text(&p, "baseline")?,
                 p["workflow_id"].as_str(),
-                p["version"].as_u64(),
+                optional_version(&p)?,
                 p.get("fixtures")
                     .cloned()
                     .map(serde_json::from_value)
@@ -397,22 +403,22 @@ async fn dispatch_call(
             )
             .await
         }
-        "run.compare" => {
+        Method::RunCompare => {
             return b
                 .compare_runs(text(&p, "baseline")?, text(&p, "candidate")?)
                 .await
                 .map_err(failure)
         }
-        "run.cancel" => {
+        Method::RunCancel => {
             let req = RunCancelReq::parse(&p)?;
             b.run_cancel(req.run_id, request).await
         }
-        "run.signal" => {
+        Method::RunSignal => {
             let req = RunSignalReq::parse(&p)?;
             b.run_signal(req.run_id, req.node_id, req.payload, request)
                 .await
         }
-        "run.adjudicate" => {
+        Method::RunAdjudicate => {
             let req = RunAdjudicateReq::parse(&p)?;
             b.run_adjudicate(
                 req.run_id,
@@ -425,81 +431,80 @@ async fn dispatch_call(
             )
             .await
         }
-        "schedule.change" | "webhook.change" => {
-            let kind = if method == "schedule.change" {
+        Method::ScheduleChange | Method::WebhookChange => {
+            let kind = if method == Method::ScheduleChange {
                 flow_journal::EventKind::ScheduleChanged
             } else {
                 flow_journal::EventKind::WebhookChanged
             };
             let req = ConfigChangeReq::parse(&p)?;
-            b.config_change(method, kind, req.key, req.patch, request)
+            b.config_change(method.as_str(), kind, req.key, req.patch, request)
                 .await
         }
-        "schedule.create"
-        | "schedule.update"
-        | "schedule.delete"
-        | "webhook.create"
-        | "webhook.set_enabled"
-        | "webhook.delete"
-        | "template.create"
-        | "template.update"
-        | "template.delete" => return product_command_route(ctx, method, &p).await,
+        Method::ScheduleCreate
+        | Method::ScheduleUpdate
+        | Method::ScheduleDelete
+        | Method::WebhookCreate
+        | Method::WebhookSetEnabled
+        | Method::WebhookDelete
+        | Method::TemplateCreate
+        | Method::TemplateUpdate
+        | Method::TemplateDelete => return product_command_route(ctx, method.as_str(), &p).await,
 
         // ---- 产品面：V2 product views（journal_views 物化，直接返回） ----
-        "workflow.list.view" => return workflow_list_view(b).await,
-        "workflow.get.view" => return workflow_get_view(b, &p).await,
-        "workflow.versions" => return workflow_versions(b, &p).await,
-        "run.get.view" => return run_get_view(b, &p).await,
-        "run.list.view" => return run_list_view(b, &p).await,
-        "run.stats" => {
+        Method::WorkflowListView => return workflow_list_view(b).await,
+        Method::WorkflowGetView => return workflow_get_view(b, &p).await,
+        Method::WorkflowVersions => return workflow_versions(b, &p).await,
+        Method::RunGetView => return run_get_view(b, &p).await,
+        Method::RunListView => return run_list_view(b, &p).await,
+        Method::RunStats => {
             let stats = flow_backend::journal_views::run_stats(b, p["workflow_id"].as_str())
                 .await
                 .map_err(view_failure)?;
             return serde_json::to_value(stats).map_err(invalid);
         }
-        "run.timeline" => {
+        Method::RunTimeline => {
             return flow_backend::journal_views::timeline(b, text(&p, "run_id")?)
                 .await
                 .map_err(view_failure);
         }
-        "run.events.view" => return events_view(b, &p).await,
-        "schedule.list" => return schedule_list(b, &p).await,
-        "webhook.list" => {
+        Method::RunEventsView => return events_view(b, &p).await,
+        Method::ScheduleList => return schedule_list(b, &p).await,
+        Method::WebhookList => {
             let webhooks = flow_backend::journal_views::list_webhooks(b, p["workflow_id"].as_str())
                 .await
                 .map_err(view_failure)?;
             return serde_json::to_value(json!({"webhooks": webhooks})).map_err(invalid);
         }
-        "template.list" => {
+        Method::TemplateList => {
             let templates = flow_backend::journal_views::template_list(b)
                 .await
                 .map_err(view_failure)?;
             return Ok(json!({"templates": templates}));
         }
-        "template.get" => {
+        Method::TemplateGet => {
             let template = flow_backend::journal_views::template_get(b, text(&p, "id")?)
                 .await
                 .map_err(view_failure)?;
             return serde_json::to_value(template).map_err(invalid);
         }
-        "config.get" => {
+        Method::ConfigGet => {
             let product = ctx_product(ctx)?;
             return Ok(crate::config_view(&product));
         }
-        "config.update" => return config_update(ctx, &p).await,
-        "secrets.list" => {
+        Method::ConfigUpdate => return config_update(ctx, &p).await,
+        Method::SecretsList => {
             let secrets: Vec<Value> = flow_backend::secrets::list_secrets()
                 .into_iter()
                 .map(|(name, source)| json!({"name": name, "source": source}))
                 .collect();
             return Ok(json!({"secrets": secrets}));
         }
-        "secrets.set" => return secrets_set(ctx, &p).await,
-        "secrets.delete" => return secrets_delete(ctx, &p).await,
-        "nodetypes.list" => {
+        Method::SecretsSet => return secrets_set(ctx, &p).await,
+        Method::SecretsDelete => return secrets_delete(ctx, &p).await,
+        Method::NodetypesList => {
             return Ok(json!({"node_types": crate::node_types()}));
         }
-        _ => unreachable!(),
     }
     .map_err(failure)?;
     serde_json::to_value(receipt).map_err(invalid)
@@ -509,7 +514,7 @@ async fn dispatch_call(
 /// status 报 disabled、其余报 -32012。
 async fn cluster_route(
     b: &JournalBackend,
-    method: &str,
+    method: Method,
     p: &Value,
     request: Option<&str>,
 ) -> Result<Value, ErrorObjectOwned> {
@@ -528,12 +533,12 @@ async fn cluster_route(
             }
         };
         return match method {
-            "journal.cluster.status" => Ok(json!({
+            Method::JournalClusterStatus => Ok(json!({
                 "enabled": true,
                 "cluster_id": cluster.cluster_id,
                 "node_id": cluster.lease.node_id,
             })),
-            "journal.cluster.nodes" => cluster
+            Method::JournalClusterNodes => cluster
                 .registry
                 .nodes(
                     p["after"].as_str().unwrap_or(""),
@@ -541,7 +546,7 @@ async fn cluster_route(
                 )
                 .await
                 .map_err(map),
-            "journal.cluster.remove" => {
+            Method::JournalClusterRemove => {
                 if p["expected_epoch"].is_null() {
                     return Err(invalid("expected_epoch required"));
                 }
@@ -555,10 +560,10 @@ async fn cluster_route(
                     .await
                     .map_err(map)
             }
-            _ => unreachable!(),
+            _ => Err(invalid("not a cluster method")),
         };
     }
-    if method == "journal.cluster.status" {
+    if method == Method::JournalClusterStatus {
         return Ok(json!({"enabled": false}));
     }
     Err(ErrorObjectOwned::owned(
@@ -870,13 +875,13 @@ async fn config_update(ctx: &Context, p: &Value) -> Result<Value, ErrorObjectOwn
         .config
         .as_ref()
         .ok_or_else(|| invalid("此实例未启用配置文件读写，无法修改配置"))?;
-    let mut current = cs.config.write().unwrap();
+    let mut current = cs.config.write().unwrap_or_else(|p| p.into_inner());
     let base = current.clone();
     let merged =
         flow_config::Config::merge_patch(&base, &patch).map_err(|e| invalid(e.to_string()))?;
     // 落点只认启动时发现的配置文件，其次默认落点（FLOW_CONFIG 声明值或
     // 平台配置目录）；绝不用进程 CWD——换目录启动会丢配置。
-    let existing = cs.path.read().unwrap().clone();
+    let existing = cs.path.read().unwrap_or_else(|p| p.into_inner()).clone();
     let (write_path, first_write) = match existing {
         Some(path) => (path, false),
         None => (
@@ -895,7 +900,7 @@ async fn config_update(ctx: &Context, p: &Value) -> Result<Value, ErrorObjectOwn
         .save(&write_path)
         .map_err(|e| invalid(format!("配置写入失败：{e}")))?;
     if first_write {
-        *cs.path.write().unwrap() = Some(write_path);
+        *cs.path.write().unwrap_or_else(|p| p.into_inner()) = Some(write_path);
     }
     *current = merged;
     drop(current);

@@ -57,7 +57,8 @@ pub fn bounded_control_text(mut text: String) -> String {
 pub const DATA_MAX_FRAME: usize = 1024 * 1024;
 
 /// 执行槽位数 X_max 默认值（可配置 1..=16）。每进程一个任务；常驻内存
-/// ≈ X_max × 单进程 RSS（JS heap 32 MiB 上限 + 输入面预算 8 MiB）。
+/// ≈ X_max × 实测单进程 RSS。JS heap 32 MiB 与输入预算 8 MiB 仅约束对应
+/// 子系统，不能充当内联 agent / 原生工具的进程内存上限。
 pub const X_MAX_DEFAULT: usize = 4;
 
 /// 活跃派发上界（继承一期执行并发 1..=16；主进程调度器同值限制）。

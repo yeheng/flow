@@ -22,7 +22,7 @@ async fn main() -> Result<()> {
         .await;
     }
     if args.len() < 3 {
-        return Err("usage: flow-capacity history|attempts|storage ROOT REPORT [COUNT]; flow-capacity soak ROOT REPORT SECONDS EXECUTOR".into());
+        return Err("usage: flow-capacity history|attempts|storage ROOT REPORT [COUNT]; flow-capacity soak|agent-soak ROOT REPORT SECONDS EXECUTOR".into());
     }
     let root = PathBuf::from(&args[1]);
     std::fs::create_dir_all(&root)?;
@@ -30,11 +30,12 @@ async fn main() -> Result<()> {
         "history" => history(&root, args.get(3).map_or(Ok(100_000), |s| s.parse())?).await?,
         "audits" => audits(&root, args.get(3).map_or(Ok(100_000), |s| s.parse())?).await?,
         "attempts" => attempts(&root, args.get(3).map_or(Ok(100_000), |s| s.parse())?).await?,
-        "soak" => {
+        "soak" | "agent-soak" => {
             soak(
                 &root,
                 args.get(3).ok_or("missing seconds")?.parse()?,
                 PathBuf::from(args.get(4).ok_or("missing executor")?),
+                mode == "agent-soak",
             )
             .await?
         }
@@ -462,7 +463,7 @@ async fn execute(
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
-async fn soak(root: &Path, seconds: u64, executor: PathBuf) -> Result<Value> {
+async fn soak(root: &Path, seconds: u64, executor: PathBuf, include_agents: bool) -> Result<Value> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
@@ -476,6 +477,26 @@ async fn soak(root: &Path, seconds: u64, executor: PathBuf) -> Result<Value> {
         }
     });
     let b = JournalBackend::open(root, Default::default()).await?;
+    let provider = if include_agents {
+        let provider = flow_test_support::provider::spawn_mock_openai(vec![
+            flow_test_support::provider::Turn::ToolThenFinal {
+                command: "echo agent-soak".into(),
+                text: "agent completed".into(),
+                delay_ms: 80,
+            },
+        ])
+        .await;
+        std::env::set_var("FLOW_SECRET_CAPACITY_AGENT", "mock-capacity-key");
+        b.install_harness_agent(Some(flow_engine::AgentRunConfig {
+            base_url: provider.base_url(),
+            model: "mock-capacity-model".into(),
+            max_turns: Some(4),
+            ..Default::default()
+        }))?;
+        Some(provider)
+    } else {
+        None
+    };
     b.start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
         flow_backend::execution::IpcOptions {
             executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
@@ -509,6 +530,19 @@ async fn soak(root: &Path, seconds: u64, executor: PathBuf) -> Result<Value> {
         b.workflow_update(&id,json!({"nodes":[{"id":"s","type":"start"},{"id":"n","type":kind,"params":params},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"n"},{"from":"n","to":"e"}]}),None).await?;
         b.workflow_publish(&id, 1, None).await?;
         workflows.push(id);
+    }
+    if include_agents {
+        let imported = b.workflow_import("agent-soak", json!({"semantics":2,"nodes":[
+            {"id":"s","type":"start"}, {"id":"n","type":"harness","params":{
+                "mode":"agent","prompt":"run the tool, then finish", "api_key":"CAPACITY_AGENT", "timeout_ms":30_000
+            }}, {"id":"e","type":"end"}
+        ],"edges":[{"from":"s","to":"n"},{"from":"n","to":"e"}]}), true, None).await?;
+        workflows.push(
+            imported.result["workflow_id"]
+                .as_str()
+                .ok_or("agent workflow")?
+                .to_owned(),
+        );
     }
     let start = Instant::now();
     let mut launch = tokio::time::interval(Duration::from_millis(200));
@@ -557,7 +591,11 @@ async fn soak(root: &Path, seconds: u64, executor: PathBuf) -> Result<Value> {
     let restored = b.diagnostics().await;
     b.close().await?;
     drop(b);
-    let report = json!({"mode":"soak","requested_secs":seconds,"elapsed_secs":elapsed,"submitted":submitted,"succeeded":succeeded,"cancelled":cancelled,"failed":failed,"timeouts":timeouts,"errors":errors,"latency":summary(&latencies),"samples":samples,"before_close":before_close,"after_close":resources(),"restart_ms":restart_ms,"restart_diagnostics":restored,"disk_bytes":disk(root)});
+    let provider_calls = provider.as_ref().map_or(0, |p| p.hits());
+    if let Some(provider) = provider {
+        provider.stop().await;
+    }
+    let report = json!({"mode":if include_agents {"agent-soak"} else {"soak"},"inline_agent":include_agents,"provider_calls":provider_calls,"provider":"local deterministic mock","dispatch_limit":4,"max_in_flight_runs":4,"launch_interval_ms":200,"requested_secs":seconds,"elapsed_secs":elapsed,"submitted":submitted,"succeeded":succeeded,"cancelled":cancelled,"failed":failed,"timeouts":timeouts,"errors":errors,"latency":summary(&latencies),"samples":samples,"before_close":before_close,"after_close":resources(),"restart_ms":restart_ms,"restart_diagnostics":restored,"disk_bytes":disk(root)});
     if failed > 0 {
         std::fs::write(
             root.join("failed-soak.json"),

@@ -236,8 +236,8 @@ pub fn command_scope(method: &str, params: &Value) -> String {
 /// 派发时随 `_flow_execution.agent` 下发，并进 operation 请求（回归指纹）。
 ///
 /// 只含非敏感标量——API key 只以密钥名出现在节点参数（`x-secret`），真值经
-/// `OperationPermit` → executor 内存 → runner stdin，任何环境变量都不携带。
-/// runner 侧经 conga 的 `CONGA_*` 环境变量面消费（变量名契约由固定 rev 锁步）。
+/// `OperationPermit` → executor 内存 → conga provider 参数，任何环境变量都不携带。
+/// 非敏感模型配置通过 typed HeadlessSpec 传入固定版本 conga-host。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentRunConfig {

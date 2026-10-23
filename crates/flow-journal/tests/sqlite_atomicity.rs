@@ -21,7 +21,7 @@ fn prepared(
 }
 fn row(key: &str, value: serde_json::Value) -> EntityChange {
     EntityChange {
-        kind: "command".into(),
+        kind: flow_journal::sqlite::EntityKind::Command,
         key: key.into(),
         value: Some(value),
     }
@@ -175,7 +175,7 @@ async fn current_objects_are_overwritten_and_domain_facts_cannot_bypass_material
     let j = Journal::open(dir.path(), Default::default()).await.unwrap();
     for lsn in 1..=20 {
         let mut change = row("run", json!({"status":lsn}));
-        change.kind = "run".into();
+        change.kind = flow_journal::sqlite::EntityKind::Run;
         let (tx, rows) = prepared(&j, lsn, &format!("tx-{lsn}"), vec![change]);
         j.submit_prepared(tx, rows).await.unwrap();
     }

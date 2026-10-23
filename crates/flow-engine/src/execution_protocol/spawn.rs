@@ -1,8 +1,8 @@
 //! 执行器子进程 spawn（供本地池与远程 agent 复用）。
 //!
 //! 通道 FD 以 `--channel-fd <N>` 随 argv 传递：子端 socketpair FD 原号
-//! 存活过 exec（无 CLOEXEC），pre_exec 只需关闭其余继承 FD，不做任何
-//! dup2 落位。其余 FD 默认 close-on-exec 由关闭循环兜底；父进程 spawn 后
+//! 在目标 fork 子进程内清除 CLOEXEC，执行器接管后立即恢复；pre_exec 为其余
+//! 继承 FD 设置 CLOEXEC，不做 dup2 落位。父进程 spawn 后
 //! 需自行关闭子端副本（本函数返回的子端流由调用方 drop）。
 
 use std::os::fd::AsRawFd;
@@ -15,7 +15,7 @@ use super::contract::ExecutorInvocation;
 use super::unix::socketpair_channel;
 
 /// 执行器运行时环境白名单（T6 修订）：执行器仍以 `env_clear` 起步，但
-/// harness 子进程（command 模式的外部 CLI 与 agent 模式的 runner）需要
+/// harness（command 模式的外部 CLI 与内联 agent 的工具）需要
 /// 常规工具链环境——空 `PATH`/`HOME` 的 shell 里 cargo/git/node 大面积
 /// 不可用。按显式白名单从父进程透传；`FLOW_*`（协议/凭据）、`CONGA_*`
 /// （harness 配置，由 executor 派发时从冻结快照构造）、`RUST_LOG`
@@ -103,93 +103,12 @@ pub fn spawn_executor_process(
         command.env("RUST_LOG", log);
     }
     apply_executor_env_whitelist(&mut command);
-    // pre_exec 只做允许的低层 FD 操作：close/getrlimit。禁止分配内存、
-    // 加锁或调用普通异步代码（二期 §3.1）。不 dup、不落位——FD 原号即通道。
-    //
-    // 关闭清单在**父进程**枚举（/proc/self/fd 或 /dev/fd，O(打开数)、无
-    // 信号安全约束），pre_exec 只对清单逐个 close——盲扫 rlim_cur（现代
-    // 系统可达 1M+）会把每次 spawn 变成上百万次 EBADF 系统调用，并行
-    // 派发时直接把整机 CPU 打满（实测拖死服务器启动）。清单枚举不到的
-    // 兜底：盲扫但封顶 65536（原行为）。
-    let keep_fd = child_fd;
-    let inherited = open_fds();
-    let fallback_limit = fd_limit();
-    unsafe {
-        command.pre_exec(move || {
-            // 关闭其余继承 FD（父端），防泄漏/串配；保留 stdio 与通道 FD。
-            if inherited.is_empty() {
-                let mut fd: i32 = 3;
-                while fd < fallback_limit {
-                    if fd != keep_fd {
-                        libc::close(fd);
-                    }
-                    fd += 1;
-                }
-            } else {
-                for fd in &inherited {
-                    if *fd != keep_fd {
-                        libc::close(*fd);
-                    }
-                }
-            }
-            Ok(())
-        });
-    }
+    // The channel is CLOEXEC in the parent. Only the intended executor clears
+    // it in its fork child; unrelated concurrent spawns cannot inherit it.
+    crate::process::close_inherited_fds(&mut command, Some(child_fd));
     let spawned = Child::spawn_executor(&mut command)?;
     // 注意：子端副本由调用方 drop（本函数返回它以明确生命周期）。
     Ok((parent, spawned, child))
-}
-
-/// 父进程侧枚举当前打开的 FD（stdio 除外）。
-///
-/// Linux 读 /proc/self/fd，macOS 读 /dev/fd；两者都拿不到（极少数平台）
-/// 返回空表，调用方回落盲扫。枚举与 fork 之间新开的 FD 由 Rust 默认的
-/// close-on-exec 兜底——这道防线针对的是无 CLOEXEC 的继承句柄，它们在
-/// 枚举时必然已打开。
-fn open_fds() -> Vec<i32> {
-    let dir = if std::path::Path::new("/proc/self/fd").exists() {
-        "/proc/self/fd"
-    } else {
-        "/dev/fd"
-    };
-    std::fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .filter_map(|entry| entry.ok())
-                .filter_map(|entry| {
-                    entry
-                        .file_name()
-                        .to_str()
-                        .and_then(|name| name.parse::<i32>().ok())
-                })
-                .filter(|fd| *fd > 2)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// 盲扫兜底的上限（getrlimit 是 pre_exec 安全的低层调用）。
-///
-/// 封顶 65536：盲扫是 O(上限) 的 EBADF 系统调用流水，上限取 rlim_cur 的
-/// 全量（1M+）会把 spawn 拖到不可用；兜底路径只在 FD 枚举完全失效时
-/// 走到，覆盖主流范围的 65536 已优于「不关」。
-fn fd_limit() -> i32 {
-    unsafe {
-        let mut limit = libc::rlimit {
-            rlim_cur: 4096,
-            rlim_max: 4096,
-        };
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
-            let cur = if limit.rlim_cur == libc::RLIM_INFINITY {
-                65_536
-            } else {
-                limit.rlim_cur
-            };
-            cur.min(65_536) as i32
-        } else {
-            4096
-        }
-    }
 }
 
 #[cfg(test)]

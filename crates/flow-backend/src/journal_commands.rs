@@ -47,17 +47,20 @@ impl PreparedDefinition {
         self,
         backend: &JournalBackend,
         latest: Option<&DefinitionVersion>,
-    ) -> Result<(String, flow_journal::StoredValue)> {
+    ) -> Result<(
+        String,
+        flow_journal::StoredValue,
+        Option<flow_journal::value::PreparedValue>,
+    )> {
         self.require_secrets()?;
-        let stored = match latest.filter(|v| v.checksum == self.checksum) {
-            Some(version) => version.definition.clone(),
-            None => {
-                backend
-                    .store_json(self.value, flow_journal::MAX_LINE_BYTES)
-                    .await?
-            }
-        };
-        Ok((self.checksum, stored))
+        if let Some(version) = latest.filter(|v| v.checksum == self.checksum) {
+            return Ok((self.checksum, version.definition.clone(), None));
+        }
+        let prepared = backend
+            .journal
+            .prepare_json(self.value, flow_journal::MAX_LINE_BYTES)
+            .await?;
+        Ok((self.checksum, prepared.stored().clone(), Some(prepared)))
     }
     fn missing_secrets(&self) -> Vec<(String, String)> {
         flow_engine::secrets::missing_secrets(&self.parsed)
@@ -117,10 +120,8 @@ fn prepare_version(
     (value, Some(event))
 }
 
-/// 命令幂等前置检查：命中已提交回执直接返回，**不重复 store 输入值**。
-/// store_json 每次都生成新 output_id，重试若先 store 再去重，journal 里
-/// 会累积无主的值垃圾；顺序重试经此检查零垃圾（同键并发的窄窗口仍由
-/// command() 串行去重兜底）。
+/// Reuse committed receipts before preparing large input. Concurrent requests
+/// only stage anonymous files; command admission deduplicates before publication.
 async fn deduped(
     backend: &JournalBackend,
     scope: &str,
@@ -383,7 +384,7 @@ impl JournalBackend {
                     self.journal.root(),
                     self.journal.durable_lsn(),
                     &run.input,
-                    8 * 1024 * 1024,
+                    flow_journal::VALUE_BUDGET,
                 )?
             } else {
                 input
@@ -437,14 +438,7 @@ impl JournalBackend {
         decision: &str,
         request_id: &str,
     ) -> Result<CommandReceipt> {
-        if reason.trim().is_empty() || reason.len() > 4096 {
-            return Err(
-                invalid("manual resolution requires a reason of at most 4096 bytes").into(),
-            );
-        }
-        if !matches!(decision, "accept_output" | "retry" | "failed") {
-            return Err(invalid("decision must be accept_output | retry | failed").into());
-        }
+        flow_engine::journal_state::validate_adjudication(decision, reason)?;
         let request = json!({"run_id":run_id,"node_id":node_id,"operation_id":operation_id,"reason":reason,"output":output,"decision":decision});
         if let Some(receipt) = deduped(
             self,
@@ -456,19 +450,47 @@ impl JournalBackend {
         {
             return Ok(receipt);
         }
-        let output = self.store_json(output, 8 * 1024 * 1024).await?;
-        self.command_for_run(run_id, &format!("run.adjudicate:{run_id}"),Some(request_id),&request,|state|{
+        let validate = |state: &State| {
+            let run = state
+                .runs
+                .get(run_id)
+                .ok_or_else(|| flow_journal::Error::NotFound("run not found".into()))?;
+            let node = run
+                .nodes
+                .get(node_id)
+                .ok_or_else(|| invalid("node not found"))?;
+            flow_engine::journal_state::adjudicate_guard(
+                run.terminal(),
+                node,
+                operation_id,
+                decision,
+                reason,
+            )
+        };
+        if let Some(receipt) = self
+            .preflight_command(
+                &format!("run.adjudicate:{run_id}"),
+                Some(request_id),
+                &request,
+                Some(run_id),
+                validate,
+            )
+            .await?
+        {
+            return Ok(receipt);
+        }
+        let prepared = self
+            .journal
+            .prepare_json(output, flow_journal::VALUE_BUDGET)
+            .await?;
+        let output = prepared.stored().clone();
+        self.command_with_value(&format!("run.adjudicate:{run_id}"),Some(request_id),&request,Some(run_id),prepared,|state|{
             let run=state.runs.get(run_id).ok_or_else(||flow_journal::Error::NotFound("run not found".into()))?;
-            let node=run.nodes.get(node_id).ok_or_else(||invalid("node not found"))?;
             // outcome 已提交(结果被捕获、输出推导未达)的 Uncertain 节点同样
             // 允许人工收口:accept_output/failed 可用已提交证据裁决;只有
             // retry 需要未决 outcome——结果已捕获后重发授权没有意义,重派发
             // 会撞「operation already authorized」。
-            if run.terminal() || node.wait.as_ref().is_none_or(|w| w.kind() != WaitKind::Uncertain)
-                || node.operation.as_ref().is_none_or(|o|o.operation_id!=operation_id
-                    || (o.outcome.is_some() && decision == "retry")) {
-                return Err(invalid("manual resolution requires the current uncertain operation"));
-            }
+            validate(state)?;
             let event=node_event(run,node_id,EventKind::Adjudicated,json!({"operation_id":operation_id,"reason":reason,"decision":decision,"output":output}),true);
             Ok((vec![event],json!({"resolved":true,"decision":decision})))
         }).await
@@ -508,41 +530,48 @@ impl JournalBackend {
                 )
             })
             .await?;
-        let (checksum, stored) = prepared.store(self, latest.as_ref()).await?;
-        self.command("workflow.import", request_id, &request, |state| {
-            let existing = import_target(state, name)?;
-            let created = existing.is_none();
-            let workflow_id = existing.map(|w| w.workflow_id.clone()).unwrap_or_else(id);
-            let mut events = Vec::new();
-            if created {
-                events.push(Event::new(
-                    EventKind::WorkflowCreated,
-                    serde_json::to_value(Workflow {
-                        workflow_id: workflow_id.clone(),
-                        name: name.into(),
-                        created_at: now(),
-                        versions: BTreeMap::new(),
-                        deleted: false,
-                    })?,
-                ));
-            }
-            let latest = existing.and_then(|w| w.versions.last_key_value().map(|(_, v)| v));
-            let (value, event) = prepare_version(&workflow_id, latest, stored, checksum);
-            let version = value.version;
-            events.extend(event);
-            let published = value.published || publish;
-            if publish && !value.published {
-                events.push(Event::new(
-                    EventKind::WorkflowPublished,
-                    json!({"workflow_id":workflow_id,"version":version.to_string()}),
-                ));
-            }
-            Ok((
-                events,
-                json!({"workflow_id":workflow_id,"name":name,"version":version,
+        let (checksum, stored, value) = prepared.store(self, latest.as_ref()).await?;
+        self.command_selected(
+            "workflow.import",
+            request_id,
+            &request,
+            None,
+            value.into_iter().collect(),
+            |state| {
+                let existing = import_target(state, name)?;
+                let created = existing.is_none();
+                let workflow_id = existing.map(|w| w.workflow_id.clone()).unwrap_or_else(id);
+                let mut events = Vec::new();
+                if created {
+                    events.push(Event::new(
+                        EventKind::WorkflowCreated,
+                        serde_json::to_value(Workflow {
+                            workflow_id: workflow_id.clone(),
+                            name: name.into(),
+                            created_at: now(),
+                            versions: BTreeMap::new(),
+                            deleted: false,
+                        })?,
+                    ));
+                }
+                let latest = existing.and_then(|w| w.versions.last_key_value().map(|(_, v)| v));
+                let (value, event) = prepare_version(&workflow_id, latest, stored, checksum);
+                let version = value.version;
+                events.extend(event);
+                let published = value.published || publish;
+                if publish && !value.published {
+                    events.push(Event::new(
+                        EventKind::WorkflowPublished,
+                        json!({"workflow_id":workflow_id,"version":version.to_string()}),
+                    ));
+                }
+                Ok((
+                    events,
+                    json!({"workflow_id":workflow_id,"name":name,"version":version,
                 "created":created,"status":if published {"published"} else {"draft"}}),
-            ))
-        })
+                ))
+            },
+        )
         .await
     }
 
@@ -598,11 +627,13 @@ impl JournalBackend {
                 )
             })
             .await?;
-        let (checksum, stored) = prepared.store(self, latest.as_ref()).await?;
-        self.command(
+        let (checksum, stored, value) = prepared.store(self, latest.as_ref()).await?;
+        self.command_selected(
             "workflow.update",
             request_id,
             &fingerprint_request,
+            None,
+            value.into_iter().collect(),
             |state| {
                 let w = state
                     .workflows
@@ -771,7 +802,6 @@ impl JournalBackend {
             )
             .await?;
         validate_run_input(&definition, &input)?;
-        let stored = self.store_json(input, 8 * 1024 * 1024).await?;
         if let Some(execution) = &mut execution {
             execution.correlation_id = correlation_id.map(str::to_owned);
         }
@@ -806,7 +836,7 @@ impl JournalBackend {
             )
             .into());
         }
-        self.command(&scope, request_id, &request, |state| {
+        let validate = |state: &State| {
             if matches!(source, "schedule" | "webhook") {
                 let key = source_detail.ok_or_else(|| invalid("trigger identity required"))?;
                 let config = if source == "schedule" {
@@ -855,17 +885,30 @@ impl JournalBackend {
                     crate::journal::R_MAX
                 )));
             }
-            let workflow = state
+            state
                 .workflows
                 .get(workflow_id)
                 .filter(|w| !w.deleted)
                 .ok_or_else(|| flow_journal::Error::NotFound("workflow not found".into()))?;
-            let definition = workflow.versions.get(&selected).ok_or_else(|| {
-                flow_journal::Error::NotFound("workflow version not found".into())
-            })?;
-            if !definition.published {
-                return Err(invalid("version not published"));
-            }
+            // freeze_execution validated this immutable version as published.
+            // Publication is monotonic; a later publish can evict the selected
+            // version from the hot cache before this command acquires the lock.
+            // Only deletion/existence must be rechecked here, not cache residency.
+            Ok(())
+        };
+        if let Some(receipt) = self
+            .preflight_command(&scope, request_id, &request, None, &validate)
+            .await?
+        {
+            return Ok(receipt);
+        }
+        let prepared = self
+            .journal
+            .prepare_json(input, flow_journal::VALUE_BUDGET)
+            .await?;
+        let stored = prepared.stored().clone();
+        self.command_with_value(&scope, request_id, &request, None, prepared, |state| {
+            validate(state)?;
             let run_id = id();
             let run = Run {
                 run_id: run_id.clone(),
@@ -954,77 +997,70 @@ impl JournalBackend {
                 flow_engine::NodeType::HumanTask | flow_engine::NodeType::Input
             )
         });
-        let output = self.store_json(payload.clone(), 8 * 1024 * 1024).await?;
-        let adjudicated_output = self
-            .store_json(
-                payload.get("output").cloned().unwrap_or(Value::Null),
-                8 * 1024 * 1024,
+        let mut adjudication = false;
+        if let Some(receipt) = self
+            .preflight_command(
+                &format!("run.signal:{run_id}"),
+                request_id,
+                &request,
+                Some(run_id),
+                |state| {
+                    let (events, _) = signal_decision(
+                        state,
+                        run_id,
+                        node_id,
+                        &payload,
+                        request_id,
+                        accepts_inbox,
+                        &flow_journal::StoredValue::Inline(Value::Null),
+                    )?;
+                    adjudication = events
+                        .first()
+                        .is_some_and(|event| event.kind == EventKind::Adjudicated);
+                    Ok(())
+                },
             )
+            .await?
+        {
+            return Ok(receipt);
+        }
+        let value = if adjudication {
+            payload.get("output").cloned().unwrap_or(Value::Null)
+        } else {
+            payload.clone()
+        };
+        let prepared = self
+            .journal
+            .prepare_json(value, flow_journal::VALUE_BUDGET)
             .await?;
-        self.command_for_run(
-            run_id,
+        let output = prepared.stored().clone();
+        self.command_with_value(
             &format!("run.signal:{run_id}"),
             request_id,
             &request,
+            Some(run_id),
+            prepared,
             |state| {
-                let run = state
-                    .runs
-                    .get(run_id)
-                    .ok_or_else(|| flow_journal::Error::NotFound("run not found".into()))?;
-                if run.terminal() {
-                    return Err(flow_journal::Error::Conflict("run is terminal; cannot deliver signal".into()));
-                }
-                let waiting = run.nodes.get(node_id).is_some_and(|n| n.wait.as_ref().is_some_and(|w| matches!(w.kind(), WaitKind::Signal | WaitKind::Uncertain)));
-                if !waiting {
-                    if !accepts_inbox || request_id.is_none() || run.nodes.get(node_id).is_some_and(|n| matches!(n.status, flow_engine::journal_state::NodeStatus::Succeeded | flow_engine::journal_state::NodeStatus::Failed | flow_engine::journal_state::NodeStatus::Skipped)) {
-                        return Err(invalid("node does not accept a pending signal"));
-                    }
-                    if run.signals.contains_key(node_id) { return Err(flow_journal::Error::Conflict("signal already queued for node".into())); }
-                    let mut event = Event::new(EventKind::SignalReceived, json!({"payload":output,"queued":true}));
-                    event.run_id = Some(run_id.into()); event.node_id = Some(node_id.into()); event.run_seq = run.last_run_seq + 1;
-                    return Ok((vec![event], json!({"delivered":true,"status":"queued","signal_id":request_id})));
-                }
-                let node = &run.nodes[node_id];
-                if !run.terminal() && node.wait.as_ref().is_some_and(|w| w.kind() == WaitKind::Uncertain) {
-                    let operation = node.operation.as_ref()
-                        .filter(|op| op.outcome.is_none())
-                        .ok_or_else(|| invalid("current uncertain operation required"))?;
-                    let (decision, reason) = match payload["action"].as_str().unwrap_or("succeeded") {
-                        "retry" => ("retry", "manual retry via run.signal"),
-                        "failed" => ("failed", payload["error"].as_str().unwrap_or("manual failure via run.signal")),
-                        "succeeded" => ("accept_output", "manual acceptance via run.signal"),
-                        _ => return Err(invalid("action must be succeeded | failed | retry")),
-                    };
-                    if reason.trim().is_empty() || reason.len() > 4096 {
-                        return Err(invalid("manual resolution requires a reason of at most 4096 bytes"));
-                    }
-                    let event = node_event(run, node_id, EventKind::Adjudicated,
-                        json!({"operation_id":operation.operation_id,"reason":reason,"decision":decision,"output":adjudicated_output}), true);
-                    return Ok((vec![event], json!({"delivered":true,"status":"applied","signal_id":request_id})));
-                }
-                if run.terminal() || node.wait.as_ref().is_none_or(|w| w.kind() != WaitKind::Signal) {
-                    return Err(invalid("node not waiting for signal"));
-                }
-                let mut signal = node_event(
-                    run,
+                let result = signal_decision(
+                    state,
+                    run_id,
                     node_id,
-                    EventKind::SignalReceived,
-                    json!({"payload":output}),
-                    true,
-                );
-                signal.run_seq = run.last_run_seq + 1;
-                let mut resolved = node_event(
-                    run,
-                    node_id,
-                    EventKind::WaitResolved,
-                    json!({"output":output}),
-                    true,
-                );
-                resolved.run_seq = run.last_run_seq + 2;
-                Ok((
-                    vec![signal, resolved],
-                    json!({"delivered":true,"status":"applied","signal_id":request_id}),
-                ))
+                    &payload,
+                    request_id,
+                    accepts_inbox,
+                    &output,
+                )?;
+                if result
+                    .0
+                    .first()
+                    .is_some_and(|event| event.kind == EventKind::Adjudicated)
+                    != adjudication
+                {
+                    return Err(flow_journal::Error::Conflict(
+                        "signal target changed before commit".into(),
+                    ));
+                }
+                Ok(result)
             },
         )
         .await
@@ -1134,6 +1170,7 @@ fn product_decision(
             let mut value = previous
                 .cloned()
                 .unwrap_or_else(|| json!({"created_at":now()}));
+            require_object(&value)?;
             match command {
                 ProductCommand::ScheduleCreate {
                     workflow_id,
@@ -1175,7 +1212,10 @@ fn product_decision(
                     .and_then(|expr| expr.parse::<cron_parser::Schedule>().ok())
                     .and_then(|cron| cron.next_after(&chrono::Local::now()))
                     .map(|t| t.with_timezone(&chrono::Utc).to_rfc3339()));
-                value.as_object_mut().unwrap().remove("input");
+                value
+                    .as_object_mut()
+                    .ok_or_else(|| invalid("malformed config row"))?
+                    .remove("input");
                 value
             } else {
                 json!({"updated":true})
@@ -1192,6 +1232,7 @@ fn product_decision(
             let mut value = previous
                 .cloned()
                 .unwrap_or_else(|| json!({"created_at":now()}));
+            require_object(&value)?;
             match command {
                 ProductCommand::WebhookCreate { workflow_id, .. } => {
                     value["workflow_id"] = json!(workflow_id);
@@ -1223,6 +1264,7 @@ fn product_decision(
             let mut value = previous
                 .cloned()
                 .unwrap_or_else(|| json!({"created_at":now(),"category":null}));
+            require_object(&value)?;
             match command {
                 ProductCommand::TemplateUpsert {
                     name,
@@ -1251,8 +1293,14 @@ fn product_decision(
             if matches!(command, ProductCommand::TemplateDelete { .. }) {
                 return Ok((events, json!({"deleted":true})));
             }
-            value.as_object_mut().unwrap().remove("nodes");
-            value.as_object_mut().unwrap().remove("edges");
+            value
+                .as_object_mut()
+                .ok_or_else(|| invalid("malformed config row"))?
+                .remove("nodes");
+            value
+                .as_object_mut()
+                .ok_or_else(|| invalid("malformed config row"))?
+                .remove("edges");
             Ok((events, value))
         }
     }
@@ -1273,6 +1321,7 @@ fn trigger_decision(
         .get(key)
         .cloned()
         .unwrap_or_else(|| json!({"created_at":now()}));
+    require_object(&value)?;
     let object = patch
         .as_object()
         .ok_or_else(|| invalid("config must be object"))?;
@@ -1293,6 +1342,7 @@ fn trigger_event(
     } else {
         &state.webhooks
     };
+    require_object(&value)?;
     let previous = map.get(key);
     let previous_enabled = previous.is_some_and(|v| v["enabled"] == true);
     let previous_cron = previous
@@ -1369,6 +1419,7 @@ fn template_decision(
     let object = patch
         .as_object()
         .ok_or_else(|| invalid("template patch must be object"))?;
+    require_object(&value)?;
     for (k, v) in object {
         value[k] = v.clone();
     }
@@ -1383,6 +1434,7 @@ fn template_event(
     if !state.templates.contains_key(key) && state.templates.len() >= 1000 {
         return Err(flow_journal::Error::Limit("maximum 1000 templates".into()));
     }
+    require_object(&value)?;
     value["id"] = json!(key);
     if value["deleted"] != true {
         flow_engine::template::normalize(&mut value)?;
@@ -1410,7 +1462,7 @@ pub(crate) fn validate_run_input(
     input: &Value,
 ) -> flow_journal::Result<()> {
     if let Some(schema) = &definition.input_schema {
-        flow_journal::codec::bounded_json(input, 8 * 1024 * 1024)?;
+        flow_journal::codec::bounded_json(input, flow_journal::VALUE_BUDGET)?;
         flow_engine::schema::validate(schema, input)
             .map_err(|e| invalid(format!("input contract: {e}")))?;
     }
@@ -1424,6 +1476,140 @@ pub(crate) fn runtime_mismatched(run: &Run) -> bool {
             .execution
             .as_ref()
             .is_some_and(|e| e.runtime != flow_engine::RUNTIME_ID)
+}
+
+fn require_object(value: &Value) -> flow_journal::Result<()> {
+    if value.is_object() {
+        Ok(())
+    } else {
+        Err(invalid("malformed config row: expected object"))
+    }
+}
+
+fn signal_decision(
+    state: &State,
+    run_id: &str,
+    node_id: &str,
+    payload: &Value,
+    request_id: Option<&str>,
+    accepts_inbox: bool,
+    output: &flow_journal::StoredValue,
+) -> flow_journal::Result<(Vec<Event>, Value)> {
+    let run = state
+        .runs
+        .get(run_id)
+        .ok_or_else(|| flow_journal::Error::NotFound("run not found".into()))?;
+    if run.terminal() {
+        return Err(flow_journal::Error::Conflict(
+            "run is terminal; cannot deliver signal".into(),
+        ));
+    }
+    let waiting = run.nodes.get(node_id).is_some_and(|n| {
+        n.wait
+            .as_ref()
+            .is_some_and(|w| matches!(w.kind(), WaitKind::Signal | WaitKind::Uncertain))
+    });
+    if !waiting {
+        if !accepts_inbox
+            || request_id.is_none()
+            || run.nodes.get(node_id).is_some_and(|n| {
+                matches!(
+                    n.status,
+                    flow_engine::journal_state::NodeStatus::Succeeded
+                        | flow_engine::journal_state::NodeStatus::Failed
+                        | flow_engine::journal_state::NodeStatus::Skipped
+                )
+            })
+        {
+            return Err(invalid("node does not accept a pending signal"));
+        }
+        if run.signals.contains_key(node_id) {
+            return Err(flow_journal::Error::Conflict(
+                "signal already queued for node".into(),
+            ));
+        }
+        let mut event = Event::new(
+            EventKind::SignalReceived,
+            json!({"payload":output,"queued":true}),
+        );
+        event.run_id = Some(run_id.into());
+        event.node_id = Some(node_id.into());
+        event.run_seq = run.last_run_seq + 1;
+        return Ok((
+            vec![event],
+            json!({"delivered":true,"status":"queued","signal_id":request_id}),
+        ));
+    }
+    let node = &run.nodes[node_id];
+    if !run.terminal()
+        && node
+            .wait
+            .as_ref()
+            .is_some_and(|w| w.kind() == WaitKind::Uncertain)
+    {
+        let operation = node
+            .operation
+            .as_ref()
+            .filter(|op| op.outcome.is_none())
+            .ok_or_else(|| invalid("current uncertain operation required"))?;
+        let (decision, reason) = match payload["action"].as_str().unwrap_or("succeeded") {
+            "retry" => ("retry", "manual retry via run.signal"),
+            "failed" => (
+                "failed",
+                payload["error"]
+                    .as_str()
+                    .unwrap_or("manual failure via run.signal"),
+            ),
+            "succeeded" => ("accept_output", "manual acceptance via run.signal"),
+            _ => return Err(invalid("action must be succeeded | failed | retry")),
+        };
+        flow_engine::journal_state::adjudicate_guard(
+            run.terminal(),
+            node,
+            &operation.operation_id,
+            decision,
+            reason,
+        )?;
+        let event = node_event(
+            run,
+            node_id,
+            EventKind::Adjudicated,
+            json!({"operation_id":operation.operation_id,"reason":reason,"decision":decision,"output":output}),
+            true,
+        );
+        return Ok((
+            vec![event],
+            json!({"delivered":true,"status":"applied","signal_id":request_id}),
+        ));
+    }
+    if run.terminal()
+        || node
+            .wait
+            .as_ref()
+            .is_none_or(|w| w.kind() != WaitKind::Signal)
+    {
+        return Err(invalid("node not waiting for signal"));
+    }
+    let mut signal = node_event(
+        run,
+        node_id,
+        EventKind::SignalReceived,
+        json!({"payload":output}),
+        true,
+    );
+    signal.run_seq = run.last_run_seq + 1;
+    let mut resolved = node_event(
+        run,
+        node_id,
+        EventKind::WaitResolved,
+        json!({"output":output}),
+        true,
+    );
+    resolved.run_seq = run.last_run_seq + 2;
+    Ok((
+        vec![signal, resolved],
+        json!({"delivered":true,"status":"applied","signal_id":request_id}),
+    ))
 }
 
 #[cfg(test)]
@@ -1494,5 +1680,73 @@ mod runtime_mismatch_tests {
         let mut legacy = waiting_run(&stale);
         legacy.execution = None;
         assert!(!runtime_mismatched(&legacy));
+    }
+}
+
+#[cfg(test)]
+mod atomic_command_tests {
+    use super::*;
+    #[tokio::test]
+    async fn cancellation_between_preflight_and_signal_commit_publishes_no_chunks() {
+        let dir = flow_test_support::io::TempDir::new("atomic-signal-rejection");
+        let b = JournalBackend::open(dir.path(), Default::default())
+            .await
+            .unwrap();
+        let wf=b.workflow_import("atomic",json!({"semantics":2,"nodes":[{"id":"s","type":"start"},{"id":"n","type":"human_task"},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"n"},{"from":"n","to":"e"}]}),true,None).await.unwrap();
+        let started = b
+            .run_start(
+                wf.result["workflow_id"].as_str().unwrap(),
+                None,
+                Value::Null,
+                "manual",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let run = started.result["run_id"].as_str().unwrap();
+        let payload = json!({"large":"x".repeat(700_000)});
+        let request = json!({"run_id":run,"node_id":"n","payload":payload});
+        let validate = |state: &State| {
+            signal_decision(
+                state,
+                run,
+                "n",
+                &payload,
+                Some("race"),
+                true,
+                &flow_journal::StoredValue::Inline(Value::Null),
+            )
+            .map(|_| ())
+        };
+        assert!(b
+            .preflight_command("run.signal", Some("race"), &request, Some(run), validate)
+            .await
+            .unwrap()
+            .is_none());
+        let prepared = b
+            .journal
+            .prepare_json(payload.clone(), flow_journal::VALUE_BUDGET)
+            .await
+            .unwrap();
+        let output = prepared.stored().clone();
+        b.run_cancel(run, None).await.unwrap();
+        assert!(b
+            .command_with_value(
+                "run.signal",
+                Some("race"),
+                &request,
+                Some(run),
+                prepared,
+                |state| signal_decision(state, run, "n", &payload, Some("race"), true, &output)
+            )
+            .await
+            .is_err());
+        let conn = flow_journal::sqlite::read_connection(dir.path()).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM value_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        b.close().await.unwrap();
     }
 }

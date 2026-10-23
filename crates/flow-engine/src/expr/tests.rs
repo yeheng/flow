@@ -48,7 +48,7 @@ fn bounded_script_memory_bomb_fails_instead_of_oom() {
     // 生产 driver 路径已切到 _bounded 变体：分配炸弹必须在 JS 堆限内
     // 失败，而不是吃光宿主进程内存（32 MiB 堆限，翻倍 25 次即触顶）。
     let (input, nodes) = ctx();
-    let err = eval_body_bounded(
+    let err = eval_body(
         "var s = 'x'; while (true) { s += s; } return s;",
         &input,
         &nodes,

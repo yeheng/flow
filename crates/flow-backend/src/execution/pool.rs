@@ -341,6 +341,12 @@ async fn session_driver(
         }
     }
     // 回收：宽限期收尾（尽力 Stopped/迟到审计）→ kill → wait/reap。
+    // No dispatch owns this event stream after coordinator shutdown. There is
+    // nobody left to persist late audit, so waiting for idle heartbeats cannot
+    // improve durability; close the channel and reap immediately.
+    if event_tx.is_closed() {
+        transport.close();
+    }
     let grace = Duration::from_millis(DRAIN_GRACE_MS);
     let _ = tokio::time::timeout(grace, async {
         while let Ok(message) = transport.recv().await {

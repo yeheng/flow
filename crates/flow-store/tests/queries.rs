@@ -20,7 +20,7 @@ async fn write(j: &Journal, rows: Vec<EntityChange>) {
 }
 fn run(id: &str, time: &str, workflow: &str, status: &str) -> EntityChange {
     EntityChange {
-        kind: "run".into(),
+        kind: flow_journal::sqlite::EntityKind::Run,
         key: id.into(),
         value: Some(
             json!({"run_id":id,"created_at":time,"workflow_id":workflow,"status":status,"source":"manual","nodes":{}}),
@@ -134,7 +134,7 @@ async fn aggregate_response_budget_returns_a_typed_limit() {
         write(
             &j,
             vec![EntityChange {
-                kind: "template".into(),
+                kind: flow_journal::sqlite::EntityKind::Template,
                 key: format!("t{index}"),
                 value: Some(json!({"id":format!("t{index}"),"nodes":["x".repeat(1024*1024)]})),
             }],
@@ -148,4 +148,52 @@ async fn aggregate_response_budget_returns_a_typed_limit() {
     ));
     store.close().await;
     j.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn list_budget_keeps_a_contiguous_prefix_and_cursor_pagination() {
+    let dir = flow_test_support::io::TempDir::new("list-budget");
+    let j = Journal::open(dir.path(), Default::default()).await.unwrap();
+    for key in ["a", "b", "c", "d", "e"] {
+        write(
+            &j,
+            vec![EntityChange {
+                kind: flow_journal::sqlite::EntityKind::Template,
+                key: key.into(),
+                value: Some(json!({"id": key, "padding": "x".repeat(1_100_000)})),
+            }],
+        )
+        .await;
+    }
+    let store = Store::open(&dir.join("flow.sqlite"), j.id()).await.unwrap();
+    let (_, first) = store.list("template", "", 256).await.unwrap();
+    assert_eq!(
+        first
+            .iter()
+            .map(|v| v["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["a", "b", "c"]
+    );
+    let (_, second) = store.list("template", "c", 256).await.unwrap();
+    assert_eq!(
+        second
+            .iter()
+            .map(|v| v["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["d", "e"]
+    );
+    assert!(store.list("template", "", 0).await.unwrap().1.is_empty());
+    store.close().await;
+    j.close().await.unwrap();
+}
+
+#[test]
+fn entity_kind_rejects_unknown_namespace_and_keeps_existing_wire_names() {
+    assert!(
+        serde_json::from_value::<EntityChange>(json!({"kind":"rn","key":"r","value":null}))
+            .is_err()
+    );
+    let row: EntityChange =
+        serde_json::from_value(json!({"kind":"run_node","key":"r","value":null})).unwrap();
+    assert_eq!(serde_json::to_value(row).unwrap()["kind"], "run_node");
 }

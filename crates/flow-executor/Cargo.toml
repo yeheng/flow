@@ -5,7 +5,7 @@ edition.workspace = true
 
 [dependencies]
 flow-engine = { path = "../flow-engine" }
-flow-journal = { path = "../flow-journal" }
+flow-journal = { path = "../flow-journal", default-features = false, features = ["storage"] }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde = { workspace = true }

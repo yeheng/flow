@@ -11,7 +11,7 @@ journal-cluster = ["sqlx/postgres", "sqlx/json"]
 fault-injection = []
 
 [dependencies]
-flow-journal = { path = "../flow-journal" }
+flow-journal = { path = "../flow-journal", default-features = false, features = ["storage"] }
 reqwest.workspace = true
 sha2.workspace = true
 hex.workspace = true

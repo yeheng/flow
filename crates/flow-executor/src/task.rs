@@ -68,6 +68,9 @@ impl From<serde_json::Error> for TaskError {
 pub enum TaskEnd {
     /// ResultCommitted 已收到：槽位可复用。
     Committed,
+    /// Agent hosts mutate process-wide state and can spawn tool descendants.
+    /// Commit normally, then retire the entire managed executor session.
+    CommittedRecycle,
     /// 取消/失败/通道断开：尽力封口后进程应退出，槽位整体回收。
     Recycle,
 }
@@ -113,8 +116,10 @@ impl TaskRunner {
         }
     }
     pub async fn run(mut self) -> TaskEnd {
+        let agent = self.node_is_agent_mode();
         let result = self.execute().await;
         match result {
+            Ok(()) if agent => TaskEnd::CommittedRecycle,
             Ok(()) => TaskEnd::Committed,
             Err(error) => {
                 tracing::warn!(dispatch = %self.dispatch_id, %error, "executor task stopped");
@@ -1366,18 +1371,18 @@ impl TaskRunner {
     /// mode 是否为 agent。`mode` 是保存期校验过的字面量（禁止模板），
     /// 原始节点参数即可判定，不需要等模板展开。
     fn node_is_agent_mode(&self) -> bool {
-        self.task
-            .node
-            .get("params")
-            .and_then(|params| params.get("mode"))
-            .and_then(Value::as_str)
-            .is_some_and(|mode| mode.trim() == "agent")
+        self.task.node["type"] == "harness"
+            && self
+                .task
+                .node
+                .get("params")
+                .and_then(|params| params.get("mode"))
+                .and_then(Value::as_str)
+                .is_some_and(|mode| mode.trim() == "agent")
     }
 
-    /// harness agent 模式：内置 flow-harness-agent runner 子进程。授权 /
-    /// Outcome / 恢复 / 回归与 command 模式同一条骨架；差异是请求构造
-    /// （冻结配置 + 密钥名）、runner 环境（临时根 + 非敏感 `CONGA_*`）
-    /// 与输出派生（附 agent 元数据）。
+    /// 内联 harness agent。沿用统一授权、Outcome 与回归协议；本次任务
+    /// 完成后回收整个 executor，不复用 host 的全局状态或工具后代。
     async fn agent_node(
         &mut self,
         params: &Value,
@@ -1441,7 +1446,14 @@ impl TaskRunner {
             None => None,
         };
         let credential = self.authorize_operation(request).await?;
-        let started = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        // Independent of Tokio progress and heartbeats. If synchronous host code
+        // blocks the runtime, the managed process still exits within a bounded grace.
+        let _watchdog = flow_engine::process::AgentWatchdog::start(
+            Duration::from_millis(timeout_ms),
+            self.cancel.clone(),
+        )
+        .map_err(|error| TaskError::Uncertain(format!("agent watchdog unavailable: {error}")))?;
         let roots =
             std::env::temp_dir().join(format!("flow-harness-{}", uuid::Uuid::now_v7().simple()));
         // prompt/密钥不进日志：只记模型、工作目录与超时（缺省时目录是临时
@@ -1485,32 +1497,35 @@ impl TaskRunner {
                 )
                 .await;
         };
-        let result = self
-            .agent_run(
+        let cancel = self.cancel.clone();
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(TaskError::Uncertain("harness agent cancelled; result incomplete".into())),
+            result = tokio::time::timeout_at(deadline, self.agent_run(
                 &config,
                 &agent_params.prompt,
                 &api_key,
                 &workdir,
-                timeout_ms,
                 &roots,
                 audit,
                 logger,
-            )
-            .await;
+            )) => result.unwrap_or_else(|_| Err(TaskError::Uncertain(
+                "harness agent lifecycle deadline exceeded; result incomplete".into(),
+            ))),
+        };
         // 成功/失败/超时/取消都收走临时根；Windows 上文件锁可能让删除失败，
         // 重试一次，仍失败交给 OS 的 tmp 清理兜底。
         if std::fs::remove_dir_all(&roots).is_err() {
-            std::thread::sleep(Duration::from_millis(100));
+            tokio::time::sleep(Duration::from_millis(100)).await;
             let _ = std::fs::remove_dir_all(&roots);
         }
-        let _ = started;
         result
     }
 
     /// 授权后的内联执行段：直接调用 conga-host 的 headless 装配（无
     /// runner 子进程、无 stdin/stdout 协议）。确定性失败（临时根不可建、
-    /// 装配失败）落封闭 outcome；超时/取消传播 Uncertain（取消先给协作
-    /// 中止一个短窗，工具边界响应信号后收尾）。
+    /// 装配失败）落封闭 outcome；调用方统一约束总截止时间与取消。
+    /// 超时/取消传播 Uncertain，随后回收整个执行器会话。
     #[allow(clippy::too_many_arguments)]
     async fn agent_run(
         &mut self,
@@ -1518,7 +1533,6 @@ impl TaskRunner {
         prompt: &str,
         api_key: &str,
         workdir: &std::path::Path,
-        timeout_ms: u64,
         roots: &std::path::Path,
         audit: &mut AuditStream,
         logger: &flow_engine::NodeLogger,
@@ -1560,44 +1574,13 @@ impl TaskRunner {
             }
         };
         let session_id = session.host.session().current_id();
-        // 取消/超时语义：先走 conga 的协作中止（工具边界响应），给短窗
-        // 收尾；仍未完成 → Uncertain（无 outcome）。Host drop 时
-        // kill_on_drop 回收工具直接子进程；孙进程依赖执行器会话级回收
-        // （执行器退出时整会话收割，见 EXECUTION.md）。
-        let turn = {
-            let run = session.host.run_turn(prompt, |_| {});
-            tokio::pin!(run);
-            let outcome = tokio::select! {
-                biased;
-                _ = self.cancel.cancelled() => {
-                    session.host.signal().cancel();
-                    match tokio::time::timeout(Duration::from_secs(5), &mut run).await {
-                        Ok(Ok(summary)) => Ok(summary),
-                        _ => Err(TaskError::Uncertain(
-                            "harness agent cancelled; result incomplete".into(),
-                        )),
-                    }
-                }
-                result = tokio::time::timeout(
-                    Duration::from_millis(timeout_ms),
-                    &mut run,
-                ) => match result {
-                    Ok(inner) => Ok(inner.map_err(|error| TaskError::Uncertain(
-                        format!("harness agent turn failed: {error}"),
-                    ))?),
-                    Err(_) => {
-                        session.host.signal().cancel();
-                        let _ = tokio::time::timeout(Duration::from_secs(5), &mut run).await;
-                        Err(TaskError::Uncertain(
-                            "harness agent deadline exceeded; result incomplete".into(),
-                        ))
-                    }
-                },
-            };
-            outcome
-        };
+        // The caller bounds assembly, the turn, cleanup and outcome publication
+        // with one deadline. Dropping this future is always followed by retiring
+        // the entire executor session, including tool process groups.
+        let turn = session.host.run_turn(prompt, |_| {}).await;
         conga_host::session_cleanup::cleanup_session_resources(&session_id).await;
-        let summary = turn?;
+        let summary = turn
+            .map_err(|error| TaskError::Uncertain(format!("harness agent turn failed: {error}")))?;
         let parsed = crate::agent_summary::summarize(&summary);
         logger.info(format!(
             "← agent {}（{}ms，{} turns）",
@@ -1942,9 +1925,6 @@ fn elapsed_label(elapsed: Duration) -> String {
         format!("{:.1}s", elapsed.as_secs_f64())
     }
 }
-
-#[allow(dead_code)]
-fn unused() {}
 
 /// Capture all three pipes concurrently under one deadline. Partial output is never success.
 async fn capture_harness(

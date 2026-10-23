@@ -32,6 +32,7 @@ flow-rpc = { path = "../flow-rpc" }
 backend-e2e = { path = "../backend-e2e" }
 
 flow-config = { path = "../flow-config" }
+flow-test-support = { path = "../flow-test-support" }
 rustls = { workspace = true }
 
 [[bin]]
@@ -47,6 +48,8 @@ path = "../flow-backend"
 path = "../flow-engine"
 [dependencies.flow-journal]
 path = "../flow-journal"
+default-features = false
+features = ["storage"]
 [dependencies.sqlx]
 workspace = true
 [dependencies.libc]

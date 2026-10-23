@@ -65,6 +65,10 @@ impl IpcDispatcher {
         Self { pool }
     }
 
+    pub(crate) async fn shutdown(&self) {
+        self.pool.shutdown().await;
+    }
+
     /// 预热 `count` 个空闲执行器。仅协调器任务在开始调度前调用；
     /// 失败由调用方降级为首次派发懒加载（见 [`ExecutorPool::prewarm`]）。
     pub(crate) async fn prewarm(
@@ -102,7 +106,10 @@ impl IpcDispatcher {
         self.pool
             .release(
                 lease,
-                outcome.is_ok() && runner.session_healthy && !runner.cancel_sent,
+                outcome.is_ok()
+                    && runner.session_healthy
+                    && !runner.cancel_sent
+                    && !node.is_harness_agent(),
             )
             .await;
         outcome
@@ -212,7 +219,7 @@ pub mod fault {
     pub async fn checkpoint_for(_name: &str, _node: &str) {}
 }
 
-const OPERATION_TRANSFER_LIMIT: u64 = 8 * 1024 * 1024;
+const OPERATION_TRANSFER_LIMIT: u64 = flow_journal::VALUE_BUDGET as u64;
 const OPERATION_TRANSFER_COUNT: usize = 16;
 
 struct OpTransfer {
@@ -250,6 +257,9 @@ pub(crate) struct DispatchRunner {
     /// 连续空闲超时次数（远程链路）：首次按失联走 Resume 对账，第二次
     /// 硬失败——防「静默执行器 ↔ 重挂」无限循环占用槽位。
     idle_strikes: u32,
+    /// Parent-side lifecycle bound, retained across remote reconnects. Heartbeats
+    /// cannot extend it. The operation request replaces the preparation bound.
+    agent_deadline: Option<tokio::time::Instant>,
 }
 
 impl DispatchRunner {
@@ -259,6 +269,12 @@ impl DispatchRunner {
         predecessors: BTreeMap<String, StoredValue>,
         observations: Option<ObservationStore>,
     ) -> Self {
+        let agent_deadline = node.is_harness_agent().then(|| {
+            tokio::time::Instant::now()
+                + Duration::from_millis(
+                    flow_engine::exec::HARNESS_TIMEOUT_MAX_MS + 2 * DURABLE_WAIT_TIMEOUT_MS,
+                )
+        });
         Self {
             attempt,
             node,
@@ -275,6 +291,7 @@ impl DispatchRunner {
             task_attempt: 1,
             remote_replay: false,
             idle_strikes: 0,
+            agent_deadline,
         }
     }
 
@@ -578,7 +595,13 @@ impl DispatchRunner {
                                 s.runs.get(&run_id).is_none_or(|run| run.terminal())
                             })
                             .await;
-                        if terminal {
+                        let deadline_exceeded = self.agent_deadline
+                            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline);
+                        if terminal || deadline_exceeded {
+                            if deadline_exceeded {
+                                tracing::warn!(dispatch = %self.attempt.dispatch_id,
+                                    "agent lifecycle deadline reached; draining executor");
+                            }
                             self.cancel_sent = true;
                             self.cancel_sent_at = Some(tokio::time::Instant::now());
                             self.session_healthy = false; // 取消后进程整体回收
@@ -1042,28 +1065,17 @@ impl DispatchRunner {
                 let upper = self.attempt.backend.journal.durable_lsn();
                 let params = prepared.params.clone();
                 let params = tokio::task::spawn_blocking(move || {
-                    flow_journal::value::materialize(&root, upper, &params, 8 * 1024 * 1024)
+                    flow_journal::value::materialize(
+                        &root,
+                        upper,
+                        &params,
+                        flow_journal::VALUE_BUDGET,
+                    )
                 })
                 .await
                 .map_err(|e| invalid(e.to_string()))??;
                 params.get("input_mapping").cloned()
             }
-        };
-        let input = if let Some(mapping) = input_mapping {
-            let bytes = flow_journal::codec::bounded_json(&mapping, 8 * 1024 * 1024)?;
-            if bytes.len() <= flow_journal::INLINE_BYTES {
-                StoredValue::Inline(mapping)
-            } else {
-                let mut reader = bytes.as_slice();
-                StoredValue::Ref(
-                    self.attempt
-                        .backend
-                        .store_stream(&mut reader, ValueCodec::Json)
-                        .await?,
-                )
-            }
-        } else {
-            prepared.input.clone()
         };
         let backend = self.attempt.backend.clone();
         let frozen = backend
@@ -1077,23 +1089,39 @@ impl DispatchRunner {
                 &frozen.definition,
             )
             .await?;
-        if definition.input_schema.is_some() {
-            let root = backend.journal.root().to_path_buf();
-            let upper = backend.journal.durable_lsn();
-            let value = input.clone();
-            let actual = tokio::task::spawn_blocking(move || {
-                flow_journal::value::materialize(&root, upper, &value, 8 * 1024 * 1024)
-            })
-            .await
-            .map_err(|e| invalid(e.to_string()))??;
-            crate::journal_commands::validate_run_input(&definition, &actual)?;
-        }
+        let (input, staged) = if let Some(mapping) = input_mapping {
+            crate::journal_commands::validate_run_input(&definition, &mapping)?;
+            let value = backend
+                .journal
+                .prepare_json(mapping, flow_journal::VALUE_BUDGET)
+                .await?;
+            (value.stored().clone(), Some(value))
+        } else {
+            let input = prepared.input.clone();
+            if definition.input_schema.is_some() {
+                let root = backend.journal.root().to_path_buf();
+                let upper = backend.journal.durable_lsn();
+                let value = input.clone();
+                let actual = tokio::task::spawn_blocking(move || {
+                    flow_journal::value::materialize(
+                        &root,
+                        upper,
+                        &value,
+                        flow_journal::VALUE_BUDGET,
+                    )
+                })
+                .await
+                .map_err(|e| invalid(e.to_string()))??;
+                crate::journal_commands::validate_run_input(&definition, &actual)?;
+            }
+            (input, None)
+        };
         let run_id = self.attempt.run_id.clone();
         let node_id = self.attempt.node_id.clone();
         let dispatch_id = self.attempt.dispatch_id.clone();
         let workflow_id = workflow_id.to_string();
         backend
-            .internal_for_run(&self.attempt.run_id, move |state| {
+            .internal_for_run_with_value(&self.attempt.run_id, staged, move |state| {
                 let parent = &state.runs[&run_id];
                 if parent.terminal() {
                     return Err(fj("parent terminal"));
@@ -1314,6 +1342,18 @@ impl DispatchRunner {
                 fault::checkpoint("permit_send:before").await;
                 let request_value: Value =
                     serde_json::from_slice(&request_bytes).unwrap_or(Value::Null);
+                if self.node.is_harness_agent() {
+                    let timeout = request_value["timeout_ms"]
+                        .as_u64()
+                        .unwrap_or(flow_engine::exec::DEFAULT_HARNESS_TIMEOUT_MS)
+                        .clamp(1, flow_engine::exec::HARNESS_TIMEOUT_MAX_MS);
+                    self.agent_deadline = Some(
+                        tokio::time::Instant::now()
+                            + Duration::from_millis(
+                                timeout + flow_engine::execution_protocol::contract::DRAIN_GRACE_MS,
+                            ),
+                    );
+                }
                 let credential = request_value["credential"]["secret_ref"]
                     .as_str()
                     .and_then(flow_engine::secrets::get_secret)

@@ -207,6 +207,99 @@ impl Publications {
     }
 }
 
+/// A command-local value. Large JSON stays in an anonymous, delete-on-close
+/// file until the writer commits it with the command in one SQLite transaction.
+#[cfg(feature = "storage")]
+pub struct PreparedValue {
+    stored: StoredValue,
+    staged: Option<StagedValue>,
+}
+#[cfg(feature = "storage")]
+pub struct StagedValue {
+    reference: ValueRef,
+    file: std::fs::File,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+#[cfg(feature = "storage")]
+impl PreparedValue {
+    pub(crate) fn json(
+        journal_id: &str,
+        value: Value,
+        limit: usize,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<Self> {
+        use std::io::{Seek, SeekFrom};
+        let bytes = bounded_json(&value, limit)?;
+        if bytes.len() <= INLINE_BYTES {
+            return Ok(Self {
+                stored: StoredValue::Inline(value),
+                staged: None,
+            });
+        }
+        let reference = ValueRef {
+            journal_id: journal_id.into(),
+            output_id: uuid::Uuid::now_v7().to_string(),
+            codec: ValueCodec::Json,
+            version: 1,
+            chunk_count: bytes.len().div_ceil(CHUNK_BYTES) as u64,
+            total_bytes: bytes.len() as u64,
+            digest: crate::codec::digest(&bytes),
+        };
+        reference.validate()?;
+        let mut file = tempfile::tempfile()?;
+        file.write_all(&bytes)?;
+        file.seek(SeekFrom::Start(0))?;
+        Ok(Self {
+            stored: StoredValue::Ref(reference.clone()),
+            staged: Some(StagedValue {
+                reference,
+                file,
+                _permit: permit,
+            }),
+        })
+    }
+    pub fn stored(&self) -> &StoredValue {
+        &self.stored
+    }
+    pub fn into_staged(self) -> Option<StagedValue> {
+        self.staged
+    }
+}
+#[cfg(feature = "storage")]
+impl StagedValue {
+    pub fn publication(&self) -> Result<Event> {
+        Ok(Event::new(
+            EventKind::ValuePublished,
+            serde_json::to_value(&self.reference)?,
+        ))
+    }
+    pub fn chunk_count(&self) -> u64 {
+        self.reference.chunk_count
+    }
+    /// Metadata is sufficient for reducer preview and apply: raw chunk bytes
+    /// are validated by the writer and rehydrated only by journal readers.
+    pub fn prefix(&self, first_lsn: u64) -> Vec<crate::Transaction> {
+        (0..self.reference.chunk_count).map(|index| crate::Transaction {
+            v: 2, journal_id: self.reference.journal_id.clone(), lsn: first_lsn + index,
+            tx_id: uuid::Uuid::now_v7().to_string(),
+            events: vec![Event::new(EventKind::ValueChunk, serde_json::json!({
+                "output_id":self.reference.output_id, "chunk_index":index.to_string(), "data":null,
+            }))],
+        }).collect()
+    }
+    pub(crate) fn read_chunk(&mut self, index: u64) -> Result<Chunk> {
+        let expected = (self.reference.total_bytes - index * CHUNK_BYTES as u64)
+            .min(CHUNK_BYTES as u64) as usize;
+        let mut bytes = vec![0; expected];
+        self.file.read_exact(&mut bytes)?;
+        Ok(Chunk {
+            output_id: self.reference.output_id.clone(),
+            chunk_index: index,
+            data: STANDARD.encode(bytes),
+        })
+    }
+}
+
 /// Scan only this object's chunks. Memory is bounded by one transaction and one raw chunk.
 /// A candidate may be checked before publication; consumers must set require_published=true.
 /// Bytes can be delivered before the final checksum: callers must abort their stream on error.

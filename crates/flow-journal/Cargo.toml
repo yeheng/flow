@@ -4,8 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = ["storage"]
-storage = ["dep:rusqlite", "dep:fs2", "dep:clap"]
+default = ["cli"]
+storage = ["dep:rusqlite", "dep:fs2", "dep:tempfile"]
+cli = ["storage", "dep:clap"]
 
 [dependencies]
 tokio.workspace = true
@@ -22,5 +23,12 @@ clap = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
 chrono.workspace = true
 
-[dev-dependencies]
-tempfile.workspace = true
+tempfile = { workspace = true, optional = true }
+
+[[bin]]
+name = "flow-journal-tool"
+required-features = ["cli"]
+
+[[bin]]
+name = "flow-journal-bench"
+required-features = ["cli"]

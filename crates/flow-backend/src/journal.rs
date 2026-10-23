@@ -163,6 +163,19 @@ impl JournalBackend {
         self.refresh_locked(&mut committed).await?;
         let mut state = committed.state.clone();
         let upper = state.applied_lsn;
+        // Explicit diagnostic export may assemble history; normal recovery and
+        // command decisions retain only the two hot versions per workflow.
+        for (id, workflow) in &mut state.workflows {
+            if let Some(row) = self
+                .store
+                .get("workflow", id)
+                .await
+                .map_err(|e| JournalError::Storage(e.to_string()))?
+                .1
+            {
+                *workflow = serde_json::from_value(row)?;
+            }
+        }
         let mut after = String::new();
         loop {
             let keys = self
@@ -283,6 +296,59 @@ impl JournalBackend {
         Ok(read(&committed.state)?)
     }
 
+    /// Read a historical definition without growing the coordinator's hot state.
+    pub(crate) async fn definition_version(
+        &self,
+        workflow: &str,
+        version: Option<u64>,
+    ) -> Result<Option<flow_engine::journal_state::DefinitionVersion>> {
+        let mut committed = self.state.lock().await;
+        self.refresh_locked(&mut committed).await?;
+        let Some(metadata) = committed.state.workflows.get(workflow) else {
+            return Ok(None);
+        };
+        let Some(version) = version.or_else(|| metadata.versions.last_key_value().map(|(v, _)| *v))
+        else {
+            return Ok(None);
+        };
+        if let Some(hit) = metadata.versions.get(&version) {
+            return Ok(Some(hit.clone()));
+        }
+        self.store
+            .current_at(
+                "workflow_version",
+                &crate::journal_history::version_key(workflow, version)?,
+                committed.state.applied_lsn,
+            )
+            .await
+            .map_err(|e| JournalError::Storage(e.to_string()))?
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(JournalError::from)
+    }
+
+    pub(crate) async fn definition_versions(
+        &self,
+        workflow: &str,
+    ) -> Result<Vec<flow_engine::journal_state::DefinitionVersion>> {
+        // Store::get assembles versions in one bounded SQLite read transaction.
+        // Historical UI reads must not hold the coordinator's decision lock.
+        let row = self
+            .store
+            .get("workflow", workflow)
+            .await
+            .map_err(|error| match error {
+                flow_store::store::Error::ResponseTooLarge => {
+                    JournalError::Journal(flow_journal::Error::Limit("RESPONSE_TOO_LARGE".into()))
+                }
+                other => JournalError::Storage(other.to_string()),
+            })?
+            .1
+            .ok_or_else(|| flow_journal::Error::NotFound("workflow not found".into()))?;
+        let workflow: flow_engine::journal_state::Workflow = serde_json::from_value(row)?;
+        Ok(workflow.versions.into_values().rev().collect())
+    }
+
     /// 取（或首次物化并缓存）某 run 的已校验 definition。definition 随
     /// run 钉死版本、创建后不可变——每个 run 只物化一次；终态由调度循环
     /// 调 [`Self::evict_definition`] 逐出。物化/校验失败不缓存，瞬时故障
@@ -327,17 +393,26 @@ impl JournalBackend {
         id: &str,
         decide: impl FnOnce(&State) -> flow_journal::Result<(Vec<Event>, T)>,
     ) -> Result<T> {
-        self.internal_selected(Some(id), decide).await
+        self.internal_selected(Some(id), None, decide).await
     }
     pub(crate) async fn internal<T>(
         &self,
         decide: impl FnOnce(&State) -> flow_journal::Result<(Vec<Event>, T)>,
     ) -> Result<T> {
-        self.internal_selected(None, decide).await
+        self.internal_selected(None, None, decide).await
+    }
+    pub(crate) async fn internal_for_run_with_value<T>(
+        &self,
+        id: &str,
+        value: Option<flow_journal::value::PreparedValue>,
+        decide: impl FnOnce(&State) -> flow_journal::Result<(Vec<Event>, T)>,
+    ) -> Result<T> {
+        self.internal_selected(Some(id), value, decide).await
     }
     async fn internal_selected<T>(
         &self,
         selected: Option<&str>,
+        value: Option<flow_journal::value::PreparedValue>,
         decide: impl FnOnce(&State) -> flow_journal::Result<(Vec<Event>, T)>,
     ) -> Result<T> {
         let mut committed = self.state.lock().await;
@@ -345,9 +420,17 @@ impl JournalBackend {
         self.load_selected(&mut committed.state, selected).await?;
         let decision = decide(&committed.state);
         crate::journal_history::trim(&mut committed.state);
-        let (events, result) = decision?;
+        let (mut events, result) = decision?;
         if !events.is_empty() {
-            self.commit_locked(&mut committed, events).await?;
+            let values: Vec<_> = value
+                .and_then(|value| value.into_staged())
+                .into_iter()
+                .collect();
+            for value in &values {
+                events.insert(0, value.publication()?);
+            }
+            self.commit_values_locked(&mut committed, events, values)
+                .await?;
         }
         Ok(result)
     }
@@ -361,7 +444,7 @@ impl JournalBackend {
         request: &Value,
         decide: impl FnOnce(&State) -> flow_journal::Result<(Vec<Event>, Value)>,
     ) -> Result<CommandReceipt> {
-        self.command_selected(scope, request_id, request, None, decide)
+        self.command_selected(scope, request_id, request, None, Vec::new(), decide)
             .await
     }
     pub(crate) async fn command_for_run(
@@ -372,15 +455,28 @@ impl JournalBackend {
         request: &Value,
         decide: impl FnOnce(&State) -> flow_journal::Result<(Vec<Event>, Value)>,
     ) -> Result<CommandReceipt> {
-        self.command_selected(scope, request_id, request, Some(run_id), decide)
+        self.command_selected(scope, request_id, request, Some(run_id), Vec::new(), decide)
             .await
     }
-    async fn command_selected(
+    pub(crate) async fn command_with_value(
         &self,
         scope: &str,
         request_id: Option<&str>,
         request: &Value,
         selected: Option<&str>,
+        value: flow_journal::value::PreparedValue,
+        decide: impl FnOnce(&State) -> flow_journal::Result<(Vec<Event>, Value)>,
+    ) -> Result<CommandReceipt> {
+        self.command_selected(scope, request_id, request, selected, vec![value], decide)
+            .await
+    }
+    pub(crate) async fn command_selected(
+        &self,
+        scope: &str,
+        request_id: Option<&str>,
+        request: &Value,
+        selected: Option<&str>,
+        values: Vec<flow_journal::value::PreparedValue>,
         decide: impl FnOnce(&State) -> flow_journal::Result<(Vec<Event>, Value)>,
     ) -> Result<CommandReceipt> {
         validate_command_identity(scope, request_id)?;
@@ -401,6 +497,7 @@ impl JournalBackend {
             }
         }
         self.load_selected(&mut committed.state, selected).await?;
+        crate::journal_history::prepare_command(&self.store, &mut committed.state, request).await?;
         let decision = decide(&committed.state);
         crate::journal_history::trim(&mut committed.state);
         let (mut events, result) = decision?;
@@ -416,7 +513,16 @@ impl JournalBackend {
             EventKind::Command,
             serde_json::to_value(&record)?,
         ));
-        let commit = self.commit_locked(&mut committed, events).await?;
+        let values: Vec<_> = values
+            .into_iter()
+            .filter_map(|value| value.into_staged())
+            .collect();
+        for value in &values {
+            events.insert(0, value.publication()?);
+        }
+        let commit = self
+            .commit_values_locked(&mut committed, events, values)
+            .await?;
         let mut receipt = self.receipt(&record);
         receipt.commit_cursor.lsn = commit;
         drop(committed);
@@ -521,23 +627,45 @@ impl JournalBackend {
         committed: &mut CommittedState,
         events: Vec<Event>,
     ) -> Result<u64> {
+        self.commit_values_locked(committed, events, Vec::new())
+            .await
+    }
+    async fn commit_values_locked(
+        &self,
+        committed: &mut CommittedState,
+        events: Vec<Event>,
+        values: Vec<flow_journal::value::StagedValue>,
+    ) -> Result<u64> {
         // Include master-produced chunks/structural transactions before checking the command.
         self.refresh_locked(committed).await?;
+        let chunks: u64 = values.iter().map(|value| value.chunk_count()).sum();
+        let final_lsn = committed
+            .state
+            .applied_lsn
+            .checked_add(chunks)
+            .and_then(|lsn| lsn.checked_add(1))
+            .ok_or_else(|| flow_journal::Error::Invalid("LSN overflow".into()))?;
         let tx = Transaction {
             v: 2,
             journal_id: self.journal.id().into(),
-            lsn: committed.state.applied_lsn + 1,
+            lsn: final_lsn,
             tx_id: uuid::Uuid::now_v7().to_string(),
             events,
         };
         crate::journal_history::prepare(&self.store, &mut committed.state, &tx).await?;
-        let rows = committed
-            .state
-            .preview(&tx, |next| crate::journal_history::index_rows(next, &tx))?;
+        let mut transactions = Vec::new();
+        for value in &values {
+            transactions
+                .extend(value.prefix(committed.state.applied_lsn + transactions.len() as u64 + 1));
+        }
+        transactions.push(tx.clone());
+        let rows = committed.state.preview_batch(&transactions, |next| {
+            crate::journal_history::index_rows(next, &tx)
+        })?;
         let journal = self.journal.clone();
         let changed = self.execution_changed.clone();
         committed.pending = Some(tokio::spawn(async move {
-            let result = journal.submit_prepared(tx, rows).await;
+            let result = journal.submit_prepared_values(tx, rows, values).await;
             changed.notify_one();
             result
         }));
@@ -556,7 +684,13 @@ impl JournalBackend {
         committed.pending = None;
         let commit = outcome??;
         let tx = &commit.transaction;
-        committed.state.apply(tx)?;
+        if commit.value_prefix.is_empty() {
+            committed.state.apply(tx)?;
+        } else {
+            let mut transactions = commit.value_prefix;
+            transactions.push((**tx).clone());
+            committed.state.apply_batch(&transactions)?;
+        }
         let parents: Vec<_> = committed
             .state
             .runs
@@ -643,25 +777,46 @@ impl JournalBackend {
         request_id: Option<&str>,
         request: &Value,
     ) -> Result<Option<CommandReceipt>> {
-        validate_command_identity(scope, request_id)?;
-        let Some(id) = request_id else {
+        if request_id.is_none() {
+            validate_command_identity(scope, request_id)?;
             return Ok(None);
-        };
+        }
+        self.preflight_command(scope, request_id, request, None, |_| Ok(()))
+            .await
+    }
+
+    /// Check permanent receipts and current state under one lock. A concurrent
+    /// duplicate must return its receipt before checking a now-terminal state.
+    pub(crate) async fn preflight_command(
+        &self,
+        scope: &str,
+        request_id: Option<&str>,
+        request: &Value,
+        selected: Option<&str>,
+        validate: impl FnOnce(&State) -> flow_journal::Result<()>,
+    ) -> Result<Option<CommandReceipt>> {
+        validate_command_identity(scope, request_id)?;
         let fingerprint = flow_journal::codec::fingerprint(request, 9 * 1024 * 1024)?;
         let mut committed = self.state.lock().await;
         self.refresh_locked(&mut committed).await?;
-        let Some(original) = self.command_record(&committed.state, scope, id).await? else {
-            return Ok(None);
-        };
-        if original.fingerprint != fingerprint {
-            return Err(flow_journal::Error::Conflict(
-                "same request identity with different arguments".into(),
-            )
-            .into());
+        if let Some(id) = request_id {
+            if let Some(original) = self.command_record(&committed.state, scope, id).await? {
+                if original.fingerprint != fingerprint {
+                    return Err(flow_journal::Error::Conflict(
+                        "same request identity with different arguments".into(),
+                    )
+                    .into());
+                }
+                let receipt = self.receipt(&original);
+                drop(committed);
+                return Ok(Some(self.visible(receipt).await?));
+            }
         }
-        let receipt = self.receipt(&original);
-        drop(committed);
-        Ok(Some(self.visible(receipt).await?))
+        self.load_selected(&mut committed.state, selected).await?;
+        let result = validate(&committed.state);
+        crate::journal_history::trim(&mut committed.state);
+        result?;
+        Ok(None)
     }
     pub async fn close(&self) -> Result<()> {
         self.shutdown.cancel();
@@ -735,6 +890,19 @@ impl JournalBackend {
         let committed = self.state.lock().await;
         let applied_lsn = committed.state.applied_lsn;
         let resident_runs = committed.state.runs.len();
+        let resident_waiting_nodes = committed
+            .state
+            .runs
+            .values()
+            .flat_map(|r| r.nodes.values())
+            .filter(|n| n.status == flow_engine::journal_state::NodeStatus::Waiting)
+            .count();
+        let resident_definition_versions: usize = committed
+            .state
+            .workflows
+            .values()
+            .map(|w| w.versions.len())
+            .sum();
         let resident_attempts: usize = committed
             .state
             .runs
@@ -750,6 +918,8 @@ impl JournalBackend {
         let stats = self.journal.stats();
         serde_json::json!({
             "applied_lsn": applied_lsn,
+            "resident_definition_versions": resident_definition_versions,
+            "resident_waiting_nodes": resident_waiting_nodes,
             "resident_runs":resident_runs,"resident_attempts":resident_attempts,"cached_publications":cached_publications,
             "projected_lsn": stats.durable_lsn,
             "durable_lsn": stats.durable_lsn,
@@ -790,7 +960,7 @@ fn audit_key(event: &Event) -> flow_journal::Result<String> {
 }
 pub(crate) fn audit_rows(tx: &Transaction) -> flow_journal::Result<Vec<EntityChange>> {
     tx.events.iter().filter(|event| event.audit_seq > 0).map(|event| {
-        Ok(EntityChange { kind: "audit".into(), key: audit_key(event)?, value: Some(serde_json::json!({
+        Ok(EntityChange { kind: flow_journal::sqlite::EntityKind::Audit, key: audit_key(event)?, value: Some(serde_json::json!({
             "digest": flow_journal::codec::digest(&flow_journal::codec::bounded_json(event, flow_journal::MAX_LINE_BYTES)?),
             "lsn": tx.lsn.to_string(),
         })) })
@@ -934,10 +1104,10 @@ pub(crate) fn project_rows(
                 "webhook" => state.webhooks.get(&key).cloned(),
                 "template" => state.templates.get(&key).cloned(),
                 "legacy" => state.legacy.get(&key).cloned(),
-                _ => None,
+                _ => return Err(flow_journal::Error::Invalid(format!("unknown projected entity kind: {kind}"))),
             };
             Ok(EntityChange {
-                kind: kind.into(),
+                kind: flow_journal::sqlite::EntityKind::parse(kind)?,
                 key,
                 value,
             })

@@ -61,7 +61,7 @@ pub async fn check(root: &Path) -> Result<ProjectionReport, Box<dyn std::error::
         let tx = sqlite::transaction(&reader, &journal_id, lsn)?;
         let rows = state.apply_with(&tx, |next| crate::journal_history::index_rows(next, &tx))?;
         for row in rows {
-            expected.insert((row.kind, row.key), (lsn, row.value));
+            expected.insert((row.kind.as_str().to_owned(), row.key), (lsn, row.value));
         }
         for event in &tx.events {
             // Published descriptors are written directly by the value store, not via

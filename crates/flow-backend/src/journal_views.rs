@@ -7,10 +7,10 @@ use flow_dto::{
     WorkflowSummary, WorkflowVersion, STATUS_DRAFT, STATUS_PUBLISHED,
 };
 use flow_engine::journal_state::{Run as JournalRun, WaitKind, Workflow as JournalWorkflow};
+use flow_journal::VALUE_BUDGET;
 use flow_journal::{StoredValue, MAX_LINE_BYTES};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-const VALUE_BUDGET: usize = 8 * 1024 * 1024;
 pub type Result<T> = std::result::Result<T, ViewError>;
 fn internal(error: impl std::fmt::Display) -> ViewError {
     ViewError::Unavailable(error.to_string())
@@ -58,25 +58,14 @@ pub async fn get_version(
     workflow_id: &str,
     version: Option<i64>,
 ) -> Result<WorkflowVersion> {
-    let stored =
-        backend
-            .inspect(|state| {
-                let workflow = state
-                    .workflows
-                    .get(workflow_id)
-                    .ok_or_else(|| ViewError::NotFound(format!("工作流不存在：{workflow_id}")))?;
-                match version {
-                    Some(v) => workflow.versions.get(&(v as u64)).cloned().ok_or_else(|| {
-                        ViewError::NotFound(format!("版本不存在：{workflow_id} v{v}"))
-                    }),
-                    None => workflow
-                        .versions
-                        .last_key_value()
-                        .map(|(_, v)| v.clone())
-                        .ok_or_else(|| ViewError::NotFound(format!("工作流不存在：{workflow_id}"))),
-                }
-            })
-            .await?;
+    if version.is_some_and(|v| v < 1) {
+        return Err(ViewError::NotFound(format!("版本不存在：{workflow_id}")));
+    }
+    let stored = backend
+        .definition_version(workflow_id, version.map(|v| v as u64))
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| ViewError::NotFound(format!("版本不存在：{workflow_id}")))?;
     let root = backend.journal.root().to_path_buf();
     let upper = backend.journal.durable_lsn();
     let workflow_id = workflow_id.to_owned();
@@ -102,14 +91,9 @@ pub async fn list_versions(
     workflow_id: &str,
 ) -> Result<Vec<WorkflowVersion>> {
     let stored = backend
-        .inspect(|state| {
-            state
-                .workflows
-                .get(workflow_id)
-                .map(|w| w.versions.values().rev().cloned().collect::<Vec<_>>())
-                .ok_or_else(|| ViewError::NotFound(format!("工作流不存在：{workflow_id}")))
-        })
-        .await?;
+        .definition_versions(workflow_id)
+        .await
+        .map_err(definition_error)?;
     reserve_values(stored.iter().map(|v| &v.definition))?;
     let root = backend.journal.root().to_path_buf();
     let upper = backend.journal.durable_lsn();
@@ -127,26 +111,31 @@ pub async fn list_versions(
 /// Metadata reads never open definition value files or clone execution history.
 pub async fn version_metadata(backend: &JournalBackend, workflow_id: &str) -> Result<Vec<Value>> {
     backend
-        .inspect(|state| {
-            let workflow = state
-                .workflows
-                .get(workflow_id)
-                .ok_or_else(|| ViewError::NotFound(format!("工作流不存在：{workflow_id}")))?;
-            workflow
-                .versions
-                .values()
-                .rev()
-                .map(|v| {
-                    Ok(json!({
-                        "version": v.version as i64,
-                        "status": if v.published { STATUS_PUBLISHED } else { STATUS_DRAFT },
-                        "checksum": v.checksum,
-                        "created_at": parse_ts(&v.created_at)?,
-                    }))
-                })
-                .collect()
-        })
+        .definition_versions(workflow_id)
         .await
+        .map_err(definition_error)?
+        .into_iter()
+        .map(|v| {
+            Ok(json!({
+                "version": v.version as i64,
+                "status": if v.published { STATUS_PUBLISHED } else { STATUS_DRAFT },
+                "checksum": v.checksum,
+                "created_at": parse_ts(&v.created_at)?,
+            }))
+        })
+        .collect()
+}
+
+fn definition_error(error: crate::journal::JournalError) -> ViewError {
+    match error {
+        crate::journal::JournalError::Journal(flow_journal::Error::NotFound(message)) => {
+            ViewError::NotFound(message)
+        }
+        crate::journal::JournalError::Journal(flow_journal::Error::Limit(_)) => {
+            ViewError::Limit("RESPONSE_TOO_LARGE".into())
+        }
+        other => internal(other),
+    }
 }
 
 /// Reserve the complete encoded business-value size before reading value files.
@@ -507,17 +496,17 @@ pub async fn timeline(backend: &JournalBackend, run_id: &str) -> Result<Value> {
         };
         let output = node
             .and_then(|n| n.output.as_ref())
-            .map(|v| materialize(v).map(|v| flow_engine::redact_value(&v)))
+            .map(|v| materialize(v).map(|v| flow_engine::nodelog::redact_snapshot(&v)))
             .transpose()?;
         let input = node
             .and_then(|n| n.prepared.as_ref())
             .map(|p| {
-                materialize(&p.params).map(|v| flow_engine::redact_value(&v))
+                materialize(&p.params).map(|v| flow_engine::nodelog::redact_snapshot(&v))
             })
             .transpose()?;
         nodes.push(json!({"id":spec.id,"name":spec.name,"type":spec.node_type,"state":display_state,
             "attempts":node.map_or(0, |n| n.attempt),"started_at":null,"ended_at":null,"duration_ms":null,
-            "input":input,"output":output,"error":node.and_then(|n| n.error.as_ref()),
+            "input":input,"output":output,"error":node.and_then(|n| n.error.as_ref()).map(|e| flow_engine::nodelog::redact_text(e)),
             "reason":node.and_then(|n| n.skip_reason.as_ref()),
             "wait":node.and_then(|n| n.wait.as_ref()),
             "operation_id":node.and_then(|n| n.operation.as_ref()).map(|o| &o.operation_id),
@@ -527,7 +516,7 @@ pub async fn timeline(backend: &JournalBackend, run_id: &str) -> Result<Value> {
         json!({"run_id":run.run_id,"status":run.status,"workflow_id":run.workflow_id,
         "workflow_version":run.workflow_version,"started_at":run.created_at,"ended_at":null,
         "output":run.output.as_ref().map(materialize).transpose()?,
-        "fatal_error":run.error,"last_seq":run.last_run_seq,"nodes":nodes,
+        "fatal_error":run.error.as_ref().map(|e| flow_engine::nodelog::redact_text(e)),"last_seq":run.last_run_seq,"nodes":nodes,
         "snapshot_cursor":{"journal_id":journal_id,"lsn":lsn.to_string()}}),
     )
     }).await.map_err(internal)?

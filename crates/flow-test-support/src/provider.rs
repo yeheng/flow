@@ -14,6 +14,14 @@ pub enum Turn {
     Tool { command: String },
     /// 最终文本（finish_reason=stop）。
     Final { text: String },
+    /// Holds a real request open, for deadline/cancel and mixed-load checks.
+    DelayedFinal { text: String, delay_ms: u64 },
+    /// Reusable per-session two-turn script, safe under concurrent requests.
+    ToolThenFinal {
+        command: String,
+        text: String,
+        delay_ms: u64,
+    },
     /// HTTP 500（transport 失败路径）。
     InternalError,
 }
@@ -92,6 +100,36 @@ async fn completions(
             json!({"choices":[{"delta":{"content":text}}]}),
             json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
         ],
+        Turn::DelayedFinal { text, delay_ms } => {
+            tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
+            vec![
+                json!({"choices":[{"delta":{"content":text}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ]
+        }
+        Turn::ToolThenFinal {
+            command,
+            text,
+            delay_ms,
+        } => {
+            tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
+            let request: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            if request["messages"]
+                .as_array()
+                .is_some_and(|messages| messages.iter().any(|m| m["role"] == "tool"))
+            {
+                vec![
+                    json!({"choices":[{"delta":{"content":text}}]}),
+                    json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+                ]
+            } else {
+                let arguments = serde_json::to_string(&json!({"command":command})).unwrap();
+                vec![
+                    json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":arguments}}]}}]}),
+                    json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+                ]
+            }
+        }
         Turn::InternalError => {
             return (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,

@@ -169,3 +169,13 @@ describe("运行输入 schema", () => {
     expect(discoverInputKeys({nodes:[],edges:[],input_schema:{type:"object",required:["id"],properties:{count:{type:"integer"}}}}, [])).toEqual(["count","id"]);
   });
 });
+
+it("runtime input keeps declared strings and validates numeric types", () => {
+  const fields = parseInputFields({ fields: [
+    { key: "code", type: "string" }, { key: "count", type: "integer" },
+    { key: "yes", type: "boolean" }, { key: "data", type: "object" },
+  ] });
+  expect(assembleInput({ code: "5", count: "5", yes: "true", data: '{"x":1}' }, fields))
+    .toEqual({ code: "5", count: 5, yes: true, data: { x: 1 } });
+  expect(() => assembleInput({ count: "1.5" }, fields)).toThrow();
+});

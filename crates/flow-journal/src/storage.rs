@@ -67,17 +67,6 @@ pub fn scan_until(
     Ok(report)
 }
 
-/// Startup reads only the database's committed metadata, not its accepted history.
-pub fn scan_fast(root: &Path) -> Result<Recovery> {
-    let conn = crate::sqlite::read_connection(root)?;
-    let (journal_id, last_lsn) = crate::sqlite::metadata(&conn)?;
-    Ok(Recovery {
-        journal_id,
-        last_lsn,
-        ..Default::default()
-    })
-}
-
 pub(crate) fn sync_dir(path: &Path) -> Result<()> {
     File::open(path)?.sync_all()?;
     Ok(())
@@ -150,6 +139,8 @@ pub struct FaultInjection {
     pub fail_data_sync: Option<u64>,
     pub fail_dir_sync: Option<u64>,
     pub sync_delay_ms: u64,
+    /// Deterministic crash barrier after all appends and before COMMIT.
+    pub before_data_sync: Option<fn(u64)>,
 }
 
 /// Fixed logarithmic microsecond buckets: bucket i contains durations <= 2^i us,

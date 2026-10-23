@@ -47,7 +47,7 @@ tokio-util = { workspace = true }
 flow-backend = { path = "../flow-backend", features = ["fault-injection"] }
 flow-agent = { path = "../flow-agent" }
 flow-engine = { path = "../flow-engine" }
-flow-journal = { path = "../flow-journal" }
+flow-journal = { path = "../flow-journal", default-features = false, features = ["storage"] }
 flow-config = { path = "../flow-config" }
 flow-rpc = { path = "../flow-rpc" }
 # wire 级客户端/进程 harness 与 backend-e2e 共用一份（DESIGN.md §14）。

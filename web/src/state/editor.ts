@@ -1,4 +1,4 @@
-import { computed, reactive, ref, shallowRef, watch } from "vue";
+import { computed, reactive, ref, shallowRef, watch, type ComputedRef } from "vue";
 import type { Connection } from "@vue-flow/core";
 import * as api from "../api/flow";
 import { RpcError, client, errText } from "../rpc/client";
@@ -158,7 +158,29 @@ function defKey(): string {
   return JSON.stringify(flowToDefinition());
 }
 
-export const dirty = computed(() => savedDefKey.value !== null && defKey() !== savedDefKey.value);
+// Cache serialization per row: dragging one node must not serialize the whole
+// graph. Comparing saved rows still makes undo back to the saved state clean.
+const savedParts = computed(() => {
+  if (savedDefKey.value === null) return null;
+  const { nodes, edges, ...options } = JSON.parse(savedDefKey.value) as Definition;
+  return { nodes: nodes.map((n) => JSON.stringify(n)), edges: edges.map((e) => JSON.stringify(e)), options: JSON.stringify(options) };
+});
+const nodeKeys = new WeakMap<EditorNode, ComputedRef<string>>();
+const edgeKeys = new WeakMap<EditorEdge, ComputedRef<string>>();
+const definitionOptionsKey = computed(() => JSON.stringify(editor.definitionOptions));
+function rowKey<T extends object>(cache: WeakMap<T, ComputedRef<string>>, row: T, value: () => unknown): string {
+  let key = cache.get(row);
+  if (!key) { key = computed(() => JSON.stringify(value())); cache.set(row, key); }
+  return key.value;
+}
+export const dirty = computed(() => {
+  const saved = savedParts.value;
+  if (!saved) return false;
+  return definitionOptionsKey.value !== saved.options || editor.nodes.length !== saved.nodes.length ||
+    editor.edges.length !== saved.edges.length ||
+    editor.nodes.some((n, i) => rowKey(nodeKeys, n, () => nodeDefinition(n)) !== saved.nodes[i]) ||
+    editor.edges.some((e, i) => rowKey(edgeKeys, e, () => edgeDefinition(e)) !== saved.edges[i]);
+});
 
 /** 把当前画布记为保存点（加载/保存成功后调用；测试也可直接使用） */
 export function markSaved(): void {
@@ -430,29 +452,22 @@ function cleanParams(params: Record<string, unknown>): Record<string, unknown> {
   return out;
 }
 
-export function flowToDefinition(): Definition {
+function nodeDefinition(n: EditorNode): Definition["nodes"][number] {
   return {
-    ...deepCloneJson(editor.definitionOptions),
-    nodes: editor.nodes.map((n) => ({
-      id: n.id,
-      type: n.data!.nodeType.type,
-      name: n.data!.name,
-      position: {
-        x: Math.round(n.position.x / CANVAS_SNAP_GRID) * CANVAS_SNAP_GRID,
-        y: Math.round(n.position.y / CANVAS_SNAP_GRID) * CANVAS_SNAP_GRID,
-      },
-      params: cleanParams(n.data!.params),
-    })),
-    edges: editor.edges.map((e) => {
-      const edge: DefinitionEdge = { from: e.source, to: e.target };
-      const source = editor.nodes.find((n) => n.id === e.source);
-      // 多出端口节点（如 condition）的出边必须落 port；单出端口省略
-      if (source && sourcePortsOf(source.data.nodeType).length > 1) {
-        edge.port = e.sourceHandle ?? undefined;
-      }
-      return edge;
-    }),
+    id: n.id, type: n.data.nodeType.type, name: n.data.name,
+    position: { x: Math.round(n.position.x / CANVAS_SNAP_GRID) * CANVAS_SNAP_GRID,
+      y: Math.round(n.position.y / CANVAS_SNAP_GRID) * CANVAS_SNAP_GRID },
+    params: cleanParams(n.data.params),
   };
+}
+const sourcePortCounts = computed(() => new Map(editor.nodes.map((n) => [n.id, sourcePortsOf(n.data.nodeType).length])));
+function edgeDefinition(e: EditorEdge): DefinitionEdge {
+  const edge: DefinitionEdge = { from: e.source, to: e.target };
+  if ((sourcePortCounts.value.get(e.source) ?? 0) > 1) edge.port = e.sourceHandle ?? undefined;
+  return edge;
+}
+export function flowToDefinition(): Definition {
+  return { ...deepCloneJson(editor.definitionOptions), nodes: editor.nodes.map(nodeDefinition), edges: editor.edges.map(edgeDefinition) };
 }
 
 // ---- 画布交互 ----

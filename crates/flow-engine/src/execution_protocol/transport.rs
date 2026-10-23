@@ -22,7 +22,6 @@ use super::message::{Message, ProtocolError};
 /// 一条通道的读任务产物。`Frame` 装箱：`Message` 最大变体携带完整
 /// `ExecuteTask`（数百字节），装箱后事件枚举与队列槽位收缩到指针大小——
 /// I/O 事件量等于消息流量，不装箱等于每帧复制整个 payload。
-#[allow(dead_code)]
 enum IoEvent {
     Frame(Box<Message>),
     Failed(ProtocolError),

@@ -10,7 +10,7 @@
 //!
 //! 本文件的职责只剩产品装配与共享助手：`AppState` / `ConfigState`
 //! （统一配置面 + 持久化密钥，挂在 v2 模块的 config.*/secrets.* 上）、
-//! timeline 投影（`timeline_value`）、展示脱敏（`redact_display_envelope`）、
+//! 产品视图由 flow-backend::journal_views 投影并执行展示脱敏；
 //! 节点类型目录与产品面校验（cron / 模板片段 / 密钥名）。
 //!
 //! 错误码词汇（v2 单一来源）：`-32001` unauthorized、`-32011` not found、
@@ -100,8 +100,8 @@ impl AppState {
 pub(crate) fn config_view(state: &AppState) -> Value {
     let (config, path, env_overrides) = match &state.config {
         Some(cs) => (
-            Some(cs.config.read().unwrap().clone()),
-            cs.path.read().unwrap().clone(),
+            Some(cs.config.read().unwrap_or_else(|p| p.into_inner()).clone()),
+            cs.path.read().unwrap_or_else(|p| p.into_inner()).clone(),
             cs.env_overrides.clone(),
         ),
         None => (None, None, Vec::new()),

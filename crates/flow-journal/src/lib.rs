@@ -64,3 +64,6 @@ pub mod decimal {
         Ok(value)
     }
 }
+
+/// Maximum JSON value materialized by product commands and read models.
+pub const VALUE_BUDGET: usize = 8 * 1024 * 1024;

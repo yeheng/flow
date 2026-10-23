@@ -7,6 +7,13 @@ use std::{
 };
 use tokio::process::{Child, Command};
 
+#[cfg(unix)]
+mod fds;
+#[cfg(unix)]
+pub(crate) use fds::close_inherited_fds;
+mod agent;
+pub use agent::AgentWatchdog;
+
 pub struct ManagedChild {
     child: Child,
     tree: Option<ProcessTree>,
@@ -36,6 +43,7 @@ impl ManagedChild {
             }
         } else {
             command.process_group(0);
+            close_inherited_fds(command, None);
         }
         #[cfg(windows)]
         command.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);

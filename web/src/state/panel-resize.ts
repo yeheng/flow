@@ -13,8 +13,10 @@ export interface PanelResizeOptions {
 }
 
 function readSize(key: string, fallback: number): number {
-  const v = Number(localStorage.getItem(key));
-  return Number.isFinite(v) && v > 0 ? v : fallback;
+  try {
+    const v = Number(window.localStorage.getItem(key));
+    return Number.isFinite(v) && v > 0 ? v : fallback;
+  } catch { return fallback; }
 }
 
 /** 面板拖拽 resize：拖动中只改 size ref，松手才写 localStorage；active 供调用方关掉过渡动画 */
@@ -35,7 +37,7 @@ export function usePanelResize(opts: PanelResizeOptions) {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
       active.value = false;
-      localStorage.setItem(opts.storageKey, String(size.value));
+      try { window.localStorage.setItem(opts.storageKey, String(size.value)); } catch { /* Private storage is optional. */ }
     };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);

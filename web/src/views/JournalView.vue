@@ -123,6 +123,7 @@ async function connect() {
 /** 选择 run：重置分页/观测水位，拉一次快照与首页观测 */
 async function selectRun(id: string) {
   if (!api.value || !id) return;
+  ++pageGeneration;
   runId.value = id;
   run.value = undefined;
   page.value = undefined;
@@ -147,13 +148,16 @@ async function refreshAll() {
   await pullObservations();
 }
 
+let pageGeneration = 0;
 async function nextPage(reset = false) {
   if (!api.value || !runId.value) return;
-  page.value = await api.value.page(
-    runId.value,
-    audit.value,
-    reset ? undefined : page.value?.next_cursor,
-  );
+  const generation = ++pageGeneration;
+  const id = runId.value;
+  const client = api.value;
+  const auditMode = audit.value;
+  const next = await client.page(id, auditMode, reset ? undefined : page.value?.next_cursor);
+  if (generation !== pageGeneration || runId.value !== id || api.value !== client || audit.value !== auditMode) return;
+  page.value = next;
 }
 
 async function copyRunId(id: string) {

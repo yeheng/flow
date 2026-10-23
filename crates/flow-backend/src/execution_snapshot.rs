@@ -10,33 +10,7 @@ impl JournalBackend {
         version: Option<u64>,
     ) -> Result<(u64, StoredValue, Option<ExecutionSnapshot>), JournalError> {
         let _metadata = self.workflow_metadata.read().await;
-        let root = self
-            .inspect_committed(|state| {
-                let root = state
-                    .workflows
-                    .get(workflow)
-                    .filter(|w| !w.deleted)
-                    .ok_or_else(|| Error::NotFound("workflow not found".into()))?;
-                let selected = version
-                    .or_else(|| {
-                        root.versions
-                            .values()
-                            .rev()
-                            .find(|v| v.published)
-                            .map(|v| v.version)
-                    })
-                    .ok_or_else(|| Error::Invalid("no published version".into()))?;
-                let root = root
-                    .versions
-                    .get(&selected)
-                    .ok_or_else(|| Error::NotFound("workflow version not found".into()))?
-                    .clone();
-                if !root.published {
-                    return Err(Error::Invalid("version not published".into()));
-                }
-                Ok::<_, Error>(root)
-            })
-            .await?;
+        let root = self.published_definition(workflow, version).await?;
         let selected = root.version;
         let root_key = format!("{workflow}@{selected}");
         let mut definitions = BTreeMap::from([(root_key.clone(), root.clone())]);
@@ -63,33 +37,31 @@ impl JournalBackend {
                     .ok_or_else(|| {
                         Error::Invalid("semantics 2 requires a static child workflow_id".into())
                     })?;
-                let (child_key, child_version) = self
-                    .inspect(|state| {
-                        let workflow = state
-                            .workflows
-                            .get(child)
-                            .filter(|w| !w.deleted)
-                            .ok_or_else(|| Error::Invalid("child workflow not found".into()))?;
-                        let version = match node.params.get("version") {
-                            Some(v) => workflow.versions.get(&v.as_u64().ok_or_else(|| {
-                                Error::Invalid("child version must be an integer".into())
-                            })?),
-                            None => workflow.versions.values().rev().find(|v| v.published),
-                        }
-                        .filter(|v| v.published)
-                        .ok_or_else(|| {
-                            Error::Invalid("child published definition missing".into())
-                        })?;
-                        let child_key = format!("{child}@{}", version.version);
-                        let unseen = !definitions.contains_key(&child_key);
-                        if unseen && definitions.len() >= 128 {
-                            return Err(Error::Limit(
-                                "dependency closure exceeds 128 definitions".into(),
-                            ));
-                        }
-                        Ok::<_, Error>((child_key, unseen.then(|| version.clone())))
+                let selected = node
+                    .params
+                    .get("version")
+                    .map(|v| {
+                        v.as_u64().ok_or_else(|| {
+                            Error::Invalid("child version must be an integer".into())
+                        })
                     })
-                    .await?;
+                    .transpose()?;
+                let version = self.published_definition(child, selected).await.map_err(
+                    |error| match error {
+                        JournalError::Journal(Error::NotFound(_)) => JournalError::Journal(
+                            Error::Invalid("child published definition missing".into()),
+                        ),
+                        other => other,
+                    },
+                )?;
+                let child_key = format!("{child}@{}", version.version);
+                let unseen = !definitions.contains_key(&child_key);
+                if unseen && definitions.len() >= 128 {
+                    return Err(
+                        Error::Limit("dependency closure exceeds 128 definitions".into()).into(),
+                    );
+                }
+                let child_version = unseen.then_some(version);
                 bindings.insert(format!("{key}/{}", node.id), child_key.clone());
                 if let Some(version) = child_version {
                     definitions.insert(child_key.clone(), version);
@@ -112,5 +84,41 @@ impl JournalBackend {
                 agent: self.harness_agent_config(),
             }),
         ))
+    }
+
+    /// Caller holds workflow_metadata read guard across the complete dependency
+    /// closure. Old explicitly pinned versions are read cold, not cached forever.
+    async fn published_definition(
+        &self,
+        workflow: &str,
+        version: Option<u64>,
+    ) -> Result<flow_engine::journal_state::DefinitionVersion, JournalError> {
+        let selected = self
+            .inspect_committed(|state| {
+                let metadata = state
+                    .workflows
+                    .get(workflow)
+                    .filter(|w| !w.deleted)
+                    .ok_or_else(|| Error::NotFound("workflow not found".into()))?;
+                version
+                    .or_else(|| {
+                        metadata
+                            .versions
+                            .values()
+                            .rev()
+                            .find(|v| v.published)
+                            .map(|v| v.version)
+                    })
+                    .ok_or_else(|| Error::Invalid("no published version".into()))
+            })
+            .await?;
+        let definition = self
+            .definition_version(workflow, Some(selected))
+            .await?
+            .ok_or_else(|| Error::NotFound("workflow version not found".into()))?;
+        if !definition.published {
+            return Err(Error::Invalid("version not published".into()).into());
+        }
+        Ok(definition)
     }
 }

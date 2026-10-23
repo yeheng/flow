@@ -52,38 +52,32 @@ pub(crate) async fn load(index: &Store, identity: &str, upper: u64) -> Result<St
                     .ok_or_else(|| {
                         JournalError::Storage("missing current control entity".into())
                     })?;
+                if matches!(kind, "schedule" | "webhook" | "template") && !value.is_object() {
+                    return Err(flow_journal::Error::Invalid(format!(
+                        "malformed {kind} row: expected object"
+                    ))
+                    .into());
+                }
                 match kind {
                     "workflow" => {
+                        let hot_versions: BTreeSet<u64> = ["latest_version", "published_version"]
+                            .into_iter()
+                            .filter_map(|field| value[field].as_u64())
+                            .filter(|version| *version > 0)
+                            .collect();
                         let mut workflow: flow_engine::journal_state::Workflow =
                             serde_json::from_value(value)?;
-                        let mut after_version = String::new();
-                        loop {
-                            let versions = index
-                                .current_keys(
-                                    "workflow_version",
-                                    Some(key),
-                                    &after_version,
-                                    upper,
-                                    256,
-                                )
+                        for version in hot_versions {
+                            let row = index
+                                .current_at("workflow_version", &version_key(key, version)?, upper)
                                 .await
-                                .map_err(db)?;
-                            if versions.is_empty() {
-                                break;
-                            }
-                            for version in &versions {
-                                let row = index
-                                    .current_at("workflow_version", version, upper)
-                                    .await
-                                    .map_err(db)?
-                                    .ok_or_else(|| {
-                                        JournalError::Storage("missing definition version".into())
-                                    })?;
-                                let version: flow_engine::journal_state::DefinitionVersion =
-                                    serde_json::from_value(row)?;
-                                workflow.versions.insert(version.version, version);
-                            }
-                            after_version = versions.last().unwrap().clone();
+                                .map_err(db)?
+                                .ok_or_else(|| {
+                                    JournalError::Storage("missing hot definition version".into())
+                                })?;
+                            workflow
+                                .versions
+                                .insert(version, serde_json::from_value(row)?);
                         }
                         state.workflows.insert(key.clone(), workflow);
                     }
@@ -158,6 +152,19 @@ pub(crate) async fn run_at(index: &Store, id: &str, upper: u64, full: bool) -> R
 /// Load cold current objects before preview, while the coordinator owns the decision lock.
 pub(crate) async fn prepare(index: &Store, state: &mut State, tx: &Transaction) -> Result<()> {
     let upper = state.applied_lsn;
+    for event in &tx.events {
+        if event.kind == EventKind::WorkflowPublished {
+            if let (Some(id), Some(version)) = (
+                event.payload["workflow_id"].as_str(),
+                event.payload["version"]
+                    .as_str()
+                    .and_then(|v| v.parse().ok())
+                    .or_else(|| event.payload["version"].as_u64()),
+            ) {
+                load_version(index, state, id, version).await?;
+            }
+        }
+    }
     let ids: BTreeSet<_> = tx
         .events
         .iter()
@@ -274,7 +281,7 @@ pub(crate) fn index_rows(
             record.lsn = tx.lsn;
             if let Some(id) = &record.request_id {
                 rows.push(EntityChange {
-                    kind: "command".into(),
+                    kind: flow_journal::sqlite::EntityKind::Command,
                     key: flow_engine::journal_state::command_key(&record.scope, id),
                     value: Some(serde_json::to_value(record)?),
                 });
@@ -282,7 +289,7 @@ pub(crate) fn index_rows(
         }
         if event.kind == EventKind::MasterEpochStarted {
             rows.push(EntityChange {
-                kind: "engine".into(),
+                kind: flow_journal::sqlite::EntityKind::Engine,
                 key: "epoch".into(),
                 value: Some(json!({"epoch":state.master_epoch.to_string()})),
             });
@@ -290,7 +297,7 @@ pub(crate) fn index_rows(
         if event.kind == EventKind::ScheduleChanged {
             if let Some(id) = event.payload["id"].as_str() {
                 rows.push(EntityChange {
-                    kind: "schedule_fire".into(),
+                    kind: flow_journal::sqlite::EntityKind::ScheduleFire,
                     key: id.into(),
                     value: state
                         .schedule_fires
@@ -307,7 +314,7 @@ pub(crate) fn index_rows(
             {
                 if let Some(fire) = state.schedule_fires.get(key) {
                     rows.push(EntityChange {
-                        kind: "schedule_fire".into(),
+                        kind: flow_journal::sqlite::EntityKind::ScheduleFire,
                         key: key.into(),
                         value: Some(serde_json::to_value(fire)?),
                     });
@@ -317,7 +324,7 @@ pub(crate) fn index_rows(
         if event.kind == EventKind::RunStarted {
             if let Some(workflow) = event.payload["workflow_id"].as_str() {
                 rows.push(EntityChange {
-                    kind: "run_workflow".into(),
+                    kind: flow_journal::sqlite::EntityKind::RunWorkflow,
                     key: workflow.into(),
                     value: Some(json!({"workflow_id":workflow})),
                 });
@@ -328,7 +335,7 @@ pub(crate) fn index_rows(
                 event.run_id.as_deref(),
             ) {
                 rows.push(EntityChange {
-                    kind: "child".into(),
+                    kind: flow_journal::sqlite::EntityKind::Child,
                     key: serde_json::to_string(&(parent, node, child))?,
                     value: Some(json!({"lsn":format!("{:020}",tx.lsn)})),
                 });
@@ -339,7 +346,7 @@ pub(crate) fn index_rows(
                 (&event.dispatch_id, &event.run_id, &event.node_id)
             {
                 rows.push(EntityChange {
-                    kind: "dispatch".into(),
+                    kind: flow_journal::sqlite::EntityKind::Dispatch,
                     key: dispatch.clone(),
                     value: Some(
                         json!({"run_id":run,"node_id":node,"attempt":event.payload["attempt"]}),
@@ -352,6 +359,18 @@ pub(crate) fn index_rows(
 }
 
 pub(crate) fn trim(state: &mut State) {
+    for workflow in state.workflows.values_mut() {
+        let latest = workflow.versions.last_key_value().map(|(v, _)| *v);
+        let published = workflow
+            .versions
+            .iter()
+            .rev()
+            .find(|(_, v)| v.published)
+            .map(|(v, _)| *v);
+        workflow
+            .versions
+            .retain(|version, _| Some(*version) == latest || Some(*version) == published);
+    }
     state.runs.retain(|_, run| !run.terminal());
     for run in state.runs.values_mut() {
         for node in run.nodes.values_mut() {
@@ -359,4 +378,73 @@ pub(crate) fn trim(state: &mut State) {
         }
     }
     state.values.trim_cache();
+}
+
+/// Definition history stays in SQLite. A cold version is loaded only while the
+/// coordinator owns the decision lock, and trimmed after that decision commits.
+pub(crate) fn version_key(workflow: &str, version: u64) -> Result<String> {
+    Ok(serde_json::to_string(&(
+        workflow,
+        format!("{version:020}"),
+    ))?)
+}
+
+pub(crate) async fn load_version(
+    index: &Store,
+    state: &mut State,
+    workflow: &str,
+    version: u64,
+) -> Result<()> {
+    if state
+        .workflows
+        .get(workflow)
+        .is_none_or(|w| w.versions.contains_key(&version))
+    {
+        return Ok(());
+    }
+    if let Some(row) = index
+        .current_at(
+            "workflow_version",
+            &version_key(workflow, version)?,
+            state.applied_lsn,
+        )
+        .await
+        .map_err(db)?
+    {
+        state
+            .workflows
+            .get_mut(workflow)
+            .unwrap()
+            .versions
+            .insert(version, serde_json::from_value(row)?);
+    }
+    Ok(())
+}
+
+pub(crate) async fn prepare_command(
+    index: &Store,
+    state: &mut State,
+    request: &Value,
+) -> Result<()> {
+    if let (Some(workflow), Some(version)) =
+        (request["workflow_id"].as_str(), request["version"].as_u64())
+    {
+        load_version(index, state, workflow, version).await?;
+    }
+    if let Some(patch) = request.get("patch") {
+        let previous = request["key"]
+            .as_str()
+            .and_then(|key| state.webhooks.get(key));
+        let workflow = patch["workflow_id"]
+            .as_str()
+            .or_else(|| previous.and_then(|v| v["workflow_id"].as_str()));
+        let version = patch["invoke_version"]
+            .as_u64()
+            .or_else(|| previous.and_then(|v| v["invoke_version"].as_u64()));
+        if let (Some(workflow), Some(version)) = (workflow, version) {
+            let workflow = workflow.to_owned();
+            load_version(index, state, &workflow, version).await?;
+        }
+    }
+    Ok(())
 }

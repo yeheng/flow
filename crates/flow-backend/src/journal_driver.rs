@@ -35,6 +35,7 @@ type NodeTask = (NodeKey, Result<()>);
 struct Coordinator {
     tasks: JoinSet<NodeTask>,
     active: HashSet<NodeKey>,
+    agents: HashSet<NodeKey>,
     wakes: BTreeMap<i64, BTreeSet<String>>,
     limit: usize,
 }
@@ -44,9 +45,15 @@ impl Coordinator {
         Self {
             tasks: JoinSet::new(),
             active: HashSet::new(),
+            agents: HashSet::new(),
             wakes: BTreeMap::new(),
             limit,
         }
+    }
+
+    fn has_capacity(&self, node: &flow_engine::Node) -> bool {
+        self.tasks.len() < self.limit
+            && (!node.is_harness_agent() || self.agents.len() < self.limit.div_ceil(2))
     }
 }
 
@@ -193,6 +200,7 @@ impl JournalBackend {
         let notify = self.execution_notification();
         notify.notify_one();
         *driver = Some(tokio::spawn(async move {
+            let outcome = AssertUnwindSafe(async {
             // 预热只在协调器任务启动时执行一次（不随 panic 重启重复）。
             // 本任务独占 `port` 且尚未进入调度循环，故不与任何 acquire 竞争。
             if prewarm {
@@ -224,7 +232,7 @@ impl JournalBackend {
                     _=cancel.cancelled()=>{coord.tasks.abort_all();while coord.tasks.join_next().await.is_some(){}return},
                     completed=coord.tasks.join_next(),if !coord.tasks.is_empty()=>{
                         match completed {
-                            Some(Ok((key,result)))=>{coord.active.remove(&key);finished=Some(key.0);if let Err(error)=result {tracing::error!(%error,"v2 node task stopped; committed evidence retained");}},
+                            Some(Ok((key,result)))=>{coord.active.remove(&key);coord.agents.remove(&key);finished=Some(key.0);if let Err(error)=result {tracing::error!(%error,"v2 node task stopped; committed evidence retained");}},
                             Some(Err(error))=>{tracing::error!(%error,"v2 task exited unexpectedly; rebuilding coordinator");coord.tasks.abort_all();while coord.tasks.join_next().await.is_some(){}return},
                             None=>{}
                         }
@@ -334,6 +342,16 @@ impl JournalBackend {
                 }
                 notify.notify_one();
             }
+            }).catch_unwind().await;
+            // The driver owns the execution port. Close must await its tracked
+            // sessions, including idle/prewarmed children and cancelled starts.
+            match &port {
+                ExecutionPort::Ipc(dispatcher) => dispatcher.shutdown().await,
+                ExecutionPort::Remote(dispatcher) => dispatcher.manager().shutdown().await,
+            }
+            if outcome.is_err() {
+                tracing::error!("coordinator exited unexpectedly; execution port reaped");
+            }
         }));
         Ok(())
     }
@@ -427,7 +445,7 @@ async fn advance_run(
             }
             NodeGate::Blocked => {}
             NodeGate::Ready(predecessors) => {
-                if coord.tasks.len() >= coord.limit {
+                if !coord.has_capacity(node) {
                     backend.defer_run(run_id.to_owned()).await;
                     continue;
                 }
@@ -711,6 +729,9 @@ async fn spawn_node_attempt(
     let attempt = Attempt::begin(backend.clone(), run_id.to_owned(), node.id.clone()).await?;
     let key: NodeKey = (run_id.to_owned(), node.id.clone());
     coord.active.insert(key.clone());
+    if node.is_harness_agent() {
+        coord.agents.insert(key.clone());
+    }
     backend
         .execution_peak
         .fetch_max(coord.tasks.len() + 1, std::sync::atomic::Ordering::Relaxed);
@@ -912,7 +933,7 @@ async fn settle_run(
                     backend.journal.root(),
                     backend.journal.durable_lsn(),
                     &output,
-                    8 * 1024 * 1024,
+                    flow_journal::VALUE_BUDGET,
                 ) {
                     Ok(value) => value,
                     Err(flow_journal::Error::Limit(_)) => {

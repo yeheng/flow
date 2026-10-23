@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-flow-journal = { path = "../flow-journal" }
+flow-journal = { path = "../flow-journal", default-features = false, features = ["storage"] }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }

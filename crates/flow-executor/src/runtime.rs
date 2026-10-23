@@ -196,6 +196,11 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
                             tracing::info!("task committed; slot reusable");
                             current = None;
                         }
+                        TaskEnd::CommittedRecycle => {
+                            tracing::info!("agent task committed; retiring executor session");
+                            current = None;
+                            break;
+                        }
                         TaskEnd::Recycle => {
                             tracing::warn!("task stopped uncommitted; exiting for recycle");
                             exit_code = 0; // 预期内回收，非错误

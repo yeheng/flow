@@ -9,6 +9,7 @@ use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use crate::codec::{self, Event, EventKind, Transaction};
 use crate::sqlite::{Disk, EntityChange};
 use crate::storage::{FaultInjection, Location};
+use crate::value::{PreparedValue, StagedValue};
 use crate::{invalid, Error, Result, MAX_LINE_BYTES};
 
 #[derive(Debug, Clone)]
@@ -43,6 +44,8 @@ pub enum QueueClass {
 pub struct Commit {
     pub transaction: Arc<Transaction>,
     pub location: Location,
+    /// Dataset chunk transactions preceding the command; byte payloads omitted.
+    pub value_prefix: Vec<Transaction>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -68,6 +71,7 @@ pub struct WriterStats {
 
 struct Pending {
     tx: Transaction,
+    values: Vec<StagedValue>,
     expected_lsn: Option<u64>,
     /// Canonical size/digest when the LSN was known at submission time.
     wire: Option<(u64, String)>,
@@ -102,8 +106,16 @@ impl WriteAdmission {
             deadline: Mutex::new(Some(deadline)),
         }
     }
+    fn lock_deadline(&self) -> std::sync::MutexGuard<'_, Option<Instant>> {
+        self.deadline.lock().unwrap_or_else(|poison| {
+            let mut guard = poison.into_inner();
+            // A poisoned authority lease is uncertain: never revive it silently.
+            *guard = None;
+            guard
+        })
+    }
     pub fn renew(&self, deadline: Instant) -> bool {
-        let mut current = self.deadline.lock().unwrap();
+        let mut current = self.lock_deadline();
         if current.is_some_and(|value| value > Instant::now()) && deadline > Instant::now() {
             *current = Some(deadline);
             true
@@ -113,10 +125,10 @@ impl WriteAdmission {
         }
     }
     pub fn revoke(&self) {
-        *self.deadline.lock().unwrap() = None;
+        *self.lock_deadline() = None;
     }
     fn check(&self) -> Result<()> {
-        let mut deadline = self.deadline.lock().unwrap();
+        let mut deadline = self.lock_deadline();
         if deadline.is_some_and(|value| value > Instant::now()) {
             return Ok(());
         }
@@ -168,6 +180,7 @@ struct Inner {
     root: PathBuf,
     shared: Arc<Shared>,
     control: Arc<Semaphore>,
+    staging: Arc<Semaphore>,
     audit: Arc<Semaphore>,
     control_slots: Arc<Semaphore>,
     audit_slots: Arc<Semaphore>,
@@ -233,6 +246,7 @@ impl Journal {
             root,
             shared: shared.clone(),
             control: Arc::new(Semaphore::new(options.control_bytes)),
+            staging: Arc::new(Semaphore::new(2 * crate::VALUE_BUDGET)),
             audit: Arc::new(Semaphore::new(options.audit_bytes)),
             control_slots: Arc::new(Semaphore::new(options.queue_requests)),
             audit_slots: Arc::new(Semaphore::new(options.queue_requests)),
@@ -284,7 +298,7 @@ impl Journal {
         events: Vec<Event>,
         class: QueueClass,
     ) -> Result<Commit> {
-        self.submit_inner(tx_id, events, class, None, Vec::new())
+        self.submit_inner(tx_id, events, class, None, Vec::new(), Vec::new())
             .await
     }
 
@@ -294,8 +308,52 @@ impl Journal {
         tx: Transaction,
         changes: Vec<EntityChange>,
     ) -> Result<Commit> {
+        self.submit_prepared_values(tx, changes, Vec::new()).await
+    }
+
+    /// Stage without publishing facts. The byte permits and anonymous file live
+    /// until cancellation/rollback drops them or the atomic command completes.
+    pub async fn prepare_json(
+        &self,
+        value: serde_json::Value,
+        limit: usize,
+    ) -> Result<PreparedValue> {
+        if limit > crate::VALUE_BUDGET {
+            return Err(Error::Limit("staged command value".into()));
+        }
+        let permit = self
+            .inner
+            .staging
+            .clone()
+            .acquire_many_owned(limit as u32)
+            .await
+            .map_err(|e| Error::Unavailable(e.to_string()))?;
+        let identity = self.id().to_owned();
+        tokio::task::spawn_blocking(move || PreparedValue::json(&identity, value, limit, permit))
+            .await
+            .map_err(|e| Error::Unavailable(e.to_string()))?
+    }
+
+    /// Stream staged chunks and the final transition inside one SQLite COMMIT.
+    pub async fn submit_prepared_values(
+        &self,
+        tx: Transaction,
+        changes: Vec<EntityChange>,
+        values: Vec<StagedValue>,
+    ) -> Result<Commit> {
         if tx.journal_id != self.id() {
             return Err(invalid("foreign prepared transition"));
+        }
+        for value in &values {
+            let publication = value.publication()?;
+            if publication.payload["journal_id"].as_str() != Some(self.id()) {
+                return Err(invalid("foreign staged value"));
+            }
+            if !tx.events.contains(&publication) {
+                return Err(invalid(
+                    "staged value requires its publication in the final transaction",
+                ));
+            }
         }
         self.submit_inner(
             tx.tx_id,
@@ -303,6 +361,7 @@ impl Journal {
             QueueClass::Control,
             Some(tx.lsn),
             changes,
+            values,
         )
         .await
     }
@@ -314,6 +373,7 @@ impl Journal {
         class: QueueClass,
         expected_lsn: Option<u64>,
         changes: Vec<EntityChange>,
+        values: Vec<StagedValue>,
     ) -> Result<Commit> {
         if events
             .iter()
@@ -342,8 +402,12 @@ impl Journal {
         } else {
             codec::bounded_json(&changes, crate::sqlite::MAX_ENTITY_BYTES)?.len()
         };
+        // Staged values stream one bounded chunk at a time. Keep its working
+        // record reserved instead of charging the whole file to the queue.
+        let scratch = if values.is_empty() { 0 } else { MAX_LINE_BYTES };
         let reserve = MAX_LINE_BYTES
-            .checked_add(change_bytes)
+            .checked_add(scratch)
+            .and_then(|n| n.checked_add(change_bytes))
             .ok_or_else(|| invalid("queue byte overflow"))?;
         let max_capacity = match class {
             QueueClass::Control => self.inner.control_budget,
@@ -368,7 +432,7 @@ impl Journal {
             events,
         };
         let body = codec::bounded_json(&tx, MAX_LINE_BYTES)?;
-        let bytes = body.len() + change_bytes;
+        let bytes = body.len() + change_bytes + scratch;
         if matches!(class, QueueClass::Audit(_)) && bytes > 512 * 1024 {
             return Err(Error::Limit("audit transaction exceeds 512 KiB".into()));
         }
@@ -392,6 +456,7 @@ impl Journal {
             queue.stats.peak_queued_requests = queue.stats.peak_queued_requests.max(queue.requests);
             let pending = Pending {
                 tx,
+                values,
                 changes,
                 expected_lsn,
                 wire,
@@ -419,6 +484,7 @@ impl Journal {
 
     pub async fn close(&self) -> Result<()> {
         self.inner.control.close();
+        self.inner.staging.close();
         self.inner.audit.close();
         self.inner.control_slots.close();
         self.inner.audit_slots.close();
@@ -506,7 +572,7 @@ fn lock_queue(shared: &Shared) -> std::sync::MutexGuard<'_, Queue> {
 }
 
 fn pump_step(disk: &mut Disk, shared: &Arc<Shared>, options: &JournalOptions) -> PumpStep {
-    let (batch, admission) = {
+    let (mut batch, admission) = {
         let mut queue = lock_queue(shared);
         while queue.requests == 0 && !queue.closing {
             queue = shared
@@ -546,7 +612,48 @@ fn pump_step(disk: &mut Disk, shared: &Arc<Shared>, options: &JournalOptions) ->
     let mut encoded_bytes = 0;
     let outcome: Result<()> = (|| {
         disk.begin()?;
-        for pending in &batch {
+        for pending in &mut batch {
+            let chunks: u64 = pending.values.iter().map(|value| value.chunk_count()).sum();
+            let final_lsn = disk
+                .last_lsn
+                .checked_add(chunks)
+                .and_then(|lsn| lsn.checked_add(1))
+                .ok_or_else(|| invalid("LSN overflow"))?;
+            if pending
+                .expected_lsn
+                .is_some_and(|expected| expected != final_lsn)
+            {
+                return Err(Error::Conflict(
+                    "prepared transition sequence changed".into(),
+                ));
+            }
+            let mut value_prefix = Vec::new();
+            for value in &mut pending.values {
+                let prefix = value.prefix(
+                    disk.last_lsn
+                        .checked_add(1)
+                        .ok_or_else(|| invalid("LSN overflow"))?,
+                );
+                for (index, metadata) in prefix.into_iter().enumerate() {
+                    if let Some(admission) = &admission {
+                        admission.check()?;
+                    }
+                    let mut chunk_tx = metadata.clone();
+                    chunk_tx.events[0].payload =
+                        serde_json::to_value(value.read_chunk(index as u64)?)?;
+                    chunk_tx.validate()?;
+                    let body = codec::bounded_json(&chunk_tx, MAX_LINE_BYTES)?;
+                    disk.append(
+                        &chunk_tx,
+                        &[],
+                        true,
+                        body.len() as u64,
+                        &codec::digest(&body),
+                    )?;
+                    encoded_bytes += body.len();
+                    value_prefix.push(metadata);
+                }
+            }
             if let Some(admission) = &admission {
                 admission.check()?;
             }
@@ -586,10 +693,16 @@ fn pump_step(disk: &mut Disk, shared: &Arc<Shared>, options: &JournalOptions) ->
                 bytes,
                 &digest,
             )?;
-            encoded_bytes += pending.bytes;
+            encoded_bytes += pending.bytes
+                - if pending.values.is_empty() {
+                    0
+                } else {
+                    MAX_LINE_BYTES
+                };
             commits.push(Commit {
                 transaction: Arc::new(tx),
                 location,
+                value_prefix,
             });
         }
         disk.sync()?;
@@ -608,12 +721,29 @@ fn pump_step(disk: &mut Disk, shared: &Arc<Shared>, options: &JournalOptions) ->
         Ok(()) => {
             queue.stats.durable_lsn = disk.last_lsn;
             queue.stats.batches += 1;
-            queue.stats.transactions += batch.len() as u64;
-            queue.stats.events += batch.iter().map(|p| p.tx.events.len() as u64).sum::<u64>();
+            queue.stats.transactions += commits
+                .iter()
+                .map(|c| c.value_prefix.len() as u64 + 1)
+                .sum::<u64>();
+            queue.stats.events += commits
+                .iter()
+                .map(|c| {
+                    c.transaction.events.len() as u64
+                        + c.value_prefix
+                            .iter()
+                            .map(|tx| tx.events.len() as u64)
+                            .sum::<u64>()
+                })
+                .sum::<u64>();
             queue.stats.encoded_bytes += encoded_bytes as u64;
-            queue.stats.max_batch_transactions =
-                queue.stats.max_batch_transactions.max(batch.len());
-            queue.stats.max_batch_bytes = queue.stats.max_batch_bytes.max(encoded_bytes);
+            queue.stats.max_batch_transactions = queue
+                .stats
+                .max_batch_transactions
+                .max(commits.iter().map(|c| c.value_prefix.len() + 1).sum());
+            queue.stats.max_batch_bytes = queue
+                .stats
+                .max_batch_bytes
+                .max(batch.iter().map(|p| p.bytes).sum());
             drop(queue);
             // Lost receivers do not roll back the persisted transaction.
             for (pending, commit) in batch.into_iter().zip(commits) {
@@ -639,5 +769,22 @@ fn pump_step(disk: &mut Disk, shared: &Arc<Shared>, options: &JournalOptions) ->
             }
             PumpStep::Continue
         }
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    #[test]
+    fn poisoned_lease_is_revoked_without_panicking_or_being_revived() {
+        let lease = WriteAdmission::new(Instant::now() + Duration::from_secs(60));
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = lease.deadline.lock().unwrap();
+            panic!("lease update interrupted");
+        });
+        assert!(matches!(lease.check(), Err(Error::Unavailable(_))));
+        assert!(!lease.renew(Instant::now() + Duration::from_secs(120)));
+        lease.revoke();
+        assert!(lease.check().is_err());
     }
 }

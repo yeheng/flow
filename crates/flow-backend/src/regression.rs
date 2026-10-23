@@ -129,7 +129,7 @@ impl JournalBackend {
             self.journal.root(),
             self.journal.durable_lsn(),
             &root.input,
-            8 * 1024 * 1024,
+            flow_journal::VALUE_BUDGET,
         )?;
         self.start_with_regression(
             workflow.unwrap_or(&root.workflow_id),

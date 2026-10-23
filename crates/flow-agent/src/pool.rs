@@ -17,9 +17,6 @@ use flow_engine::execution_protocol::transport::{master_handshake, FrameTranspor
 
 use crate::relay::{Relay, PER_EXECUTOR_QUEUE};
 
-/// 执行器声明的能力（与主进程必需能力对齐）。
-pub const EXECUTOR_CAPABILITIES: &[&str] = &["execute", "js", "http", "transfer"];
-
 /// 一个本地受控执行器会话句柄（runtime 持有）。
 pub struct ExecutorHandle {
     pub dispatch_id: String,

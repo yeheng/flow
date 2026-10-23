@@ -15,6 +15,7 @@ const h = vi.hoisted(() => {
   const obsStore: ObsRec[] = [];
   /** run.observations.page 的 from_seq 调用序列（十进制字符串水位） */
   const obsCalls: string[] = [];
+  const delayed = { page: null as null | Promise<{ events: unknown[]; next_cursor: null }> };
 
   function snapshot(runId: string) {
     return { run_id: runId, status: "running", last_run_seq: "0" };
@@ -43,12 +44,12 @@ const h = vi.hoisted(() => {
       return {} as T;
     }
     async page() {
-      return { events: [], next_cursor: null };
+      return delayed.page ?? { events: [], next_cursor: null };
     }
     async download(): Promise<void> {}
   }
 
-  return { obsStore, obsCalls, FakeJournalClient };
+  return { obsStore, obsCalls, FakeJournalClient, delayed };
 });
 
 vi.mock("../api/journal", () => ({ JournalClient: h.FakeJournalClient }));
@@ -90,6 +91,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   h.obsStore.splice(0);
   h.obsCalls.splice(0);
+  h.delayed.page = null;
   for (const seq of ["1", "2", "3", "4", "5"]) h.obsStore.push(obs(seq, `line-${seq}`));
 });
 
@@ -134,4 +136,17 @@ describe("observation incremental pull", () => {
     expect(w.findAll(".log-item").length).toBe(5);
     expect(w.text()).toContain("line-5");
   });
+});
+
+it("ignores an in-flight page after the audit selection changes", async () => {
+  const w = create();
+  await openRun(w);
+  let resolve!: (value: { events: unknown[]; next_cursor: null }) => void;
+  h.delayed.page = new Promise((r) => { resolve = r; });
+  await buttonByText(w, "重新读取").trigger("click");
+  await w.find(".journal-check input").setValue(false);
+  resolve({ events: [{ event: { kind: "run_failed", payload: { error: "stale-event" } } }], next_cursor: null });
+  await flushPromises();
+  expect(w.text()).not.toContain("stale-event");
+  expect(w.text()).toContain("尚未读取历史事件");
 });

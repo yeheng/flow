@@ -426,6 +426,14 @@ impl Node {
         NodeType::parse(&self.node_type)
     }
 
+    /// Agent mode is a validated literal, so scheduling never evaluates user JS.
+    pub fn is_harness_agent(&self) -> bool {
+        self.kind() == Some(NodeType::Harness)
+            && self
+                .param_str("mode")
+                .is_some_and(|mode| mode.trim() == "agent")
+    }
+
     pub fn param_str(&self, key: &str) -> Option<&str> {
         self.params.get(key).and_then(Value::as_str)
     }

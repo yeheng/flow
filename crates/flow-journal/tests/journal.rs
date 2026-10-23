@@ -1,82 +1,18 @@
 use std::time::Duration;
 
-use flow_journal::codec::{decode, digest, encode, read_line};
 use flow_journal::storage::FaultInjection;
 use flow_journal::value::{materialize, read_value, store_stream, ValueCodec};
 use flow_journal::{
-    scan, Event, EventKind, Journal, JournalOptions, QueueClass, StoredValue, Transaction,
-    MAX_LINE_BYTES,
+    scan, Event, EventKind, Journal, JournalOptions, QueueClass, StoredValue, MAX_LINE_BYTES,
 };
 use serde_json::json;
 
-fn tx() -> Transaction {
-    Transaction {
-        v: 2,
-        journal_id: "j1".into(),
-        lsn: 1,
-        tx_id: "t1".into(),
-        events: vec![event(), event()],
-    }
-}
 fn event() -> Event {
     Event::new(
         EventKind::Command,
         json!({"my_auth_token":"business", "nested":{"a":1}}),
     )
 }
-fn raw(data: &str) -> Vec<u8> {
-    format!(
-        "{{\"data\":{data},\"sha256\":\"{}\"}}\n",
-        digest(data.as_bytes())
-    )
-    .into_bytes()
-}
-
-#[test]
-fn codec_raw_bytes_versions_keys_and_transaction_boundary() {
-    let line = encode(&tx()).unwrap();
-    assert_eq!(decode(&line).unwrap(), tx());
-    let data = serde_json::to_string_pretty(&tx())
-        .unwrap()
-        .replace('\n', " ");
-    assert_eq!(decode(&raw(&data)).unwrap(), tx()); // hashing reserialization would reject this
-    assert!(decode(&line[..line.len() - 1]).is_err());
-    let mut corrupt = line.clone();
-    corrupt[20] ^= 1;
-    assert!(decode(&corrupt).is_err());
-    let data = serde_json::to_string(&tx()).unwrap();
-    for changed in [
-        data.replace("\"v\":2", "\"v\":3"),
-        data.replace("\"v\":1", "\"v\":99"),
-        data.replace("\"a\":1", "\"a\":1,\"a\":2"),
-        data.replace("\"lsn\":\"1\"", "\"lsn\":\"01\""),
-        data.replace("\"command\"", "\"future_required_event\""),
-    ] {
-        assert!(decode(&raw(&changed)).is_err(), "{changed}");
-    }
-    let duplicate = format!(
-        "{{\"data\":{data},\"data\":{data},\"sha256\":\"{}\"}}\n",
-        digest(data.as_bytes())
-    );
-    assert!(decode(duplicate.as_bytes()).is_err());
-    let mut huge = tx();
-    huge.events[1].payload = json!("x".repeat(MAX_LINE_BYTES));
-    assert!(encode(&huge).is_err());
-    assert!(read_line(&mut std::io::Cursor::new(vec![b'x'; MAX_LINE_BYTES + 1])).is_err());
-    assert!(read_line(&mut std::io::Cursor::new(&line[..line.len() - 1])).is_err());
-    let mut reader = std::io::Cursor::new(line.repeat(1000));
-    for _ in 0..1000 {
-        assert_eq!(
-            decode(&read_line(&mut reader).unwrap().unwrap())
-                .unwrap()
-                .events
-                .len(),
-            2
-        );
-    }
-    assert!(read_line(&mut reader).unwrap().is_none());
-}
-
 #[tokio::test]
 async fn batch_durability_round_robin_lock_and_restart() {
     let dir = tempfile::tempdir().unwrap();

@@ -20,6 +20,9 @@ const ACTIVE_RUNS_SQL:&str="SELECT key FROM current_entities INDEXED BY entity_a
 
 pub use flow_journal::sqlite::EntityChange;
 
+const LIST_BYTES: i64 = 4 * 1024 * 1024;
+const READ_BYTES: i64 = flow_journal::VALUE_BUDGET as i64;
+
 #[derive(Default)]
 pub struct RunsQuery<'a> {
     pub workflow_id: Option<&'a str>,
@@ -27,6 +30,30 @@ pub struct RunsQuery<'a> {
     pub source: Option<&'a str>,
     pub before_run_id: Option<&'a str>,
     pub limit: usize,
+}
+
+fn ordered_query(kind: &str, workflow_id: Option<&str>, by_name: bool) -> QueryBuilder<Sqlite> {
+    let name_index = by_name && matches!(kind, "workflow" | "template");
+    let mut query = QueryBuilder::<Sqlite>::new(if name_index {
+        "SELECT key,length(CAST(body AS BLOB)) AS bytes FROM current_entities INDEXED BY entity_name_order WHERE kind="
+    } else {
+        "SELECT key,length(CAST(body AS BLOB)) AS bytes FROM current_entities WHERE kind="
+    });
+    query.push_bind(kind);
+    if name_index {
+        // SQLite cannot infer this partial-index predicate from kind=? alone.
+        query.push(" AND kind IN ('workflow','template')");
+    }
+    if let Some(id) = workflow_id {
+        query.push(" AND workflow_id=").push_bind(id);
+    }
+    query.push(if by_name {
+        " ORDER BY name,key"
+    } else {
+        " ORDER BY created_order DESC,key DESC"
+    });
+    query.push(" LIMIT 10001");
+    query
 }
 
 fn attempt_filter(q: &mut QueryBuilder<Sqlite>, run: &str, all: bool) {
@@ -107,7 +134,8 @@ impl Store {
                 .fetch_one(&mut *tx)
                 .await?;
         let body_row =
-            sqlx::query("SELECT CASE WHEN length(CAST(body AS BLOB))<=8388608 THEN body ELSE 'RESPONSE_TOO_LARGE' END,digest FROM current_entities WHERE kind=? AND key=?")
+            sqlx::query("SELECT CASE WHEN length(CAST(body AS BLOB))<=? THEN body ELSE 'RESPONSE_TOO_LARGE' END,digest FROM current_entities WHERE kind=? AND key=?")
+                .bind(READ_BYTES)
                 .bind(kind)
                 .bind(key)
                 .fetch_optional(&mut *tx)
@@ -123,7 +151,7 @@ impl Store {
         if kind == "workflow" && with_nodes {
             if let Some(workflow) = value.as_mut() {
                 let size:i64=sqlx::query_scalar("SELECT COALESCE(SUM(length(CAST(body AS BLOB))),0) FROM current_entities WHERE kind='workflow_version' AND parent=?").bind(key).fetch_one(&mut *tx).await?;
-                if size > 8 * 1024 * 1024 {
+                if size > READ_BYTES {
                     return Err(Error::ResponseTooLarge);
                 }
                 let rows=sqlx::query("SELECT key,body,digest FROM current_entities WHERE kind='workflow_version' AND parent=? ORDER BY key").bind(key).fetch_all(&mut *tx).await?;
@@ -155,7 +183,7 @@ impl Store {
                         .build_query_scalar::<i64>()
                         .fetch_one(&mut *tx)
                         .await?;
-                if size > (8 * 1024 * 1024 - body.as_ref().map_or(0, String::len)) as i64 {
+                if size > (READ_BYTES as usize - body.as_ref().map_or(0, String::len)) as i64 {
                     return Err(Error::ResponseTooLarge);
                 }
                 let nodes = sqlx::query("SELECT slot AS node_id,key,body,digest FROM current_entities WHERE kind='run_node' AND parent=?")
@@ -270,37 +298,32 @@ impl Store {
             sqlx::query_scalar("SELECT committed_lsn FROM store_meta WHERE singleton=1")
                 .fetch_one(&mut *tx)
                 .await?;
+        // Bound bytes in SQLite before transferring bodies. Fetching all candidates
+        // first would defeat the response budget for a page of large values.
         let rows = sqlx::query(
-            "SELECT key,length(CAST(body AS BLOB)) AS bytes FROM current_entities WHERE kind=? AND key>? ORDER BY key LIMIT ?",
+            "WITH candidates AS MATERIALIZED (
+                SELECT key,length(CAST(body AS BLOB)) AS bytes FROM current_entities
+                WHERE kind=? AND key>? ORDER BY key LIMIT ?
+             ), bounded AS (
+                SELECT key,bytes,SUM(bytes) OVER (ORDER BY key) AS total FROM candidates
+             )
+             SELECT e.key,CASE WHEN b.total<=? THEN e.body END AS body,e.digest
+             FROM bounded b JOIN current_entities e ON e.kind=? AND e.key=b.key
+             WHERE b.total<=? OR b.total=b.bytes ORDER BY e.key",
         )
         .bind(kind)
         .bind(after)
         .bind(limit.min(256) as i64)
+        .bind(LIST_BYTES)
+        .bind(kind)
+        .bind(LIST_BYTES)
         .fetch_all(&mut *tx)
         .await?;
-        let mut values = Vec::new();
-        let mut bytes = 0i64;
+        let mut values = Vec::with_capacity(rows.len());
         for row in rows {
-            let n: i64 = row.get("bytes");
-            if bytes + n > 4 * 1024 * 1024 {
-                if values.is_empty() {
-                    return Err(Error::ResponseTooLarge);
-                }
-                break;
-            }
-            let body_row =
-                sqlx::query("SELECT body,digest FROM current_entities WHERE kind=? AND key=?")
-                    .bind(kind)
-                    .bind(row.get::<&str, _>("key"))
-                    .fetch_one(&mut *tx)
-                    .await?;
-            values.push(decode_body(
-                kind,
-                row.get("key"),
-                body_row.get("body"),
-                body_row.get("digest"),
-            )?);
-            bytes += n;
+            let body: Option<&str> = row.get("body");
+            let body = body.ok_or(Error::ResponseTooLarge)?;
+            values.push(decode_body(kind, row.get("key"), body, row.get("digest"))?);
         }
         Ok((
             lsn.parse()
@@ -361,19 +384,7 @@ impl Store {
         by_name: bool,
     ) -> Result<Vec<Value>, Error> {
         let mut tx = self.pool.begin().await?;
-        let mut query = QueryBuilder::<Sqlite>::new(
-            "SELECT key,length(CAST(body AS BLOB)) AS bytes FROM current_entities WHERE kind=",
-        );
-        query.push_bind(kind);
-        if let Some(id) = workflow_id {
-            query.push(" AND workflow_id=").push_bind(id);
-        }
-        query.push(if by_name {
-            " ORDER BY name,key"
-        } else {
-            " ORDER BY created_order DESC,key DESC"
-        });
-        query.push(" LIMIT 10001");
+        let mut query = ordered_query(kind, workflow_id, by_name);
         let rows = query.build().fetch_all(&mut *tx).await?;
         if rows.len() > 10000 {
             return Err(Error::ResponseTooLarge);
@@ -387,7 +398,7 @@ impl Store {
         rows: Vec<sqlx::sqlite::SqliteRow>,
     ) -> Result<(u64, Vec<Value>), Error> {
         let bytes: i64 = rows.iter().map(|r| r.get::<i64, _>("bytes")).sum();
-        if bytes > 8 * 1024 * 1024 {
+        if bytes > READ_BYTES {
             return Err(Error::ResponseTooLarge);
         }
         let mut values = Vec::with_capacity(rows.len());
@@ -457,6 +468,28 @@ mod tests {
             .join(" ");
         assert!(plan.contains("entity_active_runs"), "{plan}");
         assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        writer.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn named_collections_use_the_partial_index_without_temporary_sorting() {
+        let dir = flow_test_support::io::TempDir::new("name-query-plan");
+        let writer = flow_journal::Journal::open(dir.path(), Default::default())
+            .await
+            .unwrap();
+        let conn = flow_journal::sqlite::read_connection(dir.path()).unwrap();
+        for kind in ["workflow", "template"] {
+            let query = ordered_query(kind, None, true);
+            let plan = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {}", query.sql().as_str()))
+                .unwrap()
+                .query_map([kind], |r| r.get::<_, String>(3))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(plan.contains("entity_name_order"), "{plan}");
+            assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        }
         writer.close().await.unwrap();
     }
 }

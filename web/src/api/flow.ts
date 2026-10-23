@@ -448,7 +448,3 @@ export async function updateWebhookInvoke(
 export function webhookBase(): string {
   return httpUrl();
 }
-/** webhook 调用 URL（v2：Bearer 认证 + Idempotency-Key） */
-export function webhookUrl(key: string): string {
-  return `${httpUrl().replace(/\/$/, "")}/hooks/${key}`;
-}

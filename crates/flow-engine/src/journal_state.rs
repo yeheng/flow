@@ -409,6 +409,42 @@ pub struct CommandRecord {
     #[serde(with = "flow_journal::decimal")]
     pub lsn: u64,
 }
+/// One adjudication contract for command preflight and fact folding.
+pub fn validate_adjudication(decision: &str, reason: &str) -> Result<()> {
+    if reason.trim().is_empty() || reason.len() > 4096 {
+        return Err(invalid(
+            "manual resolution requires a reason of at most 4096 bytes",
+        ));
+    }
+    if !matches!(decision, "accept_output" | "retry" | "failed") {
+        return Err(invalid("decision must be accept_output | retry | failed"));
+    }
+    Ok(())
+}
+pub fn adjudicate_guard(
+    terminal: bool,
+    node: &Node,
+    operation_id: &str,
+    decision: &str,
+    reason: &str,
+) -> Result<()> {
+    validate_adjudication(decision, reason)?;
+    if terminal
+        || node
+            .wait
+            .as_ref()
+            .is_none_or(|w| w.kind() != WaitKind::Uncertain)
+        || node.operation.as_ref().is_none_or(|o| {
+            o.operation_id != operation_id || (o.outcome.is_some() && decision == "retry")
+        })
+    {
+        return Err(invalid(
+            "manual resolution requires the current uncertain operation",
+        ));
+    }
+    Ok(())
+}
+
 /// Business trigger watermark, independent of the bounded RPC receipt window.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScheduleFire {
@@ -485,10 +521,10 @@ impl State {
         tx: &Transaction,
         inspect: impl FnOnce(&State) -> Result<T>,
     ) -> Result<T> {
-        self.apply_mode(tx, true, inspect)
+        self.apply_mode(std::slice::from_ref(tx), true, inspect)
     }
     pub fn check(&mut self, tx: &Transaction) -> Result<()> {
-        self.apply_mode(tx, false, |_| Ok(()))
+        self.apply_mode(std::slice::from_ref(tx), false, |_| Ok(()))
     }
     /// Inspect the proposed state and always restore the old state, including when
     /// encoding fails. Uses the same affected-entity undo as apply(), not a full clone.
@@ -498,77 +534,114 @@ impl State {
         inspect: impl FnOnce(&State) -> Result<T>,
     ) -> Result<T> {
         let mut output = None;
-        self.apply_mode(tx, false, |state| {
+        self.apply_mode(std::slice::from_ref(tx), false, |state| {
             output = Some(inspect(state)?);
             Ok(())
         })?;
         Ok(output.expect("successful preview"))
     }
+    /// One atomic command, optionally preceded by dataset-scoped value chunks.
+    /// Chunk payload bytes are writer-owned; the reducer only needs metadata.
+    pub fn preview_batch<T>(
+        &mut self,
+        transactions: &[Transaction],
+        inspect: impl FnOnce(&State) -> Result<T>,
+    ) -> Result<T> {
+        self.apply_mode(transactions, false, inspect)
+    }
+    pub fn apply_batch(&mut self, transactions: &[Transaction]) -> Result<()> {
+        self.apply_mode(transactions, true, |_| Ok(()))
+    }
     fn apply_mode<T>(
         &mut self,
-        tx: &Transaction,
+        transactions: &[Transaction],
         commit: bool,
         inspect: impl FnOnce(&State) -> Result<T>,
     ) -> Result<T> {
-        tx.validate()?;
-        if tx.lsn != self.applied_lsn + 1
-            || (!self.journal_id.is_empty() && self.journal_id != tx.journal_id)
-        {
-            return Err(invalid("reducer identity/LSN mismatch"));
-        }
-        for (index, event) in tx.events.iter().enumerate() {
-            if event.audit_seq > 0
-                && (event.run_id.is_none()
-                    || event
-                        .node_id
-                        .as_deref()
-                        .or_else(|| event.payload["node_id"].as_str())
-                        .is_none())
+        let last = transactions
+            .last()
+            .ok_or_else(|| invalid("empty atomic transition"))?;
+        for (index, tx) in transactions.iter().enumerate() {
+            if index + 1 < transactions.len()
+                && tx.events.iter().any(|event| {
+                    event.kind != EventKind::ValueChunk
+                        || event.run_id.is_some()
+                        || event.node_id.is_some()
+                        || event.dispatch_id.is_some()
+                        || event.run_seq != 0
+                        || event.audit_seq != 0
+                })
             {
-                return Err(invalid("audit requires run and node identity"));
+                return Err(invalid(
+                    "atomic transition prefix must contain dataset value chunks only",
+                ));
             }
-            if event.kind == EventKind::MasterEpochStarted {
-                if event.run_id.is_some()
-                    || event.dispatch_id.is_some()
-                    || event.node_id.is_some()
-                    || event.run_seq != 0
-                    || event.audit_seq != 0
-                {
-                    return Err(invalid("master epoch event must be dataset-scoped"));
-                }
-                let epoch = number(&event.payload, "epoch")?;
-                if epoch != self.master_epoch + 1 {
-                    return Err(invalid("master epoch must advance by exactly one"));
-                }
-            }
-            if event.kind == EventKind::OperationIntent {
-                let next = tx
-                    .events
-                    .get(index + 1)
-                    .ok_or_else(|| invalid("intent without atomic authorization"))?;
-                if next.kind != EventKind::OperationAuthorized
-                    || next.run_id != event.run_id
-                    || next.dispatch_id != event.dispatch_id
-                    || next.node_id != event.node_id
-                    || next.payload != event.payload
-                    || event.audit_seq != 0
-                    || next.audit_seq != 0
-                {
-                    return Err(invalid(
-                        "intent/authorization must share transaction and payload",
-                    ));
-                }
-            }
-            if event.kind == EventKind::OperationAuthorized
-                && (index == 0 || tx.events[index - 1].kind != EventKind::OperationIntent)
+            tx.validate()?;
+            if tx.lsn
+                != self
+                    .applied_lsn
+                    .checked_add(index as u64 + 1)
+                    .ok_or_else(|| invalid("LSN overflow"))?
+                || tx.journal_id != last.journal_id
+                || (!self.journal_id.is_empty() && self.journal_id != tx.journal_id)
             {
-                return Err(invalid("authorization without intent"));
+                return Err(invalid("reducer identity/LSN mismatch"));
+            }
+            for (index, event) in tx.events.iter().enumerate() {
+                if event.audit_seq > 0
+                    && (event.run_id.is_none()
+                        || event
+                            .node_id
+                            .as_deref()
+                            .or_else(|| event.payload["node_id"].as_str())
+                            .is_none())
+                {
+                    return Err(invalid("audit requires run and node identity"));
+                }
+                if event.kind == EventKind::MasterEpochStarted {
+                    if event.run_id.is_some()
+                        || event.dispatch_id.is_some()
+                        || event.node_id.is_some()
+                        || event.run_seq != 0
+                        || event.audit_seq != 0
+                    {
+                        return Err(invalid("master epoch event must be dataset-scoped"));
+                    }
+                    let epoch = number(&event.payload, "epoch")?;
+                    if epoch != self.master_epoch + 1 {
+                        return Err(invalid("master epoch must advance by exactly one"));
+                    }
+                }
+                if event.kind == EventKind::OperationIntent {
+                    let next = tx
+                        .events
+                        .get(index + 1)
+                        .ok_or_else(|| invalid("intent without atomic authorization"))?;
+                    if next.kind != EventKind::OperationAuthorized
+                        || next.run_id != event.run_id
+                        || next.dispatch_id != event.dispatch_id
+                        || next.node_id != event.node_id
+                        || next.payload != event.payload
+                        || event.audit_seq != 0
+                        || next.audit_seq != 0
+                    {
+                        return Err(invalid(
+                            "intent/authorization must share transaction and payload",
+                        ));
+                    }
+                }
+                if event.kind == EventKind::OperationAuthorized
+                    && (index == 0 || tx.events[index - 1].kind != EventKind::OperationIntent)
+                {
+                    return Err(invalid("authorization without intent"));
+                }
             }
         }
+        let events: Vec<_> = transactions.iter().flat_map(|tx| &tx.events).collect();
         // Undo only changed entities, not the full historical state. Inline values are bounded.
         // Payload-only audits change counters and one receipt entry, never node state.
         // Their rollback cost is independent of the accumulated run history.
-        let audit_only = tx.events.iter().all(|e| e.is_audit_only());
+        let audit_only = events.iter().all(|e| e.is_audit_only());
         let mut audit_undo = Vec::new();
         let mut run_seq_undo = BTreeMap::new();
         let mut workflow_undo = BTreeMap::new();
@@ -576,8 +649,7 @@ impl State {
         let mut node_undo = BTreeMap::new();
         let mut attempt_undo = BTreeMap::new();
         let mut membership_undo = BTreeMap::new();
-        let replaced_nodes: std::collections::BTreeSet<_> = tx
-            .events
+        let replaced_nodes: std::collections::BTreeSet<_> = events
             .iter()
             .filter(|e| e.kind == EventKind::NodeSkipped)
             .filter_map(|e| {
@@ -597,7 +669,7 @@ impl State {
         let mut value_undo = BTreeMap::new();
         let mut legacy_undo = BTreeMap::new();
         let mut epoch_undo: Option<u64> = None;
-        for event in &tx.events {
+        for event in &events {
             if event.kind == EventKind::RunStarted {
                 let workflow = string(&event.payload, "workflow_id")?;
                 membership_undo
@@ -739,13 +811,15 @@ impl State {
             }
         }
         let result = (|| {
-            for event in &tx.events {
-                self.values.apply(event, &tx.journal_id)?;
-                self.check_values(event)?;
-                self.apply_event(event, tx.lsn, &mut command_undo)?;
-                if let Some(run) = event.run_id.as_ref().and_then(|id| self.runs.get_mut(id)) {
-                    if !audit_only {
-                        run.refresh_status();
+            for tx in transactions {
+                for event in &tx.events {
+                    self.values.apply(event, &tx.journal_id)?;
+                    self.check_values(event)?;
+                    self.apply_event(event, tx.lsn, &mut command_undo)?;
+                    if let Some(run) = event.run_id.as_ref().and_then(|id| self.runs.get_mut(id)) {
+                        if !audit_only {
+                            run.refresh_status();
+                        }
                     }
                 }
             }
@@ -835,8 +909,8 @@ impl State {
             }
         } else {
             self.version = 1;
-            self.journal_id = tx.journal_id.clone();
-            self.applied_lsn = tx.lsn;
+            self.journal_id = last.journal_id.clone();
+            self.applied_lsn = last.lsn;
         }
         result
     }
@@ -1392,22 +1466,13 @@ impl State {
             }
             EventKind::Adjudicated => {
                 let decision = p["decision"].as_str().unwrap_or_default();
-                // 与命令层同规则:outcome 已提交时仍可 accept_output/failed
-                // (人工用已捕获的外部结果收口),仅 retry 要求未决 outcome。
-                if terminal
-                    || node
-                        .wait
-                        .as_ref()
-                        .is_none_or(|w| w.kind() != WaitKind::Uncertain)
-                    || node.operation.as_ref().is_none_or(|o| {
-                        p["operation_id"] != o.operation_id
-                            || (o.outcome.is_some() && decision == "retry")
-                    })
-                    || p["reason"].as_str().is_none_or(|s| s.trim().is_empty())
-                    || !matches!(decision, "accept_output" | "retry" | "failed")
-                {
-                    return Err(invalid("invalid manual resolution"));
-                }
+                adjudicate_guard(
+                    terminal,
+                    node,
+                    p["operation_id"].as_str().unwrap_or_default(),
+                    decision,
+                    p["reason"].as_str().unwrap_or_default(),
+                )?;
                 match decision {
                     // 人工显式接受产出（不伪造外部响应被捕获的事实）
                     "accept_output" => {
@@ -1653,5 +1718,75 @@ mod wait_compat_tests {
         }
         let signal: Wait = serde_json::from_value(json!({"kind":"signal"})).unwrap();
         assert_eq!(signal.kind(), WaitKind::Signal);
+    }
+}
+
+#[cfg(test)]
+mod atomic_value_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn preview_and_apply_value_prefix_share_atomic_rollback_and_cursor_rules() {
+        let mut state = State::default();
+        let reference = flow_journal::ValueRef {
+            journal_id: "batch".into(),
+            output_id: "v".into(),
+            codec: flow_journal::value::ValueCodec::Json,
+            version: 1,
+            chunk_count: 1,
+            total_bytes: 1,
+            digest: "0".repeat(64),
+        };
+        let prefix = Transaction {
+            v: 2,
+            journal_id: "batch".into(),
+            lsn: 1,
+            tx_id: "chunk".into(),
+            events: vec![Event::new(
+                EventKind::ValueChunk,
+                json!({"output_id":"v","chunk_index":"0","data":null}),
+            )],
+        };
+        let mut final_tx = Transaction {
+            v: 2,
+            journal_id: "batch".into(),
+            lsn: 2,
+            tx_id: "command".into(),
+            events: vec![
+                Event::new(EventKind::ValuePublished, json!(reference)),
+                Event::new(
+                    EventKind::WorkflowCreated,
+                    json!({"workflow_id":"w","name":"batch","created_at":"2026-10-23T00:00:00Z","versions":{},"deleted":false}),
+                ),
+            ],
+        };
+        let before = serde_json::to_value(&state).unwrap();
+        assert!(state
+            .preview_batch(&[prefix.clone(), final_tx.clone()], |s| Ok(s
+                .workflows
+                .contains_key("w")))
+            .unwrap());
+        assert_eq!(serde_json::to_value(&state).unwrap(), before);
+        final_tx.events.push(Event::new(
+            EventKind::WorkflowPublished,
+            json!({"workflow_id":"missing","version":"1"}),
+        ));
+        assert!(state
+            .apply_batch(&[prefix.clone(), final_tx.clone()])
+            .is_err());
+        assert_eq!(
+            serde_json::to_value(&state).unwrap(),
+            before,
+            "failure must restore publication, state and cursor"
+        );
+        final_tx.events.pop();
+        let mut gap = final_tx.clone();
+        gap.lsn = 3;
+        assert!(state.apply_batch(&[prefix.clone(), gap]).is_err());
+        assert_eq!(serde_json::to_value(&state).unwrap(), before);
+        state.apply_batch(&[prefix, final_tx]).unwrap();
+        assert_eq!(state.applied_lsn, 2);
+        assert!(state.workflows.contains_key("w"));
+        assert!(state.values.check(&StoredValue::Ref(reference)).is_ok());
     }
 }

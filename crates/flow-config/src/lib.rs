@@ -280,7 +280,7 @@ pub struct HarnessAgentConfig {
     pub max_tool_calls_per_turn: Option<u64>,
     /// 1..=1_000_000
     pub max_tokens: Option<u64>,
-    /// 省略 = conga 默认（无引擎级工具超时；取消/超时由 executor 杀进程组）
+    /// 省略 = conga 默认；总生命周期仍受节点 timeout_ms 与一次性 executor 回收约束
     pub tool_timeout_secs: Option<u64>,
 }
 

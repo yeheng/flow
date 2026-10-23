@@ -204,12 +204,8 @@ struct BoundDispatch {
     notify: Notify,
 }
 
-// 字段是会话重构/记账事实：身份三件套在会话替换与 Resume 裁决路径被读，
-// bind_acks 是 bind 握手应答表；cli-side 观察者可另行读取（允许未读告警）。
-#[allow(dead_code)]
 struct AgentRegistration {
     agent_id: String,
-    agent_boot_id: String,
     link_session_id: String,
     outbound: mpsc::Sender<ToSession>,
     slots_total: AtomicU64,
@@ -236,8 +232,7 @@ pub struct AgentManager {
     tasks: tokio_util::task::TaskTracker,
 }
 
-// bind 挂起登记：agent_id/executor_id 在超时清理与诊断路径读取。
-#[allow(dead_code)]
+// Bind acknowledgement identity must match the current agent session.
 struct PendingBind {
     agent_id: String,
     link_session_id: String,
@@ -520,7 +515,6 @@ impl AgentManager {
         let (outbound, mut commands) = mpsc::channel::<ToSession>(256);
         let registration = Arc::new(AgentRegistration {
             agent_id: agent_id.clone(),
-            agent_boot_id: agent_boot_id.clone(),
             link_session_id: link_session_id.clone(),
             outbound: outbound.clone(),
             slots_total: AtomicU64::new(slots as u64),
@@ -1449,7 +1443,6 @@ mod capacity_tests {
         let register = |session: &str| {
             Arc::new(AgentRegistration {
                 agent_id: "agent".into(),
-                agent_boot_id: "boot".into(),
                 link_session_id: session.into(),
                 outbound: outbound.clone(),
                 slots_total: AtomicU64::new(1),

@@ -175,7 +175,7 @@ async fn journal_dev(
         let definition = read_json(definition, flow_journal::MAX_LINE_BYTES)?;
         let input = input
             .as_ref()
-            .map(|p| read_json(p, 8 * 1024 * 1024))
+            .map(|p| read_json(p, flow_journal::VALUE_BUDGET))
             .transpose()?
             .unwrap_or(serde_json::Value::Null);
         let created = backend.workflow_create("development", None).await?;

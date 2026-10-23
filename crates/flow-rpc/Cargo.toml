@@ -23,7 +23,7 @@ axum = { workspace = true }
 rustls = { workspace = true }
 clap = { workspace = true, features = ["env", "derive"] }
 flow-backend = { path = "../flow-backend" }
-flow-journal = { path = "../flow-journal" }
+flow-journal = { path = "../flow-journal", default-features = false, features = ["storage"] }
 flow-engine = { path = "../flow-engine" }
 flow-config = { path = "../flow-config" }
 sha2.workspace = true

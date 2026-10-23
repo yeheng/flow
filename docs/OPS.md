@@ -359,6 +359,8 @@ flow-cli run adjudicate --run-id <id> --node-id <n> \
 | 历史/正文/回执 | 本次保留全部，不引入 TTL 或 GC |
 | observations | 独立的容量与条数限额 |
 
+命令大输入和定义先进入匿名临时文件，暂存总预算 16 MiB、单值最多 8 MiB。writer 逐块读取，值块、发布与最终命令共享一次 COMMIT；拒绝或重复请求不会发布暂存值，取消／崩溃会释放未提交的暂存文件。历史事实与外部调用捕获证据继续完整保留。
+
 容量测量分开统计当前实体、事实、BLOB、索引、WAL 和空闲页。长读和大值会影响 WAL
 回收与备份成本。checkpoint 是 SQLite WAL 维护，不再产生应用状态快照。
 
@@ -528,13 +530,37 @@ executor 依赖 conga 固定 rev（见 `crates/flow-executor/Cargo.toml`），re
   （stream_fn 注入使加载分支不可达），workdir 的 `.env`/`.conga/config.toml`
   不被自动装配。执行器串行处理任务，钉根期间无并发读者。
 
-### 已知取舍
+### 生命周期与资源预算
 
-- runner 的 HOME/XDG/CARGO_HOME 全部指向本次 run 的临时目录（run 结束删除）：
-  真实 HOME 的 git/ssh 配置不可用（需要时在 workdir 的 `.git/config` 配身份），
-  私有 registry 凭据不继承（公开依赖可正常下载；每次 run 全新 CARGO_HOME
-  会重复下载，成本实测记录在 PR）。
-- FullAuto：agent 可读写 workdir、联网、起 shell——与外部 CLI harness 等价。
-  安全边界是「一个 OperationIntent 覆盖整次运行」；回归模式 0 外部调用。
-- 取消/超时走进程组 SIGKILL（executor 侧 Uncertain 裁决），依赖
-  `EXECUTION.md` 的受管 harness 合同，不依赖工具级超时。
+- agent 节点使用一次性 executor，结果提交后也回收整个会话/Job；普通节点继续复用执行器。
+- `timeout_ms` 从取得许可开始覆盖初始化、运行、清理和 outcome 落账；取消/超时保留不确定结果，不自动重放。
+  独立系统线程在截止/取消后给予 5 秒宽限（检查粒度 250ms），到期退出 executor。父端另有不受心跳延长的截止时间，触发有界取消排空和会话级 kill/wait/reap。
+- agent 并发至多 `ceil(派发上限 / 2)`。`x_max=4` 时至多 2 个；`x_max=1` 只能串行。
+  远程执行也受全局 16 个派发上限约束，增加 worker 不会自动提高该上限。
+- Linux/macOS 每 250ms 采样会话 RSS 与进程数，预算 1 GiB / 64 个进程；越界或采集失败时退出。
+  RSS 累加包含共享页，属于保守预算；采样不能阻止瞬时分配。Unix 工具继承单文件 256 MiB 硬限制。
+- CPU 总量、总磁盘、总模型费用以及主动脱离会话的 daemon，需由部署级容器、文件系统配额及供应商额度约束。
+  Windows 等其他平台本轮只提供生命周期看门狗，不能套用 Linux/macOS 的 RSS/PID 保证。
+
+### 环境与保留
+
+- HOME、XDG、CARGO_HOME 继承执行器环境白名单，**不指向临时根**。工具可能读取 git/ssh/registry 等配置；
+  需要隔离时用独立 worker 用户与受限容器。CONGA_CONFIG_DIR/CONGA_PROJECT_DIR 单独钉定到本次操作临时根。
+- FullAuto 允许读写、联网和 shell；随机 workdir 是临时工作目录，不是 OS 安全沙箱。
+- 正常路径尽力删除临时根；强制退出可能留有 `flow-harness-*` 目录。只在确认相关 executor 已回收后清理这些目录。
+- 工作流每个对象在协调器常驻最新版本与最高已发布版本；旧版本按需从 SQLite 读取。
+  软删除保留对象和历史，已启动 run 的冻结定义与回执仍有效。
+- 当前事实、正文及幂等回执不自动 TTL/GC。制定磁盘与备份预算，使用 `flow-journal-tool backup` 做一致备份，
+  用 `verify`/独立目录恢复演练核对。归档删除前必须证明活动运行、冻结子流程、审计和回执的引用闭包完整，不能直接删旧 BLOB 或事实。
+
+### 可重复的 agent 混合负载验收
+
+```sh
+cargo build --locked --offline --release -p flow-executor -p backend-perf --bin flow-executor --bin flow-capacity
+./target/release/flow-capacity agent-soak /tmp/flow-agent-soak /tmp/flow-agent-soak.json 180 ./target/release/flow-executor
+```
+
+使用全新目录。负载包含普通脚本、日志、HTTP、delay、人工任务、取消及内联 agent 的两轮模型/真实 bash 工具调用。
+provider 为本地确定性 mock，不消耗真实模型费用。JSON 写明环境、时长、提交/成功/取消/失败数、provider 调用数、延迟、进程树资源、重启与持久化诊断。
+默认最多 4 个并发 run、每 200ms 尝试提交一次；这是可复现的回归场景，不是饱和容量或生产 SLO。
+生产发布还需在目标平台按实际模型响应、工作目录体量、并发和持续时间复测。

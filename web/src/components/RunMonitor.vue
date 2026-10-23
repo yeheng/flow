@@ -62,9 +62,14 @@ function inputFormReady(nodeId: string): boolean {
 }
 
 function deliverInputForm(nodeId: string): void {
-  const assembled = assembleInput(inputFormTexts[draftKey(nodeId)] ?? {});
-  if (assembled === undefined) return;
-  void deliverSignal(nodeId, JSON.stringify(assembled));
+  try {
+    const node = monitor.nodes.find((n) => n.id === nodeId);
+    const assembled = assembleInput(inputFormTexts[draftKey(nodeId)] ?? {}, parseInputFields(node?.input));
+    if (assembled === undefined) return;
+    void deliverSignal(nodeId, JSON.stringify(assembled));
+  } catch (error) {
+    toast.error(error instanceof Error ? error.message : String(error));
+  }
 }
 
 let inputDialogs: Promise<void> = Promise.resolve();
@@ -93,6 +98,7 @@ function openInputDialog(node: TimelineNode): void {
         fields.map((f) => ({
           key: f.key,
           label: f.label ?? f.key,
+          type: f.type,
           required: true,
           defaultValue: inputFieldText(f, props.runInput),
         })),

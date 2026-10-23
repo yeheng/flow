@@ -144,3 +144,12 @@ it("ignores out-of-order workflow loads", async () => {
   expect(editor.workflowId).toBe("b");
   expect(editor.version).toBe(9);
 });
+
+it("reverting edits to saved row content clears dirty without another save", () => {
+  editor.nodes[0]!.data.name = "edit";
+  editor.edges[0]!.targetHandle = "changed";
+  expect(dirty.value).toBe(true);
+  editor.nodes[0]!.data.name = "start";
+  delete editor.edges[0]!.targetHandle;
+  expect(dirty.value).toBe(false);
+});

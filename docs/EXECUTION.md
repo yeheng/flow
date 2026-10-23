@@ -47,7 +47,17 @@
 
 受管理 harness 在超时、取消及正常结束时回收后代进程；执行器退出时，父进程还会回收其会话内的 harness 进程组。Unix 使用执行器会话和 harness 进程组，Windows 使用启动前绑定的 Job Object。主动脱离会话/作业的 daemon、跨主进程与执行器同时强杀的系统故障，仍需部署级进程容器或服务管理器约束；这不改变未知外部结果必须裁决的合同。
 
-`harness` 节点有两种模式（`mode` 参数，缺省 `command`）。`command` 运行用户自备的外部 agent CLI（请求恰好 5 字段，行为不变）。`agent` 由执行器**内联**驱动：直接调用 conga-host 的无头装配（typed 配置直入、API key 走参数、conga settings 永不被读），无独立 runner 子进程。超时/取消先走 conga 的协作中止信号（工具边界响应），未能在短窗内收尾即判 Uncertain。工具子进程由 conga 的 kill-on-drop 回收**直接子进程**；孙进程依赖执行器会话级回收（执行器退出时整会话收割，见上文受管理 harness 合同）——agent 模式不再提供独立进程组级的即时后代回收，这是内联执行的明确取舍。workdir 可选：缺省时执行器为每次 run 创建随机临时沙箱（结束后删除）；显式配置的路径须存在（授权前在执行器本机校验）。配置（base_url/model/限额等）来自 `[harness.agent]`，run 启动时冻结进执行快照；API key 只以密钥名出现在节点参数，真值经授权许可与 stdin 管道下发，任何环境变量都不携带。agent 模式同样是**单次受管 operation**：runner 内部的模型/工具调用不逐个受控、不逐轮记录，证据粒度仍是进程级（`trace_granularity=process`）。
+`harness` 节点有两种模式（`mode` 参数，缺省 `command`）。`command` 运行用户自备的外部 agent CLI。`agent` 在 executor 内联调用 conga-host 的无头装配，无独立 runner 二进制；typed 配置直入，API key 经 OperationPermit 的内存字段传给 provider，不使用 stdin 或环境变量。
+
+agent 从取得授权许可开始使用一个生命周期截止时间，覆盖临时目录准备、host 初始化、模型/工具回合、session 清理和 outcome 落账。取消或超时后停止等待，保留已有授权与结果证据；没有完整 outcome 的操作进入 Uncertain，不自动重放工具副作用。独立系统线程在截止时间或取消后给予 5 秒宽限（检查粒度 250ms），到期强制退出 executor，避免同步 host 代码阻塞 Tokio 时继续靠心跳占槽。
+
+agent 使用一次性 executor：成功结果正常提交后，本地池仍回收整个执行器会话；远程 agent 每次派发本来就独占一个执行器。父进程 kill/wait/reap 会清理会话/Job 内的工具后代，进程级环境及 host 状态不进入下一任务。普通节点继续复用空闲 executor。服务 `close()` 等待执行端口停止及跟踪会话完成回收，包含空闲和预热的 executor。调度器限制 agent 同时占用至多 `ceil(派发上限 / 2)` 个槽；上限大于 1 时给普通节点保留容量，上限为 1 时串行执行。
+
+Linux/macOS 看门狗每 250ms 检查 executor 会话各进程的 RSS 总和与数量，超过 1 GiB 或 64 个进程则退出；Unix 还设置继承到工具的 256 MiB 单文件硬上限。这是运行预算：RSS/PID 采样可能短时超量，RSS 会保守累加共享页，单文件限额不等于总磁盘限额，CPU 总量与总 token/费用没有独立硬限额。其他平台仅提供独立生命周期看门狗，资源隔离需由 worker 的 Job/容器补齐。主动脱离会话的进程和临时目录总量仍需部署级约束。
+
+workdir 可选，缺省为本次操作的随机临时工作目录；显式目录须在授权前通过存在性校验。临时目录和 FullAuto 都不构成 OS 安全沙箱。HOME、CARGO_HOME 与 XDG 路径仍按执行器白名单继承，工具可能访问其中的配置。conga 配置/项目状态单独钉定到本次操作临时根，不读取用户 conga settings。模型配置在 run 启动时冻结，回归使用 baseline 配置并执行零外部调用。
+
+agent 仍是一个受管理 operation，内部模型/工具调用不逐个持久化，证据粒度为 `trace_granularity=process`。强制终止无法撤回已发生的外部副作用，也可能留下临时目录；清理与保留策略不能冒充逐工具恢复保证。
 
 模型决定应由脚本/条件节点读取，业务工具由独立 HTTP 或子流程节点执行。每个模型调用和工具操作拥有独立的请求、授权和结果证据；可以对整个场景回归。`harness` 继续提供进程级证据，其内部调用不会被假定为独立受控工具操作。节点能力接口公开 `trace_granularity`。
 

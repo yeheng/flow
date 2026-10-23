@@ -140,14 +140,26 @@ export class WebSocketClient {
   }
 
   private async sendSubscribe(local: number, sub: Subscription): Promise<void> {
-    await this.waitOpen();
-    // 同一连接上只发一次：onopen 的重建与 subscribe 自身等待 waitOpen 后的发送在此去重
+    // Allocate the timeout before connecting: neither a silent handshake nor
+    // a silent subscription ACK may leave monitor.starting pending forever.
     if (sub.active) return;
     sub.active = true;
     const id = this.nextId++;
     await new Promise<void>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, localSub: local });
-      this.ws!.send(JSON.stringify({ jsonrpc: "2.0", id, method: sub.method, params: sub.params }));
+      const timer = setTimeout(() => {
+        if (!this.pending.delete(id)) return;
+        sub.active = false;
+        reject(new RpcError(-32001, `RPC 订阅超时：${sub.method}`));
+        this.ws?.close(); // Also dispose a late server subscription with an unknown id.
+      }, DEFAULT_CALL_TIMEOUT_MS);
+      this.pending.set(id, { resolve, reject, localSub: local, timer });
+      void this.waitOpen().then(() => {
+        if (this.pending.has(id) && this.subs.get(local) === sub) {
+          this.ws!.send(JSON.stringify({ jsonrpc: "2.0", id, method: sub.method, params: sub.params }));
+        }
+      }).catch((error) => {
+        if (this.pending.delete(id)) { clearTimeout(timer); sub.active = false; reject(error); }
+      });
     });
   }
 
@@ -174,7 +186,9 @@ export class WebSocketClient {
       // 先复位 active：本连接上尚未发送的订阅（连接未建立时发起的）由重建发送，
       // 其自身 waitOpen 后的续发会被 sendSubscribe 的 active 检查去重
       this.serverToLocal.clear();
-      for (const sub of this.subs.values()) sub.active = false;
+      for (const [local, sub] of this.subs) {
+        if (![...this.pending.values()].some((pending) => pending.localSub === local)) sub.active = false;
+      }
       for (const [local, sub] of this.subs) {
         void this.sendSubscribe(local, sub).catch(() => {});
       }

@@ -59,6 +59,7 @@ describe("WebSocketClient.call：超时上界与畸形帧可观测", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
@@ -108,4 +109,60 @@ describe("WebSocketClient.call：超时上界与畸形帧可观测", () => {
     client.close();
     await expect(p).rejects.toThrow();
   });
+});
+
+for (const connect of [false, true]) {
+  it(`subscription times out when ${connect ? "ACK" : "connection"} stays silent`, async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", MockWebSocket);
+    const client = freshClient();
+    try {
+      const pending = client.subscribe("run.subscribe", {}, () => {});
+      const rejection = expect(pending).rejects.toThrow(/订阅超时/);
+      if (connect) {
+        MockWebSocket.instances[0]!.open();
+        await Promise.resolve();
+        expect(MockWebSocket.instances[0]!.sent).toHaveLength(1);
+      }
+      await vi.advanceTimersByTimeAsync(DEFAULT_CALL_TIMEOUT_MS);
+      await rejection;
+    } finally {
+      client.close();
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+}
+
+it("subscribes once before opening and re-establishes after reconnect", async () => {
+  vi.useFakeTimers();
+  vi.stubGlobal("WebSocket", MockWebSocket);
+  const client = freshClient();
+  try {
+    const events = vi.fn();
+    const pending = client.subscribe("run.subscribe", {}, events);
+    const first = MockWebSocket.instances[0]!;
+    first.open();
+    await Promise.resolve();
+    expect(first.sent).toHaveLength(1);
+    first.receive({ jsonrpc: "2.0", id: first.lastSent().id, result: "old" });
+    const unsubscribe = await pending;
+    first.close();
+    await vi.advanceTimersByTimeAsync(500);
+    const second = MockWebSocket.instances[1]!;
+    second.open();
+    await Promise.resolve();
+    expect(second.sent).toHaveLength(1);
+    second.receive({ jsonrpc: "2.0", id: second.lastSent().id, result: "new" });
+    second.receive({ jsonrpc: "2.0", method: "run.event", params: { subscription: "new", result: { ok: true } } });
+    expect(events).toHaveBeenCalledWith({ ok: true });
+    const closing = unsubscribe();
+    await Promise.resolve();
+    second.receive({ jsonrpc: "2.0", id: second.lastSent().id, result: true });
+    await closing;
+  } finally {
+    client.close();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  }
 });

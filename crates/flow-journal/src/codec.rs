@@ -1,12 +1,10 @@
-use std::collections::HashSet;
-use std::io::{BufRead, Write};
+use std::io::Write;
 
-use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
-use serde_json::{value::RawValue, Value};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::{invalid, Error, Result, MAX_LINE_BYTES};
+use crate::{invalid, Error, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -168,14 +166,6 @@ pub fn validate_depth(value: &Value, depth: usize) -> Result<()> {
     Ok(())
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Envelope<'a> {
-    #[serde(borrow)]
-    data: &'a RawValue,
-    sha256: String,
-}
-
 pub fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -267,111 +257,4 @@ pub fn bounded_json(value: &impl Serialize, limit: usize) -> Result<Vec<u8>> {
         }
     })?;
     Ok(buffer.bytes)
-}
-
-pub fn encode(tx: &Transaction) -> Result<Vec<u8>> {
-    tx.validate()?;
-    let data = bounded_json(tx, MAX_LINE_BYTES)?;
-    let raw = RawValue::from_string(String::from_utf8(data).expect("JSON is UTF-8"))?;
-    let envelope = Envelope {
-        data: &raw,
-        sha256: digest(raw.get().as_bytes()),
-    };
-    let mut line = bounded_json(&envelope, MAX_LINE_BYTES - 1)?;
-    line.push(b'\n');
-    Ok(line)
-}
-
-pub fn decode(line: &[u8]) -> Result<Transaction> {
-    if line.len() > MAX_LINE_BYTES {
-        return Err(Error::Limit("transaction line".into()));
-    }
-    if line.last() != Some(&b'\n') || line[..line.len().saturating_sub(1)].contains(&b'\n') {
-        return Err(invalid("transaction requires exactly one terminating LF"));
-    }
-    let mut de = serde_json::Deserializer::from_slice(line);
-    Unique::deserialize(&mut de)?;
-    de.end()?;
-    let envelope: Envelope<'_> = serde_json::from_slice(line)?;
-    if digest(envelope.data.get().as_bytes()) != envelope.sha256 {
-        return Err(invalid("data SHA-256 mismatch"));
-    }
-    let tx: Transaction = serde_json::from_str(envelope.data.get())?;
-    tx.validate()?;
-    Ok(tx)
-}
-
-/// Returns at most one bounded physical line. Oversize and ambiguous tail bytes are never skipped.
-pub fn read_line(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>> {
-    let mut bytes = Vec::new();
-    loop {
-        let buf = reader.fill_buf()?;
-        if buf.is_empty() {
-            return if bytes.is_empty() {
-                Ok(None)
-            } else {
-                Err(invalid("tail missing LF"))
-            };
-        }
-        let n = buf
-            .iter()
-            .position(|b| *b == b'\n')
-            .map_or(buf.len(), |i| i + 1);
-        if n > MAX_LINE_BYTES.saturating_sub(bytes.len()) {
-            return Err(Error::Limit("transaction line".into()));
-        }
-        bytes.extend_from_slice(&buf[..n]);
-        reader.consume(n);
-        if bytes.last() == Some(&b'\n') {
-            return Ok(Some(bytes));
-        }
-    }
-}
-
-// Validate duplicate keys without converting or reserializing raw data. Per-object sets and
-// the serde recursion limit bound work by the physical line size, independently of history.
-struct Unique;
-impl<'de> Deserialize<'de> for Unique {
-    fn deserialize<D: de::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
-        d.deserialize_any(UniqueVisitor)
-    }
-}
-struct UniqueVisitor;
-impl<'de> Visitor<'de> for UniqueVisitor {
-    type Value = Unique;
-    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str("JSON with unique keys")
-    }
-    fn visit_map<M: MapAccess<'de>>(self, mut m: M) -> std::result::Result<Unique, M::Error> {
-        let mut keys = HashSet::new();
-        while let Some(key) = m.next_key::<String>()? {
-            if !keys.insert(key) {
-                return Err(de::Error::custom("duplicate JSON key"));
-            }
-            m.next_value::<Unique>()?;
-        }
-        Ok(Unique)
-    }
-    fn visit_seq<S: SeqAccess<'de>>(self, mut s: S) -> std::result::Result<Unique, S::Error> {
-        while s.next_element::<Unique>()?.is_some() {}
-        Ok(Unique)
-    }
-    fn visit_bool<E: de::Error>(self, _: bool) -> std::result::Result<Unique, E> {
-        Ok(Unique)
-    }
-    fn visit_i64<E: de::Error>(self, _: i64) -> std::result::Result<Unique, E> {
-        Ok(Unique)
-    }
-    fn visit_u64<E: de::Error>(self, _: u64) -> std::result::Result<Unique, E> {
-        Ok(Unique)
-    }
-    fn visit_f64<E: de::Error>(self, _: f64) -> std::result::Result<Unique, E> {
-        Ok(Unique)
-    }
-    fn visit_str<E: de::Error>(self, _: &str) -> std::result::Result<Unique, E> {
-        Ok(Unique)
-    }
-    fn visit_unit<E: de::Error>(self) -> std::result::Result<Unique, E> {
-        Ok(Unique)
-    }
 }

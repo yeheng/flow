@@ -1,5 +1,4 @@
 //! Shared pure node request/output helpers used by V2 execution ports.
-pub const DEFAULT_JS_TIMEOUT_MS: u64 = 2_000;
 pub const DEFAULT_HTTP_TIMEOUT_MS: u64 = 30_000;
 pub const DEFAULT_HARNESS_TIMEOUT_MS: u64 = 300_000;
 

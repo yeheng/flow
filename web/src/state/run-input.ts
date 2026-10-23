@@ -1,5 +1,5 @@
 import type { Definition, NodeTypeDesc, PropertySchema } from "../types";
-import { schemaFields, schemaObject, validateInputSchema, type FormField } from "./form-fields";
+import { parseFormFields, schemaFields, schemaObject, validateInputSchema, type FormField } from "./form-fields";
 import { formDialog } from "./modal";
 
 /**
@@ -66,6 +66,7 @@ export async function requestRunInput(
           fields.push({
             key: f.key,
             label: f.label ?? f.key,
+            type: f.type,
             required: true,
             defaultValue: f.default,
           });
@@ -123,25 +124,18 @@ export async function requestRunInput(
   return values ? { input: values.$ } : null;
 }
 
-/** 表单值 → run input：空字段省略；能 JSON.parse 的用解析值（数字/布尔/对象），否则按字符串 */
-export function assembleInput(values: Record<string, string>): unknown {
-  const out: Record<string, unknown> = {};
-  for (const [k, raw] of Object.entries(values)) {
-    const t = raw.trim();
-    if (!t) continue;
-    try {
-      out[k] = JSON.parse(t);
-    } catch {
-      out[k] = t;
-    }
-  }
-  return Object.keys(out).length > 0 ? out : undefined;
+/** Parse using the same field types as the schema-aware workflow form. */
+export function assembleInput(values: Record<string, string>, fields?: InputField[]): unknown {
+  const schema: InputField[] = fields ?? Object.keys(values).map((key) => ({ key }));
+  const out = parseFormFields(schema.map((f) => ({ ...f, label: f.label ?? f.key })), values);
+  return Object.keys(out).length ? out : undefined;
 }
 
 /** input 节点声明的字段（params.fields 的合法项；形态在建图期已由后端校验） */
 export interface InputField {
   key: string;
   label?: string;
+  type?: string;
   default?: unknown;
 }
 
@@ -152,12 +146,13 @@ export function parseInputFields(params: unknown): InputField[] {
   const out: InputField[] = [];
   for (const f of fields) {
     if (f === null || typeof f !== "object") continue;
-    const { key, label } = f as { key?: unknown; label?: unknown };
+    const { key, label, type } = f as { key?: unknown; label?: unknown; type?: unknown };
     if (typeof key !== "string" || !key.trim()) continue;
     const dft = (f as { default?: unknown }).default;
     out.push({
       key,
       ...(typeof label === "string" && label ? { label } : {}),
+      ...(typeof type === "string" ? { type } : {}),
       ...(dft !== undefined ? { default: dft } : {}),
     });
   }

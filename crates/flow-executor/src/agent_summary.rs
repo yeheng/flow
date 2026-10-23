@@ -29,14 +29,10 @@ pub fn summarize(summary: &TurnSummary) -> AgentTurnResult {
     });
     let (text, stop_reason) = match last_assistant {
         Some(message) => {
-            let joined = message
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<String>();
+            let joined = join_text(message.content.iter().filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            }));
             let reason = match &message.stop_reason {
                 StopReason::EndTurn => "end_turn",
                 StopReason::ToolUse => "tool_use",
@@ -48,7 +44,6 @@ pub fn summarize(summary: &TurnSummary) -> AgentTurnResult {
         }
         None => (String::new(), "no_assistant_message".to_string()),
     };
-    let text = cap_text(text);
     match &summary.reason {
         TurnEndReason::Completed => {
             let ok = matches!(
@@ -103,19 +98,23 @@ pub fn summarize(summary: &TurnSummary) -> AgentTurnResult {
 
 /// 派生期 8 MiB 检查之前的自我截断：在字符边界截断并写标记，把「输出
 /// 过大」变成带标记的可见结果，而不是 journal 侧的 Business。
-fn cap_text(text: String) -> String {
-    if text.len() <= TEXT_LIMIT_BYTES {
-        return text;
+fn join_text<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
+    let mut result = String::new();
+    for part in parts {
+        let remaining = TEXT_LIMIT_BYTES - result.len();
+        if part.len() <= remaining {
+            result.push_str(part);
+            continue;
+        }
+        let mut cut = remaining;
+        while !part.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        result.push_str(&part[..cut]);
+        result.push_str(TRUNCATED_MARKER);
+        break;
     }
-    let mut cut = TEXT_LIMIT_BYTES;
-    while cut > 0 && !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    let mut capped = text.into_bytes();
-    capped.truncate(cut);
-    let mut capped = String::from_utf8_lossy(&capped).into_owned();
-    capped.push_str(TRUNCATED_MARKER);
-    capped
+    result
 }
 
 #[cfg(test)]

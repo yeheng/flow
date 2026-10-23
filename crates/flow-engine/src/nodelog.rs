@@ -210,7 +210,7 @@ impl NodeLogger {
             attempt: self.attempt,
             level,
             stream,
-            message: truncate_message(&message),
+            message: truncate_message(&redact_text(&message)),
         };
         match &self.tx {
             LogTarget::Legacy(tx) => {
@@ -263,44 +263,8 @@ pub fn truncate_message(message: &str) -> String {
     format!("{}…[truncated {} bytes]", kept, message.len() - kept.len())
 }
 
-/// 输入面快照（node_started.input）的序列化字节上限：日志行有 8KB 截断，
-/// 输入面快照同理——预算管住了日志条数，这里管住单条事件的字节面。
-pub const MAX_INPUT_SNAPSHOT_BYTES: usize = 8 * 1024;
-
-/// 超限快照保留的前缀字节数。与 `truncate_message` 同一取法：**截断而非丢弃**，
-/// 标注原始字节数并留下可读的开头——输入面快照存在的意义就是调试"到底传了
-/// 什么进去"，一刀切成空壳恰好在最需要它的时候什么都不剩。
-pub const INPUT_SNAPSHOT_PREVIEW_BYTES: usize = 512;
-
-/// 超限的输入面快照 → `{"__truncated": true, "size": N, "preview": "…"}`。
-/// 先脱敏后截断：脱敏可能缩小体积，以展示值为准。
-///
-/// 借引用签名（而非消费式）：脱敏要改值、执行要原值，调用方**必然**要留一份
-/// `params.clone()`。改成拿走所有权只是把那次克隆藏进 `..line` 语法糖里，
-/// 一个字节都没省下，还让「谁拥有这份 params」变成要读三遍才看得懂的事。
-pub fn cap_input_snapshot(value: &Value) -> Value {
-    // 序列化一次，量长度与取预览复用同一个 String——不为「只量长度不分配」
-    // 引入第二个序列化（省下的一个 String 分配换不回多跑的一趟全量序列化）
-    let text = serde_json::to_string(value).unwrap_or_default();
-    if text.len() <= MAX_INPUT_SNAPSHOT_BYTES {
-        return value.clone();
-    }
-    serde_json::json!({
-        "__truncated": true,
-        "size": text.len(),
-        "preview": byte_prefix(&text, INPUT_SNAPSHOT_PREVIEW_BYTES),
-    })
-}
-
-/// 固定敏感键列表（小写子串匹配）。脱敏出口：
-/// - `node_started.input`：写入时（`driver::build_node_prep`）；
-/// - 节点 output 的**所有展示面**：timeline（`flow-rpc::timeline_value`）与
-///   run.subscribe 通知（`flow-rpc::redact_display_envelope`）——两处不同步
-///   就会让前端用事件里的原始值覆盖 timeline 的脱敏值，脱敏被绕过；
-/// - `node_failed.error` 里回显的上游响应（`exec` 的失败消息）。
-///
-/// http 日志行**不**含 headers（`exec` 只记 `→ {method} {url}`），所以没有
-/// 「请求头脱敏」这个出口；但 URL query 里的凭据要走 [`redact_url`]。
+/// Shared display policy for logs and product timeline snapshots. Execution
+/// inputs, operation evidence and raw-value downloads retain their original data.
 // 子串匹配。「set-cookie」被「cookie」完全覆盖，是死条目；同理
 // 「password_policy」「tokenizer」「secretary」这类合法字段会被误脱敏成
 // 「***」。改成精确/后缀匹配要考虑 `Authorization` / `x-apiKey` /
@@ -325,7 +289,7 @@ const REDACTED: &str = "***";
 /// 递归脱敏一个 JSON 值（返回新值，不改输入）。对象键命中敏感列表时值替换
 /// 为 "***"；数组逐位递归。
 ///
-/// 借引用签名：调用方还要拿原值执行（见 `cap_input_snapshot` 的说明），
+/// 借引用签名：调用方还要拿原值执行，
 /// 消费式签名只会让每个调用点补一个 `.clone()`。
 pub fn redact_value(value: &Value) -> Value {
     match value {
@@ -352,7 +316,7 @@ pub fn redact_value(value: &Value) -> Value {
 pub fn redact_snapshot(value: &Value) -> Value {
     fn walk(value: &Value) -> Value {
         match value {
-            Value::String(text) => Value::String(redact_url(text)),
+            Value::String(text) => Value::String(redact_text(text)),
             Value::Array(items) => Value::Array(items.iter().map(walk).collect()),
             Value::Object(map) => Value::Object(
                 map.iter()
@@ -363,6 +327,44 @@ pub fn redact_snapshot(value: &Value) -> Value {
         }
     }
     walk(&redact_value(value))
+}
+
+/// Redact JSON objects embedded in console/error text as well as URL query
+/// credentials. Limit malformed JSON attempts; an adversarial message cannot
+/// turn redaction into unbounded repeated parsing.
+pub fn redact_text(text: &str) -> String {
+    let mut output = String::new();
+    let mut rest = text;
+    let mut attempts = 0;
+    while let Some(start) = rest.find(['{', '[']) {
+        output.push_str(&redact_plain_text(&rest[..start]));
+        rest = &rest[start..];
+        attempts += 1;
+        if attempts > 64 {
+            output.push_str("[redacted: malformed structured log]");
+            return output;
+        }
+        let mut values = serde_json::Deserializer::from_str(rest).into_iter::<Value>();
+        if let Some(Ok(value)) = values.next() {
+            let used = values.byte_offset();
+            output.push_str(&serde_json::to_string(&redact_snapshot(&value)).unwrap_or_default());
+            rest = &rest[used..];
+        } else {
+            output.push_str(&rest[..1]);
+            rest = &rest[1..];
+        }
+    }
+    output.push_str(&redact_plain_text(rest));
+    output
+}
+
+fn redact_plain_text(text: &str) -> String {
+    text.split_inclusive(char::is_whitespace)
+        .map(|part| {
+            let token = part.trim_end_matches(char::is_whitespace);
+            format!("{}{}", redact_url(token), &part[token.len()..])
+        })
+        .collect()
 }
 
 /// URL 的 query 串与 fragment 脱敏：命中敏感键的参数值替换为 `"***"`。
@@ -595,26 +597,21 @@ mod tests {
     }
 
     #[test]
-    fn input_snapshot_capped_at_byte_limit() {
-        // 限内：原样保留
-        let small = json!({"url": "http://x", "n": 1});
-        assert_eq!(cap_input_snapshot(&small), small);
-        // 超限：占位携带原始序列化大小 + 可读前缀（截断而非丢弃）
-        let big = json!({"body": "x".repeat(MAX_INPUT_SNAPSHOT_BYTES)});
-        let capped = cap_input_snapshot(&big);
-        assert_eq!(capped["__truncated"], json!(true));
-        assert!(capped["size"].as_u64().unwrap() > MAX_INPUT_SNAPSHOT_BYTES as u64);
-        let preview = capped["preview"].as_str().unwrap();
-        assert!(preview.starts_with("{\"body\":\"xxx"), "{preview}");
-        assert!(preview.len() <= INPUT_SNAPSHOT_PREVIEW_BYTES);
-    }
-
-    #[test]
-    fn input_snapshot_preview_stays_on_char_boundary() {
-        // 多字节内容：前缀不得切在字符中间
-        let big = json!({"body": "宁".repeat(MAX_INPUT_SNAPSHOT_BYTES)});
-        let capped = cap_input_snapshot(&big);
-        let preview = capped["preview"].as_str().unwrap();
-        assert!(preview.ends_with("宁") || preview.ends_with('"'));
+    fn logger_redacts_structured_fragments_and_error_urls_before_truncation() {
+        let (logger, mut rx) = logger_with_budget(10);
+        let input = json!({"token":"raw-secret", "url":"https://example.test/?api_key=url-secret&ok=1", "count":5});
+        logger.info(format!("payload {}", input));
+        logger.error("request https://example.test/?ok=1 failed https://example.test/?token=error-secret&status=500");
+        let first = rx.try_recv().unwrap().message;
+        let second = rx.try_recv().unwrap().message;
+        for secret in ["raw-secret", "url-secret", "error-secret"] {
+            assert!(!first.contains(secret) && !second.contains(secret));
+        }
+        assert!(first.contains("\"count\":5"));
+        assert!(second.contains("status=500"));
+        assert_eq!(
+            input["token"], "raw-secret",
+            "execution evidence stays intact"
+        );
     }
 }

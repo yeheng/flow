@@ -406,20 +406,10 @@ fn run_js_limited(
 /// 脚本节点：body 是一段带 `return` 的函数体，可用 `input` 与 `nodes`。
 /// `logger` 承接脚本内的 console.* 输出（level 透传，log/info→stdout，warn/error→stderr）。
 ///
-/// 与 `_bounded` 同一份默认预算（32 MiB 堆 / 512 KiB 栈 / 深度 64 / 入出
+/// 默认预算（32 MiB 堆 / 512 KiB 栈 / 深度 64 / 入出
 /// 8 MiB）：不留无界入口——深嵌套输入会直接打爆原生栈（abort，不可捕获），
 /// 「无限制」在这个沙箱面里只能是事故，不是特性。
 pub fn eval_body(
-    body: &str,
-    input: &Value,
-    nodes: &Value,
-    timeout: Duration,
-    logger: &NodeLogger,
-) -> Result<Value, EngineError> {
-    eval_body_recorded(body, input, nodes, timeout, logger, None)
-}
-
-pub fn eval_body_bounded(
     body: &str,
     input: &Value,
     nodes: &Value,
@@ -471,25 +461,6 @@ pub fn eval_expr(
     )
 }
 
-/// 有界版 [`eval_expr`]：与 v2 执行端口同一份 `JsLimits` 预算。
-pub fn eval_expr_bounded(
-    expr: &str,
-    input: &Value,
-    nodes: &Value,
-    timeout: Duration,
-) -> Result<Value, EngineError> {
-    let body = format!("    return ({expr});");
-    run_js_limited(
-        &body,
-        input,
-        nodes,
-        &Value::Null,
-        timeout,
-        &NodeLogger::disabled(),
-        Some(JsLimits::default()),
-    )
-}
-
 /// 展开字符串中的 `${expr}` 模板。所有节点 params 的统一前置展开
 /// （`exec::expand_params`；script.code / condition.expr 等 opaque 字段除外）。
 ///
@@ -511,14 +482,7 @@ pub fn expand_templates(
 ) -> Result<Value, EngineError> {
     expand_templates_impl(tpl, input, nodes, timeout, Some(JsLimits::default()))
 }
-pub fn expand_templates_bounded(
-    tpl: &Value,
-    input: &Value,
-    nodes: &Value,
-    timeout: Duration,
-) -> Result<Value, EngineError> {
-    expand_templates_impl(tpl, input, nodes, timeout, Some(JsLimits::default()))
-}
+
 pub fn expand_templates_recorded(
     tpl: &Value,
     input: &Value,

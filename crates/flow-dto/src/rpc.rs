@@ -1,68 +1,87 @@
-//! Shared RPC method catalogue. Subscription methods have their own registration.
-pub const READ_METHODS: &[&str] = &[
-    "journal.cluster.status",
-    "journal.cluster.nodes",
-    "run.observations.page",
-    "command.status",
-    "workflow.list",
-    "run.list",
-    "legacy.list",
-    "workflow.get",
-    "run.get",
-    "run.compare",
-    "legacy.get",
-    "run.events.page",
-    "run.audit.page",
-    "workflow.validate",
-    "workflow.get.view",
-    "workflow.list.view",
-    "workflow.versions",
-    "run.get.view",
-    "run.list.view",
-    "run.stats",
-    "run.timeline",
-    "run.events.view",
-    "schedule.list",
-    "webhook.list",
-    "template.list",
-    "template.get",
-    "config.get",
-    "secrets.list",
-    "nodetypes.list",
-];
-
-pub const WRITE_METHODS: &[&str] = &[
-    "journal.cluster.remove",
-    "workflow.import",
-    "workflow.create",
-    "workflow.update",
-    "workflow.publish",
-    "workflow.delete",
-    "run.start",
-    "run.regress",
-    "run.cancel",
-    "run.signal",
-    "run.adjudicate",
-    "schedule.change",
-    "schedule.create",
-    "schedule.update",
-    "schedule.delete",
-    "webhook.change",
-    "webhook.create",
-    "webhook.set_enabled",
-    "webhook.delete",
-    "template.create",
-    "template.update",
-    "template.delete",
-    "secrets.set",
-    "secrets.delete",
-    "config.update",
-];
-pub fn is_write_method(method: &str) -> bool {
-    WRITE_METHODS.contains(&method)
+//! One typed catalogue for registration, admission and exhaustive dispatch.
+macro_rules! methods {
+    (read { $($read:ident => $rname:literal,)* } write { $($write:ident => $wname:literal,)* }) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum Method { $($read,)* $($write,)* }
+        impl Method {
+            pub const ALL: &'static [Self] = &[$(Self::$read,)* $(Self::$write,)*];
+            pub const fn as_str(self) -> &'static str {
+                match self { $(Self::$read => $rname,)* $(Self::$write => $wname,)* }
+            }
+            pub fn parse(name: &str) -> Option<Self> {
+                match name { $($rname => Some(Self::$read),)* $($wname => Some(Self::$write),)* _ => None }
+            }
+            pub const fn is_write(self) -> bool {
+                match self { $(Self::$read => false,)* $(Self::$write => true,)* }
+            }
+        }
+        pub const READ_METHODS: &[&str] = &[$($rname,)*];
+        pub const WRITE_METHODS: &[&str] = &[$($wname,)*];
+    };
 }
-
-/// 方法是否为读面（写命令需要 request_id 幂等键与回执解包）。
+methods! {
+    read {
+        JournalClusterStatus => "journal.cluster.status",
+        JournalClusterNodes => "journal.cluster.nodes",
+        RunObservationsPage => "run.observations.page",
+        CommandStatus => "command.status",
+        WorkflowList => "workflow.list",
+        RunList => "run.list",
+        LegacyList => "legacy.list",
+        WorkflowGet => "workflow.get",
+        RunGet => "run.get",
+        RunCompare => "run.compare",
+        LegacyGet => "legacy.get",
+        RunEventsPage => "run.events.page",
+        RunAuditPage => "run.audit.page",
+        WorkflowValidate => "workflow.validate",
+        WorkflowGetView => "workflow.get.view",
+        WorkflowListView => "workflow.list.view",
+        WorkflowVersions => "workflow.versions",
+        RunGetView => "run.get.view",
+        RunListView => "run.list.view",
+        RunStats => "run.stats",
+        RunTimeline => "run.timeline",
+        RunEventsView => "run.events.view",
+        ScheduleList => "schedule.list",
+        WebhookList => "webhook.list",
+        TemplateList => "template.list",
+        TemplateGet => "template.get",
+        ConfigGet => "config.get",
+        SecretsList => "secrets.list",
+        NodetypesList => "nodetypes.list",
+    }
+    write {
+        JournalClusterRemove => "journal.cluster.remove",
+        WorkflowImport => "workflow.import",
+        WorkflowCreate => "workflow.create",
+        WorkflowUpdate => "workflow.update",
+        WorkflowPublish => "workflow.publish",
+        WorkflowDelete => "workflow.delete",
+        RunStart => "run.start",
+        RunRegress => "run.regress",
+        RunCancel => "run.cancel",
+        RunSignal => "run.signal",
+        RunAdjudicate => "run.adjudicate",
+        ScheduleChange => "schedule.change",
+        ScheduleCreate => "schedule.create",
+        ScheduleUpdate => "schedule.update",
+        ScheduleDelete => "schedule.delete",
+        WebhookChange => "webhook.change",
+        WebhookCreate => "webhook.create",
+        WebhookSetEnabled => "webhook.set_enabled",
+        WebhookDelete => "webhook.delete",
+        TemplateCreate => "template.create",
+        TemplateUpdate => "template.update",
+        TemplateDelete => "template.delete",
+        SecretsSet => "secrets.set",
+        SecretsDelete => "secrets.delete",
+        ConfigUpdate => "config.update",
+    }
+}
+pub fn is_write_method(method: &str) -> bool {
+    Method::parse(method).is_some_and(Method::is_write)
+}
 pub fn is_read_method(method: &str) -> bool {
-    READ_METHODS.contains(&method)
+    Method::parse(method).is_some_and(|method| !method.is_write())
 }

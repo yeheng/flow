@@ -18,10 +18,80 @@ pub const DATABASE: &str = "flow.sqlite";
 pub const FORMAT: i64 = 4;
 pub const MAX_ENTITY_BYTES: usize = 2 * 1024 * 1024;
 
+/// Closed vocabulary at the authoritative write boundary. Stored SQL and JSON
+/// names stay unchanged; unknown kinds fail deserialization instead of deleting
+/// or creating a silently misspelled namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntityKind {
+    Run,
+    RunNode,
+    RunAttempt,
+    Workflow,
+    WorkflowVersion,
+    Schedule,
+    Webhook,
+    Template,
+    Dispatch,
+    Child,
+    Legacy,
+    Command,
+    Audit,
+    Published,
+    Engine,
+    ScheduleFire,
+    RunWorkflow,
+}
+impl EntityKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Run => "run",
+            Self::RunNode => "run_node",
+            Self::RunAttempt => "run_attempt",
+            Self::Workflow => "workflow",
+            Self::WorkflowVersion => "workflow_version",
+            Self::Schedule => "schedule",
+            Self::Webhook => "webhook",
+            Self::Template => "template",
+            Self::Dispatch => "dispatch",
+            Self::Child => "child",
+            Self::Legacy => "legacy",
+            Self::Command => "command",
+            Self::Audit => "audit",
+            Self::Published => "published",
+            Self::Engine => "engine",
+            Self::ScheduleFire => "schedule_fire",
+            Self::RunWorkflow => "run_workflow",
+        }
+    }
+    pub fn parse(name: &str) -> Result<Self> {
+        match name {
+            "run" => Ok(Self::Run),
+            "run_node" => Ok(Self::RunNode),
+            "run_attempt" => Ok(Self::RunAttempt),
+            "workflow" => Ok(Self::Workflow),
+            "workflow_version" => Ok(Self::WorkflowVersion),
+            "schedule" => Ok(Self::Schedule),
+            "webhook" => Ok(Self::Webhook),
+            "template" => Ok(Self::Template),
+            "dispatch" => Ok(Self::Dispatch),
+            "child" => Ok(Self::Child),
+            "legacy" => Ok(Self::Legacy),
+            "command" => Ok(Self::Command),
+            "audit" => Ok(Self::Audit),
+            "published" => Ok(Self::Published),
+            "engine" => Ok(Self::Engine),
+            "schedule_fire" => Ok(Self::ScheduleFire),
+            "run_workflow" => Ok(Self::RunWorkflow),
+            _ => Err(invalid(format!("unknown entity kind: {name}"))),
+        }
+    }
+}
+
 /// A current object, not a historical copy of every revision. None is a deletion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntityChange {
-    pub kind: String,
+    pub kind: EntityKind,
     pub key: String,
     pub value: Option<Value>,
 }
@@ -135,20 +205,20 @@ pub(crate) fn apply_entity(conn: &Connection, lsn: u64, row: &EntityChange) -> R
             String::from_utf8(codec::bounded_json(value, MAX_ENTITY_BYTES)?).expect("JSON UTF-8");
         // Receipts are immutable. A conflicting duplicate is an error, never an overwrite.
         if matches!(row.kind.as_str(), "command" | "audit") {
-            if let Some(previous) = entity(conn, &row.kind, &row.key)? {
+            if let Some(previous) = entity(conn, row.kind.as_str(), &row.key)? {
                 if previous != *value {
                     return Err(Error::Conflict("conflicting permanent receipt".into()));
                 }
                 return Ok(());
             }
         }
-        let (parent, slot, extra) = key_parts(&row.kind, &row.key);
+        let (parent, slot, extra) = key_parts(row.kind.as_str(), &row.key);
         conn.execute("INSERT INTO current_entities(kind,key,parent,slot,extra,body,digest,created_order,last_lsn) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(kind,key) DO UPDATE SET parent=excluded.parent,slot=excluded.slot,extra=excluded.extra,body=excluded.body,digest=excluded.digest,created_order=excluded.created_order,last_lsn=excluded.last_lsn",
-            params![row.kind,row.key,parent,slot,extra,body,entity_digest(&row.kind,&row.key,&body),created_order(&row.kind,value),format!("{lsn:020}")]).map_err(db)?;
+            params![row.kind.as_str(),row.key,parent,slot,extra,body,entity_digest(row.kind.as_str(),&row.key,&body),created_order(row.kind.as_str(),value),format!("{lsn:020}")]).map_err(db)?;
     } else {
         conn.execute(
             "DELETE FROM current_entities WHERE kind=? AND key=?",
-            params![row.kind, row.key],
+            params![row.kind.as_str(), row.key],
         )
         .map_err(db)?;
     }
@@ -308,6 +378,14 @@ impl Disk {
             }
         }
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON; PRAGMA foreign_keys=ON; PRAGMA temp_store=FILE;").map_err(db)?;
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .map_err(db)?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            return Err(Error::Unavailable(format!(
+                "SQLite WAL required, got {journal_mode}"
+            )));
+        }
         if initialize {
             if faults.fail_dir_sync == Some(1) {
                 return Err(std::io::Error::other("injected directory sync failure").into());
@@ -535,7 +613,7 @@ impl Disk {
             &self.conn,
             lsn,
             &EntityChange {
-                kind: "published".into(),
+                kind: crate::sqlite::EntityKind::Published,
                 key: id.into(),
                 value: Some(serde_json::json!({"lsn":lsn.to_string(),"value":event.payload})),
             },
@@ -544,6 +622,9 @@ impl Disk {
     }
     pub fn sync(&mut self) -> Result<()> {
         self.data_syncs += 1;
+        if let Some(notify) = self.faults.before_data_sync {
+            notify(self.last_lsn);
+        }
         if self.faults.sync_delay_ms > 0 {
             std::thread::sleep(Duration::from_millis(self.faults.sync_delay_ms));
         }
@@ -580,7 +661,7 @@ mod tests {
         disk.append(
             &tx,
             &[EntityChange {
-                kind: "run".into(),
+                kind: crate::sqlite::EntityKind::Run,
                 key: "r".into(),
                 value: Some(serde_json::json!({"status":"before"})),
             }],

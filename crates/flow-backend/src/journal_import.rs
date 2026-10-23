@@ -144,7 +144,7 @@ async fn baseline(b: &JournalBackend, key: &str, data: Value) -> Result<()> {
             b.journal.root(),
             b.journal.durable_lsn(),
             &stored,
-            8 * 1024 * 1024,
+            flow_journal::VALUE_BUDGET,
         )?;
         if original != data {
             return Err(format!("legacy baseline differs: {key}").into());
@@ -152,6 +152,7 @@ async fn baseline(b: &JournalBackend, key: &str, data: Value) -> Result<()> {
         return Ok(());
     }
     let mut mapped = Vec::new();
+    let mut values = Vec::new();
     if key.starts_with("workflows/") {
         mapped.push(Event::new(EventKind::WorkflowCreated,json!({"workflow_id":data["id"],"name":data["name"],"created_at":data["created_at"],"versions":{}})));
     } else if key.starts_with("workflow_versions/") {
@@ -161,9 +162,12 @@ async fn baseline(b: &JournalBackend, key: &str, data: Value) -> Result<()> {
                 .ok_or("legacy definition must be JSON text")?,
         )?;
         flow_engine::journal_state::validate_definition(&definition)?;
-        let definition = b
-            .store_json(definition, flow_journal::MAX_LINE_BYTES)
+        let prepared = b
+            .journal
+            .prepare_json(definition, flow_journal::MAX_LINE_BYTES)
             .await?;
+        let definition = prepared.stored().clone();
+        values.push(prepared);
         mapped.push(Event::new(EventKind::WorkflowUpdated,json!({"workflow_id":data["workflow_id"],"version":{"version":data["version"],"definition":definition,"checksum":data["checksum"],"published":data["status"]=="published","created_at":data["created_at"]}})));
     } else if key.starts_with("schedules/") || key.starts_with("webhooks/") {
         let mut config = data.clone();
@@ -184,11 +188,18 @@ async fn baseline(b: &JournalBackend, key: &str, data: Value) -> Result<()> {
             config,
         ));
     }
-    let stored = b.store_json(data, 8 * 1024 * 1024).await?;
-    b.command(
+    let prepared = b
+        .journal
+        .prepare_json(data, flow_journal::VALUE_BUDGET)
+        .await?;
+    let stored = prepared.stored().clone();
+    values.push(prepared);
+    b.command_selected(
         "legacy.import",
         Some(&flow_journal::codec::digest(key.as_bytes())),
         &request,
+        None,
+        values,
         |_| {
             Ok((
                 {
