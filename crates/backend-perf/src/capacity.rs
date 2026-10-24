@@ -22,7 +22,7 @@
 //! - `storage`：对比 journal 与裸 SQLite 的写入/回放成本，并做崩溃探针；
 //! - `soak` / `agent-soak`：长时间浸泡，观察资源是否随时间单调增长。
 
-//! Resource/history/soak evidence. Run release builds; JSON reports include actual durations.
+//!   Resource/history/soak evidence. Run release builds; JSON reports include actual durations.
 use flow_backend::journal::JournalBackend;
 use flow_engine::journal_state::{Run, RunStatus, WaitKind};
 use flow_journal::{Event, EventKind, StoredValue};

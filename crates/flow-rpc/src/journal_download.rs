@@ -11,7 +11,7 @@
 //!
 //! 之所以要单独成模块：下载路径与 RPC 路径的失败语义完全不同（HTTP 状态码
 //! + 流式 body，而非 JSON-RPC 错误对象），混在一起会让两边的错误分层互相
-//! 污染。
+//!   污染。
 use axum::{
     body::{Body, Bytes},
     extract::{Path, State},
