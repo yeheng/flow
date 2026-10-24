@@ -179,6 +179,8 @@ jobs:
           key: windows-check
       - name: cargo check
         run: cargo check --workspace --locked --target x86_64-pc-windows-msvc
+      - name: Executor environment policy tests
+        run: cargo test -p flow-engine --no-default-features --lib execution_protocol::environment --locked --target x86_64-pc-windows-msvc
 
   # ---- 前端：单架构 ----
   # lint / 单测 / 构建都是 node 侧的事，与 CPU 架构无关；playwright 的 e2e 里

@@ -1,6 +1,6 @@
 //! 回连承载：本地 socket（IPC7，替代旧版 TCP loopback）。
 //!
-//! socketpair + pre_exec FD 传递是 unix 专属（见 [`super::spawn`]）；其余
+//! socketpair + pre_exec FD 传递是 unix 专属（见平台启动层 [`super::bootstrap`]）；其余
 //! 平台（Windows named pipe）与本模块自身的测试路径用「父进程先建
 //! listener → 经 env 告知子进程名 → 子进程单连接回连」承载单流通道。
 //! 相比 TCP loopback：不占用网络栈、无本机端口抢连窗口（named pipe 按
@@ -73,10 +73,10 @@ fn parse_local_name(addr: &str) -> std::io::Result<interprocess::local_socket::N
 
 /// spawn 一个执行器进程并等它回连出单通道。返回 (通道, 子进程句柄)。
 /// `extra_args` 为调用点显式指定的模式/标记参数（见
-/// [`super::spawn::spawn_executor_process`]）。
+/// [`super::bootstrap::spawn_executor_transport`]）。
 ///
-/// 与 [`super::spawn::spawn_executor_process`] 同一套环境隔离规则：
-/// env_clear 后只回填 RUST_LOG、回连名与会话令牌；stdout/stderr 不
+/// 与 Unix 启动方式共用环境白名单：env_clear 后回填运行环境、
+/// RUST_LOG、回连名与会话令牌；stdout/stderr 不
 /// 携带协议帧。
 pub async fn spawn_executor_loopback(
     executor: &ExecutorInvocation,
@@ -117,7 +117,7 @@ async fn spawn_executor_loopback_at(
     if let Some(log) = std::env::var_os("RUST_LOG") {
         command.env("RUST_LOG", log);
     }
-    super::spawn::apply_executor_env_whitelist(&mut command);
+    super::environment::apply_executor_env_whitelist(&mut command);
     command.env(CONNECT_ADDR_ENV, addr);
     // 会话令牌是抢连防御：端口/名字在本机可见，毫秒窗口内别的进程
     // 可能先连上，令牌把它挡在握手之外。

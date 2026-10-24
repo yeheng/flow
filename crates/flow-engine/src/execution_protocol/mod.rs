@@ -23,6 +23,7 @@
 
 pub mod bootstrap;
 pub mod contract;
+mod environment;
 pub mod fixtures;
 pub mod frame;
 pub mod loopback;
