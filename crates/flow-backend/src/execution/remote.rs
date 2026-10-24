@@ -217,6 +217,11 @@ struct AgentRegistration {
 }
 
 // Agent 管理器：上联会话注册表 + 全局 A_max 准入 + Resume 裁决。
+//
+// 锁序（禁止逆序获取）：agents → bindings → BoundDispatch 内部锁
+// （executor_boot_id / pending_link / verdict）。pending_binds 独立、不参与嵌套。
+// 现有代码在持 bindings 时会 await 单个绑定自己的内部锁——新增代码不得
+// 引入相反顺序（内部锁 → bindings/agents，或跨绑定取锁），否则死锁。
 pub struct AgentManager {
     backend: Arc<JournalBackend>,
     journal_id: String,
@@ -660,12 +665,19 @@ impl AgentManager {
                                         "non-routable inner message from agent {agent_id} rejected"
                                     ));
                                 }
-                                let Some(routing) = routings.get(&envelope.dispatch_id.clone().unwrap_or_default()) else {
+                                // Routed 帧必须携带派发身份：无 dispatch_id 既无法路由
+                                // 也无法与完成记录比对——按协议违规关闭会话，而不是 unwrap。
+                                let Some(dispatch_id) = envelope.dispatch_id.clone() else {
+                                    return Err(format!(
+                                        "routed frame without dispatch id from agent {agent_id} rejected"
+                                    ));
+                                };
+                                let Some(routing) = routings.get(&dispatch_id) else {
                                     if let Some((previous, result_id)) = completed.iter().find(|(previous, _)| previous == &envelope) {
                                         if let (Some(result_id), Message::Result { result_id: id, .. }) = (result_id, &*inner) {
                                             if id == result_id
                                                 && send_backlog.push(&transport, Message::Routed { envelope: previous.clone(), inner: Box::new(Message::ResultCommitted {
-                                                        dispatch_id: envelope.dispatch_id.clone().unwrap(), result_id: result_id.clone(),
+                                                        dispatch_id, result_id: result_id.clone(),
                                                     })}).is_err() {
                                                     return Err(format!(
                                                         "agent {agent_id} uplink send backlog overflow"
@@ -1059,7 +1071,7 @@ impl AgentManager {
                     Arc::new(BoundDispatch {
                         agent_id: agent.agent_id.clone(),
                         link_session_id: agent.link_session_id.clone(),
-                        executor_id,
+                        executor_id: executor_id.clone(),
                         executor_boot_id: Mutex::new(None),
                         run_id,
                         node_id,
@@ -1068,7 +1080,9 @@ impl AgentManager {
                         notify: Notify::new(),
                     }),
                 );
-                break agent;
+                // 绑定与 executor_id 同临界区产出：不回读 bindings，
+                // 消除插入后到读取前被并发 unbind 摘除的 panic 窗口。
+                break (agent, executor_id);
             }
             drop(bindings);
             drop(agents);
@@ -1077,14 +1091,7 @@ impl AgentManager {
                 _ = self.shutdown.cancelled() => return Err(invalid("agent manager shut down")),
             }
         };
-        let executor_id = self
-            .bindings
-            .lock()
-            .await
-            .get(&dispatch_id)
-            .unwrap()
-            .executor_id
-            .clone();
+        let (registration, executor_id) = registration;
         let (events, rx) = mpsc::channel(256);
         let (ack_tx, ack_rx) = oneshot::channel();
         self.pending_binds.lock().await.insert(

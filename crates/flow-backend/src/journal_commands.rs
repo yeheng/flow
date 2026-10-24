@@ -1201,7 +1201,11 @@ fn product_decision(
                     }
                 }
                 ProductCommand::ScheduleDelete { .. } => value["deleted"] = json!(true),
-                _ => unreachable!(),
+                _ => {
+                    return Err(invalid(
+                        "command kind does not match schedule command family",
+                    ))
+                }
             }
             let (events, mut value) = trigger_event(state, EventKind::ScheduleChanged, key, value)?;
             let result = if matches!(command, ProductCommand::ScheduleDelete { .. }) {
@@ -1242,7 +1246,11 @@ fn product_decision(
                     value["enabled"] = json!(enabled)
                 }
                 ProductCommand::WebhookDelete { .. } => value["deleted"] = json!(true),
-                _ => unreachable!(),
+                _ => {
+                    return Err(invalid(
+                        "command kind does not match webhook command family",
+                    ))
+                }
             }
             let (events, value) = trigger_event(state, EventKind::WebhookChanged, key, value)?;
             let result = match command {
@@ -1287,7 +1295,11 @@ fn product_decision(
                     }
                 }
                 ProductCommand::TemplateDelete { .. } => value["deleted"] = json!(true),
-                _ => unreachable!(),
+                _ => {
+                    return Err(invalid(
+                        "command kind does not match template command family",
+                    ))
+                }
             }
             let (events, mut value) = template_event(state, key, value)?;
             if matches!(command, ProductCommand::TemplateDelete { .. }) {

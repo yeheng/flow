@@ -806,7 +806,11 @@ impl TaskRunner {
                 "return ({});",
                 params_value["expr"].as_str().unwrap_or("false")
             ),
-            _ => unreachable!(),
+            _ => {
+                return Err(TaskError::Invalid(format!(
+                    "compute dispatched for unsupported node kind: {kind:?}"
+                )))
+            }
         };
         let _ = inputs;
         let timeout = Duration::from_millis(

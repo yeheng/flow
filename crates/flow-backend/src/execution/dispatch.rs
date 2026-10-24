@@ -429,7 +429,8 @@ impl DispatchRunner {
                             .and_then(flow_engine::secrets::get_secret)
                             .filter(|s| !s.is_empty())
                     });
-                    let _ = link
+                    // 许可证丢失会让节点挂到 idle 超时——发送失败必须留痕。
+                    if link
                         .commands
                         .send(ToSession::Send(Box::new(Message::OperationPermit {
                             dispatch_id: self.attempt.dispatch_id.clone(),
@@ -438,7 +439,14 @@ impl DispatchRunner {
                             request_fingerprint: operation.fingerprint.clone(),
                             credential,
                         })))
-                        .await;
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            dispatch = %self.attempt.dispatch_id,
+                            "operation permit resend dropped: session link closed"
+                        );
+                    }
                 }
             }
         }
@@ -680,16 +688,10 @@ impl DispatchRunner {
                 });
                 Ok(None)
             }
-            Message::RequestOperation { .. } => {
+            Message::RequestOperation { ref transfer_id, .. } => {
                 // 单流承载（v3）：执行器按「块 → InputReady → 请求」的顺序
                 // 提交，请求到达时块必然已齐；不齐即传输损坏，明确拒绝。
-                let incomplete = match &message {
-                    Message::RequestOperation { transfer_id, .. } => {
-                        !self.op_transfer_complete(transfer_id)
-                    }
-                    _ => unreachable!(),
-                };
-                if incomplete {
+                if !self.op_transfer_complete(transfer_id) {
                     return Err(invalid(
                         "operation request arrived before its transfer completed",
                     ));
@@ -919,7 +921,8 @@ impl DispatchRunner {
         }
         // AuditAck 仅随连续持久前缀前进；commit_lsn 取 durable 位置。
         let commit_lsn = self.attempt.backend.journal.durable_lsn();
-        let _ = link
+        // Ack 丢失会让执行器永远不知道审计已持久——失败必须留痕。
+        if link
             .commands
             .send(ToSession::Send(Box::new(Message::AuditAck {
                 dispatch_id: self.attempt.dispatch_id.clone(),
@@ -927,7 +930,14 @@ impl DispatchRunner {
                 durable_bytes: self.durable_bytes,
                 commit_lsn,
             })))
-            .await;
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                dispatch = %self.attempt.dispatch_id,
+                "audit ack dropped: session link closed"
+            );
+        }
         Ok(())
     }
 
@@ -1242,7 +1252,8 @@ impl DispatchRunner {
             ..
         } = message
         else {
-            unreachable!()
+            // 调用方按变体路由；走错路径按协议违规拒绝而非 panic。
+            return Err(invalid("operation handler on non-operation message"));
         };
         if dispatch_id != self.attempt.dispatch_id {
             return Err(invalid("operation request for foreign dispatch"));

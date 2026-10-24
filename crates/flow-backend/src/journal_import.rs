@@ -35,20 +35,20 @@ fn log_report(path: &Path, run_id: &str, status: &Value) -> Result<Value> {
             break;
         }
         let Ok(event) = serde_json::from_slice::<Value>(&line) else {
-            report["invalid_records"] = json!(report["invalid_records"].as_u64().unwrap() + 1);
+            report["invalid_records"] = json!(report["invalid_records"].as_u64().unwrap_or(0) + 1);
             continue;
         };
         if event["run_id"] != run_id {
             report["foreign_run_records"] =
-                json!(report["foreign_run_records"].as_u64().unwrap() + 1);
+                json!(report["foreign_run_records"].as_u64().unwrap_or(0) + 1);
         }
         if let Some(seq) = event["seq"].as_u64() {
             if seq != last + 1 {
-                report["sequence_gaps"] = json!(report["sequence_gaps"].as_u64().unwrap() + 1);
+                report["sequence_gaps"] = json!(report["sequence_gaps"].as_u64().unwrap_or(0) + 1);
             }
             last = seq;
         } else {
-            report["invalid_records"] = json!(report["invalid_records"].as_u64().unwrap() + 1);
+            report["invalid_records"] = json!(report["invalid_records"].as_u64().unwrap_or(0) + 1);
         }
         match event["type"].as_str() {
             Some("run_completed") => report["terminal_status"] = json!("succeeded"),
@@ -112,7 +112,10 @@ fn copy_evidence(source: &Path, target: &Path, inventory: &BTreeMap<String, Stri
             }
             continue;
         }
-        std::fs::create_dir_all(destination.parent().unwrap())?;
+        let parent = destination
+            .parent()
+            .ok_or("legacy copy path has no parent")?;
+        std::fs::create_dir_all(parent)?;
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -132,7 +135,10 @@ fn copy_evidence(source: &Path, target: &Path, inventory: &BTreeMap<String, Stri
         // hard_link publishes without replacing existing evidence, even on a race.
         std::fs::hard_link(&temporary, &destination)?;
         std::fs::remove_file(&temporary)?;
-        File::open(destination.parent().unwrap())?.sync_all()?;
+        let parent = destination
+            .parent()
+            .ok_or("legacy copy path has no parent")?;
+        File::open(parent)?.sync_all()?;
     }
     Ok(())
 }

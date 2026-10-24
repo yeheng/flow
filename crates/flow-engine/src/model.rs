@@ -763,7 +763,9 @@ impl Definition {
         }
 
         for node in &self.nodes {
-            let kind = node.kind().unwrap();
+            let Some(kind) = node.kind() else {
+                return Err(format!("节点 {} 的类型未知：{}", node.id, node.node_type));
+            };
             match kind {
                 NodeType::Start => {
                     if self.incoming_count(&node.id) > 0 {
@@ -814,7 +816,9 @@ impl Definition {
             return Err("工作流存在环，必须是 DAG".into());
         }
 
-        let start = self.start_node().unwrap();
+        let Some(start) = self.start_node() else {
+            return Err("必须且只能有一个 start 节点".into());
+        };
         let mut visited: HashSet<&str> = HashSet::new();
         let mut stack = vec![start.id.as_str()];
         while let Some(id) = stack.pop() {

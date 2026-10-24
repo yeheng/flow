@@ -349,11 +349,7 @@ fn handle_message(
             None
         }
         message @ (Message::ResultCommitted { .. } | Message::OperationPermit { .. }) => {
-            let dispatch_id = match &message {
-                Message::ResultCommitted { dispatch_id, .. } => dispatch_id.clone(),
-                Message::OperationPermit { dispatch_id, .. } => dispatch_id.clone(),
-                _ => unreachable!(),
-            };
+            let dispatch_id = message.dispatch_id().unwrap_or_default().to_string();
             if let Some(task) = current {
                 if task.dispatch_id == dispatch_id {
                     pending.push_back((task.mail.clone(), message));

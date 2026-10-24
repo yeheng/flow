@@ -387,7 +387,12 @@ pub async fn store_stream(
 ) -> Result<ValueRef> {
     store_stream_using(journal.id(), input, codec, |event| async {
         let class = if event.kind == EventKind::ValueChunk {
-            QueueClass::Audit(event.payload["output_id"].as_str().unwrap().into())
+            QueueClass::Audit(
+                event.payload["output_id"]
+                    .as_str()
+                    .ok_or_else(|| invalid("value chunk missing output_id"))?
+                    .into(),
+            )
         } else {
             QueueClass::Control
         };

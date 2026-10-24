@@ -25,6 +25,8 @@ pub async fn fire_due(backend: &JournalBackend, now: DateTime<Local>) {
             .unwrap_or("")
             .parse::<cron_parser::Schedule>()
         else {
+            // 坏 cron 的静默跳过曾让 schedule 永不触发且无迹可查——至少留一条日志。
+            tracing::warn!(schedule_id = %id, "schedule cron invalid; fire skipped");
             continue;
         };
         let Some(fire) = cron.previous_before(&(now + chrono::Duration::nanoseconds(1))) else {

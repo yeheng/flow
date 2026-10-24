@@ -101,7 +101,11 @@ pub(crate) async fn load(index: &Store, identity: &str, upper: u64) -> Result<St
                     "run_workflow" => {
                         state.run_workflows.insert(key.clone());
                     }
-                    _ => unreachable!(),
+                    _ => {
+                        return Err(JournalError::Storage(format!(
+                            "unsupported control entity kind: {kind}"
+                        )))
+                    }
                 }
             }
             after = keys.last().unwrap().clone();
@@ -411,10 +415,12 @@ pub(crate) async fn load_version(
         .await
         .map_err(db)?
     {
-        state
-            .workflows
-            .get_mut(workflow)
-            .unwrap()
+        let Some(workflow) = state.workflows.get_mut(workflow) else {
+            return Err(JournalError::Storage(
+                "workflow missing while loading version".into(),
+            ));
+        };
+        workflow
             .versions
             .insert(version, serde_json::from_value(row)?);
     }

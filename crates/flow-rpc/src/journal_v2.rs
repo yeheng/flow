@@ -775,7 +775,11 @@ async fn product_command_route(
         None
     };
     let mut args = p.clone();
-    let map = args.as_object_mut().unwrap();
+    // object 性由 admit_call 前置保证，但不得跨调用帧依赖该检查——
+    // 直接在消费点拒绝，防止未来路由改动把客户端输入变成 panic。
+    let Some(map) = args.as_object_mut() else {
+        return Err(invalid("params must be an object"));
+    };
     map.remove("request_id");
     if let Some((nodes, edges)) = fragment {
         map.insert("nodes".into(), nodes);
@@ -952,7 +956,10 @@ async fn subscribe_run_events(
         }
         let (upper, row) = match ctx.backend.store.get_summary("run", &run_id).await {
             Ok(v) => v,
-            Err(_) => return,
+            Err(error) => {
+                tracing::warn!(run = %run_id, %error, "run.subscribe summary read failed; stream ends");
+                return;
+            }
         };
         let Some(row) = row else { return };
         let terminal = matches!(
@@ -994,14 +1001,24 @@ async fn subscribe_run_events(
         .await;
         let (reader, records, latest) = match batch {
             Ok(Ok(v)) => v,
-            _ => return,
+            Ok(Err(error)) => {
+                tracing::warn!(run = %run_id, %error, "run.subscribe page scan failed; stream ends");
+                return;
+            }
+            Err(join) => {
+                tracing::warn!(run = %run_id, %join, "run.subscribe page scan task failed; stream ends");
+                return;
+            }
         };
         tail = reader;
         scanned = latest;
         for record in records {
             let payload: Value = match serde_json::to_value(&record) {
                 Ok(v) => v,
-                Err(_) => return,
+                Err(error) => {
+                    tracing::warn!(run = %run_id, %error, "run.subscribe event encode failed; stream ends");
+                    return;
+                }
             };
             if flow_journal::codec::bounded_json(&payload, flow_journal::MAX_LINE_BYTES - 1024)
                 .is_err()
