@@ -1,0 +1,644 @@
+//! SessionManager: wraps [`EventStorage`], adding "current session/list/
+//! latest" semantics plus the one-shot legacy `messages.jsonl` migration.
+//!
+//! The event log (`events.jsonl`) is the single source of truth. Legacy
+//! `messages.jsonl` transcripts migrate once — wrapped row-by-row into the
+//! event log, deleted only after the full write succeeded (D1: not kept) —
+//! and any corruption fails closed with `Err` instead of being adopted.
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::SystemTime;
+
+use conga::{derive_messages, AgentError, AgentMessage, EventStorage, JsonlStorage, SessionEvent};
+
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    pub id: String,
+    pub mtime: SystemTime,
+    pub msg_count: usize,
+    /// Display name from the session's `meta.json` sidecar, if any.
+    pub name: Option<String>,
+}
+
+/// Cursor semantics: `new()` generates the initial `current_id`; only
+/// `new` / `resume` / `clear` change it; events always append to the
+/// current id. A fresh manager that was never resumed writes a brand-new
+/// session — callers that want an existing session MUST `resume` first.
+#[derive(Clone)]
+pub struct SessionManager {
+    root: PathBuf,
+    storage: EventStorage,
+    /// Current-session cursor. Interior-mutable on purpose: rotating to a
+    /// fresh id (`clear`) is a cursor move, not a host mutation — transports
+    /// that hold the `Host` behind an `Arc` (the desktop app) must be able
+    /// to `/clear` without `&mut` access.
+    current_id: Arc<parking_lot::Mutex<String>>,
+}
+
+impl Default for SessionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Count model-visible messages in one transcript's raw contents, mirroring
+/// [`derive_messages`]: only `User`/`Assistant`/`ToolResult` rows count, and
+/// everything up to the last `Cleared` marker is not counted (the cleared
+/// prefix is history on disk, not conversation). A legacy `messages.jsonl`
+/// (pre-migration) holds one message per non-empty line. A torn/unparseable
+/// event row is not a message and is skipped.
+fn count_messages(raw: &str, is_events: bool) -> usize {
+    raw.lines()
+        .filter(|l| !l.trim().is_empty())
+        .fold(0usize, |count, line| {
+            if !is_events {
+                return count + 1;
+            }
+            match serde_json::from_str::<EventTypeProbe>(line)
+                .map(|p| p.kind)
+                .as_deref()
+            {
+                Ok("user" | "assistant" | "tool_result") => count + 1,
+                Ok("cleared") => 0,
+                _ => count,
+            }
+        })
+}
+
+/// Type-only probe for [`count_messages`]: counting rows must not
+/// materialize each row's full `SessionEvent` (a large session holds
+/// megabytes of tool output per row). serde skips unknown fields without
+/// allocating, so only the discriminant string is built. Unknown `type`
+/// values (a newer writer's variants) hit the catch-all arm — the same skip
+/// a full-parse failure produced.
+#[derive(serde::Deserialize)]
+struct EventTypeProbe {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+/// `msg_count` cache keys stored in the session's `meta.json` sidecar.
+/// Additive — core's `SessionMeta` reader ignores unknown fields, so the
+/// display name written by rename flows keeps working. `msg_count` is the
+/// model-visible message count; `msg_count_bytes` is the `events.jsonl`
+/// size it was computed at (the freshness check: appends grow the file).
+const META_MSG_COUNT: &str = "msg_count";
+const META_MSG_COUNT_BYTES: &str = "msg_count_bytes";
+
+/// Read the cached `(msg_count, events_bytes)` pair from a `meta.json`.
+/// `None` when the sidecar is missing, unreadable, or predates the cache.
+async fn read_msg_count_cache(meta_path: &std::path::Path) -> Option<(usize, u64)> {
+    let raw = tokio::fs::read(meta_path).await.ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    Some((
+        v.get(META_MSG_COUNT)?.as_u64()? as usize,
+        v.get(META_MSG_COUNT_BYTES)?.as_u64()?,
+    ))
+}
+
+/// Merge the cache pair into `meta.json`, preserving every other field
+/// (e.g. the display name). Atomic (tmp + rename), best effort — a failed
+/// write never fails `list`.
+async fn write_msg_count_cache(meta_path: &std::path::Path, count: usize, events_len: u64) {
+    let write = async {
+        let mut v: serde_json::Value = match tokio::fs::read(meta_path).await {
+            Ok(raw) => serde_json::from_slice(&raw).unwrap_or_else(|_| serde_json::json!({})),
+            Err(_) => serde_json::json!({}),
+        };
+        if let Some(map) = v.as_object_mut() {
+            map.insert(META_MSG_COUNT.into(), count.into());
+            map.insert(META_MSG_COUNT_BYTES.into(), events_len.into());
+        }
+        // Unique tmp name: concurrent `list` self-heals of the same session
+        // must not write through one shared `meta.json.tmp`.
+        let mut tmp_os = meta_path.as_os_str().to_os_string();
+        tmp_os.push(format!(".{}.conga-tmp", uuid::Uuid::new_v4()));
+        let tmp = std::path::PathBuf::from(tmp_os);
+        tokio::fs::write(&tmp, v.to_string()).await?;
+        tokio::fs::rename(&tmp, meta_path).await?;
+        Ok::<(), std::io::Error>(())
+    };
+    let _ = write.await;
+}
+
+impl SessionManager {
+    pub fn new() -> Self {
+        Self::with_root(JsonlStorage::default_root().base_dir_clone())
+    }
+
+    /// 测试用：指定 root。
+    pub fn with_root(root: PathBuf) -> Self {
+        Self {
+            root: root.clone(),
+            storage: EventStorage::new(root),
+            current_id: Arc::new(parking_lot::Mutex::new(uuid::Uuid::new_v4().to_string())),
+        }
+    }
+
+    pub fn current_id(&self) -> String {
+        self.current_id.lock().clone()
+    }
+
+    /// 打开或迁移:events.jsonl 存在 → load;否则 messages.jsonl 存在 →
+    /// 旧消息逐条 `SessionEvent::from_message` 包裹,经 tmp+rename 原子
+    /// 写入 events.jsonl,迁移成功后删除旧 messages.jsonl(D1:不保留);
+    /// 两者皆无 → 新会话。中间行损坏 → `Err`(fail closed,绝不 adopt)。
+    ///
+    /// Does not change the current-session cursor; [`resume`](Self::resume)
+    /// adopts the id on top of this.
+    pub async fn open_or_migrate(&self, session_id: &str) -> Result<Vec<SessionEvent>, AgentError> {
+        if self.storage.has_events(session_id) {
+            return self.storage.load_events(session_id).await;
+        }
+        let legacy = self.storage.load_messages(session_id).await?;
+        if legacy.is_empty() {
+            // Neither an event log nor legacy content: fresh session.
+            return Ok(Vec::new());
+        }
+        let mut events = Vec::with_capacity(legacy.len());
+        for msg in &legacy {
+            let ev = SessionEvent::from_message(msg, None).ok_or_else(|| {
+                AgentError::Transcript(format!(
+                    "session {session_id}: legacy row cannot be represented as a session event"
+                ))
+            })?;
+            events.push(ev);
+        }
+        // Atomic install (tmp + rename): a crash can never leave a torn
+        // events.jsonl shadowing the intact legacy file. Crash windows:
+        //  * before the rename — only the `.tmp` exists, `has_events` stays
+        //    false, and the next open re-migrates from the untouched legacy
+        //    (idempotent; the stale `.tmp` is replaced wholesale).
+        //  * after the rename, before `delete_legacy` — events.jsonl is
+        //    complete and `has_events` short-circuits to it, so the leftover
+        //    legacy file is inert and is deliberately left in place: D1's
+        //    "delete after success" is satisfied at the rename boundary, and
+        //    a second opportunistic cleanup pass is not worth the code.
+        self.storage
+            .append_events_atomic(session_id, &events)
+            .await?;
+        self.storage.delete_legacy(session_id).await?;
+        Ok(events)
+    }
+
+    /// Append one event to the current session's log.
+    pub async fn append_event(&self, ev: &SessionEvent) -> Result<(), AgentError> {
+        let sid = self.current_id.lock().clone();
+        self.storage.append_event(&sid, ev).await
+    }
+
+    /// The agent loop's sync `persist` callback, backed by the store's
+    /// synchronous `std::fs` append — no runtime bridging, no
+    /// thread-spawn-per-event, and safe to call from any thread (the
+    /// `Handle::block_on` nested-runtime panic risk is gone by
+    /// construction). Lines are small and events per turn are few, so the
+    /// brief blocking write is noise next to an LLM round-trip.
+    #[allow(clippy::type_complexity)]
+    pub fn persist_fn(&self) -> Arc<dyn Fn(&SessionEvent) -> Result<(), AgentError> + Send + Sync> {
+        let storage = self.storage.clone();
+        let sid = self.current_id.lock().clone();
+        Arc::new(move |ev| storage.append_event_sync(&sid, ev))
+    }
+
+    /// Load (migrating if needed) a session and adopt it as the current one.
+    /// Returns the derived model-visible history. Corruption fails closed.
+    /// Load (migrating if needed) a session and adopt it as the current one.
+    /// Returns the derived model-visible history. Corruption fails closed.
+    /// `&self`: the cursor is interior-mutable, so hosts can resume through
+    /// a shared `&SessionManager` (no `&mut` gymnastics).
+    pub async fn resume(&self, id: &str) -> Result<Vec<AgentMessage>, crate::HostError> {
+        let events = self
+            .open_or_migrate(id)
+            .await
+            .map_err(|e| crate::HostError::Session(e.to_string()))?;
+        *self.current_id.lock() = id.to_string();
+        Ok(derive_messages(&events))
+    }
+
+    pub async fn resume_last(&self) -> Result<Vec<AgentMessage>, crate::HostError> {
+        let id = self
+            .list()
+            .await?
+            .into_iter()
+            .max_by_key(|s| s.mtime)
+            .map(|s| s.id)
+            .ok_or_else(|| crate::HostError::Session("no prior session".into()))?;
+        self.resume(&id).await
+    }
+
+    pub async fn list(&self) -> Result<Vec<SessionInfo>, crate::HostError> {
+        let root = self.root.clone();
+        let mut out = Vec::new();
+        // Fresh install: sessions dir doesn't exist yet -> no sessions.
+        let mut rd = match tokio::fs::read_dir(&root).await {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(crate::HostError::Session(e.to_string())),
+        };
+        while let Some(entry) = rd
+            .next_entry()
+            .await
+            .map_err(|e| crate::HostError::Session(e.to_string()))?
+        {
+            if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let id = entry.file_name().to_string_lossy().to_string();
+            // mtime comes from the transcript file, NOT the session dir:
+            // appending updates the file's mtime but leaves the dir's
+            // untouched, so dir mtime would freeze at first write. Prefer
+            // events.jsonl; an unmigrated legacy session falls back to
+            // messages.jsonl.
+            let is_events = self.storage.has_events(&id);
+            let path = if is_events {
+                self.storage.events_path(&id)
+            } else {
+                self.storage.messages_path(&id)
+            };
+            let (mtime, events_len) = match tokio::fs::metadata(&path).await {
+                Ok(m) => (m.modified().ok().unwrap_or(SystemTime::UNIX_EPOCH), m.len()),
+                Err(_) => (SystemTime::UNIX_EPOCH, 0),
+            };
+            // Count model-visible messages, not raw event lines: the event
+            // log carries TurnStart/TurnEnd marker rows that
+            // derive_messages projects away. A legacy messages.jsonl
+            // (pre-migration) still holds one message per non-empty line.
+            // Event sessions consult the msg_count cache in the meta.json
+            // sidecar first; only a missing/stale cache pays the full read.
+            let msg_count = if is_events {
+                self.cached_or_count_messages(&id, &path, events_len).await
+            } else {
+                match tokio::fs::read_to_string(&path).await {
+                    Ok(s) => count_messages(&s, false),
+                    Err(_) => 0,
+                }
+            };
+            out.push(SessionInfo {
+                id: id.clone(),
+                mtime,
+                msg_count,
+                name: self.storage.load_meta(&id).await.and_then(|m| m.name),
+            });
+        }
+        Ok(out)
+    }
+
+    /// `list` fast path: reuse the `msg_count` cached in the session's
+    /// `meta.json` sidecar while `events.jsonl`'s size still matches the
+    /// size recorded with it (`msg_count_bytes`); a missing or stale cache
+    /// (events were appended since) falls back to one full read for THIS
+    /// session only and refreshes the cache. Best effort: a failed
+    /// cache write just costs the next `list` a full read.
+    async fn cached_or_count_messages(
+        &self,
+        id: &str,
+        events_path: &std::path::Path,
+        events_len: u64,
+    ) -> usize {
+        if let Some((count, cached_len)) = read_msg_count_cache(&self.storage.meta_path(id)).await {
+            if cached_len == events_len {
+                return count;
+            }
+        }
+        let count = match tokio::fs::read_to_string(events_path).await {
+            Ok(s) => count_messages(&s, true),
+            Err(_) => 0,
+        };
+        write_msg_count_cache(&self.storage.meta_path(id), count, events_len).await;
+        count
+    }
+
+    /// Mark the conversation cleared — the unified `/clear` semantics for
+    /// every transport: append a [`SessionEvent::Cleared`] fact to the
+    /// CURRENT session's log. The session id does NOT rotate (live
+    /// connections, REST readers, and the FTS index keep addressing the same
+    /// chat); [`derive_messages`](conga::derive_messages) projects away the
+    /// pre-clear prefix; the log on disk stays append-only. Fail loud: a
+    /// failed write returns `Err` so the caller can tell the user the clear
+    /// did NOT take (a silent failure would resurrect the old history on
+    /// the next turn).
+    pub async fn mark_cleared(&self) -> Result<(), AgentError> {
+        self.append_event(&SessionEvent::Cleared).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use conga::{ContentBlock, UserMessage};
+
+    fn user_msg(t: &str) -> AgentMessage {
+        AgentMessage::User(UserMessage {
+            content: vec![ContentBlock::text(t)],
+            timestamp: 1,
+        })
+    }
+
+    fn user_event(t: &str) -> SessionEvent {
+        SessionEvent::User(user_msg(t))
+    }
+
+    fn assistant_event(t: &str) -> SessionEvent {
+        SessionEvent::Assistant {
+            message: AgentMessage::assistant_text(t),
+            usage: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_loads_and_sets_current() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sm = SessionManager::with_root(tmp.path().to_path_buf());
+        let id = "fixed-id".to_string();
+        *sm.current_id.lock() = id.clone();
+        sm.append_event(&user_event("a")).await.unwrap();
+        sm.append_event(&user_event("b")).await.unwrap();
+
+        let sm2 = SessionManager::with_root(tmp.path().to_path_buf());
+        let msgs = sm2.resume(&id).await.unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(sm2.current_id(), id);
+    }
+
+    #[tokio::test]
+    async fn resume_last_picks_most_recent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = SessionManager::with_root(tmp.path().to_path_buf());
+        *a.current_id.lock() = "old".into();
+        a.append_event(&user_event("old")).await.unwrap();
+        // 让 new 的 mtime 晚于 old
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let b = SessionManager::with_root(tmp.path().to_path_buf());
+        *b.current_id.lock() = "new".into();
+        b.append_event(&user_event("new")).await.unwrap();
+
+        let pick = SessionManager::with_root(tmp.path().to_path_buf());
+        let msgs = pick.resume_last().await.unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(pick.current_id(), "new");
+    }
+
+    #[tokio::test]
+    async fn resume_last_uses_latest_message_mtime() {
+        // Regression: dir mtime freezes at first write, so a session that gets
+        // a *second* append after another session was created must still win.
+        let tmp = tempfile::tempdir().unwrap();
+        let a = SessionManager::with_root(tmp.path().to_path_buf());
+        *a.current_id.lock() = "a".into();
+        a.append_event(&user_event("a1")).await.unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let b = SessionManager::with_root(tmp.path().to_path_buf());
+        *b.current_id.lock() = "b".into();
+        b.append_event(&user_event("b1")).await.unwrap();
+
+        // a receives a later event -> a is the most recently active session.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        a.append_event(&user_event("a2")).await.unwrap();
+
+        let pick = SessionManager::with_root(tmp.path().to_path_buf());
+        let msgs = pick.resume_last().await.unwrap();
+        assert_eq!(pick.current_id(), "a");
+        assert_eq!(msgs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_on_missing_root_is_empty() {
+        // Fresh install: sessions dir doesn't exist yet.
+        let tmp = tempfile::tempdir().unwrap();
+        let sm = SessionManager::with_root(tmp.path().join("nope"));
+        assert!(sm.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_counts_messages_not_turn_markers() {
+        // A minimal turn writes 4 event lines (TurnStart, User, Assistant,
+        // TurnEnd) but only 2 are model-visible messages. `msg_count` must
+        // report messages, not raw event lines (TurnStart/TurnEnd contribute
+        // nothing to derive_messages).
+        let tmp = tempfile::tempdir().unwrap();
+        let sm = SessionManager::with_root(tmp.path().to_path_buf());
+        let id = sm.current_id().to_string();
+        sm.append_event(&SessionEvent::TurnStart).await.unwrap();
+        sm.append_event(&user_event("hi")).await.unwrap();
+        sm.append_event(&assistant_event("hello")).await.unwrap();
+        sm.append_event(&SessionEvent::TurnEnd {
+            reason: conga::TurnEndReason::Completed,
+        })
+        .await
+        .unwrap();
+
+        let info = sm
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id == id)
+            .expect("session should be listed");
+        assert_eq!(
+            info.msg_count, 2,
+            "msg_count must count messages (User/Assistant/ToolResult), not event lines"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_marks_the_log_and_survives_restart() {
+        // /clear is a FACT in the log, not a rotation: the id stays, derive
+        // truncates, a fresh process sees the same cleared view, and the
+        // pre-clear rows are still on disk (append-only).
+        let tmp = tempfile::tempdir().unwrap();
+        let sm = SessionManager::with_root(tmp.path().to_path_buf());
+        let id = sm.current_id().to_string();
+        sm.append_event(&user_event("before clear")).await.unwrap();
+        sm.mark_cleared().await.unwrap();
+        sm.append_event(&user_event("after clear")).await.unwrap();
+
+        // Same id (no ghost sessions).
+        assert_eq!(sm.current_id(), id);
+
+        // A fresh process resume derives only the post-clear prefix.
+        let sm2 = SessionManager::with_root(tmp.path().to_path_buf());
+        let msgs = sm2.resume(&id).await.unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(&msgs[0], AgentMessage::User(u)
+            if matches!(&u.content[0], conga::ContentBlock::Text { text } if text == "after clear")));
+
+        // The log on disk kept the pre-clear rows (append-only intact).
+        let events = sm2.open_or_migrate(&id).await.unwrap();
+        assert!(events.contains(&SessionEvent::Cleared));
+        assert!(events.iter().any(|ev| matches!(ev,
+            SessionEvent::User(m) if matches!(m, AgentMessage::User(u)
+                if matches!(&u.content[0], conga::ContentBlock::Text { text } if text == "before clear")))));
+
+        // list() mirrors derive: 1 model-visible message after the clear.
+        let info = sm2
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id == id)
+            .unwrap();
+        assert_eq!(info.msg_count, 1);
+    }
+
+    #[tokio::test]
+    async fn persist_fn_writes_events_outside_async_ctx() {
+        // The loop's sync persist callback must land events in the log —
+        // including when called from a plain (non-async) caller.
+        let tmp = tempfile::tempdir().unwrap();
+        let sm = SessionManager::with_root(tmp.path().to_path_buf());
+        *sm.current_id.lock() = "persisted".into();
+        let persist = sm.persist_fn();
+        persist(&user_event("via-callback")).unwrap();
+
+        let events = sm.open_or_migrate("persisted").await.unwrap();
+        assert_eq!(events, vec![user_event("via-callback")]);
+    }
+
+    fn write_legacy(dir: &std::path::Path, msgs: &[AgentMessage]) {
+        let mut raw = String::new();
+        for m in msgs {
+            raw.push_str(&serde_json::to_string(m).unwrap());
+            raw.push('\n');
+        }
+        std::fs::write(dir.join("messages.jsonl"), raw).unwrap();
+    }
+
+    /// Crash window before the rename: `events.jsonl.tmp` exists (possibly
+    /// torn) but `events.jsonl` never materialized. `has_events` must be
+    /// false, the legacy file must still be intact, and the next open must
+    /// re-migrate the full transcript from scratch.
+    #[tokio::test]
+    async fn migration_crash_before_rename_re_migrates_from_legacy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = "crashed-migration";
+        let dir = tmp.path().join(sid);
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = vec![user_msg("hello"), user_msg("again")];
+        write_legacy(&dir, &legacy);
+        // The torn staging file a kill -9 between write and rename leaves.
+        std::fs::write(dir.join("events.jsonl.tmp"), "{\"type\":\"TurnSta").unwrap();
+
+        let sm = SessionManager::with_root(tmp.path().to_path_buf());
+        let events = sm.open_or_migrate(sid).await.unwrap();
+        assert_eq!(
+            derive_messages(&events),
+            legacy,
+            "the retry must migrate the full legacy transcript"
+        );
+        assert!(dir.join("events.jsonl").exists());
+        assert!(
+            !dir.join("events.jsonl.tmp").exists(),
+            "the retry must replace the stale staging file wholesale"
+        );
+        assert!(
+            !dir.join("messages.jsonl").exists(),
+            "legacy removed only after the successful atomic install"
+        );
+    }
+
+    /// Crash window after the rename but before `delete_legacy`:
+    /// `events.jsonl` is complete, so the open short-circuits to it and the
+    /// leftover legacy file is inert and left in place (documented choice —
+    /// the rename boundary is the success point for D1).
+    #[tokio::test]
+    async fn migration_crash_after_rename_opens_events_and_leaves_legacy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = "crashed-cleanup";
+        let dir = tmp.path().join(sid);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The already-complete migrated log plus an orphaned legacy file.
+        let events = vec![user_event("migrated-a"), user_event("migrated-b")];
+        let mut raw = String::new();
+        for ev in &events {
+            raw.push_str(&serde_json::to_string(ev).unwrap());
+            raw.push('\n');
+        }
+        std::fs::write(dir.join("events.jsonl"), raw).unwrap();
+        write_legacy(&dir, &[user_msg("old-a"), user_msg("old-b")]);
+
+        let sm = SessionManager::with_root(tmp.path().to_path_buf());
+        let loaded = sm.open_or_migrate(sid).await.unwrap();
+        assert_eq!(
+            loaded, events,
+            "must load the complete events.jsonl, never consult the legacy file"
+        );
+        assert!(
+            dir.join("messages.jsonl").exists(),
+            "the leftover legacy is inert cleanup, deliberately not deleted here"
+        );
+    }
+
+    /// `list` caches msg_count in the meta.json sidecar; a later append
+    /// changes events.jsonl's size, the stale cache is detected, and the
+    /// full read self-heals the count for that session.
+    #[tokio::test]
+    async fn list_after_append_recaches_and_self_heals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sm = SessionManager::with_root(tmp.path().to_path_buf());
+        let id = "cache-count".to_string();
+        *sm.current_id.lock() = id.clone();
+        sm.append_event(&user_event("a")).await.unwrap();
+        sm.append_event(&assistant_event("b")).await.unwrap();
+
+        let find =
+            |info: Vec<SessionInfo>| info.into_iter().find(|i| i.id == "cache-count").unwrap();
+        assert_eq!(find(sm.list().await.unwrap()).msg_count, 2);
+
+        // The first list wrote the cache into the sidecar.
+        let meta_path = tmp.path().join(&id).join("meta.json");
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+        assert_eq!(meta[META_MSG_COUNT], 2, "cache must land in meta.json");
+        let bytes = std::fs::metadata(tmp.path().join(&id).join("events.jsonl"))
+            .unwrap()
+            .len();
+        assert_eq!(meta[META_MSG_COUNT_BYTES].as_u64(), Some(bytes));
+
+        // Append: the recorded size no longer matches the file — list must
+        // fall back to the full read and report the NEW count.
+        sm.append_event(&user_event("c")).await.unwrap();
+        assert_eq!(find(sm.list().await.unwrap()).msg_count, 3);
+
+        // And the refreshed cache is written back (new size recorded).
+        let meta2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+        let bytes2 = std::fs::metadata(tmp.path().join(&id).join("events.jsonl"))
+            .unwrap()
+            .len();
+        assert_eq!(meta2[META_MSG_COUNT], 3);
+        assert_eq!(meta2[META_MSG_COUNT_BYTES].as_u64(), Some(bytes2));
+    }
+
+    /// While events.jsonl is unchanged, list serves the cached count (no
+    /// full read): a tampered-but-size-matched cache value is what comes
+    /// back. The next append self-heals.
+    #[tokio::test]
+    async fn list_serves_cached_count_while_events_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sm = SessionManager::with_root(tmp.path().to_path_buf());
+        let id = "cache-hit".to_string();
+        *sm.current_id.lock() = id.clone();
+        sm.append_event(&user_event("a")).await.unwrap();
+        sm.append_event(&user_event("b")).await.unwrap();
+        let find = |info: Vec<SessionInfo>| info.into_iter().find(|i| i.id == "cache-hit").unwrap();
+        assert_eq!(find(sm.list().await.unwrap()).msg_count, 2); // seeds cache
+
+        // Tamper ONLY the count; keep the recorded size — the cache is
+        // fresh by the bytes check, so this value must be served as-is.
+        let meta_path = tmp.path().join(&id).join("meta.json");
+        let mut meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+        meta[META_MSG_COUNT] = 99.into();
+        std::fs::write(&meta_path, meta.to_string()).unwrap();
+        assert_eq!(
+            find(sm.list().await.unwrap()).msg_count,
+            99,
+            "fresh cache must be served without a full read"
+        );
+
+        // Appending invalidates the tampered cache; the count self-heals.
+        sm.append_event(&user_event("c")).await.unwrap();
+        assert_eq!(find(sm.list().await.unwrap()).msg_count, 3);
+    }
+}

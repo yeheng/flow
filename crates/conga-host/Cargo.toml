@@ -1,0 +1,68 @@
+[package]
+name = "conga-host"
+version = "2.0.0"
+edition = "2021"
+license = "MIT"
+authors = ["conga contributors"]
+repository = "https://github.com/YeHeng/conga"
+description = "Host runtime (tools, headless assembly, session) for conga"
+
+# Vendored from https://github.com/YeHeng/conga @ 425d786
+# (see crates/VENDOR.md for the sync procedure).
+
+[lib]
+name = "conga_host"
+path = "src/lib.rs"
+
+[dependencies]
+conga = { path = "../conga" }
+dotenvy = "0.15"
+thiserror = "2"
+parking_lot = "0.12"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread", "macros", "sync", "time",
+    "fs", "io-util", "net", "process", "signal",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-util = "0.3.32"
+reqwest = { version = "0.13", default-features = false, features = [
+    "json", "rustls", "stream", "socks",
+] }
+
+# ---- built-in tools (host-level since the module move) ----
+# Gitignore-aware directory walking (list + grep tools). Bundles `walkdir` +
+# `globset`, so we no longer depend on `walkdir` directly.
+ignore = "0.4"
+# Glob matching (list tool)
+glob = "0.3"
+# Regex matching (grep tool)
+regex = "1"
+# HTML parsing for the fetch tool + URL handling
+dom_query = "0.28"
+url = "2"
+
+[features]
+default = []
+# 上游可选后端（sqlx 会话索引 / Linux Landlock 沙箱 / QuickJS 扩展）依赖的
+# crate 未随本次 vendor 引入，这里保留同名占位 feature：默认关闭；一旦开启
+# 会在 lib.rs 触发 compile_error!，提示需要补齐依赖。
+session-index = []
+sandbox-landlock = []
+ext-js = []
+rag = []
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt", "ansi", "std", "env-filter",
+] }
+tempfile = "3"
+futures-util = "0.3.32"
+parking_lot = "0.12"
+# .env loading for example hosts.
+dotenvy = "0.15"
+
+[[example]]
+name = "cli_host"

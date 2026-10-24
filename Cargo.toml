@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
+    # vendored third-party crates (see crates/VENDOR.md)
+    "crates/conga",
+    "crates/conga-host",
     "crates/flow-agent",
     "crates/flow-executor",
     "crates/flow-journal",

@@ -1,0 +1,109 @@
+# =============================================================================
+# conga config.toml example
+# Copy to ./.conga/config.toml (project-level) or ~/.conga/config.toml
+# (global) and fill in real values. Discovery order:
+#   $CONGA_CONFIG → ./.conga/config.toml → ~/.conga/config.toml
+#
+# Precedence (lowest → highest):
+#   config.toml  <  .env  <  process env  <  ~/.conga/settings.json (web UI)
+# Every key below is optional; an empty string means "unset".
+# Key names mirror the CONGA_* env vars in .env.example.
+
+# ── LLM connection (required unless set via env) ───────────────────────────
+[llm]
+base_url = "https://api.deepseek.com/v1"
+key = "your-api-key"
+model = "deepseek-chat"
+# Protocol family: openai (default) or anthropic
+api = "openai"
+
+# ── Fast model for sub-agents (optional) ───────────────────────────────────
+# A COMPLETE set routes sub-agents to a cheaper model; unset = same model as
+# the main agent. A PARTIAL set (typo) fails loud at startup.
+[fast_llm]
+# base_url = "https://api.deepseek.com/v1"
+# key = "your-fast-key"
+# model = "deepseek-chat"
+# api = "openai"
+
+# ── Proxy (optional) ────────────────────────────────────────────────────────
+[proxy]
+# LLM egress: llm covers both http and https; per-scheme keys override it.
+# llm = "http+https://proxy:8080"
+# llm_http = "http://proxy:8080"
+# llm_https = "https://proxy:8080"
+# Tool traffic proxy for fetch / web_search (http, https, socks5, socks5h).
+# The desktop app configures this via its UI; the UI value wins.
+# tool = "socks5://127.0.0.1:1080"
+
+# ── Inference loop tunables (optional, defaults shown) ──────────────────────
+[tunables]
+max_turns = 50
+max_tool_calls = 20
+max_tokens = 4096
+retry_max = 2
+retry_initial_ms = 500
+retry_max_ms = 8000
+# tool_timeout_s = 30
+
+# ── Gateway server ──────────────────────────────────────────────────────────
+[gateway]
+port = 3000
+host = "127.0.0.1"
+# suggest | auto-edit | full-auto | plan (read-only)
+mode = "auto-edit"
+approval_timeout_s = 300
+# Every /ws and /api/* request must present this token. Unset → a random
+# token is generated on first start and stored in ~/.conga/gateway_token.
+# token = ""
+# Comma-separated extra CORS origins (defaults allow the Vite dev server).
+# cors_origins = ""
+
+# ── Context compaction ──────────────────────────────────────────────────────
+# The web UI's settings dialog overrides context_window via its maxTokens
+# field (persisted to ~/.conga/settings.json).
+[compact]
+context_window = 128000
+threshold_pct = 80
+target_pct = 50
+max_messages = 80
+
+# ── Tools / MCP ─────────────────────────────────────────────────────────────
+[tools]
+# External command tools whitelist (comma-separated)
+# external_tools = "rg,jq"
+# MCP config file path (default ~/.conga/mcp.json)
+# mcp_config = "/path/to/mcp.json"
+mcp_call_timeout_s = 60
+# Allow fetch to reach private/internal networks (SSRF guard is on by
+# default). Set to true only for trusted self-hosted LANs.
+fetch_allow_private_net = false
+# Run bash tool commands in a filesystem sandbox (writes confined to
+# cwd/TMPDIR/var/tmp; macOS sandbox-exec / Linux landlock — Linux requires
+# building with --features sandbox-landlock, otherwise fail-closed).
+sandbox = false
+# Project directory the agent works on: tool sandbox root and base for
+# <dir>/.conga/skills project skills. Unset = process cwd (CLI default).
+# project_dir = "/path/to/your/project"
+
+# ── Web search (requires `ext` feature on CLI) ──────────────────────────────
+[search]
+# provider = "brave"
+# brave_api_key = ""
+# tavily_api_key = ""
+# serper_api_key = ""
+# serpapi_api_key = ""
+# exa_api_key = ""
+# firecrawl_api_key = ""
+
+# ── conga-rag ───────────────────────────────────────────────────────────────
+# These map to the CONGA_RAG_* env vars, which override rag.toml file values.
+# The rag config file itself is discovered separately:
+#   ./rag.toml → ~/.conga/rag.toml  (see rag.example.toml)
+[rag]
+# config = "/path/to/rag.toml"
+# embed_base_url = ""    # falls back to llm.base_url above
+# embed_key = ""         # falls back to llm.key above
+# embed_model = ""
+# embed_batch = 64
+# store_path = "~/.conga/rag/index.db"

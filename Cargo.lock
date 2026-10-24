@@ -584,25 +584,26 @@ dependencies = [
 [[package]]
 name = "conga"
 version = "2.0.0"
-source = "git+https://github.com/yeheng/conga?rev=425d786#425d78657df8e0e9235dadb5ec99416fc23f9d5a"
 dependencies = [
  "async-stream",
  "dirs 6.0.0",
  "dotenvy",
  "futures-util",
+ "parking_lot",
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "toml 0.9.12+spec-1.1.0",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "conga-host"
 version = "2.0.0"
-source = "git+https://github.com/yeheng/conga?rev=425d786#425d78657df8e0e9235dadb5ec99416fc23f9d5a"
 dependencies = [
  "conga",
  "dom_query",
@@ -615,9 +616,11 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "url",
  "uuid",
 ]
