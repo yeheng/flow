@@ -9,6 +9,15 @@
 //! 每条连接一个串行帧写入器（单写任务按序写帧，避免并发写导致帧交错），
 //! 读任务独立于节点执行持续运行（主进程不能等节点执行返回才读取审计）。
 //! 不绑定 `.sock` 路径、不起本地 listener、无服务发现。
+//!
+//! 本模块守护的核心不变量：
+//! - **帧序 = 提交序**：单写任务按出站队列顺序逐帧写出，因此
+//!   「Execute 先于它的 TransferChunk」这类顺序敏感关系在物理上成立，
+//!   接收端不需要重组暂存。
+//! - **故障必须可达**：写侧失败没有读事件可走，必须绕过事件队列直达
+//!   `recv`（否则读端可能永久 pending 在一个永不返回的 read 上）。
+//! - **队列必须有界**：出站积压用有界 backlog 化解背压，绝不用无界
+//!   队列——无界队列把背压换成 OOM，且掩盖真实的生产速率问题。
 
 use tokio::sync::mpsc;
 
@@ -23,22 +32,37 @@ use super::message::{Message, ProtocolError};
 /// `ExecuteTask`（数百字节），装箱后事件枚举与队列槽位收缩到指针大小——
 /// I/O 事件量等于消息流量，不装箱等于每帧复制整个 payload。
 enum IoEvent {
+    /// 一条完整消息（已通过帧解码与预算校验）。
     Frame(Box<Message>),
+    /// 协议/IO 错误事实（会话随即终止）。
     Failed(ProtocolError),
+    /// 对端正常关闭（EOF）。
     Eof,
 }
 
 /// 消息级传输端点：业务层唯一的收/发/关闭边界。
+///
+/// 内部由「读任务 + 写任务 + 两个有界 mpsc 队列」组成：业务层看到的
+/// 只有 `send`/`recv`/`close`，不感知 socket、FD 或帧格式细节。
 pub struct FrameTransport {
+    /// 入站事件队列（读任务投递帧/错误/EOF）。
     incoming: mpsc::Receiver<IoEvent>,
+    /// 非阻塞路径上暂存的错误事实（`try_recv` 遇到即返回，但真正的错误
+    /// 要留到下一次 `recv` 报出）。
     pending_error: Option<ProtocolError>,
+    /// 会话是否已结束（EOF/失败/close 之后不再接受消息）。
     ended: bool,
+    /// 出站消息队列（写任务按序取走并写帧）。
     outbound: mpsc::Sender<Message>,
+    /// I/O 任务句柄与会话共享故障状态。
     io: IoHandle,
 }
 
+/// I/O 任务句柄与会话共享状态（关闭时用来唤醒并回收任务）。
 struct IoHandle {
+    /// 读任务句柄（正常只有一条流一个读任务）。
     readers: Vec<tokio::task::JoinHandle<()>>,
+    /// 写任务句柄（单写任务是「帧序 = 提交序」的保证）。
     writers: Vec<tokio::task::JoinHandle<()>>,
     /// 会话共享故障状态（T03）：任一 I/O 方向失败即整会话终止。
     state: std::sync::Arc<SessionState>,
@@ -81,10 +105,19 @@ impl SessionState {
 impl FrameTransport {
     /// 单流承载：`u32 body_len | postcard(Message)`；发送队列一条，
     /// 帧序即提交序。
+    ///
+    /// `queue_depth` 是收发两侧队列的深度；下限 8：握手至少要能排下
+    /// Hello/Welcome/Ready 与首批业务帧，深度过小会让正常流量看起来
+    /// 像背压。
+    ///
+    /// 内部拆成读/写两个任务：读必须独立于节点执行运行，否则主进程会
+    /// 在节点执行返回之前收不到审计帧。
     pub fn spawn<S>(stream: S, queue_depth: usize) -> Self
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
+        // 下限 8：握手与首批业务帧必须能一次排下，否则会出现「刚建连
+        // 就背压」的假象。
         let (event_tx, incoming) = mpsc::channel(queue_depth.max(8));
         let (outbound, outbound_rx) = mpsc::channel::<Message>(queue_depth.max(8));
         let state = std::sync::Arc::new(SessionState {
@@ -94,6 +127,8 @@ impl FrameTransport {
             terminate: tokio_util::sync::CancellationToken::new(),
         });
         let (read_half, write_half) = tokio::io::split(stream);
+        // 用 trait object 装箱读写半边：读写任务的泛型签名不同，擦除
+        // 具体类型才能放进同一个任务集合。
         let read_half: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>> = Box::pin(read_half);
         let reader = tokio::spawn(read_loop(read_half, event_tx.clone(), state.clone()));
         let writer = tokio::spawn(write_loop(
@@ -101,6 +136,7 @@ impl FrameTransport {
             outbound_rx,
             state.clone(),
         ));
+        // 释放本地克隆：只有读任务持有发送端，通道关闭才等价于读任务退出。
         drop(event_tx);
         Self {
             incoming,
@@ -117,7 +153,13 @@ impl FrameTransport {
 
     /// 发送一条消息。会话故障（读写任一失败/close）后阻塞中的发送也会被
     /// 释放：写任务退出丢弃出站队列，等待中的 send 以 Closed 返回。
+    ///
+    /// 帧序语义：入队顺序即发送顺序，多个调用方并发 `send` 时顺序是
+    /// 「谁先拿到队列槽位」，因此顺序敏感的协议动作必须由同一个调用
+    /// 方串行发出。
     pub async fn send(&self, message: Message) -> Result<(), ProtocolError> {
+        // 已故障时立即返回：排队等一个永远不会来的写任务是纯浪费，
+        // 还会把调用方挂死在会话已经死掉的事实上。
         if self
             .io
             .state
@@ -136,6 +178,7 @@ impl FrameTransport {
     /// 协议帧错误（非法长度/损坏 postcard 体）先返回错误，随后通道关闭。
     /// 写任务失败时没有读事件可等：失败信号直达（已排队的帧先于错误交付）。
     pub async fn recv(&mut self) -> Result<Message, ProtocolError> {
+        // 非阻塞路径（try_recv）已经发现过错误：先把它报出来，再谈后续。
         if let Some(error) = self.pending_error.take() {
             return Err(error);
         }
@@ -144,6 +187,8 @@ impl FrameTransport {
         }
         let event = tokio::select! {
             biased;
+            // biased：优先投递已到达的入站事件，避免失败通知抢在已排队的
+            // 帧前面，让对端最后几帧被吞掉。
             event = self.incoming.recv() => event,
             _ = self.io.state.failed.notified() => {
                 self.ended = true;
@@ -178,6 +223,9 @@ impl FrameTransport {
     }
 
     /// 非阻塞发送（队列满/已关即失败；agent 拒绝路径使用）。
+    ///
+    /// 队列满时丢弃消息：调用方约定这条路径上的消息可丢（拒绝通知、
+    /// 心跳等），所以这里不做重试。
     pub fn try_send(&self, message: Message) -> Result<(), ProtocolError> {
         if self
             .io
@@ -206,12 +254,17 @@ impl FrameTransport {
         }
         match self.outbound.try_send(message) {
             Ok(()) => Ok(None),
+            // 队列满：把消息原样退回，调用方负责保留与重试——静默丢弃
+            // 会让审计/结果帧凭空消失，且无法事后追查。
             Err(tokio::sync::mpsc::error::TrySendError::Full(message)) => Ok(Some(message)),
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(ProtocolError::Closed),
         }
     }
 
     /// 尽力先弹出已缓冲帧；无则 None（非阻塞窥视）。
+    ///
+    /// 错误语义：这里不直接返回错误，而是把它记进 `pending_error`，
+    /// 由下一次 `recv` 报出——非阻塞路径不应抢走调用方的错误处理责任。
     pub fn try_recv(&mut self) -> Option<Message> {
         if self.ended {
             return None;
@@ -243,10 +296,17 @@ impl FrameTransport {
     }
 
     /// Finish queued frames before closing. The deadline also bounds blocked writers.
+    ///
+    /// 语义补充（中文）：先把已入队的帧写出去再关闭——排空期的最后几帧
+    /// 往往是结果/审计这类不可丢的事实；deadline 同时兜住卡在写上的
+    /// 阻塞者，避免关闭动作本身挂死。
     pub async fn flush_and_close(mut self, timeout: std::time::Duration) {
+        // 断开发送端：写任务在队列排空后自然退出并 shutdown 流。
         self.outbound = dead_sender();
+        // 超时兜底：写侧卡住时不能无限等，否则关闭路径本身会挂死。
         let _ = tokio::time::timeout(timeout, drain_tasks(&mut self.io.writers)).await;
         self.close();
+        // 收尾：中止残留任务并等待它们真正结束（避免任务句柄泄漏）。
         for task in self.io.readers.iter().chain(self.io.writers.iter()) {
             task.abort();
         }
@@ -273,6 +333,11 @@ impl FrameTransport {
 }
 
 impl Drop for FrameTransport {
+    /// 析构时兜底收尾：中止读任务、限时冲刷写任务。
+    ///
+    /// 为什么不能直接 abort 写任务：写任务可能正持有半写出的帧，直接
+    /// abort 会留下一个残缺的帧在流上，对端下次读到就是「协议损坏」
+    /// 而不是「连接已关闭」。因此给写任务一个排空宽限期，超时才 abort。
     fn drop(&mut self) {
         self.outbound = dead_sender();
         let readers = std::mem::take(&mut self.io.readers);
@@ -281,11 +346,13 @@ impl Drop for FrameTransport {
         }
         let mut writers = std::mem::take(&mut self.io.writers);
         let state = self.io.state.clone();
+        // 没有任务可等：直接停会话即可。
         if readers.is_empty() && writers.is_empty() {
             state.stop();
             return;
         }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            // 有运行时：交给后台任务做限时排空，避免在析构里阻塞。
             runtime.spawn(async move {
                 let _ = tokio::time::timeout(
                     std::time::Duration::from_millis(DRAIN_GRACE_MS),
@@ -299,6 +366,7 @@ impl Drop for FrameTransport {
                 }
             });
         } else {
+            // 无运行时（如同步上下文析构）：只能中止写任务，会话状态照常停止。
             state.stop();
             for task in writers {
                 task.abort();
@@ -309,18 +377,31 @@ impl Drop for FrameTransport {
 
 /// Remove each completed handle before polling another one. If interrupted by a
 /// deadline/cancellation, the owner still holds every handle that needs reaping.
+///
+/// 中文补充：每等一个 handle 就把它从所有者手里移除，这样被 deadline
+/// 打断时，剩下的句柄仍然由所有者持有、可被再次收割；句柄遗留在
+/// 所有者之外就等于永久泄漏。
 async fn drain_tasks(tasks: &mut Vec<tokio::task::JoinHandle<()>>) {
     while let Some(task) = tasks.last_mut() {
         let _ = task.await;
+        // 收割完成后立刻从集合移除（即使 await 被取消，已完成的句柄也
+        // 不再需要被等待）。
         tasks.pop();
     }
 }
 
+/// 把一个 I/O 事件投递给业务层；会话已终止时放弃投递。
+///
+/// # Errors
+/// 返回 `Err(())` 表示会话已终止或接收端已消失，调用方应据此退出
+/// 读/写循环。
 async fn deliver(
     events: &mpsc::Sender<IoEvent>,
     event: IoEvent,
     state: &SessionState,
 ) -> Result<(), ()> {
+    // 终止信号与投递竞争：会话已死时不再往队列里塞事件（否则会
+    // 让 `recv` 在会话结束后还收到「迟到」的事实）。
     tokio::select! {
         result = events.send(event) => result.map_err(|_| ()),
         _ = state.terminate.cancelled() => Err(()),
@@ -344,6 +425,8 @@ async fn read_loop(
     use tokio::io::AsyncReadExt;
     let mut stream = stream;
     let mut decoder = FrameDecoder::new();
+    // 64 KiB 读缓冲：一次系统调用尽量多取，减少帧数多时的 syscall 压力；
+    // 帧本身可能大于这个值，解码器会自行跨多次读重组。
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
         // 会话已在别处终止：不再发起新的读。
@@ -444,6 +527,8 @@ async fn write_loop(
                 continue;
             }
         };
+        // 整帧一次 write_all + flush：保证对端看到的帧不会交错（单写
+        // 任务保证次序），也保证控制帧不滞留在内核缓冲里。
         let written = tokio::select! {
             result = stream.write_all(&frame) => result,
             _ = state.terminate.cancelled() => return,
@@ -488,6 +573,7 @@ impl SendBacklog {
         }
     }
 
+    /// 积压是否为空（调用方据此决定「直发」还是「排队」）。
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
@@ -535,21 +621,33 @@ impl SendBacklog {
 /// 会话身份（二期 §3.2 表）。保存在会话上下文；任务帧只带 dispatch_id。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionIdentity {
+    /// 会话所属 journal 标识。
     pub journal_id: String,
+    /// 主进程任期号（跨任期识别陈旧会话）。
     pub master_epoch: u64,
+    /// 执行器标识（派发绑定对象）。
     pub executor_id: String,
+    /// 执行器本次启动的随机标识（失联判定的事实来源）。
     pub boot_id: String,
+    /// 会话标识。
     pub session_id: String,
 }
 
 /// 握手结果（主进程视角）。
 #[derive(Debug, Clone)]
 pub struct ExecutorHello {
+    /// 执行器启动标识（boot 唯一性由主进程校验）。
     pub boot_id: String,
+    /// 执行器版本标识（仅用于诊断与灰度判断）。
     pub build: String,
+    /// 执行器声明的能力目录。
     pub capabilities: Vec<String>,
 }
 
+/// 校验身份字段的长度与非空。
+///
+/// 上界来自 [`IDENTITY_MAX_BYTES`]：身份字段会进入日志与状态表，
+/// 无界长度等于给对端一个往主进程内存里灌数据的入口。
 fn validate_identity(value: &str) -> Result<(), ProtocolError> {
     if value.is_empty() || value.len() > IDENTITY_MAX_BYTES {
         return Err(ProtocolError::Malformed("invalid identity length".into()));
@@ -579,6 +677,14 @@ fn validate_session_token(
 /// 主进程侧握手：接收 Hello（校验版本/能力/boot 唯一性/会话令牌），回
 /// Welcome，等待 Ready。任一步失败即明确拒绝，不降级。版本门集中在
 /// 此处（帧不再自带版本号）。
+///
+/// 顺序不可交换：先确认版本与能力，再发 Welcome（Welcome 里带限额），
+/// 最后等 Ready——Ready 的语义是「执行器已完成 I/O 初始化、能接任务」，
+/// 在 Welcome 之前收到 Ready 说明对端状态机不对，必须拒绝。
+///
+/// # Errors
+/// 超时、版本不符、身份非法、令牌不符或缺必需能力都返回
+/// [`ProtocolError`]；调用方应终止会话，不做降级重试。
 pub async fn master_handshake(
     transport: &mut FrameTransport,
     journal_id: &str,
@@ -587,6 +693,8 @@ pub async fn master_handshake(
     session_id: &str,
     expected_session_token: Option<&str>,
 ) -> Result<ExecutorHello, ProtocolError> {
+    // 第一帧必须是 Hello：把「首帧不是 Hello」判为格式错误，而不是
+    // 把它当成可跳过的噪声帧。
     let message = tokio::time::timeout(
         std::time::Duration::from_millis(super::contract::STARTUP_TIMEOUT_MS),
         transport.recv(),
@@ -606,6 +714,8 @@ pub async fn master_handshake(
             message.type_name()
         )));
     };
+    // 版本门：postcard 变体索引是位置编码，版本不匹配时后续帧会被
+    // 静默错解成另一种消息类型，所以必须在握手处硬拒绝。
     if version != PROTOCOL_VERSION {
         return Err(ProtocolError::Malformed(format!(
             "protocol version {version} not supported (expected {PROTOCOL_VERSION})"
@@ -614,6 +724,8 @@ pub async fn master_handshake(
     validate_identity(&boot_id)?;
     validate_identity(&build)?;
     validate_session_token(session_token.as_deref(), expected_session_token)?;
+    // 必需能力逐项检查：缺能力即拒绝，不做「能跑多少跑多少」的降级
+    // 执行——降级会让失败发生在派发中途，而不是握手时。
     for capability in REQUIRED_CAPABILITIES {
         if !capabilities.iter().any(|c| c == capability) {
             return Err(ProtocolError::Malformed(format!(
@@ -621,6 +733,8 @@ pub async fn master_handshake(
             )));
         }
     }
+    // Welcome 宣告会话身份与限额：执行器据此把自己的窗口预算钳制到
+    // 主进程给出的上限之内。
     transport
         .send(Message::Welcome {
             version: PROTOCOL_VERSION,
@@ -646,6 +760,7 @@ pub async fn master_handshake(
             build,
             capabilities,
         }),
+        // Ready 之前出现别的帧：对端状态机与协议不符，明确拒绝。
         other => Err(ProtocolError::Malformed(format!(
             "expected Ready, got {}",
             other.type_name()
@@ -655,12 +770,22 @@ pub async fn master_handshake(
 
 /// 执行器侧握手：发 Hello（携带本端协议版本与会话令牌），校验 Welcome
 /// 版本与限额 ≤ 本端硬上限，回 Ready。
+///
+/// 执行器也要独立复核限额：主进程给出一个越界限额时，执行器若照单
+/// 全收，就会按对方的数字计算窗口/心跳，最终以「窗口永不释放」的
+/// 形式静默死锁。
+///
+/// # Errors
+/// 版本不符、身份非法、限额超过本地硬上限或会话异常时返回
+/// [`ProtocolError`]。
 pub async fn executor_handshake(
     transport: &mut FrameTransport,
     build: &str,
     capabilities: &[&str],
     session_token: Option<String>,
 ) -> Result<(SessionIdentity, NegotiatedLimits), ProtocolError> {
+    // boot_id 每次启动新鲜生成：它是会话身份与失联判定的事实来源，
+    // 复用旧值会让「重启后仍连旧会话」变成可能。
     let boot_id = fresh_boot_id();
     transport
         .send(Message::hello(
@@ -690,6 +815,7 @@ pub async fn executor_handshake(
     else {
         return Err(ProtocolError::Malformed("expected Welcome".into()));
     };
+    // 执行器侧的版本门：与主进程侧是同一道门，两边都必须校验。
     if version != PROTOCOL_VERSION {
         return Err(ProtocolError::Malformed(format!(
             "master protocol version {version} not supported (expected {PROTOCOL_VERSION})"
@@ -701,6 +827,8 @@ pub async fn executor_handshake(
     // 时间限额同样 ≤ 本端硬上限：0 会退化成自旋（执行器侧已钳制下限，
     // 这里补齐握手承诺的另一半），无界值让等待语义失去确定性。
     const LIMIT_TIME_MAX_MS: u64 = 300_000;
+    // 逐项核对：窗口不得超本地硬顶、单条记录不得超窗口（否则单条记录
+    // 就可能永远发不出去）、心跳/排空时限不得为 0 或无界。
     if window_bytes > W_BYTES
         || max_record_bytes > MAX_AUDIT_RECORD_BYTES
         || max_record_bytes > window_bytes
@@ -713,6 +841,7 @@ pub async fn executor_handshake(
             "welcome limits exceed local hard caps".into(),
         ));
     }
+    // Ready 之后才允许接收任务：主进程看到 Ready 才开始派发。
     transport.send(Message::Ready).await?;
     Ok((
         SessionIdentity {
@@ -734,9 +863,13 @@ pub async fn executor_handshake(
 /// Welcome 协商的限额快照。
 #[derive(Debug, Clone, Copy)]
 pub struct NegotiatedLimits {
+    /// 持久确认窗口预算（字节）。
     pub window_bytes: u64,
+    /// 单条审计记录上限（字节）。
     pub max_record_bytes: u64,
+    /// 心跳周期（毫秒）。
     pub heartbeat_ms: u64,
+    /// 排空宽限期（毫秒）。
     pub drain_grace_ms: u64,
 }
 
@@ -759,6 +892,7 @@ mod tests {
     use super::*;
     use std::os::fd::FromRawFd;
 
+    /// 建立一对互连的传输端点（socketpair 承载）。
     async fn pair() -> (FrameTransport, FrameTransport) {
         let (parent, child) = socketpair_channel().unwrap();
         (
@@ -936,6 +1070,7 @@ mod tests {
     struct DeadWritePendingRead;
 
     impl tokio::io::AsyncRead for DeadWritePendingRead {
+        /// 读端永远 Pending：模拟对端存活但不再发数据的会话。
         fn poll_read(
             self: std::pin::Pin<&mut Self>,
             _cx: &mut std::task::Context<'_>,
@@ -946,6 +1081,7 @@ mod tests {
     }
 
     impl tokio::io::AsyncWrite for DeadWritePendingRead {
+        /// 写端立即报错：模拟管道已断。
         fn poll_write(
             self: std::pin::Pin<&mut Self>,
             _cx: &mut std::task::Context<'_>,
@@ -957,6 +1093,7 @@ mod tests {
             )))
         }
 
+        /// flush 同样立即报错（与 write 语义一致）。
         fn poll_flush(
             self: std::pin::Pin<&mut Self>,
             _cx: &mut std::task::Context<'_>,
@@ -967,6 +1104,7 @@ mod tests {
             )))
         }
 
+        /// shutdown 同样立即报错。
         fn poll_shutdown(
             self: std::pin::Pin<&mut Self>,
             _cx: &mut std::task::Context<'_>,

@@ -26,6 +26,7 @@ use crate::report::{Latency, Report};
 /// human_task 节点 id（[`human_def`] 的固定形状）。
 const HUMAN_NODE: &str = "h";
 
+/// 崩溃恢复耗时测量：SIGKILL → 重启就绪 → 恢复后推进。
 pub async fn run(ctx: &mut Ctx, opts: &Opts) -> Vec<Report> {
     // 基线：空存储重启。SIGKILL + 同一存储拉起 + 就绪，不含任何恢复工作。
     let empty_started = Instant::now();
@@ -105,6 +106,7 @@ pub async fn run(ctx: &mut Ctx, opts: &Opts) -> Vec<Report> {
 }
 
 /// run.get 等到 run 重新活着且仍在 running（重启后恢复成功的验收）。
+/// 等待 run 在重启后恢复为活跃 running。
 async fn wait_live(client: &Conn, run_id: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     #[allow(unused_assignments)]
@@ -122,6 +124,7 @@ async fn wait_live(client: &Conn, run_id: &str, timeout: Duration) {
     }
 }
 
+/// 串行交付 N 个信号，返回每个信号的交付耗时。
 /// 串行交付 N 个信号，返回每个信号的交付耗时。
 async fn signal_all(client: &Conn, run_ids: &[String]) -> Latency {
     let mut latency = Latency::default();

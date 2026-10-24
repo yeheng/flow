@@ -83,8 +83,11 @@ flow-agent 机（N 台）：
 CLI --config（显式路径）  >  环境变量  >  flow.toml  >  内置默认值
 ```
 
-配置文件搜索顺序：`./flow.toml` → 平台配置目录 `flow/flow.toml`。
-显式路径用 `FLOW_CONFIG` 指定。
+配置文件搜索顺序：`./flow.toml` → flow 主目录 `~/.flow/flow.toml`（`FLOW_HOME` 可覆盖主目录位置）。
+显式路径用 `FLOW_CONFIG` 指定。运行数据统一住在 flow 主目录：
+`flow.toml`（配置）、`journal/`（数据库）、`data/`（storage 数据目录）、
+`harness/`（agent 沙箱，用后即删）；`[storage].data_dir` / `[journal].data_dir`
+的相对路径均相对 flow 主目录解析。
 
 **加载必须在构造 tokio runtime 之前同步完成**——配置错误要尽早失败。
 
@@ -97,7 +100,7 @@ journal_trigger_tick_secs = 20    # 触发器扫描周期（必须 > 0）
 
 [storage]
 backend = "journal"               # 唯一值；sqlite/postgres 已删除
-data_dir = "data"                 # 密钥存储 + 桌面历史数据
+data_dir = "data"                 # 密钥存储 + 桌面历史数据（相对 flow 主目录解析）
 
 [execution]
 mode = "ipc"                      # ipc | remote；in_process 已删除
@@ -132,7 +135,7 @@ token = null
 [journal]
 addr = "127.0.0.1:9802"           # WS RPC
 http_addr = "127.0.0.1:9803"      # 下载 + webhook（Bearer 认证）
-data_dir = null                   # journal 权威目录
+data_dir = null                   # journal 权威目录；缺省 = ~/.flow/journal
 
 ```
 
@@ -190,7 +193,7 @@ dist/journal/run-server.sh
 | 现象 | 报错 |
 | --- | --- |
 | token < 32 字节 | `FLOW_JOURNAL_TOKEN must contain at least 32 bytes` |
-| data_dir 未配置 | `journal 数据目录缺失` |
+| data_dir 未配置且无用户主目录 | `journal 数据目录缺失`（缺省落 `~/.flow/journal`，仅无 home 的退化环境报错） |
 | 同目录已有写者 | `data directory is locked` |
 | 找不到 flow-executor | `cannot locate flow-executor next to ...` |
 | 存量配置包含 `[journal.cluster]` | “unknown field cluster”；删除整个配置段后重启 |

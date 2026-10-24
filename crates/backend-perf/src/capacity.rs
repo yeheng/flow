@@ -1,3 +1,27 @@
+//! 容量、历史与浸泡（soak）证据工具。
+//!
+//! 这个二进制不是「跑一次就出个数」的基准，而是一组**可复核的证据采集器**：
+//! 它把被测库推到某个规模（十万级 run / 十万条审计 / 十万次尝试），
+//! 在中途取样资源占用与诊断信息，并在结束时用断言验证几条关键不变量
+//! （幂等重放、迟到审计被拒、已确认前缀在崩溃后完整）。
+//!
+//! 守护的不变量：
+//!
+//! - **证据必须可断言**：报告里的每个数字都对应一次真实断言，
+//!   不是「跑完就打日志」——否则报告无法作为评审依据。
+//! - **崩溃探针只声明它证明的范围**：SIGKILL 后已确认前缀完整，
+//!   但**不等于断电测试**（`power_loss_tested: false`），不做过度声称。
+//! - **采样有上限**：进程树遍历最多 4096 个进程，防止失控的子进程
+//!   把采样本身变成新的瓶颈。
+//!
+//! 各模式：
+//!
+//! - `history`：写入海量终态 run，验证幂等重放与迟到审计的拒绝；
+//! - `attempts`：写入海量失败重试，验证 attempt 计数与折叠语义；
+//! - `audits`：写入海量迟到审计，验证审计窗口的折叠与游标；
+//! - `storage`：对比 journal 与裸 SQLite 的写入/回放成本，并做崩溃探针；
+//! - `soak` / `agent-soak`：长时间浸泡，观察资源是否随时间单调增长。
+
 //! Resource/history/soak evidence. Run release builds; JSON reports include actual durations.
 use flow_backend::journal::JournalBackend;
 use flow_engine::journal_state::{Run, RunStatus, WaitKind};
@@ -11,6 +35,7 @@ use std::{
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+/// 进程入口：按子命令分派到各测量模式，并把报告写到文件与 stdout。
 async fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let mode = args.first().map(String::as_str).unwrap_or("help");
@@ -47,6 +72,10 @@ async fn main() -> Result<()> {
     println!("{}", serde_json::to_string(&report)?);
     Ok(())
 }
+/// 读取一次运行的当前快照。
+///
+/// 两套实现（legacy 基线 / 当前树）用 feature 分流，但**对外形状一致**——
+/// 保证同一份测量脚本在两种模式下可比。
 async fn snapshot(b: &JournalBackend, id: &str) -> Result<Option<Run>> {
     #[cfg(feature = "legacy-baseline")]
     {
@@ -57,6 +86,7 @@ async fn snapshot(b: &JournalBackend, id: &str) -> Result<Option<Run>> {
         Ok(b.run_snapshot(id).await?)
     }
 }
+/// 取等待类型（信号等待 / 人工等待）。
 fn wait_kind(wait: &flow_engine::journal_state::Wait) -> WaitKind {
     #[cfg(feature = "legacy-baseline")]
     {
@@ -69,6 +99,7 @@ fn wait_kind(wait: &flow_engine::journal_state::Wait) -> WaitKind {
         wait.kind()
     }
 }
+/// 递归统计目录占用的字节数（磁盘增长证据）。
 fn disk(path: &Path) -> u64 {
     std::fs::read_dir(path)
         .into_iter()
@@ -83,6 +114,10 @@ fn disk(path: &Path) -> u64 {
         })
         .sum()
 }
+/// 采样单个进程的常驻内存、线程数与 fd 数。
+///
+/// 按平台分别实现：macOS 走 `proc_pidinfo`，Linux 走 `/proc`，
+/// 其他平台返回空值而不是编造数字。
 fn process(pid: i32) -> Value {
     #[cfg(target_os = "macos")]
     unsafe {
@@ -117,6 +152,7 @@ fn process(pid: i32) -> Value {
     }
 }
 #[cfg(target_os = "linux")]
+/// 列出某进程的子进程 pid（平台相关实现）。
 fn child_pids(pid: i32) -> std::io::Result<Vec<i32>> {
     let mut pids = std::collections::BTreeSet::new();
     // Children belong to the thread that spawned them, not necessarily the leader.
@@ -162,6 +198,11 @@ fn child_pids(_: i32) -> std::io::Result<Vec<i32>> {
         "process enumeration unavailable",
     ))
 }
+/// 采样整棵进程树的资源占用（master + 所有后代）。
+///
+/// 同时报告采样是否完整（`children_collection.complete`）：
+/// 部分进程已退出或枚举失败时必须显式说明，否则读者会把不完整的
+/// 资源数字当成事实。
 fn resources() -> Value {
     let pid = std::process::id() as i32;
     let mut todo = vec![pid];
@@ -188,6 +229,7 @@ fn resources() -> Value {
     }
     json!({"master":process(pid),"children":children,"children_collection":{"supported":cfg!(any(target_os="macos",target_os="linux")),"complete":errors.is_empty(),"errors":errors},"tokio_tasks":tokio::runtime::Handle::current().metrics().num_alive_tasks()})
 }
+/// 构造一条带完整归属信息的事件（run/seq/dispatch/audit）。
 fn scoped(
     kind: EventKind,
     id: &str,
@@ -204,9 +246,11 @@ fn scoped(
     e.audit_seq = audit;
     e
 }
+/// 最小的合法工作流定义（start → end）。
 fn definition() -> Value {
     json!({"nodes":[{"id":"s","type":"start"},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"e"}]})
 }
+/// 构造一条 `RunStarted` 事件（携带冻结的定义快照）。
 fn run_start(id: &str, workflow: &str) -> Event {
     scoped(
         EventKind::RunStarted,
@@ -217,6 +261,7 @@ fn run_start(id: &str, workflow: &str) -> Event {
         json!({"run_id":id,"workflow_id":workflow,"workflow_version":1,"definition":StoredValue::Inline(definition()),"input":StoredValue::Inline(Value::Null),"source":"capacity-fixture","source_detail":null,"parent":null,"depth":0,"created_at":"2026-10-15T00:00:00Z","status":"running","output":null,"error":null,"last_run_seq":"0","nodes":{}}),
     )
 }
+/// 构造一条 `DispatchStarted` 事件（第 n 次尝试）。
 fn dispatch(id: &str, n: u64, seq: u64) -> Event {
     scoped(
         EventKind::DispatchStarted,
@@ -227,6 +272,7 @@ fn dispatch(id: &str, n: u64, seq: u64) -> Event {
         json!({"node_execution_id":format!("{id}-s"),"attempt":n.to_string()}),
     )
 }
+/// 构造一条 `InputPrepared` 事件（含 1 KiB 参数，用于测量审计载荷）。
 fn prepared(id: &str, dispatch: &str) -> Event {
     scoped(
         EventKind::InputPrepared,
@@ -237,6 +283,7 @@ fn prepared(id: &str, dispatch: &str) -> Event {
         json!({"prepared":{"input":StoredValue::Inline(Value::Null),"predecessors":{},"params":StoredValue::Inline(json!({"pad":"x".repeat(1024)})),"engine_build":"capacity-fixture","node_semantics":1}}),
     )
 }
+/// 建一个已发布的工作流，返回其 id。
 async fn workflow(b: &JournalBackend) -> Result<String> {
     let r = b.workflow_create("capacity", None).await?;
     let id = r.result["workflow_id"]
@@ -247,6 +294,7 @@ async fn workflow(b: &JournalBackend) -> Result<String> {
     b.workflow_publish(&id, 1, None).await?;
     Ok(id)
 }
+/// 把样本压成 count/p50/p95/p99/max 的摘要（空样本返回 null）。
 fn summary(samples: &[f64]) -> Value {
     if samples.is_empty() {
         return Value::Null;
@@ -255,6 +303,7 @@ fn summary(samples: &[f64]) -> Value {
     v.sort_by(f64::total_cmp);
     json!({"count":v.len(),"p50_ms":v[(v.len()-1)/2],"p95_ms":v[(v.len()*95).div_ceil(100).saturating_sub(1)],"p99_ms":v[(v.len()*99).div_ceil(100).saturating_sub(1)],"max_ms":v.last()})
 }
+/// 历史规模证据：写入海量终态 run，并在过程中验证幂等与迟到审计语义。
 async fn history(root: &Path, count: usize) -> Result<Value> {
     let b = JournalBackend::open(root, Default::default()).await?;
     let workflow = workflow(&b).await?;
@@ -358,6 +407,7 @@ async fn history(root: &Path, count: usize) -> Result<Value> {
         json!({"mode":"history","payload":"verified synthetic facts, 1 KiB prepared params and one publication per terminal run","terminal_runs":count,"fixed_active_runs":1,"samples":reports,"restart_ms":restart_ms,"restart_resources":resources(),"restart_diagnostics":diagnostics,"errors":0,"timeouts":0}),
     )
 }
+/// 尝试历史证据：写入海量失败重试，验证 attempt 折叠与重启后的计数一致。
 async fn attempts(root: &Path, count: usize) -> Result<Value> {
     let b = JournalBackend::open(root, Default::default()).await?;
     let w = workflow(&b).await?;
@@ -411,6 +461,7 @@ async fn attempts(root: &Path, count: usize) -> Result<Value> {
     )
 }
 
+/// 跑完一个 run 并返回其终态（按 kind 决定是否交付信号/取消）。
 async fn execute(
     b: Arc<JournalBackend>,
     workflow: String,
@@ -463,6 +514,7 @@ async fn execute(
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+/// 浸泡：持续提交多种节点形态的 run，观察资源、诊断与失败率随时间的变化。
 async fn soak(root: &Path, seconds: u64, executor: PathBuf, include_agents: bool) -> Result<Value> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -487,6 +539,9 @@ async fn soak(root: &Path, seconds: u64, executor: PathBuf, include_agents: bool
         ])
         .await;
         std::env::set_var("FLOW_SECRET_CAPACITY_AGENT", "mock-capacity-key");
+        // 缺省 harness 沙箱落 flow 主目录：钉在压测 ROOT 下，别碰真实 ~/.flow
+        // （executor 经 env 白名单继承）
+        std::env::set_var("FLOW_HOME", root.join("home"));
         b.install_harness_agent(Some(flow_engine::AgentRunConfig {
             base_url: provider.base_url(),
             model: "mock-capacity-model".into(),
@@ -605,6 +660,10 @@ async fn soak(root: &Path, seconds: u64, executor: PathBuf, include_agents: bool
     }
     Ok(report)
 }
+/// 存储对比：同样的 1 KiB 逻辑事实，分别用 journal 与裸 SQLite 写入并回放。
+///
+/// **范围声明**：这只是「追加 + 有界回放」的对比，不是完整的引擎迁移
+/// 或断电证明——报告里也如实标注了这一点。
 async fn storage(root: &Path, count: usize) -> Result<Value> {
     use sqlx::sqlite::{
         SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
@@ -714,6 +773,7 @@ async fn storage(root: &Path, count: usize) -> Result<Value> {
     )
 }
 
+/// 审计规模证据：写入海量迟到审计，验证审计窗口折叠与最终游标。
 async fn audits(root: &Path, count: usize) -> Result<Value> {
     let b = JournalBackend::open(root, Default::default()).await?;
     let w = workflow(&b).await?;
@@ -765,6 +825,7 @@ async fn audits(root: &Path, count: usize) -> Result<Value> {
     Ok(json!({"mode":"audits","audits":count,"samples":reports,"errors":0,"timeouts":0}))
 }
 
+/// 崩溃探针的子进程：写完已确认前缀后停在未确认事务上，等着被杀。
 async fn storage_crash_child(kind: &str, root: &Path) -> Result<()> {
     std::fs::create_dir_all(root)?;
     if kind == "journal" {
@@ -824,6 +885,7 @@ async fn storage_crash_child(kind: &str, root: &Path) -> Result<()> {
     }
     Ok(())
 }
+/// 崩溃探针：拉起子进程 → 等它写完已确认前缀 → SIGKILL → 验证前缀完整。
 async fn storage_crash_probe(root: &Path, kind: &str) -> Result<Value> {
     let root = root.join(format!("crash-{kind}"));
     let mut child = tokio::process::Command::new(std::env::current_exe()?)
@@ -875,6 +937,10 @@ async fn storage_crash_probe(root: &Path, kind: &str) -> Result<Value> {
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+/// 资源采样正确性的回归测试。
+///
+/// 关键是「子进程必须被采到」：漏采会让资源报告少算执行器的常驻内存，
+/// 进而得出「内存不增长」的错误结论。
 mod resource_tests {
     #[test]
     fn sampling_includes_a_live_child() {

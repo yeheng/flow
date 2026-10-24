@@ -6,6 +6,10 @@
 //! executor_boot_id / dispatch_id`，内层 [`Message::Routed`] 保留任务消息
 //! 与审计原始编码。agent 是受信任中继：不产生权威 ACK/Permit/
 //! ResultCommitted，不推进 DAG，不写权威状态。
+//!
+//! 守护的核心不变量：路由身份由**已确认的绑定关系**决定，执行器与
+//! agent 都不能自报机器身份来获得路由权；断线重连后只有通过 Resume
+//! 对账的派发才允许继续，不透明重跑。
 
 use serde::{Deserialize, Serialize};
 
@@ -18,11 +22,17 @@ use super::message::Message;
 /// dispatch、audit_seq 或记录内容。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RouteEnvelope {
+    /// 上联 agent 标识。
     pub agent_id: String,
+    /// agent 本次启动标识（区分重连后的新任期）。
     pub agent_boot_id: String,
+    /// 上联会话标识。
     pub link_session_id: String,
+    /// 目标执行器标识。
     pub executor_id: String,
+    /// 执行器本次启动标识。
     pub executor_boot_id: String,
+    /// 归属派发（可空：会话级消息如心跳没有派发归属）。
     #[serde(default)]
     pub dispatch_id: Option<String>,
 }
@@ -61,7 +71,9 @@ pub enum ResumeState {
 /// Resume 清单项（三阶段）：重连后 agent 上报本地未决任务事实。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResumeItem {
+    /// 派发标识（对账主键）。
     pub dispatch_id: String,
+    /// 执行器启动标识（用于确认是不是同一份执行事实）。
     pub executor_boot_id: String,
     /// 本地任务状态。
     pub state: ResumeState,
@@ -75,6 +87,7 @@ pub struct ResumeItem {
     pub result_last_audit_seq: Option<u64>,
     /// 是否丢失未确认数据 / 曾强制终止。
     pub lost_data: bool,
+    /// 是否曾被强制终止（终止后不能再信任其结果）。
     pub forced_kill: bool,
 }
 
@@ -95,22 +108,34 @@ pub enum ResumeAction {
     ReconcileRequired,
 }
 
+/// 单个派发的对账裁决（主进程 → agent）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResumeDecision {
+    /// 被裁决的派发标识。
     pub dispatch_id: String,
+    /// 裁决动作。
     pub action: ResumeAction,
 }
 
+/// agent 上联能力目录（与执行器能力分别协商）。
+///
+/// 为什么要与执行器能力分开：agent 是中继，不执行用户代码；把两者
+/// 混在一张目录里会让「agent 声称会执行」被误当成执行能力。
 pub mod capability {
     /// 主↔agent 与 agent↔executor 能力分别协商；这是 agent 上联能力
     /// （中继/资源管理），不是执行能力。
     pub const RELAY: &str = "relay";
+    /// agent 能上报资源占用（主进程据此扣减已分配资源）。
     pub const RESOURCE_REPORT: &str = "resource_report";
+    /// agent 能断线重连并参与 Resume 对账。
     pub const RECONNECT: &str = "reconnect";
+    /// agent 上联的必需能力目录（缺任一项即拒绝上联）。
     pub const REQUIRED: &[&str] = &[RELAY, RESOURCE_REPORT, RECONNECT];
 }
 
 /// 校验身份字段（与本地握手同规则）。
+///
+/// 返回 bool 而不是 Result：调用方用它做过滤判断，不需要区分失败原因。
 pub fn validate_route_identity(value: &str) -> bool {
     !value.is_empty() && value.len() <= IDENTITY_MAX_BYTES
 }
@@ -118,6 +143,9 @@ pub fn validate_route_identity(value: &str) -> bool {
 /// 内层消息必须是可路由的业务帧（禁止嵌套 Routed / 上联管理帧 /
 /// 握手帧）。`Reject` 与 `Heartbeat` 允许：执行器的任务失败通知与心跳
 /// 要经 agent 中继给主进程。
+///
+/// 这是一道**结构**闸门：嵌套 Routed 会让路由层自指（包络无限套娃），
+/// 握手帧走中继则会绕过主进程侧的版本门与令牌校验。
 pub fn routable(inner: &Message) -> bool {
     !matches!(
         inner,

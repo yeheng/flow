@@ -1,3 +1,18 @@
+//! 工作流定义模型：节点类型词汇表、图结构、参数校验与邻接索引。
+//!
+//! 本模块是「定义面」的唯一权威：节点有哪些类型、每种类型有哪些参数、
+//! 什么样的图算合法，全部在这里定义。前端拖拽面板与引擎共用这份定义，
+//! 后端校验与 RPC 能力清单也共用同一份。
+//!
+//! 它守护的核心不变量有两条：
+//! ① **单一来源**——`NODE_TYPE_TABLE` 派生 `as_str` / `parse` / `ALL` /
+//!    `descriptor` / `has_side_effect`；分开手写时漏改的那几处不会编译
+//!    报错，只在运行期表现为「类型不认识」或面板少一项。
+//! ② **不可变版本快照**——`Definition` 是落库的版本内容，序列化字节
+//!    决定 checksum 与版本复用，所以缓存（邻接索引）绝不进入序列化。
+//!
+//! 不这样做的代价：定义能画出来、能存进去，却直到执行期才失败；而失败
+//! 点与画布对不上，排查时无法判断是「画错了」还是「引擎不认」。
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{LazyLock, OnceLock};
 
@@ -5,15 +20,24 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// 节点类型。前端拖拽面板与引擎共用这一份定义。
+///
+/// 变体清单的唯一权威是下方的 `NODE_TYPE_TABLE`；本枚举只声明形状。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeType {
+    /// 入口节点：有且只有一个，无入边。
     Start,
+    /// 收口节点：输出计入 run 输出，无出边。
     End,
+    /// QuickJS 沙箱内执行的一段 JS 函数体。
     Script,
+    /// 真值判定节点，产出 true/false 两条分支。
     Condition,
+    /// 持久等待指定毫秒数（等待状态落库，不占执行槽）。
     Delay,
+    /// 任意出站 HTTP 调用（需走授权路径）。
     HttpCall,
+    /// 人工任务节点：挂起等 `run.signal` 交付。
     HumanTask,
     /// 输入收集：run 输入已含声明字段（或有默认值）时直接放行输出，
     /// 否则挂起等用户填写表单（signal 交付）后继续
@@ -68,6 +92,11 @@ impl NodeType {
         NodeType::Llm,
     ];
 
+    /// 节点类型 → wire 字符串名（落库与线协议里的样子）。
+    ///
+    /// # Panics
+    /// 若变体不在 `NODE_TYPE_TABLE` 中则 panic——这是**编程错误**而非
+    /// 运行时输入问题；`node_type_table_is_exhaustive` 钉住这条不变量。
     pub fn as_str(self) -> &'static str {
         NODE_TYPE_TABLE
             .iter()
@@ -76,6 +105,10 @@ impl NodeType {
             .expect("NodeType 的每个变体都在 NODE_TYPE_TABLE 里（node_type_table_is_exhaustive）")
     }
 
+    /// wire 字符串名 → 节点类型；未知名字返回 `None`（不 panic）。
+    ///
+    /// 未知类型是**用户输入**（存量的定义、外部导入的片段），属于正常
+    /// 的错误分支：调用方据此给出「类型未知」诊断，而不是崩掉整个进程。
     pub fn parse(s: &str) -> Option<NodeType> {
         NODE_TYPE_TABLE
             .iter()
@@ -400,28 +433,45 @@ impl NodeType {
 /// 校验按大小写不敏感处理（与执行层 to_uppercase 后解析一致）。
 pub const HTTP_METHODS: [&str; 5] = ["GET", "POST", "PUT", "PATCH", "DELETE"];
 
+/// 画布坐标。纯展示用，不参与任何执行语义。
+///
+/// 两个分量都允许缺省（`#[serde(default)]`）：老版本定义存的位置不完整，
+/// 缺失时按 0 处理比整份定义反序列化失败更合理。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Position {
+    /// 横坐标。
     #[serde(default)]
     pub x: f64,
+    /// 纵坐标。
     #[serde(default)]
     pub y: f64,
 }
 
+/// 图中的一个节点。
+///
+/// `node_type` 存的是 wire 字符串而不是 `NodeType` 枚举：定义是落库与
+/// 线协议的内容，序列化字节必须稳定（checksum 与版本复用依赖它），
+/// 枚举的内部表示不构成契约。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Node {
+    /// 节点 id，图内唯一；同时是上游输出的寻址键。
     pub id: String,
+    /// 节点类型（wire 名，如 `script`）。
     #[serde(rename = "type")]
     pub node_type: String,
+    /// 展示名；缺失时按 id 兜底。
     #[serde(default)]
     pub name: String,
+    /// 画布坐标，可缺省。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<Position>,
+    /// 节点参数；形状由节点类型决定。
     #[serde(default)]
     pub params: Value,
 }
 
 impl Node {
+    /// 解析节点类型；类型未知返回 `None`。
     pub fn kind(&self) -> Option<NodeType> {
         NodeType::parse(&self.node_type)
     }
@@ -434,26 +484,37 @@ impl Node {
                 .is_some_and(|mode| mode.trim() == "agent")
     }
 
+    /// 读一个字符串参数；缺省或类型不符返回 `None`。
     pub fn param_str(&self, key: &str) -> Option<&str> {
         self.params.get(key).and_then(Value::as_str)
     }
 
+    /// 读一个无符号整数参数；缺省、非数字或为负返回 `None`。
     pub fn param_u64(&self, key: &str) -> Option<u64> {
         self.params.get(key).and_then(Value::as_u64)
     }
 
+    /// 本节点的重试策略；未配置 `retry` 时用缺省值（不重试）。
     pub fn retry(&self) -> RetryPolicy {
         RetryPolicy::from_params(&self.params)
     }
 }
 
+/// 节点的重试策略。
+///
+/// 缺省**不重试**（`max_attempts = 1`）：重试只对「重做一次大概率成功」
+/// 的场景有意义，默认重试会让参数错误这类确定性失败反复消耗时间。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicy {
+    /// 最大尝试次数（含首次），至少为 1。
     pub max_attempts: u32,
+    /// 每次重试前的等待毫秒数。
     pub backoff_ms: u64,
 }
 
+/// 缺省重试策略：不重试、不退避。
 impl Default for RetryPolicy {
+    /// 返回缺省策略（尝试 1 次、无退避）。
     fn default() -> Self {
         RetryPolicy {
             max_attempts: 1,
@@ -463,6 +524,10 @@ impl Default for RetryPolicy {
 }
 
 impl RetryPolicy {
+    /// 从节点 params 的 `retry` 段解析重试策略。
+    ///
+    /// `max_attempts` 至少为 1（0 次尝试等于节点从未执行，语义上无意义）；
+    /// 超出 u32 范围的值被夹到 u32::MAX，而不是溢出或回绕。
     pub fn from_params(params: &Value) -> RetryPolicy {
         let retry = params.get("retry");
         RetryPolicy {
@@ -479,9 +544,12 @@ impl RetryPolicy {
     }
 }
 
+/// 图中的一条有向边。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Edge {
+    /// 起点节点 id。
     pub from: String,
+    /// 终点节点 id。
     pub to: String,
     /// condition 节点的出口端口："true" / "false"
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -505,38 +573,60 @@ pub struct Definition {
 }
 
 /// Editable definition DTO. Compile an edited copy to obtain a fresh indexed graph.
+///
+/// 可编辑副本：编辑后必须 `compile()` 得到新的 `Definition`，这样邻接索引
+/// 与图内容必然一致——不允许「改了节点但索引还指着旧数组」。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DefinitionData {
     /// Missing means the original all-success dependency contract.
+    ///
+    /// 缺省即 v1 语义：全部前驱必须成功。显式写 2 才是 v2 的
+    /// 「选中路径」语义；历史定义没有该字段，必须按 v1 解释。
     #[serde(
         default = "legacy_semantics",
         skip_serializing_if = "is_legacy_semantics"
     )]
     pub semantics: u32,
+    /// 输入契约（受限 JSON Schema 子集）；缺省表示不校验。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_schema: Option<Value>,
+    /// 输出契约（受限 JSON Schema 子集）；缺省表示不校验。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<Value>,
+    /// 节点列表。
     pub nodes: Vec<Node>,
+    /// 边列表。
     #[serde(default)]
     pub edges: Vec<Edge>,
 }
 
+/// 缺省语义版本 = 1（历史定义的解释方式）。
 fn legacy_semantics() -> u32 {
     1
 }
+
+/// 序列化时省略语义字段：当且仅当它是缺省的 v1，保持落库字节稳定。
 fn is_legacy_semantics(value: &u32) -> bool {
     *value == 1
 }
 
+/// `Definition` 解引用到它的数据部分，让调用方可以直接读 `nodes`/`edges`。
 impl std::ops::Deref for Definition {
     type Target = DefinitionData;
+    /// 返回内部数据部分的引用。
     fn deref(&self) -> &Self::Target {
         &self.data
     }
 }
 
 impl DefinitionData {
+    /// 编译成带索引的不可变定义。
+    ///
+    /// 编译即校验：非法定义在这里被拒，不会带着「半个合法」的形态进入
+    /// 执行路径。
+    ///
+    /// # Errors
+    /// 图结构或参数规则不合法时返回错误文本（见 [`Definition::validate`]）。
     pub fn compile(self) -> Result<Definition, String> {
         let definition = Definition {
             data: self,
@@ -569,6 +659,7 @@ struct DefinitionIndex {
 /// 「两个定义相等」= 它们的序列化字节相等——这正是版本复用按 checksum 判定的
 /// 那条契约。
 impl PartialEq for Definition {
+    /// 相等性只看图数据，不看缓存索引。
     fn eq(&self, other: &Self) -> bool {
         self.data == other.data
     }
@@ -585,6 +676,8 @@ impl Definition {
         self.adj.get_or_init(|| {
             let mut by_id = HashMap::with_capacity(self.nodes.len());
             for (i, node) in self.nodes.iter().enumerate() {
+                // 重复 id 保留第一个：validate 会拒绝重复 id，索引这里
+                // 的选择只影响「非法定义」的读数，不构成正确性依赖。
                 by_id.entry(node.id.clone()).or_insert(i);
             }
             let mut incoming: HashMap<String, Vec<usize>> = HashMap::new();
@@ -601,14 +694,17 @@ impl Definition {
         })
     }
 
+    /// 按 id 查节点；不存在返回 `None`。
     pub fn node(&self, id: &str) -> Option<&Node> {
         self.index().by_id.get(id).map(|i| &self.nodes[*i])
     }
 
+    /// 按 id 查节点类型；节点不存在或类型未知返回 `None`。
     pub fn node_type(&self, id: &str) -> Option<NodeType> {
         self.node(id).and_then(Node::kind)
     }
 
+    /// 列出某节点的入边（保持定义中的先后顺序）。
     pub fn incoming(&self, id: &str) -> Vec<&Edge> {
         match self.index().incoming.get(id) {
             Some(edges) => edges.iter().map(|i| &self.edges[*i]).collect(),
@@ -616,6 +712,7 @@ impl Definition {
         }
     }
 
+    /// 列出某节点的出边（保持定义中的先后顺序）。
     pub fn outgoing(&self, id: &str) -> Vec<&Edge> {
         match self.index().outgoing.get(id) {
             Some(edges) => edges.iter().map(|i| &self.edges[*i]).collect(),
@@ -628,10 +725,12 @@ impl Definition {
         self.index().incoming.get(id).map_or(0, Vec::len)
     }
 
+    /// 出边条数：不物化 `Vec<&Edge>`，供「end 不得有出边」等判定使用。
     pub fn outgoing_count(&self, id: &str) -> usize {
         self.index().outgoing.get(id).map_or(0, Vec::len)
     }
 
+    /// 找出唯一的 start 节点；定义非法时可能找不到。
     pub fn start_node(&self) -> Option<&Node> {
         self.nodes
             .iter()
@@ -639,13 +738,23 @@ impl Definition {
     }
 
     /// 建图即校验：拖拽生成的图在发布前必须过这一关。
+    ///
+    /// 覆盖四类规则：schema 合法性、节点身份与参数、边与端口的合法性、
+    /// 以及图结构（唯一 start、无环、全可达）。
+    ///
+    /// # Errors
+    /// 返回第一条违反的规则的错误文本，供 RPC 直接回给用户。
     pub fn validate(&self) -> Result<(), String> {
+        // 输入/输出 schema 先过受限子集检查：越界的 schema 必须在
+        // 保存期被拒，不能等到建 run 时才失败。
         for schema in [&self.input_schema, &self.output_schema]
             .into_iter()
             .flatten()
         {
             crate::schema::check(schema)?;
         }
+        // 语义版本只认 1 与 2：未知版本意味着解释规则未知，
+        // 宁可拒绝也不能按旧语义猜。
         if !matches!(self.semantics, 1 | 2) {
             return Err("unsupported workflow semantics".into());
         }
@@ -694,6 +803,8 @@ impl Definition {
             }
         }
 
+        // start 必须唯一：它是整张图的调度起点，两个 start 等于
+        // 两套互不知情的初始状态。
         let starts = self
             .nodes
             .iter()
@@ -702,10 +813,13 @@ impl Definition {
         if starts != 1 {
             return Err(format!("必须且只能有一个 start 节点，当前有 {starts} 个"));
         }
+        // 至少一个 end：没有收口节点就没有 run 输出可取。
         if !self.nodes.iter().any(|n| n.kind() == Some(NodeType::End)) {
             return Err("至少需要一个 end 节点".into());
         }
 
+        // 重复边判定把端口算进键：同一对 (from,to) 用不同端口是合法的
+        // 分支，不算重复。
         let mut edge_keys = HashSet::new();
         // condition 出边的目标集合：同一目标不得被两个端口同时指向（见下方规则）
         let mut condition_targets: HashMap<&str, HashSet<&str>> = HashMap::new();
@@ -762,6 +876,8 @@ impl Definition {
             }
         }
 
+        // 端口与可达性相关的形状检查：start 无入边、end 无出边、
+        // 其余节点必有入边（否则永远触发不了）。
         for node in &self.nodes {
             let Some(kind) = node.kind() else {
                 return Err(format!("节点 {} 的类型未知：{}", node.id, node.node_type));
@@ -788,13 +904,24 @@ impl Definition {
         self.check_acyclic_and_reachable()
     }
 
+    /// 环检测与可达性检测。
+    ///
+    /// 两步都基于邻接索引，因此整体是 O(N+E)：
+    /// ① 拓扑排序（Kahn）判环——排不完说明有环；
+    /// ② 从 start 出发做可达性遍历，找出走不到的节点。
+    ///
+    /// # Errors
+    /// 存在环时返回「工作流存在环，必须是 DAG」；存在从 start 不可达的
+    /// 节点时返回这些节点的 id 列表。
     fn check_acyclic_and_reachable(&self) -> Result<(), String> {
+        // 入度来自索引而不是全扫：validate 对每个节点都要问一次入度。
         let mut indegree: HashMap<&str, usize> = self
             .nodes
             .iter()
             .map(|n| (n.id.as_str(), self.incoming_count(&n.id)))
             .collect();
 
+        // Kahn 算法的初始队列：所有入度为 0 的节点（正常只有 start）。
         let mut queue: VecDeque<&str> = indegree
             .iter()
             .filter(|(_, d)| **d == 0)
@@ -812,6 +939,7 @@ impl Definition {
                 }
             }
         }
+        // 排出的节点数少于总数 ⇒ 有环（环上的节点入度永远降不到 0）
         if sorted != self.nodes.len() {
             return Err("工作流存在环，必须是 DAG".into());
         }
@@ -819,6 +947,8 @@ impl Definition {
         let Some(start) = self.start_node() else {
             return Err("必须且只能有一个 start 节点".into());
         };
+        // 可达性用显式栈做 DFS：节点数可达上限由图大小决定，不用递归
+        // 免得深图把栈打爆。
         let mut visited: HashSet<&str> = HashSet::new();
         let mut stack = vec![start.id.as_str()];
         while let Some(id) = stack.pop() {
@@ -1052,6 +1182,9 @@ mod tests {
 
     /// 一个带合法默认参数的节点。用它的前提是想验证**图结构**规则，
     /// 不想被「缺参数」提前挡下——所以按类型补上必填参数。
+    ///
+    /// （本用例自身的断言是：编辑后的定义重新编译会得到一套全新的邻接
+    /// 索引，原定义的索引与序列化字节都不受影响。）
     #[test]
     fn edited_definition_recompiles_without_stale_index() {
         let definition: Definition = serde_json::from_value(serde_json::json!({
@@ -1072,6 +1205,8 @@ mod tests {
         assert_eq!(definition.incoming_count("e"), 1);
     }
 
+    /// 传输协议的节点 id 约束必须在定义边界处生效：保留名与超长 id
+    /// 都要在建图期被拒，而不是等到派发时才发现 id 撞车。
     #[test]
     fn transport_identity_limits_are_checked_at_definition_boundary() {
         for id in [
@@ -1096,6 +1231,7 @@ mod tests {
         definition.validate().unwrap();
     }
 
+    /// 构造一个带指定 id 与类型的节点，参数按类型补齐合法默认值。
     fn node(id: &str, kind: &str) -> Value {
         let params = match kind {
             "script" => json!({"code": "return 1;"}),
@@ -1108,6 +1244,7 @@ mod tests {
         json!({"id": id, "type": kind, "params": params})
     }
 
+    /// 由节点/边 JSON 构造一个定义（语义缺省为 v1）。
     fn def(nodes: Vec<Value>, edges: Vec<Value>) -> Definition {
         serde_json::from_value(json!({"nodes": nodes, "edges": edges}))
             .expect("测试定义应可反序列化")
@@ -1131,11 +1268,13 @@ mod tests {
         )
     }
 
+    /// 线性图 start → script → end 应当通过校验。
     #[test]
     fn linear_graph_passes() {
         assert!(linear().validate().is_ok());
     }
 
+    /// 空图、缺 start、多个 start、缺 end 四种形状都要被拒。
     #[test]
     fn empty_graph_and_start_end_shape() {
         assert_eq!(
@@ -1162,6 +1301,7 @@ mod tests {
         assert!(no_end.validate().unwrap_err().contains("end 节点"));
     }
 
+    /// 重复 id、空白 id、未知类型都要在建图期被拒。
     #[test]
     fn duplicate_ids_blank_ids_and_unknown_types_are_rejected() {
         let dup = def(
@@ -1185,6 +1325,7 @@ mod tests {
         assert!(unknown.validate().unwrap_err().contains("类型未知"));
     }
 
+    /// 悬空端点、自环、重复边都要被拒。
     #[test]
     fn edges_must_reference_existing_nodes_and_be_unique() {
         let dangling = def(
@@ -1214,6 +1355,7 @@ mod tests {
         assert!(dupe.validate().unwrap_err().contains("重复的边"));
     }
 
+    /// 端口只允许出现在 condition 节点上，且取值必须是 true/false。
     #[test]
     fn condition_ports_only_on_condition_nodes() {
         let ok = def(
@@ -1268,6 +1410,7 @@ mod tests {
         assert!(stray_port.validate().unwrap_err().contains("不能带端口"));
     }
 
+    /// start 不得有入边，end 不得有出边。
     #[test]
     fn start_has_no_incoming_and_end_has_no_outgoing() {
         let bad_start = def(
@@ -1288,6 +1431,7 @@ mod tests {
         assert!(bad_end.validate().unwrap_err().contains("end 节点"));
     }
 
+    /// 环与不可达节点都要被拒；孤岛形状由「没有入边」或「环」拦下。
     #[test]
     fn cycles_and_unreachable_nodes_are_rejected() {
         let cyclic = def(
@@ -1360,6 +1504,7 @@ mod tests {
         );
     }
 
+    /// 参数校验按类型生效：缺必填被拒，http method 白名单大小写不敏感。
     #[test]
     fn node_params_are_validated_per_kind() {
         for (kind, params, needle) in [
@@ -1413,6 +1558,7 @@ mod tests {
     /// 模板 ms / 模板 method 通过；裸数字串、标量 mapping 仍被拒绝。
     #[test]
     fn template_params_pass_validation_while_ambiguous_forms_are_rejected() {
+        /// 校验一个指定类型与参数的节点定义，返回校验结果。
         fn check(kind: &str, params: Value) -> Result<(), String> {
             let d = def(
                 vec![
@@ -1519,6 +1665,7 @@ mod tests {
         );
     }
 
+    /// 重试策略的缺省值与夹取：至少一次、超大值夹到 u32::MAX。
     #[test]
     fn retry_policy_defaults_and_clamps() {
         assert_eq!(
@@ -1559,6 +1706,7 @@ mod tests {
         );
     }
 
+    /// 节点类型词汇表：wire 名往返、ALL 登记齐全、副作用标记正确。
     #[test]
     fn node_type_vocabulary_round_trips_and_flags_side_effects() {
         for kind in [
@@ -1897,6 +2045,7 @@ mod tests {
         assert!(input_def(json!("${input.fields}")).validate().is_ok());
     }
 
+    /// 各类图访问器：节点直查、类型查询、起止节点与出入边。
     #[test]
     fn graph_accessors_and_lookup() {
         let d = linear();

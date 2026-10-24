@@ -15,6 +15,9 @@ use crate::error::CliError;
 
 /// 连接服务。URL 归一化：`127.0.0.1:9802` 之类缺 scheme 的按 `ws://` 补全；
 /// `http(s)://` 原样透传（jsonrpsee 的 ws-client 接受该 scheme 指代 ws）。
+///
+/// 连接失败是**本地错误**而不是服务端错误：服务端根本没被访问到，
+/// 归类错了会让脚本误以为请求本身有问题。
 pub async fn connect(url: &str) -> Result<WsClient, CliError> {
     let normalized = if url.contains("://") {
         url.to_string()
@@ -25,6 +28,7 @@ pub async fn connect(url: &str) -> Result<WsClient, CliError> {
         .build(&normalized)
         .await
         .map_err(|err| {
+            // 附上可操作的提示：最常见的原因是服务端没起。
             CliError::local(format!(
                 "连不上 flow-journal-server（{normalized}）：{err}\n提示：先 `cargo run --bin flow-journal-server`，或用 --url / FLOW_RPC 指定地址"
             ))
@@ -47,9 +51,12 @@ pub async fn call(
     method: &str,
     params: Map<String, Value>,
 ) -> Result<Value, CliError> {
+    // 令牌只从环境变量取：它是凭据，不进命令行参数（命令行会被 ps 看见）。
     let token = std::env::var("FLOW_JOURNAL_TOKEN")
         .map_err(|_| CliError::local("FLOW_JOURNAL_TOKEN required"))?;
     let reply = crate::journal::call(client, &token, method, Value::Object(params)).await?;
+    // 写方法在已提交时返回内层 result，让调用方直接拿到业务结果；
+    // 读方法原样返回整个响应信封。
     if is_write_method(method) && reply["committed"] == true {
         Ok(reply["result"].clone())
     } else {
@@ -57,9 +64,14 @@ pub async fn call(
     }
 }
 
+/// 复用 `flow_dto` 的方法目录判断读写，避免 CLI 自己维护一份方法名清单。
 pub(crate) use flow_dto::rpc::is_write_method;
 
 #[cfg(test)]
+/// 错误文案契约的回归测试。
+///
+/// 这些用例守住的是**脚本接口**：错误文本里有没有服务端 code，直接决定
+/// 脚本能不能按 code 分流。
 mod tests {
     use super::*;
 

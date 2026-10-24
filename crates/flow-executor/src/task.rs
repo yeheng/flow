@@ -4,6 +4,16 @@
 //! 的全部用户 JS 都在本进程运行，主进程不再求值任何用户表达式。准备与
 //! 执行共用一套 audit_seq、窗口、取消与结果协议，不为 prepare/execute
 //! 分别派发。
+//!
+//! 本模块守住的边界：执行器只回答「这个节点做了什么、得到了什么」，
+//! 不回答「这个节点该不该做」。授权（外部副作用）、提交（事实落盘）与
+//! 恢复裁决都在主进程；执行器能给出的最强断言只有三种——成功、业务
+//! 失败、外部结果未知（Uncertain），三者对主进程的后续处理完全不同，
+//! 因此它们必须严格区分，不能互相冒充。
+//!
+//! 另一个核心不变量是「授权前不发请求」：外部副作用一旦获授权即视为
+//! 可能已经发生，所以任何**发不出去**的请求（畸形 URL、非法 header、
+//! 缺凭据）必须在授权之前失败，绝不能降级成 Uncertain 去人工裁决。
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -31,32 +41,57 @@ use crate::observe::{ObservationBridge, ObservationClose};
 use crate::transfer::{store_bytes, store_value, IncomingTransfers};
 
 /// 输入面预算（与一期 materialize 8 MiB 一致）。
+///
+/// 它同时是传输装配侧的硬上限（`transfer.rs` 按 `in:` 前缀强制执行）与
+/// 本模块物化侧的累计预算：超出即判任务输入非法，而不是让单个节点把
+/// 执行器内存吃光。
 pub const INPUT_BUDGET: usize = 8 * 1024 * 1024;
 
+/// 单次派发内可能出现的失败类型。
+///
+/// 分类本身就是契约：`Business` 走失败 Result（主进程按业务语义写
+/// NodeFailed/重试），其余变体属于平台故障面，走 Reject/回收，绝不与
+/// 业务失败互相冒充。
 #[derive(Debug, thiserror::Error)]
 pub enum TaskError {
     /// 业务失败（脚本/模板/HTTP 状态码/参数）：必须以失败 Result 回主进程，
     /// 由主进程按一期语义写 NodeFailed/重试，不走 Reject 回收。
     #[error("{0}")]
     Business(String),
+    /// 审计流故障（窗口满、通道关闭、取消）：持久窗口无法推进，
+    /// 本派发的审计前缀不再可信，只能整派失败回收。
     #[error("audit: {0}")]
     Audit(#[from] crate::audit::AuditError),
+    /// 传输装配故障（摘要不符、缺口、超预算）：输入面不可信，不得继续执行。
     #[error("transfer: {0}")]
     Transfer(#[from] crate::transfer::TransferError),
+    /// 值编码失败（超预算、深度超限）：产出面无法落账。
     #[error("journal encode: {0}")]
     Encode(#[from] flow_journal::Error),
+    /// 派发内容本身不合法（身份缺失、节点类型未知、协议错位）。
+    ///
+    /// 属于主进程调度错误，不是用户工作流的失败面。
     #[error("task input invalid: {0}")]
     Invalid(String),
+    /// 派发被取消：主进程已明确放弃这次执行。
     #[error("task cancelled")]
     Cancelled,
+    /// 与主进程的通道关闭：失联证据，按回收处理。
     #[error("master channel closed: {0}")]
     Closed(String),
+    /// 外部操作的结果未知：授权已发出但拿不到可验证 Outcome。
+    ///
+    /// 不得自动重试（副作用可能已发生），只能交主进程登记 uncertain
+    /// 等待人工裁决。
     #[error("external outcome uncertain: {0}")]
     Uncertain(String),
+    /// HTTP 传输层失败：请求已发出但响应不可得。
     #[error("http failure: {0}")]
     Http(String),
 }
 
+/// serde_json 解析失败归入输入非法（而非业务失败）：节点参数是主进程下发的
+/// 结构化数据，解析不出来说明派发损坏，重试没有意义。
 impl From<serde_json::Error> for TaskError {
     fn from(error: serde_json::Error) -> Self {
         TaskError::Invalid(error.to_string())
@@ -90,16 +125,29 @@ pub enum TaskEnd {
 }
 
 /// 运行一个派发：从 Accepted 到 ResultCommitted（或取消退出）。
+///
+/// 持有一个派发所需的全部上下文：任务载荷、进出站通道、取消令牌、审计
+/// 窗口额度、输入装配器。生命周期 = 一次派发，结束后随对象释放。
 pub struct TaskRunner {
+    /// 主进程给本次派发的命令身份（回执按它对账）。
     pub command_id: String,
+    /// 本次派发的唯一标识：所有进出站帧都按它归属。
     pub dispatch_id: String,
+    /// 派发载荷（节点定义、输入声明、准备元数据、恢复用 outcome）。
     pub task: ExecuteTask,
+    /// 出站通道：执行器→主进程。
     pub outbound: mpsc::Sender<Message>,
+    /// 入站邮箱：主进程→本派发（传输块、许可、ACK、取消）。
     pub mail: mpsc::Receiver<Message>,
+    /// 审计持久确认的最新位置（由运行时转发主进程的 AuditAck）。
     pub ack_tx: watch::Sender<(u64, u64)>,
+    /// 取消令牌：主进程取消或看门狗到期时唤醒所有等待点。
     pub cancel: CancellationToken,
+    /// 审计记录归属的 journal（由握手身份固定，决定值写到哪个库）。
     pub journal_id: String,
+    /// 持久窗口额度 W：待发送与未确认记录共用的字节预算。
     pub window_bytes: u64,
+    /// 是否需要应用层重放（远端 agent 上联形态）。
     pub remote_replay: bool,
     /// 本任务全部输入/重传装配（生命周期覆盖整个派发）。
     pub transfers: IncomingTransfers,
@@ -111,13 +159,24 @@ pub struct TaskRunner {
 }
 
 /// v2 装配产物：输入面的 StoredValue 重建（值字节全部来自 data 通道）。
+///
+/// 与 `TaskInputs` 的区别：这里保留 `Ref` 身份（输出回引要用同一个
+/// output_id），而 `TaskInputs` 是已解码的 JSON 视图（给 JS 用）。
 pub struct InputFace {
+    /// run 输入面（StoredValue 形态）。
     pub input: StoredValue,
+    /// 前驱节点输出面（按节点 id）。
     pub predecessors: BTreeMap<String, StoredValue>,
+    /// 已提交的准备参数（resume 时由主进程重传）。
     pub prepared_params: Option<StoredValue>,
 }
 
 impl TaskRunner {
+    /// 等待一条入站消息，直到 `deadline`。
+    ///
+    /// 超时只在远端重放形态生效：本地形态的等待由主进程的取消驱动
+    /// （主进程挂掉会关通道，邮箱随即 EOF），远端上联的链路可能既不
+    /// 断也不给回应，需要自设上限避免槽位被永久占住。
     async fn receive_until(
         &mut self,
         deadline: tokio::time::Instant,
@@ -129,7 +188,13 @@ impl TaskRunner {
             _ = tokio::time::sleep_until(deadline), if self.remote_replay => Err(TaskError::Closed(format!("{context} timeout"))),
         }
     }
+    /// 派发主流程：执行并在结束后决定进程去留。
+    ///
+    /// 返回 `TaskEnd` 而非自行退出，是因为「能否复用本执行器」是会话
+    /// 层的判断：只有拿到 ResultCommitted 才说明主进程已持久提交，
+    /// 槽位才可安全复用；其余情况一律整体回收。
     pub async fn run(mut self) -> TaskEnd {
+        // agent 模式会改写进程级状态并派生工具后代，提交后必须整体退役。
         let agent = self.node_is_agent_mode();
         let result = self.execute().await;
         match result {
@@ -152,7 +217,19 @@ impl TaskRunner {
         }
     }
 
+    /// 执行一次派发：接受 → 装配输入 → 准备 → 按类型执行 → 发 Result。
+    ///
+    /// 顺序敏感：Accepted 必须先发（主进程据此确认派发被接手），输入
+    /// 装配必须早于准备（模板展开要用到输入面），准备产出的 InputPrepared
+    /// 必须先持久（§3.8：已被 Execute 授权的纯计算要等它落账后才继续）。
+    ///
+    /// # Errors
+    /// 返回平台故障类错误（通道关闭、取消、审计/传输不可信），调用方
+    /// 据此走 Reject 回收；业务失败在内部转成失败 Result，不外泄。
     async fn execute(&mut self) -> Result<(), TaskError> {
+        // 运行时身份门禁：派发里的 _flow_execution.runtime 与本执行器不符，
+        // 说明派发是给别的语义版本准备的。宁可不执行，也不能用错的语义
+        // 解释同一份节点定义。
         if let Some(runtime) = self
             .task
             .node
@@ -284,6 +361,10 @@ impl TaskRunner {
         self.emit_result(&mut audit, outcome).await
     }
 
+    /// 以失败 Outcome 收口本次派发。
+    ///
+    /// `uncertain` 只在外部结果未知时为真：主进程据此登记「等人工
+    /// 裁决」，而不是按普通失败重试（重试可能重复副作用）。
     async fn emit_failure(
         &mut self,
         audit: &mut AuditStream,
@@ -300,6 +381,17 @@ impl TaskRunner {
         .await
     }
 
+    /// 发出最终 Result：先确保审计前缀已持久，再发 Result 并等提交回执。
+    ///
+    /// 「Result 可引用审计流末尾的值」意味着 Result 里的值引用必须落在
+    /// 已持久的前缀内，所以必须等 `last_audit_seq` 被确认后才发——顺序
+    /// 反了会得到悬空引用。
+    ///
+    /// 远端重放形态下还要重发同一 `result_id` 的 Result（主进程幂等返回
+    /// 原提交），否则回执丢失会留下一个永远等不到确认的派发。
+    ///
+    /// # Errors
+    /// 通道关闭或等待超时（远端形态）时返回 `Closed`/`Cancelled`。
     // Result can reference values at the end of the audit stream. A single flush
     // only fills the window; keep accepting ACKs until the entire prefix is durable.
     async fn emit_result(
@@ -315,6 +407,7 @@ impl TaskRunner {
         }
         let last_audit_seq = audit.next_seq().saturating_sub(1);
         if self.remote_replay {
+            // 远端形态：等待确认自带上限，避免链路半死时无限占住槽位。
             tokio::time::timeout(
                 Duration::from_millis(DURABLE_WAIT_TIMEOUT_MS),
                 audit.await_durable(last_audit_seq, &self.cancel),
@@ -348,6 +441,14 @@ impl TaskRunner {
         }
     }
 
+    /// 等待主进程确认 Result 已提交。
+    ///
+    /// 只认「同一 dispatch_id + 同一 result_id」的 ResultCommitted：串台
+    /// 的回执等于没提交。取消先到时立即放弃等待并进入回收（主进程已
+    /// 放弃这次执行，再等也没有意义）。
+    ///
+    /// # Errors
+    /// 邮箱关闭、取消先到，或收到协议错位的消息时返回错误。
     async fn wait_committed(&mut self, result_id: &str) -> Result<(), TaskError> {
         let mut last_send = None::<tokio::time::Instant>;
         loop {
@@ -426,6 +527,8 @@ impl TaskRunner {
             }
         }
         let deadline = tokio::time::Instant::now() + timeout;
+        // 只等「声明里要用的」那几个 transfer：提前到齐不代表可以开工，
+        // 必须等齐所有必需值才进准备阶段。
         while ids.iter().any(|id| !self.transfers.is_ready(id)) {
             let message = self.receive_until(deadline, "input transfer").await?;
             match message {
@@ -446,6 +549,9 @@ impl TaskRunner {
         }
         // 物化（预算内）并重建 StoredValue 面；Bytes 编码引用不能进 JS
         // 输入面。
+        //
+        // 闭包持有 &mut self 是刻意的：take 会从装配器里取走已装配的
+        // 字节（此后不可再次 take），顺序敏感的取用必须串行化。
         let mut decode = |tv: &TaskValue, id: &str| -> Result<(StoredValue, Value), TaskError> {
             let bytes = self
                 .transfers
@@ -503,6 +609,12 @@ impl TaskRunner {
 
     /// 一期 `Attempt::prepare` 的子进程等价实现：无模板直接提交实际输入；
     /// 有模板则展开（opaque 参数回填），产出 InputPrepared 审计事实。
+    ///
+    /// 模板展开在 `spawn_blocking` 里跑：用户表达式可能长时间占用 CPU，
+    /// 放回主执行线程会阻塞心跳与通道收发，心跳一停主进程即判失联。
+    ///
+    /// # Errors
+    /// 模板展开失败、参数编码超限时返回 `Invalid`。
     async fn prepare(
         &mut self,
         node: &Node,
@@ -517,12 +629,16 @@ impl TaskRunner {
             (face.input.clone(), face.predecessors.clone())
         };
         let determinism = self.determinism();
+        // 含 "${" 才展开：无模板时直接提交实际输入，避免一次无谓的
+        // 表达式求值（求值会改变用户可见的确定性上下文开销）。
         let templates = serde_json::to_string(&node.params)?.contains("${");
         let params = if !templates {
             node.params.clone()
         } else {
             let mut params = node.params.clone();
             let mut opaque = Vec::new();
+            // opaque 参数（如密钥名）不能进模板展开：展开会把字面量替换
+            // 成值，密钥引用必须在展开后原样回填。
             if let Some(map) = params.as_object_mut() {
                 for key in node.kind().map(NodeType::opaque_params).unwrap_or_default() {
                     if let Some(value) = map.remove(key) {
@@ -579,6 +695,14 @@ impl TaskRunner {
     }
 
     /// 节点执行：与一期 `journal_driver::execute` 逐分支对齐。
+    ///
+    /// 每个分支只负责「算出什么」，不负责「谁来提交」：等待类节点返回
+    /// `Wait`（由主进程挂起 run），业务失败以 `Err(TaskError::Business)`
+    /// 冒泡，外部结果未知以 `Err(TaskError::Uncertain)` 冒泡——三类结果
+    /// 在主进程的处理路径完全不同。
+    ///
+    /// # Errors
+    /// 见上；另含参数缺失等确定性业务失败。
     async fn execute_node(
         &mut self,
         node: &Node,
@@ -616,10 +740,14 @@ impl TaskRunner {
             }
             NodeType::Delay => {
                 let params = materialize_prepared_params(self, prepared).await?;
+                // ms 允许字符串形态：模板展开后常得到字符串，配置期校验
+                // 只覆盖字面量。
                 let ms = params["ms"]
                     .as_u64()
                     .or_else(|| params["ms"].as_str().and_then(|s| s.parse().ok()))
                     .ok_or_else(|| TaskError::Business("delay ms required".into()))?;
+                // 唤醒时刻用绝对毫秒：跨进程/跨重启后仍可比，时区只影响
+                // 展示（本地时区字符串），不影响语义。
                 let wake = chrono::Utc::now()
                     .timestamp_millis()
                     .checked_add(
@@ -672,9 +800,12 @@ impl TaskRunner {
                 let mut resolved = serde_json::Map::new();
                 let mut waiting = false;
                 for field in fields {
+                    // 缺 key 的字段无法交付，静默跳过（不算「待填写」）：
+                    // 否则一个坏字段会让节点永远挂起。
                     let Some(key) = field.get("key").and_then(Value::as_str) else {
                         continue;
                     };
+                    // null 视为未提供：JSON 里 null 与「没这个键」语义相同。
                     let value = run_input
                         .and_then(|o| o.get(key))
                         .filter(|v| !v.is_null())
@@ -683,6 +814,8 @@ impl TaskRunner {
                         Some(v) => {
                             resolved.insert(key.to_string(), v.clone());
                         }
+                        // 缺字段只记「待填写」，不提前返回：其余字段能解析
+                        // 的先解析，交付对象才是完整的。
                         None => waiting = true,
                     }
                 }
@@ -742,6 +875,8 @@ impl TaskRunner {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        // 按键排序保证组合结果的字节稳定：journal 里的输出字节必须与
+        // 一期进程内路径逐字节一致，顺序不能取决于哈希迭代序。
         values.sort_by(|a, b| a.0.cmp(&b.0));
         if values.len() == 1 {
             return Ok(values.pop().unwrap().1);
@@ -749,6 +884,9 @@ impl TaskRunner {
         if values.is_empty() {
             return Ok(StoredValue::Inline(Value::Null));
         }
+        // 手工拼 JSON：需要把 Ref 的原始字节原样嵌入（结构字节由
+        // flow_journal::value::ObjectWriter 的 serde_json Formatter 拥有，
+        // 这里只提供完整值）。
         let mut composed: Vec<u8> = b"{".to_vec();
         for (index, (key, value)) in values.iter().enumerate() {
             if index > 0 {
@@ -781,6 +919,9 @@ impl TaskRunner {
     }
 
     /// script/condition：纯计算（一期 `Attempt::compute` 等价）。
+    ///
+    /// 用户代码在 `spawn_blocking` 里求值并受 `timeout_ms` 约束（上限
+    /// 30s，防止一次节点永久占住执行槽）。
     async fn compute(
         &mut self,
         _node: &Node,
@@ -802,6 +943,8 @@ impl TaskRunner {
             .await?;
         let code = match kind {
             NodeType::Script => params_value["code"].as_str().unwrap_or("").to_owned(),
+            // 条件节点复用同一套脚本求值器：只多包一层 return，让两条
+            // 路径共用超时、确定性上下文与日志。
             NodeType::Condition => format!(
                 "return ({});",
                 params_value["expr"].as_str().unwrap_or("false")
@@ -813,6 +956,8 @@ impl TaskRunner {
             }
         };
         let _ = inputs;
+        // 超时上限 30s：再长的时间会让一个失控脚本长期霸占执行槽，
+        // 而执行槽是全局有限资源。
         let timeout = Duration::from_millis(
             params_value["timeout_ms"]
                 .as_u64()
@@ -840,6 +985,8 @@ impl TaskRunner {
         }
         let logger = logger.clone();
         let determinism = self.determinism();
+        // 闭包 move 进阻塞线程：求值期间不持有 &mut self（否则任务无法
+        // 响应取消），日志与确定性上下文都在闭包内自带。
         let result = tokio::task::spawn_blocking(move || {
             flow_engine::expr::eval_body_recorded(
                 &code,
@@ -853,13 +1000,21 @@ impl TaskRunner {
         .await
         .map_err(|e| TaskError::Business(e.to_string()))?
         .map_err(|e| TaskError::Business(e.to_string()))?;
+        // 条件节点的分支由宿主的 truthy 判定（与 JS 真值语义对齐），
+        // 脚本节点不带分支。
         let branch = (kind == NodeType::Condition).then(|| flow_engine::exec::truthy(&result));
         let output = store_value(audit, &self.journal_id, &result, 8 * 1024 * 1024).await?;
         Ok(ResultOutcome::Success { output, branch })
     }
 
+    /// 取出本派发的确定性上下文（时钟与随机种子）。
+    ///
+    /// 缺失即 `None`：调用方按「无固定上下文」求值。这不是错误，因为
+    /// 旧运行快照可能没有该字段。
     fn determinism(&self) -> Option<flow_engine::expr::JsDeterminism> {
         let context = self.task.node.get("_flow_execution")?;
+        // 种子先摘要再取前 8 位十六进制：把任意长度字符串压成 u32，
+        // 且分布均匀（直接截断字符串前缀会偏向短串）。
         let digest = flow_journal::codec::digest(context["seed"].as_str()?.as_bytes());
         Some(flow_engine::expr::JsDeterminism {
             clock_ms: context["clock_ms"].as_i64()?,
@@ -867,6 +1022,7 @@ impl TaskRunner {
         })
     }
 
+    /// 取一个 transfer 的装配字节，必要时等主进程送来。
     async fn take_transfer(&mut self, transfer_id: &str) -> Result<Arc<Vec<u8>>, TaskError> {
         // 输入装配在 execute 前完成；此处从会话级缓冲取。TaskRunner 的
         // transfers 在 materialize_inputs 中局部持有，这里简化为重新等待
@@ -888,6 +1044,13 @@ impl TaskRunner {
         }
     }
 
+    /// 把 StoredValue 物化成 JSON 值，并计入本次物化的字节预算。
+    ///
+    /// 预算跨多次调用累计：一次节点的输入面总量有上限，避免多个大值
+    /// 各自合法但合计超限。
+    ///
+    /// # Errors
+    /// transfer 缺失、字节超预算或编码非法时返回 `Invalid`。
     async fn materialize_stored(
         &mut self,
         stored: &StoredValue,
@@ -917,6 +1080,14 @@ impl TaskRunner {
     }
 
     /// http/email：请求构造→许可→调用→Outcome→输出（I07 执行器侧）。
+    ///
+    /// 外部副作用的三段式：先构造请求（不发），再取授权许可（主进程落
+    /// OperationIntent/Authorized 的同一事务），最后才真正发出。恢复
+    /// 路径（已有捕获的 outcome）不重复发请求。
+    ///
+    /// # Errors
+    /// 业务失败（缺参数、状态码非 2xx）以 `Business` 冒泡；授权后拿不
+    /// 到可验证响应以 `Uncertain` 冒泡（副作用可能已发生）。
     async fn http_node(
         &mut self,
         _node: &Node,
@@ -951,6 +1122,8 @@ impl TaskRunner {
             )
             .await?;
         if kind == NodeType::Email {
+            // 收件人列表压平成一行，仅用于日志展示；实际请求体由
+            // email_request 构造。
             let recipients = match &params["to"] {
                 Value::Array(list) => list
                     .iter()
@@ -960,6 +1133,8 @@ impl TaskRunner {
                 other => other.as_str().unwrap_or("").to_owned(),
             };
             logger.info(format!("→ email to {recipients}"));
+            // 这里取的是密钥**名称**（secret_ref），不是密钥值：值要等
+            // 授权许可回传，密钥材料绝不进节点参数与审计。
             let name = params["api_key"]
                 .as_str()
                 .filter(|s| !s.trim().is_empty())
@@ -967,6 +1142,8 @@ impl TaskRunner {
                 .to_owned();
             let (url, body) = flow_engine::exec::email_request(&params)
                 .map_err(|e| TaskError::Business(e.message))?;
+            // 改写成统一形态的 HTTP 请求：邮件服务只是「一个 HTTP 端点 +
+            // bearer 凭据」，复用同一条授权与 Outcome 路径。
             params = json!({
                 "method": "POST",
                 "url": url,
@@ -976,9 +1153,12 @@ impl TaskRunner {
             });
         }
         if kind == NodeType::Llm {
+            // 原生模型节点固定 POST（请求体是供应商 JSON）。
             params["method"] = json!("POST");
         }
         let method = params["method"].as_str().unwrap_or("GET").to_uppercase();
+        // 方法白名单：不在清单内即拒绝，不做「猜测意图」——发出去的
+        // 方法一旦猜错，副作用后果无法撤回。
         if !HTTP_METHODS.contains(&method.as_str()) {
             return Err(TaskError::Invalid("invalid HTTP method".into()));
         }
@@ -998,6 +1178,7 @@ impl TaskRunner {
             request["adapter"] = json!("llm");
         }
         if self.is_regression() {
+            // 回归模式：零外部调用，只放行与录制基线逐字节一致的请求。
             let outcome = self.fixture_outcome(&request)?;
             let output = self.http_output(&outcome, kind, audit).await?;
             return Ok(ResultOutcome::Success {
@@ -1009,6 +1190,8 @@ impl TaskRunner {
             .map_err(|e| TaskError::Invalid(e.to_string()))?;
         // proxy：非法 URL 是配置错误（授权前构建请求时就该失败的最晚一刻）
         let mut builder = reqwest::Client::builder()
+            // 不跟随重定向、不自动重试：两者都会在授权之外多发请求，
+            // 让「授权=一次副作用」的记账失真。
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never());
         if let Some(proxy) = params["proxy"].as_str().filter(|s| !s.trim().is_empty()) {
@@ -1058,6 +1241,7 @@ impl TaskRunner {
         // 这条不变量原先由 master 侧进程内实现保证，删除后由执行器自己守住。
         build_outbound(None)?;
         let credential = self.authorize_operation(request).await?;
+        // 带凭据重建：密钥值只在授权许可里出现，不进请求指纹与审计。
         let outbound_request = build_outbound(credential)?;
         // 展示面用的 URL（日志行）：query 里的敏感参数值脱敏，发起请求用的
         // 永远是原始 `url`。
@@ -1080,6 +1264,7 @@ impl TaskRunner {
             .content_length()
             .is_some_and(|length| length > flow_journal::MAX_VALUE_BYTES)
         {
+            // 响应超捕获上限：完整 outcome 留不下来，等价于结果未知。
             return Err(TaskError::Uncertain(
                 "response exceeds capture limit; no complete outcome retained".into(),
             ));
@@ -1101,6 +1286,8 @@ impl TaskRunner {
                 .or_insert_with(|| json!(value));
         }
         let mut raw: Vec<u8> = Vec::new();
+        // 流式读取并累计限额：Content-Length 缺失或撒谎时，只有边读
+        // 边判才能拦住超限响应。
         while let Some(bytes) = response
             .chunk()
             .await
@@ -1135,6 +1322,8 @@ impl TaskRunner {
             StoredValue::Inline(_) => String::new(),
         };
         if !body_output_id.is_empty() {
+            // 原始体登记进装配器：派生输出时按 output_id 取回，避免再读
+            // 一次 journal（恢复路径由主进程重传同一 output_id）。
             self.transfers.insert_ready(
                 TransferKey::OperationBody(body_output_id.clone()).to_wire(),
                 raw,
@@ -1143,6 +1332,8 @@ impl TaskRunner {
         let outcome = StoredValue::inline(
             json!({"status": status, "headers": headers, "body_raw": body_ref}),
         )?;
+        // Outcome 必须先落账（持久）再派生输出：它是「请求确实发生过且
+        // 结果是什么」的权威证据，恢复路径完全依赖它。
         let outcome_seq = audit.push(
             "operation_outcome",
             json!({"outcome": serde_json::to_value(&outcome)?}),
@@ -1157,19 +1348,33 @@ impl TaskRunner {
 
     /// 外部操作的请求发送与许可等待（http/harness 共用）：RequestOperation →
     /// OperationPermit（取消/断线唤醒）。返回许可携带的 credential（harness 不用）。
+    ///
+    /// 请求字节走 data 通道分块发送（再小也走），控制帧只带身份与指纹：
+    /// 控制帧有确定性上界（C6），值字节不能借道它。
+    ///
+    /// 许可回验三重身份：dispatch_id、operation_id 与请求指纹必须全部
+    /// 匹配，否则拒绝——指纹不匹配意味着许可对应的不是这次请求。
+    ///
+    /// # Errors
+    /// 身份错配返回 `Invalid`；取消返回 `Cancelled`；通道关闭返回 `Closed`。
     async fn authorize_operation(&mut self, request: Value) -> Result<Option<String>, TaskError> {
         if self.is_regression() {
+            // 回归模式禁止一切外部操作：协调器也会独立拒绝许可，双保险
+            // 防止回归意外发请求。
             return Err(TaskError::Business(
                 "external operations are disabled in regression".into(),
             ));
         }
         let request_bytes = flow_journal::codec::bounded_json(&request, INPUT_BUDGET)?;
+        // 指纹 = 请求字节摘要：授权与执行两侧对同一摘要，许可才对得上
+        // 这一次具体的请求。
         let fingerprint = flow_journal::codec::digest(&request_bytes);
         let operation_id = uuid::Uuid::now_v7().to_string();
         // v2：请求字节一律走 data 通道（再小也走），控制帧只带身份与指纹。
         let transfer_id = TransferKey::OperationRequest(operation_id.clone()).to_wire();
         {
             let mut offset = 0u64;
+            // 分块发送并逐块带摘要：接收端据此发现传输损坏。
             for chunk in request_bytes.chunks(flow_engine::execution_protocol::TRANSFER_CHUNK_BYTES)
             {
                 self.outbound
@@ -1184,6 +1389,7 @@ impl TaskRunner {
                     .map_err(|e| TaskError::Closed(e.to_string()))?;
                 offset += chunk.len() as u64;
             }
+            // InputReady 声明整值长度与摘要：接收端据此判断装配完成。
             self.outbound
                 .send(Message::InputReady {
                     dispatch_id: self.dispatch_id.clone(),
@@ -1216,6 +1422,8 @@ impl TaskRunner {
                     credential,
                     ..
                 } => {
+                    // 三重身份校验：串台的许可必须被拒，否则会对错误的
+                    // 请求执行副作用。
                     if dispatch_id != self.dispatch_id
                         || permitted != operation_id
                         || request_fingerprint != fingerprint
@@ -1232,6 +1440,8 @@ impl TaskRunner {
                     durable_bytes,
                     ..
                 } => {
+                    // 许可等待期间也要推进审计确认，否则审计窗口会被
+                    // 自己产生的记录堵死。
                     let _ = self.ack_tx.send((durable_audit_seq, durable_bytes));
                 }
                 _ => continue,
@@ -1243,6 +1453,9 @@ impl TaskRunner {
     /// harness：子进程执行（许可→spawn→Outcome→输出），与 http_node 同一条授权路径。
     /// 退出码非 0 → outcome 留存、节点判死；超时/spawn 后 IO 失败 → Uncertain
     /// （进程死前副作用未知）；spawn 失败 → 记录 spawn_error outcome 后 Business。
+    ///
+    /// # Errors
+    /// 见上；另含参数缺失（`Business`）与平台故障（`Uncertain`）。
     async fn harness_node(
         &mut self,
         _node: &Node,
@@ -1313,6 +1526,8 @@ impl TaskRunner {
             args.join(" ")
         ));
         let started = std::time::Instant::now();
+        // ManagedChild 绑定进程组/作业：执行器崩溃或取消时后代进程不会
+        // 变成孤儿继续占用机器。
         let mut child = match flow_engine::process::ManagedChild::spawn_harness(
             &mut flow_engine::exec::harness_command(&command, &args, workdir.as_deref()),
         ) {
@@ -1383,6 +1598,9 @@ impl TaskRunner {
         })
     }
 
+    /// 是否为回归模式（派发带 `_flow_execution.regression`）。
+    ///
+    /// 回归模式下一律零外部调用：结果只能来自录制基线。
     fn is_regression(&self) -> bool {
         self.task.node.pointer("/_flow_execution/regression") == Some(&Value::Bool(true))
     }
@@ -1402,6 +1620,13 @@ impl TaskRunner {
 
     /// 内联 harness agent。沿用统一授权、Outcome 与回归协议；本次任务
     /// 完成后回收整个 executor，不复用 host 的全局状态或工具后代。
+    ///
+    /// agent 是**一次性执行器**：它会改写进程级环境并派生工具后代，宿主
+    /// 状态不得流向下一个任务。
+    ///
+    /// # Errors
+    /// 配置缺失、凭据缺失等确定性失败以 `Business` 收口；超时或取消
+    /// 以 `Uncertain` 收口（工具副作用可能已发生）。
     async fn agent_node(
         &mut self,
         params: &Value,
@@ -1465,7 +1690,12 @@ impl TaskRunner {
             None => None,
         };
         let credential = self.authorize_operation(request).await?;
+        // 生命周期截止时间从授权后起算：覆盖装配、回合、清理与落账，
+        // 避免任一阶段无限延长节点占用。
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        // 看门狗独立于 Tokio：宿主同步代码堵死运行时时，协作式超时与
+        // 心跳都会失效，只有独立线程能保证执行器最终退出。
+        //
         // Independent of Tokio progress and heartbeats. If synchronous host code
         // blocks the runtime, the managed process still exits within a bounded grace.
         let _watchdog = flow_engine::process::AgentWatchdog::start(
@@ -1473,8 +1703,13 @@ impl TaskRunner {
             self.cancel.clone(),
         )
         .map_err(|error| TaskError::Uncertain(format!("agent watchdog unavailable: {error}")))?;
-        let roots =
-            std::env::temp_dir().join(format!("flow-harness-{}", uuid::Uuid::now_v7().simple()));
+        // 沙箱根：flow 主目录下 `harness/flow-harness-<uuid>`（FLOW_HOME →
+        // ~/.flow；与配置/journal 同住，不散落系统 temp）。home 不可用的
+        // 退化环境回退系统 temp。运行结束整个 roots 被收走（见下）。
+        let harness_root = flow_config::flow_home().unwrap_or_else(std::env::temp_dir);
+        let roots = harness_root
+            .join("harness")
+            .join(format!("flow-harness-{}", uuid::Uuid::now_v7().simple()));
         // prompt/密钥不进日志：只记模型、工作目录与超时（缺省时目录是临时
         // 沙箱，标注 default 以示来源）。
         let default_workdir = configured_workdir.is_none();
@@ -1519,6 +1754,9 @@ impl TaskRunner {
         let cancel = self.cancel.clone();
         let result = tokio::select! {
             biased;
+            // biased：取消优先于回合完成。回合刚完成与取消同时就绪时，
+            // 选取消会让已完成的工作被判 Uncertain——但工具副作用确实
+            // 已经发生，保守方向是对的。
             _ = cancel.cancelled() => Err(TaskError::Uncertain("harness agent cancelled; result incomplete".into())),
             result = tokio::time::timeout_at(deadline, self.agent_run(
                 &config,
@@ -1533,7 +1771,7 @@ impl TaskRunner {
             ))),
         };
         // 成功/失败/超时/取消都收走临时根；Windows 上文件锁可能让删除失败，
-        // 重试一次，仍失败交给 OS 的 tmp 清理兜底。
+        // 重试一次，仍失败只能残留（在 flow 主目录 harness/ 下，可人工清理）。
         if std::fs::remove_dir_all(&roots).is_err() {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let _ = std::fs::remove_dir_all(&roots);
@@ -1545,6 +1783,10 @@ impl TaskRunner {
     /// runner 子进程、无 stdin/stdout 协议）。确定性失败（临时根不可建、
     /// 装配失败）落封闭 outcome；调用方统一约束总截止时间与取消。
     /// 超时/取消传播 Uncertain，随后回收整个执行器会话。
+    ///
+    /// # Errors
+    /// 装配失败以 `Business`（经 `commit_agent_failure` 落 outcome）收口；
+    /// 回合失败以 `Uncertain` 收口。
     #[allow(clippy::too_many_arguments)]
     async fn agent_run(
         &mut self,
@@ -1596,11 +1838,15 @@ impl TaskRunner {
         // The caller bounds assembly, the turn, cleanup and outcome publication
         // with one deadline. Dropping this future is always followed by retiring
         // the entire executor session, including tool process groups.
+        //
+        // 进度投影只写入有界观测通道：不记录 prompt、模型正文或工具参数
+        // （详见 `agent_progress.rs`）。
         let mut progress = crate::agent_progress::AgentProgress::new(logger);
         let turn = session
             .host
             .run_turn(prompt, |event| progress.on_event(event))
             .await;
+        // 清理宿主会话资源：不做会让下一次任务继承上个会话的状态。
         conga_host::session_cleanup::cleanup_session_resources(&session_id).await;
         let summary = turn
             .map_err(|error| TaskError::Uncertain(format!("harness agent turn failed: {error}")))?;
@@ -1664,6 +1910,10 @@ impl TaskRunner {
 
     /// agent 模式的 Outcome → 节点输出（恢复与首跑共用同一派生）。
     /// 封闭形状：`spawn_error` / `agent_error` / 正常三选一。
+    ///
+    /// # Errors
+    /// `spawn_error`/`agent_error` 归为 `Business`；原始文本超限归为
+    /// `Business`（outcome 已留存）。
     async fn agent_output_from_outcome(
         &mut self,
         outcome: &StoredValue,
@@ -1704,6 +1954,9 @@ impl TaskRunner {
 
     /// 落一个封闭失败 outcome（B/C 形状）并以 Business 收口；恢复路径经
     /// [`Self::agent_output_from_outcome`] 重放同一失败文案。
+    ///
+    /// 先落 outcome 再报错：恢复期才能重放出同样的失败，而不是变成
+    /// 一次「结果未知」的人工裁决。
     async fn commit_agent_failure(
         &mut self,
         outcome: StoredValue,
@@ -1718,6 +1971,11 @@ impl TaskRunner {
         Err(TaskError::Business(message))
     }
 
+    /// 回归模式：比对请求指纹并放行录制的 outcome，绝不发起外部调用。
+    ///
+    /// # Errors
+    /// 缺 fixture 或指纹不匹配时返回 `Business`——请求与基线不同就
+    /// 不能复用基线结果。
     fn fixture_outcome(&self, request: &Value) -> Result<StoredValue, TaskError> {
         let expected = self
             .task
@@ -1741,6 +1999,9 @@ impl TaskRunner {
     }
 
     /// 一期 `Attempt::harness_output` 等价：Outcome → 节点输出（重跑同一派生）。
+    ///
+    /// # Errors
+    /// 非 0 退出码、文本超限归为 `Business`（outcome 已留存）。
     async fn harness_output(
         &mut self,
         outcome: &StoredValue,
@@ -1775,6 +2036,10 @@ impl TaskRunner {
     }
 
     /// 一期 `Attempt::http_output` 等价：状态/头/体组合或 email 解析。
+    ///
+    /// # Errors
+    /// outcome 形状非法归为 `Invalid`；状态码非 2xx、响应体非 JSON
+    /// （email/llm）、文本超限归为 `Business`（outcome 已留存）。
     async fn http_output(
         &mut self,
         outcome: &StoredValue,
@@ -1844,6 +2109,8 @@ impl TaskRunner {
             }
         }
         let valid_json = {
+            // 用 Deserializer 判「整个 body 是且仅是一个 JSON 值」：
+            // serde_json::from_slice 会拒绝尾随内容，这里要的是同样的严格性。
             let mut de = serde_json::Deserializer::from_slice(&body);
             serde::de::IgnoredAny::deserialize(&mut de).is_ok() && de.end().is_ok()
         };
@@ -1856,6 +2123,7 @@ impl TaskRunner {
             object.value(&outcome_value["headers"])?;
             object.key("body")?;
             if valid_json {
+                // JSON 体原样嵌入（保留供应商结构）；非 JSON 转义为文本。
                 object.raw_value_bytes(&body)?;
             } else {
                 serde_json::to_writer(
@@ -1867,6 +2135,8 @@ impl TaskRunner {
         }
         let output = store_bytes(audit, &self.journal_id, &composed, ValueCodec::Json).await?;
         if status >= 400 {
+            // 4xx/5xx 是业务失败而非平台故障：outcome 已落账，可按失败
+            // 重试策略处理，不需要人工裁决。
             return Err(TaskError::Business(format!(
                 "HTTP {status}; outcome retained"
             )));
@@ -1874,6 +2144,10 @@ impl TaskRunner {
         Ok(output)
     }
 
+    /// 取回已捕获的原始字节（按 output_id 定位）。
+    ///
+    /// # Errors
+    /// 字节不在本进程且主进程未重传时返回 `Closed`（等待超时）。
     async fn raw_bytes(
         &mut self,
         reference: &flow_journal::ValueRef,
@@ -1885,11 +2159,21 @@ impl TaskRunner {
     }
 }
 
+/// 已物化的输入面（JSON 视图，给 JS 求值用）。
+///
+/// 与 [`InputFace`] 的 StoredValue 视图并存：前者给用户代码，后者给
+/// 输出回引（需要保留 Ref 身份）。
 struct TaskInputs {
+    /// run 输入（JSON 值）。
     input: Value,
+    /// 前驱节点输出（按节点 id 的 JSON 对象）。
     nodes: Value,
 }
 
+/// 物化已提交的准备参数（各节点类型的公共入口）。
+///
+/// # Errors
+/// 参数缺失、超预算或编码非法时返回 `Invalid`。
 async fn materialize_prepared_params(
     runner: &mut TaskRunner,
     prepared: &Prepared,
@@ -1940,6 +2224,7 @@ fn attempt_label(attempt: u32) -> String {
     }
 }
 
+/// 人类可读的耗时标签：亚秒用毫秒，之上用一位小数秒。
 fn elapsed_label(elapsed: Duration) -> String {
     let ms = elapsed.as_millis();
     if ms < 1000 {
@@ -1949,6 +2234,9 @@ fn elapsed_label(elapsed: Duration) -> String {
     }
 }
 
+// 三条管道必须并发推进：若先写完 prompt 再读 stdout，子进程写满管道
+// 缓冲就会与写 stdin 互锁（死锁），且子进程退出前读不到任何输出。任一
+// 分支失败或超时都判 Uncertain——进程可能已产生副作用。
 /// Capture all three pipes concurrently under one deadline. Partial output is never success.
 async fn capture_harness(
     child: &mut flow_engine::process::ManagedChild,
@@ -1973,6 +2261,8 @@ async fn capture_harness(
         let input = async {
             match stdin.write_all(prompt).await {
                 Ok(()) => {}
+                // BrokenPipe：子进程可能已退出（提前失败或不读 stdin），
+                // 这不是 harness 自身的错误，按「写到这里为止」处理。
                 Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
                 Err(e) => return Err(e),
             }
@@ -1997,6 +2287,8 @@ async fn capture_harness(
             Ok::<_, std::io::Error>(bytes)
         };
         let err = async {
+            // stderr 只保留尾部 512 字节：崩溃现场（panic 栈、错误摘要）
+            // 通常在最后，前面的大段噪声对排障无用。
             let mut tail = std::collections::VecDeque::with_capacity(512);
             let mut buffer = [0; 8192];
             loop {
@@ -2023,12 +2315,16 @@ async fn capture_harness(
     let result = tokio::select! {
         result = tokio::time::timeout(timeout, capture) => match result {
             Ok(Ok(output)) => Ok(output),
+            // 采集失败/超时/取消一律 Uncertain：子进程可能已经产生
+            // 副作用，绝不能当成普通失败去重试。
             Ok(Err(error)) => Err(TaskError::Uncertain(format!("harness capture: {error}"))),
             Err(_) => Err(TaskError::Uncertain("harness deadline exceeded; result incomplete".into())),
         },
         _ = cancel.cancelled() => Err(TaskError::Uncertain("harness cancelled; result incomplete".into())),
     };
     if result.is_err() {
+        // 失败路径必须杀掉子进程并回收：否则它会变成孤儿继续占用机器
+        // （ManagedChild 的 kill_on_drop 只覆盖 drop，不覆盖这一路径）。
         let _ = child.start_kill();
         let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
     }
@@ -2038,6 +2334,7 @@ async fn capture_harness(
 #[cfg(all(test, unix))]
 mod harness_capture_tests {
     use super::*;
+    /// 测试辅助：以 `/bin/sh -c` 跑一段脚本并采集其输出。
     async fn capture(
         script: &str,
         input: &[u8],
@@ -2057,6 +2354,7 @@ mod harness_capture_tests {
         assert!(child.try_wait().unwrap().is_some(), "child must be reaped");
         result
     }
+    /// 写 stdin 被子进程阻塞时仍须按截止时间收口，并把子进程回收掉。
     #[tokio::test]
     async fn blocked_stdin_obeys_deadline_and_reaps() {
         assert!(matches!(
@@ -2069,6 +2367,7 @@ mod harness_capture_tests {
             Err(TaskError::Uncertain(_))
         ));
     }
+    /// 写 prompt 的同时必须读 stdout，否则管道缓冲会互锁。
     #[tokio::test]
     async fn drains_output_while_writing_prompt() {
         let output = capture(
@@ -2080,6 +2379,7 @@ mod harness_capture_tests {
         .unwrap();
         assert_eq!(output.stdout.len(), 262144);
     }
+    /// stdout 溢出捕获上限时不得返回「截断的成功」。
     #[tokio::test]
     async fn stdout_overflow_never_returns_truncated_success() {
         assert!(matches!(
@@ -2087,6 +2387,7 @@ mod harness_capture_tests {
             Err(TaskError::Uncertain(_))
         ));
     }
+    /// stderr 只保留尾部 512 字节。
     #[tokio::test]
     async fn stderr_capture_keeps_only_tail() {
         let output = capture(

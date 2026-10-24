@@ -28,17 +28,24 @@ pub struct TempDir {
 }
 
 impl TempDir {
+    /// 在系统临时目录下创建一个带随机后缀的独占子目录。
+    ///
+    /// `tag` 只用于让目录名可读（便于失败时人工辨认），唯一性由 UUID 保证。
     pub fn new(tag: &str) -> TempDir {
         Self::new_in(&std::env::temp_dir(), tag)
     }
 
     /// 在 `base` 下建一个独占子目录。
+    ///
+    /// 刻意**不**直接用 `base`：删除时只会删掉自己创建的那一个子目录，
+    /// 绝不会删 `base` 本身（`base` 可能是别的进程正在用的目录）。
     pub fn new_in(base: &Path, tag: &str) -> TempDir {
         let path = base.join(format!("{tag}-{}", Uuid::now_v7()));
         std::fs::create_dir_all(&path).expect("创建测试临时目录失败");
         TempDir { path }
     }
 
+    /// 临时目录的绝对路径（测试用它拼数据库文件、日志等路径）。
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -222,31 +229,43 @@ pub fn workspace_bin(name: &str) -> PathBuf {
 /// - flow-executor → flow-executor
 /// - flow-journal-tool / flow-journal-bench → flow-journal
 /// - flow-journal-dev → flow-backend
+///
+/// 这些函数存在的意义是让「找不到二进制」的错误在**测试启动前**就爆出来，
+/// 而不是等到某个用例跑到一半才失败。
 pub fn server_bin() -> PathBuf {
     workspace_bin("flow-journal-server")
 }
 
+/// CLI 产品的二进制路径（flow-cli）。
 pub fn cli_bin() -> PathBuf {
     workspace_bin("flow-cli")
 }
 
+/// flow-agent 的二进制路径。
 pub fn agent_bin() -> PathBuf {
     workspace_bin("flow-agent")
 }
 
+/// flow-executor 的二进制路径（执行器子进程本体）。
 pub fn executor_bin() -> PathBuf {
     workspace_bin("flow-executor")
 }
 
+/// journal-server 的二进制路径（与 `server_bin` 同物，此处保留独立名字
+/// 以便调用方表意更清楚）。
 pub fn journal_server_bin() -> PathBuf {
     workspace_bin("flow-journal-server")
 }
 
+/// 开发用 journal 工具的二进制路径。
 pub fn journal_dev_bin() -> PathBuf {
     workspace_bin("flow-journal-dev")
 }
 
 /// 被测进程自报端口后的结果。
+///
+/// 两个端口都由子进程自己绑 `127.0.0.1:0` 后打印出来，因此它们与
+/// 「监听者是谁」严格对应——这正是本 crate 想要的确定性。
 #[derive(Debug, Clone, Copy)]
 pub struct ReportedPorts {
     /// JSON-RPC / WebSocket 端口。
@@ -376,6 +395,11 @@ fn parse_addr_after(line: &str, marker: &str) -> Option<SocketAddr> {
 }
 
 #[cfg(test)]
+/// 日志端口解析的回归测试。
+///
+/// 这组用例守着 `spawn_reporting_ports` 的成败关键：tracing 的 ANSI
+/// 颜色序列一旦没被剥掉，端口就永远解析不出来，整个 e2e 套件会在
+/// 30 秒超时后给出完全指错方向的报错。
 mod port_parse_tests {
     use super::*;
 

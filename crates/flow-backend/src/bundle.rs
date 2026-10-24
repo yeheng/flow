@@ -1,4 +1,11 @@
 //! Versioned, read-only run evidence. Reading a bundle never starts an executor.
+//!
+//! 本模块实现证据包（bundle）：把一个 run 及其引用闭包导出成带清单的
+//! 目录，并能用同一个 reducer 离线还原出只读状态。
+//! 它守护的核心不变量是「证据只读且可验证」：正文按摘要命名、事件带
+//! 原始位置、清单在全部证据写完并校验通过后才发布。
+//! 需要它，是因为一次运行的证据必须能在原环境消失之后仍然可读、可验，
+//! 且还原过程绝不能启动执行器或撤回任何外部效果。
 use flow_engine::journal_state::{Operation, Prepared, Run, State, Wait};
 use flow_journal::{codec, Event, EventKind, Transaction, ValueRef};
 use serde::{Deserialize, Serialize};
@@ -10,9 +17,16 @@ use std::{
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// 事件正文预算：导出上限 64 MiB。
 const FACT_BUDGET: usize = 64 * 1024 * 1024;
+/// 引用正文总预算：导出上限 1 GiB。
 const BODY_BUDGET: u64 = 1024 * 1024 * 1024;
 
+/// 证据包清单：版本、run 闭包、事件摘要与正文引用。
+///
+/// `events_digest` 覆盖 events.jsonl 的全部字节；`values` 是正文引用的
+/// 完整闭包——两者共同构成「包没被改过」的证明。
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
@@ -26,6 +40,7 @@ pub struct Manifest {
     pub values: BTreeMap<String, ValueRef>,
 }
 
+/// 创建一个仅所有者可访问的目录（unix 下 0700）。
 fn private_dir(path: &Path) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
@@ -35,6 +50,8 @@ fn private_dir(path: &Path) -> std::io::Result<()> {
     }
     builder.create(path)
 }
+
+/// 以「只新建、不覆盖」的方式创建文件（unix 下 0600）。
 fn new_file(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -45,9 +62,13 @@ fn new_file(path: &Path) -> std::io::Result<std::fs::File> {
     }
     options.open(path)
 }
+
+/// 正文在包内的路径：由摘要派生，不用原始 output_id 做路径名。
 fn body_path(root: &Path, id: &str) -> PathBuf {
     root.join("values").join(codec::digest(id.as_bytes()))
 }
+
+/// 登记一个正文引用；同一 output_id 出现不同描述符即为冲突。
 fn reference(reference: ValueRef, found: &mut BTreeMap<String, ValueRef>) -> Result<()> {
     reference.validate()?;
     if found
@@ -59,12 +80,16 @@ fn reference(reference: ValueRef, found: &mut BTreeMap<String, ValueRef>) -> Res
     found.insert(reference.output_id.clone(), reference);
     Ok(())
 }
+
+/// 登记一个存储值里的正文引用（内联值没有引用）。
 fn stored(value: &flow_journal::StoredValue, found: &mut BTreeMap<String, ValueRef>) -> Result<()> {
     if let flow_journal::StoredValue::Ref(r) = value {
         reference(r.clone(), found)?;
     }
     Ok(())
 }
+
+/// 登记一个外部操作结果的引用（含其内联的原始响应正文）。
 fn outcome(
     value: &flow_journal::StoredValue,
     found: &mut BTreeMap<String, ValueRef>,
@@ -77,6 +102,8 @@ fn outcome(
     }
     Ok(())
 }
+
+/// 登记一个准备阶段记录里的全部引用。
 fn prepared(value: &Prepared, found: &mut BTreeMap<String, ValueRef>) -> Result<()> {
     stored(&value.input, found)?;
     stored(&value.params, found)?;
@@ -169,11 +196,17 @@ fn references(event: &Event, found: &mut BTreeMap<String, ValueRef>) -> Result<(
 }
 
 /// Call with the data-directory offline lock held. A partial export has no manifest.
+///
+/// 导出一个 run 及其子 run 的引用闭包。
+///
+/// 顺序不可颠倒：先写正文与事件，再校验，最后才发布 manifest——
+/// 没有 manifest 的目录只是未完成的导出，不会被误当成有效证据包。
 pub fn export(root: &Path, run_id: &str, destination: &Path) -> Result<Manifest> {
     let conn = flow_journal::sqlite::read_connection(root)?;
     let (identity, upper) = flow_journal::sqlite::metadata(&conn)?;
     let mut runs = BTreeSet::new();
     let mut todo = vec![run_id.to_owned()];
+    // 事实按 (LSN, 事件序号) 定位：还原时必须保留原始位置。
     let mut facts = BTreeMap::<(u64, usize), Event>::new();
     let mut bytes = 0;
     while let Some(run) = todo.pop() {
@@ -188,6 +221,7 @@ pub fn export(root: &Path, run_id: &str, destination: &Path) -> Result<Manifest>
         while let Some((tx, _)) = tail.next(upper)? {
             for (index, event) in tx.events.into_iter().enumerate() {
                 if event.kind == EventKind::RunStarted && event.payload["parent"]["run_id"] == run {
+                    // 子 run 的创建事实在父 run 的事务里：顺着它收齐子闭包。
                     if let Some(child) = &event.run_id {
                         todo.push(child.clone());
                     }
@@ -203,6 +237,7 @@ pub fn export(root: &Path, run_id: &str, destination: &Path) -> Result<Manifest>
             }
         }
         if !found {
+            // 没有创建事实：这个 run 不属于本数据集，不能凭空造一条。
             return Err(format!("run {run} has no creation fact").into());
         }
     }
@@ -261,6 +296,9 @@ pub fn export(root: &Path, run_id: &str, destination: &Path) -> Result<Manifest>
 /// Verify the complete reference closure, then fold facts with the normal reducer.
 /// Synthetic contiguous transaction numbers are local to this read-only view;
 /// events.jsonl retains the original positions. No database is created or repaired.
+///
+/// 校验并还原一个证据包：核对摘要、顺序、边界与引用闭包，然后用同一个
+/// reducer 折叠出只读状态。不会创建或修复任何数据库。
 pub fn inspect(root: &Path) -> Result<(Manifest, State)> {
     let mut bytes = Vec::new();
     std::fs::File::open(root.join("manifest.json"))?
@@ -274,6 +312,10 @@ pub fn inspect(root: &Path) -> Result<(Manifest, State)> {
     Ok((manifest, state))
 }
 
+/// 校验证据包的完整性并用 reducer 还原状态。
+///
+/// 校验项：版本与预算、每个正文的字节数与摘要、事件条数与整体摘要、
+/// 事实顺序与边界、run 归属、引用闭包。
 fn verify(root: &Path, manifest: &Manifest) -> Result<State> {
     if manifest.version != 1
         || manifest.events > 1_000_000
@@ -294,6 +336,7 @@ fn verify(root: &Path, manifest: &Manifest) -> Result<State> {
         if total > BODY_BUDGET {
             return Err("bundle body budget exceeded".into());
         }
+        // 多读一个字节：正好等于声明长度且摘要相同才算完整。
         let mut file = std::fs::File::open(body_path(root, id))?.take(reference.total_bytes + 1);
         let mut hash = Sha256::new();
         let count = std::io::copy(&mut file, &mut HashSink(&mut hash))?;
@@ -366,6 +409,8 @@ fn verify(root: &Path, manifest: &Manifest) -> Result<State> {
         .values()
         .filter(|r| !publications.contains(&r.output_id))
     {
+        // 有发布事实的引用由 reducer 自己登记；其余的必须预置，
+        // 否则 reducer 会认为这些正文不存在。
         state.values.remember(reference.clone())?;
     }
     let mut groups = BTreeMap::<u64, Vec<Event>>::new();
@@ -373,6 +418,8 @@ fn verify(root: &Path, manifest: &Manifest) -> Result<State> {
         groups.entry(fact.lsn).or_default().push(fact.event);
     }
     for events in groups.into_values() {
+        // 还原用本地连续事务号：原始 LSN 保留在 events.jsonl 里，
+        // 但事务号必须连续，reducer 才认这批事实。
         state.apply(&Transaction {
             v: 2,
             journal_id: manifest.journal_id.clone(),
@@ -384,16 +431,23 @@ fn verify(root: &Path, manifest: &Manifest) -> Result<State> {
     if !state.runs.contains_key(&manifest.root_run)
         || state.runs.keys().cloned().collect::<BTreeSet<_>>() != manifest.runs
     {
+        // 还原出的 run 集合必须与清单完全一致：多一个说明包里有未申报的
+        // 事实，少一个说明证据不完整。
         return Err("bundle run closure mismatch".into());
     }
     Ok(state)
 }
+
+/// 把写入的内容直接喂给摘要器，避免再拷贝一份。
 struct HashSink<'a>(&'a mut Sha256);
 impl Write for HashSink<'_> {
+    /// 只更新摘要：写入内容不需要真正落盘。
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         self.0.update(bytes);
         Ok(bytes.len())
     }
+
+    /// 无缓冲，无需刷新。
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }

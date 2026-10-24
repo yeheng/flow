@@ -1,6 +1,15 @@
+//! 表达式求值面的行为测试：注入语义、出口转换、大整数边界与沙箱边界。
+//!
+//! 这些测试是**沙箱契约**的证据：它们把「与 JSON.parse/JSON.stringify
+//! 对齐」「大整数不失真」「无 std/os/网络」等承诺钉在可执行的断言上，
+//! 升级 rquickjs 或重构读回路径时立刻能发现行为漂移。
+//!
+//! 不这样做的代价：这些语义只存在于注释与口头约定里，一次无害的重构
+//! 就能让「前端预览」与「执行期结果」分叉，而分叉往往要到线上才暴露。
 use super::*;
 use serde_json::json;
 
+/// 构造一份固定的输入/上游输出，供各用例复用。
 fn ctx() -> (Value, Value) {
     (
         json!({"order_id": "o-1", "amount": 12}),
@@ -8,6 +17,7 @@ fn ctx() -> (Value, Value) {
     )
 }
 
+/// 脚本能读到 run 输入与上游节点输出。
 #[test]
 fn body_can_read_input_and_upstream_outputs() {
     let (input, nodes) = ctx();
@@ -22,6 +32,7 @@ fn body_can_read_input_and_upstream_outputs() {
     assert_eq!(out, json!({"id": "o-1", "upstream": 200, "total": 24}));
 }
 
+/// 条件表达式求值返回原始布尔值（不归一成字符串）。
 #[test]
 fn expr_returns_falsy_value_when_condition_not_met() {
     let (input, nodes) = ctx();
@@ -29,6 +40,7 @@ fn expr_returns_falsy_value_when_condition_not_met() {
     assert_eq!(out, json!(false));
 }
 
+/// JS 异常必须以 `EngineError::Expr` 呈现（业务失败），而不是沙箱级崩溃。
 #[test]
 fn exceptions_surface_as_errors() {
     let (input, nodes) = ctx();
@@ -43,6 +55,7 @@ fn exceptions_surface_as_errors() {
     assert!(matches!(err, EngineError::Expr(_)), "{err}");
 }
 
+/// 分配炸弹必须在 JS 堆限内失败，而不是吃光宿主进程内存。
 #[test]
 fn bounded_script_memory_bomb_fails_instead_of_oom() {
     // 生产 driver 路径已切到 _bounded 变体：分配炸弹必须在 JS 堆限内
@@ -59,6 +72,7 @@ fn bounded_script_memory_bomb_fails_instead_of_oom() {
     assert!(matches!(err, EngineError::Expr(_)), "{err}");
 }
 
+/// 模板展开的两种形态：整值保留类型、插值保持字符串语义。
 #[test]
 fn templates_expand_strings_and_embed_objects() {
     let (input, nodes) = ctx();
@@ -252,6 +266,7 @@ fn templates_handle_big_integers_exactly() {
     assert_eq!(out["both"], json!("9007199254740993/18446744073709551615"));
 }
 
+/// 死循环脚本必须被中断器打断，不能占住执行槽。
 #[test]
 fn runaway_script_is_interrupted_by_timeout() {
     let (input, nodes) = ctx();
@@ -318,6 +333,7 @@ fn sandbox_has_no_std_os_or_module_loader() {
     }
 }
 
+/// 展开必须保留 `__proto__` 等特殊键，且展开结果自身是幂等的。
 #[test]
 fn templates_preserve_special_json_keys() {
     let template: Value = serde_json::from_str(r#"{"__proto__":{"kept":true},"nested":[{"__proto__":"${input.x}","constructor":1,"prototype":2}]}"#).unwrap();

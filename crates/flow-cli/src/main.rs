@@ -6,6 +6,9 @@
 //!
 //! 运行：cargo run -p flow-cli -- workflow list
 
+/// 进程入口：把退出码交给操作系统。
+///
+/// 退出码契约（0/1/2/4）在库侧统一维护，这里只做 `u8` 转换。
 fn main() -> std::process::ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let code = flow_cli::run_from_args(&argv);

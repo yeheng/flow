@@ -70,6 +70,9 @@ async fn agent_workdir_default_scratch_configured_checked_and_regression_stable(
     .await;
     std::env::set_var("FLOW_SECRET_E2EWD", "sk-wd-secret");
     let dir = tempfile::tempdir().unwrap();
+    // 缺省沙箱在 flow 主目录（FLOW_HOME → ~/.flow）下创建：钉到临时目录，
+    // 测试不碰真实用户目录（executor 经 env 白名单继承本值）
+    std::env::set_var("FLOW_HOME", dir.path().join("flow-home"));
 
     let b: Arc<JournalBackend> = JournalBackend::open(dir.path(), Default::default())
         .await
@@ -152,4 +155,5 @@ async fn agent_workdir_default_scratch_configured_checked_and_regression_stable(
     b.close().await.unwrap();
     provider.stop().await;
     std::env::remove_var("FLOW_SECRET_E2EWD");
+    std::env::remove_var("FLOW_HOME");
 }

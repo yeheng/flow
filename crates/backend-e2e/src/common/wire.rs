@@ -65,6 +65,7 @@ pub fn named(value: Value) -> ObjectParams {
     params
 }
 
+/// 发起一次 wire 级调用并反序列化结果。
 pub async fn call<T: serde::de::DeserializeOwned>(
     client: &WsClient,
     method: &str,
@@ -83,6 +84,7 @@ pub async fn call<T: serde::de::DeserializeOwned>(
     serde_json::from_value(result).unwrap()
 }
 
+/// 把方法名映射到它「物化」后的方法名（读方法直接映射到视图方法）。
 fn materialized(method: &str) -> &str {
     match method {
         "workflow.get" => "workflow.get.view",
@@ -93,6 +95,7 @@ fn materialized(method: &str) -> &str {
         other => other,
     }
 }
+/// 给参数补上 wire 协议必需的字段（令牌、幂等键等）。
 fn enrich(method: &str, mut params: Value) -> Value {
     params["_token"] = json!(TOKEN);
     if flow_rpc::journal_v2::is_write_method(method) && params.get("request_id").is_none() {
@@ -100,6 +103,7 @@ fn enrich(method: &str, mut params: Value) -> Value {
     }
     params
 }
+/// 发起一次注定失败的调用，返回错误文本。
 pub async fn call_err(client: &WsClient, method: &str, params: Value) -> String {
     let method = materialized(method);
     match client
@@ -146,6 +150,7 @@ pub async fn publish(client: &WsClient, name: &str, def: Value) -> (String, i64)
     (workflow_id, version)
 }
 
+/// 启动一次运行，返回 run_id。
 pub async fn start_run(client: &WsClient, workflow_id: &str, input: Value) -> String {
     let started: Value = call(
         client,

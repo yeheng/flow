@@ -1,4 +1,11 @@
 //! Candidate runs share the normal executor, but never receive external-operation permits.
+//!
+//! 本模块实现回归合同：候选 run 使用与 baseline 相同的时间、随机种子、
+//! 人工输入与外部录制结果，因此差异只可能来自候选定义本身。
+//! 它守护的核心不变量是「回归绝不触碰真实外部系统」：协调器独立拒绝
+//! 回归模式的外部操作许可，执行器再按请求摘要严格比对 fixture。
+//! 需要它，是因为「改了 prompt / 节点逻辑后行为是否一致」这个问题
+//! 只能在零外部副作用的条件下反复回答。
 use crate::journal::{CommandReceipt, JournalBackend, JournalError};
 use flow_engine::journal_state::{OperationFixture, Regression, Run};
 use flow_journal::{Error, StoredValue};
@@ -6,6 +13,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 impl JournalBackend {
+    /// 以 baseline 为基线启动一次回归候选 run。
     pub async fn run_regression(
         &self,
         baseline: &str,
@@ -17,6 +25,11 @@ impl JournalBackend {
             .await
     }
 
+    /// 带 fixture 覆盖的回归：先把 baseline 的外部结果录制成 fixture，
+    /// 再用覆盖项替换其中若干条，最后启动候选 run。
+    ///
+    /// `overrides` 的键是规范 JSON 节点路径（JSON 字符串数组），
+    /// 避免节点 ID 里的分隔符造成身份碰撞。
     pub async fn run_regression_with_fixtures(
         &self,
         baseline: &str,
@@ -30,6 +43,8 @@ impl JournalBackend {
             .await?
             .ok_or_else(|| Error::Invalid("baseline run not found".into()))?;
         if !root.terminal() {
+            // baseline 必须已终结：未终结的 run 其外部结果与人工输入
+            // 都不完整，录制出来的 fixture 会是假的。
             return Err(Error::Conflict("baseline must be terminal".into()).into());
         }
         let mut execution = root
@@ -53,6 +68,7 @@ impl JournalBackend {
                 continue;
             }
             if visited.len() > 1000 {
+                // 子 run 闭包有上限：闭包无界说明 baseline 的父子关系异常。
                 return Err(Error::Limit("baseline child closure exceeds 1000 runs".into()).into());
             }
             if !run.terminal() {
@@ -65,6 +81,8 @@ impl JournalBackend {
             let definition = self.cached_definition(&run.run_id, &run.definition).await?;
             for (id, node) in &run.nodes {
                 if let Some(operation) = &node.operation {
+                    // 只有已捕获 outcome 的操作才能录成 fixture：
+                    // 未决操作没有可复用的外部结果。
                     if let Some(outcome) = &operation.outcome {
                         fixtures.insert(
                             context.node_key(id),
@@ -81,6 +99,8 @@ impl JournalBackend {
                         flow_engine::NodeType::HumanTask | flow_engine::NodeType::Input
                     )
                 }) {
+                    // 人工输入同样要继承：否则候选 run 会等在一个
+                    // 永远不会到来的信号上。
                     if let Some(output) = &node.output {
                         signals.insert(context.node_key(id), output.clone());
                     }
@@ -108,6 +128,8 @@ impl JournalBackend {
         for (path, fixture) in overrides {
             let node_path: Vec<String> = serde_json::from_str(&path)
                 .map_err(|_| Error::Invalid("fixture paths must be JSON string arrays".into()))?;
+            // 路径必须是规范 JSON 数组（重序列化后与原串相同），
+            // 否则同一路径会有多种写法，身份会漂移。
             if node_path.is_empty()
                 || serde_json::to_string(&node_path)? != path
                 || fixture.fingerprint.len() != 64
@@ -116,6 +138,7 @@ impl JournalBackend {
                     Error::Invalid("invalid fixture path or request fingerprint".into()).into(),
                 );
             }
+            // 覆盖路径写进运行证据：不隐式更改 baseline。
             override_keys.insert(path.clone());
             fixtures.insert(path, fixture);
         }
@@ -145,6 +168,10 @@ impl JournalBackend {
         .await
     }
 
+    /// 比较两个 run（逐节点、逐子 run）并给出差异清单。
+    ///
+    /// `complete` 表示被比较的 run 全部终态；未终态时结果只能当作
+    /// 「目前可见的差异」，不能据此下结论。
     pub async fn compare_runs(
         &self,
         baseline: &str,
@@ -244,6 +271,7 @@ impl JournalBackend {
     }
 }
 
+/// 取某个节点外部请求的指纹（无操作时回落到 fixture 里的指纹）。
 fn request_fingerprint<'a>(run: &'a Run, node: &str) -> Option<&'a str> {
     if run
         .nodes
@@ -251,6 +279,8 @@ fn request_fingerprint<'a>(run: &'a Run, node: &str) -> Option<&'a str> {
         .and_then(|n| n.error.as_deref())
         .is_some_and(|e| e.starts_with("regression request differs"))
     {
+        // 节点本身就因「请求与 fixture 不符」而失败：没有可比对的请求，
+        // 报差异会掩盖真正的失败原因。
         return None;
     }
     run.nodes
@@ -267,6 +297,7 @@ fn request_fingerprint<'a>(run: &'a Run, node: &str) -> Option<&'a str> {
         })
 }
 
+/// 计算一个业务值的比较用摘要（内联值算摘要，引用值用其内容摘要）。
 fn value_digest(value: Option<&StoredValue>) -> Result<Option<String>, flow_journal::Error> {
     value
         .map(|v| match v {
@@ -278,6 +309,7 @@ fn value_digest(value: Option<&StoredValue>) -> Result<Option<String>, flow_jour
         .transpose()
 }
 
+/// 记录一处差异；超过 64 条后只置 truncated，不再追加。
 fn record_difference(differences: &mut Vec<Value>, truncated: &mut bool, value: Value) {
     if differences.len() < 64 {
         differences.push(value);

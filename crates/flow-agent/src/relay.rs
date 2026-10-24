@@ -25,8 +25,11 @@ pub const FAIR_TURN_FRAMES: usize = 4;
 
 /// 已确认绑定（agent 视角）：dispatch → 执行器身份。
 #[derive(Debug, Clone)]
+/// 已确认绑定（agent 视角）：dispatch → 执行器身份。
 pub struct Binding {
+    /// 执行器 id。
     pub executor_id: String,
+    /// 执行器本次启动的标识（重启即换）。
     pub executor_boot_id: String,
 }
 
@@ -39,6 +42,7 @@ pub struct Relay {
 }
 
 #[derive(Debug, thiserror::Error)]
+/// 中继可以拒绝的三类情况。
 pub enum RelayError {
     #[error("route envelope mismatch: {0}")]
     Envelope(String),
@@ -49,6 +53,10 @@ pub enum RelayError {
 }
 
 impl Relay {
+    /// 创建一个中继状态机：初始没有任何归属绑定。
+    ///
+    /// 绑定只能由 `bind`（即 BindExecutor 确认后）建立，这是「只按已确认
+    /// 路由转发」的前提。
     pub fn new(agent_id: String, agent_boot_id: String, link_session_id: String) -> Self {
         Self {
             agent_id,
@@ -69,14 +77,20 @@ impl Relay {
         );
     }
 
+    /// 解除一个派发的归属绑定（执行器回收后调用）。
+    ///
+    /// 解绑后该 dispatch 的上行包络不再被接受——执行器已经没了，
+    /// 再收到它的帧说明有串线，必须拒绝而不是转发。
     pub fn unbind(&mut self, dispatch_id: &str) {
         self.bindings.remove(dispatch_id);
     }
 
+    /// 查询某个派发的已确认归属。
     pub fn binding(&self, dispatch_id: &str) -> Option<&Binding> {
         self.bindings.get(dispatch_id)
     }
 
+    /// 遍历当前所有已绑定派发。
     pub fn dispatches(&self) -> impl Iterator<Item = &String> {
         self.bindings.keys()
     }
@@ -132,6 +146,11 @@ impl Relay {
         })
     }
 
+    /// 校验包络是否与本中继的会话身份及已确认归属一致。
+    ///
+    /// 这一步是 agent 的**安全闸**：包络里的 agent/boot/link 三个身份必须
+    /// 与本连接相符，执行器身份必须与已确认绑定相符。任何一项不符都说明
+    /// 帧来自别的会话或已被撤销的绑定，必须拒绝。
     fn verify(&self, envelope: &RouteEnvelope) -> Result<(), RelayError> {
         if envelope.agent_id != self.agent_id
             || envelope.agent_boot_id != self.agent_boot_id
@@ -187,6 +206,7 @@ pub fn estimate_weight(message: &Message) -> u64 {
     raw.min(flow_engine::execution_protocol::DATA_MAX_FRAME as u64)
 }
 
+/// 估算一个 JSON 值的编码字节数（同样零分配遍历）。
 fn estimate_value(value: &serde_json::Value) -> u64 {
     match value {
         serde_json::Value::String(text) => 16 + text.len() as u64,
@@ -216,6 +236,9 @@ pub struct UplinkBudget {
 }
 
 impl UplinkBudget {
+    /// 创建共享出站字节预算。
+    ///
+    /// 上限至少为 1：预算为 0 会让任何消息都无法出站，等于把 agent 变成黑洞。
     pub fn new(cap: u64) -> std::sync::Arc<Self> {
         let cap = u32::try_from(cap)
             .expect("uplink budget exceeds semaphore limit")
@@ -226,6 +249,7 @@ impl UplinkBudget {
         })
     }
 
+    /// 占用出站字节预算；预算不足时挂起等待（形成背压）。
     pub async fn acquire(&self, bytes: u64) -> tokio::sync::OwnedSemaphorePermit {
         self.semaphore
             .clone()
@@ -242,6 +266,11 @@ impl UplinkBudget {
 }
 
 #[cfg(test)]
+/// 中继归属校验与预算归还的回归测试。
+///
+/// 这些用例守的是 agent 的安全边界：错会话、错执行器、未绑定的包络
+/// 必须一律被拒；以及字节预算在消息被丢弃时必须归还（否则会逐渐
+/// 饿死出站）。
 mod tests {
     use super::*;
 

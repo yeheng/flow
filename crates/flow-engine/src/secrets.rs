@@ -6,6 +6,13 @@
 //! - 执行注入发生在 dispatch 之前（模板展开已由 driver 的 start_node 完成）——
 //!   真值不参与 `${}` 展开，也不会随 node_started 落盘（事件在注入前已写）；
 //! - `workflow.update` 提前校验名称存在，把配置错误挡在发布前。
+//!
+//! 本模块是**取值入口**，不负责落盘：加密存储由 [`crate::secrets_store`]
+//! 实现，本模块只定义「先 stored 后 env」的查找顺序与名称清单口径。
+//!
+//! 为什么名称与真值必须分开：definition 与事件都要落盘持久化，名称
+//! 落盘无风险，真值落盘等于凭据进数据库；名称只在执行期被解析成真值，
+//! 而注入发生在事件写入之后，所以落盘面永远看不到真值。
 
 use std::sync::{Arc, OnceLock};
 
@@ -20,19 +27,30 @@ pub const SECRET_ENV_PREFIX: &str = "FLOW_SECRET_";
 /// [`crate::secrets_store::SecretFileStore`]）。进程入口装一次；装上后
 /// `get_secret` 先查它，环境变量兜底——环境变量机制原样保留。
 pub trait SecretSource: Send + Sync {
+    /// 按名称取真值；不存在返回 `None`。
+    ///
+    /// 解密失败与「不存在」同义：密钥文件损坏时不该把内部错误暴露成
+    /// 配置问题，更不该让调用方以为拿到了错的值。
     fn get(&self, name: &str) -> Option<String>;
+    /// 列出该来源已配置的密钥名称（不含值）。
     fn names(&self) -> Vec<String>;
 }
 
+/// 全局安装的持久化密钥来源（进程级单例）。
 static STORED: OnceLock<Arc<dyn SecretSource>> = OnceLock::new();
 
 /// 安装持久化密钥来源。重复安装报错（进程入口只调一次；测试各自直连 store）。
+///
+/// # Errors
+/// 已安装过来源时返回错误：静默替换会让「谁在提供密钥」变得不可知，
+/// 也会让已缓存真值的调用方读到不同来源。
 pub fn install_secret_source(source: Arc<dyn SecretSource>) -> Result<(), String> {
     STORED
         .set(source)
         .map_err(|_| "secret source already installed".to_string())
 }
 
+/// 取已安装的持久化来源（未安装时为 `None`）。
 fn stored() -> Option<&'static Arc<dyn SecretSource>> {
     STORED.get()
 }
@@ -69,6 +87,9 @@ pub fn list_secrets() -> Vec<(String, &'static str)> {
 
 /// 按名称取密钥真值：先查持久化来源（若有），回落环境变量。
 /// 不缓存（进程内可随时改，测试友好）。
+///
+/// 查找顺序是「stored 优先、env 兜底」：界面删除某个 stored 密钥后，
+/// 同名环境变量（若设过）重新生效——这也是删除操作的语义。
 pub fn get_secret(name: &str) -> Option<String> {
     if let Some(value) = stored().and_then(|s| s.get(name)) {
         return Some(value);
@@ -143,11 +164,13 @@ pub fn missing_secrets(definition: &Definition) -> Vec<(String, String)> {
     missing
 }
 
+/// 密钥取值与清单的不变量测试。
 #[cfg(test)]
 mod tests {
     use super::*;
 
     // 环境变量是进程全局状态：每个测试用独占名称，互不干扰。
+    /// 环境变量按名称取真值，取完即失效。
     #[test]
     fn get_secret_reads_env_by_name() {
         std::env::set_var("FLOW_SECRET_TEST_GET", "s3cret");
@@ -157,6 +180,7 @@ mod tests {
         assert_eq!(get_secret("TEST_DEFINITELY_MISSING"), None);
     }
 
+    /// 名称清单按字典序排列，且任何情况下都不含值。
     #[test]
     fn list_secret_names_sorted_without_values() {
         std::env::set_var("FLOW_SECRET_TEST_LIST_B", "v1");

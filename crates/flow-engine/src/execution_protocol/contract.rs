@@ -12,6 +12,11 @@
 //! `A_MAX` 不得用来论证主进程状态内存，`X_MAX` 不得用来论证审计吞吐。
 //! 在飞 run 状态数上限（`R_MAX`）是主进程状态内存约束、不是协议量，其
 //! 唯一定义与执行点在 `flow-backend`（`journal.rs::R_MAX`）。
+//!
+//! 为什么把这些数字集中冻结在一个文件：主进程与执行器是两个独立二进制，
+//! 它们对「一帧能有多大」「一条审计记录能有多大」「心跳多久」的认知必须
+//! 逐字节一致；任何一方的本地猜测都会变成「能编码但发不出」的窄带，
+//! 而这类故障在窗口/ACK 语义里表现为静默死锁。
 
 /// IPC/上联协议版本。单流帧 `u32 body_len | postcard(Message)`：旧版 JSON
 /// 信封、三种帧 kind、十进制字符串与 Channel 概念均已删除。版本门集中在
@@ -38,11 +43,18 @@ pub const CONTROL_TEXT_MAX: usize = 8 * 1024;
 
 /// 把控制帧里的自由文本截到 [`CONTROL_TEXT_MAX`]（保持 UTF-8 边界）。
 /// 超限时追加截断标记，便于排障时辨认。
+///
+/// 截断而非拒绝：错误文本长度由用户代码（JS 抛出的消息）控制，拒绝它
+/// 等于让一次普通失败把整条会话拖垮；但直接放行又会撑爆控制帧。
+/// 追加标记是必要的——没有标记就无法区分「错误消息本来就短」与
+/// 「被截断了」，排障会追错方向。
 pub fn bounded_control_text(mut text: String) -> String {
     if text.len() <= CONTROL_TEXT_MAX {
         return text;
     }
     let mut end = CONTROL_TEXT_MAX;
+    // 回退到 UTF-8 字符边界：按字节截断可能把多字节字符切成半个，
+    // 产生的字符串不是合法 UTF-8，进 postcard 编码会直接失败。
     while !text.is_char_boundary(end) {
         end -= 1;
     }
@@ -122,11 +134,16 @@ pub const EXECUTOR_BIN_NAME: &str = "flow-executor";
 /// 列表」的隐式传递。
 #[derive(Debug, Clone)]
 pub struct ExecutorInvocation {
+    /// 执行器可执行文件的路径。只带路径，不带参数：模式/诊断标记由
+    /// spawn 入口按调用点显式追加。
     pub program: std::path::PathBuf,
 }
 
 impl ExecutorInvocation {
     /// 显式指定的执行器二进制。
+    ///
+    /// 显式优先于任何自动定位：测试与多版本部署必须能钉死用哪个
+    /// 执行器，自动定位的兜底路径不应在这条路上生效。
     pub fn explicit(bin: impl Into<std::path::PathBuf>) -> Self {
         Self {
             program: bin.into(),
@@ -136,9 +153,14 @@ impl ExecutorInvocation {
     /// 执行器定位（I09）：[`EXECUTOR_BIN_ENV`] 显式路径优先；否则取当前
     /// 可执行文件同目录下的兄弟 [`EXECUTOR_BIN_NAME`]（部署形态：全部
     /// 产品二进制同目录分发）。找不到即报错，不静默回退进程内执行。
+    ///
+    /// 找不到就报错是刻意的：静默回退到进程内执行会让「执行器缺失」
+    /// 变成一次看似成功的运行，却丢掉了隔离、限额与审计边界。
     pub fn locate() -> Result<Self, String> {
+        // 环境变量优先：显式意图高于目录约定。
         if let Some(path) = std::env::var_os(EXECUTOR_BIN_ENV) {
             let path = std::path::PathBuf::from(path);
+            // 指定了却不是文件 = 配置错误，必须显式报出，不能继续找。
             if path.is_file() {
                 return Ok(Self::explicit(path));
             }

@@ -1,3 +1,17 @@
+//! JS 沙箱求值面：脚本、条件表达式与 `${}` 模板展开。
+//!
+//! 本模块负责一切「跑用户代码」的地方：把 JSON 注入沙箱、执行脚本或
+//! 表达式、把结果读回 JSON，并施加预算（堆、栈、输入/输出体积、嵌套
+//! 深度、超时）。
+//!
+//! 它守护的核心不变量有三条：
+//! ① **每次求值全新 Runtime**——节点之间零共享状态，决定论与隔离性
+//!    同时成立；② **出口语义对齐 JSON.stringify**——升级沙箱实现时行为
+//!    不漂移；③ **一切入口都有界**——深嵌套输入必须报错退出，不能打爆
+//!    宿主栈（abort 不可捕获）。
+//!
+//! 不这样做的代价：任一条失守都会变成「节点悄悄跑出了与预览不同的结果」
+//! 或「一个脚本把执行器进程带崩」，而执行器崩溃会连带影响同机的其它 run。
 use std::time::{Duration, Instant};
 
 use rquickjs::function::Func;
@@ -82,6 +96,10 @@ struct JsReader<'js> {
 }
 
 impl<'js> JsReader<'js> {
+    /// 捕获求值所需的沙箱内置对象。
+    ///
+    /// `Date` 构造函数与 BigInt 的 toString 被提前取出，避免在读回路径上
+    /// 反复做属性查找，也避免用户脚本覆盖全局 `Date` 后改变出口语义。
     fn new(ctx: &Ctx<'js>) -> Result<Self, rquickjs::Error> {
         Ok(Self {
             date_ctor: ctx.globals().get::<_, Object>("Date")?,
@@ -110,6 +128,11 @@ impl<'js> JsReader<'js> {
         ))
     }
 
+    /// 把一个 JS 值读回 JSON 值。
+    ///
+    /// 返回 `Ok(None)` 表示「该值不可序列化」（function/symbol/undefined），
+    /// 调用方据此丢弃该字段或置为 null——与 `JSON.stringify` 的行为一致。
+    /// 深度超限属于错误而非丢弃：那是恶意或失控的数据结构。
     fn to_json(
         &self,
         value: &JsValue<'js>,
@@ -190,7 +213,12 @@ impl<'js> JsReader<'js> {
             }
         }))
     }
+    /// 从输出预算里扣减 n 字节。
+    ///
+    /// 预算是「读回」侧的粗略计量：每个值记 8 字节，字符串与键另按长度
+    /// 扣。目的是在结果变大到不可接受之前就中止，而不是等序列化完再判体积。
     fn charge(&self, n: usize) -> Result<(), rquickjs::Error> {
+        // usize::MAX 是「未设预算」的哨兵值：无上限时不扣减，直接放行。
         if self.remaining.get() == usize::MAX {
             return Ok(());
         }
@@ -213,6 +241,9 @@ impl<'js> JsReader<'js> {
 /// 数据里的任意 JSON 键都会沉淀成原子——长生命周期进程下这是无界增长；
 /// 把整个 Runtime 从「盘古开天」重新实例化，换回来的正是这张表的清零。
 /// console.log → LogLevel 映射（与 Node 约定一致：error/warn 走 stderr）。
+/// 上面这段描述的是整个求值面的设计；下面两个函数是它的最小实现：
+/// 级别名 → [`LogLevel`]、级别名 → [`LogStream`]。分成两张表而不是一张，
+/// 因为「级别」与「去向」是两个独立维度（info 也可能需要走 stderr）。
 fn console_level(name: &str) -> LogLevel {
     match name {
         "debug" => LogLevel::Debug,
@@ -222,6 +253,10 @@ fn console_level(name: &str) -> LogLevel {
     }
 }
 
+/// console 级别名 → 输出流：warn/error 走 stderr，其余走 stdout。
+///
+/// 与 Node 的常规约定一致：把「需要人工看的」与「流水」分开，
+/// 采集端按流分开处理时无需再解析内容。
 fn console_stream(name: &str) -> LogStream {
     match name {
         "warn" | "error" => LogStream::Stderr,
@@ -229,21 +264,42 @@ fn console_stream(name: &str) -> LogStream {
     }
 }
 
+/// 录制运行（regression）用的确定性上下文：固定时钟与随机种子。
+///
+/// 回归要能重放同一条路径，就不能让 `Date.now()` 与 `Math.random()`
+/// 随真实时间变化——否则每次回归的节点输出都不同，基线无法比对。
 #[derive(Clone, Copy)]
 pub struct JsDeterminism {
+    /// 冻结的 Unix 毫秒时间戳，`Date.now()` 与无参 `new Date()` 都用它。
     pub clock_ms: i64,
+    /// 随机种子，决定 `Math.random()` 的序列。
     pub seed: u32,
 }
 
+/// 沙箱的资源预算集合。
+///
+/// 这是**单一定义处**：本地执行与远程执行共用同一组数字——否则会出现
+/// 「本机能跑、远程 OOM」这类无法复现的问题（DESIGN.md §10.1）。
 #[derive(Clone, Copy)]
 pub struct JsLimits {
+    /// 输入面总字节预算（input/nodes/tpl 三者共享）。
     pub input_bytes: usize,
+    /// QuickJS 堆上限。
     pub heap_bytes: usize,
+    /// 输出面字节预算。
     pub output_bytes: usize,
+    /// JSON 嵌套深度上限。
     pub depth: usize,
+    /// 确定性上下文；`None` 表示按真实时间/随机执行。
     pub determinism: Option<JsDeterminism>,
 }
+
+/// 默认预算：8 MiB 输入 / 32 MiB 堆 / 8 MiB 输出 / 深度 64。
+///
+/// 每一项都有界是刻意的——深嵌套与大对象在无界入口下会直接打爆原生栈
+/// 或宿主内存，而那类崩溃是不可捕获的 abort，只能靠预防。
 impl Default for JsLimits {
+    /// 返回默认预算（8 MiB 输入 / 32 MiB 堆 / 8 MiB 输出 / 深度 64）。
     fn default() -> Self {
         Self {
             input_bytes: 8 * 1024 * 1024,
@@ -255,6 +311,14 @@ impl Default for JsLimits {
     }
 }
 
+/// 统一的受限求值实现：所有求值入口（脚本、条件、模板）都走这里。
+///
+/// 流程固定为「预算校验 → 建 Runtime → 设内存/栈/超时 → 注入输入 →
+/// 执行 → 读回 → 复核输出体积」。每个求值都是全新的 Runtime，绝不复用。
+///
+/// # Errors
+/// 输入超预算、沙箱创建失败、脚本异常、超时、输出超预算或序列化失败时
+/// 返回 `EngineError::Expr`，消息面向用户可直接展示。
 fn run_js_limited(
     body: &str,
     input: &Value,
@@ -265,8 +329,12 @@ fn run_js_limited(
     limits: Option<JsLimits>,
 ) -> Result<Value, EngineError> {
     if let Some(limits) = limits {
+        // 输入面预算由 input/nodes/tpl 三者**共享**：三者都来自上游
+        // 数据，任意一个塞满预算都足以拖垮下游，所以是总账而非分账。
         let mut remaining = limits.input_bytes;
         for value in [input, nodes, tpl] {
+            // 先查深度再算体积：深链的体积可能不大，但序列化/转换仍会
+            // 递归爆栈，体积检查拦不住它。
             flow_journal::codec::validate_depth(value, 0)
                 .map_err(|e| EngineError::Expr(e.to_string()))?;
             let bytes = flow_journal::codec::bounded_json(value, remaining)
@@ -274,16 +342,24 @@ fn run_js_limited(
             remaining = remaining.saturating_sub(bytes.len());
         }
     }
+    // 每次求值新建 Runtime：原子表只增不复用，清零由「重新实例化」换来。
     let runtime = Runtime::new().map_err(|e| EngineError::Expr(e.to_string()))?;
     if let Some(limits) = limits {
         runtime.set_memory_limit(limits.heap_bytes);
+        // 栈上限 512 KiB：深层递归在 JS 侧表现为宿主栈溢出（abort，
+        // 不可捕获），只能在进沙箱前就限制住。
         runtime.set_max_stack_size(512 * 1024);
     }
+    // 超时用中断处理器实现：quickjs 会在字节码边界回调它，
+    // 长循环因此能被打断而不是把执行槽永久占住。
     let deadline = Instant::now() + timeout;
     runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() > deadline)));
 
     let context = Context::full(&runtime).map_err(|e| EngineError::Expr(e.to_string()))?;
 
+    // 用户代码包在两层函数里：内层执行 body，外层 try/catch 把 JS 异常
+    // 转成 {ok:false} 结构——异常是**业务失败**，不能让它以沙箱级错误
+    // 的面目出现（那会被误判成平台故障）。
     let program = format!(
         r#"(function () {{
   try {{
@@ -299,6 +375,9 @@ fn run_js_limited(
 
     let outcome = context.with(|ctx| -> Result<Result<Value, String>, rquickjs::Error> {
         let globals = ctx.globals();
+        // 录制（回归）模式：替换全局 Date 与 Math.random，使同一份代码
+        // 在任何时刻执行都得到同一结果。时间统一按 UTC 解释，避免机器
+        // 本地时区把基线与候选拉开。
         if let Some(recorded) = limits.and_then(|l| l.determinism) {
             let install = format!(r#"(function () {{
                 const NativeDate = Date, clock = {}, initialSeed = {};
@@ -343,6 +422,8 @@ fn run_js_limited(
         let define = ctx.eval::<Function, _>(
             "(function (o, k, v) { Object.defineProperty(o, k, { value: v, enumerable: true, writable: true, configurable: true }); })",
         )?;
+        // 沙箱里只有这三个全局是数据入口：脚本、模板与节点输出。刻意
+        // 不暴露别的宿主能力——没有文件、没有网络、没有 require。
         globals.set("input", json_to_js(&ctx, input, &define)?)?;
         globals.set("nodes", json_to_js(&ctx, nodes, &define)?)?;
         globals.set("tpl", json_to_js(&ctx, tpl, &define)?)?;
@@ -383,6 +464,8 @@ fn run_js_limited(
         let result: JsValue = ctx.eval(program)?;
         let outcome = result.get::<Object>()?;
         let mut reader = JsReader::new(&ctx)?;
+        // 读回前才装上输出预算与深度上限：读回路径没有预算就等于
+        // 「结果可以无限大」，那会在序列化阶段把执行器内存吃光。
         if let Some(limits)=limits {reader.remaining.set(limits.output_bytes);reader.max_depth=limits.depth;}
         if outcome.get::<_, bool>("ok")? {
             let value = outcome.get::<_, JsValue>("value")?;
@@ -394,6 +477,8 @@ fn run_js_limited(
     match outcome.map_err(|e| EngineError::Expr(e.to_string()))? {
         Ok(value) => {
             if let Some(limits) = limits {
+                // 读回预算只是粗略计量，最终体积以实际序列化字节为准：
+                // 读回侧记账宽松时，这里是最后一道闸门。
                 flow_journal::codec::bounded_json(&value, limits.output_bytes)
                     .map_err(|e| EngineError::Expr(e.to_string()))?;
             }
@@ -419,6 +504,13 @@ pub fn eval_body(
     eval_body_recorded(body, input, nodes, timeout, logger, None)
 }
 
+/// 脚本节点的录制变体：注入确定性时钟与随机种子后执行同一段 body。
+///
+/// 与 [`eval_body`] 的差别只有上下文（时间/随机），预算规则完全相同——
+/// 回归执行与正常执行走同一条路径，才能保证基线可信。
+///
+/// # Errors
+/// 同 [`eval_body`]。
 pub fn eval_body_recorded(
     body: &str,
     input: &Value,
@@ -483,6 +575,13 @@ pub fn expand_templates(
     expand_templates_impl(tpl, input, nodes, timeout, Some(JsLimits::default()))
 }
 
+/// 模板展开的录制变体：注入确定性上下文后再展开。
+///
+/// 与 [`expand_templates`] 的差别只有时钟/随机，展开规则完全一致——
+/// 回归时模板必须求值出与基线相同的结果，否则整条基线都会失配。
+///
+/// # Errors
+/// 同 [`expand_templates`]。
 pub fn expand_templates_recorded(
     tpl: &Value,
     input: &Value,
@@ -501,6 +600,14 @@ pub fn expand_templates_recorded(
         }),
     )
 }
+/// 模板展开的内部实现：展开逻辑写成一段 JS 在沙箱里跑。
+///
+/// 展开放在沙箱内而不是宿主侧逐值求值，是为了让 `${}` 里的表达式与
+/// 脚本节点、条件节点**用同一种语言**：用户在预览里写通的表达式，
+/// 到执行期必须得到同一个答案。
+///
+/// # Errors
+/// 模板表达式求值失败、展开结果超预算时返回 `EngineError::Expr`。
 fn expand_templates_impl(
     tpl: &Value,
     input: &Value,

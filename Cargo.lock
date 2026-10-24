@@ -1165,6 +1165,7 @@ dependencies = [
  "chrono",
  "conga",
  "conga-host",
+ "flow-config",
  "flow-engine",
  "flow-journal",
  "futures",

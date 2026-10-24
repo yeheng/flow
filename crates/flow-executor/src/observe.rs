@@ -12,6 +12,9 @@
 //!   会话）；
 //! - 单行超过预算：丢行并计数（NodeLogger 已把行截到 8 KiB，这一条只是
 //!   防御性兜底）。
+//!
+//! 不变量：观测可丢，审计不可丢。因此本模块的一切背压/丢弃路径都不
+//! 影响审计流，也绝不以阻塞用户代码的方式实现。
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -45,6 +48,9 @@ pub struct ObservationClose {
 impl ObservationClose {
     /// 等转发任务排空退出。带超时防御：若有 logger 克隆泄漏，转发任务
     /// 永远等不到通道关闭；超时后 abort 并等待任务退出，关闭观测入口。
+    ///
+    /// 必须调用：尾批要在 Result 控制帧之前入队，否则会被下一个派发
+    /// 错认领（顺序契约见 [`ObservationClose`] 的类型文档）。
     pub async fn close(mut self) {
         if tokio::time::timeout(std::time::Duration::from_millis(500), &mut self.join)
             .await
@@ -59,6 +65,9 @@ impl ObservationClose {
 impl ObservationBridge {
     /// 启动有界非阻塞日志入口，按容量、100 ms 周期或关闭发送观测批次。
     /// 入口与出站超限都丢弃并计数，不阻塞执行。
+    ///
+    /// 返回三元组：logger（写日志）、丢弃计数（诊断）、收尾句柄（必须
+    /// 在发 Result 前 close）。
     pub fn start(
         dispatch_id: String,
         outbound: mpsc::Sender<Message>,
@@ -74,12 +83,16 @@ impl ObservationBridge {
             let mut lines: Vec<ObservationLine> = Vec::new();
             let mut batch_bytes = 0usize;
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+            // Skip：积压时跳过错过的 tick，而不是补发——观测是尽力而为
+            // 的叙事，补发只会放大延迟。
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             tick.tick().await;
             loop {
                 let maybe_line = tokio::select! {
                     line = rx.recv() => line,
                     _ = tick.tick() => {
+                        // 周期兜底：即使日志稀疏也要定期发出已积累的行，
+                        // 否则叙事会一直卡在缓冲里。
                         flush(&forward_outbound, &forward_loss, &forward_dispatch, &mut lines);
                         batch_bytes = 0;
                         continue;
@@ -87,6 +100,7 @@ impl ObservationBridge {
                 };
                 match maybe_line {
                     None => {
+                        // 入口关闭：这是最后一次 flush，尾批必须在这里送出。
                         flush(
                             &forward_outbound,
                             &forward_loss,
@@ -110,6 +124,8 @@ impl ObservationBridge {
                         if lines.len() >= OBSERVABILITY_BATCH_LINES
                             || batch_bytes + estimated > OBSERVABILITY_BATCH_BYTES
                         {
+                            // 批预算到顶先发一批：保证编码后的帧不会超出
+                            // DATA_MAX_FRAME，也避免无限攒批。
                             flush(
                                 &forward_outbound,
                                 &forward_loss,
@@ -138,6 +154,8 @@ impl ObservationBridge {
 }
 
 /// 发一批：观测永不反压、永不弑会话——队列满/关闭都按丢弃计数处理。
+///
+/// `try_send` 而非 `send`：观测不构成背压通道，队列满就丢整批。
 fn flush(
     outbound: &mpsc::Sender<Message>,
     loss: &ObservationLoss,
@@ -182,9 +200,11 @@ fn escaped_estimate(message: &str) -> usize {
         .bytes()
         .filter(|byte| matches!(byte, b'"' | b'\\' | 0x00..=0x1f))
         .count();
+    // +5 而不是 +6：原字节已被 len() 计过一次，追加的是替换增量。
     message.len() + escapes * 5
 }
 
+/// 日志级别名（观测帧的 wire 字面量，冻结）。
 fn level_name(level: LogLevel) -> &'static str {
     match level {
         LogLevel::Error => "error",
@@ -194,6 +214,7 @@ fn level_name(level: LogLevel) -> &'static str {
     }
 }
 
+/// 流名（观测帧的 wire 字面量，冻结）。
 fn stream_name(stream: LogStream) -> &'static str {
     match stream {
         LogStream::Stdout => "stdout",
@@ -214,6 +235,7 @@ pub fn dropped(loss: &ObservationLoss) -> (u64, u64) {
 mod tests {
     use super::*;
 
+    /// 稀疏日志也要在 logger 存活期间被周期发出。
     #[tokio::test]
     async fn sparse_logs_flush_while_logger_is_alive() {
         let (tx, mut rx) = mpsc::channel(8);
@@ -228,6 +250,7 @@ mod tests {
         close.close().await;
     }
 
+    /// 转发侧堵死时入口容量有界，丢弃被计数而不是无界排队。
     #[tokio::test]
     async fn stalled_forwarder_has_bounded_ingress_and_counts_loss() {
         let (tx, _rx) = mpsc::channel(1);

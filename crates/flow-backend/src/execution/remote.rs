@@ -1,9 +1,28 @@
 //! 远程 agent 管理器（三期 §1.2/§1.3/§1.4）：mTLS 上联、路由包络校验、
 //! BindExecutor 归属、Resume 裁决与有界公平转发。
 //!
+//! 远程 agent 管理器（三期 §1.2/§1.3/§1.4）：mTLS 上联、路由包络校验、
+//! BindExecutor 归属、Resume 裁决与有界公平转发。
+//!
 //! 主进程保持唯一提交者：AuditAck/OperationPermit/ResultCommitted 只能由
 //! 主进程权威产生后经 agent 转发；agent 中继不生成确认。所有持久事实仍
 //! 走一期/二期的 journal 单行事务。
+//!
+//! 职责边界：本模块管的是「主进程 ↔ agent 的上联链路」——谁能连上来、
+//! 一条派发归属哪个执行器、断线后如何对账、以及链路上的流量如何被
+//! 有界地转发。节点语义与审计/结果编排仍在 dispatch。
+//!
+//! 守护的核心不变量：
+//! 1. 路由权只来自已确认的绑定关系——执行器与 agent 都不能自报机器身份
+//!    来获得路由权（包络三重身份逐项校验）。
+//! 2. 断线不重跑——重连后只有通过 Resume 对账的派发才允许继续；boot
+//!    变化、数据缺口、结果未知一律进人工核对（ReconcileRequired）。
+//! 3. 链路上的流量必须有界——出站积压、入站队列、并发会话数、窗口
+//!    预算都有上限，任何一端停读都不能把主进程拖死。
+//!
+//! 为什么需要它：算力可以横向扩展（agent），但权威与提交点只有一份
+//! （C5）。这条链路因此必须把「远端算力」接进「本地权威日志」，而接法
+//! 决定了崩溃恢复时能不能判定外部副作用到底有没有发生。
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -31,15 +50,24 @@ use crate::execution::ToSession;
 use crate::journal::JournalBackend;
 
 type Result<T> = std::result::Result<T, flow_journal::Error>;
+/// 把一条诊断信息包装成 journal 层错误。
 fn invalid(s: impl Into<String>) -> flow_journal::Error {
     flow_journal::Error::Invalid(s.into())
 }
 
 type BoxedStream = Pin<Box<dyn AsyncReadWrite + Send>>;
 
+/// 上下行字节流（TLS / WSS / 内存管道）的统一抽象。
+///
+/// 远程会话只要求「可读写 + 可移动 + 可跨线程」；把这条要求抽成 trait
+/// 是为了让 TLS 流、WS 流和测试用内存流走同一条会话代码路径。
 pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Unpin> AsyncReadWrite for T {}
 
+/// 判断一个派发错误是否属于「链路死亡」（可由远程 Resume 恢复）。
+///
+/// 只有这一类错误允许挂起等待重连：其余错误（协议违规、数据非法、
+/// 落盘失败）重连后同样会失败，挂起等待只会把失败拖成超时。
 pub(crate) fn is_link_dead(error: &crate::journal::JournalError) -> bool {
     matches!(error, crate::journal::JournalError::LinkClosed(_))
 }
@@ -50,26 +78,37 @@ pub(crate) fn is_link_dead(error: &crate::journal::JournalError) -> bool {
 /// token 直接决定身份，而不是让客户端填一张没人验的表。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentCredential {
+    /// agent 标识（与 mTLS 路径的证书 CN 同名空间）。
     pub id: String,
+    /// 接入令牌：持有它即取得该 agent 身份。
     pub token: String,
 }
 
+/// 远程执行模式的连接参数。
 #[derive(Debug, Clone)]
 pub struct RemoteOptions {
+    /// mTLS 控制监听地址（host:port）。
     pub control_addr: String,
+    /// 客户端证书校验用的 CA PEM 路径。
     pub ca_cert: PathBuf,
+    /// 服务端证书 PEM 路径。
     pub server_cert: PathBuf,
+    /// 服务端私钥 PEM 路径。
     pub server_key: PathBuf,
-    // 断链后等待 agent 重连对账的总时限（超时按派发失败处理）。
+    /// 断链后等待 agent 重连对账的总时限（超时按派发失败处理）。
     pub attach_timeout_ms: u64,
-    // WSS 接入监听地址（T13，代理终止 TLS 场景的附加承载）；缺省关闭。
+    /// WSS 接入监听地址（T13，代理终止 TLS 场景的附加承载）；缺省关闭。
     pub wss_addr: Option<String>,
-    // WSS 凭据映射表（token → agent_id）：身份由凭证反查，客户端自报头
-    // 仅作一致性断言（见 [`authenticate_wss`]）。与 wss_addr 成对配置。
+    /// WSS 凭据映射表（token → agent_id）：身份由凭证反查，客户端自报头
+    /// 仅作一致性断言（见 [`authenticate_wss`]）。与 wss_addr 成对配置。
     pub wss_agents: Vec<AgentCredential>,
 }
 
 impl RemoteOptions {
+    /// 对账等待时长（下限 1s）。
+    ///
+    /// 下限存在的原因：过短的超时会让「agent 刚重启、马上回来」也变成
+    /// 派发失败，用户会看到毫无规律的间歇性失败。
     pub fn attach_timeout(&self) -> Duration {
         Duration::from_millis(self.attach_timeout_ms.max(1_000))
     }
@@ -80,18 +119,23 @@ impl RemoteOptions {
 /// 另受同一数量上限约束，同身份重连可替换旧会话。超限关闭后由 agent 退避。
 pub const MAX_AGENT_SESSIONS: usize = 256;
 
-// mTLS：验证 agent 客户端证书。
+/// mTLS 服务端：验证 agent 客户端证书。
 pub struct TlsServer {
+    /// 已配置好客户端证书校验器的 acceptor。
     pub acceptor: TlsAcceptor,
 }
 
-// 安装进程级 CryptoProvider（多 crate 启用不同 provider 时必须显式选择；
-// 幂等，重复安装忽略）。
+/// 安装进程级 CryptoProvider（多 crate 启用不同 provider 时必须显式选择；
+/// 幂等，重复安装忽略）。
 pub fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 impl TlsServer {
+    /// 从 PEM 文件构造 mTLS 服务端配置。
+    ///
+    /// 证书/私钥/CA 全部来自文件路径——它们是部署产物，不该被编译进二进制
+    /// 或塞进配置字符串。
     pub fn from_files(
         ca: &std::path::Path,
         cert: &std::path::Path,
@@ -104,6 +148,10 @@ impl TlsServer {
         )
     }
 
+    /// 从 PEM 内容构造 mTLS 服务端配置。
+    ///
+    /// 客户端证书校验是**强制**的：agent 的身份来自证书 CN，不接受「无证书
+    /// 但自报身份」的连接——否则路由信任链的第一环就断了。
     pub fn from_pem(ca: &[u8], cert: &[u8], key: &[u8]) -> std::io::Result<Self> {
         use rustls_pemfile::{certs, private_key};
         use std::io::Cursor;
@@ -117,6 +165,8 @@ impl TlsServer {
                 .map_err(bad_data)?;
         }
         if roots.is_empty() {
+            // 空 CA 根库 = 任何客户端证书都验不过；早失败比运行时逐个连接
+            // 被拒更容易定位。
             return Err(bad_data("CA PEM contains no certificates"));
         }
         let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
@@ -141,6 +191,7 @@ impl TlsServer {
     }
 }
 
+/// 把任意可显示错误包装成「配置/数据非法」类 IO 错误。
 fn bad_data<E: std::fmt::Display>(e: E) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
 }
@@ -155,7 +206,10 @@ fn unauthorized() -> tokio_tungstenite::tungstenite::handshake::server::ErrorRes
     response
 }
 
-// 提取证书 CN（TLS 身份映射 agent_id；不信客户端自报字段）。
+/// 提取证书 CN（TLS 身份映射 agent_id；不信客户端自报字段）。
+///
+/// 只取 subject 里的第一个 CN 且要求整段 DER 恰好是一张证书（`rest` 必须
+/// 为空）——不完整的解析结果不能用来映射身份。
 pub fn cert_common_name(der: &[u8]) -> Option<String> {
     use x509_parser::prelude::FromDer;
     let (rest, cert) = x509_parser::certificate::X509Certificate::from_der(der).ok()?;
@@ -171,57 +225,76 @@ pub fn cert_common_name(der: &[u8]) -> Option<String> {
     cn
 }
 
-// attach 等待的裁决结果。
+/// attach 等待的裁决结果。
 pub(crate) enum AttachOutcome {
-    // agent 会话活跃：给出可驱动链路。
+    /// agent 会话活跃：给出可驱动链路。
     Link(DispatchLink),
-    // 结果已在权威日志（AlreadyCommitted）。
+    /// 结果已在权威日志（AlreadyCommitted）。
     Committed,
-    // 取消/废止（CancelAndDrain）。
+    /// 取消/废止（CancelAndDrain）。
     Cancelled(String),
-    // 执行器丢失/boot 变化/缺数据（ReconcileRequired 或 agent 未上报）。
+    /// 执行器丢失/boot 变化/缺数据（ReconcileRequired 或 agent 未上报）。
     Lost(String),
 }
 
-// 会话侧持有的路由（dispatch → 事件通道）。
+/// 会话侧持有的路由（dispatch → 事件通道）。
 struct SessionRouting {
+    /// 该派发的路由包络（出站时用它包裹业务帧，入站时用它校验来源）。
     envelope: RouteEnvelope,
+    /// 派发侧事件通道的发送端（入站帧按派发分发到这里）。
     events: mpsc::Sender<crate::execution::FromSession>,
 }
 
-// 跨会话存活的派发绑定。
+/// 跨会话存活的派发绑定。
+///
+/// 绑定在「链路断开」期间依然存在：它占着 agent 的一枚槽位、记录着该
+/// 派发归属哪个执行器，是断线后对账（Resume）与恢复驱动的锚点。
 struct BoundDispatch {
+    /// 归属 agent 标识。
     agent_id: String,
-    // The binding itself reserves one slot, including while disconnected.
+    /// 绑定建立时所在的会话标识。
+    /// The binding itself reserves one slot, including while disconnected.
     link_session_id: String,
+    /// 绑定到该派发的执行器标识。
     executor_id: String,
+    /// 执行器本次启动标识（BindExecutorAck 到达后才有值）。
     executor_boot_id: Mutex<Option<String>>,
+    /// 所属 run 标识（对账时定位 journal 事实）。
     run_id: String,
+    /// 所属节点标识（对账时定位节点事实）。
     node_id: String,
-    // 活跃链路（等待被 dispatcher 取走驱动）。
+    /// 活跃链路（等待被 dispatcher 取走驱动）。
     pending_link: Mutex<Option<DispatchLink>>,
+    /// 终局裁决（Committed / Cancelled / Lost）。
     verdict: Mutex<Option<AttachOutcome>>,
+    /// 唤醒等待者（链路就绪或裁决产生时）。
     notify: Notify,
 }
 
+/// 一个已认证 agent 会话的注册记录。
 struct AgentRegistration {
+    /// agent 标识。
     agent_id: String,
+    /// 本次上联会话标识（重连会换新值，旧会话因此可被识别为过期）。
     link_session_id: String,
+    /// 派发方 → agent 的命令通道。
     outbound: mpsc::Sender<ToSession>,
+    /// agent 报告的受控执行槽位总数（候选选择的上限依据）。
     slots_total: AtomicU64,
     /// Drain 在 master 侧同步打标：候选选择只看本标志，不依赖 agent 回 ack
     /// 的时序——否则 drain 中（slots 已回收、used=0）的 agent 反而最优先被
     /// 选中，bind 被 agent 拒绝后整节点失败。
     draining: AtomicBool,
+    /// 该会话的取消令牌：会话替换或关停时触发。
     cancel: tokio_util::sync::CancellationToken,
 }
 
-// Agent 管理器：上联会话注册表 + 全局 A_max 准入 + Resume 裁决。
-//
-// 锁序（禁止逆序获取）：agents → bindings → BoundDispatch 内部锁
-// （executor_boot_id / pending_link / verdict）。pending_binds 独立、不参与嵌套。
-// 现有代码在持 bindings 时会 await 单个绑定自己的内部锁——新增代码不得
-// 引入相反顺序（内部锁 → bindings/agents，或跨绑定取锁），否则死锁。
+/// Agent 管理器：上联会话注册表 + 全局 A_max 准入 + Resume 裁决。
+///
+/// 锁序（禁止逆序获取）：agents → bindings → BoundDispatch 内部锁
+/// （executor_boot_id / pending_link / verdict）。pending_binds 独立、不参与嵌套。
+/// 注册表内先 clone Arc，再释放注册表锁、访问绑定内部锁或发送消息。
+/// agents → bindings 仅用于原子分配槽位；不持注册表锁等待绑定或网络。
 pub struct AgentManager {
     backend: Arc<JournalBackend>,
     journal_id: String,
@@ -237,7 +310,11 @@ pub struct AgentManager {
     tasks: tokio_util::task::TaskTracker,
 }
 
-// Bind acknowledgement identity must match the current agent session.
+/// Bind acknowledgement identity must match the current agent session.
+///
+/// 绑定的在途状态：binder 等待确认期间，ack 通过 oneshot 回传；会话身份
+/// 三元组（agent_id / link_session_id / executor_id）必须与发起时一致，
+/// 否则说明确认来自另一个会话或已被替换的绑定。
 struct PendingBind {
     agent_id: String,
     link_session_id: String,
@@ -247,6 +324,10 @@ struct PendingBind {
 }
 
 impl AgentManager {
+    /// 新建 agent 管理器。
+    ///
+    /// 全局准入信号量按 A_max 建立：它是「同时在飞的活跃派发」上界，与
+    /// 本机的 X_max（执行进程数）是两个不同的量，不可互相代用。
     pub fn new(backend: Arc<JournalBackend>, journal_id: String, master_epoch: u64) -> Arc<Self> {
         Arc::new(Self {
             backend,
@@ -264,13 +345,13 @@ impl AgentManager {
         })
     }
 
-    // 全局活跃派发准入（A_max）。
+    /// 全局活跃派发准入（A_max）。
     pub(crate) fn global_slots(&self) -> &Arc<Semaphore> {
         &self.global
     }
 
-    // TLS 监听入口（真实网络）。单条 mTLS 连接承载整条上联（单流帧：
-    // 一帧一形态，变体索引即帧类型），不再有第二条 data 连接。
+    /// TLS 监听入口（真实网络）。单条 mTLS 连接承载整条上联（单流帧：
+    /// 一帧一形态，变体索引即帧类型），不再有第二条 data 连接。
     pub async fn listen_tls(self: &Arc<Self>, options: RemoteOptions) -> Result<()> {
         install_crypto_provider();
         let tls =
@@ -412,7 +493,10 @@ impl AgentManager {
         Ok(())
     }
 
-    // R0 模拟中继入口：直接注入单流（无 TLS；身份由注入方保证）。
+    /// R0 模拟中继入口：直接注入单流（无 TLS；身份由注入方保证）。
+    ///
+    /// 仅供进程内模拟与测试使用——它绕过 mTLS/WSS 的身份验证，因此绝不能
+    /// 出现在对外可达的部署路径上。
     pub async fn attach_inprocess(
         self: &Arc<Self>,
         agent_id: String,
@@ -421,6 +505,10 @@ impl AgentManager {
         self.inject_stream(agent_id, Box::pin(stream)).await;
     }
 
+    /// 把一条已认证的字节流交给会话任务处理。
+    ///
+    /// 会话在独立任务里跑：一条 agent 上联不能阻塞监听循环，否则一条慢
+    /// 连接就能拖住所有 agent 的接入。
     async fn inject_stream(self: &Arc<Self>, agent_id: String, stream: BoxedStream) {
         let manager = self.clone();
         let agent_id = agent_id.clone();
@@ -434,10 +522,13 @@ impl AgentManager {
         });
     }
 
-    // agent 上联握手（T02）：AgentHello（版本门）→ 校验 → AgentWelcome。
-    // 与执行器握手同样的「明确拒绝，不降级」：postcard 变体索引是位置
-    // 编码，跨版本配对会静默错解成另一个消息类型，版本不匹配在握手处
-    // 显式拒绝并断链（错误信息含双方版本号）。
+    /// agent 上联握手（T02）：AgentHello（版本门）→ 校验 → AgentWelcome。
+    /// 与执行器握手同样的「明确拒绝，不降级」：postcard 变体索引是位置
+    /// 编码，跨版本配对会静默错解成另一个消息类型，版本不匹配在握手处
+    /// 显式拒绝并断链（错误信息含双方版本号）。
+    ///
+    /// 返回 `(agent_boot_id, slots, link_session_id)`：前者用于包络校验，
+    /// 后者分别是 agent 的槽位数与本次上联会话标识。
     async fn session_handshake(
         self: &Arc<Self>,
         transport: &mut FrameTransport,
@@ -500,8 +591,11 @@ impl AgentManager {
         Ok((agent_boot_id, slots, link_session_id))
     }
 
-    // 单个 agent 会话（T02）：握手与业务帧共用同一条 transport
-    //（单流：无需第二条连接与 DataBind）。
+    /// 单个 agent 会话（T02）：握手与业务帧共用同一条 transport
+    /// （单流：无需第二条连接与 DataBind）。
+    ///
+    /// 会话是「一条上联」的全部生命：注册 → 收发 → 注销。断链时它不负责
+    /// 恢复——恢复由 Resume 对账在重连后的新会话里完成。
     async fn run_session(
         self: &Arc<Self>,
         agent_id: String,
@@ -517,6 +611,8 @@ impl AgentManager {
                 result.map_err(|_| "agent handshake deadline exceeded".to_string())??,
         };
         // 3) 注册会话（替换旧会话：旧 outbound 关闭 → 相关 runner link-dead）。
+        // 出站命令队列 256：够吸收一次派发的控制帧与 Resume 批次；有界，
+        // 背压以「发送方 await 阻塞」的形式暴露，而不是丢帧。
         let (outbound, mut commands) = mpsc::channel::<ToSession>(256);
         let registration = Arc::new(AgentRegistration {
             agent_id: agent_id.clone(),
@@ -528,12 +624,16 @@ impl AgentManager {
         });
         let previous = {
             let mut agents = self.agents.lock().await;
+            // 上限只对「新身份」生效：同身份重连是替换而不是新增，否则
+            // agent 重启一次就会撞上会话数上限。
             if agents.len() >= MAX_AGENT_SESSIONS && !agents.contains_key(&agent_id) {
                 return Err("authenticated agent session limit reached".into());
             }
             agents.insert(agent_id.clone(), registration.clone())
         };
         if let Some(previous) = previous {
+            // 替换旧会话：取消旧会话令牌 → 旧会话退出 → 挂在旧链路上的
+            // runner 收到 link-dead，转入 Resume 对账而不是直接失败。
             previous.cancel.cancel();
             tracing::info!(%agent_id, "agent reconnected; old uplink replaced");
         }
@@ -550,6 +650,8 @@ impl AgentManager {
         ));
         liveness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Bounded receipts absorb in-flight duplicates after the live route is released.
+        // 保留已释放路由的回执：链路释放后仍可能收到在途的重复结果帧，
+        // 需要据此补发原提交确认（而不是当成错路由拒绝掉）。
         let mut completed: std::collections::VecDeque<(RouteEnvelope, Option<String>)> =
             Default::default();
         let mut resume_items = Vec::new();
@@ -590,6 +692,8 @@ impl AgentManager {
                                 if let Message::ResultCommitted { dispatch_id, result_id } = &*message {
                                     if let Some(route) = routings.remove(dispatch_id) {
                                         completed.push_back((route.envelope, Some(result_id.clone())));
+                                        // 有界回执表上限 256：超出丢最旧的一条——迟到的重复
+                                        // 回执价值最低，而无界表会随派发量无限增长。
                                         if completed.len() > 256 { completed.pop_front(); }
                                     }
                                 }
@@ -673,6 +777,8 @@ impl AgentManager {
                                     ));
                                 };
                                 let Some(routing) = routings.get(&dispatch_id) else {
+                                    // 路由已释放但派发确实完成过：补发原提交确认，
+                                    // 让执行器知道结果已被权威日志接纳（幂等重放）。
                                     if let Some((previous, result_id)) = completed.iter().find(|(previous, _)| previous == &envelope) {
                                         if let (Some(result_id), Message::Result { result_id: id, .. }) = (result_id, &*inner) {
                                             if id == result_id
@@ -693,6 +799,8 @@ impl AgentManager {
                                     ));
                                 };
                                 if envelope.executor_boot_id != routing.envelope.executor_boot_id {
+                                    // 执行器换了任期：这一份执行事实与之前不是
+                                    // 同一份，必须拒绝而不是当成重传。
                                     return Err("executor boot mismatch in envelope".into());
                                 }
                                 // Correctness frames cannot be dropped, and a slow runner
@@ -909,13 +1017,21 @@ impl AgentManager {
         result
     }
 
+    /// 记录某个派发已绑定到的执行器启动标识。
+    ///
+    /// 该标识是 Resume 对账的判据：boot 不同就意味着「不是同一份执行
+    /// 事实」，必须走人工核对而不是续跑。
     async fn note_bound(&self, dispatch_id: &str, executor_boot_id: String) {
-        if let Some(bound) = self.bindings.lock().await.get(dispatch_id) {
+        let bound = self.bindings.lock().await.get(dispatch_id).cloned();
+        if let Some(bound) = bound {
             *bound.executor_boot_id.lock().await = Some(executor_boot_id);
         }
     }
 
-    // Resume 裁决（三期 §1.4 表）：以主日志为准，不信 agent 自报游标。
+    /// Resume 裁决（三期 §1.4 表）：以主日志为准，不信 agent 自报游标。
+    ///
+    /// 逐项裁决而不是整体裁决：agent 一次可能上报多个派发，其中有的可
+    /// 续跑、有的必须取消——整体裁决会把可恢复的一起拖死。
     async fn adjudicate_resume(&self, agent_id: &str, items: &[ResumeItem]) -> Vec<ResumeDecision> {
         let bindings = self.bindings.lock().await.clone();
         let mut decisions = Vec::new();
@@ -939,7 +1055,10 @@ impl AgentManager {
         decisions
     }
 
-    // 写入终局裁决，保留到 dispatcher 取走并释放绑定。
+    /// 写入终局裁决，保留到 dispatcher 取走并释放绑定。
+    ///
+    /// 只写第一次：后来的裁决不得覆盖已定的结论，否则「先 Lost 后
+    /// Committed」这类竞态会让派发结果取决于谁最后说话。
     async fn resolve_binding(&self, dispatch_id: &str, outcome: AttachOutcome) {
         let binding = self.bindings.lock().await.get(dispatch_id).cloned();
         if let Some(binding) = binding {
@@ -952,7 +1071,10 @@ impl AgentManager {
         }
     }
 
-    // resume 清单未上报的该 agent 绑定 → Lost（执行器已死/失联）。
+    /// resume 清单未上报的该 agent 绑定 → Lost（执行器已死/失联）。
+    ///
+    /// 「没上报」本身就是证据：清单是 agent 的全量未决任务声明，缺项
+    /// 意味着该派发在 agent 侧已不存在——不能默认它还在跑。
     async fn mark_unreported_lost(
         &self,
         agent_id: &str,
@@ -961,7 +1083,7 @@ impl AgentManager {
     ) {
         let reported: std::collections::BTreeSet<&str> =
             items.iter().map(|item| item.dispatch_id.as_str()).collect();
-        let bindings = self.bindings.lock().await;
+        let bindings = self.bindings.lock().await.clone();
         let lost: Vec<_> = bindings
             .iter()
             .filter(|(id, bound)| {
@@ -984,7 +1106,10 @@ impl AgentManager {
         }
     }
 
-    // 为 resume 中可继续的项建立新链路并唤醒等待的 dispatcher。
+    /// 为 resume 中可继续的项建立新链路并唤醒等待的 dispatcher。
+    ///
+    /// 新链路的包络用**绑定记录里的**执行器身份重建（不采信 agent 上报
+    /// 的身份）：路由权只来自已确认的绑定关系。
     #[allow(clippy::too_many_arguments)]
     async fn attach_resumed(
         &self,
@@ -1030,7 +1155,10 @@ impl AgentManager {
         }
     }
 
-    // 绑定一个派发到某 agent 的本地执行器（BindExecutor → 确认）。
+    /// 绑定一个派发到某 agent 的本地执行器（BindExecutor → 确认）。
+    ///
+    /// 返回该派发的事件接收端；绑定失败（agent 拒绝、超时、会话被替换）
+    /// 时返回错误，调用方据此放弃这次派发。
     pub(crate) async fn bind_executor(
         self: &Arc<Self>,
         dispatch_id: String,
@@ -1049,9 +1177,12 @@ impl AgentManager {
             let pick = agents
                 .values()
                 .filter_map(|agent| {
+                    // 正在 drain 的 agent 不再接新派发。
                     if agent.draining.load(Ordering::Acquire) {
                         return None;
                     }
+                    // 已用槽位 = 绑定数（含断线期间仍占用的绑定）：断线的
+                    // 绑定仍占槽，否则重连风暴会瞬间超配 agent 的执行器数。
                     let used = bindings
                         .values()
                         .filter(|bound| bound.agent_id == agent.agent_id)
@@ -1059,6 +1190,8 @@ impl AgentManager {
                     (used < agent.slots_total.load(Ordering::Relaxed) as usize)
                         .then_some((used, agent.clone()))
                 })
+                // 选当前最空闲的 agent：先少后多，把负载摊平，避免一个
+                // agent 吃满而其他闲置。
                 .min_by_key(|(used, _)| *used);
             if let Some((_, agent)) = pick {
                 let executor_id = format!(
@@ -1094,6 +1227,8 @@ impl AgentManager {
         let (registration, executor_id) = registration;
         let (events, rx) = mpsc::channel(256);
         let (ack_tx, ack_rx) = oneshot::channel();
+        // 在途绑定登记：会话侧收到 BindExecutorAck 时按 dispatch_id 找回
+        // 这条记录（含事件通道与 ack 回传口）。
         self.pending_binds.lock().await.insert(
             dispatch_id.clone(),
             PendingBind {
@@ -1109,8 +1244,12 @@ impl AgentManager {
                 result = registration.outbound.send(ToSession::Send(Box::new(Message::BindExecutor { executor_id, dispatch_id: dispatch_id.clone() }))) => {
                     result.map_err(|_| invalid("agent session closed before bind"))?;
                 }
+                // 会话被替换（同身份重连）时本次绑定作废——旧会话的确认
+                // 不再能代表当前会话的执行器。
                 _ = registration.cancel.cancelled() => return Err(invalid("agent session replaced before bind")),
             }
+            // 确认超时 = 4 × STARTUP_TIMEOUT_MS：agent 侧还要 spawn 执行器
+            // 并完成它自己的握手，这段耗时叠加在链路往返之上。
             tokio::time::timeout(Duration::from_millis(STARTUP_TIMEOUT_MS * 4), ack_rx).await
                 .map_err(|_| invalid("agent bind acknowledgement timeout"))?
                 .map_err(|_| invalid("agent bind acknowledgement lost"))??;
@@ -1122,7 +1261,11 @@ impl AgentManager {
         result
     }
 
-    // 取走绑定的活跃链路；无则等待重连裁决（Resume）或超时。
+    /// 取走绑定的活跃链路；无则等待重连裁决（Resume）或超时。
+    ///
+    /// 三种出口互斥：拿到链路（继续驱动）、拿到裁决（终局）、超时
+    /// （失联）。等待期间不持任何注册表锁——否则一个慢 agent 会把整个
+    /// 注册表堵死。
     pub(crate) async fn wait_attach(
         self: &Arc<Self>,
         dispatch_id: &str,
@@ -1150,15 +1293,18 @@ impl AgentManager {
         }
     }
 
-    // 派发结束：解除绑定并通知 agent 取消残留执行（若非正常完成）。
+    /// 派发结束：解除绑定并通知 agent 取消残留执行（若非正常完成）。
+    ///
+    /// healthy=false 时才发 Cancel：正常完成说明结果已被权威日志接纳，
+    /// 再发取消只会让 agent 去杀一个已经完成的任务。
     pub(crate) async fn unbind(self: &Arc<Self>, dispatch_id: &str, healthy: bool) {
         self.pending_binds.lock().await.remove(dispatch_id);
         let binding = self.bindings.lock().await.remove(dispatch_id);
         self.capacity_changed.notify_waiters();
         if let Some(binding) = binding {
             if !healthy {
-                if let Some(registration) = self.agents.lock().await.get(&binding.agent_id).cloned()
-                {
+                let registration = self.agents.lock().await.get(&binding.agent_id).cloned();
+                if let Some(registration) = registration {
                     let _ = registration
                         .outbound
                         .send(ToSession::CancelDispatch(dispatch_id.to_string()))
@@ -1168,8 +1314,8 @@ impl AgentManager {
         }
     }
 
-    // 取绑定 agent 当前会话的 outbound（会话已死时返回死通道：发送立即
-    // 失败 → runner 走 link-dead → 等待重连裁决）。
+    /// 取绑定 agent 当前会话的 outbound（会话已死时返回死通道：发送立即
+    /// 失败 → runner 走 link-dead → 等待重连裁决）。
     pub(crate) async fn active_outbound(&self, dispatch_id: &str) -> mpsc::Sender<ToSession> {
         let binding = self.bindings.lock().await.get(dispatch_id).cloned();
         if let Some(binding) = binding {
@@ -1180,14 +1326,21 @@ impl AgentManager {
         dead_to_session()
     }
 
-    // 发送 drain：agent 停止接新派发、取消在飞、转发最后确认后退出
-    // （三期 §1.6）。
+    /// 发送 drain：agent 停止接新派发、取消在飞、转发最后确认后退出
+    /// （三期 §1.6）。
+    ///
+    /// draining 标志在 master 侧先置位再发命令：候选选择只看这个标志，
+    /// 不等 agent 回 ack——否则 drain 中的 agent 反而会被优先选中。
     pub async fn drain(&self, agent_id: &str, grace_ms: u64) -> Result<()> {
-        let agents = self.agents.lock().await;
-        let registration = agents
-            .get(agent_id)
-            .ok_or_else(|| invalid(format!("agent {agent_id} not connected")))?;
-        registration.draining.store(true, Ordering::Release);
+        let registration = {
+            let agents = self.agents.lock().await;
+            let registration = agents
+                .get(agent_id)
+                .ok_or_else(|| invalid(format!("agent {agent_id} not connected")))?
+                .clone();
+            registration.draining.store(true, Ordering::Release);
+            registration
+        };
         registration
             .outbound
             .send(ToSession::Send(Box::new(Message::Drain { grace_ms })))
@@ -1196,6 +1349,10 @@ impl AgentManager {
         Ok(())
     }
 
+    /// 关停 agent 管理器：停止监听与全部会话任务，清空注册表与在途绑定。
+    ///
+    /// 等待任务集合收敛后再清表：会话任务可能正在写裁决，先清表会让
+    /// 裁决丢失。
     pub async fn shutdown(&self) {
         self.shutdown.cancel();
         self.tasks.close();
@@ -1205,16 +1362,24 @@ impl AgentManager {
     }
 }
 
+/// 构造一条「已死」的命令通道：发送立即失败。
+///
+/// 用于表达「这个派发当前没有可用链路」——让上层走既有的 link-dead
+/// 路径（挂起等重连），而不是新增一条特例分支。
 fn dead_to_session() -> mpsc::Sender<ToSession> {
     let (tx, mut rx) = mpsc::channel(1);
     rx.close();
     tx
 }
 
-// 依主日志裁决单项 resume（三期 §1.4 表）：run 终态/派发被替代 →
-// CancelAndDrain；结果已提交 → AlreadyCommitted；boot 不符或缺口且无
-// 封口结果 → ReconcileRequired；否则续跑（UploadOnly/SubmitExistingResult，
-// 权威游标由重挂后的 ack 流传达）。
+/// 依主日志裁决单项 resume（三期 §1.4 表）：run 终态/派发被替代 →
+/// CancelAndDrain；结果已提交 → AlreadyCommitted；boot 不符或缺口且无
+/// 封口结果 → ReconcileRequired；否则续跑（UploadOnly/SubmitExistingResult，
+/// 权威游标由重挂后的 ack 流传达）。
+///
+/// 裁决顺序即保守程度递减：先排除「肯定不该再跑」的情况，再考虑续跑。
+/// 判错方向的代价不对称——把该跑的判成取消会丢工作，把该取消的判成续跑
+/// 会重复外部副作用。
 fn adjudicate_against_journal(
     state: &flow_engine::journal_state::State,
     binding: &BoundDispatch,
@@ -1254,7 +1419,7 @@ fn adjudicate_against_journal(
     }
 }
 
-// resume 场景的包络（executor_id 以绑定记录为准由 attach_resumed 重建）。
+/// resume 场景的包络（executor_id 以绑定记录为准由 attach_resumed 重建）。
 fn resume_envelope(
     agent_id: &str,
     agent_boot_id: &str,
@@ -1271,25 +1436,34 @@ fn resume_envelope(
     }
 }
 
-// 远程派发器：journal_driver 的第三执行端口（三期 §1.1）。
-//
-// 断链时派发挂起等待 agent 重连对账（不立即失败、不重新执行）；重挂后
-// 继续驱动同一 runner（账本/屏障状态保留），结果/审计按既有序列幂等推进。
+/// 远程派发器：journal_driver 的第三执行端口（三期 §1.1）。
+///
+/// 断链时派发挂起等待 agent 重连对账（不立即失败、不重新执行）；重挂后
+/// 继续驱动同一 runner（账本/屏障状态保留），结果/审计按既有序列幂等推进。
 #[derive(Clone)]
 pub struct RemoteDispatcher {
+    /// agent 管理器（注册表、绑定、准入）。
     manager: Arc<AgentManager>,
+    /// 远程连接参数（对账超时等）。
     options: RemoteOptions,
 }
 
 impl RemoteDispatcher {
+    /// 构造远程派发器。
     pub fn new(manager: Arc<AgentManager>, options: RemoteOptions) -> Self {
         Self { manager, options }
     }
 
+    /// 取得底层 agent 管理器（关停、容量查询等由调用方使用）。
     pub fn manager(&self) -> &Arc<AgentManager> {
         &self.manager
     }
 
+    /// 执行一次远程节点派发。
+    ///
+    /// 与本地路径的关键差异：链路死亡**不**直接失败，而是挂起等待 agent
+    /// 重连后的 Resume 裁决；只有裁决明确「已提交 / 取消 / 丢失」或
+    /// 对账超时，才结束这次派发。
     pub(crate) async fn execute(
         &self,
         attempt: &crate::journal_execution::Attempt,
@@ -1298,6 +1472,8 @@ impl RemoteDispatcher {
         observations: Option<flow_engine::observation::ObservationStore>,
     ) -> std::result::Result<(), crate::journal::JournalError> {
         use crate::execution::dispatch::DispatchRunner;
+        // 全局 A_max 准入：同时在飞的活跃派发数上限（与 agent 侧的执行器
+        // 槽位数、窗口预算是不同的量）。
         let _permit = self
             .manager
             .global_slots()
@@ -1332,6 +1508,9 @@ impl RemoteDispatcher {
                     events: std::mem::replace(&mut events, mpsc::channel(1).1),
                 })
             } else {
+                // 重挂：等 Resume 对账给出裁决（链路就绪 / 已提交 / 取消 /
+                // 丢失）。超时按丢失处理——宁可显式失败，也不在状态不明
+                // 时继续跑。
                 self.manager
                     .wait_attach(&dispatch_id, self.options.attach_timeout())
                     .await
@@ -1339,6 +1518,8 @@ impl RemoteDispatcher {
             match outcome {
                 AttachOutcome::Link(mut link) => {
                     let result = runner.drive_with_resume(&mut link, resume).await;
+                    // 之后一律按 resume 驱动：重连后不得重发 Execute，否则
+                    // 节点会被执行两遍。
                     resume = true;
                     match result {
                         Ok(()) => {
@@ -1373,11 +1554,16 @@ impl RemoteDispatcher {
     }
 }
 
+/// 派发绑定的清理守卫：无论派发正常结束、报错还是任务被取消，
+/// 绑定都必须被解除——否则 agent 侧那一枚槽位会永久泄漏。
 struct BindingGuard {
+    /// agent 管理器。
     manager: Arc<AgentManager>,
+    /// 待解除的派发标识。
     dispatch_id: String,
 }
 impl Drop for BindingGuard {
+    /// 兜底解除绑定：在独立任务里做，避免 drop 中 await。
     fn drop(&mut self) {
         let manager = self.manager.clone();
         let dispatch_id = self.dispatch_id.clone();
@@ -1424,6 +1610,7 @@ fn authenticate_wss(
     Some(agent.id.clone())
 }
 
+/// 常量时间字节比较（长度不等时直接判否——长度本身不是秘密）。
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -1439,6 +1626,8 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 mod capacity_tests {
     use super::*;
 
+    /// 会话替换后，仍在飞的绑定必须继续占用槽位——新会话不能借「重连」
+    /// 抹掉旧会话的在飞计数。
     #[tokio::test]
     async fn replacement_session_keeps_outstanding_capacity_reserved() {
         let root = std::env::temp_dir().join(format!("flow-capacity-{}", uuid::Uuid::now_v7()));
@@ -1527,11 +1716,99 @@ mod capacity_tests {
     }
 }
 
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    /// 等待绑定时不得持有注册表锁：否则一个慢绑定会冻结整个注册表。
+    #[tokio::test]
+    async fn waiting_for_binding_does_not_lock_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = JournalBackend::open(dir.path(), Default::default())
+            .await
+            .unwrap();
+        let manager = AgentManager::new(backend.clone(), backend.journal.id().into(), 1);
+        let binding = Arc::new(BoundDispatch {
+            agent_id: "agent".into(),
+            link_session_id: "session".into(),
+            executor_id: "exec".into(),
+            executor_boot_id: Mutex::new(None),
+            run_id: "run".into(),
+            node_id: "node".into(),
+            pending_link: Mutex::new(None),
+            verdict: Mutex::new(None),
+            notify: Notify::new(),
+        });
+        manager
+            .bindings
+            .lock()
+            .await
+            .insert("dispatch".into(), binding.clone());
+        let boot = binding.executor_boot_id.lock().await;
+        let note = manager.note_bound("dispatch", "boot".into());
+        tokio::pin!(note);
+        assert!(futures::poll!(&mut note).is_pending());
+        assert!(
+            manager.bindings.try_lock().is_ok(),
+            "registry cannot be held while waiting on a binding"
+        );
+        drop(boot);
+        note.await;
+        assert_eq!(
+            binding.executor_boot_id.lock().await.as_deref(),
+            Some("boot")
+        );
+        backend.close().await.unwrap();
+    }
+
+    /// 网络背压不得持有 agent 注册表锁：drain 的发送会等待通道容量。
+    #[tokio::test]
+    async fn drain_backpressure_does_not_lock_agent_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = JournalBackend::open(dir.path(), Default::default())
+            .await
+            .unwrap();
+        let manager = AgentManager::new(backend.clone(), backend.journal.id().into(), 1);
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(ToSession::CancelDispatch("occupied".into()))
+            .await
+            .unwrap();
+        let registration = Arc::new(AgentRegistration {
+            agent_id: "agent".into(),
+            link_session_id: "session".into(),
+            outbound: tx,
+            slots_total: AtomicU64::new(1),
+            draining: AtomicBool::new(false),
+            cancel: tokio_util::sync::CancellationToken::new(),
+        });
+        manager
+            .agents
+            .lock()
+            .await
+            .insert("agent".into(), registration.clone());
+        let drain = manager.drain("agent", 100);
+        tokio::pin!(drain);
+        assert!(futures::poll!(&mut drain).is_pending());
+        assert!(
+            manager.agents.try_lock().is_ok(),
+            "network backpressure cannot hold the registry"
+        );
+        assert!(registration.draining.load(Ordering::Acquire));
+        rx.recv().await.unwrap();
+        drain.await.unwrap();
+        assert!(
+            matches!(rx.recv().await, Some(ToSession::Send(message)) if matches!(*message, Message::Drain { .. }))
+        );
+        backend.close().await.unwrap();
+    }
+}
+
 /// W1：WSS 身份由凭证映射表决定；自报 header 只做一致性断言。
 #[cfg(test)]
 mod auth_tests {
     use super::*;
 
+    /// 构造一个 WSS 握手请求（token 与自报身份可分别省略）。
     fn request(
         token: Option<&str>,
         claimed: Option<&str>,
@@ -1546,6 +1823,7 @@ mod auth_tests {
         builder.body(()).unwrap()
     }
 
+    /// 两个 agent 的凭据表（token → agent_id）。
     fn table() -> Vec<AgentCredential> {
         vec![
             AgentCredential {
@@ -1559,6 +1837,7 @@ mod auth_tests {
         ]
     }
 
+    /// 身份由 token 反查决定；自报 header 只做一致性断言。
     #[test]
     fn token_decides_identity() {
         // 正确凭证 + 一致声明 / 不声明：身份都是凭证反查结果。
@@ -1572,6 +1851,7 @@ mod auth_tests {
         );
     }
 
+    /// 自报 header 不能冒充他人：凭证与声明不一致时必须拒绝。
     #[test]
     fn claimed_header_cannot_impersonate_another_agent() {
         // 持 A 凭证声明 B 身份 / 伪造 header 冒充他 agent / 错缺凭证：一律拒绝。
@@ -1597,6 +1877,7 @@ mod auth_tests {
         );
     }
 
+    /// 未知 token 不得匹配任何身份。
     #[test]
     fn unknown_token_matches_no_identity() {
         assert_eq!(
@@ -1611,6 +1892,7 @@ mod auth_tests {
 mod session_tests {
     use super::*;
 
+    /// 构造一个带临时数据目录的 agent 管理器。
     async fn manager_with_data() -> (Arc<AgentManager>, Arc<JournalBackend>, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!("flow-session-{}", uuid::Uuid::now_v7()));
         let backend = JournalBackend::open(&root, flow_journal::JournalOptions::default())
@@ -1620,6 +1902,7 @@ mod session_tests {
         (manager, backend, root)
     }
 
+    /// 关停必须打断沉默中的握手并释放监听端口。
     #[tokio::test]
     async fn shutdown_reclaims_listener_and_silent_handshake() {
         let (manager, backend, root) = manager_with_data().await;

@@ -28,6 +28,7 @@ pub struct Ctx {
 }
 
 impl Ctx {
+    /// 拉起被测服务进程，返回测试上下文。
     pub async fn start(bin: &str) -> Ctx {
         Self::start_with(bin, &[]).await
     }
@@ -52,10 +53,12 @@ impl Ctx {
         }
     }
 
+    /// 被测服务的 RPC 监听地址。
     pub fn addr(&self) -> SocketAddr {
         self.server.addr
     }
 
+    /// 被测服务的 HTTP 监听地址。
     pub fn http_addr(&self) -> SocketAddr {
         self.server.http_addr
     }
@@ -70,6 +73,7 @@ impl Ctx {
         &self.token
     }
 
+    /// 建立一个连到被测服务的 v2 客户端。
     pub async fn client(&self) -> client::Conn {
         client::connect(self.addr(), &self.token).await
     }
@@ -156,14 +160,17 @@ impl ServerProc {
         }
     }
 
+    /// 被测服务的 RPC 监听地址（进程视角）。
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
 
+    /// 被测服务的 HTTP 监听地址（进程视角）。
     pub fn http_addr(&self) -> SocketAddr {
         self.http_addr
     }
 
+    /// 被测进程是否已退出及其退出状态。
     pub fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
         self.child.try_wait().expect("check server process")
     }
@@ -173,6 +180,7 @@ impl ServerProc {
         crate::common::wire::connect(self.addr).await
     }
 
+    /// 拉起被测服务进程并等待它就绪。
     fn spawn(
         bin: &std::path::Path,
         journal_dir: &std::path::Path,
@@ -184,6 +192,9 @@ impl ServerProc {
             .env("FLOW_JOURNAL_TOKEN", token)
             // 持久化密钥存储（storage.data_dir）也落在临时目录，别污染 CWD
             .env("FLOW_DATA_DIR", journal_dir)
+            // flow 主目录（harness 沙箱、缺省 journal/data/config 落点）
+            // 也钉在临时区——executor 经 env 白名单继承，别碰真实 ~/.flow
+            .env("FLOW_HOME", journal_dir.join("home"))
             .env(
                 "RUST_LOG",
                 format!(
@@ -230,6 +241,7 @@ impl ServerProc {
         }
     }
 
+    /// 杀掉并重新拉起被测进程（保持同一个数据目录）。
     async fn restart(
         &mut self,
         bin: &std::path::Path,
@@ -245,6 +257,7 @@ impl ServerProc {
         *self = Self::spawn(bin, journal_dir, token, &env);
     }
 
+    /// 杀掉被测进程（SIGKILL，真崩溃语义）。
     pub fn kill(&mut self) {
         // SIGKILL：崩溃恢复必须是「没机会做任何清理」的死法
         let _ = self.child.kill();
@@ -253,6 +266,7 @@ impl ServerProc {
 }
 
 impl Drop for ServerProc {
+    /// 兜底清理：进程还活着就杀掉。
     fn drop(&mut self) {
         self.kill();
     }

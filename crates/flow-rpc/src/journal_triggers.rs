@@ -1,4 +1,16 @@
 //! JSONL triggers: stable fire identity and run creation share one authoritative command.
+//!
+//! 本模块负责三条入站触发路径：cron 定时触发（扫描型）、webhook 触发
+//! （管理令牌 + 幂等键）、以及业务调用面 `/invoke`（业务密钥 + 每 run 能力
+//! 令牌）。三者最终都落到同一条权威命令（`trigger_start` / `invoke_start`），
+//! 幂等与去重因此由 journal 侧统一负责。
+//!
+//! 它守护的核心不变量：**同一次触发只会产生一个 run**。cron 用「触发时刻
+//! 字符串」、webhook/业务调用用 `Idempotency-Key` 作为去重身份；没有稳定
+//! 身份的重试会造成重复执行。
+//!
+//! 能力令牌（run_token）是「一个 run 一个令牌」的窄能力：它只允许读取该
+//! run 的结果、事件、发信号与取消，绝不泄漏管理令牌，也不授权操作其他 run。
 use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, Path, Query, State},
@@ -12,8 +24,15 @@ use flow_backend::journal::{JournalBackend, JournalError};
 use serde_json::Value;
 use std::sync::Arc;
 
+/// 扫描一次到期的 cron schedule 并触发。
+///
+/// 幂等键 = 该 cron 时隙的 RFC3339 时刻字符串，因此重复扫描同一时隙只会
+/// 产生一次 run；反过来说，时隙字符串也必须是**稳定**的，扫描器重启、
+/// 时钟回拨都不能让它变。
 pub async fn fire_due(backend: &JournalBackend, now: DateTime<Local>) {
     for config in backend.trigger_configs("schedule").await {
+        // disabled 的 schedule 显式跳过：配置里的 enabled 是权威开关，
+        // 不能因为「上次触发过」而误判。
         if config["enabled"] != true {
             continue;
         }
@@ -29,6 +48,8 @@ pub async fn fire_due(backend: &JournalBackend, now: DateTime<Local>) {
             tracing::warn!(schedule_id = %id, "schedule cron invalid; fire skipped");
             continue;
         };
+        // 向前挪 1 纳秒：取「now 之前最近的一个时隙」时必须包含 now 本身，
+        // 否则恰好落在时隙边界的那次触发会被推迟到下一个周期。
         let Some(fire) = cron.previous_before(&(now + chrono::Duration::nanoseconds(1))) else {
             continue;
         };
@@ -38,9 +59,14 @@ pub async fn fire_due(backend: &JournalBackend, now: DateTime<Local>) {
             .as_str()
             .or_else(|| config["created_at"].as_str())
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok());
+        // 生效时刻之前的时隙一律不算触发：刚创建的 schedule 若 cron 表达式
+        // 指向过去（例如每小时第 0 分而创建于第 30 分），补跑会造成「一上来
+        // 就触发一次」的历史时隙。
         if active_since.is_none_or(|since| fire < since) {
             continue;
         }
+        // 去重身份用 UTC 化的时隙时刻字符串：同一时隙无论在哪个时区扫描，
+        // 得到的键都相同。
         let key = fire.with_timezone(&Utc).to_rfc3339();
         if let Err(error) = backend
             .trigger_start("schedule", id, &key, Value::Null)
@@ -51,11 +77,15 @@ pub async fn fire_due(backend: &JournalBackend, now: DateTime<Local>) {
     }
 }
 /// journal 侧触发器扫描循环；tick 由 `[server].journal_trigger_tick_secs` 配置。
+///
+/// tick 间隔决定了 cron 的触发精度上限（误差 ≤ tick）：间隔必须明显小于
+/// 最短 cron 周期，否则「每小时」这类表达式会漏掉某些时隙。
 pub fn start(
     backend: Arc<JournalBackend>,
     tick: std::time::Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // interval 的首次 tick 立即触发：启动后不必等满一个周期才开始工作。
         let mut tick = tokio::time::interval(tick);
         loop {
             tick.tick().await;
@@ -63,11 +93,18 @@ pub fn start(
         }
     })
 }
+/// 触发器 HTTP 面共享状态：journal 句柄、管理令牌、下载并发闸门。
 struct HookState {
     backend: Arc<JournalBackend>,
     token: String,
     downloads: Arc<tokio::sync::Semaphore>,
 }
+
+/// 装配触发器 HTTP 路由。
+///
+/// 路由分两类：`/hooks/{id}` 是管理面（管理令牌），`/invoke` 与
+/// `/invocations` 是业务面（业务密钥 → 每 run 能力令牌）。两类的鉴权
+/// 强度不同，CORS 头也只对业务面开放（前端直接调业务面）。
 pub fn router(backend: Arc<JournalBackend>, token: String) -> Router {
     Router::new()
         .route("/hooks/{id}", post(hook))
@@ -92,6 +129,7 @@ pub fn router(backend: Arc<JournalBackend>, token: String) -> Router {
             "/invocations/{id}/cancel",
             post(invocation_cancel).options(preflight),
         )
+        // CORS 只加在业务面路径上：管理面（/hooks）不该被浏览器页面跨域调用。
         .layer(axum::middleware::from_fn(
             |request: axum::extract::Request, next: axum::middleware::Next| async move {
                 let business = request.uri().path().starts_with("/invoke/")
@@ -117,6 +155,8 @@ pub fn router(backend: Arc<JournalBackend>, token: String) -> Router {
                 response
             },
         ))
+        // 8 MiB body 上限：与 §11.5 的 webhook 载荷上限一致，超出会被
+        // axum 在读进内存前挡掉。
         .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
         .with_state(Arc::new(HookState {
             backend,
@@ -124,10 +164,18 @@ pub fn router(backend: Arc<JournalBackend>, token: String) -> Router {
             downloads: Arc::new(tokio::sync::Semaphore::new(8)),
         }))
 }
+
+/// CORS 预检响应。
+///
+/// 固定 204 + 允许头由中间件统一设置，这里只负责让预检短路返回。
 async fn preflight() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
+/// 取出 `Authorization: Bearer <token>` 中的 token 部分。
+///
+/// 缺失或格式不符一律返回空串——调用方拿空串去比对，失败路径与「token
+/// 不符」完全一致，不泄露「头是否存在」这一信息。
 fn bearer(headers: &HeaderMap) -> &str {
     headers
         .get("authorization")
@@ -135,9 +183,16 @@ fn bearer(headers: &HeaderMap) -> &str {
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or("")
 }
+
+/// 常时字符串相等（不按首个差异字节提前返回）。
 fn equal(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |d, (a, b)| d | (a ^ b)) == 0
 }
+
+/// 取 `Idempotency-Key` 头作为幂等键。
+///
+/// 上限 128 字节与 RPC 面的 request_id 口径一致；空键视为缺失——空串做
+/// 去重键会让所有请求塌缩成同一次。
 fn request_key(headers: &HeaderMap) -> Option<&str> {
     headers
         .get("idempotency-key")
@@ -147,10 +202,16 @@ fn request_key(headers: &HeaderMap) -> Option<&str> {
 
 /// HMAC-SHA256 capabilities bind one run and one operation-independent namespace.
 /// The management token is never sent to an invocation client.
+///
+/// 用管理令牌派生「每 run 一个」的窄能力令牌：业务方拿到它只能操作这一个
+/// run，而管理令牌本身永不离开服务端。派生用 HMAC 而不是裸哈希，避免
+/// 令牌泄露后可被反推出管理令牌。
 fn run_token(secret: &str, run: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut key = [0u8; 64];
     let raw = secret.as_bytes();
+    // HMAC 的块大小是 64 字节：更长的密钥先取 SHA-256 摘要，短密钥零填充，
+    // 两者的派生结果都不可逆推出 secret。
     if raw.len() > 64 {
         key[..32].copy_from_slice(&Sha256::digest(raw));
     } else {
@@ -158,6 +219,7 @@ fn run_token(secret: &str, run: &str) -> String {
     }
     let mut inner = Sha256::new();
     inner.update(key.map(|b| b ^ 0x36));
+    // 域分隔串 + run_id：能力令牌与任何其他用途的 HMAC 不共享同一密钥流。
     inner.update(b"flow.invocation.v1\0");
     inner.update(run.as_bytes());
     let mut outer = Sha256::new();
@@ -165,9 +227,16 @@ fn run_token(secret: &str, run: &str) -> String {
     outer.update(inner.finalize());
     hex::encode(outer.finalize())
 }
+
+/// 校验请求携带的能力令牌是否匹配该 run。
 fn run_authorized(state: &HookState, id: &str, headers: &HeaderMap) -> bool {
     equal(bearer(headers), &run_token(&state.token, id))
 }
+
+/// 把 journal 错误映射成 HTTP 状态码。
+///
+/// 映射按错误**类型**而非文案：文案会变，按文案分支会让客户端在改文案后
+/// 悄悄走错分支。
 fn invocation_error(error: JournalError) -> Response {
     match error {
         JournalError::Journal(flow_journal::Error::Conflict(message)) => {
@@ -179,9 +248,16 @@ fn invocation_error(error: JournalError) -> Response {
         JournalError::Journal(flow_journal::Error::Limit(message)) => {
             (StatusCode::TOO_MANY_REQUESTS, message).into_response()
         }
+        // 其余错误（存储不可用等）一律 503：可重试，客户端应退避重试。
         _ => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
+
+/// `POST /invoke/{id}`：业务调用面入口。
+///
+/// 鉴权用「业务密钥」（配置里只存哈希），而非管理令牌：调用方是外部业务，
+/// 它的权限范围就是这一个 hook。幂等键取 `Idempotency-Key`，重试必须复用
+/// 同一个键。
 async fn invoke(
     State(state): State<Arc<HookState>>,
     Path(id): Path<String>,
@@ -190,12 +266,15 @@ async fn invoke(
 ) -> Response {
     let key = bearer(&headers);
     let hash = flow_journal::codec::digest(key.as_bytes());
+    // 匹配 hook 配置里保存的密钥摘要：服务端不保存明文业务密钥，
+    // 泄露配置不等于泄露可用的调用凭据。
     let config = state
         .backend
         .trigger_configs("webhook")
         .await
         .into_iter()
         .find(|c| c["token"] == id);
+    // 密钥长度下限与摘要比对都要满足：短密钥即便摘要对上也说明配置有问题。
     if key.len() < 32
         || !config.as_ref().is_some_and(|c| {
             c["invoke_key_hash"]
@@ -205,9 +284,12 @@ async fn invoke(
     {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    // 幂等键强制：没有稳定身份的调用无法去重，重试会重复创建 run。
     let Some(request) = request_key(&headers) else {
         return (StatusCode::BAD_REQUEST, "Idempotency-Key required").into_response();
     };
+    // 关联 ID 缺省用幂等键：业务方没给追踪 ID 时，仍能用同一串在日志里
+    // 把「调用 → run → 事件」串起来。
     let correlation = headers
         .get("x-correlation-id")
         .and_then(|v| v.to_str().ok())
@@ -226,14 +308,22 @@ async fn invoke(
         .await
     {
         Ok(receipt) => {
+            // 回执里必须有 run_id：没有它就无法给出后续的结果 URL，
+            // 此时宁可报 503 让调用方带同一个幂等键重试。
             let Some(id) = receipt.result["run_id"].as_str() else {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             };
+            // 202：run 已受理但尚未完成。返回的 run_token 是该 run 的窄能力
+            // 令牌，调用方用它读结果/事件，不再需要持有业务密钥。
             (StatusCode::ACCEPTED,Json(serde_json::json!({"run_id":id,"run_token":run_token(&state.token,id),"result_url":format!("/invocations/{id}"),"events_url":format!("/invocations/{id}/events"),"receipt":receipt}))).into_response()
         }
         Err(e) => invocation_error(e),
     }
 }
+/// `GET /invocations/{id}/values/{output}`：下载该 run 的公开输出值。
+///
+/// 能力令牌只允许下载 run 的**公开结果**；定义、预备凭据与中间值一律拒绝
+/// ——它们是管理面的追踪材料，不属于「调用方该看到的东西」。
 async fn invocation_value(
     State(state): State<Arc<HookState>>,
     Path((id, output)): Path<(String, String)>,
@@ -247,12 +337,17 @@ async fn invocation_value(
     match state.backend.run_snapshot(&id).await {
         Ok(Some(run)) if matches!(run.output.as_ref(),Some(flow_journal::StoredValue::Ref(v)) if v.output_id==output) =>
             {}
+        // 引用存在但不是 run 的公开输出 → 403（无权），而非 404。
         Ok(Some(_)) => return StatusCode::FORBIDDEN.into_response(),
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => return invocation_error(e),
     }
     crate::journal_download::download_authorized(&state.backend, &state.downloads, id, output).await
 }
+/// `GET /invocations/{id}`：run 的结果摘要。
+///
+/// 输出过大时不给内联正文，只给 `output_ref` + 下载 URL：内联大值会让
+/// 响应体积失控，也会把用户数据复制进每个轮询响应里。
 async fn invocation_result(
     State(state): State<Arc<HookState>>,
     Path(id): Path<String>,
@@ -277,6 +372,7 @@ async fn invocation_result(
                 .transpose();
             match output{
                 Ok(output)=>Json(serde_json::json!({"run_id":id,"status":run.status,"complete":run.terminal(),"output":output,"error":run.error.as_ref().map(|_|"WORKFLOW_FAILED"),"workflow_version":run.workflow_version,"correlation_id":run.execution.as_ref().and_then(|e|e.correlation_id.as_ref())})).into_response(),
+                // 超过内联上限：改用引用 + 下载 URL，语义仍是「结果可得」。
                 Err(flow_journal::Error::Limit(_))=>(StatusCode::PAYLOAD_TOO_LARGE,Json(serde_json::json!({"run_id":id,"status":run.status,"complete":run.terminal(),"output_ref":run.output,"download_url":run.output.as_ref().and_then(|v|match v {flow_journal::StoredValue::Ref(v)=>Some(format!("/invocations/{id}/values/{}",v.output_id)),_=>None})}))).into_response(),
                 Err(_)=>StatusCode::SERVICE_UNAVAILABLE.into_response(),
             }
@@ -285,11 +381,19 @@ async fn invocation_result(
         Err(e) => invocation_error(e),
     }
 }
+/// `GET /invocations/{id}/events` 的查询参数。
+///
+/// 游标与 after_lsn 都是字符串形态：LSN 是 u64，JSON 数字会丢精度，
+/// 字符串是唯一无损的表示。
 #[derive(serde::Deserialize)]
 struct EventQuery {
     cursor: Option<String>,
     after_lsn: Option<String>,
 }
+/// `GET /invocations/{id}/events`：run 的事件流（分页）。
+///
+/// 能力令牌只能看到「业务可观测」的事件子集，payload 也被裁剪成安全字段：
+/// 事件原文可能包含节点参数、预备凭据等管理面信息。
 async fn invocation_events(
     State(state): State<Arc<HookState>>,
     Path(id): Path<String>,
@@ -299,6 +403,8 @@ async fn invocation_events(
     if !run_authorized(&state, &id, &headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    // 上界取当前 durable_lsn：保证这一页是一个一致快照，不会读到
+    // 「半条事务」。
     let upper = state.backend.journal.durable_lsn();
     let cursor = match query.cursor {
         Some(raw) => match serde_json::from_str(&raw) {
@@ -316,9 +422,12 @@ async fn invocation_events(
                 let Ok(after) = raw.parse::<u64>() else {
                     return StatusCode::BAD_REQUEST.into_response();
                 };
+                // 必须是最小的十进制规范写法且不超过当前上界：否则同一个
+                // after_lsn 会有多种写法，缓存与去重都对不上。
                 if after.to_string() != raw || after > upper {
                     return StatusCode::BAD_REQUEST.into_response();
                 }
+                // 游标是「不包含下界」语义，因此从 after+1 开始。
                 let Some(next) = after.checked_add(1) else {
                     return StatusCode::BAD_REQUEST.into_response();
                 };
@@ -338,6 +447,8 @@ async fn invocation_events(
     ) {
         Ok(mut page) => {
             use flow_journal::EventKind;
+            // 白名单：只保留业务进展类事件，执行器内部的审计事实
+            // （含更多细节）不属于调用方可观测范围。
             page.events.retain(|v| {
                 matches!(
                     v.event.kind,
@@ -356,6 +467,8 @@ async fn invocation_events(
             });
             for positioned in &mut page.events {
                 let event = &mut positioned.event;
+                // payload 裁剪：只留下业务需要的字段，失败统一成
+                // EXECUTION_FAILED（不泄露内部错误细节）。
                 event.payload = match event.kind {
                     EventKind::RunStarted => {
                         serde_json::json!({"workflow_version":event.payload["workflow_version"]})
@@ -375,6 +488,10 @@ async fn invocation_events(
         Err(e) => invocation_error(e.into()),
     }
 }
+/// `POST /invocations/{id}/signals/{node}`：向人工节点投递输入。
+///
+/// 只能作用于 human_task / input 节点：能力令牌不该成为驱动外部系统
+/// （脚本、HTTP 调用等）的旁路——那属于管理面裁决的职责。
 async fn invocation_signal(
     State(state): State<Arc<HookState>>,
     Path((id, node)): Path<(String, String)>,
@@ -392,6 +509,8 @@ async fn invocation_signal(
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
     // A business capability cannot adjudicate external operations, including through run.signal's legacy alias.
+    // 节点类型必须从权威 run 定义里读出来：不能信客户端声称的节点名，
+    // 否则就能借信号路径绕过裁决。
     let run = match state.backend.run_snapshot(&id).await {
         Ok(Some(r)) => r,
         _ => return StatusCode::NOT_FOUND.into_response(),
@@ -424,6 +543,7 @@ async fn invocation_signal(
         Err(e) => invocation_error(e),
     }
 }
+/// `POST /invocations/{id}/cancel`：取消该 run（级联取消子 run）。
 async fn invocation_cancel(
     State(state): State<Arc<HookState>>,
     Path(id): Path<String>,
@@ -432,6 +552,7 @@ async fn invocation_cancel(
     if !run_authorized(&state, &id, &headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    // 取消同样要求幂等键：重复取消要能被识别为同一次操作。
     let Some(request) = request_key(&headers) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -440,17 +561,23 @@ async fn invocation_cancel(
         Err(e) => invocation_error(e),
     }
 }
+/// `POST /hooks/{id}`：webhook 触发面（管理令牌）。
+///
+/// 幂等键由调用方给出；没有它就不受理——否则一次网络重试就会多跑一次
+/// workflow。
 async fn hook(
     State(state): State<Arc<HookState>>,
     Path(id): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // 管理令牌与 RPC 面同一个 token：单用户凭据，不是多租户授权。
     let token = headers
         .get("authorization")
         .and_then(|h| h.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .unwrap_or("");
+    // 常时比较：避免用响应时间探测令牌。
     if token.len() != state.token.len()
         || token
             .bytes()

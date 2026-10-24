@@ -4,6 +4,10 @@
 //! 双方按同一字符串对账），构造与解析集中在这里——散落各文件的魔术前缀
 //! 拼接一旦 typo 只会静默丢块（执行器死等 InputReady 直到 deadline），
 //! 收敛到单一类型后拼写错误在构造处即不可表达。
+//!
+//! 契约要点：字符串前缀即语义分类（`in:` 输入面、`op:` 操作请求、
+//! `op-body:` 操作结果体），主进程与执行器据此把 TransferChunk 归到
+//! 正确的聚合器；改前缀等于改协议，不能顺手「优化」。
 
 use std::fmt;
 
@@ -26,6 +30,9 @@ pub enum TransferKey {
 
 impl TransferKey {
     /// wire 字符串（格式冻结，禁止变更）。
+    ///
+    /// 解析侧 [`Self::parse`] 必须与之严格互逆；两侧不一致的字符串会在
+    /// 接收端落到 `None`，表现为永远等不到的 InputReady。
     pub fn to_wire(&self) -> String {
         match self {
             Self::RunInput => "in:run-input".into(),
@@ -37,6 +44,10 @@ impl TransferKey {
     }
 
     /// 从 wire 字符串解析；非本协议格式返回 None。
+    ///
+    /// 保留键（`run-input` / `prepared-params`）优先于节点名解析：wire
+    /// 上 `in:run-input` 无法区分「保留键」与「节点恰好叫 run-input」，
+    /// 构造侧承担该歧义（定义校验另有节点名约束）。
     pub fn parse(wire: &str) -> Option<Self> {
         if let Some(node_id) = wire.strip_prefix("in:") {
             return match node_id {
@@ -45,6 +56,8 @@ impl TransferKey {
                 _ => Some(Self::NodeInput(node_id.into())),
             };
         }
+        // `op-body:` 与 `op:` 互不为前缀，顺序不承载语义；先判更具体的
+        // 那个，是为了将来新增同族前缀（如 `op-meta:`）时不必回头改这里。
         if let Some(output_id) = wire.strip_prefix("op-body:") {
             return Some(Self::OperationBody(output_id.into()));
         }
@@ -54,6 +67,8 @@ impl TransferKey {
 }
 
 impl fmt::Display for TransferKey {
+    /// 与 [`TransferKey::to_wire`] 同一字符串：日志与错误信息里的
+    /// transfer id 必须与 wire 上逐字节相同，否则排障时会指向错误的块。
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.to_wire())
     }

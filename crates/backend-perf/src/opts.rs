@@ -20,6 +20,7 @@ pub enum Scenario {
 }
 
 impl Scenario {
+    /// 全部场景（缺省跑全部）。
     pub const ALL: [Scenario; 4] = [
         Scenario::Throughput,
         Scenario::Read,
@@ -27,6 +28,7 @@ impl Scenario {
         Scenario::Recovery,
     ];
 
+    /// 场景的展示名（报告与日志里用）。
     pub fn name(self) -> &'static str {
         match self {
             Scenario::Throughput => "run_throughput",
@@ -39,13 +41,17 @@ impl Scenario {
 
 /// 产品后端选择。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 产品后端选择。
 pub enum BackendSel {
     Journal,
 }
 
 #[derive(Debug, Clone)]
+/// 压测参数。
 pub struct Opts {
+    /// 要跑的场景。
     pub scenarios: Vec<Scenario>,
+    /// 被测后端。
     pub backend: BackendSel,
     /// run_throughput：总 run 数。
     pub runs: usize,
@@ -64,6 +70,7 @@ pub struct Opts {
 }
 
 impl Default for Opts {
+    /// 默认参数：轻量回归规模（分钟级跑完）。
     fn default() -> Opts {
         Opts {
             scenarios: Scenario::ALL.to_vec(),
@@ -127,6 +134,7 @@ impl Opts {
     }
 }
 
+/// 解析 `--scenario` 列表（逗号分隔；`all` 表示全部）。
 fn parse_scenarios(word: &str) -> Vec<Scenario> {
     let picked: Vec<Scenario> = word
         .split(',')
@@ -147,6 +155,7 @@ fn parse_scenarios(word: &str) -> Vec<Scenario> {
     }
 }
 
+/// 解析一个正整数参数；非正整数直接退出。
 fn parse_count(flag: &str, raw: &str) -> usize {
     raw.parse::<usize>()
         .ok()
@@ -154,11 +163,13 @@ fn parse_count(flag: &str, raw: &str) -> usize {
         .unwrap_or_else(|| die(&format!("{flag} 必须是正整数：{raw}")))
 }
 
+/// 打印错误并以退出码 2 结束（参数用错的统一出口）。
 fn die(message: &str) -> ! {
     eprintln!("错误：{message}");
     exit(2);
 }
 
+/// 帮助文本（同时是参数口径的文档）。
 pub fn usage() -> &'static str {
     "flow-perf：flow 后端性能压测 harness（黑盒，真起被测进程，Journal 产品后端）\n\
      \n\

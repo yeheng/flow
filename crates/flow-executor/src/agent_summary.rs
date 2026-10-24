@@ -2,6 +2,11 @@
 //! `TurnSummary` 投影成 outcome 字段（exit_code/text/stderr 元数据语义与
 //! 原 runner 二进制的退出码契约一致：0 完成 / 1 回合失败或 max_turns
 //! 耗尽 / 130 中止）。
+//!
+//! 核心判定是「只看末条 assistant」：中间的 MaxTokens / 工具调用都不是
+//! 终态，只有最后一条消息的停止原因决定这次 agent 到底算不算完成。
+//! 误判方向被刻意选成保守——把已完成判成失败可以重试，把失败判成
+//! 成功会掩盖工具副作用。
 
 use conga::{AgentMessage, ContentBlock, StopReason, TurnEndReason};
 use conga_host::TurnSummary;
@@ -9,13 +14,18 @@ use conga_host::TurnSummary;
 /// stdout/body_raw 的最终文本上限。journal 派生按 `body_raw > 8 MiB` 拒绝，
 /// 8 MiB 文本 + 截断标记会恰好越过那条线；留出标记与余量。
 pub const TEXT_LIMIT_BYTES: usize = 7 * 1024 * 1024 + 512 * 1024;
+/// 截断标记：让读者能区分「本来就短」与「被截断了」。
 const TRUNCATED_MARKER: &str = "\n[truncated]";
 
 /// 一次 `run_turn` 的投影结果（outcome 组装用）。
 pub struct AgentTurnResult {
+    /// assistant 的文本输出（已按上限截断）。
     pub text: String,
+    /// 末条 assistant 的停止原因（wire 字面量）。
     pub stop_reason: String,
+    /// 失败原因（成功时为 None）。
     pub error: Option<String>,
+    /// 映射到 runner 退出码契约的退出码。
     pub exit_code: i32,
 }
 
@@ -29,6 +39,7 @@ pub fn summarize(summary: &TurnSummary) -> AgentTurnResult {
     });
     let (text, stop_reason) = match last_assistant {
         Some(message) => {
+            // 只拼接文本块：工具调用块的内容不是「输出」。
             let joined = join_text(message.content.iter().filter_map(|block| match block {
                 ContentBlock::Text { text } => Some(text.as_str()),
                 _ => None,
@@ -58,6 +69,8 @@ pub fn summarize(summary: &TurnSummary) -> AgentTurnResult {
                     exit_code: 0,
                 }
             } else if stop_reason == "tool_use" {
+                // 末条停在 tool_use = max_turns 耗尽：工具副作用已经发生，
+                // 不能当成「再跑一次就好」，明确判失败并说明原因。
                 AgentTurnResult {
                     text,
                     stop_reason,
@@ -106,6 +119,8 @@ fn join_text<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
             result.push_str(part);
             continue;
         }
+        // 回退到字符边界：按字节切会把多字节字符切成半个，产生非法
+        // UTF-8，一路带到 journal 会失败。
         let mut cut = remaining;
         while !part.is_char_boundary(cut) {
             cut -= 1;
@@ -123,6 +138,7 @@ mod tests {
     use conga::types::message::{AssistantMessage, FunctionCall, ToolCall};
     use conga::{AgentMessage, ContentBlock, StopReason};
 
+    /// 构造一条 assistant 消息（测试用）。
     fn assistant(stop: StopReason, text: &str) -> AgentMessage {
         AgentMessage::Assistant(AssistantMessage {
             content: vec![ContentBlock::text(text)],
@@ -134,6 +150,7 @@ mod tests {
         })
     }
 
+    /// 构造一条回合摘要（测试用）。
     fn summary(reason: TurnEndReason, messages: Vec<AgentMessage>) -> TurnSummary {
         TurnSummary {
             reason,
@@ -141,6 +158,7 @@ mod tests {
         }
     }
 
+    /// 末条 EndTurn 即成功，文本取末条。
     #[test]
     fn end_turn_is_success_with_text() {
         let s = summary(
@@ -157,6 +175,7 @@ mod tests {
         assert!(out.error.is_none());
     }
 
+    /// 末条停在 tool_use = max_turns 耗尽（失败）。
     #[test]
     fn last_tool_use_means_max_turns_exhausted() {
         let s = summary(
@@ -169,6 +188,7 @@ mod tests {
         assert!(out.error.as_deref().unwrap().contains("max turns"));
     }
 
+    /// 中间轮 MaxTokens 不判死，只看末条。
     #[test]
     fn mid_turn_max_tokens_then_end_turn_still_succeeds() {
         let s = summary(
@@ -182,6 +202,7 @@ mod tests {
         assert_eq!(summarize(&s).exit_code, 0);
     }
 
+    /// 末条 MaxTokens 不得被静默判成功。
     #[test]
     fn trailing_max_tokens_is_not_silently_successful() {
         let s = summary(
@@ -193,6 +214,7 @@ mod tests {
         assert_eq!(out.stop_reason, "max_tokens");
     }
 
+    /// 回合错误 → 退出码 1；中止 → 130。
     #[test]
     fn error_and_aborted_map_to_their_exit_codes() {
         let s = summary(
@@ -209,6 +231,7 @@ mod tests {
         assert_eq!(summarize(&s).exit_code, 130);
     }
 
+    /// 文本块拼接、工具块忽略。
     #[test]
     fn text_blocks_are_joined_and_tool_blocks_ignored() {
         let message = AssistantMessage {
@@ -240,6 +263,7 @@ mod tests {
         assert_eq!(out.exit_code, 0);
     }
 
+    /// 超限文本被截断并留标记，且仍在派生上限内。
     #[test]
     fn oversized_text_is_truncated_with_marker_under_the_derive_limit() {
         let big = "汉".repeat(TEXT_LIMIT_BYTES); // 每字符 3 字节

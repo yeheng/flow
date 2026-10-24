@@ -1,3 +1,18 @@
+//! `flow-cli journal`：v2 协议的低层命令面（回归、比较、原始调用、事件流、下载）。
+//!
+//! 这一组命令是给**自动化与排障**用的：它们直接暴露 v2 协议的能力，
+//! 而不是包装成产品语义。日常操作请用 `flow-cli workflow` / `flow-cli run`。
+//!
+//! 关键约定：
+//!
+//! - **写入必须带稳定的 request_id**：写方法的幂等键由 CLI 注入
+//!   （`--request-id` > 请求文件里的 `request_id` > 新生成的 UUID）。
+//!   回复丢失时用同一把键重发，服务端会认出「这是同一次写」。
+//! - **交付状态未知时给出命令身份**：写调用的网络错误不代表服务端没执行，
+//!   错误文案会带上 scope 与 request_id，供 `command.status` 查询回执。
+//! - **下载写新文件**：目标文件已存在会直接失败（`create_new`），
+//!   不会静默覆盖用户的数据。
+
 use crate::error::CliError;
 use clap::Subcommand;
 use jsonrpsee::{core::client::ClientT, ws_client::WsClient};
@@ -5,10 +20,15 @@ use serde_json::{json, Value};
 use std::{io::Read, path::PathBuf};
 
 tokio::task_local! {
+    /// 本次进程内生效的写命令幂等键。
+    ///
+    /// 用 task_local 传递是因为它是**命令级**上下文：一个 CLI 进程里
+    /// 可能顺序执行多次写，必须共用同一把键才能保证「回复丢失后重发」被识别。
     pub(crate) static REQUEST_ID: Option<String>;
 }
 
 #[derive(Subcommand)]
+/// journal 子命令组。
 pub enum Command {
     /// Execute a candidate against recorded external outcomes; fail CI on differences.
     Regress {
@@ -43,9 +63,14 @@ pub enum Command {
         http: String,
     },
 }
+/// 把任意错误收敛成本地错误。
 fn error(e: impl ToString) -> CliError {
     CliError::local(e.to_string())
 }
+/// 发起一次带令牌的 v2 RPC 调用，并归一化错误。
+///
+/// 写方法会自动补上 `request_id`；网络层错误（而非服务端明确报错）会被
+/// 翻译成「交付状态未知」的提示，并保留命令身份供事后查回执。
 pub(crate) async fn call(
     client: &WsClient,
     token: &str,
@@ -94,6 +119,7 @@ pub(crate) async fn call(
         Err(e) => Err(error(e)),
     }
 }
+/// 分派 journal 子命令。
 pub async fn dispatch(client: &WsClient, command: Command) -> Result<(), CliError> {
     let token =
         std::env::var("FLOW_JOURNAL_TOKEN").map_err(|_| error("FLOW_JOURNAL_TOKEN required"))?;
@@ -234,6 +260,7 @@ pub async fn dispatch(client: &WsClient, command: Command) -> Result<(), CliErro
     Ok(())
 }
 
+/// 打印回归比较报告；不通过时以 exit 4 结束。
 fn print_comparison(report: Value, candidate: &str) -> Result<(), CliError> {
     println!("{}", serde_json::to_string_pretty(&report).map_err(error)?);
     if report["passed"] == true {

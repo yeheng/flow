@@ -21,6 +21,7 @@ use crate::report::{Latency, Report};
 const PUSH_CHAIN_DEPTH: usize = 2;
 const MAX_SUBSCRIBE_CONCURRENCY: usize = 8;
 
+/// 订阅推送延迟测量：提交 → 落账 → 事件到达客户端。
 pub async fn run(ctx: &mut Ctx, opts: &Opts) -> Vec<Report> {
     let client = ctx.client().await;
     let (workflow_id, _) = publish_workflow(

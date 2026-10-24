@@ -7,6 +7,11 @@
 //! 输出复用一期连续 chunk 语义：ValueChunk(ValueCodec 编码字节按 256 KiB
 //! 分块、base64) + ValuePublished(固定描述) 审计记录，主进程按同一规则
 //! 持久化，journal 字节与一期进程内路径一致。
+//!
+//! 本模块守住的契约是「字节要么完整校验通过、要么不存在」：块摘要
+//! 逐块校验、整值摘要在装配完成时校验、长度与总量受预算封顶。任何
+//! 半截的输入若被放行，后面的模板展开与脚本求值会读到损坏的 JSON，
+//! 而错误会伪装成用户代码的失败——那是最难排查的一类偏差。
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -21,19 +26,26 @@ use flow_journal::{StoredValue, CHUNK_BYTES, INLINE_BYTES, MAX_VALUE_BYTES};
 
 use crate::audit::AuditStream;
 
+/// 传输装配故障：装配失败一律拒绝该派发，不做「尽力而为」的部分使用。
 #[derive(Debug, thiserror::Error)]
 pub enum TransferError {
+    /// 块摘要与字节不符：传输损坏或被篡改。
     #[error("transfer chunk digest mismatch at offset {0}")]
     Digest(u64),
+    /// 装配不完整：缺块、就绪声明冲突或流不存在。
     #[error("transfer incomplete: {0}")]
     Incomplete(String),
+    /// 超出体积或条数预算。
     #[error("transfer size exceeds budget: {0}")]
     Oversize(u64),
+    /// 重复块的内容与已收前缀不符。
     #[error("duplicate transfer chunk: {0}@{1}")]
     Duplicate(String, u64),
 }
 
 /// 输入装配器：按 transfer_id 聚合。
+///
+/// 生命周期覆盖一次派发：装配、派生输出、恢复重放都从这里取字节。
 #[derive(Default)]
 pub struct IncomingTransfers {
     streams: BTreeMap<String, TransferBuffer>,
@@ -52,6 +64,11 @@ struct TransferBuffer {
 }
 
 impl IncomingTransfers {
+    /// 接收一个数据块并累加到对应流的连续前缀。
+    ///
+    /// # Errors
+    /// 摘要不符、长度超限、出现缺口或重叠冲突时返回错误（不缓存半截
+    /// 数据，避免后续误用）。
     pub fn feed(&mut self, chunk: &Message) -> Result<(), TransferError> {
         let Message::TransferChunk {
             // 路由字段由主进程/中继消费；执行器会话单任务，不校验归属。
@@ -67,6 +84,8 @@ impl IncomingTransfers {
         if transfer_id.len() > 256
             || (!self.streams.contains_key(transfer_id) && self.streams.len() >= 4096)
         {
+            // transfer_id 长度与并发流条数双限额：id 长度防畸形标识撑爆
+            // 内存，条数上限防大量短流耗尽执行器内存。
             return Err(TransferError::Oversize(self.streams.len() as u64));
         }
         if bytes.len() > CHUNK_BYTES {
@@ -74,11 +93,13 @@ impl IncomingTransfers {
         }
         // T12：内存中 bytes 已是原始字节（v3 wire 的 base64 在解码层还原）。
         if hex::encode(Sha256::digest(bytes)) != *digest {
+            // 逐块摘要：损坏要在写入缓冲前发现，不能等整值摘要。
             return Err(TransferError::Digest(*offset));
         }
         let end = offset
             .checked_add(bytes.len() as u64)
             .ok_or(TransferError::Oversize(*offset))?;
+        // 输入面（`in:` 前缀）按执行器输入预算封顶，其余按单值上限封顶。
         let limit = if transfer_id.starts_with("in:") {
             crate::task::INPUT_BUDGET as u64
         } else {
@@ -88,6 +109,8 @@ impl IncomingTransfers {
             return Err(TransferError::Oversize(end));
         }
         let total: u64 = self.streams.values().map(|s| s.buf.len() as u64).sum();
+        // 输入流单独累计：单值上限 8 MiB 挡不住「N 个各 8 MiB 的输入」
+        // 一起把执行器内存撑爆。
         let inputs: u64 = self
             .streams
             .iter()
@@ -127,6 +150,10 @@ impl IncomingTransfers {
         self.try_assemble(transfer_id)
     }
 
+    /// 记录一条流的「就绪」声明（总长 + 整值摘要），并尝试完成装配。
+    ///
+    /// # Errors
+    /// 总长超限、id 畸形、或与既有就绪声明冲突时返回错误。
     pub fn input_ready(&mut self, ready: &Message) -> Result<(), TransferError> {
         let Message::InputReady {
             dispatch_id: _,
@@ -158,6 +185,8 @@ impl IncomingTransfers {
             });
         if let Some(previous) = &stream.ready {
             if *previous != (*total_bytes, digest.clone()) {
+                // 同一流出现两份不同的就绪声明：无法判定哪份为真，
+                // 只能拒绝（静默取其一等于把不确定当确定）。
                 return Err(TransferError::Incomplete("conflicting readiness".into()));
             }
             if stream.assembled {
@@ -169,6 +198,14 @@ impl IncomingTransfers {
         self.try_assemble(transfer_id)
     }
 
+    /// 尝试把某条流标记为「已装配」。
+    ///
+    /// 装配完成的判据是三个条件同时成立：就绪声明已到、已收字节数等于
+    /// 声明总长、整值摘要匹配。任一不满足就继续等或报错，绝不「差不多
+    /// 就用」。
+    ///
+    /// # Errors
+    /// 流不存在、超出声明总长或摘要不符时返回错误。
     fn try_assemble(&mut self, transfer_id: &str) -> Result<(), TransferError> {
         let Some(stream) = self.streams.get_mut(transfer_id) else {
             return Err(TransferError::Incomplete(transfer_id.into()));
@@ -216,6 +253,7 @@ impl IncomingTransfers {
         }
     }
 
+    /// 该流是否已就绪且装配完成（可取用）。
     pub fn is_ready(&self, transfer_id: &str) -> bool {
         self.streams
             .get(transfer_id)
@@ -224,6 +262,7 @@ impl IncomingTransfers {
 }
 
 impl TransferBuffer {
+    /// 新建空缓冲。
     fn new() -> Self {
         Self {
             buf: Arc::new(Vec::new()),
@@ -242,6 +281,9 @@ impl Default for TransferBuffer {
 /// 执行器侧大值编码：≤ INLINE_BYTES 直接 inline；否则按一期 Capture 语义
 /// 产出 ValueChunk/ValuePublished 审计记录并返回 Ref。journal 中的记录
 /// 字节与一期 `Attempt::json` 完全一致（journal_id 来自会话身份）。
+///
+/// # Errors
+/// 值编码超预算、深度超限或分块发布失败时返回错误。
 pub async fn store_value(
     audit: &mut AuditStream,
     journal_id: &str,
@@ -254,6 +296,9 @@ pub async fn store_value(
 }
 
 /// 任意字节（HTTP 原始响应）走 Bytes 编码。
+///
+/// # Errors
+/// 字节超单值上限或发布失败时返回错误。
 pub async fn store_bytes(
     audit: &mut AuditStream,
     journal_id: &str,
@@ -270,6 +315,9 @@ pub async fn store_bytes(
 }
 
 /// [`store_bytes`] 的分块分支：只发审计分块 + 发布，绝不 inline。
+///
+/// # Errors
+/// 字节超单值上限或审计发布失败时返回错误。
 pub async fn store_bytes_ref(
     audit: &mut AuditStream,
     journal_id: &str,
@@ -289,6 +337,8 @@ pub async fn store_bytes_ref(
             chunk_index: index,
             data: STANDARD.encode(chunk),
         };
+        // 分块逐条入审计流：每条都占窗口额度，所以 push_wait 会在窗口
+        // 满时等待主进程确认，而不是把内存撑住。
         audit
             .push_wait(
                 "value_chunk",
@@ -315,6 +365,9 @@ pub async fn store_bytes_ref(
         )
         .await?;
     // Publication is a barrier: callers can safely queue small metadata afterwards.
+    //
+    // 发布记录是屏障：主进程按它才知道这些块属于同一个值，且必须先落
+    // 盘；此后才允许追加引用它的小元数据。
     audit.await_published(seq).await?;
     Ok(StoredValue::Ref(reference))
 }
@@ -323,6 +376,7 @@ pub async fn store_bytes_ref(
 mod tests {
     use super::*;
 
+    /// 构造一个合法的 TransferChunk 测试帧。
     fn chunk(id: &str, offset: u64, data: &[u8]) -> Message {
         Message::TransferChunk {
             dispatch_id: "d".into(),
@@ -333,6 +387,7 @@ mod tests {
         }
     }
 
+    /// InputReady 未到不得取用；重复读取共享同一份字节。
     #[test]
     fn transfers_assemble_only_after_input_ready() {
         let mut incoming = IncomingTransfers::default();
@@ -356,6 +411,7 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &second));
     }
 
+    /// 缺口在 feed 时即被拒；整值摘要在装配时校验。
     #[test]
     fn gap_and_digest_rejected() {
         let mut incoming = IncomingTransfers::default();

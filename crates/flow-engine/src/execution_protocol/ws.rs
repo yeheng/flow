@@ -11,6 +11,11 @@
 //!
 //! 该类型是 `FrameTransport` 的字节流承载面：直连 mTLS 与 WSS 复用同一
 //! 传输/握手/会话校验逻辑，WSS 只替换物理承载。
+//!
+//! 守护的核心不变量：WS 只是承载，不改变帧语义——一条 Binary 消息
+//! 可以承载半帧、多帧或帧的一部分，帧边界完全由上层帧解码器重建；
+//! 任何一条 WS 消息的长度上限都必须与帧上限解耦（否则贴着帧上限的
+//! 合法帧会在 WSS 上失败、在 TCP 上正常）。
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -49,6 +54,10 @@ pub struct WsByteStream<S> {
 }
 
 impl<S> WsByteStream<S> {
+    /// 包装一条已建立的 WebSocket 流为字节流适配器。
+    ///
+    /// 适配器不改变握手语义：WS 层的握手/鉴权在上游完成，这里只
+    /// 负责字节与消息的双向搬运。
     pub fn new(stream: WebSocketStream<S>) -> Self {
         Self {
             stream,
@@ -111,6 +120,10 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> WsByteStream<S> {
 }
 
 impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> AsyncRead for WsByteStream<S> {
+    /// 从 WS 消息里取字节喂给上层帧解码器。
+    ///
+    /// 半帧/粘帧都允许：这里只保证「字节流顺序正确」，帧边界由上层
+    /// 重建。Text 消息明确拒绝（协议只用 Binary），Close 视作 EOF。
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -177,6 +190,10 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> AsyncRead for WsBy
 }
 
 impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> AsyncWrite for WsByteStream<S> {
+    /// 把字节写入待发缓冲（后续由 [`Self::poll_flush`] 按 WS 消息切分发出）。
+    ///
+    /// 契约：调用方一次写入的是**一整帧**（transport 对整帧调用一次
+    /// `write_all`），因此缓冲上限只需容纳一个最大帧。
     fn poll_write(
         mut self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
@@ -196,10 +213,14 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> AsyncWrite for WsB
         Poll::Ready(Ok(buf.len()))
     }
 
+    /// 冲刷待发缓冲与控制帧（Pong）。
+    ///
+    /// 写侧拥塞时返回 `Pending` 并保留待发内容，由 waker 唤醒后重试。
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         self.poll_send_pending(cx)
     }
 
+    /// 关闭：先冲刷待发内容，再发 WS Close 帧。
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         // 先冲刷待发，再发 Close。
         match self.poll_send_pending(cx) {
@@ -215,6 +236,10 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> AsyncWrite for WsB
     }
 }
 
+/// 把 tungstenite 错误折成 I/O 错误（统一映射为断链语义）。
+///
+/// 统一成 `BrokenPipe` 而不是逐个透传 tungstenite 的错误种类：上层只
+/// 需要知道「连接断了」，再细分错误类型没有可操作性。
 fn ws_io(error: tokio_tungstenite::tungstenite::Error) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::BrokenPipe, error)
 }
@@ -375,6 +400,7 @@ mod tests {
     }
 
     impl GatedStream {
+        /// 包装一条 duplex 流并挂上闸门。
         fn new(inner: tokio::io::DuplexStream, gate: Gate) -> Self {
             Self { inner, gate }
         }
@@ -387,13 +413,16 @@ mod tests {
     }
 
     impl Gate {
+        /// 开闸并唤醒等待者（写侧恢复可用）。
         fn open(&self) {
             self.open.store(true, std::sync::atomic::Ordering::SeqCst);
             self.wake();
         }
+        /// 关闸：写侧转为拥塞（poll_write 返回 Pending）。
         fn close(&self) {
             self.open.store(false, std::sync::atomic::Ordering::SeqCst);
         }
+        /// 唤醒最后一个登记的 waker（闸门状态变化后必须调用）。
         fn wake(&self) {
             if let Some(waker) = self.waker.lock().unwrap().take() {
                 waker.wake();
@@ -402,6 +431,7 @@ mod tests {
     }
 
     impl tokio::io::AsyncRead for GatedStream {
+        /// 读方向不受闸门影响（只关写侧）。
         fn poll_read(
             mut self: Pin<&mut Self>,
             cx: &mut Context<'_>,
@@ -412,6 +442,7 @@ mod tests {
     }
 
     impl tokio::io::AsyncWrite for GatedStream {
+        /// 闸门关闭时返回 Pending 并登记 waker，模拟底层写侧拥塞。
         fn poll_write(
             mut self: Pin<&mut Self>,
             cx: &mut Context<'_>,
@@ -424,6 +455,7 @@ mod tests {
             Pin::new(&mut self.inner).poll_write(cx, buf)
         }
 
+        /// 闸门关闭时同样返回 Pending（写侧整体不可用）。
         fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             if !self.gate.open.load(std::sync::atomic::Ordering::SeqCst) {
                 *self.gate.waker.lock().unwrap() = Some(cx.waker().clone());
@@ -432,6 +464,7 @@ mod tests {
             Pin::new(&mut self.inner).poll_flush(cx)
         }
 
+        /// 关闸不影响 shutdown（用于收尾测试）。
         fn poll_shutdown(
             mut self: Pin<&mut Self>,
             cx: &mut Context<'_>,

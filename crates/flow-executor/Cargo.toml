@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 flow-engine = { path = "../flow-engine" }
 flow-journal = { path = "../flow-journal", default-features = false, features = ["storage"] }
+# 仅用 flow_home()（harness 沙箱的统一落点 FLOW_HOME/~/.flow/harness）
+flow-config = { path = "../flow-config" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde = { workspace = true }

@@ -1,4 +1,10 @@
 //! Materialized product views of committed V2 state. No alternate command or event protocol.
+//!
+//! 本模块是产品面的物化读面：把已提交的当前行翻译成 DTO。
+//! 它守护的核心不变量是「读面不产生新事实」——这里只有读，没有第二条
+//! 写入路径，因此读到的状态与权威库严格一致。
+//! 需要它，是因为产品面需要跨运行的聚合视图（列表、统计、时间线），
+//! 而这些视图不能由 journal 的分页事实直接拼出，也不能另起一套协议。
 use crate::journal::JournalBackend;
 use crate::ViewError;
 use chrono::{DateTime, Utc};
@@ -12,9 +18,13 @@ use flow_journal::{StoredValue, MAX_LINE_BYTES};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 pub type Result<T> = std::result::Result<T, ViewError>;
+
+/// 内部错误归类：读面故障统一为 Unavailable，与「不存在」「超限」区分开。
 fn internal(error: impl std::fmt::Display) -> ViewError {
     ViewError::Unavailable(error.to_string())
 }
+
+/// 存储错误归类：响应过大单独成类，其余归为内部故障。
 fn storage(error: crate::StorageError) -> ViewError {
     if matches!(error, crate::StorageError::ResponseTooLarge) {
         ViewError::Limit("RESPONSE_TOO_LARGE".into())
@@ -22,12 +32,15 @@ fn storage(error: crate::StorageError) -> ViewError {
         internal(error)
     }
 }
+
+/// 解析 RFC3339 时间戳并统一到 UTC。
 fn parse_ts(raw: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(raw)
         .map(|ts| ts.with_timezone(&Utc))
         .map_err(|e| internal(format!("invalid timestamp {raw}: {e}")))
 }
 
+/// 把一条已存版本记录物化成产品面 DTO（定义正文在此刻才读出）。
 fn workflow_version(
     root: &std::path::Path,
     upper: u64,
@@ -53,12 +66,14 @@ fn workflow_version(
     })
 }
 
+/// 读一个工作流的指定版本（缺省为最新已发布版本）。
 pub async fn get_version(
     backend: &JournalBackend,
     workflow_id: &str,
     version: Option<i64>,
 ) -> Result<WorkflowVersion> {
     if version.is_some_and(|v| v < 1) {
+        // 版本号从 1 开始：0 不是合法版本，报「不存在」比报错更贴近调用方预期。
         return Err(ViewError::NotFound(format!("版本不存在：{workflow_id}")));
     }
     let stored = backend
@@ -74,6 +89,7 @@ pub async fn get_version(
         .map_err(internal)?
 }
 
+/// 查工作流最新的已发布版本号（无发布版本时返回 None）。
 pub async fn latest_published(backend: &JournalBackend, workflow_id: &str) -> Result<Option<i64>> {
     Ok(backend
         .inspect(|state| {
@@ -86,6 +102,7 @@ pub async fn latest_published(backend: &JournalBackend, workflow_id: &str) -> Re
         .await)
 }
 
+/// 列出工作流的全部版本（含定义正文）。
 pub async fn list_versions(
     backend: &JournalBackend,
     workflow_id: &str,
@@ -94,6 +111,7 @@ pub async fn list_versions(
         .definition_versions(workflow_id)
         .await
         .map_err(definition_error)?;
+    // 先按总量预留预算，再去读正文文件：避免读完才发现超限而浪费 IO。
     reserve_values(stored.iter().map(|v| &v.definition))?;
     let root = backend.journal.root().to_path_buf();
     let upper = backend.journal.durable_lsn();
@@ -126,6 +144,7 @@ pub async fn version_metadata(backend: &JournalBackend, workflow_id: &str) -> Re
         .collect()
 }
 
+/// 把后端错误映射成读面错误分类（NotFound / Limit / 其它）。
 fn definition_error(error: crate::journal::JournalError) -> ViewError {
     match error {
         crate::journal::JournalError::Journal(flow_journal::Error::NotFound(message)) => {
@@ -139,6 +158,9 @@ fn definition_error(error: crate::journal::JournalError) -> ViewError {
 }
 
 /// Reserve the complete encoded business-value size before reading value files.
+///
+/// 预算必须在开文件之前一次性预留完：读了半个响应才发现超限，
+/// 已经消耗的 IO 与内存都白费，而且响应可能已经被部分写出。
 fn reserve_values<'a>(values: impl IntoIterator<Item = &'a StoredValue>) -> Result<()> {
     let mut remaining = VALUE_BUDGET;
     for value in values {
@@ -153,6 +175,7 @@ fn reserve_values<'a>(values: impl IntoIterator<Item = &'a StoredValue>) -> Resu
     Ok(())
 }
 
+/// 把工作流当前行翻译成摘要 DTO（不读定义正文）。
 fn workflow_summary(value: &Value) -> Result<WorkflowSummary> {
     let workflow: JournalWorkflow = serde_json::from_value(value.clone()).map_err(internal)?;
     Ok(WorkflowSummary {
@@ -164,6 +187,7 @@ fn workflow_summary(value: &Value) -> Result<WorkflowSummary> {
     })
 }
 
+/// 列出全部未删除的工作流摘要。
 pub async fn list_workflows(backend: &JournalBackend) -> Result<Vec<WorkflowSummary>> {
     backend
         .store
@@ -171,11 +195,13 @@ pub async fn list_workflows(backend: &JournalBackend) -> Result<Vec<WorkflowSumm
         .await
         .map_err(storage)?
         .into_iter()
+        // 已删除的工作流不出现在产品列表里，但行仍保留在权威库中。
         .filter(|v| v["deleted"] != true)
         .map(|v| workflow_summary(&v))
         .collect()
 }
 
+/// 把一个 run 的当前记录翻译成产品面 DTO（含输入/输出正文）。
 fn run_record(root: &std::path::Path, upper: u64, run: &JournalRun) -> Result<RunRecord> {
     let materialize =
         |value: &StoredValue| flow_journal::value::materialize(root, upper, value, VALUE_BUDGET);
@@ -196,6 +222,7 @@ fn run_record(root: &std::path::Path, upper: u64, run: &JournalRun) -> Result<Ru
     })
 }
 
+/// 读单个 run 的产品面记录。
 pub async fn get_run(backend: &JournalBackend, run_id: &str) -> Result<RunRecord> {
     let (_, value) = backend
         .store
@@ -209,6 +236,10 @@ pub async fn get_run(backend: &JournalBackend, run_id: &str) -> Result<RunRecord
     Ok(materialize_runs(backend, vec![run]).await?.remove(0))
 }
 
+/// 批量物化 run 的输入/输出正文。
+///
+/// 先把整批的编码后尺寸算清楚，超预算就直接拒绝；正文读取放在
+/// blocking 任务里，避免阻塞异步运行时。
 async fn materialize_runs(
     backend: &JournalBackend,
     runs: Vec<JournalRun>,
@@ -236,6 +267,7 @@ async fn materialize_runs(
         .map_err(internal)?
 }
 
+/// 按工作流/状态/来源分页列出 run。
 pub async fn list_runs(
     backend: &JournalBackend,
     workflow_id: Option<&str>,
@@ -266,6 +298,7 @@ pub async fn list_runs(
     .await
 }
 
+/// 统计 run 数量（按状态与工作流分组）。
 pub async fn run_stats(backend: &JournalBackend, workflow_id: Option<&str>) -> Result<RunStats> {
     let mut stats = RunStats {
         total: 0,
@@ -295,12 +328,14 @@ pub async fn run_stats(backend: &JournalBackend, workflow_id: Option<&str>) -> R
     Ok(stats)
 }
 
+/// 判断 run 是否仍在进行（未终态）。
 pub async fn is_live(backend: &JournalBackend, run_id: &str) -> bool {
     backend
         .inspect(|state| state.runs.get(run_id).is_some_and(|run| !run.terminal()))
         .await
 }
 
+/// 把定时器配置行翻译成 DTO。
 fn schedule_from_config(config: &Value) -> Result<Schedule> {
     let input = if config["input"].is_null() {
         None
@@ -330,6 +365,7 @@ fn schedule_from_config(config: &Value) -> Result<Schedule> {
     })
 }
 
+/// 把 webhook 配置行翻译成 DTO。
 fn webhook_from_config(config: &Value) -> Result<Webhook> {
     Ok(Webhook {
         token: config["token"]
@@ -349,6 +385,7 @@ fn webhook_from_config(config: &Value) -> Result<Webhook> {
     })
 }
 
+/// 列出定时器配置（可按工作流过滤）。
 pub async fn list_schedules(
     backend: &JournalBackend,
     workflow_id: Option<&str>,
@@ -363,6 +400,7 @@ pub async fn list_schedules(
         .collect()
 }
 
+/// 列出 webhook 配置（可按工作流过滤）。
 pub async fn list_webhooks(
     backend: &JournalBackend,
     workflow_id: Option<&str>,
@@ -377,6 +415,7 @@ pub async fn list_webhooks(
         .collect()
 }
 
+/// 把模板配置行翻译成完整 DTO（含节点/边片段）。
 fn template_from_config(config: &Value) -> Result<NodeTemplate> {
     Ok(NodeTemplate {
         id: config["id"]
@@ -403,6 +442,7 @@ fn template_from_config(config: &Value) -> Result<NodeTemplate> {
     })
 }
 
+/// 列出节点模板摘要（列表视图不读完整片段）。
 pub async fn template_list(backend: &JournalBackend) -> Result<Vec<NodeTemplateSummary>> {
     let configs = backend
         .store
@@ -438,6 +478,7 @@ pub async fn template_list(backend: &JournalBackend) -> Result<Vec<NodeTemplateS
         .collect()
 }
 
+/// 读单个节点模板的完整内容。
 pub async fn template_get(backend: &JournalBackend, id: &str) -> Result<NodeTemplate> {
     backend
         .inspect(|state| {
@@ -480,6 +521,8 @@ pub async fn timeline(backend: &JournalBackend, run_id: &str) -> Result<Value> {
         let node = run.nodes.get(&spec.id);
         let child = children.get(&spec.id);
         let status = node.map_or("pending", |n| n.status.as_str());
+        // 展示态与业务状态分开：retrying 与 running 在产品面要区分，
+        // 但底层状态都还是 waiting。
         let display_state = match status {
             "succeeded" => "completed",
             "waiting" => {
@@ -496,6 +539,7 @@ pub async fn timeline(backend: &JournalBackend, run_id: &str) -> Result<Value> {
         };
         let output = node
             .and_then(|n| n.output.as_ref())
+            // 节点正文可能含密钥等敏感内容，展示前统一脱敏。
             .map(|v| materialize(v).map(|v| flow_engine::nodelog::redact_snapshot(&v)))
             .transpose()?;
         let input = node
@@ -525,6 +569,7 @@ pub async fn timeline(backend: &JournalBackend, run_id: &str) -> Result<Value> {
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+    /// 累计预算必须在开文件之前判定：两个半预算的值也必须被拒绝。
     #[test]
     fn cumulative_values_are_rejected_before_opening_files() {
         let value = StoredValue::Ref(flow_journal::value::ValueRef {

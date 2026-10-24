@@ -1,3 +1,12 @@
+//! 唯一写者：把事务排队、组提交进 SQLite，并把回执送回提交方。
+//!
+//! 本模块拥有全部写连接——只有专用泵线程可以写库，其他线程只能提交请求并
+//! 等待回执。这条边界让「提交序号」和「写顺序」有唯一解释。
+//! 核心不变量：一批事务要么整体提交、要么整体回滚，绝不确认半套数据；事实、
+//! 当前状态与回执在同一个 SQLite 事务里生效；平台故障必须冻结写者，而不是
+//! 在状态可疑的权威上继续写。
+//! 需要它的原因：协调器并发产生状态迁移，而权威库只能有一个写者；组提交
+//! 既提供吞吐，又必须让每个提交方看到「全部生效或全部不生效」。
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
@@ -12,6 +21,11 @@ use crate::storage::{FaultInjection, Location};
 use crate::value::{PreparedValue, StagedValue};
 use crate::{invalid, Error, Result, MAX_LINE_BYTES};
 
+/// 写者的资源预算。
+///
+/// 这些是上限而不是目标：每个预算都对应一种过载来源（字节预算对应载荷体积，
+/// 队列长度对应请求数量，聚合等待对应延迟）。字节预算必须至少容纳一条最大
+/// 事务，否则合法事务永远无法提交。
 #[derive(Debug, Clone)]
 pub struct JournalOptions {
     pub batch_bytes: usize,
@@ -22,6 +36,8 @@ pub struct JournalOptions {
     pub faults: FaultInjection,
 }
 impl Default for JournalOptions {
+    /// 默认预算：控制面 4 MiB、审计面 16 MiB、单批 4 MiB、队列 1024 请求、
+    /// 聚合等待 5 ms。审计面额度更大是因为值分块体积远大于命令事件。
     fn default() -> Self {
         Self {
             batch_bytes: 4 * 1024 * 1024,
@@ -34,12 +50,24 @@ impl Default for JournalOptions {
     }
 }
 
+/// 提交队列分类。
+///
+/// 控制面与审计面分开计量与排队：控制面承载业务状态迁移，延迟敏感；审计面
+/// 承载大值分块等审计事实，体积大但可以等待。两类共享同一条写序，因此不
+/// 存在「谁先谁后」的顺序歧义。
 #[derive(Debug, Clone)]
 pub enum QueueClass {
+    /// 控制面：业务状态迁移与命令回执。
     Control,
+    /// 审计面：按 dispatch/output 身份分桶，同桶内保持提交顺序。
     Audit(String),
 }
 
+/// 一次成功提交的回执。
+///
+/// 提交方拿到的不是「写完了」而是「写在哪」：`location` 指出事实的提交序号
+/// 与字节数，`transaction` 是已分配最终 LSN 的事实，`value_prefix` 是紧随其前
+/// 的值分块事务（字节正文不在其中，正文存在值存储里）。
 #[derive(Debug, Clone)]
 pub struct Commit {
     pub transaction: Arc<Transaction>,
@@ -48,6 +76,11 @@ pub struct Commit {
     pub value_prefix: Vec<Transaction>,
 }
 
+/// 写者的可观测快照。
+///
+/// 用于健康检查与基准：区分「在飞」（正在提交的一批）与「排队」（已受理未
+/// 提交），并暴露组提交比（transactions / data_syncs）与 fsync 延迟分布，
+/// 以便判断权威是否退化成每事务一次 fsync。
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct WriterStats {
     pub in_flight: bool,
@@ -69,6 +102,10 @@ pub struct WriterStats {
     pub failure: Option<String>,
 }
 
+/// 队列中一条待提交请求。
+///
+/// `_bytes` / `_slot` 是信号量许可：随请求一起排队、被弹出时释放，保证队列
+/// 长度与字节量同时受背压约束，不会因为「已编码但未提交」而超发。
 struct Pending {
     tx: Transaction,
     values: Vec<StagedValue>,
@@ -81,6 +118,10 @@ struct Pending {
     _bytes: OwnedSemaphorePermit,
     _slot: OwnedSemaphorePermit,
 }
+/// 写者的排队结构。
+///
+/// 控制面是单队列；审计面按 dispatch 身份分桶，并用轮转表公平调度，避免
+/// 一个大值流饿死其他审计提交。
 #[derive(Default)]
 struct Queue {
     control: VecDeque<Pending>,
@@ -95,6 +136,9 @@ struct Queue {
 }
 
 impl Queue {
+    /// 预看队首请求的字节数，用于组批时判断「再放一条会不会超预算」。
+    ///
+    /// 只读不改状态：真正的弹出由 `pop` 决定，预看不能改变轮转顺序。
     fn next_bytes(&self) -> Option<usize> {
         if !self.control.is_empty() && (self.control_turn || self.round.is_empty()) {
             self.control.front().map(|p| p.bytes)
@@ -105,6 +149,10 @@ impl Queue {
                 .map(|p| p.bytes)
         }
     }
+    /// 弹出队首请求并更新字节/请求计数。
+    ///
+    /// 控制面与审计面交替轮转：每个审计桶出队一次后重新排到轮转表尾部，
+    /// 保证大流量审计桶不会独占写序。
     fn pop(&mut self) -> Option<Pending> {
         let control = !self.control.is_empty() && (self.control_turn || self.round.is_empty());
         self.control_turn = !control;
@@ -129,10 +177,18 @@ impl Queue {
         pending
     }
 }
+/// 泵线程与提交方之间的共享状态。
+///
+/// 用普通线程原语而非 channel：提交方需要「按类排队 + 轮转 + 字节记账」的
+/// 结构，channel 表达不了；条件变量负责唤醒泵线程。
 struct Shared {
     queue: Mutex<Queue>,
     ready: Condvar,
 }
+/// 写者的进程内状态。
+///
+/// 字节与槽位配额用信号量表达：排队方在入队前就拿到许可，避免「先入队
+/// 再发现超限」导致队列无限增长。
 struct Inner {
     id: String,
     root: PathBuf,
@@ -148,6 +204,10 @@ struct Inner {
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 impl Drop for Inner {
+    /// 关闭写者时先标记队列关闭并唤醒泵线程，再 join 泵线程。
+    ///
+    /// 顺序不能反：先置 `closing` 才能让泵线程从等待中醒来并正常退出，
+    /// 否则泵线程会永远阻塞在条件变量上，join 变成死等。
     fn drop(&mut self) {
         lock_queue(&self.shared).closing = true;
         self.shared.ready.notify_one();
@@ -163,12 +223,24 @@ impl Drop for Inner {
 }
 
 /// Cloneable submission handle. Only the dedicated thread owns journal write descriptors.
+///
+/// 可克隆的提交句柄：克隆只复制提交能力，不复制写权限——写描述符始终由
+/// 专用泵线程独占。
 #[derive(Clone)]
 pub struct Journal {
     inner: Arc<Inner>,
 }
 impl Journal {
+    /// 打开（或创建）数据目录下的唯一写者。
+    ///
+    /// 会取得数据目录的排他文件锁并启动专用泵线程；已有写者在运行时直接
+    /// 失败（`Conflict`），因为两个写者无法对同一份权威给出两个提交序。
+    ///
+    /// # Errors
+    /// 预算不合法、目录被锁、存储格式不支持时返回对应错误。
     pub async fn open(root: impl AsRef<Path>, options: JournalOptions) -> Result<Self> {
+        // 每个字节预算都必须至少能容纳一条最大事务，否则合法事务永远无法
+        // 入队；group_wait 是延迟承诺，超过 5 ms 就不再满足组提交语义。
         if options.batch_bytes < MAX_LINE_BYTES
             || options.control_bytes < MAX_LINE_BYTES
             || options.audit_bytes < MAX_LINE_BYTES
@@ -182,6 +254,8 @@ impl Journal {
         let root = root.as_ref().to_path_buf();
         let disk_root = root.clone();
         let faults = options.faults;
+        // 打开数据库要拿排他锁并可能恢复，做在阻塞线程上，避免占住异步
+        // 运行时的工作线程。
         let disk = tokio::task::spawn_blocking(move || Disk::open(&disk_root, faults))
             .await
             .map_err(|e| Error::Unavailable(e.to_string()))??;
@@ -213,6 +287,7 @@ impl Journal {
             batch_budget: options.batch_bytes,
             thread: Mutex::new(None),
         });
+        // 泵线程是唯一持有写连接的线程：它决定提交序、组批与 COMMIT 时机。
         let handle = std::thread::Builder::new()
             .name("flow-journal".into())
             .spawn(move || pump(disk, shared, options))?;
@@ -222,12 +297,17 @@ impl Journal {
             .unwrap_or_else(|poison| poison.into_inner()) = Some(handle);
         Ok(Self { inner })
     }
+    /// 返回本数据集的身份标识（journal_id）。
+    ///
+    /// 提交的事务必须携带同一个标识，否则会被判为外来事务拒绝。
     pub fn id(&self) -> &str {
         &self.inner.id
     }
+    /// 返回数据目录路径。
     pub fn root(&self) -> &Path {
         &self.inner.root
     }
+    /// 取写者状态快照：在飞、排队、提交计数与 fsync 延迟分布。
     pub fn stats(&self) -> WriterStats {
         let queue = lock_queue(&self.inner.shared);
         let mut stats = queue.stats.clone();
@@ -236,10 +316,20 @@ impl Journal {
         stats.queued_bytes = queue.bytes;
         stats
     }
+    /// 返回已持久化的最高提交序号。
+    ///
+    /// 该值只在 COMMIT 成功后前进：它是「事实已安全落盘」的公开承诺。
     pub fn durable_lsn(&self) -> u64 {
         self.stats().durable_lsn
     }
 
+    /// 提交一批事件，返回落盘回执。
+    ///
+    /// 事件在入队前完成序列化与字节核算；最终提交序号由泵线程分配，返回值
+    /// 里的序号才是事实的真实位置。
+    ///
+    /// # Errors
+    /// 队列已关闭、权威已冻结、字节预算不足时返回对应错误。
     pub async fn submit(
         &self,
         tx_id: String,
@@ -251,6 +341,9 @@ impl Journal {
     }
 
     /// Submit a checked domain transition. Facts, current state and receipts are atomic.
+    ///
+    /// 领域状态迁移的正规入口：调用方已用 reducer 预演过状态变化，写者只
+    /// 负责把「事实 + 当前行 + 回执」放进同一事务落盘。
     pub async fn submit_prepared(
         &self,
         tx: Transaction,
@@ -261,11 +354,15 @@ impl Journal {
 
     /// Stage without publishing facts. The byte permits and anonymous file live
     /// until cancellation/rollback drops them or the atomic command completes.
+    ///
+    /// 大值先落到匿名临时文件（进程退出即消失），不进入事实账本；只有随命令
+    /// 一起提交时才切成块入库。这样「命令失败」不会留下无主的值正文。
     pub async fn prepare_json(
         &self,
         value: serde_json::Value,
         limit: usize,
     ) -> Result<PreparedValue> {
+        // 暂存额度不得超过单值物化预算，否则一次暂存就能占满写者内存。
         if limit > crate::VALUE_BUDGET {
             return Err(Error::Limit("staged command value".into()));
         }
@@ -283,6 +380,13 @@ impl Journal {
     }
 
     /// Stream staged chunks and the final transition inside one SQLite COMMIT.
+    ///
+    /// 值分块与最终状态迁移共享一个提交：要么命令与其值一起生效，要么都不
+    /// 生效，避免出现「命令已生效但值还没写完」的中间态。
+    ///
+    /// # Errors
+    /// 事务属于别的数据集、值不属于本数据集、或缺少对应的发布事实时返回
+    /// [`Error::Invalid`]。
     pub async fn submit_prepared_values(
         &self,
         tx: Transaction,
@@ -292,6 +396,8 @@ impl Journal {
         if tx.journal_id != self.id() {
             return Err(invalid("foreign prepared transition"));
         }
+        // 逐个校验暂存值：发布事实必须由本数据集产生，且必须出现在最终
+        // 事务里，否则会出现「值已入库但没有任何事实引用它」的孤儿块。
         for value in &values {
             let publication = value.publication()?;
             if publication.payload["journal_id"].as_str() != Some(self.id()) {
@@ -314,6 +420,10 @@ impl Journal {
         .await
     }
 
+    /// 所有提交路径的公共实现：核算字节、取得许可、入队并等待回执。
+    ///
+    /// 顺序敏感：先算准字节再取许可，队列里的字节账才与实际占用一致；许可
+    /// 与请求同生共死，超限立即失败而不是排到队尾再失败。
     async fn submit_inner(
         &self,
         tx_id: String,
@@ -323,12 +433,14 @@ impl Journal {
         changes: Vec<EntityChange>,
         values: Vec<StagedValue>,
     ) -> Result<Commit> {
+        // 分段事件由写者自己拥有：外部提交伪造分段事件会破坏段边界约定。
         if events
             .iter()
             .any(|e| matches!(e.kind, EventKind::SegmentStarted | EventKind::SegmentSealed))
         {
             return Err(invalid("structural events are writer-owned"));
         }
+        // 控制面与审计面各自计量：审计面的大值不能把控制面饿死。
         let (semaphore, slots) = match &class {
             QueueClass::Control => (&self.inner.control, &self.inner.control_slots),
             QueueClass::Audit(key) if !key.is_empty() => {
@@ -385,10 +497,12 @@ impl Journal {
             return Err(Error::Limit("audit transaction exceeds 512 KiB".into()));
         }
         let wire = expected_lsn.map(|_| (body.len() as u64, codec::digest(&body)));
+        // 预留量高于实际用量时立刻归还差额，避免队列字节账虚高。
         drop(permit.split(reserve - bytes));
         let (ack, result) = oneshot::channel();
         {
             let mut queue = lock_queue(&self.inner.shared);
+            // 冻结后不接受新请求：权威状态已不可信，继续写只会扩大损害面。
             if let Some(failure) = &queue.stats.failure {
                 return Err(Error::Unavailable(failure.clone()));
             }
@@ -413,6 +527,7 @@ impl Journal {
             match class {
                 QueueClass::Control => queue.control.push_back(pending),
                 QueueClass::Audit(key) => {
+                    // 新桶首次出现时才登记进轮转表，否则轮转会重复调度同一桶。
                     if !queue.audit.contains_key(&key) {
                         queue.round.push_back(key.clone());
                     }
@@ -420,6 +535,7 @@ impl Journal {
                 }
             }
         }
+        // 入队后唤醒泵线程；泵线程在持锁状态下检查队列，不会错过这次通知。
         self.inner.shared.ready.notify_one();
         result
             .await
@@ -427,6 +543,13 @@ impl Journal {
             .map_err(Error::Unavailable)
     }
 
+    /// 关闭写者并等待泵线程退出。
+    ///
+    /// 关闭后所有信号量关闭，等待中的提交方立即得到明确错误而不是永久挂起。
+    /// 若此前发生过平台故障，关闭会返回该故障。
+    ///
+    /// # Errors
+    /// 泵线程 panic 或此前存在写失败时返回 `Unavailable`。
     pub async fn close(&self) -> Result<()> {
         self.inner.control.close();
         self.inner.staging.close();
@@ -454,6 +577,10 @@ impl Journal {
     }
 }
 
+/// 泵线程主循环。
+///
+/// 每次迭代处理一批事务；任何 panic 都被捕获并转成「冻结权威」，因为唯一
+/// 写者线程挂掉必须对运维可见，不能只表现为提交方永久等待。
 fn pump(mut disk: Disk, shared: Arc<Shared>, options: JournalOptions) {
     loop {
         // pump 线程 panic 必须可见（铁律 2 的运维面）：排队者不能永久挂在
@@ -516,6 +643,10 @@ fn lock_queue(shared: &Shared) -> std::sync::MutexGuard<'_, Queue> {
         .unwrap_or_else(|poison| poison.into_inner())
 }
 
+/// 一次泵迭代：等队列、组批、在同一事务里提交整批并回执。
+///
+/// 组批窗口最多等待 5 ms：再长会拖慢单笔提交，再短则组提交比过低、fsync
+/// 次数过多。
 fn pump_step(disk: &mut Disk, shared: &Arc<Shared>, options: &JournalOptions) -> PumpStep {
     let mut batch = {
         let mut queue = lock_queue(shared);
@@ -528,6 +659,8 @@ fn pump_step(disk: &mut Disk, shared: &Arc<Shared>, options: &JournalOptions) ->
         if queue.requests == 0 && queue.closing {
             return PumpStep::Closing;
         }
+        // 组批窗口：从本轮开始计时，最多等 group_wait，让零星请求也能凑成
+        // 一批共享一次 fsync。
         let deadline = Instant::now() + options.group_wait;
         while !queue.closing && queue.bytes < options.batch_bytes {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
@@ -556,6 +689,7 @@ fn pump_step(disk: &mut Disk, shared: &Arc<Shared>, options: &JournalOptions) ->
     let mut commits = Vec::with_capacity(batch.len());
     let mut encoded_bytes = 0;
     let outcome: Result<()> = (|| {
+        // 一个 SQLite 事务覆盖整批：事实、当前行、回执与提交水位同生共死。
         disk.begin()?;
         for pending in &mut batch {
             let chunks: u64 = pending.values.iter().map(|value| value.chunk_count()).sum();
@@ -641,6 +775,7 @@ fn pump_step(disk: &mut Disk, shared: &Arc<Shared>, options: &JournalOptions) ->
                 value_prefix,
             });
         }
+        // COMMIT 是整批唯一的持久化点：成功之后这批事实才对读者可见。
         disk.sync()?;
         Ok(())
     })();
@@ -652,8 +787,10 @@ fn pump_step(disk: &mut Disk, shared: &Arc<Shared>, options: &JournalOptions) ->
     queue.stats.directory_sync_latency = disk.directory_latency.clone();
     match outcome {
         Ok(()) => {
+            // 持久化水位只在 COMMIT 成功后前进，对外承诺的事实到此为止。
             queue.stats.durable_lsn = disk.last_lsn;
             queue.stats.batches += 1;
+            // 事务计数含值分块事务：它们同样是已提交的事实。
             queue.stats.transactions += commits
                 .iter()
                 .map(|c| c.value_prefix.len() as u64 + 1)
@@ -679,12 +816,15 @@ fn pump_step(disk: &mut Disk, shared: &Arc<Shared>, options: &JournalOptions) ->
                 .max(batch.iter().map(|p| p.bytes).sum());
             drop(queue);
             // Lost receivers do not roll back the persisted transaction.
+            // 提交方可能已经放弃等待（超时或取消），但事实已落盘就不该回滚：
+            // 回滚会让「已确认的命令」凭空消失。
             for (pending, commit) in batch.into_iter().zip(commits) {
                 let _ = pending.ack.send(Ok(commit));
             }
             PumpStep::Continue
         }
         Err(error) => {
+            // 整批回滚：宁可这批全部失败，也不能让事实与当前行只落一半。
             disk.rollback();
             let failure = error.to_string();
             for pending in batch {

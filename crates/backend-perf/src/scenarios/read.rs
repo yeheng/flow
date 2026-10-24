@@ -26,6 +26,10 @@ const METHODS: [&str; 5] = [
     "run.events.view",
 ];
 
+/// RPC 读路径延迟测量。
+///
+/// 先预置一批终态 run（读延迟跟数据量相关），再对每种方法各调用
+/// `iterations` 次，统计分位数。
 pub async fn run(ctx: &mut Ctx, opts: &Opts) -> Vec<Report> {
     let client = ctx.client().await;
     let (workflow_id, _) = publish_workflow(
@@ -92,6 +96,7 @@ pub async fn run(ctx: &mut Ctx, opts: &Opts) -> Vec<Report> {
 }
 
 /// `run.get` → `run_get_ms`。
+/// 由方法名生成指标名（`run.get` → `run_get_ms`）。
 fn metric_name(method: &str) -> String {
     format!("{}_ms", method.replace('.', "_"))
 }

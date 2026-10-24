@@ -16,6 +16,7 @@ pub struct Latency {
 }
 
 impl Latency {
+    /// 记录一个延迟样本（内部统一转成毫秒）。
     pub fn add(&mut self, elapsed: Duration) {
         self.samples.push(elapsed.as_secs_f64() * 1000.0);
     }
@@ -42,6 +43,10 @@ pub struct Stats {
 }
 
 impl Stats {
+    /// 由样本算出分位数摘要。
+    ///
+    /// 空样本直接 panic：没有样本的指标说明测量根本没跑起来，
+    /// 与其报一个全零的假指标，不如让压测当场失败。
     pub fn new(name: &str, samples: &[f64]) -> Stats {
         assert!(!samples.is_empty(), "指标 {name} 没有样本");
         let mut sorted = samples.to_vec();
@@ -79,6 +84,7 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 
 /// 一次场景测量的结果：参数、计数器（吞吐/耗时等标量）与延迟指标。
 #[derive(Debug, Serialize)]
+/// 一次场景测量的结果：参数、计数器与延迟指标。
 pub struct Report {
     pub backend: String,
     pub scenario: String,
@@ -88,6 +94,7 @@ pub struct Report {
 }
 
 impl Report {
+    /// 构造一份测量报告（尚不含延迟指标）。
     pub fn new(backend: &str, scenario: &str, params: Value, counters: Value) -> Report {
         Report {
             backend: backend.to_string(),
@@ -98,12 +105,14 @@ impl Report {
         }
     }
 
+    /// 附上延迟指标（builder 风格，便于链式构造）。
     pub fn with_metrics(mut self, metrics: Vec<Stats>) -> Report {
         self.metrics = metrics;
         self
     }
 
     /// 文本报告：标题 + 参数 + 计数器 + 每个指标一行分位数。
+    /// 打印文本报告：先计数器，再逐个指标。
     pub fn print(&self) {
         println!(
             "── backend={} · {} {}",
@@ -122,22 +131,26 @@ impl Report {
 
 /// 整轮压测的汇总（JSON 输出根对象）。
 #[derive(Debug, Serialize)]
+/// 一次压测运行的全部报告 + 元信息。
 pub struct Suite {
     pub meta: Value,
     pub reports: Vec<Report>,
 }
 
 impl Suite {
+    /// 序列化成 JSON 字符串。
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).expect("报告序列化失败")
     }
 
+    /// 把报告写到文件（供 CI 归档与趋势对比）。
     pub fn save_json(&self, path: &str) -> std::io::Result<()> {
         std::fs::write(path, format!("{}\n", self.to_json()))
     }
 }
 
 /// params/counters 对象 → `k=v k=v` 单行（数值保留 3 位小数，字符串原样）。
+/// 把一个 JSON 计数器对象渲染成一行文本。
 fn kv_line(value: &Value) -> String {
     let Some(map) = value.as_object() else {
         return value.to_string();

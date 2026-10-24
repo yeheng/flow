@@ -97,6 +97,7 @@ pub fn fanout_def(width: usize) -> Value {
 }
 
 /// 唯一名称（工作流名要避开重复，避免版本历史影响测量）。
+/// 生成一个唯一的工作流名（压测反复建工作流，不能重名）。
 pub fn unique_name(prefix: &str) -> String {
     format!("{prefix}-{}", Uuid::now_v7().simple())
 }
@@ -106,7 +107,9 @@ pub fn unique_name(prefix: &str) -> String {
 /// 一个 run 的提交打点。
 #[derive(Debug, Clone, Copy)]
 pub struct Mark {
+    /// run.start 请求发出前的时刻。
     pub call: Instant,
+    /// run.start 响应返回后的时刻（提交已被服务端确认）。
     pub returned: Instant,
 }
 
@@ -199,20 +202,27 @@ impl Marks {
             .expect("打点表为空")
     }
 
+    /// 取打点表的锁（中毒即 panic：并发压测里带病继续只会产出错误数据）。
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Mark>> {
         self.marks.lock().expect("打点表锁中毒")
     }
 
+    /// 记录一次提交失败，并同时释放 pending 与在飞额度。
+    ///
+    /// 两处都要减：pending 决定「是否还有提交在途」，在飞决定限流闸门——
+    /// 只减一个会让收集器永远等下去。
     fn record_error(&self, error: String) {
         self.errors.lock().expect("错误表锁中毒").push(error);
         self.pending.fetch_sub(1, Ordering::SeqCst);
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 
+    /// 一次提交尝试结束（成功或失败），递减 pending。
     fn finish_attempt(&self) {
         self.pending.fetch_sub(1, Ordering::SeqCst);
     }
 
+    /// 一次提交尝试开始，递增在飞计数。
     fn begin_attempt(&self) {
         self.in_flight.fetch_add(1, Ordering::SeqCst);
     }
@@ -291,10 +301,15 @@ pub async fn start_runs_measured(
 /// 各 run 订阅上观测到的事件到达时刻（按 run_id 归并）。
 #[derive(Debug, Default)]
 pub struct Arrivals {
+    /// 每个 run 的首条事件到达时刻。
     pub first: HashMap<String, Instant>,
+    /// 每个 run 的终态事件到达时刻。
     pub terminal: HashMap<String, Instant>,
+    /// 成功收尾的 run 数。
     pub completed: usize,
+    /// 失败/取消收尾的 run 数。
     pub failed: usize,
+    /// 收到的总事件数。
     pub events: usize,
 }
 

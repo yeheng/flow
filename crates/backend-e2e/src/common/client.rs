@@ -111,6 +111,7 @@ pub async fn call<T: DeserializeOwned>(conn: &Conn, method: &str, params: Value)
     }
 }
 
+/// 调用并返回原始 JSON 响应（不做反序列化）。
 pub async fn call_json(conn: &Conn, method: &str, params: Value) -> Value {
     call::<Value>(conn, method, params).await
 }
@@ -198,6 +199,7 @@ pub async fn start_run(conn: &Conn, workflow_id: &str, input: Value) -> String {
     started["run_id"].as_str().unwrap().to_string()
 }
 
+/// 读取一次运行记录。
 pub async fn get_run(conn: &Conn, run_id: &str) -> Value {
     call_json(conn, "run.get.view", json!({ "run_id": run_id })).await
 }
@@ -224,6 +226,7 @@ pub async fn wait_run_status(
     }
 }
 
+/// 等待运行进入终态，返回终态记录；超时则 panic（带最后状态）。
 pub async fn wait_run_terminal(conn: &Conn, run_id: &str, timeout: Duration) -> Value {
     let deadline = Instant::now() + timeout;
     #[allow(unused_assignments)]

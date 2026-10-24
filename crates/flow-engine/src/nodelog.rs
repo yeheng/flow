@@ -5,6 +5,11 @@
 //! - 预算是 **per-run** 共享状态（`Arc<LogBudget>`），driver 持有，NodeLogger
 //!   克隆 Arc——logger 是 per-node-attempt 的，判定必须落在 per-run 一处；
 //! - EventLog 对预算无感知，写盘策略（进程级持久）由 `EventLog::append_log` 承担。
+//!
+//! 本模块同时承载**展示面的脱敏**：日志与快照先脱敏再落盘，执行用的展开后
+//! 参数不经过这里（快照即展示，没有第二个出口）。
+//! 不这样做的代价：日志与快照会进入事件库、PG 与前端，任何一处漏网都等于
+//! 凭据永久落盘；而执行侧仍需原值，所以脱敏只能发生在「复制出去」的那一刻。
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -42,12 +47,19 @@ pub struct LogBudget {
     max: usize,
     /// 所有级别（含 warn/error）的合计硬顶。
     hard_max: usize,
+    /// 已放行的 debug/info 条数（软预算的当前水位）。
     emitted: AtomicUsize,
+    /// 已放行的全部级别条数（硬顶的当前水位）。
     total: AtomicUsize,
+    /// 累计丢弃条数。
     dropped: AtomicUsize,
 }
 
 impl LogBudget {
+    /// 建立一份 per-run 预算；硬顶按 [`hard_max_for`] 与软预算取大。
+    ///
+    /// 返回 `Arc` 是因为 logger 是 per-node-attempt 的克隆体，预算必须
+    /// 由 driver 共享给所有 logger，判定才能落在 per-run 一处。
     pub fn new(max: usize) -> Arc<LogBudget> {
         Arc::new(LogBudget::build(max, hard_max_for(max)))
     }
@@ -58,6 +70,7 @@ impl LogBudget {
         Arc::new(LogBudget::build(max, hard_max))
     }
 
+    /// 构造预算计数器（`new` 与测试注入共用）。
     fn build(max: usize, hard_max: usize) -> LogBudget {
         LogBudget {
             max,
@@ -122,10 +135,15 @@ pub fn budget_from_env() -> usize {
 /// 通道载荷：driver 排空后转成 `Event::NodeLog` 落盘。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LogLine {
+    /// 产生该行的节点。
     pub node_id: String,
+    /// 第几次尝试（重试叙事靠它区分）。
     pub attempt: u32,
+    /// 日志级别。
     pub level: LogLevel,
+    /// 来源流（stdout/stderr/engine）。
     pub stream: LogStream,
+    /// 日志正文（已脱敏、已截断）。
     pub message: String,
 }
 
@@ -139,20 +157,36 @@ pub struct NodeLogger {
     attempt: u32,
 }
 
+/// 日志的实际去处。三种目标对应三种丢失语义：Legacy 无界通道（不丢，
+/// 但可能堆积）、Bounded 有界通道（满了计丢弃）、Observation 观测存储
+///（自带队列与磁盘预算，有独立的丢失口径）。
 #[derive(Clone)]
 enum LogTarget {
+    /// 旧路径：无界通道。
     Legacy(UnboundedSender<LogLine>),
+    /// 有界通道：满了就丢，并计量。
     Bounded(tokio::sync::mpsc::Sender<LogLine>, Arc<LogQueueLoss>),
+    /// 观测存储：写入独立的有界分段日志。
     Observation(crate::observation::ObservationLogger),
 }
 
+/// 有界通道的丢弃计量。
+///
+/// 与 [`LogBudget`] 的丢弃分开记：前者是「预算超了」，后者是「消费者
+/// 跟不上」，排查方向不同。
 #[derive(Default)]
 pub struct LogQueueLoss {
+    /// 被丢弃的日志条数。
     pub dropped_lines: std::sync::atomic::AtomicU64,
+    /// 被丢弃的日志字节数。
     pub dropped_bytes: std::sync::atomic::AtomicU64,
 }
 
 impl NodeLogger {
+    /// 构造有界通道目标的 logger。
+    ///
+    /// 自带一份默认预算：这条路径的调用方没有 per-run 预算可共享，
+    /// 用默认值兜住总量。
     pub fn bounded(tx: tokio::sync::mpsc::Sender<LogLine>, loss: Arc<LogQueueLoss>) -> Self {
         Self {
             tx: LogTarget::Bounded(tx, loss),
@@ -162,6 +196,10 @@ impl NodeLogger {
         }
     }
 
+    /// 构造无界通道目标的 logger（legacy 路径）。
+    ///
+    /// 预算由调用方（driver）持有并共享：logger 是 per-node-attempt 的
+    /// 克隆体，预算判定必须落在 per-run 一处。
     pub fn new(
         tx: UnboundedSender<LogLine>,
         budget: Arc<LogBudget>,
@@ -176,6 +214,10 @@ impl NodeLogger {
         }
     }
 
+    /// 构造观测存储目标的 logger。
+    ///
+    /// 预算设为 `usize::MAX`：观测存储自己就有界（内存队列 + 磁盘预算），
+    /// 再叠一层 per-run 预算会让「为什么丢了」难以归因。
     pub fn observation(
         target: crate::observation::ObservationLogger,
         node_id: String,
@@ -195,9 +237,17 @@ impl NodeLogger {
         NodeLogger::new(tx, LogBudget::new(usize::MAX), "", 0)
     }
 
+    /// 发射一条日志：先过预算，再脱敏截断，最后投递。
+    ///
+    /// 顺序有讲究：预算判定在脱敏之前（脱敏与截断都是 CPU 开销，被
+    /// 丢弃的日志不值得处理）；脱敏在截断之前（先截断会把 JSON 片段
+    /// 切成非法 JSON，里面藏的凭据就漏过去了）。
+    ///
+    /// 投递失败一律静默：日志永远不能影响执行结果。
     pub fn log(&self, level: LogLevel, stream: LogStream, message: impl Into<String>) {
         let message = message.into();
         if !self.budget.admit(level) {
+            // 预算拒绝：只对有界通道记丢弃（legacy 通道不存在「满」这回事）。
             if let LogTarget::Bounded(_, loss) = &self.tx {
                 loss.dropped_lines.fetch_add(1, Ordering::Relaxed);
                 loss.dropped_bytes
@@ -218,6 +268,7 @@ impl NodeLogger {
             }
             LogTarget::Bounded(tx, loss) => {
                 let bytes = line.message.len();
+                // 通道满：丢弃并计量，不阻塞发射侧（fire-and-forget）。
                 if tx.try_send(line).is_err() {
                     loss.dropped_lines.fetch_add(1, Ordering::Relaxed);
                     loss.dropped_bytes
@@ -228,24 +279,31 @@ impl NodeLogger {
         }
     }
 
+    /// 发射一条 engine 侧 debug 日志。
     pub fn debug(&self, message: impl Into<String>) {
         self.log(LogLevel::Debug, LogStream::Engine, message);
     }
 
+    /// 发射一条 engine 侧 info 日志。
     pub fn info(&self, message: impl Into<String>) {
         self.log(LogLevel::Info, LogStream::Engine, message);
     }
 
+    /// 发射一条 engine 侧 warn 日志。
     pub fn warn(&self, message: impl Into<String>) {
         self.log(LogLevel::Warn, LogStream::Engine, message);
     }
 
+    /// 发射一条 engine 侧 error 日志。
     pub fn error(&self, message: impl Into<String>) {
         self.log(LogLevel::Error, LogStream::Engine, message);
     }
 }
 
 /// 取不超过 `max` 字节的 UTF-8 前缀（字符边界安全）。两个截断器共用。
+///
+/// 回退到字符边界是必须的：按字节切在多字节字符中间会产出非法 UTF-8，
+/// 而日志行要被 JSON 序列化落盘，非法 UTF-8 会让整行序列化失败。
 fn byte_prefix(text: &str, max: usize) -> &str {
     let mut end = text.len().min(max);
     while end > 0 && !text.is_char_boundary(end) {
@@ -255,6 +313,9 @@ fn byte_prefix(text: &str, max: usize) -> &str {
 }
 
 /// 超限截断：按 UTF-8 字符边界切，尾部带截断标记（保留原字节数信息）。
+///
+/// 标记里的字节数是**真正丢掉的字节**（总长 − 实际截断位置），不是
+/// 「上限 − 总长」：多字节内容上后者会系统性偏小。
 pub fn truncate_message(message: &str) -> String {
     if message.len() <= MAX_LOG_LINE_BYTES {
         return message.to_string();
@@ -269,6 +330,8 @@ pub fn truncate_message(message: &str) -> String {
 // 「password_policy」「tokenizer」「secretary」这类合法字段会被误脱敏成
 // 「***」。改成精确/后缀匹配要考虑 `Authorization` / `x-apiKey` /
 // `my_auth_token` 这些真实形状，属于独立决策，暂按现状。
+// 这张表是 JSON 键脱敏与 URL query 脱敏共用的唯一判据：两处判定必须
+// 一致，否则同一种凭据会在不同展示面呈现不同的可见性。
 const SENSITIVE_KEYS: [&str; 7] = [
     "authorization",
     "cookie",
@@ -279,11 +342,16 @@ const SENSITIVE_KEYS: [&str; 7] = [
     "apikey",
 ];
 
+/// 判断一个键名是否应视为敏感（大小写不敏感的子串匹配）。
+///
+/// 子串匹配是当前的既定取舍，代价见 [`SENSITIVE_KEYS`] 上方的说明：
+/// 会误伤 `tokenizer` 这类合法字段，但不会漏掉 `my_auth_token`。
 pub fn is_sensitive_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
     SENSITIVE_KEYS.iter().any(|s| key.contains(s))
 }
 
+/// 脱敏后的占位值。
 const REDACTED: &str = "***";
 
 /// 递归脱敏一个 JSON 值（返回新值，不改输入）。对象键命中敏感列表时值替换
@@ -314,6 +382,7 @@ pub fn redact_value(value: &Value) -> Value {
 /// 键名脱敏管不到。快照即展示（DESIGN.md §12.3「没有第二个出口」），执行用的
 /// 展开后 params 不经此函数。
 pub fn redact_snapshot(value: &Value) -> Value {
+    /// 递归遍历：字符串叶子过 [`redact_text`]，其余结构原样重建。
     fn walk(value: &Value) -> Value {
         match value {
             Value::String(text) => Value::String(redact_text(text)),
@@ -337,19 +406,24 @@ pub fn redact_text(text: &str) -> String {
     let mut rest = text;
     let mut attempts = 0;
     while let Some(start) = rest.find(['{', '[']) {
+        // 结构化片段之前是纯文本：按 token 粒度过一遍 URL 脱敏。
         output.push_str(&redact_plain_text(&rest[..start]));
         rest = &rest[start..];
         attempts += 1;
         if attempts > 64 {
+            // 恶意文本可以把解析拖成近乎无界的重复解析：到此为止，
+            // 剩余内容整体标记为不可解析。
             output.push_str("[redacted: malformed structured log]");
             return output;
         }
         let mut values = serde_json::Deserializer::from_str(rest).into_iter::<Value>();
         if let Some(Ok(value)) = values.next() {
+            // 只取第一个 JSON 值：byte_offset 给出已消费长度，余下的继续当文本扫。
             let used = values.byte_offset();
             output.push_str(&serde_json::to_string(&redact_snapshot(&value)).unwrap_or_default());
             rest = &rest[used..];
         } else {
+            // 不是合法 JSON：把它当普通字符带过，继续找下一个候选起点。
             output.push_str(&rest[..1]);
             rest = &rest[1..];
         }
@@ -358,6 +432,10 @@ pub fn redact_text(text: &str) -> String {
     output
 }
 
+/// 按空白切分，逐 token 走一遍 URL 脱敏。
+///
+/// 切到空白边界而不是整串匹配：URL 在日志里通常只是句子里的一个词，
+/// 整串正则既容易漏（后面跟着标点）也容易误伤。
 fn redact_plain_text(text: &str) -> String {
     text.split_inclusive(char::is_whitespace)
         .map(|part| {
@@ -396,6 +474,9 @@ pub fn redact_url(url: &str) -> String {
     format!("{base}?{query}{fragment}")
 }
 
+/// 脱敏 query/fragment 的参数值：命中敏感键的「值」替换为 `***`。
+///
+/// 键保留：排查时要知道打了哪个接口、用了哪个参数名，泄的是值不是名。
 fn redact_params(params: &str) -> String {
     params
         .split('&')
@@ -408,11 +489,13 @@ fn redact_params(params: &str) -> String {
         .join("&")
 }
 
+/// 预算、脱敏与截断的不变量测试。
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
+    /// 造一个带指定预算的 logger 及其接收端。
     fn logger_with_budget(
         max: usize,
     ) -> (NodeLogger, tokio::sync::mpsc::UnboundedReceiver<LogLine>) {
@@ -420,6 +503,7 @@ mod tests {
         (NodeLogger::new(tx, LogBudget::new(max), "n1", 2), rx)
     }
 
+    /// 超限的 debug/info 被丢弃，warn/error 仍然放行，且日志归属到具体 attempt。
     #[test]
     fn budget_drops_info_but_keeps_warn_error() {
         let (logger, mut rx) = logger_with_budget(2);
@@ -502,6 +586,7 @@ mod tests {
         assert_eq!(hard, HARD_LOG_LINE_LIMIT);
     }
 
+    /// 截断必须落在字符边界上，且尾部带截断标记。
     #[test]
     fn message_truncated_at_char_boundary_with_marker() {
         let (logger, mut rx) = logger_with_budget(usize::MAX);
@@ -532,6 +617,7 @@ mod tests {
         assert!(truncate_message(&ascii).contains("[truncated 100 bytes]"));
     }
 
+    /// 脱敏要递归进入嵌套对象与数组，且不改动调用方的原值。
     #[test]
     fn redact_walks_nested_structures() {
         let value = json!({
@@ -551,6 +637,7 @@ mod tests {
         assert_eq!(value["Authorization"], json!("Bearer x"));
     }
 
+    /// URL 脱敏只动敏感参数的值：键、host、path 与普通参数原样保留。
     #[test]
     fn redact_url_masks_only_sensitive_query_values() {
         // 命中敏感键的 query 值：键保留（排查要看打了哪个接口），值脱敏
@@ -589,6 +676,7 @@ mod tests {
         );
     }
 
+    /// 没有接收端的 logger 也不能 panic：发射路径必须永远安全。
     #[tokio::test]
     async fn disabled_logger_never_panics() {
         let logger = NodeLogger::disabled();
@@ -596,6 +684,7 @@ mod tests {
         logger.error("也没人听");
     }
 
+    /// 结构化片段与错误 URL 里的凭据都要在截断之前被脱敏。
     #[test]
     fn logger_redacts_structured_fragments_and_error_urls_before_truncation() {
         let (logger, mut rx) = logger_with_budget(10);

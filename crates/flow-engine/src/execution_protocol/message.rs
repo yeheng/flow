@@ -15,6 +15,12 @@
 //!
 //! 审计记录的**计费口径**仍用 JSON：[`record_bytes`] 是主进程与执行器
 //! 共用的确定性编码长度函数（窗口预算与幂等比对），与 wire 编码无关。
+//!
+//! 本文件是协议目录的唯一定义处：变体索引即帧类型，所以「新增/删除/
+//! 调整一个变体」都是协议变更（必须 bump [`PROTOCOL_VERSION`]），而不是
+//! 普通的代码重构。守护的核心约束是 C6：控制帧只携带身份与元数据，
+//! 用户值字节一律走 data 语义帧分块传输——否则一次大输出就能把会话
+//! 帧撑爆，而协议层唯一的手段是杀会话。
 
 use flow_journal::{StoredValue, ValueRef};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -31,6 +37,16 @@ use super::remote::{Capacity, ResumeDecision, ResumeItem, RouteEnvelope};
 pub mod wire_json {
     use super::*;
 
+    /// 以「JSON 字节」承载 `serde_json::Value`（binary/postcard 路径）。
+    ///
+    /// 为什么不直接把 Value 编进 postcard：`Value` 的反序列化依赖
+    /// `deserialize_any`（自描述格式专用），postcard 永不支持；强行走
+    /// 会得到「格式不支持」而不是数据。改用规范 JSON 字节后，wire 上
+    /// 的字节与 journal 侧的 JSON 完全一致，两端对同一份 payload 的
+    /// 编码长度也天然可比。
+    ///
+    /// human-readable 路径（journal/诊断 JSON）保持 Value 原生形状：
+    /// 那些文件是给人读的，不该因为协议承载方式而变形。
     pub fn serialize<S: Serializer>(value: &Value, serializer: S) -> Result<S::Ok, S::Error> {
         if serializer.is_human_readable() {
             return value.serialize(serializer);
@@ -40,6 +56,11 @@ pub mod wire_json {
             .serialize(serializer)
     }
 
+    /// 与 [`serialize`] 对称的解码：binary 路径先取字节再解 JSON。
+    ///
+    /// # Errors
+    /// 字节不是合法 JSON 时返回 serde 自定义错误（协议层归为
+    /// `Malformed`）。
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Value, D::Error> {
         if deserializer.is_human_readable() {
             return Value::deserialize(deserializer);
@@ -53,6 +74,12 @@ pub mod wire_json {
     pub mod option {
         use super::*;
 
+        /// `Option<Value>` 的 binary 承载：None 走 option 的原生判别，
+        /// Some 包一层 Wrapper 让内层复用 `wire_json` 的双路径规则。
+        ///
+        /// 为什么要 Wrapper：serde 的 `Option` 反序列化只接受「有/无」
+        /// 两种形状，内层字段的编码规则无法通过它透传，只能显式包一层
+        /// 才能让 `Value` 走正确的 binary/human-readable 分支。
         pub fn serialize<S: Serializer>(
             value: &Option<Value>,
             serializer: S,
@@ -68,21 +95,27 @@ pub mod wire_json {
             }
         }
 
+        /// `Option<Value>` 的 binary 解码：None/Some 由 Visitor 分流，
+        /// Some 的内层交回 `wire_json::deserialize`。
         pub fn deserialize<'de, D: Deserializer<'de>>(
             deserializer: D,
         ) -> Result<Option<Value>, D::Error> {
             if deserializer.is_human_readable() {
                 return Option::<Value>::deserialize(deserializer);
             }
+            /// serde Visitor：`Option<Value>` 的形状分流器。
             struct Visitor;
             impl<'de> serde::de::Visitor<'de> for Visitor {
                 type Value = Option<Value>;
+                /// serde 报错时展示的期望类型描述。
                 fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                     formatter.write_str("option of json value")
                 }
+                /// `None` 分支：直接产出空值，无需访问反序列化器。
                 fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
                     Ok(None)
                 }
+                /// `Some` 分支：内层交给 `wire_json` 的解码规则。
                 fn visit_some<D: Deserializer<'de>>(
                     self,
                     deserializer: D,
@@ -103,12 +136,19 @@ pub mod wire_json {
 pub mod wire_stored {
     use super::*;
 
+    /// `StoredValue` 的 binary 镜像：外部 tagged（变体索引在数据外），
+    /// 避免 journal 侧 internally tagged 的 `type`/`value` 判别依赖
+    /// `deserialize_any`（postcard 永不支持）。
     #[derive(Serialize, Deserialize)]
     enum Wire {
         Inline(Vec<u8>),
         Ref(ValueRef),
     }
 
+    /// `StoredValue` 的 binary 承载。
+    ///
+    /// inline 走 JSON 字节、ref 走 `ValueRef` 身份元数据；human-readable
+    /// 路径原样透传，journal 文件里的形状不变。
     pub fn serialize<S: Serializer>(value: &StoredValue, serializer: S) -> Result<S::Ok, S::Error> {
         if serializer.is_human_readable() {
             return value.serialize(serializer);
@@ -122,6 +162,12 @@ pub mod wire_stored {
         wire.serialize(serializer)
     }
 
+    /// `StoredValue` 的 binary 解码。
+    ///
+    /// inline 走 `StoredValue::inline` 而不是直接构造：inline 的尺寸
+    /// 校验必须执行，否则一个超大 inline 值会绕过 journal 侧的容量
+    /// 约束进到内存里。ref 分支则显式 `validate`——引用身份来自对端，
+    /// 不能假定它一定合法。
     pub fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<StoredValue, D::Error> {
@@ -145,6 +191,8 @@ pub mod wire_stored {
     pub mod option {
         use super::*;
 
+        /// `Option<StoredValue>` 的 binary 承载（Some 包 Wrapper 复用
+        /// `wire_stored` 的双路径规则）。
         pub fn serialize<S: Serializer>(
             value: &Option<StoredValue>,
             serializer: S,
@@ -160,21 +208,27 @@ pub mod wire_stored {
             }
         }
 
+        /// `Option<StoredValue>` 的 binary 解码（None/Some 由 Visitor
+        /// 分流）。
         pub fn deserialize<'de, D: Deserializer<'de>>(
             deserializer: D,
         ) -> Result<Option<StoredValue>, D::Error> {
             if deserializer.is_human_readable() {
                 return Option::<StoredValue>::deserialize(deserializer);
             }
+            /// serde Visitor：`Option<StoredValue>` 的形状分流器。
             struct Visitor;
             impl<'de> serde::de::Visitor<'de> for Visitor {
                 type Value = Option<StoredValue>;
+                /// serde 报错时展示的期望类型描述。
                 fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                     formatter.write_str("option of stored value")
                 }
+                /// `None` 分支：直接产出空值，无需访问反序列化器。
                 fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
                     Ok(None)
                 }
+                /// `Some` 分支：内层交给 `wire_stored` 的解码规则。
                 fn visit_some<D: Deserializer<'de>>(
                     self,
                     deserializer: D,
@@ -188,18 +242,29 @@ pub mod wire_stored {
 }
 
 /// 协议层错误：明确拒绝语义（二期 §3.2“明确拒绝，不降级”）。
+///
+/// 错误分类的意义在于「谁来承担后果」：帧级错误（`FrameTooLarge`/
+/// `Malformed`）意味着对端或中间人给了非法字节，只能终止会话；
+/// `InvalidPayload` 意味着字节合法但内容越界（如未声明的 transfer），
+/// 同样拒绝，但排障方向不同。
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
+    /// 帧体超过该消息类型的预算上限（实际长度, 允许上限）。
     #[error("protocol frame too large: {0} > {1}")]
     FrameTooLarge(usize, usize),
+    /// 帧格式非法：长度头越界、postcard 损坏或帧体有尾随字节。
     #[error("protocol frame malformed: {0}")]
     Malformed(String),
+    /// 收到无法识别的消息类型（目录变更导致的版本错配的表象）。
     #[error("unsupported protocol message: {0}")]
     UnknownMessage(String),
+    /// 帧合法但载荷越界（缺能力、限额超本地硬顶、令牌不符等）。
     #[error("message payload invalid: {0}")]
     InvalidPayload(String),
+    /// 会话/通道已关闭（EOF、显式 close、写任务退出）。
     #[error("session/channel closed")]
     Closed,
+    /// 底层 I/O 失败。
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -210,8 +275,12 @@ pub enum ProtocolError {
 /// 确定性 JSON 编码：字段顺序固定，serde_json 的 BTreeMap 保证键序。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditRecord {
+    /// 主进程分配的审计序号：在同一 journal 内单调递增，是幂等重传与
+    /// 「连续持久前缀」推进的排序键。
     pub audit_seq: u64,
+    /// 事件类型名（snake_case）。
     pub kind: String,
+    /// 事件载荷（journal-JSON 语义，与 wire 承载同一份数据）。
     #[serde(with = "wire_json")]
     pub payload: Value,
 }
@@ -249,15 +318,19 @@ pub enum ResultOutcome {
     /// 正常完成：固定结果描述（小结果 inline，大值为已发送 chunk 的 ValueRef）
     /// 与可选 condition 分支。
     Success {
+        /// 结果值：小结果 inline，大值以引用形式指向已发出的 chunk。
         #[serde(with = "wire_stored")]
         output: StoredValue,
+        /// condition 分支结果（true/false；无分支为 None）。
         branch: Option<bool>,
     },
     /// 失败结果（准备失败走同一派发的失败 Result，不发送第二个 Execute）。
     /// `uncertain_operation`：授权后调用未得到可验证 Outcome——主进程按
     /// 一期规则登记 uncertain 等待而非节点失败。
     Failure {
+        /// 错误文本（长度经控制文本上限截断）。
         error: String,
+        /// 是否处于「外部操作结果未知」状态（不得直接判定失败）。
         #[serde(default)]
         uncertain_operation: bool,
     },
@@ -283,15 +356,19 @@ pub enum WaitKind {
 /// 由主进程在结果接受事务创建并登记（执行器不创建子 run）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WaitRequest {
+    /// 等待类别（闭集枚举，wire 上是变体索引）。
     #[serde(rename = "type")]
     pub kind: WaitKind,
+    /// 定时唤醒时刻（epoch 毫秒）；仅 Delay 用。
     #[serde(default)]
     pub wake_at: Option<i64>,
+    /// 等待期产出的值（若有）。
     #[serde(default, with = "wire_stored::option")]
     pub output: Option<StoredValue>,
     /// sub_workflow 等待：子 run 由主进程在结果接受事务创建。
     #[serde(default)]
     pub workflow_id: Option<String>,
+    /// 子工作流输入映射（journal-JSON 语义）。
     #[serde(default, with = "wire_json::option")]
     pub input_mapping: Option<Value>,
 }
@@ -303,6 +380,10 @@ pub const ROUTED_MAX_DEPTH: u32 = 8;
 thread_local! {
     /// `Routed.inner` 的当前解码深度。解码全程同步（无 await 点），
     /// 线程本地计数不会跨任务交错。
+    ///
+    /// 为什么用线程本地而不是全局计数器：解码是同步调用链，深度只在
+    /// 单次 `deserialize` 内有意义；用全局原子计数器会引入「谁负责
+    /// 归零」的跨线程耦合，一次 panic 就会永久污染计数。
     static ROUTED_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
@@ -314,6 +395,7 @@ where
     D: Deserializer<'de>,
 {
     let depth = ROUTED_DEPTH.with(|c| c.get());
+    // 深度门必须先于展开：展开 `Box<Message>` 才会进入递归下降解码。
     if depth >= ROUTED_MAX_DEPTH {
         return Err(serde::de::Error::custom(format!(
             "routed nesting exceeds {} levels",
@@ -322,6 +404,8 @@ where
     }
     ROUTED_DEPTH.with(|c| c.set(depth + 1));
     let result = Box::<Message>::deserialize(deserializer);
+    // 无论成功还是失败都必须还原计数，否则同线程后续解码会被上一次的
+    // 残留深度误伤（表现为「偶发」的超限拒绝）。
     ROUTED_DEPTH.with(|c| c.set(depth));
     result
 }
@@ -345,14 +429,23 @@ pub enum Message {
     },
     /// control，主→子。选定会话身份、限额与超时；`version` 同样必检。
     Welcome {
+        /// 协议版本（与主进程常量相等，否则执行器拒绝）。
         version: u32,
+        /// 会话所属 journal 标识。
         journal_id: String,
+        /// 主进程任期号（master epoch）：跨任期复用旧会话必须被识别。
         master_epoch: u64,
+        /// 本次会话标识。
         session_id: String,
+        /// 执行器标识（派发绑定的对象）。
         executor_id: String,
+        /// 持久确认窗口预算（字节）。
         window_bytes: u64,
+        /// 单条审计记录上限（字节）。
         max_record_bytes: u64,
+        /// 心跳周期（毫秒）。
         heartbeat_ms: u64,
+        /// 排空宽限期（毫秒）。
         drain_grace_ms: u64,
     },
     /// control，子→主。I/O 循环初始化完成，可接任务。
@@ -374,15 +467,22 @@ pub enum Message {
     /// data，子→主。审计事实批次（含 InputPrepared、输出 chunk、
     /// OperationOutcome 等）。ACK 仅确认持久性。
     AuditBatch {
+        /// 归属派发。
         dispatch_id: String,
+        /// 本批第一条记录的审计序号（批次内序号连续，接收方据此校验）。
         first_seq: u64,
+        /// 审计记录列表。
         records: Vec<AuditRecord>,
     },
     /// control，主→子。只随连续持久前缀前进；不授予外部调用权。
     AuditAck {
+        /// 归属派发。
         dispatch_id: String,
+        /// 已持久化的最大连续审计序号（窗口只能沿前缀推进）。
         durable_audit_seq: u64,
+        /// 已持久化的累计字节数（窗口计费口径）。
         durable_bytes: u64,
+        /// 对应的 journal 提交 LSN。
         commit_lsn: u64,
     },
     /// control，子→主。请求外部操作许可；请求体经 data 通道分块传输。
@@ -535,8 +635,11 @@ pub enum Message {
 /// 观测行（nodelog console/stdout/stderr 叙事）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObservationLine {
+    /// 级别（如 `info`/`warn`/`error`）。
     pub level: String,
+    /// 来源流（`stdout`/`stderr`/`console`）。
     pub stream: String,
+    /// 文本行（长度由观测侧的截断入口保证）。
     pub message: String,
 }
 
@@ -544,9 +647,13 @@ pub struct ObservationLine {
 /// node_execution_id；接收端按连接上下文校验派发归属。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExecuteTask {
+    /// 所属 run 标识。
     pub run_id: String,
+    /// 节点标识。
     pub node_id: String,
+    /// 节点执行标识（同节点重试时递增）。
     pub node_execution_id: String,
+    /// 重试计数（从 1 起）。
     pub attempt: u32,
     /// 节点定义（含未展开 params）。控制帧唯一允许的变长项（有界：
     /// dispatch 侧按 CONTROL_MAX_FRAME/2 预检，超限拒绝派发而非杀会话）。
@@ -555,6 +662,7 @@ pub struct ExecuteTask {
     /// run 输入与前驱输出的声明：控制帧只携带身份与 codec，值字节
     /// 无论大小一律走 data 通道（TransferChunk + InputReady）。
     pub input: TaskValue,
+    /// 前驱节点输出声明（只声明身份，字节走 data 通道）。
     pub predecessors: Vec<(String, TaskValue)>,
     /// 已提交 InputPrepared 的元数据（重试恢复；执行器跳过求值，不重新
     /// 求时间/随机模板）。input/predecessors/params 的值经 inputs 声明
@@ -575,20 +683,28 @@ pub struct ExecuteTask {
 ///   接收端按 JSON 解码。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TaskValue {
+    /// 按 journal 引用回传的值（字节由主进程从 journal 流式送出）。
     Ref(flow_journal::ValueRef),
+    /// 原 inline 值（字节由主进程分块送出）。
     Local,
 }
 
 /// 已提交 InputPrepared 的元数据（值字段不入控制帧）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PreparedMeta {
+    /// 产出该准备事实的引擎版本（用于判定重试是否跨版本）。
     pub engine_build: String,
+    /// 节点语义版本号（跨版本重试不得直接复用准备结果）。
     pub node_semantics: u32,
     /// 已提交准备参数的值声明（字节走 in:prepared-params 传输）。
     pub params: TaskValue,
 }
 
 impl Message {
+    /// 消息类型名（诊断用人类可读名，非 wire 编码）。
+    ///
+    /// 仅用于日志与错误信息：wire 上的帧类型是 postcard 的变体索引，
+    /// 两者不能互相替代——这里的名字不参与编解码，改名不构成协议变更。
     pub fn type_name(&self) -> &'static str {
         match self {
             Message::Hello { .. } => "Hello",
@@ -622,6 +738,14 @@ impl Message {
         }
     }
 
+    /// 取消息携带的派发标识（路由键）。
+    ///
+    /// 绝大多数业务帧都带 `dispatch_id`，它是把帧归属到某次派发的唯一
+    /// 依据；缺失时返回 `None` 的只有会话级/连接级消息（握手、容量报告、
+    /// Resume 清单等）。
+    ///
+    /// `Routed` 取外层包络的 `dispatch_id` 而不是内层的：包络是路由事实
+    /// 的权威来源，内层字段可被执行器自行填写。
     pub fn dispatch_id(&self) -> Option<&str> {
         match self {
             Message::Execute { dispatch_id, .. }
@@ -644,6 +768,9 @@ impl Message {
     }
 
     /// 构造携带当前协议版本的 Hello（执行器侧握手用）。
+    ///
+    /// 版本号由构造器统一注入：握手是唯一的版本门，版本字段漏填或
+    /// 填错会让版本检查形同虚设。
     pub fn hello(
         boot_id: impl Into<String>,
         build: impl Into<String>,
@@ -660,6 +787,9 @@ impl Message {
     }
 
     /// 构造携带当前协议版本的 AgentHello（agent 上联握手用）。
+    ///
+    /// 与 [`Message::hello`] 同理：版本由构造器注入，上联侧的版本门
+    /// 与执行器侧是同一道门。
     pub fn agent_hello(
         agent_boot_id: impl Into<String>,
         build: impl Into<String>,

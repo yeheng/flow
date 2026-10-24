@@ -2,6 +2,10 @@
 //!
 //! 供 flow-engine 单元测试与 flow-executor / flow-backend 的跨 crate 回归
 //! 复用；这些样本是冻结契约的一部分，修改等于变更协议。
+//!
+//! 之所以把样本放进协议 crate（而不是各测试自带）：只有一份，才能保证
+//! 「主进程认为合法」与「执行器认为合法」是同一批字节。样本里的字节是
+//! 对抗性输入的固定语料——回归时若有人放宽了解码规则，这里会先炸。
 
 use flow_journal::value::ValueCodec;
 use flow_journal::{StoredValue, ValueRef};
@@ -14,6 +18,7 @@ use super::message::{
     WaitRequest,
 };
 
+/// 引用型值样本（`TaskValue::Ref` 用）。
 pub fn value_ref() -> ValueRef {
     ValueRef {
         journal_id: "journal-fixture".into(),
@@ -26,6 +31,7 @@ pub fn value_ref() -> ValueRef {
     }
 }
 
+/// 单条审计记录样本。
 pub fn audit_record() -> AuditRecord {
     AuditRecord {
         audit_seq: 41,
@@ -197,6 +203,7 @@ pub fn wait_result() -> Message {
     }
 }
 
+/// 失败结果样本（节点失败路径）。
 pub fn failure_result() -> Message {
     Message::Result {
         dispatch_id: "dispatch-11".into(),
@@ -243,6 +250,9 @@ pub fn corrupt_frames() -> Vec<Vec<u8>> {
 }
 
 /// 同 dispatch 同序号异内容样本（必须拒绝）。
+///
+/// 幂等重传的前提是「同序号必同内容」：一旦出现同序号不同内容，
+/// 说明两侧对同一事实的理解已经分叉，必须拒绝而不是选一个信。
 pub fn conflicting_audit_records() -> (AuditRecord, AuditRecord) {
     let a = AuditRecord {
         audit_seq: 7,

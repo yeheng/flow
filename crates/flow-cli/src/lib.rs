@@ -10,12 +10,19 @@
 //! 命令定义与分发在 [`cli`]；bin 入口（src/main.rs）只做参数适配与
 //! 退出码传递（[`run_from_args`] 是库形态的进程入口）。
 
+/// 命令定义与分发。
 pub mod cli;
+/// JSON-RPC WebSocket 客户端封装。
 pub mod client;
+/// 错误类型与退出码契约。
 pub mod error;
+/// v2 协议的低层命令面（回归/比较/原始调用/事件流/下载）。
 pub mod journal;
+/// 终端输出与文档 IO 工具。
 pub mod output;
+/// run 的触发与查询命令。
 pub mod run;
+/// 工作流定义的 CRUD 与导入导出。
 pub mod workflow;
 
 /// 进程入口：自带多线程 runtime，

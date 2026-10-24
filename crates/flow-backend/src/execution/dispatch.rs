@@ -5,6 +5,24 @@
 //! journal 记录与进程内执行逐字节同构：InputPrepared/ValueChunk/
 //! ValuePublished/OperationIntent/OperationAuthorized/OperationOutcome/
 //! NodeCompleted/NodeFailed/WaitRegistered 及 sealed_through 屏障语义不变。
+//!
+//! 职责边界：本模块是「master 侧派发编排」——把节点任务发出去、把执行器
+//! 的审计与结果收回来、并把两者之间的协议交互收敛成可重放的账本状态。
+//! 它**不做**节点计算（那在 flow-executor），也**不**决定谁该跑（那在
+//! journal_driver）。
+//!
+//! 守护的核心不变量：
+//! 1. 主进程是唯一权威写者——AuditAck / OperationPermit / ResultCommitted
+//!    只能由主进程生成，agent 只转发；执行器自称的确认一律不作数。
+//! 2. 结果必须晚于它依赖的审计事实：结果帧带 `last_audit_seq`，未追平
+//!    则先挂起等审计，绝不先提交结果再补审计（否则崩溃后会出现「结果
+//!    在、证据不在」的不可裁决状态）。
+//! 3. 外部副作用先落意图再放行（C3）：OperationIntent 与
+//!    OperationAuthorized 必须同一事务提交，许可才可下发。
+//!
+//! 为什么需要它：崩溃恢复的困难全在「请求发出去了吗」。这里把每一次
+//! 对外交互都变成可判定的事实，使恢复期能区分「从未发出」（可安全重试）
+//! 与「已授权、结果未知」（必须停下来等人工裁决）。
 
 use crate::journal::JournalError;
 use std::collections::BTreeMap;
@@ -35,12 +53,20 @@ use super::pool::ExecutorPool;
 use super::{FromSession, ToSession};
 
 type Result<T> = std::result::Result<T, crate::journal::JournalError>;
+/// 把一条诊断信息包装成 journal 层错误。
+///
+/// 派发层的所有失败最终都要经由 journal_driver 统一包装成终态或
+/// uncertain，因此这里统一走 `flow_journal::Error::Invalid`——错误类型
+/// 决定上游如何区分「平台故障」与「工作流失败」，不能随手挑一个。
 fn invalid(s: impl Into<String>) -> crate::journal::JournalError {
     crate::journal::JournalError::Journal(flow_journal::Error::Invalid(s.into()))
 }
 /// 取消后排空截止（P2-8）：见 contract 的 [`CANCEL_REAP_TIMEOUT_MS`]。
 const CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_millis(CANCEL_REAP_TIMEOUT_MS);
 /// internal() 闭包内的错误类型（flow_journal::Error）。
+///
+/// 与外部 [`invalid`] 的区别只在类型：闭包跑在 journal 事务内部，只能
+/// 返回 `flow_journal::Error`，不能带 journal 外层的上下文包装。
 fn fj(s: impl Into<String>) -> flow_journal::Error {
     flow_journal::Error::Invalid(s.into())
 }
@@ -56,15 +82,20 @@ pub struct IpcDispatcher {
 /// 派发链路：命令发送 + 事件流。本地池会话（二期）与远程 agent 路由
 /// （三期）共用同一编排；远程模式链路死亡后可重建继续驱动同一 runner。
 pub(crate) struct DispatchLink {
+    /// 派发方 → 会话（本地执行器或 agent 中继）的命令通道。
     pub commands: mpsc::Sender<ToSession>,
+    /// 会话 → 派发方的事件通道；派发侧独占消费。
     pub events: mpsc::Receiver<FromSession>,
 }
 
 impl IpcDispatcher {
+    /// 绑定一个执行器池。派发器本身无状态：会话的借还由池管理，节点级
+    /// 编排状态在每次 `execute` 内新建的 [`DispatchRunner`] 里。
     pub fn new(pool: Arc<ExecutorPool>) -> Self {
         Self { pool }
     }
 
+    /// 关停派发端口：池内全部执行器进程被 kill 并 wait/reap，不留僵尸。
     pub(crate) async fn shutdown(&self) {
         self.pool.shutdown().await;
     }
@@ -96,6 +127,8 @@ impl IpcDispatcher {
             DispatchRunner::new(attempt.clone(), node.clone(), predecessors, observations);
         let mut link = DispatchLink {
             commands: lease.to_session.clone(),
+            // 事件接收端必须从租约里「取走」：派发期间它归派发侧独占消费，
+            // 用占位通道换出，避免与池的空闲复用并发读同一条流。
             events: std::mem::replace(&mut lease.events, mpsc::channel(1).1),
         };
         let outcome = runner.drive(&mut link).await;
@@ -103,6 +136,8 @@ impl IpcDispatcher {
         lease.events = std::mem::replace(&mut link.events, mpsc::channel(1).1);
         // A late durable result can win after Cancel was already queued. Its
         // business result is valid, but the process is draining and cannot be reused.
+        // 复用条件四项全满足：派发成功、会话仍健康、未发取消、节点不是 harness。
+        // harness 节点执行的是不可复用的 agent 会话，即便成功也不进空闲池。
         self.pool
             .release(
                 lease,
@@ -129,11 +164,13 @@ pub mod fault {
     use std::sync::OnceLock;
     use tokio::sync::watch;
 
+    /// 单个检查点的门：`hold` 决定是否暂停，`reached` 通知测试「已到达」。
     #[derive(Clone)]
     struct Gate {
         hold: watch::Receiver<bool>,
         reached: watch::Sender<bool>,
     }
+    /// 全局检查点注册表。OnceLock 保证进程内只有一份，Mutex 保护并发注册。
     static REGISTRY: OnceLock<std::sync::Mutex<HashMap<String, Gate>>> = OnceLock::new();
 
     /// 注册检查点（初始 hold=true：到达即暂停，直至发送端置 false 释放）。
@@ -215,44 +252,77 @@ pub mod fault {
 /// 生产构建的空壳：调用点保留、注册表不进产物，checkpoint 立即返回。
 #[cfg(not(any(test, feature = "fault-injection")))]
 pub mod fault {
+    /// 生产构建：检查点是空操作（立即返回）。
     pub async fn checkpoint(_name: &str) {}
+    /// 生产构建：节点级检查点是空操作（立即返回）。
     pub async fn checkpoint_for(_name: &str, _node: &str) {}
 }
 
+/// 单个操作请求传输的字节预算（沿用值预算 VALUE_BUDGET）。
+/// 超过即拒绝——执行器侧对输入聚合有独立上限，主进程侧再设一道是为了
+/// 防止恶意/异常对端用大量传输条目耗尽主进程内存。
 const OPERATION_TRANSFER_LIMIT: u64 = flow_journal::VALUE_BUDGET as u64;
+/// 并发在途的操作请求传输条目数上限。
+/// 条目数即内存占用：每个条目都持有一段已接收的字节缓冲。
 const OPERATION_TRANSFER_COUNT: usize = 16;
 
+/// 一个操作请求的传输槽：已收字节 + 收齐声明（总长度与摘要）。
 struct OpTransfer {
     /// 连续接收前缀（T07）：单流按序到达，无需块树与排序装配。
     /// 装配期独占可写；消费侧取共享句柄（跨 await 逃借不整段克隆）。
     buf: Arc<Vec<u8>>,
+    /// `(total_bytes, digest)`：执行器用 `InputReady` 声明整值长度与摘要。
     ready: Option<(u64, String)>,
 }
 
+/// 一个已到达但尚未满足屏障的结果帧。
+///
+/// 结果帧可能先于它依赖的审计批次到达（两条入站路径的到达序不保证）。
+/// 先挂起，等 `durable_seq` 追平 `last_audit_seq` 再提交，避免出现
+/// 「结果已提交、证据未落盘」的不可裁决状态。
 struct PendingResult {
+    /// 执行器给出的结果标识（幂等键）。
     result_id: String,
+    /// 该结果依赖的最后一条审计序号。
     last_audit_seq: u64,
+    /// 结果内容（成功/失败/等待）。
     outcome: ResultOutcome,
 }
 
+/// 一次节点派发的编排状态机。
+///
+/// 跨链路重建时（远程 Resume）必须保留同一实例：其中的审计游标、
+/// 已提交摘要表、结果挂起状态就是「幂等与屏障」的记忆，丢掉它等于允许
+/// 同一批审计被重复提交或让结果越过屏障落地。
 pub(crate) struct DispatchRunner {
+    /// 本次派发的身份与 journal 句柄（终态提交走它）。
     attempt: Attempt,
+    /// 被派发的节点定义（重试策略、harness 判定都取自它）。
     node: Node,
+    /// 前驱节点的输出值（按 journal 引用/内联两种形态）。
     predecessors: BTreeMap<String, StoredValue>,
+    /// 节点可观察性日志的落盘目标；缺省表示该派发不收集观测。
     observations: Option<ObservationStore>,
+    /// 已持久化的最后审计序号（连续前缀长度）。
     durable_seq: u64,
+    /// 已持久化的审计字节累计（回执里的窗口计费依据）。
     durable_bytes: u64,
     /// 已提交记录的确定性编码摘要（同序号同内容幂等；异内容拒绝）。
     committed: BTreeMap<u64, String>,
+    /// 已到达但屏障未满足、暂挂的结果。
     pending_result: Option<PendingResult>,
+    /// 在途的操作请求传输槽（按 transfer_id 索引）。
     op_transfers: BTreeMap<String, OpTransfer>,
+    /// 是否已发出 Cancel（发出后不再复用该会话）。
     cancel_sent: bool,
     /// Cancel 发出时刻：取消后的排空必须有截止时间——持续心跳但不响应
     /// Cancel 的执行器不能无限占用信号量槽位与会话。
     cancel_sent_at: Option<tokio::time::Instant>,
+    /// 会话是否仍可复用（取消/故障后一律置假，会话整体回收重建）。
     session_healthy: bool,
     /// 本次派发的尝试序号（观测日志归属用；在 drive_link 读记录时对齐）。
     task_attempt: u32,
+    /// 是否处于远程重放模式（远程链路的空闲判定与取消回收与本地不同）。
     remote_replay: bool,
     /// 连续空闲超时次数（远程链路）：首次按失联走 Resume 对账，第二次
     /// 硬失败——防「静默执行器 ↔ 重挂」无限循环占用槽位。
@@ -263,12 +333,21 @@ pub(crate) struct DispatchRunner {
 }
 
 impl DispatchRunner {
+    /// 新建一次派发的编排状态。
+    ///
+    /// 唯一的隐含状态是 harness agent 的生命周期上限：harness 节点可能
+    /// 长时间运行，但主进程不能无限期地等它——上限之外必须主动排空，
+    /// 否则一个不响应的 agent 会一直占着全局派发槽位。
     fn new(
         attempt: Attempt,
         node: Node,
         predecessors: BTreeMap<String, StoredValue>,
         observations: Option<ObservationStore>,
     ) -> Self {
+        // 生命周期上限 = harness 自身最大超时 + 两倍持久等待超时：多出的
+        // 两倍留给「准备已提交、等待授权/等待持久 ACK」的正常空档。心跳
+        // 不能延长它（见 agent_deadline 字段说明），否则 agent 只要一直
+        // 发心跳就能永久占住槽位。
         let agent_deadline = node.is_harness_agent().then(|| {
             tokio::time::Instant::now()
                 + Duration::from_millis(
@@ -311,6 +390,10 @@ impl DispatchRunner {
         self.drive_link(link, resume).await
     }
 
+    /// 构造一个派发 runner（远程模式用）。
+    ///
+    /// 与 `new` 等价；单独暴露是因为远程派发器拿不到 `IpcDispatcher`
+    /// 的会话租约，必须自己建 runner 再交给 `drive_with_resume`。
     pub(crate) fn runner(
         attempt: Attempt,
         node: Node,
@@ -331,9 +414,13 @@ impl DispatchRunner {
             .ok_or_else(|| invalid("dispatch record missing"))?
             .clone();
         if record.dispatch_id != self.attempt.dispatch_id {
+            // 陈旧派发：节点已被重试取代，此时提交任何事实都会污染新尝试
+            // 的账本。宁可失败也不能写错。
             return Err(invalid("stale dispatch"));
         }
         self.task_attempt = record.attempt;
+        // 恢复路径携带上一份结果：重挂后的执行器据此识别「这份结果已经
+        // 产出过」，从而走幂等提交而不是重新执行。
         let mut previous_outcome = record
             .operation
             .as_ref()
@@ -388,6 +475,8 @@ impl DispatchRunner {
             observability: self.observations.is_some(),
         };
         let command_id = format!("cmd-{}", uuid::Uuid::now_v7());
+        // 命令标识用 v7 UUID：时间有序便于日志按发生顺序定位，全局唯一
+        // 便于跨会话追踪同一条命令。
         let execute = Message::Execute {
             command_id,
             dispatch_id: self.attempt.dispatch_id.clone(),
@@ -410,6 +499,8 @@ impl DispatchRunner {
             }
         }
         if !resume {
+            // 首挂：Execute 只发一次。resume 路径重发它等于让执行器重跑
+            // 节点——而恢复期的正确做法是靠审计重传与结果封口推进。
             link.commands
                 .send(ToSession::Send(Box::new(execute)))
                 .await
@@ -479,7 +570,12 @@ impl DispatchRunner {
         // 空闲上限只对远程链路生效。
         let idle_limit = Duration::from_millis(DURABLE_WAIT_TIMEOUT_MS);
         let mut last_progress = tokio::time::Instant::now();
+        // 100ms 轮询节拍：只用于检查「取消排空截止」与「agent 生命周期
+        // 上限」这两个时间型条件。真正的取消触发靠提交通知（commits），
+        // 不靠轮询——轮询只保证截止时间到点时能被及时处理。
         let mut cancel_tick = tokio::time::interval(Duration::from_millis(100));
+        let mut commits = self.attempt.backend.subscribe_commits();
+        commits.mark_changed(); // Also check a cancellation committed before subscribing.
         let mut error: Option<crate::journal::JournalError> = None;
         loop {
             if let Some(err) = error.take() {
@@ -590,13 +686,18 @@ impl DispatchRunner {
                         }
                     }
                 }
-                _ = cancel_tick.tick() => {
+                state_changed = async {
+                    tokio::select! {
+                        result = commits.changed() => result.is_ok(),
+                        _ = cancel_tick.tick() => false,
+                    }
+                } => {
                     // 持久取消观察：run 终态即发 Cancel 并排空回收。
-                    // 只读终态判定，不 clone 整个 run（大 run 下每 100ms 全量
-                    // 深拷贝是纯浪费）。
+                    // 提交通知才读取状态；100ms 定时器只检查截止时间和排空。
+                    // 不为每个派发定时抢状态锁，也不复制整个 run。
                     if !self.cancel_sent {
                         let run_id = self.attempt.run_id.clone();
-                        let terminal = self
+                        let terminal = state_changed && self
                             .attempt
                             .backend
                             .inspect(|s| {
@@ -625,6 +726,10 @@ impl DispatchRunner {
         }
     }
 
+    /// 读取该 run 的当前已提交状态快照。
+    ///
+    /// 派发期所有裁决（准备是否已提交、授权是否已发出、是否已终态）都以
+    /// 这份快照为准——它是 journal 的权威视图，不是内存缓存。
     async fn snapshot(&self) -> Result<Run> {
         self.attempt
             .backend
@@ -688,7 +793,9 @@ impl DispatchRunner {
                 });
                 Ok(None)
             }
-            Message::RequestOperation { ref transfer_id, .. } => {
+            Message::RequestOperation {
+                ref transfer_id, ..
+            } => {
                 // 单流承载（v3）：执行器按「块 → InputReady → 请求」的顺序
                 // 提交，请求到达时块必然已齐；不齐即传输损坏，明确拒绝。
                 if !self.op_transfer_complete(transfer_id) {
@@ -715,6 +822,9 @@ impl DispatchRunner {
                     return Err(invalid("transfer chunk digest mismatch"));
                 }
                 let received: u64 = self.op_transfers.values().map(|e| e.buf.len() as u64).sum();
+                // 三重预算都在**写入缓冲之前**判定：单块偏移越界、累计字节
+                // 超限、新建条目数超限——先判后收，避免畸形对端靠「先占住
+                // 内存再报错」耗尽主进程预算。
                 if offset
                     .checked_add(bytes.len() as u64)
                     .is_none_or(|end| end > OPERATION_TRANSFER_LIMIT)
@@ -766,6 +876,7 @@ impl DispatchRunner {
                     buf: Arc::new(Vec::new()),
                     ready: None,
                 });
+                // 收齐声明：整值长度与摘要在此刻才被信任（此前只有分块）。
                 entry.ready = Some((total_bytes, digest));
                 Ok(None)
             }
@@ -872,6 +983,9 @@ impl DispatchRunner {
                 }
             }
             if record.audit_seq != self.durable_seq + new_records.len() as u64 + 1 {
+                // 连续性闸门：批内必须首尾相接地接在已持久前缀之后。
+                // 有缺口就意味着中间有审计丢了——此时落盘会让 journal 出现
+                // 无法解释的空洞，恢复期无法裁决，因此整批拒绝。
                 return Err(invalid("audit gap/duplicate"));
             }
             new_records.push((record, digest));
@@ -914,6 +1028,7 @@ impl DispatchRunner {
                 })
                 .await?;
             for (record, digest) in new_records {
+                // 已持久前缀推进到本批最后一条；摘要入库供同序号重传比对。
                 self.durable_seq = record.audit_seq;
                 self.durable_bytes += record_bytes(record.audit_seq, &record.kind, &record.payload);
                 self.committed.insert(record.audit_seq, digest);
@@ -969,6 +1084,10 @@ impl DispatchRunner {
                         .operation
                         .as_ref()
                         .is_some_and(|o| o.outcome.is_none());
+                // 「已授权但没有 Outcome」= 外部副作用的状态未知。这类失败
+                // 不能包装成普通失败（那会让调度器自动重试，等于把「可能
+                // 已经扣过款」当成「肯定没扣」），必须进 uncertain 等人工
+                // 裁决（C4）。
                 let message = if uncertain && !error.starts_with("external outcome uncertain") {
                     format!("external outcome uncertain: {error}")
                 } else {
@@ -989,6 +1108,9 @@ impl DispatchRunner {
                         &self.predecessors,
                     );
                     let policy = self.node.retry();
+                    // 自动重试的三个前提：准备已提交（输入确定）、没有外部
+                    // 操作授权（无副作用）、节点类型是纯本地计算（script/
+                    // condition）。缺一不可——否则重试就是重复副作用。
                     if record.prepared.is_some()
                         && record.operation.is_none()
                         && matches!(
@@ -997,6 +1119,8 @@ impl DispatchRunner {
                         )
                         && record.attempt < policy.max_attempts.min(100)
                     {
+                        // 退避时刻由主进程派生并写入载荷：重试时机是平台
+                        // 决策，不能交给执行器自选（否则退避策略形同虚设）。
                         let delay = policy.backoff_ms.min(i64::MAX as u64) as i64;
                         payload["retry_wake_at"] =
                             json!(chrono::Utc::now().timestamp_millis().saturating_add(delay));
@@ -1139,6 +1263,9 @@ impl DispatchRunner {
                 if parent.depth >= flow_engine::MAX_SUB_WORKFLOW_DEPTH {
                     return Err(fj("child depth exceeded"));
                 }
+                // R_max 是主进程在飞 run 状态数的上限（不是协议量）：子 run
+                // 也要占主进程状态，必须在同一事务里判定，否则并发注册会
+                // 冲破上限。
                 if state
                     .runs
                     .values()
@@ -1282,6 +1409,8 @@ impl DispatchRunner {
             return Err(invalid("operation fingerprint mismatch"));
         }
         // 请求入库（journal 级值，不占 audit_seq；与一期 store_json 同构）。
+        // 小值内联、大值存为 journal 引用：内联阈值保证控制帧不会因为
+        // 外部请求体而膨胀（值字节本身走 data 通道传输）。
         let stored = if request_bytes.len() <= flow_journal::INLINE_BYTES {
             StoredValue::Inline(
                 serde_json::from_slice(&request_bytes).map_err(|e| invalid(e.to_string()))?,
@@ -1309,6 +1438,9 @@ impl DispatchRunner {
         let dispatch = self.attempt.dispatch_id.clone();
         let operation_value = serde_json::to_value(&operation)?;
         fault::checkpoint("auth_persist:before").await;
+        // 授权事务：OperationIntent 与 OperationAuthorized 必须同一事务提交
+        // （C3）。分成两条事务会留下「有意图、未必授权」的中间态，恢复期
+        // 将无法区分「请求没发出」与「请求已发出但没记录授权」。
         let authorize = self
             .attempt
             .backend
@@ -1430,8 +1562,14 @@ enum ByteSource {
 }
 
 #[derive(Debug)]
+/// 输入传输的失败原因。
+///
+/// 区分「链路断了」与「数据坏了」：前者可由远程模式走 Resume 对账恢复，
+/// 后者必须直接失败——坏数据重传一次还是坏，重试没有意义。
 enum InputTransferError {
+    /// 传输内容非法（编码失败、摘要不符、journal 读失败）。
     Invalid(String),
+    /// 命令通道已关闭（会话死亡或被回收）。
     LinkClosed,
 }
 
@@ -1446,6 +1584,10 @@ fn task_value(stored: &StoredValue) -> flow_engine::execution_protocol::TaskValu
     }
 }
 
+/// StoredValue → 可读字节源。
+///
+/// Ref 走 journal 流式读出（主进程不把大值整个读进内存），Inline 序列化
+/// 成内存字节。失败返回 `Err(())`（调用方转成 `InputTransferError::Invalid`）。
 fn byte_source(stored: &StoredValue) -> std::result::Result<ByteSource, ()> {
     match stored {
         StoredValue::Ref(reference) => Ok(ByteSource::Journal(reference.clone())),
@@ -1455,6 +1597,15 @@ fn byte_source(stored: &StoredValue) -> std::result::Result<ByteSource, ()> {
     }
 }
 
+/// 把一次派发所需的全部输入字节分块送到执行器。
+///
+/// 传输与事件循环并行：本协程只管发字节，主循环只管收审计/结果，二者
+/// 互不阻塞——否则大输入的传输延迟会拖住审计确认，触发执行器侧的窗口
+/// 停滞。
+///
+/// 顺序敏感：每个值的 `TransferChunk` 必须全部发完后才发它的 `InputReady`，
+/// 执行器据此判断材料齐备；因此这里在成功读完并通过摘要校验后才发布
+/// readiness。
 #[allow(clippy::too_many_arguments)]
 async fn transfer_inputs(
     session: tokio::sync::mpsc::Sender<ToSession>,
@@ -1509,6 +1660,9 @@ async fn transfer_inputs(
             ByteSource::Journal(reference) => {
                 let root = root.clone();
                 let reference = reference.clone();
+                // journal 读值是阻塞 IO：放进 spawn_blocking 执行，经 256 KiB
+                // 有界管道喂给异步发送侧。有界是必须的——值可达数百 MiB，
+                // 无界缓冲会让主进程内存占用与值大小成正比。
                 let (reader, writer) = tokio::io::duplex(256 * 1024);
                 let produce = tokio::task::spawn_blocking(move || {
                     use std::io::Write;
@@ -1552,6 +1706,8 @@ async fn transfer_one(
     reader: &mut (impl tokio::io::AsyncRead + Unpin),
 ) -> std::result::Result<Message, InputTransferError> {
     use tokio::io::AsyncReadExt;
+    // 固定 256 KiB 块（与 contract 的 TRANSFER_CHUNK_BYTES 一致）：主进程
+    // 不按值边界重切，避免与执行器的块大小约定漂移。
     let mut buffer = vec![0u8; TRANSFER_CHUNK_BYTES];
     let mut offset = 0u64;
     let mut hash = sha2::Sha256::new();
@@ -1564,6 +1720,7 @@ async fn transfer_one(
             break;
         }
         hash.update(&buffer[..n]);
+        // 每块自带摘要：执行器逐块校验，损坏只影响该块而不是整条传输。
         session
             .send(ToSession::Send(Box::new(Message::TransferChunk {
                 dispatch_id: dispatch_id.into(),
@@ -1584,19 +1741,29 @@ async fn transfer_one(
     })
 }
 
+/// 单个字节值的 SHA-256 十六进制摘要。
 fn hex_sha(bytes: &[u8]) -> String {
     hex::encode(sha2::Sha256::digest(bytes))
 }
 
+/// 增量摘要的终值（用于整值摘要，避免把整段读进内存再算一次）。
 fn hex_sha_result(hash: &sha2::Sha256) -> String {
     use sha2::Digest;
     hex::encode(hash.clone().finalize())
 }
 
+/// 审计记录的规范化 wire 表示（幂等比较的输入）。
+///
+/// 摘要对象必须是**原始内容**的确定编码：同序号同内容重传必须得到同一
+/// 摘要（幂等放行），同序号异内容必须得到不同摘要（拒绝）。
 fn wire_record(audit_seq: u64, kind: &str, payload: &Value) -> Value {
     json!({"audit_seq": audit_seq.to_string(), "kind": kind, "payload": payload})
 }
 
+/// wire 上的审计种类 → journal 事件种类。
+///
+/// 闭集映射：未列出的种类一律拒绝（`None`），不做「未知即忽略」——忽略
+/// 会让执行器的审计与 journal 事实静默错位。
 fn event_kind(kind: &str) -> Option<EventKind> {
     Some(match kind {
         "input_prepared" => EventKind::InputPrepared,
@@ -1627,6 +1794,7 @@ async fn resolve_dispatch(
     }
 }
 
+/// wire 上的日志级别 → journal 日志级别（未知级别按 info 处理）。
 fn level_of(level: &str) -> flow_engine::log_types::LogLevel {
     match level {
         "error" => flow_engine::log_types::LogLevel::Error,
@@ -1636,6 +1804,7 @@ fn level_of(level: &str) -> flow_engine::log_types::LogLevel {
     }
 }
 
+/// wire 上的输出流 → journal 日志流（未知流按 stdout 处理）。
 fn stream_of(stream: &str) -> flow_engine::log_types::LogStream {
     match stream {
         "stderr" => flow_engine::log_types::LogStream::Stderr,
@@ -1644,6 +1813,14 @@ fn stream_of(stream: &str) -> flow_engine::log_types::LogStream {
     }
 }
 
+/// 解析子流程应使用的定义版本。
+///
+/// 两条路径：
+/// - 固定上下文执行（execution 快照存在）：子流程版本被**钉死**在父 run
+///   的 bindings 里，必须与钉死值一致，否则父 run 的可复现性被破坏。
+/// - 普通执行：取该 workflow 最新的已发布版本。
+///
+/// 找不到定义即报错：子 run 绝不能绑到「猜出来的」定义上。
 fn child_definition<'a>(
     state: &'a flow_engine::journal_state::State,
     parent: &'a Run,
@@ -1679,6 +1856,7 @@ fn child_definition<'a>(
 mod transfer_budget_tests {
     use super::*;
 
+    /// 传输失败必须关管道，且坏值绝不能被发布为「已就绪」。
     #[tokio::test]
     async fn journal_transfer_closes_pipe_on_failure_and_never_publishes_bad_value() {
         let root = tempfile::tempdir().unwrap();
@@ -1734,6 +1912,8 @@ mod transfer_budget_tests {
         backend.close().await.unwrap();
     }
 
+    /// 畸形传输必须在**保留**（进入 op_transfers 表）之前就被拒绝，
+    /// 避免攻击者/异常对端用无效条目占住内存预算。
     #[tokio::test]
     async fn malformed_transfers_are_bounded_before_retention() {
         let root =

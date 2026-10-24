@@ -4,6 +4,10 @@
 //! 在目标 fork 子进程内清除 CLOEXEC，执行器接管后立即恢复；pre_exec 为其余
 //! 继承 FD 设置 CLOEXEC，不做 dup2 落位。父进程 spawn 后
 //! 需自行关闭子端副本（本函数返回的子端流由调用方 drop）。
+//!
+//! 守护的核心不变量：只有**目标执行器**能拿到通道 FD（其余继承 FD 一律
+//! CLOEXEC），且子进程环境是白名单式的（凭据类变量不继承）——这两条合起来
+//! 决定「谁能看到这条会话」与「执行器能看到哪些秘密」。
 
 use std::os::fd::AsRawFd;
 
@@ -19,12 +23,15 @@ use super::unix::socketpair_channel;
 /// 常规工具链环境——空 `PATH`/`HOME` 的 shell 里 cargo/git/node 大面积
 /// 不可用。按显式白名单从父进程透传；`FLOW_*`（协议/凭据）、`CONGA_*`
 /// （harness 配置，由 executor 派发时从冻结快照构造）、`RUST_LOG`
-/// （单独注入）与任何密钥类变量都不透传。remote 模式下父进程是远端
-/// 机器上的 flow-agent，透传的是那台机器的环境。
+/// （单独注入）与任何密钥类变量都不透传。例外 `FLOW_HOME`：它是
+/// harness 沙箱的目录定位（无凭据语义），必须与父进程一致（测试隔离
+/// 与多实例部署都靠它在父子间对齐 `~/.flow`）。remote 模式下父进程是
+/// 远端机器上的 flow-agent，透传的是那台机器的环境。
 #[cfg(unix)]
 pub(crate) const EXECUTOR_ENV_WHITELIST: &[&str] = &[
     "PATH",
     "HOME",
+    "FLOW_HOME",
     "TMPDIR",
     "TMP",
     "LANG",
@@ -44,6 +51,7 @@ pub(crate) const EXECUTOR_ENV_WHITELIST: &[&str] = &[
 pub(crate) const EXECUTOR_ENV_WHITELIST: &[&str] = &[
     "PATH",
     "USERPROFILE",
+    "FLOW_HOME",
     "APPDATA",
     "LOCALAPPDATA",
     "TEMP",
@@ -55,6 +63,9 @@ pub(crate) const EXECUTOR_ENV_WHITELIST: &[&str] = &[
 ];
 
 /// 把白名单环境应用到执行器命令。
+///
+/// 只透传白名单里的变量，且父进程没设的变量不设（不补空串）——补空串
+/// 会让子进程误以为「变量存在但为空」，行为与「未设置」不同。
 pub(crate) fn apply_executor_env_whitelist(command: &mut Command) {
     for name in EXECUTOR_ENV_WHITELIST {
         if let Some(value) = std::env::var_os(name) {
@@ -90,6 +101,8 @@ pub fn spawn_executor_process(
     if let Some(tag) = tag {
         command.arg("--tag").arg(tag);
     }
+    // 通道 FD 号随 argv 传给子进程：子进程据此从继承的 FD 表里接管
+    // 对端；号必须与父进程看到的一致（同一个 socketpair 端）。
     command.arg("--channel-fd").arg(child_fd.to_string());
     command
         .stdin(std::process::Stdio::null())
@@ -132,6 +145,7 @@ mod tests {
         unsafe {
             std::env::set_var("CONGA_LLM_KEY", "sk-leak");
             std::env::set_var("FLOW_SECRET_X", "leak");
+            std::env::set_var("FLOW_HOME", "/tmp/flow-home-whitelist");
         }
         apply_executor_env_whitelist(&mut command);
         let envs = command
@@ -141,6 +155,8 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         // 白名单变量在设置时透传（PATH 几乎必然存在；HOME 同理）
         assert!(envs.contains("PATH"), "PATH 应在白名单集内：{envs:?}");
+        // FLOW_HOME 是目录定位例外（harness 沙箱父子对齐），必须透传
+        assert!(envs.contains("FLOW_HOME"), "FLOW_HOME 应透传：{envs:?}");
         // 协议/密钥/harness 配置变量不透传（env_clear 语义不回退）
         for banned in ["CONGA_LLM_KEY", "FLOW_SECRET_X", "RUST_LOG"] {
             assert!(!envs.contains(banned), "{banned} 不该透传：{envs:?}");
@@ -148,6 +164,7 @@ mod tests {
         unsafe {
             std::env::remove_var("CONGA_LLM_KEY");
             std::env::remove_var("FLOW_SECRET_X");
+            std::env::remove_var("FLOW_HOME");
         }
     }
 }

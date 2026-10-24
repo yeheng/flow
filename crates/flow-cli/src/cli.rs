@@ -1,4 +1,15 @@
 //! `flow-cli` 命令定义与分发。
+//!
+//! 本模块只负责三件事：**定义命令行表面**（clap）、**把参数分派到对应
+//! 的业务模块**、**把错误映射成进程退出码**。它不包含任何业务判断——
+//! 「这个工作流能不能跑」这类问题一律由服务端回答，CLI 只负责如实转述。
+//!
+//! 为什么坚持「CLI 不做业务判断」：一旦 CLI 自己也有一份校验，两份规则
+//! 就会随版本漂移，用户会遇到「CLI 说可以、服务端说不行」这种最难排查
+//! 的不一致。
+//!
+//! 全局参数（`--url` / `--json` / `--request_id`）是 `global = true`，
+//! 因此可以出现在任意子命令之后——脚本里通常把通用参数写在末尾。
 
 use clap::{Parser, Subcommand};
 
@@ -30,29 +41,35 @@ pub struct Cli {
     /// Stable identity for writes; reuse it with identical arguments after a lost reply.
     #[arg(long, global = true, value_parser = parse_request_id)]
     request_id: Option<String>,
+    /// 要执行的子命令。
     #[command(subcommand)]
     command: Command,
 }
 
+/// CLI 的顶层命令组。
 #[derive(Subcommand)]
 pub enum Command {
     /// JSONL v2 commands, bounded history pages and streaming downloads.
     Journal {
+        /// journal 子命令。
         #[command(subcommand)]
         command: crate::journal::Command,
     },
     /// 工作流定义：增删改查 + 导入导出
     Workflow {
+        /// workflow 子命令。
         #[command(subcommand)]
         command: WorkflowCommand,
     },
     /// 运行：手动触发 run + 运行记录查询/取消
     Run {
+        /// run 子命令。
         #[command(subcommand)]
         command: RunCommand,
     },
 }
 
+/// 工作流相关子命令。
 #[derive(Subcommand)]
 pub enum WorkflowCommand {
     /// 列出全部工作流
@@ -114,6 +131,7 @@ pub enum WorkflowCommand {
     },
 }
 
+/// 运行相关子命令。
 #[derive(Subcommand)]
 pub enum RunCommand {
     /// 手动触发一次 run（默认等待终态并打印输出）
@@ -161,10 +179,15 @@ pub enum RunCommand {
 }
 
 /// 进程入口：解析命令行 → 连服务（连不上是本地错误，exit 1）→ 分发到命令组。
+///
+/// 退出码契约：0 成功、1 本地/连接错误、2 参数错误、4 服务端业务错误。
+/// 这套码是脚本的接口——CI 里靠它区分「命令写错了」与「业务失败了」。
 pub async fn run_from_args(argv: &[String]) -> i32 {
     // parse_from 的首元素是程序名占位：`flow-cli` 是展示名，实际参数从 argv 起。
     let cli = Cli::parse_from(std::iter::once("flow-cli".to_string()).chain(argv.iter().cloned()));
     let request_id = cli.request_id.clone();
+    // 整个执行包在一个幂等作用域里：回复丢失时用同一个 request_id 重发，
+    // 服务端会认出「这是同一次写」而不是执行第二次。
     match crate::journal::REQUEST_ID
         .scope(request_id, dispatch(cli))
         .await
@@ -177,6 +200,10 @@ pub async fn run_from_args(argv: &[String]) -> i32 {
     }
 }
 
+/// 建立连接并把子命令分派到对应业务模块。
+///
+/// 连接失败在这一层变成 `CliError`（本地错误，exit 1），与「服务端返回的
+/// 业务错误」区分开：前者通常是服务没起，后者是请求本身有问题。
 async fn dispatch(cli: Cli) -> Result<(), CliError> {
     let client = crate::client::connect(&cli.url).await?;
     match cli.command {
@@ -188,6 +215,10 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
     }
 }
 
+/// 校验 `--request_id`：非空且不超过 128 字节。
+///
+/// 长度上限是服务端存储的硬边界——超长 id 会在服务端被拒绝，
+/// 与其让请求往返一趟才失败，不如在本地就挡住。
 fn parse_request_id(value: &str) -> Result<String, String> {
     if value.is_empty() || value.len() > 128 {
         return Err("request_id must contain 1..=128 bytes".into());

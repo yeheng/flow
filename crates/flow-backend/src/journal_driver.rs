@@ -2,6 +2,13 @@
 //! Node execution semantics live only in the executor: every platform drives
 //! them through the subprocess pool (unix socketpair, others loopback dialback)
 //! or remote agents; the coordinator never runs node logic in-process.
+//!
+//! 本模块是协调循环：把「已提交事实」推进成「下一步动作」，并把每一次
+//! 推进写成新的 journal 事实。它守护的核心不变量是「没有事实就没有决策」
+//! 与「不知道就不动」——推进只依据已提交的当前状态，所有副作用都落在
+//! 事实上，节点语义则一律交给执行器子进程（C2）。
+//! 需要它，是因为外部副作用无法纳入本地事务：只有把意图、授权与结果
+//! 分成三个可裁决的阶段（C3/C4），崩溃后的未知结果才有一个明确的出口。
 use crate::execution::remote::{RemoteDispatcher, RemoteOptions};
 use crate::execution::{ExecutionMode, IpcDispatcher};
 use crate::journal::{JournalBackend, JournalError};
@@ -41,6 +48,7 @@ struct Coordinator {
 }
 
 impl Coordinator {
+    /// 新建协调器状态（每次循环重启都会重置——重启后从已提交事实重建）。
     fn new(limit: usize) -> Self {
         Self {
             tasks: JoinSet::new(),
@@ -51,6 +59,10 @@ impl Coordinator {
         }
     }
 
+    /// 是否还有派发槽位。
+    ///
+    /// agent 节点另设子上限（上限的一半）：agent 一次占满一个执行器且
+    /// 生命周期长，宽松地排满会让普通节点完全排不上队。
     fn has_capacity(&self, node: &flow_engine::Node) -> bool {
         self.tasks.len() < self.limit
             && (!node.is_harness_agent() || self.agents.len() < self.limit.div_ceil(2))
@@ -80,6 +92,8 @@ struct GateNode {
 }
 
 type Result<T> = std::result::Result<T, JournalError>;
+
+/// 统一错误构造（参数/合同类问题）。
 fn invalid(s: impl Into<String>) -> flow_journal::Error {
     flow_journal::Error::Invalid(s.into())
 }
@@ -121,7 +135,11 @@ impl JournalBackend {
         self.start_execution_with_port(limit, ExecutionPort::Ipc(dispatcher), prewarm)
             .await
     }
+
     /// 持久提交新任期并返回新 epoch。
+    ///
+    /// 任期号是执行器的「写权凭证」：新任期提交后，旧执行器即使还活着
+    /// 也会因为任期不符而被拒绝提交结果。
     pub(crate) async fn bump_master_epoch(self: &Arc<Self>) -> Result<u64> {
         self.internal(|state| {
             let epoch = state.master_epoch + 1;
@@ -135,6 +153,7 @@ impl JournalBackend {
         })
         .await
     }
+
     /// 三期远程模式：epoch + TLS 监听 + 远程派发器（R1）。
     pub async fn start_execution_remote(self: &Arc<Self>, options: RemoteOptions) -> Result<()> {
         let epoch = self.bump_master_epoch().await?;
@@ -148,6 +167,7 @@ impl JournalBackend {
         // 身份由 token→agent_id 映射表决定，凭据表不可留空。
         if let Some(addr) = &options.wss_addr {
             if options.wss_agents.is_empty() {
+                // 配了接入地址却没有凭据，等于开了一个谁都能连的口子。
                 manager.shutdown().await;
                 return Err(crate::journal::JournalError::Journal(
                     flow_journal::Error::Invalid(
@@ -168,6 +188,8 @@ impl JournalBackend {
             .start_execution_with_port(16, ExecutionPort::Remote(dispatcher), false)
             .await;
         if result.is_err() {
+            // 启动失败时必须关掉已监听的端口，否则会留下一个没有协调器
+            // 的空壳监听。
             manager.shutdown().await;
         }
         result
@@ -184,6 +206,10 @@ impl JournalBackend {
             .await
     }
 
+    /// 启动协调循环任务（唯一持有执行端口的任务）。
+    ///
+    /// 端口归这一个任务所有：它负责派发、回收与关闭，别的任务不碰
+    /// 执行器，避免两个任务同时 acquire 造成槽位超发。
     async fn start_execution_with_port(
         self: &Arc<Self>,
         limit: usize,
@@ -192,6 +218,7 @@ impl JournalBackend {
     ) -> Result<()> {
         let mut driver = self.execution.lock().await;
         if driver.as_ref().is_some_and(|handle| !handle.is_finished()) {
+            // 已有在跑的协调器：直接复用，不重复起第二个派发者。
             return Ok(());
         }
         let observation = self.observations.clone();
@@ -218,6 +245,8 @@ impl JournalBackend {
                 let restarted = AssertUnwindSafe(async {
             let mut coord = Coordinator::new(limit);
             loop {
+                // 睡眠时长由最近的持久唤醒时刻决定：没有等待时退到 60s，
+                // 避免空转烧 CPU；有到期唤醒时精确等到那一刻。
                 let delay = coord
                     .wakes
                     .first_key_value()
@@ -233,6 +262,8 @@ impl JournalBackend {
                     completed=coord.tasks.join_next(),if !coord.tasks.is_empty()=>{
                         match completed {
                             Some(Ok((key,result)))=>{coord.active.remove(&key);coord.agents.remove(&key);finished=Some(key.0);if let Err(error)=result {tracing::error!(%error,"v2 node task stopped; committed evidence retained");}},
+                            // 任务本身崩溃（不是节点失败）：放弃本轮协调器，
+                            // 从已提交事实重建——内存里的在飞记账已不可信。
                             Some(Err(error))=>{tracing::error!(%error,"v2 task exited unexpectedly; rebuilding coordinator");coord.tasks.abort_all();while coord.tasks.join_next().await.is_some(){}return},
                             None=>{}
                         }
@@ -267,6 +298,7 @@ impl JournalBackend {
                     backend.defer_run(run).await;
                 }
                 let now = chrono::Utc::now().timestamp_millis();
+                // 到期的持久唤醒：把这些 run 重新放回 dirty 集。
                 while coord.wakes.first_key_value().is_some_and(|(at, _)| *at <= now) {
                     let (_, runs) = coord.wakes.pop_first().unwrap();
                     for run in runs {
@@ -276,6 +308,8 @@ impl JournalBackend {
                 let mut runs = backend.take_dirty_runs().await.into_iter();
                 while let Some(run_id) = runs.next() {
                     if coord.tasks.len() >= coord.limit {
+                        // 槽位已满：把本批剩余 run 全部退回 dirty 集，
+                        // 等下一轮再调度，避免部分推进造成顺序不公。
                         backend
                             .defer_runs(std::iter::once(run_id).chain(runs).collect())
                             .await;
@@ -325,6 +359,8 @@ impl JournalBackend {
                     panicked = restarted.is_err(),
                     "restarting v2 coordinator from committed state"
                 );
+                // 重建：把所有在飞 run 重新标为 dirty，从已提交事实重新推导，
+                // 而不是沿用崩溃前的内存记账。
                 let pending = backend
                     .inspect(|state| {
                         state
@@ -361,6 +397,10 @@ impl JournalBackend {
 /// propagation, waiting nodes, ready gates, task spawn and terminal
 /// settlement. Every mutation lands as journal facts; transient errors
 /// surface to the coordinator loop for a delayed retry.
+///
+/// 推进一个 run 直到「已提交事实允许的尽头」：父级取消传播、等待中的节点、
+/// 就绪闸门、任务派发与终态收口。每一次变更都写成 journal 事实；
+/// 瞬时错误上抛给协调循环，由它延迟重试。
 async fn advance_run(
     backend: &Arc<JournalBackend>,
     port: &ExecutionPort,
@@ -446,6 +486,7 @@ async fn advance_run(
             NodeGate::Blocked => {}
             NodeGate::Ready(predecessors) => {
                 if !coord.has_capacity(node) {
+                    // 槽位不足：本轮不派发，把 run 退回 dirty 集等下一轮。
                     backend.defer_run(run_id.to_owned()).await;
                     continue;
                 }
@@ -467,6 +508,9 @@ async fn advance_run(
 
 /// A cancelled parent durably drives bounded one-child cancellation, so
 /// restart resumes propagation without a giant transaction.
+///
+/// 父 run 被取消时，子 run 的取消必须「每次只推进一个」的粒度落盘，
+/// 否则一次级联取消会变成一个巨大的事务。
 async fn cancel_if_parent_cancelled(backend: &Arc<JournalBackend>, run: &Run) -> Result<bool> {
     if let Some(parent) = &run.parent {
         let cancelled = backend.run_status(&parent.run_id).await? == Some(RunStatus::Cancelled);
@@ -483,6 +527,9 @@ async fn cancel_if_parent_cancelled(backend: &Arc<JournalBackend>, run: &Run) ->
 /// Advance a node that already has committed facts. Returns true when this
 /// pass fully handled the node (still waiting, terminal, or uncertain-op
 /// bookkeeping); false means gate evaluation may proceed.
+///
+/// 处理「已经有事实」的节点：等待、终态、重试授权与未决操作的恢复。
+/// 返回 true 表示本轮已完整处理该节点，无需再走闸门判定。
 async fn advance_committed_node(
     backend: &Arc<JournalBackend>,
     run_id: &str,
@@ -491,6 +538,8 @@ async fn advance_committed_node(
     wakes: &mut BTreeMap<i64, BTreeSet<String>>,
 ) -> Result<bool> {
     let now = chrono::Utc::now().timestamp_millis();
+    // C4：只有显式声明 repeatable 的节点才能拿持久重试授权；尝试次数
+    // 受 max_attempts 与 100 次硬上限双重约束。
     if node.params["effect_policy"] == "repeatable"
         && record
             .operation
@@ -513,6 +562,7 @@ async fn advance_committed_node(
             .as_ref()
             .ok_or_else(|| invalid("waiting node missing wait"))?;
         if wait.kind() == WaitKind::Signal {
+            // 等待人工信号：只有 inbox 里已有信号才能唤醒，否则本轮无事可做。
             backend
                 .internal_for_run(run_id, |s| {
                     let run = &s.runs[run_id];
@@ -553,6 +603,7 @@ async fn advance_committed_node(
                     Ok((vec![node_event(parent,&node.id,kind,payload,true)], ()))
                 }).await?;
             } else {
+                // 子 run 还没结束：登记一次 1 秒后的唤醒，避免空转轮询。
                 wakes
                     .entry(now.saturating_add(1000))
                     .or_default()
@@ -561,6 +612,7 @@ async fn advance_committed_node(
             return Ok(true);
         }
         if wait.kind() == WaitKind::Delay && wait.wake_at().is_some_and(|at| at <= now) {
+            // 延时已到：唤醒节点。
             backend
                 .internal_for_run(run_id, |s| {
                     let r = &s.runs[run_id];
@@ -576,6 +628,7 @@ async fn advance_committed_node(
         }
         if matches!(wait.kind(), WaitKind::Delay | WaitKind::Retry) {
             if let Some(at) = wait.wake_at().filter(|at| *at > now) {
+                // 到期时刻登记进唤醒表：协调循环据此精确等待而不是轮询。
                 wakes.entry(at).or_default().insert(run_id.to_owned());
             }
         }
@@ -624,6 +677,9 @@ async fn advance_committed_node(
 /// 纯函数：入边在当前快照下的推进结论（无 IO、无副作用）。
 /// 入参是入边前驱的最小视图（[`GateNode`]），不是整份 Run——本函数只读
 /// 汇合判定所需的状态/分支/输出三件事。
+///
+/// 汇合语义分两套：v2 默认「等全部入边确定」（selected 模式是例外），
+/// v1 则要求全部前驱成功。两者不可混用——跳过向下游传播是 v1 的语义。
 fn incoming_gate(
     definition: &Definition,
     view: &BTreeMap<String, GateNode>,
@@ -633,6 +689,8 @@ fn incoming_gate(
         .as_str()
         .map_or(definition.semantics >= 2, |j| j == "selected");
     if selected {
+        // selected 汇合：等全部入边确定，然后只走被选中的成功路径；
+        // 未选分支记 inactive，全部入边 inactive 时传播 inactive。
         let mut pending = false;
         let mut failed = false;
         let mut active = 0;
@@ -675,6 +733,7 @@ fn incoming_gate(
     for edge in definition.incoming(&node.id) {
         match view.get(&edge.from) {
             Some(n) if n.status == NodeStatus::Skipped => {
+                // v1 语义：前驱被跳过则下游也跳过（跳转会向下游传播）。
                 skip = true;
                 ready = false;
                 if skip_reason.is_empty() {
@@ -717,6 +776,9 @@ fn incoming_gate(
 
 /// Reserve one dispatch slot and spawn the node attempt; in-flight
 /// bookkeeping (active key, peak gauge) happens before the task ever runs.
+///
+/// 先占槽位与在飞记账，再启动任务：任务一旦运行就可能立刻回写结果，
+/// 记账必须先于它完成，否则会漏掉这次尝试。
 async fn spawn_node_attempt(
     backend: &Arc<JournalBackend>,
     port: &ExecutionPort,
@@ -748,6 +810,10 @@ async fn spawn_node_attempt(
 /// converted into committed evidence: uncertain operations wait for
 /// adjudication, prepare-stage script/condition failures schedule a retry
 /// wake, everything else lands as NodeFailed.
+///
+/// 一次节点尝试的执行包装：把失败与 panic 都转成可提交的事实。
+/// 关键是「不把平台故障写成业务失败」——已授权外部操作的节点在断链时
+/// 必须落到 Uncertain 等待人工裁决。
 async fn execute_node(
     port: ExecutionPort,
     attempt: Attempt,
@@ -811,6 +877,8 @@ async fn execute_node(
                 && matches!(node.kind(), Some(NodeType::Script | NodeType::Condition))
                 && n.attempt < policy.max_attempts.min(100)
             {
+                // 准备阶段就失败（脚本/条件在派发前抛错）属于本节点自己的
+                // 错误，没有碰过外部系统，可以按策略自动重试。
                 let delay = policy.backoff_ms.min(i64::MAX as u64) as i64;
                 payload["retry_wake_at"] =
                     json!(chrono::Utc::now().timestamp_millis().saturating_add(delay));
@@ -856,6 +924,9 @@ async fn execute_node(
 /// （错误取定义序第一个 failed 节点）；否则全部 end 计入输出（无输出/
 /// skipped 的 end 记 null，不再丢弃——多 end 时形状恒为 map，与 v1
 /// singular_or_map 一致）。
+///
+/// 收口只在「全部节点都终态」时发生：还有节点在跑或等待时，
+/// run 的结局尚未确定。
 async fn settle_run(
     backend: &Arc<JournalBackend>,
     run_id: &str,
@@ -897,6 +968,7 @@ async fn settle_run(
                             .is_some_and(|n| n.status == NodeStatus::Succeeded)
                 })
             {
+                // v2 语义：没有有效 end 完成即视为失败（v1 允许无 end）。
                 return finish_run(
                     backend,
                     run_id,
@@ -929,6 +1001,7 @@ async fn settle_run(
                 .collect();
             let output = join_values(backend, ends).await?;
             if let Some(schema) = &definition.output_schema {
+                // 输出合同不满足时 run 失败，而不是把不合规的输出交给调用方。
                 let actual = match flow_journal::value::materialize(
                     backend.journal.root(),
                     backend.journal.durable_lsn(),
@@ -963,6 +1036,10 @@ async fn settle_run(
     Ok(())
 }
 
+/// 把多个 end 输出合成一个 run 输出值。
+///
+/// 单值直接复用；多值合成一个流式对象并落成正文引用——多个 end 的
+/// 输出不能塞进一行事务。
 async fn join_values(
     backend: &JournalBackend,
     mut values: BTreeMap<String, StoredValue>,
@@ -988,6 +1065,10 @@ async fn join_values(
     Ok(StoredValue::Ref(value))
 }
 
+/// 收口一个 run：写 RunCompleted / RunFailed 事实，并顺带唤醒父 run。
+///
+/// 父 run 的等待节点在子 run 终态时立刻得到结论：成功则传输出，
+/// 失败则传错误——父节点不必等到下一轮轮询才发现子 run 已结束。
 async fn finish_run(
     backend: &JournalBackend,
     run_id: &str,
@@ -1013,6 +1094,7 @@ async fn finish_run(
 mod gate_tests {
     use super::*;
 
+    /// 构造一个带给定边的定义（闸门单测用）。
     fn definition(edges: Value) -> Definition {
         serde_json::from_value(json!({
             "nodes": [
@@ -1028,6 +1110,7 @@ mod gate_tests {
         .unwrap()
     }
 
+    /// 按 ID 取定义中的节点。
     fn node<'a>(id: &str, def: &'a Definition) -> &'a flow_engine::Node {
         def.nodes.iter().find(|n| n.id == id).unwrap()
     }
@@ -1053,6 +1136,7 @@ mod gate_tests {
             .collect()
     }
 
+    /// 闸门：前驱未定则节点保持阻塞。
     #[test]
     fn gate_blocks_until_all_predecessors_settle() {
         let def = definition(json!([
@@ -1075,6 +1159,7 @@ mod gate_tests {
         ));
     }
 
+    /// 闸门：只收集被接受的前驱输出。
     #[test]
     fn gate_collects_accepted_predecessor_outputs() {
         let def = definition(json!([
@@ -1098,6 +1183,7 @@ mod gate_tests {
         );
     }
 
+    /// 闸门：失败或跳过的上游会让下游被跳过。
     #[test]
     fn gate_skips_downstream_of_failed_or_skipped() {
         let def = definition(json!([
@@ -1124,6 +1210,7 @@ mod gate_tests {
         ));
     }
 
+    /// 闸门：条件节点的分支端口决定哪条边被接受。
     #[test]
     fn gate_honors_condition_branch_ports() {
         let def = definition(json!([
@@ -1146,6 +1233,7 @@ mod gate_tests {
         };
     }
 
+    /// 闸门：没有入边的节点（如 start）直接就绪。
     #[test]
     fn node_without_incoming_edges_is_ready() {
         let def = definition(json!([{"from":"s","to":"a"}]));
@@ -1177,6 +1265,7 @@ mod regression_tests {
             .await
             .unwrap();
     }
+    /// 装一个工作流（创建 → 更新 → 发布）并启动一次 run，返回 run_id。
     async fn install(backend: &JournalBackend, definition: Value) -> String {
         let created = backend
             .workflow_create("driver-regression", None)
@@ -1191,6 +1280,7 @@ mod regression_tests {
             .unwrap();
         started.result["run_id"].as_str().unwrap().into()
     }
+    /// 轮询等待 run 进入终态（超时即失败）。
     async fn terminal(backend: &JournalBackend, id: &str) -> Run {
         tokio::time::timeout(Duration::from_secs(8), async {
             loop {
@@ -1248,6 +1338,7 @@ mod regression_tests {
         backend.close().await.unwrap();
     }
 
+    /// 定义物化瞬时失败后应能自动重试，不应产生额外命令。
     #[tokio::test]
     async fn transient_materialize_error_retries_without_another_command() {
         let root = tempfile::tempdir().unwrap();

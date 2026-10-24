@@ -104,6 +104,10 @@ pub fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
     out
 }
 
+/// 把一行单元格按列宽补齐。
+///
+/// 列宽按**显示宽度**而不是字符数或字节数——CJK 占两列，按字符数对齐
+/// 会让含中文的表格整体歪掉。
 fn pad_row(cells: &[String], widths: &[usize]) -> String {
     // 列间两空格；最后一列不补空格（避免拖尾空白进管道）
     let mut out = String::new();
@@ -125,6 +129,10 @@ pub fn display_width(text: &str) -> usize {
     text.chars().map(|c| if is_wide(c) { 2 } else { 1 }).sum()
 }
 
+/// 判断一个字符是否为东亚宽字符（占两列）。
+///
+/// 用区间表而不是 Unicode 属性表：不追求覆盖全部组合字符，
+/// 但覆盖了表格里真正会出现的 CJK、假名、谚文与常见 emoji。
 fn is_wide(c: char) -> bool {
     matches!(c,
         '\u{1100}'..='\u{115F}'
@@ -195,6 +203,10 @@ pub fn confirm(prompt: &str) -> Result<bool, CliError> {
 }
 
 #[cfg(test)]
+/// 输出格式的回归测试。
+///
+/// 这些用例守的是**脚本可见的行为**：JSON 参数的三种写法、CJK 表格对齐、
+/// 字符级截断。任何一个改动都可能让用户现有的 shell 管道悄悄变形。
 mod tests {
     use super::*;
     use serde_json::json;

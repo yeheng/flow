@@ -412,6 +412,10 @@ pub async fn resume(
     }
 }
 
+/// 取消并清空所有在飞执行器（停机/断线路径）。
+///
+/// 先发取消信号再清表：句柄被 drop 时 `Drop` 也会触发取消，
+/// 但这里显式取消是为了让执行器有机会在宽限期内自行收尾。
 async fn cancel_all(handles: &Arc<tokio::sync::Mutex<BTreeMap<String, ExecutorHandle>>>) {
     for handle in handles.lock().await.values() {
         handle.cancel.cancel();
@@ -441,6 +445,10 @@ fn queue_uplink(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// 一次上联会话的服务循环：接收 master 帧 → 路由到执行器 →
+/// 把执行器出站帧公平转发回 master，直到连接断开或被取消。
+///
+/// 这里是 agent 的**主循环**：所有转发、背压与公平性都收敛在这里。
 pub async fn serve(
     config: &AgentConfig,
     _agent_boot_id: &str,
@@ -805,6 +813,10 @@ impl Drop for UplinkPipeline {
     }
 }
 
+/// 启动上联管线：执行器出站 → 包装 → 预算占用 → 公平多路复用 → transport。
+///
+/// 管线独立成任务是为了让服务循环不被单个慢执行器拖住；
+/// 它的 Drop 会中止所有子任务，保证连接断开时没有残留任务。
 fn spawn_uplink_pipeline(
     handles: Arc<tokio::sync::Mutex<BTreeMap<String, ExecutorHandle>>>,
     relay_slot: Arc<parking_lot::Mutex<Arc<parking_lot::Mutex<Relay>>>>,

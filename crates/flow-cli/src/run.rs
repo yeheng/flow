@@ -21,6 +21,7 @@ use crate::output::{
     duration_text, load_json_arg, local_time, note, print_json, short_id, table, truncate_chars,
 };
 
+/// 分派 run 子命令到各自的实现。
 pub async fn dispatch(client: &WsClient, json: bool, command: RunCommand) -> Result<(), CliError> {
     match command {
         RunCommand::Start {
@@ -133,6 +134,7 @@ async fn wait_terminal(
     }
 }
 
+/// 读取一次运行记录（取响应里的 `run` 字段）。
 async fn run_record(client: &WsClient, run_id: &str) -> Result<Value, CliError> {
     Ok(call(
         client,
@@ -152,12 +154,14 @@ fn run_seconds(run: &Value) -> Option<f64> {
     Some((ended - started).num_milliseconds() as f64 / 1000.0)
 }
 
+/// 解析 RFC3339 时间戳；格式不认识就返回 None（不猜）。
 fn parse_time(iso: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(iso)
         .ok()
         .map(|time| time.with_timezone(&Utc))
 }
 
+/// 列出运行记录（新的在前），支持按工作流/状态/来源过滤。
 async fn list(
     client: &WsClient,
     json: bool,
@@ -220,6 +224,7 @@ async fn list(
     Ok(())
 }
 
+/// 查看一次运行的完整记录。
 async fn get(client: &WsClient, json: bool, run_id: &str) -> Result<(), CliError> {
     let result = call(
         client,
@@ -282,6 +287,7 @@ async fn events(client: &WsClient, run_id: &str, from_seq: Option<u64>) -> Resul
     Ok(())
 }
 
+/// 查看运行时间线：整体状态 + 每个节点的最终态。
 async fn timeline(client: &WsClient, json: bool, run_id: &str) -> Result<(), CliError> {
     let result = call(
         client,
@@ -348,6 +354,10 @@ fn node_outcome(node: &Value) -> String {
     }
 }
 
+/// 取消一次仍在运行的 run。
+///
+/// `pending=true` 表示取消请求已入队但尚未生效，
+/// 需要用 `run get` 再确认一次。
 async fn cancel(client: &WsClient, json: bool, run_id: &str) -> Result<(), CliError> {
     let result = call(
         client,
@@ -370,6 +380,10 @@ async fn cancel(client: &WsClient, json: bool, run_id: &str) -> Result<(), CliEr
 }
 
 #[cfg(test)]
+/// run 展示逻辑的回归测试。
+///
+/// 这些用例守的是「缺字段时返回 None 而不是 0」这类约定——
+/// 把未知耗时显示成 0 秒会让用户误判运行是瞬时完成的。
 mod tests {
     use super::*;
     use serde_json::json;

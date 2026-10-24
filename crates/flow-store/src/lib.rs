@@ -1,3 +1,20 @@
-//! Read-only product and execution queries over flow.sqlite.
-//! The flow-journal writer atomically owns facts, current entities and receipts.
+//! 只读的产品视图与执行视图查询层，全部落在 `flow.sqlite` 这一个权威库上。
+//!
+//! 本 crate 的存在意义是**把读路径与写路径彻底分开**：`flow-journal` 的写入者
+//! 独占事实、当前实体与回执的原子提交，本 crate 只以只读连接打开同一个库，
+//! 绝不写入。这样做的代价是多了一份「读模型」要跟着投影规则演进，收益是
+//! 产品查询永远不会与权威写者争锁、也不会把一个半成品状态暴露出去。
+//!
+//! 关键不变量：
+//!
+//! - **读到的必须是已提交状态**：所有查询都在同一个 SQLite 读事务里同时取
+//!   状态与游标（`committed_lsn`），避免「状态来自 A 时刻、游标来自 B 时刻」
+//!   这种撕裂。
+//! - **体积预算是硬边界**：任何一次响应都有字节上限，超限直接报
+//!   `ResponseTooLarge`，而不是先读进内存再截断——读进来就晚了。
+//! - **完整性由摘要保证**：每个实体读取时都校验 `digest`，不匹配即视为
+//!   协议错误，绝不把可疑内容当成事实返回。
+//!
+//! 权威的持久化与提交协议见 `docs/adr/0002-sqlite-persistence.md`，
+//! 整体语义见 `docs/DESIGN.md`。
 pub mod store;

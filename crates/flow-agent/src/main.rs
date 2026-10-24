@@ -63,6 +63,10 @@ struct Agent {
     token: Option<String>,
 }
 
+/// 进程入口：解析参数 → 加载配置 → 启动 agent。
+///
+/// 配置必须在构造 tokio runtime 之前同步加载：配置加载失败要能在
+/// 没有任何副作用之前就退出。
 fn main() -> std::process::ExitCode {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let agent = match Agent::try_parse() {
@@ -123,6 +127,9 @@ fn exit_fail(err: &dyn std::fmt::Display) -> std::process::ExitCode {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// 组装运行期配置并启动 agent runtime。
+///
+/// 参数优先级：CLI flag > 环境变量（clap 已合并）> 配置文件 `[agent]` > 报错。
 fn agent_main(
     config: Config,
     flag_control_addr: Option<String>,
@@ -250,6 +257,7 @@ fn agent_main(
     0
 }
 
+/// 打印错误并返回失败退出码。
 fn fail(err: &dyn std::fmt::Display) -> i32 {
     eprintln!("error: {err}");
     1

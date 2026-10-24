@@ -75,10 +75,13 @@ Linux 安装 WebKitGTK 4.1 等 [Tauri 系统依赖](https://v2.tauri.app/start/p
 会在启动前自动执行 `npm run build:executor`，因此执行器源码改动无需手动重建。
 执行器与主进程必须使用匹配的执行协议；缺失或不兼容的 sidecar 会明确拒绝启动。
 
-桌面数据默认存放在 Tauri 应用数据目录（macOS 为
-`~/Library/Application Support/com.flow.workflow.desktop/`），工作流、运行与权威事件保存在 `journal/flow.sqlite`，
-密钥与保留的旧数据使用 `flow/` 目录。需要隔离开发数据时，在启动前
-设置 `FLOW_DESKTOP_DATA_DIR=/绝对路径`。桌面不会自动导入原服务器数据目录。
+桌面数据默认存放在用户主目录的 flow 主目录 `~/.flow`（可用 `FLOW_HOME` 覆盖），
+与 journal-server / harness 沙箱统一布局：工作流、运行与权威事件保存在
+`~/.flow/journal/flow.sqlite`，密钥与保留的旧数据使用 `~/.flow/data/` 目录，
+可选配置文件为 `~/.flow/flow.toml`。需要隔离开发数据时，在启动前
+设置 `FLOW_DESKTOP_DATA_DIR=/绝对路径`（或 `FLOW_HOME`）。桌面不会自动导入
+原服务器数据目录，也不会自动迁移旧的 Tauri 应用数据目录
+（`~/Library/Application Support/com.flow.workflow.desktop/`）。
 
 应用启动会恢复本地运行并启动定时调度；无 `flow.toml` 时默认开启执行器预热
 （`execution.prewarm = true`）：协调器就绪后立刻拉起一个空闲 `flow-executor`，

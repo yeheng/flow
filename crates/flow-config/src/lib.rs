@@ -17,6 +17,18 @@
 //! 旧 `[server].rpc_addr / http_addr / scheduler_tick_secs` 与 `FLOW_ADDR /
 //! FLOW_HTTP_ADDR` 不再生效（deny_unknown_fields 会让存量配置显式报错）。
 //!
+//! # 统一目录布局（flow 主目录）
+//!
+//! 运行数据统一住在 flow 主目录（[`flow_home`]：`FLOW_HOME` 环境变量 →
+//! `~/.flow`），不散落在进程 CWD 或平台应用目录：
+//!
+//! ```text
+//! ~/.flow/flow.toml     配置文件（检索序末位与 config.update 默认落点）
+//! ~/.flow/journal/      journal 权威数据库（flow.sqlite + observations/）
+//! ~/.flow/data/         storage 数据目录（密钥存储等；[storage].data_dir 相对此解析）
+//! ~/.flow/harness/      harness agent 每次运行的临时沙箱（运行结束即删）
+//! ```
+//!
 //! 明确**不收敛**的配置（保持现状）：`RUST_LOG`（env-filter 惯例）、
 //! `FLOW_SECRET_*`（凭据走密钥机制，见 flow-engine secrets）、journal token
 //! （每工作区凭据，仅 env）、执行协议冻结常量（帧上限/超时族，改即协议变更）、
@@ -35,34 +47,86 @@ use thiserror::Error;
 /// 配置文件路径的显式覆盖环境变量（优先级最高的文件来源）。
 pub const CONFIG_FILE_ENV: &str = "FLOW_CONFIG";
 
-/// 默认配置文件名（搜索顺序：`./flow.toml` → 平台配置目录 `flow/flow.toml`）。
+/// flow 主目录的显式覆盖环境变量（测试/多实例隔离用）。
+/// 缺省为 `~/.flow`：配置、journal 数据库与 harness 沙箱统一住在这里。
+pub const HOME_ENV: &str = "FLOW_HOME";
+
+/// 默认配置文件名（搜索顺序：`./flow.toml` → flow 主目录 `flow.toml`）。
 pub const CONFIG_FILE_NAME: &str = "flow.toml";
 
+/// flow 主目录：`FLOW_HOME` 环境变量（非空）→ `~/.flow`。
+/// 配置文件、journal 数据库（`journal/`）、storage 数据目录与 harness
+/// agent 沙箱（`harness/`）的统一根。返回 None 仅发生在无 home 目录的
+/// 退化环境（此时各消费方按各自缺省降级）。
+pub fn flow_home() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os(HOME_ENV) {
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+    dirs::home_dir().map(|home| home.join(".flow"))
+}
+
+/// 数据目录解析：绝对路径原样返回；相对路径相对 flow 主目录
+/// （`data` → `~/.flow/data`），不再按进程 CWD 解释——换目录启动的
+/// 进程必须看到同一份数据。无 home 的退化环境回退到 CWD 相对（旧行为）。
+pub fn resolve_data_dir(spec: &str) -> PathBuf {
+    let path = PathBuf::from(spec);
+    if path.is_absolute() {
+        return path;
+    }
+    match flow_home() {
+        Some(home) => home.join(path),
+        None => path,
+    }
+}
+
+/// 配置加载与校验过程中可能失败的原因。
+///
+/// 刻意区分「读文件失败」「解析失败」「语义非法」三类：运维看到这三类
+/// 错误时该做的事完全不同——分别是修路径、修语法、修取值。
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    /// 配置文件读不到（路径错、权限不足）。
     #[error("读取配置文件 {path} 失败：{source}")]
     Io {
+        /// 出问题的文件路径。
         path: PathBuf,
+        /// 底层 IO 错误。
         source: std::io::Error,
     },
+    /// TOML 语法错误（含未知字段）。
     #[error("解析配置失败：{0}")]
     Parse(String),
+    /// 语法没问题但取值非法（跨字段约束不成立）。
     #[error("配置非法：{0}")]
     Invalid(String),
 }
 
+/// 配置文件的顶层结构：每个分区一个子结构。
+///
+/// 所有分区都带 `serde(default)` 与 `deny_unknown_fields`：前者让缺省分区
+/// 可省略，后者让**写错的键显式报错**——静默忽略拼错的键是配置类问题里
+/// 最难排查的一种。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 #[derive(Default)]
 pub struct Config {
+    /// `[server]`：调度器与触发器扫描。
     pub server: ServerConfig,
+    /// `[storage]`：后端选择与数据目录。
     pub storage: StorageConfig,
+    /// `[execution]`：执行模式与执行器参数。
     pub execution: ExecutionConfig,
+    /// `[agent]`：flow-agent 的部署参数。
     pub agent: AgentConfig,
+    /// `[journal]`：journal-server 的监听地址与数据目录。
     pub journal: JournalConfig,
+    /// `[harness]`：harness 节点的内置 agent 配置。
     pub harness: HarnessConfig,
 }
 
+/// `[server]` 分区：与「谁在什么时候扫描触发器」有关。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
@@ -74,6 +138,10 @@ pub struct ServerConfig {
 }
 
 impl Default for ServerConfig {
+    /// 调度器默认开启、扫描间隔 20 秒。
+    ///
+    /// 间隔取 20 秒是权衡：太短会让空转消耗持续 CPU，太长会让定时任务
+    /// 的启动延迟肉眼可见。
     fn default() -> Self {
         ServerConfig {
             scheduler_enabled: true,
@@ -82,6 +150,11 @@ impl Default for ServerConfig {
     }
 }
 
+/// 存储后端选择。
+///
+/// 只剩一个变体，但保留枚举而不是裸字符串：它是**契约的一部分**
+/// （配置/迁移文档都按名字引用它），未来若新增后端，枚举能保证所有
+/// `match` 点被编译器强制更新。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageBackend {
@@ -90,6 +163,7 @@ pub enum StorageBackend {
 }
 
 impl StorageBackend {
+    /// 序列化成配置与文档中使用的名称。
     pub fn as_str(&self) -> &'static str {
         match self {
             StorageBackend::Journal => "journal",
@@ -97,16 +171,20 @@ impl StorageBackend {
     }
 }
 
+/// `[storage]` 分区：权威后端与非权威数据目录。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StorageConfig {
+    /// 业务权威后端。
     pub backend: StorageBackend,
-    /// 数据目录（原 FLOW_DATA_DIR，默认 CWD 下 `data`）：密钥存储与
+    /// 数据目录（原 FLOW_DATA_DIR，默认 flow 主目录下 `data`）：密钥存储与
     /// 桌面历史数据在这里；journal 权威在 [journal].data_dir。
+    /// 相对路径相对 flow 主目录解析（见 [`resolve_data_dir`]）。
     pub data_dir: String,
 }
 
 impl Default for StorageConfig {
+    /// 默认 journal 后端 + 主目录下的 `data` 子目录。
     fn default() -> Self {
         StorageConfig {
             backend: StorageBackend::Journal,
@@ -115,15 +193,23 @@ impl Default for StorageConfig {
     }
 }
 
+/// 执行模式：节点语义在哪里被执行。
+///
+/// 这是**安全边界**的开关，不是性能选项：进程内执行意味着用户定义的
+/// 脚本与权威写者同处一个故障域，因此该模式已在配置期被拒绝。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionModeKind {
+    /// 进程内执行（已全平台删除，配置期即拒绝）。
     InProcess,
+    /// 通过 IPC 把任务派发给 `flow-executor` 子进程（当前唯一本地模式）。
     Ipc,
+    /// 通过 TLS/WSS 派发给远端 agent 托管的执行器。
     Remote,
 }
 
 impl ExecutionModeKind {
+    /// 序列化成配置与 CLI 使用的名称。
     pub fn as_str(&self) -> &'static str {
         match self {
             ExecutionModeKind::InProcess => "in_process",
@@ -133,9 +219,11 @@ impl ExecutionModeKind {
     }
 }
 
+/// `[execution]` 分区：执行模式、执行器二进制与槽位。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ExecutionConfig {
+    /// 执行模式（ipc / remote）。
     pub mode: ExecutionModeKind,
     /// 执行器二进制（原 FLOW_EXECUTOR_BIN）；缺省定位同目录兄弟 flow-executor。
     pub executor_bin: Option<String>,
@@ -150,6 +238,10 @@ pub struct ExecutionConfig {
 }
 
 impl Default for ExecutionConfig {
+    /// 默认 4 个 IPC 槽位、不预热。
+    ///
+    /// 槽位取 4 是默认值而非上限：`x_max` 的合法范围是 1..=16，但槽位
+    /// 越多常驻的执行器进程越多，空闲时也在占内存。
     fn default() -> Self {
         ExecutionConfig {
             // 默认 ipc（全平台）：unix 走 socketpair，其余走 loopback 回连；
@@ -163,17 +255,23 @@ impl Default for ExecutionConfig {
     }
 }
 
+/// `[execution.remote]` 分区：master 侧连接远端 agent 的参数。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RemoteExecutionConfig {
+    /// 控制通道地址（master 侧监听，agent 上联）。
     pub control_addr: String,
     /// 已废弃（v3 上联收敛为单条 TLS 连接）：仅为存量配置兼容保留，
     /// 值被忽略（T10 约束：旧配置不应突然被拒绝）。
     #[serde(default)]
     pub data_addr: Option<String>,
+    /// 用于校验 agent 证书的 CA。
     pub ca_cert: PathBuf,
+    /// master 侧证书。
     pub cert: PathBuf,
+    /// master 侧私钥。
     pub key: PathBuf,
+    /// 等待 agent 上联/接入的超时（毫秒）。
     pub attach_timeout_ms: u64,
     /// WSS 接入监听地址（T13，代理终止 TLS 场景的附加承载）；缺省关闭。
     pub wss_addr: Option<String>,
@@ -197,6 +295,10 @@ pub struct AgentCredential {
 }
 
 impl Default for RemoteExecutionConfig {
+    /// 空的默认配置：地址与证书路径都为空，由 `Config::validate` 拒绝。
+    ///
+    /// 刻意不给「像样的」默认值——凭空造一个证书路径只会让错误延后到
+    /// TLS 握手时才暴露成网络故障。
     fn default() -> Self {
         RemoteExecutionConfig {
             control_addr: String::new(),
@@ -204,6 +306,7 @@ impl Default for RemoteExecutionConfig {
             ca_cert: PathBuf::new(),
             cert: PathBuf::new(),
             key: PathBuf::new(),
+            // 2 分钟：远端 agent 可能要下载/拉起执行器镜像，给足时间。
             attach_timeout_ms: 120_000,
             wss_addr: None,
             agents: Vec::new(),
@@ -215,20 +318,27 @@ impl Default for RemoteExecutionConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentConfig {
+    /// master 控制通道地址（agent 上联目标）。
     pub control_addr: Option<String>,
     /// 已废弃（v3 上联收敛为单条 TLS 连接）：仅为存量配置兼容保留，
     /// 值被忽略。
     #[serde(default)]
     pub data_addr: Option<String>,
+    /// 本 agent 的身份标识；远端侧用它做会话注册键。
     pub agent_id: Option<String>,
+    /// 用于校验 master 证书的 CA。
     pub ca_cert: Option<PathBuf>,
+    /// agent 侧证书。
     pub cert: Option<PathBuf>,
+    /// agent 侧私钥。
     pub key: Option<PathBuf>,
     /// mTLS 服务端证书校验名/SNI（缺省 `flow-server`，与服务端证书 SAN
     /// 对应；使用自有 PKI 且 SAN 不同时在此指定）。
     #[serde(default)]
     pub sni: Option<String>,
+    /// agent 本机的执行器二进制路径。
     pub executor_bin: Option<String>,
+    /// 本 agent 可提供的执行槽位。
     pub slots: u32,
     /// WSS 上联地址（T13，代理终止 TLS 场景）；设置后优先于 mTLS 直连。
     pub wss_url: Option<String>,
@@ -238,6 +348,7 @@ pub struct AgentConfig {
 }
 
 impl Default for AgentConfig {
+    /// 默认 4 个槽位，其余字段留空（未配置）。
     fn default() -> Self {
         AgentConfig {
             control_addr: None,
@@ -255,6 +366,7 @@ impl Default for AgentConfig {
     }
 }
 
+/// `[harness]` 分区：harness 节点的内置 agent 行为。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct HarnessConfig {
@@ -285,6 +397,9 @@ pub struct HarnessAgentConfig {
 }
 
 impl HarnessAgentConfig {
+    /// 把「有值」与「非空白」统一成一处判断。
+    ///
+    /// TOML 里写 `base_url = ""` 与不写是两种语义，前者是显式关闭。
     fn non_empty(value: &Option<String>) -> Option<&str> {
         value.as_deref().filter(|v| !v.trim().is_empty())
     }
@@ -361,6 +476,8 @@ pub struct JournalConfig {
     /// 下载/webhook HTTP 监听地址（原 FLOW_JOURNAL_HTTP_ADDR；Bearer token 认证）。
     pub http_addr: String,
     /// journal 数据目录（原 FLOW_JOURNAL_DATA_DIR；journal-server 用）。
+    /// 缺省 = flow 主目录下 `journal`（`~/.flow/journal`）；相对路径相对
+    /// flow 主目录解析（见 [`resolve_data_dir`]）。
     pub data_dir: Option<String>,
 }
 
@@ -428,6 +545,10 @@ impl Config {
         }
     }
 
+    /// 搜索默认配置文件：`FLOW_CONFIG` → `./flow.toml` → flow 主目录。
+    ///
+    /// 顺序即优先级：环境变量显式指定优先于当前目录，当前目录优先于
+    /// 主目录。找不到就返回 None（回落纯默认值 + env）。
     fn find_default_file() -> Option<PathBuf> {
         if let Ok(path) = std::env::var(CONFIG_FILE_ENV) {
             let path = PathBuf::from(path);
@@ -439,23 +560,23 @@ impl Config {
         if local.exists() {
             return Some(local);
         }
-        dirs::config_dir()
-            .map(|dir| dir.join("flow").join(CONFIG_FILE_NAME))
+        flow_home()
+            .map(|home| home.join(CONFIG_FILE_NAME))
             .filter(|p| p.exists())
     }
 
     /// config.update 在启动时无配置文件情况下的落点：运维声明的
-    /// `FLOW_CONFIG`（即使启动时文件尚不存在）→ 平台配置目录
+    /// `FLOW_CONFIG`（即使启动时文件尚不存在）→ flow 主目录
     /// （与 [`Config::find_default_file`] 检索序末位一致，写下去下次启动
     /// 一定找得到）。绝不落到进程 CWD——换目录启动会丢配置。
-    /// 返回 `None` 只可能发生在无平台配置目录的环境，调用方应拒绝写入。
+    /// 返回 `None` 只可能发生在无 home 目录的环境，调用方应拒绝写入。
     pub fn default_write_path() -> Option<PathBuf> {
         if let Ok(path) = std::env::var(CONFIG_FILE_ENV) {
             if !path.is_empty() {
                 return Some(PathBuf::from(path));
             }
         }
-        dirs::config_dir().map(|dir| dir.join("flow").join(CONFIG_FILE_NAME))
+        flow_home().map(|home| home.join(CONFIG_FILE_NAME))
     }
 
     /// 写入口统一校验。所有监听地址必须可解析；枚举值在 deserialize 层已把关，
@@ -593,6 +714,7 @@ impl Config {
 /// load 的返回：合并结果 + 文件路径 + env 覆盖名单。
 #[derive(Debug, Clone)]
 pub struct Loaded {
+    /// 合并后的最终配置。
     pub config: Config,
     /// 实际读取（或将写入）的配置文件路径；None = 未找到文件。
     pub path: Option<PathBuf>,
@@ -600,10 +722,14 @@ pub struct Loaded {
     pub env_overrides: Vec<String>,
 }
 
+/// 把可选路径渲染成可读文本（用于错误信息）。
+///
+/// 没有路径时用占位符 `<config>`，让错误文案始终指明「是哪个来源」。
 fn path_display(path: &Option<PathBuf>) -> &str {
     path.as_deref().and_then(Path::to_str).unwrap_or("<config>")
 }
 
+/// 解析监听地址，并在失败时给出可直接照抄的示例。
 fn parse_addr(addr: &str, field: &str) -> Result<std::net::SocketAddr, String> {
     addr.parse()
         .map_err(|_| format!("{field} 不是合法地址：{addr:?}（形如 127.0.0.1:9800）"))
@@ -760,6 +886,21 @@ fn apply_env(config: &mut Config) -> Result<Vec<String>, String> {
 }
 
 impl Config {
+    /// journal 权威数据目录（含 env 叠加后的值）：显式配置绝对路径原样、
+    /// 相对路径相对 flow 主目录；缺省 = flow 主目录下 `journal`。
+    /// home 不可用的退化环境 + 未显式配置时返回 None（调用方报错）。
+    pub fn journal_data_dir(&self) -> Option<PathBuf> {
+        match self.journal.data_dir.as_deref() {
+            Some(spec) => Some(resolve_data_dir(spec)),
+            None => flow_home().map(|home| home.join("journal")),
+        }
+    }
+
+    /// storage 数据目录（密钥存储等）：相对路径相对 flow 主目录解析。
+    pub fn storage_data_dir(&self) -> PathBuf {
+        resolve_data_dir(&self.storage.data_dir)
+    }
+
     /// journal 触发器扫描间隔（秒 → Duration）。
     pub fn journal_trigger_tick(&self) -> Duration {
         Duration::from_secs(self.server.journal_trigger_tick_secs)
@@ -767,6 +908,13 @@ impl Config {
 }
 
 /// Atomic replacement; Unix success includes syncing the file and parent directory.
+///
+/// 原子替换的实现：先写同目录下的临时文件并 fsync，再 `rename` 覆盖目标。
+/// `rename` 在同一文件系统内是原子的，因此读者要么看到旧文件、要么看到
+/// 新文件，**不会看到写了一半的配置文件**。
+///
+/// Unix 上还要 fsync 父目录：否则 rename 本身可能只存在于 page cache 里，
+/// 崩溃后目录项可能回退——数据看起来「丢了一次写入」。
 fn durable_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -775,6 +923,8 @@ fn durable_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent)?;
+    // 临时文件名带进程号 + 计数器并用 create_new 独占创建：
+    // 避免两个进程写同一个配置目录时互相覆盖临时文件。
     let (tmp, mut file) = loop {
         let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = parent.join(format!(".flow-config-{}-{id}.tmp", std::process::id()));
@@ -790,6 +940,7 @@ fn durable_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     };
     let result = (|| {
         file.write_all(bytes)?;
+        // 先把内容刷盘再 rename：否则崩溃可能留下一个已改名但内容为空的文件。
         file.sync_all()?;
         drop(file);
         std::fs::rename(&tmp, path)?;
@@ -798,12 +949,17 @@ fn durable_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         Ok(())
     })();
     if result.is_err() {
+        // 失败时清掉临时文件，避免目录里堆积半成品。
         let _ = std::fs::remove_file(tmp);
     }
     result
 }
 
 #[cfg(test)]
+/// 配置模型的单元测试。
+///
+/// 覆盖三类风险：默认值必须与旧 env 语义一致、跨字段约束必须能拒绝
+/// 非法组合、已删除的配置段必须显式报错而不是被静默忽略。
 mod tests {
     #[test]
     fn harness_agent_section_validates_pairing_urls_and_bounds() {
@@ -1092,5 +1248,94 @@ data_dir = "/var/lib/flow/journal"
     fn explicit_missing_file_is_an_error() {
         let result = Config::load(Some(Path::new("/nonexistent/flow-config-test.toml")));
         assert!(matches!(result, Err(ConfigError::Io { .. })));
+    }
+
+    /// FLOW_HOME/FLOW_CONFIG env 手术的测试共用锁：并行 set/remove
+    /// 同名变量会互相践踏（flow-engine spawn.rs 的 ENV_LOCK 同款）。
+    static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn flow_home_env_override_and_defaults() {
+        let _guard = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 未设 FLOW_HOME：~/.flow（home 总是存在；仅验证后缀拼装）
+        let saved = clean_env(&["FLOW_HOME", "FLOW_CONFIG"]);
+        assert!(
+            flow_home().is_some_and(|home| home.ends_with(".flow")),
+            "缺省 flow home 应是 ~/.flow：{:?}",
+            flow_home()
+        );
+
+        // FLOW_HOME 覆盖（测试/多实例隔离）
+        std::env::set_var("FLOW_HOME", "/tmp/flow-home-override");
+        assert_eq!(flow_home(), Some(PathBuf::from("/tmp/flow-home-override")));
+        // 空值视为未设置
+        std::env::set_var("FLOW_HOME", "");
+        assert!(
+            flow_home().is_some_and(|home| home.ends_with(".flow")),
+            "空 FLOW_HOME 应忽略"
+        );
+
+        // default_write_path：FLOW_CONFIG 优先，否则 flow 主目录下的 flow.toml
+        std::env::set_var("FLOW_CONFIG", "/tmp/declared.toml");
+        assert_eq!(
+            Config::default_write_path(),
+            Some(PathBuf::from("/tmp/declared.toml"))
+        );
+        std::env::remove_var("FLOW_CONFIG");
+        std::env::set_var("FLOW_HOME", "/tmp/flow-home-override");
+        assert_eq!(
+            Config::default_write_path(),
+            Some(PathBuf::from("/tmp/flow-home-override/flow.toml"))
+        );
+        restore_env(saved);
+    }
+
+    #[test]
+    fn data_dirs_resolve_against_flow_home() {
+        let _guard = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = clean_env(&["FLOW_HOME"]);
+        std::env::set_var("FLOW_HOME", "/tmp/flow-home-resolve");
+
+        // 绝对路径原样；相对路径相对 flow 主目录（不再按 CWD 解释）
+        assert_eq!(
+            resolve_data_dir("/var/lib/flow"),
+            PathBuf::from("/var/lib/flow")
+        );
+        assert_eq!(
+            resolve_data_dir("data"),
+            PathBuf::from("/tmp/flow-home-resolve/data")
+        );
+
+        let config = Config::default();
+        assert_eq!(
+            config.storage_data_dir(),
+            PathBuf::from("/tmp/flow-home-resolve/data")
+        );
+        assert_eq!(
+            config.journal_data_dir(),
+            Some(PathBuf::from("/tmp/flow-home-resolve/journal"))
+        );
+
+        let configured: Config = toml::from_str(
+            "[storage]\ndata_dir = \"custom\"\n\n[journal]\ndata_dir = \"journal-x\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            configured.storage_data_dir(),
+            PathBuf::from("/tmp/flow-home-resolve/custom")
+        );
+        assert_eq!(
+            configured.journal_data_dir(),
+            Some(PathBuf::from("/tmp/flow-home-resolve/journal-x"))
+        );
+
+        // 绝对配置不受 flow home 影响
+        let absolute: Config = toml::from_str("[journal]\ndata_dir = \"/srv/journal\"\n").unwrap();
+        assert_eq!(
+            absolute.journal_data_dir(),
+            Some(PathBuf::from("/srv/journal"))
+        );
+
+        restore_env(saved);
     }
 }

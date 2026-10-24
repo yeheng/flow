@@ -25,12 +25,14 @@ const CHAIN_DEPTH: usize = 6;
 const FANOUT_WIDTH: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 执行形态：串行链 or 扇出。
 enum Shape {
     Chain,
     Fanout,
 }
 
 impl Shape {
+    /// 形态名（报告与工作流名里用）。
     fn name(self) -> &'static str {
         match self {
             Shape::Chain => "chain",
@@ -38,6 +40,7 @@ impl Shape {
         }
     }
 
+    /// 该形态对应的工作流定义。
     fn definition(self) -> Value {
         match self {
             Shape::Chain => chain_def(CHAIN_DEPTH),
@@ -46,6 +49,7 @@ impl Shape {
     }
 }
 
+/// run 执行吞吐测量：两种形态各测一遍。
 pub async fn run(ctx: &mut Ctx, opts: &Opts) -> Vec<Report> {
     let client = ctx.client().await;
     let mut reports = Vec::new();
@@ -55,6 +59,7 @@ pub async fn run(ctx: &mut Ctx, opts: &Opts) -> Vec<Report> {
     reports
 }
 
+/// 测量单一形态的吞吐与延迟。
 async fn measure(client: &Conn, _ctx: &Ctx, opts: &Opts, shape: Shape) -> Report {
     let workflow_name = unique_name(&format!("perf-{}", shape.name()));
     let (workflow_id, _) = publish_workflow(client, &workflow_name, shape.definition()).await;

@@ -283,6 +283,7 @@ pub fn deep_chain_defs(depth: usize) -> Vec<Value> {
 
 // ---- HTTP stub ----
 
+/// 把 HTTP 状态码映射成一句人类可读的原因。
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
@@ -297,6 +298,7 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
+/// 构造一个完整的 HTTP 响应字节流（状态行 + 头 + 体）。
 fn response_bytes(status: u16, body: &str) -> Vec<u8> {
     format!(
         "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -355,14 +357,17 @@ pub struct StubHttp {
 }
 
 impl StubHttp {
+    /// 已收到的请求路径列表（断言用）。
     pub fn requests(&self) -> Vec<String> {
         self.requests.lock().unwrap().clone()
     }
 
+    /// 拼出 stub 服务的完整 URL。
     pub fn url(&self, path: &str) -> String {
         format!("http://{}{path}", self.addr)
     }
 
+    /// 在 127.0.0.1:0 上绑定一个监听器，返回监听器与地址。
     async fn bind() -> (TcpListener, SocketAddr) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -491,6 +496,7 @@ impl StubHttp {
 }
 
 impl Drop for StubHttp {
+    /// 关闭 stub 服务（Drop 时自动收尾）。
     fn drop(&mut self) {
         self.handle.abort();
     }

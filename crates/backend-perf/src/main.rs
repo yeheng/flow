@@ -25,6 +25,10 @@ use serde_json::json;
 use crate::opts::{Opts, Scenario};
 use crate::report::{Report, Suite};
 
+/// 进程入口：自举服务模式 / 压测 harness 模式二选一。
+///
+/// 用环境变量而不是命令行参数区分，是因为 harness 拉起被测进程时
+/// 需要「同一个可执行文件扮演两种角色」，参数无法在两次 spawn 间复用。
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var_os("FLOW_PERF_SERVE").is_some() {
         // 与 flow-journal-server 相同的多线程 runtime。
@@ -45,6 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// 压测主流程：按场景逐个测量并汇总报告。
 async fn perf_main() {
     if std::env::var_os("FLOW_PERF_SERVE").is_some() {
         if let Err(err) = serve_product().await {
@@ -135,6 +140,7 @@ async fn run_one(scenario: Scenario, bin: &str, opts: &Opts) -> Vec<Report> {
     }
 }
 
+/// 自举服务模式：跑产品服务装配（与 flow-journal-server 同一条路径）。
 async fn serve_product() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let loaded = flow_config::Config::load(None)?;

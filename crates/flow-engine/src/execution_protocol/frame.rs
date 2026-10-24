@@ -11,6 +11,10 @@
 //! 对抗性输入（验收项）：postcard 对 String/bytes 的长度声明先做
 //! 边界检查再取字节、对超出的 seq 长度声明抑制 size_hint——巨型声明
 //! 在小帧内立即报错，不会先按声明分配（见 message.rs 的对应测试）。
+//!
+//! 为什么编解码必须自带预算复核：帧长是接收方唯一无法伪造的成本闸门
+//! （声明多大就得读多大）。若这里放过超限帧，一个 200 MiB 的节点输出
+//! 就能让接收方在分配阶段被拖垮，而不是在预算检查处被明确拒绝。
 
 use super::contract::{CONTROL_MAX_FRAME, DATA_MAX_FRAME};
 use super::message::{Message, ProtocolError};
@@ -52,9 +56,18 @@ fn check_body_len(body_len: usize) -> Result<(), ProtocolError> {
 }
 
 /// 单流帧编码：`u32 body_len | postcard(Message)`。
+///
+/// 长度头用大端：帧头是协议里唯一跨字节序解释的部分（帧体本身是
+/// postcard 的 LE varint），固定为大端让抓包与跨语言排障工具不必猜
+/// 主机字节序。
+///
+/// # Errors
+/// postcard 编码失败返回 [`ProtocolError::Malformed`]；编码后超过该消息
+/// 类型的帧预算返回 [`ProtocolError::FrameTooLarge`]（不截断）。
 pub fn encode_frame(message: &Message) -> Result<Vec<u8>, ProtocolError> {
     let body = postcard::to_allocvec(message)
         .map_err(|e| ProtocolError::Malformed(format!("postcard: {e}")))?;
+    // 预算按消息语义分类：control 收紧、data 放宽，但两者都是硬上限。
     let limit = frame_limit(message);
     if body.len() > limit {
         return Err(ProtocolError::FrameTooLarge(body.len(), limit));
@@ -72,25 +85,34 @@ pub struct FrameDecoder {
 }
 
 impl Default for FrameDecoder {
+    /// 与 [`FrameDecoder::new`] 等价：解码器无内部状态，默认构造即空缓冲。
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl FrameDecoder {
+    /// 新建空解码器（无缓冲）。
     pub fn new() -> Self {
         Self { buffer: Vec::new() }
     }
 
     /// 追加字节。长度头一到就校验上限（分配任何载荷缓冲前拒绝）。
+    ///
+    /// 半帧与粘帧都由调用方随意切分喂入：解码器只负责累积字节，
+    /// 完整帧的判定与弹出在 [`FrameDecoder::pop`]。
     pub fn feed(&mut self, bytes: &[u8]) -> Result<(), ProtocolError> {
         if bytes.is_empty() {
             return Ok(());
         }
         self.buffer.extend_from_slice(bytes);
+        // 长度头一旦到齐就立刻校验：此时还没有任何按声明长度分配的缓冲，
+        // 恶意长度声明无法放大内存占用。
         if self.buffer.len() >= FRAME_LENGTH_BYTES {
             check_body_len(self.head_length())?;
         }
+        // 缓冲不会一直长：pop 会摘走完整帧，这里只回收「半帧残留 +
+        // 超大声明」造成的过量容量，避免长期会话的 RSS 被历史大帧撑住。
         let cap = FRAME_LENGTH_BYTES + DATA_MAX_FRAME + 1024;
         if self.buffer.capacity() > cap {
             self.buffer.shrink_to(cap);
@@ -98,6 +120,9 @@ impl FrameDecoder {
         Ok(())
     }
 
+    /// 读取长度头声明的 body 尺寸（大端 u32）。
+    ///
+    /// 调用前置条件：缓冲里至少已有 [`FRAME_LENGTH_BYTES`] 字节。
     fn head_length(&self) -> usize {
         u32::from_be_bytes([
             self.buffer[0],
@@ -109,11 +134,17 @@ impl FrameDecoder {
 
     /// 弹出一个完整消息；无完整帧返回 None。解码在缓冲内进行，仅在
     /// 帧完整、postcard 恰好消费完帧体且预算通过后才从缓冲摘除。
+    ///
+    /// 摘除（`drain`）刻意放在所有校验之后：任何一条校验失败时缓冲
+    /// 原样保留，会话随即因错误终止——半个被消费的帧留在缓冲里没有
+    /// 意义，保留它只会掩盖「协议已经坏了」这一事实。
     pub fn pop(&mut self) -> Result<Option<Message>, ProtocolError> {
         if self.buffer.len() < FRAME_LENGTH_BYTES {
             return Ok(None);
         }
         let body_len = self.head_length();
+        // 长度头已到齐即复核上限：feed 时校验过一次，这里防止在两次
+        // feed 之间长度语义被绕过（例如上层换了解码器实例）。
         check_body_len(body_len)?;
         let total = FRAME_LENGTH_BYTES + body_len;
         if self.buffer.len() < total {
@@ -122,11 +153,16 @@ impl FrameDecoder {
         let body = &self.buffer[FRAME_LENGTH_BYTES..total];
         let (message, rest) = postcard::take_from_bytes::<Message>(body)
             .map_err(|e| ProtocolError::Malformed(format!("postcard: {e}")))?;
+        // 帧体必须被恰好消费完：尾随字节意味着「合法消息 + 走私数据」，
+        // 是典型的帧内走私形态，必须按协议错误拒绝而不是忽略。
         if !rest.is_empty() {
             return Err(ProtocolError::Malformed(
                 "frame body has trailing bytes".into(),
             ));
         }
+        // 长度头声明的上限是全局硬顶（DATA_MAX_FRAME），这里再按消息
+        // 语义复核收紧后的预算：control 消息不能借声明长度塞进 data
+        // 级的字节量。
         let limit = frame_limit(&message);
         if body_len > limit {
             return Err(ProtocolError::FrameTooLarge(body_len, limit));

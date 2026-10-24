@@ -27,6 +27,9 @@ use crate::client::{call, object};
 use crate::error::CliError;
 use crate::output::{local_time, note, parse_json, print_json, read_text, table, truncate_chars};
 
+/// 分派 workflow 子命令到各自的实现。
+///
+/// 每个子命令先解析 name/id（除 create 外），再执行对应的 RPC。
 pub async fn dispatch(
     client: &WsClient,
     json: bool,
@@ -96,6 +99,7 @@ pub async fn resolve_workflow_id(client: &WsClient, name_or_id: &str) -> Result<
     Ok(matched.unwrap_or_else(|| name_or_id.to_string()))
 }
 
+/// 列出全部工作流（人类模式打表格，`--json` 打原始结果）。
 async fn list(client: &WsClient, json: bool) -> Result<(), CliError> {
     let result = call(client, "workflow.list.view", object(vec![])).await?;
     if json {
@@ -138,6 +142,10 @@ async fn list(client: &WsClient, json: bool) -> Result<(), CliError> {
     Ok(())
 }
 
+/// 查看某个版本的定义。
+///
+/// stdout 只输出 definition（可重定向成纯 JSON 文件），
+/// 说明性信息一律走 stderr。
 async fn get(
     client: &WsClient,
     json: bool,
@@ -169,6 +177,7 @@ async fn get(
     Ok(())
 }
 
+/// 列出工作流的所有版本（倒序元数据，不含定义体）。
 async fn versions(client: &WsClient, json: bool, workflow_id: &str) -> Result<(), CliError> {
     let result = call(
         client,
@@ -206,6 +215,7 @@ async fn versions(client: &WsClient, json: bool, workflow_id: &str) -> Result<()
     Ok(())
 }
 
+/// 创建一个空壳工作流（还没有定义，暂时不可执行）。
 async fn create(client: &WsClient, json: bool, name: &str) -> Result<(), CliError> {
     let result = call(
         client,
@@ -224,6 +234,7 @@ async fn create(client: &WsClient, json: bool, name: &str) -> Result<(), CliErro
     Ok(())
 }
 
+/// 保存定义为一个新版本（服务端落库即校验）。
 async fn update(
     client: &WsClient,
     json: bool,
@@ -252,6 +263,7 @@ async fn update(
     Ok(())
 }
 
+/// 发布指定版本；只有 published 的版本能被 run 引用。
 async fn publish(
     client: &WsClient,
     json: bool,
@@ -275,6 +287,7 @@ async fn publish(
     Ok(())
 }
 
+/// 删除工作流；已有 run 记录时服务端会拒绝。
 async fn delete(
     client: &WsClient,
     json: bool,
@@ -407,6 +420,9 @@ fn load_definition(file: &str) -> Result<Value, CliError> {
     Ok(definition)
 }
 
+/// 最浅的定义形状检查：必须是对象且含 nodes/edges 数组。
+///
+/// 真正的规则由服务端 `Definition::validate` 裁决，这里只挡明显的用法错误。
 fn check_definition_shape(definition: &Value) -> Result<(), CliError> {
     let Some(object) = definition.as_object() else {
         return Err(CliError::local(
@@ -470,6 +486,10 @@ fn file_stem(file: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+/// 导入文件解析的回归测试。
+///
+/// 这些用例守的是 name 的解析优先级与 stdin 的报错行为——
+/// 它们决定了用户的导入命令在各种文件形态下的行为。
 mod tests {
     use super::*;
     use serde_json::json;

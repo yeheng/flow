@@ -17,7 +17,6 @@ tauri-plugin-dialog = "2"
 flow-backend = { path = "../../crates/flow-backend" }
 flow-config = { path = "../../crates/flow-config" }
 flow-rpc = { path = "../../crates/flow-rpc" }
-dirs = "6"
 jsonrpsee = { version = "0.26", features = ["server"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

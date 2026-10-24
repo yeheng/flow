@@ -1,3 +1,11 @@
+//! 桌面端的集成测试：验证内嵌后端在**没有 RPC 监听器**的情况下
+//! 依然能跑完整的工作流生命周期。
+//!
+//! 这组用例守的是桌面形态的三个特有契约：
+//!
+//! - 进程内调用与 WebSocket 调用**行为一致**（同一方法模块）；
+//! - 会话与窗口绑定，窗口关闭即中止订阅；
+//! - 同一数据目录**不允许第二个实例**（目录锁保证单写者）。
 use crate::service::{Host, Service};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -18,6 +26,10 @@ fn ensure_executor_bin() {
     }
 }
 
+/// 在宿主 runtime 上发起一次调用并取回响应。
+///
+/// 用 `unwrap` 是有意的：调用失败说明桌面端装配本身坏了，测试应当
+/// 直接崩在根因上，而不是继续断言后续步骤。
 async fn call(host: &Arc<Host>, service: Service, method: &str, params: Value) -> Value {
     let services = host.services.clone();
     let method = method.to_string();
@@ -26,10 +38,16 @@ async fn call(host: &Arc<Host>, service: Service, method: &str, params: Value) -
         .await
         .unwrap()
 }
+
+/// 最小的合法工作流定义（start → end）。
 fn definition() -> Value {
     json!({"nodes":[{"id":"s","type":"start"},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"e"}]})
 }
 
+/// 端到端：创建 → 更新 → 发布 → 启动 → 订阅到完成 → 关闭 → 重开仍在。
+///
+/// 最后一段（重开后数据仍在）是重点：桌面端的权威在 SQLite，
+/// 进程重启不能丢任何已提交的工作流。
 #[tokio::test]
 async fn embedded_flow_runs_streams_and_persists_without_a_rpc_listener() {
     ensure_executor_bin();
@@ -114,6 +132,10 @@ async fn embedded_flow_runs_streams_and_persists_without_a_rpc_listener() {
     reopened.shutdown().unwrap();
 }
 
+/// 幂等与令牌：写命令按 `request_id` 去重，且渲染层自带的 token 被忽略。
+///
+/// `_token: "wrong-browser-token"` 断言的是「服务端注入的令牌胜出」——
+/// 桌面端不接受渲染层提供的网络凭据。
 #[tokio::test]
 async fn journal_uses_separate_authority_and_native_token() {
     ensure_executor_bin();
@@ -155,6 +177,7 @@ async fn journal_uses_separate_authority_and_native_token() {
     reopened.shutdown().unwrap();
 }
 
+/// 会话与窗口绑定：关窗即中止订阅，迟到订阅被拒，单写者锁生效。
 #[tokio::test]
 async fn sessions_cancel_on_close_reload_and_reject_late_subscriptions() {
     ensure_executor_bin();

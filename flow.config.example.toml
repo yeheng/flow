@@ -1,5 +1,7 @@
 # flow 统一配置示例。复制为 flow.toml（搜索顺序：--config / FLOW_CONFIG 显式路径
-# → ./flow.toml → 平台配置目录 flow/flow.toml），或放到 flow-journal-server 工作目录。
+# → ./flow.toml → flow 主目录 ~/.flow/flow.toml），或放到 flow-journal-server 工作目录。
+# flow 主目录（FLOW_HOME 环境变量可覆盖，缺省 ~/.flow）统一承载：flow.toml 配置、
+# journal 数据库（journal/）、storage 数据目录（data/）、harness agent 沙箱（harness/）。
 # 分层：CLI 参数 > 环境变量（FLOW_* 全部保留）> 本文件 > 内置默认值。
 # 本文件列出的是**非默认值或常用项**；全部字段见 crates/flow-config/src/lib.rs。
 # Web 设置页（/settings）保存时整文件重写，手工注释不会保留。
@@ -17,6 +19,7 @@ journal_trigger_tick_secs = 20
 # 历史数据不迁移，见 docs/SQLITE_V1_TO_V2_MIGRATION.md）
 backend = "journal"
 # 数据目录（原 FLOW_DATA_DIR；密钥存储在这里，journal 权威在 [journal].data_dir）
+# 相对路径相对 flow 主目录解析（data → ~/.flow/data），绝对路径原样
 data_dir = "data"
 
 [execution]
@@ -67,7 +70,7 @@ x_max = 4
 # [journal]
 # addr = "127.0.0.1:9802"
 # http_addr = "127.0.0.1:9803"
-# data_dir = "/var/lib/flow/journal"
+# data_dir = "/var/lib/flow/journal"   # 缺省 = flow 主目录下 journal（~/.flow/journal）
 
 # 明确**不进配置文件**的配置（保持现状）：
 # - RUST_LOG（tracing env-filter 惯例）

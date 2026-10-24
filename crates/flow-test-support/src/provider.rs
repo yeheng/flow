@@ -34,41 +34,59 @@ pub enum Turn {
 /// 被捕获的一次请求：Bearer 头 + 解析后的请求体。
 #[derive(Clone, Debug)]
 pub struct CapturedRequest {
+    /// `Authorization` 头的原值（通常形如 `Bearer sk-...`）。
+    ///
+    /// 断言它是为了确认**密钥确实走了请求头**而不是被塞进 body 或环境变量。
     pub bearer: String,
+    /// 解析后的 JSON 请求体（解析失败时为 `Null`）。
     pub body: Value,
 }
 
+/// provider 的共享状态：调用计数、请求捕获与编排脚本。
 type Shared = (
     Arc<AtomicUsize>,
     Arc<Mutex<Vec<CapturedRequest>>>,
     Vec<Turn>,
 );
 
+/// 运行中的 mock provider 句柄。
 pub struct MockProvider {
+    /// 已处理的请求数（每次请求自增）。
     pub calls: Arc<AtomicUsize>,
+    /// 捕获到的全部请求。
     pub captured: Arc<Mutex<Vec<CapturedRequest>>>,
+    /// 监听地址。
     pub addr: std::net::SocketAddr,
+    /// 服务任务句柄；`stop` 时中止它。
     handle: tokio::task::JoinHandle<()>,
 }
 
 impl MockProvider {
+    /// 已收到的请求次数（用 SeqCst 读取：测试要看到确定的先后顺序）。
     pub fn hits(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
     }
 
+    /// 取出全部捕获到的请求（克隆一份，避免持锁跨越断言）。
     pub fn requests(&self) -> Vec<CapturedRequest> {
         self.captured.lock().unwrap().clone()
     }
 
+    /// provider 的 base URL（供被测配置写入 `harness.agent.base_url`）。
     pub fn base_url(&self) -> String {
         format!("http://{}/v1", self.addr)
     }
 
+    /// 停止服务：直接 abort 任务，因为测试结束时不关心优雅停机。
     pub async fn stop(self) {
         self.handle.abort();
     }
 }
 
+/// 把若干 chunk 拼成 SSE 响应体，末尾补上 `[DONE]` 结束标记。
+///
+/// `[DONE]` 不能省：OpenAI 兼容客户端靠它判断流已正常结束，缺了会让
+/// 客户端一直等下去或把流当成异常中断。
 fn sse_body(chunks: &[Value]) -> String {
     let mut body = String::new();
     for chunk in chunks {
@@ -78,6 +96,10 @@ fn sse_body(chunks: &[Value]) -> String {
     body
 }
 
+/// `/v1/chat/completions` 的处理逻辑。
+///
+/// 每次调用按序号从编排脚本里取一个 turn；同时把请求（Bearer 头与请求体）
+/// 记录下来，供测试断言「密钥是否被正确传递」。
 async fn completions(
     State((calls, captured, turns)): State<Shared>,
     headers: axum::http::HeaderMap,
@@ -94,6 +116,8 @@ async fn completions(
         body: serde_json::from_str(&body).unwrap_or(Value::Null),
     });
     let chunks: Vec<Value> = match turns.get(turn).unwrap_or(turns.last().unwrap()) {
+        // 工具调用轮：先发 tool_calls，再发 finish_reason=tool_calls，
+        // 客户端据此把工具结果拼进下一轮消息。
         Turn::Tool { command } => {
             let arguments = serde_json::to_string(&json!({ "command": command })).unwrap();
             vec![
@@ -126,6 +150,9 @@ async fn completions(
         } => {
             tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
             let request: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            // 第二轮的特征是消息里已经带了 tool 角色的结果：
+            // 有则回最终文本，没有则发工具调用。这让同一个 turn 能服务
+            // 任意轮数的会话（并发安全，不依赖全局状态）。
             if request["messages"]
                 .as_array()
                 .is_some_and(|messages| messages.iter().any(|m| m["role"] == "tool"))
@@ -159,9 +186,13 @@ async fn completions(
 }
 
 /// 起一个 mock provider：`turns` 按调用序消费（超出后重复最后一项）。
+///
+/// 重复最后一项而不是报错，是为了让「只关心最后一轮」的用例只需写一个
+/// turn 就能覆盖多轮会话。
 pub async fn spawn_mock_openai(turns: Vec<Turn>) -> MockProvider {
     let calls = Arc::new(AtomicUsize::new(0));
     let captured: Arc<Mutex<Vec<CapturedRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    // 绑 0 端口让内核分配，避免与并行用例抢端口。
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let shared: Shared = (calls.clone(), captured.clone(), turns);

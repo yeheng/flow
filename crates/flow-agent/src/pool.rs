@@ -19,13 +19,18 @@ use crate::relay::{Relay, PER_EXECUTOR_QUEUE};
 
 /// 一个本地受控执行器会话句柄（runtime 持有）。
 pub struct ExecutorHandle {
+    /// 派发 id：中继路由的归属键。
     pub dispatch_id: String,
+    /// 执行器 id（agent 内唯一）。
     pub executor_id: String,
+    /// 执行器本次启动的唯一标识：重启后同 id 也会换 boot_id，
+    /// 用于区分「同一个执行器进程」与「同名的另一个进程」。
     pub executor_boot_id: String,
     /// master→executor 内层消息入口。
     pub inbox: mpsc::Sender<Message>,
     /// executor→上联出站（未包装内层；有界，满则背压）。
     pub out: mpsc::Receiver<Message>,
+    /// 取消信号；drop 本句柄即触发（见 `Drop` 实现）。
     pub cancel: CancellationToken,
     /// 主进程最后确认的审计序号（旁路观察，Resume 事实）。
     pub last_acked: Arc<AtomicU64>,
@@ -37,6 +42,7 @@ pub struct ExecutorHandle {
     pub lost_data: Arc<AtomicBool>,
     /// executor_loop 走完回收（自然完成或被杀）；drain 宽限等待用。
     pub done: Arc<AtomicBool>,
+    /// journal 已提交结果：此时该执行器可以安全回收。
     pub committed: Arc<AtomicBool>,
     /// 出站帧到达信号：executor_loop 每次 out.send 后 notify_one，
     /// fair_mux_bridge 空闲时等它而不是固定轮询（新增执行器由 50ms
@@ -51,7 +57,9 @@ impl Drop for ExecutorHandle {
 }
 
 #[derive(Debug, thiserror::Error)]
+/// 执行器池的错误类型。
 pub enum PoolError {
+    /// 绑定失败：执行器进程拉不起来、握手失败或本地握手超时。
     #[error("bind failed: {0}")]
     Bind(String),
 }

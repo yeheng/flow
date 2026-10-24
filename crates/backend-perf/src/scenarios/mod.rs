@@ -16,6 +16,7 @@ use backend_e2e::common::Ctx;
 use crate::opts::{Opts, Scenario};
 use crate::report::Report;
 
+/// 按场景分派到对应的测量实现。
 pub async fn run(scenario: Scenario, ctx: &mut Ctx, opts: &Opts) -> Vec<Report> {
     match scenario {
         Scenario::Throughput => throughput::run(ctx, opts).await,

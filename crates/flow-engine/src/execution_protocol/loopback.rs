@@ -16,6 +16,10 @@
 //!（drop 时 `remove_file`，见其「Name reclamation」文档），进程不崩溃就
 //! 不会在临时目录累积 `.sock`；崩溃残留需人工清（随机后缀防撞名）。
 //! 本模块的测试断言 spawn 返回后路径已不存在。
+//!
+//! 守护的核心不变量：单连接即单会话（listener 只 accept 一次）；回连
+//! 成功与否都必须在有界时间内收口，绝不允许子进程无限等待一个不会来的
+//! 连接。
 
 use std::time::Duration;
 
@@ -95,6 +99,8 @@ async fn spawn_executor_loopback_at(
     let listener = ListenerOptions::new()
         .name(parse_local_name(addr)?)
         .create_tokio()?;
+    // listener 必须先于 spawn 建立：执行器可能秒级内就绪，晚了就会
+    // 撞上「连接被拒绝」。
     let mut command = Command::new(&executor.program);
     command.args(extra_args);
     if let Some(tag) = tag {
@@ -105,12 +111,16 @@ async fn spawn_executor_loopback_at(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::inherit())
         .kill_on_drop(true);
+    // env_clear：执行器只应看到显式注入的回连地址与会话令牌，父进程的
+    // 凭据类变量一律不继承。
     command.env_clear();
     if let Some(log) = std::env::var_os("RUST_LOG") {
         command.env("RUST_LOG", log);
     }
     super::spawn::apply_executor_env_whitelist(&mut command);
     command.env(CONNECT_ADDR_ENV, addr);
+    // 会话令牌是抢连防御：端口/名字在本机可见，毫秒窗口内别的进程
+    // 可能先连上，令牌把它挡在握手之外。
     command.env(SESSION_TOKEN_ENV, &session_token);
     let mut child = Child::spawn_executor(&mut command)?;
     // 单连接即整条会话；执行器起不来（缺二进制/秒退）时靠超时收口。
@@ -119,11 +129,14 @@ async fn spawn_executor_loopback_at(
     match channel {
         Ok(Ok(stream)) => Ok((stream, child)),
         Ok(Err(error)) => {
+            // 监听失败：杀掉子进程并收割，避免留下孤儿进程。
             let _ = child.start_kill();
             let _ = child.wait().await;
             Err(error)
         }
         Err(_) => {
+            // 超时：同样必须收割子进程——执行器可能还活着并会永远
+            // 等待一个永远不会到来的连接。
             let _ = child.start_kill();
             let _ = child.wait().await;
             Err(std::io::Error::new(
@@ -135,6 +148,9 @@ async fn spawn_executor_loopback_at(
 }
 
 /// 执行器侧：按 [`CONNECT_ADDR_ENV`] 指示的地址回连主进程（单连接）。
+///
+/// 只连一次：回连失败由调用方按启动失败处理，不做重试循环——重试会
+/// 把「主进程已经放弃」变成子进程里的长时间悬挂。
 pub async fn connect_loopback(addr: &str) -> std::io::Result<Stream> {
     Stream::connect(parse_local_name(addr)?).await
 }
