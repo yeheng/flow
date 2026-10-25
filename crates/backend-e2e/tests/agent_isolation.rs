@@ -131,10 +131,15 @@ async fn provider_stall_hits_lifecycle_deadline_and_retains_uncertain_evidence()
     .await;
     let root = tempfile::tempdir().unwrap();
     let (backend, key) = start(root.path(), &provider).await;
+    // The lifecycle deadline must clear executor cold boot (spawn + harness
+    // init + first provider request). On loaded 2-vCPU arm CI runners that
+    // routinely takes >1.5s; a tighter deadline fires before the request is
+    // ever sent, the executor is killed with zero provider hits, and the
+    // "no automatic retry" assertion below fails with hits()==0.
     let agent = workflow(
         &backend,
         "deadline",
-        json!({"mode":"agent","prompt":"wait","api_key":key,"timeout_ms":800}),
+        json!({"mode":"agent","prompt":"wait","api_key":key,"timeout_ms":6000}),
         "harness",
     )
     .await;
@@ -197,11 +202,15 @@ async fn unterminated_shell_output_cannot_hold_an_agent_slot_forever() {
     .await;
     let root = tempfile::tempdir().unwrap();
     let (backend, key) = start(root.path(), &provider).await;
+    // Same cold-boot constraint as the deadline test above: the sentinel line
+    // merged into stdout leaves the tool call stuck in `collect` (its own
+    // timeout is 120s), so the node deadline is what ends the task. It must
+    // fire after boot + the first provider turn, not during boot.
     let agent = workflow(
         &backend,
         "unterminated-output",
         json!({"mode":"agent","prompt":"run tool",
-        "api_key":key,"timeout_ms":1500}),
+        "api_key":key,"timeout_ms":6000}),
         "harness",
     )
     .await;
