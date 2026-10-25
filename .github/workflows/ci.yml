@@ -306,23 +306,11 @@ jobs:
 
       # T6：桌面默认执行模式已切 ipc（unix）。flow-executor 作为 externalBin
       # 随包分发（macOS 进 Contents/MacOS/、Linux 进 bin/，与主程序同目录，
-      # 满足 locate() 兄弟目录契约）。Windows 桌面仍是 in_process 过渡态
-      # （B 方案），executor 是 unix-only 产品无法交叉——放占位文件让 tauri
-      # externalBin 检查通过，实际不会被调用；随命名管道 transport（A 方案）
-      # 再换真实产物。
+      # 满足 locate() 兄弟目录契约）。Windows 走 in_process 过渡态（B 方案），
+      # 脚本写占位文件跳过真实构建。
       - name: 构建执行器（externalBin）
         shell: bash
-        run: |
-          mkdir -p web/src-tauri/bin
-          # shellcheck disable=SC2193  # 矩阵表达式被换成哑字符串后该比较必为 false，属误报
-          if [[ "${{ matrix.target }}" == *windows* ]]; then
-            printf 'placeholder: flow-executor is unix-only; windows desktop runs in_process (plan B)' \
-              > "web/src-tauri/bin/flow-executor-${{ matrix.target }}.exe"
-          else
-            cargo build --release -p flow-executor --target ${{ matrix.target }}
-            cp "target/${{ matrix.target }}/release/flow-executor" \
-              "web/src-tauri/bin/flow-executor-${{ matrix.target }}"
-          fi
+        run: sh scripts/build-desktop-executor.sh ${{ matrix.target }}
 
       # tauri build 会先跑 tauri.conf.json 的 beforeBuildCommand（npm run build）。
       # src-tauri 是独立 workspace（自带 Cargo.lock），产物落在

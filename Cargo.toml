@@ -63,7 +63,10 @@ toml = "1"
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake"] }
 base64 = "0.23"
 tempfile = "3"
-rusqlite = { version = "0.38", features = ["backup"] }
+# bundled：局部构建（如 -p flow-executor）的依赖树里没有 sqlx 去点亮
+# libsqlite3-sys/bundled，Windows 没有系统 sqlite3.lib 可链（LNK1181）；
+# workspace 全量构建经 sqlx 特性统一本就是 bundled，这里只是补齐孤立树。
+rusqlite = { version = "0.38", features = ["backup", "bundled"] }
 
 [profile.dev]
 debug = 1
