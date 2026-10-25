@@ -1,0 +1,56 @@
+[package]
+name = "flow-harness-agent-core"
+version = "2.0.0"
+edition = "2021"
+license = "MIT"
+authors = ["flow contributors"]
+repository = "https://github.com/yeheng/flow"
+description = "Harness agent 模式的可插拔 agent core"
+
+# harness agent 内联运行时（裁剪自第三方 agent core，来源与升级流程见
+# crates/VENDOR.md）。
+
+[lib]
+name = "flow_harness_agent_core"
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = [
+    "rt-multi-thread", "macros", "sync", "time",
+    "fs", "io-util", "net", "process", "signal",
+] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "2"
+
+# Logging & Tracing
+tracing = "0.1"
+
+# HTTP client (providers)
+reqwest = { version = "0.13", default-features = false, features = [
+    "json", "rustls", "stream", "socks",
+] }
+
+# Async utilities
+futures-util = "0.3.32"
+async-stream = "0.3"
+
+# Home/config dir lookup
+dirs = "6"
+
+# config.toml base config layer (env vars override the file)
+toml = "0.9"
+dotenvy = "0.15"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt", "ansi", "std", "env-filter",
+] }
+tempfile = "3"
+parking_lot = "0.12"

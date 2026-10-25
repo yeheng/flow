@@ -1,4 +1,4 @@
-//! harness agent 模式（mode=agent）的结果投影：把 conga `run_turn` 的
+//! harness agent 模式（mode=agent）的结果投影：把 agent core `run_turn` 的
 //! `TurnSummary` 投影成 outcome 字段（exit_code/text/stderr 元数据语义与
 //! 原 runner 二进制的退出码契约一致：0 完成 / 1 回合失败或 max_turns
 //! 耗尽 / 130 中止）。
@@ -8,8 +8,8 @@
 //! 误判方向被刻意选成保守——把已完成判成失败可以重试，把失败判成
 //! 成功会掩盖工具副作用。
 
-use conga::{AgentMessage, ContentBlock, StopReason, TurnEndReason};
-use conga_host::TurnSummary;
+use flow_harness_agent_core::{AgentMessage, ContentBlock, StopReason, TurnEndReason};
+use flow_harness_agent_host::TurnSummary;
 
 /// stdout/body_raw 的最终文本上限。journal 派生按 `body_raw > 8 MiB` 拒绝，
 /// 8 MiB 文本 + 截断标记会恰好越过那条线；留出标记与余量。
@@ -29,7 +29,7 @@ pub struct AgentTurnResult {
     pub exit_code: i32,
 }
 
-/// 成功判定（与 conga 语义对齐）：`Completed` 且末条 assistant 的
+/// 成功判定（与 agent core 语义对齐）：`Completed` 且末条 assistant 的
 /// stop_reason 为 `EndTurn`；末条 `ToolUse` = max_turns 耗尽（失败，末轮
 /// 工具副作用已发生）；中间 `MaxTokens` 不单独判死——只看**末条**。
 pub fn summarize(summary: &TurnSummary) -> AgentTurnResult {
@@ -135,8 +135,8 @@ fn join_text<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use conga::types::message::{AssistantMessage, FunctionCall, ToolCall};
-    use conga::{AgentMessage, ContentBlock, StopReason};
+    use flow_harness_agent_core::types::message::{AssistantMessage, FunctionCall, ToolCall};
+    use flow_harness_agent_core::{AgentMessage, ContentBlock, StopReason};
 
     /// 构造一条 assistant 消息（测试用）。
     fn assistant(stop: StopReason, text: &str) -> AgentMessage {

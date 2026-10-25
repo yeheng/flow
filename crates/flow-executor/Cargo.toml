@@ -22,11 +22,11 @@ hex = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 futures = { workspace = true }
-# conga 源码已 vendored 进仓库（crates/conga、crates/conga-host，源自
-# https://github.com/YeHeng/conga @ 425d786）。headless 内联执行：typed 配置直入、
-# key 走参数、settings 不可达、状态根 RAII 钉定。上游升级需全量回归 agent e2e。
-conga = { path = "../conga", default-features = false }
-conga-host = { path = "../conga-host", default-features = false }
+# harness agent 内联运行时（裁剪自第三方 agent core/host，来源与升级流程见
+# crates/VENDOR.md）。headless 内联执行：typed 配置直入、key 走参数、
+# settings 不可达、状态根 RAII 钉定。版本升级需全量回归 agent e2e。
+flow-harness-agent-core = { path = "../flow-harness-agent-core" }
+flow-harness-agent-host = { path = "../flow-harness-agent-host" }
 
 
 [lib]

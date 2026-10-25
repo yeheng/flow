@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    # vendored third-party crates (see crates/VENDOR.md)
-    "crates/conga",
-    "crates/conga-host",
+    # harness agent 内联运行时（裁剪自第三方 agent core/host，见 crates/VENDOR.md）
+    "crates/flow-harness-agent-core",
+    "crates/flow-harness-agent-host",
     "crates/flow-agent",
     "crates/flow-executor",
     "crates/flow-journal",

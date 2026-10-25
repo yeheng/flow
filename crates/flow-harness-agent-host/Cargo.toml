@@ -1,0 +1,58 @@
+[package]
+name = "flow-harness-agent-host"
+version = "2.0.0"
+edition = "2021"
+license = "MIT"
+authors = ["flow contributors"]
+repository = "https://github.com/yeheng/flow"
+description = "Harness agent 模式的 host 运行时（工具、无头装配、会话）"
+
+# harness agent 内联运行时（裁剪自第三方 agent host，来源与升级流程见
+# crates/VENDOR.md）。
+
+[lib]
+name = "flow_harness_agent_host"
+path = "src/lib.rs"
+
+[dependencies]
+flow-harness-agent-core = { path = "../flow-harness-agent-core" }
+dotenvy = "0.15"
+thiserror = "2"
+parking_lot = "0.13"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread", "macros", "sync", "time",
+    "fs", "io-util", "net", "process", "signal",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-util = "0.3.32"
+reqwest = { version = "0.13", default-features = false, features = [
+    "json", "rustls", "stream", "socks",
+] }
+
+# ---- built-in tools (host-level since the module move) ----
+# Gitignore-aware directory walking (list + grep tools). Bundles `walkdir` +
+# `globset`, so we no longer depend on `walkdir` directly.
+ignore = "0.4"
+# Glob matching (list tool)
+glob = "0.3"
+# Regex matching (grep tool)
+regex = "1"
+# HTML parsing for the fetch tool + URL handling
+dom_query = "0.29"
+url = "2"
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt", "ansi", "std", "env-filter",
+] }
+tempfile = "3"
+futures-util = "0.3.32"
+parking_lot = "0.13"
+# .env loading for example hosts.
+dotenvy = "0.15"
+
+[[example]]
+name = "cli_host"
