@@ -98,28 +98,51 @@ async fn execute(
 /// resolved to (all verified public). Pinned into the client via
 /// `resolve_to_addrs`, closing the gap where a rebinding DNS server answers
 /// the guard with a public IP and the actual request with 169.254.169.254.
+#[derive(Debug)]
 struct SsrfPin {
     host: String,
     addrs: Vec<std::net::SocketAddr>,
 }
 
-/// Reject URLs whose host resolves (or literals point) into non-public
-/// address space, returning the validated DNS pin for hostname URLs.
-/// Skipped entirely when a tool proxy is configured - the proxy decides
-/// where traffic may go - or when the operator opted out.
+/// Guard the fetch target against SSRF, returning the validated DNS pin for
+/// hostname URLs.
+///
+/// Two independent layers:
+///
+/// * **Address admission** - a target that points into non-public address
+///   space (loopback, private, link-local incl. cloud metadata, multicast)
+///   is refused. This runs in every mode, proxy or not: a proxy that sits
+///   *inside* the network can reach the metadata endpoint too, so handing it
+///   a private target is not safer.
+/// * **Target binding (the pin)** - for hostname URLs the validated address
+///   is bound via `resolve_to_addrs`, so the connection goes to an address
+///   the guard has seen and reqwest never re-resolves.
+///
+/// A proxy cannot carry the pin: it resolves the hostname itself. So in a
+/// proxy environment (an explicit tool proxy, or a system proxy that would
+/// take this URL over) the admission layer still runs but the pin is
+/// dropped - the proxy decides where the traffic ends up. Without a proxy
+/// the pin is bound and the client connects straight to the validated
+/// address, ignoring any stray proxy configuration.
+///
+/// The whole guard is skipped when the operator opted out
+/// (`CONGA_FETCH_ALLOW_PRIVATE_NET=1`).
 async fn ssrf_guard(url: &str) -> Result<Option<SsrfPin>, String> {
-    if crate::proxy::tool_proxy().is_some() {
-        return Ok(None);
-    }
+    let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "URL has no host".to_string())?;
+
     if let Ok(v) = std::env::var("CONGA_FETCH_ALLOW_PRIVATE_NET") {
         if v == "1" || v.eq_ignore_ascii_case("true") {
             return Ok(None);
         }
     }
-    let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| "URL has no host".to_string())?;
+
+    // Proxy environment: the request will be handed to a proxy, which
+    // resolves the hostname itself - no pin is possible from here.
+    let proxy_env =
+        crate::proxy::tool_proxy().is_some() || crate::proxy::system_proxy_applies(parsed.as_str());
 
     // Fast path: IP literal - check directly, no DNS, nothing to pin (the
     // connection can only go to the literal itself).
@@ -139,16 +162,22 @@ async fn ssrf_guard(url: &str) -> Result<Option<SsrfPin>, String> {
 
     // Hostname: resolve once and reject if ANY answer is non-public (a
     // public name that rebinds to an internal IP must not slip through).
-    // Resolution failure fails CLOSED: without a validated address there is
-    // nothing to pin, and proceeding unpinned would hand the destination
-    // choice back to whatever a rebinding DNS answers next.
+    // Resolution failure fails CLOSED when the request goes out directly:
+    // without a validated address there is nothing to pin, and proceeding
+    // unpinned would hand the destination choice back to whatever a
+    // rebinding DNS answers next. In a proxy environment the local
+    // resolver may simply be incomplete (the proxy resolves for us), so
+    // there the proxy's own egress policy is the gate.
     let addrs: Vec<std::net::SocketAddr> =
         match tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(&addr)).await {
             Ok(Ok(addrs)) => addrs.collect(),
             Ok(Err(_)) | Err(_) => {
+                if proxy_env {
+                    return Ok(None);
+                }
                 return Err(format!(
                     "DNS resolution for {host} failed (SSRF guard requires a validated address)"
-                ))
+                ));
             }
         };
     if addrs.is_empty() {
@@ -163,6 +192,11 @@ async fn ssrf_guard(url: &str) -> Result<Option<SsrfPin>, String> {
             ));
         }
     }
+    if proxy_env {
+        // A proxy resolves the hostname itself: the target cannot be bound
+        // to the validated address, so there is no pin to hand out.
+        return Ok(None);
+    }
     // Lowercased to match reqwest's override key normalization.
     Ok(Some(SsrfPin {
         host: host.to_ascii_lowercase(),
@@ -173,12 +207,24 @@ async fn ssrf_guard(url: &str) -> Result<Option<SsrfPin>, String> {
 /// Build the fetch client. A DNS pin (guard-validated addresses only) is
 /// bound via `resolve_to_addrs`, so the TCP connection is guaranteed to go
 /// to an address the SSRF guard has seen - reqwest never re-resolves.
+///
+/// Proxies and a pin are mutually exclusive. reqwest auto-detects system
+/// proxies (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`), and a proxy resolves
+/// the hostname itself - that would void the pin and re-open the very
+/// DNS-rebinding hole the pin closes. So a pinned client goes straight to
+/// the validated address (`no_proxy()`), and an unpinned one is free to use
+/// whichever proxy applies.
 fn build_client(pin: Option<&SsrfPin>) -> Result<reqwest::Client, reqwest::Error> {
-    let mut builder = crate::proxy::apply_tool_proxy(reqwest::Client::builder())
+    let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(TIMEOUT_SECS))
         .user_agent("conga-fetch/1.0");
-    if let Some(pin) = pin {
-        builder = builder.resolve_to_addrs(&pin.host, &pin.addrs);
+    match pin {
+        Some(pin) => {
+            builder = builder.no_proxy().resolve_to_addrs(&pin.host, &pin.addrs);
+        }
+        None => {
+            builder = crate::proxy::apply_tool_proxy(builder);
+        }
     }
     builder.build()
 }
@@ -453,6 +499,102 @@ mod tests {
         let head = server.await.unwrap();
         let head = String::from_utf8_lossy(&head);
         assert!(head.starts_with("GET /"), "pinned server saw: {head}");
+    }
+
+    /// Regression: a pinned client must not be proxied - not by an
+    /// explicitly configured proxy, not by a system proxy picked up from
+    /// the environment (`HTTP_PROXY` and friends, which reqwest reads by
+    /// default). A proxy resolves the hostname itself, so it voids the pin
+    /// and re-opens the DNS-rebinding hole the pin closes. The proxy here
+    /// points at a dead port: if the request were proxied, it could not
+    /// reach the pinned listener at all.
+    #[tokio::test]
+    async fn pinned_client_ignores_configured_proxy() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _g = crate::proxy::test_util::LOCK.lock().await;
+
+        // Restore the global proxy override even if the test panics.
+        struct ProxyGuard;
+        impl Drop for ProxyGuard {
+            fn drop(&mut self) {
+                let _ = crate::proxy::set_tool_proxy(None);
+            }
+        }
+        crate::proxy::set_tool_proxy(Some("http://127.0.0.1:9")).unwrap();
+        let _guard = ProxyGuard;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let n = sock.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = "pinned-content";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            buf
+        });
+
+        let pin = SsrfPin {
+            host: "rebind.test".into(),
+            addrs: vec![addr],
+        };
+        let client = build_client(Some(&pin)).unwrap();
+        let resp = client.get("http://rebind.test/").send().await.unwrap();
+        assert!(resp.status().is_success());
+        assert_eq!(resp.text().await.unwrap(), "pinned-content");
+        server.await.unwrap();
+    }
+
+    /// The guard has two layers, and a proxy environment only disables one
+    /// of them:
+    ///
+    /// * address admission stays on - a proxy usually sits *inside* the
+    ///   network and can reach cloud metadata / loopback just fine, so
+    ///   handing it a private target is not safer;
+    /// * the pin goes away - the proxy resolves the hostname itself, so the
+    ///   target cannot be bound to the validated address.
+    #[tokio::test]
+    async fn proxy_environment_keeps_address_admission_and_drops_the_pin() {
+        let _g = crate::proxy::test_util::LOCK.lock().await;
+        let _env = crate::proxy::test_util::EnvGuard::set(&[
+            ("HTTP_PROXY", "http://127.0.0.1:9"),
+            ("ALL_PROXY", ""),
+            ("NO_PROXY", ""),
+        ]);
+
+        // Private targets stay refused, proxy or not.
+        for url in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1:8080/",
+            "http://10.0.0.5/admin",
+        ] {
+            let err = ssrf_guard(url).await.unwrap_err();
+            assert!(err.contains("non-public"), "{url}: {err}");
+        }
+
+        // A hostname the local resolver cannot answer: in a proxy
+        // environment the proxy may resolve it, so there is no pin to hand
+        // out - and no local answer to validate either.
+        let pin = ssrf_guard("http://definitely-not-a-real-host.invalid/")
+            .await
+            .unwrap();
+        assert!(pin.is_none(), "proxy environment must not pin");
     }
     #[tokio::test]
     async fn fetch_rejects_non_http_scheme() {

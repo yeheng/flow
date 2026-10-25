@@ -35,6 +35,7 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 sha2 = "0.11"
 hex = "0.4"
+hmac = "0.13"
 parking_lot = "0.12"
 fs2 = "0.4"
 sqlx = { version = "0.9", features = ["sqlite", "runtime-tokio", "chrono"] }

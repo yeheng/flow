@@ -853,14 +853,23 @@ impl JournalBackend {
             committed.state.apply_batch(&transactions)?;
         }
         // 子 run 终态会改变父 run 的等待条件，父 run 必须重新评估。
-        let parents: Vec<_> = committed
-            .state
-            .runs
-            .values()
-            .filter(|r| r.terminal())
-            .filter_map(|r| r.parent.as_ref().map(|p| p.run_id.clone()))
-            .collect();
-        committed.dirty_runs.extend(parents);
+        // 只看本事务涉及且现已终态的 run：父唤醒只依赖「子变为终态」的
+        // 那一刻，而那一刻必然落在本事务的事件里；启动恢复时全部 run 已
+        // 进 dirty 集，历史终态无需每笔提交全量重扫（旧实现每笔提交
+        // O(resident runs)）。
+        for event in &tx.events {
+            if let Some(id) = &event.run_id {
+                if let Some(parent) = committed
+                    .state
+                    .runs
+                    .get(id)
+                    .filter(|r| r.terminal())
+                    .and_then(|r| r.parent.as_ref())
+                {
+                    committed.dirty_runs.insert(parent.run_id.clone());
+                }
+            }
+        }
         crate::journal_history::trim(&mut committed.state);
         for event in &tx.events {
             if let Some(id) = &event.run_id {

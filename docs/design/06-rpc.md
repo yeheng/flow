@@ -105,6 +105,11 @@ audit 按 `lsn` + `audit_seq` 推进（含执行器审计事实与迟到的 `Lat
 本次判定（不是时钟抖动容错）；去重键 = **该触发时隙**的 RFC3339 时刻字符串
 （不是「下一次」触发时间——那只用于 schedule.list 的展示字段）。
 
+**错过的时隙只补最近一次**：每次 tick 只判定「now 之前最近的一个时隙」，
+服务停机跨越多个时隙时，中间的时隙**静默跳过**，不追补、不告警。这是有意的
+策略（停机重启后一次性追补会造成触发雪崩），`active_since` 之前的历史时隙同理
+不算触发。需要逐次补跑语义的场景应使用 webhook/invoke 外部驱动，而不是 cron。
+
 **webhook**（`POST /hooks/{id}`）：Bearer token + `Idempotency-Key`（≤128 字节）、
 body ≤ 8 MiB。
 

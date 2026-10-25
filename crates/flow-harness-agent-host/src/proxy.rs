@@ -93,6 +93,25 @@ fn apply_proxy_url(
     builder
 }
 
+/// Whether the ambient system proxy (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`,
+/// minus `NO_PROXY`) would take this URL over.
+///
+/// Uses the very matcher reqwest applies for its auto-detected system proxy,
+/// so the answer matches the routing that will actually happen - including
+/// `NO_PROXY` exemptions. An unparseable URL answers "no".
+///
+/// A system proxy is not the same thing as [`tool_proxy`]: the tool proxy is
+/// an operator's explicit choice for this tool, the system proxy is whatever
+/// the surrounding environment happens to export.
+pub fn system_proxy_applies(url: &str) -> bool {
+    let Ok(uri) = url.parse::<http::Uri>() else {
+        return false;
+    };
+    hyper_util::client::proxy::matcher::Matcher::from_system()
+        .intercept(&uri)
+        .is_some()
+}
+
 #[cfg(test)]
 pub(crate) mod test_util {
     pub(crate) fn fake_env(
@@ -103,6 +122,36 @@ pub(crate) mod test_util {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         move |k: &str| map.get(k).cloned().ok_or(std::env::VarError::NotPresent)
+    }
+
+    /// Sets env vars for the duration of a test and restores the previous
+    /// values on drop (even if the test panics).
+    pub(crate) struct EnvGuard {
+        saved: Vec<(String, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        pub(crate) fn set(pairs: &[(&str, &str)]) -> Self {
+            let saved = pairs
+                .iter()
+                .map(|(k, _)| (k.to_string(), std::env::var(k).ok()))
+                .collect();
+            for (k, v) in pairs {
+                std::env::set_var(k, v);
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in self.saved.drain(..) {
+                match v {
+                    Some(v) => std::env::set_var(&k, v),
+                    None => std::env::remove_var(&k),
+                }
+            }
+        }
     }
 
     /// Serializes tests that touch the global override. Shared across this
@@ -173,6 +222,31 @@ mod tests {
         // blank input clears
         set_tool_proxy(Some("   ")).unwrap();
         assert_eq!(resolve_with(&fake_env(&[])), None);
+    }
+
+    /// The system proxy decision must match what reqwest will actually do:
+    /// `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` take a URL over, `NO_PROXY`
+    /// exempts it.
+    #[test]
+    fn system_proxy_follows_env_and_no_proxy_exemptions() {
+        let _g = test_util::LOCK.blocking_lock();
+        let _env = test_util::EnvGuard::set(&[
+            ("HTTP_PROXY", "http://127.0.0.1:9"),
+            ("HTTPS_PROXY", "http://127.0.0.1:9"),
+            ("ALL_PROXY", ""),
+            ("NO_PROXY", "internal.example"),
+        ]);
+
+        assert!(system_proxy_applies("http://public.example/"));
+        assert!(system_proxy_applies("https://public.example/"));
+        assert!(
+            !system_proxy_applies("http://internal.example/"),
+            "NO_PROXY must exempt the host"
+        );
+        assert!(
+            !system_proxy_applies("not a url"),
+            "unparseable URL must not claim a proxy"
+        );
     }
 
     #[test]

@@ -261,7 +261,7 @@ impl JournalBackend {
                     _=cancel.cancelled()=>{coord.tasks.abort_all();while coord.tasks.join_next().await.is_some(){}return},
                     completed=coord.tasks.join_next(),if !coord.tasks.is_empty()=>{
                         match completed {
-                            Some(Ok((key,result)))=>{coord.active.remove(&key);coord.agents.remove(&key);finished=Some(key.0);if let Err(error)=result {tracing::error!(%error,"v2 node task stopped; committed evidence retained");}},
+                            Some(Ok((key,result)))=>{coord.active.remove(&key);coord.agents.remove(&key);finished=Some(key.0);if let Err(error)=result {tracing::error!(%error,"v2 node task stopped; failure evidence handling ran inside the attempt");}},
                             // 任务本身崩溃（不是节点失败）：放弃本轮协调器，
                             // 从已提交事实重建——内存里的在飞记账已不可信。
                             Some(Err(error))=>{tracing::error!(%error,"v2 task exited unexpectedly; rebuilding coordinator");coord.tasks.abort_all();while coord.tasks.join_next().await.is_some(){}return},

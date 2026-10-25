@@ -632,6 +632,16 @@ impl Run {
     }
 }
 
+/// `check_values` 顺带产出的重载荷解析结果，`apply_event` 直接复用：
+/// RunStarted / InputPrepared 的结构化载荷每次折叠只解析一次。
+/// 两处永远在 `apply_mode` 里紧挨着调用，`None` 到达需要它的分支
+/// 只可能是内部调用顺序被破坏，按非法事实报错而不是 panic。
+enum Parsed {
+    None,
+    Run(Box<Run>),
+    Prepared(Box<Prepared>),
+}
+
 impl State {
     // 先查有界窗口，再回落到 `schedule_fires` 里的最新调度水位：
     // 业务去重不能依赖那个有限重试窗口，否则窗口一满就会漏掉幂等判定。
@@ -840,8 +850,8 @@ impl State {
                     // 值引用必须先登记再被业务事件引用，否则引用完整性检查
                     // 会把合法引用误判为「引用了未发布的值」。
                     self.values.apply(event, &tx.journal_id)?;
-                    self.check_values(event)?;
-                    self.apply_event(event, tx.lsn, &mut undo)?;
+                    let parsed = self.check_values(event)?;
+                    self.apply_event(event, tx.lsn, &mut undo, parsed)?;
                     if let Some(run) = event.run_id.as_ref().and_then(|id| self.runs.get_mut(id)) {
                         // 审计批次不动 run 状态：让审计事件顺带改写 run 的
                         // 状态会让「只补证据」变成「改结论」。
@@ -872,14 +882,19 @@ impl State {
     /// 必须在这里逐个确认：漏检会让折叠态持有指向不存在正文的引用，
     /// 后续物化时才炸，且那时已经无从事后修复。
     ///
+    /// RunStarted / InputPrepared 的结构化载荷在这里解析一次，随返回值
+    /// 交给 `apply_event` 复用——热路径不再对同一载荷付两次 JSON 反序列化
+    /// （RunStarted 此前把整个 Run 解析两遍、InputPrepared 三遍）。
+    ///
     /// # Errors
     /// 任一引用缺失、未发布或不匹配时返回错误。
-    fn check_values(&self, event: &Event) -> Result<()> {
+    fn check_values(&self, event: &Event) -> Result<Parsed> {
         let p = &event.payload;
         let check = |v: &Value| -> Result<()> {
             self.values
                 .check(&serde_json::from_value::<StoredValue>(v.clone())?)
         };
+        let mut parsed = Parsed::None;
         match event.kind {
             EventKind::LegacyImport => check(&p["data"])?,
             EventKind::WorkflowUpdated => check(&p["version"]["definition"])?,
@@ -919,6 +934,7 @@ impl State {
                         }
                     }
                 }
+                parsed = Parsed::Run(Box::new(run));
             }
             EventKind::InputPrepared => {
                 let prepared: Prepared = serde_json::from_value(p["prepared"].clone())?;
@@ -927,6 +943,7 @@ impl State {
                 for value in prepared.predecessors.values() {
                     self.values.check(value)?;
                 }
+                parsed = Parsed::Prepared(Box::new(prepared));
             }
             EventKind::NodeCompleted
             | EventKind::RunCompleted
@@ -954,7 +971,7 @@ impl State {
             }
             _ => {}
         }
-        Ok(())
+        Ok(parsed)
     }
 
     /// 把单个事件折叠进状态。
@@ -966,7 +983,13 @@ impl State {
     /// # Errors
     /// 事件与既有状态矛盾（版本不连续、序号不连续、指纹不符、
     /// 越过结果屏障等）时返回错误。
-    fn apply_event(&mut self, event: &Event, lsn: u64, undo: &mut UndoLog) -> Result<()> {
+    fn apply_event(
+        &mut self,
+        event: &Event,
+        lsn: u64,
+        undo: &mut UndoLog,
+        parsed: Parsed,
+    ) -> Result<()> {
         let p = &event.payload;
         // 迟到审计只补审计证据，绝不推进 run 序号：run 序号代表业务推进，
         // 让补证据顺带推进业务水位会让下游误以为节点已经向前走了。
@@ -1116,7 +1139,10 @@ impl State {
                 return Ok(());
             }
             EventKind::RunStarted => {
-                let mut run: Run = serde_json::from_value(p.clone())?;
+                let mut run = match parsed {
+                    Parsed::Run(run) => *run,
+                    _ => return Err(invalid("run payload missing parsed form")),
+                };
                 if event.run_id.as_deref() != Some(run.run_id.as_str())
                     || event.run_seq != 1
                     || self.runs.contains_key(&run.run_id)
@@ -1323,7 +1349,9 @@ impl State {
             return Ok(());
         }
         if event.kind == EventKind::InputPrepared {
-            let prepared: Prepared = serde_json::from_value(p["prepared"].clone())?;
+            let Parsed::Prepared(prepared) = &parsed else {
+                return Err(invalid("prepared payload missing parsed form"));
+            };
             // 准备事实不得与已提交的 run 输入漂移：执行器按 prepared.input
             // 取值，若它与 run.input 不同，重放就会得到不同的结果。
             // node_semantics 只接受已知版本，未知版本不能猜。
@@ -1395,7 +1423,10 @@ impl State {
                 if node.prepared.is_some() {
                     return Err(invalid("input already prepared"));
                 }
-                node.prepared = Some(serde_json::from_value(p["prepared"].clone())?);
+                let Parsed::Prepared(prepared) = parsed else {
+                    return Err(invalid("prepared payload missing parsed form"));
+                };
+                node.prepared = Some(*prepared);
             }
             EventKind::OperationIntent => {
                 // 意图必须在输入准备之后：没准备输入就无法确定这次

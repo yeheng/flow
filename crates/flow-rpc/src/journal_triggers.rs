@@ -205,27 +205,20 @@ fn request_key(headers: &HeaderMap) -> Option<&str> {
 ///
 /// 用管理令牌派生「每 run 一个」的窄能力令牌：业务方拿到它只能操作这一个
 /// run，而管理令牌本身永不离开服务端。派生用 HMAC 而不是裸哈希，避免
-/// 令牌泄露后可被反推出管理令牌。
+/// 令牌泄露后可被反推出管理令牌。实现走 RustCrypto 的 `hmac` crate
+/// （与 RFC 2104 逐字节一致，含超长密钥先摘要的规则）；输出形状由
+/// `token_tests::run_token_matches_legacy_hmac_bytewise` 钉死，保证已
+/// 发出的能力令牌跨版本不失效。
 fn run_token(secret: &str, run: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut key = [0u8; 64];
-    let raw = secret.as_bytes();
-    // HMAC 的块大小是 64 字节：更长的密钥先取 SHA-256 摘要，短密钥零填充，
-    // 两者的派生结果都不可逆推出 secret。
-    if raw.len() > 64 {
-        key[..32].copy_from_slice(&Sha256::digest(raw));
-    } else {
-        key[..raw.len()].copy_from_slice(raw);
-    }
-    let mut inner = Sha256::new();
-    inner.update(key.map(|b| b ^ 0x36));
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+    // HMAC 接受任意长度密钥，new_from_slice 对 HMAC 永远成功。
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
     // 域分隔串 + run_id：能力令牌与任何其他用途的 HMAC 不共享同一密钥流。
-    inner.update(b"flow.invocation.v1\0");
-    inner.update(run.as_bytes());
-    let mut outer = Sha256::new();
-    outer.update(key.map(|b| b ^ 0x5c));
-    outer.update(inner.finalize());
-    hex::encode(outer.finalize())
+    mac.update(b"flow.invocation.v1\0");
+    mac.update(run.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
 }
 
 /// 校验请求携带的能力令牌是否匹配该 run。
@@ -572,19 +565,8 @@ async fn hook(
     body: Bytes,
 ) -> Response {
     // 管理令牌与 RPC 面同一个 token：单用户凭据，不是多租户授权。
-    let token = headers
-        .get("authorization")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .unwrap_or("");
-    // 常时比较：避免用响应时间探测令牌。
-    if token.len() != state.token.len()
-        || token
-            .bytes()
-            .zip(state.token.bytes())
-            .fold(0u8, |d, (a, b)| d | (a ^ b))
-            != 0
-    {
+    // 常时比较复用 equal()：安全原语在本文件只许有一份实现。
+    if !equal(bearer(&headers), &state.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let Some(request) = headers
@@ -609,5 +591,51 @@ async fn hook(
     {
         Ok(receipt) => Json(receipt).into_response(),
         Err(error) => invocation_error(error),
+    }
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+
+    /// 换用 hmac crate 前的手写参考实现（RFC 2104 构造，域分隔串与消息
+    /// 布局与线上格式一致）。保留在这里钉死 run_token 的输出字节：已发给
+    /// 调用方的能力令牌跨版本必须继续有效，任何改动这个断言的提交都是在
+    /// 吊销在途凭据。
+    fn legacy_run_token(secret: &str, run: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut key = [0u8; 64];
+        let raw = secret.as_bytes();
+        if raw.len() > 64 {
+            key[..32].copy_from_slice(&Sha256::digest(raw));
+        } else {
+            key[..raw.len()].copy_from_slice(raw);
+        }
+        let mut inner = Sha256::new();
+        inner.update(key.map(|b| b ^ 0x36));
+        inner.update(b"flow.invocation.v1\0");
+        inner.update(run.as_bytes());
+        let mut outer = Sha256::new();
+        outer.update(key.map(|b| b ^ 0x5c));
+        outer.update(inner.finalize());
+        hex::encode(outer.finalize())
+    }
+
+    /// 密钥长度覆盖三档（短 / 恰好 64 字节块 / 超长先摘要），与 hmac crate
+    /// 逐字节一致；不同 run 派生不同令牌。
+    #[test]
+    fn run_token_matches_legacy_hmac_bytewise() {
+        let keys = [
+            "short-secret-value".to_string(),
+            "e".repeat(64),
+            "z".repeat(200),
+        ];
+        for secret in &keys {
+            for run in ["r1", "run-01923f4e-uuid"] {
+                assert_eq!(run_token(secret, run), legacy_run_token(secret, run));
+            }
+        }
+        assert_ne!(run_token("s", "a"), run_token("s", "b"));
+        assert_ne!(run_token("s", "a"), run_token("t", "a"));
     }
 }

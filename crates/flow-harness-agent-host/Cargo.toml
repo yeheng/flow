@@ -43,6 +43,12 @@ regex = "1"
 # HTML parsing for the fetch tool + URL handling
 dom_query = "0.29"
 url = "2"
+# Used to decide whether the ambient system proxy would take a URL over,
+# with the same matcher reqwest itself uses (see proxy::system_proxy_applies).
+http = "1"
+hyper-util = { version = "0.1.12", default-features = false, features = [
+    "client-proxy",
+] }
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", default-features = false, features = [
