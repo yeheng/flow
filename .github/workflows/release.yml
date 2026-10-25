@@ -127,12 +127,13 @@ jobs:
         shell: bash
         run: |
           mkdir -p web/src-tauri/bin
+          # shellcheck disable=SC2193  # 矩阵表达式被换成哑字符串后该比较必为 false，属误报
           if [[ "${{ matrix.target }}" == *windows* ]]; then
-            printf 'placeholder: flow-executor is unix-only; windows desktop runs in_process (plan B)' 
+            printf 'placeholder: flow-executor is unix-only; windows desktop runs in_process (plan B)' \
               > "web/src-tauri/bin/flow-executor-${{ matrix.target }}.exe"
           else
             cargo build --release -p flow-executor --target ${{ matrix.target }}
-            cp "target/${{ matrix.target }}/release/flow-executor" 
+            cp "target/${{ matrix.target }}/release/flow-executor" \
               "web/src-tauri/bin/flow-executor-${{ matrix.target }}"
           fi
 

@@ -1459,6 +1459,7 @@ dependencies = [
  "flow-journal",
  "futures",
  "hex",
+ "hmac",
  "jsonrpsee",
  "rustls",
  "serde",

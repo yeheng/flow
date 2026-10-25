@@ -292,6 +292,9 @@ mod tests {
         );
     }
 
+    // Every caller is macOS-gated (the sandbox tests); without the gate the
+    // helper is dead code on other targets and `-D warnings` fails the build.
+    #[cfg(target_os = "macos")]
     async fn run_with_env(
         args: serde_json::Value,
         cwd: &std::path::Path,

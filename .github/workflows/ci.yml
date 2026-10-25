@@ -84,12 +84,15 @@ jobs:
       - name: test
         run: cargo test --workspace --all-targets --locked --target ${{ matrix.arch.target }}
 
-  # ---- 多架构构建：gnu 原生编，musl 用 cross ----
+  # ---- CLI 二进制矩阵：Linux / Windows / macOS 七个 target 全量构建 ----
+  # 产物打 zip（内含版本号）+ sha256 上传 artifact，合入即可下载试用；
+  # Windows 补齐桌面产品面，macOS 补齐日常开发平台。
   # gnu target 用各自架构的原生 runner 编（与 test 矩阵同一批 runner）：
   # cross 的 gnu 镜像 glibc 太旧，新版 Rust std 的 getrandom 弱符号在链接期
   # 解析不到（undefined reference to getrandom），musl 镜像不受影响。
   # musl 全静态，拷到服务器或 scratch 容器里直接能跑；C 依赖（rquickjs 的
   # cc 构建）由 cross 镜像内的目标架构工具链解决。
+  # macos-13 Intel runner 已退役：aarch64 原生编，x86_64 在 arm 机上交叉编。
   build:
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
@@ -110,18 +113,32 @@ jobs:
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04
             use-cross: true
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            use-cross: false
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            use-cross: false
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            use-cross: false
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # aws-lc-sys 在 MSVC 上要 nasm 汇编器（与 windows-check 同一原因）
+      - uses: ilammy/setup-nasm@v1
+        if: runner.os == 'Windows'
       - uses: taiki-e/install-action@cross
         if: matrix.use-cross
       # cross 在容器里换着工具链编译，增量产物与原生 cargo 不通用，单独一份 key
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.use-cross && 'cross-' || '' }}${{ matrix.target }}-build
+      # shell: bash：Windows runner 走 git bash，三平台共用同一段脚本
       - name: build（workspace，release）
+        shell: bash
         run: |
           if [ "${{ matrix.use-cross }}" = "true" ]; then
             cross build --workspace --release --locked --target ${{ matrix.target }}
@@ -133,30 +150,70 @@ jobs:
       # 同名会写同一个产物、cargo 报 output filename collision，谁覆盖谁取决于
       # 构建顺序，所以两者必须保持不同的名字。
       - name: 收集 flow-cli / flow-perf / flow-journal-server / flow-journal-server-e2e
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
+          if [ "${{ runner.os }}" = "Windows" ]; then ext=".exe"; else ext=""; fi
           for bin in flow-cli flow-perf flow-journal-server flow-journal-server-e2e; do
-            cp "target/${{ matrix.target }}/release/$bin" "dist/$bin"
+            cp "target/${{ matrix.target }}/release/$bin$ext" "dist/$bin$ext"
           done
-      - name: 校验产物是目标架构的 ELF
+      # 校验产物架构与目标一致（交叉编译配错 target 时在这里拦住）。
+      # Linux 查 ELF、macOS 查 Mach-O；Windows 的 git bash 没有 file，
+      # 直接读 PE 头两个字节（MZ）。
+      - name: 校验产物架构
+        shell: bash
         run: |
           set -euo pipefail
           case '${{ matrix.target }}' in
-            x86_64-*) want='x86-64' ;;
-            aarch64-*) want='aarch64' ;;
+            x86_64-*) want='x86-64|x86_64' ;;
+            aarch64-*) want='aarch64|arm64' ;;
             *) want='?' ;;
           esac
           for f in dist/*; do
             echo "== $f"
-            file "$f"
-            file "$f" | grep -q 'ELF 64-bit' || { echo "::error::$f 不是 ELF 64"; exit 1; }
-            file "$f" | grep -q "$want" || { echo "::error::$f 架构不是 $want"; exit 1; }
+            case '${{ runner.os }}' in
+              Linux)
+                file "$f" | grep -q 'ELF 64-bit' || { echo "::error::$f 不是 ELF 64"; exit 1; }
+                ;;
+              macOS)
+                file "$f" | grep -q 'Mach-O 64-bit' || { echo "::error::$f 不是 Mach-O 64"; exit 1; }
+                ;;
+              Windows)
+                sig=$(head -c 2 "$f" | od -An -tx1 | tr -d ' \n')
+                [ "$sig" = "4d5a" ] || { echo "::error::$f 不是 PE（缺 MZ 头）"; exit 1; }
+                continue
+                ;;
+            esac
+            file "$f" | grep -Eq "$want" || { echo "::error::$f 架构不是 $want"; exit 1; }
           done
+      # zip 名带 workspace 版本（Cargo.toml 的 [workspace.package] version），
+      # 下载后无需解包即可分辨新旧。
+      - name: 打包 zip + sha256（Linux / macOS）
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          VER=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
+          NAME="flow-$VER-${{ matrix.target }}.zip"
+          mkdir -p staging
+          (cd dist && zip "../staging/$NAME" ./*)
+          (cd staging && shasum -a 256 "$NAME" > "$NAME.sha256")
+      - name: 打包 zip + sha256（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # [^"]* 不依赖行尾锚点：Windows checkout 的 CRLF 行尾不会让匹配落空
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]*)"' |
+            Select-Object -First 1).Matches.Groups[1].Value
+          $name = "flow-$ver-${{ matrix.target }}.zip"
+          New-Item -ItemType Directory -Force staging | Out-Null
+          Compress-Archive -Path dist/* -DestinationPath "staging/$name"
+          $hash = (Get-FileHash "staging/$name" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name" | Out-File -Encoding ascii "staging/$name.sha256"
       - uses: actions/upload-artifact@v4
         with:
           name: flow-${{ matrix.target }}
-          path: dist
+          path: staging
           if-no-files-found: error
 
   # ---- Windows 编译门禁 ----
@@ -181,6 +238,151 @@ jobs:
         run: cargo check --workspace --locked --target x86_64-pc-windows-msvc
       - name: Executor environment policy tests
         run: cargo test -p flow-engine --no-default-features --lib execution_protocol::environment --locked --target x86_64-pc-windows-msvc
+
+  # ---- 桌面端（Tauri）三平台构建：发版前的编译门禁 + 可下载 zip ----
+  # 步骤与 release.yml 的 build job 保持同一套（那边额外校验 tag 版本并上传
+  # GitHub Release，这里上传 artifact），保证 PR 阶段就能发现桌面端编不过，
+  # 而不是打 tag 发版当天才发现。产物名不带版本号：CI artifact 本身按 run
+  # 归档，不会混淆；正式带版本的包走 release.yml。
+  desktop:
+    name: desktop (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-aarch64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            bundles: app
+          - name: windows-x86_64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: msi,nsis
+          # 22.04 的 glibc / webkit 版本对 AppImage 分发更友好。
+          - name: linux-x86_64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: appimage,deb
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux 系统依赖（Tauri v2 WebKit 工具链）
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev \
+            libgtk-3-dev libappindicator3-dev librsvg2-dev patchelf \
+            libxdo-dev libssl-dev build-essential curl wget file
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # aws-lc-sys 在 MSVC 上要 nasm 汇编器
+      - uses: ilammy/setup-nasm@v1
+        if: runner.os == 'Windows'
+
+      # 双 workspace 都要缓存：src-tauri（桌面壳）+ 根工作区（executor 及
+      # 其依赖链都在根 target/ 下构建）
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            web/src-tauri
+          key: desktop-${{ matrix.target }}
+
+      - name: 安装前端依赖
+        working-directory: web
+        run: npm ci
+
+      # T6：桌面默认执行模式已切 ipc（unix）。flow-executor 作为 externalBin
+      # 随包分发（macOS 进 Contents/MacOS/、Linux 进 bin/，与主程序同目录，
+      # 满足 locate() 兄弟目录契约）。Windows 桌面仍是 in_process 过渡态
+      # （B 方案），executor 是 unix-only 产品无法交叉——放占位文件让 tauri
+      # externalBin 检查通过，实际不会被调用；随命名管道 transport（A 方案）
+      # 再换真实产物。
+      - name: 构建执行器（externalBin）
+        shell: bash
+        run: |
+          mkdir -p web/src-tauri/bin
+          # shellcheck disable=SC2193  # 矩阵表达式被换成哑字符串后该比较必为 false，属误报
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            printf 'placeholder: flow-executor is unix-only; windows desktop runs in_process (plan B)' \
+              > "web/src-tauri/bin/flow-executor-${{ matrix.target }}.exe"
+          else
+            cargo build --release -p flow-executor --target ${{ matrix.target }}
+            cp "target/${{ matrix.target }}/release/flow-executor" \
+              "web/src-tauri/bin/flow-executor-${{ matrix.target }}"
+          fi
+
+      # tauri build 会先跑 tauri.conf.json 的 beforeBuildCommand（npm run build）。
+      # src-tauri 是独立 workspace（自带 Cargo.lock），产物落在
+      # web/src-tauri/target/<target>/release/bundle/ 下。
+      - name: 构建 Tauri 应用
+        working-directory: web
+        run: npm run build:desktop -- --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
+      - name: 打包 zip（macOS）
+        if: runner.os == 'macOS'
+        run: |
+          NAME="Flow-${{ matrix.name }}.zip"
+          BUNDLE="web/src-tauri/target/${{ matrix.target }}/release/bundle/macos"
+          mkdir -p staging
+          # .app 必须用 ditto 打包：保留符号链接与权限，普通 zip 会损坏应用结构。
+          ditto -c -k --sequesterRsrc --keepParent "$BUNDLE/Flow.app" "staging/$NAME"
+          (cd staging && shasum -a 256 "$NAME" > "$NAME.sha256")
+
+      - name: 打包 zip（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "Flow-${{ matrix.name }}.zip"
+          $bundle = "web/src-tauri/target/${{ matrix.target }}/release/bundle"
+          New-Item -ItemType Directory -Force staging | Out-Null
+          $files = @(Get-ChildItem "$bundle/msi/*.msi") + @(Get-ChildItem "$bundle/nsis/*.exe")
+          if ($files.Count -eq 0) { throw "bundle 目录里没有 msi/nsis 产物" }
+          Compress-Archive -Path $files.FullName -DestinationPath "staging/$name"
+          $hash = (Get-FileHash "staging/$name" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name" | Out-File -Encoding ascii "staging/$name.sha256"
+
+      # 绿色版：免安装，zip 里只有一个改名后的主程序，解压即运行
+      # （仍依赖系统 WebView2 运行时，Win11 与多数 Win10 已预装）。
+      - name: 打包 zip（Windows 绿色版）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "Flow-${{ matrix.name }}-portable.zip"
+          $exe = "web/src-tauri/target/${{ matrix.target }}/release/flow-desktop.exe"
+          if (-not (Test-Path $exe)) { throw "找不到便携版可执行文件：$exe" }
+          New-Item -ItemType Directory -Force portable | Out-Null
+          Copy-Item $exe "portable/Flow.exe"
+          Compress-Archive -Path "portable/Flow.exe" -DestinationPath "staging/$name"
+          $hash = (Get-FileHash "staging/$name" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name" | Out-File -Encoding ascii "staging/$name.sha256"
+
+      - name: 打包 zip（Linux）
+        if: runner.os == 'Linux'
+        run: |
+          NAME="Flow-${{ matrix.name }}.zip"
+          BUNDLE="web/src-tauri/target/${{ matrix.target }}/release/bundle"
+          mkdir -p staging
+          zip -j "staging/$NAME" "$BUNDLE"/appimage/*.AppImage "$BUNDLE"/deb/*.deb
+          (cd staging && sha256sum "$NAME" > "$NAME.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flow-desktop-${{ matrix.name }}
+          path: staging
+          if-no-files-found: error
 
   # ---- 前端：单架构 ----
   # lint / 单测 / 构建都是 node 侧的事，与 CPU 架构无关；playwright 的 e2e 里
