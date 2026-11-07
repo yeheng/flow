@@ -290,7 +290,7 @@ async fn cli_recovers_an_accepted_write_after_losing_its_reply() {
     assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), original);
     let rows = b
         .store
-        .runs_page(flow_store::store::RunsQuery {
+        .runs_page(flow_journal::query::RunsQuery {
             limit: 10,
             ..Default::default()
         })

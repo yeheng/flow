@@ -10,7 +10,7 @@ default = []
 fault-injection = []
 
 [dependencies]
-flow-journal = { path = "../flow-journal", default-features = false, features = ["storage"] }
+flow-journal = { path = "../flow-journal", default-features = false, features = ["storage", "query"] }
 reqwest.workspace = true
 sha2.workspace = true
 hex.workspace = true
@@ -41,7 +41,6 @@ futures = { workspace = true }
 flow-engine = { path = "../flow-engine" }
 tokio-tungstenite = { workspace = true }
 flow-dto = { path = "../flow-dto" }
-flow-store = { path = "../flow-store" }
 flow-config = { path = "../flow-config" }
 
 [dev-dependencies]

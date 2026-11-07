@@ -9,14 +9,14 @@
 //! 翻译规则收在一处，才能保证「事实 → 状态」永远只有一种解释。
 use crate::journal::{audit_rows, project_rows, JournalBackend, JournalError};
 use flow_engine::journal_state::{Run, State};
+use flow_journal::query::{EntityChange, Store};
 use flow_journal::{EventKind, StoredValue, Transaction, ValueRef};
-use flow_store::store::{EntityChange, Store};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 type Result<T> = std::result::Result<T, JournalError>;
 
 /// 把存储层错误包装成统一的后端错误。
-fn db(e: flow_store::store::Error) -> JournalError {
+fn db(e: flow_journal::query::Error) -> JournalError {
     JournalError::Storage(e.to_string())
 }
 

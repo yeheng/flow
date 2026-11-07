@@ -278,7 +278,7 @@ pub async fn list_runs(
 ) -> Result<Vec<RunRecord>> {
     let (_, values) = backend
         .store
-        .runs_page(flow_store::store::RunsQuery {
+        .runs_page(flow_journal::query::RunsQuery {
             workflow_id,
             status,
             source,

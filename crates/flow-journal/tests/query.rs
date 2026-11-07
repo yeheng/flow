@@ -1,6 +1,6 @@
+use flow_journal::query::{RunsQuery, Store};
 use flow_journal::sqlite::EntityChange;
 use flow_journal::{Event, EventKind, Journal, Transaction};
-use flow_store::store::{RunsQuery, Store};
 use serde_json::json;
 
 async fn write(j: &Journal, rows: Vec<EntityChange>) {
@@ -144,7 +144,7 @@ async fn aggregate_response_budget_returns_a_typed_limit() {
     let store = Store::open(&dir.join("flow.sqlite"), j.id()).await.unwrap();
     assert!(matches!(
         store.ordered("template", None, false).await,
-        Err(flow_store::store::Error::ResponseTooLarge)
+        Err(flow_journal::query::Error::ResponseTooLarge)
     ));
     store.close().await;
     j.close().await.unwrap();

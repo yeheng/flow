@@ -378,7 +378,7 @@ async fn cancelled_run_start_is_scheduled_without_a_retry_or_state_read() {
         loop {
             let (_, rows) = b
                 .store
-                .runs_page(flow_store::store::RunsQuery {
+                .runs_page(flow_journal::query::RunsQuery {
                     status: Some("succeeded"),
                     limit: 1,
                     ..Default::default()

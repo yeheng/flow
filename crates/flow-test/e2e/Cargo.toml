@@ -31,7 +31,6 @@ flow-backend = { path = "../../flow-backend" }
 flow-rpc = { path = "../../flow-rpc" }
 flow-config = { path = "../../flow-config" }
 flow-engine = { path = "../../flow-engine" }
-flow-journal = { path = "../../flow-journal", default-features = false, features = ["storage"] }
 flow-test-support = { path = "../test-support" }
 rustls = { workspace = true }
 
@@ -63,4 +62,4 @@ cron-parser = { workspace = true }
 sqlx = { workspace = true }
 libc = { workspace = true }
 flow-dto = { path = "../../flow-dto" }
-flow-store = { path = "../../flow-store" }
+flow-journal = { path = "../../flow-journal", default-features = false, features = ["storage", "query"] }

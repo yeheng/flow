@@ -8,10 +8,15 @@
 //! 需要它的原因：业务语义只允许存在一份权威副本，内存投影与磁盘事实一旦
 //! 分叉就无法判定谁是真的；把两者绑进同一事务，恢复期才只需信任磁盘。
 pub mod codec;
+
 #[cfg(feature = "storage")]
 pub mod maintenance;
 #[cfg(feature = "storage")]
 pub mod page;
+/// 同库只读查询层（原 flow-store 合入，T6）：Reader 私有只读连接池，
+/// 与写入者共用 schema/摘要/格式规则，读写能力在 API 面分离。
+#[cfg(feature = "query")]
+pub mod query;
 #[cfg(feature = "storage")]
 pub mod sqlite;
 #[cfg(feature = "storage")]

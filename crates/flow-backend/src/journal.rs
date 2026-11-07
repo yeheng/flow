@@ -26,8 +26,8 @@ use std::sync::{
 
 use flow_engine::journal_state::{CommandRecord, State};
 use flow_journal::page::CommitCursor;
+use flow_journal::query::{EntityChange, Store};
 use flow_journal::{Event, EventKind, Journal, JournalOptions, Transaction};
-use flow_store::store::{EntityChange, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Mutex, Notify, RwLock};
@@ -496,7 +496,7 @@ impl JournalBackend {
             .get("workflow", workflow)
             .await
             .map_err(|error| match error {
-                flow_store::store::Error::ResponseTooLarge => {
+                flow_journal::query::Error::ResponseTooLarge => {
                     JournalError::Journal(flow_journal::Error::Limit("RESPONSE_TOO_LARGE".into()))
                 }
                 other => JournalError::Storage(other.to_string()),

@@ -45,7 +45,7 @@ pub struct Store {
 // 悄悄退化成全表扫。
 const ACTIVE_RUNS_SQL:&str="SELECT key FROM current_entities INDEXED BY entity_active_runs WHERE kind='run' AND status IN ('running','awaiting_resume') AND key>? ORDER BY key LIMIT 256";
 
-pub use flow_journal::sqlite::EntityChange;
+pub use crate::sqlite::EntityChange;
 
 /// 列表类接口的单次响应字节上限（4 MiB）。
 ///
@@ -53,7 +53,7 @@ pub use flow_journal::sqlite::EntityChange;
 /// 预算必须覆盖累积后的全部 body；`READ_BYTES` 只约束单条实体读取。
 const LIST_BYTES: i64 = 4 * 1024 * 1024;
 /// 单条实体（含其附属的节点/尝试/版本）的读取预算，与 journal 的值预算同源。
-const READ_BYTES: i64 = flow_journal::VALUE_BUDGET as i64;
+const READ_BYTES: i64 = crate::VALUE_BUDGET as i64;
 
 /// 运行列表的过滤条件。
 ///
@@ -123,7 +123,7 @@ fn attempt_filter(q: &mut QueryBuilder<Sqlite>, run: &str, all: bool) {
 /// （截断、外部改写、迁移缺陷），此时必须报错而不是照抄内容——
 /// 读侧一旦把损坏内容当事实返回，后面所有裁决都建立在错误输入上。
 fn decode_body(kind: &str, key: &str, body: &str, digest: &str) -> Result<Value, Error> {
-    if flow_journal::sqlite::entity_digest(kind, key, body) != digest {
+    if crate::sqlite::entity_digest(kind, key, body) != digest {
         return Err(sqlx::Error::Protocol("current entity checksum mismatch".into()).into());
     }
     serde_json::from_str(body).map_err(|e| Error::Database(sqlx::Error::Decode(Box::new(e))))
@@ -147,7 +147,7 @@ impl Store {
         let version: i64 = sqlx::query_scalar("PRAGMA user_version")
             .fetch_one(&pool)
             .await?;
-        if version != flow_journal::sqlite::FORMAT {
+        if version != crate::sqlite::FORMAT {
             return Err(sqlx::Error::Protocol("unsupported SQLite storage format".into()).into());
         }
         let identity: String =
@@ -605,10 +605,10 @@ mod tests {
     #[tokio::test]
     async fn startup_seeks_the_active_index_without_scanning_completed_history() {
         let dir = flow_test_support::io::TempDir::new("active-query-plan");
-        let writer = flow_journal::Journal::open(dir.path(), Default::default())
+        let writer = crate::Journal::open(dir.path(), Default::default())
             .await
             .unwrap();
-        let conn = flow_journal::sqlite::read_connection(dir.path()).unwrap();
+        let conn = crate::sqlite::read_connection(dir.path()).unwrap();
         let plan: String = conn
             .prepare(&format!("EXPLAIN QUERY PLAN {ACTIVE_RUNS_SQL}"))
             .unwrap()
@@ -624,10 +624,10 @@ mod tests {
     #[tokio::test]
     async fn named_collections_use_the_partial_index_without_temporary_sorting() {
         let dir = flow_test_support::io::TempDir::new("name-query-plan");
-        let writer = flow_journal::Journal::open(dir.path(), Default::default())
+        let writer = crate::Journal::open(dir.path(), Default::default())
             .await
             .unwrap();
-        let conn = flow_journal::sqlite::read_connection(dir.path()).unwrap();
+        let conn = crate::sqlite::read_connection(dir.path()).unwrap();
         for kind in ["workflow", "template"] {
             let query = ordered_query(kind, None, true);
             let plan = conn

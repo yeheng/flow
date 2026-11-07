@@ -2061,7 +2061,7 @@ mod tests {
 
     /// 邻接索引是纯缓存：**绝不进入序列化**。
     ///
-    /// `flow_store::definition_checksum` 按 `serde_json::to_vec(definition)`
+    /// `flow_journal::query::definition_checksum` 按 `serde_json::to_vec(definition)`
     /// 算 checksum 决定「相同定义复用版本号」。索引一旦进了序列化，每个
     /// definition 的 checksum 都会掺入缓存内容，版本复用契约当场失效。
     #[test]

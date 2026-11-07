@@ -22,9 +22,9 @@ pub mod journal_import;
 pub mod journal_views;
 pub mod projection_check;
 mod regression;
+pub use flow_journal::query::Error as StorageError;
 /// Read and write paths share the same typed error categories.
 pub use flow_journal::Error as ViewError;
-pub use flow_store::store::Error as StorageError;
 
 /// `[harness.agent]`（用户输入 schema）→ 冻结快照用的运行期形态。唯一的
 /// 转换点：base_url 与 model 都非空才启用（成对校验在 flow-config 已把关，
