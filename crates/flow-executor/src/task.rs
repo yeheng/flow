@@ -1798,59 +1798,49 @@ impl TaskRunner {
         audit: &mut AuditStream,
         logger: &flow_engine::NodeLogger,
     ) -> Result<ResultOutcome, TaskError> {
-        std::fs::create_dir_all(roots.join("tmp"))
-            .map_err(|e| TaskError::Business(format!("harness agent 临时目录创建失败：{e}")))?;
         let started = std::time::Instant::now();
-        // typed 配置直入（不经 CONGA_* env）；key 走参数。装配失败（代理
-        // 非法/规格空）是确定性失败 → outcome B。
-        let spec = agent_host::headless::HeadlessSpec {
-            base_url: config.base_url.clone(),
-            model: config.model.clone(),
-            api: config.api.clone(),
-            proxy: config.proxy.clone(),
-            max_turns: config.max_turns.map(|v| v as usize),
-            max_tool_calls_per_turn: config.max_tool_calls_per_turn.map(|v| v as usize),
-            max_tokens: config.max_tokens.map(|v| v as usize),
-            tool_timeout_secs: config.tool_timeout_secs,
-        };
-        let session = match agent_host::headless::build_headless_with(
+        // agent 运行时住在独立插件进程里（agent-plugin 项目）：spawn →
+        // 握手 → runTurn → 事件泵 → 摘要（见 `agent_plugin.rs`）。装配/
+        // 环境类失败是确定性失败 → outcome B；回合类失败 → Uncertain。
+        // 回合的清理（会话资源回收）在插件侧完成后才回摘要。
+        //
+        // The caller bounds assembly, the turn, cleanup and outcome publication
+        // with one deadline. Dropping this future is always followed by retiring
+        // the entire executor session, including the plugin and tool process
+        // groups (插件与执行器同进程组).
+        //
+        // 进度投影只写入有界观测通道：不记录 prompt、模型正文或工具参数
+        // （隐私边界在插件侧投影时执行，详见 `agent_progress.rs`）。
+        let mut progress = crate::agent_progress::AgentProgress::new(logger);
+        let parsed = match crate::agent_plugin::run_agent_turn(
+            config,
+            prompt,
             api_key,
-            &spec,
-            roots,
             workdir,
-            agent_host::permission::Mode::FullAuto,
+            roots,
+            |event| progress.on_wire_event(event),
         )
         .await
         {
-            Ok(session) => session,
-            Err(error) => {
-                let outcome = StoredValue::inline(json!({ "agent_error": error.to_string() }))?;
+            Ok(parsed) => parsed,
+            Err(crate::agent_plugin::AgentPluginError::Assembly(message)) => {
+                // 装配/环境失败与原内联路径同语义：先落 outcome 留痕，
+                // 再以 Business 收口（重试无意义）。
+                let outcome = StoredValue::inline(json!({ "agent_error": message }))?;
                 return self
                     .commit_agent_failure(
                         outcome,
                         audit,
-                        format!("harness agent assembly failed: {error}"),
+                        format!("harness agent assembly failed: {message}"),
                     )
                     .await;
             }
+            Err(crate::agent_plugin::AgentPluginError::Turn(message)) => {
+                return Err(TaskError::Uncertain(format!(
+                    "harness agent turn failed: {message}"
+                )));
+            }
         };
-        let session_id = session.host.session().current_id();
-        // The caller bounds assembly, the turn, cleanup and outcome publication
-        // with one deadline. Dropping this future is always followed by retiring
-        // the entire executor session, including tool process groups.
-        //
-        // 进度投影只写入有界观测通道：不记录 prompt、模型正文或工具参数
-        // （详见 `agent_progress.rs`）。
-        let mut progress = crate::agent_progress::AgentProgress::new(logger);
-        let turn = session
-            .host
-            .run_turn(prompt, |event| progress.on_event(event))
-            .await;
-        // 清理宿主会话资源：不做会让下一次任务继承上个会话的状态。
-        agent_host::session_cleanup::cleanup_session_resources(&session_id).await;
-        let summary = turn
-            .map_err(|error| TaskError::Uncertain(format!("harness agent turn failed: {error}")))?;
-        let parsed = crate::agent_summary::summarize(&summary);
         logger.info(format!(
             "← agent {}（{}ms，{} turns）",
             if parsed.exit_code == 0 {

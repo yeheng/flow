@@ -187,8 +187,7 @@ impl ProcessHookChain {
     /// `<project_dir>/.conga/hooks.json`. `None` when no hooks are
     /// configured (nothing pushed into the stack — zero overhead).
     pub fn discover(project_dir: &Path) -> Option<Arc<Self>> {
-        let hooks =
-            load_process_hooks(&agent_core::storage::config_dir(), project_dir);
+        let hooks = load_process_hooks(&agent_core::storage::config_dir(), project_dir);
         if hooks.is_empty() {
             None
         } else {

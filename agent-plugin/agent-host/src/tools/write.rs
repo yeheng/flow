@@ -23,18 +23,16 @@ pub fn tool() -> ToolDefinition {
     }
 }
 
-async fn execute(
-    ctx: ToolCallCtx,
-) -> Result<ToolResult, agent_core::error::ToolError> {
+async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, agent_core::error::ToolError> {
     if ctx.aborted() {
         return Ok(ToolResult::error("aborted".to_string()));
     }
-    let path = ctx.args["path"].as_str().ok_or_else(|| {
-        agent_core::error::ToolError::Message("path is required".into())
-    })?;
-    let content = ctx.args["content"].as_str().ok_or_else(|| {
-        agent_core::error::ToolError::Message("content is required".into())
-    })?;
+    let path = ctx.args["path"]
+        .as_str()
+        .ok_or_else(|| agent_core::error::ToolError::Message("path is required".into()))?;
+    let content = ctx.args["content"]
+        .as_str()
+        .ok_or_else(|| agent_core::error::ToolError::Message("content is required".into()))?;
 
     let full = match super::resolve_within_cwd(&ctx.ctx.cwd, path) {
         Ok(p) => p,

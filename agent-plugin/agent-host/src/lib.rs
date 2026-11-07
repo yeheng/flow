@@ -37,6 +37,7 @@ pub mod subagent_types;
 pub mod tools;
 pub mod wire;
 
+pub use agent_core::RiskLevel;
 pub use assembly::{gather_tools, resume_session, ApprovalEmit, SessionAssembly, SubagentEmit};
 pub use compact::{
     compact_by_count, max_messages_from_env, Compacted, ContextBudget, DEFAULT_MAX_MESSAGES,
@@ -45,7 +46,6 @@ pub use config::{ConfigLoader, HostConfig, TurnInputs};
 pub use external_tool::{
     commands_from_env, load_all as load_external_tools, ExternalCommand, ExternalToolBridge,
 };
-pub use agent_core::RiskLevel;
 pub use hooks::HookStack;
 pub use mcp::{load_all_mcp, McpBridge, McpError, McpServerConfig};
 pub use memory::append_memory;
@@ -149,8 +149,7 @@ impl Host {
         system_prompt: String,
         tools: Vec<ToolDefinition>,
     ) -> Self {
-        let hooks: Arc<dyn agent_core::HookChain> =
-            Arc::new(HookStack::new(vec![policy.clone()]));
+        let hooks: Arc<dyn agent_core::HookChain> = Arc::new(HookStack::new(vec![policy.clone()]));
         // Tool sandbox + project skills follow the project dir (env
         // override for servers); unset = process cwd, so the CLI is
         // unchanged. `.` fallback keeps tools resolving to the same place.
@@ -799,9 +798,8 @@ mod tests {
             _system: &str,
             _tools: &[ToolDefinition],
             _signal: Option<agent_core::CancelSignal>,
-        ) -> std::pin::Pin<
-            Box<dyn futures_util::Stream<Item = agent_core::StreamChunk> + Send>,
-        > {
+        ) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = agent_core::StreamChunk> + Send>>
+        {
             unreachable!("not called in construction tests")
         }
     }
@@ -816,9 +814,8 @@ mod tests {
             _system: &str,
             _tools: &[ToolDefinition],
             _signal: Option<agent_core::CancelSignal>,
-        ) -> std::pin::Pin<
-            Box<dyn futures_util::Stream<Item = agent_core::StreamChunk> + Send>,
-        > {
+        ) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = agent_core::StreamChunk> + Send>>
+        {
             Box::pin(futures_util::stream::pending())
         }
     }
@@ -851,9 +848,8 @@ mod tests {
             _: &str,
             _: &[ToolDefinition],
             _: Option<agent_core::CancelSignal>,
-        ) -> std::pin::Pin<
-            Box<dyn futures_util::Stream<Item = agent_core::StreamChunk> + Send>,
-        > {
+        ) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = agent_core::StreamChunk> + Send>>
+        {
             Box::pin(futures_util::stream::iter([
                 agent_core::StreamChunk::TextDelta("partial".into()),
                 agent_core::StreamChunk::Error("provider-boom".into()),

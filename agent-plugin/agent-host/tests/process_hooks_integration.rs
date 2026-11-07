@@ -91,9 +91,7 @@ async fn blocking_process_hook_stops_tool_call_in_agent_loop() {
             let ran = Arc::clone(&ran_probe);
             Box::pin(async move {
                 ran.store(true, Ordering::SeqCst);
-                Ok(agent_core::ToolResult::error(
-                    "MUST NOT RUN".to_string(),
-                ))
+                Ok(agent_core::ToolResult::error("MUST NOT RUN".to_string()))
             })
         }),
     };

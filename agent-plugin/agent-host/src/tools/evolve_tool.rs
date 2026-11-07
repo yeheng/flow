@@ -111,10 +111,7 @@ mod tests {
     async fn no_handle_reports_unavailable() {
         let t = tool(None);
         assert_eq!(t.name, "evolve");
-        assert_eq!(
-            t.risk,
-            agent_core::types::tool::RiskLevel::High
-        );
+        assert_eq!(t.risk, agent_core::types::tool::RiskLevel::High);
         let ctx = agent_core::types::tool::ToolCallCtx {
             tool_call_id: "tc".into(),
             args: serde_json::json!({}),

@@ -27,15 +27,13 @@ pub fn tool() -> ToolDefinition {
     }
 }
 
-async fn execute(
-    ctx: ToolCallCtx,
-) -> Result<ToolResult, agent_core::error::ToolError> {
+async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, agent_core::error::ToolError> {
     if ctx.aborted() {
         return Ok(ToolResult::error("aborted".to_string()));
     }
-    let path = ctx.args["path"].as_str().ok_or_else(|| {
-        agent_core::error::ToolError::Message("path is required".into())
-    })?;
+    let path = ctx.args["path"]
+        .as_str()
+        .ok_or_else(|| agent_core::error::ToolError::Message("path is required".into()))?;
     let offset = ctx.args["offset"].as_u64().unwrap_or(1) as usize;
     let limit = ctx.args["limit"].as_u64().map(|l| l as usize);
 

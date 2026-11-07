@@ -13,7 +13,6 @@ mod common;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use common::FakeStream;
 use agent_core::types::message::{FunctionCall, ToolCall};
 use agent_core::{
     derive_messages, AgentMessage, AssistantMessage, CancelCause, ContentBlock, EventStorage,
@@ -23,6 +22,7 @@ use agent_host::{
     ConfigLoader, EventPrinter, Host, HostConfig, Mode, PermissionPolicy, SessionManager,
     TurnSummary,
 };
+use common::FakeStream;
 use parking_lot::Mutex;
 
 fn fake_env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Result<String, std::env::VarError> {
@@ -184,10 +184,7 @@ async fn aborted_turn_persists_partial_facts() {
     let signal = host.signal().clone();
     let summary = host
         .run_turn("go", move |ev| {
-            if matches!(
-                ev,
-                agent_core::AgentEvent::ToolExecutionEnd { .. }
-            ) {
+            if matches!(ev, agent_core::AgentEvent::ToolExecutionEnd { .. }) {
                 signal.cancel();
             }
         })
@@ -672,9 +669,7 @@ impl agent_core::StreamFn for PrefixCaptureStream {
         system: &str,
         _tools: &[agent_core::ToolDefinition],
         _signal: Option<agent_core::CancelSignal>,
-    ) -> std::pin::Pin<
-        Box<dyn futures_util::Stream<Item = agent_core::StreamChunk> + Send>,
-    > {
+    ) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = agent_core::StreamChunk> + Send>> {
         self.seen
             .lock()
             .push((system.to_string(), messages.to_vec()));

@@ -46,15 +46,13 @@ pub fn tool() -> ToolDefinition {
     }
 }
 
-async fn execute(
-    ctx: ToolCallCtx,
-) -> Result<ToolResult, agent_core::error::ToolError> {
+async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, agent_core::error::ToolError> {
     if ctx.aborted() {
         return Ok(ToolResult::error("aborted".to_string()));
     }
-    let pattern = ctx.args["pattern"].as_str().ok_or_else(|| {
-        agent_core::error::ToolError::Message("pattern is required".into())
-    })?;
+    let pattern = ctx.args["pattern"]
+        .as_str()
+        .ok_or_else(|| agent_core::error::ToolError::Message("pattern is required".into()))?;
     let path = ctx.args["path"].as_str().unwrap_or(".");
     let glob = ctx.args["glob"].as_str();
     let ci = ctx.args["case_insensitive"].as_bool().unwrap_or(false);

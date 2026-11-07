@@ -124,9 +124,7 @@ mod tests {
             ToolResultMessage {
                 tool_call_id: r.tool_call_id.clone(),
                 tool_name: r.tool_name.clone(),
-                content: vec![agent_core::ContentBlock::text(
-                    "[x]".to_string(),
-                )],
+                content: vec![agent_core::ContentBlock::text("[x]".to_string())],
                 is_error: r.is_error,
                 timestamp: r.timestamp,
             }

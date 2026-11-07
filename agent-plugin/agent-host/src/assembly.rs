@@ -358,9 +358,9 @@ fn apply_fast_provider(
         agent_core::ProviderApi::OpenAiCompat => {
             Arc::new(agent_core::OpenAiCompat::from_config(fast))
         }
-        agent_core::ProviderApi::Anthropic => Arc::new(
-            agent_core::AnthropicProvider::from_config(fast),
-        ),
+        agent_core::ProviderApi::Anthropic => {
+            Arc::new(agent_core::AnthropicProvider::from_config(fast))
+        }
     };
 }
 
@@ -435,10 +435,9 @@ async fn assemble_host(
     match settings_fast {
         Some(fast) => apply_fast_provider(&mut loop_config, &fast, &cfg.tunables),
         None => {
-            match agent_core::ProviderConfig::from_env_prefixed(
-                "CONGA_FAST_LLM",
-                &|k: &str| std::env::var(k),
-            ) {
+            match agent_core::ProviderConfig::from_env_prefixed("CONGA_FAST_LLM", &|k: &str| {
+                std::env::var(k)
+            }) {
                 Ok(Some(fast)) => apply_fast_provider(&mut loop_config, &fast, &cfg.tunables),
                 Ok(None) => {}
                 Err(e) => {
@@ -482,8 +481,7 @@ mod tests {
         let id = "corrupt-sess";
         let dir = tmp.path().join(id);
         std::fs::create_dir_all(&dir).unwrap();
-        let good =
-            serde_json::to_string(&agent_core::SessionEvent::TurnStart).unwrap();
+        let good = serde_json::to_string(&agent_core::SessionEvent::TurnStart).unwrap();
         let body = format!("{good}\n{{\"type\":\"from_the_future\"}}\n{good}\n");
         std::fs::write(dir.join("events.jsonl"), body).unwrap();
 

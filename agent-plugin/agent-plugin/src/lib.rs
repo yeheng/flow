@@ -258,7 +258,10 @@ pub fn summarize(summary: &TurnSummary) -> TurnOutcome {
                 ContentBlock::Text { text } => Some(text.as_str()),
                 _ => None,
             }));
-            (joined, stop_reason_literal(message.stop_reason.clone()).to_string())
+            (
+                joined,
+                stop_reason_literal(message.stop_reason.clone()).to_string(),
+            )
         }
         None => (String::new(), "no_assistant_message".to_string()),
     };
@@ -383,7 +386,7 @@ pub struct TurnHandle {
 mod tests {
     use super::*;
     use agent_core::types::message::{AssistantMessage, ToolResultMessage, Usage};
-    use agent_core::{AgentMessage, CancelCause, ContentBlock, StopReason, TurnEndReason};
+    use agent_core::{AgentMessage, ContentBlock, StopReason, TurnEndReason};
     use agent_host::TurnSummary;
     use serde_json::json;
 
@@ -421,21 +424,23 @@ mod tests {
         assert_eq!(outcome.exit_code, 1);
         assert!(outcome.error.unwrap().contains("max turns"));
 
-        // 显式取消 → 130（runner 中止契约）。
+        // 回合错误 → 1。
         let summary = TurnSummary {
-            reason: TurnEndReason::Cancelled,
-            new_messages: vec![],
-        };
-        assert_eq!(summarize(&summary).exit_code, 130);
-
-        // provider 失败 → 1。
-        let summary = TurnSummary {
-            reason: TurnEndReason::Failed(agent_core::AgentError::Provider("boom".into())),
+            reason: TurnEndReason::Error {
+                message: "provider boom".into(),
+            },
             new_messages: vec![],
         };
         let outcome = summarize(&summary);
         assert_eq!(outcome.exit_code, 1);
         assert!(outcome.error.unwrap().contains("boom"));
+
+        // 中止 → 130（runner 中止契约）。
+        let summary = TurnSummary {
+            reason: TurnEndReason::Aborted { cause: None },
+            new_messages: vec![],
+        };
+        assert_eq!(summarize(&summary).exit_code, 130);
     }
 
     /// 文本上限：截断后的长度必须仍落在 journal 派生的 8 MiB 线内。
@@ -456,7 +461,9 @@ mod tests {
     fn wire_events_carry_metadata_only() {
         let clocks = EventClocks::default();
         let mut response = AssistantMessage::new(&"m".into());
-        response.content.push(ContentBlock::text("private-response"));
+        response
+            .content
+            .push(ContentBlock::text("private-response"));
         response.stop_reason = StopReason::Error("private-provider-error".into());
         response.usage = Some(Usage {
             input_tokens: 12,
@@ -465,9 +472,7 @@ mod tests {
         });
         let events = vec![
             AgentEvent::TurnStart,
-            AgentEvent::BeforeProviderRequest {
-                model: "m".into(),
-            },
+            AgentEvent::BeforeProviderRequest { model: "m".into() },
             AgentEvent::AfterProviderResponse {
                 model: "m".into(),
                 response,
@@ -511,12 +516,17 @@ mod tests {
         )
         .is_none());
         // 取消原因里的文本也不过线（Error 事件只投「发生了错误」）。
-        assert!(project_event(
+        // Error 事件只投「发生了错误」，message 正文不过线。
+        let projected = project_event(
             &AgentEvent::Error {
-                cause: CancelCause::Cancelled
+                message: "private-error-detail".into(),
             },
-            &clocks
+            &clocks,
         )
-        .is_some());
+        .unwrap();
+        assert!(matches!(projected, WireEvent::Error));
+        assert!(!serde_json::to_string(&projected)
+            .unwrap()
+            .contains("private-error-detail"));
     }
 }

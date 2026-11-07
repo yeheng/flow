@@ -41,12 +41,12 @@ impl HostConfig {
     /// from this; power users (or tests) can take it directly.
     pub fn provider_stream_fn(&self) -> Arc<dyn StreamFn> {
         match self.provider.api {
-            agent_core::ProviderApi::OpenAiCompat => Arc::new(
-                agent_core::OpenAiCompat::from_config(&self.provider),
-            ),
-            agent_core::ProviderApi::Anthropic => Arc::new(
-                agent_core::AnthropicProvider::from_config(&self.provider),
-            ),
+            agent_core::ProviderApi::OpenAiCompat => {
+                Arc::new(agent_core::OpenAiCompat::from_config(&self.provider))
+            }
+            agent_core::ProviderApi::Anthropic => {
+                Arc::new(agent_core::AnthropicProvider::from_config(&self.provider))
+            }
         }
     }
 
@@ -182,10 +182,7 @@ mod tests {
     fn loads_provider_and_tunables() {
         let cfg = test_cfg(&[("CONGA_MAX_TURNS", "7"), ("CONGA_LLM_API", "anthropic")]);
         assert_eq!(cfg.provider.model, "m");
-        assert_eq!(
-            cfg.provider.api,
-            agent_core::ProviderApi::Anthropic
-        );
+        assert_eq!(cfg.provider.api, agent_core::ProviderApi::Anthropic);
         assert_eq!(cfg.tunables.max_turns, 7);
     }
 
@@ -201,10 +198,7 @@ mod tests {
         // max_turns is the caller's arg (3), NOT the tunables value (7).
         let lc = cfg.build_loop_config(3, None, None, cfg.provider_stream_fn());
         assert_eq!(lc.model.id, "m");
-        assert_eq!(
-            lc.model.api,
-            agent_core::ProviderApi::Anthropic
-        );
+        assert_eq!(lc.model.api, agent_core::ProviderApi::Anthropic);
         assert_eq!(lc.max_turns, 3);
         assert_eq!(lc.retry.max_retries, 2);
     }
@@ -221,9 +215,7 @@ mod tests {
     fn build_context_maps_fields() {
         let cfg = test_cfg(&[]);
         let history = vec![AgentMessage::User(agent_core::UserMessage {
-            content: vec![agent_core::ContentBlock::text(
-                "hi".to_string(),
-            )],
+            content: vec![agent_core::ContentBlock::text("hi".to_string())],
             timestamp: 1,
         })];
         let ctx = cfg.build_context(

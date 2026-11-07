@@ -49,6 +49,11 @@ jobs:
       # lints 全开，一个 warning 都不放过（DESIGN.md §13 的验证命令）
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # agent-plugin 独立 workspace：同等门禁（共享 target 目录，缓存复用）
+      - name: fmt (agent-plugin)
+        run: cargo fmt --manifest-path agent-plugin/Cargo.toml -- --check
+      - name: clippy (agent-plugin)
+        run: CARGO_TARGET_DIR=target cargo clippy --manifest-path agent-plugin/Cargo.toml --all-targets --locked -- -D warnings
 
   # ---- 测试矩阵：x86_64 + aarch64 原生各跑一遍全量 ----
   test:
@@ -81,6 +86,10 @@ jobs:
       # 的 workspace_bin）——不先 build 就会 panic "binary not built"。
       - name: build workspace bins
         run: cargo build --workspace --bins --locked --target ${{ matrix.arch.target }}
+      # harness agent 插件（agent-plugin 独立 workspace）：harness e2e 需要
+      # 它与 flow-executor 同目录；共享 target 使兄弟定位直接生效。
+      - name: build agent-plugin bin
+        run: CARGO_TARGET_DIR=target cargo build --manifest-path agent-plugin/Cargo.toml --bins --locked
       - name: test
         run: cargo test --workspace --all-targets --locked --target ${{ matrix.arch.target }}
 

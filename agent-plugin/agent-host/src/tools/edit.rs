@@ -46,32 +46,26 @@ struct Hunk<'a> {
     new_text: &'a str,
 }
 
-async fn execute(
-    ctx: ToolCallCtx,
-) -> Result<ToolResult, agent_core::error::ToolError> {
+async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, agent_core::error::ToolError> {
     if ctx.aborted() {
         return Ok(ToolResult::error("aborted".to_string()));
     }
-    let path = ctx.args["path"].as_str().ok_or_else(|| {
-        agent_core::error::ToolError::Message("path is required".into())
-    })?;
-    let edits = ctx.args["edits"].as_array().ok_or_else(|| {
-        agent_core::error::ToolError::Message("edits array is required".into())
-    })?;
+    let path = ctx.args["path"]
+        .as_str()
+        .ok_or_else(|| agent_core::error::ToolError::Message("path is required".into()))?;
+    let edits = ctx.args["edits"]
+        .as_array()
+        .ok_or_else(|| agent_core::error::ToolError::Message("edits array is required".into()))?;
     if edits.is_empty() {
         return Ok(ToolResult::error("edits must not be empty".to_string()));
     }
     let mut hunks: Vec<Hunk> = Vec::with_capacity(edits.len());
     for (i, e) in edits.iter().enumerate() {
         let old_text = e["old_text"].as_str().ok_or_else(|| {
-            agent_core::error::ToolError::Message(format!(
-                "edits[{i}].old_text is required"
-            ))
+            agent_core::error::ToolError::Message(format!("edits[{i}].old_text is required"))
         })?;
         let new_text = e["new_text"].as_str().ok_or_else(|| {
-            agent_core::error::ToolError::Message(format!(
-                "edits[{i}].new_text is required"
-            ))
+            agent_core::error::ToolError::Message(format!("edits[{i}].new_text is required"))
         })?;
         hunks.push(Hunk { old_text, new_text });
     }

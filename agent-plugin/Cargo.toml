@@ -7,5 +7,7 @@ members = ["agent-core", "agent-host", "agent-plugin"]
 # crate——除 plugin-proto / proc-ipc（传输与协议层，本身零 flow 依赖，
 # 当前以 path 依赖引用；发布后切换为版本依赖）。
 #
-# 共享宿主仓库的 target 目录：flow-executor 按「同目录兄弟二进制」定位
-# 本项目的 flow-agent-plugin，e2e 与 CI 也因此不需要第二份编译产物树。
+# 产物落位：构建时显式指定 CARGO_TARGET_DIR=<repo>/target（flow-test-support
+# 与 CI 都这么调），让 flow-agent-plugin 与 flow-executor 同目录——执行器按
+# 「同目录兄弟」定位插件，e2e 无需第二份产物树。不用 .cargo/config.toml：
+# 它按 cwd 发现而非 manifest 路径，从仓库根调用时会被静默跳过。

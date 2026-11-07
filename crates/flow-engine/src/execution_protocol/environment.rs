@@ -11,8 +11,10 @@ use tokio::process::Command;
 /// harness 沙箱的目录定位（无凭据语义），必须与父进程一致（测试隔离
 /// 与多实例部署都靠它在父子间对齐 `~/.flow`）。remote 模式下父进程是
 /// 远端机器上的 flow-agent，透传的是那台机器的环境。
+/// 执行器/插件共用的环境白名单（对执行器与 agent 插件进程同源生效，
+/// 避免两份清单漂移）。
 #[cfg(not(windows))]
-pub(crate) const EXECUTOR_ENV_WHITELIST: &[&str] = &[
+pub const EXECUTOR_ENV_WHITELIST: &[&str] = &[
     "PATH",
     "HOME",
     "FLOW_HOME",
@@ -29,6 +31,8 @@ pub(crate) const EXECUTOR_ENV_WHITELIST: &[&str] = &[
     "XDG_DATA_HOME",
     "XDG_CONFIG_HOME",
     "XDG_CACHE_HOME",
+    // agent 插件二进制的显式定位覆盖（缺省走同目录兄弟定位）
+    "FLOW_AGENT_PLUGIN_BIN",
 ];
 
 #[cfg(windows)]
@@ -44,6 +48,7 @@ pub(crate) const EXECUTOR_ENV_WHITELIST: &[&str] = &[
     "COMSPEC",
     "PATHEXT",
     "LANG",
+    "FLOW_AGENT_PLUGIN_BIN",
 ];
 
 /// 把白名单环境应用到执行器命令。

@@ -38,9 +38,7 @@ pub fn tool() -> ToolDefinition {
     }
 }
 
-async fn execute(
-    ctx: ToolCallCtx,
-) -> Result<ToolResult, agent_core::error::ToolError> {
+async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, agent_core::error::ToolError> {
     if ctx.aborted() {
         return Ok(ToolResult::error("aborted".to_string()));
     }

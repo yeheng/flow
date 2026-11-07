@@ -77,6 +77,7 @@ async fn agent_workdir_default_scratch_configured_checked_and_regression_stable(
     let b: Arc<JournalBackend> = JournalBackend::open(dir.path(), Default::default())
         .await
         .unwrap();
+    let _plugin = flow_test_support::io::agent_plugin_bin();
     b.install_harness_agent(Some(flow_engine::AgentRunConfig {
         base_url: provider.base_url(),
         model: "wd-model".into(),

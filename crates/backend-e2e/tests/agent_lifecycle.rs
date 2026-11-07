@@ -54,6 +54,7 @@ async fn fresh_backend(
 ) -> Arc<JournalBackend> {
     let backend: Arc<JournalBackend> = JournalBackend::open(dir, Default::default()).await.unwrap();
     backend.install_harness_agent(config).unwrap();
+    let _plugin = flow_test_support::io::agent_plugin_bin();
     backend
         .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
             flow_backend::execution::IpcOptions {

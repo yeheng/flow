@@ -253,6 +253,55 @@ pub fn executor_bin() -> PathBuf {
 
 /// journal-server 的二进制路径（与 `server_bin` 同物，此处保留独立名字
 /// 以便调用方表意更清楚）。
+/// flow-agent-plugin（agent-plugin 独立 workspace 的 bin）。
+///
+/// 与 workspace_bin 不同：它不是本 workspace 的成员，缺产物时先按需构建
+/// （显式 CARGO_TARGET_DIR 共享本仓库 target），再走同一套定位。这样
+/// `cargo test -p backend-e2e` 单独跑也能自举。
+pub fn agent_plugin_bin() -> PathBuf {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root");
+    if !workspace_bin_exists("flow-agent-plugin") {
+        let status =
+            std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+                .current_dir(root)
+                .env("CARGO_TARGET_DIR", root.join("target"))
+                .args([
+                    "build",
+                    "--manifest-path",
+                    "agent-plugin/Cargo.toml",
+                    "--bins",
+                    "--locked",
+                ])
+                .status()
+                .expect("spawn cargo for agent-plugin");
+        assert!(status.success(), "cargo build agent-plugin failed");
+    }
+    workspace_bin("flow-agent-plugin")
+}
+
+fn workspace_bin_exists(name: &str) -> bool {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root");
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(profile) = exe.parent().and_then(|deps| deps.parent()) {
+            if profile.join(name).is_file() {
+                return true;
+            }
+        }
+    }
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("target"));
+    ["debug", "release"]
+        .iter()
+        .any(|profile| target.join(profile).join(name).is_file())
+}
+
 pub fn journal_server_bin() -> PathBuf {
     workspace_bin("flow-journal-server")
 }

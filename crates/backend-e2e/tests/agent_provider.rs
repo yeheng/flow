@@ -47,6 +47,7 @@ async fn agent_node_full_stack_with_inline_conga_and_mock_provider() {
             tool_timeout_secs: None,
         }))
         .unwrap();
+    let _plugin = flow_test_support::io::agent_plugin_bin();
     backend
         .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
             flow_backend::execution::IpcOptions {

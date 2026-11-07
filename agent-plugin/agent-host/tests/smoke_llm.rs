@@ -14,9 +14,7 @@
 use std::sync::Arc;
 
 use agent_core::AgentMessage;
-use agent_host::{
-    ConfigLoader, EventPrinter, Host, Mode, PermissionPolicy, SessionManager,
-};
+use agent_host::{ConfigLoader, EventPrinter, Host, Mode, PermissionPolicy, SessionManager};
 
 /// 构造一次完整的 `Host::run_turn`，验证 ConfigLoader + Host + EventPrinter
 /// 端到端能跑通（真实 LLM）。

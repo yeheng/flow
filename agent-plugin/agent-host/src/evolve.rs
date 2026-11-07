@@ -387,11 +387,7 @@ pub async fn run_evolve(
     let events = session.open_or_migrate(&sid).await?;
     let messages = agent_core::derive_messages(&events);
     let trajectory = render_trajectory(&messages, MAX_TRAJECTORY_CHARS);
-    let catalog = catalog_snapshot(
-        memory_root,
-        cwd,
-        &agent_core::storage::config_dir(),
-    );
+    let catalog = catalog_snapshot(memory_root, cwd, &agent_core::storage::config_dir());
 
     let spawner = spawner.ok_or_else(|| {
         agent_core::AgentError::Tool("no subagent spawner wired on this host".into())
@@ -401,9 +397,10 @@ pub async fn run_evolve(
             task: extraction_task_prompt(&trajectory, &catalog),
         }])
         .await;
-    let result = results.into_iter().next().ok_or_else(|| {
-        agent_core::AgentError::Tool("extractor returned no result".into())
-    })?;
+    let result = results
+        .into_iter()
+        .next()
+        .ok_or_else(|| agent_core::AgentError::Tool("extractor returned no result".into()))?;
     if let Some(err) = result.error {
         return Err(agent_core::AgentError::Tool(format!(
             "extractor failed: {err}"
@@ -766,9 +763,7 @@ mod tests {
             "Root cause: conga-ext path-ref'd conga-host. Removed the edge; build green.",
         );
         session
-            .append_event(
-                &agent_core::SessionEvent::from_message(&assistant, None).unwrap(),
-            )
+            .append_event(&agent_core::SessionEvent::from_message(&assistant, None).unwrap())
             .await
             .unwrap();
 

@@ -26,15 +26,13 @@ pub fn tool() -> ToolDefinition {
     }
 }
 
-async fn execute(
-    ctx: ToolCallCtx,
-) -> Result<ToolResult, agent_core::error::ToolError> {
+async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, agent_core::error::ToolError> {
     if ctx.aborted() {
         return Ok(ToolResult::error("aborted".to_string()));
     }
-    let url = ctx.args["url"].as_str().ok_or_else(|| {
-        agent_core::error::ToolError::Message("url is required".into())
-    })?;
+    let url = ctx.args["url"]
+        .as_str()
+        .ok_or_else(|| agent_core::error::ToolError::Message("url is required".into()))?;
 
     // Reject non-http(s) schemes early — defends against file:///etc/passwd etc.
     let scheme = url.split("://").next().unwrap_or("").to_ascii_lowercase();
@@ -55,13 +53,14 @@ async fn execute(
         Err(msg) => return Ok(ToolResult::error(msg)),
     };
 
-    let client = build_client(pin.as_ref()).map_err(|e| {
-        agent_core::error::ToolError::Message(format!("client build failed: {e}"))
-    })?;
+    let client = build_client(pin.as_ref())
+        .map_err(|e| agent_core::error::ToolError::Message(format!("client build failed: {e}")))?;
 
-    let resp = client.get(url).send().await.map_err(|e| {
-        agent_core::error::ToolError::Message(format!("request failed: {e}"))
-    })?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| agent_core::error::ToolError::Message(format!("request failed: {e}")))?;
 
     let content_type = resp
         .headers()
@@ -75,9 +74,10 @@ async fn execute(
         return Ok(ToolResult::error(format!("HTTP {status}")));
     }
 
-    let body = resp.text().await.map_err(|e| {
-        agent_core::error::ToolError::Message(format!("read body failed: {e}"))
-    })?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| agent_core::error::ToolError::Message(format!("read body failed: {e}")))?;
 
     let text = if content_type.contains("html") {
         html_to_text(&body)

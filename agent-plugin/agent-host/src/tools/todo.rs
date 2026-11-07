@@ -8,9 +8,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use agent_core::{
-    ContentBlock, RiskLevel, ToolCallCtx, ToolDefinition, ToolError, ToolResult,
-};
+use agent_core::{ContentBlock, RiskLevel, ToolCallCtx, ToolDefinition, ToolError, ToolResult};
 
 #[derive(Default, Serialize, Deserialize, Clone)]
 struct Todo {

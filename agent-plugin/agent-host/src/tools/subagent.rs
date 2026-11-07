@@ -44,9 +44,9 @@ async fn execute(
         return Ok(ToolResult::error("aborted".to_string()));
     }
 
-    let tasks = ctx.args["tasks"].as_array().ok_or_else(|| {
-        agent_core::error::ToolError::Message("tasks array is required".into())
-    })?;
+    let tasks = ctx.args["tasks"]
+        .as_array()
+        .ok_or_else(|| agent_core::error::ToolError::Message("tasks array is required".into()))?;
 
     let mut spawns: Vec<SubagentSpawn> = tasks
         .iter()

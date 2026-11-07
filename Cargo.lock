@@ -84,6 +84,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-plugin"
+version = "0.1.0"
+dependencies = [
+ "agent-core",
+ "agent-host",
+ "plugin-proto",
+ "proc-ipc",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1167,8 +1183,7 @@ dependencies = [
 name = "flow-executor"
 version = "0.1.0"
 dependencies = [
- "agent-core",
- "agent-host",
+ "agent-plugin",
  "base64 0.22.1",
  "chrono",
  "flow-config",
@@ -1176,6 +1191,8 @@ dependencies = [
  "flow-journal",
  "futures",
  "hex",
+ "plugin-proto",
+ "proc-ipc",
  "reqwest",
  "serde",
  "serde_json",

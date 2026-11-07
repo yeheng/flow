@@ -80,9 +80,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Persist every Assistant/ToolResult as it happens (assistant hits the
     // log before any tool in it executes), then frame the turn.
     let session_id = context.session_id.clone();
-    let store = agent_core::EventStorage::new(
-        agent_core::JsonlStorage::default_root().base_dir_clone(),
-    );
+    let store =
+        agent_core::EventStorage::new(agent_core::JsonlStorage::default_root().base_dir_clone());
     let persist_store = store.clone();
     let persist_sid = session_id.clone();
     let config = agent_core::AgentLoopConfig {
@@ -96,26 +95,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stream_fn,
         hooks: None,
         retry: tunables.retry,
-        persist: Some(Arc::new(
-            move |ev: &agent_core::SessionEvent| {
-                let store = persist_store.clone();
-                let sid = persist_sid.clone();
-                let handle = tokio::runtime::Handle::current();
-                std::thread::scope(|s| {
-                    s.spawn(move || handle.block_on(store.append_event(&sid, ev)))
-                        .join()
-                        .expect("persist bridge thread panicked")
-                })
-            },
-        )),
+        persist: Some(Arc::new(move |ev: &agent_core::SessionEvent| {
+            let store = persist_store.clone();
+            let sid = persist_sid.clone();
+            let handle = tokio::runtime::Handle::current();
+            std::thread::scope(|s| {
+                s.spawn(move || handle.block_on(store.append_event(&sid, ev)))
+                    .join()
+                    .expect("persist bridge thread panicked")
+            })
+        })),
         steer: None,
         transform_context: None,
     };
     store
-        .append_event(
-            &session_id,
-            &agent_core::SessionEvent::TurnStart,
-        )
+        .append_event(&session_id, &agent_core::SessionEvent::TurnStart)
         .await?;
     store
         .append_event(

@@ -323,10 +323,7 @@ pub struct HeadlessSpec {
 }
 
 impl HeadlessSpec {
-    fn provider_config(
-        &self,
-        api_key: &str,
-    ) -> Result<agent_core::ProviderConfig, AssemblyError> {
+    fn provider_config(&self, api_key: &str) -> Result<agent_core::ProviderConfig, AssemblyError> {
         let api = match self.api.trim() {
             "" | "openai" => agent_core::ProviderApi::OpenAiCompat,
             "anthropic" => agent_core::ProviderApi::Anthropic,

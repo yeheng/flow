@@ -93,8 +93,11 @@ async fn serve(channel: Channel, token: Option<String>) -> Result<(), SessionErr
             return Err(SessionError::Protocol(error));
         }
     };
-    let params = parse_initialize_params(&request)
-        .map_err(|error| SessionError::Protocol(plugin_proto::ProtoError::InvalidMessage(error.message.clone())))?;
+    let params = parse_initialize_params(&request).map_err(|error| {
+        SessionError::Protocol(plugin_proto::ProtoError::InvalidMessage(
+            error.message.clone(),
+        ))
+    })?;
     if let Err(message) = plugin_proto::handshake::check_version(params.protocol_version) {
         // 版本不等：回 -32001（含双方主版本）再退出，不降级（wire.md §3）。
         let response = plugin_proto::jsonrpc::Response {
@@ -112,7 +115,9 @@ async fn serve(channel: Channel, token: Option<String>) -> Result<(), SessionErr
 
     // --- 会话循环：一次至多一个在飞回合（宿主按任务串行派发） ---
     while let Some(message) = read_message_opt(&mut reader).await? {
-        match classify(message).map_err(|e| SessionError::Protocol(plugin_proto::ProtoError::InvalidMessage(e.message.clone())))? {
+        match classify(message).map_err(|e| {
+            SessionError::Protocol(plugin_proto::ProtoError::InvalidMessage(e.message.clone()))
+        })? {
             Incoming::Request(request) => match request.method.as_str() {
                 RUN_TURN_METHOD => {
                     run_turn(&mut reader, &mut writer, request).await?;
@@ -138,7 +143,11 @@ async fn serve(channel: Channel, token: Option<String>) -> Result<(), SessionErr
 }
 
 /// 驱动一次 runTurn：装配 → 事件转发 → 摘要/错误响应；期间处理取消。
-async fn run_turn<R, W>(reader: &mut R, writer: &mut W, request: Request) -> Result<(), SessionError>
+async fn run_turn<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    request: Request,
+) -> Result<(), SessionError>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
@@ -192,7 +201,10 @@ where
                 jsonrpc: "2.0",
                 id,
                 result: None,
-                error: Some(app_error(ASSEMBLY_ERROR, format!("harness agent assembly failed: {error}"))),
+                error: Some(app_error(
+                    ASSEMBLY_ERROR,
+                    format!("harness agent assembly failed: {error}"),
+                )),
             };
             return write_message(writer, &Message::Response(response)).await;
         }
@@ -231,14 +243,12 @@ where
                 }
             }
             incoming = read_message_opt(reader) => {
-                if let Some(message) = incoming? {
-                    if let Message::Notification(note) = message {
-                        if note.method == CANCEL_METHOD {
-                            let target = note.params.as_ref()
-                                .and_then(|p| p.get("id")).cloned();
-                            if target == Some(serde_json::to_value(&id)?) {
-                                cancel_for_task.cancel();
-                            }
+                if let Some(Message::Notification(note)) = incoming? {
+                    if note.method == CANCEL_METHOD {
+                        let target = note.params.as_ref()
+                            .and_then(|p| p.get("id")).cloned();
+                        if target == Some(serde_json::to_value(&id)?) {
+                            cancel_for_task.cancel();
                         }
                     }
                 }
@@ -274,9 +284,7 @@ async fn read_message<S>(stream: &mut S) -> Result<Message, SessionError>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
-    read_message_opt(stream)
-        .await?
-        .ok_or(SessionError::Closed)
+    read_message_opt(stream).await?.ok_or(SessionError::Closed)
 }
 
 async fn read_message_opt<S>(stream: &mut S) -> Result<Option<Message>, SessionError>

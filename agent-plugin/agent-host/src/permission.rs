@@ -4,9 +4,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
-use agent_core::{
-    CancelSignal, HookChain, RiskLevel, ToolCallVerdict, ToolResultMessage,
-};
+use agent_core::{CancelSignal, HookChain, RiskLevel, ToolCallVerdict, ToolResultMessage};
 use parking_lot::RwLock as PlRwLock;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {

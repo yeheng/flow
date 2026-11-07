@@ -43,6 +43,11 @@ crates/
   flow-test-support  共享测试基建
   backend-e2e     v2 产品面端到端矩阵（真起进程）
   backend-perf    性能压测 harness（黑盒）
+
+agent-plugin/     独立 workspace：harness agent 运行时（agent-core /
+                 agent-host，自 flow 仓库迁出）+ flow-agent-plugin 插件
+                 服务进程。执行器 spawn 插件并经 plugin-proto 对话，
+                 不再链接 agent 运行时（见 agent-plugin/README.md）。
 ```
 
 产品二进制按职责分属各自 crate，**没有统一多路入口**：

@@ -30,10 +30,7 @@ pub struct MemoryEntry {
 
 /// Production entry: root is conga's config dir (`~/.conga`).
 pub fn append_memory(base: &str) -> String {
-    append_memory_in(
-        base,
-        &agent_core::storage::config_dir().join("memory"),
-    )
+    append_memory_in(base, &agent_core::storage::config_dir().join("memory"))
 }
 
 /// Testable core: `root` is injected (production uses the config dir).

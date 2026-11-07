@@ -17,8 +17,8 @@
 //! 裁决：成功交 Result、业务失败交失败 Result、外部结果未知交 Uncertain，
 //! 通道或进程级故障才走 Reject 回收。
 
+mod agent_plugin;
 mod agent_progress;
-pub mod agent_summary;
 pub mod audit;
 pub mod observe;
 pub mod runtime;

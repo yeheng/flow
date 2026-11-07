@@ -59,10 +59,7 @@ pub(crate) fn truncate_output(s: &str) -> String {
 /// in-context by a head preview + file path (the full output is preserved
 /// on disk at that path). Falls back to plain truncation if the disk write fails —
 /// a spill problem must never fail the tool.
-pub(crate) fn spill_or_truncate(
-    ctx: &agent_core::types::tool::ToolCallCtx,
-    s: &str,
-) -> String {
+pub(crate) fn spill_or_truncate(ctx: &agent_core::types::tool::ToolCallCtx, s: &str) -> String {
     if s.len() <= MAX_OUTPUT_BYTES {
         return s.to_string();
     }
@@ -141,11 +138,7 @@ pub(crate) fn resolve_within_cwd(cwd: &Path, requested: &str) -> Result<PathBuf,
 /// own config dir (`~/.conga` — spill files and tool state live there).
 /// Anything else absolute is rejected: the cwd sandbox stays intact.
 pub(crate) fn resolve_read_path(cwd: &Path, requested: &str) -> Result<PathBuf, String> {
-    resolve_read_path_in(
-        cwd,
-        &agent_core::storage::config_dir(),
-        requested,
-    )
+    resolve_read_path_in(cwd, &agent_core::storage::config_dir(), requested)
 }
 
 /// Testable core: `allowed_root` is injected (production uses the config dir).

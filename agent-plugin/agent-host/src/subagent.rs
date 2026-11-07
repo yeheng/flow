@@ -567,8 +567,7 @@ mod tests {
             Mode::FullAuto,
             Arc::new(|_, _| Box::pin(async { true })),
         ));
-        let hooks: Arc<dyn agent_core::HookChain> =
-            Arc::new(HookStack::new(vec![policy]));
+        let hooks: Arc<dyn agent_core::HookChain> = Arc::new(HookStack::new(vec![policy]));
         let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel::<SubagentEvent>();
         let tmp = tempfile::tempdir().unwrap();
         let spawner = test_spawner(
@@ -621,8 +620,7 @@ mod tests {
             })
         });
         let policy = Arc::new(PermissionPolicy::new(Mode::AutoEdit, approver));
-        let hooks: Arc<dyn agent_core::HookChain> =
-            Arc::new(HookStack::new(vec![policy]));
+        let hooks: Arc<dyn agent_core::HookChain> = Arc::new(HookStack::new(vec![policy]));
 
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<SubagentEvent>();
         let spawner = test_spawner(
@@ -694,9 +692,7 @@ mod tests {
             {
                 Box::pin(async move {
                     if name == "bash" {
-                        agent_core::ToolCallVerdict::Block(
-                            "no bash by extra hook".into(),
-                        )
+                        agent_core::ToolCallVerdict::Block("no bash by extra hook".into())
                     } else {
                         agent_core::ToolCallVerdict::Allow
                     }
@@ -765,8 +761,7 @@ mod tests {
             Mode::FullAuto,
             Arc::new(|_, _| Box::pin(async { true })),
         ));
-        let hooks: Arc<dyn agent_core::HookChain> =
-            Arc::new(HookStack::new(vec![policy]));
+        let hooks: Arc<dyn agent_core::HookChain> = Arc::new(HookStack::new(vec![policy]));
 
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<SubagentEvent>();
         let spawner = test_spawner(
@@ -829,8 +824,7 @@ mod tests {
             Mode::FullAuto,
             Arc::new(|_, _| Box::pin(async { true })),
         ));
-        let hooks: Arc<dyn agent_core::HookChain> =
-            Arc::new(HookStack::new(vec![policy]));
+        let hooks: Arc<dyn agent_core::HookChain> = Arc::new(HookStack::new(vec![policy]));
         let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel::<SubagentEvent>();
         // Mock replays the same chunks every turn: text + tool call → the
         // loop keeps going until max_turns (2) runs out.
@@ -875,8 +869,7 @@ mod tests {
             Mode::FullAuto,
             Arc::new(|_, _| Box::pin(async { true })),
         ));
-        let hooks: Arc<dyn agent_core::HookChain> =
-            Arc::new(HookStack::new(vec![policy]));
+        let hooks: Arc<dyn agent_core::HookChain> = Arc::new(HookStack::new(vec![policy]));
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<SubagentEvent>();
         let spawner = test_spawner(
             Arc::new(MockStream(vec![
@@ -921,8 +914,7 @@ mod tests {
             Mode::FullAuto,
             Arc::new(|_, _| Box::pin(async { true })),
         ));
-        let hooks: Arc<dyn agent_core::HookChain> =
-            Arc::new(HookStack::new(vec![policy]));
+        let hooks: Arc<dyn agent_core::HookChain> = Arc::new(HookStack::new(vec![policy]));
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<SubagentEvent>();
         let spawner = test_spawner(
             Arc::new(MockStream(vec![
@@ -965,8 +957,7 @@ mod tests {
             Mode::FullAuto,
             Arc::new(|_, _| Box::pin(async { true })),
         ));
-        let hooks: Arc<dyn agent_core::HookChain> =
-            Arc::new(HookStack::new(vec![policy]));
+        let hooks: Arc<dyn agent_core::HookChain> = Arc::new(HookStack::new(vec![policy]));
         // The stream parks on a oneshot; if the sub-agent task survives the
         // spawn-future drop, the sender below stays alive and this test hangs
         // (it fails via the assertion instead).
@@ -974,12 +965,7 @@ mod tests {
         let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel::<SubagentEvent>();
         let stream: Arc<dyn StreamFn> =
             Arc::new(BlockingStream(parking_lot::Mutex::new(Some(block_rx))));
-        let spawner = test_spawner(
-            stream,
-            hooks,
-            ev_tx,
-            agent_core::CancelSignal::new(),
-        );
+        let spawner = test_spawner(stream, hooks, ev_tx, agent_core::CancelSignal::new());
 
         // `spawn()` already returns `Pin<Box<dyn Future>>` — no tokio::pin!
         // (it would shadow the variable, making `drop(fut)` drop only the

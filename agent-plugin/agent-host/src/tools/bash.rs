@@ -28,15 +28,13 @@ pub fn tool() -> ToolDefinition {
     }
 }
 
-async fn execute(
-    ctx: ToolCallCtx,
-) -> Result<ToolResult, agent_core::error::ToolError> {
+async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, agent_core::error::ToolError> {
     if ctx.aborted() {
         return Ok(ToolResult::error("aborted".to_string()));
     }
-    let command = ctx.args["command"].as_str().ok_or_else(|| {
-        agent_core::error::ToolError::Message("command is required".into())
-    })?;
+    let command = ctx.args["command"]
+        .as_str()
+        .ok_or_else(|| agent_core::error::ToolError::Message("command is required".into()))?;
     let timeout = ctx.args["timeout"].as_u64().unwrap_or(DEFAULT_TIMEOUT_SECS);
     let run_in_background = ctx.args["run_in_background"].as_bool().unwrap_or(false);
 

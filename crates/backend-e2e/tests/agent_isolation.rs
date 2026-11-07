@@ -14,6 +14,8 @@ use std::{sync::Arc, time::Duration};
 async fn start(root: &std::path::Path, provider: &MockProvider) -> (Arc<JournalBackend>, String) {
     let key = format!("ISOLATION_{}", provider.addr.port());
     std::env::set_var(format!("FLOW_SECRET_{key}"), "mock-key");
+    // 插件二进制按需构建 + 定位（独立 workspace，见 agent-plugin/）。
+    let _plugin = flow_test_support::io::agent_plugin_bin();
     let backend = JournalBackend::open(root, Default::default())
         .await
         .unwrap();
