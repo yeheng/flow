@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["llm-plugin"]
+
+# llm 节点插件（独立项目）：模型调用的出站执行进程。
+#
+# 职责边界（R4，docs/plans/2026-11-06-plugin-system.md §3/§8）：
+# - 这里只有**出站执行**：无重定向、无自动重试、限额流读、二进制帧回传；
+# - 授权（permit/指纹/journal intent）与 outcome 审计留在 runtime——
+#   插件不碰 journal、不见 master；
+# - 产物落位与构建约定同 agent-plugin（显式 CARGO_TARGET_DIR=<repo>/target，
+#   与 flow 二进制同目录，兄弟定位生效）。

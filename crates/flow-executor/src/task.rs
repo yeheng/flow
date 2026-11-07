@@ -156,6 +156,9 @@ pub struct TaskRunner {
     /// 装配阶段重建的输入面（StoredValue 形态：Ref 保身份供输出回引，
     /// Local 已物化为 Inline）。resume 重建 Prepared、fresh prepare 都用它。
     pub face: Option<InputFace>,
+    /// 插件注册表（进程启动时加载一次，不热加载）：节点类型 → 插件
+    /// 注册的路由。执行器只做路由与供给，节点语义在插件进程里。
+    pub plugins: std::sync::Arc<crate::plugin_registry::PluginRegistry>,
 }
 
 /// v2 装配产物：输入面的 StoredValue 重建（值字节全部来自 data 通道）。
@@ -694,6 +697,18 @@ impl TaskRunner {
         Ok(prepared)
     }
 
+    /// llm 插件会话错误 → TaskError：Setup（环境）按 Invalid——但授权已
+    /// 提交，许可已落 journal，环境失败同样意味着「副作用状态未知」，统一
+    /// Uncertain 是保守正确的方向。
+    fn llm_session_error(error: crate::plugin_session::PluginSessionError) -> TaskError {
+        match error {
+            crate::plugin_session::PluginSessionError::Setup(message)
+            | crate::plugin_session::PluginSessionError::Invoke(message) => {
+                TaskError::Uncertain(format!("llm plugin session failed: {message}"))
+            }
+        }
+    }
+
     /// 节点执行：与一期 `journal_driver::execute` 逐分支对齐。
     ///
     /// 每个分支只负责「算出什么」，不负责「谁来提交」：等待类节点返回
@@ -730,10 +745,13 @@ impl TaskRunner {
                 self.compute(node, kind, prepared, inputs, audit, logger)
                     .await
             }
-            kind @ (NodeType::HttpCall | NodeType::Email | NodeType::Llm) => {
+            kind @ (NodeType::HttpCall | NodeType::Email) => {
                 self.http_node(node, kind, prepared, inputs, audit, &logger)
                     .await
             }
+            // llm 节点（R4）：出站执行在 flow-llm-plugin 插件进程里；
+            // 授权（permit/指纹）、outcome 审计与输派生留在本进程。
+            NodeType::Llm => self.llm_node(node, prepared, inputs, audit, &logger).await,
             NodeType::Harness => {
                 self.harness_node(node, prepared, inputs, audit, &logger)
                     .await
@@ -1456,6 +1474,210 @@ impl TaskRunner {
     ///
     /// # Errors
     /// 见上；另含参数缺失（`Business`）与平台故障（`Uncertain`）。
+    /// llm 节点（R4 插件化）：授权与审计在本进程，出站执行在插件。
+    ///
+    /// 与原 http_node 的 Llm 分支逐条对齐的不变量：
+    /// - 请求 JSON（含 `adapter: "llm"`）是**指纹与回归 fixture 的基底**，
+    ///   形状一个字节都不能漂，否则存量 fixture 全部失配；
+    /// - T7：畸形请求（方法/URL/代理）必须在授权前失败——授权即承诺
+    ///   「副作用可能已发生」，永远发不出去的请求不进 uncertain；
+    /// - 重定向/重试禁用、限额流读、多值头合并在插件侧（llm-plugin
+    ///   自测钉住），本侧对返回字节做长度+摘要互验后才落 outcome；
+    /// - 授权后通道失败/出站失败/超限 = Uncertain（副作用状态未知）。
+    async fn llm_node(
+        &mut self,
+        _node: &Node,
+        prepared: &Prepared,
+        _inputs: &TaskInputs,
+        audit: &mut AuditStream,
+        logger: &flow_engine::NodeLogger,
+    ) -> Result<ResultOutcome, TaskError> {
+        // 恢复路径：已有 Outcome 直接派生输出，不重发请求。
+        if let Some(outcome_value) = self
+            .task
+            .previous_outcome
+            .clone()
+            .filter(|_| !self.is_regression())
+        {
+            logger.info("已有捕获的 operation outcome，不重复发起请求（恢复）");
+            let outcome: StoredValue =
+                serde_json::from_value(outcome_value).map_err(TaskError::from)?;
+            let output = self.http_output(&outcome, NodeType::Llm, audit).await?;
+            return Ok(ResultOutcome::Success {
+                output,
+                branch: None,
+            });
+        }
+        let mut budget = INPUT_BUDGET;
+        let mut params = self
+            .materialize_stored(
+                &prepared.params,
+                &TransferKey::PreparedParams.to_wire(),
+                &mut budget,
+            )
+            .await?;
+        // 原生模型节点固定 POST（请求体是供应商 JSON）。
+        params["method"] = json!("POST");
+        let method = "POST";
+        if !HTTP_METHODS.contains(&method) {
+            return Err(TaskError::Invalid("invalid HTTP method".into()));
+        }
+        let url = params["url"]
+            .as_str()
+            .ok_or_else(|| TaskError::Business("HTTP URL missing".into()))?
+            .to_owned();
+        // T7 授权前校验：URL 与代理解析失败是确定性失败。
+        reqwest::Url::parse(&url).map_err(|e| TaskError::Invalid(e.to_string()))?;
+        if let Some(proxy) = params["proxy"].as_str().filter(|s| !s.trim().is_empty()) {
+            reqwest::Proxy::all(proxy)
+                .map_err(|e| TaskError::Business(format!("invalid proxy URL: {e}")))?;
+        }
+        // 请求 JSON：授权指纹与回归 fixture 的基底（形状冻结）。
+        let request = json!({
+            "method": method,
+            "url": url,
+            "headers": params.get("headers").cloned().unwrap_or(json!({})),
+            "body": params.get("body").cloned().unwrap_or(Value::Null),
+            "proxy": params.get("proxy").cloned().unwrap_or(Value::Null),
+            "credential": params.get("credential").cloned().unwrap_or(Value::Null),
+            "adapter": "llm",
+        });
+        if self.is_regression() {
+            // 回归模式：零外部调用，只放行与录制基线逐字节一致的请求。
+            let outcome = self.fixture_outcome(&request)?;
+            let output = self.http_output(&outcome, NodeType::Llm, audit).await?;
+            return Ok(ResultOutcome::Success {
+                output,
+                branch: None,
+            });
+        }
+        // 授权：RequestOperation → OperationPermit（凭据在许可里，不进
+        // 请求指纹与审计）。插件拿到的凭据只经通道过线。
+        let credential = self.authorize_operation(request).await?;
+        // 注册表路由：llm → 插件（内置默认注册或 manifest 发现）。
+        let plugin = match self.plugins.resolve("llm") {
+            Some(plugin) => plugin.clone(),
+            None => {
+                return Err(TaskError::Business(
+                    "llm 插件未注册：执行器启动时未找到默认二进制或 manifest（见启动日志）".into(),
+                ))
+            }
+        };
+        let url_label = flow_engine::redact_url(&url);
+        logger.info(format!("→ {method} {url_label}"));
+        let started = std::time::Instant::now();
+        let timeout_ms = params["timeout_ms"]
+            .as_u64()
+            .unwrap_or(flow_engine::exec::DEFAULT_HTTP_TIMEOUT_MS)
+            .clamp(1, flow_engine::exec::HTTP_TIMEOUT_MAX_MS);
+        let invoke_params = json!({
+            "method": method,
+            "url": url,
+            "headers": params.get("headers").cloned().unwrap_or(json!({})),
+            "body": params.get("body").cloned().unwrap_or(Value::Null),
+            "proxy": params.get("proxy").cloned().unwrap_or(Value::Null),
+            "timeout_ms": timeout_ms,
+            "credential": credential,
+        });
+        let mut session = crate::plugin_session::open(&plugin, true)
+            .await
+            .map_err(Self::llm_session_error)?;
+        let outcome = crate::plugin_session::invoke(
+            &mut session,
+            &plugin.invoke_method,
+            invoke_params,
+            |_| {},
+        )
+        .await;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = session.shutdown().await;
+                return Err(Self::llm_session_error(error));
+            }
+        };
+        let _ = session.shutdown().await;
+        let result = match outcome.error {
+            None => outcome.result,
+            Some(error) => {
+                // 应用码分派：-32020/-32021/-32022 全部按 Uncertain 收口
+                //（授权已提交：许可在 journal 里，副作用状态未知即不确定）。
+                return Err(TaskError::Uncertain(format!(
+                    "llm plugin egress failed: {}",
+                    error.message
+                )));
+            }
+        }
+        .ok_or_else(|| TaskError::Uncertain("llm plugin returned empty result".into()))?;
+        // 互验：body 长度 + 摘要（插件侧契约：二进制块先行、摘要后至）。
+        let status = result["status"]
+            .as_u64()
+            .ok_or_else(|| TaskError::Uncertain("llm plugin result missing status".into()))?
+            as u16;
+        let body_bytes = result["body_bytes"].as_u64().unwrap_or(0);
+        if body_bytes != outcome.binary.len() as u64 {
+            return Err(TaskError::Uncertain(format!(
+                "llm plugin body length mismatch: declared {body_bytes}, received {}",
+                outcome.binary.len()
+            )));
+        }
+        let expected_digest = result["body_digest"].as_str().unwrap_or("");
+        let actual_digest = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&outcome.binary))
+        };
+        if expected_digest != actual_digest {
+            return Err(TaskError::Uncertain(
+                "llm plugin body digest mismatch".into(),
+            ));
+        }
+        let headers = result["headers"].clone();
+        let raw = outcome.binary;
+        // 响应元信息一行：状态码、耗时、体量；非 2xx/3xx 升级 warn。
+        let response_line = format!(
+            "← HTTP {status}（{}ms，body {}B）",
+            started.elapsed().as_millis(),
+            raw.len()
+        );
+        if status >= 400 {
+            logger.warn(response_line);
+        } else {
+            logger.info(response_line);
+        }
+        // 捕获审计：与 http_node 完全同一套（store_bytes → 本地装配器
+        // 登记 → outcome 先落账再派生输出）。
+        let raw_stored = store_bytes(audit, &self.journal_id, &raw, ValueCodec::Bytes).await?;
+        let body_ref = match &raw_stored {
+            StoredValue::Ref(reference) => serde_json::to_value(reference)?,
+            StoredValue::Inline(value) => value.clone(),
+        };
+        let body_output_id = match &raw_stored {
+            StoredValue::Ref(reference) => reference.output_id.clone(),
+            StoredValue::Inline(_) => String::new(),
+        };
+        if !body_output_id.is_empty() {
+            self.transfers.insert_ready(
+                TransferKey::OperationBody(body_output_id.clone()).to_wire(),
+                raw,
+            );
+        }
+        let outcome_value = StoredValue::inline(
+            json!({"status": status, "headers": headers, "body_raw": body_ref}),
+        )?;
+        let outcome_seq = audit.push(
+            "operation_outcome",
+            json!({"outcome": serde_json::to_value(&outcome_value)?}),
+        )?;
+        audit.await_durable(outcome_seq, &self.cancel).await?;
+        let output = self
+            .http_output(&outcome_value, NodeType::Llm, audit)
+            .await?;
+        Ok(ResultOutcome::Success {
+            output,
+            branch: None,
+        })
+    }
+
     async fn harness_node(
         &mut self,
         _node: &Node,
@@ -1811,13 +2033,33 @@ impl TaskRunner {
         //
         // 进度投影只写入有界观测通道：不记录 prompt、模型正文或工具参数
         // （隐私边界在插件侧投影时执行，详见 `agent_progress.rs`）。
+        // 节点类型路由：harness → 插件注册（内置默认或 manifest 发现，
+        // 见 plugin_registry）。注册缺失 = 环境问题，确定性失败。
+        let plugin = match self.plugins.resolve("harness") {
+            Some(plugin) => plugin.clone(),
+            None => {
+                let outcome = StoredValue::inline(json!({ "agent_error":
+                    "harness 插件未注册：执行器启动时未找到默认二进制或 manifest（见启动日志）"
+                }))?;
+                return self
+                    .commit_agent_failure(
+                        outcome,
+                        audit,
+                        "harness plugin registration missing".into(),
+                    )
+                    .await;
+            }
+        };
         let mut progress = crate::agent_progress::AgentProgress::new(logger);
         let parsed = match crate::agent_plugin::run_agent_turn(
-            config,
-            prompt,
-            api_key,
-            workdir,
-            roots,
+            crate::agent_plugin::TurnRequest {
+                plugin: &plugin,
+                config,
+                prompt,
+                api_key,
+                workdir,
+                roots,
+            },
             |event| progress.on_wire_event(event),
         )
         .await

@@ -203,6 +203,24 @@ pub struct ExecutionSnapshot {
     /// 回归必须用同一份。旧 journal 反序列化为 None（未配置时代）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<flow_dto::AgentRunConfig>,
+    /// 插件声明冻结（U1）：历史 run 的 UI 渲染自持——插件升级/卸载/
+    /// agent 机消失都不影响旧 run 的详情展示。ui 是 UiProjection 的
+    /// 序列化（结构契约见 flow-config::plugin_manifest）；旧 journal
+    /// 反序列化为 None（快照冻结之前的时代）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_plugin: Option<AgentPluginSnapshot>,
+}
+
+/// 快照冻结的插件声明元数据（id/version/UI 投影）。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AgentPluginSnapshot {
+    /// 插件 id（展示归属）。
+    pub id: String,
+    /// 插件版本（诊断展示；渲染永不回读插件目录）。
+    pub version: String,
+    /// UiProjection 的序列化（palette/params/summary_keys）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui: Option<serde_json::Value>,
 }
 impl ExecutionSnapshot {
     /// 节点在快照路径下的唯一键（路径的 JSON 编码）。

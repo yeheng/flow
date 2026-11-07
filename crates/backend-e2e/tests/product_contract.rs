@@ -51,6 +51,11 @@ fn script(code: &str) -> Value {
     json!({"nodes":[{"id":"s","type":"start"},{"id":"n","type":"script","params":{"code":code}},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"n"},{"from":"n","to":"e"}]})
 }
 
+/// llm 插件二进制按需构建 + 定位（R4：llm 节点经插件出站）。
+fn ensure_llm_plugin_built() {
+    let _ = flow_test_support::io::llm_plugin_bin();
+}
+
 #[tokio::test]
 async fn conditional_merge_executes_only_selected_branch_and_preserves_legacy() {
     let dir = tempfile::tempdir().unwrap();
@@ -524,6 +529,7 @@ async fn invocation_uses_scoped_credentials_validates_contracts_and_protects_oth
 
 #[tokio::test]
 async fn native_model_and_tool_steps_are_recorded_and_regress_without_calls() {
+    ensure_llm_plugin_built();
     use std::sync::atomic::{AtomicUsize, Ordering};
     let calls = Arc::new(AtomicUsize::new(0));
     let counter = calls.clone();

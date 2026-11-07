@@ -244,7 +244,15 @@ pub async fn serve_journal_product(
         let (state, _secrets) =
             AppState::for_production(backend.clone(), config_state, &data_dir).await;
         let module = journal_v2::module_product(backend.clone(), token, Some(state))?;
-        let harness_agent = flow_backend::harness_agent_run_config(&config.harness.agent);
+        // R3：[harness.agent] 值经 manifest 三源合一（plugin_config 单一
+        // 入口）→ resolved 快照 + 插件声明元数据。解析失败 = 启动失败
+        //（配置期显式报错，不带病上岗）。
+        let harness_agent = flow_backend::plugin_config::harness_agent_plugin(
+            &config.harness.agent,
+        )
+        .map_err(|error| -> Box<dyn std::error::Error> {
+            format!("harness agent 配置非法：{error}").into()
+        })?;
         flow_backend::start_execution(&config.execution, harness_agent, &backend).await?;
         Ok::<_, Box<dyn std::error::Error>>((
             listener, bound_http, rpc_server, bound_rpc, router, module,

@@ -11,6 +11,7 @@ pub use flow_engine::{redact_value, secrets, Definition, NodeType, HTTP_METHODS}
 pub mod execution;
 pub mod journal;
 mod journal_commands;
+pub mod plugin_config;
 pub use journal_commands::ProductCommand;
 pub mod bundle;
 mod execution_snapshot;
@@ -32,34 +33,13 @@ pub use flow_store::store::Error as StorageError;
 /// 转换只在启动时发生一次：新 run 的快照由此生成，in-flight run 一律读
 /// `run.execution.agent` 里冻结的值——重启后修改配置不得改变在飞 run 的
 /// 执行身份，否则同一次运行的证据链会出现两套 agent 配置。
+#[deprecated = "R3：走 plugin_config::harness_agent_plugin（manifest 三源合一 + 快照元数据）"]
 pub fn harness_agent_run_config(
     config: &flow_config::HarnessAgentConfig,
 ) -> Option<flow_dto::AgentRunConfig> {
-    let base_url = config
-        .base_url
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())?;
-    let model = config
-        .model
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())?;
-    // api 缺省为 openai：供应商协议不在这里推断，写死默认值优于让请求
-    // 因空 api 字段在派发时才失败。
-    Some(flow_dto::AgentRunConfig {
-        base_url: base_url.to_string(),
-        model: model.to_string(),
-        api: config
-            .api
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or("openai")
-            .to_string(),
-        proxy: config.proxy.clone(),
-        max_turns: config.max_turns,
-        max_tool_calls_per_turn: config.max_tool_calls_per_turn,
-        max_tokens: config.max_tokens,
-        tool_timeout_secs: config.tool_timeout_secs,
-    })
+    crate::plugin_config::harness_agent_plugin(config)
+        .expect("harness agent 配置解析失败")
+        .map(|installed| installed.run_config)
 }
 
 /// 按配置选择执行端口（本地 IPC 子进程池或远程 agent）并启动协调循环。
@@ -72,16 +52,17 @@ pub fn harness_agent_run_config(
 /// 执行器二进制缺失、配置非法、端口监听失败或 harness agent 配置重复安装时返回错误。
 pub async fn start_execution(
     execution: &flow_config::ExecutionConfig,
-    harness_agent: Option<flow_dto::AgentRunConfig>,
+    harness_agent: Option<crate::plugin_config::InstalledAgentPlugin>,
     backend: &std::sync::Arc<crate::journal::JournalBackend>,
 ) -> Result<(), crate::journal::JournalError> {
     let invalid = |message: String| {
         crate::journal::JournalError::Journal(flow_journal::Error::Invalid(message))
     };
     // [harness.agent] 启动时安装一次：新 run 快照的唯一来源；派发时从
-    // run.execution 读冻结值。配置在重启后修改只影响新 run。
+    // run.execution 读冻结值。配置在重启后修改只影响新 run。resolved
+    // 形态直接装（typed 注入口是 e2e/dev 的兼容路径，内部同样补元数据）。
     backend
-        .install_harness_agent(harness_agent)
+        .install_harness_agent_plugin(harness_agent)
         .map_err(|message| invalid(message.to_string()))?;
     match execution.mode {
         // 进程内执行路径已全平台删除（节点执行语义只在 flow-executor）；

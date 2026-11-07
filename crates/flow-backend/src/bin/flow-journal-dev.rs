@@ -80,7 +80,16 @@ fn main() -> std::process::ExitCode {
         .enable_all()
         .build()
         .expect("journal-dev tokio runtime");
-    let harness_agent = flow_backend::harness_agent_run_config(&loaded.config.harness.agent);
+    // R3：与 flow-rpc 同一入口（manifest 三源合一）；dev 运行器对配置
+    // 错误的处置是打印退出，不静默跳过 agent。
+    let harness_agent =
+        match flow_backend::plugin_config::harness_agent_plugin(&loaded.config.harness.agent) {
+            Ok(installed) => installed,
+            Err(error) => {
+                eprintln!("harness agent 配置非法：{error}");
+                return std::process::ExitCode::from(2);
+            }
+        };
     let code = match runtime.block_on(journal_dev(
         loaded.config.execution,
         harness_agent,
@@ -106,7 +115,7 @@ fn exit_fail(err: &dyn std::fmt::Display) -> std::process::ExitCode {
 
 async fn journal_dev(
     execution: flow_config::ExecutionConfig,
-    harness_agent: Option<flow_dto::AgentRunConfig>,
+    harness_agent: Option<flow_backend::plugin_config::InstalledAgentPlugin>,
     data_dir: PathBuf,
     command: JournalDevCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {

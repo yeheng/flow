@@ -1,0 +1,32 @@
+[package]
+name = "llm-plugin"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# flow-llm-plugin：llm 节点的出站执行进程。
+#
+# 方法层契约（`llm/invoke`，见本目录 README.md）：请求带方法/URL/头/体/
+# 代理/超时/凭据，响应用二进制帧回传 body 字节 + JSON-RPC 摘要。授权与
+# 审计不在这里——runtime 先拿 permit 才会 invoke 本插件。
+
+[lib]
+name = "llm_plugin"
+path = "src/lib.rs"
+
+[[bin]]
+name = "flow-llm-plugin"
+path = "src/main.rs"
+
+[dependencies]
+proc-ipc = { path = "../../crates/proc-ipc" }
+plugin-proto = { path = "../../crates/plugin-proto" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "env-filter"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "socks"] }
+sha2 = "0.10"
+hex = "0.4"

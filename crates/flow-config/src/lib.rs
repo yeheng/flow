@@ -37,6 +37,8 @@
 //!
 //! 加载必须在**构造 tokio runtime 之前**同步完成。
 
+pub mod plugin_manifest;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 

@@ -1,0 +1,67 @@
+# harness-agent 插件 manifest（打包源头；部署时随 bin/ 一起拷入
+# <flow_home>/plugins/harness-agent/）。
+#
+# 声明纪律见 docs/plans/2026-11-06-plugin-system.md §4：
+# - runtime 用 node_types 路由派发，用 methods.invoke 调用；
+# - backend 用 [config] 做 [harness.agent] 值的三源合一解析（单一入口
+#   plugin_config::resolve_plugin_config），resolved 快照随 run 冻结；
+# - master/web 消费 ui 段（配置表单/调色板/运行视图，U 系列接线）；
+# - 协议快筛用 protocol（握手仍是权威裁决）。
+#
+# 数值边界与 flow-config HarnessAgentConfig::validate 保持一致：
+# 声明与校验两处必须同改（这里改窄 = 配置期更早拒绝；改宽 = 运行期裸奔）。
+[plugin]
+id = "harness-agent"
+name = "Harness Agent"
+version = "0.1.0"
+entry = "bin/flow-agent-plugin"
+protocol = 1
+node_types = ["harness"]
+
+[methods]
+invoke = "agent/runTurn"
+
+[[config.field]]
+key = "base_url"
+type = "text"
+required = true
+[[config.field]]
+key = "model"
+type = "text"
+required = true
+[[config.field]]
+key = "api"
+type = "enum"
+values = ["openai", "anthropic"]
+default = "openai"
+[[config.field]]
+key = "proxy"
+type = "text"
+[[config.field]]
+key = "max_turns"
+type = "number"
+min = 1
+max = 200
+[[config.field]]
+key = "max_tool_calls_per_turn"
+type = "number"
+min = 1
+max = 100
+[[config.field]]
+key = "max_tokens"
+type = "number"
+min = 1
+max = 1000000
+[[config.field]]
+key = "tool_timeout_secs"
+type = "number"
+min = 1
+max = 86400
+
+[ui]
+[ui.palette]
+category = "ai"
+icon_key = "spark"
+
+[ui.run_view]
+summary_keys = ["agent.model", "agent.stop_reason", "exit_code"]

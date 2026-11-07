@@ -302,6 +302,32 @@ fn workspace_bin_exists(name: &str) -> bool {
         .any(|profile| target.join(profile).join(name).is_file())
 }
 
+/// flow-llm-plugin（llm-plugin 独立 workspace 的 bin）：与 agent_plugin_bin
+/// 同一套自举与定位约定。
+pub fn llm_plugin_bin() -> PathBuf {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root");
+    if !workspace_bin_exists("flow-llm-plugin") {
+        let status =
+            std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+                .current_dir(root)
+                .env("CARGO_TARGET_DIR", root.join("target"))
+                .args([
+                    "build",
+                    "--manifest-path",
+                    "llm-plugin/Cargo.toml",
+                    "--bins",
+                    "--locked",
+                ])
+                .status()
+                .expect("spawn cargo for llm-plugin");
+        assert!(status.success(), "cargo build llm-plugin failed");
+    }
+    workspace_bin("flow-llm-plugin")
+}
+
 pub fn journal_server_bin() -> PathBuf {
     workspace_bin("flow-journal-server")
 }

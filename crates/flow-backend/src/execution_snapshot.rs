@@ -82,6 +82,9 @@ impl JournalBackend {
                 regression: None,
                 correlation_id: None,
                 agent: self.harness_agent_config(),
+                agent_plugin: self.harness_agent_plugin_meta().map(|(id, version, ui)| {
+                    flow_engine::journal_state::AgentPluginSnapshot { id, version, ui }
+                }),
             }),
         ))
     }

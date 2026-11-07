@@ -1,0 +1,21 @@
+[plugin]
+id = "llm"
+name = "Model Call"
+version = "0.1.0"
+entry = "bin/flow-llm-plugin"
+protocol = 1
+node_types = ["llm"]
+
+[methods]
+invoke = "llm/invoke"
+
+# llm 节点的参数是逐节点的（url/body/headers/credential/timeout），
+# 插件级配置暂无——provider 级 defaults 出现真实需求再声明 [config]。
+
+[ui]
+[ui.palette]
+category = "ai"
+icon_key = "model"
+
+[ui.run_view]
+summary_keys = ["status", "body_bytes"]

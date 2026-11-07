@@ -120,7 +120,7 @@ pub struct JournalBackend {
     /// 启动时安装的 `[harness.agent]` 运行配置：**新 run 快照的唯一来源**。
     /// 派发时从 `run.execution.agent` 读冻结值，不从这里现取——配置在进程
     /// 重启后修改只影响新 run，in-flight run 的重试/恢复身份不变。
-    harness_agent: std::sync::OnceLock<Option<flow_dto::AgentRunConfig>>,
+    harness_agent: std::sync::OnceLock<Option<crate::plugin_config::InstalledAgentPlugin>>,
 }
 
 impl JournalBackend {
@@ -133,15 +133,70 @@ impl JournalBackend {
         &self,
         config: Option<flow_dto::AgentRunConfig>,
     ) -> std::result::Result<(), &'static str> {
+        // typed 注入（e2e/dev）：补齐插件元数据——manifest 坏时降级为
+        // 无元数据（typed 值自身已过校验，快照只少冻结展示层），warn 留痕。
+        let installed = match config {
+            Some(run_config) => {
+                let meta = crate::plugin_config::harness_agent_manifest()
+                    .ok()
+                    .map(|manifest| {
+                        let ui = serde_json::to_value(manifest.ui_projection()).ok();
+                        (manifest.plugin.id, manifest.plugin.version, ui)
+                    });
+                match meta {
+                    Some((plugin_id, version, ui)) => {
+                        Some(crate::plugin_config::InstalledAgentPlugin {
+                            run_config,
+                            plugin_id,
+                            version,
+                            ui,
+                        })
+                    }
+                    None => {
+                        tracing::warn!("harness agent 插件元数据补齐失败（快照将缺 UI 投影）");
+                        Some(crate::plugin_config::InstalledAgentPlugin {
+                            run_config,
+                            plugin_id: "harness-agent".into(),
+                            version: "unknown".into(),
+                            ui: None,
+                        })
+                    }
+                }
+            }
+            None => None,
+        };
+        self.install_harness_agent_plugin(installed)
+    }
+
+    /// resolved 形态的安装口（start_execution 走这里，无二次转换）。
+    pub fn install_harness_agent_plugin(
+        &self,
+        installed: Option<crate::plugin_config::InstalledAgentPlugin>,
+    ) -> std::result::Result<(), &'static str> {
         self.harness_agent
-            .set(config)
+            .set(installed)
             .map(|_| ())
             .map_err(|_| "harness agent config installed twice; startup path must call this once")
     }
 
     /// 新 run 快照的 agent 配置来源：未安装（旧调用路径/测试）视为未启用。
     pub(crate) fn harness_agent_config(&self) -> Option<flow_dto::AgentRunConfig> {
-        self.harness_agent.get().cloned().flatten()
+        self.harness_agent
+            .get()
+            .cloned()
+            .flatten()
+            .map(|installed| installed.run_config)
+    }
+
+    /// 新 run 快照冻结的插件声明元数据（U1：历史渲染自持）。
+    pub(crate) fn harness_agent_plugin_meta(
+        &self,
+    ) -> Option<(String, String, Option<serde_json::Value>)> {
+        self.harness_agent
+            .get()
+            .cloned()
+            .flatten()
+            .map(|installed| (installed.plugin_id, installed.version, installed.ui))
     }
 
     /// 打开（或创建）数据目录上的权威库，并从已提交的当前行恢复内存状态。

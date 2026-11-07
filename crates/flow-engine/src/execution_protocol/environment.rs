@@ -33,6 +33,9 @@ pub const EXECUTOR_ENV_WHITELIST: &[&str] = &[
     "XDG_CACHE_HOME",
     // agent 插件二进制的显式定位覆盖（缺省走同目录兄弟定位）
     "FLOW_AGENT_PLUGIN_BIN",
+    "FLOW_LLM_PLUGIN_BIN",
+    // 插件 manifest 发现目录覆盖（缺省 <flow_home>/plugins）
+    "FLOW_PLUGINS_DIR",
 ];
 
 #[cfg(windows)]
@@ -49,6 +52,8 @@ pub(crate) const EXECUTOR_ENV_WHITELIST: &[&str] = &[
     "PATHEXT",
     "LANG",
     "FLOW_AGENT_PLUGIN_BIN",
+    "FLOW_LLM_PLUGIN_BIN",
+    "FLOW_PLUGINS_DIR",
 ];
 
 /// 把白名单环境应用到执行器命令。

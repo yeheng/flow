@@ -169,6 +169,11 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
     // 不再拉取新出站消息（自然背压到心跳/任务生产方）。
     let mut send_backlog =
         flow_engine::execution_protocol::transport::SendBacklog::with_capacity(4);
+    // 插件注册表：进程启动加载一次（内置默认注册 + plugins 目录发现），
+    // 不热加载——进程重启即插件重载。坏 manifest 只 warn 并禁用该插件，
+    // 不影响执行器会话。
+    let plugins = std::sync::Arc::new(crate::plugin_registry::PluginRegistry::load());
+    tracing::info!(registered = plugins.len(), "plugin registry loaded");
     loop {
         // 每轮先冲刷积压：积压未清时不再拉取新的出站消息，形成对
         // 心跳与任务生产方的自然背压。
@@ -260,7 +265,7 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
                 received = transport.recv(), if pending.is_empty() => {
                 match received {
                     Ok(message) => {
-                        if let Some(code) = handle_message(&mut current, &mut pending, message, &outbound_tx, &identity, limits_ref, config.remote_replay) {
+                        if let Some(code) = handle_message(&mut current, &mut pending, message, &outbound_tx, &identity, limits_ref, config.remote_replay, &plugins) {
                             exit_code = code;
                             break;
                         }
@@ -316,6 +321,9 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
 ///
 /// 职责边界：只做归属判定与转发，不解释业务语义（那是 task.rs 的事）。
 /// 任何无法归属到当前派发的帧一律丢弃或拒绝，绝不跨派发投递。
+/// 参数是会话循环的全部环境（与 task.rs 的 agent_run 同款处置：
+/// 会话管道函数，参数各自独立、无重组收益）。
+#[allow(clippy::too_many_arguments)]
 fn handle_message(
     current: &mut Option<CurrentTask>,
     pending: &mut std::collections::VecDeque<(mpsc::Sender<Message>, Message)>,
@@ -324,6 +332,7 @@ fn handle_message(
     identity: &SessionIdentity,
     limits: NegotiatedLimits,
     remote_replay: bool,
+    plugins: &std::sync::Arc<crate::plugin_registry::PluginRegistry>,
 ) -> Option<i32> {
     match message {
         Message::Execute {
@@ -367,6 +376,7 @@ fn handle_message(
                 remote_replay,
                 transfers: IncomingTransfers::default(),
                 last_result: None,
+                plugins: plugins.clone(),
             };
             tokio::spawn(async move {
                 let end = runner.run().await;

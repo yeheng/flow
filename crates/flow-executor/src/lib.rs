@@ -21,6 +21,8 @@ mod agent_plugin;
 mod agent_progress;
 pub mod audit;
 pub mod observe;
+pub mod plugin_registry;
+mod plugin_session;
 pub mod runtime;
 pub mod task;
 pub mod transfer;

@@ -54,6 +54,10 @@ jobs:
         run: cargo fmt --manifest-path agent-plugin/Cargo.toml -- --check
       - name: clippy (agent-plugin)
         run: CARGO_TARGET_DIR=target cargo clippy --manifest-path agent-plugin/Cargo.toml --all-targets --locked -- -D warnings
+      - name: fmt (llm-plugin)
+        run: cargo fmt --manifest-path llm-plugin/Cargo.toml --all -- --check
+      - name: clippy (llm-plugin)
+        run: CARGO_TARGET_DIR=target cargo clippy --manifest-path llm-plugin/Cargo.toml --all-targets --locked -- -D warnings
 
   # ---- 测试矩阵：x86_64 + aarch64 原生各跑一遍全量 ----
   test:
@@ -90,6 +94,8 @@ jobs:
       # 它与 flow-executor 同目录；共享 target 使兄弟定位直接生效。
       - name: build agent-plugin bin
         run: CARGO_TARGET_DIR=target cargo build --manifest-path agent-plugin/Cargo.toml --bins --locked
+      - name: build llm-plugin bin
+        run: CARGO_TARGET_DIR=target cargo build --manifest-path llm-plugin/Cargo.toml --bins --locked
       - name: test
         run: cargo test --workspace --all-targets --locked --target ${{ matrix.arch.target }}
 
