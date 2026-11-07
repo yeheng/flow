@@ -84,6 +84,27 @@ jobs:
       - name: test
         run: cargo test --workspace --all-targets --locked --target ${{ matrix.arch.target }}
 
+  # ---- 插件栈跨平台测试：proc-ipc / plugin-proto 三平台原生跑 ----
+  # 全量 test 矩阵只在 ubuntu；这两个 crate 的非 unix 路径（named pipe
+  # 回连 + 会话令牌回验 + interprocess 承载）只有在这里被真正编译与执行。
+  # python_e2e 在有 python 的 runner 上一并覆盖（无 python 自动跳过）。
+  plugin-test:
+    name: plugin crates (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: plugin-${{ matrix.os }}
+      - name: test
+        run: cargo test -p proc-ipc -p plugin-proto --all-targets --locked
+
   # ---- CLI 二进制矩阵：Linux / Windows / macOS 七个 target 全量构建 ----
   # 产物打 zip（内含版本号）+ sha256 上传 artifact，合入即可下载试用；
   # Windows 补齐桌面产品面，macOS 补齐日常开发平台。

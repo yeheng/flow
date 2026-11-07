@@ -1,0 +1,13 @@
+{
+  "name": "error_method_not_found",
+  "kind": "rpc",
+  "message": {
+    "jsonrpc": "2.0",
+    "id": 42,
+    "error": {
+      "code": -32601,
+      "message": "method not found: no_such_method"
+    }
+  },
+  "bytes_hex": "010000005e7b226a736f6e727063223a22322e30222c226964223a34322c226572726f72223a7b22636f6465223a2d33323630312c226d657373616765223a226d6574686f64206e6f7420666f756e643a206e6f5f737563685f6d6574686f64227d7d"
+}

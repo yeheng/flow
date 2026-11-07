@@ -1,0 +1,19 @@
+{
+  "migrated_version": "3.0.0",
+  "finalized": false,
+  "appliedAt": "2026-11-06T13:55:22.113Z",
+  "log": [
+    {
+      "action": "skipped:missing",
+      "from": "/Users/yeheng/workspaces/flow/.unipi/config/compactor.json"
+    },
+    {
+      "action": "skipped:missing",
+      "from": "/Users/yeheng/workspaces/flow/.unipi/fusion-preset.json"
+    },
+    {
+      "action": "skipped:missing",
+      "from": "/Users/yeheng/workspaces/flow/.unipi/config/background-tasks.json"
+    }
+  ]
+}

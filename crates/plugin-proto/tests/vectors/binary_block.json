@@ -1,0 +1,6 @@
+{
+  "name": "binary_block",
+  "kind": "binary",
+  "payload_hex": "deadbeef68656c6c6f20766563746f72",
+  "bytes_hex": "0200000010deadbeef68656c6c6f20766563746f72"
+}

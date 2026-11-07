@@ -1,0 +1,20 @@
+{
+  "name": "initialize_response_with_token",
+  "kind": "rpc",
+  "message": {
+    "jsonrpc": "2.0",
+    "id": "s-1",
+    "result": {
+      "protocol_version": 1,
+      "capabilities": [
+        "reverse_requests"
+      ],
+      "server_info": {
+        "name": "example-plugin",
+        "version": "0.3.0"
+      },
+      "session_token": "feedface-feed-face-feed-facefeedface"
+    }
+  },
+  "bytes_hex": "01000000d17b226a736f6e727063223a22322e30222c226964223a22732d31222c22726573756c74223a7b226361706162696c6974696573223a5b22726576657273655f7265717565737473225d2c2270726f746f636f6c5f76657273696f6e223a312c227365727665725f696e666f223a7b226e616d65223a226578616d706c652d706c7567696e222c2276657273696f6e223a22302e332e30227d2c2273657373696f6e5f746f6b656e223a2266656564666163652d666565642d666163652d666565642d666163656665656466616365227d7d"
+}

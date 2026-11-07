@@ -1,0 +1,17 @@
+{
+  "name": "error_version_mismatch",
+  "kind": "rpc",
+  "message": {
+    "jsonrpc": "2.0",
+    "id": "s-7",
+    "error": {
+      "code": -32001,
+      "message": "protocol major version mismatch: host=0, peer=1",
+      "data": {
+        "host_major": 0,
+        "peer_major": 1
+      }
+    }
+  },
+  "bytes_hex": "01000000977b226a736f6e727063223a22322e30222c226964223a22732d37222c226572726f72223a7b22636f6465223a2d33323030312c226d657373616765223a2270726f746f636f6c206d616a6f722076657273696f6e206d69736d617463683a20686f73743d302c20706565723d31222c2264617461223a7b22686f73745f6d616a6f72223a302c22706565725f6d616a6f72223a317d7d7d"
+}
