@@ -15,7 +15,7 @@
 //! 3. **事件只带元信息**：`agent/event` 通知的投影在插件侧完成（隐私
 //!    边界见 agent-plugin crate），本层只转发给进度投影器。
 
-use agent_plugin::{RunTurnParams, TurnOutcome, TurnSpec, WireEvent, ASSEMBLY_ERROR};
+use flow_harness_protocol::{RunTurnParams, TurnOutcome, TurnSpec, WireEvent, ASSEMBLY_ERROR};
 use plugin_proto::jsonrpc::ErrorCode;
 
 use crate::plugin_registry::RegisteredPlugin;

@@ -31,7 +31,7 @@ tokio-tungstenite = { workspace = true }
 
 # Shared test infrastructure; no production dependency on test processes.
 [dev-dependencies]
-flow-test-support = { path = "../flow-test-support" }
+flow-test-support = { path = "../flow-test/test-support" }
 uuid = { workspace = true }
 sha2 = { workspace = true }
 

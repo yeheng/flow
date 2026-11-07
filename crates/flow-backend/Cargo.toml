@@ -48,4 +48,4 @@ flow-config = { path = "../flow-config" }
 # 自依赖只为给集成测试打开 fault-injection feature 的历史使命已终结：相关
 # 用例（journal_fault_matrix）已迁往 remote-e2e，由那边的依赖链启用；
 # dispatch::fault 在本 crate 单测下由 cfg(any(test, ..)) 自带。
-flow-test-support = { path = "../flow-test-support" }
+flow-test-support = { path = "../flow-test/test-support" }

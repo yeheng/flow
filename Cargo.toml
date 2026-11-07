@@ -16,10 +16,17 @@ members = [
     "crates/flow-config",
     "crates/flow-rpc",
     "crates/flow-cli",
-    "crates/flow-test-support",
-    "crates/backend-e2e",
-    "crates/remote-e2e",
-    "crates/backend-perf",
+    # 插件（T3）：独立版本与独立进程，但共享根 workspace 与锁文件
+    "plugins/harness/protocol",
+    "plugins/harness/agent-core",
+    "plugins/harness/agent-host",
+    "plugins/harness/plugin",
+    "plugins/llm/plugin",
+    # 测试归组（T2）：基建/单机 e2e/远程 e2e/性能各自独立 package
+    "crates/flow-test/test-support",
+    "crates/flow-test/e2e",
+    "crates/flow-test/e2e-remote",
+    "crates/flow-test/performance",
 ]
 
 [workspace.package]

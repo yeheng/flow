@@ -24,7 +24,8 @@ tracing-subscriber = { workspace = true }
 futures = { workspace = true }
 # harness agent 运行时整体住在独立插件进程（agent-plugin 项目）里；
 # 这里只链接其 lib 的 wire 类型（方法层契约的唯一来源），运行时不进进程。
-agent-plugin = { path = "../../agent-plugin/agent-plugin" }
+# harness 方法层 wire 契约（DTO/错误码）：只依赖协议，不依赖 agent 实现
+flow-harness-protocol = { path = "../../plugins/harness/protocol" }
 proc-ipc = { path = "../proc-ipc" }
 plugin-proto = { path = "../plugin-proto" }
 

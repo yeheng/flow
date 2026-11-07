@@ -18,8 +18,7 @@ use flow_config::HarnessAgentConfig;
 use serde_json::{json, Value};
 
 /// 随包内置的 harness-agent manifest 副本（编译期嵌入；显式部署可覆盖）。
-const EMBEDDED_HARNESS_MANIFEST: &str =
-    include_str!("../../../agent-plugin/agent-plugin/plugin.toml");
+const EMBEDDED_HARNESS_MANIFEST: &str = include_str!("../../../plugins/harness/plugin/plugin.toml");
 
 /// 已安装插件的运行时形态：resolved 配置 + 快照冻结用的声明元数据。
 #[derive(Debug, Clone, PartialEq)]

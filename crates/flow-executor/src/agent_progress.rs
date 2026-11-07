@@ -12,8 +12,8 @@
 
 use std::time::Instant;
 
-use agent_plugin::WireEvent;
 use flow_engine::NodeLogger;
+use flow_harness_protocol::WireEvent;
 
 /// Agent 事件的实时进度投影器。
 ///

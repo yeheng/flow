@@ -1,0 +1,19 @@
+[package]
+name = "flow-harness-protocol"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# harness agent 的方法层协议契约（wire 类型与应用错误码）。
+#
+# 职责纪律（2026-11-08 crate-layout 评审 T1）：这里**只有**跨进程 DTO、
+# 方法名与错误码——宿主（flow-executor）与插件实现（flow-harness-plugin）
+# 共同依赖的唯一契约。事件投影（AgentEvent→WireEvent）、结果摘要
+# （TurnSummary→TurnOutcome）等**实现**留在插件实现包，绝不进协议包：
+# 否则宿主又会把 agent 运行时拖进编译依赖（这正是本包要切断的）。
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

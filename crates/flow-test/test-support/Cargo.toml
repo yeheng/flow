@@ -1,0 +1,23 @@
+[package]
+name = "flow-test-support"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# 测试基建 crate：只被 dev-dependencies 或测试 crate 依赖，不进产品二进制。
+#
+# 为什么不是一个 flow-* 库里的 `#[doc(hidden)] pub mod test_util`：
+# 那会让被测 crate 自己拥有测试基建，下游测试也得跟着被测 crate 的
+# feature 开关走。单独一个 crate 让依赖方向保持单向：所有测试都依赖它，
+# 它不依赖任何被测 crate。
+
+[dependencies]
+uuid = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+jsonrpsee = { workspace = true, features = ["client"] }
+flow-dto = { path = "../../flow-dto" }
+futures = { workspace = true }
+reqwest = { workspace = true }

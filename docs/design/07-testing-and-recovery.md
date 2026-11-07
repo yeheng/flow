@@ -42,8 +42,8 @@ observations 使用独立队列与磁盘限额。删除后日志永久丢失，�
 | 层 | 位置 | 覆盖 |
 | --- | --- | --- |
 | **单元** | 各 crate `#[cfg(test)]` | 折叠规则、gate 判定、模板展开、codec 预算、协议编解码、幂等去重 |
-| **e2e** | `crates/backend-e2e/tests/` | 与 `remote-e2e` 共同覆盖真实 server/executor/agent、故障注入和新版产品合同 |
-| **性能** | `crates/backend-perf/` | 黑盒压测 harness |
+| **e2e** | `crates/flow-test/e2e/tests/` | 与 `remote-e2e` 共同覆盖真实 server/executor/agent、故障注入和新版产品合同 |
+| **性能** | `crates/flow-test/performance/` | 黑盒压测 harness |
 | **故障注入** | `execution/dispatch.rs::fault` | 在「结果提交前」「取消后」等精确位置确定性切断 |
 
 **e2e 是这份设计的真正守门人**。原因：本设计的多数不变量（I6–I24）只有在
