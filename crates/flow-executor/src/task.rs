@@ -1803,7 +1803,7 @@ impl TaskRunner {
         let started = std::time::Instant::now();
         // typed 配置直入（不经 CONGA_* env）；key 走参数。装配失败（代理
         // 非法/规格空）是确定性失败 → outcome B。
-        let spec = flow_harness_agent_host::headless::HeadlessSpec {
+        let spec = agent_host::headless::HeadlessSpec {
             base_url: config.base_url.clone(),
             model: config.model.clone(),
             api: config.api.clone(),
@@ -1813,12 +1813,12 @@ impl TaskRunner {
             max_tokens: config.max_tokens.map(|v| v as usize),
             tool_timeout_secs: config.tool_timeout_secs,
         };
-        let session = match flow_harness_agent_host::headless::build_headless_with(
+        let session = match agent_host::headless::build_headless_with(
             api_key,
             &spec,
             roots,
             workdir,
-            flow_harness_agent_host::permission::Mode::FullAuto,
+            agent_host::permission::Mode::FullAuto,
         )
         .await
         {
@@ -1847,7 +1847,7 @@ impl TaskRunner {
             .run_turn(prompt, |event| progress.on_event(event))
             .await;
         // 清理宿主会话资源：不做会让下一次任务继承上个会话的状态。
-        flow_harness_agent_host::session_cleanup::cleanup_session_resources(&session_id).await;
+        agent_host::session_cleanup::cleanup_session_resources(&session_id).await;
         let summary = turn
             .map_err(|error| TaskError::Uncertain(format!("harness agent turn failed: {error}")))?;
         let parsed = crate::agent_summary::summarize(&summary);

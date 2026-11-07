@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["agent-core", "agent-host", "agent-plugin"]
+
+# 独立项目：harness agent 运行时（原 flow 仓库内的 vendored crates，见
+# 根仓库 crates/VENDOR.md 的来源说明）。本 workspace 不依赖 flow 的任何
+# crate——除 plugin-proto / proc-ipc（传输与协议层，本身零 flow 依赖，
+# 当前以 path 依赖引用；发布后切换为版本依赖）。
+#
+# 共享宿主仓库的 target 目录：flow-executor 按「同目录兄弟二进制」定位
+# 本项目的 flow-agent-plugin，e2e 与 CI 也因此不需要第二份编译产物树。

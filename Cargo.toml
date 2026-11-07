@@ -1,9 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-    # harness agent 内联运行时（裁剪自第三方 agent core/host，见 crates/VENDOR.md）
-    "crates/flow-harness-agent-core",
-    "crates/flow-harness-agent-host",
     # 传输层：进程间字节通道（跨语言边界的地基，零 flow 依赖）
     "crates/proc-ipc",
     # 对外插件协议层：显式信封 + JSON-RPC 2.0 子集（跨语言契约本体是

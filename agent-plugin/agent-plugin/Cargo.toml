@@ -1,0 +1,36 @@
+[package]
+name = "agent-plugin"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# flow-agent-plugin：harness agent 的插件服务进程。
+#
+# 边界（与根仓库 docs/protocol/wire.md 的分层一致）：
+# - proc-ipc 提供字节通道（fd=3 / 回连+令牌）；
+# - plugin-proto 提供帧与 JSON-RPC 2.0 子集（initialize 握手、$/cancelRequest）；
+# - 本 crate 在其上定义 agent/* 方法层（见 README.md）：一次 runTurn 请求
+#   + agent/event 通知流 + 摘要响应。宿主（flow-executor）不链接任何
+#   agent 运行时——运行时整体住在独立进程里。
+
+[lib]
+name = "agent_plugin"
+path = "src/lib.rs"
+
+[[bin]]
+name = "flow-agent-plugin"
+path = "src/main.rs"
+
+[dependencies]
+agent-core = { path = "../agent-core" }
+agent-host = { path = "../agent-host" }
+# 传输与协议层（零 flow 依赖；当前 path 引用，publish 后切版本依赖）
+proc-ipc = { path = "../../crates/proc-ipc" }
+plugin-proto = { path = "../../crates/plugin-proto" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "env-filter"] }
+thiserror = "2"

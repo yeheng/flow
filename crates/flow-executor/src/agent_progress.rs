@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use flow_engine::NodeLogger;
-use flow_harness_agent_core::{AgentEvent, ContentBlock, StopReason};
+use agent_core::{AgentEvent, ContentBlock, StopReason};
 
 /// Agent 事件的实时进度投影器。
 ///
@@ -187,8 +187,8 @@ mod tests {
     use super::*;
     use flow_engine::log_types::LogLevel;
     use flow_engine::LogBudget;
-    use flow_harness_agent_core::types::message::{AssistantMessage, ToolResultMessage, Usage};
-    use flow_harness_agent_core::ContentDelta;
+    use agent_core::types::message::{AssistantMessage, ToolResultMessage, Usage};
+    use agent_core::ContentDelta;
     use serde_json::json;
 
     /// 重试与失败必须可见，但事件载荷（正文/参数）绝不能进日志。

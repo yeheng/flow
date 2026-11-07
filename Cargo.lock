@@ -38,6 +38,52 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-core"
+version = "2.0.0"
+dependencies = [
+ "async-stream",
+ "dirs 6.0.0",
+ "dotenvy",
+ "futures-util",
+ "parking_lot 0.12.5",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml 0.9.12+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "agent-host"
+version = "2.0.0"
+dependencies = [
+ "agent-core",
+ "dom_query",
+ "dotenvy",
+ "futures-util",
+ "glob",
+ "http",
+ "hyper-util",
+ "ignore",
+ "parking_lot 0.13.0",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1121,12 +1167,12 @@ dependencies = [
 name = "flow-executor"
 version = "0.1.0"
 dependencies = [
+ "agent-core",
+ "agent-host",
  "base64 0.22.1",
  "chrono",
  "flow-config",
  "flow-engine",
- "flow-harness-agent-core",
- "flow-harness-agent-host",
  "flow-journal",
  "futures",
  "hex",
@@ -1139,52 +1185,6 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "flow-harness-agent-core"
-version = "2.0.0"
-dependencies = [
- "async-stream",
- "dirs 6.0.0",
- "dotenvy",
- "futures-util",
- "parking_lot 0.12.5",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "toml 0.9.12+spec-1.1.0",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "flow-harness-agent-host"
-version = "2.0.0"
-dependencies = [
- "dom_query",
- "dotenvy",
- "flow-harness-agent-core",
- "futures-util",
- "glob",
- "http",
- "hyper-util",
- "ignore",
- "parking_lot 0.13.0",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
  "uuid",
 ]
 

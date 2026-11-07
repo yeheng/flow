@@ -8,8 +8,8 @@
 //! 误判方向被刻意选成保守——把已完成判成失败可以重试，把失败判成
 //! 成功会掩盖工具副作用。
 
-use flow_harness_agent_core::{AgentMessage, ContentBlock, StopReason, TurnEndReason};
-use flow_harness_agent_host::TurnSummary;
+use agent_core::{AgentMessage, ContentBlock, StopReason, TurnEndReason};
+use agent_host::TurnSummary;
 
 /// stdout/body_raw 的最终文本上限。journal 派生按 `body_raw > 8 MiB` 拒绝，
 /// 8 MiB 文本 + 截断标记会恰好越过那条线；留出标记与余量。
@@ -135,8 +135,8 @@ fn join_text<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flow_harness_agent_core::types::message::{AssistantMessage, FunctionCall, ToolCall};
-    use flow_harness_agent_core::{AgentMessage, ContentBlock, StopReason};
+    use agent_core::types::message::{AssistantMessage, FunctionCall, ToolCall};
+    use agent_core::{AgentMessage, ContentBlock, StopReason};
 
     /// 构造一条 assistant 消息（测试用）。
     fn assistant(stop: StopReason, text: &str) -> AgentMessage {

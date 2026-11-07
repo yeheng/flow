@@ -1,0 +1,4 @@
+# 与宿主 flow workspace 共享 target 目录：flow-executor 按「同目录兄弟
+# 二进制」定位 flow-agent-plugin；e2e/CI 无需第二份产物树。
+[build]
+target-dir = "../target"
