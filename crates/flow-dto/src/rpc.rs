@@ -69,6 +69,8 @@ methods! {
         ConfigGet => "config.get",
         SecretsList => "secrets.list",
         NodetypesList => "nodetypes.list",
+        PluginsList => "plugins.list",
+        PluginsRecheck => "plugins.recheck",
     }
     write {
         WorkflowImport => "workflow.import",

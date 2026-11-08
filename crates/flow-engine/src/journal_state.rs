@@ -209,6 +209,10 @@ pub struct ExecutionSnapshot {
     /// 反序列化为 None（快照冻结之前的时代）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_plugin: Option<AgentPluginSnapshot>,
+    /// 本 run 引用的全部插件声明投影（动态节点类型的渲染自持源；
+    /// harness/llm 由 agent_plugin 承载，此处收动态类型）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugins: Vec<AgentPluginSnapshot>,
 }
 
 /// 快照冻结的插件声明元数据（id/version/UI 投影）。
@@ -1683,9 +1687,20 @@ pub fn number(v: &Value, key: &str) -> Result<u64> {
 /// # Errors
 /// 结构不符或语义校验不通过时返回错误。
 pub fn validate_definition(value: &Value) -> Result<Definition> {
+    validate_definition_with_dynamic(value, &Default::default())
+}
+
+/// 带动态（插件声明）节点类型的定义校验：backend 在写入口按已安装
+/// manifest 计算集合并传入；引擎自身不发现插件。
+pub fn validate_definition_with_dynamic(
+    value: &Value,
+    dynamic_types: &std::collections::BTreeSet<String>,
+) -> Result<Definition> {
     let definition: Definition = serde_json::from_value(value.clone())
         .map_err(|e| invalid(format!("definition 结构不符：{e}")))?;
-    definition.validate().map_err(|e| invalid(e.to_string()))?;
+    definition
+        .validate_with_dynamic(dynamic_types)
+        .map_err(|e| invalid(e.to_string()))?;
     Ok(definition)
 }
 

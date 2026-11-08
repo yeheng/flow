@@ -726,6 +726,12 @@ impl TaskRunner {
         audit: &mut AuditStream,
         logger: flow_engine::NodeLogger,
     ) -> Result<ResultOutcome, TaskError> {
+        // 插件声明的动态节点类型（不在编译枚举内）：路由进注册表命中
+        // 的插件（通用 node 契约）。未注册 = 定义引用悬空（插件下架），
+        // 确定性失败。
+        if node.kind().is_none() {
+            return self.plugin_node(node, prepared, audit, &logger).await;
+        }
         let kind = node
             .kind()
             .ok_or_else(|| TaskError::Invalid("unknown node type".into()))?;
@@ -1158,7 +1164,7 @@ impl TaskRunner {
                 .filter(|s| !s.trim().is_empty())
                 .ok_or_else(|| TaskError::Business("api_key secret reference required".into()))?
                 .to_owned();
-            let (url, body) = flow_engine::exec::email_request(&params)
+            let (url, body) = flow_internal_plugins::email_request(&params)
                 .map_err(|e| TaskError::Business(e.message))?;
             // 改写成统一形态的 HTTP 请求：邮件服务只是「一个 HTTP 端点 +
             // bearer 凭据」，复用同一条授权与 Outcome 路径。
@@ -1678,6 +1684,104 @@ impl TaskRunner {
         })
     }
 
+    /// 动态节点类型的通用插件派发：materialize 参数 → invoke（manifest 声明
+    /// 的方法）→ `{output}` 响应 → 落账输出。
+    ///
+    /// 通用契约（manifest `methods.invoke`）：
+    /// - 请求 `{params: <节点参数>}`（已模板展开物化）；
+    /// - 响应 `{output: <任意 JSON>}`（≤ 8 MiB）；分支输出不支持
+    /// - 会话/协议失败按 Uncertain（授权外副作用可能已发生）。
+    async fn plugin_node(
+        &mut self,
+        node: &Node,
+        prepared: &Prepared,
+        audit: &mut AuditStream,
+        logger: &flow_engine::NodeLogger,
+    ) -> Result<ResultOutcome, TaskError> {
+        if let Some(outcome_value) = self
+            .task
+            .previous_outcome
+            .clone()
+            .filter(|_| !self.is_regression())
+        {
+            logger.info("已有捕获的 operation outcome，不重复调用插件（恢复）");
+            let outcome: StoredValue =
+                serde_json::from_value(outcome_value).map_err(TaskError::from)?;
+            let output = match outcome {
+                StoredValue::Inline(value) => value,
+                StoredValue::Ref(_) => {
+                    return Err(TaskError::Invalid("plugin outcome must be inline".into()))
+                }
+            };
+            return Ok(ResultOutcome::Success {
+                output: StoredValue::Inline(output),
+                branch: None,
+            });
+        }
+        let plugin = match self.plugins.resolve(&node.node_type) {
+            Some(plugin) => plugin.clone(),
+            None => {
+                return Err(TaskError::Business(format!(
+                    "节点类型 {} 的插件未注册（manifest 缺失或已下架，见启动日志）",
+                    node.node_type
+                )))
+            }
+        };
+        let mut budget = INPUT_BUDGET;
+        let params = self
+            .materialize_stored(
+                &prepared.params,
+                &TransferKey::PreparedParams.to_wire(),
+                &mut budget,
+            )
+            .await?;
+        logger.info(format!("→ 插件 {}（{}）", plugin.plugin_id, node.node_type));
+        let started = std::time::Instant::now();
+        let timeout_ms = params["timeout_ms"]
+            .as_u64()
+            .unwrap_or(60_000)
+            .clamp(1, flow_engine::exec::HTTP_TIMEOUT_MAX_MS);
+        let invoke_params = json!({"params": params});
+        let mut session = crate::plugin_session::open(&plugin, false)
+            .await
+            .map_err(Self::llm_session_error)?;
+        let outcome = crate::plugin_session::invoke(
+            &mut session,
+            &plugin.invoke_method,
+            invoke_params,
+            |_| {},
+        )
+        .await;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = session.shutdown().await;
+                return Err(Self::llm_session_error(error));
+            }
+        };
+        let _ = session.shutdown().await;
+        let result = outcome
+            .result
+            .ok_or_else(|| TaskError::Uncertain("plugin invoke failed".into()))?;
+        let output_value = result["output"].clone();
+        if output_value.is_null() {
+            return Err(TaskError::Uncertain(
+                "plugin response missing `output`".into(),
+            ));
+        }
+        logger.info(format!(
+            "← 插件 {}（{}ms）",
+            plugin.plugin_id,
+            started.elapsed().as_millis()
+        ));
+        let _ = timeout_ms;
+        let output = store_value(audit, &self.journal_id, &output_value, 8 * 1024 * 1024).await?;
+        Ok(ResultOutcome::Success {
+            output,
+            branch: None,
+        })
+    }
+
     async fn harness_node(
         &mut self,
         _node: &Node,
@@ -1720,7 +1824,7 @@ impl TaskRunner {
             return self.agent_node(&params, audit, logger).await;
         }
         let (command, args, workdir, timeout_ms, prompt) =
-            flow_engine::exec::harness_request(&params)
+            flow_internal_plugins::harness_request(&params)
                 .map_err(|e| TaskError::Business(e.message))?;
         // 用户可配 timeout_ms 同样设上限：超限的等待会无限占用执行槽位
         // （本地/远程都没有对应 wall-clock 预算）。
@@ -1751,7 +1855,7 @@ impl TaskRunner {
         // ManagedChild 绑定进程组/作业：执行器崩溃或取消时后代进程不会
         // 变成孤儿继续占用机器。
         let mut child = match flow_engine::process::ManagedChild::spawn_harness(
-            &mut flow_engine::exec::harness_command(&command, &args, workdir.as_deref()),
+            &mut flow_internal_plugins::harness_command(&command, &args, workdir.as_deref()),
         ) {
             Ok(child) => child,
             Err(error) => {
@@ -1806,7 +1910,7 @@ impl TaskRunner {
         let outcome = StoredValue::inline(json!({
             "exit_code": output.status.code(),
             "body_raw": body_ref,
-            "stderr": flow_engine::exec::stderr_tail(&String::from_utf8_lossy(&output.stderr)),
+            "stderr": flow_internal_plugins::stderr_tail(&String::from_utf8_lossy(&output.stderr)),
         }))?;
         let outcome_seq = audit.push(
             "operation_outcome",
@@ -1855,14 +1959,14 @@ impl TaskRunner {
         audit: &mut AuditStream,
         logger: &flow_engine::NodeLogger,
     ) -> Result<ResultOutcome, TaskError> {
-        let agent_params =
-            flow_engine::exec::agent_params(params).map_err(|e| TaskError::Business(e.message))?;
+        let agent_params = flow_internal_plugins::agent_params(params)
+            .map_err(|e| TaskError::Business(e.message))?;
         let timeout_ms = agent_params
             .timeout_ms
             .clamp(1, flow_engine::exec::HARNESS_TIMEOUT_MAX_MS);
         // 配置缺失/畸形发生在授权之前：请求指纹必须包含冻结配置，没有它
         // 就无法授权，也就没有可落账的 operation——直接 Business。
-        let config = flow_engine::exec::frozen_agent_config(&self.task.node)
+        let config = flow_internal_plugins::frozen_agent_config(&self.task.node)
             .map_err(TaskError::Invalid)?
             .ok_or_else(|| {
                 TaskError::Business(
@@ -1871,8 +1975,8 @@ impl TaskRunner {
                         .into(),
                 )
             })?;
-        let request = flow_engine::exec::agent_request(
-            &flow_engine::exec::AgentParams {
+        let request = flow_internal_plugins::agent_request(
+            &flow_internal_plugins::AgentParams {
                 prompt: agent_params.prompt.clone(),
                 workdir: agent_params.workdir.clone(),
                 api_key: agent_params.api_key.clone(),
@@ -2174,7 +2278,7 @@ impl TaskRunner {
             ));
         }
         let stdout = self.raw_bytes(&raw).await?;
-        let output = flow_engine::exec::agent_output(
+        let output = flow_internal_plugins::agent_output(
             exit_code,
             String::from_utf8_lossy(&stdout).into_owned(),
             stderr,
@@ -2258,7 +2362,7 @@ impl TaskRunner {
             ));
         }
         let stdout = self.raw_bytes(&raw).await?;
-        let output = flow_engine::exec::harness_output(
+        let output = flow_internal_plugins::harness_output(
             exit_code,
             String::from_utf8_lossy(&stdout).into_owned(),
             stderr,
@@ -2573,7 +2677,11 @@ mod harness_capture_tests {
         timeout: Duration,
     ) -> Result<std::process::Output, TaskError> {
         let mut child = flow_engine::process::ManagedChild::spawn_harness(
-            &mut flow_engine::exec::harness_command("/bin/sh", &["-c".into(), script.into()], None),
+            &mut flow_internal_plugins::harness_command(
+                "/bin/sh",
+                &["-c".into(), script.into()],
+                None,
+            ),
         )
         .unwrap();
         let result = capture_harness(

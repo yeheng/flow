@@ -69,6 +69,17 @@ impl JournalBackend {
                 }
             }
         }
+        // 冻结投影要看得见节点类型：root.definition 可能是 Ref（值在外部
+        // 存储），直接序列化只有引用没有 nodes——用物化缓存的定义。
+        let root_materialized = self
+            .cached_definition(
+                &format!("dependency:{root_key}:{}", root.checksum),
+                &root.definition,
+            )
+            .await?;
+        let definition_plugins = crate::plugin_registry::plugins_for_definition(
+            &serde_json::to_value(&root_materialized).unwrap_or(serde_json::Value::Null),
+        );
         Ok((
             selected,
             root.definition,
@@ -85,6 +96,7 @@ impl JournalBackend {
                 agent_plugin: self.harness_agent_plugin_meta().map(|(id, version, ui)| {
                     flow_engine::journal_state::AgentPluginSnapshot { id, version, ui }
                 }),
+                plugins: definition_plugins,
             }),
         ))
     }

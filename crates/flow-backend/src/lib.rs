@@ -12,6 +12,7 @@ pub mod execution;
 pub mod journal;
 mod journal_commands;
 pub mod plugin_config;
+pub mod plugin_registry;
 pub use journal_commands::ProductCommand;
 pub mod bundle;
 mod execution_snapshot;

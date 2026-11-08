@@ -566,6 +566,34 @@ pub async fn timeline(backend: &JournalBackend, run_id: &str) -> Result<Value> {
     }).await.map_err(internal)?
 }
 
+/// run 详情附带的本 run 插件声明投影（动态类型 + harness/agent）。
+///
+/// 冻结在 ExecutionSnapshot（agent_plugin + plugins）；历史 run 的 UI
+/// 渲染自持来源，插件升级/卸载不影响。
+pub async fn run_plugin_projections(backend: &JournalBackend, run_id: &str) -> Value {
+    let Ok((_, Some(value))) = backend.store.get_execution(run_id).await else {
+        return serde_json::json!([]);
+    };
+    // run 实体里的 execution 快照键逐层探测（快照字段名随版本演进，
+    // 三个候选路径都试——存在哪个读哪个）。
+    let mut projections = Vec::new();
+    for pointer in ["/execution/agent_plugin", "/agent_plugin"] {
+        if let Some(agent) = value.pointer(pointer) {
+            if !agent.is_null() {
+                projections.push(agent.clone());
+            }
+            break;
+        }
+    }
+    for pointer in ["/execution/plugins", "/plugins"] {
+        if let Some(plugins) = value.pointer(pointer).and_then(|p| p.as_array()) {
+            projections.extend(plugins.iter().cloned());
+            break;
+        }
+    }
+    serde_json::json!(projections)
+}
+
 #[cfg(test)]
 mod budget_tests {
     use super::*;

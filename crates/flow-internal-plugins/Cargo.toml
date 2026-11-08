@@ -19,6 +19,8 @@ publish = false
 flow-engine = { path = "../flow-engine" }
 serde_json = { workspace = true }
 flow-journal = { path = "../flow-journal", default-features = false }
+flow-dto = { path = "../flow-dto" }
 rquickjs = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
 chrono = { workspace = true }
 uuid = { workspace = true }

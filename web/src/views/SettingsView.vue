@@ -13,6 +13,8 @@ import type {
   AgentCredential,
   ConfigView,
   FlowConfig,
+  PluginInfo,
+  PluginViolation,
   RemoteExecutionConfig,
   SecretInfo,
 } from "../types";
@@ -76,6 +78,28 @@ interface SectionDesc {
   /** 桌面端隐藏（内嵌服务无网络监听/存储布局固定） */
   hideOnDesktop?: boolean;
   fields: FieldDesc[];
+}
+
+const plugins = ref<PluginInfo[]>([]);
+const pluginViolations = ref<PluginViolation[] | null>(null);
+const pluginError = ref("");
+
+async function loadPlugins(): Promise<void> {
+  try {
+    plugins.value = await api.listPlugins();
+    pluginError.value = "";
+  } catch (e) {
+    pluginError.value = errText(e);
+  }
+}
+
+async function recheckPlugins(): Promise<void> {
+  try {
+    pluginViolations.value = await api.recheckPlugins();
+    toast.info("重校验完成");
+  } catch (e) {
+    toast.error(`重校验失败：${errText(e)}`);
+  }
 }
 
 const sections: SectionDesc[] = [
@@ -237,6 +261,10 @@ function onBeforeUnload(e: BeforeUnloadEvent): void {
   e.preventDefault();
   e.returnValue = "";
 }
+
+onMounted(() => {
+  void loadPlugins();
+});
 
 onMounted(() => {
   void refresh();
@@ -499,6 +527,39 @@ async function onDeleteSecret(name: string): Promise<void> {
         </template>
       </section>
     </template>
+
+    <section class="card">
+      <div class="card-head">
+        <h3>插件</h3>
+        <AppButton variant="ghost" @click="recheckPlugins">重校验发布定义</AppButton>
+      </div>
+      <div v-if="pluginError" class="empty">插件清单加载失败：{{ pluginError }}</div>
+      <div v-else-if="plugins.length === 0" class="empty">
+        暂无已部署插件（plugins 目录见运维文档）。
+      </div>
+      <table v-else class="table">
+        <thead>
+          <tr><th>插件</th><th>版本</th><th>节点类型</th><th>配置项</th></tr>
+        </thead>
+        <tbody>
+          <tr v-for="p in plugins" :key="p.id">
+            <td><code>{{ p.id }}</code></td>
+            <td>{{ p.version }}</td>
+            <td>{{ p.node_types.join(", ") }}</td>
+            <td>{{ (p.config_fields ?? []).map((f) => f.key).join(", ") || "—" }}</td>
+          </tr>
+        </tbody>
+      </table>
+      <div v-if="pluginViolations && pluginViolations.length > 0" class="empty">
+        {{ pluginViolations.length }} 处已发布定义与当前插件不符（详见运行日志）：
+        <ul>
+          <li v-for="v in pluginViolations.slice(0, 5)" :key="`${v.workflow_id}:${v.node_id}`">
+            {{ v.workflow_id }} v{{ v.version }} · {{ v.node_id }}（{{ v.node_type }}）：{{ v.reason }}
+          </li>
+        </ul>
+      </div>
+      <div v-else-if="pluginViolations" class="env-tag">全部已发布定义与当前插件一致</div>
+    </section>
 
     <section v-if="!loadError" class="card">
       <div class="card-head">

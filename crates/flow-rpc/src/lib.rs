@@ -335,10 +335,23 @@ async fn shutdown_signal() -> std::io::Result<()> {
 /// 顺序固定且响应逐字节稳定：前端按数组下标渲染表单与能力，插入新节点类型
 /// 若改变顺序会让旧前端与后端能力错位（快照测试守着这条线）。
 pub(crate) fn node_types() -> Value {
-    json!(NodeType::ALL
+    let mut types: Vec<Value> = NodeType::ALL
         .iter()
         .map(|kind| kind.descriptor().clone())
-        .collect::<Vec<Value>>())
+        .collect();
+    // 插件声明的动态节点类型附在编译类型之后：编译 12 类顺序与快照
+    // 逐字节稳定（前端按下标渲染），插件条目按 id 排序追加。
+    for plugin in flow_backend::plugin_registry::discover_plugins() {
+        for form in &plugin.manifest.ui.params_forms {
+            if flow_engine::NodeType::parse(&form.node_type).is_none() {
+                types.push(flow_backend::plugin_registry::manifest_to_node_type_desc(
+                    &plugin.manifest,
+                    form,
+                ));
+            }
+        }
+    }
+    json!(types)
 }
 
 /// cron 合法性校验（标准 5 字段，分 时 日 月 周，本地时间）。非法表达式

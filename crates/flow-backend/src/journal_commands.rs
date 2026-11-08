@@ -58,7 +58,25 @@ impl PreparedDefinition {
             // 未显式指定语义时按 v2 解释；显式传 1 仍可创建兼容版本。
             object.entry("semantics").or_insert(json!(2));
         }
-        let parsed = flow_engine::journal_state::validate_definition(&value)?;
+        // 插件声明的动态节点类型：按已部署 manifest 计算集合（引擎不发现
+        // 插件）；参数按 manifest 表单校验（类型级错误在发布期拒绝）。
+        let dynamic_types = crate::plugin_registry::dynamic_node_types();
+        let parsed =
+            flow_engine::journal_state::validate_definition_with_dynamic(&value, &dynamic_types)?;
+        if !dynamic_types.is_empty() {
+            let forms = crate::plugin_registry::dynamic_params_forms();
+            // validate_definition_with_dynamic 已反序列化过；这里直接
+            // 按最小形状遍历节点（不重复建 Definition）。
+            let nodes = value["nodes"].as_array().cloned().unwrap_or_default();
+            for node_value in nodes {
+                let node: flow_engine::Node = serde_json::from_value(node_value)
+                    .map_err(|e| flow_journal::Error::Invalid(format!("节点结构不符：{e}")))?;
+                if dynamic_types.contains(&node.node_type) {
+                    crate::plugin_registry::validate_dynamic_params(&node, &forms)
+                        .map_err(flow_journal::Error::Invalid)?;
+                }
+            }
+        }
         let bytes = flow_journal::codec::bounded_json(&value, flow_journal::MAX_LINE_BYTES)?;
         Ok(Self {
             value,

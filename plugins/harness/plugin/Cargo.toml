@@ -37,3 +37,5 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "env-filter"] }
 thiserror = "2"
+
+# 二进制名是部署契约：运行时按同目录兄弟 flow-agent-plugin 定位。

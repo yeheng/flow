@@ -640,11 +640,76 @@ async fn dispatch_call(
         Method::NodetypesList => {
             return Ok(json!({"node_types": crate::node_types()}));
         }
+        Method::PluginsList => {
+            let plugins: Vec<Value> = flow_backend::plugin_registry::discover_plugins()
+                .iter()
+                .map(flow_backend::plugin_registry::plugin_list_entry)
+                .collect();
+            return Ok(json!({"plugins": plugins}));
+        }
+        Method::PluginsRecheck => return plugins_recheck(ctx).await,
     }
     // 写命令的共同出口：回执统一在这里转成 JSON，错误统一在这里按
     // journal 错误类型分层——读面各自 return，不经过这条路径。
     .map_err(failure)?;
     serde_json::to_value(receipt).map_err(invalid)
+}
+
+/// 插件升级重校验：全部已发布工作流按**当前**已部署 manifest 重验。
+///
+/// 返回违规清单（工作流/版本/节点/原因）。发布期校验只覆盖发布时刻；
+/// 插件升级收紧闭集后，存量定义可能已非法——这个方法把漂移显式化，
+/// 不等它在凌晨三点的 run 里爆。
+async fn plugins_recheck(ctx: &Context) -> Result<Value, ErrorObjectOwned> {
+    let dynamic = flow_backend::plugin_registry::dynamic_node_types();
+    let forms = flow_backend::plugin_registry::dynamic_params_forms();
+    let b = &ctx.backend;
+    let workflows = flow_backend::journal_views::list_workflows(b)
+        .await
+        .map_err(view_failure)?;
+    let mut violations: Vec<Value> = Vec::new();
+    for summary in workflows {
+        let workflow_id = summary.workflow_id.clone();
+        let latest = summary.latest_version;
+        for version in 1..=latest {
+            let Ok(version_value) =
+                flow_backend::journal_views::get_version(b, &workflow_id, Some(version)).await
+            else {
+                continue;
+            };
+            let nodes = version_value.definition["nodes"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            for node_value in nodes {
+                let Ok(node) = serde_json::from_value::<flow_engine::Node>(node_value) else {
+                    continue;
+                };
+                if dynamic.contains(&node.node_type) {
+                    if let Err(reason) =
+                        flow_backend::plugin_registry::validate_dynamic_params(&node, &forms)
+                    {
+                        violations.push(json!({
+                            "workflow_id": workflow_id,
+                            "version": version,
+                            "node_id": node.id,
+                            "node_type": node.node_type,
+                            "reason": reason,
+                        }));
+                    }
+                } else if flow_engine::NodeType::parse(&node.node_type).is_none() {
+                    violations.push(json!({
+                        "workflow_id": workflow_id,
+                        "version": version,
+                        "node_id": node.id,
+                        "node_type": node.node_type,
+                        "reason": "节点类型的插件已不存在（manifest 下架）",
+                    }));
+                }
+            }
+        }
+    }
+    Ok(json!({"violations": violations}))
 }
 
 /// 观测分页：run 存在性以 projection 为准；store 未启用时返回空页 + 丢失
@@ -846,7 +911,8 @@ async fn run_get_view(b: &JournalBackend, p: &Value) -> Result<Value, ErrorObjec
         .await
         .map_err(view_failure)?;
     let live = flow_backend::journal_views::is_live(b, run_id).await;
-    Ok(json!({"run": run, "live": live}))
+    let plugin_projections = flow_backend::journal_views::run_plugin_projections(b, run_id).await;
+    Ok(json!({"run": run, "live": live, "plugin_projections": plugin_projections}))
 }
 
 /// 产品面：run 清单（status/source 过滤 + 分页）。

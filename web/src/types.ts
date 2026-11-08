@@ -79,6 +79,28 @@ export interface NodeTypeDesc {
   retry_scope?: "declared_repeatable_only" | string;
 }
 
+/** plugins.list 条目：已部署插件的 manifest 投影 */
+export interface PluginInfo {
+  id: string;
+  name: string;
+  version: string;
+  node_types: string[];
+  invoke: string;
+  protocol: number;
+  config_fields?: { key: string; type: string; required?: boolean; default?: unknown }[];
+  ui?: Record<string, unknown>;
+  source: string;
+}
+
+/** plugins.recheck 违规项 */
+export interface PluginViolation {
+  workflow_id: string;
+  version: number;
+  node_id: string;
+  node_type: string;
+  reason: string;
+}
+
 export interface WorkflowSummary {
   workflow_id: string;
   name: string;

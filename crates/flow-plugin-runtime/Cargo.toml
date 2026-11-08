@@ -36,3 +36,9 @@ flow-internal-plugins = { path = "../flow-internal-plugins" }
 [lib]
 name = "flow_plugin_runtime"
 path = "src/lib.rs"
+
+# 二进制名是部署契约（评审红线）：包已改名 flow-plugin-runtime，
+# 但 master 的定位器、CI、打包脚本都钉在 flow-executor 上。
+[[bin]]
+name = "flow-executor"
+path = "src/main.rs"

@@ -21,6 +21,8 @@ import type {
   RunRecord,
   RunStats,
   Schedule,
+  PluginInfo,
+  PluginViolation,
   SecretInfo,
   Timeline,
   VersionMeta,
@@ -33,6 +35,18 @@ import type {
 export async function listNodeTypes(): Promise<NodeTypeDesc[]> {
   const r = await client.call<{ node_types: NodeTypeDesc[] }>("nodetypes.list", {});
   return r.node_types;
+}
+
+/** plugins.list：已部署插件（manifest 发现；id/版本/节点类型/配置面/投影） */
+export async function listPlugins(): Promise<PluginInfo[]> {
+  const r = await client.call<{ plugins: PluginInfo[] }>("plugins.list", {});
+  return r.plugins;
+}
+
+/** plugins.recheck：插件升级后按当前 manifest 重校验全部已发布定义 */
+export async function recheckPlugins(): Promise<PluginViolation[]> {
+  const r = await client.call<{ violations: PluginViolation[] }>("plugins.recheck", {});
+  return r.violations;
 }
 
 /** secrets.list 返回 {name, source} 清单（值不出服务端；source=stored|env） */

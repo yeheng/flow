@@ -1166,10 +1166,12 @@ name = "flow-internal-plugins"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "flow-dto",
  "flow-engine",
  "flow-journal",
  "rquickjs",
  "serde_json",
+ "tokio",
  "uuid",
 ]
 

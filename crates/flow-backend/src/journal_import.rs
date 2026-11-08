@@ -196,7 +196,10 @@ async fn baseline(b: &JournalBackend, key: &str, data: Value) -> Result<()> {
                 .as_str()
                 .ok_or("legacy definition must be JSON text")?,
         )?;
-        flow_engine::journal_state::validate_definition(&definition)?;
+        flow_engine::journal_state::validate_definition_with_dynamic(
+            &definition,
+            &crate::plugin_registry::dynamic_node_types(),
+        )?;
         let prepared = b
             .journal
             .prepare_json(definition, flow_journal::MAX_LINE_BYTES)
