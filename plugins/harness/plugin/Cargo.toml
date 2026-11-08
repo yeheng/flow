@@ -1,5 +1,5 @@
 [package]
-name = "agent-plugin"
+name = "flow-harness-plugin"
 version = "0.1.0"
 edition = "2021"
 publish = false
@@ -14,7 +14,7 @@ publish = false
 #   agent 运行时——运行时整体住在独立进程里。
 
 [lib]
-name = "agent_plugin"
+name = "flow_harness_plugin"
 path = "src/lib.rs"
 
 [[bin]]
@@ -22,13 +22,14 @@ name = "flow-agent-plugin"
 path = "src/main.rs"
 
 [dependencies]
+flow-plugin-sdk = { path = "../../../crates/flow-plugin-sdk" }
 agent-core = { path = "../agent-core" }
 agent-host = { path = "../agent-host" }
 # 方法层 wire 契约（DTO/错误码单一来源；投影与摘要在本包）
 flow-harness-protocol = { path = "../protocol" }
 # 传输与协议层（零 flow 依赖；当前 path 引用，publish 后切版本依赖）
-proc-ipc = { path = "../../../crates/proc-ipc" }
-plugin-proto = { path = "../../../crates/plugin-proto" }
+
+
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net"] }
 serde = { version = "1", features = ["derive"] }

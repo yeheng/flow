@@ -24,7 +24,17 @@ fn main() {
     println!("cargo:rustc-env=FLOW_COMPATIBILITY_ID={compatibility}");
     let root = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("../..");
     let mut paths = Vec::new();
-    for dir in ["crates/flow-engine/src", "crates/flow-executor/src"] {
+    // 溯源哈希覆盖（T5/T7）：引擎共享契约、插件运行时（原 executor）、
+    // 内置实现库、插件 SDK 协议与 harness 方法协议——这些源码共同决定
+    // 执行行为身份。纯目录搬迁不改 RUNTIME_ID 的兼容版本（上方 version
+    // 常量），但任何实现的修改都必须改变 BUILD_ID。
+    for dir in [
+        "crates/flow-engine/src",
+        "crates/flow-plugin-runtime/src",
+        "crates/flow-internal-plugins/src",
+        "crates/flow-plugin-sdk/src",
+        "plugins/harness/protocol/src",
+    ] {
         println!("cargo:rerun-if-changed={}", root.join(dir).display());
         files(&root.join(dir), &mut paths);
     }
@@ -32,8 +42,11 @@ fn main() {
         "Cargo.lock",
         "Cargo.toml",
         "crates/flow-engine/Cargo.toml",
-        "crates/flow-executor/Cargo.toml",
+        "crates/flow-plugin-runtime/Cargo.toml",
         "crates/flow-engine/build.rs",
+        // 插件 manifest：声明即行为（路由键/方法名/协议快筛）
+        "plugins/harness/plugin/plugin.toml",
+        "plugins/llm/plugin/plugin.toml",
     ] {
         paths.push(root.join(name));
     }

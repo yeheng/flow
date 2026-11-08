@@ -4,7 +4,7 @@
 //! - `tests/*`：用例。真 master + agent + executor 链路（部分用例以 in-process
 //!   模拟 agent 注入身份/剪断上联，二进制进程用 `flow-test-support` 的
 //!   workspace_bin 定位）；
-//! - wire 级客户端助手与 backend-e2e 共用一份（`backend_e2e::common::wire`），
+//! - wire 级客户端助手与 backend-e2e 共用一份（`flow_e2e::common::wire`），
 //!   单机/分布式两套讲同一套 v2 协议（e2e-review.md E06 的契约一致要求）。
 //!
 //! 运行：`cargo test -p remote-e2e`（测试本地 master、agent 与 executor 链路）。

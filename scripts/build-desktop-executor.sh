@@ -19,6 +19,6 @@ case "$TARGET" in
     ;;
 esac
 cd "$ROOT"
-cargo build --release -p flow-executor --target "$TARGET"
+cargo build --release -p flow-plugin-runtime --target "$TARGET"
 cp "target/$TARGET/release/flow-executor" "$OUT"
 echo "externalBin ready: $OUT"

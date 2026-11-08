@@ -309,8 +309,9 @@ async fn matrix_disconnect_before_result_committed_no_duplicate_side_effect() {
     flow_backend::execution::dispatch::fault::clear();
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "flow_backend=debug,flow_agent=info,flow_executor=info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "flow_backend=debug,flow_agent=info,flow_plugin_runtime=info".into()
+            }),
         )
         .try_init();
     let root = temp();

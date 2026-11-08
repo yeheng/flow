@@ -2,7 +2,7 @@
 //!
 //! 契约来源：DESIGN.md §8.2（定义模型与校验）、§3.6（存储约束）、§11.1（RPC 方法表）。
 
-use backend_e2e::e2e_test;
+use flow_e2e::e2e_test;
 use flow_test_support::fixtures::linear_def;
 use flow_test_support::{
     call, call_err, call_json, publish_workflow, start_run, wait_run_terminal, Ctx, SHORT, TIMEOUT,

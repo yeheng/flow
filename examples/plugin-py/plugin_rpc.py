@@ -5,7 +5,7 @@
 「又一个 SDK」，而是**对规范本身的检验**：规范里任何含糊的地方，都会
 在第二种语言实现它的那一刻暴露出来。
 
-只用标准库。契约的 ground truth 是 crates/plugin-proto/tests/vectors/，
+只用标准库。契约的 ground truth 是 crates/flow-plugin-sdk（protocol 模块）/tests/vectors/，
 test_vectors.py 对它逐字节校验。
 
 用法（作为插件被 proc-ipc 宿主拉起）：

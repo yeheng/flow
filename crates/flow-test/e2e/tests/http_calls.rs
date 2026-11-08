@@ -5,7 +5,7 @@
 //! （v1 引擎的自动重试语义用例已随 flow-server 退役：v2 里外部操作失败
 //! 一律 uncertain 等人工裁决，见 crash_recovery 的裁决用例。）
 
-use backend_e2e::e2e_test;
+use flow_e2e::e2e_test;
 use flow_test_support::fixtures::{http_def, http_def_full, timeline_node, StubHttp};
 use flow_test_support::{
     call_err, call_json, publish_workflow, start_run, wait_run_status, wait_run_terminal, Conn,

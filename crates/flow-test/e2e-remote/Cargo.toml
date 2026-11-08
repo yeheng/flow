@@ -11,7 +11,7 @@
 #
 # 运行：cargo test -p remote-e2e
 [package]
-name = "remote-e2e"
+name = "flow-remote-e2e"
 version.workspace = true
 edition.workspace = true
 publish = false

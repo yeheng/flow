@@ -3,7 +3,7 @@
 //! `-32001` unauthorized / `-32011` not found / `-32012` conflict /
 //! `-32602` invalid params / `-32603` internal）。
 
-use backend_e2e::e2e_test;
+use flow_e2e::e2e_test;
 use flow_test_support::fixtures::linear_def;
 use flow_test_support::{call, call_err, call_json, publish_workflow, start_run, Ctx, TIMEOUT};
 use serde_json::{json, Value};

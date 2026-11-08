@@ -2,7 +2,7 @@
 """对 golden vectors 的逐字节校验（跨语言用法示范，wire.md §7）。
 
 用法：
-    python3 test_vectors.py            # 默认指向 crates/plugin-proto/tests/vectors
+    python3 test_vectors.py            # 默认指向 crates/flow-plugin-sdk（protocol 模块）/tests/vectors
     python3 test_vectors.py <目录>
 
 对每条向量断言：
@@ -33,7 +33,7 @@ from plugin_rpc import (  # noqa: E402
 DEFAULT_DIR = (
     pathlib.Path(__file__).resolve().parents[2]
     / "crates"
-    / "plugin-proto"
+    / "flow-plugin-sdk"
     / "tests"
     / "vectors"
 )

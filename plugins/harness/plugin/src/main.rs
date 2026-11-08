@@ -7,16 +7,16 @@
 //! 进程生命周期归宿主（flow-executor）管：宿主杀进程组即整体回收，
 //! 本进程不装信号处理、不自行 daemon 化。
 
-use agent_plugin::{
+use flow_harness_plugin::{
     app_error, classify, initialize_result, project_event, summarize, EventClocks, Incoming,
 };
 use flow_harness_protocol::{
     RunTurnParams, ASSEMBLY_ERROR, EVENT_METHOD, RUN_TURN_METHOD, TURN_ERROR,
 };
-use plugin_proto::envelope::{read_frame, write_frame, Frame, FrameKind};
-use plugin_proto::handshake::{parse_initialize_params, INITIALIZE_METHOD};
-use plugin_proto::jsonrpc::{Message, Notification, Request};
-use proc_ipc::Channel;
+use flow_plugin_sdk::ipc::Channel;
+use flow_plugin_sdk::protocol::envelope::{read_frame, write_frame, Frame, FrameKind};
+use flow_plugin_sdk::protocol::handshake::{parse_initialize_params, INITIALIZE_METHOD};
+use flow_plugin_sdk::protocol::jsonrpc::{Message, Notification, Request};
 
 const CANCEL_METHOD: &str = "$/cancelRequest";
 
@@ -38,7 +38,7 @@ fn main() {
 
 /// 按环境变量接管通道并进入服务循环。
 async fn serve_from_env() -> i32 {
-    let token = proc_ipc::env::token_from_env();
+    let token = flow_plugin_sdk::ipc::env::token_from_env();
     let channel = match channel_from_env().await {
         Ok(channel) => channel,
         Err(error) => {
@@ -60,11 +60,11 @@ async fn serve_from_env() -> i32 {
 async fn channel_from_env() -> std::io::Result<Channel> {
     #[cfg(unix)]
     {
-        proc_ipc::channel::from_env()
+        flow_plugin_sdk::ipc::channel::from_env()
     }
     #[cfg(not(unix))]
     {
-        proc_ipc::channel::from_env().await
+        flow_plugin_sdk::ipc::channel::from_env().await
     }
 }
 
@@ -76,7 +76,7 @@ enum SessionError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("protocol: {0}")]
-    Protocol(#[from] plugin_proto::ProtoError),
+    Protocol(#[from] flow_plugin_sdk::protocol::ProtoError),
     #[error("serde: {0}")]
     Serde(#[from] serde_json::Error),
 }
@@ -89,20 +89,22 @@ async fn serve(channel: Channel, token: Option<String>) -> Result<(), SessionErr
     let request = match first {
         Message::Request(request) if request.method == INITIALIZE_METHOD => request,
         other => {
-            let error = plugin_proto::ProtoError::InvalidMessage(format!(
+            let error = flow_plugin_sdk::protocol::ProtoError::InvalidMessage(format!(
                 "first message must be initialize, got {other:?}"
             ));
             return Err(SessionError::Protocol(error));
         }
     };
     let params = parse_initialize_params(&request).map_err(|error| {
-        SessionError::Protocol(plugin_proto::ProtoError::InvalidMessage(
+        SessionError::Protocol(flow_plugin_sdk::protocol::ProtoError::InvalidMessage(
             error.message.clone(),
         ))
     })?;
-    if let Err(message) = plugin_proto::handshake::check_version(params.protocol_version) {
+    if let Err(message) =
+        flow_plugin_sdk::protocol::handshake::check_version(params.protocol_version)
+    {
         // 版本不等：回 -32001（含双方主版本）再退出，不降级（wire.md §3）。
-        let response = plugin_proto::jsonrpc::Response {
+        let response = flow_plugin_sdk::protocol::jsonrpc::Response {
             jsonrpc: "2.0",
             id: request.id,
             result: None,
@@ -112,25 +114,27 @@ async fn serve(channel: Channel, token: Option<String>) -> Result<(), SessionErr
         return Err(SessionError::Closed);
     }
     let result = initialize_result(token);
-    let response = plugin_proto::handshake::initialize_response(request.id, &result);
+    let response = flow_plugin_sdk::protocol::handshake::initialize_response(request.id, &result);
     write_message(&mut writer, &Message::Response(response)).await?;
 
     // --- 会话循环：一次至多一个在飞回合（宿主按任务串行派发） ---
     while let Some(message) = read_message_opt(&mut reader).await? {
         match classify(message).map_err(|e| {
-            SessionError::Protocol(plugin_proto::ProtoError::InvalidMessage(e.message.clone()))
+            SessionError::Protocol(flow_plugin_sdk::protocol::ProtoError::InvalidMessage(
+                e.message.clone(),
+            ))
         })? {
             Incoming::Request(request) => match request.method.as_str() {
                 RUN_TURN_METHOD => {
                     run_turn(&mut reader, &mut writer, request).await?;
                 }
                 _ => {
-                    let response = plugin_proto::jsonrpc::Response {
+                    let response = flow_plugin_sdk::protocol::jsonrpc::Response {
                         jsonrpc: "2.0",
                         id: request.id,
                         result: None,
-                        error: Some(plugin_proto::jsonrpc::Error::new(
-                            plugin_proto::jsonrpc::ErrorCode::MethodNotFound,
+                        error: Some(flow_plugin_sdk::protocol::jsonrpc::Error::new(
+                            flow_plugin_sdk::protocol::jsonrpc::ErrorCode::MethodNotFound,
                             format!("method not found: {}", request.method),
                         )),
                     };
@@ -159,7 +163,7 @@ where
         .params
         .and_then(|value| serde_json::from_value(value).ok())
         .ok_or_else(|| {
-            SessionError::Protocol(plugin_proto::ProtoError::InvalidMessage(
+            SessionError::Protocol(flow_plugin_sdk::protocol::ProtoError::InvalidMessage(
                 "agent/runTurn requires RunTurnParams".into(),
             ))
         })?;
@@ -177,7 +181,7 @@ where
     };
     let roots = std::path::PathBuf::from(&params.roots);
     if let Err(error) = std::fs::create_dir_all(roots.join("tmp")) {
-        let response = plugin_proto::jsonrpc::Response {
+        let response = flow_plugin_sdk::protocol::jsonrpc::Response {
             jsonrpc: "2.0",
             id,
             result: None,
@@ -199,7 +203,7 @@ where
     let session = match assembled {
         Ok(session) => session,
         Err(error) => {
-            let response = plugin_proto::jsonrpc::Response {
+            let response = flow_plugin_sdk::protocol::jsonrpc::Response {
                 jsonrpc: "2.0",
                 id,
                 result: None,
@@ -257,19 +261,19 @@ where
             }
             result = &mut turn => {
                 let response = match result {
-                    Ok(Ok(summary)) => plugin_proto::jsonrpc::Response {
+                    Ok(Ok(summary)) => flow_plugin_sdk::protocol::jsonrpc::Response {
                         jsonrpc: "2.0",
                         id,
                         result: Some(serde_json::to_value(summarize(&summary))?),
                         error: None,
                     },
-                    Ok(Err(error)) => plugin_proto::jsonrpc::Response {
+                    Ok(Err(error)) => flow_plugin_sdk::protocol::jsonrpc::Response {
                         jsonrpc: "2.0",
                         id,
                         result: None,
                         error: Some(app_error(TURN_ERROR, format!("harness agent turn failed: {error}"))),
                     },
-                    Err(join) => plugin_proto::jsonrpc::Response {
+                    Err(join) => flow_plugin_sdk::protocol::jsonrpc::Response {
                         jsonrpc: "2.0",
                         id,
                         result: None,

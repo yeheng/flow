@@ -1,0 +1,24 @@
+[package]
+name = "flow-plugin-sdk"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# 插件 SDK（T7：原 proc-ipc 与 plugin-proto 合并）。
+# protocol 与 ipc 是单向模块边界：协议不依赖传输；SDK 不含任何 flow
+# 业务实现（注册表/审计/调度都在宿主或插件实现里）。
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["process", "io-util", "net", "rt", "macros", "time"] }
+libc = { workspace = true }
+getrandom = { workspace = true }
+hex = { workspace = true }
+
+[target.'cfg(not(unix))'.dependencies]
+interprocess = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time"] }

@@ -47,7 +47,7 @@
 
 受管理 harness 在超时、取消及正常结束时回收后代进程；执行器退出时，父进程还会回收其会话内的 harness 进程组。Unix 使用执行器会话和 harness 进程组，Windows 使用启动前绑定的 Job Object。主动脱离会话/作业的 daemon、跨主进程与执行器同时强杀的系统故障，仍需部署级进程容器或服务管理器约束；这不改变未知外部结果必须裁决的合同。
 
-`harness` 节点有两种模式（`mode` 参数，缺省 `command`）。`command` 运行用户自备的外部 agent CLI。`agent` 由 executor spawn 独立插件进程 `flow-agent-plugin`（`agent-plugin/` 独立 workspace，见 `agent-plugin/VENDOR.md`）：typed 配置与 API key 经 proc-ipc 字节通道 + plugin-proto JSON-RPC 传入（key 不过环境变量/stdin），进度以元信息通知回流（隐私边界：正文/参数/prompt 不过线），插件与执行器同进程组，会话击杀连带回收。方法层契约见 `agent-plugin/README.md`。
+`harness` 节点有两种模式（`mode` 参数，缺省 `command`）。`command` 运行用户自备的外部 agent CLI。`agent` 由 executor spawn 独立插件进程 `flow-agent-plugin`（`plugins/harness/` 独立 workspace，见 `plugins/harness/VENDOR.md`）：typed 配置与 API key 经 proc-ipc 字节通道 + plugin-proto JSON-RPC 传入（key 不过环境变量/stdin），进度以元信息通知回流（隐私边界：正文/参数/prompt 不过线），插件与执行器同进程组，会话击杀连带回收。方法层契约见 `plugins/harness/README.md`。
 
 agent 从取得授权许可开始使用一个生命周期截止时间，覆盖临时目录准备、host 初始化、模型/工具回合、session 清理和 outcome 落账。取消或超时后停止等待，保留已有授权与结果证据；没有完整 outcome 的操作进入 Uncertain，不自动重放工具副作用。独立系统线程在截止时间或取消后给予 5 秒宽限（检查粒度 250ms），到期强制退出 executor，避免同步 host 代码阻塞 Tokio 时继续靠心跳占槽。
 

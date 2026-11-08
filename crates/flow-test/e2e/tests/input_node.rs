@@ -1,7 +1,7 @@
 //! 输入节点：run 输入已含声明字段（或默认值兜底）时直接放行；
 //! 否则挂起等用户填写（run.signal 交付），交付对象成为节点输出。
 
-use backend_e2e::e2e_test;
+use flow_e2e::e2e_test;
 use flow_test_support::fixtures::{input_def, timeline_node};
 use flow_test_support::{
     call, call_json, publish_workflow, start_run, wait_run_terminal, Conn, Ctx, SHORT,

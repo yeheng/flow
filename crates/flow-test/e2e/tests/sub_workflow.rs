@@ -3,7 +3,7 @@
 //!
 //! 契约来源：DESIGN.md §8.1（子工作流）。
 
-use backend_e2e::e2e_test;
+use flow_e2e::e2e_test;
 use flow_test_support::fixtures::{
     deep_chain_defs, human_def, linear_def, set_sub_wf, sub_def, timeline_node,
 };

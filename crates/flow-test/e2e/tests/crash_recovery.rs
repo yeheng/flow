@@ -5,7 +5,7 @@
 //!   （succeeded / failed / retry 三个分支）；
 //! - 已终结的 run 重启后不重复执行（事件日志不变，无第二个写者）。
 
-use backend_e2e::e2e_test;
+use flow_e2e::e2e_test;
 use flow_test_support::fixtures::{delay_def, http_def_full, linear_def, timeline_node, StubHttp};
 use flow_test_support::{
     call, call_json, publish_workflow, start_run, wait_run_status, wait_run_terminal, Conn, Ctx,

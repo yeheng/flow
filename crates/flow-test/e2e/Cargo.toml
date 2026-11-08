@@ -13,7 +13,7 @@
 # 环境变量：
 #   RUST_LOG           透传给被测服务进程（默认 info）
 [package]
-name = "backend-e2e"
+name = "flow-e2e"
 version.workspace = true
 edition.workspace = true
 publish = false

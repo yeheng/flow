@@ -102,23 +102,6 @@ pub fn singular_or_map(mut entries: Vec<(String, Value)>) -> Value {
     Value::Object(entries.into_iter().collect())
 }
 
-/// 按 JavaScript 真值语义判定一个 JSON 值。
-///
-/// 与 JS 的 `Boolean(x)` 严格对齐：空串为假、非空串（包括 `"false"`、
-/// `"0"`）为真、数组与对象恒为真、空数组也真。
-///
-/// 必须与 JS 一致：条件节点的表达式在沙箱里求值，若宿主侧判定口径不同，
-/// 同一份数据会在两处得到相反结论，且这种分歧只在边界值上出现。
-pub fn truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(b) => *b,
-        Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
-        Value::String(s) => !s.is_empty(),
-        Value::Array(_) | Value::Object(_) => true,
-    }
-}
-
 /// harness（command 模式）的进程规格：命令、参数、工作目录、超时、提示词。
 ///
 /// 用元组而非结构体：它只在「拼装 → 发起」之间传递一次，且 executor
@@ -406,37 +389,7 @@ pub fn agent_output(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expr;
     use serde_json::json;
-    use std::time::Duration;
-    /// 宿主侧真值判定必须与 JS 的 `Boolean(x)` 逐值一致，
-    /// 否则同一份数据在沙箱内外会得到相反结论。
-    #[test]
-    fn json_truthiness_matches_javascript() {
-        for value in [
-            json!(null),
-            json!(false),
-            json!(true),
-            json!(0),
-            json!(-1),
-            json!(""),
-            json!("false"),
-            json!("0"),
-            json!([]),
-            json!({}),
-            json!([0]),
-            json!({"x": false}),
-        ] {
-            let expected = expr::eval_expr(
-                "Boolean(input)",
-                &value,
-                &Value::Null,
-                Duration::from_secs(1),
-            )
-            .unwrap();
-            assert_eq!(json!(truthy(&value)), expected, "{value}");
-        }
-    }
     /// harness command 模式的参数装配：缺省值、类型强转与缺参失败。
     #[test]
     fn harness_request_builds_spawn_spec() {

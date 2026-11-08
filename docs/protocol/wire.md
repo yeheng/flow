@@ -1,7 +1,7 @@
 # 插件线协议规范（wire.md）
 
 > 状态：v1（`protocol_version = 1`）。
-> 本文档与 `crates/plugin-proto/tests/vectors/` 共同构成**对外契约本体**；
+> 本文档与 `crates/flow-plugin-sdk/tests/vectors/` 共同构成**对外契约本体**；
 > Rust crate `plugin-proto` 只是契约的一种实现，实现之间以本文档 + 向量为准。
 > 向量**只增不改**；改本文档的任何 wire 语义 = bump 主版本。
 
@@ -277,8 +277,8 @@ binary 向量额外携带 `payload_hex`（body 的 hex）。其他语言的用�
 
 | 实现 | 位置 | 说明 |
 | --- | --- | --- |
-| Rust（宿主 + 插件两侧） | `crates/plugin-proto` | 帧编解码、JSON-RPC 子集、initialize；对向量逐字节断言 |
-| Rust 传输层 | `crates/proc-ipc` | spawn + 通道交接 + fd 收敛 + 进程回收（§0 的配套约定） |
+| Rust（宿主 + 插件两侧） | `crates/flow-plugin-sdk/src/protocol` | 帧编解码、JSON-RPC 子集、initialize；对向量逐字节断言 |
+| Rust 传输层 | `crates/flow-plugin-sdk/src/ipc` | spawn + 通道交接 + fd 收敛 + 进程回收（§0 的配套约定） |
 | Python（插件侧） | `examples/plugin-py/plugin_rpc.py` | 纯标准库；「第二种语言能独立复现向量字节」是规范成立的证据 |
 
 Python 侧自检与用法：
@@ -288,7 +288,7 @@ python3 examples/plugin-py/test_vectors.py   # 向量逐字节校验
 python3 examples/plugin-py/plugin_rpc.py     # 作为插件被宿主拉起
 ```
 
-`crates/plugin-proto/tests/python_e2e.rs` 是跨语言端到端测试：Rust 宿主
+`crates/flow-plugin-sdk/src/protocol/tests/python_e2e.rs` 是跨语言端到端测试：Rust 宿主
 拉起真实 python3 插件，完成握手、请求往返、-32601、通知忽略与进程回收。
 机器上没有 python3 时该测试自动跳过（不算失败）。
 

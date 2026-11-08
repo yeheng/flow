@@ -522,7 +522,7 @@ flow-journal-bench
 
 harness agent 模式**内联在 flow-executor 内执行**（conga-host 无头装配，
 无独立 runner 二进制）：分发面与 command 模式完全一致，无需额外二进制。
-executor 依赖 conga 固定 rev（见 `crates/flow-executor/Cargo.toml`），rev
+executor 依赖 conga 固定 rev（见 `crates/flow-plugin-runtime/Cargo.toml`），rev
 变更需全量回归 agent e2e；master/executor 仍按 `RUNTIME_ID` 锁步升级。
 
 ### 配置与密钥

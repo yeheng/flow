@@ -5,7 +5,7 @@
 //! jsonrpsee 客户端流只在连接断开时结束，服务端 sink 关闭不通知客户端——
 //! 「流自然结束」在 wire 上可观测为「终态事件之后不再有任何事件」。
 
-use backend_e2e::e2e_test;
+use flow_e2e::e2e_test;
 use flow_test_support::fixtures::{delay_def, human_def, linear_def, timeline_node};
 use flow_test_support::{
     call, call_json, collect_run_events, publish_workflow, start_run, subscribe, wait_run_terminal,

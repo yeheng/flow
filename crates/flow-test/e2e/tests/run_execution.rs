@@ -3,7 +3,7 @@
 //!
 //! 契约来源：DESIGN.md §3（事件日志）、§3.3（折叠器）、§9.1-§9.2（汇合、输出、真值）。
 
-use backend_e2e::e2e_test;
+use flow_e2e::e2e_test;
 use flow_test_support::fixtures::{
     condition_def, delay_def, failing_def, join_skip_def, linear_def, multi_end_def,
     multi_pred_def, skip_chain_def, timeline_node,

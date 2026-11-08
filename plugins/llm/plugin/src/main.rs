@@ -22,10 +22,12 @@
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
-use plugin_proto::envelope::{read_frame, write_frame, Frame, FrameKind};
-use plugin_proto::handshake::{parse_initialize_params, Capability, INITIALIZE_METHOD};
-use plugin_proto::jsonrpc::{Error, ErrorCode, Id, Message, Notification, Request};
-use proc_ipc::Channel;
+use flow_plugin_sdk::ipc::Channel;
+use flow_plugin_sdk::protocol::envelope::{read_frame, write_frame, Frame, FrameKind};
+use flow_plugin_sdk::protocol::handshake::{
+    parse_initialize_params, Capability, INITIALIZE_METHOD,
+};
+use flow_plugin_sdk::protocol::jsonrpc::{Error, ErrorCode, Id, Message, Notification, Request};
 
 /// 出站失败（不确定类）。
 pub const EGRESS_ERROR: i64 = -32020;
@@ -92,7 +94,7 @@ fn main() {
 }
 
 async fn serve_from_env() -> i32 {
-    let token = proc_ipc::env::token_from_env();
+    let token = flow_plugin_sdk::ipc::env::token_from_env();
     let channel = match channel_from_env().await {
         Ok(channel) => channel,
         Err(error) => {
@@ -112,11 +114,11 @@ async fn serve_from_env() -> i32 {
 async fn channel_from_env() -> std::io::Result<Channel> {
     #[cfg(unix)]
     {
-        proc_ipc::channel::from_env()
+        flow_plugin_sdk::ipc::channel::from_env()
     }
     #[cfg(not(unix))]
     {
-        proc_ipc::channel::from_env().await
+        flow_plugin_sdk::ipc::channel::from_env().await
     }
 }
 
@@ -127,7 +129,7 @@ enum SessionError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("protocol: {0}")]
-    Protocol(#[from] plugin_proto::ProtoError),
+    Protocol(#[from] flow_plugin_sdk::protocol::ProtoError),
 }
 
 async fn serve(channel: Channel, token: Option<String>) -> Result<(), SessionError> {
@@ -139,17 +141,21 @@ async fn serve(channel: Channel, token: Option<String>) -> Result<(), SessionErr
         Message::Request(request) if request.method == INITIALIZE_METHOD => request,
         _ => {
             return Err(SessionError::Protocol(
-                plugin_proto::ProtoError::InvalidMessage("first message must be initialize".into()),
+                flow_plugin_sdk::protocol::ProtoError::InvalidMessage(
+                    "first message must be initialize".into(),
+                ),
             ))
         }
     };
     let params = parse_initialize_params(&request).map_err(|error| {
-        SessionError::Protocol(plugin_proto::ProtoError::InvalidMessage(
+        SessionError::Protocol(flow_plugin_sdk::protocol::ProtoError::InvalidMessage(
             error.message.clone(),
         ))
     })?;
-    if let Err(message) = plugin_proto::handshake::check_version(params.protocol_version) {
-        let response = plugin_proto::jsonrpc::Response {
+    if let Err(message) =
+        flow_plugin_sdk::protocol::handshake::check_version(params.protocol_version)
+    {
+        let response = flow_plugin_sdk::protocol::jsonrpc::Response {
             jsonrpc: "2.0",
             id: request.id,
             result: None,
@@ -158,13 +164,13 @@ async fn serve(channel: Channel, token: Option<String>) -> Result<(), SessionErr
         let _ = try_write(&mut writer, &Message::Response(response)).await;
         return Err(SessionError::Closed);
     }
-    let result = plugin_proto::handshake::InitializeResult {
-        protocol_version: plugin_proto::PROTOCOL_VERSION,
+    let result = flow_plugin_sdk::protocol::handshake::InitializeResult {
+        protocol_version: flow_plugin_sdk::protocol::PROTOCOL_VERSION,
         capabilities: vec![Capability::BinaryBlocks],
         server_info: serde_json::json!({"name": "flow-llm-plugin", "version": "0.1.0"}),
         session_token: token,
     };
-    let response = plugin_proto::handshake::initialize_response(request.id, &result);
+    let response = flow_plugin_sdk::protocol::handshake::initialize_response(request.id, &result);
     write_message(&mut writer, &Message::Response(response)).await?;
 
     // --- 会话循环：单请求单响应（与派发 1:1） ---
@@ -179,7 +185,7 @@ async fn serve(channel: Channel, token: Option<String>) -> Result<(), SessionErr
                 invoke_round(&mut reader, &mut writer, request).await?;
             }
             other => {
-                let response = plugin_proto::jsonrpc::Response {
+                let response = flow_plugin_sdk::protocol::jsonrpc::Response {
                     jsonrpc: "2.0",
                     id: request.id,
                     result: None,
@@ -207,7 +213,7 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let respond_error = |code: i64, message: String| {
-        let response = plugin_proto::jsonrpc::Response {
+        let response = flow_plugin_sdk::protocol::jsonrpc::Response {
             jsonrpc: "2.0",
             id: request.id.clone(),
             result: None,
@@ -362,7 +368,7 @@ where
         body_bytes: raw.len() as u64,
         body_digest: digest,
     };
-    let response = plugin_proto::jsonrpc::Response {
+    let response = flow_plugin_sdk::protocol::jsonrpc::Response {
         jsonrpc: "2.0",
         id: request.id,
         result: Some(serde_json::to_value(&result).expect("InvokeResult serializable")),

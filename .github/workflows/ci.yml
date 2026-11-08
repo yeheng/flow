@@ -105,7 +105,7 @@ jobs:
         with:
           key: plugin-${{ matrix.os }}
       - name: test
-        run: cargo test -p proc-ipc -p plugin-proto -p flow-harness-protocol -p agent-plugin -p llm-plugin --all-targets --locked
+        run: cargo test -p flow-plugin-sdk -p flow-harness-protocol -p flow-harness-plugin -p flow-llm-plugin --all-targets --locked
 
   # ---- CLI 二进制矩阵：Linux / Windows / macOS 七个 target 全量构建 ----
   # 产物打 zip（内含版本号）+ sha256 上传 artifact，合入即可下载试用；

@@ -6,12 +6,12 @@
 
 use std::time::Duration;
 
-use plugin_proto::envelope::{read_frame, write_frame, Frame, FrameKind};
-use plugin_proto::handshake::{
+use flow_plugin_sdk::ipc::SpawnConfig;
+use flow_plugin_sdk::protocol::envelope::{read_frame, write_frame, Frame, FrameKind};
+use flow_plugin_sdk::protocol::handshake::{
     initialize_request, parse_initialize_params, Capability, InitializeParams, PROTOCOL_VERSION,
 };
-use plugin_proto::jsonrpc::{ErrorCode, Id, Message, Request};
-use proc_ipc::SpawnConfig;
+use flow_plugin_sdk::protocol::jsonrpc::{ErrorCode, Id, Message, Request};
 use serde_json::json;
 
 fn plugin_bin() -> std::path::PathBuf {
@@ -42,10 +42,10 @@ async fn mock_server(response: &'static str) -> (String, tokio::task::JoinHandle
     (format!("http://{addr}/model"), handle)
 }
 
-async fn open_plugin() -> proc_ipc::Session {
+async fn open_plugin() -> flow_plugin_sdk::ipc::Session {
     let mut config = SpawnConfig::new(plugin_bin());
     config.new_session = false;
-    let mut session = proc_ipc::Session::spawn(config)
+    let mut session = flow_plugin_sdk::ipc::Session::spawn(config)
         .await
         .expect("spawn plugin");
     let params = InitializeParams {
@@ -77,7 +77,7 @@ async fn open_plugin() -> proc_ipc::Session {
     session
 }
 
-async fn write(message: Message, session: &mut proc_ipc::Session) {
+async fn write(message: Message, session: &mut flow_plugin_sdk::ipc::Session) {
     let frame = Frame {
         kind: FrameKind::Rpc,
         payload: message.to_vec().expect("encode"),
@@ -87,7 +87,7 @@ async fn write(message: Message, session: &mut proc_ipc::Session) {
         .expect("write");
 }
 
-async fn expect_rpc(session: &mut proc_ipc::Session) -> Message {
+async fn expect_rpc(session: &mut flow_plugin_sdk::ipc::Session) -> Message {
     loop {
         let frame =
             tokio::time::timeout(Duration::from_secs(10), read_frame(session.channel_mut()))
@@ -102,7 +102,10 @@ async fn expect_rpc(session: &mut proc_ipc::Session) -> Message {
 }
 
 /// 收集「响应之前的全部二进制帧」。
-async fn invoke(session: &mut proc_ipc::Session, params: serde_json::Value) -> (Message, Vec<u8>) {
+async fn invoke(
+    session: &mut flow_plugin_sdk::ipc::Session,
+    params: serde_json::Value,
+) -> (Message, Vec<u8>) {
     let request = Message::Request(Request {
         jsonrpc: "2.0",
         id: Id::Number(2),

@@ -1,0 +1,24 @@
+[package]
+name = "flow-internal-plugins"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# 内置节点实现库（T4）：静态编译进执行器的节点语义实现，不是动态插件。
+#
+# 边界纪律（2026-11-08 crate-layout 评审）：
+# - 只放纯实现（参数计算/求值/请求构造），不 import 执行器的
+#   AuditStream/master 通道/TaskError——授权、审计、Transfer、恢复编排
+#   留在执行器（flow-executor）；
+# - 允许依赖 flow-engine 的共享契约（模型/日志/错误），engine 不得反向
+#   依赖本包；
+# - JS 求值器（rquickjs）随实现迁入：engine 的 runtime feature 不再背它。
+
+[dependencies]
+# 共享契约（模型/日志/错误）在 runtime feature 面；rquickjs 已随实现迁入本包
+flow-engine = { path = "../flow-engine" }
+serde_json = { workspace = true }
+flow-journal = { path = "../flow-journal", default-features = false }
+rquickjs = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }

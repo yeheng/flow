@@ -3,7 +3,7 @@
 //! 契约来源：DESIGN.md §5.3（外部信号）。v2 里 signal 的幂等键就是命令
 //! request_id（持久 inbox 落账语义已随 pg 臂退役；journal 命令日志即权威账）。
 
-use backend_e2e::e2e_test;
+use flow_e2e::e2e_test;
 use flow_test_support::fixtures::{delay_def, human_def, linear_def, timeline_node};
 use flow_test_support::{
     call, call_err, call_json, publish_workflow, start_run, wait_run_status, wait_run_terminal,

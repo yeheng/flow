@@ -24,8 +24,8 @@ pub use flow_harness_protocol::{
 };
 
 use agent_host::TurnSummary;
-use plugin_proto::jsonrpc::{Error, ErrorCode, Id, Message};
-use plugin_proto::PROTOCOL_VERSION;
+use flow_plugin_sdk::protocol::jsonrpc::{Error, ErrorCode, Id, Message};
+use flow_plugin_sdk::protocol::PROTOCOL_VERSION;
 
 /// 把一条 `AgentEvent` 投影成 wire 事件；不适合过线的事件返回 `None`。
 ///
@@ -256,8 +256,10 @@ fn join_text<'a>(parts: impl Iterator<Item = &'a str>) -> String {
 // ---------------------------------------------------------------------------
 
 /// 构造 initialize 成功响应（含回连令牌回验，wire.md §3.5）。
-pub fn initialize_result(token: Option<String>) -> plugin_proto::handshake::InitializeResult {
-    plugin_proto::handshake::InitializeResult {
+pub fn initialize_result(
+    token: Option<String>,
+) -> flow_plugin_sdk::protocol::handshake::InitializeResult {
+    flow_plugin_sdk::protocol::handshake::InitializeResult {
         protocol_version: PROTOCOL_VERSION,
         capabilities: vec![],
         server_info: serde_json::json!({"name": "flow-agent-plugin", "version": "0.1.0"}),
@@ -272,9 +274,9 @@ pub fn app_error(code: i64, message: impl Into<String>) -> Error {
 
 /// 服务循环的读侧消息分类（供 serve 与测试复用）。
 pub enum Incoming {
-    Request(plugin_proto::jsonrpc::Request),
-    Notification(plugin_proto::jsonrpc::Notification),
-    Response(plugin_proto::jsonrpc::Response),
+    Request(flow_plugin_sdk::protocol::jsonrpc::Request),
+    Notification(flow_plugin_sdk::protocol::jsonrpc::Notification),
+    Response(flow_plugin_sdk::protocol::jsonrpc::Response),
 }
 
 /// 把一条入站消息分类；不合法结构在这里就拒绝。

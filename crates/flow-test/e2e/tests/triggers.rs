@@ -3,7 +3,7 @@
 //!
 //! 契约来源：DESIGN.md §11.5（触发器）。
 
-use backend_e2e::e2e_test;
+use flow_e2e::e2e_test;
 use flow_test_support::fixtures::linear_def;
 use flow_test_support::{
     call, call_err, call_json, http_post_hook, publish_workflow, wait_run_terminal, Ctx, TIMEOUT,

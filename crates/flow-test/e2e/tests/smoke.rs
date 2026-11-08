@@ -2,7 +2,7 @@
 //!
 //! 用法：`e2e_test!(名字, |ctx: &mut Ctx| async move { ... })`。
 
-use backend_e2e::e2e_test;
+use flow_e2e::e2e_test;
 use flow_test_support::fixtures::linear_def;
 use flow_test_support::{call_json, publish_workflow, start_run, wait_run_terminal, Ctx, TIMEOUT};
 use serde_json::json;

@@ -9,7 +9,7 @@
 # 运行：cargo run -p backend-perf -- --help
 # 默认规模是「轻量回归」（单次数分钟内），参数可放大做重负载。
 [package]
-name = "backend-perf"
+name = "flow-perf"
 version.workspace = true
 edition.workspace = true
 publish = false

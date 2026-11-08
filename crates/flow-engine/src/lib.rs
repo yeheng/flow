@@ -22,7 +22,6 @@ pub mod error;
 pub mod exec;
 pub mod execution_protocol;
 #[cfg(feature = "runtime")]
-pub mod expr;
 #[cfg(feature = "runtime")]
 pub mod journal_state;
 pub use flow_dto::AgentRunConfig;
