@@ -340,6 +340,7 @@ mod tests {
                 prepared: None,
                 previous_outcome: None,
                 observability: false,
+                pending_operation: None,
             }),
         };
         assert!(matches!(

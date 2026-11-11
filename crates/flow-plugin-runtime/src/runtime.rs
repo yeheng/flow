@@ -74,6 +74,8 @@ struct CurrentTask {
     dispatch_id: String,
     /// 本派发的入站邮箱（传输块、许可、ACK 转发目标）。
     mail: mpsc::Sender<Message>,
+    /// 工具裁决专用通道（G5）：与 mail 分离，反向处理器在回合内独占消费。
+    tool: mpsc::Sender<Message>,
     /// 审计确认的转发通道。
     ack_tx: watch::Sender<(u64, u64)>,
     /// 取消令牌：会话取消/失联时唤醒任务。
@@ -356,6 +358,7 @@ fn handle_message(
             }
             let _ = identity;
             let (mail_tx, mail_rx) = mpsc::channel(64);
+            let (tool_tx, tool_rx) = mpsc::channel(16);
             let (ack_tx, _) = watch::channel((0u64, 0u64));
             let runner_ack = ack_tx.clone();
             let cancel = CancellationToken::new();
@@ -369,6 +372,7 @@ fn handle_message(
                 task,
                 outbound: outbound.clone(),
                 mail: mail_rx,
+                tool_mail: std::sync::Arc::new(tokio::sync::Mutex::new(tool_rx)),
                 ack_tx: runner_ack,
                 cancel: cancel.clone(),
                 journal_id: identity.journal_id.clone(),
@@ -385,6 +389,7 @@ fn handle_message(
             *current = Some(CurrentTask {
                 dispatch_id,
                 mail: mail_tx,
+                tool: tool_tx,
                 ack_tx,
                 cancel,
                 done: done_rx,
@@ -416,13 +421,26 @@ fn handle_message(
             }
             None
         }
-        message @ (Message::ResultCommitted { .. } | Message::OperationPermit { .. }) => {
-            // 这两类消息由任务侧等待（wait_committed / authorize_operation），
+        message @ (Message::ResultCommitted { .. }
+        | Message::OperationPermit { .. }
+        | Message::OperationPending { .. }
+        | Message::OperationDenied { .. }) => {
+            // 这几类消息由任务侧等待（wait_committed / authorize_operation），
             // 会话层只负责按派发归属转投递。
             let dispatch_id = message.dispatch_id().unwrap_or_default().to_string();
             if let Some(task) = current {
                 if task.dispatch_id == dispatch_id {
                     pending.push_back((task.mail.clone(), message));
+                }
+            }
+            None
+        }
+        Message::ToolPermissionDecision { .. } => {
+            // G5 工具裁决走专用通道：反向处理器在回合内独占消费。
+            let dispatch_id = message.dispatch_id().unwrap_or_default().to_string();
+            if let Some(task) = current {
+                if task.dispatch_id == dispatch_id {
+                    pending.push_back((task.tool.clone(), message));
                 }
             }
             None

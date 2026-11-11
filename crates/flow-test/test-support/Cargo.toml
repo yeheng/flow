@@ -19,5 +19,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 jsonrpsee = { workspace = true, features = ["client"] }
 flow-dto = { path = "../../flow-dto" }
+sha2 = { workspace = true }
+url = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true }

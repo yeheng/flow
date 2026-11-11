@@ -41,7 +41,228 @@ pub async fn dispatch(client: &WsClient, json: bool, command: RunCommand) -> Res
         RunCommand::Events { run_id, from_seq } => events(client, &run_id, from_seq).await,
         RunCommand::Timeline { run_id } => timeline(client, json, &run_id).await,
         RunCommand::Cancel { run_id } => cancel(client, json, &run_id).await,
+        RunCommand::Approvals { run_id, all } => approvals(client, json, run_id, all).await,
+        RunCommand::Approve {
+            run_id,
+            node_id,
+            operation_id,
+            request_hash,
+            scope,
+        } => decide(
+            client,
+            json,
+            true,
+            &run_id,
+            &node_id,
+            &operation_id,
+            &request_hash,
+            &scope,
+            None,
+        )
+        .await,
+        RunCommand::Deny {
+            run_id,
+            node_id,
+            operation_id,
+            request_hash,
+            reason,
+        } => decide(
+            client,
+            json,
+            false,
+            &run_id,
+            &node_id,
+            &operation_id,
+            &request_hash,
+            "once",
+            Some(&reason),
+        )
+        .await,
+        RunCommand::ApprovalsRevoke {
+            run_id,
+            node_id,
+            digest,
+        } => approvals_revoke(client, json, &run_id, &node_id, &digest).await,
     }
+}
+
+/// 待审批收件箱：表格输出操作摘要（命令全文在 JSON 面里）。
+async fn approvals(
+    client: &WsClient,
+    json: bool,
+    run_id: Option<String>,
+    all: bool,
+) -> Result<(), CliError> {
+    let mut params = Vec::new();
+    if let Some(run_id) = run_id {
+        params.push(("run_id", json!(run_id)));
+    }
+    if all {
+        params.push(("all", json!(true)));
+    }
+    let result = call(client, "approvals.list", object(params)).await?;
+    if json {
+        print_json(&result);
+        return Ok(());
+    }
+    let items = result["items"].as_array().cloned().unwrap_or_default();
+    if items.is_empty() {
+        note("没有待审批的操作");
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = items
+        .iter()
+        .map(|item| {
+            let summary = item["specs"]
+                .as_array()
+                .map(|specs| {
+                    specs
+                        .iter()
+                        .map(spec_summary)
+                        .collect::<Vec<_>>()
+                        .join(" + ")
+                })
+                .unwrap_or_default();
+            vec![
+                short_id(item["run_id"].as_str().unwrap_or_default()),
+                item["node_id"].as_str().unwrap_or_default().to_string(),
+                item["status"].as_str().unwrap_or_default().to_string(),
+                summary,
+                item["operation_id"]
+                    .as_str()
+                    .map(short_id)
+                    .unwrap_or_default(),
+            ]
+        })
+        .collect();
+    println!(
+        "{}",
+        table(
+            &["RUN", "节点", "状态", "操作", "OPERATION"],
+            &rows,
+        )
+    );
+    note("flow-cli run approve/deny 需要 operation_id 与 request_hash（run approvals --json 查看）");
+    Ok(())
+}
+
+/// 单条需求的人类摘要（http/命令/密钥名……）。
+fn spec_summary(spec: &Value) -> String {
+    match spec["action"].as_str() {
+        Some("net") => format!(
+            "{} {}",
+            spec["method"].as_str().unwrap_or("?"),
+            spec["url"].as_str().unwrap_or("?")
+        ),
+        Some("exec") => format!(
+            "{} {}",
+            spec["executable"].as_str().unwrap_or("?"),
+            spec["argv"]
+                .as_array()
+                .map(|argv| {
+                    argv.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default()
+        ),
+        Some("shell") => format!(
+            "sh -c {}",
+            spec["script_digest"].as_str().unwrap_or("?")
+        ),
+        Some("secret") => format!("secret {}", spec["secret_name"].as_str().unwrap_or("?")),
+        Some("llm_call") => format!(
+            "llm {} {}",
+            spec["provider"].as_str().unwrap_or("?"),
+            spec["model"].as_str().unwrap_or("?")
+        ),
+        Some("send_email") => format!(
+            "email → {}",
+            spec["recipients"]
+                .as_array()
+                .map(|to| to
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(","))
+                .unwrap_or_default()
+        ),
+        Some("file_write") => format!("write {}", spec["path"].as_str().unwrap_or("?")),
+        Some("file_read") => format!("read {}", spec["path"].as_str().unwrap_or("?")),
+        Some("file_delete") => format!("delete {}", spec["path"].as_str().unwrap_or("?")),
+        _ => spec.to_string(),
+    }
+}
+
+/// run.approve / run.deny。
+#[allow(clippy::too_many_arguments)]
+async fn decide(
+    client: &WsClient,
+    json: bool,
+    allow: bool,
+    run_id: &str,
+    node_id: &str,
+    operation_id: &str,
+    request_hash: &str,
+    scope: &str,
+    reason: Option<&str>,
+) -> Result<(), CliError> {
+    let method = if allow { "run.approve" } else { "run.deny" };
+    let mut params = vec![
+        ("run_id", json!(run_id)),
+        ("node_id", json!(node_id)),
+        ("operation_id", json!(operation_id)),
+        ("request_hash", json!(request_hash)),
+    ];
+    if allow {
+        params.push(("scope", json!(scope)));
+    }
+    if let Some(reason) = reason {
+        params.push(("reason", json!(reason)));
+    }
+    let result = call(client, method, object(params)).await?;
+    if json {
+        print_json(&result);
+        return Ok(());
+    }
+    let decided = if allow {
+        format!("已批准（{}）", result["decision"].as_str().unwrap_or("allowed"))
+    } else {
+        "已拒绝".to_string()
+    };
+    note(format!("{decided}：run {} 节点 {}", short_id(run_id), node_id));
+    Ok(())
+}
+
+/// run.approvals.revoke。
+async fn approvals_revoke(
+    client: &WsClient,
+    json: bool,
+    run_id: &str,
+    node_id: &str,
+    digest: &str,
+) -> Result<(), CliError> {
+    let result = call(
+        client,
+        "run.approvals.revoke",
+        object(vec![
+            ("run_id", json!(run_id)),
+            ("node_id", json!(node_id)),
+            ("digest", json!(digest)),
+        ]),
+    )
+    .await?;
+    if json {
+        print_json(&result);
+        return Ok(());
+    }
+    note(format!(
+        "已撤销 run {} 节点 {} 的 Run 精确授权",
+        short_id(run_id),
+        node_id
+    ));
+    Ok(())
 }
 
 /// 手动触发：接受 workflow_id 或 name（name 在本地解析成 id），默认等终态。

@@ -143,3 +143,59 @@ export function sourceLabel(source: string): string {
       return source;
   }
 }
+
+/** 审批状态（approvals.* / run.timeline 节点 approval.status）→ 中文 */
+export function approvalStatusLabel(status: string): string {
+  switch (status) {
+    case "pending":
+      return "待审批";
+    case "allowed":
+      return "已批准";
+    case "denied":
+      return "已拒绝";
+    case "expired":
+      return "已过期";
+    case "superseded":
+      return "已被取代";
+    case "withdrawn":
+      return "已撤回";
+    case "cancelled":
+      return "已取消";
+    default:
+      return status;
+  }
+}
+
+/** 审批状态徽章着色（沿用 run 状态配色体系：蓝 pending/绿 allowed/红 denied/灰其余） */
+export function approvalBadgeClass(status: string): string {
+  if (status === "pending") return "run-running";
+  if (status === "allowed") return "run-succeeded";
+  if (status === "denied") return "run-failed";
+  return "run-cancelled";
+}
+
+/** 能力动作（CapabilityAction）→ 中文（编辑器下拉与审批卡片共用） */
+export function capabilityActionLabel(action: string): string {
+  switch (action) {
+    case "exec":
+      return "执行命令";
+    case "shell":
+      return "Shell 脚本";
+    case "net":
+      return "联网";
+    case "secret":
+      return "密钥";
+    case "llm_call":
+      return "模型调用";
+    case "send_email":
+      return "发邮件";
+    case "file_read":
+      return "读文件";
+    case "file_write":
+      return "写文件";
+    case "file_delete":
+      return "删文件";
+    default:
+      return action;
+  }
+}

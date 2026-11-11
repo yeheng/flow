@@ -11,6 +11,8 @@ export interface DefinitionNode {
   name?: string;
   position?: Position;
   params: Record<string, unknown>;
+  /** 节点级权限：缺省 = inherit（沿用工作流能力）；restrict = 收紧为闭集 */
+  permissions?: NodePermissions;
 }
 
 export interface DefinitionEdge {
@@ -24,6 +26,8 @@ export interface Definition {
   semantics?: number;
   input_schema?: unknown;
   output_schema?: unknown;
+  /** 工作流级权限块：缺省 = legacy（含副作用节点的旧工作流不能启动新 run） */
+  permissions?: WorkflowPermissions;
   nodes: DefinitionNode[];
   edges: DefinitionEdge[];
 }
@@ -409,6 +413,18 @@ export interface ConfigView {
 
 export type NodeRunState = "pending" | "running" | "retrying" | "completed" | "failed" | "skipped";
 
+/** run.timeline 节点条目的审批投影：节点等待人工批准时的摘要（approvals 面词汇表）。
+ *  终态 run 的 pending 显示为 "cancelled"。 */
+export interface NodeApprovalSummary {
+  gate: ApprovalGate | string;
+  status: ApprovalStatus | string;
+  operation_id: string;
+  request_hash: string;
+  deadline: number;
+  matched: string[];
+  decision: ApprovalDecision | null;
+}
+
 /** run.timeline 节点条目（crates/flow-rpc/src/lib.rs timeline_value） */
 export interface TimelineNode {
   wait?: { kind: string; child_run_id?: string | null } | null;
@@ -428,6 +444,8 @@ export interface TimelineNode {
   reason?: string;
   /** sub_workflow 节点启动的子 run；其余节点为空 */
   child_run_id?: string;
+  /** 审批等待投影：wait.kind === "approval" 时非空；旧 run / 无审批为空 */
+  approval?: NodeApprovalSummary | null;
 }
 
 
@@ -485,4 +503,173 @@ export interface ObservationLoss {
   retention_dropped?: number;
   storage_dropped?: number;
   history_incomplete?: boolean;
+}
+
+// ---- 权限模型（capability / approval；与 crates/flow-permissions 的 JSON 形状逐字段对齐） ----
+
+/** 能力动作闭集（服务端词汇表；未知值原样透传渲染，不判死） */
+export type CapabilityAction =
+  | "exec"
+  | "shell"
+  | "net"
+  | "secret"
+  | "llm_call"
+  | "send_email"
+  | "file_read"
+  | "file_write"
+  | "file_delete";
+
+/**
+ * 能力条目（定义 JSON 的 CapabilityJSON，序列化进 definition 用）：
+ * 公共字段 id/action/approval/expires_at 之外，按 action 携带闭集字段——
+ * net: methods/url_prefix；secret: names；exec: executable(绝对路径)/argv_exact；
+ * shell: executable(可选)/script_digest(64hex)；file_*: path 或 subtree（二选一，相对路径）；
+ * llm_call: providers/models；send_email: recipients。
+ * 前端不做精确判型（字段随 action 变化），校验规则见 state/capabilities.ts。
+ */
+export interface Capability {
+  id: string;
+  action: CapabilityAction | string;
+  /** auto=免审批 ask=需审批（命中后挂起等人工批准/拒绝） */
+  approval: "auto" | "ask";
+  expires_at?: string | null;
+  [key: string]: unknown;
+}
+
+/** definition 顶层 permissions：version 固定为 1；mode=plan 只规划不执行副作用 */
+export interface WorkflowPermissions {
+  version: 1;
+  mode: "execute" | "plan";
+  allow: Capability[];
+}
+
+/** definition 节点 permissions：inherit 沿用工作流能力；restrict 只放行本列表 */
+export type NodePermissions = { mode: "inherit" } | { mode: "restrict"; allow: Capability[] };
+
+/** 审批门：node=节点门（进入节点前）/ tool=工具门（节点内单次工具调用） */
+export type ApprovalGate = "node" | "tool";
+
+/** 审批状态词汇表（approvals.* 与 run.timeline 节点 approval.status 同一份） */
+export type ApprovalStatus =
+  | "pending"
+  | "allowed"
+  | "denied"
+  | "expired"
+  | "superseded"
+  | "withdrawn"
+  | "cancelled";
+
+/** 审批请求里的单条需求（ApprovalSpec）：action 之外的字段按 action 解释。
+ *  URL/命令/脚本等都是不可信文本，只做纯文本插值渲染，禁止 v-html。 */
+export interface ApprovalSpec {
+  action: CapabilityAction | string;
+  // exec: executable/argv/cwd/env_digest/stdin_digest?；shell: executable/script_digest/cwd/env_digest/stdin_digest?
+  // net: method/url/headers_digest/body_digest；secret: secret_name
+  // llm_call: provider/model/payload_digest；send_email: recipients/payload_digest
+  // file_*: path/content_digest?
+  [key: string]: unknown;
+}
+
+/** 审批发起方：一般 {kind:"node",run_id,node_id}，label 可选 */
+export interface ApprovalActor {
+  kind: string;
+  [key: string]: unknown;
+}
+
+/** 已有裁决（allow/deny + 裁决人/依据/时间） */
+export interface ApprovalDecision {
+  decision: "allow" | "deny";
+  by: ApprovalActor;
+  reason?: string;
+  matched_capabilities: string[];
+  evaluated_at: string;
+}
+
+/** approvals.list 单条审批（卡片逐字段渲染） */
+export interface ApprovalItem {
+  run_id: string;
+  workflow_id: string;
+  workflow_version: number;
+  node_id: string;
+  gate: ApprovalGate | string;
+  status: ApprovalStatus | string;
+  /** 审批身份：run.approve / run.deny 必须原样回传 */
+  operation_id: string;
+  request_hash: string;
+  actor: ApprovalActor;
+  /** 需求集合，全部渲染 */
+  specs: ApprovalSpec[];
+  context: {
+    run_id: string;
+    workflow_id: string;
+    workflow_version: number;
+    node_id: string;
+    node_type: string;
+    dispatch_id: string;
+    attempt: number;
+    request_fingerprint: string;
+    tool_call_id?: string;
+    [key: string]: unknown;
+  };
+  policy_digest: string;
+  /** 命中的能力依据（"workflow:xx" / "node:xx"） */
+  matched: string[];
+  /** 毫秒时间戳，服务端为准 */
+  asked_at: number;
+  deadline: number;
+  decision: ApprovalDecision | null;
+  /** 请求正文 JSON；可能为 {truncated:true,bytes}（过大只给字节数） */
+  request_preview: unknown;
+}
+
+/** approvals.list 返回：pending 在前、deadline 升序；server_time 为服务端毫秒时钟 */
+export interface ApprovalsPage {
+  items: ApprovalItem[];
+  server_time: number;
+}
+
+/** run.approve / run.deny 的命令回执：result 为 {decision:"allowed",scope} 或
+ *  {already_decided:true,decision} 等（approval 面的物化结果） */
+export interface CommandReceipt {
+  result?: unknown;
+  [key: string]: unknown;
+}
+
+/** permissions.effective 的节点条目：allow 带 derived 派生标注 */
+export interface EffectiveCapability extends Capability {
+  derived?: "not_granted_by_workflow" | "requires_approval" | "auto" | string;
+}
+
+export interface EffectiveNode {
+  node_id: string;
+  node_type: string;
+  mode: "inherit" | "restrict" | string;
+  allow: EffectiveCapability[];
+  side_effect: boolean;
+}
+
+/** 能力天花板：如 harness 子代理自带的上限（source 说明来源） */
+export interface EffectiveCeiling {
+  source: string;
+  allow: Capability[];
+}
+
+/** permissions.effective 返回：定义版本或 run 的策略投影（诊断只读展示） */
+export interface PermissionsEffective {
+  /** true = 工作流未声明顶层 permissions（legacy，不能启动新 run） */
+  legacy: boolean;
+  mode: "execute" | "plan" | string;
+  policy_digest: string;
+  workflow: Capability[];
+  nodes: EffectiveNode[];
+  ceilings: EffectiveCeiling[];
+  diagnostics: string[];
+  start_gate: string | null;
+  /** 定义版本查询时附带 */
+  workflow_id?: string;
+  version?: number;
+  /** run 查询时附带：策略已冻结 + run 内已登记的批准 */
+  run_id?: string;
+  frozen?: boolean;
+  approvals?: unknown;
 }

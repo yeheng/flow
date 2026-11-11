@@ -495,15 +495,16 @@ pub enum Message {
         /// 请求字节的 data 通道 transfer 标识（op:<operation_id>）。
         transfer_id: String,
     },
-    /// control，主→子。Intent 与 Authorized 同事务提交成功后发出；
-    /// 绑定会话身份；重复 permit_id 不再调用。
+    /// control，主→子。PermissionDecided{Allow}（与 Intent/Authorized 同
+    /// 事务）提交成功后发出；绑定会话身份；重复 permit_id 不再调用。
     OperationPermit {
         dispatch_id: String,
         operation_id: String,
         permit_id: String,
         request_fingerprint: String,
-        /// 主进程解析的凭证值（仅本次调用使用，不进入授权事实）。
-        credential: Option<String>,
+        /// 主进程按需求集合逐项解析的凭证（仅本次调用使用，不进入授权
+        /// 事实）。只有全部需求获准后才解析交付（I37）。
+        credentials: Vec<PermitCredential>,
     },
     /// data，双向。输入分块传输：offset + raw bytes + digest。
     /// `dispatch_id` 是路由键：远程中继按它把帧包进 Routed 信封发往归属
@@ -630,6 +631,67 @@ pub enum Message {
     Drain { grace_ms: u64 },
     /// control，agent→主。drain 完成：在飞任务终态已转发。
     DrainComplete { drained: u32 },
+    /// control，主→子（v8）。权限评估为 Ask：执行器原地等待 Permit 或
+    /// Denied，不得自行超时执行；`deadline_ms` 是审批绝对截止（毫秒时间戳），
+    /// 只用于给本地等待设宽限上界——裁决权在主进程（TTL 到期由主进程拒绝）。
+    OperationPending {
+        dispatch_id: String,
+        operation_id: String,
+        request_fingerprint: String,
+        deadline_ms: i64,
+    },
+    /// control，主→子（v8）。权限拒绝或审批过期：执行器以业务失败收口，
+    /// 绝不执行该操作。`reason` 有界（CONTROL_TEXT_MAX）。
+    OperationDenied {
+        dispatch_id: String,
+        operation_id: String,
+        request_fingerprint: String,
+        reason: String,
+    },
+    /// control，子→主（v8，G5）。活跃 harness 回合内的工具调用裁决请求：
+    /// 宿主按工具闭集派生需求集合并按冻结策略裁决。`params` 必须能装进
+    /// 控制帧（超限在发送侧拒绝，不静默截断）。
+    ToolPermissionRequest {
+        dispatch_id: String,
+        tool_call_id: String,
+        tool: String,
+        #[serde(with = "wire_json")]
+        params: Value,
+        cwd: Option<String>,
+    },
+    /// control，主→子（v8，G5）。工具裁决结果：绑定同一 tool_call_id；
+    /// 传输重试由宿主按 (dispatch, tool_call_id, 请求摘要) 幂等。
+    ToolPermissionDecision {
+        dispatch_id: String,
+        tool_call_id: String,
+        operation_id: String,
+        allowed: bool,
+        reason: Option<String>,
+    },
+}
+
+/// Permit 交付的一项凭证：secret 名 → 真值。`Debug` 不打印真值。
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermitCredential {
+    pub name: String,
+    pub value: String,
+}
+
+impl std::fmt::Debug for PermitCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PermitCredential")
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .finish()
+    }
+}
+
+/// 从 Permit 凭证集合中按 secret 名取值（节点请求的 credential.secret_ref）。
+pub fn credential_for<'a>(credentials: &'a [PermitCredential], name: &str) -> Option<&'a str> {
+    credentials
+        .iter()
+        .find(|credential| credential.name == name)
+        .map(|credential| credential.value.as_str())
 }
 
 /// 观测行（nodelog console/stdout/stderr 叙事）。
@@ -674,6 +736,10 @@ pub struct ExecuteTask {
     pub previous_outcome: Option<Value>,
     /// 观测开/关（主进程未配置观测存储时关闭，避免无谓传输）。
     pub observability: bool,
+    /// v8：换 dispatch 恢复待审批操作时沿用的原 operation_id（§6.1）。执行器
+    /// 用它代替新生成的身份重发 RequestOperation；内容摘要不变，request_hash
+    /// 因 dispatch 变化而重算，必须重新批准。
+    pub pending_operation: Option<String>,
 }
 
 /// 输入值声明（v2 起控制帧不携带用户值字节）。
@@ -735,6 +801,10 @@ impl Message {
             Message::ResumeReply { .. } => "ResumeReply",
             Message::Drain { .. } => "Drain",
             Message::DrainComplete { .. } => "DrainComplete",
+            Message::OperationPending { .. } => "OperationPending",
+            Message::OperationDenied { .. } => "OperationDenied",
+            Message::ToolPermissionRequest { .. } => "ToolPermissionRequest",
+            Message::ToolPermissionDecision { .. } => "ToolPermissionDecision",
         }
     }
 
@@ -754,6 +824,10 @@ impl Message {
             | Message::AuditAck { dispatch_id, .. }
             | Message::RequestOperation { dispatch_id, .. }
             | Message::OperationPermit { dispatch_id, .. }
+            | Message::OperationPending { dispatch_id, .. }
+            | Message::OperationDenied { dispatch_id, .. }
+            | Message::ToolPermissionRequest { dispatch_id, .. }
+            | Message::ToolPermissionDecision { dispatch_id, .. }
             | Message::Result { dispatch_id, .. }
             | Message::ResultCommitted { dispatch_id, .. }
             | Message::Cancel { dispatch_id, .. }

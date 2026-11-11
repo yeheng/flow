@@ -8,7 +8,12 @@ vi.mock("./CodeEditor.vue", () => ({ default: defineComponent({ template: "<div 
 vi.mock("../state/history", () => ({ commitParams: vi.fn() }));
 vi.mock("../state/editor", async () => {
   const { ref } = await import("vue");
-  return { selectedNode: ref(null), nodeValidationError: () => null };
+  return {
+    selectedNode: ref(null),
+    nodeValidationError: () => null,
+    // 权限区块只读这些字段：给最小可用形状
+    editor: { definitionOptions: {}, secrets: [], nodeTypes: [], workflows: [] },
+  };
 });
 
 import ParamsModal from "./ParamsModal.vue";

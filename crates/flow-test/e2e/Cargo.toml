@@ -50,6 +50,8 @@ name = "flow-journal-server-e2e"
 path = "src/bin/flow-journal-server-e2e.rs"
 
 [dev-dependencies]
+flow-journal = { path = "../../flow-journal", default-features = false, features = ["storage", "query"] }
+rusqlite = { workspace = true }
 tokio-tungstenite = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
@@ -62,4 +64,3 @@ cron-parser = { workspace = true }
 sqlx = { workspace = true }
 libc = { workspace = true }
 flow-dto = { path = "../../flow-dto" }
-flow-journal = { path = "../../flow-journal", default-features = false, features = ["storage", "query"] }

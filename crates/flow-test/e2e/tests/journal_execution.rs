@@ -88,7 +88,7 @@ async fn manual_resolution_binds_operation_and_never_fabricates_outcome() {
         .append(vec![event(
             EventKind::DispatchStarted,
             json!({"node_execution_id":"execution","attempt":"1"}),
-            2,
+            3,
             0,
         )])
         .await
@@ -116,19 +116,43 @@ async fn manual_resolution_binds_operation_and_never_fabricates_outcome() {
         request: StoredValue::Inline(json!({})),
         outcome: None,
     };
+    // 受管 run（run.start 冻结策略；PolicyFrozen 占 run_seq=2）：先落 Allow
+    // 裁决（I26：授权前必须有同实例的 Allow 记录），再落 Intent/Authorized。
+    let decided = event(
+        EventKind::PermissionDecided,
+        json!({
+            "gate": "node",
+            "record": {
+                "operation_id": "operation",
+                "request_hash": "a".repeat(64),
+                "evaluated_at": "2026-11-11T00:00:00Z",
+                "policy_revision": "test",
+                "decision": "allow",
+                "by": {"kind": "system"},
+                "matched_capabilities": [],
+                "modifiers": {},
+                "scope": "once"
+            },
+            "request_fingerprint": flow_journal::codec::digest(b"{}"),
+            "status": "allowed"
+        }),
+        4,
+        0,
+    );
     backend
         .append(vec![
-            event(EventKind::OperationIntent, json!({"operation":op}), 3, 0),
+            decided,
+            event(EventKind::OperationIntent, json!({"operation":op}), 5, 0),
             event(
                 EventKind::OperationAuthorized,
                 json!({"operation":op}),
-                4,
+                6,
                 0,
             ),
         ])
         .await
         .unwrap();
-    backend.append(vec![event(EventKind::WaitRegistered,json!({"wait":{"kind":"uncertain","wake_at":null,"child_run_id":null},"sealed_through":"1","integrity":"unknown"}),5,0)]).await.unwrap();
+    backend.append(vec![event(EventKind::WaitRegistered,json!({"wait":{"kind":"uncertain","wake_at":null,"child_run_id":null},"sealed_through":"1","integrity":"unknown"}),7,0)]).await.unwrap();
     let late = event(
         EventKind::LateAudit,
         json!({"reason":"response metadata arrived after sealing","status":200}),
@@ -141,7 +165,7 @@ async fn manual_resolution_binds_operation_and_never_fabricates_outcome() {
     conflicting.payload["status"] = json!(500);
     assert!(backend.append(vec![conflicting]).await.is_err());
     let snapshot = backend.state().await.unwrap();
-    assert_eq!(snapshot.runs[run_id].last_run_seq, 5);
+    assert_eq!(snapshot.runs[run_id].last_run_seq, 7);
     assert_eq!(
         snapshot.runs[run_id].nodes["h"].attempts["dispatch"]
             .result
@@ -266,7 +290,7 @@ async fn integration_adapters_capture_results_without_persisting_resolved_creden
         ),
         (
             "harness",
-            json!({"command":"sh","args":["-c","cat; echo warn >&2"],"prompt":"hello"}),
+            json!({"command":"/bin/sh","args":["-c","cat; echo warn >&2"],"prompt":"hello"}),
             json!({"exit_code":0,"stdout":"hello","stderr":"warn\n"}),
         ),
     ] {

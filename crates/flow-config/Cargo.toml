@@ -4,8 +4,10 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+flow-dto = { path = "../flow-dto" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }
+chrono = { workspace = true }
 dirs = { workspace = true }

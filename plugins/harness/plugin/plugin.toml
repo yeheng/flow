@@ -65,3 +65,59 @@ icon_key = "spark"
 
 [ui.run_view]
 summary_keys = ["agent.model", "agent.stop_reason", "exit_code"]
+
+# 09 权限模型：能力需求上限。harness agent 是开放式工具执行面（读写、
+# 命令、网络、模型调用都由 agent 决定），manifest 层只能给族级上限——
+# 实际边界由 workflow/node 权限与逐次裁决收窄；没有 OS 沙箱的平台不承诺
+# 进程内细粒度限制（§1.3 诚实条款）。
+[permissions]
+schema = 1
+required_features = ["master-permit-v1"]
+
+[[permissions.capabilities]]
+id = "agent-llm"
+action = "llm_call"
+any = true
+required = true
+
+[[permissions.capabilities]]
+id = "agent-secret"
+action = "secret"
+any = true
+required = true
+
+[[permissions.capabilities]]
+id = "agent-file-read"
+action = "file_read"
+any = true
+required = true
+
+[[permissions.capabilities]]
+id = "agent-file-write"
+action = "file_write"
+any = true
+required = true
+
+[[permissions.capabilities]]
+id = "agent-file-delete"
+action = "file_delete"
+any = true
+required = false
+
+[[permissions.capabilities]]
+id = "agent-exec"
+action = "exec"
+any = true
+required = true
+
+[[permissions.capabilities]]
+id = "agent-shell"
+action = "shell"
+any = true
+required = true
+
+[[permissions.capabilities]]
+id = "agent-net"
+action = "net"
+any = true
+required = true

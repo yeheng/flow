@@ -103,6 +103,9 @@ pub fn normalize_fragment(
             // 位置由插入画布的一方决定，不从片段继承。
             position: None,
             params,
+            // 片段只做逐节点参数校验：权限属于宿主执行定义，不随模板
+            // 片段传播（插入画布后由权限编辑器显式设置）。
+            permissions: None,
         };
         // 参数规则与整图同源（同一份 validate_params），只是不做
         // 整图级的 DAG 校验——片段本身不是完整 Definition。

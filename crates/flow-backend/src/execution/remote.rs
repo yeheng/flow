@@ -1146,6 +1146,8 @@ impl AgentManager {
             let link = DispatchLink {
                 commands: outbound.clone(),
                 events: rx,
+                // 远程链路：agent 侧槽位照常占用（审批挂起不交还，已知限制）。
+                parking: None,
             };
             let mut pending = binding.pending_link.lock().await;
             if pending.is_none() {
@@ -1506,6 +1508,7 @@ impl RemoteDispatcher {
                 AttachOutcome::Link(crate::execution::dispatch::DispatchLink {
                     commands: self.manager.active_outbound(&dispatch_id).await,
                     events: std::mem::replace(&mut events, mpsc::channel(1).1),
+                    parking: None,
                 })
             } else {
                 // 重挂：等 Resume 对账给出裁决（链路就绪 / 已提交 / 取消 /

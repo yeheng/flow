@@ -6,12 +6,14 @@ import type {
   Definition,
   DefinitionEdge,
   NodeTypeDesc,
+  NodePermissions,
   PortDesc,
   Position,
   WorkflowSummary,
 } from "../types";
 import { commit, resetHistory } from "./history";
 import { deepCloneJson } from "./clone";
+import { validateCapabilities } from "./capabilities";
 import { layeredPositions } from "./layout";
 import { confirmDialog } from "./modal";
 import { overlaysOf } from "./overlays";
@@ -23,6 +25,8 @@ export interface FlowNodeData {
   name: string;
   nodeType: NodeTypeDesc;
   params: Record<string, unknown>;
+  /** 节点级权限（definition 的 node.permissions）：缺省 = inherit；restrict 为闭集 */
+  permissions?: NodePermissions;
   /** 只读运行画布（RunCanvas）直接注入的节点运行态；编辑器画布为空，走 monitor 查询 */
   runState?: string | null;
   [key: string]: unknown;
@@ -425,6 +429,8 @@ export function definitionToFlow(def: Definition): { nodes: EditorNode[]; edges:
       // 未知类型降级为占位描述（前向兼容：旧前端渲染新定义不白屏）
       nodeType: nodeTypeDesc(n.type) ?? unknownTypeDesc(n.type),
       params: (n.params ?? {}) as Record<string, unknown>,
+      // 节点权限独立于 params：克隆隔离（undo 快照与画布编辑互不串引用）
+      permissions: n.permissions ? deepCloneJson(n.permissions) : undefined,
     },
   }));
   // 单出端口节点的唯一出口 handle id 是 "out"，definition 里不落 port
@@ -453,12 +459,15 @@ function cleanParams(params: Record<string, unknown>): Record<string, unknown> {
 }
 
 function nodeDefinition(n: EditorNode): Definition["nodes"][number] {
-  return {
+  const def: Definition["nodes"][number] = {
     id: n.id, type: n.data.nodeType.type, name: n.data.name,
     position: { x: Math.round(n.position.x / CANVAS_SNAP_GRID) * CANVAS_SNAP_GRID,
       y: Math.round(n.position.y / CANVAS_SNAP_GRID) * CANVAS_SNAP_GRID },
     params: cleanParams(n.data.params),
   };
+  // 节点权限是独立字段（不在 params 里）：inherit/restrict 原样随定义序列化
+  if (n.data.permissions) def.permissions = deepCloneJson(n.data.permissions);
+  return def;
 }
 const sourcePortCounts = computed(() => new Map(editor.nodes.map((n) => [n.id, sourcePortsOf(n.data.nodeType).length])));
 function edgeDefinition(e: EditorEdge): DefinitionEdge {
@@ -577,6 +586,9 @@ async function saveSnapshot(token?: number): Promise<SavedWorkflow | null> {
   if (!editor.workflowId || saving.value) return null;
   // 保存前过前端预校验：有错不打 RPC（服务端 validate 仍是最终裁决）
   const errs = validateNow();
+  // 顶层权限块（definitionOptions.permissions）不在 validateDefinition 的输入里，单独校验
+  const topPerms = editor.definitionOptions.permissions;
+  if (topPerms) errs.push(...validateCapabilities(topPerms.allow).map((msg) => ({ message: `工作流权限：${msg}` })));
   if (errs.length > 0) {
     validationUi.open = true;
     toast.error(`工作流定义有 ${errs.length} 处校验错误，请先修复`);

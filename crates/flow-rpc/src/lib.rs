@@ -243,7 +243,12 @@ pub async fn serve_journal_product(
             .merge(journal_triggers::router(backend.clone(), token.clone()));
         let (state, _secrets) =
             AppState::for_production(backend.clone(), config_state, &data_dir).await;
-        let module = journal_v2::module_product(backend.clone(), token, Some(state))?;
+        let module = journal_v2::module_product_with_keys(
+            backend.clone(),
+            token,
+            Some(state),
+            config.api_keys.clone(),
+        )?;
         // R3：[harness.agent] 值经 manifest 三源合一（plugin_config 单一
         // 入口）→ resolved 快照 + 插件声明元数据。解析失败 = 启动失败
         //（配置期显式报错，不带病上岗）。
@@ -253,6 +258,14 @@ pub async fn serve_journal_product(
         .map_err(|error| -> Box<dyn std::error::Error> {
             format!("harness agent 配置非法：{error}").into()
         })?;
+        // 09 权限模型：审批 TTL 在启动时注入（夹紧在后端）；已登记询问的
+        // deadline 随事实持久，运行期改配置只影响新询问。
+        if let Some(ttl_ms) = config.permissions.approval_ttl_ms {
+            backend.set_approval_ttl_ms(ttl_ms);
+        }
+        // 09 §7：内置插件随产品分发（受信二进制），启动时幂等自动授予声明
+        // 能力；第三方插件必须经 permissions.grant 显式授予。
+        backend.ensure_bundled_grants().await;
         flow_backend::start_execution(&config.execution, harness_agent, &backend).await?;
         Ok::<_, Box<dyn std::error::Error>>((
             listener, bound_http, rpc_server, bound_rpc, router, module,

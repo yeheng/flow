@@ -1035,6 +1035,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "x509-parser",
 ]
@@ -1059,7 +1060,9 @@ dependencies = [
 name = "flow-config"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "dirs 7.0.0",
+ "flow-dto",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -1073,6 +1076,8 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
+ "url",
 ]
 
 [[package]]
@@ -1095,6 +1100,7 @@ dependencies = [
  "libc",
  "parking_lot 0.12.5",
  "reqwest",
+ "rusqlite",
  "rustls",
  "serde",
  "serde_json",
@@ -1249,6 +1255,7 @@ dependencies = [
  "flow-plugin-sdk",
  "futures",
  "hex",
+ "postcard",
  "reqwest",
  "serde",
  "serde_json",
@@ -1341,7 +1348,9 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "tokio",
+ "url",
  "uuid",
 ]
 

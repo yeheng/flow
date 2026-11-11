@@ -1,4 +1,7 @@
-PRAGMA user_version=4;
+-- v5（09 §10.2）：transactions 增加 prev_digest / chain_digest——
+-- 链值 = SHA-256(prev_chain ‖ digest(body))，把「改了数据会被读时发现」
+-- 升级为「改了任何一帧，其后全部链断」。v4 旧库由打开路径原地迁移。
+PRAGMA user_version=5;
 CREATE TABLE store_meta (
     singleton INTEGER PRIMARY KEY CHECK(singleton=1),
     journal_id TEXT NOT NULL,
@@ -10,7 +13,9 @@ CREATE TABLE transactions (
     tx_id TEXT NOT NULL UNIQUE,
     event_count INTEGER NOT NULL CHECK(event_count>0),
     digest TEXT NOT NULL,
-    bytes INTEGER NOT NULL CHECK(bytes>0)
+    bytes INTEGER NOT NULL CHECK(bytes>0),
+    prev_digest TEXT NOT NULL DEFAULT '',
+    chain_digest TEXT NOT NULL DEFAULT ''
 ) WITHOUT ROWID;
 CREATE TABLE events (
     lsn TEXT NOT NULL REFERENCES transactions(lsn),

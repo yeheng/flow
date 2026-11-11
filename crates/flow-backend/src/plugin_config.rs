@@ -31,6 +31,10 @@ pub struct InstalledAgentPlugin {
     pub version: String,
     /// UI 投影（快照冻结的本体：palette/params/summary_keys）。
     pub ui: Option<Value>,
+    /// 权限需求投影（09 §7.2）。None = legacy-unrestricted。
+    pub permissions: Option<Value>,
+    /// 内容身份（I35）。typed 注入路径可能无法定位二进制 → None（诊断用）。
+    pub content_hash: Option<String>,
 }
 
 /// harness-agent 的 manifest：plugins 目录显式部署 → 内置副本。
@@ -38,6 +42,29 @@ pub struct InstalledAgentPlugin {
 /// # Errors
 /// 显式部署的 manifest 解析失败 = 启动失败（部署坏了要让运维看见，
 /// 不静默回落内置副本——那会把坏部署变成幽灵配置）。
+/// harness-agent 的 (权限投影, 内容哈希)：部署目录优先，缺省回嵌入文本 +
+/// 入口二进制（env FLOW_AGENT_PLUGIN_BIN 或同目录兄弟文件）。
+pub fn harness_agent_identity(
+    manifest: &PluginManifest,
+    manifest_text: Option<&str>,
+) -> (Option<Value>, Option<String>) {
+    let permissions = manifest.permissions_projection();
+    let content_hash = manifest_text.and_then(|text| {
+        let entry = std::env::var_os("FLOW_AGENT_PLUGIN_BIN")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| exe.parent().map(|dir| dir.join("flow-agent-plugin")))
+            });
+        let bytes = entry.and_then(|path| std::fs::read(path).ok());
+        bytes.map(|bytes| {
+            crate::plugin_registry::content_hash(text.as_bytes(), &bytes)
+        })
+    });
+    (permissions, content_hash)
+}
+
 pub fn harness_agent_manifest() -> Result<PluginManifest, String> {
     let base = std::env::var_os("FLOW_PLUGINS_DIR")
         .map(std::path::PathBuf::from)
@@ -199,11 +226,14 @@ pub fn harness_agent_plugin(
     let resolved = resolve_plugin_config(&manifest.plugin.id, &manifest.config_fields, &values)?;
     let run_config: flow_dto::AgentRunConfig = serde_json::from_value(resolved)
         .map_err(|error| format!("resolved 配置与 AgentRunConfig 形状不符：{error}"))?;
+    let (permissions, content_hash) = harness_agent_identity(&manifest, None);
     Ok(Some(InstalledAgentPlugin {
         run_config,
         plugin_id: manifest.plugin.id.clone(),
         version: manifest.plugin.version.clone(),
         ui: serde_json::to_value(manifest.ui_projection()).ok(),
+        permissions,
+        content_hash,
     }))
 }
 
@@ -241,11 +271,14 @@ pub fn installed_from_run_config(
     run_config: flow_dto::AgentRunConfig,
 ) -> Result<InstalledAgentPlugin, String> {
     let manifest = harness_agent_manifest()?;
+    let (permissions, content_hash) = harness_agent_identity(&manifest, None);
     Ok(InstalledAgentPlugin {
         run_config,
         plugin_id: manifest.plugin.id.clone(),
         version: manifest.plugin.version.clone(),
         ui: serde_json::to_value(manifest.ui_projection()).ok(),
+        permissions,
+        content_hash,
     })
 }
 

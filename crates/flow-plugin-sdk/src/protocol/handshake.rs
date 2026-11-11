@@ -23,7 +23,9 @@ use crate::protocol::jsonrpc::{Error, ErrorCode, Id, Request, Response};
 ///
 /// 主版本不等 = 拒绝；次版本只用于诊断展示，不参与裁决 —— 向后兼容的
 /// 新增（新方法、新能力名）体现在次版本，不需要对方同步升级。
-pub const PROTOCOL_VERSION: u32 = 1;
+/// v2（09 权限模型）：新增 [`Capability::MasterPermitV1`] 与
+/// `permission/request` 反向方法——受管插件按宿主裁决执行工具动作。
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// 当前主版本。
 pub const PROTOCOL_VERSION_MAJOR: u32 = PROTOCOL_VERSION >> 16;
@@ -39,6 +41,39 @@ pub enum Capability {
     ReverseRequests,
     /// 宿主接受 kind=binary 的数据块帧。
     BinaryBlocks,
+    /// 宿主提供 master 权限裁决（`permission/request` 反向方法；09 §8）。
+    /// 受管插件必须协商此能力，未协商即拒绝执行受管工具。
+    MasterPermitV1,
+}
+
+/// `permission/request` 方法名（插件 → 宿主反向请求：工具动作裁决）。
+pub const PERMISSION_REQUEST_METHOD: &str = "permission/request";
+
+/// `permission/request` 的请求参数（插件 → 宿主）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermissionRequestParams {
+    /// 发起裁决的工具调用标识（宿主以此去重传输重试）。
+    pub tool_call_id: String,
+    /// 工具名（闭集由宿主映射到动作）。
+    pub tool: String,
+    /// 工具参数（宿主按工具闭集派生需求集合）。
+    pub params: serde_json::Value,
+    /// 插件自述的 cwd（诊断；授权以宿主派生为准）。
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+/// `permission/request` 的响应（宿主 → 插件）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermissionRequestResult {
+    /// allow：可执行本次调用（绑定 tool_call_id，不得挪用）。
+    pub allowed: bool,
+    /// 拒绝原因（拒绝时展示）。
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// 宿主分配的操作实例 id（审计关联；同一 (tool_call_id, 请求摘要)
+    /// 的传输重试返回同一 id）。
+    pub operation_id: String,
 }
 
 /// 一个能力目录：可序列化的能力集合。

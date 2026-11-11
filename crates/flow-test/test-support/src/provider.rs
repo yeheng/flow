@@ -120,8 +120,10 @@ async fn completions(
         // 客户端据此把工具结果拼进下一轮消息。
         Turn::Tool { command } => {
             let arguments = serde_json::to_string(&json!({ "command": command })).unwrap();
+            // tool_call_id 每轮唯一：真实的 provider 如此，权限账本也按它区分
+            // 新调用与传输重试（复用 id 会被判为重试而复用旧裁决）。
             vec![
-                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":arguments}}]}}]}),
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":format!("call_{turn}"),"function":{"name":"bash","arguments":arguments}}]}}]}),
                 json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
             ]
         }

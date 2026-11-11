@@ -261,7 +261,9 @@ pub fn initialize_result(
 ) -> flow_plugin_sdk::protocol::handshake::InitializeResult {
     flow_plugin_sdk::protocol::handshake::InitializeResult {
         protocol_version: PROTOCOL_VERSION,
-        capabilities: vec![],
+        // 09 §8：受管工具协议。宿主按此协商 `permission/request` 反向通道；
+        // 旧宿主忽略能力名，插件侧未收到受管回合时按本地 fail-closed 装配。
+        capabilities: vec![flow_plugin_sdk::protocol::handshake::Capability::MasterPermitV1],
         server_info: serde_json::json!({"name": "flow-agent-plugin", "version": "0.1.0"}),
         session_token: token,
     }

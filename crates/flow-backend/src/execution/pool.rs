@@ -74,7 +74,7 @@ pub struct RawSession {
 
 /// 一个可派发的会话租约：持有 X_max 信号量份额与会话命令通道。
 ///
-/// 租约即「槽位凭证」：`_permit` 随租约一起移动，租约被丢弃时份额自动
+/// 租约即「槽位凭证」：槽位份额随租约一起移动，租约被丢弃时份额自动
 /// 归还，池的并发上限因此不可能被绕过。
 pub struct SessionLease {
     /// 派发方 → 会话的命令通道。
@@ -91,8 +91,9 @@ pub struct SessionLease {
     pub child_pid: Option<u32>,
     /// 生命周期守卫：drop 即回收会话（杀进程并回收）。
     lifecycle: tokio_util::sync::DropGuard,
-    /// X_max 槽位份额：持有租约期间占用一个执行槽。
-    _permit: OwnedSemaphorePermit,
+    /// X_max 槽位份额：持有租约期间占用一个执行槽。审批挂起（09 §6.1）期间
+    /// 交还份额（None），会话进程保留但不计槽；恢复前重新取得。
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 /// 执行器进程池。
@@ -205,7 +206,7 @@ impl ExecutorPool {
                     session_id: session.session_id,
                     child_pid: session.child_pid,
                     lifecycle: session.cancel.drop_guard(),
-                    _permit: permit,
+                    permit: Some(permit),
                 });
             }
             let session = self.spawn_session().await?;
@@ -217,9 +218,47 @@ impl ExecutorPool {
                 session_id: session.session_id,
                 child_pid: session.child_pid,
                 lifecycle: session.cancel.drop_guard(),
-                _permit: permit,
+                permit: Some(permit),
             });
         }
+    }
+
+    /// 审批挂起：交还租约的 X_max 份额（会话进程保留、绑定原派发，不进
+    /// 空闲栈）。挂起总数受 [`A_MAX`] 约束，超限时保持占槽（降级而非失败）。
+    ///
+    /// 返回 true 表示确实交还了份额（调用方随后必须 [`Self::unpark`]）。
+    pub(crate) fn park(&self, lease: &mut SessionLease) -> bool {
+        if lease.permit.is_none() {
+            return false;
+        }
+        let parked = crate::journal::PARKED_DISPATCHES.fetch_add(1, Ordering::AcqRel);
+        if parked >= flow_engine::execution_protocol::A_MAX {
+            crate::journal::PARKED_DISPATCHES.fetch_sub(1, Ordering::AcqRel);
+            return false;
+        }
+        drop(lease.permit.take());
+        true
+    }
+
+    /// 结束挂起：重新取得一个 X_max 份额（可能等待其他派发释放）。
+    ///
+    /// # Errors
+    /// 池已关停时返回 [`PoolError::Unavailable`]。
+    pub(crate) async fn unpark(&self, lease: &mut SessionLease) -> Result<(), PoolError> {
+        if lease.permit.is_some() {
+            return Ok(());
+        }
+        crate::journal::PARKED_DISPATCHES.fetch_sub(1, Ordering::AcqRel);
+        let permit = tokio::select! {
+            permit = self.slots.clone().acquire_owned() => {
+                permit.map_err(|_| PoolError::Unavailable("pool closed".into()))?
+            }
+            _ = self.shutdown.cancelled() => {
+                return Err(PoolError::Unavailable("pool closed".into()))
+            }
+        };
+        lease.permit = Some(permit);
+        Ok(())
     }
 
     /// 派发结束后归还会话（健康时复用；draining/故障时回收重建）。
@@ -236,8 +275,13 @@ impl ExecutorPool {
             session_id,
             child_pid,
             lifecycle,
-            _permit,
+            permit,
         } = lease;
+        // 挂起中结束（错误路径）：挂起计数随租约一起归还。
+        if permit.is_none() {
+            crate::journal::PARKED_DISPATCHES.fetch_sub(1, Ordering::AcqRel);
+        }
+        drop(permit);
         if healthy && !self.shutdown.is_cancelled() {
             self.idle.lock().await.push(RawSession {
                 to_session,
@@ -505,7 +549,7 @@ mod lifecycle_tests {
                 session_id: "s".into(),
                 child_pid: None,
                 lifecycle: cancel.clone().drop_guard(),
-                _permit: pool.slots.clone().acquire_owned().await.unwrap(),
+                permit: Some(pool.slots.clone().acquire_owned().await.unwrap()),
             };
             if abandon {
                 drop(lease)

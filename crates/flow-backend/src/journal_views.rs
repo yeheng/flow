@@ -554,6 +554,18 @@ pub async fn timeline(backend: &JournalBackend, run_id: &str) -> Result<Value> {
             "reason":node.and_then(|n| n.skip_reason.as_ref()),
             "wait":node.and_then(|n| n.wait.as_ref()),
             "operation_id":node.and_then(|n| n.operation.as_ref()).map(|o| &o.operation_id),
+            // 审批状态（09 §6）：卡片从持久请求生成；cancelled 为终态派生。
+            "approval": node.and_then(|n| n.approval.as_ref()).map(|a| json!({
+                "gate": a.gate,
+                "status": if run.terminal() && a.status
+                    == flow_engine::journal_state::ApprovalStatus::Pending
+                { "cancelled" } else { a.status.as_str() },
+                "operation_id": a.request.operation_id,
+                "request_hash": a.request.request_hash,
+                "deadline": a.deadline,
+                "matched": a.matched,
+                "decision": a.decision,
+            })),
             "child_run_id":child}));
     }
     Ok(

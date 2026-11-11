@@ -15,6 +15,12 @@ use std::collections::BTreeSet;
 /// （同一常量，不另写数字）。
 pub const R_MAX: usize = 1000;
 
+/// 当前处于审批挂起（09 §6.1）且已交还执行槽位的派发数：执行器池 park 时
+/// +1、unpark/结束时 -1。协调器在判定派发槽位时扣除它，避免几个夜间待审批
+/// 占满全部 X_max；总数受 `A_MAX` 约束（超限的挂起降级为保持占槽）。
+pub static PARKED_DISPATCHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// 定义缓存硬顶：正常路径靠 run 终态逐出，这里只兜底防泄漏
 /// （超过即任意逐出——缓存只省磁盘读，正确性不依赖它）。
 const DEFINITION_CACHE_MAX: usize = 128;
@@ -121,6 +127,36 @@ pub struct JournalBackend {
     /// 派发时从 `run.execution.agent` 读冻结值，不从这里现取——配置在进程
     /// 重启后修改只影响新 run，in-flight run 的重试/恢复身份不变。
     harness_agent: std::sync::OnceLock<Option<crate::plugin_config::InstalledAgentPlugin>>,
+    /// 审批等待 TTL（09 §6，`[permissions] approval_ttl_ms`）：新询问的绝对
+    /// deadline = 询问时刻 + 该值；已登记的询问 deadline 随事实持久，配置
+    /// 修改与重启都不刷新它（I34）。
+    approval_ttl_ms: AtomicU64,
+}
+
+/// 审批 TTL 缺省（24h）与夹紧范围（60s..=7d）。
+pub const APPROVAL_TTL_DEFAULT_MS: u64 = 24 * 60 * 60 * 1000;
+const APPROVAL_TTL_RANGE_MS: (u64, u64) = (60 * 1000, 7 * 24 * 60 * 60 * 1000);
+
+impl JournalBackend {
+    /// 设置审批 TTL（启动时由 `[permissions] approval_ttl_ms` 注入；夹紧到
+    /// 60s..=7d）。`FLOW_APPROVAL_TTL_MS` 环境变量仅供测试缩短等待（夹紧
+    /// 下限 1s），不进配置文件契约。
+    pub fn set_approval_ttl_ms(&self, ttl_ms: u64) {
+        let (low, high) = APPROVAL_TTL_RANGE_MS;
+        self.approval_ttl_ms
+            .store(ttl_ms.clamp(low, high), Ordering::Relaxed);
+    }
+
+    /// 当前审批 TTL（毫秒）。
+    pub fn approval_ttl_ms(&self) -> u64 {
+        if let Some(ms) = std::env::var("FLOW_APPROVAL_TTL_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            return ms.clamp(1000, APPROVAL_TTL_RANGE_MS.1);
+        }
+        self.approval_ttl_ms.load(Ordering::Relaxed)
+    }
 }
 
 impl JournalBackend {
@@ -141,15 +177,25 @@ impl JournalBackend {
                     .ok()
                     .map(|manifest| {
                         let ui = serde_json::to_value(manifest.ui_projection()).ok();
-                        (manifest.plugin.id, manifest.plugin.version, ui)
+                        let (permissions, content_hash) =
+                            crate::plugin_config::harness_agent_identity(&manifest, None);
+                        (
+                            manifest.plugin.id,
+                            manifest.plugin.version,
+                            ui,
+                            permissions,
+                            content_hash,
+                        )
                     });
                 match meta {
-                    Some((plugin_id, version, ui)) => {
+                    Some((plugin_id, version, ui, permissions, content_hash)) => {
                         Some(crate::plugin_config::InstalledAgentPlugin {
                             run_config,
                             plugin_id,
                             version,
                             ui,
+                            permissions,
+                            content_hash,
                         })
                     }
                     None => {
@@ -159,6 +205,8 @@ impl JournalBackend {
                             plugin_id: "harness-agent".into(),
                             version: "unknown".into(),
                             ui: None,
+                            permissions: None,
+                            content_hash: None,
                         })
                     }
                 }
@@ -191,12 +239,22 @@ impl JournalBackend {
     /// 新 run 快照冻结的插件声明元数据（U1：历史渲染自持）。
     pub(crate) fn harness_agent_plugin_meta(
         &self,
-    ) -> Option<(String, String, Option<serde_json::Value>)> {
-        self.harness_agent
-            .get()
-            .cloned()
-            .flatten()
-            .map(|installed| (installed.plugin_id, installed.version, installed.ui))
+    ) -> Option<(
+        String,
+        String,
+        Option<serde_json::Value>,
+        Option<serde_json::Value>,
+        Option<String>,
+    )> {
+        self.harness_agent.get().cloned().flatten().map(|installed| {
+            (
+                installed.plugin_id,
+                installed.version,
+                installed.ui,
+                installed.permissions,
+                installed.content_hash,
+            )
+        })
     }
 
     /// 打开（或创建）数据目录上的权威库，并从已提交的当前行恢复内存状态。
@@ -239,6 +297,7 @@ impl JournalBackend {
             coordinator_last_tick_ms: AtomicI64::new(0),
             definitions: Mutex::new(std::collections::HashMap::new()),
             harness_agent: std::sync::OnceLock::new(),
+            approval_ttl_ms: AtomicU64::new(APPROVAL_TTL_DEFAULT_MS),
         });
         Ok(backend)
     }

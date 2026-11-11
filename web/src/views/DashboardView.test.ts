@@ -5,7 +5,11 @@ import { toast } from "../state/toast";
 import type { RunRecord, RunStats } from "../types";
 import DashboardView from "./DashboardView.vue";
 
-vi.mock("../api/flow", () => ({ runStats: vi.fn(), listRuns: vi.fn() }));
+vi.mock("../api/flow", () => ({
+  runStats: vi.fn(),
+  listRuns: vi.fn(),
+  approvalsList: vi.fn(async () => ({ items: [], server_time: 0 })),
+}));
 vi.mock("../rpc/client", () => ({
   client: { onReconnect: vi.fn(() => () => {}) },
   errText: (e: unknown) => (e instanceof Error ? e.message : String(e)),

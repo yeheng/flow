@@ -1,11 +1,16 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, useId, watch } from "vue";
-import { nodeValidationError, selectedNode } from "../state/editor";
+import { editor, nodeValidationError, selectedNode } from "../state/editor";
 import { useModalFocusTrap } from "../state/modal-a11y";
 import { commitParams } from "../state/history";
 import { overlaysOf, type OverlayEntry } from "../state/overlays";
+import { CAPABILITY_ACTIONS, newCapability } from "../state/capabilities";
+import { capabilityActionLabel } from "../state/labels";
+import { toast } from "../state/toast";
+import type { Capability, NodePermissions, WorkflowPermissions } from "../types";
 import SchemaField from "./SchemaField.vue";
 import AppButton from "./AppButton.vue";
+import CapabilityEditor from "./CapabilityEditor.vue";
 
 /** 栈上 params 条目的载荷：nodeId 标识编辑目标（入口：双击节点/右键「编辑参数」/校验定位） */
 export interface ParamsPayload {
@@ -90,6 +95,68 @@ function setRetry(key: "max_attempts" | "backoff_ms", ev: Event): void {
   const clean = Object.fromEntries(Object.entries(next).filter(([, x]) => x !== undefined));
   setParam("retry", Object.keys(clean).length > 0 ? clean : undefined);
 }
+
+// ---- 节点权限：Inherit / Restrict（写 node.permissions，definition 保存路径独立于 params） ----
+
+/** 顶层无 permissions 块（legacy）：含副作用节点的旧工作流不能启动新 run */
+const workflowLegacy = computed(() => editor.definitionOptions?.permissions === undefined);
+
+/** 一键迁移：顶层写入空权限块（进入 definitionOptions，随画布保存/发布落库） */
+function migrateWorkflowPermissions(): void {
+  const block: WorkflowPermissions = { version: 1, mode: "execute", allow: [] };
+  editor.definitionOptions.permissions = block;
+  toast.success("已创建空权限块（allow 暂为空）：保存并发布后生效");
+}
+
+const nodePermissions = computed<NodePermissions | null>(
+  () => (data.value?.permissions as NodePermissions | undefined) ?? null,
+);
+
+/** 缺省视为 inherit（definition 里不落显式块，语义相同） */
+const nodeMode = computed<"inherit" | "restrict">(() =>
+  nodePermissions.value?.mode === "restrict" ? "restrict" : "inherit",
+);
+
+const nodeAllow = computed<Capability[]>(() =>
+  nodePermissions.value?.mode === "restrict" ? nodePermissions.value.allow : [],
+);
+
+function setNodePermissions(p: NodePermissions): void {
+  if (!data.value || !node.value) return;
+  // 与 params 同一 undo 通道（history 快照含 permissions），标签独立合并连续编辑
+  commitParams(`${node.value.id}:__permissions__`);
+  data.value.permissions = p;
+}
+
+function onNodeMode(mode: "inherit" | "restrict"): void {
+  if (nodeMode.value === mode) return;
+  setNodePermissions(
+    mode === "inherit"
+      ? { mode: "inherit" }
+      : { mode: "restrict", allow: nodeAllow.value.map((c) => ({ ...c })) },
+  );
+}
+
+function updateNodeCap(index: number, cap: Capability): void {
+  const allow = [...nodeAllow.value];
+  allow[index] = cap;
+  setNodePermissions({ mode: "restrict", allow });
+}
+
+function removeNodeCap(index: number): void {
+  setNodePermissions({ mode: "restrict", allow: nodeAllow.value.filter((_, i) => i !== index) });
+}
+
+/** 新增能力的动作选择（默认联网；闭集见 CAPABILITY_ACTIONS） */
+const newAction = ref<string>("net");
+
+function addNodeCap(): void {
+  const action = newAction.value;
+  setNodePermissions({
+    mode: "restrict",
+    allow: [...nodeAllow.value, newCapability(action, nodeAllow.value.map((c) => c.id))],
+  });
+}
 </script>
 
 <template>
@@ -129,6 +196,58 @@ function setRetry(key: "max_attempts" | "backoff_ms", ev: Event): void {
             :model-value="data.params[key]"
             @update:model-value="setParam(key, $event)"
           />
+          <fieldset class="permissions">
+            <legend>权限</legend>
+            <template v-if="workflowLegacy">
+              <p class="retry-warning">
+                工作流未声明权限（legacy）：含副作用节点的旧工作流不能启动新 run。
+              </p>
+              <AppButton @click="migrateWorkflowPermissions()">迁移（创建空权限块）</AppButton>
+            </template>
+            <div class="perm-mode">
+              <label class="perm-radio">
+                <input
+                  type="radio"
+                  name="node-perm-mode"
+                  :checked="nodeMode === 'inherit'"
+                  @change="onNodeMode('inherit')"
+                />
+                继承工作流（Inherit）
+              </label>
+              <label class="perm-radio">
+                <input
+                  type="radio"
+                  name="node-perm-mode"
+                  :checked="nodeMode === 'restrict'"
+                  @change="onNodeMode('restrict')"
+                />
+                限制为本节点声明（Restrict）
+              </label>
+            </div>
+            <template v-if="nodeMode === 'restrict'">
+              <p v-if="nodeAllow.length === 0" class="perm-empty">
+                空列表 = 禁止所有外部能力
+              </p>
+              <CapabilityEditor
+                v-for="(cap, i) in nodeAllow"
+                :key="`${node.id}:cap:${i}:${cap.id}`"
+                :capability="cap"
+                @update:capability="updateNodeCap(i, $event)"
+                @remove="removeNodeCap(i)"
+              />
+              <div class="perm-add">
+                <select v-model="newAction" aria-label="新增能力动作">
+                  <option v-for="a in CAPABILITY_ACTIONS" :key="a" :value="a">
+                    {{ capabilityActionLabel(a) }}
+                  </option>
+                </select>
+                <AppButton @click="addNodeCap()">添加能力</AppButton>
+              </div>
+            </template>
+            <p v-else class="field-help">
+              节点沿用工作流顶层能力声明；需要收紧本节点时切换为 Restrict。
+            </p>
+          </fieldset>
           <fieldset v-if="desc.supports_retry" class="retry">
             <legend>重试</legend>
             <p v-if="desc.retry_scope === 'declared_repeatable_only'" class="retry-warning">
@@ -278,5 +397,40 @@ fieldset.retry legend {
   color: var(--warn);
   font-size: 11px;
   line-height: 1.5;
+}
+
+fieldset.permissions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.perm-mode {
+  display: flex;
+  gap: 16px;
+}
+
+.perm-radio {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  font-size: 12px;
+  color: var(--text2);
+  cursor: pointer;
+}
+
+.perm-empty {
+  margin: 0;
+  padding: 6px 10px;
+  border: 1px dashed var(--danger);
+  border-radius: 6px;
+  color: var(--danger);
+  font-size: 11px;
+}
+
+.perm-add {
+  display: flex;
+  gap: 8px;
+  align-items: center;
 }
 </style>

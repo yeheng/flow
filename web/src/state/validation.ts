@@ -1,4 +1,5 @@
 import type { EditorEdge, EditorNode } from "./editor";
+import { validateCapabilities } from "./capabilities";
 import type { NodeTypeDesc } from "../types";
 
 export interface ValidationError {
@@ -40,6 +41,13 @@ export function validateDefinition(
     if (!desc || !typeOf.has(desc.type)) {
       errors.push({ nodeId: node.id, message: `节点 ${node.id} 的类型未知` });
       continue;
+    }
+    // 节点级权限（restrict）：能力条目本地校验（服务端 validate 仍是最终裁决）
+    const nodePerms = node.data?.permissions;
+    if (nodePerms?.mode === "restrict") {
+      for (const msg of validateCapabilities(nodePerms.allow)) {
+        errors.push({ nodeId: node.id, message: `节点「${node.id}」权限：${msg}` });
+      }
     }
     // required 参数非空（undefined / null / 空串视为缺失）
     for (const key of desc.params_schema.required ?? []) {

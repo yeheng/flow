@@ -126,6 +126,90 @@ pub struct Config {
     pub journal: JournalConfig,
     /// `[harness]`：harness 节点的内置 agent 配置。
     pub harness: HarnessConfig,
+    /// `[permissions]`：权限模型的全局参数（09 §6）。
+    pub permissions: PermissionsConfig,
+    /// `[[api_keys]]`：分档 API key（09 §9）。FLOW_JOURNAL_TOKEN 保持为
+    /// 隐式 admin key 永久兼容。
+    #[serde(default, rename = "api_keys", skip_serializing_if = "Vec::is_empty")]
+    pub api_keys: Vec<ApiKey>,
+}
+
+/// `[permissions]` 分区：权限模型全局参数（09 权限模型）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PermissionsConfig {
+    /// 人工审批等待 TTL（毫秒）：到期 = Deny + 节点业务失败（I34）。后端夹紧
+    /// 到 60s..=7d，缺省 24h；已登记询问的 deadline 随事实持久，改配置不刷新。
+    pub approval_ttl_ms: Option<u64>,
+}
+
+impl Default for PermissionsConfig {
+    fn default() -> Self {
+        PermissionsConfig { approval_ttl_ms: None }
+    }
+}
+
+/// 一条分档 API key。`token_hash` 是 sha256(明文 token) 的 hex——明文只在
+/// 创建时给持有者看一次，配置文件与日志永不携带明文。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct ApiKey {
+    /// key 身份（决策记录的 by: ApiKey{id}）。
+    pub id: String,
+    /// sha256(明文 token) 的 64 位小写 hex。
+    pub token_hash: String,
+    /// scopes ∈ read | write | approve | admin（闭集；admin = 全部）。
+    pub scopes: Vec<String>,
+    /// 过期时间（RFC3339；None = 不过期）。
+    pub expires_at: Option<String>,
+}
+
+impl ApiKey {
+    /// 闭集校验（deny_unknown 纪律：拼错即拒）。
+    pub fn validate(&self) -> Result<(), String> {
+        const KNOWN: [&str; 4] = ["read", "write", "approve", "admin"];
+        if self.id.trim().is_empty() {
+            return Err("api_keys.id 不能为空".into());
+        }
+        if self.token_hash.len() != 64
+            || !self
+                .token_hash
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(format!(
+                "api_keys.{} 的 token_hash 必须是 64 位小写 hex",
+                self.id
+            ));
+        }
+        for scope in &self.scopes {
+            if !KNOWN.contains(&scope.as_str()) {
+                return Err(format!(
+                    "api_keys.{} 的 scope 非法：{scope:?}（闭集 read|write|approve|admin）",
+                    self.id
+                ));
+            }
+        }
+        if let Some(at) = &self.expires_at {
+            if chrono::DateTime::parse_from_rfc3339(at).is_err() {
+                return Err(format!("api_keys.{} 的 expires_at 不是 RFC3339", self.id));
+            }
+        }
+        Ok(())
+    }
+
+    /// 该 key 是否具备某 scope（admin 全通过；过期 = 全拒）。
+    pub fn has_scope(&self, scope: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+        if self
+            .expires_at
+            .as_deref()
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+            .is_some_and(|expires| expires.with_timezone(&chrono::Utc) <= now)
+        {
+            return false;
+        }
+        self.scopes.iter().any(|s| s == "admin" || s == scope)
+    }
 }
 
 /// `[server]` 分区：与「谁在什么时候扫描触发器」有关。
@@ -794,6 +878,15 @@ fn apply_env(config: &mut Config) -> Result<Vec<String>, String> {
     if let Some(v) = env_str("FLOW_EXECUTOR_BIN") {
         config.execution.executor_bin = Some(v);
         applied.push("FLOW_EXECUTOR_BIN".into());
+    }
+    if let Some(v) = env_str("FLOW_X_MAX") {
+        // 非法值显式报错（同 FLOW_EXECUTION_MODE 语义）：静默换并发上限比
+        // 启动失败危险。夹紧仍由执行器池负责（1..=16）。
+        let parsed: u32 = v
+            .parse()
+            .map_err(|_| format!("FLOW_X_MAX 必须是 1..=16 的整数，当前 {v:?}"))?;
+        config.execution.x_max = parsed;
+        applied.push("FLOW_X_MAX".into());
     }
     if let Some(v) = env_str("FLOW_REMOTE_CONTROL_ADDR") {
         config

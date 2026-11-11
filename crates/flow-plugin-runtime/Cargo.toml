@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+postcard = { workspace = true }
 flow-plugin-sdk = { path = "../flow-plugin-sdk" }
 flow-engine = { path = "../flow-engine" }
 flow-journal = { path = "../flow-journal", default-features = false, features = ["storage"] }

@@ -55,6 +55,24 @@ pub enum EventKind {
     LegacyImport,
     /// Explicit machine retry authorization for a declared repeatable operation.
     OperationRetryAuthorized,
+    /// 09 权限模型（G2）：run 启动时冻结的策略身份；与 RunStarted 同事务、
+    /// 紧随其后（I30）。策略内容随 RunStarted 的 run 快照冻结。
+    PolicyFrozen,
+    /// 节点/工具级操作进入人工审批：非封口等待（attempt 不封口，执行器
+    /// 原地等待 Permit），run 保持 Running（I14 同款）。
+    PermissionAsked,
+    /// 一次权限裁决（auto / 人工 / TTL / 能力拒绝）。auto 放行同样落一条：
+    /// 全自动 = 决策全自动，记录一条不少（§10）。
+    PermissionDecided,
+    /// Run 精确授权：仅免除同 run/node 下精确操作的再次询问，不增加能力。
+    RunApprovalUpserted,
+    /// 撤销一条 Run 精确授权。
+    RunApprovalRemoved,
+    /// 工作流权限块变化（谁在何时改了能力上限）；与 WorkflowUpdated 同事务。
+    WorkflowPermissionsChanged,
+    /// 插件能力授予（09 §7）：按 (plugin_id, content_hash) 键；只写 journal，
+    /// 不回写 plugin.toml。
+    PluginGrantUpserted,
 }
 
 /// 一条已接受的事实。

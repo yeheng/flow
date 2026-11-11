@@ -15,11 +15,20 @@
 //! 3. **事件只带元信息**：`agent/event` 通知的投影在插件侧完成（隐私
 //!    边界见 agent-plugin crate），本层只转发给进度投影器。
 
-use flow_harness_protocol::{RunTurnParams, TurnOutcome, TurnSpec, WireEvent, ASSEMBLY_ERROR};
+use flow_harness_protocol::{
+    RunTurnParams, TurnOutcome, TurnPermission, TurnSpec, WireEvent, ASSEMBLY_ERROR,
+};
 use flow_plugin_sdk::protocol::jsonrpc::ErrorCode;
 
 use crate::plugin_registry::RegisteredPlugin;
 use crate::plugin_session::{self, PluginSessionError};
+
+/// 反向请求处理结果（`permission/request` → master 裁决 → 回插件）。
+pub(super) type ReverseHandler = std::sync::Arc<
+    dyn Fn(flow_plugin_sdk::protocol::jsonrpc::Request) -> futures::future::BoxFuture<'static, flow_plugin_sdk::protocol::jsonrpc::Message>
+        + Send
+        + Sync,
+>;
 
 /// 适配层错误：两类失败的上游处置不同（见模块文档第 1 条）。
 #[derive(Debug)]
@@ -48,6 +57,10 @@ pub(super) struct TurnRequest<'a> {
     pub(super) api_key: &'a str,
     pub(super) workdir: &'a std::path::Path,
     pub(super) roots: &'a std::path::Path,
+    /// 受管回合的权限（None = legacy 回合）。
+    pub(super) permission: Option<TurnPermission>,
+    /// 反向请求处理器（permission/request → master）。受管回合必填。
+    pub(super) on_request: Option<ReverseHandler>,
 }
 
 /// 驱动一次 agent 回合：spawn 插件 → 握手 → `agent/runTurn` → 事件泵 →
@@ -63,7 +76,10 @@ pub(super) async fn run_agent_turn(
         api_key,
         workdir,
         roots,
+        permission,
+        on_request,
     } = request;
+    let request_permission = permission;
     let mut session = plugin_session::open(plugin, false).await?;
 
     let params = RunTurnParams {
@@ -81,8 +97,22 @@ pub(super) async fn run_agent_turn(
         prompt: prompt.to_string(),
         workdir: workdir.display().to_string(),
         roots: roots.display().to_string(),
+        permission: request_permission,
     };
-    let outcome = plugin_session::invoke(
+    let reverse = on_request.map(|handler| {
+        Box::new(move |request: flow_plugin_sdk::protocol::jsonrpc::Request| {
+            let handler = handler.clone();
+            Box::pin(async move { handler(request).await }) as futures::future::BoxFuture<'static, _>
+        }) as Box<
+            dyn FnMut(
+                    flow_plugin_sdk::protocol::jsonrpc::Request,
+                ) -> futures::future::BoxFuture<
+                    'static,
+                    flow_plugin_sdk::protocol::jsonrpc::Message,
+                > + Send,
+        >
+    });
+    let outcome = plugin_session::invoke_with_reverse(
         &mut session,
         &plugin.invoke_method,
         serde_json::to_value(&params).expect("RunTurnParams serializable"),
@@ -97,6 +127,7 @@ pub(super) async fn run_agent_turn(
                 }
             }
         },
+        reverse,
     )
     .await;
     let outcome = match outcome {

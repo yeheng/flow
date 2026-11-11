@@ -61,6 +61,34 @@ pub fn verify(root: &Path) -> Result<Recovery> {
     if count != upper as i64 {
         return Err(invalid("SQLite fact count and commit watermark mismatch"));
     }
+    // 哈希链顺链校验（09 §10.2）：链首 prev=""，逐帧 chain == SHA-256(prev ‖ digest)。
+    // 改任何一帧的 body / digest / 链列，都会让该帧或其后全部失配。
+    {
+        let mut statement = conn
+            .prepare("SELECT lsn, prev_digest, digest, chain_digest FROM transactions ORDER BY lsn")
+            .map_err(crate::sqlite::db)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(crate::sqlite::db)?;
+        let mut expected_prev = String::new();
+        for row in rows {
+            let (lsn, prev, digest, chain) = row.map_err(crate::sqlite::db)?;
+            let expected = crate::sqlite::chain_digest(&expected_prev, &digest);
+            if prev != expected_prev || chain != expected {
+                return Err(invalid(format!(
+                    "transaction hash chain broken at lsn {lsn}"
+                )));
+            }
+            expected_prev = chain;
+        }
+    }
     let mut report = Recovery {
         journal_id: identity,
         last_lsn: 0,

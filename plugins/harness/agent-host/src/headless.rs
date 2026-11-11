@@ -368,6 +368,64 @@ impl std::ops::Deref for HeadlessHost {
     }
 }
 
+/// 受管形态（09 §8）：所有工具调用经 PermissionChannel 裁决（master 的
+/// `permission/request`），本地不再放行；`plan` 为只读上限。通道错误
+/// fail closed（Block），绝不回退 FullAuto。
+pub async fn build_headless_managed(
+    api_key: &str,
+    spec: &HeadlessSpec,
+    roots: &Path,
+    project_dir: &Path,
+    channel: crate::permission::PermissionChannel,
+    plan: bool,
+) -> Result<HeadlessHost, AssemblyError> {
+    if std::env::var_os("CONGA_LLM_KEY").is_some() {
+        return Err(AssemblyError::Config(
+            "CONGA_LLM_KEY must not be set in the environment: the headless path \
+             takes the api key as an explicit parameter"
+                .into(),
+        ));
+    }
+    let provider = spec.provider_config(api_key)?;
+    if provider.base_url.is_empty() || provider.model.is_empty() {
+        return Err(AssemblyError::Config(
+            "headless spec requires a non-empty base_url and model".into(),
+        ));
+    }
+    let cfg = crate::HostConfig {
+        tunables: spec.tunables(),
+        provider,
+    };
+    let pin = ScopedEnvPin::pin(&[
+        ("CONGA_CONFIG_DIR", roots.join("conga").into_os_string()),
+        (
+            "CONGA_PROJECT_DIR",
+            project_dir.to_path_buf().into_os_string(),
+        ),
+    ]);
+    if !agent_core::storage::config_dir().starts_with(roots) {
+        return Err(AssemblyError::Config(format!(
+            "conga config dir {:?} does not fall inside the pinned roots {:?}",
+            agent_core::storage::config_dir(),
+            roots
+        )));
+    }
+    let session = SessionManager::with_root(roots.join("sessions"));
+    let policy = std::sync::Arc::new(crate::permission::PermissionPolicy::new_managed(
+        channel, plan,
+    ));
+    let quiet_emit: crate::assembly::SubagentEmit =
+        Arc::new(|_: crate::subagent_types::SubagentEvent| {});
+    let stream_fn = cfg.provider_stream_fn();
+    let host = crate::assembly::assemble_managed_host(cfg, session, policy, quiet_emit).await;
+    let _ = stream_fn;
+    let _ = pin;
+    Ok(HeadlessHost {
+        host,
+        _pin: pin,
+    })
+}
+
 /// In-process variant of [`build_headless`]: provider + tunables arrive as
 /// typed values (no env reads), state root and project dir are pinned for the
 /// caller's scope, sessions live under `roots/sessions`. Same guarantees:

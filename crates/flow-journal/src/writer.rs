@@ -841,7 +841,7 @@ fn pump_step(disk: &mut Disk, shared: &Arc<Shared>, options: &JournalOptions) ->
             // brick the only writer. Only platform/storage faults freeze the authority.
             if !matches!(
                 error,
-                Error::Invalid(_) | Error::Limit(_) | Error::Conflict(_)
+                Error::Invalid(_) | Error::Limit(_) | Error::Conflict(_) | Error::Forbidden(_)
             ) {
                 drop(queue);
                 freeze(shared, failure);

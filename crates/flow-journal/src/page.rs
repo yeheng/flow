@@ -24,7 +24,24 @@ pub enum Filter {
     Events,
     Audit,
     All,
+    /// 09 §10.3：权限事件（policy_frozen / permission_asked / permission_decided /
+    /// run_approval_* / workflow_permissions_changed / plugin_grant_upserted）。
+    Permission,
 }
+/// 权限事件判定（09 §10.3）：闭集，与 codec EventKind 字面量一致。
+fn is_permission_kind(event: &crate::Event) -> bool {
+    matches!(
+        event.kind,
+        crate::EventKind::PolicyFrozen
+            | crate::EventKind::PermissionAsked
+            | crate::EventKind::PermissionDecided
+            | crate::EventKind::RunApprovalUpserted
+            | crate::EventKind::RunApprovalRemoved
+            | crate::EventKind::WorkflowPermissionsChanged
+            | crate::EventKind::PluginGrantUpserted
+    )
+}
+
 /// 分页游标。
 ///
 /// 游标绑定数据集、run、过滤条件与快照水位，并记录下一笔事务与事务内事件
@@ -130,6 +147,8 @@ pub fn page(
         Filter::All => "",
         Filter::Events => " AND run_event=1",
         Filter::Audit => " AND audit_event=1",
+        // 权限事实全部是 run 事件（无审计流条目），但 kind 过滤在事件层做。
+        Filter::Permission => " AND run_event=1",
     };
     let sql=format!("SELECT DISTINCT lsn FROM events WHERE run_id=? AND lsn>=? AND lsn<=?{predicate} ORDER BY lsn LIMIT 1024");
     let mut statement = conn.prepare(&sql).map_err(crate::sqlite::db)?;
@@ -175,6 +194,7 @@ pub fn page(
                     Filter::All => true,
                     Filter::Events => event.run_seq > 0,
                     Filter::Audit => audit,
+                    Filter::Permission => is_permission_kind(event),
                 };
             if include {
                 let positioned = PositionedEvent {

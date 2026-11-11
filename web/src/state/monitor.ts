@@ -1,7 +1,13 @@
 import { computed, reactive, watch } from "vue";
 import * as api from "../api/flow";
-import { client, errText } from "../rpc/client";
-import type { AdjudicateDecision, LogLine, ObservationLoss, TimelineNode } from "../types";
+import { RpcError, client, errText } from "../rpc/client";
+import type {
+  AdjudicateDecision,
+  ApprovalItem,
+  LogLine,
+  ObservationLoss,
+  TimelineNode,
+} from "../types";
 import { dirty, editor } from "./editor";
 import { TERMINAL_RUN_STATUSES } from "./labels";
 import { appendObservations, mergeObservationLoss } from "./monitor-logic";
@@ -48,6 +54,10 @@ export const monitor = reactive({
    * 停止对 timeline 的 250ms 重试（否则必失败的请求风暴），观测与原始事件仍可看。
    */
   timelineUnavailable: false,
+  /** 当前 run 的审批收件箱（approvals.list，timeline 发现审批等待时拉取） */
+  approvals: [] as ApprovalItem[],
+  /** run.start 因 -32020（legacy 工作流无权限块）被服务端拒绝 */
+  legacyStartBlocked: false,
   starting: false,
   /** 取消/交付信号/裁决进行中（按钮禁用，防重复点击） */
   cancelling: false,
@@ -87,6 +97,37 @@ export const waitingInputNodes = computed(() =>
 export const uncertainNodes = computed(() =>
   monitor.nodes.filter((n) => n.wait?.kind === "uncertain"),
 );
+
+/** 等待人工批准的节点（wait.kind === "approval" 且 approval 仍为 pending） */
+export const pendingApprovalNodes = computed(() =>
+  monitor.nodes.filter((n) => n.wait?.kind === "approval" && n.approval?.status === "pending"),
+);
+
+/**
+ * 拉取当前 run 的审批收件箱（approvals.list）。timeline 发现审批等待（wait.kind
+ * === "approval" 或节点 approval pending）时触发；终态后 refresh 不再调用。
+ * 失败静默：不打断时间线投影，下一轮发现仍在等待会再试。
+ */
+export async function refreshApprovals(): Promise<void> {
+  const runId = monitor.runId;
+  if (!runId) return;
+  try {
+    const page = await api.approvalsList(runId);
+    // 迟到响应不写回：期间可能已切到别的 run
+    if (monitor.runId === runId) monitor.approvals = page.items;
+  } catch {
+    // 收件箱拉取失败不影响运行观测
+  }
+}
+
+/**
+ * 手动要求下一次轮询强制重拉时间线（审批裁决后立即同步节点状态）。
+ * 正常路径由订阅事件置脏驱动；这里兜底「事件还没到/丢了」的场景。
+ */
+let timelinePoke = false;
+export function pokeTimeline(): void {
+  timelinePoke = true;
+}
 
 export function nodeRunState(nodeId: string): string | null {
   if (!monitor.runId || monitor.workflowId !== editor.workflowId) return null;
@@ -151,6 +192,7 @@ export async function startRun(): Promise<void> {
     }
   }
   monitor.starting = true;
+  monitor.legacyStartBlocked = false;
   const controller = new AbortController();
   startingController = controller;
   const workflowId = editor.workflowId;
@@ -175,6 +217,8 @@ export async function startRun(): Promise<void> {
       monitor.workflowId = workflowId;
     }
   } catch (e) {
+    // -32020：legacy 工作流（无权限块）不能启动新 run，横幅引导去权限页迁移
+    if (e instanceof RpcError && e.code === -32020) monitor.legacyStartBlocked = true;
     if (!controller.signal.aborted) toast.error(errText(e));
   } finally {
     if (startingController === controller) {
@@ -246,6 +290,7 @@ async function attach(runId: string, input?: unknown, signal?: AbortSignal): Pro
   previousStatus = monitor.status;
   monitor.timelineUnavailable = initial === null;
   monitor.nodes = initial?.nodes ?? [];
+  monitor.approvals = [];
   monitor.output = initial?.output;
   monitor.fatalError = initial?.fatal_error ?? null;
   monitor.lastSeq = initial?.last_seq ?? 0;
@@ -258,6 +303,14 @@ async function attach(runId: string, input?: unknown, signal?: AbortSignal): Pro
     storage_dropped: 0,
     history_incomplete: false,
   };
+  // 已在等审批的 run：attach 即拉收件箱（首轮回调可能没有事件置脏）
+  if (
+    initial &&
+    !TERMINAL_RUN_STATUSES.has(initial.status) &&
+    initial.nodes.some((n) => n.wait?.kind === "approval" || n.approval?.status === "pending")
+  ) {
+    void refreshApprovals();
+  }
   /** 空闲降频计数：观测存储独立于控制事件 flush，dirty 时紧跟拉取，
    * 否则每 4 拍（约 1Hz）拉一次，挂着的运行页不再每 250ms 白打 RPC */
   let ticks = 0;
@@ -268,8 +321,9 @@ async function attach(runId: string, input?: unknown, signal?: AbortSignal): Pro
       ticks++;
       const pollObservations = forceObservations || dirty || ticks === 1 || ticks % 4 === 0;
       // 时间线不可用（大 run 超预算）时不再重试：只拉观测，避免必失败的请求风暴
-      if (!monitor.timelineUnavailable && (dirty || monitor.status === null)) {
+      if (!monitor.timelineUnavailable && (dirty || monitor.status === null || timelinePoke)) {
         dirty = false;
+        timelinePoke = false;
         try {
           const snapshot = await api.runTimeline(runId);
           if (!current()) return;
@@ -281,6 +335,13 @@ async function attach(runId: string, input?: unknown, signal?: AbortSignal): Pro
           monitor.output = snapshot.output;
           monitor.fatalError = snapshot.fatal_error;
           notifyTerminal(snapshot.status);
+          // 节点在等审批（或审批仍 pending）：拉一次收件箱供审批卡渲染；终态停止
+          if (
+            !TERMINAL_RUN_STATUSES.has(snapshot.status) &&
+            snapshot.nodes.some((n) => n.wait?.kind === "approval" || n.approval?.status === "pending")
+          ) {
+            void refreshApprovals();
+          }
         } catch {
           if (!current()) return;
           monitor.timelineUnavailable = true;
@@ -358,6 +419,8 @@ export async function detachRun(): Promise<void> {
   monitor.fatalError = null;
   monitor.lastSeq = 0;
   monitor.nodes = [];
+  monitor.approvals = [];
+  monitor.legacyStartBlocked = false;
   monitor.logs = [];
   monitor.logsByNode = {};
   monitor.lastLogSeq = "0";

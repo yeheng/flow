@@ -52,6 +52,8 @@ enum Undo {
     Value(flow_journal::value::ValueUndo),
     /// 写者纪元前像。
     Epoch(u64),
+    /// 插件授予前像（键 → 旧授予；None = 此前未授予）。
+    PluginGrant(String, Option<Box<PluginGrant>>),
 }
 
 /// 配置类容器的种类。
@@ -156,6 +158,18 @@ impl UndoLog {
             }
             // 纪元只有一个标量，旧值本身就是完整前像。
             EventKind::MasterEpochStarted => self.0.push(Undo::Epoch(state.master_epoch)),
+            // 插件授予按 (id, hash) 键整体替换：旧条目可能不存在。
+            EventKind::PluginGrantUpserted => {
+                let key = string(p, "plugin_id").and_then(|id| {
+                    string(p, "content_hash").map(|hash| PluginGrant::key(&id, &hash))
+                });
+                if let Ok(key) = key {
+                    self.0.push(Undo::PluginGrant(
+                        key.clone(),
+                        state.plugin_grants.get(&key).cloned().map(Box::new),
+                    ));
+                }
+            }
             EventKind::ValueChunk | EventKind::ValuePublished => {
                 // 发布缓存也是折叠态的一部分：发布失败必须把缓存还原，
                 // 否则会留下「引用了未发布值」的悬空状态。
@@ -196,7 +210,16 @@ impl UndoLog {
             | EventKind::SignalReceived
             | EventKind::Adjudicated
             | EventKind::LateAudit
-            | EventKind::OperationRetryAuthorized => {}
+            | EventKind::OperationRetryAuthorized
+            // 权限事实：只改 run/node 的执行字段（策略/授权投影/审批态），
+            // 由下面通用的 Run/Node 摘要前像还原。
+            | EventKind::PolicyFrozen
+            | EventKind::PermissionAsked
+            | EventKind::PermissionDecided
+            | EventKind::RunApprovalUpserted
+            | EventKind::RunApprovalRemoved
+            // 纯审计标记（只校验不改状态），无需前像。
+            | EventKind::WorkflowPermissionsChanged => {}
         }
         // 不带 run 身份的事件（数据集级事件）到不了 run/node 这一层，
         // 它们的前像已在上面的分支里采集完毕。
@@ -350,6 +373,9 @@ impl UndoLog {
                 Undo::Command(id, previous) => restore_one(&mut state.commands, id, previous),
                 Undo::Value(previous) => state.values.restore(previous),
                 Undo::Epoch(previous) => state.master_epoch = previous,
+                Undo::PluginGrant(key, previous) => {
+                    restore_one(&mut state.plugin_grants, key, previous.map(|v| *v))
+                }
             }
         }
         Ok(())

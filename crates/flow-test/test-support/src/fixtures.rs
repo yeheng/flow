@@ -511,3 +511,41 @@ pub fn timeline_node<'a>(timeline: &'a Value, node_id: &str) -> &'a Value {
         .find(|n| n["id"] == json!(node_id))
         .unwrap_or_else(|| panic!("timeline 里没有节点 {node_id}：{timeline}"))
 }
+
+// ---- 09 权限模型夹具：给副作用节点定义生成精确 permissions 块 ----
+
+/// 顶层 permissions 块（execute 模式）。
+pub fn permissions_block(allow: Value) -> Value {
+    json!({"version": 1, "mode": "execute", "allow": allow})
+}
+
+/// Net 能力条目（methods + url_prefix）。
+pub fn net_cap(id: &str, method: &str, prefix: &str, approval: &str) -> Value {
+    json!({"id": id, "action": "net", "methods": [method], "url_prefix": prefix,
+           "approval": approval})
+}
+
+/// Secret 能力条目。
+pub fn secret_cap(id: &str, name: &str, approval: &str) -> Value {
+    json!({"id": id, "action": "secret", "names": [name], "approval": approval})
+}
+
+/// 给 start → http_call → end 定义按当前 URL 生成 auto/ask 的权限块并升级
+/// semantics=2。对 http_def / http_def_full 产物直接可用。
+pub fn governed_http_def(method: &str, url: &str, approval: &str) -> Value {
+    let mut definition = http_def(method, url);
+    definition["semantics"] = json!(2);
+    // URL → 前缀（同 scheme://host:port/path 全量匹配）。
+    definition["permissions"] = permissions_block(json!([
+        net_cap("call-net", method, url, approval)
+    ]));
+    definition
+}
+
+/// 任意定义升级为受管定义：注入顶层 permissions 块与 semantics=2。
+pub fn governed(definition: &Value, allow: Value) -> Value {
+    let mut governed = definition.clone();
+    governed["semantics"] = json!(2);
+    governed["permissions"] = permissions_block(allow);
+    governed
+}

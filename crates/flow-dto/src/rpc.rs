@@ -71,6 +71,11 @@ methods! {
         NodetypesList => "nodetypes.list",
         PluginsList => "plugins.list",
         PluginsRecheck => "plugins.recheck",
+        // 09 权限模型：待审批收件箱与有效权限（只读，不含 secret 值）。
+        ApprovalsList => "approvals.list",
+        PermissionsEffective => "permissions.effective",
+        /// 数据集级权限审计分页（谁在何时批了什么；按 actor/decision/run 过滤）。
+        PermissionsAuditPage => "permissions.audit.page",
     }
     write {
         WorkflowImport => "workflow.import",
@@ -97,6 +102,12 @@ methods! {
         SecretsSet => "secrets.set",
         SecretsDelete => "secrets.delete",
         ConfigUpdate => "config.update",
+        // 09 权限模型：人工审批与 Run 精确授权撤销（只能裁决当前 pending 实例）。
+        RunApprove => "run.approve",
+        RunDeny => "run.deny",
+        RunApprovalsRevoke => "run.approvals.revoke",
+        // 09 §7：插件能力授予（管理员显式批准；只写 journal 不回写部署文件）。
+        PermissionsGrant => "permissions.grant",
     }
 }
 

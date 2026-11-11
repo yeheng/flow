@@ -21,9 +21,68 @@ use std::{net::SocketAddr, sync::Arc};
 pub struct Context {
     backend: Arc<JournalBackend>,
     token: String,
+    /// 分档 API key（09 §9；FLOW_JOURNAL_TOKEN 恒为隐式 admin key）。
+    api_keys: Vec<flow_config::ApiKey>,
     /// 产品装配（统一配置面 + 持久化密钥）。None = 未装配（开发模式），
     /// config/secrets 方法报「未启用」。
     product: Option<Arc<crate::AppState>>,
+}
+
+/// admit_call 解析出的调用主体与所需 scope。
+pub struct Caller {
+    pub principal: flow_dto::permission::Principal,
+    /// 该调用要求的最低 scope（读=read，写=write，审批=approve）。
+    pub required_scope: &'static str,
+}
+
+/// 解析主体并按方法 scope 裁决（admin key 恒通过）。
+fn resolve_caller(
+    ctx: &Context,
+    method: &str,
+    supplied: &str,
+) -> Result<Caller, ErrorObjectOwned> {
+    if constant_time_eq(supplied, &ctx.token) {
+        return Ok(Caller {
+            principal: flow_dto::permission::Principal::LocalAdmin,
+            required_scope: "read",
+        });
+    }
+    // 明文 → sha256 与配置比对（常时比较逐 key）。
+    let digest = {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(supplied.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    let now = chrono::Utc::now();
+    for key in &ctx.api_keys {
+        if !constant_time_eq(&digest, &key.token_hash) {
+            continue;
+        }
+        // scope 裁决：读面 read；审批 write 级（Once）+ approve；其余写 write；
+        // 权限管理（grant/keys）admin。
+        let required: &'static str = match method {
+            "run.approve" | "run.deny" => "approve",
+            "permissions.grant" => "admin",
+            m if flow_dto::rpc::is_read_method(m) => "read",
+            _ => "write",
+        };
+        if !key.has_scope(required, now) {
+            return Err(ErrorObjectOwned::owned(
+                PERMISSION_ERROR,
+                format!("api key {} lacks '{required}' scope", key.id),
+                None::<()>,
+            ));
+        }
+        return Ok(Caller {
+            principal: flow_dto::permission::Principal::ApiKey {
+                id: key.id.clone(),
+            },
+            required_scope: required,
+        });
+    }
+    Err(ErrorObjectOwned::owned(-32001, "unauthorized", None::<()>))
 }
 use crate::invalid;
 /// 把 journal 错误映射为 v2 错误码。
@@ -33,8 +92,8 @@ use crate::invalid;
 ///
 /// # Errors
 /// 返回 `-32012` conflict / `-32021` limit / `-32011` not found /
-/// `-32602` invalid params，其余一律降级为 `-32603` internal——不向客户端
-/// 泄漏内部细节。
+/// `-32020` permission（09 权限模型拒绝）/ `-32602` invalid params，其余
+/// 一律降级为 `-32603` internal——不向客户端泄漏内部细节。
 fn failure(error: JournalError) -> ErrorObjectOwned {
     match error {
         JournalError::Journal(flow_journal::Error::Conflict(message)) => {
@@ -46,10 +105,17 @@ fn failure(error: JournalError) -> ErrorObjectOwned {
         JournalError::Journal(flow_journal::Error::NotFound(message)) => {
             ErrorObjectOwned::owned(-32011, message, None::<()>)
         }
+        JournalError::Journal(flow_journal::Error::Forbidden(message)) => {
+            ErrorObjectOwned::owned(PERMISSION_ERROR, message, None::<()>)
+        }
         JournalError::Journal(flow_journal::Error::Invalid(message)) => invalid(message),
         _ => ErrorObjectOwned::owned(-32603, "journal service unavailable", None::<()>),
     }
 }
+
+/// 权限模型拒绝的错误码（09）：legacy 定义需迁移、能力不足、无审批权、
+/// 审批实例冲突/过期。
+pub const PERMISSION_ERROR: i32 = -32020;
 /// 视图层错误到 v2 错误码的映射（复用 journal 的同一套码表）。
 ///
 /// 产品面读法（journal_views）产生的错误必须与写面同码，否则客户端要
@@ -345,12 +411,26 @@ pub fn module_product(
     token: String,
     product: Option<Arc<crate::AppState>>,
 ) -> Result<RpcModule<Context>, Box<dyn std::error::Error>> {
+    module_product_with_keys(backend, token, product, Vec::new())
+}
+
+/// 同 [`module_product`]，但带 `[[api_keys]]`（09 §9 分档鉴权）。
+pub fn module_product_with_keys(
+    backend: Arc<JournalBackend>,
+    token: String,
+    product: Option<Arc<crate::AppState>>,
+    api_keys: Vec<flow_config::ApiKey>,
+) -> Result<RpcModule<Context>, Box<dyn std::error::Error>> {
     if token.len() < 32 {
         return Err("FLOW_JOURNAL_TOKEN must contain at least 32 bytes".into());
+    }
+    for key in &api_keys {
+        key.validate().map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     }
     let mut module = RpcModule::new(Context {
         backend,
         token,
+        api_keys,
         product,
     });
     for &method in Method::ALL {
@@ -395,7 +475,7 @@ async fn admit_call(
     ctx: &Context,
     method: &str,
     params: jsonrpsee::types::Params<'_>,
-) -> Result<(Value, Option<String>), ErrorObjectOwned> {
+) -> Result<(Value, Option<String>, Caller), ErrorObjectOwned> {
     // JSON-RPC 允许整体省略 params（到达的是 null）——归一为空对象。
     let mut p: Value = match params.parse::<Value>() {
         Ok(Value::Null) => json!({}),
@@ -403,9 +483,7 @@ async fn admit_call(
         Err(e) => return Err(e),
     };
     let supplied = p.get("_token").and_then(Value::as_str).unwrap_or("");
-    if !constant_time_eq(supplied, &ctx.token) {
-        return Err(ErrorObjectOwned::owned(-32001, "unauthorized", None::<()>));
-    }
+    let caller = resolve_caller(ctx, method, supplied)?;
     // 令牌在鉴权后从参数里摘掉：它不该进入命令指纹（幂等去重），更不该
     // 被回显给客户端。
     p.as_object_mut()
@@ -425,7 +503,7 @@ async fn admit_call(
     if is_write_method(method) && request.is_none_or(|id| id.trim().is_empty()) {
         return Err(invalid("request_id required for write commands"));
     }
-    Ok((p, request_id))
+    Ok((p, request_id, caller))
 }
 
 /// 单条方法分发：cluster 族与读面直接返回；写命令产出回执。
@@ -442,7 +520,7 @@ async fn dispatch_call(
     method: Method,
     params: jsonrpsee::types::Params<'_>,
 ) -> Result<Value, ErrorObjectOwned> {
-    let (p, request_id) = admit_call(ctx, method.as_str(), params).await?;
+    let (p, request_id, caller) = admit_call(ctx, method.as_str(), params).await?;
     let request = request_id.as_deref();
     let b = &ctx.backend;
     let receipt = match method {
@@ -463,7 +541,7 @@ async fn dispatch_call(
         Method::WorkflowGet | Method::RunGet | Method::LegacyGet => {
             return snapshot_get(b, method.as_str(), &p).await
         }
-        Method::RunEventsPage | Method::RunAuditPage => {
+        Method::RunEventsPage | Method::RunAuditPage | Method::PermissionsAuditPage => {
             return events_page(b, method.as_str(), &p).await
         }
 
@@ -641,13 +719,86 @@ async fn dispatch_call(
             return Ok(json!({"node_types": crate::node_types()}));
         }
         Method::PluginsList => {
-            let plugins: Vec<Value> = flow_backend::plugin_registry::discover_plugins()
-                .iter()
-                .map(flow_backend::plugin_registry::plugin_list_entry)
-                .collect();
-            return Ok(json!({"plugins": plugins}));
+            return Ok(json!({"plugins": b.plugins_view().await}));
         }
         Method::PluginsRecheck => return plugins_recheck(ctx).await,
+        // ---- 09 权限模型 ----
+        Method::RunApprove | Method::RunDeny => {
+            let allow = method == Method::RunApprove;
+            let scope = match p.get("scope").and_then(Value::as_str) {
+                None | Some("once") => flow_dto::permission::ApprovalScope::Once,
+                Some("run") => flow_dto::permission::ApprovalScope::Run,
+                Some(other) => {
+                    return Err(invalid(format!("scope must be once | run, got {other}")))
+                }
+            };
+            b.run_decide(
+                flow_backend::journal_permissions::ApprovalCommand {
+                    run_id: text(&p, "run_id")?,
+                    node_id: text(&p, "node_id")?,
+                    operation_id: text(&p, "operation_id")?,
+                    request_hash: text(&p, "request_hash")?,
+                    allow,
+                    scope,
+                    reason: p.get("reason").and_then(Value::as_str),
+                    by: caller.principal.clone(),
+                },
+                request.ok_or_else(|| invalid("request_id required"))?,
+            )
+            .await
+        }
+        Method::PermissionsGrant => {
+            let capability_ids = match p.get("capability_ids") {
+                None | Some(Value::Null) => None,
+                Some(Value::Array(items)) => Some(
+                    items
+                        .iter()
+                        .map(|item| {
+                            item.as_str()
+                                .map(str::to_string)
+                                .ok_or_else(|| invalid("capability_ids must be strings"))
+                        })
+                        .collect::<std::result::Result<Vec<_>, _>>()?,
+                ),
+                Some(_) => return Err(invalid("capability_ids must be an array")),
+            };
+            b.plugin_grant(
+                text(&p, "plugin_id")?,
+                capability_ids,
+                p.get("legacy_confirm").and_then(Value::as_bool).unwrap_or(false),
+                request.ok_or_else(|| invalid("request_id required"))?,
+            )
+            .await
+        }
+        Method::RunApprovalsRevoke => {
+            b.run_approval_revoke(
+                text(&p, "run_id")?,
+                text(&p, "node_id")?,
+                text(&p, "digest")?,
+                caller.principal.clone(),
+                request.ok_or_else(|| invalid("request_id required"))?,
+            )
+            .await
+        }
+        Method::ApprovalsList => {
+            return Ok(b
+                .approvals_view(
+                    p.get("run_id").and_then(Value::as_str),
+                    p.get("all").and_then(Value::as_bool).unwrap_or(false),
+                )
+                .await)
+        }
+        Method::PermissionsEffective => {
+            return b
+                .permissions_effective_view(
+                    p.get("workflow_id").and_then(Value::as_str),
+                    optional_version(&p)?,
+                    p.get("node_id").and_then(Value::as_str),
+                    p.get("run_id").and_then(Value::as_str),
+                )
+                .await
+                .map_err(failure)
+        }
     }
     // 写命令的共同出口：回执统一在这里转成 JSON，错误统一在这里按
     // journal 错误类型分层——读面各自 return，不经过这条路径。
@@ -833,10 +984,13 @@ async fn events_page(
         return Err(ErrorObjectOwned::owned(-32011, "run not found", None::<()>));
     }
     // 事件面与审计面是两种不同的流：前者是业务进展，后者是执行器审计事实。
-    let filter = if method == "run.events.page" {
-        Filter::Events
-    } else {
-        Filter::Audit
+    // permissions 模式（09 §10.3）过滤权限事件闭集（谁在何时批了什么）。
+    let filter = match method {
+        "run.events.page" => Filter::Events,
+        "run.audit.page" if p.get("filter").and_then(Value::as_str) == Some("permission") => {
+            Filter::Permission
+        }
+        _ => Filter::Audit,
     };
     let identity = b.journal.id().to_owned();
     // 无游标 = 从第一页开始；游标自带过滤条件与位置，必须与本次请求的

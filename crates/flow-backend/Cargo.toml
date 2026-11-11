@@ -42,6 +42,7 @@ flow-engine = { path = "../flow-engine" }
 tokio-tungstenite = { workspace = true }
 flow-dto = { path = "../flow-dto" }
 flow-config = { path = "../flow-config" }
+url = { workspace = true }
 
 [dev-dependencies]
 # 自依赖只为给集成测试打开 fault-injection feature 的历史使命已终结：相关

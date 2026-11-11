@@ -63,8 +63,14 @@ impl Coordinator {
     ///
     /// agent 节点另设子上限（上限的一半）：agent 一次占满一个执行器且
     /// 生命周期长，宽松地排满会让普通节点完全排不上队。
+    ///
+    /// 审批挂起（09 §6.1）的派发已交还执行槽位（本地池 park），按挂起计数
+    /// 扣除：几个夜间待审批不能占满 X_max。挂起本身受 A_MAX 约束（池侧）。
     fn has_capacity(&self, node: &flow_engine::Node) -> bool {
-        self.tasks.len() < self.limit
+        let parked = crate::journal::PARKED_DISPATCHES
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let busy = self.tasks.len().saturating_sub(parked);
+        busy < self.limit
             && (!node.is_harness_agent() || self.agents.len() < self.limit.div_ceil(2))
     }
 }
@@ -556,7 +562,19 @@ async fn advance_committed_node(
         }).await?;
         return Ok(true);
     }
-    if record.status == NodeStatus::Waiting {
+    // 审批等待是派发内的非封口等待：走到这里说明派发已无活动任务（主进程
+    // 重启/会话丢失）。节点级询问（尚无授权操作）→ 重派发，执行器沿用原
+    // operation_id 重新登记、继承原 deadline（§6.1）；工具级询问（回合已
+    // 授权在飞）→ 交给下面的未决操作路径转 Uncertain，不自动重跑整轮。
+    let approval_wait = record.status == NodeStatus::Waiting
+        && record
+            .wait
+            .as_ref()
+            .is_some_and(|wait| wait.kind() == WaitKind::Approval);
+    if approval_wait && record.operation.is_none() {
+        return Ok(false);
+    }
+    if record.status == NodeStatus::Waiting && !approval_wait {
         let wait = record
             .wait
             .as_ref()
@@ -855,6 +873,19 @@ async fn execute_node(
             //   run_adjudicate 不再有出口。
             let operation = n.operation.as_ref();
             let uncertain = operation.is_some();
+            // 节点级审批等待中断链/会话死亡（操作未授权、无副作用风险）：
+            // 不写失败事实——保持 Approval 等待，交回调度器重派发（执行器沿用
+            // 原 operation_id 重新登记、继承原 deadline）。TTL 到期后 G3 直接
+            // Deny，因此重派发不会无限循环。
+            let awaiting_approval = !uncertain
+                && n.wait
+                    .as_ref()
+                    .is_some_and(|wait| wait.kind() == WaitKind::Approval);
+            if awaiting_approval {
+                tracing::warn!(run_id = %attempt.run_id, node_id = %attempt.node_id,
+                    error = %error, "session lost while awaiting approval; redispatching");
+                return (key, result);
+            }
             let mut payload = if uncertain {
                 let integrity = if operation.is_some_and(|o| o.outcome.is_none()) {
                     "unknown"

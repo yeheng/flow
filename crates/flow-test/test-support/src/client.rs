@@ -165,7 +165,25 @@ pub async fn call_err(conn: &Conn, method: &str, params: Value) -> ErrorObjectOw
 }
 
 /// 建工作流 → 存定义 → 发布，返回 (workflow_id, version)。
+///
+/// 09 权限模型：含内置副作用节点、且未声明权限块的定义，自动注入「恰好
+/// 覆盖自身字面操作」的精确能力（见 [`crate::permissions`]）——存量用例
+/// 测的是节点语义而不是权限。验证 legacy 门本身用 [`publish_legacy_workflow`]。
 pub async fn publish_workflow(conn: &Conn, name: &str, definition: Value) -> (String, i64) {
+    publish_legacy_workflow(
+        conn,
+        name,
+        crate::permissions::with_static_permissions(definition),
+    )
+    .await
+}
+
+/// 原样发布（不注入权限块）：legacy 门、权限缺失等用例专用。
+pub async fn publish_legacy_workflow(
+    conn: &Conn,
+    name: &str,
+    definition: Value,
+) -> (String, i64) {
     let created: Value = call(conn, "workflow.create", json!({ "name": name })).await;
     let workflow_id = created["workflow_id"].as_str().unwrap().to_string();
     let updated: Value = call(
@@ -239,6 +257,76 @@ pub async fn wait_run_terminal(conn: &Conn, run_id: &str, timeout: Duration) -> 
         }
         if Instant::now() > deadline {
             panic!("等待 run {run_id} 终态超时：{last}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// run.approve（裁决该节点当前 pending 的请求实例）。
+pub async fn approve(
+    conn: &Conn,
+    run_id: &str,
+    node_id: &str,
+    operation_id: &str,
+    request_hash: &str,
+    scope: &str,
+) -> Value {
+    call_json(
+        conn,
+        "run.approve",
+        json!({"run_id": run_id, "node_id": node_id, "operation_id": operation_id,
+               "request_hash": request_hash, "scope": scope}),
+    )
+    .await
+}
+
+/// run.deny（必须带理由）。
+pub async fn deny(
+    conn: &Conn,
+    run_id: &str,
+    node_id: &str,
+    operation_id: &str,
+    request_hash: &str,
+    reason: &str,
+) -> Value {
+    call_json(
+        conn,
+        "run.deny",
+        json!({"run_id": run_id, "node_id": node_id, "operation_id": operation_id,
+               "request_hash": request_hash, "reason": reason}),
+    )
+    .await
+}
+
+/// approvals.list（默认只看 pending）。
+pub async fn approvals(conn: &Conn, run_id: Option<&str>) -> Value {
+    call_json(
+        conn,
+        "approvals.list",
+        json!({"run_id": run_id}),
+    )
+    .await
+}
+
+/// 轮询 approvals.list 直到该 run/node 出现 pending 询问，返回该条目。
+pub async fn wait_pending_approval(
+    conn: &Conn,
+    run_id: &str,
+    node_id: &str,
+    timeout: Duration,
+) -> Value {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let list = approvals(conn, Some(run_id)).await;
+        if let Some(item) = list["items"].as_array().and_then(|items| {
+            items
+                .iter()
+                .find(|item| item["run_id"] == json!(run_id) && item["node_id"] == json!(node_id))
+        }) {
+            return item.clone();
+        }
+        if Instant::now() > deadline {
+            panic!("等待 {run_id}/{node_id} 的 pending 审批超时：{list}");
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

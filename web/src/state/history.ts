@@ -34,6 +34,8 @@ function cloneNode(n: EditorNode): EditorNode {
       name: n.data.name,
       nodeType: n.data.nodeType,
       params: deepCloneJson(n.data.params ?? {}),
+      // 节点权限随快照克隆：权限编辑同样可撤销/重做
+      permissions: n.data.permissions ? deepCloneJson(n.data.permissions) : undefined,
     },
   };
 }

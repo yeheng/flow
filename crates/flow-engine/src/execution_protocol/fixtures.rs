@@ -14,8 +14,8 @@ use serde_json::json;
 use super::contract::PROTOCOL_VERSION;
 use super::frame::FRAME_LENGTH_BYTES;
 use super::message::{
-    AuditRecord, ExecuteTask, Message, ObservationLine, ResultOutcome, TaskValue, WaitKind,
-    WaitRequest,
+    AuditRecord, ExecuteTask, Message, ObservationLine, PermitCredential, ResultOutcome,
+    TaskValue, WaitKind, WaitRequest,
 };
 
 /// 引用型值样本（`TaskValue::Ref` 用）。
@@ -81,6 +81,7 @@ pub fn valid_messages() -> Vec<Message> {
                 prepared: None,
                 previous_outcome: None,
                 observability: true,
+                pending_operation: Some("op-0".into()),
             }),
         },
         Message::Accepted {
@@ -110,7 +111,36 @@ pub fn valid_messages() -> Vec<Message> {
             operation_id: "op-1".into(),
             permit_id: "permit-1".into(),
             request_fingerprint: "ff".repeat(32),
-            credential: Some("token".into()),
+            credentials: vec![PermitCredential {
+                name: "API_KEY".into(),
+                value: "token".into(),
+            }],
+        },
+        Message::OperationPending {
+            dispatch_id: "dispatch-09".into(),
+            operation_id: "op-1".into(),
+            request_fingerprint: "ff".repeat(32),
+            deadline_ms: 1_790_000_000_000,
+        },
+        Message::OperationDenied {
+            dispatch_id: "dispatch-09".into(),
+            operation_id: "op-1".into(),
+            request_fingerprint: "ff".repeat(32),
+            reason: "workflow 能力上限未满足".into(),
+        },
+        Message::ToolPermissionRequest {
+            dispatch_id: "dispatch-09".into(),
+            tool_call_id: "tc-1".into(),
+            tool: "bash".into(),
+            params: json!({"command": "git status"}),
+            cwd: Some("/tmp/work".into()),
+        },
+        Message::ToolPermissionDecision {
+            dispatch_id: "dispatch-09".into(),
+            tool_call_id: "tc-1".into(),
+            operation_id: "op-tool-1".into(),
+            allowed: true,
+            reason: None,
         },
         Message::TransferChunk {
             dispatch_id: "dispatch-09".into(),
@@ -228,8 +258,8 @@ pub fn corrupt_frames() -> Vec<Vec<u8>> {
         frame
     };
     vec![
-        // 变体索引越界（目录 28 个变体，索引 0..=27）。
-        frame_of(&[28]),
+        // 变体索引越界（v8 目录 32 个变体，索引 0..=31）。
+        frame_of(&[32]),
         frame_of(&[200]),
         // 截断的 varint（0x80 起始的连续字节，帧体在此结束）。
         frame_of(&[0x80, 0x80, 0x80]),

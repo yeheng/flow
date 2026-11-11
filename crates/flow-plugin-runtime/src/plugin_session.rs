@@ -18,6 +18,7 @@
 
 use std::time::Duration;
 
+use futures::future::BoxFuture;
 use flow_engine::execution_protocol::environment::EXECUTOR_ENV_WHITELIST;
 use flow_plugin_sdk::ipc::{Session, SpawnConfig};
 use flow_plugin_sdk::protocol::envelope::{read_frame, write_frame, Frame, FrameKind};
@@ -73,13 +74,13 @@ pub(super) async fn open(
         .await
         .map_err(|error| PluginSessionError::Setup(format!("plugin spawn failed: {error}")))?;
 
+    let mut capabilities = vec![flow_plugin_sdk::protocol::handshake::Capability::MasterPermitV1];
+    if require_binary_blocks {
+        capabilities.push(flow_plugin_sdk::protocol::handshake::Capability::BinaryBlocks);
+    }
     let params = InitializeParams {
         protocol_version: PROTOCOL_VERSION,
-        capabilities: if require_binary_blocks {
-            vec![flow_plugin_sdk::protocol::handshake::Capability::BinaryBlocks]
-        } else {
-            vec![]
-        },
+        capabilities,
         client_info: serde_json::json!({"name": "flow-executor"}),
     };
     let initialize = Message::Request(initialize_request(Id::Number(1), &params));
@@ -143,7 +144,27 @@ pub(super) async fn invoke(
     session: &mut Session,
     method: &str,
     params: serde_json::Value,
+    on_notification: impl FnMut(&flow_plugin_sdk::protocol::jsonrpc::Notification),
+) -> Result<InvokeOutcome, PluginSessionError> {
+    invoke_with_reverse(session, method, params, on_notification, None).await
+}
+
+/// 带反向请求处理的 invoke（09 §8 G5）：插件在回合内发起的
+/// `permission/request` 等请求交给 `on_request` 裁决并回响应；未提供
+/// 处理器时维持旧行为（忽略——旧插件不发请求）。
+#[allow(clippy::type_complexity)]
+pub(super) async fn invoke_with_reverse<'a>(
+    session: &mut Session,
+    method: &str,
+    params: serde_json::Value,
     mut on_notification: impl FnMut(&flow_plugin_sdk::protocol::jsonrpc::Notification),
+    mut on_request: Option<
+        Box<
+            dyn FnMut(flow_plugin_sdk::protocol::jsonrpc::Request) -> BoxFuture<'static, Message>
+                + Send
+                + 'a,
+        >,
+    >,
 ) -> Result<InvokeOutcome, PluginSessionError> {
     let request = Message::Request(Request {
         jsonrpc: "2.0",
@@ -173,7 +194,22 @@ pub(super) async fn invoke(
                             binary,
                         });
                     }
-                    // 其余消息（迟到响应/请求）：无反向能力时忽略。
+                    // 反向请求（permission/request 等）：交给宿主裁决并回响应。
+                    Message::Request(plugin_request) => {
+                        let Some(handler) = on_request.as_mut() else {
+                            continue;
+                        };
+                        let id = plugin_request.id.clone();
+                        let response = handler(plugin_request).await;
+                        // 响应回写与帧读取串行（同一 channel_mut 借用）。
+                        if write_rpc(session, &response).await.is_err() {
+                            return Err(PluginSessionError::Invoke(
+                                "plugin channel failed writing reverse response".into(),
+                            ));
+                        }
+                        let _ = id;
+                    }
+                    // 其余消息（迟到响应）：忽略。
                     _ => {}
                 }
             }

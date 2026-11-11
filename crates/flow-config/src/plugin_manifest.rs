@@ -39,6 +39,37 @@ pub struct PluginManifest {
     pub ui: UiSection,
     /// `[methods]`：runtime 可调方法。
     pub methods: MethodsSection,
+    /// `[permissions]`：能力需求上限声明（09 §7）。缺省 = legacy-unrestricted
+    /// （不伪装为空能力；执行需管理员显式确认）。声明只是需求上限，
+    /// 实际允许范围 = 声明 ∩ 安装授予 ∩ run 策略 ∩ 逐次裁决。
+    pub permissions: ManifestPermissions,
+}
+
+/// `[permissions]` 的解析结果。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ManifestPermissions {
+    /// 未声明：无限制执行的旧插件。授予页必须显式确认风险后才能用于新 run；
+    /// Plan 模式一律拒绝。
+    Legacy,
+    /// 已声明的能力需求（闭集）。
+    Declared(PermissionsSection),
+}
+
+/// 权限声明段（schema=1）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PermissionsSection {
+    pub schema: u32,
+    /// 宿主/执行器/插件三方握手的能力要求（当前闭集：master-permit-v1）。
+    pub required_features: Vec<String>,
+    pub capabilities: Vec<ManifestCapability>,
+}
+
+/// 一条 manifest 能力声明：matcher + required（未授予的 required 能力使
+/// 插件不可执行；optional 可缺失，插件自行处理）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ManifestCapability {
+    pub capability: flow_dto::permission::Capability,
+    pub required: bool,
 }
 
 /// `[plugin]` 段。
@@ -165,6 +196,28 @@ pub struct UiProjection {
 }
 
 impl PluginManifest {
+    /// 权限声明投影（run 快照冻结物，09 §7.2 `PermissionProjection` 的内容）：
+    /// 规范化需求 + required，不含授予（授予记录只写 journal）。
+    pub fn permissions_projection(&self) -> Option<serde_json::Value> {
+        let ManifestPermissions::Declared(section) = &self.permissions else {
+            return None;
+        };
+        let capabilities: Vec<serde_json::Value> = section
+            .capabilities
+            .iter()
+            .map(|entry| {
+                let mut value = entry.capability.to_json();
+                value["required"] = serde_json::json!(entry.required);
+                value
+            })
+            .collect();
+        Some(serde_json::json!({
+            "schema": section.schema,
+            "required_features": section.required_features,
+            "capabilities": capabilities,
+        }))
+    }
+
     /// 生成 UI 投影（快照冻结物）。
     pub fn ui_projection(&self) -> UiProjection {
         UiProjection {
@@ -264,6 +317,62 @@ impl PluginManifest {
                 _ => {}
             }
         }
+        self.validate_permissions()?;
+        Ok(())
+    }
+
+    /// 权限声明的闭集校验（09 §7.1）：未知握手要求、重复 id、secret 引用
+    /// 归属（config.*/params.* 必须指向本插件声明的 Widget::Secret 字段）。
+    fn validate_permissions(&self) -> Result<(), ManifestError> {
+        let ManifestPermissions::Declared(section) = &self.permissions else {
+            return Ok(());
+        };
+        const KNOWN_FEATURES: [&str; 1] = ["master-permit-v1"];
+        for feature in &section.required_features {
+            if !KNOWN_FEATURES.contains(&feature.as_str()) {
+                return Err(ManifestError(format!(
+                    "[permissions].required_features 含未知能力 {feature:?}（闭集 master-permit-v1）"
+                )));
+            }
+        }
+        // secret 字段集合：config 与 params 表单里声明为 Widget::Secret 的 key。
+        let mut secret_keys = std::collections::BTreeSet::new();
+        for field in self
+            .config_fields
+            .iter()
+            .chain(self.ui.params_forms.iter().flat_map(|form| &form.fields))
+        {
+            if matches!(field.widget, Widget::Secret) {
+                secret_keys.insert(field.key.clone());
+            }
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for entry in &section.capabilities {
+            let id = &entry.capability.id;
+            if !ids.insert(id.clone()) {
+                return Err(ManifestError(format!(
+                    "[permissions] 能力 id 重复：{id}"
+                )));
+            }
+            if let flow_dto::permission::ResourcePattern::Secret { names } = &entry.capability.pattern
+            {
+                for name in names {
+                    // 引用形式 config.<key> / params.<key> 必须指向本插件声明的
+                    // secret 字段；其余按直接密钥名（manifest 不硬编码用户密钥名，
+                    // 直接名只用于宿主预置密钥）。
+                    if let Some(key) = name
+                        .strip_prefix("config.")
+                        .or_else(|| name.strip_prefix("params."))
+                    {
+                        if !secret_keys.contains(key) {
+                            return Err(ManifestError(format!(
+                                "[permissions] secret 引用 {name:?} 指向的字段不是本插件声明的 Secret 字段"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -298,6 +407,21 @@ struct RawManifest {
     ui: Option<RawUiSection>,
     #[serde(default)]
     methods: Option<RawMethodsSection>,
+    #[serde(default)]
+    permissions: Option<RawPermissionsSection>,
+}
+
+/// `[permissions]` 的 TOML 形状。能力条目经 JSON 中转走 flow-dto 的闭集
+/// 解析（`parse_manifest_capability`），字段闭集只有一份实现。
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPermissionsSection {
+    #[serde(default)]
+    schema: Option<u32>,
+    #[serde(default, rename = "required_features")]
+    required_features: Vec<String>,
+    #[serde(default)]
+    capabilities: Vec<toml::Table>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -440,8 +564,43 @@ impl PluginManifest {
                 fields: fields(&form.fields)?,
             });
         }
+        // [permissions]：经 JSON 中转走 flow-dto 闭集解析；缺段 = legacy。
+        let permissions = match raw.permissions {
+            None => ManifestPermissions::Legacy,
+            Some(section) => {
+                let schema = section.schema.ok_or_else(|| {
+                    ManifestError("[permissions].schema 必填（当前支持 1）".into())
+                })?;
+                if schema != flow_dto::permission::PERMISSION_SCHEMA_VERSION {
+                    return Err(ManifestError(format!(
+                        "[permissions].schema = {schema} 不受支持（当前支持 1）"
+                    )));
+                }
+                let mut capabilities = Vec::with_capacity(section.capabilities.len());
+                for table in &section.capabilities {
+                    let value = serde_json::to_value(table)
+                        .map_err(|e| ManifestError(format!("能力条目转码失败：{e}")))?;
+                    let capability = flow_dto::permission::parse_manifest_capability(&value)
+                        .map_err(|error| ManifestError(format!("[permissions] {error}")))?;
+                    let required = table
+                        .get("required")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    capabilities.push(ManifestCapability {
+                        capability,
+                        required,
+                    });
+                }
+                ManifestPermissions::Declared(PermissionsSection {
+                    schema,
+                    required_features: section.required_features,
+                    capabilities,
+                })
+            }
+        };
         Ok(Self {
             config_fields: fields(&raw.config.unwrap_or_default().fields)?,
+            permissions,
             plugin: PluginSection {
                 id: plugin.id,
                 name: plugin.name.unwrap_or_default(),

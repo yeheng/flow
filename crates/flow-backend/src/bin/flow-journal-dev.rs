@@ -210,6 +210,7 @@ async fn journal_dev(
         .filter(|r| !r.terminal())
         .map(|r| r.run_id.clone())
         .collect::<BTreeSet<_>>();
+    backend.ensure_bundled_grants().await;
     flow_backend::start_execution(&execution, harness_agent, &backend).await?;
     while !pending.is_empty() {
         tokio::select! {_=tokio::signal::ctrl_c()=>break,_=tokio::time::sleep(std::time::Duration::from_millis(100))=>{}}

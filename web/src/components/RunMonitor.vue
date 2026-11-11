@@ -9,6 +9,9 @@ import {
   monitor,
   openChildRun,
   canCancelRun,
+  pendingApprovalNodes,
+  pokeTimeline,
+  refreshApprovals,
   uncertainNodes,
   waitingHumanTasks,
   waitingInputNodes,
@@ -21,8 +24,10 @@ import { confirmDialog, formDialog } from "../state/modal";
 import { assembleInput, inputFieldText, parseInputFields } from "../state/run-input";
 import { toast } from "../state/toast";
 import { copyWithToast } from "../state/clipboard";
-import type { AdjudicateDecision, TimelineNode } from "../types";
+import type { AdjudicateDecision, ApprovalItem, TimelineNode } from "../types";
+import { SIDE_EFFECT_NODE_TYPES } from "../state/capabilities";
 import ActivityFeed from "./ActivityFeed.vue";
+import ApprovalCard from "./ApprovalCard.vue";
 import LogConsole from "./LogConsole.vue";
 import AppButton from "./AppButton.vue";
 
@@ -233,6 +238,50 @@ function onOpenChildRun(childRunId: string): void {
   if (props.childRunNavigate) router.push(`/runs/${childRunId}`);
   else void openChildRun(childRunId);
 }
+
+// ---- 审批等待：monitor.approvals 收件箱 → 逐节点挂审批卡 ----
+
+/** 节点 → 收件箱条目（operation_id 对齐优先，退回 node_id 首条） */
+const approvalsByNode = computed(() => {
+  const map = new Map<string, ApprovalItem>();
+  for (const node of pendingApprovalNodes.value) {
+    const candidates = monitor.approvals.filter(
+      (a) => a.run_id === monitor.runId && a.node_id === node.id,
+    );
+    if (candidates.length === 0) continue;
+    map.set(node.id, candidates.find((a) => a.operation_id === node.operation_id) ?? candidates[0]);
+  }
+  return map;
+});
+
+/** 裁决落定：刷新收件箱对齐最新状态，并强制下一轮重拉时间线（不等订阅事件） */
+async function onApprovalResolved(): Promise<void> {
+  await refreshApprovals();
+  pokeTimeline();
+}
+
+// ---- legacy 横幅：无权限块的旧工作流不能启动新 run ----
+
+/** 副作用节点类型闭集 + nodetypes 下发的 side_effect 标注 */
+const sideEffectTypes = computed(() => {
+  const set = new Set<string>(SIDE_EFFECT_NODE_TYPES);
+  for (const t of editor.nodeTypes) if (t.side_effect) set.add(t.type);
+  return set;
+});
+
+/** -32020 指向被启动的工作流；画布判定用 monitor 与编辑器同工作流 */
+const legacyWorkflowId = computed(() => editor.workflowId ?? monitor.workflowId);
+
+/** legacy 判定：启动被 -32020 拒绝，或当前画布无顶层权限块且含副作用节点 */
+const legacyBlocked = computed(() => {
+  if (monitor.legacyStartBlocked && legacyWorkflowId.value) return true;
+  return (
+    monitor.workflowId !== null &&
+    monitor.workflowId === editor.workflowId &&
+    editor.definitionOptions?.permissions === undefined &&
+    editor.nodes.some((n) => sideEffectTypes.value.has(n.data.nodeType.type))
+  );
+});
 </script>
 
 <template>
@@ -264,6 +313,14 @@ function onOpenChildRun(childRunId: string): void {
         >
       </div>
       <div v-if="monitor.fatalError" class="run-fatal">{{ monitor.fatalError }}</div>
+
+      <!-- legacy：无权限块的旧工作流不能启动新 run（-32020 或画布判定） -->
+      <div v-if="legacyBlocked" class="legacy-banner">
+        工作流未声明权限（legacy）：含副作用节点的旧工作流不能启动新 run。
+        <RouterLink class="link" :to="`/workflows/${legacyWorkflowId}/permissions`">
+          前往权限页迁移 →
+        </RouterLink>
+      </div>
       <div v-if="monitor.output !== undefined" class="run-output">
         <div class="run-output-head">
           输出
@@ -383,6 +440,17 @@ function onOpenChildRun(childRunId: string): void {
             重发会产生真实外部副作用（可能重复扣款/发信等），仅在确认首次调用未生效时使用。
           </div>
         </template>
+      </div>
+
+      <!-- 审批等待：节点门/工具门挂起等人工批准（中性蓝紫，与 uncertain 裁决卡同区） -->
+      <div v-for="n in pendingApprovalNodes" :key="`approval-${n.id}`" class="signal-box signal-approval">
+        <div>「{{ n.name || n.id }}」等待审批</div>
+        <ApprovalCard
+          v-if="approvalsByNode.get(n.id)"
+          :item="approvalsByNode.get(n.id)!"
+          @resolved="onApprovalResolved"
+        />
+        <div v-else class="field-help">审批详情加载中…（收件箱拉取中）</div>
       </div>
     </div>
 
@@ -677,6 +745,23 @@ function onOpenChildRun(childRunId: string): void {
 .signal-uncertain {
   border-color: var(--danger);
   background: rgba(248, 81, 73, 0.08);
+}
+
+/* 审批等待卡：中性蓝紫（与 uncertain 的红、signal 的黄区分） */
+.signal-approval {
+  border-color: var(--accent);
+  background: rgba(124, 108, 255, 0.08);
+}
+
+/* legacy 迁移横幅：中性提示，不抢 fatal/danger 的语义 */
+.legacy-banner {
+  border: 1px solid var(--warn);
+  border-radius: 6px;
+  background: rgba(210, 153, 34, 0.08);
+  color: var(--text2);
+  font-size: 12px;
+  padding: 6px 8px;
+  margin-bottom: 8px;
 }
 
 .field-help-danger {

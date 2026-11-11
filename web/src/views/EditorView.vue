@@ -27,6 +27,7 @@ import { cancelRunStart, monitor, startRun } from "../state/monitor";
 import { openOverlay, topOverlay } from "../state/overlays";
 import { saveWorkflowAsNodeTemplate } from "../state/templates";
 import { toast } from "../state/toast";
+import { SIDE_EFFECT_NODE_TYPES } from "../state/capabilities";
 import AppButton from "../components/AppButton.vue";
 import NodePalette from "../components/NodePalette.vue";
 import FlowCanvas from "../components/FlowCanvas.vue";
@@ -251,6 +252,22 @@ async function saveAsNode(): Promise<void> {
   const created = await saveWorkflowAsNodeTemplate(editor.workflowId, name);
   if (created) toast.success("已存为业务节点（子流程），可在「业务节点」区插入");
 }
+
+// ---- legacy 权限横幅：定义无顶层 permissions 且含副作用节点（不能启动新 run） ----
+
+/** 副作用节点类型：闭集 + nodetypes 下发的 side_effect 标注 */
+const sideEffectTypes = computed(() => {
+  const set = new Set<string>(SIDE_EFFECT_NODE_TYPES);
+  for (const t of editor.nodeTypes) if (t.side_effect) set.add(t.type);
+  return set;
+});
+
+const legacyPermissions = computed(
+  () =>
+    !!editor.workflowId &&
+    editor.definitionOptions.permissions === undefined &&
+    editor.nodes.some((n) => sideEffectTypes.value.has(n.data.nodeType.type)),
+);
 </script>
 
 <template>
@@ -280,6 +297,9 @@ async function saveAsNode(): Promise<void> {
           >
           <RouterLink class="link" :to="`/workflows/${editor.workflowId}/triggers`">
             触发器
+          </RouterLink>
+          <RouterLink class="link" :to="`/workflows/${editor.workflowId}/permissions`">
+            权限
           </RouterLink>
           <RouterLink class="link" :to="`/workflows/${editor.workflowId}/runs`"
             >运行记录</RouterLink
@@ -341,6 +361,13 @@ async function saveAsNode(): Promise<void> {
           {{ runDrawerOpen ? "控制台 ▾" : "控制台 ▴" }}
         </AppButton>
       </div>
+    </div>
+    <!-- legacy：无权限块的旧工作流（含副作用节点）不能启动新 run，引导去权限页 -->
+    <div v-if="legacyPermissions" class="legacy-banner">
+      工作流未声明权限（legacy）：含副作用节点的旧工作流不能启动新 run。
+      <RouterLink class="link" :to="`/workflows/${editor.workflowId}/permissions`">
+        前往权限页创建权限块 →
+      </RouterLink>
     </div>
     <main class="editor-main" :class="`console-${effectiveConsoleMode}`">
       <div class="editor-body">
@@ -495,6 +522,16 @@ aside.left.collapsed {
   padding: 8px 12px;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+/* legacy 权限迁移横幅：提示级（warn），不抢 fatal 的红 */
+.legacy-banner {
+  padding: 6px 12px;
+  background: rgba(210, 153, 34, 0.08);
+  border-bottom: 1px solid var(--warn);
+  color: var(--text2);
+  font-size: 12px;
   flex-shrink: 0;
 }
 

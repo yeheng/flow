@@ -5,11 +5,14 @@ import { client, errText } from "../rpc/client";
 import { activeCount, perWorkflowRates, successRate, type WorkflowRate } from "../state/dashboard";
 import { editor, refreshWorkflows } from "../state/editor";
 import { runBadgeClass, runStatusLabel } from "../state/labels";
+import { approvalSummary } from "../state/approvals";
 import { fmtTime } from "../state/time";
+import { usePolling } from "../state/polling";
 import { toast } from "../state/toast";
 import { copyWithToast } from "../state/clipboard";
-import type { RunRecord, RunStats } from "../types";
+import type { ApprovalItem, RunRecord, RunStats } from "../types";
 import AppButton from "../components/AppButton.vue";
+import ApprovalCard from "../components/ApprovalCard.vue";
 
 /** 仪表盘：全局概览。统计来自 run.stats（服务端 GROUP BY 精确计数）；
  *  最近运行表只是展示窗口，走 run.list(limit 10) */
@@ -61,6 +64,7 @@ function workflowName(r: WorkflowRate): string {
 }
 
 async function refresh(): Promise<void> {
+  void refreshApprovals();
   try {
     if (editor.workflows.length === 0) await refreshWorkflows();
     [stats.value, runs.value] = await Promise.all([api.runStats(), api.listRuns({ limit: 10 })]);
@@ -80,11 +84,42 @@ async function copyRunId(id: string): Promise<void> {
   await copyWithToast(id, "run id");
 }
 
+// ---- 待审批收件箱：进入页面拉一次 + 60s 轮询 + 手动刷新 ----
+
+const approvals = ref<ApprovalItem[]>([]);
+const approvalsLoading = ref(false);
+
+async function refreshApprovals(): Promise<void> {
+  if (approvalsLoading.value) return;
+  approvalsLoading.value = true;
+  try {
+    approvals.value = (await api.approvalsList()).items;
+  } catch {
+    // 收件箱拉取失败不打断仪表盘：60s 轮询/手动刷新会重试，也不伪造空态
+  } finally {
+    approvalsLoading.value = false;
+  }
+}
+
+/** 收件箱只展示待处理项（服务端 pending 在前、deadline 升序） */
+const pendingApprovals = computed(() => approvals.value.filter((a) => a.status === "pending"));
+
+function approvalWorkflowName(a: ApprovalItem): string {
+  return workflowNames.value.get(a.workflow_id) ?? a.workflow_id;
+}
+
 // 一次性加载 + 手动刷新；断线期间错过的事件由重连回调补齐，无需常驻轮询
-const offReconnect = client.onReconnect(() => void refresh());
+const offReconnect = client.onReconnect(() => {
+  void refresh();
+  void refreshApprovals();
+});
+
+// 审批是人工等待面：低频轮询（页面不可见暂停，恢复时立即补拉）
+usePolling(refreshApprovals, 60_000);
 
 onMounted(() => {
   void refresh();
+  void refreshApprovals();
 });
 
 onUnmounted(() => {
@@ -142,6 +177,37 @@ onUnmounted(() => {
       非终态 {{ capacity.active }} / {{ RUN_CAP }}
       <span class="capacity-sub">· 在飞派发上限 {{ DISPATCH_CAP }}</span>
     </p>
+
+    <!-- 待审批收件箱：有等待项才占屏；卡片可直接裁决，也可跳 run 详情 -->
+    <section v-if="pendingApprovals.length > 0" class="section">
+      <div class="approval-head-row">
+        <h3>待审批（{{ pendingApprovals.length }}）</h3>
+        <AppButton :disabled="approvalsLoading" @click="refreshApprovals()">
+          {{ approvalsLoading ? "刷新中…" : "刷新" }}
+        </AppButton>
+      </div>
+      <div class="approval-cards">
+        <div
+          v-for="a in pendingApprovals"
+          :key="`${a.run_id}:${a.operation_id}`"
+          class="approval-inbox-card"
+        >
+          <div class="approval-inbox-meta">
+            <RouterLink class="link mono" :to="`/runs/${a.run_id}`" :title="a.run_id">
+              run {{ a.run_id.slice(0, 8) }}…
+            </RouterLink>
+            <RouterLink class="link" :to="`/workflows/${a.workflow_id}`">
+              {{ approvalWorkflowName(a) }}
+            </RouterLink>
+            <span class="muted">v{{ a.workflow_version }} · {{ a.node_id }}</span>
+          </div>
+          <p class="approval-inbox-summary mono" :title="approvalSummary(a.specs)">
+            {{ approvalSummary(a.specs) }}
+          </p>
+          <ApprovalCard :item="a" @resolved="refreshApprovals()" />
+        </div>
+      </div>
+    </section>
 
     <section class="section">
       <h3>最近运行</h3>
@@ -280,6 +346,51 @@ onUnmounted(() => {
 
 .section {
   margin-bottom: 24px;
+}
+
+/* 待审批收件箱：窄卡纵排（审批卡自带操作区，横排会挤） */
+.approval-head-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.approval-head-row h3 {
+  margin: 0;
+}
+
+.approval-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.approval-inbox-card {
+  padding: 10px 12px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  background: rgba(124, 108, 255, 0.06);
+}
+
+.approval-inbox-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
+.approval-inbox-summary {
+  margin: 4px 0 6px;
+  font-size: 11px;
+  color: var(--text2);
+  word-break: break-all;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
 }
 
 /* 容量口径小字：≥80% 用 warn 色提示接近平台上限 */

@@ -19,3 +19,21 @@ icon_key = "model"
 
 [ui.run_view]
 summary_keys = ["status", "body_bytes"]
+
+# 09 权限模型：能力需求上限（安装授予面见设置页；workflow/node 层再收窄）。
+# llm 节点的 URL 与凭据引用都是逐节点参数，无法在插件层枚举 → 族级上限。
+[permissions]
+schema = 1
+required_features = ["master-permit-v1"]
+
+[[permissions.capabilities]]
+id = "model-http"
+action = "net"
+any = true
+required = true
+
+[[permissions.capabilities]]
+id = "model-key"
+action = "secret"
+any = true
+required = false

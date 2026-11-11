@@ -81,7 +81,7 @@ impl<'de> Deserialize<'de> for ErrorCode {
 }
 
 /// 请求 id：string 或 number（error 响应里可为 null）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Id {
     /// 字符串 id。

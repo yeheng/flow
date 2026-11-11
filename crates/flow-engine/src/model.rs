@@ -468,6 +468,11 @@ pub struct Node {
     /// 节点参数；形状由节点类型决定。
     #[serde(default)]
     pub params: Value,
+    /// 宿主执行定义的节点权限（09 §3.5）：不属于插件 params schema，不得被
+    /// raw params 编辑覆盖。缺省 = Inherit（工作流有权限块时）；legacy 定义
+    /// 不得出现。`skip_none` 保证旧定义序列化字节不变（checksum 契约）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<flow_dto::permission::NodePermissions>,
 }
 
 impl Node {
@@ -587,6 +592,11 @@ pub struct DefinitionData {
         skip_serializing_if = "is_legacy_semantics"
     )]
     pub semantics: u32,
+    /// 工作流层能力上限（09 §3.4）。缺省 = legacy（不等于 Inherit 或 Auto）：
+    /// 含副作用节点的 legacy 定义不能启动新 run，必须由 admin 显式迁移。
+    /// 闭集解析在 flow-dto（未知版本/字段/动作一律拒绝）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<flow_dto::permission::WorkflowPermissions>,
     /// 输入契约（受限 JSON Schema 子集）；缺省表示不校验。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_schema: Option<Value>,
@@ -634,6 +644,58 @@ impl DefinitionData {
         };
         definition.validate()?;
         Ok(definition)
+    }
+
+    /// 会产生外部操作的**内置**节点（动态插件类型不算：它们的执行面在
+    /// P1 接入授予链路前与 legacy 语义一致，门在 backend policy 层分流）。
+    ///
+    /// legacy 静态门用它：含这些节点的 legacy 定义不能启动新 run（09 §3.5
+    /// 「首次新执行前由 admin 显式迁移」）；纯计算 legacy 照常运行。
+    pub fn side_effect_nodes(&self) -> Vec<&Node> {
+        self.nodes
+            .iter()
+            .filter(|node| node.kind().is_some_and(NodeType::has_side_effect))
+            .collect()
+    }
+
+    /// 保存期的「明显越界」诊断（09 §3.5：给诊断，执行时逐请求取交集为准）。
+    ///
+    /// 不是错误：节点能力超出 workflow 上限只会在运行时被稳定拒绝，未授权
+    /// 动作可存在于定义中。首版只做 Action 级粗判（任意 matcher 的集合包含
+    /// 算法不在首版范围），外加「workflow Ask 覆盖 node Auto」的提示。
+    pub fn permission_diagnostics(&self) -> Vec<String> {
+        use flow_dto::permission::{Approval, NodePermissions};
+        let Some(workflow) = &self.permissions else {
+            return Vec::new();
+        };
+        let mut diagnostics = Vec::new();
+        for node in &self.nodes {
+            let Some(NodePermissions::Restrict { allow }) = &node.permissions else {
+                continue;
+            };
+            for capability in allow {
+                let action = capability.pattern.action();
+                let same_action: Vec<_> = workflow
+                    .allow
+                    .iter()
+                    .filter(|c| c.pattern.action() == action)
+                    .collect();
+                if same_action.is_empty() {
+                    diagnostics.push(format!(
+                        "节点 {} 的能力 {}（{}）未被 workflow 授予：运行时将被拒绝",
+                        node.id, capability.id, action
+                    ));
+                } else if capability.approval == Approval::Auto
+                    && same_action.iter().all(|c| c.approval == Approval::Ask)
+                {
+                    diagnostics.push(format!(
+                        "节点 {} 的能力 {} 标记 auto，但 workflow 同类能力要求 ask：最终仍需审批",
+                        node.id, capability.id
+                    ));
+                }
+            }
+        }
+        diagnostics
     }
 }
 
@@ -780,6 +842,16 @@ impl Definition {
         }
         if self.nodes.is_empty() {
             return Err("工作流没有任何节点".into());
+        }
+        // 权限块随 run 本身冻结（RunStarted 快照，G2），不依赖 v2 执行快照：
+        // v1/v2 语义都可声明。节点层权限必须挂在工作流权限块之下。
+        if self.permissions.is_none() {
+            if let Some(node) = self.nodes.iter().find(|n| n.permissions.is_some()) {
+                return Err(format!(
+                    "节点 {} 声明了 permissions，但工作流未声明 permissions 块",
+                    node.id
+                ));
+            }
         }
 
         let mut seen = HashSet::new();
@@ -2203,5 +2275,176 @@ mod tests {
             elapsed.as_millis() < 250,
             "validate 在 {N} 节点宽图上耗时 {elapsed:?}——邻接索引被绕过了？"
         );
+    }
+
+    // ---- 权限块（09 §3.5）：字段兼容、保存期校验与诊断 ----
+
+    fn permissions_block(allow: Value) -> Value {
+        json!({"version": 1, "mode": "execute", "allow": allow})
+    }
+
+    #[test]
+    fn permissions_field_roundtrips_without_touching_legacy_bytes() {
+        // legacy 定义反序列化 → 再序列化，字节不含 permissions（checksum 契约）。
+        let legacy = json!({
+            "semantics": 2,
+            "nodes": [
+                {"id": "s", "type": "start"},
+                {"id": "c", "type": "script", "params": {"code": "return 1;"}},
+                {"id": "e", "type": "end"}
+            ],
+            "edges": [
+                {"from": "s", "to": "c"}, {"from": "c", "to": "e"}
+            ]
+        });
+        let definition: Definition = serde_json::from_value(legacy).unwrap();
+        assert!(definition.permissions.is_none());
+        let encoded = serde_json::to_value(&definition).unwrap();
+        assert!(encoded.get("permissions").is_none(), "{encoded}");
+        for node in encoded["nodes"].as_array().unwrap() {
+            assert!(node.get("permissions").is_none(), "{node}");
+        }
+        // 编码幂等：再解析再编码字节一致（版本复用依赖它）。
+        let again: Definition = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&again).unwrap(), encoded);
+
+        // 带权限块的定义解析成功并保留节点层。
+        let governed = json!({
+            "semantics": 2,
+            "permissions": permissions_block(json!([
+                {"id": "api", "action": "net", "methods": ["POST"],
+                 "url_prefix": "https://api.example.com/", "approval": "auto"}
+            ])),
+            "nodes": [
+                {"id": "s", "type": "start"},
+                {"id": "h", "type": "http_call", "params": {
+                    "url": "https://api.example.com/x", "method": "POST"},
+                 "permissions": {"mode": "inherit"}},
+                {"id": "e", "type": "end"}
+            ],
+            "edges": [
+                {"from": "s", "to": "h"}, {"from": "h", "to": "e"}
+            ]
+        });
+        let definition: Definition = serde_json::from_value(governed).unwrap();
+        assert_eq!(definition.permissions.as_ref().unwrap().allow.len(), 1);
+        assert_eq!(
+            definition
+                .node("h")
+                .unwrap()
+                .permissions
+                .as_ref()
+                .unwrap()
+                .clone(),
+            flow_dto::permission::NodePermissions::Inherit
+        );
+        assert!(definition.validate().is_ok());
+    }
+
+    #[test]
+    fn permissions_need_a_workflow_block_and_closed_sets() {
+        // semantics=1 + 权限块：策略随 run 冻结，v1 语义同样可声明。
+        let mut v1 = json!({
+            "nodes": [{"id": "s", "type": "start"}, {"id": "e", "type": "end"}],
+            "edges": [{"from": "s", "to": "e"}],
+            "permissions": permissions_block(json!([]))
+        });
+        v1["semantics"] = json!(1);
+        let definition: Definition = serde_json::from_value(v1).unwrap();
+        assert!(definition.validate().is_ok());
+
+        // 节点权限但工作流无权限块：拒绝。
+        let orphan = json!({
+            "semantics": 2,
+            "nodes": [
+                {"id": "s", "type": "start"},
+                {"id": "c", "type": "script", "params": {"code": "return 1;"},
+                 "permissions": {"mode": "inherit"}},
+                {"id": "e", "type": "end"}
+            ],
+            "edges": [{"from": "s", "to": "c"}, {"from": "c", "to": "e"}]
+        });
+        let definition: Definition = serde_json::from_value(orphan).unwrap();
+        let err = definition.validate().unwrap_err();
+        assert!(err.contains("工作流未声明 permissions"), "{err}");
+
+        // 未知版本 / 未知动作：解析期拒绝（flow-dto 闭集）。
+        let bad_version = json!({
+            "semantics": 2,
+            "permissions": {"version": 99, "mode": "execute"},
+            "nodes": [{"id": "s", "type": "start"}, {"id": "e", "type": "end"}],
+            "edges": [{"from": "s", "to": "e"}]
+        });
+        assert!(serde_json::from_value::<Definition>(bad_version).is_err());
+        let bad_action = json!({
+            "semantics": 2,
+            "permissions": permissions_block(json!(
+                [{"id": "x", "action": "teleport", "approval": "auto"}]
+            )),
+            "nodes": [{"id": "s", "type": "start"}, {"id": "e", "type": "end"}],
+            "edges": [{"from": "s", "to": "e"}]
+        });
+        assert!(serde_json::from_value::<Definition>(bad_action).is_err());
+    }
+
+    #[test]
+    fn side_effect_nodes_cover_builtin_and_dynamic() {
+        let definition = def(
+            vec![
+                json!({"id": "s", "type": "start"}),
+                json!({"id": "h", "type": "http_call", "params": {
+                    "url": "https://a.b/", "method": "GET"}}),
+                json!({"id": "c", "type": "script", "params": {"code": "return 1;"}}),
+                json!({"id": "p", "type": "echo", "params": {}}),
+                json!({"id": "e", "type": "end"}),
+            ],
+            vec![
+                json!({"from": "s", "to": "h"}),
+                json!({"from": "h", "to": "c"}),
+                json!({"from": "c", "to": "p"}),
+                json!({"from": "p", "to": "e"}),
+            ],
+        );
+        let ids: Vec<&str> = definition
+            .side_effect_nodes()
+            .iter()
+            .map(|n| n.id.as_str())
+            .collect();
+        // 动态插件节点不算内置副作用：P1 接入授予链路前与 legacy 语义一致。
+        assert_eq!(ids, vec!["h"]);
+    }
+
+    #[test]
+    fn permission_diagnostics_flag_overreach_and_ask_override() {
+        let definition: Definition = serde_json::from_value(json!({
+            "semantics": 2,
+            "permissions": permissions_block(json!([
+                {"id": "api-ask", "action": "net", "methods": ["POST"],
+                 "url_prefix": "https://api.example.com/", "approval": "ask"},
+                {"id": "key", "action": "secret", "names": ["k"], "approval": "auto"}
+            ])),
+            "nodes": [
+                {"id": "s", "type": "start"},
+                {"id": "h", "type": "http_call", "params": {
+                    "url": "https://api.example.com/x", "method": "POST"},
+                 "permissions": {"mode": "restrict", "allow": [
+                    {"id": "n1", "action": "net", "methods": ["POST"],
+                     "url_prefix": "https://api.example.com/", "approval": "auto"},
+                    {"id": "n2", "action": "secret", "names": ["other"], "approval": "auto"},
+                    {"id": "n3", "action": "file_write", "path": "out.txt", "approval": "auto"}
+                 ]}},
+                {"id": "e", "type": "end"}
+            ],
+            "edges": [{"from": "s", "to": "h"}, {"from": "h", "to": "e"}]
+        }))
+        .unwrap();
+        let diagnostics = definition.permission_diagnostics();
+        let joined = diagnostics.join("\n");
+        // file_write 未被 workflow 授予。
+        assert!(joined.contains("n3") && joined.contains("未被 workflow 授予"), "{joined}");
+        // node auto 不覆盖 workflow ask。
+        assert!(joined.contains("n1") && joined.contains("仍需审批"), "{joined}");
+        // secret 两层都有 → 无越界诊断（n2 是同 Action 且 workflow 有 key）。
+        assert!(!joined.contains("n2"), "{joined}");
     }
 }

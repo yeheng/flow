@@ -42,9 +42,47 @@ pub type Approver = Arc<
         + Sync,
 >;
 
+/// 受管裁决通道（09 §8）：每次工具调用发完整请求给宿主（master），
+/// 由 master 按冻结策略裁决。宿主不可达/拒绝响应 → fail closed。
+pub type PermissionChannel = Arc<
+    dyn for<'a> Fn(
+            &'a str,
+            &'a str,
+            &'a serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = std::result::Result<ToolCallVerdict, String>> + Send + 'a>>
+        + Send
+        + Sync,
+>;
+
+/// 工具裁决账本（ApprovalLedger，09 §8）：按 tool_call_id 缓存宿主结论，
+/// 只去重**传输重试**——新的工具调用必有新的 tool_call_id，不复用结论。
+#[derive(Default)]
+pub struct ApprovalLedger {
+    entries: parking_lot::Mutex<std::collections::HashMap<String, ToolCallVerdict>>,
+}
+
+impl ApprovalLedger {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    fn get(&self, id: &str) -> Option<ToolCallVerdict> {
+        self.entries.lock().get(id).cloned()
+    }
+    fn put(&self, id: &str, verdict: ToolCallVerdict) {
+        self.entries.lock().insert(id.to_string(), verdict);
+    }
+}
+
 pub struct PermissionPolicy {
     mode: AtomicU8,
     approver: Approver,
+    /// 受管通道（Some = 所有工具调用走 master 裁决，本地模式矩阵只保留
+    /// Plan 的提前拒绝；None = 传统本地模式）。
+    channel: Option<PermissionChannel>,
+    /// plan 只读上限（受管形态下在通道前生效）。
+    managed_plan: bool,
+    /// 传输重试去重账本。
+    ledger: Arc<ApprovalLedger>,
     /// Shared cancel signal (the Host's). When cancelled while waiting on
     /// the approver, the wait is abandoned immediately (event-driven -
     /// cancellation is centralized here instead of trusting every approver
@@ -57,8 +95,32 @@ impl PermissionPolicy {
         Self {
             mode: AtomicU8::new(mode as u8),
             approver,
+            channel: None,
+            managed_plan: false,
+            ledger: Arc::new(ApprovalLedger::new()),
             signal: PlRwLock::new(None),
         }
+    }
+
+    /// 受管形态：所有工具调用经通道裁决；`plan` 为只读上限（变更性工具
+    /// 本地提前拒绝，不再打扰 master）。本地 Approver 仅作通道不可用时的
+    /// fail-closed 兜底（恒拒绝）。
+    pub fn new_managed(channel: PermissionChannel, plan: bool) -> Self {
+        Self {
+            mode: AtomicU8::new(Mode::AutoEdit as u8),
+            approver: Arc::new(|_name, _args| {
+                Box::pin(async { false }) as Pin<Box<dyn Future<Output = bool> + Send>>
+            }),
+            channel: Some(channel),
+            managed_plan: plan,
+            ledger: Arc::new(ApprovalLedger::new()),
+            signal: PlRwLock::new(None),
+        }
+    }
+
+    /// 受管账本（宿主侧观察/测试用）。
+    pub fn ledger(&self) -> Arc<ApprovalLedger> {
+        self.ledger.clone()
     }
 
     /// Attach the shared cancel signal (the Host's). Call once after the Host
@@ -134,6 +196,34 @@ impl HookChain for PermissionPolicy {
         risk: RiskLevel,
     ) -> Pin<Box<dyn Future<Output = ToolCallVerdict> + Send + 'a>> {
         Box::pin(async move {
+            if let Some(channel) = &self.channel {
+                // 受管形态：本地不再放行任何工具（§8.4）。Plan 只读上限例外：
+                // 变更性工具提前拒绝，不消耗 master 往返。
+                let mutating = matches!(
+                    name,
+                    "write" | "edit" | "bash" | "evolve"
+                );
+                if self.managed_plan && mutating {
+                    return ToolCallVerdict::Block(
+                        "plan mode is read-only — present your plan as text".into(),
+                    );
+                }
+                // 传输重试去重：同 tool_call_id 直接复用账本结论。
+                if let Some(cached) = self.ledger.get(_id) {
+                    return cached;
+                }
+                let verdict = match channel(_id, name, args).await {
+                    Ok(verdict) => verdict,
+                    Err(error) => {
+                        tracing::warn!(tool = name, %error, "permission channel failed (failing closed)");
+                        ToolCallVerdict::Block(format!(
+                            "permission channel failed (failing closed): {error}"
+                        ))
+                    }
+                };
+                self.ledger.put(_id, verdict.clone());
+                return verdict;
+            }
             match (self.mode(), risk) {
                 (Mode::FullAuto, _) => ToolCallVerdict::Allow,
                 (Mode::AutoEdit, RiskLevel::Low) | (Mode::AutoEdit, RiskLevel::Medium) => {

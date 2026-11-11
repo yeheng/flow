@@ -20,6 +20,11 @@ export const router = createRouter({
       props: (r) => ({ workflowId: r.params.id as string }),
     },
     {
+      path: "/workflows/:id/permissions",
+      component: () => import("./views/PermissionsView.vue"),
+      props: (r) => ({ workflowId: r.params.id as string }),
+    },
+    {
       path: "/workflows/:id/runs",
       component: () => import("./views/RunListView.vue"),
       props: (r) => ({ workflowId: r.params.id as string }),

@@ -35,6 +35,9 @@ impl Ctx {
 
     /// extra_env 透传给被测进程（如 FLOW_EXECUTION_MODE / FLOW_X_MAX）。
     pub async fn start_with(bin: &str, extra_env: &[(&str, &str)]) -> Ctx {
+        // 09 权限模型的存量迁移钩子：所有经 Ctx 的用例默认按运行期事实
+        // 自动治理 legacy 定义（个别权限语义用例自行 publish legacy）。
+        crate::permissions::enable_auto_govern();
         // v2 部署 token 随机（≥32 字节）
         let dir = std::env::temp_dir().join(format!("flow-e2e-j-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).expect("创建 journal 临时目录失败");

@@ -23,6 +23,20 @@ pub const RUN_TURN_METHOD: &str = "agent/runTurn";
 /// 进度事件通知方法名。
 pub const EVENT_METHOD: &str = "agent/event";
 
+/// 回合权限（09 §8 TurnPermission）：缺省 = 未受管（legacy 路径，仅限
+/// 测试钩子自动治理之前的兼容；生产 master 一律下发受管回合）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnPermission {
+    /// `execute` | `plan`（plan 是不可提升的只读上限，插件侧提前拒绝
+    /// 变更性工具，其余仍逐条问宿主）。
+    pub execution_mode: String,
+    /// master 冻结的 workflow/node 权限身份（诊断与审计关联）。
+    pub policy_digest: String,
+    /// 所有工具调用必须经 `permission/request` 反向请求裁决；未协商
+    /// master_permit_v1 能力或宿主不可达时 fail closed。
+    pub managed: bool,
+}
+
 /// `agent/runTurn` 的请求参数。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunTurnParams {
@@ -36,6 +50,9 @@ pub struct RunTurnParams {
     pub workdir: String,
     /// 状态根目录（harness 沙箱根）。
     pub roots: String,
+    /// 回合权限（缺省 None = 未受管 legacy 回合）。
+    #[serde(default)]
+    pub permission: Option<TurnPermission>,
 }
 
 /// 模型与 provider 规格。
@@ -133,6 +150,7 @@ mod tests {
     #[test]
     fn turn_dto_roundtrip() {
         let params = RunTurnParams {
+            permission: None,
             spec: TurnSpec {
                 base_url: "http://x".into(),
                 model: "m".into(),

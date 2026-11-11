@@ -146,6 +146,8 @@ impl Services {
             listener.local_addr().map_err(|e| e.to_string())?
         );
         let harness_agent = flow_backend::harness_agent_run_config(&config.harness.agent);
+        // 09 §7：内置插件幂等自动授予（桌面分发 = 受信二进制）。
+        journal.ensure_bundled_grants().await;
         flow_backend::start_execution(&config.execution, harness_agent, &journal)
             .await
             .map_err(|e| e.to_string())?;

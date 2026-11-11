@@ -176,6 +176,38 @@ pub enum RunCommand {
     Timeline { run_id: String },
     /// 取消活着的 run（已终态返回 conflict）
     Cancel { run_id: String },
+    /// 待审批收件箱（09 权限模型；默认只看 pending）
+    Approvals {
+        #[arg(long)]
+        run_id: Option<String>,
+        /// 含已裁决/过期/取消的条目
+        #[arg(long)]
+        all: bool,
+    },
+    /// 批准该节点当前 pending 的请求实例（run_id/node_id 从收件箱取）
+    Approve {
+        run_id: String,
+        node_id: String,
+        operation_id: String,
+        request_hash: String,
+        /// once 只批本次；run 免除同 run/node 下精确操作的再次询问
+        #[arg(long, default_value = "once")]
+        scope: String,
+    },
+    /// 拒绝该节点当前 pending 的请求实例（必须给理由）
+    Deny {
+        run_id: String,
+        node_id: String,
+        operation_id: String,
+        request_hash: String,
+        reason: String,
+    },
+    /// 撤销一条 Run 精确授权
+    ApprovalsRevoke {
+        run_id: String,
+        node_id: String,
+        digest: String,
+    },
 }
 
 /// 进程入口：解析命令行 → 连服务（连不上是本地错误，exit 1）→ 分发到命令组。

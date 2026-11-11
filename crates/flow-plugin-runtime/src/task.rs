@@ -26,6 +26,10 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use flow_engine::execution_protocol::contract::{bounded_control_text, DURABLE_WAIT_TIMEOUT_MS};
+
+/// 审批等待的本地宽限（v8 OperationPending）：主进程 TTL 判定与 Denied 投递
+/// 的余量。超过「审批截止 + 宽限」仍无裁决只可能是链路已失联（remote）。
+const APPROVAL_GRACE_MS: u64 = 2 * DURABLE_WAIT_TIMEOUT_MS;
 use flow_engine::execution_protocol::message::{
     ExecuteTask, Message, ResultOutcome, TaskValue, WaitKind, WaitRequest,
 };
@@ -135,6 +139,9 @@ pub struct TaskRunner {
     pub dispatch_id: String,
     /// 派发载荷（节点定义、输入声明、准备元数据、恢复用 outcome）。
     pub task: ExecuteTask,
+    /// 工具裁决专用邮箱（G5）：agent 回合内的反向请求等待它；与 mail 分离
+    /// 避免与主等待循环争抢。
+    pub(super) tool_mail: std::sync::Arc<tokio::sync::Mutex<mpsc::Receiver<Message>>>,
     /// 出站通道：执行器→主进程。
     pub outbound: mpsc::Sender<Message>,
     /// 入站邮箱：主进程→本派发（传输块、许可、ACK、取消）。
@@ -1371,7 +1378,8 @@ impl TaskRunner {
     }
 
     /// 外部操作的请求发送与许可等待（http/harness 共用）：RequestOperation →
-    /// OperationPermit（取消/断线唤醒）。返回许可携带的 credential（harness 不用）。
+    /// OperationPermit（取消/断线唤醒）。返回许可里与请求 `credential.secret_ref`
+    /// 同名的凭证（harness command 不用）。
     ///
     /// 请求字节走 data 通道分块发送（再小也走），控制帧只带身份与指纹：
     /// 控制帧有确定性上界（C6），值字节不能借道它。
@@ -1379,8 +1387,13 @@ impl TaskRunner {
     /// 许可回验三重身份：dispatch_id、operation_id 与请求指纹必须全部
     /// 匹配，否则拒绝——指纹不匹配意味着许可对应的不是这次请求。
     ///
+    /// v8 权限裁决（09 §5 G3）：`OperationPending` = 主进程评估为 Ask，原地
+    /// 等待（本地超时预算暂停，只按审批截止 + 宽限设上界）；
+    /// `OperationDenied` = 能力拒绝或审批过期，按业务失败收口，绝不执行。
+    ///
     /// # Errors
-    /// 身份错配返回 `Invalid`；取消返回 `Cancelled`；通道关闭返回 `Closed`。
+    /// 身份错配返回 `Invalid`；取消返回 `Cancelled`；通道关闭返回 `Closed`；
+    /// 权限拒绝返回 `Business`。
     async fn authorize_operation(&mut self, request: Value) -> Result<Option<String>, TaskError> {
         if self.is_regression() {
             // 回归模式禁止一切外部操作：协调器也会独立拒绝许可，双保险
@@ -1389,11 +1402,21 @@ impl TaskRunner {
                 "external operations are disabled in regression".into(),
             ));
         }
+        // 凭证按名取：许可按需求集合逐项交付，节点只拿自己请求里引用的那份。
+        let secret_ref = request["credential"]["secret_ref"]
+            .as_str()
+            .map(str::to_owned);
         let request_bytes = flow_journal::codec::bounded_json(&request, INPUT_BUDGET)?;
         // 指纹 = 请求字节摘要：授权与执行两侧对同一摘要，许可才对得上
         // 这一次具体的请求。
         let fingerprint = flow_journal::codec::digest(&request_bytes);
-        let operation_id = uuid::Uuid::now_v7().to_string();
+        // 换 dispatch 恢复待审批操作时沿用原 operation 身份（§6.1），只用一次；
+        // 其余情况新生成调用实例身份。
+        let operation_id = self
+            .task
+            .pending_operation
+            .take()
+            .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
         // v2：请求字节一律走 data 通道（再小也走），控制帧只带身份与指纹。
         let transfer_id = TransferKey::OperationRequest(operation_id.clone()).to_wire();
         {
@@ -1434,16 +1457,16 @@ impl TaskRunner {
             })
             .await
             .map_err(|e| TaskError::Closed(e.to_string()))?;
-        let permit_deadline =
+        let mut permit_deadline =
             tokio::time::Instant::now() + Duration::from_millis(DURABLE_WAIT_TIMEOUT_MS);
-        let credential = loop {
+        let credentials = loop {
             let message = self.receive_until(permit_deadline, "permit").await?;
             match message {
                 Message::OperationPermit {
                     dispatch_id,
                     operation_id: permitted,
                     request_fingerprint,
-                    credential,
+                    credentials,
                     ..
                 } => {
                     // 三重身份校验：串台的许可必须被拒，否则会对错误的
@@ -1454,7 +1477,44 @@ impl TaskRunner {
                     {
                         return Err(TaskError::Invalid("permit identity mismatch".into()));
                     }
-                    break credential;
+                    break credentials;
+                }
+                Message::OperationPending {
+                    dispatch_id,
+                    operation_id: pending,
+                    request_fingerprint,
+                    deadline_ms,
+                } => {
+                    if dispatch_id != self.dispatch_id
+                        || pending != operation_id
+                        || request_fingerprint != fingerprint
+                    {
+                        return Err(TaskError::Invalid("pending identity mismatch".into()));
+                    }
+                    // 人工等待暂停本地超时预算：只按审批绝对截止 + 宽限设上界
+                    // （TTL 到期由主进程裁决拒绝；宽限覆盖主进程 TTL 判定延迟）。
+                    let remaining = deadline_ms
+                        .saturating_sub(chrono::Utc::now().timestamp_millis())
+                        .max(0) as u64;
+                    permit_deadline = tokio::time::Instant::now()
+                        + Duration::from_millis(remaining.saturating_add(APPROVAL_GRACE_MS));
+                    tracing::info!(dispatch = %self.dispatch_id, operation = %operation_id,
+                        "operation awaiting permission approval");
+                }
+                Message::OperationDenied {
+                    dispatch_id,
+                    operation_id: denied,
+                    request_fingerprint,
+                    reason,
+                } => {
+                    if dispatch_id != self.dispatch_id
+                        || denied != operation_id
+                        || request_fingerprint != fingerprint
+                    {
+                        return Err(TaskError::Invalid("denial identity mismatch".into()));
+                    }
+                    // 能力拒绝/审批过期：业务失败，操作从未执行（无需 Outcome）。
+                    return Err(TaskError::Business(format!("permission denied: {reason}")));
                 }
                 Message::Cancel { dispatch_id, .. } if dispatch_id == self.dispatch_id => {
                     return Err(TaskError::Cancelled)
@@ -1471,7 +1531,10 @@ impl TaskRunner {
                 _ => continue,
             }
         };
-        Ok(credential)
+        Ok(secret_ref.and_then(|name| {
+            flow_engine::execution_protocol::credential_for(&credentials, &name)
+                .map(str::to_owned)
+        }))
     }
 
     /// harness：子进程执行（许可→spawn→Outcome→输出），与 http_node 同一条授权路径。
@@ -2155,6 +2218,42 @@ impl TaskRunner {
             }
         };
         let mut progress = crate::agent_progress::AgentProgress::new(logger);
+        // 受管回合（master 冻结了策略）：权限随 _flow_execution 下发；反向
+        // 裁决经执行协议转 master（G5）。未受管（legacy 回合）不接通道。
+        let execution = self.task.node.pointer("/_flow_execution");
+        let managed = execution
+            .and_then(|e| e.get("permissions_managed"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let permission = managed.then(|| flow_harness_protocol::TurnPermission {
+            execution_mode: execution
+                .and_then(|e| e.get("permissions_mode"))
+                .and_then(Value::as_str)
+                .unwrap_or("execute")
+                .to_string(),
+            policy_digest: execution
+                .and_then(|e| e.get("policy_digest"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            managed: true,
+        });
+        let on_request = managed.then(|| {
+            let outbound = self.outbound.clone();
+            let dispatch_id = self.dispatch_id.clone();
+            let cancel = self.cancel.clone();
+            let tool_mail = self.tool_mail.clone();
+            std::sync::Arc::new(move |request: flow_plugin_sdk::protocol::jsonrpc::Request| {
+                let outbound = outbound.clone();
+                let dispatch_id = dispatch_id.clone();
+                let cancel = cancel.clone();
+                let tool_mail = tool_mail.clone();
+                Box::pin(async move {
+                    forward_permission_request(outbound, dispatch_id, cancel, tool_mail, request)
+                        .await
+                }) as futures::future::BoxFuture<'static, _>
+            }) as crate::agent_plugin::ReverseHandler
+        });
         let parsed = match crate::agent_plugin::run_agent_turn(
             crate::agent_plugin::TurnRequest {
                 plugin: &plugin,
@@ -2163,6 +2262,8 @@ impl TaskRunner {
                 api_key,
                 workdir,
                 roots,
+                permission,
+                on_request,
             },
             |event| progress.on_wire_event(event),
         )
@@ -2739,5 +2840,111 @@ mod harness_capture_tests {
         .unwrap();
         assert_eq!(output.stderr.len(), 512);
         assert!(output.stderr.ends_with(b"tail"));
+    }
+}
+
+/// 控制帧预算预检（postcard 编码长度）。
+fn postcard_probe(message: &Message) -> std::result::Result<Vec<u8>, String> {
+    postcard::to_allocvec(message).map_err(|e| e.to_string())
+}
+
+/// 反向工具裁决转发（G5）：`permission/request` → 执行协议
+/// ToolPermissionRequest → master 裁决 → ToolPermissionDecision → JSON-RPC
+/// 响应回插件。链路断/取消/超时一律 fail closed（拒绝该次工具调用），
+/// 不回退到本地放行。
+async fn forward_permission_request(
+    outbound: mpsc::Sender<Message>,
+    dispatch_id: String,
+    cancel: CancellationToken,
+    tool_mail: std::sync::Arc<tokio::sync::Mutex<mpsc::Receiver<Message>>>,
+    request: flow_plugin_sdk::protocol::jsonrpc::Request,
+) -> flow_plugin_sdk::protocol::jsonrpc::Message {
+    use flow_plugin_sdk::protocol::handshake::{
+        PermissionRequestParams, PermissionRequestResult, PERMISSION_REQUEST_METHOD,
+    };
+    use flow_plugin_sdk::protocol::jsonrpc::{Response, Response as RpcResponse};
+    let id = request.id.clone();
+    let error_response = |message: String| {
+        flow_plugin_sdk::protocol::jsonrpc::Message::Response(RpcResponse {
+            jsonrpc: "2.0".into(),
+            id: id.clone(),
+            result: None,
+            error: Some(flow_plugin_sdk::protocol::jsonrpc::Error {
+                code: flow_plugin_sdk::protocol::jsonrpc::ErrorCode::Application(-32011),
+                message,
+                data: None,
+            }),
+        })
+    };
+    if request.method != PERMISSION_REQUEST_METHOD {
+        return error_response(format!("unknown reverse method: {}", request.method));
+    }
+    let Some(params_value) = request.params else {
+        return error_response("permission request missing params".into());
+    };
+    let params: PermissionRequestParams = match serde_json::from_value(params_value) {
+        Ok(params) => params,
+        Err(error) => return error_response(format!("permission params malformed: {error}")),
+    };
+    let request = Message::ToolPermissionRequest {
+        dispatch_id: dispatch_id.clone(),
+        tool_call_id: params.tool_call_id.clone(),
+        tool: params.tool.clone(),
+        params: params.params.clone(),
+        cwd: params.cwd.clone(),
+    };
+    // 控制帧预算预检：工具参数必须整体装进控制帧（截断 = 拒绝，不静默）。
+    let probe = postcard_probe(&request);
+    match probe {
+        Ok(bytes)
+            if bytes.len() > flow_engine::execution_protocol::CONTROL_MAX_FRAME =>
+        {
+            return error_response("工具参数超过控制帧预算（写入内容过大）".into())
+        }
+        Err(error) => return error_response(format!("tool request encode failed: {error}")),
+        _ => {}
+    }
+    if outbound.send(request).await.is_err() {
+        return error_response("master link closed; failing closed".into());
+    }
+    // 等裁决：同一 tool_call_id 的响应（幂等重发由 master 折叠态处理）。
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+    let mut mailbox = tool_mail.lock().await;
+    loop {
+        let message = tokio::select! {
+            message = mailbox.recv() => {
+                match message {
+                    Some(message) => message,
+                    None => return error_response("master link closed; failing closed".into()),
+                }
+            }
+            _ = cancel.cancelled() => return error_response("cancelled; failing closed".into()),
+            _ = tokio::time::sleep_until(deadline) => {
+                return error_response("tool permission decision timeout; failing closed".into())
+            }
+        };
+        match message {
+            Message::ToolPermissionDecision {
+                dispatch_id: target,
+                tool_call_id,
+                operation_id,
+                allowed,
+                reason,
+            } if target == dispatch_id && tool_call_id == params.tool_call_id =>
+            {
+                let result = PermissionRequestResult {
+                    allowed,
+                    reason,
+                    operation_id,
+                };
+                return flow_plugin_sdk::protocol::jsonrpc::Message::Response(Response {
+                    jsonrpc: "2.0".into(),
+                    id,
+                    result: Some(serde_json::to_value(result).unwrap_or(Value::Null)),
+                    error: None,
+                });
+            }
+            _ => continue,
+        }
     }
 }

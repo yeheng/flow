@@ -5,12 +5,15 @@ import { httpUrl } from "../config";
 import { rawRunToRecord, selectRawRuns } from "../state/run-raw";
 import type {
   AdjudicateDecision,
+  ApprovalsPage,
+  CommandReceipt,
   ConfigView,
   Definition,
   FlowConfig,
   FragmentEdge,
   FragmentNode,
   NodeTypeDesc,
+  PermissionsEffective,
   NodeTemplate,
   NodeTemplateSummary,
   RunEvent,
@@ -379,6 +382,72 @@ export function subscribeRun(
   onEvent: (e: RunEvent) => void,
 ): Promise<() => Promise<void>> {
   return client.subscribe("run.subscribe", { run_id: runId }, (e) => onEvent(e as RunEvent));
+}
+
+// ---- 审批（approvals 面：capability approval=ask 挂起后的人工决定） ----
+
+/**
+ * 批准当前挂起的审批（run.approve）。operation_id/request_hash 是审批身份，
+ * 必须从 ApprovalItem 原样回传；scope=once 只放行本次请求，scope=run 在本 run 内
+ * 免除相同操作的再次询问。已裁决/实例变化时服务端返回 -32012（result 带 already_decided）。
+ */
+export async function runApprove(
+  runId: string,
+  nodeId: string,
+  operationId: string,
+  requestHash: string,
+  scope: "once" | "run",
+): Promise<CommandReceipt> {
+  return client.call<CommandReceipt>("run.approve", {
+    run_id: runId,
+    node_id: nodeId,
+    operation_id: operationId,
+    request_hash: requestHash,
+    scope,
+  });
+}
+
+/** 拒绝当前挂起的审批（run.deny）：reason 必填（≤4096 字节）。 */
+export async function runDeny(
+  runId: string,
+  nodeId: string,
+  operationId: string,
+  requestHash: string,
+  reason: string,
+): Promise<CommandReceipt> {
+  return client.call<CommandReceipt>("run.deny", {
+    run_id: runId,
+    node_id: nodeId,
+    operation_id: operationId,
+    request_hash: requestHash,
+    reason,
+  });
+}
+
+/**
+ * 审批收件箱（approvals.list）：pending 在前、deadline 升序。
+ * runId 缺省 = 全局收件箱（仪表盘待审批区）；all=true 时附带非 pending 项。
+ */
+export async function approvalsList(runId?: string, all?: boolean): Promise<ApprovalsPage> {
+  const params: Record<string, unknown> = {};
+  if (runId !== undefined) params.run_id = runId;
+  if (all) params.all = true;
+  return client.call<ApprovalsPage>("approvals.list", params);
+}
+
+/** 策略投影（permissions.effective）：按定义版本或 run 查询派生状态与诊断。 */
+export async function permissionsEffective(params: {
+  workflow_id?: string;
+  version?: number;
+  node_id?: string;
+  run_id?: string;
+}): Promise<PermissionsEffective> {
+  const wire: Record<string, unknown> = {};
+  if (params.workflow_id !== undefined) wire.workflow_id = params.workflow_id;
+  if (params.version !== undefined) wire.version = params.version;
+  if (params.node_id !== undefined) wire.node_id = params.node_id;
+  if (params.run_id !== undefined) wire.run_id = params.run_id;
+  return client.call<PermissionsEffective>("permissions.effective", wire);
 }
 
 // ---- 触发器：cron 调度与 webhook（schedule.* / webhook.*） ----

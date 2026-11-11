@@ -11,10 +11,21 @@ vi.mock("../api/flow", () => ({
   runSignal: vi.fn(),
   adjudicateRun: vi.fn(async () => {}),
   runObservations: vi.fn(async () => ({ records: [], loss: {} })),
+  runApprove: vi.fn(),
+  runDeny: vi.fn(),
+  approvalsList: vi.fn(async () => ({ items: [], server_time: 0 })),
 }));
 vi.mock("../rpc/client", () => ({
   client: { onReconnect: vi.fn() },
   errText: (e: unknown) => String(e),
+  RpcError: class RpcError extends Error {
+    constructor(
+      public code: number,
+      message: string,
+    ) {
+      super(message);
+    }
+  },
 }));
 vi.mock("../state/editor", () => ({
   editor: {

@@ -11,6 +11,7 @@ vi.mock("../api/flow", () => ({
   getWorkflow: vi.fn(),
   runCancel: vi.fn(),
   runSignal: vi.fn(),
+  approvalsList: vi.fn(async () => ({ items: [], server_time: 0 })),
 }));
 
 import * as api from "../api/flow";

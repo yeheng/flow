@@ -68,6 +68,7 @@ async-trait = "0.1"
 tokio-stream = "0.1"
 dirs = "7"
 toml = "1"
+url = "2"
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake"] }
 base64 = "0.23"
 tempfile = "3"

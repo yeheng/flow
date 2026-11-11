@@ -25,6 +25,16 @@ pub(crate) fn id() -> String {
     uuid::Uuid::now_v7().to_string()
 }
 
+/// 是否处于测试进程（存量 e2e 的自动治理钩子；生产恒 false）。
+/// `FLOW_TEST_AUTO_GOVERN=0` 显式关闭（验证 legacy 门/工具裁决的用例用）。
+pub(crate) fn tests_auto_govern() -> bool {
+    match std::env::var("FLOW_TEST_AUTO_GOVERN").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => std::env::var_os("CARGO_BIN_EXE_flow-journal-server-e2e").is_some(),
+    }
+}
+
 /// 生成 RFC3339 时间戳（统一 UTC，避免各处时区不一致）。
 pub(crate) fn now() -> String {
     chrono::Utc::now().to_rfc3339()
@@ -50,6 +60,8 @@ struct PreparedDefinition {
     value: Value,
     parsed: flow_engine::Definition,
     checksum: String,
+    /// 权限内容摘要（legacy = None）：与上一版本不同则记 WorkflowPermissionsChanged。
+    permissions_digest: Option<String>,
 }
 impl PreparedDefinition {
     /// 归一化并校验一份定义：补齐语义版本、校验结构、计算摘要。
@@ -78,10 +90,12 @@ impl PreparedDefinition {
             }
         }
         let bytes = flow_journal::codec::bounded_json(&value, flow_journal::MAX_LINE_BYTES)?;
+        let permissions_digest = crate::policy::definition_permissions_digest(&parsed);
         Ok(Self {
             value,
             parsed,
             checksum: flow_journal::codec::digest(&bytes),
+            permissions_digest,
         })
     }
     /// Caller holds the metadata write guard through the eventual command commit.
@@ -149,6 +163,29 @@ fn import_target<'a>(state: &'a State, name: &str) -> flow_journal::Result<Optio
         )));
     }
     Ok(target)
+}
+
+/// 新版本的权限内容相对上一版本有变化时的审计事实（与 WorkflowUpdated 同
+/// 事务、紧随其后）。`by` 首版恒为 LocalAdmin（P2 起由认证主体传入）。
+fn permission_change_event(
+    workflow_id: &str,
+    version: u64,
+    previous: Option<&str>,
+    next: Option<&str>,
+) -> Option<Event> {
+    if previous == next {
+        return None;
+    }
+    Some(Event::new(
+        EventKind::WorkflowPermissionsChanged,
+        json!({
+            "workflow_id": workflow_id,
+            "definition_version": version.to_string(),
+            "policy_digest": next,
+            "previous_digest": previous,
+            "by": flow_dto::permission::Principal::LocalAdmin,
+        }),
+    ))
 }
 
 /// Repeated saves/imports reuse the latest version and its publication state.
@@ -627,6 +664,11 @@ impl JournalBackend {
                 )
             })
             .await?;
+        let previous_digest = match &latest {
+            Some(version) => self.version_permissions_digest(version).await?,
+            None => None,
+        };
+        let next_digest = prepared.permissions_digest.clone();
         let (checksum, stored, value) = prepared.store(self, latest.as_ref()).await?;
         self.command_selected(
             "workflow.import",
@@ -654,7 +696,16 @@ impl JournalBackend {
                 let latest = existing.and_then(|w| w.versions.last_key_value().map(|(_, v)| v));
                 let (value, event) = prepare_version(&workflow_id, latest, stored, checksum);
                 let version = value.version;
+                let created_version = event.is_some();
                 events.extend(event);
+                if created_version {
+                    events.extend(permission_change_event(
+                        &workflow_id,
+                        version,
+                        previous_digest.as_deref(),
+                        next_digest.as_deref(),
+                    ));
+                }
                 let published = value.published || publish;
                 if publish && !value.published {
                     events.push(Event::new(
@@ -730,6 +781,11 @@ impl JournalBackend {
                 )
             })
             .await?;
+        let previous_digest = match &latest {
+            Some(version) => self.version_permissions_digest(version).await?,
+            None => None,
+        };
+        let next_digest = prepared.permissions_digest.clone();
         let (checksum, stored, value) = prepared.store(self, latest.as_ref()).await?;
         self.command_selected(
             "workflow.update",
@@ -745,10 +801,17 @@ impl JournalBackend {
                     .ok_or_else(|| flow_journal::Error::NotFound("workflow not found".into()))?;
                 let latest = w.versions.last_key_value().map(|(_, v)| v);
                 let (value, event) = prepare_version(workflow_id, latest, stored, checksum);
-                Ok((
-                    event.into_iter().collect(),
-                    json!({"version":value.version}),
-                ))
+                let mut events: Vec<Event> = Vec::new();
+                if event.is_some() {
+                    events.extend(event);
+                    events.extend(permission_change_event(
+                        workflow_id,
+                        value.version,
+                        previous_digest.as_deref(),
+                        next_digest.as_deref(),
+                    ));
+                }
+                Ok((events, json!({"version":value.version})))
             },
         )
         .await
@@ -956,6 +1019,35 @@ impl JournalBackend {
             )
             .into());
         }
+        // 测试钩子：legacy 定义按运行期已知事实合成权限块（只影响门与冻结，
+        // 不改写落盘定义）。识别条件 = 显式 FLOW_TEST_AUTO_GOVERN，或测试
+        // 二进制环境（cargo 为集成测试注入 CARGO_BIN_EXE_*）；生产进程
+        // 两个条件都不成立。
+        let definition = if definition.permissions.is_none() && tests_auto_govern() {
+            let governed = crate::policy::auto_govern_for_tests(
+                &definition,
+                execution.as_ref().and_then(|snapshot| snapshot.agent.as_ref()),
+            );
+            // 内置插件在进程内测试里没有启动期授予：这里幂等补上。
+            self.ensure_bundled_grants().await;
+            std::sync::Arc::new(governed)
+        } else {
+            definition
+        };
+        // 权限静态门（G2 前置）：legacy 定义含内置副作用节点 → 拒绝；受管
+        // 定义含尚不受管的组合（动态插件节点 / Plan+agent）→ 拒绝。回归候选
+        // 零外部调用（固件重放），不经此门。
+        let regression_run = execution
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.regression.is_some());
+        if !regression_run {
+            crate::policy::start_gate(&definition)
+                .map_err(flow_journal::Error::Forbidden)?;
+        }
+        let agent_plugin_id = self.harness_agent_plugin_meta().map(|(id, ..)| id);
+        let plugin_ceilings =
+            crate::policy::plugin_ceilings(self, &definition, agent_plugin_id.as_deref()).await;
+        let policy = crate::policy::freeze_root(&definition, plugin_ceilings);
         let validate = |state: &State| {
             if matches!(source, "schedule" | "webhook") {
                 let key = source_detail.ok_or_else(|| invalid("trigger identity required"))?;
@@ -1057,12 +1149,28 @@ impl JournalBackend {
                     .map(|e| e.signal_inputs())
                     .unwrap_or_default(),
                 execution,
+                policy: Some(policy.clone()),
+                approvals: Vec::new(),
+                approval_seq: 0,
             };
             let mut event = Event::new(EventKind::RunStarted, serde_json::to_value(run)?);
             event.run_id = Some(run_id.clone());
             event.run_seq = 1;
+            // 策略冻结与 run 启动同事务且紧随其后（G2/I30）：PolicyFrozen 由
+            // 折叠层强制紧邻 RunStarted（run_seq=2）。
+            let mut frozen = Event::new(
+                EventKind::PolicyFrozen,
+                json!({
+                    "policy_digest": policy.digest,
+                    "permission_schema_version":
+                        flow_dto::permission::PERMISSION_SCHEMA_VERSION,
+                    "legacy": policy.legacy,
+                }),
+            );
+            frozen.run_id = Some(run_id.clone());
+            frozen.run_seq = 2;
             Ok((
-                vec![event],
+                vec![event, frozen],
                 json!({"run_id":run_id,"workflow_version":selected}),
             ))
         })

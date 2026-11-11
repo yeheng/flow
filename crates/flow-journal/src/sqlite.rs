@@ -30,7 +30,46 @@ pub const DATABASE: &str = "flow.sqlite";
 ///
 /// 版本 4 与版本 3 表结构相同，差别在于「语义门」：旧程序读到版本 4 必须
 /// 拒绝把它当 legacy DAG 解释，而不是按旧语义误读。
-pub const FORMAT: i64 = 4;
+pub const FORMAT: i64 = 5;
+
+/// v4 → v5 原地迁移（09 §10.2）：补 prev_digest/chain_digest 列并顺链回填。
+/// 旧库的 digest 自身仍是可信基线（读侧一直复核 body==digest），迁移把
+/// 它们串成链；此后改任何一帧，其后全部链断。
+fn migrate_v4_to_v5(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction().map_err(db)?;
+    tx.execute_batch(
+        "ALTER TABLE transactions ADD COLUMN prev_digest TEXT NOT NULL DEFAULT '';
+         ALTER TABLE transactions ADD COLUMN chain_digest TEXT NOT NULL DEFAULT '';",
+    )
+    .map_err(db)?;
+    let rows: Vec<(String, String)> = {
+        let mut statement = tx
+            .prepare("SELECT lsn, digest FROM transactions ORDER BY lsn")
+            .map_err(db)?;
+        let mapped = statement
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .map_err(db)?;
+        mapped.collect::<std::result::Result<Vec<_>, _>>().map_err(db)?
+    };
+    let mut prev = String::new();
+    for (lsn, digest) in rows {
+        let chain = chain_digest(&prev, &digest);
+        tx.execute(
+            "UPDATE transactions SET prev_digest = ?1, chain_digest = ?2 WHERE lsn = ?3",
+            rusqlite::params![prev, chain, lsn],
+        )
+        .map_err(db)?;
+        prev = chain;
+    }
+    tx.execute_batch("PRAGMA user_version=5;").map_err(db)?;
+    tx.commit().map_err(db)
+}
+
+/// 链值 = SHA-256(prev_chain ‖ body_digest)。与文档 §10.2 等价：改任何
+/// 一帧的 body → 该帧 digest 变 → 链断；改链列本身 → verify 复算即断。
+pub(crate) fn chain_digest(prev: &str, digest: &str) -> String {
+    crate::codec::digest(format!("{prev}{digest}").as_bytes())
+}
 /// 单条当前实体 body 的字节上限。
 ///
 /// 当前行是投影而非历史档案：过大说明调用方塞了不该进投影的内容。
@@ -410,6 +449,8 @@ pub(crate) struct Disk {
     pub conn: Connection,
     pub id: String,
     pub last_lsn: u64,
+    /// 哈希链尾（上一事务的 chain_digest；空串 = 链首）。append 顺链推进。
+    pub chain_tail: String,
     pub data_syncs: u64,
     pub data_latency: SyncLatency,
     pub directory_latency: SyncLatency,
@@ -465,6 +506,9 @@ impl Disk {
                     return Err(invalid("unsupported SQLite storage format"));
                 }
                 initialize = true;
+            } else if version == 4 && FORMAT == 5 {
+                // v4 → v5（09 §10.2 哈希链）：补列 + 顺链回填（单事务）。
+                migrate_v4_to_v5(&mut conn)?;
             } else if version != FORMAT {
                 return Err(invalid("unsupported SQLite storage format; format 3 can be copied with flow-journal-tool upgrade <source> <new-directory>"));
             } else {
@@ -506,10 +550,30 @@ impl Disk {
         if last != ((last_lsn > 0).then(|| format!("{last_lsn:020}"))) {
             return Err(invalid("SQLite commit watermark mismatch"));
         }
+        // 恢复链尾：打开时顺最后一段复核（尾帧 prev 与链值必须自洽——
+        // 尾部被改会让这里先炸，verify 再顺全链定位中段篡改）。
+        let chain_tail: String = conn
+            .query_row(
+                "SELECT chain_digest FROM transactions ORDER BY lsn DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or_default();
+        if last_lsn > 0 {
+            let (prev, digest, chain): (String, String, String) = conn.query_row(
+                "SELECT prev_digest, digest, chain_digest FROM transactions ORDER BY lsn DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            ).map_err(db)?;
+            if chain != chain_digest(&prev, &digest) {
+                return Err(invalid("transaction hash chain broken at tail"));
+            }
+        }
         Ok(Self {
             conn,
             id,
             last_lsn,
+            chain_tail,
             data_syncs: 0,
             data_latency: SyncLatency::default(),
             directory_latency: SyncLatency::default(),
@@ -572,16 +636,20 @@ impl Disk {
         }
         self.conn
             .execute(
-                "INSERT INTO transactions VALUES(?,?,?,?,?)",
+                "INSERT INTO transactions VALUES(?,?,?,?,?,?,?)",
                 params![
                     format!("{:020}", tx.lsn),
                     tx.tx_id,
                     tx.events.len() as i64,
                     digest,
-                    bytes as i64
+                    bytes as i64,
+                    self.chain_tail.clone(),
+                    chain_digest(&self.chain_tail, digest),
                 ],
             )
             .map_err(db)?;
+        // 链尾推进放在事务提交之前、同一条 SQL 事务里：提交成功即链已延伸。
+        self.chain_tail = chain_digest(&self.chain_tail, digest);
         // 事件逐条写入：事件索引是事务内定位事实的唯一依据，必须与读回
         // 路径的期望一致。
         for (index, event) in tx.events.iter().enumerate() {

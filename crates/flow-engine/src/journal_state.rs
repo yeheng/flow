@@ -111,6 +111,10 @@ pub enum WaitKind {
     Child,
     Retry,
     Uncertain,
+    /// 人工权限审批等待（09 §6）：非封口——由 PermissionAsked 折叠产生，
+    /// PermissionDecided 解除。run 保持 Running（业务等待不是平台故障），
+    /// 不触碰 AwaitingResume。
+    Approval,
 }
 
 impl WaitKind {
@@ -125,6 +129,7 @@ impl WaitKind {
             Self::Child => "child",
             Self::Retry => "retry",
             Self::Uncertain => "uncertain",
+            Self::Approval => "approval",
         }
     }
 }
@@ -180,6 +185,21 @@ pub struct Run {
     pub execution: Option<ExecutionSnapshot>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub signals: BTreeMap<String, StoredValue>,
+    /// 冻结策略（09 G2/I30）：随 RunStarted 快照冻结，派发与审批只读它。
+    /// None = 权限模型之前启动的 run（缺少策略快照：G3 一律拒绝外部操作）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<flow_dto::permission::FrozenPolicy>,
+    /// Run 精确授权投影（RunApprovalUpserted/Removed 折叠；只免重复询问）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approvals: Vec<flow_dto::permission::RunApproval>,
+    /// Run 授权事件水位：policy_revision = 策略 digest + 该水位（§3.3）。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub approval_seq: u64,
+}
+
+/// serde 帮手：零值计数器不序列化（旧快照字节不变）。
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 // 运行快照在 run 启动时冻结：runtime、时钟、随机种子、绑定与被引用定义版本
@@ -225,6 +245,13 @@ pub struct AgentPluginSnapshot {
     /// UiProjection 的序列化（palette/params/summary_keys）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui: Option<serde_json::Value>,
+    /// PermissionProjection 的序列化（规范化能力需求 + required；
+    /// 09 §7.2）。None = legacy-unrestricted 插件（无权限声明）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<serde_json::Value>,
+    /// manifest 内容哈希（安装身份；授予按 (plugin_id, content_hash) 键）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
 }
 impl ExecutionSnapshot {
     /// 节点在快照路径下的唯一键（路径的 JSON 编码）。
@@ -301,6 +328,9 @@ impl Run {
             nodes: BTreeMap::new(),
             execution: self.execution.clone(),
             signals: self.signals.clone(),
+            policy: self.policy.clone(),
+            approvals: self.approvals.clone(),
+            approval_seq: self.approval_seq,
         }
     }
     // 刷新规则只覆盖非终态 run：终态事实（成功/失败/取消）一旦落账就不该
@@ -350,6 +380,108 @@ pub struct Node {
     /// 跳过原因（NodeSkipped 事件携带；时间线展示用，不影响裁决）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skip_reason: Option<String>,
+    /// 最近一次权限询问（09 §6）。跨 DispatchStarted 保留：被重派发取代的
+    /// 询问留下 deadline 供继承（不得因等待重启而刷新 TTL）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ApprovalState>,
+    /// 节点级 Allow 裁决留下的授权凭条（I26 折叠闸）：OperationAuthorized
+    /// 必须消费同 operation_id + fingerprint 的凭条，消费即清空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permit: Option<PermitGrant>,
+}
+
+/// 权限询问的状态机：`Pending → Allowed | Denied | Expired`，或因派发
+/// 结束而 `Superseded`（重派发）/ `Withdrawn`（会话结束/节点出结果）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalStatus {
+    Pending,
+    Allowed,
+    Denied,
+    Expired,
+    Superseded,
+    Withdrawn,
+}
+
+impl ApprovalStatus {
+    /// 线上名称（视图与 RPC 展示用）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Allowed => "allowed",
+            Self::Denied => "denied",
+            Self::Expired => "expired",
+            Self::Superseded => "superseded",
+            Self::Withdrawn => "withdrawn",
+        }
+    }
+}
+
+/// 一次权限询问的折叠态（PermissionAsked 载荷 + 当前状态）。
+///
+/// 审批 RPC 从这里取回完整请求重新评估（能力过期 → 直接拒绝），并用
+/// `operation_request` 构造 OperationAuthorized——审批卡片的每个字段都来自
+/// master 的持久请求，插件不能覆盖关键字段（§7.2）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalState {
+    /// `node`（G3 节点级）或 `tool`（G5 工具级）。
+    pub gate: String,
+    pub request: flow_dto::permission::PermissionRequest,
+    pub dispatch_id: String,
+    pub asked_at: i64,
+    /// 绝对截止（毫秒）；TTL 到期 = Deny + 节点业务失败（I34）。
+    pub deadline: i64,
+    /// 操作请求正文（G3：批准后用于 OperationIntent/Authorized）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_request: Option<StoredValue>,
+    /// 评估时命中的能力项（审批卡片「依据」）。
+    #[serde(default)]
+    pub matched: Vec<String>,
+    pub status: ApprovalStatus,
+    /// 裁决记录（终态时）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<flow_dto::permission::DecisionRecord>,
+}
+
+/// 节点级 Allow 凭条：绑定 operation_id + 请求指纹 + request_hash。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermitGrant {
+    pub operation_id: String,
+    pub request_hash: String,
+    pub fingerprint: String,
+}
+
+/// `PolicyFrozen` 事件载荷（09 §10.1）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyFrozenPayload {
+    pub policy_digest: String,
+    pub permission_schema_version: u32,
+    pub legacy: bool,
+}
+
+/// `PermissionAsked` 事件载荷。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermissionAskedPayload {
+    /// `node`（G3）| `tool`（G5）。
+    pub gate: String,
+    pub request: flow_dto::permission::PermissionRequest,
+    pub asked_at: i64,
+    pub deadline: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_request: Option<StoredValue>,
+    #[serde(default)]
+    pub matched: Vec<String>,
+}
+
+/// `PermissionDecided` 事件载荷：裁决记录 + 结论状态。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermissionDecidedPayload {
+    pub gate: String,
+    pub record: flow_dto::permission::DecisionRecord,
+    /// 被裁决请求的字节摘要（I26 折叠闸用它对上 OperationAuthorized）。
+    pub request_fingerprint: String,
+    /// `allowed` | `denied` | `expired`。
+    pub status: ApprovalStatus,
 }
 impl Node {
     // 与 run 摘要同理：节点摘要只保留执行字段，尝试历史单独索引。
@@ -368,6 +500,8 @@ impl Node {
             attempts: BTreeMap::new(),
             error: self.error.clone(),
             skip_reason: self.skip_reason.clone(),
+            approval: self.approval.clone(),
+            permit: self.permit.clone(),
         }
     }
 }
@@ -422,8 +556,17 @@ pub enum Wait {
         wake_at: i64,
     },
     Uncertain,
+    /// 权限审批等待：`deadline` 走线上 `wake_at` 字段（定时等待语义），
+    /// operation_id/request_hash 绑定被询问的那一次请求实例。
+    Approval {
+        operation_id: String,
+        request_hash: String,
+        deadline: i64,
+    },
 }
 /// `Wait` 的线上表示：字段齐平、带显式 null，用来保持旧 JSON 形状。
+///
+/// 审批等待新增的两个字段 skip_none：旧种类的 JSON 形状一个字节都不变。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WaitWire {
     kind: WaitKind,
@@ -431,6 +574,10 @@ struct WaitWire {
     child_run_id: Option<String>,
     #[serde(default)]
     output: Option<StoredValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_hash: Option<String>,
 }
 impl TryFrom<WaitWire> for Wait {
     type Error = &'static str;
@@ -446,11 +593,17 @@ impl TryFrom<WaitWire> for Wait {
         if w.child_run_id.is_some() && w.kind != WaitKind::Child {
             return Err("child_run_id on non-child wait");
         }
-        if w.wake_at.is_some() && !matches!(w.kind, WaitKind::Delay | WaitKind::Retry) {
+        if w.wake_at.is_some()
+            && !matches!(w.kind, WaitKind::Delay | WaitKind::Retry | WaitKind::Approval)
+        {
             return Err("wake_at on non-timed wait");
         }
         if w.output.is_some() && !matches!(w.kind, WaitKind::Delay | WaitKind::Signal) {
             return Err("output on non-value wait");
+        }
+        if (w.operation_id.is_some() || w.request_hash.is_some()) && w.kind != WaitKind::Approval
+        {
+            return Err("approval identity on non-approval wait");
         }
         Ok(match w.kind {
             WaitKind::Delay => Self::Delay {
@@ -468,6 +621,17 @@ impl TryFrom<WaitWire> for Wait {
                 wake_at: w.wake_at.ok_or("retry missing wake_at")?,
             },
             WaitKind::Uncertain => Self::Uncertain,
+            WaitKind::Approval => Self::Approval {
+                operation_id: w
+                    .operation_id
+                    .filter(|id| !id.is_empty())
+                    .ok_or("approval missing operation_id")?,
+                request_hash: w
+                    .request_hash
+                    .filter(|hash| !hash.is_empty())
+                    .ok_or("approval missing request_hash")?,
+                deadline: w.wake_at.ok_or("approval missing deadline")?,
+            },
         })
     }
 }
@@ -479,9 +643,20 @@ impl From<Wait> for WaitWire {
             wake_at: w.wake_at(),
             child_run_id: None,
             output: w.output().cloned(),
+            operation_id: None,
+            request_hash: None,
         };
-        if let Wait::Child { child_run_id } = w {
-            wire.child_run_id = Some(child_run_id);
+        match w {
+            Wait::Child { child_run_id } => wire.child_run_id = Some(child_run_id),
+            Wait::Approval {
+                operation_id,
+                request_hash,
+                ..
+            } => {
+                wire.operation_id = Some(operation_id);
+                wire.request_hash = Some(request_hash);
+            }
+            _ => {}
         }
         wire
     }
@@ -495,12 +670,14 @@ impl Wait {
             Self::Child { .. } => WaitKind::Child,
             Self::Retry { .. } => WaitKind::Retry,
             Self::Uncertain => WaitKind::Uncertain,
+            Self::Approval { .. } => WaitKind::Approval,
         }
     }
-    /// 定时唤醒时刻（毫秒时间戳）；仅 delay/retry 等待有值。
+    /// 定时唤醒时刻（毫秒时间戳）；delay/retry 等待与审批截止有值。
     pub fn wake_at(&self) -> Option<i64> {
         match self {
             Self::Delay { wake_at, .. } | Self::Retry { wake_at } => Some(*wake_at),
+            Self::Approval { deadline, .. } => Some(*deadline),
             _ => None,
         }
     }
@@ -637,6 +814,59 @@ pub struct State {
     /// Zero means a journal written before the epoch event existed.
     #[serde(default, with = "snapshot_decimal")]
     pub master_epoch: u64,
+    /// 插件能力授予（09 §7，I35）：键 = `plugin_id:content_hash`。授予是
+    /// 安装期事实（谁在何时批准了哪个内容身份的哪些能力），run 冻结时
+    /// 从这里取上限；不回写 plugin.toml。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub plugin_grants: BTreeMap<String, PluginGrant>,
+}
+
+/// 授予层能力：按 manifest 闭集解析（允许族级 any / 裸程序名）。
+mod grant_capabilities {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        value: &Vec<flow_dto::permission::Capability>,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        value.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Vec<flow_dto::permission::Capability>, D::Error> {
+        let values = Vec::<serde_json::Value>::deserialize(deserializer)?;
+        values
+            .iter()
+            .map(|value| {
+                flow_dto::permission::parse_manifest_capability(value)
+                    .map_err(serde::de::Error::custom)
+            })
+            .collect()
+    }
+}
+
+/// 一条插件授予记录（PluginGrantUpserted 的折叠产物）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginGrant {
+    pub plugin_id: String,
+    pub content_hash: String,
+    /// 授予的能力（manifest 声明的子集；legacy 确认为空。Any 变体只
+    /// 存在于授予/上限层，按 manifest 闭集解析）。
+    #[serde(with = "grant_capabilities")]
+    pub capabilities: Vec<flow_dto::permission::Capability>,
+    /// legacy-unrestricted 插件的显式风险确认（无声明可授）。
+    #[serde(default)]
+    pub legacy_confirmed: bool,
+    pub granted_at: String,
+    pub by: flow_dto::permission::Principal,
+}
+
+impl PluginGrant {
+    /// 授予键（唯一身份）。
+    pub fn key(plugin_id: &str, content_hash: &str) -> String {
+        format!("{plugin_id}:{content_hash}")
+    }
 }
 
 /// 命令幂等键：由 scope 与 request_id 组成的 JSON 元组编码。
@@ -851,6 +1081,19 @@ impl State {
                 {
                     return Err(invalid("authorization without intent"));
                 }
+                // 策略冻结与 run 启动同事务且紧随其后（G2/I30）：中间夹入别的
+                // 事实会出现「run 已存在但策略未冻结」的窗口。
+                if event.kind == EventKind::PolicyFrozen
+                    && index
+                        .checked_sub(1)
+                        .map(|previous| &tx.events[previous])
+                        .is_none_or(|previous| {
+                            previous.kind != EventKind::RunStarted
+                                || previous.run_id != event.run_id
+                        })
+                {
+                    return Err(invalid("policy freeze must immediately follow its run start"));
+                }
             }
         }
         // Undo only changed entities, not the full historical state. Inline values are bounded.
@@ -988,6 +1231,13 @@ impl State {
             EventKind::WaitRegistered => {
                 let wait: Wait = serde_json::from_value(p["wait"].clone())?;
                 if let Some(value) = wait.output() {
+                    self.values.check(value)?;
+                }
+            }
+            EventKind::PermissionAsked => {
+                // 审批卡片的请求正文必须是已发布值：批准时据此构造授权事实。
+                let asked: PermissionAskedPayload = serde_json::from_value(p.clone())?;
+                if let Some(value) = &asked.operation_request {
                     self.values.check(value)?;
                 }
             }
@@ -1160,6 +1410,37 @@ impl State {
                 replace_config(&mut self.templates, p, "id")?;
                 return Ok(());
             }
+            EventKind::WorkflowPermissionsChanged => {
+                // 审计标记：只校验指向已存在的定义版本（与 WorkflowUpdated 同
+                // 事务、在其后），本身不改状态——权限内容就在定义版本里。
+                let id = string(p, "workflow_id")?;
+                let version = number(p, "definition_version")?;
+                if self
+                    .workflows
+                    .get(&id)
+                    .and_then(|w| w.versions.get(&version))
+                    .is_none()
+                {
+                    return Err(invalid("permission change for missing workflow version"));
+                }
+                return Ok(());
+            }
+            EventKind::PluginGrantUpserted => {
+                // 授予是安装期事实：同键重复授予以后写为准（升级差异确认），
+                // 不同键互不影响。能力走 flow-dto 闭集解析。
+                let grant: PluginGrant = serde_json::from_value(p.clone())?;
+                if grant.plugin_id.trim().is_empty()
+                    || grant.content_hash.len() != 64
+                    || !grant.legacy_confirmed && grant.capabilities.is_empty()
+                {
+                    return Err(invalid("malformed plugin grant"));
+                }
+                self.plugin_grants.insert(
+                    PluginGrant::key(&grant.plugin_id, &grant.content_hash),
+                    grant,
+                );
+                return Ok(());
+            }
             EventKind::RunStarted => {
                 let mut run = match parsed {
                     Parsed::Run(run) => *run,
@@ -1177,6 +1458,17 @@ impl State {
                 // 畸形事实混入，这里强制归一到 writer 契约形状。
                 run.status = RunStatus::Running;
                 run.nodes.clear();
+                // Run 授权只能经 RunApprovalUpserted 事实产生，出生载荷不可预置。
+                run.approvals.clear();
+                run.approval_seq = 0;
+                // 冻结策略的身份必须自洽：digest 与层内容逐字对得上（I30）。
+                if run
+                    .policy
+                    .as_ref()
+                    .is_some_and(|policy| !policy.digest_is_consistent())
+                {
+                    return Err(invalid("frozen policy digest mismatch"));
+                }
                 // 记录 run→workflow 归属：它按 workflow 数量而非 run 数量
                 // 增长，是「一个工作流名下有哪些 run」的永久索引。
                 self.run_workflows.insert(run.workflow_id.clone());
@@ -1270,6 +1562,53 @@ impl State {
                 }
                 return Ok(());
             }
+            EventKind::PolicyFrozen => {
+                // 冻结记录必须与 RunStarted 快照里的策略逐字对得上，且只能是
+                // run 的第二条事实（结构规则另保证同事务紧随）。
+                let frozen: PolicyFrozenPayload = serde_json::from_value(p.clone())?;
+                let policy = run
+                    .policy
+                    .as_ref()
+                    .ok_or_else(|| invalid("policy freeze without frozen policy"))?;
+                if event.run_seq != 2
+                    || frozen.policy_digest != policy.digest
+                    || frozen.legacy != policy.legacy
+                    || frozen.permission_schema_version
+                        != flow_dto::permission::PERMISSION_SCHEMA_VERSION
+                {
+                    return Err(invalid("policy freeze does not match the frozen run policy"));
+                }
+                return Ok(());
+            }
+            EventKind::RunApprovalUpserted => {
+                // Run 授权只免除重复询问，不增加能力（I27/I30）：没有冻结策略
+                // 或 legacy run 无从谈起；终态 run 不再接受新授权。
+                if run.terminal() || run.policy.as_ref().is_none_or(|policy| policy.legacy) {
+                    return Err(invalid("run approval requires a live governed run"));
+                }
+                let approval: flow_dto::permission::RunApproval =
+                    serde_json::from_value(p.clone())?;
+                if approval.digest.len() != 64 || approval.node_id.is_empty() {
+                    return Err(invalid("malformed run approval"));
+                }
+                run.approvals
+                    .retain(|a| !(a.node_id == approval.node_id && a.digest == approval.digest));
+                run.approvals.push(approval);
+                run.approval_seq += 1;
+                return Ok(());
+            }
+            EventKind::RunApprovalRemoved => {
+                let node = string(p, "node_id")?;
+                let digest = string(p, "digest")?;
+                let before = run.approvals.len();
+                run.approvals
+                    .retain(|a| !(a.node_id == node && a.digest == digest));
+                if run.approvals.len() == before {
+                    return Err(invalid("run approval not found"));
+                }
+                run.approval_seq += 1;
+                return Ok(());
+            }
             _ => {}
         }
         let node_id = event
@@ -1302,6 +1641,8 @@ impl State {
                 attempts: BTreeMap::new(),
                 error: None,
                 skip_reason: None,
+                approval: None,
+                permit: None,
             });
             // 三重派发守卫：同一逻辑节点（node_execution_id 不变）、
             // attempt 严格 +1、且上一条外部操作的结果已经捕获。
@@ -1313,6 +1654,17 @@ impl State {
             {
                 return Err(invalid("unsafe dispatch retry"));
             }
+            // dispatch 变更：旧 pending 询问被取代（保留 deadline 供新询问继承，
+            // 不得因等待重启而刷新 TTL）；旧 dispatch 的授权凭条作废——旧审批
+            // 不能自动套用到新派发（§6.1）。
+            if let Some(approval) = node
+                .approval
+                .as_mut()
+                .filter(|approval| approval.status == ApprovalStatus::Pending)
+            {
+                approval.status = ApprovalStatus::Superseded;
+            }
+            node.permit = None;
             run.status = RunStatus::Running;
             node.attempt = attempt;
             node.dispatch_id = dispatch_id.clone();
@@ -1366,6 +1718,8 @@ impl State {
                     // 跳过原因只在事件里携带；折影保留一份供时间线展示
                     //（upstream_failed / upstream_skipped / branch_not_taken …）
                     skip_reason: p.get("reason").and_then(Value::as_str).map(str::to_owned),
+                    approval: None,
+                    permit: None,
                 },
             );
             return Ok(());
@@ -1396,6 +1750,8 @@ impl State {
             }
         }
         let terminal = run.terminal();
+        // 有冻结策略的 run 受 I26 折叠闸约束（缺快照的旧 run 由 master 侧拒绝）。
+        let governed = run.policy.is_some();
         let node = run
             .nodes
             .get_mut(&node_id)
@@ -1480,6 +1836,21 @@ impl State {
                 {
                     return Err(invalid("invalid operation identity/request fingerprint"));
                 }
+                // I26：有冻结策略的 run 中，授权必须消费一张同 operation_id +
+                // 指纹的 Allow 凭条（PermissionDecided 已落盘）。凭条一次性：
+                // 不能挪给下一次调用。
+                if governed {
+                    let permitted = node.permit.as_ref().is_some_and(|permit| {
+                        permit.operation_id == operation.operation_id
+                            && permit.fingerprint == operation.fingerprint
+                    });
+                    if !permitted {
+                        return Err(invalid(
+                            "operation authorized without a recorded allow decision (I26)",
+                        ));
+                    }
+                    node.permit = None;
+                }
                 node.operation = Some(operation);
             }
             EventKind::OperationOutcome => {
@@ -1495,6 +1866,16 @@ impl State {
                 op.outcome = Some(serde_json::from_value(p["outcome"].clone())?);
             }
             EventKind::NodeCompleted | EventKind::WaitRegistered | EventKind::NodeFailed => {
+                // 派发出结果即本次会话结束：仍 pending 的询问随之失效（会话
+                // 丢失走 Uncertain 路径，不得把旧批准交给新会话，§6.1）。
+                if let Some(approval) = node
+                    .approval
+                    .as_mut()
+                    .filter(|approval| approval.status == ApprovalStatus::Pending)
+                {
+                    approval.status = ApprovalStatus::Withdrawn;
+                }
+                node.permit = None;
                 let n = number(p, "sealed_through")?;
                 let attempt = node
                     .attempts
@@ -1601,6 +1982,123 @@ impl State {
                 // 裁决即人工介入完成：awaiting_resume 回到 running（终态由
                 // 后续 RunCompleted/RunFailed 事件落定）
                 run.status = RunStatus::Running;
+            }
+            EventKind::PermissionAsked => {
+                // master 写的节点事实：绑定当前 dispatch、占 run_seq、不占
+                // audit_seq；终态 run 不再询问。
+                if terminal || event.audit_seq != 0 || event.run_seq == 0 {
+                    return Err(invalid("permission ask must be a live master run event"));
+                }
+                let asked: PermissionAskedPayload = serde_json::from_value(p.clone())?;
+                let request = &asked.request;
+                // 自报 hash 必须等于请求 canonical 摘要；请求上下文必须指向
+                // 本节点的当前派发（插件自报 node_id 不能改变 master 的绑定）。
+                if request.request_hash != request.compute_hash()
+                    || request.context.dispatch_id != node.dispatch_id
+                    || request.context.node_id != node_id
+                    || request.specs.is_empty()
+                    || asked.deadline <= asked.asked_at
+                {
+                    return Err(invalid("invalid permission ask identity"));
+                }
+                if node.status != NodeStatus::Running
+                    || node
+                        .approval
+                        .as_ref()
+                        .is_some_and(|approval| approval.status == ApprovalStatus::Pending)
+                {
+                    return Err(invalid(
+                        "permission ask requires a running node without a pending approval",
+                    ));
+                }
+                match asked.gate.as_str() {
+                    // G3：节点级询问发生在副作用授权之前。
+                    "node" => {
+                        if node.prepared.is_none()
+                            || node.operation.is_some()
+                            || asked.operation_request.is_none()
+                        {
+                            return Err(invalid("node-level ask must precede authorization"));
+                        }
+                    }
+                    // G5：工具级询问发生在已授权且在飞的 agent 回合内。
+                    "tool" => {
+                        if node.operation.as_ref().is_none_or(|o| o.outcome.is_some()) {
+                            return Err(invalid(
+                                "tool-level ask requires an in-flight authorized turn",
+                            ));
+                        }
+                    }
+                    _ => return Err(invalid("unknown permission gate")),
+                }
+                node.status = NodeStatus::Waiting;
+                node.wait = Some(Wait::Approval {
+                    operation_id: request.operation_id.clone(),
+                    request_hash: request.request_hash.clone(),
+                    deadline: asked.deadline,
+                });
+                node.approval = Some(ApprovalState {
+                    gate: asked.gate,
+                    dispatch_id: node.dispatch_id.clone(),
+                    asked_at: asked.asked_at,
+                    deadline: asked.deadline,
+                    operation_request: asked.operation_request,
+                    matched: asked.matched,
+                    status: ApprovalStatus::Pending,
+                    decision: None,
+                    request: asked.request,
+                });
+            }
+            EventKind::PermissionDecided => {
+                if terminal || event.audit_seq != 0 || event.run_seq == 0 {
+                    return Err(invalid("permission decision must be a live master run event"));
+                }
+                let decided: PermissionDecidedPayload = serde_json::from_value(p.clone())?;
+                let record = &decided.record;
+                use flow_dto::permission::Decision;
+                let consistent = matches!(
+                    (record.decision, decided.status),
+                    (Decision::Allow, ApprovalStatus::Allowed)
+                        | (Decision::Deny, ApprovalStatus::Denied | ApprovalStatus::Expired)
+                );
+                if !consistent || record.request_hash.len() != 64 {
+                    return Err(invalid("inconsistent permission decision"));
+                }
+                let pending = node.approval.as_ref().filter(|approval| {
+                    approval.status == ApprovalStatus::Pending
+                        && approval.request.operation_id == record.operation_id
+                });
+                if let Some(pending) = pending {
+                    // 只能裁决该节点当前 pending 的那一次请求实例（I32）：
+                    // 换了 hash（内容/派发变了）的旧批准一律拒绝。
+                    if pending.request.request_hash != record.request_hash
+                        || pending.gate != decided.gate
+                        || pending.request.context.request_fingerprint
+                            != decided.request_fingerprint
+                    {
+                        return Err(invalid("decision for a different request instance"));
+                    }
+                    node.wait = None;
+                    node.status = NodeStatus::Running;
+                    let approval = node.approval.as_mut().expect("pending approval");
+                    approval.status = decided.status;
+                    approval.decision = Some(decided.record.clone());
+                } else {
+                    // 直接裁决（auto 放行 / 能力拒绝）：节点必须正在跑当前派发；
+                    // 过期只能作用于 pending 询问。
+                    if node.status != NodeStatus::Running
+                        || decided.status == ApprovalStatus::Expired
+                    {
+                        return Err(invalid("direct decision requires a running dispatch"));
+                    }
+                }
+                if decided.gate == "node" && record.decision == Decision::Allow {
+                    node.permit = Some(PermitGrant {
+                        operation_id: record.operation_id.clone(),
+                        request_hash: record.request_hash.clone(),
+                        fingerprint: decided.request_fingerprint.clone(),
+                    });
+                }
             }
             EventKind::OperationRetryAuthorized => {
                 // 机器重试授权的四道闸：run 未终态、输入已准备、
@@ -1800,6 +2298,8 @@ mod aggregate_status_tests {
             attempts: BTreeMap::new(),
             error: None,
             skip_reason: None,
+            approval: None,
+            permit: None,
         };
         run.nodes.insert("a".into(), node(true));
         run.nodes.insert("b".into(), node(true));
@@ -1855,6 +2355,451 @@ mod wait_compat_tests {
         }
         let signal: Wait = serde_json::from_value(json!({"kind":"signal"})).unwrap();
         assert_eq!(signal.kind(), WaitKind::Signal);
+    }
+
+    /// 审批等待：deadline 走 wake_at，身份字段只允许出现在 approval 上。
+    #[test]
+    fn approval_wait_shape_round_trips_and_is_kind_bound() {
+        let approval = json!({"kind":"approval","wake_at":99,"child_run_id":null,"output":null,
+            "operation_id":"op","request_hash":"h"});
+        let wait: Wait = serde_json::from_value(approval.clone()).unwrap();
+        assert_eq!(wait.kind(), WaitKind::Approval);
+        assert_eq!(wait.wake_at(), Some(99));
+        assert_eq!(serde_json::to_value(wait).unwrap(), approval);
+        for bad in [
+            json!({"kind":"approval","wake_at":1,"request_hash":"h"}),
+            json!({"kind":"approval","operation_id":"op","request_hash":"h"}),
+            json!({"kind":"delay","wake_at":1,"operation_id":"op"}),
+        ] {
+            assert!(serde_json::from_value::<Wait>(bad.clone()).is_err(), "{bad}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod permission_fold_tests {
+    //! 09 权限事实的折叠语义：策略冻结、询问/裁决状态机、I26 授权闸与
+    //! Run 精确授权投影。每个用例都走真实 `State::apply`（I5 唯一实现）。
+    use super::*;
+    use flow_dto::permission::{
+        ApprovalScope, Decision, DecisionRecord, ExecutionMode, FrozenPolicy, Modifiers,
+        OperationSpec, PermissionRequest, Principal, RequestContext, WorkflowPermissions,
+    };
+    use serde_json::json;
+
+    struct Harness {
+        state: State,
+        lsn: u64,
+    }
+
+    impl Harness {
+        fn apply(&mut self, events: Vec<Event>) -> Result<()> {
+            let tx = Transaction {
+                v: 2,
+                journal_id: "perm".into(),
+                lsn: self.lsn + 1,
+                tx_id: format!("tx-{}", self.lsn + 1),
+                events,
+            };
+            self.state.apply(&tx)?;
+            self.lsn += 1;
+            Ok(())
+        }
+        fn seq(&self) -> u64 {
+            self.state.runs.get("r").map_or(1, |r| r.last_run_seq + 1)
+        }
+        fn node(&self) -> &Node {
+            &self.state.runs["r"].nodes["n"]
+        }
+    }
+
+    fn policy(legacy: bool) -> FrozenPolicy {
+        let workflow = WorkflowPermissions {
+            version: 1,
+            mode: ExecutionMode::Execute,
+            allow: vec![],
+        };
+        FrozenPolicy::sealed(
+            ExecutionMode::Execute,
+            legacy,
+            workflow,
+            BTreeMap::new(),
+            vec![],
+            vec![],
+        )
+    }
+
+    fn run_event(kind: EventKind, seq: u64, payload: Value) -> Event {
+        let mut event = Event::new(kind, payload);
+        event.run_id = Some("r".into());
+        event.run_seq = seq;
+        event
+    }
+
+    fn node_event(kind: EventKind, seq: u64, dispatch: &str, payload: Value) -> Event {
+        let mut event = run_event(kind, seq, payload);
+        event.node_id = Some("n".into());
+        event.dispatch_id = Some(dispatch.into());
+        event
+    }
+
+    fn inline(value: Value) -> StoredValue {
+        StoredValue::Inline(value)
+    }
+
+    /// 启动受管 run，派发节点 n（dispatch d1）并提交输入准备。
+    fn started(policy: Option<FrozenPolicy>) -> Harness {
+        let mut harness = Harness {
+            state: State::default(),
+            lsn: 0,
+        };
+        let mut run: Run = serde_json::from_value(json!({
+            "run_id":"r", "workflow_id":"w", "workflow_version":1,
+            "definition": inline(Value::Null), "input": inline(Value::Null),
+            "source":"manual", "source_detail":null, "parent":null, "depth":0,
+            "created_at":"now", "status":"running", "output":null, "error":null,
+            "last_run_seq":"0", "nodes":{}
+        }))
+        .unwrap();
+        run.policy = policy.clone();
+        let mut events = vec![run_event(
+            EventKind::RunStarted,
+            1,
+            serde_json::to_value(&run).unwrap(),
+        )];
+        if let Some(policy) = &policy {
+            events.push(run_event(
+                EventKind::PolicyFrozen,
+                2,
+                json!({"policy_digest": policy.digest, "permission_schema_version": 1,
+                       "legacy": policy.legacy}),
+            ));
+        }
+        harness.apply(events).unwrap();
+        let seq = harness.seq();
+        harness
+            .apply(vec![node_event(
+                EventKind::DispatchStarted,
+                seq,
+                "d1",
+                json!({"node_execution_id":"x","attempt":"1"}),
+            )])
+            .unwrap();
+        let mut prepared = node_event(
+            EventKind::InputPrepared,
+            0,
+            "d1",
+            json!({"prepared": {
+                "input": inline(Value::Null), "predecessors": {},
+                "params": inline(json!({})), "engine_build": "b", "node_semantics": 2
+            }}),
+        );
+        prepared.audit_seq = 1;
+        harness.apply(vec![prepared]).unwrap();
+        harness
+    }
+
+    fn request(dispatch: &str, operation: &str) -> PermissionRequest {
+        PermissionRequest {
+            actor: Principal::Node {
+                run_id: "r".into(),
+                node_id: "n".into(),
+            },
+            operation_id: operation.into(),
+            specs: vec![OperationSpec::Secret {
+                secret_name: "k".into(),
+            }],
+            context: RequestContext {
+                run_id: "r".into(),
+                workflow_id: "w".into(),
+                workflow_version: 1,
+                node_id: "n".into(),
+                node_type: "http_call".into(),
+                dispatch_id: dispatch.into(),
+                attempt: 1,
+                request_fingerprint: null_fingerprint(),
+                tool_call_id: None,
+            },
+            policy_digest: policy(false).digest,
+            request_hash: String::new(),
+        }
+        .sealed()
+    }
+
+    fn decided(request: &PermissionRequest, decision: Decision, status: &str) -> Value {
+        json!({
+            "gate": "node",
+            "record": DecisionRecord {
+                operation_id: request.operation_id.clone(),
+                request_hash: request.request_hash.clone(),
+                evaluated_at: chrono::Utc::now(),
+                policy_revision: "rev".into(),
+                decision,
+                by: Principal::System,
+                matched_capabilities: vec![],
+                modifiers: Modifiers::default(),
+                scope: ApprovalScope::Once,
+                reason: None,
+            },
+            "request_fingerprint": request.context.request_fingerprint,
+            "status": status,
+        })
+    }
+
+    /// 指纹 = 请求字节摘要（I11）：测试请求是内联 null。
+    fn null_fingerprint() -> String {
+        flow_journal::codec::digest(
+            &flow_journal::codec::bounded_json(&Value::Null, flow_journal::INLINE_BYTES).unwrap(),
+        )
+    }
+
+    fn operation(id: &str) -> Value {
+        let digest = null_fingerprint();
+        json!({"operation": {"operation_id": id, "fingerprint": digest,
+            "permit_id": "p", "request": inline(Value::Null), "outcome": null}})
+    }
+
+    fn authorize(harness: &mut Harness, id: &str) -> Result<()> {
+        let seq = harness.seq();
+        harness.apply(vec![
+            node_event(EventKind::OperationIntent, seq, "d1", operation(id)),
+            node_event(EventKind::OperationAuthorized, seq + 1, "d1", operation(id)),
+        ])
+    }
+
+    #[test]
+    fn policy_freeze_must_match_and_follow_run_start() {
+        let harness = started(Some(policy(false)));
+        assert!(harness.state.runs["r"].policy.is_some());
+        // 摘要对不上：拒绝。
+        let mut bad = Harness {
+            state: State::default(),
+            lsn: 0,
+        };
+        let mut run: Run = serde_json::from_value(
+            serde_json::to_value(&harness.state.runs["r"].summary()).unwrap(),
+        )
+        .unwrap();
+        run.last_run_seq = 0;
+        let events = vec![
+            run_event(EventKind::RunStarted, 1, serde_json::to_value(&run).unwrap()),
+            run_event(
+                EventKind::PolicyFrozen,
+                2,
+                json!({"policy_digest": "0".repeat(64), "permission_schema_version": 1,
+                       "legacy": false}),
+            ),
+        ];
+        assert!(bad.apply(events).is_err());
+        // 不紧随 RunStarted：结构规则拒绝。
+        let lone = run_event(
+            EventKind::PolicyFrozen,
+            2,
+            json!({"policy_digest": run.policy.as_ref().unwrap().digest,
+                   "permission_schema_version": 1, "legacy": false}),
+        );
+        assert!(bad.apply(vec![lone]).is_err());
+    }
+
+    #[test]
+    fn i26_authorization_requires_a_recorded_allow() {
+        // 受管 run：无 Allow 凭条的授权被折叠层拒绝。
+        let mut harness = started(Some(policy(false)));
+        assert!(authorize(&mut harness, "op1").is_err());
+        // 直接 Allow 裁决后同 operation 可授权，凭条随之消费。
+        let req = request("d1", "op1");
+        let seq = harness.seq();
+        harness
+            .apply(vec![node_event(
+                EventKind::PermissionDecided,
+                seq,
+                "d1",
+                decided(&req, Decision::Allow, "allowed"),
+            )])
+            .unwrap();
+        assert!(harness.node().permit.is_some());
+        authorize(&mut harness, "op1").unwrap();
+        assert!(harness.node().permit.is_none());
+        assert!(harness.node().operation.is_some());
+
+        // 无冻结策略的旧 run 不受折叠闸约束（master 侧负责拒绝）。
+        let mut legacy = started(None);
+        authorize(&mut legacy, "op1").unwrap();
+    }
+
+    #[test]
+    fn allow_for_another_operation_does_not_authorize() {
+        let mut harness = started(Some(policy(false)));
+        let req = request("d1", "op1");
+        let seq = harness.seq();
+        harness
+            .apply(vec![node_event(
+                EventKind::PermissionDecided,
+                seq,
+                "d1",
+                decided(&req, Decision::Allow, "allowed"),
+            )])
+            .unwrap();
+        // 凭条绑定 op1，不能挪给 op2（I36）。
+        assert!(authorize(&mut harness, "op2").is_err());
+    }
+
+    #[test]
+    fn ask_then_decide_is_a_non_sealing_wait() {
+        let mut harness = started(Some(policy(false)));
+        let req = request("d1", "op1");
+        let seq = harness.seq();
+        harness
+            .apply(vec![node_event(
+                EventKind::PermissionAsked,
+                seq,
+                "d1",
+                json!({"gate":"node","request":req,"asked_at":1,"deadline":1000,
+                       "operation_request": inline(Value::Null),"matched":["api"]}),
+            )])
+            .unwrap();
+        let node = harness.node();
+        assert_eq!(node.status, NodeStatus::Waiting);
+        assert_eq!(node.wait.as_ref().unwrap().kind(), WaitKind::Approval);
+        // 非封口：attempt 未 sealed，run 仍 Running（不是 AwaitingResume）。
+        assert!(!node.attempts["d1"].sealed);
+        assert_eq!(harness.state.runs["r"].status, RunStatus::Running);
+
+        // 重复询问被拒（同一时刻只有一个 pending）。
+        let seq = harness.seq();
+        assert!(harness
+            .apply(vec![node_event(
+                EventKind::PermissionAsked,
+                seq,
+                "d1",
+                json!({"gate":"node","request":request("d1","op2"),"asked_at":1,
+                       "deadline":1000,"operation_request": inline(Value::Null)}),
+            )])
+            .is_err());
+
+        // 换了 hash 的裁决拒绝（I32）。
+        let mut forged = req.clone();
+        forged.context.request_fingerprint = "e".repeat(64);
+        let forged = forged.sealed();
+        let seq = harness.seq();
+        assert!(harness
+            .apply(vec![node_event(
+                EventKind::PermissionDecided,
+                seq,
+                "d1",
+                decided(&forged, Decision::Allow, "allowed"),
+            )])
+            .is_err());
+
+        // 正确裁决：等待解除、节点回 Running、留下凭条。
+        let seq = harness.seq();
+        harness
+            .apply(vec![node_event(
+                EventKind::PermissionDecided,
+                seq,
+                "d1",
+                decided(&req, Decision::Allow, "allowed"),
+            )])
+            .unwrap();
+        let node = harness.node();
+        assert_eq!(node.status, NodeStatus::Running);
+        assert!(node.wait.is_none());
+        assert_eq!(
+            node.approval.as_ref().unwrap().status,
+            ApprovalStatus::Allowed
+        );
+        authorize(&mut harness, "op1").unwrap();
+    }
+
+    #[test]
+    fn expiry_only_applies_to_pending_and_redispatch_supersedes() {
+        let mut harness = started(Some(policy(false)));
+        let req = request("d1", "op1");
+        // 没有 pending 询问时不能「过期」。
+        let seq = harness.seq();
+        assert!(harness
+            .apply(vec![node_event(
+                EventKind::PermissionDecided,
+                seq,
+                "d1",
+                decided(&req, Decision::Deny, "expired"),
+            )])
+            .is_err());
+        let seq = harness.seq();
+        harness
+            .apply(vec![node_event(
+                EventKind::PermissionAsked,
+                seq,
+                "d1",
+                json!({"gate":"node","request":req,"asked_at":1,"deadline":1000,
+                       "operation_request": inline(Value::Null)}),
+            )])
+            .unwrap();
+        // 状态不一致的裁决（Allow + expired）拒绝。
+        let seq = harness.seq();
+        assert!(harness
+            .apply(vec![node_event(
+                EventKind::PermissionDecided,
+                seq,
+                "d1",
+                decided(&req, Decision::Allow, "expired"),
+            )])
+            .is_err());
+        // 会话结束（节点出结果）：pending 询问 withdrawn。
+        let seq = harness.seq();
+        harness
+            .apply(vec![node_event(
+                EventKind::NodeFailed,
+                seq,
+                "d1",
+                json!({"error":"session lost","sealed_through":"1"}),
+            )])
+            .unwrap();
+        assert_eq!(
+            harness.node().approval.as_ref().unwrap().status,
+            ApprovalStatus::Withdrawn
+        );
+    }
+
+    #[test]
+    fn run_approvals_need_a_governed_live_run() {
+        let mut harness = started(Some(policy(false)));
+        let approval = json!({"node_id":"n","actor":{"kind":"node","run_id":"r","node_id":"n"},
+            "digest": "a".repeat(64), "expires_at": null, "by": {"kind":"local_admin"}});
+        let seq = harness.seq();
+        harness
+            .apply(vec![run_event(EventKind::RunApprovalUpserted, seq, approval.clone())])
+            .unwrap();
+        assert_eq!(harness.state.runs["r"].approvals.len(), 1);
+        assert_eq!(harness.state.runs["r"].approval_seq, 1);
+        // upsert 同一 (node, digest) 不重复。
+        let seq = harness.seq();
+        harness
+            .apply(vec![run_event(EventKind::RunApprovalUpserted, seq, approval)])
+            .unwrap();
+        assert_eq!(harness.state.runs["r"].approvals.len(), 1);
+        let seq = harness.seq();
+        harness
+            .apply(vec![run_event(
+                EventKind::RunApprovalRemoved,
+                seq,
+                json!({"node_id":"n","digest":"a".repeat(64),"by":{"kind":"local_admin"}}),
+            )])
+            .unwrap();
+        assert!(harness.state.runs["r"].approvals.is_empty());
+        assert_eq!(harness.state.runs["r"].approval_seq, 3);
+
+        // legacy 策略的 run 不接受 Run 授权。
+        let mut legacy = started(Some(policy(true)));
+        let seq = legacy.seq();
+        assert!(legacy
+            .apply(vec![run_event(
+                EventKind::RunApprovalUpserted,
+                seq,
+                json!({"node_id":"n","actor":{"kind":"system"},"digest":"a".repeat(64),
+                       "expires_at":null,"by":{"kind":"local_admin"}}),
+            )])
+            .is_err());
     }
 }
 

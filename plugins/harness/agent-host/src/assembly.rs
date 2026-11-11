@@ -340,6 +340,18 @@ pub(crate) async fn assemble_headless_host(
     .await
 }
 
+/// 受管形态（09 §8）：预建 PermissionPolicy（通道裁决 + ledger）直接入栈，
+/// 不再有本地放行矩阵。供 harness 插件进程的 TurnPermission 路径使用。
+pub(crate) async fn assemble_managed_host(
+    cfg: HostConfig,
+    session: SessionManager,
+    policy: Arc<PermissionPolicy>,
+    subagent_emit: SubagentEmit,
+) -> Host {
+    let tools = gather_tools(Vec::new(), Vec::new(), true).await;
+    assemble_with_policy(cfg, session, policy, Vec::new(), tools, subagent_emit).await
+}
+
 /// The one Host assembly shared by every caller of this module:
 /// Swap a sub-agent loop config onto a fast provider (model id + stream_fn
 /// together — a half-applied switch would be worse than none). Tunables
@@ -379,9 +391,21 @@ async fn assemble_host(
     tools: Vec<ToolDefinition>,
     subagent_emit: SubagentEmit,
 ) -> Host {
+    let policy = Arc::new(PermissionPolicy::new(mode, approver));
+    assemble_with_policy(cfg, session, policy, extra_hooks, tools, subagent_emit).await
+}
+
+/// 策略预建形态的装配主体（本地矩阵形态与受管通道形态共用同一条栈）。
+async fn assemble_with_policy(
+    cfg: HostConfig,
+    session: SessionManager,
+    policy: Arc<PermissionPolicy>,
+    extra_hooks: Vec<Arc<dyn agent_core::HookChain>>,
+    tools: Vec<ToolDefinition>,
+    subagent_emit: SubagentEmit,
+) -> Host {
     let cwd = crate::project_dir();
     let system_prompt = crate::append_project_doc(crate::CODING_AGENT_PROMPT, &cwd);
-    let policy = Arc::new(PermissionPolicy::new(mode, approver));
 
     // Host hooks: extra gates first (e.g. the CLI's ext permission gate),
     // the permission policy last so its verdicts see post-gate calls.

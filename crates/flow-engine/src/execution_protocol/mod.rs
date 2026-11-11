@@ -46,8 +46,9 @@ pub use loopback::{connect_loopback, spawn_executor_loopback, CONNECT_ADDR_ENV};
 // 消息目录的公开面：只导出业务层真正会构造/匹配的类型，wire 承载辅助
 // （`wire_json` / `wire_stored`）留在 message 内部，不外泄编码细节。
 pub use message::{
-    record_bytes, AuditRecord, ExecuteTask, Message, ObservationLine, PreparedMeta, ProtocolError,
-    ResultOutcome, TaskValue, WaitKind, WaitRequest,
+    credential_for, record_bytes, AuditRecord, ExecuteTask, Message, ObservationLine,
+    PermitCredential, PreparedMeta, ProtocolError, ResultOutcome, TaskValue, WaitKind,
+    WaitRequest,
 };
 // transfer id 的 wire 格式收在单一类型里：散落的字符串前缀拼写错误
 // 只会静默丢块（执行器死等 InputReady 直到 deadline）。

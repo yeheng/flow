@@ -27,7 +27,12 @@
 /// 无法安全共存，不提供兼容垫片）。
 /// v7 adds recorded execution context, strict regression isolation and native model calls;
 /// older executors must not silently ignore this task metadata.
-pub const PROTOCOL_VERSION: u32 = 7;
+/// v8（09 权限模型）：master 侧策略裁决——OperationPending（Ask：原地等待、
+/// 超时预算暂停）、OperationDenied（Deny/过期：业务失败收口）、Permit 携带
+/// 按需求集合逐项解析的 credentials、ExecuteTask.pending_operation（换
+/// dispatch 时沿用原 operation 身份）。旧执行器忽略这些字段即会在受管工作流
+/// 上无限制执行，因此必须在握手层拒绝。
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// control 通道单帧上限（不含 4 字节长度头）。握手
 /// 只可协商到本上限以内。

@@ -57,10 +57,11 @@ pub const MAX_VALUE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// 存储层失败的分类。
 ///
-/// 分类直接决定唯一写者是否冻结：`Invalid` / `Limit` / `Conflict` 是调用方
-/// 输入或时序问题，只拒绝当前事务，写者继续服务；`Io` / `Unavailable` /
-/// `Json` 意味着无法确认权威是否完整，必须冻结写者并让人工介入。把「坏输入」
-/// 误判成「平台故障」会把一条错误请求升级成「权威不可用直到重启」。
+/// 分类直接决定唯一写者是否冻结：`Invalid` / `Limit` / `Conflict` /
+/// `Forbidden` 是调用方输入、时序或授权问题，只拒绝当前事务，写者继续服务；
+/// `Io` / `Unavailable` / `Json` 意味着无法确认权威是否完整，必须冻结写者并
+/// 让人工介入。把「坏输入」误判成「平台故障」会把一条错误请求升级成「权威
+/// 不可用直到重启」。
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("journal I/O: {0}")]
@@ -69,6 +70,10 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("invalid journal: {0}")]
     Invalid(String),
+    /// 权限模型拒绝（09）：legacy 定义需迁移、能力上限不足、主体无权审批。
+    /// RPC 映射为 `-32020`，按类型而非文案分支。
+    #[error("permission: {0}")]
+    Forbidden(String),
     #[error("{0}")]
     NotFound(String),
     #[error("journal limit exceeded: {0}")]
