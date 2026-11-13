@@ -214,6 +214,13 @@ pub fn repo_root() -> &'static std::path::Path {
 /// package（flow-rpc / flow-cli / flow-agent / …），而使用它们的测试在
 /// 别的 package 里，只能按工作区布局定位。
 pub fn workspace_bin(name: &str) -> PathBuf {
+    // 09 权限模型测试钩子：所有测试套件（单机/远程/性能）都经这里定位
+    // 二进制——在此一次性开启 legacy 自动治理（权限语义用例以
+    // FLOW_TEST_AUTO_GOVERN=0 显式关闭）。Cargo 的 CARGO_BIN_EXE_* 只在
+    // 部分套件可用，这里是统一的 chokepoint。
+    if std::env::var("FLOW_TEST_AUTO_GOVERN").as_deref() != Ok("0") {
+        std::env::set_var("FLOW_TEST_AUTO_GOVERN", "1");
+    }
     let root = repo_root();
     // Integration executables live in <target>/<profile>/deps, including custom
     // --target-dir builds. Prefer the sibling binary from the same build tree.

@@ -16,8 +16,8 @@ use flow_harness_protocol::{
 use flow_plugin_sdk::ipc::Channel;
 use flow_plugin_sdk::protocol::envelope::{read_frame, write_frame, Frame, FrameKind};
 use flow_plugin_sdk::protocol::handshake::{
-    parse_initialize_params, PermissionRequestParams, PermissionRequestResult,
-    INITIALIZE_METHOD, PERMISSION_REQUEST_METHOD,
+    parse_initialize_params, PermissionRequestParams, PermissionRequestResult, INITIALIZE_METHOD,
+    PERMISSION_REQUEST_METHOD,
 };
 use flow_plugin_sdk::protocol::jsonrpc::{Id, Message, Notification, Request, Response};
 
@@ -218,62 +218,66 @@ where
             let writer_ref = writer.clone();
             let pending_reverse = pending_reverse.clone();
             let reverse_seq = reverse_seq.clone();
-            std::sync::Arc::new(move |tool_call_id: &str, tool: &str, args: &serde_json::Value| {
-                let writer_ref = writer_ref.clone();
-                let pending_reverse = pending_reverse.clone();
-                let reverse_seq = reverse_seq.clone();
-                let tool_call_id = tool_call_id.to_string();
-                let tool = tool.to_string();
-                let args = args.clone();
-                Box::pin(async move {
-                    let (tx, rx) = tokio::sync::oneshot::channel::<Message>();
-                    let id = Id::String(format!(
-                        "perm-{}",
-                        reverse_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    ));
-                    let params = PermissionRequestParams {
-                        tool_call_id: tool_call_id.clone(),
-                        tool: tool.clone(),
-                        params: args,
-                        cwd: None,
-                    };
-                    let request = Message::Request(Request {
-                        jsonrpc: "2.0".into(),
-                        id: id.clone(),
-                        method: PERMISSION_REQUEST_METHOD.into(),
-                        params: Some(serde_json::to_value(&params).map_err(|e| e.to_string())?),
-                    });
-                    write_message(&mut *writer_ref.lock().await, &request)
-                        .await
-                        .map_err(|e| format!("permission channel write failed: {e}"))?;
-                    pending_reverse.lock().await.insert(id, tx);
-                    let response = tokio::select! {
-                        response = rx => response.map_err(|_| "permission channel closed".to_string())?,
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(600)) => {
-                            return Err("permission decision timeout (failing closed)".into());
-                        }
-                    };
-                    match response {
-                        Message::Response(Response { result: Some(value), .. }) => {
-                            let verdict: PermissionRequestResult =
-                                serde_json::from_value(value).map_err(|e| e.to_string())?;
-                            if verdict.allowed {
-                                Ok(agent_core::ToolCallVerdict::Allow)
-                            } else {
-                                Ok(agent_core::ToolCallVerdict::Block(format!(
-                                    "permission denied: {}",
-                                    verdict.reason.unwrap_or_default()
-                                )))
+            std::sync::Arc::new(
+                move |tool_call_id: &str, tool: &str, args: &serde_json::Value| {
+                    let writer_ref = writer_ref.clone();
+                    let pending_reverse = pending_reverse.clone();
+                    let reverse_seq = reverse_seq.clone();
+                    let tool_call_id = tool_call_id.to_string();
+                    let tool = tool.to_string();
+                    let args = args.clone();
+                    Box::pin(async move {
+                        let (tx, rx) = tokio::sync::oneshot::channel::<Message>();
+                        let id = Id::String(format!(
+                            "perm-{}",
+                            reverse_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        ));
+                        let params = PermissionRequestParams {
+                            tool_call_id: tool_call_id.clone(),
+                            tool: tool.clone(),
+                            params: args,
+                            cwd: None,
+                        };
+                        let request = Message::Request(Request {
+                            jsonrpc: "2.0",
+                            id: id.clone(),
+                            method: PERMISSION_REQUEST_METHOD.into(),
+                            params: Some(serde_json::to_value(&params).map_err(|e| e.to_string())?),
+                        });
+                        write_message(&mut *writer_ref.lock().await, &request)
+                            .await
+                            .map_err(|e| format!("permission channel write failed: {e}"))?;
+                        pending_reverse.lock().await.insert(id, tx);
+                        let response = tokio::select! {
+                            response = rx => response.map_err(|_| "permission channel closed".to_string())?,
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(600)) => {
+                                return Err("permission decision timeout (failing closed)".into());
                             }
+                        };
+                        match response {
+                            Message::Response(Response {
+                                result: Some(value),
+                                ..
+                            }) => {
+                                let verdict: PermissionRequestResult =
+                                    serde_json::from_value(value).map_err(|e| e.to_string())?;
+                                if verdict.allowed {
+                                    Ok(agent_core::ToolCallVerdict::Allow)
+                                } else {
+                                    Ok(agent_core::ToolCallVerdict::Block(format!(
+                                        "permission denied: {}",
+                                        verdict.reason.unwrap_or_default()
+                                    )))
+                                }
+                            }
+                            Message::Response(Response {
+                                error: Some(error), ..
+                            }) => Err(format!("permission request rejected: {}", error.message)),
+                            _ => Err("unexpected permission response shape".into()),
                         }
-                        Message::Response(Response { error: Some(error), .. }) => Err(format!(
-                            "permission request rejected: {}",
-                            error.message
-                        )),
-                        _ => Err("unexpected permission response shape".into()),
-                    }
-                })
-            })
+                    })
+                },
+            )
         };
         agent_host::headless::build_headless_managed(
             &params.api_key,

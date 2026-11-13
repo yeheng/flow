@@ -28,7 +28,10 @@ pub enum Evaluation {
     /// 全部能力满足且无需询问（matched = `层:能力 id`）。
     Allow { matched: Vec<String> },
     /// 任一能力上限不满足（I27：审批不能越过）。matched 记录已满足的层。
-    Deny { reason: String, matched: Vec<String> },
+    Deny {
+        reason: String,
+        matched: Vec<String>,
+    },
     /// 能力满足但至少一层要求询问，且无精确 Run 授权免除。
     Ask { matched: Vec<String> },
 }
@@ -70,8 +73,7 @@ pub fn check(
     // legacy 定义：没有权限块就没有任何能力（不自动生成全能力）。
     if policy.legacy {
         return Evaluation::Deny {
-            reason: "legacy 工作流未声明权限块；迁移（添加 permissions）后才能执行外部操作"
-                .into(),
+            reason: "legacy 工作流未声明权限块；迁移（添加 permissions）后才能执行外部操作".into(),
             matched: vec![],
         };
     }
@@ -90,8 +92,14 @@ pub fn check(
             };
         };
         let layer = format!("plugin:{plugin_id}");
-        if !evaluate_layer(&ceiling.allow, input.specs, evaluated_at, &layer, &mut matched, &mut ask)
-        {
+        if !evaluate_layer(
+            &ceiling.allow,
+            input.specs,
+            evaluated_at,
+            &layer,
+            &mut matched,
+            &mut ask,
+        ) {
             return deny(matched, &layer);
         }
     }
@@ -108,7 +116,14 @@ pub fn check(
     }
     // 步骤 3：node 层（Inherit 继承；Restrict 也必须匹配）。
     if let Some(NodePermissions::Restrict { allow }) = policy.nodes.get(input.node_id) {
-        if !evaluate_layer(allow, input.specs, evaluated_at, "node", &mut matched, &mut ask) {
+        if !evaluate_layer(
+            allow,
+            input.specs,
+            evaluated_at,
+            "node",
+            &mut matched,
+            &mut ask,
+        ) {
             return deny(matched, "node");
         }
     }
@@ -180,7 +195,11 @@ pub fn freeze_child(
     parent_node: &str,
     plugin_ceilings: Vec<flow_dto::permission::PluginCeiling>,
 ) -> FrozenPolicy {
-    freeze(definition, Some((parent, parent_run, parent_node)), plugin_ceilings)
+    freeze(
+        definition,
+        Some((parent, parent_run, parent_node)),
+        plugin_ceilings,
+    )
 }
 
 fn freeze(
@@ -296,6 +315,35 @@ pub async fn plugin_ceilings(
                                     ))
                                     .cloned()
                             })
+                        })
+                        // 测试兜底：进程内测试没有启动期授予时，内置插件按其
+                        // 声明能力给一个瞬态上限（不落 journal；生产路径恒有
+                        // 启动期自动授予，走不到这里）。
+                        .or_else(|| {
+                            crate::journal_commands::tests_auto_govern()
+                                .then(|| {
+                                    identity.as_ref().map(|identity| {
+                                        flow_engine::journal_state::PluginGrant {
+                                            plugin_id: identity.plugin_id.clone(),
+                                            content_hash: identity.content_hash.clone(),
+                                            capabilities: identity
+                                                .capabilities
+                                                .clone()
+                                                .unwrap_or_default()
+                                                .into_iter()
+                                                .map(|entry| {
+                                                    let mut cap = entry.capability;
+                                                    cap.approval = Approval::Auto;
+                                                    cap
+                                                })
+                                                .collect(),
+                                            legacy_confirmed: identity.legacy,
+                                            granted_at: String::new(),
+                                            by: flow_dto::permission::Principal::System,
+                                        }
+                                    })
+                                })
+                                .flatten()
                         })?;
                     let allow = if grant.legacy_confirmed {
                         Action::ALL
@@ -338,9 +386,7 @@ pub fn plugin_id_for_node(
         _ => node
             .kind()
             .is_none()
-            .then(|| {
-                crate::plugin_registry::bundled_or_discovered_by_type(&node.node_type)
-            })
+            .then(|| crate::plugin_registry::bundled_or_discovered_by_type(&node.node_type))
             .flatten(),
     }
 }
@@ -360,10 +406,10 @@ pub fn auto_govern_for_tests(
     // 只含动态插件节点的定义保持 legacy：legacy 门只拦内置副作用节点，动态
     // 节点照旧运行（G4 接入前 plugin_node 无授权步，受管反而会被门拒绝）。
     let has_dynamic = definition.nodes.iter().any(|node| node.kind().is_none());
-    let has_builtin_side_effect = definition
-        .nodes
-        .iter()
-        .any(|node| node.kind().is_some_and(flow_engine::NodeType::has_side_effect));
+    let has_builtin_side_effect = definition.nodes.iter().any(|node| {
+        node.kind()
+            .is_some_and(flow_engine::NodeType::has_side_effect)
+    });
     if has_dynamic && !has_builtin_side_effect {
         return definition.clone();
     }
@@ -384,10 +430,7 @@ pub fn auto_govern_for_tests(
                 if let Some(url) = params["url"].as_str() {
                     if let Some(prefix) = static_origin(url) {
                         push(ResourcePattern::Net {
-                            methods: crate::HTTP_METHODS
-                            .iter()
-                            .map(|m| m.to_string())
-                            .collect(),
+                            methods: crate::HTTP_METHODS.iter().map(|m| m.to_string()).collect(),
                             url_prefix: prefix,
                         });
                     }
@@ -471,7 +514,9 @@ pub fn auto_govern_for_tests(
                         items
                             .iter()
                             .map(|v| {
-                                v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())
+                                v.as_str()
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| v.to_string())
                             })
                             .collect()
                     })
@@ -522,7 +567,10 @@ fn static_origin(url: &str) -> Option<String> {
     if host.contains("${") {
         return None;
     }
-    let port = parsed.port().map(|port| format!(":{port}")).unwrap_or_default();
+    let port = parsed
+        .port()
+        .map(|port| format!(":{port}"))
+        .unwrap_or_default();
     Some(format!("{}://{host}{port}/", parsed.scheme()))
 }
 
@@ -563,7 +611,7 @@ pub fn start_gate(definition: &flow_engine::Definition) -> Result<(), String> {
                 side_effects.join(", ")
             ))
         }
-        Some(permissions) => {
+        Some(_permissions) => {
             // 动态插件节点的调用不经 G3（plugin_node 无授权步）：插件授予
             // 链路接入前不能伪装已受管，fail-closed（G4 待接入）。
             if let Some(node) = definition.nodes.iter().find(|n| n.kind().is_none()) {
@@ -666,7 +714,13 @@ mod tests {
     }
 
     fn policy(allow: Vec<Capability>) -> FrozenPolicy {
-        frozen(ExecutionMode::Execute, allow, BTreeMap::new(), vec![], vec![])
+        frozen(
+            ExecutionMode::Execute,
+            allow,
+            BTreeMap::new(),
+            vec![],
+            vec![],
+        )
     }
 
     fn actor() -> Principal {
@@ -688,7 +742,11 @@ mod tests {
         }
     }
 
-    fn check_now(specs: &[OperationSpec], policy: &FrozenPolicy, approvals: &[RunApproval]) -> Evaluation {
+    fn check_now(
+        specs: &[OperationSpec],
+        policy: &FrozenPolicy,
+        approvals: &[RunApproval],
+    ) -> Evaluation {
         check(&input(specs, "fingerprint"), policy, approvals, Utc::now())
     }
 
@@ -699,7 +757,11 @@ mod tests {
     #[test]
     fn unmatched_is_denied_not_asked() {
         // 未授予的动作直接 Deny：点批准不能获得能力（§3.4）。
-        match check_now(&[http_spec("https://api.example.com/x")], &policy(vec![]), &[]) {
+        match check_now(
+            &[http_spec("https://api.example.com/x")],
+            &policy(vec![]),
+            &[],
+        ) {
             Evaluation::Deny { reason, .. } => assert!(reason.contains("workflow"), "{reason}"),
             other => panic!("expected deny, got {other:?}"),
         }
@@ -717,7 +779,10 @@ mod tests {
         );
         match check_now(&[http_spec("https://api.example.com/x")], &p, &[]) {
             Evaluation::Ask { matched } => {
-                assert_eq!(matched, vec!["workflow:w".to_string(), "node:n1".to_string()]);
+                assert_eq!(
+                    matched,
+                    vec!["workflow:w".to_string(), "node:n1".to_string()]
+                );
             }
             other => panic!("expected ask, got {other:?}"),
         }
@@ -745,7 +810,13 @@ mod tests {
             other => panic!("expected deny, got {other:?}"),
         }
         // Restrict 空列表 = 禁止所有外部能力。
-        let p = frozen(ExecutionMode::Execute, allow, restrict(vec![]), vec![], vec![]);
+        let p = frozen(
+            ExecutionMode::Execute,
+            allow,
+            restrict(vec![]),
+            vec![],
+            vec![],
+        );
         assert!(matches!(
             check_now(&[http_spec("https://a.example.com/x")], &p, &[]),
             Evaluation::Deny { .. }
@@ -793,7 +864,10 @@ mod tests {
         let read = [OperationSpec::FileRead {
             path: "src/a.rs".into(),
         }];
-        assert!(matches!(check_now(&read, &p, &[]), Evaluation::Allow { .. }));
+        assert!(matches!(
+            check_now(&read, &p, &[]),
+            Evaluation::Allow { .. }
+        ));
     }
 
     #[test]
@@ -822,7 +896,11 @@ mod tests {
         }))
         .unwrap();
         assert!(matches!(
-            check_now(&[http_spec("https://api.example.com/x")], &policy(vec![cap]), &[]),
+            check_now(
+                &[http_spec("https://api.example.com/x")],
+                &policy(vec![cap]),
+                &[]
+            ),
             Evaluation::Deny { .. }
         ));
     }
@@ -850,15 +928,24 @@ mod tests {
         }
         // 内容变化（不同 URL）→ 新摘要 → 仍 Ask；不能挪给下一次调用。
         let other = [http_spec("https://api.example.com/other")];
-        assert!(matches!(check_now(&other, &p, &approvals), Evaluation::Ask { .. }));
+        assert!(matches!(
+            check_now(&other, &p, &approvals),
+            Evaluation::Ask { .. }
+        ));
         // 指纹变化（同 URL 不同 body/cwd）→ 仍 Ask。
         assert!(matches!(
             check(&input(&specs, "fingerprint-2"), &p, &approvals, Utc::now()),
             Evaluation::Ask { .. }
         ));
         // 授权过期 → 重新询问。
-        let expired = vec![approval(digest, Some(Utc::now() - chrono::Duration::hours(1)))];
-        assert!(matches!(check_now(&specs, &p, &expired), Evaluation::Ask { .. }));
+        let expired = vec![approval(
+            digest,
+            Some(Utc::now() - chrono::Duration::hours(1)),
+        )];
+        assert!(matches!(
+            check_now(&specs, &p, &expired),
+            Evaluation::Ask { .. }
+        ));
     }
 
     #[test]

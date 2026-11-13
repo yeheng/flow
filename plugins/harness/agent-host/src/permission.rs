@@ -49,8 +49,9 @@ pub type PermissionChannel = Arc<
             &'a str,
             &'a str,
             &'a serde_json::Value,
-        ) -> Pin<Box<dyn Future<Output = std::result::Result<ToolCallVerdict, String>> + Send + 'a>>
-        + Send
+        ) -> Pin<
+            Box<dyn Future<Output = std::result::Result<ToolCallVerdict, String>> + Send + 'a>,
+        > + Send
         + Sync,
 >;
 
@@ -199,10 +200,7 @@ impl HookChain for PermissionPolicy {
             if let Some(channel) = &self.channel {
                 // 受管形态：本地不再放行任何工具（§8.4）。Plan 只读上限例外：
                 // 变更性工具提前拒绝，不消耗 master 往返。
-                let mutating = matches!(
-                    name,
-                    "write" | "edit" | "bash" | "evolve"
-                );
+                let mutating = matches!(name, "write" | "edit" | "bash" | "evolve");
                 if self.managed_plan && mutating {
                     return ToolCallVerdict::Block(
                         "plan mode is read-only — present your plan as text".into(),

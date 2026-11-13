@@ -594,15 +594,17 @@ impl TryFrom<WaitWire> for Wait {
             return Err("child_run_id on non-child wait");
         }
         if w.wake_at.is_some()
-            && !matches!(w.kind, WaitKind::Delay | WaitKind::Retry | WaitKind::Approval)
+            && !matches!(
+                w.kind,
+                WaitKind::Delay | WaitKind::Retry | WaitKind::Approval
+            )
         {
             return Err("wake_at on non-timed wait");
         }
         if w.output.is_some() && !matches!(w.kind, WaitKind::Delay | WaitKind::Signal) {
             return Err("output on non-value wait");
         }
-        if (w.operation_id.is_some() || w.request_hash.is_some()) && w.kind != WaitKind::Approval
-        {
+        if (w.operation_id.is_some() || w.request_hash.is_some()) && w.kind != WaitKind::Approval {
             return Err("approval identity on non-approval wait");
         }
         Ok(match w.kind {
@@ -1092,7 +1094,9 @@ impl State {
                                 || previous.run_id != event.run_id
                         })
                 {
-                    return Err(invalid("policy freeze must immediately follow its run start"));
+                    return Err(invalid(
+                        "policy freeze must immediately follow its run start",
+                    ));
                 }
             }
         }
@@ -1576,7 +1580,9 @@ impl State {
                     || frozen.permission_schema_version
                         != flow_dto::permission::PERMISSION_SCHEMA_VERSION
                 {
-                    return Err(invalid("policy freeze does not match the frozen run policy"));
+                    return Err(invalid(
+                        "policy freeze does not match the frozen run policy",
+                    ));
                 }
                 return Ok(());
             }
@@ -2051,7 +2057,9 @@ impl State {
             }
             EventKind::PermissionDecided => {
                 if terminal || event.audit_seq != 0 || event.run_seq == 0 {
-                    return Err(invalid("permission decision must be a live master run event"));
+                    return Err(invalid(
+                        "permission decision must be a live master run event",
+                    ));
                 }
                 let decided: PermissionDecidedPayload = serde_json::from_value(p.clone())?;
                 let record = &decided.record;
@@ -2059,7 +2067,10 @@ impl State {
                 let consistent = matches!(
                     (record.decision, decided.status),
                     (Decision::Allow, ApprovalStatus::Allowed)
-                        | (Decision::Deny, ApprovalStatus::Denied | ApprovalStatus::Expired)
+                        | (
+                            Decision::Deny,
+                            ApprovalStatus::Denied | ApprovalStatus::Expired
+                        )
                 );
                 if !consistent || record.request_hash.len() != 64 {
                     return Err(invalid("inconsistent permission decision"));
@@ -2371,7 +2382,10 @@ mod wait_compat_tests {
             json!({"kind":"approval","operation_id":"op","request_hash":"h"}),
             json!({"kind":"delay","wake_at":1,"operation_id":"op"}),
         ] {
-            assert!(serde_json::from_value::<Wait>(bad.clone()).is_err(), "{bad}");
+            assert!(
+                serde_json::from_value::<Wait>(bad.clone()).is_err(),
+                "{bad}"
+            );
         }
     }
 }
@@ -2577,12 +2591,16 @@ mod permission_fold_tests {
             lsn: 0,
         };
         let mut run: Run = serde_json::from_value(
-            serde_json::to_value(&harness.state.runs["r"].summary()).unwrap(),
+            serde_json::to_value(harness.state.runs["r"].summary()).unwrap(),
         )
         .unwrap();
         run.last_run_seq = 0;
         let events = vec![
-            run_event(EventKind::RunStarted, 1, serde_json::to_value(&run).unwrap()),
+            run_event(
+                EventKind::RunStarted,
+                1,
+                serde_json::to_value(&run).unwrap(),
+            ),
             run_event(
                 EventKind::PolicyFrozen,
                 2,
@@ -2768,14 +2786,22 @@ mod permission_fold_tests {
             "digest": "a".repeat(64), "expires_at": null, "by": {"kind":"local_admin"}});
         let seq = harness.seq();
         harness
-            .apply(vec![run_event(EventKind::RunApprovalUpserted, seq, approval.clone())])
+            .apply(vec![run_event(
+                EventKind::RunApprovalUpserted,
+                seq,
+                approval.clone(),
+            )])
             .unwrap();
         assert_eq!(harness.state.runs["r"].approvals.len(), 1);
         assert_eq!(harness.state.runs["r"].approval_seq, 1);
         // upsert 同一 (node, digest) 不重复。
         let seq = harness.seq();
         harness
-            .apply(vec![run_event(EventKind::RunApprovalUpserted, seq, approval)])
+            .apply(vec![run_event(
+                EventKind::RunApprovalUpserted,
+                seq,
+                approval,
+            )])
             .unwrap();
         assert_eq!(harness.state.runs["r"].approvals.len(), 1);
         let seq = harness.seq();

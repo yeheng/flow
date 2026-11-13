@@ -521,7 +521,8 @@ async fn audit_receipts_survive_cache_eviction_and_repeated_restart() {
         json!({"node_execution_id":"exec-s","attempt":"1"}),
     );
     dispatch.run_id = Some(run_id.clone());
-    dispatch.run_seq = 2;
+    // RunStarted(1) 后紧跟 PolicyFrozen(2)（09 G2/I30），DispatchStarted=3。
+    dispatch.run_seq = 3;
     dispatch.node_id = Some("s".into());
     dispatch.dispatch_id = Some("dispatch-s".into());
     b.append(vec![dispatch]).await.unwrap();

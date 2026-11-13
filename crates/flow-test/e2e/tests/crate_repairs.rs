@@ -114,7 +114,8 @@ async fn terminal_subscription_closes_after_unrelated_commits() {
         .iter()
         .filter_map(|e| e["params"]["result"]["event"]["kind"].as_str())
         .collect();
-    assert_eq!(kinds, ["run_started", "run_cancelled"]);
+    // 09 权限模型：RunStarted 后紧跟 PolicyFrozen（run_seq=2，G2/I30）。
+    assert_eq!(kinds, ["run_started", "policy_frozen", "run_cancelled"]);
     b.close().await.unwrap();
 }
 

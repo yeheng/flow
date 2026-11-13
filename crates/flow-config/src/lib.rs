@@ -137,16 +137,11 @@ pub struct Config {
 /// `[permissions]` 分区：权限模型全局参数（09 权限模型）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[derive(Default)]
 pub struct PermissionsConfig {
     /// 人工审批等待 TTL（毫秒）：到期 = Deny + 节点业务失败（I34）。后端夹紧
     /// 到 60s..=7d，缺省 24h；已登记询问的 deadline 随事实持久，改配置不刷新。
     pub approval_ttl_ms: Option<u64>,
-}
-
-impl Default for PermissionsConfig {
-    fn default() -> Self {
-        PermissionsConfig { approval_ttl_ms: None }
-    }
 }
 
 /// 一条分档 API key。`token_hash` 是 sha256(明文 token) 的 hex——明文只在

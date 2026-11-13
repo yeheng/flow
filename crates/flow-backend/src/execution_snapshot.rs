@@ -93,17 +93,15 @@ impl JournalBackend {
                 regression: None,
                 correlation_id: None,
                 agent: self.harness_agent_config(),
-                agent_plugin: self.harness_agent_plugin_meta().map(
-                    |(id, version, ui, permissions, content_hash)| {
-                        flow_engine::journal_state::AgentPluginSnapshot {
-                            id,
-                            version,
-                            ui,
-                            permissions,
-                            content_hash,
-                        }
-                    },
-                ),
+                agent_plugin: self.harness_agent_plugin_meta().map(|meta| {
+                    flow_engine::journal_state::AgentPluginSnapshot {
+                        id: meta.id,
+                        version: meta.version,
+                        ui: meta.ui,
+                        permissions: meta.permissions,
+                        content_hash: meta.content_hash,
+                    }
+                }),
                 plugins: definition_plugins,
             }),
         ))

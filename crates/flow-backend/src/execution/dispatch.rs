@@ -1335,7 +1335,10 @@ impl DispatchRunner {
         {
             crate::policy::start_gate(&definition).map_err(flow_journal::Error::Forbidden)?;
         }
-        let agent_plugin_id = run.execution.as_ref().and_then(|e| e.agent_plugin.as_ref().map(|p| p.id.clone()));
+        let agent_plugin_id = run
+            .execution
+            .as_ref()
+            .and_then(|e| e.agent_plugin.as_ref().map(|p| p.id.clone()));
         let child_ceilings = crate::policy::plugin_ceilings(
             backend.as_ref(),
             &definition,
@@ -1700,10 +1703,7 @@ impl DispatchRunner {
                     .await;
                 Ok(())
             }
-            G3Decision::Allow {
-                request,
-                matched,
-            } => {
+            G3Decision::Allow { request, matched } => {
                 // 允许：PermissionDecided{Allow, by=System} 与 Intent/Authorized
                 // 同一事务（I26：决策先于或同时于授权落盘）；auto 不是审计
                 // 豁免——决策全自动，记录一条不少。
@@ -1714,13 +1714,8 @@ impl DispatchRunner {
                     request: stored,
                     outcome: None,
                 };
-                let decision = record_of(
-                    &request,
-                    Decision::Allow,
-                    Principal::System,
-                    matched,
-                    None,
-                );
+                let decision =
+                    record_of(&request, Decision::Allow, Principal::System, matched, None);
                 let operation_value = serde_json::to_value(&operation)?;
                 let decided_fingerprint = request_fingerprint.clone();
                 let authorize = self
@@ -1796,6 +1791,7 @@ impl DispatchRunner {
                         // Reserve capacity before taking the decision lock. Enqueue under
                         // that same lock: a cancellation committed before this point must
                         // prevent delivery, not merely stop a later scheduling tick.
+                        fault::checkpoint("permit_send:before").await;
                         let permit = link
                             .commands
                             .clone()
@@ -1906,7 +1902,11 @@ impl DispatchRunner {
         let run = self.snapshot().await?;
         // 幂等重发：折叠态已有该 tool_call_id 的终态裁决 → 原样重发（I36：
         // 只去重传输重试，新调用必有独立裁决）。
-        if let Some(approval) = run.nodes.get(&self.attempt.node_id).and_then(|n| n.approval.as_ref()) {
+        if let Some(approval) = run
+            .nodes
+            .get(&self.attempt.node_id)
+            .and_then(|n| n.approval.as_ref())
+        {
             if approval.request.context.tool_call_id.as_deref() == Some(tool_call_id.as_str())
                 && approval.gate == "tool"
             {
@@ -1914,7 +1914,8 @@ impl DispatchRunner {
                     flow_engine::journal_state::ApprovalStatus::Allowed
                     | flow_engine::journal_state::ApprovalStatus::Denied
                     | flow_engine::journal_state::ApprovalStatus::Expired => {
-                        let (allowed, reason) = match (&approval.status, approval.decision.as_ref()) {
+                        let (allowed, reason) = match (&approval.status, approval.decision.as_ref())
+                        {
                             (flow_engine::journal_state::ApprovalStatus::Allowed, _) => {
                                 (true, None)
                             }
@@ -1957,8 +1958,7 @@ impl DispatchRunner {
                 node_id: self.attempt.node_id.clone(),
             };
             let node = run.nodes.get(&self.attempt.node_id);
-            let fingerprint =
-                flow_dto::permission::canonical_digest(&serde_json::json!(&params));
+            let fingerprint = flow_dto::permission::canonical_digest(&serde_json::json!(&params));
             let request = PermissionRequest {
                 actor: actor.clone(),
                 operation_id: crate::journal_commands::id(),
@@ -1983,7 +1983,14 @@ impl DispatchRunner {
             }
             .sealed();
             let Some(policy) = &run.policy else {
-                return invalid_tool(&self.attempt, link, &tool_call_id, &request, "run 缺少冻结策略").await;
+                return invalid_tool(
+                    &self.attempt,
+                    link,
+                    &tool_call_id,
+                    &request,
+                    "run 缺少冻结策略",
+                )
+                .await;
             };
             let specs = match specs {
                 Ok(specs) => specs,
@@ -2065,9 +2072,9 @@ impl DispatchRunner {
                     gate: "tool".into(),
                     request: request.clone(),
                     asked_at: evaluated_at.timestamp_millis(),
-                    deadline: evaluated_at
-                        .timestamp_millis()
-                        .saturating_add(self.attempt.backend.approval_ttl_ms().min(i64::MAX as u64) as i64),
+                    deadline: evaluated_at.timestamp_millis().saturating_add(
+                        self.attempt.backend.approval_ttl_ms().min(i64::MAX as u64) as i64,
+                    ),
                     operation_request: None,
                     matched,
                 };
@@ -2130,9 +2137,9 @@ impl DispatchRunner {
                 node_type: self.node.node_type.clone(),
                 dispatch_id: self.attempt.dispatch_id.clone(),
                 attempt: 0,
-                request_fingerprint: flow_dto::permission::canonical_digest(
-                    &serde_json::json!(params),
-                ),
+                request_fingerprint: flow_dto::permission::canonical_digest(&serde_json::json!(
+                    params
+                )),
                 tool_call_id: Some(tool_call_id.to_string()),
             },
             policy_digest: String::new(),
@@ -2252,8 +2259,14 @@ impl DispatchRunner {
                             vec![],
                             Some("approval ttl expired".into()),
                         );
-                        let fingerprint =
-                            node.approval.as_ref().expect("checked").request.context.request_fingerprint.clone();
+                        let fingerprint = node
+                            .approval
+                            .as_ref()
+                            .expect("checked")
+                            .request
+                            .context
+                            .request_fingerprint
+                            .clone();
                         let mut event = crate::journal_commands::node_event(
                             run,
                             &node_id,
@@ -2315,17 +2328,17 @@ impl DispatchRunner {
                     .await
                     .map_err(|_| invalid("operation permit session closed"))?;
                 permit.send(ToSession::Send(Box::new(Message::OperationPermit {
-                        dispatch_id: self.attempt.dispatch_id.clone(),
-                        operation_id: pending.operation_id.clone(),
-                        permit_id: node
-                            .operation
-                            .as_ref()
-                            .expect("authorized checked")
-                            .permit_id
-                            .clone(),
-                        request_fingerprint: pending.request_fingerprint.clone(),
-                        credentials,
-                    })));
+                    dispatch_id: self.attempt.dispatch_id.clone(),
+                    operation_id: pending.operation_id.clone(),
+                    permit_id: node
+                        .operation
+                        .as_ref()
+                        .expect("authorized checked")
+                        .permit_id
+                        .clone(),
+                    request_fingerprint: pending.request_fingerprint.clone(),
+                    credentials,
+                })));
                 tracing::info!(dispatch = %self.attempt.dispatch_id,
                     operation = %pending.operation_id, "approval granted; permit delivered");
                 Ok(())
@@ -2486,9 +2499,8 @@ fn evaluate_node_request(
                         )
                 })
                 .map(|approval| approval.deadline);
-            let deadline = inherited.unwrap_or_else(|| {
-                now.saturating_add(approval_ttl_ms.min(i64::MAX as u64) as i64)
-            });
+            let deadline = inherited
+                .unwrap_or_else(|| now.saturating_add(approval_ttl_ms.min(i64::MAX as u64) as i64));
             if deadline <= now {
                 return G3Decision::Deny {
                     reason: "approval ttl expired before the operation was re-requested".into(),
@@ -2565,7 +2577,13 @@ async fn invalid_tool(
     request: &PermissionRequest,
     reason: &str,
 ) -> Result<()> {
-    let record = record_of(request, Decision::Deny, Principal::System, vec![], Some(reason.to_string()));
+    let record = record_of(
+        request,
+        Decision::Deny,
+        Principal::System,
+        vec![],
+        Some(reason.to_string()),
+    );
     let dispatch = request.context.dispatch_id.clone();
     let node_id = request.context.node_id.clone();
     let run_id = attempt.run_id.clone();

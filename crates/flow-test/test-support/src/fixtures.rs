@@ -536,9 +536,8 @@ pub fn governed_http_def(method: &str, url: &str, approval: &str) -> Value {
     let mut definition = http_def(method, url);
     definition["semantics"] = json!(2);
     // URL → 前缀（同 scheme://host:port/path 全量匹配）。
-    definition["permissions"] = permissions_block(json!([
-        net_cap("call-net", method, url, approval)
-    ]));
+    definition["permissions"] =
+        permissions_block(json!([net_cap("call-net", method, url, approval)]));
     definition
 }
 

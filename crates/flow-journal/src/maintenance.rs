@@ -292,6 +292,53 @@ pub fn rebuild_index(root: &Path, upper_lsn: u64) -> Result<Recovery> {
 ///
 /// # Errors
 /// 源格式不是 3、目标不合法或升级副本校验失败时返回错误，源库始终不变。
+/// v4/v3 → v5 链列迁移（备份库上执行；语义与打开路径的 v4→v5 相同）。
+fn migrate_chain_columns(conn: &mut rusqlite::Connection) -> Result<()> {
+    // 幂等：v3（无链列）补列；已被降级标记的 v5 库（列已在）只回填。
+    let has_prev: bool = {
+        let mut statement = conn
+            .prepare(
+                "SELECT COUNT(*) FROM pragma_table_info('transactions') WHERE name='prev_digest'",
+            )
+            .map_err(crate::sqlite::db)?;
+        statement
+            .query_row([], |r| r.get::<_, i64>(0))
+            .map_err(crate::sqlite::db)?
+            > 0
+    };
+    if !has_prev {
+        conn.execute_batch(
+            "ALTER TABLE transactions ADD COLUMN prev_digest TEXT NOT NULL DEFAULT '';
+             ALTER TABLE transactions ADD COLUMN chain_digest TEXT NOT NULL DEFAULT '';",
+        )
+        .map_err(crate::sqlite::db)?;
+    }
+    let rows: Vec<(String, String)> = {
+        let mut statement = conn
+            .prepare("SELECT lsn, digest FROM transactions ORDER BY lsn")
+            .map_err(crate::sqlite::db)?;
+        let mapped = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(crate::sqlite::db)?;
+        mapped
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(crate::sqlite::db)?
+    };
+    let mut prev = String::new();
+    for (lsn, digest) in rows {
+        let chain = crate::sqlite::chain_digest(&prev, &digest);
+        conn.execute(
+            "UPDATE transactions SET prev_digest = ?1, chain_digest = ?2 WHERE lsn = ?3",
+            rusqlite::params![prev, chain, lsn],
+        )
+        .map_err(crate::sqlite::db)?;
+        prev = chain;
+    }
+    Ok(())
+}
+
 pub fn upgrade(source: &Path, destination: &Path) -> Result<Recovery> {
     let database = source.join(crate::sqlite::DATABASE);
     if fs::symlink_metadata(&database)?.file_type().is_symlink() {
@@ -304,7 +351,7 @@ pub fn upgrade(source: &Path, destination: &Path) -> Result<Recovery> {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(crate::sqlite::db)?;
     if version != 3 {
-        return Err(invalid("upgrade supports only SQLite format 3 -> 4"));
+        return Err(invalid("upgrade supports only SQLite format 3"));
     }
     let created = prepare_destination(destination, ".upgrade-", "upgrade")?;
     let staging = destination.join(format!(".upgrade-{}", uuid::Uuid::now_v7()));
@@ -322,9 +369,12 @@ pub fn upgrade(source: &Path, destination: &Path) -> Result<Recovery> {
         .map_err(crate::sqlite::db)?
         .run_to_completion(128, std::time::Duration::from_millis(1), None)
         .map_err(crate::sqlite::db)?;
+    // v5（09 §10.2 哈希链）：备份后建链（ALTER 补列 + 顺链回填）再升版本，
+    // verify 会顺链校验产物。
+    migrate_chain_columns(&mut target)?;
     target
         .execute_batch(
-            "PRAGMA synchronous=FULL; PRAGMA user_version=4; PRAGMA journal_mode=DELETE;",
+            "PRAGMA synchronous=FULL; PRAGMA user_version=5; PRAGMA journal_mode=DELETE;",
         )
         .map_err(crate::sqlite::db)?;
     drop(target);

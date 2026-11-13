@@ -698,6 +698,8 @@ fn pump_step(disk: &mut Disk, shared: &Arc<Shared>, options: &JournalOptions) ->
     let outcome: Result<()> = (|| {
         // 一个 SQLite 事务覆盖整批：事实、当前行、回执与提交水位同生共死。
         disk.begin()?;
+        // 链尾快照随批次拍（整批可能含多个 append；中途失败整批回滚）。
+        disk.begin_chain_batch();
         for pending in &mut batch {
             let chunks: u64 = pending.values.iter().map(|value| value.chunk_count()).sum();
             let final_lsn = disk

@@ -179,11 +179,7 @@ pub async fn publish_workflow(conn: &Conn, name: &str, definition: Value) -> (St
 }
 
 /// 原样发布（不注入权限块）：legacy 门、权限缺失等用例专用。
-pub async fn publish_legacy_workflow(
-    conn: &Conn,
-    name: &str,
-    definition: Value,
-) -> (String, i64) {
+pub async fn publish_legacy_workflow(conn: &Conn, name: &str, definition: Value) -> (String, i64) {
     let created: Value = call(conn, "workflow.create", json!({ "name": name })).await;
     let workflow_id = created["workflow_id"].as_str().unwrap().to_string();
     let updated: Value = call(
@@ -300,12 +296,7 @@ pub async fn deny(
 
 /// approvals.list（默认只看 pending）。
 pub async fn approvals(conn: &Conn, run_id: Option<&str>) -> Value {
-    call_json(
-        conn,
-        "approvals.list",
-        json!({"run_id": run_id}),
-    )
-    .await
+    call_json(conn, "approvals.list", json!({"run_id": run_id})).await
 }
 
 /// 轮询 approvals.list 直到该 run/node 出现 pending 询问，返回该条目。

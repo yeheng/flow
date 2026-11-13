@@ -124,7 +124,11 @@ pub fn derive_allow(definition: &Value) -> Vec<Value> {
                     .map(|items| {
                         items
                             .iter()
-                            .map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))
+                            .map(|v| {
+                                v.as_str()
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| v.to_string())
+                            })
                             .collect()
                     })
                     .unwrap_or_default();
@@ -192,7 +196,10 @@ pub fn normalize_provider(url: &str) -> String {
         (Some(port), _) => format!(":{port}"),
         (None, _) => String::new(),
     };
-    format!("{scheme}://{host}{port}{}", parsed.path().trim_end_matches('/'))
+    format!(
+        "{scheme}://{host}{port}{}",
+        parsed.path().trim_end_matches('/')
+    )
 }
 
 /// SHA-256 hex（Shell 能力的脚本摘要）。

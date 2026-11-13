@@ -107,11 +107,16 @@ impl JournalBackend {
             return Err(flow_journal::Error::Invalid("deny requires a reason".into()).into());
         }
         if !command.allow && command.scope == ApprovalScope::Run {
-            return Err(
-                flow_journal::Error::Invalid("deny does not take an approval scope".into()).into(),
-            );
+            return Err(flow_journal::Error::Invalid(
+                "deny does not take an approval scope".into(),
+            )
+            .into());
         }
-        let verb = if command.allow { "run.approve" } else { "run.deny" };
+        let verb = if command.allow {
+            "run.approve"
+        } else {
+            "run.deny"
+        };
         let scope_name = format!("{verb}:{}", command.run_id);
         let request = json!({
             "run_id": command.run_id,
@@ -154,7 +159,9 @@ impl JournalBackend {
                 .iter()
                 .any(|a| a.node_id == node_id && a.digest == digest)
             {
-                return Err(flow_journal::Error::NotFound("run approval not found".into()));
+                return Err(flow_journal::Error::NotFound(
+                    "run approval not found".into(),
+                ));
             }
             let mut event = Event::new(
                 EventKind::RunApprovalRemoved,
@@ -226,9 +233,8 @@ impl JournalBackend {
             view["approvals"] = serde_json::to_value(&run.approvals)?;
             return Ok(view);
         }
-        let workflow_id = workflow_id.ok_or_else(|| {
-            flow_journal::Error::Invalid("workflow_id or run_id required".into())
-        })?;
+        let workflow_id = workflow_id
+            .ok_or_else(|| flow_journal::Error::Invalid("workflow_id or run_id required".into()))?;
         let selected = self
             .inspect(|state| {
                 let workflow = state.workflows.get(workflow_id).filter(|w| !w.deleted)?;
@@ -262,7 +268,9 @@ fn approval_item(run: &Run, node_id: &str, approval: &ApprovalState) -> Value {
     };
     let preview = match &approval.operation_request {
         Some(StoredValue::Inline(value)) => {
-            let bytes = serde_json::to_vec(value).map(|b| b.len()).unwrap_or(usize::MAX);
+            let bytes = serde_json::to_vec(value)
+                .map(|b| b.len())
+                .unwrap_or(usize::MAX);
             if bytes <= PREVIEW_MAX_BYTES {
                 value.clone()
             } else {
@@ -366,18 +374,19 @@ fn decide(
         event.run_seq = *seq;
         event
     };
-    let record = |decision: Decision, matched: Vec<String>, reason: Option<String>| DecisionRecord {
-        operation_id: approval.request.operation_id.clone(),
-        request_hash: approval.request.request_hash.clone(),
-        evaluated_at: now,
-        policy_revision: format!("{}:{}", policy.digest, run.approval_seq),
-        decision,
-        by: command.by.clone(),
-        matched_capabilities: matched,
-        modifiers: Modifiers::default(),
-        scope: command.scope,
-        reason,
-    };
+    let record =
+        |decision: Decision, matched: Vec<String>, reason: Option<String>| DecisionRecord {
+            operation_id: approval.request.operation_id.clone(),
+            request_hash: approval.request.request_hash.clone(),
+            evaluated_at: now,
+            policy_revision: format!("{}:{}", policy.digest, run.approval_seq),
+            decision,
+            by: command.by.clone(),
+            matched_capabilities: matched,
+            modifiers: Modifiers::default(),
+            scope: command.scope,
+            reason,
+        };
     let fingerprint = approval.request.context.request_fingerprint.clone();
     if !command.allow {
         let event = node_event(
@@ -406,9 +415,7 @@ fn decide(
         now,
     );
     let matched = match evaluation {
-        crate::policy::Evaluation::Deny {
-            reason: denied, ..
-        } => {
+        crate::policy::Evaluation::Deny { reason: denied, .. } => {
             let event = node_event(
                 &mut seq,
                 EventKind::PermissionDecided,
@@ -423,14 +430,10 @@ fn decide(
                     status: ApprovalStatus::Denied,
                 })?,
             );
-            return Ok((
-                vec![event],
-                json!({"decision": "denied", "reason": denied}),
-            ));
+            return Ok((vec![event], json!({"decision": "denied", "reason": denied})));
         }
-        crate::policy::Evaluation::Allow { matched } | crate::policy::Evaluation::Ask { matched } => {
-            matched
-        }
+        crate::policy::Evaluation::Allow { matched }
+        | crate::policy::Evaluation::Ask { matched } => matched,
     };
     let mut events = vec![node_event(
         &mut seq,
@@ -577,9 +580,7 @@ impl JournalBackend {
     /// 唯一数据源；未部署的内置插件不出现在这里）。
     pub async fn plugins_view(&self) -> Vec<Value> {
         let plugins = crate::plugin_registry::discover_plugins();
-        let grants = self
-            .inspect(|state| state.plugin_grants.clone())
-            .await;
+        let grants = self.inspect(|state| state.plugin_grants.clone()).await;
         plugins
             .iter()
             .map(|plugin| {
@@ -619,10 +620,9 @@ impl JournalBackend {
         request_id: &str,
     ) -> Result<CommandReceipt> {
         let Some(identity) = crate::plugin_registry::bundled_or_discovered(plugin_id) else {
-            return Err(flow_journal::Error::NotFound(format!(
-                "plugin {plugin_id} not deployed"
-            ))
-            .into());
+            return Err(
+                flow_journal::Error::NotFound(format!("plugin {plugin_id} not deployed")).into(),
+            );
         };
         let request = json!({
             "plugin_id": plugin_id,
@@ -633,7 +633,10 @@ impl JournalBackend {
         let scope = format!("permissions.grant:{plugin_id}");
         self.command(&scope, Some(request_id), &request, move |state| {
             let grant = build_grant(&identity, &capability_ids, legacy_confirm, state)?;
-            let mut event = Event::new(EventKind::PluginGrantUpserted, serde_json::to_value(&grant)?);
+            let mut event = Event::new(
+                EventKind::PluginGrantUpserted,
+                serde_json::to_value(&grant)?,
+            );
             event.payload["granted_at"] = json!(crate::journal_commands::now());
             Ok((vec![event], serde_json::to_value(&grant)?))
         })
@@ -646,10 +649,8 @@ impl JournalBackend {
             let Some(identity) = crate::plugin_registry::bundled_or_discovered(plugin_id) else {
                 continue;
             };
-            let key = flow_engine::journal_state::PluginGrant::key(
-                plugin_id,
-                &identity.content_hash,
-            );
+            let key =
+                flow_engine::journal_state::PluginGrant::key(plugin_id, &identity.content_hash);
             let already = self
                 .inspect(|state| state.plugin_grants.contains_key(&key))
                 .await;

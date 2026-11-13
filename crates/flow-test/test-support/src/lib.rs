@@ -28,7 +28,6 @@ pub mod wire;
 pub use client::{
     approvals, approve, call, call_err, call_json, collect_run_events, connect, deny,
     http_post_hook, named, publish_legacy_workflow, publish_workflow, start_run, subscribe,
-    try_call_json, wait_pending_approval, wait_run_status, wait_run_terminal, Conn, SHORT,
-    TIMEOUT,
+    try_call_json, wait_pending_approval, wait_run_status, wait_run_terminal, Conn, SHORT, TIMEOUT,
 };
 pub use server::{run_case, run_case_with_env, Ctx, ServerProc};

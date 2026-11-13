@@ -140,7 +140,10 @@ fn llm_spec(request: &Value) -> Result<OperationSpec, String> {
         .ok_or_else(|| "请求缺少 url".to_string())?;
     Ok(OperationSpec::LlmCall {
         provider: normalize_provider(url),
-        model: request["body"]["model"].as_str().unwrap_or_default().to_string(),
+        model: request["body"]["model"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
         payload_digest: canonical_digest(&request["body"].clamp_object()),
     })
 }
@@ -177,14 +180,20 @@ fn harness_command_specs(request: &Value) -> Result<Vec<OperationSpec>, String> 
         .skip(1)
         .any(|component| matches!(component, "" | "." | ".."))
     {
-        return Err(format!("harness command 必须规范化（无 ./..// 组件）：{executable}"));
+        return Err(format!(
+            "harness command 必须规范化（无 ./..// 组件）：{executable}"
+        ));
     }
     let argv: Vec<String> = request["args"]
         .as_array()
         .map(|items| {
             items
                 .iter()
-                .map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| v.to_string())
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -227,6 +236,94 @@ impl ClampObject for Value {
     }
 }
 
+/// harness 内置工具 → 需求集合（G5 闭集映射，§8）。
+///
+/// 未知工具 / evolve / 后台 bash → Err（Deny：不能默认映射为已允许的能力）。
+/// todo 写状态文件（FileWrite todos.json）；spawn_subagents 的子代理模型
+/// 调用随子代理自身逐次裁决（父调用本身映射为只读工作区检查）。
+///
+/// # Errors
+/// 未知工具或无法派生（命令后台化等）返回错误文本。
+pub fn tool_specs(
+    tool: &str,
+    params: &Value,
+    _cwd: Option<&str>,
+) -> Result<Vec<OperationSpec>, String> {
+    let path = |value: &Value| -> String {
+        // "."（工作区根）→ ""（只匹配 subtree 能力；精确 path 不放行）。
+        let path = value.as_str().unwrap_or(".").trim().trim_end_matches('/');
+        if path == "." || path.is_empty() {
+            String::new()
+        } else {
+            path.trim_start_matches("./").to_string()
+        }
+    };
+    match tool {
+        "read" => Ok(vec![OperationSpec::FileRead {
+            path: path(&params["path"]),
+        }]),
+        "list" => Ok(vec![OperationSpec::FileRead {
+            path: path(&params["path"]),
+        }]),
+        "grep" => Ok(vec![OperationSpec::FileRead {
+            path: params["path"].as_str().unwrap_or(".").trim().to_string(),
+        }]),
+        "write" => {
+            let content = params["content"].as_str().unwrap_or_default();
+            Ok(vec![OperationSpec::FileWrite {
+                path: path(&params["path"]),
+                content_digest: flow_dto::permission::sha256_hex(content.as_bytes()),
+            }])
+        }
+        "edit" => {
+            let script = serde_json::to_string(&params["edits"]).unwrap_or_default();
+            Ok(vec![OperationSpec::FileWrite {
+                path: path(&params["path"]),
+                content_digest: flow_dto::permission::sha256_hex(script.as_bytes()),
+            }])
+        }
+        "bash" => {
+            if params["run_in_background"].as_bool() == Some(true) {
+                return Err("后台 bash 不受权限模型支持（结果不可收口）".into());
+            }
+            let command = params["command"]
+                .as_str()
+                .ok_or_else(|| "bash 缺少 command".to_string())?;
+            Ok(vec![OperationSpec::Shell {
+                executable: "/bin/sh".into(),
+                script_digest: flow_dto::permission::sha256_hex(command.as_bytes()),
+                cwd: String::new(),
+                env_digest: flow_dto::permission::sha256_hex(b"{}"),
+                stdin_digest: None,
+            }])
+        }
+        "fetch" => {
+            let url = params["url"]
+                .as_str()
+                .ok_or_else(|| "fetch 缺少 url".to_string())?;
+            Ok(vec![OperationSpec::Http {
+                method: "GET".into(),
+                url: url.to_string(),
+                headers_digest: flow_dto::permission::sha256_hex(b"{}"),
+                body_digest: flow_dto::permission::sha256_hex(b"{}"),
+            }])
+        }
+        "todo" => Ok(vec![OperationSpec::FileWrite {
+            path: "todos.json".into(),
+            content_digest: flow_dto::permission::sha256_hex(
+                serde_json::to_string(&params)
+                    .unwrap_or_default()
+                    .as_bytes(),
+            ),
+        }]),
+        "spawn_subagents" => Ok(vec![OperationSpec::FileRead {
+            path: String::new(),
+        }]),
+        "evolve" => Err("evolve 写宿主配置目录，首版不授权".into()),
+        other => Err(format!("未知工具 {other}：不默认映射为已允许的能力")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,7 +348,9 @@ mod tests {
         .unwrap();
         assert_eq!(specs.len(), 2);
         assert_eq!(specs[0].action(), Action::Net);
-        assert!(matches!(&specs[0], OperationSpec::Http { method, url, .. } if method=="POST" && url=="https://Api.Example.com/v1/x"));
+        assert!(
+            matches!(&specs[0], OperationSpec::Http { method, url, .. } if method=="POST" && url=="https://Api.Example.com/v1/x")
+        );
         assert_eq!(specs[1].action(), Action::Secret);
         // 无凭据引用 → 无 Secret 需求。
         let specs = derive_specs(
@@ -305,7 +404,9 @@ mod tests {
         )
         .unwrap();
         match specs.iter().find(|s| s.action() == Action::LlmCall) {
-            Some(OperationSpec::LlmCall { provider, model, .. }) => {
+            Some(OperationSpec::LlmCall {
+                provider, model, ..
+            }) => {
                 assert_eq!(provider, "https://api.openai.com/v1/chat/completions");
                 assert_eq!(model, "gpt-4o");
             }
@@ -390,7 +491,9 @@ mod tests {
         .unwrap();
         // agent 请求没有 url/body：llm_spec 以 agent 配置为准。
         match specs.iter().find(|s| s.action() == Action::LlmCall) {
-            Some(OperationSpec::LlmCall { provider, model, .. }) => {
+            Some(OperationSpec::LlmCall {
+                provider, model, ..
+            }) => {
                 assert_eq!(provider, "https://api.deepseek.com/v1");
                 assert_eq!(model, "deepseek-chat");
             }
@@ -415,81 +518,5 @@ mod tests {
             normalize_provider("http://api.example.com:8080"),
             "http://api.example.com:8080"
         );
-    }
-}
-
-/// harness 内置工具 → 需求集合（G5 闭集映射，§8）。
-///
-/// 未知工具 / evolve / 后台 bash → Err（Deny：不能默认映射为已允许的能力）。
-/// todo 写状态文件（FileWrite todos.json）；spawn_subagents 的子代理模型
-/// 调用随子代理自身逐次裁决（父调用本身映射为只读工作区检查）。
-///
-/// # Errors
-/// 未知工具或无法派生（命令后台化等）返回错误文本。
-pub fn tool_specs(tool: &str, params: &Value, _cwd: Option<&str>) -> Result<Vec<OperationSpec>, String> {
-    let path = |value: &Value| -> String {
-        // "."（工作区根）→ ""（只匹配 subtree 能力；精确 path 不放行）。
-        let path = value.as_str().unwrap_or(".").trim().trim_end_matches('/');
-        if path == "." || path.is_empty() {
-            String::new()
-        } else {
-            path.trim_start_matches("./").to_string()
-        }
-    };
-    match tool {
-        "read" => Ok(vec![OperationSpec::FileRead { path: path(&params["path"]) }]),
-        "list" => Ok(vec![OperationSpec::FileRead { path: path(&params["path"]) }]),
-        "grep" => Ok(vec![OperationSpec::FileRead {
-            path: params["path"].as_str().unwrap_or(".").trim().to_string(),
-        }]),
-        "write" => {
-            let content = params["content"].as_str().unwrap_or_default();
-            Ok(vec![OperationSpec::FileWrite {
-                path: path(&params["path"]),
-                content_digest: flow_dto::permission::sha256_hex(content.as_bytes()),
-            }])
-        }
-        "edit" => {
-            let script = serde_json::to_string(&params["edits"]).unwrap_or_default();
-            Ok(vec![OperationSpec::FileWrite {
-                path: path(&params["path"]),
-                content_digest: flow_dto::permission::sha256_hex(script.as_bytes()),
-            }])
-        }
-        "bash" => {
-            if params["run_in_background"].as_bool() == Some(true) {
-                return Err("后台 bash 不受权限模型支持（结果不可收口）".into());
-            }
-            let command = params["command"]
-                .as_str()
-                .ok_or_else(|| "bash 缺少 command".to_string())?;
-            Ok(vec![OperationSpec::Shell {
-                executable: "/bin/sh".into(),
-                script_digest: flow_dto::permission::sha256_hex(command.as_bytes()),
-                cwd: String::new(),
-                env_digest: flow_dto::permission::sha256_hex(b"{}"),
-                stdin_digest: None,
-            }])
-        }
-        "fetch" => {
-            let url = params["url"]
-                .as_str()
-                .ok_or_else(|| "fetch 缺少 url".to_string())?;
-            Ok(vec![OperationSpec::Http {
-                method: "GET".into(),
-                url: url.to_string(),
-                headers_digest: flow_dto::permission::sha256_hex(b"{}"),
-                body_digest: flow_dto::permission::sha256_hex(b"{}"),
-            }])
-        }
-        "todo" => Ok(vec![OperationSpec::FileWrite {
-            path: "todos.json".into(),
-            content_digest: flow_dto::permission::sha256_hex(
-                serde_json::to_string(&params).unwrap_or_default().as_bytes(),
-            ),
-        }]),
-        "spawn_subagents" => Ok(vec![OperationSpec::FileRead { path: String::new() }]),
-        "evolve" => Err("evolve 写宿主配置目录，首版不授权".into()),
-        other => Err(format!("未知工具 {other}：不默认映射为已允许的能力")),
     }
 }

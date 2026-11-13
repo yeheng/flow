@@ -350,11 +350,10 @@ impl PluginManifest {
         for entry in &section.capabilities {
             let id = &entry.capability.id;
             if !ids.insert(id.clone()) {
-                return Err(ManifestError(format!(
-                    "[permissions] 能力 id 重复：{id}"
-                )));
+                return Err(ManifestError(format!("[permissions] 能力 id 重复：{id}")));
             }
-            if let flow_dto::permission::ResourcePattern::Secret { names } = &entry.capability.pattern
+            if let flow_dto::permission::ResourcePattern::Secret { names } =
+                &entry.capability.pattern
             {
                 for name in names {
                     // 引用形式 config.<key> / params.<key> 必须指向本插件声明的

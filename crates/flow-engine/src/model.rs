@@ -2441,9 +2441,15 @@ mod tests {
         let diagnostics = definition.permission_diagnostics();
         let joined = diagnostics.join("\n");
         // file_write 未被 workflow 授予。
-        assert!(joined.contains("n3") && joined.contains("未被 workflow 授予"), "{joined}");
+        assert!(
+            joined.contains("n3") && joined.contains("未被 workflow 授予"),
+            "{joined}"
+        );
         // node auto 不覆盖 workflow ask。
-        assert!(joined.contains("n1") && joined.contains("仍需审批"), "{joined}");
+        assert!(
+            joined.contains("n1") && joined.contains("仍需审批"),
+            "{joined}"
+        );
         // secret 两层都有 → 无越界诊断（n2 是同 Action 且 workflow 有 key）。
         assert!(!joined.contains("n2"), "{joined}");
     }

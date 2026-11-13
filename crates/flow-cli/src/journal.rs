@@ -54,6 +54,14 @@ pub enum Command {
         #[arg(long)]
         audit: bool,
     },
+    /// 权限审计分页（09 §10.3）：谁在何时批准/拒绝了什么，JSONL 输出。
+    PermissionsAudit {
+        #[arg(long)]
+        run_id: Option<String>,
+        /// 只看 allow 或 deny
+        #[arg(long)]
+        decision: Option<String>,
+    },
     /// Stream a complete referenced value into a NEW file.
     Download {
         run_id: String,
@@ -187,6 +195,45 @@ pub async fn dispatch(client: &WsClient, command: Command) -> Result<(), CliErro
             }
             let params = serde_json::from_slice(&bytes).map_err(error)?;
             println!("{}", call(client, &token, &method, params).await?);
+        }
+        Command::PermissionsAudit { run_id, decision } => {
+            let mut params = json!({"limit": 256});
+            if let Some(run_id) = &run_id {
+                params["run_id"] = json!(run_id);
+            }
+            if let Some(decision) = &decision {
+                params["decision"] = json!(decision);
+            }
+            // permissions.audit.page 的 complete=false 表示页满：以 (run_id,lsn)
+            // 游标续读直至 complete。
+            let mut cursor = Value::Null;
+            loop {
+                let mut request = params.clone();
+                if !cursor.is_null() {
+                    request["cursor"] = cursor.clone();
+                }
+                let page = call(client, &token, "permissions.audit.page", request).await?;
+                for event in page["events"]
+                    .as_array()
+                    .ok_or_else(|| error("invalid page"))?
+                {
+                    println!("{event}");
+                }
+                let complete = page["complete"].as_bool().unwrap_or(true);
+                cursor = page["events"]
+                    .as_array()
+                    .and_then(|events| events.last())
+                    .map(|last| {
+                        json!({
+                            "run_id": last["event"]["run_id"].clone(),
+                            "lsn": last["lsn"].as_u64().map(|v| v + 1).unwrap_or(1),
+                        })
+                    })
+                    .unwrap_or(Value::Null);
+                if complete || cursor.is_null() {
+                    break;
+                }
+            }
         }
         Command::Events { run_id, audit } => {
             let method = if audit {

@@ -14,8 +14,8 @@ use serde_json::json;
 use super::contract::PROTOCOL_VERSION;
 use super::frame::FRAME_LENGTH_BYTES;
 use super::message::{
-    AuditRecord, ExecuteTask, Message, ObservationLine, PermitCredential, ResultOutcome,
-    TaskValue, WaitKind, WaitRequest,
+    AuditRecord, ExecuteTask, Message, ObservationLine, PermitCredential, ResultOutcome, TaskValue,
+    WaitKind, WaitRequest,
 };
 
 /// 引用型值样本（`TaskValue::Ref` 用）。

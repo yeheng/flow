@@ -1026,10 +1026,14 @@ impl JournalBackend {
         let definition = if definition.permissions.is_none() && tests_auto_govern() {
             let governed = crate::policy::auto_govern_for_tests(
                 &definition,
-                execution.as_ref().and_then(|snapshot| snapshot.agent.as_ref()),
+                execution
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.agent.as_ref()),
             );
-            // 内置插件在进程内测试里没有启动期授予：这里幂等补上。
-            self.ensure_bundled_grants().await;
+            // 注意：这里不写授予事实——run.start 的提交链必须保持原长
+            // （调用方在提交中途被取消时，run 仍要被调度，见 e2e
+            // cancelled_run_start）。进程内测试的内置插件上限由
+            // plugin_ceilings 的测试兜底提供（server 启动路径仍幂等授予）。
             std::sync::Arc::new(governed)
         } else {
             definition
@@ -1041,10 +1045,9 @@ impl JournalBackend {
             .as_ref()
             .is_some_and(|snapshot| snapshot.regression.is_some());
         if !regression_run {
-            crate::policy::start_gate(&definition)
-                .map_err(flow_journal::Error::Forbidden)?;
+            crate::policy::start_gate(&definition).map_err(flow_journal::Error::Forbidden)?;
         }
-        let agent_plugin_id = self.harness_agent_plugin_meta().map(|(id, ..)| id);
+        let agent_plugin_id = self.harness_agent_plugin_meta().map(|meta| meta.id);
         let plugin_ceilings =
             crate::policy::plugin_ceilings(self, &definition, agent_plugin_id.as_deref()).await;
         let policy = crate::policy::freeze_root(&definition, plugin_ceilings);

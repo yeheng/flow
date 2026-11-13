@@ -53,7 +53,11 @@ pub enum Principal {
     /// 远程执行 agent（mTLS CN 或 WSS token 反查）。
     Agent { id: String },
     /// 插件进程：身份 = id + 版本 + 内容哈希（§7）。
-    Plugin { id: String, version: String, content_hash: String },
+    Plugin {
+        id: String,
+        version: String,
+        content_hash: String,
+    },
     /// 发起操作的执行主体：run 内的某个节点。
     Node { run_id: String, node_id: String },
     /// 系统自动决策（TTL 超时拒绝、auto 放行、内置 deny 命中）。
@@ -230,7 +234,8 @@ pub enum OperationSpec {
         url: String,
         headers_digest: String,
         body_digest: String,
-    },    Secret {
+    },
+    Secret {
         secret_name: String,
     },
     LlmCall {
@@ -276,22 +281,46 @@ pub enum ResourcePattern {
     /// Secret：精确密钥名列表。只授权凭据读取/交付。
     Secret { names: Vec<String> },
     /// Exec：执行机器上的已解析绝对路径 + 精确 argv（不含可执行文件自身）。
-    Exec { executable: String, argv_exact: Vec<String> },
+    Exec {
+        executable: String,
+        argv_exact: Vec<String>,
+    },
     /// Exec（manifest 层专用）：裸程序名（匹配已解析路径的 basename）+
     /// 精确 argv。绝对路径把关由 workflow 层完成。
-    ExecProgram { program: String, argv_exact: Vec<String> },
+    ExecProgram {
+        program: String,
+        argv_exact: Vec<String>,
+    },
     /// Shell：完全相同脚本的 SHA-256 + 可选解释器路径。默认没有此能力。
-    Shell { executable: Option<String>, script_digest: String },
+    Shell {
+        executable: Option<String>,
+        script_digest: String,
+    },
     /// FileRead：会话根内精确相对路径或子树。
-    FileRead { path: Option<String>, subtree: Option<String> },
+    FileRead {
+        path: Option<String>,
+        subtree: Option<String>,
+    },
     /// FileWrite：同上；删除必须单独授权（FileDelete）。
-    FileWrite { path: Option<String>, subtree: Option<String> },
+    FileWrite {
+        path: Option<String>,
+        subtree: Option<String>,
+    },
     /// FileDelete：删除单独授权。
-    FileDelete { path: Option<String>, subtree: Option<String> },
+    FileDelete {
+        path: Option<String>,
+        subtree: Option<String>,
+    },
     /// Net：HTTP 方法集合 + URL 前缀（scheme/host/port 精确，路径按段前缀）。
-    Net { methods: Vec<String>, url_prefix: String },
+    Net {
+        methods: Vec<String>,
+        url_prefix: String,
+    },
     /// LlmCall：provider/model 精确集合。请求内容仍绑定完整摘要。
-    LlmCall { providers: Vec<String>, models: Vec<String> },
+    LlmCall {
+        providers: Vec<String>,
+        models: Vec<String>,
+    },
     /// SendEmail：收件人精确集合（To/Cc/Bcc 全部校验）。
     SendEmail { recipients: Vec<String> },
     /// 族级上限（manifest 层专用）：显式声明才存在，匹配该 Action 的任意
@@ -336,14 +365,22 @@ impl ResourcePattern {
                     executable,
                     argv_exact,
                 },
-                OperationSpec::Exec { executable: e, argv, .. },
+                OperationSpec::Exec {
+                    executable: e,
+                    argv,
+                    ..
+                },
             ) => executable == e && argv_exact == argv,
             (
                 Self::ExecProgram {
                     program,
                     argv_exact,
                 },
-                OperationSpec::Exec { executable: e, argv, .. },
+                OperationSpec::Exec {
+                    executable: e,
+                    argv,
+                    ..
+                },
             ) => {
                 let base = e.rsplit('/').next().unwrap_or(e);
                 base == program && argv_exact == argv
@@ -384,7 +421,13 @@ impl ResourcePattern {
                     false
                 }
             }
-            (Self::Net { methods, url_prefix }, OperationSpec::Http { method, url, .. }) => {
+            (
+                Self::Net {
+                    methods,
+                    url_prefix,
+                },
+                OperationSpec::Http { method, url, .. },
+            ) => {
                 methods.iter().any(|m| m.eq_ignore_ascii_case(method))
                     && url_prefix_matches(url_prefix, url)
             }
@@ -394,12 +437,9 @@ impl ResourcePattern {
                     provider, model, ..
                 },
             ) => providers.contains(provider) && models.contains(model),
-            (
-                Self::SendEmail { recipients },
-                OperationSpec::SendEmail {
-                    recipients: to, ..
-                },
-            ) => to.iter().all(|r| recipients.contains(r)),
+            (Self::SendEmail { recipients }, OperationSpec::SendEmail { recipients: to, .. }) => {
+                to.iter().all(|r| recipients.contains(r))
+            }
             (Self::Any { .. }, _) => true,
             _ => false,
         }
@@ -477,7 +517,10 @@ impl Capability {
                     object.insert("subtree".into(), json_str(subtree));
                 }
             }
-            ResourcePattern::Net { methods, url_prefix } => {
+            ResourcePattern::Net {
+                methods,
+                url_prefix,
+            } => {
                 object.insert("action".into(), json_str(Action::Net.as_str()));
                 object.insert("methods".into(), json_strings(methods));
                 object.insert("url_prefix".into(), json_str(url_prefix));
@@ -496,15 +539,9 @@ impl Capability {
                 object.insert("any".into(), Value::Bool(true));
             }
         }
-        object.insert(
-            "approval".into(),
-            json_str(self.approval.as_str()),
-        );
+        object.insert("approval".into(), json_str(self.approval.as_str()));
         if let Some(expires_at) = &self.expires_at {
-            object.insert(
-                "expires_at".into(),
-                Value::String(expires_at.to_rfc3339()),
-            );
+            object.insert("expires_at".into(), Value::String(expires_at.to_rfc3339()));
         }
         Value::Object(object)
     }
@@ -891,8 +928,7 @@ fn encode(value: &Value, limit: usize, out: &mut String) -> Result<(), String> {
                 if index > 0 {
                     out.push(',');
                 }
-                let encoded_key =
-                    serde_json::to_string(key.as_str()).map_err(|e| e.to_string())?;
+                let encoded_key = serde_json::to_string(key.as_str()).map_err(|e| e.to_string())?;
                 out.push_str(&encoded_key);
                 out.push(':');
                 encode(&object[*key], limit, out)?;
@@ -920,7 +956,11 @@ fn encode(value: &Value, limit: usize, out: &mut String) -> Result<(), String> {
 /// canonical 编码的 SHA-256 摘要。
 pub fn canonical_digest(value: &Value) -> String {
     // 权限对象有界（闭集 + 字段上限），1 MiB 足够；超限视为损坏。
-    sha256_hex(canonical_json(value, 1024 * 1024).unwrap_or_default().as_bytes())
+    sha256_hex(
+        canonical_json(value, 1024 * 1024)
+            .unwrap_or_default()
+            .as_bytes(),
+    )
 }
 
 /// Run 授权匹配摘要：完整操作内容（排除调用实例与 transport dispatch，
@@ -968,8 +1008,7 @@ fn parse_capability_in(value: &Value, manifest_layer: bool) -> Result<Capability
         .get("action")
         .and_then(Value::as_str)
         .ok_or_else(|| "能力缺少 action 字段".to_string())?;
-    let action =
-        Action::parse(action_name).ok_or_else(|| format!("未知动作：{action_name}"))?;
+    let action = Action::parse(action_name).ok_or_else(|| format!("未知动作：{action_name}"))?;
     let id = string_field(object, "id")?;
     // manifest 层能力只声明需求（required），不声明审批要求：缺省 ask
     //（授予层的 approval 只影响该层是否询问，harmless）。
@@ -1119,7 +1158,8 @@ fn parse_capability_in(value: &Value, manifest_layer: bool) -> Result<Capability
         ResourcePattern::Exec { .. } => &["executable", "argv_exact"],
         ResourcePattern::ExecProgram { .. } => &["program", "argv_exact"],
         ResourcePattern::Shell { .. } => &["executable", "script_digest"],
-        ResourcePattern::FileRead { .. } | ResourcePattern::FileWrite { .. }
+        ResourcePattern::FileRead { .. }
+        | ResourcePattern::FileWrite { .. }
         | ResourcePattern::FileDelete { .. } => &["path", "subtree"],
         ResourcePattern::Net { .. } => &["methods", "url_prefix"],
         ResourcePattern::LlmCall { .. } => &["providers", "models"],
@@ -1141,8 +1181,7 @@ fn parse_capability_in(value: &Value, manifest_layer: bool) -> Result<Capability
 }
 
 /// HTTP 方法闭集（http_node 的现有白名单）。
-pub const HTTP_METHODS: [&str; 7] =
-    ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+pub const HTTP_METHODS: [&str; 7] = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
 
 /// 解析 workflow 层权限块。
 ///
@@ -1333,8 +1372,10 @@ fn validate_absolute_path(path: &str) -> Result<(), String> {
 
 /// 摘要：64 位小写 hex。
 fn validate_digest(digest: &str) -> Result<(), String> {
-    let valid =
-        digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'));
+    let valid = digest.len() == 64
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'));
     if valid {
         Ok(())
     } else {
@@ -1438,38 +1479,58 @@ mod tests {
 
     #[test]
     fn rejects_unknown_fields_and_actions() {
-        assert!(parse_capability(&json!({"id":"x","action":"net","methods":["GET"],
-            "url_prefix":"https://a.b/","approval":"auto","surprise":1})).is_err());
-        assert!(parse_capability(&json!({"id":"x","action":"teleport","approval":"auto"})).is_err());
+        assert!(
+            parse_capability(&json!({"id":"x","action":"net","methods":["GET"],
+            "url_prefix":"https://a.b/","approval":"auto","surprise":1}))
+            .is_err()
+        );
+        assert!(
+            parse_capability(&json!({"id":"x","action":"teleport","approval":"auto"})).is_err()
+        );
         assert!(parse_capability(&json!({"id":"x","action":"exec",
-            "executable":"/bin/ls","argv_exact":[],"approval":"yes"})).is_err());
+            "executable":"/bin/ls","argv_exact":[],"approval":"yes"}))
+        .is_err());
         // 模板表达式拒绝。
         assert!(parse_capability(&json!({"id":"x","action":"secret",
-            "names":["${input.key}"],"approval":"auto"})).is_err());
+            "names":["${input.key}"],"approval":"auto"}))
+        .is_err());
         // exec 缺 executable/program。
-        assert!(parse_capability(&json!({"id":"x","action":"exec","argv_exact":[],
-            "approval":"auto"})).is_err());
+        assert!(
+            parse_capability(&json!({"id":"x","action":"exec","argv_exact":[],
+            "approval":"auto"}))
+            .is_err()
+        );
         // 摘要非法。
         assert!(parse_capability(&json!({"id":"x","action":"shell",
-            "script_digest":"deadbeef","approval":"auto"})).is_err());
+            "script_digest":"deadbeef","approval":"auto"}))
+        .is_err());
         // path 与 subtree 互斥。
         assert!(parse_capability(&json!({"id":"x","action":"file_write",
-            "path":"a.txt","subtree":"src","approval":"auto"})).is_err());
+            "path":"a.txt","subtree":"src","approval":"auto"}))
+        .is_err());
         // URL 带 userinfo / query。
-        assert!(parse_capability(&json!({"id":"x","action":"net","methods":["GET"],
-            "url_prefix":"https://u:p@a.b/","approval":"auto"})).is_err());
-        assert!(parse_capability(&json!({"id":"x","action":"net","methods":["GET"],
-            "url_prefix":"https://a.b/?q=1","approval":"auto"})).is_err());
+        assert!(
+            parse_capability(&json!({"id":"x","action":"net","methods":["GET"],
+            "url_prefix":"https://u:p@a.b/","approval":"auto"}))
+            .is_err()
+        );
+        assert!(
+            parse_capability(&json!({"id":"x","action":"net","methods":["GET"],
+            "url_prefix":"https://a.b/?q=1","approval":"auto"}))
+            .is_err()
+        );
     }
 
     #[test]
     fn manifest_only_variants_rejected_in_workflow_layer() {
-        let any = parse_manifest_capability(&json!({"id":"x","action":"net","any":true,"approval":"auto"}))
-            .expect("manifest layer accepts any");
+        let any = parse_manifest_capability(
+            &json!({"id":"x","action":"net","any":true,"approval":"auto"}),
+        )
+        .expect("manifest layer accepts any");
         assert!(validate_capabilities(&[any], "workflow ").is_err());
         let program = parse_manifest_capability(&json!({"id":"x","action":"exec","program":"git",
             "argv_exact":["status"],"approval":"auto"}))
-            .expect("manifest layer accepts program");
+        .expect("manifest layer accepts program");
         assert!(validate_capabilities(std::slice::from_ref(&program), "workflow ").is_err());
         // manifest 层自身的校验放行。
         assert!(validate_manifest_capabilities(&[program]).is_ok());
@@ -1487,10 +1548,14 @@ mod tests {
             headers_digest: "0".repeat(64),
             body_digest: "0".repeat(64),
         };
-        assert!(net.pattern.matches(&spec("https://api.example.com/v1/x?k=1")));
+        assert!(net
+            .pattern
+            .matches(&spec("https://api.example.com/v1/x?k=1")));
         assert!(net.pattern.matches(&spec("https://api.example.com/v1")));
         assert!(!net.pattern.matches(&spec("https://api.example.com/v10")));
-        assert!(!net.pattern.matches(&spec("https://api.example.com:8443/v1/x")));
+        assert!(!net
+            .pattern
+            .matches(&spec("https://api.example.com:8443/v1/x")));
         assert!(!net.pattern.matches(&spec("http://api.example.com/v1/x")));
         assert!(!net.pattern.matches(&spec("https://api.example.com/")));
         // 方法大小写不敏感。
@@ -1575,7 +1640,10 @@ mod tests {
         let a = json!({"b": 1, "a": {"y": 2, "x": [3, {"z": 4, "w": 5}]}});
         let b = json!({"a": {"x": [3, {"w": 5, "z": 4}], "y": 2}, "b": 1});
         assert_eq!(canonical_digest(&a), canonical_digest(&b));
-        assert_ne!(canonical_digest(&a), canonical_digest(&json!({"a":1,"b":2})));
+        assert_ne!(
+            canonical_digest(&a),
+            canonical_digest(&json!({"a":1,"b":2}))
+        );
     }
 
     #[test]
@@ -1608,12 +1676,8 @@ mod tests {
             parse_node_permissions(&json!({"mode": "inherit"})).unwrap(),
             NodePermissions::Inherit
         );
-        let restrict =
-            parse_node_permissions(&json!({"mode": "restrict", "allow": []})).unwrap();
-        assert_eq!(
-            restrict,
-            NodePermissions::Restrict { allow: vec![] }
-        );
+        let restrict = parse_node_permissions(&json!({"mode": "restrict", "allow": []})).unwrap();
+        assert_eq!(restrict, NodePermissions::Restrict { allow: vec![] });
         assert!(parse_node_permissions(&json!({"mode": "wild"})).is_err());
     }
 

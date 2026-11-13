@@ -146,6 +146,24 @@ master 派发方放弃等待、agent 侧强制收割，不能无限占用槽位�
 
 ---
 
+### 13.7 权限模型不变量（09，I26–I38）
+
+| # | 不变量 |
+| --- | --- |
+| I26 | 任何副作用发生前，`PermissionDecided{Allow}` 与对应 `request_hash` 必须已落盘，且 Permit 绑定同一 operation_id、dispatch_id 与 hash，执行前核验载荷（I6/I11 的推广） |
+| I27 | 任一能力上限不满足即 Deny；审批与 Run 精确授权不能越过能力上限或 Plan |
+| I28 | workflow 为能力上限，node 只能取交集收紧；未知动作及未匹配目标默认拒绝 |
+| I29 | 权限发布、Run 精确授权与每次裁决均记录 by；扩大能力仅限 admin，审批者不能借 Once 提升权限 |
+| I30 | 策略在 run 启动时冻结并记 `PolicyFrozen`；Run 精确授权仅免重复询问；权限修改只影响新 run，不改基础快照 |
+| I31 | 同一请求、冻结策略、run 授权事件水位与 evaluated_at 必得同一评估结果；regression 使用已记录 Decision，不重新询问 |
+| I32 | `run.approve/deny` 幂等（按 `request_hash`），且只能裁决该节点当前 pending 的请求 |
+| I33 | 业务面凭据（webhook key、run_token）永远不能执行审批或规则管理 |
+| I34 | 审批等待必有 deadline；到期 = Deny + 节点业务失败，不存在无限等待或静默放行 |
+| I35 | 插件授予以 `(plugin_id, content_hash)` 为键；哈希变化未重授予 → 一切执行被拒 |
+| I36 | 按 `(operation_id, request_hash)` 去重传输重试；新调用必有独立裁决与执行证据，不复用 Permit |
+| I37 | Secret 读取与动作授权分别校验；同一操作全部需求获准后才解析交付凭据，审批不扩大密钥可见范围 |
+| I38 | 节点权限取 workflow 上限交集；Exec/Shell 内部细粒度限制要求实际 OS 执法，不支持则拒绝该限制组合 |
+
 ## 15. 已知限制与未做
 
 **明确未实现**（不要按已实现规划）：

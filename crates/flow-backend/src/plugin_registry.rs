@@ -33,7 +33,11 @@ pub fn content_hash(manifest_bytes: &[u8], entry_bytes: &[u8]) -> String {
     let mut hasher = sha2::Sha256::new();
     hasher.update(manifest_bytes);
     hasher.update(entry_bytes);
-    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// 扫描 plugins 目录（FLOW_PLUGINS_DIR → <flow_home>/plugins）。
@@ -77,8 +81,7 @@ pub fn discover_plugins() -> Vec<DiscoveredPlugin> {
                     source: plugin_dir,
                     content_hash,
                 })
-            })
-        {
+            }) {
             Ok(plugin) => found.push(plugin),
             Err(error) => tracing::warn!(
                 ?manifest_path,
@@ -386,6 +389,118 @@ pub fn plugins_for_definition(
         .collect()
 }
 
+/// 插件的授予身份：内容哈希 + 声明能力（legacy 插件无声明）。
+pub struct PluginIdentity {
+    pub plugin_id: String,
+    pub content_hash: String,
+    pub legacy: bool,
+    pub capabilities: Option<Vec<flow_config::plugin_manifest::ManifestCapability>>,
+}
+
+/// manifest 权限段的来源标记（内置副本 vs 部署目录）。
+pub enum ManifestPermissionsSource {
+    Bundled,
+    Discovered,
+}
+
+/// 按节点类型反查插件 id（动态类型 + 内置 llm/harness）。
+pub fn bundled_or_discovered_by_type(node_type: &str) -> Option<String> {
+    if let Some(found) = discover_plugins().into_iter().find(|plugin| {
+        plugin
+            .manifest
+            .plugin
+            .node_types
+            .iter()
+            .any(|t| t == node_type)
+    }) {
+        return Some(found.manifest.plugin.id);
+    }
+    match node_type {
+        "llm" => Some("llm".into()),
+        "harness" => Some("harness-agent".into()),
+        _ => None,
+    }
+}
+
+/// 按插件 id 取授予身份：部署目录优先（发现结果带内容哈希）；内置副本
+/// （harness 嵌入 manifest / llm 嵌入 manifest + 入口二进制）兜底——两者
+/// 必须算出与执行器侧一致的哈希（manifest 字节 ‖ entry 字节）。
+pub fn bundled_or_discovered(plugin_id: &str) -> Option<PluginIdentity> {
+    if let Some(found) = discover_plugins()
+        .into_iter()
+        .find(|plugin| plugin.manifest.plugin.id == plugin_id)
+    {
+        let legacy = matches!(
+            found.manifest.permissions,
+            flow_config::plugin_manifest::ManifestPermissions::Legacy
+        );
+        let capabilities = match &found.manifest.permissions {
+            flow_config::plugin_manifest::ManifestPermissions::Legacy => None,
+            flow_config::plugin_manifest::ManifestPermissions::Declared(section) => {
+                Some(section.capabilities.clone())
+            }
+        };
+        return Some(PluginIdentity {
+            plugin_id: plugin_id.to_string(),
+            content_hash: found.content_hash,
+            legacy,
+            capabilities,
+        });
+    }
+    // 内置兜底：嵌入 manifest 文本 + 入口二进制（env 或同目录兄弟文件）。
+    let (manifest_text, entry_env, sibling) = match plugin_id {
+        "harness-agent" => (
+            include_str!("../../../plugins/harness/plugin/plugin.toml"),
+            "FLOW_AGENT_PLUGIN_BIN",
+            "flow-agent-plugin",
+        ),
+        "llm" => (
+            include_str!("../../../plugins/llm/plugin/plugin.toml"),
+            "FLOW_LLM_PLUGIN_BIN",
+            "flow-llm-plugin",
+        ),
+        _ => return None,
+    };
+    let manifest = match parse(manifest_text) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            tracing::warn!(plugin = plugin_id, %error, "内置 manifest 解析失败");
+            return None;
+        }
+    };
+    // 入口定位：env → current_exe 同目录 → 上溯两级（cargo test 的测试
+    // 二进制在 target/debug/deps 下，兄弟二进制在 target/debug）。
+    let entry = std::env::var_os(entry_env)
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::current_exe().ok().and_then(|exe| {
+                let name = std::path::Path::new(sibling);
+                std::iter::successors(exe.parent(), |parent| parent.parent())
+                    .take(3)
+                    .map(|dir| dir.join(name))
+                    .find(|candidate| candidate.is_file())
+            })
+        });
+    let entry_bytes = entry.and_then(|path| std::fs::read(path).ok())?;
+    let content_hash = content_hash(manifest_text.as_bytes(), &entry_bytes);
+    let legacy = matches!(
+        manifest.permissions,
+        flow_config::plugin_manifest::ManifestPermissions::Legacy
+    );
+    let capabilities = match &manifest.permissions {
+        flow_config::plugin_manifest::ManifestPermissions::Legacy => None,
+        flow_config::plugin_manifest::ManifestPermissions::Declared(section) => {
+            Some(section.capabilities.clone())
+        }
+    };
+    Some(PluginIdentity {
+        plugin_id: plugin_id.to_string(),
+        content_hash,
+        legacy,
+        capabilities,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -516,112 +631,4 @@ required = true
             "code"
         );
     }
-}
-
-/// 插件的授予身份：内容哈希 + 声明能力（legacy 插件无声明）。
-pub struct PluginIdentity {
-    pub plugin_id: String,
-    pub content_hash: String,
-    pub legacy: bool,
-    pub capabilities: Option<Vec<flow_config::plugin_manifest::ManifestCapability>>,
-}
-
-/// manifest 权限段的来源标记（内置副本 vs 部署目录）。
-pub enum ManifestPermissionsSource {
-    Bundled,
-    Discovered,
-}
-
-/// 按节点类型反查插件 id（动态类型 + 内置 llm/harness）。
-pub fn bundled_or_discovered_by_type(node_type: &str) -> Option<String> {
-    if let Some(found) = discover_plugins()
-        .into_iter()
-        .find(|plugin| plugin.manifest.plugin.node_types.iter().any(|t| t == node_type))
-    {
-        return Some(found.manifest.plugin.id);
-    }
-    match node_type {
-        "llm" => Some("llm".into()),
-        "harness" => Some("harness-agent".into()),
-        _ => None,
-    }
-}
-
-/// 按插件 id 取授予身份：部署目录优先（发现结果带内容哈希）；内置副本
-/// （harness 嵌入 manifest / llm 嵌入 manifest + 入口二进制）兜底——两者
-/// 必须算出与执行器侧一致的哈希（manifest 字节 ‖ entry 字节）。
-pub fn bundled_or_discovered(plugin_id: &str) -> Option<PluginIdentity> {
-    if let Some(found) = discover_plugins()
-        .into_iter()
-        .find(|plugin| plugin.manifest.plugin.id == plugin_id)
-    {
-        let legacy = matches!(
-            found.manifest.permissions,
-            flow_config::plugin_manifest::ManifestPermissions::Legacy
-        );
-        let capabilities = match &found.manifest.permissions {
-            flow_config::plugin_manifest::ManifestPermissions::Legacy => None,
-            flow_config::plugin_manifest::ManifestPermissions::Declared(section) => {
-                Some(section.capabilities.clone())
-            }
-        };
-        return Some(PluginIdentity {
-            plugin_id: plugin_id.to_string(),
-            content_hash: found.content_hash,
-            legacy,
-            capabilities,
-        });
-    }
-    // 内置兜底：嵌入 manifest 文本 + 入口二进制（env 或同目录兄弟文件）。
-    let (manifest_text, entry_env, sibling) = match plugin_id {
-        "harness-agent" => (
-            include_str!("../../../plugins/harness/plugin/plugin.toml"),
-            "FLOW_AGENT_PLUGIN_BIN",
-            "flow-agent-plugin",
-        ),
-        "llm" => (
-            include_str!("../../../plugins/llm/plugin/plugin.toml"),
-            "FLOW_LLM_PLUGIN_BIN",
-            "flow-llm-plugin",
-        ),
-        _ => return None,
-    };
-    let manifest = match parse(manifest_text) {
-        Ok(manifest) => manifest,
-        Err(error) => {
-            tracing::warn!(plugin = plugin_id, %error, "内置 manifest 解析失败");
-            return None;
-        }
-    };
-    // 入口定位：env → current_exe 同目录 → 上溯两级（cargo test 的测试
-    // 二进制在 target/debug/deps 下，兄弟二进制在 target/debug）。
-    let entry = std::env::var_os(entry_env)
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::current_exe().ok().and_then(|exe| {
-                let name = std::path::Path::new(sibling);
-                std::iter::successors(exe.parent(), |parent| parent.parent())
-                    .take(3)
-                    .map(|dir| dir.join(name))
-                    .find(|candidate| candidate.is_file())
-            })
-        });
-    let entry_bytes = entry.and_then(|path| std::fs::read(path).ok())?;
-    let content_hash = content_hash(manifest_text.as_bytes(), &entry_bytes);
-    let legacy = matches!(
-        manifest.permissions,
-        flow_config::plugin_manifest::ManifestPermissions::Legacy
-    );
-    let capabilities = match &manifest.permissions {
-        flow_config::plugin_manifest::ManifestPermissions::Legacy => None,
-        flow_config::plugin_manifest::ManifestPermissions::Declared(section) => {
-            Some(section.capabilities.clone())
-        }
-    };
-    Some(PluginIdentity {
-        plugin_id: plugin_id.to_string(),
-        content_hash,
-        legacy,
-        capabilities,
-    })
 }

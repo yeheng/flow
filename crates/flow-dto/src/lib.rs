@@ -319,7 +319,11 @@ pub fn command_scope(method: &str, params: &Value) -> String {
             "run.start:manual:regression:{}",
             params["baseline"].as_str().unwrap_or("")
         ),
-        "run.cancel" | "run.signal" | "run.adjudicate" | "run.approve" | "run.deny"
+        "run.cancel"
+        | "run.signal"
+        | "run.adjudicate"
+        | "run.approve"
+        | "run.deny"
         | "run.approvals.revoke" => {
             format!("{method}:{}", params["run_id"].as_str().unwrap_or(""))
         }

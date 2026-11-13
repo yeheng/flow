@@ -47,9 +47,13 @@ fn migrate_v4_to_v5(conn: &mut Connection) -> Result<()> {
             .prepare("SELECT lsn, digest FROM transactions ORDER BY lsn")
             .map_err(db)?;
         let mapped = statement
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
             .map_err(db)?;
-        mapped.collect::<std::result::Result<Vec<_>, _>>().map_err(db)?
+        mapped
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db)?
     };
     let mut prev = String::new();
     for (lsn, digest) in rows {
@@ -449,8 +453,11 @@ pub(crate) struct Disk {
     pub conn: Connection,
     pub id: String,
     pub last_lsn: u64,
-    /// 哈希链尾（上一事务的 chain_digest；空串 = 链首）。append 顺链推进。
+    /// 哈希链尾（上一事务的 chain_digest；空串 = 链首）。append 顺链推进；
+    /// 批次回滚时恢复。
     pub chain_tail: String,
+    /// 批次开始时的链尾快照（rollback 用）。
+    batch_chain_tail: String,
     pub data_syncs: u64,
     pub data_latency: SyncLatency,
     pub directory_latency: SyncLatency,
@@ -573,7 +580,8 @@ impl Disk {
             conn,
             id,
             last_lsn,
-            chain_tail,
+            chain_tail: chain_tail.clone(),
+            batch_chain_tail: chain_tail,
             data_syncs: 0,
             data_latency: SyncLatency::default(),
             directory_latency: SyncLatency::default(),
@@ -648,7 +656,7 @@ impl Disk {
                 ],
             )
             .map_err(db)?;
-        // 链尾推进放在事务提交之前、同一条 SQL 事务里：提交成功即链已延伸。
+        // 链尾随 SQL 事务推进；快照在 begin() 拍（整批一个），rollback 恢复。
         self.chain_tail = chain_digest(&self.chain_tail, digest);
         // 事件逐条写入：事件索引是事务内定位事实的唯一依据，必须与读回
         // 路径的期望一致。
@@ -839,9 +847,17 @@ impl Disk {
     ///
     /// 水位必须一起复位：否则回滚后水位会指向并不存在的事实，读面会认为
     /// 这些事实已经提交。
+    /// 拍链尾批次快照（writer 在整批 append 循环前调用）。
+    pub fn begin_chain_batch(&mut self) {
+        self.batch_chain_tail = self.chain_tail.clone();
+    }
+
     pub fn rollback(&mut self) {
         let _ = self.conn.execute_batch("ROLLBACK");
         self.last_lsn = self.before_batch;
+        // 链尾回退到批次前：append 中途失败（含冲突回滚）不得留下已推进
+        // 的链尾——那会让后续事务挂到一条从未提交的链上。
+        self.chain_tail = self.batch_chain_tail.clone();
     }
 }
 

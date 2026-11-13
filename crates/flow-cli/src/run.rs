@@ -48,36 +48,40 @@ pub async fn dispatch(client: &WsClient, json: bool, command: RunCommand) -> Res
             operation_id,
             request_hash,
             scope,
-        } => decide(
-            client,
-            json,
-            true,
-            &run_id,
-            &node_id,
-            &operation_id,
-            &request_hash,
-            &scope,
-            None,
-        )
-        .await,
+        } => {
+            decide(
+                client,
+                json,
+                true,
+                &run_id,
+                &node_id,
+                &operation_id,
+                &request_hash,
+                &scope,
+                None,
+            )
+            .await
+        }
         RunCommand::Deny {
             run_id,
             node_id,
             operation_id,
             request_hash,
             reason,
-        } => decide(
-            client,
-            json,
-            false,
-            &run_id,
-            &node_id,
-            &operation_id,
-            &request_hash,
-            "once",
-            Some(&reason),
-        )
-        .await,
+        } => {
+            decide(
+                client,
+                json,
+                false,
+                &run_id,
+                &node_id,
+                &operation_id,
+                &request_hash,
+                "once",
+                Some(&reason),
+            )
+            .await
+        }
         RunCommand::ApprovalsRevoke {
             run_id,
             node_id,
@@ -137,12 +141,11 @@ async fn approvals(
         .collect();
     println!(
         "{}",
-        table(
-            &["RUN", "节点", "状态", "操作", "OPERATION"],
-            &rows,
-        )
+        table(&["RUN", "节点", "状态", "操作", "OPERATION"], &rows,)
     );
-    note("flow-cli run approve/deny 需要 operation_id 与 request_hash（run approvals --json 查看）");
+    note(
+        "flow-cli run approve/deny 需要 operation_id 与 request_hash（run approvals --json 查看）",
+    );
     Ok(())
 }
 
@@ -167,10 +170,7 @@ fn spec_summary(spec: &Value) -> String {
                 })
                 .unwrap_or_default()
         ),
-        Some("shell") => format!(
-            "sh -c {}",
-            spec["script_digest"].as_str().unwrap_or("?")
-        ),
+        Some("shell") => format!("sh -c {}", spec["script_digest"].as_str().unwrap_or("?")),
         Some("secret") => format!("secret {}", spec["secret_name"].as_str().unwrap_or("?")),
         Some("llm_call") => format!(
             "llm {} {}",
@@ -227,11 +227,18 @@ async fn decide(
         return Ok(());
     }
     let decided = if allow {
-        format!("已批准（{}）", result["decision"].as_str().unwrap_or("allowed"))
+        format!(
+            "已批准（{}）",
+            result["decision"].as_str().unwrap_or("allowed")
+        )
     } else {
         "已拒绝".to_string()
     };
-    note(format!("{decided}：run {} 节点 {}", short_id(run_id), node_id));
+    note(format!(
+        "{decided}：run {} 节点 {}",
+        short_id(run_id),
+        node_id
+    ));
     Ok(())
 }
 

@@ -420,10 +420,7 @@ pub async fn build_headless_managed(
     let host = crate::assembly::assemble_managed_host(cfg, session, policy, quiet_emit).await;
     let _ = stream_fn;
     let _ = pin;
-    Ok(HeadlessHost {
-        host,
-        _pin: pin,
-    })
+    Ok(HeadlessHost { host, _pin: pin })
 }
 
 /// In-process variant of [`build_headless`]: provider + tunables arrive as

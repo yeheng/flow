@@ -58,9 +58,7 @@ pub fn harness_agent_identity(
                     .and_then(|exe| exe.parent().map(|dir| dir.join("flow-agent-plugin")))
             });
         let bytes = entry.and_then(|path| std::fs::read(path).ok());
-        bytes.map(|bytes| {
-            crate::plugin_registry::content_hash(text.as_bytes(), &bytes)
-        })
+        bytes.map(|bytes| crate::plugin_registry::content_hash(text.as_bytes(), &bytes))
     });
     (permissions, content_hash)
 }

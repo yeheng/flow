@@ -36,11 +36,7 @@ pub struct Caller {
 }
 
 /// 解析主体并按方法 scope 裁决（admin key 恒通过）。
-fn resolve_caller(
-    ctx: &Context,
-    method: &str,
-    supplied: &str,
-) -> Result<Caller, ErrorObjectOwned> {
+fn resolve_caller(ctx: &Context, method: &str, supplied: &str) -> Result<Caller, ErrorObjectOwned> {
     if constant_time_eq(supplied, &ctx.token) {
         return Ok(Caller {
             principal: flow_dto::permission::Principal::LocalAdmin,
@@ -76,9 +72,7 @@ fn resolve_caller(
             ));
         }
         return Ok(Caller {
-            principal: flow_dto::permission::Principal::ApiKey {
-                id: key.id.clone(),
-            },
+            principal: flow_dto::permission::Principal::ApiKey { id: key.id.clone() },
             required_scope: required,
         });
     }
@@ -425,7 +419,8 @@ pub fn module_product_with_keys(
         return Err("FLOW_JOURNAL_TOKEN must contain at least 32 bytes".into());
     }
     for key in &api_keys {
-        key.validate().map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        key.validate()
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     }
     let mut module = RpcModule::new(Context {
         backend,
@@ -541,8 +536,13 @@ async fn dispatch_call(
         Method::WorkflowGet | Method::RunGet | Method::LegacyGet => {
             return snapshot_get(b, method.as_str(), &p).await
         }
-        Method::RunEventsPage | Method::RunAuditPage | Method::PermissionsAuditPage => {
+        Method::RunEventsPage | Method::RunAuditPage => {
             return events_page(b, method.as_str(), &p).await
+        }
+        Method::PermissionsAuditPage => {
+            // 数据集级权限审计（09 §10.3）：run_id 缺省 = 全部 run 的权限事实，
+            // 按 decision/actor 过滤，服务端逐页有界。
+            return permissions_audit_page(b, &p).await;
         }
 
         // ---- 写命令（CommandReceipt 回执面）：边缘一次 struct 化 ----
@@ -765,7 +765,9 @@ async fn dispatch_call(
             b.plugin_grant(
                 text(&p, "plugin_id")?,
                 capability_ids,
-                p.get("legacy_confirm").and_then(Value::as_bool).unwrap_or(false),
+                p.get("legacy_confirm")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
                 request.ok_or_else(|| invalid("request_id required"))?,
             )
             .await
@@ -1015,6 +1017,114 @@ async fn events_page(
     .map_err(invalid)?
     .map_err(|e| failure(e.into()))?;
     serde_json::to_value(page).map_err(invalid)
+}
+
+/// permissions.audit.page：数据集级权限审计分页。
+///
+/// 回答「**谁**在**何时**批准了**哪些**命令、依据哪些能力项」：按
+/// run_id / decision / actor(kind) 过滤权限事件闭集。实现按 run 分页
+/// （复用 run 级 Permission 过滤器）：无 run_id 时从在册 run 里逐个收集
+/// 到页满；游标 = 下一批 (run_id, lsn)。
+async fn permissions_audit_page(b: &JournalBackend, p: &Value) -> Result<Value, ErrorObjectOwned> {
+    let decision = p.get("decision").and_then(Value::as_str);
+    if let Some(decision) = decision {
+        if !matches!(decision, "allow" | "deny") {
+            return Err(invalid("decision must be allow | deny"));
+        }
+    }
+    let run_id = p.get("run_id").and_then(Value::as_str);
+    let limit = p
+        .get("limit")
+        .map(|v| v.as_u64().ok_or_else(|| invalid("invalid limit")))
+        .transpose()?
+        .unwrap_or(100)
+        .min(256) as usize;
+    // 候选 run：指定 run 或全部在册 run（有权限事实的只占少数，逐 run 扫描
+    // 由 Permission 过滤器短路）。
+    let runs: Vec<String> = match run_id {
+        Some(run_id) => vec![run_id.to_owned()],
+        None => b.run_ids_view().await,
+    };
+    let identity = b.journal.id().to_owned();
+    let root = b.journal.root().to_path_buf();
+    let decision = decision.map(str::to_owned);
+    let mut events: Vec<Value> = Vec::new();
+    let mut exhausted = true;
+    for run_id in runs {
+        let Some((upper, summary)) = b.store.get_summary("run", &run_id).await.ok() else {
+            continue;
+        };
+        if summary.is_none() {
+            continue;
+        }
+        let mut cursor = match p.get("cursor").filter(|v| !v.is_null()) {
+            // 游标只认 (run_id, lsn) 续读位置：跨 run 续读由 items 顺序保证。
+            Some(v) => {
+                let value = v.clone();
+                let wanted_run = value["run_id"].as_str().unwrap_or(&run_id).to_owned();
+                let from_lsn = value["lsn"].as_u64().unwrap_or(1);
+                Cursor::first(identity.clone(), wanted_run, Filter::Permission, upper)
+                    .with_next_lsn(from_lsn)
+            }
+            None => Cursor::first(identity.clone(), run_id.clone(), Filter::Permission, upper),
+        };
+        loop {
+            let page = tokio::task::spawn_blocking({
+                let root = root.clone();
+                let identity = identity.clone();
+                let run_id = run_id.clone();
+                let cursor = cursor.clone();
+                move || {
+                    flow_journal::page::page(
+                        &root,
+                        &identity,
+                        &run_id,
+                        Filter::Permission,
+                        cursor,
+                        upper,
+                        256,
+                    )
+                }
+            })
+            .await
+            .map_err(invalid)?
+            .map_err(|e| failure(e.into()))?;
+            for positioned in &page.events {
+                // decision 过滤只对裁决事件有意义：给出过滤时只返回匹配的
+                // permission_decided；未给过滤时返回全部权限事实。
+                let record = &positioned.event.payload["record"];
+                let matched = match &decision {
+                    Some(decision) => {
+                        matches!(
+                            positioned.event.kind,
+                            flow_journal::EventKind::PermissionDecided
+                        ) && record["decision"].as_str() == Some(decision.as_str())
+                    }
+                    None => true,
+                };
+                if matched {
+                    events.push(serde_json::to_value(positioned).map_err(invalid)?);
+                }
+            }
+            if events.len() >= limit {
+                exhausted = false;
+                break;
+            }
+            match page.next_cursor {
+                Some(next) => cursor = next,
+                None => break,
+            }
+        }
+        if !exhausted {
+            break;
+        }
+    }
+    events.truncate(limit);
+    Ok(json!({
+        "events": events,
+        "complete": exhausted,
+        // 导出提示：JSONL = 逐行 serde_json::to_string(events[i])（CLI 同款）。
+    }))
 }
 
 /// 产品面：工作流清单视图。

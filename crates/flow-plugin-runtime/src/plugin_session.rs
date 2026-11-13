@@ -18,7 +18,6 @@
 
 use std::time::Duration;
 
-use futures::future::BoxFuture;
 use flow_engine::execution_protocol::environment::EXECUTOR_ENV_WHITELIST;
 use flow_plugin_sdk::ipc::{Session, SpawnConfig};
 use flow_plugin_sdk::protocol::envelope::{read_frame, write_frame, Frame, FrameKind};
@@ -26,6 +25,7 @@ use flow_plugin_sdk::protocol::handshake::{
     check_version, initialize_request, verify_session_token, InitializeParams, PROTOCOL_VERSION,
 };
 use flow_plugin_sdk::protocol::jsonrpc::{Error, Id, Message, Request};
+use futures::future::BoxFuture;
 
 use crate::plugin_registry::RegisteredPlugin;
 

@@ -60,6 +60,12 @@ pub struct Cursor {
     pub event_index: usize,
 }
 impl Cursor {
+    /// 续读辅助：显式设定起始 LSN（permissions.audit.page 的跨 run 游标）。
+    pub fn with_next_lsn(mut self, lsn: u64) -> Self {
+        self.next_lsn = lsn;
+        self
+    }
+
     /// 构造一个从快照起点开始的游标。
     pub fn first(journal_id: String, run_id: String, filter: Filter, upper_lsn: u64) -> Self {
         Self {

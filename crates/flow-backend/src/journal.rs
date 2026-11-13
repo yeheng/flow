@@ -133,6 +133,15 @@ pub struct JournalBackend {
     approval_ttl_ms: AtomicU64,
 }
 
+/// harness agent 插件的快照元数据（五元组命名别名，避免长元组类型）。
+pub(crate) struct HarnessAgentPluginMeta {
+    pub id: String,
+    pub version: String,
+    pub ui: Option<serde_json::Value>,
+    pub permissions: Option<serde_json::Value>,
+    pub content_hash: Option<String>,
+}
+
 /// 审批 TTL 缺省（24h）与夹紧范围（60s..=7d）。
 pub const APPROVAL_TTL_DEFAULT_MS: u64 = 24 * 60 * 60 * 1000;
 const APPROVAL_TTL_RANGE_MS: (u64, u64) = (60 * 1000, 7 * 24 * 60 * 60 * 1000);
@@ -237,24 +246,18 @@ impl JournalBackend {
     }
 
     /// 新 run 快照冻结的插件声明元数据（U1：历史渲染自持）。
-    pub(crate) fn harness_agent_plugin_meta(
-        &self,
-    ) -> Option<(
-        String,
-        String,
-        Option<serde_json::Value>,
-        Option<serde_json::Value>,
-        Option<String>,
-    )> {
-        self.harness_agent.get().cloned().flatten().map(|installed| {
-            (
-                installed.plugin_id,
-                installed.version,
-                installed.ui,
-                installed.permissions,
-                installed.content_hash,
-            )
-        })
+    pub(crate) fn harness_agent_plugin_meta(&self) -> Option<HarnessAgentPluginMeta> {
+        self.harness_agent
+            .get()
+            .cloned()
+            .flatten()
+            .map(|installed| HarnessAgentPluginMeta {
+                id: installed.plugin_id,
+                version: installed.version,
+                ui: installed.ui,
+                permissions: installed.permissions,
+                content_hash: installed.content_hash,
+            })
     }
 
     /// 打开（或创建）数据目录上的权威库，并从已提交的当前行恢复内存状态。
@@ -488,6 +491,12 @@ impl JournalBackend {
     /// 历史上同时在飞的执行器数量峰值（诊断用）。
     pub fn execution_peak(&self) -> usize {
         self.execution_peak.load(Ordering::Relaxed)
+    }
+
+    /// 在册 run id 清单（权限审计分页用；只读投影）。
+    pub async fn run_ids_view(&self) -> Vec<String> {
+        self.inspect(|state| state.runs.keys().cloned().collect())
+            .await
     }
 
     /// 只读地观察当前已提交状态。

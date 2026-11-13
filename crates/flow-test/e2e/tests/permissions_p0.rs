@@ -36,8 +36,7 @@ fn permissions(mode: &str, allow: Vec<Value>) -> Value {
 
 /// 取 run 的权限事件（kind 前缀过滤）。
 async fn permission_events(client: &flow_test_support::Conn, run_id: &str) -> Vec<Value> {
-    let events: Value =
-        call_json(client, "run.events.view", json!({"run_id": run_id})).await;
+    let events: Value = call_json(client, "run.events.view", json!({"run_id": run_id})).await;
     events["events"]
         .as_array()
         .cloned()
@@ -55,9 +54,10 @@ e2e_test!(
     auto_capability_executes_with_system_decision_recorded,
     |ctx: &mut Ctx| Box::pin(async move {
         let stub = StubHttp::fixed(200, json!({"ok": true})).await;
-        let definition = governed_http(permissions("execute", vec![
-            net_cap("w-net", "POST", &stub.url("/x"), "auto"),
-        ]));
+        let definition = governed_http(permissions(
+            "execute",
+            vec![net_cap("w-net", "POST", &stub.url("/x"), "auto")],
+        ));
         // http_def 里 url 是 placeholder：换成 stub。
         let definition = rewrite_url(definition, &stub.url("/x"));
         let client = ctx.client().await;
@@ -78,8 +78,14 @@ e2e_test!(
             .iter()
             .find(|e| e["event"]["kind"] == json!("permission_decided"))
             .unwrap();
-        assert_eq!(decided["event"]["payload"]["record"]["decision"], json!("allow"));
-        assert_eq!(decided["event"]["payload"]["record"]["by"], json!({"kind": "system"}));
+        assert_eq!(
+            decided["event"]["payload"]["record"]["decision"],
+            json!("allow")
+        );
+        assert_eq!(
+            decided["event"]["payload"]["record"]["by"],
+            json!({"kind": "system"})
+        );
         assert_eq!(
             decided["event"]["payload"]["record"]["matched_capabilities"],
             json!(["workflow:w-net"])
@@ -92,9 +98,10 @@ e2e_test!(
     |ctx: &mut Ctx| Box::pin(async move {
         let stub = StubHttp::fixed(200, json!({"ok": true})).await;
         let url = stub.url("/x");
-        let definition = governed_http(permissions("execute", vec![
-            net_cap("w-net", "POST", &url, "ask"),
-        ]));
+        let definition = governed_http(permissions(
+            "execute",
+            vec![net_cap("w-net", "POST", &url, "ask")],
+        ));
         let definition = rewrite_url(definition, &url);
         let client = ctx.client().await;
         let (workflow_id, _) = publish_legacy_workflow(&client, "ask 等待", definition).await;
@@ -109,9 +116,12 @@ e2e_test!(
         assert!(stub.requests().is_empty());
         // 批准 → 原请求继续执行（同 operation）。
         approve(
-            &client, &run_id, "call",
+            &client,
+            &run_id,
+            "call",
             pending["operation_id"].as_str().unwrap(),
-            pending["request_hash"].as_str().unwrap(), "once",
+            pending["request_hash"].as_str().unwrap(),
+            "once",
         )
         .await;
         let run = wait_run_terminal(&client, &run_id, TIMEOUT).await;
@@ -119,25 +129,30 @@ e2e_test!(
         assert_eq!(stub.requests().len(), 1);
         // timeline 的审批终态。
         let timeline: Value = call_json(&client, "run.timeline", json!({"run_id": run_id})).await;
-        assert_eq!(timeline_node(&timeline, "call")["approval"]["status"], json!("allowed"));
+        assert_eq!(
+            timeline_node(&timeline, "call")["approval"]["status"],
+            json!("allowed")
+        );
     })
 );
 
-e2e_test!(
-    deny_fails_the_node_without_any_request,
-    |ctx: &mut Ctx| Box::pin(async move {
+e2e_test!(deny_fails_the_node_without_any_request, |ctx: &mut Ctx| {
+    Box::pin(async move {
         let stub = StubHttp::fixed(200, json!({"ok": true})).await;
         let url = stub.url("/x");
-        let definition = governed_http(permissions("execute", vec![
-            net_cap("w-net", "POST", &url, "ask"),
-        ]));
+        let definition = governed_http(permissions(
+            "execute",
+            vec![net_cap("w-net", "POST", &url, "ask")],
+        ));
         let definition = rewrite_url(definition, &url);
         let client = ctx.client().await;
         let (workflow_id, _) = publish_legacy_workflow(&client, "ask 拒绝", definition).await;
         let run_id = start_run(&client, &workflow_id, json!({})).await;
         let pending = wait_pending_approval(&client, &run_id, "call", TIMEOUT).await;
         deny(
-            &client, &run_id, "call",
+            &client,
+            &run_id,
+            "call",
             pending["operation_id"].as_str().unwrap(),
             pending["request_hash"].as_str().unwrap(),
             "误操作，不发布",
@@ -148,13 +163,16 @@ e2e_test!(
         // 零请求：Deny 时操作从未执行。
         assert!(stub.requests().is_empty());
         let timeline: Value = call_json(&client, "run.timeline", json!({"run_id": run_id})).await;
-        assert_eq!(timeline_node(&timeline, "call")["approval"]["status"], json!("denied"));
+        assert_eq!(
+            timeline_node(&timeline, "call")["approval"]["status"],
+            json!("denied")
+        );
         assert!(timeline_node(&timeline, "call")["error"]
             .as_str()
             .unwrap_or_default()
             .contains("permission denied"));
     })
-);
+});
 
 e2e_test!(
     unmatched_capability_denies_without_asking,
@@ -162,9 +180,10 @@ e2e_test!(
         let stub = StubHttp::fixed(200, json!({"ok": true})).await;
         let url = stub.url("/x");
         // 能力只覆盖别的源站。
-        let definition = governed_http(permissions("execute", vec![
-            net_cap("w-other", "POST", "https://other.invalid/", "auto"),
-        ]));
+        let definition = governed_http(permissions(
+            "execute",
+            vec![net_cap("w-other", "POST", "https://other.invalid/", "auto")],
+        ));
         let definition = rewrite_url(definition, &url);
         let client = ctx.client().await;
         let (workflow_id, _) = publish_legacy_workflow(&client, "未授予即拒绝", definition).await;
@@ -186,19 +205,20 @@ async fn legacy_definition_with_side_effect_nodes_cannot_start() {
         &[("FLOW_TEST_AUTO_GOVERN", "0")],
         |ctx| {
             Box::pin(async move {
-            let stub = StubHttp::fixed(200, json!({"ok": true})).await;
-            let definition = http_def("POST", &stub.url("/x"));
-            let client = ctx.client().await;
-            let (workflow_id, _) = publish_legacy_workflow(&client, "legacy 副作用", definition).await;
-            let error = call_err(
-                &client,
-                "run.start",
-                json!({"workflow_id": workflow_id, "input": {}}),
-            )
-            .await;
-            assert_eq!(error.code(), -32020, "{error}");
-            assert!(error.message().contains("call"), "{}", error.message());
-            // 纯计算 legacy 照常运行。
+                let stub = StubHttp::fixed(200, json!({"ok": true})).await;
+                let definition = http_def("POST", &stub.url("/x"));
+                let client = ctx.client().await;
+                let (workflow_id, _) =
+                    publish_legacy_workflow(&client, "legacy 副作用", definition).await;
+                let error = call_err(
+                    &client,
+                    "run.start",
+                    json!({"workflow_id": workflow_id, "input": {}}),
+                )
+                .await;
+                assert_eq!(error.code(), -32020, "{error}");
+                assert!(error.message().contains("call"), "{}", error.message());
+                // 纯计算 legacy 照常运行。
                 let (pure_wf, _) = publish_legacy_workflow(
                     &client,
                     "legacy 纯计算",
@@ -214,14 +234,14 @@ async fn legacy_definition_with_side_effect_nodes_cannot_start() {
     .await;
 }
 
-e2e_test!(
-    plan_mode_denies_mutating_operation,
-    |ctx: &mut Ctx| Box::pin(async move {
+e2e_test!(plan_mode_denies_mutating_operation, |ctx: &mut Ctx| {
+    Box::pin(async move {
         let stub = StubHttp::fixed(200, json!({"ok": true})).await;
         let url = stub.url("/x");
-        let definition = governed_http(permissions("plan", vec![
-            net_cap("w-net", "POST", &url, "auto"),
-        ]));
+        let definition = governed_http(permissions(
+            "plan",
+            vec![net_cap("w-net", "POST", &url, "auto")],
+        ));
         let definition = rewrite_url(definition, &url);
         let client = ctx.client().await;
         let (workflow_id, _) = publish_legacy_workflow(&client, "plan 只读", definition).await;
@@ -230,19 +250,25 @@ e2e_test!(
         assert_eq!(run["run"]["status"], json!("failed"), "{run}");
         assert!(stub.requests().is_empty());
         let timeline: Value = call_json(&client, "run.timeline", json!({"run_id": run_id})).await;
-        let error = timeline_node(&timeline, "call")["error"].as_str().unwrap_or_default();
-        assert!(error.contains("permission denied") || error.contains("plan"), "{error}");
+        let error = timeline_node(&timeline, "call")["error"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            error.contains("permission denied") || error.contains("plan"),
+            "{error}"
+        );
     })
-);
+});
 
 e2e_test!(
     approve_is_idempotent_and_rejects_changed_hash,
     |ctx: &mut Ctx| Box::pin(async move {
         let stub = StubHttp::fixed(200, json!({"ok": true})).await;
         let url = stub.url("/x");
-        let definition = governed_http(permissions("execute", vec![
-            net_cap("w-net", "POST", &url, "ask"),
-        ]));
+        let definition = governed_http(permissions(
+            "execute",
+            vec![net_cap("w-net", "POST", &url, "ask")],
+        ));
         let definition = rewrite_url(definition, &url);
         let client = ctx.client().await;
         let (workflow_id, _) = publish_legacy_workflow(&client, "幂等", definition).await;
@@ -260,9 +286,12 @@ e2e_test!(
         assert_eq!(error.code(), -32012, "{error}");
         // 正确批准两次：第二次返回既有结论。
         let first = approve(
-            &client, &run_id, "call",
+            &client,
+            &run_id,
+            "call",
             pending["operation_id"].as_str().unwrap(),
-            pending["request_hash"].as_str().unwrap(), "once",
+            pending["request_hash"].as_str().unwrap(),
+            "once",
         )
         .await;
         assert_eq!(first["decision"], json!("allowed"), "{first}");
@@ -291,13 +320,13 @@ async fn approval_ttl_expires_into_system_deny() {
             Box::pin(async move {
                 let stub = StubHttp::fixed(200, json!({"ok": true})).await;
                 let url = stub.url("/x");
-                let definition = governed_http(permissions("execute", vec![
-                    net_cap("w-net", "POST", &url, "ask"),
-                ]));
+                let definition = governed_http(permissions(
+                    "execute",
+                    vec![net_cap("w-net", "POST", &url, "ask")],
+                ));
                 let definition = rewrite_url(definition, &url);
                 let client = ctx.client().await;
-                let (workflow_id, _) =
-                    publish_legacy_workflow(&client, "TTL", definition).await;
+                let (workflow_id, _) = publish_legacy_workflow(&client, "TTL", definition).await;
                 let run_id = start_run(&client, &workflow_id, json!({})).await;
                 let pending = wait_pending_approval(&client, &run_id, "call", TIMEOUT).await;
                 assert_eq!(pending["status"], json!("pending"));
@@ -323,9 +352,10 @@ e2e_test!(
     |ctx: &mut Ctx| Box::pin(async move {
         let stub = StubHttp::fixed(200, json!({"ok": true})).await;
         let url = stub.url("/x");
-        let definition = governed_http(permissions("execute", vec![
-            net_cap("w-net", "POST", &url, "ask"),
-        ]));
+        let definition = governed_http(permissions(
+            "execute",
+            vec![net_cap("w-net", "POST", &url, "ask")],
+        ));
         let definition = rewrite_url(definition, &url);
         let client = ctx.client().await;
         let (workflow_id, _) = publish_legacy_workflow(&client, "重启继承", definition).await;
@@ -372,9 +402,12 @@ e2e_test!(
         .await;
         assert_eq!(error.code(), -32012, "{error}");
         approve(
-            &client, &run_id, "call",
+            &client,
+            &run_id,
+            "call",
             second["operation_id"].as_str().unwrap(),
-            second["request_hash"].as_str().unwrap(), "once",
+            second["request_hash"].as_str().unwrap(),
+            "once",
         )
         .await;
         let run = wait_run_terminal(&client, &run_id, TIMEOUT).await;
@@ -390,18 +423,22 @@ e2e_test!(
         // 内容变化仍要问。
         let stub = StubHttp::fixed(200, json!({"ok": true})).await;
         let url = stub.url("/x");
-        let definition = governed_http(permissions("execute", vec![
-            net_cap("w-net", "POST", &url, "ask"),
-        ]));
+        let definition = governed_http(permissions(
+            "execute",
+            vec![net_cap("w-net", "POST", &url, "ask")],
+        ));
         let definition = rewrite_url(definition, &url);
         let client = ctx.client().await;
         let (workflow_id, _) = publish_legacy_workflow(&client, "Run 授权", definition).await;
         let run_id = start_run(&client, &workflow_id, json!({})).await;
         let pending = wait_pending_approval(&client, &run_id, "call", TIMEOUT).await;
         approve(
-            &client, &run_id, "call",
+            &client,
+            &run_id,
+            "call",
             pending["operation_id"].as_str().unwrap(),
-            pending["request_hash"].as_str().unwrap(), "run",
+            pending["request_hash"].as_str().unwrap(),
+            "run",
         )
         .await;
         let run = wait_run_terminal(&client, &run_id, TIMEOUT).await;
@@ -409,8 +446,7 @@ e2e_test!(
         // Run 授权投影已登记，且可撤销。
         let inbox = approvals(&client, Some(&run_id)).await;
         assert_eq!(inbox["items"].as_array().map(Vec::len), Some(0));
-        let events: Value =
-            call_json(&client, "run.events.view", json!({"run_id": run_id})).await;
+        let events: Value = call_json(&client, "run.events.view", json!({"run_id": run_id})).await;
         let upserted = events["events"]
             .as_array()
             .unwrap()
@@ -432,9 +468,10 @@ e2e_test!(
             "credential": {"scheme": "bearer", "secret_ref": "P0_TEST_KEY"}
         }));
         definition["semantics"] = json!(2);
-        definition["permissions"] = permissions("execute", vec![
-            net_cap("w-net", "POST", &stub_root(&url), "auto"),
-        ]);
+        definition["permissions"] = permissions(
+            "execute",
+            vec![net_cap("w-net", "POST", &stub_root(&url), "auto")],
+        );
         let client = ctx.client().await;
         // 密钥真值走 secrets store（与生产同一条交付路径）。
         call_json(
@@ -476,8 +513,7 @@ e2e_test!(
             request.contains("Bearer shhhh"),
             "凭据真值应经 Permit 交付：{request}"
         );
-        let events: Value =
-            call_json(&client, "run.events.view", json!({"run_id": run_id})).await;
+        let events: Value = call_json(&client, "run.events.view", json!({"run_id": run_id})).await;
         let text = serde_json::to_string(&events).unwrap();
         assert!(!text.contains("shhhh"), "secret 真值不得进入任何事件");
     })
@@ -541,15 +577,17 @@ e2e_test!(
         let client = ctx.client().await;
         let mut child = http_def("POST", &stub_b.url("/x"));
         child["semantics"] = json!(2);
-        child["permissions"] = permissions("execute", vec![
-            net_cap("c-net", "POST", &stub_b.url("/x"), "auto"),
-        ]);
+        child["permissions"] = permissions(
+            "execute",
+            vec![net_cap("c-net", "POST", &stub_b.url("/x"), "auto")],
+        );
         let (child_wf, _) = publish_legacy_workflow(&client, "子流程宽", child).await;
         let mut parent = flow_test_support::fixtures::sub_def(&child_wf);
         parent["semantics"] = json!(2);
-        parent["permissions"] = permissions("execute", vec![
-            net_cap("p-net", "POST", &stub_a.url("/"), "auto"),
-        ]);
+        parent["permissions"] = permissions(
+            "execute",
+            vec![net_cap("p-net", "POST", &stub_a.url("/"), "auto")],
+        );
         for node in parent["nodes"].as_array_mut().unwrap() {
             if node["type"] == json!("sub_workflow") {
                 node["permissions"] = json!({
@@ -571,9 +609,10 @@ e2e_test!(
     |ctx: &mut Ctx| Box::pin(async move {
         let stub = StubHttp::fixed(200, json!({"ok": true})).await;
         let url = stub.url("/x");
-        let mut definition = governed_http(permissions("execute", vec![
-            net_cap("w-net", "POST", "https://other.invalid/", "ask"),
-        ]));
+        let mut definition = governed_http(permissions(
+            "execute",
+            vec![net_cap("w-net", "POST", "https://other.invalid/", "ask")],
+        ));
         definition = rewrite_url(definition, &url);
         // 节点层 auto 覆盖不了 workflow ask。
         definition["nodes"][1]["permissions"] = json!({
@@ -599,18 +638,21 @@ e2e_test!(
         assert_eq!(node["mode"], json!("restrict"));
         assert_eq!(node["allow"][0]["derived"], json!("requires_approval"));
         let diagnostics = serde_json::to_string(&view["diagnostics"]).unwrap();
-        assert!(diagnostics.contains("n-net") && diagnostics.contains("仍需审批"), "{view}");
+        assert!(
+            diagnostics.contains("n-net") && diagnostics.contains("仍需审批"),
+            "{view}"
+        );
     })
 );
 
-e2e_test!(
-    workflow_permissions_change_is_audited,
-    |ctx: &mut Ctx| Box::pin(async move {
+e2e_test!(workflow_permissions_change_is_audited, |ctx: &mut Ctx| {
+    Box::pin(async move {
         let stub = StubHttp::fixed(200, json!({"ok": true})).await;
         let url = stub.url("/x");
-        let definition = governed_http(permissions("execute", vec![
-            net_cap("w-net", "POST", &url, "auto"),
-        ]));
+        let definition = governed_http(permissions(
+            "execute",
+            vec![net_cap("w-net", "POST", &url, "auto")],
+        ));
         let definition = rewrite_url(definition, &url);
         let client = ctx.client().await;
         let (workflow_id, version) =
@@ -635,15 +677,18 @@ e2e_test!(
         let run_id = start_run(&client, &workflow_id, json!({})).await;
         let pending = wait_pending_approval(&client, &run_id, "call", TIMEOUT).await;
         approve(
-            &client, &run_id, "call",
+            &client,
+            &run_id,
+            "call",
             pending["operation_id"].as_str().unwrap(),
-            pending["request_hash"].as_str().unwrap(), "once",
+            pending["request_hash"].as_str().unwrap(),
+            "once",
         )
         .await;
         let run = wait_run_terminal(&client, &run_id, TIMEOUT).await;
         assert_eq!(run["run"]["status"], json!("succeeded"), "{run}");
     })
-);
+});
 
 /// 把 http_def 里的 placeholder URL 替换成真实 stub URL（保参数形状不变）。
 fn rewrite_url(mut definition: Value, url: &str) -> Value {

@@ -11,8 +11,8 @@ fn net_cap(id: &str, method: &str, prefix: &str, approval: &str) -> Value {
            "approval": approval})
 }
 use flow_test_support::{
-    approve, call_err, call_json, publish_legacy_workflow, start_run,
-    wait_pending_approval, TIMEOUT,
+    approve, call_err, call_json, publish_legacy_workflow, start_run, wait_pending_approval,
+    TIMEOUT,
 };
 use serde_json::{json, Value};
 
@@ -61,19 +61,13 @@ async fn approve_only_key_cannot_write_workflows_but_can_approve() {
                 let (workflow_id, _) =
                     publish_legacy_workflow(&admin, "P2 分档", definition.clone()).await;
                 let run_id = start_run(&admin, &workflow_id, json!({})).await;
-                let pending =
-                    wait_pending_approval(&admin, &run_id, "call", TIMEOUT).await;
+                let pending = wait_pending_approval(&admin, &run_id, "call", TIMEOUT).await;
 
                 // approve-only key 走独立连接（同 WS 服务，_token 换 key）。
-                let approver =
-                    flow_test_support::connect(ctx.addr(), approve_key_plain).await;
+                let approver = flow_test_support::connect(ctx.addr(), approve_key_plain).await;
                 // 读面放行（read scope）。
-                let inbox: Value = call_json(
-                    &approver,
-                    "approvals.list",
-                    json!({"run_id": run_id}),
-                )
-                .await;
+                let inbox: Value =
+                    call_json(&approver, "approvals.list", json!({"run_id": run_id})).await;
                 assert_eq!(inbox["items"].as_array().map(Vec::len), Some(1), "{inbox}");
                 // 写 workflow：拒绝（缺 write scope）。
                 let error = call_err(
@@ -95,9 +89,12 @@ async fn approve_only_key_cannot_write_workflows_but_can_approve() {
                 assert_eq!(error.code(), -32020, "{error}");
                 // 审批本身：放行，决策记录 by = ApiKey{id}。
                 approve(
-                    &approver, &run_id, "call",
+                    &approver,
+                    &run_id,
+                    "call",
                     pending["operation_id"].as_str().unwrap(),
-                    pending["request_hash"].as_str().unwrap(), "once",
+                    pending["request_hash"].as_str().unwrap(),
+                    "once",
                 )
                 .await;
                 let run = flow_test_support::wait_run_terminal(&admin, &run_id, TIMEOUT).await;
@@ -108,9 +105,11 @@ async fn approve_only_key_cannot_write_workflows_but_can_approve() {
                     .as_array()
                     .unwrap()
                     .iter()
-                    .find(|e| e["event"]["kind"] == json!("permission_decided")
-                        && e["event"]["payload"]["gate"] == json!("node")
-                        && e["event"]["payload"]["record"]["decision"] == json!("allow"))
+                    .find(|e| {
+                        e["event"]["kind"] == json!("permission_decided")
+                            && e["event"]["payload"]["gate"] == json!("node")
+                            && e["event"]["payload"]["record"]["decision"] == json!("allow")
+                    })
                     .expect("allow decision recorded");
                 assert_eq!(
                     decided["event"]["payload"]["record"]["by"],
@@ -119,24 +118,16 @@ async fn approve_only_key_cannot_write_workflows_but_can_approve() {
                     serde_json::to_string(decided).unwrap()
                 );
                 // 未知 token 仍是 -32001。
-                let stranger = flow_test_support::connect(
-                    ctx.addr(),
-                    "totally-wrong-token-0000000000000000",
-                )
-                .await;
-                let error = call_err(
-                    &stranger,
-                    "approvals.list",
-                    json!({"run_id": run_id}),
-                )
-                .await;
+                let stranger =
+                    flow_test_support::connect(ctx.addr(), "totally-wrong-token-0000000000000000")
+                        .await;
+                let error = call_err(&stranger, "approvals.list", json!({"run_id": run_id})).await;
                 assert_eq!(error.code(), -32001, "{error}");
             })
         },
     )
     .await;
 }
-
 
 /// 哈希链（09 §10.2）：中段事务的 body+digest 被一致篡改（旧读侧逐帧校验
 /// 会被绕过），verify 顺链必断。
@@ -228,11 +219,8 @@ async fn hash_chain_detects_consistent_mid_history_tampering() {
             tx_id,
             events,
         };
-        let body_bytes = flow_journal::codec::bounded_json(
-            &tx,
-            flow_journal::MAX_LINE_BYTES,
-        )
-        .unwrap();
+        let body_bytes =
+            flow_journal::codec::bounded_json(&tx, flow_journal::MAX_LINE_BYTES).unwrap();
         let digest = flow_journal::codec::digest(&body_bytes);
         conn.execute(
             "UPDATE transactions SET digest = ?1, bytes = ?2, event_count = ?3 WHERE lsn = ?4",
@@ -257,11 +245,81 @@ async fn hash_chain_detects_consistent_mid_history_tampering() {
             })
             .unwrap();
         for row in rows.flatten() {
-            eprintln!("row {:?} prev={:.8} digest={:.8} chain={:.8}", row.0, row.1, row.2, row.3);
+            eprintln!(
+                "row {:?} prev={:.8} digest={:.8} chain={:.8}",
+                row.0, row.1, row.2, row.3
+            );
         }
     }
     let report = flow_journal::maintenance::verify(dir.path());
     assert!(report.is_err(), "中段一致篡改必须被链发现");
     let message = report.unwrap_err().to_string();
     assert!(message.contains("chain broken"), "{message}");
+}
+
+/// permissions.audit.page（09 §10.3）：能回答「谁批了什么」——批准事件的
+/// record.by / matched_capabilities 可查，decision 过滤生效。
+#[tokio::test]
+async fn permissions_audit_page_answers_who_approved_what() {
+    flow_test_support::run_case_with_env(
+        env!("CARGO_BIN_EXE_flow-journal-server-e2e"),
+        &[("FLOW_TEST_AUTO_GOVERN", "0")],
+        |ctx| {
+            Box::pin(async move {
+                let client = ctx.client().await;
+                let stub = StubHttp::fixed(200, json!({"ok": true})).await;
+                let url = stub.url("/x");
+                let definition = governed_ask(&url);
+                let (workflow_id, _) =
+                    publish_legacy_workflow(&client, "P2 审计", definition).await;
+                let run_id = start_run(&client, &workflow_id, json!({})).await;
+                let pending = wait_pending_approval(&client, &run_id, "call", TIMEOUT).await;
+                approve(
+                    &client,
+                    &run_id,
+                    "call",
+                    pending["operation_id"].as_str().unwrap(),
+                    pending["request_hash"].as_str().unwrap(),
+                    "once",
+                )
+                .await;
+                let _ = flow_test_support::wait_run_terminal(&client, &run_id, TIMEOUT).await;
+
+                let page: Value = flow_test_support::call_json(
+                    &client,
+                    "permissions.audit.page",
+                    json!({"run_id": run_id, "decision": "allow"}),
+                )
+                .await;
+                let text = serde_json::to_string(&page).unwrap();
+                assert!(
+                    text.contains("\"kind\":\"local_admin\""),
+                    "决策记录应含 by=local_admin：{text}"
+                );
+                assert!(text.contains("w-net"), "应含命中的能力项：{text}");
+                // deny 过滤：无 deny 记录 → 空。
+                let deny_page: Value = flow_test_support::call_json(
+                    &client,
+                    "permissions.audit.page",
+                    json!({"run_id": run_id, "decision": "deny"}),
+                )
+                .await;
+                assert_eq!(
+                    deny_page["events"].as_array().map(Vec::len),
+                    Some(0),
+                    "{deny_page}"
+                );
+                // run.audit.page 的 filter=permission 模式同样可用。
+                let audit: Value = flow_test_support::call_json(
+                    &client,
+                    "run.audit.page",
+                    json!({"run_id": run_id, "filter": "permission", "limit": 50}),
+                )
+                .await;
+                let audit_text = serde_json::to_string(&audit).unwrap();
+                assert!(audit_text.contains("permission_decided"), "{audit_text}");
+            })
+        },
+    )
+    .await;
 }

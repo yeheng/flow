@@ -25,7 +25,10 @@ use crate::plugin_session::{self, PluginSessionError};
 
 /// 反向请求处理结果（`permission/request` → master 裁决 → 回插件）。
 pub(super) type ReverseHandler = std::sync::Arc<
-    dyn Fn(flow_plugin_sdk::protocol::jsonrpc::Request) -> futures::future::BoxFuture<'static, flow_plugin_sdk::protocol::jsonrpc::Message>
+    dyn Fn(
+            flow_plugin_sdk::protocol::jsonrpc::Request,
+        )
+            -> futures::future::BoxFuture<'static, flow_plugin_sdk::protocol::jsonrpc::Message>
         + Send
         + Sync,
 >;
@@ -100,17 +103,21 @@ pub(super) async fn run_agent_turn(
         permission: request_permission,
     };
     let reverse = on_request.map(|handler| {
-        Box::new(move |request: flow_plugin_sdk::protocol::jsonrpc::Request| {
-            let handler = handler.clone();
-            Box::pin(async move { handler(request).await }) as futures::future::BoxFuture<'static, _>
-        }) as Box<
-            dyn FnMut(
-                    flow_plugin_sdk::protocol::jsonrpc::Request,
-                ) -> futures::future::BoxFuture<
-                    'static,
-                    flow_plugin_sdk::protocol::jsonrpc::Message,
-                > + Send,
-        >
+        Box::new(
+            move |request: flow_plugin_sdk::protocol::jsonrpc::Request| {
+                let handler = handler.clone();
+                Box::pin(async move { handler(request).await })
+                    as futures::future::BoxFuture<'static, _>
+            },
+        )
+            as Box<
+                dyn FnMut(
+                        flow_plugin_sdk::protocol::jsonrpc::Request,
+                    ) -> futures::future::BoxFuture<
+                        'static,
+                        flow_plugin_sdk::protocol::jsonrpc::Message,
+                    > + Send,
+            >
     });
     let outcome = plugin_session::invoke_with_reverse(
         &mut session,

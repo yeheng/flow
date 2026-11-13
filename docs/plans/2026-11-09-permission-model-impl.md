@@ -1,6 +1,6 @@
 # 权限模型实现计划（P0+P1+P2）
 
-> 状态：待 review。依据 [09-permission-model.md](../design/09-permission-model.md)。
+> 状态：**已实现**（P0+P1+P2；G4 与 Event.actor 的缺口见 09 §13 实现注记）。依据 [09-permission-model.md](../design/09-permission-model.md)。
 
 ## Context
 09 设计要把「谁允许谁做什么」从散落、隐式、事后补问的状态，收敛为「能力上限 + 审批」分离的模型。现状问题：

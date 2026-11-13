@@ -6,12 +6,14 @@
 
 ### 11.1 方法面
 
-`flow-rpc/src/journal_v2.rs` 注册 **51 个方法** + 1 个订阅（`run.subscribe`）。
+`flow-rpc/src/journal_v2.rs` 注册 **58 个方法** + 1 个订阅（`run.subscribe`）。
 所有方法共用一个入口：`flow_dto::rpc::Method` 目录和 `admit_call` 准入门。
 
-方法按访问性质分两张清单——`READ_METHODS` 27 项 / `WRITE_METHODS` 24 项。**注意
-这两张表不做权限分级，也没有「暂停期」语义**（不存在维护窗口：没有 paused 标志，
-读写在运行期同权）。它们只服务三件事：
+方法按访问性质分两张清单——`READ_METHODS` 31 项 / `WRITE_METHODS` 27 项。
+**09 权限模型引入了分档**：`FLOW_JOURNAL_TOKEN` 恒为隐式 admin key；
+`[[api_keys]]` 按 scope 裁决（读=read，写=write，`run.approve/deny`=approve，
+`permissions.grant`=admin；审批 key 无法写 workflow，见 09 §9/§13.4）。
+其余两张清单仍服务三件事：
 
 1. **写命令必须带 `request_id`**（`is_write_method` → 空即 `-32602`）；
 2. **写命令的返回要解包成 `CommandReceipt`**（读面直接返回值；例外：
@@ -121,3 +123,19 @@ body ≤ 8 MiB。
 | `429` | 触发限流（`Error::Limit`） |
 | `200` | 旧 hook 已受理（run 已创建）；独立业务入口 `/invoke/{id}` 使用 202 |
 | `503` | 存储或服务暂不可用 |
+
+### 11.9 权限模型方法（09）
+
+新增方法与错误码（`-32020` permission）：
+
+| 方法 | 读/写 | 说明 |
+| --- | --- | --- |
+| `approvals.list` | 读 | 待审批收件箱（`run_id?`、`all?`），卡片字段逐字来自 master 持久请求 |
+| `permissions.effective` | 读 | 有效权限投影（`workflow_id`+`version` 设计期 / `run_id` 运行期，不混用） |
+| `permissions.audit.page` | 读 | 数据集级权限审计分页（`run_id?`、`decision?`；CLI `journal permissions-audit` 出 JSONL） |
+| `run.approve` | 写 | 裁决当前 pending 实例（`scope` once/run；幂等按 `request_hash`） |
+| `run.deny` | 写 | 拒绝当前 pending 实例（reason 必填 ≤4096B） |
+| `run.approvals.revoke` | 写 | 撤销一条 Run 精确授权 |
+| `permissions.grant` | 写 | 插件能力授予（admin；只写 journal 不回写 plugin.toml） |
+
+`run.audit.page` 新增 `filter:"permission"` 模式（权限事件闭集分页）。

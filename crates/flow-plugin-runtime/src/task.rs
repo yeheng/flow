@@ -1532,8 +1532,7 @@ impl TaskRunner {
             }
         };
         Ok(secret_ref.and_then(|name| {
-            flow_engine::execution_protocol::credential_for(&credentials, &name)
-                .map(str::to_owned)
+            flow_engine::execution_protocol::credential_for(&credentials, &name).map(str::to_owned)
         }))
     }
 
@@ -2243,16 +2242,24 @@ impl TaskRunner {
             let dispatch_id = self.dispatch_id.clone();
             let cancel = self.cancel.clone();
             let tool_mail = self.tool_mail.clone();
-            std::sync::Arc::new(move |request: flow_plugin_sdk::protocol::jsonrpc::Request| {
-                let outbound = outbound.clone();
-                let dispatch_id = dispatch_id.clone();
-                let cancel = cancel.clone();
-                let tool_mail = tool_mail.clone();
-                Box::pin(async move {
-                    forward_permission_request(outbound, dispatch_id, cancel, tool_mail, request)
+            std::sync::Arc::new(
+                move |request: flow_plugin_sdk::protocol::jsonrpc::Request| {
+                    let outbound = outbound.clone();
+                    let dispatch_id = dispatch_id.clone();
+                    let cancel = cancel.clone();
+                    let tool_mail = tool_mail.clone();
+                    Box::pin(async move {
+                        forward_permission_request(
+                            outbound,
+                            dispatch_id,
+                            cancel,
+                            tool_mail,
+                            request,
+                        )
                         .await
-                }) as futures::future::BoxFuture<'static, _>
-            }) as crate::agent_plugin::ReverseHandler
+                    }) as futures::future::BoxFuture<'static, _>
+                },
+            ) as crate::agent_plugin::ReverseHandler
         });
         let parsed = match crate::agent_plugin::run_agent_turn(
             crate::agent_plugin::TurnRequest {
@@ -2866,7 +2873,7 @@ async fn forward_permission_request(
     let id = request.id.clone();
     let error_response = |message: String| {
         flow_plugin_sdk::protocol::jsonrpc::Message::Response(RpcResponse {
-            jsonrpc: "2.0".into(),
+            jsonrpc: "2.0",
             id: id.clone(),
             result: None,
             error: Some(flow_plugin_sdk::protocol::jsonrpc::Error {
@@ -2896,9 +2903,7 @@ async fn forward_permission_request(
     // 控制帧预算预检：工具参数必须整体装进控制帧（截断 = 拒绝，不静默）。
     let probe = postcard_probe(&request);
     match probe {
-        Ok(bytes)
-            if bytes.len() > flow_engine::execution_protocol::CONTROL_MAX_FRAME =>
-        {
+        Ok(bytes) if bytes.len() > flow_engine::execution_protocol::CONTROL_MAX_FRAME => {
             return error_response("工具参数超过控制帧预算（写入内容过大）".into())
         }
         Err(error) => return error_response(format!("tool request encode failed: {error}")),
@@ -2930,15 +2935,14 @@ async fn forward_permission_request(
                 operation_id,
                 allowed,
                 reason,
-            } if target == dispatch_id && tool_call_id == params.tool_call_id =>
-            {
+            } if target == dispatch_id && tool_call_id == params.tool_call_id => {
                 let result = PermissionRequestResult {
                     allowed,
                     reason,
                     operation_id,
                 };
                 return flow_plugin_sdk::protocol::jsonrpc::Message::Response(Response {
-                    jsonrpc: "2.0".into(),
+                    jsonrpc: "2.0",
                     id,
                     result: Some(serde_json::to_value(result).unwrap_or(Value::Null)),
                     error: None,

@@ -74,7 +74,6 @@ methods! {
         // 09 权限模型：待审批收件箱与有效权限（只读，不含 secret 值）。
         ApprovalsList => "approvals.list",
         PermissionsEffective => "permissions.effective",
-        /// 数据集级权限审计分页（谁在何时批了什么；按 actor/decision/run 过滤）。
         PermissionsAuditPage => "permissions.audit.page",
     }
     write {

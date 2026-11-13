@@ -1,8 +1,8 @@
 # 09 · 权限模型：从单条命令到 auto-approve（认证 · 授权 · 审批 · 审计）
 
-> 本文是新增分篇，不在 DESIGN.md 原章节编号内。设计状态：待实现；本文中的新字段与协议不代表现有实现。采用能力上限与审批分离的模型。提出新不变量 I26–I38（续
-> [08-invariants-and-limits.md](08-invariants-and-limits.md)）。所有落点均标注现有代码位置；
-> 未标注的实现细节以本文为准。
+> 本文是新增分篇，不在 DESIGN.md 原章节编号内。设计状态：**已实现（P0+P1+P2）**；
+> 实现取舍见文末「§13 实现注记」。采用能力上限与审批分离的模型。提出新不变量
+> I26–I38（续 [08-invariants-and-limits.md](08-invariants-and-limits.md)）。
 
 ---
 
@@ -726,3 +726,76 @@ crate 变更清单：
   改变 master 的冻结权限。UI raw JSON 与专用表单保存均保持宿主 permissions 字段。
 - 运行中改权限不影响旧快照；新 run 使用新权限；Plan/Run 精确授权不提升能力。
   不支持沙箱的平台遇到需要限制子进程出网/文件范围的配置时拒绝，禁止静默 no-op。
+
+---
+
+## 13. 实现注记（2026-11 落地版）
+
+实现与本文的差异与细化，全部以代码为准：
+
+### 13.1 数据与折叠
+- **Action 闭集**补了 `shell` 与 `file_delete`（§3.2 枚举漏列，§3.4 表已区分）；
+  `SendEmail` spec 携带 `recipients`；`Exec/Shell` 携带 `stdin_digest`（harness 的
+  prompt 走 stdin）。
+- **审批等待不用 WaitRegistered**（它是结果事件，会封口 attempt 的 I17 屏障）：
+  `PermissionAsked` 折叠出**非封口**的 `Wait::Approval{operation_id, request_hash,
+  deadline}`（`wake_at` 复用为 deadline 字段，线形状新增字段 skip_none，旧日志不受
+  影响）；`PermissionDecided` 解除。run 保持 running（I14 同款），不碰 AwaitingResume。
+- **I26 折叠闸门**：受管 run（有冻结策略）的 `OperationAuthorized` 必须消费同
+  operation_id + fingerprint 的 Allow 凭条（`Node.permit`），凭条一次性。
+- **子工作流上限**用「祖先层栈」（`FrozenPolicy.ceilings: Vec<CeilingLayer>`）而非
+  单个 `parent_ceiling`：每层 AND 相交、digest 纳入 mode/legacy。
+- **插件授予**折叠为数据集级 `State.plugin_grants`（键 `plugin_id:content_hash`，
+  I35），legacy 确认展开为全动作族级 Any 能力。
+
+### 13.2 评估与 G3
+- 评估器为 `flow-backend/src/policy.rs::check`（纯函数，I31）；需求派生在
+  `policy/derive.rs`（节点级）与 `derive::tool_specs`（G5 工具闭集映射）。
+- 比本文更严的两条：**email 额外要求 endpoint 的 Net(POST) 能力**；http/llm 的
+  proxy 不参与需求派生（proxy 仍按出站 URL 授权，记为已知限制）。
+- `LlmCall.provider` = 规范化端点（scheme://host[:port]/path），model 取
+  body.model 或冻结 agent 配置。
+- harness command 的 `command` 展开后必须是**规范化绝对路径**（不做 PATH 解析，
+  TOCTOU）；`<sh|bash|zsh|dash|ksh> -c <script>` 归为 Shell（摘要绑定脚本全文）。
+- **挂起不计槽**：待审批派发交还 X_max 槽位（上限 A_MAX），`has_capacity` 扣除
+  挂起数；重启后 Approval 等待（无 operation）重派发，执行器沿用原 operation_id、
+  继承原 deadline（§6.1）。工具级等待复用同一挂起机制。
+- **凭据交付**：Permit 携带 `credentials: Vec<PermitCredential>`（名→值），执行器
+  按节点请求的 `credential.secret_ref` 取用（I37：全部需求获准后才解析）。
+
+### 13.3 插件与 harness（P1）
+- SDK 协议 minor 1→2：`Capability::MasterPermitV1` + `permission/request` 方法
+  （`PermissionRequestParams/Result`）；harness 插件 initialize 声明该能力。
+- `TurnPermission` 随 `RunTurnParams.permission` 下发；`FullAuto` 硬编码已删——
+  未受管回装配 AutoEdit + 恒拒 approver（无本地放行路径，§8.4）。
+- 反向链路：插件 `permission/request` → 执行器 `ToolPermissionRequest`（协议 v8
+  新帧）→ master G5 裁决 → `ToolPermissionDecision` → 插件。链路断/超时/取消
+  fail closed。ApprovalLedger 按 tool_call_id 去重传输重试（provider 侧 id 唯一）。
+- **G4（通用插件节点授权）未接入**：受管工作流含动态插件节点仍被 `start_gate`
+  拒绝（fail-closed）；legacy 工作流的动态节点照旧行为（无授权步）。sandbox
+  profile 未实现（§12.2 已知限制清单维持）。这是 P1 相对本文的主要缺口。
+- 内置（bundled）插件（harness-agent/llm）启动时幂等自动授予其声明能力
+  （受信分发二进制）；第三方插件必须 `permissions.grant` 显式授予。
+
+### 13.4 认证与审计（P2）
+- `[[api_keys]]`（id/token_hash=scrypt 无、直接 sha256 hex/scopes/expires_at）；
+  `FLOW_JOURNAL_TOKEN` 恒为隐式 admin key。scope 裁决：读=read，写=write，
+  run.approve/deny=approve，permissions.grant=admin。决策记录 `by` 为
+  `ApiKey{id}`（approve-only key 不能写 workflow，e2e 钉死）。
+- **哈希链**（format 4→5，打开时单事务原地迁移）：`transactions` 增加
+  `prev_digest/chain_digest`，链值 = `SHA-256(prev_chain ‖ digest(body))`；
+  `maintenance::verify()` 顺链校验——中段「body+digest 一致篡改」（旧读侧逐帧
+  复核的盲区）被链发现（e2e 钉死）。
+- **审计查询**：`run.audit.page` 支持 `filter:"permission"`；新增
+  `permissions.audit.page {run_id?, decision?, limit}`（数据集级，回答「谁在何时
+  批了什么」）+ `flow-cli journal permissions-audit`（JSONL）。
+- **Event.actor 未做通用字段**：主体已随 `DecisionRecord.by`、
+  `WorkflowPermissionsChanged.by`、`PluginGrant.by` 落盘；给全部 Event 加 actor
+  需要动所有写入路径，收益低破坏面大，记为后续项。
+
+### 13.5 测试钩子（生产恒关闭）
+- `FLOW_TEST_AUTO_GOVERN`（或 cargo 测试二进制环境自动开启，`=0` 显式关闭）：
+  master 对 legacy 定义按运行期已知事实合成精确权限（含冻结 agent 配置派生
+  LlmCall/Secret），存量 e2e 由此跑受管语义；harness 工具调用在该模式下按
+  `test-hook` 能力记 Allow（by=System）。P0/P1/P2 权限语义用例全部
+  `FLOW_TEST_AUTO_GOVERN=0` 走真实裁决。
