@@ -102,6 +102,8 @@ struct CommittedState {
 /// 跨 SQLite 查询或落盘等待都不得持有 `state`。
 pub struct JournalBackend {
     pub journal: Journal,
+    pub(crate) environment_metadata: RwLock<()>,
+    pub environments: std::sync::OnceLock<Arc<flow_engine::environments::EnvironmentStore>>,
     pub store: Arc<Store>,
     pub observations: Option<flow_engine::observation::ObservationStore>,
     state: Arc<Mutex<CommittedState>>,
@@ -147,6 +149,70 @@ pub const APPROVAL_TTL_DEFAULT_MS: u64 = 24 * 60 * 60 * 1000;
 const APPROVAL_TTL_RANGE_MS: (u64, u64) = (60 * 1000, 7 * 24 * 60 * 60 * 1000);
 
 impl JournalBackend {
+    pub async fn delete_environment(&self, id: &str, revision: u64) -> Result<()> {
+        let _metadata = self.environment_metadata.write().await;
+        let referenced = self
+            .inspect(|state| {
+                state
+                    .schedules
+                    .values()
+                    .chain(state.webhooks.values())
+                    .any(|v| v["deleted"] != true && v["environment_id"].as_str() == Some(id))
+            })
+            .await;
+        if referenced {
+            return Err(flow_journal::Error::Invalid(
+                "environment is referenced by a trigger".into(),
+            )
+            .into());
+        }
+        let mut before: Option<String> = None;
+        loop {
+            let (_, rows) = self
+                .store
+                .runs_page(flow_journal::query::RunsQuery {
+                    before_run_id: before.as_deref(),
+                    limit: 100,
+                    ..Default::default()
+                })
+                .await
+                .map_err(|e| JournalError::Storage(e.to_string()))?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in &rows {
+                let run_id = row["run_id"]
+                    .as_str()
+                    .or_else(|| row["id"].as_str())
+                    .ok_or_else(|| flow_journal::Error::Invalid("run identity missing".into()))?;
+                if let (_, Some(value)) = self
+                    .store
+                    .get_execution(run_id)
+                    .await
+                    .map_err(|e| JournalError::Storage(e.to_string()))?
+                {
+                    if value
+                        .pointer("/environment/id")
+                        .or_else(|| value.pointer("/execution/environment/id"))
+                        .and_then(Value::as_str)
+                        == Some(id)
+                    {
+                        return Err(flow_journal::Error::Invalid(
+                            "environment is referenced by a run".into(),
+                        )
+                        .into());
+                    }
+                }
+                before = Some(run_id.to_owned());
+            }
+        }
+        self.environments
+            .get()
+            .ok_or_else(|| flow_journal::Error::Invalid("environment store unavailable".into()))?
+            .delete(id, revision)
+            .map_err(|e| flow_journal::Error::Invalid(e).into())
+    }
+
     /// 设置审批 TTL（启动时由 `[permissions] approval_ttl_ms` 注入；夹紧到
     /// 60s..=7d）。`FLOW_APPROVAL_TTL_MS` 环境变量仅供测试缩短等待（夹紧
     /// 下限 1s），不进配置文件契约。
@@ -300,6 +366,8 @@ impl JournalBackend {
             coordinator_last_tick_ms: AtomicI64::new(0),
             definitions: Mutex::new(std::collections::HashMap::new()),
             harness_agent: std::sync::OnceLock::new(),
+            environments: std::sync::OnceLock::new(),
+            environment_metadata: RwLock::new(()),
             approval_ttl_ms: AtomicU64::new(APPROVAL_TTL_DEFAULT_MS),
         });
         Ok(backend)

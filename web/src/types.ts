@@ -132,6 +132,7 @@ export interface VersionMeta {
 
 /** schedule.create / schedule.list 返回的 cron 调度（crates/flow-dto/src/lib.rs Schedule） */
 export interface Schedule {
+  environment_id?: string | null;
   id: string;
   workflow_id: string;
   cron_expr: string;
@@ -145,6 +146,7 @@ export interface Schedule {
 
 /** webhook.create / webhook.list 返回的 webhook 触发器（flow-dto Webhook，token 即 URL 凭证） */
 export interface Webhook {
+  environment_id?: string | null;
   token: string;
   workflow_id: string;
   enabled: boolean;
@@ -299,7 +301,7 @@ export interface NodeTemplateSummary {
 /** 密钥清单条目：source=stored（界面管理，可删）| env（进程环境变量） */
 export interface SecretInfo {
   name: string;
-  source: "stored" | "env";
+  source: "stored" | "env" | "environment";
 }
 
 // ---- 统一配置（crates/flow-config/src/lib.rs Config；分区形状对齐） ----

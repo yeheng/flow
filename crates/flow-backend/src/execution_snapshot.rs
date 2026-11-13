@@ -84,6 +84,7 @@ impl JournalBackend {
             selected,
             root.definition,
             Some(ExecutionSnapshot {
+                environment: None,
                 runtime: flow_engine::RUNTIME_ID.into(),
                 clock_ms: chrono::Utc::now().timestamp_millis(),
                 seed: crate::journal_commands::id(),

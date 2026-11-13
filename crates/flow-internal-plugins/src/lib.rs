@@ -20,6 +20,6 @@ pub use command::{
 };
 pub use email::email_request;
 pub use script::{
-    eval_body, eval_body_recorded, eval_expr, expand_templates, expand_templates_recorded, truthy,
-    JsDeterminism, JsLimits,
+    eval_body, eval_body_recorded, eval_expr, expand_templates, expand_templates_recorded,
+    expand_templates_with_config, truthy, JsDeterminism, JsLimits,
 };

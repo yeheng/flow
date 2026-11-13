@@ -88,7 +88,7 @@ pub enum WorkflowCommand {
         #[arg(long)]
         name: String,
     },
-    /// 保存定义为新版本（落库即校验，非法定义 -32010）
+    /// 保存定义为新版本（落库即校验，非法定义 -32602）
     Update {
         workflow_id: String,
         /// 定义文件（JSON）；'-' 读标准输入

@@ -67,6 +67,7 @@ methods! {
         TemplateList => "template.list",
         TemplateGet => "template.get",
         ConfigGet => "config.get",
+        EnvironmentsList => "environments.list",
         SecretsList => "secrets.list",
         NodetypesList => "nodetypes.list",
         PluginsList => "plugins.list",
@@ -100,6 +101,8 @@ methods! {
         TemplateDelete => "template.delete",
         SecretsSet => "secrets.set",
         SecretsDelete => "secrets.delete",
+        EnvironmentsDelete => "environments.delete",
+        EnvironmentsSave => "environments.save",
         ConfigUpdate => "config.update",
         // 09 权限模型：人工审批与 Run 精确授权撤销（只能裁决当前 pending 实例）。
         RunApprove => "run.approve",

@@ -641,6 +641,7 @@ impl TaskRunner {
         let determinism = self.determinism();
         // 含 "${" 才展开：无模板时直接提交实际输入，避免一次无谓的
         // 表达式求值（求值会改变用户可见的确定性上下文开销）。
+        let config = self.task.node.pointer("/_flow_execution/environment/config").cloned().unwrap_or(Value::Null);
         let templates = serde_json::to_string(&node.params)?.contains("${");
         let params = if !templates {
             node.params.clone()
@@ -661,12 +662,13 @@ impl TaskRunner {
                 let input = inputs.input.clone();
                 let nodes = inputs.nodes.clone();
                 move || {
-                    flow_internal_plugins::expand_templates_recorded(
+                    flow_internal_plugins::expand_templates_with_config(
                         &params,
                         &input,
                         &nodes,
                         Duration::from_secs(2),
                         determinism,
+                        &config,
                     )
                 }
             })

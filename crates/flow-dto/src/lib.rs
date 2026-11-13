@@ -185,6 +185,8 @@ pub struct WorkflowSummary {
 /// cron 定时调度（schedules 表）。cron_expr 是标准 5 字段（分 时 日 月 周），本地时间。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Schedule {
+    #[serde(default)]
+    pub environment_id: Option<String>,
     /// 调度 id。
     pub id: String,
     /// 被调度的工作流。
@@ -202,6 +204,8 @@ pub struct Schedule {
 /// webhook 触发器（webhooks 表，token 即主键，随机生成不可猜）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Webhook {
+    #[serde(default)]
+    pub environment_id: Option<String>,
     /// 触发 token，同时是主键；不可猜测，因为它本身就是凭据。
     pub token: String,
     /// 被触发的工作流。

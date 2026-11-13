@@ -522,6 +522,50 @@ async fn dispatch_call(
     let (p, request_id, caller) = admit_call(ctx, method.as_str(), params).await?;
     let request = request_id.as_deref();
     let b = &ctx.backend;
+    let credentials = if matches!(
+        method,
+        Method::WorkflowImport | Method::WorkflowUpdate | Method::WorkflowValidate
+    ) {
+        match p
+            .get("environment_id")
+            .and_then(Value::as_str)
+            .filter(|id| *id != "default")
+        {
+            Some(id) => {
+                let store = b
+                    .environments
+                    .get()
+                    .ok_or_else(|| invalid("environment store unavailable"))?;
+                Some(
+                    store
+                        .credentials(&store.bind(id).map_err(invalid)?)
+                        .map_err(invalid)?,
+                )
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    let dispatch = dispatch_admitted(ctx, method, p, request, caller);
+    match credentials {
+        Some(values) => {
+            flow_backend::secrets::ENVIRONMENT_CREDENTIALS
+                .scope(values, dispatch)
+                .await
+        }
+        None => dispatch.await,
+    }
+}
+
+async fn dispatch_admitted(
+    ctx: &Context,
+    method: Method,
+    p: Value,
+    request: Option<&str>,
+    caller: Caller,
+) -> Result<Value, ErrorObjectOwned> {
+    let b = &ctx.backend;
     let receipt = match method {
         // ---- 观测 / 读面（直接返回，不走回执解包） ----
         Method::RunObservationsPage => return observations_page(b, &p).await,
@@ -608,13 +652,17 @@ async fn dispatch_call(
             let req = RunStartReq::parse(&p)?;
             // 来源写死为 "manual"：RPC 触发的 run 都是人工发起，回归跑
             // 另有 run.regress 通道并在后端标注来源。
-            b.run_start(
+            b.run_start_in_environment(
                 req.workflow_id,
                 req.version,
                 req.input,
-                "manual",
-                None,
                 request,
+                p.get("environment_id")
+                    .map(|v| {
+                        v.as_str()
+                            .ok_or_else(|| invalid("environment_id must be a string"))
+                    })
+                    .transpose()?,
             )
             .await
         }
@@ -722,12 +770,82 @@ async fn dispatch_call(
                 .map_err(view_failure)?;
             return serde_json::to_value(template).map_err(invalid);
         }
+        Method::EnvironmentsList => {
+            let store = b
+                .environments
+                .get()
+                .ok_or_else(|| invalid("environment store unavailable"))?;
+            return Ok(json!({"environments": store.list()}));
+        }
+        Method::EnvironmentsDelete => {
+            b.delete_environment(
+                text(&p, "id")?,
+                p["revision"]
+                    .as_u64()
+                    .ok_or_else(|| invalid("revision required"))?,
+            )
+            .await
+            .map_err(failure)?;
+            return Ok(json!({"deleted":true}));
+        }
+        Method::EnvironmentsSave => {
+            let store = b
+                .environments
+                .get()
+                .ok_or_else(|| invalid("environment store unavailable"))?;
+            let secret = p
+                .get("secret")
+                .map(|s| -> Result<_, ErrorObjectOwned> {
+                    let value = match s.get("value") {
+                        None | Some(Value::Null) => None,
+                        Some(value) => Some(
+                            value
+                                .as_str()
+                                .ok_or_else(|| invalid("secret value must be a string"))?,
+                        ),
+                    };
+                    Ok((text(s, "name")?, value))
+                })
+                .transpose()?;
+            let binding = store
+                .save(
+                    text(&p, "id")?,
+                    text(&p, "name")?,
+                    p.get("config")
+                        .cloned()
+                        .ok_or_else(|| invalid("config required"))?,
+                    secret,
+                    p["revision"]
+                        .as_u64()
+                        .ok_or_else(|| invalid("revision required"))?,
+                )
+                .map_err(invalid)?;
+            return serde_json::to_value(binding).map_err(invalid);
+        }
         Method::ConfigGet => {
             let product = ctx_product(ctx)?;
             return Ok(crate::config_view(&product));
         }
         Method::ConfigUpdate => return config_update(ctx, &p).await,
         Method::SecretsList => {
+            if let Some(id) = p
+                .get("environment_id")
+                .and_then(Value::as_str)
+                .filter(|id| *id != "default")
+            {
+                let store = b
+                    .environments
+                    .get()
+                    .ok_or_else(|| invalid("environment store unavailable"))?;
+                let binding = store.bind(id).map_err(invalid)?;
+                let secrets: Vec<_> = store
+                    .credentials(&binding)
+                    .map_err(invalid)?
+                    .keys()
+                    .map(|name| json!({"name":name,"source":"environment"}))
+                    .collect();
+                return Ok(json!({"secrets":secrets}));
+            }
             let secrets: Vec<Value> = flow_backend::secrets::list_secrets()
                 .into_iter()
                 .map(|(name, source)| json!({"name": name, "source": source}))
@@ -1241,7 +1359,14 @@ async fn run_get_view(b: &JournalBackend, p: &Value) -> Result<Value, ErrorObjec
         .map_err(view_failure)?;
     let live = flow_backend::journal_views::is_live(b, run_id).await;
     let plugin_projections = flow_backend::journal_views::run_plugin_projections(b, run_id).await;
-    Ok(json!({"run": run, "live": live, "plugin_projections": plugin_projections}))
+    let environment = b
+        .run_snapshot(run_id)
+        .await
+        .map_err(failure)?
+        .and_then(|r| r.execution.and_then(|s| s.environment));
+    Ok(
+        json!({"run": run, "live": live, "plugin_projections": plugin_projections, "environment": environment}),
+    )
 }
 
 /// 产品面：run 清单（status/source 过滤 + 分页）。

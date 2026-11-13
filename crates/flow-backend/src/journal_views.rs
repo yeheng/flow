@@ -343,6 +343,7 @@ fn schedule_from_config(config: &Value) -> Result<Schedule> {
         Some(config["input"].clone())
     };
     Ok(Schedule {
+        environment_id: config["environment_id"].as_str().map(str::to_owned),
         id: config["id"]
             .as_str()
             .ok_or_else(|| internal("schedule config missing id"))?
@@ -368,6 +369,7 @@ fn schedule_from_config(config: &Value) -> Result<Schedule> {
 /// 把 webhook 配置行翻译成 DTO。
 fn webhook_from_config(config: &Value) -> Result<Webhook> {
     Ok(Webhook {
+        environment_id: config["environment_id"].as_str().map(str::to_owned),
         token: config["token"]
             .as_str()
             .ok_or_else(|| internal("webhook config missing token"))?

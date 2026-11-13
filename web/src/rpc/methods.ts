@@ -26,4 +26,6 @@ export const WRITE_METHODS = new Set([
   "secrets.set",
   "secrets.delete",
   "config.update",
+  "environments.save",
+  "environments.delete",
 ]);

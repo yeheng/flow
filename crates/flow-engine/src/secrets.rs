@@ -85,12 +85,15 @@ pub fn list_secrets() -> Vec<(String, &'static str)> {
     out
 }
 
-/// 按名称取密钥真值：先查持久化来源（若有），回落环境变量。
-/// 不缓存（进程内可随时改，测试友好）。
-///
-/// 查找顺序是「stored 优先、env 兜底」：界面删除某个 stored 密钥后，
-/// 同名环境变量（若设过）重新生效——这也是删除操作的语义。
+tokio::task_local! {
+    pub static ENVIRONMENT_CREDENTIALS: std::collections::BTreeMap<String, String>;
+}
+
+/// 环境内只查绑定版本；旧运行保持 stored 优先、env 兜底。
 pub fn get_secret(name: &str) -> Option<String> {
+    if let Ok(value) = ENVIRONMENT_CREDENTIALS.try_with(|values| values.get(name).cloned()) {
+        return value;
+    }
     if let Some(value) = stored().and_then(|s| s.get(name)) {
         return Some(value);
     }
@@ -192,5 +195,30 @@ mod tests {
         std::env::remove_var("FLOW_SECRET_TEST_LIST_A");
         std::env::remove_var("FLOW_SECRET_TEST_LIST_B");
         assert!(!list_secret_names().iter().any(|n| n == "TEST_LIST_A"));
+    }
+}
+
+#[cfg(test)]
+mod environment_tests {
+    use super::*;
+    #[tokio::test]
+    async fn concurrent_scopes_do_not_leak_or_fall_back() {
+        let a = ENVIRONMENT_CREDENTIALS.scope(
+            std::collections::BTreeMap::from([("KEY".into(), "dev".into())]),
+            async {
+                tokio::task::yield_now().await;
+                assert_eq!(get_secret("KEY").as_deref(), Some("dev"));
+                assert_eq!(get_secret("MISSING"), None);
+            },
+        );
+        let b = ENVIRONMENT_CREDENTIALS.scope(
+            std::collections::BTreeMap::from([("KEY".into(), "prod".into())]),
+            async {
+                tokio::task::yield_now().await;
+                assert_eq!(get_secret("KEY").as_deref(), Some("prod"));
+            },
+        );
+        tokio::join!(a, b);
+        assert!(ENVIRONMENT_CREDENTIALS.try_with(|_| ()).is_err());
     }
 }

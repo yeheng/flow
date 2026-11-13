@@ -37,6 +37,7 @@ pub mod process;
 #[cfg(feature = "runtime")]
 pub mod schema;
 #[cfg(feature = "runtime")]
+pub mod environments;
 pub mod secrets;
 #[cfg(feature = "runtime")]
 pub mod secrets_store;

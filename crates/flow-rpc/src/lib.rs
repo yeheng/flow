@@ -95,6 +95,10 @@ impl AppState {
         Arc<AppState>,
         Option<Arc<flow_engine::secrets_store::SecretFileStore>>,
     ) {
+        match flow_engine::environments::EnvironmentStore::open(&data_dir.join("environments")) {
+            Ok(store) => { let _ = backend.environments.set(Arc::new(store)); }
+            Err(error) => tracing::error!(%error, "环境存储不可用"),
+        }
         let store = match flow_engine::secrets_store::SecretFileStore::open(data_dir) {
             Ok(store) => {
                 let store = Arc::new(store);

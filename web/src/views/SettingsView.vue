@@ -18,6 +18,7 @@ import type {
   RemoteExecutionConfig,
   SecretInfo,
 } from "../types";
+import EnvironmentSettings from "../components/EnvironmentSettings.vue";
 import AppButton from "../components/AppButton.vue";
 
 /**
@@ -384,6 +385,7 @@ async function onDeleteSecret(name: string): Promise<void> {
       </AppButton>
     </div>
 
+    <EnvironmentSettings />
     <section v-if="!isDesktop()" class="card">
       <div class="card-head">
         <h3>服务连接</h3>

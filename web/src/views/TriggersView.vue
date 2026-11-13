@@ -134,7 +134,7 @@ async function onCreateSchedule(): Promise<void> {
   const token = scope.mark();
   const cron = newCron.value.trim();
   if (!cron) return;
-  // input 文本域：空 = 无输入；非空必须是合法 JSON（前端先拦，cron 非法由后端 -32010 toast）
+  // input 文本域：空 = 无输入；非空必须是合法 JSON（前端先拦，cron 非法由后端 -32602 toast）
   let input: unknown;
   const raw = newInput.value.trim();
   if (raw) {
@@ -516,7 +516,7 @@ onUnmounted(() => {
         <tbody>
           <template v-for="s in schedules" :key="s.id">
             <tr>
-              <td class="mono">{{ s.cron_expr }}</td>
+              <td class="mono">{{ s.cron_expr }} · {{ s.environment_id ?? "default" }}</td>
               <td :title="s.next_fire_at ?? undefined">{{ fmtTime(s.next_fire_at) }}</td>
               <td class="mono muted" :title="JSON.stringify(s.input)">{{ fmtInput(s.input) }}</td>
               <td>
@@ -603,7 +603,7 @@ onUnmounted(() => {
               <td class="mono hook-url">{{ hookUrl(w) }}</td>
               <td>
                 <span class="badge" :class="w.enabled ? 'run-succeeded' : 'run-cancelled'">
-                  {{ w.enabled ? "已启用" : "已停用" }}
+                  {{ w.enabled ? "已启用" : "已停用" }} · {{ w.environment_id ?? "default" }}
                 </span>
               </td>
               <td :title="w.created_at">{{ fmtTime(w.created_at) }}</td>

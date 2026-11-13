@@ -1,11 +1,27 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, watch } from "vue";
 import { useRoute } from "vue-router";
 import { client } from "./rpc/client";
 import AppToasts from "./components/AppToasts.vue";
 import AppModal from "./components/AppModal.vue";
 
+import { environments, selectedEnvironment, refreshEnvironments } from "./state/environments";
+import { refreshSecrets } from "./state/editor";
 const route = useRoute();
+watch([selectedEnvironment, () => environments.value.find(e => e.id === selectedEnvironment.value)?.revision], () => {
+  void refreshSecrets();
+});
+watch(
+  () => client.connected.value,
+  (value) => {
+    if (value)
+      void refreshEnvironments().catch(() => {
+        environments.value = [];
+        selectedEnvironment.value = "default";
+      });
+  },
+  { immediate: true },
+);
 const connected = computed(() => client.connected.value);
 
 /** 导航高亮：`/` 精确命中，其余按路径段前缀（/workflows/:id 归「工作流」、/runs/:id 归「运行记录」） */
@@ -32,6 +48,13 @@ function navActive(path: string, to: string): boolean {
         设置
       </RouterLink>
     </nav>
+    <label
+      >运行环境
+      <select v-model="selectedEnvironment" aria-label="运行环境">
+        <option value="default">默认</option>
+        <option v-for="e in environments" :key="e.id" :value="e.id">{{ e.name }}</option>
+      </select>
+    </label>
     <!-- 业务 chrome 不常显 RPC 地址：连接态只留圆点+文案，地址进 tooltip -->
     <span class="conn" :class="{ ok: connected }" :title="client.url">
       <span class="conn-dot" aria-hidden="true" />

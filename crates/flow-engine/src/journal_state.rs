@@ -208,6 +208,8 @@ fn is_zero(value: &u64) -> bool {
 /// Immutable dependencies and deterministic inputs, inherited by child runs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<crate::environments::EnvironmentBinding>,
     pub runtime: String,
     pub clock_ms: i64,
     pub seed: String,

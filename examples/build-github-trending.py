@@ -169,6 +169,48 @@ return {
 
 HEADERS = {"User-Agent": "flow-github-trending", "Accept": "text/html"}
 
+# ---- 权限块（09 权限模型）----
+# 含副作用节点（http_call / harness）的定义**必须**声明 permissions：
+# 缺了就是 legacy 定义——保存能过，run.start 会被服务端拒绝（-32020
+# "工作流未声明权限块（legacy）…需由管理员迁移"）。这条门在运行期，离线
+# validate_def 查不出来。
+#
+# allow 的每条能力 = {id, action, approval, + 该动作的匹配字段}：
+#   net       → methods + url_prefix（scheme/host/port 精确，路径按段前缀）
+#   llm_call  → providers + models（provider = 规范化后的 base_url）
+#   secret    → names（密钥**名称**，与节点 api_key 一致）
+# approval：auto = 命中即放行（仍逐次落审计）；ask = 挂起等人工审批。
+#
+# agent-llm 的 providers / models 必须与 [harness.agent] 对齐：
+# provider = 规范化后的 base_url（scheme://host[:port]/path），model = 配置里的
+# 模型名。改了配置就改这里，否则 agent 的首个请求会被拒（fail-closed）。
+PERMISSIONS = {
+    "version": 1,
+    "mode": "execute",
+    "allow": [
+        {
+            "id": "fetch-trending",
+            "action": "net",
+            "methods": ["GET"],
+            "url_prefix": "https://github.com/trending",
+            "approval": "auto",
+        },
+        {
+            "id": "agent-llm",
+            "action": "llm_call",
+            "providers": ["https://api.deepseek.com/v1"],
+            "models": ["deepseek-chat"],
+            "approval": "auto",
+        },
+        {
+            "id": "agent-key",
+            "action": "secret",
+            "names": [AGENT_SECRET],
+            "approval": "auto",
+        },
+    ],
+}
+
 
 def http(node_id, name, url, x, y):
     return {
@@ -187,6 +229,7 @@ def http(node_id, name, url, x, y):
 
 definition = {
     "semantics": 2,
+    "permissions": PERMISSIONS,
     "nodes": [
         {"id": "start", "type": "start", "name": "开始", "position": {"x": 40, "y": 200}},
         http(
@@ -244,7 +287,7 @@ definition = {
 
 doc = {
     "name": "github-trending",
-    "description": "拉取 GitHub Trending 日报（全量 + spoken_language_code=zh），解析成 中文 / 非中文 两组项目后，用内置 harness agent 总结榜单趋势并推荐有趣的项目（含介绍与卖点）。需配置 [harness.agent] 模型、密钥 DEEPSEEK_API_KEY；recommend 节点默认使用临时工作目录，无需配置 workdir",
+    "description": "拉取 GitHub Trending 日报（全量 + spoken_language_code=zh），解析成 中文 / 非中文 两组项目后，用内置 harness agent 总结榜单趋势并推荐有趣的项目（含介绍与卖点）。需配置 [harness.agent] 模型、密钥 DEEPSEEK_API_KEY；recommend 节点默认使用临时工作目录，无需配置 workdir；permissions.allow 里的 agent-llm（providers/models）必须与 [harness.agent] 对齐",
     "definition": definition,
 }
 

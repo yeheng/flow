@@ -12,8 +12,17 @@
 //! 不是合法 JSON 或结构不符。**报错文案与服务端 `workflow.update` 完全一致**
 //! ——两边调的是同一个 `Definition::validate`，所以这里红了，导入一定也红。
 //!
-//! 边界：这里只跑**建图期**校验（`flow-engine/src/model.rs`）。密钥存在性、
-//! `input_schema` 的实际取值、子流程依赖闭包都在服务端校验，本工具管不到。
+//! 语义缺省与服务端一致：缺 `semantics` 时按 **v2** 解释（服务端在校验前
+//! 注入 `semantics: 2`；引擎反序列化的缺省是 v1，那是历史定义的解释口径，
+//! 不该被离线工具当默认）。
+//!
+//! 边界：这里只跑**建图期**校验（`flow-engine/src/model.rs`）。以下都在服务端、
+//! 本工具管不到：
+//! - 密钥存在性、`input_schema` 的实际取值、子流程依赖闭包；
+//! - **插件声明的动态节点类型**：离线没有 manifest，插件类型会被当成
+//!   「类型未知」拒绝；含插件节点的定义只能在服务端校验；
+//! - **权限块的作用域**：权限块本身的形状离线可验，但「含副作用节点却没有
+//!   权限块 → run.start 被拒」是运行期门（legacy 迁移），离线查不出来。
 
 use std::io::Read;
 
@@ -29,7 +38,12 @@ fn main() -> std::process::ExitCode {
         Err(err) => return fail(2, &format!("JSON 解析失败：{err}")),
     };
     // 信封形态优先；没有 `definition` 键时整体就是 definition。
-    let definition = value.get("definition").cloned().unwrap_or(value);
+    let mut definition = value.get("definition").cloned().unwrap_or(value);
+    // 与服务端归一化同口径：缺省补 `semantics: 2`（服务端在校验前注入），
+    // 否则离线按 v1 判、导入按 v2 判，两边结论会不一致。
+    if let Some(object) = definition.as_object_mut() {
+        object.entry("semantics").or_insert(serde_json::json!(2));
+    }
     match serde_json::from_value::<Definition>(definition) {
         Ok(definition) => match definition.validate() {
             Ok(()) => {

@@ -32,6 +32,7 @@ const router = useRouter();
 
 const record = ref<RunRecord | null>(null);
 const live = ref(false);
+const environment = ref<{ id: string; revision: number } | null>(null);
 const definition = ref<Definition | null>(null);
 /** 定义拉取中：区分「加载中」与「加载完成但没有定义」，避免首屏闪「不可用」 */
 const loadingDefinition = ref(false);
@@ -230,7 +231,6 @@ const workflowName = computed(() => {
   return editor.workflows.find((w) => w.workflow_id === wf)?.name ?? wf ?? "";
 });
 
-
 function fmtJson(v: unknown): string {
   if (v === undefined || v === null) return "";
   return JSON.stringify(v, null, 2);
@@ -281,10 +281,12 @@ async function load(runId: string): Promise<void> {
   candidates.value = null;
   candidatesLoaded = false;
   try {
+    environment.value = null;
     const r = await api.getRun(runId);
     if (loadStale.stale(gen)) return;
     record.value = r.run;
     live.value = r.live;
+    environment.value = r.environment ?? null;
   } catch {
     if (loadStale.stale(gen)) return;
     // 物化读面失败（超大值 / 服务端错误）：不猜错误码，直接试原始信封读面
@@ -292,6 +294,8 @@ async function load(runId: string): Promise<void> {
       const raw = await api.getRunRaw(runId);
       if (loadStale.stale(gen)) return;
       record.value = rawRunToRecord(raw);
+      const execution = raw.execution as { environment?: { id: string; revision: number } } | undefined;
+      environment.value = execution?.environment ?? null;
       live.value = false;
       liteMode.value = true;
     } catch (e2) {
@@ -359,6 +363,10 @@ onUnmounted(() => {
             {{ workflowName }}
           </RouterLink>
           <span class="muted">v{{ record.workflow_version }}</span>
+          <span class="muted"
+            >环境：{{ environment?.id ?? "default"
+            }}<template v-if="environment"> · v{{ environment.revision }}</template></span
+          >
           <RouterLink class="link" :to="`/workflows/${record.workflow_id}/runs`">
             该工作流的运行记录
           </RouterLink>
@@ -453,7 +461,9 @@ onUnmounted(() => {
                 {{ downloading === inputValue.outputId ? "下载中…" : "下载完整值" }}
               </AppButton>
             </div>
-            <code v-else class="run-io">{{ fmtJson(liteMode ? inputValue.value : record.input) || "（空）" }}</code>
+            <code v-else class="run-io">{{
+              fmtJson(liteMode ? inputValue.value : record.input) || "（空）"
+            }}</code>
           </div>
           <div v-if="record.error" class="io-block">
             <div class="io-label muted">错误</div>
@@ -481,7 +491,9 @@ onUnmounted(() => {
                 {{ downloading === outputValue.outputId ? "下载中…" : "下载完整值" }}
               </AppButton>
             </div>
-            <code v-else class="run-io">{{ fmtJson(liteMode ? outputValue.value : record.output) }}</code>
+            <code v-else class="run-io">{{
+              fmtJson(liteMode ? outputValue.value : record.output)
+            }}</code>
           </div>
           <details class="run-candidates" @toggle="onCandidatesToggle">
             <summary>回归候选（以本 run 为基线，点开加载）</summary>
@@ -568,7 +580,11 @@ onUnmounted(() => {
             <div v-if="showEvents" class="events-list">
               <p v-if="events === null" class="run-hint">加载中…</p>
               <template v-else>
-                <div v-for="e in events" :key="`${e.lsn}:${e.event_index}`" class="events-item mono">
+                <div
+                  v-for="e in events"
+                  :key="`${e.lsn}:${e.event_index}`"
+                  class="events-item mono"
+                >
                   <span class="muted">#{{ e.event.run_seq }}</span> {{ e.event.kind }}
                   <span v-if="e.event.node_id" class="muted">{{ e.event.node_id }}</span>
                 </div>

@@ -419,7 +419,7 @@ impl DispatchRunner {
     /// 在给定链路上驱动派发；链路死亡返回 `JournalError::LinkClosed`，
     /// 由远程模式重连后继续驱动同一 runner（保留账本/屏障状态）。
     pub(crate) async fn drive(&mut self, link: &mut DispatchLink) -> Result<()> {
-        self.drive_link(link, false).await
+        self.drive_scoped(link, false).await
     }
 
     /// 远程模式：resume=true 时不重发 Execute（重挂同一执行器继续）。
@@ -429,7 +429,7 @@ impl DispatchRunner {
         resume: bool,
     ) -> Result<()> {
         self.remote_replay = true;
-        self.drive_link(link, resume).await
+        self.drive_scoped(link, resume).await
     }
 
     /// 构造一个派发 runner（远程模式用）。
@@ -448,6 +448,23 @@ impl DispatchRunner {
     /// `resume`：重连后继续驱动同一任务（不重发 Execute；输入传输幂等
     /// 重传；已授权未 Outcome 的操作重发许可——许可由主进程权威生成，
     /// 绑定当前会话，非旧会话重放）。
+    async fn drive_scoped(&mut self, link: &mut DispatchLink, resume: bool) -> Result<()> {
+        let run = self.snapshot().await?;
+        if let Some(binding) = run.execution.as_ref().and_then(|s| s.environment.as_ref()) {
+            let store = self.attempt.backend.environments.get().ok_or_else(|| {
+                flow_journal::Error::Invalid("environment store unavailable".into())
+            })?;
+            let credentials = store
+                .credentials(binding)
+                .map_err(flow_journal::Error::Invalid)?;
+            flow_engine::secrets::ENVIRONMENT_CREDENTIALS
+                .scope(credentials, self.drive_link(link, resume))
+                .await
+        } else {
+            self.drive_link(link, resume).await
+        }
+    }
+
     async fn drive_link(&mut self, link: &mut DispatchLink, resume: bool) -> Result<()> {
         let run = self.snapshot().await?;
         let record = run
@@ -486,6 +503,7 @@ impl DispatchRunner {
                 "seed": format!("{}:{}", execution.seed, execution.node_key(&self.node.id)),
                 "regression": execution.regression.is_some(),
                 "fixture_fingerprint": fixture.map(|f| &f.fingerprint),
+                "environment": execution.environment,
             });
             // 冻结的 agent 配置（与 operation 请求里的 agent 是同一份快照的
             // 两次序列化；测试断言两者相等）。旧 journal / 未配置时无此键。

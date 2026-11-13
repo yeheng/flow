@@ -249,6 +249,7 @@ async fn deduped(
 #[derive(Debug, Clone)]
 pub enum ProductCommand {
     ScheduleCreate {
+        environment_id: Option<String>,
         key: String,
         workflow_id: String,
         cron: String,
@@ -265,6 +266,7 @@ pub enum ProductCommand {
         id: String,
     },
     WebhookCreate {
+        environment_id: Option<String>,
         key: String,
         workflow_id: String,
     },
@@ -317,6 +319,11 @@ impl ProductCommand {
         };
         Ok(match method {
             "schedule.create" => Self::ScheduleCreate {
+                environment_id: optional_field(
+                    p,
+                    "environment_id",
+                    "environment_id must be string",
+                )?,
                 key: id(),
                 workflow_id: field("workflow_id")?.to_owned(),
                 cron: field("cron")?.to_owned(),
@@ -333,6 +340,11 @@ impl ProductCommand {
                 id: field("id")?.to_owned(),
             },
             "webhook.create" => Self::WebhookCreate {
+                environment_id: optional_field(
+                    p,
+                    "environment_id",
+                    "environment_id must be string",
+                )?,
                 key: uuid::Uuid::now_v7().simple().to_string(),
                 workflow_id: field("workflow_id")?.to_owned(),
             },
@@ -456,6 +468,7 @@ impl JournalBackend {
             None,
             Some(correlation),
             Some(key_hash),
+            config.get("environment_id").and_then(Value::as_str),
         )
         .await
     }
@@ -469,6 +482,19 @@ impl JournalBackend {
         fingerprint: &Value,
         request_id: &str,
     ) -> Result<CommandReceipt> {
+        let _environment_metadata = self.environment_metadata.read().await;
+        let environment = match &command {
+            ProductCommand::ScheduleCreate { environment_id, .. }
+            | ProductCommand::WebhookCreate { environment_id, .. } => environment_id.as_deref(),
+            _ => None,
+        };
+        if let Some(id) = environment.filter(|id| *id != "default") {
+            self.environments
+                .get()
+                .ok_or_else(|| invalid("environment store unavailable"))?
+                .bind(id)
+                .map_err(|e| invalid(&e))?;
+        }
         let method = command.method();
         self.command(method, Some(request_id), fingerprint, |state| {
             product_decision(state, &command)
@@ -527,13 +553,20 @@ impl JournalBackend {
                 input
             };
             return self
-                .run_start(
+                .start_with_regression(
                     &run.workflow_id,
                     None,
                     input,
                     source,
                     Some(key),
                     Some(request_id),
+                    None,
+                    None,
+                    None,
+                    run.execution
+                        .as_ref()
+                        .and_then(|s| s.environment.as_ref())
+                        .map(|e| e.id.as_str()),
                 )
                 .await;
         }
@@ -555,8 +588,19 @@ impl JournalBackend {
         } else {
             input
         };
-        self.run_start(workflow, None, input, source, Some(key), Some(request_id))
-            .await
+        self.start_with_regression(
+            workflow,
+            None,
+            input,
+            source,
+            Some(key),
+            Some(request_id),
+            None,
+            None,
+            None,
+            config.get("environment_id").and_then(Value::as_str),
+        )
+        .await
     }
     /// Explicit operator resolution. This records a manual decision, never fabricates an
     /// external OperationOutcome. `decision`:
@@ -980,6 +1024,30 @@ impl JournalBackend {
             None,
             None,
             None,
+            None,
+        )
+        .await
+    }
+
+    pub async fn run_start_in_environment(
+        &self,
+        workflow: &str,
+        version: Option<u64>,
+        input: Value,
+        request_id: Option<&str>,
+        environment: Option<&str>,
+    ) -> Result<CommandReceipt> {
+        self.start_with_regression(
+            workflow,
+            version,
+            input,
+            "manual",
+            None,
+            request_id,
+            None,
+            None,
+            None,
+            environment,
         )
         .await
     }
@@ -1000,11 +1068,17 @@ impl JournalBackend {
         regression: Option<flow_engine::journal_state::ExecutionSnapshot>,
         correlation_id: Option<&str>,
         invocation_key_hash: Option<&str>,
+        environment_id: Option<&str>,
     ) -> Result<CommandReceipt> {
+        let _environment_metadata = self.environment_metadata.read().await;
+        let environment_id = environment_id.filter(|id| *id != "default");
         if !flow_dto::RunSource::is_valid_str(source) {
             return Err(invalid("invalid run source").into());
         }
         let mut request = json!({"workflow_id":workflow_id,"version":version,"input":input,"source":source,"source_detail":source_detail});
+        if let Some(environment_id) = environment_id {
+            request["environment_id"] = json!(environment_id);
+        }
         if let Some(regression) = &regression {
             request["regression"] = serde_json::to_value(regression)?;
         }
@@ -1033,6 +1107,32 @@ impl JournalBackend {
         }
         let (selected, frozen_definition, mut execution) =
             self.freeze_execution(workflow_id, version).await?;
+        if let Some(environment_id) = environment_id.filter(|id| *id != "default") {
+            let store = self
+                .environments
+                .get()
+                .ok_or_else(|| invalid("environment store unavailable"))?;
+            let binding = store.bind(environment_id).map_err(|e| invalid(&e))?;
+            let snapshot = execution
+                .as_mut()
+                .ok_or_else(|| invalid("environments require semantics 2"))?;
+            if let Some(value) = binding.config.pointer("/harness/agent") {
+                let config: flow_config::HarnessAgentConfig = serde_json::from_value(value.clone())
+                    .map_err(|e| invalid(format!("invalid environment harness.agent: {e}")))?;
+                let installed =
+                    crate::plugin_config::harness_agent_plugin(&config).map_err(|e| invalid(&e))?;
+                snapshot.agent = installed.as_ref().map(|p| p.run_config.clone());
+                snapshot.agent_plugin =
+                    installed.map(|p| flow_engine::journal_state::AgentPluginSnapshot {
+                        id: p.plugin_id,
+                        version: p.version,
+                        ui: p.ui,
+                        permissions: p.permissions,
+                        content_hash: p.content_hash,
+                    });
+            }
+            snapshot.environment = Some(binding);
+        }
         if correlation_id.is_some() && execution.is_none() {
             // 业务调用需要执行快照（时间/种子/依赖）才可复现，
             // 语义 1 的定义没有这套快照。
@@ -1052,6 +1152,7 @@ impl JournalBackend {
             let snapshot = execution
                 .as_mut()
                 .ok_or_else(|| invalid("regression requires semantics 2"))?;
+            snapshot.environment = recorded.environment;
             snapshot.clock_ms = recorded.clock_ms;
             snapshot.seed = recorded.seed;
             snapshot.regression = recorded.regression;
@@ -1404,8 +1505,22 @@ impl JournalBackend {
                     | "deleted"
                     | "invoke_version"
                     | "invoke_key_hash"
+                    | "environment_id"
             ) {
                 return Err(invalid(format!("config field is not writable: {field}")).into());
+            }
+        }
+        let _environment_metadata = self.environment_metadata.read().await;
+        if let Some(value) = patch.get("environment_id") {
+            let id = value
+                .as_str()
+                .ok_or_else(|| invalid("environment_id must be a string"))?;
+            if id != "default" {
+                self.environments
+                    .get()
+                    .ok_or_else(|| invalid("environment store unavailable"))?
+                    .bind(id)
+                    .map_err(|e| invalid(&e))?;
             }
         }
         self.command(
@@ -1494,6 +1609,7 @@ fn product_decision(
             require_object(&value)?;
             match command {
                 ProductCommand::ScheduleCreate {
+                    environment_id,
                     workflow_id,
                     cron,
                     enabled,
@@ -1501,6 +1617,7 @@ fn product_decision(
                     ..
                 } => {
                     value["workflow_id"] = json!(workflow_id);
+                    value["environment_id"] = json!(environment_id.as_deref().unwrap_or("default"));
                     value["cron_expr"] = json!(cron);
                     value["enabled"] = json!(enabled);
                     value["input"] = input.clone();
@@ -1559,7 +1676,12 @@ fn product_decision(
                 .unwrap_or_else(|| json!({"created_at":now()}));
             require_object(&value)?;
             match command {
-                ProductCommand::WebhookCreate { workflow_id, .. } => {
+                ProductCommand::WebhookCreate {
+                    workflow_id,
+                    environment_id,
+                    ..
+                } => {
+                    value["environment_id"] = json!(environment_id.as_deref().unwrap_or("default"));
                     value["workflow_id"] = json!(workflow_id);
                     value["enabled"] = json!(true);
                 }
@@ -2113,5 +2235,127 @@ mod atomic_command_tests {
             .unwrap();
         assert_eq!(count, 0);
         b.close().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod environment_tests {
+    use super::*;
+    #[tokio::test]
+    async fn runs_pin_revision_and_block_deletion() {
+        let dir = flow_test_support::io::TempDir::new("environment-runs");
+        let b = JournalBackend::open(dir.path(), Default::default())
+            .await
+            .unwrap();
+        let store = std::sync::Arc::new(
+            flow_engine::environments::EnvironmentStore::open(&dir.path().join("env")).unwrap(),
+        );
+        assert!(b.environments.set(store.clone()).is_ok());
+        store
+            .save(
+                "dev",
+                "Dev",
+                json!({"url":"old"}),
+                Some(("KEY", Some("first"))),
+                0,
+            )
+            .unwrap();
+        let wf=b.workflow_import("env",json!({"semantics":2,"nodes":[{"id":"s","type":"start"},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"e"}]}),true,None).await.unwrap();
+        let id = wf.result["workflow_id"].as_str().unwrap();
+        let first = b
+            .run_start_in_environment(id, None, Value::Null, Some("first"), Some("dev"))
+            .await
+            .unwrap();
+        store
+            .save(
+                "dev",
+                "Dev",
+                json!({"url":"new"}),
+                Some(("KEY", Some("second"))),
+                1,
+            )
+            .unwrap();
+        let retry = b
+            .run_start_in_environment(id, None, Value::Null, Some("first"), Some("dev"))
+            .await
+            .unwrap();
+        assert_eq!(first.result, retry.result);
+        let run = b
+            .run_snapshot(first.result["run_id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let binding = run.execution.unwrap().environment.unwrap();
+        assert_eq!(binding.revision, 1);
+        assert_eq!(binding.config["url"], "old");
+        assert_eq!(store.credentials(&binding).unwrap()["KEY"], "first");
+        assert!(b.delete_environment("dev", 2).await.is_err());
+        let second = b
+            .run_start_in_environment(id, None, Value::Null, Some("second"), Some("dev"))
+            .await
+            .unwrap();
+        assert_eq!(
+            b.run_snapshot(second.result["run_id"].as_str().unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .execution
+                .unwrap()
+                .environment
+                .unwrap()
+                .revision,
+            2
+        );
+        assert!(b
+            .run_start_in_environment(id, None, Value::Null, None, Some("missing"))
+            .await
+            .is_err());
+        b.config_change("schedule.change", EventKind::ScheduleChanged, "timer",
+            json!({"workflow_id":id,"cron_expr":"* * * * *","input":null,"enabled":true,"environment_id":"dev"}), Some("create-timer")).await.unwrap();
+        let trigger = b
+            .trigger_start("schedule", "timer", "tick-1", Value::Null)
+            .await
+            .unwrap();
+        let trigger_run = b
+            .run_snapshot(trigger.result["run_id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            trigger_run.execution.unwrap().environment.unwrap().id,
+            "dev"
+        );
+        b.config_change(
+            "schedule.change",
+            EventKind::ScheduleChanged,
+            "timer",
+            json!({"environment_id":"default"}),
+            Some("switch-timer"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            b.trigger_start("schedule", "timer", "tick-1", Value::Null)
+                .await
+                .unwrap()
+                .result,
+            trigger.result
+        );
+        let next = b
+            .trigger_start("schedule", "timer", "tick-2", Value::Null)
+            .await
+            .unwrap();
+        assert!(b
+            .run_snapshot(next.result["run_id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .execution
+            .unwrap()
+            .environment
+            .is_none());
+        store.save("unused", "Unused", json!({}), None, 0).unwrap();
+        b.delete_environment("unused", 1).await.unwrap();
+        assert!(store.bind("unused").is_err());
     }
 }

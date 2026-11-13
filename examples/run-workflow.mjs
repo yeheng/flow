@@ -1,21 +1,46 @@
 #!/usr/bin/env node
-// 通过 JSON-RPC（WebSocket）把一份工作流定义「创建 → 发布 → 运行 → 落盘」。
+// 通过 JSON-RPC（WebSocket）把一份工作流定义「导入发布 → 运行 → 落盘」。
 //
 //   node examples/run-workflow.mjs [定义 JSON] [输出 JSON]
 //
 // 缺省：定义 examples/github-trending.workflow.json → 输出 data/github-trending.json
-// 服务地址用 FLOW_RPC 覆盖（缺省 ws://127.0.0.1:9800）。
+// 服务地址用 FLOW_RPC 覆盖（缺省 ws://127.0.0.1:9802，与 flow-cli 一致）。
+// 令牌从 FLOW_JOURNAL_TOKEN 取（≥ 32 字节，服务端要求每次调用都带）。
 //
 // 说明：引擎没有「写文件」节点，run 的结果只是 run 输出（事件日志里的
 // run_completed.output）。这个脚本负责把它拉下来写成磁盘上的 JSON。
+//
+// 三条硬约定（少了就调不通）：
+//   1. 每次调用都带 `_token`（凭据，不进 URL、不进日志）；
+//   2. **写方法必须带 `request_id`**（幂等键，1..=128 字节）——服务端没有它
+//      直接拒（-32602 "request_id required for write commands"）；
+//   3. 写方法返回的是**回执信封** `{committed, result, ...}`，业务结果在
+//      `result` 里；读方法原样返回结果。
 
+import { randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-const RPC_URL = process.env.FLOW_RPC ?? "ws://127.0.0.1:9800";
+const RPC_URL = process.env.FLOW_RPC ?? "ws://127.0.0.1:9802";
+const TOKEN = process.env.FLOW_JOURNAL_TOKEN;
 const TERMINAL = new Set(["succeeded", "failed", "cancelled"]);
 const POLL_INTERVAL_MS = 300;
 const POLL_TIMEOUT_MS = 120_000;
+
+/** 写方法清单：这些要带 request_id，且返回值要取 `result`。 */
+const WRITE_METHODS = new Set([
+  "workflow.import",
+  "workflow.create",
+  "workflow.update",
+  "workflow.publish",
+  "workflow.delete",
+  "run.start",
+  "run.cancel",
+  "run.signal",
+  "run.adjudicate",
+  "run.approve",
+  "run.deny",
+]);
 
 class RpcClient {
   #ws;
@@ -43,12 +68,25 @@ class RpcClient {
     });
   }
 
-  call(method, params = {}) {
+  /**
+   * 发一次调用。写方法自动补 request_id 并拆出回执里的 `result`。
+   * requestId 可显式传入：回复丢了要用**同一个** id 重发，服务端才认成
+   * 「同一次写」而不是执行第二次。
+   */
+  call(method, params = {}, requestId) {
+    const payload = { ...params, _token: TOKEN };
+    if (WRITE_METHODS.has(method)) {
+      payload.request_id = requestId ?? randomUUID();
+    }
     const id = ++this.#nextId;
     return new Promise((resolve, reject) => {
       this.#pending.set(id, { resolve, reject });
-      this.#ws.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
-    });
+      this.#ws.send(JSON.stringify({ jsonrpc: "2.0", id, method, params: payload }));
+    }).then((result) =>
+      WRITE_METHODS.has(method) && result && typeof result === "object" && "result" in result
+        ? result.result
+        : result,
+    );
   }
 
   close() {
@@ -56,25 +94,22 @@ class RpcClient {
   }
 }
 
-/** 定义已存在同名工作流就追加新版本，否则新建。返回已发布的 workflow_id。 */
-async function upsert(client, name, definition) {
-  const { workflows } = await client.call("workflow.list");
-  const existing = workflows.find((w) => w.name === name);
-  const workflowId =
-    existing?.workflow_id ??
-    (await client.call("workflow.create", { name })).workflow_id;
-  const { version } = await client.call("workflow.update", {
-    workflow_id: workflowId,
-    definition,
-  });
-  await client.call("workflow.publish", { workflow_id: workflowId, version });
-  return { workflowId, version, created: !existing };
+/**
+ * 导入并发布（服务端原子方法 workflow.import）：按 name upsert——同名就是
+ * 追加一个新版本，创建/版本/发布三条事实同一事务提交。
+ * 返回已发布的 workflow_id 与版本号。
+ */
+async function importWorkflow(client, name, definition) {
+  const receipt = await client.call("workflow.import", { name, definition, publish: true });
+  return { workflowId: receipt.workflow_id, version: receipt.version, created: receipt.created };
 }
 
 async function waitTerminal(client, runId) {
   const deadline = Date.now() + POLL_TIMEOUT_MS;
   for (;;) {
-    const { run } = await client.call("run.get", { run_id: runId });
+    // run.get.view 返回 {run: {...}, live}；run.get 是原始投影（values 数组），
+    // 视图方法才是给人看的形状。
+    const { run } = await client.call("run.get.view", { run_id: runId });
     if (TERMINAL.has(run.status)) return run;
     if (Date.now() > deadline) throw new Error(`run ${runId} 未在 ${POLL_TIMEOUT_MS}ms 内终结（${run.status}）`);
     await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
@@ -82,6 +117,7 @@ async function waitTerminal(client, runId) {
 }
 
 async function main() {
+  if (!TOKEN) throw new Error("FLOW_JOURNAL_TOKEN 未设置（服务端要求每次调用带令牌）");
   const defPath = process.argv[2] ?? "examples/github-trending.workflow.json";
   const outPath = process.argv[3] ?? "data/github-trending.json";
 
@@ -93,7 +129,7 @@ async function main() {
   const client = new RpcClient();
   await client.connect(RPC_URL);
   try {
-    const { workflowId, version, created } = await upsert(client, name, definition);
+    const { workflowId, version, created } = await importWorkflow(client, name, definition);
     console.log(`${created ? "创建" : "复用"}工作流 ${name} (${workflowId}) v${version}，已发布`);
 
     const { run_id: runId } = await client.call("run.start", { workflow_id: workflowId });

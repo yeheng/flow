@@ -1,3 +1,4 @@
+import { selectedEnvironment } from "../state/environments";
 import { client } from "../rpc/client";
 export { JournalClient } from "./journal";
 export { downloadValue, runValueUrl } from "./download";
@@ -53,8 +54,11 @@ export async function recheckPlugins(): Promise<PluginViolation[]> {
 }
 
 /** secrets.list 返回 {name, source} 清单（值不出服务端；source=stored|env） */
-export async function listSecrets(): Promise<SecretInfo[]> {
-  const r = await client.call<{ secrets: SecretInfo[] }>("secrets.list", {});
+export async function listSecrets(environmentId = "default"): Promise<SecretInfo[]> {
+  const r = await client.call<{ secrets: SecretInfo[] }>(
+    "secrets.list",
+    environmentId === "default" ? {} : { environment_id: environmentId },
+  );
   return r.secrets;
 }
 
@@ -134,7 +138,10 @@ export interface WorkflowValidation {
 }
 
 export async function validateWorkflow(definition: Definition): Promise<WorkflowValidation> {
-  return client.call("workflow.validate", { definition });
+  return client.call("workflow.validate", {
+    definition,
+    environment_id: selectedEnvironment.value,
+  });
 }
 
 export async function importWorkflowDefinition(
@@ -148,11 +155,17 @@ export async function importWorkflowDefinition(
   created: boolean;
   status: string;
 }> {
-  return client.call("workflow.import", { name, definition, publish });
+  return client.call("workflow.import", {
+    name,
+    definition,
+    publish,
+    environment_id: selectedEnvironment.value,
+  });
 }
 
 export async function updateWorkflow(workflowId: string, definition: Definition): Promise<number> {
   const r = await client.call<{ workflow_id: string; version: number }>("workflow.update", {
+    environment_id: selectedEnvironment.value,
     workflow_id: workflowId,
     definition: definition as unknown as Record<string, unknown>,
   });
@@ -164,7 +177,10 @@ export async function publishWorkflow(workflowId: string, version: number): Prom
 }
 
 export async function getWorkflow(workflowId: string, version?: number): Promise<WorkflowDetail> {
-  const params: Record<string, unknown> = { workflow_id: workflowId };
+  const params: Record<string, unknown> = {
+    workflow_id: workflowId,
+    environment_id: selectedEnvironment.value,
+  };
   if (version !== undefined) params.version = version;
   return client.call<WorkflowDetail>("workflow.get.view", params);
 }
@@ -219,7 +235,9 @@ export async function runStats(workflowId?: string): Promise<RunStats> {
   return client.call<RunStats>("run.stats", params);
 }
 
-export async function getRun(runId: string): Promise<{ run: RunRecord; live: boolean }> {
+export async function getRun(
+  runId: string,
+): Promise<{ run: RunRecord; live: boolean; environment?: { id: string; revision: number } }> {
   return client.call("run.get.view", { run_id: runId });
 }
 
@@ -457,7 +475,11 @@ export async function createSchedule(
   cron: string,
   input?: unknown,
 ): Promise<Schedule> {
-  const params: Record<string, unknown> = { workflow_id: workflowId, cron };
+  const params: Record<string, unknown> = {
+    workflow_id: workflowId,
+    cron,
+    environment_id: selectedEnvironment.value,
+  };
   if (input !== undefined) params.input = input;
   const created = await client.call<{ id: string }>("schedule.create", params);
   const schedule = (await listSchedules(workflowId)).find((s) => s.id === created.id);
@@ -492,7 +514,10 @@ export async function deleteSchedule(id: string): Promise<void> {
 }
 
 export async function createWebhook(workflowId: string): Promise<Webhook> {
-  return client.call<Webhook>("webhook.create", { workflow_id: workflowId });
+  return client.call<Webhook>("webhook.create", {
+    workflow_id: workflowId,
+    environment_id: selectedEnvironment.value,
+  });
 }
 
 export async function listWebhooks(workflowId?: string): Promise<Webhook[]> {

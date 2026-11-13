@@ -572,7 +572,14 @@ pub fn expand_templates(
     nodes: &Value,
     timeout: Duration,
 ) -> Result<Value, EngineError> {
-    expand_templates_impl(tpl, input, nodes, timeout, Some(JsLimits::default()))
+    expand_templates_impl(
+        tpl,
+        input,
+        nodes,
+        timeout,
+        Some(JsLimits::default()),
+        &Value::Null,
+    )
 }
 
 /// 模板展开的录制变体：注入确定性上下文后再展开。
@@ -598,6 +605,28 @@ pub fn expand_templates_recorded(
             determinism,
             ..JsLimits::default()
         }),
+        &Value::Null,
+    )
+}
+
+pub fn expand_templates_with_config(
+    tpl: &Value,
+    input: &Value,
+    nodes: &Value,
+    timeout: Duration,
+    determinism: Option<JsDeterminism>,
+    config: &Value,
+) -> Result<Value, EngineError> {
+    expand_templates_impl(
+        tpl,
+        input,
+        nodes,
+        timeout,
+        Some(JsLimits {
+            determinism,
+            ..JsLimits::default()
+        }),
+        config,
     )
 }
 /// 模板展开的内部实现：展开逻辑写成一段 JS 在沙箱里跑。
@@ -614,6 +643,7 @@ fn expand_templates_impl(
     nodes: &Value,
     timeout: Duration,
     limits: Option<JsLimits>,
+    config: &Value,
 ) -> Result<Value, EngineError> {
     let body = r#"    function __one(e) {
       var r = eval(e);
@@ -642,8 +672,9 @@ fn expand_templates_impl(
       return v;
     }
     return __expand(tpl, input, nodes);"#;
+    let body = format!("var config = {};\n{}", config, body);
     run_js_limited(
-        body,
+        &body,
         input,
         nodes,
         tpl,
@@ -1061,5 +1092,18 @@ mod tests {
             .unwrap();
             assert_eq!(json!(truthy(&value)), expected, "{value}");
         }
+    }
+}
+
+#[cfg(test)]
+mod environment_config_tests {
+    use super::*;
+    #[test]
+    fn templates_read_config_without_changing_input() {
+        let value=expand_templates_with_config(&serde_json::json!({"url":"${config.url}/path","count":"${config.count}","input":"${input.x}"}), &serde_json::json!({"x":7}), &Value::Null, Duration::from_secs(2), None, &serde_json::json!({"url":"https://example.test","count":3})).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"url":"https://example.test/path","count":3,"input":7})
+        );
     }
 }

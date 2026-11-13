@@ -1,3 +1,4 @@
+import { selectedEnvironment } from "./environments";
 import { computed, reactive, ref, shallowRef, watch, type ComputedRef } from "vue";
 import type { Connection } from "@vue-flow/core";
 import * as api from "../api/flow";
@@ -263,7 +264,10 @@ export async function ensureSecrets(): Promise<boolean> {
 
 async function loadSecrets(): Promise<boolean> {
   try {
-    editor.secrets = (await api.listSecrets()).map((s) => s.name);
+    const environmentId = selectedEnvironment.value;
+    const secrets = await api.listSecrets(environmentId);
+    if (selectedEnvironment.value !== environmentId) return false;
+    editor.secrets = secrets.map((s) => s.name);
     return true;
   } catch {
     return false;
