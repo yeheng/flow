@@ -247,3 +247,50 @@ pub fn page(
         snapshot_cursor,
     })
 }
+
+/// 数据集级权限事件（run 外事实：workflow_permissions_changed /
+/// plugin_grant_upserted；09 §10.3 审计「谁改了上限 / 谁授予了插件」）。
+/// 从 `from_lsn`（含）起按 (lsn, event_index) 序返回，最多 `limit` 条。
+pub fn dataset_permission_events(
+    root: &std::path::Path,
+    identity: &str,
+    from_lsn: u64,
+    limit: usize,
+) -> Result<Vec<PositionedEvent>> {
+    let conn = crate::sqlite::read_connection(root)?;
+    if crate::sqlite::metadata(&conn)?.0 != identity {
+        return Err(invalid("foreign dataset"));
+    }
+    let mut statement = conn
+        .prepare(
+            "SELECT lsn, event_index, body FROM events \
+             WHERE run_id IS NULL AND lsn >= ? ORDER BY lsn, event_index LIMIT ?",
+        )
+        .map_err(crate::sqlite::db)?;
+    let rows = statement
+        .query_map(
+            rusqlite::params![format!("{:020}", from_lsn), limit.clamp(1, 1024) as i64],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .map_err(crate::sqlite::db)?;
+    let mut events = Vec::new();
+    for row in rows {
+        let (lsn, index, body) = row.map_err(crate::sqlite::db)?;
+        let lsn: u64 = lsn.parse().map_err(|_| invalid("invalid fact sequence"))?;
+        let event: Event = serde_json::from_str(&body).map_err(|e| invalid(e.to_string()))?;
+        if is_permission_kind(&event) {
+            events.push(PositionedEvent {
+                lsn,
+                event_index: index as usize,
+                event,
+            });
+        }
+    }
+    Ok(events)
+}

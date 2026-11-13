@@ -1999,10 +1999,14 @@ impl State {
                 let request = &asked.request;
                 // 自报 hash 必须等于请求 canonical 摘要；请求上下文必须指向
                 // 本节点的当前派发（插件自报 node_id 不能改变 master 的绑定）。
+                // 动态插件节点（类型不在内置闭集内）无 concrete spec：需求是
+                // manifest 声明的模式（G4），specs 合法为空。
+                let dynamic_plugin_node =
+                    crate::model::NodeType::parse(&request.context.node_type).is_none();
                 if request.request_hash != request.compute_hash()
                     || request.context.dispatch_id != node.dispatch_id
                     || request.context.node_id != node_id
-                    || request.specs.is_empty()
+                    || (!dynamic_plugin_node && request.specs.is_empty())
                     || asked.deadline <= asked.asked_at
                 {
                     return Err(invalid("invalid permission ask identity"));

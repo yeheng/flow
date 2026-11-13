@@ -170,6 +170,159 @@ fn deny(matched: Vec<String>, layer: &str) -> Evaluation {
 }
 
 // ---------------------------------------------------------------------------
+// G4：动态插件节点的需求包含评估（09 §7）
+// ---------------------------------------------------------------------------
+
+/// G4 评估输入：插件 manifest 声明的 required 能力是**模式**而非具体请求。
+/// `unrestricted = true` 表示 manifest 未声明（legacy-unrestricted）：需求
+/// 不可枚举，只能逐次人工确认。
+pub struct PluginNeedsInput<'a> {
+    pub plugin_id: &'a str,
+    pub node_id: &'a str,
+    pub actor: &'a Principal,
+    /// manifest 声明的 required 能力（Declared 时非空可空；Legacy 时为空）。
+    pub needs: &'a [Capability],
+    /// 请求指纹：节点参数 + manifest 需求的 canonical 摘要（Run 授权用它
+    /// 绑定「精确重复」）。
+    pub request_fingerprint: &'a str,
+    /// manifest 是否未声明（legacy-unrestricted，已由管理员确认授予）。
+    pub unrestricted: bool,
+}
+
+/// G4：动态插件节点的授权评估。问题从「层覆盖具体请求」变为
+/// 「层覆盖 manifest 声明的需求模式」：层间 AND、层内 OR、命中项 Ask
+/// 即需询问，与 [`check`] 同构；区别仅在匹配语义用
+/// [`ResourcePattern::covers`](flow_dto::permission::ResourcePattern::covers)。
+/// Run 精确授权以空 specs + 请求指纹派生摘要（无具体请求可枚举）。
+pub fn check_plugin_needs(
+    input: &PluginNeedsInput<'_>,
+    policy: &FrozenPolicy,
+    run_approvals: &[RunApproval],
+    evaluated_at: DateTime<Utc>,
+) -> Evaluation {
+    // 插件进程的副作用面不可枚举：Plan 下无法证明只读，一律拒绝。
+    if policy.mode == ExecutionMode::Plan {
+        return Evaluation::Deny {
+            reason: "plan 模式禁止插件节点（无法证明只读）".into(),
+            matched: vec![],
+        };
+    }
+    if policy.legacy {
+        return Evaluation::Deny {
+            reason: "legacy 工作流未声明权限块；迁移（添加 permissions）后才能执行外部操作".into(),
+            matched: vec![],
+        };
+    }
+    let Some(ceiling) = policy
+        .plugin_ceilings
+        .iter()
+        .find(|c| c.plugin_id == input.plugin_id)
+    else {
+        return Evaluation::Deny {
+            reason: format!("插件 {} 无授予记录（待授予状态拒绝执行）", input.plugin_id),
+            matched: vec![],
+        };
+    };
+    // legacy-unrestricted：需求不可枚举，节点/workflow 层约束不了它；
+    // 已由管理员确认授予 → 逐次人工确认（Run 精确授权可免同指纹重复）。
+    if input.unrestricted {
+        let digest = flow_dto::permission::run_approval_digest(
+            input.actor,
+            &[],
+            input.request_fingerprint,
+            &policy.digest,
+        );
+        let approved = run_approvals.iter().any(|approval| {
+            approval.node_id == input.node_id
+                && approval.digest == digest
+                && approval.expires_at.is_none_or(|at| at > evaluated_at)
+        });
+        let label = format!("plugin:{}:legacy-confirmed", input.plugin_id);
+        if approved {
+            return Evaluation::Allow {
+                matched: vec![label, "run-approval".into()],
+            };
+        }
+        return Evaluation::Ask {
+            matched: vec![label],
+        };
+    }
+    let mut matched: Vec<String> = Vec::new();
+    let mut ask = false;
+    let mut layers: Vec<(&[Capability], String)> = Vec::new();
+    layers.push((&ceiling.allow, format!("plugin:{}", input.plugin_id)));
+    layers.push((policy.workflow.allow.as_slice(), "workflow".to_string()));
+    if let Some(NodePermissions::Restrict { allow }) = policy.nodes.get(input.node_id) {
+        layers.push((allow.as_slice(), "node".to_string()));
+    }
+    for ceiling in &policy.ceilings {
+        layers.push((ceiling.allow.as_slice(), ceiling.source.clone()));
+    }
+    for (allow, layer) in &layers {
+        if !covers_layer(
+            allow,
+            input.needs,
+            evaluated_at,
+            layer,
+            &mut matched,
+            &mut ask,
+        ) {
+            return deny(matched, layer);
+        }
+    }
+    if ask {
+        let digest = flow_dto::permission::run_approval_digest(
+            input.actor,
+            &[],
+            input.request_fingerprint,
+            &policy.digest,
+        );
+        let approved = run_approvals.iter().any(|approval| {
+            approval.node_id == input.node_id
+                && approval.digest == digest
+                && approval.expires_at.is_none_or(|at| at > evaluated_at)
+        });
+        if !approved {
+            return Evaluation::Ask { matched };
+        }
+        matched.push("run-approval".into());
+    }
+    Evaluation::Allow { matched }
+}
+
+/// [`evaluate_layer`] 的模式版：全部需求都被层内某个未过期能力覆盖才算
+/// 满足；命中 Ask 即询问（层内 OR、层间 AND、跨层 OR 询问）。
+fn covers_layer(
+    layer: &[Capability],
+    needs: &[Capability],
+    now: DateTime<Utc>,
+    layer_name: &str,
+    matched: &mut Vec<String>,
+    ask: &mut bool,
+) -> bool {
+    for need in needs {
+        let mut hit = false;
+        for capability in layer {
+            let live = capability.expires_at.is_none_or(|at| at > now);
+            if live && capability.pattern.covers(&need.pattern) {
+                hit = true;
+                let label = format!("{layer_name}:{}", capability.id);
+                if !matched.contains(&label) {
+                    matched.push(label);
+                }
+                if capability.approval == Approval::Ask {
+                    *ask = true;
+                }
+            }
+        }
+        if !hit {
+            return false;
+        }
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
 // G2：策略冻结与静态门
 // ---------------------------------------------------------------------------
 
@@ -296,25 +449,24 @@ pub async fn plugin_ceilings(
             wanted
                 .iter()
                 .filter_map(|plugin_id| {
-                    // 首选精确内容哈希；否则该插件任意最新授予（哈希执法在
-                    // 执行器上报侧，见 P1 协议）。
+                    // I35：授予以 (plugin_id, content_hash) 为键——二进制或
+                    // manifest 变化后旧授予不再适用（换内容必须重新授予）。
+                    // identity 不可得时（目录不可读）才退回该插件任意最新授予，
+                    // 由执行器上报哈希侧再核验。
                     let identity = crate::plugin_registry::bundled_or_discovered(plugin_id);
-                    let grant = state
-                        .plugin_grants
-                        .values()
-                        .filter(|grant| grant.plugin_id == *plugin_id)
-                        .max_by_key(|grant| grant.granted_at.clone())
-                        .cloned()
-                        .or_else(|| {
-                            identity.as_ref().and_then(|identity| {
-                                state
-                                    .plugin_grants
-                                    .get(&flow_engine::journal_state::PluginGrant::key(
-                                        plugin_id,
-                                        &identity.content_hash,
-                                    ))
-                                    .cloned()
-                            })
+                    // I35：只认 (plugin_id, 当前内容哈希) 的精确授予——
+                    // 二进制或 manifest 变化后旧授予不再适用（换内容必须
+                    // 重新授予）。
+                    let grant = identity
+                        .as_ref()
+                        .and_then(|identity| {
+                            state
+                                .plugin_grants
+                                .get(&flow_engine::journal_state::PluginGrant::key(
+                                    plugin_id,
+                                    &identity.content_hash,
+                                ))
+                                .cloned()
                         })
                         // 测试兜底：进程内测试没有启动期授予时，内置插件按其
                         // 声明能力给一个瞬态上限（不落 journal；生产路径恒有
@@ -358,9 +510,7 @@ pub async fn plugin_ceilings(
                     } else {
                         grant.capabilities.clone()
                     };
-                    let content_hash = identity
-                        .map(|identity| identity.content_hash)
-                        .unwrap_or(grant.content_hash.clone());
+                    let content_hash = grant.content_hash.clone();
                     Some(PluginCeiling {
                         plugin_id: plugin_id.clone(),
                         content_hash,
@@ -391,6 +541,50 @@ pub fn plugin_id_for_node(
     }
 }
 
+/// G4：动态插件节点的需求来源（master 侧 manifest，不信任执行器自报）：
+/// `(plugin_id, required 能力, 是否 legacy-unrestricted)`。插件未部署返回
+/// `None`（派发层按能力拒绝收口）。
+pub fn plugin_needs_for_type(node_type: &str) -> Option<(String, Vec<Capability>, bool)> {
+    let plugin_id = crate::plugin_registry::bundled_or_discovered_by_type(node_type)?;
+    let identity = crate::plugin_registry::bundled_or_discovered(&plugin_id)?;
+    let needs = identity
+        .capabilities
+        .as_ref()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|entry| entry.required)
+                .map(|entry| entry.capability.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    Some((plugin_id, needs, identity.legacy))
+}
+
+/// G4/I35：执行器上报的插件身份（id + 内容哈希）必须与 master 侧一致且
+/// 与冻结授予同哈希——远程执行器二进制与授予快照脱钩时拒绝执行。
+pub fn verify_plugin_identity(
+    expected_id: &str,
+    expected_hash: &str,
+    reported: &serde_json::Value,
+) -> Result<(), String> {
+    let id = reported["id"].as_str().unwrap_or_default();
+    let hash = reported["content_hash"].as_str().unwrap_or_default();
+    if id != expected_id {
+        return Err(format!(
+            "插件身份不符：执行器上报 {id:?}，策略冻结 {expected_id:?}"
+        ));
+    }
+    if !expected_hash.is_empty() && hash != expected_hash {
+        return Err(format!(
+            "插件 {expected_id} 内容哈希与授予时不符（执行器 {}，授予 {}）：需重新授予后才能执行（I35）",
+            &hash[..8.min(hash.len())],
+            &expected_hash[..8.min(expected_hash.len())],
+        ));
+    }
+    Ok(())
+}
+
 /// 测试钩子（FLOW_TEST_AUTO_GOVERN=1）：legacy 定义按**运行期已知事实**
 /// 合成精确权限块——节点字面参数 + 冻结的 agent 配置。产品语义不受影响
 ///（生产不设此变量）：legacy 定义照旧被静态门拒绝。
@@ -403,16 +597,6 @@ pub fn auto_govern_for_tests(
     agent: Option<&flow_dto::AgentRunConfig>,
 ) -> flow_engine::Definition {
     use flow_dto::permission::{Capability, ResourcePattern, WorkflowPermissions};
-    // 只含动态插件节点的定义保持 legacy：legacy 门只拦内置副作用节点，动态
-    // 节点照旧运行（G4 接入前 plugin_node 无授权步，受管反而会被门拒绝）。
-    let has_dynamic = definition.nodes.iter().any(|node| node.kind().is_none());
-    let has_builtin_side_effect = definition.nodes.iter().any(|node| {
-        node.kind()
-            .is_some_and(flow_engine::NodeType::has_side_effect)
-    });
-    if has_dynamic && !has_builtin_side_effect {
-        return definition.clone();
-    }
     let mut allow: Vec<Capability> = Vec::new();
     let mut push = |pattern: ResourcePattern| {
         let id = format!("auto-{}", allow.len());
@@ -539,9 +723,25 @@ pub fn auto_govern_for_tests(
                 }
             }
             _ => {
-                // 动态插件节点：调用不经 G3（plugin_node 无授权步），受管工作流
-                // 会被静态门拒绝（fail-closed，接入 G4 前不伪装已受管）。
-                // 这里不注入能力，让 legacy 路径保持现状（未受管执行）。
+                // G4：动态插件节点同样受管。Declared manifest 的 required 能力
+                // 合成进 workflow 层（manifest 专用变体 Any/ExecProgram 无法
+                // 在 workflow 层表达，跳过——这类用例需显式权限）；Legacy
+                // manifest 需求不可枚举，不注入（派发层的测试钩子免裁）。
+                if let Some(plugin_id) =
+                    crate::plugin_registry::bundled_or_discovered_by_type(&node.node_type)
+                {
+                    if let Some(identity) =
+                        crate::plugin_registry::bundled_or_discovered(&plugin_id)
+                    {
+                        if let Some(capabilities) = identity.capabilities.as_ref() {
+                            for entry in capabilities.iter().filter(|entry| entry.required) {
+                                if !entry.capability.pattern.is_manifest_only() {
+                                    push(entry.capability.pattern.clone());
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -589,12 +789,16 @@ pub fn definition_permissions_digest(definition: &flow_engine::Definition) -> Op
     })))
 }
 
-/// 启动静态门（G2 前置）：legacy 定义含副作用节点 → 拒绝启动并提示迁移；
-/// 受管定义里首版尚不支持的组合 → 拒绝（fail-closed，不能伪装已受管）。
+/// 启动静态门（G2 前置）：legacy 定义含副作用节点（内置副作用或动态
+/// 插件节点，方案已确认决策 2）→ 拒绝启动并提示迁移；受管定义里的动态
+/// 插件节点要求插件已部署且已授予（G4，逐次裁决在派发层）。
 ///
 /// # Errors
 /// 返回面向用户的拒绝原因（RPC `-32020`）。
-pub fn start_gate(definition: &flow_engine::Definition) -> Result<(), String> {
+pub fn start_gate(
+    definition: &flow_engine::Definition,
+    plugin_ceilings: &[flow_dto::permission::PluginCeiling],
+) -> Result<(), String> {
     match &definition.permissions {
         None => {
             let side_effects: Vec<&str> = definition
@@ -606,19 +810,37 @@ pub fn start_gate(definition: &flow_engine::Definition) -> Result<(), String> {
                 return Ok(());
             }
             Err(format!(
-                "工作流未声明权限块（legacy），含副作用节点 {}：需由管理员迁移（添加 \
+                "工作流未声明权限块（legacy），含副作用节点 {}（含动态插件节点）：需由管理员迁移（添加 \
                  permissions 并显式授予能力）后才能启动新 run",
                 side_effects.join(", ")
             ))
         }
         Some(_permissions) => {
-            // 动态插件节点的调用不经 G3（plugin_node 无授权步）：插件授予
-            // 链路接入前不能伪装已受管，fail-closed（G4 待接入）。
-            if let Some(node) = definition.nodes.iter().find(|n| n.kind().is_none()) {
-                return Err(format!(
-                    "动态插件节点 {}（{}）尚未接入插件授予，权限工作流中不能执行",
-                    node.id, node.node_type
-                ));
+            // G4：动态插件节点走授予链路（manifest 声明 ⊆ 授予 ∩ workflow \
+            // ∩ node，派发时逐次裁决）；启动门只把未部署/未授予的挑出来，
+            // fail-fast（-32020 列出节点）。
+            let mut missing: Vec<String> = Vec::new();
+            for node in definition.nodes.iter().filter(|n| n.kind().is_none()) {
+                match crate::plugin_registry::bundled_or_discovered_by_type(&node.node_type) {
+                    None => missing.push(format!(
+                        "节点 {} 的插件类型 {} 未部署（manifest 缺失或已下架）",
+                        node.id, node.node_type
+                    )),
+                    Some(plugin_id) => {
+                        if !plugin_ceilings
+                            .iter()
+                            .any(|ceiling| ceiling.plugin_id == plugin_id)
+                        {
+                            missing.push(format!(
+                                "节点 {} 依赖的插件 {plugin_id} 未授予（permissions.grant 后才能运行）",
+                                node.id
+                            ));
+                        }
+                    }
+                }
+            }
+            if !missing.is_empty() {
+                return Err(missing.join("；"));
             }
             // Plan + harness agent：工具已受管（变更性工具本地 + master 双重
             // 提前拒绝），允许启动。
@@ -666,7 +888,7 @@ fn evaluate_layer(
 mod tests {
     use super::*;
     use flow_dto::permission::{
-        parse_capability, parse_workflow_permissions, CeilingLayer, PluginCeiling,
+        parse_capability, parse_workflow_permissions, CeilingLayer, PluginCeiling, ResourcePattern,
         WorkflowPermissions,
     };
     use serde_json::json;
@@ -764,6 +986,39 @@ mod tests {
         ) {
             Evaluation::Deny { reason, .. } => assert!(reason.contains("workflow"), "{reason}"),
             other => panic!("expected deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proxied_request_requires_net_capability_for_proxy_origin() {
+        // 带代理的请求是两条需求（目标 + 代理 origin）：只授目标 → Deny。
+        let target_only = policy(vec![net_cap("t", "https://api.example.com/", "auto")]);
+        let proxied = vec![
+            http_spec("https://api.example.com/x"),
+            OperationSpec::Http {
+                method: "POST".into(),
+                url: "http://proxy.local:8080/".into(),
+                headers_digest: "0".repeat(64),
+                body_digest: "0".repeat(64),
+            },
+        ];
+        match check_now(&proxied, &target_only, &[]) {
+            Evaluation::Deny { reason, .. } => {
+                assert!(reason.contains("workflow"), "{reason}")
+            }
+            other => panic!("expected deny without proxy capability, got {other:?}"),
+        }
+        // 目标与代理都授 → Allow，且 matched 记录两条能力。
+        let both = policy(vec![
+            net_cap("t", "https://api.example.com/", "auto"),
+            net_cap("p", "http://proxy.local:8080/", "auto"),
+        ]);
+        match check_now(&proxied, &both, &[]) {
+            Evaluation::Allow { matched } => {
+                assert!(matched.contains(&"workflow:t".to_string()));
+                assert!(matched.contains(&"workflow:p".to_string()));
+            }
+            other => panic!("expected allow with both capabilities, got {other:?}"),
         }
     }
 
@@ -1033,5 +1288,264 @@ mod tests {
         );
         assert_ne!(a.digest, b.digest);
         assert!(a.digest_is_consistent());
+    }
+
+    // -----------------------------------------------------------------
+    // G4：check_plugin_needs 真值表
+    // -----------------------------------------------------------------
+
+    fn need_cap(id: &str, pattern: ResourcePattern) -> Capability {
+        Capability {
+            id: id.to_string(),
+            pattern,
+            approval: Approval::Auto,
+            expires_at: None,
+        }
+    }
+
+    fn plugin_policy(allow: Vec<Capability>, grant: Vec<Capability>) -> FrozenPolicy {
+        frozen(
+            ExecutionMode::Execute,
+            allow,
+            BTreeMap::new(),
+            vec![],
+            vec![PluginCeiling {
+                plugin_id: "demo".into(),
+                content_hash: "0".repeat(64),
+                allow: grant,
+            }],
+        )
+    }
+
+    fn needs_input<'a>(needs: &'a [Capability], fingerprint: &'a str) -> PluginNeedsInput<'a> {
+        PluginNeedsInput {
+            plugin_id: "demo",
+            node_id: "n",
+            actor: &ACTOR,
+            needs,
+            request_fingerprint: fingerprint,
+            unrestricted: false,
+        }
+    }
+
+    fn check_needs(
+        needs: &[Capability],
+        policy: &FrozenPolicy,
+        approvals: &[RunApproval],
+    ) -> Evaluation {
+        check_plugin_needs(&needs_input(needs, "fp"), policy, approvals, Utc::now())
+    }
+
+    #[test]
+    fn plugin_needs_covered_by_all_layers_allows() {
+        let need = need_cap(
+            "m-net",
+            ResourcePattern::Net {
+                methods: vec!["GET".into()],
+                url_prefix: "https://api.example.com/v1/".into(),
+            },
+        );
+        // workflow 层比需求更宽（多方法 + 更短前缀）；授予层与需求同宽。
+        let policy = plugin_policy(
+            vec![need_cap(
+                "w-net",
+                ResourcePattern::Net {
+                    methods: vec!["GET".into(), "POST".into()],
+                    url_prefix: "https://api.example.com/".into(),
+                },
+            )],
+            vec![need.clone()],
+        );
+        match check_needs(&[need], &policy, &[]) {
+            Evaluation::Allow { matched } => {
+                assert!(
+                    matched.contains(&"workflow:w-net".to_string()),
+                    "{matched:?}"
+                );
+                assert!(
+                    matched.contains(&"plugin:demo:m-net".to_string()),
+                    "{matched:?}"
+                );
+            }
+            other => panic!("expected allow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plugin_needs_workflow_gap_denies() {
+        let need = need_cap(
+            "m-net",
+            ResourcePattern::Net {
+                methods: vec!["POST".into()],
+                url_prefix: "https://api.example.com/v1/".into(),
+            },
+        );
+        // workflow 只给了 GET：覆盖不了 POST 需求。
+        let policy = plugin_policy(
+            vec![need_cap(
+                "w-net",
+                ResourcePattern::Net {
+                    methods: vec!["GET".into()],
+                    url_prefix: "https://api.example.com/".into(),
+                },
+            )],
+            vec![need.clone()],
+        );
+        match check_needs(&[need], &policy, &[]) {
+            Evaluation::Deny { reason, .. } => assert!(reason.contains("workflow"), "{reason}"),
+            other => panic!("expected deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plugin_needs_ask_propagates_and_run_approval_exempts() {
+        let need = need_cap(
+            "m-net",
+            ResourcePattern::Net {
+                methods: vec!["GET".into()],
+                url_prefix: "https://api.example.com/".into(),
+            },
+        );
+        let ask_grant = Capability {
+            approval: Approval::Ask,
+            ..need.clone()
+        };
+        let policy = plugin_policy(vec![need.clone()], vec![ask_grant]);
+        match check_needs(std::slice::from_ref(&need), &policy, &[]) {
+            Evaluation::Ask { .. } => {}
+            other => panic!("expected ask, got {other:?}"),
+        }
+        // Run 授权摘要 = (actor, 空 specs, fingerprint, policy digest)。
+        let digest = flow_dto::permission::run_approval_digest(&ACTOR, &[], "fp", &policy.digest);
+        let approvals = [RunApproval {
+            node_id: "n".into(),
+            actor: ACTOR.clone(),
+            digest,
+            expires_at: None,
+            by: Principal::System,
+        }];
+        match check_needs(&[need], &policy, &approvals) {
+            Evaluation::Allow { matched } => assert!(matched.contains(&"run-approval".to_string())),
+            other => panic!("expected allow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plugin_needs_unrestricted_asks_every_dispatch() {
+        let policy = plugin_policy(vec![], vec![]);
+        let mut input = needs_input(&[], "fp");
+        input.unrestricted = true;
+        match check_plugin_needs(&input, &policy, &[], Utc::now()) {
+            Evaluation::Ask { matched } => {
+                assert_eq!(matched, vec!["plugin:demo:legacy-confirmed".to_string()])
+            }
+            other => panic!("expected ask, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plugin_needs_plan_and_missing_grant_deny() {
+        let need = need_cap(
+            "m-net",
+            ResourcePattern::Net {
+                methods: vec!["GET".into()],
+                url_prefix: "https://api.example.com/".into(),
+            },
+        );
+        // Plan：不可证明只读 → 拒绝。
+        let plan = frozen(
+            ExecutionMode::Plan,
+            vec![need.clone()],
+            BTreeMap::new(),
+            vec![],
+            vec![PluginCeiling {
+                plugin_id: "demo".into(),
+                content_hash: "0".repeat(64),
+                allow: vec![need.clone()],
+            }],
+        );
+        match check_needs(std::slice::from_ref(&need), &plan, &[]) {
+            Evaluation::Deny { reason, .. } => assert!(reason.contains("plan"), "{reason}"),
+            other => panic!("expected deny, got {other:?}"),
+        }
+        // 未授予：无 ceiling → 拒绝。
+        let ungranted = policy(vec![need]);
+        match check_needs(&[], &ungranted, &[]) {
+            Evaluation::Deny { reason, .. } => assert!(reason.contains("授予"), "{reason}"),
+            other => panic!("expected deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plugin_needs_expired_capability_does_not_cover() {
+        let need = need_cap(
+            "m-net",
+            ResourcePattern::Net {
+                methods: vec!["GET".into()],
+                url_prefix: "https://api.example.com/".into(),
+            },
+        );
+        let expired = Capability {
+            expires_at: Some(Utc::now() - chrono::Duration::hours(1)),
+            ..need.clone()
+        };
+        let policy = plugin_policy(vec![need.clone()], vec![expired]);
+        match check_needs(&[need], &policy, &[]) {
+            Evaluation::Deny { reason, .. } => assert!(reason.contains("plugin"), "{reason}"),
+            other => panic!("expected deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plugin_needs_node_restrict_narrows_workflow() {
+        let need = need_cap(
+            "m-net",
+            ResourcePattern::Net {
+                methods: vec!["GET".into()],
+                url_prefix: "https://api.example.com/".into(),
+            },
+        );
+        // node Restrict 为空层：盖不住任何需求 → Deny（层间 AND）。
+        let policy = frozen(
+            ExecutionMode::Execute,
+            vec![need.clone()],
+            restrict(vec![]),
+            vec![],
+            vec![PluginCeiling {
+                plugin_id: "demo".into(),
+                content_hash: "0".repeat(64),
+                allow: vec![need.clone()],
+            }],
+        );
+        match check_needs(&[need], &policy, &[]) {
+            Evaluation::Deny { reason, .. } => assert!(reason.contains("node"), "{reason}"),
+            other => panic!("expected deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plugin_needs_empty_declared_allows_without_asking() {
+        // 声明了权限但无 required 能力：插件自我声明无外部动作 → 直接放行。
+        let policy = plugin_policy(vec![], vec![]);
+        match check_needs(&[], &policy, &[]) {
+            Evaluation::Allow { matched } => assert!(matched.is_empty()),
+            other => panic!("expected allow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plugin_identity_verification_binds_content_hash() {
+        let reported = json!({"id": "demo", "content_hash": "a".repeat(64)});
+        assert!(verify_plugin_identity("demo", &"a".repeat(64), &reported).is_ok());
+        // 哈希不符（换二进制未重授予）→ 拒绝。
+        let mismatch = verify_plugin_identity("demo", &"b".repeat(64), &reported)
+            .expect_err("hash mismatch must fail");
+        assert!(mismatch.contains("I35"), "{mismatch}");
+        // id 不符 → 拒绝。
+        let id_mismatch = verify_plugin_identity("other", &"a".repeat(64), &reported)
+            .expect_err("id mismatch must fail");
+        assert!(id_mismatch.contains("身份不符"), "{id_mismatch}");
+        // 期望哈希未知（无冻结 ceiling）：不拦截（交给层缺失拒绝）。
+        assert!(verify_plugin_identity("demo", "", &reported).is_ok());
     }
 }

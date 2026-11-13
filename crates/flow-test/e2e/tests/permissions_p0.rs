@@ -5,7 +5,7 @@
 //! §6（审批流）、§12.1（I26–I34）。全部用本地 stub 与真实执行器进程。
 
 use flow_e2e::e2e_test;
-use flow_test_support::fixtures::{http_def, http_def_full, timeline_node, StubHttp};
+use flow_test_support::fixtures::{governed, http_def, http_def_full, timeline_node, StubHttp};
 /// Net 能力条目（测试本地形状）。
 fn net_cap(id: &str, method: &str, prefix: &str, approval: &str) -> Value {
     json!({"id": id, "action": "net", "methods": [method], "url_prefix": prefix,
@@ -689,6 +689,58 @@ e2e_test!(workflow_permissions_change_is_audited, |ctx: &mut Ctx| {
         assert_eq!(run["run"]["status"], json!("succeeded"), "{run}");
     })
 });
+
+e2e_test!(
+    proxy_egress_denied_without_net_capability_for_proxy_origin,
+    |ctx: &mut Ctx| {
+        Box::pin(async move {
+            let target = StubHttp::fixed(200, json!({"ok": true})).await;
+            let proxy = StubHttp::fixed(200, json!({"via": "proxy"})).await;
+            // 只授目标源站：代理 origin 无能力 → Deny；目标与代理都零请求
+            //（字节实际去向是代理主机，代理出站必须单独授权）。
+            let definition = governed(
+                &http_def_full(json!({
+                    "method": "GET",
+                    "url": target.url("/x"),
+                    "proxy": proxy.url(""),
+                })),
+                json!([net_cap("w-net", "GET", &stub_root(&target.url("/x")), "auto")]),
+            );
+            let client = ctx.client().await;
+            let (workflow_id, _) = publish_legacy_workflow(&client, "proxy 无能力", definition).await;
+            let run_id = start_run(&client, &workflow_id, json!({})).await;
+            let run = wait_run_terminal(&client, &run_id, TIMEOUT).await;
+            assert_eq!(run["run"]["status"], json!("failed"), "{run}");
+            assert!(
+                run["run"]["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("permission denied"),
+                "{run}"
+            );
+            assert!(target.requests().is_empty(), "目标零请求");
+            assert!(proxy.requests().is_empty(), "代理零请求：Deny 先于任何出站");
+            // 补上代理能力后同一形状成功（正向路径另由 http_calls 的显式代理
+            // 用例覆盖，这里补齐最小对照）。
+            let both = governed(
+                &http_def_full(json!({
+                    "method": "GET",
+                    "url": target.url("/x"),
+                    "proxy": proxy.url(""),
+                })),
+                json!([
+                    net_cap("w-net", "GET", &stub_root(&target.url("/x")), "auto"),
+                    net_cap("w-proxy", "GET", &stub_root(&proxy.url("")), "auto"),
+                ]),
+            );
+            let (workflow_id, _) = publish_legacy_workflow(&client, "proxy 双能力", both).await;
+            let run_id = start_run(&client, &workflow_id, json!({})).await;
+            let run = wait_run_terminal(&client, &run_id, TIMEOUT).await;
+            assert_eq!(run["run"]["status"], json!("succeeded"), "{run}");
+            assert_eq!(proxy.requests().len(), 1, "代理收到一次请求");
+        })
+    }
+);
 
 /// 把 http_def 里的 placeholder URL 替换成真实 stub URL（保参数形状不变）。
 fn rewrite_url(mut definition: Value, url: &str) -> Value {

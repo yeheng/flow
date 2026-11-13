@@ -1,9 +1,11 @@
 # 插件线协议规范（wire.md）
 
-> 状态：v1（`protocol_version = 1`）。
+> 状态：v2（`protocol_version = 2`；v1 → v2：新增 `master_permit_v1` 能力
+> 与 `permission/request` 反向方法，见 §3.3 / §3.7 与 §8 变更记录）。
 > 本文档与 `crates/flow-plugin-sdk/tests/vectors/` 共同构成**对外契约本体**；
-> Rust crate `plugin-proto` 只是契约的一种实现，实现之间以本文档 + 向量为准。
-> 向量**只增不改**；改本文档的任何 wire 语义 = bump 主版本。
+> Rust crate `flow-plugin-sdk`（protocol + ipc 分层）只是契约的一种实现，
+> 实现之间以本文档 + 向量为准。向量**只增不改**；改本文档的任何 wire
+> 语义 = bump 主版本并在 §8 留痕。
 
 ## 0. 这份协议是什么
 
@@ -11,7 +13,7 @@
 字节流从哪来不在本规范范围内：本地 socket、named pipe、stdio、TCP 都行。
 本规范定义字节流里的帧与消息。
 
-**本地 spawn 的配套约定**（参考实现 `proc-ipc` crate）：
+**本地 spawn 的配套约定**（参考实现 `flow-plugin-sdk` ipc 模块）：
 
 - unix：宿主用 socketpair 建通道，在 exec 前把通道 dup2 到**固定号 3**，
   经环境变量 `PROC_IPC_FD`（恒为 `"3"`）告知子进程；其余继承 fd 一律
@@ -148,8 +150,8 @@ host                          plugin
 
 ```json
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{
-  "protocol_version":1,
-  "capabilities":["binary_blocks"],
+  "protocol_version":2,
+  "capabilities":["binary_blocks","master_permit_v1"],
   "client_info":{"name":"example-host","version":"1.2.3"}}}
 ```
 
@@ -163,8 +165,8 @@ host                          plugin
 
 ```json
 {"jsonrpc":"2.0","id":1,"result":{
-  "protocol_version":1,
-  "capabilities":["binary_blocks","reverse_requests"],
+  "protocol_version":2,
+  "capabilities":["binary_blocks","reverse_requests","master_permit_v1"],
   "server_info":{"name":"example-plugin","version":"0.3.0"}}}
 ```
 
@@ -176,6 +178,7 @@ host                          plugin
 | --- | --- |
 | `reverse_requests` | 宿主愿意接受插件发来的 **request**（反向调用） |
 | `binary_blocks` | 本侧接受 `kind=0x02` 帧 |
+| `master_permit_v1` | 宿主提供 master 权限裁决（`permission/request` 反向方法；09 §8）。受管插件必须协商此能力；未协商的插件在受管（声明了权限的工作流）中拒绝执行，握手缺少该能力即拒 |
 
 - 能力名是**闭集**：未知名字在握手时按 `-32602` 拒绝（闭集让「双方对
   同一个名字的理解」永远一致；新增能力名 = bump 次版本）。
@@ -208,6 +211,36 @@ unix fd 承载无需令牌（fd 本身就是能力）：双方均省略该字段
 `initialize_response` 与 `initialize_response_with_token` 的差异）。
 
 ### 3.6 兼容性说明
+
+### 3.7 `permission/request`（v2：插件 → 宿主反向请求，需 `reverse_requests` + `master_permit_v1`）
+
+受管插件在执行工具动作前，逐次向宿主请求裁决（09 权限模型 §8）：
+
+```json
+{"jsonrpc":"2.0","id":7,"method":"permission/request","params":{
+  "tool_call_id":"call-1",
+  "tool":"bash",
+  "params":{"command":"git status"},
+  "cwd":"/tmp/w"}}
+```
+
+```json
+{"jsonrpc":"2.0","id":7,"result":{
+  "allowed":true,
+  "operation_id":"0192a5f0-0000-7000-8000-000000000001",
+  "reason":null}}
+```
+
+- `tool_call_id`：发起方（agent 提供方）侧唯一；宿主按 `(tool_call_id, 请求摘要)`
+  去重**传输重试**（同一调用的新请求必新 id）；
+- `tool` / `params`：宿主按工具闭集派生需求集合，**插件自述仅供参考**，
+  授权以宿主派生为准；
+- `allowed=true` 绑定本次 `tool_call_id`，不得挪用；拒绝时 `reason` 面向展示；
+- `operation_id`：宿主分配的操作实例 id（审计关联）；
+- **fail-closed**：通道断开、超时、取消或宿主回错误 = 拒绝执行；等待裁决
+  期间插件不得自行放行。
+
+向量：`permission_request_request` / `permission_request_response`。
 
 ---
 
@@ -294,3 +327,12 @@ python3 examples/plugin-py/plugin_rpc.py     # 作为插件被宿主拉起
 
 维护规则：**改协议必须同时改三个地方**——本文档、向量集（只增不改）、
 两个参考实现；做不到就别改。
+
+---
+
+## 8. 变更记录
+
+| 版本 | 变更 | 破坏性 |
+| --- | --- | --- |
+| v1 | 初始契约：帧格式、JSON-RPC 子集、initialize 握手、binary 块 | — |
+| v2 | 新增 `master_permit_v1` 能力与 `permission/request` 反向方法（09 权限模型 §8）；向量新增 `permission_request_request` / `permission_request_response` | 否（主版本不变；老插件在受管工作流中被拒绝执行，语义由上层 09 §8 定义） |

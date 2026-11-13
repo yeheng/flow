@@ -27,27 +27,32 @@ flow 是一个**工作流执行引擎**：发布不可变的流程定义（DAG�
 crates/
   flow-dto        领域 DTO 与状态词汇表（零依赖叶子）：RunRecord / WorkflowSummary / …
   flow-config     统一配置（flow.toml，叶子 crate）：分层加载 + validate + 原子写回
-  flow-journal    SQLite 写入 owner、事实分页、codec 预算、BLOB 值存储、离线维护
+  flow-journal    SQLite 写入 owner、事实分页、codec 预算、BLOB 值存储、离线维护;
+                  query feature 承接同库只读执行与产品查询(原 flow-store 并入)
   flow-engine     执行引擎共享能力：定义模型与校验、JS 沙箱、表达式/模板、
                   journal_state（run 状态折叠）、观测日志、密钥、执行协议（v7 postcard 单流）
-  flow-store      同一 SQLite 库的只读执行与产品查询
   flow-backend    journal 唯一权威后端：journal.rs（JournalBackend）+ journal_commands
                   （产品 CRUD，request_id 幂等）+ journal_views（物化读面）+
                   journal_driver（协调循环）+ journal_execution（Attempt 簿记）+
                   journal_import（legacy 只读保全）+ execution/（ipc 池 / remote 派发）
-  flow-executor   受管理执行子进程：节点语义的唯一居所
+  flow-plugin-sdk 插件 SDK：protocol（wire 契约）+ ipc（传输）单向分层;
+                  跨语言契约本体是 docs/protocol/wire.md + vectors
+  flow-plugin-runtime  受管理执行子进程（bin: flow-executor）：节点语义的唯一居所;
+                  task 执行、插件注册表与会话、审计与传输
+  flow-internal-plugins  内置节点实现库：Script/Condition 求值器等静态实现
   flow-agent      受信任远程执行中继（单条 mTLS/WSS 上联 + 本机执行器池）
   flow-rpc        jsonrpsee WebSocket 服务：journal_v2（产品 RPC 面）+
                   journal_triggers（cron + webhook HTTP）+ journal_download（值下载）
   flow-cli        命令行客户端（纯 RPC，不碰存储）
-  flow-test-support  共享测试基建
-  backend-e2e     v2 产品面端到端矩阵（真起进程）
-  backend-perf    性能压测 harness（黑盒）
 
-plugins/harness/     独立 workspace：harness agent 运行时（agent-core /
-                 agent-host，自 flow 仓库迁出）+ flow-agent-plugin 插件
-                 服务进程。执行器 spawn 插件并经 plugin-proto 对话，
-                 不再链接 agent 运行时（见 plugins/harness/README.md）。
+crates/flow-test/ 测试归组：test-support（共享基建）/ e2e（单机端到端，真起进程）/
+                  e2e-remote（远程端到端）/ performance（性能压测）。
+
+plugins/harness/  harness agent 运行时（protocol / agent-core / agent-host / plugin,
+                  独立版本与进程,但共享根 workspace 与锁文件)+ 插件服务进程;
+                  执行器 spawn 插件并经 plugin-proto 对话,不再链接 agent
+                  运行时（见 plugins/harness/README.md）。plugins/llm/ 为
+                  LLM 插件（独立版本与进程）。
 ```
 
 产品二进制按职责分属各自 crate，**没有统一多路入口**：
@@ -56,32 +61,33 @@ plugins/harness/     独立 workspace：harness agent 运行时（agent-core /
 | --- | --- | --- |
 | `flow-journal-server` | flow-rpc | SQLite 产品服务（WS RPC + cron + webhook + 下载） |
 | `flow-cli` | flow-cli | 命令行客户端（纯 RPC） |
-| `flow-executor` | flow-executor | 受管理执行子进程（通道 FD 经 argv `--channel-fd` 传递） |
+| `flow-executor` | flow-plugin-runtime | 受管理执行子进程（通道 FD 经 argv `--channel-fd` 传递） |
 | `flow-agent` | flow-agent | 受信任远程执行中继 |
 | `flow-journal-tool` | flow-journal | journal 离线维护（verify/rebuild-index/backup） |
 | `flow-journal-dev` | flow-backend | 开发运行器（run/resume/status/import-legacy），含 `check-projection` 事实重放校验 |
 | `flow-journal-bench` | flow-journal | journal 写入基准 |
 
-测试与压测面另有 `backend-e2e` 的 `flow-journal-server-e2e`、`backend-perf` 的
-`flow-perf` / `flow-capacity`，不属于产品二进制。
+测试与压测面另有 `flow-e2e` 的 `flow-journal-server-e2e` 与 `flow-performance`
+的压测二进制，不属于产品二进制。
 
 依赖方向（与 Cargo.toml 对齐的现状）：
 
 ```
 flow-rpc ──> flow-backend ──> flow-engine ──> flow-dto
-           ├─> flow-journal  （v2 值分页/下载）
-           ├─> flow-store    （同库只读查询）
+           ├─> flow-journal  （storage+query：v2 值分页/下载与同库只读查询）
            └─> flow-config
-flow-backend ──> flow-journal / flow-engine / flow-dto / flow-store / flow-config
+flow-backend ──> flow-journal / flow-engine / flow-dto / flow-config
 flow-engine ──> flow-dto
              └─> flow-journal（只共享 StoredValue/ValueRef 词汇与 codec 预算）
 flow-journal ──> 无 flow 依赖（叶子）
 flow-dto ──> 无依赖（叶子）
-flow-agent / flow-executor ──> flow-engine, flow-journal（执行协议两侧）
+flow-plugin-runtime ──> flow-plugin-sdk / flow-engine / flow-journal / flow-config
+                       / flow-internal-plugins / plugins/harness/protocol
+flow-agent ──> flow-engine, flow-journal（执行协议两侧）
 flow-cli ──> flow-dto（自带 jsonrpsee/reqwest WS 客户端，运行期连 flow-journal-server，
             但不依赖任何服务 crate）
-flow-cli ──✗> flow-store    ✗（CLI 不碰存储与事件日志，没有第二条写入路径）
-remote-e2e ──> flow-agent   （flow-agent 只被 remote-e2e 套件依赖；backend 不依赖它）
+flow-cli ──✗> flow-journal  ✗（CLI 不碰存储与事件日志，没有第二条写入路径）
+flow-e2e-remote ──> flow-agent   （flow-agent 只被 remote-e2e 套件依赖；backend 不依赖它）
 ```
 
 ### 2.2 架构图：三条链路
@@ -112,7 +118,7 @@ graph TB
         BE["JournalBackend<br/>flow-backend"]
         COORD["协调循环<br/>journal_driver::Coordinator"]
         W["Journal 写者线程<br/>flow-journal::Journal"]
-        PROJ["同库只读查询<br/>flow-store::store::Store"]
+        PROJ["同库只读查询<br/>flow-journal::query"]
         DISK[("data_dir/flow.sqlite<br/>事实 + 当前状态 + 回执 + BLOB")]
     end
 

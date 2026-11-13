@@ -7,9 +7,10 @@
 //! `publish_legacy_workflow`。
 //!
 //! 派生规则与 master 的 `policy::derive` 一一对应：
-//! - http_call：Net（全部方法 × URL 源站前缀）+ Secret（credential.secret_ref）；
+//! - http_call：Net（全部方法 × URL 源站前缀）+ Net（proxy origin，若设）
+//!   + Secret（credential.secret_ref）；
 //! - email：Net（POST 端点源站）+ SendEmail（字面收件人）+ Secret（api_key）；
-//! - llm：LlmCall（规范化端点 × body.model）+ Secret；
+//! - llm：LlmCall（规范化端点 × body.model）+ Net（proxy origin，若设）+ Secret；
 //! - harness command：Exec（字面绝对路径 + 精确 argv）或 Shell（`sh -c`）。
 //!
 //! 模板化目标（`${...}`）无法静态派生：源站之外的部分带模板时按源站前缀
@@ -77,6 +78,7 @@ pub fn derive_allow(definition: &Value) -> Vec<Value> {
                 if let Some(prefix) = params["url"].as_str().and_then(origin) {
                     push(net(&ALL_METHODS, &prefix));
                 }
+                proxy_origin(&params["proxy"], &mut push);
                 secret_ref(&params["credential"]["secret_ref"], &mut push);
             }
             Some("email") => {
@@ -110,6 +112,7 @@ pub fn derive_allow(definition: &Value) -> Vec<Value> {
                         "providers": [normalize_provider(provider)], "models": [model],
                         "approval": "auto"}));
                 }
+                proxy_origin(&params["proxy"], &mut push);
                 secret_ref(&params["credential"]["secret_ref"], &mut push);
             }
             Some("harness") if params["mode"].as_str() != Some("agent") => {
@@ -177,6 +180,19 @@ fn origin(url: &str) -> Option<String> {
         .map(|port| format!(":{port}"))
         .unwrap_or_default();
     Some(format!("{}://{host}{port}/", parsed.scheme()))
+}
+
+/// proxy 参数 → 代理 origin 的 Net 能力（与 master 派生的第二条需求对应：
+/// 带代理的请求目标与代理各自需要能力覆盖，缺一即 Deny）。模板化代理
+/// 无法静态派生，用例需显式给能力。
+fn proxy_origin(proxy: &Value, push: &mut impl FnMut(Value)) {
+    if let Some(prefix) = proxy
+        .as_str()
+        .filter(|s| !s.trim().is_empty() && !s.contains("${"))
+        .and_then(origin)
+    {
+        push(net(&ALL_METHODS, &prefix));
+    }
 }
 
 /// 与 master `policy::derive::normalize_provider` 同规。

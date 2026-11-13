@@ -1,0 +1,18 @@
+{
+  "name": "permission_request_request",
+  "kind": "rpc",
+  "message": {
+    "jsonrpc": "2.0",
+    "id": 7,
+    "method": "permission/request",
+    "params": {
+      "cwd": "/tmp/w",
+      "params": {
+        "command": "git status"
+      },
+      "tool": "bash",
+      "tool_call_id": "call-1"
+    }
+  },
+  "bytes_hex": "01000000987b226a736f6e727063223a22322e30222c226964223a372c226d6574686f64223a227065726d697373696f6e2f72657175657374222c22706172616d73223a7b22637764223a222f746d702f77222c22706172616d73223a7b22636f6d6d616e64223a2267697420737461747573227d2c22746f6f6c223a2262617368222c22746f6f6c5f63616c6c5f6964223a2263616c6c2d31227d7d"
+}

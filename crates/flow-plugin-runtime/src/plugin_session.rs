@@ -66,6 +66,11 @@ pub(super) async fn open(
             plugin.binary.display()
         )));
     }
+    // I35：spawn 前复核内容哈希——注册与执行之间二进制/manifest 被换掉
+    //（升级、篡改）时拒绝执行，而不是拿旧授予跑新代码。
+    if let Err(reason) = plugin.recheck_content_hash() {
+        return Err(PluginSessionError::Setup(reason));
+    }
     let mut config = SpawnConfig::new(&plugin.binary);
     config.env = plugin_env();
     // 同进程组：master 按会话击杀执行器时连带回收插件子树，不留孤儿。

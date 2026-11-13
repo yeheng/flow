@@ -599,6 +599,8 @@ export interface ApprovalItem {
   actor: ApprovalActor;
   /** 需求集合，全部渲染 */
   specs: ApprovalSpec[];
+  /** G4 插件节点：manifest 声明的需求（模式形状；specs 为空时展示） */
+  needs?: ApprovalSpec[];
   context: {
     run_id: string;
     workflow_id: string;

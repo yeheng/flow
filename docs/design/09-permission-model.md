@@ -752,7 +752,10 @@ crate 变更清单：
 - 评估器为 `flow-backend/src/policy.rs::check`（纯函数，I31）；需求派生在
   `policy/derive.rs`（节点级）与 `derive::tool_specs`（G5 工具闭集映射）。
 - 比本文更严的两条：**email 额外要求 endpoint 的 Net(POST) 能力**；http/llm 的
-  proxy 不参与需求派生（proxy 仍按出站 URL 授权，记为已知限制）。
+  proxy 派生为**第二条 Net 需求**（代理 origin 归一化为
+  `scheme://host[:port]/`，剥 userinfo/path/query；目标与代理各自需要能力覆盖，
+  缺一即 Deny；proxy 只支持 http/https，与 url_prefix 授权面一致——2026-11
+  起不再按已知限制放行）。
 - `LlmCall.provider` = 规范化端点（scheme://host[:port]/path），model 取
   body.model 或冻结 agent 配置。
 - harness command 的 `command` 展开后必须是**规范化绝对路径**（不做 PATH 解析，
@@ -771,18 +774,39 @@ crate 变更清单：
 - 反向链路：插件 `permission/request` → 执行器 `ToolPermissionRequest`（协议 v8
   新帧）→ master G5 裁决 → `ToolPermissionDecision` → 插件。链路断/超时/取消
   fail closed。ApprovalLedger 按 tool_call_id 去重传输重试（provider 侧 id 唯一）。
-- **G4（通用插件节点授权）未接入**：受管工作流含动态插件节点仍被 `start_gate`
-  拒绝（fail-closed）；legacy 工作流的动态节点照旧行为（无授权步）。sandbox
-  profile 未实现（§12.2 已知限制清单维持）。这是 P1 相对本文的主要缺口。
+- **G4（通用插件节点授权）已接线（2026-11 审计修复）**：legacy 定义含动态
+  插件节点被静态门拒绝（已确认决策 2）；受管定义要求插件已部署且已授予
+  （`start_gate` fail-fast）。逐次裁决走 G3 同一管道：执行器 `plugin_node`
+  发 `RequestOperation`（params 全文进指纹），master 用 manifest 声明的
+  required 能力做**模式包含**评估（`ResourcePattern::covers`，授予 ∩ workflow
+  ∩ node 逐层 AND、层内 OR、Ask 传播、Run 授权以空 specs + 指纹免问）。
+  `Widget::Secret` 字段按名经 Permit 交付（I37）。legacy-unrestricted 插件
+  经管理员 `legacy_confirm` 授予后逐次人工确认（卡片标注）。
+  已知限制：Exec 裸名把关无 OS 执法（同名二进制替换风险，I38 的完全拒绝
+  待 sandbox 接入，sandbox-exec profile 仍未实现）；manifest 专用变体
+  （`any`/`program`）无法在 workflow 层表达，这类需求需族级授予覆盖。
 - 内置（bundled）插件（harness-agent/llm）启动时幂等自动授予其声明能力
   （受信分发二进制）；第三方插件必须 `permissions.grant` 显式授予。
+- **内容哈希执法（I35，2026-11 审计修复补齐）**：两侧 registry 均计算
+  sha256(manifest ‖ entry)；执行器 spawn 前复核（注册后换二进制即拒）；
+  插件节点请求携带 (id, content_hash)，master 与冻结授予核验（远程执行器
+  与授予快照脱钩即拒）；授予查找只认精确 (plugin_id, 当前哈希)，不做
+  Hello 清单上报（逐请求核验强于启动期快照）。
 
 ### 13.4 认证与审计（P2）
 - `[[api_keys]]`（id/token_hash=scrypt 无、直接 sha256 hex/scopes/expires_at）；
   `FLOW_JOURNAL_TOKEN` 恒为隐式 admin key。scope 裁决：读=read，写=write，
   run.approve/deny=approve，permissions.grant=admin。决策记录 `by` 为
   `ApiKey{id}`（approve-only key 不能写 workflow，e2e 钉死）。
-- **哈希链**（format 4→5，打开时单事务原地迁移）：`transactions` 增加
+- **key 管理 v1 = 配置文件**（方案 P2.1 的管理 RPC 与 web 设置卡未实现，
+  认账为 v1 范围缩减）：`[[api_keys]]` 改 `flow.config.toml` + 重启生效；
+  明文 token 由管理员生成，只入哈希。热轮换与管理 RPC 列为后续项。
+- **权限块变更仅 admin**（§9；2026-11 审计修复补齐）：write-scope key 只能
+  保存权限不变的定义版本；`WorkflowPermissionsChanged.by` 记录真实主体
+  （LocalAdmin / ApiKey{id}），数据集级权限事实（含 plugin_grant_upserted）
+  由 `permissions.audit.page` 无 run 范围时一并提供。
+- **哈希链**（format 5；打开路径不做旧版本原地迁移，v4 库直接拒绝，
+  旧数据仅可经 flow-journal-tool upgrade 离线复制升级）：`transactions` 增加
   `prev_digest/chain_digest`，链值 = `SHA-256(prev_chain ‖ digest(body))`；
   `maintenance::verify()` 顺链校验——中段「body+digest 一致篡改」（旧读侧逐帧
   复核的盲区）被链发现（e2e 钉死）。

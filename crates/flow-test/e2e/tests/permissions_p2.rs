@@ -323,3 +323,126 @@ async fn permissions_audit_page_answers_who_approved_what() {
     )
     .await;
 }
+
+/// P2 权限变更鉴权（09 §9：权限块变更仅 admin）：write-scope key 能改
+/// 定义但不能改权限块（-32020）；admin key 可改；WorkflowPermissionsChanged
+/// 的 by 记录真实主体（ApiKey{id}），不再写死 LocalAdmin。
+#[tokio::test]
+async fn permission_block_change_requires_admin_and_records_actor() {
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(bytes);
+        digest.iter().map(|b| format!("{b:02x}")).collect()
+    }
+    let writer_plain = "writer-key-0123456789abcdef";
+    let admin_plain = "admin-key-0123456789abcdef";
+    let config_dir = tempfile::tempdir().unwrap();
+    let config_path = config_dir.path().join("flow.config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[[api_keys]]\nid = \"writer\"\ntoken_hash = \"{}\"\nscopes = [\"read\", \"write\"]\n\
+             [[api_keys]]\nid = \"boss\"\ntoken_hash = \"{}\"\nscopes = [\"admin\"]\n",
+            sha256_hex(writer_plain.as_bytes()),
+            sha256_hex(admin_plain.as_bytes()),
+        ),
+    )
+    .unwrap();
+    flow_test_support::run_case_with_env(
+        env!("CARGO_BIN_EXE_flow-journal-server-e2e"),
+        &[("FLOW_CONFIG", &config_path.display().to_string())],
+        |ctx: &mut flow_test_support::Ctx| {
+            Box::pin(async move {
+                let admin = ctx.client().await;
+                let writer = flow_test_support::connect(ctx.addr(), writer_plain).await;
+
+                // admin 建一个受管工作流（带权限块）。
+                let wf: Value = flow_test_support::call_json(
+                    &admin,
+                    "workflow.create",
+                    json!({"name": "perm-change-gate"}),
+                )
+                .await;
+                let workflow_id = wf["workflow_id"].as_str().unwrap().to_owned();
+                let governed = || json!({
+                    "semantics": 2,
+                    "permissions": {"version": 1, "mode": "execute", "allow": [
+                        net_cap("w-net", "POST", "https://api.example.com/", "auto"),
+                    ]},
+                    "nodes": [
+                        {"id": "s", "type": "start"},
+                        {"id": "c", "type": "http_call",
+                         "params": {"method": "POST", "url": "https://api.example.com/x"}},
+                        {"id": "e", "type": "end"}
+                    ],
+                    "edges": [{"from": "s", "to": "c"}, {"from": "c", "to": "e"}]
+                });
+                let saved: Value = flow_test_support::call_json(
+                    &admin,
+                    "workflow.update",
+                    json!({"workflow_id": workflow_id, "definition": governed()}),
+                )
+                .await;
+                let version = saved["version"].as_u64().unwrap_or(1);
+
+                // write key：保存权限不变的新版本 → 允许（改动 params）。
+                let mut unchanged = governed();
+                unchanged["nodes"][1]["params"]["url"] = json!("https://api.example.com/y");
+                let ok: Value = flow_test_support::call_json(
+                    &writer,
+                    "workflow.update",
+                    json!({"workflow_id": workflow_id, "definition": unchanged}),
+                )
+                .await;
+                assert!(ok["version"].as_u64().is_some(), "write key 可改非权限内容：{ok}");
+
+                // write key：改权限块（auto → ask）→ -32020。
+
+                let mut loosened = governed();
+                loosened["permissions"]["allow"][0]["approval"] = json!("ask");
+                let error = flow_test_support::call_err(
+                    &writer,
+                    "workflow.update",
+                    json!({"workflow_id": workflow_id, "definition": loosened}),
+                )
+                .await;
+                assert_eq!(error.code(), -32020, "非 admin 改权限块必须拒绝：{error}");
+                assert!(
+                    error.message().contains("admin"),
+                    "拒绝原因点名 admin：{error}"
+                );
+
+                // admin key：改权限块（writer 被拒的同一份 loosened）→ 允许；
+                // 事件 by = ApiKey{boss}（不再写死 LocalAdmin）。
+                let mut loosened = governed();
+                loosened["permissions"]["allow"][0]["approval"] = json!("ask");
+                let changed: Value = flow_test_support::call_json(
+                    &flow_test_support::connect(ctx.addr(), admin_plain).await,
+                    "workflow.update",
+                    json!({"workflow_id": workflow_id, "definition": loosened}),
+                )
+                .await;
+                assert!(changed["version"].as_u64().is_some(), "{changed}");
+                let events: Value = flow_test_support::call_json(
+                    &admin,
+                    "permissions.audit.page",
+                    json!({"limit": 100}),
+                )
+                .await;
+                let changed_events: Vec<&Value> = events["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|e| e["event"]["kind"] == json!("workflow_permissions_changed"))
+                    .collect();
+                assert!(
+                    changed_events.iter().any(|e| {
+                        e["event"]["payload"]["by"] == json!({"kind": "api_key", "id": "boss"})
+                    }),
+                    "by 必须记录真实主体（ApiKey{{boss}}）：{events:?}（初始版本 v{version} 由 local_admin 建立）"
+                );
+            })
+        },
+    )
+    .await;
+}

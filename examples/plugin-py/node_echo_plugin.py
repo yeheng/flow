@@ -2,7 +2,7 @@
 """echo 插件：动态节点类型的参考实现（e2e 专用）。
 
 实现通用 node 契约（manifest methods.invoke = "node/invoke"）：
-- initialize 握手（plugin-proto）；
+- initialize 握手（flow-plugin-sdk 协议）；
 - `node/invoke` 请求 `{params: {text, times, mode}}` → 响应
   `{output: {echo: <text 重复 times 次>, mode: <mode>, via: "python-echo"}}`。
 

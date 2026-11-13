@@ -646,15 +646,16 @@ impl DefinitionData {
         Ok(definition)
     }
 
-    /// 会产生外部操作的**内置**节点（动态插件类型不算：它们的执行面在
-    /// P1 接入授予链路前与 legacy 语义一致，门在 backend policy 层分流）。
+    /// 会产生外部操作的节点：内置副作用类型（http/email/llm/harness）与
+    /// 动态插件类型（插件进程副作用面不可枚举，一律按副作用对待——方案
+    /// 已确认决策 2）。
     ///
     /// legacy 静态门用它：含这些节点的 legacy 定义不能启动新 run（09 §3.5
     /// 「首次新执行前由 admin 显式迁移」）；纯计算 legacy 照常运行。
     pub fn side_effect_nodes(&self) -> Vec<&Node> {
         self.nodes
             .iter()
-            .filter(|node| node.kind().is_some_and(NodeType::has_side_effect))
+            .filter(|node| node.kind().is_none_or(NodeType::has_side_effect))
             .collect()
     }
 
@@ -2410,8 +2411,8 @@ mod tests {
             .iter()
             .map(|n| n.id.as_str())
             .collect();
-        // 动态插件节点不算内置副作用：P1 接入授予链路前与 legacy 语义一致。
-        assert_eq!(ids, vec!["h"]);
+        // 动态插件节点与内置副作用同等待遇（决策 2：legacy 门一并拒绝）。
+        assert_eq!(ids, vec!["h", "p"]);
     }
 
     #[test]

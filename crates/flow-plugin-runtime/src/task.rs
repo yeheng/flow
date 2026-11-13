@@ -1271,7 +1271,13 @@ impl TaskRunner {
         // 授权即承诺「副作用可能已发生」，永远发不出去的请求不该进 uncertain——
         // 这条不变量原先由 master 侧进程内实现保证，删除后由执行器自己守住。
         build_outbound(None)?;
-        let credential = self.authorize_operation(request).await?;
+        let secret_ref = request["credential"]["secret_ref"]
+            .as_str()
+            .map(str::to_owned);
+        let credentials = self.authorize_operation(request).await?;
+        let credential = secret_ref.and_then(|name| {
+            flow_engine::execution_protocol::credential_for(&credentials, &name).map(str::to_owned)
+        });
         // 带凭据重建：密钥值只在授权许可里出现，不进请求指纹与审计。
         let outbound_request = build_outbound(credential)?;
         // 展示面用的 URL（日志行）：query 里的敏感参数值脱敏，发起请求用的
@@ -1378,8 +1384,9 @@ impl TaskRunner {
     }
 
     /// 外部操作的请求发送与许可等待（http/harness 共用）：RequestOperation →
-    /// OperationPermit（取消/断线唤醒）。返回许可里与请求 `credential.secret_ref`
-    /// 同名的凭证（harness command 不用）。
+    /// OperationPermit（取消/断线唤醒）。返回许可携带的全部凭证
+    ///（http/llm/agent 按 `credential.secret_ref` 取用；插件节点按 manifest
+    /// Secret 字段名取用，I37）。
     ///
     /// 请求字节走 data 通道分块发送（再小也走），控制帧只带身份与指纹：
     /// 控制帧有确定性上界（C6），值字节不能借道它。
@@ -1394,7 +1401,10 @@ impl TaskRunner {
     /// # Errors
     /// 身份错配返回 `Invalid`；取消返回 `Cancelled`；通道关闭返回 `Closed`；
     /// 权限拒绝返回 `Business`。
-    async fn authorize_operation(&mut self, request: Value) -> Result<Option<String>, TaskError> {
+    async fn authorize_operation(
+        &mut self,
+        request: Value,
+    ) -> Result<Vec<flow_engine::execution_protocol::PermitCredential>, TaskError> {
         if self.is_regression() {
             // 回归模式禁止一切外部操作：协调器也会独立拒绝许可，双保险
             // 防止回归意外发请求。
@@ -1402,10 +1412,6 @@ impl TaskRunner {
                 "external operations are disabled in regression".into(),
             ));
         }
-        // 凭证按名取：许可按需求集合逐项交付，节点只拿自己请求里引用的那份。
-        let secret_ref = request["credential"]["secret_ref"]
-            .as_str()
-            .map(str::to_owned);
         let request_bytes = flow_journal::codec::bounded_json(&request, INPUT_BUDGET)?;
         // 指纹 = 请求字节摘要：授权与执行两侧对同一摘要，许可才对得上
         // 这一次具体的请求。
@@ -1531,9 +1537,7 @@ impl TaskRunner {
                 _ => continue,
             }
         };
-        Ok(secret_ref.and_then(|name| {
-            flow_engine::execution_protocol::credential_for(&credentials, &name).map(str::to_owned)
-        }))
+        Ok(credentials)
     }
 
     /// harness：子进程执行（许可→spawn→Outcome→输出），与 http_node 同一条授权路径。
@@ -1621,7 +1625,13 @@ impl TaskRunner {
         }
         // 授权：RequestOperation → OperationPermit（凭据在许可里，不进
         // 请求指纹与审计）。插件拿到的凭据只经通道过线。
-        let credential = self.authorize_operation(request).await?;
+        let secret_ref = request["credential"]["secret_ref"]
+            .as_str()
+            .map(str::to_owned);
+        let credentials = self.authorize_operation(request).await?;
+        let credential = secret_ref.and_then(|name| {
+            flow_engine::execution_protocol::credential_for(&credentials, &name).map(str::to_owned)
+        });
         // 注册表路由：llm → 插件（内置默认注册或 manifest 发现）。
         let plugin = match self.plugins.resolve("llm") {
             Some(plugin) => plugin.clone(),
@@ -1798,6 +1808,45 @@ impl TaskRunner {
             )
             .await?;
         logger.info(format!("→ 插件 {}（{}）", plugin.plugin_id, node.node_type));
+        // G4：动态插件节点与内置副作用节点同一条授权路径（09 §5）：
+        // manifest 需求由 master 裁决，Allow 前 zero 副作用；params 全文
+        // 进指纹（换参 = 新请求 = 重新批准）。请求携带插件内容身份（I35：
+        // master 核验执行器二进制与授予快照一致）。
+        let request = json!({
+            "kind": "plugin_invoke",
+            "node_type": node.node_type,
+            "plugin": {
+                "id": plugin.plugin_id,
+                "content_hash": plugin.content_hash,
+            },
+            "params": params,
+        });
+        let credentials = self.authorize_operation(request).await?;
+        // Widget::Secret 字段按名取值注入（I37：全部需求获准后才解析）。
+        let mut params = params;
+        if !credentials.is_empty() {
+            for form in plugin
+                .ui
+                .as_ref()
+                .map(|ui| ui.params_forms.as_slice())
+                .unwrap_or_default()
+            {
+                if form.node_type != node.node_type {
+                    continue;
+                }
+                for field in &form.fields {
+                    if matches!(field.widget, flow_config::plugin_manifest::Widget::Secret) {
+                        if let Some(name) = params.get(&field.key).and_then(Value::as_str) {
+                            if let Some(value) =
+                                flow_engine::execution_protocol::credential_for(&credentials, name)
+                            {
+                                params[&field.key] = Value::String(value.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let started = std::time::Instant::now();
         let timeout_ms = params["timeout_ms"]
             .as_u64()
@@ -2077,7 +2126,13 @@ impl TaskRunner {
             }
             None => None,
         };
-        let credential = self.authorize_operation(request).await?;
+        let secret_ref = request["credential"]["secret_ref"]
+            .as_str()
+            .map(str::to_owned);
+        let credentials = self.authorize_operation(request).await?;
+        let credential = secret_ref.and_then(|name| {
+            flow_engine::execution_protocol::credential_for(&credentials, &name).map(str::to_owned)
+        });
         // 生命周期截止时间从授权后起算：覆盖装配、回合、清理与落账，
         // 避免任一阶段无限延长节点占用。
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""plugin-proto 的 Python 参考实现。
+"""flow-plugin-sdk 插件线协议（wire.md）的 Python 参考实现。
 
 这是 wire.md（docs/protocol/wire.md）的第二个实现。它存在的意义不是
 「又一个 SDK」，而是**对规范本身的检验**：规范里任何含糊的地方，都会
@@ -8,10 +8,10 @@
 只用标准库。契约的 ground truth 是 crates/flow-plugin-sdk（protocol 模块）/tests/vectors/，
 test_vectors.py 对它逐字节校验。
 
-用法（作为插件被 proc-ipc 宿主拉起）：
+用法（作为插件被宿主拉起）：
 
     宿主 spawn:  python3 plugin_rpc.py
-    通道交接:    环境变量 PROC_IPC_FD（固定 3，见 proc-ipc 文档）
+    通道交接:    环境变量 PROC_IPC_FD（固定 3，见 wire.md §0）
 
 协议要点（与 wire.md 一一对应）：
 - 帧：[u8 kind][u32 BE len][payload]；kind 1=rpc 2=binary；上限 1 MiB。
@@ -29,7 +29,7 @@ MAX_FRAME_BYTES = 1024 * 1024
 KIND_RPC = 0x01
 KIND_BINARY = 0x02
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 PROTOCOL_VERSION_MAJOR = PROTOCOL_VERSION >> 16
 
 APP_ERROR_RANGE = range(-32099, -32000)  # -32099..=-32001
@@ -187,10 +187,42 @@ def default_dispatch(method: str, params):
     raise MethodNotFound(f"method not found: {method}")
 
 
+def request_permission(sock, next_id, tool_call_id, tool, params, cwd=None):
+    """v2 `permission/request`（wire.md §3.7）：受管插件执行工具动作前逐次
+    向宿主请求裁决。fail-closed：任何异常（通道断/超时/错误响应）都当作
+    拒绝——受管插件不得自行放行。
+
+    返回 (allowed, operation_id, reason)。
+    """
+    request = {
+        "jsonrpc": "2.0",
+        "id": next_id,
+        "method": "permission/request",
+        "params": {
+            "tool_call_id": tool_call_id,
+            "tool": tool,
+            "params": params,
+            **({"cwd": cwd} if cwd is not None else {}),
+        },
+    }
+    sock.sendall(encode_frame(KIND_RPC, encode_message(request)))
+    try:
+        kind, payload = read_frame(sock)
+        message = decode_message(payload) if kind == KIND_RPC else None
+    except (ProtocolError, OSError):
+        return False, None, "permission channel closed"
+    if message is None or message.get("id") != next_id:
+        return False, None, "permission response malformed"
+    if "error" in message:
+        return False, None, str(message["error"].get("message", "denied"))
+    result = message.get("result") or {}
+    return bool(result.get("allowed")), result.get("operation_id"), result.get("reason")
+
+
 def serve(dispatch=None, capabilities=(), server_info=None) -> int:
     """插件主循环：接管通道 → initialize 握手 → 分发请求。
 
-    通道交接按环境变量自动选择（与 proc-ipc 的约定一致）：
+    通道交接按环境变量自动选择（与 wire.md §0 的配套约定一致）：
     - `PROC_IPC_FD`（unix）：接管的 socketpair fd，归一为阻塞模式。
     - `PROC_IPC_ADDR`（Windows / 回连）：named pipe 路径，按文件打开。
 

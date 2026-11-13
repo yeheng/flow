@@ -13,6 +13,10 @@
 **09 权限模型引入了分档**：`FLOW_JOURNAL_TOKEN` 恒为隐式 admin key；
 `[[api_keys]]` 按 scope 裁决（读=read，写=write，`run.approve/deny`=approve，
 `permissions.grant`=admin；审批 key 无法写 workflow，见 09 §9/§13.4）。
+**权限块变更另需 admin**：非 admin 主体提交的 `workflow.update` / `workflow.import`
+若改变权限摘要，一律 `-32020`（09 §9）。
+key 管理 v1 = `flow.config.toml` 的 `[[api_keys]]`（重启生效，无管理 RPC；
+09 §13.4）。
 其余两张清单仍服务三件事：
 
 1. **写命令必须带 `request_id`**（`is_write_method` → 空即 `-32602`）；

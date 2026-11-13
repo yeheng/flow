@@ -444,9 +444,198 @@ impl ResourcePattern {
             _ => false,
         }
     }
+
+    /// 模式包含（G4，09 §7）：本模式是否完整覆盖一条 manifest 声明的需求
+    /// 模式。与 [`Self::matches`] 的关系：`matches` 是「模式 ⊇ 具体请求」，
+    /// `covers` 是「模式 ⊇ 模式」。`need` 只会出现 manifest 层形状（含
+    /// [`ResourcePattern::Any`] / [`ResourcePattern::ExecProgram`]）；授予层
+    /// 的能力同样来自 manifest，因此两侧都可能出现 manifest 专用变体。
+    pub fn covers(&self, need: &ResourcePattern) -> bool {
+        if self.action() != need.action() {
+            return false;
+        }
+        match (self, need) {
+            // 族级上限覆盖同动作任意需求；反之族级需求只能被族级上限覆盖
+            //（更窄的具体模式盖不住「任意」）。
+            (Self::Any { .. }, _) => true,
+            (_, Self::Any { .. }) => false,
+            (Self::Secret { names }, Self::Secret { names: need }) => {
+                need.iter().all(|n| names.contains(n))
+            }
+            (
+                Self::Exec {
+                    executable,
+                    argv_exact,
+                },
+                Self::Exec {
+                    executable: need_executable,
+                    argv_exact: need_argv,
+                },
+            ) => executable == need_executable && argv_exact == need_argv,
+            // 裸名与绝对路径同 basename + 同 argv 互相覆盖（方案 P1.1：
+            // manifest 声明裸名，绝对路径由 workflow 层把关）。无 OS 执法时
+            // 同名二进制替换风险记为已知限制（I38 完全拒绝待 sandbox 接入）。
+            (
+                Self::ExecProgram {
+                    program,
+                    argv_exact,
+                },
+                Self::Exec {
+                    executable: need_executable,
+                    argv_exact: need_argv,
+                },
+            ) => {
+                let basename = need_executable
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(need_executable);
+                basename == program && argv_exact == need_argv
+            }
+            (
+                Self::Exec {
+                    executable,
+                    argv_exact,
+                },
+                Self::ExecProgram {
+                    program: need_program,
+                    argv_exact: need_argv,
+                },
+            ) => {
+                let basename = executable.rsplit('/').next().unwrap_or(executable);
+                basename == need_program && argv_exact == need_argv
+            }
+            (
+                Self::ExecProgram {
+                    program,
+                    argv_exact,
+                },
+                Self::ExecProgram {
+                    program: need_program,
+                    argv_exact: need_argv,
+                },
+            ) => program == need_program && argv_exact == need_argv,
+            (
+                Self::Shell {
+                    executable,
+                    script_digest,
+                },
+                Self::Shell {
+                    executable: need_executable,
+                    script_digest: need_digest,
+                },
+            ) => {
+                script_digest == need_digest
+                    && executable
+                        .as_deref()
+                        .is_none_or(|exe| need_executable.as_deref() == Some(exe))
+            }
+            // File 三兄弟同形：精确只盖精确同路径；子树盖子树之内的精确与
+            // 更窄子树（与 matches 的空路径规则一致：枚举工作区根只能被
+            // 子树授权覆盖）。
+            (
+                Self::FileRead { path, subtree }
+                | Self::FileWrite { path, subtree }
+                | Self::FileDelete { path, subtree },
+                Self::FileRead {
+                    path: need_path,
+                    subtree: need_subtree,
+                }
+                | Self::FileWrite {
+                    path: need_path,
+                    subtree: need_subtree,
+                }
+                | Self::FileDelete {
+                    path: need_path,
+                    subtree: need_subtree,
+                },
+            ) => covers_path(
+                path.as_deref(),
+                subtree.as_deref(),
+                need_path.as_deref(),
+                need_subtree.as_deref(),
+            ),
+            (
+                Self::Net {
+                    methods,
+                    url_prefix,
+                },
+                Self::Net {
+                    methods: need_methods,
+                    url_prefix: need_prefix,
+                },
+            ) => {
+                need_methods
+                    .iter()
+                    .all(|m| methods.iter().any(|x| x.eq_ignore_ascii_case(m)))
+                    && url_prefix_covers(url_prefix, need_prefix)
+            }
+            (
+                Self::LlmCall { providers, models },
+                Self::LlmCall {
+                    providers: need_providers,
+                    models: need_models,
+                },
+            ) => {
+                need_providers.iter().all(|p| providers.contains(p))
+                    && need_models.iter().all(|m| models.contains(m))
+            }
+            (
+                Self::SendEmail { recipients },
+                Self::SendEmail {
+                    recipients: need_recipients,
+                },
+            ) => need_recipients.iter().all(|r| recipients.contains(r)),
+            _ => false,
+        }
+    }
 }
 
-/// 一条能力：matcher + 审批要求 + 可选期限（§3.4）。
+/// File 系模式包含：精确/子树 × 精确/子树。
+fn covers_path(
+    sup_path: Option<&str>,
+    sup_subtree: Option<&str>,
+    need_path: Option<&str>,
+    need_subtree: Option<&str>,
+) -> bool {
+    match (need_path, need_subtree) {
+        (Some(path), None) => match (sup_path, sup_subtree) {
+            (Some(exact), _) => !path.is_empty() && exact == path,
+            (None, Some(dir)) => {
+                path.is_empty() || path == dir || path.starts_with(&format!("{dir}/"))
+            }
+            (None, None) => false,
+        },
+        // 子树需求只能被子树满足（精确路径盖不住一个范围）。
+        (None, Some(dir)) => {
+            sup_path.is_none()
+                && matches!(sup_subtree, Some(sup) if sup == dir || dir.starts_with(&format!("{sup}/")))
+        }
+        _ => false,
+    }
+}
+
+/// URL 前缀包含：源站一致且需求路径在上限路径的段前缀内（或上限是根）。
+fn url_prefix_covers(sup: &str, need: &str) -> bool {
+    let (Ok(sup), Ok(need)) = (url::Url::parse(sup), url::Url::parse(need)) else {
+        return false;
+    };
+    if sup.scheme() != need.scheme()
+        || sup.host_str().is_none()
+        || sup.host_str() != need.host_str()
+    {
+        return false;
+    }
+    if sup.port_or_known_default() != need.port_or_known_default() {
+        return false;
+    }
+    let sup_path = sup.path();
+    if sup_path == "/" || sup_path.is_empty() {
+        return true;
+    }
+    let sup_path = sup_path.trim_end_matches('/');
+    let need_path = need.path().trim_end_matches('/');
+    need_path == sup_path || need_path.starts_with(&format!("{sup_path}/"))
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capability {
     /// 本策略内唯一，供诊断与 UI 引用。
@@ -1475,6 +1664,118 @@ mod tests {
             let round = capability(cap.to_json());
             assert_eq!(round, cap);
         }
+    }
+
+    fn rp(value: Value) -> ResourcePattern {
+        let mut capability = json!({"id": "t", "approval": "auto"});
+        let dst = capability.as_object_mut().expect("object");
+        for (key, item) in value.as_object().expect("object pattern") {
+            dst.insert(key.clone(), item.clone());
+        }
+        parse_manifest_capability(&capability)
+            .expect("closed-set pattern")
+            .pattern
+    }
+
+    #[test]
+    fn covers_any_and_specific_patterns() {
+        // 族级上限覆盖同动作任意需求。
+        let any_net = rp(json!({"action": "net", "any": true}));
+        let net_get = rp(json!({
+            "action": "net", "methods": ["GET"],
+            "url_prefix": "https://a.b/v1/x/"
+        }));
+        assert!(any_net.covers(&net_get));
+        // 具体模式盖不住族级需求。
+        assert!(!net_get.covers(&any_net));
+        // 动作不同不覆盖。
+        let secret = rp(json!({"action": "secret", "names": ["k"]}));
+        assert!(!any_net.covers(&secret));
+    }
+
+    #[test]
+    fn covers_net_method_superset_and_segment_prefix() {
+        let wide = rp(json!({
+            "action": "net", "methods": ["GET", "POST"],
+            "url_prefix": "https://a.b/"
+        }));
+        let narrow = rp(json!({
+            "action": "net", "methods": ["GET"],
+            "url_prefix": "https://a.b/v1/"
+        }));
+        assert!(wide.covers(&narrow));
+        // 方法不够 → 不覆盖。
+        let get_only = rp(json!({
+            "action": "net", "methods": ["GET"],
+            "url_prefix": "https://a.b/"
+        }));
+        let need_post = rp(json!({
+            "action": "net", "methods": ["POST"],
+            "url_prefix": "https://a.b/"
+        }));
+        assert!(!get_only.covers(&need_post));
+        // 段前缀：/v1x 不是 /v1 的子段。
+        let v1 = rp(json!({
+            "action": "net", "methods": ["GET"],
+            "url_prefix": "https://a.b/v1"
+        }));
+        let v1x = rp(json!({
+            "action": "net", "methods": ["GET"],
+            "url_prefix": "https://a.b/v1x/"
+        }));
+        assert!(!v1.covers(&v1x));
+        // 跨源站不覆盖。
+        let other_host = rp(json!({
+            "action": "net", "methods": ["GET"],
+            "url_prefix": "https://c.d/"
+        }));
+        assert!(!wide.covers(&other_host));
+    }
+
+    #[test]
+    fn covers_exec_program_and_absolute_shapes() {
+        let program = rp(json!({"action": "exec", "program": "git", "argv_exact": ["status"]}));
+        let absolute = rp(json!({
+            "action": "exec", "executable": "/usr/bin/git", "argv_exact": ["status"]
+        }));
+        // 裸名（授予层）盖绝对路径（需求）；绝对路径（workflow 层把关）也
+        // 盖同 basename 裸名需求。
+        assert!(program.covers(&absolute));
+        assert!(absolute.covers(&program));
+        // argv 不同不覆盖。
+        let other_argv = rp(json!({
+            "action": "exec", "executable": "/usr/bin/git", "argv_exact": ["push"]
+        }));
+        assert!(!program.covers(&other_argv));
+    }
+
+    #[test]
+    fn covers_shell_digest_bound_and_interpreter_wildcard() {
+        let digest = "1".repeat(64);
+        let any_interp = rp(json!({"action": "shell", "script_digest": digest}));
+        let with_sh = rp(json!({
+            "action": "shell", "executable": "/bin/sh", "script_digest": digest
+        }));
+        // 解释器通配盖具体解释器。
+        assert!(any_interp.covers(&with_sh));
+        assert!(!with_sh.covers(&any_interp));
+        // 摘要不同不覆盖。
+        let other_digest = rp(json!({
+            "action": "shell", "executable": "/bin/sh", "script_digest": "2".repeat(64)
+        }));
+        assert!(!with_sh.covers(&other_digest));
+    }
+
+    #[test]
+    fn covers_file_exact_subtree_combinations() {
+        let subtree = rp(json!({"action": "file_read", "subtree": "src"}));
+        let exact = rp(json!({"action": "file_read", "path": "src/lib.rs"}));
+        let nested = rp(json!({"action": "file_read", "subtree": "src/deep"}));
+        assert!(subtree.covers(&exact));
+        assert!(subtree.covers(&nested));
+        assert!(!exact.covers(&subtree));
+        let exact_same = rp(json!({"action": "file_read", "path": "src/lib.rs"}));
+        assert!(exact.covers(&exact_same));
     }
 
     #[test]

@@ -172,6 +172,7 @@ fn permission_change_event(
     version: u64,
     previous: Option<&str>,
     next: Option<&str>,
+    by: &flow_dto::permission::Principal,
 ) -> Option<Event> {
     if previous == next {
         return None;
@@ -183,9 +184,23 @@ fn permission_change_event(
             "definition_version": version.to_string(),
             "policy_digest": next,
             "previous_digest": previous,
-            "by": flow_dto::permission::Principal::LocalAdmin,
+            "by": by,
         }),
     ))
+}
+
+/// 外部写入调用的主体与权限（P2 鉴权：权限块变更仅 admin）。内部可信
+/// 路径（恢复重发 / dev 工具）不带主体，等同 LocalAdmin。
+pub struct WriteActor<'a> {
+    pub principal: &'a flow_dto::permission::Principal,
+    /// 是否允许改变权限块（LocalAdmin 或 admin-scope API key）。
+    pub permission_admin: bool,
+}
+
+/// 权限块变更鉴权（09 §9：首版仅 admin 可提交）：摘要变化且调用方无
+/// admin 权限 → -32020。内部调用（None）不受限。
+fn permission_change_allowed(actor: Option<&WriteActor<'_>>) -> bool {
+    actor.is_none_or(|actor| actor.permission_admin)
 }
 
 /// Repeated saves/imports reuse the latest version and its publication state.
@@ -647,6 +662,19 @@ impl JournalBackend {
         publish: bool,
         request_id: Option<&str>,
     ) -> Result<CommandReceipt> {
+        self.workflow_import_as(name, definition, publish, request_id, None)
+            .await
+    }
+
+    /// [`Self::workflow_import`] 的带主体版（RPC 面）：权限块变更仅 admin。
+    pub async fn workflow_import_as(
+        &self,
+        name: &str,
+        definition: Value,
+        publish: bool,
+        request_id: Option<&str>,
+        actor: Option<&WriteActor<'_>>,
+    ) -> Result<CommandReceipt> {
         validate_workflow_name(name)?;
         let prepared = PreparedDefinition::new(definition)?;
         let request = json!({"name":name,"definition":prepared.value,"publish":publish});
@@ -669,6 +697,15 @@ impl JournalBackend {
             None => None,
         };
         let next_digest = prepared.permissions_digest.clone();
+        if previous_digest != next_digest && !permission_change_allowed(actor) {
+            return Err(flow_journal::Error::Forbidden(
+                "权限块变更需要 admin（非 admin 只能保存权限不变的定义版本）".into(),
+            )
+            .into());
+        }
+        let change_by = actor
+            .map(|actor| actor.principal.clone())
+            .unwrap_or(flow_dto::permission::Principal::LocalAdmin);
         let (checksum, stored, value) = prepared.store(self, latest.as_ref()).await?;
         self.command_selected(
             "workflow.import",
@@ -704,6 +741,7 @@ impl JournalBackend {
                         version,
                         previous_digest.as_deref(),
                         next_digest.as_deref(),
+                        &change_by,
                     ));
                 }
                 let published = value.published || publish;
@@ -761,6 +799,18 @@ impl JournalBackend {
         definition: Value,
         request_id: Option<&str>,
     ) -> Result<CommandReceipt> {
+        self.workflow_update_as(workflow_id, definition, request_id, None)
+            .await
+    }
+
+    /// [`Self::workflow_update`] 的带主体版（RPC 面）：权限块变更仅 admin。
+    pub async fn workflow_update_as(
+        &self,
+        workflow_id: &str,
+        definition: Value,
+        request_id: Option<&str>,
+        actor: Option<&WriteActor<'_>>,
+    ) -> Result<CommandReceipt> {
         let prepared = PreparedDefinition::new(definition)?;
         let fingerprint_request = json!({"workflow_id":workflow_id,"definition":prepared.value});
         let _metadata = self.workflow_metadata.write().await;
@@ -786,6 +836,15 @@ impl JournalBackend {
             None => None,
         };
         let next_digest = prepared.permissions_digest.clone();
+        if previous_digest != next_digest && !permission_change_allowed(actor) {
+            return Err(flow_journal::Error::Forbidden(
+                "权限块变更需要 admin（非 admin 只能保存权限不变的定义版本）".into(),
+            )
+            .into());
+        }
+        let change_by = actor
+            .map(|actor| actor.principal.clone())
+            .unwrap_or(flow_dto::permission::Principal::LocalAdmin);
         let (checksum, stored, value) = prepared.store(self, latest.as_ref()).await?;
         self.command_selected(
             "workflow.update",
@@ -809,6 +868,7 @@ impl JournalBackend {
                         value.version,
                         previous_digest.as_deref(),
                         next_digest.as_deref(),
+                        &change_by,
                     ));
                 }
                 Ok((events, json!({"version":value.version})))
@@ -1038,18 +1098,19 @@ impl JournalBackend {
         } else {
             definition
         };
-        // 权限静态门（G2 前置）：legacy 定义含内置副作用节点 → 拒绝；受管
-        // 定义含尚不受管的组合（动态插件节点 / Plan+agent）→ 拒绝。回归候选
-        // 零外部调用（固件重放），不经此门。
+        // 权限静态门（G2 前置）：legacy 定义含副作用节点（含动态插件节点，
+        // 决策 2）→ 拒绝；受管定义的动态插件节点要求已部署且已授予（G4）。
+        // 回归候选零外部调用（固件重放），不经此门。
         let regression_run = execution
             .as_ref()
             .is_some_and(|snapshot| snapshot.regression.is_some());
-        if !regression_run {
-            crate::policy::start_gate(&definition).map_err(flow_journal::Error::Forbidden)?;
-        }
         let agent_plugin_id = self.harness_agent_plugin_meta().map(|meta| meta.id);
         let plugin_ceilings =
             crate::policy::plugin_ceilings(self, &definition, agent_plugin_id.as_deref()).await;
+        if !regression_run {
+            crate::policy::start_gate(&definition, &plugin_ceilings)
+                .map_err(flow_journal::Error::Forbidden)?;
+        }
         let policy = crate::policy::freeze_root(&definition, plugin_ceilings);
         let validate = |state: &State| {
             if matches!(source, "schedule" | "webhook") {

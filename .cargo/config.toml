@@ -1,0 +1,9 @@
+# 仓库级环境（cargo build/run/test 统一生效）。
+#
+# NO_PROXY：回环地址永远不走环境代理。测试套件大量使用 127.0.0.1 mock
+# 服务（agent-core 流式 / agent-host MCP / e2e stub），开发机常见的
+# all_proxy/http_proxy 会把这些请求劫持到本地代理导致测试红。此处仅在
+# 环境未设置 NO_PROXY 时补默认值（force=false），不覆盖用户显式配置；
+# 非回环流量的代理行为不受影响。
+[env]
+NO_PROXY = { value = "127.0.0.1,localhost,::1", force = false }

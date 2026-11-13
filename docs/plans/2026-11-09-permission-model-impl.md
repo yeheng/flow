@@ -1,6 +1,6 @@
 # 权限模型实现计划（P0+P1+P2）
 
-> 状态：**已实现**（P0+P1+P2；G4 与 Event.actor 的缺口见 09 §13 实现注记）。依据 [09-permission-model.md](../design/09-permission-model.md)。
+> 状态：**已实现**（P0+P1+P2；G4 已于 2026-11 审计修复后接线，Event.actor 的缺口见 09 §13 实现注记）。依据 [09-permission-model.md](../design/09-permission-model.md)。
 
 ## Context
 09 设计要把「谁允许谁做什么」从散落、隐式、事后补问的状态，收敛为「能力上限 + 审批」分离的模型。现状问题：
@@ -15,7 +15,7 @@
 ## 已定决策
 用户已确认：
 1. 范围：P0+P1+P2。
-2. legacy 定义（没有 `permissions` 块）：含副作用节点（http_call/email/llm/harness/动态插件）的，run.start 拒绝（cron、webhook、子工作流触发同样拒绝），返回新错误码 `-32020` 并列出节点；只含纯计算节点的照常运行。已在飞的 legacy run 一旦走到 G3，一律 Deny（文档：缺少策略快照的未完成 run 不自动恢复执行）。
+2. legacy 定义（没有 `permissions` 块）：含副作用节点（http_call/email/llm/harness/动态插件）的，run.start 拒绝（cron、webhook、子工作流触发同样拒绝），返回新错误码 `-32020` 并列出节点；只含纯计算节点的照常运行。已在飞的 legacy run 一旦走到 G3，一律 Deny（文档：缺少策略快照的未完成 run 不自动恢复执行）。（2026-11 审计修复：动态插件节点正式纳入 legacy 门与 G4 授权链，本条全部兑现。）
 3. Ask 等待期间执行器原地等待。待审批的派发释放调度槽和本地池许可，挂起总数上限为 A_MAX=16。远程 agent 的槽位照常占用，记为已知限制。
 4. web：审批卡片、收件箱、workflow/节点权限编辑器、legacy 迁移横幅；P2 另加 API key 设置。
 
@@ -86,7 +86,7 @@
 
 ## P1 插件与工具级
 1. **manifest**（`crates/flow-config/src/plugin_manifest.rs`）：新增 typed `[permissions]`（schema、required_features、capabilities 及 required）；`secret_fields` 必须指向本插件的 `Widget::Secret` 字段；任何错误都拒绝加载；缺少该段的标记为 legacy-unrestricted。新增 PermissionProjection；给 bundled 插件的 plugin.toml 补上声明。
-2. **内容哈希**：两侧 registry 都计算 sha256(manifest ‖ entry)；spawn 前复核；执行协议 Hello 上报插件清单（id/版本/哈希/规范化声明）。
+2. **内容哈希**：两侧 registry 都计算 sha256(manifest ‖ entry)；执行器 spawn 前复核（换二进制即拒）；插件请求携带 (id, content_hash)，master 核验与冻结授予一致（远程执行器脱钩即拒）。（取舍：不做执行协议 Hello 清单上报——逐请求核验比启动期清单快照更强；I35 授予查找只认精确哈希。）
 3. **授予**：
     - 新增 `permissions.grant` RPC，写 PluginGrantUpserted；只写 journal，不回写 plugin.toml。
     - `plugins.list` 显示授予状态和升级差异；`plugins.recheck` 把「待授予」检出。
@@ -116,12 +116,12 @@
     - 新增 `[[api_keys]]{id, token_hash, scopes, expires_at}`。
     - `admit_call` 映射 Principal：FLOW_JOURNAL_TOKEN 为 LocalAdmin；其余 key 常时比较。
     - 分档：approve scope 只允许 Once；授予、Run 授权、权限变更、key 管理需要 admin。
-    - Principal 贯穿到裁决记录的 by；提供 key 管理 RPC，明文只在创建时显示一次。
+    - Principal 贯穿到裁决记录的 by；~~提供 key 管理 RPC，明文只在创建时显示一次~~（v1 取舍：key 管理走 `[[api_keys]]` 配置文件 + 重启生效，管理 RPC 与 web 设置卡未实现；明文 token 由管理员自行生成并哈希入库。见 09 §13.4）。
 2. **权限变更鉴权**：纯函数分类器，非 admin 只能做可证明的收紧；update/import/publish 全部校验。
 3. **Event.actor**：新增 `Event.actor: Option<Principal>`（flow-journal 依赖 flow-dto，旧事件字节不变）；run.start 不再写死 manual。
 4. **哈希链**：格式升到 5 并原地迁移；`append` 写链；读时和 `maintenance::verify()` 顺链校验。
 5. **审计查询**：`run.audit.page` 增加 `Filter::Permission`；新增 `permissions.audit.page`，支持 JSONL 导出（CLI 同步）。
-6. **web**：API key 设置卡；没有 approve scope 时隐藏操作入口，服务端仍独立拒绝。
+6. **web**：~~API key 设置卡；没有 approve scope 时隐藏操作入口，服务端仍独立拒绝~~（v1 取舍：key 管理走配置文件，web 不感知调用方 scope；服务端 scope 裁决独立生效。见 09 §13.4）。
 
 ## 文档
 - 09 标为已实现，写入上述取舍。

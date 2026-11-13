@@ -74,6 +74,23 @@ const previewJson = computed(() =>
     : JSON.stringify(props.item.request_preview, null, 2),
 );
 
+/** G4 插件需求摘要（能力模式的可读目标；纯文本，不可信内容不拼接执行）。 */
+function needText(need: ApprovalSpec): string {
+  const first = (key: string): string => {
+    const v = need[key];
+    return Array.isArray(v) ? v.join(", ") : typeof v === "string" ? v : "";
+  };
+  return (
+    first("url_prefix") ||
+    first("program") ||
+    first("executable") ||
+    first("names") ||
+    first("providers") ||
+    first("recipients") ||
+    "（族级）"
+  );
+}
+
 // ---- 人工决定（仅 pending 可操作） ----
 
 const scope = ref<"once" | "run">("once");
@@ -154,6 +171,19 @@ function handleDecisionError(e: unknown): void {
       <span class="approval-actor" :title="item.node_id">{{ actorLabel(item.actor) }}</span>
       <span class="approval-gate muted">{{ item.gate === "tool" ? "工具门" : "节点门" }}</span>
       <span class="approval-deadline muted">{{ deadlineText }}</span>
+    </div>
+
+    <!-- G4 插件节点：specs 为空时展示 manifest 需求（能力模式，纯文本） -->
+    <div
+      v-if="item.specs.length === 0 && (item.needs?.length ?? 0) > 0"
+      class="approval-spec"
+    >
+      <span class="spec-action">插件需求</span>
+      <div class="spec-body">
+        <div v-for="(need, i) in item.needs" :key="i" class="spec-mono">
+          {{ capabilityActionLabel(String(need.action)) }} {{ needText(need) }}
+        </div>
+      </div>
     </div>
 
     <div v-for="(spec, i) in item.specs" :key="i" class="approval-spec">

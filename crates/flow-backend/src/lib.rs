@@ -13,7 +13,7 @@ pub mod journal;
 mod journal_commands;
 pub mod plugin_config;
 pub mod plugin_registry;
-pub use journal_commands::ProductCommand;
+pub use journal_commands::{ProductCommand, WriteActor};
 pub mod bundle;
 mod execution_snapshot;
 mod journal_driver;

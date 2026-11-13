@@ -33,6 +33,8 @@ pub struct Caller {
     pub principal: flow_dto::permission::Principal,
     /// 该调用要求的最低 scope（读=read，写=write，审批=approve）。
     pub required_scope: &'static str,
+    /// 是否允许改变工作流权限块（LocalAdmin 或 admin-scope API key；09 §9）。
+    pub permission_admin: bool,
 }
 
 /// 解析主体并按方法 scope 裁决（admin key 恒通过）。
@@ -41,6 +43,7 @@ fn resolve_caller(ctx: &Context, method: &str, supplied: &str) -> Result<Caller,
         return Ok(Caller {
             principal: flow_dto::permission::Principal::LocalAdmin,
             required_scope: "read",
+            permission_admin: true,
         });
     }
     // 明文 → sha256 与配置比对（常时比较逐 key）。
@@ -74,6 +77,7 @@ fn resolve_caller(ctx: &Context, method: &str, supplied: &str) -> Result<Caller,
         return Ok(Caller {
             principal: flow_dto::permission::Principal::ApiKey { id: key.id.clone() },
             required_scope: required,
+            permission_admin: key.has_scope("admin", now),
         });
     }
     Err(ErrorObjectOwned::owned(-32001, "unauthorized", None::<()>))
@@ -562,8 +566,17 @@ async fn dispatch_call(
                 // 缺省即发布：导入一份 workflow 的常见意图就是「导入并上线」，
                 // 要求调用方额外传 publish=true 会让默认路径多一次往返。
                 .unwrap_or(true);
-            b.workflow_import(text(&p, "name")?, p["definition"].clone(), publish, request)
-                .await
+            b.workflow_import_as(
+                text(&p, "name")?,
+                p["definition"].clone(),
+                publish,
+                request,
+                Some(&flow_backend::WriteActor {
+                    principal: &caller.principal,
+                    permission_admin: caller.permission_admin,
+                }),
+            )
+            .await
         }
         Method::WorkflowCreate => {
             let req = WorkflowCreateReq::parse(&p)?;
@@ -571,8 +584,16 @@ async fn dispatch_call(
         }
         Method::WorkflowUpdate => {
             let req = WorkflowUpdateReq::parse(&p)?;
-            b.workflow_update(req.workflow_id, req.definition, request)
-                .await
+            b.workflow_update_as(
+                req.workflow_id,
+                req.definition,
+                request,
+                Some(&flow_backend::WriteActor {
+                    principal: &caller.principal,
+                    permission_admin: caller.permission_admin,
+                }),
+            )
+            .await
         }
         Method::WorkflowPublish => {
             let req = WorkflowPublishReq::parse(&p)?;
@@ -1048,6 +1069,30 @@ async fn permissions_audit_page(b: &JournalBackend, p: &Value) -> Result<Value, 
     let identity = b.journal.id().to_owned();
     let root = b.journal.root().to_path_buf();
     let decision = decision.map(str::to_owned);
+    // 数据集级权限事实（run 外）：游标 run_id 为 null 时只续读数据集段。
+    let dataset_only = p
+        .get("cursor")
+        .is_some_and(|c| !c.is_null() && c["run_id"].is_null());
+    if dataset_only && run_id.is_none() && decision.is_none() {
+        let from_lsn = p["cursor"]["lsn"].as_u64().unwrap_or(1);
+        let dataset = tokio::task::spawn_blocking({
+            let root = root.clone();
+            let identity = identity.clone();
+            move || {
+                flow_journal::page::dataset_permission_events(&root, &identity, from_lsn, limit + 1)
+            }
+        })
+        .await
+        .map_err(invalid)?
+        .map_err(|e| failure(e.into()))?;
+        let complete = dataset.len() <= limit;
+        let events: Vec<Value> = dataset
+            .into_iter()
+            .take(limit)
+            .map(|positioned| serde_json::to_value(&positioned).map_err(invalid))
+            .collect::<Result<_, _>>()?;
+        return Ok(json!({"events": events, "complete": complete}));
+    }
     let mut events: Vec<Value> = Vec::new();
     let mut exhausted = true;
     for run_id in runs {
@@ -1120,6 +1165,26 @@ async fn permissions_audit_page(b: &JournalBackend, p: &Value) -> Result<Value, 
         }
     }
     events.truncate(limit);
+    // 追加数据集级权限事实（无 run 范围、无 decision 过滤时）：审批审计之外
+    // 的「谁改了权限 / 谁授予了插件」同属权限审计面（09 §10.3）。
+    if run_id.is_none() && decision.is_none() && events.len() < limit {
+        let remaining = limit - events.len();
+        let dataset = tokio::task::spawn_blocking({
+            let root = root.clone();
+            let identity = identity.clone();
+            move || {
+                flow_journal::page::dataset_permission_events(&root, &identity, 1, remaining + 1)
+            }
+        })
+        .await
+        .map_err(invalid)?
+        .map_err(|e| failure(e.into()))?;
+        // 数据集段截断时整页不算读完（续读游标由 CLI 从末条 run_id=null 事件推导）。
+        exhausted &= dataset.len() <= remaining;
+        for positioned in dataset.into_iter().take(remaining) {
+            events.push(serde_json::to_value(&positioned).map_err(invalid)?);
+        }
+    }
     Ok(json!({
         "events": events,
         "complete": exhausted,

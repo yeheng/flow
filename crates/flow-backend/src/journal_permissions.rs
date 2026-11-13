@@ -282,6 +282,14 @@ fn approval_item(run: &Run, node_id: &str, approval: &ApprovalState) -> Value {
         }
         None => Value::Null,
     };
+    let needs = if approval.request.specs.is_empty() && approval.gate == "node" {
+        // G4 插件节点：卡片展示 manifest 需求（master 侧权威来源）。
+        crate::policy::plugin_needs_for_type(&approval.request.context.node_type)
+            .map(|(_, needs, _)| needs.iter().map(|cap| cap.to_json()).collect::<Vec<_>>())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     json!({
         "run_id": run.run_id,
         "workflow_id": run.workflow_id,
@@ -293,6 +301,7 @@ fn approval_item(run: &Run, node_id: &str, approval: &ApprovalState) -> Value {
         "request_hash": approval.request.request_hash,
         "actor": approval.request.actor,
         "specs": approval.request.specs,
+        "needs": needs,
         "context": approval.request.context,
         "policy_digest": approval.request.policy_digest,
         "matched": approval.matched,
@@ -402,18 +411,39 @@ fn decide(
         return Ok((vec![event], json!({"decision": "denied"})));
     }
     // 批准时重新评估（能力期限相对提交时刻求值；过期/撤权直接拒绝，§4）。
-    let evaluation = crate::policy::check(
-        &crate::policy::CheckInput {
-            specs: &approval.request.specs,
-            actor: &approval.request.actor,
-            node_id: command.node_id,
-            request_fingerprint: &fingerprint,
-            plugin_id: None,
-        },
-        policy,
-        &run.approvals,
-        now,
-    );
+    // G4 插件节点请求无 concrete spec（specs 为空 + 类型解析到已部署插件）：
+    // 用 manifest 需求重跑包含评估，而不是空集拒绝。
+    let plugin_recheck = (approval.request.specs.is_empty() && approval.gate == "node")
+        .then(|| crate::policy::plugin_needs_for_type(&approval.request.context.node_type))
+        .flatten();
+    let evaluation = if let Some((plugin_id, needs, unrestricted)) = &plugin_recheck {
+        crate::policy::check_plugin_needs(
+            &crate::policy::PluginNeedsInput {
+                plugin_id,
+                node_id: command.node_id,
+                actor: &approval.request.actor,
+                needs,
+                request_fingerprint: &fingerprint,
+                unrestricted: *unrestricted,
+            },
+            policy,
+            &run.approvals,
+            now,
+        )
+    } else {
+        crate::policy::check(
+            &crate::policy::CheckInput {
+                specs: &approval.request.specs,
+                actor: &approval.request.actor,
+                node_id: command.node_id,
+                request_fingerprint: &fingerprint,
+                plugin_id: None,
+            },
+            policy,
+            &run.approvals,
+            now,
+        )
+    };
     let matched = match evaluation {
         crate::policy::Evaluation::Deny { reason: denied, .. } => {
             let event = node_event(
@@ -571,7 +601,7 @@ pub fn effective_permissions(
             "allow": c.allow.iter().map(flow_dto::permission::Capability::to_json).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
         "diagnostics": definition.permission_diagnostics(),
-        "start_gate": crate::policy::start_gate(definition).err(),
+        "start_gate": crate::policy::start_gate(definition, &frozen.plugin_ceilings).err(),
     })
 }
 

@@ -50,10 +50,51 @@ pub struct RegisteredPlugin {
     pub binary: PathBuf,
     /// plugin-proto 协议版本（快筛值；握手权威）。
     pub protocol: u32,
+    /// 内容身份（I35）：sha256(manifest 字节 ‖ entry 字节)。内置默认注册
+    /// 无 manifest，为空串（内置节点不走 plugin_node 授权链）。
+    pub content_hash: String,
     /// UI 投影（未来 run 快照冻结物；R1 先解析携带）。
     pub ui: Option<plugin_manifest::UiProjection>,
     /// 注册来源。
     pub source: RegistrationSource,
+}
+
+impl RegisteredPlugin {
+    /// I35：spawn 前复核内容哈希（注册后二进制/manifest 被换掉 → 拒绝）。
+    /// 内置默认注册（无 manifest）不参与复核。
+    pub fn recheck_content_hash(&self) -> Result<(), String> {
+        let RegistrationSource::Manifest(manifest_path) = &self.source else {
+            return Ok(());
+        };
+        let (manifest_bytes, entry_bytes) = (
+            std::fs::read(manifest_path).map_err(|e| format!("manifest 不可读：{e}"))?,
+            std::fs::read(&self.binary).map_err(|e| format!("入口不可读：{e}"))?,
+        );
+        let current = content_hash(&manifest_bytes, &entry_bytes);
+        if current != self.content_hash {
+            return Err(format!(
+                "插件 {} 内容已变化（注册时 {}，当前 {}）：需重新授予后才能执行（I35）",
+                self.plugin_id,
+                &self.content_hash[..8.min(self.content_hash.len())],
+                &current[..8.min(current.len())],
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// 内容身份：sha256(manifest 字节 ‖ entry 字节)——与 master 侧
+/// `flow_backend::plugin_registry::content_hash` 同一公式。
+fn content_hash(manifest_bytes: &[u8], entry_bytes: &[u8]) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(manifest_bytes);
+    hasher.update(entry_bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// 节点类型 → 插件注册的路由表。
@@ -113,6 +154,7 @@ impl PluginRegistry {
                         invoke_method: invoke.into(),
                         binary,
                         protocol: flow_plugin_sdk::protocol::PROTOCOL_VERSION,
+                        content_hash: String::new(),
                         ui: None,
                         source: RegistrationSource::Default,
                     },
@@ -243,12 +285,14 @@ impl PluginRegistry {
             ));
             return;
         }
+        let entry_bytes = std::fs::read(&binary).unwrap_or_default();
         let registration = RegisteredPlugin {
             plugin_id: manifest.plugin.id.clone(),
             version: manifest.plugin.version.clone(),
             invoke_method: manifest.methods.invoke.clone(),
             binary,
             protocol: manifest.plugin.protocol,
+            content_hash: content_hash(text.as_bytes(), &entry_bytes),
             ui: Some(manifest.ui_projection()),
             source: RegistrationSource::Manifest(manifest_path.to_path_buf()),
         };
@@ -408,6 +452,7 @@ invoke = "agent/runTurn"
                 invoke_method: "agent/runTurn".into(),
                 binary: PathBuf::from("/nonexistent-default"),
                 protocol: 1,
+                content_hash: String::new(),
                 ui: None,
                 source: RegistrationSource::Default,
             },

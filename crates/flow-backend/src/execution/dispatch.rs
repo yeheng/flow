@@ -1328,13 +1328,6 @@ impl DispatchRunner {
         // 子 run：静态门与策略冻结（§3.5）。子工作流拥有独立冻结策略，父
         // 节点的有效层作为上限逐层 AND，不继承父节点凭据；回归候选零外部
         // 调用，不经静态门。缺策略快照的旧父 run 只按子定义自身冻结。
-        if run
-            .execution
-            .as_ref()
-            .is_none_or(|snapshot| snapshot.regression.is_none())
-        {
-            crate::policy::start_gate(&definition).map_err(flow_journal::Error::Forbidden)?;
-        }
         let agent_plugin_id = run
             .execution
             .as_ref()
@@ -1345,6 +1338,14 @@ impl DispatchRunner {
             agent_plugin_id.as_deref(),
         )
         .await;
+        if run
+            .execution
+            .as_ref()
+            .is_none_or(|snapshot| snapshot.regression.is_none())
+        {
+            crate::policy::start_gate(&definition, &child_ceilings)
+                .map_err(flow_journal::Error::Forbidden)?;
+        }
         let child_policy = match &run.policy {
             Some(parent_policy) => crate::policy::freeze_child(
                 &definition,
@@ -1787,7 +1788,16 @@ impl DispatchRunner {
                                     ),
                             );
                         }
-                        let credentials = resolve_credentials_from_specs(&request.specs);
+                        let credentials = if request.specs.is_empty() {
+                            // G4 插件节点：无 concrete spec，凭证按 manifest 的
+                            // Secret 字段引用解析（I37）。
+                            resolve_plugin_credentials(
+                                &self.node.node_type,
+                                &request_value["params"],
+                            )
+                        } else {
+                            resolve_credentials_from_specs(&request.specs)
+                        };
                         // Reserve capacity before taking the decision lock. Enqueue under
                         // that same lock: a cancellation committed before this point must
                         // prevent delivery, not merely stop a later scheduling tick.
@@ -2426,9 +2436,100 @@ fn evaluate_node_request(
         node_id: attempt.node_id.clone(),
     };
     let record = run.nodes.get(&attempt.node_id);
-    let (specs, derive_error) = match crate::policy::derive::derive_specs(node, request_value) {
-        Ok(specs) => (specs, None),
-        Err(reason) => (Vec::new(), Some(reason)),
+    // G4：动态插件节点——需求来自 master 侧 manifest（不信任执行器自报），
+    // 元 concrete spec；未部署/未声明均按能力拒绝。
+    let plugin_needs = if node.kind().is_none() {
+        match crate::policy::plugin_needs_for_type(&node.node_type) {
+            Some(found) => {
+                // I35：执行器上报身份必须与 master 侧一致（远程执行器二进制
+                // 与授予快照脱钩 → 拒绝）。
+                if let Err(reason) = crate::policy::verify_plugin_identity(
+                    &found.0,
+                    &run.policy
+                        .as_ref()
+                        .and_then(|policy| {
+                            policy
+                                .plugin_ceilings
+                                .iter()
+                                .find(|ceiling| ceiling.plugin_id == found.0)
+                                .map(|ceiling| ceiling.content_hash.clone())
+                        })
+                        .unwrap_or_default(),
+                    &request_value["plugin"],
+                ) {
+                    let request = PermissionRequest {
+                        actor,
+                        operation_id: operation_id.to_string(),
+                        specs: Vec::new(),
+                        context: RequestContext {
+                            run_id: attempt.run_id.clone(),
+                            workflow_id: run.workflow_id.clone(),
+                            workflow_version: run.workflow_version,
+                            node_id: attempt.node_id.clone(),
+                            node_type: node.node_type.clone(),
+                            dispatch_id: attempt.dispatch_id.clone(),
+                            attempt: record.map_or(0, |record| record.attempt),
+                            request_fingerprint: request_fingerprint.to_string(),
+                            tool_call_id: None,
+                        },
+                        policy_digest: run
+                            .policy
+                            .as_ref()
+                            .map(|policy| policy.digest.clone())
+                            .unwrap_or_default(),
+                        request_hash: String::new(),
+                    }
+                    .sealed();
+                    return G3Decision::Deny {
+                        reason,
+                        request: Some(request),
+                    };
+                }
+                Some(found)
+            }
+            None => {
+                let request = PermissionRequest {
+                    actor,
+                    operation_id: operation_id.to_string(),
+                    specs: Vec::new(),
+                    context: RequestContext {
+                        run_id: attempt.run_id.clone(),
+                        workflow_id: run.workflow_id.clone(),
+                        workflow_version: run.workflow_version,
+                        node_id: attempt.node_id.clone(),
+                        node_type: node.node_type.clone(),
+                        dispatch_id: attempt.dispatch_id.clone(),
+                        attempt: record.map_or(0, |record| record.attempt),
+                        request_fingerprint: request_fingerprint.to_string(),
+                        tool_call_id: None,
+                    },
+                    policy_digest: run
+                        .policy
+                        .as_ref()
+                        .map(|policy| policy.digest.clone())
+                        .unwrap_or_default(),
+                    request_hash: String::new(),
+                }
+                .sealed();
+                return G3Decision::Deny {
+                    reason: format!(
+                        "节点类型 {} 的插件未部署（manifest 缺失或已下架）：拒绝执行",
+                        node.node_type
+                    ),
+                    request: Some(request),
+                };
+            }
+        }
+    } else {
+        None
+    };
+    let (specs, derive_error) = match (
+        &plugin_needs,
+        crate::policy::derive::derive_specs(node, request_value),
+    ) {
+        (Some(_), _) => (Vec::new(), None),
+        (None, Ok(specs)) => (specs, None),
+        (None, Err(reason)) => (Vec::new(), Some(reason)),
     };
     let request = PermissionRequest {
         actor: actor.clone(),
@@ -2466,18 +2567,42 @@ fn evaluate_node_request(
             request: Some(request),
         };
     }
-    let evaluation = crate::policy::check(
-        &crate::policy::CheckInput {
-            specs: &request.specs,
-            actor: &actor,
-            node_id: &attempt.node_id,
-            request_fingerprint,
-            plugin_id: None,
-        },
-        policy,
-        &run.approvals,
-        evaluated_at,
-    );
+    let evaluation = if let Some((plugin_id, needs, unrestricted)) = &plugin_needs {
+        // 存量 e2e 免裁钩子（与工具级同一开关）：声明式需求直接 System 放行，
+        // 但事实照落（PermissionDecided{System, test-hook}）。
+        if crate::journal_commands::tests_auto_govern() {
+            crate::policy::Evaluation::Allow {
+                matched: vec!["test-hook".into()],
+            }
+        } else {
+            crate::policy::check_plugin_needs(
+                &crate::policy::PluginNeedsInput {
+                    plugin_id,
+                    node_id: &attempt.node_id,
+                    actor: &actor,
+                    needs,
+                    request_fingerprint,
+                    unrestricted: *unrestricted,
+                },
+                policy,
+                &run.approvals,
+                evaluated_at,
+            )
+        }
+    } else {
+        crate::policy::check(
+            &crate::policy::CheckInput {
+                specs: &request.specs,
+                actor: &actor,
+                node_id: &attempt.node_id,
+                request_fingerprint,
+                plugin_id: None,
+            },
+            policy,
+            &run.approvals,
+            evaluated_at,
+        )
+    };
     match evaluation {
         crate::policy::Evaluation::Allow { matched } => G3Decision::Allow { request, matched },
         crate::policy::Evaluation::Deny { reason, .. } => G3Decision::Deny {
@@ -2565,6 +2690,38 @@ fn resolve_credentials_from_request(request: &Value) -> Vec<PermitCredential> {
             }])
         })
         .unwrap_or_default()
+}
+
+/// G4：插件节点凭证解析（I37）：manifest 的 `Widget::Secret` 字段在请求
+/// params 里携带的是秘密名引用；全部需求获准后逐项解析交付。
+fn resolve_plugin_credentials(node_type: &str, params: &Value) -> Vec<PermitCredential> {
+    let Some(found) = crate::plugin_registry::discover_plugins()
+        .into_iter()
+        .find(|found| {
+            found
+                .manifest
+                .ui
+                .params_forms
+                .iter()
+                .any(|form| form.node_type == node_type)
+        })
+    else {
+        return Vec::new();
+    };
+    found
+        .manifest
+        .ui
+        .params_forms
+        .iter()
+        .filter(|form| form.node_type == node_type)
+        .flat_map(|form| form.fields.iter())
+        .filter(|field| matches!(field.widget, flow_config::plugin_manifest::Widget::Secret))
+        .map(|field| field.key.clone())
+        .filter_map(|key| params.get(&key).and_then(Value::as_str).map(str::to_string))
+        .flat_map(|name| {
+            resolve_credentials_from_specs(&[OperationSpec::Secret { secret_name: name }])
+        })
+        .collect()
 }
 
 /// 工具级拒绝：落 Deny 事实（审计一条不少）并回拒（不阻塞回合——插件

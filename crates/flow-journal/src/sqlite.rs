@@ -28,46 +28,10 @@ use crate::{invalid, Error, Result, MAX_VALUE_BYTES};
 pub const DATABASE: &str = "flow.sqlite";
 /// 存储格式版本。
 ///
-/// 版本 4 与版本 3 表结构相同，差别在于「语义门」：旧程序读到版本 4 必须
-/// 拒绝把它当 legacy DAG 解释，而不是按旧语义误读。
+/// v5 在 v4 基础上补齐哈希链列（prev_digest/chain_digest）；v5 起不再提供
+/// 打开路径的旧版本迁移——旧库（v4 及更早）一律拒绝，需要保留数据时用
+/// flow-journal-tool upgrade（离线复制升级，仅支持格式 3）。
 pub const FORMAT: i64 = 5;
-
-/// v4 → v5 原地迁移（09 §10.2）：补 prev_digest/chain_digest 列并顺链回填。
-/// 旧库的 digest 自身仍是可信基线（读侧一直复核 body==digest），迁移把
-/// 它们串成链；此后改任何一帧，其后全部链断。
-fn migrate_v4_to_v5(conn: &mut Connection) -> Result<()> {
-    let tx = conn.transaction().map_err(db)?;
-    tx.execute_batch(
-        "ALTER TABLE transactions ADD COLUMN prev_digest TEXT NOT NULL DEFAULT '';
-         ALTER TABLE transactions ADD COLUMN chain_digest TEXT NOT NULL DEFAULT '';",
-    )
-    .map_err(db)?;
-    let rows: Vec<(String, String)> = {
-        let mut statement = tx
-            .prepare("SELECT lsn, digest FROM transactions ORDER BY lsn")
-            .map_err(db)?;
-        let mapped = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(db)?;
-        mapped
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(db)?
-    };
-    let mut prev = String::new();
-    for (lsn, digest) in rows {
-        let chain = chain_digest(&prev, &digest);
-        tx.execute(
-            "UPDATE transactions SET prev_digest = ?1, chain_digest = ?2 WHERE lsn = ?3",
-            rusqlite::params![prev, chain, lsn],
-        )
-        .map_err(db)?;
-        prev = chain;
-    }
-    tx.execute_batch("PRAGMA user_version=5;").map_err(db)?;
-    tx.commit().map_err(db)
-}
 
 /// 链值 = SHA-256(prev_chain ‖ body_digest)。与文档 §10.2 等价：改任何
 /// 一帧的 body → 该帧 digest 变 → 链断；改链列本身 → verify 复算即断。
@@ -222,7 +186,9 @@ pub fn read_connection(root: &Path) -> Result<Connection> {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(db)?;
     if version != FORMAT {
-        return Err(invalid("unsupported SQLite storage format; use flow-journal-tool upgrade <source> <new-directory> for format 3"));
+        return Err(invalid(
+            "unsupported SQLite storage format; use flow-journal-tool upgrade <source> <new-directory> for format 3",
+        ));
     }
     Ok(conn)
 }
@@ -513,11 +479,10 @@ impl Disk {
                     return Err(invalid("unsupported SQLite storage format"));
                 }
                 initialize = true;
-            } else if version == 4 && FORMAT == 5 {
-                // v4 → v5（09 §10.2 哈希链）：补列 + 顺链回填（单事务）。
-                migrate_v4_to_v5(&mut conn)?;
             } else if version != FORMAT {
-                return Err(invalid("unsupported SQLite storage format; format 3 can be copied with flow-journal-tool upgrade <source> <new-directory>"));
+                return Err(invalid(format!(
+                    "unsupported SQLite storage format {version}; this build requires v5 (hash chain) and no longer migrates v4 in place; recreate the dataset or use an earlier build / flow-journal-tool upgrade (format 3 only)"
+                )));
             } else {
                 metadata(&conn)?;
             }
@@ -864,6 +829,34 @@ impl Disk {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v4 及更旧版本不再原地迁移：打开必须拒绝，而不是把无链列的旧库
+    /// 当 v5 继续写（那会产出链列全空的伪 v5 库）。
+    #[test]
+    fn v4_database_is_rejected_not_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DATABASE);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE transactions(lsn TEXT PRIMARY KEY);
+             PRAGMA user_version=4; PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .unwrap();
+        drop(conn);
+        let error = Disk::open(dir.path(), FaultInjection::default())
+            .err()
+            .expect("v4 库必须被拒绝");
+        assert!(error.to_string().contains("format 4"), "{error}");
+        assert!(
+            error.to_string().contains("no longer migrates v4"),
+            "{error}"
+        );
+        // 只读连接同样拒绝（与写路径同一版本门）。
+        let error = read_connection(dir.path())
+            .expect_err("只读连接也必须拒绝 v4");
+        assert!(error.to_string().contains("unsupported"), "{error}");
+    }
+
     /// 钉住「磁盘写满」的失败语义：事实、当前行与提交水位必须一起回滚，
     /// 且重启后仍然是提交前的那一份权威，而不是半套数据。
     #[test]

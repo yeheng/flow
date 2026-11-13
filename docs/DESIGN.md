@@ -1,6 +1,6 @@
 # flow 工作流引擎设计文档（索引）
 
-> 状态：**当前工作区代码的实际语义**（2026-10-24 校订）。本文件是设计文档的**索引与总纲**，
+> 状态：**当前工作区代码的实际语义**（2026-11 复校：crate 结构对齐 flow-store 并入 flow-journal、flow-executor 并入 flow-plugin-runtime 之后的现状）。本文件是设计文档的**索引与总纲**，
 > 详细设计按章节拆分在 [`design/`](design/) 下；各分篇保留原 § 编号，跨篇引用按
 > 「文档地图」的覆盖章节回查即可。本套文档不保留历史设计记录；被删除的 v1
 > （SQLite/Postgres 双后端、Driver/Engine/fold 事件面、`run_tail`、NodeSlot 状态机）

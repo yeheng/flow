@@ -282,17 +282,9 @@ pub fn rebuild_index(root: &Path, upper_lsn: u64) -> Result<Recovery> {
     Ok(report)
 }
 
-/// Format 4 fences older executors from interpreting semantics-2 runs as legacy
-/// DAGs. The SQL schema is unchanged. Upgrade a consistent COPY; never edit or
-/// overwrite the source. The caller must hold the source's offline lock.
-///
-/// 把格式 3 的一致副本升级为格式 4：表结构不变，只在副本上写 `user_version=4`，
-/// 以此给旧执行器设「语义门」，不让它们把新语义当成 legacy DAG 解释。
-/// 源目录只读、绝不改写；调用方必须持有源目录的离线排他锁。
-///
-/// # Errors
-/// 源格式不是 3、目标不合法或升级副本校验失败时返回错误，源库始终不变。
-/// v4/v3 → v5 链列迁移（备份库上执行；语义与打开路径的 v4→v5 相同）。
+/// v3/v4 → v5 链列迁移（离线 upgrade 工具在备份库上执行）：无链列时
+/// ALTER 补列，顺链回填 prev/chain 摘要；此后改任何一帧，其后全部链断。
+/// 幂等：列已在（降级标记的 v5 库）时只回填。
 fn migrate_chain_columns(conn: &mut rusqlite::Connection) -> Result<()> {
     // 幂等：v3（无链列）补列；已被降级标记的 v5 库（列已在）只回填。
     let has_prev: bool = {
@@ -339,6 +331,12 @@ fn migrate_chain_columns(conn: &mut rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
+/// 离线升级：把格式 3 源库的一致副本升级为 v5（备份 → 补链列 → 顺链回填
+/// → 写 user_version=5）。源库只读、绝不改写；产物经 verify 顺链校验。
+/// 打开路径不再做任何原地迁移（v4 库直接拒绝）；需要保留旧数据只有这一条路。
+///
+/// # Errors
+/// 源格式不是 3、目标不合法或升级副本校验失败时返回错误，源库始终不变。
 pub fn upgrade(source: &Path, destination: &Path) -> Result<Recovery> {
     let database = source.join(crate::sqlite::DATABASE);
     if fs::symlink_metadata(&database)?.file_type().is_symlink() {

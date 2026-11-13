@@ -258,50 +258,55 @@ pub fn workspace_bin(name: &str) -> PathBuf {
 /// 这些函数存在的意义是让「找不到二进制」的错误在**测试启动前**就爆出来，
 /// 而不是等到某个用例跑到一半才失败。
 pub fn server_bin() -> PathBuf {
+    ensure_bin("flow-journal-server", "flow-rpc");
     workspace_bin("flow-journal-server")
 }
 
 /// CLI 产品的二进制路径（flow-cli）。
 pub fn cli_bin() -> PathBuf {
+    ensure_bin("flow-cli", "flow-cli");
     workspace_bin("flow-cli")
 }
 
 /// flow-agent 的二进制路径。
 pub fn agent_bin() -> PathBuf {
+    ensure_bin("flow-agent", "flow-agent");
     workspace_bin("flow-agent")
 }
 
 /// flow-executor 的二进制路径（执行器子进程本体）。
 pub fn executor_bin() -> PathBuf {
+    ensure_bin("flow-executor", "flow-plugin-runtime");
     workspace_bin("flow-executor")
 }
 
 /// journal-server 的二进制路径（与 `server_bin` 同物，此处保留独立名字
 /// 以便调用方表意更清楚）。
-/// flow-agent-plugin（agent-plugin 独立 workspace 的 bin）。
+/// flow-agent-plugin（根 workspace 成员 plugins/harness/plugin 的 bin）。
 ///
-/// 与 workspace_bin 不同：它不是本 workspace 的成员，缺产物时先按需构建
-/// （显式 CARGO_TARGET_DIR 共享本仓库 target），再走同一套定位。这样
-/// `cargo test -p backend-e2e` 单独跑也能自举。
+/// 与 workspace_bin 不同：缺产物时先按需构建（显式 CARGO_TARGET_DIR
+/// 共享本仓库 target），再走同一套定位。这样 `cargo test -p flow-e2e`
+/// 单独跑也能自举。
 pub fn agent_plugin_bin() -> PathBuf {
-    let root = repo_root();
-    if !workspace_bin_exists("flow-agent-plugin") {
-        let status =
-            std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
-                .current_dir(root)
-                .env("CARGO_TARGET_DIR", root.join("target"))
-                .args([
-                    "build",
-                    "--manifest-path",
-                    "agent-plugin/Cargo.toml",
-                    "--bins",
-                    "--locked",
-                ])
-                .status()
-                .expect("spawn cargo for agent-plugin");
-        assert!(status.success(), "cargo build agent-plugin failed");
-    }
+    ensure_bin("flow-agent-plugin", "flow-harness-plugin");
     workspace_bin("flow-agent-plugin")
+}
+
+/// 缺件自建：`cargo test` 只编译测试目标，不保证产出裸 bin 硬链；
+/// 定位器在缺失时按所属包按需构建（cargo 文件锁自然串行化并发自建）。
+fn ensure_bin(bin: &str, package: &str) {
+    if workspace_bin_exists(bin) {
+        return;
+    }
+    let root = repo_root();
+    let status =
+        std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+            .current_dir(root)
+            .env("CARGO_TARGET_DIR", root.join("target"))
+            .args(["build", "-p", package, "--bin", bin, "--locked"])
+            .status()
+            .unwrap_or_else(|error| panic!("spawn cargo for {bin}: {error}"));
+    assert!(status.success(), "cargo build {bin} ({package}) failed");
 }
 
 fn workspace_bin_exists(name: &str) -> bool {
@@ -324,32 +329,17 @@ fn workspace_bin_exists(name: &str) -> bool {
 /// flow-llm-plugin（llm-plugin 独立 workspace 的 bin）：与 agent_plugin_bin
 /// 同一套自举与定位约定。
 pub fn llm_plugin_bin() -> PathBuf {
-    let root = repo_root();
-    if !workspace_bin_exists("flow-llm-plugin") {
-        let status =
-            std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
-                .current_dir(root)
-                .env("CARGO_TARGET_DIR", root.join("target"))
-                .args([
-                    "build",
-                    "--manifest-path",
-                    "llm-plugin/Cargo.toml",
-                    "--bins",
-                    "--locked",
-                ])
-                .status()
-                .expect("spawn cargo for llm-plugin");
-        assert!(status.success(), "cargo build llm-plugin failed");
-    }
+    ensure_bin("flow-llm-plugin", "flow-llm-plugin");
     workspace_bin("flow-llm-plugin")
 }
 
 pub fn journal_server_bin() -> PathBuf {
-    workspace_bin("flow-journal-server")
+    server_bin()
 }
 
 /// 开发用 journal 工具的二进制路径。
 pub fn journal_dev_bin() -> PathBuf {
+    ensure_bin("flow-journal-dev", "flow-backend");
     workspace_bin("flow-journal-dev")
 }
 

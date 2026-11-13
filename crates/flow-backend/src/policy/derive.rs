@@ -93,15 +93,61 @@ fn http_specs(request: &Value) -> Result<Vec<OperationSpec>, String> {
     let headers_digest = canonical_digest(&request["headers"].clamp_object());
     let body_digest = canonical_digest(&request["body"].clamp_object());
     let mut specs = vec![OperationSpec::Http {
-        method,
+        method: method.clone(),
         url,
-        headers_digest,
-        body_digest,
+        headers_digest: headers_digest.clone(),
+        body_digest: body_digest.clone(),
     }];
+    if let Some(proxy) = proxy_spec(request, &method, &headers_digest, &body_digest)? {
+        specs.push(proxy);
+    }
     if let Some(secret) = secret_spec(request) {
         specs.push(secret);
     }
     Ok(specs)
+}
+
+/// proxy 参数 → 代理出站点的第二条 Net 需求。
+///
+/// 设了代理的请求有两条出站路径：目标 URL 之外，字节的实际去向是代理
+/// 主机（http 目标可见全部载荷；https 目标也拿到 CONNECT 的目标主机）。
+/// 只按目标 URL 授权等于允许「经 proxy 参数向任意主机外发字节」，因此
+/// 代理 origin 派生为额外一条 Http 需求——需求集合内 AND、层内 OR：
+/// 目标与代理各自需要 Net 能力覆盖，缺一即 Deny（09 §13.2）。
+///
+/// spec URL 归一化为 `scheme://host[:port]/`：剥 userinfo（代理凭据不进
+/// 需求与审计；完整请求字节仍由指纹绑定）、剥 path/query（授权只需
+/// 覆盖 origin）。method/摘要与目标 spec 相同——http 代理可见完整载荷，
+/// https 隧道下这是更严的绑定而非更宽。scheme 限 http/https，与
+/// [`validate_url_prefix`](flow_dto::permission) 的授权面一致。
+fn proxy_spec(
+    request: &Value,
+    method: &str,
+    headers_digest: &str,
+    body_digest: &str,
+) -> Result<Option<OperationSpec>, String> {
+    let Some(proxy) = request["proxy"].as_str().filter(|s| !s.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let parsed = url::Url::parse(proxy).map_err(|e| format!("proxy URL 非法：{e}"))?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(format!(
+            "proxy 只支持 http/https（与 Net 授权的 url_prefix 一致）：{proxy}"
+        ));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| format!("proxy URL 缺少主机：{proxy}"))?;
+    let origin = match parsed.port() {
+        Some(port) => format!("{}://{host}:{port}/", parsed.scheme()),
+        None => format!("{}://{host}/", parsed.scheme()),
+    };
+    Ok(Some(OperationSpec::Http {
+        method: method.to_string(),
+        url: origin,
+        headers_digest: headers_digest.to_string(),
+        body_digest: body_digest.to_string(),
+    }))
 }
 
 /// credential.secret_ref → Secret 需求（只以引用参与请求，真值走凭据通道）。
@@ -359,6 +405,69 @@ mod tests {
         )
         .unwrap();
         assert_eq!(specs.len(), 1);
+    }
+
+    #[test]
+    fn proxy_derives_second_net_need_normalized_to_origin() {
+        let node = node("http_call", json!({}));
+        // 带 userinfo/path/query 的代理：spec 只取 origin，凭据与路径不进需求。
+        let specs = derive_specs(
+            &node,
+            &json!({
+                "method": "GET", "url": "https://api.example.com/v1",
+                "headers": {}, "body": null,
+                "proxy": "http://user:pass@proxy.local:8080/ignored?x=1"
+            }),
+        )
+        .unwrap();
+        assert_eq!(specs.len(), 2, "目标 + 代理两条 Net 需求");
+        match &specs[1] {
+            OperationSpec::Http { method, url, .. } => {
+                assert_eq!(method, "GET");
+                assert_eq!(url, "http://proxy.local:8080/");
+            }
+            other => panic!("proxy spec 形状错误：{other:?}"),
+        }
+        // 代理 origin 必须能被同前缀的能力覆盖（端到端匹配面自洽）。
+        let grant = flow_dto::permission::parse_capability(&json!({
+            "id": "p", "action": "net", "methods": ["GET"],
+            "url_prefix": "http://proxy.local:8080/", "approval": "auto"
+        }))
+        .unwrap();
+        assert!(grant.pattern.matches(&specs[1]));
+
+        // 默认端口归一：无端口的 https 代理。
+        let specs = derive_specs(
+            &node,
+            &json!({
+                "method": "GET", "url": "https://a.b/", "headers": {}, "body": null,
+                "proxy": "https://proxy.internal"
+            }),
+        )
+        .unwrap();
+        assert!(matches!(&specs[1], OperationSpec::Http { url, .. } if url == "https://proxy.internal/"));
+
+        // 空串/缺失/null（llm 节点的默认形态）→ 无代理需求。
+        for proxy in [json!(""), json!(null)] {
+            let specs = derive_specs(
+                &node,
+                &json!({"method":"GET","url":"https://a.b/","headers":{},"body":null,"proxy":proxy}),
+            )
+            .unwrap();
+            assert_eq!(specs.len(), 1, "proxy={proxy} 不产生需求");
+        }
+
+        // socks5 代理与非法 URL：fail-closed，派生失败即 Deny。
+        for proxy in ["socks5://proxy.local:1080", "not a url"] {
+            assert!(
+                derive_specs(
+                    &node,
+                    &json!({"method":"GET","url":"https://a.b/","headers":{},"body":null,"proxy":proxy}),
+                )
+                .is_err(),
+                "proxy={proxy} 应拒绝派生"
+            );
+        }
     }
 
     #[test]
