@@ -609,23 +609,33 @@ impl JournalBackend {
     /// `plugins.list`：已部署插件 + 内容身份 + 授予状态（UI 授予页的
     /// 唯一数据源；未部署的内置插件不出现在这里）。
     pub async fn plugins_view(&self) -> Vec<Value> {
-        let plugins = crate::plugin_registry::discover_plugins();
+        let snapshot = match tokio::task::spawn_blocking(crate::plugin_registry::installed_snapshot).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(%error, "plugin scan worker failed");
+                return Vec::new();
+            }
+        };
         let grants = self.inspect(|state| state.plugin_grants.clone()).await;
-        plugins
-            .iter()
-            .map(|plugin| {
+        let running = self.services.lock().await.keys().cloned().collect::<std::collections::BTreeSet<_>>();
+        snapshot.rows.iter().map(|row| {
+            let value = if let Some(plugin) = &row.plugin {
                 let key = flow_engine::journal_state::PluginGrant::key(
-                    &plugin.manifest.plugin.id,
-                    &plugin.content_hash,
+                    &plugin.manifest.plugin.id, &plugin.content_hash,
                 );
                 let exact = grants.get(&key);
-                let hash_mismatch = !exact.is_some()
-                    && grants
-                        .values()
-                        .any(|grant| grant.plugin_id == plugin.manifest.plugin.id);
+                let hash_mismatch = exact.is_none() && grants.values()
+                    .any(|grant| grant.plugin_id == plugin.manifest.plugin.id);
                 crate::plugin_registry::plugin_list_entry_with_grant(plugin, exact, hash_mismatch)
-            })
-            .collect()
+            } else {
+                json!({"name": row.id, "grant_state": "unavailable",
+                    "version": row.manifest.as_ref().map(|m| m.plugin.version.clone()).unwrap_or_default(),
+                    "node_types": row.manifest.as_ref().map(|m| m.plugin.node_types.clone()).unwrap_or_default()})
+            };
+            let mut value = row.annotate(value);
+            value["running"] = json!(running.contains(&row.id));
+            value
+        }).collect()
     }
 }
 

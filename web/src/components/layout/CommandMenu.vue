@@ -45,15 +45,21 @@ onUnmounted(() => window.removeEventListener("keydown", onKey));
     <CommandList>
       <CommandEmpty>没有匹配的页面</CommandEmpty>
       <CommandGroup v-for="group in navGroups" :key="group.title" :heading="group.title">
-        <CommandItem
-          v-for="item in group.items"
-          :key="item.url"
-          :value="item.title"
-          @select="go(item.url)"
-        >
-          <ArrowRight class="size-4 text-muted-foreground" />
-          {{ item.title }}
-        </CommandItem>
+        <template v-for="item in group.items" :key="item.title">
+          <CommandItem v-if="item.url" :value="item.title" @select="go(item.url)">
+            <ArrowRight class="size-4 text-muted-foreground" />
+            {{ item.title }}
+          </CommandItem>
+          <CommandItem
+            v-for="sub in item.items ?? []"
+            :key="sub.url"
+            :value="`${item.title}-${sub.title}`"
+            @select="go(sub.url)"
+          >
+            <ArrowRight class="size-4 text-muted-foreground" />
+            {{ item.title }} / {{ sub.title }}
+          </CommandItem>
+        </template>
       </CommandGroup>
       <CommandSeparator />
       <CommandGroup heading="主题">

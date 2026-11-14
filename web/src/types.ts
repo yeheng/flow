@@ -85,6 +85,15 @@ export interface NodeTypeDesc {
 
 /** plugins.list 条目：已部署插件的 manifest 投影 */
 export interface PluginInfo {
+  load_state?: 'loaded' | 'broken' | 'conflict';
+  load_error?: string | null;
+  directory_name?: string;
+  id_matches_directory?: boolean;
+  entry_contained?: boolean;
+  entry_symlink?: boolean;
+  entry_oversize?: boolean;
+  running?: boolean;
+  service?: boolean;
   id: string;
   name: string;
   version: string;

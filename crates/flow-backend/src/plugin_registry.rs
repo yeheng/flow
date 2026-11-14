@@ -15,7 +15,7 @@ use flow_config::plugin_manifest::ParamsFormDecl;
 use flow_config::plugin_manifest::{parse, FieldDecl, PluginManifest, Widget};
 use serde_json::{json, Value};
 
-/// 发现结果：全部可读 manifest（解析失败的记为 broken，不静默消失）。
+/// 可路由的发现结果；损坏和冲突行保留在 plugin_scan 的扫描快照中。
 #[derive(Debug, Clone)]
 pub struct DiscoveredPlugin {
     pub manifest: PluginManifest,
@@ -45,60 +45,21 @@ pub fn content_hash(manifest_bytes: &[u8], entry_bytes: &[u8]) -> String {
 /// harness 的内置副本**不**在这里注入：发现函数只看显式部署；内置
 /// 兜底仅 harness 配置解析使用（plugin_config），动态类型/列表只认
 /// 已部署 manifest——没部署的插件不该出现在调色板里。
-pub fn discover_plugins() -> Vec<DiscoveredPlugin> {
-    let Some(base) = flow_config::plugin_fs::plugins_root()
-    else {
-        return Vec::new();
-    };
-    let Ok(entries) = std::fs::read_dir(&base) else {
-        return Vec::new();
-    };
-    let mut found = Vec::new();
-    let mut dirs: Vec<_> = entries
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
-        .collect();
-    dirs.sort();
-    for plugin_dir in dirs {
-        let manifest_path = plugin_dir.join("plugin.toml");
-        if !manifest_path.is_file() {
-            continue;
-        }
-        match std::fs::read(&manifest_path)
-            .map_err(|e| e.to_string())
-            .and_then(|bytes| {
-                let text = String::from_utf8(bytes.clone()).map_err(|e| e.to_string())?;
-                let manifest = parse(&text).map_err(|e| e.to_string())?;
-                let entry = resolve_entry(&plugin_dir, &manifest.plugin.entry)
-                    .ok_or_else(|| format!("入口不存在：{}", manifest.plugin.entry))?;
-                let entry_bytes = std::fs::read(&entry).map_err(|e| e.to_string())?;
-                let content_hash = content_hash(&bytes, &entry_bytes);
-                Ok(DiscoveredPlugin {
-                    manifest,
-                    source: plugin_dir,
-                    content_hash,
-                })
-            }) {
-            Ok(plugin) => found.push(plugin),
-            Err(error) => tracing::warn!(
-                ?manifest_path,
-                %error,
-                "插件 manifest 解析失败，不进列表/不接受其节点类型"
-            ),
+pub fn installed_snapshot() -> crate::plugin_scan::PluginSnapshot {
+    let empty = || crate::plugin_scan::PluginSnapshot { rows: Vec::new() };
+    let Some(root) = flow_config::plugin_fs::plugins_root() else { return empty(); };
+    if !root.exists() { return empty(); }
+    match crate::plugin_scan::scan(&root, &BTreeMap::new()) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!(%error, ?root, "plugin scan failed");
+            empty()
         }
     }
-    found
 }
 
-/// 入口路径解析：相对插件目录或绝对路径（与 runtime 侧同规）。
-fn resolve_entry(plugin_dir: &std::path::Path, entry: &str) -> Option<std::path::PathBuf> {
-    let path = std::path::Path::new(entry);
-    if path.is_absolute() {
-        Some(path.to_path_buf())
-    } else {
-        Some(plugin_dir.join(path))
-    }
+pub fn discover_plugins() -> Vec<DiscoveredPlugin> {
+    installed_snapshot().rows.into_iter().filter_map(|row| row.plugin).collect()
 }
 
 /// 动态节点类型集合：已部署 manifest 声明且**不在**编译枚举内的类型名。

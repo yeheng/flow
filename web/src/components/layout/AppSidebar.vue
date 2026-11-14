@@ -1,58 +1,20 @@
 <script setup lang="ts">
-import { useRoute } from "vue-router";
-import {
-  Sidebar,
-  SidebarContent,
-  SidebarFooter,
-  SidebarGroup,
-  SidebarGroupLabel,
-  SidebarHeader,
-  SidebarMenu,
-  SidebarMenuButton,
-  SidebarMenuItem,
-  SidebarRail,
-  useSidebar,
-} from "@/components/ui/sidebar";
-import { navActive, navGroups } from "./nav";
+import { Sidebar, SidebarContent, SidebarFooter, SidebarHeader, SidebarRail } from "@/components/ui/sidebar";
+import { sidebarCollapsible, sidebarVariant } from "./layout-state";
+import { navGroups } from "./nav";
+import NavGroup from "./NavGroup.vue";
 import NavUser from "./NavUser.vue";
 import TeamSwitcher from "./TeamSwitcher.vue";
-
-const route = useRoute();
-const { setOpenMobile } = useSidebar();
-
-function closeMobile(): void {
-  setOpenMobile(false);
-}
 </script>
 
 <template>
-  <Sidebar collapsible="icon" variant="inset">
+  <Sidebar :collapsible="sidebarCollapsible" :variant="sidebarVariant">
     <SidebarHeader>
       <TeamSwitcher />
     </SidebarHeader>
     <SidebarContent>
       <nav class="nav">
-        <SidebarGroup v-for="group in navGroups" :key="group.title">
-          <SidebarGroupLabel>{{ group.title }}</SidebarGroupLabel>
-          <SidebarMenu>
-            <SidebarMenuItem v-for="item in group.items" :key="item.url">
-              <SidebarMenuButton
-                as-child
-                :is-active="navActive(route.path, item.url)"
-                :tooltip="item.title"
-              >
-                <RouterLink
-                  :to="item.url"
-                  :class="{ 'nav-active': navActive(route.path, item.url) }"
-                  @click="closeMobile"
-                >
-                  <component :is="item.icon" />
-                  <span>{{ item.title }}</span>
-                </RouterLink>
-              </SidebarMenuButton>
-            </SidebarMenuItem>
-          </SidebarMenu>
-        </SidebarGroup>
+        <NavGroup v-for="group in navGroups" :key="group.title" :group="group" />
       </nav>
     </SidebarContent>
     <SidebarFooter>

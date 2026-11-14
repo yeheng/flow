@@ -6,9 +6,12 @@ import AppToasts from "./components/AppToasts.vue";
 import AppModal from "./components/AppModal.vue";
 import AppSidebar from "./components/layout/AppSidebar.vue";
 import CommandMenu from "./components/layout/CommandMenu.vue";
+import ConfigDrawer from "./components/layout/ConfigDrawer.vue";
 import HeaderBar from "./components/layout/HeaderBar.vue";
+import ProfileMenu from "./components/layout/ProfileMenu.vue";
 import SearchButton from "./components/layout/SearchButton.vue";
 import ThemeSwitch from "./components/layout/ThemeSwitch.vue";
+import TopNav from "./components/layout/TopNav.vue";
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
 import { environments, refreshEnvironments, selectedEnvironment } from "./state/environments";
 import { refreshSecrets } from "./state/editor";
@@ -43,10 +46,13 @@ watch(
   <SidebarProvider class="h-svh overflow-hidden">
     <a class="skip" href="#content">跳到主内容</a>
     <AppSidebar />
-    <SidebarInset class="h-svh min-h-0 overflow-hidden md:h-[calc(100svh-1rem)]">
+    <SidebarInset class="@container/content h-svh min-h-0 overflow-hidden md:h-[calc(100svh-1rem)]">
       <HeaderBar v-if="!instrument">
-        <SearchButton class="ms-auto" />
+        <TopNav class="me-auto" />
+        <SearchButton />
         <ThemeSwitch />
+        <ConfigDrawer />
+        <ProfileMenu />
       </HeaderBar>
       <div id="content" class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
         <RouterView />

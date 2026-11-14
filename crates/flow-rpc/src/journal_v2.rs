@@ -599,9 +599,10 @@ async fn dispatch_admitted(
 
         // ---- 写命令（CommandReceipt 回执面）：边缘一次 struct 化 ----
         Method::WorkflowValidate => {
-            return b
-                .workflow_validate(p["definition"].clone())
-                .map_err(failure)
+            let backend = b.clone();
+            let definition = p["definition"].clone();
+            return tokio::task::spawn_blocking(move || backend.workflow_validate(definition))
+                .await.map_err(invalid)?.map_err(failure)
         }
         Method::WorkflowImport => {
             let publish = p
@@ -920,8 +921,8 @@ async fn dispatch_admitted(
             let (lease,source,entry_path,declaration,html)=tokio::task::spawn_blocking(move||{
                 let root=flow_config::plugin_fs::plugins_root().ok_or_else(||invalid("plugin root unavailable"))?;
                 let lease=flow_config::plugin_fs::RootLease::shared(&root).map_err(invalid)?;
-            let plugin = flow_backend::plugin_registry::discover_plugins()
-                .into_iter()
+            let plugin = flow_backend::plugin_scan::scan_unlocked(&root, &std::collections::BTreeMap::new())
+                .map_err(invalid)?.rows.into_iter().filter_map(|row| row.plugin)
                 .find(|plugin| plugin.manifest.plugin.id == selected_id)
                 .ok_or_else(|| invalid("plugin not installed"))?;
             let declaration = plugin
@@ -1169,8 +1170,10 @@ async fn dispatch_admitted(
 /// 插件升级收紧闭集后，存量定义可能已非法——这个方法把漂移显式化，
 /// 不等它在凌晨三点的 run 里爆。
 async fn plugins_recheck(ctx: &Context) -> Result<Value, ErrorObjectOwned> {
-    let dynamic = flow_backend::plugin_registry::dynamic_node_types();
-    let forms = flow_backend::plugin_registry::dynamic_params_forms();
+    let snapshot = tokio::task::spawn_blocking(flow_backend::plugin_registry::installed_snapshot)
+        .await.map_err(invalid)?;
+    let dynamic = snapshot.dynamic_types();
+    let forms = snapshot.forms();
     let b = &ctx.backend;
     let workflows = flow_backend::journal_views::list_workflows(b)
         .await

@@ -194,29 +194,71 @@ impl PluginRegistry {
 
     /// manifest 发现：逐子目录找 `plugin.toml`，按合并/拒绝规则装载。
     fn discover(&mut self, dir: &Path) {
+        if !dir.exists() {
+            return;
+        }
+        let _lease = match flow_config::plugin_fs::RootLease::shared(dir) {
+            Ok(lease) => lease,
+            Err(error) => {
+                tracing::warn!(%error, ?dir, "plugin lease unavailable");
+                return;
+            }
+        };
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
             Err(error) => {
-                tracing::warn!(?dir, %error, "plugins 目录不可读，跳过插件发现");
+                tracing::warn!(%error, ?dir, "plugin directory unavailable");
                 return;
             }
         };
         let mut dirs: Vec<_> = entries
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .filter(|path| path.is_dir())
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_dir()
+                    && !p
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .starts_with('.')
+            })
             .collect();
         dirs.sort();
+        let mut candidates = Vec::new();
+        let mut ids = std::collections::BTreeMap::new();
         for plugin_dir in dirs {
             let manifest_path = plugin_dir.join("plugin.toml");
             if !manifest_path.is_file() {
                 continue;
             }
-            match std::fs::read_to_string(&manifest_path) {
-                Ok(text) => self.load_manifest(&manifest_path, &plugin_dir, &text),
-                Err(error) => tracing::warn!(?manifest_path, %error, "manifest 不可读，插件禁用"),
+            let text = (|| -> std::io::Result<String> {
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                std::fs::File::open(&manifest_path)?
+                    .take(262145)
+                    .read_to_end(&mut bytes)?;
+                if bytes.len() > 262144 {
+                    return Err(std::io::Error::other("manifest exceeds 256 KiB"));
+                }
+                String::from_utf8(bytes).map_err(std::io::Error::other)
+            })();
+            match text {
+                Ok(text) => {
+                    let id = plugin_manifest::parse(&text).ok().map(|m| m.plugin.id);
+                    if let Some(id) = &id {
+                        *ids.entry(id.clone()).or_insert(0usize) += 1;
+                    }
+                    candidates.push((manifest_path, plugin_dir, text, id));
+                }
+                Err(error) => tracing::warn!(?manifest_path, %error, "manifest unavailable"),
             }
+        }
+        for (path, dir, text, id) in candidates {
+            if id.as_ref().is_some_and(|id| ids[id] > 1) {
+                tracing::warn!(?path, ?id, "duplicate plugin id; all copies disabled");
+                continue;
+            }
+            self.load_manifest(&path, &dir, &text);
         }
     }
 
@@ -351,6 +393,30 @@ invoke = "agent/runTurn"
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn discovery_disables_duplicate_ids_and_ignores_hidden_directories() {
+        let root = tempdir("duplicate-ids");
+        for (directory, id, node) in [
+            ("a", "duplicate", "one"),
+            ("b", "duplicate", "two"),
+            (".hidden", "hidden", "hidden-node"),
+            ("c", "valid", "valid-node"),
+        ] {
+            let dir = root.join(directory);
+            std::fs::create_dir(&dir).unwrap();
+            fake_entry(&dir);
+            let text = manifest_text(id, &format!("\"{node}\""), "entry-bin");
+            std::fs::write(dir.join("plugin.toml"), text).unwrap();
+        }
+        let mut registry = PluginRegistry::default();
+        registry.discover(&root);
+        assert!(registry.resolve("one").is_none());
+        assert!(registry.resolve("two").is_none());
+        assert!(registry.resolve("hidden-node").is_none());
+        assert_eq!(registry.resolve("valid-node").unwrap().plugin_id, "valid");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

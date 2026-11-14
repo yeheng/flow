@@ -72,11 +72,12 @@ impl PreparedDefinition {
         }
         // 插件声明的动态节点类型：按已部署 manifest 计算集合（引擎不发现
         // 插件）；参数按 manifest 表单校验（类型级错误在发布期拒绝）。
-        let dynamic_types = crate::plugin_registry::dynamic_node_types();
+        let snapshot = crate::plugin_registry::installed_snapshot();
+        let dynamic_types = snapshot.dynamic_types();
         let parsed =
             flow_engine::journal_state::validate_definition_with_dynamic(&value, &dynamic_types)?;
         if !dynamic_types.is_empty() {
-            let forms = crate::plugin_registry::dynamic_params_forms();
+            let forms = snapshot.forms();
             // validate_definition_with_dynamic 已反序列化过；这里直接
             // 按最小形状遍历节点（不重复建 Definition）。
             let nodes = value["nodes"].as_array().cloned().unwrap_or_default();
@@ -720,7 +721,8 @@ impl JournalBackend {
         actor: Option<&WriteActor<'_>>,
     ) -> Result<CommandReceipt> {
         validate_workflow_name(name)?;
-        let prepared = PreparedDefinition::new(definition)?;
+        let prepared = tokio::task::spawn_blocking(move || PreparedDefinition::new(definition))
+            .await.map_err(|error| JournalError::Storage(format!("definition worker: {error}")))??;
         let request = json!({"name":name,"definition":prepared.value,"publish":publish});
         // 元数据写锁：定义写入与依赖冻结必须互斥，否则冻结可能读到
         // 半更新的元数据视图。
@@ -855,7 +857,8 @@ impl JournalBackend {
         request_id: Option<&str>,
         actor: Option<&WriteActor<'_>>,
     ) -> Result<CommandReceipt> {
-        let prepared = PreparedDefinition::new(definition)?;
+        let prepared = tokio::task::spawn_blocking(move || PreparedDefinition::new(definition))
+            .await.map_err(|error| JournalError::Storage(format!("definition worker: {error}")))??;
         let fingerprint_request = json!({"workflow_id":workflow_id,"definition":prepared.value});
         let _metadata = self.workflow_metadata.write().await;
         if let Some(receipt) =

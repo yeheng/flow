@@ -4,12 +4,21 @@ import { LayoutDashboard, ScrollText, Settings, ListTree, Workflow } from "@luci
 export interface NavLinkItem {
   title: string;
   url: string;
-  icon: Component;
+  icon?: Component;
+  badge?: string;
+}
+
+export interface NavItem {
+  title: string;
+  url?: string;
+  icon?: Component;
+  badge?: string;
+  items?: NavLinkItem[];
 }
 
 export interface NavGroupData {
   title: string;
-  items: NavLinkItem[];
+  items: NavItem[];
 }
 
 /** 分组方式对齐 shadcn-admin 的 sidebarData.navGroups，条目是 Flow 自己的页面。 */
