@@ -1328,7 +1328,7 @@ dependencies = [
  "flow-dto",
  "flow-engine",
  "flow-journal",
- "flow-store",
+ "flow-plugin-sdk",
  "fs2",
  "futures",
  "hex",
@@ -1350,6 +1350,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "x509-parser",
 ]
@@ -1358,7 +1359,9 @@ dependencies = [
 name = "flow-config"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "dirs",
+ "flow-dto",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -1395,6 +1398,8 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
+ "url",
 ]
 
 [[package]]
@@ -1413,7 +1418,6 @@ dependencies = [
  "parking_lot",
  "postcard",
  "reqwest",
- "rquickjs",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -1437,11 +1441,26 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "sqlx",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
  "uuid",
+]
+
+[[package]]
+name = "flow-plugin-sdk"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "hex",
+ "interprocess",
+ "libc",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]
@@ -1469,17 +1488,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "flow-store"
-version = "0.1.0"
-dependencies = [
- "flow-journal",
- "serde_json",
- "sqlx",
- "thiserror 2.0.21",
- "tokio",
 ]
 
 [[package]]
@@ -2068,11 +2076,6 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
-dependencies = [
- "allocator-api2",
- "equivalent",
- "foldhash",
-]
 
 [[package]]
 name = "hashlink"
@@ -4016,15 +4019,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
-name = "relative-path"
-version = "2.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2a073568cd8b9c4825429d3e9fc5f52851b4f97cc1348800689408921e6b8f8"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "reqwest"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4107,35 +4101,6 @@ name = "route-recognizer"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "afab94fb28594581f62d981211a9a4d53cc8130bbcbbb89a0440d9b8e81a7746"
-
-[[package]]
-name = "rquickjs"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0a22bf72f515cc4189dd7c63d016f6de92a11eee98ddf7dd64794198f6eb34e"
-dependencies = [
- "rquickjs-core",
-]
-
-[[package]]
-name = "rquickjs-core"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6657979a24d543e5fc66f32cef2f47ca82ce8eb55cec5f7d59a12b7b570bbf24"
-dependencies = [
- "hashbrown 0.17.1",
- "relative-path",
- "rquickjs-sys",
-]
-
-[[package]]
-name = "rquickjs-sys"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cee271d0eeba64f0915b846cb7ae02e16faf3dfdffdca91731101d9d30fe3423"
-dependencies = [
- "cc",
-]
 
 [[package]]
 name = "rsqlite-vfs"

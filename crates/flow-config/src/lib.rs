@@ -774,9 +774,10 @@ impl Config {
                 "agent" => replace_section!(out.agent, "agent", value),
                 "journal" => replace_section!(out.journal, "journal", value),
                 "harness" => replace_section!(out.harness, "harness", value),
+                "permissions" => replace_section!(out.permissions, "permissions", value),
                 other => {
                     return Err(ConfigError::Invalid(format!(
-                        "未知配置分区 {other:?}（合法：server/storage/execution/agent/journal/harness）"
+                        "未知配置分区 {other:?}（合法：server/storage/execution/agent/journal/harness/permissions）"
                     )))
                 }
             }
@@ -1427,5 +1428,16 @@ data_dir = "/var/lib/flow/journal"
         );
 
         restore_env(saved);
+    }
+}
+
+#[cfg(test)]
+mod settings_roundtrip_tests {
+    use super::*;
+    #[test]
+    fn settings_can_save_the_default_permissions_section() {
+        let base = Config::default();
+        let patch = serde_json::to_value(&base).unwrap();
+        assert_eq!(Config::merge_patch(&base, &patch).unwrap(), base);
     }
 }

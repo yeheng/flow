@@ -18,3 +18,5 @@ pub use protocol::{
     InitializeResult, Message, Notification, ProtoError, Request, Response, APP_ERROR_RANGE_START,
     MAX_FRAME_BYTES, PROTOCOL_VERSION, PROTOCOL_VERSION_MAJOR,
 };
+
+pub mod duplex;

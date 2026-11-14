@@ -37,6 +37,8 @@ pub const INITIALIZE_METHOD: &str = "initialize";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
+    /// Resident interaction requests and event notifications over full-duplex IPC.
+    InteractionEventsV1,
     /// 宿主可以转发宿主 → 插件的请求（插件侧反向调用）。
     ReverseRequests,
     /// 宿主接受 kind=binary 的数据块帧。

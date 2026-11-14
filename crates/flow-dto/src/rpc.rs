@@ -70,6 +70,8 @@ methods! {
         EnvironmentsList => "environments.list",
         SecretsList => "secrets.list",
         NodetypesList => "nodetypes.list",
+        ServicesList => "services.list",
+        ServicesEvents => "services.events",
         PluginsList => "plugins.list",
         PluginsRecheck => "plugins.recheck",
         // 09 权限模型：待审批收件箱与有效权限（只读，不含 secret 值）。
@@ -78,6 +80,9 @@ methods! {
         PermissionsAuditPage => "permissions.audit.page",
     }
     write {
+        ServicesStart => "services.start",
+        ServicesStop => "services.stop",
+        ServicesCall => "services.call",
         WorkflowImport => "workflow.import",
         WorkflowCreate => "workflow.create",
         WorkflowUpdate => "workflow.update",

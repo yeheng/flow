@@ -137,7 +137,7 @@ impl Services {
         .into();
         let downloads = flow_rpc::journal_download::router(journal.clone(), token.clone())
             .map_err(|e| e.to_string())?;
-        // Only incoming webhooks need HTTP. RPC and downloads stay inside the process.
+        // Webhooks and isolated plugin documents use loopback HTTP. RPC and value downloads stay in process.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|e| e.to_string())?;
@@ -145,7 +145,7 @@ impl Services {
             "http://{}",
             listener.local_addr().map_err(|e| e.to_string())?
         );
-        let harness_agent = flow_backend::harness_agent_run_config(&config.harness.agent);
+        let harness_agent = flow_backend::plugin_config::harness_agent_plugin(&config.harness.agent)?;
         // 09 §7：内置插件幂等自动授予（桌面分发 = 受信二进制）。
         journal.ensure_bundled_grants().await;
         flow_backend::start_execution(&config.execution, harness_agent, &journal)
@@ -163,7 +163,8 @@ impl Services {
         let http = tokio::spawn(async move {
             if let Err(error) = axum::serve(
                 listener,
-                flow_rpc::journal_triggers::router(journal_http, http_token),
+                flow_rpc::journal_triggers::router(journal_http.clone(), http_token)
+                    .merge(flow_rpc::journal_download::service_ui_router(journal_http)),
             )
             .await
             {

@@ -677,3 +677,12 @@ export interface PermissionsEffective {
   frozen?: boolean;
   approvals?: unknown;
 }
+
+
+export interface ResidentService {
+  plugin_id:string;
+  instance:string;
+  alive:boolean;
+  ui?:string|null;
+  binding?:{run_id:string;node_id:string}|null;
+}

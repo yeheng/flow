@@ -41,7 +41,7 @@ export default async function globalSetup(): Promise<void> {
   // T6：默认执行模式已切 ipc，服务端需要 flow-executor（与产品默认路径一致）；
   // 本目录下没有兄弟 flow-executor，用 FLOW_EXECUTOR_BIN 显式指向构建产物。
   execSync(
-    "cargo build -p flow-rpc --bin flow-journal-server --locked && cargo build -p flow-plugin-runtime --bin flow-executor --locked",
+    "cargo build -p flow-rpc --bin flow-journal-server --locked && cargo build -p flow-plugin-runtime --bin flow-executor --locked && cargo build -p flow-plugin-sdk --example resident_echo --locked",
     {
       cwd: REPO_ROOT,
       stdio: "inherit",
@@ -54,6 +54,7 @@ export default async function globalSetup(): Promise<void> {
   const child = spawn(bin, [], {
     env: {
       ...process.env,
+      FLOW_HOME: dir,
       FLOW_DATA_DIR: path.join(dir, "secrets"),
       FLOW_JOURNAL_DATA_DIR: path.join(dir, "journal"),
       FLOW_JOURNAL_TOKEN: E2E_TOKEN,

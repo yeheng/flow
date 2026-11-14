@@ -44,6 +44,7 @@ pub fn router(
     if token.len() < 32 {
         return Err("download token must contain at least 32 bytes".into());
     }
+    let resources = service_ui_router(backend.clone());
     Ok(Router::new()
         .route(
             "/runs/{run_id}/values/{output_id}",
@@ -73,7 +74,8 @@ pub fn router(
             backend,
             token,
             slots: Arc::new(tokio::sync::Semaphore::new(8)),
-        })))
+        }))
+        .merge(resources))
 }
 
 /// 在 run 投影快照里找 output_id 对应的值引用。
@@ -286,4 +288,74 @@ pub(crate) async fn download_authorized(
         Body::from_stream(stream),
     )
         .into_response()
+}
+
+/// Read-only ephemeral plugin documents. This exposes no value downloads or RPC methods.
+pub fn service_ui_router(backend: Arc<JournalBackend>) -> Router {
+    Router::new()
+        .route("/plugin-ui/{id}", get(plugin_ui))
+        .with_state(backend)
+}
+
+async fn plugin_ui(State(state): State<Arc<JournalBackend>>, Path(id): Path<String>) -> Response {
+    let ui = state.service_ui.lock().await;
+    let Some((_, html)) = ui.get(&id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    (
+        [("content-type","text/html; charset=utf-8"),
+         ("content-security-policy","default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'; sandbox allow-scripts"),
+         ("cache-control","no-store"),
+         ("referrer-policy","no-referrer"),
+         ("x-content-type-options","nosniff")],html.clone()
+    ).into_response()
+}
+
+#[cfg(test)]
+mod service_ui_tests {
+    use super::*;
+    #[tokio::test]
+    async fn ui_resources_are_bounded_handles_with_isolation_headers() {
+        let root = std::env::temp_dir().join(format!(
+            "flow-service-ui-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let backend = JournalBackend::open(&root, Default::default())
+            .await
+            .unwrap();
+        backend.service_ui.lock().await.insert(
+            "resource-handle".into(),
+            (
+                "instance".into(),
+                "<!doctype html><title>fixture</title>".into(),
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let routes = router(backend.clone(), "a".repeat(32)).unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, routes).await.unwrap();
+        });
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(b"GET /plugin-ui/resource-handle HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.contains("sandbox allow-scripts"));
+        assert!(response.contains("connect-src 'none'"));
+        assert!(response.contains("cache-control: no-store"));
+        assert!(response.contains("<title>fixture</title>"));
+        backend.service_ui.lock().await.clear();
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(b"GET /plugin-ui/resource-handle HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await.unwrap();
+        response.clear();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 404"));
+        task.abort();
+        let _ = task.await;
+        backend.close().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

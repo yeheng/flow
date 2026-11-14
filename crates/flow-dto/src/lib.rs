@@ -390,3 +390,5 @@ impl AgentRunConfig {
 
 pub mod permission;
 pub mod rpc;
+
+pub mod interaction;

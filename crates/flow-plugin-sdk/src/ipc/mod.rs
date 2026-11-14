@@ -9,7 +9,6 @@ pub mod child;
 pub mod env;
 mod fds;
 pub mod spawn;
-#[cfg(unix)]
 pub use challenge::Challenge;
 pub use channel::Channel;
 pub use child::ChildGuard;

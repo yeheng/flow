@@ -16,6 +16,7 @@ import { toast } from "../state/toast";
 import { copyWithToast } from "../state/clipboard";
 import { confirmDialog } from "../state/modal";
 import type { Definition, RunEvent, RunRecord } from "../types";
+import RunPluginTabs from "../components/RunPluginTabs.vue";
 import RunCanvas from "../components/RunCanvas.vue";
 import RunMonitor from "../components/RunMonitor.vue";
 import LogConsole from "../components/LogConsole.vue";
@@ -32,6 +33,7 @@ const router = useRouter();
 
 const record = ref<RunRecord | null>(null);
 const live = ref(false);
+const pluginTabActive=ref(false);
 const environment = ref<{ id: string; revision: number } | null>(null);
 const definition = ref<Definition | null>(null);
 /** 定义拉取中：区分「加载中」与「加载完成但没有定义」，避免首屏闪「不可用」 */
@@ -427,7 +429,8 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <section class="center">
+    <RunPluginTabs :key="props.runId" :run-id="props.runId" @active="pluginTabActive=$event" />
+    <section v-show="!pluginTabActive" class="center">
       <RunCanvas
         v-if="definition"
         :definition="definition"
@@ -438,7 +441,7 @@ onUnmounted(() => {
       <div v-else class="canvas-hint">工作流定义不可用，仅展示时间线</div>
     </section>
 
-    <div ref="bottomEl" class="bottom" :style="{ height: bottomResize.size.value + 'px' }">
+    <div v-show="!pluginTabActive" ref="bottomEl" class="bottom" :style="{ height: bottomResize.size.value + 'px' }">
       <ResizeHandle
         orientation="horizontal"
         class="edge-top"

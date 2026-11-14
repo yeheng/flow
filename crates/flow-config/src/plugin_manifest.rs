@@ -31,6 +31,7 @@ pub fn parse(text: &str) -> Result<PluginManifest, ManifestError> {
 /// 已解析且通过校验的插件 manifest。
 #[derive(Debug, Clone, PartialEq)]
 pub struct PluginManifest {
+    pub service: Option<ServiceDecl>,
     /// `[plugin]`：身份与入口。
     pub plugin: PluginSection,
     /// `[[config.field]]`：配置声明（三源合并的 schema 侧输入）。
@@ -43,6 +44,17 @@ pub struct PluginManifest {
     /// （不伪装为空能力；执行需管理员显式确认）。声明只是需求上限，
     /// 实际允许范围 = 声明 ∩ 安装授予 ∩ run 策略 ∩ 逐次裁决。
     pub permissions: ManifestPermissions,
+}
+
+/// Optional resident role; methods are an explicit invocation allowlist.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceDecl {
+    #[serde(default)]
+    pub peers: Vec<String>,
+    #[serde(default)]
+    pub web_ui: Option<String>,
+    pub methods: Vec<String>,
 }
 
 /// `[permissions]` 的解析结果。
@@ -230,6 +242,42 @@ impl PluginManifest {
     }
 
     fn validate(&self) -> Result<(), ManifestError> {
+        if let Some(service) = &self.service {
+            if service.peers.len() > 32 || service.peers.iter().any(|id| !is_kebab_id(id)) {
+                return Err(ManifestError("invalid service.peers".into()));
+            }
+
+            if let Some(path) = &service.web_ui {
+                if path.is_empty()
+                    || path.len() > 256
+                    || std::path::Path::new(path)
+                        .components()
+                        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+                {
+                    return Err(ManifestError(
+                        "service.web_ui must be a relative file path".into(),
+                    ));
+                }
+            }
+
+            let mut methods = std::collections::BTreeSet::new();
+            if service.methods.is_empty() || service.methods.len() > 64 {
+                return Err(ManifestError(
+                    "service.methods must contain 1..=64 methods".into(),
+                ));
+            }
+            for method in &service.methods {
+                if method.is_empty()
+                    || method.len() > 128
+                    || method == "initialize"
+                    || method.chars().any(char::is_control)
+                    || !methods.insert(method)
+                {
+                    return Err(ManifestError("invalid or duplicate service method".into()));
+                }
+            }
+        }
+
         let PluginSection {
             id,
             name: _,
@@ -249,7 +297,7 @@ impl PluginManifest {
         if entry.trim().is_empty() {
             return Err(ManifestError("plugin.entry 不能为空".into()));
         }
-        if node_types.is_empty() {
+        if node_types.is_empty() && self.service.is_none() {
             return Err(ManifestError(
                 "plugin.node_types 不能为空：没有节点类型的插件没有意义".into(),
             ));
@@ -261,7 +309,7 @@ impl PluginManifest {
                 )));
             }
         }
-        if self.methods.invoke.trim().is_empty() {
+        if !node_types.is_empty() && self.methods.invoke.trim().is_empty() {
             return Err(ManifestError(
                 "methods.invoke 必填：runtime 按它派发节点执行".into(),
             ));
@@ -398,6 +446,8 @@ fn is_node_type_name(name: &str) -> bool {
 
 #[derive(Debug, Deserialize)]
 struct RawManifest {
+    #[serde(default)]
+    service: Option<ServiceDecl>,
     #[serde(default)]
     plugin: Option<RawPluginSection>,
     #[serde(default, rename = "config")]
@@ -598,6 +648,7 @@ impl PluginManifest {
             }
         };
         Ok(Self {
+            service: raw.service,
             config_fields: fields(&raw.config.unwrap_or_default().fields)?,
             permissions,
             plugin: PluginSection {
@@ -971,5 +1022,31 @@ summary_keys = ["agent.model", "exit_code"]
             parse("[methods]\ninvoke = \"x\"\n").is_err(),
             "[plugin] 必需"
         );
+    }
+}
+
+#[cfg(test)]
+mod resident_tests {
+    use super::*;
+    const SERVICE: &str = r#"
+[plugin]
+id="resident-test"
+version="1"
+entry="bin/plugin"
+protocol=2
+node_types=[]
+[service]
+methods=["echo"]
+peers=["other-plugin"]
+web_ui="web-ui/index.html"
+"#;
+    #[test]
+    fn service_only_role_is_explicit_and_validates_resources() {
+        let service = parse(SERVICE).unwrap().service.unwrap();
+        assert_eq!(service.methods, vec!["echo"]);
+        assert!(parse(&SERVICE.replace("web-ui/index.html", "../escape.html")).is_err());
+        assert!(parse(&SERVICE.replace("methods=[\"echo\"]", "methods=[\"initialize\"]")).is_err());
+        assert!(parse(&SERVICE.replace("other-plugin", "bad/peer")).is_err());
+        assert!(parse(SERVICE.split("[service]").next().unwrap()).is_err());
     }
 }

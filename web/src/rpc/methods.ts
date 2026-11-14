@@ -1,4 +1,7 @@
 export const WRITE_METHODS = new Set([
+  "services.start",
+  "services.stop",
+  "services.call",
   "workflow.create",
   "workflow.import",
   "workflow.update",

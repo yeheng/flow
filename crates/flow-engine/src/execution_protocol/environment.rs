@@ -39,7 +39,7 @@ pub const EXECUTOR_ENV_WHITELIST: &[&str] = &[
 ];
 
 #[cfg(windows)]
-pub(crate) const EXECUTOR_ENV_WHITELIST: &[&str] = &[
+pub const EXECUTOR_ENV_WHITELIST: &[&str] = &[
     "PATH",
     "USERPROFILE",
     "FLOW_HOME",

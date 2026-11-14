@@ -1,0 +1,10 @@
+[plugin]
+id = "resident-echo"
+version = "0.1.0"
+entry = "bin/resident_echo"
+protocol = 2
+node_types = []
+
+[service]
+methods = ["echo"]
+web_ui = "web-ui/index.html"

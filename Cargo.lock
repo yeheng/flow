@@ -1013,6 +1013,7 @@ dependencies = [
  "flow-dto",
  "flow-engine",
  "flow-journal",
+ "flow-plugin-sdk",
  "flow-test-support",
  "fs2",
  "futures",

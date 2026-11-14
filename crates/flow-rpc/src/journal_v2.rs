@@ -445,6 +445,10 @@ pub fn module_product_with_keys(
         "run.unsubscribe",
         |params, pending, ctx, _| async move { subscribe_run_events(params, pending, &ctx).await },
     )?;
+    module.register_subscription(
+        "services.subscribe", "services.event", "services.unsubscribe",
+        |params,pending,ctx,_|async move {subscribe_service_events(params,pending,&ctx).await},
+    )?;
     Ok(module)
 }
 
@@ -856,6 +860,88 @@ async fn dispatch_admitted(
         Method::SecretsDelete => return secrets_delete(ctx, &p).await,
         Method::NodetypesList => {
             return Ok(json!({"node_types": crate::node_types()}));
+        }
+        Method::ServicesList => {
+            let services = b.services.lock().await;
+            let ui=b.service_ui.lock().await;
+            return Ok(json!({"services":services.iter().map(|(id,s)|json!({"plugin_id":id,"instance":s.instance,"alive":s.alive(),"binding":s.binding.get().map(|(run_id,node_id,_)|json!({"run_id":run_id,"node_id":node_id})),"ui":ui.iter().find(|(_, (instance,_))|instance==&s.instance).map(|(key,_)|key)})).collect::<Vec<_>>()}));
+        }
+        Method::ServicesEvents => {
+            if !caller.permission_admin {return Err(invalid("service events require admin"));}
+            let services = b.services.lock().await;
+            let service = services.get(text(&p,"plugin_id")?).ok_or_else(||invalid("service unavailable"))?.clone();
+            drop(services);
+            return service.events_since(text(&p,"instance")?, text(&p,"after")?.parse().map_err(invalid)?).map_err(invalid);
+        }
+        Method::ServicesStart => {
+            if !caller.permission_admin {return Err(invalid("service start requires admin"));}
+            let id = text(&p,"plugin_id")?;
+            let mut services = b.services.lock().await;
+            if !b.accepts_services(){return Err(invalid("host is shutting down"));}
+            if let Some(service) = services.get(id).filter(|s|s.alive()) {
+                if p.get("binding").is_some(){return Err(invalid("service already running; stop before rebinding"));}
+                return Ok(json!({"instance":service.instance}));
+            }
+            if services.len() >= 32 && !services.contains_key(id) {return Err(invalid("service limit reached"));}
+            let plugin=flow_backend::plugin_registry::discover_plugins().into_iter().find(|p|p.manifest.plugin.id==id).ok_or_else(||invalid("plugin not installed"))?;
+            let declaration=plugin.manifest.service.ok_or_else(||invalid("plugin has no service role"))?;
+            let html=if let Some(path)=&declaration.web_ui {
+                let root=plugin.source.canonicalize().map_err(invalid)?;
+                let path=root.join(path).canonicalize().map_err(invalid)?;
+                if !path.starts_with(&root){return Err(invalid("web-ui path escapes plugin"));}
+                let metadata=std::fs::metadata(&path).map_err(invalid)?;
+                if !metadata.is_file() || metadata.len()>262144 {return Err(invalid("web-ui must be a single HTML file under 256 KiB"));}
+                use std::io::Read;
+                let mut html=String::new();
+                std::fs::File::open(path).map_err(invalid)?.take(262145).read_to_string(&mut html).map_err(invalid)?;
+                if html.len()>262144 {return Err(invalid("web-ui exceeds 256 KiB"));}
+                Some(html)
+            }else{None};
+            let entry=std::path::PathBuf::from(&plugin.manifest.plugin.entry);
+            let entry=if entry.is_absolute(){entry}else{plugin.source.join(entry)};
+            let binding=if let Some(value)=p.get("binding") {
+                let run_id=text(value,"run_id")?.to_owned();let node_id=text(value,"node_id")?.to_owned();
+                let run=b.run_snapshot(&run_id).await.map_err(failure)?.ok_or_else(||invalid("binding run not found"))?;
+                if run.terminal(){return Err(invalid("binding run is terminal"));}
+                let node=run.nodes.get(&node_id).ok_or_else(||invalid("binding node not active"))?;
+                Some((run_id,node_id,node.dispatch_id.clone()))
+            }else{None};
+            let public_binding=binding.clone();
+            let host=flow_backend::service_host::handler(b,id.to_owned(),declaration.peers,binding);
+            let service_slot=Arc::new(std::sync::OnceLock::new());
+            let host=flow_backend::service_host::with_subscriptions(host,service_slot.clone());
+            let service=flow_backend::resident_service::ResidentService::start_installed_with_host(entry,declaration.methods,host).await.map_err(invalid)?;
+            if let Some(binding)=public_binding {let _=service.binding.set(binding);}
+            let _=service_slot.set(Arc::downgrade(&service));
+            service.notify_ready().map_err(invalid)?;
+            let instance=service.instance.clone();
+            let mut ui=b.service_ui.lock().await;
+            if let Some(previous)=services.get(id){ui.retain(|_,(i,_)|i!=&previous.instance);}
+            if let Some(html)=html {
+                // An unguessable read-only resource handle, never an RPC credential.
+                let key=format!("{}-{}",instance,service.resource_token());
+                ui.insert(key,(instance.clone(),html));
+            }
+            drop(ui);
+            if let Some(previous)=services.insert(id.into(),service){previous.shutdown().await;}
+            return Ok(json!({"instance":instance}));
+        }
+        Method::ServicesStop => {
+            if !caller.permission_admin {return Err(invalid("service stop requires admin"));}
+            let mut services=b.services.lock().await;
+            let id=text(&p,"plugin_id")?;
+            let service=services.get(id).ok_or_else(||invalid("service unavailable"))?;
+            if service.instance!=text(&p,"instance")? {return Err(invalid("stale service instance"));}
+            let service=services.remove(id).unwrap();drop(services);
+            b.service_ui.lock().await.retain(|_,(i,_)|i!=&service.instance);
+            service.shutdown().await;
+            return Ok(json!({"stopped":true}));
+        }
+        Method::ServicesCall => {
+            if !caller.permission_admin {return Err(invalid("service calls require admin until per-service grants are configured"));}
+            let service=b.services.lock().await.get(text(&p,"plugin_id")?).ok_or_else(||invalid("service unavailable"))?.clone();
+            let value=service.call(text(&p,"instance")?,text(&p,"method")?,p["params"].clone()).await.map_err(invalid)?;
+            return Ok(json!({"value":value}));
         }
         Method::PluginsList => {
             return Ok(json!({"plugins": b.plugins_view().await}));
@@ -1951,6 +2037,107 @@ mod tests {
             json!("18446744073709551616"),
         ] {
             assert!(decimal_param(&json!({"from_lsn":value}), "from_lsn").is_err());
+        }
+    }
+}
+
+async fn subscribe_service_events(
+    params: jsonrpsee::types::Params<'_>,
+    pending: jsonrpsee::PendingSubscriptionSink,
+    ctx: &Context,
+) {
+    let admitted = admit_call(ctx, "services.events", params).await;
+    let (p, _, caller) = match admitted {
+        Ok(value) => value,
+        Err(error) => {
+            pending.reject(error).await;
+            return;
+        }
+    };
+    if !caller.permission_admin {
+        pending
+            .reject(invalid("service events require admin"))
+            .await;
+        return;
+    }
+    let parsed = (|| -> Result<_, ErrorObjectOwned> {
+        Ok((
+            text(&p, "plugin_id")?.to_owned(),
+            text(&p, "instance")?.to_owned(),
+            text(&p, "after")?.parse::<u64>().map_err(invalid)?,
+        ))
+    })();
+    let (id, instance, mut cursor) = match parsed {
+        Ok(v) => v,
+        Err(e) => {
+            pending.reject(e).await;
+            return;
+        }
+    };
+    let Some(service) = ctx.backend.services.lock().await.get(&id).cloned() else {
+        pending.reject(invalid("service unavailable")).await;
+        return;
+    };
+    let mut receiver = service.events.subscribe();
+    let initial = match service.events_since(&instance, cursor) {
+        Ok(v) => v,
+        Err(e) => {
+            pending.reject(invalid(e)).await;
+            return;
+        }
+    };
+    let Ok(sink) = pending.accept().await else {
+        return;
+    };
+    let mut queue =
+        std::collections::VecDeque::from(initial["events"].as_array().cloned().unwrap_or_default());
+    loop {
+        if sink.is_closed() {
+            return;
+        }
+        let value = if let Some(value) = queue.pop_front() {
+            value
+        } else {
+            if !service.alive() {
+                json!({"type":"disconnected"})
+            } else {
+                match tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv()).await
+                {
+                    Ok(Ok(value)) => value,
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+                        json!({"type":"resync_required"})
+                    }
+                    Ok(Err(_)) => json!({"type":"disconnected"}),
+                    Err(_) => continue,
+                }
+            }
+        };
+        let terminal = value.get("type").is_some();
+        if !terminal {
+            let sequence = value["sequence"]
+                .as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            if sequence <= cursor {
+                continue;
+            }
+            cursor = sequence;
+        }
+        let Ok(message) = jsonrpsee::server::SubscriptionMessage::new(
+            "services.event",
+            sink.subscription_id(),
+            &value,
+        ) else {
+            return;
+        };
+        if !matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), sink.send(message)).await,
+            Ok(Ok(()))
+        ) {
+            return;
+        }
+        if terminal {
+            return;
         }
     }
 }

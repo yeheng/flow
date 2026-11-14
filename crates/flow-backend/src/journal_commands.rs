@@ -1386,7 +1386,34 @@ impl JournalBackend {
         payload: Value,
         request_id: Option<&str>,
     ) -> Result<CommandReceipt> {
-        let request = json!({"run_id":run_id,"node_id":node_id,"payload":payload});
+        self.run_signal_bound(run_id, node_id, payload, request_id, None)
+            .await
+    }
+    pub async fn run_signal_bound(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        payload: Value,
+        request_id: Option<&str>,
+        expected_dispatch: Option<&str>,
+    ) -> Result<CommandReceipt> {
+        let mut request = json!({"run_id":run_id,"node_id":node_id,"payload":payload});
+        if let Some(dispatch) = expected_dispatch {
+            request["expected_dispatch"] = json!(dispatch);
+        }
+        let validate_binding = |state: &State| -> flow_journal::Result<()> {
+            if let Some(expected) = expected_dispatch {
+                if state
+                    .runs
+                    .get(run_id)
+                    .and_then(|r| r.nodes.get(node_id))
+                    .is_none_or(|n| n.dispatch_id != expected)
+                {
+                    return Err(flow_journal::Error::Conflict("stale node binding".into()));
+                }
+            }
+            Ok(())
+        };
         if let Some(receipt) =
             deduped(self, &format!("run.signal:{run_id}"), request_id, &request).await?
         {
@@ -1403,6 +1430,11 @@ impl JournalBackend {
                 flow_engine::NodeType::HumanTask | flow_engine::NodeType::Input
             )
         });
+        if expected_dispatch.is_some() && !accepts_inbox {
+            return Err(
+                invalid("bound service signals require an input or human_task node").into(),
+            );
+        }
         // 预检阶段先判定这次信号是「裁决」还是普通信号，提交阶段再核对
         // 判定是否一致——节点状态在两次之间变了就必须报冲突。
         let mut adjudication = false;
@@ -1413,6 +1445,7 @@ impl JournalBackend {
                 &request,
                 Some(run_id),
                 |state| {
+                    validate_binding(state)?;
                     let (events, _) = signal_decision(
                         state,
                         run_id,
@@ -1450,6 +1483,7 @@ impl JournalBackend {
             Some(run_id),
             prepared,
             |state| {
+                validate_binding(state)?;
                 let result = signal_decision(
                     state,
                     run_id,
@@ -2357,5 +2391,80 @@ mod environment_tests {
         store.save("unused", "Unused", json!({}), None, 0).unwrap();
         b.delete_environment("unused", 1).await.unwrap();
         assert!(store.bind("unused").is_err());
+    }
+}
+
+#[cfg(test)]
+mod service_binding_tests {
+    use super::*;
+    #[tokio::test]
+    async fn bound_signals_are_durable_idempotent_and_attempt_scoped() {
+        let dir = flow_test_support::io::TempDir::new("service-binding");
+        let b = JournalBackend::open(dir.path(), Default::default())
+            .await
+            .unwrap();
+        let workflow=b.workflow_import("binding",json!({"semantics":2,"nodes":[{"id":"s","type":"start"},{"id":"q","type":"human_task"},{"id":"e","type":"end"}],"edges":[{"from":"s","to":"q"},{"from":"q","to":"e"}]}),true,None).await.unwrap();
+        let started = b
+            .run_start(
+                workflow.result["workflow_id"].as_str().unwrap(),
+                None,
+                Value::Null,
+                "manual",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let run = started.result["run_id"].as_str().unwrap();
+        let attempt = crate::journal_execution::Attempt::begin(b.clone(), run.into(), "q".into())
+            .await
+            .unwrap();
+        assert!(b
+            .run_signal_bound(run, "q", json!("answer"), Some("bad"), Some("stale"))
+            .await
+            .is_err());
+        let receipt = b
+            .run_signal_bound(
+                run,
+                "q",
+                json!("answer"),
+                Some("answer"),
+                Some(&attempt.dispatch_id),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            receipt.result,
+            b.run_signal_bound(
+                run,
+                "q",
+                json!("answer"),
+                Some("answer"),
+                Some(&attempt.dispatch_id)
+            )
+            .await
+            .unwrap()
+            .result
+        );
+        assert!(b
+            .command_status(&format!("run.signal:{run}"), "answer")
+            .await
+            .unwrap()
+            .is_some());
+        let next = crate::journal_execution::Attempt::begin(b.clone(), run.into(), "q".into())
+            .await
+            .unwrap();
+        assert_ne!(attempt.dispatch_id, next.dispatch_id);
+        assert!(b
+            .run_signal_bound(
+                run,
+                "q",
+                json!("late"),
+                Some("late"),
+                Some(&attempt.dispatch_id)
+            )
+            .await
+            .is_err());
+        b.close().await.unwrap();
     }
 }

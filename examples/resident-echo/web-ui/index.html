@@ -1,0 +1,13 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>常驻插件对话示例</title>
+<style>body{font:16px system-ui;padding:24px;color:#172033;background:#f6f8fb}input,button{padding:10px;font:inherit}pre{white-space:pre-wrap}#status{color:#54657c}</style>
+<h2>常驻插件 Echo</h2><p id="status">等待宿主连接</p><form><input aria-label="消息" placeholder="发送给插件进程" required><button type="button" disabled>发送</button></form><pre aria-live="polite"></pre>
+<script>
+let port;let sequence=0;const pending=new Map();
+window.addEventListener('message',event=>{
+ if(event.source!==parent||event.data?.type!=='flow-ui-connect'||event.data.version!==1||event.ports.length!==1)return;
+ port?.close();port=event.ports[0];document.querySelector('#status').textContent='已连接常驻插件';document.querySelector('button').disabled=false;
+ port.onmessage=event=>{const d=event.data;document.querySelector('pre').textContent+=JSON.stringify(d)+'\n';if(d.id)pending.delete(d.id);if(d.type==='disconnected')document.querySelector('button').disabled=true;};
+});
+document.querySelector('button').onclick=()=>{if(!port)return;const id=String(++sequence);pending.set(id,true);port.postMessage({id,method:'echo',params:{text:document.querySelector('input').value}});};
+document.querySelector('form').onsubmit=event=>event.preventDefault();
+</script></html>

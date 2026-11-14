@@ -102,6 +102,10 @@ struct CommittedState {
 /// 跨 SQLite 查询或落盘等待都不得持有 `state`。
 pub struct JournalBackend {
     pub journal: Journal,
+    pub service_ui: tokio::sync::Mutex<std::collections::BTreeMap<String, (String, String)>>,
+    pub services: tokio::sync::Mutex<
+        std::collections::BTreeMap<String, Arc<crate::resident_service::ResidentService>>,
+    >,
     pub(crate) environment_metadata: RwLock<()>,
     pub environments: std::sync::OnceLock<Arc<flow_engine::environments::EnvironmentStore>>,
     pub store: Arc<Store>,
@@ -366,6 +370,8 @@ impl JournalBackend {
             coordinator_last_tick_ms: AtomicI64::new(0),
             definitions: Mutex::new(std::collections::HashMap::new()),
             harness_agent: std::sync::OnceLock::new(),
+            services: tokio::sync::Mutex::new(Default::default()),
+            service_ui: tokio::sync::Mutex::new(Default::default()),
             environments: std::sync::OnceLock::new(),
             environment_metadata: RwLock::new(()),
             approval_ttl_ms: AtomicU64::new(APPROVAL_TTL_DEFAULT_MS),
@@ -1186,12 +1192,20 @@ impl JournalBackend {
         .await?;
         Ok(None)
     }
+    pub fn accepts_services(&self) -> bool {
+        !self.shutdown.is_cancelled()
+    }
     /// 关闭后端：停协调循环、等待在途执行会话回收、再关闭写者与读侧。
     ///
     /// 顺序不可颠倒：必须先让执行端口停下并回收子进程，再关写者——
     /// 反过来会让执行器在权威库关闭后仍尝试写入。
     pub async fn close(&self) -> Result<()> {
         self.shutdown.cancel();
+        let services = std::mem::take(&mut *self.services.lock().await);
+        for (_, service) in services {
+            service.shutdown().await;
+        }
+        self.service_ui.lock().await.clear();
         if let Some(task) = self.execution.lock().await.take() {
             let _ = task.await;
         }
