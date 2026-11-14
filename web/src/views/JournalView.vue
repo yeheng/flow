@@ -170,7 +170,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <main class="page journal">
+  <div class="page journal">
     <div class="page-header">
       <div class="page-title">
         <h2>事件审计</h2>
@@ -312,7 +312,7 @@ onBeforeUnmount(() => {
         </div>
       </section>
     </div>
-  </main>
+  </div>
 </template>
 
 <style scoped>

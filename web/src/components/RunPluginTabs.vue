@@ -110,8 +110,8 @@ button {
   padding: 6px 12px;
 }
 button[aria-selected="true"] {
-  border-color: var(--accent);
-  color: var(--accent);
+  border-color: var(--signal);
+  color: var(--signal);
 }
 .expanded :deep(iframe) {
   flex: 1;

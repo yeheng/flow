@@ -9,6 +9,7 @@ const frame = ref<HTMLIFrameElement | null>(null);
 let port: MessagePort | null = null;
 let unsubscribe: (() => Promise<void>) | null = null;
 let disposed = false;
+let attached = false;
 function dispose() {
   port?.close();
   port = null;
@@ -20,12 +21,14 @@ function close() {
   emit("ended");
 }
 function attach() {
-  port?.close();
-  if (unsubscribe) void unsubscribe();
-  unsubscribe = null;
+  if (attached) {
+    close();
+    return;
+  }
   const service = props.service,
     target = frame.value?.contentWindow;
   if (!service || !target) return;
+  attached = true;
   const channel = new MessageChannel(),
     bound = channel.port1;
   port = bound;
@@ -68,10 +71,11 @@ function attach() {
       (event) => {
         if (port !== bound || disposed) return;
         const data = event as Record<string, unknown>;
-        if (data.type) {
+        if (data.type === "disconnected" || data.type === "resync_required") {
           bound.postMessage({ type: "disconnected", error: String(data.type) });
           close();
-        } else bound.postMessage({ type: "event", ...data });
+        } else if (data.type === "gap") bound.postMessage({ type: "gap", cursor: data.cursor });
+        else bound.postMessage({ type: "event", ...data });
       },
     )
     .then((stop) => {

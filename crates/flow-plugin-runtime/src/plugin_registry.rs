@@ -165,9 +165,7 @@ impl PluginRegistry {
                 ),
             }
         }
-        let dir = std::env::var_os("FLOW_PLUGINS_DIR")
-            .map(PathBuf::from)
-            .or_else(|| flow_config::flow_home().map(|home| home.join("plugins")));
+        let dir = flow_config::plugin_fs::plugins_root();
         if let Some(dir) = dir {
             registry.discover(&dir);
         }

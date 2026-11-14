@@ -654,7 +654,7 @@ onUnmounted(() => {
 }
 
 .run-regression-source {
-  color: var(--accent2);
+  color: var(--signal-2);
 }
 
 .run-header-links {

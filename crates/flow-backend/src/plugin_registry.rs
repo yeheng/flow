@@ -46,9 +46,7 @@ pub fn content_hash(manifest_bytes: &[u8], entry_bytes: &[u8]) -> String {
 /// 兜底仅 harness 配置解析使用（plugin_config），动态类型/列表只认
 /// 已部署 manifest——没部署的插件不该出现在调色板里。
 pub fn discover_plugins() -> Vec<DiscoveredPlugin> {
-    let Some(base) = std::env::var_os("FLOW_PLUGINS_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|| flow_config::flow_home().map(|home| home.join("plugins")))
+    let Some(base) = flow_config::plugin_fs::plugins_root()
     else {
         return Vec::new();
     };

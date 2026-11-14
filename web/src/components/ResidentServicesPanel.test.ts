@@ -94,3 +94,20 @@ it("rejects oversized page requests without calling the plugin", async () => {
   );
   w.unmount();
 });
+it("closes the bridge when the plugin frame navigates", async () => {
+  const w = mount(ResidentServicesPanel, { attachTo: document.body });
+  await flushPromises();
+  await w
+    .findAll("button")
+    .find((b) => b.text() === "打开界面")!
+    .trigger("click");
+  const iframe = w.find("iframe");
+  await iframe.trigger("load");
+  expect(ports).toHaveLength(1);
+  await iframe.trigger("load");
+  await flushPromises();
+  expect(ports).toHaveLength(1);
+  expect(ports[0]!.close).toHaveBeenCalled();
+  expect(w.find("iframe").exists()).toBe(false);
+  w.unmount();
+});

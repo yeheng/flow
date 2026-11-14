@@ -34,18 +34,18 @@ cargo build --offline -p flow-plugin-sdk --example resident_echo
 
 宿主为插件/UI绑定身份，不接受页面伪造目标实例；消息 DTO 提供 Endpoint、Command/Event/Query/Response。临时服务通知带源端点、序号及事件 envelope。历史节点事件继续使用 Journal 的事实格式，由受限宿主适配器读取。
 
-每服务最多 64 个在途请求、64 条发送队列、16 个反向宿主请求。方法和消息身份最长 128 字节，调用 payload 最大 64 KiB，单次调用超时 30 秒。超时或断线报告结果可能未知，不自动重试有副作用的动作。
+每服务最多 64 个在途请求、64 条发送队列、16 个并行反向宿主请求。第 17 个反向请求返回错误，不拆掉会话。发送队列满时只结束那条订阅。方法和消息身份最长 128 字节，调用 payload 最大 64 KiB，单次调用超时 30 秒。超时或断线报告结果可能未知，不自动重试有副作用的动作。
 
 ### 宿主管理 RPC
 
-- `services.list` → `{services:[{plugin_id,instance,alive,ui}]}`。
+- `services.list` → `{services:[{plugin_id,instance,alive,binding,ui}]}`。`ui` 只发给管理员。
 - `services.start {plugin_id,binding?:{run_id,node_id}}` → `{instance}`。绑定必须指向当前已有的活动节点；服务运行中不能重新绑定，应先停止。
 - `services.stop {plugin_id,instance}` → 停止并等待进程回收，撤销 UI 资源地址。
 - `services.call {plugin_id,instance,method,params}` → `{value: 方法结果}`，避免插件数据被误认成宿主命令回执；不隐式重试。
 - `services.subscribe {plugin_id,instance,after:"0"}`：Flow 原生订阅，推送 services.event；取消使用 services.unsubscribe。先捕获实时订阅再补读历史，去重后交付。
-- `services.events {plugin_id,instance,after:"0"}` → `{cursor,events,alive}`，序号使用无损十进制字符串。
+- `services.events {plugin_id,instance,after:"0"}` → `{cursor,events,alive,gap}`，序号使用无损十进制字符串。
 
-start/stop/call/events 当前都要求管理员；list 仅包含运行元数据。服务通知为临时有界流，保留最近 128 条，游标超出窗口报 resync_required，不伪装成可靠历史。消费者可重新打开界面重建会话，不能依赖这些通知恢复业务。
+start/stop/call/events 当前都要求管理员。list 对非管理员不返回 `ui`。服务通知为临时有界流，保留最近 128 条。`after` 为 `"0"` 时返回窗口里还在的事件；有更早的事件被丢掉时 `gap` 为 true。非零游标掉出窗口才报 resync_required，不把缺口伪装成完整历史。不能依赖这些通知恢复业务。
 
 ### 插件 → 宿主 / 其他插件
 

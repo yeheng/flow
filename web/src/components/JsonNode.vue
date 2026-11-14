@@ -135,7 +135,7 @@ details[open] > .json-summary::before {
 
 .j-bool,
 .j-null {
-  color: var(--accent, #a371f7);
+  color: var(--signal, #a371f7);
   font-style: italic;
 }
 

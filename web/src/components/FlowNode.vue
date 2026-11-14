@@ -143,9 +143,9 @@ function sourceStyle(index: number, total: number) {
 
 /* 选中态：祖先 .vue-flow__node 在组件外，scoped 只给末级选择器加属性，仍可命中 */
 .vue-flow__node.selected .flow-node {
-  border-color: var(--accent);
+  border-color: var(--signal);
   box-shadow:
-    0 0 0 2px rgba(124, 108, 255, 0.35),
+    0 0 0 2px rgba(15, 111, 98, 0.35),
     0 4px 20px var(--shadow-hover);
 }
 
@@ -245,7 +245,7 @@ function sourceStyle(index: number, total: number) {
 
 /* RunPanel 行 hover/click 联动 */
 .flow-node.highlighted {
-  border-color: var(--accent2);
+  border-color: var(--signal-2);
   box-shadow:
     0 0 0 2px rgba(163, 113, 247, 0.35),
     0 4px 20px var(--shadow-hover);

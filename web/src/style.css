@@ -1,36 +1,9 @@
-/* 设计参考 hezi-ywt/flow-canvas：深色 surface 分层 + 紫色 accent + 点阵画布
- *
- * 本文件只保留：CSS 变量、reset、全局布局骨架、跨组件共享的基础类。
- * 组件自有样式在各 .vue 的 scoped style 中；vue-flow 内部类无法被 scoped 命中，
- * 其覆盖样式保留在文件末尾并注释说明。
+/* 设计令牌在 styles/globals.css。本文件是跨页面的布局与控件。
+ * 元素选择器放进 components 层，避免压过 shadcn / Tailwind utilities。
+ * vue-flow 内部类无法被 scoped 命中，覆盖样式留在文件末尾、不进 layer。
  */
 
-:root {
-  /* 自绘暗色主题：声明 color-scheme，让滚动条/checkbox/select 等原生控件
-   * 在浅色 OS 下也按暗色渲染，避免与自绘 UI 割裂 */
-  color-scheme: dark;
-  --bg: #0f0f11;
-  --surface: #18181c;
-  --surface2: #222228;
-  --surface3: #2a2a32;
-  --border: rgba(255, 255, 255, 0.08);
-  --border2: rgba(255, 255, 255, 0.14);
-  --text: #e8e8f0;
-  --text2: #888899;
-  --text3: #55556a;
-  --accent: #7c6cff;
-  --accent2: #a599ff;
-  --shadow: rgba(0, 0, 0, 0.4);
-  --shadow-hover: rgba(0, 0, 0, 0.55);
-  --hover-border: rgba(255, 255, 255, 0.22);
-  --danger: #f85149;
-  --ok: #3fb950;
-  --warn: #d29922;
-  --run: #58a6ff;
-  --radius: 10px;
-  --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
-}
-
+@layer components {
 * {
   box-sizing: border-box;
 }
@@ -43,8 +16,10 @@ body,
 }
 
 body {
-  font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-family: Inter, "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", "Microsoft YaHei",
+    sans-serif;
   font-size: 13px;
+  font-variant-numeric: tabular-nums;
   color: var(--text);
   background: var(--bg);
 }
@@ -87,12 +62,13 @@ aside.left {
 
 h3 {
   margin: 0 0 8px;
-  font-size: 12px;
+  font-size: 14px;
   font-weight: 600;
-  color: var(--text2);
+  letter-spacing: -0.01em;
+  color: var(--text);
 }
 
-button {
+button:not([data-slot]) {
   border: 1px solid var(--border2);
   background: var(--surface2);
   color: var(--text);
@@ -106,25 +82,26 @@ button {
     border-color 0.15s;
 }
 
-button:hover {
+button:not([data-slot]):hover {
   background: var(--surface3);
   border-color: var(--hover-border);
 }
 
-button:disabled {
+button:not([data-slot]):disabled {
   opacity: 0.5;
   cursor: default;
 }
 
 button.primary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #fff;
+  background: var(--primary);
+  border-color: var(--primary);
+  color: var(--primary-foreground);
 }
 
 button.primary:hover {
-  background: var(--accent2);
-  border-color: var(--accent2);
+  background: var(--primary);
+  border-color: var(--primary);
+  opacity: 0.9;
 }
 
 button.danger {
@@ -143,10 +120,10 @@ button.ghost {
 }
 
 /* input/textarea/select 用边框聚焦（见上），按钮与可聚焦元素用 outline */
-button:focus-visible,
+button:not([data-slot]):focus-visible,
 .link:focus-visible,
 [tabindex]:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--signal);
   outline-offset: 1px;
 }
 
@@ -168,7 +145,7 @@ select {
 input:focus,
 textarea:focus,
 select:focus {
-  border-color: var(--accent);
+  border-color: var(--signal);
 }
 
 input::placeholder,
@@ -184,7 +161,7 @@ input.code {
 /* ---- 共享工具类 ---- */
 
 .link {
-  color: var(--accent2);
+  color: var(--signal-2);
   text-decoration: none;
   cursor: pointer;
   background: none;
@@ -266,19 +243,23 @@ input.code {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 20px 24px;
+  padding: 1.5rem 1rem 2rem;
 }
 
 .page-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 14px;
+  gap: 12px;
+  margin-bottom: 18px;
 }
 
 .page-header h2 {
   margin: 0;
-  font-size: 15px;
+  font-size: 1.5rem;
+  font-weight: 700;
+  letter-spacing: -0.025em;
+  line-height: 1.2;
 }
 
 .data-table {
@@ -288,20 +269,20 @@ input.code {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   overflow: hidden;
-  font-size: 12px;
+  font-size: 13px;
 }
 
 .data-table th,
 .data-table td {
   text-align: left;
-  padding: 8px 12px;
+  padding: 9px 12px;
   border-bottom: 1px solid var(--border);
 }
 
 .data-table th {
-  color: var(--text3);
-  font-weight: 400;
-  background: var(--surface2);
+  color: var(--text2);
+  font-weight: 500;
+  background: transparent;
 }
 
 .data-table tbody tr:last-child td {
@@ -438,6 +419,26 @@ input.code {
   color: var(--text3);
   pointer-events: none;
 }
+}
+
+/* 画布是深色操作台：节点沿用暗色表面，不跟台面的纸色走 */
+.canvas-wrap {
+  --bg: #141a18;
+  --surface: #1c2422;
+  --surface2: #24302c;
+  --surface3: #2e3b36;
+  --border: rgba(255, 255, 255, 0.08);
+  --border2: rgba(255, 255, 255, 0.16);
+  --text: #e6eeea;
+  --text2: #b7c6c0;
+  --text3: #7e9089;
+  --signal: #3ebea6;
+  --signal-2: #8ee0d0;
+  --shadow: rgba(0, 0, 0, 0.45);
+  --hover-border: rgba(255, 255, 255, 0.22);
+  background: var(--bg);
+  color: var(--text);
+}
 
 /* ---- vue-flow 内部类覆盖：scoped 样式无法命中第三方组件内部 DOM，必须全局 ---- */
 
@@ -451,18 +452,18 @@ input.code {
 }
 
 .vue-flow__handle:hover {
-  background: var(--accent);
-  border-color: var(--accent2);
+  background: var(--signal);
+  border-color: var(--signal-2);
 }
 
 .vue-flow__handle.valid {
-  background: var(--accent);
-  border-color: var(--accent2);
+  background: var(--signal);
+  border-color: var(--signal-2);
 }
 
 /* 连线 */
 .vue-flow__edge-path {
-  stroke: var(--accent);
+  stroke: var(--signal);
   stroke-width: 1.5;
   opacity: 0.5;
   transition: opacity 0.15s;
@@ -474,9 +475,9 @@ input.code {
 
 .vue-flow__edge.selected .vue-flow__edge-path {
   opacity: 1;
-  stroke: var(--accent2);
+  stroke: var(--signal-2);
   stroke-width: 2.5;
-  filter: drop-shadow(0 0 6px rgba(124, 108, 255, 0.6));
+  filter: drop-shadow(0 0 6px rgba(62, 190, 166, 0.45));
 }
 
 .vue-flow__edge-text {

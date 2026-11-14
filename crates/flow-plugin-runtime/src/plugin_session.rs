@@ -60,6 +60,25 @@ pub(super) async fn open(
     plugin: &RegisteredPlugin,
     require_binary_blocks: bool,
 ) -> Result<Session, PluginSessionError> {
+    let root = match &plugin.source {
+        crate::plugin_registry::RegistrationSource::Manifest(path) => path
+            .parent()
+            .and_then(|p| p.parent())
+            .map(std::path::Path::to_path_buf),
+        crate::plugin_registry::RegistrationSource::Default => None,
+    };
+    let publication_lease = if let Some(root) = root {
+        Some(
+            tokio::task::spawn_blocking(move || flow_config::plugin_fs::RootLease::shared(&root))
+                .await
+                .map_err(|e| PluginSessionError::Setup(e.to_string()))?
+                .map_err(|e| {
+                    PluginSessionError::Setup(format!("plugin publication lease failed: {e}"))
+                })?,
+        )
+    } else {
+        None
+    };
     if !plugin.binary.is_file() {
         return Err(PluginSessionError::Setup(format!(
             "plugin binary missing at dispatch: {}",
@@ -78,6 +97,8 @@ pub(super) async fn open(
     let mut session = Session::spawn(config)
         .await
         .map_err(|error| PluginSessionError::Setup(format!("plugin spawn failed: {error}")))?;
+
+    drop(publication_lease);
 
     let mut capabilities = vec![flow_plugin_sdk::protocol::handshake::Capability::MasterPermitV1];
     if require_binary_blocks {

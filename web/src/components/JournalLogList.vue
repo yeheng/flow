@@ -161,7 +161,7 @@ function toggle(key: string): void {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--accent2);
+  color: var(--signal-2);
 }
 
 .log-row.log-warn .log-label {

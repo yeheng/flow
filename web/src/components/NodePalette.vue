@@ -281,7 +281,7 @@ async function onRenameTemplate(id: string, current: string): Promise<void> {
 }
 
 .palette-save:not(:disabled):hover {
-  border-color: var(--accent);
+  border-color: var(--signal);
 }
 
 .palette-search {
@@ -403,7 +403,7 @@ async function onRenameTemplate(id: string, current: string): Promise<void> {
 }
 
 .palette-dot.tpl {
-  background: var(--accent, #7aa2f7);
+  background: var(--signal, #7aa2f7);
 }
 
 .palette-template {

@@ -4,6 +4,7 @@ import { mount, RouterLinkStub } from "@vue/test-utils";
 const state = vi.hoisted(() => ({ path: "/" }));
 vi.mock("vue-router", () => ({
   useRoute: () => ({ path: state.path }),
+  useRouter: () => ({ push: vi.fn() }),
 }));
 
 import App from "./App.vue";

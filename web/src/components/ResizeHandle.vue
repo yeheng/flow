@@ -29,6 +29,6 @@ const emit = defineEmits<{ dragstart: [PointerEvent] }>();
 }
 
 .resize-handle:hover {
-  background: rgba(124, 108, 255, 0.5);
+  background: rgba(15, 111, 98, 0.45);
 }
 </style>

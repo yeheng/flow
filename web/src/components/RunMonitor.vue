@@ -749,8 +749,8 @@ const legacyBlocked = computed(() => {
 
 /* 审批等待卡：中性蓝紫（与 uncertain 的红、signal 的黄区分） */
 .signal-approval {
-  border-color: var(--accent);
-  background: rgba(124, 108, 255, 0.08);
+  border-color: var(--signal);
+  background: rgba(15, 111, 98, 0.08);
 }
 
 /* legacy 迁移横幅：中性提示，不抢 fatal/danger 的语义 */
@@ -808,7 +808,7 @@ const legacyBlocked = computed(() => {
 }
 
 .timeline tr.highlighted td {
-  background: rgba(124, 108, 255, 0.15);
+  background: rgba(15, 111, 98, 0.14);
 }
 
 .node-error {

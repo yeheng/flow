@@ -1,8 +1,15 @@
+import path from "node:path";
+import tailwindcss from "@tailwindcss/vite";
 import { defineConfig } from "vitest/config";
 import vue from "@vitejs/plugin-vue";
 
 export default defineConfig({
-  plugins: [vue()],
+  plugins: [vue(), tailwindcss()],
+  resolve: {
+    alias: {
+      "@": path.resolve(__dirname, "./src"),
+    },
+  },
   // Tauri waits for this exact URL; never silently move to another port.
   clearScreen: false,
   server: {

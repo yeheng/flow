@@ -304,7 +304,7 @@ async fn plugin_ui(State(state): State<Arc<JournalBackend>>, Path(id): Path<Stri
     };
     (
         [("content-type","text/html; charset=utf-8"),
-         ("content-security-policy","default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'; sandbox allow-scripts"),
+         ("content-security-policy","default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'; navigate-to 'none'; sandbox allow-scripts"),
          ("cache-control","no-store"),
          ("referrer-policy","no-referrer"),
          ("x-content-type-options","nosniff")],html.clone()
@@ -344,6 +344,7 @@ mod service_ui_tests {
         stream.read_to_string(&mut response).await.unwrap();
         assert!(response.starts_with("HTTP/1.1 200"));
         assert!(response.contains("sandbox allow-scripts"));
+        assert!(response.contains("navigate-to 'none'"));
         assert!(response.contains("connect-src 'none'"));
         assert!(response.contains("cache-control: no-store"));
         assert!(response.contains("<title>fixture</title>"));

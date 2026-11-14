@@ -33,7 +33,7 @@ import CanvasContextMenu, { type MenuEntry, type MenuPayload } from "./CanvasCon
 
 const { screenToFlowCoordinate, setViewport, getViewport, fitView } = useVueFlow();
 const defaultEdgeOptions = {
-  markerEnd: { type: MarkerType.ArrowClosed, color: "#7c6cff" },
+  markerEnd: { type: MarkerType.ArrowClosed, color: "#0f6f62" },
 };
 
 function onDrop(event: DragEvent): void {
@@ -484,7 +484,7 @@ onUnmounted(() => {
   background: none;
   font-size: 12px;
   font-weight: 400;
-  color: var(--accent2);
+  color: var(--signal-2);
   cursor: pointer;
 }
 
@@ -515,7 +515,7 @@ onUnmounted(() => {
 }
 
 .rmb-link-layer line.invalid {
-  stroke: #7c6cff;
+  stroke: #0f6f62;
 }
 
 .rmb-link-layer line.valid {
@@ -527,7 +527,7 @@ onUnmounted(() => {
 }
 
 .rmb-link-layer circle.invalid {
-  fill: #7c6cff;
+  fill: #0f6f62;
 }
 </style>
 

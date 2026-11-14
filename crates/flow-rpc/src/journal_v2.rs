@@ -862,9 +862,27 @@ async fn dispatch_admitted(
             return Ok(json!({"node_types": crate::node_types()}));
         }
         Method::ServicesList => {
+            let admin = caller.permission_admin;
             let services = b.services.lock().await;
-            let ui=b.service_ui.lock().await;
-            return Ok(json!({"services":services.iter().map(|(id,s)|json!({"plugin_id":id,"instance":s.instance,"alive":s.alive(),"binding":s.binding.get().map(|(run_id,node_id,_)|json!({"run_id":run_id,"node_id":node_id})),"ui":ui.iter().find(|(_, (instance,_))|instance==&s.instance).map(|(key,_)|key)})).collect::<Vec<_>>()}));
+            let ui = if admin {
+                Some(b.service_ui.lock().await)
+            } else {
+                None
+            };
+            return Ok(json!({"services": services.iter().map(|(id, s)| {
+                let handle = ui.as_ref().and_then(|ui| {
+                    ui.iter()
+                        .find(|(_, (instance, _))| instance == &s.instance)
+                        .map(|(key, _)| key.clone())
+                });
+                json!({
+                    "plugin_id": id,
+                    "instance": s.instance,
+                    "alive": s.alive(),
+                    "binding": s.binding.get().map(|(run_id, node_id, _)| json!({"run_id": run_id, "node_id": node_id})),
+                    "ui": handle,
+                })
+            }).collect::<Vec<_>>()}));
         }
         Method::ServicesEvents => {
             if !caller.permission_admin {return Err(invalid("service events require admin"));}
@@ -874,68 +892,180 @@ async fn dispatch_admitted(
             return service.events_since(text(&p,"instance")?, text(&p,"after")?.parse().map_err(invalid)?).map_err(invalid);
         }
         Method::ServicesStart => {
-            if !caller.permission_admin {return Err(invalid("service start requires admin"));}
-            let id = text(&p,"plugin_id")?;
-            let mut services = b.services.lock().await;
-            if !b.accepts_services(){return Err(invalid("host is shutting down"));}
-            if let Some(service) = services.get(id).filter(|s|s.alive()) {
-                if p.get("binding").is_some(){return Err(invalid("service already running; stop before rebinding"));}
-                return Ok(json!({"instance":service.instance}));
+            if !caller.permission_admin {
+                return Err(invalid("service start requires admin"));
             }
-            if services.len() >= 32 && !services.contains_key(id) {return Err(invalid("service limit reached"));}
-            let plugin=flow_backend::plugin_registry::discover_plugins().into_iter().find(|p|p.manifest.plugin.id==id).ok_or_else(||invalid("plugin not installed"))?;
-            let declaration=plugin.manifest.service.ok_or_else(||invalid("plugin has no service role"))?;
-            let html=if let Some(path)=&declaration.web_ui {
-                let root=plugin.source.canonicalize().map_err(invalid)?;
-                let path=root.join(path).canonicalize().map_err(invalid)?;
-                if !path.starts_with(&root){return Err(invalid("web-ui path escapes plugin"));}
-                let metadata=std::fs::metadata(&path).map_err(invalid)?;
-                if !metadata.is_file() || metadata.len()>262144 {return Err(invalid("web-ui must be a single HTML file under 256 KiB"));}
+            let b=Arc::clone(b);let p=p.clone();
+            let worker=tokio::spawn(async move {
+            let id = text(&p, "plugin_id")?;
+            {
+                let services = b.services.lock().await;
+                if !b.accepts_services() {
+                    return Err(invalid("host is shutting down"));
+                }
+                if let Some(service) = services.get(id).filter(|service| service.alive()) {
+                    if p.get("binding").is_some() {
+                        return Err(invalid("service already running; stop before rebinding"));
+                    }
+                    return Ok(json!({"instance": service.instance}));
+                }
+                if services.len() >= 32 && !services.contains_key(id) {
+                    return Err(invalid("service limit reached"));
+                }
+            }
+            // Discovery, the process, and the handshake stay outside `services`.
+            // Stop and call of every other service must not wait on this spawn.
+            let _starting = b.reserve_service_start(id).map_err(invalid)?;
+            let selected_id=id.to_owned();
+            let (lease,source,entry_path,declaration,html)=tokio::task::spawn_blocking(move||{
+                let root=flow_config::plugin_fs::plugins_root().ok_or_else(||invalid("plugin root unavailable"))?;
+                let lease=flow_config::plugin_fs::RootLease::shared(&root).map_err(invalid)?;
+            let plugin = flow_backend::plugin_registry::discover_plugins()
+                .into_iter()
+                .find(|plugin| plugin.manifest.plugin.id == selected_id)
+                .ok_or_else(|| invalid("plugin not installed"))?;
+            let declaration = plugin
+                .manifest
+                .service
+                .ok_or_else(|| invalid("plugin has no service role"))?;
+            let html = if let Some(path) = &declaration.web_ui {
+                let root = plugin.source.canonicalize().map_err(invalid)?;
+                let path = root.join(path).canonicalize().map_err(invalid)?;
+                if !path.starts_with(&root) {
+                    return Err(invalid("web-ui path escapes plugin"));
+                }
+                let metadata = std::fs::metadata(&path).map_err(invalid)?;
+                if !metadata.is_file() || metadata.len() > 262144 {
+                    return Err(invalid("web-ui must be a single HTML file under 256 KiB"));
+                }
                 use std::io::Read;
-                let mut html=String::new();
-                std::fs::File::open(path).map_err(invalid)?.take(262145).read_to_string(&mut html).map_err(invalid)?;
-                if html.len()>262144 {return Err(invalid("web-ui exceeds 256 KiB"));}
+                let mut html = String::new();
+                std::fs::File::open(path)
+                    .map_err(invalid)?
+                    .take(262145)
+                    .read_to_string(&mut html)
+                    .map_err(invalid)?;
+                if html.len() > 262144 {
+                    return Err(invalid("web-ui exceeds 256 KiB"));
+                }
                 Some(html)
-            }else{None};
-            let entry=std::path::PathBuf::from(&plugin.manifest.plugin.entry);
-            let entry=if entry.is_absolute(){entry}else{plugin.source.join(entry)};
-            let binding=if let Some(value)=p.get("binding") {
-                let run_id=text(value,"run_id")?.to_owned();let node_id=text(value,"node_id")?.to_owned();
-                let run=b.run_snapshot(&run_id).await.map_err(failure)?.ok_or_else(||invalid("binding run not found"))?;
-                if run.terminal(){return Err(invalid("binding run is terminal"));}
-                let node=run.nodes.get(&node_id).ok_or_else(||invalid("binding node not active"))?;
-                Some((run_id,node_id,node.dispatch_id.clone()))
-            }else{None};
-            let public_binding=binding.clone();
-            let host=flow_backend::service_host::handler(b,id.to_owned(),declaration.peers,binding);
-            let service_slot=Arc::new(std::sync::OnceLock::new());
-            let host=flow_backend::service_host::with_subscriptions(host,service_slot.clone());
-            let service=flow_backend::resident_service::ResidentService::start_installed_with_host(entry,declaration.methods,host).await.map_err(invalid)?;
-            if let Some(binding)=public_binding {let _=service.binding.set(binding);}
-            let _=service_slot.set(Arc::downgrade(&service));
-            service.notify_ready().map_err(invalid)?;
-            let instance=service.instance.clone();
-            let mut ui=b.service_ui.lock().await;
-            if let Some(previous)=services.get(id){ui.retain(|_,(i,_)|i!=&previous.instance);}
-            if let Some(html)=html {
-                // An unguessable read-only resource handle, never an RPC credential.
-                let key=format!("{}-{}",instance,service.resource_token());
-                ui.insert(key,(instance.clone(),html));
+            } else {
+                None
+            };
+                Ok::<_,ErrorObjectOwned>((lease,plugin.source,plugin.manifest.plugin.entry,declaration,html))
+            }).await.map_err(invalid)??;
+            let entry = std::path::PathBuf::from(entry_path);
+            let entry = if entry.is_absolute() {
+                entry
+            } else {
+                source.join(entry)
+            };
+            let binding = if let Some(value) = p.get("binding") {
+                let run_id = text(value, "run_id")?.to_owned();
+                let node_id = text(value, "node_id")?.to_owned();
+                let run = b
+                    .run_snapshot(&run_id)
+                    .await
+                    .map_err(failure)?
+                    .ok_or_else(|| invalid("binding run not found"))?;
+                if run.terminal() {
+                    return Err(invalid("binding run is terminal"));
+                }
+                let node = run
+                    .nodes
+                    .get(&node_id)
+                    .ok_or_else(|| invalid("binding node not active"))?;
+                Some((run_id, node_id, node.dispatch_id.clone()))
+            } else {
+                None
+            };
+            let public_binding = binding.clone();
+            let host =
+                flow_backend::service_host::handler(&b, id.to_owned(), declaration.peers, binding);
+            let service_slot = Arc::new(std::sync::OnceLock::new());
+            let host = flow_backend::service_host::with_subscriptions(host, service_slot.clone());
+            let service =
+                flow_backend::resident_service::ResidentService::start_installed_with_host_lease(
+                    entry,
+                    declaration.methods,
+                    host,
+                    lease,
+                )
+                .await
+                .map_err(invalid)?;
+            if let Some(binding) = public_binding {
+                let _ = service.binding.set(binding);
             }
-            drop(ui);
-            if let Some(previous)=services.insert(id.into(),service){previous.shutdown().await;}
-            return Ok(json!({"instance":instance}));
+            let _ = service_slot.set(Arc::downgrade(&service));
+            if let Err(error) = service.notify_ready() {
+                service.shutdown().await;
+                return Err(invalid(error));
+            }
+            let instance = service.instance.clone();
+            let installed = {
+                let mut services = b.services.lock().await;
+                if !b.accepts_services() {
+                    Err(invalid("host is shutting down"))
+                } else if let Some(existing) = services.get(id).filter(|service| service.alive()) {
+                    if p.get("binding").is_some() {
+                        Err(invalid("service already running; stop before rebinding"))
+                    } else {
+                        Ok(Err(existing.instance.clone()))
+                    }
+                } else if services.len() >= 32 && !services.contains_key(id) {
+                    Err(invalid("service limit reached"))
+                } else {
+                    Ok(Ok(services.insert(id.to_owned(), service.clone())))
+                }
+            };
+            let previous = match installed {
+                Ok(Ok(previous)) => previous,
+                Ok(Err(existing)) => {
+                    service.shutdown().await;
+                    return Ok(json!({"instance": existing}));
+                }
+                Err(error) => {
+                    service.shutdown().await;
+                    return Err(error);
+                }
+            };
+            {
+                let mut ui = b.service_ui.lock().await;
+                // Close clears this map after cancelling the host. A start that
+                // already passed the insert check must not publish a new handle.
+                if b.accepts_services() {
+                    if let Some(previous) = previous.as_ref() {
+                        ui.retain(|_, (installed, _)| installed != &previous.instance);
+                    }
+                    if let Some(html) = html {
+                        // An unguessable read-only resource handle, never an RPC credential.
+                        let key = format!("{}-{}", instance, service.resource_token());
+                        ui.insert(key, (instance.clone(), html));
+                    }
+                }
+            }
+            if let Some(previous) = previous {
+                previous.shutdown().await;
+            }
+            return Ok(json!({"instance": instance}));
+            });
+            return worker.await.map_err(invalid)?;
         }
         Method::ServicesStop => {
             if !caller.permission_admin {return Err(invalid("service stop requires admin"));}
-            let mut services=b.services.lock().await;
+            let b=Arc::clone(b);let p=p.clone();
+            let worker=tokio::spawn(async move {
             let id=text(&p,"plugin_id")?;
+            let _operation=b.reserve_plugin_operation(id).map_err(|e|if e=="plugin operation in progress"{ErrorObjectOwned::owned(-32012,e,None::<()>)}else{invalid(e)})?;
+            let mut services=b.services.lock().await;
             let service=services.get(id).ok_or_else(||invalid("service unavailable"))?;
             if service.instance!=text(&p,"instance")? {return Err(invalid("stale service instance"));}
             let service=services.remove(id).unwrap();drop(services);
             b.service_ui.lock().await.retain(|_,(i,_)|i!=&service.instance);
             service.shutdown().await;
             return Ok(json!({"stopped":true}));
+            });
+            return worker.await.map_err(invalid)?;
         }
         Method::ServicesCall => {
             if !caller.permission_admin {return Err(invalid("service calls require admin until per-service grants are configured"));}
@@ -2091,6 +2221,9 @@ async fn subscribe_service_events(
     };
     let mut queue =
         std::collections::VecDeque::from(initial["events"].as_array().cloned().unwrap_or_default());
+    if initial.get("gap").and_then(|value| value.as_bool()) == Some(true) {
+        queue.push_front(json!({"type": "gap", "cursor": initial["cursor"].clone()}));
+    }
     loop {
         if sink.is_closed() {
             return;
@@ -2112,8 +2245,9 @@ async fn subscribe_service_events(
                 }
             }
         };
-        let terminal = value.get("type").is_some();
-        if !terminal {
+        let kind = value.get("type").and_then(|item| item.as_str());
+        let terminal = matches!(kind, Some("disconnected" | "resync_required"));
+        if kind.is_none() {
             let sequence = value["sequence"]
                 .as_str()
                 .and_then(|s| s.parse::<u64>().ok())

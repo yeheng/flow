@@ -4,13 +4,28 @@ import { useRoute } from "vue-router";
 import { client } from "./rpc/client";
 import AppToasts from "./components/AppToasts.vue";
 import AppModal from "./components/AppModal.vue";
-
-import { environments, selectedEnvironment, refreshEnvironments } from "./state/environments";
+import AppSidebar from "./components/layout/AppSidebar.vue";
+import CommandMenu from "./components/layout/CommandMenu.vue";
+import HeaderBar from "./components/layout/HeaderBar.vue";
+import SearchButton from "./components/layout/SearchButton.vue";
+import ThemeSwitch from "./components/layout/ThemeSwitch.vue";
+import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
+import { environments, refreshEnvironments, selectedEnvironment } from "./state/environments";
 import { refreshSecrets } from "./state/editor";
+
 const route = useRoute();
-watch([selectedEnvironment, () => environments.value.find(e => e.id === selectedEnvironment.value)?.revision], () => {
-  void refreshSecrets();
-});
+
+/** 画布页自己有顶栏，不再套一层管理页 header。 */
+const instrument = computed(
+  () => /^\/workflows\/[^/]+$/.test(route.path) || /^\/runs\/[^/]+$/.test(route.path),
+);
+
+watch(
+  [selectedEnvironment, () => environments.value.find((e) => e.id === selectedEnvironment.value)?.revision],
+  () => {
+    void refreshSecrets();
+  },
+);
 watch(
   () => client.connected.value,
   (value) => {
@@ -22,130 +37,42 @@ watch(
   },
   { immediate: true },
 );
-const connected = computed(() => client.connected.value);
-
-/** 导航高亮：`/` 精确命中，其余按路径段前缀（/workflows/:id 归「工作流」、/runs/:id 归「运行记录」） */
-function navActive(path: string, to: string): boolean {
-  return to === "/" ? path === "/" : path === to || path.startsWith(`${to}/`);
-}
 </script>
 
 <template>
-  <header>
-    <span class="logo">Flow</span>
-    <nav class="nav">
-      <RouterLink to="/" :class="{ 'nav-active': navActive(route.path, '/') }">仪表盘</RouterLink>
-      <RouterLink to="/workflows" :class="{ 'nav-active': navActive(route.path, '/workflows') }">
-        工作流
-      </RouterLink>
-      <RouterLink to="/runs" :class="{ 'nav-active': navActive(route.path, '/runs') }">
-        运行记录
-      </RouterLink>
-      <RouterLink to="/journal" :class="{ 'nav-active': navActive(route.path, '/journal') }">
-        事件审计
-      </RouterLink>
-      <RouterLink to="/settings" :class="{ 'nav-active': navActive(route.path, '/settings') }">
-        设置
-      </RouterLink>
-    </nav>
-    <label
-      >运行环境
-      <select v-model="selectedEnvironment" aria-label="运行环境">
-        <option value="default">默认</option>
-        <option v-for="e in environments" :key="e.id" :value="e.id">{{ e.name }}</option>
-      </select>
-    </label>
-    <!-- 业务 chrome 不常显 RPC 地址：连接态只留圆点+文案，地址进 tooltip -->
-    <span class="conn" :class="{ ok: connected }" :title="client.url">
-      <span class="conn-dot" aria-hidden="true" />
-      {{ connected ? "已连接" : "未连接" }}
-    </span>
-  </header>
-  <RouterView />
+  <SidebarProvider class="h-svh overflow-hidden">
+    <a class="skip" href="#content">跳到主内容</a>
+    <AppSidebar />
+    <SidebarInset class="h-svh min-h-0 overflow-hidden md:h-[calc(100svh-1rem)]">
+      <HeaderBar v-if="!instrument">
+        <SearchButton class="ms-auto" />
+        <ThemeSwitch />
+      </HeaderBar>
+      <div id="content" class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+        <RouterView />
+      </div>
+    </SidebarInset>
+  </SidebarProvider>
+  <CommandMenu />
   <AppToasts />
   <AppModal />
 </template>
 
 <style scoped>
-header {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  height: 48px;
-  padding: 0 16px;
-  flex-shrink: 0;
-  background: var(--surface);
-  border-bottom: 1px solid var(--border);
-}
-
-.logo {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  flex-shrink: 0;
-}
-
-.logo::before {
-  content: "";
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--accent);
-  box-shadow: 0 0 8px var(--accent);
-}
-
-.nav {
-  display: flex;
-  gap: 14px;
-  min-width: 0;
-  overflow-x: auto;
-  white-space: nowrap;
-}
-
-.nav a {
-  color: var(--text2);
-  text-decoration: none;
+.skip {
+  position: fixed;
+  inset-inline-start: 11rem;
+  z-index: 100;
+  translate: 0 -13rem;
+  background: var(--primary);
+  color: var(--primary-foreground);
+  padding: 0.5rem 1rem;
+  font-size: 0.875rem;
   font-weight: 500;
-  padding: 3px 2px;
-  border-bottom: 2px solid transparent;
+  border-radius: var(--radius);
 }
 
-.nav a:hover {
-  color: var(--text);
-}
-
-/* 高亮由 nav-active 判定（useRoute 路径前缀），router-link-active 仅兜底 */
-.nav a.router-link-active,
-.nav a.nav-active {
-  color: var(--text);
-  border-bottom-color: var(--accent);
-}
-
-.conn {
-  margin-left: auto;
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  color: var(--danger);
-  font-size: 11px;
-  font-family: var(--mono);
-}
-
-.conn.ok {
-  color: var(--ok);
-}
-
-.conn-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: currentColor;
-}
-@media (max-width: 700px) {
-  .conn {
-    display: none;
-  }
+.skip:focus {
+  translate: 0 0.75rem;
 }
 </style>

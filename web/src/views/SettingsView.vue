@@ -733,7 +733,7 @@ async function onDeleteSecret(name: string): Promise<void> {
 .field input:focus,
 .field select:focus {
   outline: none;
-  border-color: var(--accent);
+  border-color: var(--signal);
 }
 
 .field .help {
@@ -803,7 +803,7 @@ async function onDeleteSecret(name: string): Promise<void> {
 }
 
 .src.stored {
-  color: var(--accent2);
+  color: var(--signal-2);
 }
 
 .src.env {
@@ -828,7 +828,7 @@ async function onDeleteSecret(name: string): Promise<void> {
 
 .secret-add input:focus {
   outline: none;
-  border-color: var(--accent);
+  border-color: var(--signal);
 }
 
 .help {

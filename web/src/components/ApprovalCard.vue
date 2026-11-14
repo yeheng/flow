@@ -312,7 +312,7 @@ function handleDecisionError(e: unknown): void {
 }
 
 .spec-action {
-  color: var(--accent2);
+  color: var(--signal-2);
   font-size: 11px;
   flex-shrink: 0;
 }
@@ -355,9 +355,9 @@ function handleDecisionError(e: unknown): void {
 
 .matched-chip {
   padding: 0 6px;
-  border: 1px solid var(--accent);
+  border: 1px solid var(--signal);
   border-radius: 999px;
-  color: var(--accent2);
+  color: var(--signal-2);
   font-size: 10px;
   max-width: 200px;
   overflow: hidden;

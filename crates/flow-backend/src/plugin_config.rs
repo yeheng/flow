@@ -64,9 +64,7 @@ pub fn harness_agent_identity(
 }
 
 pub fn harness_agent_manifest() -> Result<PluginManifest, String> {
-    let base = std::env::var_os("FLOW_PLUGINS_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|| flow_config::flow_home().map(|home| home.join("plugins")));
+    let base = flow_config::plugin_fs::plugins_root();
     if let Some(manifest) = manifest_from(base.as_deref()) {
         return manifest;
     }

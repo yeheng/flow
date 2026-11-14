@@ -13,6 +13,7 @@ import { copyWithToast } from "../state/clipboard";
 import type { ApprovalItem, RunRecord, RunStats } from "../types";
 import AppButton from "../components/AppButton.vue";
 import ApprovalCard from "../components/ApprovalCard.vue";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 
 /** 仪表盘：全局概览。统计来自 run.stats（服务端 GROUP BY 精确计数）；
  *  最近运行表只是展示窗口，走 run.list(limit 10) */
@@ -154,28 +155,44 @@ onUnmounted(() => {
       </div>
     </section>
 
-    <div class="cards">
-      <div class="card">
-        <div class="card-value">{{ editor.workflows.length }}</div>
-        <div class="card-label">工作流</div>
-      </div>
-      <div class="card">
-        <div class="card-value">{{ summary.total }}</div>
-        <div class="card-label">运行总数</div>
-      </div>
-      <div class="card">
-        <div class="card-value ok">{{ fmtRate(summary.successRate) }}</div>
-        <div class="card-label">成功率</div>
-      </div>
-      <div class="card">
-        <div class="card-value running">{{ summary.active }}</div>
-        <div class="card-label">进行中</div>
-      </div>
+    <div class="cards grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+      <Card class="card gap-2 py-4 shadow-sm">
+        <CardHeader class="px-6 pb-0">
+          <CardTitle class="card-label text-sm font-medium">工作流</CardTitle>
+        </CardHeader>
+        <CardContent class="px-6">
+          <div class="card-value text-2xl font-bold">{{ editor.workflows.length }}</div>
+        </CardContent>
+      </Card>
+      <Card class="card gap-2 py-4 shadow-sm">
+        <CardHeader class="px-6 pb-0">
+          <CardTitle class="card-label text-sm font-medium">运行总数</CardTitle>
+        </CardHeader>
+        <CardContent class="px-6">
+          <div class="card-value text-2xl font-bold">{{ summary.total }}</div>
+        </CardContent>
+      </Card>
+      <Card class="card gap-2 py-4 shadow-sm">
+        <CardHeader class="px-6 pb-0">
+          <CardTitle class="card-label text-sm font-medium">成功率</CardTitle>
+        </CardHeader>
+        <CardContent class="px-6">
+          <div class="card-value ok text-2xl font-bold">{{ fmtRate(summary.successRate) }}</div>
+        </CardContent>
+      </Card>
+      <Card class="card gap-2 py-4 shadow-sm">
+        <CardHeader class="px-6 pb-0">
+          <CardTitle class="card-label text-sm font-medium">进行中</CardTitle>
+        </CardHeader>
+        <CardContent class="px-6">
+          <div class="card-value running text-2xl font-bold">{{ summary.active }}</div>
+        </CardContent>
+      </Card>
     </div>
 
     <p v-if="!firstRun" class="capacity" :class="{ warn: capacity.warn }" :title="capacityTitle">
       非终态 {{ capacity.active }} / {{ RUN_CAP }}
-      <span class="capacity-sub">· 在飞派发上限 {{ DISPATCH_CAP }}</span>
+      <span class="capacity-sub">在飞派发上限 {{ DISPATCH_CAP }}</span>
     </p>
 
     <!-- 待审批收件箱：有等待项才占屏；卡片可直接裁决，也可跳 run 详情 -->
@@ -281,18 +298,14 @@ onUnmounted(() => {
 <style scoped>
 
 .cards {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-  gap: 12px;
-  margin-bottom: 24px;
+  margin-bottom: 16px;
 }
 
 .first-run {
   margin-bottom: 20px;
-  padding: 16px 18px;
-  border: 1px solid var(--border2);
-  border-radius: var(--radius);
-  background: var(--surface);
+  padding: 4px 0 8px 14px;
+  border-left: 2px solid var(--signal);
+  max-width: 62ch;
 }
 
 .first-run h3 {
@@ -317,17 +330,8 @@ onUnmounted(() => {
   font-weight: 600;
 }
 
-.card {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 14px 16px;
-}
-
 .card-value {
-  font-size: 22px;
-  font-weight: 600;
-  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
 }
 
 .card-value.ok {
@@ -336,12 +340,6 @@ onUnmounted(() => {
 
 .card-value.running {
   color: var(--run);
-}
-
-.card-label {
-  margin-top: 4px;
-  color: var(--text3);
-  font-size: 11px;
 }
 
 .section {
@@ -368,9 +366,9 @@ onUnmounted(() => {
 
 .approval-inbox-card {
   padding: 10px 12px;
-  border: 1px solid var(--accent);
+  border: 1px solid var(--signal);
   border-radius: var(--radius);
-  background: rgba(124, 108, 255, 0.06);
+  background: color-mix(in srgb, var(--signal) 8%, var(--surface));
 }
 
 .approval-inbox-meta {
@@ -395,8 +393,8 @@ onUnmounted(() => {
 
 /* 容量口径小字：≥80% 用 warn 色提示接近平台上限 */
 .capacity {
-  margin: -12px 0 20px;
-  font-size: 11px;
+  margin: 0 0 20px;
+  font-size: 12px;
   color: var(--text3);
 }
 

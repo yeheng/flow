@@ -15,7 +15,7 @@ const props = defineProps<{ definition: Definition }>();
 const emit = defineEmits<{ "node-click": [nodeId: string]; "open-child": [childRunId: string] }>();
 
 const defaultEdgeOptions = {
-  markerEnd: { type: MarkerType.ArrowClosed, color: "#7c6cff" },
+  markerEnd: { type: MarkerType.ArrowClosed, color: "#0f6f62" },
 };
 
 const flow = computed(() => definitionToFlow(props.definition));

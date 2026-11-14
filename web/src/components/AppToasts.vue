@@ -22,13 +22,23 @@ import { dismissToast, toasts } from "../state/toast";
 <style scoped>
 .toasts {
   position: fixed;
-  top: 56px;
-  right: 16px;
+  top: 72px;
+  right: 20px;
   z-index: 100;
   display: flex;
   flex-direction: column;
   gap: 8px;
   max-width: 360px;
+}
+
+@media (max-width: 760px) {
+  .toasts {
+    top: auto;
+    bottom: 12px;
+    left: 12px;
+    right: 12px;
+    max-width: none;
+  }
 }
 
 .toast {
@@ -44,7 +54,7 @@ import { dismissToast, toasts } from "../state/toast";
 }
 
 .toast-info {
-  border-left: 3px solid var(--accent);
+  border-left: 3px solid var(--signal);
 }
 
 .toast-success {

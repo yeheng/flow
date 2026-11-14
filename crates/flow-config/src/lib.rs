@@ -1441,3 +1441,5 @@ mod settings_roundtrip_tests {
         assert_eq!(Config::merge_patch(&base, &patch).unwrap(), base);
     }
 }
+
+pub mod plugin_fs;

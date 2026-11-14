@@ -106,6 +106,10 @@ pub struct JournalBackend {
     pub services: tokio::sync::Mutex<
         std::collections::BTreeMap<String, Arc<crate::resident_service::ResidentService>>,
     >,
+    /// Plugin ids whose start is past the admission check and not yet installed.
+    /// This is a std mutex so a guard can release the reservation on drop.
+    pub plugin_ops: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    plugin_ops_changed: Notify,
     pub(crate) environment_metadata: RwLock<()>,
     pub environments: std::sync::OnceLock<Arc<flow_engine::environments::EnvironmentStore>>,
     pub store: Arc<Store>,
@@ -137,6 +141,24 @@ pub struct JournalBackend {
     /// deadline = 询问时刻 + 该值；已登记的询问 deadline 随事实持久，配置
     /// 修改与重启都不刷新它（I34）。
     approval_ttl_ms: AtomicU64,
+}
+
+/// Clears a [`JournalBackend::reserve_service_start`] reservation on drop.
+pub struct ServiceStartGuard {
+    backend: Arc<JournalBackend>,
+    id: String,
+}
+
+impl Drop for ServiceStartGuard {
+    fn drop(&mut self) {
+        let mut starts = self
+            .backend
+            .plugin_ops
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        starts.remove(&self.id);
+        self.backend.plugin_ops_changed.notify_waiters();
+    }
 }
 
 /// harness agent 插件的快照元数据（五元组命名别名，避免长元组类型）。
@@ -371,6 +393,8 @@ impl JournalBackend {
             definitions: Mutex::new(std::collections::HashMap::new()),
             harness_agent: std::sync::OnceLock::new(),
             services: tokio::sync::Mutex::new(Default::default()),
+            plugin_ops: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            plugin_ops_changed: Notify::new(),
             service_ui: tokio::sync::Mutex::new(Default::default()),
             environments: std::sync::OnceLock::new(),
             environment_metadata: RwLock::new(()),
@@ -1195,12 +1219,59 @@ impl JournalBackend {
     pub fn accepts_services(&self) -> bool {
         !self.shutdown.is_cancelled()
     }
+
+    /// Reserve one in-flight start for `id`. The reservation clears when the guard drops.
+    pub fn reserve_service_start(
+        self: &Arc<Self>,
+        id: &str,
+    ) -> std::result::Result<ServiceStartGuard, &'static str> {
+        self.reserve_plugin_operation(id).map_err(|error| {
+            if error == "plugin operation in progress" {
+                "service start already in progress"
+            } else {
+                error
+            }
+        })
+    }
+    pub fn reserve_plugin_operation(
+        self: &Arc<Self>,
+        id: &str,
+    ) -> std::result::Result<ServiceStartGuard, &'static str> {
+        let mut operations = self.plugin_ops.lock().unwrap_or_else(|p| p.into_inner());
+        if !self.accepts_services() {
+            return Err("host is shutting down");
+        }
+        if !operations.insert(id.into()) {
+            return Err("plugin operation in progress");
+        }
+        Ok(ServiceStartGuard {
+            backend: self.clone(),
+            id: id.into(),
+        })
+    }
+    async fn drain_plugin_operations(&self) {
+        loop {
+            let notified = self.plugin_ops_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self
+                .plugin_ops
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty()
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
     /// 关闭后端：停协调循环、等待在途执行会话回收、再关闭写者与读侧。
     ///
     /// 顺序不可颠倒：必须先让执行端口停下并回收子进程，再关写者——
     /// 反过来会让执行器在权威库关闭后仍尝试写入。
     pub async fn close(&self) -> Result<()> {
         self.shutdown.cancel();
+        self.drain_plugin_operations().await;
         let services = std::mem::take(&mut *self.services.lock().await);
         for (_, service) in services {
             service.shutdown().await;
@@ -1524,4 +1595,44 @@ pub(crate) fn project_rows(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod plugin_operation_tests {
+    use super::*;
+    #[tokio::test]
+    async fn close_drains_owned_operations_and_rejects_new_reservations() {
+        let dir = flow_test_support::io::TempDir::new("plugin-operations");
+        let backend = JournalBackend::open(dir.path(), Default::default())
+            .await
+            .unwrap();
+        let operation = backend.reserve_plugin_operation("example").unwrap();
+        assert_eq!(
+            backend.reserve_service_start("example").err(),
+            Some("service start already in progress")
+        );
+        assert_eq!(
+            backend.reserve_plugin_operation("example").err(),
+            Some("plugin operation in progress")
+        );
+        let another = backend.reserve_plugin_operation("another").unwrap();
+        drop(another);
+        let closing = backend.clone();
+        let mut close = tokio::spawn(async move { closing.close().await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut close)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            backend.reserve_service_start("new").err(),
+            Some("host is shutting down")
+        );
+        drop(operation);
+        tokio::time::timeout(std::time::Duration::from_secs(2), close)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
 }

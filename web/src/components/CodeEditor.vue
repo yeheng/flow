@@ -62,6 +62,6 @@ onBeforeUnmount(() => {
 }
 
 .code-editor:focus-within {
-  border-color: var(--accent);
+  border-color: var(--signal);
 }
 </style>
