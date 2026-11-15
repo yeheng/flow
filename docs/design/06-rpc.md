@@ -28,6 +28,13 @@ key 管理 v1 = `flow.config.toml` 的 `[[api_keys]]`（重启生效，无管理
 分类的实际效果是「写面有幂等键与提交游标，读面没有」——因为只有写面会改变权威
 状态、才需要重放保护。
 
+插件目录管理的写方法返回普通 JSON，回执持久化在插件根的 `.ops`，不进入 journal Command，也不由 `command.status` 查询：
+
+| 方法 | 参数 | 权限 |
+| --- | --- | --- |
+| `plugins.install` | `request_id`, `source`, `replace?:false` | admin |
+| `plugins.uninstall` | `request_id`, `plugin_id`, `stop_first?:false` | admin |
+
 ### 11.2 幂等：`request_id`
 
 每个写方法接受调用方提供的 `request_id`（1..=128 字节）：

@@ -77,9 +77,14 @@ impl JournalBackend {
                 &root.definition,
             )
             .await?;
-        let definition_plugins = crate::plugin_registry::plugins_for_definition(
-            &serde_json::to_value(&root_materialized).unwrap_or(serde_json::Value::Null),
-        );
+        let defaults = self.plugin_defaults();
+        let definition_plugins = tokio::task::spawn_blocking(move || {
+            let snapshot = crate::plugin_registry::installed_snapshot_with_defaults(&defaults);
+            crate::plugin_registry::plugins_for_definition_with_plugins(
+                &serde_json::to_value(&root_materialized).unwrap_or(serde_json::Value::Null),
+                snapshot.rows.into_iter().filter_map(|row| row.plugin).collect(),
+            )
+        }).await.map_err(|error| JournalError::Storage(error.to_string()))?;
         Ok((
             selected,
             root.definition,

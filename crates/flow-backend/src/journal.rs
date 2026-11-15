@@ -108,6 +108,7 @@ pub struct JournalBackend {
     >,
     /// Plugin ids whose start is past the admission check and not yet installed.
     /// This is a std mutex so a guard can release the reservation on drop.
+    pub(crate) plugin_executor_program: std::sync::RwLock<Option<std::path::PathBuf>>,
     pub plugin_ops: std::sync::Mutex<std::collections::BTreeSet<String>>,
     plugin_ops_changed: Notify,
     pub(crate) environment_metadata: RwLock<()>,
@@ -393,6 +394,7 @@ impl JournalBackend {
             definitions: Mutex::new(std::collections::HashMap::new()),
             harness_agent: std::sync::OnceLock::new(),
             services: tokio::sync::Mutex::new(Default::default()),
+            plugin_executor_program: std::sync::RwLock::new(None),
             plugin_ops: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             plugin_ops_changed: Notify::new(),
             service_ui: tokio::sync::Mutex::new(Default::default()),
@@ -688,17 +690,13 @@ impl JournalBackend {
         let root = self.journal.root().to_path_buf();
         let upper = self.journal.durable_lsn();
         let stored = definition.clone();
-        let materialized = tokio::task::spawn_blocking(move || {
-            flow_journal::value::materialize(&root, upper, &stored, flow_journal::MAX_LINE_BYTES)
-        })
-        .await
-        .map_err(|e| flow_journal::Error::Unavailable(e.to_string()))??;
-        let parsed = Arc::new(
-            flow_engine::journal_state::validate_definition_with_dynamic(
-                &materialized,
-                &crate::plugin_registry::dynamic_node_types(),
-            )?,
-        );
+        let defaults = self.plugin_defaults();
+        let parsed = tokio::task::spawn_blocking(move || {
+            let materialized = flow_journal::value::materialize(&root, upper, &stored, flow_journal::MAX_LINE_BYTES)?;
+            let snapshot = crate::plugin_registry::installed_snapshot_with_defaults(&defaults);
+            flow_engine::journal_state::validate_definition_with_dynamic(&materialized, &snapshot.dynamic_types())
+        }).await.map_err(|e| flow_journal::Error::Unavailable(e.to_string()))??;
+        let parsed = Arc::new(parsed);
         let mut cache = self.definitions.lock().await;
         cache.insert(run_id.to_owned(), parsed.clone());
         while cache.len() > DEFINITION_CACHE_MAX {

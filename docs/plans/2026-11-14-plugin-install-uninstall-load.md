@@ -294,7 +294,7 @@ flowchart LR
 缓存：
 
 - master 的 **list / recheck** 可以有进程内缓存：`(manifest 路径, mtime, len, entry 路径, mtime, len) → content_hash + 解析结果`。mtime 与长度都没变就不必重读。这是尽力而为：同一秒、同一长度的改写（`cp` 保留时间戳，或时间戳分辨率粗）会命中旧哈希。缓存**不是** start 或 install 的输入。
-- install 成功发布后递增 `plugin_generation`，并对新目录再 `stat` 一次，使下一轮 list 不会沿用替换前的缓存项。uninstall 同样递增。手工拷贝不经过 RPC，generation 不动；list 仍靠 stat。stat 漏掉的内容变化要等下一次 start/install 的强制重读，或等 mtime/len 变化。不把 list 缓存说成强一致。
+- install 成功发布后清除该插件根的进程内扫描缓存；uninstall 同样失效。下一轮 list 重新 stat 和读取，不会沿用替换前的缓存项。这里直接清缓存，不另存 generation 计数器；目录恢复身份仍使用独立的 generation UUID。手工拷贝不经过 RPC，list 仍靠 stat。stat 漏掉的内容变化要等下一次 start/install 的强制重读，或等 mtime/len 变化。不把 list 缓存说成强一致。
 - `services.start` 与 `plugins.install` 在 `spawn_blocking` 里重新读它们即将 spawn 或发布的那份 manifest、entry 与（start 还有）web-ui。不查这层缓存。
 - 执行器不共享这份缓存，也不提供刷新 RPC。`plugins.list` 不能表示执行器已经跟上。
 - 离开 `services` 锁不等于离开异步运行时。`discover_plugins` 今天在 RPC 任务上直接 `fs::read` manifest 和整个入口。冷扫描 64 个插件、入口合计可达数百 MiB，会占住 worker，而常驻握手的 10 秒超时跑在同一个运行时上。因此凡是 RPC 或发布路径触发的扫描、哈希、web-ui 读取，都进 `spawn_blocking`（或同一个阻塞快照函数）。缓存命中时 list 只做 stat，仍放在阻塞快照里，避免以后有人把「未命中就在 worker 上哈希」写回去。
@@ -653,11 +653,13 @@ PluginsUninstall => "plugins.uninstall",
 
 新安装目录带 `.flow-install.json` generation UUID，与同内容重装的另一代区分。源包不得自带宿主保留的 `.flow-install.json`；新 generation 由宿主在封存后写入并同步。操作旧目录时，先在排他租约下为无 marker 的 legacy 目录补 generation；不能写 marker 就返回明确 IO 错误，不降低身份检查。generation 是目录对象的恢复标识，不是第二份插件目录权威，不改变加载与授予。保留 marker 的手工原位修改不受管理，应被 bundle_digest 复查发现并冲突，不能自动回滚覆盖。
 
+发布前明确的参数、容量或冲突拒绝也需要终结回执：保留指纹及失败码/消息，释放该 ID 给新请求，不能让一次 `replace:false` 拒绝永久留下 capturing/sealed 围栏。已写入活目录变更意图的 IO 失败不走这个终结分支，继续依证据恢复；缺失或被其他代际替代的恢复证据也不能改写成普通失败后放行。
+
 `status` 为 prepared/completed；prepared 的 phase 为 capturing、sealed、move_old_intent、publish_intent、remove_intent。每个变更意图必须先以临时文件+rename 持久化，再改目录；恢复通过 operation_id、generation、bundle_digest 和约定路径对账，不能仅凭「同名目录存在/不存在」或「哈希相同」决定成功。
 
 | 恢复证据 | 动作 |
 | --- | --- |
-| completed + 同参数指纹 | 原样回放 result，不碰目录或源 |
+| completed + 同参数指纹 | 原样回放 result（明确失败则回放原错误码与消息），不碰目录或源 |
 | 不同参数指纹 | -32012 same request identity with different arguments |
 | capturing，尚无封存副本且从未修改活目录 | 可从重试参数提供的源重做拷贝；plugin_id 必须仍匹配。此阶段尚未固定包内容 |
 | sealed 或更晚阶段 | 只使用记录的副本和摘要，不再读取 source 决定内容；副本丢失且未有本操作发布证据则报恢复冲突，不从已变化的源补造 |
@@ -666,6 +668,8 @@ PluginsUninstall => "plugins.uninstall",
 | 卸载目标已移入本操作 trash（或阶段已有已移出证据） | 补 completed，即使后来同 ID 被重新安装也不能再删新目录 |
 | 目标出现其他 generation，或 marker/内容与记录不符 | -32012 plugin operation superseded；不删除、不覆盖、不自动回滚后来安装 |
 | 证据不足，例如目标消失且本操作 trash 和已移出证据都缺失 | -32012 plugin recovery evidence missing；不把猜测写成 completed |
+
+新变更按 ID 占位后先对账该 ID 的旧变更意图。最终根级排他裁决还要检查其他 ID 是否有未完成的 rename 意图；有则返回包含原 operation_id 和 plugin_id 的恢复冲突，不抢占它尚未完成的节点类型或容量。其他 ID 处于 capturing/sealed 时仍可并行准备，list 和无关服务不因此阻塞。
 
 prepared 的 trash 在 completed 持久化前不清理，staging 也不能被其他操作的清理器删掉。成功 result 在变更前固定，包含可选 cleanup 目标与 pending 提示；completed 回放不重新推断垃圾是否还在，清理结果不改变已经持久化的逻辑成功结果。进程重启必须先在根级排他租约下对账未完成意图；发现同 id 的旧 prepared 未解决时阻止该 id 的新变更，并返回可操作的恢复错误，不能靠内存占位丢失后继续发布。即使外部修改或未来运维操作使后来一代已经存在，恢复也只能完成旧回执或报告冲突，绝不能对后来一代重放旧动作。
 
@@ -959,53 +963,53 @@ cp target/debug/examples/resident_echo "$dest/bin/resident_echo"
 
 对应 PR 1。这一步会改变已经在盘上的路由，范围以「Rollout Plan」第 1 步为准。绝对入口、已有符号链接、大于 256 MiB 的入口保持可执行。
 
-- [ ] **T1.1 插件根与根级租约只留一处实现。** 先提供 master/执行器共用的跨进程锁模块，读取扫描持共享租约；锁文件兼容要求见根级发布裁决。 `plugins_root()` 供 `discover_plugins`、执行器 `PluginRegistry::load`、`plugin_config::harness_agent_manifest` 共用。删掉后两者各自拼接 `FLOW_PLUGINS_DIR` / `flow_home()/plugins` 的副本。完成：三处解析出的根相同；`FLOW_HOME` 非空时用它，否则 `~/.flow`。
-- [ ] **T1.2 `scan_plugins()` 与可路由子集。** 一层子目录，跳过以 `.` 开头的名字。`discover_plugins()` 只返回谓词通过的插件。`scan_plugins()` 额外返回 `broken` / `conflict`，给 list 和以后的卸载。完成：坏 `plugin.toml` 出现在 list，`load_state=broken`，且不进动态类型集。
-- [ ] **T1.3 路由谓词与 `load_manifest` 对齐，重复 id 除外。** 目录升序。默认行用 `mode_from_config` 真正 spawn 的程序：`config.execution.executor_bin` 优先，否则 `ExecutorInvocation::locate()`。`FLOW_*_PLUGIN_BIN` 已设置但不是文件则没有默认行，不找兄弟文件。`execution.mode=remote` 不插入本机默认行。协议主版本不符、内置类型名（`Harness` / `Llm` 除外）、入口缺失：整份 Broken。异 id 重叠：先接受的留下，后一份整份 Broken。同 id 两份目录：两份都 Conflict，不采用 `load_manifest` 的后者覆盖。没有默认行时，第三方 id 可以声明 `harness` / `llm`。`plugin.toml` > 256 KiB 为 Broken。完成：单测覆盖 `executor_bin` 与 journal 二进制不在同一目录；变量已设但路径不存在；重复 id 两份都不可 start；异 id 重叠时先接受的那份仍可路由。
-- [ ] **T1.4 旧树注解，不摘路由。** 相对符号链接、canonicalize 后在插件目录外、入口 > 256 MiB：仍可路由，list 带 `entry_symlink` / `entry_contained=false` / `entry_oversize`。完成：这种旧插件 `services.start` 仍能发现它。
-- [ ] **T1.5 list 缓存与一次快照。** 全部枚举与读取持根级共享租约，不把“同一次函数调用”当成原子文件系统快照。 list / recheck 的缓存键是 manifest 与 entry 的路径、mtime、len。mtime+len 相同视为尽力而为，文档和注释写明同一秒同长度会漏。`plugins.recheck` 和发布校验消费同一次 `spawn_blocking` 快照，类型集和表单都从它派生，不再各调一次 `discover_plugins()`。完成：快照中间发生 rename 时，不会出现「新类型 + 旧表单」。冷扫描不在异步 worker 上 `fs::read` 整个入口。
-- [ ] **T1.6 `plugins.list` 增量字段。** 可路由插件增加 `load_state`、`directory_name`、`id_matches_directory`、`entry_contained`、`entry_symlink`、`entry_oversize`、`running`、`service`。没有 `executor_reload_required`。`running` 在扫描结束、放下扫描所用的阻塞调用之后，用一次 `services` 锁标注。`web/src/types.ts` 的 `PluginInfo` 把新字段标成可选。完成：旧前端忽略未知字段仍能列出插件；非管理员仍拿不到 `services.list` 的 `ui`。
+- [x] **T1.1 插件根与根级租约只留一处实现。** 先提供 master/执行器共用的跨进程锁模块，读取扫描持共享租约；锁文件兼容要求见根级发布裁决。 `plugins_root()` 供 `discover_plugins`、执行器 `PluginRegistry::load`、`plugin_config::harness_agent_manifest` 共用。删掉后两者各自拼接 `FLOW_PLUGINS_DIR` / `flow_home()/plugins` 的副本。完成：三处解析出的根相同；`FLOW_HOME` 非空时用它，否则 `~/.flow`。
+- [x] **T1.2 `scan_plugins()` 与可路由子集。** 一层子目录，跳过以 `.` 开头的名字。`discover_plugins()` 只返回谓词通过的插件。`scan_plugins()` 额外返回 `broken` / `conflict`，给 list 和以后的卸载。完成：坏 `plugin.toml` 出现在 list，`load_state=broken`，且不进动态类型集。
+- [x] **T1.3 路由谓词与 `load_manifest` 对齐，重复 id 除外。** 目录升序。默认行用 `mode_from_config` 真正 spawn 的程序：`config.execution.executor_bin` 优先，否则 `ExecutorInvocation::locate()`。`FLOW_*_PLUGIN_BIN` 已设置但不是文件则没有默认行，不找兄弟文件。`execution.mode=remote` 不插入本机默认行。协议主版本不符、内置类型名（`Harness` / `Llm` 除外）、入口缺失：整份 Broken。异 id 重叠：先接受的留下，后一份整份 Broken。同 id 两份目录：两份都 Conflict，不采用 `load_manifest` 的后者覆盖。没有默认行时，第三方 id 可以声明 `harness` / `llm`。`plugin.toml` > 256 KiB 为 Broken。完成：单测覆盖 `executor_bin` 与 journal 二进制不在同一目录；变量已设但路径不存在；重复 id 两份都不可 start；异 id 重叠时先接受的那份仍可路由。
+- [x] **T1.4 旧树注解，不摘路由。** 相对符号链接、canonicalize 后在插件目录外、入口 > 256 MiB：仍可路由，list 带 `entry_symlink` / `entry_contained=false` / `entry_oversize`。完成：这种旧插件 `services.start` 仍能发现它。
+- [x] **T1.5 list 缓存与一次快照。** 全部枚举与读取持根级共享租约，不把“同一次函数调用”当成原子文件系统快照。 list / recheck 的缓存键是 manifest 与 entry 的路径、mtime、len。mtime+len 相同视为尽力而为，文档和注释写明同一秒同长度会漏。`plugins.recheck` 和发布校验消费同一次 `spawn_blocking` 快照，类型集和表单都从它派生，不再各调一次 `discover_plugins()`。完成：快照中间发生 rename 时，不会出现「新类型 + 旧表单」。冷扫描不在异步 worker 上 `fs::read` 整个入口。
+- [x] **T1.6 `plugins.list` 增量字段。** 可路由插件增加 `load_state`、`directory_name`、`id_matches_directory`、`entry_contained`、`entry_symlink`、`entry_oversize`、`running`、`service`。没有 `executor_reload_required`。`running` 在扫描结束、放下扫描所用的阻塞调用之后，用一次 `services` 锁标注。`web/src/types.ts` 的 `PluginInfo` 把新字段标成可选。完成：旧前端忽略未知字段仍能列出插件；非管理员仍拿不到 `services.list` 的 `ui`。
 
 ### T2 — 占位盖住停止，租约覆盖校验到 spawn
 
 对应 PR 2。不删除插件目录，不改 32 的比较对象，不改握手 10 秒、绑定、`ui` 仅管理员、gap/resync、反向请求 16。
 
-- [ ] **T2.1 `service_starts` 改成 `plugin_ops`。** 同一张 `Mutex<BTreeSet<String>>` 覆盖 start、公开 stop、以后的 install/uninstall。mutex 只在插删 id 时拿着，guard 跨 `.await`。完成：占位期间第二次 `services.start` 仍是 `-32602` `service start already in progress`，不是 `-32012`。`close` 已取消时，start/stop 的占位失败是 `host is shutting down`。
-- [ ] **T2.2 公开 stop 占位到进程回收结束。** 顺序：占位、锁内核对 `instance` 并 `remove`、放锁、`service_ui.retain`、`shutdown().await`、放占位。instance 不匹配仍是 `stale service instance`，并释放占位。完成：stop 已经摘表、`shutdown` 还没返回时，同 id 的 start 进不了占位。
-- [ ] **T2.3 `close` 先排空占位。** `shutdown.cancel()` 之后等 `plugin_ops` 变空，再 `mem::take(services)`，逐个 `shutdown`，然后才 `service_ui.clear()`。等待期间不拿 `services`。完成：`close` 的句柄清空仍在全部进程回收之后，不改成 stop 的顺序。
-- [ ] **T2.4 跨进程执行租约。** master start 和执行器 plugin_session::open 从新鲜校验到 Session::spawn 返回持同一根级共享租约，握手在释放后做；安装/卸载排他发布。完成：校验后暂停执行器并发 replace，必须等 spawn 返回后才发布，绝不以旧身份执行新字节；显式路径、默认二进制、remote 本地根边界分别测试。
+- [x] **T2.1 `service_starts` 改成 `plugin_ops`。** 同一张 `Mutex<BTreeSet<String>>` 覆盖 start、公开 stop、以后的 install/uninstall。mutex 只在插删 id 时拿着，guard 跨 `.await`。完成：占位期间第二次 `services.start` 仍是 `-32602` `service start already in progress`，不是 `-32012`。`close` 已取消时，start/stop 的占位失败是 `host is shutting down`。
+- [x] **T2.2 公开 stop 占位到进程回收结束。** 顺序：占位、锁内核对 `instance` 并 `remove`、放锁、`service_ui.retain`、`shutdown().await`、放占位。instance 不匹配仍是 `stale service instance`，并释放占位。完成：stop 已经摘表、`shutdown` 还没返回时，同 id 的 start 进不了占位。
+- [x] **T2.3 `close` 先排空占位。** `shutdown.cancel()` 之后等 `plugin_ops` 变空，再 `mem::take(services)`，逐个 `shutdown`，然后才 `service_ui.clear()`。等待期间不拿 `services`。完成：`close` 的句柄清空仍在全部进程回收之后，不改成 stop 的顺序。
+- [x] **T2.4 跨进程执行租约。** master start 和执行器 plugin_session::open 从新鲜校验到 Session::spawn 返回持同一根级共享租约，握手在释放后做；安装/卸载排他发布。完成：校验后暂停执行器并发 replace，必须等 spawn 返回后才发布，绝不以旧身份执行新字节；显式路径、默认二进制、remote 本地根边界分别测试。
 
 ### T3 — `plugins.install` / `plugins.uninstall`
 
 对应 PR 3。依赖 T1、T2。新模块 `crates/flow-backend/src/plugin_lifecycle.rs`。方法进 `flow_dto::rpc` 的写集合。`resolve_caller` 把这两个名字和 `permissions.grant` 放在一起，缺 `admin` 为 `-32020`。
 
-- [ ] **T3.1 可恢复回执。** 实现「幂等」节完整字段、阶段、generation marker、独立 bundle_digest 和持久化顺序。完成：发布后源变化不再读源；旧卸载遇同 ID 新 generation 不动新目录；缺失证据报冲突；completed 原样回放；副本/回执/父目录持久化故障均覆盖。
-- [ ] **T3.2 安装校验与发布。** 只接受本机目录，不接受 URL 和压缩包。源目录不是符号链接，canonical 不在插件根内。副本上做清单、相对 `Normal` 入口、路由谓词、`[service]` 上限、走树（4096 文件、单文件 256 MiB、整树 512 MiB）、web-ui ≤ 256 KiB。`plugin.id` 长度 1..=64，发布位置是 `plugins_root/<id>/`。同盘 `rename`。`replace: false` 且哈希不同：`-32012` `plugin already installed`。alive 行存在：`-32012` `service already running; stop before replace`，不杀进程。死行不阻止替换。安装不 spawn，不写 grant。完成：校验失败不留下活目录；新目录 rename 失败且 trash 回滚也失败时 `-32603`，message 带 trash 路径，data 为 `None`；成功响应含 `content_hash`、`grant_state`、`executor_reload_required`（仅 `node_types` 非空为 true）、`idempotent`。
-- [ ] **T3.3 根级发布和执行边界。** 拷贝并行，排他发布租约内重新检查跨 id 类型冲突、容量及 generation，并完成意图/rename/回执。完成：两个 id 争同类型至多一成功，第64/65行不超限；替换双 rename 期间扫描被阻塞；执行器校验到 spawn 租约保持。安装不杀已启动节点、不热加载。
-- [ ] **T3.4 卸载。** 参数是 `plugin_id`，不是路径。目标只可能是 `plugins_root.join(plugin_id)`。符号链接或 canonical 不在插件根的直接子目录：`-32602`，不 `remove_dir_all`。能解析的清单必须 id、目录名、参数三者相同，否则 message 含 `source=`。清单坏掉仍允许删这个直接子目录。目录已不存在：成功 `{removed:false, already_absent:true}`，不用 `-32011`。默认有 alive 行则 `-32012` `service running`。完成：`remove_dir_all` 只发生在 canonical 仍位于 `plugins_root/.trash` 之下的那一棵；trash 本身是符号链接时留下并 `-32603`。
-- [ ] **T3.5 `stop_first`。** 不调用公开 `services.stop`。占位内 `remove` 当前行，不核对调用方 instance；先 `service_ui.retain`，再 `shutdown().await`，占位留到回收结束；然后再短锁确认该 id 不在表里，然后才 rename。`stopped_instance` 来自被摘下的行。shutdown 不返回则目录不动，不另加更短超时。完成：stop 成功但 rename 失败时，服务已不在表里，目录还在，返回 `-32603`。
-- [ ] **T3.6 上限与错误码表。** 第 65 个扫描行的 install 返回 `-32021`。已经超过 64 的旧目录仍全部列出。服务表满仍是 `-32602` `service limit reached`，按 `services.len()` 含死行。不新增错误码。完成：错误表里的每一句都有一条单测或现有测试钉住，data 字段保持 `None`。
+- [x] **T3.1 可恢复回执。** 实现「幂等」节完整字段、阶段、generation marker、独立 bundle_digest 和持久化顺序。完成：发布后源变化不再读源；旧卸载遇同 ID 新 generation 不动新目录；缺失证据报冲突；completed 原样回放；副本/回执/父目录持久化故障均覆盖。
+- [x] **T3.2 安装校验与发布。** 只接受本机目录，不接受 URL 和压缩包。源目录不是符号链接，canonical 不在插件根内。副本上做清单、相对 `Normal` 入口、路由谓词、`[service]` 上限、走树（4096 文件、单文件 256 MiB、整树 512 MiB）、web-ui ≤ 256 KiB。`plugin.id` 长度 1..=64，发布位置是 `plugins_root/<id>/`。同盘 `rename`。`replace: false` 且哈希不同：`-32012` `plugin already installed`。alive 行存在：`-32012` `service already running; stop before replace`，不杀进程。死行不阻止替换。安装不 spawn，不写 grant。完成：校验失败不留下活目录；新目录 rename 失败且 trash 回滚也失败时 `-32603`，message 带 trash 路径，data 为 `None`；成功响应含 `content_hash`、`grant_state`、`executor_reload_required`（仅 `node_types` 非空为 true）、`idempotent`。
+- [x] **T3.3 根级发布和执行边界。** 拷贝并行，排他发布租约内重新检查跨 id 类型冲突、容量及 generation，并完成意图/rename/回执。完成：两个 id 争同类型至多一成功，第64/65行不超限；替换双 rename 期间扫描被阻塞；执行器校验到 spawn 租约保持。安装不杀已启动节点、不热加载。
+- [x] **T3.4 卸载。** 参数是 `plugin_id`，不是路径。目标只可能是 `plugins_root.join(plugin_id)`。符号链接或 canonical 不在插件根的直接子目录：`-32602`，不 `remove_dir_all`。能解析的清单必须 id、目录名、参数三者相同，否则 message 含 `source=`。清单坏掉仍允许删这个直接子目录。目录已不存在：成功 `{removed:false, already_absent:true}`，不用 `-32011`。默认有 alive 行则 `-32012` `service running`。完成：`remove_dir_all` 只发生在 canonical 仍位于 `plugins_root/.trash` 之下的那一棵；trash 本身是符号链接时留下并 `-32603`。
+- [x] **T3.5 `stop_first`。** 不调用公开 `services.stop`。占位内 `remove` 当前行，不核对调用方 instance；先 `service_ui.retain`，再 `shutdown().await`，占位留到回收结束；然后再短锁确认该 id 不在表里，然后才 rename。`stopped_instance` 来自被摘下的行。shutdown 不返回则目录不动，不另加更短超时。完成：stop 成功但 rename 失败时，服务已不在表里，目录还在，返回 `-32603`。
+- [x] **T3.6 上限与错误码表。** 第 65 个扫描行的 install 返回 `-32021`。已经超过 64 的旧目录仍全部列出。服务表满仍是 `-32602` `service limit reached`，按 `services.len()` 含死行。不新增错误码。完成：错误表里的每一句都有一条单测或现有测试钉住，data 字段保持 `None`。
 
 ### T4 — CLI
 
 对应 PR 4。依赖 T3。
 
-- [ ] **T4.1 子命令。** `flow journal plugins list|recheck|install|uninstall`。install 只有 `--source` 和可选 `--replace`。uninstall 是位置参数 `plugin-id` 加可选 `--stop-first`。不新增子命令级 `--request-id`。完成：参数对象里已有 `request_id` 时它赢过全局 flag；否则用 `REQUEST_ID`；否则新 UUID。子命令组参数时不预填 `request_id`。
-- [ ] **T4.2 失败提示。** 网络错误不要指向 `command.status`。提示保留这一次的 `request_id`，让人看 `plugins.list` 的 `content_hash` 再重放。完成：`plugins.install` / `plugins.uninstall` 不在「去 command.status」的文案里。CLI 不复制校验逻辑。
+- [x] **T4.1 子命令。** `flow journal plugins list|recheck|install|uninstall`。install 只有 `--source` 和可选 `--replace`。uninstall 是位置参数 `plugin-id` 加可选 `--stop-first`。不新增子命令级 `--request-id`。完成：参数对象里已有 `request_id` 时它赢过全局 flag；否则用 `REQUEST_ID`；否则新 UUID。子命令组参数时不预填 `request_id`。
+- [x] **T4.2 失败提示。** 网络错误不要指向 `command.status`。提示保留这一次的 `request_id`，让人看 `plugins.list` 的 `content_hash` 再重放。完成：`plugins.install` / `plugins.uninstall` 不在「去 command.status」的文案里。CLI 不复制校验逻辑。
 
 ### T5 — 设置页
 
 对应 PR 5。依赖 T3。PR 1 的字段可以先只读展示。
 
-- [ ] **T5.1 卡片。** 显示 `load_state`、`grant_state`、`running`、`entry_contained`、`entry_symlink`、`entry_oversize`。不把 `executor_reload_required` 存成卡片状态。完成：刷新列表后 toast 消失，卡片不显示「执行器待重启」。
-- [ ] **T5.2 安装与卸载。** 安装输入是本机目录路径，交给 master，不上传目录。`node_types` 非空时，用这一次响应做一次性 toast。`running` 时卸载要求确认 `stop_first`，否则提示去常驻面板停止。`WRITE_METHODS` 加入 `plugins.install` 和 `plugins.uninstall`。完成：不改 `PluginServiceFrame.vue` 的一次绑定，不改 Tauri `frame-src`，不重写权限页的授予编辑器。
+- [x] **T5.1 卡片。** 显示 `load_state`、`grant_state`、`running`、`entry_contained`、`entry_symlink`、`entry_oversize`。不把 `executor_reload_required` 存成卡片状态。完成：刷新列表后 toast 消失，卡片不显示「执行器待重启」。
+- [x] **T5.2 安装与卸载。** 安装输入是本机目录路径，交给 master，不上传目录。`node_types` 非空时，用这一次响应做一次性 toast。`running` 时卸载要求确认 `stop_first`，否则提示去常驻面板停止。`WRITE_METHODS` 加入 `plugins.install` 和 `plugins.uninstall`。完成：不改 `PluginServiceFrame.vue` 的一次绑定，不改 Tauri `frame-src`，不重写权限页的授予编辑器。
 
 ### T6 — 文档
 
 对应 PR 6。依赖 T3 的最终错误字符串。
 
-- [ ] **T6.1 常驻服务文档。** `docs/features/resident-plugin-services.md` 写明：手工拷贝仍合法；RPC 是受检路径；加载、recheck、start 不是一件事；节点插件要重启执行器；卸载不撤 grant；服务存活时不能换目录。
-- [ ] **T6.2 不改已经写错的承诺。** `docs/design/06-rpc.md` 只在方法表加 `plugins.install` / `plugins.uninstall` 两行。不改 I35 的定义；独立 bundle_digest 仅用于目录恢复。不把 09 §7「recheck 检出待授予」改成已实现。`examples/resident-echo/README.md` 保留拷贝步骤，加一句可以对样例目录调用 `plugins.install`。
+- [x] **T6.1 常驻服务文档。** `docs/features/resident-plugin-services.md` 写明：手工拷贝仍合法；RPC 是受检路径；加载、recheck、start 不是一件事；节点插件要重启执行器；卸载不撤 grant；服务存活时不能换目录。
+- [x] **T6.2 不改已经写错的承诺。** `docs/design/06-rpc.md` 只在方法表加 `plugins.install` / `plugins.uninstall` 两行。不改 I35 的定义；独立 bundle_digest 仅用于目录恢复。不把 09 §7「recheck 检出待授予」改成已实现。`examples/resident-echo/README.md` 保留拷贝步骤，加一句可以对样例目录调用 `plugins.install`。
 
 ### 明确不做
 

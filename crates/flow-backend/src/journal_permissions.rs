@@ -609,7 +609,7 @@ impl JournalBackend {
     /// `plugins.list`：已部署插件 + 内容身份 + 授予状态（UI 授予页的
     /// 唯一数据源；未部署的内置插件不出现在这里）。
     pub async fn plugins_view(&self) -> Vec<Value> {
-        let snapshot = match tokio::task::spawn_blocking(crate::plugin_registry::installed_snapshot).await {
+        let snapshot = match tokio::task::spawn_blocking({ let defaults = self.plugin_defaults(); move || crate::plugin_registry::installed_snapshot_cached_with_defaults(&defaults) }).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 tracing::warn!(%error, "plugin scan worker failed");
@@ -659,7 +659,13 @@ impl JournalBackend {
         legacy_confirm: bool,
         request_id: &str,
     ) -> Result<CommandReceipt> {
-        let Some(identity) = crate::plugin_registry::bundled_or_discovered(plugin_id) else {
+        let selected_id = plugin_id.to_owned();
+        let defaults = self.plugin_defaults();
+        let identity = tokio::task::spawn_blocking(move || {
+            let snapshot = crate::plugin_registry::installed_snapshot_with_defaults(&defaults);
+            crate::plugin_registry::bundled_or_discovered_with_plugins(&selected_id, snapshot.rows.into_iter().filter_map(|row| row.plugin).collect())
+        }).await.map_err(|error| crate::journal::JournalError::Storage(error.to_string()))?;
+        let Some(identity) = identity else {
             return Err(
                 flow_journal::Error::NotFound(format!("plugin {plugin_id} not deployed")).into(),
             );

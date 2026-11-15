@@ -131,14 +131,16 @@ impl JournalBackend {
             ))
             .into());
         }
+        let plugin_executor_program = options.executor.program.clone();
         let epoch = self.bump_master_epoch().await?;
         // 协调器的派发窗口与执行槽位是同一个旋钮：IPC 的 x_max 同时是池容量与
         // A_max。16 是协议上限。
         let limit = options.x_max.clamp(1, 16);
         let pool = crate::execution::ExecutorPool::new(options, self.journal.id().into(), epoch);
         let dispatcher = Arc::new(IpcDispatcher::new(pool));
-        self.start_execution_with_port(limit, ExecutionPort::Ipc(dispatcher), prewarm)
-            .await
+        self.start_execution_with_port(limit, ExecutionPort::Ipc(dispatcher), prewarm).await?;
+        *self.plugin_executor_program.write().unwrap_or_else(|e| e.into_inner()) = Some(plugin_executor_program);
+        Ok(())
     }
 
     /// 持久提交新任期并返回新 epoch。
@@ -196,6 +198,8 @@ impl JournalBackend {
             // 启动失败时必须关掉已监听的端口，否则会留下一个没有协调器
             // 的空壳监听。
             manager.shutdown().await;
+        } else {
+            *self.plugin_executor_program.write().unwrap_or_else(|e| e.into_inner()) = None;
         }
         result
     }
@@ -207,8 +211,9 @@ impl JournalBackend {
         options: RemoteOptions,
     ) -> Result<()> {
         let dispatcher = Arc::new(RemoteDispatcher::new(manager, options));
-        self.start_execution_with_port(16, ExecutionPort::Remote(dispatcher), false)
-            .await
+        self.start_execution_with_port(16, ExecutionPort::Remote(dispatcher), false).await?;
+        *self.plugin_executor_program.write().unwrap_or_else(|e| e.into_inner()) = None;
+        Ok(())
     }
 
     /// 启动协调循环任务（唯一持有执行端口的任务）。

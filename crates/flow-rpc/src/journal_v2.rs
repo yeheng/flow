@@ -63,7 +63,7 @@ fn resolve_caller(ctx: &Context, method: &str, supplied: &str) -> Result<Caller,
         // 权限管理（grant/keys）admin。
         let required: &'static str = match method {
             "run.approve" | "run.deny" => "approve",
-            "permissions.grant" => "admin",
+            "permissions.grant" | "plugins.install" | "plugins.uninstall" => "admin",
             m if flow_dto::rpc::is_read_method(m) => "read",
             _ => "write",
         };
@@ -109,6 +109,17 @@ fn failure(error: JournalError) -> ErrorObjectOwned {
         JournalError::Journal(flow_journal::Error::Invalid(message)) => invalid(message),
         _ => ErrorObjectOwned::owned(-32603, "journal service unavailable", None::<()>),
     }
+}
+
+fn plugin_failure(error: flow_backend::plugin_operation::OperationError) -> ErrorObjectOwned {
+    use flow_backend::{plugin_bundle::BundleError, plugin_operation::OperationError};
+    let code = match &error {
+        OperationError::Invalid(_) | OperationError::Bundle(BundleError::Invalid(_)) => -32602,
+        OperationError::Conflict(_) => -32012,
+        OperationError::Bundle(BundleError::Limit(_)) => -32021,
+        _ => -32603,
+    };
+    ErrorObjectOwned::owned(code, error.to_string(), None::<()>)
 }
 
 /// 权限模型拒绝的错误码（09）：legacy 定义需迁移、能力不足、无审批权、
@@ -860,7 +871,12 @@ async fn dispatch_admitted(
         Method::SecretsSet => return secrets_set(ctx, &p).await,
         Method::SecretsDelete => return secrets_delete(ctx, &p).await,
         Method::NodetypesList => {
-            return Ok(json!({"node_types": crate::node_types()}));
+            let defaults = b.plugin_defaults();
+            let types = tokio::task::spawn_blocking(move || {
+                let snapshot = flow_backend::plugin_registry::installed_snapshot_cached_with_defaults(&defaults);
+                crate::node_types(snapshot.rows.into_iter().filter_map(|row| row.plugin))
+            }).await.map_err(invalid)?;
+            return Ok(json!({"node_types": types}));
         }
         Method::ServicesList => {
             let admin = caller.permission_admin;
@@ -917,11 +933,15 @@ async fn dispatch_admitted(
             // Discovery, the process, and the handshake stay outside `services`.
             // Stop and call of every other service must not wait on this spawn.
             let _starting = b.reserve_service_start(id).map_err(invalid)?;
+            let defaults = b.plugin_defaults();
             let selected_id=id.to_owned();
             let (lease,source,entry_path,declaration,html)=tokio::task::spawn_blocking(move||{
                 let root=flow_config::plugin_fs::plugins_root().ok_or_else(||invalid("plugin root unavailable"))?;
                 let lease=flow_config::plugin_fs::RootLease::shared(&root).map_err(invalid)?;
-            let plugin = flow_backend::plugin_scan::scan_unlocked(&root, &std::collections::BTreeMap::new())
+                if flow_backend::plugin_operation::Operation::has_unfinished(&root, &selected_id).map_err(invalid)? {
+                    return Err(invalid("plugin operation requires recovery"));
+                }
+            let plugin = flow_backend::plugin_scan::scan_unlocked(&root, &defaults)
                 .map_err(invalid)?.rows.into_iter().filter_map(|row| row.plugin)
                 .find(|plugin| plugin.manifest.plugin.id == selected_id)
                 .ok_or_else(|| invalid("plugin not installed"))?;
@@ -1074,6 +1094,16 @@ async fn dispatch_admitted(
             let value=service.call(text(&p,"instance")?,text(&p,"method")?,p["params"].clone()).await.map_err(invalid)?;
             return Ok(json!({"value":value}));
         }
+        Method::PluginsInstall => {
+            if !caller.permission_admin { return Err(invalid("plugin install requires admin")); }
+            let replace = p.get("replace").map(|v| v.as_bool().ok_or_else(|| invalid("replace must be a boolean"))).transpose()?.unwrap_or(false);
+            return b.plugin_install(text(&p, "source")?.to_owned(), replace, text(&p, "request_id")?.to_owned()).await.map_err(plugin_failure);
+        }
+        Method::PluginsUninstall => {
+            if !caller.permission_admin { return Err(invalid("plugin uninstall requires admin")); }
+            let stop_first = p.get("stop_first").map(|v| v.as_bool().ok_or_else(|| invalid("stop_first must be a boolean"))).transpose()?.unwrap_or(false);
+            return b.plugin_uninstall(text(&p, "plugin_id")?.to_owned(), stop_first, text(&p, "request_id")?.to_owned()).await.map_err(plugin_failure);
+        }
         Method::PluginsList => {
             return Ok(json!({"plugins": b.plugins_view().await}));
         }
@@ -1170,7 +1200,7 @@ async fn dispatch_admitted(
 /// 插件升级收紧闭集后，存量定义可能已非法——这个方法把漂移显式化，
 /// 不等它在凌晨三点的 run 里爆。
 async fn plugins_recheck(ctx: &Context) -> Result<Value, ErrorObjectOwned> {
-    let snapshot = tokio::task::spawn_blocking(flow_backend::plugin_registry::installed_snapshot)
+    let snapshot = tokio::task::spawn_blocking({ let defaults = ctx.backend.plugin_defaults(); move || flow_backend::plugin_registry::installed_snapshot_cached_with_defaults(&defaults) })
         .await.map_err(invalid)?;
     let dynamic = snapshot.dynamic_types();
     let forms = snapshot.forms();
@@ -2123,6 +2153,21 @@ mod tests {
     /// 错误码必须由**类型**决定，而不是由文案决定。
     ///
     /// 这条规则一旦破例，客户端的按码分支会在某次措辞调整后静默失效。
+    #[test]
+    fn plugin_mutations_use_existing_error_codes_without_error_data() {
+        use flow_backend::{plugin_bundle::BundleError, plugin_operation::OperationError};
+        for (error, code) in [
+            (OperationError::Invalid("bad path".into()), -32602),
+            (OperationError::Conflict("plugin operation superseded".into()), -32012),
+            (OperationError::Bundle(BundleError::Limit("plugin limit reached".into())), -32021),
+            (OperationError::Io(std::io::Error::other("rename failed")), -32603),
+        ] {
+            let mapped = super::plugin_failure(error);
+            assert_eq!(mapped.code(), code);
+            assert!(mapped.data().is_none());
+        }
+    }
+
     #[test]
     fn error_codes_follow_types_instead_of_message_text() {
         assert_eq!(

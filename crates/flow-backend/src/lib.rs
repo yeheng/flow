@@ -98,3 +98,9 @@ pub mod resident_service;
 pub mod service_host;
 
 pub mod plugin_scan;
+
+pub mod plugin_bundle;
+
+pub mod plugin_operation;
+
+pub mod plugin_lifecycle;

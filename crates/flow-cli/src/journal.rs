@@ -30,6 +30,11 @@ tokio::task_local! {
 #[derive(Subcommand)]
 /// journal 子命令组。
 pub enum Command {
+    /// Manage local plugin bundles on the journal host.
+    Plugins {
+        #[command(subcommand)]
+        command: PluginCommand,
+    },
     /// Execute a candidate against recorded external outcomes; fail CI on differences.
     Regress {
         baseline: String,
@@ -71,6 +76,23 @@ pub enum Command {
         http: String,
     },
 }
+#[derive(Subcommand)]
+pub enum PluginCommand {
+    List,
+    Recheck,
+    Install {
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        replace: bool,
+    },
+    Uninstall {
+        plugin_id: String,
+        #[arg(long)]
+        stop_first: bool,
+    },
+}
+
 /// 把任意错误收敛成本地错误。
 fn error(e: impl ToString) -> CliError {
     CliError::local(e.to_string())
@@ -115,7 +137,9 @@ pub(crate) async fn call(
         }),
         Err(e) if crate::client::is_write_method(method) => {
             let identity = json!({"scope":flow_dto::command_scope(method, &params), "request_id":params["request_id"]});
-            let recovery = if matches!(method, "config.update" | "secrets.set" | "secrets.delete") {
+            let recovery = if matches!(method, "plugins.install" | "plugins.uninstall") {
+                "使用同一 request_id 与原参数重试；插件操作回执存于宿主插件目录，不通过 command.status 查询。"
+            } else if matches!(method, "config.update" | "secrets.set" | "secrets.delete") {
                 "此方法没有持久命令回执；请查询当前配置或密钥状态后再决定是否重试。"
             } else {
                 "使用 command.status 查询回执；重试必须使用同一 request_id 与原参数，不能换新键。"
@@ -132,6 +156,27 @@ pub async fn dispatch(client: &WsClient, command: Command) -> Result<(), CliErro
     let token =
         std::env::var("FLOW_JOURNAL_TOKEN").map_err(|_| error("FLOW_JOURNAL_TOKEN required"))?;
     match command {
+        Command::Plugins { command } => {
+            let (method, params) = match command {
+                PluginCommand::List => ("plugins.list", json!({})),
+                PluginCommand::Recheck => ("plugins.recheck", json!({})),
+                PluginCommand::Install { source, replace } => (
+                    "plugins.install",
+                    json!({"source":source,"replace":replace}),
+                ),
+                PluginCommand::Uninstall {
+                    plugin_id,
+                    stop_first,
+                } => (
+                    "plugins.uninstall",
+                    json!({"plugin_id":plugin_id,"stop_first":stop_first}),
+                ),
+            };
+            let result = call(client, &token, method, params).await?;
+            println!("{}", serde_json::to_string_pretty(&result).map_err(error)?);
+            return Ok(());
+        }
+
         Command::Regress {
             baseline,
             workflow_id,
@@ -318,5 +363,48 @@ fn print_comparison(report: Value, candidate: &str) -> Result<(), CliError> {
             status: "regression_difference".into(),
             error: Some("candidate did not match baseline".into()),
         })
+    }
+}
+
+#[cfg(test)]
+mod plugin_command_tests {
+    use clap::Parser;
+    #[test]
+    fn plugin_commands_use_the_existing_global_request_identity() {
+        for arguments in [
+            vec!["flow", "journal", "plugins", "list"],
+            vec!["flow", "journal", "plugins", "recheck"],
+            vec![
+                "flow",
+                "--request-id",
+                "stable",
+                "journal",
+                "plugins",
+                "install",
+                "--source",
+                "/tmp/plugin",
+                "--replace",
+            ],
+            vec![
+                "flow",
+                "journal",
+                "plugins",
+                "uninstall",
+                "demo",
+                "--stop-first",
+                "--request-id",
+                "stable",
+            ],
+        ] {
+            assert!(crate::cli::Cli::try_parse_from(arguments).is_ok());
+        }
+        assert!(crate::cli::Cli::try_parse_from([
+            "flow",
+            "journal",
+            "plugins",
+            "install",
+            "/tmp/plugin"
+        ])
+        .is_err());
     }
 }

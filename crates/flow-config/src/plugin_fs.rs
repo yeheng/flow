@@ -15,9 +15,9 @@ pub struct RootLease {
     file: File,
 }
 impl RootLease {
-    fn open(root: &Path, exclusive: bool) -> io::Result<Self> {
+    fn open(root: &Path, name: &str, exclusive: bool) -> io::Result<Self> {
         let root = root.canonicalize()?;
-        let path = root.join(".publish.lock");
+        let path = root.join(name);
         let file = match OpenOptions::new()
             .read(true)
             .write(true)
@@ -46,10 +46,14 @@ impl RootLease {
     }
     /// Blocking: callers on an async runtime must acquire through spawn_blocking.
     pub fn shared(root: &Path) -> io::Result<Self> {
-        Self::open(root, false)
+        Self::open(root, ".publish.lock", false)
     }
     pub fn exclusive(root: &Path) -> io::Result<Self> {
-        Self::open(root, true)
+        Self::open(root, ".publish.lock", true)
+    }
+    /// Short receipt read/create/update critical sections only; never hold during copying.
+    pub fn operations(root: &Path) -> io::Result<Self> {
+        Self::open(root, ".ops.lock", true)
     }
 }
 impl Drop for RootLease {

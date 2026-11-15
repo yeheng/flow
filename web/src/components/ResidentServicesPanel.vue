@@ -56,6 +56,7 @@ function open(service: Service) {
   close();
   selected.value = service;
 }
+defineExpose({ refresh });
 onMounted(() => {
   void refresh();
 });

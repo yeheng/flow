@@ -80,6 +80,8 @@ methods! {
         PermissionsAuditPage => "permissions.audit.page",
     }
     write {
+        PluginsInstall => "plugins.install",
+        PluginsUninstall => "plugins.uninstall",
         ServicesStart => "services.start",
         ServicesStop => "services.stop",
         ServicesCall => "services.call",

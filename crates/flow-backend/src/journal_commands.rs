@@ -65,14 +65,14 @@ struct PreparedDefinition {
 }
 impl PreparedDefinition {
     /// 归一化并校验一份定义：补齐语义版本、校验结构、计算摘要。
-    fn new(mut value: Value) -> flow_journal::Result<Self> {
+    fn new(mut value: Value, defaults: BTreeMap<String, String>) -> flow_journal::Result<Self> {
         if let Some(object) = value.as_object_mut() {
             // 未显式指定语义时按 v2 解释；显式传 1 仍可创建兼容版本。
             object.entry("semantics").or_insert(json!(2));
         }
         // 插件声明的动态节点类型：按已部署 manifest 计算集合（引擎不发现
         // 插件）；参数按 manifest 表单校验（类型级错误在发布期拒绝）。
-        let snapshot = crate::plugin_registry::installed_snapshot();
+        let snapshot = crate::plugin_registry::installed_snapshot_with_defaults(&defaults);
         let dynamic_types = snapshot.dynamic_types();
         let parsed =
             flow_engine::journal_state::validate_definition_with_dynamic(&value, &dynamic_types)?;
@@ -686,7 +686,7 @@ impl JournalBackend {
     /// 预检不写任何事实，只回报「定义是否可用、缺哪些密钥」——
     /// 编辑器需要即时反馈，而预检写库会污染事实序列。
     pub fn workflow_validate(&self, definition: Value) -> Result<Value> {
-        let prepared = PreparedDefinition::new(definition)?;
+        let prepared = PreparedDefinition::new(definition, self.plugin_defaults())?;
         let missing: Vec<Value> = prepared
             .missing_secrets()
             .into_iter()
@@ -721,7 +721,8 @@ impl JournalBackend {
         actor: Option<&WriteActor<'_>>,
     ) -> Result<CommandReceipt> {
         validate_workflow_name(name)?;
-        let prepared = tokio::task::spawn_blocking(move || PreparedDefinition::new(definition))
+        let defaults = self.plugin_defaults();
+        let prepared = tokio::task::spawn_blocking(move || PreparedDefinition::new(definition, defaults))
             .await.map_err(|error| JournalError::Storage(format!("definition worker: {error}")))??;
         let request = json!({"name":name,"definition":prepared.value,"publish":publish});
         // 元数据写锁：定义写入与依赖冻结必须互斥，否则冻结可能读到
@@ -857,7 +858,8 @@ impl JournalBackend {
         request_id: Option<&str>,
         actor: Option<&WriteActor<'_>>,
     ) -> Result<CommandReceipt> {
-        let prepared = tokio::task::spawn_blocking(move || PreparedDefinition::new(definition))
+        let defaults = self.plugin_defaults();
+        let prepared = tokio::task::spawn_blocking(move || PreparedDefinition::new(definition, defaults))
             .await.map_err(|error| JournalError::Storage(format!("definition worker: {error}")))??;
         let fingerprint_request = json!({"workflow_id":workflow_id,"definition":prepared.value});
         let _metadata = self.workflow_metadata.write().await;

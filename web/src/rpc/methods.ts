@@ -1,4 +1,6 @@
 export const WRITE_METHODS = new Set([
+  "plugins.install",
+  "plugins.uninstall",
   "services.start",
   "services.stop",
   "services.call",

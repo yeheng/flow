@@ -45,11 +45,75 @@ pub fn content_hash(manifest_bytes: &[u8], entry_bytes: &[u8]) -> String {
 /// harness 的内置副本**不**在这里注入：发现函数只看显式部署；内置
 /// 兜底仅 harness 配置解析使用（plugin_config），动态类型/列表只认
 /// 已部署 manifest——没部署的插件不该出现在调色板里。
+impl crate::journal::JournalBackend {
+    /// Defaults match the actual IPC executor program; remote/unstarted hosts add none.
+    pub fn plugin_defaults(&self) -> BTreeMap<String, String> {
+        let program = self
+            .plugin_executor_program
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        default_routes(program.as_deref(), |name| std::env::var_os(name))
+    }
+    pub fn plugin_snapshot(&self) -> crate::plugin_scan::PluginSnapshot {
+        installed_snapshot_with_defaults(&self.plugin_defaults())
+    }
+}
+fn default_routes(
+    program: Option<&std::path::Path>,
+    environment: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> BTreeMap<String, String> {
+    let mut defaults = BTreeMap::new();
+    let Some(program) = program else {
+        return defaults;
+    };
+    for (node, id, variable, sibling) in [
+        (
+            "harness",
+            "harness-agent",
+            "FLOW_AGENT_PLUGIN_BIN",
+            "flow-agent-plugin",
+        ),
+        ("llm", "llm", "FLOW_LLM_PLUGIN_BIN", "flow-llm-plugin"),
+    ] {
+        let binary = environment(variable)
+            .map(std::path::PathBuf::from)
+            .or_else(|| program.parent().map(|dir| dir.join(sibling)));
+        if binary.is_some_and(|path| path.is_file()) {
+            defaults.insert(node.into(), id.into());
+        }
+    }
+    defaults
+}
+
 pub fn installed_snapshot() -> crate::plugin_scan::PluginSnapshot {
+    installed_snapshot_with_defaults(&BTreeMap::new())
+}
+pub fn installed_snapshot_with_defaults(
+    defaults: &BTreeMap<String, String>,
+) -> crate::plugin_scan::PluginSnapshot {
+    snapshot_with_defaults(defaults, false)
+}
+pub fn installed_snapshot_cached_with_defaults(
+    defaults: &BTreeMap<String, String>,
+) -> crate::plugin_scan::PluginSnapshot {
+    snapshot_with_defaults(defaults, true)
+}
+fn snapshot_with_defaults(
+    defaults: &BTreeMap<String, String>,
+    cached: bool,
+) -> crate::plugin_scan::PluginSnapshot {
     let empty = || crate::plugin_scan::PluginSnapshot { rows: Vec::new() };
-    let Some(root) = flow_config::plugin_fs::plugins_root() else { return empty(); };
-    if !root.exists() { return empty(); }
-    match crate::plugin_scan::scan(&root, &BTreeMap::new()) {
+    let Some(root) = flow_config::plugin_fs::plugins_root() else {
+        return empty();
+    };
+    if !root.exists() {
+        return empty();
+    }
+    match if cached {
+        crate::plugin_scan::scan_cached(&root, defaults)
+    } else {
+        crate::plugin_scan::scan(&root, defaults)
+    } {
         Ok(snapshot) => snapshot,
         Err(error) => {
             tracing::warn!(%error, ?root, "plugin scan failed");
@@ -59,7 +123,11 @@ pub fn installed_snapshot() -> crate::plugin_scan::PluginSnapshot {
 }
 
 pub fn discover_plugins() -> Vec<DiscoveredPlugin> {
-    installed_snapshot().rows.into_iter().filter_map(|row| row.plugin).collect()
+    installed_snapshot()
+        .rows
+        .into_iter()
+        .filter_map(|row| row.plugin)
+        .collect()
 }
 
 /// 动态节点类型集合：已部署 manifest 声明且**不在**编译枚举内的类型名。
@@ -311,6 +379,12 @@ fn field_summary(field: &FieldDecl) -> Value {
 pub fn plugins_for_definition(
     definition: &Value,
 ) -> Vec<flow_engine::journal_state::AgentPluginSnapshot> {
+    plugins_for_definition_with_plugins(definition, discover_plugins())
+}
+pub fn plugins_for_definition_with_plugins(
+    definition: &Value,
+    plugins: Vec<DiscoveredPlugin>,
+) -> Vec<flow_engine::journal_state::AgentPluginSnapshot> {
     let nodes = definition["nodes"].as_array().cloned().unwrap_or_default();
     let mut wanted: BTreeSet<String> = BTreeSet::new();
     for node in nodes {
@@ -320,7 +394,7 @@ pub fn plugins_for_definition(
             }
         }
     }
-    discover_plugins()
+    plugins
         .into_iter()
         .filter(|plugin| {
             plugin
@@ -385,7 +459,13 @@ pub fn bundled_or_discovered_by_type(node_type: &str) -> Option<String> {
 /// （harness 嵌入 manifest / llm 嵌入 manifest + 入口二进制）兜底——两者
 /// 必须算出与执行器侧一致的哈希（manifest 字节 ‖ entry 字节）。
 pub fn bundled_or_discovered(plugin_id: &str) -> Option<PluginIdentity> {
-    if let Some(found) = discover_plugins()
+    bundled_or_discovered_with_plugins(plugin_id, discover_plugins())
+}
+pub fn bundled_or_discovered_with_plugins(
+    plugin_id: &str,
+    plugins: Vec<DiscoveredPlugin>,
+) -> Option<PluginIdentity> {
+    if let Some(found) = plugins
         .into_iter()
         .find(|plugin| plugin.manifest.plugin.id == plugin_id)
     {
@@ -589,5 +669,35 @@ required = true
             desc["params_schema"]["properties"]["text"]["x-widget"],
             "code"
         );
+    }
+}
+
+#[cfg(test)]
+mod executor_default_tests {
+    use super::*;
+    #[test]
+    fn defaults_follow_actual_executor_and_explicit_missing_override_does_not_fall_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor_dir = temp.path().join("executor");
+        let journal_dir = temp.path().join("journal");
+        std::fs::create_dir(&executor_dir).unwrap();
+        std::fs::create_dir(&journal_dir).unwrap();
+        std::fs::write(executor_dir.join("flow-agent-plugin"), b"executor sibling").unwrap();
+        std::fs::write(journal_dir.join("flow-llm-plugin"), b"wrong sibling").unwrap();
+        let program = executor_dir.join("flow-executor");
+        let defaults = default_routes(Some(&program), |_| None);
+        assert_eq!(
+            defaults.get("harness").map(String::as_str),
+            Some("harness-agent")
+        );
+        assert!(!defaults.contains_key("llm"));
+        let defaults = default_routes(Some(&program), |name| {
+            (name == "FLOW_AGENT_PLUGIN_BIN").then(|| temp.path().join("missing").into_os_string())
+        });
+        assert!(!defaults.contains_key("harness"));
+        assert!(default_routes(None, |_| Some(
+            executor_dir.join("flow-agent-plugin").into_os_string()
+        ))
+        .is_empty());
     }
 }

@@ -55,6 +55,7 @@ export default async function globalSetup(): Promise<void> {
     env: {
       ...process.env,
       FLOW_HOME: dir,
+      FLOW_PLUGINS_DIR: path.join(dir, "plugins"),
       FLOW_DATA_DIR: path.join(dir, "secrets"),
       FLOW_JOURNAL_DATA_DIR: path.join(dir, "journal"),
       FLOW_JOURNAL_TOKEN: E2E_TOKEN,

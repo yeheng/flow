@@ -47,6 +47,22 @@ export async function listPlugins(): Promise<PluginInfo[]> {
   return r.plugins;
 }
 
+export interface PluginMutationResult {
+  plugin_id: string;
+  executor_reload_required: boolean;
+  replaced?: boolean;
+  idempotent?: boolean;
+  removed?: boolean;
+  already_absent?: boolean;
+  trash?: string | null;
+}
+export function installPlugin(source: string, replace: boolean, requestId: string): Promise<PluginMutationResult> {
+  return client.call("plugins.install", { source, replace, request_id: requestId });
+}
+export function uninstallPlugin(pluginId: string, stopFirst: boolean, requestId: string): Promise<PluginMutationResult> {
+  return client.call("plugins.uninstall", { plugin_id: pluginId, stop_first: stopFirst, request_id: requestId });
+}
+
 /** plugins.recheck：插件升级后按当前 manifest 重校验全部已发布定义 */
 export async function recheckPlugins(): Promise<PluginViolation[]> {
   const r = await client.call<{ violations: PluginViolation[] }>("plugins.recheck", {});

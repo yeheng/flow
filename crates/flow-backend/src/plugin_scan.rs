@@ -9,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[derive(Clone)]
 pub struct ScanRow {
     pub id: String,
     pub directory_name: String,
@@ -36,6 +37,7 @@ impl ScanRow {
         value
     }
 }
+#[derive(Clone)]
 pub struct PluginSnapshot {
     pub rows: Vec<ScanRow>,
 }
@@ -211,6 +213,110 @@ pub fn scan(root: &Path, defaults: &BTreeMap<String, String>) -> io::Result<Plug
     scan_unlocked(root, defaults)
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: std::time::SystemTime,
+}
+#[derive(Clone, PartialEq, Eq)]
+struct ScanStamp {
+    manifest: PathBuf,
+    manifest_stamp: Option<FileStamp>,
+    entry: Option<(PathBuf, Option<FileStamp>)>,
+}
+#[derive(Clone)]
+struct CachedSnapshot {
+    defaults: BTreeMap<String, String>,
+    stamps: Vec<ScanStamp>,
+    snapshot: PluginSnapshot,
+}
+static SNAPSHOTS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<PathBuf, CachedSnapshot>>> =
+    std::sync::OnceLock::new();
+fn cache() -> &'static std::sync::Mutex<BTreeMap<PathBuf, CachedSnapshot>> {
+    SNAPSHOTS.get_or_init(Default::default)
+}
+fn stamp(path: &Path) -> io::Result<Option<FileStamp>> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(Some(FileStamp {
+            len: metadata.len(),
+            modified: metadata.modified()?,
+        })),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+fn scan_stamps(root: &Path, snapshot: &PluginSnapshot) -> io::Result<Vec<ScanStamp>> {
+    let mut stamps = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let directory = entry?.path();
+        if !directory.is_dir()
+            || directory
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .starts_with('.')
+        {
+            continue;
+        }
+        let manifest = directory.join("plugin.toml");
+        let entry = snapshot
+            .rows
+            .iter()
+            .find(|row| row.source == directory)
+            .and_then(|row| row.manifest.as_ref())
+            .map(|m| {
+                let path = directory.join(&m.plugin.entry);
+                stamp(&path).map(|value| (path, value))
+            })
+            .transpose()?;
+        stamps.push(ScanStamp {
+            manifest_stamp: stamp(&manifest)?,
+            manifest,
+            entry,
+        });
+    }
+    stamps.sort_by(|a, b| a.manifest.cmp(&b.manifest));
+    Ok(stamps)
+}
+/// Listing/recheck optimization only. Same-length writes preserving timestamps
+/// can be missed. Never use this cache to authorize a spawn or managed publication.
+pub fn scan_cached(root: &Path, defaults: &BTreeMap<String, String>) -> io::Result<PluginSnapshot> {
+    let root = root.canonicalize()?;
+    let _lease = flow_config::plugin_fs::RootLease::shared(&root)?;
+    let old = cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&root)
+        .cloned();
+    if let Some(old) = old {
+        if old.defaults == *defaults
+            && scan_stamps(&root, &old.snapshot).ok().as_ref() == Some(&old.stamps)
+        {
+            return Ok(old.snapshot);
+        }
+    }
+    let snapshot = scan_unlocked(&root, defaults)?;
+    if let Ok(stamps) = scan_stamps(&root, &snapshot) {
+        cache().lock().unwrap_or_else(|e| e.into_inner()).insert(
+            root,
+            CachedSnapshot {
+                defaults: defaults.clone(),
+                stamps,
+                snapshot: snapshot.clone(),
+            },
+        );
+    }
+    Ok(snapshot)
+}
+pub fn invalidate(root: &Path) {
+    if let Ok(root) = root.canonicalize() {
+        cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&root);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,6 +381,46 @@ mod tests {
             .as_ref()
             .unwrap()
             .contains("256 KiB"));
+    }
+    #[test]
+    fn listing_cache_is_best_effort_and_explicit_invalidation_forces_new_hash() {
+        let root = flow_test_support::io::TempDir::new("plugin-scan-cache");
+        plugin(root.path(), "demo", "demo", "custom");
+        let first = scan_cached(root.path(), &BTreeMap::new()).unwrap();
+        let old_hash = first.rows[0].plugin.as_ref().unwrap().content_hash.clone();
+        let entry = root.path().join("demo/entry");
+        let modified = std::fs::metadata(&entry).unwrap().modified().unwrap();
+        let size = std::fs::metadata(&entry).unwrap().len();
+        std::fs::write(&entry, vec![b'x'; size as usize]).unwrap();
+        std::fs::File::open(&entry)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let cached = scan_cached(root.path(), &BTreeMap::new()).unwrap();
+        assert_eq!(
+            cached.rows[0].plugin.as_ref().unwrap().content_hash,
+            old_hash
+        );
+        // Start/install use uncached scanning even when the listing stamp matches.
+        let fresh = scan(root.path(), &BTreeMap::new()).unwrap();
+        assert_ne!(
+            fresh.rows[0].plugin.as_ref().unwrap().content_hash,
+            old_hash
+        );
+        invalidate(root.path());
+        let refreshed = scan_cached(root.path(), &BTreeMap::new()).unwrap();
+        assert_eq!(
+            refreshed.rows[0].plugin.as_ref().unwrap().content_hash,
+            fresh.rows[0].plugin.as_ref().unwrap().content_hash
+        );
+        plugin(root.path(), "new", "new", "other");
+        assert_eq!(
+            scan_cached(root.path(), &BTreeMap::new())
+                .unwrap()
+                .rows
+                .len(),
+            2
+        );
     }
     #[cfg(unix)]
     #[test]

@@ -28,6 +28,31 @@ cargo build --offline -p flow-plugin-sdk --example resident_echo
 
 将样例的 plugin.toml、web-ui/ 和构建产物（放到 bin/resident_echo）放入插件目录。示例通过真实 IPC 处理多个请求并产生 echo.received 事件。
 
+## 安装、加载与卸载
+
+设置页的「插件」区域接受**宿主本机目录路径**；浏览器不会上传目录。目录包含 `plugin.toml`、相对入口和可选 Web UI。安装与卸载需要管理员，安装本身不会运行插件或新增授予。手工拷贝仍然合法；RPC 提供有校验、跨进程发布锁和可恢复回执的受管理路径。
+
+```sh
+flow journal plugins list
+flow journal plugins recheck
+flow journal plugins install --source /absolute/path/to/plugin
+flow journal plugins install --source /absolute/path/to/plugin --replace
+flow journal plugins uninstall resident-echo --stop-first
+```
+
+对应 RPC：
+
+- `plugins.install {request_id, source, replace?:false}`：从目录封存副本再发布，目标为插件根的 `<plugin.id>/`。相同整包的新请求可返回不变成功；只改 Web UI 也属于包变化，需要 `replace:true`。
+- `plugins.uninstall {request_id, plugin_id, stop_first?:false}`：只卸载根下同名直接子目录；缺失是成功。服务存活时默认拒绝；`stop_first:true` 先撤销页面句柄并等待进程回收，再移走目录。目录名与清单 ID 不同的旧目录需要手工处理。
+
+`plugins.list` 会保留 `broken` / `conflict` 行并展示原因；重复 ID 的全部副本都不能路由或 start。列表同时展示运行状态及旧树入口的目录外路径、符号链接、超大文件注解。这些旧树注解不会单独禁止加载。新安装拒绝符号链接和特殊文件，限制清单与 Web UI 各 256 KiB、单文件 256 MiB、包总大小 512 MiB、文件数 4096、扫描行数 64。
+
+加载表示清单可路由；`recheck` 检查现有定义与当前动态类型/表单是否一致；`services.start` 才启动常驻进程。节点执行器在启动时冻结注册表，节点插件变更需要重启执行器。安装/卸载响应里的 `executor_reload_required` 只是本次提示，列表不跟踪执行器代际。已经运行的节点不被卸载取消；运行中的 Web UI 使用 start 时的 HTML 副本。
+
+卸载不撤销 journal 授予，同内容重装可继续匹配旧授予。I35 身份仍是 `sha256(manifest || entry)`；整包 `bundle_digest` 额外包含 UI、路径和执行权限，用于发布及恢复，不参与授予。
+
+请求失败或响应丢失时保留原 `request_id` 和参数重试。`.ops` 中的永久回执不由 `command.status` 查询，也不自动修剪；封存后恢复不再读取源目录。发布前的明确拒绝会保存失败回执，释放该 ID 供新请求操作；已进入变更意图但证据不足的操作会阻止后续发布，避免其他 ID 抢占它尚未完成的节点类型或容量，避免覆盖后来一代目录。不要删除 `.ops`、`.publish.lock`、`.ops.lock` 或目录的 `.flow-install.json` 来强行重试。手工原位修改不具备受管理发布的租约保证。
+
 ## 会话与消息
 
 复用 SDK JSON-RPC 信封及帧协议，握手显式协商 `interaction_events_v1` 能力。宿主先发 initialize，插件响应。SDK 的 `duplex::pump` 提供一个读取者和一个写入者；请求、响应、通知可并发流动，不会因发送消息丢弃读取到一半的帧。常驻服务不替换现有单次节点 invoke。

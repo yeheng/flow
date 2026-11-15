@@ -66,11 +66,16 @@ impl RegisteredPlugin {
         let RegistrationSource::Manifest(manifest_path) = &self.source else {
             return Ok(());
         };
-        let (manifest_bytes, entry_bytes) = (
-            std::fs::read(manifest_path).map_err(|e| format!("manifest 不可读：{e}"))?,
-            std::fs::read(&self.binary).map_err(|e| format!("入口不可读：{e}"))?,
-        );
-        let current = content_hash(&manifest_bytes, &entry_bytes);
+        use std::io::Read;
+        let mut manifest_bytes = Vec::new();
+        std::fs::File::open(manifest_path)
+            .and_then(|file| file.take(262145).read_to_end(&mut manifest_bytes))
+            .map_err(|e| format!("manifest 不可读：{e}"))?;
+        if manifest_bytes.len() > 262144 {
+            return Err("manifest exceeds 256 KiB".into());
+        }
+        let current = content_hash_path(&manifest_bytes, &self.binary)
+            .map_err(|e| format!("入口不可读：{e}"))?;
         if current != self.content_hash {
             return Err(format!(
                 "插件 {} 内容已变化（注册时 {}，当前 {}）：需重新授予后才能执行（I35）",
@@ -85,6 +90,7 @@ impl RegisteredPlugin {
 
 /// 内容身份：sha256(manifest 字节 ‖ entry 字节)——与 master 侧
 /// `flow_backend::plugin_registry::content_hash` 同一公式。
+#[cfg(test)]
 fn content_hash(manifest_bytes: &[u8], entry_bytes: &[u8]) -> String {
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
@@ -95,6 +101,23 @@ fn content_hash(manifest_bytes: &[u8], entry_bytes: &[u8]) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+fn content_hash_path(manifest_bytes: &[u8], entry: &Path) -> std::io::Result<String> {
+    use sha2::Digest;
+    use std::io::Read;
+    let mut hash = sha2::Sha256::new();
+    hash.update(manifest_bytes);
+    let mut file = std::fs::File::open(entry)?;
+    let mut buffer = [0; 65536];
+    loop {
+        let size = file.read(&mut buffer)?;
+        if size == 0 {
+            break;
+        }
+        hash.update(&buffer[..size]);
+    }
+    Ok(hex::encode(hash.finalize()))
 }
 
 /// 节点类型 → 插件注册的路由表。
@@ -325,14 +348,20 @@ impl PluginRegistry {
             ));
             return;
         }
-        let entry_bytes = std::fs::read(&binary).unwrap_or_default();
+        let content_hash = match content_hash_path(text.as_bytes(), &binary) {
+            Ok(hash) => hash,
+            Err(error) => {
+                reject(format!("入口不可读：{error}"));
+                return;
+            }
+        };
         let registration = RegisteredPlugin {
             plugin_id: manifest.plugin.id.clone(),
             version: manifest.plugin.version.clone(),
             invoke_method: manifest.methods.invoke.clone(),
             binary,
             protocol: manifest.plugin.protocol,
-            content_hash: content_hash(text.as_bytes(), &entry_bytes),
+            content_hash,
             ui: Some(manifest.ui_projection()),
             source: RegistrationSource::Manifest(manifest_path.to_path_buf()),
         };
@@ -416,6 +445,28 @@ invoke = "agent/runTurn"
         assert!(registry.resolve("two").is_none());
         assert!(registry.resolve("hidden-node").is_none());
         assert_eq!(registry.resolve("valid-node").unwrap().plugin_id, "valid");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn streaming_hash_matches_i35_and_recheck_rejects_changed_bytes() {
+        let root = tempdir("stream-hash");
+        let entry = fake_entry(&root);
+        let text = manifest_text("demo", "\"custom\"", "entry-bin");
+        assert_eq!(
+            content_hash_path(text.as_bytes(), &entry).unwrap(),
+            content_hash(text.as_bytes(), &std::fs::read(&entry).unwrap())
+        );
+        std::fs::write(root.join("plugin.toml"), &text).unwrap();
+        let mut registry = PluginRegistry::default();
+        registry.load_manifest(&root.join("plugin.toml"), &root, &text);
+        let registration = registry.resolve("custom").unwrap();
+        registration.recheck_content_hash().unwrap();
+        std::fs::write(&entry, b"different bytes").unwrap();
+        assert!(registration
+            .recheck_content_hash()
+            .unwrap_err()
+            .contains("内容已变化"));
         std::fs::remove_dir_all(root).unwrap();
     }
 

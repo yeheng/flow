@@ -86,6 +86,50 @@ const plugins = ref<PluginInfo[]>([]);
 const pluginViolations = ref<PluginViolation[] | null>(null);
 const pluginError = ref("");
 
+const pluginSource = ref("");
+const pluginReplace = ref(false);
+const pluginBusy = ref(false);
+const pluginMutationError = ref("");
+const residentPanel = ref<InstanceType<typeof ResidentServicesPanel> | null>(null);
+type PluginMutation = { requestId: string } & (
+  { kind: "install"; source: string; replace: boolean } |
+  { kind: "uninstall"; pluginId: string; stopFirst: boolean }
+);
+const pluginPending = ref<PluginMutation | null>(null);
+async function runPluginMutation(): Promise<void> {
+  const pending = pluginPending.value;
+  if (!pending || pluginBusy.value) return;
+  pluginBusy.value = true;
+  pluginMutationError.value = "";
+  try {
+    const result = pending.kind === "install"
+      ? await api.installPlugin(pending.source, pending.replace, pending.requestId)
+      : await api.uninstallPlugin(pending.pluginId, pending.stopFirst, pending.requestId);
+    pluginPending.value = null;
+    await Promise.all([loadPlugins(), residentPanel.value?.refresh()]);
+    toast.info(pending.kind === "install" ? "插件安装完成" : "插件已卸载，授予记录已保留");
+    if (result.executor_reload_required) toast.info("节点插件变更需要重启执行器后生效；在飞运行不受影响");
+  } catch (error) {
+    pluginMutationError.value = errText(error);
+  } finally {
+    pluginBusy.value = false;
+  }
+}
+async function installPlugin(): Promise<void> {
+  if (pluginPending.value || !pluginSource.value.trim()) return;
+  if (pluginReplace.value && !await confirmDialog("替换已有插件？运行中的服务需要先停止。", { danger: true, confirmText: "替换" })) return;
+  pluginPending.value = { kind: "install", source: pluginSource.value.trim(), replace: pluginReplace.value, requestId: crypto.randomUUID() };
+  await runPluginMutation();
+}
+async function uninstallPlugin(plugin: PluginInfo): Promise<void> {
+  if (pluginPending.value || plugin.id_matches_directory === false) return;
+  if (!await confirmDialog(plugin.running
+    ? `停止服务并卸载 ${plugin.id}？授予记录和在飞运行会保留。`
+    : `卸载 ${plugin.id}？授予记录和在飞运行会保留。`, { danger: true, confirmText: plugin.running ? "停止并卸载" : "卸载" })) return;
+  pluginPending.value = { kind: "uninstall", pluginId: plugin.directory_name ?? plugin.id, stopFirst: !!plugin.running, requestId: crypto.randomUUID() };
+  await runPluginMutation();
+}
+
 async function loadPlugins(): Promise<void> {
   try {
     plugins.value = await api.listPlugins();
@@ -387,7 +431,7 @@ async function onDeleteSecret(name: string): Promise<void> {
     </div>
 
     <EnvironmentSettings />
-    <ResidentServicesPanel />
+    <ResidentServicesPanel ref="residentPanel" />
     <section v-if="!isDesktop()" class="card">
       <div class="card-head">
         <h3>服务连接</h3>
@@ -537,20 +581,35 @@ async function onDeleteSecret(name: string): Promise<void> {
         <h3>插件</h3>
         <AppButton variant="ghost" @click="recheckPlugins">重校验发布定义</AppButton>
       </div>
+      <form class="field" @submit.prevent="installPlugin">
+        <label for="plugin-source">宿主上的插件目录</label>
+        <input id="plugin-source" v-model="pluginSource" placeholder="/absolute/path/to/plugin" :disabled="!!pluginPending" required />
+        <label><input v-model="pluginReplace" type="checkbox" :disabled="!!pluginPending" /> 替换已有插件</label>
+        <AppButton type="submit" :disabled="!!pluginPending || !pluginSource.trim()">安装插件</AppButton>
+      </form>
+      <div v-if="pluginMutationError" role="alert" class="empty">{{ pluginMutationError }}</div>
+      <div v-if="pluginPending" class="field">
+        <code>请求 ID：{{ pluginPending.requestId }}</code>
+        <p>响应未确认时，可使用原请求重试。</p>
+        <AppButton :disabled="pluginBusy" @click="runPluginMutation">按原参数重试</AppButton>
+        <AppButton variant="ghost" :disabled="pluginBusy" @click="pluginPending = null; pluginMutationError = ''">结束本次操作</AppButton>
+      </div>
       <div v-if="pluginError" class="empty">插件清单加载失败：{{ pluginError }}</div>
       <div v-else-if="plugins.length === 0" class="empty">
         暂无已部署插件（plugins 目录见运维文档）。
       </div>
       <table v-else class="table">
         <thead>
-          <tr><th>插件</th><th>版本</th><th>节点类型</th><th>配置项</th></tr>
+          <tr><th>插件</th><th>版本</th><th>节点类型</th><th>状态</th><th>配置项</th><th>操作</th></tr>
         </thead>
         <tbody>
-          <tr v-for="p in plugins" :key="p.id">
+          <tr v-for="p in plugins" :key="p.source">
             <td><code>{{ p.id }}</code></td>
             <td>{{ p.version }}</td>
-            <td>{{ p.node_types.join(", ") }}</td>
+            <td>{{ (p.node_types ?? []).join(", ") }}</td>
+            <td>{{ p.load_state === 'broken' ? '损坏' : p.load_state === 'conflict' ? '冲突' : '已加载' }}{{ p.running ? ' · 运行中' : '' }}<div v-if="p.load_error">{{ p.load_error }}</div><div v-if="p.grant_state">授予：{{ p.grant_state }}</div><div v-if="p.entry_contained === false">入口位于插件目录外</div><div v-if="p.entry_symlink">入口是符号链接</div><div v-if="p.entry_oversize">入口超过 256 MiB</div></td>
             <td>{{ (p.config_fields ?? []).map((f) => f.key).join(", ") || "—" }}</td>
+            <td><AppButton variant="ghost" :disabled="!!pluginPending || p.id_matches_directory === false" @click="uninstallPlugin(p)">{{ p.running ? '停止并卸载' : '卸载' }}</AppButton><div v-if="p.id_matches_directory === false">目录名与插件 ID 不一致，请手工处理：{{ p.source }}</div></td>
           </tr>
         </tbody>
       </table>

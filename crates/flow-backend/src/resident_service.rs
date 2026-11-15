@@ -744,6 +744,16 @@ mod tests {
             assert!(saw_limit, "17th host request did not return an error");
             assert!(!stop.is_cancelled());
             block.store(false, Ordering::SeqCst);
+            // Releasing the handler flag does not synchronously finish/reap the
+            // 16 tasks. Wait for their replies before asserting fresh capacity.
+            for _ in 0..16 {
+                let frame = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut plugin))
+                    .await.unwrap().unwrap();
+                let Message::Response(response) = frame.as_rpc().unwrap() else {
+                    panic!("expected completed host response");
+                };
+                assert_eq!(response.result, Some(json!("done")));
+            }
             let request = Message::Request(Request {
                 jsonrpc: "2.0",
                 id: Id::String("ping".into()),

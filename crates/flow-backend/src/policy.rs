@@ -422,28 +422,38 @@ pub async fn plugin_ceilings(
     agent_plugin_id: Option<&str>,
 ) -> Vec<flow_dto::permission::PluginCeiling> {
     use flow_dto::permission::{Action, Capability, PluginCeiling, ResourcePattern};
-    let mut wanted: Vec<String> = Vec::new();
-    for node in &definition.nodes {
-        match node.kind() {
-            Some(flow_engine::NodeType::Llm) => wanted.push("llm".into()),
-            Some(flow_engine::NodeType::Harness)
-                if node.is_harness_agent() && agent_plugin_id.is_some() =>
-            {
-                wanted.push(agent_plugin_id.expect("checked").to_string())
-            }
-            _ => {
-                if node.kind().is_none() {
-                    if let Some(plugin) =
-                        crate::plugin_registry::bundled_or_discovered_by_type(&node.node_type)
-                    {
-                        wanted.push(plugin);
+    let nodes = definition.nodes.clone();
+    let agent_plugin_id = agent_plugin_id.map(str::to_owned);
+    let defaults = backend.plugin_defaults();
+    let prepared = tokio::task::spawn_blocking(move || {
+        let snapshot = crate::plugin_registry::installed_snapshot_with_defaults(&defaults);
+        let plugins = snapshot.rows.into_iter().filter_map(|row| row.plugin).collect::<Vec<_>>();
+        let mut wanted = Vec::new();
+        for node in nodes {
+            match node.kind() {
+                Some(flow_engine::NodeType::Llm) => wanted.push("llm".to_owned()),
+                Some(flow_engine::NodeType::Harness) if node.is_harness_agent() => {
+                    if let Some(id) = &agent_plugin_id { wanted.push(id.clone()); }
+                }
+                None => {
+                    if let Some(plugin) = plugins.iter().find(|plugin| plugin.manifest.plugin.node_types.contains(&node.node_type)) {
+                        wanted.push(plugin.manifest.plugin.id.clone());
                     }
                 }
+                _ => (),
             }
         }
-    }
-    wanted.sort();
-    wanted.dedup();
+        wanted.sort();
+        wanted.dedup();
+        let identities = wanted.iter().filter_map(|id| {
+            crate::plugin_registry::bundled_or_discovered_with_plugins(id, plugins.clone()).map(|identity| (id.clone(), identity))
+        }).collect::<std::collections::BTreeMap<_,_>>();
+        (wanted, identities)
+    }).await;
+    let (wanted, identities) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => { tracing::warn!(%error, "plugin permission snapshot failed"); return Vec::new(); }
+    };
     let state_ceilings = backend
         .inspect(|state| {
             wanted
@@ -453,7 +463,7 @@ pub async fn plugin_ceilings(
                     // manifest 变化后旧授予不再适用（换内容必须重新授予）。
                     // identity 不可得时（目录不可读）才退回该插件任意最新授予，
                     // 由执行器上报哈希侧再核验。
-                    let identity = crate::plugin_registry::bundled_or_discovered(plugin_id);
+                    let identity = identities.get(plugin_id);
                     // I35：只认 (plugin_id, 当前内容哈希) 的精确授予——
                     // 二进制或 manifest 变化后旧授予不再适用（换内容必须
                     // 重新授予）。
