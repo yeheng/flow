@@ -395,7 +395,7 @@ mod tests {
 id = "{id}"
 version = "0.1.0"
 entry = "{entry}"
-protocol = 1
+protocol = 2
 node_types = [{node_types}]
 
 [methods]
@@ -529,7 +529,7 @@ invoke = "agent/runTurn"
         std::fs::create_dir_all(&old_dir).unwrap();
         let old_entry = fake_entry(&old_dir);
         let old_manifest = manifest_text("old", "\"old_type\"", old_entry.to_str().unwrap())
-            .replace("protocol = 1", &(9u32 << 16).to_string());
+            .replace("protocol = 2", &(9u32 << 16).to_string());
         std::fs::write(old_dir.join("plugin.toml"), old_manifest).unwrap();
 
         let mut full = PluginRegistry::default();

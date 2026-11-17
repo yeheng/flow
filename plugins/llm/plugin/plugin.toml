@@ -3,7 +3,8 @@ id = "llm"
 name = "Model Call"
 version = "0.1.0"
 entry = "bin/flow-llm-plugin"
-protocol = 1
+# 完整版本号（u32：高 16 位主版本；与 wire.md §3.1 同一编码）。
+protocol = 2
 node_types = ["llm"]
 
 [methods]

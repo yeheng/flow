@@ -559,7 +559,7 @@ mod tests {
 id = "echo-plugin"
 version = "0.1.0"
 entry = "bin/x"
-protocol = 1
+protocol = 2
 node_types = ["echo"]
 
 [methods]
@@ -644,7 +644,7 @@ id = "echo-plugin"
 name = "Echo"
 version = "0.1.0"
 entry = "bin/x"
-protocol = 1
+protocol = 2
 node_types = ["echo"]
 
 [methods]

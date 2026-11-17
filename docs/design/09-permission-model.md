@@ -772,8 +772,10 @@ crate 变更清单：
 - `TurnPermission` 随 `RunTurnParams.permission` 下发；`FullAuto` 硬编码已删——
   未受管回装配 AutoEdit + 恒拒 approver（无本地放行路径，§8.4）。
 - 反向链路：插件 `permission/request` → 执行器 `ToolPermissionRequest`（协议 v8
-  新帧）→ master G5 裁决 → `ToolPermissionDecision` → 插件。链路断/超时/取消
-  fail closed。ApprovalLedger 按 tool_call_id 去重传输重试（provider 侧 id 唯一）。
+  新帧）→ master G5 裁决 → `ToolPermissionDecision` → 插件。链路断/取消
+  fail closed；裁决时限归 master 的审批 TTL（`[permissions] approval_ttl_ms`，
+  默认 24h），执行器不设第二只钟（2026-11 修复：曾硬编码 600s，与 24h 审批
+  窗直接冲突）。ApprovalLedger 按 tool_call_id 去重传输重试（provider 侧 id 唯一）。
 - **G4（通用插件节点授权）已接线（2026-11 审计修复）**：legacy 定义含动态
   插件节点被静态门拒绝（已确认决策 2）；受管定义要求插件已部署且已授予
   （`start_gate` fail-fast）。逐次裁决走 G3 同一管道：执行器 `plugin_node`

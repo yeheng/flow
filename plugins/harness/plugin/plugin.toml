@@ -15,7 +15,10 @@ id = "harness-agent"
 name = "Harness Agent"
 version = "0.1.0"
 entry = "bin/flow-agent-plugin"
-protocol = 1
+# plugin-proto 完整版本号（u32：高 16 位主版本，低 16 位次版本，与
+# wire.md §3.1 initialize 的 protocol_version 同一编码）。这里只做廉价
+# 快筛；握手才是权威裁决。
+protocol = 2
 node_types = ["harness"]
 
 [methods]

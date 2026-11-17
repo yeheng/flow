@@ -19,7 +19,7 @@ id = "harness-agent"
 name = "Harness Agent"
 version = "9.9.9-e2e"
 entry = "{ENTRY}"
-protocol = 1
+protocol = 2
 node_types = ["harness"]
 
 [methods]
@@ -37,7 +37,7 @@ const EVIL_MANIFEST: &str = r#"
 id = "evil"
 version = "0.0.1"
 entry = "/nonexistent-anyway"
-protocol = 1
+protocol = 2
 node_types = ["script"]
 
 [methods]

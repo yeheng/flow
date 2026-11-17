@@ -96,7 +96,9 @@ pub struct PluginSection {
     /// 入口二进制：相对插件目录或绝对路径。存在性由宿主在发现期检查
     ///（解析器只见文本）。
     pub entry: String,
-    /// plugin-proto 协议版本（廉价快筛；握手再权威裁决）。
+    /// plugin-proto 协议完整版本号（u32：高 16 位主版本，低 16 位次版本，
+    /// 与 wire.md §3.1 initialize 的 protocol_version 同一编码）。廉价
+    /// 快筛用；握手再权威裁决。语义变化见 wire.md §8。
     pub protocol: u32,
     /// 本插件实现的节点类型（runtime 路由键）。内置类型名出现于此 =
     /// 宿主拒绝加载（防语义被插件悄悄顶掉）——该检查在 runtime 侧，
@@ -283,13 +285,20 @@ impl PluginManifest {
             name: _,
             version,
             entry,
-            protocol: _,
+            protocol,
             node_types,
         } = &self.plugin;
         if !is_kebab_id(id) {
             return Err(ManifestError(format!(
                 "plugin.id 必须是 kebab-case（当前 {id:?}）"
             )));
+        }
+        if *protocol == 0 {
+            return Err(ManifestError(
+                "plugin.protocol 必须是 plugin-proto 完整版本号（u32：高 16 位主版本，\
+低 16 位次版本，与 wire.md §3.1 同一编码），不接受 0"
+                    .into(),
+            ));
         }
         if version.trim().is_empty() {
             return Err(ManifestError("plugin.version 不能为空".into()));
@@ -907,7 +916,7 @@ id = "harness-agent"
 name = "Harness Agent"
 version = "0.1.0"
 entry = "bin/flow-agent-plugin"
-protocol = 1
+protocol = 2
 node_types = ["harness"]
 
 [methods]
@@ -994,6 +1003,11 @@ summary_keys = ["agent.model", "exit_code"]
         assert!(
             parse(&VALID.replace("id = \"harness-agent\"", "id = \"Harness_Agent\"")).is_err(),
             "id 必须 kebab-case"
+        );
+        assert!(
+            parse(&VALID.replace("protocol = 2", "protocol = 0")).is_err(),
+            "protocol 必须是完整版本号（u32，非 0）：防止把未声明/无效版本
+            静默当成主版本 0 通过快筛"
         );
         assert!(
             parse(&VALID.replace("node_types = [\"harness\"]", "node_types = []")).is_err(),

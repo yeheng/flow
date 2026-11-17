@@ -61,7 +61,7 @@ id = "echo-plugin"
 name = "Echo"
 version = "0.1.0"
 entry = "{entry}"
-protocol = 1
+protocol = 2
 node_types = ["echo"]
 
 [methods]

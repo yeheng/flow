@@ -2914,8 +2914,9 @@ fn postcard_probe(message: &Message) -> std::result::Result<Vec<u8>, String> {
 
 /// 反向工具裁决转发（G5）：`permission/request` → 执行协议
 /// ToolPermissionRequest → master 裁决 → ToolPermissionDecision → JSON-RPC
-/// 响应回插件。链路断/取消/超时一律 fail closed（拒绝该次工具调用），
-/// 不回退到本地放行。
+/// 响应回插件。链路断/取消一律 fail closed（拒绝该次工具调用），
+/// 不回退到本地放行；裁决时限归 master（approval TTL），执行器不设
+/// 第二只钟。
 async fn forward_permission_request(
     outbound: mpsc::Sender<Message>,
     dispatch_id: String,
@@ -2970,7 +2971,12 @@ async fn forward_permission_request(
         return error_response("master link closed; failing closed".into());
     }
     // 等裁决：同一 tool_call_id 的响应（幂等重发由 master 折叠态处理）。
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+    // 不设执行器侧绝对时限：裁决时钟归 master——approval TTL（默认
+    // 24h，`[permissions] approval_ttl_ms`）到期由 drive_approval 回
+    // Denied/Expired，人工审批期间 agent 生命周期预算暂停。执行器只做
+    // 活性判定：链路断（mailbox 关闭）或取消即 fail closed。曾有的
+    // 600s 硬限会把 10 分钟未批的工具调用错判为超时，与 master 的
+    // 审批窗直接冲突（两个时钟各说各话）。
     let mut mailbox = tool_mail.lock().await;
     loop {
         let message = tokio::select! {
@@ -2981,9 +2987,6 @@ async fn forward_permission_request(
                 }
             }
             _ = cancel.cancelled() => return error_response("cancelled; failing closed".into()),
-            _ = tokio::time::sleep_until(deadline) => {
-                return error_response("tool permission decision timeout; failing closed".into())
-            }
         };
         match message {
             Message::ToolPermissionDecision {

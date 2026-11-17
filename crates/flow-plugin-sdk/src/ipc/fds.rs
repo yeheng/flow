@@ -1,5 +1,7 @@
-//! 子进程 fd 收敛：fork 前备好 fd 清单，exec 前用 async-signal-safe 的
-//! fcntl 逐个打上 FD_CLOEXEC；必要时把通道 dup2 落位到固定号。
+//! 子进程 fd 收敛（仅 unix）：fork 前备好 fd 清单，exec 前用
+//! async-signal-safe 的 fcntl 逐个打上 FD_CLOEXEC；必要时把通道 dup2
+//! 落位到固定号。非 unix 承载不继承 fd（回连 + 令牌），本模块仅在
+//! unix 编译。
 //!
 //! 不变量：
 //! - fork 后只做 async-signal-safe 调用（否则可能死锁）；只打标记不

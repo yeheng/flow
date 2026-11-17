@@ -7,6 +7,7 @@ pub mod challenge;
 pub mod channel;
 pub mod child;
 pub mod env;
+#[cfg(unix)]
 mod fds;
 pub mod spawn;
 pub use challenge::Challenge;
