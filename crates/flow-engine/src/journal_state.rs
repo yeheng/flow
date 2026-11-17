@@ -14,6 +14,8 @@ use std::collections::BTreeMap;
 use crate::Definition;
 
 mod undo;
+#[cfg(test)]
+mod transition_table;
 use undo::UndoLog;
 
 /// 折叠层的错误类型：直接复用 journal 的错误族，避免第二套错误码语义。
@@ -1532,6 +1534,11 @@ impl State {
                 if run.terminal() {
                     return Err(invalid("terminal run completion"));
                 }
+                // AwaitingResume 是唯一人工介入点（§6.1）：不经裁决直接收口
+                // 等于绕过「外部操作结果不明」的平台故障面。
+                if run.status == RunStatus::AwaitingResume {
+                    return Err(invalid("completion requires adjudication"));
+                }
                 run.status = RunStatus::Succeeded;
                 run.output = Some(serde_json::from_value(p["output"].clone())?);
                 return Ok(());
@@ -1539,10 +1546,16 @@ impl State {
             EventKind::RunFailed => {
                 // 失败对已终态的 run 是无操作（与取消对齐）：终态是已落账的事实，
                 // 不能被后来的失败事实改写。
-                if !run.terminal() {
-                    run.status = RunStatus::Failed;
-                    run.error = Some(string(p, "error")?);
+                if run.terminal() {
+                    return Ok(());
                 }
+                // AwaitingResume 同样不许直接判失败（§6.1）：先裁决回
+                // Running，收尾判定再写 RunFailed。
+                if run.status == RunStatus::AwaitingResume {
+                    return Err(invalid("failure requires adjudication"));
+                }
+                run.status = RunStatus::Failed;
+                run.error = Some(string(p, "error")?);
                 return Ok(());
             }
             EventKind::SignalReceived => {
@@ -1656,7 +1669,19 @@ impl State {
             // attempt 严格 +1、且上一条外部操作的结果已经捕获。
             // 最后一条是 C4 的折叠层闸门——结果未知时再派一次，
             // 等于对可能已经发生的外部副作用再触发一次。
-            if node.node_execution_id != execution
+            // 源状态闸（§6.2）：终态节点（Succeeded/Failed/Skipped）不可再
+            // 派发——重派会改写权威结果；非 Retry/Approval 的等待必须经
+            // WaitResolved/Adjudicated 解除，不许绕道重派。Running 的在飞
+            // 重派是合法恢复路径（执行器会话丢失、收件箱信号重投），
+            // 状态图上 Running→Running 不可见，由 attempt 账本承载。
+            let dispatchable = matches!(
+                node.status,
+                NodeStatus::Pending | NodeStatus::Running
+            ) || node.wait.as_ref().is_some_and(|w| {
+                matches!(w.kind(), WaitKind::Retry | WaitKind::Approval)
+            });
+            if !dispatchable
+                || node.node_execution_id != execution
                 || attempt != node.attempt + 1
                 || node.operation.as_ref().is_some_and(|o| o.outcome.is_none())
             {
@@ -1809,6 +1834,11 @@ impl State {
                 if node.prepared.is_some() {
                     return Err(invalid("input already prepared"));
                 }
+                // 输入准备只发生在在飞派发上（§6.2）：给终态/等待节点补准备
+                // 事实没有对应执行，属于写者违背发射纪律的状态矛盾。
+                if node.status != NodeStatus::Running {
+                    return Err(invalid("input prepared outside running dispatch"));
+                }
                 let Parsed::Prepared(prepared) = parsed else {
                     return Err(invalid("prepared payload missing parsed form"));
                 };
@@ -1874,6 +1904,35 @@ impl State {
                 op.outcome = Some(serde_json::from_value(p["outcome"].clone())?);
             }
             EventKind::NodeCompleted | EventKind::WaitRegistered | EventKind::NodeFailed => {
+                // 折叠层源状态守卫（§6.2 状态图）：结果事件只来自在飞的
+                // Running 节点。两类例外：child 等待的失败解除（驱动层直接
+                // 写 NodeFailed，不经 WaitResolved）；审批等待是派发内非封口
+                // 等待（09 §6），会话出结果时 pending 询问按 withdrawn 收尾。
+                // 终态节点或其余等待形态收到结果即状态矛盾，整批拒绝，
+                // 防止迟到结果改写已裁决/已解除的新状态。
+                let wait_allows_result = node.status == NodeStatus::Waiting
+                    && node.wait.as_ref().is_some_and(|w| {
+                        matches!(
+                            w.kind(),
+                            WaitKind::Child | WaitKind::Approval
+                        )
+                    });
+                let result_source_ok = match event.kind {
+                    EventKind::NodeFailed => {
+                        node.status == NodeStatus::Running || wait_allows_result
+                    }
+                    EventKind::NodeCompleted => {
+                        node.status == NodeStatus::Running
+                            || (node.status == NodeStatus::Waiting
+                                && node.wait.as_ref().is_some_and(|w| {
+                                    w.kind() == WaitKind::Approval
+                                }))
+                    }
+                    _ => node.status == NodeStatus::Running,
+                };
+                if !result_source_ok {
+                    return Err(invalid("result for node not in flight"));
+                }
                 // 派发出结果即本次会话结束：仍 pending 的询问随之失效（会话
                 // 丢失走 Uncertain 路径，不得把旧批准交给新会话，§6.1）。
                 if let Some(approval) = node
@@ -1944,6 +2003,24 @@ impl State {
                 }
             }
             EventKind::WaitResolved => {
+                // 折叠层重放权威（I5）：被解除的等待必须真实存在，且只有
+                // Delay/Signal/Child 三类走 WaitResolved 解除（§6.2/§6.3）——
+                // Retry 到期直接重派发不经此处，Approval 由 PermissionDecided
+                // 解除，Uncertain 由 Adjudicated 解除。解除一个不在等待中或不
+                // 可如此解除的节点，意味着写者违背了发射纪律——按状态矛盾
+                // 拒绝（与 signal on terminal run 同类），不能静默改写已经
+                // 过裁决或重派发的新状态。终态 run 上等待节点的迟到解除
+                // 仍走下面的无操作路径（证据已在账，业务状态不再动）。
+                let resolvable = node.status == NodeStatus::Waiting
+                    && node.wait.as_ref().is_some_and(|w| {
+                        matches!(
+                            w.kind(),
+                            WaitKind::Delay | WaitKind::Signal | WaitKind::Child
+                        )
+                    });
+                if !resolvable {
+                    return Err(invalid("wait resolution without active wait"));
+                }
                 // 等待解除时顺带清掉信号收件箱里的对应槽位：信号已被消费，
                 // 留着会让后续同节点信号被误判为「槽位已占用」。
                 if !terminal {
@@ -2904,5 +2981,161 @@ mod atomic_value_tests {
         assert_eq!(state.applied_lsn, 2);
         assert!(state.workflows.contains_key("w"));
         assert!(state.values.check(&StoredValue::Ref(reference)).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod wait_fold_tests {
+    //! 等待语义的折叠层守卫（I5）：WaitResolved 只对持活跃等待的 Waiting
+    //! 节点合法。解除一个不在等待中的节点是状态矛盾，整批拒绝——不是
+    //! 幂等无操作，迟到取消/失败才是无操作家族。
+    use super::*;
+    use serde_json::json;
+
+    struct Harness {
+        state: State,
+        lsn: u64,
+    }
+
+    impl Harness {
+        fn apply(&mut self, events: Vec<Event>) -> Result<()> {
+            let tx = Transaction {
+                v: 2,
+                journal_id: "wait".into(),
+                lsn: self.lsn + 1,
+                tx_id: format!("tx-{}", self.lsn + 1),
+                events,
+            };
+            self.state.apply(&tx)?;
+            self.lsn += 1;
+            Ok(())
+        }
+
+        fn seq(&self) -> u64 {
+            self.state.runs.get("r").map_or(1, |r| r.last_run_seq + 1)
+        }
+
+        fn node(&self) -> &Node {
+            &self.state.runs["r"].nodes["n"]
+        }
+    }
+
+    fn inline(value: Value) -> StoredValue {
+        StoredValue::Inline(value)
+    }
+
+    fn node_event(kind: EventKind, seq: u64, payload: Value) -> Event {
+        let mut event = Event::new(kind, payload);
+        event.run_id = Some("r".into());
+        event.run_seq = seq;
+        event.node_id = Some("n".into());
+        event.dispatch_id = Some("d1".into());
+        event
+    }
+
+    /// 启动 run、派发节点 n 并提交输入准备：节点处于 Running。
+    fn dispatched() -> Harness {
+        let mut harness = Harness {
+            state: State::default(),
+            lsn: 0,
+        };
+        let run: Run = serde_json::from_value(json!({
+            "run_id":"r", "workflow_id":"w", "workflow_version":1,
+            "definition": inline(Value::Null), "input": inline(Value::Null),
+            "source":"manual", "source_detail":null, "parent":null, "depth":0,
+            "created_at":"now", "status":"running", "output":null, "error":null,
+            "last_run_seq":"0", "nodes":{}
+        }))
+        .unwrap();
+        let mut started = Event::new(EventKind::RunStarted, serde_json::to_value(&run).unwrap());
+        started.run_id = Some("r".into());
+        started.run_seq = 1;
+        harness.apply(vec![started]).unwrap();
+        harness
+            .apply(vec![node_event(
+                EventKind::DispatchStarted,
+                harness.seq(),
+                json!({"node_execution_id":"x","attempt":"1"}),
+            )])
+            .unwrap();
+        let mut prepared = node_event(
+            EventKind::InputPrepared,
+            0,
+            json!({"prepared": {
+                "input": inline(Value::Null), "predecessors": {},
+                "params": inline(json!({})), "engine_build": "b", "node_semantics": 2
+            }}),
+        );
+        prepared.audit_seq = 1;
+        harness.apply(vec![prepared]).unwrap();
+        assert_eq!(harness.node().status, NodeStatus::Running);
+        harness
+    }
+
+    /// 在 dispatched 的基础上登记一个 delay 等待：节点处于 Waiting。
+    fn waiting() -> Harness {
+        let mut harness = dispatched();
+        harness
+            .apply(vec![node_event(
+                EventKind::WaitRegistered,
+                harness.seq(),
+                json!({"wait":{"kind":"delay","wake_at":123}, "sealed_through":"1"}),
+            )])
+            .unwrap();
+        assert_eq!(harness.node().status, NodeStatus::Waiting);
+        harness
+    }
+
+    #[test]
+    fn wait_resolved_sets_succeeded_and_clears_wait() {
+        let mut harness = waiting();
+        harness
+            .apply(vec![node_event(
+                EventKind::WaitResolved,
+                harness.seq(),
+                json!({"output": inline(json!({"ok":true}))}),
+            )])
+            .unwrap();
+        assert_eq!(harness.node().status, NodeStatus::Succeeded);
+        assert!(harness.node().wait.is_none());
+    }
+
+    #[test]
+    fn wait_resolved_on_running_node_is_rejected() {
+        // 解除一个从未登记等待的节点（仍处 Running）：状态矛盾，整批拒绝。
+        let mut harness = dispatched();
+        let err = harness
+            .apply(vec![node_event(
+                EventKind::WaitResolved,
+                harness.seq(),
+                json!({"output": inline(json!({"ok":true}))}),
+            )])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("without active wait"), "{err}");
+        assert_eq!(harness.node().status, NodeStatus::Running);
+    }
+
+    #[test]
+    fn wait_resolved_twice_is_rejected_not_noop() {
+        // 双重解除不是幂等无操作：第一次已消费等待，第二次是状态矛盾。
+        let mut harness = waiting();
+        harness
+            .apply(vec![node_event(
+                EventKind::WaitResolved,
+                harness.seq(),
+                json!({"output": inline(json!({"ok":true}))}),
+            )])
+            .unwrap();
+        let err = harness
+            .apply(vec![node_event(
+                EventKind::WaitResolved,
+                harness.seq(),
+                json!({"output": inline(json!({"ok":true}))}),
+            )])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("without active wait"), "{err}");
+        assert_eq!(harness.node().status, NodeStatus::Succeeded);
     }
 }

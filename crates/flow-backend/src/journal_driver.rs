@@ -588,6 +588,17 @@ async fn advance_committed_node(
             backend
                 .internal_for_run(run_id, |s| {
                     let run = &s.runs[run_id];
+                    // 锁内新鲜复核（与 child 分支同纪律）：闭包外的 record 是
+                    // 快照读，拿到决策锁之前状态可能已被并发命令改变。
+                    if run.terminal()
+                        || run
+                            .nodes
+                            .get(&node.id)
+                            .and_then(|current| current.wait.as_ref())
+                            .is_none_or(|w| w.kind() != WaitKind::Signal)
+                    {
+                        return Ok((vec![], ()));
+                    }
                     let Some(output) = run.signals.get(&node.id) else {
                         return Ok((vec![], ()));
                     };
@@ -634,10 +645,19 @@ async fn advance_committed_node(
             return Ok(true);
         }
         if wait.kind() == WaitKind::Delay && wait.wake_at().is_some_and(|at| at <= now) {
-            // 延时已到：唤醒节点。
+            // 延时已到：唤醒节点。锁内复核终态与等待仍在（闭包外的 wait
+            // 是快照读），与 signal/child 分支同纪律。
             backend
                 .internal_for_run(run_id, |s| {
                     let r = &s.runs[run_id];
+                    if r.terminal()
+                        || r.nodes
+                            .get(&node.id)
+                            .and_then(|current| current.wait.as_ref())
+                            .is_none_or(|w| w.kind() != WaitKind::Delay)
+                    {
+                        return Ok((vec![], ()));
+                    }
                     Ok((vec![node_event(
                         r,
                         &node.id,
