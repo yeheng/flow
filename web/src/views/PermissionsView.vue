@@ -48,7 +48,7 @@ const workflowName = computed(
 
 const isLegacy = computed(() => perms.value === null);
 const allow = computed<Capability[]>(() => perms.value?.allow ?? []);
-const mode = computed<"execute" | "plan">(() => perms.value?.mode ?? "execute");
+const mode = computed<"execute" | "plan" | "bypass">(() => perms.value?.mode ?? "execute");
 /** 定义里含副作用节点（legacy 横幅的严重级别判定） */
 const hasSideEffect = computed(() => definitionHasSideEffectNodes(definition.value));
 /** 保存前本地校验（服务端权威） */
@@ -81,7 +81,7 @@ function createPermissionsBlock(): void {
   perms.value = { version: 1, mode: "execute", allow: [] };
 }
 
-function setMode(m: "execute" | "plan"): void {
+function setMode(m: "execute" | "plan" | "bypass"): void {
   if (!perms.value || perms.value.mode === m) return;
   perms.value = { ...perms.value, mode: m };
 }
@@ -242,10 +242,14 @@ watch(
             />
             规划（plan）
           </label>
-          <span class="muted mode-help">plan 只规划不执行副作用动作</span>
+          <label class="mode-radio">
+            <input type="radio" name="wf-perm-mode" :checked="mode === 'bypass'" @change="setMode('bypass')" />
+            跳过权限检查（bypass）
+          </label>
+          <span class="muted mode-help">{{ mode === 'bypass' ? '该工作流内所有节点和 step 跳过权限检查' : 'plan 只规划不执行副作用动作' }}</span>
         </div>
 
-        <p v-if="allow.length === 0" class="allow-empty">
+        <p v-if="mode !== 'bypass' && allow.length === 0" class="allow-empty">
           allow 为空：不放行任何外部能力（节点级声明除外）
         </p>
         <CapabilityEditor

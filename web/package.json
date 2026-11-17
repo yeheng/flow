@@ -16,7 +16,8 @@
     "format": "prettier --write .",
     "test": "vitest run",
     "test:e2e": "playwright test",
-    "typecheck": "vue-tsc --noEmit"
+    "typecheck": "vue-tsc --noEmit",
+    "build:server": "sh scripts/build-server.sh"
   },
   "dependencies": {
     "@fontsource/inter": "^5.3.0",

@@ -34,12 +34,13 @@ use flow_dto::permission::{
     ApprovalScope, Decision, DecisionRecord, Modifiers, OperationSpec, PermissionRequest,
     Principal, RequestContext,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::Digest as _;
 use tokio::sync::mpsc;
 
 use crate::journal::JournalBackend;
 use crate::journal_execution::Attempt;
+use flow_engine::execution_protocol::TransferKey;
 use flow_engine::execution_protocol::contract::{
     CANCEL_REAP_TIMEOUT_MS, DURABLE_WAIT_TIMEOUT_MS, TRANSFER_CHUNK_BYTES,
 };
@@ -47,7 +48,6 @@ use flow_engine::execution_protocol::message::{
     Message, PermitCredential, ResultOutcome, WaitKind as WaitRequestKind,
 };
 use flow_engine::execution_protocol::record_bytes;
-use flow_engine::execution_protocol::TransferKey;
 use flow_engine::journal_state::{
     PermissionAskedPayload, PermissionDecidedPayload, Prepared, Run, RunStatus, Wait, WaitKind,
 };
@@ -1360,6 +1360,10 @@ impl DispatchRunner {
             .execution
             .as_ref()
             .is_none_or(|snapshot| snapshot.regression.is_none())
+            && !run
+                .policy
+                .as_ref()
+                .is_some_and(|p| p.mode == flow_dto::permission::ExecutionMode::Bypass)
         {
             crate::policy::start_gate(&definition, &child_ceilings)
                 .map_err(flow_journal::Error::Forbidden)?;
@@ -2021,6 +2025,7 @@ impl DispatchRunner {
                 .await;
             };
             let specs = match specs {
+                Err(_) if policy.mode == flow_dto::permission::ExecutionMode::Bypass => Vec::new(),
                 Ok(specs) => specs,
                 Err(reason) => {
                     return invalid_tool(&self.attempt, link, &tool_call_id, &request, &reason)
@@ -2453,10 +2458,14 @@ fn evaluate_node_request(
         run_id: attempt.run_id.clone(),
         node_id: attempt.node_id.clone(),
     };
+    let bypass = run
+        .policy
+        .as_ref()
+        .is_some_and(|p| p.mode == flow_dto::permission::ExecutionMode::Bypass);
     let record = run.nodes.get(&attempt.node_id);
     // G4：动态插件节点——需求来自 master 侧 manifest（不信任执行器自报），
     // 元 concrete spec；未部署/未声明均按能力拒绝。
-    let plugin_needs = if node.kind().is_none() {
+    let plugin_needs = if !bypass && node.kind().is_none() {
         match crate::policy::plugin_needs_for_type(&node.node_type) {
             Some(found) => {
                 // I35：执行器上报身份必须与 master 侧一致（远程执行器二进制
@@ -2579,7 +2588,7 @@ fn evaluate_node_request(
             request: Some(request),
         };
     };
-    if let Some(reason) = derive_error {
+    if let Some(reason) = derive_error.filter(|_| !bypass) {
         return G3Decision::Deny {
             reason: format!("请求无法派生权限需求：{reason}"),
             request: Some(request),
@@ -3200,14 +3209,18 @@ mod transfer_budget_tests {
             total_bytes,
             digest: String::new(),
         };
-        assert!(runner
-            .handle(ready("foreign", "t", 0), &mut link)
-            .await
-            .is_err());
-        assert!(runner
-            .handle(ready("d", "t", u64::MAX), &mut link)
-            .await
-            .is_err());
+        assert!(
+            runner
+                .handle(ready("foreign", "t", 0), &mut link)
+                .await
+                .is_err()
+        );
+        assert!(
+            runner
+                .handle(ready("d", "t", u64::MAX), &mut link)
+                .await
+                .is_err()
+        );
         assert!(runner.op_transfers.is_empty());
         let chunk = |id: &str, offset, bytes: &[u8]| Message::TransferChunk {
             dispatch_id: "d".into(),
@@ -3216,10 +3229,12 @@ mod transfer_budget_tests {
             bytes: bytes.to_vec(),
             digest: hex_sha(bytes),
         };
-        assert!(runner
-            .handle(chunk("t", u64::MAX, b"x"), &mut link)
-            .await
-            .is_err());
+        assert!(
+            runner
+                .handle(chunk("t", u64::MAX, b"x"), &mut link)
+                .await
+                .is_err()
+        );
         let half = vec![b'x'; OPERATION_TRANSFER_LIMIT as usize / 2];
         runner
             .handle(chunk("a", 0, &half), &mut link)
@@ -3238,10 +3253,12 @@ mod transfer_budget_tests {
                 .await
                 .unwrap();
         }
-        assert!(runner
-            .handle(ready("d", "overflow", 0), &mut link)
-            .await
-            .is_err());
+        assert!(
+            runner
+                .handle(ready("d", "overflow", 0), &mut link)
+                .await
+                .is_err()
+        );
         assert_eq!(runner.op_transfers.len(), OPERATION_TRANSFER_COUNT);
         backend.close().await.unwrap();
         std::fs::remove_dir_all(root).unwrap();

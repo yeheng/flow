@@ -182,15 +182,18 @@ impl PluginRegistry {
                         source: RegistrationSource::Default,
                     },
                 ),
-                None => tracing::warn!(
-                    plugin_id,
-                    "{bin_env} 未设且同目录无 {bin_name}；{node_type} 节点将不可用，除非 plugins 目录提供 manifest"
-                ),
+                None => {},
             }
         }
         let dir = flow_config::plugin_fs::plugins_root();
         if let Some(dir) = dir {
             registry.discover(&dir);
+        }
+        for node_type in ["harness", "llm"] {
+            if registry.resolve(node_type).is_none() {
+                tracing::warn!(node_type, plugins_dir = ?flow_config::plugin_fs::plugins_root(),
+                    "plugin unavailable after scanning plugin directory and binary overrides");
+            }
         }
         registry
     }

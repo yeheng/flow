@@ -11,6 +11,7 @@ import { deepCloneJson } from "./clone";
 export interface Snapshot {
   nodes: EditorNode[];
   edges: EditorEdge[];
+  definitionOptions: typeof editor.definitionOptions;
 }
 
 const LIMIT = 100;
@@ -42,6 +43,7 @@ function cloneNode(n: EditorNode): EditorNode {
 
 function takeSnapshot(): Snapshot {
   return {
+    definitionOptions: deepCloneJson(editor.definitionOptions),
     nodes: editor.nodes.map(cloneNode),
     edges: editor.edges.map((e) => ({ ...e })),
   };
@@ -98,6 +100,7 @@ export function endDrag(): void {
 
 function apply(s: Snapshot): void {
   // 栈内快照再克隆一份回画布，避免后续编辑直接改到栈内容
+  editor.definitionOptions = deepCloneJson(s.definitionOptions);
   editor.nodes = s.nodes.map(cloneNode);
   editor.edges = s.edges.map((e) => ({ ...e }));
   if (editor.selectedNodeId && !editor.nodes.some((n) => n.id === editor.selectedNodeId)) {

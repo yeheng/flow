@@ -173,7 +173,7 @@ impl AgentTunables {
         Self {
             max_turns: env_parse(lookup, "CONGA_MAX_TURNS", 50),
             max_tool_calls_per_turn: env_parse(lookup, "CONGA_MAX_TOOL_CALLS", 20),
-            max_tokens: env_parse(lookup, "CONGA_MAX_TOKENS", 4096),
+            max_tokens: env_parse(lookup, "CONGA_MAX_TOKENS", 0),
             tool_timeout_secs: lookup("CONGA_TOOL_TIMEOUT_S")
                 .ok()
                 .and_then(|s| s.parse().ok()),
@@ -280,7 +280,7 @@ mod tests {
         let t = AgentTunables::from_env_with(&fake_env(&[]));
         assert_eq!(t.max_turns, 50);
         assert_eq!(t.max_tool_calls_per_turn, 20);
-        assert_eq!(t.max_tokens, 4096);
+        assert_eq!(t.max_tokens, 0);
         assert_eq!(t.retry.max_retries, 2);
     }
 

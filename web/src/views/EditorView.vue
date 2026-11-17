@@ -22,13 +22,14 @@ import {
   validationUi,
 } from "../state/editor";
 import { history, redo, undo } from "../state/history";
-import { promptDialog } from "../state/modal";
+import { confirmDialog, promptDialog } from "../state/modal";
 import { cancelRunStart, monitor, startRun } from "../state/monitor";
 import { openOverlay, topOverlay } from "../state/overlays";
 import { saveWorkflowAsNodeTemplate } from "../state/templates";
 import { toast } from "../state/toast";
 import { SIDE_EFFECT_NODE_TYPES } from "../state/capabilities";
 import AppButton from "../components/AppButton.vue";
+import RawWorkflowEditor from "../components/RawWorkflowEditor.vue";
 import NodePalette from "../components/NodePalette.vue";
 import FlowCanvas from "../components/FlowCanvas.vue";
 import ParamsModal from "../components/ParamsModal.vue";
@@ -36,6 +37,20 @@ import BusinessNodeDialog from "../components/BusinessNodeDialog.vue";
 import ResizeHandle from "../components/ResizeHandle.vue";
 import RunPanel from "../components/RunPanel.vue";
 import { usePanelResize } from "../state/panel-resize";
+
+const rawMode = ref(false);
+const rawPending = ref(false);
+async function confirmRawDiscard(): Promise<boolean> {
+  return !rawPending.value || await confirmDialog("放弃尚未应用的 JSON 草稿？");
+}
+async function toggleRawMode(): Promise<void> {
+  if (!(await confirmRawDiscard())) return;
+  rawPending.value = false;
+  rawMode.value = !rawMode.value;
+}
+async function confirmEditorDiscard(): Promise<boolean> {
+  return await confirmRawDiscard() && await confirmDiscardIfDirty();
+}
 
 const route = useRoute();
 const router = useRouter();
@@ -154,14 +169,14 @@ watch(
 
 onBeforeRouteUpdate(async (to) => {
   if (to.params.id === route.params.id) return true;
-  return confirmDiscardIfDirty();
+  return confirmEditorDiscard();
 });
 
-onBeforeRouteLeave(() => confirmDiscardIfDirty());
+onBeforeRouteLeave(() => confirmEditorDiscard());
 
 // 刷新/关页没有路由守卫可拦：仅 dirty 时触发浏览器原生确认（与编辑器同一份 dirty 判定）
 function onBeforeUnload(e: BeforeUnloadEvent): void {
-  if (!dirty.value) return;
+  if (!dirty.value && !rawPending.value) return;
   e.preventDefault();
   e.returnValue = "";
 }
@@ -184,6 +199,7 @@ function onKeydown(e: KeyboardEvent): void {
     validationUi.open = false;
     return;
   }
+  if (rawMode.value && !(e.key.toLowerCase() === "s" && (e.metaKey || e.ctrlKey))) return;
   if ((e.key === "Delete" || e.key === "Backspace") && !isEditableTarget(e.target)) {
     if (deleteSelection()) e.preventDefault();
     return;
@@ -192,7 +208,8 @@ function onKeydown(e: KeyboardEvent): void {
   const key = e.key.toLowerCase();
   if (key === "s") {
     e.preventDefault();
-    void save();
+    if (rawPending.value) toast.error("请先校验并应用 JSON 草稿");
+    else void save();
     return;
   }
   if (key === "b") {
@@ -307,14 +324,15 @@ const legacyPermissions = computed(
         </template>
       </nav>
       <div class="editor-actions">
-        <AppButton title="撤销 (⌘Z)" :disabled="!history.canUndo" @click="undo()">↶ 撤销</AppButton>
-        <AppButton title="重做 (⌘⇧Z)" :disabled="!history.canRedo" @click="redo()"
+        <AppButton @click="toggleRawMode">{{ rawMode ? "切换画布" : "Raw JSON" }}</AppButton>
+        <AppButton title="撤销 (⌘Z)" :disabled="rawPending || !history.canUndo" @click="undo()">↶ 撤销</AppButton>
+        <AppButton title="重做 (⌘⇧Z)" :disabled="rawPending || !history.canRedo" @click="redo()"
           >↷ 重做</AppButton
         >
-        <AppButton :disabled="editor.nodes.length === 0" @click="autoLayout()">自动布局</AppButton>
+        <AppButton :disabled="rawMode || editor.nodes.length === 0" @click="autoLayout()">自动布局</AppButton>
         <AppButton
           title="把当前工作流打包成可复用的子流程节点（存入「业务节点」区）"
-          :disabled="!editor.workflowId"
+          :disabled="rawPending || !editor.workflowId"
           @click="saveAsNode()"
         >
           存为业务节点
@@ -340,16 +358,16 @@ const legacyPermissions = computed(
             </button>
           </div>
         </span>
-        <AppButton title="保存 (⌘S)" :disabled="saving" @click="save()">
+        <AppButton title="保存 (⌘S)" :disabled="rawPending || saving" @click="save()">
           {{ saving ? "保存中…" : "保存" }}
         </AppButton>
-        <AppButton :disabled="publishing" @click="publish()">
+        <AppButton :disabled="rawPending || publishing" @click="publish()">
           {{ publishing ? "发布中…" : "发布" }}
         </AppButton>
         <AppButton
           variant="primary"
           title="运行已发布版本；修改参数后请先发布"
-          :disabled="monitor.starting"
+          :disabled="rawPending || monitor.starting"
           @click="startRun()"
         >
           运行
@@ -370,7 +388,8 @@ const legacyPermissions = computed(
       </RouterLink>
     </div>
     <main class="editor-main" :class="`console-${effectiveConsoleMode}`">
-      <div class="editor-body">
+      <RawWorkflowEditor v-if="rawMode" :key="editor.workflowId ?? 'empty'" class="raw-body" @pending="rawPending = $event" />
+      <div v-else class="editor-body">
         <aside
           ref="paletteEl"
           class="left"
@@ -437,6 +456,8 @@ const legacyPermissions = computed(
 .editor-main.console-sidebar {
   flex-direction: row;
 }
+
+.raw-body { flex: 1; min-width: 0; min-height: 0; }
 
 .editor-body {
   flex: 1;

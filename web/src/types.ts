@@ -551,7 +551,7 @@ export interface Capability {
 /** definition 顶层 permissions：version 固定为 1；mode=plan 只规划不执行副作用 */
 export interface WorkflowPermissions {
   version: 1;
-  mode: "execute" | "plan";
+  mode: "execute" | "plan" | "bypass";
   allow: Capability[];
 }
 

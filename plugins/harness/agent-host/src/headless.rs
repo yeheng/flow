@@ -347,7 +347,7 @@ impl HeadlessSpec {
         agent_core::AgentTunables {
             max_turns: self.max_turns.unwrap_or(50),
             max_tool_calls_per_turn: self.max_tool_calls_per_turn.unwrap_or(20),
-            max_tokens: self.max_tokens.unwrap_or(4096),
+            max_tokens: self.max_tokens.unwrap_or(0),
             retry: Default::default(),
             tool_timeout_secs: self.tool_timeout_secs,
         }

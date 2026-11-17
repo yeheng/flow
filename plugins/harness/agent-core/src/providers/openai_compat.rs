@@ -116,7 +116,6 @@ fn build_request_body(
         "model": model.id,
         "messages": msgs,
         "stream": true,
-        "max_tokens": model.max_tokens,
         "stream_options": {"include_usage": true},
     });
 
@@ -302,6 +301,18 @@ pub(crate) fn parse_openai_chunk(json_str: &str) -> Vec<StreamChunk> {
     }
 
     chunks
+}
+
+#[cfg(test)]
+mod output_budget_tests {
+    use super::*;
+    #[test]
+    fn leaves_output_budget_to_api() {
+        let model = ModelSpec { id: "test".into(), api: crate::types::context::ProviderApi::OpenAiCompat, max_tokens: 4096 };
+        let body = build_request_body(&model, &[], "", &[]);
+        assert!(body.get("max_tokens").is_none());
+        assert!(body.get("max_completion_tokens").is_none());
+    }
 }
 
 #[cfg(test)]

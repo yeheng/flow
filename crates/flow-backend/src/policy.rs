@@ -55,6 +55,11 @@ pub fn check(
     run_approvals: &[RunApproval],
     evaluated_at: DateTime<Utc>,
 ) -> Evaluation {
+    if policy.mode == ExecutionMode::Bypass {
+        return Evaluation::Allow {
+            matched: vec!["workflow:bypass".into()],
+        };
+    }
     if input.specs.is_empty() {
         return Evaluation::Deny {
             reason: "空需求集合不能授权".into(),
@@ -200,6 +205,11 @@ pub fn check_plugin_needs(
     run_approvals: &[RunApproval],
     evaluated_at: DateTime<Utc>,
 ) -> Evaluation {
+    if policy.mode == ExecutionMode::Bypass {
+        return Evaluation::Allow {
+            matched: vec!["workflow:bypass".into()],
+        };
+    }
     // 插件进程的副作用面不可枚举：Plan 下无法证明只读，一律拒绝。
     if policy.mode == ExecutionMode::Plan {
         return Evaluation::Deny {
@@ -363,8 +373,10 @@ fn freeze(
     use flow_dto::permission::{CeilingLayer, WorkflowPermissions};
     let mut ceilings = Vec::new();
     let mut parent_plan = false;
+    let mut parent_bypass = false;
     if let Some((parent, run, node)) = parent {
         parent_plan = parent.mode == ExecutionMode::Plan;
+        parent_bypass = parent.mode == ExecutionMode::Bypass;
         ceilings.extend(parent.ceilings.iter().cloned());
         let source = |layer: &str| format!("parent:{run}/{node}:{layer}");
         // legacy 父 run 没有任何能力：子 run 的外部操作一律被空上限拒绝。
@@ -397,6 +409,8 @@ fn freeze(
     };
     let mode = if parent_plan {
         ExecutionMode::Plan
+    } else if parent_bypass {
+        ExecutionMode::Bypass
     } else {
         workflow.mode
     };
@@ -427,16 +441,25 @@ pub async fn plugin_ceilings(
     let defaults = backend.plugin_defaults();
     let prepared = tokio::task::spawn_blocking(move || {
         let snapshot = crate::plugin_registry::installed_snapshot_with_defaults(&defaults);
-        let plugins = snapshot.rows.into_iter().filter_map(|row| row.plugin).collect::<Vec<_>>();
+        let plugins = snapshot
+            .rows
+            .into_iter()
+            .filter_map(|row| row.plugin)
+            .collect::<Vec<_>>();
         let mut wanted = Vec::new();
         for node in nodes {
             match node.kind() {
                 Some(flow_engine::NodeType::Llm) => wanted.push("llm".to_owned()),
                 Some(flow_engine::NodeType::Harness) if node.is_harness_agent() => {
-                    if let Some(id) = &agent_plugin_id { wanted.push(id.clone()); }
+                    if let Some(id) = &agent_plugin_id {
+                        wanted.push(id.clone());
+                    }
                 }
                 None => {
-                    if let Some(plugin) = plugins.iter().find(|plugin| plugin.manifest.plugin.node_types.contains(&node.node_type)) {
+                    if let Some(plugin) = plugins
+                        .iter()
+                        .find(|plugin| plugin.manifest.plugin.node_types.contains(&node.node_type))
+                    {
                         wanted.push(plugin.manifest.plugin.id.clone());
                     }
                 }
@@ -445,14 +468,22 @@ pub async fn plugin_ceilings(
         }
         wanted.sort();
         wanted.dedup();
-        let identities = wanted.iter().filter_map(|id| {
-            crate::plugin_registry::bundled_or_discovered_with_plugins(id, plugins.clone()).map(|identity| (id.clone(), identity))
-        }).collect::<std::collections::BTreeMap<_,_>>();
+        let identities = wanted
+            .iter()
+            .filter_map(|id| {
+                crate::plugin_registry::bundled_or_discovered_with_plugins(id, plugins.clone())
+                    .map(|identity| (id.clone(), identity))
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
         (wanted, identities)
-    }).await;
+    })
+    .await;
     let (wanted, identities) = match prepared {
         Ok(prepared) => prepared,
-        Err(error) => { tracing::warn!(%error, "plugin permission snapshot failed"); return Vec::new(); }
+        Err(error) => {
+            tracing::warn!(%error, "plugin permission snapshot failed");
+            return Vec::new();
+        }
     };
     let state_ceilings = backend
         .inspect(|state| {
@@ -809,6 +840,13 @@ pub fn start_gate(
     definition: &flow_engine::Definition,
     plugin_ceilings: &[flow_dto::permission::PluginCeiling],
 ) -> Result<(), String> {
+    if definition
+        .permissions
+        .as_ref()
+        .is_some_and(|p| p.mode == ExecutionMode::Bypass)
+    {
+        return Ok(());
+    }
     match &definition.permissions {
         None => {
             let side_effects: Vec<&str> = definition
@@ -898,8 +936,8 @@ fn evaluate_layer(
 mod tests {
     use super::*;
     use flow_dto::permission::{
-        parse_capability, parse_workflow_permissions, CeilingLayer, PluginCeiling, ResourcePattern,
-        WorkflowPermissions,
+        CeilingLayer, PluginCeiling, ResourcePattern, WorkflowPermissions, parse_capability,
+        parse_workflow_permissions,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -943,6 +981,54 @@ mod tests {
         plugins: Vec<PluginCeiling>,
     ) -> FrozenPolicy {
         FrozenPolicy::sealed(mode, false, workflow(mode, allow), nodes, ceilings, plugins)
+    }
+
+    #[test]
+    fn bypass_allows_operations_and_plugins_without_grants_or_node_capabilities() {
+        let policy = frozen(
+            ExecutionMode::Bypass,
+            vec![],
+            restrict(vec![]),
+            vec![CeilingLayer {
+                source: "parent".into(),
+                allow: vec![],
+            }],
+            vec![],
+        );
+        assert!(matches!(
+            check_now(&[http_spec("https://example.com")], &policy, &[]),
+            Evaluation::Allow { .. }
+        ));
+        assert!(matches!(
+            check_now(&[], &policy, &[]),
+            Evaluation::Allow { .. }
+        ));
+        assert!(matches!(
+            check_needs(&[], &policy, &[]),
+            Evaluation::Allow { .. }
+        ));
+        assert_eq!(ExecutionMode::parse("bypass"), Some(ExecutionMode::Bypass));
+        let decoded: WorkflowPermissions =
+            serde_json::from_value(serde_json::json!({"version":1,"mode":"bypass","allow":[]}))
+                .unwrap();
+        assert_eq!(decoded.mode, ExecutionMode::Bypass);
+    }
+
+    #[test]
+    fn bypass_is_inherited_by_child_workflows_and_start_gate_accepts_it() {
+        let definition: flow_engine::Definition = serde_json::from_value(serde_json::json!({
+            "nodes": [], "edges": [], "permissions": {"version":1,"mode":"bypass","allow":[]}
+        }))
+        .unwrap();
+        assert!(start_gate(&definition, &[]).is_ok());
+        let parent = freeze_root(&definition, vec![]);
+        let child: flow_engine::Definition = serde_json::from_value(serde_json::json!({"nodes":[],"edges":[]})).unwrap();
+        let frozen = freeze_child(&child, &parent, "parent-run", "node", vec![]);
+        assert_eq!(frozen.mode, ExecutionMode::Bypass);
+        assert!(matches!(
+            check_now(&[http_spec("https://example.com")], &frozen, &[]),
+            Evaluation::Allow { .. }
+        ));
     }
 
     fn policy(allow: Vec<Capability>) -> FrozenPolicy {

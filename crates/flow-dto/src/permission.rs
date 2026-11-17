@@ -167,6 +167,7 @@ impl Approval {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionMode {
+    Bypass,
     Execute,
     Plan,
 }
@@ -175,6 +176,7 @@ impl ExecutionMode {
     /// 线上名称。
     pub fn as_str(self) -> &'static str {
         match self {
+            ExecutionMode::Bypass => "bypass",
             ExecutionMode::Execute => "execute",
             ExecutionMode::Plan => "plan",
         }
@@ -183,6 +185,7 @@ impl ExecutionMode {
     /// 反查；未知名称返回 None。
     pub fn parse(name: &str) -> Option<Self> {
         match name {
+            "bypass" => Some(Self::Bypass),
             "execute" => Some(Self::Execute),
             "plan" => Some(Self::Plan),
             _ => None,
@@ -1212,7 +1215,7 @@ fn parse_capability_in(value: &Value, manifest_layer: bool) -> Result<Capability
             other => {
                 return Err(format!(
                     "能力 {id} 的 approval 必须是 auto|ask，当前为 {other}"
-                ))
+                ));
             }
         },
     };
@@ -1399,7 +1402,7 @@ pub fn parse_workflow_permissions(value: &Value) -> Result<WorkflowPermissions, 
     }
     let mode = match object.get("mode").and_then(Value::as_str) {
         Some(mode) => ExecutionMode::parse(mode)
-            .ok_or_else(|| format!("permissions.mode 必须是 execute|plan，当前为 {mode}"))?,
+            .ok_or_else(|| format!("permissions.mode 必须是 execute|plan|bypass，当前为 {mode}"))?,
         None => return Err("permissions.mode 缺失".to_string()),
     };
     let allow = match object.get("allow") {
@@ -1788,13 +1791,17 @@ mod tests {
         assert!(
             parse_capability(&json!({"id":"x","action":"teleport","approval":"auto"})).is_err()
         );
-        assert!(parse_capability(&json!({"id":"x","action":"exec",
+        assert!(
+            parse_capability(&json!({"id":"x","action":"exec",
             "executable":"/bin/ls","argv_exact":[],"approval":"yes"}))
-        .is_err());
+            .is_err()
+        );
         // 模板表达式拒绝。
-        assert!(parse_capability(&json!({"id":"x","action":"secret",
+        assert!(
+            parse_capability(&json!({"id":"x","action":"secret",
             "names":["${input.key}"],"approval":"auto"}))
-        .is_err());
+            .is_err()
+        );
         // exec 缺 executable/program。
         assert!(
             parse_capability(&json!({"id":"x","action":"exec","argv_exact":[],
@@ -1802,13 +1809,17 @@ mod tests {
             .is_err()
         );
         // 摘要非法。
-        assert!(parse_capability(&json!({"id":"x","action":"shell",
+        assert!(
+            parse_capability(&json!({"id":"x","action":"shell",
             "script_digest":"deadbeef","approval":"auto"}))
-        .is_err());
+            .is_err()
+        );
         // path 与 subtree 互斥。
-        assert!(parse_capability(&json!({"id":"x","action":"file_write",
+        assert!(
+            parse_capability(&json!({"id":"x","action":"file_write",
             "path":"a.txt","subtree":"src","approval":"auto"}))
-        .is_err());
+            .is_err()
+        );
         // URL 带 userinfo / query。
         assert!(
             parse_capability(&json!({"id":"x","action":"net","methods":["GET"],
@@ -1849,14 +1860,16 @@ mod tests {
             headers_digest: "0".repeat(64),
             body_digest: "0".repeat(64),
         };
-        assert!(net
-            .pattern
-            .matches(&spec("https://api.example.com/v1/x?k=1")));
+        assert!(
+            net.pattern
+                .matches(&spec("https://api.example.com/v1/x?k=1"))
+        );
         assert!(net.pattern.matches(&spec("https://api.example.com/v1")));
         assert!(!net.pattern.matches(&spec("https://api.example.com/v10")));
-        assert!(!net
-            .pattern
-            .matches(&spec("https://api.example.com:8443/v1/x")));
+        assert!(
+            !net.pattern
+                .matches(&spec("https://api.example.com:8443/v1/x"))
+        );
         assert!(!net.pattern.matches(&spec("http://api.example.com/v1/x")));
         assert!(!net.pattern.matches(&spec("https://api.example.com/")));
         // 方法大小写不敏感。
@@ -2010,10 +2023,12 @@ mod tests {
         }))
         .expect("manifest layer accepts any");
         // any=true 时不允许再携带 matcher 字段。
-        assert!(parse_manifest_capability(&json!({
-            "id":"all","action":"net","any":true,"methods":["GET"],"approval":"ask"
-        }))
-        .is_err());
+        assert!(
+            parse_manifest_capability(&json!({
+                "id":"all","action":"net","any":true,"methods":["GET"],"approval":"ask"
+            }))
+            .is_err()
+        );
         let spec = OperationSpec::Http {
             method: "GET".into(),
             url: "https://anywhere.example/".into(),

@@ -146,3 +146,8 @@ describe("importWorkflow 先校验再原子提交", () => {
     expect(api.importWorkflowDefinition).not.toHaveBeenCalled();
   });
 });
+
+it("导入保留工作流顶级 bypass 模式及节点限制", () => {
+  const definition = { nodes: [{ id: "n", type: "shell", permissions: { mode: "restrict", allow: [] } }], edges: [], permissions: { version: 1, mode: "bypass", allow: [] } };
+  expect(parseImportDocument(JSON.stringify(definition), "bypass.json").definition).toEqual(definition);
+});

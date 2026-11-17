@@ -18,6 +18,8 @@ vi.mock("../platform", () => ({ isDesktop: () => false }));
 vi.mock("../config", () => ({
   apiToken: () => "",
   setApiToken: vi.fn(),
+  httpUrl: () => "http://127.0.0.1:9803",
+  setServerUrls: vi.fn(),
   rpcUrl: () => "http://127.0.0.1:9802",
 }));
 vi.mock("../state/editor", () => ({ refreshSecrets: vi.fn(async () => {}) }));
@@ -87,7 +89,9 @@ function create() {
 }
 
 function field(w: ReturnType<typeof mount>, label: string) {
-  const f = w.findAll(".field").find((el) => el.find("label").exists() && el.text().includes(label));
+  const f = w
+    .findAll(".field")
+    .find((el) => el.find("label").exists() && el.text().includes(label));
   if (!f) throw new Error(`找不到字段：${label}`);
   return f;
 }

@@ -31,7 +31,10 @@ export async function loadRuntimeConfig(): Promise<void> {
 
 export function rpcUrl(): string {
   return (
-    runtime.rpcUrl ?? (import.meta.env.VITE_FLOW_RPC as string | undefined) ?? "ws://127.0.0.1:9802"
+    (isDesktop() ? null : localStorage.getItem("flow.rpcUrl")) ??
+    runtime.rpcUrl ??
+    (import.meta.env.VITE_FLOW_RPC as string | undefined) ??
+    "ws://127.0.0.1:9802"
   );
 }
 
@@ -52,8 +55,38 @@ export function setApiToken(token: string): void {
 
 export function httpUrl(): string {
   return (
+    (isDesktop() ? null : localStorage.getItem("flow.httpUrl")) ??
     runtime.httpUrl ??
     (import.meta.env.VITE_FLOW_HTTP as string | undefined) ??
     "http://127.0.0.1:9803"
   );
+}
+
+/** Validate both endpoints before persisting either one. Empty values restore deployment defaults. */
+export function setServerUrls(rpc: string, http: string): void {
+  const entries = [
+    ["flow.rpcUrl", rpc.trim(), ["ws:", "wss:"]],
+    ["flow.httpUrl", http.trim(), ["http:", "https:"]],
+  ] as const;
+  for (const [, value, protocols] of entries) {
+    if (!value) continue;
+    let url: URL;
+    try {
+      url = new URL(value);
+    } catch {
+      throw new Error("请输入完整的服务地址");
+    }
+    if (
+      !(protocols as readonly string[]).includes(url.protocol) ||
+      url.username ||
+      url.password ||
+      url.hash
+    ) {
+      throw new Error("RPC 地址须使用 ws/wss，HTTP 地址须使用 http/https，且不能包含凭据或片段");
+    }
+  }
+  for (const [key, value] of entries) {
+    if (value) localStorage.setItem(key, value);
+    else localStorage.removeItem(key);
+  }
 }

@@ -128,7 +128,6 @@ fn build_request_body(
 
     let mut body = json!({
         "model": model.id,
-        "max_tokens": model.max_tokens,
         "messages": msgs,
         "stream": true,
     });
@@ -370,6 +369,18 @@ pub(crate) fn parse_anthropic_chunk(json_str: &str) -> Vec<StreamChunk> {
             }
         }
         _ => vec![],
+    }
+}
+
+#[cfg(test)]
+mod output_budget_tests {
+    use super::*;
+    #[test]
+    fn leaves_output_budget_to_api() {
+        let model = ModelSpec { id: "test".into(), api: crate::types::context::ProviderApi::Anthropic, max_tokens: 4096 };
+        let body = build_request_body(&model, &[], "", &[]);
+        assert!(body.get("max_tokens").is_none());
+        assert!(body.get("max_completion_tokens").is_none());
     }
 }
 

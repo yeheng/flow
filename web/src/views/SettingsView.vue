@@ -4,7 +4,7 @@ import { onBeforeRouteLeave } from "vue-router";
 import * as api from "../api/flow";
 import { errText } from "../rpc/client";
 import { isDesktop } from "../platform";
-import { apiToken, setApiToken, rpcUrl } from "../config";
+import { apiToken, setApiToken, rpcUrl, httpUrl, setServerUrls } from "../config";
 import { refreshSecrets } from "../state/editor";
 import { deepCloneJson } from "../state/clone";
 import { confirmDialog } from "../state/modal";
@@ -28,11 +28,19 @@ import AppButton from "../components/AppButton.vue";
  * 「哪个分区哪个键怎么渲染」，不复制默认值。
  */
 
+const connectionRpc = ref(rpcUrl());
+const connectionHttp = ref(httpUrl());
+const connectionError = ref("");
 const connectionToken = ref(apiToken());
 function saveConnection(): void {
+  try {
+    setServerUrls(connectionRpc.value, connectionHttp.value);
+  } catch (error) {
+    connectionError.value = errText(error);
+    return;
+  }
   setApiToken(connectionToken.value.trim());
-  loading.value = true;
-  void refresh();
+  window.location.reload();
 }
 
 const loading = ref(true);
@@ -92,8 +100,8 @@ const pluginBusy = ref(false);
 const pluginMutationError = ref("");
 const residentPanel = ref<InstanceType<typeof ResidentServicesPanel> | null>(null);
 type PluginMutation = { requestId: string } & (
-  { kind: "install"; source: string; replace: boolean } |
-  { kind: "uninstall"; pluginId: string; stopFirst: boolean }
+  | { kind: "install"; source: string; replace: boolean }
+  | { kind: "uninstall"; pluginId: string; stopFirst: boolean }
 );
 const pluginPending = ref<PluginMutation | null>(null);
 async function runPluginMutation(): Promise<void> {
@@ -102,13 +110,15 @@ async function runPluginMutation(): Promise<void> {
   pluginBusy.value = true;
   pluginMutationError.value = "";
   try {
-    const result = pending.kind === "install"
-      ? await api.installPlugin(pending.source, pending.replace, pending.requestId)
-      : await api.uninstallPlugin(pending.pluginId, pending.stopFirst, pending.requestId);
+    const result =
+      pending.kind === "install"
+        ? await api.installPlugin(pending.source, pending.replace, pending.requestId)
+        : await api.uninstallPlugin(pending.pluginId, pending.stopFirst, pending.requestId);
     pluginPending.value = null;
     await Promise.all([loadPlugins(), residentPanel.value?.refresh()]);
     toast.info(pending.kind === "install" ? "插件安装完成" : "插件已卸载，授予记录已保留");
-    if (result.executor_reload_required) toast.info("节点插件变更需要重启执行器后生效；在飞运行不受影响");
+    if (result.executor_reload_required)
+      toast.info("节点插件变更需要重启执行器后生效；在飞运行不受影响");
   } catch (error) {
     pluginMutationError.value = errText(error);
   } finally {
@@ -117,16 +127,39 @@ async function runPluginMutation(): Promise<void> {
 }
 async function installPlugin(): Promise<void> {
   if (pluginPending.value || !pluginSource.value.trim()) return;
-  if (pluginReplace.value && !await confirmDialog("替换已有插件？运行中的服务需要先停止。", { danger: true, confirmText: "替换" })) return;
-  pluginPending.value = { kind: "install", source: pluginSource.value.trim(), replace: pluginReplace.value, requestId: crypto.randomUUID() };
+  if (
+    pluginReplace.value &&
+    !(await confirmDialog("替换已有插件？运行中的服务需要先停止。", {
+      danger: true,
+      confirmText: "替换",
+    }))
+  )
+    return;
+  pluginPending.value = {
+    kind: "install",
+    source: pluginSource.value.trim(),
+    replace: pluginReplace.value,
+    requestId: crypto.randomUUID(),
+  };
   await runPluginMutation();
 }
 async function uninstallPlugin(plugin: PluginInfo): Promise<void> {
   if (pluginPending.value || plugin.id_matches_directory === false) return;
-  if (!await confirmDialog(plugin.running
-    ? `停止服务并卸载 ${plugin.id}？授予记录和在飞运行会保留。`
-    : `卸载 ${plugin.id}？授予记录和在飞运行会保留。`, { danger: true, confirmText: plugin.running ? "停止并卸载" : "卸载" })) return;
-  pluginPending.value = { kind: "uninstall", pluginId: plugin.directory_name ?? plugin.id, stopFirst: !!plugin.running, requestId: crypto.randomUUID() };
+  if (
+    !(await confirmDialog(
+      plugin.running
+        ? `停止服务并卸载 ${plugin.id}？授予记录和在飞运行会保留。`
+        : `卸载 ${plugin.id}？授予记录和在飞运行会保留。`,
+      { danger: true, confirmText: plugin.running ? "停止并卸载" : "卸载" },
+    ))
+  )
+    return;
+  pluginPending.value = {
+    kind: "uninstall",
+    pluginId: plugin.directory_name ?? plugin.id,
+    stopFirst: !!plugin.running,
+    requestId: crypto.randomUUID(),
+  };
   await runPluginMutation();
 }
 
@@ -438,6 +471,28 @@ async function onDeleteSecret(name: string): Promise<void> {
         <code>{{ rpcUrl() }}</code>
       </div>
       <div class="field">
+        <label for="connection-rpc">RPC 地址</label>
+        <input
+          id="connection-rpc"
+          v-model="connectionRpc"
+          placeholder="ws://127.0.0.1:9802"
+          spellcheck="false"
+        />
+      </div>
+      <div class="field">
+        <label for="connection-http">HTTP 地址</label>
+        <input
+          id="connection-http"
+          v-model="connectionHttp"
+          placeholder="http://127.0.0.1:9803"
+          spellcheck="false"
+        />
+        <div class="help">
+          服务可独立运行；地址保存在当前浏览器，保存后刷新连接。清空地址恢复部署默认值。
+        </div>
+      </div>
+      <div v-if="connectionError" role="alert">{{ connectionError }}</div>
+      <div class="field">
         <label for="connection-token">API token</label>
         <input
           id="connection-token"
@@ -498,11 +553,7 @@ async function onDeleteSecret(name: string): Promise<void> {
           <template v-if="remoteCfg">
             <div class="field">
               <label>WSS 接入地址</label>
-              <input
-                v-model="remoteCfg.wss_addr"
-                placeholder="缺省关闭"
-                spellcheck="false"
-              />
+              <input v-model="remoteCfg.wss_addr" placeholder="缺省关闭" spellcheck="false" />
               <div class="help">
                 代理终止 TLS 场景的附加承载（execution.remote.wss_addr），与下方 agent 凭据成对配置
               </div>
@@ -523,7 +574,12 @@ async function onDeleteSecret(name: string): Promise<void> {
             </div>
             <div class="field">
               <label>data 地址</label>
-              <input class="deprecated" :value="str(remoteCfg.data_addr)" disabled spellcheck="false" />
+              <input
+                class="deprecated"
+                :value="str(remoteCfg.data_addr)"
+                disabled
+                spellcheck="false"
+              />
               <div class="help">已废弃，仅存量兼容（v3 收敛为单条 TLS 连接，值被忽略）</div>
             </div>
           </template>
@@ -535,8 +591,14 @@ async function onDeleteSecret(name: string): Promise<void> {
         <template v-if="s.sect === 'harness'">
           <div class="field">
             <label>base_url</label>
-            <input v-model="harnessAgent.base_url" placeholder="https://api.deepseek.com/v1" spellcheck="false" />
-            <div class="help">与 model 成对配置才启用；都留空 = 关闭内置 agent（http(s)、禁 userinfo/query）</div>
+            <input
+              v-model="harnessAgent.base_url"
+              placeholder="https://api.deepseek.com/v1"
+              spellcheck="false"
+            />
+            <div class="help">
+              与 model 成对配置才启用；都留空 = 关闭内置 agent（http(s)、禁 userinfo/query）
+            </div>
           </div>
           <div class="field">
             <label>model</label>
@@ -553,24 +615,39 @@ async function onDeleteSecret(name: string): Promise<void> {
           </div>
           <div class="field">
             <label>proxy</label>
-            <input v-model="harnessAgent.proxy" placeholder="http://127.0.0.1:7890" spellcheck="false" />
-            <div class="help">LLM 出口代理（http(s)、禁 userinfo/query——代理凭据不进请求/journal）</div>
+            <input
+              v-model="harnessAgent.proxy"
+              placeholder="http://127.0.0.1:7890"
+              spellcheck="false"
+            />
+            <div class="help">
+              LLM 出口代理（http(s)、禁 userinfo/query——代理凭据不进请求/journal）
+            </div>
           </div>
           <div class="field">
             <label>max_turns</label>
-            <input v-model.number="harnessAgent.max_turns" type="number" placeholder="50（1..=200）" />
+            <input
+              v-model.number="harnessAgent.max_turns"
+              type="number"
+              placeholder="50（1..=200）"
+            />
           </div>
           <div class="field">
             <label>max_tool_calls_per_turn</label>
-            <input v-model.number="harnessAgent.max_tool_calls_per_turn" type="number" placeholder="conga 默认（1..=100）" />
+            <input
+              v-model.number="harnessAgent.max_tool_calls_per_turn"
+              type="number"
+              placeholder="conga 默认（1..=100）"
+            />
           </div>
-          <div class="field">
-            <label>max_tokens</label>
-            <input v-model.number="harnessAgent.max_tokens" type="number" placeholder="conga 默认（1..=1,000,000）" />
-          </div>
+          <p class="help">输出长度由模型 API 决定，不发送 max_tokens 限制。</p>
           <div class="field">
             <label>tool_timeout_secs</label>
-            <input v-model.number="harnessAgent.tool_timeout_secs" type="number" placeholder="无引擎级工具超时（取消/超时由 executor 杀进程组）" />
+            <input
+              v-model.number="harnessAgent.tool_timeout_secs"
+              type="number"
+              placeholder="无引擎级工具超时（取消/超时由 executor 杀进程组）"
+            />
           </div>
         </template>
       </section>
@@ -583,16 +660,35 @@ async function onDeleteSecret(name: string): Promise<void> {
       </div>
       <form class="field" @submit.prevent="installPlugin">
         <label for="plugin-source">宿主上的插件目录</label>
-        <input id="plugin-source" v-model="pluginSource" placeholder="/absolute/path/to/plugin" :disabled="!!pluginPending" required />
-        <label><input v-model="pluginReplace" type="checkbox" :disabled="!!pluginPending" /> 替换已有插件</label>
-        <AppButton type="submit" :disabled="!!pluginPending || !pluginSource.trim()">安装插件</AppButton>
+        <input
+          id="plugin-source"
+          v-model="pluginSource"
+          placeholder="/absolute/path/to/plugin"
+          :disabled="!!pluginPending"
+          required
+        />
+        <label
+          ><input v-model="pluginReplace" type="checkbox" :disabled="!!pluginPending" />
+          替换已有插件</label
+        >
+        <AppButton type="submit" :disabled="!!pluginPending || !pluginSource.trim()"
+          >安装插件</AppButton
+        >
       </form>
       <div v-if="pluginMutationError" role="alert" class="empty">{{ pluginMutationError }}</div>
       <div v-if="pluginPending" class="field">
         <code>请求 ID：{{ pluginPending.requestId }}</code>
         <p>响应未确认时，可使用原请求重试。</p>
         <AppButton :disabled="pluginBusy" @click="runPluginMutation">按原参数重试</AppButton>
-        <AppButton variant="ghost" :disabled="pluginBusy" @click="pluginPending = null; pluginMutationError = ''">结束本次操作</AppButton>
+        <AppButton
+          variant="ghost"
+          :disabled="pluginBusy"
+          @click="
+            pluginPending = null;
+            pluginMutationError = '';
+          "
+          >结束本次操作</AppButton
+        >
       </div>
       <div v-if="pluginError" class="empty">插件清单加载失败：{{ pluginError }}</div>
       <div v-else-if="plugins.length === 0" class="empty">
@@ -600,16 +696,48 @@ async function onDeleteSecret(name: string): Promise<void> {
       </div>
       <table v-else class="table">
         <thead>
-          <tr><th>插件</th><th>版本</th><th>节点类型</th><th>状态</th><th>配置项</th><th>操作</th></tr>
+          <tr>
+            <th>插件</th>
+            <th>版本</th>
+            <th>节点类型</th>
+            <th>状态</th>
+            <th>配置项</th>
+            <th>操作</th>
+          </tr>
         </thead>
         <tbody>
           <tr v-for="p in plugins" :key="p.source">
-            <td><code>{{ p.id }}</code></td>
+            <td>
+              <code>{{ p.id }}</code>
+            </td>
             <td>{{ p.version }}</td>
             <td>{{ (p.node_types ?? []).join(", ") }}</td>
-            <td>{{ p.load_state === 'broken' ? '损坏' : p.load_state === 'conflict' ? '冲突' : '已加载' }}{{ p.running ? ' · 运行中' : '' }}<div v-if="p.load_error">{{ p.load_error }}</div><div v-if="p.grant_state">授予：{{ p.grant_state }}</div><div v-if="p.entry_contained === false">入口位于插件目录外</div><div v-if="p.entry_symlink">入口是符号链接</div><div v-if="p.entry_oversize">入口超过 256 MiB</div></td>
+            <td>
+              {{
+                p.load_state === "broken"
+                  ? "损坏"
+                  : p.load_state === "conflict"
+                    ? "冲突"
+                    : "已加载"
+              }}{{ p.running ? " · 运行中" : "" }}
+              <div v-if="p.load_error">{{ p.load_error }}</div>
+              <div v-if="p.grant_state">授予：{{ p.grant_state }}</div>
+              <div v-if="p.entry_contained === false">入口位于插件目录外</div>
+              <div v-if="p.entry_symlink">入口是符号链接</div>
+              <div v-if="p.entry_oversize">入口超过 256 MiB</div>
+            </td>
             <td>{{ (p.config_fields ?? []).map((f) => f.key).join(", ") || "—" }}</td>
-            <td><AppButton variant="ghost" :disabled="!!pluginPending || p.id_matches_directory === false" @click="uninstallPlugin(p)">{{ p.running ? '停止并卸载' : '卸载' }}</AppButton><div v-if="p.id_matches_directory === false">目录名与插件 ID 不一致，请手工处理：{{ p.source }}</div></td>
+            <td>
+              <AppButton
+                variant="ghost"
+                :disabled="!!pluginPending || p.id_matches_directory === false"
+                @click="uninstallPlugin(p)"
+                >{{ p.running ? "停止并卸载" : "卸载" }}</AppButton
+              >
+              <div v-if="p.id_matches_directory === false">
+                目录名与插件 ID 不一致，请手工处理：{{ p.source }}
+              </div>
+            </td>
           </tr>
         </tbody>
       </table>
@@ -617,7 +745,9 @@ async function onDeleteSecret(name: string): Promise<void> {
         {{ pluginViolations.length }} 处已发布定义与当前插件不符（详见运行日志）：
         <ul>
           <li v-for="v in pluginViolations.slice(0, 5)" :key="`${v.workflow_id}:${v.node_id}`">
-            {{ v.workflow_id }} v{{ v.version }} · {{ v.node_id }}（{{ v.node_type }}）：{{ v.reason }}
+            {{ v.workflow_id }} v{{ v.version }} · {{ v.node_id }}（{{ v.node_type }}）：{{
+              v.reason
+            }}
           </li>
         </ul>
       </div>
