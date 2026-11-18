@@ -30,6 +30,7 @@ fn main() {
     // 常量），但任何实现的修改都必须改变 BUILD_ID。
     for dir in [
         "crates/flow-engine/src",
+        "crates/flow-domain/src",
         "crates/flow-plugin-runtime/src",
         "crates/flow-internal-plugins/src",
         "crates/flow-plugin-sdk/src",

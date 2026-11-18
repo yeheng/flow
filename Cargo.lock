@@ -1072,6 +1072,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "flow-domain"
+version = "0.1.0"
+dependencies = [
+ "flow-dto",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "flow-dto"
 version = "0.1.0"
 dependencies = [
@@ -1122,6 +1131,7 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "chrono",
+ "flow-domain",
  "flow-dto",
  "flow-journal",
  "flow-test-support",

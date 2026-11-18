@@ -79,6 +79,11 @@ jobs:
       # 先产出普通二进制：cargo test 不落 target/<triple>/<profile>/flow-*，
       # 而 remote/IPC 集成测试按工作区布局定位真实二进制（flow-test-support
       # 的 workspace_bin）——不先 build 就会 panic "binary not built"。
+      # Separate invocation prevents workspace feature unification hiding core coupling.
+      - name: isolated domain
+        run: cargo test -p flow-domain --locked
+      - name: domain without runtime
+        run: cargo test -p flow-engine --no-default-features --lib --test core_boundary --locked
       - name: build workspace bins
         run: cargo build --workspace --bins --locked --target ${{ matrix.arch.target }}
       # 插件（plugins/）已是根 workspace 成员：--bins 一并产出，

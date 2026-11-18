@@ -8,6 +8,7 @@ default = ["runtime"]
 runtime = ["flow-journal/storage", "dep:reqwest", "dep:aes-gcm"]
 
 [dependencies]
+flow-domain = { path = "../flow-domain" }
 flow-journal = { path = "../flow-journal", default-features = false }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

@@ -21,27 +21,21 @@ pub mod error;
 #[cfg(feature = "runtime")]
 pub mod exec;
 pub mod execution_protocol;
-#[cfg(feature = "runtime")]
-#[cfg(feature = "runtime")]
 pub mod journal_state;
 pub use flow_dto::AgentRunConfig;
 #[cfg(feature = "runtime")]
 pub mod log_types;
-#[cfg(feature = "runtime")]
-pub mod model;
+pub use flow_domain::model;
 #[cfg(feature = "runtime")]
 pub mod nodelog;
 #[cfg(feature = "runtime")]
 pub mod observation;
 pub mod process;
-#[cfg(feature = "runtime")]
-pub mod schema;
-#[cfg(feature = "runtime")]
+pub use flow_domain::schema;
 pub mod environments;
 pub mod secrets;
 #[cfg(feature = "runtime")]
 pub mod secrets_store;
-#[cfg(feature = "runtime")]
 pub mod template;
 /// 子工作流嵌套的硬上限。子流程调用是「run 套 run」的递归结构，
 /// 没有上限时一个自引用的定义能把执行器拖进无界递归（栈溢出或
@@ -62,7 +56,6 @@ pub const BUILD_ID: &str = env!("FLOW_BUILD_ID");
 pub use error::EngineError;
 #[cfg(feature = "runtime")]
 pub use log_types::{LogLevel, LogStream};
-#[cfg(feature = "runtime")]
 pub use model::{Definition, Edge, Node, NodeType, Position, RetryPolicy, HTTP_METHODS};
 #[cfg(feature = "runtime")]
 pub use nodelog::{budget_from_env, redact_url, redact_value, LogBudget, LogLine, NodeLogger};

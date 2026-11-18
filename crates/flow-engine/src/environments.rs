@@ -1,7 +1,9 @@
 //! Versioned environment bundles. Credentials are persisted only through the encrypted store.
+#[cfg(feature = "runtime")]
 use crate::{secrets::SecretSource, secrets_store::SecretFileStore};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(feature = "runtime")]
 use std::{collections::BTreeMap, path::Path, sync::Mutex};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -10,20 +12,24 @@ pub struct EnvironmentBinding {
     pub revision: u64,
     pub config: Value,
 }
+#[cfg(feature = "runtime")]
 #[derive(Clone, Serialize, Deserialize)]
 struct Revision {
     name: String,
     config: Value,
     secrets: BTreeMap<String, String>,
 }
+#[cfg(feature = "runtime")]
 #[derive(Default, Clone, Serialize, Deserialize)]
 struct Data {
     environments: BTreeMap<String, Vec<Revision>>,
 }
+#[cfg(feature = "runtime")]
 pub struct EnvironmentStore {
     encrypted: SecretFileStore,
     data: Mutex<Data>,
 }
+#[cfg(feature = "runtime")]
 impl EnvironmentStore {
     pub fn open(path: &Path) -> Result<Self, String> {
         let encrypted = SecretFileStore::open(path)?;
@@ -156,7 +162,7 @@ impl EnvironmentStore {
             .ok_or_else(|| "environment revision missing".into())
     }
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "runtime"))]
 mod tests {
     use super::*;
     #[test]

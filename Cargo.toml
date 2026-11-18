@@ -9,6 +9,7 @@ members = [
     "crates/flow-journal",
     # 内置节点实现库（T4）：Script/Condition 求值器等静态实现
     "crates/flow-internal-plugins",
+    "crates/flow-domain",
     "crates/flow-engine",
     "crates/flow-backend",
     "crates/flow-dto",
