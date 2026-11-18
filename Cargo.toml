@@ -4,13 +4,16 @@ members = [
     # 插件 SDK：protocol（wire 契约）+ ipc（传输）单向分层（T7 合并
     # 原 proc-ipc/plugin-proto；跨语言契约本体仍是 wire.md + vectors）
     "crates/flow-plugin-sdk",
+    "crates/flow-plugin-catalog",
     "crates/flow-agent",
     "crates/flow-plugin-runtime",
     "crates/flow-journal",
     # 内置节点实现库（T4）：Script/Condition 求值器等静态实现
     "crates/flow-internal-plugins",
     "crates/flow-domain",
+    "crates/flow-facts",
     "crates/flow-engine",
+    "crates/flow-dispatcher",
     "crates/flow-backend",
     "crates/flow-dto",
     "crates/flow-config",

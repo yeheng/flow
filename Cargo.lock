@@ -1010,9 +1010,11 @@ dependencies = [
  "clap",
  "cron-parser",
  "flow-config",
+ "flow-dispatcher",
  "flow-dto",
  "flow-engine",
  "flow-journal",
+ "flow-plugin-catalog",
  "flow-plugin-sdk",
  "flow-test-support",
  "fs2",
@@ -1072,10 +1074,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "flow-dispatcher"
+version = "0.1.0"
+dependencies = [
+ "flow-facts",
+ "futures",
+ "getrandom 0.4.3",
+ "hex",
+ "interprocess",
+ "libc",
+ "parking_lot 0.12.5",
+ "postcard",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "flow-domain"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "flow-dto",
+ "flow-facts",
  "serde",
  "serde_json",
 ]
@@ -1131,28 +1159,33 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "chrono",
+ "flow-dispatcher",
  "flow-domain",
  "flow-dto",
  "flow-journal",
  "flow-test-support",
- "futures",
- "getrandom 0.4.3",
  "hex",
- "interprocess",
- "libc",
- "parking_lot 0.12.5",
- "postcard",
  "reqwest",
  "serde",
  "serde_json",
  "sha2 0.11.1",
  "thiserror 2.0.21",
  "tokio",
- "tokio-tungstenite",
  "tokio-util",
  "tracing",
  "uuid",
- "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "flow-facts"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1184,12 +1217,16 @@ name = "flow-internal-plugins"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "flow-dispatcher",
  "flow-dto",
  "flow-engine",
+ "flow-facts",
  "flow-journal",
  "rquickjs",
+ "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
  "uuid",
 ]
 
@@ -1200,6 +1237,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "clap",
+ "flow-facts",
  "flow-test-support",
  "fs2",
  "hex",
@@ -1254,6 +1292,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "flow-plugin-catalog"
+version = "0.1.0"
+dependencies = [
+ "flow-config",
+ "flow-domain",
+ "flow-plugin-sdk",
+ "hex",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+]
+
+[[package]]
 name = "flow-plugin-runtime"
 version = "0.1.0"
 dependencies = [
@@ -1264,6 +1315,7 @@ dependencies = [
  "flow-harness-protocol",
  "flow-internal-plugins",
  "flow-journal",
+ "flow-plugin-catalog",
  "flow-plugin-sdk",
  "futures",
  "hex",

@@ -15,14 +15,14 @@ use serde_json::{json, Value};
 
 /// 构造一条「输入非法」错误。
 ///
-/// 片段类错误统一走 `flow_journal::Error::Invalid`：它属于**请求形状不对**
+/// 片段类错误统一走 `flow_facts::Error::Invalid`：它属于**请求形状不对**
 /// （4xx 类），而不是执行失败，两者在 RPC 层的回执语义不同。
-fn invalid(message: impl Into<String>) -> flow_journal::Error {
-    flow_journal::Error::Invalid(message.into())
+fn invalid(message: impl Into<String>) -> flow_facts::Error {
+    flow_facts::Error::Invalid(message.into())
 }
 
 /// Validate a merged template document and normalize its fragment for persistence.
-pub fn normalize(value: &mut Value) -> flow_journal::Result<()> {
+pub fn normalize(value: &mut Value) -> flow_facts::Result<()> {
     validate_name(
         value["name"]
             .as_str()
@@ -46,7 +46,7 @@ pub fn normalize(value: &mut Value) -> flow_journal::Result<()> {
 /// 上限 100 是展示位约束（模板名进列表标题）；原始长度另设 1024 的
 /// 上限挡「填充 100 个空格 + 内容」这类绕过——只看去空白后的长度
 /// 会让实际存储的字节数无界。
-pub fn validate_name(name: &str) -> Result<(), flow_journal::Error> {
+pub fn validate_name(name: &str) -> Result<(), flow_facts::Error> {
     let trimmed = name.trim();
     if trimmed.is_empty() || trimmed.len() > 100 || name.len() > 1024 {
         return Err(invalid("模板名须为 1..=100 个字符"));
@@ -64,7 +64,7 @@ pub fn validate_name(name: &str) -> Result<(), flow_journal::Error> {
 pub fn normalize_fragment(
     nodes: &Value,
     edges: &Value,
-) -> Result<(Value, Value), flow_journal::Error> {
+) -> Result<(Value, Value), flow_facts::Error> {
     let nodes_arr = nodes
         .as_array()
         .ok_or_else(|| invalid("nodes 必须是数组"))?;

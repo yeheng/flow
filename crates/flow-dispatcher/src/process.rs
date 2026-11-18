@@ -339,8 +339,8 @@ impl ProcessTree {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use flow_test_support::io::TempDir;
     use std::{process::Stdio, time::Duration};
+    use tempfile::TempDir;
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     /// 等待子进程打出就绪标记：早于它启动后台子进程，测试才有意义。
@@ -362,8 +362,8 @@ mod tests {
     #[tokio::test]
     async fn killing_or_dropping_harness_stops_its_descendants() {
         for drop_only in [false, true] {
-            let dir = TempDir::new("harness-tree");
-            let marker = dir.join("escaped");
+            let dir = TempDir::new().unwrap();
+            let marker = dir.path().join("escaped");
             let script = format!(
                 "(sleep 0.5; touch '{}') & printf 'tree-ready\\n'; wait",
                 marker.display()
@@ -408,8 +408,8 @@ mod tests {
     /// 执行器被 SIGKILL（Drop 不跑）时，父进程仍要靠 session 扫描收掉后代。
     #[tokio::test]
     async fn reaping_a_dead_executor_stops_other_groups_in_its_session() {
-        let dir = TempDir::new("executor-session");
-        let marker = dir.join("escaped");
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("escaped");
         let mut child = ManagedChild::spawn_executor(
             Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "process::tests::session_fixture", "--nocapture"])

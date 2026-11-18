@@ -15,30 +15,8 @@ use flow_config::plugin_manifest::ParamsFormDecl;
 use flow_config::plugin_manifest::{parse, FieldDecl, PluginManifest, Widget};
 use serde_json::{json, Value};
 
-/// 可路由的发现结果；损坏和冲突行保留在 plugin_scan 的扫描快照中。
-#[derive(Debug, Clone)]
-pub struct DiscoveredPlugin {
-    pub manifest: PluginManifest,
-    /// 发现来源目录（诊断）。
-    pub source: std::path::PathBuf,
-    /// 内容身份（I35）：sha256(manifest 字节 ‖ entry 字节)。插件身份键从
-    /// (id, version) 升级为 (id, content_hash)——升级/换二进制必须重新授予。
-    pub content_hash: String,
-}
-
-/// 计算插件内容哈希：manifest 原文字节 + 入口二进制字节（不可读 = 拒绝，
-/// 由调用方处置）。
-pub fn content_hash(manifest_bytes: &[u8], entry_bytes: &[u8]) -> String {
-    use sha2::Digest as _;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(manifest_bytes);
-    hasher.update(entry_bytes);
-    hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
+use flow_plugin_catalog::{content_hash_path, default_routes, BUNDLED_ROUTES};
+pub use flow_plugin_catalog::{content_hash, DiscoveredPlugin};
 
 /// 扫描 plugins 目录（FLOW_PLUGINS_DIR → <flow_home>/plugins）。
 ///
@@ -58,33 +36,6 @@ impl crate::journal::JournalBackend {
         installed_snapshot_with_defaults(&self.plugin_defaults())
     }
 }
-fn default_routes(
-    program: Option<&std::path::Path>,
-    environment: impl Fn(&str) -> Option<std::ffi::OsString>,
-) -> BTreeMap<String, String> {
-    let mut defaults = BTreeMap::new();
-    let Some(program) = program else {
-        return defaults;
-    };
-    for (node, id, variable, sibling) in [
-        (
-            "harness",
-            "harness-agent",
-            "FLOW_AGENT_PLUGIN_BIN",
-            "flow-agent-plugin",
-        ),
-        ("llm", "llm", "FLOW_LLM_PLUGIN_BIN", "flow-llm-plugin"),
-    ] {
-        let binary = environment(variable)
-            .map(std::path::PathBuf::from)
-            .or_else(|| program.parent().map(|dir| dir.join(sibling)));
-        if binary.is_some_and(|path| path.is_file()) {
-            defaults.insert(node.into(), id.into());
-        }
-    }
-    defaults
-}
-
 pub fn installed_snapshot() -> crate::plugin_scan::PluginSnapshot {
     installed_snapshot_with_defaults(&BTreeMap::new())
 }
@@ -448,11 +399,8 @@ pub fn bundled_or_discovered_by_type(node_type: &str) -> Option<String> {
     }) {
         return Some(found.manifest.plugin.id);
     }
-    match node_type {
-        "llm" => Some("llm".into()),
-        "harness" => Some("harness-agent".into()),
-        _ => None,
-    }
+    BUNDLED_ROUTES.iter().find(|route| route.node_type == node_type)
+        .map(|route| route.plugin_id.to_owned())
 }
 
 /// 按插件 id 取授予身份：部署目录优先（发现结果带内容哈希）；内置副本
@@ -487,19 +435,8 @@ pub fn bundled_or_discovered_with_plugins(
         });
     }
     // 内置兜底：嵌入 manifest 文本 + 入口二进制（env 或同目录兄弟文件）。
-    let (manifest_text, entry_env, sibling) = match plugin_id {
-        "harness-agent" => (
-            include_str!("../../../plugins/harness/plugin/plugin.toml"),
-            "FLOW_AGENT_PLUGIN_BIN",
-            "flow-agent-plugin",
-        ),
-        "llm" => (
-            include_str!("../../../plugins/llm/plugin/plugin.toml"),
-            "FLOW_LLM_PLUGIN_BIN",
-            "flow-llm-plugin",
-        ),
-        _ => return None,
-    };
+    let route = BUNDLED_ROUTES.iter().find(|route| route.plugin_id == plugin_id)?;
+    let manifest_text = route.manifest;
     let manifest = match parse(manifest_text) {
         Ok(manifest) => manifest,
         Err(error) => {
@@ -509,19 +446,18 @@ pub fn bundled_or_discovered_with_plugins(
     };
     // 入口定位：env → current_exe 同目录 → 上溯两级（cargo test 的测试
     // 二进制在 target/debug/deps 下，兄弟二进制在 target/debug）。
-    let entry = std::env::var_os(entry_env)
+    let entry = std::env::var_os(route.binary_env)
         .map(std::path::PathBuf::from)
         .or_else(|| {
             std::env::current_exe().ok().and_then(|exe| {
-                let name = std::path::Path::new(sibling);
+                let name = std::path::Path::new(route.sibling);
                 std::iter::successors(exe.parent(), |parent| parent.parent())
                     .take(3)
                     .map(|dir| dir.join(name))
                     .find(|candidate| candidate.is_file())
             })
         });
-    let entry_bytes = entry.and_then(|path| std::fs::read(path).ok())?;
-    let content_hash = content_hash(manifest_text.as_bytes(), &entry_bytes);
+    let content_hash = content_hash_path(manifest_text.as_bytes(), &entry?).ok()?;
     let legacy = matches!(
         manifest.permissions,
         flow_config::plugin_manifest::ManifestPermissions::Legacy

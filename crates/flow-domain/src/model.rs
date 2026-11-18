@@ -807,9 +807,8 @@ impl Definition {
     ///
     /// # Errors
     /// 返回第一条违反的规则的错误文本，供 RPC 直接回给用户。
-    /// 动态节点类型（插件声明）的逃生口：集合内的类型名跳过枚举匹配与
-    /// `validate_params`（参数由宿主按 manifest schema 校验——引擎不读
-    /// 文件系统），图结构规则照常适用。
+    /// Admit externally declared node types while retaining built-in rules.
+    /// The host validates extension parameters against their declared schema.
     pub fn validate_with_dynamic(
         &self,
         dynamic_types: &std::collections::BTreeSet<String>,
@@ -827,7 +826,9 @@ impl Definition {
         &self,
         dynamic_types: Option<&std::collections::BTreeSet<String>>,
     ) -> Result<(), String> {
-        let is_dynamic = |name: &str| dynamic_types.is_some_and(|set| set.contains(name));
+        let is_dynamic = |name: &str| {
+            dynamic_types.is_some_and(|set| set.contains(name)) && NodeType::parse(name).is_none()
+        };
         // 输入/输出 schema 先过受限子集检查：越界的 schema 必须在
         // 保存期被拒，不能等到建 run 时才失败。
         for schema in [&self.input_schema, &self.output_schema]
@@ -874,10 +875,7 @@ impl Definition {
             if !seen.insert(node.id.as_str()) {
                 return Err(format!("节点 id 重复：{}", node.id));
             }
-            if is_dynamic(&node.node_type) {
-                // 插件声明类型：跳过枚举与 typed 参数规则（宿主按 manifest
-                // schema 校验，见 backend plugin_registry）。仍参与全部图结构规则。
-            } else {
+            if !is_dynamic(&node.node_type) {
                 let kind = node
                     .kind()
                     .ok_or_else(|| format!("节点 {} 的类型未知：{}", node.id, node.node_type))?;
@@ -983,11 +981,8 @@ impl Definition {
         for node in &self.nodes {
             if is_dynamic(&node.node_type) {
                 // 动态类型：缺省单入单出，按普通节点做可达性检查。
-                if node.kind() != Some(NodeType::Start) && self.incoming_count(&node.id) == 0 {
+                if self.incoming_count(&node.id) == 0 {
                     return Err(format!("节点 {} 没有入边（永远无法触发）", node.id));
-                }
-                if node.kind() == Some(NodeType::End) && self.outgoing_count(&node.id) > 0 {
-                    return Err(format!("end 节点 {} 不能有出边", node.id));
                 }
                 continue;
             }

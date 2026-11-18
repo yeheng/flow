@@ -693,6 +693,27 @@ pub async fn master_handshake(
     session_id: &str,
     expected_session_token: Option<&str>,
 ) -> Result<ExecutorHello, ProtocolError> {
+    master_handshake_with_capabilities(
+        transport,
+        journal_id,
+        master_epoch,
+        executor_id,
+        session_id,
+        expected_session_token,
+        REQUIRED_CAPABILITIES.iter().copied(),
+    )
+    .await
+}
+
+pub(crate) async fn master_handshake_with_capabilities<'a>(
+    transport: &mut FrameTransport,
+    journal_id: &str,
+    master_epoch: u64,
+    executor_id: &str,
+    session_id: &str,
+    expected_session_token: Option<&str>,
+    required_capabilities: impl IntoIterator<Item = &'a str>,
+) -> Result<ExecutorHello, ProtocolError> {
     // 第一帧必须是 Hello：把「首帧不是 Hello」判为格式错误，而不是
     // 把它当成可跳过的噪声帧。
     let message = tokio::time::timeout(
@@ -726,7 +747,7 @@ pub async fn master_handshake(
     validate_session_token(session_token.as_deref(), expected_session_token)?;
     // 必需能力逐项检查：缺能力即拒绝，不做「能跑多少跑多少」的降级
     // 执行——降级会让失败发生在派发中途，而不是握手时。
-    for capability in REQUIRED_CAPABILITIES {
+    for capability in required_capabilities {
         if !capabilities.iter().any(|c| c == capability) {
             return Err(ProtocolError::Malformed(format!(
                 "executor missing required capability: {capability}"

@@ -15,6 +15,9 @@ publish = false
 # - JS 求值器（rquickjs）随实现迁入：engine 的 runtime feature 不再背它。
 
 [dependencies]
+serde.workspace = true
+flow-dispatcher = { path = "../flow-dispatcher" }
+flow-facts = { path = "../flow-facts" }
 # 共享契约（模型/日志/错误）在 runtime feature 面；rquickjs 已随实现迁入本包
 flow-engine = { path = "../flow-engine" }
 serde_json = { workspace = true }
@@ -24,3 +27,6 @@ rquickjs = { workspace = true }
 tokio = { workspace = true, features = ["process"] }
 chrono = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+tokio-util.workspace = true

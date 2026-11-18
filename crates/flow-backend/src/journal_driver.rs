@@ -66,8 +66,7 @@ impl Coordinator {
     ///
     /// 审批挂起（09 §6.1）的派发已交还执行槽位（本地池 park），按挂起计数
     /// 扣除：几个夜间待审批不能占满 X_max。挂起本身受 A_MAX 约束（池侧）。
-    fn has_capacity(&self, node: &flow_engine::Node) -> bool {
-        let parked = crate::journal::PARKED_DISPATCHES.load(std::sync::atomic::Ordering::Relaxed);
+    fn has_capacity(&self, node: &flow_engine::Node, parked: usize) -> bool {
         let busy = self.tasks.len().saturating_sub(parked);
         busy < self.limit
             && (!node.is_harness_agent() || self.agents.len() < self.limit.div_ceil(2))
@@ -495,11 +494,17 @@ async fn advance_run(
             }
             NodeGate::Blocked => {}
             NodeGate::Ready(predecessors) => {
-                if !coord.has_capacity(node) {
+                let parked = match port {
+                    ExecutionPort::Ipc(dispatcher) => dispatcher.parked_count(),
+                    ExecutionPort::Remote(_) => 0,
+                };
+                if !coord.has_capacity(node, parked) {
                     // 槽位不足：本轮不派发，把 run 退回 dirty 集等下一轮。
                     backend.defer_run(run_id.to_owned()).await;
                     continue;
                 }
+                #[cfg(feature = "fault-injection")]
+                crate::execution::dispatch::fault::checkpoint_for("dispatch:before", &node.id).await;
                 spawn_node_attempt(
                     backend,
                     port,

@@ -1,0 +1,16 @@
+[package]
+name = "flow-plugin-catalog"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+flow-config = { path = "../flow-config" }
+flow-domain = { path = "../flow-domain" }
+flow-plugin-sdk = { path = "../flow-plugin-sdk" }
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

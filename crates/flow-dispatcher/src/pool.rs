@@ -21,15 +21,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use flow_engine::process::ManagedChild as Child;
+use crate::process::ManagedChild as Child;
 use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
-use flow_engine::execution_protocol::contract::{
+use crate::execution_protocol::contract::{
     DRAIN_GRACE_MS, HEARTBEAT_TIMEOUT_MS, STARTUP_TIMEOUT_MS,
 };
-use flow_engine::execution_protocol::message::Message;
-use flow_engine::execution_protocol::transport::{master_handshake, FrameTransport, SendBacklog};
+use crate::execution_protocol::message::Message;
+use crate::execution_protocol::transport::{
+    master_handshake_with_capabilities, FrameTransport, SendBacklog,
+};
 
 use super::{FromSession, IpcOptions, ToSession};
 
@@ -64,6 +66,8 @@ pub struct RawSession {
     pub executor_id: String,
     /// 执行器本次启动标识（由握手取得）：用于把审计归属到具体进程实例。
     pub boot_id: String,
+    /// Capabilities advertised by this process during handshake.
+    capabilities: Vec<String>,
     /// 会话标识（`session-N`）。
     pub session_id: String,
     /// 子进程 PID（便于诊断与外部排障）。
@@ -85,6 +89,8 @@ pub struct SessionLease {
     pub executor_id: String,
     /// 执行器本次启动标识。
     pub boot_id: String,
+    /// Capabilities advertised by this process during handshake.
+    capabilities: Vec<String>,
     /// 会话标识。
     pub session_id: String,
     /// 子进程 PID。
@@ -94,6 +100,13 @@ pub struct SessionLease {
     /// X_max 槽位份额：持有租约期间占用一个执行槽。审批挂起（09 §6.1）期间
     /// 交还份额（None），会话进程保留但不计槽；恢复前重新取得。
     permit: Option<OwnedSemaphorePermit>,
+    parked: Option<OwnedSemaphorePermit>,
+}
+
+impl SessionLease {
+    pub fn supports(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|item| item == capability)
+    }
 }
 
 /// 执行器进程池。
@@ -110,6 +123,8 @@ pub struct ExecutorPool {
     master_epoch: u64,
     /// 执行槽位信号量（X_max 份额）。
     slots: Arc<Semaphore>,
+    parked: Arc<Semaphore>,
+    required_capabilities: Vec<String>,
     /// 已握手但当前空闲的会话（栈顶优先复用）。
     idle: Arc<Mutex<Vec<RawSession>>>,
     /// 执行器编号计数器。
@@ -129,12 +144,31 @@ impl ExecutorPool {
     /// 过大会让并发进程数突破内存预算——两个方向的错误都比配置错误更难
     /// 排查，因此在这里就夹住。
     pub fn new(options: IpcOptions, journal_id: String, master_epoch: u64) -> Arc<Self> {
+        Self::with_capabilities(
+            options,
+            journal_id,
+            master_epoch,
+            crate::execution_protocol::REQUIRED_CAPABILITIES
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        )
+    }
+
+    pub(crate) fn with_capabilities(
+        options: IpcOptions,
+        journal_id: String,
+        master_epoch: u64,
+        required_capabilities: Vec<String>,
+    ) -> Arc<Self> {
         let x_max = options.x_max.clamp(1, 16);
         Arc::new(Self {
             options,
             journal_id,
             master_epoch,
             slots: Arc::new(Semaphore::new(x_max)),
+            parked: Arc::new(Semaphore::new(crate::execution_protocol::A_MAX)),
+            required_capabilities,
             idle: Arc::new(Mutex::new(Vec::new())),
             executor_counter: AtomicU64::new(0),
             session_counter: AtomicU64::new(0),
@@ -203,10 +237,12 @@ impl ExecutorPool {
                     events: session.events,
                     executor_id: session.executor_id,
                     boot_id: session.boot_id,
+                    capabilities: session.capabilities,
                     session_id: session.session_id,
                     child_pid: session.child_pid,
                     lifecycle: session.cancel.drop_guard(),
                     permit: Some(permit),
+                    parked: None,
                 });
             }
             let session = self.spawn_session().await?;
@@ -215,27 +251,32 @@ impl ExecutorPool {
                 events: session.events,
                 executor_id: session.executor_id,
                 boot_id: session.boot_id,
+                capabilities: session.capabilities,
                 session_id: session.session_id,
                 child_pid: session.child_pid,
                 lifecycle: session.cancel.drop_guard(),
                 permit: Some(permit),
+                parked: None,
             });
         }
+    }
+
+    pub fn parked_count(&self) -> usize {
+        crate::execution_protocol::A_MAX - self.parked.available_permits()
     }
 
     /// 审批挂起：交还租约的 X_max 份额（会话进程保留、绑定原派发，不进
     /// 空闲栈）。挂起总数受 [`A_MAX`] 约束，超限时保持占槽（降级而非失败）。
     ///
     /// 返回 true 表示确实交还了份额（调用方随后必须 [`Self::unpark`]）。
-    pub(crate) fn park(&self, lease: &mut SessionLease) -> bool {
+    pub fn park(&self, lease: &mut SessionLease) -> bool {
         if lease.permit.is_none() {
             return false;
         }
-        let parked = crate::journal::PARKED_DISPATCHES.fetch_add(1, Ordering::AcqRel);
-        if parked >= flow_engine::execution_protocol::A_MAX {
-            crate::journal::PARKED_DISPATCHES.fetch_sub(1, Ordering::AcqRel);
+        let Ok(parked) = self.parked.clone().try_acquire_owned() else {
             return false;
-        }
+        };
+        lease.parked = Some(parked);
         drop(lease.permit.take());
         true
     }
@@ -244,11 +285,10 @@ impl ExecutorPool {
     ///
     /// # Errors
     /// 池已关停时返回 [`PoolError::Unavailable`]。
-    pub(crate) async fn unpark(&self, lease: &mut SessionLease) -> Result<(), PoolError> {
+    pub async fn unpark(&self, lease: &mut SessionLease) -> Result<(), PoolError> {
         if lease.permit.is_some() {
             return Ok(());
         }
-        crate::journal::PARKED_DISPATCHES.fetch_sub(1, Ordering::AcqRel);
         let permit = tokio::select! {
             permit = self.slots.clone().acquire_owned() => {
                 permit.map_err(|_| PoolError::Unavailable("pool closed".into()))?
@@ -258,6 +298,7 @@ impl ExecutorPool {
             }
         };
         lease.permit = Some(permit);
+        drop(lease.parked.take());
         Ok(())
     }
 
@@ -272,22 +313,21 @@ impl ExecutorPool {
             events,
             executor_id,
             boot_id,
+            capabilities,
             session_id,
             child_pid,
             lifecycle,
             permit,
+            parked,
         } = lease;
-        // 挂起中结束（错误路径）：挂起计数随租约一起归还。
-        if permit.is_none() {
-            crate::journal::PARKED_DISPATCHES.fetch_sub(1, Ordering::AcqRel);
-        }
-        drop(permit);
+        drop(parked);
         if healthy && !self.shutdown.is_cancelled() {
             self.idle.lock().await.push(RawSession {
                 to_session,
                 events,
                 executor_id,
                 boot_id,
+                capabilities,
                 session_id,
                 child_pid,
                 cancel: lifecycle.disarm(),
@@ -300,6 +340,7 @@ impl ExecutorPool {
             // 命令队列可能已满（对端停读），发命令会一直等。
             drop(lifecycle);
         }
+        drop(permit);
     }
 
     /// 启动一个新的执行器进程并完成握手，返回未占槽位的裸会话。
@@ -337,7 +378,7 @@ async fn spawn_and_handshake(
     shutdown: CancellationToken,
 ) -> Result<RawSession, PoolError> {
     let (mut transport, mut child, session_token) =
-        flow_engine::execution_protocol::bootstrap::spawn_executor_transport(
+        crate::execution_protocol::bootstrap::spawn_executor_transport(
             &pool.options.executor,
             pool.options.tag.as_deref(),
             &[],
@@ -351,7 +392,7 @@ async fn spawn_and_handshake(
     // 超时同样按失败处理，不重试——反复 spawn 只会放大启动风暴。
     let handshake = tokio::select! {
         result=tokio::time::timeout(Duration::from_millis(STARTUP_TIMEOUT_MS * 2),
-            master_handshake(&mut transport,&pool.journal_id,pool.master_epoch,executor_id,session_id,session_token.as_deref())) =>
+            master_handshake_with_capabilities(&mut transport,&pool.journal_id,pool.master_epoch,executor_id,session_id,session_token.as_deref(),pool.required_capabilities.iter().map(String::as_str))) =>
             match result { Ok(Ok(hello))=>Ok(hello), Ok(Err(e))=>Err(e.to_string()), Err(_)=>Err("handshake timeout".into()) },
         _=shutdown.cancelled()=>Err("pool closed during handshake".into()),
     };
@@ -386,6 +427,7 @@ async fn spawn_and_handshake(
         events,
         executor_id: executor_id.to_string(),
         boot_id,
+        capabilities: hello.capabilities,
         session_id: session_id.to_string(),
         child_pid,
         cancel: shutdown,
@@ -529,9 +571,7 @@ mod lifecycle_tests {
     #[tokio::test]
     async fn unhealthy_release_and_abandoned_lease_do_not_wait_for_command_capacity() {
         let options = IpcOptions {
-            executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
-                "unused",
-            ),
+            executor: crate::execution_protocol::contract::ExecutorInvocation::explicit("unused"),
             x_max: 1,
             tag: None,
         };
@@ -546,10 +586,12 @@ mod lifecycle_tests {
                 events,
                 executor_id: "e".into(),
                 boot_id: "b".into(),
+                capabilities: Vec::new(),
                 session_id: "s".into(),
                 child_pid: None,
                 lifecycle: cancel.clone().drop_guard(),
                 permit: Some(pool.slots.clone().acquire_owned().await.unwrap()),
+                parked: None,
             };
             if abandon {
                 drop(lease)

@@ -29,12 +29,15 @@ crates/
   flow-config     统一配置（flow.toml，叶子 crate）：分层加载 + validate + 原子写回
   flow-journal    SQLite 写入 owner、事实分页、codec 预算、BLOB 值存储、离线维护;
                   query feature 承接同库只读执行与产品查询(原 flow-store 并入)
-  flow-engine     执行引擎共享能力：定义模型与校验、JS 沙箱、表达式/模板、
-                  journal_state（run 状态折叠）、观测日志、密钥、执行协议（v7 postcard 单流）
+  flow-facts      事件、事务、值描述符及有界编码契约
+  flow-domain     工作流定义、图规则、schema 校验与确定性状态折叠
+  flow-dispatcher  IPC 协议、进程池与通用任务派发（v8 postcard 单流）
+  flow-engine     工作流运行共享设施：观测日志、密钥，并重导出领域规则与 IPC 契约
   flow-backend    journal 唯一权威后端：journal.rs（JournalBackend）+ journal_commands
                   （产品 CRUD，request_id 幂等）+ journal_views（物化读面）+
                   journal_driver（协调循环）+ journal_execution（Attempt 簿记）+
-                  journal_import（legacy 只读保全）+ execution/（ipc 池 / remote 派发）
+                  journal_import（legacy 只读保全）+ execution/（工作流派发适配与远程中继）
+  flow-plugin-catalog  后端与 Worker 共用的 manifest 发现、诊断、节点归属与内容身份
   flow-plugin-sdk 插件 SDK：protocol（wire 契约）+ ipc（传输）单向分层;
                   跨语言契约本体是 docs/protocol/wire.md + vectors
   flow-plugin-runtime  受管理执行子进程（bin: flow-executor）：节点语义的唯一居所;
@@ -73,13 +76,16 @@ plugins/harness/  harness agent 运行时（protocol / agent-core / agent-host /
 依赖方向（与 Cargo.toml 对齐的现状）：
 
 ```
-flow-rpc ──> flow-backend ──> flow-engine ──> flow-dto
+flow-rpc ──> flow-backend ──> flow-engine ──> flow-domain / flow-dto / flow-dispatcher
            ├─> flow-journal  （storage+query：v2 值分页/下载与同库只读查询）
            └─> flow-config
-flow-backend ──> flow-journal / flow-engine / flow-dto / flow-config
-flow-engine ──> flow-dto
-             └─> flow-journal（只共享 StoredValue/ValueRef 词汇与 codec 预算）
-flow-journal ──> 无 flow 依赖（叶子）
+flow-backend ──> flow-dispatcher / flow-journal / flow-engine / flow-dto / flow-config
+flow-engine ──> flow-domain / flow-dto / flow-dispatcher
+             └─> flow-journal（runtime 下的观测写入）
+flow-dispatcher ──> flow-facts
+flow-domain ──> flow-facts / flow-dto
+flow-journal ──> flow-facts
+flow-facts ──> 无 flow 依赖（叶子）
 flow-dto ──> 无依赖（叶子）
 flow-plugin-runtime ──> flow-plugin-sdk / flow-engine / flow-journal / flow-config
                        / flow-internal-plugins / plugins/harness/protocol
@@ -89,6 +95,43 @@ flow-cli ──> flow-dto（自带 jsonrpsee/reqwest WS 客户端，运行期连
 flow-cli ──✗> flow-journal  ✗（CLI 不碰存储与事件日志，没有第二条写入路径）
 flow-e2e-remote ──> flow-agent   （flow-agent 只被 remote-e2e 套件依赖；backend 不依赖它）
 ```
+
+本地派发基础设施在 `flow-dispatcher` 中，包含进程池、IPC 帧、会话握手与
+进程回收。Dispatcher 与领域状态折叠均通过 `flow-facts` 共享事件和值契约。
+SQLite 和磁盘读写由 `flow-journal` 提供。工作流
+仍由 `flow-backend` 解释节点和持久化结果。`execution::workflow_task` 将已提交的
+节点尝试和执行快照装配为工作流载荷，再走共用的进程池、发送及完成确认入口。
+工作流现有 `Execute` 与 v8 帧索引保留，旧执行器和远程中继沿用这条路径。
+
+独立任务只携带 `id`、带版本的 `handler` 和有界字节输入。Worker 握手广告
+`job:<handler>` 后才会收到 `ExecuteJob`。`Accepted` 确认接收，`JobFinished`
+上报结果，调用方完成持久提交后由 Dispatcher 发送 `ResultCommitted`。
+调用方负责提交和重试，现阶段独立任务没有内置持久待办队列。工作流的审批、
+副作用授权和结果屏障仍由原路径处理。
+
+裸运行可执行 `cargo build -p flow-dispatcher --bins`，再运行
+`flow-dispatcher WORKER RECEIPT_DIR TEXT [TEXT ...]`。`WORKER` 指向构建出的
+`flow-worker`，`RECEIPT_DIR` 为已存在的目录。此入口最多使用两个进程，
+将 `echo.v1` 结果写为单独的 JSON 回执。CI 单独运行 `cargo test -p flow-dispatcher`。
+
+`script.v1` 的独立 Worker 可用 `cargo build -p flow-internal-plugins --bin flow-script-worker`
+构建。用 `flow-dispatcher --handler script.v1 WORKER RECEIPT_DIR INPUT` 提交一条
+已准备的 JSON 输入，例如 `'{"code":"return input.x * 2;","input":{"x":21},"nodes":{}}'`。
+此入口要求 `job-transfer-v1` 能力，使用 `TransferChunk` 和 `InputReady` 传输输入与
+输出，每一侧最多 8 MiB，并完整校验顺序、长度和摘要后才确认结果。
+
+本地工作流 Script 可协商 `prepared-job-v1`。先通过 `PrepareJob` 装配输入，并提交或
+复用 `InputPrepared`。Worker 报告 `JobPrepared` 后，Dispatcher 收到权威状态确认才发
+通用 `ExecuteJob`。该命令用节点执行 ID 引用同一会话里已经装配的冻结值，不重复传输。
+Worker 构造同一个 `ScriptTask`。完成后，沿用工作流审计流和 `ResultCommitted` 屏障。
+本地 Condition 通过独立的 `prepared-condition-job-v1` 能力走同一握手。工作流节点适配
+仍把表达式值转换成真假分支标记，协调器在结果提交后推进对应的后继。只支持 Script
+扩展的执行器仍用原 v8 `Execute` 执行 Condition。
+
+`flow-plugin-catalog` 向后端的发布校验和 Worker 的启动路由提供同一套发现规则。
+目录扫描统一决定节点归属和冲突，默认注册复用同一份兼容表。内容授予与进程启动
+使用同一哈希公式，Worker 仍在启动插件进程前重新核验。领域校验允许外部声明新类型，
+内置节点保留原参数和图约束。Dispatcher 不依赖插件目录。
 
 ### 2.2 架构图：三条链路
 
@@ -122,7 +165,7 @@ graph TB
         DISK[("data_dir/flow.sqlite<br/>事实 + 当前状态 + 回执 + BLOB")]
     end
 
-    subgraph L3["链路 3：执行面（v7 postcard 单流 IPC）"]
+    subgraph L3["链路 3：执行面（v8 postcard 单流 IPC）"]
         POOL["ExecutorPool<br/>x_max 个子进程"]
         EX["flow-executor<br/>节点语义唯一居所"]
         AM["AgentManager<br/>mTLS / WSS（地址由配置指定）"]
@@ -153,7 +196,7 @@ graph TB
 
 1. master↔executor 是同一种 IPC 协议；master = backend（单机）或 agent（远程中继）。
 2. 节点执行语义只许存在于 `flow-executor`；master 只做裁决和调度。
-3. 协议 v7 postcard 单流：控制与数据复用**同一条双向流、同一个 `Message` 枚举**，
+3. 协议 v8 postcard 单流：控制与数据复用**同一条双向流、同一个 `Message` 枚举**，
    帧格式唯一——`u32 body_len(大端) | postcard(Message)`。没有独立的 data 通道、
    没有帧内 1 字节 `kind`：**postcard 的变体索引即帧类型**，`TransferChunk` 的
    二进制体由 postcard 原生承载（len varint + 原始字节，无 base64、无 JSON meta
@@ -175,7 +218,7 @@ graph TB
 | 模式 | 平台 | 节点执行位置 | 备注 |
 | --- | --- | --- | --- |
 | `ipc` | 全平台（缺省） | `flow-executor` 子进程 | 执行器缺失/协议版本不符直接失败，不静默回退 |
-| `remote` | 全平台 | 经 `flow-agent` 中继的远端执行器 | 单条 mTLS 或 WSS（v7 postcard 单流）；`mode=remote` 时 `[execution.remote]` 必填 |
+| `remote` | 全平台 | 经 `flow-agent` 中继的远端执行器 | 单条 mTLS 或 WSS（v8 postcard 单流）；`mode=remote` 时 `[execution.remote]` 必填 |
 | `in_process` | **已删除** | — | 全平台配置即报错；`ExecutionMode` enum 只剩 `Ipc` |
 
 执行模式在**配置期与装配期双重把关**：`flow-config` 的 validate 在任何平台拒绝

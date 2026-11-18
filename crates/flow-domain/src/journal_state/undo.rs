@@ -49,7 +49,7 @@ enum Undo {
     /// 命令回执前像。
     Command(String, Option<CommandRecord>),
     /// 值发布缓存前像。
-    Value(flow_journal::value::ValueUndo),
+    Value(flow_facts::value::ValueUndo),
     /// 写者纪元前像。
     Epoch(u64),
     /// 插件授予前像（键 → 旧授予；None = 此前未授予）。
@@ -475,7 +475,7 @@ mod tests {
             json!({"node_execution_id":"exec","attempt":"1"}),
         );
         dispatched.dispatch_id = Some("dispatch".into());
-        let reference: flow_journal::ValueRef = serde_json::from_value(json!({
+        let reference: flow_facts::ValueRef = serde_json::from_value(json!({
             "journal_id":"undo","output_id":"value","codec":"utf8","version":1,"chunk_count":"0","total_bytes":"0",
             "digest":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         })).unwrap();

@@ -97,7 +97,7 @@ pub mod resident_service;
 
 pub mod service_host;
 
-pub mod plugin_scan;
+pub use flow_plugin_catalog as plugin_scan;
 
 pub mod plugin_bundle;
 

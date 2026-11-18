@@ -15,12 +15,6 @@ use std::collections::BTreeSet;
 /// （同一常量，不另写数字）。
 pub const R_MAX: usize = 1000;
 
-/// 当前处于审批挂起（09 §6.1）且已交还执行槽位的派发数：执行器池 park 时
-/// +1、unpark/结束时 -1。协调器在判定派发槽位时扣除它，避免几个夜间待审批
-/// 占满全部 X_max；总数受 `A_MAX` 约束（超限的挂起降级为保持占槽）。
-pub static PARKED_DISPATCHES: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
 /// 定义缓存硬顶：正常路径靠 run 终态逐出，这里只兜底防泄漏
 /// （超过即任意逐出——缓存只省磁盘读，正确性不依赖它）。
 const DEFINITION_CACHE_MAX: usize = 128;

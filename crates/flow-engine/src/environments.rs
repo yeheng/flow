@@ -1,17 +1,14 @@
 //! Versioned environment bundles. Credentials are persisted only through the encrypted store.
 #[cfg(feature = "runtime")]
 use crate::{secrets::SecretSource, secrets_store::SecretFileStore};
+#[cfg(feature = "runtime")]
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "runtime")]
 use serde_json::Value;
 #[cfg(feature = "runtime")]
 use std::{collections::BTreeMap, path::Path, sync::Mutex};
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct EnvironmentBinding {
-    pub id: String,
-    pub revision: u64,
-    pub config: Value,
-}
+pub use flow_domain::EnvironmentBinding;
 #[cfg(feature = "runtime")]
 #[derive(Clone, Serialize, Deserialize)]
 struct Revision {

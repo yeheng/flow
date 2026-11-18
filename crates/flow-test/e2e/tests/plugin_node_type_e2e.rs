@@ -80,6 +80,15 @@ async fn plugin_declared_node_type_end_to_end() {
     std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0o755)).unwrap();
     let manifest = ECHO_MANIFEST.replace("{ENTRY}", &entry.display().to_string());
     std::fs::write(plugins.join("echo-plugin").join("plugin.toml"), manifest).unwrap();
+    // A later manifest claims the same node with an entry that cannot serve it.
+    // Listing, validation and worker dispatch must all keep the first owner.
+    let shadow = plugins.join("zz-shadow");
+    std::fs::create_dir(&shadow).unwrap();
+    std::fs::write(shadow.join("entry"), b"not an echo plugin").unwrap();
+    std::fs::write(
+        shadow.join("plugin.toml"),
+        ECHO_MANIFEST.replace("echo-plugin", "zz-shadow").replace("{ENTRY}", "entry"),
+    ).unwrap();
     std::env::set_var("FLOW_PLUGINS_DIR", &plugins);
 
     let backend: std::sync::Arc<JournalBackend> =
@@ -126,6 +135,15 @@ async fn plugin_declared_node_type_end_to_end() {
                 .unwrap()
                 .iter()
                 .any(|entry| entry["id"] == "echo-plugin"));
+            let shadow = plugin_list["plugins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["id"] == "zz-shadow")
+                .expect("overlapping plugin remains visible in diagnostics");
+            assert_eq!(shadow["load_state"], "broken");
+            assert_eq!(shadow["load_error"], "node type overlaps plugin echo-plugin");
+
 
             // ---- publish：动态类型被接受；参数违反 manifest 闭集被拒 ----
             let wf = call_json(&client, "workflow.create", json!({"name": "echo-e2e"})).await;

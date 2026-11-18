@@ -121,12 +121,19 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
             FrameTransport::spawn(stream, config.queue_depth)
         }
     };
+    let mut capabilities = EXECUTOR_CAPABILITIES.to_vec();
+    if !config.remote_replay {
+        capabilities.extend([
+            flow_engine::execution_protocol::PREPARED_JOB_CAPABILITY,
+            flow_engine::execution_protocol::PREPARED_CONDITION_JOB_CAPABILITY,
+        ]);
+    }
     let (identity, limits) = match tokio::time::timeout(
         Duration::from_millis(STARTUP_TIMEOUT_MS * 2),
         executor_handshake(
             &mut transport,
             EXECUTOR_BUILD,
-            EXECUTOR_CAPABILITIES,
+            &capabilities,
             config.session_token.clone(),
         ),
     )
@@ -337,11 +344,26 @@ fn handle_message(
     plugins: &std::sync::Arc<crate::plugin_registry::PluginRegistry>,
 ) -> Option<i32> {
     match message {
-        Message::Execute {
-            command_id,
-            dispatch_id,
-            task,
-        } => {
+        message @ (Message::Execute { .. } | Message::PrepareJob { .. }) => {
+            let (command_id, dispatch_id, task, await_job) = match message {
+                Message::Execute {
+                    command_id,
+                    dispatch_id,
+                    task,
+                } => (command_id, dispatch_id, task, false),
+                Message::PrepareJob {
+                    command_id,
+                    dispatch_id,
+                    task,
+                } => (command_id, dispatch_id, task, true),
+                _ => unreachable!(),
+            };
+            if await_job && remote_replay {
+                let _ = outbound.try_send(Message::Reject {
+                    reason: "prepared jobs require a local session".into(),
+                });
+                return Some(76);
+            }
             if current.is_some() {
                 // 执行进程单任务：占用期拒绝新派发（主进程调度错误）。
                 let _ = outbound.try_send(Message::Reject {
@@ -367,6 +389,7 @@ fn handle_message(
             let task = *task;
             let runner = TaskRunner {
                 face: None,
+                await_job,
                 command_id,
                 dispatch_id: dispatch_id.clone(),
                 task,
@@ -421,7 +444,8 @@ fn handle_message(
             }
             None
         }
-        message @ (Message::ResultCommitted { .. }
+        message @ (Message::ExecuteJob { .. }
+        | Message::ResultCommitted { .. }
         | Message::OperationPermit { .. }
         | Message::OperationPending { .. }
         | Message::OperationDenied { .. }) => {

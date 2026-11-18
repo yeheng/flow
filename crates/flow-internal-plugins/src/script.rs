@@ -268,7 +268,7 @@ fn console_stream(name: &str) -> LogStream {
 ///
 /// 回归要能重放同一条路径，就不能让 `Date.now()` 与 `Math.random()`
 /// 随真实时间变化——否则每次回归的节点输出都不同，基线无法比对。
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Deserialize, serde::Serialize)]
 pub struct JsDeterminism {
     /// 冻结的 Unix 毫秒时间戳，`Date.now()` 与无参 `new Date()` 都用它。
     pub clock_ms: i64,
@@ -531,6 +531,41 @@ pub fn eval_body_recorded(
             ..JsLimits::default()
         }),
     )
+}
+
+/// The handler for a prepared script, shared by standalone jobs and workflow execution.
+pub use flow_engine::SCRIPT_V1_HANDLER as SCRIPT_V1;
+
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct ScriptTask {
+    pub code: String,
+    pub input: Value,
+    pub nodes: Value,
+    pub timeout_ms: Option<u64>,
+    pub determinism: Option<JsDeterminism>,
+}
+
+impl ScriptTask {
+    pub fn execute(&self, logger: &NodeLogger) -> Result<Value, EngineError> {
+        eval_body_recorded(
+            &self.code,
+            &self.input,
+            &self.nodes,
+            Duration::from_millis(self.timeout_ms.unwrap_or(2000).min(30_000)),
+            logger,
+            self.determinism,
+        )
+    }
+
+    /// Decode an already prepared job and encode its bounded result for IPC.
+    pub fn execute_job(input: Vec<u8>) -> Result<Vec<u8>, String> {
+        let task: Self = serde_json::from_slice(&input).map_err(|error| error.to_string())?;
+        let output = task
+            .execute(&NodeLogger::disabled())
+            .map_err(|error| error.to_string())?;
+        flow_facts::codec::bounded_json(&output, flow_dispatcher::MAX_STREAMED_JOB_BYTES)
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// 条件节点：求值单个表达式。console 可用（disabled logger，输出丢弃）。

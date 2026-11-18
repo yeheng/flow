@@ -42,7 +42,8 @@ use crate::journal::JournalBackend;
 use crate::journal_execution::Attempt;
 use flow_engine::execution_protocol::TransferKey;
 use flow_engine::execution_protocol::contract::{
-    CANCEL_REAP_TIMEOUT_MS, DURABLE_WAIT_TIMEOUT_MS, TRANSFER_CHUNK_BYTES,
+    CANCEL_REAP_TIMEOUT_MS, DURABLE_WAIT_TIMEOUT_MS, PREPARED_CONDITION_JOB_CAPABILITY,
+    PREPARED_JOB_CAPABILITY, TRANSFER_CHUNK_BYTES,
 };
 use flow_engine::execution_protocol::message::{
     Message, PermitCredential, ResultOutcome, WaitKind as WaitRequestKind,
@@ -109,6 +110,10 @@ impl IpcDispatcher {
     /// 编排状态在每次 `execute` 内新建的 [`DispatchRunner`] 里。
     pub fn new(pool: Arc<ExecutorPool>) -> Self {
         Self { pool }
+    }
+
+    pub(crate) fn parked_count(&self) -> usize {
+        self.pool.parked_count()
     }
 
     /// 关停派发端口：池内全部执行器进程被 kill 并 wait/reap，不留僵尸。
@@ -314,12 +319,20 @@ struct PendingResult {
     outcome: ResultOutcome,
 }
 
+#[derive(PartialEq, Eq)]
+enum PreparedJobStage {
+    Preparing,
+    Sent(String),
+    Accepted,
+}
+
 /// 一次节点派发的编排状态机。
 ///
 /// 跨链路重建时（远程 Resume）必须保留同一实例：其中的审计游标、
 /// 已提交摘要表、结果挂起状态就是「幂等与屏障」的记忆，丢掉它等于允许
 /// 同一批审计被重复提交或让结果越过屏障落地。
 pub(crate) struct DispatchRunner {
+    prepared_job: Option<PreparedJobStage>,
     /// 本次派发的身份与 journal 句柄（终态提交走它）。
     attempt: Attempt,
     /// 被派发的节点定义（重试策略、harness 判定都取自它）。
@@ -395,6 +408,7 @@ impl DispatchRunner {
                 )
         });
         Self {
+            prepared_job: None,
             attempt,
             node,
             predecessors,
@@ -478,107 +492,50 @@ impl DispatchRunner {
             return Err(invalid("stale dispatch"));
         }
         self.task_attempt = record.attempt;
-        // 恢复路径携带上一份结果：重挂后的执行器据此识别「这份结果已经
-        // 产出过」，从而走幂等提交而不是重新执行。
-        let mut previous_outcome = record
-            .operation
-            .as_ref()
-            .and_then(|o| o.outcome.clone())
-            .map(|v| serde_json::to_value(&v))
-            .transpose()?;
-        let mut node_value = serde_json::to_value(&self.node)?;
-        if let Some(execution) = &run.execution {
-            if execution.runtime != flow_engine::RUNTIME_ID {
-                return Err(invalid("run requires a different executor runtime"));
-            }
-            let fixture = execution
-                .regression
-                .as_ref()
-                .and_then(|r| r.fixtures.get(&execution.node_key(&self.node.id)));
-            if let Some(fixture) = fixture {
-                previous_outcome = Some(serde_json::to_value(&fixture.outcome)?);
-            }
-            let mut execution_value = json!({
-                "runtime": execution.runtime, "clock_ms":execution.clock_ms,
-                "seed": format!("{}:{}", execution.seed, execution.node_key(&self.node.id)),
-                "regression": execution.regression.is_some(),
-                "fixture_fingerprint": fixture.map(|f| &f.fingerprint),
-                "environment": execution.environment,
-            });
-            // 冻结的 agent 配置（与 operation 请求里的 agent 是同一份快照的
-            // 两次序列化；测试断言两者相等）。旧 journal / 未配置时无此键。
-            if let Some(agent) = &execution.agent {
-                execution_value["agent"] = serde_json::to_value(agent)?;
-            }
-            // 09 §8：受管回合权限（TurnPermission）随执行上下文下发——执行器
-            // 据此装配 permission/request 反向通道；legacy run 无这些键 =
-            // 未受管回合。
-            if let Some(policy) = &run.policy {
-                execution_value["permissions_managed"] = json!(!policy.legacy);
-                execution_value["permissions_mode"] = json!(policy.mode.as_str());
-                execution_value["policy_digest"] = json!(policy.digest);
-            }
-            node_value["_flow_execution"] = execution_value;
-        }
-        let task = flow_engine::execution_protocol::ExecuteTask {
-            run_id: self.attempt.run_id.clone(),
-            node_id: self.attempt.node_id.clone(),
-            node_execution_id: record.node_execution_id.clone(),
-            attempt: record.attempt,
-            node: node_value,
-            input: task_value(&run.input),
-            predecessors: self
-                .predecessors
-                .iter()
-                .map(|(id, value)| (id.clone(), task_value(value)))
-                .collect(),
-            prepared: record.prepared.as_ref().map(|committed| {
-                flow_engine::execution_protocol::PreparedMeta {
-                    engine_build: committed.engine_build.clone(),
-                    node_semantics: committed.node_semantics,
-                    params: task_value(&committed.params),
-                }
-            }),
-            previous_outcome: previous_outcome.clone(),
-            observability: self.observations.is_some(),
-            // v8：存在待审批/待沿用操作身份时随任务下发——执行器重发
-            // RequestOperation 时沿用原 operation_id（§6.1），不新建实例。
-            pending_operation: record
-                .approval
-                .as_ref()
-                .map(|approval| approval.request.operation_id.clone()),
-        };
+        let task = super::workflow_task::prepare(
+            &self.attempt,
+            &run,
+            &self.node,
+            &record,
+            &self.predecessors,
+            self.observations.is_some(),
+        )?;
+        let transfer_outcome = task.previous_outcome.clone();
         let command_id = format!("cmd-{}", uuid::Uuid::now_v7());
         // 命令标识用 v7 UUID：时间有序便于日志按发生顺序定位，全局唯一
         // 便于跨会话追踪同一条命令。
-        let execute = Message::Execute {
-            command_id,
-            dispatch_id: self.attempt.dispatch_id.clone(),
-            task: Box::new(task),
+        let capability = match self.node.kind() {
+            Some(NodeType::Script) => Some(PREPARED_JOB_CAPABILITY),
+            Some(NodeType::Condition) => Some(PREPARED_CONDITION_JOB_CAPABILITY),
+            _ => None,
         };
-        // 整帧预检（C6/I23，P2-7）：对整个 Execute 消息的真实 wire 编码长度
-        // 做上限校验。半预算分别预检 node/previous_outcome 会漏掉两者相加
-        // 再加 predecessors 声明的越界——超限若漏到会话编码点爆发，
-        // `encode_frame` 报 FrameTooLarge 会杀掉整条会话（远程模式是整条
-        // agent 上联），这正是「拒绝派发而不是杀会话」要防的失败模式。
-        if !resume {
-            let encoded = postcard::to_allocvec(&execute)
-                .map_err(|e| invalid(format!("execute encode probe: {e}")))?;
-            if encoded.len() > flow_engine::execution_protocol::CONTROL_MAX_FRAME {
-                return Err(invalid(format!(
-                    "execute frame exceeds control budget: {} bytes > {}",
-                    encoded.len(),
-                    flow_engine::execution_protocol::CONTROL_MAX_FRAME
-                )));
+        let prepare_job = !resume
+            && capability.is_some_and(|capability| {
+                link.parking
+                    .as_ref()
+                    .is_some_and(|session| session.lease.supports(capability))
+            });
+        let dispatch_id = self.attempt.dispatch_id.clone();
+        let task = Box::new(task);
+        let execute = if prepare_job {
+            self.prepared_job = Some(PreparedJobStage::Preparing);
+            Message::PrepareJob {
+                command_id,
+                dispatch_id,
+                task,
             }
-        }
+        } else {
+            Message::Execute {
+                command_id,
+                dispatch_id,
+                task,
+            }
+        };
         if !resume {
-            // 首挂：Execute 只发一次。resume 路径重发它等于让执行器重跑
-            // 节点——而恢复期的正确做法是靠审计重传与结果封口推进。
-            link.commands
-                .send(ToSession::Send(Box::new(execute)))
+            // A resumed session replays its previous audit/result, never Execute.
+            flow_dispatcher::send_execute(&link.commands, execute)
                 .await
-                .map_err(|_| invalid("executor session closed before execute"))?;
+                .map_err(|error| invalid(error.to_string()))?;
         } else {
             // 重挂：授权已提交但 Outcome 未到（许可可能在断线中丢失）时
             // 重发当前会话许可；其余靠执行器审计重传自然恢复。
@@ -646,7 +603,6 @@ impl DispatchRunner {
         let transfer_input = run.input.clone();
         let transfer_preds = self.predecessors.clone();
         let transfer_prepared = record.prepared.clone();
-        let transfer_outcome = previous_outcome.clone();
         let mut transfer = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(transfer_inputs(
             transfer_session,
             self.attempt.dispatch_id.clone(),
@@ -857,10 +813,71 @@ impl DispatchRunner {
     /// 处理一条来自执行器的消息。Ok(Some(())) = 派发完成。
     async fn handle(&mut self, message: Message, link: &mut DispatchLink) -> Result<Option<()>> {
         match message {
-            Message::Accepted { dispatch_id, .. } => {
+            Message::Accepted {
+                command_id,
+                dispatch_id,
+            } => {
                 if dispatch_id != self.attempt.dispatch_id {
                     return Err(invalid("accepted for foreign dispatch"));
                 }
+                if matches!(&self.prepared_job, Some(PreparedJobStage::Sent(expected)) if expected == &command_id)
+                {
+                    self.prepared_job = Some(PreparedJobStage::Accepted);
+                    fault::checkpoint_for("prepared_job:accepted", &self.attempt.node_id).await;
+                }
+                Ok(None)
+            }
+            Message::JobPrepared { dispatch_id } => {
+                if dispatch_id != self.attempt.dispatch_id
+                    || self.prepared_job != Some(PreparedJobStage::Preparing)
+                {
+                    return Err(invalid("unexpected prepared job event"));
+                }
+                fault::checkpoint_for("prepared_job:ready", &self.attempt.node_id).await;
+                if self.cancel_sent {
+                    return Ok(None);
+                }
+                // The worker is ready, but only committed state can authorize the handoff.
+                let job_id = self
+                    .attempt
+                    .backend
+                    .inspect(|state| {
+                        let Some(run) = state
+                            .runs
+                            .get(&self.attempt.run_id)
+                            .filter(|run| !run.terminal())
+                        else {
+                            return Ok(None);
+                        };
+                        run.nodes
+                            .get(&self.attempt.node_id)
+                            .filter(|record| {
+                                record.dispatch_id == dispatch_id && record.prepared.is_some()
+                            })
+                            .map(|record| Some(record.node_execution_id.clone()))
+                            .ok_or_else(|| invalid("job prepared before its input was committed"))
+                    })
+                    .await?;
+                let Some(job_id) = job_id else {
+                    return Ok(None);
+                };
+                let command_id = format!("job-{dispatch_id}");
+                flow_dispatcher::send_execute(
+                    &link.commands,
+                    Message::ExecuteJob {
+                        command_id: command_id.clone(),
+                        dispatch_id,
+                        job: flow_dispatcher::Job {
+                            id: job_id,
+                            handler: flow_engine::SCRIPT_V1_HANDLER.into(),
+                            // The authenticated session already holds these exact frozen values.
+                            input: Vec::new(),
+                        },
+                    },
+                )
+                .await
+                .map_err(|error| invalid(error.to_string()))?;
+                self.prepared_job = Some(PreparedJobStage::Sent(command_id));
                 Ok(None)
             }
             Message::AuditBatch {
@@ -889,6 +906,14 @@ impl DispatchRunner {
             } => {
                 if dispatch_id != self.attempt.dispatch_id {
                     return Err(invalid("result for foreign dispatch"));
+                }
+                if matches!(&self.prepared_job, Some(PreparedJobStage::Sent(_)))
+                    || (self.prepared_job == Some(PreparedJobStage::Preparing)
+                        && !matches!(&outcome, ResultOutcome::Failure { .. }))
+                {
+                    return Err(invalid(
+                        "prepared job produced a result before accepting execution",
+                    ));
                 }
                 if self.durable_seq >= last_audit_seq {
                     let pending = PendingResult {
@@ -1147,6 +1172,10 @@ impl DispatchRunner {
                     Ok((events, ()))
                 })
                 .await?;
+            #[cfg(feature = "fault-injection")]
+            if new_records.iter().any(|(record, _)| record.kind == "input_prepared") {
+                fault::checkpoint_for("input_prepared:committed", &self.attempt.node_id).await;
+            }
             for (record, digest) in new_records {
                 // 已持久前缀推进到本批最后一条；摘要入库供同序号重传比对。
                 self.durable_seq = record.audit_seq;
@@ -1287,13 +1316,12 @@ impl DispatchRunner {
         }
         // 结果已提交：回执使执行器释放槽位（重复派发返回原提交）。
         fault::checkpoint_for("result_committed:before", &self.attempt.node_id).await;
-        let _ = link
-            .commands
-            .send(ToSession::Send(Box::new(Message::ResultCommitted {
-                dispatch_id: self.attempt.dispatch_id.clone(),
-                result_id,
-            })))
-            .await;
+        let _ = flow_dispatcher::send_committed(
+            &link.commands,
+            self.attempt.dispatch_id.clone(),
+            result_id,
+        )
+        .await;
         fault::checkpoint_for("result_committed:after", &self.attempt.node_id).await;
         Ok(())
     }
@@ -2835,17 +2863,6 @@ enum InputTransferError {
     Invalid(String),
     /// 命令通道已关闭（会话死亡或被回收）。
     LinkClosed,
-}
-
-/// StoredValue → 控制帧声明：Ref 保留 journal 身份（输出回引），
-/// Inline 只声明存在（字节走 data 通道）。
-fn task_value(stored: &StoredValue) -> flow_engine::execution_protocol::TaskValue {
-    match stored {
-        StoredValue::Ref(reference) => {
-            flow_engine::execution_protocol::TaskValue::Ref(reference.clone())
-        }
-        StoredValue::Inline(_) => flow_engine::execution_protocol::TaskValue::Local,
-    }
 }
 
 /// StoredValue → 可读字节源。

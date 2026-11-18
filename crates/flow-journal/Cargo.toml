@@ -12,6 +12,7 @@ query = ["storage", "dep:sqlx"]
 cli = ["storage", "dep:clap"]
 
 [dependencies]
+flow-facts = { path = "../flow-facts" }
 tokio.workspace = true
 tokio-util.workspace = true
 serde.workspace = true

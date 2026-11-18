@@ -1,32 +1,11 @@
-//! 插件注册表：节点类型 → 插件注册的路由表（设计见
-//! docs/plans/2026-11-06-plugin-system.md §4/§8 R1-R2）。
-//!
-//! 加载来源两路，合并规则白纸黑字：
-//!
-//! 1. **内置默认注册**（编译期约定）：`harness` → harness-agent 插件的
-//!    传统定位（`FLOW_AGENT_PLUGIN_BIN` 或同目录兄弟二进制）。这保证
-//!    「没有 plugins 目录的部署照样能跑 harness 节点」——R2 的行为
-//!    零变化靠它。
-//! 2. **manifest 发现**（`FLOW_PLUGINS_DIR`，缺省 `<flow_home>/plugins`）：
-//!    逐目录解析 `plugin.toml`。**显式部署胜过隐式默认**：同 id 的
-//!    manifest 替换默认注册；其余冲突一律拒绝加载该 manifest。
-//!
-//! 拒绝规则（每条都 loud，不静默跳字段）：
-//! - `node_types` 含内置节点类型名（`NodeType::parse` 可识别且非
-//!   Harness）——防插件悄悄顶掉内置语义；
-//! - `node_types` 与**其他插件**的注册重叠——一个节点类型只能有一个
-//!   语义居所；
-//! - 协议主版本不符（廉价快筛：不匹配连进程都不拉，握手才是权威裁决）；
-//! - 入口二进制不存在。
-//!
-//! 注册表在执行器进程启动时加载一次，**不热加载**：进程重启即插件
-//! 重载，这是刻意的（设计 §0）。
+//! Worker routing table built from the same plugin catalog used for publication.
+//! The catalog is read once at startup. Spawn rechecks manifest and entry identity.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use flow_config::plugin_manifest::{self, PluginManifest};
-use flow_engine::NodeType;
+use flow_config::plugin_manifest;
+use flow_plugin_catalog::{content_hash_path, read_manifest, BUNDLED_ROUTES};
 
 /// 注册来源。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,14 +45,8 @@ impl RegisteredPlugin {
         let RegistrationSource::Manifest(manifest_path) = &self.source else {
             return Ok(());
         };
-        use std::io::Read;
-        let mut manifest_bytes = Vec::new();
-        std::fs::File::open(manifest_path)
-            .and_then(|file| file.take(262145).read_to_end(&mut manifest_bytes))
-            .map_err(|e| format!("manifest 不可读：{e}"))?;
-        if manifest_bytes.len() > 262144 {
-            return Err("manifest exceeds 256 KiB".into());
-        }
+        let manifest_bytes =
+            read_manifest(manifest_path).map_err(|e| format!("manifest 不可读：{e}"))?;
         let current = content_hash_path(&manifest_bytes, &self.binary)
             .map_err(|e| format!("入口不可读：{e}"))?;
         if current != self.content_hash {
@@ -88,56 +61,10 @@ impl RegisteredPlugin {
     }
 }
 
-/// 内容身份：sha256(manifest 字节 ‖ entry 字节)——与 master 侧
-/// `flow_backend::plugin_registry::content_hash` 同一公式。
-#[cfg(test)]
-fn content_hash(manifest_bytes: &[u8], entry_bytes: &[u8]) -> String {
-    use sha2::Digest;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(manifest_bytes);
-    hasher.update(entry_bytes);
-    hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
-fn content_hash_path(manifest_bytes: &[u8], entry: &Path) -> std::io::Result<String> {
-    use sha2::Digest;
-    use std::io::Read;
-    let mut hash = sha2::Sha256::new();
-    hash.update(manifest_bytes);
-    let mut file = std::fs::File::open(entry)?;
-    let mut buffer = [0; 65536];
-    loop {
-        let size = file.read(&mut buffer)?;
-        if size == 0 {
-            break;
-        }
-        hash.update(&buffer[..size]);
-    }
-    Ok(hex::encode(hash.finalize()))
-}
-
 /// 节点类型 → 插件注册的路由表。
 #[derive(Debug, Clone, Default)]
 pub struct PluginRegistry {
     by_node_type: HashMap<String, RegisteredPlugin>,
-}
-
-/// 内置默认注册的通用定位：`<BIN_ENV>` 显式指定，否则执行器同目录
-/// 兄弟 `<bin_name>`（行为零变化的锚点：没有 plugins 目录的部署照样
-/// 能跑，plugins 目录的 manifest 永远可以覆盖默认注册）。
-fn default_sibling_binary(bin_env: &str, bin_name: &str) -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os(bin_env) {
-        let path = PathBuf::from(path);
-        return path.is_file().then_some(path);
-    }
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(bin_name)))
-        .filter(|path| path.is_file())
 }
 
 impl PluginRegistry {
@@ -150,49 +77,35 @@ impl PluginRegistry {
     /// 所有拒绝都走 `tracing::warn`：坏插件禁用，执行器照常服务。
     pub fn load() -> Self {
         let mut registry = Self::default();
-        // 内置默认注册两张：harness（R2）与 llm（R4）。二进制缺失只 warn：
-        // 对应节点不可用，执行器照常服务其它节点类型。
-        for (node_type, plugin_id, bin_env, bin_name, invoke) in [
-            (
-                "harness",
-                "harness-agent",
-                "FLOW_AGENT_PLUGIN_BIN",
-                "flow-agent-plugin",
-                "agent/runTurn",
-            ),
-            (
-                "llm",
-                "llm",
-                "FLOW_LLM_PLUGIN_BIN",
-                "flow-llm-plugin",
-                "llm/invoke",
-            ),
-        ] {
-            match default_sibling_binary(bin_env, bin_name) {
-                Some(binary) => registry.register(
-                    node_type,
+        let executor = std::env::current_exe().ok();
+        for route in BUNDLED_ROUTES {
+            if let Some(binary) =
+                route.binary(executor.as_deref(), std::env::var_os(route.binary_env))
+            {
+                registry.register(
+                    route.node_type,
                     RegisteredPlugin {
-                        plugin_id: plugin_id.into(),
+                        plugin_id: route.plugin_id.into(),
                         version: "bundled".into(),
-                        invoke_method: invoke.into(),
+                        invoke_method: route.invoke.into(),
                         binary,
                         protocol: flow_plugin_sdk::protocol::PROTOCOL_VERSION,
                         content_hash: String::new(),
                         ui: None,
                         source: RegistrationSource::Default,
                     },
-                ),
-                None => {},
+                );
             }
         }
-        let dir = flow_config::plugin_fs::plugins_root();
-        if let Some(dir) = dir {
+        if let Some(dir) = flow_config::plugin_fs::plugins_root() {
             registry.discover(&dir);
         }
-        for node_type in ["harness", "llm"] {
-            if registry.resolve(node_type).is_none() {
-                tracing::warn!(node_type, plugins_dir = ?flow_config::plugin_fs::plugins_root(),
-                    "plugin unavailable after scanning plugin directory and binary overrides");
+        for route in BUNDLED_ROUTES {
+            if registry.resolve(route.node_type).is_none() {
+                tracing::warn!(
+                    node_type = route.node_type,
+                    "plugin unavailable after scanning plugin directory and binary overrides"
+                );
             }
         }
         registry
@@ -218,171 +131,41 @@ impl PluginRegistry {
             .insert(node_type.to_string(), registration);
     }
 
-    /// manifest 发现：逐子目录找 `plugin.toml`，按合并/拒绝规则装载。
     fn discover(&mut self, dir: &Path) {
-        if !dir.exists() {
+        if !dir.is_dir() {
             return;
         }
-        let _lease = match flow_config::plugin_fs::RootLease::shared(dir) {
-            Ok(lease) => lease,
-            Err(error) => {
-                tracing::warn!(%error, ?dir, "plugin lease unavailable");
-                return;
-            }
-        };
-        let entries = match std::fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(error) => {
-                tracing::warn!(%error, ?dir, "plugin directory unavailable");
-                return;
-            }
-        };
-        let mut dirs: Vec<_> = entries
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|p| {
-                p.is_dir()
-                    && !p
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .starts_with('.')
-            })
-            .collect();
-        dirs.sort();
-        let mut candidates = Vec::new();
-        let mut ids = std::collections::BTreeMap::new();
-        for plugin_dir in dirs {
-            let manifest_path = plugin_dir.join("plugin.toml");
-            if !manifest_path.is_file() {
-                continue;
-            }
-            let text = (|| -> std::io::Result<String> {
-                use std::io::Read;
-                let mut bytes = Vec::new();
-                std::fs::File::open(&manifest_path)?
-                    .take(262145)
-                    .read_to_end(&mut bytes)?;
-                if bytes.len() > 262144 {
-                    return Err(std::io::Error::other("manifest exceeds 256 KiB"));
-                }
-                String::from_utf8(bytes).map_err(std::io::Error::other)
-            })();
-            match text {
-                Ok(text) => {
-                    let id = plugin_manifest::parse(&text).ok().map(|m| m.plugin.id);
-                    if let Some(id) = &id {
-                        *ids.entry(id.clone()).or_insert(0usize) += 1;
-                    }
-                    candidates.push((manifest_path, plugin_dir, text, id));
-                }
-                Err(error) => tracing::warn!(?manifest_path, %error, "manifest unavailable"),
-            }
-        }
-        for (path, dir, text, id) in candidates {
-            if id.as_ref().is_some_and(|id| ids[id] > 1) {
-                tracing::warn!(?path, ?id, "duplicate plugin id; all copies disabled");
-                continue;
-            }
-            self.load_manifest(&path, &dir, &text);
-        }
-    }
-
-    fn load_manifest(&mut self, manifest_path: &Path, plugin_dir: &Path, text: &str) {
-        let manifest: PluginManifest = match plugin_manifest::parse(text) {
-            Ok(manifest) => manifest,
-            Err(error) => {
-                tracing::warn!(?manifest_path, %error, "manifest 解析失败，插件禁用（不猜、不跳过）");
-                return;
-            }
-        };
-        let reject = |reason: String| {
-            tracing::warn!(
-                ?manifest_path,
-                plugin = %manifest.plugin.id,
-                "{reason}，插件禁用"
-            );
-        };
-        // 协议快筛：主版本不等连进程都不拉（握手的版本门仍是权威裁决）。
-        if manifest.plugin.protocol >> 16 != flow_plugin_sdk::protocol::PROTOCOL_VERSION >> 16 {
-            reject(format!(
-                "协议主版本不符：manifest={}，runtime={}",
-                manifest.plugin.protocol >> 16,
-                flow_plugin_sdk::protocol::PROTOCOL_VERSION >> 16
-            ));
-            return;
-        }
-        // 内置类型名防护：NodeType 可解析且仍由编译期处理器承载 = 不可
-        // 被插件顶掉。harness/llm 已迁出为插件承载（R2/R4），不在守卫集。
-        if let Some(builtin) = manifest.plugin.node_types.iter().find(|name| {
-            matches!(
-                NodeType::parse(name),
-                Some(kind) if !matches!(kind, NodeType::Harness | NodeType::Llm)
-            )
-        }) {
-            reject(format!(
-                "node_types 含内置类型 {builtin:?}（内置语义不可被插件顶掉）"
-            ));
-            return;
-        }
-        // 入口存在性：相对路径相对插件目录，也可绝对路径（测试/部署布局）。
-        let entry = PathBuf::from(&manifest.plugin.entry);
-        let binary = if entry.is_absolute() {
-            entry
-        } else {
-            plugin_dir.join(entry)
-        };
-        if !binary.is_file() {
-            reject(format!("入口二进制不存在：{}", binary.display()));
-            return;
-        }
-        // 与其他插件的重叠：一个节点类型只能有一个语义居所。同 id 的
-        // 默认注册（harness-agent）允许被替换 = 显式部署胜过隐式默认。
-        if let Some(existing) = manifest
-            .plugin
-            .node_types
+        let occupied = self
+            .by_node_type
             .iter()
-            .filter_map(|node_type| self.by_node_type.get(node_type))
-            .find(|existing| existing.plugin_id != manifest.plugin.id)
-        {
-            reject(format!(
-                "node_types 与插件 {} 的注册重叠",
-                existing.plugin_id
-            ));
-            return;
-        }
-        let content_hash = match content_hash_path(text.as_bytes(), &binary) {
-            Ok(hash) => hash,
+            .map(|(node, registration)| (node.clone(), registration.plugin_id.clone()))
+            .collect();
+        let snapshot = match flow_plugin_catalog::scan(dir, &occupied) {
+            Ok(snapshot) => snapshot,
             Err(error) => {
-                reject(format!("入口不可读：{error}"));
+                tracing::warn!(%error, ?dir, "plugin scan failed");
                 return;
             }
         };
-        let registration = RegisteredPlugin {
-            plugin_id: manifest.plugin.id.clone(),
-            version: manifest.plugin.version.clone(),
-            invoke_method: manifest.methods.invoke.clone(),
-            binary,
-            protocol: manifest.plugin.protocol,
-            content_hash,
-            ui: Some(manifest.ui_projection()),
-            source: RegistrationSource::Manifest(manifest_path.to_path_buf()),
-        };
-        let node_types = manifest.plugin.node_types.clone();
-        for node_type in &node_types {
-            let replaced_default = matches!(
-                self.by_node_type.get(node_type),
-                Some(existing) if existing.source == RegistrationSource::Default
-            );
-            if replaced_default {
-                tracing::info!(
-                    ?manifest_path,
-                    plugin = %registration.plugin_id,
-                    node_type,
-                    "manifest 替换内置默认注册（显式部署胜过隐式默认）"
-                );
+        for row in snapshot.rows {
+            let manifest_path = row.source.join("plugin.toml");
+            let Some(plugin) = row.plugin else {
+                tracing::warn!(?manifest_path, plugin = %row.id, reason = ?row.load_error, "plugin disabled by catalog");
+                continue;
+            };
+            let registration = RegisteredPlugin {
+                plugin_id: plugin.manifest.plugin.id.clone(),
+                version: plugin.manifest.plugin.version.clone(),
+                invoke_method: plugin.manifest.methods.invoke.clone(),
+                binary: plugin.entry(),
+                protocol: plugin.manifest.plugin.protocol,
+                content_hash: plugin.content_hash,
+                ui: Some(plugin.manifest.ui_projection()),
+                source: RegistrationSource::Manifest(manifest_path),
+            };
+            for node_type in &plugin.manifest.plugin.node_types {
+                self.register(node_type, registration.clone());
             }
-            self.register(node_type, registration.clone());
         }
     }
 }
@@ -454,15 +237,17 @@ invoke = "agent/runTurn"
     #[test]
     fn streaming_hash_matches_i35_and_recheck_rejects_changed_bytes() {
         let root = tempdir("stream-hash");
-        let entry = fake_entry(&root);
+        let plugin = root.join("demo");
+        std::fs::create_dir(&plugin).unwrap();
+        let entry = fake_entry(&plugin);
         let text = manifest_text("demo", "\"custom\"", "entry-bin");
         assert_eq!(
             content_hash_path(text.as_bytes(), &entry).unwrap(),
-            content_hash(text.as_bytes(), &std::fs::read(&entry).unwrap())
+            flow_plugin_catalog::content_hash(text.as_bytes(), &std::fs::read(&entry).unwrap())
         );
-        std::fs::write(root.join("plugin.toml"), &text).unwrap();
+        std::fs::write(plugin.join("plugin.toml"), &text).unwrap();
         let mut registry = PluginRegistry::default();
-        registry.load_manifest(&root.join("plugin.toml"), &root, &text);
+        registry.discover(&root);
         let registration = registry.resolve("custom").unwrap();
         registration.recheck_content_hash().unwrap();
         std::fs::write(&entry, b"different bytes").unwrap();

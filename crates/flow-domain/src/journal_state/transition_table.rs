@@ -153,8 +153,8 @@ fn inline(value: Value) -> StoredValue {
 }
 
 fn fingerprint(value: &Value) -> String {
-    flow_journal::codec::digest(
-        &flow_journal::codec::bounded_json(value, flow_journal::INLINE_BYTES).unwrap(),
+    flow_facts::codec::digest(
+        &flow_facts::codec::bounded_json(value, flow_facts::INLINE_BYTES).unwrap(),
     )
 }
 
@@ -281,9 +281,7 @@ fn state_for(shape: Shape) -> Harness {
         Shape::Running => {}
         Shape::WaitDelay => register_wait(&mut harness, json!({"kind":"delay","wake_at":123})),
         Shape::WaitSignal => register_wait(&mut harness, json!({"kind":"signal"})),
-        Shape::WaitChild => {
-            register_wait(&mut harness, json!({"kind":"child","child_run_id":"c"}))
-        }
+        Shape::WaitChild => register_wait(&mut harness, json!({"kind":"child","child_run_id":"c"})),
         Shape::WaitRetry => {
             let sealed = sealed_through(&harness);
             harness
@@ -459,7 +457,11 @@ fn probe_event(harness: &Harness, probe: Probe) -> Event {
                        "decision":decision,"output": inline(json!({"ok":true}))}),
             )
         }
-        Probe::RunComplete => run_event(EventKind::RunCompleted, seq, json!({"output": inline(Value::Null)})),
+        Probe::RunComplete => run_event(
+            EventKind::RunCompleted,
+            seq,
+            json!({"output": inline(Value::Null)}),
+        ),
         Probe::RunFail => run_event(EventKind::RunFailed, seq, json!({"error":"late"})),
         Probe::RunCancel => run_event(EventKind::RunCancelled, seq, json!({"reason":"late"})),
     }
@@ -641,8 +643,9 @@ fn shape_builders_reach_target_states() {
             Absent => None,
             Pending => Some("pending"),
             Running | CancelledRunning => Some("running"),
-            WaitDelay | WaitSignal | WaitChild | WaitRetry
-            | WaitUncertain | CancelledWaiting => Some("waiting"),
+            WaitDelay | WaitSignal | WaitChild | WaitRetry | WaitUncertain | CancelledWaiting => {
+                Some("waiting")
+            }
             Succeeded => Some("succeeded"),
             Failed => Some("failed"),
             Skipped => Some("skipped"),

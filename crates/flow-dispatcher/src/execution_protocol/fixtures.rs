@@ -7,8 +7,8 @@
 //! 「主进程认为合法」与「执行器认为合法」是同一批字节。样本里的字节是
 //! 对抗性输入的固定语料——回归时若有人放宽了解码规则，这里会先炸。
 
-use flow_journal::value::ValueCodec;
-use flow_journal::{StoredValue, ValueRef};
+use flow_facts::value::ValueCodec;
+use flow_facts::{StoredValue, ValueRef};
 use serde_json::json;
 
 use super::contract::PROTOCOL_VERSION;
@@ -40,7 +40,7 @@ pub fn audit_record() -> AuditRecord {
     }
 }
 
-/// 全消息目录的合法样本（每类至少一条）。
+/// 工作流 v8 消息目录的合法样本（独立任务扩展由真实 worker 测试覆盖）。
 pub fn valid_messages() -> Vec<Message> {
     vec![
         Message::Hello {

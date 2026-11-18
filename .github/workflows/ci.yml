@@ -81,7 +81,9 @@ jobs:
       # 的 workspace_bin）——不先 build 就会 panic "binary not built"。
       # Separate invocation prevents workspace feature unification hiding core coupling.
       - name: isolated domain
-        run: cargo test -p flow-domain --locked
+        run: cargo test -p flow-facts -p flow-domain --locked
+      - name: isolated dispatcher
+        run: cargo test -p flow-dispatcher --locked
       - name: domain without runtime
         run: cargo test -p flow-engine --no-default-features --lib --test core_boundary --locked
       - name: build workspace bins

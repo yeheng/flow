@@ -20,8 +20,8 @@
 pub mod error;
 #[cfg(feature = "runtime")]
 pub mod exec;
-pub mod execution_protocol;
-pub mod journal_state;
+pub use flow_dispatcher::execution_protocol;
+pub use flow_domain::journal_state;
 pub use flow_dto::AgentRunConfig;
 #[cfg(feature = "runtime")]
 pub mod log_types;
@@ -30,18 +30,16 @@ pub use flow_domain::model;
 pub mod nodelog;
 #[cfg(feature = "runtime")]
 pub mod observation;
-pub mod process;
+pub use flow_dispatcher::process;
 pub use flow_domain::schema;
 pub mod environments;
 pub mod secrets;
 #[cfg(feature = "runtime")]
 pub mod secrets_store;
-pub mod template;
-/// 子工作流嵌套的硬上限。子流程调用是「run 套 run」的递归结构，
-/// 没有上限时一个自引用的定义能把执行器拖进无界递归（栈溢出或
-/// 无限派发），且崩溃点在最深处的子 run，事后极难定位。
-/// 取 16 是「远深于任何合理业务嵌套」与「仍在可诊断范围内」的折中。
-pub const MAX_SUB_WORKFLOW_DEPTH: u32 = 16;
+pub use flow_domain::template;
+/// Versioned handler selected by the workflow adapter for prepared script computation.
+pub const SCRIPT_V1_HANDLER: &str = "script.v1";
+pub use flow_domain::MAX_SUB_WORKFLOW_DEPTH;
 /// Execution compatibility, frozen into runs. Bump when node semantics, snapshot
 /// interpretation or executor contracts become incompatible. Never accept an old
 /// source hash as this compatibility version without an explicit migration.

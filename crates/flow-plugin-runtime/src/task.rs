@@ -133,6 +133,8 @@ pub enum TaskEnd {
 /// 持有一个派发所需的全部上下文：任务载荷、进出站通道、取消令牌、审计
 /// 窗口额度、输入装配器。生命周期 = 一次派发，结束后随对象释放。
 pub struct TaskRunner {
+    /// The local adapter starts computation with a separate prepared job command.
+    pub(crate) await_job: bool,
     /// 主进程给本次派发的命令身份（回执按它对账）。
     pub command_id: String,
     /// 本次派发的唯一标识：所有进出站帧都按它归属。
@@ -258,6 +260,11 @@ impl TaskRunner {
             .await
             .map_err(|e| TaskError::Closed(e.to_string()))?;
         let node: Node = serde_json::from_value(self.task.node.clone()).map_err(TaskError::from)?;
+        if self.await_job && !matches!(node.kind(), Some(NodeType::Script | NodeType::Condition)) {
+            return Err(TaskError::Invalid(
+                "node does not support a prepared job".into(),
+            ));
+        }
         let mut audit = AuditStream::new(
             self.dispatch_id.clone(),
             self.outbound.clone(),
@@ -326,6 +333,9 @@ impl TaskRunner {
                 Err(other) => return Err(other),
             },
         };
+        if self.await_job {
+            self.await_prepared_job().await?;
+        }
         // 3) 执行（按节点类型）；业务失败/未定外部结果转失败 Result
         // （同一派发；uncertain 由主进程依操作状态登记）。
         let attempt_logger = logger.clone();
@@ -369,6 +379,39 @@ impl TaskRunner {
         }
         drain_observations(attempt_logger, obs_close).await;
         self.emit_result(&mut audit, outcome).await
+    }
+
+    async fn await_prepared_job(&mut self) -> Result<(), TaskError> {
+        self.outbound
+            .send(Message::JobPrepared {
+                dispatch_id: self.dispatch_id.clone(),
+            })
+            .await
+            .map_err(|e| TaskError::Closed(e.to_string()))?;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(DURABLE_WAIT_TIMEOUT_MS);
+        match self.receive_until(deadline, "prepared job").await? {
+            Message::ExecuteJob {
+                command_id,
+                dispatch_id,
+                job,
+            } if dispatch_id == self.dispatch_id
+                && job.id == self.task.node_execution_id
+                && job.handler == flow_engine::SCRIPT_V1_HANDLER
+                && job.input.is_empty() =>
+            {
+                self.outbound
+                    .send(Message::Accepted {
+                        command_id,
+                        dispatch_id,
+                    })
+                    .await
+                    .map_err(|e| TaskError::Closed(e.to_string()))?;
+                Ok(())
+            }
+            _ => Err(TaskError::Invalid(
+                "expected job referencing the prepared input".into(),
+            )),
+        }
     }
 
     /// 以失败 Outcome 收口本次派发。
@@ -989,14 +1032,6 @@ impl TaskRunner {
             }
         };
         let _ = inputs;
-        // 超时上限 30s：再长的时间会让一个失控脚本长期霸占执行槽，
-        // 而执行槽是全局有限资源。
-        let timeout = Duration::from_millis(
-            params_value["timeout_ms"]
-                .as_u64()
-                .unwrap_or(2000)
-                .min(30_000),
-        );
         let input = self
             .materialize_stored(
                 &prepared.input,
@@ -1016,23 +1051,18 @@ impl TaskRunner {
                 .await?,
             );
         }
-        let logger = logger.clone();
-        let determinism = self.determinism();
-        // 闭包 move 进阻塞线程：求值期间不持有 &mut self（否则任务无法
-        // 响应取消），日志与确定性上下文都在闭包内自带。
-        let result = tokio::task::spawn_blocking(move || {
-            flow_internal_plugins::eval_body_recorded(
-                &code,
-                &input,
-                &Value::Object(nodes),
-                timeout,
-                &logger,
-                determinism,
-            )
-        })
-        .await
-        .map_err(|e| TaskError::Business(e.to_string()))?
-        .map_err(|e| TaskError::Business(e.to_string()))?;
+        let script = flow_internal_plugins::script::ScriptTask {
+            code,
+            input,
+            nodes: Value::Object(nodes),
+            timeout_ms: params_value["timeout_ms"].as_u64(),
+            determinism: self.determinism(),
+        };
+        // Keep the blocking evaluator outside the IPC loop.
+        let result = tokio::task::spawn_blocking(move || script.execute(&logger))
+            .await
+            .map_err(|e| TaskError::Business(e.to_string()))?
+            .map_err(|e| TaskError::Business(e.to_string()))?;
         // 条件节点的分支由宿主的 truthy 判定（与 JS 真值语义对齐），
         // 脚本节点不带分支。
         let branch = (kind == NodeType::Condition).then(|| flow_internal_plugins::truthy(&result));

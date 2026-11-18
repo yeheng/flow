@@ -1,6 +1,6 @@
 //! One immutable discovery result shared by list, routing and validation.
-use crate::plugin_registry::DiscoveredPlugin;
 use flow_config::plugin_manifest::{parse, FieldDecl, PluginManifest};
+use flow_domain::NodeType;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -8,6 +8,117 @@ use std::{
     io::{self, Read},
     path::{Path, PathBuf},
 };
+
+/// Route admitted by the scan, including the identity used for grants and spawn checks.
+#[derive(Debug, Clone)]
+pub struct DiscoveredPlugin {
+    pub manifest: PluginManifest,
+    pub source: PathBuf,
+    pub content_hash: String,
+}
+
+impl DiscoveredPlugin {
+    pub fn entry(&self) -> PathBuf {
+        self.source.join(&self.manifest.plugin.entry)
+    }
+}
+
+/// Read the exact bytes used for parsing and content identity, with a fixed budget.
+pub fn read_manifest(path: &Path) -> io::Result<Vec<u8>> {
+    const MAX_BYTES: usize = 256 * 1024;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take((MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_BYTES {
+        return Err(io::Error::other("manifest exceeds 256 KiB"));
+    }
+    Ok(bytes)
+}
+
+/// Content identity used by grants: SHA-256(manifest bytes followed by entry bytes).
+pub fn content_hash(manifest: &[u8], entry: &[u8]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(manifest);
+    hash.update(entry);
+    hex::encode(hash.finalize())
+}
+
+pub fn content_hash_path(manifest: &[u8], entry: &Path) -> io::Result<String> {
+    let mut hash = Sha256::new();
+    hash.update(manifest);
+    let mut file = std::fs::File::open(entry)?;
+    let mut buffer = [0; 65536];
+    loop {
+        let size = file.read(&mut buffer)?;
+        if size == 0 {
+            break;
+        }
+        hash.update(&buffer[..size]);
+    }
+    Ok(hex::encode(hash.finalize()))
+}
+
+/// Compatibility registrations for bundled plugins. External plugins use manifests.
+pub struct BundledRoute {
+    pub node_type: &'static str,
+    pub plugin_id: &'static str,
+    pub binary_env: &'static str,
+    pub sibling: &'static str,
+    pub invoke: &'static str,
+    pub manifest: &'static str,
+}
+
+pub const BUNDLED_ROUTES: &[BundledRoute] = &[
+    BundledRoute {
+        node_type: "harness",
+        plugin_id: "harness-agent",
+        binary_env: "FLOW_AGENT_PLUGIN_BIN",
+        sibling: "flow-agent-plugin",
+        invoke: "agent/runTurn",
+        manifest: include_str!("../../../plugins/harness/plugin/plugin.toml"),
+    },
+    BundledRoute {
+        node_type: "llm",
+        plugin_id: "llm",
+        binary_env: "FLOW_LLM_PLUGIN_BIN",
+        sibling: "flow-llm-plugin",
+        invoke: "llm/invoke",
+        manifest: include_str!("../../../plugins/llm/plugin/plugin.toml"),
+    },
+];
+
+impl BundledRoute {
+    /// Match the actual executor environment and its sibling binary layout.
+    pub fn binary(
+        &self,
+        executor: Option<&Path>,
+        override_path: Option<std::ffi::OsString>,
+    ) -> Option<PathBuf> {
+        let path = override_path
+            .map(PathBuf::from)
+            .or_else(|| executor?.parent().map(|dir| dir.join(self.sibling)))?;
+        path.is_file().then_some(path)
+    }
+}
+
+pub fn default_routes(
+    program: Option<&Path>,
+    environment: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> BTreeMap<String, String> {
+    if program.is_none() {
+        return BTreeMap::new();
+    }
+    BUNDLED_ROUTES
+        .iter()
+        .filter(|route| {
+            route
+                .binary(program, environment(route.binary_env))
+                .is_some()
+        })
+        .map(|route| (route.node_type.into(), route.plugin_id.into()))
+        .collect()
+}
 
 #[derive(Clone)]
 pub struct ScanRow {
@@ -47,7 +158,7 @@ impl PluginSnapshot {
             .iter()
             .filter_map(|r| r.plugin.as_ref())
             .flat_map(|p| p.manifest.plugin.node_types.iter().cloned())
-            .filter(|name| flow_engine::NodeType::parse(name).is_none())
+            .filter(|name| NodeType::parse(name).is_none())
             .collect()
     }
     pub fn forms(&self) -> BTreeMap<String, Vec<FieldDecl>> {
@@ -55,7 +166,7 @@ impl PluginSnapshot {
             .iter()
             .filter_map(|r| r.plugin.as_ref())
             .flat_map(|p| p.manifest.ui.params_forms.iter())
-            .filter(|f| flow_engine::NodeType::parse(&f.node_type).is_none())
+            .filter(|f| NodeType::parse(&f.node_type).is_none())
             .map(|f| (f.node_type.clone(), f.fields.clone()))
             .collect()
     }
@@ -101,15 +212,7 @@ pub fn scan_unlocked(
             plugin: None,
         };
         let result = (|| -> Result<DiscoveredPlugin, String> {
-            let mut bytes = Vec::new();
-            std::fs::File::open(&path)
-                .map_err(|e| e.to_string())?
-                .take(262145)
-                .read_to_end(&mut bytes)
-                .map_err(|e| e.to_string())?;
-            if bytes.len() > 262144 {
-                return Err("manifest exceeds 256 KiB".into());
-            }
+            let bytes = read_manifest(&path).map_err(|e| e.to_string())?;
             let manifest = parse(std::str::from_utf8(&bytes).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?;
             row.id = manifest.plugin.id.clone();
@@ -118,12 +221,8 @@ pub fn scan_unlocked(
                 return Err("protocol major mismatch".into());
             }
             if manifest.plugin.node_types.iter().any(|name| {
-                flow_engine::NodeType::parse(name).is_some_and(|kind| {
-                    !matches!(
-                        kind,
-                        flow_engine::NodeType::Harness | flow_engine::NodeType::Llm
-                    )
-                })
+                NodeType::parse(name).is_some()
+                    && !BUNDLED_ROUTES.iter().any(|route| route.node_type == name)
             }) {
                 return Err("node_types contains builtin type".into());
             }
@@ -146,21 +245,11 @@ pub fn scan_unlocked(
                 .map_err(|e| e.to_string())?
                 .starts_with(directory.canonicalize().map_err(|e| e.to_string())?);
             row.entry_oversize = metadata.len() > 256 * 1024 * 1024;
-            let mut hash = Sha256::new();
-            hash.update(&bytes);
-            let mut file = std::fs::File::open(entry).map_err(|e| e.to_string())?;
-            let mut buffer = [0u8; 65536];
-            loop {
-                let n = file.read(&mut buffer).map_err(|e| e.to_string())?;
-                if n == 0 {
-                    break;
-                }
-                hash.update(&buffer[..n]);
-            }
+            let content_hash = content_hash_path(&bytes, &entry).map_err(|e| e.to_string())?;
             Ok(DiscoveredPlugin {
                 manifest,
                 source: directory,
-                content_hash: hex::encode(hash.finalize()),
+                content_hash,
             })
         })();
         match result {
@@ -328,7 +417,7 @@ mod tests {
     }
     #[test]
     fn duplicate_ids_disable_both_and_different_ids_keep_first_owner() {
-        let root = flow_test_support::io::TempDir::new("plugin-scan-conflicts");
+        let root = tempfile::tempdir().unwrap();
         plugin(root.path(), "a", "duplicate", "first-node");
         plugin(root.path(), "b", "duplicate", "second-node");
         plugin(root.path(), "c", "first", "shared-node");
@@ -349,7 +438,7 @@ mod tests {
         let loaded = snapshot.rows[2].plugin.as_ref().unwrap();
         assert_eq!(
             loaded.content_hash,
-            crate::plugin_registry::content_hash(
+            content_hash(
                 &std::fs::read(root.path().join("c/plugin.toml")).unwrap(),
                 b"plugin bytes"
             )
@@ -357,7 +446,7 @@ mod tests {
     }
     #[test]
     fn malformed_and_oversized_manifests_are_visible_and_hidden_directories_ignored() {
-        let root = flow_test_support::io::TempDir::new("plugin-scan-broken");
+        let root = tempfile::tempdir().unwrap();
         plugin(root.path(), "a", "valid", "custom-node");
         plugin(root.path(), ".hidden", "hidden", "hidden-node");
         std::fs::create_dir(root.path().join("broken")).unwrap();
@@ -384,7 +473,7 @@ mod tests {
     }
     #[test]
     fn listing_cache_is_best_effort_and_explicit_invalidation_forces_new_hash() {
-        let root = flow_test_support::io::TempDir::new("plugin-scan-cache");
+        let root = tempfile::tempdir().unwrap();
         plugin(root.path(), "demo", "demo", "custom");
         let first = scan_cached(root.path(), &BTreeMap::new()).unwrap();
         let old_hash = first.rows[0].plugin.as_ref().unwrap().content_hash.clone();
@@ -425,7 +514,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn legacy_external_entry_is_annotated_without_removing_its_route() {
-        let root = flow_test_support::io::TempDir::new("plugin-scan-legacy");
+        let root = tempfile::tempdir().unwrap();
         plugin(root.path(), "legacy", "legacy", "legacy-node");
         let entry = root.path().join("legacy/entry");
         std::fs::remove_file(&entry).unwrap();

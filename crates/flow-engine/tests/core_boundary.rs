@@ -35,3 +35,13 @@ fn extensions_cannot_bypass_graph_integrity() {
     let extensions = BTreeSet::from(["example_transform".to_owned()]);
     assert!(graph.validate_with_dynamic(&extensions).is_err());
 }
+
+#[test]
+fn declaring_a_builtin_as_an_extension_cannot_override_its_parameter_rules() {
+    let mut value = serde_json::to_value(definition()).unwrap();
+    value["nodes"][1]["type"] = json!("script");
+    let graph: Definition = serde_json::from_value(value).unwrap();
+    let invalid = graph.validate().expect_err("script requires code");
+    let extensions = BTreeSet::from(["script".to_owned()]);
+    assert_eq!(graph.validate_with_dynamic(&extensions), Err(invalid));
+}

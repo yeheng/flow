@@ -32,12 +32,21 @@
 /// 按需求集合逐项解析的 credentials、ExecuteTask.pending_operation（换
 /// dispatch 时沿用原 operation 身份）。旧执行器忽略这些字段即会在受管工作流
 /// 上无限制执行，因此必须在握手层拒绝。
+/// Standalone task frames are an additive capability (`job:<handler>`). Only
+/// negotiated standalone sessions send them; v8 workflow sessions keep their
+/// original frame set and postcard indices.
 pub const PROTOCOL_VERSION: u32 = 8;
+
+/// Local workflow sessions with this capability can start a handler with an
+/// empty `Job.input`, referring to the frozen inputs of the same dispatch.
+pub const PREPARED_JOB_CAPABILITY: &str = "prepared-job-v1";
+/// Separate opt-in for executors that also accept prepared Condition nodes.
+pub const PREPARED_CONDITION_JOB_CAPABILITY: &str = "prepared-condition-job-v1";
 
 /// control 通道单帧上限（不含 4 字节长度头）。握手
 /// 只可协商到本上限以内。
 ///
-/// 取 128 KiB 的约束：内联业务值上限 `flow_journal::INLINE_BYTES` 是 64 KiB
+/// 取 128 KiB 的约束：内联业务值上限 `flow_facts::INLINE_BYTES` 是 64 KiB
 /// （按编码后字节数计），`Result`/`Wait` 控制帧 = 值编码 + 信封必须永远
 /// 装得下——64 KiB 值 + 64 KiB 余量使「可 inline 但装不进控制帧」的窄带
 /// 在算术上不可达，不再需要降级补丁。
@@ -95,7 +104,7 @@ pub const MAX_AUDIT_RECORD_BYTES: u64 = 512 * 1024;
 /// 避免主进程重切日志 chunk。
 ///
 /// 传输体积的真实约束不在此文件，由接收侧硬执行：输入流聚合 ≤ 执行器
-/// `INPUT_BUDGET`（8 MiB）、单值 ≤ `flow_journal::MAX_VALUE_BYTES`
+/// `INPUT_BUDGET`（8 MiB）、单值 ≤ `flow_facts::MAX_VALUE_BYTES`
 /// （见 flow-executor `transfer.rs` 的 feed/input_ready 拒绝路径）；
 /// agent 侧队列按帧数有界（relay.rs）。本文件不重复声明这些数字。
 pub const TRANSFER_CHUNK_BYTES: usize = 256 * 1024;

@@ -5,11 +5,12 @@ edition.workspace = true
 
 [features]
 default = ["runtime"]
-runtime = ["flow-journal/storage", "dep:reqwest", "dep:aes-gcm"]
+runtime = ["dep:flow-journal", "flow-journal/storage", "dep:reqwest", "dep:aes-gcm"]
 
 [dependencies]
+flow-dispatcher = { path = "../flow-dispatcher" }
 flow-domain = { path = "../flow-domain" }
-flow-journal = { path = "../flow-journal", default-features = false }
+flow-journal = { path = "../flow-journal", default-features = false, optional = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde = { workspace = true }
@@ -17,17 +18,10 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 reqwest = { workspace = true, optional = true }
-parking_lot = { workspace = true }
-libc = { workspace = true }
-getrandom = { workspace = true }
-interprocess = { workspace = true }
-postcard = { workspace = true }
 tracing = { workspace = true }
 aes-gcm = { version = "0.10", optional = true }
 hex = { workspace = true }
 flow-dto = { path = "../flow-dto" }
-futures = { workspace = true }
-tokio-tungstenite = { workspace = true }
 
 # Shared test infrastructure; no production dependency on test processes.
 [dev-dependencies]
@@ -41,6 +35,3 @@ sha2.workspace = true
 [[test]]
 name = "observation"
 required-features = ["runtime"]
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp"] }

@@ -22,7 +22,7 @@
 //! 用户值字节一律走 data 语义帧分块传输——否则一次大输出就能把会话
 //! 帧撑爆，而协议层唯一的手段是杀会话。
 
-use flow_journal::{StoredValue, ValueRef};
+use flow_facts::{StoredValue, ValueRef};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
@@ -668,6 +668,34 @@ pub enum Message {
         allowed: bool,
         reason: Option<String>,
     },
+    /// Optional task protocol. Only sent to a peer advertising the handler capability.
+    /// Append variants to preserve all existing postcard indices.
+    ExecuteJob {
+        command_id: String,
+        dispatch_id: String,
+        job: crate::Job,
+    },
+    JobFinished {
+        dispatch_id: String,
+        result_id: String,
+        outcome: Result<Vec<u8>, String>,
+    },
+    /// Negotiated large values follow as TransferChunk/InputReady on the same stream.
+    ExecuteJobStream {
+        command_id: String,
+        dispatch_id: String,
+        job_id: String,
+        handler: String,
+    },
+    /// Workflow adapter: assemble inputs and emit preparation facts, then wait
+    /// for a separate `ExecuteJob`. Requires the advertised node capability.
+    PrepareJob {
+        command_id: String,
+        dispatch_id: String,
+        task: Box<ExecuteTask>,
+    },
+    /// A prepared input bound to this dispatch is now available on the session.
+    JobPrepared { dispatch_id: String },
 }
 
 /// Permit 交付的一项凭证：secret 名 → 真值。`Debug` 不打印真值。
@@ -750,7 +778,7 @@ pub struct ExecuteTask {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TaskValue {
     /// 按 journal 引用回传的值（字节由主进程从 journal 流式送出）。
-    Ref(flow_journal::ValueRef),
+    Ref(flow_facts::ValueRef),
     /// 原 inline 值（字节由主进程分块送出）。
     Local,
 }
@@ -777,6 +805,11 @@ impl Message {
             Message::Welcome { .. } => "Welcome",
             Message::Ready => "Ready",
             Message::Execute { .. } => "Execute",
+            Message::ExecuteJob { .. } => "ExecuteJob",
+            Message::ExecuteJobStream { .. } => "ExecuteJobStream",
+            Message::PrepareJob { .. } => "PrepareJob",
+            Message::JobPrepared { .. } => "JobPrepared",
+            Message::JobFinished { .. } => "JobFinished",
             Message::Accepted { .. } => "Accepted",
             Message::AuditBatch { .. } => "AuditBatch",
             Message::AuditAck { .. } => "AuditAck",
@@ -819,6 +852,11 @@ impl Message {
     pub fn dispatch_id(&self) -> Option<&str> {
         match self {
             Message::Execute { dispatch_id, .. }
+            | Message::ExecuteJob { dispatch_id, .. }
+            | Message::ExecuteJobStream { dispatch_id, .. }
+            | Message::PrepareJob { dispatch_id, .. }
+            | Message::JobPrepared { dispatch_id }
+            | Message::JobFinished { dispatch_id, .. }
             | Message::Accepted { dispatch_id, .. }
             | Message::AuditBatch { dispatch_id, .. }
             | Message::AuditAck { dispatch_id, .. }

@@ -6,27 +6,27 @@
 //! 不存在第二份状态语义；同时保证「事实已接受但折叠失败」时状态回到折叠前。
 //! 没有这一层，SQLite 事务提交成功后内存态就会与权威事实分叉，
 //! 崩溃恢复将读到与事实不一致的 run 状态（进而重复派发或漏发外部副作用）。
-use flow_journal::{Event, EventKind, StoredValue, Transaction};
+use flow_facts::{Event, EventKind, StoredValue, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
 use crate::Definition;
 
-mod undo;
 #[cfg(test)]
 mod transition_table;
+mod undo;
 use undo::UndoLog;
 
 /// 折叠层的错误类型：直接复用 journal 的错误族，避免第二套错误码语义。
-type Result<T> = flow_journal::Result<T>;
+type Result<T> = flow_facts::Result<T>;
 
 /// 构造一条「事实非法」错误。
 ///
 /// 折叠层拒绝一条事实时用它统一报错形状：消息进入协调循环日志并让事务
 /// 整批回滚，调用方不需要区分「形状非法」与「状态冲突」两类错误。
-fn invalid(s: impl Into<String>) -> flow_journal::Error {
-    flow_journal::Error::Invalid(s.into())
+fn invalid(s: impl Into<String>) -> flow_facts::Error {
+    flow_facts::Error::Invalid(s.into())
 }
 
 // Accept numeric snapshot counters from earlier development logs, emit lossless strings.
@@ -211,7 +211,7 @@ fn is_zero(value: &u64) -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub environment: Option<crate::environments::EnvironmentBinding>,
+    pub environment: Option<crate::EnvironmentBinding>,
     pub runtime: String,
     pub clock_ms: i64,
     pub seed: String,
@@ -723,7 +723,7 @@ pub struct CommandRecord {
     pub request_id: Option<String>,
     pub fingerprint: String,
     pub result: Value,
-    #[serde(with = "flow_journal::decimal")]
+    #[serde(with = "flow_facts::decimal")]
     pub lsn: u64,
 }
 // 裁决形状契约由命令预检与事实折叠共用，避免「命令层放行但折叠层拒绝」
@@ -791,7 +791,7 @@ pub struct ScheduleFire {
 pub struct State {
     /// Rebuilt by replay before accepting commands; never trusted from serialized snapshots.
     #[serde(skip)]
-    pub values: flow_journal::value::Publications,
+    pub values: flow_facts::value::Publications,
     /// Backend keeps permanent audit receipts in a rebuildable disk index.
     #[serde(skip)]
     pub compact_audits: bool,
@@ -1674,12 +1674,11 @@ impl State {
             // WaitResolved/Adjudicated 解除，不许绕道重派。Running 的在飞
             // 重派是合法恢复路径（执行器会话丢失、收件箱信号重投），
             // 状态图上 Running→Running 不可见，由 attempt 账本承载。
-            let dispatchable = matches!(
-                node.status,
-                NodeStatus::Pending | NodeStatus::Running
-            ) || node.wait.as_ref().is_some_and(|w| {
-                matches!(w.kind(), WaitKind::Retry | WaitKind::Approval)
-            });
+            let dispatchable = matches!(node.status, NodeStatus::Pending | NodeStatus::Running)
+                || node
+                    .wait
+                    .as_ref()
+                    .is_some_and(|w| matches!(w.kind(), WaitKind::Retry | WaitKind::Approval));
             if !dispatchable
                 || node.node_execution_id != execution
                 || attempt != node.attempt + 1
@@ -1820,9 +1819,9 @@ impl State {
                 attempt.audit_lsns.insert(event.audit_seq, lsn);
                 attempt.audit_digests.insert(
                     event.audit_seq,
-                    flow_journal::codec::digest(&flow_journal::codec::bounded_json(
+                    flow_facts::codec::digest(&flow_facts::codec::bounded_json(
                         event,
-                        flow_journal::MAX_LINE_BYTES,
+                        flow_facts::MAX_LINE_BYTES,
                     )?),
                 );
             }
@@ -1859,8 +1858,8 @@ impl State {
                 }
                 let operation: Operation = serde_json::from_value(p["operation"].clone())?;
                 let digest = match &operation.request {
-                    StoredValue::Inline(value) => flow_journal::codec::digest(
-                        &flow_journal::codec::bounded_json(value, flow_journal::INLINE_BYTES)?,
+                    StoredValue::Inline(value) => flow_facts::codec::digest(
+                        &flow_facts::codec::bounded_json(value, flow_facts::INLINE_BYTES)?,
                     ),
                     StoredValue::Ref(value) => value.digest.clone(),
                 };
@@ -1911,12 +1910,10 @@ impl State {
                 // 终态节点或其余等待形态收到结果即状态矛盾，整批拒绝，
                 // 防止迟到结果改写已裁决/已解除的新状态。
                 let wait_allows_result = node.status == NodeStatus::Waiting
-                    && node.wait.as_ref().is_some_and(|w| {
-                        matches!(
-                            w.kind(),
-                            WaitKind::Child | WaitKind::Approval
-                        )
-                    });
+                    && node
+                        .wait
+                        .as_ref()
+                        .is_some_and(|w| matches!(w.kind(), WaitKind::Child | WaitKind::Approval));
                 let result_source_ok = match event.kind {
                     EventKind::NodeFailed => {
                         node.status == NodeStatus::Running || wait_allows_result
@@ -1924,9 +1921,10 @@ impl State {
                     EventKind::NodeCompleted => {
                         node.status == NodeStatus::Running
                             || (node.status == NodeStatus::Waiting
-                                && node.wait.as_ref().is_some_and(|w| {
-                                    w.kind() == WaitKind::Approval
-                                }))
+                                && node
+                                    .wait
+                                    .as_ref()
+                                    .is_some_and(|w| w.kind() == WaitKind::Approval))
                     }
                     _ => node.status == NodeStatus::Running,
                 };
@@ -2645,8 +2643,8 @@ mod permission_fold_tests {
 
     /// 指纹 = 请求字节摘要（I11）：测试请求是内联 null。
     fn null_fingerprint() -> String {
-        flow_journal::codec::digest(
-            &flow_journal::codec::bounded_json(&Value::Null, flow_journal::INLINE_BYTES).unwrap(),
+        flow_facts::codec::digest(
+            &flow_facts::codec::bounded_json(&Value::Null, flow_facts::INLINE_BYTES).unwrap(),
         )
     }
 
@@ -2921,10 +2919,10 @@ mod atomic_value_tests {
     #[test]
     fn preview_and_apply_value_prefix_share_atomic_rollback_and_cursor_rules() {
         let mut state = State::default();
-        let reference = flow_journal::ValueRef {
+        let reference = flow_facts::ValueRef {
             journal_id: "batch".into(),
             output_id: "v".into(),
-            codec: flow_journal::value::ValueCodec::Json,
+            codec: flow_facts::value::ValueCodec::Json,
             version: 1,
             chunk_count: 1,
             total_bytes: 1,
