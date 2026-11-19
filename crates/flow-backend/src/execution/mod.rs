@@ -13,6 +13,7 @@
 //! 路径，否则同一份配置在两条路径下会得到不同的执行语义；把「解析」与
 //! 「执行」分开，也让模式决策可以被单独断言。
 
+mod credentials;
 pub mod dispatch;
 pub use flow_dispatcher::pool;
 pub mod remote;

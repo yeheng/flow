@@ -75,6 +75,7 @@ struct CurrentTask {
     /// 本派发的入站邮箱（传输块、许可、ACK 转发目标）。
     mail: mpsc::Sender<Message>,
     /// 工具裁决专用通道（G5）：与 mail 分离，反向处理器在回合内独占消费。
+    #[cfg(feature = "plugins")]
     tool: mpsc::Sender<Message>,
     /// 审计确认的转发通道。
     ack_tx: watch::Sender<(u64, u64)>,
@@ -181,8 +182,12 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
     // 插件注册表：进程启动加载一次（内置默认注册 + plugins 目录发现），
     // 不热加载——进程重启即插件重载。坏 manifest 只 warn 并禁用该插件，
     // 不影响执行器会话。
-    let plugins = std::sync::Arc::new(crate::plugin_registry::PluginRegistry::load());
-    tracing::info!(registered = plugins.len(), "plugin registry loaded");
+    #[cfg(feature = "plugins")]
+    let plugins = {
+        let registry = std::sync::Arc::new(crate::plugin_registry::PluginRegistry::load());
+        tracing::info!(registered = registry.len(), "plugin registry loaded");
+        registry
+    };
     loop {
         // 每轮先冲刷积压：积压未清时不再拉取新的出站消息，形成对
         // 心跳与任务生产方的自然背压。
@@ -274,7 +279,12 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
                 received = transport.recv(), if pending.is_empty() => {
                 match received {
                     Ok(message) => {
-                        if let Some(code) = handle_message(&mut current, &mut pending, message, &outbound_tx, &identity, limits_ref, config.remote_replay, &plugins) {
+                        if let Some(code) = handle_message(
+                            &mut current, &mut pending, message, &outbound_tx,
+                            &identity, limits_ref, config.remote_replay,
+                            #[cfg(feature = "plugins")]
+                            &plugins,
+                        ) {
                             exit_code = code;
                             break;
                         }
@@ -341,7 +351,7 @@ fn handle_message(
     identity: &SessionIdentity,
     limits: NegotiatedLimits,
     remote_replay: bool,
-    plugins: &std::sync::Arc<crate::plugin_registry::PluginRegistry>,
+    #[cfg(feature = "plugins")] plugins: &std::sync::Arc<crate::plugin_registry::PluginRegistry>,
 ) -> Option<i32> {
     match message {
         message @ (Message::Execute { .. } | Message::PrepareJob { .. }) => {
@@ -380,6 +390,7 @@ fn handle_message(
             }
             let _ = identity;
             let (mail_tx, mail_rx) = mpsc::channel(64);
+            #[cfg(feature = "plugins")]
             let (tool_tx, tool_rx) = mpsc::channel(16);
             let (ack_tx, _) = watch::channel((0u64, 0u64));
             let runner_ack = ack_tx.clone();
@@ -395,6 +406,7 @@ fn handle_message(
                 task,
                 outbound: outbound.clone(),
                 mail: mail_rx,
+                #[cfg(feature = "plugins")]
                 tool_mail: std::sync::Arc::new(tokio::sync::Mutex::new(tool_rx)),
                 ack_tx: runner_ack,
                 cancel: cancel.clone(),
@@ -403,6 +415,7 @@ fn handle_message(
                 remote_replay,
                 transfers: IncomingTransfers::default(),
                 last_result: None,
+                #[cfg(feature = "plugins")]
                 plugins: plugins.clone(),
             };
             tokio::spawn(async move {
@@ -412,6 +425,7 @@ fn handle_message(
             *current = Some(CurrentTask {
                 dispatch_id,
                 mail: mail_tx,
+                #[cfg(feature = "plugins")]
                 tool: tool_tx,
                 ack_tx,
                 cancel,
@@ -461,10 +475,13 @@ fn handle_message(
         }
         Message::ToolPermissionDecision { .. } => {
             // G5 工具裁决走专用通道：反向处理器在回合内独占消费。
-            let dispatch_id = message.dispatch_id().unwrap_or_default().to_string();
-            if let Some(task) = current {
-                if task.dispatch_id == dispatch_id {
-                    pending.push_back((task.tool.clone(), message));
+            #[cfg(feature = "plugins")]
+            {
+                let dispatch_id = message.dispatch_id().unwrap_or_default();
+                if let Some(task) = current {
+                    if task.dispatch_id == dispatch_id {
+                        pending.push_back((task.tool.clone(), message));
+                    }
                 }
             }
             None

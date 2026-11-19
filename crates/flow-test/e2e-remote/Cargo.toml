@@ -39,6 +39,7 @@ flow-agent = { path = "../../flow-agent" }
 flow-engine = { path = "../../flow-engine" }
 flow-journal = { path = "../../flow-journal", default-features = false, features = ["storage"] }
 flow-config = { path = "../../flow-config" }
+flow-dto = { path = "../../flow-dto" }
 flow-rpc = { path = "../../flow-rpc" }
 # wire 级客户端/进程 harness 与 backend-e2e 共用一份（DESIGN.md §14）。
 flow-test-support = { path = "../test-support" }

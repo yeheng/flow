@@ -9,13 +9,14 @@
 //! 事实上，节点语义则一律交给执行器子进程（C2）。
 //! 需要它，是因为外部副作用无法纳入本地事务：只有把意图、授权与结果
 //! 分成三个可裁决的阶段（C3/C4），崩溃后的未知结果才有一个明确的出口。
-use crate::execution::remote::{RemoteDispatcher, RemoteOptions};
-use crate::execution::{ExecutionMode, IpcDispatcher};
+use crate::execution::remote::{RemoteDispatcher, RemoteListeners, RemoteOptions};
+use crate::execution::{ExecutionMode, IpcDispatcher, IpcOptions};
 use crate::journal::{JournalBackend, JournalError};
 use crate::journal_commands::node_event;
 use crate::journal_commands::runtime_mismatched;
 use crate::journal_execution::Attempt;
 use flow_engine::journal_state::{Node as NodeState, NodeStatus, Run, RunStatus, Wait, WaitKind};
+use flow_engine::progression::{is_settled, node_gate, run_settlement, NodeGate, RunSettlement};
 use flow_engine::{Definition, NodeLogger, NodeType};
 use flow_journal::{Event, EventKind, StoredValue};
 use futures::FutureExt;
@@ -73,28 +74,6 @@ impl Coordinator {
     }
 }
 
-/// 纯状态推断（reducer）：一个节点在当前快照的入边结论。只读 committed
-/// facts，决策与副作用彻底分离——副作用全部落在 journal 事实里。
-#[derive(Debug, Clone)]
-enum NodeGate {
-    /// 前驱未全部终态，本轮不动。
-    Blocked,
-    /// 分支不可达或上游失败/跳过：写 NodeSkipped（携带原因）。
-    Skip(&'static str),
-    /// 可派发，携带已接受的前驱输出。
-    Ready(BTreeMap<String, StoredValue>),
-}
-
-/// 入边判定所需的最小前驱视图：状态 / 分支结论 / 输出声明。
-/// （不带 attempts 账本——那是结果屏障的账，与汇合判定无关。）
-#[derive(Debug, Clone)]
-struct GateNode {
-    status: NodeStatus,
-    branch: Option<bool>,
-    output: Option<StoredValue>,
-    inactive: bool,
-}
-
 type Result<T> = std::result::Result<T, JournalError>;
 
 /// 统一错误构造（参数/合同类问题）。
@@ -120,16 +99,16 @@ impl JournalBackend {
         mode: ExecutionMode,
         prewarm: bool,
     ) -> Result<()> {
-        // ExecutionMode 只有 Ipc 一个变体（进程内路径已全平台删除）。
         let ExecutionMode::Ipc(options) = mode;
-        // I09：启用 IPC 时二进制缺失直接失败，不静默回退进程内执行。
-        if !options.executor.program.is_file() {
-            return Err(invalid(format!(
-                "executor binary missing: {}",
-                options.executor.program.display()
-            ))
-            .into());
-        }
+        check_executor(&options)?;
+        self.activate_ipc(options, prewarm).await
+    }
+
+    pub(crate) async fn activate_ipc(
+        self: &Arc<Self>,
+        options: IpcOptions,
+        prewarm: bool,
+    ) -> Result<()> {
         let plugin_executor_program = options.executor.program.clone();
         let epoch = self.bump_master_epoch().await?;
         // 协调器的派发窗口与执行槽位是同一个旋钮：IPC 的 x_max 同时是池容量与
@@ -137,8 +116,15 @@ impl JournalBackend {
         let limit = options.x_max.clamp(1, 16);
         let pool = crate::execution::ExecutorPool::new(options, self.journal.id().into(), epoch);
         let dispatcher = Arc::new(IpcDispatcher::new(pool));
-        self.start_execution_with_port(limit, ExecutionPort::Ipc(dispatcher), prewarm).await?;
-        *self.plugin_executor_program.write().unwrap_or_else(|e| e.into_inner()) = Some(plugin_executor_program);
+        if self
+            .start_execution_with_port(limit, ExecutionPort::Ipc(dispatcher), prewarm)
+            .await
+        {
+            *self
+                .plugin_executor_program
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = Some(plugin_executor_program);
+        }
         Ok(())
     }
 
@@ -162,45 +148,35 @@ impl JournalBackend {
 
     /// 三期远程模式：epoch + TLS 监听 + 远程派发器（R1）。
     pub async fn start_execution_remote(self: &Arc<Self>, options: RemoteOptions) -> Result<()> {
+        let listeners = RemoteListeners::bind(&options).await?;
+        self.activate_remote(options, listeners).await
+    }
+
+    pub(crate) async fn activate_remote(
+        self: &Arc<Self>,
+        options: RemoteOptions,
+        listeners: RemoteListeners,
+    ) -> Result<()> {
         let epoch = self.bump_master_epoch().await?;
         let manager = crate::execution::remote::AgentManager::new(
             self.clone(),
             self.journal.id().into(),
             epoch,
         );
-        manager.listen_tls(options.clone()).await?;
-        // T13：配置了 WSS 时附加启动代理接入监听（直连 mTLS 不变）。
-        // 身份由 token→agent_id 映射表决定，凭据表不可留空。
-        if let Some(addr) = &options.wss_addr {
-            if options.wss_agents.is_empty() {
-                // 配了接入地址却没有凭据，等于开了一个谁都能连的口子。
-                manager.shutdown().await;
-                return Err(crate::journal::JournalError::Journal(
-                    flow_journal::Error::Invalid(
-                        "execution.remote.wss_addr 配置了但 agents 凭据表为空".into(),
-                    ),
-                ));
-            }
-            if let Err(error) = manager
-                .listen_wss(addr.clone(), options.wss_agents.clone())
-                .await
-            {
-                manager.shutdown().await;
-                return Err(error.into());
-            }
-        }
-        let dispatcher = Arc::new(RemoteDispatcher::new(manager.clone(), options.clone()));
-        let result = self
+        listeners.start(&manager, options.wss_agents.clone());
+        let dispatcher = Arc::new(RemoteDispatcher::new(manager.clone(), options));
+        if self
             .start_execution_with_port(16, ExecutionPort::Remote(dispatcher), false)
-            .await;
-        if result.is_err() {
-            // 启动失败时必须关掉已监听的端口，否则会留下一个没有协调器
-            // 的空壳监听。
-            manager.shutdown().await;
+            .await
+        {
+            *self
+                .plugin_executor_program
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = None;
         } else {
-            *self.plugin_executor_program.write().unwrap_or_else(|e| e.into_inner()) = None;
+            manager.shutdown().await;
         }
-        result
+        Ok(())
     }
 
     /// 三期远程（测试/in-process 入口）：用既有 manager 启动远程端口。
@@ -210,8 +186,15 @@ impl JournalBackend {
         options: RemoteOptions,
     ) -> Result<()> {
         let dispatcher = Arc::new(RemoteDispatcher::new(manager, options));
-        self.start_execution_with_port(16, ExecutionPort::Remote(dispatcher), false).await?;
-        *self.plugin_executor_program.write().unwrap_or_else(|e| e.into_inner()) = None;
+        if self
+            .start_execution_with_port(16, ExecutionPort::Remote(dispatcher), false)
+            .await
+        {
+            *self
+                .plugin_executor_program
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+        }
         Ok(())
     }
 
@@ -224,11 +207,11 @@ impl JournalBackend {
         limit: usize,
         port: ExecutionPort,
         prewarm: bool,
-    ) -> Result<()> {
+    ) -> bool {
         let mut driver = self.execution.lock().await;
         if driver.as_ref().is_some_and(|handle| !handle.is_finished()) {
             // 已有在跑的协调器：直接复用，不重复起第二个派发者。
-            return Ok(());
+            return false;
         }
         let observation = self.observations.clone();
         let weak = Arc::downgrade(self);
@@ -398,8 +381,18 @@ impl JournalBackend {
                 tracing::error!("coordinator exited unexpectedly; execution port reaped");
             }
         }));
-        Ok(())
+        true
     }
+}
+
+pub(crate) fn check_executor(options: &IpcOptions) -> Result<()> {
+    if !options.executor.program.is_file() {
+        return Err(invalid(format!(
+            "executor binary missing: {}",
+            options.executor.program.display()
+        )).into());
+    }
+    Ok(())
 }
 
 /// Drive one dirty run as far as committed facts allow: parent-cancel
@@ -436,46 +429,28 @@ async fn advance_run(
         if coord.active.contains(&(run_id.to_owned(), node.id.clone())) {
             continue;
         }
-        // 循环内会写事件（NodeSkipped/DispatchStarted），状态读取必须保持
-        // 每节点新鲜；但只取推进所需的最小视图（终态位 + 本节点记录 + 入边
-        // 前驱的 gate 三元组），不再整克隆 Run（definition/输入/attempts
-        // 账本与单节点推进无关）。
-        let (terminal, record, gate_view) = backend
-            .inspect(|s| {
-                let run = s.runs.get(run_id)?;
-                let view: BTreeMap<String, GateNode> = definition
-                    .incoming(&node.id)
-                    .into_iter()
-                    .filter_map(|edge| {
-                        run.nodes.get(&edge.from).map(|from| {
-                            (
-                                edge.from.clone(),
-                                GateNode {
-                                    status: from.status,
-                                    branch: from.branch,
-                                    output: from.output.clone(),
-                                    inactive: matches!(
-                                        from.skip_reason.as_deref(),
-                                        Some("branch_not_taken" | "inactive")
-                                    ),
-                                },
-                            )
-                        })
-                    })
-                    .collect();
-                Some((run.terminal(), run.nodes.get(&node.id).cloned(), view))
+        // Earlier nodes may have committed during this pass. Read each node and
+        // its gate from the same fresh snapshot without copying the full run.
+        let Some((record, gate)) = backend
+            .inspect(|state| -> flow_journal::Result<_> {
+                let run = state.runs.get(run_id).ok_or_else(|| invalid("run missing"))?;
+                Ok((!run.terminal()).then(|| {
+                    (
+                        run.nodes.get(&node.id).cloned(),
+                        node_gate(&definition, &run.nodes, node),
+                    )
+                }))
             })
-            .await
-            .ok_or_else(|| invalid("run missing"))?;
-        if terminal {
+            .await?
+        else {
             break;
-        }
+        };
         if let Some(record) = record {
             if advance_committed_node(backend, run_id, node, &record, &mut coord.wakes).await? {
                 continue;
             }
         }
-        match incoming_gate(&definition, &gate_view, node) {
+        match gate {
             NodeGate::Skip(reason) => {
                 backend
                     .internal_for_run(run_id, |s| {
@@ -683,13 +658,9 @@ async fn advance_committed_node(
             return Ok(true);
         }
     }
-    if matches!(record.status, NodeStatus::Succeeded | NodeStatus::Skipped) {
-        return Ok(true);
-    }
-    // v1 语义（DESIGN.md §9.2，engine_recovery 钉死）：节点失败不立即终结
-    // run——独立分支继续跑完，失败分支的下游被跳过（reason=upstream_failed），
-    // 全部节点终态后由收尾判定写 RunFailed。
-    if record.status == NodeStatus::Failed {
+    // Independent branches may continue after a node fails. Settlement waits
+    // for the whole graph and reports the first failure in definition order.
+    if is_settled(record.status) {
         return Ok(true);
     }
     // 重启恢复:在飞派发只留下 operation 事实时,节点没有活动任务
@@ -719,106 +690,6 @@ async fn advance_committed_node(
         return Ok(true);
     }
     Ok(false)
-}
-
-/// 纯函数：入边在当前快照下的推进结论（无 IO、无副作用）。
-/// 入参是入边前驱的最小视图（[`GateNode`]），不是整份 Run——本函数只读
-/// 汇合判定所需的状态/分支/输出三件事。
-///
-/// 汇合语义分两套：v2 默认「等全部入边确定」（selected 模式是例外），
-/// v1 则要求全部前驱成功。两者不可混用——跳过向下游传播是 v1 的语义。
-fn incoming_gate(
-    definition: &Definition,
-    view: &BTreeMap<String, GateNode>,
-    node: &flow_engine::Node,
-) -> NodeGate {
-    let selected = node.params["join"]
-        .as_str()
-        .map_or(definition.semantics >= 2, |j| j == "selected");
-    if selected {
-        // selected 汇合：等全部入边确定，然后只走被选中的成功路径；
-        // 未选分支记 inactive，全部入边 inactive 时传播 inactive。
-        let mut pending = false;
-        let mut failed = false;
-        let mut active = 0;
-        let mut predecessors = BTreeMap::new();
-        for edge in definition.incoming(&node.id) {
-            match view.get(&edge.from) {
-                Some(n) if n.status == NodeStatus::Skipped && n.inactive => {}
-                Some(n) if matches!(n.status, NodeStatus::Failed | NodeStatus::Skipped) => {
-                    failed = true
-                }
-                Some(n) if n.status == NodeStatus::Succeeded => {
-                    if edge
-                        .port
-                        .as_deref()
-                        .is_none_or(|p| n.branch == Some(p == "true"))
-                    {
-                        active += 1;
-                        if let Some(output) = &n.output {
-                            predecessors.insert(edge.from.clone(), output.clone());
-                        }
-                    }
-                }
-                _ => pending = true,
-            }
-        }
-        return if pending {
-            NodeGate::Blocked
-        } else if failed {
-            NodeGate::Skip("upstream_failed")
-        } else if active == 0 && definition.incoming_count(&node.id) > 0 {
-            NodeGate::Skip("inactive")
-        } else {
-            NodeGate::Ready(predecessors)
-        };
-    }
-    let mut ready = true;
-    let mut skip = false;
-    let mut predecessors = BTreeMap::new();
-    let mut skip_reason = "";
-    for edge in definition.incoming(&node.id) {
-        match view.get(&edge.from) {
-            Some(n) if n.status == NodeStatus::Skipped => {
-                // v1 语义：前驱被跳过则下游也跳过（跳转会向下游传播）。
-                skip = true;
-                ready = false;
-                if skip_reason.is_empty() {
-                    skip_reason = "upstream_skipped";
-                }
-            }
-            Some(n) if n.status == NodeStatus::Failed => {
-                skip = true;
-                ready = false;
-                if skip_reason.is_empty() {
-                    skip_reason = "upstream_failed";
-                }
-            }
-            Some(n) if n.status == NodeStatus::Succeeded => {
-                let accepted = edge
-                    .port
-                    .as_deref()
-                    .is_none_or(|port| n.branch == Some(port == "true"));
-                if !accepted {
-                    skip = true;
-                    ready = false;
-                    if skip_reason.is_empty() {
-                        skip_reason = "branch_not_taken";
-                    }
-                } else if let Some(output) = &n.output {
-                    predecessors.insert(edge.from.clone(), output.clone());
-                }
-            }
-            _ => ready = false,
-        }
-    }
-    if skip {
-        NodeGate::Skip(skip_reason)
-    } else if !ready {
-        NodeGate::Blocked
-    } else {
-        NodeGate::Ready(predecessors)
-    }
 }
 
 /// Reserve one dispatch slot and spawn the node attempt; in-flight
@@ -980,120 +851,57 @@ async fn execute_node(
     (key, result)
 }
 
-/// v1 收尾判定（§6.6）：全部节点终态后收口 run——任一 failed → RunFailed
-/// （错误取定义序第一个 failed 节点）；否则全部 end 计入输出（无输出/
-/// skipped 的 end 记 null，不再丢弃——多 end 时形状恒为 map，与 v1
-/// singular_or_map 一致）。
-///
-/// 收口只在「全部节点都终态」时发生：还有节点在跑或等待时，
-/// run 的结局尚未确定。
+/// Materialize and commit the outcome selected by the workflow rules.
 async fn settle_run(
     backend: &Arc<JournalBackend>,
     run_id: &str,
     definition: &Definition,
 ) -> Result<()> {
-    let Some(snapshot) = backend.inspect(|s| s.runs.get(run_id).cloned()).await else {
-        return Ok(());
-    };
-    if snapshot.terminal()
-        || !definition.nodes.iter().all(|n| {
-            snapshot.nodes.get(&n.id).is_some_and(|n| {
-                matches!(
-                    n.status,
-                    NodeStatus::Succeeded | NodeStatus::Skipped | NodeStatus::Failed
-                )
-            })
+    let settlement = backend
+        .inspect(|state| {
+            let run = state.runs.get(run_id).filter(|run| !run.terminal())?;
+            run_settlement(definition, &run.nodes)
         })
-    {
-        return Ok(());
-    }
-    let failed = definition.nodes.iter().find(|n| {
-        snapshot
-            .nodes
-            .get(&n.id)
-            .is_some_and(|r| r.status == NodeStatus::Failed)
-    });
-    match failed {
-        Some(failed_node) => {
-            let error = snapshot.nodes[&failed_node.id].error.clone();
-            finish_run(backend, run_id, None, error).await?;
+        .await;
+    let ends = match settlement {
+        None => return Ok(()),
+        Some(RunSettlement::Failed(error)) => {
+            return finish_run(backend, run_id, None, error).await;
         }
-        None => {
-            if definition.semantics >= 2
-                && !definition.nodes.iter().any(|n| {
-                    n.kind() == Some(NodeType::End)
-                        && snapshot
-                            .nodes
-                            .get(&n.id)
-                            .is_some_and(|n| n.status == NodeStatus::Succeeded)
-                })
-            {
-                // v2 语义：没有有效 end 完成即视为失败（v1 允许无 end）。
+        Some(RunSettlement::Completed(ends)) => ends,
+    };
+    let output = join_values(backend, ends).await?;
+    if let Some(schema) = &definition.output_schema {
+        // 输出合同不满足时 run 失败，而不是把不合规的输出交给调用方。
+        let actual = match flow_journal::value::materialize(
+            backend.journal.root(),
+            backend.journal.durable_lsn(),
+            &output,
+            flow_journal::VALUE_BUDGET,
+        ) {
+            Ok(value) => value,
+            Err(flow_journal::Error::Limit(_)) => {
                 return finish_run(
                     backend,
                     run_id,
                     None,
-                    Some("no active end node completed".into()),
+                    Some("output contract exceeds 8 MiB validation budget".into()),
                 )
-                .await;
+                .await
             }
-            let ends = definition
-                .nodes
-                .iter()
-                .filter(|n| n.kind() == Some(NodeType::End))
-                .filter(|n| {
-                    definition.semantics == 1
-                        || snapshot
-                            .nodes
-                            .get(&n.id)
-                            .is_some_and(|r| r.status == NodeStatus::Succeeded)
-                })
-                .map(|n| {
-                    (
-                        n.id.clone(),
-                        snapshot
-                            .nodes
-                            .get(&n.id)
-                            .and_then(|r| r.output.clone())
-                            .unwrap_or(StoredValue::Inline(Value::Null)),
-                    )
-                })
-                .collect();
-            let output = join_values(backend, ends).await?;
-            if let Some(schema) = &definition.output_schema {
-                // 输出合同不满足时 run 失败，而不是把不合规的输出交给调用方。
-                let actual = match flow_journal::value::materialize(
-                    backend.journal.root(),
-                    backend.journal.durable_lsn(),
-                    &output,
-                    flow_journal::VALUE_BUDGET,
-                ) {
-                    Ok(value) => value,
-                    Err(flow_journal::Error::Limit(_)) => {
-                        return finish_run(
-                            backend,
-                            run_id,
-                            None,
-                            Some("output contract exceeds 8 MiB validation budget".into()),
-                        )
-                        .await
-                    }
-                    Err(e) => return Err(e.into()),
-                };
-                if let Err(error) = flow_engine::schema::validate(schema, &actual) {
-                    return finish_run(
-                        backend,
-                        run_id,
-                        None,
-                        Some(format!("output contract: {error}")),
-                    )
-                    .await;
-                }
-            }
-            finish_run(backend, run_id, Some(output), None).await?;
+            Err(e) => return Err(e.into()),
+        };
+        if let Err(error) = flow_engine::schema::validate(schema, &actual) {
+            return finish_run(
+                backend,
+                run_id,
+                None,
+                Some(format!("output contract: {error}")),
+            )
+            .await;
         }
     }
-    Ok(())
+    finish_run(backend, run_id, Some(output), None).await
 }
 
 /// 把多个 end 输出合成一个 run 输出值。
@@ -1148,161 +956,6 @@ async fn finish_run(
         }
         Ok((events,()))
     }).await
-}
-
-#[cfg(test)]
-mod gate_tests {
-    use super::*;
-
-    /// 构造一个带给定边的定义（闸门单测用）。
-    fn definition(edges: Value) -> Definition {
-        serde_json::from_value(json!({
-            "nodes": [
-                {"id":"s","type":"start"},
-                {"id":"a","type":"script"},
-                {"id":"b","type":"script"},
-                {"id":"x","type":"script"},
-                {"id":"y","type":"script"},
-                {"id":"e","type":"end"}
-            ],
-            "edges": edges
-        }))
-        .unwrap()
-    }
-
-    /// 按 ID 取定义中的节点。
-    fn node<'a>(id: &str, def: &'a Definition) -> &'a flow_engine::Node {
-        def.nodes.iter().find(|n| n.id == id).unwrap()
-    }
-
-    /// (id, status, branch, output)——output 为业务值，此处包装成 inline StoredValue。
-    fn view(nodes: &[(&str, &str, Option<bool>, Option<Value>)]) -> BTreeMap<String, GateNode> {
-        nodes
-            .iter()
-            .map(|(id, status, branch, output)| {
-                let output = output
-                    .as_ref()
-                    .map(|value| StoredValue::inline(value.clone()).unwrap());
-                (
-                    (*id).to_string(),
-                    GateNode {
-                        status: serde_json::from_value::<NodeStatus>(json!(status)).unwrap(),
-                        branch: *branch,
-                        output,
-                        inactive: *status == "skipped",
-                    },
-                )
-            })
-            .collect()
-    }
-
-    /// 闸门：前驱未定则节点保持阻塞。
-    #[test]
-    fn gate_blocks_until_all_predecessors_settle() {
-        let def = definition(json!([
-            {"from":"s","to":"a"},{"from":"s","to":"b"},
-            {"from":"a","to":"e"},{"from":"b","to":"e"}
-        ]));
-        let settled = view(&[
-            ("s", "succeeded", None, None),
-            ("a", "succeeded", None, Some(json!(1))),
-        ]);
-        assert!(matches!(
-            incoming_gate(&def, &settled, node("e", &def)),
-            NodeGate::Blocked
-        ));
-        // 未注册的入边节点（缺前驱记录）同样阻塞。
-        let empty = view(&[]);
-        assert!(matches!(
-            incoming_gate(&def, &empty, node("a", &def)),
-            NodeGate::Blocked
-        ));
-    }
-
-    /// 闸门：只收集被接受的前驱输出。
-    #[test]
-    fn gate_collects_accepted_predecessor_outputs() {
-        let def = definition(json!([
-            {"from":"s","to":"a"},{"from":"s","to":"b"},
-            {"from":"a","to":"e"},{"from":"b","to":"e"}
-        ]));
-        let view = view(&[
-            ("s", "succeeded", None, None),
-            ("a", "succeeded", None, Some(json!({"a":1}))),
-            ("b", "succeeded", None, Some(json!(2))),
-        ]);
-        let NodeGate::Ready(predecessors) = incoming_gate(&def, &view, node("e", &def)) else {
-            panic!("expected ready");
-        };
-        assert_eq!(
-            predecessors,
-            BTreeMap::from([
-                ("a".to_string(), StoredValue::Inline(json!({"a":1}))),
-                ("b".to_string(), StoredValue::Inline(json!(2))),
-            ])
-        );
-    }
-
-    /// 闸门：失败或跳过的上游会让下游被跳过。
-    #[test]
-    fn gate_skips_downstream_of_failed_or_skipped() {
-        let def = definition(json!([
-            {"from":"s","to":"a"},{"from":"s","to":"b"},
-            {"from":"a","to":"e"},{"from":"b","to":"e"}
-        ]));
-        let failed = view(&[
-            ("s", "succeeded", None, None),
-            ("a", "failed", None, None),
-            ("b", "skipped", None, None),
-        ]);
-        assert!(matches!(
-            incoming_gate(&def, &failed, node("e", &def)),
-            NodeGate::Skip("upstream_failed")
-        ));
-        let view = view(&[
-            ("s", "succeeded", None, None),
-            ("a", "skipped", None, None),
-            ("b", "skipped", None, None),
-        ]);
-        assert!(matches!(
-            incoming_gate(&def, &view, node("e", &def)),
-            NodeGate::Skip("upstream_skipped")
-        ));
-    }
-
-    /// 闸门：条件节点的分支端口决定哪条边被接受。
-    #[test]
-    fn gate_honors_condition_branch_ports() {
-        let def = definition(json!([
-            {"from":"a","to":"x","port":"true"},
-            {"from":"a","to":"y","port":"false"}
-        ]));
-        let view = view(&[("a", "succeeded", Some(false), Some(json!(1)))]);
-        assert!(matches!(
-            incoming_gate(&def, &view, node("x", &def)),
-            NodeGate::Skip("branch_not_taken")
-        ));
-        let NodeGate::Ready(predecessors) = incoming_gate(&def, &view, node("y", &def)) else {
-            panic!("expected ready");
-        };
-        assert_eq!(predecessors["a"], StoredValue::Inline(json!(1)));
-        // 无端口的边不受分支影响。
-        let plain = definition(json!([{"from":"a","to":"x"}]));
-        let NodeGate::Ready(_) = incoming_gate(&plain, &view, node("x", &plain)) else {
-            panic!("expected ready");
-        };
-    }
-
-    /// 闸门：没有入边的节点（如 start）直接就绪。
-    #[test]
-    fn node_without_incoming_edges_is_ready() {
-        let def = definition(json!([{"from":"s","to":"a"}]));
-        let view = view(&[]);
-        assert!(matches!(
-            incoming_gate(&def, &view, node("s", &def)),
-            NodeGate::Ready(_)
-        ));
-    }
 }
 
 #[cfg(test)]

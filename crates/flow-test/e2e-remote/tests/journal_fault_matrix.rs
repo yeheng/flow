@@ -301,6 +301,101 @@ async fn matrix_cancel_between_persist_and_permit_keeps_http_zero() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[tokio::test]
+async fn matrix_cancel_after_approval_blocks_permit_and_http() {
+    use flow_backend::journal_permissions::ApprovalCommand;
+    use flow_engine::journal_state::ApprovalStatus;
+
+    let _scenario = SCENARIO.lock().await;
+    flow_backend::execution::dispatch::fault::clear();
+    let root = tempfile::tempdir().unwrap();
+    let (backend, manager) = open_backend(root.path()).await;
+    let handles: Handles = Arc::new(tokio::sync::Mutex::new(Default::default()));
+    let _shutdown = spawn_agent(&manager, "agent-approval", 1, handles).await;
+    let counter = Arc::new(AtomicUsize::new(0));
+    let url = counting_http(counter.clone()).await;
+    let mut definition = http_flow(&url);
+    definition["permissions"] = json!({
+        "version": 1, "mode": "execute", "allow": [{
+            "id": "http", "action": "net", "methods": ["GET"],
+            "url_prefix": url, "approval": "ask"
+        }]
+    });
+    let flow = install(&backend, definition).await;
+    let gates = flow_backend::execution::dispatch::fault::register(&[
+        "permit_send:before",
+        "permit_send:after",
+        "permit_send:blocked",
+    ]);
+    let created = backend
+        .run_start(&flow, None, json!({}), "manual", None, None)
+        .await
+        .unwrap();
+    let run_id = created.result["run_id"].as_str().unwrap();
+    let pending = until(&backend, run_id, |run| {
+        run.nodes
+            .get("n")
+            .and_then(|node| node.approval.as_ref())
+            .is_some_and(|approval| approval.status == ApprovalStatus::Pending)
+    })
+    .await;
+    let request = &pending.nodes["n"].approval.as_ref().unwrap().request;
+    let receipt = backend
+        .run_decide(
+            ApprovalCommand {
+                run_id,
+                node_id: "n",
+                operation_id: &request.operation_id,
+                request_hash: &request.request_hash,
+                allow: true,
+                scope: flow_dto::permission::ApprovalScope::Once,
+                reason: None,
+                by: flow_dto::permission::Principal::System,
+            },
+            "matrix-approve",
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt.result["decision"], json!("allowed"));
+    reached("permit_send:before").await;
+    backend.run_cancel(run_id, None).await.unwrap();
+    gates["permit_send:before"].send_replace(false);
+
+    // Keep the runner at the enqueue checkpoint if it sends a stale permit, so a
+    // subsequent cancellation message cannot hide the regression at the receiver.
+    let stale_permit = tokio::select! {
+        _ = reached("permit_send:after") => true,
+        _ = reached("permit_send:blocked") => false,
+    };
+    if stale_permit {
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            while counter.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+    }
+    gates["permit_send:after"].send_replace(false);
+    gates["permit_send:blocked"].send_replace(false);
+    let run = until(&backend, run_id, Run::terminal).await;
+    manager.shutdown().await;
+    backend.close().await.unwrap();
+    assert_eq!(run.status, RunStatus::Cancelled);
+    assert!(
+        run.nodes["n"].operation.is_some(),
+        "approval fact was committed"
+    );
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        0,
+        "HTTP after committed cancellation"
+    );
+    assert!(
+        !stale_permit,
+        "permit enqueued after committed cancellation"
+    );
+}
+
 /// 场景 C（T09 矩阵）：ResultCommitted 发送**前**断线 → 外部调用恰好一次
 /// （无重复），已持久结果不因确认丢失而撤销。
 #[tokio::test]

@@ -31,16 +31,15 @@ use std::time::Duration;
 
 use chrono::Utc;
 use flow_dto::permission::{
-    ApprovalScope, Decision, DecisionRecord, Modifiers, OperationSpec, PermissionRequest,
-    Principal, RequestContext,
+    ApprovalScope, Decision, DecisionRecord, Modifiers, PermissionRequest, Principal,
+    RequestContext,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::Digest as _;
 use tokio::sync::mpsc;
 
 use crate::journal::JournalBackend;
 use crate::journal_execution::Attempt;
-use flow_engine::execution_protocol::TransferKey;
 use flow_engine::execution_protocol::contract::{
     CANCEL_REAP_TIMEOUT_MS, DURABLE_WAIT_TIMEOUT_MS, PREPARED_CONDITION_JOB_CAPABILITY,
     PREPARED_JOB_CAPABILITY, TRANSFER_CHUNK_BYTES,
@@ -49,14 +48,19 @@ use flow_engine::execution_protocol::message::{
     Message, PermitCredential, ResultOutcome, WaitKind as WaitRequestKind,
 };
 use flow_engine::execution_protocol::record_bytes;
+use flow_engine::execution_protocol::TransferKey;
 use flow_engine::journal_state::{
-    PermissionAskedPayload, PermissionDecidedPayload, Prepared, Run, RunStatus, Wait, WaitKind,
+    ApprovalStatus, Operation, PermissionAskedPayload, PermissionDecidedPayload, Prepared, Run,
+    RunStatus, Wait, WaitKind,
 };
 use flow_engine::observation::ObservationStore;
 use flow_engine::{Node, NodeType};
 use flow_journal::value::ValueCodec;
 use flow_journal::{EventKind, StoredValue};
 
+use crate::policy::{CheckInput, Evaluation};
+
+use super::credentials;
 use super::pool::ExecutorPool;
 use super::{FromSession, ToSession};
 
@@ -464,19 +468,8 @@ impl DispatchRunner {
     /// 绑定当前会话，非旧会话重放）。
     async fn drive_scoped(&mut self, link: &mut DispatchLink, resume: bool) -> Result<()> {
         let run = self.snapshot().await?;
-        if let Some(binding) = run.execution.as_ref().and_then(|s| s.environment.as_ref()) {
-            let store = self.attempt.backend.environments.get().ok_or_else(|| {
-                flow_journal::Error::Invalid("environment store unavailable".into())
-            })?;
-            let credentials = store
-                .credentials(binding)
-                .map_err(flow_journal::Error::Invalid)?;
-            flow_engine::secrets::ENVIRONMENT_CREDENTIALS
-                .scope(credentials, self.drive_link(link, resume))
-                .await
-        } else {
-            self.drive_link(link, resume).await
-        }
+        let backend = self.attempt.backend.clone();
+        credentials::with_run_scope(&backend, &run, self.drive_link(link, resume)).await
     }
 
     async fn drive_link(&mut self, link: &mut DispatchLink, resume: bool) -> Result<()> {
@@ -539,31 +532,17 @@ impl DispatchRunner {
         } else {
             // 重挂：授权已提交但 Outcome 未到（许可可能在断线中丢失）时
             // 重发当前会话许可；其余靠执行器审计重传自然恢复。
-            if let Some(operation) = record.operation.clone() {
+            if let Some(operation) = &record.operation {
                 if operation.outcome.is_none() && !self.cancel_sent {
-                    let request_value = match &operation.request {
-                        StoredValue::Inline(value) => Some(value.clone()),
-                        _ => None,
-                    };
-                    let credentials = request_value
-                        .map(|value| resolve_credentials_from_request(&value))
-                        .unwrap_or_default();
+                    let credentials = credentials::from_resumed_request(&operation.request);
                     // 许可证丢失会让节点挂到 idle 超时——发送失败必须留痕。
-                    if link
-                        .commands
-                        .send(ToSession::Send(Box::new(Message::OperationPermit {
-                            dispatch_id: self.attempt.dispatch_id.clone(),
-                            operation_id: operation.operation_id.clone(),
-                            permit_id: operation.permit_id.clone(),
-                            request_fingerprint: operation.fingerprint.clone(),
-                            credentials,
-                        })))
+                    if let Err(error) = self
+                        .enqueue_operation_permit(link, operation, credentials)
                         .await
-                        .is_err()
                     {
                         tracing::warn!(
                             dispatch = %self.attempt.dispatch_id,
-                            "operation permit resend dropped: session link closed"
+                            %error, "operation permit resend failed"
                         );
                     }
                 }
@@ -948,7 +927,12 @@ impl DispatchRunner {
                 Ok(None)
             }
             Message::ToolPermissionRequest { .. } => {
-                self.handle_tool_permission(message, link).await?;
+                self.handle_tool_permission(
+                    message,
+                    link,
+                    crate::journal_commands::tests_auto_govern(),
+                )
+                .await?;
                 Ok(None)
             }
             Message::TransferChunk {
@@ -1622,126 +1606,86 @@ impl DispatchRunner {
                     .await?,
             )
         };
-        // 取当前提交状态（准备/授权串行裁决在 internal 事务内完成）。
         let run = self.snapshot().await?;
         let request_value: Value = serde_json::from_slice(&request_bytes)?;
-        // ---- G3：master 内唯一的节点级权限裁决（09 §5）----
-        // 派生需求集合 → 评估 → Allow/Ask/Deny。执行器与插件是执法者不是
-        // 立法者；无策略快照的 run（权限模型前启动）一律拒绝。
-        let evaluated_at = Utc::now();
-        let evaluation = evaluate_node_request(
+        // Manifest resolution and request derivation happen before taking the writer lock.
+        let (request, needs) = prepare_node_permission(
             &run,
             &self.node,
             &request_value,
             &operation_id,
             &request_fingerprint,
             &self.attempt,
-            evaluated_at,
-            self.attempt.backend.approval_ttl_ms(),
         );
-        let run_id = self.attempt.run_id.clone();
-        let node_id = self.attempt.node_id.clone();
-        let dispatch = self.attempt.dispatch_id.clone();
+        let operation = Operation {
+            operation_id: operation_id.clone(),
+            fingerprint: request_fingerprint.clone(),
+            permit_id: crate::journal_commands::id(),
+            request: stored,
+            outcome: None,
+        };
+        let approval_ttl_ms = self.attempt.backend.approval_ttl_ms();
         fault::checkpoint("auth_persist:before").await;
-        match evaluation {
-            G3Decision::Deny { reason, request } => {
-                // 能力不足 / 载荷非法 / legacy：落拒绝事实，通知执行器按业务
-                // 失败收口。会话保持（执行器还要提交 NodeFailed）。
-                let record = request.map(|request| {
-                    (
-                        record_of(
-                            &request,
-                            Decision::Deny,
-                            Principal::System,
-                            vec![],
-                            Some(reason.clone()),
-                        ),
-                        request.context.request_fingerprint.clone(),
-                    )
-                });
-                self.attempt
-                    .backend
-                    .internal_for_run(&self.attempt.run_id, move |state| {
-                        let run = state.runs.get(&run_id).ok_or_else(|| fj("run missing"))?;
-                        let node = &run.nodes[&node_id];
-                        if run.terminal() || node.dispatch_id != dispatch {
-                            return Ok((vec![], ()));
-                        }
-                        let Some((record, fingerprint)) = record else {
-                            return Ok((vec![], ()));
-                        };
-                        let mut event = crate::journal_commands::node_event(
-                            run,
-                            &node_id,
-                            EventKind::PermissionDecided,
-                            serde_json::to_value(PermissionDecidedPayload {
-                                gate: "node".into(),
-                                record,
-                                request_fingerprint: fingerprint,
-                                status: flow_engine::journal_state::ApprovalStatus::Denied,
-                            })?,
-                            true,
-                        );
-                        event.dispatch_id = Some(dispatch.clone());
-                        Ok((vec![event], ()))
-                    })
-                    .await?;
-                let reason = bounded_deny_reason(&reason);
+        let committed = self
+            .attempt
+            .backend
+            .internal_for_run(&self.attempt.run_id, |state| {
+                let run = state
+                    .runs
+                    .get(&self.attempt.run_id)
+                    .ok_or_else(|| fj("run missing"))?;
+                let node = run
+                    .nodes
+                    .get(&self.attempt.node_id)
+                    .ok_or_else(|| fj("node missing"))?;
+                if run.terminal() || node.dispatch_id != self.attempt.dispatch_id {
+                    return Err(fj("operation cancelled/stale"));
+                }
+                let evaluated_at = Utc::now();
+                let outcome =
+                    evaluate_node_permission(run, &request, &needs, evaluated_at, approval_ttl_ms);
+                let events = node_permission_events(
+                    run,
+                    node,
+                    &request,
+                    &operation,
+                    &outcome,
+                    evaluated_at,
+                )?;
+                Ok((events, outcome))
+            })
+            .await;
+        let outcome = match committed {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.cancel_sent = true;
+                self.session_healthy = false;
+                let _ = link
+                    .commands
+                    .send(ToSession::CancelDispatch(self.attempt.dispatch_id.clone()))
+                    .await;
+                return Err(error);
+            }
+        };
+        match outcome {
+            NodeAuthorization::Denied(reason) => {
                 let _ = link
                     .commands
                     .send(ToSession::Send(Box::new(Message::OperationDenied {
                         dispatch_id: self.attempt.dispatch_id.clone(),
                         operation_id,
                         request_fingerprint,
-                        reason,
+                        reason: bounded_deny_reason(&reason),
                     })))
                     .await;
-                Ok(())
             }
-            G3Decision::Ask {
-                request,
-                matched,
-                deadline,
-            } => {
-                // 询问：PermissionAsked 落盘（请求正文随事件持久，审批卡片
-                // 与批准事务都从 master 的持久请求生成），通知执行器原地等待。
-                let payload = PermissionAskedPayload {
-                    gate: "node".into(),
-                    request: request.clone(),
-                    asked_at: evaluated_at.timestamp_millis(),
-                    deadline,
-                    operation_request: Some(stored.clone()),
-                    matched,
-                };
-                self.attempt
-                    .backend
-                    .internal_for_run(&self.attempt.run_id, move |state| {
-                        let run = state.runs.get(&run_id).ok_or_else(|| fj("run missing"))?;
-                        let node = &run.nodes[&node_id];
-                        if run.terminal() || node.dispatch_id != dispatch {
-                            return Err(fj("operation cancelled/stale"));
-                        }
-                        if node.prepared.is_none() || node.operation.is_some() {
-                            return Err(fj("operation already authorized or not prepared"));
-                        }
-                        let mut event = crate::journal_commands::node_event(
-                            run,
-                            &node_id,
-                            EventKind::PermissionAsked,
-                            serde_json::to_value(payload)?,
-                            true,
-                        );
-                        event.dispatch_id = Some(dispatch.clone());
-                        Ok((vec![event], ()))
-                    })
-                    .await?;
+            NodeAuthorization::Pending { deadline, .. } => {
                 fault::checkpoint("auth_persist:after").await;
                 self.pending_approval = Some(PendingApproval {
                     operation_id: operation_id.clone(),
                     request_fingerprint: request_fingerprint.clone(),
                     deadline,
                 });
-                // 挂起不计槽（09 §6.1）：执行器原地等待，槽位交还。
                 self.park(link).await;
                 let _ = link
                     .commands
@@ -1752,157 +1696,87 @@ impl DispatchRunner {
                         deadline_ms: deadline,
                     })))
                     .await;
-                Ok(())
             }
-            G3Decision::Allow { request, matched } => {
-                // 允许：PermissionDecided{Allow, by=System} 与 Intent/Authorized
-                // 同一事务（I26：决策先于或同时于授权落盘）；auto 不是审计
-                // 豁免——决策全自动，记录一条不少。
-                let operation = flow_engine::journal_state::Operation {
-                    operation_id: operation_id.clone(),
-                    fingerprint: request_fingerprint.clone(),
-                    permit_id: crate::journal_commands::id(),
-                    request: stored,
-                    outcome: None,
-                };
-                let decision =
-                    record_of(&request, Decision::Allow, Principal::System, matched, None);
-                let operation_value = serde_json::to_value(&operation)?;
-                let decided_fingerprint = request_fingerprint.clone();
-                let authorize = self
-                    .attempt
-                    .backend
-                    .internal_for_run(&self.attempt.run_id, move |state| {
-                        let run = state.runs.get(&run_id).ok_or_else(|| fj("run missing"))?;
-                        let node = &run.nodes[&node_id];
-                        if run.terminal() || node.dispatch_id != dispatch {
-                            return Err(fj("operation cancelled/stale"));
-                        }
-                        if node.prepared.is_none() {
-                            return Err(fj("operation before committed preparation"));
-                        }
-                        if node.operation.is_some() {
-                            return Err(fj(
-                                "operation already authorized; outcome must be reconciled, not resent",
-                            ));
-                        }
-                        let mut decided = crate::journal_commands::node_event(
-                            run,
-                            &node_id,
-                            EventKind::PermissionDecided,
-                            serde_json::to_value(PermissionDecidedPayload {
-                                gate: "node".into(),
-                                record: decision,
-                                request_fingerprint: decided_fingerprint,
-                                status: flow_engine::journal_state::ApprovalStatus::Allowed,
-                            })?,
-                            true,
-                        );
-                        decided.dispatch_id = Some(dispatch.clone());
-                        let mut intent = crate::journal_commands::node_event(
-                            run,
-                            &node_id,
-                            EventKind::OperationIntent,
-                            json!({"operation": operation_value}),
-                            true,
-                        );
-                        intent.dispatch_id = Some(dispatch.clone());
-                        intent.run_seq += 1;
-                        let mut authorized = crate::journal_commands::node_event(
-                            run,
-                            &node_id,
-                            EventKind::OperationAuthorized,
-                            json!({"operation": operation_value}),
-                            true,
-                        );
-                        authorized.dispatch_id = Some(dispatch.clone());
-                        authorized.run_seq += 2;
-                        Ok((vec![decided, intent, authorized], ()))
-                    })
-                    .await;
+            NodeAuthorization::Allowed(_) => {
                 fault::checkpoint("auth_persist:after").await;
-                match authorize {
-                    Ok(_) => {
-                        // 解析凭证（不进入授权事实）：全部需求已获准（I37），
-                        // 逐项解析需求集合里的 Secret 引用。
-                        if self.node.is_harness_agent() {
-                            let timeout = request_value["timeout_ms"]
-                                .as_u64()
-                                .unwrap_or(flow_engine::exec::DEFAULT_HARNESS_TIMEOUT_MS)
-                                .clamp(1, flow_engine::exec::HARNESS_TIMEOUT_MAX_MS);
-                            self.agent_deadline = Some(
-                                tokio::time::Instant::now()
-                                    + Duration::from_millis(
-                                        timeout
-                                            + flow_engine::execution_protocol::contract::DRAIN_GRACE_MS,
-                                    ),
-                            );
-                        }
-                        let credentials = if request.specs.is_empty() {
-                            // G4 插件节点：无 concrete spec，凭证按 manifest 的
-                            // Secret 字段引用解析（I37）。
-                            resolve_plugin_credentials(
-                                &self.node.node_type,
-                                &request_value["params"],
-                            )
-                        } else {
-                            resolve_credentials_from_specs(&request.specs)
-                        };
-                        // Reserve capacity before taking the decision lock. Enqueue under
-                        // that same lock: a cancellation committed before this point must
-                        // prevent delivery, not merely stop a later scheduling tick.
-                        fault::checkpoint("permit_send:before").await;
-                        let permit = link
-                            .commands
-                            .clone()
-                            .reserve_owned()
-                            .await
-                            .map_err(|_| invalid("operation permit session closed"))?;
-                        self.attempt
-                            .backend
-                            .internal_for_run(&self.attempt.run_id, |state| {
-                                let run = state
-                                    .runs
-                                    .get(&self.attempt.run_id)
-                                    .ok_or_else(|| fj("run missing"))?;
-                                let node = &run.nodes[&self.attempt.node_id];
-                                if run.terminal()
-                                    || node.dispatch_id != self.attempt.dispatch_id
-                                    || node
-                                        .operation
-                                        .as_ref()
-                                        .is_none_or(|op| op.permit_id != operation.permit_id)
-                                {
-                                    return Err(fj(
-                                        "operation cancelled/stale before permit delivery",
-                                    ));
-                                }
-                                permit.send(ToSession::Send(Box::new(Message::OperationPermit {
-                                    dispatch_id: self.attempt.dispatch_id.clone(),
-                                    operation_id,
-                                    permit_id: operation.permit_id.clone(),
-                                    request_fingerprint,
-                                    credentials,
-                                })));
-                                Ok((vec![], ()))
-                            })
-                            .await?;
-                        fault::checkpoint("permit_send:after").await;
-                        Ok(())
-                    }
-                    Err(error) => {
-                        // 取消先提交或身份无效：不发 Permit，保存证据并取消派发。
-                        self.cancel_sent = true;
-                        self.session_healthy = false;
-                        let _ = link
-                            .commands
-                            .send(ToSession::CancelDispatch(self.attempt.dispatch_id.clone()))
-                            .await;
-                        Err(error)
-                    }
+                if self.node.is_harness_agent() {
+                    let timeout = request_value["timeout_ms"]
+                        .as_u64()
+                        .unwrap_or(flow_engine::exec::DEFAULT_HARNESS_TIMEOUT_MS)
+                        .clamp(1, flow_engine::exec::HARNESS_TIMEOUT_MAX_MS);
+                    self.agent_deadline = Some(
+                        tokio::time::Instant::now()
+                            + Duration::from_millis(
+                                timeout + flow_engine::execution_protocol::contract::DRAIN_GRACE_MS,
+                            ),
+                    );
+                }
+                let credentials = credentials::from_allowed_request(
+                    &self.node.node_type,
+                    &request.specs,
+                    &request_value["params"],
+                );
+                if !self
+                    .enqueue_operation_permit(link, &operation, credentials)
+                    .await?
+                {
+                    return Err(fj("operation cancelled/stale before permit delivery").into());
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Reserve the queue slot first, then verify and enqueue under the same
+    /// decision lock that serializes cancellation and the authorization facts.
+    async fn enqueue_operation_permit(
+        &self,
+        link: &DispatchLink,
+        operation: &Operation,
+        credentials: Vec<PermitCredential>,
+    ) -> Result<bool> {
+        fault::checkpoint("permit_send:before").await;
+        let permit = link
+            .commands
+            .clone()
+            .reserve_owned()
+            .await
+            .map_err(|_| invalid("operation permit session closed"))?;
+        let sent = self
+            .attempt
+            .backend
+            .internal_for_run(&self.attempt.run_id, |state| {
+                let current = state
+                    .runs
+                    .get(&self.attempt.run_id)
+                    .filter(|run| !run.terminal())
+                    .and_then(|run| run.nodes.get(&self.attempt.node_id))
+                    .filter(|node| node.dispatch_id == self.attempt.dispatch_id)
+                    .and_then(|node| node.operation.as_ref());
+                let Some(current) = current.filter(|current| {
+                    current.outcome.is_none()
+                        && current.operation_id == operation.operation_id
+                        && current.permit_id == operation.permit_id
+                        && current.fingerprint == operation.fingerprint
+                }) else {
+                    return Ok((vec![], false));
+                };
+                permit.send(ToSession::Send(Box::new(Message::OperationPermit {
+                    dispatch_id: self.attempt.dispatch_id.clone(),
+                    operation_id: current.operation_id.clone(),
+                    permit_id: current.permit_id.clone(),
+                    request_fingerprint: current.fingerprint.clone(),
+                    credentials,
+                })));
+                Ok((vec![], true))
+            })
+            .await?;
+        if sent {
+            fault::checkpoint("permit_send:after").await;
+        } else {
+            fault::checkpoint("permit_send:blocked").await;
+        }
+        Ok(sent)
     }
 
     /// 挂起当前派发：本地池交还执行槽位（总数受 A_MAX 约束，超限保持占槽）；
@@ -1945,6 +1819,7 @@ impl DispatchRunner {
         &mut self,
         message: Message,
         link: &mut DispatchLink,
+        test_bypass: bool,
     ) -> Result<()> {
         let Message::ToolPermissionRequest {
             dispatch_id,
@@ -1960,300 +1835,281 @@ impl DispatchRunner {
             return Err(invalid("tool permission for foreign dispatch"));
         }
         let run = self.snapshot().await?;
-        // 幂等重发：折叠态已有该 tool_call_id 的终态裁决 → 原样重发（I36：
-        // 只去重传输重试，新调用必有独立裁决）。
-        if let Some(approval) = run
-            .nodes
-            .get(&self.attempt.node_id)
-            .and_then(|n| n.approval.as_ref())
-        {
-            if approval.request.context.tool_call_id.as_deref() == Some(tool_call_id.as_str())
-                && approval.gate == "tool"
-            {
-                match approval.status {
-                    flow_engine::journal_state::ApprovalStatus::Allowed
-                    | flow_engine::journal_state::ApprovalStatus::Denied
-                    | flow_engine::journal_state::ApprovalStatus::Expired => {
-                        let (allowed, reason) = match (&approval.status, approval.decision.as_ref())
-                        {
-                            (flow_engine::journal_state::ApprovalStatus::Allowed, _) => {
-                                (true, None)
-                            }
-                            (_, record) => (
-                                false,
-                                record
-                                    .and_then(|r| r.reason.clone())
-                                    .or(Some("permission denied".into())),
-                            ),
-                        };
-                        let _ = link
-                            .commands
-                            .send(ToSession::Send(Box::new(Message::ToolPermissionDecision {
-                                dispatch_id: self.attempt.dispatch_id.clone(),
-                                tool_call_id: tool_call_id.clone(),
-                                operation_id: approval.request.operation_id.clone(),
-                                allowed,
-                                reason,
-                            })))
-                            .await;
-                        return Ok(());
+        let fingerprint = flow_dto::permission::canonical_digest(&params);
+        // A persisted tool decision can be replayed only for the same dispatch and call.
+        let node = run.nodes.get(&self.attempt.node_id);
+        let prior = node
+            .and_then(|node| node.approval.as_ref())
+            .filter(|approval| {
+                approval.gate == "tool"
+                    && approval.dispatch_id == dispatch_id
+                    && approval.request.context.tool_call_id.as_deref() == Some(&tool_call_id)
+            });
+        if let Some(approval) = prior {
+            if approval.request.context.request_fingerprint != fingerprint {
+                return Err(invalid(
+                    "tool call parameters differ from the committed request",
+                ));
+            }
+            match approval.status {
+                ApprovalStatus::Allowed => {
+                    if let Some(turn) = self.active_tool_turn(&run) {
+                        self.enqueue_tool_allow(link, &approval.request, &turn.permit_id, true)
+                            .await?;
                     }
-                    _ => {}
+                    return Ok(());
                 }
-            }
-        }
-        let evaluated_at = Utc::now();
-        let run_id = self.attempt.run_id.clone();
-        // 存量 e2e 的工具免裁钩子：与 legacy 自动治理同一开关（P0/P1 权限
-        // 语义用例以 FLOW_TEST_AUTO_GOVERN=0 选择真实裁决）。
-        if crate::journal_commands::tests_auto_govern() {
-            return self
-                .allow_tool_for_tests(&tool, &tool_call_id, &params, link)
-                .await;
-        }
-        let evaluation = {
-            let specs = crate::policy::derive::tool_specs(&tool, &params, cwd.as_deref());
-            let actor = Principal::Node {
-                run_id: self.attempt.run_id.clone(),
-                node_id: self.attempt.node_id.clone(),
-            };
-            let node = run.nodes.get(&self.attempt.node_id);
-            let fingerprint = flow_dto::permission::canonical_digest(&serde_json::json!(&params));
-            let request = PermissionRequest {
-                actor: actor.clone(),
-                operation_id: crate::journal_commands::id(),
-                specs: specs.clone().unwrap_or_default(),
-                context: RequestContext {
-                    run_id: self.attempt.run_id.clone(),
-                    workflow_id: run.workflow_id.clone(),
-                    workflow_version: run.workflow_version,
-                    node_id: self.attempt.node_id.clone(),
-                    node_type: self.node.node_type.clone(),
-                    dispatch_id: self.attempt.dispatch_id.clone(),
-                    attempt: node.map_or(0, |n| n.attempt),
-                    request_fingerprint: fingerprint,
-                    tool_call_id: Some(tool_call_id.clone()),
-                },
-                policy_digest: run
-                    .policy
-                    .as_ref()
-                    .map(|policy| policy.digest.clone())
-                    .unwrap_or_default(),
-                request_hash: String::new(),
-            }
-            .sealed();
-            let Some(policy) = &run.policy else {
-                return invalid_tool(
-                    &self.attempt,
-                    link,
-                    &tool_call_id,
-                    &request,
-                    "run 缺少冻结策略",
-                )
-                .await;
-            };
-            let specs = match specs {
-                Err(_) if policy.mode == flow_dto::permission::ExecutionMode::Bypass => Vec::new(),
-                Ok(specs) => specs,
-                Err(reason) => {
-                    return invalid_tool(&self.attempt, link, &tool_call_id, &request, &reason)
+                ApprovalStatus::Denied | ApprovalStatus::Expired => {
+                    let reason = approval
+                        .decision
+                        .as_ref()
+                        .and_then(|record| record.reason.clone())
+                        .unwrap_or_else(|| "permission denied".into());
+                    let _ = link
+                        .commands
+                        .send(ToSession::Send(Box::new(Message::ToolPermissionDecision {
+                            dispatch_id,
+                            tool_call_id,
+                            operation_id: approval.request.operation_id.clone(),
+                            allowed: false,
+                            reason: Some(reason),
+                        })))
                         .await;
+                    return Ok(());
                 }
-            };
-            let plugin_id = crate::policy::plugin_id_for_node(
-                &self.node,
-                run.execution
-                    .as_ref()
-                    .and_then(|e| e.agent_plugin.as_ref().map(|p| p.id.as_str())),
-            );
-            let evaluation = crate::policy::check(
-                &crate::policy::CheckInput {
-                    specs: &specs,
-                    actor: &actor,
-                    node_id: &self.attempt.node_id,
-                    request_fingerprint: &request.context.request_fingerprint,
-                    plugin_id: plugin_id.as_deref(),
-                },
-                policy,
-                &run.approvals,
-                evaluated_at,
-            );
-            (request, evaluation)
-        };
-        let (request, evaluation) = evaluation;
-        match evaluation {
-            crate::policy::Evaluation::Allow { matched } => {
-                let record = record_of(&request, Decision::Allow, Principal::System, matched, None);
-                let dispatch = self.attempt.dispatch_id.clone();
-                let node_id = self.attempt.node_id.clone();
-                self.attempt
-                    .backend
-                    .internal_for_run(&self.attempt.run_id, move |state| {
-                        let run = state.runs.get(&run_id).ok_or_else(|| fj("run missing"))?;
-                        let node = &run.nodes[&node_id];
-                        if run.terminal() || node.dispatch_id != dispatch {
-                            return Err(fj("tool permission for stale dispatch"));
-                        }
-                        if node.operation.as_ref().is_none_or(|o| o.outcome.is_some()) {
-                            return Err(fj("tool permission requires an in-flight turn"));
-                        }
-                        let mut event = crate::journal_commands::node_event(
-                            run,
-                            &node_id,
-                            EventKind::PermissionDecided,
-                            serde_json::to_value(PermissionDecidedPayload {
-                                gate: "tool".into(),
-                                record,
-                                request_fingerprint: request.context.request_fingerprint.clone(),
-                                status: flow_engine::journal_state::ApprovalStatus::Allowed,
-                            })?,
-                            true,
-                        );
-                        event.dispatch_id = Some(dispatch.clone());
-                        Ok((vec![event], ()))
-                    })
-                    .await?;
-                let _ = link
-                    .commands
-                    .send(ToSession::Send(Box::new(Message::ToolPermissionDecision {
-                        dispatch_id: self.attempt.dispatch_id.clone(),
-                        tool_call_id,
-                        operation_id: request.operation_id.clone(),
-                        allowed: true,
-                        reason: None,
-                    })))
-                    .await;
-                Ok(())
-            }
-            crate::policy::Evaluation::Deny { reason, .. } => {
-                invalid_tool(&self.attempt, link, &tool_call_id, &request, &reason).await
-            }
-            crate::policy::Evaluation::Ask { matched } => {
-                let payload = PermissionAskedPayload {
-                    gate: "tool".into(),
-                    request: request.clone(),
-                    asked_at: evaluated_at.timestamp_millis(),
-                    deadline: evaluated_at.timestamp_millis().saturating_add(
-                        self.attempt.backend.approval_ttl_ms().min(i64::MAX as u64) as i64,
-                    ),
-                    operation_request: None,
-                    matched,
-                };
-                let dispatch = self.attempt.dispatch_id.clone();
-                let node_id = self.attempt.node_id.clone();
-                self.attempt
-                    .backend
-                    .internal_for_run(&self.attempt.run_id, move |state| {
-                        let run = state.runs.get(&run_id).ok_or_else(|| fj("run missing"))?;
-                        let node = &run.nodes[&node_id];
-                        if run.terminal() || node.dispatch_id != dispatch {
-                            return Err(fj("tool permission for stale dispatch"));
-                        }
-                        let mut event = crate::journal_commands::node_event(
-                            run,
-                            &node_id,
-                            EventKind::PermissionAsked,
-                            serde_json::to_value(payload)?,
-                            true,
-                        );
-                        event.dispatch_id = Some(dispatch.clone());
-                        Ok((vec![event], ()))
-                    })
-                    .await?;
-                self.pending_approval = Some(PendingApproval {
-                    operation_id: request.operation_id.clone(),
-                    request_fingerprint: request.context.request_fingerprint.clone(),
-                    deadline: evaluated_at.timestamp_millis()
-                        + self.attempt.backend.approval_ttl_ms() as i64,
-                });
-                // 工具级询问：回合同合活跃、执行器在等反向响应；挂起只影响
-                // 调度预算，不向执行器发 OperationPending（那是节点级语义）。
-                self.park(link).await;
-                Ok(())
+                _ => {}
             }
         }
-    }
 
-    /// 存量 e2e 的工具免裁钩子：落 Allow（by=System，reason=test-hook）
-    /// 并回放行——与真实 Allow 同一条事实路径，只是跳过策略评估。
-    async fn allow_tool_for_tests(
-        &mut self,
-        tool: &str,
-        tool_call_id: &str,
-        params: &Value,
-        link: &mut DispatchLink,
-    ) -> Result<()> {
+        let (specs, derive_error) = if test_bypass {
+            (Vec::new(), None)
+        } else {
+            match crate::policy::derive::tool_specs(&tool, &params, cwd.as_deref()) {
+                Ok(specs) => (specs, None),
+                Err(reason) => (Vec::new(), Some(reason)),
+            }
+        };
         let request = PermissionRequest {
             actor: Principal::Node {
                 run_id: self.attempt.run_id.clone(),
                 node_id: self.attempt.node_id.clone(),
             },
             operation_id: crate::journal_commands::id(),
-            specs: Vec::new(),
+            specs,
             context: RequestContext {
                 run_id: self.attempt.run_id.clone(),
-                workflow_id: String::new(),
-                workflow_version: 0,
+                workflow_id: run.workflow_id.clone(),
+                workflow_version: run.workflow_version,
                 node_id: self.attempt.node_id.clone(),
                 node_type: self.node.node_type.clone(),
-                dispatch_id: self.attempt.dispatch_id.clone(),
-                attempt: 0,
-                request_fingerprint: flow_dto::permission::canonical_digest(&serde_json::json!(
-                    params
-                )),
-                tool_call_id: Some(tool_call_id.to_string()),
+                dispatch_id,
+                attempt: node.map_or(0, |node| node.attempt),
+                request_fingerprint: fingerprint,
+                tool_call_id: Some(tool_call_id.clone()),
             },
-            policy_digest: String::new(),
+            policy_digest: run
+                .policy
+                .as_ref()
+                .map(|policy| policy.digest.clone())
+                .unwrap_or_default(),
             request_hash: String::new(),
         }
         .sealed();
-        let _ = tool;
-        let record = record_of(
-            &request,
-            Decision::Allow,
-            Principal::System,
-            vec!["test-hook".into()],
-            Some("FLOW_TEST_AUTO_GOVERN tool bypass".into()),
+        let plugin_id = crate::policy::plugin_id_for_node(
+            &self.node,
+            run.execution.as_ref().and_then(|execution| {
+                execution
+                    .agent_plugin
+                    .as_ref()
+                    .map(|plugin| plugin.id.as_str())
+            }),
         );
-        let dispatch = self.attempt.dispatch_id.clone();
-        let node_id = self.attempt.node_id.clone();
-        let run_id = self.attempt.run_id.clone();
-        let key = run_id.clone();
-        self.attempt
+
+        let approval_ttl_ms = self.attempt.backend.approval_ttl_ms();
+        fault::checkpoint("tool_auth_persist:before").await;
+        let committed = self
+            .attempt
             .backend
-            .internal_for_run(&key, move |state| {
-                let run = state.runs.get(&run_id).ok_or_else(|| fj("run missing"))?;
-                let node = &run.nodes[&node_id];
-                if run.terminal() || node.dispatch_id != dispatch {
-                    return Ok((vec![], ()));
+            .internal_for_run(&self.attempt.run_id, |state| {
+                let run = state
+                    .runs
+                    .get(&self.attempt.run_id)
+                    .ok_or_else(|| fj("run missing"))?;
+                let evaluated_at = Utc::now();
+                let evaluation = if test_bypass {
+                    Evaluation::Allow {
+                        matched: vec!["test-hook".into()],
+                    }
+                } else {
+                    let Some(policy) = &run.policy else {
+                        return Ok((vec![], ToolAuthorization::Denied("run 缺少冻结策略".into())));
+                    };
+                    if let Some(reason) = derive_error {
+                        if policy.mode != flow_dto::permission::ExecutionMode::Bypass {
+                            return Ok((vec![], ToolAuthorization::Denied(reason)));
+                        }
+                    }
+                    crate::policy::check(
+                        &CheckInput {
+                            specs: &request.specs,
+                            actor: &request.actor,
+                            node_id: &self.attempt.node_id,
+                            request_fingerprint: &request.context.request_fingerprint,
+                            plugin_id: plugin_id.as_deref(),
+                        },
+                        policy,
+                        &run.approvals,
+                        evaluated_at,
+                    )
+                };
+                match evaluation {
+                    Evaluation::Deny { reason, .. } => {
+                        Ok((vec![], ToolAuthorization::Denied(reason)))
+                    }
+                    Evaluation::Allow { matched } => {
+                        let turn = self
+                            .active_tool_turn(run)
+                            .ok_or_else(|| fj("tool permission requires an in-flight turn"))?;
+                        let record = record_of(
+                            &request,
+                            evaluated_at,
+                            Decision::Allow,
+                            Principal::System,
+                            matched,
+                            test_bypass.then(|| "FLOW_TEST_AUTO_GOVERN tool bypass".into()),
+                        );
+                        let event = crate::journal_commands::node_event(
+                            run,
+                            &self.attempt.node_id,
+                            EventKind::PermissionDecided,
+                            serde_json::to_value(PermissionDecidedPayload {
+                                gate: "tool".into(),
+                                record,
+                                request_fingerprint: request.context.request_fingerprint.clone(),
+                                status: ApprovalStatus::Allowed,
+                            })?,
+                            true,
+                        );
+                        Ok((
+                            vec![event],
+                            ToolAuthorization::Allowed(turn.permit_id.clone()),
+                        ))
+                    }
+                    Evaluation::Ask { matched } => {
+                        self.active_tool_turn(run)
+                            .ok_or_else(|| fj("tool permission requires an in-flight turn"))?;
+                        let asked_at = evaluated_at.timestamp_millis();
+                        let deadline =
+                            asked_at.saturating_add(approval_ttl_ms.min(i64::MAX as u64) as i64);
+                        let event = crate::journal_commands::node_event(
+                            run,
+                            &self.attempt.node_id,
+                            EventKind::PermissionAsked,
+                            serde_json::to_value(PermissionAskedPayload {
+                                gate: "tool".into(),
+                                request: request.clone(),
+                                asked_at,
+                                deadline,
+                                operation_request: None,
+                                matched,
+                            })?,
+                            true,
+                        );
+                        Ok((vec![event], ToolAuthorization::Pending(deadline)))
+                    }
                 }
-                let mut event = crate::journal_commands::node_event(
-                    run,
-                    &node_id,
-                    EventKind::PermissionDecided,
-                    serde_json::to_value(PermissionDecidedPayload {
-                        gate: "tool".into(),
-                        record,
-                        request_fingerprint: request.context.request_fingerprint.clone(),
-                        status: flow_engine::journal_state::ApprovalStatus::Allowed,
-                    })?,
-                    true,
-                );
-                event.dispatch_id = Some(dispatch.clone());
-                Ok((vec![event], ()))
             })
             .await?;
-        let _ = link
+        match committed {
+            ToolAuthorization::Denied(reason) => {
+                invalid_tool(&self.attempt, link, &tool_call_id, &request, &reason).await
+            }
+            ToolAuthorization::Allowed(turn_permit_id) => {
+                self.enqueue_tool_allow(link, &request, &turn_permit_id, false)
+                    .await
+            }
+            ToolAuthorization::Pending(deadline) => {
+                self.pending_approval = Some(PendingApproval {
+                    operation_id: request.operation_id,
+                    request_fingerprint: request.context.request_fingerprint,
+                    deadline,
+                });
+                // The executor is already waiting for the tool response.
+                self.park(link).await;
+                Ok(())
+            }
+        }
+    }
+
+    fn active_tool_turn<'a>(&self, run: &'a Run) -> Option<&'a Operation> {
+        let node = run.nodes.get(&self.attempt.node_id)?;
+        if self.cancel_sent
+            || run.terminal()
+            || node.dispatch_id != self.attempt.dispatch_id
+            || node.status != flow_engine::journal_state::NodeStatus::Running
+        {
+            return None;
+        }
+        node.operation
+            .as_ref()
+            .filter(|turn| turn.outcome.is_none())
+    }
+
+    /// A fresh auto decision comes from a successful commit. Manual decisions and
+    /// replays also have to match the approval still projected for this call.
+    async fn enqueue_tool_allow(
+        &self,
+        link: &DispatchLink,
+        request: &PermissionRequest,
+        turn_permit_id: &str,
+        require_approval: bool,
+    ) -> Result<()> {
+        let Some(tool_call_id) = &request.context.tool_call_id else {
+            return Err(invalid("tool decision missing call id"));
+        };
+        fault::checkpoint("tool_allow_send:before").await;
+        let permit = link
             .commands
-            .send(ToSession::Send(Box::new(Message::ToolPermissionDecision {
-                dispatch_id: self.attempt.dispatch_id.clone(),
-                tool_call_id: tool_call_id.to_string(),
-                operation_id: request.operation_id.clone(),
-                allowed: true,
-                reason: None,
-            })))
-            .await;
-        Ok(())
+            .clone()
+            .reserve_owned()
+            .await
+            .map_err(|_| invalid("tool decision session closed"))?;
+        self.attempt
+            .backend
+            .internal_for_run(&self.attempt.run_id, |state| {
+                let Some(run) = state.runs.get(&self.attempt.run_id) else {
+                    return Ok((vec![], ()));
+                };
+                if self
+                    .active_tool_turn(run)
+                    .is_none_or(|turn| turn.permit_id != turn_permit_id)
+                {
+                    return Ok((vec![], ()));
+                }
+                if require_approval
+                    && run.nodes[&self.attempt.node_id]
+                        .approval
+                        .as_ref()
+                        .is_none_or(|approval| {
+                            approval.gate != "tool"
+                                || approval.status != ApprovalStatus::Allowed
+                                || approval.dispatch_id != self.attempt.dispatch_id
+                                || approval.request.operation_id != request.operation_id
+                                || approval.request.request_hash != request.request_hash
+                        })
+                {
+                    return Ok((vec![], ()));
+                }
+                permit.send(ToSession::Send(Box::new(Message::ToolPermissionDecision {
+                    dispatch_id: self.attempt.dispatch_id.clone(),
+                    tool_call_id: tool_call_id.clone(),
+                    operation_id: request.operation_id.clone(),
+                    allowed: true,
+                    reason: None,
+                })));
+                Ok((vec![], ()))
+            })
+            .await
     }
 
     /// 审批挂起观察（在提交通知与 100ms tick 上推进）：
@@ -2283,7 +2139,14 @@ impl DispatchRunner {
             self.unpark(link).await;
             return Ok(());
         };
-        use flow_engine::journal_state::ApprovalStatus;
+        if approval.dispatch_id != self.attempt.dispatch_id
+            || approval.request.operation_id != pending.operation_id
+            || approval.request.context.request_fingerprint != pending.request_fingerprint
+        {
+            self.pending_approval = None;
+            self.unpark(link).await;
+            return Ok(());
+        }
         match approval.status {
             ApprovalStatus::Pending => {
                 let now_ms = Utc::now().timestamp_millis();
@@ -2303,39 +2166,37 @@ impl DispatchRunner {
                     .internal_for_run(&key, move |state| {
                         let run = state.runs.get(&run_id).ok_or_else(|| fj("run missing"))?;
                         let node = &run.nodes[&node_id];
-                        if run.terminal()
-                            || node.dispatch_id != dispatch
-                            || node.approval.as_ref().is_none_or(|a| {
-                                a.status != ApprovalStatus::Pending
-                                    || a.request.operation_id != operation_id
-                                    || a.request.request_hash != request_hash
-                            })
-                        {
+                        let Some(approval) = node.approval.as_ref().filter(|approval| {
+                            !run.terminal()
+                                && node.dispatch_id == dispatch
+                                && approval.dispatch_id == dispatch
+                                && approval.status == ApprovalStatus::Pending
+                                && approval.request.operation_id == operation_id
+                                && approval.request.request_hash == request_hash
+                                && Utc::now().timestamp_millis() >= approval.deadline
+                        }) else {
                             return Ok((vec![], ()));
-                        }
+                        };
                         let record = record_of(
-                            &node.approval.as_ref().expect("checked").request,
+                            &approval.request,
+                            Utc::now(),
                             Decision::Deny,
                             Principal::System,
                             vec![],
                             Some("approval ttl expired".into()),
                         );
-                        let fingerprint = node
-                            .approval
-                            .as_ref()
-                            .expect("checked")
-                            .request
-                            .context
-                            .request_fingerprint
-                            .clone();
                         let mut event = crate::journal_commands::node_event(
                             run,
                             &node_id,
                             EventKind::PermissionDecided,
                             serde_json::to_value(PermissionDecidedPayload {
-                                gate: "node".into(),
+                                gate: approval.gate.clone(),
                                 record,
-                                request_fingerprint: fingerprint,
+                                request_fingerprint: approval
+                                    .request
+                                    .context
+                                    .request_fingerprint
+                                    .clone(),
                                 status: ApprovalStatus::Expired,
                             })?,
                             true,
@@ -2347,61 +2208,34 @@ impl DispatchRunner {
                 Ok(())
             }
             ApprovalStatus::Allowed if approval.gate == "tool" => {
-                // 工具级：回放 ToolPermissionDecision（绑定同一 tool_call_id）。
                 self.pending_approval = None;
                 self.unpark(link).await;
-                let tool_call_id = approval
-                    .request
-                    .context
-                    .tool_call_id
-                    .clone()
-                    .unwrap_or_default();
-                let _ = link
-                    .commands
-                    .send(ToSession::Send(Box::new(Message::ToolPermissionDecision {
-                        dispatch_id: self.attempt.dispatch_id.clone(),
-                        tool_call_id,
-                        operation_id: pending.operation_id.clone(),
-                        allowed: true,
-                        reason: None,
-                    })))
-                    .await;
-                tracing::info!(dispatch = %self.attempt.dispatch_id,
-                    operation = %pending.operation_id, "tool approval granted");
+                if let Some(turn) = self.active_tool_turn(&run) {
+                    self.enqueue_tool_allow(link, &approval.request, &turn.permit_id, true)
+                        .await?;
+                }
                 Ok(())
             }
             ApprovalStatus::Allowed => {
                 // 批准事务已写 OperationAuthorized：下发 Permit（重复投递由
                 // 执行器按 operation 去重——无等待者时自然忽略）。
-                let authorized = node.operation.as_ref().is_some_and(|operation| {
-                    operation.outcome.is_none() && operation.operation_id == pending.operation_id
-                });
-                if !authorized {
+                let Some(operation) = node.operation.as_ref().filter(|operation| {
+                    operation.outcome.is_none()
+                        && operation.operation_id == pending.operation_id
+                        && operation.fingerprint == pending.request_fingerprint
+                }) else {
                     return Ok(());
-                }
+                };
                 self.pending_approval = None;
                 self.unpark(link).await;
-                let credentials = resolve_credentials_from_specs(&approval.request.specs);
-                let permit = link
-                    .commands
-                    .clone()
-                    .reserve_owned()
-                    .await
-                    .map_err(|_| invalid("operation permit session closed"))?;
-                permit.send(ToSession::Send(Box::new(Message::OperationPermit {
-                    dispatch_id: self.attempt.dispatch_id.clone(),
-                    operation_id: pending.operation_id.clone(),
-                    permit_id: node
-                        .operation
-                        .as_ref()
-                        .expect("authorized checked")
-                        .permit_id
-                        .clone(),
-                    request_fingerprint: pending.request_fingerprint.clone(),
-                    credentials,
-                })));
-                tracing::info!(dispatch = %self.attempt.dispatch_id,
-                    operation = %pending.operation_id, "approval granted; permit delivered");
+                let credentials = credentials::from_specs(&approval.request.specs);
+                if self
+                    .enqueue_operation_permit(link, operation, credentials)
+                    .await?
+                {
+                    tracing::info!(dispatch = %self.attempt.dispatch_id,
+                        operation = %pending.operation_id, "approval granted; permit enqueued");
+                }
                 Ok(())
             }
             ApprovalStatus::Denied | ApprovalStatus::Expired => {
@@ -2449,146 +2283,91 @@ impl DispatchRunner {
     }
 }
 
-/// G3 评估结论（携带封口后的请求，供事实载荷与审批卡片使用）。
-enum G3Decision {
-    Allow {
-        request: PermissionRequest,
-        matched: Vec<String>,
-    },
-    Ask {
-        request: PermissionRequest,
-        matched: Vec<String>,
-        /// 审批绝对截止（毫秒）：重派发继承旧询问的 deadline，不刷新 TTL。
-        deadline: i64,
-    },
-    /// `request` 为 None 只在请求无法构造时（理论上不出现，保守降级）。
-    Deny {
-        reason: String,
-        request: Option<PermissionRequest>,
-    },
+#[cfg(test)]
+mod permission_tests;
+
+enum ToolAuthorization {
+    Allowed(String),
+    Pending(i64),
+    Denied(String),
 }
 
-/// G3 纯评估：从认证连接推导 actor/context，从冻结节点 + 请求字节派生
-/// 需求集合，交给 [`crate::policy::check`]（09 §3.3：不信任插件自报的身份、
-/// hash 或风险级别）。
-#[allow(clippy::too_many_arguments)]
-fn evaluate_node_request(
+enum NodePermissionNeeds {
+    Concrete,
+    Plugin {
+        id: String,
+        capabilities: Vec<flow_dto::permission::Capability>,
+        unrestricted: bool,
+        test_bypass: bool,
+    },
+    Invalid(String),
+}
+
+enum NodeAuthorization {
+    Allowed(Vec<String>),
+    Pending { matched: Vec<String>, deadline: i64 },
+    Denied(String),
+}
+
+/// Capture request identity and derive requirements without holding the journal lock.
+fn prepare_node_permission(
     run: &Run,
     node: &Node,
-    request_value: &Value,
+    value: &Value,
     operation_id: &str,
-    request_fingerprint: &str,
+    fingerprint: &str,
     attempt: &Attempt,
-    evaluated_at: chrono::DateTime<Utc>,
-    approval_ttl_ms: u64,
-) -> G3Decision {
-    let actor = Principal::Node {
-        run_id: attempt.run_id.clone(),
-        node_id: attempt.node_id.clone(),
-    };
+) -> (PermissionRequest, NodePermissionNeeds) {
     let bypass = run
         .policy
         .as_ref()
-        .is_some_and(|p| p.mode == flow_dto::permission::ExecutionMode::Bypass);
-    let record = run.nodes.get(&attempt.node_id);
-    // G4：动态插件节点——需求来自 master 侧 manifest（不信任执行器自报），
-    // 元 concrete spec；未部署/未声明均按能力拒绝。
-    let plugin_needs = if !bypass && node.kind().is_none() {
-        match crate::policy::plugin_needs_for_type(&node.node_type) {
-            Some(found) => {
-                // I35：执行器上报身份必须与 master 侧一致（远程执行器二进制
-                // 与授予快照脱钩 → 拒绝）。
-                if let Err(reason) = crate::policy::verify_plugin_identity(
-                    &found.0,
-                    &run.policy
-                        .as_ref()
-                        .and_then(|policy| {
-                            policy
-                                .plugin_ceilings
-                                .iter()
-                                .find(|ceiling| ceiling.plugin_id == found.0)
-                                .map(|ceiling| ceiling.content_hash.clone())
-                        })
-                        .unwrap_or_default(),
-                    &request_value["plugin"],
-                ) {
-                    let request = PermissionRequest {
-                        actor,
-                        operation_id: operation_id.to_string(),
-                        specs: Vec::new(),
-                        context: RequestContext {
-                            run_id: attempt.run_id.clone(),
-                            workflow_id: run.workflow_id.clone(),
-                            workflow_version: run.workflow_version,
-                            node_id: attempt.node_id.clone(),
-                            node_type: node.node_type.clone(),
-                            dispatch_id: attempt.dispatch_id.clone(),
-                            attempt: record.map_or(0, |record| record.attempt),
-                            request_fingerprint: request_fingerprint.to_string(),
-                            tool_call_id: None,
-                        },
-                        policy_digest: run
-                            .policy
-                            .as_ref()
-                            .map(|policy| policy.digest.clone())
-                            .unwrap_or_default(),
-                        request_hash: String::new(),
-                    }
-                    .sealed();
-                    return G3Decision::Deny {
-                        reason,
-                        request: Some(request),
-                    };
-                }
-                Some(found)
-            }
-            None => {
-                let request = PermissionRequest {
-                    actor,
-                    operation_id: operation_id.to_string(),
-                    specs: Vec::new(),
-                    context: RequestContext {
-                        run_id: attempt.run_id.clone(),
-                        workflow_id: run.workflow_id.clone(),
-                        workflow_version: run.workflow_version,
-                        node_id: attempt.node_id.clone(),
-                        node_type: node.node_type.clone(),
-                        dispatch_id: attempt.dispatch_id.clone(),
-                        attempt: record.map_or(0, |record| record.attempt),
-                        request_fingerprint: request_fingerprint.to_string(),
-                        tool_call_id: None,
+        .is_some_and(|policy| policy.mode == flow_dto::permission::ExecutionMode::Bypass);
+    let (specs, needs) = if !bypass && node.kind().is_none() {
+        let needs = match crate::policy::plugin_needs_for_type(&node.node_type) {
+            Some((id, capabilities, unrestricted)) => {
+                let expected = run
+                    .policy
+                    .as_ref()
+                    .and_then(|policy| {
+                        policy
+                            .plugin_ceilings
+                            .iter()
+                            .find(|ceiling| ceiling.plugin_id == id)
+                    })
+                    .map(|ceiling| ceiling.content_hash.as_str())
+                    .unwrap_or_default();
+                match crate::policy::verify_plugin_identity(&id, expected, &value["plugin"]) {
+                    Ok(()) => NodePermissionNeeds::Plugin {
+                        id,
+                        capabilities,
+                        unrestricted,
+                        test_bypass: crate::journal_commands::tests_auto_govern(),
                     },
-                    policy_digest: run
-                        .policy
-                        .as_ref()
-                        .map(|policy| policy.digest.clone())
-                        .unwrap_or_default(),
-                    request_hash: String::new(),
+                    Err(reason) => NodePermissionNeeds::Invalid(reason),
                 }
-                .sealed();
-                return G3Decision::Deny {
-                    reason: format!(
-                        "节点类型 {} 的插件未部署（manifest 缺失或已下架）：拒绝执行",
-                        node.node_type
-                    ),
-                    request: Some(request),
-                };
             }
-        }
+            None => NodePermissionNeeds::Invalid(format!(
+                "节点类型 {} 的插件未部署（manifest 缺失或已下架）：拒绝执行",
+                node.node_type,
+            )),
+        };
+        (vec![], needs)
     } else {
-        None
-    };
-    let (specs, derive_error) = match (
-        &plugin_needs,
-        crate::policy::derive::derive_specs(node, request_value),
-    ) {
-        (Some(_), _) => (Vec::new(), None),
-        (None, Ok(specs)) => (specs, None),
-        (None, Err(reason)) => (Vec::new(), Some(reason)),
+        match crate::policy::derive::derive_specs(node, value) {
+            Ok(specs) => (specs, NodePermissionNeeds::Concrete),
+            Err(_) if bypass || run.policy.is_none() => (vec![], NodePermissionNeeds::Concrete),
+            Err(reason) => (
+                vec![],
+                NodePermissionNeeds::Invalid(format!("请求无法派生权限需求：{reason}")),
+            ),
+        }
     };
     let request = PermissionRequest {
-        actor: actor.clone(),
-        operation_id: operation_id.to_string(),
+        actor: Principal::Node {
+            run_id: attempt.run_id.clone(),
+            node_id: attempt.node_id.clone(),
+        },
+        operation_id: operation_id.into(),
         specs,
         context: RequestContext {
             run_id: attempt.run_id.clone(),
@@ -2597,8 +2376,11 @@ fn evaluate_node_request(
             node_id: attempt.node_id.clone(),
             node_type: node.node_type.clone(),
             dispatch_id: attempt.dispatch_id.clone(),
-            attempt: record.map_or(0, |record| record.attempt),
-            request_fingerprint: request_fingerprint.to_string(),
+            attempt: run
+                .nodes
+                .get(&attempt.node_id)
+                .map_or(0, |node| node.attempt),
+            request_fingerprint: fingerprint.into(),
             tool_call_id: None,
         },
         policy_digest: run
@@ -2609,96 +2391,174 @@ fn evaluate_node_request(
         request_hash: String::new(),
     }
     .sealed();
-    let Some(policy) = &run.policy else {
-        return G3Decision::Deny {
-            reason: "run 缺少冻结策略（权限模型启用前启动）：外部操作拒绝，需取消后以新 run 重启"
-                .into(),
-            request: Some(request),
-        };
-    };
-    if let Some(reason) = derive_error.filter(|_| !bypass) {
-        return G3Decision::Deny {
-            reason: format!("请求无法派生权限需求：{reason}"),
-            request: Some(request),
-        };
+    (request, needs)
+}
+
+/// The caller holds the decision lock, so Run approvals and inherited deadlines
+/// belong to the same state used to append the resulting authorization facts.
+fn evaluate_node_permission(
+    run: &Run,
+    request: &PermissionRequest,
+    needs: &NodePermissionNeeds,
+    evaluated_at: chrono::DateTime<Utc>,
+    approval_ttl_ms: u64,
+) -> NodeAuthorization {
+    if let NodePermissionNeeds::Invalid(reason) = needs {
+        return NodeAuthorization::Denied(reason.clone());
     }
-    let evaluation = if let Some((plugin_id, needs, unrestricted)) = &plugin_needs {
-        // 存量 e2e 免裁钩子（与工具级同一开关）：声明式需求直接 System 放行，
-        // 但事实照落（PermissionDecided{System, test-hook}）。
-        if crate::journal_commands::tests_auto_govern() {
-            crate::policy::Evaluation::Allow {
-                matched: vec!["test-hook".into()],
-            }
-        } else {
-            crate::policy::check_plugin_needs(
-                &crate::policy::PluginNeedsInput {
-                    plugin_id,
-                    node_id: &attempt.node_id,
-                    actor: &actor,
-                    needs,
-                    request_fingerprint,
-                    unrestricted: *unrestricted,
-                },
-                policy,
-                &run.approvals,
-                evaluated_at,
-            )
-        }
-    } else {
-        crate::policy::check(
-            &crate::policy::CheckInput {
+    let Some(policy) = &run.policy else {
+        return NodeAuthorization::Denied(
+            "run 缺少冻结策略（权限模型启用前启动）：外部操作拒绝，需取消后以新 run 重启".into(),
+        );
+    };
+    let node_id = &request.context.node_id;
+    let request_fingerprint = &request.context.request_fingerprint;
+    let evaluation = match needs {
+        NodePermissionNeeds::Plugin {
+            test_bypass: true, ..
+        } => Evaluation::Allow {
+            matched: vec!["test-hook".into()],
+        },
+        NodePermissionNeeds::Plugin {
+            id,
+            capabilities,
+            unrestricted,
+            ..
+        } => crate::policy::check_plugin_needs(
+            &crate::policy::PluginNeedsInput {
+                plugin_id: id,
+                node_id,
+                actor: &request.actor,
+                needs: capabilities,
+                request_fingerprint,
+                unrestricted: *unrestricted,
+            },
+            policy,
+            &run.approvals,
+            evaluated_at,
+        ),
+        NodePermissionNeeds::Concrete => crate::policy::check(
+            &CheckInput {
                 specs: &request.specs,
-                actor: &actor,
-                node_id: &attempt.node_id,
+                actor: &request.actor,
+                node_id,
                 request_fingerprint,
                 plugin_id: None,
             },
             policy,
             &run.approvals,
             evaluated_at,
-        )
+        ),
+        NodePermissionNeeds::Invalid(_) => unreachable!("handled above"),
     };
     match evaluation {
-        crate::policy::Evaluation::Allow { matched } => G3Decision::Allow { request, matched },
-        crate::policy::Evaluation::Deny { reason, .. } => G3Decision::Deny {
-            reason,
-            request: Some(request),
-        },
-        crate::policy::Evaluation::Ask { matched } => {
-            // 不得因等待重启而刷新 TTL（§6.1）：被重派发取代的同一操作实例
-            // 继承原 deadline；已过期则直接拒绝。
+        Evaluation::Allow { matched } => NodeAuthorization::Allowed(matched),
+        Evaluation::Deny { reason, .. } => NodeAuthorization::Denied(reason),
+        Evaluation::Ask { matched } => {
             let now = evaluated_at.timestamp_millis();
-            let inherited = record
-                .and_then(|record| record.approval.as_ref())
+            let inherited = run
+                .nodes
+                .get(node_id)
+                .and_then(|node| node.approval.as_ref())
                 .filter(|approval| {
-                    approval.request.operation_id == operation_id
+                    approval.request.operation_id == request.operation_id
                         && matches!(
                             approval.status,
-                            flow_engine::journal_state::ApprovalStatus::Superseded
-                                | flow_engine::journal_state::ApprovalStatus::Withdrawn
+                            ApprovalStatus::Superseded | ApprovalStatus::Withdrawn
                         )
                 })
                 .map(|approval| approval.deadline);
             let deadline = inherited
                 .unwrap_or_else(|| now.saturating_add(approval_ttl_ms.min(i64::MAX as u64) as i64));
             if deadline <= now {
-                return G3Decision::Deny {
-                    reason: "approval ttl expired before the operation was re-requested".into(),
-                    request: Some(request),
-                };
+                return NodeAuthorization::Denied(
+                    "approval ttl expired before the operation was re-requested".into(),
+                );
             }
-            G3Decision::Ask {
-                request,
-                matched,
-                deadline,
+            NodeAuthorization::Pending { matched, deadline }
+        }
+    }
+}
+
+fn node_permission_events(
+    run: &Run,
+    node: &flow_engine::journal_state::Node,
+    request: &PermissionRequest,
+    operation: &Operation,
+    outcome: &NodeAuthorization,
+    evaluated_at: chrono::DateTime<Utc>,
+) -> flow_journal::Result<Vec<flow_journal::Event>> {
+    let node_id = &request.context.node_id;
+    let event =
+        |kind, payload| crate::journal_commands::node_event(run, node_id, kind, payload, true);
+    let decision_event = |decision, matched, reason, status| {
+        let record = record_of(
+            request,
+            evaluated_at,
+            decision,
+            Principal::System,
+            matched,
+            reason,
+        );
+        let payload = serde_json::to_value(PermissionDecidedPayload {
+            gate: "node".into(),
+            record,
+            request_fingerprint: operation.fingerprint.clone(),
+            status,
+        })?;
+        Ok::<_, flow_journal::Error>(event(EventKind::PermissionDecided, payload))
+    };
+    match outcome {
+        NodeAuthorization::Denied(reason) => Ok(vec![decision_event(
+            Decision::Deny,
+            vec![],
+            Some(reason.clone()),
+            ApprovalStatus::Denied,
+        )?]),
+        NodeAuthorization::Pending { matched, deadline } => {
+            if node.prepared.is_none() || node.operation.is_some() {
+                return Err(fj("operation already authorized or not prepared"));
             }
+            let payload = serde_json::to_value(PermissionAskedPayload {
+                gate: "node".into(),
+                request: request.clone(),
+                asked_at: evaluated_at.timestamp_millis(),
+                deadline: *deadline,
+                operation_request: Some(operation.request.clone()),
+                matched: matched.clone(),
+            })?;
+            Ok(vec![event(EventKind::PermissionAsked, payload)])
+        }
+        NodeAuthorization::Allowed(matched) => {
+            if node.prepared.is_none() {
+                return Err(fj("operation before committed preparation"));
+            }
+            if node.operation.is_some() {
+                return Err(fj(
+                    "operation already authorized; outcome must be reconciled, not resent",
+                ));
+            }
+            // The reducer requires all three facts in this order in the same commit.
+            let decided = decision_event(
+                Decision::Allow,
+                matched.clone(),
+                None,
+                ApprovalStatus::Allowed,
+            )?;
+            let payload = json!({"operation": operation});
+            let mut intent = event(EventKind::OperationIntent, payload.clone());
+            intent.run_seq += 1;
+            let mut authorized = event(EventKind::OperationAuthorized, payload);
+            authorized.run_seq += 2;
+            Ok(vec![decided, intent, authorized])
         }
     }
 }
 
 /// 组装一条系统裁决记录（policy_revision = 冻结策略 digest）。
-pub(crate) fn record_of(
+fn record_of(
     request: &PermissionRequest,
+    evaluated_at: chrono::DateTime<Utc>,
     decision: Decision,
     by: Principal,
     matched: Vec<String>,
@@ -2707,7 +2567,7 @@ pub(crate) fn record_of(
     DecisionRecord {
         operation_id: request.operation_id.clone(),
         request_hash: request.request_hash.clone(),
-        evaluated_at: Utc::now(),
+        evaluated_at,
         policy_revision: request.policy_digest.clone(),
         decision,
         by,
@@ -2716,67 +2576,6 @@ pub(crate) fn record_of(
         scope: ApprovalScope::Once,
         reason,
     }
-}
-
-/// 按需求集合逐项解析 Secret 引用（I37：只有全部需求获准后才调用）。
-/// 解析失败/空值的项不交付（节点按缺凭证处理）。
-pub(crate) fn resolve_credentials_from_specs(specs: &[OperationSpec]) -> Vec<PermitCredential> {
-    specs
-        .iter()
-        .filter_map(|spec| match spec {
-            OperationSpec::Secret { secret_name } => flow_engine::secrets::get_secret(secret_name)
-                .filter(|value| !value.is_empty())
-                .map(|value| PermitCredential {
-                    name: secret_name.clone(),
-                    value,
-                }),
-            _ => None,
-        })
-        .collect()
-}
-
-/// 重挂许可重发：已授权操作的请求里只有一个凭证引用（节点级形态）。
-fn resolve_credentials_from_request(request: &Value) -> Vec<PermitCredential> {
-    request["credential"]["secret_ref"]
-        .as_str()
-        .map(|name| {
-            resolve_credentials_from_specs(&[OperationSpec::Secret {
-                secret_name: name.to_string(),
-            }])
-        })
-        .unwrap_or_default()
-}
-
-/// G4：插件节点凭证解析（I37）：manifest 的 `Widget::Secret` 字段在请求
-/// params 里携带的是秘密名引用；全部需求获准后逐项解析交付。
-fn resolve_plugin_credentials(node_type: &str, params: &Value) -> Vec<PermitCredential> {
-    let Some(found) = crate::plugin_registry::discover_plugins()
-        .into_iter()
-        .find(|found| {
-            found
-                .manifest
-                .ui
-                .params_forms
-                .iter()
-                .any(|form| form.node_type == node_type)
-        })
-    else {
-        return Vec::new();
-    };
-    found
-        .manifest
-        .ui
-        .params_forms
-        .iter()
-        .filter(|form| form.node_type == node_type)
-        .flat_map(|form| form.fields.iter())
-        .filter(|field| matches!(field.widget, flow_config::plugin_manifest::Widget::Secret))
-        .map(|field| field.key.clone())
-        .filter_map(|key| params.get(&key).and_then(Value::as_str).map(str::to_string))
-        .flat_map(|name| {
-            resolve_credentials_from_specs(&[OperationSpec::Secret { secret_name: name }])
-        })
-        .collect()
 }
 
 /// 工具级拒绝：落 Deny 事实（审计一条不少）并回拒（不阻塞回合——插件
@@ -2791,6 +2590,7 @@ async fn invalid_tool(
 ) -> Result<()> {
     let record = record_of(
         request,
+        Utc::now(),
         Decision::Deny,
         Principal::System,
         vec![],

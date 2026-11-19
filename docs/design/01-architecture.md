@@ -66,6 +66,7 @@ plugins/harness/  harness agent 运行时（protocol / agent-core / agent-host /
 | `flow-cli` | flow-cli | 命令行客户端（纯 RPC） |
 | `flow-dispatcher` / `flow-worker` | flow-dispatcher | 独立任务提交与基础 Worker |
 | `flow-script-worker` | flow-internal-plugins | 独立 `script.v1` Worker |
+| `flow-workflow` | flow-workflow | 内存 FSM 运行器，经 IPC 派发计算节点 |
 | `flow-executor` | flow-plugin-runtime | 受管理执行子进程（通道 FD 经 argv `--channel-fd` 传递） |
 | `flow-agent` | flow-agent | 受信任远程执行中继 |
 | `flow-journal-tool` | flow-journal | journal 离线维护（verify/rebuild-index/backup） |
@@ -81,18 +82,20 @@ plugins/harness/  harness agent 运行时（protocol / agent-core / agent-host /
 flow-rpc ──> flow-backend ──> flow-engine ──> flow-domain / flow-dto / flow-dispatcher
            ├─> flow-journal  （storage+query：v2 值分页/下载与同库只读查询）
            └─> flow-config
-flow-backend ──> flow-dispatcher / flow-journal / flow-engine / flow-dto / flow-config
+flow-backend ──> flow-dispatcher / flow-journal / flow-engine / flow-dto / flow-config / flow-policy
               └─> flow-plugin-catalog / flow-plugin-sdk
 flow-engine ──> flow-domain / flow-dto / flow-dispatcher
              └─> flow-journal（runtime 下的观测写入）
 flow-dispatcher ──> flow-facts
+flow-workflow ──> flow-domain / flow-dispatcher / flow-facts
 flow-domain ──> flow-facts / flow-dto
+flow-policy ──> flow-dto
 flow-journal ──> flow-facts
 flow-facts ──> 无 flow 依赖（叶子）
 flow-dto ──> 无依赖（叶子）
 flow-plugin-catalog ──> flow-config / flow-domain / flow-plugin-sdk
-flow-plugin-runtime ──> flow-plugin-sdk / flow-engine / flow-journal / flow-config / flow-plugin-catalog
-                       / flow-internal-plugins / plugins/harness/protocol
+flow-plugin-runtime ──> flow-engine（node-execution）/ flow-facts / flow-internal-plugins
+                    └─> flow-plugin-catalog / flow-plugin-sdk / flow-config / flow-harness-protocol（plugins feature）
 flow-agent ──> flow-engine（无默认 features）/ flow-config
 flow-cli ──> flow-dto（自带 jsonrpsee/reqwest WS 客户端，运行期连 flow-journal-server，
             但不依赖任何服务 crate）
@@ -109,7 +112,7 @@ SQLite 和磁盘读写由 `flow-journal` 提供。工作流
 
 独立任务只携带 `id`、带版本的 `handler` 和有界字节输入。Worker 握手广告
 `job:<handler>` 后才会收到 `ExecuteJob`。`Accepted` 确认接收，`JobFinished`
-上报结果，调用方完成持久提交后由 Dispatcher 发送 `ResultCommitted`。
+上报结果，调用方提交至其权威状态后由 Dispatcher 发送 `ResultCommitted`。
 调用方负责提交和重试，现阶段独立任务没有内置持久待办队列。工作流的审批、
 副作用授权和结果屏障仍由原路径处理。
 
@@ -152,6 +155,51 @@ cargo test --workspace --all-targets --locked --no-fail-fast
 
 工作区回归包含本机 IPC、RPC、模拟服务和进程故障用例。CI 另行验证领域与
 Dispatcher 的隔离构建，避免工作区合并 features 掩盖反向依赖。
+
+#### 分层目标与独立运行
+
+| 层 | 职责 | 最小验收 |
+| --- | --- | --- |
+| Dispatcher / Worker | IPC 会话、进程池、任务收发与结果确认 | 独立提交 Echo 或 Script，单个 Worker 退出后其余 Worker 继续处理。 |
+| FSM 工作流 | 根据流程定义、当前状态和输入事件决定下一步 | 用内存状态和本地任务端口推进基础流程。分支、汇合与终态决策可脱离进程和 SQLite 验证。 |
+| 托管运行 | Journal 权威提交与恢复，冻结环境，解析密钥引用，裁决权限 | 基础工作流从 SQLite 恢复。需要密钥或许可的任务由主进程按本次派发授权。 |
+| Plugin | 注册节点类型、参数契约和执行实现 | 同一托管运行器可接入清单节点。移除插件后仍可执行基础流程。 |
+| Remote Worker | 将派发、结果和回执通过远程会话转发 | 远端仅部署基础执行器也能跑内置节点。有插件任务时，目标 Worker 额外提供相应能力。 |
+
+插件和远程执行是两条独立的扩展路径。本地 Worker 可以执行插件，远程 Worker
+可以执行基础节点。远程进程处理派发和结果传输，主进程继续负责状态提交及授权。
+
+`flow-workflow` 和 `flow-backend` 共用入边判定、终态判定和类型化节点结论。
+内存运行器接纳节点结论后确认 IPC 结果。托管运行器复核审计封口并在 SQLite
+提交后确认，同时提供等待、恢复、环境和权限能力。托管开发入口先准备执行端口，
+新 run 提交后再启用协调器。远程端口在准备时绑定，启用后开始接收连接。
+
+独立构建的 `flow-executor` 通过 `flow-facts` 使用值描述、编码和预算，
+环境版本与密钥存储由主进程持有。本地与远程派发从同一个主进程凭证模块
+取得冻结环境的密钥，权限获准并提交事实后按派发交付所需凭证。
+
+`flow-policy` 根据请求、冻结策略、Run 授权和显式时间计算权限结论。
+主进程负责读取插件清单、构造请求与提交审计事实。节点自动放行、人工批准和
+重连补发都在同一决策锁下核对已提交的授权和派发身份，再将许可排入执行端口。
+工具放行还要核对当前回合未收录结果。节点与工具的自动放行及询问在事实提交锁内
+读取 Run 授权，因此先提交的撤销会参与后续请求的裁决。
+
+`flow-executor` 默认启用 `plugins`。动态节点、LLM 和 Harness 的 agent 模式从
+`task::plugins` 进入插件进程，Worker 仍负责输入准备、许可、审计和结果确认。
+基础 Worker 用 `cargo build --locked -p flow-plugin-runtime --bin flow-executor --no-default-features`
+构建，可由本地 Dispatcher 或远程 Agent 使用。它在请求许可前拒绝需要插件的任务，
+Harness 的本地命令模式仍走内置执行路径。需要插件节点的部署使用默认构建。
+
+内存入口支持 Start、Script、Condition、End、v1/v2 分支与输入输出 schema。
+文件和单个中间 JSON 值采用 64 KiB 内联上限。合流任务按 Worker 输入预算校验。
+输出报告包含运行终态、结果和已接纳的节点结论。需要持久等待、重试或权限的定义
+由托管运行器处理。独立构建可直接运行以下命令。
+
+```sh
+cargo build --locked -p flow-workflow -p flow-internal-plugins --bins
+target/debug/flow-workflow --worker target/debug/flow-script-worker \
+  --definition workflow.json --input input.json
+```
 
 ### 2.2 架构图：三条链路
 

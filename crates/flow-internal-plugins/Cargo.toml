@@ -18,10 +18,9 @@ publish = false
 serde.workspace = true
 flow-dispatcher = { path = "../flow-dispatcher" }
 flow-facts = { path = "../flow-facts" }
-# 共享契约（模型/日志/错误）在 runtime feature 面；rquickjs 已随实现迁入本包
-flow-engine = { path = "../flow-engine" }
+# 本地 Worker 使用执行期日志和错误契约，观测存储由托管运行注入。
+flow-engine = { path = "../flow-engine", default-features = false, features = ["node-execution"] }
 serde_json = { workspace = true }
-flow-journal = { path = "../flow-journal", default-features = false }
 flow-dto = { path = "../flow-dto" }
 rquickjs = { workspace = true }
 tokio = { workspace = true, features = ["process"] }

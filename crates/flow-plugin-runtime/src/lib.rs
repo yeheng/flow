@@ -17,11 +17,15 @@
 //! 裁决：成功交 Result、业务失败交失败 Result、外部结果未知交 Uncertain，
 //! 通道或进程级故障才走 Reject 回收。
 
+#[cfg(feature = "plugins")]
 mod agent_plugin;
+#[cfg(feature = "plugins")]
 mod agent_progress;
 pub mod audit;
 pub mod observe;
+#[cfg(feature = "plugins")]
 pub mod plugin_registry;
+#[cfg(feature = "plugins")]
 mod plugin_session;
 pub mod runtime;
 pub mod task;

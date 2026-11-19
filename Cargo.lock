@@ -1016,6 +1016,7 @@ dependencies = [
  "flow-journal",
  "flow-plugin-catalog",
  "flow-plugin-sdk",
+ "flow-policy",
  "flow-test-support",
  "fs2",
  "futures",
@@ -1221,7 +1222,6 @@ dependencies = [
  "flow-dto",
  "flow-engine",
  "flow-facts",
- "flow-journal",
  "rquickjs",
  "serde",
  "serde_json",
@@ -1312,9 +1312,9 @@ dependencies = [
  "chrono",
  "flow-config",
  "flow-engine",
+ "flow-facts",
  "flow-harness-protocol",
  "flow-internal-plugins",
- "flow-journal",
  "flow-plugin-catalog",
  "flow-plugin-sdk",
  "futures",
@@ -1347,12 +1347,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "flow-policy"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "flow-dto",
+ "serde_json",
+]
+
+[[package]]
 name = "flow-remote-e2e"
 version = "0.1.0"
 dependencies = [
  "flow-agent",
  "flow-backend",
  "flow-config",
+ "flow-dto",
  "flow-engine",
  "flow-journal",
  "flow-rpc",
@@ -1415,6 +1425,22 @@ dependencies = [
  "sha2 0.11.1",
  "tokio",
  "url",
+ "uuid",
+]
+
+[[package]]
+name = "flow-workflow"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "flow-dispatcher",
+ "flow-domain",
+ "flow-facts",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
  "uuid",
 ]
 

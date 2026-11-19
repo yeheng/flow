@@ -7,14 +7,15 @@ use tokio::{sync::Barrier, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 fn dispatcher(slots: usize) -> Dispatcher {
-    Dispatcher::new(
-        IpcOptions {
-            executor: ExecutorInvocation::explicit(env!("CARGO_BIN_EXE_flow-worker")),
-            x_max: slots,
-            tag: None,
-        },
-        "echo.v1",
-    )
+    Dispatcher::new(options(slots), "echo.v1")
+}
+
+fn options(slots: usize) -> IpcOptions {
+    IpcOptions {
+        executor: ExecutorInvocation::explicit(env!("CARGO_BIN_EXE_flow-worker")),
+        x_max: slots,
+        tag: None,
+    }
 }
 
 fn job(text: &str) -> Job {
@@ -123,5 +124,76 @@ async fn a_failed_commit_retires_the_session_and_cancellation_does_not_commit() 
         })
         .await;
     assert!(matches!(result, Err(JobError::Cancelled)));
+    dispatcher.shutdown().await;
+}
+
+#[tokio::test]
+async fn streaming_worker_round_trips_empty_and_multichunk_values() {
+    let dispatcher = Dispatcher::new_streaming(options(1), "echo.v1");
+    let cancel = CancellationToken::new();
+    let input: Vec<_> = (0..2 * flow_dispatcher::execution_protocol::TRANSFER_CHUNK_BYTES + 1)
+        .map(|index| (index % 251) as u8)
+        .collect();
+    let mut worker = None;
+    for bytes in [input.as_slice(), &[]] {
+        let mut task = job("streamed");
+        task.input = bytes.to_vec();
+        let result = dispatcher
+            .execute(task, deadline(), &cancel, |completion| async move {
+                assert_eq!(completion.outcome.as_ref().unwrap().as_slice(), bytes);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.outcome.unwrap().as_slice(), bytes);
+        if let Some(first) = worker {
+            assert_eq!(result.worker_pid, Some(first));
+        }
+        worker = result.worker_pid;
+    }
+    dispatcher.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn aborting_the_caller_reaps_the_old_worker_before_the_next_commit() {
+    use std::sync::Arc;
+
+    let dispatcher = Arc::new(dispatcher(1));
+    let (started, waiting) = tokio::sync::oneshot::channel();
+    let dispatch = dispatcher.clone();
+    let task = tokio::spawn(async move {
+        dispatch
+            .execute(
+                job("abort"),
+                deadline(),
+                &CancellationToken::new(),
+                |done| async move {
+                    started.send(done.worker_pid.unwrap()).unwrap();
+                    std::future::pending().await
+                },
+            )
+            .await
+    });
+    let retired = tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    task.abort();
+    assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+
+    let result = dispatcher
+        .execute(
+            job("replacement"),
+            deadline(),
+            &CancellationToken::new(),
+            |_| async {
+                assert_eq!(unsafe { libc::kill(retired as libc::pid_t, 0) }, -1);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.outcome.unwrap(), b"replacement");
     dispatcher.shutdown().await;
 }

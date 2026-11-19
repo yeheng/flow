@@ -105,8 +105,9 @@ impl Dispatcher {
         self.pool.shutdown().await;
     }
 
-    /// Run a job through acceptance and result. `commit` must only return Ok
-    /// after durable persistence; failure retires the session without an ACK.
+    /// Run a job through acceptance and result. `commit` returns Ok only after
+    /// the caller's authoritative state accepts the result. A durable caller
+    /// must finish persistence before returning. Failure retires the session.
     /// After commit succeeds the result wins even if confirmation is lost.
     pub async fn execute<C, F>(
         &self,

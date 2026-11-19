@@ -264,17 +264,7 @@ fn console_stream(name: &str) -> LogStream {
     }
 }
 
-/// 录制运行（regression）用的确定性上下文：固定时钟与随机种子。
-///
-/// 回归要能重放同一条路径，就不能让 `Date.now()` 与 `Math.random()`
-/// 随真实时间变化——否则每次回归的节点输出都不同，基线无法比对。
-#[derive(Clone, Copy, serde::Deserialize, serde::Serialize)]
-pub struct JsDeterminism {
-    /// 冻结的 Unix 毫秒时间戳，`Date.now()` 与无参 `new Date()` 都用它。
-    pub clock_ms: i64,
-    /// 随机种子，决定 `Math.random()` 的序列。
-    pub seed: u32,
-}
+pub use flow_engine::script::{truthy, JsDeterminism, ScriptTask, SCRIPT_V1_HANDLER as SCRIPT_V1};
 
 /// 沙箱的资源预算集合。
 ///
@@ -335,9 +325,9 @@ fn run_js_limited(
         for value in [input, nodes, tpl] {
             // 先查深度再算体积：深链的体积可能不大，但序列化/转换仍会
             // 递归爆栈，体积检查拦不住它。
-            flow_journal::codec::validate_depth(value, 0)
+            flow_facts::codec::validate_depth(value, 0)
                 .map_err(|e| EngineError::Expr(e.to_string()))?;
-            let bytes = flow_journal::codec::bounded_json(value, remaining)
+            let bytes = flow_facts::codec::bounded_json(value, remaining)
                 .map_err(|e| EngineError::Expr(e.to_string()))?;
             remaining = remaining.saturating_sub(bytes.len());
         }
@@ -479,7 +469,7 @@ fn run_js_limited(
             if let Some(limits) = limits {
                 // 读回预算只是粗略计量，最终体积以实际序列化字节为准：
                 // 读回侧记账宽松时，这里是最后一道闸门。
-                flow_journal::codec::bounded_json(&value, limits.output_bytes)
+                flow_facts::codec::bounded_json(&value, limits.output_bytes)
                     .map_err(|e| EngineError::Expr(e.to_string()))?;
             }
             Ok(value)
@@ -533,39 +523,23 @@ pub fn eval_body_recorded(
     )
 }
 
-/// The handler for a prepared script, shared by standalone jobs and workflow execution.
-pub use flow_engine::SCRIPT_V1_HANDLER as SCRIPT_V1;
-
-#[derive(serde::Deserialize, serde::Serialize)]
-pub struct ScriptTask {
-    pub code: String,
-    pub input: Value,
-    pub nodes: Value,
-    pub timeout_ms: Option<u64>,
-    pub determinism: Option<JsDeterminism>,
+pub fn execute_script(task: &ScriptTask, logger: &NodeLogger) -> Result<Value, EngineError> {
+    eval_body_recorded(
+        &task.code,
+        &task.input,
+        &task.nodes,
+        task.timeout(),
+        logger,
+        task.determinism,
+    )
 }
 
-impl ScriptTask {
-    pub fn execute(&self, logger: &NodeLogger) -> Result<Value, EngineError> {
-        eval_body_recorded(
-            &self.code,
-            &self.input,
-            &self.nodes,
-            Duration::from_millis(self.timeout_ms.unwrap_or(2000).min(30_000)),
-            logger,
-            self.determinism,
-        )
-    }
-
-    /// Decode an already prepared job and encode its bounded result for IPC.
-    pub fn execute_job(input: Vec<u8>) -> Result<Vec<u8>, String> {
-        let task: Self = serde_json::from_slice(&input).map_err(|error| error.to_string())?;
-        let output = task
-            .execute(&NodeLogger::disabled())
-            .map_err(|error| error.to_string())?;
-        flow_facts::codec::bounded_json(&output, flow_dispatcher::MAX_STREAMED_JOB_BYTES)
-            .map_err(|error| error.to_string())
-    }
+/// Decode a prepared job and encode its bounded result for IPC.
+pub fn execute_job(input: Vec<u8>) -> Result<Vec<u8>, String> {
+    let task = serde_json::from_slice(&input).map_err(|error| error.to_string())?;
+    let output = execute_script(&task, &NodeLogger::disabled()).map_err(|error| error.to_string())?;
+    flow_facts::codec::bounded_json(&output, flow_dispatcher::MAX_STREAMED_JOB_BYTES)
+        .map_err(|error| error.to_string())
 }
 
 /// 条件节点：求值单个表达式。console 可用（disabled logger，输出丢弃）。
@@ -717,23 +691,6 @@ fn expand_templates_impl(
         &NodeLogger::disabled(),
         limits,
     )
-}
-
-/// 按 JavaScript 真值语义判定一个 JSON 值。
-///
-/// 与 JS 的 `Boolean(x)` 严格对齐：空串为假、非空串（包括 `"false"`、
-/// `"0"`）为真、数组与对象恒为真、空数组也真。
-///
-/// 必须与 JS 一致：条件节点的表达式在沙箱里求值，若宿主侧判定口径不同，
-/// 同一份数据会在两处得到相反结论，且这种分歧只在边界值上出现。
-pub fn truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(b) => *b,
-        Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
-        Value::String(s) => !s.is_empty(),
-        Value::Array(_) | Value::Object(_) => true,
-    }
 }
 
 #[cfg(test)]

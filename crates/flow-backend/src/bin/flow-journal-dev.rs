@@ -180,53 +180,70 @@ async fn journal_dev(
         return Ok(());
     }
     let backend = JournalBackend::open(&data_dir, JournalOptions::default()).await?;
-    if let JournalDevCommand::Run { definition, input } = &command {
-        let definition = read_json(definition, flow_journal::MAX_LINE_BYTES)?;
-        let input = input
-            .as_ref()
-            .map(|p| read_json(p, flow_journal::VALUE_BUDGET))
-            .transpose()?
-            .unwrap_or(serde_json::Value::Null);
-        let created = backend.workflow_create("development", None).await?;
-        let workflow = created.result["workflow_id"].as_str().expect("workflow_id");
-        backend.workflow_update(workflow, definition, None).await?;
-        backend.workflow_publish(workflow, 1, None).await?;
-        let receipt = backend
-            .run_start(workflow, None, input, "manual", None, None)
-            .await?;
-        println!("{}", serde_json::to_string(&receipt)?);
-    }
     if matches!(command, JournalDevCommand::Status) {
         serde_json::to_writer_pretty(std::io::stdout(), &backend.state().await?)?;
         println!();
         backend.close().await?;
         return Ok(());
     }
-    let mut pending = backend
-        .state()
-        .await?
-        .runs
-        .values()
-        .filter(|r| !r.terminal())
-        .map(|r| r.run_id.clone())
-        .collect::<BTreeSet<_>>();
-    backend.ensure_bundled_grants().await;
-    flow_backend::start_execution(&execution, harness_agent, &backend).await?;
-    while !pending.is_empty() {
-        tokio::select! {_=tokio::signal::ctrl_c()=>break,_=tokio::time::sleep(std::time::Duration::from_millis(100))=>{}}
-        for run in backend
+    let result = async {
+        let submission = if let JournalDevCommand::Run { definition, input } = &command {
+            let definition = read_json(definition, flow_journal::MAX_LINE_BYTES)?;
+            let input = input
+                .as_ref()
+                .map(|p| read_json(p, flow_journal::VALUE_BUDGET))
+                .transpose()?
+                .unwrap_or(serde_json::Value::Null);
+            Some((definition, input))
+        } else {
+            None
+        };
+        let mut pending = backend
             .state()
             .await?
             .runs
             .values()
-            .filter(|r| r.terminal())
-        {
-            if pending.remove(&run.run_id) {
-                serde_json::to_writer(std::io::stdout(), run)?;
-                println!();
+            .filter(|r| !r.terminal())
+            .map(|r| r.run_id.clone())
+            .collect::<BTreeSet<_>>();
+        let execution = flow_backend::prepare_execution(&execution, harness_agent, &backend).await?;
+        backend.ensure_bundled_grants().await;
+        if let Some((definition, input)) = submission {
+            let created = backend.workflow_create("development", None).await?;
+            let workflow = created.result["workflow_id"].as_str().expect("workflow_id");
+            backend.workflow_update(workflow, definition, None).await?;
+            backend.workflow_publish(workflow, 1, None).await?;
+            let receipt = backend
+                .run_start(workflow, None, input, "manual", None, None)
+                .await?;
+            let run_id = receipt.result["run_id"].as_str().expect("run_id");
+            pending.insert(run_id.to_owned());
+            println!("{}", serde_json::to_string(&receipt)?);
+        }
+        execution.start().await?;
+        while !pending.is_empty() {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => break,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+            }
+            for run in backend
+                .state()
+                .await?
+                .runs
+                .values()
+                .filter(|r| r.terminal())
+            {
+                if pending.remove(&run.run_id) {
+                    serde_json::to_writer(std::io::stdout(), run)?;
+                    println!();
+                }
             }
         }
+        Ok::<_, Box<dyn std::error::Error>>(())
     }
-    backend.close().await?;
+    .await;
+    let closed = backend.close().await;
+    result?;
+    closed?;
     Ok(())
 }

@@ -8,8 +8,8 @@
 //!
 //! 职责边界：本模块只管「执行器进程的借还与生命周期」，不管节点语义、
 //! 不管审计与结果的编排（那在 dispatch）。守护的核心不变量：
-//! 1. 并发执行进程数恒 ≤ X_max——由信号量份额把守，进程数与主进程
-//!    内存占用因此有确定上界；
+//! 1. X_max bounds worker processes, with a separate allowance for parked
+//!    sessions. Startup and retirement keep their capacity until cleanup.
 //! 2. 每个子进程必被 wait/reap——不留僵尸，也不把已取消/故障的进程
 //!    放回空闲池复用（复用一个状态不明的进程等于复用未知事实）。
 //!
@@ -17,13 +17,16 @@
 //! HTTP）跑在子进程里，主进程只做裁决与调度。池把「隔离」变成可运营的
 //! 资源：有限并发、可靠回收、故障后重建。
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::process::ManagedChild as Child;
-use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
-use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tokio::sync::{mpsc, oneshot, Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio_util::{
+    sync::{CancellationToken, DropGuard},
+    task::TaskTracker,
+};
 
 use crate::execution_protocol::contract::{
     DRAIN_GRACE_MS, HEARTBEAT_TIMEOUT_MS, STARTUP_TIMEOUT_MS,
@@ -72,14 +75,70 @@ pub struct RawSession {
     pub session_id: String,
     /// 子进程 PID（便于诊断与外部排障）。
     pub child_pid: Option<u32>,
-    /// 会话生命周期令牌：取消它会终止会话驱动任务并回收子进程。
-    cancel: CancellationToken,
+    lifetime: SessionLifetime,
 }
 
-/// 一个可派发的会话租约：持有 X_max 信号量份额与会话命令通道。
+struct SessionLifetime {
+    retired: oneshot::Sender<OwnedSemaphorePermit>,
+    _cancel: DropGuard,
+}
+
+enum WorkerSlot {
+    Active(OwnedSemaphorePermit),
+    Parked {
+        permit: OwnedSemaphorePermit,
+        _count: ParkedCount,
+    },
+}
+
+struct ParkedCount(Arc<AtomicUsize>);
+
+impl Drop for ParkedCount {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct LeaseCapacity {
+    lifetime: Option<SessionLifetime>,
+    slot: Option<WorkerSlot>,
+}
+
+impl Drop for LeaseCapacity {
+    fn drop(&mut self) {
+        let Some(lifetime) = self.lifetime.take() else {
+            return;
+        };
+        let permit = match self.slot.take().expect("leased session has a slot") {
+            WorkerSlot::Active(permit) | WorkerSlot::Parked { permit, .. } => permit,
+        };
+        // The driver retains the permit until the child has been reaped. If
+        // it has already exited, the closed receiver returns the permit here.
+        let _ = lifetime.retired.send(permit);
+    }
+}
+
+impl RawSession {
+    fn lease(self, permit: OwnedSemaphorePermit) -> SessionLease {
+        SessionLease {
+            to_session: self.to_session,
+            events: self.events,
+            executor_id: self.executor_id,
+            boot_id: self.boot_id,
+            capabilities: self.capabilities,
+            session_id: self.session_id,
+            child_pid: self.child_pid,
+            capacity: LeaseCapacity {
+                lifetime: Some(self.lifetime),
+                slot: Some(WorkerSlot::Active(permit)),
+            },
+        }
+    }
+}
+
+/// 一个可派发的会话租约：持有信号量份额与会话命令通道。
 ///
-/// 租约即「槽位凭证」：槽位份额随租约一起移动，租约被丢弃时份额自动
-/// 归还，池的并发上限因此不可能被绕过。
+/// 健康会话放回空闲池后归还槽位。丢弃租约时，槽位由驱动任务持有到进程回收。
 pub struct SessionLease {
     /// 派发方 → 会话的命令通道。
     pub to_session: mpsc::Sender<ToSession>,
@@ -95,12 +154,7 @@ pub struct SessionLease {
     pub session_id: String,
     /// 子进程 PID。
     pub child_pid: Option<u32>,
-    /// 生命周期守卫：drop 即回收会话（杀进程并回收）。
-    lifecycle: tokio_util::sync::DropGuard,
-    /// X_max 槽位份额：持有租约期间占用一个执行槽。审批挂起（09 §6.1）期间
-    /// 交还份额（None），会话进程保留但不计槽；恢复前重新取得。
-    permit: Option<OwnedSemaphorePermit>,
-    parked: Option<OwnedSemaphorePermit>,
+    capacity: LeaseCapacity,
 }
 
 impl SessionLease {
@@ -124,6 +178,7 @@ pub struct ExecutorPool {
     /// 执行槽位信号量（X_max 份额）。
     slots: Arc<Semaphore>,
     parked: Arc<Semaphore>,
+    live_parked: Arc<AtomicUsize>,
     required_capabilities: Vec<String>,
     /// 已握手但当前空闲的会话（栈顶优先复用）。
     idle: Arc<Mutex<Vec<RawSession>>>,
@@ -168,6 +223,7 @@ impl ExecutorPool {
             master_epoch,
             slots: Arc::new(Semaphore::new(x_max)),
             parked: Arc::new(Semaphore::new(crate::execution_protocol::A_MAX)),
+            live_parked: Arc::new(AtomicUsize::new(0)),
             required_capabilities,
             idle: Arc::new(Mutex::new(Vec::new())),
             executor_counter: AtomicU64::new(0),
@@ -196,19 +252,22 @@ impl ExecutorPool {
     /// 预热：预先 spawn `count` 个空闲会话放入复用池，省去首次派发的
     /// 进程启动 + 握手延迟。
     ///
-    /// **只允许协调器任务在开始调度前调用**：调用期间没有并发 `acquire`，
-    /// 因此不会与按槽位计数的懒加载竞争出超过 x_max 的常驻进程。
-    /// 调用方对失败做降级处理（首次派发仍会懒加载），不因预热失败拒绝启动。
+    /// Existing idle workers and concurrent leases count against capacity.
     pub async fn prewarm(self: &Arc<Self>, count: usize) -> Result<usize, PoolError> {
-        // 预热进程占用后续 acquire 的槽位；上限即当前空闲槽位数。
-        let count = count.min(self.slots.available_permits());
         let mut warmed = 0;
         for _ in 0..count {
-            if self.shutdown.is_cancelled() {
+            let Ok(permit) = self.slots.clone().try_acquire_owned() else {
                 break;
+            };
+            {
+                let mut idle = self.idle.lock().await;
+                idle.retain(|session| !session.to_session.is_closed());
+                if idle.len() > self.slots.available_permits() {
+                    break;
+                }
             }
-            let session = self.spawn_session().await?;
-            self.idle.lock().await.push(session);
+            let lease = self.spawn_lease(permit).await?;
+            self.release(lease, true).await;
             warmed += 1;
         }
         Ok(warmed)
@@ -224,45 +283,24 @@ impl ExecutorPool {
             permit=self.slots.clone().acquire_owned()=>permit.map_err(|_|PoolError::Unavailable("pool closed".into()))?,
             _=self.shutdown.cancelled()=>return Err(PoolError::Unavailable("pool closed".into())),
         };
-        loop {
-            let reused = self.idle.lock().await.pop();
-            if let Some(session) = reused {
-                if session.to_session.is_closed() {
-                    // 复用的会话命令通道已关闭 = 对端已死：丢弃它继续取
-                    // 下一个，绝不把死会话交给派发方。
-                    continue;
-                }
-                return Ok(SessionLease {
-                    to_session: session.to_session,
-                    events: session.events,
-                    executor_id: session.executor_id,
-                    boot_id: session.boot_id,
-                    capabilities: session.capabilities,
-                    session_id: session.session_id,
-                    child_pid: session.child_pid,
-                    lifecycle: session.cancel.drop_guard(),
-                    permit: Some(permit),
-                    parked: None,
-                });
+        {
+            let mut idle = self.idle.lock().await;
+            if self.shutdown.is_cancelled() {
+                return Err(PoolError::Unavailable("pool closed".into()));
             }
-            let session = self.spawn_session().await?;
-            return Ok(SessionLease {
-                to_session: session.to_session,
-                events: session.events,
-                executor_id: session.executor_id,
-                boot_id: session.boot_id,
-                capabilities: session.capabilities,
-                session_id: session.session_id,
-                child_pid: session.child_pid,
-                lifecycle: session.cancel.drop_guard(),
-                permit: Some(permit),
-                parked: None,
-            });
+            while let Some(session) = idle.pop() {
+                if !session.to_session.is_closed() {
+                    return Ok(session.lease(permit));
+                }
+            }
         }
+        self.spawn_lease(permit).await
     }
 
     pub fn parked_count(&self) -> usize {
-        crate::execution_protocol::A_MAX - self.parked.available_permits()
+        // Retiring workers still hold their physical slots, but no longer
+        // count as parked tasks for the coordinator's admission decisions.
+        self.live_parked.load(Ordering::Relaxed)
     }
 
     /// 审批挂起：交还租约的 X_max 份额（会话进程保留、绑定原派发，不进
@@ -270,14 +308,17 @@ impl ExecutorPool {
     ///
     /// 返回 true 表示确实交还了份额（调用方随后必须 [`Self::unpark`]）。
     pub fn park(&self, lease: &mut SessionLease) -> bool {
-        if lease.permit.is_none() {
+        if !matches!(lease.capacity.slot, Some(WorkerSlot::Active(_))) {
             return false;
         }
         let Ok(parked) = self.parked.clone().try_acquire_owned() else {
             return false;
         };
-        lease.parked = Some(parked);
-        drop(lease.permit.take());
+        self.live_parked.fetch_add(1, Ordering::Relaxed);
+        lease.capacity.slot = Some(WorkerSlot::Parked {
+            permit: parked,
+            _count: ParkedCount(self.live_parked.clone()),
+        });
         true
     }
 
@@ -286,7 +327,7 @@ impl ExecutorPool {
     /// # Errors
     /// 池已关停时返回 [`PoolError::Unavailable`]。
     pub async fn unpark(&self, lease: &mut SessionLease) -> Result<(), PoolError> {
-        if lease.permit.is_some() {
+        if matches!(lease.capacity.slot, Some(WorkerSlot::Active(_))) {
             return Ok(());
         }
         let permit = tokio::select! {
@@ -297,8 +338,7 @@ impl ExecutorPool {
                 return Err(PoolError::Unavailable("pool closed".into()))
             }
         };
-        lease.permit = Some(permit);
-        drop(lease.parked.take());
+        lease.capacity.slot = Some(WorkerSlot::Active(permit));
         Ok(())
     }
 
@@ -308,6 +348,13 @@ impl ExecutorPool {
     /// 状态不明（可能还挂着半个任务、半个审计窗口），复用它等于把未知
     /// 事实带进下一次派发。
     pub async fn release(self: &Arc<Self>, lease: SessionLease, healthy: bool) {
+        if !healthy || !matches!(lease.capacity.slot, Some(WorkerSlot::Active(_))) {
+            return;
+        }
+        let mut idle = self.idle.lock().await;
+        if self.shutdown.is_cancelled() || lease.to_session.is_closed() {
+            return;
+        }
         let SessionLease {
             to_session,
             events,
@@ -316,43 +363,50 @@ impl ExecutorPool {
             capabilities,
             session_id,
             child_pid,
-            lifecycle,
-            permit,
-            parked,
+            mut capacity,
         } = lease;
-        drop(parked);
-        if healthy && !self.shutdown.is_cancelled() {
-            self.idle.lock().await.push(RawSession {
-                to_session,
-                events,
-                executor_id,
-                boot_id,
-                capabilities,
-                session_id,
-                child_pid,
-                cancel: lifecycle.disarm(),
-            });
-        } else {
-            // Do not wait on a potentially full command queue after its reader
-            // stopped draining correctness events. The owned guard wakes all waits.
-            // 守卫 disarm（复用路径）表示「不要回收这个会话」；drop 则触发
-            // 回收（杀进程 + reap）。这里必须走 drop 而不是发 Recycle 命令：
-            // 命令队列可能已满（对端停读），发命令会一直等。
-            drop(lifecycle);
-        }
-        drop(permit);
+        idle.push(RawSession {
+            to_session,
+            events,
+            executor_id,
+            boot_id,
+            capabilities,
+            session_id,
+            child_pid,
+            lifetime: capacity
+                .lifetime
+                .take()
+                .expect("leased session has a lifetime"),
+        });
+        drop(capacity);
     }
 
-    /// 启动一个新的执行器进程并完成握手，返回未占槽位的裸会话。
-    ///
-    /// 编号在 spawn 之前分配：标识必须与进程一一对应且顺序稳定，便于把
-    /// 事后审计（日志、崩溃报告）关联回具体进程实例。
-    async fn spawn_session(self: &Arc<Self>) -> Result<RawSession, PoolError> {
-        // Track startup before checking cancellation: shutdown must also wait for
-        // a handshake that has not yet installed its session driver.
-        let _starting = self.tasks.token();
-        if self.shutdown.is_cancelled() {
-            return Err(PoolError::Unavailable("pool closed".into()));
+    // Startup owns the slot even if the caller times out or drops its future.
+    async fn spawn_lease(
+        self: &Arc<Self>,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<SessionLease, PoolError> {
+        let pool = self.clone();
+        let shutdown = self.shutdown.child_token();
+        let cancelled = shutdown.clone().drop_guard();
+        let (tx, rx) = oneshot::channel();
+        self.tasks.spawn(async move {
+            let result = pool
+                .spawn_session(shutdown)
+                .await
+                .map(|session| session.lease(permit));
+            let _ = tx.send(result);
+        });
+        let lease = rx
+            .await
+            .map_err(|_| PoolError::Unavailable("worker startup stopped".into()))??;
+        cancelled.disarm();
+        Ok(lease)
+    }
+
+    async fn spawn_session(&self, shutdown: CancellationToken) -> Result<RawSession, PoolError> {
+        if shutdown.is_cancelled() {
+            return Err(PoolError::Unavailable("worker startup cancelled".into()));
         }
         let executor_id = format!(
             "exec-{}",
@@ -362,7 +416,7 @@ impl ExecutorPool {
             "session-{}",
             self.session_counter.fetch_add(1, Ordering::Relaxed)
         );
-        spawn_and_handshake(self, &executor_id, &session_id, self.shutdown.child_token()).await
+        spawn_and_handshake(self, &executor_id, &session_id, shutdown).await
     }
 }
 
@@ -402,7 +456,7 @@ async fn spawn_and_handshake(
             // 握手失败：先杀再 reap 再关传输——顺序保证不留僵尸进程，也不
             // 让失败的子进程继续持有继承来的通道端。
             let _ = child.start_kill();
-            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+            let _ = child.wait().await;
             transport.close();
             transport.join().await;
             return Err(PoolError::Handshake(error));
@@ -414,14 +468,19 @@ async fn spawn_and_handshake(
     // 发送方 await 承担，从而把「执行器停读」显式暴露成阻塞而非丢帧。
     let (to_session, command_rx) = mpsc::channel::<ToSession>(64);
     let (event_tx, events) = mpsc::channel::<FromSession>(256);
-    pool.tasks.spawn(session_driver(
+    let (retired, retain_slot) = oneshot::channel();
+    let driver = session_driver(
         transport,
         child,
         command_rx,
         event_tx,
         executor_id.to_string(),
         shutdown.clone(),
-    ));
+    );
+    pool.tasks.spawn(async move {
+        driver.await;
+        drop(retain_slot);
+    });
     Ok(RawSession {
         to_session,
         events,
@@ -430,7 +489,10 @@ async fn spawn_and_handshake(
         capabilities: hello.capabilities,
         session_id: session_id.to_string(),
         child_pid,
-        cancel: shutdown,
+        lifetime: SessionLifetime {
+            retired,
+            _cancel: shutdown.drop_guard(),
+        },
     })
 }
 
@@ -566,22 +628,29 @@ async fn session_driver(
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
-    /// 归还不健康的租约、或干脆丢弃租约，都不能阻塞在满掉的命令队列上——
-    /// 否则一次故障就能让整个池卡死。
-    #[tokio::test]
-    async fn unhealthy_release_and_abandoned_lease_do_not_wait_for_command_capacity() {
-        let options = IpcOptions {
-            executor: crate::execution_protocol::contract::ExecutorInvocation::explicit("unused"),
-            x_max: 1,
-            tag: None,
-        };
-        let pool = ExecutorPool::new(options, "j".into(), 1);
-        for abandon in [false, true] {
-            let cancel = CancellationToken::new();
-            let (commands, _held_receiver) = mpsc::channel(1);
-            commands.try_send(ToSession::Recycle).unwrap();
-            let (_, events) = mpsc::channel(1);
-            let lease = SessionLease {
+
+    fn single_slot_pool() -> Arc<ExecutorPool> {
+        ExecutorPool::new(
+            IpcOptions {
+                executor: crate::execution_protocol::contract::ExecutorInvocation::explicit(
+                    "unused",
+                ),
+                x_max: 1,
+                tag: None,
+            },
+            "j".into(),
+            1,
+        )
+    }
+
+    fn fixture_session(
+        commands: mpsc::Sender<ToSession>,
+        events: mpsc::Receiver<FromSession>,
+        cancel: CancellationToken,
+    ) -> (RawSession, oneshot::Receiver<OwnedSemaphorePermit>) {
+        let (retired, retain_slot) = oneshot::channel();
+        (
+            RawSession {
                 to_session: commands,
                 events,
                 executor_id: "e".into(),
@@ -589,10 +658,27 @@ mod lifecycle_tests {
                 capabilities: Vec::new(),
                 session_id: "s".into(),
                 child_pid: None,
-                lifecycle: cancel.clone().drop_guard(),
-                permit: Some(pool.slots.clone().acquire_owned().await.unwrap()),
-                parked: None,
-            };
+                lifetime: SessionLifetime {
+                    retired,
+                    _cancel: cancel.drop_guard(),
+                },
+            },
+            retain_slot,
+        )
+    }
+
+    /// 归还不健康的租约、或干脆丢弃租约，都不能阻塞在满掉的命令队列上——
+    /// 否则一次故障就能让整个池卡死。
+    #[tokio::test]
+    async fn unhealthy_release_and_abandoned_lease_do_not_wait_for_command_capacity() {
+        let pool = single_slot_pool();
+        for abandon in [false, true] {
+            let cancel = CancellationToken::new();
+            let (commands, _held_receiver) = mpsc::channel(1);
+            commands.try_send(ToSession::Recycle).unwrap();
+            let (_, events) = mpsc::channel(1);
+            let (session, retain_slot) = fixture_session(commands, events, cancel.clone());
+            let lease = session.lease(pool.slots.clone().acquire_owned().await.unwrap());
             if abandon {
                 drop(lease)
             } else {
@@ -601,9 +687,98 @@ mod lifecycle_tests {
                     .expect("release cannot wait behind a full command queue");
             }
             assert!(cancel.is_cancelled());
+            assert!(
+                pool.slots.clone().try_acquire_owned().is_err(),
+                "the process still being reaped must hold its slot"
+            );
+            drop(retain_slot);
             assert_eq!(pool.slots.available_permits(), 1);
         }
         pool.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn warm_idle_session_counts_against_prewarm_capacity() {
+        let pool = single_slot_pool();
+        let (commands, _command_rx) = mpsc::channel(1);
+        let (_event_tx, events) = mpsc::channel(1);
+        let (session, _retain_slot) =
+            fixture_session(commands, events, pool.shutdown.child_token());
+        pool.idle.lock().await.push(session);
+        assert_eq!(pool.prewarm(1).await.unwrap(), 0);
+        let lease = pool.acquire().await.unwrap();
+        assert_eq!(lease.session_id, "s");
+        pool.release(lease, false).await;
+        pool.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn parked_retirement_keeps_physical_quota_without_counting_as_a_parked_task() {
+        let pool = single_slot_pool();
+        let (commands, _command_rx) = mpsc::channel(1);
+        let (_event_tx, events) = mpsc::channel(1);
+        let (session, retain_slot) = fixture_session(commands, events, pool.shutdown.child_token());
+        let mut lease = session.lease(pool.slots.clone().acquire_owned().await.unwrap());
+        let available = pool.parked.available_permits();
+        assert!(pool.park(&mut lease));
+        assert_eq!(pool.parked_count(), 1);
+        assert_eq!(pool.slots.available_permits(), 1);
+
+        pool.release(lease, true).await;
+        assert!(pool.idle.lock().await.is_empty());
+        assert_eq!(pool.parked_count(), 0);
+        assert_eq!(pool.parked.available_permits(), available - 1);
+        drop(retain_slot);
+        assert_eq!(pool.parked.available_permits(), available);
+        pool.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn abandoned_handshake_is_reaped_before_shutdown_returns() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("worker");
+        let pid_file = dir.path().join("worker.pid");
+        // Report startup, then keep the IPC endpoint open without a Hello.
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$0.pid\"\nexec /bin/sleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let pool = ExecutorPool::new(
+            IpcOptions {
+                executor: crate::execution_protocol::ExecutorInvocation::explicit(script),
+                x_max: 1,
+                tag: None,
+            },
+            "fixture".into(),
+            1,
+        );
+        let starting_pool = pool.clone();
+        let starting = tokio::spawn(async move { starting_pool.acquire().await });
+        let pid: libc::pid_t = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(&pid_file)
+                    .ok()
+                    .and_then(|value| value.trim().parse().ok())
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker spawned");
+
+        starting.abort();
+        assert!(matches!(starting.await, Err(error) if error.is_cancelled()));
+        tokio::time::timeout(Duration::from_secs(5), pool.shutdown())
+            .await
+            .expect("shutdown waits for the abandoned handshake");
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
     }
     /// 关停必须打断被填满的事件队列，并保证子进程被回收（不留僵尸）。
     #[cfg(unix)]

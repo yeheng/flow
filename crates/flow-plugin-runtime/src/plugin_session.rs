@@ -32,11 +32,11 @@ use flow_plugin_sdk::ipc::Challenge;
 
 use crate::plugin_registry::RegisteredPlugin;
 
-/// binary 累积预算：与 flow_journal::MAX_VALUE_BYTES、插件侧 llm 契约
+/// binary 累积预算：与 flow_facts::MAX_VALUE_BYTES、插件侧 llm 契约
 /// MAX_CAPTURE_BYTES 同值——跨进程契约值，改动必须双侧同步 + bump
 /// 协议主版本。帧上限（1 MiB）只防单帧；这里封的是跨帧总量，坏插件
 /// 不能靠无限发 binary 帧撑爆执行器内存。
-const MAX_BINARY_BYTES: usize = flow_journal::MAX_VALUE_BYTES as usize;
+const MAX_BINARY_BYTES: usize = flow_facts::MAX_VALUE_BYTES as usize;
 
 /// 握手超时：覆盖插件 exec + 初始化 + 一次往返。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);

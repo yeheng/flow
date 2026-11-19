@@ -3,14 +3,24 @@ name = "flow-plugin-runtime"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["plugins"]
+plugins = [
+    "dep:flow-plugin-catalog",
+    "dep:flow-plugin-sdk",
+    "dep:flow-config",
+    "dep:flow-harness-protocol",
+    "dep:futures",
+    "dep:postcard",
+]
+
 [dependencies]
-flow-plugin-catalog = { path = "../flow-plugin-catalog" }
-postcard = { workspace = true }
-flow-plugin-sdk = { path = "../flow-plugin-sdk" }
-flow-engine = { path = "../flow-engine" }
-flow-journal = { path = "../flow-journal", default-features = false, features = ["storage"] }
-# 仅用 flow_home()（harness 沙箱的统一落点 FLOW_HOME/~/.flow/harness）
-flow-config = { path = "../flow-config" }
+flow-plugin-catalog = { path = "../flow-plugin-catalog", optional = true }
+postcard = { workspace = true, optional = true }
+flow-plugin-sdk = { path = "../flow-plugin-sdk", optional = true }
+flow-engine = { path = "../flow-engine", default-features = false, features = ["node-execution"] }
+flow-facts = { path = "../flow-facts" }
+flow-config = { path = "../flow-config", optional = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde = { workspace = true }
@@ -24,11 +34,11 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-futures = { workspace = true }
+futures = { workspace = true, optional = true }
 # harness agent 运行时整体住在独立插件进程（agent-plugin 项目）里；
 # 这里只链接其 lib 的 wire 类型（方法层契约的唯一来源），运行时不进进程。
 # harness 方法层 wire 契约（DTO/错误码）：只依赖协议，不依赖 agent 实现
-flow-harness-protocol = { path = "../../plugins/harness/protocol" }
+flow-harness-protocol = { path = "../../plugins/harness/protocol", optional = true }
 # 内置节点实现（T4）：Script/Condition 求值
 flow-internal-plugins = { path = "../flow-internal-plugins" }
 

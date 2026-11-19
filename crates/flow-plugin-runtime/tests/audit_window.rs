@@ -158,7 +158,7 @@ async fn large_output_production_stays_inside_window_and_frame_limit() {
             &mut audit,
             "j",
             &vec![b'x'; 6 * 1024 * 1024],
-            flow_journal::value::ValueCodec::Bytes,
+            flow_facts::value::ValueCodec::Bytes,
         )
         .await
         .unwrap();

@@ -169,9 +169,10 @@ async fn deployed_sibling_executor_runs_in_spaced_directory() {
     );
 
     std::fs::remove_file(deployment.executor()).unwrap();
+    let without_worker = temp.path().join("without-worker");
     let output = local_output(
         deployment
-            .journal(&temp.path().join("without-worker"))
+            .journal(&without_worker)
             .arg("run")
             .arg("--definition")
             .arg(&definition),
@@ -182,6 +183,12 @@ async fn deployed_sibling_executor_runs_in_spaced_directory() {
         !output.status.success() && error.contains("cannot locate flow-executor"),
         "{error}"
     );
+    assert!(output.stdout.is_empty(), "startup failure issued a receipt");
+    let status = local_output(deployment.journal(&without_worker).arg("status")).await;
+    assert!(status.status.success(), "{:?}", status);
+    let state: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(state["workflows"], json!({}));
+    assert_eq!(state["runs"], json!({}));
 }
 
 async fn local_output(cmd: &mut tokio::process::Command) -> std::process::Output {
@@ -189,6 +196,67 @@ async fn local_output(cmd: &mut tokio::process::Command) -> std::process::Output
         .await
         .expect("local deployment command must finish")
         .expect("spawn local deployment command")
+}
+
+#[tokio::test]
+async fn invalid_run_submission_leaves_recovered_runs_dormant() {
+    let root = tempfile::tempdir().unwrap();
+    let deployment = LocalDeployment::copy_to(&root.path().join("local bundle")).unwrap();
+    let data = root.path().join("data");
+    let definition = json!({
+        "nodes": [{"id":"s","type":"start"}, {"id":"e","type":"end"}],
+        "edges": [{"from":"s","to":"e"}]
+    });
+    let backend = JournalBackend::open(&data, JournalOptions::default())
+        .await
+        .unwrap();
+    let workflow = install(&backend, definition.clone()).await;
+    let receipt = backend
+        .run_start(
+            &workflow,
+            None,
+            serde_json::Value::Null,
+            "manual",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let pending = receipt.result["run_id"].as_str().unwrap();
+    backend.close().await.unwrap();
+    drop(backend);
+
+    let mut invalid = definition;
+    invalid["input_schema"] = json!({"type": "object", "required": ["value"]});
+    let path = root.path().join("invalid-input.json");
+    std::fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+    let rejected = local_output(
+        deployment
+            .journal(&data)
+            .arg("run")
+            .arg("--definition")
+            .arg(&path),
+    )
+    .await;
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("input contract"));
+    assert!(rejected.stdout.is_empty());
+
+    let status = local_output(deployment.journal(&data).arg("status")).await;
+    assert!(status.status.success(), "{status:?}");
+    let state: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(
+        state["master_epoch"], "0",
+        "validation must not start the coordinator"
+    );
+    assert_eq!(state["runs"].as_object().unwrap().len(), 1);
+    assert_eq!(state["runs"][pending]["nodes"], json!({}));
+
+    let resumed = local_output(deployment.journal(&data).arg("resume")).await;
+    assert!(resumed.status.success(), "{resumed:?}");
+    let run: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(run["run_id"], pending);
+    assert_eq!(run["status"], "succeeded");
 }
 
 #[tokio::test]

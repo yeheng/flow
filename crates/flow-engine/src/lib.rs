@@ -12,34 +12,35 @@
 //! 不这样做的代价：执行器与 master 版本漂移时，在飞 run 会被按新语义
 //! 执行——结果是「悄悄跑错」而不是「响亮拒绝」，事后无法从证据倒推。
 //!
-//! `runtime` feature 门控的是**需要执行期依赖**的模块（SQLite 存储、
-//! HTTP 客户端、QuickJS 沙箱、密钥加密）。关闭它可得到一个只含协议与
-//! 数据模型的精简构建，用于不需要执行侧的纯消费方。
+//! `node-execution` 提供 Worker 所需的错误、日志和常量。
+//! `runtime` 另启用 SQLite 观测存储和密钥加密。纯协议消费方可关闭默认 features。
 
-#[cfg(feature = "runtime")]
+#[cfg(feature = "node-execution")]
 pub mod error;
-#[cfg(feature = "runtime")]
+#[cfg(feature = "node-execution")]
 pub mod exec;
 pub use flow_dispatcher::execution_protocol;
 pub use flow_domain::journal_state;
 pub use flow_dto::AgentRunConfig;
-#[cfg(feature = "runtime")]
+#[cfg(feature = "node-execution")]
 pub mod log_types;
 pub use flow_domain::model;
-#[cfg(feature = "runtime")]
+pub use flow_domain::progression;
+#[cfg(feature = "node-execution")]
 pub mod nodelog;
 #[cfg(feature = "runtime")]
 pub mod observation;
 pub use flow_dispatcher::process;
 pub use flow_domain::schema;
+pub use flow_domain::script;
 pub mod environments;
 pub mod secrets;
 #[cfg(feature = "runtime")]
 pub mod secrets_store;
-pub use flow_domain::template;
 /// Versioned handler selected by the workflow adapter for prepared script computation.
-pub const SCRIPT_V1_HANDLER: &str = "script.v1";
-pub use flow_domain::MAX_SUB_WORKFLOW_DEPTH;
+pub use flow_domain::script::SCRIPT_V1_HANDLER;
+pub use flow_domain::template;
+pub use flow_domain::{Prepared, MAX_SUB_WORKFLOW_DEPTH};
 /// Execution compatibility, frozen into runs. Bump when node semantics, snapshot
 /// interpretation or executor contracts become incompatible. Never accept an old
 /// source hash as this compatibility version without an explicit migration.
@@ -50,10 +51,10 @@ pub const RUNTIME_ID: &str = env!("FLOW_COMPATIBILITY_ID");
 pub const RUNTIME_VERSION: &str = env!("FLOW_RUNTIME_VERSION");
 /// Exact source/dependency provenance; diagnostic only, never a resume gate.
 pub const BUILD_ID: &str = env!("FLOW_BUILD_ID");
-#[cfg(feature = "runtime")]
+#[cfg(feature = "node-execution")]
 pub use error::EngineError;
-#[cfg(feature = "runtime")]
+#[cfg(feature = "node-execution")]
 pub use log_types::{LogLevel, LogStream};
 pub use model::{Definition, Edge, Node, NodeType, Position, RetryPolicy, HTTP_METHODS};
-#[cfg(feature = "runtime")]
+#[cfg(feature = "node-execution")]
 pub use nodelog::{budget_from_env, redact_url, redact_value, LogBudget, LogLine, NodeLogger};

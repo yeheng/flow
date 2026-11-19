@@ -67,34 +67,7 @@ const COMMAND_WINDOW: usize = 8192;
 /// 避免出现第二份 `ALL`/`as_str`。
 pub use flow_dto::RunStatus;
 
-/// 节点执行状态（`Node.status`）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NodeStatus {
-    Pending,
-    Running,
-    Waiting,
-    Succeeded,
-    Skipped,
-    Failed,
-}
-
-impl NodeStatus {
-    /// 节点状态的稳定字符串形式（与 `serde` 的 snake_case 重命名一致）。
-    ///
-    /// 这是对外暴露的稳定字面量，会落进快照、HTTP 响应与事件载荷；
-    /// 改字面量等于改协议，必须同步改 `serde` 属性。
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Running => "running",
-            Self::Waiting => "waiting",
-            Self::Succeeded => "succeeded",
-            Self::Skipped => "skipped",
-            Self::Failed => "failed",
-        }
-    }
-}
+pub use crate::progression::NodeStatus;
 
 impl std::fmt::Display for NodeStatus {
     /// 显示时复用 `as_str`，保证日志与错误信息里的状态词与协议字面量一致。
@@ -394,6 +367,36 @@ pub struct Node {
     pub permit: Option<PermitGrant>,
 }
 
+impl crate::progression::WorkflowNodeState for Node {
+    fn view(&self) -> crate::progression::NodeView<'_> {
+        crate::progression::NodeView {
+            status: self.status,
+            output: self.output.as_ref(),
+            branch: self.branch,
+            error: self.error.as_deref(),
+            skip_reason: self.skip_reason.as_deref(),
+        }
+    }
+}
+
+impl Node {
+    fn apply_outcome(&mut self, outcome: crate::progression::NodeOutcome) {
+        use crate::progression::{NodeOutcome, WorkflowNodeState};
+        self.status = outcome.view().status;
+        match outcome {
+            NodeOutcome::Succeeded { output, branch } => {
+                self.output = Some(output);
+                self.branch = branch;
+            }
+            NodeOutcome::Failed { error } => {
+                self.error = Some(error);
+                self.wait = None;
+            }
+            NodeOutcome::Skipped { skip_reason } => self.skip_reason = skip_reason,
+        }
+    }
+}
+
 /// 权限询问的状态机：`Pending → Allowed | Denied | Expired`，或因派发
 /// 结束而 `Superseded`（重派发）/ `Withdrawn`（会话结束/节点出结果）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -526,18 +529,7 @@ pub struct Attempt {
     pub sealed: bool,
     pub integrity: String,
 }
-/// 输入准备事实的冻结内容：节点将要消费的输入、前驱输出与参数。
-///
-/// `node_semantics` 记录执行语义版本，用于判断旧准备事实能否被当前引擎
-/// 解释；`engine_build` 记录写入该准备事实的引擎构建号。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Prepared {
-    pub input: StoredValue,
-    pub predecessors: BTreeMap<String, StoredValue>,
-    pub params: StoredValue,
-    pub engine_build: String,
-    pub node_semantics: u32,
-}
+pub use crate::Prepared;
 // 内部枚举按「种类」携带各自需要的字段，避免用一堆 Option 拼出无效组合；
 // 但对外的 JSON 形状必须保持旧检查点/事件的原样（显式 null 也要保留），
 // 因此通过 WaitWire 做双向适配，旧日志才能原样读回。
@@ -1733,27 +1725,28 @@ impl State {
                     return Err(invalid("cannot skip dispatched node"));
                 }
             }
-            run.nodes.insert(
-                node_id,
-                Node {
-                    node_execution_id: String::new(),
-                    attempt: 0,
-                    dispatch_id: String::new(),
-                    status: NodeStatus::Skipped,
-                    output: None,
-                    branch: None,
-                    prepared: None,
-                    wait: None,
-                    operation: None,
-                    attempts: BTreeMap::new(),
-                    error: None,
-                    // 跳过原因只在事件里携带；折影保留一份供时间线展示
-                    //（upstream_failed / upstream_skipped / branch_not_taken …）
-                    skip_reason: p.get("reason").and_then(Value::as_str).map(str::to_owned),
-                    approval: None,
-                    permit: None,
-                },
-            );
+            let mut node = Node {
+                node_execution_id: String::new(),
+                attempt: 0,
+                dispatch_id: String::new(),
+                status: NodeStatus::Pending,
+                output: None,
+                branch: None,
+                prepared: None,
+                wait: None,
+                operation: None,
+                attempts: BTreeMap::new(),
+                error: None,
+                // 跳过原因只在事件里携带；折影保留一份供时间线展示
+                //（upstream_failed / upstream_skipped / branch_not_taken …）
+                skip_reason: None,
+                approval: None,
+                permit: None,
+            };
+            node.apply_outcome(crate::progression::NodeOutcome::Skipped {
+                skip_reason: p.get("reason").and_then(Value::as_str).map(str::to_owned),
+            });
+            run.nodes.insert(node_id, node);
             return Ok(());
         }
         if event.kind == EventKind::InputPrepared {
@@ -1965,9 +1958,10 @@ impl State {
                 }
                 match event.kind {
                     EventKind::NodeCompleted => {
-                        node.status = NodeStatus::Succeeded;
-                        node.output = Some(serde_json::from_value(p["output"].clone())?);
-                        node.branch = p.get("branch").and_then(Value::as_bool);
+                        node.apply_outcome(crate::progression::NodeOutcome::Succeeded {
+                            output: serde_json::from_value(p["output"].clone())?,
+                            branch: p.get("branch").and_then(Value::as_bool),
+                        });
                     }
                     EventKind::WaitRegistered => {
                         node.status = NodeStatus::Waiting;
@@ -1983,9 +1977,9 @@ impl State {
                         };
                     }
                     _ => {
-                        node.status = NodeStatus::Failed;
-                        node.wait = None;
-                        node.error = Some(string(p, "error")?);
+                        node.apply_outcome(crate::progression::NodeOutcome::Failed {
+                            error: string(p, "error")?,
+                        });
                         // 纯重试与外部操作互斥（I9）：带未决 operation 的节点
                         // 不能用 retry_wake_at 自动重来，因为外部副作用可能
                         // 已经发生，只能等人工裁决。

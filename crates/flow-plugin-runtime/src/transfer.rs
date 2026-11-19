@@ -21,8 +21,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use flow_engine::execution_protocol::message::Message;
-use flow_journal::value::{Chunk, ValueCodec, ValueRef};
-use flow_journal::{StoredValue, CHUNK_BYTES, INLINE_BYTES, MAX_VALUE_BYTES};
+use flow_facts::value::{Chunk, ValueCodec, ValueRef};
+use flow_facts::{StoredValue, CHUNK_BYTES, INLINE_BYTES, MAX_VALUE_BYTES};
 
 use crate::audit::AuditStream;
 
@@ -290,8 +290,8 @@ pub async fn store_value(
     value: &Value,
     limit: usize,
 ) -> Result<StoredValue, crate::task::TaskError> {
-    let bytes = flow_journal::codec::bounded_json(value, limit)?;
-    flow_journal::codec::validate_depth(value, 0)?;
+    let bytes = flow_facts::codec::bounded_json(value, limit)?;
+    flow_facts::codec::validate_depth(value, 0)?;
     store_bytes(audit, journal_id, &bytes, ValueCodec::Json).await
 }
 

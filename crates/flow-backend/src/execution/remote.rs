@@ -323,6 +323,54 @@ struct PendingBind {
     ack: oneshot::Sender<Result<String>>,
 }
 
+/// Bound sockets for a prepared execution port. Accept loops start on activation.
+pub(crate) struct RemoteListeners {
+    tls: (TcpListener, TlsServer),
+    wss: Option<TcpListener>,
+}
+
+impl RemoteListeners {
+    pub(crate) async fn bind(options: &RemoteOptions) -> Result<Self> {
+        if options.wss_addr.is_some() && options.wss_agents.is_empty() {
+            return Err(invalid(
+                "execution.remote.wss_addr 配置了但 agents 凭据表为空",
+            ));
+        }
+        let tls = bind_tls(options).await?;
+        let wss = match &options.wss_addr {
+            Some(addr) => Some(bind_wss(addr).await?),
+            None => None,
+        };
+        Ok(Self { tls, wss })
+    }
+
+    pub(crate) fn start(self, manager: &Arc<AgentManager>, agents: Vec<AgentCredential>) {
+        manager.accept_tls(self.tls.0, self.tls.1);
+        if let Some(listener) = self.wss {
+            manager.accept_wss(listener, agents);
+        }
+    }
+}
+
+async fn bind_tls(options: &RemoteOptions) -> Result<(TcpListener, TlsServer)> {
+    install_crypto_provider();
+    let tls = TlsServer::from_files(&options.ca_cert, &options.server_cert, &options.server_key)
+        .map_err(|e| invalid(format!("agent TLS config: {e}")))?;
+    let listener = TcpListener::bind(&options.control_addr)
+        .await
+        .map_err(|e| invalid(format!("agent listen: {e}")))?;
+    tracing::info!(listen = %listener.local_addr()?, "agent TLS listener ready");
+    Ok((listener, tls))
+}
+
+async fn bind_wss(addr: &str) -> Result<TcpListener> {
+    let listener = TcpListener::bind(addr)
+        .await
+        .map_err(|e| invalid(format!("agent wss listen: {e}")))?;
+    tracing::info!(listen = %listener.local_addr()?, "agent WSS listener ready");
+    Ok(listener)
+}
+
 impl AgentManager {
     /// 新建 agent 管理器。
     ///
@@ -353,18 +401,13 @@ impl AgentManager {
     /// TLS 监听入口（真实网络）。单条 mTLS 连接承载整条上联（单流帧：
     /// 一帧一形态，变体索引即帧类型），不再有第二条 data 连接。
     pub async fn listen_tls(self: &Arc<Self>, options: RemoteOptions) -> Result<()> {
-        install_crypto_provider();
-        let tls =
-            TlsServer::from_files(&options.ca_cert, &options.server_cert, &options.server_key)
-                .map_err(|e| invalid(format!("agent TLS config: {e}")))?;
-        let listener = TcpListener::bind(&options.control_addr)
-            .await
-            .map_err(|e| invalid(format!("agent listen: {e}")))?;
-        tracing::info!(
-            listen = %listener.local_addr().map_err(|e| invalid(e.to_string()))?,
-            "agent TLS listener ready"
-        );
-        let acceptor = tls.acceptor.clone();
+        let (listener, tls) = bind_tls(&options).await?;
+        self.accept_tls(listener, tls);
+        Ok(())
+    }
+
+    fn accept_tls(self: &Arc<Self>, listener: TcpListener, tls: TlsServer) {
+        let acceptor = tls.acceptor;
         // 绑定即返回：accept 循环作为后台任务（与 v2 时代语义一致）。
         // 直接 await 会把 start_execution_remote（含生产 remote 模式启动）
         // 永久阻塞在 accept 循环上。
@@ -405,7 +448,6 @@ impl AgentManager {
                 });
             }
         });
-        Ok(())
     }
 
     /// WSS 接入（T13）：反向代理/统一入口场景的**附加**承载。明文 TCP，
@@ -416,22 +458,20 @@ impl AgentManager {
     ///
     /// 协议层面：一条完整帧对应一条（或分片后多条）WS Binary 消息；Text/超限消息拒绝；
     /// 协商上限由 [`MAX_WS_MESSAGE_BYTES`] 硬约束。
-    #[allow(clippy::result_large_err)] // accept_hdr 回调签名固定，ErrorResponse 为大类型
     pub async fn listen_wss(
         self: &Arc<Self>,
         addr: String,
         agents: Vec<AgentCredential>,
     ) -> Result<()> {
+        self.accept_wss(bind_wss(&addr).await?, agents);
+        Ok(())
+    }
+
+    #[allow(clippy::result_large_err)] // accept_hdr 回调签名固定，ErrorResponse 为大类型
+    fn accept_wss(self: &Arc<Self>, listener: TcpListener, agents: Vec<AgentCredential>) {
         use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
         use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
-        let listener = TcpListener::bind(&addr)
-            .await
-            .map_err(|e| invalid(format!("agent wss listen: {e}")))?;
-        tracing::info!(
-            listen = %listener.local_addr().map_err(|e| invalid(e.to_string()))?,
-            "agent WSS listener ready"
-        );
         let manager = self.clone();
         let limit = Some(flow_engine::execution_protocol::ws::MAX_WS_MESSAGE_BYTES);
         let config = Some(
@@ -490,7 +530,6 @@ impl AgentManager {
                 });
             }
         });
-        Ok(())
     }
 
     /// R0 模拟中继入口：直接注入单流（无 TLS；身份由注入方保证）。

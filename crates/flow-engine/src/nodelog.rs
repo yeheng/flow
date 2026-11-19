@@ -167,6 +167,7 @@ enum LogTarget {
     /// 有界通道：满了就丢，并计量。
     Bounded(tokio::sync::mpsc::Sender<LogLine>, Arc<LogQueueLoss>),
     /// 观测存储：写入独立的有界分段日志。
+    #[cfg(feature = "runtime")]
     Observation(crate::observation::ObservationLogger),
 }
 
@@ -218,6 +219,7 @@ impl NodeLogger {
     ///
     /// 预算设为 `usize::MAX`：观测存储自己就有界（内存队列 + 磁盘预算），
     /// 再叠一层 per-run 预算会让「为什么丢了」难以归因。
+    #[cfg(feature = "runtime")]
     pub fn observation(
         target: crate::observation::ObservationLogger,
         node_id: String,
@@ -275,6 +277,7 @@ impl NodeLogger {
                         .fetch_add(bytes as u64, Ordering::Relaxed);
                 }
             }
+            #[cfg(feature = "runtime")]
             LogTarget::Observation(target) => target.emit(line),
         }
     }

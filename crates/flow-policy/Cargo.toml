@@ -1,0 +1,11 @@
+[package]
+name = "flow-policy"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chrono.workspace = true
+flow-dto = { path = "../flow-dto" }
+
+[dev-dependencies]
+serde_json.workspace = true

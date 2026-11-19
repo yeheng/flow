@@ -45,53 +45,82 @@ pub fn harness_agent_run_config(
         .map(|installed| installed.run_config)
 }
 
-/// 按配置选择执行端口（本地 IPC 子进程池或远程 agent）并启动协调循环。
-///
-/// 先安装 `[harness.agent]` 快照来源，再按 `execution.mode` 建立端口；
-/// `InProcess` 模式在此显式拒绝——进程内执行路径已全平台删除，静默改走别的
-/// 模式会让用户以为节点语义仍受进程隔离保护（C2）。
-///
-/// # Errors
-/// 执行器二进制缺失、配置非法、端口监听失败或 harness agent 配置重复安装时返回错误。
-pub async fn start_execution(
-    execution: &flow_config::ExecutionConfig,
-    harness_agent: Option<crate::plugin_config::InstalledAgentPlugin>,
-    backend: &std::sync::Arc<crate::journal::JournalBackend>,
-) -> Result<(), crate::journal::JournalError> {
-    let invalid = |message: String| {
-        crate::journal::JournalError::Journal(flow_journal::Error::Invalid(message))
-    };
-    // [harness.agent] 启动时安装一次：新 run 快照的唯一来源；派发时从
-    // run.execution 读冻结值。配置在重启后修改只影响新 run。resolved
-    // 形态直接装（typed 注入口是 e2e/dev 的兼容路径，内部同样补元数据）。
-    backend
-        .install_harness_agent_plugin(harness_agent)
-        .map_err(|message| invalid(message.to_string()))?;
-    match execution.mode {
-        // 进程内执行路径已全平台删除（节点执行语义只在 flow-executor）；
-        // 配置期就明确拒绝，不静默改走别的模式。
-        flow_config::ExecutionModeKind::InProcess => {
-            Err(invalid(execution::IN_PROCESS_REMOVED.into()))
-        }
-        flow_config::ExecutionModeKind::Ipc => {
-            let options = match execution::mode_from_config(execution) {
-                Ok(execution::ExecutionMode::Ipc(options)) => options,
-                Err(error) => return Err(invalid(format!("execution.mode=ipc: {error}"))),
-            };
-            backend
-                .start_execution_ipc_prewarm(
-                    execution::ExecutionMode::Ipc(options),
-                    execution.prewarm,
-                )
-                .await
-        }
-        flow_config::ExecutionModeKind::Remote => {
-            let options = execution::remote_options_from_config(execution).map_err(invalid)?;
-            backend.start_execution_remote(options).await
+/// A validated execution port whose coordinator has not yet started.
+pub struct PreparedExecution {
+    backend: std::sync::Arc<journal::JournalBackend>,
+    port: PreparedPort,
+}
+
+enum PreparedPort {
+    Ipc(execution::IpcOptions, bool),
+    Remote(execution::remote::RemoteOptions, execution::remote::RemoteListeners),
+}
+
+impl PreparedExecution {
+    /// Activate dispatch and recovery after the caller has accepted its work.
+    pub async fn start(self) -> Result<(), journal::JournalError> {
+        match self.port {
+            PreparedPort::Ipc(options, prewarm) => self.backend.activate_ipc(options, prewarm).await,
+            PreparedPort::Remote(options, listeners) => {
+                self.backend.activate_remote(options, listeners).await
+            }
         }
     }
 }
 
+/// Validate the port and establish runtime configuration for run snapshots.
+/// Remote sockets are bound here. Recovery, epoch allocation and accepting
+/// remote agents begin only when the prepared port is started.
+pub async fn prepare_execution(
+    config: &flow_config::ExecutionConfig,
+    harness_agent: Option<plugin_config::InstalledAgentPlugin>,
+    backend: &std::sync::Arc<journal::JournalBackend>,
+) -> Result<PreparedExecution, journal::JournalError> {
+    let invalid = |message: String| flow_journal::Error::Invalid(message);
+    let port = match config.mode {
+        flow_config::ExecutionModeKind::InProcess => {
+            return Err(invalid(execution::IN_PROCESS_REMOVED.into()).into());
+        }
+        flow_config::ExecutionModeKind::Ipc => {
+            let execution::ExecutionMode::Ipc(options) = execution::mode_from_config(config)
+                .map_err(|error| invalid(format!("execution.mode=ipc: {error}")))?;
+            journal_driver::check_executor(&options)?;
+            PreparedPort::Ipc(options, config.prewarm)
+        }
+        flow_config::ExecutionModeKind::Remote => {
+            let options = execution::remote_options_from_config(config).map_err(invalid)?;
+            let listeners = execution::remote::RemoteListeners::bind(&options).await?;
+            PreparedPort::Remote(options, listeners)
+        }
+    };
+    backend
+        .install_harness_agent_plugin(harness_agent)
+        .map_err(|error| invalid(error.to_owned()))?;
+    let executor = match &port {
+        PreparedPort::Ipc(options, _) => Some(options.executor.program.clone()),
+        PreparedPort::Remote(..) => None,
+    };
+    *backend
+        .plugin_executor_program
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = executor;
+    Ok(PreparedExecution {
+        backend: backend.clone(),
+        port,
+    })
+}
+
+/// Prepare and immediately start the execution port for service entry points.
+pub async fn start_execution(
+    execution: &flow_config::ExecutionConfig,
+    harness_agent: Option<plugin_config::InstalledAgentPlugin>,
+    backend: &std::sync::Arc<journal::JournalBackend>,
+) -> Result<(), journal::JournalError> {
+    prepare_execution(execution, harness_agent, backend)
+        .await?
+        .start()
+        .await
+}
 
 pub mod resident_service;
 

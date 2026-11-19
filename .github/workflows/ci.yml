@@ -84,8 +84,41 @@ jobs:
         run: cargo test -p flow-facts -p flow-domain --locked
       - name: isolated dispatcher
         run: cargo test -p flow-dispatcher --locked
+      - name: isolated permission policy
+        run: |
+          deps=$(cargo tree -p flow-policy --edges normal --prefix none --locked --target ${{ matrix.arch.target }})
+          if grep -E '^flow-' <<< "$deps" | grep -Ev '^flow-(policy|dto) v'; then
+            exit 1
+          fi
+          cargo test -p flow-policy --locked --target ${{ matrix.arch.target }}
       - name: domain without runtime
         run: cargo test -p flow-engine --no-default-features --lib --test core_boundary --locked
+      - name: isolated workflow with script worker
+        run: |
+          deps=$(cargo tree -p flow-workflow -p flow-internal-plugins --edges normal --prefix none --locked --target ${{ matrix.arch.target }})
+          if grep -E '^(flow-journal|flow-backend|flow-policy|flow-plugin-(catalog|runtime|sdk)|flow-agent|flow-rpc|libsqlite3-sys) v' <<< "$deps"; then
+            exit 1
+          fi
+          cargo build -p flow-workflow -p flow-internal-plugins --bins --locked --target ${{ matrix.arch.target }}
+          cargo test -p flow-e2e --test workflow_memory --locked --target ${{ matrix.arch.target }}
+      - name: isolated managed executor
+        run: |
+          deps=$(cargo tree -p flow-plugin-runtime --edges normal --prefix none --locked --target ${{ matrix.arch.target }})
+          if grep -E '^(flow-journal|flow-backend|flow-policy|libsqlite3-sys|aes-gcm) v' <<< "$deps"; then
+            exit 1
+          fi
+          cargo test -p flow-plugin-runtime --all-targets --locked --target ${{ matrix.arch.target }}
+      - name: managed executor without plugins
+        run: |
+          deps=$(cargo tree -p flow-plugin-runtime --no-default-features --edges normal --prefix none --locked --target ${{ matrix.arch.target }})
+          if grep -E '^(flow-plugin-(catalog|sdk)|flow-harness-protocol|flow-config|flow-journal|flow-backend|flow-policy|libsqlite3-sys|aes-gcm) v' <<< "$deps"; then
+            exit 1
+          fi
+          cargo test -p flow-plugin-runtime --no-default-features --all-targets --locked --target ${{ matrix.arch.target }}
+          cargo build -p flow-plugin-runtime --no-default-features --bin flow-executor --locked --target ${{ matrix.arch.target }}
+          cargo build -p flow-backend -p flow-agent --bins --locked --target ${{ matrix.arch.target }}
+          cargo test -p flow-e2e --test journal_ipc_packaging --test journal_execution --locked --target ${{ matrix.arch.target }}
+          cargo test -p flow-remote-e2e --test journal_remote_tls --locked --target ${{ matrix.arch.target }} tls_agent_end_to_end_business -- --exact
       - name: build workspace bins
         run: cargo build --workspace --bins --locked --target ${{ matrix.arch.target }}
       # 插件（plugins/）已是根 workspace 成员：--bins 一并产出，

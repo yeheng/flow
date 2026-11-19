@@ -47,7 +47,7 @@ fn offset_overflow_and_overlapping_chunks_are_rejected() {
 #[test]
 fn aggregate_input_budget_is_enforced_before_assembly() {
     let mut transfers = IncomingTransfers::default();
-    let bytes = vec![b'a'; flow_journal::CHUNK_BYTES];
+    let bytes = vec![b'a'; flow_facts::CHUNK_BYTES];
     for index in 0..32 {
         transfers
             .feed(&chunk("in:run-input", index * bytes.len() as u64, &bytes))

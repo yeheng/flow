@@ -5,7 +5,8 @@ edition.workspace = true
 
 [features]
 default = ["runtime"]
-runtime = ["dep:flow-journal", "flow-journal/storage", "dep:reqwest", "dep:aes-gcm"]
+node-execution = []
+runtime = ["node-execution", "dep:flow-journal", "flow-journal/storage", "dep:reqwest", "dep:aes-gcm"]
 
 [dependencies]
 flow-dispatcher = { path = "../flow-dispatcher" }

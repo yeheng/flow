@@ -4,6 +4,8 @@ pub mod schema;
 pub use model::{Definition, Edge, Node, NodeType, Position, RetryPolicy, HTTP_METHODS};
 
 pub mod journal_state;
+pub mod progression;
+pub mod script;
 pub mod template;
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -11,6 +13,19 @@ pub struct EnvironmentBinding {
     pub id: String,
     pub revision: u64,
     pub config: serde_json::Value,
+}
+
+/// 输入准备事实的冻结内容：节点将要消费的输入、前驱输出与参数。
+///
+/// `node_semantics` 记录执行语义版本，用于判断旧准备事实能否被当前引擎
+/// 解释；`engine_build` 记录写入该准备事实的引擎构建号。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Prepared {
+    pub input: flow_facts::StoredValue,
+    pub predecessors: std::collections::BTreeMap<String, flow_facts::StoredValue>,
+    pub params: flow_facts::StoredValue,
+    pub engine_build: String,
+    pub node_semantics: u32,
 }
 
 /// 子工作流嵌套的硬上限。子流程调用是「run 套 run」的递归结构，
