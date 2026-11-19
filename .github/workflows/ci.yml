@@ -116,11 +116,16 @@ jobs:
           fi
           cargo test -p flow-plugin-runtime --no-default-features --all-targets --locked --target ${{ matrix.arch.target }}
           cargo build -p flow-plugin-runtime --no-default-features --bin flow-executor --locked --target ${{ matrix.arch.target }}
+          cp "target/${{ matrix.arch.target }}/debug/flow-executor" "$RUNNER_TEMP/flow-executor-builtins"
           cargo build -p flow-backend -p flow-agent --bins --locked --target ${{ matrix.arch.target }}
           cargo test -p flow-e2e --test journal_ipc_packaging --test journal_execution --locked --target ${{ matrix.arch.target }}
           cargo test -p flow-remote-e2e --test journal_remote_tls --locked --target ${{ matrix.arch.target }} tls_agent_end_to_end_business -- --exact
       - name: build workspace bins
         run: cargo build --workspace --bins --locked --target ${{ matrix.arch.target }}
+      - name: mixed remote Worker builds
+        run: |
+          FLOW_TEST_BUILTIN_EXECUTOR_BIN="$RUNNER_TEMP/flow-executor-builtins" \
+            cargo test -p flow-remote-e2e --locked --target ${{ matrix.arch.target }} --test journal_remote_wss mixed_worker_builds_route_plugins_without_consuming_builtin_capacity -- --ignored --exact
       # 插件（plugins/）已是根 workspace 成员：--bins 一并产出，
       # 与 flow-executor 同目录，兄弟定位直接生效。
       - name: test

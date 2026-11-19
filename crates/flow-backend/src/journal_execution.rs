@@ -98,7 +98,15 @@ impl Attempt {
         run_id: String,
         node_id: String,
     ) -> Result<Self> {
-        let dispatch_id = id();
+        Self::begin_with_id(backend, run_id, node_id, id()).await
+    }
+
+    pub async fn begin_with_id(
+        backend: Arc<JournalBackend>,
+        run_id: String,
+        node_id: String,
+        dispatch_id: String,
+    ) -> Result<Self> {
         backend
             .internal_for_run(&run_id, |state| {
                 let run = state

@@ -69,7 +69,18 @@ impl Drop for AgentProcess {
 }
 
 fn spawn_agent_wss(port: u16, agent_id: &str, slots: u32, token: &str) -> AgentProcess {
-    let mut child = std::process::Command::new(flow_test_support::io::agent_bin())
+    spawn_agent_wss_with_executor(port, agent_id, slots, token, None)
+}
+
+fn spawn_agent_wss_with_executor(
+    port: u16,
+    agent_id: &str,
+    slots: u32,
+    token: &str,
+    executor: Option<&std::path::Path>,
+) -> AgentProcess {
+    let mut command = std::process::Command::new(flow_test_support::io::agent_bin());
+    command
         .args([
             "--wss-url",
             &format!("ws://127.0.0.1:{port}/ws/agent"),
@@ -80,9 +91,11 @@ fn spawn_agent_wss(port: u16, agent_id: &str, slots: u32, token: &str) -> AgentP
             "--slots",
             &slots.to_string(),
         ])
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn flow-agent (wss)");
+        .stderr(std::process::Stdio::piped());
+    if let Some(executor) = executor {
+        command.arg("--executor-bin").arg(executor);
+    }
+    let mut child = command.spawn().expect("spawn flow-agent (wss)");
     AgentProcess {
         stderr: child.stderr.take(),
         child,
@@ -329,3 +342,218 @@ impl AsInline for flow_journal::StoredValue {
 /// 用不到的重导出占位，避免未使用告警。
 #[allow(dead_code)]
 fn _unused(_: &FrameTransport) {}
+
+#[tokio::test]
+#[ignore = "requires a separate no-default-features Worker in FLOW_TEST_BUILTIN_EXECUTOR_BIN"]
+async fn mixed_worker_builds_route_plugins_without_consuming_builtin_capacity() {
+    use flow_backend::execution::remote::{AgentCredential, AgentManager};
+    use flow_test_support::fixtures::StubHttp;
+
+    let builtin = std::path::PathBuf::from(
+        std::env::var_os("FLOW_TEST_BUILTIN_EXECUTOR_BIN").expect("builtin Worker path"),
+    );
+    let plugin = flow_test_support::io::executor_bin();
+    assert_ne!(
+        builtin.canonicalize().unwrap(),
+        plugin.canonicalize().unwrap()
+    );
+    let root = tempfile::tempdir().unwrap();
+    let backend = JournalBackend::open(root.path(), JournalOptions::default())
+        .await
+        .unwrap();
+    let manager = AgentManager::new(backend.clone(), backend.journal.id().into(), 1);
+    backend
+        .start_execution_remote_manager(manager.clone(), plain_remote_options())
+        .await
+        .unwrap();
+    let port = free_ports(1)[0];
+    manager
+        .listen_wss(
+            format!("127.0.0.1:{port}"),
+            vec![
+                AgentCredential {
+                    id: "a-builtin".into(),
+                    token: "builtin-fixture".into(),
+                },
+                AgentCredential {
+                    id: "b-plugins".into(),
+                    token: "plugins-fixture".into(),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    let installed_builtin = root.path().join("builtin-executor");
+    std::fs::copy(&builtin, &installed_builtin).unwrap();
+    let _builtin = spawn_agent_wss_with_executor(
+        port,
+        "a-builtin",
+        2,
+        "builtin-fixture",
+        Some(&installed_builtin),
+    );
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let model = StubHttp::fixed(200, json!({"choices":[{"message":{"content":"fixture"}}]})).await;
+    let model_definition = |url| {
+        json!({
+            "permissions":{"version":1,"mode":"bypass","allow":[]},
+            "nodes":[{"id":"s","type":"start"},
+                {"id":"model","type":"llm","params":{"url":url,"body":{"model":"fixture","messages":[{"role":"user","content":"hello"}]}}},
+                {"id":"e","type":"end"}],
+            "edges":[{"from":"s","to":"model"},{"from":"model","to":"e"}]
+        })
+    };
+    let workflow = install(&backend, model_definition(model.url("/model"))).await;
+    let run_model = || async {
+        backend
+            .run_start(&workflow, None, Value::Null, "manual", None, None)
+            .await
+            .unwrap()
+    };
+    let missing = run_model().await;
+    let done = until(
+        &backend,
+        missing.result["run_id"].as_str().unwrap(),
+        Run::terminal,
+    )
+    .await;
+    assert_eq!(done.status, RunStatus::Failed);
+    let node = &done.nodes["model"];
+    assert!(
+        node.error
+            .as_deref()
+            .is_some_and(|error| error.contains("no plugin-capable agent")),
+        "{:?}",
+        node.error
+    );
+    assert!(
+        node.prepared.is_none(),
+        "the unsupported dispatch must not start a Worker"
+    );
+    assert!(model.requests().is_empty());
+
+    let _plugins =
+        spawn_agent_wss_with_executor(port, "b-plugins", 1, "plugins-fixture", Some(&plugin));
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let held_url = format!("http://{}/model", listener.local_addr().unwrap());
+    let (arrived, arrival) = tokio::sync::oneshot::channel();
+    let (release, open) = tokio::sync::oneshot::channel();
+    let held_http = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        assert!(socket.read(&mut request).await.unwrap() > 0);
+        arrived.send(()).unwrap();
+        open.await.unwrap();
+        let body = r#"{"choices":[{"message":{"content":"held fixture"}}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len(),
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+    });
+    let held_flow = install(&backend, model_definition(held_url)).await;
+    let held = backend
+        .run_start(&held_flow, None, Value::Null, "manual", None, None)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), arrival)
+        .await
+        .expect("plugin Worker must reach the model")
+        .unwrap();
+
+    let queued = run_model().await;
+    let queued_id = queued.result["run_id"].as_str().unwrap();
+    until(&backend, queued_id, |run| {
+        run.nodes.get("s").is_some_and(|node| node.output.is_some())
+    })
+    .await;
+    let basic_flow = install(
+        &backend,
+        json!({
+            "nodes":[{"id":"s","type":"start"},
+                {"id":"compute","type":"script","params":{"code":"return 42;"}},
+                {"id":"e","type":"end"}],
+            "edges":[{"from":"s","to":"compute"},{"from":"compute","to":"e"}]
+        }),
+    )
+    .await;
+    let basic = backend
+        .run_start(&basic_flow, None, Value::Null, "manual", None, None)
+        .await
+        .unwrap();
+    let basic = tokio::time::timeout(
+        Duration::from_secs(8),
+        until(
+            &backend,
+            basic.result["run_id"].as_str().unwrap(),
+            Run::terminal,
+        ),
+    )
+    .await
+    .expect("a busy plugin slot must leave the builtin Worker available");
+    assert_eq!(basic.status, RunStatus::Succeeded, "{:?}", basic.error);
+    assert_eq!(
+        basic.nodes["compute"].output.as_ref().unwrap().as_inline(),
+        &json!(42)
+    );
+    let waiting = backend.run_snapshot(queued_id).await.unwrap().unwrap();
+    assert!(
+        !waiting.nodes.contains_key("model"),
+        "a queued plugin task must have no dispatch"
+    );
+    assert!(model.requests().is_empty());
+
+    release.send(()).unwrap();
+    held_http.await.unwrap();
+    let held = until(
+        &backend,
+        held.result["run_id"].as_str().unwrap(),
+        Run::terminal,
+    )
+    .await;
+    assert_eq!(
+        held.status,
+        RunStatus::Succeeded,
+        "{:?}",
+        held.nodes.get("model")
+    );
+    let done = until(&backend, queued_id, Run::terminal).await;
+    assert_eq!(
+        done.status,
+        RunStatus::Succeeded,
+        "{:?}",
+        done.nodes.get("model")
+    );
+    assert_eq!(model.requests().len(), 1);
+    // The active Agent must corroborate its advertised profile on the new child.
+    #[cfg(unix)]
+    {
+        let replacement = root.path().join("replacement-executor");
+        std::fs::copy(&plugin, &replacement).unwrap();
+        std::fs::rename(&replacement, &installed_builtin).unwrap();
+        let changed = backend
+            .run_start(&basic_flow, None, Value::Null, "manual", None, None)
+            .await
+            .unwrap();
+        let changed = until(
+            &backend,
+            changed.result["run_id"].as_str().unwrap(),
+            Run::terminal,
+        )
+        .await;
+        assert_eq!(changed.status, RunStatus::Failed);
+        assert!(
+            changed.nodes["s"]
+                .error
+                .as_deref()
+                .is_some_and(|err| err.contains("worker profile changed")),
+            "{:?}",
+            changed.nodes.get("s")
+        );
+        assert!(changed.nodes["s"].prepared.is_none());
+    }
+    manager.shutdown().await;
+    backend.close().await.unwrap();
+}

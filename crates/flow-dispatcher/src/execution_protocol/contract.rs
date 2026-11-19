@@ -43,6 +43,43 @@ pub const PREPARED_JOB_CAPABILITY: &str = "prepared-job-v1";
 /// Separate opt-in for executors that also accept prepared Condition nodes.
 pub const PREPARED_CONDITION_JOB_CAPABILITY: &str = "prepared-condition-job-v1";
 
+/// An additive v8 capability confirmed by a Worker handshake. Agents relay
+/// this profile in their own Hello, independently of transport capabilities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerProfile {
+    Legacy,
+    Builtins,
+    Plugins,
+}
+
+impl WorkerProfile {
+    const BUILTINS: &'static str = "worker:builtins-v1";
+    const PLUGINS: &'static str = "worker:plugins-v1";
+
+    pub fn from_capabilities(capabilities: &[String]) -> Result<Self, &'static str> {
+        let builtins = capabilities
+            .iter()
+            .any(|capability| capability == Self::BUILTINS);
+        let plugins = capabilities
+            .iter()
+            .any(|capability| capability == Self::PLUGINS);
+        match (builtins, plugins) {
+            (true, true) => Err("conflicting worker profiles"),
+            (true, false) => Ok(Self::Builtins),
+            (false, true) => Ok(Self::Plugins),
+            (false, false) => Ok(Self::Legacy),
+        }
+    }
+
+    pub fn capability(self) -> Option<&'static str> {
+        match self {
+            Self::Legacy => None,
+            Self::Builtins => Some(Self::BUILTINS),
+            Self::Plugins => Some(Self::PLUGINS),
+        }
+    }
+}
+
 /// control 通道单帧上限（不含 4 字节长度头）。握手
 /// 只可协商到本上限以内。
 ///

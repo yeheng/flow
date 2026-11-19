@@ -5,7 +5,7 @@
 
 use flow_agent::runtime::{serve_for_tests, AgentConfig};
 use flow_backend::journal::JournalBackend;
-use flow_engine::execution_protocol::transport::FrameTransport;
+use flow_engine::execution_protocol::{transport::FrameTransport, Message};
 use flow_engine::journal_state::Run;
 use flow_engine::journal_state::RunStatus;
 use flow_journal::{JournalOptions, StoredValue};
@@ -86,12 +86,18 @@ async fn start_agent(
     tokio::task::JoinHandle<()>,
 ) {
     let (stream, proxies) = proxy_pair(manager, "agent-r2").await;
+    (proxies, start_agent_on(stream, handles))
+}
+
+fn start_agent_on(
+    stream: tokio::io::DuplexStream,
+    handles: Handles,
+) -> tokio::task::JoinHandle<()> {
     let config = agent_config();
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let session = tokio::spawn(async move {
+    tokio::spawn(async move {
         // 首连握手（与 R0 相同序列；v4 单流无 DataBind）。
         let mut transport = FrameTransport::spawn(stream, 128);
-        use flow_engine::execution_protocol::Message;
         let boot = flow_engine::execution_protocol::transport::fresh_boot_id();
         transport
             .send(Message::AgentHello {
@@ -134,8 +140,7 @@ async fn start_agent(
             shutdown,
         )
         .await;
-    });
-    (proxies, session)
+    })
 }
 
 async fn disconnect(
@@ -175,6 +180,12 @@ async fn until(b: &Arc<JournalBackend>, run_id: &str, predicate: impl Fn(&Run) -
 }
 
 fn init_tracing() {
+    static TEST_ENVIRONMENT: std::sync::Once = std::sync::Once::new();
+    TEST_ENVIRONMENT.call_once(|| {
+        std::env::set_var("FLOW_TEST_AUTO_GOVERN", "0");
+        std::env::set_var("FLOW_PLUGINS_DIR", temp().join("plugins"));
+        std::env::set_var("FLOW_SECRET_REMOTE_TOOL", "fixture-key");
+    });
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "off".into()),
@@ -294,7 +305,7 @@ async fn cancel_during_disconnect_drains_after_resume() {
     });
     let workflow = install(
         &backend,
-        json!({"nodes":[
+        json!({"permissions":{"version":1,"mode":"bypass","allow":[]},"nodes":[
             {"id":"s","type":"start"},
             {"id":"h","type":"http_call","params":{"url": format!("http://{hang_addr}/hang"), "timeout_ms": 30000}},
             {"id":"e","type":"end"}],
@@ -359,4 +370,315 @@ async fn cancel_during_disconnect_drains_after_resume() {
     manager.shutdown().await;
     backend.close().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+/// Apply a fault to the first tool reply after the master has queued it.
+async fn tool_reply_proxy(
+    manager: &Arc<flow_backend::execution::remote::AgentManager>,
+    copies: usize,
+) -> (
+    tokio::io::DuplexStream,
+    tokio::task::JoinHandle<()>,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Receiver<Message>,
+) {
+    let (agent_stream, agent_proxy) = tokio::io::duplex(256 * 1024);
+    let (master_stream, master_proxy) = tokio::io::duplex(256 * 1024);
+    manager
+        .attach_inprocess("agent-r2".into(), master_stream)
+        .await;
+    let (dropped, receipt) = tokio::sync::oneshot::channel();
+    let (ready, registration) = tokio::sync::oneshot::channel();
+    let proxy = tokio::spawn(async move {
+        let mut agent = FrameTransport::spawn(agent_proxy, 128);
+        let mut master = FrameTransport::spawn(master_proxy, 128);
+        let mut ready = Some(ready);
+        let mut observed = Some(dropped);
+        loop {
+            tokio::select! {
+                frame = agent.recv() => {
+                    let Ok(frame) = frame else { return };
+                    if matches!(frame, Message::CapacityReport { .. }) {
+                        if let Some(ready) = ready.take() {
+                            let _ = ready.send(());
+                        }
+                    }
+                    if master.send(frame).await.is_err() { return; }
+                }
+                frame = master.recv() => {
+                    let Ok(frame) = frame else { return };
+                    if let Message::Routed { inner, .. } = &frame {
+                        if matches!(**inner, Message::ToolPermissionDecision { .. }) {
+                            if let Some(observed) = observed.take() {
+                                let _ = observed.send((**inner).clone());
+                                for _ in 0..copies {
+                                    if agent.send(frame.clone()).await.is_err() { return; }
+                                }
+                                if copies == 0 { return; }
+                                continue;
+                            }
+                        }
+                    }
+                    if agent.send(frame).await.is_err() { return; }
+                }
+            }
+        }
+    });
+    (agent_stream, proxy, registration, receipt)
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum ToolDisconnect {
+    LoseAutoApproval,
+    LoseManualApproval,
+    LoseDenial,
+    AwaitManualApproval,
+    CancelAfterApproval,
+}
+
+#[cfg(unix)]
+async fn tool_disconnect(scenario: ToolDisconnect) {
+    use flow_backend::journal_permissions::ApprovalCommand;
+    use flow_dto::permission::{ApprovalScope, Principal};
+    use flow_engine::journal_state::ApprovalStatus;
+    use flow_test_support::provider::{spawn_mock_openai, Turn};
+
+    init_tracing();
+    let _plugin = flow_test_support::io::agent_plugin_bin();
+    let root = tempfile::tempdir().unwrap();
+    let workdir = root.path().join("workspace");
+    std::fs::create_dir(&workdir).unwrap();
+    let counter = workdir.join("tool-count");
+    let command = "printf x >> tool-count";
+    let provider = spawn_mock_openai(vec![
+        Turn::Tool {
+            command: command.into(),
+        },
+        Turn::Final {
+            text: "tool turn complete".into(),
+        },
+    ])
+    .await;
+    let backend = JournalBackend::open(&root.path().join("data"), JournalOptions::default())
+        .await
+        .unwrap();
+    backend
+        .install_harness_agent(Some(flow_dto::AgentRunConfig {
+            base_url: provider.base_url(),
+            model: "fixture-model".into(),
+            ..Default::default()
+        }))
+        .unwrap();
+    backend.ensure_bundled_grants().await;
+    let manager = flow_backend::execution::remote::AgentManager::new(
+        backend.clone(),
+        backend.journal.id().into(),
+        1,
+    );
+    backend
+        .start_execution_remote_manager(manager.clone(), remote_options())
+        .await
+        .unwrap();
+
+    let handles: Handles = Arc::new(tokio::sync::Mutex::new(Default::default()));
+    let (stream, proxy, ready, dropped) = tool_reply_proxy(&manager, 0).await;
+    let session = start_agent_on(stream, handles.clone());
+    tokio::time::timeout(Duration::from_secs(3), ready)
+        .await
+        .expect("agent reports capacity after handshake")
+        .unwrap();
+
+    let manual = matches!(
+        scenario,
+        ToolDisconnect::LoseManualApproval | ToolDisconnect::AwaitManualApproval
+    );
+    let mut allow = vec![
+        json!({"id":"model","action":"llm_call","providers":[provider.base_url()],"models":["fixture-model"],"approval":"auto"}),
+        json!({"id":"key","action":"secret","names":["REMOTE_TOOL"],"approval":"auto"}),
+    ];
+    if !matches!(scenario, ToolDisconnect::LoseDenial) {
+        allow.push(json!({
+            "id":"tool", "action":"shell",
+            "script_digest":flow_dto::permission::sha256_hex(command.as_bytes()),
+            "approval": if manual {"ask"} else {"auto"}
+        }));
+    }
+    let workflow = install(
+        &backend,
+        json!({
+            "permissions":{"version":1,"mode":"execute","allow":allow},
+            "nodes":[
+                {"id":"s","type":"start"},
+                {"id":"a","type":"harness","params":{
+                    "mode":"agent","prompt":"Run the fixture tool","api_key":"REMOTE_TOOL",
+                    "workdir":workdir,"timeout_ms":60_000
+                }},
+                {"id":"e","type":"end"}
+            ],
+            "edges":[{"from":"s","to":"a"},{"from":"a","to":"e"}]
+        }),
+    )
+    .await;
+    let created = backend
+        .run_start(&workflow, None, json!({}), "manual", None, None)
+        .await
+        .unwrap();
+    let run_id = created.result["run_id"].as_str().unwrap();
+
+    let approval = if manual {
+        let run = until(&backend, run_id, |run| {
+            run.terminal()
+                || run
+                    .nodes
+                    .get("a")
+                    .and_then(|node| node.approval.as_ref())
+                    .is_some_and(|approval| {
+                        approval.gate == "tool" && approval.status == ApprovalStatus::Pending
+                    })
+        })
+        .await;
+        assert!(
+            !run.terminal(),
+            "{:?}",
+            run.nodes.get("a").and_then(|node| node.error.as_ref())
+        );
+        run.nodes["a"].approval.clone()
+    } else {
+        None
+    };
+    let approve = || async {
+        let approval = approval.as_ref().unwrap();
+        backend
+            .run_decide(
+                ApprovalCommand {
+                    run_id,
+                    node_id: "a",
+                    operation_id: &approval.request.operation_id,
+                    request_hash: &approval.request.request_hash,
+                    allow: true,
+                    scope: ApprovalScope::Once,
+                    reason: None,
+                    by: Principal::LocalAdmin,
+                },
+                "fixture-approve",
+            )
+            .await
+            .unwrap();
+    };
+
+    if matches!(scenario, ToolDisconnect::AwaitManualApproval) {
+        disconnect(vec![proxy], session).await;
+        approve().await;
+    } else {
+        if manual {
+            approve().await;
+        }
+        let reply = tokio::time::timeout(Duration::from_secs(12), dropped)
+            .await
+            .expect("tool decision must reach the proxy")
+            .unwrap();
+        assert!(
+            matches!(reply, Message::ToolPermissionDecision { allowed, .. }
+            if allowed != matches!(scenario, ToolDisconnect::LoseDenial))
+        );
+        proxy.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), session)
+            .await
+            .expect("old link closes")
+            .unwrap();
+    }
+    assert_eq!(
+        provider.hits(),
+        1,
+        "tool response stayed on the disconnected link"
+    );
+    assert!(!counter.exists(), "tool ran before reconnect");
+    if matches!(scenario, ToolDisconnect::CancelAfterApproval) {
+        backend.run_cancel(run_id, None).await.unwrap();
+    }
+
+    let (stream, _proxies) = if matches!(scenario, ToolDisconnect::LoseAutoApproval) {
+        let (stream, proxy, _, _) = tool_reply_proxy(&manager, 24).await;
+        (stream, vec![proxy])
+    } else {
+        proxy_pair(&manager, "agent-r2").await
+    };
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let reconnect_handles = handles.clone();
+    let reconnect_shutdown = shutdown.clone();
+    let reconnected = tokio::spawn(async move {
+        let boot = flow_engine::execution_protocol::transport::fresh_boot_id();
+        flow_agent::runtime::reconnect_session(
+            &agent_config(),
+            FrameTransport::spawn(stream, 128),
+            &boot,
+            4,
+            reconnect_handles,
+            reconnect_shutdown,
+        )
+        .await
+    });
+    let done = tokio::time::timeout(
+        Duration::from_secs(6),
+        until(&backend, run_id, |run| {
+            run.terminal()
+                && run
+                    .nodes
+                    .get("a")
+                    .is_some_and(|node| node.attempts[&node.dispatch_id].sealed)
+        }),
+    )
+    .await;
+    shutdown.cancel();
+    manager.shutdown().await;
+    let _ = reconnected.await.unwrap();
+    backend.close().await.unwrap();
+
+    let done = done.expect("tool reply must be recovered on the new link");
+    assert_eq!(done.nodes["a"].attempt, 1);
+    if matches!(scenario, ToolDisconnect::CancelAfterApproval) {
+        assert_eq!(done.status, RunStatus::Cancelled);
+        assert_eq!(provider.hits(), 1);
+        assert!(!counter.exists());
+    } else {
+        assert_eq!(done.status, RunStatus::Succeeded, "{:?}", done.error);
+        assert_eq!(provider.hits(), 2);
+        if matches!(scenario, ToolDisconnect::LoseDenial) {
+            assert!(!counter.exists());
+        } else {
+            assert_eq!(std::fs::read(&counter).unwrap(), b"x");
+        }
+    }
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn reconnect_replays_lost_auto_tool_approval() {
+    tool_disconnect(ToolDisconnect::LoseAutoApproval).await;
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn reconnect_replays_lost_manual_tool_approval() {
+    tool_disconnect(ToolDisconnect::LoseManualApproval).await;
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn reconnect_replays_lost_tool_denial() {
+    tool_disconnect(ToolDisconnect::LoseDenial).await;
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn reconnect_delivers_tool_approval_committed_while_disconnected() {
+    tool_disconnect(ToolDisconnect::AwaitManualApproval).await;
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn reconnect_cancellation_precedes_lost_tool_approval() {
+    tool_disconnect(ToolDisconnect::CancelAfterApproval).await;
 }

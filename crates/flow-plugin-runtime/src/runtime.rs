@@ -76,7 +76,7 @@ struct CurrentTask {
     mail: mpsc::Sender<Message>,
     /// 工具裁决专用通道（G5）：与 mail 分离，反向处理器在回合内独占消费。
     #[cfg(feature = "plugins")]
-    tool: mpsc::Sender<Message>,
+    tool_replies: std::sync::Arc<crate::task::ToolReplySlot>,
     /// 审计确认的转发通道。
     ack_tx: watch::Sender<(u64, u64)>,
     /// 取消令牌：会话取消/失联时唤醒任务。
@@ -123,6 +123,12 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
         }
     };
     let mut capabilities = EXECUTOR_CAPABILITIES.to_vec();
+    let profile = if cfg!(feature = "plugins") {
+        flow_engine::execution_protocol::contract::WorkerProfile::Plugins
+    } else {
+        flow_engine::execution_protocol::contract::WorkerProfile::Builtins
+    };
+    capabilities.extend(profile.capability());
     if !config.remote_replay {
         capabilities.extend([
             flow_engine::execution_protocol::PREPARED_JOB_CAPABILITY,
@@ -391,7 +397,7 @@ fn handle_message(
             let _ = identity;
             let (mail_tx, mail_rx) = mpsc::channel(64);
             #[cfg(feature = "plugins")]
-            let (tool_tx, tool_rx) = mpsc::channel(16);
+            let tool_replies = std::sync::Arc::new(crate::task::ToolReplySlot::default());
             let (ack_tx, _) = watch::channel((0u64, 0u64));
             let runner_ack = ack_tx.clone();
             let cancel = CancellationToken::new();
@@ -407,7 +413,7 @@ fn handle_message(
                 outbound: outbound.clone(),
                 mail: mail_rx,
                 #[cfg(feature = "plugins")]
-                tool_mail: std::sync::Arc::new(tokio::sync::Mutex::new(tool_rx)),
+                tool_replies: tool_replies.clone(),
                 ack_tx: runner_ack,
                 cancel: cancel.clone(),
                 journal_id: identity.journal_id.clone(),
@@ -426,7 +432,7 @@ fn handle_message(
                 dispatch_id,
                 mail: mail_tx,
                 #[cfg(feature = "plugins")]
-                tool: tool_tx,
+                tool_replies,
                 ack_tx,
                 cancel,
                 done: done_rx,
@@ -474,13 +480,14 @@ fn handle_message(
             None
         }
         Message::ToolPermissionDecision { .. } => {
-            // G5 工具裁决走专用通道：反向处理器在回合内独占消费。
+            // A replay may arrive after the tool consumed its response. Only an
+            // active matching waiter receives it, so old replies exert no backpressure.
             #[cfg(feature = "plugins")]
             {
                 let dispatch_id = message.dispatch_id().unwrap_or_default();
                 if let Some(task) = current {
                     if task.dispatch_id == dispatch_id {
-                        pending.push_back((task.tool.clone(), message));
+                        task.tool_replies.deliver(message);
                     }
                 }
             }

@@ -10,10 +10,10 @@ use tokio_util::sync::CancellationToken;
 
 use flow_engine::execution_protocol::bootstrap::spawn_executor_transport;
 use flow_engine::execution_protocol::contract::{
-    DRAIN_GRACE_MS, HEARTBEAT_TIMEOUT_MS, STARTUP_TIMEOUT_MS,
+    ExecutorInvocation, WorkerProfile, DRAIN_GRACE_MS, HEARTBEAT_TIMEOUT_MS, STARTUP_TIMEOUT_MS,
 };
 use flow_engine::execution_protocol::message::Message;
-use flow_engine::execution_protocol::transport::{master_handshake, FrameTransport};
+use flow_engine::execution_protocol::transport::{master_handshake, ExecutorHello, FrameTransport};
 
 use crate::relay::{Relay, PER_EXECUTOR_QUEUE};
 
@@ -72,25 +72,45 @@ async fn kill_and_reap(mut child: flow_engine::process::ManagedChild) {
     let _ = child.wait().await;
 }
 
-/// 绑定一个派发到新执行器进程并完成本地握手（确认后才转发 Execute）。
-pub async fn bind_executor(
-    executor: &flow_engine::execution_protocol::contract::ExecutorInvocation,
+/// Probe with the normal local IPC handshake and reap the process without sending work.
+pub(crate) async fn probe_worker_profile(
+    executor: &ExecutorInvocation,
+) -> Result<WorkerProfile, PoolError> {
+    let (transport, child, hello) = start_worker(
+        executor,
+        "profile-probe",
+        0,
+        "profile-probe",
+        "profile-probe",
+        "agent:profile-probe",
+    )
+    .await?;
+    drop(transport);
+    kill_and_reap(child).await;
+    WorkerProfile::from_capabilities(&hello.capabilities)
+        .map_err(|error| PoolError::Bind(error.into()))
+}
+
+async fn start_worker(
+    executor: &ExecutorInvocation,
     journal_id: &str,
     master_epoch: u64,
-    relay: &Arc<parking_lot::Mutex<Relay>>,
     executor_id: &str,
-    dispatch_id: &str,
-) -> Result<ExecutorHandle, PoolError> {
+    session_id: &str,
+    tag: &str,
+) -> Result<
+    (
+        FrameTransport,
+        flow_engine::process::ManagedChild,
+        ExecutorHello,
+    ),
+    PoolError,
+> {
     // 模式标记（中继模式）由调用点显式追加，不做「预置参数列表」传递。
-    let invocation = executor.clone();
-    let (mut transport, child, session_token) = spawn_executor_transport(
-        &invocation,
-        Some(&format!("agent:{executor_id}")),
-        &["--remote-relay"],
-        64,
-    )
-    .await
-    .map_err(|e| PoolError::Bind(format!("spawn executor: {e}")))?;
+    let (mut transport, child, session_token) =
+        spawn_executor_transport(executor, Some(tag), &["--remote-relay"], 64)
+            .await
+            .map_err(|e| PoolError::Bind(format!("spawn executor: {e}")))?;
     let hello = match tokio::time::timeout(
         Duration::from_millis(STARTUP_TIMEOUT_MS * 2),
         master_handshake(
@@ -98,7 +118,7 @@ pub async fn bind_executor(
             journal_id,
             master_epoch,
             executor_id,
-            &format!("local-{dispatch_id}"),
+            session_id,
             session_token.as_deref(),
         ),
     )
@@ -114,6 +134,58 @@ pub async fn bind_executor(
             return Err(PoolError::Bind("local handshake timeout".into()));
         }
     };
+    Ok((transport, child, hello))
+}
+
+/// 绑定一个派发到新执行器进程并完成本地握手（确认后才转发 Execute）。
+pub async fn bind_executor(
+    executor: &ExecutorInvocation,
+    journal_id: &str,
+    master_epoch: u64,
+    relay: &Arc<parking_lot::Mutex<Relay>>,
+    executor_id: &str,
+    dispatch_id: &str,
+) -> Result<ExecutorHandle, PoolError> {
+    bind_profiled_executor(
+        executor,
+        journal_id,
+        master_epoch,
+        relay,
+        executor_id,
+        dispatch_id,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn bind_profiled_executor(
+    executor: &ExecutorInvocation,
+    journal_id: &str,
+    master_epoch: u64,
+    relay: &Arc<parking_lot::Mutex<Relay>>,
+    executor_id: &str,
+    dispatch_id: &str,
+    expected_profile: Option<WorkerProfile>,
+) -> Result<ExecutorHandle, PoolError> {
+    let (transport, child, hello) = start_worker(
+        executor,
+        journal_id,
+        master_epoch,
+        executor_id,
+        &format!("local-{dispatch_id}"),
+        &format!("agent:{executor_id}"),
+    )
+    .await?;
+    if let Some(expected) = expected_profile {
+        let actual = WorkerProfile::from_capabilities(&hello.capabilities);
+        if actual != Ok(expected) {
+            drop(transport);
+            kill_and_reap(child).await;
+            return Err(PoolError::Bind(format!(
+                "worker profile changed: advertised {expected:?}, started {actual:?}"
+            )));
+        }
+    }
     let executor_boot_id = hello.boot_id;
     // 登记归属（R0：确认后才允许 Execute 转发）。
     relay

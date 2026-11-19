@@ -45,6 +45,8 @@ use crate::transfer::{store_bytes, store_value, IncomingTransfers};
 
 #[cfg(feature = "plugins")]
 mod plugins;
+#[cfg(feature = "plugins")]
+pub(crate) use plugins::ToolReplySlot;
 
 /// 输入面预算（与一期 materialize 8 MiB 一致）。
 ///
@@ -143,10 +145,9 @@ pub struct TaskRunner {
     pub dispatch_id: String,
     /// 派发载荷（节点定义、输入声明、准备元数据、恢复用 outcome）。
     pub task: ExecuteTask,
-    /// 工具裁决专用邮箱（G5）：agent 回合内的反向请求等待它；与 mail 分离
-    /// 避免与主等待循环争抢。
+    /// The in-flight reverse request, separate from the node-operation mailbox.
     #[cfg(feature = "plugins")]
-    pub(super) tool_mail: std::sync::Arc<tokio::sync::Mutex<mpsc::Receiver<Message>>>,
+    pub(super) tool_replies: Arc<ToolReplySlot>,
     /// 出站通道：执行器→主进程。
     pub outbound: mpsc::Sender<Message>,
     /// 入站邮箱：主进程→本派发（传输块、许可、ACK、取消）。

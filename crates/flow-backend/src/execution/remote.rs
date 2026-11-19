@@ -37,7 +37,7 @@ use tokio::sync::{mpsc, oneshot, Mutex, Notify, Semaphore};
 use tokio_rustls::TlsAcceptor;
 
 use flow_engine::execution_protocol::contract::{
-    bounded_control_text, A_MAX, PROTOCOL_VERSION, STARTUP_TIMEOUT_MS, W_BYTES,
+    bounded_control_text, WorkerProfile, A_MAX, PROTOCOL_VERSION, STARTUP_TIMEOUT_MS, W_BYTES,
 };
 use flow_engine::execution_protocol::message::Message;
 use flow_engine::execution_protocol::remote::{
@@ -275,6 +275,7 @@ struct BoundDispatch {
 struct AgentRegistration {
     /// agent 标识。
     agent_id: String,
+    worker_profile: WorkerProfile,
     /// 本次上联会话标识（重连会换新值，旧会话因此可被识别为过期）。
     link_session_id: String,
     /// 派发方 → agent 的命令通道。
@@ -299,10 +300,8 @@ pub struct AgentManager {
     backend: Arc<JournalBackend>,
     journal_id: String,
     master_epoch: u64,
-    global: Arc<Semaphore>,
     agents: Mutex<BTreeMap<String, Arc<AgentRegistration>>>,
     bindings: Mutex<BTreeMap<String, Arc<BoundDispatch>>>,
-    capacity_changed: Notify,
     pending_binds: Mutex<BTreeMap<String, PendingBind>>,
     session_counter: AtomicU64,
     agent_counter: AtomicU64,
@@ -374,28 +373,20 @@ async fn bind_wss(addr: &str) -> Result<TcpListener> {
 impl AgentManager {
     /// 新建 agent 管理器。
     ///
-    /// 全局准入信号量按 A_max 建立：它是「同时在飞的活跃派发」上界，与
-    /// 本机的 X_max（执行进程数）是两个不同的量，不可互相代用。
+    /// Reservations count towards A_MAX even while a Worker is starting or disconnected.
     pub fn new(backend: Arc<JournalBackend>, journal_id: String, master_epoch: u64) -> Arc<Self> {
         Arc::new(Self {
             backend,
             journal_id,
             master_epoch,
-            global: Arc::new(Semaphore::new(A_MAX)),
             agents: Mutex::new(BTreeMap::new()),
             bindings: Mutex::new(BTreeMap::new()),
-            capacity_changed: Notify::new(),
             pending_binds: Mutex::new(BTreeMap::new()),
             session_counter: AtomicU64::new(0),
             agent_counter: AtomicU64::new(0),
             shutdown: tokio_util::sync::CancellationToken::new(),
             tasks: tokio_util::task::TaskTracker::new(),
         })
-    }
-
-    /// 全局活跃派发准入（A_max）。
-    pub(crate) fn global_slots(&self) -> &Arc<Semaphore> {
-        &self.global
     }
 
     /// TLS 监听入口（真实网络）。单条 mTLS 连接承载整条上联（单流帧：
@@ -572,7 +563,7 @@ impl AgentManager {
         self: &Arc<Self>,
         transport: &mut FrameTransport,
         agent_id: &str,
-    ) -> std::result::Result<(String, u32, String), String> {
+    ) -> std::result::Result<(String, u32, String, WorkerProfile), String> {
         let message = tokio::time::timeout(
             Duration::from_millis(STARTUP_TIMEOUT_MS * 2),
             transport.recv(),
@@ -611,6 +602,7 @@ impl AgentManager {
         if !validate_route_identity(agent_id) || !validate_route_identity(&agent_boot_id) {
             return Err("invalid agent identity".into());
         }
+        let worker_profile = WorkerProfile::from_capabilities(&capabilities)?;
         let link_session_id = format!(
             "link-{}",
             self.session_counter.fetch_add(1, Ordering::Relaxed)
@@ -627,7 +619,7 @@ impl AgentManager {
             })
             .await
             .map_err(|e| format!("write welcome: {e}"))?;
-        Ok((agent_boot_id, slots, link_session_id))
+        Ok((agent_boot_id, slots, link_session_id, worker_profile))
     }
 
     /// 单个 agent 会话（T02）：握手与业务帧共用同一条 transport
@@ -644,7 +636,7 @@ impl AgentManager {
         // AgentWelcome。不再用临时 decoder 取首帧后丢弃——同一次 read 里
         // Hello 之后的尾随帧不会在交接时丢失。
         let mut transport = FrameTransport::spawn(stream, 128);
-        let (agent_boot_id, slots, link_session_id) = tokio::select! {
+        let (agent_boot_id, slots, link_session_id, worker_profile) = tokio::select! {
             _ = self.shutdown.cancelled() => return Ok(()),
             result = tokio::time::timeout(Duration::from_millis(STARTUP_TIMEOUT_MS), self.session_handshake(&mut transport, &agent_id)) =>
                 result.map_err(|_| "agent handshake deadline exceeded".to_string())??,
@@ -655,6 +647,7 @@ impl AgentManager {
         let (outbound, mut commands) = mpsc::channel::<ToSession>(256);
         let registration = Arc::new(AgentRegistration {
             agent_id: agent_id.clone(),
+            worker_profile,
             link_session_id: link_session_id.clone(),
             outbound: outbound.clone(),
             slots_total: AtomicU64::new(slots as u64),
@@ -676,7 +669,7 @@ impl AgentManager {
             previous.cancel.cancel();
             tracing::info!(%agent_id, "agent reconnected; old uplink replaced");
         }
-        self.capacity_changed.notify_waiters();
+        self.backend.execution_notification().notify_one();
         tracing::info!(%agent_id, slots, "agent session registered");
         let mut routings: BTreeMap<String, SessionRouting> = BTreeMap::new();
         // 上联活跃看门狗（§3.7 Suspect）：agent 周期性发心跳，任何入站帧
@@ -693,7 +686,8 @@ impl AgentManager {
         // 需要据此补发原提交确认（而不是当成错路由拒绝掉）。
         let mut completed: std::collections::VecDeque<(RouteEnvelope, Option<String>)> =
             Default::default();
-        let mut resume_items = Vec::new();
+        let mut resume_reported = std::collections::BTreeSet::new();
+        let mut resume_continuing = std::collections::BTreeSet::new();
         // 出站积压（T03）：handler 内只 push、循环顶 flush，不 await
         // `transport.send`——出站阻塞（队列满 + 对端停读）不能卡住整个
         // select，否则入站心跳/Cancel/Resume 与 liveness 看门狗全部停摆，
@@ -907,11 +901,11 @@ impl AgentManager {
                                 }
                             }
                             Message::CapacityReport { capacity } => {
-                                registration
-                                    .slots_total
-                                    .store(capacity.slots as u64, Ordering::Relaxed);
+                                let previous = registration.slots_total.swap(capacity.slots as u64, Ordering::Relaxed);
                                 // in_flight is telemetry, not an admission counter.
-                                self.capacity_changed.notify_waiters();
+                                if previous != u64::from(capacity.slots) {
+                                    self.backend.execution_notification().notify_one();
+                                }
                             }
                             Message::Resume { items, page, more } => {
                                 let decisions = self
@@ -1003,21 +997,24 @@ impl AgentManager {
                                         }
                                     }
                                 }
-                                if send_backlog.push(&transport, Message::ResumeReply { decisions: decisions.clone(), page }).is_err() {
+                                for decision in &decisions {
+                                    if matches!(decision.action, ResumeAction::UploadOnly { .. } | ResumeAction::SubmitExistingResult) {
+                                        resume_continuing.insert(decision.dispatch_id.clone());
+                                    }
+                                }
+                                resume_reported.extend(items.into_iter().map(|item| item.dispatch_id));
+                                if send_backlog.push(&transport, Message::ResumeReply { decisions, page }).is_err() {
                                     return Err(format!(
                                         "agent {agent_id} uplink send backlog overflow"
                                     ));
                                 }
-                                resume_items.extend(items.iter().cloned());
-                                // Every page establishes routes before the next page arrives.
-                                let continuing: Vec<_> = items.iter().filter(|item| decisions.iter().any(|decision|
-                                    decision.dispatch_id == item.dispatch_id && matches!(decision.action, ResumeAction::UploadOnly { .. } | ResumeAction::SubmitExistingResult))).cloned().collect();
-                                self.attach_resumed(&agent_id, &continuing, &outbound, &mut routings, &link_session_id, &agent_boot_id).await;
                                 if more { continue; }
-                                // 清单末页：未上报的该 agent 绑定判 Lost（执行器已失联）。
-                                self.mark_unreported_lost(&agent_id, &link_session_id, &resume_items).await;
-                                resume_items.clear();
-
+                                // The agent consumes only resume replies and terminal actions
+                                // before the final page. Publish live routes after its reply is queued.
+                                self.attach_resumed(&agent_id, &resume_continuing, &outbound, &mut routings, &link_session_id, &agent_boot_id).await;
+                                self.mark_unreported_lost(&agent_id, &link_session_id, &resume_reported).await;
+                                resume_continuing.clear();
+                                resume_reported.clear();
                             }
                             Message::DrainComplete { drained } => {
                                 tracing::info!(%agent_id, drained, "agent drained");
@@ -1052,7 +1049,7 @@ impl AgentManager {
             .lock()
             .await
             .retain(|_, bind| bind.link_session_id != link_session_id);
-        self.capacity_changed.notify_waiters();
+        self.backend.execution_notification().notify_one();
         result
     }
 
@@ -1118,10 +1115,8 @@ impl AgentManager {
         &self,
         agent_id: &str,
         link_session_id: &str,
-        items: &[ResumeItem],
+        reported: &std::collections::BTreeSet<String>,
     ) {
-        let reported: std::collections::BTreeSet<&str> =
-            items.iter().map(|item| item.dispatch_id.as_str()).collect();
         let bindings = self.bindings.lock().await.clone();
         let lost: Vec<_> = bindings
             .iter()
@@ -1153,14 +1148,14 @@ impl AgentManager {
     async fn attach_resumed(
         &self,
         agent_id: &str,
-        items: &[ResumeItem],
+        dispatches: &std::collections::BTreeSet<String>,
         outbound: &mpsc::Sender<ToSession>,
         routings: &mut BTreeMap<String, SessionRouting>,
         link_session_id: &str,
         agent_boot_id: &str,
     ) {
-        for item in items {
-            let binding = self.bindings.lock().await.get(&item.dispatch_id).cloned();
+        for dispatch_id in dispatches {
+            let binding = self.bindings.lock().await.get(dispatch_id).cloned();
             let Some(binding) = binding else { continue };
             let bound_boot = binding.executor_boot_id.lock().await.clone();
             let Some(executor_boot_id) = bound_boot else {
@@ -1172,11 +1167,11 @@ impl AgentManager {
                 link_session_id: link_session_id.to_string(),
                 executor_id: binding.executor_id.clone(),
                 executor_boot_id: executor_boot_id.clone(),
-                dispatch_id: Some(item.dispatch_id.clone()),
+                dispatch_id: Some(dispatch_id.clone()),
             };
             let (events, rx) = mpsc::channel(256);
             routings.insert(
-                item.dispatch_id.clone(),
+                dispatch_id.clone(),
                 SessionRouting {
                     envelope: envelope.clone(),
                     events,
@@ -1196,76 +1191,90 @@ impl AgentManager {
         }
     }
 
-    /// 绑定一个派发到某 agent 的本地执行器（BindExecutor → 确认）。
-    ///
-    /// 返回该派发的事件接收端；绑定失败（agent 拒绝、超时、会话被替换）
-    /// 时返回错误，调用方据此放弃这次派发。
-    pub(crate) async fn bind_executor(
+    /// Reserve capacity before committing DispatchStarted. A busy compatible
+    /// lane leaves the node ready in the coordinator and consumes no slot.
+    async fn reserve(
         self: &Arc<Self>,
-        dispatch_id: String,
-        run_id: String,
-        node_id: String,
-    ) -> Result<mpsc::Receiver<crate::execution::FromSession>> {
-        let registration = loop {
-            let changed = self.capacity_changed.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            let agents = self.agents.lock().await;
-            if agents.is_empty() {
-                return Err(invalid("no agent connected"));
-            }
-            let mut bindings = self.bindings.lock().await;
-            let pick = agents
-                .values()
-                .filter_map(|agent| {
-                    // 正在 drain 的 agent 不再接新派发。
-                    if agent.draining.load(Ordering::Acquire) {
-                        return None;
-                    }
-                    // 已用槽位 = 绑定数（含断线期间仍占用的绑定）：断线的
-                    // 绑定仍占槽，否则重连风暴会瞬间超配 agent 的执行器数。
-                    let used = bindings
-                        .values()
-                        .filter(|bound| bound.agent_id == agent.agent_id)
-                        .count();
-                    (used < agent.slots_total.load(Ordering::Relaxed) as usize)
-                        .then_some((used, agent.clone()))
-                })
-                // 选当前最空闲的 agent：先少后多，把负载摊平，避免一个
-                // agent 吃满而其他闲置。
-                .min_by_key(|(used, _)| *used);
-            if let Some((_, agent)) = pick {
-                let executor_id = format!(
-                    "exec-{}@{}",
-                    self.agent_counter.fetch_add(1, Ordering::Relaxed),
-                    agent.agent_id
-                );
-                bindings.insert(
-                    dispatch_id.clone(),
-                    Arc::new(BoundDispatch {
-                        agent_id: agent.agent_id.clone(),
-                        link_session_id: agent.link_session_id.clone(),
-                        executor_id: executor_id.clone(),
-                        executor_boot_id: Mutex::new(None),
-                        run_id,
-                        node_id,
-                        pending_link: Mutex::new(None),
-                        verdict: Mutex::new(None),
-                        notify: Notify::new(),
-                    }),
-                );
-                // 绑定与 executor_id 同临界区产出：不回读 bindings，
-                // 消除插入后到读取前被并发 unbind 摘除的 panic 窗口。
-                break (agent, executor_id);
-            }
-            drop(bindings);
-            drop(agents);
-            tokio::select! {
-                _ = changed => {},
-                _ = self.shutdown.cancelled() => return Err(invalid("agent manager shut down")),
-            }
+        run_id: &str,
+        node_id: &str,
+        requires_plugins: bool,
+    ) -> Result<Option<RemoteReservation>> {
+        let agents = self.agents.lock().await;
+        if agents.is_empty() {
+            return Err(invalid("no agent connected"));
+        }
+        let mut bindings = self.bindings.lock().await;
+        let compatible_rank =
+            |agent: &AgentRegistration| match (requires_plugins, agent.worker_profile) {
+                (true, WorkerProfile::Builtins) => None,
+                (true, WorkerProfile::Plugins) | (false, WorkerProfile::Builtins) => Some(0),
+                _ => Some(1),
+            };
+        if !agents
+            .values()
+            .any(|agent| compatible_rank(agent).is_some())
+        {
+            return Err(invalid("no plugin-capable agent connected"));
+        }
+        if bindings.len() >= A_MAX {
+            return Ok(None);
+        }
+        let chosen = agents
+            .values()
+            .filter_map(|agent| {
+                let rank = compatible_rank(agent)?;
+                if agent.draining.load(Ordering::Acquire) {
+                    return None;
+                }
+                let used = bindings
+                    .values()
+                    .filter(|bound| bound.agent_id == agent.agent_id)
+                    .count();
+                (used < agent.slots_total.load(Ordering::Relaxed) as usize)
+                    .then_some(((rank, used), agent))
+            })
+            .min_by_key(|(key, _)| *key);
+        let Some((_, registration)) = chosen else {
+            return Ok(None);
         };
-        let (registration, executor_id) = registration;
+        let dispatch_id = crate::journal_commands::id();
+        let executor_id = format!(
+            "exec-{}@{}",
+            self.agent_counter.fetch_add(1, Ordering::Relaxed),
+            registration.agent_id
+        );
+        bindings.insert(
+            dispatch_id.clone(),
+            Arc::new(BoundDispatch {
+                agent_id: registration.agent_id.clone(),
+                link_session_id: registration.link_session_id.clone(),
+                executor_id: executor_id.clone(),
+                executor_boot_id: Mutex::new(None),
+                run_id: run_id.to_owned(),
+                node_id: node_id.to_owned(),
+                pending_link: Mutex::new(None),
+                verdict: Mutex::new(None),
+                notify: Notify::new(),
+            }),
+        );
+        Ok(Some(RemoteReservation {
+            guard: BindingGuard {
+                manager: self.clone(),
+                dispatch_id,
+            },
+            registration: registration.clone(),
+            executor_id,
+        }))
+    }
+
+    /// Bind the already reserved slot after its dispatch identity has committed.
+    async fn bind_reserved(
+        self: &Arc<Self>,
+        reservation: &RemoteReservation,
+    ) -> Result<mpsc::Receiver<crate::execution::FromSession>> {
+        let dispatch_id = reservation.dispatch_id().to_owned();
+        let registration = &reservation.registration;
+        let executor_id = reservation.executor_id.clone();
         let (events, rx) = mpsc::channel(256);
         let (ack_tx, ack_rx) = oneshot::channel();
         // 在途绑定登记：会话侧收到 BindExecutorAck 时按 dispatch_id 找回
@@ -1341,7 +1350,7 @@ impl AgentManager {
     pub(crate) async fn unbind(self: &Arc<Self>, dispatch_id: &str, healthy: bool) {
         self.pending_binds.lock().await.remove(dispatch_id);
         let binding = self.bindings.lock().await.remove(dispatch_id);
-        self.capacity_changed.notify_waiters();
+        self.backend.execution_notification().notify_one();
         if let Some(binding) = binding {
             if !healthy {
                 let registration = self.agents.lock().await.get(&binding.agent_id).cloned();
@@ -1500,6 +1509,19 @@ impl RemoteDispatcher {
         &self.manager
     }
 
+    pub(crate) async fn reserve_node(
+        &self,
+        run_id: &str,
+        node: &flow_engine::Node,
+    ) -> Result<Option<RemoteReservation>> {
+        let requires_plugins = node.kind().is_none()
+            || node.kind() == Some(flow_engine::NodeType::Llm)
+            || node.is_harness_agent();
+        self.manager
+            .reserve(run_id, &node.id, requires_plugins)
+            .await
+    }
+
     /// 执行一次远程节点派发。
     ///
     /// 与本地路径的关键差异：链路死亡**不**直接失败，而是挂起等待 agent
@@ -1508,35 +1530,13 @@ impl RemoteDispatcher {
     pub(crate) async fn execute(
         &self,
         attempt: &crate::journal_execution::Attempt,
+        reservation: RemoteReservation,
         node: &flow_engine::Node,
         predecessors: std::collections::BTreeMap<String, flow_journal::StoredValue>,
         observations: Option<flow_engine::observation::ObservationStore>,
     ) -> std::result::Result<(), crate::journal::JournalError> {
         use crate::execution::dispatch::DispatchRunner;
-        // 全局 A_max 准入：同时在飞的活跃派发数上限（与 agent 侧的执行器
-        // 槽位数、窗口预算是不同的量）。
-        let _permit = self
-            .manager
-            .global_slots()
-            .acquire()
-            .await
-            .map_err(|_| invalid("remote slots closed"))
-            .map_err(crate::journal::JournalError::from)?;
-        // Cancellation/panic must release pending binds as well as established ones.
-        let _binding_guard = BindingGuard {
-            manager: self.manager.clone(),
-            dispatch_id: attempt.dispatch_id.clone(),
-        };
-        // 绑定（BindExecutor → agent 本地 spawn+握手 → Ack）。
-        let mut events = self
-            .manager
-            .bind_executor(
-                attempt.dispatch_id.clone(),
-                attempt.run_id.clone(),
-                attempt.node_id.clone(),
-            )
-            .await
-            .map_err(crate::journal::JournalError::from)?;
+        let mut events = self.manager.bind_reserved(&reservation).await?;
         let mut runner =
             DispatchRunner::runner(attempt.clone(), node.clone(), predecessors, observations);
         let dispatch_id = attempt.dispatch_id.clone();
@@ -1593,6 +1593,18 @@ impl RemoteDispatcher {
                 }
             }
         }
+    }
+}
+
+pub(crate) struct RemoteReservation {
+    guard: BindingGuard,
+    registration: Arc<AgentRegistration>,
+    executor_id: String,
+}
+
+impl RemoteReservation {
+    pub(crate) fn dispatch_id(&self) -> &str {
+        &self.guard.dispatch_id
     }
 }
 
@@ -1677,10 +1689,11 @@ mod capacity_tests {
             .await
             .unwrap();
         let manager = AgentManager::new(backend.clone(), backend.journal.id().into(), 1);
-        let (outbound, mut messages) = mpsc::channel(8);
+        let (outbound, _messages) = mpsc::channel(8);
         let register = |session: &str| {
             Arc::new(AgentRegistration {
                 agent_id: "agent".into(),
+                worker_profile: WorkerProfile::Legacy,
                 link_session_id: session.into(),
                 outbound: outbound.clone(),
                 slots_total: AtomicU64::new(1),
@@ -1693,64 +1706,30 @@ mod capacity_tests {
             .lock()
             .await
             .insert("agent".into(), register("old"));
-        let first = {
-            let manager = manager.clone();
-            tokio::spawn(async move {
-                manager
-                    .bind_executor("first".into(), "run".into(), "node".into())
-                    .await
-            })
-        };
-        assert!(matches!(messages.recv().await, Some(ToSession::Send(_))));
-        manager
-            .pending_binds
-            .lock()
+        let first = manager
+            .reserve("run", "first", false)
             .await
-            .remove("first")
             .unwrap()
-            .ack
-            .send(Ok("boot-first".into()))
             .unwrap();
-        let _first_events = first.await.unwrap().unwrap();
         manager
             .agents
             .lock()
             .await
             .insert("agent".into(), register("new"));
-        manager.capacity_changed.notify_waiters();
-        let second = {
-            let manager = manager.clone();
-            tokio::spawn(async move {
-                manager
-                    .bind_executor("second".into(), "run".into(), "node".into())
-                    .await
-            })
-        };
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), messages.recv())
-                .await
-                .is_err(),
-            "replacement must not reset used capacity"
-        );
-        assert_eq!(manager.bindings.lock().await.len(), 1);
-        manager.unbind("first", true).await;
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(1), messages.recv())
-                .await
-                .unwrap(),
-            Some(ToSession::Send(_))
-        ));
-        manager
-            .pending_binds
-            .lock()
+        assert!(manager
+            .reserve("run", "second", false)
             .await
-            .remove("second")
             .unwrap()
-            .ack
-            .send(Ok("boot-second".into()))
+            .is_none());
+        assert_eq!(manager.bindings.lock().await.len(), 1);
+        manager.unbind(first.dispatch_id(), true).await;
+        let second = manager
+            .reserve("run", "second", false)
+            .await
+            .unwrap()
             .unwrap();
-        let _second_events = second.await.unwrap().unwrap();
-        manager.unbind("second", true).await;
+        assert_eq!(second.registration.link_session_id, "new");
+        manager.unbind(second.dispatch_id(), true).await;
         assert!(manager.pending_binds.lock().await.is_empty());
         assert!(manager.bindings.lock().await.is_empty());
         backend.close().await.unwrap();
@@ -1817,6 +1796,7 @@ mod lock_tests {
             .unwrap();
         let registration = Arc::new(AgentRegistration {
             agent_id: "agent".into(),
+            worker_profile: WorkerProfile::Legacy,
             link_session_id: "session".into(),
             outbound: tx,
             slots_total: AtomicU64::new(1),
@@ -1996,6 +1976,108 @@ mod session_tests {
             panic!("expected AgentWelcome, got {}", welcome.type_name());
         };
         (transport, link_session_id)
+    }
+
+    #[tokio::test]
+    async fn resume_routes_stay_dormant_until_the_final_page_reply() {
+        let (manager, backend, root) = manager_with_data().await;
+        let created = backend.workflow_create("paged resume", None).await.unwrap();
+        let workflow = created.result["workflow_id"].as_str().unwrap();
+        backend
+            .workflow_update(
+                workflow,
+                serde_json::json!({
+                    "nodes": [{"id":"s", "type":"start"}, {"id":"e", "type":"end"}],
+                    "edges": [{"from":"s", "to":"e"}]
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        backend.workflow_publish(workflow, 1, None).await.unwrap();
+        let started = backend
+            .run_start(
+                workflow,
+                None,
+                serde_json::Value::Null,
+                "manual",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let run_id = started.result["run_id"].as_str().unwrap().to_string();
+        let attempt =
+            crate::journal_execution::Attempt::begin(backend.clone(), run_id.clone(), "s".into())
+                .await
+                .unwrap();
+        let mut transport = session_pair(&manager, "agent-1").await.0;
+        manager.bindings.lock().await.insert(
+            attempt.dispatch_id.clone(),
+            Arc::new(BoundDispatch {
+                agent_id: "agent-1".into(),
+                link_session_id: "old-link".into(),
+                executor_id: "executor".into(),
+                executor_boot_id: Mutex::new(Some("worker-boot".into())),
+                run_id,
+                node_id: "s".into(),
+                pending_link: Mutex::new(None),
+                verdict: Mutex::new(None),
+                notify: Notify::new(),
+            }),
+        );
+        transport
+            .send(Message::Resume {
+                items: vec![ResumeItem {
+                    dispatch_id: attempt.dispatch_id.clone(),
+                    executor_boot_id: "worker-boot".into(),
+                    state: flow_engine::execution_protocol::remote::ResumeState::Executing,
+                    durable_audit_seq: 0,
+                    result_id: None,
+                    result_last_audit_seq: None,
+                    lost_data: false,
+                    forced_kill: false,
+                }],
+                page: 0,
+                more: true,
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(transport.recv().await.unwrap(), Message::ResumeReply { page: 0, decisions }
+            if matches!(decisions[0].action, ResumeAction::UploadOnly { .. }))
+        );
+        assert!(
+            matches!(
+                manager
+                    .wait_attach(&attempt.dispatch_id, Duration::from_millis(50))
+                    .await,
+                AttachOutcome::Lost(_)
+            ),
+            "an early dispatcher could replay a tool reply during pagination"
+        );
+        transport
+            .send(Message::Resume {
+                items: vec![],
+                page: 1,
+                more: false,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            transport.recv().await.unwrap(),
+            Message::ResumeReply { page: 1, .. }
+        ));
+        assert!(matches!(
+            manager
+                .wait_attach(&attempt.dispatch_id, Duration::from_secs(1))
+                .await,
+            AttachOutcome::Link(_)
+        ));
+        drop(transport);
+        manager.shutdown().await;
+        backend.close().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// W3：对端停读 + 出站饱和时入站帧仍被处理（旧版卡死在

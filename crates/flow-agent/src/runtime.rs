@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use flow_engine::execution_protocol::contract::bounded_control_text;
 use flow_engine::execution_protocol::contract::{
-    ExecutorInvocation, DRAIN_GRACE_MS, PROTOCOL_VERSION,
+    ExecutorInvocation, WorkerProfile, DRAIN_GRACE_MS, PROTOCOL_VERSION,
 };
 use flow_engine::execution_protocol::message::Message;
 use flow_engine::execution_protocol::remote::{
@@ -51,6 +51,13 @@ pub struct AgentConfig {
 /// agent 运行入口：循环「连接 → 服务 → 断线 → 退避重连」，直到 shutdown。
 /// 返回进程退出原因。
 pub async fn run_agent(config: AgentConfig, shutdown: CancellationToken) -> String {
+    let worker_profile = tokio::select! {
+        _ = shutdown.cancelled() => return "shutdown".into(),
+        profile = pool::probe_worker_profile(&config.executor) => match profile {
+            Ok(profile) => profile,
+            Err(error) => return format!("worker capability probe failed: {error}"),
+        }
+    };
     let agent_boot_id = flow_engine::execution_protocol::transport::fresh_boot_id();
     let executor_handles: Arc<tokio::sync::Mutex<BTreeMap<String, ExecutorHandle>>> =
         Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
@@ -73,7 +80,7 @@ pub async fn run_agent(config: AgentConfig, shutdown: CancellationToken) -> Stri
         // Reconnecting：建立单条 mTLS + 握手。
         let connection = tokio::select! {
             _ = shutdown.cancelled() => {cancel_all(&executor_handles).await; return "shutdown".into();},
-            result = tokio::time::timeout(Duration::from_secs(15), connect(&config, &agent_boot_id)) => result.unwrap_or_else(|_| Err("agent connect timeout".into())),
+            result = tokio::time::timeout(Duration::from_secs(15), connect(&config, &agent_boot_id, worker_profile)) => result.unwrap_or_else(|_| Err("agent connect timeout".into())),
         };
         match connection {
             Ok((mut transport, link_session_id, journal_id, master_epoch, heartbeat_ms)) => {
@@ -104,8 +111,9 @@ pub async fn run_agent(config: AgentConfig, shutdown: CancellationToken) -> Stri
                     }
                 }
                 // Ready：转发循环（断线返回）。
-                let reason = serve(
+                let reason = serve_with_worker_profile(
                     &config,
+                    Some(worker_profile),
                     &agent_boot_id,
                     &link_session_id,
                     &journal_id,
@@ -142,9 +150,10 @@ pub async fn run_agent(config: AgentConfig, shutdown: CancellationToken) -> Stri
 async fn connect(
     config: &AgentConfig,
     agent_boot_id: &str,
+    worker_profile: WorkerProfile,
 ) -> std::result::Result<(FrameTransport, String, String, u64, u64), String> {
     if config.wss_url.is_some() {
-        return connect_wss(config, agent_boot_id).await;
+        return connect_wss(config, agent_boot_id, worker_profile).await;
     }
     let connector = tls::client_config_from_files(&config.ca_cert, &config.cert, &config.key)
         .map_err(|e| format!("tls config: {e}"))?;
@@ -166,7 +175,7 @@ async fn connect(
     // AgentWelcome。不再用临时 decoder 取首帧后丢弃——一次 read 里 Welcome
     // 之后的尾随字节不会在交接时丢失。
     let transport = FrameTransport::spawn(stream, 128);
-    handshake(transport, config, agent_boot_id).await
+    handshake(transport, config, agent_boot_id, worker_profile).await
 }
 
 /// WSS 上联（T13）：明文 TCP（代理终止 TLS）+ 显式认证头；同一套帧/握手。
@@ -175,6 +184,7 @@ async fn connect(
 async fn connect_wss(
     config: &AgentConfig,
     agent_boot_id: &str,
+    worker_profile: WorkerProfile,
 ) -> std::result::Result<(FrameTransport, String, String, u64, u64), String> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -214,7 +224,7 @@ async fn connect_wss(
         flow_engine::execution_protocol::ws::WsByteStream::new(ws),
         128,
     );
-    handshake(transport, config, agent_boot_id).await
+    handshake(transport, config, agent_boot_id, worker_profile).await
 }
 
 /// 上联握手：AgentHello → AgentWelcome（transport 已建立，与承载无关）。
@@ -223,13 +233,16 @@ async fn handshake(
     mut transport: FrameTransport,
     config: &AgentConfig,
     agent_boot_id: &str,
+    worker_profile: WorkerProfile,
 ) -> std::result::Result<(FrameTransport, String, String, u64, u64), String> {
     let hello = Message::agent_hello(
         agent_boot_id,
         crate::AGENT_BUILD,
         crate::AGENT_CAPABILITIES
             .iter()
-            .map(|s| s.to_string())
+            .copied()
+            .chain(worker_profile.capability())
+            .map(str::to_string)
             .collect(),
         config.slots,
     );
@@ -451,6 +464,40 @@ fn queue_uplink(
 /// 这里是 agent 的**主循环**：所有转发、背压与公平性都收敛在这里。
 pub async fn serve(
     config: &AgentConfig,
+    agent_boot_id: &str,
+    link_session_id: &str,
+    journal_id: &str,
+    master_epoch: u64,
+    heartbeat_ms: u64,
+    transport: FrameTransport,
+    relay: Arc<parking_lot::Mutex<Relay>>,
+    handles: Arc<tokio::sync::Mutex<BTreeMap<String, ExecutorHandle>>>,
+    uplink_rx: &mut mpsc::Receiver<(Message, tokio::sync::OwnedSemaphorePermit)>,
+    budget: std::sync::Arc<crate::relay::UplinkBudget>,
+    shutdown: CancellationToken,
+) -> String {
+    serve_with_worker_profile(
+        config,
+        None,
+        agent_boot_id,
+        link_session_id,
+        journal_id,
+        master_epoch,
+        heartbeat_ms,
+        transport,
+        relay,
+        handles,
+        uplink_rx,
+        budget,
+        shutdown,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_with_worker_profile(
+    config: &AgentConfig,
+    worker_profile: Option<WorkerProfile>,
     _agent_boot_id: &str,
     _link_session_id: &str,
     journal_id: &str,
@@ -667,7 +714,7 @@ pub async fn serve(
                             let journal = journal_id.to_owned();
                             let task_relay = relay.clone();
                             starting.spawn(async move {
-                                let bound = pool::bind_executor(&executor, &journal, master_epoch, &task_relay, &executor_id, &dispatch_id).await;
+                                let bound = pool::bind_profiled_executor(&executor, &journal, master_epoch, &task_relay, &executor_id, &dispatch_id, worker_profile).await;
                                 (executor_id, dispatch_id, bound)
                             });
                         }

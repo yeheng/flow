@@ -34,6 +34,12 @@ pub(crate) enum ExecutionPort {
     Remote(Arc<RemoteDispatcher>),
 }
 
+enum NodeDispatch {
+    Ipc(Arc<IpcDispatcher>),
+    Remote(Arc<RemoteDispatcher>, crate::execution::remote::RemoteReservation),
+    Unavailable(flow_journal::Error),
+}
+
 /// 一个在飞节点尝试的归还键与结果。
 type NodeKey = (String, String);
 type NodeTask = (NodeKey, Result<()>);
@@ -706,7 +712,29 @@ async fn spawn_node_attempt(
     predecessors: BTreeMap<String, StoredValue>,
     coord: &mut Coordinator,
 ) -> Result<()> {
-    let attempt = Attempt::begin(backend.clone(), run_id.to_owned(), node.id.clone()).await?;
+    let dispatch = match port {
+        ExecutionPort::Ipc(dispatcher) => NodeDispatch::Ipc(dispatcher.clone()),
+        ExecutionPort::Remote(dispatcher) => match dispatcher.reserve_node(run_id, node).await {
+            Ok(Some(reservation)) => NodeDispatch::Remote(dispatcher.clone(), reservation),
+            Ok(None) => {
+                backend.defer_run(run_id.to_owned()).await;
+                return Ok(());
+            }
+            Err(error) => NodeDispatch::Unavailable(error),
+        },
+    };
+    let attempt = match &dispatch {
+        NodeDispatch::Remote(_, reservation) => {
+            Attempt::begin_with_id(
+                backend.clone(),
+                run_id.to_owned(),
+                node.id.clone(),
+                reservation.dispatch_id().to_owned(),
+            )
+            .await?
+        }
+        _ => Attempt::begin(backend.clone(), run_id.to_owned(), node.id.clone()).await?,
+    };
     let key: NodeKey = (run_id.to_owned(), node.id.clone());
     coord.active.insert(key.clone());
     if node.is_harness_agent() {
@@ -717,10 +745,9 @@ async fn spawn_node_attempt(
         .fetch_max(coord.tasks.len() + 1, std::sync::atomic::Ordering::Relaxed);
     let node = node.clone();
     let observation = observation.clone();
-    let port = port.clone();
-    coord
-        .tasks
-        .spawn(async move { execute_node(port, attempt, node, predecessors, observation).await });
+    coord.tasks.spawn(async move {
+        execute_node(dispatch, attempt, node, predecessors, observation).await
+    });
     Ok(())
 }
 
@@ -733,7 +760,7 @@ async fn spawn_node_attempt(
 /// 关键是「不把平台故障写成业务失败」——已授权外部操作的节点在断链时
 /// 必须落到 Uncertain 等待人工裁决。
 async fn execute_node(
-    port: ExecutionPort,
+    dispatch: NodeDispatch,
     attempt: Attempt,
     node: flow_engine::Node,
     predecessors: BTreeMap<String, StoredValue>,
@@ -741,17 +768,24 @@ async fn execute_node(
 ) -> NodeTask {
     let key: NodeKey = (attempt.run_id.clone(), attempt.node_id.clone());
     let result = AssertUnwindSafe(async {
-        match &port {
-            ExecutionPort::Ipc(dispatcher) => {
+        match dispatch {
+            NodeDispatch::Ipc(dispatcher) => {
                 dispatcher
                     .execute(&attempt, &node, predecessors.clone(), observation.clone())
                     .await
             }
-            ExecutionPort::Remote(dispatcher) => {
+            NodeDispatch::Remote(dispatcher, reservation) => {
                 dispatcher
-                    .execute(&attempt, &node, predecessors.clone(), observation.clone())
+                    .execute(
+                        &attempt,
+                        reservation,
+                        &node,
+                        predecessors.clone(),
+                        observation.clone(),
+                    )
                     .await
             }
+            NodeDispatch::Unavailable(error) => Err(error.into()),
         }
     })
     .catch_unwind()

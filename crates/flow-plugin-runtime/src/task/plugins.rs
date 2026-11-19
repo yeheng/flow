@@ -3,6 +3,38 @@
 
 use super::*;
 
+use std::sync::Mutex;
+use tokio::sync::oneshot;
+
+/// The plugin session handles reverse RPCs serially, so one matching reply is enough.
+#[derive(Default)]
+pub(crate) struct ToolReplySlot {
+    waiter: Mutex<Option<(String, oneshot::Sender<Message>)>>,
+}
+
+impl ToolReplySlot {
+    fn register(&self, call_id: String) -> oneshot::Receiver<Message> {
+        let (send, receive) = oneshot::channel();
+        *self.waiter.lock().expect("tool reply slot") = Some((call_id, send));
+        receive
+    }
+
+    pub(crate) fn deliver(&self, message: Message) {
+        let Message::ToolPermissionDecision { tool_call_id, .. } = &message else {
+            return;
+        };
+        let mut waiter = self.waiter.lock().expect("tool reply slot");
+        if waiter
+            .as_ref()
+            .is_some_and(|(call_id, _)| call_id == tool_call_id)
+        {
+            if let Some((_, send)) = waiter.take() {
+                let _ = send.send(message);
+            }
+        }
+    }
+}
+
 impl TaskRunner {
     /// llm 插件会话错误 → TaskError：Setup（环境）按 Invalid——但授权已
     /// 提交，许可已落 journal，环境失败同样意味着「副作用状态未知」，统一
@@ -619,19 +651,19 @@ impl TaskRunner {
             let outbound = self.outbound.clone();
             let dispatch_id = self.dispatch_id.clone();
             let cancel = self.cancel.clone();
-            let tool_mail = self.tool_mail.clone();
+            let tool_replies = self.tool_replies.clone();
             std::sync::Arc::new(
                 move |request: flow_plugin_sdk::protocol::jsonrpc::Request| {
                     let outbound = outbound.clone();
                     let dispatch_id = dispatch_id.clone();
                     let cancel = cancel.clone();
-                    let tool_mail = tool_mail.clone();
+                    let tool_replies = tool_replies.clone();
                     Box::pin(async move {
                         forward_permission_request(
                             outbound,
                             dispatch_id,
                             cancel,
-                            tool_mail,
+                            tool_replies,
                             request,
                         )
                         .await
@@ -808,7 +840,7 @@ async fn forward_permission_request(
     outbound: mpsc::Sender<Message>,
     dispatch_id: String,
     cancel: CancellationToken,
-    tool_mail: std::sync::Arc<tokio::sync::Mutex<mpsc::Receiver<Message>>>,
+    tool_replies: Arc<ToolReplySlot>,
     request: flow_plugin_sdk::protocol::jsonrpc::Request,
 ) -> flow_plugin_sdk::protocol::jsonrpc::Message {
     use flow_plugin_sdk::protocol::handshake::{
@@ -854,48 +886,42 @@ async fn forward_permission_request(
         Err(error) => return error_response(format!("tool request encode failed: {error}")),
         _ => {}
     }
-    if outbound.send(request).await.is_err() {
-        return error_response("master link closed; failing closed".into());
-    }
-    // 等裁决：同一 tool_call_id 的响应（幂等重发由 master 折叠态处理）。
-    // 不设执行器侧绝对时限：裁决时钟归 master——approval TTL（默认
-    // 24h，`[permissions] approval_ttl_ms`）到期由 drive_approval 回
-    // Denied/Expired，人工审批期间 agent 生命周期预算暂停。执行器只做
-    // 活性判定：链路断（mailbox 关闭）或取消即 fail closed。曾有的
-    // 600s 硬限会把 10 分钟未批的工具调用错判为超时，与 master 的
-    // 审批窗直接冲突（两个时钟各说各话）。
-    let mut mailbox = tool_mail.lock().await;
-    loop {
-        let message = tokio::select! {
-            message = mailbox.recv() => {
-                match message {
-                    Some(message) => message,
-                    None => return error_response("master link closed; failing closed".into()),
-                }
-            }
-            _ = cancel.cancelled() => return error_response("cancelled; failing closed".into()),
-        };
-        match message {
-            Message::ToolPermissionDecision {
-                dispatch_id: target,
-                tool_call_id,
-                operation_id,
-                allowed,
-                reason,
-            } if target == dispatch_id && tool_call_id == params.tool_call_id => {
-                let result = PermissionRequestResult {
-                    allowed,
-                    reason,
-                    operation_id,
-                };
-                return flow_plugin_sdk::protocol::jsonrpc::Message::Response(Response {
-                    jsonrpc: "2.0",
-                    id,
-                    result: Some(serde_json::to_value(result).unwrap_or(Value::Null)),
-                    error: None,
-                });
-            }
-            _ => continue,
+    // Register before sending. Replays for a finished or different call are
+    // discarded by the slot, and the approval deadline still belongs to the master.
+    let reply = tool_replies.register(params.tool_call_id.clone());
+    let message = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return error_response("cancelled; failing closed".into()),
+        result = async {
+            outbound.send(request).await.map_err(|_| ())?;
+            reply.await.map_err(|_| ())
+        } => match result {
+            Ok(message) => message,
+            Err(()) => return error_response("master link closed; failing closed".into()),
         }
+    };
+    let Message::ToolPermissionDecision {
+        dispatch_id: target,
+        tool_call_id,
+        operation_id,
+        allowed,
+        reason,
+    } = message
+    else {
+        return error_response("invalid tool reply".into());
+    };
+    if target != dispatch_id || tool_call_id != params.tool_call_id {
+        return error_response("tool reply identity mismatch".into());
     }
+    let result = PermissionRequestResult {
+        allowed,
+        reason,
+        operation_id,
+    };
+    flow_plugin_sdk::protocol::jsonrpc::Message::Response(Response {
+        jsonrpc: "2.0",
+        id,
+        result: Some(serde_json::to_value(result).unwrap_or(Value::Null)),
+        error: None,
+    })
 }

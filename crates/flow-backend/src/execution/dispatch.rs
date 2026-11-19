@@ -376,6 +376,9 @@ pub(crate) struct DispatchRunner {
     /// 提交通知上观察裁决、按绝对 deadline 执行 TTL；期间暂停 agent 生命周期
     /// 与远程空闲判定（人工等待不消耗执行预算）。
     pending_approval: Option<PendingApproval>,
+    /// Reverse tool calls are serial. The next call proves the preceding reply
+    /// reached the executor. Keep one committed reply across link replacement.
+    last_tool_reply: Option<ToolReply>,
     /// 本派发是否已交还执行槽位（本地池 park）。
     parked: bool,
 }
@@ -430,6 +433,7 @@ impl DispatchRunner {
             idle_strikes: 0,
             agent_deadline,
             pending_approval: None,
+            last_tool_reply: None,
             parked: false,
         }
     }
@@ -530,36 +534,38 @@ impl DispatchRunner {
                 .await
                 .map_err(|error| invalid(error.to_string()))?;
         } else {
-            // 重挂：授权已提交但 Outcome 未到（许可可能在断线中丢失）时
-            // 重发当前会话许可；其余靠执行器审计重传自然恢复。
-            if let Some(operation) = &record.operation {
-                if operation.outcome.is_none() && !self.cancel_sent {
+            // A tool request proves the executor already consumed its node permit.
+            let tool_approval = record.approval.as_ref().is_some_and(|approval| {
+                approval.gate == "tool" && approval.dispatch_id == self.attempt.dispatch_id
+            });
+            if !tool_approval && self.last_tool_reply.is_none() {
+                if let Some(operation) = record
+                    .operation
+                    .as_ref()
+                    .filter(|operation| operation.outcome.is_none() && !self.cancel_sent)
+                {
                     let credentials = credentials::from_resumed_request(&operation.request);
-                    // 许可证丢失会让节点挂到 idle 超时——发送失败必须留痕。
                     if let Err(error) = self
                         .enqueue_operation_permit(link, operation, credentials)
                         .await
                     {
-                        tracing::warn!(
-                            dispatch = %self.attempt.dispatch_id,
-                            %error, "operation permit resend failed"
-                        );
+                        tracing::warn!(dispatch = %self.attempt.dispatch_id, %error, "operation permit resend failed");
                     }
                 }
             }
-            // 重挂时若存在待审批操作（重启恢复），恢复挂起观察与原 deadline：
-            // 新裁决到达后经 drive_approval 下发 Permit/Denied。
-            if let Some(approval) = record.approval.as_ref() {
-                if approval.status == flow_engine::journal_state::ApprovalStatus::Pending
+            if let Some(approval) = record.approval.as_ref().filter(|approval| {
+                approval.status == ApprovalStatus::Pending
                     && approval.dispatch_id == self.attempt.dispatch_id
-                {
-                    self.pending_approval = Some(PendingApproval {
-                        operation_id: approval.request.operation_id.clone(),
-                        request_fingerprint: approval.request.context.request_fingerprint.clone(),
-                        deadline: approval.deadline,
-                    });
-                    self.park(link).await;
-                    // 挂起即宣告：让执行器知道还在等（可能换了会话）。
+            }) {
+                self.pending_approval = Some(PendingApproval {
+                    operation_id: approval.request.operation_id.clone(),
+                    request_fingerprint: approval.request.context.request_fingerprint.clone(),
+                    deadline: approval.deadline,
+                });
+                self.park(link).await;
+                // Only the node-operation mailbox understands OperationPending.
+                // The plugin's reverse request is already waiting for its tool reply.
+                if approval.gate == "node" {
                     let _ = link
                         .commands
                         .send(ToSession::Send(Box::new(Message::OperationPending {
@@ -573,6 +579,11 @@ impl DispatchRunner {
                             deadline_ms: approval.deadline,
                         })))
                         .await;
+                }
+            }
+            if let Some(reply) = &self.last_tool_reply {
+                if self.active_tool_turn(&run).is_some() {
+                    self.send_tool_reply(link, reply).await?;
                 }
             }
         }
@@ -1836,7 +1847,25 @@ impl DispatchRunner {
         }
         let run = self.snapshot().await?;
         let fingerprint = flow_dto::permission::canonical_digest(&params);
-        // A persisted tool decision can be replayed only for the same dispatch and call.
+        let (specs, derive_error) = if test_bypass {
+            (Vec::new(), None)
+        } else {
+            match crate::policy::derive::tool_specs(&tool, &params, cwd.as_deref()) {
+                Ok(specs) => (specs, None),
+                Err(reason) => (Vec::new(), Some(reason)),
+            }
+        };
+        if let Some(reply) = self
+            .last_tool_reply
+            .as_ref()
+            .filter(|reply| reply.request.context.tool_call_id.as_deref() == Some(&tool_call_id))
+        {
+            check_tool_replay(&reply.request, &fingerprint, &specs)?;
+            return self.send_tool_reply(link, reply).await;
+        }
+        // A later reverse request confirms delivery of the previous reply.
+        self.last_tool_reply = None;
+
         let node = run.nodes.get(&self.attempt.node_id);
         let prior = node
             .and_then(|node| node.approval.as_ref())
@@ -1846,49 +1875,36 @@ impl DispatchRunner {
                     && approval.request.context.tool_call_id.as_deref() == Some(&tool_call_id)
             });
         if let Some(approval) = prior {
-            if approval.request.context.request_fingerprint != fingerprint {
-                return Err(invalid(
-                    "tool call parameters differ from the committed request",
-                ));
-            }
-            match approval.status {
+            check_tool_replay(&approval.request, &fingerprint, &specs)?;
+            return match approval.status {
+                ApprovalStatus::Pending => Ok(()),
                 ApprovalStatus::Allowed => {
                     if let Some(turn) = self.active_tool_turn(&run) {
-                        self.enqueue_tool_allow(link, &approval.request, &turn.permit_id, true)
-                            .await?;
+                        self.remember_tool_reply(
+                            link,
+                            approval.request.clone(),
+                            ToolVerdict::Allowed {
+                                turn_permit_id: turn.permit_id.clone(),
+                                manual: true,
+                            },
+                        )
+                        .await
+                    } else {
+                        Ok(())
                     }
-                    return Ok(());
                 }
                 ApprovalStatus::Denied | ApprovalStatus::Expired => {
-                    let reason = approval
-                        .decision
-                        .as_ref()
-                        .and_then(|record| record.reason.clone())
-                        .unwrap_or_else(|| "permission denied".into());
-                    let _ = link
-                        .commands
-                        .send(ToSession::Send(Box::new(Message::ToolPermissionDecision {
-                            dispatch_id,
-                            tool_call_id,
-                            operation_id: approval.request.operation_id.clone(),
-                            allowed: false,
-                            reason: Some(reason),
-                        })))
-                        .await;
-                    return Ok(());
+                    self.remember_tool_reply(
+                        link,
+                        approval.request.clone(),
+                        ToolVerdict::Denied(approval_denial_reason(approval)),
+                    )
+                    .await
                 }
-                _ => {}
-            }
+                ApprovalStatus::Withdrawn | ApprovalStatus::Superseded => Ok(()),
+            };
         }
 
-        let (specs, derive_error) = if test_bypass {
-            (Vec::new(), None)
-        } else {
-            match crate::policy::derive::tool_specs(&tool, &params, cwd.as_deref()) {
-                Ok(specs) => (specs, None),
-                Err(reason) => (Vec::new(), Some(reason)),
-            }
-        };
         let request = PermissionRequest {
             actor: Principal::Node {
                 run_id: self.attempt.run_id.clone(),
@@ -2022,11 +2038,25 @@ impl DispatchRunner {
             .await?;
         match committed {
             ToolAuthorization::Denied(reason) => {
-                invalid_tool(&self.attempt, link, &tool_call_id, &request, &reason).await
+                let verdict = ToolVerdict::Denied(reason.clone());
+                if commit_tool_denial(&self.attempt, &request, &reason).await {
+                    self.remember_tool_reply(link, request, verdict).await
+                } else {
+                    // Fail closed even if the denial itself could not be recorded.
+                    self.send_tool_reply(link, &ToolReply { request, verdict })
+                        .await
+                }
             }
             ToolAuthorization::Allowed(turn_permit_id) => {
-                self.enqueue_tool_allow(link, &request, &turn_permit_id, false)
-                    .await
+                self.remember_tool_reply(
+                    link,
+                    request,
+                    ToolVerdict::Allowed {
+                        turn_permit_id,
+                        manual: false,
+                    },
+                )
+                .await
             }
             ToolAuthorization::Pending(deadline) => {
                 self.pending_approval = Some(PendingApproval {
@@ -2055,6 +2085,46 @@ impl DispatchRunner {
             .filter(|turn| turn.outcome.is_none())
     }
 
+    async fn remember_tool_reply(
+        &mut self,
+        link: &DispatchLink,
+        request: PermissionRequest,
+        verdict: ToolVerdict,
+    ) -> Result<()> {
+        // Retain the committed response even if this link closes before enqueue.
+        self.last_tool_reply = Some(ToolReply { request, verdict });
+        self.send_tool_reply(link, self.last_tool_reply.as_ref().expect("retained reply"))
+            .await
+    }
+
+    async fn send_tool_reply(&self, link: &DispatchLink, reply: &ToolReply) -> Result<()> {
+        let request = &reply.request;
+        match &reply.verdict {
+            ToolVerdict::Allowed {
+                turn_permit_id,
+                manual,
+            } => {
+                self.enqueue_tool_allow(link, request, turn_permit_id, *manual)
+                    .await
+            }
+            ToolVerdict::Denied(reason) => {
+                let Some(tool_call_id) = request.context.tool_call_id.as_ref() else {
+                    return Err(invalid("tool decision missing call id"));
+                };
+                link.commands
+                    .send(ToSession::Send(Box::new(Message::ToolPermissionDecision {
+                        dispatch_id: self.attempt.dispatch_id.clone(),
+                        tool_call_id: tool_call_id.clone(),
+                        operation_id: request.operation_id.clone(),
+                        allowed: false,
+                        reason: Some(bounded_deny_reason(reason)),
+                    })))
+                    .await
+                    .map_err(|_| JournalError::LinkClosed("tool decision session closed".into()))
+            }
+        }
+    }
+
     /// A fresh auto decision comes from a successful commit. Manual decisions and
     /// replays also have to match the approval still projected for this call.
     async fn enqueue_tool_allow(
@@ -2073,7 +2143,7 @@ impl DispatchRunner {
             .clone()
             .reserve_owned()
             .await
-            .map_err(|_| invalid("tool decision session closed"))?;
+            .map_err(|_| JournalError::LinkClosed("tool decision session closed".into()))?;
         self.attempt
             .backend
             .internal_for_run(&self.attempt.run_id, |state| {
@@ -2211,8 +2281,15 @@ impl DispatchRunner {
                 self.pending_approval = None;
                 self.unpark(link).await;
                 if let Some(turn) = self.active_tool_turn(&run) {
-                    self.enqueue_tool_allow(link, &approval.request, &turn.permit_id, true)
-                        .await?;
+                    self.remember_tool_reply(
+                        link,
+                        approval.request.clone(),
+                        ToolVerdict::Allowed {
+                            turn_permit_id: turn.permit_id.clone(),
+                            manual: true,
+                        },
+                    )
+                    .await?;
                 }
                 Ok(())
             }
@@ -2241,31 +2318,21 @@ impl DispatchRunner {
             ApprovalStatus::Denied | ApprovalStatus::Expired => {
                 self.pending_approval = None;
                 self.unpark(link).await;
-                let reason = approval
-                    .decision
-                    .as_ref()
-                    .and_then(|record| record.reason.clone())
-                    .unwrap_or_else(|| "permission denied".into());
-                let decision = if approval.gate == "tool" {
-                    Message::ToolPermissionDecision {
-                        dispatch_id: self.attempt.dispatch_id.clone(),
-                        tool_call_id: approval
-                            .request
-                            .context
-                            .tool_call_id
-                            .clone()
-                            .unwrap_or_default(),
-                        operation_id: pending.operation_id.clone(),
-                        allowed: false,
-                        reason: Some(bounded_deny_reason(&reason)),
-                    }
-                } else {
-                    Message::OperationDenied {
-                        dispatch_id: self.attempt.dispatch_id.clone(),
-                        operation_id: pending.operation_id.clone(),
-                        request_fingerprint: pending.request_fingerprint.clone(),
-                        reason: bounded_deny_reason(&reason),
-                    }
+                let reason = approval_denial_reason(approval);
+                if approval.gate == "tool" {
+                    return self
+                        .remember_tool_reply(
+                            link,
+                            approval.request.clone(),
+                            ToolVerdict::Denied(reason),
+                        )
+                        .await;
+                }
+                let decision = Message::OperationDenied {
+                    dispatch_id: self.attempt.dispatch_id.clone(),
+                    operation_id: pending.operation_id.clone(),
+                    request_fingerprint: pending.request_fingerprint.clone(),
+                    reason: bounded_deny_reason(&reason),
                 };
                 let _ = link
                     .commands
@@ -2285,6 +2352,38 @@ impl DispatchRunner {
 
 #[cfg(test)]
 mod permission_tests;
+
+struct ToolReply {
+    request: PermissionRequest,
+    verdict: ToolVerdict,
+}
+
+enum ToolVerdict {
+    Allowed {
+        turn_permit_id: String,
+        manual: bool,
+    },
+    Denied(String),
+}
+
+fn check_tool_replay(
+    request: &PermissionRequest,
+    fingerprint: &str,
+    specs: &[flow_dto::permission::OperationSpec],
+) -> Result<()> {
+    if request.context.request_fingerprint != fingerprint || request.specs != specs {
+        return Err(invalid("tool call differs from the committed request"));
+    }
+    Ok(())
+}
+
+fn approval_denial_reason(approval: &flow_engine::journal_state::ApprovalState) -> String {
+    approval
+        .decision
+        .as_ref()
+        .and_then(|record| record.reason.clone())
+        .unwrap_or_else(|| "permission denied".into())
+}
 
 enum ToolAuthorization {
     Allowed(String),
@@ -2581,13 +2680,7 @@ fn record_of(
 /// 工具级拒绝：落 Deny 事实（审计一条不少）并回拒（不阻塞回合——插件
 /// 自行处理工具失败）。事实写不进去（run 终态/派发陈旧）也照发拒绝：
 /// 宁可多拒，不可静默放行。
-async fn invalid_tool(
-    attempt: &Attempt,
-    link: &mut DispatchLink,
-    tool_call_id: &str,
-    request: &PermissionRequest,
-    reason: &str,
-) -> Result<()> {
+async fn commit_tool_denial(attempt: &Attempt, request: &PermissionRequest, reason: &str) -> bool {
     let record = record_of(
         request,
         Utc::now(),
@@ -2612,7 +2705,7 @@ async fn invalid_tool(
             let run = state.runs.get(&run_id).ok_or_else(|| fj("run missing"))?;
             let node = &run.nodes[&node_id];
             if run.terminal() || node.dispatch_id != dispatch {
-                return Ok((vec![], ()));
+                return Ok((vec![], false));
             }
             let mut event = crate::journal_commands::node_event(
                 run,
@@ -2622,23 +2715,16 @@ async fn invalid_tool(
                 true,
             );
             event.dispatch_id = Some(dispatch.clone());
-            Ok((vec![event], ()))
+            Ok((vec![event], true))
         })
         .await;
-    if let Err(error) = write {
-        tracing::warn!(%error, "tool denial fact could not be committed; still denying");
+    match write {
+        Ok(committed) => committed,
+        Err(error) => {
+            tracing::warn!(%error, "tool denial fact could not be committed; still denying");
+            false
+        }
     }
-    let _ = link
-        .commands
-        .send(ToSession::Send(Box::new(Message::ToolPermissionDecision {
-            dispatch_id: request.context.dispatch_id.clone(),
-            tool_call_id: tool_call_id.to_string(),
-            operation_id: request.operation_id.clone(),
-            allowed: false,
-            reason: Some(bounded_deny_reason(reason)),
-        })))
-        .await;
-    Ok(())
 }
 
 /// 控制帧里的拒绝原因有界（CONTROL_TEXT_MAX）。
