@@ -1,7 +1,13 @@
 //! Local process fault tests live here to use the same fault-injection build as the remote matrix.
 #![cfg(unix)]
 
-use std::{io::Write, path::Path, process::Stdio, sync::Arc, time::Duration};
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
+};
 
 use flow_backend::{
     execution::{dispatch::fault, ExecutionMode, IpcOptions},
@@ -12,13 +18,22 @@ use flow_engine::{
     journal_state::{NodeStatus, Run, RunStatus},
 };
 use flow_journal::{EventKind, JournalOptions};
+use flow_test_support::io::LocalDeployment;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 async fn start(backend: &Arc<JournalBackend>, tag: Option<String>) {
+    start_with_executor(backend, flow_test_support::io::executor_bin(), tag).await;
+}
+
+async fn start_with_executor(
+    backend: &Arc<JournalBackend>,
+    executor: PathBuf,
+    tag: Option<String>,
+) {
     backend
         .start_execution_ipc(ExecutionMode::Ipc(IpcOptions {
-            executor: ExecutorInvocation::explicit(flow_test_support::io::executor_bin()),
+            executor: ExecutorInvocation::explicit(executor),
             x_max: 1,
             tag,
         }))
@@ -149,7 +164,8 @@ async fn dispatcher_crash_fixture() {
         .unwrap();
     let point = "dispatch:before:e";
     let holds = fault::register(&[point, ACCEPTED]);
-    start(&backend, None).await;
+    let executor = std::env::current_dir().unwrap().join("flow-executor");
+    start_with_executor(&backend, executor, None).await;
     let run = if std::env::var_os("FLOW_CONDITION_CRASH_FIXTURE").is_some() {
         launch_condition(&backend, 101).await
     } else {
@@ -180,11 +196,12 @@ async fn kill_dispatcher_after_condition_commit_advances_only_the_selected_branc
 
 async fn assert_dispatcher_restart(condition: bool) {
     let dir = tempfile::tempdir().unwrap();
-    let mut cmd = tokio::process::Command::new(std::env::current_exe().unwrap());
+    let data = dir.path().join("data");
+    let deployment = LocalDeployment::copy_to(&dir.path().join("local bundle")).unwrap();
+    let mut cmd = deployment.command(&std::env::current_exe().unwrap());
     cmd.args(["--exact", "dispatcher_crash_fixture", "--nocapture"])
-        .env("FLOW_SCRIPT_CRASH_FIXTURE", dir.path())
-        .stdout(Stdio::piped())
-        .kill_on_drop(true);
+        .env("FLOW_SCRIPT_CRASH_FIXTURE", &data)
+        .stdout(Stdio::piped());
     if condition {
         cmd.env("FLOW_CONDITION_CRASH_FIXTURE", "1");
     }
@@ -201,7 +218,7 @@ async fn assert_dispatcher_restart(condition: bool) {
     .await
     .unwrap();
     child.kill().await.unwrap();
-    let backend = JournalBackend::open(dir.path(), JournalOptions::default())
+    let backend = JournalBackend::open(&data, JournalOptions::default())
         .await
         .unwrap();
     let before = backend.state().await.unwrap().runs[&run].clone();
@@ -211,8 +228,25 @@ async fn assert_dispatcher_restart(condition: bool) {
     if condition {
         assert_eq!(committed.branch, Some(true));
     }
-    start(&backend, None).await;
-    let after = finished(&backend, &run).await;
+    backend.close().await.unwrap();
+    drop(backend);
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(30),
+        deployment.journal(&data).arg("resume").output(),
+    )
+    .await
+    .expect("isolated journal runner resumes without optional components")
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let backend = JournalBackend::open(&data, JournalOptions::default())
+        .await
+        .unwrap();
+    let after = backend.state().await.unwrap().runs[&run].clone();
     assert_eq!(after.status, RunStatus::Succeeded);
     assert_eq!(after.nodes["n"].dispatch_id, committed.dispatch_id);
     assert_eq!(after.nodes["n"].branch, committed.branch);
@@ -222,14 +256,8 @@ async fn assert_dispatcher_restart(condition: bool) {
     }
     assert_eq!(after.nodes["e"].attempts.len(), 1);
     backend.close().await.unwrap();
-    assert_eq!(
-        count_fact(dir.path(), &run, "n", EventKind::NodeCompleted),
-        1
-    );
-    assert_eq!(
-        count_fact(dir.path(), &run, "e", EventKind::NodeCompleted),
-        1
-    );
+    assert_eq!(count_fact(&data, &run, "n", EventKind::NodeCompleted), 1);
+    assert_eq!(count_fact(&data, &run, "e", EventKind::NodeCompleted), 1);
 }
 
 #[tokio::test]

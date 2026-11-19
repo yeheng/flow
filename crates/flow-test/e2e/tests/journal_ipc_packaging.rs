@@ -9,6 +9,7 @@
 use flow_backend::journal::JournalBackend;
 use flow_engine::journal_state::RunStatus;
 use flow_journal::JournalOptions;
+use flow_test_support::io::LocalDeployment;
 use serde_json::json;
 use std::time::Duration;
 
@@ -18,10 +19,6 @@ fn temp() -> std::path::PathBuf {
 
 fn executor_bin() -> std::path::PathBuf {
     flow_test_support::io::executor_bin()
-}
-
-fn journal_dev_bin() -> std::path::PathBuf {
-    flow_test_support::io::journal_dev_bin()
 }
 
 async fn install(b: &JournalBackend, definition: serde_json::Value) -> String {
@@ -106,75 +103,92 @@ async fn missing_executor_binary_fails_loudly_without_fallback() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-/// 部署形态回归：主进程与 flow-executor 同目录、不设 FLOW_EXECUTOR_BIN，
-/// locate() 必须找到兄弟执行器；路径带空格同样可运行（I09 定位规则的
-/// 独立二进制形态）。
-#[test]
-fn deployed_sibling_executor_runs_in_spaced_directory() {
-    let spaced = std::env::temp_dir().join(format!("flow spaced {}", uuid::Uuid::now_v7()));
-    std::fs::create_dir_all(&spaced).unwrap();
-    let dev = spaced.join("flow-journal-dev");
-    let executor = spaced.join("flow-executor");
-    std::fs::copy(journal_dev_bin(), &dev).unwrap();
-    std::fs::copy(executor_bin(), &executor).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dev, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::set_permissions(&executor, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    let data = spaced.join("data");
-    let definition = spaced.join("definition.json");
-    std::fs::write(
-        &definition,
-        serde_json::to_string(&json!({"nodes":[
-            {"id":"s","type":"start"},
-            {"id":"n","type":"script","params":{"code":"return {ok: true};"}},
-            {"id":"e","type":"end"}],
-            "edges":[{"from":"s","to":"n"},{"from":"n","to":"e"}]}))
-        .unwrap(),
+/// Exercise the packaged entry point with no optional binaries or manifests.
+#[tokio::test]
+async fn deployed_sibling_executor_runs_in_spaced_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let deployment = LocalDeployment::copy_to(&temp.path().join("local bundle")).unwrap();
+    let data = temp.path().join("data");
+    let definition = temp.path().join("definition.json");
+    let missing_plugin = temp.path().join("missing-plugin.json");
+    let flow = json!({"nodes":[
+        {"id":"s","type":"start"},
+        {"id":"n","type":"script","params":{"code":"return {ok: true};"}},
+        {"id":"e","type":"end"}],
+        "edges":[{"from":"s","to":"n"},{"from":"n","to":"e"}]});
+    std::fs::write(&definition, serde_json::to_vec(&flow).unwrap()).unwrap();
+    let mut missing = flow;
+    missing["nodes"][1]["type"] = json!("absent-extension");
+    std::fs::write(&missing_plugin, serde_json::to_vec(&missing).unwrap()).unwrap();
+
+    let output = local_output(
+        deployment
+            .journal(&data)
+            .arg("run")
+            .arg("--definition")
+            .arg(&missing_plugin),
     )
-    .unwrap();
-    let output = std::process::Command::new(&dev)
-        .arg("--data-dir")
-        .arg(&data)
-        .arg("run")
-        .arg("--definition")
-        .arg(&definition)
-        .env("FLOW_EXECUTION_MODE", "ipc")
-        .env_remove("FLOW_EXECUTOR_BIN")
-        .output()
-        .expect("spawn flow-journal-dev");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    .await;
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && error.contains("absent-extension"),
+        "{error}"
+    );
+
+    let output = local_output(
+        deployment
+            .journal(&data)
+            .arg("run")
+            .arg("--definition")
+            .arg(&definition),
+    )
+    .await;
     assert!(
         output.status.success(),
-        "sibling executor must be located without FLOW_EXECUTOR_BIN\nstdout:{stdout}\nstderr:{}",
+        "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(stdout.contains("succeeded"), "run must finish: {stdout}");
-    // 兄弟执行器被移走后再启动：locate() 报错退出，绝不静默回退进程内执行。
-    std::fs::remove_file(&executor).unwrap();
-    let data2 = spaced.join("data2");
-    let output = std::process::Command::new(&dev)
-        .arg("--data-dir")
-        .arg(&data2)
-        .arg("run")
-        .arg("--definition")
-        .arg(&definition)
-        .env("FLOW_EXECUTION_MODE", "ipc")
-        .env_remove("FLOW_EXECUTOR_BIN")
-        .output()
-        .expect("spawn flow-journal-dev without executor");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !output.status.success(),
-        "missing sibling executor must fail startup"
+    let run: serde_json::Value = serde_json::from_slice(
+        output
+            .stdout
+            .rsplit(|&b| b == b'\n')
+            .find(|line| !line.is_empty())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(run["status"], "succeeded");
+    assert_eq!(
+        run["nodes"]["n"]["output"],
+        json!({"type":"inline","value":{"ok":true}})
     );
+    let report = local_output(deployment.journal(&data).arg("check-projection")).await;
     assert!(
-        stderr.contains("cannot locate flow-executor"),
-        "error must name the locator: {stderr}"
+        report.status.success(),
+        "{}",
+        String::from_utf8_lossy(&report.stderr)
     );
-    std::fs::remove_dir_all(&spaced).unwrap();
+
+    std::fs::remove_file(deployment.executor()).unwrap();
+    let output = local_output(
+        deployment
+            .journal(&temp.path().join("without-worker"))
+            .arg("run")
+            .arg("--definition")
+            .arg(&definition),
+    )
+    .await;
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && error.contains("cannot locate flow-executor"),
+        "{error}"
+    );
+}
+
+async fn local_output(cmd: &mut tokio::process::Command) -> std::process::Output {
+    tokio::time::timeout(Duration::from_secs(30), cmd.output())
+        .await
+        .expect("local deployment command must finish")
+        .expect("spawn local deployment command")
 }
 
 #[tokio::test]

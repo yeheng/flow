@@ -343,6 +343,52 @@ pub fn journal_dev_bin() -> PathBuf {
     workspace_bin("flow-journal-dev")
 }
 
+/// A local workflow deployment with just the journal runner and its executor.
+/// Tests provide a fresh root, so neither configuration nor optional siblings
+/// can leak in from the build tree or the user's flow home.
+pub struct LocalDeployment {
+    root: PathBuf,
+}
+
+impl LocalDeployment {
+    pub fn copy_to(root: &Path) -> std::io::Result<Self> {
+        std::fs::create_dir(root)?;
+        for (source, name) in [
+            (journal_dev_bin(), "flow-journal-dev"),
+            (executor_bin(), "flow-executor"),
+        ] {
+            std::fs::copy(source, root.join(name))?;
+        }
+        Ok(Self {
+            root: root.to_owned(),
+        })
+    }
+
+    pub fn executor(&self) -> PathBuf {
+        self.root.join("flow-executor")
+    }
+
+    pub fn command(&self, program: &Path) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.env_clear()
+            .current_dir(&self.root)
+            .env("FLOW_HOME", self.root.join("home"))
+            .env("FLOW_EXECUTION_MODE", "ipc")
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        if let Some(value) = std::env::var_os("SystemRoot") {
+            cmd.env("SystemRoot", value);
+        }
+        cmd
+    }
+
+    pub fn journal(&self, data: &Path) -> tokio::process::Command {
+        let mut cmd = self.command(&self.root.join("flow-journal-dev"));
+        cmd.arg("--data-dir").arg(data);
+        cmd
+    }
+}
+
 /// 被测进程自报端口后的结果。
 ///
 /// 两个端口都由子进程自己绑 `127.0.0.1:0` 后打印出来，因此它们与

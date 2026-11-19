@@ -64,6 +64,8 @@ plugins/harness/  harness agent 运行时（protocol / agent-core / agent-host /
 | --- | --- | --- |
 | `flow-journal-server` | flow-rpc | SQLite 产品服务（WS RPC + cron + webhook + 下载） |
 | `flow-cli` | flow-cli | 命令行客户端（纯 RPC） |
+| `flow-dispatcher` / `flow-worker` | flow-dispatcher | 独立任务提交与基础 Worker |
+| `flow-script-worker` | flow-internal-plugins | 独立 `script.v1` Worker |
 | `flow-executor` | flow-plugin-runtime | 受管理执行子进程（通道 FD 经 argv `--channel-fd` 传递） |
 | `flow-agent` | flow-agent | 受信任远程执行中继 |
 | `flow-journal-tool` | flow-journal | journal 离线维护（verify/rebuild-index/backup） |
@@ -80,6 +82,7 @@ flow-rpc ──> flow-backend ──> flow-engine ──> flow-domain / flow-dto
            ├─> flow-journal  （storage+query：v2 值分页/下载与同库只读查询）
            └─> flow-config
 flow-backend ──> flow-dispatcher / flow-journal / flow-engine / flow-dto / flow-config
+              └─> flow-plugin-catalog / flow-plugin-sdk
 flow-engine ──> flow-domain / flow-dto / flow-dispatcher
              └─> flow-journal（runtime 下的观测写入）
 flow-dispatcher ──> flow-facts
@@ -87,9 +90,10 @@ flow-domain ──> flow-facts / flow-dto
 flow-journal ──> flow-facts
 flow-facts ──> 无 flow 依赖（叶子）
 flow-dto ──> 无依赖（叶子）
-flow-plugin-runtime ──> flow-plugin-sdk / flow-engine / flow-journal / flow-config
+flow-plugin-catalog ──> flow-config / flow-domain / flow-plugin-sdk
+flow-plugin-runtime ──> flow-plugin-sdk / flow-engine / flow-journal / flow-config / flow-plugin-catalog
                        / flow-internal-plugins / plugins/harness/protocol
-flow-agent ──> flow-engine, flow-journal（执行协议两侧）
+flow-agent ──> flow-engine（无默认 features）/ flow-config
 flow-cli ──> flow-dto（自带 jsonrpsee/reqwest WS 客户端，运行期连 flow-journal-server，
             但不依赖任何服务 crate）
 flow-cli ──✗> flow-journal  ✗（CLI 不碰存储与事件日志，没有第二条写入路径）
@@ -132,6 +136,22 @@ Worker 构造同一个 `ScriptTask`。完成后，沿用工作流审计流和 `R
 目录扫描统一决定节点归属和冲突，默认注册复用同一份兼容表。内容授予与进程启动
 使用同一哈希公式，Worker 仍在启动插件进程前重新核验。领域校验允许外部声明新类型，
 内置节点保留原参数和图约束。Dispatcher 不依赖插件目录。
+
+最小本地工作流可用同目录的 `flow-journal-dev` 与 `flow-executor` 运行。部署回归在
+独立工作目录与 `FLOW_HOME` 下启动两份二进制，清除继承配置。没有插件清单、插件
+二进制、remote agent 或 RPC 服务时，测试验证基础流程、缺失扩展时报错以及事实重放。
+崩溃回归在节点结果提交后终止调度进程，再用同一部署的 `flow-journal-dev resume`
+恢复。Script 后继与 Condition 选中分支都只推进一次。
+
+本机可按 CI 顺序构建执行器与插件二进制，再运行工作区回归：
+
+```sh
+cargo build --workspace --bins --locked
+cargo test --workspace --all-targets --locked --no-fail-fast
+```
+
+工作区回归包含本机 IPC、RPC、模拟服务和进程故障用例。CI 另行验证领域与
+Dispatcher 的隔离构建，避免工作区合并 features 掩盖反向依赖。
 
 ### 2.2 架构图：三条链路
 

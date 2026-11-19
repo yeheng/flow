@@ -227,8 +227,9 @@ async fn plugin_declared_node_type_end_to_end() {
             let recheck = call_json(&client, "plugins.recheck", json!({})).await;
             assert_eq!(recheck["violations"].as_array().map(Vec::len), Some(0), "{recheck}");
 
-            // 下架插件后 recheck 报引用悬空。
-            let _ = std::fs::remove_dir_all(plugins.join("echo-plugin"));
+            // Remove both manifests so no installed plugin owns echo.
+            std::fs::remove_dir_all(plugins.join("zz-shadow")).unwrap();
+            std::fs::remove_dir_all(plugins.join("echo-plugin")).unwrap();
             let recheck = call_json(&client, "plugins.recheck", json!({})).await;
             assert!(
                 recheck["violations"]
