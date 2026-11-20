@@ -94,6 +94,7 @@ export interface PluginInfo {
   entry_symlink?: boolean;
   entry_oversize?: boolean;
   running?: boolean;
+  draining?: boolean;
   service?: boolean;
   id: string;
   name: string;

@@ -227,7 +227,12 @@ impl JournalBackend {
             let definition = self
                 .cached_definition(&format!("effective:{run_id}"), &run.definition)
                 .await?;
-            let mut view = effective_permissions(&definition, run.policy.as_ref(), node_id);
+            let mut view = effective_permissions(
+                &definition,
+                run.policy.as_ref(),
+                node_id,
+                run.plugin_bindings.as_ref(),
+            );
             view["run_id"] = json!(run_id);
             view["frozen"] = json!(run.policy.is_some());
             view["approvals"] = serde_json::to_value(&run.approvals)?;
@@ -251,7 +256,7 @@ impl JournalBackend {
                 &selected.definition,
             )
             .await?;
-        let mut view = effective_permissions(&definition, None, node_id);
+        let mut view = effective_permissions(&definition, None, node_id, None);
         view["workflow_id"] = json!(workflow_id);
         view["version"] = json!(selected.version);
         Ok(view)
@@ -284,7 +289,7 @@ fn approval_item(run: &Run, node_id: &str, approval: &ApprovalState) -> Value {
     };
     let needs = if approval.request.specs.is_empty() && approval.gate == "node" {
         // G4 插件节点：卡片展示 manifest 需求（master 侧权威来源）。
-        crate::policy::plugin_needs_for_type(&approval.request.context.node_type)
+        crate::policy::plugin_needs_for_type(run, &approval.request.context.node_type)
             .map(|(_, needs, _)| needs.iter().map(|cap| cap.to_json()).collect::<Vec<_>>())
             .unwrap_or_default()
     } else {
@@ -414,7 +419,7 @@ fn decide(
     // G4 插件节点请求无 concrete spec（specs 为空 + 类型解析到已部署插件）：
     // 用 manifest 需求重跑包含评估，而不是空集拒绝。
     let plugin_recheck = (approval.request.specs.is_empty() && approval.gate == "node")
-        .then(|| crate::policy::plugin_needs_for_type(&approval.request.context.node_type))
+        .then(|| crate::policy::plugin_needs_for_type(run, &approval.request.context.node_type))
         .flatten();
     let evaluation = if let Some((plugin_id, needs, unrestricted)) = &plugin_recheck {
         crate::policy::check_plugin_needs(
@@ -533,6 +538,9 @@ pub fn effective_permissions(
     definition: &flow_engine::Definition,
     policy: Option<&flow_dto::permission::FrozenPolicy>,
     node_id: Option<&str>,
+    bindings: Option<
+        &std::collections::BTreeMap<String, flow_engine::journal_state::PluginBinding>,
+    >,
 ) -> Value {
     let frozen = policy
         .cloned()
@@ -601,7 +609,7 @@ pub fn effective_permissions(
             "allow": c.allow.iter().map(flow_dto::permission::Capability::to_json).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
         "diagnostics": definition.permission_diagnostics(),
-        "start_gate": crate::policy::start_gate(definition, &frozen.plugin_ceilings).err(),
+        "start_gate": crate::policy::start_gate(definition, &frozen.plugin_ceilings, bindings).err(),
     })
 }
 
@@ -609,7 +617,25 @@ impl JournalBackend {
     /// `plugins.list`：已部署插件 + 内容身份 + 授予状态（UI 授予页的
     /// 唯一数据源；未部署的内置插件不出现在这里）。
     pub async fn plugins_view(&self) -> Vec<Value> {
-        let snapshot = match tokio::task::spawn_blocking({ let defaults = self.plugin_defaults(); move || crate::plugin_registry::installed_snapshot_cached_with_defaults(&defaults) }).await {
+        let _catalog = self.plugin_catalog.read().await;
+        let defaults = self.plugin_defaults();
+        let (snapshot, draining) = match tokio::task::spawn_blocking(move || {
+            let snapshot = crate::plugin_registry::installed_snapshot_cached_with_defaults(&defaults);
+            let mut draining = std::collections::BTreeSet::new();
+            if let Some(root) = flow_config::plugin_fs::plugins_root() {
+                for row in &snapshot.rows {
+                    match crate::plugin_operation::is_draining(&root, &row.id) {
+                        Ok(false) => {}
+                        Ok(true) => { draining.insert(row.id.clone()); }
+                        Err(error) => {
+                            tracing::warn!(%error, plugin_id = %row.id, "cannot read plugin drain state");
+                            draining.insert(row.id.clone());
+                        }
+                    }
+                }
+            }
+            (snapshot, draining)
+        }).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 tracing::warn!(%error, "plugin scan worker failed");
@@ -634,6 +660,7 @@ impl JournalBackend {
             };
             let mut value = row.annotate(value);
             value["running"] = json!(running.contains(&row.id));
+            value["draining"] = json!(draining.contains(&row.id));
             value
         }).collect()
     }
@@ -663,7 +690,12 @@ impl JournalBackend {
         let defaults = self.plugin_defaults();
         let identity = tokio::task::spawn_blocking(move || {
             let snapshot = crate::plugin_registry::installed_snapshot_with_defaults(&defaults);
-            crate::plugin_registry::bundled_or_discovered_with_plugins(&selected_id, snapshot.rows.into_iter().filter_map(|row| row.plugin).collect())
+            let plugins: Vec<_> = snapshot
+                .rows
+                .into_iter()
+                .filter_map(|row| row.plugin)
+                .collect();
+            crate::plugin_registry::bundled_or_discovered_with_plugins(&selected_id, &plugins)
         }).await.map_err(|error| crate::journal::JournalError::Storage(error.to_string()))?;
         let Some(identity) = identity else {
             return Err(

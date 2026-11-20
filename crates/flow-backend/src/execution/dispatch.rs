@@ -1373,12 +1373,31 @@ impl DispatchRunner {
             .execution
             .as_ref()
             .and_then(|e| e.agent_plugin.as_ref().map(|p| p.id.clone()));
-        let child_ceilings = crate::policy::plugin_ceilings(
-            backend.as_ref(),
-            &definition,
-            agent_plugin_id.as_deref(),
-        )
-        .await;
+        // The root freezes the whole closure. Older journals retain their
+        // existing child-admission behavior and are protected by the catalog gate.
+        let inherited_bindings = run.execution.as_ref().and(run.plugin_bindings.as_ref());
+        let _catalog = if inherited_bindings.is_none() {
+            Some(backend.plugin_catalog.read().await)
+        } else {
+            None
+        };
+        let child_ceilings = if let Some(policy) = run
+            .policy
+            .as_ref()
+            .filter(|_| inherited_bindings.is_some())
+        {
+            policy.plugin_ceilings.clone()
+        } else {
+            let types = definition
+                .nodes
+                .iter()
+                .filter_map(flow_engine::Node::plugin_type)
+                .map(str::to_owned)
+                .collect();
+            crate::policy::freeze_plugins(backend.as_ref(), types, agent_plugin_id.as_deref())
+                .await?
+                .ceilings
+        };
         if run
             .execution
             .as_ref()
@@ -1388,7 +1407,7 @@ impl DispatchRunner {
                 .as_ref()
                 .is_some_and(|p| p.mode == flow_dto::permission::ExecutionMode::Bypass)
         {
-            crate::policy::start_gate(&definition, &child_ceilings)
+            crate::policy::start_gate(&definition, &child_ceilings, inherited_bindings)
                 .map_err(flow_journal::Error::Forbidden)?;
         }
         let child_policy = match &run.policy {
@@ -1432,6 +1451,7 @@ impl DispatchRunner {
         let node_id = self.attempt.node_id.clone();
         let dispatch_id = self.attempt.dispatch_id.clone();
         let workflow_id = workflow_id.to_string();
+        let inherited_bindings = inherited_bindings.cloned();
         backend
             .internal_for_run_with_value(&self.attempt.run_id, staged, move |state| {
                 let parent = &state.runs[&run_id];
@@ -1483,6 +1503,7 @@ impl DispatchRunner {
                     execution: parent.execution.clone().map(|mut e| { e.path.push(node_id.clone()); e }),
                     signals: parent.execution.clone().map(|mut e| { e.path.push(node_id.clone()); e.signal_inputs() }).unwrap_or_default(),
                     policy: Some(child_policy.clone()),
+                    plugin_bindings: inherited_bindings,
                     approvals: Vec::new(),
                     approval_seq: 0,
                 };
@@ -1931,15 +1952,7 @@ impl DispatchRunner {
             request_hash: String::new(),
         }
         .sealed();
-        let plugin_id = crate::policy::plugin_id_for_node(
-            &self.node,
-            run.execution.as_ref().and_then(|execution| {
-                execution
-                    .agent_plugin
-                    .as_ref()
-                    .map(|plugin| plugin.id.as_str())
-            }),
-        );
+        let plugin_id = crate::policy::plugin_id_for_node(&self.node, &run);
 
         let approval_ttl_ms = self.attempt.backend.approval_ttl_ms();
         fault::checkpoint("tool_auth_persist:before").await;
@@ -2422,7 +2435,7 @@ fn prepare_node_permission(
         .as_ref()
         .is_some_and(|policy| policy.mode == flow_dto::permission::ExecutionMode::Bypass);
     let (specs, needs) = if !bypass && node.kind().is_none() {
-        let needs = match crate::policy::plugin_needs_for_type(&node.node_type) {
+        let needs = match crate::policy::plugin_needs_for_type(run, &node.node_type) {
             Some((id, capabilities, unrestricted)) => {
                 let expected = run
                     .policy

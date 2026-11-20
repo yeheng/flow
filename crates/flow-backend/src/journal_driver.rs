@@ -714,14 +714,42 @@ async fn spawn_node_attempt(
 ) -> Result<()> {
     let dispatch = match port {
         ExecutionPort::Ipc(dispatcher) => NodeDispatch::Ipc(dispatcher.clone()),
-        ExecutionPort::Remote(dispatcher) => match dispatcher.reserve_node(run_id, node).await {
-            Ok(Some(reservation)) => NodeDispatch::Remote(dispatcher.clone(), reservation),
-            Ok(None) => {
-                backend.defer_run(run_id.to_owned()).await;
-                return Ok(());
+        ExecutionPort::Remote(dispatcher) => {
+            let binding = if let Some(node_type) = node.plugin_type() {
+                backend
+                    .inspect(|state| {
+                        let run = state.runs.get(run_id)?;
+                        // Replaying a stored outcome does not invoke the plugin.
+                        let recorded = run
+                            .execution
+                            .as_ref()
+                            .is_some_and(|snapshot| snapshot.regression.is_some())
+                            || run
+                                .nodes
+                                .get(&node.id)
+                                .and_then(|record| record.operation.as_ref()?.outcome.as_ref())
+                                .is_some();
+                        if recorded {
+                            return None;
+                        }
+                        run.plugin_bindings.as_ref()?.get(node_type).cloned()
+                    })
+                    .await
+            } else {
+                None
+            };
+            match dispatcher
+                .reserve_node(run_id, node, binding.as_ref())
+                .await
+            {
+                Ok(Some(reservation)) => NodeDispatch::Remote(dispatcher.clone(), reservation),
+                Ok(None) => {
+                    backend.defer_run(run_id.to_owned()).await;
+                    return Ok(());
+                }
+                Err(error) => NodeDispatch::Unavailable(error),
             }
-            Err(error) => NodeDispatch::Unavailable(error),
-        },
+        }
     };
     let attempt = match &dispatch {
         NodeDispatch::Remote(_, reservation) => {

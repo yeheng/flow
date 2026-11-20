@@ -64,6 +64,15 @@ pub(super) fn prepare(
         }
         node_value["_flow_execution"] = execution_value;
     }
+    if let Some(binding) = node
+        .plugin_type()
+        .and_then(|kind| run.plugin_bindings.as_ref()?.get(kind))
+    {
+        node_value["_flow_plugin"] = json!({
+            "id": binding.plugin_id,
+            "content_hash": binding.content_hash,
+        });
+    }
     Ok(ExecuteTask {
         run_id: attempt.run_id.clone(),
         node_id: attempt.node_id.clone(),

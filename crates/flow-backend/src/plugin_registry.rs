@@ -407,14 +407,14 @@ pub fn bundled_or_discovered_by_type(node_type: &str) -> Option<String> {
 /// （harness 嵌入 manifest / llm 嵌入 manifest + 入口二进制）兜底——两者
 /// 必须算出与执行器侧一致的哈希（manifest 字节 ‖ entry 字节）。
 pub fn bundled_or_discovered(plugin_id: &str) -> Option<PluginIdentity> {
-    bundled_or_discovered_with_plugins(plugin_id, discover_plugins())
+    bundled_or_discovered_with_plugins(plugin_id, &discover_plugins())
 }
 pub fn bundled_or_discovered_with_plugins(
     plugin_id: &str,
-    plugins: Vec<DiscoveredPlugin>,
+    plugins: &[DiscoveredPlugin],
 ) -> Option<PluginIdentity> {
     if let Some(found) = plugins
-        .into_iter()
+        .iter()
         .find(|plugin| plugin.manifest.plugin.id == plugin_id)
     {
         let legacy = matches!(
@@ -429,7 +429,7 @@ pub fn bundled_or_discovered_with_plugins(
         };
         return Some(PluginIdentity {
             plugin_id: plugin_id.to_string(),
-            content_hash: found.content_hash,
+            content_hash: found.content_hash.clone(),
             legacy,
             capabilities,
         });

@@ -773,13 +773,19 @@ impl TaskRunner {
         audit: &mut AuditStream,
         logger: flow_engine::NodeLogger,
     ) -> Result<ResultOutcome, TaskError> {
-        let Some(kind) = node.kind() else {
+        if node.plugin_type().is_some() {
             #[cfg(feature = "plugins")]
-            return self.plugin_node(node, prepared, audit, &logger).await;
+            return self
+                .execute_plugin_node(node, prepared, audit, &logger)
+                .await;
             #[cfg(not(feature = "plugins"))]
-            return Err(plugins_disabled(&node.node_type));
-        };
-        match kind {
+            return Err(plugins_disabled(if node.is_harness_agent() {
+                "harness agent"
+            } else {
+                &node.node_type
+            }));
+        }
+        match node.kind().expect("built-in node has a kind") {
             NodeType::Start => Ok(ResultOutcome::Success {
                 output: prepared.input.clone(),
                 branch: None,
@@ -791,7 +797,7 @@ impl TaskRunner {
                     branch: None,
                 })
             }
-            NodeType::Script | NodeType::Condition => {
+            kind @ (NodeType::Script | NodeType::Condition) => {
                 self.compute(node, kind, prepared, inputs, audit, logger)
                     .await
             }
@@ -799,20 +805,7 @@ impl TaskRunner {
                 self.http_node(node, kind, prepared, inputs, audit, &logger)
                     .await
             }
-            #[cfg(feature = "plugins")]
-            NodeType::Llm => self.llm_node(prepared, audit, &logger).await,
-            #[cfg(not(feature = "plugins"))]
-            NodeType::Llm => Err(plugins_disabled(&node.node_type)),
-            NodeType::Harness if self.node_is_agent_mode() => {
-                #[cfg(feature = "plugins")]
-                {
-                    self.agent_node(prepared, audit, &logger).await
-                }
-                #[cfg(not(feature = "plugins"))]
-                {
-                    Err(plugins_disabled("harness agent"))
-                }
-            }
+            NodeType::Llm => unreachable!("LLM is routed through the plugin host"),
             NodeType::Harness => self.command_node(prepared, audit, &logger).await,
             NodeType::Delay => {
                 let params = materialize_prepared_params(self, prepared).await?;
@@ -1432,6 +1425,8 @@ impl TaskRunner {
                 "external operations are disabled in regression".into(),
             ));
         }
+        #[cfg(feature = "plugins")]
+        self.verify_frozen_plugin().await?;
         let request_bytes = flow_facts::codec::bounded_json(&request, INPUT_BUDGET)?;
         // 指纹 = 请求字节摘要：授权与执行两侧对同一摘要，许可才对得上
         // 这一次具体的请求。

@@ -489,6 +489,12 @@ impl Node {
                 .is_some_and(|mode| mode.trim() == "agent")
     }
 
+    /// Node types that require a plugin host in the managed runtime.
+    pub fn plugin_type(&self) -> Option<&str> {
+        (self.kind().is_none() || self.kind() == Some(NodeType::Llm) || self.is_harness_agent())
+            .then_some(self.node_type.as_str())
+    }
+
     /// 读一个字符串参数；缺省或类型不符返回 `None`。
     pub fn param_str(&self, key: &str) -> Option<&str> {
         self.params.get(key).and_then(Value::as_str)

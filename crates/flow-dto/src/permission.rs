@@ -977,20 +977,26 @@ impl<'de> Deserialize<'de> for PluginCeiling {
             allow: Vec<Value>,
         }
         let wire = Wire::deserialize(deserializer)?;
-        let allow = wire
-            .allow
-            .iter()
-            .map(|value| {
-                parse_manifest_capability(value)
-                    .map_err(|error| serde::de::Error::custom(format!("plugin ceiling: {error}")))
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let allow = parse_plugin_capabilities(&wire.allow)
+            .map_err(|error| serde::de::Error::custom(format!("plugin ceiling: {error}")))?;
         Ok(Self {
             plugin_id: wire.plugin_id,
             content_hash: wire.content_hash,
             allow,
         })
     }
+}
+
+fn parse_plugin_capabilities(values: &[Value]) -> Result<Vec<Capability>, String> {
+    values.iter().map(parse_manifest_capability).collect()
+}
+
+/// Decode the manifest capability vocabulary in a persisted plugin snapshot.
+pub fn deserialize_plugin_capabilities<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<Capability>, D::Error> {
+    let values = Vec::<Value>::deserialize(deserializer)?;
+    parse_plugin_capabilities(&values).map_err(serde::de::Error::custom)
 }
 
 /// 子工作流的上限层：调用方（父 run 节点）的一个有效能力层。多层之间取

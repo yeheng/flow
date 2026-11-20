@@ -58,6 +58,76 @@ async fn reject(mut op: Operation, error: OperationError) -> Result<Value> {
 }
 
 impl JournalBackend {
+    async fn plugin_blockers(&self, plugin_id: &str) -> Result<Vec<String>> {
+        let (mut blockers, legacy) = self
+            .inspect_committed(|state| {
+                let mut blockers = Vec::new();
+                let mut legacy = Vec::new();
+                for run in state.runs.values().filter(|run| !run.terminal()) {
+                    match &run.plugin_bindings {
+                        Some(bindings)
+                            if bindings
+                                .values()
+                                .any(|binding| binding.plugin_id == plugin_id) =>
+                        {
+                            blockers.push(run.run_id.clone());
+                        }
+                        Some(_) if run.execution.is_some() => {}
+                        Some(_) => legacy.push(run.clone()),
+                        None => legacy.push(run.clone()),
+                    }
+                }
+                Ok((blockers, legacy))
+            })
+            .await
+            .map_err(|error| OperationError::Io(std::io::Error::other(error)))?;
+        for run in legacy {
+            let frozen_ceiling = run.policy.as_ref().is_some_and(|policy| {
+                policy
+                    .plugin_ceilings
+                    .iter()
+                    .any(|ceiling| ceiling.plugin_id == plugin_id)
+            });
+            if frozen_ceiling || self.legacy_run_uses_plugin(&run, plugin_id).await? {
+                blockers.push(run.run_id);
+            }
+        }
+        Ok(blockers)
+    }
+
+    async fn legacy_run_uses_plugin(
+        &self,
+        run: &flow_engine::journal_state::Run,
+        plugin_id: &str,
+    ) -> Result<bool> {
+        let mut definitions = vec![&run.definition];
+        if let Some(snapshot) = &run.execution {
+            definitions.extend(
+                snapshot
+                    .definitions
+                    .values()
+                    .map(|version| &version.definition),
+            );
+        }
+        for (index, stored) in definitions.into_iter().enumerate() {
+            let key = format!("plugin-drain:{}:{index}", run.run_id);
+            let definition = self
+                .cached_definition(&key, stored)
+                .await
+                .map_err(|error| OperationError::Io(std::io::Error::other(error)))?;
+            for node in &definition.nodes {
+                // Semantics 1 resolves children at execution time.
+                if (run.execution.is_none()
+                    && node.kind() == Some(flow_engine::NodeType::SubWorkflow))
+                    || crate::policy::plugin_id_for_node(node, run).as_deref() == Some(plugin_id)
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     pub async fn plugin_install(
         self: &Arc<Self>,
         source: String,
@@ -109,11 +179,13 @@ impl JournalBackend {
                 "service already running; stop before replace".into(),
             ));
         }
+        let catalog = self.plugin_catalog.write().await;
         let mut op = blocking(move || {
             Operation::reconcile_pending(&root, &id)?;
             Operation::begin(&root, "plugins.install", &request_id, &arguments, &id)
         })
         .await?;
+        drop(catalog);
         if let Some(result) = op.replay()? {
             return Ok(result);
         }
@@ -151,6 +223,34 @@ impl JournalBackend {
             )
             .await;
         }
+        let _catalog = self.plugin_catalog.write().await;
+        let (op, changes_bundle) = blocking(move || {
+            let mut op = op;
+            let _lease = RootLease::exclusive(op.root())?;
+            let changes_bundle = attempt(&mut op, |op| {
+                validate_target(op)?;
+                let old = op.target_identity()?;
+                let new_digest = op
+                    .receipt
+                    .new_identity
+                    .as_ref()
+                    .map(|identity| &identity.bundle_digest);
+                Ok(
+                    old.as_ref().map(|identity| &identity.bundle_digest) != new_digest
+                        && (old.is_none() || replace),
+                )
+            })?;
+            Ok((op, changes_bundle))
+        })
+        .await?;
+        let plugin_id = op.receipt.plugin_id.clone();
+        if changes_bundle {
+            let blockers = self.plugin_blockers(&plugin_id).await?;
+            if !blockers.is_empty() {
+                return drain(op, blockers).await;
+            }
+        }
+        let mut op = op;
         let defaults = self.plugin_defaults();
         let grants = self.inspect(|state| state.plugin_grants.clone()).await;
         blocking(move || {
@@ -227,6 +327,9 @@ impl JournalBackend {
                     return Err(OperationError::Conflict("plugin already installed".into()));
                 }
                 let result = install_result(&bundle, grant_state, old.is_some() && !same, same);
+                if !same || crate::plugin_operation::is_draining(op.root(), &op.receipt.plugin_id)? {
+                    op.record_drain(old.as_ref())?;
+                }
                 let result = if same {
                     op.complete_unchanged(result)?
                 } else {
@@ -234,6 +337,9 @@ impl JournalBackend {
                     op.recover()?
                 };
                 cleanup(&op)?;
+                if let Err(error) = op.clear_draining() {
+                    tracing::warn!(%error, plugin_id = %op.receipt.plugin_id, "could not clear plugin drain marker");
+                }
                 Ok(result)
             })
         })
@@ -279,6 +385,7 @@ impl JournalBackend {
             return Ok(result);
         }
         let _reservation = self.reserve_plugin_operation(&id).map_err(reservation)?;
+        let _catalog = self.plugin_catalog.write().await;
         let mut op = blocking(move || {
             Operation::reconcile_pending(&root, &id)?;
             Operation::begin(&root, "plugins.uninstall", &request_id, &arguments, &id)
@@ -297,12 +404,22 @@ impl JournalBackend {
             })
             .await;
         }
-        op = blocking(move || {
+        let (prepared, installed) = blocking(move || {
             let _lease = RootLease::shared(op.root())?;
-            attempt(&mut op, |op| validate_target(op))?;
-            Ok(op)
+            let installed = attempt(&mut op, |op| {
+                validate_target(op)?;
+                Ok(op.live().try_exists()?)
+            })?;
+            Ok((op, installed))
         })
         .await?;
+        op = prepared;
+        if installed {
+            let blockers = self.plugin_blockers(&op.receipt.plugin_id).await?;
+            if !blockers.is_empty() {
+                return drain(op, blockers).await;
+            }
+        }
         let running = self
             .services
             .lock()
@@ -343,17 +460,34 @@ impl JournalBackend {
                 "in_flight_runs_unaffected":true,"executor_reload_required":old.is_some() && reload,
                 "grants_retained":true,"trash":old.as_ref().map(|_| op.trash())});
                 let result = if let Some(old) = old {
+                    op.record_drain(Some(&old))?;
                     op.remove_intent(old, result)?;
                     op.recover()?
                 } else {
                     op.complete_unchanged(result)?
                 };
                 cleanup(&op)?;
+                if let Err(error) = op.clear_draining() {
+                    tracing::warn!(%error, plugin_id = %op.receipt.plugin_id, "could not clear plugin drain marker");
+                }
                 Ok(result)
             })
         })
         .await
     }
+}
+
+async fn drain(mut op: Operation, run_ids: Vec<String>) -> Result<Value> {
+    blocking(move || {
+        op.mark_draining()?;
+        let error = OperationError::Conflict(format!(
+            "plugin is draining; active runs: {}",
+            run_ids.join(", ")
+        ));
+        op.reject(&error)?;
+        Err(error)
+    })
+    .await
 }
 
 fn install_result(

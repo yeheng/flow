@@ -1110,7 +1110,8 @@ impl JournalBackend {
         if let Some(receipt) = deduped(self, &scope, request_id, &request).await? {
             return Ok(receipt);
         }
-        let (selected, frozen_definition, mut execution) =
+        let _plugin_catalog = self.plugin_catalog.read().await;
+        let (selected, frozen_definition, mut execution, plugin_types) =
             self.freeze_execution(workflow_id, version).await?;
         if let Some(environment_id) = environment_id.filter(|id| *id != "default") {
             let store = self
@@ -1210,14 +1211,25 @@ impl JournalBackend {
         let regression_run = execution
             .as_ref()
             .is_some_and(|snapshot| snapshot.regression.is_some());
-        let agent_plugin_id = self.harness_agent_plugin_meta().map(|meta| meta.id);
-        let plugin_ceilings =
-            crate::policy::plugin_ceilings(self, &definition, agent_plugin_id.as_deref()).await;
+        let agent_plugin_id = execution
+            .as_ref()
+            .and_then(|snapshot| snapshot.agent_plugin.as_ref())
+            .map(|plugin| plugin.id.as_str());
+        let plugins = crate::policy::freeze_plugins(self, plugin_types, agent_plugin_id).await?;
         if !regression_run {
-            crate::policy::start_gate(&definition, &plugin_ceilings)
+            if let Some(plugin_id) = plugins.draining.first() {
+                return Err(flow_journal::Error::Conflict(format!(
+                    "plugin {plugin_id} is draining"
+                ))
+                .into());
+            }
+            crate::policy::start_gate(&definition, &plugins.ceilings, Some(&plugins.bindings))
                 .map_err(flow_journal::Error::Forbidden)?;
         }
-        let policy = crate::policy::freeze_root(&definition, plugin_ceilings);
+        if let Some(snapshot) = &mut execution {
+            snapshot.plugins = plugins.projections;
+        }
+        let policy = crate::policy::freeze_root(&definition, plugins.ceilings);
         let validate = |state: &State| {
             if matches!(source, "schedule" | "webhook") {
                 let key = source_detail.ok_or_else(|| invalid("trigger identity required"))?;
@@ -1320,6 +1332,7 @@ impl JournalBackend {
                     .unwrap_or_default(),
                 execution,
                 policy: Some(policy.clone()),
+                plugin_bindings: Some(plugins.bindings),
                 approvals: Vec::new(),
                 approval_seq: 0,
             };

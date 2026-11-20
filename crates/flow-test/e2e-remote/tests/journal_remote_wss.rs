@@ -79,6 +79,17 @@ fn spawn_agent_wss_with_executor(
     token: &str,
     executor: Option<&std::path::Path>,
 ) -> AgentProcess {
+    spawn_agent_wss_with_plugin(port, agent_id, slots, token, executor, None)
+}
+
+fn spawn_agent_wss_with_plugin(
+    port: u16,
+    agent_id: &str,
+    slots: u32,
+    token: &str,
+    executor: Option<&std::path::Path>,
+    model_plugin: Option<&std::path::Path>,
+) -> AgentProcess {
     let mut command = std::process::Command::new(flow_test_support::io::agent_bin());
     command
         .args([
@@ -95,11 +106,115 @@ fn spawn_agent_wss_with_executor(
     if let Some(executor) = executor {
         command.arg("--executor-bin").arg(executor);
     }
+    if let Some(plugin) = model_plugin {
+        command.env("FLOW_LLM_PLUGIN_BIN", plugin).env(
+            "FLOW_PLUGINS_DIR",
+            plugin.parent().unwrap().join("empty-plugins"),
+        );
+    }
     let mut child = command.spawn().expect("spawn flow-agent (wss)");
     AgentProcess {
         stderr: child.stderr.take(),
         child,
     }
+}
+
+#[tokio::test]
+async fn wss_routes_the_exact_frozen_plugin_content() {
+    use flow_backend::execution::remote::{AgentCredential, AgentManager};
+    use flow_test_support::fixtures::StubHttp;
+
+    let root = tempfile::tempdir().unwrap();
+    let backend = JournalBackend::open(root.path(), JournalOptions::default())
+        .await
+        .unwrap();
+    let manager = AgentManager::new(backend.clone(), backend.journal.id().into(), 1);
+    backend
+        .start_execution_remote_manager(manager.clone(), plain_remote_options())
+        .await
+        .unwrap();
+    let port = free_ports(1)[0];
+    manager
+        .listen_wss(
+            format!("127.0.0.1:{port}"),
+            vec![
+                AgentCredential {
+                    id: "a-wrong".into(),
+                    token: "wrong-content".into(),
+                },
+                AgentCredential {
+                    id: "z-exact".into(),
+                    token: "exact-content".into(),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    let wrong_plugin = root.path().join("wrong-plugin");
+    std::fs::create_dir(root.path().join("empty-plugins")).unwrap();
+    std::fs::write(&wrong_plugin, b"different model plugin").unwrap();
+    let _wrong = spawn_agent_wss_with_plugin(
+        port,
+        "a-wrong",
+        1,
+        "wrong-content",
+        None,
+        Some(&wrong_plugin),
+    );
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let model = StubHttp::fixed(200, json!({"choices":[{"message":{"content":"exact"}}]})).await;
+    let workflow = install(
+        &backend,
+        json!({
+            "permissions":{"version":1,"mode":"bypass","allow":[]},
+            "nodes":[{"id":"s","type":"start"},
+                {"id":"model","type":"llm","params":{"url":model.url("/model"),
+                    "body":{"model":"fixture","messages":[{"role":"user","content":"hello"}]}}},
+                {"id":"e","type":"end"}],
+            "edges":[{"from":"s","to":"model"},{"from":"model","to":"e"}]
+        }),
+    )
+    .await;
+    let run_model = || async {
+        let receipt = backend
+            .run_start(&workflow, None, Value::Null, "manual", None, None)
+            .await
+            .unwrap();
+        until(
+            &backend,
+            receipt.result["run_id"].as_str().unwrap(),
+            Run::terminal,
+        )
+        .await
+    };
+    let failed = run_model().await;
+    let node = &failed.nodes["model"];
+    assert!(
+        node.error
+            .as_deref()
+            .is_some_and(|error| error.contains("no agent with plugin llm")),
+        "status={:?}, node_error={:?}, run_error={:?}",
+        failed.status,
+        node.error,
+        failed.error
+    );
+    assert!(node.prepared.is_none());
+    assert!(model.requests().is_empty());
+
+    let _exact = spawn_agent_wss(port, "z-exact", 1, "exact-content");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let done = run_model().await;
+    assert_eq!(
+        done.status,
+        RunStatus::Succeeded,
+        "{:?}",
+        done.nodes["model"].error
+    );
+    assert_eq!(model.requests().len(), 1);
+
+    manager.shutdown().await;
+    backend.close().await.unwrap();
 }
 
 async fn install(b: &JournalBackend, definition: Value) -> String {

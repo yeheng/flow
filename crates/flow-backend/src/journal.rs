@@ -105,6 +105,8 @@ pub struct JournalBackend {
     pub(crate) plugin_executor_program: std::sync::RwLock<Option<std::path::PathBuf>>,
     pub plugin_ops: std::sync::Mutex<std::collections::BTreeSet<String>>,
     plugin_ops_changed: Notify,
+    /// Serialize managed plugin publication with the snapshot and commit of new runs.
+    pub(crate) plugin_catalog: RwLock<()>,
     pub(crate) environment_metadata: RwLock<()>,
     pub environments: std::sync::OnceLock<Arc<flow_engine::environments::EnvironmentStore>>,
     pub store: Arc<Store>,
@@ -391,6 +393,7 @@ impl JournalBackend {
             plugin_executor_program: std::sync::RwLock::new(None),
             plugin_ops: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             plugin_ops_changed: Notify::new(),
+            plugin_catalog: RwLock::default(),
             service_ui: tokio::sync::Mutex::new(Default::default()),
             environments: std::sync::OnceLock::new(),
             environment_metadata: RwLock::new(()),

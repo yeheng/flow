@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use flow_config::plugin_manifest;
+use flow_engine::plugin_inventory::PluginInventory;
 use flow_plugin_catalog::{content_hash_path, read_manifest, BUNDLED_ROUTES};
 
 /// 注册来源。
@@ -29,8 +30,7 @@ pub struct RegisteredPlugin {
     pub binary: PathBuf,
     /// plugin-proto 协议版本（快筛值；握手权威）。
     pub protocol: u32,
-    /// 内容身份（I35）：sha256(manifest 字节 ‖ entry 字节)。内置默认注册
-    /// 无 manifest，为空串（内置节点不走 plugin_node 授权链）。
+    /// Content identity of the installed or embedded manifest and its entry.
     pub content_hash: String,
     /// UI 投影（未来 run 快照冻结物；R1 先解析携带）。
     pub ui: Option<plugin_manifest::UiProjection>,
@@ -40,13 +40,19 @@ pub struct RegisteredPlugin {
 
 impl RegisteredPlugin {
     /// I35：spawn 前复核内容哈希（注册后二进制/manifest 被换掉 → 拒绝）。
-    /// 内置默认注册（无 manifest）不参与复核。
     pub fn recheck_content_hash(&self) -> Result<(), String> {
-        let RegistrationSource::Manifest(manifest_path) = &self.source else {
-            return Ok(());
+        let manifest_bytes = match &self.source {
+            RegistrationSource::Manifest(path) => {
+                read_manifest(path).map_err(|e| format!("manifest 不可读：{e}"))?
+            }
+            RegistrationSource::Default => BUNDLED_ROUTES
+                .iter()
+                .find(|route| route.plugin_id == self.plugin_id)
+                .ok_or_else(|| format!("unknown bundled plugin {}", self.plugin_id))?
+                .manifest
+                .as_bytes()
+                .to_vec(),
         };
-        let manifest_bytes =
-            read_manifest(manifest_path).map_err(|e| format!("manifest 不可读：{e}"))?;
         let current = content_hash_path(&manifest_bytes, &self.binary)
             .map_err(|e| format!("入口不可读：{e}"))?;
         if current != self.content_hash {
@@ -82,6 +88,13 @@ impl PluginRegistry {
             if let Some(binary) =
                 route.binary(executor.as_deref(), std::env::var_os(route.binary_env))
             {
+                let content_hash = match content_hash_path(route.manifest.as_bytes(), &binary) {
+                    Ok(hash) => hash,
+                    Err(error) => {
+                        tracing::warn!(plugin = route.plugin_id, %error, "bundled plugin unreadable");
+                        continue;
+                    }
+                };
                 registry.register(
                     route.node_type,
                     RegisteredPlugin {
@@ -90,7 +103,7 @@ impl PluginRegistry {
                         invoke_method: route.invoke.into(),
                         binary,
                         protocol: flow_plugin_sdk::protocol::PROTOCOL_VERSION,
-                        content_hash: String::new(),
+                        content_hash,
                         ui: None,
                         source: RegistrationSource::Default,
                     },
@@ -114,6 +127,19 @@ impl PluginRegistry {
     /// 节点类型路由查询。
     pub fn resolve(&self, node_type: &str) -> Option<&RegisteredPlugin> {
         self.by_node_type.get(node_type)
+    }
+
+    pub(crate) fn inventory(&self) -> PluginInventory {
+        let mut inventory = PluginInventory::default();
+        let mut entries: Vec<_> = self.by_node_type.iter().collect();
+        entries.sort_unstable_by_key(|(node_type, _)| *node_type);
+        for (node_type, plugin) in entries {
+            if let Err(error) = inventory.insert(node_type, &plugin.plugin_id, &plugin.content_hash)
+            {
+                tracing::warn!(%node_type, %error, "plugin unavailable for inventory-based routing");
+            }
+        }
+        inventory
     }
 
     /// 已注册的节点类型数（诊断）。

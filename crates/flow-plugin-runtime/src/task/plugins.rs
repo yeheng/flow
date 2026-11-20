@@ -36,6 +36,42 @@ impl ToolReplySlot {
 }
 
 impl TaskRunner {
+    pub(super) async fn execute_plugin_node(
+        &mut self,
+        node: &Node,
+        prepared: &Prepared,
+        audit: &mut AuditStream,
+        logger: &flow_engine::NodeLogger,
+    ) -> Result<ResultOutcome, TaskError> {
+        match node.kind() {
+            Some(NodeType::Llm) => self.llm_node(prepared, audit, logger).await,
+            Some(NodeType::Harness) => self.agent_node(prepared, audit, logger).await,
+            _ => self.plugin_node(node, prepared, audit, logger).await,
+        }
+    }
+
+    pub(super) async fn verify_frozen_plugin(&self) -> Result<(), TaskError> {
+        let Some(binding) = self.task.node.get("_flow_plugin") else {
+            return Ok(());
+        };
+        let node_type = self.task.node["type"].as_str().unwrap_or_default();
+        let plugin = self.plugins.resolve(node_type).ok_or_else(|| {
+            TaskError::Business(format!("plugin for node type {node_type} is not installed"))
+        })?;
+        if binding["id"].as_str() != Some(plugin.plugin_id.as_str())
+            || binding["content_hash"].as_str() != Some(plugin.content_hash.as_str())
+        {
+            return Err(TaskError::Business(format!(
+                "plugin identity changed for node type {node_type}"
+            )));
+        }
+        let plugin = plugin.clone();
+        tokio::task::spawn_blocking(move || plugin.recheck_content_hash())
+            .await
+            .map_err(|error| TaskError::Business(error.to_string()))?
+            .map_err(TaskError::Business)
+    }
+
     /// llm 插件会话错误 → TaskError：Setup（环境）按 Invalid——但授权已
     /// 提交，许可已落 journal，环境失败同样意味着「副作用状态未知」，统一
     /// Uncertain 是保守正确的方向。

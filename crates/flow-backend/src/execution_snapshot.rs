@@ -1,14 +1,22 @@
 use crate::journal::{JournalBackend, JournalError};
 use flow_engine::journal_state::ExecutionSnapshot;
 use flow_journal::{Error, StoredValue};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 impl JournalBackend {
     pub(crate) async fn freeze_execution(
         &self,
         workflow: &str,
         version: Option<u64>,
-    ) -> Result<(u64, StoredValue, Option<ExecutionSnapshot>), JournalError> {
+    ) -> Result<
+        (
+            u64,
+            StoredValue,
+            Option<ExecutionSnapshot>,
+            BTreeSet<String>,
+        ),
+        JournalError,
+    > {
         let _metadata = self.workflow_metadata.read().await;
         let root = self.published_definition(workflow, version).await?;
         let selected = root.version;
@@ -16,6 +24,7 @@ impl JournalBackend {
         let mut definitions = BTreeMap::from([(root_key.clone(), root.clone())]);
         let mut bindings = BTreeMap::new();
         let mut todo = vec![root_key.clone()];
+        let mut plugin_types = BTreeSet::new();
         while let Some(key) = todo.pop() {
             let version = &definitions[&key];
             let def = self
@@ -24,8 +33,14 @@ impl JournalBackend {
                     &version.definition,
                 )
                 .await?;
+            plugin_types.extend(
+                def.nodes
+                    .iter()
+                    .filter_map(flow_engine::Node::plugin_type)
+                    .map(str::to_owned),
+            );
             if key == root_key && def.semantics == 1 {
-                return Ok((selected, root.definition, None));
+                return Ok((selected, root.definition, None, plugin_types));
             }
             for node in &def.nodes {
                 if node.kind() != Some(flow_engine::NodeType::SubWorkflow) {
@@ -69,22 +84,6 @@ impl JournalBackend {
                 }
             }
         }
-        // 冻结投影要看得见节点类型：root.definition 可能是 Ref（值在外部
-        // 存储），直接序列化只有引用没有 nodes——用物化缓存的定义。
-        let root_materialized = self
-            .cached_definition(
-                &format!("dependency:{root_key}:{}", root.checksum),
-                &root.definition,
-            )
-            .await?;
-        let defaults = self.plugin_defaults();
-        let definition_plugins = tokio::task::spawn_blocking(move || {
-            let snapshot = crate::plugin_registry::installed_snapshot_with_defaults(&defaults);
-            crate::plugin_registry::plugins_for_definition_with_plugins(
-                &serde_json::to_value(&root_materialized).unwrap_or(serde_json::Value::Null),
-                snapshot.rows.into_iter().filter_map(|row| row.plugin).collect(),
-            )
-        }).await.map_err(|error| JournalError::Storage(error.to_string()))?;
         Ok((
             selected,
             root.definition,
@@ -108,8 +107,9 @@ impl JournalBackend {
                         content_hash: meta.content_hash,
                     }
                 }),
-                plugins: definition_plugins,
+                plugins: Vec::new(),
             }),
+            plugin_types,
         ))
     }
 

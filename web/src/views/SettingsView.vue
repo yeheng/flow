@@ -121,6 +121,7 @@ async function runPluginMutation(): Promise<void> {
       toast.info("节点插件变更需要重启执行器后生效；在飞运行不受影响");
   } catch (error) {
     pluginMutationError.value = errText(error);
+    await loadPlugins();
   } finally {
     pluginBusy.value = false;
   }
@@ -719,7 +720,7 @@ async function onDeleteSecret(name: string): Promise<void> {
                   : p.load_state === "conflict"
                     ? "冲突"
                     : "已加载"
-              }}{{ p.running ? " · 运行中" : "" }}
+              }}{{ p.running ? " · 运行中" : "" }}{{ p.draining ? " · 排空中" : "" }}
               <div v-if="p.load_error">{{ p.load_error }}</div>
               <div v-if="p.grant_state">授予：{{ p.grant_state }}</div>
               <div v-if="p.entry_contained === false">入口位于插件目录外</div>

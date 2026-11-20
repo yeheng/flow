@@ -47,7 +47,9 @@ flow journal plugins uninstall resident-echo --stop-first
 
 `plugins.list` 会保留 `broken` / `conflict` 行并展示原因；重复 ID 的全部副本都不能路由或 start。列表同时展示运行状态及旧树入口的目录外路径、符号链接、超大文件注解。这些旧树注解不会单独禁止加载。新安装拒绝符号链接和特殊文件，限制清单与 Web UI 各 256 KiB、单文件 256 MiB、包总大小 512 MiB、文件数 4096、扫描行数 64。
 
-加载表示清单可路由；`recheck` 检查现有定义与当前动态类型/表单是否一致；`services.start` 才启动常驻进程。节点执行器在启动时冻结注册表，节点插件变更需要重启执行器。安装/卸载响应里的 `executor_reload_required` 只是本次提示，列表不跟踪执行器代际。已经运行的节点不被卸载取消；运行中的 Web UI 使用 start 时的 HTML 副本。
+加载表示清单可路由。`recheck` 检查现有定义与当前动态类型和表单是否一致。`services.start` 启动常驻进程。节点执行器在启动时读取注册表，节点插件更新后需要轮换执行器。安装和卸载响应通过 `executor_reload_required` 提示这次变更，列表仍按主控目录显示状态。
+
+替换或卸载节点插件时，如果活动 Run 的冻结依赖包含该插件，管理操作会返回阻塞的 Run ID，并把当前插件代际标为排空中。`plugins.list` 返回 `draining`。等待这些 Run 结束或通过已有 Run 取消入口终止后，使用新请求 ID 重试变更。排空状态跨主控重启保留。重新提交同一份已安装包可取消排空。新 Run 的接纳检查覆盖尚未创建的子流程。远程主机上的插件包也需要由运维保持可用，直到对应 Run 收尾。
 
 卸载不撤销 journal 授予，同内容重装可继续匹配旧授予。I35 身份仍是 `sha256(manifest || entry)`；整包 `bundle_digest` 额外包含 UI、路径和执行权限，用于发布及恢复，不参与授予。
 

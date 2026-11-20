@@ -615,6 +615,68 @@ pub fn validate_id(id: &str) -> Result<()> {
     }
     Ok(())
 }
+
+#[derive(Serialize, Deserialize)]
+struct DrainMarker {
+    generation: Option<String>,
+    operation: String,
+}
+
+/// Fence new runs until publication is durable, including across a restart in
+/// the middle of renaming the live directory.
+pub(crate) fn is_draining(root: &Path, id: &str) -> Result<bool> {
+    validate_id(id)?;
+    let bytes = match fs::read(root.join(".draining").join(id)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let marker: DrainMarker = serde_json::from_slice(&bytes)?;
+    if marker.operation.len() != 64 || !marker.operation.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(OperationError::Invalid("invalid plugin drain receipt".into()));
+    }
+    let receipt: Receipt = serde_json::from_slice(&fs::read(root.join(".ops").join(marker.operation))?)?;
+    if receipt.plugin_id != id {
+        return Err(OperationError::Invalid("plugin drain receipt belongs to another plugin".into()));
+    }
+    if receipt.phase == Phase::Completed && receipt.result.is_some() {
+        return Ok(false);
+    }
+    let current = match fs::read(root.join(id).join(MARKER)) {
+        Ok(bytes) => Some(serde_json::from_slice::<Identity>(&bytes)?.generation),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    Ok(current.is_none() || marker.generation == current)
+}
+
+impl Operation {
+    pub(crate) fn mark_draining(&self) -> Result<()> {
+        let _lease = flow_config::plugin_fs::RootLease::exclusive(self.root())?;
+        self.record_drain(self.target_identity()?.as_ref())
+    }
+
+    /// Hold the exclusive publication lease when recording a drain.
+    pub(crate) fn record_drain(&self, target: Option<&Identity>) -> Result<()> {
+        let directory = self.root().join(".draining");
+        create_durable_root(&directory)?;
+        let marker = DrainMarker {
+            generation: target.map(|identity| identity.generation.clone()),
+            operation: self.key.clone(),
+        };
+        atomic_json(&directory.join(&self.receipt.plugin_id), &marker)
+    }
+
+    pub(crate) fn clear_draining(&self) -> Result<()> {
+        let directory = self.root().join(".draining");
+        match fs::remove_file(directory.join(&self.receipt.plugin_id)) {
+            Ok(()) => Ok(plugin_bundle::sync_dir(&directory)?),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
 fn identity(path: &Path, create: bool) -> Result<Option<Identity>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,

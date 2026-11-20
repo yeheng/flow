@@ -8,9 +8,11 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
+use flow_engine::plugin_inventory::PluginInventory;
 use flow_engine::execution_protocol::bootstrap::spawn_executor_transport;
 use flow_engine::execution_protocol::contract::{
-    ExecutorInvocation, WorkerProfile, DRAIN_GRACE_MS, HEARTBEAT_TIMEOUT_MS, STARTUP_TIMEOUT_MS,
+    ExecutorInvocation, WorkerProfile, DRAIN_GRACE_MS, HEARTBEAT_TIMEOUT_MS,
+    STARTUP_TIMEOUT_MS,
 };
 use flow_engine::execution_protocol::message::Message;
 use flow_engine::execution_protocol::transport::{master_handshake, ExecutorHello, FrameTransport};
@@ -73,9 +75,9 @@ async fn kill_and_reap(mut child: flow_engine::process::ManagedChild) {
 }
 
 /// Probe with the normal local IPC handshake and reap the process without sending work.
-pub(crate) async fn probe_worker_profile(
+pub(crate) async fn probe_worker(
     executor: &ExecutorInvocation,
-) -> Result<WorkerProfile, PoolError> {
+) -> Result<(WorkerProfile, Option<PluginInventory>), PoolError> {
     let (transport, child, hello) = start_worker(
         executor,
         "profile-probe",
@@ -87,8 +89,11 @@ pub(crate) async fn probe_worker_profile(
     .await?;
     drop(transport);
     kill_and_reap(child).await;
-    WorkerProfile::from_capabilities(&hello.capabilities)
-        .map_err(|error| PoolError::Bind(error.into()))
+    let profile = WorkerProfile::from_capabilities(&hello.capabilities)
+        .map_err(|error| PoolError::Bind(error.into()))?;
+    let inventory = PluginInventory::from_capabilities(&hello.capabilities)
+        .map_err(|error| PoolError::Bind(error.into()))?;
+    Ok((profile, inventory))
 }
 
 async fn start_worker(

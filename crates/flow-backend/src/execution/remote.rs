@@ -36,8 +36,10 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Mutex, Notify, Semaphore};
 use tokio_rustls::TlsAcceptor;
 
+use flow_engine::plugin_inventory::PluginInventory;
 use flow_engine::execution_protocol::contract::{
-    bounded_control_text, WorkerProfile, A_MAX, PROTOCOL_VERSION, STARTUP_TIMEOUT_MS, W_BYTES,
+    bounded_control_text, WorkerProfile, A_MAX, PROTOCOL_VERSION,
+    STARTUP_TIMEOUT_MS, W_BYTES,
 };
 use flow_engine::execution_protocol::message::Message;
 use flow_engine::execution_protocol::remote::{
@@ -276,6 +278,7 @@ struct AgentRegistration {
     /// agent 标识。
     agent_id: String,
     worker_profile: WorkerProfile,
+    inventory: Option<PluginInventory>,
     /// 本次上联会话标识（重连会换新值，旧会话因此可被识别为过期）。
     link_session_id: String,
     /// 派发方 → agent 的命令通道。
@@ -563,7 +566,8 @@ impl AgentManager {
         self: &Arc<Self>,
         transport: &mut FrameTransport,
         agent_id: &str,
-    ) -> std::result::Result<(String, u32, String, WorkerProfile), String> {
+    ) -> std::result::Result<(String, u32, String, WorkerProfile, Option<PluginInventory>), String>
+    {
         let message = tokio::time::timeout(
             Duration::from_millis(STARTUP_TIMEOUT_MS * 2),
             transport.recv(),
@@ -603,6 +607,7 @@ impl AgentManager {
             return Err("invalid agent identity".into());
         }
         let worker_profile = WorkerProfile::from_capabilities(&capabilities)?;
+        let inventory = PluginInventory::from_capabilities(&capabilities)?;
         let link_session_id = format!(
             "link-{}",
             self.session_counter.fetch_add(1, Ordering::Relaxed)
@@ -619,7 +624,13 @@ impl AgentManager {
             })
             .await
             .map_err(|e| format!("write welcome: {e}"))?;
-        Ok((agent_boot_id, slots, link_session_id, worker_profile))
+        Ok((
+            agent_boot_id,
+            slots,
+            link_session_id,
+            worker_profile,
+            inventory,
+        ))
     }
 
     /// 单个 agent 会话（T02）：握手与业务帧共用同一条 transport
@@ -636,7 +647,7 @@ impl AgentManager {
         // AgentWelcome。不再用临时 decoder 取首帧后丢弃——同一次 read 里
         // Hello 之后的尾随帧不会在交接时丢失。
         let mut transport = FrameTransport::spawn(stream, 128);
-        let (agent_boot_id, slots, link_session_id, worker_profile) = tokio::select! {
+        let (agent_boot_id, slots, link_session_id, worker_profile, inventory) = tokio::select! {
             _ = self.shutdown.cancelled() => return Ok(()),
             result = tokio::time::timeout(Duration::from_millis(STARTUP_TIMEOUT_MS), self.session_handshake(&mut transport, &agent_id)) =>
                 result.map_err(|_| "agent handshake deadline exceeded".to_string())??,
@@ -648,6 +659,7 @@ impl AgentManager {
         let registration = Arc::new(AgentRegistration {
             agent_id: agent_id.clone(),
             worker_profile,
+            inventory,
             link_session_id: link_session_id.clone(),
             outbound: outbound.clone(),
             slots_total: AtomicU64::new(slots as u64),
@@ -1198,22 +1210,45 @@ impl AgentManager {
         run_id: &str,
         node_id: &str,
         requires_plugins: bool,
+        plugin: Option<(&str, &flow_engine::journal_state::PluginBinding)>,
     ) -> Result<Option<RemoteReservation>> {
         let agents = self.agents.lock().await;
         if agents.is_empty() {
             return Err(invalid("no agent connected"));
         }
         let mut bindings = self.bindings.lock().await;
-        let compatible_rank =
-            |agent: &AgentRegistration| match (requires_plugins, agent.worker_profile) {
+        let has_inventory = agents.values().any(|agent| agent.inventory.is_some());
+        let compatible_rank = |agent: &AgentRegistration| {
+            if let Some((node_type, binding)) = plugin {
+                if agent.worker_profile == WorkerProfile::Builtins {
+                    return None;
+                }
+                if let Some(inventory) = &agent.inventory {
+                    return inventory
+                        .matches(node_type, &binding.plugin_id, &binding.content_hash)
+                        .then_some(0);
+                }
+                // Preserve existing routing for deployments made up of old peers.
+                if has_inventory {
+                    return None;
+                }
+            }
+            match (requires_plugins, agent.worker_profile) {
                 (true, WorkerProfile::Builtins) => None,
                 (true, WorkerProfile::Plugins) | (false, WorkerProfile::Builtins) => Some(0),
                 _ => Some(1),
-            };
+            }
+        };
         if !agents
             .values()
             .any(|agent| compatible_rank(agent).is_some())
         {
+            if let Some((node_type, binding)) = plugin.filter(|_| has_inventory) {
+                return Err(invalid(format!(
+                    "no agent with plugin {} ({}) for node type {node_type}",
+                    binding.plugin_id, binding.content_hash
+                )));
+            }
             return Err(invalid("no plugin-capable agent connected"));
         }
         if bindings.len() >= A_MAX {
@@ -1513,12 +1548,16 @@ impl RemoteDispatcher {
         &self,
         run_id: &str,
         node: &flow_engine::Node,
+        binding: Option<&flow_engine::journal_state::PluginBinding>,
     ) -> Result<Option<RemoteReservation>> {
-        let requires_plugins = node.kind().is_none()
-            || node.kind() == Some(flow_engine::NodeType::Llm)
-            || node.is_harness_agent();
+        let plugin_type = node.plugin_type();
         self.manager
-            .reserve(run_id, &node.id, requires_plugins)
+            .reserve(
+                run_id,
+                &node.id,
+                plugin_type.is_some(),
+                plugin_type.zip(binding),
+            )
             .await
     }
 
@@ -1694,6 +1733,7 @@ mod capacity_tests {
             Arc::new(AgentRegistration {
                 agent_id: "agent".into(),
                 worker_profile: WorkerProfile::Legacy,
+                inventory: None,
                 link_session_id: session.into(),
                 outbound: outbound.clone(),
                 slots_total: AtomicU64::new(1),
@@ -1707,7 +1747,7 @@ mod capacity_tests {
             .await
             .insert("agent".into(), register("old"));
         let first = manager
-            .reserve("run", "first", false)
+            .reserve("run", "first", false, None)
             .await
             .unwrap()
             .unwrap();
@@ -1717,14 +1757,14 @@ mod capacity_tests {
             .await
             .insert("agent".into(), register("new"));
         assert!(manager
-            .reserve("run", "second", false)
+            .reserve("run", "second", false, None)
             .await
             .unwrap()
             .is_none());
         assert_eq!(manager.bindings.lock().await.len(), 1);
         manager.unbind(first.dispatch_id(), true).await;
         let second = manager
-            .reserve("run", "second", false)
+            .reserve("run", "second", false, None)
             .await
             .unwrap()
             .unwrap();
@@ -1797,6 +1837,7 @@ mod lock_tests {
         let registration = Arc::new(AgentRegistration {
             agent_id: "agent".into(),
             worker_profile: WorkerProfile::Legacy,
+            inventory: None,
             link_session_id: "session".into(),
             outbound: tx,
             slots_total: AtomicU64::new(1),

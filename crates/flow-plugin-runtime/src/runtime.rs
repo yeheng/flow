@@ -122,6 +122,12 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
             FrameTransport::spawn(stream, config.queue_depth)
         }
     };
+    // Remote workers need the registry to advertise its inventory. Local workers
+    // can complete the handshake before scanning installed packages.
+    #[cfg(feature = "plugins")]
+    let registry = config
+        .remote_replay
+        .then(crate::plugin_registry::PluginRegistry::load);
     let mut capabilities = EXECUTOR_CAPABILITIES.to_vec();
     let profile = if cfg!(feature = "plugins") {
         flow_engine::execution_protocol::contract::WorkerProfile::Plugins
@@ -135,6 +141,12 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
             flow_engine::execution_protocol::PREPARED_CONDITION_JOB_CAPABILITY,
         ]);
     }
+    #[cfg(feature = "plugins")]
+    let inventory: Vec<String> = registry.as_ref()
+        .map(|registry| registry.inventory().capabilities().collect())
+        .unwrap_or_default();
+    #[cfg(feature = "plugins")]
+    capabilities.extend(inventory.iter().map(String::as_str));
     let (identity, limits) = match tokio::time::timeout(
         Duration::from_millis(STARTUP_TIMEOUT_MS * 2),
         executor_handshake(
@@ -185,14 +197,11 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
     // 不再拉取新出站消息（自然背压到心跳/任务生产方）。
     let mut send_backlog =
         flow_engine::execution_protocol::transport::SendBacklog::with_capacity(4);
-    // 插件注册表：进程启动加载一次（内置默认注册 + plugins 目录发现），
-    // 不热加载——进程重启即插件重载。坏 manifest 只 warn 并禁用该插件，
-    // 不影响执行器会话。
     #[cfg(feature = "plugins")]
     let plugins = {
-        let registry = std::sync::Arc::new(crate::plugin_registry::PluginRegistry::load());
+        let registry = registry.unwrap_or_else(crate::plugin_registry::PluginRegistry::load);
         tracing::info!(registered = registry.len(), "plugin registry loaded");
-        registry
+        std::sync::Arc::new(registry)
     };
     loop {
         // 每轮先冲刷积压：积压未清时不再拉取新的出站消息，形成对

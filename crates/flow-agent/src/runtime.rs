@@ -15,6 +15,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use flow_engine::plugin_inventory::PluginInventory;
 use flow_engine::execution_protocol::contract::bounded_control_text;
 use flow_engine::execution_protocol::contract::{
     ExecutorInvocation, WorkerProfile, DRAIN_GRACE_MS, PROTOCOL_VERSION,
@@ -51,9 +52,9 @@ pub struct AgentConfig {
 /// agent 运行入口：循环「连接 → 服务 → 断线 → 退避重连」，直到 shutdown。
 /// 返回进程退出原因。
 pub async fn run_agent(config: AgentConfig, shutdown: CancellationToken) -> String {
-    let worker_profile = tokio::select! {
+    let (worker_profile, inventory) = tokio::select! {
         _ = shutdown.cancelled() => return "shutdown".into(),
-        profile = pool::probe_worker_profile(&config.executor) => match profile {
+        profile = pool::probe_worker(&config.executor) => match profile {
             Ok(profile) => profile,
             Err(error) => return format!("worker capability probe failed: {error}"),
         }
@@ -80,7 +81,7 @@ pub async fn run_agent(config: AgentConfig, shutdown: CancellationToken) -> Stri
         // Reconnecting：建立单条 mTLS + 握手。
         let connection = tokio::select! {
             _ = shutdown.cancelled() => {cancel_all(&executor_handles).await; return "shutdown".into();},
-            result = tokio::time::timeout(Duration::from_secs(15), connect(&config, &agent_boot_id, worker_profile)) => result.unwrap_or_else(|_| Err("agent connect timeout".into())),
+            result = tokio::time::timeout(Duration::from_secs(15), connect(&config, &agent_boot_id, worker_profile, inventory.as_ref())) => result.unwrap_or_else(|_| Err("agent connect timeout".into())),
         };
         match connection {
             Ok((mut transport, link_session_id, journal_id, master_epoch, heartbeat_ms)) => {
@@ -151,9 +152,10 @@ async fn connect(
     config: &AgentConfig,
     agent_boot_id: &str,
     worker_profile: WorkerProfile,
+    inventory: Option<&PluginInventory>,
 ) -> std::result::Result<(FrameTransport, String, String, u64, u64), String> {
     if config.wss_url.is_some() {
-        return connect_wss(config, agent_boot_id, worker_profile).await;
+        return connect_wss(config, agent_boot_id, worker_profile, inventory).await;
     }
     let connector = tls::client_config_from_files(&config.ca_cert, &config.cert, &config.key)
         .map_err(|e| format!("tls config: {e}"))?;
@@ -175,7 +177,7 @@ async fn connect(
     // AgentWelcome。不再用临时 decoder 取首帧后丢弃——一次 read 里 Welcome
     // 之后的尾随字节不会在交接时丢失。
     let transport = FrameTransport::spawn(stream, 128);
-    handshake(transport, config, agent_boot_id, worker_profile).await
+    handshake(transport, config, agent_boot_id, worker_profile, inventory).await
 }
 
 /// WSS 上联（T13）：明文 TCP（代理终止 TLS）+ 显式认证头；同一套帧/握手。
@@ -185,6 +187,7 @@ async fn connect_wss(
     config: &AgentConfig,
     agent_boot_id: &str,
     worker_profile: WorkerProfile,
+    inventory: Option<&PluginInventory>,
 ) -> std::result::Result<(FrameTransport, String, String, u64, u64), String> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -224,7 +227,7 @@ async fn connect_wss(
         flow_engine::execution_protocol::ws::WsByteStream::new(ws),
         128,
     );
-    handshake(transport, config, agent_boot_id, worker_profile).await
+    handshake(transport, config, agent_boot_id, worker_profile, inventory).await
 }
 
 /// 上联握手：AgentHello → AgentWelcome（transport 已建立，与承载无关）。
@@ -234,6 +237,7 @@ async fn handshake(
     config: &AgentConfig,
     agent_boot_id: &str,
     worker_profile: WorkerProfile,
+    inventory: Option<&PluginInventory>,
 ) -> std::result::Result<(FrameTransport, String, String, u64, u64), String> {
     let hello = Message::agent_hello(
         agent_boot_id,
@@ -243,6 +247,11 @@ async fn handshake(
             .copied()
             .chain(worker_profile.capability())
             .map(str::to_string)
+            .chain(
+                inventory
+                    .into_iter()
+                    .flat_map(PluginInventory::capabilities),
+            )
             .collect(),
         config.slots,
     );

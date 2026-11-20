@@ -30,6 +30,7 @@ pub use flow_domain::progression;
 pub mod nodelog;
 #[cfg(feature = "runtime")]
 pub mod observation;
+pub mod plugin_inventory;
 pub use flow_dispatcher::process;
 pub use flow_domain::schema;
 pub use flow_domain::script;

@@ -164,12 +164,24 @@ pub struct Run {
     /// None = 权限模型之前启动的 run（缺少策略快照：G3 一律拒绝外部操作）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<flow_dto::permission::FrozenPolicy>,
+    /// Plugin dependencies of this run and its frozen child definitions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_bindings: Option<BTreeMap<String, PluginBinding>>,
     /// Run 精确授权投影（RunApprovalUpserted/Removed 折叠；只免重复询问）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub approvals: Vec<flow_dto::permission::RunApproval>,
     /// Run 授权事件水位：policy_revision = 策略 digest + 该水位（§3.3）。
     #[serde(default, skip_serializing_if = "is_zero")]
     pub approval_seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginBinding {
+    pub plugin_id: String,
+    pub content_hash: String,
+    #[serde(deserialize_with = "flow_dto::permission::deserialize_plugin_capabilities")]
+    pub required: Vec<flow_dto::permission::Capability>,
+    pub unrestricted: bool,
 }
 
 /// serde 帮手：零值计数器不序列化（旧快照字节不变）。
@@ -306,6 +318,7 @@ impl Run {
             execution: self.execution.clone(),
             signals: self.signals.clone(),
             policy: self.policy.clone(),
+            plugin_bindings: self.plugin_bindings.clone(),
             approvals: self.approvals.clone(),
             approval_seq: self.approval_seq,
         }
