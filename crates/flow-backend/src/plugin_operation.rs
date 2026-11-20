@@ -561,6 +561,12 @@ impl Operation {
         ] {
             plugin_bundle::sync_dir(directory)?;
         }
+        if matches!(self.receipt.phase, Phase::PublishIntent | Phase::RemoveIntent) {
+            atomic_json(
+                &self.root.join(flow_config::plugin_fs::PUBLICATION_REVISION),
+                &self.receipt.operation_id,
+            )?;
+        }
         self.receipt.phase = Phase::Completed;
         self.save()?;
         crate::plugin_scan::invalidate(&self.root);

@@ -73,6 +73,7 @@ methods! {
         ServicesList => "services.list",
         ServicesEvents => "services.events",
         PluginsList => "plugins.list",
+        PluginsDeployment => "plugins.deployment",
         PluginsRecheck => "plugins.recheck",
         // 09 权限模型：待审批收件箱与有效权限（只读，不含 secret 值）。
         ApprovalsList => "approvals.list",

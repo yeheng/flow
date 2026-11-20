@@ -118,7 +118,7 @@ async function runPluginMutation(): Promise<void> {
     await Promise.all([loadPlugins(), residentPanel.value?.refresh()]);
     toast.info(pending.kind === "install" ? "插件安装完成" : "插件已卸载，授予记录已保留");
     if (result.executor_reload_required)
-      toast.info("节点插件变更需要重启执行器后生效；在飞运行不受影响");
+      toast.info("节点插件已发布，执行器将在后续派发时轮换");
   } catch (error) {
     pluginMutationError.value = errText(error);
     await loadPlugins();

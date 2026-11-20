@@ -15,7 +15,6 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use flow_engine::plugin_inventory::PluginInventory;
 use flow_engine::execution_protocol::contract::bounded_control_text;
 use flow_engine::execution_protocol::contract::{
     ExecutorInvocation, WorkerProfile, DRAIN_GRACE_MS, PROTOCOL_VERSION,
@@ -25,10 +24,13 @@ use flow_engine::execution_protocol::remote::{
     Capacity, ResumeAction, ResumeItem, ResumeState, RESUME_PAGE_MAX,
 };
 use flow_engine::execution_protocol::transport::FrameTransport;
+use flow_engine::plugin_inventory::PluginOffer;
 
 use crate::pool::{self, ExecutorHandle};
 use crate::relay::{Relay, RelayError, UPLINK_OUT_QUEUE};
 use crate::tls;
+
+type SharedInventory = Arc<parking_lot::RwLock<PluginOffer>>;
 
 pub struct AgentConfig {
     pub agent_id: String,
@@ -52,6 +54,7 @@ pub struct AgentConfig {
 /// agent 运行入口：循环「连接 → 服务 → 断线 → 退避重连」，直到 shutdown。
 /// 返回进程退出原因。
 pub async fn run_agent(config: AgentConfig, shutdown: CancellationToken) -> String {
+    let revision = read_publication_revision().await.ok().flatten();
     let (worker_profile, inventory) = tokio::select! {
         _ = shutdown.cancelled() => return "shutdown".into(),
         profile = pool::probe_worker(&config.executor) => match profile {
@@ -59,6 +62,21 @@ pub async fn run_agent(config: AgentConfig, shutdown: CancellationToken) -> Stri
             Err(error) => return format!("worker capability probe failed: {error}"),
         }
     };
+    let offer = PluginOffer {
+        revision: inventory.as_ref().and(revision.clone()),
+        inventory,
+    };
+    let inventory = Arc::new(parking_lot::RwLock::new(offer));
+    let inventory_shutdown = shutdown.child_token();
+    let _stop_inventory = inventory_shutdown.clone().drop_guard();
+    if worker_profile == WorkerProfile::Plugins {
+        tokio::spawn(refresh_inventory(
+            config.executor.clone(),
+            inventory.clone(),
+            revision,
+            inventory_shutdown,
+        ));
+    }
     let agent_boot_id = flow_engine::execution_protocol::transport::fresh_boot_id();
     let executor_handles: Arc<tokio::sync::Mutex<BTreeMap<String, ExecutorHandle>>> =
         Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
@@ -79,9 +97,10 @@ pub async fn run_agent(config: AgentConfig, shutdown: CancellationToken) -> Stri
             return "shutdown".into();
         }
         // Reconnecting：建立单条 mTLS + 握手。
+        let advertised = inventory.read().clone();
         let connection = tokio::select! {
             _ = shutdown.cancelled() => {cancel_all(&executor_handles).await; return "shutdown".into();},
-            result = tokio::time::timeout(Duration::from_secs(15), connect(&config, &agent_boot_id, worker_profile, inventory.as_ref())) => result.unwrap_or_else(|_| Err("agent connect timeout".into())),
+            result = tokio::time::timeout(Duration::from_secs(15), connect(&config, &agent_boot_id, worker_profile, &advertised)) => result.unwrap_or_else(|_| Err("agent connect timeout".into())),
         };
         match connection {
             Ok((mut transport, link_session_id, journal_id, master_epoch, heartbeat_ms)) => {
@@ -115,6 +134,7 @@ pub async fn run_agent(config: AgentConfig, shutdown: CancellationToken) -> Stri
                 let reason = serve_with_worker_profile(
                     &config,
                     Some(worker_profile),
+                    Some(&inventory),
                     &agent_boot_id,
                     &link_session_id,
                     &journal_id,
@@ -146,16 +166,56 @@ pub async fn run_agent(config: AgentConfig, shutdown: CancellationToken) -> Stri
     }
 }
 
+async fn read_publication_revision() -> std::io::Result<Option<String>> {
+    tokio::task::spawn_blocking(flow_config::plugin_fs::publication_revision)
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+async fn refresh_inventory(
+    executor: ExecutorInvocation,
+    inventory: SharedInventory,
+    mut revision: Option<String>,
+    shutdown: CancellationToken,
+) {
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = tick.tick() => {}
+        }
+        let Ok(current) = read_publication_revision().await else {
+            continue;
+        };
+        if current == revision {
+            continue;
+        }
+        // Let an already-started probe finish and reap its child on shutdown.
+        match pool::probe_worker(&executor).await {
+            Ok((WorkerProfile::Plugins, Some(updated))) => {
+                *inventory.write() = PluginOffer {
+                    inventory: Some(updated),
+                    revision: current.clone(),
+                };
+                revision = current;
+            }
+            Ok(_) => tracing::warn!("plugin inventory unavailable from Worker probe"),
+            Err(error) => tracing::warn!(%error, "plugin inventory refresh failed"),
+        }
+    }
+}
+
 /// 建立上联（T13）：按配置选择 mTLS 直连或 WSS，随后走同一套
 /// AgentHello/AgentWelcome 握手（transport 复用）。
 async fn connect(
     config: &AgentConfig,
     agent_boot_id: &str,
     worker_profile: WorkerProfile,
-    inventory: Option<&PluginInventory>,
+    offer: &PluginOffer,
 ) -> std::result::Result<(FrameTransport, String, String, u64, u64), String> {
     if config.wss_url.is_some() {
-        return connect_wss(config, agent_boot_id, worker_profile, inventory).await;
+        return connect_wss(config, agent_boot_id, worker_profile, offer).await;
     }
     let connector = tls::client_config_from_files(&config.ca_cert, &config.cert, &config.key)
         .map_err(|e| format!("tls config: {e}"))?;
@@ -177,7 +237,7 @@ async fn connect(
     // AgentWelcome。不再用临时 decoder 取首帧后丢弃——一次 read 里 Welcome
     // 之后的尾随字节不会在交接时丢失。
     let transport = FrameTransport::spawn(stream, 128);
-    handshake(transport, config, agent_boot_id, worker_profile, inventory).await
+    handshake(transport, config, agent_boot_id, worker_profile, offer).await
 }
 
 /// WSS 上联（T13）：明文 TCP（代理终止 TLS）+ 显式认证头；同一套帧/握手。
@@ -187,7 +247,7 @@ async fn connect_wss(
     config: &AgentConfig,
     agent_boot_id: &str,
     worker_profile: WorkerProfile,
-    inventory: Option<&PluginInventory>,
+    offer: &PluginOffer,
 ) -> std::result::Result<(FrameTransport, String, String, u64, u64), String> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -227,7 +287,7 @@ async fn connect_wss(
         flow_engine::execution_protocol::ws::WsByteStream::new(ws),
         128,
     );
-    handshake(transport, config, agent_boot_id, worker_profile, inventory).await
+    handshake(transport, config, agent_boot_id, worker_profile, offer).await
 }
 
 /// 上联握手：AgentHello → AgentWelcome（transport 已建立，与承载无关）。
@@ -237,7 +297,7 @@ async fn handshake(
     config: &AgentConfig,
     agent_boot_id: &str,
     worker_profile: WorkerProfile,
-    inventory: Option<&PluginInventory>,
+    offer: &PluginOffer,
 ) -> std::result::Result<(FrameTransport, String, String, u64, u64), String> {
     let hello = Message::agent_hello(
         agent_boot_id,
@@ -247,11 +307,7 @@ async fn handshake(
             .copied()
             .chain(worker_profile.capability())
             .map(str::to_string)
-            .chain(
-                inventory
-                    .into_iter()
-                    .flat_map(PluginInventory::capabilities),
-            )
+            .chain(offer.capabilities())
             .collect(),
         config.slots,
     );
@@ -488,6 +544,7 @@ pub async fn serve(
     serve_with_worker_profile(
         config,
         None,
+        None,
         agent_boot_id,
         link_session_id,
         journal_id,
@@ -507,6 +564,7 @@ pub async fn serve(
 async fn serve_with_worker_profile(
     config: &AgentConfig,
     worker_profile: Option<WorkerProfile>,
+    inventory: Option<&SharedInventory>,
     _agent_boot_id: &str,
     _link_session_id: &str,
     journal_id: &str,
@@ -519,6 +577,7 @@ async fn serve_with_worker_profile(
     budget: std::sync::Arc<crate::relay::UplinkBudget>,
     shutdown: CancellationToken,
 ) -> String {
+    let mut reported = PluginOffer::default();
     let mut draining = None;
     let mut pending: Option<(mpsc::Sender<Message>, Message)> = None;
     // 出站积压（T03）：上联队列满时按 FIFO 有界暂存，不让阻塞中的 send
@@ -630,7 +689,9 @@ async fn serve_with_worker_profile(
                     // 注册后立报。master 据 slots 更新准入（used < slots_total），
                     // 其余字段是遥测。报告可丢——下一拍补，不为它保留队列。
                     let in_flight = handles.lock().await.len() as u32;
-                    let _ = queue_uplink(
+                    let current = inventory.map(|shared| shared.read().clone()).unwrap_or_default();
+                    let changed = current != reported;
+                    let sent = queue_uplink(
                         &transport,
                         &mut send_backlog,
                         Message::CapacityReport {
@@ -640,13 +701,15 @@ async fn serve_with_worker_profile(
                                 pending_bytes: budget.pending_bytes(),
                                 // 可用内存未采集（无跨平台来源）；0 表示未知。
                                 memory_mib: 0,
-                                capabilities: crate::AGENT_CAPABILITIES
-                                    .iter()
-                                    .map(|cap| (*cap).to_string())
+                                capabilities: crate::AGENT_CAPABILITIES.iter().map(|cap| (*cap).to_string())
+                                    .chain(changed.then(|| current.capabilities()).into_iter().flatten())
                                     .collect(),
                             },
                         },
                     );
+                    if sent.is_ok() && changed {
+                        reported = current;
+                    }
                 }
             }
             _ = shutdown.cancelled() => {

@@ -219,6 +219,10 @@ impl JournalBackend {
             // 已有在跑的协调器：直接复用，不重复起第二个派发者。
             return false;
         }
+        *self.plugin_remote_manager.write().unwrap() = match &port {
+            ExecutionPort::Remote(dispatcher) => Arc::downgrade(dispatcher.manager()),
+            ExecutionPort::Ipc(_) => std::sync::Weak::new(),
+        };
         let observation = self.observations.clone();
         let weak = Arc::downgrade(self);
         let cancel = self.cancellation();

@@ -36,16 +36,15 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Mutex, Notify, Semaphore};
 use tokio_rustls::TlsAcceptor;
 
-use flow_engine::plugin_inventory::PluginInventory;
 use flow_engine::execution_protocol::contract::{
-    bounded_control_text, WorkerProfile, A_MAX, PROTOCOL_VERSION,
-    STARTUP_TIMEOUT_MS, W_BYTES,
+    bounded_control_text, WorkerProfile, A_MAX, PROTOCOL_VERSION, STARTUP_TIMEOUT_MS, W_BYTES,
 };
 use flow_engine::execution_protocol::message::Message;
 use flow_engine::execution_protocol::remote::{
     capability, validate_route_identity, ResumeAction, ResumeDecision, ResumeItem, RouteEnvelope,
 };
 use flow_engine::execution_protocol::transport::{FrameTransport, SendBacklog};
+use flow_engine::plugin_inventory::PluginOffer;
 
 use crate::execution::dispatch::DispatchLink;
 use crate::execution::ToSession;
@@ -278,7 +277,7 @@ struct AgentRegistration {
     /// agent 标识。
     agent_id: String,
     worker_profile: WorkerProfile,
-    inventory: Option<PluginInventory>,
+    inventory: std::sync::RwLock<PluginOffer>,
     /// 本次上联会话标识（重连会换新值，旧会话因此可被识别为过期）。
     link_session_id: String,
     /// 派发方 → agent 的命令通道。
@@ -390,6 +389,45 @@ impl AgentManager {
             shutdown: tokio_util::sync::CancellationToken::new(),
             tasks: tokio_util::task::TaskTracker::new(),
         })
+    }
+
+    pub(crate) async fn plugin_readiness(
+        &self,
+        id: &str,
+        hash: &str,
+        node_types: &[String],
+        revision: Option<&str>,
+    ) -> BTreeMap<String, &'static str> {
+        self.agents
+            .lock()
+            .await
+            .iter()
+            .map(|(name, agent)| {
+                let inventory = agent.inventory.read().unwrap();
+                let status = if agent.worker_profile == WorkerProfile::Builtins {
+                    "builtins_only"
+                } else if agent.cancel.is_cancelled()
+                    || agent.draining.load(Ordering::Acquire)
+                    || agent.slots_total.load(Ordering::Relaxed) == 0
+                {
+                    "unavailable"
+                } else if let Some(entries) = &inventory.inventory {
+                    if inventory.revision.as_deref() != revision {
+                        "pending_publication"
+                    } else if node_types
+                        .iter()
+                        .all(|node| entries.matches(node, id, hash))
+                    {
+                        "ready"
+                    } else {
+                        "different_content"
+                    }
+                } else {
+                    "inventory_unknown"
+                };
+                (name.clone(), status)
+            })
+            .collect()
     }
 
     /// TLS 监听入口（真实网络）。单条 mTLS 连接承载整条上联（单流帧：
@@ -566,8 +604,7 @@ impl AgentManager {
         self: &Arc<Self>,
         transport: &mut FrameTransport,
         agent_id: &str,
-    ) -> std::result::Result<(String, u32, String, WorkerProfile, Option<PluginInventory>), String>
-    {
+    ) -> std::result::Result<(String, u32, String, WorkerProfile, PluginOffer), String> {
         let message = tokio::time::timeout(
             Duration::from_millis(STARTUP_TIMEOUT_MS * 2),
             transport.recv(),
@@ -607,7 +644,7 @@ impl AgentManager {
             return Err("invalid agent identity".into());
         }
         let worker_profile = WorkerProfile::from_capabilities(&capabilities)?;
-        let inventory = PluginInventory::from_capabilities(&capabilities)?;
+        let inventory = PluginOffer::from_capabilities(&capabilities)?;
         let link_session_id = format!(
             "link-{}",
             self.session_counter.fetch_add(1, Ordering::Relaxed)
@@ -659,7 +696,7 @@ impl AgentManager {
         let registration = Arc::new(AgentRegistration {
             agent_id: agent_id.clone(),
             worker_profile,
-            inventory,
+            inventory: std::sync::RwLock::new(inventory),
             link_session_id: link_session_id.clone(),
             outbound: outbound.clone(),
             slots_total: AtomicU64::new(slots as u64),
@@ -913,9 +950,21 @@ impl AgentManager {
                                 }
                             }
                             Message::CapacityReport { capacity } => {
+                                // Update routing under the same registration lock used
+                                // for reservations. v8 peers without inventory still
+                                // report capacity using their existing format.
+                                let next = PluginOffer::from_capabilities(&capacity.capabilities)?;
+                                let changed = if next.inventory.is_some() {
+                                    let _agents = self.agents.lock().await;
+                                    let mut inventory = registration.inventory.write().unwrap();
+                                    let changed = *inventory != next;
+                                    *inventory = next;
+                                    changed
+                                } else {
+                                    false
+                                };
                                 let previous = registration.slots_total.swap(capacity.slots as u64, Ordering::Relaxed);
-                                // in_flight is telemetry, not an admission counter.
-                                if previous != u64::from(capacity.slots) {
+                                if changed || previous != u64::from(capacity.slots) {
                                     self.backend.execution_notification().notify_one();
                                 }
                             }
@@ -1217,13 +1266,15 @@ impl AgentManager {
             return Err(invalid("no agent connected"));
         }
         let mut bindings = self.bindings.lock().await;
-        let has_inventory = agents.values().any(|agent| agent.inventory.is_some());
+        let has_inventory = agents
+            .values()
+            .any(|agent| agent.inventory.read().unwrap().inventory.is_some());
         let compatible_rank = |agent: &AgentRegistration| {
             if let Some((node_type, binding)) = plugin {
                 if agent.worker_profile == WorkerProfile::Builtins {
                     return None;
                 }
-                if let Some(inventory) = &agent.inventory {
+                if let Some(inventory) = agent.inventory.read().unwrap().inventory.as_ref() {
                     return inventory
                         .matches(node_type, &binding.plugin_id, &binding.content_hash)
                         .then_some(0);
@@ -1733,7 +1784,7 @@ mod capacity_tests {
             Arc::new(AgentRegistration {
                 agent_id: "agent".into(),
                 worker_profile: WorkerProfile::Legacy,
-                inventory: None,
+                inventory: std::sync::RwLock::default(),
                 link_session_id: session.into(),
                 outbound: outbound.clone(),
                 slots_total: AtomicU64::new(1),
@@ -1837,7 +1888,7 @@ mod lock_tests {
         let registration = Arc::new(AgentRegistration {
             agent_id: "agent".into(),
             worker_profile: WorkerProfile::Legacy,
-            inventory: None,
+            inventory: std::sync::RwLock::default(),
             link_session_id: "session".into(),
             outbound: tx,
             slots_total: AtomicU64::new(1),

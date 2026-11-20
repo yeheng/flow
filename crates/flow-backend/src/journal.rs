@@ -103,6 +103,9 @@ pub struct JournalBackend {
     /// Plugin ids whose start is past the admission check and not yet installed.
     /// This is a std mutex so a guard can release the reservation on drop.
     pub(crate) plugin_executor_program: std::sync::RwLock<Option<std::path::PathBuf>>,
+    pub(crate) plugin_remote_manager: std::sync::RwLock<
+        std::sync::Weak<crate::execution::remote::AgentManager>,
+    >,
     pub plugin_ops: std::sync::Mutex<std::collections::BTreeSet<String>>,
     plugin_ops_changed: Notify,
     /// Serialize managed plugin publication with the snapshot and commit of new runs.
@@ -391,6 +394,7 @@ impl JournalBackend {
             harness_agent: std::sync::OnceLock::new(),
             services: tokio::sync::Mutex::new(Default::default()),
             plugin_executor_program: std::sync::RwLock::new(None),
+            plugin_remote_manager: std::sync::RwLock::default(),
             plugin_ops: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             plugin_ops_changed: Notify::new(),
             plugin_catalog: RwLock::default(),

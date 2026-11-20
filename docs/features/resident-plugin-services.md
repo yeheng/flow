@@ -47,9 +47,22 @@ flow journal plugins uninstall resident-echo --stop-first
 
 `plugins.list` 会保留 `broken` / `conflict` 行并展示原因；重复 ID 的全部副本都不能路由或 start。列表同时展示运行状态及旧树入口的目录外路径、符号链接、超大文件注解。这些旧树注解不会单独禁止加载。新安装拒绝符号链接和特殊文件，限制清单与 Web UI 各 256 KiB、单文件 256 MiB、包总大小 512 MiB、文件数 4096、扫描行数 64。
 
-加载表示清单可路由。`recheck` 检查现有定义与当前动态类型和表单是否一致。`services.start` 启动常驻进程。节点执行器在启动时读取注册表，节点插件更新后需要轮换执行器。安装和卸载响应通过 `executor_reload_required` 提示这次变更，列表仍按主控目录显示状态。
+加载表示清单可路由。`recheck` 检查现有定义与当前动态类型和表单是否一致。`services.start` 启动常驻进程。节点执行器在启动时读取注册表。主控发布后，本地执行器池在下次派发时换代，已在执行的租约完成后回收。安装和卸载响应继续提供 `executor_reload_required` 字段，供旧客户端识别节点插件变更。
 
-替换或卸载节点插件时，如果活动 Run 的冻结依赖包含该插件，管理操作会返回阻塞的 Run ID，并把当前插件代际标为排空中。`plugins.list` 返回 `draining`。等待这些 Run 结束或通过已有 Run 取消入口终止后，使用新请求 ID 重试变更。排空状态跨主控重启保留。重新提交同一份已安装包可取消排空。新 Run 的接纳检查覆盖尚未创建的子流程。远程主机上的插件包也需要由运维保持可用，直到对应 Run 收尾。
+替换或卸载节点插件时，如果活动 Run 的冻结依赖包含该插件，管理操作会返回阻塞的 Run ID，并把当前插件代际标为排空中。`plugins.list` 返回 `draining`。等待这些 Run 结束或通过已有 Run 取消入口终止后，使用新请求 ID 重试变更。排空状态跨主控重启保留。重新提交同一份已安装包可取消排空。新 Run 的接纳检查覆盖尚未创建的子流程。
+
+### 发布到远程 Agent
+
+把主控和目标 Agent 的 `FLOW_PLUGINS_DIR` 指向同一个共享目录。主控写入，Agent 可只读挂载。共享文件系统需要支持原子重命名和跨主机文件锁。主控首次发布会建立目录和锁文件。插件包源目录位于主控可读的路径，且与安装目录分开。
+
+```sh
+flow-cli journal plugins deploy --source /srv/staging/ocr-plugin \
+  --replace --agent worker-a --agent worker-b --timeout 60
+```
+
+主控沿用现有安装校验、授权和排空规则。发布成功后，Agent 探测新包并通过现有连接更新清单。命令等指定 Agent 都报告当前发布代际及匹配的节点类型、插件 ID 和内容哈希后返回 `activation=ready`，随后可以启动依赖插件的工作流。没有指定 Agent 时，命令返回 `activation=published`。安装权限和执行授予沿用现有入口。
+
+超时会列出尚未就绪的 Agent，已完成的发布会保留。网络错误可用同一 `--request-id` 和参数继续确认。排空冲突需要等阻塞 Run 收尾后用新请求 ID 重试。管理员也可通过 `plugins.deployment` 查询当前包和 Agent 状态。每台机器拥有独立插件目录的部署可继续由运维分别发布包。
 
 卸载不撤销 journal 授予，同内容重装可继续匹配旧授予。I35 身份仍是 `sha256(manifest || entry)`；整包 `bundle_digest` 额外包含 UI、路径和执行权限，用于发布及恢复，不参与授予。
 

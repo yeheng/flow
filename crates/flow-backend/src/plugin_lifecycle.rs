@@ -58,6 +58,74 @@ async fn reject(mut op: Operation, error: OperationError) -> Result<Value> {
 }
 
 impl JournalBackend {
+    pub async fn plugin_deployment(
+        &self,
+        plugin_id: &str,
+    ) -> std::result::Result<Value, crate::journal::JournalError> {
+        let _catalog = self.plugin_catalog.read().await;
+        let id = plugin_id.to_owned();
+        let defaults = self.plugin_defaults();
+        let (package, bundle_digest, revision, draining) = tokio::task::spawn_blocking(move || {
+            use crate::journal::JournalError;
+
+            let package =
+                crate::plugin_registry::installed_snapshot_cached_with_defaults(&defaults)
+                    .rows
+                    .into_iter()
+                    .filter_map(|row| row.plugin)
+                    .find(|plugin| plugin.manifest.plugin.id == id)
+                    .ok_or_else(|| {
+                        flow_journal::Error::NotFound("installed plugin not found".into())
+                    })?;
+            let root = package
+                .source
+                .parent()
+                .ok_or_else(|| JournalError::Storage("plugin directory has no root".into()))?;
+            let draining = crate::plugin_operation::is_draining(root, &id)
+                .map_err(|error| JournalError::Storage(error.to_string()))?;
+            let revision = flow_config::plugin_fs::publication_revision()
+                .map_err(|error| JournalError::Storage(error.to_string()))?;
+            let marker = package.source.join(plugin_bundle::MARKER);
+            let digest = match fs::read(marker) {
+                Ok(bytes) => Some(
+                    serde_json::from_slice::<crate::plugin_operation::Identity>(&bytes)?
+                        .bundle_digest,
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(JournalError::Storage(error.to_string())),
+            };
+            Ok::<_, JournalError>((package, digest, revision, draining))
+        })
+        .await
+        .map_err(|error| crate::journal::JournalError::Storage(error.to_string()))??;
+        let node_types = package.manifest.plugin.node_types;
+        let manager = self.plugin_remote_manager.read().unwrap().upgrade();
+        let mode = if manager.is_some() { "remote" } else { "local" };
+        let agents = match manager {
+            Some(manager) if !node_types.is_empty() => {
+                manager
+                    .plugin_readiness(
+                        plugin_id,
+                        &package.content_hash,
+                        &node_types,
+                        revision.as_deref(),
+                    )
+                    .await
+            }
+            _ => Default::default(),
+        };
+        Ok(json!({
+            "plugin_id": plugin_id,
+            "content_hash": package.content_hash,
+            "bundle_digest": bundle_digest,
+            "node_types": node_types,
+            "draining": draining,
+            "publication_revision": revision,
+            "mode": mode,
+            "agents": agents,
+        }))
+    }
+
     async fn plugin_blockers(&self, plugin_id: &str) -> Result<Vec<String>> {
         let (mut blockers, legacy) = self
             .inspect_committed(|state| {
@@ -497,7 +565,8 @@ fn install_result(
     idempotent: bool,
 ) -> Value {
     json!({"plugin_id":bundle.manifest.plugin.id,"version":bundle.manifest.plugin.version,
-        "content_hash":bundle.content_hash,"node_types":bundle.manifest.plugin.node_types,
+        "content_hash":bundle.content_hash,"bundle_digest":bundle.bundle_digest,
+        "node_types":bundle.manifest.plugin.node_types,
         "service":bundle.manifest.service.is_some(),"grant_state":grant_state,
         "entry_executable":bundle.entry_executable,
         "executor_reload_required":!bundle.manifest.plugin.node_types.is_empty(),

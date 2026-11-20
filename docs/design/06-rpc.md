@@ -34,6 +34,7 @@ key 管理 v1 = `flow.config.toml` 的 `[[api_keys]]`（重启生效，无管理
 | --- | --- | --- |
 | `plugins.install` | `request_id`, `source`, `replace?:false` | admin |
 | `plugins.uninstall` | `request_id`, `plugin_id`, `stop_first?:false` | admin |
+| `plugins.deployment` | `plugin_id` | admin |
 
 ### 11.2 幂等：`request_id`
 

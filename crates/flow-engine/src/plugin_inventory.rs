@@ -70,9 +70,71 @@ impl PluginInventory {
     }
 }
 
+/// A probe result and the shared publication revision visible when probing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PluginOffer {
+    pub inventory: Option<PluginInventory>,
+    pub revision: Option<String>,
+}
+
+impl PluginOffer {
+    const PREFIX: &'static str = "plugin-revision-v1:";
+
+    pub fn from_capabilities(capabilities: &[String]) -> Result<Self, &'static str> {
+        let inventory = PluginInventory::from_capabilities(capabilities)?;
+        let mut revision = None;
+        for token in capabilities
+            .iter()
+            .filter_map(|cap| cap.strip_prefix(Self::PREFIX))
+        {
+            if inventory.is_none()
+                || revision.is_some()
+                || token.is_empty()
+                || token.len() > 64
+                || !token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+            {
+                return Err("invalid plugin publication revision");
+            }
+            revision = Some(token.to_owned());
+        }
+        Ok(Self {
+            inventory,
+            revision,
+        })
+    }
+
+    pub fn capabilities(&self) -> impl Iterator<Item = String> + '_ {
+        self.inventory
+            .iter()
+            .flat_map(PluginInventory::capabilities)
+            .chain(
+                self.revision
+                    .iter()
+                    .map(|revision| format!("{}{revision}", Self::PREFIX)),
+            )
+    }
+}
+
 #[cfg(test)]
 mod plugin_inventory_tests {
-    use super::PluginInventory;
+    use super::{PluginInventory, PluginOffer};
+
+    #[test]
+    fn publication_revision_requires_an_inventory() {
+        let offer = PluginOffer {
+            inventory: Some(PluginInventory::default()),
+            revision: Some("1234-abcd".into()),
+        };
+        let caps: Vec<_> = offer.capabilities().collect();
+        assert_eq!(PluginOffer::from_capabilities(&caps), Ok(offer));
+        assert_eq!(
+            PluginOffer::from_capabilities(&[]),
+            Ok(PluginOffer::default())
+        );
+        assert!(PluginOffer::from_capabilities(&caps[1..]).is_err());
+    }
 
     #[test]
     fn inventory_distinguishes_legacy_empty_and_exact_matches() {

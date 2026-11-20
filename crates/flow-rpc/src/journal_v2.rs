@@ -63,7 +63,7 @@ fn resolve_caller(ctx: &Context, method: &str, supplied: &str) -> Result<Caller,
         // 权限管理（grant/keys）admin。
         let required: &'static str = match method {
             "run.approve" | "run.deny" => "approve",
-            "permissions.grant" | "plugins.install" | "plugins.uninstall" => "admin",
+            "permissions.grant" | "plugins.install" | "plugins.uninstall" | "plugins.deployment" => "admin",
             m if flow_dto::rpc::is_read_method(m) => "read",
             _ => "write",
         };
@@ -1106,6 +1106,10 @@ async fn dispatch_admitted(
         }
         Method::PluginsList => {
             return Ok(json!({"plugins": b.plugins_view().await}));
+        }
+        Method::PluginsDeployment => {
+            if !caller.permission_admin { return Err(invalid("plugin deployment status requires admin")); }
+            return b.plugin_deployment(text(&p, "plugin_id")?).await.map_err(failure);
         }
         Method::PluginsRecheck => return plugins_recheck(ctx).await,
         // ---- 09 权限模型 ----

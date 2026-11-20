@@ -11,6 +11,22 @@ pub fn plugins_root() -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| crate::flow_home().map(|home| home.join("plugins")))
 }
+
+pub const PUBLICATION_REVISION: &str = ".publish-revision";
+
+/// The writer replaces this small file atomically after changing the live tree.
+pub fn publication_revision() -> io::Result<Option<String>> {
+    let Some(root) = plugins_root() else {
+        return Ok(None);
+    };
+    match std::fs::read_to_string(root.join(PUBLICATION_REVISION)) {
+        Ok(value) => serde_json::from_str(&value)
+            .map(Some)
+            .map_err(io::Error::other),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
 pub struct RootLease {
     file: File,
 }
@@ -18,22 +34,29 @@ impl RootLease {
     fn open(root: &Path, name: &str, exclusive: bool) -> io::Result<Self> {
         let root = root.canonicalize()?;
         let path = root.join(name);
-        let file = match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
+        let open_existing = || -> io::Result<File> {
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "publication lock must be a regular file",
+                ));
+            }
+            OpenOptions::new().read(true).write(exclusive).open(&path)
+        };
+        let file = match open_existing() {
             Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                let metadata = std::fs::symlink_metadata(&path)?;
-                if !metadata.is_file() || metadata.file_type().is_symlink() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "publication lock must be a regular file",
-                    ));
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => open_existing()?,
+                    Err(error) => return Err(error),
                 }
-                OpenOptions::new().read(true).write(exclusive).open(&path)?
             }
             Err(error) => return Err(error),
         };

@@ -89,6 +89,7 @@ fn fj(s: impl Into<String>) -> flow_journal::Error {
 #[derive(Clone)]
 pub struct IpcDispatcher {
     pool: Arc<ExecutorPool>,
+    publication_revision: Arc<tokio::sync::Mutex<Option<String>>>,
 }
 
 /// 派发链路：命令发送 + 事件流。本地池会话（二期）与远程 agent 路由
@@ -110,10 +111,29 @@ pub(crate) struct Parking {
 }
 
 impl IpcDispatcher {
-    /// 绑定一个执行器池。派发器本身无状态：会话的借还由池管理，节点级
-    /// 编排状态在每次 `execute` 内新建的 [`DispatchRunner`] 里。
+    /// 绑定执行池并观察插件发布代际。节点级编排仍由每次派发的
+    /// [`DispatchRunner`] 持有。
     pub fn new(pool: Arc<ExecutorPool>) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            publication_revision: Arc::default(),
+        }
+    }
+
+    async fn rotate_after_publication(&self) -> Result<()> {
+        let mut revision = self.publication_revision.lock().await;
+        let current = tokio::task::spawn_blocking(flow_config::plugin_fs::publication_revision)
+            .await
+            .map_err(|error| invalid(error.to_string()))?;
+        match current {
+            Ok(current) if current != *revision => {
+                self.pool.rotate();
+                *revision = current;
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "could not read plugin publication revision"),
+        }
+        Ok(())
     }
 
     pub(crate) fn parked_count(&self) -> usize {
@@ -131,6 +151,9 @@ impl IpcDispatcher {
         &self,
         count: usize,
     ) -> std::result::Result<usize, super::pool::PoolError> {
+        self.rotate_after_publication()
+            .await
+            .map_err(|error| super::pool::PoolError::Unavailable(error.to_string()))?;
         self.pool.prewarm(count).await
     }
 
@@ -143,6 +166,7 @@ impl IpcDispatcher {
         predecessors: BTreeMap<String, StoredValue>,
         observations: Option<ObservationStore>,
     ) -> Result<()> {
+        self.rotate_after_publication().await?;
         let mut lease = self
             .pool
             .acquire()

@@ -79,6 +79,7 @@ pub struct RawSession {
 }
 
 struct SessionLifetime {
+    generation: u64,
     retired: oneshot::Sender<OwnedSemaphorePermit>,
     _cancel: DropGuard,
 }
@@ -183,6 +184,7 @@ pub struct ExecutorPool {
     /// 已握手但当前空闲的会话（栈顶优先复用）。
     idle: Arc<Mutex<Vec<RawSession>>>,
     /// 执行器编号计数器。
+    generation: AtomicU64,
     executor_counter: AtomicU64,
     /// 会话编号计数器。
     session_counter: AtomicU64,
@@ -226,6 +228,7 @@ impl ExecutorPool {
             live_parked: Arc::new(AtomicUsize::new(0)),
             required_capabilities,
             idle: Arc::new(Mutex::new(Vec::new())),
+            generation: AtomicU64::new(0),
             executor_counter: AtomicU64::new(0),
             session_counter: AtomicU64::new(0),
             shutdown: CancellationToken::new(),
@@ -279,22 +282,43 @@ impl ExecutorPool {
     /// 「常驻进程数 ≤ X_max」——否则并发 acquire 会各自 spawn，进程数会
     /// 随并发数增长。
     pub async fn acquire(self: &Arc<Self>) -> Result<SessionLease, PoolError> {
-        let permit = tokio::select! {
-            permit=self.slots.clone().acquire_owned()=>permit.map_err(|_|PoolError::Unavailable("pool closed".into()))?,
-            _=self.shutdown.cancelled()=>return Err(PoolError::Unavailable("pool closed".into())),
-        };
-        {
-            let mut idle = self.idle.lock().await;
-            if self.shutdown.is_cancelled() {
-                return Err(PoolError::Unavailable("pool closed".into()));
-            }
-            while let Some(session) = idle.pop() {
-                if !session.to_session.is_closed() {
-                    return Ok(session.lease(permit));
+        loop {
+            let permit = tokio::select! {
+                permit = self.slots.clone().acquire_owned() => permit.map_err(|_| PoolError::Unavailable("pool closed".into()))?,
+                _ = self.shutdown.cancelled() => return Err(PoolError::Unavailable("pool closed".into())),
+            };
+            let session = {
+                let mut idle = self.idle.lock().await;
+                if self.shutdown.is_cancelled() {
+                    return Err(PoolError::Unavailable("pool closed".into()));
                 }
+                idle.retain(|session| !session.to_session.is_closed());
+                idle.pop()
+            };
+            let lease = match session {
+                Some(session) => session.lease(permit),
+                None => self.spawn_lease(permit).await?,
+            };
+            if self.current(&lease) {
+                return Ok(lease);
             }
+            // The lease transfers its capacity to the reaper before the next acquire.
+            drop(lease);
         }
-        self.spawn_lease(permit).await
+    }
+
+    /// Old workers finish their current lease. A subsequent acquisition recycles
+    /// stale idle workers through the same slot-accounted retirement path.
+    pub fn rotate(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn current(&self, lease: &SessionLease) -> bool {
+        lease
+            .capacity
+            .lifetime
+            .as_ref()
+            .is_some_and(|lifetime| lifetime.generation == self.generation.load(Ordering::Acquire))
     }
 
     pub fn parked_count(&self) -> usize {
@@ -352,7 +376,7 @@ impl ExecutorPool {
             return;
         }
         let mut idle = self.idle.lock().await;
-        if self.shutdown.is_cancelled() || lease.to_session.is_closed() {
+        if self.shutdown.is_cancelled() || lease.to_session.is_closed() || !self.current(&lease) {
             return;
         }
         let SessionLease {
@@ -431,6 +455,7 @@ async fn spawn_and_handshake(
     session_id: &str,
     shutdown: CancellationToken,
 ) -> Result<RawSession, PoolError> {
+    let generation = pool.generation.load(Ordering::Acquire);
     let (mut transport, mut child, session_token) =
         crate::execution_protocol::bootstrap::spawn_executor_transport(
             &pool.options.executor,
@@ -490,6 +515,7 @@ async fn spawn_and_handshake(
         session_id: session_id.to_string(),
         child_pid,
         lifetime: SessionLifetime {
+            generation,
             retired,
             _cancel: shutdown.drop_guard(),
         },
@@ -659,12 +685,34 @@ mod lifecycle_tests {
                 session_id: "s".into(),
                 child_pid: None,
                 lifetime: SessionLifetime {
+                    generation: 0,
                     retired,
                     _cancel: cancel.drop_guard(),
                 },
             },
             retain_slot,
         )
+    }
+
+    #[tokio::test]
+    async fn rotation_keeps_an_active_worker_until_its_lease_finishes() {
+        let pool = single_slot_pool();
+        let cancel = CancellationToken::new();
+        let (commands, _command_rx) = mpsc::channel(1);
+        let (_event_tx, events) = mpsc::channel(1);
+        let (session, retained) = fixture_session(commands, events, cancel.clone());
+        let lease = session.lease(pool.slots.clone().acquire_owned().await.unwrap());
+
+        pool.rotate();
+        assert!(!cancel.is_cancelled());
+        pool.release(lease, true).await;
+        assert!(cancel.is_cancelled());
+        assert!(pool.idle.lock().await.is_empty());
+
+        let permit = retained.await.unwrap();
+        assert_eq!(pool.slots.available_permits(), 0);
+        drop(permit);
+        assert_eq!(pool.slots.available_permits(), 1);
     }
 
     /// 归还不健康的租约、或干脆丢弃租约，都不能阻塞在满掉的命令队列上——

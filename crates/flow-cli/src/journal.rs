@@ -86,6 +86,17 @@ pub enum PluginCommand {
         #[arg(long)]
         replace: bool,
     },
+    /// Publish an already staged bundle and wait for the selected shared-directory Agents.
+    Deploy {
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        replace: bool,
+        #[arg(long = "agent")]
+        agents: Vec<String>,
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=600))]
+        timeout: u64,
+    },
     Uninstall {
         plugin_id: String,
         #[arg(long)]
@@ -151,6 +162,92 @@ pub(crate) async fn call(
         Err(e) => Err(error(e)),
     }
 }
+async fn deploy_plugin(
+    client: &WsClient,
+    token: &str,
+    source: PathBuf,
+    replace: bool,
+    agents: &[String],
+    timeout: u64,
+) -> Result<Value, CliError> {
+    let receipt = call(
+        client,
+        token,
+        "plugins.install",
+        json!({"source":source,"replace":replace}),
+    )
+    .await?;
+    let id = receipt["plugin_id"]
+        .as_str()
+        .ok_or_else(|| error("install receipt missing plugin_id"))?;
+    let hash = receipt["content_hash"]
+        .as_str()
+        .ok_or_else(|| error("install receipt missing content_hash"))?;
+    if agents.is_empty() {
+        return Ok(json!({"install": receipt, "activation": "published"}));
+    }
+    if receipt["node_types"].as_array().is_none_or(Vec::is_empty) {
+        return Err(error(format!(
+            "plugin {id} was published as a service; it has no Worker deployment"
+        )));
+    }
+    let params = json!({"plugin_id": id});
+    let mut pending = agents
+        .iter()
+        .map(|agent| (agent.clone(), "not_connected".to_owned()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let waited = tokio::time::timeout(std::time::Duration::from_secs(timeout), async {
+        loop {
+            let deployment = call(client, token, "plugins.deployment", params.clone())
+                .await
+                .map_err(|failure| {
+                    error(format!(
+                        "plugin {id} was published; readiness check failed: {failure}"
+                    ))
+                })?;
+            if deployment["content_hash"].as_str() != Some(hash)
+                || receipt["bundle_digest"]
+                    .as_str()
+                    .is_some_and(|digest| deployment["bundle_digest"].as_str() != Some(digest))
+                || deployment["draining"] == true
+            {
+                return Err(error(format!(
+                    "plugin {id} deployment was superseded or is draining"
+                )));
+            }
+            if deployment["mode"] != "remote" {
+                return Err(error(format!(
+                    "plugin {id} was published; the journal server is using local execution"
+                )));
+            }
+            // Check all targets against the same live snapshot on every poll.
+            pending.clear();
+            for agent in agents {
+                let status = deployment["agents"][agent.as_str()]
+                    .as_str()
+                    .unwrap_or("not_connected");
+                if status != "ready" {
+                    pending.insert(agent.clone(), status.to_owned());
+                }
+            }
+            if pending.is_empty() {
+                return Ok(deployment);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        }
+    })
+    .await;
+    match waited {
+        Ok(Ok(deployment)) => {
+            Ok(json!({"install": receipt, "activation":"ready", "deployment":deployment}))
+        }
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(error(format!(
+            "plugin {id} was published; Agent readiness timed out: {pending:?}"
+        ))),
+    }
+}
+
 /// 分派 journal 子命令。
 pub async fn dispatch(client: &WsClient, command: Command) -> Result<(), CliError> {
     let token =
@@ -164,6 +261,17 @@ pub async fn dispatch(client: &WsClient, command: Command) -> Result<(), CliErro
                     "plugins.install",
                     json!({"source":source,"replace":replace}),
                 ),
+                PluginCommand::Deploy {
+                    source,
+                    replace,
+                    agents,
+                    timeout,
+                } => {
+                    let result =
+                        deploy_plugin(client, &token, source, replace, &agents, timeout).await?;
+                    println!("{}", serde_json::to_string_pretty(&result).map_err(error)?);
+                    return Ok(());
+                }
                 PluginCommand::Uninstall {
                     plugin_id,
                     stop_first,
