@@ -5,6 +5,7 @@ import type { NodeTypeDesc } from "../types";
 export interface ValidationError {
   /** 能定位到具体节点的错误带 nodeId，用于画布标红与点击定位 */
   nodeId?: string;
+  permission?: true;
   message: string;
 }
 
@@ -46,7 +47,7 @@ export function validateDefinition(
     const nodePerms = node.data?.permissions;
     if (nodePerms?.mode === "restrict") {
       for (const msg of validateCapabilities(nodePerms.allow)) {
-        errors.push({ nodeId: node.id, message: `节点「${node.id}」权限：${msg}` });
+        errors.push({ nodeId: node.id, permission: true, message: `节点「${node.id}」权限：${msg}` });
       }
     }
     // required 参数非空（undefined / null / 空串视为缺失）

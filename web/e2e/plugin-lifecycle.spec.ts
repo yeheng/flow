@@ -16,6 +16,7 @@ test("设置页：安装常驻插件，停止并卸载后撤下服务与页面",
   writeFileSync(path.join(source, "plugin.toml"), manifest);
   try {
     await page.goto("/settings");
+    await page.getByRole("tab", { name: "插件与服务", exact: true }).click();
     await page.getByLabel("宿主上的插件目录").fill(source);
     await page.getByRole("button", { name: "安装插件", exact: true }).click();
     const row = page.getByRole("row").filter({ hasText: id });

@@ -1325,10 +1325,13 @@ dependencies = [
  "clap",
  "cron-parser",
  "flow-config",
+ "flow-dispatcher",
  "flow-dto",
  "flow-engine",
  "flow-journal",
+ "flow-plugin-catalog",
  "flow-plugin-sdk",
+ "flow-policy",
  "fs2",
  "futures",
  "hex",
@@ -1393,6 +1396,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "flow-dispatcher"
+version = "0.1.0"
+dependencies = [
+ "flow-facts",
+ "futures",
+ "getrandom 0.4.3",
+ "hex",
+ "interprocess",
+ "libc",
+ "parking_lot",
+ "postcard",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "flow-domain"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "flow-dto",
+ "flow-facts",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "flow-dto"
 version = "0.1.0"
 dependencies = [
@@ -1409,25 +1447,31 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "chrono",
+ "flow-dispatcher",
+ "flow-domain",
  "flow-dto",
  "flow-journal",
- "futures",
- "getrandom 0.4.3",
  "hex",
- "interprocess",
- "libc",
- "parking_lot",
- "postcard",
  "reqwest",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "thiserror 2.0.21",
  "tokio",
- "tokio-tungstenite",
  "tokio-util",
  "tracing",
- "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "flow-facts"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1436,6 +1480,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "chrono",
+ "flow-facts",
  "fs2",
  "hex",
  "rusqlite",
@@ -1451,6 +1496,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "flow-plugin-catalog"
+version = "0.1.0"
+dependencies = [
+ "flow-config",
+ "flow-domain",
+ "flow-plugin-sdk",
+ "hex",
+ "serde_json",
+ "sha2 0.11.0",
+]
+
+[[package]]
 name = "flow-plugin-sdk"
 version = "0.1.0"
 dependencies = [
@@ -1462,6 +1519,14 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+]
+
+[[package]]
+name = "flow-policy"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "flow-dto",
 ]
 
 [[package]]

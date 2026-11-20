@@ -53,13 +53,25 @@ it("applies validated top-level options with undo and redo", async () => {
     permissions: { version: 1, mode: "bypass", allow: [] },
     input_schema: { type: "object" },
   };
-  await w.get(".json").setValue(JSON.stringify(definition));
+  await w.get(".json").setValue(JSON.stringify({ name: "imported", definition }));
   expect(await (w.vm as unknown as { apply(): Promise<boolean> }).apply()).toBe(true);
   expect(flowToDefinition()).toEqual(definition);
   undo();
   expect(editor.definitionOptions).toEqual({});
   redo();
   expect(flowToDefinition()).toEqual(definition);
+  w.unmount();
+});
+it("shows the node and secret when validation reports a missing credential", async () => {
+  vi.mocked(api.validateWorkflow).mockResolvedValue({
+    valid: false,
+    missing_secrets: [{ node_id: "recommend", name: "HARNESS_AGENT_API_KEY" }],
+  });
+  const w = render();
+  await w.get(".json").setValue('{"nodes":[],"edges":[],"semantics":2}');
+  expect(await (w.vm as unknown as { apply(): Promise<boolean> }).apply()).toBe(false);
+  expect(w.get('[role="alert"]').text()).toBe("recommend 缺少密钥 HARNESS_AGENT_API_KEY");
+  expect(editor.definitionOptions).toEqual({});
   w.unmount();
 });
 it("does not apply a stale validation response after the draft changes", async () => {

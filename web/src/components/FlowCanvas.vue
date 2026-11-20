@@ -269,6 +269,11 @@ function nodeMenu(node: EditorNode): MenuEntry[] {
       },
     },
     {
+      key: "permissions",
+      label: "编辑节点权限",
+      action: () => openOverlay("canvas-permissions", { nodeId: node.id }),
+    },
+    {
       key: "copy",
       label: "复制",
       hint: "⌘C",

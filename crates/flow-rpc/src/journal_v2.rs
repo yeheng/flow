@@ -612,7 +612,14 @@ async fn dispatch_admitted(
         Method::WorkflowValidate => {
             let backend = b.clone();
             let definition = p["definition"].clone();
-            return tokio::task::spawn_blocking(move || backend.workflow_validate(definition))
+            let environment_credentials = flow_backend::secrets::ENVIRONMENT_CREDENTIALS
+                .try_with(Clone::clone)
+                .ok();
+            return tokio::task::spawn_blocking(move || match environment_credentials {
+                Some(values) => flow_backend::secrets::ENVIRONMENT_CREDENTIALS
+                    .sync_scope(values, || backend.workflow_validate(definition)),
+                None => backend.workflow_validate(definition),
+            })
                 .await.map_err(invalid)?.map_err(failure)
         }
         Method::WorkflowImport => {

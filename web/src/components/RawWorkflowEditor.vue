@@ -3,6 +3,7 @@ import { computed, onUnmounted, ref, watch } from "vue";
 import * as api from "../api/flow";
 import { definitionToFlow, editor, flowToDefinition } from "../state/editor";
 import { commit } from "../state/history";
+import { confirmDialog } from "../state/modal";
 import { errText } from "../rpc/client";
 import { extractDefinition, parseRawDefinition, responseText } from "../state/raw-definition";
 import CodeEditor from "./CodeEditor.vue";
@@ -36,6 +37,7 @@ watch(
 );
 
 async function apply(): Promise<boolean> {
+  if (applying.value) return false;
   error.value = "";
   const source = raw.value;
   const workflowId = editor.workflowId;
@@ -44,7 +46,12 @@ async function apply(): Promise<boolean> {
     const definition = parseRawDefinition(source);
     const result = await api.validateWorkflow(definition);
     if (disposed || workflowId !== editor.workflowId || source !== raw.value) return false;
-    if (!result.valid) throw new Error("工作流校验未通过");
+    if (!result.valid) {
+      const missing = result.missing_secrets
+        .map(({ node_id, name }) => `${node_id} 缺少密钥 ${name}`)
+        .join("；");
+      throw new Error(missing || "工作流校验未通过");
+    }
     const converted = definitionToFlow(definition);
     const { nodes: _nodes, edges: _edges, ...options } = definition;
     commit();
@@ -61,6 +68,11 @@ async function apply(): Promise<boolean> {
   } finally {
     applying.value = false;
   }
+}
+async function discard(): Promise<void> {
+  if (!(await confirmDialog("放弃尚未应用的 JSON 草稿？"))) return;
+  raw.value = baseline.value;
+  error.value = "";
 }
 function useReply(text: string): void {
   try {
@@ -155,8 +167,9 @@ defineExpose({ apply });
   <div class="raw-workflow">
     <section class="json-pane">
       <div class="raw-toolbar">
-        <strong>工作流 JSON</strong><span>{{ pending ? "草稿未应用" : "已同步画布" }}</span
-        ><AppButton :disabled="!pending || applying" @click="apply">{{
+        <strong>工作流 JSON</strong><span>{{ pending ? "草稿未应用" : "已同步画布" }}</span>
+        <AppButton v-if="pending" :disabled="applying" @click="discard">放弃 JSON 草稿</AppButton>
+        <AppButton :disabled="!pending || applying" @click="apply">{{
           applying ? "校验中…" : "校验并应用"
         }}</AppButton>
       </div>

@@ -51,6 +51,89 @@ test("编辑器：画布渲染、顶部条、改参数保存无错误", async ({
   await expect(page.locator(".wf-dirty")).toHaveCount(0);
 });
 
+test("编辑器：在画布修改工作流和节点权限并保存", async ({ page }) => {
+  const wf = await seedWorkflow(uniq("e2e-画布权限"), "return 1;");
+  await page.goto(`/workflows/${wf.id}`);
+  await expect(page.locator(".vue-flow__node")).toHaveCount(3);
+
+  await page.getByRole("button", { name: "编辑工作流权限" }).click();
+  const workflow = page.getByRole("dialog", { name: "编辑工作流权限" });
+  await workflow.getByRole("button", { name: "添加能力" }).click();
+  const apply = workflow.getByRole("button", { name: "应用到画布" });
+  await expect(apply).toBeDisabled();
+  await expect(workflow.getByRole("alert").last()).toContainText("URL 前缀");
+  await workflow.getByLabel("URL 前缀").fill("https://example.test/data");
+  await apply.click();
+
+  await page.locator(".vue-flow__node").nth(1).click();
+  await page.getByRole("button", { name: "编辑节点权限" }).click();
+  const node = page.getByRole("dialog", { name: "编辑节点权限" });
+  await node.getByLabel("权限模式").selectOption("restrict");
+  await node.getByRole("button", { name: "应用到画布" }).click();
+  await page.getByRole("button", { name: "保存", exact: true }).click();
+  await expect(page.locator(".toast-success")).toContainText("已保存 v2");
+  const saved = await rpc<{ definition: {
+    permissions: unknown;
+    nodes: Array<{ id: string; permissions?: unknown }>;
+  } }>("workflow.get.view", { workflow_id: wf.id });
+  expect(saved.definition.permissions).toMatchObject({
+    mode: "execute",
+    allow: [{ action: "net", url_prefix: "https://example.test/data" }],
+  });
+  expect(saved.definition.nodes.find((n) => n.id === "n")?.permissions).toEqual({
+    mode: "restrict", allow: [],
+  });
+});
+
+test("编辑器：权限与 Raw JSON 共用画布草稿", async ({ page }) => {
+  const wf = await seedWorkflow(uniq("e2e-共享草稿"), "return 1;");
+  const path = `/workflows/${wf.id}`;
+  await page.goto(`${path}/permissions`);
+  await page.getByRole("link", { name: "编辑工作流权限" }).click();
+  const permissions = page.getByRole("dialog", { name: "编辑工作流权限" });
+  await permissions.getByLabel("权限模式").selectOption("plan");
+  await permissions.getByRole("button", { name: "应用到画布" }).click();
+  await page.getByRole("link", { name: "权限详情" }).click();
+  await expect(page.getByRole("heading", { name: /权限详情/ })).toContainText("已发布");
+  await page.getByRole("link", { name: "版本", exact: true }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "取消", exact: true }).click();
+  await expect(page).toHaveURL(`${path}/permissions`);
+  await page.getByRole("link", { name: "编辑工作流权限" }).click();
+  await expect(permissions.getByLabel("权限模式")).toHaveValue("plan");
+  await permissions.getByRole("button", { name: "取消", exact: true }).click();
+
+  await page.getByRole("button", { name: "Raw JSON" }).click();
+  const code = page.locator(".json-pane .monaco-editor");
+  await code.click();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.insertText("{");
+  await page.getByRole("button", { name: "画布", exact: true }).click();
+  await expect(page.locator(".json-pane [role=alert]")).toBeVisible();
+  await expect(code).toBeVisible();
+
+  const stored = await rpc<{ published_version: number; definition: {
+    nodes: { id: string; name?: string }[];
+    permissions?: { version: number; mode: string; allow: unknown[] };
+  } }>("workflow.get.view", { workflow_id: wf.id });
+  stored.definition.nodes.find((n) => n.id === "n")!.name = "从 JSON 修改";
+  stored.definition.permissions = { version: 1, mode: "plan", allow: [] };
+  await code.click();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.insertText(JSON.stringify(stored.definition));
+  await page.getByRole("button", { name: "编辑工作流权限" }).click();
+  await expect(permissions.getByLabel("权限模式")).toHaveValue("plan");
+  await permissions.getByLabel("权限模式").selectOption("execute");
+  await permissions.getByRole("button", { name: "取消", exact: true }).click();
+  await page.getByRole("button", { name: "画布", exact: true }).click();
+  await expect(page.locator(".vue-flow__node").filter({ hasText: "从 JSON 修改" })).toBeVisible();
+  await page.getByRole("button", { name: "保存", exact: true }).click();
+  await expect(page.locator(".toast-success")).toContainText("已保存 v2");
+  const updated = await rpc<typeof stored>("workflow.get.view", { workflow_id: wf.id });
+  expect(updated.definition.permissions?.mode).toBe("plan");
+  expect(updated.definition.nodes.find((n) => n.id === "n")?.name).toBe("从 JSON 修改");
+  expect(updated.published_version).toBe(wf.version);
+});
+
 test("业务节点：存为业务节点 → 另一流程插入 → 刷新仍在", async ({ page }) => {
   const name = uniq("e2e-模板");
   const wf = await seedWorkflow(name, "return 1;");

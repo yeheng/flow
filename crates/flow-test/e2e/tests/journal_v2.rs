@@ -763,3 +763,47 @@ async fn workflow_import_reports_missing_secrets_without_creating_records() {
     assert!(backend.state().await.unwrap().workflows.is_empty());
     backend.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn workflow_preflight_uses_the_same_environment_credentials_as_save() {
+    let root = flow_test_support::io::TempDir::new("workflow-environment-preflight");
+    let backend = JournalBackend::open(root.path(), Default::default())
+        .await
+        .unwrap();
+    let store = flow_engine::environments::EnvironmentStore::open(&root.path().join("env"))
+        .unwrap();
+    store
+        .save(
+            "staging",
+            "Staging",
+            json!({}),
+            Some(("WORKFLOW_ENV_PREFLIGHT_ONLY", Some("test-value"))),
+            0,
+        )
+        .unwrap();
+    assert!(backend.environments.set(std::sync::Arc::new(store)).is_ok());
+    let token = "workflow-environment-token-at-least-32-bytes";
+    let module = flow_rpc::journal_v2::module(backend.clone(), token.into()).unwrap();
+    let definition = json!({"nodes":[{"id":"s","type":"start"},
+        {"id":"agent","type":"harness","params":{"mode":"agent","prompt":"test","api_key":"WORKFLOW_ENV_PREFLIGHT_ONLY"}},
+        {"id":"e","type":"end"}],"edges":[{"from":"s","to":"agent"},{"from":"agent","to":"e"}]});
+    let args = json!({"_token":token,"environment_id":"staging","definition":definition});
+    let validation = call(&module, "workflow.validate", args.clone()).await;
+    assert_eq!(validation["result"]["valid"], true, "{validation}");
+    let mut default_args = args.clone();
+    default_args["environment_id"] = json!("default");
+    let validation = call(&module, "workflow.validate", default_args).await;
+    assert_eq!(validation["result"]["valid"], false, "{validation}");
+    let created = call(
+        &module,
+        "workflow.create",
+        json!({"_token":token,"name":"environment workflow","request_id":"create"}),
+    )
+    .await;
+    let mut update = args;
+    update["request_id"] = json!("save");
+    update["workflow_id"] = created["result"]["result"]["workflow_id"].clone();
+    let saved = call(&module, "workflow.update", update).await;
+    assert_eq!(saved["result"]["result"]["version"], 1, "{saved}");
+    backend.close().await.unwrap();
+}

@@ -30,6 +30,8 @@ import { toast } from "../state/toast";
 import { SIDE_EFFECT_NODE_TYPES } from "../state/capabilities";
 import AppButton from "../components/AppButton.vue";
 import RawWorkflowEditor from "../components/RawWorkflowEditor.vue";
+import CanvasPermissionsModal from "../components/CanvasPermissionsModal.vue";
+import type { ValidationError } from "../state/validation";
 import NodePalette from "../components/NodePalette.vue";
 import FlowCanvas from "../components/FlowCanvas.vue";
 import ParamsModal from "../components/ParamsModal.vue";
@@ -40,16 +42,33 @@ import { usePanelResize } from "../state/panel-resize";
 
 const rawMode = ref(false);
 const rawPending = ref(false);
-async function confirmRawDiscard(): Promise<boolean> {
-  return !rawPending.value || await confirmDialog("放弃尚未应用的 JSON 草稿？");
+const rawEditor = ref<InstanceType<typeof RawWorkflowEditor> | null>(null);
+const applyingDraft = ref(false);
+
+async function applyRawDraft(): Promise<boolean> {
+  if (applyingDraft.value) return false;
+  if (!rawPending.value) return true;
+  applyingDraft.value = true;
+  try {
+    return (await rawEditor.value?.apply()) === true;
+  } finally {
+    applyingDraft.value = false;
+  }
 }
-async function toggleRawMode(): Promise<void> {
-  if (!(await confirmRawDiscard())) return;
-  rawPending.value = false;
-  rawMode.value = !rawMode.value;
+
+async function saveEditor(action: () => Promise<unknown> = save): Promise<void> {
+  if (saving.value || publishing.value) return;
+  if (await applyRawDraft()) await action();
+}
+
+async function setRawMode(next: boolean): Promise<void> {
+  if (next === rawMode.value || !(await applyRawDraft())) return;
+  rawMode.value = next;
 }
 async function confirmEditorDiscard(): Promise<boolean> {
-  return await confirmRawDiscard() && await confirmDiscardIfDirty();
+  return rawPending.value
+    ? await confirmDialog("离开此工作流并放弃未保存的修改？")
+    : await confirmDiscardIfDirty();
 }
 
 const route = useRoute();
@@ -146,6 +165,7 @@ async function load(id: string): Promise<void> {
   // 密钥名称清单不阻断加载：拉不到时 x-secret 字段仍可手输，重连后自动重试
   void ensureSecrets();
   await refreshWorkflows();
+  if (route.params.id !== id) return;
   // refreshWorkflows 失败（连接断开）时名单为空：跳过存在性校验，交给 selectWorkflow 报错
   if (editor.workflows.length > 0 && !editor.workflows.some((w) => w.workflow_id === id)) {
     toast.error("工作流不存在或已删除");
@@ -156,14 +176,28 @@ async function load(id: string): Promise<void> {
   if (editor.workflowId !== id) await selectWorkflow(id);
 }
 
-onMounted(() => load(route.params.id as string));
+async function openRequestedPermissions(): Promise<void> {
+  const id = route.params.id as string;
+  if (!id || route.query.edit !== "permissions") return;
+  if (editor.workflowId !== id) await load(id);
+  if (editor.workflowId !== id || route.params.id !== id || route.query.edit !== "permissions") return;
+  await openPermissions();
+  if (route.params.id !== id || route.query.edit !== "permissions") return;
+  const { edit: _edit, ...query } = route.query;
+  await router.replace({ query });
+}
+
+onMounted(() => route.query.edit === "permissions"
+  ? openRequestedPermissions()
+  : load(route.params.id as string));
 onUnmounted(cancelRunStart);
 
 // 同组件参数切换（如浏览器前进/后退）：先过脏检查，再加载新工作流
 watch(
-  () => route.params.id,
-  (id, prev) => {
-    if (id && id !== prev && id !== editor.workflowId) void load(id as string);
+  [() => route.params.id, () => route.query.edit],
+  ([id, edit], [previousId]) => {
+    if (edit === "permissions") void openRequestedPermissions();
+    else if (id && id !== previousId && id !== editor.workflowId) void load(id as string);
   },
 );
 
@@ -172,7 +206,9 @@ onBeforeRouteUpdate(async (to) => {
   return confirmEditorDiscard();
 });
 
-onBeforeRouteLeave(() => confirmEditorDiscard());
+onBeforeRouteLeave((to) => to.path === `/workflows/${editor.workflowId}/permissions`
+  ? applyRawDraft()
+  : confirmEditorDiscard());
 
 // 刷新/关页没有路由守卫可拦：仅 dirty 时触发浏览器原生确认（与编辑器同一份 dirty 判定）
 function onBeforeUnload(e: BeforeUnloadEvent): void {
@@ -208,8 +244,7 @@ function onKeydown(e: KeyboardEvent): void {
   const key = e.key.toLowerCase();
   if (key === "s") {
     e.preventDefault();
-    if (rawPending.value) toast.error("请先校验并应用 JSON 草稿");
-    else void save();
+    void saveEditor();
     return;
   }
   if (key === "b") {
@@ -250,10 +285,18 @@ function onPointerDownOutside(e: PointerEvent): void {
 onMounted(() => window.addEventListener("pointerdown", onPointerDownOutside, true));
 onUnmounted(() => window.removeEventListener("pointerdown", onPointerDownOutside, true));
 
-function locateError(nodeId?: string): void {
-  if (nodeId) {
-    editor.selectedNodeId = nodeId;
-    openOverlay("params", { nodeId });
+async function openPermissions(nodeId?: string): Promise<void> {
+  const id = editor.workflowId;
+  if ((await applyRawDraft()) && id === editor.workflowId) {
+    openOverlay("canvas-permissions", { nodeId });
+  }
+}
+
+function locateError(error: ValidationError): void {
+  if (error.permission) void openPermissions(error.nodeId);
+  else if (error.nodeId) {
+    editor.selectedNodeId = error.nodeId;
+    openOverlay("params", { nodeId: error.nodeId });
   }
   validationUi.open = false;
 }
@@ -315,16 +358,19 @@ const legacyPermissions = computed(
           <RouterLink class="link" :to="`/workflows/${editor.workflowId}/triggers`">
             触发器
           </RouterLink>
-          <RouterLink class="link" :to="`/workflows/${editor.workflowId}/permissions`">
-            权限
-          </RouterLink>
+          <RouterLink class="link" :to="`/workflows/${editor.workflowId}/permissions`">权限详情</RouterLink>
           <RouterLink class="link" :to="`/workflows/${editor.workflowId}/runs`"
             >运行记录</RouterLink
           >
         </template>
       </nav>
       <div class="editor-actions">
-        <AppButton @click="toggleRawMode">{{ rawMode ? "切换画布" : "Raw JSON" }}</AppButton>
+        <div class="editor-mode" role="group" aria-label="工作流编辑方式">
+          <AppButton :aria-pressed="!rawMode" :disabled="applyingDraft" @click="setRawMode(false)">画布</AppButton>
+          <AppButton :aria-pressed="rawMode" :disabled="applyingDraft" @click="setRawMode(true)">Raw JSON</AppButton>
+        </div>
+        <AppButton :disabled="!editor.workflowId || applyingDraft" @click="openPermissions()">编辑工作流权限</AppButton>
+        <AppButton v-if="!rawMode && editor.selectedNodeId" @click="openPermissions(editor.selectedNodeId)">编辑节点权限</AppButton>
         <AppButton title="撤销 (⌘Z)" :disabled="rawPending || !history.canUndo" @click="undo()">↶ 撤销</AppButton>
         <AppButton title="重做 (⌘⇧Z)" :disabled="rawPending || !history.canRedo" @click="redo()"
           >↷ 重做</AppButton
@@ -351,17 +397,17 @@ const legacyPermissions = computed(
               :key="i"
               type="button"
               class="validation-item"
-              :class="{ clickable: !!err.nodeId }"
-              @click="locateError(err.nodeId)"
+              :class="{ clickable: !!err.nodeId || err.permission }"
+              @click="locateError(err)"
             >
               {{ err.message }}
             </button>
           </div>
         </span>
-        <AppButton title="保存 (⌘S)" :disabled="rawPending || saving" @click="save()">
+        <AppButton title="保存 (⌘S)" :disabled="applyingDraft || saving || publishing" @click="saveEditor()">
           {{ saving ? "保存中…" : "保存" }}
         </AppButton>
-        <AppButton :disabled="rawPending || publishing" @click="publish()">
+        <AppButton :disabled="applyingDraft || saving || publishing" @click="saveEditor(publish)">
           {{ publishing ? "发布中…" : "发布" }}
         </AppButton>
         <AppButton
@@ -383,12 +429,10 @@ const legacyPermissions = computed(
     <!-- legacy：无权限块的旧工作流（含副作用节点）不能启动新 run，引导去权限页 -->
     <div v-if="legacyPermissions" class="legacy-banner">
       工作流未声明权限（legacy）：含副作用节点的旧工作流不能启动新 run。
-      <RouterLink class="link" :to="`/workflows/${editor.workflowId}/permissions`">
-        前往权限页创建权限块 →
-      </RouterLink>
+      <AppButton :disabled="applyingDraft" @click="openPermissions()">创建工作流权限</AppButton>
     </div>
     <main class="editor-main" :class="`console-${effectiveConsoleMode}`">
-      <RawWorkflowEditor v-if="rawMode" :key="editor.workflowId ?? 'empty'" class="raw-body" @pending="rawPending = $event" />
+      <RawWorkflowEditor v-if="rawMode" ref="rawEditor" :key="editor.workflowId ?? 'empty'" class="raw-body" @pending="rawPending = $event" />
       <div v-else class="editor-body">
         <aside
           ref="paletteEl"
@@ -431,6 +475,7 @@ const legacyPermissions = computed(
       </section>
     </main>
     <ParamsModal />
+    <CanvasPermissionsModal />
     <BusinessNodeDialog />
   </div>
 </template>
@@ -591,6 +636,16 @@ aside.left.collapsed {
   gap: 8px;
   row-gap: 6px;
   align-items: center;
+}
+
+.editor-mode {
+  display: flex;
+  gap: 2px;
+}
+
+.editor-mode button[aria-pressed="true"] {
+  color: var(--text);
+  border-color: var(--signal);
 }
 
 /* 校验错误徽章与列表 popover */

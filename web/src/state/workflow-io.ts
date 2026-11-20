@@ -165,6 +165,11 @@ export async function importWorkflow(
     for (const key of names) await api.setSecret(key, String(values[key]));
     validation = await api.validateWorkflow(prepared);
   }
-  if (!validation.valid) throw new Error("工作流校验未通过，请检查配置后重试");
+  if (!validation.valid) {
+    const missing = validation.missing_secrets
+      .map(({ node_id, name }) => `${node_id} 缺少密钥 ${name}`)
+      .join("；");
+    throw new Error(missing || "工作流校验未通过");
+  }
   return api.importWorkflowDefinition(name, prepared, opts.publish ?? true);
 }

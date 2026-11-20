@@ -1,7 +1,11 @@
 import type { Definition } from "../types";
 
 export function parseRawDefinition(text: string): Definition {
-  const value = JSON.parse(text);
+  const document = JSON.parse(text);
+  const value = document && typeof document === "object" &&
+    !Array.isArray(document) && !("nodes" in document) && "definition" in document
+    ? document.definition
+    : document;
   if (
     !value ||
     typeof value !== "object" ||

@@ -590,12 +590,9 @@ async function saveSnapshot(token?: number): Promise<SavedWorkflow | null> {
   if (!editor.workflowId || saving.value) return null;
   // 保存前过前端预校验：有错不打 RPC（服务端 validate 仍是最终裁决）
   const errs = validateNow();
-  // 顶层权限块（definitionOptions.permissions）不在 validateDefinition 的输入里，单独校验
-  const topPerms = editor.definitionOptions.permissions;
-  if (topPerms) errs.push(...validateCapabilities(topPerms.allow).map((msg) => ({ message: `工作流权限：${msg}` })));
   if (errs.length > 0) {
     validationUi.open = true;
-    toast.error(`工作流定义有 ${errs.length} 处校验错误，请先修复`);
+    toast.error(errs[0].message);
     return null;
   }
   const workflowId = editor.workflowId;
@@ -886,11 +883,11 @@ export const validationUi = reactive({ open: false });
 
 let validationTimer: ReturnType<typeof setTimeout> | null = null;
 watch(
-  [() => editor.nodes, () => editor.edges],
+  [() => editor.nodes, () => editor.edges, () => editor.definitionOptions.permissions, () => editor.nodeTypes],
   () => {
     if (validationTimer) clearTimeout(validationTimer);
     validationTimer = setTimeout(() => {
-      validationErrors.value = validateDefinition(editor.nodes, editor.edges, editor.nodeTypes);
+      validateNow();
     }, 150);
   },
   { deep: true, immediate: true },
@@ -898,7 +895,14 @@ watch(
 
 /** 同步重算（保存门禁用，不等 debounce） */
 export function validateNow(): ValidationError[] {
-  validationErrors.value = validateDefinition(editor.nodes, editor.edges, editor.nodeTypes);
+  const errors = validateDefinition(editor.nodes, editor.edges, editor.nodeTypes);
+  const permissions = editor.definitionOptions.permissions;
+  if (permissions) {
+    for (const message of validateCapabilities(permissions.allow)) {
+      errors.push({ permission: true, message: `工作流权限：${message}` });
+    }
+  }
+  validationErrors.value = errors;
   return validationErrors.value;
 }
 

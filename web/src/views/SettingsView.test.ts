@@ -108,6 +108,7 @@ function mockConfigView(cfg: FlowConfig): ConfigView {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  sessionStorage.clear();
   vi.mocked(api.getConfig).mockResolvedValue(mockConfigView(config()));
   // 保存回显服务端写回的同一视图（这里直接以 patch 当写回结果）
   vi.mocked(api.updateConfig).mockImplementation(async (patch) =>
@@ -122,12 +123,18 @@ afterEach(() => {
 describe("settings execution/agent fields", () => {
   it("prewarm 开关 round-trip：整包 config.update 带回开关值且不丢未编辑字段", async () => {
     const w = create();
+    await w.get('#settings-tab-execution').trigger("click");
     await flushPromises();
 
     const checkbox = field(w, "预热执行器").find("input[type=checkbox]");
     expect((checkbox.element as HTMLInputElement).checked).toBe(false);
     await checkbox.setValue(true);
     expect(field(w, "预热执行器").text()).toContain("开启");
+
+    await w.get("#settings-tab-harness").trigger("click");
+    expect(w.findAll(".field").some((el) => el.text().includes("预热执行器"))).toBe(false);
+    await w.get("#settings-tab-execution").trigger("click");
+    expect((field(w, "预热执行器").find("input").element as HTMLInputElement).checked).toBe(true);
 
     await buttonByText(w, "保存（重启后生效）").trigger("click");
     await flushPromises();
@@ -146,6 +153,7 @@ describe("settings execution/agent fields", () => {
 
   it("execution.remote.wss_addr 与 agents（id/token 行编辑 + 增删）随整包保存", async () => {
     const w = create();
+    await w.get('#settings-tab-execution').trigger("click");
     await flushPromises();
 
     await field(w, "WSS 接入地址").find("input").setValue("wss://127.0.0.1:9443");
@@ -171,6 +179,7 @@ describe("settings execution/agent fields", () => {
 
   it("agent.wss_url / token 可编辑；data_addr 标已废弃且只读（存量值不丢）", async () => {
     const w = create();
+    await w.get('#settings-tab-execution').trigger("click");
     await flushPromises();
 
     await field(w, "WSS 上联地址").find("input").setValue("wss://agent-up");
@@ -206,6 +215,7 @@ describe("settings harness.agent fields", () => {
 
   it("base_url/model/api 可编辑并随整包保存；api_key 提示指向密钥管理", async () => {
     const w = create();
+    await w.get('#settings-tab-harness').trigger("click");
     await flushPromises();
 
     await exactField(w, "base_url").find("input").setValue("https://api.deepseek.com/v1");
@@ -227,6 +237,7 @@ describe("settings harness.agent fields", () => {
 
   it("成对校验提示：base_url 有帮助文案说明与 model 成对启用", async () => {
     const w = create();
+    await w.get('#settings-tab-harness').trigger("click");
     await flushPromises();
     expect(w.text()).toContain("与 model 成对配置才启用");
   });

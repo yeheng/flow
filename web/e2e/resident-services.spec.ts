@@ -95,6 +95,7 @@ test("常驻插件：隔离页面双向通信、插件间路由及关闭后回�
       }),
     ).rejects.toThrow("forbidden");
     await page.goto("/settings");
+    await page.getByRole("tab", { name: "插件与服务", exact: true }).click();
     const panel = page.locator(".resident-services");
     await panel
       .getByRole("listitem")

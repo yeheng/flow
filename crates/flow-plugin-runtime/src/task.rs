@@ -291,7 +291,7 @@ impl TaskRunner {
         // 每次尝试一条开始行 + 一条终态行：没有它们，script/condition 节点
         // （脚本不打 console 时）在观测日志里整段静默，用户看不到节点在跑。
         // start/end 是零工作量的流程节点，不产生叙事。
-        let narrative = narrative_kind(node.kind());
+        let narrative = narrative_kind(&node);
         if let Some(label) = narrative {
             logger.info(format!(
                 "开始执行：{label}{}",
@@ -1939,12 +1939,13 @@ async fn drain_observations(logger: flow_engine::NodeLogger, close: Option<Obser
 }
 
 /// 节点类型的叙事名：观测日志的开始/终态行用它拼出人话。
-fn narrative_kind(kind: Option<NodeType>) -> Option<&'static str> {
-    match kind? {
+fn narrative_kind(node: &Node) -> Option<&'static str> {
+    match node.kind()? {
         NodeType::Script => Some("脚本"),
         NodeType::Condition => Some("条件判断"),
         NodeType::HttpCall => Some("HTTP 请求"),
         NodeType::Email => Some("发送邮件"),
+        NodeType::Harness if node.is_harness_agent() => Some("Harness 代理"),
         NodeType::Harness => Some("本地命令"),
         NodeType::Llm => Some("模型调用"),
         NodeType::Delay => Some("延时等待"),
