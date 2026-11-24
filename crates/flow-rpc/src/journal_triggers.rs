@@ -232,13 +232,13 @@ fn run_authorized(state: &HookState, id: &str, headers: &HeaderMap) -> bool {
 /// 悄悄走错分支。
 fn invocation_error(error: JournalError) -> Response {
     match error {
-        JournalError::Journal(flow_journal::Error::Conflict(message)) => {
+        JournalError::Journal(flow_facts::Error::Conflict(message)) => {
             (StatusCode::CONFLICT, message).into_response()
         }
-        JournalError::Journal(flow_journal::Error::Invalid(message)) => {
+        JournalError::Journal(flow_facts::Error::Invalid(message)) => {
             (StatusCode::BAD_REQUEST, message).into_response()
         }
-        JournalError::Journal(flow_journal::Error::Limit(message)) => {
+        JournalError::Journal(flow_facts::Error::Limit(message)) => {
             (StatusCode::TOO_MANY_REQUESTS, message).into_response()
         }
         // 其余错误（存储不可用等）一律 503：可重试，客户端应退避重试。
@@ -258,7 +258,7 @@ async fn invoke(
     body: Bytes,
 ) -> Response {
     let key = bearer(&headers);
-    let hash = flow_journal::codec::digest(key.as_bytes());
+    let hash = flow_facts::codec::digest(key.as_bytes());
     // 匹配 hook 配置里保存的密钥摘要：服务端不保存明文业务密钥，
     // 泄露配置不等于泄露可用的调用凭据。
     let config = state
@@ -328,7 +328,7 @@ async fn invocation_value(
     // End users may download the public result, not definitions, prepared
     // credentials or arbitrary intermediate values from the management trace.
     match state.backend.run_snapshot(&id).await {
-        Ok(Some(run)) if matches!(run.output.as_ref(),Some(flow_journal::StoredValue::Ref(v)) if v.output_id==output) =>
+        Ok(Some(run)) if matches!(run.output.as_ref(),Some(flow_facts::StoredValue::Ref(v)) if v.output_id==output) =>
             {}
         // 引用存在但不是 run 的公开输出 → 403（无权），而非 404。
         Ok(Some(_)) => return StatusCode::FORBIDDEN.into_response(),
@@ -351,22 +351,16 @@ async fn invocation_result(
     }
     match state.backend.run_snapshot(&id).await {
         Ok(Some(run)) => {
-            let output = run
-                .output
-                .as_ref()
-                .map(|v| {
-                    flow_journal::value::materialize(
-                        state.backend.journal.root(),
-                        state.backend.journal.durable_lsn(),
-                        v,
-                        8 * 1024 * 1024,
-                    )
-                })
-                .transpose();
+            let output = match run.output.as_ref() {
+                Some(value) => flow_backend::journal_views::materialize_run_value(
+                    &state.backend, value, 8 * 1024 * 1024
+                ).await.map(Some),
+                None => Ok(None),
+            };
             match output{
                 Ok(output)=>Json(serde_json::json!({"run_id":id,"status":run.status,"complete":run.terminal(),"output":output,"error":run.error.as_ref().map(|_|"WORKFLOW_FAILED"),"workflow_version":run.workflow_version,"correlation_id":run.execution.as_ref().and_then(|e|e.correlation_id.as_ref())})).into_response(),
                 // 超过内联上限：改用引用 + 下载 URL，语义仍是「结果可得」。
-                Err(flow_journal::Error::Limit(_))=>(StatusCode::PAYLOAD_TOO_LARGE,Json(serde_json::json!({"run_id":id,"status":run.status,"complete":run.terminal(),"output_ref":run.output,"download_url":run.output.as_ref().and_then(|v|match v {flow_journal::StoredValue::Ref(v)=>Some(format!("/invocations/{id}/values/{}",v.output_id)),_=>None})}))).into_response(),
+                Err(flow_facts::Error::Limit(_))=>(StatusCode::PAYLOAD_TOO_LARGE,Json(serde_json::json!({"run_id":id,"status":run.status,"complete":run.terminal(),"output_ref":run.output,"download_url":run.output.as_ref().and_then(|v|match v {flow_facts::StoredValue::Ref(v)=>Some(format!("/invocations/{id}/values/{}",v.output_id)),_=>None})}))).into_response(),
                 Err(_)=>StatusCode::SERVICE_UNAVAILABLE.into_response(),
             }
         }
@@ -396,91 +390,25 @@ async fn invocation_events(
     if !run_authorized(&state, &id, &headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    // 上界取当前 durable_lsn：保证这一页是一个一致快照，不会读到
-    // 「半条事务」。
-    let upper = state.backend.journal.durable_lsn();
-    let cursor = match query.cursor {
-        Some(raw) => match serde_json::from_str(&raw) {
-            Ok(c) => c,
-            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
-        },
-        None => {
-            let mut cursor = flow_journal::page::Cursor::first(
-                state.backend.journal.id().into(),
-                id.clone(),
-                flow_journal::page::Filter::Events,
-                upper,
-            );
-            if let Some(raw) = query.after_lsn {
-                let Ok(after) = raw.parse::<u64>() else {
-                    return StatusCode::BAD_REQUEST.into_response();
-                };
-                // 必须是最小的十进制规范写法且不超过当前上界：否则同一个
-                // after_lsn 会有多种写法，缓存与去重都对不上。
-                if after.to_string() != raw || after > upper {
-                    return StatusCode::BAD_REQUEST.into_response();
-                }
-                // 游标是「不包含下界」语义，因此从 after+1 开始。
-                let Some(next) = after.checked_add(1) else {
-                    return StatusCode::BAD_REQUEST.into_response();
-                };
-                cursor.next_lsn = next;
-            }
-            cursor
+    match flow_backend::journal_views::invocation_events(
+        &state.backend,
+        id,
+        query.cursor,
+        query.after_lsn,
+    )
+    .await
+    {
+        Ok(page) => Json(page).into_response(),
+        Err(flow_backend::journal_views::EventReadError::Invalid(_)) => {
+            StatusCode::BAD_REQUEST.into_response()
         }
-    };
-    match flow_journal::page::page(
-        state.backend.journal.root(),
-        state.backend.journal.id(),
-        &id,
-        flow_journal::page::Filter::Events,
-        cursor,
-        upper,
-        100,
-    ) {
-        Ok(mut page) => {
-            use flow_journal::EventKind;
-            // 白名单：只保留业务进展类事件，执行器内部的审计事实
-            // （含更多细节）不属于调用方可观测范围。
-            page.events.retain(|v| {
-                matches!(
-                    v.event.kind,
-                    EventKind::RunStarted
-                        | EventKind::RunCompleted
-                        | EventKind::RunFailed
-                        | EventKind::RunCancelled
-                        | EventKind::DispatchStarted
-                        | EventKind::NodeCompleted
-                        | EventKind::NodeFailed
-                        | EventKind::NodeSkipped
-                        | EventKind::WaitRegistered
-                        | EventKind::WaitResolved
-                        | EventKind::SignalReceived
-                )
-            });
-            for positioned in &mut page.events {
-                let event = &mut positioned.event;
-                // payload 裁剪：只留下业务需要的字段，失败统一成
-                // EXECUTION_FAILED（不泄露内部错误细节）。
-                event.payload = match event.kind {
-                    EventKind::RunStarted => {
-                        serde_json::json!({"workflow_version":event.payload["workflow_version"]})
-                    }
-                    EventKind::WaitRegistered => {
-                        serde_json::json!({"wait":{"kind":event.payload["wait"]["kind"],"wake_at":event.payload["wait"]["wake_at"]}})
-                    }
-                    EventKind::NodeSkipped => serde_json::json!({"reason":event.payload["reason"]}),
-                    EventKind::NodeFailed | EventKind::RunFailed => {
-                        serde_json::json!({"error":"EXECUTION_FAILED"})
-                    }
-                    _ => serde_json::json!({}),
-                };
-            }
-            Json(page).into_response()
+        Err(flow_backend::journal_views::EventReadError::Journal(error)) => {
+            invocation_error(error.into())
         }
-        Err(e) => invocation_error(e.into()),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
+
 /// `POST /invocations/{id}/signals/{node}`：向人工节点投递输入。
 ///
 /// 只能作用于 human_task / input 节点：能力令牌不该成为驱动外部系统
@@ -508,13 +436,7 @@ async fn invocation_signal(
         Ok(Some(r)) => r,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
-    let definition = match flow_journal::value::materialize(
-        state.backend.journal.root(),
-        state.backend.journal.durable_lsn(),
-        &run.definition,
-        flow_journal::MAX_LINE_BYTES,
-    )
-    .and_then(|v| flow_engine::journal_state::validate_definition(&v))
+    let definition = match flow_backend::journal_views::signal_definition(&state.backend, &run).await
     {
         Ok(d) => d,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),

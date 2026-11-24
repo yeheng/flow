@@ -9,7 +9,7 @@
 //! 把方法路由到独立的命名 Handler。对外 JSON-RPC 2.0 契约（错误码、错误
 //! 文本、回执形状）逐字保持，改动仅限内部组织。
 use flow_backend::journal::{JournalBackend, JournalError};
-use flow_journal::page::{Cursor, Filter};
+use flow_backend::journal_views::{self, EventReadError, EventStream, RunEventTail, RunEvents};
 use jsonrpsee::{types::ErrorObjectOwned, RpcModule};
 use serde_json::{json, Value};
 use std::{net::SocketAddr, sync::Arc};
@@ -94,19 +94,19 @@ use crate::invalid;
 /// 一律降级为 `-32603` internal——不向客户端泄漏内部细节。
 fn failure(error: JournalError) -> ErrorObjectOwned {
     match error {
-        JournalError::Journal(flow_journal::Error::Conflict(message)) => {
+        JournalError::Journal(flow_facts::Error::Conflict(message)) => {
             ErrorObjectOwned::owned(-32012, message, None::<()>)
         }
-        JournalError::Journal(flow_journal::Error::Limit(message)) => {
+        JournalError::Journal(flow_facts::Error::Limit(message)) => {
             ErrorObjectOwned::owned(-32021, message, None::<()>)
         }
-        JournalError::Journal(flow_journal::Error::NotFound(message)) => {
+        JournalError::Journal(flow_facts::Error::NotFound(message)) => {
             ErrorObjectOwned::owned(-32011, message, None::<()>)
         }
-        JournalError::Journal(flow_journal::Error::Forbidden(message)) => {
+        JournalError::Journal(flow_facts::Error::Forbidden(message)) => {
             ErrorObjectOwned::owned(PERMISSION_ERROR, message, None::<()>)
         }
-        JournalError::Journal(flow_journal::Error::Invalid(message)) => invalid(message),
+        JournalError::Journal(flow_facts::Error::Invalid(message)) => invalid(message),
         _ => ErrorObjectOwned::owned(-32603, "journal service unavailable", None::<()>),
     }
 }
@@ -736,9 +736,9 @@ async fn dispatch_admitted(
             // 事件种类与方法一一对应：journal 里「什么被改了」是事实，
             // 不能由调用方自由声明。
             let kind = if method == Method::ScheduleChange {
-                flow_journal::EventKind::ScheduleChanged
+                flow_facts::EventKind::ScheduleChanged
             } else {
-                flow_journal::EventKind::WebhookChanged
+                flow_facts::EventKind::WebhookChanged
             };
             let req = ConfigChangeReq::parse(&p)?;
             b.config_change(method.as_str(), kind, req.key, req.patch, request)
@@ -1272,13 +1272,7 @@ async fn plugins_recheck(ctx: &Context) -> Result<Value, ErrorObjectOwned> {
 async fn observations_page(b: &JournalBackend, p: &Value) -> Result<Value, ErrorObjectOwned> {
     let run_id = text(p, "run_id")?.to_owned();
     // 存在性以投影为准：投影是「这个 run 被系统承认过」的权威判据。
-    if b.store
-        .get_summary("run", &run_id)
-        .await
-        .map_err(invalid)?
-        .1
-        .is_none()
-    {
+    if !journal_views::run_exists(b, &run_id).await.map_err(invalid)? {
         return Err(ErrorObjectOwned::owned(-32011, "run not found", None::<()>));
     }
     // 观测存储未启用（可选组件）时返回空页 + 丢失标记，而不是报错：
@@ -1325,20 +1319,8 @@ async fn snapshot_list(
     // 实体类别直接取方法名的首段：三个方法共享同一套快照语义。
     let kind = method.split('.').next().unwrap();
     let after = p["after"].as_str().unwrap_or("");
-    let (lsn, values) = b
-        .store
-        .list(
-            kind,
-            after,
-            // 页大小上限 256：快照读会一次性物化整页，过大的页会拖慢投影。
-            p["limit"].as_u64().unwrap_or(64).min(256) as usize,
-        )
-        .await
-        .map_err(storage_failure)?;
-    Ok(json!({
-        "snapshot_cursor": {"journal_id": b.journal.id(), "lsn": lsn.to_string()},
-        "values": values,
-    }))
+    let limit = p["limit"].as_u64().unwrap_or(64).min(256) as usize;
+    journal_views::snapshot_list(b, kind, after, limit).await.map_err(storage_failure)
 }
 
 /// workflow.get / run.get / legacy.get：单键快照。
@@ -1358,11 +1340,7 @@ async fn snapshot_get(
             _ => "workflow_id",
         },
     )?;
-    let (lsn, value) = b.store.get(kind, key).await.map_err(storage_failure)?;
-    Ok(json!({
-        "snapshot_cursor": {"journal_id": b.journal.id(), "lsn": lsn.to_string()},
-        "value": value,
-    }))
+    journal_views::snapshot_get(b, kind, key).await.map_err(storage_failure)
 }
 
 /// run.events.page / run.audit.page：游标化 journal 事件/审计分页。
@@ -1374,200 +1352,37 @@ async fn events_page(
     method: &str,
     p: &Value,
 ) -> Result<Value, ErrorObjectOwned> {
-    let run_id = text(p, "run_id")?.to_owned();
-    // upper（本次页的 LSN 上界）先从投影取，保证整页读同一个快照。
-    let (upper, run) = b
-        .store
-        .get_summary("run", &run_id)
+    let read = open_run_events(b, p).await?;
+    let stream = match method {
+        "run.events.page" => EventStream::Control,
+        "run.audit.page" if p.get("filter").and_then(Value::as_str) == Some("permission") =>
+            EventStream::Permission,
+        _ => EventStream::Audit,
+    };
+    read.page(stream, p.get("cursor"), p.get("limit"))
         .await
-        .map_err(storage_failure)?;
-    if run.is_none() {
-        return Err(ErrorObjectOwned::owned(-32011, "run not found", None::<()>));
-    }
-    // 事件面与审计面是两种不同的流：前者是业务进展，后者是执行器审计事实。
-    // permissions 模式（09 §10.3）过滤权限事件闭集（谁在何时批了什么）。
-    let filter = match method {
-        "run.events.page" => Filter::Events,
-        "run.audit.page" if p.get("filter").and_then(Value::as_str) == Some("permission") => {
-            Filter::Permission
-        }
-        _ => Filter::Audit,
-    };
-    let identity = b.journal.id().to_owned();
-    // 无游标 = 从第一页开始；游标自带过滤条件与位置，必须与本次请求的
-    // run/filter 一致，否则会串页。
-    let cursor = match p.get("cursor").filter(|v| !v.is_null()) {
-        Some(v) => serde_json::from_value::<Cursor>(v.clone()).map_err(invalid)?,
-        None => Cursor::first(identity.clone(), run_id.clone(), filter, upper),
-    };
-    let limit = p
-        .get("limit")
-        .map(|v| v.as_u64().ok_or_else(|| invalid("invalid limit")))
-        .transpose()?
-        .unwrap_or(256)
-        .min(256) as usize;
-    let root = b.journal.root().to_path_buf();
-    // 文件扫描放阻塞线程池：这一段是同步 IO，压在异步 worker 上会拖慢
-    // 整个 RPC 面。
-    let page = tokio::task::spawn_blocking(move || {
-        flow_journal::page::page(&root, &identity, &run_id, filter, cursor, upper, limit)
-    })
-    .await
-    .map_err(invalid)?
-    .map_err(|e| failure(e.into()))?;
-    serde_json::to_value(page).map_err(invalid)
+        .map_err(event_read_failure)
 }
 
-/// permissions.audit.page：数据集级权限审计分页。
-///
-/// 回答「**谁**在**何时**批准了**哪些**命令、依据哪些能力项」：按
-/// run_id / decision / actor(kind) 过滤权限事件闭集。实现按 run 分页
-/// （复用 run 级 Permission 过滤器）：无 run_id 时从在册 run 里逐个收集
-/// 到页满；游标 = 下一批 (run_id, lsn)。
+async fn open_run_events(b: &JournalBackend, p: &Value) -> Result<RunEvents, ErrorObjectOwned> {
+    let run_id = text(p, "run_id")?.to_owned();
+    RunEvents::open(b, run_id)
+        .await
+        .map_err(storage_failure)?
+        .ok_or_else(|| ErrorObjectOwned::owned(-32011, "run not found", None::<()>))
+}
+
+fn event_read_failure(error: EventReadError) -> ErrorObjectOwned {
+    match error {
+        EventReadError::Projection(error) => storage_failure(error),
+        EventReadError::Invalid(message) => invalid(message),
+        EventReadError::Journal(error) => view_failure(error),
+        EventReadError::Task(error) => invalid(error),
+    }
+}
+
 async fn permissions_audit_page(b: &JournalBackend, p: &Value) -> Result<Value, ErrorObjectOwned> {
-    let decision = p.get("decision").and_then(Value::as_str);
-    if let Some(decision) = decision {
-        if !matches!(decision, "allow" | "deny") {
-            return Err(invalid("decision must be allow | deny"));
-        }
-    }
-    let run_id = p.get("run_id").and_then(Value::as_str);
-    let limit = p
-        .get("limit")
-        .map(|v| v.as_u64().ok_or_else(|| invalid("invalid limit")))
-        .transpose()?
-        .unwrap_or(100)
-        .min(256) as usize;
-    // 候选 run：指定 run 或全部在册 run（有权限事实的只占少数，逐 run 扫描
-    // 由 Permission 过滤器短路）。
-    let runs: Vec<String> = match run_id {
-        Some(run_id) => vec![run_id.to_owned()],
-        None => b.run_ids_view().await,
-    };
-    let identity = b.journal.id().to_owned();
-    let root = b.journal.root().to_path_buf();
-    let decision = decision.map(str::to_owned);
-    // 数据集级权限事实（run 外）：游标 run_id 为 null 时只续读数据集段。
-    let dataset_only = p
-        .get("cursor")
-        .is_some_and(|c| !c.is_null() && c["run_id"].is_null());
-    if dataset_only && run_id.is_none() && decision.is_none() {
-        let from_lsn = p["cursor"]["lsn"].as_u64().unwrap_or(1);
-        let dataset = tokio::task::spawn_blocking({
-            let root = root.clone();
-            let identity = identity.clone();
-            move || {
-                flow_journal::page::dataset_permission_events(&root, &identity, from_lsn, limit + 1)
-            }
-        })
-        .await
-        .map_err(invalid)?
-        .map_err(|e| failure(e.into()))?;
-        let complete = dataset.len() <= limit;
-        let events: Vec<Value> = dataset
-            .into_iter()
-            .take(limit)
-            .map(|positioned| serde_json::to_value(&positioned).map_err(invalid))
-            .collect::<Result<_, _>>()?;
-        return Ok(json!({"events": events, "complete": complete}));
-    }
-    let mut events: Vec<Value> = Vec::new();
-    let mut exhausted = true;
-    for run_id in runs {
-        let Some((upper, summary)) = b.store.get_summary("run", &run_id).await.ok() else {
-            continue;
-        };
-        if summary.is_none() {
-            continue;
-        }
-        let mut cursor = match p.get("cursor").filter(|v| !v.is_null()) {
-            // 游标只认 (run_id, lsn) 续读位置：跨 run 续读由 items 顺序保证。
-            Some(v) => {
-                let value = v.clone();
-                let wanted_run = value["run_id"].as_str().unwrap_or(&run_id).to_owned();
-                let from_lsn = value["lsn"].as_u64().unwrap_or(1);
-                Cursor::first(identity.clone(), wanted_run, Filter::Permission, upper)
-                    .with_next_lsn(from_lsn)
-            }
-            None => Cursor::first(identity.clone(), run_id.clone(), Filter::Permission, upper),
-        };
-        loop {
-            let page = tokio::task::spawn_blocking({
-                let root = root.clone();
-                let identity = identity.clone();
-                let run_id = run_id.clone();
-                let cursor = cursor.clone();
-                move || {
-                    flow_journal::page::page(
-                        &root,
-                        &identity,
-                        &run_id,
-                        Filter::Permission,
-                        cursor,
-                        upper,
-                        256,
-                    )
-                }
-            })
-            .await
-            .map_err(invalid)?
-            .map_err(|e| failure(e.into()))?;
-            for positioned in &page.events {
-                // decision 过滤只对裁决事件有意义：给出过滤时只返回匹配的
-                // permission_decided；未给过滤时返回全部权限事实。
-                let record = &positioned.event.payload["record"];
-                let matched = match &decision {
-                    Some(decision) => {
-                        matches!(
-                            positioned.event.kind,
-                            flow_journal::EventKind::PermissionDecided
-                        ) && record["decision"].as_str() == Some(decision.as_str())
-                    }
-                    None => true,
-                };
-                if matched {
-                    events.push(serde_json::to_value(positioned).map_err(invalid)?);
-                }
-            }
-            if events.len() >= limit {
-                exhausted = false;
-                break;
-            }
-            match page.next_cursor {
-                Some(next) => cursor = next,
-                None => break,
-            }
-        }
-        if !exhausted {
-            break;
-        }
-    }
-    events.truncate(limit);
-    // 追加数据集级权限事实（无 run 范围、无 decision 过滤时）：审批审计之外
-    // 的「谁改了权限 / 谁授予了插件」同属权限审计面（09 §10.3）。
-    if run_id.is_none() && decision.is_none() && events.len() < limit {
-        let remaining = limit - events.len();
-        let dataset = tokio::task::spawn_blocking({
-            let root = root.clone();
-            let identity = identity.clone();
-            move || {
-                flow_journal::page::dataset_permission_events(&root, &identity, 1, remaining + 1)
-            }
-        })
-        .await
-        .map_err(invalid)?
-        .map_err(|e| failure(e.into()))?;
-        // 数据集段截断时整页不算读完（续读游标由 CLI 从末条 run_id=null 事件推导）。
-        exhausted &= dataset.len() <= remaining;
-        for positioned in dataset.into_iter().take(remaining) {
-            events.push(serde_json::to_value(&positioned).map_err(invalid)?);
-        }
-    }
-    Ok(json!({
-        "events": events,
-        "complete": exhausted,
-        // 导出提示：JSONL = 逐行 serde_json::to_string(events[i])（CLI 同款）。
-    }))
+    journal_views::permissions_audit_page(b, p).await.map_err(event_read_failure)
 }
 
 /// 产品面：工作流清单视图。
@@ -1670,40 +1485,9 @@ async fn run_list_view(b: &JournalBackend, p: &Value) -> Result<Value, ErrorObje
 /// 与 run.events.page 的差别在于本视图额外支持 `from_seq` 起点，适合
 /// 「接上一次的进度继续看」的场景。
 async fn events_view(b: &JournalBackend, p: &Value) -> Result<Value, ErrorObjectOwned> {
-    let run_id = text(p, "run_id")?.to_owned();
-    let (upper, run) = b
-        .store
-        .get_summary("run", &run_id)
-        .await
-        .map_err(storage_failure)?;
-    if run.is_none() {
-        return Err(ErrorObjectOwned::owned(-32011, "run not found", None::<()>));
-    }
-    // from_seq 与平台序号参数规范同口径（十进制字符串）：传 JSON 数字
-    // 必须显式报错，静默当 0 会从头发送全部事件。
+    let read = open_run_events(b, p).await?;
     let from = decimal_param(p, "from_seq")?;
-    let identity = b.journal.id().to_owned();
-    let root = b.journal.root().to_path_buf();
-    let cursor = match p.get("cursor").filter(|v| !v.is_null()) {
-        Some(v) => serde_json::from_value::<Cursor>(v.clone()).map_err(invalid)?,
-        None => Cursor::first(identity.clone(), run_id.clone(), Filter::Events, upper),
-    };
-    let mut page = tokio::task::spawn_blocking(move || {
-        flow_journal::page::page(
-            &root,
-            &identity,
-            &run_id,
-            Filter::Events,
-            cursor,
-            upper,
-            256,
-        )
-    })
-    .await
-    .map_err(invalid)?
-    .map_err(|e| failure(e.into()))?;
-    page.events.retain(|e| e.event.run_seq >= from);
-    serde_json::to_value(page).map_err(invalid)
+    read.from_sequence(from, p.get("cursor")).await.map_err(event_read_failure)
 }
 
 /// schedule/webhook/template CRUD：cron 与模板片段校验后走统一产品命令
@@ -1951,87 +1735,20 @@ async fn subscribe_run_events(
         Ok(s) => s,
         Err(_) => return,
     };
-    let mut tail = flow_journal::tail::TailReader::for_run(
-        ctx.backend.journal.root(),
-        ctx.backend.journal.id(),
-        &run_id,
-    );
-    // scanned 记录已扫描到的 LSN：既是 tail 续读位置，也是「本轮无需
-    // 再睡」的判据。
-    let mut scanned = 0;
+    let mut tail = RunEventTail::new(ctx.backend.clone(), run_id.clone(), from_seq, from_lsn, audit);
     loop {
         if sink.is_closed() {
             return;
         }
-        // 每轮先取一次投影快照：它给出本轮的 LSN 上界（upper），保证
-        // 这一轮读到的都是已提交的事实。
-        let (upper, row) = match ctx.backend.store.get_summary("run", &run_id).await {
-            Ok(v) => v,
+        let batch = match tail.next().await {
+            Ok(Some(batch)) => batch,
+            Ok(None) => return,
             Err(error) => {
-                tracing::warn!(run = %run_id, %error, "run.subscribe summary read failed; stream ends");
+                tracing::warn!(run = %run_id, %error, "run.subscribe scan failed; stream ends");
                 return;
             }
         };
-        // run 不存在（没这行）直接结束：不是错误，因为订阅一个不存在的
-        // run 本来就无从推送。
-        let Some(row) = row else { return };
-        let terminal = matches!(
-            row["status"].as_str(),
-            Some("succeeded" | "failed" | "cancelled")
-        );
-        let id = run_id.clone();
-        // 阻塞扫描放到线程池：journal 文件是同步 IO，压在异步 worker 上
-        // 会拖慢整个 RPC 面。
-        let batch = tokio::task::spawn_blocking(move || -> flow_journal::Result<_> {
-            let mut records = Vec::new();
-            let mut bytes = 0;
-            let mut latest = scanned;
-            // 单批最多累积 MAX_LINE_BYTES：再大就会被 jsonrpsee 的响应
-            // 体积上限拒收。
-            while bytes < flow_journal::MAX_LINE_BYTES {
-                let Some((tx, location)) = tail.next(upper)? else {
-                    // A filtered reader may exhaust this snapshot without returning
-                    // a transaction at upper. Progress is scan work, not event delivery.
-                    latest = upper;
-                    break;
-                };
-                latest = tx.lsn;
-                bytes += location.bytes as usize;
-                for (index, event) in tx.events.into_iter().enumerate() {
-                    // 两种流各自的推进基准：control 按 run_seq（业务事件序），
-                    // audit 按 lsn（写入序）。
-                    if event.run_id.as_deref() == Some(&id)
-                        && (if audit {
-                            tx.lsn > from_lsn && event.is_audit()
-                        } else {
-                            event.run_seq > from_seq
-                        })
-                    {
-                        records.push(flow_journal::page::PositionedEvent {
-                            lsn: tx.lsn,
-                            event_index: index,
-                            event,
-                        });
-                    }
-                }
-            }
-            Ok((tail, records, latest))
-        })
-        .await;
-        let (reader, records, latest) = match batch {
-            Ok(Ok(v)) => v,
-            Ok(Err(error)) => {
-                tracing::warn!(run = %run_id, %error, "run.subscribe page scan failed; stream ends");
-                return;
-            }
-            Err(join) => {
-                tracing::warn!(run = %run_id, %join, "run.subscribe page scan task failed; stream ends");
-                return;
-            }
-        };
-        tail = reader;
-        scanned = latest;
-        for record in records {
+        for record in batch.records {
             let payload: Value = match serde_json::to_value(&record) {
                 Ok(v) => v,
                 Err(error) => {
@@ -2041,7 +1758,7 @@ async fn subscribe_run_events(
             };
             // 单帧超过上限时先发一帧明确的 stream_error 再断流：
             // 客户端据此知道「事件流因体积中断」，而不是「事件流已结束」。
-            if flow_journal::codec::bounded_json(&payload, flow_journal::MAX_LINE_BYTES - 1024)
+            if flow_facts::codec::bounded_json(&payload, flow_facts::MAX_LINE_BYTES - 1024)
                 .is_err()
             {
                 if let Ok(message) = jsonrpsee::server::SubscriptionMessage::new(
@@ -2071,10 +1788,10 @@ async fn subscribe_run_events(
                 return;
             }
         }
-        if scanned >= upper {
+        if batch.caught_up {
             // 终态 run 的 control 流可以自行结束（后面不会再有业务事件）；
             // audit 流不结束——迟到的审计记录理论上仍可能出现。
-            if terminal && !audit {
+            if batch.terminal && !audit {
                 return;
             }
             tokio::select! {
@@ -2182,11 +1899,11 @@ mod tests {
     #[test]
     fn error_codes_follow_types_instead_of_message_text() {
         assert_eq!(
-            failure(flow_journal::Error::NotFound("任意文案".into()).into()).code(),
+            failure(flow_facts::Error::NotFound("任意文案".into()).into()).code(),
             -32011
         );
         assert_eq!(
-            failure(flow_journal::Error::Invalid("workflow not found".into()).into()).code(),
+            failure(flow_facts::Error::Invalid("workflow not found".into()).into()).code(),
             -32602
         );
         assert_eq!(

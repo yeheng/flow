@@ -434,35 +434,6 @@ pub(crate) fn index_rows(
     Ok(rows)
 }
 
-/// 裁剪协调器的热状态：只保留仍在用的东西。
-///
-/// 裁剪只影响内存占用，不影响正确性——被裁掉的东西都能从 SQLite 的
-/// 当前行按需读回，所以这里可以放心地按「最后两个版本 + 在飞 run」收口。
-pub(crate) fn trim(state: &mut State) {
-    for workflow in state.workflows.values_mut() {
-        let latest = workflow.versions.last_key_value().map(|(v, _)| *v);
-        let published = workflow
-            .versions
-            .iter()
-            .rev()
-            .find(|(_, v)| v.published)
-            .map(|(v, _)| *v);
-        // 只保留最新版本与已发布版本：前者是编辑目标，后者是执行依赖。
-        workflow
-            .versions
-            .retain(|version, _| Some(*version) == latest || Some(*version) == published);
-    }
-    // 终态 run 不再需要调度，直接丢弃出内存。
-    state.runs.retain(|_, run| !run.terminal());
-    for run in state.runs.values_mut() {
-        for node in run.nodes.values_mut() {
-            // 只保留当前 attempt 的账本；旧 attempt 是历史，不参与判定。
-            node.attempts.retain(|id, _| *id == node.dispatch_id);
-        }
-    }
-    state.values.trim_cache();
-}
-
 /// Definition history stays in SQLite. A cold version is loaded only while the
 /// coordinator owns the decision lock, and trimmed after that decision commits.
 ///

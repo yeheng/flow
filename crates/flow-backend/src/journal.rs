@@ -24,6 +24,9 @@ use std::sync::{
     Arc,
 };
 
+use flow_application::commit::{
+    self, CommitRuntime, DurableTransition, TransitionWriter, WriteFailure,
+};
 use flow_engine::journal_state::{CommandRecord, State};
 use flow_journal::page::CommitCursor;
 use flow_journal::query::{EntityChange, Store};
@@ -64,6 +67,32 @@ impl From<serde_json::Error> for JournalError {
 }
 type Result<T> = std::result::Result<T, JournalError>;
 
+struct JournalWriter(Journal);
+
+impl TransitionWriter for JournalWriter {
+    type Changes = Vec<EntityChange>;
+    type Values = Vec<flow_journal::value::StagedValue>;
+
+    async fn write(
+        self,
+        transaction: Transaction,
+        changes: Self::Changes,
+        values: Self::Values,
+    ) -> std::result::Result<DurableTransition, WriteFailure> {
+        self.0
+            .submit_prepared_values(transaction, changes, values)
+            .await
+            .map(|commit| DurableTransition {
+                transaction: commit.transaction,
+                value_prefix: commit.value_prefix,
+            })
+            .map_err(|error| WriteFailure {
+                error,
+                writer_failed: self.0.stats().failure.is_some(),
+            })
+    }
+}
+
 /// 校验命令身份（幂等键）的形状：scope 与 request_id 的长度上限是
 /// 索引键与回执存储的预算边界，越界直接拒绝而不是截断——截断会让两个
 /// 不同请求撞上同一个幂等键。
@@ -77,16 +106,6 @@ fn validate_command_identity(scope: &str, request_id: Option<&str>) -> flow_jour
         ));
     }
     Ok(())
-}
-
-/// 已提交状态的内存镜像：事实、当前状态与「需要重新调度」的 run 集合。
-/// `pending` 表示有一个提交在途，`failure` 表示权威库已不可信——两者
-/// 都会让后续决策 fail closed（见 [`JournalBackend::begin_decision`]）。
-struct CommittedState {
-    state: State,
-    pending: bool,
-    failure: Option<String>,
-    dirty_runs: BTreeSet<String>,
 }
 
 /// journal 权威后端：持有 writer、只读 store 与内存状态投影。
@@ -114,17 +133,13 @@ pub struct JournalBackend {
     pub environments: std::sync::OnceLock<Arc<flow_engine::environments::EnvironmentStore>>,
     pub store: Arc<Store>,
     pub observations: Option<flow_engine::observation::ObservationStore>,
-    state: Arc<Mutex<CommittedState>>,
+    commits: CommitRuntime,
     // Lock order: workflow_metadata → decision → state. Never await IO with state held.
-    decision: Arc<Mutex<()>>,
     /// Workflow mutations take the write guard before the state lock. Dependency
     /// freezing holds a read guard, so it can copy only selected versions while
     /// retaining one consistent metadata view across asynchronous value reads.
     pub(crate) workflow_metadata: RwLock<()>,
-    shutdown: CancellationToken,
     pub(crate) execution: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    execution_changed: Arc<Notify>,
-    commits: tokio::sync::watch::Sender<()>,
     pub(crate) execution_peak: AtomicUsize,
     /// 诊断：协调循环心跳（每轮 select 醒来自增；挂死排查用）。
     pub(crate) coordinator_ticks: AtomicU64,
@@ -368,13 +383,7 @@ impl JournalBackend {
         let state =
             crate::journal_history::load(&store, journal.id(), journal.durable_lsn()).await?;
         let backend = Arc::new(Self {
-            state: Arc::new(Mutex::new(CommittedState {
-                dirty_runs: state.runs.keys().cloned().collect(),
-                state,
-                pending: false,
-                failure: None,
-            })),
-            decision: Arc::new(Mutex::new(())),
+            commits: CommitRuntime::new(state),
             workflow_metadata: RwLock::new(()),
             observations: flow_engine::observation::ObservationStore::open(
                 root.join("observations"),
@@ -383,10 +392,7 @@ impl JournalBackend {
             .ok(),
             journal,
             store,
-            shutdown: CancellationToken::new(),
             execution: Mutex::new(None),
-            execution_changed: Arc::new(Notify::new()),
-            commits: tokio::sync::watch::channel(()).0,
             execution_peak: AtomicUsize::new(0),
             coordinator_ticks: AtomicU64::new(0),
             coordinator_last_tick_ms: AtomicI64::new(0),
@@ -567,7 +573,7 @@ impl JournalBackend {
     /// 提交路径负责——内存先行、落盘随后是崩溃语义的关键（未提交的状态
     /// 在重启后自然消失）。
     pub(crate) async fn update_state<T>(&self, update: impl FnOnce(&mut State) -> T) -> T {
-        update(&mut self.state.lock().await.state)
+        update(&mut self.commits.state.lock().await.state)
     }
 
     /// 取得决策锁，并在权威库已不可信时 fail closed。
@@ -576,17 +582,7 @@ impl JournalBackend {
     /// 某个提交任务在落盘途中被中止——两种情况下的内存状态都不再可信，
     /// 必须拒绝新决策，而不是基于可能过期的状态继续迁移。
     async fn begin_decision(&self) -> Result<tokio::sync::OwnedMutexGuard<()>> {
-        let decision = self.decision.clone().lock_owned().await;
-        let committed = self.state.lock().await;
-        if let Some(error) = &committed.failure {
-            return Err(JournalError::Storage(error.clone()));
-        }
-        if committed.pending {
-            return Err(JournalError::Storage(
-                "commit task stopped before publishing state".into(),
-            ));
-        }
-        Ok(decision)
+        self.commits.begin().await.map_err(JournalError::Storage)
     }
 
     /// 历史上同时在飞的执行器数量峰值（诊断用）。
@@ -602,7 +598,7 @@ impl JournalBackend {
 
     /// 只读地观察当前已提交状态。
     pub(crate) async fn inspect<T>(&self, read: impl FnOnce(&State) -> T) -> T {
-        read(&self.state.lock().await.state)
+        read(&self.commits.state.lock().await.state)
     }
 
     /// Finish any commit whose caller was cancelled before its receipt arrived.
@@ -757,7 +753,7 @@ impl JournalBackend {
         let decision = self
             .update_state(|state| {
                 let result = decide(state);
-                crate::journal_history::trim(state);
+                commit::trim_hot_state(state);
                 result
             })
             .await;
@@ -850,7 +846,7 @@ impl JournalBackend {
         let decision = self
             .update_state(|state| {
                 let result = decide(state);
-                crate::journal_history::trim(state);
+                commit::trim_hot_state(state);
                 result
             })
             .await;
@@ -982,11 +978,7 @@ impl JournalBackend {
             .map_err(JournalError::from)
     }
 
-    /// 把事件、正文与投影行提交为一个 SQLite 事务，并把结果应用到内存状态。
-    ///
-    /// 这是「同一提交决定」的落点：事实、当前行、永久回执与正文在一次
-    /// COMMIT 里可见。提交任务被独立 spawn——调用方取消时任务仍会跑完，
-    /// 否则取消会留下「事实已落盘、状态未发布」的裂缝。
+    /// Preview against committed state and use the same single writer for the whole transition.
     async fn commit_values(
         &self,
         decision: tokio::sync::OwnedMutexGuard<()>,
@@ -994,129 +986,25 @@ impl JournalBackend {
         values: Vec<flow_journal::value::StagedValue>,
     ) -> Result<u64> {
         let upper = self.inspect(|s| s.applied_lsn).await;
-        let chunks: u64 = values.iter().map(|value| value.chunk_count()).sum();
-        // 预留正文分块占用的 LSN，保证事务号大于所有已用 LSN，避免倒退。
-        let final_lsn = upper
-            .checked_add(chunks)
-            .and_then(|lsn| lsn.checked_add(1))
-            .ok_or_else(|| flow_journal::Error::Invalid("LSN overflow".into()))?;
-        let tx = Transaction {
-            v: 2,
-            journal_id: self.journal.id().into(),
-            lsn: final_lsn,
-            tx_id: uuid::Uuid::now_v7().to_string(),
-            events,
-        };
+        let chunks = values.iter().map(|value| value.chunk_count()).sum();
+        let tx = commit::transaction(self.journal.id(), upper, chunks, events)?;
         crate::journal_history::prepare(self, &tx).await?;
         let mut transactions = Vec::new();
         for value in &values {
             transactions.extend(value.prefix(upper + transactions.len() as u64 + 1));
         }
         transactions.push(tx.clone());
-        // preview 先把本次事务的投影行算出来：reducer 的 UndoLog 让失败
-        // 时的回滚与成功时的落库共用同一条路径。
         let rows = self
-            .update_state(|state| {
-                state.preview_batch(&transactions, |next| {
-                    crate::journal_history::index_rows(next, &tx)
-                })
-            })
+            .commits
+            .preview(&transactions, |next| crate::journal_history::index_rows(next, &tx))
             .await?;
-        let journal = self.journal.clone();
-        let changed = self.execution_changed.clone();
-        let state = self.state.clone();
-        let shutdown = self.shutdown.clone();
-        let commits = self.commits.clone();
-        self.state.lock().await.pending = true;
-        // The accepted task owns the decision guard through durable commit and apply.
-        // Dropping the caller only drops its JoinHandle; this task still finishes.
-        tokio::spawn(async move {
-            let result = journal.submit_prepared_values(tx, rows, values).await;
-            // A rejected transition rolls back cleanly and must not poison the backend.
-            // A writer failure, or reducer failure after COMMIT, is unrecoverable here.
-            let durable = result.is_ok();
-            let writer_failed = journal.stats().failure.is_some();
-            let mut committed = state.lock().await;
-            let result = result.and_then(|commit| Self::apply_commit(&mut committed, commit));
-            committed.pending = false;
-            if let Err(error) = &result {
-                if durable || writer_failed {
-                    // 已落盘或写者已坏：内存状态不再可信，永久失败并停机。
-                    // 未落盘的拒绝（reducer 拒绝的非法迁移）只回滚，不停机。
-                    committed.failure = Some(error.to_string());
-                    shutdown.cancel();
-                }
-            }
-            drop(committed);
-            if result.is_ok() {
-                commits.send_replace(());
-            }
-            changed.notify_one();
-            drop(decision);
-            result
-        })
-        .await
-        .map_err(|e| JournalError::Storage(e.to_string()))?
-        .map_err(JournalError::from)
-    }
-
-    /// 把已提交的事务应用到内存状态，并标记需要重新调度的 run。
-    fn apply_commit(
-        committed: &mut CommittedState,
-        commit: flow_journal::Commit,
-    ) -> flow_journal::Result<u64> {
-        let tx = &commit.transaction;
-        if commit.value_prefix.is_empty() {
-            committed.state.apply(tx)?;
-        } else {
-            // 有正文分块时，先应用分块前缀事务再应用主事务，reducer 才能
-            // 看到「值已发布」这一事实。
-            let mut transactions = commit.value_prefix;
-            transactions.push((**tx).clone());
-            committed.state.apply_batch(&transactions)?;
-        }
-        // 子 run 终态会改变父 run 的等待条件，父 run 必须重新评估。
-        // 只看本事务涉及且现已终态的 run：父唤醒只依赖「子变为终态」的
-        // 那一刻，而那一刻必然落在本事务的事件里；启动恢复时全部 run 已
-        // 进 dirty 集，历史终态无需每笔提交全量重扫（旧实现每笔提交
-        // O(resident runs)）。
-        for event in &tx.events {
-            if let Some(id) = &event.run_id {
-                if let Some(parent) = committed
-                    .state
-                    .runs
-                    .get(id)
-                    .filter(|r| r.terminal())
-                    .and_then(|r| r.parent.as_ref())
-                {
-                    committed.dirty_runs.insert(parent.run_id.clone());
-                }
-            }
-        }
-        crate::journal_history::trim(&mut committed.state);
-        for event in &tx.events {
-            if let Some(id) = &event.run_id {
-                if committed.state.runs.get(id).is_some_and(|r| !r.terminal()) {
-                    committed.dirty_runs.insert(id.clone());
-                } else {
-                    committed.dirty_runs.remove(id);
-                }
-                if event.kind == EventKind::RunCancelled {
-                    // 取消父 run 会级联影响子 run，子 run 必须一起重新评估。
-                    let children = committed
-                        .state
-                        .runs
-                        .values()
-                        .filter(|r| {
-                            !r.terminal() && r.parent.as_ref().is_some_and(|p| p.run_id == *id)
-                        })
-                        .map(|r| r.run_id.clone())
-                        .collect::<Vec<_>>();
-                    committed.dirty_runs.extend(children);
-                }
-            }
-        }
-        Ok(tx.lsn)
+        self.commits
+            .persist(decision, JournalWriter(self.journal.clone()), tx, rows, values)
+            .await
+            .map_err(|error| match error {
+                commit::CommitError::Facts(error) => error.into(),
+                commit::CommitError::Task(error) => JournalError::Storage(error.to_string()),
+            })
     }
 
     /// 由已提交的命令记录构造回执（`visible` 由调用方按可见性设置）。
@@ -1209,14 +1097,14 @@ impl JournalBackend {
         self.load_selected(selected).await?;
         self.update_state(|state| {
             let result = validate(state);
-            crate::journal_history::trim(state);
+            commit::trim_hot_state(state);
             result
         })
         .await?;
         Ok(None)
     }
     pub fn accepts_services(&self) -> bool {
-        !self.shutdown.is_cancelled()
+        !self.commits.shutdown.is_cancelled()
     }
 
     /// Reserve one in-flight start for `id`. The reservation clears when the guard drops.
@@ -1269,7 +1157,7 @@ impl JournalBackend {
     /// 顺序不可颠倒：必须先让执行端口停下并回收子进程，再关写者——
     /// 反过来会让执行器在权威库关闭后仍尝试写入。
     pub async fn close(&self) -> Result<()> {
-        self.shutdown.cancel();
+        self.commits.shutdown.cancel();
         self.drain_plugin_operations().await;
         let services = std::mem::take(&mut *self.services.lock().await);
         for (_, service) in services {
@@ -1280,8 +1168,8 @@ impl JournalBackend {
             let _ = task.await;
         }
         // 取决策锁确保没有提交在途，然后读出永久失败原因（如有）。
-        let _decision = self.decision.lock().await;
-        let failure = self.state.lock().await.failure.clone();
+        let _decision = self.commits.quiesce().await;
+        let failure = self.commits.state.lock().await.failure.clone();
         let closed = self.journal.close().await;
         self.store.close().await;
         if let Some(error) = failure {
@@ -1302,12 +1190,12 @@ impl JournalBackend {
 
     /// 停机信号：权威库不可信时会被取消，协调循环随即退出。
     pub(crate) fn cancellation(&self) -> CancellationToken {
-        self.shutdown.clone()
+        self.commits.shutdown.clone()
     }
 
     /// 状态变更通知（提交完成或协调器需要重新调度时唤醒）。
     pub(crate) fn execution_notification(&self) -> Arc<Notify> {
-        self.execution_changed.clone()
+        self.commits.execution_changed.clone()
     }
 
     /// 订阅提交完成事件（每次成功提交后发一次）。
@@ -1317,7 +1205,7 @@ impl JournalBackend {
 
     /// 取走需要重新调度的 run 集合（协调循环每轮取一次）。
     pub(crate) async fn take_dirty_runs(&self) -> Vec<String> {
-        let mut committed = self.state.lock().await;
+        let mut committed = self.commits.state.lock().await;
 
         std::mem::take(&mut committed.dirty_runs)
             .into_iter()
@@ -1326,7 +1214,7 @@ impl JournalBackend {
 
     /// 把一个非终态 run 标记为待重新调度。
     pub(crate) async fn defer_run(&self, id: String) {
-        let mut state = self.state.lock().await;
+        let mut state = self.commits.state.lock().await;
         // 终态 run 不再需要调度，标记它只会浪费协调循环的一轮。
         if state.state.runs.get(&id).is_some_and(|r| !r.terminal()) {
             state.dirty_runs.insert(id);
@@ -1335,7 +1223,7 @@ impl JournalBackend {
 
     /// 批量把非终态 run 标记为待重新调度。
     pub(crate) async fn defer_runs(&self, ids: Vec<String>) {
-        let mut state = self.state.lock().await;
+        let mut state = self.commits.state.lock().await;
         for id in ids {
             if state.state.runs.get(&id).is_some_and(|r| !r.terminal()) {
                 state.dirty_runs.insert(id);
@@ -1348,7 +1236,7 @@ impl JournalBackend {
     /// 字段刻意保持诊断语义而非业务语义：`applied_lsn` 与 `durable_lsn`
     /// 的差距直接指向「已提交但未应用」的裂缝。
     pub async fn diagnostics(&self) -> serde_json::Value {
-        let committed = self.state.lock().await;
+        let committed = self.commits.state.lock().await;
         let applied_lsn = committed.state.applied_lsn;
         let resident_runs = committed.state.runs.len();
         let resident_waiting_nodes = committed

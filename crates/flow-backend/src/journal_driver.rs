@@ -9,12 +9,14 @@
 //! 事实上，节点语义则一律交给执行器子进程（C2）。
 //! 需要它，是因为外部副作用无法纳入本地事务：只有把意图、授权与结果
 //! 分成三个可裁决的阶段（C3/C4），崩溃后的未知结果才有一个明确的出口。
-use crate::execution::remote::{RemoteDispatcher, RemoteListeners, RemoteOptions};
+use crate::execution::ports::{DispatchWork, ExecutionPort, NodeDispatch};
+use crate::execution::remote::{AgentManager, RemoteDispatcher, RemoteListeners, RemoteOptions};
 use crate::execution::{ExecutionMode, IpcDispatcher, IpcOptions};
 use crate::journal::{JournalBackend, JournalError};
 use crate::journal_commands::node_event;
 use crate::journal_commands::runtime_mismatched;
 use crate::journal_execution::Attempt;
+use flow_application::dispatch::{admit, DispatchRequest};
 use flow_engine::journal_state::{Node as NodeState, NodeStatus, Run, RunStatus, Wait, WaitKind};
 use flow_engine::progression::{is_settled, node_gate, run_settlement, NodeGate, RunSettlement};
 use flow_engine::{Definition, NodeLogger, NodeType};
@@ -23,22 +25,9 @@ use futures::FutureExt;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::task::JoinSet;
-
-/// 节点执行端口：本地 IPC 子进程池 / 远程 agent。
-#[derive(Clone)]
-pub(crate) enum ExecutionPort {
-    Ipc(Arc<IpcDispatcher>),
-    Remote(Arc<RemoteDispatcher>),
-}
-
-enum NodeDispatch {
-    Ipc(Arc<IpcDispatcher>),
-    Remote(Arc<RemoteDispatcher>, crate::execution::remote::RemoteReservation),
-    Unavailable(flow_journal::Error),
-}
 
 /// 一个在飞节点尝试的归还键与结果。
 type NodeKey = (String, String);
@@ -123,7 +112,7 @@ impl JournalBackend {
         let pool = crate::execution::ExecutorPool::new(options, self.journal.id().into(), epoch);
         let dispatcher = Arc::new(IpcDispatcher::new(pool));
         if self
-            .start_execution_with_port(limit, ExecutionPort::Ipc(dispatcher), prewarm)
+            .start_execution_with_port(limit, dispatcher, prewarm, Weak::new())
             .await
         {
             *self
@@ -172,7 +161,7 @@ impl JournalBackend {
         listeners.start(&manager, options.wss_agents.clone());
         let dispatcher = Arc::new(RemoteDispatcher::new(manager.clone(), options));
         if self
-            .start_execution_with_port(16, ExecutionPort::Remote(dispatcher), false)
+            .start_execution_with_port(16, dispatcher, false, Arc::downgrade(&manager))
             .await
         {
             *self
@@ -191,9 +180,9 @@ impl JournalBackend {
         manager: Arc<crate::execution::remote::AgentManager>,
         options: RemoteOptions,
     ) -> Result<()> {
-        let dispatcher = Arc::new(RemoteDispatcher::new(manager, options));
+        let dispatcher = Arc::new(RemoteDispatcher::new(manager.clone(), options));
         if self
-            .start_execution_with_port(16, ExecutionPort::Remote(dispatcher), false)
+            .start_execution_with_port(16, dispatcher, false, Arc::downgrade(&manager))
             .await
         {
             *self
@@ -211,18 +200,16 @@ impl JournalBackend {
     async fn start_execution_with_port(
         self: &Arc<Self>,
         limit: usize,
-        port: ExecutionPort,
+        port: Arc<ExecutionPort>,
         prewarm: bool,
+        remote_manager: Weak<AgentManager>,
     ) -> bool {
         let mut driver = self.execution.lock().await;
         if driver.as_ref().is_some_and(|handle| !handle.is_finished()) {
             // 已有在跑的协调器：直接复用，不重复起第二个派发者。
             return false;
         }
-        *self.plugin_remote_manager.write().unwrap() = match &port {
-            ExecutionPort::Remote(dispatcher) => Arc::downgrade(dispatcher.manager()),
-            ExecutionPort::Ipc(_) => std::sync::Weak::new(),
-        };
+        *self.plugin_remote_manager.write().unwrap() = remote_manager;
         let observation = self.observations.clone();
         let weak = Arc::downgrade(self);
         let cancel = self.cancellation();
@@ -233,14 +220,12 @@ impl JournalBackend {
             // 预热只在协调器任务启动时执行一次（不随 panic 重启重复）。
             // 本任务独占 `port` 且尚未进入调度循环，故不与任何 acquire 竞争。
             if prewarm {
-                if let ExecutionPort::Ipc(dispatcher) = &port {
-                    match dispatcher.prewarm(1).await {
-                        Ok(warmed) => tracing::info!(warmed, "executor prewarmed"),
-                        Err(error) => tracing::warn!(
-                            %error,
-                            "executor prewarm failed; first dispatch will spawn lazily"
-                        ),
-                    }
+                match port.prewarm().await {
+                    Ok(warmed) => tracing::info!(warmed, "executor prewarmed"),
+                    Err(error) => tracing::warn!(
+                        %error,
+                        "executor prewarm failed; first dispatch will spawn lazily"
+                    ),
                 }
             }
             loop {
@@ -383,10 +368,7 @@ impl JournalBackend {
             }).catch_unwind().await;
             // The driver owns the execution port. Close must await its tracked
             // sessions, including idle/prewarmed children and cancelled starts.
-            match &port {
-                ExecutionPort::Ipc(dispatcher) => dispatcher.shutdown().await,
-                ExecutionPort::Remote(dispatcher) => dispatcher.manager().shutdown().await,
-            }
+            port.shutdown().await;
             if outcome.is_err() {
                 tracing::error!("coordinator exited unexpectedly; execution port reaped");
             }
@@ -415,7 +397,7 @@ pub(crate) fn check_executor(options: &IpcOptions) -> Result<()> {
 /// 瞬时错误上抛给协调循环，由它延迟重试。
 async fn advance_run(
     backend: &Arc<JournalBackend>,
-    port: &ExecutionPort,
+    port: &Arc<ExecutionPort>,
     observation: &Option<flow_engine::observation::ObservationStore>,
     run_id: &str,
     coord: &mut Coordinator,
@@ -479,10 +461,7 @@ async fn advance_run(
             }
             NodeGate::Blocked => {}
             NodeGate::Ready(predecessors) => {
-                let parked = match port {
-                    ExecutionPort::Ipc(dispatcher) => dispatcher.parked_count(),
-                    ExecutionPort::Remote(_) => 0,
-                };
+                let parked = port.parked_count();
                 if !coord.has_capacity(node, parked) {
                     // 槽位不足：本轮不派发，把 run 退回 dirty 集等下一轮。
                     backend.defer_run(run_id.to_owned()).await;
@@ -709,63 +688,57 @@ async fn advance_committed_node(
 /// 记账必须先于它完成，否则会漏掉这次尝试。
 async fn spawn_node_attempt(
     backend: &Arc<JournalBackend>,
-    port: &ExecutionPort,
+    port: &Arc<ExecutionPort>,
     observation: &Option<flow_engine::observation::ObservationStore>,
     run_id: &str,
     node: &flow_engine::Node,
     predecessors: BTreeMap<String, StoredValue>,
     coord: &mut Coordinator,
 ) -> Result<()> {
-    let dispatch = match port {
-        ExecutionPort::Ipc(dispatcher) => NodeDispatch::Ipc(dispatcher.clone()),
-        ExecutionPort::Remote(dispatcher) => {
-            let binding = if let Some(node_type) = node.plugin_type() {
-                backend
-                    .inspect(|state| {
-                        let run = state.runs.get(run_id)?;
-                        // Replaying a stored outcome does not invoke the plugin.
-                        let recorded = run
-                            .execution
-                            .as_ref()
-                            .is_some_and(|snapshot| snapshot.regression.is_some())
-                            || run
-                                .nodes
-                                .get(&node.id)
-                                .and_then(|record| record.operation.as_ref()?.outcome.as_ref())
-                                .is_some();
-                        if recorded {
-                            return None;
-                        }
-                        run.plugin_bindings.as_ref()?.get(node_type).cloned()
-                    })
-                    .await
-            } else {
-                None
-            };
-            match dispatcher
-                .reserve_node(run_id, node, binding.as_ref())
-                .await
-            {
-                Ok(Some(reservation)) => NodeDispatch::Remote(dispatcher.clone(), reservation),
-                Ok(None) => {
-                    backend.defer_run(run_id.to_owned()).await;
-                    return Ok(());
+    let plugin_binding = if let Some(node_type) = node.plugin_type().filter(|_| port.uses_plugin_affinity()) {
+        backend
+            .inspect(|state| {
+                let run = state.runs.get(run_id)?;
+                // Replaying a stored outcome does not invoke the plugin.
+                let recorded = run
+                    .execution
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.regression.is_some())
+                    || run
+                        .nodes
+                        .get(&node.id)
+                        .and_then(|record| record.operation.as_ref()?.outcome.as_ref())
+                        .is_some();
+                if recorded {
+                    return None;
                 }
-                Err(error) => NodeDispatch::Unavailable(error),
-            }
-        }
+                run.plugin_bindings.as_ref()?.get(node_type).cloned()
+            })
+            .await
+    } else {
+        None
     };
-    let attempt = match &dispatch {
-        NodeDispatch::Remote(_, reservation) => {
-            Attempt::begin_with_id(
+    let request = DispatchRequest {
+        run_id,
+        node,
+        plugin_binding: plugin_binding.as_ref(),
+    };
+    let admitted = admit(port.clone(), request, |id| async {
+        match id {
+            Some(id) => Attempt::begin_with_id(
                 backend.clone(),
                 run_id.to_owned(),
                 node.id.clone(),
-                reservation.dispatch_id().to_owned(),
+                id,
             )
-            .await?
+            .await,
+            None => Attempt::begin(backend.clone(), run_id.to_owned(), node.id.clone()).await,
         }
-        _ => Attempt::begin(backend.clone(), run_id.to_owned(), node.id.clone()).await?,
+    })
+    .await?;
+    let Some((attempt, dispatch)) = admitted else {
+        backend.defer_run(run_id.to_owned()).await;
+        return Ok(());
     };
     let key: NodeKey = (run_id.to_owned(), node.id.clone());
     coord.active.insert(key.clone());
@@ -799,32 +772,18 @@ async fn execute_node(
     observation: Option<flow_engine::observation::ObservationStore>,
 ) -> NodeTask {
     let key: NodeKey = (attempt.run_id.clone(), attempt.node_id.clone());
-    let result = AssertUnwindSafe(async {
-        match dispatch {
-            NodeDispatch::Ipc(dispatcher) => {
-                dispatcher
-                    .execute(&attempt, &node, predecessors.clone(), observation.clone())
-                    .await
-            }
-            NodeDispatch::Remote(dispatcher, reservation) => {
-                dispatcher
-                    .execute(
-                        &attempt,
-                        reservation,
-                        &node,
-                        predecessors.clone(),
-                        observation.clone(),
-                    )
-                    .await
-            }
-            NodeDispatch::Unavailable(error) => Err(error.into()),
-        }
-    })
-    .catch_unwind()
-    .await
-    .unwrap_or_else(|_| {
-        Err(invalid("node execution panicked; committed operation evidence retained").into())
-    });
+    let work = DispatchWork {
+        attempt: attempt.clone(),
+        node: node.clone(),
+        predecessors: predecessors.clone(),
+        observations: observation.clone(),
+    };
+    let result = AssertUnwindSafe(dispatch.execute(work))
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| {
+            Err(invalid("node execution panicked; committed operation evidence retained").into())
+        });
     if let Err(error) = &result {
         if let Ok(snapshot) = attempt.snapshot().await {
             let Some(n) = snapshot.nodes.get(&attempt.node_id) else {

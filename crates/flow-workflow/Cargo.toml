@@ -4,12 +4,21 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
+[features]
+default = ["ipc"]
+ipc = ["dep:clap", "dep:flow-dispatcher"]
+
+[[bin]]
+name = "flow-workflow"
+path = "src/main.rs"
+required-features = ["ipc"]
+
 [dependencies]
-flow-dispatcher = { path = "../flow-dispatcher" }
+flow-dispatcher = { path = "../flow-dispatcher", optional = true }
 flow-domain = { path = "../flow-domain" }
 flow-facts = { path = "../flow-facts" }
 chrono.workspace = true
-clap.workspace = true
+clap = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

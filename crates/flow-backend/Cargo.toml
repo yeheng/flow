@@ -10,6 +10,7 @@ default = []
 fault-injection = []
 
 [dependencies]
+flow-application = { path = "../flow-application" }
 flow-plugin-catalog = { path = "../flow-plugin-catalog" }
 flow-dispatcher = { path = "../flow-dispatcher" }
 flow-policy = { path = "../flow-policy" }

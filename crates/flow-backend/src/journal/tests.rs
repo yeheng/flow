@@ -148,7 +148,7 @@ async fn failed_commit_does_not_publish_or_allow_later_decisions() {
             .inspect(|s| s.workflows.is_empty() && s.applied_lsn == 0)
             .await
     );
-    assert!(!backend.state.lock().await.pending);
+    assert!(!backend.commits.state.lock().await.pending);
     assert!(backend
         .command("create", None, &json!({}), |_| panic!("must fail closed"))
         .await
@@ -173,7 +173,7 @@ async fn rejected_publication_does_not_poison_later_commands_or_notify_readers()
         }),
     );
     assert!(backend.append(vec![rejected]).await.is_err());
-    assert!(backend.state.lock().await.failure.is_none());
+    assert!(backend.commits.state.lock().await.failure.is_none());
     assert!(!backend.cancellation().is_cancelled());
     assert!(!commits.has_changed().unwrap());
     assert_eq!(backend.inspect(|s| s.applied_lsn).await, 0);

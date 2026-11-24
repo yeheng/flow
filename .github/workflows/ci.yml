@@ -93,6 +93,17 @@ jobs:
           cargo test -p flow-policy --locked --target ${{ matrix.arch.target }}
       - name: domain without runtime
         run: cargo test -p flow-engine --no-default-features --lib --test core_boundary --locked
+      - name: application without storage or process adapters
+        run: |
+          deps=$(cargo tree -p flow-application -p flow-workflow --no-default-features --edges normal --prefix none --locked --target ${{ matrix.arch.target }})
+          if grep -E '^(flow-(journal|dispatcher|engine|backend|rpc|agent|plugin-[^ ]+)|libsqlite3-sys) v' <<< "$deps"; then
+            exit 1
+          fi
+          cargo test -p flow-application -p flow-workflow --no-default-features --lib --locked --target ${{ matrix.arch.target }}
+          rpc_deps=$(cargo tree -p flow-rpc --depth 1 --edges normal --prefix none --locked --target ${{ matrix.arch.target }})
+          if grep -E '^flow-journal v' <<< "$rpc_deps"; then
+            exit 1
+          fi
       - name: isolated workflow with script worker
         run: |
           deps=$(cargo tree -p flow-workflow -p flow-internal-plugins --edges normal --prefix none --locked --target ${{ matrix.arch.target }})

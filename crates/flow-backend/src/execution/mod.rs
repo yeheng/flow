@@ -16,6 +16,7 @@
 mod credentials;
 pub mod dispatch;
 pub use flow_dispatcher::pool;
+pub(crate) mod ports;
 pub mod remote;
 mod workflow_task;
 

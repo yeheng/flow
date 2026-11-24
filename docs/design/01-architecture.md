@@ -31,6 +31,7 @@ crates/
                   query feature 承接同库只读执行与产品查询(原 flow-store 并入)
   flow-facts      事件、事务、值描述符及有界编码契约
   flow-domain     工作流定义、图规则、schema 校验与确定性状态折叠
+  flow-application  托管运行的原子提交、状态发布与派发准入，定义写入和执行端口
   flow-dispatcher  IPC 协议、进程池与通用任务派发（v8 postcard 单流）
   flow-engine     工作流运行共享设施：观测日志、密钥，并重导出领域规则与 IPC 契约
   flow-backend    journal 唯一权威后端：journal.rs（JournalBackend）+ journal_commands
@@ -79,15 +80,14 @@ plugins/harness/  harness agent 运行时（protocol / agent-core / agent-host /
 依赖方向（与 Cargo.toml 对齐的现状）：
 
 ```
-flow-rpc ──> flow-backend ──> flow-engine ──> flow-domain / flow-dto / flow-dispatcher
-           ├─> flow-journal  （storage+query：v2 值分页/下载与同库只读查询）
-           └─> flow-config
+flow-rpc ──> flow-backend / flow-config / flow-dto / flow-engine / flow-facts
+flow-application ──> flow-domain / flow-facts
 flow-backend ──> flow-dispatcher / flow-journal / flow-engine / flow-dto / flow-config / flow-policy
-              └─> flow-plugin-catalog / flow-plugin-sdk
+              └─> flow-application / flow-plugin-catalog / flow-plugin-sdk
 flow-engine ──> flow-domain / flow-dto / flow-dispatcher
              └─> flow-journal（runtime 下的观测写入）
 flow-dispatcher ──> flow-facts
-flow-workflow ──> flow-domain / flow-dispatcher / flow-facts
+flow-workflow ──> flow-domain / flow-facts（默认 ipc feature 另外启用 flow-dispatcher）
 flow-domain ──> flow-facts / flow-dto
 flow-policy ──> flow-dto
 flow-journal ──> flow-facts
@@ -109,6 +109,12 @@ SQLite 和磁盘读写由 `flow-journal` 提供。工作流
 仍由 `flow-backend` 解释节点和持久化结果。`execution::workflow_task` 将已提交的
 节点尝试和执行快照装配为工作流载荷，再走共用的进程池、发送及完成确认入口。
 工作流现有 `Execute` 与 v8 帧索引保留，旧执行器和远程中继沿用这条路径。
+
+`flow-backend` 为 `flow-application` 装配 Journal 写入和本地/远程执行。
+提交端口保证事实、投影和暂存正文原子写入，应用层在落盘后发布状态。
+远程派发先预留兼容容量，再提交本次尝试；预留随租约释放。
+分页、订阅续读和下载解析由 `journal_views` 读取已提交快照，RPC 负责鉴权和传输。
+`flow-workflow` 关闭默认 feature 后可以用替身执行器验证应用逻辑。
 
 独立任务只携带 `id`、带版本的 `handler` 和有界字节输入。Worker 握手广告
 `job:<handler>` 后才会收到 `ExecuteJob`。`Accepted` 确认接收，`JobFinished`

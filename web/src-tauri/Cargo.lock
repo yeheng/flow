@@ -1316,6 +1316,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "flow-application"
+version = "0.1.0"
+dependencies = [
+ "flow-domain",
+ "flow-facts",
+ "futures",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
 name = "flow-backend"
 version = "0.1.0"
 dependencies = [
@@ -1324,6 +1337,7 @@ dependencies = [
  "chrono",
  "clap",
  "cron-parser",
+ "flow-application",
  "flow-config",
  "flow-dispatcher",
  "flow-dto",
@@ -1541,7 +1555,7 @@ dependencies = [
  "flow-config",
  "flow-dto",
  "flow-engine",
- "flow-journal",
+ "flow-facts",
  "futures",
  "hex",
  "hmac",

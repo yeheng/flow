@@ -1,23 +1,38 @@
 //! In-memory workflow runner sharing graph decisions and node outcomes with
-//! the managed coordinator. Script execution stays in an IPC worker.
+//! the managed coordinator. Script execution is supplied by the caller.
 
-use std::{collections::BTreeMap, future, io, time::Duration};
+use std::{collections::BTreeMap, future::Future};
 
-use flow_dispatcher::{
-    execution_protocol::STARTUP_TIMEOUT_MS, Dispatcher, Job, JobError, MAX_STREAMED_JOB_BYTES,
-};
 use flow_domain::{
     journal_state::RunStatus,
     progression::{node_gate, run_settlement, NodeGate, NodeOutcome, RunSettlement},
     schema,
-    script::{truthy, ScriptTask, SCRIPT_V1_HANDLER},
+    script::{truthy, ScriptTask},
     Definition, Node, NodeType,
 };
 use flow_facts::{codec::bounded_json, Error, Result, StoredValue, INLINE_BYTES};
 use serde::Serialize;
 use serde_json::Value;
-use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+
+#[cfg(feature = "ipc")]
+mod ipc;
+
+#[derive(Debug)]
+pub enum ExecutionError {
+    Cancelled,
+    Unavailable(String),
+}
+
+/// The executor calls `accept` before it acknowledges the result to its worker.
+pub trait NodeExecutor: Sync {
+    fn execute(
+        &self,
+        task: ScriptTask,
+        cancel: &CancellationToken,
+        accept: impl FnOnce(std::result::Result<Value, String>) -> Result<()> + Send,
+    ) -> impl Future<Output = std::result::Result<(), ExecutionError>> + Send;
+}
 
 #[derive(Debug, Serialize)]
 pub struct RunReport {
@@ -30,11 +45,10 @@ pub struct RunReport {
 }
 
 /// Run an inline JSON workflow with Start, Script, Condition and End nodes.
-/// The dispatcher must be configured for streamed `script.v1` jobs.
 pub async fn run(
     definition: &Definition,
     input: Value,
-    dispatcher: &Dispatcher,
+    executor: &impl NodeExecutor,
     cancel: &CancellationToken,
 ) -> Result<RunReport> {
     validate(definition, &input)?;
@@ -75,14 +89,16 @@ pub async fn run(
                         }
                         NodeType::Script | NodeType::Condition => {
                             match memory
-                                .dispatch_script(dispatcher, cancel, node, kind, predecessors)
+                                .dispatch_script(executor, cancel, node, kind, predecessors)
                                 .await
                             {
                                 Ok(_) => {}
-                                Err(JobError::Cancelled) => {
+                                Err(ExecutionError::Cancelled) => {
                                     return Ok(memory.report(RunStatus::Cancelled, None, None));
                                 }
-                                Err(error) => return Err(Error::Unavailable(error.to_string())),
+                                Err(ExecutionError::Unavailable(error)) => {
+                                    return Err(Error::Unavailable(error));
+                                }
                             }
                         }
                         _ => unreachable!("validated node kind"),
@@ -193,48 +209,36 @@ struct MemoryRun {
 impl MemoryRun {
     async fn dispatch_script(
         &mut self,
-        dispatcher: &Dispatcher,
+        executor: &impl NodeExecutor,
         cancel: &CancellationToken,
         node: &Node,
         kind: NodeType,
         predecessors: BTreeMap<String, StoredValue>,
-    ) -> std::result::Result<(), JobError> {
-        let protocol = |error: Error| JobError::Protocol(error.to_string());
+    ) -> std::result::Result<(), ExecutionError> {
+        let unavailable = |error: Error| ExecutionError::Unavailable(error.to_string());
         let script = ScriptTask::from_prepared(
             kind,
             &node.params,
-            inline_json(self.input.clone()).map_err(protocol)?,
-            object(predecessors).map_err(protocol)?,
+            inline_json(self.input.clone()).map_err(unavailable)?,
+            object(predecessors).map_err(unavailable)?,
             None,
         )
         .expect("validated compute node");
-        let deadline =
-            Instant::now() + Duration::from_millis(STARTUP_TIMEOUT_MS * 3) + script.timeout();
-        let job = Job {
-            id: uuid::Uuid::now_v7().to_string(),
-            handler: SCRIPT_V1_HANDLER.into(),
-            input: bounded_json(&script, MAX_STREAMED_JOB_BYTES).map_err(protocol)?,
-        };
-        dispatcher
-            .execute(job, deadline, cancel, |completion| {
-                future::ready(
-                    self.complete_script(node, kind, completion.outcome)
-                        .map_err(io::Error::other),
-                )
+        executor
+            .execute(script, cancel, |outcome| {
+                self.complete_script(node, kind, outcome)
             })
-            .await?;
-        Ok(())
+            .await
     }
 
     fn complete_script(
         &mut self,
         node: &Node,
         kind: NodeType,
-        outcome: std::result::Result<Vec<u8>, String>,
+        outcome: std::result::Result<Value, String>,
     ) -> Result<()> {
         match outcome {
-            Ok(bytes) => {
-                let value: Value = serde_json::from_slice(&bytes)?;
+            Ok(value) => {
                 let branch = (kind == NodeType::Condition).then(|| truthy(&value));
                 let output = StoredValue::inline(value).map_err(|error| error.to_string());
                 self.complete_node(node, output, branch)
@@ -279,5 +283,90 @@ impl MemoryRun {
             error,
             nodes: self.nodes,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    struct Executor {
+        cancel_in_flight: bool,
+    }
+
+    impl NodeExecutor for Executor {
+        async fn execute(
+            &self,
+            task: ScriptTask,
+            cancel: &CancellationToken,
+            accept: impl FnOnce(std::result::Result<Value, String>) -> Result<()> + Send,
+        ) -> std::result::Result<(), ExecutionError> {
+            if self.cancel_in_flight {
+                cancel.cancel();
+                return Err(ExecutionError::Cancelled);
+            }
+            let result = match task.code.as_str() {
+                "return (true);" => json!(true),
+                "return 42;" => json!(42),
+                _ => panic!("the inactive branch must not reach the executor"),
+            };
+            accept(Ok(result)).unwrap();
+            Ok(())
+        }
+    }
+
+    fn branch_and_join() -> Definition {
+        serde_json::from_value(json!({
+            "semantics": 2,
+            "nodes": [
+                {"id":"start", "type":"start"},
+                {"id":"branch", "type":"condition", "params":{"expr":"true"}},
+                {"id":"yes", "type":"script", "params":{"code":"return 42;"}},
+                {"id":"no", "type":"script", "params":{"code":"return 0;"}},
+                {"id":"end", "type":"end"}
+            ],
+            "edges": [
+                {"from":"start", "to":"branch"},
+                {"from":"branch", "port":"true", "to":"yes"},
+                {"from":"branch", "port":"false", "to":"no"},
+                {"from":"yes", "to":"end"},
+                {"from":"no", "to":"end"}
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn application_advances_branch_and_join_with_an_in_memory_executor() {
+        let report = run(
+            &branch_and_join(),
+            Value::Null,
+            &Executor {
+                cancel_in_flight: false,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.status, RunStatus::Succeeded);
+        assert_eq!(report.output, Some(StoredValue::Inline(json!(42))));
+        assert!(matches!(report.nodes["no"], NodeOutcome::Skipped { .. }));
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_execution_does_not_settle_the_node() {
+        let report = run(
+            &branch_and_join(),
+            Value::Null,
+            &Executor {
+                cancel_in_flight: true,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.status, RunStatus::Cancelled);
+        assert!(!report.nodes.contains_key("branch"));
     }
 }

@@ -1,0 +1,17 @@
+[package]
+name = "flow-application"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+flow-domain = { path = "../flow-domain" }
+flow-facts = { path = "../flow-facts" }
+futures.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

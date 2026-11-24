@@ -19,6 +19,66 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 pub type Result<T> = std::result::Result<T, ViewError>;
 
+mod downloads;
+mod events;
+pub use downloads::value_download;
+pub use events::{
+    invocation_events, permissions_audit_page, EventReadError, EventStream, RunEventTail, RunEvents,
+};
+
+pub async fn run_exists(
+    b: &JournalBackend,
+    run_id: &str,
+) -> std::result::Result<bool, crate::StorageError> {
+    Ok(b.store.get_summary("run", run_id).await?.1.is_some())
+}
+
+pub async fn snapshot_get(
+    b: &JournalBackend,
+    kind: &str,
+    key: &str,
+) -> std::result::Result<Value, crate::StorageError> {
+    let (lsn, value) = b.store.get(kind, key).await?;
+    Ok(json!({
+        "snapshot_cursor": {"journal_id": b.journal.id(), "lsn": lsn.to_string()},
+        "value": value,
+    }))
+}
+
+pub async fn snapshot_list(
+    b: &JournalBackend,
+    kind: &str,
+    after: &str,
+    limit: usize,
+) -> std::result::Result<Value, crate::StorageError> {
+    let (lsn, values) = b.store.list(kind, after, limit).await?;
+    Ok(json!({
+        "snapshot_cursor": {"journal_id": b.journal.id(), "lsn": lsn.to_string()},
+        "values": values,
+    }))
+}
+
+pub async fn materialize_run_value(
+    b: &JournalBackend,
+    value: &StoredValue,
+    limit: usize,
+) -> Result<Value> {
+    let root = b.journal.root().to_path_buf();
+    let upper = b.journal.durable_lsn();
+    let value = value.clone();
+    tokio::task::spawn_blocking(move || flow_journal::value::materialize(&root, upper, &value, limit))
+        .await
+        .map_err(internal)?
+}
+
+pub async fn signal_definition(
+    b: &JournalBackend,
+    run: &JournalRun,
+) -> Result<flow_engine::Definition> {
+    let value = materialize_run_value(b, &run.definition, MAX_LINE_BYTES).await?;
+    flow_engine::journal_state::validate_definition(&value)
+}
+
 /// 内部错误归类：读面故障统一为 Unavailable，与「不存在」「超限」区分开。
 fn internal(error: impl std::fmt::Display) -> ViewError {
     ViewError::Unavailable(error.to_string())
