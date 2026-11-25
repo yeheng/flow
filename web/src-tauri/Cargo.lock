@@ -1321,7 +1321,6 @@ version = "0.1.0"
 dependencies = [
  "flow-domain",
  "flow-facts",
- "futures",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",

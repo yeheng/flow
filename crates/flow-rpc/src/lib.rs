@@ -91,10 +91,16 @@ impl AppState {
         backend: Arc<JournalBackend>,
         config_state: ConfigState,
         data_dir: &std::path::Path,
+        permissions: &flow_config::PermissionsConfig,
     ) -> (
         Arc<AppState>,
         Option<Arc<flow_engine::secrets_store::SecretFileStore>>,
     ) {
+        backend.set_approval_ttl_ms(
+            permissions
+                .approval_ttl_ms
+                .unwrap_or(flow_backend::journal::APPROVAL_TTL_DEFAULT_MS),
+        );
         match flow_engine::environments::EnvironmentStore::open(&data_dir.join("environments")) {
             Ok(store) => { let _ = backend.environments.set(Arc::new(store)); }
             Err(error) => tracing::error!(%error, "环境存储不可用"),
@@ -245,8 +251,13 @@ pub async fn serve_journal_product(
         let bound_rpc = rpc_server.local_addr()?;
         let router = journal_download::router(backend.clone(), token.clone())?
             .merge(journal_triggers::router(backend.clone(), token.clone()));
-        let (state, _secrets) =
-            AppState::for_production(backend.clone(), config_state, &data_dir).await;
+        let (state, _secrets) = AppState::for_production(
+            backend.clone(),
+            config_state,
+            &data_dir,
+            &config.permissions,
+        )
+        .await;
         let module = journal_v2::module_product_with_keys(
             backend.clone(),
             token,
@@ -262,11 +273,6 @@ pub async fn serve_journal_product(
         .map_err(|error| -> Box<dyn std::error::Error> {
             format!("harness agent 配置非法：{error}").into()
         })?;
-        // 09 权限模型：审批 TTL 在启动时注入（夹紧在后端）；已登记询问的
-        // deadline 随事实持久，运行期改配置只影响新询问。
-        if let Some(ttl_ms) = config.permissions.approval_ttl_ms {
-            backend.set_approval_ttl_ms(ttl_ms);
-        }
         // 09 §7：内置插件随产品分发（受信二进制），启动时幂等自动授予声明
         // 能力；第三方插件必须经 permissions.grant 显式授予。
         backend.ensure_bundled_grants().await;

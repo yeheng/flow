@@ -1275,21 +1275,10 @@ impl DispatchRunner {
                         &snapshot.input,
                         &self.predecessors,
                     );
-                    let policy = self.node.retry();
-                    // 自动重试的三个前提：准备已提交（输入确定）、没有外部
-                    // 操作授权（无副作用）、节点类型是纯本地计算（script/
-                    // condition）。缺一不可——否则重试就是重复副作用。
-                    if record.prepared.is_some()
-                        && record.operation.is_none()
-                        && matches!(
-                            self.node.kind(),
-                            Some(NodeType::Script | NodeType::Condition)
-                        )
-                        && record.attempt < policy.max_attempts.min(100)
+                    if let Some(delay) =
+                        crate::journal_execution::pure_retry_delay(&self.node, record)
                     {
-                        // 退避时刻由主进程派生并写入载荷：重试时机是平台
-                        // 决策，不能交给执行器自选（否则退避策略形同虚设）。
-                        let delay = policy.backoff_ms.min(i64::MAX as u64) as i64;
+                        // The coordinator owns the wake time and commits it with the failure.
                         payload["retry_wake_at"] =
                             json!(chrono::Utc::now().timestamp_millis().saturating_add(delay));
                     }
@@ -1385,7 +1374,7 @@ impl DispatchRunner {
             })
             .await?;
         let definition = backend
-            .cached_definition(
+            .cached_frozen_definition(
                 &format!("child:{workflow_id}@{}:{}", frozen.version, frozen.checksum),
                 &frozen.definition,
             )

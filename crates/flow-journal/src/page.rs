@@ -12,7 +12,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::codec::{self, Event};
-use crate::{invalid, Result};
+use crate::{invalid, EventKind, Result};
 
 /// 事实过滤条件。
 ///
@@ -28,19 +28,15 @@ pub enum Filter {
     /// run_approval_* / workflow_permissions_changed / plugin_grant_upserted）。
     Permission,
 }
-/// 权限事件判定（09 §10.3）：闭集，与 codec EventKind 字面量一致。
-fn is_permission_kind(event: &crate::Event) -> bool {
-    matches!(
-        event.kind,
-        crate::EventKind::PolicyFrozen
-            | crate::EventKind::PermissionAsked
-            | crate::EventKind::PermissionDecided
-            | crate::EventKind::RunApprovalUpserted
-            | crate::EventKind::RunApprovalRemoved
-            | crate::EventKind::WorkflowPermissionsChanged
-            | crate::EventKind::PluginGrantUpserted
-    )
-}
+const PERMISSION_KINDS: &[EventKind] = &[
+    EventKind::PolicyFrozen,
+    EventKind::PermissionAsked,
+    EventKind::PermissionDecided,
+    EventKind::RunApprovalUpserted,
+    EventKind::RunApprovalRemoved,
+    EventKind::WorkflowPermissionsChanged,
+    EventKind::PluginGrantUpserted,
+];
 
 /// 分页游标。
 ///
@@ -60,7 +56,7 @@ pub struct Cursor {
     pub event_index: usize,
 }
 impl Cursor {
-    /// 续读辅助：显式设定起始 LSN（permissions.audit.page 的跨 run 游标）。
+    /// 续读辅助：显式设定起始 LSN。
     pub fn with_next_lsn(mut self, lsn: u64) -> Self {
         self.next_lsn = lsn;
         self
@@ -200,7 +196,7 @@ pub fn page(
                     Filter::All => true,
                     Filter::Events => event.run_seq > 0,
                     Filter::Audit => audit,
-                    Filter::Permission => is_permission_kind(event),
+                    Filter::Permission => PERMISSION_KINDS.contains(&event.kind),
                 };
             if include {
                 let positioned = PositionedEvent {
@@ -248,49 +244,97 @@ pub fn page(
     })
 }
 
-/// 数据集级权限事件（run 外事实：workflow_permissions_changed /
-/// plugin_grant_upserted；09 §10.3 审计「谁改了上限 / 谁授予了插件」）。
-/// 从 `from_lsn`（含）起按 (lsn, event_index) 序返回，最多 `limit` 条。
-pub fn dataset_permission_events(
-    root: &std::path::Path,
+pub enum PermissionScope<'a> {
+    All,
+    Run(&'a str),
+    Dataset,
+}
+
+#[derive(Serialize)]
+pub struct EventPosition {
+    #[serde(with = "crate::decimal")]
+    pub lsn: u64,
+    pub event_index: u32,
+}
+
+/// Read permission facts in commit order, including terminal runs. Filter before
+/// counting the page so an unrelated fact cannot look like the end of the stream.
+pub fn permission_events(
+    root: &Path,
     identity: &str,
-    from_lsn: u64,
+    scope: PermissionScope<'_>,
+    decision: Option<&str>,
+    start: EventPosition,
     limit: usize,
-) -> Result<Vec<PositionedEvent>> {
+) -> Result<(Vec<PositionedEvent>, Option<EventPosition>)> {
     let conn = crate::sqlite::read_connection(root)?;
     if crate::sqlite::metadata(&conn)?.0 != identity {
         return Err(invalid("foreign dataset"));
     }
-    let mut statement = conn
-        .prepare(
-            "SELECT lsn, event_index, body FROM events \
-             WHERE run_id IS NULL AND lsn >= ? ORDER BY lsn, event_index LIMIT ?",
-        )
-        .map_err(crate::sqlite::db)?;
-    let rows = statement
-        .query_map(
-            rusqlite::params![format!("{:020}", from_lsn), limit.clamp(1, 1024) as i64],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )
+    if start.lsn == 0 || !(1..=256).contains(&limit) {
+        return Err(invalid("cursor binding/boundary mismatch"));
+    }
+    let (scope_clause, run_id) = match scope {
+        PermissionScope::All => ("", None),
+        PermissionScope::Run(id) => (" AND run_id=?3", Some(id)),
+        PermissionScope::Dataset => (" AND run_id IS NULL", None),
+    };
+    let kinds = if decision.is_some() {
+        &[EventKind::PermissionDecided][..]
+    } else {
+        PERMISSION_KINDS
+    };
+    let sql = format!(
+        "SELECT lsn, event_index FROM events
+         WHERE (lsn, event_index) >= (?1, ?2){scope_clause}
+         AND json_extract(body, '$.kind') IN (SELECT value FROM json_each(?4))
+         AND (?5 IS NULL OR json_extract(body, '$.payload.record.decision') = ?5)
+         ORDER BY lsn, event_index LIMIT ?6"
+    );
+    let mut statement = conn.prepare(&sql).map_err(crate::sqlite::db)?;
+    let mut rows = statement
+        .query(rusqlite::params![
+            format!("{:020}", start.lsn),
+            start.event_index,
+            run_id,
+            serde_json::to_string(kinds)?,
+            decision,
+            (limit + 1) as i64,
+        ])
         .map_err(crate::sqlite::db)?;
     let mut events = Vec::new();
-    for row in rows {
-        let (lsn, index, body) = row.map_err(crate::sqlite::db)?;
-        let lsn: u64 = lsn.parse().map_err(|_| invalid("invalid fact sequence"))?;
-        let event: Event = serde_json::from_str(&body).map_err(|e| invalid(e.to_string()))?;
-        if is_permission_kind(&event) {
-            events.push(PositionedEvent {
-                lsn,
-                event_index: index as usize,
-                event,
-            });
+    let mut bytes = 2048;
+    let mut transaction: Option<crate::Transaction> = None;
+    while let Some(row) = rows.next().map_err(crate::sqlite::db)? {
+        let lsn = row
+            .get::<_, String>(0)
+            .map_err(crate::sqlite::db)?
+            .parse()
+            .map_err(|_| invalid("invalid fact sequence"))?;
+        let event_index = row.get::<_, u32>(1).map_err(crate::sqlite::db)?;
+        let next = EventPosition { lsn, event_index };
+        if events.len() == limit {
+            return Ok((events, Some(next)));
         }
+        // Verify the source transaction once even when several of its events match.
+        if transaction.as_ref().is_none_or(|tx| tx.lsn != lsn) {
+            transaction = Some(crate::sqlite::transaction(&conn, identity, lsn)?);
+        }
+        let event = transaction
+            .as_ref()
+            .and_then(|tx| tx.events.get(event_index as usize))
+            .ok_or_else(|| invalid("invalid fact position"))?;
+        let event = PositionedEvent {
+            lsn,
+            event_index: event_index as usize,
+            event: event.clone(),
+        };
+        let size = codec::bounded_json(&event, crate::MAX_LINE_BYTES - 2049)?.len() + 1;
+        if bytes + size > crate::MAX_LINE_BYTES {
+            return Ok((events, Some(next)));
+        }
+        bytes += size;
+        events.push(event);
     }
-    Ok(events)
+    Ok((events, None))
 }

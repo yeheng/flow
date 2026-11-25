@@ -71,14 +71,6 @@ pub async fn materialize_run_value(
         .map_err(internal)?
 }
 
-pub async fn signal_definition(
-    b: &JournalBackend,
-    run: &JournalRun,
-) -> Result<flow_engine::Definition> {
-    let value = materialize_run_value(b, &run.definition, MAX_LINE_BYTES).await?;
-    flow_engine::journal_state::validate_definition(&value)
-}
-
 /// 内部错误归类：读面故障统一为 Unavailable，与「不存在」「超限」区分开。
 fn internal(error: impl std::fmt::Display) -> ViewError {
     ViewError::Unavailable(error.to_string())

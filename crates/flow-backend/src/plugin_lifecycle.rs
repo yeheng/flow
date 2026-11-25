@@ -180,7 +180,7 @@ impl JournalBackend {
         for (index, stored) in definitions.into_iter().enumerate() {
             let key = format!("plugin-drain:{}:{index}", run.run_id);
             let definition = self
-                .cached_definition(&key, stored)
+                .cached_frozen_definition(&key, stored)
                 .await
                 .map_err(|error| OperationError::Io(std::io::Error::other(error)))?;
             for node in &definition.nodes {

@@ -151,8 +151,7 @@ pub fn service_ui_router(backend: Arc<JournalBackend>) -> Router {
 }
 
 async fn plugin_ui(State(state): State<Arc<JournalBackend>>, Path(id): Path<String>) -> Response {
-    let ui = state.service_ui.lock().await;
-    let Some((_, html)) = ui.get(&id) else {
+    let Some(html) = state.service_document(&id).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
     (
@@ -160,7 +159,7 @@ async fn plugin_ui(State(state): State<Arc<JournalBackend>>, Path(id): Path<Stri
          ("content-security-policy","default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'; navigate-to 'none'; sandbox allow-scripts"),
          ("cache-control","no-store"),
          ("referrer-policy","no-referrer"),
-         ("x-content-type-options","nosniff")],html.clone()
+         ("x-content-type-options","nosniff")],html
     ).into_response()
 }
 

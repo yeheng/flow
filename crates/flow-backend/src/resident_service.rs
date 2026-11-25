@@ -1,4 +1,6 @@
 //! Host-owned resident session. Calls are transient, bounded, and never retried implicitly.
+use crate::journal::{JournalBackend, JournalError};
+use flow_journal::Error as FactsError;
 use flow_plugin_sdk::protocol::{
     envelope::{read_frame, write_frame},
     handshake::{
@@ -865,4 +867,253 @@ mod tests {
         stop.cancel();
         let _ = serve_task.await;
     }
+}
+
+fn invalid(message: impl Into<String>) -> JournalError {
+    FactsError::Invalid(message.into()).into()
+}
+
+impl JournalBackend {
+    pub async fn list_services(&self, include_ui: bool) -> Value {
+        let services = self.services.lock().await;
+        let ui = if include_ui {
+            Some(self.service_ui.lock().await)
+        } else {
+            None
+        };
+        json!({"services": services.iter().map(|(id, service)| {
+            let handle = ui.as_ref().and_then(|ui| {
+                ui.iter().find(|(_, (instance, _))| instance == &service.instance)
+                    .map(|(key, _)| key.clone())
+            });
+            json!({
+                "plugin_id": id,
+                "instance": service.instance,
+                "alive": service.alive(),
+                "binding": service.binding.get().map(|(run_id, node_id, _)| json!({
+                    "run_id": run_id, "node_id": node_id,
+                })),
+                "ui": handle,
+            })
+        }).collect::<Vec<_>>()})
+    }
+
+    pub async fn resident_service(&self, id: &str) -> Option<Arc<ResidentService>> {
+        self.services.lock().await.get(id).cloned()
+    }
+
+    pub async fn service_document(&self, handle: &str) -> Option<String> {
+        self.service_ui
+            .lock()
+            .await
+            .get(handle)
+            .map(|(_, html)| html.clone())
+    }
+
+    /// A dropped RPC request leaves the accepted start owned by the host.
+    pub async fn start_resident_service(
+        self: &Arc<Self>,
+        id: String,
+        binding: Option<(String, String)>,
+    ) -> Result<String, JournalError> {
+        let backend = self.clone();
+        tokio::spawn(async move { backend.start_resident(id, binding).await })
+            .await
+            .map_err(|error| invalid(error.to_string()))?
+    }
+
+    async fn start_resident(
+        self: Arc<Self>,
+        id: String,
+        target: Option<(String, String)>,
+    ) -> Result<String, JournalError> {
+        let check = |services: &BTreeMap<String, Arc<ResidentService>>| {
+            if !self.accepts_services() {
+                return Err(invalid("host is shutting down"));
+            }
+            if let Some(service) = services.get(&id).filter(|service| service.alive()) {
+                if target.is_some() {
+                    return Err(invalid("service already running; stop before rebinding"));
+                }
+                return Ok(Some(service.instance.clone()));
+            }
+            if services.len() >= 32 && !services.contains_key(&id) {
+                return Err(invalid("service limit reached"));
+            }
+            Ok(None)
+        };
+        {
+            let services = self.services.lock().await;
+            if let Some(instance) = check(&services)? {
+                return Ok(instance);
+            }
+        }
+        let _starting = self.reserve_service_start(&id).map_err(invalid)?;
+        // The plugin root lease spans discovery and process startup, outside the registry lock.
+        let defaults = self.plugin_defaults();
+        let selected_id = id.clone();
+        let (lease, entry, declaration, html) = tokio::task::spawn_blocking(move || {
+            let root = flow_config::plugin_fs::plugins_root()
+                .ok_or_else(|| invalid("plugin root unavailable"))?;
+            let lease = flow_config::plugin_fs::RootLease::shared(&root)
+                .map_err(|error| invalid(error.to_string()))?;
+            if crate::plugin_operation::Operation::has_unfinished(&root, &selected_id)
+                .map_err(|error| invalid(error.to_string()))?
+            {
+                return Err(invalid("plugin operation requires recovery"));
+            }
+            let plugin = crate::plugin_scan::scan_unlocked(&root, &defaults)
+                .map_err(|error| invalid(error.to_string()))?
+                .rows
+                .into_iter()
+                .filter_map(|row| row.plugin)
+                .find(|plugin| plugin.manifest.plugin.id == selected_id)
+                .ok_or_else(|| invalid("plugin not installed"))?;
+            let declaration = plugin
+                .manifest
+                .service
+                .ok_or_else(|| invalid("plugin has no service role"))?;
+            let html = declaration
+                .web_ui
+                .as_ref()
+                .map(|path| read_document(&plugin.source, path.as_ref()))
+                .transpose()?;
+            let entry = plugin.source.join(plugin.manifest.plugin.entry);
+            Ok::<_, JournalError>((lease, entry, declaration, html))
+        })
+        .await
+        .map_err(|error| invalid(error.to_string()))??;
+
+        let binding = if let Some((run_id, node_id)) = target.as_ref() {
+            let run = self
+                .run_snapshot(run_id)
+                .await?
+                .ok_or_else(|| invalid("binding run not found"))?;
+            if run.terminal() {
+                return Err(invalid("binding run is terminal"));
+            }
+            let node = run
+                .nodes
+                .get(node_id)
+                .ok_or_else(|| invalid("binding node not active"))?;
+            Some((run_id.clone(), node_id.clone(), node.dispatch_id.clone()))
+        } else {
+            None
+        };
+        let host =
+            crate::service_host::handler(&self, id.clone(), declaration.peers, binding.clone());
+        let slot = Arc::new(std::sync::OnceLock::new());
+        let host = crate::service_host::with_subscriptions(host, slot.clone());
+        let service = ResidentService::start_installed_with_host_lease(
+            entry,
+            declaration.methods,
+            host,
+            lease,
+        )
+        .await
+        .map_err(invalid)?;
+        if let Some(binding) = binding {
+            let _ = service.binding.set(binding);
+        }
+        let _ = slot.set(Arc::downgrade(&service));
+        if let Err(error) = service.notify_ready() {
+            service.shutdown().await;
+            return Err(invalid(error));
+        }
+
+        let previous = {
+            let mut services = self.services.lock().await;
+            match check(&services) {
+                Ok(None) => services.insert(id.clone(), service.clone()),
+                Ok(Some(instance)) => {
+                    drop(services);
+                    service.shutdown().await;
+                    return Ok(instance);
+                }
+                Err(error) => {
+                    drop(services);
+                    service.shutdown().await;
+                    return Err(error);
+                }
+            }
+        };
+        let instance = service.instance.clone();
+        {
+            let mut ui = self.service_ui.lock().await;
+            if self.accepts_services() {
+                if let Some(previous) = previous.as_ref() {
+                    ui.retain(|_, (installed, _)| installed != &previous.instance);
+                }
+                if let Some(html) = html {
+                    let key = format!("{}-{}", instance, service.resource_token());
+                    ui.insert(key, (instance.clone(), html));
+                }
+            }
+        }
+        if let Some(previous) = previous {
+            previous.shutdown().await;
+        }
+        Ok(instance)
+    }
+
+    pub async fn stop_resident_service(
+        self: &Arc<Self>,
+        id: String,
+        instance: String,
+    ) -> Result<(), JournalError> {
+        let backend = self.clone();
+        tokio::spawn(async move {
+            let _operation = backend.reserve_plugin_operation(&id).map_err(|error| {
+                if error == "plugin operation in progress" {
+                    FactsError::Conflict(error.into()).into()
+                } else {
+                    invalid(error)
+                }
+            })?;
+            let service = {
+                let mut services = backend.services.lock().await;
+                let service = services
+                    .get(&id)
+                    .ok_or_else(|| invalid("service unavailable"))?;
+                if service.instance != instance {
+                    return Err(invalid("stale service instance"));
+                }
+                services.remove(&id).unwrap()
+            };
+            backend
+                .service_ui
+                .lock()
+                .await
+                .retain(|_, (id, _)| id != &instance);
+            service.shutdown().await;
+            Ok(())
+        })
+        .await
+        .map_err(|error| invalid(error.to_string()))?
+    }
+}
+
+fn read_document(source: &std::path::Path, path: &std::path::Path) -> Result<String, JournalError> {
+    use std::io::Read;
+    let io_error = |error: std::io::Error| invalid(error.to_string());
+    let root = source.canonicalize().map_err(io_error)?;
+    let path = root.join(path).canonicalize().map_err(io_error)?;
+    if !path.starts_with(&root) {
+        return Err(invalid("web-ui path escapes plugin"));
+    }
+    const MAX_BYTES: u64 = 256 * 1024;
+    let metadata = std::fs::metadata(&path).map_err(io_error)?;
+    if !metadata.is_file() || metadata.len() > MAX_BYTES {
+        return Err(invalid("web-ui must be a single HTML file under 256 KiB"));
+    }
+    let mut html = String::new();
+    std::fs::File::open(path)
+        .map_err(io_error)?
+        .take(MAX_BYTES + 1)
+        .read_to_string(&mut html)
+        .map_err(io_error)?;
+    if html.len() as u64 > MAX_BYTES {
+        return Err(invalid("web-ui exceeds 256 KiB"));
+    }
+    Ok(html)
 }

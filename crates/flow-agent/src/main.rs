@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use flow_config::Config;
-use flow_engine::execution_protocol::contract::ExecutorInvocation;
+use flow_dispatcher::execution_protocol::contract::ExecutorInvocation;
 
 /// flow-agent：受信任的远程执行中继（单条 mTLS 上联 + 本机执行器池）。
 #[derive(Parser)]

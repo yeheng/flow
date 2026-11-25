@@ -148,7 +148,7 @@ async fn failed_commit_does_not_publish_or_allow_later_decisions() {
             .inspect(|s| s.workflows.is_empty() && s.applied_lsn == 0)
             .await
     );
-    assert!(!backend.commits.state.lock().await.pending);
+    assert!(backend.diagnostics().await["commit_pending"] == false);
     assert!(backend
         .command("create", None, &json!({}), |_| panic!("must fail closed"))
         .await
@@ -173,7 +173,7 @@ async fn rejected_publication_does_not_poison_later_commands_or_notify_readers()
         }),
     );
     assert!(backend.append(vec![rejected]).await.is_err());
-    assert!(backend.commits.state.lock().await.failure.is_none());
+    assert!(backend.commits.failure().await.is_none());
     assert!(!backend.cancellation().is_cancelled());
     assert!(!commits.has_changed().unwrap());
     assert_eq!(backend.inspect(|s| s.applied_lsn).await, 0);
@@ -183,5 +183,34 @@ async fn rejected_publication_does_not_poison_later_commands_or_notify_readers()
         .unwrap();
     assert_eq!(receipt.commit_cursor.lsn, 1);
     assert!(commits.has_changed().unwrap());
+    backend.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn frozen_graph_decodes_a_dynamic_type_without_an_installed_plugin() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = JournalBackend::open(root.path(), Default::default())
+        .await
+        .unwrap();
+    let stored = flow_journal::StoredValue::inline(serde_json::json!({
+        "semantics": 2,
+        "nodes": [
+            {"id": "s", "type": "start"},
+            {"id": "p", "type": "previously_installed_fixture"},
+            {"id": "e", "type": "end"}
+        ],
+        "edges": [{"from":"s","to":"p"}, {"from":"p","to":"e"}]
+    }))
+    .unwrap();
+
+    let frozen = backend
+        .cached_frozen_definition("frozen-run", &stored)
+        .await
+        .unwrap();
+    assert_eq!(
+        frozen.nodes[1].plugin_type(),
+        Some("previously_installed_fixture")
+    );
+    assert!(backend.cached_definition("new-run", &stored).await.is_err());
     backend.close().await.unwrap();
 }

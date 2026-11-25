@@ -36,6 +36,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Mutex, Notify, Semaphore};
 use tokio_rustls::TlsAcceptor;
 
+use flow_dispatcher::execution_protocol::plugin_inventory::PluginOffer;
 use flow_engine::execution_protocol::contract::{
     bounded_control_text, WorkerProfile, A_MAX, PROTOCOL_VERSION, STARTUP_TIMEOUT_MS, W_BYTES,
 };
@@ -44,7 +45,6 @@ use flow_engine::execution_protocol::remote::{
     capability, validate_route_identity, ResumeAction, ResumeDecision, ResumeItem, RouteEnvelope,
 };
 use flow_engine::execution_protocol::transport::{FrameTransport, SendBacklog};
-use flow_engine::plugin_inventory::PluginOffer;
 
 use crate::execution::dispatch::DispatchLink;
 use crate::execution::ToSession;
@@ -1813,7 +1813,15 @@ mod capacity_tests {
             .unwrap()
             .is_none());
         assert_eq!(manager.bindings.lock().await.len(), 1);
-        manager.unbind(first.dispatch_id(), true).await;
+        // A rejected attempt commit drops the reservation before sending Bind.
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !manager.bindings.lock().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping a reservation must release the remote slot");
         let second = manager
             .reserve("run", "second", false, None)
             .await

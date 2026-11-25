@@ -429,33 +429,19 @@ async fn invocation_signal(
         Ok(v) => v,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    // A business capability cannot adjudicate external operations, including through run.signal's legacy alias.
-    // 节点类型必须从权威 run 定义里读出来：不能信客户端声称的节点名，
-    // 否则就能借信号路径绕过裁决。
-    let run = match state.backend.run_snapshot(&id).await {
-        Ok(Some(r)) => r,
-        _ => return StatusCode::NOT_FOUND.into_response(),
-    };
-    let definition = match flow_backend::journal_views::signal_definition(&state.backend, &run).await
-    {
-        Ok(d) => d,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    if !definition.node_type(&node).is_some_and(|k| {
-        matches!(
-            k,
-            flow_engine::NodeType::HumanTask | flow_engine::NodeType::Input
-        )
-    }) {
-        return StatusCode::FORBIDDEN.into_response();
-    }
     match state
         .backend
-        .run_signal(&id, &node, input, Some(request))
+        .invocation_signal(&id, &node, input, request)
         .await
     {
-        Ok(r) => Json(r).into_response(),
-        Err(e) => invocation_error(e),
+        Ok(receipt) => Json(receipt).into_response(),
+        Err(JournalError::Journal(flow_facts::Error::Forbidden(_))) => {
+            StatusCode::FORBIDDEN.into_response()
+        }
+        Err(JournalError::Journal(flow_facts::Error::NotFound(_))) => {
+            StatusCode::NOT_FOUND.into_response()
+        }
+        Err(error) => invocation_error(error),
     }
 }
 /// `POST /invocations/{id}/cancel`：取消该 run（级联取消子 run）。

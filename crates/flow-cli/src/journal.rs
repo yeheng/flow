@@ -357,8 +357,6 @@ pub async fn dispatch(client: &WsClient, command: Command) -> Result<(), CliErro
             if let Some(decision) = &decision {
                 params["decision"] = json!(decision);
             }
-            // permissions.audit.page 的 complete=false 表示页满：以 (run_id,lsn)
-            // 游标续读直至 complete。
             let mut cursor = Value::Null;
             loop {
                 let mut request = params.clone();
@@ -366,26 +364,32 @@ pub async fn dispatch(client: &WsClient, command: Command) -> Result<(), CliErro
                     request["cursor"] = cursor.clone();
                 }
                 let page = call(client, &token, "permissions.audit.page", request).await?;
-                for event in page["events"]
+                let events = page["events"]
                     .as_array()
-                    .ok_or_else(|| error("invalid page"))?
-                {
+                    .ok_or_else(|| error("invalid page"))?;
+                for event in events {
                     println!("{event}");
                 }
-                let complete = page["complete"].as_bool().unwrap_or(true);
-                cursor = page["events"]
-                    .as_array()
-                    .and_then(|events| events.last())
-                    .map(|last| {
-                        json!({
-                            "run_id": last["event"]["run_id"].clone(),
-                            "lsn": last["lsn"].as_u64().map(|v| v + 1).unwrap_or(1),
-                        })
-                    })
-                    .unwrap_or(Value::Null);
-                if complete || cursor.is_null() {
+                if page["complete"].as_bool().unwrap_or(true) {
                     break;
                 }
+                let next = match page.get("next_cursor") {
+                    Some(next) => next.clone(),
+                    None => {
+                        // Older servers accept a numeric LSN and resume at the next transaction.
+                        let last = events.last().ok_or_else(|| error("missing audit cursor"))?;
+                        let lsn = last["lsn"]
+                            .as_u64()
+                            .or_else(|| last["lsn"].as_str()?.parse().ok())
+                            .and_then(|lsn| lsn.checked_add(1))
+                            .ok_or_else(|| error("invalid audit event position"))?;
+                        json!({"run_id": last["event"]["run_id"], "lsn": lsn})
+                    }
+                };
+                if !next.is_object() || next == cursor {
+                    return Err(error("audit cursor did not advance"));
+                }
+                cursor = next;
             }
         }
         Command::Events { run_id, audit } => {

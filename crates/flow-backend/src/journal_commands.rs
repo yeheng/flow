@@ -421,6 +421,13 @@ impl ProductCommand {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SignalSource<'a> {
+    Admin,
+    Invocation,
+    Bound(&'a str),
+}
+
 impl JournalBackend {
     /// 业务调用入口：按 hook 配置启动一次 run（幂等键来自业务请求）。
     ///
@@ -1404,9 +1411,27 @@ impl JournalBackend {
         payload: Value,
         request_id: Option<&str>,
     ) -> Result<CommandReceipt> {
-        self.run_signal_bound(run_id, node_id, payload, request_id, None)
+        self.deliver_signal(run_id, node_id, payload, request_id, SignalSource::Admin)
             .await
     }
+
+    pub async fn invocation_signal(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        payload: Value,
+        request_id: &str,
+    ) -> Result<CommandReceipt> {
+        self.deliver_signal(
+            run_id,
+            node_id,
+            payload,
+            Some(request_id),
+            SignalSource::Invocation,
+        )
+        .await
+    }
+
     pub async fn run_signal_bound(
         &self,
         run_id: &str,
@@ -1415,6 +1440,23 @@ impl JournalBackend {
         request_id: Option<&str>,
         expected_dispatch: Option<&str>,
     ) -> Result<CommandReceipt> {
+        let source = expected_dispatch.map_or(SignalSource::Admin, SignalSource::Bound);
+        self.deliver_signal(run_id, node_id, payload, request_id, source)
+            .await
+    }
+
+    async fn deliver_signal(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        payload: Value,
+        request_id: Option<&str>,
+        source: SignalSource<'_>,
+    ) -> Result<CommandReceipt> {
+        let expected_dispatch = match source {
+            SignalSource::Bound(dispatch) => Some(dispatch),
+            _ => None,
+        };
         let mut request = json!({"run_id":run_id,"node_id":node_id,"payload":payload});
         if let Some(dispatch) = expected_dispatch {
             request["expected_dispatch"] = json!(dispatch);
@@ -1432,16 +1474,20 @@ impl JournalBackend {
             }
             Ok(())
         };
-        if let Some(receipt) =
-            deduped(self, &format!("run.signal:{run_id}"), request_id, &request).await?
-        {
-            return Ok(receipt);
+        let invocation = matches!(source, SignalSource::Invocation);
+        let scope = format!("run.signal:{run_id}");
+        if !invocation {
+            if let Some(receipt) = deduped(self, &scope, request_id, &request).await? {
+                return Ok(receipt);
+            }
         }
         let snapshot = self
             .run_snapshot(run_id)
             .await?
             .ok_or_else(|| flow_journal::Error::NotFound("run not found".into()))?;
-        let definition = self.cached_definition(run_id, &snapshot.definition).await?;
+        let definition = self
+            .cached_frozen_definition(run_id, &snapshot.definition)
+            .await?;
         let accepts_inbox = definition.node_type(node_id).is_some_and(|k| {
             matches!(
                 k,
@@ -1453,32 +1499,47 @@ impl JournalBackend {
                 invalid("bound service signals require an input or human_task node").into(),
             );
         }
+        if invocation && !accepts_inbox {
+            return Err(flow_journal::Error::Forbidden(
+                "business signals require an input or human_task node".into(),
+            )
+            .into());
+        }
+        let decide = |state: &State, output: &flow_journal::StoredValue| {
+            validate_binding(state)?;
+            if invocation
+                && state
+                    .runs
+                    .get(run_id)
+                    .and_then(|run| run.nodes.get(node_id))
+                    .and_then(|node| node.wait.as_ref())
+                    .is_some_and(|wait| wait.kind() == WaitKind::Uncertain)
+            {
+                return Err(flow_journal::Error::Forbidden(
+                    "business signals cannot adjudicate".into(),
+                ));
+            }
+            signal_decision(
+                state,
+                run_id,
+                node_id,
+                &payload,
+                request_id,
+                accepts_inbox,
+                output,
+            )
+        };
         // 预检阶段先判定这次信号是「裁决」还是普通信号，提交阶段再核对
         // 判定是否一致——节点状态在两次之间变了就必须报冲突。
         let mut adjudication = false;
         if let Some(receipt) = self
-            .preflight_command(
-                &format!("run.signal:{run_id}"),
-                request_id,
-                &request,
-                Some(run_id),
-                |state| {
-                    validate_binding(state)?;
-                    let (events, _) = signal_decision(
-                        state,
-                        run_id,
-                        node_id,
-                        &payload,
-                        request_id,
-                        accepts_inbox,
-                        &flow_journal::StoredValue::Inline(Value::Null),
-                    )?;
-                    adjudication = events
-                        .first()
-                        .is_some_and(|event| event.kind == EventKind::Adjudicated);
-                    Ok(())
-                },
-            )
+            .preflight_command(&scope, request_id, &request, Some(run_id), |state| {
+                let (events, _) = decide(state, &flow_journal::StoredValue::Inline(Value::Null))?;
+                adjudication = events
+                    .first()
+                    .is_some_and(|event| event.kind == EventKind::Adjudicated);
+                Ok(())
+            })
             .await?
         {
             return Ok(receipt);
@@ -1495,22 +1556,13 @@ impl JournalBackend {
             .await?;
         let output = prepared.stored().clone();
         self.command_with_value(
-            &format!("run.signal:{run_id}"),
+            &scope,
             request_id,
             &request,
             Some(run_id),
             prepared,
             |state| {
-                validate_binding(state)?;
-                let result = signal_decision(
-                    state,
-                    run_id,
-                    node_id,
-                    &payload,
-                    request_id,
-                    accepts_inbox,
-                    &output,
-                )?;
+                let result = decide(state, &output)?;
                 if result
                     .0
                     .first()

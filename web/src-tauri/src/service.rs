@@ -125,8 +125,13 @@ impl Services {
             default_path,
             env_overrides: Vec::new(),
         };
-        let (state, _secrets) =
-            flow_rpc::AppState::for_production(journal.clone(), config_state, &data_dir).await;
+        let (state, _secrets) = flow_rpc::AppState::for_production(
+            journal.clone(),
+            config_state,
+            &data_dir,
+            &config.permissions,
+        )
+        .await;
         // 主服务与 /journal 工作区同一 v2 模块（产品面全量；v1 RPC 面退役）
         let journal_methods: Methods = flow_rpc::journal_v2::module_product(
             journal.clone(),

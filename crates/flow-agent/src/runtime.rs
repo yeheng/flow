@@ -15,16 +15,16 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use flow_engine::execution_protocol::contract::bounded_control_text;
-use flow_engine::execution_protocol::contract::{
+use flow_dispatcher::execution_protocol::contract::bounded_control_text;
+use flow_dispatcher::execution_protocol::contract::{
     ExecutorInvocation, WorkerProfile, DRAIN_GRACE_MS, PROTOCOL_VERSION,
 };
-use flow_engine::execution_protocol::message::Message;
-use flow_engine::execution_protocol::remote::{
+use flow_dispatcher::execution_protocol::message::Message;
+use flow_dispatcher::execution_protocol::plugin_inventory::PluginOffer;
+use flow_dispatcher::execution_protocol::remote::{
     Capacity, ResumeAction, ResumeItem, ResumeState, RESUME_PAGE_MAX,
 };
-use flow_engine::execution_protocol::transport::FrameTransport;
-use flow_engine::plugin_inventory::PluginOffer;
+use flow_dispatcher::execution_protocol::transport::FrameTransport;
 
 use crate::pool::{self, ExecutorHandle};
 use crate::relay::{Relay, RelayError, UPLINK_OUT_QUEUE};
@@ -77,7 +77,7 @@ pub async fn run_agent(config: AgentConfig, shutdown: CancellationToken) -> Stri
             inventory_shutdown,
         ));
     }
-    let agent_boot_id = flow_engine::execution_protocol::transport::fresh_boot_id();
+    let agent_boot_id = flow_dispatcher::execution_protocol::transport::fresh_boot_id();
     let executor_handles: Arc<tokio::sync::Mutex<BTreeMap<String, ExecutorHandle>>> =
         Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
     // 上联转发管道常驻：断线只换 serve 会话的 transport，执行器与桥不拆
@@ -275,7 +275,7 @@ async fn connect_wss(
             .parse()
             .map_err(|_| "invalid token header".to_string())?,
     );
-    let limit = Some(flow_engine::execution_protocol::ws::MAX_WS_MESSAGE_BYTES);
+    let limit = Some(flow_dispatcher::execution_protocol::ws::MAX_WS_MESSAGE_BYTES);
     let ws_config = WebSocketConfig::default()
         .max_message_size(limit)
         .max_frame_size(limit);
@@ -284,7 +284,7 @@ async fn connect_wss(
             .await
             .map_err(|e| format!("wss connect: {e}"))?;
     let transport = FrameTransport::spawn(
-        flow_engine::execution_protocol::ws::WsByteStream::new(ws),
+        flow_dispatcher::execution_protocol::ws::WsByteStream::new(ws),
         128,
     );
     handshake(transport, config, agent_boot_id, worker_profile, offer).await
@@ -316,7 +316,7 @@ async fn handshake(
         .await
         .map_err(|e| format!("send hello: {e}"))?;
     let message = tokio::time::timeout(
-        Duration::from_millis(flow_engine::execution_protocol::STARTUP_TIMEOUT_MS),
+        Duration::from_millis(flow_dispatcher::execution_protocol::STARTUP_TIMEOUT_MS),
         transport.recv(),
     )
     .await
@@ -514,7 +514,7 @@ async fn cancel_all(handles: &Arc<tokio::sync::Mutex<BTreeMap<String, ExecutorHa
 /// 积压超限/会话失效返回 Err（不用无界队列化解背压）。
 fn queue_uplink(
     transport: &FrameTransport,
-    backlog: &mut flow_engine::execution_protocol::transport::SendBacklog,
+    backlog: &mut flow_dispatcher::execution_protocol::transport::SendBacklog,
     message: Message,
 ) -> Result<(), String> {
     backlog
@@ -589,7 +589,7 @@ async fn serve_with_worker_profile(
         Result<ExecutorHandle, pool::PoolError>,
     )> = tokio::task::JoinSet::new();
     let mut send_backlog =
-        flow_engine::execution_protocol::transport::SendBacklog::with_capacity(16);
+        flow_dispatcher::execution_protocol::transport::SendBacklog::with_capacity(16);
     let mut housekeeping = tokio::time::interval(Duration::from_millis(20));
     // 上联心跳（§3.7）：按 Welcome 协商周期发送；master 侧以它为活跃
     // 证据（静默超时即判失联）。积压占用时跳拍（下一拍再试）——心跳是
@@ -1006,7 +1006,7 @@ pub async fn serve_for_tests(
         "test-link",
         journal_id,
         master_epoch,
-        flow_engine::execution_protocol::HEARTBEAT_INTERVAL_MS,
+        flow_dispatcher::execution_protocol::HEARTBEAT_INTERVAL_MS,
         transport,
         session_relay,
         handles,
@@ -1220,12 +1220,12 @@ mod tests {
                         page,
                         decisions: items
                             .into_iter()
-                            .map(
-                                |item| flow_engine::execution_protocol::remote::ResumeDecision {
+                            .map(|item| {
+                                flow_dispatcher::execution_protocol::remote::ResumeDecision {
                                     dispatch_id: item.dispatch_id,
                                     action: ResumeAction::AlreadyCommitted,
-                                },
-                            )
+                                }
+                            })
                             .collect(),
                     })
                     .await

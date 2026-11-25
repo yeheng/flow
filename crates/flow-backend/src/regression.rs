@@ -78,7 +78,9 @@ impl JournalBackend {
                 .execution
                 .as_ref()
                 .ok_or_else(|| Error::Invalid("baseline child context missing".into()))?;
-            let definition = self.cached_definition(&run.run_id, &run.definition).await?;
+            let definition = self
+                .cached_frozen_definition(&run.run_id, &run.definition)
+                .await?;
             for (id, node) in &run.nodes {
                 if let Some(operation) = &node.operation {
                     // 只有已捕获 outcome 的操作才能录成 fixture：

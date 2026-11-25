@@ -28,6 +28,7 @@ pub mod fixtures;
 pub mod frame;
 pub mod loopback;
 pub mod message;
+pub mod plugin_inventory;
 pub mod remote;
 #[cfg(unix)]
 pub mod spawn;

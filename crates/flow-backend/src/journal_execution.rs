@@ -23,6 +23,22 @@ fn invalid(s: impl Into<String>) -> flow_journal::Error {
     flow_journal::Error::Invalid(s.into())
 }
 
+/// Retry pure computation only after the exact input has been committed.
+pub(crate) fn pure_retry_delay(
+    node: &flow_engine::Node,
+    record: &flow_engine::journal_state::Node,
+) -> Option<i64> {
+    let policy = node.retry();
+    (record.prepared.is_some()
+        && record.operation.is_none()
+        && matches!(
+            node.kind(),
+            Some(flow_engine::NodeType::Script | flow_engine::NodeType::Condition)
+        )
+        && record.attempt < policy.max_attempts.min(100))
+    .then_some(policy.backoff_ms.min(i64::MAX as u64) as i64)
+}
+
 /// NodeFailed 证据载荷的预算收口（铁律 1：失败证据必须能落到 journal
 /// 事件上）。载荷原样内嵌 original_input 与全部前驱输出——宽扇入下两者
 /// 相加可超 1 MiB 事务行上限，超限提交被 bounded_json 拒绝、错误又被

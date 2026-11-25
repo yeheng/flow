@@ -50,7 +50,7 @@ impl JournalBackend {
             return Ok(hit.clone());
         }
         let definition = self
-            .cached_definition(
+            .cached_frozen_definition(
                 &format!("permissions-digest:{}", version.checksum),
                 &version.definition,
             )
@@ -225,7 +225,7 @@ impl JournalBackend {
                 .await?
                 .ok_or_else(|| flow_journal::Error::NotFound("run not found".into()))?;
             let definition = self
-                .cached_definition(&format!("effective:{run_id}"), &run.definition)
+                .cached_frozen_definition(run_id, &run.definition)
                 .await?;
             let mut view = effective_permissions(
                 &definition,
@@ -251,7 +251,7 @@ impl JournalBackend {
             .await
             .ok_or_else(|| flow_journal::Error::NotFound("workflow version not found".into()))?;
         let definition = self
-            .cached_definition(
+            .cached_frozen_definition(
                 &format!("effective-def:{}", selected.checksum),
                 &selected.definition,
             )

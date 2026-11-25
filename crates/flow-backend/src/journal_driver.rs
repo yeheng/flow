@@ -9,17 +9,16 @@
 //! 事实上，节点语义则一律交给执行器子进程（C2）。
 //! 需要它，是因为外部副作用无法纳入本地事务：只有把意图、授权与结果
 //! 分成三个可裁决的阶段（C3/C4），崩溃后的未知结果才有一个明确的出口。
-use crate::execution::ports::{DispatchWork, ExecutionPort, NodeDispatch};
+use crate::execution::ports::{ExecutionPort, NodeDispatch};
 use crate::execution::remote::{AgentManager, RemoteDispatcher, RemoteListeners, RemoteOptions};
 use crate::execution::{ExecutionMode, IpcDispatcher, IpcOptions};
 use crate::journal::{JournalBackend, JournalError};
 use crate::journal_commands::node_event;
 use crate::journal_commands::runtime_mismatched;
 use crate::journal_execution::Attempt;
-use flow_application::dispatch::{admit, DispatchRequest};
 use flow_engine::journal_state::{Node as NodeState, NodeStatus, Run, RunStatus, Wait, WaitKind};
 use flow_engine::progression::{is_settled, node_gate, run_settlement, NodeGate, RunSettlement};
-use flow_engine::{Definition, NodeLogger, NodeType};
+use flow_engine::{Definition, NodeLogger};
 use flow_journal::{Event, EventKind, StoredValue};
 use futures::FutureExt;
 use serde_json::{json, Value};
@@ -112,7 +111,14 @@ impl JournalBackend {
         let pool = crate::execution::ExecutorPool::new(options, self.journal.id().into(), epoch);
         let dispatcher = Arc::new(IpcDispatcher::new(pool));
         if self
-            .start_execution_with_port(limit, dispatcher, prewarm, Weak::new())
+            .start_execution_with_port(
+                limit,
+                ExecutionPort::Local {
+                    dispatcher,
+                    prewarm,
+                },
+                Weak::new(),
+            )
             .await
         {
             *self
@@ -161,7 +167,11 @@ impl JournalBackend {
         listeners.start(&manager, options.wss_agents.clone());
         let dispatcher = Arc::new(RemoteDispatcher::new(manager.clone(), options));
         if self
-            .start_execution_with_port(16, dispatcher, false, Arc::downgrade(&manager))
+            .start_execution_with_port(
+                16,
+                ExecutionPort::Remote(dispatcher),
+                Arc::downgrade(&manager),
+            )
             .await
         {
             *self
@@ -182,7 +192,11 @@ impl JournalBackend {
     ) -> Result<()> {
         let dispatcher = Arc::new(RemoteDispatcher::new(manager.clone(), options));
         if self
-            .start_execution_with_port(16, dispatcher, false, Arc::downgrade(&manager))
+            .start_execution_with_port(
+                16,
+                ExecutionPort::Remote(dispatcher),
+                Arc::downgrade(&manager),
+            )
             .await
         {
             *self
@@ -200,8 +214,7 @@ impl JournalBackend {
     async fn start_execution_with_port(
         self: &Arc<Self>,
         limit: usize,
-        port: Arc<ExecutionPort>,
-        prewarm: bool,
+        port: ExecutionPort,
         remote_manager: Weak<AgentManager>,
     ) -> bool {
         let mut driver = self.execution.lock().await;
@@ -219,8 +232,8 @@ impl JournalBackend {
             let outcome = AssertUnwindSafe(async {
             // 预热只在协调器任务启动时执行一次（不随 panic 重启重复）。
             // 本任务独占 `port` 且尚未进入调度循环，故不与任何 acquire 竞争。
-            if prewarm {
-                match port.prewarm().await {
+            if let ExecutionPort::Local { dispatcher, prewarm: true } = &port {
+                match dispatcher.prewarm(1).await {
                     Ok(warmed) => tracing::info!(warmed, "executor prewarmed"),
                     Err(error) => tracing::warn!(
                         %error,
@@ -397,7 +410,7 @@ pub(crate) fn check_executor(options: &IpcOptions) -> Result<()> {
 /// 瞬时错误上抛给协调循环，由它延迟重试。
 async fn advance_run(
     backend: &Arc<JournalBackend>,
-    port: &Arc<ExecutionPort>,
+    port: &ExecutionPort,
     observation: &Option<flow_engine::observation::ObservationStore>,
     run_id: &str,
     coord: &mut Coordinator,
@@ -415,7 +428,7 @@ async fn advance_run(
         return Ok(());
     }
     let definition = backend
-        .cached_definition(&run.run_id, &run.definition)
+        .cached_frozen_definition(&run.run_id, &run.definition)
         .await?;
     for node in &definition.nodes {
         if coord.active.contains(&(run_id.to_owned(), node.id.clone())) {
@@ -461,7 +474,10 @@ async fn advance_run(
             }
             NodeGate::Blocked => {}
             NodeGate::Ready(predecessors) => {
-                let parked = port.parked_count();
+                let parked = match port {
+                    ExecutionPort::Local { dispatcher, .. } => dispatcher.parked_count(),
+                    ExecutionPort::Remote(_) => 0,
+                };
                 if !coord.has_capacity(node, parked) {
                     // 槽位不足：本轮不派发，把 run 退回 dirty 集等下一轮。
                     backend.defer_run(run_id.to_owned()).await;
@@ -688,57 +704,64 @@ async fn advance_committed_node(
 /// 记账必须先于它完成，否则会漏掉这次尝试。
 async fn spawn_node_attempt(
     backend: &Arc<JournalBackend>,
-    port: &Arc<ExecutionPort>,
+    port: &ExecutionPort,
     observation: &Option<flow_engine::observation::ObservationStore>,
     run_id: &str,
     node: &flow_engine::Node,
     predecessors: BTreeMap<String, StoredValue>,
     coord: &mut Coordinator,
 ) -> Result<()> {
-    let plugin_binding = if let Some(node_type) = node.plugin_type().filter(|_| port.uses_plugin_affinity()) {
-        backend
-            .inspect(|state| {
-                let run = state.runs.get(run_id)?;
-                // Replaying a stored outcome does not invoke the plugin.
-                let recorded = run
-                    .execution
-                    .as_ref()
-                    .is_some_and(|snapshot| snapshot.regression.is_some())
-                    || run
-                        .nodes
-                        .get(&node.id)
-                        .and_then(|record| record.operation.as_ref()?.outcome.as_ref())
-                        .is_some();
-                if recorded {
-                    return None;
+    let dispatch = match port {
+        ExecutionPort::Local { dispatcher, .. } => Ok(NodeDispatch::Local(dispatcher.clone())),
+        ExecutionPort::Remote(dispatcher) => {
+            let plugin_binding = if let Some(node_type) = node.plugin_type() {
+                backend
+                    .inspect(|state| {
+                        let run = state.runs.get(run_id)?;
+                        // Replaying a stored outcome does not invoke the plugin.
+                        let recorded = run
+                            .execution
+                            .as_ref()
+                            .is_some_and(|snapshot| snapshot.regression.is_some())
+                            || run
+                                .nodes
+                                .get(&node.id)
+                                .and_then(|record| record.operation.as_ref()?.outcome.as_ref())
+                                .is_some();
+                        if recorded {
+                            return None;
+                        }
+                        run.plugin_bindings.as_ref()?.get(node_type).cloned()
+                    })
+                    .await
+            } else {
+                None
+            };
+            match dispatcher
+                .reserve_node(run_id, node, plugin_binding.as_ref())
+                .await
+            {
+                Ok(Some(reservation)) => Ok(NodeDispatch::Remote(dispatcher.clone(), reservation)),
+                Ok(None) => {
+                    backend.defer_run(run_id.to_owned()).await;
+                    return Ok(());
                 }
-                run.plugin_bindings.as_ref()?.get(node_type).cloned()
-            })
-            .await
-    } else {
-        None
-    };
-    let request = DispatchRequest {
-        run_id,
-        node,
-        plugin_binding: plugin_binding.as_ref(),
-    };
-    let admitted = admit(port.clone(), request, |id| async {
-        match id {
-            Some(id) => Attempt::begin_with_id(
-                backend.clone(),
-                run_id.to_owned(),
-                node.id.clone(),
-                id,
-            )
-            .await,
-            None => Attempt::begin(backend.clone(), run_id.to_owned(), node.id.clone()).await,
+                // A failed reservation still gets an attempt to record its failure.
+                Err(error) => Err(error.into()),
+            }
         }
-    })
-    .await?;
-    let Some((attempt, dispatch)) = admitted else {
-        backend.defer_run(run_id.to_owned()).await;
-        return Ok(());
+    };
+    let dispatch_id = dispatch
+        .as_ref()
+        .ok()
+        .and_then(NodeDispatch::dispatch_id)
+        .map(str::to_owned);
+    // The remote reservation stays owned here until commit succeeds or this call exits.
+    let attempt = match dispatch_id {
+        Some(id) => {
+            Attempt::begin_with_id(backend.clone(), run_id.to_owned(), node.id.clone(), id).await?
+        }
+        None => Attempt::begin(backend.clone(), run_id.to_owned(), node.id.clone()).await?,
     };
     let key: NodeKey = (run_id.to_owned(), node.id.clone());
     coord.active.insert(key.clone());
@@ -765,20 +788,18 @@ async fn spawn_node_attempt(
 /// 关键是「不把平台故障写成业务失败」——已授权外部操作的节点在断链时
 /// 必须落到 Uncertain 等待人工裁决。
 async fn execute_node(
-    dispatch: NodeDispatch,
+    dispatch: Result<NodeDispatch>,
     attempt: Attempt,
     node: flow_engine::Node,
     predecessors: BTreeMap<String, StoredValue>,
     observation: Option<flow_engine::observation::ObservationStore>,
 ) -> NodeTask {
     let key: NodeKey = (attempt.run_id.clone(), attempt.node_id.clone());
-    let work = DispatchWork {
-        attempt: attempt.clone(),
-        node: node.clone(),
-        predecessors: predecessors.clone(),
-        observations: observation.clone(),
-    };
-    let result = AssertUnwindSafe(dispatch.execute(work))
+    let result = AssertUnwindSafe(async {
+        dispatch?
+            .execute(&attempt, &node, predecessors.clone(), observation.clone())
+            .await
+    })
         .catch_unwind()
         .await
         .unwrap_or_else(|_| {
@@ -826,16 +847,7 @@ async fn execute_node(
                     &predecessors,
                 )
             };
-            let policy = node.retry();
-            if !uncertain
-                && n.operation.is_none()
-                && n.prepared.is_some()
-                && matches!(node.kind(), Some(NodeType::Script | NodeType::Condition))
-                && n.attempt < policy.max_attempts.min(100)
-            {
-                // 准备阶段就失败（脚本/条件在派发前抛错）属于本节点自己的
-                // 错误，没有碰过外部系统，可以按策略自动重试。
-                let delay = policy.backoff_ms.min(i64::MAX as u64) as i64;
+            if let Some(delay) = crate::journal_execution::pure_retry_delay(&node, n) {
                 payload["retry_wake_at"] =
                     json!(chrono::Utc::now().timestamp_millis().saturating_add(delay));
                 if let Some(store) = &observation {

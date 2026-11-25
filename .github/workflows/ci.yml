@@ -112,6 +112,12 @@ jobs:
           fi
           cargo build -p flow-workflow -p flow-internal-plugins --bins --locked --target ${{ matrix.arch.target }}
           cargo test -p flow-e2e --test workflow_memory --locked --target ${{ matrix.arch.target }}
+      - name: isolated remote agent
+        run: |
+          deps=$(cargo tree -p flow-agent --edges normal --prefix none --locked --target ${{ matrix.arch.target }})
+          if grep -E '^(flow-(engine|domain|journal|backend|plugin-[^ ]+)|libsqlite3-sys) v' <<< "$deps"; then
+            exit 1
+          fi
       - name: isolated managed executor
         run: |
           deps=$(cargo tree -p flow-plugin-runtime --edges normal --prefix none --locked --target ${{ matrix.arch.target }})

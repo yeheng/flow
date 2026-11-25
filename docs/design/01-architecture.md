@@ -31,7 +31,7 @@ crates/
                   query feature 承接同库只读执行与产品查询(原 flow-store 并入)
   flow-facts      事件、事务、值描述符及有界编码契约
   flow-domain     工作流定义、图规则、schema 校验与确定性状态折叠
-  flow-application  托管运行的原子提交、状态发布与派发准入，定义写入和执行端口
+  flow-application  托管运行的原子提交、状态发布与待调度集合，定义写入端口
   flow-dispatcher  IPC 协议、进程池与通用任务派发（v8 postcard 单流）
   flow-engine     工作流运行共享设施：观测日志、密钥，并重导出领域规则与 IPC 契约
   flow-backend    journal 唯一权威后端：journal.rs（JournalBackend）+ journal_commands
@@ -96,7 +96,7 @@ flow-dto ──> 无依赖（叶子）
 flow-plugin-catalog ──> flow-config / flow-domain / flow-plugin-sdk
 flow-plugin-runtime ──> flow-engine（node-execution）/ flow-facts / flow-internal-plugins
                     └─> flow-plugin-catalog / flow-plugin-sdk / flow-config / flow-harness-protocol（plugins feature）
-flow-agent ──> flow-engine（无默认 features）/ flow-config
+flow-agent ──> flow-dispatcher / flow-config
 flow-cli ──> flow-dto（自带 jsonrpsee/reqwest WS 客户端，运行期连 flow-journal-server，
             但不依赖任何服务 crate）
 flow-cli ──✗> flow-journal  ✗（CLI 不碰存储与事件日志，没有第二条写入路径）
@@ -110,9 +110,10 @@ SQLite 和磁盘读写由 `flow-journal` 提供。工作流
 节点尝试和执行快照装配为工作流载荷，再走共用的进程池、发送及完成确认入口。
 工作流现有 `Execute` 与 v8 帧索引保留，旧执行器和远程中继沿用这条路径。
 
-`flow-backend` 为 `flow-application` 装配 Journal 写入和本地/远程执行。
+`flow-backend` 为 `flow-application` 装配 Journal 写入，本地和远程派发由后端协调器装配。
 提交端口保证事实、投影和暂存正文原子写入，应用层在落盘后发布状态。
 远程派发先预留兼容容量，再提交本次尝试；预留随租约释放。
+恢复已提交的工作流时按冻结定义解释节点类型，Worker 路由继续核对冻结的插件身份。
 分页、订阅续读和下载解析由 `journal_views` 读取已提交快照，RPC 负责鉴权和传输。
 `flow-workflow` 关闭默认 feature 后可以用替身执行器验证应用逻辑。
 

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use flow_config::plugin_manifest;
-use flow_engine::plugin_inventory::PluginInventory;
+use flow_engine::execution_protocol::plugin_inventory::PluginInventory;
 use flow_plugin_catalog::{content_hash_path, read_manifest, BUNDLED_ROUTES};
 
 /// 注册来源。

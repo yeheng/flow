@@ -8,14 +8,16 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
-use flow_engine::plugin_inventory::PluginInventory;
-use flow_engine::execution_protocol::bootstrap::spawn_executor_transport;
-use flow_engine::execution_protocol::contract::{
+use flow_dispatcher::execution_protocol::bootstrap::spawn_executor_transport;
+use flow_dispatcher::execution_protocol::contract::{
     ExecutorInvocation, WorkerProfile, DRAIN_GRACE_MS, HEARTBEAT_TIMEOUT_MS,
     STARTUP_TIMEOUT_MS,
 };
-use flow_engine::execution_protocol::message::Message;
-use flow_engine::execution_protocol::transport::{master_handshake, ExecutorHello, FrameTransport};
+use flow_dispatcher::execution_protocol::message::Message;
+use flow_dispatcher::execution_protocol::plugin_inventory::PluginInventory;
+use flow_dispatcher::execution_protocol::transport::{
+    master_handshake, ExecutorHello, FrameTransport,
+};
 
 use crate::relay::{Relay, PER_EXECUTOR_QUEUE};
 
@@ -69,7 +71,7 @@ pub enum PoolError {
 /// 失败路径回收：kill 之后必须 wait/reap。只 kill 不 wait 会把 Child 随
 /// 错误值一起 drop，SIGKILL 后的子进程无人收割成为僵尸；执行器二进制
 /// 损坏或启动慢导致握手反复超时时，僵尸会线性累积。
-async fn kill_and_reap(mut child: flow_engine::process::ManagedChild) {
+async fn kill_and_reap(mut child: flow_dispatcher::process::ManagedChild) {
     let _ = child.start_kill();
     let _ = child.wait().await;
 }
@@ -106,7 +108,7 @@ async fn start_worker(
 ) -> Result<
     (
         FrameTransport,
-        flow_engine::process::ManagedChild,
+        flow_dispatcher::process::ManagedChild,
         ExecutorHello,
     ),
     PoolError,
@@ -245,7 +247,7 @@ pub(crate) async fn bind_profiled_executor(
 async fn executor_loop(
     dispatch_id: String,
     mut transport: FrameTransport,
-    mut child: flow_engine::process::ManagedChild,
+    mut child: flow_dispatcher::process::ManagedChild,
     mut inbox: mpsc::Receiver<Message>,
     out: mpsc::Sender<Message>,
     cancel: CancellationToken,
@@ -267,8 +269,9 @@ async fn executor_loop(
     // Cancel 转发后的收割截止（P2-8）：持续心跳但不处理 Cancel 的执行器
     // （用户脚本/执行器 bug）到点强制 kill——没有这道闸它会永久占一个
     // agent 槽位，master 派发方早已放弃等待，无人再触发回收。
-    let cancel_reap_timeout =
-        Duration::from_millis(flow_engine::execution_protocol::contract::CANCEL_REAP_TIMEOUT_MS);
+    let cancel_reap_timeout = Duration::from_millis(
+        flow_dispatcher::execution_protocol::contract::CANCEL_REAP_TIMEOUT_MS,
+    );
     let mut cancel_sent_at: Option<tokio::time::Instant> = None;
     loop {
         tokio::select! {

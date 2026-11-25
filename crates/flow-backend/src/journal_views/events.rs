@@ -116,158 +116,82 @@ impl RunEvents {
         serde_json::to_value(page).map_err(invalid)
     }
 }
-/// permissions.audit.page：数据集级权限审计分页。
-///
-/// 按 run_id 和 decision 过滤权限事实，事件保留裁决主体、时间和能力项。实现按 run 分页
-/// （复用 run 级 Permission 过滤器）：无 run_id 时从在册 run 里逐个收集
-/// 到页满；游标 = 下一批 (run_id, lsn)。
+/// Read permissions.audit.page from the committed fact stream.
 pub async fn permissions_audit_page(
     b: &JournalBackend,
     p: &Value,
 ) -> Result<Value, EventReadError> {
     let decision = p.get("decision").and_then(Value::as_str);
-    if let Some(decision) = decision {
-        if !matches!(decision, "allow" | "deny") {
-            return Err(EventReadError::Invalid(
-                "decision must be allow | deny".into(),
-            ));
-        }
+    if decision.is_some_and(|value| !matches!(value, "allow" | "deny")) {
+        return Err(invalid("decision must be allow | deny"));
     }
     let run_id = p.get("run_id").and_then(Value::as_str);
     let limit = p
         .get("limit")
-        .map(|v| {
-            v.as_u64()
-                .ok_or_else(|| EventReadError::Invalid("invalid limit".into()))
-        })
+        .map(|v| v.as_u64().ok_or_else(|| invalid("invalid limit")))
         .transpose()?
         .unwrap_or(100)
         .min(256) as usize;
-    // 候选 run：指定 run 或全部在册 run（有权限事实的只占少数，逐 run 扫描
-    // 由 Permission 过滤器短路）。
-    let runs: Vec<String> = match run_id {
-        Some(run_id) => vec![run_id.to_owned()],
-        None => b.run_ids_view().await,
+    let cursor = p.get("cursor").filter(|value| !value.is_null());
+    let (lsn, event_index) = match cursor {
+        None => (1, 0),
+        Some(cursor) => {
+            // Older clients send numeric LSNs; v2 positions use decimal strings.
+            let lsn = match &cursor["lsn"] {
+                Value::String(value) => value
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|lsn| lsn.to_string() == *value),
+                value => value.as_u64(),
+            }
+            .ok_or_else(|| invalid("invalid audit cursor lsn"))?;
+            let event_index = cursor
+                .get("event_index")
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .and_then(|index| u32::try_from(index).ok())
+                        .ok_or_else(|| invalid("invalid audit cursor event_index"))
+                })
+                .transpose()?
+                .unwrap_or(0);
+            (lsn, event_index)
+        }
     };
-    let identity = b.journal.id().to_owned();
+    let cursor_run = cursor.and_then(|value| value.get("run_id"));
+    if let (Some(run), Some(cursor_run)) = (run_id, cursor_run.and_then(Value::as_str)) {
+        if run != cursor_run {
+            return Err(invalid("cursor binding/boundary mismatch"));
+        }
+    }
+    // Explicit null preserves the dataset-only continuation of the old cursor.
+    let dataset_only = run_id.is_none() && decision.is_none() && cursor_run == Some(&Value::Null);
     let root = b.journal.root().to_path_buf();
+    let identity = b.journal.id().to_owned();
     let decision = decision.map(str::to_owned);
-    // 数据集级权限事实（run 外）：游标 run_id 为 null 时只续读数据集段。
-    let dataset_only = p
-        .get("cursor")
-        .is_some_and(|c| !c.is_null() && c["run_id"].is_null());
-    if dataset_only && run_id.is_none() && decision.is_none() {
-        let from_lsn = p["cursor"]["lsn"].as_u64().unwrap_or(1);
-        let dataset = tokio::task::spawn_blocking({
-            let root = root.clone();
-            let identity = identity.clone();
-            move || {
-                flow_journal::page::dataset_permission_events(&root, &identity, from_lsn, limit + 1)
-            }
-        })
-        .await
-        .map_err(invalid)??;
-        let complete = dataset.len() <= limit;
-        let events: Vec<Value> = dataset
-            .into_iter()
-            .take(limit)
-            .map(|positioned| serde_json::to_value(&positioned).map_err(invalid))
-            .collect::<Result<_, _>>()?;
-        return Ok(json!({"events": events, "complete": complete}));
-    }
-    let mut events: Vec<Value> = Vec::new();
-    let mut exhausted = true;
-    for run_id in runs {
-        let Some((upper, summary)) = b.store.get_summary("run", &run_id).await.ok() else {
-            continue;
+    let run_id = run_id.map(str::to_owned);
+    tokio::task::spawn_blocking(move || {
+        let scope = match run_id.as_deref() {
+            Some(id) => page::PermissionScope::Run(id),
+            None if dataset_only => page::PermissionScope::Dataset,
+            None => page::PermissionScope::All,
         };
-        if summary.is_none() {
-            continue;
+        let (events, next) = page::permission_events(
+            &root,
+            &identity,
+            scope,
+            decision.as_deref(),
+            page::EventPosition { lsn, event_index },
+            limit,
+        )?;
+        let complete = next.is_none();
+        let mut next_cursor = serde_json::to_value(next).map_err(invalid)?;
+        if !complete && (dataset_only || run_id.is_some()) {
+            next_cursor["run_id"] = json!(run_id);
         }
-        let mut cursor = match p.get("cursor").filter(|v| !v.is_null()) {
-            // 游标只认 (run_id, lsn) 续读位置：跨 run 续读由 items 顺序保证。
-            Some(v) => {
-                let value = v.clone();
-                let wanted_run = value["run_id"].as_str().unwrap_or(&run_id).to_owned();
-                let from_lsn = value["lsn"].as_u64().unwrap_or(1);
-                Cursor::first(identity.clone(), wanted_run, Filter::Permission, upper)
-                    .with_next_lsn(from_lsn)
-            }
-            None => Cursor::first(identity.clone(), run_id.clone(), Filter::Permission, upper),
-        };
-        loop {
-            let page = tokio::task::spawn_blocking({
-                let root = root.clone();
-                let identity = identity.clone();
-                let run_id = run_id.clone();
-                let cursor = cursor.clone();
-                move || {
-                    flow_journal::page::page(
-                        &root,
-                        &identity,
-                        &run_id,
-                        Filter::Permission,
-                        cursor,
-                        upper,
-                        256,
-                    )
-                }
-            })
-            .await
-            .map_err(invalid)??;
-            for positioned in &page.events {
-                // decision 过滤只对裁决事件有意义：给出过滤时只返回匹配的
-                // permission_decided；未给过滤时返回全部权限事实。
-                let record = &positioned.event.payload["record"];
-                let matched = match &decision {
-                    Some(decision) => {
-                        matches!(positioned.event.kind, EventKind::PermissionDecided)
-                            && record["decision"].as_str() == Some(decision.as_str())
-                    }
-                    None => true,
-                };
-                if matched {
-                    events.push(serde_json::to_value(positioned).map_err(invalid)?);
-                }
-            }
-            if events.len() >= limit {
-                exhausted = false;
-                break;
-            }
-            match page.next_cursor {
-                Some(next) => cursor = next,
-                None => break,
-            }
-        }
-        if !exhausted {
-            break;
-        }
-    }
-    events.truncate(limit);
-    // 追加数据集级权限事实（无 run 范围、无 decision 过滤时）：审批审计之外
-    // 的「谁改了权限 / 谁授予了插件」同属权限审计面（09 §10.3）。
-    if run_id.is_none() && decision.is_none() && events.len() < limit {
-        let remaining = limit - events.len();
-        let dataset = tokio::task::spawn_blocking({
-            let root = root.clone();
-            let identity = identity.clone();
-            move || {
-                flow_journal::page::dataset_permission_events(&root, &identity, 1, remaining + 1)
-            }
-        })
-        .await
-        .map_err(invalid)??;
-        // 数据集段截断时整页不算读完（续读游标由 CLI 从末条 run_id=null 事件推导）。
-        exhausted &= dataset.len() <= remaining;
-        for positioned in dataset.into_iter().take(remaining) {
-            events.push(serde_json::to_value(&positioned).map_err(invalid)?);
-        }
-    }
-    Ok(json!({
-        "events": events,
-        "complete": exhausted,
-        // 导出提示：JSONL = 逐行 serde_json::to_string(events[i])（CLI 同款）。
-    }))
+        Ok(json!({"events": events, "complete": complete, "next_cursor": next_cursor}))
+    })
+    .await?
 }
 
 /// Business callers only see the public progress stream and a reduced payload.

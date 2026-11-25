@@ -982,7 +982,7 @@ dependencies = [
  "chrono",
  "clap",
  "flow-config",
- "flow-engine",
+ "flow-dispatcher",
  "futures",
  "libc",
  "parking_lot 0.12.5",
@@ -1006,7 +1006,6 @@ version = "0.1.0"
 dependencies = [
  "flow-domain",
  "flow-facts",
- "futures",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",

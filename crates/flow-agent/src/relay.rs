@@ -6,8 +6,8 @@
 
 use std::collections::BTreeMap;
 
-use flow_engine::execution_protocol::message::Message;
-use flow_engine::execution_protocol::remote::{routable, RouteEnvelope};
+use flow_dispatcher::execution_protocol::message::Message;
+use flow_dispatcher::execution_protocol::remote::{routable, RouteEnvelope};
 
 /// 单个执行器转发队列的帧数上界（满了→停止读该执行器→其持久窗口自然
 /// 背压生产，二期 §3.5；agent 不提前 ACK）。
@@ -203,7 +203,7 @@ pub fn estimate_weight(message: &Message) -> u64 {
         Message::Result { .. } => 1024,
         _ => 1024,
     };
-    raw.min(flow_engine::execution_protocol::DATA_MAX_FRAME as u64)
+    raw.min(flow_dispatcher::execution_protocol::DATA_MAX_FRAME as u64)
 }
 
 /// 估算一个 JSON 值的编码字节数（同样零分配遍历）。

@@ -40,12 +40,32 @@ async fn approve_only_key_cannot_write_workflows_but_can_approve() {
     // 明文 key 只在测试里可见；配置存 sha256。
     let approve_key_plain = "approve-only-key-0123456789abcdef";
     let approve_key_hash = sha256_hex(approve_key_plain.as_bytes());
+    let write_key = "write-only-key-0123456789abcdef";
+    let write_hash = sha256_hex(write_key.as_bytes());
+    let expired_key = "expired-read-key-0123456789abcdef";
+    let expired_hash = sha256_hex(expired_key.as_bytes());
     let config_dir = tempfile::tempdir().unwrap();
     let config_path = config_dir.path().join("flow.config.toml");
     std::fs::write(
         &config_path,
         format!(
-            "[[api_keys]]\nid = \"approver\"\ntoken_hash = \"{approve_key_hash}\"\nscopes = [\"read\", \"approve\"]\n"
+            r#"
+[[api_keys]]
+id = "approver"
+token_hash = "{approve_key_hash}"
+scopes = ["read", "approve"]
+
+[[api_keys]]
+id = "writer"
+token_hash = "{write_hash}"
+scopes = ["write"]
+
+[[api_keys]]
+id = "expired"
+token_hash = "{expired_hash}"
+scopes = ["read"]
+expires_at = "2000-01-01T00:00:00Z"
+"#
         ),
     )
     .unwrap();
@@ -69,6 +89,24 @@ async fn approve_only_key_cannot_write_workflows_but_can_approve() {
                 let inbox: Value =
                     call_json(&approver, "approvals.list", json!({"run_id": run_id})).await;
                 assert_eq!(inbox["items"].as_array().map(Vec::len), Some(1), "{inbox}");
+                let mut subscription = flow_test_support::subscribe(&approver, &run_id).await;
+                let event = tokio::time::timeout(TIMEOUT, subscription.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(event["event"]["run_id"], run_id);
+                for key in [write_key, expired_key] {
+                    let client = flow_test_support::connect(ctx.addr(), key).await;
+                    let error = call_err(
+                        &client,
+                        "run.subscribe",
+                        json!({"run_id": run_id, "event_format": "v2"}),
+                    )
+                    .await;
+                    assert_eq!(error.code(), -32020, "{error}");
+                    assert!(error.message().contains("'read' scope"), "{error}");
+                }
                 // 写 workflow：拒绝（缺 write scope）。
                 let error = call_err(
                     &approver,
@@ -257,6 +295,76 @@ async fn hash_chain_detects_consistent_mid_history_tampering() {
     assert!(message.contains("chain broken"), "{message}");
 }
 
+#[tokio::test]
+async fn updating_approval_ttl_only_affects_new_approvals() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let config_path = config_dir.path().join("flow.toml");
+    std::fs::write(&config_path, "[permissions]\napproval_ttl_ms = 60000\n").unwrap();
+    flow_test_support::run_case_with_env(
+        env!("CARGO_BIN_EXE_flow-journal-server-e2e"),
+        &[
+            ("FLOW_CONFIG", config_path.to_str().unwrap()),
+            ("FLOW_APPROVAL_TTL_MS", ""),
+            ("FLOW_TEST_AUTO_GOVERN", "0"),
+        ],
+        |ctx| {
+            Box::pin(async move {
+                let client = ctx.client().await;
+                let stub = StubHttp::fixed(200, json!({})).await;
+                let (workflow_id, _) = publish_legacy_workflow(
+                    &client,
+                    "approval TTL",
+                    governed_ask(&stub.url("/approval")),
+                )
+                .await;
+
+                let mut approvals: Vec<(String, Value)> = Vec::new();
+                for (patch, ttl) in [
+                    (None, 60_000),
+                    (Some(json!(180_000)), 180_000),
+                    (
+                        Some(Value::Null),
+                        flow_backend::journal::APPROVAL_TTL_DEFAULT_MS as i64,
+                    ),
+                ] {
+                    if let Some(value) = patch {
+                        let config = flow_test_support::client::try_call_json(
+                            &client,
+                            "config.update",
+                            json!({"patch":{"permissions":{"approval_ttl_ms":value}}}),
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(config["config"]["permissions"]["approval_ttl_ms"], value);
+                        let (initial_run, initial_approval) = &approvals[0];
+                        let existing =
+                            wait_pending_approval(&client, initial_run, "call", TIMEOUT).await;
+                        assert_eq!(existing["deadline"], initial_approval["deadline"]);
+                    }
+                    let run_id = start_run(&client, &workflow_id, json!({})).await;
+                    let approval = wait_pending_approval(&client, &run_id, "call", TIMEOUT).await;
+                    let deadline = approval["deadline"].as_i64().unwrap();
+                    let asked_at = approval["asked_at"].as_i64().unwrap();
+                    assert_eq!(deadline - asked_at, ttl);
+                    approvals.push((run_id, approval));
+                }
+                for (run_id, approval) in approvals {
+                    flow_test_support::deny(
+                        &client,
+                        &run_id,
+                        "call",
+                        approval["operation_id"].as_str().unwrap(),
+                        approval["request_hash"].as_str().unwrap(),
+                        "TTL fixture complete",
+                    )
+                    .await;
+                }
+            })
+        },
+    )
+    .await;
+}
+
 /// permissions.audit.page（09 §10.3）：能回答「谁批了什么」——批准事件的
 /// record.by / matched_capabilities 可查，decision 过滤生效。
 #[tokio::test]
@@ -272,18 +380,65 @@ async fn permissions_audit_page_answers_who_approved_what() {
                 let definition = governed_ask(&url);
                 let (workflow_id, _) =
                     publish_legacy_workflow(&client, "P2 审计", definition).await;
-                let run_id = start_run(&client, &workflow_id, json!({})).await;
-                let pending = wait_pending_approval(&client, &run_id, "call", TIMEOUT).await;
-                approve(
+                let mut finished_runs = Vec::new();
+                for scope in ["run", "once"] {
+                    let run_id = start_run(&client, &workflow_id, json!({})).await;
+                    let pending = wait_pending_approval(&client, &run_id, "call", TIMEOUT).await;
+                    approve(
+                        &client,
+                        &run_id,
+                        "call",
+                        pending["operation_id"].as_str().unwrap(),
+                        pending["request_hash"].as_str().unwrap(),
+                        scope,
+                    )
+                    .await;
+                    let _ = flow_test_support::wait_run_terminal(&client, &run_id, TIMEOUT).await;
+                    finished_runs.push(run_id);
+                }
+                let run_id = &finished_runs[0];
+                let all: Value = call_json(&client, "permissions.audit.page", json!({})).await;
+                let events = all["events"].as_array().unwrap();
+                assert_eq!(all["complete"], true);
+                for run_id in &finished_runs {
+                    assert!(events.iter().any(|entry| {
+                        entry["event"]["run_id"] == *run_id
+                            && entry["event"]["kind"] == "policy_frozen"
+                    }));
+                }
+                assert!(events
+                    .iter()
+                    .any(|entry| { entry["event"]["kind"] == "workflow_permissions_changed" }));
+                assert!(events.windows(2).any(|items| {
+                    items[0]["lsn"] == items[1]["lsn"]
+                        && items[1]["event"]["kind"] == "run_approval_upserted"
+                }));
+
+                let mut cursor = Value::Null;
+                for (index, event) in events.iter().enumerate() {
+                    let page: Value = call_json(
+                        &client,
+                        "permissions.audit.page",
+                        json!({"limit": 1, "cursor": cursor}),
+                    )
+                    .await;
+                    assert_eq!(page["events"], json!([event]));
+                    assert_eq!(page["complete"], index + 1 == events.len());
+                    cursor = page["next_cursor"].clone();
+                }
+                assert!(cursor.is_null());
+                // Even a one-event page starting at the first transaction sees dataset facts.
+                let dataset: Value = call_json(
                     &client,
-                    &run_id,
-                    "call",
-                    pending["operation_id"].as_str().unwrap(),
-                    pending["request_hash"].as_str().unwrap(),
-                    "once",
+                    "permissions.audit.page",
+                    json!({"limit": 1, "cursor": {"run_id": null, "lsn": 1}}),
                 )
                 .await;
-                let _ = flow_test_support::wait_run_terminal(&client, &run_id, TIMEOUT).await;
+                let first_dataset_fact = events
+                    .iter()
+                    .find(|entry| entry["event"]["run_id"].is_null())
+                    .unwrap();
+                assert_eq!(dataset["events"], json!([first_dataset_fact]));
 
                 let page: Value = flow_test_support::call_json(
                     &client,

@@ -227,6 +227,59 @@ async fn plugin_declared_node_type_end_to_end() {
             let recheck = call_json(&client, "plugins.recheck", json!({})).await;
             assert_eq!(recheck["violations"].as_array().map(Vec::len), Some(0), "{recheck}");
 
+            // Invocation authorization applies to the signal target, even if a different
+            // branch or later node in the frozen workflow is a dynamic plugin.
+            const BUSINESS_KEY: &str = "dynamic-node-invocation-fixture-key";
+            let _: Value = call_json(&client, "permissions.grant", json!({
+                "plugin_id": "echo-plugin", "legacy_confirm": true,
+            })).await;
+            let signal_workflow = call_json(&client, "workflow.create", json!({
+                "name": "dynamic with signal",
+            })).await;
+            let signal_id = signal_workflow["workflow_id"].as_str().unwrap();
+            let _: Value = call_json(&client, "workflow.update", json!({
+                "workflow_id": signal_id,
+                "definition": {
+                    "semantics": 2,
+                    "permissions": {"version": 1, "mode": "execute", "allow": []},
+                    "nodes": [
+                        {"id": "s", "type": "start"},
+                        {"id": "h", "type": "human_task", "params": {"prompt": "Continue"}},
+                        {"id": "p", "type": "echo", "params": {"text": "fixture"}},
+                        {"id": "e", "type": "end"}
+                    ],
+                    "edges": [{"from":"s","to":"h"}, {"from":"h","to":"p"}, {"from":"p","to":"e"}]
+                }
+            })).await;
+            let _: Value = call_json(&client, "workflow.publish", json!({
+                "workflow_id": signal_id, "version": 1,
+            })).await;
+            let _: Value = call_json(&client, "webhook.change", json!({
+                "key": "dynamic-signal",
+                "patch": {
+                    "workflow_id": signal_id, "enabled": true, "invoke_version": 1,
+                    "invoke_key_hash": flow_journal::codec::digest(BUSINESS_KEY.as_bytes()),
+                }
+            })).await;
+            let http = reqwest::Client::new();
+            let origin = format!("http://{}", ctx.http_addr());
+            let invoked = http.post(format!("{origin}/invoke/dynamic-signal"))
+                .bearer_auth(BUSINESS_KEY).header("Idempotency-Key", "invoke")
+                .json(&json!({})).send().await.unwrap();
+            assert_eq!(invoked.status(), 202);
+            let invoked: Value = invoked.json().await.unwrap();
+            let run_id = invoked["run_id"].as_str().unwrap();
+            let token = invoked["run_token"].as_str().unwrap();
+            let signal = |node: &str| http.post(format!("{origin}/invocations/{run_id}/signals/{node}"))
+                .bearer_auth(token).header("Idempotency-Key", "signal").json(&json!({}));
+            assert_eq!(signal("p").send().await.unwrap().status(), 403);
+            let delivered = signal("h").send().await.unwrap();
+            assert_eq!(delivered.status(), 200);
+            let receipt: Value = delivered.json().await.unwrap();
+            let retried: Value = signal("h").send().await.unwrap()
+                .error_for_status().unwrap().json().await.unwrap();
+            assert_eq!(retried, receipt);
+
             // Remove both manifests so no installed plugin owns echo.
             std::fs::remove_dir_all(plugins.join("zz-shadow")).unwrap();
             std::fs::remove_dir_all(plugins.join("echo-plugin")).unwrap();

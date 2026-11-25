@@ -39,17 +39,17 @@ pub enum CommitError {
 }
 
 /// The in-memory mirror of the durable state. The coordinator consumes dirty runs.
-pub struct CommittedState {
-    pub state: State,
-    pub pending: bool,
-    pub failure: Option<String>,
-    pub dirty_runs: BTreeSet<String>,
+struct CommittedState {
+    state: State,
+    pending: bool,
+    failure: Option<String>,
+    dirty_runs: BTreeSet<String>,
 }
 
 pub struct CommitRuntime {
-    pub state: Arc<Mutex<CommittedState>>,
-    pub shutdown: CancellationToken,
-    pub execution_changed: Arc<Notify>,
+    state: Arc<Mutex<CommittedState>>,
+    shutdown: CancellationToken,
+    execution_changed: Arc<Notify>,
     decision: Arc<Mutex<()>>,
     commits: watch::Sender<()>,
 }
@@ -67,6 +67,55 @@ impl CommitRuntime {
             execution_changed: Arc::new(Notify::new()),
             decision: Arc::new(Mutex::new(())),
             commits: watch::channel(()).0,
+        }
+    }
+
+    pub fn cancellation(&self) -> CancellationToken {
+        self.shutdown.clone()
+    }
+
+    pub fn notify_execution(&self) -> Arc<Notify> {
+        self.execution_changed.clone()
+    }
+
+    pub async fn inspect<T>(&self, read: impl FnOnce(&State) -> T) -> T {
+        read(&self.state.lock().await.state)
+    }
+
+    /// Hydrate or evict cached facts while the caller holds the decision lock.
+    pub async fn update_cache<T>(&self, update: impl FnOnce(&mut State) -> T) -> T {
+        update(&mut self.state.lock().await.state)
+    }
+
+    pub async fn failure(&self) -> Option<String> {
+        self.state.lock().await.failure.clone()
+    }
+
+    pub async fn diagnostics<T>(
+        &self,
+        read: impl FnOnce(&State, bool, &BTreeSet<String>) -> T,
+    ) -> T {
+        let committed = self.state.lock().await;
+        read(&committed.state, committed.pending, &committed.dirty_runs)
+    }
+
+    pub async fn take_dirty_runs(&self) -> Vec<String> {
+        std::mem::take(&mut self.state.lock().await.dirty_runs)
+            .into_iter()
+            .collect()
+    }
+
+    pub async fn defer_runs(&self, ids: impl IntoIterator<Item = String>) {
+        let mut committed = self.state.lock().await;
+        for id in ids {
+            if committed
+                .state
+                .runs
+                .get(&id)
+                .is_some_and(|run| !run.terminal())
+            {
+                committed.dirty_runs.insert(id);
+            }
         }
     }
 

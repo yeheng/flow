@@ -116,7 +116,7 @@ fn validate_command_identity(scope: &str, request_id: Option<&str>) -> flow_jour
 pub struct JournalBackend {
     pub journal: Journal,
     pub service_ui: tokio::sync::Mutex<std::collections::BTreeMap<String, (String, String)>>,
-    pub services: tokio::sync::Mutex<
+    pub(crate) services: tokio::sync::Mutex<
         std::collections::BTreeMap<String, Arc<crate::resident_service::ResidentService>>,
     >,
     /// Plugin ids whose start is past the admission check and not yet installed.
@@ -254,7 +254,7 @@ impl JournalBackend {
             .map_err(|e| flow_journal::Error::Invalid(e).into())
     }
 
-    /// 设置审批 TTL（启动时由 `[permissions] approval_ttl_ms` 注入；夹紧到
+    /// 设置新审批的 TTL（来自 `[permissions] approval_ttl_ms`；夹紧到
     /// 60s..=7d）。`FLOW_APPROVAL_TTL_MS` 环境变量仅供测试缩短等待（夹紧
     /// 下限 1s），不进配置文件契约。
     pub fn set_approval_ttl_ms(&self, ttl_ms: u64) {
@@ -573,7 +573,7 @@ impl JournalBackend {
     /// 提交路径负责——内存先行、落盘随后是崩溃语义的关键（未提交的状态
     /// 在重启后自然消失）。
     pub(crate) async fn update_state<T>(&self, update: impl FnOnce(&mut State) -> T) -> T {
-        update(&mut self.commits.state.lock().await.state)
+        self.commits.update_cache(update).await
     }
 
     /// 取得决策锁，并在权威库已不可信时 fail closed。
@@ -590,15 +590,9 @@ impl JournalBackend {
         self.execution_peak.load(Ordering::Relaxed)
     }
 
-    /// 在册 run id 清单（权限审计分页用；只读投影）。
-    pub async fn run_ids_view(&self) -> Vec<String> {
-        self.inspect(|state| state.runs.keys().cloned().collect())
-            .await
-    }
-
     /// 只读地观察当前已提交状态。
     pub(crate) async fn inspect<T>(&self, read: impl FnOnce(&State) -> T) -> T {
-        read(&self.commits.state.lock().await.state)
+        self.commits.inspect(read).await
     }
 
     /// Finish any commit whose caller was cancelled before its receipt arrived.
@@ -672,14 +666,30 @@ impl JournalBackend {
         Ok(workflow.versions.into_values().rev().collect())
     }
 
-    /// 取（或首次物化并缓存）某 run 的已校验 definition。definition 随
-    /// run 钉死版本、创建后不可变——每个 run 只物化一次；终态由调度循环
-    /// 调 [`Self::evict_definition`] 逐出。物化/校验失败不缓存，瞬时故障
-    /// （如值目录暂不可读）的重试路径照常工作。
+    /// Load a definition for design-time checks or admission of a new run.
     pub(crate) async fn cached_definition(
         &self,
         run_id: &str,
         definition: &flow_journal::StoredValue,
+    ) -> Result<Arc<flow_engine::Definition>> {
+        self.load_cached_definition(run_id, definition, true).await
+    }
+
+    /// Load the accepted graph for an existing run. Worker admission checks
+    /// whether a compatible implementation of a dynamic type is available.
+    pub(crate) async fn cached_frozen_definition(
+        &self,
+        key: &str,
+        definition: &flow_journal::StoredValue,
+    ) -> Result<Arc<flow_engine::Definition>> {
+        self.load_cached_definition(key, definition, false).await
+    }
+
+    async fn load_cached_definition(
+        &self,
+        run_id: &str,
+        definition: &flow_journal::StoredValue,
+        check_installed_types: bool,
     ) -> Result<Arc<flow_engine::Definition>> {
         if let Some(hit) = self.definitions.lock().await.get(run_id) {
             return Ok(hit.clone());
@@ -687,12 +697,39 @@ impl JournalBackend {
         let root = self.journal.root().to_path_buf();
         let upper = self.journal.durable_lsn();
         let stored = definition.clone();
-        let defaults = self.plugin_defaults();
+        let defaults = check_installed_types.then(|| self.plugin_defaults());
         let parsed = tokio::task::spawn_blocking(move || {
-            let materialized = flow_journal::value::materialize(&root, upper, &stored, flow_journal::MAX_LINE_BYTES)?;
-            let snapshot = crate::plugin_registry::installed_snapshot_with_defaults(&defaults);
-            flow_engine::journal_state::validate_definition_with_dynamic(&materialized, &snapshot.dynamic_types())
-        }).await.map_err(|e| flow_journal::Error::Unavailable(e.to_string()))??;
+            let value = flow_journal::value::materialize(
+                &root,
+                upper,
+                &stored,
+                flow_journal::MAX_LINE_BYTES,
+            )?;
+            let definition: flow_engine::Definition =
+                serde_json::from_value(value).map_err(|error| {
+                    flow_journal::Error::Invalid(format!("definition 结构不符：{error}"))
+                })?;
+            let dynamic = match defaults {
+                Some(defaults) => {
+                    crate::plugin_registry::installed_snapshot_with_defaults(&defaults)
+                        .dynamic_types()
+                }
+                // Previously accepted types are part of the frozen graph, independently
+                // of whether a compatible worker is available for the next dispatch.
+                None => definition
+                    .nodes
+                    .iter()
+                    .filter(|node| node.kind().is_none())
+                    .map(|node| node.node_type.clone())
+                    .collect(),
+            };
+            definition
+                .validate_with_dynamic(&dynamic)
+                .map_err(flow_journal::Error::Invalid)?;
+            Ok::<_, flow_journal::Error>(definition)
+        })
+        .await
+        .map_err(|error| flow_journal::Error::Unavailable(error.to_string()))??;
         let parsed = Arc::new(parsed);
         let mut cache = self.definitions.lock().await;
         cache.insert(run_id.to_owned(), parsed.clone());
@@ -1104,7 +1141,7 @@ impl JournalBackend {
         Ok(None)
     }
     pub fn accepts_services(&self) -> bool {
-        !self.commits.shutdown.is_cancelled()
+        !self.cancellation().is_cancelled()
     }
 
     /// Reserve one in-flight start for `id`. The reservation clears when the guard drops.
@@ -1157,7 +1194,7 @@ impl JournalBackend {
     /// 顺序不可颠倒：必须先让执行端口停下并回收子进程，再关写者——
     /// 反过来会让执行器在权威库关闭后仍尝试写入。
     pub async fn close(&self) -> Result<()> {
-        self.commits.shutdown.cancel();
+        self.cancellation().cancel();
         self.drain_plugin_operations().await;
         let services = std::mem::take(&mut *self.services.lock().await);
         for (_, service) in services {
@@ -1169,7 +1206,7 @@ impl JournalBackend {
         }
         // 取决策锁确保没有提交在途，然后读出永久失败原因（如有）。
         let _decision = self.commits.quiesce().await;
-        let failure = self.commits.state.lock().await.failure.clone();
+        let failure = self.commits.failure().await;
         let closed = self.journal.close().await;
         self.store.close().await;
         if let Some(error) = failure {
@@ -1190,12 +1227,12 @@ impl JournalBackend {
 
     /// 停机信号：权威库不可信时会被取消，协调循环随即退出。
     pub(crate) fn cancellation(&self) -> CancellationToken {
-        self.commits.shutdown.clone()
+        self.commits.cancellation()
     }
 
     /// 状态变更通知（提交完成或协调器需要重新调度时唤醒）。
     pub(crate) fn execution_notification(&self) -> Arc<Notify> {
-        self.commits.execution_changed.clone()
+        self.commits.notify_execution()
     }
 
     /// 订阅提交完成事件（每次成功提交后发一次）。
@@ -1205,30 +1242,17 @@ impl JournalBackend {
 
     /// 取走需要重新调度的 run 集合（协调循环每轮取一次）。
     pub(crate) async fn take_dirty_runs(&self) -> Vec<String> {
-        let mut committed = self.commits.state.lock().await;
-
-        std::mem::take(&mut committed.dirty_runs)
-            .into_iter()
-            .collect()
+        self.commits.take_dirty_runs().await
     }
 
     /// 把一个非终态 run 标记为待重新调度。
     pub(crate) async fn defer_run(&self, id: String) {
-        let mut state = self.commits.state.lock().await;
-        // 终态 run 不再需要调度，标记它只会浪费协调循环的一轮。
-        if state.state.runs.get(&id).is_some_and(|r| !r.terminal()) {
-            state.dirty_runs.insert(id);
-        }
+        self.commits.defer_runs(std::iter::once(id)).await;
     }
 
     /// 批量把非终态 run 标记为待重新调度。
     pub(crate) async fn defer_runs(&self, ids: Vec<String>) {
-        let mut state = self.commits.state.lock().await;
-        for id in ids {
-            if state.state.runs.get(&id).is_some_and(|r| !r.terminal()) {
-                state.dirty_runs.insert(id);
-            }
-        }
+        self.commits.defer_runs(ids).await;
     }
 
     /// 诊断快照：挂死排查用（零日志冻结时看内部游标、队列与等待者）。
@@ -1236,34 +1260,49 @@ impl JournalBackend {
     /// 字段刻意保持诊断语义而非业务语义：`applied_lsn` 与 `durable_lsn`
     /// 的差距直接指向「已提交但未应用」的裂缝。
     pub async fn diagnostics(&self) -> serde_json::Value {
-        let committed = self.commits.state.lock().await;
-        let applied_lsn = committed.state.applied_lsn;
-        let resident_runs = committed.state.runs.len();
-        let resident_waiting_nodes = committed
-            .state
-            .runs
-            .values()
-            .flat_map(|r| r.nodes.values())
-            .filter(|n| n.status == flow_engine::journal_state::NodeStatus::Waiting)
-            .count();
-        let resident_definition_versions: usize = committed
-            .state
-            .workflows
-            .values()
-            .map(|w| w.versions.len())
-            .sum();
-        let resident_attempts: usize = committed
-            .state
-            .runs
-            .values()
-            .flat_map(|r| r.nodes.values())
-            .map(|n| n.attempts.len())
-            .sum();
-        let cached_publications = committed.state.values.cached_publications();
-        let pending = committed.pending;
-        let dirty_count = committed.dirty_runs.len();
-        let dirty: Vec<String> = committed.dirty_runs.iter().take(256).cloned().collect();
-        drop(committed);
+        let (
+            applied_lsn,
+            resident_runs,
+            resident_waiting_nodes,
+            resident_definition_versions,
+            resident_attempts,
+            cached_publications,
+            pending,
+            dirty_count,
+            dirty,
+        ) = self
+            .commits
+            .diagnostics(|state, pending, dirty_runs| {
+                let resident_waiting_nodes = state
+                    .runs
+                    .values()
+                    .flat_map(|run| run.nodes.values())
+                    .filter(|node| node.status == flow_engine::journal_state::NodeStatus::Waiting)
+                    .count();
+                let resident_definition_versions: usize = state
+                    .workflows
+                    .values()
+                    .map(|workflow| workflow.versions.len())
+                    .sum();
+                let resident_attempts: usize = state
+                    .runs
+                    .values()
+                    .flat_map(|run| run.nodes.values())
+                    .map(|node| node.attempts.len())
+                    .sum();
+                (
+                    state.applied_lsn,
+                    state.runs.len(),
+                    resident_waiting_nodes,
+                    resident_definition_versions,
+                    resident_attempts,
+                    state.values.cached_publications(),
+                    pending,
+                    dirty_runs.len(),
+                    dirty_runs.iter().take(256).cloned().collect::<Vec<_>>(),
+                )
+            })
+            .await;
         let stats = self.journal.stats();
         serde_json::json!({
             "applied_lsn": applied_lsn,

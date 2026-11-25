@@ -64,6 +64,7 @@ fn resolve_caller(ctx: &Context, method: &str, supplied: &str) -> Result<Caller,
         let required: &'static str = match method {
             "run.approve" | "run.deny" => "approve",
             "permissions.grant" | "plugins.install" | "plugins.uninstall" | "plugins.deployment" => "admin",
+            "run.subscribe" => "read",
             m if flow_dto::rpc::is_read_method(m) => "read",
             _ => "write",
         };
@@ -885,221 +886,73 @@ async fn dispatch_admitted(
             }).await.map_err(invalid)?;
             return Ok(json!({"node_types": types}));
         }
-        Method::ServicesList => {
-            let admin = caller.permission_admin;
-            let services = b.services.lock().await;
-            let ui = if admin {
-                Some(b.service_ui.lock().await)
-            } else {
-                None
-            };
-            return Ok(json!({"services": services.iter().map(|(id, s)| {
-                let handle = ui.as_ref().and_then(|ui| {
-                    ui.iter()
-                        .find(|(_, (instance, _))| instance == &s.instance)
-                        .map(|(key, _)| key.clone())
-                });
-                json!({
-                    "plugin_id": id,
-                    "instance": s.instance,
-                    "alive": s.alive(),
-                    "binding": s.binding.get().map(|(run_id, node_id, _)| json!({"run_id": run_id, "node_id": node_id})),
-                    "ui": handle,
-                })
-            }).collect::<Vec<_>>()}));
-        }
+        Method::ServicesList => return Ok(b.list_services(caller.permission_admin).await),
         Method::ServicesEvents => {
-            if !caller.permission_admin {return Err(invalid("service events require admin"));}
-            let services = b.services.lock().await;
-            let service = services.get(text(&p,"plugin_id")?).ok_or_else(||invalid("service unavailable"))?.clone();
-            drop(services);
-            return service.events_since(text(&p,"instance")?, text(&p,"after")?.parse().map_err(invalid)?).map_err(invalid);
+            if !caller.permission_admin {
+                return Err(invalid("service events require admin"));
+            }
+            let service = b
+                .resident_service(text(&p, "plugin_id")?)
+                .await
+                .ok_or_else(|| invalid("service unavailable"))?;
+            return service
+                .events_since(
+                    text(&p, "instance")?,
+                    text(&p, "after")?.parse().map_err(invalid)?,
+                )
+                .map_err(invalid);
         }
         Method::ServicesStart => {
             if !caller.permission_admin {
                 return Err(invalid("service start requires admin"));
             }
-            let b=Arc::clone(b);let p=p.clone();
-            let worker=tokio::spawn(async move {
-            let id = text(&p, "plugin_id")?;
-            {
-                let services = b.services.lock().await;
-                if !b.accepts_services() {
-                    return Err(invalid("host is shutting down"));
-                }
-                if let Some(service) = services.get(id).filter(|service| service.alive()) {
-                    if p.get("binding").is_some() {
-                        return Err(invalid("service already running; stop before rebinding"));
-                    }
-                    return Ok(json!({"instance": service.instance}));
-                }
-                if services.len() >= 32 && !services.contains_key(id) {
-                    return Err(invalid("service limit reached"));
-                }
+            let id = text(&p, "plugin_id")?.to_owned();
+            let binding = p
+                .get("binding")
+                .map(|value| {
+                    Ok::<_, ErrorObjectOwned>((
+                        text(value, "run_id")?.to_owned(),
+                        text(value, "node_id")?.to_owned(),
+                    ))
+                })
+                .transpose()?;
+            let instance = b
+                .start_resident_service(id, binding)
+                .await
+                .map_err(failure)?;
+            return Ok(json!({"instance": instance}));
+        }
+        Method::ServicesStop => {
+            if !caller.permission_admin {
+                return Err(invalid("service stop requires admin"));
             }
-            // Discovery, the process, and the handshake stay outside `services`.
-            // Stop and call of every other service must not wait on this spawn.
-            let _starting = b.reserve_service_start(id).map_err(invalid)?;
-            let defaults = b.plugin_defaults();
-            let selected_id=id.to_owned();
-            let (lease,source,entry_path,declaration,html)=tokio::task::spawn_blocking(move||{
-                let root=flow_config::plugin_fs::plugins_root().ok_or_else(||invalid("plugin root unavailable"))?;
-                let lease=flow_config::plugin_fs::RootLease::shared(&root).map_err(invalid)?;
-                if flow_backend::plugin_operation::Operation::has_unfinished(&root, &selected_id).map_err(invalid)? {
-                    return Err(invalid("plugin operation requires recovery"));
-                }
-            let plugin = flow_backend::plugin_scan::scan_unlocked(&root, &defaults)
-                .map_err(invalid)?.rows.into_iter().filter_map(|row| row.plugin)
-                .find(|plugin| plugin.manifest.plugin.id == selected_id)
-                .ok_or_else(|| invalid("plugin not installed"))?;
-            let declaration = plugin
-                .manifest
-                .service
-                .ok_or_else(|| invalid("plugin has no service role"))?;
-            let html = if let Some(path) = &declaration.web_ui {
-                let root = plugin.source.canonicalize().map_err(invalid)?;
-                let path = root.join(path).canonicalize().map_err(invalid)?;
-                if !path.starts_with(&root) {
-                    return Err(invalid("web-ui path escapes plugin"));
-                }
-                let metadata = std::fs::metadata(&path).map_err(invalid)?;
-                if !metadata.is_file() || metadata.len() > 262144 {
-                    return Err(invalid("web-ui must be a single HTML file under 256 KiB"));
-                }
-                use std::io::Read;
-                let mut html = String::new();
-                std::fs::File::open(path)
-                    .map_err(invalid)?
-                    .take(262145)
-                    .read_to_string(&mut html)
-                    .map_err(invalid)?;
-                if html.len() > 262144 {
-                    return Err(invalid("web-ui exceeds 256 KiB"));
-                }
-                Some(html)
-            } else {
-                None
-            };
-                Ok::<_,ErrorObjectOwned>((lease,plugin.source,plugin.manifest.plugin.entry,declaration,html))
-            }).await.map_err(invalid)??;
-            let entry = std::path::PathBuf::from(entry_path);
-            let entry = if entry.is_absolute() {
-                entry
-            } else {
-                source.join(entry)
-            };
-            let binding = if let Some(value) = p.get("binding") {
-                let run_id = text(value, "run_id")?.to_owned();
-                let node_id = text(value, "node_id")?.to_owned();
-                let run = b
-                    .run_snapshot(&run_id)
-                    .await
-                    .map_err(failure)?
-                    .ok_or_else(|| invalid("binding run not found"))?;
-                if run.terminal() {
-                    return Err(invalid("binding run is terminal"));
-                }
-                let node = run
-                    .nodes
-                    .get(&node_id)
-                    .ok_or_else(|| invalid("binding node not active"))?;
-                Some((run_id, node_id, node.dispatch_id.clone()))
-            } else {
-                None
-            };
-            let public_binding = binding.clone();
-            let host =
-                flow_backend::service_host::handler(&b, id.to_owned(), declaration.peers, binding);
-            let service_slot = Arc::new(std::sync::OnceLock::new());
-            let host = flow_backend::service_host::with_subscriptions(host, service_slot.clone());
-            let service =
-                flow_backend::resident_service::ResidentService::start_installed_with_host_lease(
-                    entry,
-                    declaration.methods,
-                    host,
-                    lease,
+            b.stop_resident_service(
+                text(&p, "plugin_id")?.to_owned(),
+                text(&p, "instance")?.to_owned(),
+            )
+            .await
+            .map_err(failure)?;
+            return Ok(json!({"stopped": true}));
+        }
+        Method::ServicesCall => {
+            if !caller.permission_admin {
+                return Err(invalid(
+                    "service calls require admin until per-service grants are configured",
+                ));
+            }
+            let service = b
+                .resident_service(text(&p, "plugin_id")?)
+                .await
+                .ok_or_else(|| invalid("service unavailable"))?;
+            let value = service
+                .call(
+                    text(&p, "instance")?,
+                    text(&p, "method")?,
+                    p["params"].clone(),
                 )
                 .await
                 .map_err(invalid)?;
-            if let Some(binding) = public_binding {
-                let _ = service.binding.set(binding);
-            }
-            let _ = service_slot.set(Arc::downgrade(&service));
-            if let Err(error) = service.notify_ready() {
-                service.shutdown().await;
-                return Err(invalid(error));
-            }
-            let instance = service.instance.clone();
-            let installed = {
-                let mut services = b.services.lock().await;
-                if !b.accepts_services() {
-                    Err(invalid("host is shutting down"))
-                } else if let Some(existing) = services.get(id).filter(|service| service.alive()) {
-                    if p.get("binding").is_some() {
-                        Err(invalid("service already running; stop before rebinding"))
-                    } else {
-                        Ok(Err(existing.instance.clone()))
-                    }
-                } else if services.len() >= 32 && !services.contains_key(id) {
-                    Err(invalid("service limit reached"))
-                } else {
-                    Ok(Ok(services.insert(id.to_owned(), service.clone())))
-                }
-            };
-            let previous = match installed {
-                Ok(Ok(previous)) => previous,
-                Ok(Err(existing)) => {
-                    service.shutdown().await;
-                    return Ok(json!({"instance": existing}));
-                }
-                Err(error) => {
-                    service.shutdown().await;
-                    return Err(error);
-                }
-            };
-            {
-                let mut ui = b.service_ui.lock().await;
-                // Close clears this map after cancelling the host. A start that
-                // already passed the insert check must not publish a new handle.
-                if b.accepts_services() {
-                    if let Some(previous) = previous.as_ref() {
-                        ui.retain(|_, (installed, _)| installed != &previous.instance);
-                    }
-                    if let Some(html) = html {
-                        // An unguessable read-only resource handle, never an RPC credential.
-                        let key = format!("{}-{}", instance, service.resource_token());
-                        ui.insert(key, (instance.clone(), html));
-                    }
-                }
-            }
-            if let Some(previous) = previous {
-                previous.shutdown().await;
-            }
-            return Ok(json!({"instance": instance}));
-            });
-            return worker.await.map_err(invalid)?;
-        }
-        Method::ServicesStop => {
-            if !caller.permission_admin {return Err(invalid("service stop requires admin"));}
-            let b=Arc::clone(b);let p=p.clone();
-            let worker=tokio::spawn(async move {
-            let id=text(&p,"plugin_id")?;
-            let _operation=b.reserve_plugin_operation(id).map_err(|e|if e=="plugin operation in progress"{ErrorObjectOwned::owned(-32012,e,None::<()>)}else{invalid(e)})?;
-            let mut services=b.services.lock().await;
-            let service=services.get(id).ok_or_else(||invalid("service unavailable"))?;
-            if service.instance!=text(&p,"instance")? {return Err(invalid("stale service instance"));}
-            let service=services.remove(id).unwrap();drop(services);
-            b.service_ui.lock().await.retain(|_,(i,_)|i!=&service.instance);
-            service.shutdown().await;
-            return Ok(json!({"stopped":true}));
-            });
-            return worker.await.map_err(invalid)?;
-        }
-        Method::ServicesCall => {
-            if !caller.permission_admin {return Err(invalid("service calls require admin until per-service grants are configured"));}
-            let service=b.services.lock().await.get(text(&p,"plugin_id")?).ok_or_else(||invalid("service unavailable"))?.clone();
-            let value=service.call(text(&p,"instance")?,text(&p,"method")?,p["params"].clone()).await.map_err(invalid)?;
-            return Ok(json!({"value":value}));
+            return Ok(json!({"value": value}));
         }
         Method::PluginsInstall => {
             if !caller.permission_admin { return Err(invalid("plugin install requires admin")); }
@@ -1604,6 +1457,14 @@ async fn config_update(ctx: &Context, p: &Value) -> Result<Value, ErrorObjectOwn
     if first_write {
         *cs.path.write().unwrap_or_else(|p| p.into_inner()) = Some(write_path);
     }
+    if patch.get("permissions").is_some() {
+        ctx.backend.set_approval_ttl_ms(
+            merged
+                .permissions
+                .approval_ttl_ms
+                .unwrap_or(flow_backend::journal::APPROVAL_TTL_DEFAULT_MS),
+        );
+    }
     *current = merged;
     drop(current);
     Ok(crate::config_view(&product))
@@ -1679,22 +1540,13 @@ async fn subscribe_run_events(
     pending: jsonrpsee::server::PendingSubscriptionSink,
     ctx: &Context,
 ) {
-    let p: Value = match params.parse() {
-        Ok(p) => p,
-        Err(e) => {
-            pending.reject(e).await;
+    let (p, _, _) = match admit_call(ctx, "run.subscribe", params).await {
+        Ok(admitted) => admitted,
+        Err(error) => {
+            pending.reject(error).await;
             return;
         }
     };
-    // 订阅也要鉴权，且口径与普通方法一致：token 是唯一屏障，
-    // 「订阅入口不走 admit_call」不构成例外理由。
-    let supplied = p["_token"].as_str().unwrap_or("");
-    if !constant_time_eq(supplied, &ctx.token) {
-        pending
-            .reject(ErrorObjectOwned::owned(-32001, "unauthorized", None::<()>))
-            .await;
-        return;
-    }
     // event_format 必须恰好是 "v2"：只有一种事件格式，才能保证前端不会
     // 悄悄按旧格式解析。
     if p["event_format"] != "v2" {
@@ -1980,7 +1832,7 @@ async fn subscribe_service_events(
             return;
         }
     };
-    let Some(service) = ctx.backend.services.lock().await.get(&id).cloned() else {
+    let Some(service) = ctx.backend.resident_service(&id).await else {
         pending.reject(invalid("service unavailable")).await;
         return;
     };

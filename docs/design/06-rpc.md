@@ -151,3 +151,11 @@ body ≤ 8 MiB。
 | `permissions.grant` | 写 | 插件能力授予（admin；只写 journal 不回写 plugin.toml） |
 
 `run.audit.page` 新增 `filter:"permission"` 模式（权限事件闭集分页）。
+
+`permissions.audit.page` 按提交位置 `(lsn, event_index)` 读取已提交的权限事实。
+省略 `run_id` 时会读取各 run 的历史及数据集级事实。响应的 `complete` 为
+`false` 时，请原样传回 `next_cursor` 并沿用筛选参数。旧式数字 LSN 游标仍可读取。
+
+`run.subscribe` 与事件分页共用读权限准入。成功写入的
+`config.update` → `permissions.approval_ttl_ms` 立即用于新审批，清除该值时
+恢复 24 小时默认值。已登记审批的截止时间以持久化记录为准。
