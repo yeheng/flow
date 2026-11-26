@@ -1766,87 +1766,6 @@ pub(crate) async fn bind_product_server(
     Ok(server)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    /// 错误码必须由**类型**决定，而不是由文案决定。
-    ///
-    /// 这条规则一旦破例，客户端的按码分支会在某次措辞调整后静默失效。
-    #[test]
-    fn plugin_mutations_use_existing_error_codes_without_error_data() {
-        use flow_backend::{plugin_bundle::BundleError, plugin_operation::OperationError};
-        for (error, code) in [
-            (OperationError::Invalid("bad path".into()), -32602),
-            (
-                OperationError::Conflict("plugin operation superseded".into()),
-                -32012,
-            ),
-            (
-                OperationError::Bundle(BundleError::Limit("plugin limit reached".into())),
-                -32021,
-            ),
-            (
-                OperationError::Io(std::io::Error::other("rename failed")),
-                -32603,
-            ),
-        ] {
-            let mapped = super::plugin_failure(error);
-            assert_eq!(mapped.code(), code);
-            assert!(mapped.data().is_none());
-        }
-    }
-
-    #[test]
-    fn error_codes_follow_types_instead_of_message_text() {
-        assert_eq!(
-            failure(flow_facts::Error::NotFound("任意文案".into()).into()).code(),
-            -32011
-        );
-        assert_eq!(
-            failure(flow_facts::Error::Invalid("workflow not found".into()).into()).code(),
-            -32602
-        );
-        assert_eq!(
-            view_failure(flow_backend::ViewError::NotFound("new wording".into())).code(),
-            -32011
-        );
-        assert_eq!(
-            view_failure(flow_backend::ViewError::Limit("budget".into())).code(),
-            -32021
-        );
-    }
-
-    /// 存储层错误映射同样不依赖数据库文案。
-    #[test]
-    fn storage_limit_mapping_does_not_depend_on_database_messages() {
-        assert_eq!(
-            storage_failure(flow_backend::StorageError::ResponseTooLarge).code(),
-            -32021
-        );
-    }
-
-    /// 序号参数必须是规范的十进制字符串：数字形态、带符号、带前导零的写法
-    /// 一律拒绝，否则同一个序号会有多种表示，幂等与去重都会对不上。
-    #[test]
-    fn sequence_parameters_are_lossless_canonical_decimal_strings() {
-        assert_eq!(decimal_param(&json!({}), "from_lsn").unwrap(), 0);
-        assert_eq!(
-            decimal_param(&json!({"from_lsn":"18446744073709551615"}), "from_lsn").unwrap(),
-            u64::MAX
-        );
-        for value in [
-            json!(1),
-            json!(null),
-            json!("+1"),
-            json!("01"),
-            json!("-1"),
-            json!("18446744073709551616"),
-        ] {
-            assert!(decimal_param(&json!({"from_lsn":value}), "from_lsn").is_err());
-        }
-    }
-}
-
 async fn subscribe_service_events(
     params: jsonrpsee::types::Params<'_>,
     pending: jsonrpsee::PendingSubscriptionSink,
@@ -1948,6 +1867,87 @@ async fn subscribe_service_events(
         }
         if terminal {
             return;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// 错误码必须由**类型**决定，而不是由文案决定。
+    ///
+    /// 这条规则一旦破例，客户端的按码分支会在某次措辞调整后静默失效。
+    #[test]
+    fn plugin_mutations_use_existing_error_codes_without_error_data() {
+        use flow_backend::{plugin_bundle::BundleError, plugin_operation::OperationError};
+        for (error, code) in [
+            (OperationError::Invalid("bad path".into()), -32602),
+            (
+                OperationError::Conflict("plugin operation superseded".into()),
+                -32012,
+            ),
+            (
+                OperationError::Bundle(BundleError::Limit("plugin limit reached".into())),
+                -32021,
+            ),
+            (
+                OperationError::Io(std::io::Error::other("rename failed")),
+                -32603,
+            ),
+        ] {
+            let mapped = super::plugin_failure(error);
+            assert_eq!(mapped.code(), code);
+            assert!(mapped.data().is_none());
+        }
+    }
+
+    #[test]
+    fn error_codes_follow_types_instead_of_message_text() {
+        assert_eq!(
+            failure(flow_facts::Error::NotFound("任意文案".into()).into()).code(),
+            -32011
+        );
+        assert_eq!(
+            failure(flow_facts::Error::Invalid("workflow not found".into()).into()).code(),
+            -32602
+        );
+        assert_eq!(
+            view_failure(flow_backend::ViewError::NotFound("new wording".into())).code(),
+            -32011
+        );
+        assert_eq!(
+            view_failure(flow_backend::ViewError::Limit("budget".into())).code(),
+            -32021
+        );
+    }
+
+    /// 存储层错误映射同样不依赖数据库文案。
+    #[test]
+    fn storage_limit_mapping_does_not_depend_on_database_messages() {
+        assert_eq!(
+            storage_failure(flow_backend::StorageError::ResponseTooLarge).code(),
+            -32021
+        );
+    }
+
+    /// 序号参数必须是规范的十进制字符串：数字形态、带符号、带前导零的写法
+    /// 一律拒绝，否则同一个序号会有多种表示，幂等与去重都会对不上。
+    #[test]
+    fn sequence_parameters_are_lossless_canonical_decimal_strings() {
+        assert_eq!(decimal_param(&json!({}), "from_lsn").unwrap(), 0);
+        assert_eq!(
+            decimal_param(&json!({"from_lsn":"18446744073709551615"}), "from_lsn").unwrap(),
+            u64::MAX
+        );
+        for value in [
+            json!(1),
+            json!(null),
+            json!("+1"),
+            json!("01"),
+            json!("-1"),
+            json!("18446744073709551616"),
+        ] {
+            assert!(decimal_param(&json!({"from_lsn":value}), "from_lsn").is_err());
         }
     }
 }

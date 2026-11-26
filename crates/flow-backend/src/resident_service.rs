@@ -46,21 +46,35 @@ fn host_error(id: Id, message: &str) -> Message {
     })
 }
 
-/// Read and write the plugin stream until it closes, the stop token fires, or the
-/// outgoing channel closes. A limit or a bad notification stays inside this call.
-async fn serve<S>(
-    stream: S,
-    outgoing: mpsc::Receiver<Message>,
+/// Shared session state the serve loop needs. Grouped into one struct so the
+/// per-connection wiring stays readable at the call sites.
+struct SessionContext {
     host: Option<HostHandler>,
-    stop: CancellationToken,
     pending: Arc<Mutex<BTreeMap<String, Reply>>>,
     history: Arc<Mutex<(u64, std::collections::VecDeque<Value>)>>,
     events: broadcast::Sender<Value>,
     responses: mpsc::Sender<Message>,
     instance: String,
+}
+
+/// Read and write the plugin stream until it closes, the stop token fires, or the
+/// outgoing channel closes. A limit or a bad notification stays inside this call.
+async fn serve<S>(
+    stream: S,
+    outgoing: mpsc::Receiver<Message>,
+    stop: CancellationToken,
+    context: SessionContext,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let SessionContext {
+        host,
+        pending,
+        history,
+        events,
+        responses,
+        instance,
+    } = context;
     let (incoming, mut messages) = mpsc::channel(64);
     let dispatch = async {
         let mut tasks = tokio::task::JoinSet::<Message>::new();
@@ -280,13 +294,15 @@ impl ResidentService {
             serve(
                 session.channel_mut(),
                 outgoing,
-                host,
                 stop.clone(),
-                pending.clone(),
-                history,
-                events,
-                responses,
-                instance,
+                SessionContext {
+                    host,
+                    pending: pending.clone(),
+                    history,
+                    events,
+                    responses,
+                    instance,
+                },
             )
             .await;
             let _ = session.shutdown().await;
@@ -546,331 +562,6 @@ impl Drop for ResidentService {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use flow_plugin_sdk::protocol::envelope::{read_frame, write_frame};
-    use flow_plugin_sdk::{Frame, FrameKind};
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    fn fixture(events: u64, sender: mpsc::Sender<Message>) -> Arc<ResidentService> {
-        let (events_tx, _) = broadcast::channel(8);
-        let mut history = (0u64, std::collections::VecDeque::new());
-        for sequence in 1..=events {
-            history.0 = sequence;
-            history
-                .1
-                .push_back(json!({"sequence": sequence.to_string()}));
-            if history.1.len() > 128 {
-                history.1.pop_front();
-            }
-        }
-        Arc::new(ResidentService {
-            instance: "instance".into(),
-            binding: std::sync::OnceLock::new(),
-            methods: BTreeSet::new(),
-            sender,
-            pending: Arc::new(Mutex::new(BTreeMap::new())),
-            events: events_tx,
-            subscriptions: Mutex::new(BTreeMap::new()),
-            history: Arc::new(Mutex::new(history)),
-            stop: CancellationToken::new(),
-            task: tokio::sync::Mutex::new(None),
-        })
-    }
-
-    #[test]
-    fn fresh_cursor_keeps_the_retained_window_and_marks_the_gap() {
-        let (sender, _outgoing) = mpsc::channel(1);
-        let service = fixture(200, sender);
-        let page = service.events_since("instance", 0).unwrap();
-        assert_eq!(page["gap"], json!(true));
-        assert_eq!(page["cursor"], json!("200"));
-        let events = page["events"].as_array().unwrap();
-        assert_eq!(events.len(), 128);
-        assert_eq!(events[0]["sequence"], json!("73"));
-        assert!(service.events_since("instance", 71).is_err());
-        let caught_up = service.events_since("instance", 72).unwrap();
-        assert_eq!(caught_up["gap"], json!(false));
-        assert_eq!(caught_up["events"].as_array().unwrap().len(), 128);
-        assert_eq!(caught_up["events"][0]["sequence"], json!("73"));
-        let current = service.events_since("instance", 200).unwrap();
-        assert_eq!(current["gap"], json!(false));
-        assert_eq!(current["cursor"], json!("200"));
-        assert_eq!(current["events"].as_array().unwrap().len(), 0);
-        assert!(service.events_since("instance", 201).is_err());
-        assert!(service.events_since("other", 0).is_err());
-        let (sender, _outgoing) = mpsc::channel(1);
-        let small = fixture(2, sender);
-        let page = small.events_since("instance", 0).unwrap();
-        assert_eq!(page["gap"], json!(false));
-        assert_eq!(page["events"].as_array().unwrap().len(), 2);
-        let (sender, _outgoing) = mpsc::channel(1);
-        let exact = fixture(128, sender);
-        let page = exact.events_since("instance", 0).unwrap();
-        assert_eq!(page["gap"], json!(false));
-        assert_eq!(page["cursor"], json!("128"));
-        assert_eq!(page["events"].as_array().unwrap().len(), 128);
-        let (sender, _outgoing) = mpsc::channel(1);
-        let empty = fixture(0, sender);
-        let page = empty.events_since("instance", 0).unwrap();
-        assert_eq!(page["gap"], json!(false));
-        assert_eq!(page["cursor"], json!("0"));
-        assert_eq!(page["events"].as_array().unwrap().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn full_event_queue_ends_the_subscription_only() {
-        let (sender, mut outgoing) = mpsc::channel(1);
-        sender
-            .try_send(Message::Notification(flow_plugin_sdk::Notification {
-                jsonrpc: "2.0",
-                method: "filled".into(),
-                params: None,
-            }))
-            .unwrap();
-        let service = fixture(0, sender);
-        let handler: HostHandler = Arc::new(|_, _| {
-            Box::pin(async {
-                Ok(json!({"events": [json!({"n": 1})], "cursor": "1", "alive": true}))
-            })
-        });
-        service
-            .follow(
-                "sub".into(),
-                handler,
-                "flow/events".into(),
-                json!({"after": "0"}),
-            )
-            .unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            let finished = service
-                .subscriptions
-                .lock()
-                .unwrap()
-                .get("sub")
-                .is_some_and(|task| task.is_finished());
-            if finished {
-                break;
-            }
-            if tokio::time::Instant::now() > deadline {
-                panic!("subscription stayed alive");
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(service.alive());
-        let _ = outgoing.try_recv();
-    }
-
-    #[tokio::test]
-    async fn excess_host_request_is_rejected_without_stopping_the_service() {
-        let result = tokio::time::timeout(Duration::from_secs(5), async {
-            let (host_io, mut plugin) = tokio::io::duplex(1024 * 1024);
-            let (sender, outgoing) = mpsc::channel(64);
-            let pending = Arc::new(Mutex::new(BTreeMap::new()));
-            let history = Arc::new(Mutex::new((0u64, std::collections::VecDeque::new())));
-            let (events, _) = broadcast::channel(8);
-            let stop = CancellationToken::new();
-            let block = Arc::new(AtomicBool::new(true));
-            let host: HostHandler = Arc::new({
-                let block = block.clone();
-                move |method, _params| {
-                    let block = block.clone();
-                    Box::pin(async move {
-                        if method == "ping" {
-                            return Ok(json!("pong"));
-                        }
-                        while block.load(Ordering::SeqCst) {
-                            tokio::task::yield_now().await;
-                        }
-                        Ok(json!("done"))
-                    })
-                }
-            });
-            let serve_task = tokio::spawn({
-                let stop = stop.clone();
-                async move {
-                    serve(
-                        host_io,
-                        outgoing,
-                        Some(host),
-                        stop,
-                        pending,
-                        history,
-                        events,
-                        sender,
-                        "instance".into(),
-                    )
-                    .await;
-                }
-            });
-            for index in 0..17 {
-                let request = Message::Request(Request {
-                    jsonrpc: "2.0",
-                    id: Id::String(format!("h{index}")),
-                    method: "block".into(),
-                    params: Some(json!({})),
-                });
-                write_frame(
-                    &mut plugin,
-                    &Frame {
-                        kind: FrameKind::Rpc,
-                        payload: request.to_vec().unwrap(),
-                    },
-                )
-                .await
-                .unwrap();
-            }
-            let mut saw_limit = false;
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-            while tokio::time::Instant::now() < deadline && !saw_limit {
-                let frame =
-                    match tokio::time::timeout(Duration::from_millis(200), read_frame(&mut plugin))
-                        .await
-                    {
-                        Ok(frame) => frame.unwrap(),
-                        Err(_) => continue,
-                    };
-                let Message::Response(response) = frame.as_rpc().unwrap() else {
-                    continue;
-                };
-                if response
-                    .error
-                    .as_ref()
-                    .is_some_and(|error| error.message.contains("host request limit"))
-                {
-                    saw_limit = true;
-                }
-            }
-            assert!(saw_limit, "17th host request did not return an error");
-            assert!(!stop.is_cancelled());
-            block.store(false, Ordering::SeqCst);
-            // Releasing the handler flag does not synchronously finish/reap the
-            // 16 tasks. Wait for their replies before asserting fresh capacity.
-            for _ in 0..16 {
-                let frame = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut plugin))
-                    .await
-                    .unwrap()
-                    .unwrap();
-                let Message::Response(response) = frame.as_rpc().unwrap() else {
-                    panic!("expected completed host response");
-                };
-                assert_eq!(response.result, Some(json!("done")));
-            }
-            let request = Message::Request(Request {
-                jsonrpc: "2.0",
-                id: Id::String("ping".into()),
-                method: "ping".into(),
-                params: Some(json!({})),
-            });
-            write_frame(
-                &mut plugin,
-                &Frame {
-                    kind: FrameKind::Rpc,
-                    payload: request.to_vec().unwrap(),
-                },
-            )
-            .await
-            .unwrap();
-            let mut saw_pong = false;
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-            while tokio::time::Instant::now() < deadline && !saw_pong {
-                let frame =
-                    match tokio::time::timeout(Duration::from_millis(200), read_frame(&mut plugin))
-                        .await
-                    {
-                        Ok(frame) => frame.unwrap(),
-                        Err(_) => continue,
-                    };
-                let Message::Response(response) = frame.as_rpc().unwrap() else {
-                    continue;
-                };
-                if response.id == Id::String("ping".into()) {
-                    assert_eq!(response.result, Some(json!("pong")));
-                    saw_pong = true;
-                }
-            }
-            assert!(saw_pong, "service stopped answering after the limit error");
-            assert!(!stop.is_cancelled());
-            stop.cancel();
-            let _ = serve_task.await;
-        })
-        .await;
-        result.expect("excess host request hung the service");
-    }
-
-    #[tokio::test]
-    async fn dropped_notifications_do_not_gap_the_sequence_or_stop_the_service() {
-        let (host_io, mut plugin) = tokio::io::duplex(1024 * 1024);
-        let (sender, outgoing) = mpsc::channel(64);
-        let pending = Arc::new(Mutex::new(BTreeMap::new()));
-        let history = Arc::new(Mutex::new((0u64, std::collections::VecDeque::new())));
-        let seen = history.clone();
-        let (events, _) = broadcast::channel(8);
-        let stop = CancellationToken::new();
-        let serve_task = tokio::spawn({
-            let stop = stop.clone();
-            async move {
-                serve(
-                    host_io,
-                    outgoing,
-                    None,
-                    stop,
-                    pending,
-                    history,
-                    events,
-                    sender,
-                    "instance".into(),
-                )
-                .await;
-            }
-        });
-        for note in [
-            Message::Notification(flow_plugin_sdk::Notification {
-                jsonrpc: "2.0",
-                method: "x".repeat(200),
-                params: Some(json!({})),
-            }),
-            Message::Notification(flow_plugin_sdk::Notification {
-                jsonrpc: "2.0",
-                method: "echo.received".into(),
-                params: Some(json!("x".repeat(70_000))),
-            }),
-            Message::Notification(flow_plugin_sdk::Notification {
-                jsonrpc: "2.0",
-                method: "echo.received".into(),
-                params: Some(json!({"ok": true})),
-            }),
-        ] {
-            write_frame(
-                &mut plugin,
-                &Frame {
-                    kind: FrameKind::Rpc,
-                    payload: note.to_vec().unwrap(),
-                },
-            )
-            .await
-            .unwrap();
-        }
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            let stored = seen.lock().unwrap().1.iter().cloned().collect::<Vec<_>>();
-            if stored.len() == 1 {
-                assert_eq!(stored[0]["sequence"], json!("1"));
-                break;
-            }
-            if tokio::time::Instant::now() > deadline {
-                panic!("valid notification was not stored, history={stored:?}");
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(!stop.is_cancelled());
-        stop.cancel();
-        let _ = serve_task.await;
-    }
-}
-
 fn invalid(message: impl Into<String>) -> JournalError {
     FactsError::Invalid(message.into()).into()
 }
@@ -1118,4 +809,333 @@ fn read_document(source: &std::path::Path, path: &std::path::Path) -> Result<Str
         return Err(invalid("web-ui exceeds 256 KiB"));
     }
     Ok(html)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flow_plugin_sdk::protocol::envelope::{read_frame, write_frame};
+    use flow_plugin_sdk::{Frame, FrameKind};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn fixture(events: u64, sender: mpsc::Sender<Message>) -> Arc<ResidentService> {
+        let (events_tx, _) = broadcast::channel(8);
+        let mut history = (0u64, std::collections::VecDeque::new());
+        for sequence in 1..=events {
+            history.0 = sequence;
+            history
+                .1
+                .push_back(json!({"sequence": sequence.to_string()}));
+            if history.1.len() > 128 {
+                history.1.pop_front();
+            }
+        }
+        Arc::new(ResidentService {
+            instance: "instance".into(),
+            binding: std::sync::OnceLock::new(),
+            methods: BTreeSet::new(),
+            sender,
+            pending: Arc::new(Mutex::new(BTreeMap::new())),
+            events: events_tx,
+            subscriptions: Mutex::new(BTreeMap::new()),
+            history: Arc::new(Mutex::new(history)),
+            stop: CancellationToken::new(),
+            task: tokio::sync::Mutex::new(None),
+        })
+    }
+
+    #[test]
+    fn fresh_cursor_keeps_the_retained_window_and_marks_the_gap() {
+        let (sender, _outgoing) = mpsc::channel(1);
+        let service = fixture(200, sender);
+        let page = service.events_since("instance", 0).unwrap();
+        assert_eq!(page["gap"], json!(true));
+        assert_eq!(page["cursor"], json!("200"));
+        let events = page["events"].as_array().unwrap();
+        assert_eq!(events.len(), 128);
+        assert_eq!(events[0]["sequence"], json!("73"));
+        assert!(service.events_since("instance", 71).is_err());
+        let caught_up = service.events_since("instance", 72).unwrap();
+        assert_eq!(caught_up["gap"], json!(false));
+        assert_eq!(caught_up["events"].as_array().unwrap().len(), 128);
+        assert_eq!(caught_up["events"][0]["sequence"], json!("73"));
+        let current = service.events_since("instance", 200).unwrap();
+        assert_eq!(current["gap"], json!(false));
+        assert_eq!(current["cursor"], json!("200"));
+        assert_eq!(current["events"].as_array().unwrap().len(), 0);
+        assert!(service.events_since("instance", 201).is_err());
+        assert!(service.events_since("other", 0).is_err());
+        let (sender, _outgoing) = mpsc::channel(1);
+        let small = fixture(2, sender);
+        let page = small.events_since("instance", 0).unwrap();
+        assert_eq!(page["gap"], json!(false));
+        assert_eq!(page["events"].as_array().unwrap().len(), 2);
+        let (sender, _outgoing) = mpsc::channel(1);
+        let exact = fixture(128, sender);
+        let page = exact.events_since("instance", 0).unwrap();
+        assert_eq!(page["gap"], json!(false));
+        assert_eq!(page["cursor"], json!("128"));
+        assert_eq!(page["events"].as_array().unwrap().len(), 128);
+        let (sender, _outgoing) = mpsc::channel(1);
+        let empty = fixture(0, sender);
+        let page = empty.events_since("instance", 0).unwrap();
+        assert_eq!(page["gap"], json!(false));
+        assert_eq!(page["cursor"], json!("0"));
+        assert_eq!(page["events"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn full_event_queue_ends_the_subscription_only() {
+        let (sender, mut outgoing) = mpsc::channel(1);
+        sender
+            .try_send(Message::Notification(flow_plugin_sdk::Notification {
+                jsonrpc: "2.0",
+                method: "filled".into(),
+                params: None,
+            }))
+            .unwrap();
+        let service = fixture(0, sender);
+        let handler: HostHandler = Arc::new(|_, _| {
+            Box::pin(async {
+                Ok(json!({"events": [json!({"n": 1})], "cursor": "1", "alive": true}))
+            })
+        });
+        service
+            .follow(
+                "sub".into(),
+                handler,
+                "flow/events".into(),
+                json!({"after": "0"}),
+            )
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let finished = service
+                .subscriptions
+                .lock()
+                .unwrap()
+                .get("sub")
+                .is_some_and(|task| task.is_finished());
+            if finished {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!("subscription stayed alive");
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(service.alive());
+        let _ = outgoing.try_recv();
+    }
+
+    #[tokio::test]
+    async fn excess_host_request_is_rejected_without_stopping_the_service() {
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            let (host_io, mut plugin) = tokio::io::duplex(1024 * 1024);
+            let (sender, outgoing) = mpsc::channel(64);
+            let pending = Arc::new(Mutex::new(BTreeMap::new()));
+            let history = Arc::new(Mutex::new((0u64, std::collections::VecDeque::new())));
+            let (events, _) = broadcast::channel(8);
+            let stop = CancellationToken::new();
+            let block = Arc::new(AtomicBool::new(true));
+            let host: HostHandler = Arc::new({
+                let block = block.clone();
+                move |method, _params| {
+                    let block = block.clone();
+                    Box::pin(async move {
+                        if method == "ping" {
+                            return Ok(json!("pong"));
+                        }
+                        while block.load(Ordering::SeqCst) {
+                            tokio::task::yield_now().await;
+                        }
+                        Ok(json!("done"))
+                    })
+                }
+            });
+            let serve_task = tokio::spawn({
+                let stop = stop.clone();
+                async move {
+                    serve(
+                        host_io,
+                        outgoing,
+                        stop,
+                        SessionContext {
+                            host: Some(host),
+                            pending,
+                            history,
+                            events,
+                            responses: sender,
+                            instance: "instance".into(),
+                        },
+                    )
+                    .await;
+                }
+            });
+            for index in 0..17 {
+                let request = Message::Request(Request {
+                    jsonrpc: "2.0",
+                    id: Id::String(format!("h{index}")),
+                    method: "block".into(),
+                    params: Some(json!({})),
+                });
+                write_frame(
+                    &mut plugin,
+                    &Frame {
+                        kind: FrameKind::Rpc,
+                        payload: request.to_vec().unwrap(),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            let mut saw_limit = false;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while tokio::time::Instant::now() < deadline && !saw_limit {
+                let frame =
+                    match tokio::time::timeout(Duration::from_millis(200), read_frame(&mut plugin))
+                        .await
+                    {
+                        Ok(frame) => frame.unwrap(),
+                        Err(_) => continue,
+                    };
+                let Message::Response(response) = frame.as_rpc().unwrap() else {
+                    continue;
+                };
+                if response
+                    .error
+                    .as_ref()
+                    .is_some_and(|error| error.message.contains("host request limit"))
+                {
+                    saw_limit = true;
+                }
+            }
+            assert!(saw_limit, "17th host request did not return an error");
+            assert!(!stop.is_cancelled());
+            block.store(false, Ordering::SeqCst);
+            // Releasing the handler flag does not synchronously finish/reap the
+            // 16 tasks. Wait for their replies before asserting fresh capacity.
+            for _ in 0..16 {
+                let frame = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut plugin))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let Message::Response(response) = frame.as_rpc().unwrap() else {
+                    panic!("expected completed host response");
+                };
+                assert_eq!(response.result, Some(json!("done")));
+            }
+            let request = Message::Request(Request {
+                jsonrpc: "2.0",
+                id: Id::String("ping".into()),
+                method: "ping".into(),
+                params: Some(json!({})),
+            });
+            write_frame(
+                &mut plugin,
+                &Frame {
+                    kind: FrameKind::Rpc,
+                    payload: request.to_vec().unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+            let mut saw_pong = false;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while tokio::time::Instant::now() < deadline && !saw_pong {
+                let frame =
+                    match tokio::time::timeout(Duration::from_millis(200), read_frame(&mut plugin))
+                        .await
+                    {
+                        Ok(frame) => frame.unwrap(),
+                        Err(_) => continue,
+                    };
+                let Message::Response(response) = frame.as_rpc().unwrap() else {
+                    continue;
+                };
+                if response.id == Id::String("ping".into()) {
+                    assert_eq!(response.result, Some(json!("pong")));
+                    saw_pong = true;
+                }
+            }
+            assert!(saw_pong, "service stopped answering after the limit error");
+            assert!(!stop.is_cancelled());
+            stop.cancel();
+            let _ = serve_task.await;
+        })
+        .await;
+        result.expect("excess host request hung the service");
+    }
+
+    #[tokio::test]
+    async fn dropped_notifications_do_not_gap_the_sequence_or_stop_the_service() {
+        let (host_io, mut plugin) = tokio::io::duplex(1024 * 1024);
+        let (sender, outgoing) = mpsc::channel(64);
+        let pending = Arc::new(Mutex::new(BTreeMap::new()));
+        let history = Arc::new(Mutex::new((0u64, std::collections::VecDeque::new())));
+        let seen = history.clone();
+        let (events, _) = broadcast::channel(8);
+        let stop = CancellationToken::new();
+        let serve_task = tokio::spawn({
+            let stop = stop.clone();
+            async move {
+                serve(
+                    host_io,
+                    outgoing,
+                    stop,
+                    SessionContext {
+                        host: None,
+                        pending,
+                        history,
+                        events,
+                        responses: sender,
+                        instance: "instance".into(),
+                    },
+                )
+                .await;
+            }
+        });
+        for note in [
+            Message::Notification(flow_plugin_sdk::Notification {
+                jsonrpc: "2.0",
+                method: "x".repeat(200),
+                params: Some(json!({})),
+            }),
+            Message::Notification(flow_plugin_sdk::Notification {
+                jsonrpc: "2.0",
+                method: "echo.received".into(),
+                params: Some(json!("x".repeat(70_000))),
+            }),
+            Message::Notification(flow_plugin_sdk::Notification {
+                jsonrpc: "2.0",
+                method: "echo.received".into(),
+                params: Some(json!({"ok": true})),
+            }),
+        ] {
+            write_frame(
+                &mut plugin,
+                &Frame {
+                    kind: FrameKind::Rpc,
+                    payload: note.to_vec().unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let stored = seen.lock().unwrap().1.iter().cloned().collect::<Vec<_>>();
+            if stored.len() == 1 {
+                assert_eq!(stored[0]["sequence"], json!("1"));
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!("valid notification was not stored, history={stored:?}");
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(!stop.is_cancelled());
+        stop.cancel();
+        let _ = serve_task.await;
+    }
 }

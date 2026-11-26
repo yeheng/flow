@@ -130,12 +130,10 @@ async fn call(
 #[tokio::test]
 async fn observation_lookup_precedes_cursor_validation_when_no_log_can_be_read() {
     let dir = flow_test_support::io::TempDir::new("observations-disabled");
-    // A file at the observation directory path disables only the optional store.
-    std::fs::write(dir.path().join("observations"), b"").unwrap();
-    let backend = JournalBackend::open(dir.path(), Default::default())
+    let mut backend = JournalBackend::open(dir.path(), Default::default())
         .await
         .unwrap();
-    assert!(backend.observations.is_none());
+    std::sync::Arc::get_mut(&mut backend).unwrap().observations = None;
     let module = flow_rpc::journal_v2::module(
         backend.clone(),
         "observations-contract-test-token-32bytes".into(),
