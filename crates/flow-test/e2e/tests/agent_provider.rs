@@ -8,7 +8,7 @@
 //! - 内置 coding prompt / 工具集来自无头装配（system 消息非空、tools 含 bash）。
 
 use flow_backend::journal::JournalBackend;
-use flow_engine::journal_state::RunStatus;
+use flow_domain::journal_state::RunStatus;
 use flow_test_support::provider::{spawn_mock_openai, Turn};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -36,7 +36,7 @@ async fn agent_node_full_stack_with_inline_conga_and_mock_provider() {
         .await
         .unwrap();
     backend
-        .install_harness_agent(Some(flow_engine::AgentRunConfig {
+        .install_harness_agent(Some(flow_dto::AgentRunConfig {
             base_url: provider.base_url(),
             model: "mock-model".into(),
             api: "openai".into(),
@@ -51,9 +51,10 @@ async fn agent_node_full_stack_with_inline_conga_and_mock_provider() {
     backend
         .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
             flow_backend::execution::IpcOptions {
-                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
-                    flow_test_support::io::executor_bin(),
-                ),
+                executor:
+                    flow_dispatcher::execution_protocol::contract::ExecutorInvocation::explicit(
+                        flow_test_support::io::executor_bin(),
+                    ),
                 x_max: 2,
                 tag: None,
             },

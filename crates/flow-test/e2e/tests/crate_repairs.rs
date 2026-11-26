@@ -26,7 +26,7 @@ async fn backend_close_waits_for_idle_executor_reaping() {
         .unwrap();
     b.start_execution_ipc_prewarm(
         flow_backend::execution::ExecutionMode::Ipc(flow_backend::execution::IpcOptions {
-            executor: flow_engine::execution_protocol::ExecutorInvocation::explicit(
+            executor: flow_dispatcher::execution_protocol::ExecutorInvocation::explicit(
                 flow_test_support::io::executor_bin(),
             ),
             x_max: 1,
@@ -127,7 +127,7 @@ async fn child_inputs_use_the_pinned_contract_before_run_creation() {
         .unwrap();
     b.start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
         flow_backend::execution::IpcOptions {
-            executor: flow_engine::execution_protocol::ExecutorInvocation::explicit(
+            executor: flow_dispatcher::execution_protocol::ExecutorInvocation::explicit(
                 flow_test_support::io::executor_bin(),
             ),
             x_max: 2,
@@ -182,7 +182,7 @@ async fn child_inputs_use_the_pinned_contract_before_run_creation() {
             .await
             .unwrap();
             assert_eq!(
-                run.status == flow_engine::journal_state::RunStatus::Succeeded,
+                run.status == flow_domain::journal_state::RunStatus::Succeeded,
                 valid,
                 "{input}: {:?}",
                 run.error
@@ -313,7 +313,7 @@ async fn harness_deadline_and_run_cancel_stop_descendants() {
         .unwrap();
     b.start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
         flow_backend::execution::IpcOptions {
-            executor: flow_engine::execution_protocol::ExecutorInvocation::explicit(
+            executor: flow_dispatcher::execution_protocol::ExecutorInvocation::explicit(
                 flow_test_support::io::executor_bin(),
             ),
             x_max: 2,
@@ -348,7 +348,7 @@ async fn harness_deadline_and_run_cancel_stop_descendants() {
                 if if cancel {
                     run.terminal()
                 } else {
-                    run.status == flow_engine::journal_state::RunStatus::AwaitingResume
+                    run.status == flow_domain::journal_state::RunStatus::AwaitingResume
                 } {
                     break;
                 }

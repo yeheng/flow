@@ -5,8 +5,8 @@
 
 use flow_agent::runtime::{serve_for_tests, AgentConfig};
 use flow_backend::journal::JournalBackend;
-use flow_engine::execution_protocol::transport::FrameTransport;
-use flow_engine::journal_state::{Run, RunStatus};
+use flow_dispatcher::execution_protocol::transport::FrameTransport;
+use flow_domain::journal_state::{Run, RunStatus};
 use flow_journal::JournalOptions;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -48,7 +48,7 @@ fn agent_config(agent_id: &str, slots: u32) -> AgentConfig {
         cert: Default::default(),
         key: Default::default(),
         sni: None,
-        executor: flow_engine::execution_protocol::ExecutorInvocation {
+        executor: flow_dispatcher::execution_protocol::ExecutorInvocation {
             program: flow_test_support::io::executor_bin(),
         },
         slots,
@@ -78,12 +78,12 @@ async fn spawn_agent(
     let session_shutdown = shutdown.clone();
     let agent_id = agent_id.to_string();
     tokio::spawn(async move {
-        use flow_engine::execution_protocol::Message;
+        use flow_dispatcher::execution_protocol::Message;
         let mut transport = FrameTransport::spawn(control_b, 128);
-        let boot = flow_engine::execution_protocol::transport::fresh_boot_id();
+        let boot = flow_dispatcher::execution_protocol::transport::fresh_boot_id();
         if transport
             .send(Message::AgentHello {
-                version: flow_engine::execution_protocol::PROTOCOL_VERSION,
+                version: flow_dispatcher::execution_protocol::PROTOCOL_VERSION,
                 agent_boot_id: boot.clone(),
                 build: "sim".into(),
                 capabilities: vec!["relay".into(), "resource_report".into(), "reconnect".into()],
@@ -105,7 +105,7 @@ async fn spawn_agent(
             }
         };
         let Message::AgentWelcome {
-            version: flow_engine::execution_protocol::PROTOCOL_VERSION,
+            version: flow_dispatcher::execution_protocol::PROTOCOL_VERSION,
             journal_id,
             master_epoch,
             link_session_id,
@@ -304,7 +304,7 @@ async fn matrix_cancel_between_persist_and_permit_keeps_http_zero() {
 #[tokio::test]
 async fn matrix_cancel_after_approval_blocks_permit_and_http() {
     use flow_backend::journal_permissions::ApprovalCommand;
-    use flow_engine::journal_state::ApprovalStatus;
+    use flow_domain::journal_state::ApprovalStatus;
 
     let _scenario = SCENARIO.lock().await;
     flow_backend::execution::dispatch::fault::clear();
@@ -459,7 +459,7 @@ async fn matrix_disconnect_before_result_committed_no_duplicate_side_effect() {
     let run = until(&backend, &run_id, |r| {
         r.nodes
             .get("n")
-            .is_some_and(|n| n.status == flow_engine::journal_state::NodeStatus::Succeeded)
+            .is_some_and(|n| n.status == flow_domain::journal_state::NodeStatus::Succeeded)
     })
     .await;
     assert!(

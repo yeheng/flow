@@ -2,9 +2,9 @@
 
 use std::collections::BTreeMap;
 
-use flow_engine::execution_protocol::{ExecuteTask, TaskValue};
-use flow_engine::journal_state::{Node as NodeRecord, Run};
-use flow_engine::Node;
+use flow_dispatcher::execution_protocol::{ExecuteTask, TaskValue};
+use flow_domain::journal_state::{Node as NodeRecord, Run};
+use flow_domain::Node;
 use flow_journal::StoredValue;
 use serde_json::json;
 
@@ -29,7 +29,7 @@ pub(super) fn prepare(
         .transpose()?;
     let mut node_value = serde_json::to_value(node)?;
     if let Some(execution) = &run.execution {
-        if execution.runtime != flow_engine::RUNTIME_ID {
+        if execution.runtime != flow_dispatcher::execution_protocol::contract::RUNTIME_ID {
             return Err(flow_journal::Error::Invalid(
                 "run requires a different executor runtime".into(),
             )
@@ -85,7 +85,7 @@ pub(super) fn prepare(
             .map(|(id, value)| (id.clone(), task_value(value)))
             .collect(),
         prepared: record.prepared.as_ref().map(|committed| {
-            flow_engine::execution_protocol::PreparedMeta {
+            flow_dispatcher::execution_protocol::PreparedMeta {
                 engine_build: committed.engine_build.clone(),
                 node_semantics: committed.node_semantics,
                 params: task_value(&committed.params),

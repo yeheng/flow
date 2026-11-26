@@ -73,11 +73,11 @@
 
 | 想改的东西 | 该读代码 | 背景章节 |
 | --- | --- | --- |
-| 加一种节点类型 | `flow-engine/src/model.rs` 的 `NODE_TYPE_TABLE` + `descriptor`；`flow-executor/src/task.rs` 的执行分支 | [05](design/05-definitions-and-semantics.md) |
-| 改 run 状态语义 | `flow-engine/src/journal_state.rs` 的 `State::apply` | [02](design/02-data-model.md) |
+| 加一种节点类型 | `flow-domain/src/model.rs` 的 `NODE_TYPE_TABLE` + `descriptor`、`flow-rpc/src/node_types.rs` 的展示信息与 `flow-plugin-runtime/src/task.rs` 的执行分支 | [05](design/05-definitions-and-semantics.md) |
+| 改 run 状态语义 | `flow-domain/src/journal_state.rs` 的 `State::apply` | [02](design/02-data-model.md) |
 | 改调度/汇合规则 | `flow-backend/src/journal_driver.rs` 的 `incoming_gate` + `advance_run` | [03](design/03-single-node-execution.md) |
 | 改写盘行为/组提交 | `flow-journal/src/writer.rs` | [02](design/02-data-model.md) |
-| 改协议消息 | `flow-engine/src/execution_protocol/{contract,message}.rs`（改 `contract.rs` 即需 bump `PROTOCOL_VERSION`） | [08](design/08-invariants-and-limits.md)（§13.6） |
+| 改协议消息 | `flow-dispatcher/src/execution_protocol/{contract,message}.rs`（改 `contract.rs` 即需 bump `PROTOCOL_VERSION`） | [08](design/08-invariants-and-limits.md)（§13.6） |
 | 加 RPC 方法 | `flow-rpc/src/journal_v2.rs` 的 `READ_METHODS`/`WRITE_METHODS` + 对应 handler | [06](design/06-rpc.md) |
 | 改触发器 | `flow-rpc/src/journal_triggers.rs` | [06](design/06-rpc.md) |
 | 改 agent 中继 | `flow-agent/src/{runtime,relay,pool}.rs` | [04](design/04-remote-execution.md) |

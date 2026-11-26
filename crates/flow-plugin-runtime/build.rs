@@ -16,12 +16,6 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn main() {
-    // Explicit semantic compatibility: bump for incompatible execution changes.
-    // Keep the existing 64-hex snapshot representation, independently of sources.
-    let version = "flow-execution-v1";
-    let compatibility = hex(&Sha256::digest(version.as_bytes()));
-    println!("cargo:rustc-env=FLOW_RUNTIME_VERSION={version}");
-    println!("cargo:rustc-env=FLOW_COMPATIBILITY_ID={compatibility}");
     let root = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("../..");
     let mut paths = Vec::new();
     // 溯源哈希覆盖（T5/T7）：引擎共享契约、插件运行时（原 executor）、
@@ -32,6 +26,7 @@ fn main() {
         "crates/flow-engine/src",
         "crates/flow-dispatcher/src",
         "crates/flow-domain/src",
+        "crates/flow-dto/src",
         "crates/flow-facts/src",
         "crates/flow-plugin-runtime/src",
         "crates/flow-plugin-catalog/src",
@@ -47,7 +42,7 @@ fn main() {
         "Cargo.toml",
         "crates/flow-engine/Cargo.toml",
         "crates/flow-plugin-runtime/Cargo.toml",
-        "crates/flow-engine/build.rs",
+        "crates/flow-plugin-runtime/build.rs",
         // 插件 manifest：声明即行为（路由键/方法名/协议快筛）
         "plugins/harness/plugin/plugin.toml",
         "plugins/llm/plugin/plugin.toml",

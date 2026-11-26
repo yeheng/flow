@@ -12,13 +12,13 @@ publish = false
 # 它不依赖任何被测 crate。
 
 [dependencies]
+flow-rpc-contract = { path = "../../flow-rpc/contract" }
 uuid = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 jsonrpsee = { workspace = true, features = ["client"] }
-flow-dto = { path = "../../flow-dto" }
 sha2 = { workspace = true }
 url = { workspace = true }
 futures = { workspace = true }

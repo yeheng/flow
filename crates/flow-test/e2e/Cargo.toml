@@ -19,18 +19,19 @@ edition.workspace = true
 publish = false
 
 [dependencies]
+flow-dispatcher = { path = "../../flow-dispatcher" }
+flow-domain = { path = "../../flow-domain" }
 tokio = { workspace = true }
 futures = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 uuid = { workspace = true }
-chrono = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
 jsonrpsee = { version = "0.26", features = ["client", "ws-client", "server"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 flow-backend = { path = "../../flow-backend" }
 flow-rpc = { path = "../../flow-rpc" }
 flow-config = { path = "../../flow-config" }
-flow-engine = { path = "../../flow-engine" }
 flow-test-support = { path = "../test-support" }
 rustls = { workspace = true }
 

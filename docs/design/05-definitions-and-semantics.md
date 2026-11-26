@@ -30,7 +30,7 @@
 钉住与表一致。新增节点类型只改这张表和 enum——手写这些面时漏改的那几处不会
 编译报错，只在运行期表现为「类型不认识」或前端面板少一项，测试会在 CI 拦住。
 
-### 8.2 校验规则（`flow-engine/src/model.rs`）
+### 8.2 校验规则（`flow-domain/src/model.rs`）
 
 - **DAG 完整性**：节点 id 唯一、边引用的节点存在、无环、恰好一个 `start`。
 - **端口合法性**：`condition` 的出边可带 `port: "true" | "false"`，其他类型不可带。
@@ -38,7 +38,7 @@
   是数组（空数组目前不被拒绝，属已知宽松点）、每项含非空 `key`，`${...}` 模板
   值放行（运行期展开）。
 - **密钥参数**：`x-secret` 标记的参数（目前有 `email.api_key` 与
-  `harness.api_key`）永不落 journal 明文，只存引用（`flow-engine` 的 secret store）。
+  `harness.api_key`）永不落 journal 明文，只存引用（`flow-backend` 的 secret store）。
 - **`sub_workflow` 深度**：`MAX_SUB_WORKFLOW_DEPTH = 16`（**不是**旧文档写的 8）。
 - **不可变发布**：`WorkflowPublished` 后定义冻结；修改走新版本号，版本号必须连续。
 

@@ -21,7 +21,7 @@ fn definition(kind: &str, params: Value) -> Value {
 async fn execution(b: &std::sync::Arc<JournalBackend>) {
     b.start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
         flow_backend::execution::IpcOptions {
-            executor: flow_engine::execution_protocol::ExecutorInvocation::explicit(
+            executor: flow_dispatcher::execution_protocol::ExecutorInvocation::explicit(
                 flow_test_support::io::executor_bin(),
             ),
             x_max: 1,
@@ -31,7 +31,7 @@ async fn execution(b: &std::sync::Arc<JournalBackend>) {
     .await
     .unwrap();
 }
-async fn finished(b: &JournalBackend, id: &str) -> flow_engine::journal_state::Run {
+async fn finished(b: &JournalBackend, id: &str) -> flow_domain::journal_state::Run {
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let run = b.run_snapshot(id).await.unwrap().unwrap();
@@ -162,7 +162,7 @@ async fn console_logs_and_timeline_redact_secrets_but_execution_output_keeps_evi
     let run = finished(&b, id).await;
     assert_eq!(
         run.status,
-        flow_engine::journal_state::RunStatus::Succeeded,
+        flow_domain::journal_state::RunStatus::Succeeded,
         "{:?}",
         run.error
     );
@@ -219,7 +219,7 @@ async fn executor_harness_does_not_inherit_any_ipc_socket() {
     let run = finished(&b, started.result["run_id"].as_str().unwrap()).await;
     assert_eq!(
         run.status,
-        flow_engine::journal_state::RunStatus::Succeeded,
+        flow_domain::journal_state::RunStatus::Succeeded,
         "{:?}",
         run.error
     );

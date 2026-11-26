@@ -8,7 +8,7 @@
 //! 影响其他插件。
 
 use flow_backend::journal::JournalBackend;
-use flow_engine::journal_state::RunStatus;
+use flow_domain::journal_state::RunStatus;
 use flow_test_support::provider::{spawn_mock_openai, Turn};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -73,7 +73,7 @@ async fn manifest_discovered_plugin_routes_harness_dispatch() {
         .await
         .unwrap();
     backend
-        .install_harness_agent(Some(flow_engine::AgentRunConfig {
+        .install_harness_agent(Some(flow_dto::AgentRunConfig {
             base_url: provider.base_url(),
             model: "mock-model".into(),
             api: "openai".into(),
@@ -84,9 +84,10 @@ async fn manifest_discovered_plugin_routes_harness_dispatch() {
     backend
         .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
             flow_backend::execution::IpcOptions {
-                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
-                    flow_test_support::io::executor_bin(),
-                ),
+                executor:
+                    flow_dispatcher::execution_protocol::contract::ExecutorInvocation::explicit(
+                        flow_test_support::io::executor_bin(),
+                    ),
                 x_max: 1,
                 tag: None,
             },

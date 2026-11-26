@@ -9,8 +9,6 @@
 //!   新增一个变体只需要改一处。
 //! - **形状与存储解耦**：DTO 只描述「产品面看到什么」，不承担持久化语义；
 //!   存储侧的合法值校验在写入口调用本 crate 的 `is_valid_str`。
-//! - **命令作用域可推导**：`command_scope` 把一次 RPC 调用映射到可重放的
-//!   幂等作用域，使「回复丢失」的写可以被安全重试。
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -305,36 +303,6 @@ pub struct NodeTemplateSummary {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Durable command namespace used to recover a write after a lost reply.
-///
-/// 把一次写调用映射到一个**可重放的幂等作用域**：当 RPC 回复在途中丢失时，
-/// 客户端用同一个 scope 重发，服务端就能认出「这是同一次写」而不是新写一次。
-///
-/// scope 的构造规则：
-/// - `run.start` 与 `run.regress` 共享 `run.start:manual:` 前缀，因为回归
-///   本质上就是一次手动启动；regress 额外带上 baseline 以区分不同基线。
-/// - `run.cancel` / `run.signal` / `run.adjudicate` 按 `run_id` 定位，
-///   同一 run 上的同类操作天然幂等。
-/// - 其余方法用方法名本身作为作用域。
-pub fn command_scope(method: &str, params: &Value) -> String {
-    match method {
-        "run.start" => "run.start:manual:".into(),
-        "run.regress" => format!(
-            "run.start:manual:regression:{}",
-            params["baseline"].as_str().unwrap_or("")
-        ),
-        "run.cancel"
-        | "run.signal"
-        | "run.adjudicate"
-        | "run.approve"
-        | "run.deny"
-        | "run.approvals.revoke" => {
-            format!("{method}:{}", params["run_id"].as_str().unwrap_or(""))
-        }
-        other => other.into(),
-    }
-}
-
 /// `[harness.agent]` 的运行期形态：run 启动时冻结进 `ExecutionSnapshot`，
 /// 派发时随 `_flow_execution.agent` 下发，并进 operation 请求（回归指纹）。
 ///
@@ -389,6 +357,5 @@ impl AgentRunConfig {
 }
 
 pub mod permission;
-pub mod rpc;
 
 pub mod interaction;

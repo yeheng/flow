@@ -67,7 +67,7 @@
 
 ## 3. 核心模型（数据结构优先）
 
-先定数据，再定流程。权限 DTO 落在 `flow-dto`，定义字段落在 `flow-engine::model`；评估器在 master（§5）。
+先定数据，再定流程。权限 DTO 落在 `flow-dto`，定义字段落在 `flow_domain::model`；评估器在 master（§5）。
 
 ### 3.1 Principal —— 谁在行动 / 谁在裁决
 
@@ -654,7 +654,7 @@ crate 变更清单：
 | `flow-dto` | Principal/Action/OperationSpec/ResourcePattern/WorkflowPermissions/NodePermissions/DecisionRecord DTO；新 EventKind 与 RPC 方法枚举（`run.approve/deny`、`permissions.*`） |
 | `flow-journal` | EventKind 扩展、`actor` 字段、`prev_digest` 列与链校验、工作流权限版本 / Run 精确授权 / 插件授予投影 |
 | `flow-backend` | `policy.rs`（评估器，纯函数）、freeze 策略快照、G3 状态机、审批 wait 折叠、`permissions.*` RPC |
-| `flow-engine` | DefinitionData/Node 独立 permissions 字段与 checksum/兼容校验；`WaitKind::Approval`、`journal_state` 审批与 run 授权折叠 |
+| `flow-domain` | DefinitionData/Node 独立 permissions 字段与 checksum/兼容校验；`WaitKind::Approval`、`journal_state` 审批与 run 授权折叠 |
 | `flow-plugin-sdk` | ReverseRequests 服务端：`permission/request` 方法；协议 minor +1 + vectors |
 | `flow-plugin-runtime` | `plugin_session` 能力校验与反向请求服务；registry `content_hash`；SpawnConfig 沙箱参数 |
 | `flow-config` | manifest `[permissions]` / `[[permissions.capabilities]]`；部署 `[permissions] approval_ttl_ms`；workflow/node 权限在定义内；matcher 闭集校验 |

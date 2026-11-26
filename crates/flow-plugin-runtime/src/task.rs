@@ -25,17 +25,19 @@ use sha2::Digest as _;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use flow_engine::execution_protocol::contract::{bounded_control_text, DURABLE_WAIT_TIMEOUT_MS};
+use flow_dispatcher::execution_protocol::contract::{
+    bounded_control_text, DURABLE_WAIT_TIMEOUT_MS,
+};
 
 /// 审批等待的本地宽限（v8 OperationPending）：主进程 TTL 判定与 Denied 投递
 /// 的余量。超过「审批截止 + 宽限」仍无裁决只可能是链路已失联（remote）。
 const APPROVAL_GRACE_MS: u64 = 2 * DURABLE_WAIT_TIMEOUT_MS;
-use flow_engine::execution_protocol::message::{
+use flow_dispatcher::execution_protocol::message::{
     ExecuteTask, Message, ResultOutcome, TaskValue, WaitKind, WaitRequest,
 };
-use flow_engine::execution_protocol::TransferKey;
-use flow_engine::model::Node;
-use flow_engine::{NodeType, Prepared, HTTP_METHODS};
+use flow_dispatcher::execution_protocol::TransferKey;
+use flow_domain::model::Node;
+use flow_domain::{NodeType, Prepared, HTTP_METHODS};
 use flow_facts::value::ValueCodec;
 use flow_facts::StoredValue;
 
@@ -255,7 +257,7 @@ impl TaskRunner {
             .pointer("/_flow_execution/runtime")
             .and_then(Value::as_str)
         {
-            if runtime != flow_engine::RUNTIME_ID {
+            if runtime != flow_dispatcher::execution_protocol::contract::RUNTIME_ID {
                 return Err(TaskError::Invalid("executor runtime mismatch".into()));
             }
         }
@@ -403,7 +405,7 @@ impl TaskRunner {
                 job,
             } if dispatch_id == self.dispatch_id
                 && job.id == self.task.node_execution_id
-                && job.handler == flow_engine::SCRIPT_V1_HANDLER
+                && job.handler == flow_domain::script::SCRIPT_V1_HANDLER
                 && job.input.is_empty() =>
             {
                 self.outbound
@@ -516,14 +518,14 @@ impl TaskRunner {
                 message = self.mail.recv() => message,
                 _ = self.cancel.cancelled() => return Err(TaskError::Cancelled),
                 _ = tokio::time::sleep(Duration::from_millis(
-                    flow_engine::execution_protocol::ACK_RETRANSMIT_MS / 2 + 1,
+                    flow_dispatcher::execution_protocol::ACK_RETRANSMIT_MS / 2 + 1,
                 )), if self.remote_replay => {
                     // 结果回执可能在上联/中继中丢失：周期性重发同一
                     // result_id 的 Result（主进程幂等返回原提交）。
                     if last_send.is_none_or(|at| {
                         at.elapsed()
                             >= Duration::from_millis(
-                                flow_engine::execution_protocol::ACK_RETRANSMIT_MS,
+                                flow_dispatcher::execution_protocol::ACK_RETRANSMIT_MS,
                             )
                     }) {
                         if let Some(result) = self.last_result.clone() {
@@ -691,7 +693,12 @@ impl TaskRunner {
         let determinism = self.determinism();
         // 含 "${" 才展开：无模板时直接提交实际输入，避免一次无谓的
         // 表达式求值（求值会改变用户可见的确定性上下文开销）。
-        let config = self.task.node.pointer("/_flow_execution/environment/config").cloned().unwrap_or(Value::Null);
+        let config = self
+            .task
+            .node
+            .pointer("/_flow_execution/environment/config")
+            .cloned()
+            .unwrap_or(Value::Null);
         let templates = serde_json::to_string(&node.params)?.contains("${");
         let params = if !templates {
             node.params.clone()
@@ -746,7 +753,7 @@ impl TaskRunner {
             input: face_input,
             predecessors,
             params: stored_params,
-            engine_build: flow_engine::BUILD_ID.into(),
+            engine_build: crate::BUILD_ID.into(),
             node_semantics: if determinism.is_some() { 2 } else { 1 },
         };
         audit.push(
@@ -1041,9 +1048,9 @@ impl TaskRunner {
         let result = tokio::task::spawn_blocking(move || {
             flow_internal_plugins::script::execute_script(&script, &logger)
         })
-            .await
-            .map_err(|e| TaskError::Business(e.to_string()))?
-            .map_err(|e| TaskError::Business(e.to_string()))?;
+        .await
+        .map_err(|e| TaskError::Business(e.to_string()))?
+        .map_err(|e| TaskError::Business(e.to_string()))?;
         // 条件节点的分支由宿主的 truthy 判定（与 JS 真值语义对齐），
         // 脚本节点不带分支。
         let branch = (kind == NodeType::Condition).then(|| flow_internal_plugins::truthy(&result));
@@ -1289,7 +1296,8 @@ impl TaskRunner {
             .map(str::to_owned);
         let credentials = self.authorize_operation(request).await?;
         let credential = secret_ref.and_then(|name| {
-            flow_engine::execution_protocol::credential_for(&credentials, &name).map(str::to_owned)
+            flow_dispatcher::execution_protocol::credential_for(&credentials, &name)
+                .map(str::to_owned)
         });
         // 带凭据重建：密钥值只在授权许可里出现，不进请求指纹与审计。
         let outbound_request = build_outbound(credential)?;
@@ -1417,7 +1425,7 @@ impl TaskRunner {
     async fn authorize_operation(
         &mut self,
         request: Value,
-    ) -> Result<Vec<flow_engine::execution_protocol::PermitCredential>, TaskError> {
+    ) -> Result<Vec<flow_dispatcher::execution_protocol::PermitCredential>, TaskError> {
         if self.is_regression() {
             // 回归模式禁止一切外部操作：协调器也会独立拒绝许可，双保险
             // 防止回归意外发请求。
@@ -1443,7 +1451,8 @@ impl TaskRunner {
         {
             let mut offset = 0u64;
             // 分块发送并逐块带摘要：接收端据此发现传输损坏。
-            for chunk in request_bytes.chunks(flow_engine::execution_protocol::TRANSFER_CHUNK_BYTES)
+            for chunk in
+                request_bytes.chunks(flow_dispatcher::execution_protocol::TRANSFER_CHUNK_BYTES)
             {
                 self.outbound
                     .send(Message::TransferChunk {
@@ -1614,7 +1623,7 @@ impl TaskRunner {
         let started = std::time::Instant::now();
         // ManagedChild 绑定进程组/作业：执行器崩溃或取消时后代进程不会
         // 变成孤儿继续占用机器。
-        let mut child = match flow_engine::process::ManagedChild::spawn_harness(
+        let mut child = match flow_dispatcher::process::ManagedChild::spawn_harness(
             &mut flow_internal_plugins::harness_command(&command, &args, workdir.as_deref()),
         ) {
             Ok(child) => child,
@@ -1836,7 +1845,7 @@ impl TaskRunner {
                 ))
             })?;
             if let Some(schema) = self.task.node.pointer("/params/response_schema") {
-                flow_engine::schema::validate(schema, &response).map_err(|e| {
+                flow_domain::schema::validate(schema, &response).map_err(|e| {
                     TaskError::Business(format!("model response contract: {e}; outcome retained"))
                 })?;
             }
@@ -1980,7 +1989,7 @@ fn elapsed_label(elapsed: Duration) -> String {
 // 分支失败或超时都判 Uncertain——进程可能已产生副作用。
 /// Capture all three pipes concurrently under one deadline. Partial output is never success.
 async fn capture_harness(
-    child: &mut flow_engine::process::ManagedChild,
+    child: &mut flow_dispatcher::process::ManagedChild,
     prompt: &[u8],
     timeout: Duration,
     cancel: &tokio_util::sync::CancellationToken,
@@ -2081,7 +2090,7 @@ mod harness_capture_tests {
         input: &[u8],
         timeout: Duration,
     ) -> Result<std::process::Output, TaskError> {
-        let mut child = flow_engine::process::ManagedChild::spawn_harness(
+        let mut child = flow_dispatcher::process::ManagedChild::spawn_harness(
             &mut flow_internal_plugins::harness_command(
                 "/bin/sh",
                 &["-c".into(), script.into()],
@@ -2194,7 +2203,7 @@ mod builtin_worker_tests {
             input: StoredValue::Inline(Value::Null),
             predecessors: BTreeMap::new(),
             params: StoredValue::Inline(json!({})),
-            engine_build: flow_engine::BUILD_ID.into(),
+            engine_build: crate::BUILD_ID.into(),
             node_semantics: 2,
         };
         let inputs = TaskInputs {

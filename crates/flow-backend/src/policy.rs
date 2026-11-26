@@ -6,8 +6,8 @@ pub mod derive;
 use std::collections::{BTreeMap, BTreeSet};
 
 use derive::normalize_provider;
+use flow_domain::journal_state::{AgentPluginSnapshot, PluginBinding, Run};
 use flow_dto::permission::{Approval, Capability, ExecutionMode, FrozenPolicy, NodePermissions};
-use flow_engine::journal_state::{AgentPluginSnapshot, PluginBinding, Run};
 pub use flow_policy::{check, check_plugin_needs, CheckInput, Evaluation, PluginNeedsInput};
 
 // ---------------------------------------------------------------------------
@@ -20,7 +20,7 @@ pub use flow_policy::{check, check_plugin_needs, CheckInput, Evaluation, PluginN
 /// 能力；静态门另在启动时拒绝含副作用节点的 legacy 定义。`plugin_ceilings`
 /// 是该定义引用的插件授予层（无授予记录的插件不出现在层里 → G3 拒绝）。
 pub fn freeze_root(
-    definition: &flow_engine::Definition,
+    definition: &flow_domain::Definition,
     plugin_ceilings: Vec<flow_dto::permission::PluginCeiling>,
 ) -> FrozenPolicy {
     freeze(definition, None, plugin_ceilings)
@@ -30,7 +30,7 @@ pub fn freeze_root(
 /// 调用方节点的有效层作为额外上限逐层 AND（§3.5）：不继承父节点凭据、
 /// 不自动提升能力；父 Plan 则子也只读。
 pub fn freeze_child(
-    definition: &flow_engine::Definition,
+    definition: &flow_domain::Definition,
     parent: &FrozenPolicy,
     parent_run: &str,
     parent_node: &str,
@@ -44,7 +44,7 @@ pub fn freeze_child(
 }
 
 fn freeze(
-    definition: &flow_engine::Definition,
+    definition: &flow_domain::Definition,
     parent: Option<(&FrozenPolicy, &str, &str)>,
     plugin_ceilings: Vec<flow_dto::permission::PluginCeiling>,
 ) -> FrozenPolicy {
@@ -142,9 +142,9 @@ pub(crate) async fn freeze_plugins(
             let installed = plugins
                 .iter()
                 .find(|plugin| plugin.manifest.plugin.node_types.contains(&node_type));
-            let id = match flow_engine::NodeType::parse(&node_type) {
-                Some(flow_engine::NodeType::Llm) => Some("llm"),
-                Some(flow_engine::NodeType::Harness) => agent_plugin_id.as_deref(),
+            let id = match flow_domain::NodeType::parse(&node_type) {
+                Some(flow_domain::NodeType::Llm) => Some("llm"),
+                Some(flow_domain::NodeType::Harness) => agent_plugin_id.as_deref(),
                 _ => installed.map(|plugin| plugin.manifest.plugin.id.as_str()),
             };
             let Some(id) = id else { continue };
@@ -161,7 +161,7 @@ pub(crate) async fn freeze_plugins(
                 .map(|entry| entry.capability.clone())
                 .collect();
             if let Some(plugin) = installed.filter(|plugin| plugin.manifest.plugin.id == id) {
-                if flow_engine::NodeType::parse(&node_type).is_none() {
+                if flow_domain::NodeType::parse(&node_type).is_none() {
                     projections
                         .entry(id.to_owned())
                         .or_insert_with(|| AgentPluginSnapshot {
@@ -212,7 +212,7 @@ pub(crate) async fn freeze_plugins(
                     // 重新授予）。
                     let grant = state
                         .plugin_grants
-                        .get(&flow_engine::journal_state::PluginGrant::key(
+                        .get(&flow_domain::journal_state::PluginGrant::key(
                             plugin_id,
                             &identity.content_hash,
                         ))
@@ -222,7 +222,7 @@ pub(crate) async fn freeze_plugins(
                         // 启动期自动授予，走不到这里）。
                         .or_else(|| {
                             crate::journal_commands::tests_auto_govern().then(|| {
-                                flow_engine::journal_state::PluginGrant {
+                                flow_domain::journal_state::PluginGrant {
                                     plugin_id: identity.plugin_id.clone(),
                                     content_hash: identity.content_hash.clone(),
                                     capabilities: identity
@@ -274,7 +274,7 @@ pub(crate) async fn freeze_plugins(
 }
 
 /// 节点操作对应的插件身份（G3/G5 评估输入；与 freeze 的解析同源）。
-pub fn plugin_id_for_node(node: &flow_engine::Node, run: &Run) -> Option<String> {
+pub fn plugin_id_for_node(node: &flow_domain::Node, run: &Run) -> Option<String> {
     let node_type = node.plugin_type()?;
     if let Some(bindings) = &run.plugin_bindings {
         return bindings
@@ -282,8 +282,8 @@ pub fn plugin_id_for_node(node: &flow_engine::Node, run: &Run) -> Option<String>
             .map(|binding| binding.plugin_id.clone());
     }
     match node.kind() {
-        Some(flow_engine::NodeType::Llm) => Some("llm".into()),
-        Some(flow_engine::NodeType::Harness) => run
+        Some(flow_domain::NodeType::Llm) => Some("llm".into()),
+        Some(flow_domain::NodeType::Harness) => run
             .execution
             .as_ref()?
             .agent_plugin
@@ -353,9 +353,9 @@ pub fn verify_plugin_identity(
 /// 静态派生（host/收件人/model 含 `${}` 的节点不生成能力 → 该节点在
 /// 受管语义下被拒——这类用例需要显式权限）。
 pub fn auto_govern_for_tests(
-    definition: &flow_engine::Definition,
+    definition: &flow_domain::Definition,
     agent: Option<&flow_dto::AgentRunConfig>,
-) -> flow_engine::Definition {
+) -> flow_domain::Definition {
     use flow_dto::permission::{Capability, ResourcePattern, WorkflowPermissions};
     let mut allow: Vec<Capability> = Vec::new();
     let mut push = |pattern: ResourcePattern| {
@@ -370,7 +370,7 @@ pub fn auto_govern_for_tests(
     for node in &definition.nodes {
         let params = &node.params;
         match node.kind() {
-            Some(flow_engine::NodeType::HttpCall) => {
+            Some(flow_domain::NodeType::HttpCall) => {
                 if let Some(url) = params["url"].as_str() {
                     if let Some(prefix) = static_origin(url) {
                         push(ResourcePattern::Net {
@@ -385,7 +385,7 @@ pub fn auto_govern_for_tests(
                     });
                 }
             }
-            Some(flow_engine::NodeType::Email) => {
+            Some(flow_domain::NodeType::Email) => {
                 let endpoint = params["endpoint"]
                     .as_str()
                     .filter(|s| !s.trim().is_empty())
@@ -413,7 +413,7 @@ pub fn auto_govern_for_tests(
                     });
                 }
             }
-            Some(flow_engine::NodeType::Llm) => {
+            Some(flow_domain::NodeType::Llm) => {
                 let provider = params["url"].as_str().filter(|u| !u.contains("${"));
                 let model = params["body"]["model"]
                     .as_str()
@@ -430,7 +430,7 @@ pub fn auto_govern_for_tests(
                     });
                 }
             }
-            Some(flow_engine::NodeType::Harness) if node.is_harness_agent() => {
+            Some(flow_domain::NodeType::Harness) if node.is_harness_agent() => {
                 // agent 的 LlmCall 来自冻结配置（运行期才知道端点/模型/密钥名）。
                 if let Some(agent) = agent.filter(|a| a.enabled()) {
                     push(ResourcePattern::LlmCall {
@@ -445,7 +445,7 @@ pub fn auto_govern_for_tests(
                     }
                 }
             }
-            Some(flow_engine::NodeType::Harness) => {
+            Some(flow_domain::NodeType::Harness) => {
                 let Some(command) = params["command"].as_str() else {
                     continue;
                 };
@@ -513,7 +513,7 @@ pub fn auto_govern_for_tests(
     });
     // 动态（插件声明）类型参与校验：echo 节点不是未知类型。
     let dynamic = crate::plugin_registry::dynamic_node_types();
-    flow_engine::journal_state::validate_definition_with_dynamic(
+    flow_domain::journal_state::validate_definition_with_dynamic(
         &serde_json::to_value(&data).expect("definition serializable"),
         &dynamic,
     )
@@ -536,7 +536,7 @@ fn static_origin(url: &str) -> Option<String> {
 
 /// 定义的权限内容摘要（workflow 层 + 各节点层）；legacy 定义为 None。
 /// 变化即在新版本事务里记 WorkflowPermissionsChanged（谁在何时改了上限）。
-pub fn definition_permissions_digest(definition: &flow_engine::Definition) -> Option<String> {
+pub fn definition_permissions_digest(definition: &flow_domain::Definition) -> Option<String> {
     let workflow = definition.permissions.as_ref()?;
     let nodes: std::collections::BTreeMap<&str, &NodePermissions> = definition
         .nodes
@@ -556,7 +556,7 @@ pub fn definition_permissions_digest(definition: &flow_engine::Definition) -> Op
 /// # Errors
 /// 返回面向用户的拒绝原因（RPC `-32020`）。
 pub fn start_gate(
-    definition: &flow_engine::Definition,
+    definition: &flow_domain::Definition,
     plugin_ceilings: &[flow_dto::permission::PluginCeiling],
     bindings: Option<&BTreeMap<String, PluginBinding>>,
 ) -> Result<(), String> {
@@ -631,13 +631,13 @@ mod tests {
 
     #[test]
     fn bypass_is_inherited_by_child_workflows_and_start_gate_accepts_it() {
-        let definition: flow_engine::Definition = serde_json::from_value(serde_json::json!({
+        let definition: flow_domain::Definition = serde_json::from_value(serde_json::json!({
             "nodes": [], "edges": [], "permissions": {"version":1,"mode":"bypass","allow":[]}
         }))
         .unwrap();
         assert!(start_gate(&definition, &[], None).is_ok());
         let parent = freeze_root(&definition, vec![]);
-        let child: flow_engine::Definition =
+        let child: flow_domain::Definition =
             serde_json::from_value(json!({"nodes": [], "edges": []})).unwrap();
         let frozen = freeze_child(&child, &parent, "parent-run", "node", vec![]);
         assert_eq!(frozen.mode, ExecutionMode::Bypass);

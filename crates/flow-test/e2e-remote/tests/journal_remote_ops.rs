@@ -6,9 +6,9 @@
 
 use flow_agent::runtime::{serve_for_tests, AgentConfig};
 use flow_backend::journal::JournalBackend;
-use flow_engine::execution_protocol::transport::FrameTransport;
-use flow_engine::journal_state::Run;
-use flow_engine::journal_state::RunStatus;
+use flow_dispatcher::execution_protocol::transport::FrameTransport;
+use flow_domain::journal_state::Run;
+use flow_domain::journal_state::RunStatus;
 use flow_journal::JournalOptions;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -19,8 +19,8 @@ fn temp() -> std::path::PathBuf {
 }
 
 /// 独立 flow-executor 二进制（agent 本机执行器池召唤它）。
-fn executor() -> flow_engine::execution_protocol::contract::ExecutorInvocation {
-    flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
+fn executor() -> flow_dispatcher::execution_protocol::contract::ExecutorInvocation {
+    flow_dispatcher::execution_protocol::contract::ExecutorInvocation::explicit(
         flow_test_support::io::executor_bin(),
     )
 }
@@ -69,12 +69,12 @@ async fn spawn_agent(
     let shutdown = tokio_util::sync::CancellationToken::new();
     let agent_id = agent_id.to_string();
     tokio::spawn(async move {
-        use flow_engine::execution_protocol::Message;
+        use flow_dispatcher::execution_protocol::Message;
         let mut transport = FrameTransport::spawn(control_b, 128);
-        let boot = flow_engine::execution_protocol::transport::fresh_boot_id();
+        let boot = flow_dispatcher::execution_protocol::transport::fresh_boot_id();
         if transport
             .send(Message::AgentHello {
-                version: flow_engine::execution_protocol::PROTOCOL_VERSION,
+                version: flow_dispatcher::execution_protocol::PROTOCOL_VERSION,
                 agent_boot_id: boot.clone(),
                 build: "sim".into(),
                 capabilities: vec!["relay".into(), "resource_report".into(), "reconnect".into()],
@@ -96,7 +96,7 @@ async fn spawn_agent(
             }
         };
         let Message::AgentWelcome {
-            version: flow_engine::execution_protocol::PROTOCOL_VERSION,
+            version: flow_dispatcher::execution_protocol::PROTOCOL_VERSION,
             journal_id,
             master_epoch,
             link_session_id,

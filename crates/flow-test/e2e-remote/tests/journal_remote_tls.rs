@@ -4,8 +4,8 @@
 //! 端到端业务（script/HTTP）、过时 v2 帧拒绝、单任务取消不关上联。
 
 use flow_backend::journal::JournalBackend;
-use flow_engine::journal_state::Run;
-use flow_engine::journal_state::RunStatus;
+use flow_domain::journal_state::Run;
+use flow_domain::journal_state::RunStatus;
 use flow_journal::{JournalOptions, StoredValue};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -296,8 +296,8 @@ fn raw_frame(body: &[u8]) -> Vec<u8> {
 async fn unexpected_session_frame_rejected_and_single_cancel_keeps_uplink() {
     // 会话级协议校验：目录外帧必须整会话拒绝（不能静默容忍）。走裸帧注入
     // 而不是 Message 构造：拒绝路径恰恰是 postcard 解码的变体索引越界。
-    use flow_engine::execution_protocol::frame::{encode_frame, FrameDecoder};
-    use flow_engine::execution_protocol::message::Message;
+    use flow_dispatcher::execution_protocol::frame::{encode_frame, FrameDecoder};
+    use flow_dispatcher::execution_protocol::message::Message;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let dir = temp();
     std::fs::create_dir_all(&dir).unwrap();
@@ -315,7 +315,7 @@ async fn unexpected_session_frame_rejected_and_single_cancel_keeps_uplink() {
         .await;
     // AgentHello 裸帧（与 flow-agent 上联同格式）。
     let hello = Message::AgentHello {
-        version: flow_engine::execution_protocol::PROTOCOL_VERSION,
+        version: flow_dispatcher::execution_protocol::PROTOCOL_VERSION,
         agent_boot_id: "boot-bad".into(),
         build: "t".into(),
         capabilities: vec!["relay".into(), "resource_report".into(), "reconnect".into()],
@@ -335,7 +335,7 @@ async fn unexpected_session_frame_rejected_and_single_cancel_keeps_uplink() {
         if let Some(message) = decoder.pop().unwrap() {
             match message {
                 Message::AgentWelcome {
-                    version: flow_engine::execution_protocol::PROTOCOL_VERSION,
+                    version: flow_dispatcher::execution_protocol::PROTOCOL_VERSION,
                     link_session_id,
                     ..
                 } => break link_session_id,
@@ -444,8 +444,8 @@ async fn coalesced_hello_and_trailing_frame_not_lost_by_master() {
     // T02 主进程侧：AgentHello 与尾随过时 DataBind 同一次 write。握手经
     // 统一 transport 收发后，尾随帧必须交付（表现为整会话拒绝关闭）；
     // 若握手用临时 decoder 取首帧后丢弃，尾帧丢失、会话悬挂不关闭。
-    use flow_engine::execution_protocol::frame::encode_frame;
-    use flow_engine::execution_protocol::message::Message;
+    use flow_dispatcher::execution_protocol::frame::encode_frame;
+    use flow_dispatcher::execution_protocol::message::Message;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let dir = temp();
     std::fs::create_dir_all(&dir).unwrap();
@@ -462,7 +462,7 @@ async fn coalesced_hello_and_trailing_frame_not_lost_by_master() {
         .attach_inprocess("agent-coal".to_string(), control_a)
         .await;
     let hello = Message::AgentHello {
-        version: flow_engine::execution_protocol::PROTOCOL_VERSION,
+        version: flow_dispatcher::execution_protocol::PROTOCOL_VERSION,
         agent_boot_id: "boot-coal".into(),
         build: "t".into(),
         capabilities: vec!["relay".into(), "resource_report".into(), "reconnect".into()],
@@ -498,8 +498,8 @@ async fn coalesced_welcome_and_trailing_frame_not_lost_by_agent() {
     // agent 握手经统一 transport 后必须消费尾帧并断开会话；若握手临时
     // decoder 丢弃尾字节，agent 只能干等心跳超时（10s 级），测试在 5 秒
     // 内断言连接关闭即可区分两种实现。
-    use flow_engine::execution_protocol::frame::{encode_frame, FrameDecoder};
-    use flow_engine::execution_protocol::message::Message;
+    use flow_dispatcher::execution_protocol::frame::{encode_frame, FrameDecoder};
+    use flow_dispatcher::execution_protocol::message::Message;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     // 测试进程内安装 rustls provider（与 flow-agent/flow-backend 进程一致）。
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -550,12 +550,12 @@ async fn coalesced_welcome_and_trailing_frame_not_lost_by_agent() {
         }
         // 关键：Welcome + 目录外变体帧拼接后单次写回。
         let welcome = encode_frame(&Message::AgentWelcome {
-            version: flow_engine::execution_protocol::PROTOCOL_VERSION,
+            version: flow_dispatcher::execution_protocol::PROTOCOL_VERSION,
             journal_id: "journal-wc".into(),
             master_epoch: 1,
             link_session_id: "link-wc".into(),
             agent_id: "agent-wc".into(),
-            heartbeat_ms: flow_engine::execution_protocol::HEARTBEAT_INTERVAL_MS,
+            heartbeat_ms: flow_dispatcher::execution_protocol::HEARTBEAT_INTERVAL_MS,
             agent_window_bytes: 8 * 1024 * 1024,
         })
         .unwrap();

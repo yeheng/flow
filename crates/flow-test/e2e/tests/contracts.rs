@@ -6,7 +6,7 @@ use flow_backend::journal::JournalBackend;
 
 use flow_rpc::AppState;
 const TOKEN: &str = "flow-rpc-contract-test-token-32-bytes";
-use flow_engine::journal_state::NodeStatus;
+use flow_domain::journal_state::NodeStatus;
 use serde_json::{json, Value};
 
 struct Fixture {

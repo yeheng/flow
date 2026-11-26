@@ -55,7 +55,7 @@ impl From<PluginSessionError> for AgentPluginError {
 /// 一次回合的上下文：调用方只组一个结构，不散参数。
 pub(super) struct TurnRequest<'a> {
     pub(super) plugin: &'a RegisteredPlugin,
-    pub(super) config: &'a flow_engine::AgentRunConfig,
+    pub(super) config: &'a flow_dto::AgentRunConfig,
     pub(super) prompt: &'a str,
     pub(super) api_key: &'a str,
     pub(super) workdir: &'a std::path::Path,

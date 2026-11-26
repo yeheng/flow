@@ -8,14 +8,14 @@
 //!    回归仍匹配（0 provider 调用）。
 
 use flow_backend::journal::JournalBackend;
-use flow_engine::journal_state::{Run, RunStatus};
+use flow_domain::journal_state::{Run, RunStatus};
 use flow_test_support::provider::{spawn_mock_openai, MockProvider, Turn};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
 
-fn agent_config(base_url: &str) -> flow_engine::AgentRunConfig {
-    flow_engine::AgentRunConfig {
+fn agent_config(base_url: &str) -> flow_dto::AgentRunConfig {
+    flow_dto::AgentRunConfig {
         base_url: base_url.into(),
         model: "lifecycle-model".into(),
         api: "openai".into(),
@@ -50,7 +50,7 @@ fn definition(prompt: &str, with_workdir: bool) -> Value {
 
 async fn fresh_backend(
     dir: &std::path::Path,
-    config: Option<flow_engine::AgentRunConfig>,
+    config: Option<flow_dto::AgentRunConfig>,
 ) -> Arc<JournalBackend> {
     let backend: Arc<JournalBackend> = JournalBackend::open(dir, Default::default()).await.unwrap();
     backend.install_harness_agent(config).unwrap();
@@ -58,9 +58,10 @@ async fn fresh_backend(
     backend
         .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
             flow_backend::execution::IpcOptions {
-                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
-                    flow_test_support::io::executor_bin(),
-                ),
+                executor:
+                    flow_dispatcher::execution_protocol::contract::ExecutorInvocation::explicit(
+                        flow_test_support::io::executor_bin(),
+                    ),
                 x_max: 2,
                 tag: None,
             },

@@ -4,7 +4,7 @@
 >
 > 工作流定义是**可执行代码**——它能让引擎发出 HTTP、跑命令、发邮件、调模型。因此定义里除了图和参数，还必须声明**权限块**（"这个工作流允许做什么"）：含副作用节点却没有权限块的定义是 legacy，保存能过但 `run.start` 会被拒（`-32020`）。这是本文的第一前提，不是可选项。
 >
-> 所有规则均来自代码事实：`crates/flow-engine/src/model.rs`（定义模型与校验）、`crates/flow-dto/src/permission.rs`（权限块闭集解析）、`crates/flow-backend/src/policy.rs`（权限判定与启动门）、`crates/flow-internal-plugins/src/script.rs`（JS 沙箱与 `${}` 模板展开）、`crates/flow-cli/src/workflow.rs`（导入导出）。示例中的每一份定义都经过引擎 `Definition::validate` 实测通过。
+> 所有规则均来自代码事实：`crates/flow-domain/src/model.rs`（定义模型与校验）、`crates/flow-dto/src/permission.rs`（权限块闭集解析）、`crates/flow-backend/src/policy.rs`（权限判定与启动门）、`crates/flow-internal-plugins/src/script.rs`（JS 沙箱与 `${}` 模板展开）、`crates/flow-cli/src/workflow.rs`（导入导出）。示例中的每一份定义都经过引擎 `Definition::validate` 实测通过。
 
 ## 快速开始
 
@@ -489,8 +489,8 @@ export FLOW_SECRET_RESEND_KEY="re_xxxxx"      # 环境变量来源
 导入前想快速验证定义合法性，可直接跑引擎的校验器（不需要启动服务）：
 
 ```sh
-cargo run -q -p flow-engine --example validate_def -- my-flow.workflow.json
-cat my-flow.workflow.json | cargo run -q -p flow-engine --example validate_def
+cargo run -q -p flow-domain --example validate_def -- my-flow.workflow.json
+cat my-flow.workflow.json | cargo run -q -p flow-domain --example validate_def
 # OK: 定义通过校验（7 节点 / 7 边）
 # 校验失败：工作流存在环，必须是 DAG
 ```
@@ -538,13 +538,13 @@ cat my-flow.workflow.json | cargo run -q -p flow-engine --example validate_def
 
 | 路径 | 内容 |
 | --- | --- |
-| `crates/flow-engine/src/model.rs` | 节点类型表、params schema、建图校验规则的单一来源 |
+| `crates/flow-domain/src/model.rs` | 节点类型表、params schema、建图校验规则的单一来源 |
 | `crates/flow-dto/src/permission.rs` | 权限块闭集解析：动作、能力匹配（workflow/node 层禁用族级 `any`） |
 | `crates/flow-backend/src/policy.rs` | 权限判定（层间 AND、层内 OR）与 run 启动门（legacy 拒绝） |
 | `crates/flow-internal-plugins/src/script.rs` | QuickJS 沙箱边界与 `${}` 模板展开 |
-| `crates/flow-engine/src/template.rs` | 画布片段（template.create/update）的校验与归一化 |
+| `crates/flow-domain/src/template.rs` | 画布片段（template.create/update）的校验与归一化 |
 | `crates/flow-cli/src/workflow.rs` | 导入导出（name 解析 + 调用服务端 `workflow.import`） |
-| `crates/flow-engine/examples/validate_def.rs` | 离线定义校验器 |
+| `crates/flow-domain/examples/validate_def.rs` | 离线定义校验器 |
 | `examples/github-trending.workflow.json` | 完整可运行示例（并行 HTTP + 脚本解析 + harness agent 策展推荐，含权限块） |
 | `examples/build-github-trending.py` | 上述示例的生成脚本（改这里而非手改 JSON） |
 | `examples/run-workflow.mjs` | 无依赖的 RPC 导入 + 运行 + 落盘示例 |

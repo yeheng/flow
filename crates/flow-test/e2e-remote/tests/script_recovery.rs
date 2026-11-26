@@ -13,10 +13,8 @@ use flow_backend::{
     execution::{dispatch::fault, ExecutionMode, IpcOptions},
     journal::JournalBackend,
 };
-use flow_engine::{
-    execution_protocol::ExecutorInvocation,
-    journal_state::{NodeStatus, Run, RunStatus},
-};
+use flow_dispatcher::execution_protocol::ExecutorInvocation;
+use flow_domain::journal_state::{NodeStatus, Run, RunStatus};
 use flow_journal::{EventKind, JournalOptions};
 use flow_test_support::io::LocalDeployment;
 use serde_json::json;

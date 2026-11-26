@@ -18,7 +18,7 @@ use std::sync::{Arc, OnceLock};
 
 use serde_json::Value;
 
-use crate::model::{Definition, Node};
+use flow_domain::{Definition, Node};
 
 /// 密钥环境变量前缀。名称 `OPENAI_KEY` ↔ 环境变量 `FLOW_SECRET_OPENAI_KEY`。
 pub const SECRET_ENV_PREFIX: &str = "FLOW_SECRET_";

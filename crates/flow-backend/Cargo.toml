@@ -10,6 +10,9 @@ default = []
 fault-injection = []
 
 [dependencies]
+flow-facts = { path = "../flow-facts" }
+aes-gcm = "0.10"
+flow-domain = { path = "../flow-domain" }
 flow-application = { path = "../flow-application" }
 flow-plugin-catalog = { path = "../flow-plugin-catalog" }
 flow-dispatcher = { path = "../flow-dispatcher" }
@@ -38,7 +41,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 postcard = { workspace = true }
-chrono = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 fs2 = { workspace = true }

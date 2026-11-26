@@ -179,7 +179,8 @@ impl UndoLog {
             EventKind::Command => {
                 let c: CommandRecord = serde_json::from_value(p.clone())?;
                 // 调度类命令还会推进该槽位的触发水位，水位也要能回滚。
-                if let Some(key) = c.scope.strip_prefix("run.start:schedule:") {
+                if let Some(scope) = flow_facts::command::ScheduleScope::parse(&c.scope) {
+                    let key = scope.key();
                     self.0.push(Undo::Fire(
                         key.into(),
                         state.schedule_fires.get(key).cloned(),

@@ -47,7 +47,7 @@
 
 ### 3.3 State：唯一领域转移规则
 
-`flow-engine/src/journal_state.rs` 的 `State::apply(&Transaction)` 是**唯一**的状态
+`flow-domain/src/journal_state.rs` 的 `State::apply(&Transaction)` 是**唯一**的状态
 转移函数。提交前用同一规则预演并生成当前实体变更，预演始终撤销；COMMIT 后才更新内存。
 启动加载当前实体，正常启动不重放事实账本。离线事实核验仍可以使用 reducer。
 

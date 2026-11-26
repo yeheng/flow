@@ -20,7 +20,7 @@ pub(crate) mod ports;
 pub mod remote;
 mod workflow_task;
 
-use flow_engine::execution_protocol::contract::{
+use flow_dispatcher::execution_protocol::contract::{
     ExecutorInvocation, EXECUTION_MODE_ENV, X_MAX_DEFAULT,
 };
 

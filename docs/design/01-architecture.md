@@ -25,19 +25,22 @@ flow 是一个**工作流执行引擎**：发布不可变的流程定义（DAG�
 
 ```
 crates/
-  flow-dto        领域 DTO 与状态词汇表（零依赖叶子）：RunRecord / WorkflowSummary / …
+  flow-dto        领域 DTO 与状态词汇表（无工作区依赖）：RunRecord / WorkflowSummary / …
   flow-config     统一配置（flow.toml，叶子 crate）：分层加载 + validate + 原子写回
   flow-journal    SQLite 写入 owner、事实分页、codec 预算、BLOB 值存储、离线维护;
                   query feature 承接同库只读执行与产品查询(原 flow-store 并入)
   flow-facts      事件、事务、值描述符及有界编码契约
   flow-domain     工作流定义、图规则、schema 校验与确定性状态折叠
+  flow-policy     冻结策略、请求、授权及显式时间的权限裁决
   flow-application  托管运行的原子提交、状态发布与待调度集合，定义写入端口
+  flow-workflow   独立内存工作流，默认特性装配 IPC Worker
   flow-dispatcher  IPC 协议、进程池与通用任务派发（v8 postcard 单流）
-  flow-engine     工作流运行共享设施：观测日志、密钥，并重导出领域规则与 IPC 契约
+  flow-engine     节点执行共享库：日志、错误与超时常量
   flow-backend    journal 唯一权威后端：journal.rs（JournalBackend）+ journal_commands
                   （产品 CRUD，request_id 幂等）+ journal_views（物化读面）+
                   journal_driver（协调循环）+ journal_execution（Attempt 簿记）+
-                  journal_import（legacy 只读保全）+ execution/（工作流派发适配与远程中继）
+                  journal_import（legacy 只读保全）+ execution/（派发适配与远程中继）;
+                  持有观测日志、环境和密钥存储
   flow-plugin-catalog  后端与 Worker 共用的 manifest 发现、诊断、节点归属与内容身份
   flow-plugin-sdk 插件 SDK：protocol（wire 契约）+ ipc（传输）单向分层;
                   跨语言契约本体是 docs/protocol/wire.md + vectors
@@ -47,6 +50,7 @@ crates/
   flow-agent      受信任远程执行中继（单条 mTLS/WSS 上联 + 本机执行器池）
   flow-rpc        jsonrpsee WebSocket 服务：journal_v2（产品 RPC 面）+
                   journal_triggers（cron + webhook HTTP）+ journal_download（值下载）
+  flow-rpc-contract  RPC 方法目录、读写分类与客户端回执查询键
   flow-cli        命令行客户端（纯 RPC，不碰存储）
 
 crates/flow-test/ 测试归组：test-support（共享基建）/ e2e（单机端到端，真起进程）/
@@ -80,24 +84,23 @@ plugins/harness/  harness agent 运行时（protocol / agent-core / agent-host /
 依赖方向（与 Cargo.toml 对齐的现状）：
 
 ```
-flow-rpc ──> flow-backend / flow-config / flow-dto / flow-engine / flow-facts
+flow-rpc ──> flow-backend / flow-config / flow-domain / flow-dto / flow-facts / flow-rpc-contract
 flow-application ──> flow-domain / flow-facts
 flow-backend ──> flow-dispatcher / flow-journal / flow-engine / flow-dto / flow-config / flow-policy
-              └─> flow-application / flow-plugin-catalog / flow-plugin-sdk
-flow-engine ──> flow-domain / flow-dto / flow-dispatcher
-             └─> flow-journal（runtime 下的观测写入）
+              └─> flow-application / flow-domain / flow-facts / flow-plugin-catalog / flow-plugin-sdk
+flow-engine ──> 无工作区依赖
 flow-dispatcher ──> flow-facts
 flow-workflow ──> flow-domain / flow-facts（默认 ipc feature 另外启用 flow-dispatcher）
 flow-domain ──> flow-facts / flow-dto
 flow-policy ──> flow-dto
 flow-journal ──> flow-facts
 flow-facts ──> 无 flow 依赖（叶子）
-flow-dto ──> 无依赖（叶子）
+flow-dto / flow-rpc-contract ──> 无工作区依赖
 flow-plugin-catalog ──> flow-config / flow-domain / flow-plugin-sdk
-flow-plugin-runtime ──> flow-engine（node-execution）/ flow-facts / flow-internal-plugins
+flow-plugin-runtime ──> flow-domain / flow-dispatcher / flow-dto / flow-engine / flow-facts / flow-internal-plugins
                     └─> flow-plugin-catalog / flow-plugin-sdk / flow-config / flow-harness-protocol（plugins feature）
 flow-agent ──> flow-dispatcher / flow-config
-flow-cli ──> flow-dto（自带 jsonrpsee/reqwest WS 客户端，运行期连 flow-journal-server，
+flow-cli ──> flow-dto / flow-rpc-contract（自带 jsonrpsee/reqwest WS 客户端，运行期连 flow-journal-server，
             但不依赖任何服务 crate）
 flow-cli ──✗> flow-journal  ✗（CLI 不碰存储与事件日志，没有第二条写入路径）
 flow-e2e-remote ──> flow-agent   （flow-agent 只被 remote-e2e 套件依赖；backend 不依赖它）
@@ -114,7 +117,7 @@ SQLite 和磁盘读写由 `flow-journal` 提供。工作流
 提交端口保证事实、投影和暂存正文原子写入，应用层在落盘后发布状态。
 远程派发先预留兼容容量，再提交本次尝试；预留随租约释放。
 恢复已提交的工作流时按冻结定义解释节点类型，Worker 路由继续核对冻结的插件身份。
-分页、订阅续读和下载解析由 `journal_views` 读取已提交快照，RPC 负责鉴权和传输。
+分页、订阅续读、观测日志读取和下载解析归 `journal_views`，RPC 负责鉴权和传输。
 `flow-workflow` 关闭默认 feature 后可以用替身执行器验证应用逻辑。
 
 独立任务只携带 `id`、带版本的 `handler` 和有界字节输入。Worker 握手广告
@@ -161,7 +164,8 @@ cargo test --workspace --all-targets --locked --no-fail-fast
 ```
 
 工作区回归包含本机 IPC、RPC、模拟服务和进程故障用例。CI 另行验证领域与
-Dispatcher 的隔离构建，避免工作区合并 features 掩盖反向依赖。
+Dispatcher 的隔离构建，避免工作区合并 features 掩盖反向依赖。核心 crate 分别检查
+正常和构建依赖的传递闭包，且关闭 Chrono 的取时特性。
 
 #### 分层目标与独立运行
 

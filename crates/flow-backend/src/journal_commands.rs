@@ -8,7 +8,7 @@
 //! 需要它，是因为产品面的重试、传输失败与并发重复都必须收敛到同一条
 //! 命令身份上——否则一次重发就可能变成两次业务副作用。
 use crate::journal::{CommandReceipt, JournalBackend, JournalError};
-use flow_engine::journal_state::{DefinitionVersion, Run, RunStatus, State, WaitKind, Workflow};
+use flow_domain::journal_state::{DefinitionVersion, Run, RunStatus, State, WaitKind, Workflow};
 use flow_journal::{Event, EventKind};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -58,7 +58,7 @@ fn validate_workflow_name(name: &str) -> flow_journal::Result<()> {
 /// 的规则会在不同入口上产生分歧。
 struct PreparedDefinition {
     value: Value,
-    parsed: flow_engine::Definition,
+    parsed: flow_domain::Definition,
     checksum: String,
     /// 权限内容摘要（legacy = None）：与上一版本不同则记 WorkflowPermissionsChanged。
     permissions_digest: Option<String>,
@@ -75,14 +75,14 @@ impl PreparedDefinition {
         let snapshot = crate::plugin_registry::installed_snapshot_with_defaults(&defaults);
         let dynamic_types = snapshot.dynamic_types();
         let parsed =
-            flow_engine::journal_state::validate_definition_with_dynamic(&value, &dynamic_types)?;
+            flow_domain::journal_state::validate_definition_with_dynamic(&value, &dynamic_types)?;
         if !dynamic_types.is_empty() {
             let forms = snapshot.forms();
             // validate_definition_with_dynamic 已反序列化过；这里直接
             // 按最小形状遍历节点（不重复建 Definition）。
             let nodes = value["nodes"].as_array().cloned().unwrap_or_default();
             for node_value in nodes {
-                let node: flow_engine::Node = serde_json::from_value(node_value)
+                let node: flow_domain::Node = serde_json::from_value(node_value)
                     .map_err(|e| flow_journal::Error::Invalid(format!("节点结构不符：{e}")))?;
                 if dynamic_types.contains(&node.node_type) {
                     crate::plugin_registry::validate_dynamic_params(&node, &forms)
@@ -126,7 +126,7 @@ impl PreparedDefinition {
 
     /// 列出定义里引用但当前环境未提供的密钥（节点 ID + 密钥名）。
     fn missing_secrets(&self) -> Vec<(String, String)> {
-        flow_engine::secrets::missing_secrets(&self.parsed)
+        crate::secrets::missing_secrets(&self.parsed)
     }
 
     /// 缺密钥时拒绝保存：定义引用的密钥必须在保存时就能被解析，
@@ -448,7 +448,7 @@ impl JournalBackend {
         let workflow = config["workflow_id"]
             .as_str()
             .ok_or_else(|| invalid("workflow_id required"))?;
-        let scope = format!("run.start:webhook:invocation:{hook}");
+        let scope = flow_facts::command::run_start_scope("webhook", hook, true);
         // 重试时沿用原回执里的版本：调用方重试的是同一次业务调用，
         // 不该因为期间发布了新版本而换掉执行语义。
         let version = if let Some(receipt) = self.command_status(&scope, request_id).await? {
@@ -538,7 +538,10 @@ impl JournalBackend {
         }
         // A retry remains attached even if the operator subsequently edits/deletes the trigger.
         if let Some(receipt) = self
-            .command_status(&format!("run.start:{source}:{key}"), request_id)
+            .command_status(
+                &flow_facts::command::run_start_scope(source, key, false),
+                request_id,
+            )
             .await?
         {
             let run_id = receipt.result["run_id"]
@@ -630,7 +633,7 @@ impl JournalBackend {
         decision: &str,
         request_id: &str,
     ) -> Result<CommandReceipt> {
-        flow_engine::journal_state::validate_adjudication(decision, reason)?;
+        flow_domain::journal_state::validate_adjudication(decision, reason)?;
         let request = json!({"run_id":run_id,"node_id":node_id,"operation_id":operation_id,"reason":reason,"output":output,"decision":decision});
         if let Some(receipt) = deduped(
             self,
@@ -651,7 +654,7 @@ impl JournalBackend {
                 .nodes
                 .get(node_id)
                 .ok_or_else(|| invalid("node not found"))?;
-            flow_engine::journal_state::adjudicate_guard(
+            flow_domain::journal_state::adjudicate_guard(
                 run.terminal(),
                 node,
                 operation_id,
@@ -729,8 +732,10 @@ impl JournalBackend {
     ) -> Result<CommandReceipt> {
         validate_workflow_name(name)?;
         let defaults = self.plugin_defaults();
-        let prepared = tokio::task::spawn_blocking(move || PreparedDefinition::new(definition, defaults))
-            .await.map_err(|error| JournalError::Storage(format!("definition worker: {error}")))??;
+        let prepared =
+            tokio::task::spawn_blocking(move || PreparedDefinition::new(definition, defaults))
+                .await
+                .map_err(|error| JournalError::Storage(format!("definition worker: {error}")))??;
         let request = json!({"name":name,"definition":prepared.value,"publish":publish});
         // 元数据写锁：定义写入与依赖冻结必须互斥，否则冻结可能读到
         // 半更新的元数据视图。
@@ -866,8 +871,10 @@ impl JournalBackend {
         actor: Option<&WriteActor<'_>>,
     ) -> Result<CommandReceipt> {
         let defaults = self.plugin_defaults();
-        let prepared = tokio::task::spawn_blocking(move || PreparedDefinition::new(definition, defaults))
-            .await.map_err(|error| JournalError::Storage(format!("definition worker: {error}")))??;
+        let prepared =
+            tokio::task::spawn_blocking(move || PreparedDefinition::new(definition, defaults))
+                .await
+                .map_err(|error| JournalError::Storage(format!("definition worker: {error}")))??;
         let fingerprint_request = json!({"workflow_id":workflow_id,"definition":prepared.value});
         let _metadata = self.workflow_metadata.write().await;
         if let Some(receipt) =
@@ -1077,7 +1084,7 @@ impl JournalBackend {
         source: &str,
         source_detail: Option<&str>,
         request_id: Option<&str>,
-        regression: Option<flow_engine::journal_state::ExecutionSnapshot>,
+        regression: Option<flow_domain::journal_state::ExecutionSnapshot>,
         correlation_id: Option<&str>,
         invocation_key_hash: Option<&str>,
         environment_id: Option<&str>,
@@ -1103,16 +1110,10 @@ impl JournalBackend {
         if let Some(hash) = invocation_key_hash {
             request["invocation_key_hash"] = json!(hash);
         }
-        let scope = format!(
-            "run.start:{source}:{}{}",
-            // 业务调用额外加一段前缀：它的幂等身份来自业务密钥，
-            // 与后台触发器不能共用同一个 scope 空间。
-            if correlation_id.is_some() {
-                "invocation:"
-            } else {
-                ""
-            },
-            source_detail.unwrap_or("")
+        let scope = flow_facts::command::run_start_scope(
+            source,
+            source_detail.unwrap_or(""),
+            correlation_id.is_some(),
         );
         if let Some(receipt) = deduped(self, &scope, request_id, &request).await? {
             return Ok(receipt);
@@ -1136,7 +1137,7 @@ impl JournalBackend {
                     crate::plugin_config::harness_agent_plugin(&config).map_err(|e| invalid(&e))?;
                 snapshot.agent = installed.as_ref().map(|p| p.run_config.clone());
                 snapshot.agent_plugin =
-                    installed.map(|p| flow_engine::journal_state::AgentPluginSnapshot {
+                    installed.map(|p| flow_domain::journal_state::AgentPluginSnapshot {
                         id: p.plugin_id,
                         version: p.version,
                         ui: p.ui,
@@ -1181,7 +1182,7 @@ impl JournalBackend {
             .as_ref()
             .is_none_or(|snapshot| snapshot.agent.is_none())
             && definition.nodes.iter().any(|node| {
-                node.kind() == Some(flow_engine::NodeType::Harness)
+                node.kind() == Some(flow_domain::NodeType::Harness)
                     && node
                         .param_str("mode")
                         .is_some_and(|mode| mode.trim() == "agent")
@@ -1491,7 +1492,7 @@ impl JournalBackend {
         let accepts_inbox = definition.node_type(node_id).is_some_and(|k| {
             matches!(
                 k,
-                flow_engine::NodeType::HumanTask | flow_engine::NodeType::Input
+                flow_domain::NodeType::HumanTask | flow_domain::NodeType::Input
             )
         });
         if expected_dispatch.is_some() && !accepts_inbox {
@@ -2007,7 +2008,7 @@ fn template_event(
     value["id"] = json!(key);
     if value["deleted"] != true {
         // 先归一化再校验：片段合并后必须是完整合法的模板。
-        flow_engine::template::normalize(&mut value)?;
+        flow_domain::template::normalize(&mut value)?;
         // name 唯一（UI 以名为键）：撞别的模板即拒绝，不静默改名。
         if state
             .templates
@@ -2031,12 +2032,12 @@ fn template_event(
 /// 输入合同在派发前校验：不合法的输入若等到执行期才失败，会留下一条
 /// 已经消耗掉外部资源的失败记录。
 pub(crate) fn validate_run_input(
-    definition: &flow_engine::Definition,
+    definition: &flow_domain::Definition,
     input: &Value,
 ) -> flow_journal::Result<()> {
     if let Some(schema) = &definition.input_schema {
         flow_journal::codec::bounded_json(input, flow_journal::VALUE_BUDGET)?;
-        flow_engine::schema::validate(schema, input)
+        flow_domain::schema::validate(schema, input)
             .map_err(|e| invalid(format!("input contract: {e}")))?;
     }
     Ok(())
@@ -2051,7 +2052,7 @@ pub(crate) fn runtime_mismatched(run: &Run) -> bool {
         && run
             .execution
             .as_ref()
-            .is_some_and(|e| e.runtime != flow_engine::RUNTIME_ID)
+            .is_some_and(|e| e.runtime != flow_dispatcher::execution_protocol::contract::RUNTIME_ID)
 }
 
 /// 要求配置行是 JSON 对象（配置一律按字段合并，非对象无法安全合并）。
@@ -2098,9 +2099,9 @@ fn signal_decision(
             || run.nodes.get(node_id).is_some_and(|n| {
                 matches!(
                     n.status,
-                    flow_engine::journal_state::NodeStatus::Succeeded
-                        | flow_engine::journal_state::NodeStatus::Failed
-                        | flow_engine::journal_state::NodeStatus::Skipped
+                    flow_domain::journal_state::NodeStatus::Succeeded
+                        | flow_domain::journal_state::NodeStatus::Failed
+                        | flow_domain::journal_state::NodeStatus::Skipped
                 )
             })
         {
@@ -2149,7 +2150,7 @@ fn signal_decision(
             "succeeded" => ("accept_output", "manual acceptance via run.signal"),
             _ => return Err(invalid("action must be succeeded | failed | retry")),
         };
-        flow_engine::journal_state::adjudicate_guard(
+        flow_domain::journal_state::adjudicate_guard(
             run.terminal(),
             node,
             &operation.operation_id,
@@ -2254,14 +2255,16 @@ mod runtime_mismatch_tests {
     fn runtime_mismatch_targets_only_stale_non_terminal_runs() {
         // 历史构建指纹不自动升级为执行兼容版本。
         let stale = "0".repeat(64);
-        let stale = if stale == flow_engine::RUNTIME_ID {
+        let stale = if stale == flow_dispatcher::execution_protocol::contract::RUNTIME_ID {
             "1".repeat(64)
         } else {
             stale
         };
         assert!(runtime_mismatched(&waiting_run(&stale)));
         // 当前 runtime 的在途 run 不隔离
-        assert!(!runtime_mismatched(&waiting_run(flow_engine::RUNTIME_ID)));
+        assert!(!runtime_mismatched(&waiting_run(
+            flow_dispatcher::execution_protocol::contract::RUNTIME_ID
+        )));
         // 终态（failed）的陈旧 run 不隔离
         let mut failed = waiting_run(&stale);
         failed.status = RunStatus::Failed;
@@ -2352,7 +2355,7 @@ mod environment_tests {
             .await
             .unwrap();
         let store = std::sync::Arc::new(
-            flow_engine::environments::EnvironmentStore::open(&dir.path().join("env")).unwrap(),
+            crate::environments::EnvironmentStore::open(&dir.path().join("env")).unwrap(),
         );
         assert!(b.environments.set(store.clone()).is_ok());
         store

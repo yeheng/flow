@@ -1,5 +1,5 @@
 use super::{internal, JournalBackend, Result};
-use flow_engine::journal_state::Run;
+use flow_domain::journal_state::Run;
 use flow_journal::{StoredValue, ValueRef};
 use std::io::Write;
 use tokio::sync::{mpsc, OwnedSemaphorePermit};

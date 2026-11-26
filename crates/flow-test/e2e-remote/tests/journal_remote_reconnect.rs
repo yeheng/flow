@@ -5,9 +5,9 @@
 
 use flow_agent::runtime::{serve_for_tests, AgentConfig};
 use flow_backend::journal::JournalBackend;
-use flow_engine::execution_protocol::{transport::FrameTransport, Message};
-use flow_engine::journal_state::Run;
-use flow_engine::journal_state::RunStatus;
+use flow_dispatcher::execution_protocol::{transport::FrameTransport, Message};
+use flow_domain::journal_state::Run;
+use flow_domain::journal_state::RunStatus;
 use flow_journal::{JournalOptions, StoredValue};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -18,8 +18,8 @@ fn temp() -> std::path::PathBuf {
 }
 
 /// 独立 flow-executor 二进制（agent 本机执行器池召唤它）。
-fn executor() -> flow_engine::execution_protocol::contract::ExecutorInvocation {
-    flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
+fn executor() -> flow_dispatcher::execution_protocol::contract::ExecutorInvocation {
+    flow_dispatcher::execution_protocol::contract::ExecutorInvocation::explicit(
         flow_test_support::io::executor_bin(),
     )
 }
@@ -98,10 +98,10 @@ fn start_agent_on(
     tokio::spawn(async move {
         // 首连握手（与 R0 相同序列；v4 单流无 DataBind）。
         let mut transport = FrameTransport::spawn(stream, 128);
-        let boot = flow_engine::execution_protocol::transport::fresh_boot_id();
+        let boot = flow_dispatcher::execution_protocol::transport::fresh_boot_id();
         transport
             .send(Message::AgentHello {
-                version: flow_engine::execution_protocol::PROTOCOL_VERSION,
+                version: flow_dispatcher::execution_protocol::PROTOCOL_VERSION,
                 agent_boot_id: boot.clone(),
                 build: "sim".into(),
                 capabilities: vec!["relay".into(), "resource_report".into(), "reconnect".into()],
@@ -116,7 +116,7 @@ fn start_agent_on(
             }
         };
         let Message::AgentWelcome {
-            version: flow_engine::execution_protocol::PROTOCOL_VERSION,
+            version: flow_dispatcher::execution_protocol::PROTOCOL_VERSION,
             journal_id,
             master_epoch,
             link_session_id,
@@ -249,7 +249,7 @@ async fn uplink_drop_then_reconnect_resumes_without_double_execution() {
     let handles_reconnect = handles.clone();
     tokio::spawn(async move {
         let transport = FrameTransport::spawn(stream, 128);
-        let boot = flow_engine::execution_protocol::transport::fresh_boot_id();
+        let boot = flow_dispatcher::execution_protocol::transport::fresh_boot_id();
         let (_link, reason) = flow_agent::runtime::reconnect_session(
             &config,
             transport,
@@ -330,7 +330,7 @@ async fn cancel_during_disconnect_drains_after_resume() {
     let handles_reconnect = handles.clone();
     tokio::spawn(async move {
         let transport = FrameTransport::spawn(stream, 128);
-        let boot = flow_engine::execution_protocol::transport::fresh_boot_id();
+        let boot = flow_dispatcher::execution_protocol::transport::fresh_boot_id();
         let (link, reason) = flow_agent::runtime::reconnect_session(
             &config,
             transport,
@@ -441,8 +441,8 @@ enum ToolDisconnect {
 #[cfg(unix)]
 async fn tool_disconnect(scenario: ToolDisconnect) {
     use flow_backend::journal_permissions::ApprovalCommand;
+    use flow_domain::journal_state::ApprovalStatus;
     use flow_dto::permission::{ApprovalScope, Principal};
-    use flow_engine::journal_state::ApprovalStatus;
     use flow_test_support::provider::{spawn_mock_openai, Turn};
 
     init_tracing();
@@ -609,7 +609,7 @@ async fn tool_disconnect(scenario: ToolDisconnect) {
     let reconnect_handles = handles.clone();
     let reconnect_shutdown = shutdown.clone();
     let reconnected = tokio::spawn(async move {
-        let boot = flow_engine::execution_protocol::transport::fresh_boot_id();
+        let boot = flow_dispatcher::execution_protocol::transport::fresh_boot_id();
         flow_agent::runtime::reconnect_session(
             &agent_config(),
             FrameTransport::spawn(stream, 128),

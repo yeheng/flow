@@ -6,13 +6,18 @@
 //! 需要它，是因为节点语义必须待在受管理的执行器子进程里（DESIGN C2），
 //! 而权威状态又必须只有一份（DESIGN C1）；协调器正是这两者之间唯一的裁决面，
 //! 任何绕过它的写入都会撕裂「事实 → 状态」的对应关系。
+pub use flow_domain::{Definition, NodeType, HTTP_METHODS};
 pub use flow_dto::{RunSource, RunStatus};
-pub use flow_engine::{redact_value, secrets, Definition, NodeType, HTTP_METHODS};
+pub use flow_engine::redact_value;
+pub mod environments;
 pub mod execution;
 pub mod journal;
 mod journal_commands;
+pub mod observation;
 pub mod plugin_config;
 pub mod plugin_registry;
+pub mod secrets;
+pub mod secrets_store;
 pub use journal_commands::{ProductCommand, WriteActor};
 pub mod bundle;
 mod execution_snapshot;
@@ -53,14 +58,19 @@ pub struct PreparedExecution {
 
 enum PreparedPort {
     Ipc(execution::IpcOptions, bool),
-    Remote(execution::remote::RemoteOptions, execution::remote::RemoteListeners),
+    Remote(
+        execution::remote::RemoteOptions,
+        execution::remote::RemoteListeners,
+    ),
 }
 
 impl PreparedExecution {
     /// Activate dispatch and recovery after the caller has accepted its work.
     pub async fn start(self) -> Result<(), journal::JournalError> {
         match self.port {
-            PreparedPort::Ipc(options, prewarm) => self.backend.activate_ipc(options, prewarm).await,
+            PreparedPort::Ipc(options, prewarm) => {
+                self.backend.activate_ipc(options, prewarm).await
+            }
             PreparedPort::Remote(options, listeners) => {
                 self.backend.activate_remote(options, listeners).await
             }

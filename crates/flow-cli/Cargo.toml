@@ -23,6 +23,7 @@ name = "flow_cli"
 path = "src/lib.rs"
 
 [dependencies]
+flow-rpc-contract = { path = "../flow-rpc/contract" }
 flow-dto = { path = "../flow-dto" }
 uuid = { workspace = true }
 tokio = { workspace = true }
@@ -31,7 +32,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 jsonrpsee = { workspace = true }
-chrono = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
 reqwest.workspace = true
 
 # 无 dev-dependencies：原 tests/（CLI 子进程往返）已并入 backend-e2e 套件；

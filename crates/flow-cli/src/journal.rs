@@ -147,7 +147,7 @@ pub(crate) async fn call(
             message: e.message().into(),
         }),
         Err(e) if crate::client::is_write_method(method) => {
-            let identity = json!({"scope":flow_dto::command_scope(method, &params), "request_id":params["request_id"]});
+            let identity = json!({"scope":flow_rpc_contract::command_scope(method, &params), "request_id":params["request_id"]});
             let recovery = if matches!(method, "plugins.install" | "plugins.uninstall") {
                 "使用同一 request_id 与原参数重试；插件操作回执存于宿主插件目录，不通过 command.status 查询。"
             } else if matches!(method, "config.update" | "secrets.set" | "secrets.delete") {

@@ -21,10 +21,10 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use flow_engine::execution_protocol::contract::{
+use flow_dispatcher::execution_protocol::contract::{
     OBSERVABILITY_BATCH_BYTES, OBSERVABILITY_BATCH_LINES,
 };
-use flow_engine::execution_protocol::message::{Message, ObservationLine};
+use flow_dispatcher::execution_protocol::message::{Message, ObservationLine};
 use flow_engine::log_types::{LogLevel, LogStream};
 use flow_engine::nodelog::{LogLine, NodeLogger};
 
@@ -282,14 +282,14 @@ mod tests {
             let Message::ObservabilityBatch { lines, .. } = message else {
                 continue;
             };
-            let frame = flow_engine::execution_protocol::frame::encode_frame(
+            let frame = flow_dispatcher::execution_protocol::frame::encode_frame(
                 &Message::ObservabilityBatch {
                     dispatch_id: Some("dispatch-test".into()),
                     lines,
                 },
             )
             .expect("observability batch must encode within DATA_MAX_FRAME");
-            assert!(frame.len() <= flow_engine::execution_protocol::DATA_MAX_FRAME);
+            assert!(frame.len() <= flow_dispatcher::execution_protocol::DATA_MAX_FRAME);
             encoded_batches += 1;
         }
         assert!(encoded_batches > 0, "至少应有一批送达");

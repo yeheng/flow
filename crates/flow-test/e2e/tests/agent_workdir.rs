@@ -3,7 +3,7 @@
 //! 按配置执行。沙箱路径不进请求/指纹（回归在缺省模式下仍可匹配）。
 
 use flow_backend::journal::JournalBackend;
-use flow_engine::journal_state::{Run, RunStatus};
+use flow_domain::journal_state::{Run, RunStatus};
 use flow_test_support::provider::{spawn_mock_openai, Turn};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -78,7 +78,7 @@ async fn agent_workdir_default_scratch_configured_checked_and_regression_stable(
         .await
         .unwrap();
     let _plugin = flow_test_support::io::agent_plugin_bin();
-    b.install_harness_agent(Some(flow_engine::AgentRunConfig {
+    b.install_harness_agent(Some(flow_dto::AgentRunConfig {
         base_url: provider.base_url(),
         model: "wd-model".into(),
         api: "openai".into(),
@@ -91,7 +91,7 @@ async fn agent_workdir_default_scratch_configured_checked_and_regression_stable(
     .unwrap();
     b.start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
         flow_backend::execution::IpcOptions {
-            executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
+            executor: flow_dispatcher::execution_protocol::contract::ExecutorInvocation::explicit(
                 flow_test_support::io::executor_bin(),
             ),
             x_max: 2,

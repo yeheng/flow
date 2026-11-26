@@ -126,6 +126,56 @@ async fn call(
 }
 
 #[tokio::test]
+async fn observation_lookup_precedes_cursor_validation_when_no_log_can_be_read() {
+    let dir = flow_test_support::io::TempDir::new("observations-disabled");
+    let backend = JournalBackend::open(dir.path(), Default::default())
+        .await
+        .unwrap();
+    let module = flow_rpc::journal_v2::module(
+        backend.clone(),
+        "observations-contract-test-token-32bytes".into(),
+    )
+    .unwrap();
+    let call_page = |run_id: &str| {
+        json!({
+            "_token": "observations-contract-test-token-32bytes",
+            "run_id": run_id,
+            "from_seq": 1,
+        })
+    };
+
+    let missing = call(&module, "run.observations.page", call_page("missing")).await;
+    assert_eq!(missing["error"]["code"], -32011);
+    assert_eq!(missing["error"]["message"], "run not found");
+
+    let receipt = backend
+        .workflow_create("observations-disabled", None)
+        .await
+        .unwrap();
+    let workflow = receipt.result["workflow_id"].as_str().unwrap();
+    backend
+        .workflow_update(
+            workflow,
+            flow_test_support::wire::line_def("return input;"),
+            None,
+        )
+        .await
+        .unwrap();
+    backend.workflow_publish(workflow, 1, None).await.unwrap();
+    let receipt = backend
+        .run_start(workflow, None, json!(null), "manual", None, None)
+        .await
+        .unwrap();
+    let run_id = receipt.result["run_id"].as_str().unwrap();
+
+    let page = call(&module, "run.observations.page", call_page(run_id)).await;
+    assert_eq!(
+        page["result"],
+        json!({"records": [], "loss": {"history_incomplete": true}, "loss_scope": "store"})
+    );
+}
+
+#[tokio::test]
 async fn v2_subscription_backfills_from_run_sequence_and_closes_after_terminal() {
     let root = std::env::temp_dir().join(format!("flow-v2-subscription-{}", uuid::Uuid::now_v7()));
     let backend = JournalBackend::open(&root, Default::default())
@@ -679,9 +729,10 @@ async fn start_ipc(backend: &std::sync::Arc<flow_backend::journal::JournalBacken
     backend
         .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
             flow_backend::execution::IpcOptions {
-                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
-                    flow_test_support::io::executor_bin(),
-                ),
+                executor:
+                    flow_dispatcher::execution_protocol::contract::ExecutorInvocation::explicit(
+                        flow_test_support::io::executor_bin(),
+                    ),
                 x_max,
                 tag: None,
             },
@@ -770,8 +821,8 @@ async fn workflow_preflight_uses_the_same_environment_credentials_as_save() {
     let backend = JournalBackend::open(root.path(), Default::default())
         .await
         .unwrap();
-    let store = flow_engine::environments::EnvironmentStore::open(&root.path().join("env"))
-        .unwrap();
+    let store =
+        flow_backend::environments::EnvironmentStore::open(&root.path().join("env")).unwrap();
     store
         .save(
             "staging",

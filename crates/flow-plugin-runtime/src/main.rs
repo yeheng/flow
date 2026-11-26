@@ -6,7 +6,7 @@
 //! 协议帧，只用于诊断输出；未知参数忽略（`--tag` 等诊断标记由主进程追加）。
 //!
 //! 定位契约：主进程（flow-server / flow-agent）经
-//! `flow_engine::execution_protocol::contract::ExecutorInvocation::locate`
+//! `flow_dispatcher::execution_protocol::contract::ExecutorInvocation::locate`
 //! 在自身同目录召唤本二进制，或用 FLOW_EXECUTOR_BIN 显式指定。
 
 use flow_plugin_runtime::runtime::{ChannelBootstrap, ExecutorConfig};
@@ -55,10 +55,10 @@ fn bootstrap_config() -> Option<ExecutorConfig> {
     let remote_replay = std::env::args().any(|arg| arg == "--remote-relay");
     // 会话令牌是 loopback 回连形态的认领凭据：防同机其他进程抢连这条
     // 通道。空串视同没有令牌（不参与回验）。
-    let session_token = std::env::var(flow_engine::execution_protocol::SESSION_TOKEN_ENV)
+    let session_token = std::env::var(flow_dispatcher::execution_protocol::SESSION_TOKEN_ENV)
         .ok()
         .filter(|token| !token.is_empty());
-    if let Ok(addr) = std::env::var(flow_engine::execution_protocol::CONNECT_ADDR_ENV) {
+    if let Ok(addr) = std::env::var(flow_dispatcher::execution_protocol::CONNECT_ADDR_ENV) {
         if !addr.is_empty() {
             return Some(ExecutorConfig {
                 bootstrap: ChannelBootstrap::Loopback { addr },
@@ -90,7 +90,7 @@ fn bootstrap_config() -> Option<ExecutorConfig> {
     {
         eprintln!(
             "flow-executor: {} 未设置（本平台本地执行只走 loopback 回连）",
-            flow_engine::execution_protocol::CONNECT_ADDR_ENV
+            flow_dispatcher::execution_protocol::CONNECT_ADDR_ENV
         );
         None
     }

@@ -300,7 +300,7 @@ impl ResidentService {
     }
     fn installed_config(entry: std::path::PathBuf) -> Result<SpawnConfig, String> {
         let mut config = SpawnConfig::new(entry);
-        config.env = flow_engine::execution_protocol::environment::EXECUTOR_ENV_WHITELIST
+        config.env = flow_dispatcher::execution_protocol::environment::EXECUTOR_ENV_WHITELIST
             .iter()
             .filter_map(|name| std::env::var_os(name).map(|value| ((*name).into(), value)))
             .collect();
@@ -750,7 +750,9 @@ mod tests {
             // 16 tasks. Wait for their replies before asserting fresh capacity.
             for _ in 0..16 {
                 let frame = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut plugin))
-                    .await.unwrap().unwrap();
+                    .await
+                    .unwrap()
+                    .unwrap();
                 let Message::Response(response) = frame.as_rpc().unwrap() else {
                     panic!("expected completed host response");
                 };

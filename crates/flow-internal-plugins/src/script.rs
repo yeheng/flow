@@ -264,7 +264,7 @@ fn console_stream(name: &str) -> LogStream {
     }
 }
 
-pub use flow_engine::script::{truthy, JsDeterminism, ScriptTask, SCRIPT_V1_HANDLER as SCRIPT_V1};
+pub use flow_domain::script::{truthy, JsDeterminism, ScriptTask, SCRIPT_V1_HANDLER as SCRIPT_V1};
 
 /// 沙箱的资源预算集合。
 ///
@@ -537,7 +537,8 @@ pub fn execute_script(task: &ScriptTask, logger: &NodeLogger) -> Result<Value, E
 /// Decode a prepared job and encode its bounded result for IPC.
 pub fn execute_job(input: Vec<u8>) -> Result<Vec<u8>, String> {
     let task = serde_json::from_slice(&input).map_err(|error| error.to_string())?;
-    let output = execute_script(&task, &NodeLogger::disabled()).map_err(|error| error.to_string())?;
+    let output =
+        execute_script(&task, &NodeLogger::disabled()).map_err(|error| error.to_string())?;
     flow_facts::codec::bounded_json(&output, flow_dispatcher::MAX_STREAMED_JOB_BYTES)
         .map_err(|error| error.to_string())
 }

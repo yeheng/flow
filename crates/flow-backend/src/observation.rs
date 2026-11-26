@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
-use crate::nodelog::LogLine;
+use flow_engine::nodelog::LogLine;
 use serde::{Deserialize, Serialize};
 
 /// 单条观测记录的字节上限（整行，含 JSON 编码）。

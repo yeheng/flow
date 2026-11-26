@@ -17,7 +17,7 @@ pub mod provider;
 // e2e 公共 harness（自 backend-e2e/src/common 迁入，T2）
 //
 // 契约纪律：support 不依赖任何被测实现（backend/rpc/engine/executor）；
-// 对服务端的唯一契约引用是 flow_dto::rpc::is_write_method（产品词汇表）。
+// 对服务端的唯一契约引用是 flow_rpc_contract::is_write_method（产品词汇表）。
 // ---------------------------------------------------------------------------
 pub mod client;
 pub mod fixtures;

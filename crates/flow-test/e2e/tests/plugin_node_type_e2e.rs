@@ -87,8 +87,11 @@ async fn plugin_declared_node_type_end_to_end() {
     std::fs::write(shadow.join("entry"), b"not an echo plugin").unwrap();
     std::fs::write(
         shadow.join("plugin.toml"),
-        ECHO_MANIFEST.replace("echo-plugin", "zz-shadow").replace("{ENTRY}", "entry"),
-    ).unwrap();
+        ECHO_MANIFEST
+            .replace("echo-plugin", "zz-shadow")
+            .replace("{ENTRY}", "entry"),
+    )
+    .unwrap();
     std::env::set_var("FLOW_PLUGINS_DIR", &plugins);
 
     let backend: std::sync::Arc<JournalBackend> =
@@ -98,9 +101,10 @@ async fn plugin_declared_node_type_end_to_end() {
     backend
         .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
             flow_backend::execution::IpcOptions {
-                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
-                    flow_test_support::io::executor_bin(),
-                ),
+                executor:
+                    flow_dispatcher::execution_protocol::contract::ExecutorInvocation::explicit(
+                        flow_test_support::io::executor_bin(),
+                    ),
                 x_max: 1,
                 tag: None,
             },

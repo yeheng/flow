@@ -14,11 +14,11 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
 
-use flow_engine::execution_protocol::contract::{
+use flow_dispatcher::execution_protocol::contract::{
     ACK_RETRANSMIT_MS, DATA_MAX_FRAME, MAX_AUDIT_RECORD_BYTES, W_BYTES,
 };
-use flow_engine::execution_protocol::message::{AuditRecord, Message};
-use flow_engine::execution_protocol::record_bytes;
+use flow_dispatcher::execution_protocol::message::{AuditRecord, Message};
+use flow_dispatcher::execution_protocol::record_bytes;
 
 /// 审计流故障：通道关闭、等待被取消、记录超限或窗口已满。
 #[derive(Debug, thiserror::Error)]

@@ -80,19 +80,12 @@ jobs:
       # 而 remote/IPC 集成测试按工作区布局定位真实二进制（flow-test-support
       # 的 workspace_bin）——不先 build 就会 panic "binary not built"。
       # Separate invocation prevents workspace feature unification hiding core coupling.
+      - name: core dependency boundary
+        run: bash scripts/check-core-dependencies.sh
       - name: isolated domain
-        run: cargo test -p flow-facts -p flow-domain --locked
+        run: cargo test -p flow-dto -p flow-facts -p flow-domain -p flow-policy --all-targets --locked
       - name: isolated dispatcher
         run: cargo test -p flow-dispatcher --locked
-      - name: isolated permission policy
-        run: |
-          deps=$(cargo tree -p flow-policy --edges normal --prefix none --locked --target ${{ matrix.arch.target }})
-          if grep -E '^flow-' <<< "$deps" | grep -Ev '^flow-(policy|dto) v'; then
-            exit 1
-          fi
-          cargo test -p flow-policy --locked --target ${{ matrix.arch.target }}
-      - name: domain without runtime
-        run: cargo test -p flow-engine --no-default-features --lib --test core_boundary --locked
       - name: application without storage or process adapters
         run: |
           deps=$(cargo tree -p flow-application -p flow-workflow --no-default-features --edges normal --prefix none --locked --target ${{ matrix.arch.target }})
@@ -101,7 +94,7 @@ jobs:
           fi
           cargo test -p flow-application -p flow-workflow --no-default-features --lib --locked --target ${{ matrix.arch.target }}
           rpc_deps=$(cargo tree -p flow-rpc --depth 1 --edges normal --prefix none --locked --target ${{ matrix.arch.target }})
-          if grep -E '^flow-journal v' <<< "$rpc_deps"; then
+          if grep -E '^flow-(journal|engine) v' <<< "$rpc_deps"; then
             exit 1
           fi
       - name: isolated workflow with script worker
@@ -322,7 +315,7 @@ jobs:
       - name: cargo check
         run: cargo check --workspace --locked --target x86_64-pc-windows-msvc
       - name: Executor environment policy tests
-        run: cargo test -p flow-engine --no-default-features --lib execution_protocol::environment --locked --target x86_64-pc-windows-msvc
+        run: cargo test -p flow-dispatcher --lib execution_protocol::environment --locked --target x86_64-pc-windows-msvc
 
   # ---- 桌面端（Tauri）三平台构建：发版前的编译门禁 + 可下载 zip ----
   # 步骤与 release.yml 的 build job 保持同一套（那边额外校验 tag 版本并上传

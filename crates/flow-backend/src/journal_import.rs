@@ -197,8 +197,11 @@ async fn baseline(b: &JournalBackend, key: &str, data: Value) -> Result<()> {
                 .ok_or("legacy definition must be JSON text")?,
         )?;
         let defaults = b.plugin_defaults();
-        let dynamic = tokio::task::spawn_blocking(move || crate::plugin_registry::installed_snapshot_with_defaults(&defaults).dynamic_types()).await?;
-        flow_engine::journal_state::validate_definition_with_dynamic(&definition, &dynamic)?;
+        let dynamic = tokio::task::spawn_blocking(move || {
+            crate::plugin_registry::installed_snapshot_with_defaults(&defaults).dynamic_types()
+        })
+        .await?;
+        flow_domain::journal_state::validate_definition_with_dynamic(&definition, &dynamic)?;
         let prepared = b
             .journal
             .prepare_json(definition, flow_journal::MAX_LINE_BYTES)

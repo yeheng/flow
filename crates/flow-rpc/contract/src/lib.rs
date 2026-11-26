@@ -13,6 +13,38 @@
 //!
 //! 注意 `parse` 对未知方法返回 `None` 而不是报错：未注册的方法必须在
 //! 准入层被当作「未知」处理，而不是 panic 或误判为读方法。
+use serde_json::Value;
+
+/// Durable command namespace used to recover a write after a lost reply.
+///
+/// 把一次写调用映射到一个**可重放的幂等作用域**：当 RPC 回复在途中丢失时，
+/// 客户端用同一个 scope 重发，服务端就能认出「这是同一次写」而不是新写一次。
+///
+/// scope 的构造规则：
+/// - `run.start` 与 `run.regress` 共享 `run.start:manual:` 前缀，因为回归
+///   本质上就是一次手动启动；regress 额外带上 baseline 以区分不同基线。
+/// - `run.cancel` / `run.signal` / `run.adjudicate` 按 `run_id` 定位，
+///   同一 run 上的同类操作天然幂等。
+/// - 其余方法用方法名本身作为作用域。
+pub fn command_scope(method: &str, params: &Value) -> String {
+    match method {
+        "run.start" => "run.start:manual:".into(),
+        "run.regress" => format!(
+            "run.start:manual:regression:{}",
+            params["baseline"].as_str().unwrap_or("")
+        ),
+        "run.cancel"
+        | "run.signal"
+        | "run.adjudicate"
+        | "run.approve"
+        | "run.deny"
+        | "run.approvals.revoke" => {
+            format!("{method}:{}", params["run_id"].as_str().unwrap_or(""))
+        }
+        other => other.into(),
+    }
+}
+
 macro_rules! methods {
     (read { $($read:ident => $rname:literal,)* } write { $($write:ident => $wname:literal,)* }) => {
         /// 全部 RPC 方法的枚举。

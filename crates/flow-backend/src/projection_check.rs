@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use flow_engine::journal_state::State;
+use flow_domain::journal_state::State;
 use flow_journal::sqlite;
 use flow_journal::EventKind;
 use serde::Serialize;

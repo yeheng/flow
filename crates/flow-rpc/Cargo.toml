@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+flow-rpc-contract = { path = "contract" }
+flow-domain = { path = "../flow-domain" }
 flow-dto = { path = "../flow-dto" }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -13,14 +15,13 @@ jsonrpsee = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 futures = { workspace = true }
-chrono = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
 cron-parser = { workspace = true }
 axum = { workspace = true }
 rustls = { workspace = true }
 clap = { workspace = true, features = ["env", "derive"] }
 flow-backend = { path = "../flow-backend" }
 flow-facts = { path = "../flow-facts" }
-flow-engine = { path = "../flow-engine" }
 flow-config = { path = "../flow-config" }
 sha2.workspace = true
 hex.workspace = true

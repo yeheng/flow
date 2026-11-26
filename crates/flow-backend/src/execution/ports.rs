@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use flow_engine::{observation::ObservationStore, Node};
+use crate::observation::ObservationStore;
+use flow_domain::Node;
 use flow_journal::StoredValue;
 
 use super::remote::{RemoteDispatcher, RemoteReservation};

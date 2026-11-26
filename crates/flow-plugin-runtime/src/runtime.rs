@@ -19,15 +19,15 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use flow_engine::execution_protocol::contract::bounded_control_text;
-use flow_engine::execution_protocol::contract::{DRAIN_GRACE_MS, STARTUP_TIMEOUT_MS};
-use flow_engine::execution_protocol::loopback::connect_loopback;
-use flow_engine::execution_protocol::message::Message;
-use flow_engine::execution_protocol::transport::{
+use flow_dispatcher::execution_protocol::contract::bounded_control_text;
+use flow_dispatcher::execution_protocol::contract::{DRAIN_GRACE_MS, STARTUP_TIMEOUT_MS};
+use flow_dispatcher::execution_protocol::loopback::connect_loopback;
+use flow_dispatcher::execution_protocol::message::Message;
+use flow_dispatcher::execution_protocol::transport::{
     executor_handshake, FrameTransport, NegotiatedLimits, SessionIdentity,
 };
 #[cfg(unix)]
-use flow_engine::execution_protocol::unix::channel_from_raw;
+use flow_dispatcher::execution_protocol::unix::channel_from_raw;
 
 use crate::task::{TaskEnd, TaskRunner};
 use crate::transfer::IncomingTransfers;
@@ -130,19 +130,20 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
         .then(crate::plugin_registry::PluginRegistry::load);
     let mut capabilities = EXECUTOR_CAPABILITIES.to_vec();
     let profile = if cfg!(feature = "plugins") {
-        flow_engine::execution_protocol::contract::WorkerProfile::Plugins
+        flow_dispatcher::execution_protocol::contract::WorkerProfile::Plugins
     } else {
-        flow_engine::execution_protocol::contract::WorkerProfile::Builtins
+        flow_dispatcher::execution_protocol::contract::WorkerProfile::Builtins
     };
     capabilities.extend(profile.capability());
     if !config.remote_replay {
         capabilities.extend([
-            flow_engine::execution_protocol::PREPARED_JOB_CAPABILITY,
-            flow_engine::execution_protocol::PREPARED_CONDITION_JOB_CAPABILITY,
+            flow_dispatcher::execution_protocol::PREPARED_JOB_CAPABILITY,
+            flow_dispatcher::execution_protocol::PREPARED_CONDITION_JOB_CAPABILITY,
         ]);
     }
     #[cfg(feature = "plugins")]
-    let inventory: Vec<String> = registry.as_ref()
+    let inventory: Vec<String> = registry
+        .as_ref()
         .map(|registry| registry.inventory().capabilities().collect())
         .unwrap_or_default();
     #[cfg(feature = "plugins")]
@@ -196,7 +197,7 @@ pub async fn run_executor(config: ExecutorConfig) -> i32 {
     // 整个 select——入站 Cancel/ACK 与任务完成始终可被处理；积压占用期间
     // 不再拉取新出站消息（自然背压到心跳/任务生产方）。
     let mut send_backlog =
-        flow_engine::execution_protocol::transport::SendBacklog::with_capacity(4);
+        flow_dispatcher::execution_protocol::transport::SendBacklog::with_capacity(4);
     #[cfg(feature = "plugins")]
     let plugins = {
         let registry = registry.unwrap_or_else(crate::plugin_registry::PluginRegistry::load);

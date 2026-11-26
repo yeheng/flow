@@ -15,10 +15,13 @@ plugins = [
 ]
 
 [dependencies]
+flow-dto = { path = "../flow-dto" }
+flow-dispatcher = { path = "../flow-dispatcher" }
+flow-domain = { path = "../flow-domain" }
 flow-plugin-catalog = { path = "../flow-plugin-catalog", optional = true }
 postcard = { workspace = true, optional = true }
 flow-plugin-sdk = { path = "../flow-plugin-sdk", optional = true }
-flow-engine = { path = "../flow-engine", default-features = false, features = ["node-execution"] }
+flow-engine = { path = "../flow-engine" }
 flow-facts = { path = "../flow-facts" }
 flow-config = { path = "../flow-config", optional = true }
 tokio = { workspace = true }
@@ -26,7 +29,7 @@ tokio-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
-chrono = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
 thiserror = { workspace = true }
 reqwest = { workspace = true }
 base64 = "0.22"
@@ -44,6 +47,9 @@ flow-internal-plugins = { path = "../flow-internal-plugins" }
 
 
 
+
+[build-dependencies]
+sha2.workspace = true
 
 [lib]
 name = "flow_plugin_runtime"

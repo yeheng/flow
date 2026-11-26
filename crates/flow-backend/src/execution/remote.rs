@@ -36,15 +36,15 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Mutex, Notify, Semaphore};
 use tokio_rustls::TlsAcceptor;
 
-use flow_dispatcher::execution_protocol::plugin_inventory::PluginOffer;
-use flow_engine::execution_protocol::contract::{
+use flow_dispatcher::execution_protocol::contract::{
     bounded_control_text, WorkerProfile, A_MAX, PROTOCOL_VERSION, STARTUP_TIMEOUT_MS, W_BYTES,
 };
-use flow_engine::execution_protocol::message::Message;
-use flow_engine::execution_protocol::remote::{
+use flow_dispatcher::execution_protocol::message::Message;
+use flow_dispatcher::execution_protocol::plugin_inventory::PluginOffer;
+use flow_dispatcher::execution_protocol::remote::{
     capability, validate_route_identity, ResumeAction, ResumeDecision, ResumeItem, RouteEnvelope,
 };
-use flow_engine::execution_protocol::transport::{FrameTransport, SendBacklog};
+use flow_dispatcher::execution_protocol::transport::{FrameTransport, SendBacklog};
 
 use crate::execution::dispatch::DispatchLink;
 use crate::execution::ToSession;
@@ -505,7 +505,7 @@ impl AgentManager {
         use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
         let manager = self.clone();
-        let limit = Some(flow_engine::execution_protocol::ws::MAX_WS_MESSAGE_BYTES);
+        let limit = Some(flow_dispatcher::execution_protocol::ws::MAX_WS_MESSAGE_BYTES);
         let config = Some(
             WebSocketConfig::default()
                 .max_message_size(limit)
@@ -556,7 +556,7 @@ impl AgentManager {
                     manager
                         .inject_stream(
                             agent_id,
-                            Box::pin(flow_engine::execution_protocol::ws::WsByteStream::new(ws)),
+                            Box::pin(flow_dispatcher::execution_protocol::ws::WsByteStream::new(ws)),
                         )
                         .await;
                 });
@@ -656,7 +656,7 @@ impl AgentManager {
                 master_epoch: self.master_epoch,
                 link_session_id: link_session_id.clone(),
                 agent_id: agent_id.to_string(),
-                heartbeat_ms: flow_engine::execution_protocol::HEARTBEAT_INTERVAL_MS,
+                heartbeat_ms: flow_dispatcher::execution_protocol::HEARTBEAT_INTERVAL_MS,
                 agent_window_bytes: W_BYTES * A_MAX as u64,
             })
             .await
@@ -727,7 +727,7 @@ impl AgentManager {
         // 静默网络分区会留下僵尸 registration：bind 每次烧满超时才失败。
         let mut liveness = tokio::time::Instant::now();
         let mut liveness_tick = tokio::time::interval(Duration::from_millis(
-            flow_engine::execution_protocol::HEARTBEAT_TIMEOUT_MS,
+            flow_dispatcher::execution_protocol::HEARTBEAT_TIMEOUT_MS,
         ));
         liveness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Bounded receipts absorb in-flight duplicates after the live route is released.
@@ -754,12 +754,12 @@ impl AgentManager {
                     _ = liveness_tick.tick() => {
                         if liveness.elapsed()
                             > Duration::from_millis(
-                                flow_engine::execution_protocol::HEARTBEAT_TIMEOUT_MS,
+                                flow_dispatcher::execution_protocol::HEARTBEAT_TIMEOUT_MS,
                             )
                         {
                             return Err(format!(
                                 "agent {agent_id} uplink silent for over {}ms",
-                                flow_engine::execution_protocol::HEARTBEAT_TIMEOUT_MS
+                                flow_dispatcher::execution_protocol::HEARTBEAT_TIMEOUT_MS
                             ));
                         }
                     }
@@ -779,7 +779,7 @@ impl AgentManager {
                                         if completed.len() > 256 { completed.pop_front(); }
                                     }
                                 }
-                                let frame = if flow_engine::execution_protocol::remote::routable(
+                                let frame = if flow_dispatcher::execution_protocol::remote::routable(
                                     &message,
                                 ) {
                                     match message
@@ -846,7 +846,7 @@ impl AgentManager {
                                 // 内层必须是可路由业务帧（出站 wrap 侧的同一规则，
                                 // 在入站方向补齐）：嵌套 Routed / 上联管理帧 / 握手帧
                                 // 是协议违规，关闭会话而不是往派发队列里转发。
-                                if !flow_engine::execution_protocol::remote::routable(&inner) {
+                                if !flow_dispatcher::execution_protocol::remote::routable(&inner) {
                                     return Err(format!(
                                         "non-routable inner message from agent {agent_id} rejected"
                                     ));
@@ -1259,7 +1259,7 @@ impl AgentManager {
         run_id: &str,
         node_id: &str,
         requires_plugins: bool,
-        plugin: Option<(&str, &flow_engine::journal_state::PluginBinding)>,
+        plugin: Option<(&str, &flow_domain::journal_state::PluginBinding)>,
     ) -> Result<Option<RemoteReservation>> {
         let agents = self.agents.lock().await;
         if agents.is_empty() {
@@ -1517,7 +1517,7 @@ fn dead_to_session() -> mpsc::Sender<ToSession> {
 /// 判错方向的代价不对称——把该跑的判成取消会丢工作，把该取消的判成续跑
 /// 会重复外部副作用。
 fn adjudicate_against_journal(
-    state: &flow_engine::journal_state::State,
+    state: &flow_domain::journal_state::State,
     binding: &BoundDispatch,
     item: &ResumeItem,
     bound_boot: Option<&str>,
@@ -1598,8 +1598,8 @@ impl RemoteDispatcher {
     pub(crate) async fn reserve_node(
         &self,
         run_id: &str,
-        node: &flow_engine::Node,
-        binding: Option<&flow_engine::journal_state::PluginBinding>,
+        node: &flow_domain::Node,
+        binding: Option<&flow_domain::journal_state::PluginBinding>,
     ) -> Result<Option<RemoteReservation>> {
         let plugin_type = node.plugin_type();
         self.manager
@@ -1621,9 +1621,9 @@ impl RemoteDispatcher {
         &self,
         attempt: &crate::journal_execution::Attempt,
         reservation: RemoteReservation,
-        node: &flow_engine::Node,
+        node: &flow_domain::Node,
         predecessors: std::collections::BTreeMap<String, flow_journal::StoredValue>,
-        observations: Option<flow_engine::observation::ObservationStore>,
+        observations: Option<crate::observation::ObservationStore>,
     ) -> std::result::Result<(), crate::journal::JournalError> {
         use crate::execution::dispatch::DispatchRunner;
         let mut events = self.manager.bind_reserved(&reservation).await?;
@@ -2131,7 +2131,7 @@ mod session_tests {
                 items: vec![ResumeItem {
                     dispatch_id: attempt.dispatch_id.clone(),
                     executor_boot_id: "worker-boot".into(),
-                    state: flow_engine::execution_protocol::remote::ResumeState::Executing,
+                    state: flow_dispatcher::execution_protocol::remote::ResumeState::Executing,
                     durable_audit_seq: 0,
                     result_id: None,
                     result_last_audit_seq: None,

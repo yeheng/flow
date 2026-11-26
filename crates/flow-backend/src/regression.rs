@@ -7,7 +7,7 @@
 //! 需要它，是因为「改了 prompt / 节点逻辑后行为是否一致」这个问题
 //! 只能在零外部副作用的条件下反复回答。
 use crate::journal::{CommandReceipt, JournalBackend, JournalError};
-use flow_engine::journal_state::{OperationFixture, Regression, Run};
+use flow_domain::journal_state::{OperationFixture, Regression, Run};
 use flow_journal::{Error, StoredValue};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -98,7 +98,7 @@ impl JournalBackend {
                 if definition.node_type(id).is_some_and(|k| {
                     matches!(
                         k,
-                        flow_engine::NodeType::HumanTask | flow_engine::NodeType::Input
+                        flow_domain::NodeType::HumanTask | flow_domain::NodeType::Input
                     )
                 }) {
                     // 人工输入同样要继承：否则候选 run 会等在一个

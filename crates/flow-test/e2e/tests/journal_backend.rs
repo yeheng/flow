@@ -1,5 +1,5 @@
 use flow_backend::journal::JournalBackend;
-use flow_engine::journal_state::Workflow;
+use flow_domain::journal_state::Workflow;
 use flow_journal::{Event, EventKind, JournalOptions};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -342,7 +342,7 @@ async fn cancelled_run_start_is_scheduled_without_a_retry_or_state_read() {
     b.workflow_publish(&workflow, 1, None).await.unwrap();
     b.start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
         flow_backend::execution::IpcOptions {
-            executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
+            executor: flow_dispatcher::execution_protocol::contract::ExecutorInvocation::explicit(
                 flow_test_support::io::executor_bin(),
             ),
             x_max: 1,

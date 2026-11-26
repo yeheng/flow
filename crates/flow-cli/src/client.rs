@@ -65,7 +65,7 @@ pub async fn call(
 }
 
 /// 复用 `flow_dto` 的方法目录判断读写，避免 CLI 自己维护一份方法名清单。
-pub(crate) use flow_dto::rpc::is_write_method;
+pub(crate) use flow_rpc_contract::is_write_method;
 
 #[cfg(test)]
 /// 错误文案契约的回归测试。

@@ -2,7 +2,7 @@
 //!
 //! 运行（release 计数，结果记录进基线报告）：
 //! ```sh
-//! cargo run -p flow-engine --release --example ipc_baseline --locked
+//! cargo run -p flow-dispatcher --release --example ipc_baseline --locked
 //! ```
 //!
 //! 场景覆盖：小控制消息、审计批次、最大合法传输块的编解码（吞吐 +
@@ -14,11 +14,9 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use sha2::Digest;
-
-use flow_engine::execution_protocol::frame::{encode_frame, FrameDecoder};
-use flow_engine::execution_protocol::message::{AuditRecord, Message};
-use flow_engine::execution_protocol::transport::FrameTransport;
+use flow_dispatcher::execution_protocol::frame::{encode_frame, FrameDecoder};
+use flow_dispatcher::execution_protocol::message::{AuditRecord, Message};
+use flow_dispatcher::execution_protocol::transport::FrameTransport;
 
 // ---- 分配计数器（全局分配器包装）：每场景快照差值 ----
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
@@ -111,8 +109,8 @@ fn audit_batch(dispatch: &str, records: usize, payload_len: usize) -> Message {
 
 fn max_transfer_chunk(dispatch: &str) -> Message {
     // 最大合法块：CHUNK_BYTES 原始字节（base64 后占 4/3）。
-    let raw = vec![0xa5u8; flow_engine::execution_protocol::TRANSFER_CHUNK_BYTES];
-    let digest = hex::encode(sha2::Sha256::digest(&raw));
+    let raw = vec![0xa5u8; flow_dispatcher::execution_protocol::TRANSFER_CHUNK_BYTES];
+    let digest = flow_facts::codec::digest(&raw);
     Message::TransferChunk {
         dispatch_id: dispatch.into(),
         transfer_id: "in:baseline".into(),

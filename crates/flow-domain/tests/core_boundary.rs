@@ -1,5 +1,5 @@
 //! Public domain contracts also run with --no-default-features.
-use flow_engine::Definition;
+use flow_domain::Definition;
 use serde_json::json;
 use std::collections::BTreeSet;
 

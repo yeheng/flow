@@ -98,7 +98,7 @@ fn materialized(method: &str) -> &str {
 /// 给参数补上 wire 协议必需的字段（令牌、幂等键等）。
 fn enrich(method: &str, mut params: Value) -> Value {
     params["_token"] = json!(TOKEN);
-    if flow_dto::rpc::is_write_method(method) && params.get("request_id").is_none() {
+    if flow_rpc_contract::is_write_method(method) && params.get("request_id").is_none() {
         params["request_id"] = json!(uuid::Uuid::now_v7().to_string());
     }
     params

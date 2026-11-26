@@ -3,8 +3,8 @@
 //! 进程回收、重启恢复与一期语义等价。
 
 use flow_backend::journal::JournalBackend;
-use flow_engine::journal_state::Run;
-use flow_engine::journal_state::{NodeStatus, RunStatus, WaitKind};
+use flow_domain::journal_state::Run;
+use flow_domain::journal_state::{NodeStatus, RunStatus, WaitKind};
 use flow_journal::{JournalOptions, StoredValue};
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
@@ -21,8 +21,8 @@ fn executor_bin() -> std::path::PathBuf {
 }
 
 /// 独立 flow-executor 二进制（无子命令前缀）。
-fn executor() -> flow_engine::execution_protocol::contract::ExecutorInvocation {
-    flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(executor_bin())
+fn executor() -> flow_dispatcher::execution_protocol::contract::ExecutorInvocation {
+    flow_dispatcher::execution_protocol::contract::ExecutorInvocation::explicit(executor_bin())
 }
 
 /// 强制 IPC 模式（绕过环境变量，测试内显式指定二进制）。
@@ -1056,9 +1056,10 @@ async fn start_ipc(backend: &std::sync::Arc<flow_backend::journal::JournalBacken
     backend
         .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
             flow_backend::execution::IpcOptions {
-                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
-                    flow_test_support::io::executor_bin(),
-                ),
+                executor:
+                    flow_dispatcher::execution_protocol::contract::ExecutorInvocation::explicit(
+                        flow_test_support::io::executor_bin(),
+                    ),
                 x_max,
                 tag: None,
             },
@@ -1077,7 +1078,7 @@ async fn start_ipc(backend: &std::sync::Arc<flow_backend::journal::JournalBacken
 /// 保持 `Inline` 原样落地，不再降级为审计分块。
 #[tokio::test]
 async fn result_output_in_control_frame_kill_band_survives() {
-    use flow_engine::execution_protocol::contract::CONTROL_MAX_FRAME;
+    use flow_dispatcher::execution_protocol::contract::CONTROL_MAX_FRAME;
     use flow_journal::INLINE_BYTES;
 
     let root = temp();
@@ -1158,7 +1159,7 @@ async fn result_output_in_control_frame_kill_band_survives() {
 /// 假象。修复后按 `CONTROL_TEXT_MAX` 截断，业务失败语义保持不变，会话存活。
 #[tokio::test]
 async fn oversized_failure_message_is_truncated_not_fatal() {
-    use flow_engine::execution_protocol::contract::CONTROL_TEXT_MAX;
+    use flow_dispatcher::execution_protocol::contract::CONTROL_TEXT_MAX;
 
     let root = temp();
     let backend = ipc_backend_explicit(&root).await;

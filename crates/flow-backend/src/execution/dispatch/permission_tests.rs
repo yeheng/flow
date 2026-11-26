@@ -1,8 +1,8 @@
 use super::*;
 
 use crate::journal_permissions::ApprovalCommand;
+use flow_domain::journal_state::ApprovalStatus;
 use flow_dto::permission::{run_approval_digest, RunApproval};
-use flow_engine::journal_state::ApprovalStatus;
 use tokio::sync::Mutex;
 
 static SCENARIO: Mutex<()> = Mutex::const_new(());

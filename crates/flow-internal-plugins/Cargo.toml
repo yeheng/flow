@@ -15,16 +15,17 @@ publish = false
 # - JS 求值器（rquickjs）随实现迁入：engine 的 runtime feature 不再背它。
 
 [dependencies]
+flow-domain = { path = "../flow-domain" }
 serde.workspace = true
 flow-dispatcher = { path = "../flow-dispatcher" }
 flow-facts = { path = "../flow-facts" }
 # 本地 Worker 使用执行期日志和错误契约，观测存储由托管运行注入。
-flow-engine = { path = "../flow-engine", default-features = false, features = ["node-execution"] }
+flow-engine = { path = "../flow-engine" }
 serde_json = { workspace = true }
 flow-dto = { path = "../flow-dto" }
 rquickjs = { workspace = true }
 tokio = { workspace = true, features = ["process"] }
-chrono = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
 uuid = { workspace = true }
 
 [dev-dependencies]

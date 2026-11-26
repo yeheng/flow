@@ -40,21 +40,21 @@ use tokio::sync::mpsc;
 
 use crate::journal::JournalBackend;
 use crate::journal_execution::Attempt;
-use flow_engine::execution_protocol::contract::{
+use crate::observation::ObservationStore;
+use flow_dispatcher::execution_protocol::contract::{
     CANCEL_REAP_TIMEOUT_MS, DURABLE_WAIT_TIMEOUT_MS, PREPARED_CONDITION_JOB_CAPABILITY,
     PREPARED_JOB_CAPABILITY, TRANSFER_CHUNK_BYTES,
 };
-use flow_engine::execution_protocol::message::{
+use flow_dispatcher::execution_protocol::message::{
     Message, PermitCredential, ResultOutcome, WaitKind as WaitRequestKind,
 };
-use flow_engine::execution_protocol::record_bytes;
-use flow_engine::execution_protocol::TransferKey;
-use flow_engine::journal_state::{
+use flow_dispatcher::execution_protocol::record_bytes;
+use flow_dispatcher::execution_protocol::TransferKey;
+use flow_domain::journal_state::{
     ApprovalStatus, Operation, PermissionAskedPayload, PermissionDecidedPayload, Prepared, Run,
     RunStatus, Wait, WaitKind,
 };
-use flow_engine::observation::ObservationStore;
-use flow_engine::{Node, NodeType};
+use flow_domain::{Node, NodeType};
 use flow_journal::value::ValueCodec;
 use flow_journal::{EventKind, StoredValue};
 
@@ -883,7 +883,7 @@ impl DispatchRunner {
                         dispatch_id,
                         job: flow_dispatcher::Job {
                             id: job_id,
-                            handler: flow_engine::SCRIPT_V1_HANDLER.into(),
+                            handler: flow_domain::script::SCRIPT_V1_HANDLER.into(),
                             // The authenticated session already holds these exact frozen values.
                             input: Vec::new(),
                         },
@@ -1121,7 +1121,7 @@ impl DispatchRunner {
     /// 审计批次：连续性 + 同序号同内容幂等 + 单事务持久化 + AuditAck。
     async fn handle_audit(
         &mut self,
-        records: Vec<flow_engine::execution_protocol::AuditRecord>,
+        records: Vec<flow_dispatcher::execution_protocol::AuditRecord>,
         link: &mut DispatchLink,
     ) -> Result<()> {
         tracing::info!(
@@ -1192,7 +1192,10 @@ impl DispatchRunner {
                 })
                 .await?;
             #[cfg(feature = "fault-injection")]
-            if new_records.iter().any(|(record, _)| record.kind == "input_prepared") {
+            if new_records
+                .iter()
+                .any(|(record, _)| record.kind == "input_prepared")
+            {
                 fault::checkpoint_for("input_prepared:committed", &self.attempt.node_id).await;
             }
             for (record, digest) in new_records {
@@ -1394,23 +1397,20 @@ impl DispatchRunner {
         } else {
             None
         };
-        let child_ceilings = if let Some(policy) = run
-            .policy
-            .as_ref()
-            .filter(|_| inherited_bindings.is_some())
-        {
-            policy.plugin_ceilings.clone()
-        } else {
-            let types = definition
-                .nodes
-                .iter()
-                .filter_map(flow_engine::Node::plugin_type)
-                .map(str::to_owned)
-                .collect();
-            crate::policy::freeze_plugins(backend.as_ref(), types, agent_plugin_id.as_deref())
-                .await?
-                .ceilings
-        };
+        let child_ceilings =
+            if let Some(policy) = run.policy.as_ref().filter(|_| inherited_bindings.is_some()) {
+                policy.plugin_ceilings.clone()
+            } else {
+                let types = definition
+                    .nodes
+                    .iter()
+                    .filter_map(flow_domain::Node::plugin_type)
+                    .map(str::to_owned)
+                    .collect();
+                crate::policy::freeze_plugins(backend.as_ref(), types, agent_plugin_id.as_deref())
+                    .await?
+                    .ceilings
+            };
         if run
             .execution
             .as_ref()
@@ -1471,7 +1471,7 @@ impl DispatchRunner {
                 if parent.terminal() {
                     return Err(fj("parent terminal"));
                 }
-                if parent.depth >= flow_engine::MAX_SUB_WORKFLOW_DEPTH {
+                if parent.depth >= flow_domain::MAX_SUB_WORKFLOW_DEPTH {
                     return Err(fj("child depth exceeded"));
                 }
                 // R_max 是主进程在飞 run 状态数的上限（不是协议量）：子 run
@@ -1494,7 +1494,7 @@ impl DispatchRunner {
                     return Err(flow_journal::Error::Conflict("child definition changed before registration".into()));
                 }
                 let child_id = crate::journal_commands::id();
-                let child = flow_engine::journal_state::Run {
+                let child = flow_domain::journal_state::Run {
                     run_id: child_id.clone(),
                     workflow_id: workflow_id.clone(),
                     workflow_version: definition.version,
@@ -1502,7 +1502,7 @@ impl DispatchRunner {
                     input,
                     source: "sub_workflow".into(),
                     source_detail: None,
-                    parent: Some(flow_engine::journal_state::Parent {
+                    parent: Some(flow_domain::journal_state::Parent {
                         run_id: run_id.clone(),
                         node_id: node_id.clone(),
                     }),
@@ -1752,7 +1752,8 @@ impl DispatchRunner {
                     self.agent_deadline = Some(
                         tokio::time::Instant::now()
                             + Duration::from_millis(
-                                timeout + flow_engine::execution_protocol::contract::DRAIN_GRACE_MS,
+                                timeout
+                                    + flow_dispatcher::execution_protocol::contract::DRAIN_GRACE_MS,
                             ),
                     );
                 }
@@ -2102,7 +2103,7 @@ impl DispatchRunner {
         if self.cancel_sent
             || run.terminal()
             || node.dispatch_id != self.attempt.dispatch_id
-            || node.status != flow_engine::journal_state::NodeStatus::Running
+            || node.status != flow_domain::journal_state::NodeStatus::Running
         {
             return None;
         }
@@ -2403,7 +2404,7 @@ fn check_tool_replay(
     Ok(())
 }
 
-fn approval_denial_reason(approval: &flow_engine::journal_state::ApprovalState) -> String {
+fn approval_denial_reason(approval: &flow_domain::journal_state::ApprovalState) -> String {
     approval
         .decision
         .as_ref()
@@ -2607,7 +2608,7 @@ fn evaluate_node_permission(
 
 fn node_permission_events(
     run: &Run,
-    node: &flow_engine::journal_state::Node,
+    node: &flow_domain::journal_state::Node,
     request: &PermissionRequest,
     operation: &Operation,
     outcome: &NodeAuthorization,
@@ -2722,7 +2723,7 @@ async fn commit_tool_denial(attempt: &Attempt, request: &PermissionRequest, reas
         gate: "tool".into(),
         record,
         request_fingerprint: request.context.request_fingerprint.clone(),
-        status: flow_engine::journal_state::ApprovalStatus::Denied,
+        status: flow_domain::journal_state::ApprovalStatus::Denied,
     };
     let key = run_id.clone();
     let write = attempt
@@ -2755,7 +2756,7 @@ async fn commit_tool_denial(attempt: &Attempt, request: &PermissionRequest, reas
 
 /// 控制帧里的拒绝原因有界（CONTROL_TEXT_MAX）。
 fn bounded_deny_reason(reason: &str) -> String {
-    flow_engine::execution_protocol::contract::bounded_control_text(reason.to_string())
+    flow_dispatcher::execution_protocol::contract::bounded_control_text(reason.to_string())
 }
 
 /// 输入传输（master→executor，data 通道）：v2 起所有声明的值字节都走
@@ -3015,11 +3016,11 @@ fn stream_of(stream: &str) -> flow_engine::log_types::LogStream {
 ///
 /// 找不到定义即报错：子 run 绝不能绑到「猜出来的」定义上。
 fn child_definition<'a>(
-    state: &'a flow_engine::journal_state::State,
+    state: &'a flow_domain::journal_state::State,
     parent: &'a Run,
     workflow_id: &str,
     node_id: &str,
-) -> flow_journal::Result<&'a flow_engine::journal_state::DefinitionVersion> {
+) -> flow_journal::Result<&'a flow_domain::journal_state::DefinitionVersion> {
     Ok(if let Some(execution) = &parent.execution {
         let binding = format!(
             "{}@{}/{}",
@@ -3138,18 +3139,14 @@ mod transfer_budget_tests {
             total_bytes,
             digest: String::new(),
         };
-        assert!(
-            runner
-                .handle(ready("foreign", "t", 0), &mut link)
-                .await
-                .is_err()
-        );
-        assert!(
-            runner
-                .handle(ready("d", "t", u64::MAX), &mut link)
-                .await
-                .is_err()
-        );
+        assert!(runner
+            .handle(ready("foreign", "t", 0), &mut link)
+            .await
+            .is_err());
+        assert!(runner
+            .handle(ready("d", "t", u64::MAX), &mut link)
+            .await
+            .is_err());
         assert!(runner.op_transfers.is_empty());
         let chunk = |id: &str, offset, bytes: &[u8]| Message::TransferChunk {
             dispatch_id: "d".into(),
@@ -3158,12 +3155,10 @@ mod transfer_budget_tests {
             bytes: bytes.to_vec(),
             digest: hex_sha(bytes),
         };
-        assert!(
-            runner
-                .handle(chunk("t", u64::MAX, b"x"), &mut link)
-                .await
-                .is_err()
-        );
+        assert!(runner
+            .handle(chunk("t", u64::MAX, b"x"), &mut link)
+            .await
+            .is_err());
         let half = vec![b'x'; OPERATION_TRANSFER_LIMIT as usize / 2];
         runner
             .handle(chunk("a", 0, &half), &mut link)
@@ -3182,12 +3177,10 @@ mod transfer_budget_tests {
                 .await
                 .unwrap();
         }
-        assert!(
-            runner
-                .handle(ready("d", "overflow", 0), &mut link)
-                .await
-                .is_err()
-        );
+        assert!(runner
+            .handle(ready("d", "overflow", 0), &mut link)
+            .await
+            .is_err());
         assert_eq!(runner.op_transfers.len(), OPERATION_TRANSFER_COUNT);
         backend.close().await.unwrap();
         std::fs::remove_dir_all(root).unwrap();

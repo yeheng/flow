@@ -3,8 +3,8 @@ use flow_backend::execution::{
     ExecutionMode, IpcOptions,
 };
 use flow_backend::journal::JournalBackend;
-use flow_engine::execution_protocol::contract::ExecutorInvocation;
-use flow_engine::journal_state::RunStatus;
+use flow_dispatcher::execution_protocol::contract::ExecutorInvocation;
+use flow_domain::journal_state::RunStatus;
 use flow_test_support::{fixtures::StubHttp, io};
 use serde_json::{json, Value};
 use std::{fs, path::Path, time::Duration};

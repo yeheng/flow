@@ -914,7 +914,7 @@ impl State {
         self.commands
             .get(&command_key(scope, request_id))
             .or_else(|| {
-                let key = scope.strip_prefix("run.start:schedule:")?;
+                let key = flow_facts::command::ScheduleScope::parse(scope)?.key();
                 let fire = self.schedule_fires.get(key)?;
                 (fire.command.request_id.as_deref() == Some(request_id)).then_some(&fire.command)
             })
@@ -1300,7 +1300,8 @@ impl State {
                 // runs during this migration/replay.
                 // 调度触发的水位在这里重建：Command 与 RunStarted 事实里
                 // 已经含有稳定的槽位身份与结果，重放时无需再执行一次业务。
-                if let Some(key) = command.scope.strip_prefix("run.start:schedule:") {
+                if let Some(scope) = flow_facts::command::ScheduleScope::parse(&command.scope) {
+                    let key = scope.key();
                     let at = command
                         .request_id
                         .as_deref()
@@ -2634,7 +2635,7 @@ mod permission_fold_tests {
             "record": DecisionRecord {
                 operation_id: request.operation_id.clone(),
                 request_hash: request.request_hash.clone(),
-                evaluated_at: chrono::Utc::now(),
+                evaluated_at: chrono::DateTime::UNIX_EPOCH,
                 policy_revision: "rev".into(),
                 decision,
                 by: Principal::System,

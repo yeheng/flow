@@ -5,7 +5,7 @@
 //! 数据形状，不是内部 API。
 //!
 //! [`Conn`] 是 WsClient + 部署 token 的薄包装：`call` 自动补 `_token`；写命令
-//! （`flow_dto::rpc::is_write_method` 集合）自动带 `request_id` 并把
+//! （`flow_rpc_contract::is_write_method` 集合）自动带 `request_id` 并把
 //! 回执 `{committed, result, ...}` 解包为 `result`（用例零感知）。
 //!
 //! 服务端在写响应前等到投影可见（applied_lsn >= commit_lsn），健康路径不会
@@ -75,7 +75,7 @@ pub fn named(value: Value) -> ObjectParams {
 /// v2 语义调用：token 注入 + 写命令 request_id/回执解包。
 /// 写命令返回 `receipt.result`（v1 门面形状）。
 pub async fn call<T: DeserializeOwned>(conn: &Conn, method: &str, params: Value) -> T {
-    let write = flow_dto::rpc::is_write_method(method);
+    let write = flow_rpc_contract::is_write_method(method);
     let request_id = if write {
         Some(
             params
@@ -130,7 +130,7 @@ pub async fn try_call_json(
     };
     if let Some(obj) = enriched.as_object_mut() {
         obj.insert("_token".into(), json!(conn.token));
-        if flow_dto::rpc::is_write_method(method) {
+        if flow_rpc_contract::is_write_method(method) {
             obj.entry("request_id")
                 .or_insert_with(|| json!(uuid::Uuid::now_v7().to_string()));
         }
@@ -152,7 +152,7 @@ pub async fn call_err(conn: &Conn, method: &str, params: Value) -> ErrorObjectOw
     };
     if let Some(obj) = enriched.as_object_mut() {
         obj.insert("_token".into(), json!(conn.token));
-        if flow_dto::rpc::is_write_method(method) {
+        if flow_rpc_contract::is_write_method(method) {
             obj.entry("request_id")
                 .or_insert_with(|| json!(uuid::Uuid::now_v7().to_string()));
         }

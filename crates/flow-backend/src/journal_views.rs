@@ -8,11 +8,11 @@
 use crate::journal::JournalBackend;
 use crate::ViewError;
 use chrono::{DateTime, Utc};
+use flow_domain::journal_state::{Run as JournalRun, WaitKind, Workflow as JournalWorkflow};
 use flow_dto::{
     NodeTemplate, NodeTemplateSummary, RunRecord, RunStats, Schedule, Webhook, WorkflowRunStats,
     WorkflowSummary, WorkflowVersion, STATUS_DRAFT, STATUS_PUBLISHED,
 };
-use flow_engine::journal_state::{Run as JournalRun, WaitKind, Workflow as JournalWorkflow};
 use flow_journal::VALUE_BUDGET;
 use flow_journal::{StoredValue, MAX_LINE_BYTES};
 use serde_json::{json, Value};
@@ -26,11 +26,65 @@ pub use events::{
     invocation_events, permissions_audit_page, EventReadError, EventStream, RunEventTail, RunEvents,
 };
 
-pub async fn run_exists(
+pub enum RunObservations {
+    Missing,
+    Disabled(Value),
+    Available(ObservationPageReader),
+}
+
+pub struct ObservationPageReader {
+    store: crate::observation::ObservationStore,
+    run_id: String,
+}
+
+pub async fn run_observations(
     b: &JournalBackend,
-    run_id: &str,
-) -> std::result::Result<bool, crate::StorageError> {
-    Ok(b.store.get_summary("run", run_id).await?.1.is_some())
+    run_id: String,
+) -> std::result::Result<RunObservations, crate::StorageError> {
+    if b.store.get_summary("run", &run_id).await?.1.is_none() {
+        return Ok(RunObservations::Missing);
+    }
+    let Some(store) = b.observations.clone() else {
+        return Ok(RunObservations::Disabled(json!({
+            "records": [],
+            "loss": {"history_incomplete": true},
+            "loss_scope": "store",
+        })));
+    };
+    Ok(RunObservations::Available(ObservationPageReader {
+        store,
+        run_id,
+    }))
+}
+
+impl ObservationPageReader {
+    pub async fn page(
+        self,
+        dispatch: Option<String>,
+        from: u64,
+        limit: Option<u64>,
+    ) -> std::result::Result<Value, String> {
+        let Self { store, run_id } = self;
+        // Pagination scans the observation files and must run off the async worker.
+        tokio::task::spawn_blocking(move || {
+            let records = store
+                .page(
+                    &run_id,
+                    dispatch.as_deref(),
+                    from,
+                    limit.unwrap_or(100).min(256) as usize,
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(json!({
+                "records": records,
+                "loss": store.scoped_loss(&run_id, dispatch.as_deref()),
+                "loss_scope": if dispatch.is_some() { "dispatch" } else { "run" },
+                "store_loss": store.loss(),
+            }))
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
 }
 
 pub async fn snapshot_get(
@@ -66,9 +120,11 @@ pub async fn materialize_run_value(
     let root = b.journal.root().to_path_buf();
     let upper = b.journal.durable_lsn();
     let value = value.clone();
-    tokio::task::spawn_blocking(move || flow_journal::value::materialize(&root, upper, &value, limit))
-        .await
-        .map_err(internal)?
+    tokio::task::spawn_blocking(move || {
+        flow_journal::value::materialize(&root, upper, &value, limit)
+    })
+    .await
+    .map_err(internal)?
 }
 
 /// 内部错误归类：读面故障统一为 Unavailable，与「不存在」「超限」区分开。
@@ -97,7 +153,7 @@ fn workflow_version(
     root: &std::path::Path,
     upper: u64,
     workflow_id: &str,
-    version: &flow_engine::journal_state::DefinitionVersion,
+    version: &flow_domain::journal_state::DefinitionVersion,
 ) -> Result<WorkflowVersion> {
     Ok(WorkflowVersion {
         workflow_id: workflow_id.to_string(),
@@ -567,7 +623,7 @@ pub async fn timeline(backend: &JournalBackend, run_id: &str) -> Result<Value> {
     let journal_id = backend.journal.id().to_owned();
     tokio::task::spawn_blocking(move || {
     let materialize = |v: &StoredValue| flow_journal::value::materialize(&root, upper, v, VALUE_BUDGET).map_err(internal);
-    let definition: flow_engine::Definition =
+    let definition: flow_domain::Definition =
         serde_json::from_value(materialize(&run.definition)?)
             .map_err(internal)?;
     let mut nodes = Vec::new();
@@ -612,7 +668,7 @@ pub async fn timeline(backend: &JournalBackend, run_id: &str) -> Result<Value> {
             "approval": node.and_then(|n| n.approval.as_ref()).map(|a| json!({
                 "gate": a.gate,
                 "status": if run.terminal() && a.status
-                    == flow_engine::journal_state::ApprovalStatus::Pending
+                    == flow_domain::journal_state::ApprovalStatus::Pending
                 { "cancelled" } else { a.status.as_str() },
                 "operation_id": a.request.operation_id,
                 "request_hash": a.request.request_hash,

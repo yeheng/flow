@@ -10,7 +10,7 @@
 //! 事实，执行器才有资格去调外部系统（C3）。
 use crate::journal::{JournalBackend, JournalError};
 use crate::journal_commands::{id, node_event};
-use flow_engine::journal_state::Run;
+use flow_domain::journal_state::Run;
 use flow_journal::{EventKind, StoredValue};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -25,15 +25,15 @@ fn invalid(s: impl Into<String>) -> flow_journal::Error {
 
 /// Retry pure computation only after the exact input has been committed.
 pub(crate) fn pure_retry_delay(
-    node: &flow_engine::Node,
-    record: &flow_engine::journal_state::Node,
+    node: &flow_domain::Node,
+    record: &flow_domain::journal_state::Node,
 ) -> Option<i64> {
     let policy = node.retry();
     (record.prepared.is_some()
         && record.operation.is_none()
         && matches!(
             node.kind(),
-            Some(flow_engine::NodeType::Script | flow_engine::NodeType::Condition)
+            Some(flow_domain::NodeType::Script | flow_domain::NodeType::Condition)
         )
         && record.attempt < policy.max_attempts.min(100))
     .then_some(policy.backoff_ms.min(i64::MAX as u64) as i64)

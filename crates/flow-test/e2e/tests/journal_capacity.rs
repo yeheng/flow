@@ -1,6 +1,6 @@
 //! Explicit acceptance load, not part of the short regression suite.
 use flow_backend::journal::JournalBackend;
-use flow_engine::journal_state::RunStatus;
+use flow_domain::journal_state::RunStatus;
 use serde_json::json;
 use std::time::{Duration, Instant};
 
@@ -194,9 +194,10 @@ async fn start_ipc(backend: &std::sync::Arc<flow_backend::journal::JournalBacken
     backend
         .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
             flow_backend::execution::IpcOptions {
-                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
-                    flow_test_support::io::executor_bin(),
-                ),
+                executor:
+                    flow_dispatcher::execution_protocol::contract::ExecutorInvocation::explicit(
+                        flow_test_support::io::executor_bin(),
+                    ),
                 x_max,
                 tag: None,
             },

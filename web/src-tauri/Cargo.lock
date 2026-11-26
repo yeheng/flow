@@ -594,10 +594,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
- "js-sys",
  "num-traits",
  "serde",
- "wasm-bindgen",
  "windows-link",
 ]
 
@@ -1331,6 +1329,7 @@ dependencies = [
 name = "flow-backend"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "async-trait",
  "base64 0.23.1",
  "chrono",
@@ -1339,8 +1338,10 @@ dependencies = [
  "flow-application",
  "flow-config",
  "flow-dispatcher",
+ "flow-domain",
  "flow-dto",
  "flow-engine",
+ "flow-facts",
  "flow-journal",
  "flow-plugin-catalog",
  "flow-plugin-sdk",
@@ -1458,21 +1459,10 @@ dependencies = [
 name = "flow-engine"
 version = "0.1.0"
 dependencies = [
- "aes-gcm",
- "chrono",
- "flow-dispatcher",
- "flow-domain",
- "flow-dto",
- "flow-journal",
- "hex",
- "reqwest",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "thiserror 2.0.21",
  "tokio",
- "tokio-util",
- "tracing",
 ]
 
 [[package]]
@@ -1552,9 +1542,10 @@ dependencies = [
  "cron-parser",
  "flow-backend",
  "flow-config",
+ "flow-domain",
  "flow-dto",
- "flow-engine",
  "flow-facts",
+ "flow-rpc-contract",
  "futures",
  "hex",
  "hmac",
@@ -1567,6 +1558,13 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "flow-rpc-contract"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

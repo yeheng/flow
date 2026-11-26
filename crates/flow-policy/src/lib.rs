@@ -365,6 +365,12 @@ fn evaluate_layer(
 
 #[cfg(test)]
 mod tests {
+    fn evaluated_at() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
     use super::*;
     use flow_dto::permission::{
         parse_capability, parse_workflow_permissions, CeilingLayer, PluginCeiling, ResourcePattern,
@@ -479,7 +485,12 @@ mod tests {
         policy: &FrozenPolicy,
         approvals: &[RunApproval],
     ) -> Evaluation {
-        check(&input(specs, "fingerprint"), policy, approvals, Utc::now())
+        check(
+            &input(specs, "fingerprint"),
+            policy,
+            approvals,
+            evaluated_at(),
+        )
     }
 
     fn restrict(allow: Vec<Capability>) -> BTreeMap<String, NodePermissions> {
@@ -653,7 +664,7 @@ mod tests {
 
     #[test]
     fn expired_capability_is_unmatched() {
-        let past = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let past = (evaluated_at() - chrono::Duration::hours(1)).to_rfc3339();
         let cap = parse_capability(&json!({
             "id":"net-exp", "action":"net", "methods":["POST"],
             "url_prefix":"https://api.example.com/", "approval":"auto",
@@ -699,13 +710,18 @@ mod tests {
         ));
         // 指纹变化（同 URL 不同 body/cwd）→ 仍 Ask。
         assert!(matches!(
-            check(&input(&specs, "fingerprint-2"), &p, &approvals, Utc::now()),
+            check(
+                &input(&specs, "fingerprint-2"),
+                &p,
+                &approvals,
+                evaluated_at()
+            ),
             Evaluation::Ask { .. }
         ));
         // 授权过期 → 重新询问。
         let expired = vec![approval(
             digest,
-            Some(Utc::now() - chrono::Duration::hours(1)),
+            Some(evaluated_at() - chrono::Duration::hours(1)),
         )];
         assert!(matches!(
             check_now(&specs, &p, &expired),
@@ -748,13 +764,13 @@ mod tests {
         let specs = [http_spec("https://api.example.com/x")];
         let mut with_plugin = input(&specs, "f");
         with_plugin.plugin_id = Some("llm");
-        match check(&with_plugin, &p, &[], Utc::now()) {
+        match check(&with_plugin, &p, &[], evaluated_at()) {
             Evaluation::Deny { reason, .. } => assert!(reason.contains("plugin:llm"), "{reason}"),
             other => panic!("expected deny, got {other:?}"),
         }
         // 无授予记录的插件同样拒绝。
         with_plugin.plugin_id = Some("other");
-        match check(&with_plugin, &p, &[], Utc::now()) {
+        match check(&with_plugin, &p, &[], evaluated_at()) {
             Evaluation::Deny { reason, .. } => assert!(reason.contains("待授予"), "{reason}"),
             other => panic!("expected deny, got {other:?}"),
         }
@@ -843,7 +859,7 @@ mod tests {
         policy: &FrozenPolicy,
         approvals: &[RunApproval],
     ) -> Evaluation {
-        check_plugin_needs(&needs_input(needs, "fp"), policy, approvals, Utc::now())
+        check_plugin_needs(&needs_input(needs, "fp"), policy, approvals, evaluated_at())
     }
 
     #[test]
@@ -945,7 +961,7 @@ mod tests {
         let policy = plugin_policy(vec![], vec![]);
         let mut input = needs_input(&[], "fp");
         input.unrestricted = true;
-        match check_plugin_needs(&input, &policy, &[], Utc::now()) {
+        match check_plugin_needs(&input, &policy, &[], evaluated_at()) {
             Evaluation::Ask { matched } => {
                 assert_eq!(matched, vec!["plugin:demo:legacy-confirmed".to_string()])
             }
@@ -996,7 +1012,7 @@ mod tests {
             },
         );
         let expired = Capability {
-            expires_at: Some(Utc::now() - chrono::Duration::hours(1)),
+            expires_at: Some(evaluated_at() - chrono::Duration::hours(1)),
             ..need.clone()
         };
         let policy = plugin_policy(vec![need.clone()], vec![expired]);

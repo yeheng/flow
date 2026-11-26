@@ -9,11 +9,11 @@
 //! pending 的那一次请求实例」的裁决（I32）；同 hash 重复提交返回既有结论，
 //! 换了 hash 拒绝。
 use crate::journal::{CommandReceipt, JournalBackend, JournalError};
+use flow_domain::journal_state::{
+    ApprovalState, ApprovalStatus, Operation, PermissionDecidedPayload, Run, State,
+};
 use flow_dto::permission::{
     ApprovalScope, Decision, DecisionRecord, Modifiers, NodePermissions, Principal, RunApproval,
-};
-use flow_engine::journal_state::{
-    ApprovalState, ApprovalStatus, Operation, PermissionDecidedPayload, Run, State,
 };
 use flow_journal::{Event, EventKind, StoredValue};
 use serde_json::{json, Value};
@@ -39,7 +39,7 @@ impl JournalBackend {
     /// 计算某个定义版本的权限内容摘要（legacy = None），按 checksum 缓存。
     pub(crate) async fn version_permissions_digest(
         &self,
-        version: &flow_engine::journal_state::DefinitionVersion,
+        version: &flow_domain::journal_state::DefinitionVersion,
     ) -> Result<Option<String>> {
         let cache = PERMISSION_DIGEST_CACHE.get_or_init(Default::default);
         if let Some(hit) = cache
@@ -535,11 +535,11 @@ fn decide(
 /// 有效权限（`permissions.effective`）：设计期按指定定义版本、运行期按冻结
 /// 快照，不混用「当前配置」与「该次运行」（§7.3）。不返回任何 secret 值。
 pub fn effective_permissions(
-    definition: &flow_engine::Definition,
+    definition: &flow_domain::Definition,
     policy: Option<&flow_dto::permission::FrozenPolicy>,
     node_id: Option<&str>,
     bindings: Option<
-        &std::collections::BTreeMap<String, flow_engine::journal_state::PluginBinding>,
+        &std::collections::BTreeMap<String, flow_domain::journal_state::PluginBinding>,
     >,
 ) -> Value {
     let frozen = policy
@@ -594,7 +594,7 @@ pub fn effective_permissions(
                 "node_type": node.node_type,
                 "mode": mode,
                 "allow": caps,
-                "side_effect": node.kind().is_none_or(flow_engine::NodeType::has_side_effect),
+                "side_effect": node.kind().is_none_or(flow_domain::NodeType::has_side_effect),
             })
         })
         .collect();
@@ -643,10 +643,16 @@ impl JournalBackend {
             }
         };
         let grants = self.inspect(|state| state.plugin_grants.clone()).await;
-        let running = self.services.lock().await.keys().cloned().collect::<std::collections::BTreeSet<_>>();
+        let running = self
+            .services
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
         snapshot.rows.iter().map(|row| {
             let value = if let Some(plugin) = &row.plugin {
-                let key = flow_engine::journal_state::PluginGrant::key(
+                let key = flow_domain::journal_state::PluginGrant::key(
                     &plugin.manifest.plugin.id, &plugin.content_hash,
                 );
                 let exact = grants.get(&key);
@@ -696,7 +702,9 @@ impl JournalBackend {
                 .filter_map(|row| row.plugin)
                 .collect();
             crate::plugin_registry::bundled_or_discovered_with_plugins(&selected_id, &plugins)
-        }).await.map_err(|error| crate::journal::JournalError::Storage(error.to_string()))?;
+        })
+        .await
+        .map_err(|error| crate::journal::JournalError::Storage(error.to_string()))?;
         let Some(identity) = identity else {
             return Err(
                 flow_journal::Error::NotFound(format!("plugin {plugin_id} not deployed")).into(),
@@ -728,7 +736,7 @@ impl JournalBackend {
                 continue;
             };
             let key =
-                flow_engine::journal_state::PluginGrant::key(plugin_id, &identity.content_hash);
+                flow_domain::journal_state::PluginGrant::key(plugin_id, &identity.content_hash);
             let already = self
                 .inspect(|state| state.plugin_grants.contains_key(&key))
                 .await;
@@ -755,7 +763,7 @@ fn build_grant(
     capability_ids: &Option<Vec<String>>,
     legacy_confirm: bool,
     state: &State,
-) -> flow_journal::Result<flow_engine::journal_state::PluginGrant> {
+) -> flow_journal::Result<flow_domain::journal_state::PluginGrant> {
     if identity.legacy {
         if !legacy_confirm {
             return Err(flow_journal::Error::Invalid(format!(
@@ -763,7 +771,7 @@ fn build_grant(
                 identity.plugin_id
             )));
         }
-        return Ok(flow_engine::journal_state::PluginGrant {
+        return Ok(flow_domain::journal_state::PluginGrant {
             plugin_id: identity.plugin_id.clone(),
             content_hash: identity.content_hash.clone(),
             capabilities: Vec::new(),
@@ -797,7 +805,7 @@ fn build_grant(
             cap
         })
         .collect();
-    Ok(flow_engine::journal_state::PluginGrant {
+    Ok(flow_domain::journal_state::PluginGrant {
         plugin_id: identity.plugin_id.clone(),
         content_hash: identity.content_hash.clone(),
         capabilities,

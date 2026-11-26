@@ -217,7 +217,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     // 临时文件名带唯一后缀：并发写不会互相覆盖临时文件。
     let tmp = parent.join(format!(
         ".flow-secret-{}.tmp",
-        crate::execution_protocol::transport::fresh_boot_id()
+        flow_dispatcher::execution_protocol::transport::fresh_boot_id()
     ));
     let result = (|| {
         {

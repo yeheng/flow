@@ -1,4 +1,4 @@
-use flow_engine::execution_protocol::message::Message;
+use flow_dispatcher::execution_protocol::message::Message;
 use flow_plugin_runtime::transfer::IncomingTransfers;
 use sha2::{Digest, Sha256};
 

@@ -3,10 +3,8 @@ use flow_backend::{
     execution::{ExecutionMode, IpcOptions},
     journal::JournalBackend,
 };
-use flow_engine::{
-    execution_protocol::ExecutorInvocation,
-    journal_state::{NodeStatus, RunStatus, WaitKind},
-};
+use flow_dispatcher::execution_protocol::ExecutorInvocation;
+use flow_domain::journal_state::{NodeStatus, RunStatus, WaitKind};
 use flow_test_support::provider::{spawn_mock_openai, MockProvider, Turn};
 use serde_json::{json, Value};
 use std::{sync::Arc, time::Duration};
@@ -20,7 +18,7 @@ async fn start(root: &std::path::Path, provider: &MockProvider) -> (Arc<JournalB
         .await
         .unwrap();
     backend
-        .install_harness_agent(Some(flow_engine::AgentRunConfig {
+        .install_harness_agent(Some(flow_dto::AgentRunConfig {
             base_url: provider.base_url(),
             model: "mock-model".into(),
             max_turns: Some(4),

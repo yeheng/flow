@@ -7,7 +7,7 @@
 //! - 版本不兼容（假二进制）在握手处明确失败
 
 use flow_backend::journal::JournalBackend;
-use flow_engine::journal_state::RunStatus;
+use flow_domain::journal_state::RunStatus;
 use flow_journal::JournalOptions;
 use flow_test_support::io::LocalDeployment;
 use serde_json::json;
@@ -86,9 +86,10 @@ async fn missing_executor_binary_fails_loudly_without_fallback() {
     let result = backend
         .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
             flow_backend::execution::IpcOptions {
-                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
-                    root.join("does-not-exist"),
-                ),
+                executor:
+                    flow_dispatcher::execution_protocol::contract::ExecutorInvocation::explicit(
+                        root.join("does-not-exist"),
+                    ),
                 x_max: 1,
                 tag: None,
             },
@@ -278,9 +279,10 @@ async fn incompatible_executor_binary_fails_handshake_and_node_errors() {
     backend
         .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
             flow_backend::execution::IpcOptions {
-                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
-                    fake,
-                ),
+                executor:
+                    flow_dispatcher::execution_protocol::contract::ExecutorInvocation::explicit(
+                        fake,
+                    ),
                 x_max: 1,
                 tag: None,
             },
@@ -334,9 +336,10 @@ async fn parent_close_reaps_executor_without_orphans() {
     backend
         .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
             flow_backend::execution::IpcOptions {
-                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
-                    executor_bin(),
-                ),
+                executor:
+                    flow_dispatcher::execution_protocol::contract::ExecutorInvocation::explicit(
+                        executor_bin(),
+                    ),
                 x_max: 1,
                 tag: Some(tag.clone()),
             },
@@ -390,9 +393,10 @@ async fn repeated_cancel_and_rebuild_leaves_no_orphans() {
     backend
         .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
             flow_backend::execution::IpcOptions {
-                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
-                    executor_bin(),
-                ),
+                executor:
+                    flow_dispatcher::execution_protocol::contract::ExecutorInvocation::explicit(
+                        executor_bin(),
+                    ),
                 x_max: 1,
                 tag: Some(tag.clone()),
             },
@@ -497,9 +501,10 @@ async fn executor_child_gets_cleared_env_and_isolated_fds() {
     backend
         .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
             flow_backend::execution::IpcOptions {
-                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
-                    wrapper.clone(),
-                ),
+                executor:
+                    flow_dispatcher::execution_protocol::contract::ExecutorInvocation::explicit(
+                        wrapper.clone(),
+                    ),
                 x_max: 1,
                 tag: None,
             },

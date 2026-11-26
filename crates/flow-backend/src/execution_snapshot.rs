@@ -1,5 +1,5 @@
 use crate::journal::{JournalBackend, JournalError};
-use flow_engine::journal_state::ExecutionSnapshot;
+use flow_domain::journal_state::ExecutionSnapshot;
 use flow_journal::{Error, StoredValue};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -36,14 +36,14 @@ impl JournalBackend {
             plugin_types.extend(
                 def.nodes
                     .iter()
-                    .filter_map(flow_engine::Node::plugin_type)
+                    .filter_map(flow_domain::Node::plugin_type)
                     .map(str::to_owned),
             );
             if key == root_key && def.semantics == 1 {
                 return Ok((selected, root.definition, None, plugin_types));
             }
             for node in &def.nodes {
-                if node.kind() != Some(flow_engine::NodeType::SubWorkflow) {
+                if node.kind() != Some(flow_domain::NodeType::SubWorkflow) {
                     continue;
                 }
                 let child = node.params["workflow_id"]
@@ -89,7 +89,7 @@ impl JournalBackend {
             root.definition,
             Some(ExecutionSnapshot {
                 environment: None,
-                runtime: flow_engine::RUNTIME_ID.into(),
+                runtime: flow_dispatcher::execution_protocol::contract::RUNTIME_ID.into(),
                 clock_ms: chrono::Utc::now().timestamp_millis(),
                 seed: crate::journal_commands::id(),
                 path: Vec::new(),
@@ -99,7 +99,7 @@ impl JournalBackend {
                 correlation_id: None,
                 agent: self.harness_agent_config(),
                 agent_plugin: self.harness_agent_plugin_meta().map(|meta| {
-                    flow_engine::journal_state::AgentPluginSnapshot {
+                    flow_domain::journal_state::AgentPluginSnapshot {
                         id: meta.id,
                         version: meta.version,
                         ui: meta.ui,
@@ -119,7 +119,7 @@ impl JournalBackend {
         &self,
         workflow: &str,
         version: Option<u64>,
-    ) -> Result<flow_engine::journal_state::DefinitionVersion, JournalError> {
+    ) -> Result<flow_domain::journal_state::DefinitionVersion, JournalError> {
         let selected = self
             .inspect_committed(|state| {
                 let metadata = state

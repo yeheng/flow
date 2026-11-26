@@ -1,5 +1,5 @@
-use flow_engine::observation::{ObservationOptions, ObservationStore};
-use flow_engine::{LogLevel, LogLine, LogStream, NodeLogger};
+use flow_backend::observation::{ObservationOptions, ObservationStore};
+use flow_engine::{LogLevel, LogLine, LogStream};
 
 #[test]
 fn bounded_observations_survive_restart_and_record_loss() {
@@ -9,10 +9,15 @@ fn bounded_observations_survive_restart_and_record_loss() {
         retained_bytes: 32 * 1024,
     };
     let store = ObservationStore::open(&root, options.clone()).unwrap();
-    let target = store.logger("r".into(), "d".into());
-    let logger = NodeLogger::observation(target, "n".into(), 1);
+    let logger = store.logger("r".into(), "d".into());
     for _ in 0..10_000 {
-        logger.log(LogLevel::Warn, LogStream::Stderr, "x".repeat(1024));
+        logger.emit(LogLine::new(
+            "n".into(),
+            1,
+            LogLevel::Warn,
+            LogStream::Stderr,
+            &"x".repeat(1024),
+        ));
     }
     store.flush();
     assert!(store.loss().queue_dropped + store.loss().retention_dropped > 0);

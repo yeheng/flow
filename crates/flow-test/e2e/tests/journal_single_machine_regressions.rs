@@ -267,7 +267,7 @@ async fn config_patch_rejects_system_fields_before_commit() {
 async fn ipc(b: &std::sync::Arc<JournalBackend>, tag: Option<String>, prewarm: bool) {
     b.start_execution_ipc_prewarm(
         flow_backend::execution::ExecutionMode::Ipc(flow_backend::execution::IpcOptions {
-            executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
+            executor: flow_dispatcher::execution_protocol::contract::ExecutorInvocation::explicit(
                 flow_test_support::io::executor_bin(),
             ),
             x_max: 1,
@@ -334,11 +334,11 @@ async fn cancelling_child_settles_parent_and_survives_restart() {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let r = b.run_snapshot(parent_id).await.unwrap().unwrap();
     assert!(r.terminal());
-    assert_eq!(r.status, flow_engine::journal_state::RunStatus::Failed);
+    assert_eq!(r.status, flow_domain::journal_state::RunStatus::Failed);
     assert!(r.nodes["c"].wait.is_none());
     assert_eq!(
         b.run_snapshot(&child_id).await.unwrap().unwrap().status,
-        flow_engine::journal_state::RunStatus::Cancelled
+        flow_domain::journal_state::RunStatus::Cancelled
     );
     b.close().await.unwrap();
 }

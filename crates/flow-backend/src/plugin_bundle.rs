@@ -173,10 +173,10 @@ pub fn inspect(directory: &Path) -> Result<SealedBundle> {
         return Err(BundleError::Invalid("protocol major mismatch".into()));
     }
     if manifest.plugin.node_types.iter().any(|name| {
-        flow_engine::NodeType::parse(name).is_some_and(|kind| {
+        flow_domain::NodeType::parse(name).is_some_and(|kind| {
             !matches!(
                 kind,
-                flow_engine::NodeType::Harness | flow_engine::NodeType::Llm
+                flow_domain::NodeType::Harness | flow_domain::NodeType::Llm
             )
         })
     }) {

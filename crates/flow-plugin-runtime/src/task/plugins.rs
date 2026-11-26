@@ -166,7 +166,8 @@ impl TaskRunner {
             .map(str::to_owned);
         let credentials = self.authorize_operation(request).await?;
         let credential = secret_ref.and_then(|name| {
-            flow_engine::execution_protocol::credential_for(&credentials, &name).map(str::to_owned)
+            flow_dispatcher::execution_protocol::credential_for(&credentials, &name)
+                .map(str::to_owned)
         });
         // 注册表路由：llm → 插件（内置默认注册或 manifest 发现）。
         let plugin = match self.plugins.resolve("llm") {
@@ -373,9 +374,10 @@ impl TaskRunner {
                 for field in &form.fields {
                     if matches!(field.widget, flow_config::plugin_manifest::Widget::Secret) {
                         if let Some(name) = params.get(&field.key).and_then(Value::as_str) {
-                            if let Some(value) =
-                                flow_engine::execution_protocol::credential_for(&credentials, name)
-                            {
+                            if let Some(value) = flow_dispatcher::execution_protocol::credential_for(
+                                &credentials,
+                                name,
+                            ) {
                                 params[&field.key] = Value::String(value.to_string());
                             }
                         }
@@ -522,7 +524,8 @@ impl TaskRunner {
             .map(str::to_owned);
         let credentials = self.authorize_operation(request).await?;
         let credential = secret_ref.and_then(|name| {
-            flow_engine::execution_protocol::credential_for(&credentials, &name).map(str::to_owned)
+            flow_dispatcher::execution_protocol::credential_for(&credentials, &name)
+                .map(str::to_owned)
         });
         // 生命周期截止时间从授权后起算：覆盖装配、回合、清理与落账，
         // 避免任一阶段无限延长节点占用。
@@ -532,7 +535,7 @@ impl TaskRunner {
         //
         // Independent of Tokio progress and heartbeats. If synchronous host code
         // blocks the runtime, the managed process still exits within a bounded grace.
-        let _watchdog = flow_engine::process::AgentWatchdog::start(
+        let _watchdog = flow_dispatcher::process::AgentWatchdog::start(
             Duration::from_millis(timeout_ms),
             self.cancel.clone(),
         )
@@ -624,7 +627,7 @@ impl TaskRunner {
     #[allow(clippy::too_many_arguments)]
     async fn agent_run(
         &mut self,
-        config: &flow_engine::AgentRunConfig,
+        config: &flow_dto::AgentRunConfig,
         prompt: &str,
         api_key: &str,
         workdir: &std::path::Path,
@@ -916,7 +919,7 @@ async fn forward_permission_request(
     // 控制帧预算预检：工具参数必须整体装进控制帧（截断 = 拒绝，不静默）。
     let probe = postcard_probe(&request);
     match probe {
-        Ok(bytes) if bytes.len() > flow_engine::execution_protocol::CONTROL_MAX_FRAME => {
+        Ok(bytes) if bytes.len() > flow_dispatcher::execution_protocol::CONTROL_MAX_FRAME => {
             return error_response("工具参数超过控制帧预算（写入内容过大）".into())
         }
         Err(error) => return error_response(format!("tool request encode failed: {error}")),

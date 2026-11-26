@@ -7,8 +7,8 @@
 //! - Text 消息拒绝：认证通过后发 Text，会话必须拒绝关闭。
 
 use flow_backend::journal::JournalBackend;
-use flow_engine::execution_protocol::transport::FrameTransport;
-use flow_engine::journal_state::{Run, RunStatus};
+use flow_dispatcher::execution_protocol::transport::FrameTransport;
+use flow_domain::journal_state::{Run, RunStatus};
 use flow_journal::JournalOptions;
 use serde_json::{json, Value};
 use std::sync::Arc;

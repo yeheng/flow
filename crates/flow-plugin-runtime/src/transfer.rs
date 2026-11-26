@@ -20,7 +20,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use flow_engine::execution_protocol::message::Message;
+use flow_dispatcher::execution_protocol::message::Message;
 use flow_facts::value::{Chunk, ValueCodec, ValueRef};
 use flow_facts::{StoredValue, CHUNK_BYTES, INLINE_BYTES, MAX_VALUE_BYTES};
 

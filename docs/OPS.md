@@ -31,7 +31,7 @@ dist/journal/
 ```
 
 **`flow-executor` 必须与主进程同目录**。定位规则
-（`ExecutorInvocation::locate`，`flow-engine/src/execution_protocol/contract.rs`）：
+（`ExecutorInvocation::locate`，`flow-dispatcher/src/execution_protocol/contract.rs`）：
 
 ```
 FLOW_EXECUTOR_BIN 显式路径（最高优先）
@@ -439,7 +439,7 @@ agent 上联握手 `AgentHello`/`AgentWelcome` 的 `version` 字段不符直接�
 不协商、不降级、不逐帧校验（版本门集中在握手）。postcard 的变体索引是
 位置编码，没有版本门的跨版本配对会静默错解成另一个消息类型。
 
-改 `flow-engine/src/execution_protocol/contract.rs` 的任何常量都构成协议变更，
+改 `flow-dispatcher/src/execution_protocol/contract.rs` 的任何常量都构成协议变更，
 必须 bump `PROTOCOL_VERSION`。升级 = **同批替换全部二进制**
 （`flow-journal-server` + `flow-executor` + `flow-agent`）。
 v7 的执行上下文和 regression 隔离要求同批替换全部二进制，旧执行器/agent 在握手处拒绝。

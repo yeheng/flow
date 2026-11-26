@@ -147,6 +147,24 @@ pub struct LogLine {
     pub message: String,
 }
 
+impl LogLine {
+    pub fn new(
+        node_id: String,
+        attempt: u32,
+        level: LogLevel,
+        stream: LogStream,
+        message: &str,
+    ) -> Self {
+        Self {
+            node_id,
+            attempt,
+            level,
+            stream,
+            message: truncate_message(&redact_text(message)),
+        }
+    }
+}
+
 /// 单节点的日志发射器。Clone 进 exec 任务 / QuickJS console 桥接。
 /// 通道满/接收端已关一律静默（fire-and-forget，日志永远不影响执行）。
 #[derive(Clone)]
@@ -157,18 +175,13 @@ pub struct NodeLogger {
     attempt: u32,
 }
 
-/// 日志的实际去处。三种目标对应三种丢失语义：Legacy 无界通道（不丢，
-/// 但可能堆积）、Bounded 有界通道（满了计丢弃）、Observation 观测存储
-///（自带队列与磁盘预算，有独立的丢失口径）。
+/// 日志的实际去处。无界通道可能堆积，有界通道满时记录丢失。
 #[derive(Clone)]
 enum LogTarget {
     /// 旧路径：无界通道。
     Legacy(UnboundedSender<LogLine>),
     /// 有界通道：满了就丢，并计量。
     Bounded(tokio::sync::mpsc::Sender<LogLine>, Arc<LogQueueLoss>),
-    /// 观测存储：写入独立的有界分段日志。
-    #[cfg(feature = "runtime")]
-    Observation(crate::observation::ObservationLogger),
 }
 
 /// 有界通道的丢弃计量。
@@ -215,24 +228,6 @@ impl NodeLogger {
         }
     }
 
-    /// 构造观测存储目标的 logger。
-    ///
-    /// 预算设为 `usize::MAX`：观测存储自己就有界（内存队列 + 磁盘预算），
-    /// 再叠一层 per-run 预算会让「为什么丢了」难以归因。
-    #[cfg(feature = "runtime")]
-    pub fn observation(
-        target: crate::observation::ObservationLogger,
-        node_id: String,
-        attempt: u32,
-    ) -> Self {
-        Self {
-            tx: LogTarget::Observation(target),
-            budget: LogBudget::new(usize::MAX),
-            node_id,
-            attempt,
-        }
-    }
-
     /// 无接收端的 logger（直接调用 exec 的测试路径用）：发射即丢，预算放行。
     pub fn disabled() -> NodeLogger {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -257,13 +252,7 @@ impl NodeLogger {
             }
             return;
         }
-        let line = LogLine {
-            node_id: self.node_id.clone(),
-            attempt: self.attempt,
-            level,
-            stream,
-            message: truncate_message(&redact_text(&message)),
-        };
+        let line = LogLine::new(self.node_id.clone(), self.attempt, level, stream, &message);
         match &self.tx {
             LogTarget::Legacy(tx) => {
                 let _ = tx.send(line);
@@ -277,8 +266,6 @@ impl NodeLogger {
                         .fetch_add(bytes as u64, Ordering::Relaxed);
                 }
             }
-            #[cfg(feature = "runtime")]
-            LogTarget::Observation(target) => target.emit(line),
         }
     }
 

@@ -16,9 +16,10 @@ use crate::journal::{JournalBackend, JournalError};
 use crate::journal_commands::node_event;
 use crate::journal_commands::runtime_mismatched;
 use crate::journal_execution::Attempt;
-use flow_engine::journal_state::{Node as NodeState, NodeStatus, Run, RunStatus, Wait, WaitKind};
-use flow_engine::progression::{is_settled, node_gate, run_settlement, NodeGate, RunSettlement};
-use flow_engine::{Definition, NodeLogger};
+use flow_domain::journal_state::{Node as NodeState, NodeStatus, Run, RunStatus, Wait, WaitKind};
+use flow_domain::progression::{is_settled, node_gate, run_settlement, NodeGate, RunSettlement};
+use flow_domain::Definition;
+use flow_engine::{LogLevel, LogLine, LogStream};
 use flow_journal::{Event, EventKind, StoredValue};
 use futures::FutureExt;
 use serde_json::{json, Value};
@@ -61,7 +62,7 @@ impl Coordinator {
     ///
     /// 审批挂起（09 §6.1）的派发已交还执行槽位（本地池 park），按挂起计数
     /// 扣除：几个夜间待审批不能占满 X_max。挂起本身受 A_MAX 约束（池侧）。
-    fn has_capacity(&self, node: &flow_engine::Node, parked: usize) -> bool {
+    fn has_capacity(&self, node: &flow_domain::Node, parked: usize) -> bool {
         let busy = self.tasks.len().saturating_sub(parked);
         busy < self.limit
             && (!node.is_harness_agent() || self.agents.len() < self.limit.div_ceil(2))
@@ -395,7 +396,8 @@ pub(crate) fn check_executor(options: &IpcOptions) -> Result<()> {
         return Err(invalid(format!(
             "executor binary missing: {}",
             options.executor.program.display()
-        )).into());
+        ))
+        .into());
     }
     Ok(())
 }
@@ -411,7 +413,7 @@ pub(crate) fn check_executor(options: &IpcOptions) -> Result<()> {
 async fn advance_run(
     backend: &Arc<JournalBackend>,
     port: &ExecutionPort,
-    observation: &Option<flow_engine::observation::ObservationStore>,
+    observation: &Option<crate::observation::ObservationStore>,
     run_id: &str,
     coord: &mut Coordinator,
 ) -> Result<()> {
@@ -438,7 +440,10 @@ async fn advance_run(
         // its gate from the same fresh snapshot without copying the full run.
         let Some((record, gate)) = backend
             .inspect(|state| -> flow_journal::Result<_> {
-                let run = state.runs.get(run_id).ok_or_else(|| invalid("run missing"))?;
+                let run = state
+                    .runs
+                    .get(run_id)
+                    .ok_or_else(|| invalid("run missing"))?;
                 Ok((!run.terminal()).then(|| {
                     (
                         run.nodes.get(&node.id).cloned(),
@@ -484,7 +489,8 @@ async fn advance_run(
                     continue;
                 }
                 #[cfg(feature = "fault-injection")]
-                crate::execution::dispatch::fault::checkpoint_for("dispatch:before", &node.id).await;
+                crate::execution::dispatch::fault::checkpoint_for("dispatch:before", &node.id)
+                    .await;
                 spawn_node_attempt(
                     backend,
                     port,
@@ -528,7 +534,7 @@ async fn cancel_if_parent_cancelled(backend: &Arc<JournalBackend>, run: &Run) ->
 async fn advance_committed_node(
     backend: &Arc<JournalBackend>,
     run_id: &str,
-    node: &flow_engine::Node,
+    node: &flow_domain::Node,
     record: &NodeState,
     wakes: &mut BTreeMap<i64, BTreeSet<String>>,
 ) -> Result<bool> {
@@ -705,9 +711,9 @@ async fn advance_committed_node(
 async fn spawn_node_attempt(
     backend: &Arc<JournalBackend>,
     port: &ExecutionPort,
-    observation: &Option<flow_engine::observation::ObservationStore>,
+    observation: &Option<crate::observation::ObservationStore>,
     run_id: &str,
-    node: &flow_engine::Node,
+    node: &flow_domain::Node,
     predecessors: BTreeMap<String, StoredValue>,
     coord: &mut Coordinator,
 ) -> Result<()> {
@@ -790,9 +796,9 @@ async fn spawn_node_attempt(
 async fn execute_node(
     dispatch: Result<NodeDispatch>,
     attempt: Attempt,
-    node: flow_engine::Node,
+    node: flow_domain::Node,
     predecessors: BTreeMap<String, StoredValue>,
-    observation: Option<flow_engine::observation::ObservationStore>,
+    observation: Option<crate::observation::ObservationStore>,
 ) -> NodeTask {
     let key: NodeKey = (attempt.run_id.clone(), attempt.node_id.clone());
     let result = AssertUnwindSafe(async {
@@ -800,11 +806,11 @@ async fn execute_node(
             .execute(&attempt, &node, predecessors.clone(), observation.clone())
             .await
     })
-        .catch_unwind()
-        .await
-        .unwrap_or_else(|_| {
-            Err(invalid("node execution panicked; committed operation evidence retained").into())
-        });
+    .catch_unwind()
+    .await
+    .unwrap_or_else(|_| {
+        Err(invalid("node execution panicked; committed operation evidence retained").into())
+    });
     if let Err(error) = &result {
         if let Ok(snapshot) = attempt.snapshot().await {
             let Some(n) = snapshot.nodes.get(&attempt.node_id) else {
@@ -851,15 +857,16 @@ async fn execute_node(
                 payload["retry_wake_at"] =
                     json!(chrono::Utc::now().timestamp_millis().saturating_add(delay));
                 if let Some(store) = &observation {
-                    NodeLogger::observation(
-                        store.logger(attempt.run_id.clone(), attempt.dispatch_id.clone()),
+                    let line = LogLine::new(
                         attempt.node_id.clone(),
                         n.attempt,
-                    )
-                    .warn(format!(
-                        "第 {} 次尝试失败，{}ms 后自动重试",
-                        n.attempt, delay
-                    ));
+                        LogLevel::Warn,
+                        LogStream::Engine,
+                        &format!("第 {} 次尝试失败，{}ms 后自动重试", n.attempt, delay),
+                    );
+                    store
+                        .logger(attempt.run_id.clone(), attempt.dispatch_id.clone())
+                        .emit(line);
                 }
             }
             // 失败证据落账失败必须留痕（铁律 1 的运维面）：吞错会让节点
@@ -928,7 +935,7 @@ async fn settle_run(
             }
             Err(e) => return Err(e.into()),
         };
-        if let Err(error) = flow_engine::schema::validate(schema, &actual) {
+        if let Err(error) = flow_domain::schema::validate(schema, &actual) {
             return finish_run(
                 backend,
                 run_id,
@@ -1005,7 +1012,7 @@ mod regression_tests {
             .start_execution_ipc(crate::execution::ExecutionMode::Ipc(
                 crate::execution::IpcOptions {
                     executor:
-                        flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
+                        flow_dispatcher::execution_protocol::contract::ExecutorInvocation::explicit(
                             flow_test_support::io::executor_bin(),
                         ),
                     x_max,

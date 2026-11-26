@@ -24,7 +24,7 @@
 
 //!   Resource/history/soak evidence. Run release builds; JSON reports include actual durations.
 use flow_backend::journal::JournalBackend;
-use flow_engine::journal_state::{Run, RunStatus, WaitKind};
+use flow_domain::journal_state::{Run, RunStatus, WaitKind};
 use flow_journal::{Event, EventKind, StoredValue};
 use serde_json::{json, Value};
 use std::{
@@ -87,7 +87,7 @@ async fn snapshot(b: &JournalBackend, id: &str) -> Result<Option<Run>> {
     }
 }
 /// 取等待类型（信号等待 / 人工等待）。
-fn wait_kind(wait: &flow_engine::journal_state::Wait) -> WaitKind {
+fn wait_kind(wait: &flow_domain::journal_state::Wait) -> WaitKind {
     #[cfg(feature = "legacy-baseline")]
     {
         // The persisted shape is shared by both revisions; this adapter also
@@ -542,7 +542,7 @@ async fn soak(root: &Path, seconds: u64, executor: PathBuf, include_agents: bool
         // 缺省 harness 沙箱落 flow 主目录：钉在压测 ROOT 下，别碰真实 ~/.flow
         // （executor 经 env 白名单继承）
         std::env::set_var("FLOW_HOME", root.join("home"));
-        b.install_harness_agent(Some(flow_engine::AgentRunConfig {
+        b.install_harness_agent(Some(flow_dto::AgentRunConfig {
             base_url: provider.base_url(),
             model: "mock-capacity-model".into(),
             max_turns: Some(4),
@@ -554,7 +554,7 @@ async fn soak(root: &Path, seconds: u64, executor: PathBuf, include_agents: bool
     };
     b.start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
         flow_backend::execution::IpcOptions {
-            executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
+            executor: flow_dispatcher::execution_protocol::contract::ExecutorInvocation::explicit(
                 executor,
             ),
             x_max: 4,

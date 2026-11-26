@@ -63,9 +63,10 @@ fn resolve_caller(ctx: &Context, method: &str, supplied: &str) -> Result<Caller,
         // 权限管理（grant/keys）admin。
         let required: &'static str = match method {
             "run.approve" | "run.deny" => "approve",
-            "permissions.grant" | "plugins.install" | "plugins.uninstall" | "plugins.deployment" => "admin",
+            "permissions.grant" | "plugins.install" | "plugins.uninstall"
+            | "plugins.deployment" => "admin",
             "run.subscribe" => "read",
-            m if flow_dto::rpc::is_read_method(m) => "read",
+            m if flow_rpc_contract::is_read_method(m) => "read",
             _ => "write",
         };
         if !key.has_scope(required, now) {
@@ -380,8 +381,8 @@ impl<'a> CommandStatusReq<'a> {
     }
 }
 
-use flow_dto::rpc::Method;
-pub use flow_dto::rpc::{is_read_method, is_write_method, READ_METHODS, WRITE_METHODS};
+use flow_rpc_contract::Method;
+pub use flow_rpc_contract::{is_read_method, is_write_method, READ_METHODS, WRITE_METHODS};
 
 /// 写命令的服务端命令 scope（`command.status` 查询键）。run.start 带来源
 /// 归因、run 族按 run_id 分域；其余就是方法名。
@@ -391,7 +392,7 @@ pub use flow_dto::rpc::{is_read_method, is_write_method, READ_METHODS, WRITE_MET
 /// 服务端才能认出「这是同一次写」。scope 规则必须与服务端侧一致，否则
 /// 客户端查回执会查错作用域。
 pub fn command_scope(method: &str, params: &Value) -> String {
-    flow_dto::command_scope(method, params)
+    flow_rpc_contract::command_scope(method, params)
 }
 
 /// 开发形态模块（不含产品装配）。
@@ -621,7 +622,9 @@ async fn dispatch_admitted(
                     .sync_scope(values, || backend.workflow_validate(definition)),
                 None => backend.workflow_validate(definition),
             })
-                .await.map_err(invalid)?.map_err(failure)
+            .await
+            .map_err(invalid)?
+            .map_err(failure);
         }
         Method::WorkflowImport => {
             let publish = p
@@ -881,9 +884,14 @@ async fn dispatch_admitted(
         Method::NodetypesList => {
             let defaults = b.plugin_defaults();
             let types = tokio::task::spawn_blocking(move || {
-                let snapshot = flow_backend::plugin_registry::installed_snapshot_cached_with_defaults(&defaults);
+                let snapshot =
+                    flow_backend::plugin_registry::installed_snapshot_cached_with_defaults(
+                        &defaults,
+                    );
                 crate::node_types(snapshot.rows.into_iter().filter_map(|row| row.plugin))
-            }).await.map_err(invalid)?;
+            })
+            .await
+            .map_err(invalid)?;
             return Ok(json!({"node_types": types}));
         }
         Method::ServicesList => return Ok(b.list_services(caller.permission_admin).await),
@@ -955,21 +963,58 @@ async fn dispatch_admitted(
             return Ok(json!({"value": value}));
         }
         Method::PluginsInstall => {
-            if !caller.permission_admin { return Err(invalid("plugin install requires admin")); }
-            let replace = p.get("replace").map(|v| v.as_bool().ok_or_else(|| invalid("replace must be a boolean"))).transpose()?.unwrap_or(false);
-            return b.plugin_install(text(&p, "source")?.to_owned(), replace, text(&p, "request_id")?.to_owned()).await.map_err(plugin_failure);
+            if !caller.permission_admin {
+                return Err(invalid("plugin install requires admin"));
+            }
+            let replace = p
+                .get("replace")
+                .map(|v| {
+                    v.as_bool()
+                        .ok_or_else(|| invalid("replace must be a boolean"))
+                })
+                .transpose()?
+                .unwrap_or(false);
+            return b
+                .plugin_install(
+                    text(&p, "source")?.to_owned(),
+                    replace,
+                    text(&p, "request_id")?.to_owned(),
+                )
+                .await
+                .map_err(plugin_failure);
         }
         Method::PluginsUninstall => {
-            if !caller.permission_admin { return Err(invalid("plugin uninstall requires admin")); }
-            let stop_first = p.get("stop_first").map(|v| v.as_bool().ok_or_else(|| invalid("stop_first must be a boolean"))).transpose()?.unwrap_or(false);
-            return b.plugin_uninstall(text(&p, "plugin_id")?.to_owned(), stop_first, text(&p, "request_id")?.to_owned()).await.map_err(plugin_failure);
+            if !caller.permission_admin {
+                return Err(invalid("plugin uninstall requires admin"));
+            }
+            let stop_first = p
+                .get("stop_first")
+                .map(|v| {
+                    v.as_bool()
+                        .ok_or_else(|| invalid("stop_first must be a boolean"))
+                })
+                .transpose()?
+                .unwrap_or(false);
+            return b
+                .plugin_uninstall(
+                    text(&p, "plugin_id")?.to_owned(),
+                    stop_first,
+                    text(&p, "request_id")?.to_owned(),
+                )
+                .await
+                .map_err(plugin_failure);
         }
         Method::PluginsList => {
             return Ok(json!({"plugins": b.plugins_view().await}));
         }
         Method::PluginsDeployment => {
-            if !caller.permission_admin { return Err(invalid("plugin deployment status requires admin")); }
-            return b.plugin_deployment(text(&p, "plugin_id")?).await.map_err(failure);
+            if !caller.permission_admin {
+                return Err(invalid("plugin deployment status requires admin"));
+            }
+            return b
+                .plugin_deployment(text(&p, "plugin_id")?)
+                .await
+                .map_err(failure);
         }
         Method::PluginsRecheck => return plugins_recheck(ctx).await,
         // ---- 09 权限模型 ----
@@ -1064,8 +1109,12 @@ async fn dispatch_admitted(
 /// 插件升级收紧闭集后，存量定义可能已非法——这个方法把漂移显式化，
 /// 不等它在凌晨三点的 run 里爆。
 async fn plugins_recheck(ctx: &Context) -> Result<Value, ErrorObjectOwned> {
-    let snapshot = tokio::task::spawn_blocking({ let defaults = ctx.backend.plugin_defaults(); move || flow_backend::plugin_registry::installed_snapshot_cached_with_defaults(&defaults) })
-        .await.map_err(invalid)?;
+    let snapshot = tokio::task::spawn_blocking({
+        let defaults = ctx.backend.plugin_defaults();
+        move || flow_backend::plugin_registry::installed_snapshot_cached_with_defaults(&defaults)
+    })
+    .await
+    .map_err(invalid)?;
     let dynamic = snapshot.dynamic_types();
     let forms = snapshot.forms();
     let b = &ctx.backend;
@@ -1087,7 +1136,7 @@ async fn plugins_recheck(ctx: &Context) -> Result<Value, ErrorObjectOwned> {
                 .cloned()
                 .unwrap_or_default();
             for node_value in nodes {
-                let Ok(node) = serde_json::from_value::<flow_engine::Node>(node_value) else {
+                let Ok(node) = serde_json::from_value::<flow_domain::Node>(node_value) else {
                     continue;
                 };
                 if dynamic.contains(&node.node_type) {
@@ -1102,7 +1151,7 @@ async fn plugins_recheck(ctx: &Context) -> Result<Value, ErrorObjectOwned> {
                             "reason": reason,
                         }));
                     }
-                } else if flow_engine::NodeType::parse(&node.node_type).is_none() {
+                } else if flow_domain::NodeType::parse(&node.node_type).is_none() {
                     violations.push(json!({
                         "workflow_id": workflow_id,
                         "version": version,
@@ -1117,47 +1166,23 @@ async fn plugins_recheck(ctx: &Context) -> Result<Value, ErrorObjectOwned> {
     Ok(json!({"violations": violations}))
 }
 
-/// 观测分页：run 存在性以 projection 为准；store 未启用时返回空页 + 丢失
-/// 标记（history_incomplete）。
-///
-/// 「丢失」必须显式出现在响应里而不是伪装成空列表：客户端据此知道这段
-/// 历史不可信，不能拿它做完整性判断。
 async fn observations_page(b: &JournalBackend, p: &Value) -> Result<Value, ErrorObjectOwned> {
     let run_id = text(p, "run_id")?.to_owned();
-    // 存在性以投影为准：投影是「这个 run 被系统承认过」的权威判据。
-    if !journal_views::run_exists(b, &run_id).await.map_err(invalid)? {
-        return Err(ErrorObjectOwned::owned(-32011, "run not found", None::<()>));
+    match journal_views::run_observations(b, run_id)
+        .await
+        .map_err(invalid)?
+    {
+        journal_views::RunObservations::Missing => {
+            Err(ErrorObjectOwned::owned(-32011, "run not found", None::<()>))
+        }
+        journal_views::RunObservations::Disabled(page) => Ok(page),
+        journal_views::RunObservations::Available(reader) => {
+            let from = decimal_param(p, "from_seq")?;
+            let dispatch = p["dispatch_id"].as_str().map(str::to_owned);
+            let limit = p["limit"].as_u64();
+            reader.page(dispatch, from, limit).await.map_err(invalid)
+        }
     }
-    // 观测存储未启用（可选组件）时返回空页 + 丢失标记，而不是报错：
-    // 客户端要能继续用同一个会话读其他方法。
-    let Some(store) = b.observations.clone() else {
-        return Ok(json!({
-            "records": [],
-            "loss": {"history_incomplete": true},
-            "loss_scope": "store",
-        }));
-    };
-    let from = decimal_param(p, "from_seq")?;
-    let dispatch = p["dispatch_id"].as_str().map(str::to_owned);
-    // 上限 256：单页过大既拖慢投影查询，也让前端一次要处理太多记录。
-    let limit = p["limit"].as_u64().unwrap_or(100).min(256) as usize;
-    // 磁盘扫描类操作放到阻塞线程池，避免占住异步 worker 把整个 RPC 面
-    // 卡住。
-    tokio::task::spawn_blocking(move || {
-        let records = store
-            .page(&run_id, dispatch.as_deref(), from, limit)
-            .map_err(invalid)?;
-        Ok(json!({
-            "records": records,
-            // 两级丢失范围分开报：dispatch 级（某次派发内）与 run 级
-            // （整条 run）的丢失含义不同，客户端处理方式也不同。
-            "loss": store.scoped_loss(&run_id, dispatch.as_deref()),
-            "loss_scope": if dispatch.is_some() { "dispatch" } else { "run" },
-            "store_loss": store.loss(),
-        }))
-    })
-    .await
-    .map_err(invalid)?
 }
 
 /// workflow.list / run.list / legacy.list：projection 快照 + 游标。
@@ -1173,7 +1198,9 @@ async fn snapshot_list(
     let kind = method.split('.').next().unwrap();
     let after = p["after"].as_str().unwrap_or("");
     let limit = p["limit"].as_u64().unwrap_or(64).min(256) as usize;
-    journal_views::snapshot_list(b, kind, after, limit).await.map_err(storage_failure)
+    journal_views::snapshot_list(b, kind, after, limit)
+        .await
+        .map_err(storage_failure)
 }
 
 /// workflow.get / run.get / legacy.get：单键快照。
@@ -1193,7 +1220,9 @@ async fn snapshot_get(
             _ => "workflow_id",
         },
     )?;
-    journal_views::snapshot_get(b, kind, key).await.map_err(storage_failure)
+    journal_views::snapshot_get(b, kind, key)
+        .await
+        .map_err(storage_failure)
 }
 
 /// run.events.page / run.audit.page：游标化 journal 事件/审计分页。
@@ -1208,8 +1237,9 @@ async fn events_page(
     let read = open_run_events(b, p).await?;
     let stream = match method {
         "run.events.page" => EventStream::Control,
-        "run.audit.page" if p.get("filter").and_then(Value::as_str) == Some("permission") =>
-            EventStream::Permission,
+        "run.audit.page" if p.get("filter").and_then(Value::as_str) == Some("permission") => {
+            EventStream::Permission
+        }
         _ => EventStream::Audit,
     };
     read.page(stream, p.get("cursor"), p.get("limit"))
@@ -1235,7 +1265,9 @@ fn event_read_failure(error: EventReadError) -> ErrorObjectOwned {
 }
 
 async fn permissions_audit_page(b: &JournalBackend, p: &Value) -> Result<Value, ErrorObjectOwned> {
-    journal_views::permissions_audit_page(b, p).await.map_err(event_read_failure)
+    journal_views::permissions_audit_page(b, p)
+        .await
+        .map_err(event_read_failure)
 }
 
 /// 产品面：工作流清单视图。
@@ -1340,7 +1372,9 @@ async fn run_list_view(b: &JournalBackend, p: &Value) -> Result<Value, ErrorObje
 async fn events_view(b: &JournalBackend, p: &Value) -> Result<Value, ErrorObjectOwned> {
     let read = open_run_events(b, p).await?;
     let from = decimal_param(p, "from_seq")?;
-    read.from_sequence(from, p.get("cursor")).await.map_err(event_read_failure)
+    read.from_sequence(from, p.get("cursor"))
+        .await
+        .map_err(event_read_failure)
 }
 
 /// schedule/webhook/template CRUD：cron 与模板片段校验后走统一产品命令
@@ -1372,7 +1406,7 @@ async fn product_command_route(
         && p.get("edges").is_some()
     {
         Some(
-            flow_engine::template::normalize_fragment(&p["nodes"], &p["edges"])
+            flow_domain::template::normalize_fragment(&p["nodes"], &p["edges"])
                 .map_err(|e| failure(e.into()))?,
         )
     } else {
@@ -1587,7 +1621,13 @@ async fn subscribe_run_events(
         Ok(s) => s,
         Err(_) => return,
     };
-    let mut tail = RunEventTail::new(ctx.backend.clone(), run_id.clone(), from_seq, from_lsn, audit);
+    let mut tail = RunEventTail::new(
+        ctx.backend.clone(),
+        run_id.clone(),
+        from_seq,
+        from_lsn,
+        audit,
+    );
     loop {
         if sink.is_closed() {
             return;
@@ -1610,8 +1650,7 @@ async fn subscribe_run_events(
             };
             // 单帧超过上限时先发一帧明确的 stream_error 再断流：
             // 客户端据此知道「事件流因体积中断」，而不是「事件流已结束」。
-            if flow_facts::codec::bounded_json(&payload, flow_facts::MAX_LINE_BYTES - 1024)
-                .is_err()
+            if flow_facts::codec::bounded_json(&payload, flow_facts::MAX_LINE_BYTES - 1024).is_err()
             {
                 if let Ok(message) = jsonrpsee::server::SubscriptionMessage::new(
                     "run.event",
@@ -1738,9 +1777,18 @@ mod tests {
         use flow_backend::{plugin_bundle::BundleError, plugin_operation::OperationError};
         for (error, code) in [
             (OperationError::Invalid("bad path".into()), -32602),
-            (OperationError::Conflict("plugin operation superseded".into()), -32012),
-            (OperationError::Bundle(BundleError::Limit("plugin limit reached".into())), -32021),
-            (OperationError::Io(std::io::Error::other("rename failed")), -32603),
+            (
+                OperationError::Conflict("plugin operation superseded".into()),
+                -32012,
+            ),
+            (
+                OperationError::Bundle(BundleError::Limit("plugin limit reached".into())),
+                -32021,
+            ),
+            (
+                OperationError::Io(std::io::Error::other("rename failed")),
+                -32603,
+            ),
         ] {
             let mapped = super::plugin_failure(error);
             assert_eq!(mapped.code(), code);

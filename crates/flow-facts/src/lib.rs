@@ -1,6 +1,7 @@
 //! Persisted fact and value contracts, independent of the journal writer.
 
 pub mod codec;
+pub mod command;
 pub mod value;
 pub use codec::{Event, EventKind, Transaction};
 pub use value::{StoredValue, ValueRef};

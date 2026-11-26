@@ -2,11 +2,11 @@
 
 use std::future::Future;
 
+use crate::secrets::{get_secret, ENVIRONMENT_CREDENTIALS};
 use flow_config::plugin_manifest::Widget;
+use flow_dispatcher::execution_protocol::message::PermitCredential;
+use flow_domain::journal_state::Run;
 use flow_dto::permission::OperationSpec;
-use flow_engine::execution_protocol::message::PermitCredential;
-use flow_engine::journal_state::Run;
-use flow_engine::secrets::{get_secret, ENVIRONMENT_CREDENTIALS};
 use flow_journal::StoredValue;
 use serde_json::Value;
 

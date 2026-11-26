@@ -33,7 +33,7 @@ pub mod transfer;
 
 /// 执行器构建标识：握手时随 Hello 上报，主进程据此判断「这条派发是不是
 /// 由匹配的执行器语义处理的」。它是溯源信息，不是恢复门禁（恢复门禁是
-/// `flow_engine::RUNTIME_ID` 与审计里的 `engine_build`）。
+/// `flow_dispatcher::execution_protocol::contract::RUNTIME_ID` 与审计里的 `engine_build`）。
 pub const EXECUTOR_BUILD: &str = env!("CARGO_PKG_VERSION");
 
 /// 执行器声明的能力目录（与契约 REQUIRED_CAPABILITIES 对齐）。
@@ -41,3 +41,14 @@ pub const EXECUTOR_BUILD: &str = env!("CARGO_PKG_VERSION");
 /// 目录在握手阶段交换：主进程据此判定本执行器能否承接某类节点语义，
 /// 声明缺项时宁可拒绝派发，也不要让主进程按「本执行器会做」来编排。
 pub const EXECUTOR_CAPABILITIES: &[&str] = &["execute", "js", "http", "transfer"];
+
+/// Source and dependency provenance recorded with prepared execution evidence.
+const BUILD_ID: &str = env!("FLOW_BUILD_ID");
+
+#[cfg(test)]
+#[test]
+fn runtime_id_matches_the_semantic_version() {
+    use flow_dispatcher::execution_protocol::contract::{RUNTIME_ID, RUNTIME_VERSION};
+    use sha2::{Digest, Sha256};
+    assert_eq!(RUNTIME_ID, hex::encode(Sha256::digest(RUNTIME_VERSION)));
+}

@@ -17,6 +17,8 @@ edition.workspace = true
 publish = false
 
 [dependencies]
+flow-dispatcher = { path = "../../flow-dispatcher" }
+flow-domain = { path = "../../flow-domain" }
 tokio = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
@@ -36,7 +38,6 @@ tokio-util = { workspace = true }
 # 只有测试依赖链上启用）。
 flow-backend = { path = "../../flow-backend", features = ["fault-injection"] }
 flow-agent = { path = "../../flow-agent" }
-flow-engine = { path = "../../flow-engine" }
 flow-journal = { path = "../../flow-journal", default-features = false, features = ["storage"] }
 flow-config = { path = "../../flow-config" }
 flow-dto = { path = "../../flow-dto" }

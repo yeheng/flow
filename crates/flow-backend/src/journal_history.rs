@@ -8,7 +8,7 @@
 //! 需要它，是因为权威库既要保存全部事实，又要能被快速读取；把两者的
 //! 翻译规则收在一处，才能保证「事实 → 状态」永远只有一种解释。
 use crate::journal::{audit_rows, project_rows, JournalBackend, JournalError};
-use flow_engine::journal_state::{Run, State};
+use flow_domain::journal_state::{Run, State};
 use flow_journal::query::{EntityChange, Store};
 use flow_journal::{EventKind, StoredValue, Transaction, ValueRef};
 use serde_json::{json, Value};
@@ -86,7 +86,7 @@ pub(crate) async fn load(index: &Store, identity: &str, upper: u64) -> Result<St
                             .filter_map(|field| value[field].as_u64())
                             .filter(|version| *version > 0)
                             .collect();
-                        let mut workflow: flow_engine::journal_state::Workflow =
+                        let mut workflow: flow_domain::journal_state::Workflow =
                             serde_json::from_value(value)?;
                         for version in hot_versions {
                             let row = index
@@ -348,13 +348,13 @@ pub(crate) fn index_rows(
         if event.kind == EventKind::Command {
             // 永久命令回执：写进 current_entities 后即可在重启后直接查回，
             // 不必回放全部历史事实。
-            let mut record: flow_engine::journal_state::CommandRecord =
+            let mut record: flow_domain::journal_state::CommandRecord =
                 serde_json::from_value(event.payload.clone())?;
             record.lsn = tx.lsn;
             if let Some(id) = &record.request_id {
                 rows.push(EntityChange {
                     kind: flow_journal::sqlite::EntityKind::Command,
-                    key: flow_engine::journal_state::command_key(&record.scope, id),
+                    key: flow_domain::journal_state::command_key(&record.scope, id),
                     value: Some(serde_json::to_value(record)?),
                 });
             }
@@ -382,10 +382,11 @@ pub(crate) fn index_rows(
         if event.kind == EventKind::Command {
             // 定时触发产生的 run.start 命令会同时推进「该时隙已烧掉」的
             // 记录，防止同一时隙被重复触发。
-            if let Some(key) = event.payload["scope"]
+            if let Some(scope) = event.payload["scope"]
                 .as_str()
-                .and_then(|s| s.strip_prefix("run.start:schedule:"))
+                .and_then(flow_facts::command::ScheduleScope::parse)
             {
+                let key = scope.key();
                 if let Some(fire) = state.schedule_fires.get(key) {
                     rows.push(EntityChange {
                         kind: flow_journal::sqlite::EntityKind::ScheduleFire,

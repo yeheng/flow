@@ -1,5 +1,5 @@
 use flow_backend::journal::JournalBackend;
-use flow_engine::journal_state::{Run, RunStatus};
+use flow_domain::journal_state::{Run, RunStatus};
 use serde_json::{json, Value};
 use std::{sync::Arc, time::Duration};
 
@@ -15,7 +15,7 @@ async fn install(b: &JournalBackend, definition: Value) -> String {
 async fn start(b: &Arc<JournalBackend>) {
     b.start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
         flow_backend::execution::IpcOptions {
-            executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
+            executor: flow_dispatcher::execution_protocol::contract::ExecutorInvocation::explicit(
                 flow_test_support::io::executor_bin(),
             ),
             x_max: 4,
@@ -72,7 +72,7 @@ async fn conditional_merge_executes_only_selected_branch_and_preserves_legacy() 
         assert_eq!(r.nodes["m"].attempt, 1);
         assert_eq!(
             r.nodes["e"].status,
-            flow_engine::journal_state::NodeStatus::Succeeded
+            flow_domain::journal_state::NodeStatus::Succeeded
         );
     }
     let mut legacy = definition;
@@ -82,7 +82,7 @@ async fn conditional_merge_executes_only_selected_branch_and_preserves_legacy() 
     let r = until(&b, &id, Run::terminal).await;
     assert_eq!(
         r.nodes["m"].status,
-        flow_engine::journal_state::NodeStatus::Skipped
+        flow_domain::journal_state::NodeStatus::Skipped
     );
     b.close().await.unwrap();
 }
@@ -255,7 +255,7 @@ async fn regression_never_reissues_http_and_rejects_changed_requests() {
     request["url"] = json!(format!("http://{addr}/changed"));
     let overrides = std::collections::BTreeMap::from([(
         baseline_run.execution.as_ref().unwrap().node_key("h"),
-        flow_engine::journal_state::OperationFixture {
+        flow_domain::journal_state::OperationFixture {
             fingerprint: flow_journal::codec::fingerprint(&request, 8 * 1024 * 1024).unwrap(),
             outcome: operation.outcome.clone().unwrap(),
         },
@@ -638,7 +638,7 @@ async fn incompatible_runtime_leaves_active_runs_untouched_and_starts_execution(
     // 用户可手动取消。拒绝启动会把桌面 app 整体带崩（setup hook 失败）。
     b.start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
         flow_backend::execution::IpcOptions {
-            executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
+            executor: flow_dispatcher::execution_protocol::contract::ExecutorInvocation::explicit(
                 flow_test_support::io::executor_bin(),
             ),
             x_max: 1,

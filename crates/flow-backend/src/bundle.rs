@@ -6,7 +6,7 @@
 //! 原始位置、清单在全部证据写完并校验通过后才发布。
 //! 需要它，是因为一次运行的证据必须能在原环境消失之后仍然可读、可验，
 //! 且还原过程绝不能启动执行器或撤回任何外部效果。
-use flow_engine::journal_state::{Operation, Prepared, Run, State, Wait};
+use flow_domain::journal_state::{Operation, Prepared, Run, State, Wait};
 use flow_journal::{codec, Event, EventKind, Transaction, ValueRef};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

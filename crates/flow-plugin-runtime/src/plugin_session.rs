@@ -18,7 +18,7 @@
 
 use std::time::Duration;
 
-use flow_engine::execution_protocol::environment::EXECUTOR_ENV_WHITELIST;
+use flow_dispatcher::execution_protocol::environment::EXECUTOR_ENV_WHITELIST;
 use flow_plugin_sdk::ipc::{Session, SpawnConfig};
 use flow_plugin_sdk::protocol::envelope::{read_frame, write_frame, Frame, FrameKind};
 use flow_plugin_sdk::protocol::handshake::{

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot, watch};
 
-use flow_engine::execution_protocol::message::Message;
+use flow_dispatcher::execution_protocol::message::Message;
 
 use flow_plugin_runtime::audit::{AuditError, AuditStream};
 
@@ -32,7 +32,7 @@ fn payload() -> serde_json::Value {
 #[tokio::test]
 async fn window_blocks_until_prefix_acked_then_resumes() {
     // 窗口只容一条记录：第二条必须等第一条的 ACK（B(S)-B(D) ≤ W）。
-    let unit = flow_engine::execution_protocol::record_bytes(1, "business_audit", &payload());
+    let unit = flow_dispatcher::execution_protocol::record_bytes(1, "business_audit", &payload());
     let (mut audit, mut rx, acks) = stream(unit + 16);
     assert_eq!(audit.push("business_audit", payload()).unwrap(), 1);
     assert!(audit.push("business_audit", payload()).is_err());
@@ -100,7 +100,7 @@ async fn oversize_record_rejected_at_push() {
 #[tokio::test]
 async fn await_durable_is_cancellable() {
     // 满窗口/等待 ACK 必须可被取消唤醒（二期 §4.3）。
-    let unit = flow_engine::execution_protocol::record_bytes(1, "business_audit", &payload());
+    let unit = flow_dispatcher::execution_protocol::record_bytes(1, "business_audit", &payload());
     let (mut audit, _rx, _acks) = stream(unit + 16);
     audit.push("business_audit", payload()).unwrap();
     audit.flush().await.unwrap();
@@ -112,9 +112,10 @@ async fn await_durable_is_cancellable() {
 
 #[tokio::test]
 async fn only_remote_uplink_replays_unacknowledged_batches() {
-    let (mut local, mut local_rx, _local_acks) = stream(flow_engine::execution_protocol::W_BYTES);
+    let (mut local, mut local_rx, _local_acks) =
+        stream(flow_dispatcher::execution_protocol::W_BYTES);
     let (mut remote, mut remote_rx, _remote_acks) =
-        stream(flow_engine::execution_protocol::W_BYTES);
+        stream(flow_dispatcher::execution_protocol::W_BYTES);
     let local_cancel = tokio_util::sync::CancellationToken::new();
     let remote_cancel = tokio_util::sync::CancellationToken::new();
     local.configure(false, local_cancel.clone());
@@ -148,7 +149,7 @@ async fn only_remote_uplink_replays_unacknowledged_batches() {
 
 #[tokio::test]
 async fn large_output_production_stays_inside_window_and_frame_limit() {
-    use flow_engine::execution_protocol::{
+    use flow_dispatcher::execution_protocol::{
         contract::{DATA_MAX_FRAME, W_BYTES},
         frame::encode_frame,
     };

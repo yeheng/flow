@@ -1,5 +1,5 @@
 use flow_backend::journal::{CommandReceipt, JournalBackend};
-use flow_engine::journal_state::command_key;
+use flow_domain::journal_state::command_key;
 use flow_journal::{Event, EventKind};
 use serde_json::json;
 use std::sync::Arc;

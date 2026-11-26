@@ -32,13 +32,14 @@
 use std::sync::Arc;
 
 use flow_backend::journal::JournalBackend;
-use flow_backend::NodeType;
+use flow_domain::NodeType;
 use jsonrpsee::types::error::{ErrorObject, ErrorObjectOwned};
 use serde_json::{json, Value};
 
 pub mod journal_download;
 pub mod journal_triggers;
 pub mod journal_v2;
+mod node_types;
 
 /// RPC 层状态：v2 产品装配的工作副本（config.get/update、secrets.set/delete）。
 ///
@@ -55,7 +56,7 @@ pub struct AppState {
     pub config: Option<ConfigState>,
     /// 持久化密钥存储（secrets.set/delete 落这里）；None 时这两个方法报
     /// 「未启用」。引擎侧取值经 secrets::get_secret（stored 优先，env 兜底）。
-    pub secrets: Option<Arc<flow_engine::secrets_store::SecretFileStore>>,
+    pub secrets: Option<Arc<flow_backend::secrets_store::SecretFileStore>>,
 }
 
 /// 进程启动时装配的配置工作副本。
@@ -94,23 +95,25 @@ impl AppState {
         permissions: &flow_config::PermissionsConfig,
     ) -> (
         Arc<AppState>,
-        Option<Arc<flow_engine::secrets_store::SecretFileStore>>,
+        Option<Arc<flow_backend::secrets_store::SecretFileStore>>,
     ) {
         backend.set_approval_ttl_ms(
             permissions
                 .approval_ttl_ms
                 .unwrap_or(flow_backend::journal::APPROVAL_TTL_DEFAULT_MS),
         );
-        match flow_engine::environments::EnvironmentStore::open(&data_dir.join("environments")) {
-            Ok(store) => { let _ = backend.environments.set(Arc::new(store)); }
+        match flow_backend::environments::EnvironmentStore::open(&data_dir.join("environments")) {
+            Ok(store) => {
+                let _ = backend.environments.set(Arc::new(store));
+            }
             Err(error) => tracing::error!(%error, "环境存储不可用"),
         }
-        let store = match flow_engine::secrets_store::SecretFileStore::open(data_dir) {
+        let store = match flow_backend::secrets_store::SecretFileStore::open(data_dir) {
             Ok(store) => {
                 let store = Arc::new(store);
                 // 进程级 SecretSource 是单例：第二个入口（如桌面内嵌 + 本进程）
                 // 装不上属预期情况，记告警即可，不能因此让调用方拿到 None。
-                if let Err(err) = flow_engine::secrets::install_secret_source(store.clone()) {
+                if let Err(err) = flow_backend::secrets::install_secret_source(store.clone()) {
                     tracing::warn!(%err, "持久化密钥来源安装失败，仅环境变量密钥生效");
                     None
                 } else {
@@ -352,21 +355,22 @@ async fn shutdown_signal() -> std::io::Result<()> {
 
 /// 前端拖拽面板 + 参数表单所需的能力清单。
 ///
-/// 单条描述的唯一来源是 `flow_engine::NodeType::descriptor`（与引擎共用一份
-/// 定义），这里只负责按序组装；schema 约定见 descriptor 的文档注释。
+/// 内置参数 schema 来自领域模型，产品标签和表单提示由本 crate 补齐。
 ///
 /// 顺序固定且响应逐字节稳定：前端按数组下标渲染表单与能力，插入新节点类型
 /// 若改变顺序会让旧前端与后端能力错位（快照测试守着这条线）。
-pub(crate) fn node_types(plugins: impl IntoIterator<Item = flow_backend::plugin_registry::DiscoveredPlugin>) -> Value {
+pub(crate) fn node_types(
+    plugins: impl IntoIterator<Item = flow_backend::plugin_registry::DiscoveredPlugin>,
+) -> Value {
     let mut types: Vec<Value> = NodeType::ALL
         .iter()
-        .map(|kind| kind.descriptor().clone())
+        .map(|kind| node_types::descriptor(*kind).clone())
         .collect();
     // 插件声明的动态节点类型附在编译类型之后：编译 12 类顺序与快照
     // 逐字节稳定（前端按下标渲染），插件条目按 id 排序追加。
     for plugin in plugins {
         for form in &plugin.manifest.ui.params_forms {
-            if flow_engine::NodeType::parse(&form.node_type).is_none() {
+            if NodeType::parse(&form.node_type).is_none() {
                 types.push(flow_backend::plugin_registry::manifest_to_node_type_desc(
                     &plugin.manifest,
                     form,

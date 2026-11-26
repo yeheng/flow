@@ -5,7 +5,7 @@
 //! 用例放到独立测试二进制，避免新增调度扰动它的时序。
 
 use flow_backend::journal::JournalBackend;
-use flow_engine::journal_state::{Run, RunStatus};
+use flow_domain::journal_state::{Run, RunStatus};
 use flow_journal::JournalOptions;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -15,8 +15,8 @@ fn temp() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("flow-journal-prewarm-{}", uuid::Uuid::now_v7()))
 }
 
-fn executor() -> flow_engine::execution_protocol::contract::ExecutorInvocation {
-    flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
+fn executor() -> flow_dispatcher::execution_protocol::contract::ExecutorInvocation {
+    flow_dispatcher::execution_protocol::contract::ExecutorInvocation::explicit(
         flow_test_support::io::executor_bin(),
     )
 }

@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 
 /// 在飞（非终态）run 状态数上限：约束主进程 run 状态内存与调度表。
 /// 这是后端状态内存约束，不是协议量——协议并发面（A_max/X_max）见
-/// `flow_engine::execution_protocol::contract`，两者不得互相代用。
+/// `flow_dispatcher::execution_protocol::contract`，两者不得互相代用。
 /// 执行点：`journal_commands::run_start` 与 `execution::dispatch::register_child_run`
 /// （同一常量，不另写数字）。
 pub const R_MAX: usize = 1000;
@@ -27,7 +27,7 @@ use std::sync::{
 use flow_application::commit::{
     self, CommitRuntime, DurableTransition, TransitionWriter, WriteFailure,
 };
-use flow_engine::journal_state::{CommandRecord, State};
+use flow_domain::journal_state::{CommandRecord, State};
 use flow_journal::page::CommitCursor;
 use flow_journal::query::{EntityChange, Store};
 use flow_journal::{Event, EventKind, Journal, JournalOptions, Transaction};
@@ -122,17 +122,16 @@ pub struct JournalBackend {
     /// Plugin ids whose start is past the admission check and not yet installed.
     /// This is a std mutex so a guard can release the reservation on drop.
     pub(crate) plugin_executor_program: std::sync::RwLock<Option<std::path::PathBuf>>,
-    pub(crate) plugin_remote_manager: std::sync::RwLock<
-        std::sync::Weak<crate::execution::remote::AgentManager>,
-    >,
+    pub(crate) plugin_remote_manager:
+        std::sync::RwLock<std::sync::Weak<crate::execution::remote::AgentManager>>,
     pub plugin_ops: std::sync::Mutex<std::collections::BTreeSet<String>>,
     plugin_ops_changed: Notify,
     /// Serialize managed plugin publication with the snapshot and commit of new runs.
     pub(crate) plugin_catalog: RwLock<()>,
     pub(crate) environment_metadata: RwLock<()>,
-    pub environments: std::sync::OnceLock<Arc<flow_engine::environments::EnvironmentStore>>,
+    pub environments: std::sync::OnceLock<Arc<crate::environments::EnvironmentStore>>,
     pub store: Arc<Store>,
-    pub observations: Option<flow_engine::observation::ObservationStore>,
+    pub observations: Option<crate::observation::ObservationStore>,
     commits: CommitRuntime,
     // Lock order: workflow_metadata → decision → state. Never await IO with state held.
     /// Workflow mutations take the write guard before the state lock. Dependency
@@ -147,7 +146,7 @@ pub struct JournalBackend {
     /// 物化后的 run 定义缓存：definition 随 run 钉死版本、创建后不可变，
     /// 是天然缓存键——每个 run 只物化一次（从 journal 值目录拼 chunk），
     /// 终态即逐出。调度循环每个 tick 都要用定义，不该每趟重读磁盘。
-    definitions: Mutex<std::collections::HashMap<String, Arc<flow_engine::Definition>>>,
+    definitions: Mutex<std::collections::HashMap<String, Arc<flow_domain::Definition>>>,
     /// 启动时安装的 `[harness.agent]` 运行配置：**新 run 快照的唯一来源**。
     /// 派发时从 `run.execution.agent` 读冻结值，不从这里现取——配置在进程
     /// 重启后修改只影响新 run，in-flight run 的重试/恢复身份不变。
@@ -385,7 +384,7 @@ impl JournalBackend {
         let backend = Arc::new(Self {
             commits: CommitRuntime::new(state),
             workflow_metadata: RwLock::new(()),
-            observations: flow_engine::observation::ObservationStore::open(
+            observations: crate::observation::ObservationStore::open(
                 root.join("observations"),
                 Default::default(),
             )
@@ -468,7 +467,7 @@ impl JournalBackend {
     pub(crate) async fn run_status(
         &self,
         id: &str,
-    ) -> Result<Option<flow_engine::journal_state::RunStatus>> {
+    ) -> Result<Option<flow_domain::journal_state::RunStatus>> {
         if let Some(status) = self.inspect(|s| s.runs.get(id).map(|run| run.status)).await {
             return Ok(Some(status));
         }
@@ -483,7 +482,7 @@ impl JournalBackend {
     }
 
     /// 读单个 run 的当前快照（内存优先，回落只读 store）。
-    pub async fn run_snapshot(&self, id: &str) -> Result<Option<flow_engine::journal_state::Run>> {
+    pub async fn run_snapshot(&self, id: &str) -> Result<Option<flow_domain::journal_state::Run>> {
         Ok(self.run_snapshot_with_cursor(id).await?.1)
     }
 
@@ -494,7 +493,7 @@ impl JournalBackend {
     pub(crate) async fn run_snapshot_with_cursor(
         &self,
         id: &str,
-    ) -> Result<(u64, Option<flow_engine::journal_state::Run>)> {
+    ) -> Result<(u64, Option<flow_domain::journal_state::Run>)> {
         let (upper, run) = self
             .inspect(|s| (s.applied_lsn, s.runs.get(id).cloned()))
             .await;
@@ -536,8 +535,8 @@ impl JournalBackend {
             .map_err(|e| JournalError::Storage(e.to_string()))?;
         owner
             .map(|owner| {
-                let run = flow_engine::journal_state::string(&owner, "run_id")?;
-                let node = flow_engine::journal_state::string(&owner, "node_id")?;
+                let run = flow_domain::journal_state::string(&owner, "run_id")?;
+                let node = flow_domain::journal_state::string(&owner, "node_id")?;
                 // attempt 缺失或不可解析说明索引行畸形，宁可报错也不猜。
                 let attempt = owner["attempt"]
                     .as_str()
@@ -610,7 +609,7 @@ impl JournalBackend {
         &self,
         workflow: &str,
         version: Option<u64>,
-    ) -> Result<Option<flow_engine::journal_state::DefinitionVersion>> {
+    ) -> Result<Option<flow_domain::journal_state::DefinitionVersion>> {
         let _decision = self.begin_decision().await?;
         let selected = self
             .inspect(|state| {
@@ -647,7 +646,7 @@ impl JournalBackend {
     pub(crate) async fn definition_versions(
         &self,
         workflow: &str,
-    ) -> Result<Vec<flow_engine::journal_state::DefinitionVersion>> {
+    ) -> Result<Vec<flow_domain::journal_state::DefinitionVersion>> {
         // Store::get assembles versions in one bounded SQLite read transaction.
         // Historical UI reads must not hold the coordinator's decision lock.
         let row = self
@@ -662,7 +661,7 @@ impl JournalBackend {
             })?
             .1
             .ok_or_else(|| flow_journal::Error::NotFound("workflow not found".into()))?;
-        let workflow: flow_engine::journal_state::Workflow = serde_json::from_value(row)?;
+        let workflow: flow_domain::journal_state::Workflow = serde_json::from_value(row)?;
         Ok(workflow.versions.into_values().rev().collect())
     }
 
@@ -671,7 +670,7 @@ impl JournalBackend {
         &self,
         run_id: &str,
         definition: &flow_journal::StoredValue,
-    ) -> Result<Arc<flow_engine::Definition>> {
+    ) -> Result<Arc<flow_domain::Definition>> {
         self.load_cached_definition(run_id, definition, true).await
     }
 
@@ -681,7 +680,7 @@ impl JournalBackend {
         &self,
         key: &str,
         definition: &flow_journal::StoredValue,
-    ) -> Result<Arc<flow_engine::Definition>> {
+    ) -> Result<Arc<flow_domain::Definition>> {
         self.load_cached_definition(key, definition, false).await
     }
 
@@ -690,7 +689,7 @@ impl JournalBackend {
         run_id: &str,
         definition: &flow_journal::StoredValue,
         check_installed_types: bool,
-    ) -> Result<Arc<flow_engine::Definition>> {
+    ) -> Result<Arc<flow_domain::Definition>> {
         if let Some(hit) = self.definitions.lock().await.get(run_id) {
             return Ok(hit.clone());
         }
@@ -705,7 +704,7 @@ impl JournalBackend {
                 &stored,
                 flow_journal::MAX_LINE_BYTES,
             )?;
-            let definition: flow_engine::Definition =
+            let definition: flow_domain::Definition =
                 serde_json::from_value(value).map_err(|error| {
                     flow_journal::Error::Invalid(format!("definition 结构不符：{error}"))
                 })?;
@@ -1004,7 +1003,7 @@ impl JournalBackend {
             .store
             .get(
                 "command",
-                &flow_engine::journal_state::command_key(scope, id),
+                &flow_domain::journal_state::command_key(scope, id),
             )
             .await
             .map_err(|e| JournalError::Storage(e.to_string()))?
@@ -1033,10 +1032,18 @@ impl JournalBackend {
         transactions.push(tx.clone());
         let rows = self
             .commits
-            .preview(&transactions, |next| crate::journal_history::index_rows(next, &tx))
+            .preview(&transactions, |next| {
+                crate::journal_history::index_rows(next, &tx)
+            })
             .await?;
         self.commits
-            .persist(decision, JournalWriter(self.journal.clone()), tx, rows, values)
+            .persist(
+                decision,
+                JournalWriter(self.journal.clone()),
+                tx,
+                rows,
+                values,
+            )
             .await
             .map_err(|error| match error {
                 commit::CommitError::Facts(error) => error.into(),
@@ -1277,7 +1284,7 @@ impl JournalBackend {
                     .runs
                     .values()
                     .flat_map(|run| run.nodes.values())
-                    .filter(|node| node.status == flow_engine::journal_state::NodeStatus::Waiting)
+                    .filter(|node| node.status == flow_domain::journal_state::NodeStatus::Waiting)
                     .count();
                 let resident_definition_versions: usize = state
                     .workflows
@@ -1365,7 +1372,7 @@ pub(crate) fn audit_rows(tx: &Transaction) -> flow_journal::Result<Vec<EntityCha
 }
 
 /// run 的当前行内容（产品面读的是摘要，不是完整执行历史）。
-fn run_row(run: &flow_engine::journal_state::Run) -> flow_journal::Result<Value> {
+fn run_row(run: &flow_domain::journal_state::Run) -> flow_journal::Result<Value> {
     Ok(serde_json::to_value(run.summary())?)
 }
 
@@ -1421,7 +1428,7 @@ pub(crate) fn project_rows(
             EventKind::LegacyImport => {
                 keys.insert((
                     "legacy",
-                    flow_engine::journal_state::string(&e.payload, "key")?,
+                    flow_domain::journal_state::string(&e.payload, "key")?,
                 ));
             }
             EventKind::WorkflowCreated
@@ -1433,7 +1440,7 @@ pub(crate) fn project_rows(
                     let version = match e.kind {
                         EventKind::WorkflowUpdated => e.payload["version"]["version"].as_u64(),
                         EventKind::WorkflowPublished => {
-                            Some(flow_engine::journal_state::number(&e.payload, "version")?)
+                            Some(flow_domain::journal_state::number(&e.payload, "version")?)
                         }
                         _ => None,
                     };
@@ -1450,19 +1457,19 @@ pub(crate) fn project_rows(
             EventKind::ScheduleChanged => {
                 keys.insert((
                     "schedule",
-                    flow_engine::journal_state::string(&e.payload, "id")?,
+                    flow_domain::journal_state::string(&e.payload, "id")?,
                 ));
             }
             EventKind::WebhookChanged => {
                 keys.insert((
                     "webhook",
-                    flow_engine::journal_state::string(&e.payload, "token")?,
+                    flow_domain::journal_state::string(&e.payload, "token")?,
                 ));
             }
             EventKind::TemplateChanged => {
                 keys.insert((
                     "template",
-                    flow_engine::journal_state::string(&e.payload, "id")?,
+                    flow_domain::journal_state::string(&e.payload, "id")?,
                 ));
             }
             _ => {}

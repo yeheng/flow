@@ -1,6 +1,6 @@
 //! Non-power-loss phase-one acceptance. All datasets are disposable.
 use flow_backend::journal::JournalBackend;
-use flow_engine::journal_state::{NodeStatus, RunStatus, WaitKind};
+use flow_domain::journal_state::{NodeStatus, RunStatus, WaitKind};
 use serde_json::{json, Value};
 use std::{
     sync::Arc,
@@ -15,7 +15,7 @@ async fn install(b: &JournalBackend, nodes: Value, edges: Value) -> String {
     b.workflow_publish(&id, 1, None).await.unwrap();
     id
 }
-async fn terminal(b: &JournalBackend, id: &str) -> flow_engine::journal_state::Run {
+async fn terminal(b: &JournalBackend, id: &str) -> flow_domain::journal_state::Run {
     tokio::time::timeout(Duration::from_secs(90), async {
         loop {
             let r = b.state().await.unwrap().runs[id].clone();
@@ -670,9 +670,10 @@ async fn start_ipc(backend: &std::sync::Arc<flow_backend::journal::JournalBacken
     backend
         .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
             flow_backend::execution::IpcOptions {
-                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
-                    flow_test_support::io::executor_bin(),
-                ),
+                executor:
+                    flow_dispatcher::execution_protocol::contract::ExecutorInvocation::explicit(
+                        flow_test_support::io::executor_bin(),
+                    ),
                 x_max,
                 tag: None,
             },

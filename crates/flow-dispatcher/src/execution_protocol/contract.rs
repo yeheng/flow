@@ -18,6 +18,12 @@
 //! 逐字节一致；任何一方的本地猜测都会变成「能编码但发不出」的窄带，
 //! 而这类故障在窗口/ACK 语义里表现为静默死锁。
 
+/// Explicit execution compatibility version shared by master and Worker.
+pub const RUNTIME_VERSION: &str = "flow-execution-v1";
+
+/// SHA-256 of the semantic version, persisted in execution snapshots.
+pub const RUNTIME_ID: &str = "94fd0243ca0a1d1a3f73d902dcbb24d64d7b38e817e1e39d193ac6b1b6754888";
+
 /// IPC/上联协议版本。单流帧 `u32 body_len | postcard(Message)`：旧版 JSON
 /// 信封、三种帧 kind、十进制字符串与 Channel 概念均已删除。版本门集中在
 /// 握手的 version 字段——执行器侧 Hello/Welcome 与 agent 上联侧

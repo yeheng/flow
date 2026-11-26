@@ -1,8 +1,8 @@
 //! 离线工作流定义校验器：不启动服务就跑完与服务端同一份建图校验。
 //!
 //! ```sh
-//! cargo run -q -p flow-engine --example validate_def -- my-flow.workflow.json
-//! cat my-flow.workflow.json | cargo run -q -p flow-engine --example validate_def
+//! cargo run -q -p flow-domain --example validate_def -- my-flow.workflow.json
+//! cat my-flow.workflow.json | cargo run -q -p flow-domain --example validate_def
 //! ```
 //!
 //! 输入兼容两种文件形态：`{name, definition}` 信封（`workflow export` 与
@@ -16,7 +16,7 @@
 //! 注入 `semantics: 2`；引擎反序列化的缺省是 v1，那是历史定义的解释口径，
 //! 不该被离线工具当默认）。
 //!
-//! 边界：这里只跑**建图期**校验（`flow-engine/src/model.rs`）。以下都在服务端、
+//! 边界：这里只跑**建图期**校验（`flow-domain/src/model.rs`）。以下都在服务端、
 //! 本工具管不到：
 //! - 密钥存在性、`input_schema` 的实际取值、子流程依赖闭包；
 //! - **插件声明的动态节点类型**：离线没有 manifest，插件类型会被当成
@@ -26,7 +26,7 @@
 
 use std::io::Read;
 
-use flow_engine::model::Definition;
+use flow_domain::model::Definition;
 
 fn main() -> std::process::ExitCode {
     let source = match read_source() {

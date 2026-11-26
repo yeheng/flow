@@ -9,8 +9,8 @@
 //! - email 额外要求 endpoint 的 Net(POST) 能力（防模板化端点送出密钥）；
 //! - harness command 必须是规范化绝对路径，不做 PATH 解析（TOCTOU）。
 
+use flow_domain::{Node, NodeType};
 use flow_dto::permission::{canonical_digest, sha256_hex, OperationSpec};
-use flow_engine::{Node, NodeType};
 use serde_json::Value;
 
 /// 空环境摘要：harness 子进程继承执行器环境，不受请求控制，用固定值
@@ -445,7 +445,9 @@ mod tests {
             }),
         )
         .unwrap();
-        assert!(matches!(&specs[1], OperationSpec::Http { url, .. } if url == "https://proxy.internal/"));
+        assert!(
+            matches!(&specs[1], OperationSpec::Http { url, .. } if url == "https://proxy.internal/")
+        );
 
         // 空串/缺失/null（llm 节点的默认形态）→ 无代理需求。
         for proxy in [json!(""), json!(null)] {

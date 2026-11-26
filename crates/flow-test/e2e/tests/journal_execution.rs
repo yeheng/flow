@@ -1,6 +1,6 @@
 use flow_backend::journal::JournalBackend;
-use flow_engine::journal_state::Run;
-use flow_engine::journal_state::{RunStatus, WaitKind};
+use flow_domain::journal_state::Run;
+use flow_domain::journal_state::{RunStatus, WaitKind};
 use flow_journal::{JournalOptions, StoredValue};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -93,7 +93,7 @@ async fn manual_resolution_binds_operation_and_never_fabricates_outcome() {
         )])
         .await
         .unwrap();
-    let prepared = flow_engine::journal_state::Prepared {
+    let prepared = flow_domain::journal_state::Prepared {
         input: StoredValue::Inline(json!({})),
         predecessors: Default::default(),
         params: StoredValue::Inline(json!({"url":"http://invalid.invalid"})),
@@ -109,7 +109,7 @@ async fn manual_resolution_binds_operation_and_never_fabricates_outcome() {
         )])
         .await
         .unwrap();
-    let op = flow_engine::journal_state::Operation {
+    let op = flow_domain::journal_state::Operation {
         operation_id: "operation".into(),
         fingerprint: flow_journal::codec::digest(b"{}"),
         permit_id: "permit".into(),
@@ -588,9 +588,10 @@ async fn start_ipc(backend: &std::sync::Arc<flow_backend::journal::JournalBacken
     backend
         .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
             flow_backend::execution::IpcOptions {
-                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
-                    flow_test_support::io::executor_bin(),
-                ),
+                executor:
+                    flow_dispatcher::execution_protocol::contract::ExecutorInvocation::explicit(
+                        flow_test_support::io::executor_bin(),
+                    ),
                 x_max,
                 tag: None,
             },

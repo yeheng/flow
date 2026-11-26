@@ -15,8 +15,8 @@ use flow_config::plugin_manifest::ParamsFormDecl;
 use flow_config::plugin_manifest::{parse, FieldDecl, PluginManifest, Widget};
 use serde_json::{json, Value};
 
-use flow_plugin_catalog::{content_hash_path, default_routes, BUNDLED_ROUTES};
 pub use flow_plugin_catalog::{content_hash, DiscoveredPlugin};
+use flow_plugin_catalog::{content_hash_path, default_routes, BUNDLED_ROUTES};
 
 /// 扫描 plugins 目录（FLOW_PLUGINS_DIR → <flow_home>/plugins）。
 ///
@@ -86,7 +86,7 @@ pub fn dynamic_node_types() -> BTreeSet<String> {
     discover_plugins()
         .into_iter()
         .flat_map(|plugin| plugin.manifest.plugin.node_types)
-        .filter(|name| flow_engine::NodeType::parse(name).is_none())
+        .filter(|name| flow_domain::NodeType::parse(name).is_none())
         .collect()
 }
 
@@ -95,7 +95,7 @@ pub fn dynamic_params_forms() -> BTreeMap<String, Vec<FieldDecl>> {
     let mut forms = BTreeMap::new();
     for plugin in discover_plugins() {
         for form in plugin.manifest.ui.params_forms {
-            if flow_engine::NodeType::parse(&form.node_type).is_none() {
+            if flow_domain::NodeType::parse(&form.node_type).is_none() {
                 forms.insert(form.node_type.clone(), form.fields);
             }
         }
@@ -110,7 +110,7 @@ pub fn dynamic_params_forms() -> BTreeMap<String, Vec<FieldDecl>> {
 /// 与内置类型一致）。类型级错误在发布时拒绝——这是「坏参数在发布时
 /// 爆，而不是凌晨三点的 run 里」的 manifest 版。
 pub fn validate_dynamic_params(
-    node: &flow_engine::Node,
+    node: &flow_domain::Node,
     forms: &BTreeMap<String, Vec<FieldDecl>>,
 ) -> Result<(), String> {
     let Some(fields) = forms.get(&node.node_type) else {
@@ -270,7 +270,7 @@ pub fn plugin_list_entry(plugin: &DiscoveredPlugin) -> Value {
 /// hash_mismatch = 该插件存在旧哈希的授予 → 升级后待重授予）。
 pub fn plugin_list_entry_with_grant(
     plugin: &DiscoveredPlugin,
-    grant: Option<&flow_engine::journal_state::PluginGrant>,
+    grant: Option<&flow_domain::journal_state::PluginGrant>,
     hash_mismatch: bool,
 ) -> Value {
     let manifest = &plugin.manifest;
@@ -329,18 +329,18 @@ fn field_summary(field: &FieldDecl) -> Value {
 
 pub fn plugins_for_definition(
     definition: &Value,
-) -> Vec<flow_engine::journal_state::AgentPluginSnapshot> {
+) -> Vec<flow_domain::journal_state::AgentPluginSnapshot> {
     plugins_for_definition_with_plugins(definition, discover_plugins())
 }
 pub fn plugins_for_definition_with_plugins(
     definition: &Value,
     plugins: Vec<DiscoveredPlugin>,
-) -> Vec<flow_engine::journal_state::AgentPluginSnapshot> {
+) -> Vec<flow_domain::journal_state::AgentPluginSnapshot> {
     let nodes = definition["nodes"].as_array().cloned().unwrap_or_default();
     let mut wanted: BTreeSet<String> = BTreeSet::new();
     for node in nodes {
         if let Some(node_type) = node["type"].as_str() {
-            if flow_engine::NodeType::parse(node_type).is_none() {
+            if flow_domain::NodeType::parse(node_type).is_none() {
                 wanted.insert(node_type.to_string());
             }
         }
@@ -362,7 +362,7 @@ pub fn plugins_for_definition_with_plugins(
                 content_hash,
             } = plugin;
             let ui = serde_json::to_value(manifest.ui_projection()).ok();
-            flow_engine::journal_state::AgentPluginSnapshot {
+            flow_domain::journal_state::AgentPluginSnapshot {
                 id: manifest.plugin.id.clone(),
                 version: manifest.plugin.version.clone(),
                 ui,
@@ -399,7 +399,9 @@ pub fn bundled_or_discovered_by_type(node_type: &str) -> Option<String> {
     }) {
         return Some(found.manifest.plugin.id);
     }
-    BUNDLED_ROUTES.iter().find(|route| route.node_type == node_type)
+    BUNDLED_ROUTES
+        .iter()
+        .find(|route| route.node_type == node_type)
         .map(|route| route.plugin_id.to_owned())
 }
 
@@ -435,7 +437,9 @@ pub fn bundled_or_discovered_with_plugins(
         });
     }
     // 内置兜底：嵌入 manifest 文本 + 入口二进制（env 或同目录兄弟文件）。
-    let route = BUNDLED_ROUTES.iter().find(|route| route.plugin_id == plugin_id)?;
+    let route = BUNDLED_ROUTES
+        .iter()
+        .find(|route| route.plugin_id == plugin_id)?;
     let manifest_text = route.manifest;
     let manifest = match parse(manifest_text) {
         Ok(manifest) => manifest,
@@ -480,7 +484,7 @@ pub fn bundled_or_discovered_with_plugins(
 mod tests {
     use super::*;
 
-    fn node(node_type: &str, params: Value) -> flow_engine::Node {
+    fn node(node_type: &str, params: Value) -> flow_domain::Node {
         serde_json::from_value(json!({
             "id": "n1",
             "type": node_type,

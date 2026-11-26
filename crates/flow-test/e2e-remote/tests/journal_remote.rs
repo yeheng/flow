@@ -7,10 +7,10 @@
 
 use flow_agent::runtime::AgentConfig;
 use flow_backend::journal::JournalBackend;
-use flow_engine::execution_protocol::transport::FrameTransport;
-use flow_engine::execution_protocol::Message;
-use flow_engine::journal_state::Run;
-use flow_engine::journal_state::RunStatus;
+use flow_dispatcher::execution_protocol::transport::FrameTransport;
+use flow_dispatcher::execution_protocol::Message;
+use flow_domain::journal_state::Run;
+use flow_domain::journal_state::RunStatus;
 use flow_journal::{JournalOptions, StoredValue};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -21,8 +21,8 @@ fn temp() -> std::path::PathBuf {
 }
 
 /// 独立 flow-executor 二进制（agent 本机执行器池召唤它）。
-fn executor() -> flow_engine::execution_protocol::contract::ExecutorInvocation {
-    flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
+fn executor() -> flow_dispatcher::execution_protocol::contract::ExecutorInvocation {
+    flow_dispatcher::execution_protocol::contract::ExecutorInvocation::explicit(
         flow_test_support::io::executor_bin(),
     )
 }
@@ -67,10 +67,10 @@ async fn spawn_simulated_agent(
         // 模拟 agent：单流 transport 上先裸握手（AgentHello → AgentWelcome，
         // v3 无 DataBind），再交 serve。
         let mut transport = FrameTransport::spawn(control_b, 128);
-        let boot = flow_engine::execution_protocol::transport::fresh_boot_id();
+        let boot = flow_dispatcher::execution_protocol::transport::fresh_boot_id();
         transport
-            .send(flow_engine::execution_protocol::Message::AgentHello {
-                version: flow_engine::execution_protocol::PROTOCOL_VERSION,
+            .send(flow_dispatcher::execution_protocol::Message::AgentHello {
+                version: flow_dispatcher::execution_protocol::PROTOCOL_VERSION,
                 agent_boot_id: boot.clone(),
                 build: "sim".into(),
                 capabilities: vec!["relay".into(), "resource_report".into(), "reconnect".into()],
@@ -80,12 +80,12 @@ async fn spawn_simulated_agent(
             .expect("send agent hello");
         let welcome = loop {
             let message = transport.recv().await.expect("welcome");
-            if let flow_engine::execution_protocol::Message::AgentWelcome { .. } = message {
+            if let flow_dispatcher::execution_protocol::Message::AgentWelcome { .. } = message {
                 break message;
             }
         };
-        let flow_engine::execution_protocol::Message::AgentWelcome {
-            version: flow_engine::execution_protocol::PROTOCOL_VERSION,
+        let flow_dispatcher::execution_protocol::Message::AgentWelcome {
+            version: flow_dispatcher::execution_protocol::PROTOCOL_VERSION,
             journal_id,
             master_epoch,
             link_session_id,
@@ -270,7 +270,7 @@ async fn relay_path_produces_identical_authoritative_facts() {
 
 /// 收集下一个 BindExecutor 帧（跳过其他帧）；超时返回 None。
 async fn next_bind_opt(transport: &mut FrameTransport, wait: Duration) -> Option<(String, String)> {
-    use flow_engine::execution_protocol::Message;
+    use flow_dispatcher::execution_protocol::Message;
     let deadline = tokio::time::Instant::now() + wait;
     loop {
         let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
@@ -292,7 +292,7 @@ async fn next_bind_opt(transport: &mut FrameTransport, wait: Duration) -> Option
 /// 首拍（注册后）立即到达并按心跳周期重复；slots/in_flight 携带真实值。
 #[tokio::test]
 async fn capacity_report_arrives_immediately_and_repeats() {
-    use flow_engine::execution_protocol::Message;
+    use flow_dispatcher::execution_protocol::Message;
     let (agent_side, master_side) = tokio::io::duplex(64 * 1024);
     let agent_transport = FrameTransport::spawn(agent_side, 16);
     let mut master_transport = FrameTransport::spawn(master_side, 16);
@@ -367,8 +367,8 @@ async fn capacity_report_arrives_immediately_and_repeats() {
 /// bind」的动态路径。
 #[tokio::test]
 async fn capacity_report_raises_admission_slots() {
-    use flow_engine::execution_protocol::remote::Capacity;
-    use flow_engine::execution_protocol::Message;
+    use flow_dispatcher::execution_protocol::remote::Capacity;
+    use flow_dispatcher::execution_protocol::Message;
     let root = temp();
     let backend = JournalBackend::open(&root, JournalOptions::default())
         .await
@@ -389,7 +389,7 @@ async fn capacity_report_raises_admission_slots() {
     let mut transport = FrameTransport::spawn(control_b, 16);
     transport
         .send(Message::AgentHello {
-            version: flow_engine::execution_protocol::PROTOCOL_VERSION,
+            version: flow_dispatcher::execution_protocol::PROTOCOL_VERSION,
             agent_boot_id: "boot-cap".into(),
             build: "sim".into(),
             capabilities: vec!["relay".into(), "resource_report".into(), "reconnect".into()],
@@ -477,7 +477,7 @@ async fn capacity_report_raises_admission_slots() {
 
 #[tokio::test]
 async fn wrong_route_frames_never_reach_authority() {
-    use flow_engine::execution_protocol::Message;
+    use flow_dispatcher::execution_protocol::Message;
     // relay 层：错路由拒绝（详见 flow-agent relay 单测）；这里验证 master
     // 会话侧：未绑定 dispatch 的 Routed 帧被拒绝且 journal 无任何写入。
     let root = temp();
@@ -498,7 +498,7 @@ async fn wrong_route_frames_never_reach_authority() {
     let mut transport = FrameTransport::spawn(control_b, 16);
     transport
         .send(Message::AgentHello {
-            version: flow_engine::execution_protocol::PROTOCOL_VERSION,
+            version: flow_dispatcher::execution_protocol::PROTOCOL_VERSION,
             agent_boot_id: "boot-evil".into(),
             build: "t".into(),
             capabilities: vec!["relay".into(), "resource_report".into(), "reconnect".into()],
@@ -516,7 +516,7 @@ async fn wrong_route_frames_never_reach_authority() {
     // 伪造：为未绑定派发上报审计。
     transport
         .send(Message::Routed {
-            envelope: flow_engine::execution_protocol::remote::RouteEnvelope {
+            envelope: flow_dispatcher::execution_protocol::remote::RouteEnvelope {
                 agent_id: "agent-evil".into(),
                 agent_boot_id: "boot-evil".into(),
                 link_session_id: "link-0".into(),
@@ -527,7 +527,7 @@ async fn wrong_route_frames_never_reach_authority() {
             inner: Box::new(Message::AuditBatch {
                 dispatch_id: "dispatch-not-bound".into(),
                 first_seq: 1,
-                records: vec![flow_engine::execution_protocol::AuditRecord {
+                records: vec![flow_dispatcher::execution_protocol::AuditRecord {
                     audit_seq: 1,
                     kind: "input_prepared".into(),
                     payload: json!({"prepared": {}}),
@@ -563,7 +563,7 @@ fn relay_cannot_wrap_authoritative_control_frames() {
     relay.bind("d", "exec", "eboot");
     for forbidden in [
         Message::AgentHello {
-            version: flow_engine::execution_protocol::PROTOCOL_VERSION,
+            version: flow_dispatcher::execution_protocol::PROTOCOL_VERSION,
             agent_boot_id: "x".into(),
             build: "x".into(),
             capabilities: vec![],
@@ -576,9 +576,9 @@ fn relay_cannot_wrap_authoritative_control_frames() {
     // AuditAck 这类业务帧本身只能来自主进程；执行器不产生它——relay 层
     // 无法区分来源，但其唯一写入口是 wrap_to_master(执行器消息)，管理帧
     // 已被 routable() 拒绝。
-    use flow_engine::execution_protocol::remote::routable;
+    use flow_dispatcher::execution_protocol::remote::routable;
     assert!(!routable(&Message::AgentWelcome {
-        version: flow_engine::execution_protocol::PROTOCOL_VERSION,
+        version: flow_dispatcher::execution_protocol::PROTOCOL_VERSION,
         journal_id: "j".into(),
         master_epoch: 1,
         link_session_id: "l".into(),
@@ -696,9 +696,10 @@ async fn start_ipc(backend: &std::sync::Arc<flow_backend::journal::JournalBacken
     backend
         .start_execution_ipc(flow_backend::execution::ExecutionMode::Ipc(
             flow_backend::execution::IpcOptions {
-                executor: flow_engine::execution_protocol::contract::ExecutorInvocation::explicit(
-                    flow_test_support::io::executor_bin(),
-                ),
+                executor:
+                    flow_dispatcher::execution_protocol::contract::ExecutorInvocation::explicit(
+                        flow_test_support::io::executor_bin(),
+                    ),
                 x_max,
                 tag: None,
             },

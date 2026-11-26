@@ -124,194 +124,142 @@ impl NodeType {
         )
     }
 
-    /// 能力描述的**主体**（`nodetypes.list` 单条去掉 `"type"` 字段）。
-    ///
-    /// `"type"` 由 [`Self::descriptor`] 从 [`NODE_TYPE_TABLE`] 注入，不在这里
-    /// 重写一遍：同一个类型名字符串出现在表、`as_str`、`parse`、这里共四处时，
-    /// 改名必漏其中一处。
-    ///
-    /// `params_schema` 是 JSON Schema draft-07 子集
-    /// （type/required/properties/enum/default），另带 `x-widget`
-    /// （code/json/workflow-picker）、`x-label`、`x-help`、`x-secret` 扩展，
-    /// 前端据此递归渲染参数表单；后端校验以 [`validate_params`] 为准，
-    /// 它读的必填清单也来自本函数（见 [`Self::required_params`]）。
+    /// Schema and execution metadata for the built-in node.
     fn descriptor_body(self) -> Value {
         match self {
             NodeType::Start => serde_json::json!({
-                "label": "开始",
-                "category": "control",
                 "max_instances": 1,
-                "ports": [{"id": "out", "label": "出"}],
+                "ports": [{"id": "out"}],
                 "params_schema": {"type": "object", "properties": {}}
             }),
             NodeType::End => serde_json::json!({
-                "label": "结束",
-                "category": "control",
-                "ports": [{"id": "in", "label": "入"}],
+                "ports": [{"id": "in"}],
                 "params_schema": {"type": "object", "properties": {}}
             }),
             NodeType::Script => serde_json::json!({
-                "label": "脚本",
-                "category": "compute",
-                "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
+                "ports": [{"id": "in"}, {"id": "out"}],
                 "params_schema": {
                     "type": "object",
                     "required": ["code"],
                     "properties": {
-                        "code": {"type": "string", "x-widget": "code", "x-opaque": true,
-                                 "x-label": "JS 函数体",
-                                 "x-help": "可用 input（run 输入）与 nodes（上游节点输出），用 return 返回结果"},
-                        "timeout_ms": {"type": "integer", "default": 2000, "x-label": "脚本超时（毫秒）"}
+                        "code": {"type": "string", "x-opaque": true},
+                        "timeout_ms": {"type": "integer", "default": 2000}
                     }
                 },
                 "supports_retry": true
             }),
             NodeType::Condition => serde_json::json!({
-                "label": "条件分支",
-                "category": "control",
-                "ports": [{"id": "in", "label": "入"}, {"id": "true", "label": "真"}, {"id": "false", "label": "假"}],
+                "ports": [{"id": "in"}, {"id": "true"}, {"id": "false"}],
                 "params_schema": {
                     "type": "object",
                     "required": ["expr"],
                     "properties": {
-                        "expr": {"type": "string", "x-widget": "code", "x-opaque": true,
-                                 "x-label": "条件表达式",
-                                 "x-help": "表达式结果按真值判定（非空字符串、非 0 数为真），可用 input 与 nodes"},
-                        "timeout_ms": {"type": "integer", "default": 2000, "x-label": "求值超时（毫秒）"}
+                        "expr": {"type": "string", "x-opaque": true},
+                        "timeout_ms": {"type": "integer", "default": 2000}
                     }
                 }
             }),
             NodeType::Delay => serde_json::json!({
-                "label": "等待",
-                "category": "control",
-                "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
+                "ports": [{"id": "in"}, {"id": "out"}],
                 "params_schema": {
                     "type": "object",
                     "required": ["ms"],
                     "properties": {
-                        "ms": {"type": "integer", "x-label": "时长（毫秒）",
-                                "x-help": "数字，或 ${input.x} / ${nodes.n.y} 模板（展开结果须为整数）"}
+                        "ms": {"type": "integer"}
                     }
                 }
             }),
             NodeType::HttpCall => serde_json::json!({
-                "label": "HTTP 请求",
-                "category": "integration",
-                "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
+                "ports": [{"id": "in"}, {"id": "out"}],
                 "params_schema": {
                     "type": "object",
                     "required": ["url"],
                     "properties": {
-                        "method": {"type": "string", "enum": HTTP_METHODS, "default": "GET", "x-label": "方法"},
-                        "url": {"type": "string", "x-label": "URL",
-                                "x-help": "支持 ${input.x} / ${nodes.n2.y} 模板（${} 内不能含 }）"},
-                        "headers": {"x-widget": "key-value", "default": {}, "x-label": "请求头"},
-                        "body": {"x-widget": "json", "x-label": "请求体"},
-                        "proxy": {"type": "string", "x-label": "代理",
-                                  "x-help": "http(s)://[user:pass@]host:port，留空直连"},
-                        "timeout_ms": {"type": "integer", "default": 30000, "x-label": "HTTP 超时（毫秒）"}
+                        "method": {"type": "string", "enum": HTTP_METHODS, "default": "GET"},
+                        "url": {"type": "string"},
+                        "headers": {"default": {}},
+                        "body": {},
+                        "proxy": {"type": "string"},
+                        "timeout_ms": {"type": "integer", "default": 30000}
                     }
                 },
                 "supports_retry": true,
                 "side_effect": true
             }),
             NodeType::HumanTask => serde_json::json!({
-                "label": "人工节点",
-                "category": "human",
-                "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
+                "ports": [{"id": "in"}, {"id": "out"}],
                 "params_schema": {
                     "type": "object",
                     "properties": {
-                        "prompt": {"type": "string", "x-label": "提示"}
+                        "prompt": {"type": "string"}
                     }
                 }
             }),
             NodeType::Input => serde_json::json!({
-                "label": "输入",
-                "category": "human",
-                "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
+                "ports": [{"id": "in"}, {"id": "out"}],
                 "params_schema": {
                     "type": "object",
                     "required": ["fields"],
                     "properties": {
-                        "fields": {"type": "array", "x-widget": "json", "x-label": "输入字段",
-                                   "x-help": "JSON 数组，每项 {\"key\":\"token\",\"label\":\"显示名\",\"default\":…}（label/default 可省）。run 输入已覆盖全部字段（默认值可兜底）时直接放行，输出这些字段的值；否则挂起等用户填写（run.signal 交付的对象成为本节点输出）"}
+                        "fields": {"type": "array"}
                     }
                 }
             }),
             NodeType::SubWorkflow => serde_json::json!({
-                "label": "子工作流",
-                "category": "control",
-                "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
+                "ports": [{"id": "in"}, {"id": "out"}],
                 "params_schema": {
                     "type": "object",
                     "required": ["workflow_id"],
                     "properties": {
-                        "workflow_id": {"type": "string", "x-widget": "workflow-picker", "x-label": "目标工作流",
-                                        "x-help": "v2 在运行启动时固定已发布子流程；输出透传，失败向上传导"},
-                        "version":{"type":"integer","x-label":"子流程版本","x-help":"省略时在运行启动时固定最新已发布版本"},
-                        "input_mapping": {"x-widget": "json", "x-label": "子 run 输入映射",
-                                        "x-help": "JSON 对象，值支持 ${input.x} / ${nodes.n.y} 模板；展开结果整体作为子 run 输入。省略 = 沿用父 run 输入"}
+                        "workflow_id": {"type": "string"},
+                        "version":{"type":"integer"},
+                        "input_mapping": {}
                     }
                 },
                 "supports_retry": true
             }),
             NodeType::Harness => serde_json::json!({
-                "label": "Harness 代理",
-                "category": "ai",
-                "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
+                "ports": [{"id": "in"}, {"id": "out"}],
                 "params_schema": {
                     "type": "object",
                     "required": ["prompt"],
                     "properties": {
-                        "mode": {"type": "string", "enum": ["command", "agent"], "default": "command",
-                                 "x-label": "模式",
-                                 "x-help": "command 运行外部 CLI（需 command 参数）；agent 使用内置 flow-harness-agent（需 api_key，workdir 可留空，模型配置见设置页 [harness.agent]）"},
-                        "prompt": {"type": "string", "x-widget": "code", "x-label": "提示词"},
-                        "command": {"type": "string", "x-label": "命令",
-                                    "x-help": "mode=command 时必填；进程级记录：prompt 经 stdin，最终 stdout 作为输出；逐模型/工具记录使用模型调用和 HTTP 节点"},
-                        "args": {"type": "array", "items": {"type": "string"}, "x-widget": "json", "x-label": "额外参数",
-                                 "x-help": "仅 mode=command 可用"},
-                        "workdir": {"type": "string", "x-label": "工作目录",
-                                    "x-help": "仅 mode=agent；可选。缺省 = 每次 run 的临时沙箱（结束后删除）；配置后为 agent 工作根（绝对路径且须存在，agent 可读写其中文件）"},
-                        "timeout_ms": {"type": "number", "default": 300000, "x-label": "超时 (ms)"},
-                        "api_key": {"type": "string", "x-secret": true, "x-label": "API 密钥名称",
-                                    "x-help": "仅 mode=agent：只存密钥名称，真值来自密钥管理（secrets.list 提供候选）"}
+                        "mode": {"type": "string", "enum": ["command", "agent"], "default": "command"},
+                        "prompt": {"type": "string"},
+                        "command": {"type": "string"},
+                        "args": {"type": "array", "items": {"type": "string"}},
+                        "workdir": {"type": "string"},
+                        "timeout_ms": {"type": "number", "default": 300000},
+                        "api_key": {"type": "string", "x-secret": true}
                     }
                 },
                 "supports_retry": true,
                 "side_effect": true
             }),
             NodeType::Llm => serde_json::json!({
-                "label":"模型调用", "category":"ai", "side_effect":true, "supports_retry":false,
-                "ports":[{"id":"in","label":"入"},{"id":"out","label":"出"}],
+                "side_effect":true, "supports_retry":false,
+                "ports":[{"id":"in"},{"id":"out"}],
                 "params_schema":{"type":"object","required":["url","body"],"properties":{
-                    "url":{"type":"string","x-label":"模型 API 地址"},
-                    "body":{"type":"object","x-widget":"json","x-label":"模型请求"},
-                    "headers":{"x-widget":"key-value","default":{},"x-label":"请求头"},
-                    "credential":{"type":"object","x-widget":"json","x-label":"凭据引用","x-help":"{scheme: bearer, secret_ref: 密钥名称}"},
-                    "response_schema":{"type":"object","x-widget":"json","x-label":"响应约束"},
-                    "timeout_ms":{"type":"integer","default":30000,"x-label":"超时（毫秒）"}
+                    "url":{"type":"string"},
+                    "body":{"type":"object"},
+                    "headers":{"default":{}},
+                    "credential":{"type":"object"},
+                    "response_schema":{"type":"object"},
+                    "timeout_ms":{"type":"integer","default":30000}
                 }}
             }),
             NodeType::Email => serde_json::json!({
-                "label": "邮件",
-                "category": "notify",
-                "ports": [{"id": "in", "label": "入"}, {"id": "out", "label": "出"}],
+                "ports": [{"id": "in"}, {"id": "out"}],
                 "params_schema": {
                     "type": "object",
                     "required": ["api_key", "from", "to", "subject", "body"],
                     "properties": {
-                        "endpoint": {"type": "string", "default": "https://api.resend.com/emails", "x-label": "API 端点",
-                                     "x-help": "Resend 兼容接口：POST {from, to, subject, text}，Bearer 认证"},
-                        "api_key": {"type": "string", "x-secret": true, "x-label": "API 密钥名称",
-                                    "x-help": "只存密钥名称（如 RESEND_KEY），真值来自 FLOW_SECRET_<名称> 环境变量；已配置的名称见 secrets.list"},
-                        "from": {"type": "string", "x-label": "发件人"},
-                        "to": {"type": "string", "x-label": "收件人"},
-                        "subject": {"type": "string", "x-label": "主题",
-                                    "x-help": "支持 ${input.x} / ${nodes.n.y} 模板"},
-                        "body": {"type": "string", "x-widget": "code", "x-label": "正文",
-                                 "x-help": "纯文本（作为 text 字段发送），支持 ${input.x} / ${nodes.n.y} 模板"}
+                        "endpoint": {"type": "string", "default": "https://api.resend.com/emails"},
+                        "api_key": {"type": "string", "x-secret": true},
+                        "from": {"type": "string"},
+                        "to": {"type": "string"},
+                        "subject": {"type": "string"},
+                        "body": {"type": "string"}
                     }
                 },
                 "supports_retry": true,
@@ -320,7 +268,7 @@ impl NodeType {
         }
     }
 
-    /// 能力描述（`nodetypes.list` 的单条）。内容由 [`Self::descriptor_body`]
+    /// 节点图结构、参数 schema 和执行元数据。内容由 [`Self::descriptor_body`]
     /// 决定，`"type"` 从 [`NODE_TYPE_TABLE`] 注入。
     ///
     /// 一次性构建 + 缓存：每次调用重跑一遍 `json!` 纯属浪费——构造出来的
@@ -336,12 +284,13 @@ impl NodeType {
                 let kind = NodeType::ALL[i];
                 let mut body = kind.descriptor_body();
                 if kind != NodeType::Start {
-                    body["params_schema"]["properties"]["join"] = serde_json::json!({"type":"string","enum":["selected","all"],"x-label":"合流规则","x-help":"selected 等全部入边确定后执行已选路径；all 要求每个前驱成功。省略时沿用流程版本的默认规则"});
+                    body["params_schema"]["properties"]["join"] =
+                        serde_json::json!({"type":"string","enum":["selected","all"]});
                 }
                 if kind.has_side_effect() {
                     body["supports_retry"] = serde_json::json!(true);
                     body["retry_scope"] = serde_json::json!("declared_repeatable_only");
-                    body["params_schema"]["properties"]["effect_policy"] = serde_json::json!({"type":"string","enum":["manual","repeatable"],"default":"manual","x-label":"未知结果恢复","x-help":"manual 等人工核对；repeatable 仅用于重复调用仍安全且无时效限制的接口，并受重试次数限制"});
+                    body["params_schema"]["properties"]["effect_policy"] = serde_json::json!({"type":"string","enum":["manual","repeatable"],"default":"manual"});
                 }
                 body["trace_granularity"] = serde_json::json!(match kind {
                     NodeType::Harness => "process",
@@ -365,7 +314,7 @@ impl NodeType {
     /// 「前端把可选参数渲染成必填框」或反之。
     ///
     /// 返回 `Vec<&str>` 而非 `&'static [...]`：descriptor 是 `LazyLock` 里的
-    /// `Value`，借出的引用活不到 `'static`。调用点是建图校验与 `workflow.update`
+    /// `Value`。调用点是建图校验与 `workflow.update`
     /// （每次保存一次），分配成本无关紧要。
     pub fn required_params(self) -> Vec<&'static str> {
         self.descriptor()

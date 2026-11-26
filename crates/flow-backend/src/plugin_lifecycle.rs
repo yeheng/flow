@@ -165,7 +165,7 @@ impl JournalBackend {
 
     async fn legacy_run_uses_plugin(
         &self,
-        run: &flow_engine::journal_state::Run,
+        run: &flow_domain::journal_state::Run,
         plugin_id: &str,
     ) -> Result<bool> {
         let mut definitions = vec![&run.definition];
@@ -186,7 +186,7 @@ impl JournalBackend {
             for node in &definition.nodes {
                 // Semantics 1 resolves children at execution time.
                 if (run.execution.is_none()
-                    && node.kind() == Some(flow_engine::NodeType::SubWorkflow))
+                    && node.kind() == Some(flow_domain::NodeType::SubWorkflow))
                     || crate::policy::plugin_id_for_node(node, run).as_deref() == Some(plugin_id)
                 {
                     return Ok(true);
@@ -374,7 +374,7 @@ impl JournalBackend {
                 {
                     return Err(BundleError::Limit("plugin limit reached".into()).into());
                 }
-                let key = flow_engine::journal_state::PluginGrant::key(
+                let key = flow_domain::journal_state::PluginGrant::key(
                     &op.receipt.plugin_id,
                     &bundle.content_hash,
                 );
