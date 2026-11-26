@@ -10,8 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use flow_dispatcher::execution_protocol::bootstrap::spawn_executor_transport;
 use flow_dispatcher::execution_protocol::contract::{
-    ExecutorInvocation, WorkerProfile, DRAIN_GRACE_MS, HEARTBEAT_TIMEOUT_MS,
-    STARTUP_TIMEOUT_MS,
+    ExecutorInvocation, WorkerProfile, DRAIN_GRACE_MS, HEARTBEAT_TIMEOUT_MS, STARTUP_TIMEOUT_MS,
 };
 use flow_dispatcher::execution_protocol::message::Message;
 use flow_dispatcher::execution_protocol::plugin_inventory::PluginInventory;

@@ -206,7 +206,8 @@ async fn journal_dev(
             .filter(|r| !r.terminal())
             .map(|r| r.run_id.clone())
             .collect::<BTreeSet<_>>();
-        let execution = flow_backend::prepare_execution(&execution, harness_agent, &backend).await?;
+        let execution =
+            flow_backend::prepare_execution(&execution, harness_agent, &backend).await?;
         backend.ensure_bundled_grants().await;
         if let Some((definition, input)) = submission {
             let created = backend.workflow_create("development", None).await?;

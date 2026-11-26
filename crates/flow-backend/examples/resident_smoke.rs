@@ -69,13 +69,19 @@ async fn main() {
         .await
         .is_err());
     relay.shutdown().await;
-    assert!(service.call(&instance,"crash",json!({})).await.is_err());
+    assert!(service.call(&instance, "crash", json!({})).await.is_err());
     service.shutdown().await;
     assert!(!service.alive());
     assert!(service.call(&instance, "echo", json!({})).await.is_err());
-    let replacement=ResidentService::start_installed(std::path::PathBuf::from(&entry),vec!["echo".into()]).await.unwrap();
-    assert_ne!(replacement.instance,instance);
-    assert!(replacement.call(&instance,"echo",json!({})).await.is_err());
+    let replacement =
+        ResidentService::start_installed(std::path::PathBuf::from(&entry), vec!["echo".into()])
+            .await
+            .unwrap();
+    assert_ne!(replacement.instance, instance);
+    assert!(replacement
+        .call(&instance, "echo", json!({}))
+        .await
+        .is_err());
     replacement.shutdown().await;
     println!("resident smoke: concurrent requests, events, stale identity, allowlist and shutdown passed");
 }

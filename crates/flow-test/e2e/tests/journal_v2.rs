@@ -57,7 +57,8 @@ async fn schedule_reactivation_and_legacy_creation_boundaries_are_durable() {
     let created = chrono::Utc::now();
     backend.append(vec![flow_journal::Event::new(flow_journal::EventKind::ScheduleChanged,
         json!({"id":"legacy","workflow_id":workflow,"enabled":true,"cron_expr":"* * * * *","input":null,"created_at":created.to_rfc3339()}))]).await.unwrap();
-    flow_rpc::journal_triggers::fire_due(&backend, created.with_timezone(&chrono::Local)).await;
+    let historical = (created - chrono::TimeDelta::nanoseconds(1)).with_timezone(&chrono::Local);
+    flow_rpc::journal_triggers::fire_due(&backend, historical).await;
     assert!(backend.state().await.unwrap().runs.is_empty());
     backend
         .config_change(
@@ -93,8 +94,9 @@ async fn schedule_reactivation_and_legacy_creation_boundaries_are_durable() {
             .is_err(),
         "the command decision must reject stale scan results under the state lock"
     );
-    let now = chrono::Local::now();
-    flow_rpc::journal_triggers::fire_due(&backend, now).await;
+    let before_activation =
+        (since - chrono::TimeDelta::nanoseconds(1)).with_timezone(&chrono::Local);
+    flow_rpc::journal_triggers::fire_due(&backend, before_activation).await;
     assert!(backend.state().await.unwrap().runs.is_empty());
     backend
         .config_change(
@@ -128,9 +130,12 @@ async fn call(
 #[tokio::test]
 async fn observation_lookup_precedes_cursor_validation_when_no_log_can_be_read() {
     let dir = flow_test_support::io::TempDir::new("observations-disabled");
+    // A file at the observation directory path disables only the optional store.
+    std::fs::write(dir.path().join("observations"), b"").unwrap();
     let backend = JournalBackend::open(dir.path(), Default::default())
         .await
         .unwrap();
+    assert!(backend.observations.is_none());
     let module = flow_rpc::journal_v2::module(
         backend.clone(),
         "observations-contract-test-token-32bytes".into(),
@@ -171,7 +176,8 @@ async fn observation_lookup_precedes_cursor_validation_when_no_log_can_be_read()
     let page = call(&module, "run.observations.page", call_page(run_id)).await;
     assert_eq!(
         page["result"],
-        json!({"records": [], "loss": {"history_incomplete": true}, "loss_scope": "store"})
+        json!({"records": [], "loss": {"history_incomplete": true}, "loss_scope": "store"}),
+        "{page}",
     );
 }
 

@@ -326,7 +326,7 @@ impl JournalBackend {
             attempt(&mut op, |op| {
                 if op.receipt.phase != Phase::Sealed {
                     let result = op.recover()?;
-                    cleanup(&op)?;
+                    cleanup(op)?;
                     return Ok(result);
                 }
                 let bundle = plugin_bundle::inspect(&op.stage())?;
@@ -367,7 +367,7 @@ impl JournalBackend {
                         }
                     }
                 }
-                validate_target(&op)?;
+                validate_target(op)?;
                 let old = op.target_identity()?;
                 if !snapshot.rows.iter().any(|row| row.source == op.live())
                     && snapshot.rows.len() >= 64
@@ -404,7 +404,7 @@ impl JournalBackend {
                     op.install_intent(old, result)?;
                     op.recover()?
                 };
-                cleanup(&op)?;
+                cleanup(op)?;
                 if let Err(error) = op.clear_draining() {
                     tracing::warn!(%error, plugin_id = %op.receipt.plugin_id, "could not clear plugin drain marker");
                 }
@@ -518,7 +518,7 @@ impl JournalBackend {
         blocking(move || {
             let _lease = RootLease::exclusive(op.root())?;
             attempt(&mut op, |op| {
-                validate_target(&op)?;
+                validate_target(op)?;
                 let reload = plugin_bundle::bounded_manifest(&op.live())
                     .map(|(_, m)| !m.plugin.node_types.is_empty())
                     .unwrap_or(true);
@@ -534,7 +534,7 @@ impl JournalBackend {
                 } else {
                     op.complete_unchanged(result)?
                 };
-                cleanup(&op)?;
+                cleanup(op)?;
                 if let Err(error) = op.clear_draining() {
                     tracing::warn!(%error, plugin_id = %op.receipt.plugin_id, "could not clear plugin drain marker");
                 }

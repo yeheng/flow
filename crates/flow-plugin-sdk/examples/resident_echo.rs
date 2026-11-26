@@ -93,8 +93,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Message::Notification(notification) => {
-                    if notification.method=="flow/event" || notification.method=="flow/stream_closed" {
-                        sender.send(Message::Notification(flow_plugin_sdk::Notification{jsonrpc:"2.0",method:"host.event".into(),params:notification.params})).await?;
+                    if notification.method == "flow/event"
+                        || notification.method == "flow/stream_closed"
+                    {
+                        sender
+                            .send(Message::Notification(flow_plugin_sdk::Notification {
+                                jsonrpc: "2.0",
+                                method: "host.event".into(),
+                                params: notification.params,
+                            }))
+                            .await?;
                     }
                 }
             }

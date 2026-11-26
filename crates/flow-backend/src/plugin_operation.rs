@@ -561,7 +561,10 @@ impl Operation {
         ] {
             plugin_bundle::sync_dir(directory)?;
         }
-        if matches!(self.receipt.phase, Phase::PublishIntent | Phase::RemoveIntent) {
+        if matches!(
+            self.receipt.phase,
+            Phase::PublishIntent | Phase::RemoveIntent
+        ) {
             atomic_json(
                 &self.root.join(flow_config::plugin_fs::PUBLICATION_REVISION),
                 &self.receipt.operation_id,
@@ -639,11 +642,16 @@ pub(crate) fn is_draining(root: &Path, id: &str) -> Result<bool> {
     };
     let marker: DrainMarker = serde_json::from_slice(&bytes)?;
     if marker.operation.len() != 64 || !marker.operation.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(OperationError::Invalid("invalid plugin drain receipt".into()));
+        return Err(OperationError::Invalid(
+            "invalid plugin drain receipt".into(),
+        ));
     }
-    let receipt: Receipt = serde_json::from_slice(&fs::read(root.join(".ops").join(marker.operation))?)?;
+    let receipt: Receipt =
+        serde_json::from_slice(&fs::read(root.join(".ops").join(marker.operation))?)?;
     if receipt.plugin_id != id {
-        return Err(OperationError::Invalid("plugin drain receipt belongs to another plugin".into()));
+        return Err(OperationError::Invalid(
+            "plugin drain receipt belongs to another plugin".into(),
+        ));
     }
     if receipt.phase == Phase::Completed && receipt.result.is_some() {
         return Ok(false);

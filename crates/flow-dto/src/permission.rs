@@ -1797,17 +1797,13 @@ mod tests {
         assert!(
             parse_capability(&json!({"id":"x","action":"teleport","approval":"auto"})).is_err()
         );
-        assert!(
-            parse_capability(&json!({"id":"x","action":"exec",
+        assert!(parse_capability(&json!({"id":"x","action":"exec",
             "executable":"/bin/ls","argv_exact":[],"approval":"yes"}))
-            .is_err()
-        );
+        .is_err());
         // 模板表达式拒绝。
-        assert!(
-            parse_capability(&json!({"id":"x","action":"secret",
+        assert!(parse_capability(&json!({"id":"x","action":"secret",
             "names":["${input.key}"],"approval":"auto"}))
-            .is_err()
-        );
+        .is_err());
         // exec 缺 executable/program。
         assert!(
             parse_capability(&json!({"id":"x","action":"exec","argv_exact":[],
@@ -1815,17 +1811,13 @@ mod tests {
             .is_err()
         );
         // 摘要非法。
-        assert!(
-            parse_capability(&json!({"id":"x","action":"shell",
+        assert!(parse_capability(&json!({"id":"x","action":"shell",
             "script_digest":"deadbeef","approval":"auto"}))
-            .is_err()
-        );
+        .is_err());
         // path 与 subtree 互斥。
-        assert!(
-            parse_capability(&json!({"id":"x","action":"file_write",
+        assert!(parse_capability(&json!({"id":"x","action":"file_write",
             "path":"a.txt","subtree":"src","approval":"auto"}))
-            .is_err()
-        );
+        .is_err());
         // URL 带 userinfo / query。
         assert!(
             parse_capability(&json!({"id":"x","action":"net","methods":["GET"],
@@ -1866,16 +1858,14 @@ mod tests {
             headers_digest: "0".repeat(64),
             body_digest: "0".repeat(64),
         };
-        assert!(
-            net.pattern
-                .matches(&spec("https://api.example.com/v1/x?k=1"))
-        );
+        assert!(net
+            .pattern
+            .matches(&spec("https://api.example.com/v1/x?k=1")));
         assert!(net.pattern.matches(&spec("https://api.example.com/v1")));
         assert!(!net.pattern.matches(&spec("https://api.example.com/v10")));
-        assert!(
-            !net.pattern
-                .matches(&spec("https://api.example.com:8443/v1/x"))
-        );
+        assert!(!net
+            .pattern
+            .matches(&spec("https://api.example.com:8443/v1/x")));
         assert!(!net.pattern.matches(&spec("http://api.example.com/v1/x")));
         assert!(!net.pattern.matches(&spec("https://api.example.com/")));
         // 方法大小写不敏感。
@@ -2029,12 +2019,10 @@ mod tests {
         }))
         .expect("manifest layer accepts any");
         // any=true 时不允许再携带 matcher 字段。
-        assert!(
-            parse_manifest_capability(&json!({
-                "id":"all","action":"net","any":true,"methods":["GET"],"approval":"ask"
-            }))
-            .is_err()
-        );
+        assert!(parse_manifest_capability(&json!({
+            "id":"all","action":"net","any":true,"methods":["GET"],"approval":"ask"
+        }))
+        .is_err());
         let spec = OperationSpec::Http {
             method: "GET".into(),
             url: "https://anywhere.example/".into(),

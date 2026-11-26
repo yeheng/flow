@@ -704,10 +704,16 @@ e2e_test!(
                     "url": target.url("/x"),
                     "proxy": proxy.url(""),
                 })),
-                json!([net_cap("w-net", "GET", &stub_root(&target.url("/x")), "auto")]),
+                json!([net_cap(
+                    "w-net",
+                    "GET",
+                    &stub_root(&target.url("/x")),
+                    "auto"
+                )]),
             );
             let client = ctx.client().await;
-            let (workflow_id, _) = publish_legacy_workflow(&client, "proxy 无能力", definition).await;
+            let (workflow_id, _) =
+                publish_legacy_workflow(&client, "proxy 无能力", definition).await;
             let run_id = start_run(&client, &workflow_id, json!({})).await;
             let run = wait_run_terminal(&client, &run_id, TIMEOUT).await;
             assert_eq!(run["run"]["status"], json!("failed"), "{run}");

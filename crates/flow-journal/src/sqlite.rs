@@ -852,8 +852,7 @@ mod tests {
             "{error}"
         );
         // 只读连接同样拒绝（与写路径同一版本门）。
-        let error = read_connection(dir.path())
-            .expect_err("只读连接也必须拒绝 v4");
+        let error = read_connection(dir.path()).expect_err("只读连接也必须拒绝 v4");
         assert!(error.to_string().contains("unsupported"), "{error}");
     }
 

@@ -353,8 +353,12 @@ async fn invocation_result(
         Ok(Some(run)) => {
             let output = match run.output.as_ref() {
                 Some(value) => flow_backend::journal_views::materialize_run_value(
-                    &state.backend, value, 8 * 1024 * 1024
-                ).await.map(Some),
+                    &state.backend,
+                    value,
+                    8 * 1024 * 1024,
+                )
+                .await
+                .map(Some),
                 None => Ok(None),
             };
             match output{
