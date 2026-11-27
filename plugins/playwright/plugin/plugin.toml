@@ -1,0 +1,101 @@
+# playwright 插件 manifest（打包源头；部署时随 bin/ 一起拷入
+# <flow_home>/plugins/playwright/）。
+#
+# 声明纪律见 docs/protocol/wire.md 与 crates/flow-config/src/plugin_manifest.rs：
+# - runtime 用 node_types 路由派发，用 methods.invoke 调用；
+# - master/web 消费 ui 段（调色板 / 参数表单 / 运行视图）；
+# - 协议快筛用 protocol（握手仍是权威裁决）。
+#
+# playwright 节点 = 一次浏览器自动化：脚本（JS 函数体）在 Node + Playwright
+# 里执行，输出 `{status, browser, duration_ms, logs, result}` 落 journal。
+# 数值边界与插件实现（lib.rs TIMEOUT_* 常量）保持一致：声明与实现两处
+# 必须同改（这里改窄 = 发布期更早拒绝；改宽 = 运行期裸奔）。
+[plugin]
+id = "playwright"
+name = "Playwright 浏览器"
+version = "0.1.0"
+entry = "bin/flow-playwright-plugin"
+# plugin-proto 完整版本号（u32：高 16 位主版本，低 16 位次版本，与
+# wire.md §3.1 initialize 的 protocol_version 同一编码）。廉价快筛；
+# 握手再权威裁决。
+protocol = 2
+node_types = ["playwright"]
+
+[methods]
+invoke = "playwright/invoke"
+
+# 节点参数逐节点声明（脚本/浏览器/无头/超时都随节点走）；插件级配置
+# （如 node 解释器路径）暂无——出现真实需求再声明 [config]。
+[ui]
+[ui.palette]
+category = "integration"
+icon_key = "browser"
+
+[ui.run_view]
+summary_keys = ["status", "duration_ms"]
+
+[[ui.params]]
+for = "playwright"
+[[ui.params.field]]
+key = "script"
+type = "code"
+format = "js"
+required = true
+max_len = 262144
+[[ui.params.field]]
+key = "browser"
+type = "enum"
+values = ["chromium", "firefox", "webkit"]
+default = "chromium"
+[[ui.params.field]]
+key = "headless"
+type = "boolean"
+default = "true"
+[[ui.params.field]]
+key = "timeout_ms"
+type = "number"
+default = "60000"
+min = 1000
+max = 600000
+
+# 09 权限模型：能力需求上限（安装授予面见设置页；workflow/node 层再收窄）。
+#
+# pw-exec 是唯一 required 能力，形状与真实命令同值：插件固定以
+# `node runtime/wrapper.js` 启动执行器（cwd = 插件根，argv 是相对串）。
+# workflow 层镜像覆盖：{"action":"exec","executable":"<node 绝对路径>",
+# "argv_exact":["runtime/wrapper.js"]}（裸名与绝对路径同 basename + 同
+# argv 互盖，flow-dto covers 的 P1.1 规则）。
+#
+# 浏览器导航/上传/下载的副作用面不可枚举（任意 URL、任意文件），无法
+# 声明成可镜像的具体模式；族级 any 只能在 manifest 层存在，workflow
+# 层无法覆盖 any 需求（covers：(_, Any) => false）——所以 net/file
+# 声明为 optional（信息性上限，供授予页展示），required 只留 exec。
+# 无 OS 沙箱的平台不承诺进程内细粒度执法（同 harness 诚实条款）。
+[permissions]
+schema = 1
+required_features = ["master-permit-v1"]
+
+[[permissions.capabilities]]
+id = "pw-exec"
+action = "exec"
+program = "node"
+argv_exact = ["runtime/wrapper.js"]
+required = true
+
+[[permissions.capabilities]]
+id = "pw-net"
+action = "net"
+any = true
+required = false
+
+[[permissions.capabilities]]
+id = "pw-file-read"
+action = "file_read"
+any = true
+required = false
+
+[[permissions.capabilities]]
+id = "pw-file-write"
+action = "file_write"
+any = true
+required = false

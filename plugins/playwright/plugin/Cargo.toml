@@ -1,0 +1,34 @@
+[package]
+name = "flow-playwright-plugin"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# flow-playwright-plugin：playwright 节点的执行进程。
+#
+# 方法层契约（`playwright/invoke`，见本目录 README.md 与 plugin.toml）：
+# 请求 `{params: {script, browser?, headless?, timeout_ms?}}`，响应
+# `{output: {status, browser, duration_ms, logs, result}}`。授权与审计不在
+# 这里——runtime 先拿 permit 才会 invoke 本插件。
+
+[lib]
+name = "flow_playwright_plugin"
+path = "src/lib.rs"
+
+[[bin]]
+name = "flow-playwright-plugin"
+path = "src/main.rs"
+
+[dependencies]
+flow-plugin-sdk = { path = "../../../crates/flow-plugin-sdk" }
+libc = { workspace = true }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net", "process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "env-filter"] }
+
+[dev-dependencies]
+flow-config = { path = "../../../crates/flow-config" }

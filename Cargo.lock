@@ -1299,6 +1299,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "flow-playwright-plugin"
+version = "0.1.0"
+dependencies = [
+ "flow-config",
+ "flow-plugin-sdk",
+ "libc",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "flow-plugin-catalog"
 version = "0.1.0"
 dependencies = [

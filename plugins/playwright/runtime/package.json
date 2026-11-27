@@ -1,0 +1,13 @@
+{
+  "name": "flow-playwright-runtime",
+  "private": true,
+  "version": "0.1.0",
+  "description": "flow playwright 插件的 Node 执行环境（wrapper.js + playwright 依赖）；部署时随插件拷入 <flow_home>/plugins/playwright/runtime/",
+  "main": "wrapper.js",
+  "scripts": {
+    "test": "node --test ../plugin/tests/wrapper.test.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.55.0"
+  }
+}

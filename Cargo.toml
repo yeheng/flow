@@ -29,6 +29,7 @@ members = [
     "plugins/harness/agent-host",
     "plugins/harness/plugin",
     "plugins/llm/plugin",
+    "plugins/playwright/plugin",
     # 测试归组（T2）：基建/单机 e2e/远程 e2e/性能各自独立 package
     "crates/flow-test/test-support",
     "crates/flow-test/e2e",
