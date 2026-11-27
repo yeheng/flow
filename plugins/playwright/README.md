@@ -170,6 +170,6 @@ playwright 节点是副作用节点：定义必须带顶层 `permissions`，且�
 | `-32023` | 超时（进程组已击杀） |
 | `-32024` | 环境缺失：node 不在 PATH / runtime 未拷 / playwright 未 npm install |
 
-注意：宿主侧（runtime `plugin_node`）当前把插件的错误响应统一收敛为
-Uncertain 且不透传 message——排障看执行器 stderr 日志（插件把失败详情
-也打在 stderr）。
+脚本失败时节点按 Uncertain 收口（副作用状态未知，run 挂起等裁决）；
+错误详情（插件名 + 脚本错误 + 堆栈 + 捕获的 console）会透传进 run
+错误与执行器日志，排障直接看 run 详情。

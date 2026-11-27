@@ -409,9 +409,25 @@ impl TaskRunner {
             }
         };
         let _ = session.shutdown().await;
-        let result = outcome
-            .result
-            .ok_or_else(|| TaskError::Uncertain("plugin invoke failed".into()))?;
+        let result = match outcome.error {
+            None => outcome.result,
+            Some(error) => {
+                // 应用错误按 Uncertain 收口（授权已提交：许可在 journal 里，
+                // 副作用状态未知即不确定），但 message 必须透传——插件侧的
+                // 错误详情（脚本失败原因/超时/环境缺失）是排障的唯一线索，
+                // 丢弃等于把「失败」变成「谜语」（与 llm_node 同一条纪律）。
+                return Err(TaskError::Uncertain(format!(
+                    "plugin {} invoke failed: {}",
+                    plugin.plugin_id, error.message
+                )));
+            }
+        }
+        .ok_or_else(|| {
+            TaskError::Uncertain(format!(
+                "plugin {} response missing result and error",
+                plugin.plugin_id
+            ))
+        })?;
         let output_value = result["output"].clone();
         if output_value.is_null() {
             return Err(TaskError::Uncertain(
