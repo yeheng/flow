@@ -8,7 +8,10 @@
 //   stdout 的哨兵前缀）。
 //
 // 退出码：0 = 已处理（含脚本失败，见信封 status）；3 = 环境问题
-// （playwright 未安装等，Rust 侧映射 ENVIRONMENT_ERROR）；1 = 未预期崩溃。
+// （playwright 未安装等，Rust 侧读退出码后映射 ENVIRONMENT_ERROR /
+// -32024，确定类：直接失败不挂起）；1 = 未预期崩溃（Rust 侧按
+// SCRIPT_ERROR + stderr 尾巴收口，不确定类）。改这里的退出码语义 =
+// 改 Rust 侧 WRAPPER_EXIT_ENVIRONMENT，两处同改。
 //
 // 纪律：
 // - 不设第二只钟——超时由 Rust 插件整组击杀（单钟原则）；

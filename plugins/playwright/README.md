@@ -153,22 +153,23 @@ playwright 节点是副作用节点：定义必须带顶层 `permissions`，且�
 3. **输出 ≤ 8 MiB**（journal 捕获预算）：超限报 `-32021`，logs 先截、
    `result` 不截（不静默给你半截数据）。
 4. **超时单钟**：只有插件掐表，到点 SIGKILL 整个进程组（node + 浏览器），
-   信封不会送达——超时的 run 拿到 `-32023`。
+   信封不会送达——超时的 run 拿到 `-32023`。**仅 unix 整组击杀**；
+   Windows 退化为只杀 node，浏览器子进程可能残留（见 6）。
 5. **stdout 是结果通道**：wrapper 在 stdout 末行打 `__FLOW_PW__<JSON>`；
    脚本里 `console.log` 已被捕获，但直接 `process.stdout.write` 会污染通道，
    别用。
-6. 浏览器进程偶发残留（被 SIGKILL 时没机会清理）是已知代价；下次同版本
-   安装会复用浏览器缓存目录，不受影响。
+6. 浏览器进程偶发残留（被 SIGKILL 时没机会清理；或 Windows 上只杀了 node）
+   是已知代价；下次同版本安装会复用浏览器缓存目录，不受影响。
 
 ## 契约速查（错误码）
 
 | code | 场景 |
 | --- | --- |
-| `-32020` | 脚本失败 / 浏览器崩溃 / wrapper 未回信封（不确定类） |
+| `-32020` | 脚本失败 / 浏览器崩溃 / wrapper 未回信封且非退出码 3（不确定类） |
 | `-32021` | 输出超过 8 MiB 捕获上限 |
-| `-32022` | 参数畸形（防御纵深；发布期 manifest 表单先拦一道） |
+| `-32022` | 参数畸形（spawn 前拦截；正常由发布期 manifest 表单先拦，运行期不可达） |
 | `-32023` | 超时（进程组已击杀） |
-| `-32024` | 环境缺失：node 不在 PATH / runtime 未拷 / playwright 未 npm install |
+| `-32024` | 环境缺失（确定类，直接失败）：node 不在 PATH / runtime 未拷 / playwright 未 npm install（wrapper 退出码 3） |
 
 脚本失败时节点按 Uncertain 收口（副作用状态未知，run 挂起等裁决）；
 错误详情（插件名 + 脚本错误 + 堆栈 + 捕获的 console）会透传进 run

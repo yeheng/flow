@@ -411,16 +411,10 @@ impl TaskRunner {
         let _ = session.shutdown().await;
         let result = match outcome.error {
             None => outcome.result,
-            Some(error) => {
-                // 应用错误按 Uncertain 收口（授权已提交：许可在 journal 里，
-                // 副作用状态未知即不确定），但 message 必须透传——插件侧的
-                // 错误详情（脚本失败原因/超时/环境缺失）是排障的唯一线索，
-                // 丢弃等于把「失败」变成「谜语」（与 llm_node 同一条纪律）。
-                return Err(TaskError::Uncertain(format!(
-                    "plugin {} invoke failed: {}",
-                    plugin.plugin_id, error.message
-                )));
-            }
+            // 按码分派：确定类闭集（-32024 环境缺失）→ Business 直接失败；
+            // 其余 → Uncertain（授权已提交，副作用状态未知）。见
+            // `plugin_invoke_error`。
+            Some(error) => return Err(plugin_invoke_error(&plugin.plugin_id, &error)),
         }
         .ok_or_else(|| {
             TaskError::Uncertain(format!(
@@ -979,4 +973,119 @@ async fn forward_permission_request(
         result: Some(serde_json::to_value(result).unwrap_or(Value::Null)),
         error: None,
     })
+}
+
+/// 通用插件节点的**确定类**应用错误码闭集：命中 = 插件在产生任何副作用
+/// 之前就失败了，按 `TaskError::Business` 直接失败（NodeFailed），
+/// 不进 uncertain 等人工裁决。
+///
+/// 闭集纪律：新增码 = 宿主版本变更，不问插件、不自动放行。当前只有
+/// `-32024`（插件未能启动执行环境：解释器 / runtime 依赖缺失）。
+/// 与 playwright 插件 `ENVIRONMENT_ERROR` 同值，两侧各自声明；
+/// `definite_plugin_error_codes_are_pinned` 钉住。
+const DEFINITE_PLUGIN_ERROR: i64 = -32024;
+
+/// 插件 invoke 的错误响应 → `TaskError`。
+///
+/// 默认 Uncertain：授权已提交（许可在 journal 里），拿不到可验证
+/// Outcome 就意味着副作用状态未知——这是保守正确的缺省。只有闭集内
+/// 的码可以降级为 Business：它们承诺「副作用不可能已发生」。
+/// message 原样透传（插件侧的错误详情是排障的唯一线索）。
+fn plugin_invoke_error(
+    plugin_id: &str,
+    error: &flow_plugin_sdk::protocol::jsonrpc::Error,
+) -> TaskError {
+    use flow_plugin_sdk::protocol::jsonrpc::ErrorCode;
+    let message = format!("plugin {plugin_id} invoke failed: {}", error.message);
+    match error.code {
+        ErrorCode::Application(code) if code == DEFINITE_PLUGIN_ERROR => {
+            TaskError::Business(message)
+        }
+        _ => TaskError::Uncertain(message),
+    }
+}
+
+#[cfg(test)]
+mod plugin_invoke_error_tests {
+    use super::*;
+    use flow_plugin_sdk::protocol::jsonrpc::{Error, ErrorCode};
+
+    fn app_error(code: i64) -> Error {
+        Error::new(ErrorCode::Application(code), "detail")
+    }
+
+    fn kind(error: &TaskError) -> &'static str {
+        match error {
+            TaskError::Business(_) => "business",
+            TaskError::Uncertain(_) => "uncertain",
+            other => panic!("unexpected variant: {other}"),
+        }
+    }
+
+    /// 确定类闭集钉子：-32024 → Business（直接失败，不挂起裁决）。
+    #[test]
+    fn environment_error_is_definite() {
+        let error = plugin_invoke_error("playwright", &app_error(-32024));
+        assert_eq!(kind(&error), "business");
+        let TaskError::Business(message) = error else {
+            unreachable!()
+        };
+        assert!(message.starts_with("plugin playwright invoke failed: "));
+        assert!(
+            message.contains("detail"),
+            "插件错误详情必须透传：{message}"
+        );
+    }
+
+    /// 缺省保守：闭集之外的应用码（脚本失败 -32020、超限 -32021、畸形
+    /// -32022、超时 -32023，以及任意未知名）一律 Uncertain——授权已
+    /// 提交，副作用状态未知。逐个钉住，防止「顺手多加一个确定码」。
+    #[test]
+    fn everything_else_stays_uncertain() {
+        for code in [-32020i64, -32021, -32022, -32023, -32025, -32099, -32001] {
+            let error = plugin_invoke_error("p", &app_error(code));
+            assert_eq!(
+                kind(&error),
+                "uncertain",
+                "应用码 {code} 不在确定类闭集内，必须是 Uncertain"
+            );
+        }
+    }
+
+    /// 协议层错误（非应用码：方法不存在、内部错误、参数非法）不是插件的
+    /// 业务声明，即使数值碰巧等于 -32024 也不能被当成确定类。
+    #[test]
+    fn non_application_codes_are_never_definite() {
+        for code in [
+            ErrorCode::MethodNotFound,
+            ErrorCode::InvalidParams,
+            ErrorCode::InternalError,
+        ] {
+            let error = plugin_invoke_error("p", &Error::new(code, "x"));
+            assert_eq!(kind(&error), "uncertain", "{code:?} 必须是 Uncertain");
+        }
+    }
+
+    /// 跨进程契约钉子：宿主的确定类码必须与 playwright 插件声明的
+    /// `ENVIRONMENT_ERROR` 同值（插件 lib.rs 是另一侧的唯一来源）。
+    #[test]
+    fn definite_plugin_error_codes_are_pinned() {
+        let plugin_lib = include_str!("../../../../plugins/playwright/plugin/src/lib.rs");
+        let declared = plugin_lib
+            .lines()
+            .find(|line| line.starts_with("pub const ENVIRONMENT_ERROR: i64 ="))
+            .expect("playwright 插件必须声明 ENVIRONMENT_ERROR");
+        let value: i64 = declared
+            .rsplit('=')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .trim_end_matches(';')
+            .parse()
+            .expect("ENVIRONMENT_ERROR 必须是整数字面量");
+        assert_eq!(
+            DEFINITE_PLUGIN_ERROR, value,
+            "宿主确定类码与插件 ENVIRONMENT_ERROR 分叉"
+        );
+    }
 }

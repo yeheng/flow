@@ -12,10 +12,10 @@
 //!   logs, result}}`（`result` = 脚本返回值；`status = failed` 时带
 //!   `error`）；
 //! - 应用错误码：`-32020` 脚本失败/浏览器崩溃（不确定类：副作用可能
-//!   已发生）；`-32021` 输出超过捕获上限；`-32022` 参数畸形（防御
-//!   纵深：runtime 授权前已按 manifest 校验过一次）；`-32023` 超时
-//!   （不确定类）；`-32024` 环境缺失（node / playwright runtime 未装，
-//!   确定类）。
+//!   已发生）；`-32021` 输出超过捕获上限；`-32022` 参数畸形（spawn 前
+//!   拦截；正常由发布期 manifest 表单先拦，运行期不可达）；`-32023`
+//!   超时（不确定类）；`-32024` 环境缺失（node 解释器起不来 / runtime
+//!   未拷 / wrapper 以退出码 3 收尾，确定类：直接失败，不进 Uncertain）。
 //!
 //! 超时纪律：runtime 的 `plugin_node` 不掐表（`let _ = timeout_ms;`），
 //! 本插件是**唯一的一只钟**——到点杀整个进程组（node + 浏览器子进程），
@@ -63,6 +63,7 @@ pub const STDERR_TAIL_BYTES: usize = 2_048;
 /// wrapper 在 stdout 打的哨兵行前缀：前面任何字节都不是我们的（用户脚本
 /// 里 `process.stdout.write` 直写会污染通道——README 已声明禁止）。
 pub const RESULT_SENTINEL: &str = "__FLOW_PW__";
+pub const WRAPPER_EXIT_ENVIRONMENT: i32 = 3;
 
 /// `playwright/invoke` 请求参数（节点层参数，经模板展开与 secret 注入后）。
 #[derive(Debug, Deserialize)]
@@ -200,37 +201,54 @@ pub async fn run_playwright(
             format!("无法启动 {node_bin}：{error}（本机需要 Node.js）"),
         )
     })?;
-    // stdin 喂完即关（EOF 是 wrapper 的「参数齐了」信号）。
-    {
-        use tokio::io::AsyncWriteExt as _;
-        let mut stdin = child.stdin.take().expect("stdin piped");
-        let payload = stdin_payload.to_string();
-        stdin
-            .write_all(payload.as_bytes())
-            .await
-            .map_err(|error| InvokeError::new(SCRIPT_ERROR, format!("写 stdin 失败：{error}")))?;
-        stdin
-            .shutdown()
-            .await
-            .map_err(|error| InvokeError::new(SCRIPT_ERROR, format!("关 stdin 失败：{error}")))?;
-    }
-    // 自己持有三根管道：wait_with_output 会把 child 搬进 future，超时分支
-    // 就拿不回进程组句柄了。两根读端并发排空（防 pipe 缓冲区死锁），
-    // 都到 EOF 再 wait。
+    // 三路管道真并发（stdin 写 + stdout/stderr 读）：
+    //
+    // - 两路读必须并发：串行读时，wrapper 写满 stderr 管道缓冲而 stdout
+    //   尚未关闭，双方互等卡死（旧实现的真实缺陷，测试
+    //   heavy_stderr_does_not_deadlock_stdout 钉住）。
+    // - 写 stdin 与读端并发：不再依赖「wrapper 一定先读完 stdin」的
+    //   顺序巧合；wrapper 不读 stdin 时也不丢它已写出的信封。
+    // - 写 stdin 失败（EPIPE = wrapper 已退出）**不是**终态错误：继续把
+    //   两路读到 EOF，以信封/退出码为准。
+    //
+    // 自持三根管道而不是 wait_with_output：后者把 child 搬进 future，
+    // 超时分支就拿不回进程组句柄了。
+    let mut stdin_pipe = child.stdin.take().expect("stdin piped");
     let mut stdout_pipe = child.stdout.take().expect("stdout piped");
     let mut stderr_pipe = child.stderr.take().expect("stderr piped");
     let timed = tokio::time::timeout(params.timeout, async {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let out = tokio::io::AsyncReadExt::read_to_end(&mut stdout_pipe, &mut stdout).await;
-        let err = tokio::io::AsyncReadExt::read_to_end(&mut stderr_pipe, &mut stderr).await;
-        let status = child.wait().await?;
-        out?;
-        err?;
+        // 写端包一层：失败只记日志，不中断读端（永不返回 Err）。
+        //
+        // stdin_pipe 必须**按值搬进** async 块（`async move`）：`async` 块
+        // 默认按引用捕获，块结束时只是借用结束，管道 fd 会活到函数尾，
+        // wrapper 就永远等不到 EOF（实测：数据已到、EOF 不来、整个 invoke
+        // 超时）。写完显式 drop 关管道——EOF 是 wrapper「参数齐了」的信号。
+        let write_stdin = async move {
+            use tokio::io::AsyncWriteExt as _;
+            let payload = stdin_payload.to_string();
+            if let Err(error) = stdin_pipe.write_all(payload.as_bytes()).await {
+                tracing::debug!(
+                    "playwright wrapper 未读完 stdin 即退出（{error}）；以信封/退出码为准"
+                );
+            }
+            // drop(stdin_pipe) 关闭写端 = EOF；shutdown() 本身不关 fd。
+            drop(stdin_pipe);
+        };
+        let (read_stdout, read_stderr, (), waited) = tokio::join!(
+            tokio::io::AsyncReadExt::read_to_end(&mut stdout_pipe, &mut stdout),
+            tokio::io::AsyncReadExt::read_to_end(&mut stderr_pipe, &mut stderr),
+            write_stdin,
+            child.wait(),
+        );
+        read_stdout?;
+        read_stderr?;
+        let status = waited?;
         std::io::Result::Ok((status, stdout, stderr))
     })
     .await;
-    let (_status, stdout, stderr) = match timed {
+    let (status, stdout, stderr) = match timed {
         Ok(result) => result
             .map_err(|error| InvokeError::new(SCRIPT_ERROR, format!("node 进程失败：{error}")))?,
         Err(_) => {
@@ -248,10 +266,14 @@ pub async fn run_playwright(
     };
     let stdout = String::from_utf8_lossy(&stdout);
     let stderr = String::from_utf8_lossy(&stderr);
+    let exit_code = status.code();
     let envelope = match parse_envelope(&stdout) {
         Some(envelope) => envelope,
         None => {
-            // 没有哨兵 = wrapper 没能正常收尾（崩溃/被信号杀/环境炸了）。
+            // 没有哨兵：按退出码分派。3 = wrapper 自己声明的环境问题
+            //（playwright 未安装 / stdin 非法 JSON）——确定类，直接失败，
+            // 不该进 Uncertain 让 run 挂起等裁决。其余（崩溃 / 被信号杀 /
+            // 未预期退出）仍是不确定类。
             let tail = stderr.trim();
             let mut message = "wrapper 未返回结果信封".to_string();
             if !tail.is_empty() {
@@ -264,7 +286,10 @@ pub async fn run_playwright(
                 message.push_str("；stderr 尾巴：");
                 message.push_str(&tail);
             }
-            return Err(InvokeError::new(SCRIPT_ERROR, message));
+            return Err(match exit_code {
+                Some(WRAPPER_EXIT_ENVIRONMENT) => InvokeError::new(ENVIRONMENT_ERROR, message),
+                _ => InvokeError::new(SCRIPT_ERROR, message),
+            });
         }
     };
     if envelope["status"] == "failed" {
@@ -535,6 +560,169 @@ mod tests {
             .await
             .expect_err("缺 runtime 必须报环境错误");
         assert_eq!(error.code, ENVIRONMENT_ERROR);
+    }
+
+    /// 回归（review 问题 1）：wrapper 以退出码 3 收尾（playwright 未安装 /
+    /// stdin 非法 JSON）必须映射 ENVIRONMENT_ERROR（确定类，直接失败），
+    /// 不能落进 SCRIPT_ERROR（不确定类 → run 挂起等裁决）。
+    /// 修前：退出码从不读取，一律 SCRIPT_ERROR。
+    #[tokio::test]
+    async fn wrapper_exit_3_is_environment_error() {
+        let Some(guard) =
+            node_wrapper_fixture("process.stderr.write('pw missing\\n'); process.exit(3);")
+        else {
+            return;
+        };
+        let error = run_playwright(&guard.params, &guard.root, "node")
+            .await
+            .expect_err("exit 3 必须是错误");
+        assert_eq!(error.code, ENVIRONMENT_ERROR, "message: {}", error.message);
+        assert!(
+            error.message.contains("pw missing"),
+            "stderr 尾巴要带上：{}",
+            error.message
+        );
+    }
+
+    /// 非 3 的非零退出码仍是不确定类（崩溃 / 被信号杀），不因「读退出码」
+    /// 而被误降级成确定类。
+    #[tokio::test]
+    async fn wrapper_crash_stays_script_error() {
+        let Some(guard) = node_wrapper_fixture("process.exit(1);") else {
+            return;
+        };
+        let error = run_playwright(&guard.params, &guard.root, "node")
+            .await
+            .expect_err("exit 1 必须是错误");
+        assert_eq!(error.code, SCRIPT_ERROR);
+    }
+
+    /// 大脚本（远超管道缓冲）+ wrapper 延迟读 stdin：三路并发下的
+    /// 回归保护。如实说明：旧实现在这个形态下**也能过**（对照实验 3/3
+    /// 成功——tokio 把 200KB 全塞进了缓冲，没卡到 wrapper 退出）；
+    /// 真正在旧实现上必红的是 stderr 风暴（串行读卡死），见
+    /// `heavy_stderr_does_not_deadlock_stdout`。本测试钉的是并发改造
+    /// 没有把这条真实形态弄坏（v1 改造曾因 stdin 不关而在此超时）。
+    #[tokio::test]
+    async fn large_script_survives_wrapper_that_reads_stdin_late() {
+        // wrapper：先忙 50ms（不碰 stdin），再读 stdin 并回信封——
+        // 真 wrapper 的形态（require 冷启动后才 readStdin）。
+        let wrapper = r#"
+            setTimeout(async () => {
+              let raw = '';
+              for await (const chunk of process.stdin) raw += chunk;
+              const request = JSON.parse(raw);
+              process.stdout.write('__FLOW_PW__' + JSON.stringify({
+                status: 'success', result: { script_len: request.script.length },
+              }) + '\n');
+            }, 50);
+        "#;
+        let Some(guard) = node_wrapper_fixture(wrapper) else {
+            return;
+        };
+        // 远超常见 64KiB 管道缓冲；仍在 manifest 的 256KiB 上限内。
+        let big = ValidatedParams {
+            script: format!("return 1; //{}", "x".repeat(200 * 1024)),
+            ..guard.params.clone()
+        };
+        let envelope = run_playwright(&big, &guard.root, "node")
+            .await
+            .expect("大脚本不应丢结果");
+        assert_eq!(envelope["status"], "success");
+        assert_eq!(envelope["result"]["script_len"], big.script.len());
+    }
+
+    /// stderr 大量输出不得卡死读端（两路读必须并发）。**旧实现必红**
+    /// （对照实验卡满 20s）：原实现注释说并发排空，实际是先读完 stdout
+    /// 再读 stderr；wrapper 写满 stderr 管道缓冲时互等。
+    #[tokio::test]
+    async fn heavy_stderr_does_not_deadlock_stdout() {
+        let wrapper = r#"
+            let raw = '';
+            for await (const chunk of process.stdin) raw += chunk;
+            JSON.parse(raw);
+            for (let i = 0; i < 400; i++) process.stderr.write('E'.repeat(2048) + '\n');
+            process.stdout.write('__FLOW_PW__{"status":"success","result":"ok"}\n');
+        "#;
+        let Some(guard) = node_wrapper_fixture(wrapper) else {
+            return;
+        };
+        let envelope = run_playwright(&guard.params, &guard.root, "node")
+            .await
+            .expect("stderr 风暴不应卡死");
+        assert_eq!(envelope["result"], "ok");
+    }
+
+    /// 契约钉子（review 问题 3）：`OUTPUT_MAX_BYTES` 是跨进程契约值，
+    /// 必须与 runtime `plugin_node` 的 `store_value` 预算同值。runtime 侧
+    /// 是裸字面量（无具名常量可引），这里读它的源码断言——两处分叉时
+    /// 第一时间红，而不是等到 run 在 journal 写入时才炸。
+    #[test]
+    fn output_budget_matches_runtime_store_value_budget() {
+        let runtime_src =
+            include_str!("../../../../crates/flow-plugin-runtime/src/task/plugins.rs");
+        // plugin_node 的输出落账行：`store_value(audit, &self.journal_id, &output_value, <budget>)`
+        // runtime 侧预算是裸字面量 `8 * 1024 * 1024`（无具名常量可引）。
+        // 这里把它按字面写死并断言两处同值：任一侧改了，这个测试就红，
+        // 而不是等到 run 在 journal 写入时才炸。
+        const RUNTIME_LITERAL: &str = "8 * 1024 * 1024";
+        assert_eq!(
+            OUTPUT_MAX_BYTES,
+            8 * 1024 * 1024,
+            "插件侧 OUTPUT_MAX_BYTES 与本测试钉的 runtime 字面量分叉"
+        );
+        let line = runtime_src
+            .lines()
+            .find(|line| line.contains("store_value(audit, &self.journal_id, &output_value"))
+            .expect("runtime plugin_node 的 store_value 行必须存在");
+        let normalized: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized.contains(&format!(", {RUNTIME_LITERAL})")),
+            "plugin_node 输出预算变了（不再是 {RUNTIME_LITERAL}）：插件侧 OUTPUT_MAX_BYTES 必须同改。行：{line}"
+        );
+    }
+
+    /// 真 node 上跑一个临时 wrapper 的 fixture。本机无 node 时返回 None
+    /// （调用方跳过，不算失败）。
+    struct WrapperFixture {
+        root: PathBuf,
+        params: ValidatedParams,
+    }
+
+    fn node_wrapper_fixture(wrapper_source: &str) -> Option<WrapperFixture> {
+        if !std::process::Command::new("node")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            eprintln!("跳过：本机无 node");
+            return None;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "flow-pw-fx-{}-{:p}",
+            std::process::id(),
+            wrapper_source
+        ));
+        let runtime = root.join("runtime");
+        std::fs::create_dir_all(&runtime).expect("创建 fixture runtime");
+        std::fs::write(runtime.join("wrapper.js"), wrapper_source).expect("写 fixture wrapper");
+        Some(WrapperFixture {
+            root,
+            params: ValidatedParams {
+                script: "return 1;".into(),
+                browser: "chromium".to_string(),
+                headless: true,
+                timeout: Duration::from_millis(20_000),
+            },
+        })
+    }
+
+    impl Drop for WrapperFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
     }
 
     #[cfg(unix)]
